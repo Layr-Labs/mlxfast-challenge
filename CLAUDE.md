@@ -262,6 +262,19 @@ Do not specialize for the public correctness prompt. Optimizations should be
 prompt-independent and model-general for DeepSeek V4 Flash. Hidden correctness,
 GPQA, and benchmark prompts are different from the public fixtures.
 
+Do not add caches or memos keyed on a request's input tokens whose only
+possible hit is the benchmark harness repeating an identical computation — for
+example, memoizing a whole-prompt forward's logits or KV state so a repeated
+identical forward can skip the work. Bit-identical output does not make this
+legitimate. The benchmark measures single-pass inference: optimizations must
+save work that recurs in single-pass production inference (one prefill, then
+decode, per prompt), not work that only exists in the measurement protocol.
+The harness never legitimately issues the same whole-prompt forward twice to
+one worker process; any such repetition is a harness bug, never a contract to
+rely on. Input-independent caching (weights, dequantized tensors, RoPE/mask
+tables keyed on shapes and offsets) and within-request KV reuse remain fine.
+Submissions in this category fail the static review as bypass behavior.
+
 Do not treat local-only environment overrides as proof of a valid improvement.
 Examples include disabling the sandbox, skipping transform without verifying
 the produced `weights/`, pointing at a user-specific reference path, or tuning
