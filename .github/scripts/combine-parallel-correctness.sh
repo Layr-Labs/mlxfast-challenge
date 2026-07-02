@@ -173,6 +173,44 @@ jq -e \
   | if .passed then . else (.score = null) end
   ' "${MACHINE1_DIR}/score.json" > "${MLXFAST_COMBINED_SCORE_PATH}"
 
+# Coarsen the diagnostic (non-ranking) real-valued fields in the FINAL published
+# score to the same 2 significant figures the Swift harness applies to per-machine
+# scores (see roundedToSignificantFigures / withCoarsenedPublicDiagnostics). The
+# per-machine artifacts are already coarse, but this combined file is reassembled
+# here by jq -- and the merge RE-DERIVES some fields at full precision
+# (expert_hit_rate = hits/(hits+misses)) or reintroduces it (correctness_seconds =
+# gates + integer slice seconds, expert_read_seconds = gates + timing) -- so
+# without this pass the artifact the leaderboard bot publishes would still leak a
+# fine-grained timing/memory covert channel that submitted model code can drive.
+# Ranking- and floor-critical fields (decode/prefill seconds-per-token, speedups,
+# floors, baselines, score) are left untouched so scoring and the downstream
+# artifact validator are unaffected. Rounding is monotone, so validator ordering
+# checks (wall >= timed, ttft_max >= p50) still hold; re-clamped for safety.
+# FIGURES kept in one place; mirrors MLXFastConstants.publicDiagnosticSignificantFigures.
+round_tmp="$(mktemp)"
+jq '
+  def sigfig($n): if (type != "number") then .
+    elif . == 0 then 0
+    else (fabs | log10 | floor) as $m | pow(10; ($n - 1 - $m)) as $f | (((. * $f) | round) / $f)
+    end;
+  # Only touch keys that are present and numeric, so partial/legacy inputs
+  # (e.g. the combiner probe fixtures) are not mutated or crashed.
+  .metrics |= (
+    reduce ([
+      "peak_ram_gb", "bandwidth_gb_per_token", "preflight_seconds", "correctness_seconds",
+      "timed_benchmark_seconds", "benchmark_wall_seconds", "gpqa_ttft_seconds",
+      "gpqa_ttft_p50_seconds", "gpqa_ttft_max_seconds", "process_resident_memory_gb",
+      "expert_read_seconds", "expert_hit_rate"
+    ] | .[]) as $k (.; if (.[$k] | type) == "number" then .[$k] |= sigfig(2) else . end)
+    # Re-clamp the ordering pairs the artifact validator asserts.
+    | (if (.benchmark_wall_seconds | type) == "number" and (.timed_benchmark_seconds | type) == "number"
+        then .benchmark_wall_seconds = ([.benchmark_wall_seconds, .timed_benchmark_seconds] | max) else . end)
+    | (if (.gpqa_ttft_max_seconds | type) == "number" and (.gpqa_ttft_p50_seconds | type) == "number"
+        then .gpqa_ttft_max_seconds = ([.gpqa_ttft_max_seconds, .gpqa_ttft_p50_seconds] | max) else . end)
+  )
+  ' "${MLXFAST_COMBINED_SCORE_PATH}" > "${round_tmp}"
+mv "${round_tmp}" "${MLXFAST_COMBINED_SCORE_PATH}"
+
 combined_passed="$(jq -r '.passed' "${MLXFAST_COMBINED_SCORE_PATH}")"
 echo "combine-parallel-correctness: wrote ${MLXFAST_COMBINED_SCORE_PATH} passed=${combined_passed}"
 
