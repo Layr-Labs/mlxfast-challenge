@@ -1244,12 +1244,13 @@ func benchmarkSplitsGatesAndTimingOntoSeparateMachinesWithoutSpuriousSemanticCap
     #expect(runtime.contains("if checkGates, let semanticCapture {"))
     #expect(!runtime.contains("if let semanticCapture {\n                guard semanticAnswers.count == semanticCapture.caseCount else {"))
 
-    // Placeholder timing values for a gates-only machine must be the official
+    // Placeholder timing values for a gates-only machine must be the resolved
     // baseline exactly (speedup == 1.0, always finite) -- 0 would divide-by-
     // zero into +Infinity in BenchmarkScore.speedup, and Double.infinity fails
-    // JSON encoding outright.
-    #expect(runtime.contains("prefillSecondsPerToken = MLXFastConstants.officialBaselinePrefillSecondsPerToken"))
-    #expect(runtime.contains("secondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,"))
+    // JSON encoding outright. "Resolved" means the golden oracle's per-prompt
+    // baseline when it carries one, else the calibrated constants.
+    #expect(runtime.contains("prefillSecondsPerToken = baselinePrefillSecondsPerToken"))
+    #expect(runtime.contains("secondsPerToken: baselineDecodeSecondsPerToken,"))
 
     let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
     #expect(cli.contains("MLXFAST_BENCHMARK_CHECK_GATES"))

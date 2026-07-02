@@ -169,6 +169,15 @@ public struct BenchmarkGolden: Codable, Equatable {
     public let decodeSeedTokens: [Int]
     public let expectedDecodeSeedToken: Int
     public let expectedDecodeTokens: [Int]
+    // Per-prompt baselines for prompt-pool rotation (see
+    // docs/benchmark-window-freeze.md). A pool golden carries the seconds-per-
+    // token the baseline reference measured for THIS prompt on the official
+    // runner, so rotating prompts of different intrinsic difficulty keeps
+    // speedups comparable. Both must be present together or absent together;
+    // absent means "score against the calibrated defaults in MLXFastConstants"
+    // (the pre-pool behavior, used by all public fixtures).
+    public let baselinePrefillSecondsPerToken: Double?
+    public let baselineDecodeSecondsPerToken: Double?
 
     enum CodingKeys: String, CodingKey {
         case prefillPromptTokens = "prefill_prompt_tokens"
@@ -176,6 +185,8 @@ public struct BenchmarkGolden: Codable, Equatable {
         case decodeSeedTokens = "decode_seed_tokens"
         case expectedDecodeSeedToken = "expected_decode_seed_token"
         case expectedDecodeTokens = "expected_decode_tokens"
+        case baselinePrefillSecondsPerToken = "baseline_prefill_seconds_per_token"
+        case baselineDecodeSecondsPerToken = "baseline_decode_seconds_per_token"
     }
 
     public init(
@@ -183,13 +194,25 @@ public struct BenchmarkGolden: Codable, Equatable {
         expectedPrefillToken: Int,
         decodeSeedTokens: [Int],
         expectedDecodeSeedToken: Int,
-        expectedDecodeTokens: [Int]
+        expectedDecodeTokens: [Int],
+        baselinePrefillSecondsPerToken: Double? = nil,
+        baselineDecodeSecondsPerToken: Double? = nil
     ) {
         self.prefillPromptTokens = prefillPromptTokens
         self.expectedPrefillToken = expectedPrefillToken
         self.decodeSeedTokens = decodeSeedTokens
         self.expectedDecodeSeedToken = expectedDecodeSeedToken
         self.expectedDecodeTokens = expectedDecodeTokens
+        self.baselinePrefillSecondsPerToken = baselinePrefillSecondsPerToken
+        self.baselineDecodeSecondsPerToken = baselineDecodeSecondsPerToken
+    }
+
+    public var resolvedBaselinePrefillSecondsPerToken: Double {
+        baselinePrefillSecondsPerToken ?? MLXFastConstants.officialBaselinePrefillSecondsPerToken
+    }
+
+    public var resolvedBaselineDecodeSecondsPerToken: Double {
+        baselineDecodeSecondsPerToken ?? MLXFastConstants.officialBaselineDecodeSecondsPerToken
     }
 }
 
@@ -550,6 +573,32 @@ public func validateBenchmarkGolden(_ benchmark: BenchmarkGolden) throws {
     try validateTokens(benchmark.decodeSeedTokens, field: "benchmark.decode_seed_tokens")
     try validateTokens([benchmark.expectedDecodeSeedToken], field: "benchmark.expected_decode_seed_token")
     try validateTokens(benchmark.expectedDecodeTokens, field: "benchmark.expected_decode_tokens")
+    try validateBenchmarkGoldenBaselines(benchmark)
+}
+
+private func validateBenchmarkGoldenBaselines(_ benchmark: BenchmarkGolden) throws {
+    // A half-calibrated oracle (one axis carried, one falling back to the
+    // constants) would silently mix two calibration regimes in one score, so
+    // the pair is all-or-nothing.
+    switch (benchmark.baselinePrefillSecondsPerToken, benchmark.baselineDecodeSecondsPerToken) {
+    case (nil, nil):
+        return
+    case (nil, _), (_, nil):
+        throw MLXFastError.invalidInput(
+            "benchmark.baseline_prefill_seconds_per_token and benchmark.baseline_decode_seconds_per_token must be provided together"
+        )
+    case let (prefill?, decode?):
+        guard prefill.isFinite, prefill > 0 else {
+            throw MLXFastError.invalidInput(
+                "benchmark.baseline_prefill_seconds_per_token must be finite and positive"
+            )
+        }
+        guard decode.isFinite, decode > 0 else {
+            throw MLXFastError.invalidInput(
+                "benchmark.baseline_decode_seconds_per_token must be finite and positive"
+            )
+        }
+    }
 }
 
 private func validateGoldenFixtureKeys(_ data: Data) throws {
