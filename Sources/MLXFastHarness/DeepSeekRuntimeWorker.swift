@@ -24,10 +24,16 @@ extension DeepSeekRuntime {
         // future request nonces or spoof JSON responses with normal stdio.
         let protocolIO = try RuntimeWorkerProtocolIO.isolatingStandardIO()
         let sessionNonce = generateRuntimeWorkerNonce()
+        // Report the expert-streaming counters as they stand BEFORE any forward
+        // runs. The parent uses this as the baseline for the seed prefill's
+        // incremental reads (see requirePlausibleSeedForwardExpertReads), so a
+        // submission cannot pre-stream experts at startup to inflate the cumulative
+        // counter and disguise a memoized/replayed seed forward as real work.
         try protocolIO.writeLine(try encoder.encode(RuntimeWorkerResponse(
             id: 0,
             nonce: sessionNonce,
-            ok: true
+            ok: true,
+            expertStats: expertStats(from: weightCache)
         )))
         var state = RuntimeWorkerState()
 
@@ -169,16 +175,20 @@ extension DeepSeekRuntime {
             guard let seedTokens = request.seedTokens else {
                 throw MLXFastError.invalidInput("runtime worker decode_begin request missing seed_tokens")
             }
-            let warmupCache = DeepSeekModelCache(config: weightCache.config)
-            let warmupLogits = try DeepSeekModel.logits(
-                inputIDs: inputIDsArray(seedTokens),
-                weightCache: weightCache,
-                cache: warmupCache,
-                positionOffset: 0
-            )
-            _ = try DeepSeekCorrectness.greedyToken(from: warmupLogits)
-            Memory.clearCache()
-
+            // Exactly one whole-prompt (seed) forward runs here, with NO preceding
+            // warmup pass. The decode measurement deliberately charges this seed
+            // prefill to the decode phase (see measureWorkerDecode). A second,
+            // identical whole-prompt forward -- the warmup this used to run before
+            // the seed -- let submitted model code memoize one pass and serve the
+            // other from that memo (both had the same tokens at offset 0), so two
+            // charged forwards collapsed into one and inflated decode_speedup with
+            // no real speedup. The trusted harness cannot force editable code to
+            // recompute a forward it issues, so the only robust defense is to never
+            // issue two identical forwards in the timed window: with a single seed
+            // forward there is no identical predecessor to reuse, and the 128
+            // single-token decode steps are input-dependent and cannot be
+            // precomputed. Prefill/decode/correctness each run in their own worker
+            // process, so no memo persists across phases either.
             let cache = DeepSeekModelCache(config: weightCache.config)
             let start = DispatchTime.now().uptimeNanoseconds
             let logits = try DeepSeekModel.logits(
@@ -413,6 +423,9 @@ final class RuntimeWorkerClient {
     private var sessionNonce = ""
     private var nextID = 1
     private var closed = false
+    // Expert-streaming counters reported in the worker's protocol hello, before
+    // any forward has run. Baseline for the seed prefill's incremental reads.
+    private(set) var initialExpertStats: ExpertStreamingStats?
 
     init(options: RuntimeWorkerOptions, weightsPath: String) throws {
         let process = Process()
@@ -452,6 +465,7 @@ final class RuntimeWorkerClient {
             throw MLXFastError.invalidInput("runtime worker did not return a valid protocol hello")
         }
         self.sessionNonce = nonce
+        self.initialExpertStats = hello.expertStats
     }
 
     deinit {

@@ -1078,6 +1078,41 @@ func benchmarkTimingChargesDecodeSetupAndSeparatesWorkers() throws {
 }
 
 @Test
+func decodeMeasurementRunsSingleUnmemoizableSeedForward() throws {
+    // The decode measurement must run exactly ONE whole-prompt (seed) forward in
+    // the timed window. A second identical forward (the warmup this used to run
+    // before the seed) let submitted model code memoize one pass and serve the
+    // other from that memo, collapsing two decode-charged forwards into one and
+    // inflating decode_speedup with no real speedup. Guard both decode paths.
+    let worker = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntimeWorker.swift",
+        encoding: .utf8
+    )
+    let beginStart = try #require(worker.range(of: "case \"decode_begin\":"))
+    let beginEnd = try #require(worker.range(of: "case \"decode_step\":"))
+    let decodeBegin = String(worker[beginStart.lowerBound..<beginEnd.lowerBound])
+    // Exactly one whole-prompt forward, and no warmup pass preceding the seed.
+    #expect(!decodeBegin.contains("warmupCache"))
+    #expect(!decodeBegin.contains("warmupLogits"))
+    #expect(decodeBegin.components(separatedBy: "DeepSeekModel.logits(").count - 1 == 1)
+    #expect(decodeBegin.contains("with NO preceding"))
+
+    let benchmark = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntimeBenchmark.swift",
+        encoding: .utf8
+    )
+    let decodeStart = try #require(benchmark.range(of: "static func measureDecode("))
+    let decodeEnd = try #require(benchmark.range(of: "static func measureWorkerDecode("))
+    let measureDecode = String(benchmark[decodeStart.lowerBound..<decodeEnd.lowerBound])
+    // No warmup pass before the seed prefill. (Unlike decode_begin, this path
+    // inlines the per-step decode loop, which has its own single-token
+    // logits call, so we assert on the absence of the warmup rather than a
+    // whole-prompt forward count.)
+    #expect(!measureDecode.contains("warmupCache"))
+    #expect(!measureDecode.contains("decode warmup start"))
+}
+
+@Test
 func compareTeacherForcedWithWorkerSupportsStartStepForParallelCorrectness() throws {
     let runtime = try harnessRuntimeSource()
 
