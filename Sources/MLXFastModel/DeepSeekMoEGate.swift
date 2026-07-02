@@ -18,6 +18,7 @@ public enum DeepSeekMoEGate {
         hidden: MLXArray,
         inputIDs: MLXArray? = nil,
         weight: MLXArray,
+        weightTransposed: MLXArray? = nil,
         correctionBias: MLXArray? = nil,
         tokenToExpert: MLXArray? = nil,
         topK: Int,
@@ -25,7 +26,10 @@ public enum DeepSeekMoEGate {
         normTopKProb: Bool,
         scoring: DeepSeekGateScoring
     ) throws -> DeepSeekMoEGateResult {
-        let logits = matmul(hidden, weight.T).asType(.float32)
+        let logits = DeepSeekOps.cast(
+            matmul(hidden, weightTransposed ?? weight.T),
+            to: .float32
+        )
         let scores = score(logits, scoring: scoring)
 
         let indices: MLXArray

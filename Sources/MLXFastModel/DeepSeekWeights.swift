@@ -101,7 +101,16 @@ public struct DeepSeekWeightLoader {
     public let expertBank: ExpertSlotBank
     public let expertStreamingConfig: ExpertStreamingConfig
     public let expertStreamingMetrics: ExpertStreamingMetrics?
+    public let expertPrefetcher: ExpertPrefetcher
+    public let residentExpertScales: ResidentExpertTensors?
+    public let pinnedExpertCodes: ResidentExpertTensors?
+    public let expertLayerStager: ExpertLayerStager?
     private let bridge: MLXArrayTensorBridge
+
+    /// Sized for the official 48 GB runner: pin only where at least that
+    /// budget exists, and never more than two layers of codes (~6.4 GiB).
+    private static let pinningMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
+    private static let pinnedHashLayerCap = 2
 
     public init(
         weightsPath: String,
@@ -114,9 +123,38 @@ public struct DeepSeekWeightLoader {
         self.denseStore = try DenseTensorStore(weightsPath: weightsPath)
         self.expertStreamingConfig = expertStreamingConfig
         self.expertStreamingMetrics = metrics
-        self.expertBank = try ExpertSlotBank(
+        let expertBank = try ExpertSlotBank(
             manifestPath: "\(weightsPath)/experts/manifest.json",
             capacity: expertStreamingConfig.tensorCacheCapacity,
+            metrics: metrics
+        )
+        self.expertBank = expertBank
+        self.expertPrefetcher = ExpertPrefetcher(expertBank: expertBank)
+        // Resident stores come from a process-wide registry: the trusted
+        // benchmark harness keeps two loaders alive at once, and duplicating
+        // ~14 GiB of resident data per loader would threaten the 48 GB
+        // runner budget.
+        let manifestPath = "\(weightsPath)/experts/manifest.json"
+        self.residentExpertScales = ResidentExpertStoreRegistry.scales(
+            manifestPath: manifestPath,
+            metrics: metrics
+        )
+        // Pinning trades RAM for guaranteed hits on the token-id-routed
+        // layers; only worthwhile at the official 48 GB budget or above,
+        // and capped so the pinned codes (~3.2 GiB per layer) leave headroom
+        // for the resident scales, staging buffers, and page cache inside
+        // that budget. Both constants encode the OFFICIAL runner's memory
+        // math — do not raise them because a larger local machine has room.
+        let hashLayerCount = (try? DeepSeekConfig.load(from: weightsPath))?.numHashLayers ?? 0
+        self.pinnedExpertCodes = ProcessInfo.processInfo.physicalMemory >= Self.pinningMinimumPhysicalMemoryBytes
+            ? ResidentExpertStoreRegistry.pinnedHashLayerCodes(
+                manifestPath: manifestPath,
+                hashLayerCount: min(hashLayerCount, Self.pinnedHashLayerCap),
+                metrics: metrics
+            )
+            : nil
+        self.expertLayerStager = ExpertLayerStager(
+            manifestPath: manifestPath,
             metrics: metrics
         )
         self.bridge = bridge
@@ -133,6 +171,10 @@ public struct DeepSeekWeightLoader {
         self.expertBank = expertBank
         self.expertStreamingConfig = expertStreamingConfig
         self.expertStreamingMetrics = expertStreamingMetrics ?? expertBank.metrics
+        self.expertPrefetcher = ExpertPrefetcher(expertBank: expertBank)
+        self.residentExpertScales = nil
+        self.pinnedExpertCodes = nil
+        self.expertLayerStager = nil
         self.bridge = bridge
     }
 
@@ -235,7 +277,8 @@ public struct DeepSeekWeightLoader {
     public func expertLinearWeight(
         candidates: [String],
         expectedShape: [Int],
-        expertIndex: Int
+        expertIndex: Int,
+        preferStaged: Bool = false
     ) throws -> DeepSeekLinearWeight {
         for candidate in candidates {
             guard let record = expertBank.record(named: candidate) else {
@@ -243,14 +286,39 @@ public struct DeepSeekWeightLoader {
             }
             let isStacked = record.shape.count == expectedShape.count + 1
                 && record.shape.first.map { expertIndex < $0 } == true
-            let tensor = try isStacked
-                ? expertBank.materializedTensor(named: candidate, firstAxisIndex: expertIndex)
-                : expertBank.materializedTensor(named: candidate)
+            let tensor: MaterializedTensor
+            if isStacked,
+               let pinned = pinnedExpertCodes?.materializedTensor(
+                   named: candidate,
+                   firstAxisIndex: expertIndex
+               ) {
+                tensor = pinned
+            } else if preferStaged, isStacked,
+               let staged = stagedSliceTensor(recordName: candidate, expertIndex: expertIndex) {
+                tensor = staged
+            } else if isStacked {
+                tensor = try expertBank.materializedTensor(named: candidate, firstAxisIndex: expertIndex)
+            } else {
+                tensor = try expertBank.materializedTensor(named: candidate)
+            }
             return try linearWeight(
                 baseName: candidate,
                 expectedShape: expectedShape,
                 tensor: tensor,
                 companionTensor: { companionName, shouldSlice in
+                    if let resident = residentExpertScales?.materializedTensor(
+                        named: companionName,
+                        firstAxisIndex: shouldSlice ? expertIndex : nil
+                    ) {
+                        return resident
+                    }
+                    if preferStaged, shouldSlice,
+                       let staged = stagedSliceTensor(
+                           recordName: companionName,
+                           expertIndex: expertIndex
+                       ) {
+                        return staged
+                    }
                     guard expertBank.record(named: companionName) != nil else {
                         return nil
                     }
@@ -263,6 +331,85 @@ public struct DeepSeekWeightLoader {
         }
         throw MLXFastError.invalidInput(
             "expert tensor not found; tried \(candidates.joined(separator: ", "))"
+        )
+    }
+
+    /// Stacked expert record names for one layer, for whole-tensor staging:
+    /// the three projection code tensors, plus scales companions when they are
+    /// not RAM-resident and biases companions when the manifest has them.
+    /// Returns nil when any projection does not resolve to a stacked record,
+    /// in which case callers keep the per-slice streaming path.
+    public func stagedExpertLayerPlan(layerIndex: Int) -> ExpertLayerStager.LayerPlan? {
+        guard expertLayerStager != nil else {
+            return nil
+        }
+        var names: [String] = []
+        for projection in [DeepSeekExpertProjection.gate, .up, .down] {
+            let candidates = DeepSeekWeightNames.routedExpert(
+                layerIndex: layerIndex,
+                expertIndex: 0,
+                projection: projection
+            )
+            guard let candidate = candidates.first(where: { expertBank.record(named: $0) != nil }),
+                  let record = expertBank.record(named: candidate),
+                  record.shape.count == 3,
+                  let firstDimension = record.shape.first,
+                  firstDimension > 0,
+                  record.byteLength % firstDimension == 0
+            else {
+                return nil
+            }
+            if pinnedExpertCodes?.isResident(name: candidate) != true {
+                names.append(candidate)
+            }
+            if record.dtype == "U32" {
+                for suffix in ["scales", "biases"] {
+                    let companion = companionName(for: candidate, suffix: suffix)
+                    guard let companionRecord = expertBank.record(named: companion) else {
+                        continue
+                    }
+                    let scalesResident = suffix == "scales"
+                        && residentExpertScales?.isResident(name: companion) == true
+                    if !scalesResident, companionRecord.shape.count >= 2 {
+                        names.append(companion)
+                    }
+                }
+            }
+        }
+        guard !names.isEmpty else {
+            // Everything the plan would stage is already RAM-resident;
+            // the per-slice path serves those layers from memory.
+            return nil
+        }
+        return ExpertLayerStager.LayerPlan(layerIndex: layerIndex, recordNames: names)
+    }
+
+    /// Fabricates the same MaterializedTensor the bank's firstAxisIndex read
+    /// would return, from a staged whole-tensor buffer: identical name, dtype,
+    /// shape, and — by the bank's own slice arithmetic — identical bytes.
+    private func stagedSliceTensor(recordName: String, expertIndex: Int) -> MaterializedTensor? {
+        guard
+            let stager = expertLayerStager,
+            let record = expertBank.record(named: recordName),
+            let bytes = stager.stagedBytes(recordName: recordName),
+            let firstDimension = record.shape.first,
+            record.shape.count >= 2,
+            expertIndex >= 0,
+            expertIndex < firstDimension,
+            record.byteLength % firstDimension == 0,
+            bytes.count == record.byteLength,
+            let dtype = try? TensorDType.parse(record.dtype)
+        else {
+            return nil
+        }
+        let sliceByteLength = record.byteLength / firstDimension
+        let start = bytes.startIndex + expertIndex * sliceByteLength
+        let slice = bytes[start..<(start + sliceByteLength)]
+        return try? MaterializedTensor(
+            name: "\(recordName)[\(expertIndex)]",
+            dtype: dtype,
+            shape: Array(record.shape.dropFirst()),
+            bytes: slice
         )
     }
 

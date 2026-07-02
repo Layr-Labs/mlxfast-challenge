@@ -33,11 +33,21 @@ public struct DeepSeekHyperConnectionWeights {
     public let fn: MLXArray
     public let base: MLXArray
     public let scale: MLXArray
+    // Derived arrays shared across every forward pass. The collapse path
+    // consumes fn transposed and mixes/scale/base in float32; hoisting the
+    // transpose and the exact bf16->f32 widening here removes those nodes
+    // from each of the per-layer collapse calls without changing any value.
+    public let fnTransposedF32: MLXArray
+    public let baseF32: MLXArray
+    public let scaleF32: MLXArray
 
     public init(fn: MLXArray, base: MLXArray, scale: MLXArray) {
         self.fn = fn
         self.base = base
         self.scale = scale
+        self.fnTransposedF32 = DeepSeekOps.cast(fn, to: .float32).T
+        self.baseF32 = DeepSeekOps.cast(base, to: .float32)
+        self.scaleF32 = DeepSeekOps.cast(scale, to: .float32)
     }
 }
 
@@ -72,8 +82,9 @@ public enum DeepSeekBlock {
         let attentionMix = try DeepSeekHyperConnection.collapse(
             hidden,
             fn: weights.attentionHyperConnection.fn,
-            base: weights.attentionHyperConnection.base,
-            scale: weights.attentionHyperConnection.scale,
+            fnTransposed: weights.attentionHyperConnection.fnTransposedF32,
+            base: weights.attentionHyperConnection.baseF32,
+            scale: weights.attentionHyperConnection.scaleF32,
             hcMult: spec.hcMult,
             sinkhornIters: spec.hcSinkhornIters,
             eps: spec.hcEps,
@@ -96,8 +107,9 @@ public enum DeepSeekBlock {
         let feedForwardMix = try DeepSeekHyperConnection.collapse(
             hidden,
             fn: weights.feedForwardHyperConnection.fn,
-            base: weights.feedForwardHyperConnection.base,
-            scale: weights.feedForwardHyperConnection.scale,
+            fnTransposed: weights.feedForwardHyperConnection.fnTransposedF32,
+            base: weights.feedForwardHyperConnection.baseF32,
+            scale: weights.feedForwardHyperConnection.scaleF32,
             hcMult: spec.hcMult,
             sinkhornIters: spec.hcSinkhornIters,
             eps: spec.hcEps,

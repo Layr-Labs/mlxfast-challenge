@@ -3,6 +3,12 @@ import MLX
 import MLXFastCore
 
 public enum DeepSeekOps {
+    /// Cast that skips the graph node when the array is already in the target
+    /// dtype (MLXArray.asType emits a node even for a no-op cast).
+    public static func cast(_ input: MLXArray, to dtype: DType) -> MLXArray {
+        input.dtype == dtype ? input : input.asType(dtype)
+    }
+
     public static func embedding(inputIDs: MLXArray, weight: MLXArray) -> MLXArray {
         weight[inputIDs]
     }

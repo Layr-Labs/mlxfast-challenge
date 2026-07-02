@@ -438,7 +438,7 @@ public enum DeepSeekKVCompressor {
             ? overlapCompress(kv: kvWindows, gate: gateWindows, ape: weights.ape)
             : simpleCompress(kv: kvWindows, gate: gateWindows, ape: weights.ape)
         let normalized = DeepSeekOps.rmsNorm(input: pooled, weight: weights.norm, eps: spec.rmsNormEps)
-        let rope = try DeepSeekRoPE(
+        let rope = try DeepSeekRoPECache.shared(
             rotaryDimensions: spec.ropeHeadDim,
             base: spec.ropeTheta,
             scaling: spec.ropeScaling,
@@ -491,7 +491,7 @@ public enum DeepSeekLocalAttention {
         try validateInput(x, spec: spec)
         let batchSize = x.shape[0]
         let sequenceLength = x.shape[1]
-        let rope = try DeepSeekRoPE(
+        let rope = try DeepSeekRoPECache.shared(
             rotaryDimensions: spec.qkRopeHeadDim,
             base: spec.ropeTheta,
             scaling: nil,
@@ -514,7 +514,7 @@ public enum DeepSeekLocalAttention {
         if let cache {
             let cached = try cache.updateAndFetch(kv)
             kv = cached.kv
-            attentionMask = try DeepSeekAttentionMask.causal(
+            attentionMask = try DeepSeekMaskCache.causal(
                 queryLength: sequenceLength,
                 keyLength: kv.shape[2],
                 queryOffset: positionOffset,
@@ -529,7 +529,7 @@ public enum DeepSeekLocalAttention {
             values: kv,
             scale: Float(pow(Double(spec.headDim), -0.5)),
             mask: attentionMask,
-            sinks: weights.attentionSink.map { $0.asType(q.dtype) }
+            sinks: weights.attentionSink.map { DeepSeekOps.cast($0, to: q.dtype) }
         )
         out = try rope.applied(to: out, offset: positionOffset, inverse: true)
 
@@ -566,7 +566,7 @@ public enum DeepSeekCompressedAttention {
         try validateInput(x, spec: spec)
         let batchSize = x.shape[0]
         let sequenceLength = x.shape[1]
-        let rope = try DeepSeekRoPE(
+        let rope = try DeepSeekRoPECache.shared(
             rotaryDimensions: spec.qkRopeHeadDim,
             base: spec.ropeTheta,
             scaling: spec.ropeScaling,
@@ -592,7 +592,7 @@ public enum DeepSeekCompressedAttention {
         if let localCache = cache?.local {
             let cached = try localCache.updateAndFetch(kv)
             kv = cached.kv
-            localMask = try DeepSeekAttentionMask.causal(
+            localMask = try DeepSeekMaskCache.causal(
                 queryLength: sequenceLength,
                 keyLength: kv.shape[2],
                 queryOffset: positionOffset,
@@ -619,7 +619,7 @@ public enum DeepSeekCompressedAttention {
         let pooledMask = cache?.pooled?.makeMask(queryLength: sequenceLength, offset: positionOffset)
 
         let pooledLength = pooled.shape[1]
-        let sinks = weights.attention.attentionSink.map { $0.asType(q.dtype) }
+        let sinks = weights.attention.attentionSink.map { DeepSeekOps.cast($0, to: q.dtype) }
         var out: MLXArray
         if spec.compressRatio == 4, pooledLength > spec.indexTopK {
             guard let indexer = weights.indexer else {
@@ -905,7 +905,7 @@ public enum DeepSeekIndexer {
             throw MLXFastError.invalidInput("indexer requires at least one pooled KV token")
         }
 
-        let rope = try DeepSeekRoPE(
+        let rope = try DeepSeekRoPECache.shared(
             rotaryDimensions: spec.qkRopeHeadDim,
             base: spec.ropeTheta,
             scaling: spec.ropeScaling,

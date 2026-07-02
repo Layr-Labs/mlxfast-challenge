@@ -27,6 +27,9 @@ public struct DeepSeekMoEWeights {
     public let correctionBias: MLXArray?
     public let tokenToExpert: MLXArray?
     public let sharedExperts: DeepSeekMLPWeights
+    // Router matmul consumes gate transposed; sharing one transpose view
+    // avoids a fresh node per layer per forward. Same dtype, same values.
+    public let gateTransposed: MLXArray
 
     public init(
         gate: MLXArray,
@@ -38,6 +41,7 @@ public struct DeepSeekMoEWeights {
         self.correctionBias = correctionBias
         self.tokenToExpert = tokenToExpert
         self.sharedExperts = sharedExperts
+        self.gateTransposed = gate.T
     }
 }
 
@@ -103,6 +107,7 @@ public enum DeepSeekMoE {
             hidden: x,
             inputIDs: inputIDs,
             weight: weights.gate,
+            weightTransposed: weights.gateTransposed,
             correctionBias: weights.correctionBias,
             tokenToExpert: weights.tokenToExpert,
             topK: spec.expertsPerToken,
