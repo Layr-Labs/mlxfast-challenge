@@ -15,6 +15,8 @@ private func packageFile(_ path: String) throws -> String {
 }
 
 // Returns the trimmed right-hand side of `let <name> = <literal>` in Swift source.
+// Strips a trailing line comment so a future `let x = 3.6 // note` still extracts
+// just `3.6` and matches the value quoted in the freeze doc.
 private func swiftConstantLiteral(_ source: String, name: String) throws -> String {
     let marker = "let \(name) = "
     let start = try #require(
@@ -23,7 +25,11 @@ private func swiftConstantLiteral(_ source: String, name: String) throws -> Stri
     )
     let rest = source[start.upperBound...]
     let lineEnd = rest.firstIndex(of: "\n") ?? rest.endIndex
-    return String(rest[..<lineEnd]).trimmingCharacters(in: .whitespaces)
+    var literal = String(rest[..<lineEnd])
+    if let comment = literal.range(of: "//") {
+        literal = String(literal[..<comment.lowerBound])
+    }
+    return literal.trimmingCharacters(in: .whitespaces)
 }
 
 private func slice(_ source: String, from startMarker: String, to endMarker: String) throws -> String {
@@ -76,6 +82,10 @@ func benchmarkWindowFreezeDocMatchesConstants() throws {
 func timedDecodeChargesOneValidatedSeedForward() throws {
     let worker = try packageFile("Sources/MLXFastHarness/DeepSeekRuntimeWorker.swift")
     let decodeBegin = try slice(worker, from: "case \"decode_begin\":", to: "case \"decode_step\":")
+    // The one-forward/no-warmup property is also guarded by
+    // BenchmarkScriptTests.decodeMeasurementRunsSingleUnmemoizableSeedForward;
+    // this test intentionally supersets it (it additionally pins parent-timed,
+    // oracle-validated measurement) so the freeze guard stands on its own.
     // Exactly one whole-prompt forward, and no warmup pass to memoize against it.
     #expect(decodeBegin.components(separatedBy: "DeepSeekModel.logits(").count - 1 == 1)
     #expect(!decodeBegin.contains("warmupCache"))
@@ -118,5 +128,11 @@ func decodeValidationDelayHookDefaultsToNoOp() {
     // never speed it up, but the frozen baseline is measured at zero delay, so a
     // nonzero default here would mean the baseline and submissions were timed
     // through different decode loops.
+    //
+    // BenchmarkSupportTests.submissionValidationDelayDefaultsToZero asserts the
+    // same literal for a different reason (the general default of the hook). The
+    // re-assert here is intentional: this file is meant to be the single,
+    // self-contained guard for everything the frozen window depends on, so it
+    // does not rely on an unrelated test staying green.
     #expect(DeepSeekSubmissionControls.measuredDecodeDelayMilliseconds == 0)
 }
