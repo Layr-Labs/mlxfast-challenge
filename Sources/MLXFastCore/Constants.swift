@@ -77,4 +77,14 @@ public enum MLXFastConstants {
     public static let scoreDecodeSpeedupFloor = 0.95
     public static let defaultMaxTransformedWeightsBytes = 25 * 1024 * 1024 * 1024
     public static let defaultMaxSubmissionSourceBytes = 256 * 1024 * 1024
+    // Diagnostic (non-ranking) real-valued score fields are published rounded to
+    // this many significant figures. Submitted model code controls its own
+    // latency/memory, so every full-precision analog field it can influence
+    // (RAM, bandwidth, wall/preflight/correctness/TTFT seconds, hit rate) is a
+    // covert channel for exfiltrating the hidden prompt/golden it sees. Coarsening
+    // these -- which carry no ranking weight -- collapses each from ~30 bits to a
+    // few. The ranking fields (decode/prefill seconds-per-token and speedups) are
+    // left precise here on purpose; bounding that residual channel is a publishing/
+    // rate-limit decision on the scoring backend, not a repo-side change.
+    public static let publicDiagnosticSignificantFigures = 2
 }

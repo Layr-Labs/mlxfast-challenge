@@ -1542,23 +1542,115 @@ func combineParallelCorrectnessSumsSliceTimingIntoCorrectnessSeconds() throws {
         return try #require(metrics[key] as? Double)
     }
 
-    // Sidecars present: 120 + 95 must be added on top of machine1's gates-only 400.5.
+    // Sidecars present: 120 + 95 added on top of machine1's gates-only 400.5, then
+    // the final combined score is coarsened to 2 significant figures (615.5 -> 620)
+    // so the published artifact does not leak a fine-grained correctness-timing
+    // covert channel. checked_steps is an integer count and is left exact.
     try writeMachine("machine2", rangeStart: 0, rangeEnd: 32, sliceTiming: "{\"slice_seconds\":120}")
     try writeMachine("machine3", rangeStart: 32, rangeEnd: 64, sliceTiming: "{\"slice_seconds\":95}")
     #expect(try runCombiner(machineDirs: "machine2 machine3") == 0)
-    #expect(try combinedMetric("correctness_seconds") == 400.5 + 120 + 95)
+    #expect(try combinedMetric("correctness_seconds") == 620)
     #expect(try combinedMetric("checked_steps") == Double(50 + 64))
 
-    // Absent sidecars (the public probe workflow predates them) must still combine.
+    // Absent sidecars (the public probe workflow predates them) must still combine;
+    // 400.5 coarsens to 400.
     try writeMachine("machine4", rangeStart: 0, rangeEnd: 32, sliceTiming: nil)
     try writeMachine("machine5", rangeStart: 32, rangeEnd: 64, sliceTiming: nil)
     #expect(try runCombiner(machineDirs: "machine4 machine5") == 0)
-    #expect(try combinedMetric("correctness_seconds") == 400.5)
+    #expect(try combinedMetric("correctness_seconds") == 400)
 
     // A malformed sidecar is a real bug and must fail closed, not silently zero.
     try writeMachine("machine6", rangeStart: 0, rangeEnd: 32, sliceTiming: "{\"slice_seconds\":\"soon\"}")
     try writeMachine("machine7", rangeStart: 32, rangeEnd: 64, sliceTiming: "{\"slice_seconds\":95}")
     #expect(try runCombiner(machineDirs: "machine6 machine7") != 0)
+}
+
+// The published (combined) score is reassembled here by jq and re-derives some
+// diagnostics at full precision (expert_hit_rate) or reintroduces it
+// (correctness/expert_read seconds), so the combiner must apply the same 2-sig-fig
+// coarsening the Swift harness applies per machine -- otherwise the leaderboard
+// artifact still leaks a fine-grained timing/memory covert channel. Ranking fields
+// stay precise; validator ordering pairs stay ordered.
+@Test
+func sealedStdoutScoreIsCoarsenedLikeTheWrittenFile() throws {
+    // benchmark.sh rebuilds score.json from emitScorePayloadToStdout's output, so
+    // that emit -- not the discarded writeScorePayload file -- is the published
+    // per-machine artifact. It must apply the same diagnostic coarsening, or the
+    // covert-channel mitigation is bypassed on the sealed path.
+    let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
+    let start = try #require(cli.range(of: "private static func emitScorePayloadToStdout"))
+    let body = String(cli[start.lowerBound...].prefix(700))
+    #expect(body.contains("withCoarsenedPublicDiagnostics()"))
+}
+
+@Test
+func combineParallelCorrectnessCoarsensPublishedDiagnostics() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    func writeSlice(_ name: String, rangeStart: Int, rangeEnd: Int) throws {
+        let dir = root.appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try "sharedhash".write(to: dir.appendingPathComponent("weights.sha256"), atomically: true, encoding: .utf8)
+        try "{\"step_range_start\": \(rangeStart), \"step_range_end\": \(rangeEnd)}"
+            .write(to: dir.appendingPathComponent("step-range.json"), atomically: true, encoding: .utf8)
+        try "{\"passed\": true, \"checked_steps\": \(rangeEnd - rangeStart), \"first_failing_step\": null}"
+            .write(to: dir.appendingPathComponent("correctness-report.json"), atomically: true, encoding: .utf8)
+    }
+
+    try FileManager.default.createDirectory(at: root.appendingPathComponent("machine1"), withIntermediateDirectories: true)
+    try "sharedhash".write(to: root.appendingPathComponent("machine1/weights.sha256"), atomically: true, encoding: .utf8)
+    // machine1 carries full-precision diagnostics AND a ranking field.
+    try """
+    {"score": 2.0142336773, "passed": true, "metrics": {
+      "passed_correctness": true, "checked_steps": 50, "correctness_seconds": 400,
+      "case_count": 6, "first_failing_case": null, "first_failing_step": null,
+      "decode_speedup": 2.0142336773, "peak_ram_gb": 15.927597,
+      "benchmark_wall_seconds": 484.7341, "timed_benchmark_seconds": 283.10626,
+      "gpqa_ttft_p50_seconds": 59.6692053, "gpqa_ttft_max_seconds": 63.3736865,
+      "expert_hit_rate": 0.173790069 }}
+    """.write(to: root.appendingPathComponent("machine1/score.json"), atomically: true, encoding: .utf8)
+
+    try writeSlice("machine2", rangeStart: 0, rangeEnd: 32)
+    try writeSlice("machine3", rangeStart: 32, rangeEnd: 64)
+
+    let scriptPath = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent(".github/scripts/combine-parallel-correctness.sh").path
+    let combinedPath = root.appendingPathComponent("score.combined.json")
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = [scriptPath]
+    process.currentDirectoryURL = root
+    process.environment = [
+        "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",
+        "MLXFAST_MACHINE1_DIR": "machine1",
+        "MLXFAST_CORRECTNESS_MACHINE_DIRS": "machine2 machine3",
+        "MLXFAST_EXPECTED_CORRECTNESS_STEPS": "64",
+        "MLXFAST_COMBINED_SCORE_PATH": combinedPath.path,
+    ]
+    process.standardOutput = Pipe()
+    process.standardError = Pipe()
+    try process.run()
+    process.waitUntilExit()
+    #expect(process.terminationStatus == 0)
+
+    let object = try JSONSerialization.jsonObject(with: Data(contentsOf: combinedPath))
+    let metrics = try #require((object as? [String: Any])?["metrics"] as? [String: Any])
+    func number(_ key: String) throws -> Double { try #require(metrics[key] as? Double) }
+
+    // Diagnostics coarsened to 2 significant figures.
+    #expect(try number("peak_ram_gb") == 16)
+    #expect(try number("benchmark_wall_seconds") == 480)
+    #expect(try number("timed_benchmark_seconds") == 280)
+    #expect(try number("gpqa_ttft_p50_seconds") == 60)
+    #expect(try number("gpqa_ttft_max_seconds") == 63)
+    #expect(try number("expert_hit_rate") == 0.17)
+    // Ranking field left precise.
+    #expect(try number("decode_speedup") == 2.0142336773)
+    // Ordering invariants the artifact validator asserts survive rounding.
+    #expect(try number("benchmark_wall_seconds") >= number("timed_benchmark_seconds"))
+    #expect(try number("gpqa_ttft_max_seconds") >= number("gpqa_ttft_p50_seconds"))
 }
 
 @Test

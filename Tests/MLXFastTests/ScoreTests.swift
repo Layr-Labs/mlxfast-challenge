@@ -119,7 +119,7 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
                 gpqaTTFTPassed: true,
                 gpqaTTFTPassCount: 9,
                 gpqaTTFTCaseCount: 9,
-                gpqaTTFTSeconds: 72.5,
+                gpqaTTFTSeconds: 72,
                 gpqaTTFTP50Seconds: 72,
                 gpqaTTFTMaxSeconds: 75,
                 gpqaTTFTSource: "hidden_gpqa_first_token",
@@ -138,7 +138,7 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
                 expertBytesRead: 1024,
                 expertReadSeconds: 0.25,
                 expertPeakCachedTensors: 4,
-                expertHitRate: 0.375,
+                expertHitRate: 0.38,
                 firstFailingLayer: nil,
                 firstFailingCase: "case-b",
                 firstFailingStep: 12,
@@ -178,7 +178,7 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(raw.contains("\"expert_bytes_read\" : 1024"))
     #expect(raw.contains("\"expert_read_seconds\" : 0.25"))
     #expect(raw.contains("\"expert_peak_cached_tensors\" : 4"))
-    #expect(raw.contains("\"expert_hit_rate\" : 0.375"))
+    #expect(raw.contains("\"expert_hit_rate\" : 0.38"))
     #expect(raw.contains("\"golden_hash\" : \"golden-hash\""))
     #expect(raw.contains("\"weights_hash\" : \"weights-hash\""))
     #expect(raw.contains("\"weights_byte_count\" : 4096"))
@@ -199,7 +199,7 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(raw.contains("\"gpqa_ttft_passed\" : true"))
     #expect(raw.contains("\"gpqa_ttft_pass_count\" : 9"))
     #expect(raw.contains("\"gpqa_ttft_case_count\" : 9"))
-    #expect(raw.contains("\"gpqa_ttft_seconds\" : 72.5"))
+    #expect(raw.contains("\"gpqa_ttft_seconds\" : 72"))
     #expect(raw.contains("\"gpqa_ttft_p50_seconds\" : 72"))
     #expect(raw.contains("\"gpqa_ttft_max_seconds\" : 75"))
     #expect(raw.contains("\"gpqa_ttft_source\" : \"hidden_gpqa_first_token\""))
@@ -221,7 +221,7 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(decoded.metrics.expertBytesRead == 1024)
     #expect(decoded.metrics.expertReadSeconds == 0.25)
     #expect(decoded.metrics.expertPeakCachedTensors == 4)
-    #expect(decoded.metrics.expertHitRate == 0.375)
+    #expect(decoded.metrics.expertHitRate == 0.38)
     #expect(decoded.metrics.goldenHash == "golden-hash")
     #expect(decoded.metrics.weightsHash == "weights-hash")
     #expect(decoded.metrics.weightsByteCount == 4096)
@@ -242,7 +242,7 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(decoded.metrics.gpqaTTFTPassed == true)
     #expect(decoded.metrics.gpqaTTFTPassCount == 9)
     #expect(decoded.metrics.gpqaTTFTCaseCount == 9)
-    #expect(decoded.metrics.gpqaTTFTSeconds == 72.5)
+    #expect(decoded.metrics.gpqaTTFTSeconds == 72)
     #expect(decoded.metrics.gpqaTTFTP50Seconds == 72)
     #expect(decoded.metrics.gpqaTTFTMaxSeconds == 75)
     #expect(decoded.metrics.gpqaTTFTSource == "hidden_gpqa_first_token")
@@ -251,6 +251,90 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(decoded.metrics.semanticGPQACaseCount == 9)
     #expect(decoded.metrics.semanticGPQAModel == "claude-sonnet-4-5-20250929")
     #expect(decoded.metrics.processResidentMemoryGB == 3.5)
+}
+
+@Test
+func publicDiagnosticsAreCoarsenedWhileRankingStaysPrecise() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("score.json")
+
+    try writeScorePayload(
+        ScorePayload(
+            score: 1.947063198,
+            passed: true,
+            metrics: ScoreMetrics(
+                peakRamGB: 15.927597,
+                bandwidthGBPerToken: 2.882812,
+                decodeSecondsPerToken: 2.0953410813828124,
+                prefillSecondsPerToken: 0.0985421517,
+                decodeSpeedup: 2.0142336773,
+                prefillSpeedup: 1.7586954276,
+                benchmarkWallSeconds: 484.7341,
+                preflightSeconds: 0.0270376,
+                correctnessSeconds: 1076.0285,
+                timedBenchmarkSeconds: 283.10626,
+                gpqaTTFTPassed: true,
+                gpqaTTFTPassCount: 5,
+                gpqaTTFTCaseCount: 5,
+                gpqaTTFTSeconds: 58.3755152,
+                gpqaTTFTP50Seconds: 59.6692053,
+                gpqaTTFTMaxSeconds: 63.3736865,
+                gpqaTTFTSource: "hidden_gpqa_first_token",
+                semanticGPQAPassed: true,
+                semanticGPQAPassCount: 3,
+                semanticGPQACaseCount: 5,
+                semanticGPQAModel: "m",
+                processResidentMemoryGB: 0.30030822,
+                passedCorrectness: true,
+                numLayers: MLXFastConstants.numHiddenLayers,
+                checkedSteps: 114,
+                caseCount: 6,
+                expertReadSeconds: 95.48715,
+                expertHitRate: 0.173790069,
+                firstFailingLayer: nil,
+                firstFailingCase: nil,
+                firstFailingStep: nil,
+                expectedToken: nil,
+                actualToken: nil,
+                maxAbsDiff: 0,
+                goldenHash: "g",
+                bandwidthSource: "trusted_core_expert_slot_bank_reads",
+                error: "",
+                commit: "c",
+                timestamp: "t",
+                harnessHash: "h",
+                runtime: "swift"
+            )
+        ),
+        to: path.path
+    )
+
+    let decoded = try JSONDecoder().decode(ScorePayload.self, from: Data(contentsOf: path))
+
+    // Ranking- and floor-critical fields are published at full precision so
+    // scoring, the speedup floor, and the parallel-combine merge are unaffected.
+    #expect(decoded.score == 1.947063198)
+    #expect(decoded.metrics.decodeSecondsPerToken == 2.0953410813828124)
+    #expect(decoded.metrics.prefillSecondsPerToken == 0.0985421517)
+    #expect(decoded.metrics.decodeSpeedup == 2.0142336773)
+    #expect(decoded.metrics.prefillSpeedup == 1.7586954276)
+
+    // Diagnostic analog fields are coarsened to 2 significant figures, shrinking
+    // the timing/memory covert channel submitted code can drive.
+    #expect(decoded.metrics.peakRamGB == 16)
+    #expect(decoded.metrics.bandwidthGBPerToken == 2.9)
+    #expect(decoded.metrics.benchmarkWallSeconds == 480)
+    #expect(decoded.metrics.correctnessSeconds == 1100)
+    #expect(decoded.metrics.timedBenchmarkSeconds == 280)
+    #expect(decoded.metrics.gpqaTTFTSeconds == 58)
+    #expect(decoded.metrics.gpqaTTFTP50Seconds == 60)
+    #expect(decoded.metrics.gpqaTTFTMaxSeconds == 63)
+    #expect(decoded.metrics.processResidentMemoryGB == 0.3)
+    #expect(decoded.metrics.expertReadSeconds == 95)
+
+    // Ordering invariants the artifact validators assert survive rounding.
+    #expect(decoded.metrics.benchmarkWallSeconds >= decoded.metrics.timedBenchmarkSeconds)
+    #expect(decoded.metrics.gpqaTTFTMaxSeconds >= decoded.metrics.gpqaTTFTP50Seconds)
 }
 
 @Test
