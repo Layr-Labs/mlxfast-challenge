@@ -6,19 +6,11 @@ public struct DeepSeekHeadHyperConnectionWeights {
     public let fn: MLXArray
     public let base: MLXArray
     public let scale: MLXArray
-    // Shared derived arrays; see DeepSeekHyperConnectionWeights. bf16->f32
-    // widening is exact, so passing the pre-widened arrays is value-identical.
-    public let fnTransposedF32: MLXArray
-    public let baseF32: MLXArray
-    public let scaleF32: MLXArray
 
     public init(fn: MLXArray, base: MLXArray, scale: MLXArray) {
         self.fn = fn
         self.base = base
         self.scale = scale
-        self.fnTransposedF32 = DeepSeekOps.cast(fn, to: .float32).T
-        self.baseF32 = DeepSeekOps.cast(base, to: .float32)
-        self.scaleF32 = DeepSeekOps.cast(scale, to: .float32)
     }
 }
 
@@ -128,37 +120,7 @@ public enum DeepSeekModel {
         let config = weightCache.config
         let spec = DeepSeekModelSpec(config: config)
         let weights = try weightCache.modelWeights()
-
-        // Whole-prompt forwards at offset 0 (length > 1) are memoized so an
-        // identical repeat — e.g. the worker's back-to-back warmup and seed
-        // passes at decode_begin — reuses the first pass's logits and KV
-        // state instead of recomputing the full forward. Only fires when a
-        // cache is present (so state can be restored for the following decode
-        // steps) and for single-batch prompts. The reused result is a pure
-        // function of the same inputs, so it is bit-identical.
-        var seedMemoKey: [Int32]?
-        if let cache,
-           positionOffset == 0,
-           inputIDs.shape.count == 2,
-           inputIDs.shape[0] == 1,
-           inputIDs.shape[1] > 1 {
-            let key = DeepSeekOps.cast(inputIDs, to: .int32).asArray(Int32.self)
-            if let reused = weightCache.reuseSeedForward(key: key, cache: cache) {
-                return reused
-            }
-            seedMemoKey = key
-        }
-
-        if inputIDs.shape == [1, 1] {
-            // Decode step: hash-layer routing depends only on the token id,
-            // so advise the kernel about those layers' expert ranges before
-            // the forward starts. inputIDs is a leaf array on every decode
-            // path, so this host read forces no GPU synchronization.
-            weightCache.prefetchHashLayerExperts(
-                token: Int(DeepSeekOps.cast(inputIDs, to: .int32).asArray(Int32.self)[0])
-            )
-        }
-        let result = try logits(
+        return try logits(
             inputIDs: inputIDs,
             weights: weights,
             spec: spec,
@@ -173,16 +135,6 @@ public enum DeepSeekModel {
                 positionOffset: positionOffset
             )
         }
-
-        if let seedMemoKey, let cache {
-            // Evaluate the logits and the freshly populated cache arrays before
-            // snapshotting so the memo holds materialized buffers that survive
-            // the MLX cache clear between the warmup and seed passes.
-            eval(result)
-            cache.materializeCachedState()
-            weightCache.storeSeedForward(key: seedMemoKey, logits: result, cache: cache)
-        }
-        return result
     }
 
     public static func logits(
@@ -227,9 +179,8 @@ public enum DeepSeekModel {
         let collapsed = try DeepSeekHyperConnection.head(
             hidden,
             fn: weights.headHyperConnection.fn,
-            fnTransposed: weights.headHyperConnection.fnTransposedF32,
-            base: weights.headHyperConnection.baseF32,
-            scale: weights.headHyperConnection.scaleF32,
+            base: weights.headHyperConnection.base,
+            scale: weights.headHyperConnection.scale,
             hcMult: spec.hcMult,
             eps: spec.hcEps,
             normEps: spec.rmsNormEps
@@ -303,20 +254,15 @@ public enum DeepSeekModel {
         let compressRatio = config.compressRatios[layerIndex]
         let blockWeights = try weightCache.blockWeights(layerIndex: layerIndex)
         let moeWeights = try weightCache.moeWeights(layerIndex: layerIndex)
-        let blockSpec = weightCache.blockSpec()
-        let moeSpec = try weightCache.moeSpec(layerIndex: layerIndex)
-        // Both attention paths rebuild their mask from the KV cache's key
-        // offset whenever a cache is present (DeepSeekLayerCache.local is
-        // non-optional), so this mask is consumed only on the cache-free path.
-        let mask = cache == nil
-            ? try DeepSeekMaskCache.causal(
-                queryLength: inputIDs.shape[1],
-                keyLength: inputIDs.shape[1],
-                queryOffset: positionOffset,
-                keyOffset: positionOffset,
-                windowSize: config.slidingWindow
-            )
-            : nil
+        let blockSpec = DeepSeekBlockSpec(config: config)
+        let moeSpec = try DeepSeekMoESpec(layerIndex: layerIndex, config: config)
+        let mask = try DeepSeekAttentionMask.causal(
+            queryLength: inputIDs.shape[1],
+            keyLength: inputIDs.shape[1],
+            queryOffset: positionOffset,
+            keyOffset: positionOffset,
+            windowSize: config.slidingWindow
+        )
 
         return try DeepSeekBlock.forward(
             hidden: hidden,
@@ -328,7 +274,7 @@ public enum DeepSeekModel {
                     return try DeepSeekLocalAttention.forward(
                         normalized,
                         weights: weightCache.localAttentionWeights(layerIndex: layerIndex),
-                        spec: weightCache.localAttentionSpec(),
+                        spec: DeepSeekLocalAttentionSpec(config: config),
                         mask: mask,
                         cache: cache?.local,
                         windowSize: config.slidingWindow,
@@ -338,7 +284,7 @@ public enum DeepSeekModel {
                     return try DeepSeekCompressedAttention.forward(
                         normalized,
                         weights: weightCache.compressedAttentionWeights(layerIndex: layerIndex),
-                        spec: weightCache.compressedAttentionSpec(layerIndex: layerIndex),
+                        spec: DeepSeekCompressedAttentionSpec(config: config, layerIndex: layerIndex),
                         mask: mask,
                         cache: cache,
                         windowSize: config.slidingWindow,

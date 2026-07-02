@@ -58,22 +58,6 @@ public final class DeepSeekLocalKVCache {
     func arraysForMaterialization() -> [MLXArray] {
         kv.map { [$0] } ?? []
     }
-
-    public struct Snapshot {
-        let kv: MLXArray?
-        let offset: Int
-        let startPosition: Int
-    }
-
-    func snapshot() -> Snapshot {
-        Snapshot(kv: kv, offset: offset, startPosition: startPosition)
-    }
-
-    func restore(_ snapshot: Snapshot) {
-        kv = snapshot.kv
-        offset = snapshot.offset
-        startPosition = snapshot.startPosition
-    }
 }
 
 public struct DeepSeekPoolingWindow {
@@ -171,22 +155,6 @@ public final class DeepSeekPoolingCache {
     func arraysForMaterialization() -> [MLXArray] {
         [bufferedKV, bufferedGate, pooled].compactMap { $0 }
     }
-
-    public struct Snapshot {
-        let bufferedKV: MLXArray?
-        let bufferedGate: MLXArray?
-        let pooled: MLXArray?
-    }
-
-    func snapshot() -> Snapshot {
-        Snapshot(bufferedKV: bufferedKV, bufferedGate: bufferedGate, pooled: pooled)
-    }
-
-    func restore(_ snapshot: Snapshot) {
-        bufferedKV = snapshot.bufferedKV
-        bufferedGate = snapshot.bufferedGate
-        pooled = snapshot.pooled
-    }
 }
 
 public final class DeepSeekLayerCache {
@@ -204,30 +172,6 @@ public final class DeepSeekLayerCache {
         local.arraysForMaterialization()
             + (pooled?.arraysForMaterialization() ?? [])
             + (indexPooled?.arraysForMaterialization() ?? [])
-    }
-
-    public struct Snapshot {
-        let local: DeepSeekLocalKVCache.Snapshot
-        let pooled: DeepSeekPoolingCache.Snapshot?
-        let indexPooled: DeepSeekPoolingCache.Snapshot?
-    }
-
-    func snapshot() -> Snapshot {
-        Snapshot(
-            local: local.snapshot(),
-            pooled: pooled?.snapshot(),
-            indexPooled: indexPooled?.snapshot()
-        )
-    }
-
-    func restore(_ snapshot: Snapshot) {
-        local.restore(snapshot.local)
-        if let pooledSnapshot = snapshot.pooled {
-            pooled?.restore(pooledSnapshot)
-        }
-        if let indexSnapshot = snapshot.indexPooled {
-            indexPooled?.restore(indexSnapshot)
-        }
     }
 }
 
@@ -252,29 +196,5 @@ public final class DeepSeekModelCache {
         for array in arraysForMaterialization() {
             eval(array)
         }
-    }
-
-    public struct Snapshot {
-        let layers: [DeepSeekLayerCache.Snapshot]
-    }
-
-    /// Captures every layer's KV/pooling state. The caller is responsible for
-    /// having evaluated the arrays first (see `materializeCachedState`) so the
-    /// snapshot holds materialized buffers that survive an MLX cache clear.
-    public func snapshot() -> Snapshot {
-        Snapshot(layers: layers.map { $0.snapshot() })
-    }
-
-    /// Overwrites this cache's per-layer state with a previously captured
-    /// snapshot. Requires the same layer count (same config), which holds
-    /// because both caches are built from the worker's single config.
-    public func restore(_ snapshot: Snapshot) -> Bool {
-        guard snapshot.layers.count == layers.count else {
-            return false
-        }
-        for (layer, layerSnapshot) in zip(layers, snapshot.layers) {
-            layer.restore(layerSnapshot)
-        }
-        return true
     }
 }

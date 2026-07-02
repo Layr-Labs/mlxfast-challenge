@@ -55,129 +55,60 @@ public enum DeepSeekRoutedExperts {
         let batchSize = x.shape[0]
         let sequenceLength = x.shape[1]
         let topK = expertIndices.shape[2]
-        let hiddenSize = spec.hiddenSize
-        let tokenCount = batchSize * sequenceLength
-
-        // Prefill-shaped calls touch essentially every expert, so schedule
-        // whole-stacked-tensor staging for this layer (and the next) BEFORE
-        // the routing sync below: the sequential ~1 GiB reads then overlap
-        // the GPU drain instead of following it. Staging needs no routing
-        // indices, and a failed stage falls back to the per-slice path.
-        var stagingScheduled = false
-        if tokenCount >= stagingMinimumTokenCount,
-           let stager = loader.expertLayerStager,
-           let plan = loader.stagedExpertLayerPlan(layerIndex: spec.layerIndex)
-        {
-            stager.schedule(plan)
-            if let nextPlan = loader.stagedExpertLayerPlan(layerIndex: spec.layerIndex + 1) {
-                stager.schedule(nextPlan)
-            }
-            stagingScheduled = true
-        }
-
         let selectedExperts = expertIndices.asArray(Int32.self).map(Int.init)
-        let useStaged = stagingScheduled
-            && loader.expertLayerStager?.waitForLayer(spec.layerIndex) == true
-        defer {
-            if useStaged {
-                loader.expertLayerStager?.releaseLayer(spec.layerIndex)
-            }
-        }
-        if !useStaged {
-            // Kernel read-ahead for every byte range this layer is about to
-            // pread, so SSD I/O overlaps the per-expert GPU compute below.
-            loader.expertPrefetcher.prefetch(layerIndex: spec.layerIndex, expertIndices: selectedExperts)
-        }
 
-        let outputCount = tokenCount * topK
+        let outputCount = batchSize * sequenceLength * topK
         guard outputCount > 0 else {
-            return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
+            return zeros([batchSize, sequenceLength, topK, spec.hiddenSize], dtype: x.dtype)
         }
 
-        // Group activation flat-indices by expert so each expert runs one batched
-        // matmul over all of its tokens instead of one matmul per token.
         var flatIndicesByExpert: [Int: [Int]] = [:]
         flatIndicesByExpert.reserveCapacity(min(outputCount, 256))
         for (flatIndex, expertIndex) in selectedExperts.enumerated() {
             flatIndicesByExpert[expertIndex, default: []].append(flatIndex)
         }
 
-        // Flatten the token axis once. Row (batch * sequenceLength + position)
-        // equals x[batch, position], so an activation flat index maps to token row
-        // flatIndex / topK. Gathering rows with a single `take` replaces the
-        // per-token slice+concat that built each expert batch previously.
-        let xFlat = x.reshaped([tokenCount, hiddenSize])
-
-        // Decode/1-token path: the per-expert code slices are otherwise read
-        // one blocking pread at a time on the compute thread. Read them
-        // concurrently up front through a capacity-0 side bank (byte-identical
-        // ranges), so the per-expert loop below builds its MLXArrays from
-        // already-fetched bytes instead of serializing on each pread. Anything
-        // not prefetched falls back to the normal per-expert bank read.
-        var decodePrefetch: [String: StagedExpertCode]?
-        if tokenCount == 1, !useStaged {
-            decodePrefetch = loader.prefetchDecodeExpertCodes(
-                layerIndex: spec.layerIndex,
-                expertIndices: Array(flatIndicesByExpert.keys),
-                hiddenSize: spec.hiddenSize,
-                intermediateSize: spec.intermediateSize
-            )
-        } else if useStaged {
-            // Prefill/warmup staged path: build the active experts' base
-            // MLXArrays from the staged layer buffer concurrently so the loop
-            // below skips the serial Data->Metal copy (same win as decode).
-            decodePrefetch = loader.prefetchStagedExpertCodes(
-                layerIndex: spec.layerIndex,
-                expertIndices: Array(flatIndicesByExpert.keys),
-                hiddenSize: spec.hiddenSize,
-                intermediateSize: spec.intermediateSize
-            )
-        }
-
-        var expertOutputs: [MLXArray] = []
-        expertOutputs.reserveCapacity(flatIndicesByExpert.count)
-        var scatterOrder: [Int] = []
-        scatterOrder.reserveCapacity(outputCount)
-
+        var outputs = Array<MLXArray?>(repeating: nil, count: outputCount)
         for (expertIndex, flatIndices) in flatIndicesByExpert {
             let expertWeights = try weights(
                 forExpert: expertIndex,
                 loader: loader,
-                spec: spec,
-                preferStaged: useStaged,
-                decodePrefetch: decodePrefetch
+                spec: spec
             )
-            let tokenRows = flatIndices.map { Int32($0 / topK) }
-            let tokens = xFlat.take(MLXArray(tokenRows), axis: 0)
+            let tokens = concatenated(
+                flatIndices.map { flatIndex in
+                    let tokenIndex = flatIndex / topK
+                    let batch = tokenIndex / sequenceLength
+                    let position = tokenIndex % sequenceLength
+                    return x[batch, position].reshaped([1, spec.hiddenSize])
+                },
+                axis: 0
+            )
             let expertOutput = DeepSeekMLP.forward(
                 tokens,
                 weights: expertWeights,
                 swigluLimit: spec.swigluLimit
             )
-            expertOutputs.append(expertOutput)
-            scatterOrder.append(contentsOf: flatIndices)
+            for (indexInExpertBatch, flatIndex) in flatIndices.enumerated() {
+                outputs[flatIndex] = expertOutput[indexInExpertBatch].reshaped([1, spec.hiddenSize])
+            }
         }
 
-        let combined = concatenated(expertOutputs, axis: 0)
-
-        // scatterOrder[row] is the activation flat index that produced combined
-        // row `row`. Invert it so a single gather places every output back into
-        // activation order, replacing the previous per-row scatter loop.
-        var inverse = [Int32](repeating: 0, count: outputCount)
-        for (row, flatIndex) in scatterOrder.enumerated() {
-            inverse[flatIndex] = Int32(row)
+        let orderedOutputs = try outputs.enumerated().map { flatIndex, output in
+            guard let output else {
+                throw MLXFastError.invalidInput("missing routed expert output at flat index \(flatIndex)")
+            }
+            return output
         }
-        let ordered = combined.take(MLXArray(inverse), axis: 0)
 
-        return ordered.reshaped([batchSize, sequenceLength, topK, hiddenSize])
+        return concatenated(orderedOutputs, axis: 0)
+            .reshaped([batchSize, sequenceLength, topK, spec.hiddenSize])
     }
 
     public static func weights(
         forExpert expertIndex: Int,
         loader: DeepSeekWeightLoader,
-        spec: DeepSeekRoutedExpertSpec,
-        preferStaged: Bool = false,
-        decodePrefetch: [String: StagedExpertCode]? = nil
+        spec: DeepSeekRoutedExpertSpec
     ) throws -> DeepSeekMLPWeights {
         try DeepSeekMLPWeights(
             gate: loader.expertLinearWeight(
@@ -187,9 +118,7 @@ public enum DeepSeekRoutedExperts {
                     projection: .gate
                 ),
                 expectedShape: [spec.intermediateSize, spec.hiddenSize],
-                expertIndex: expertIndex,
-                preferStaged: preferStaged,
-                decodePrefetch: decodePrefetch
+                expertIndex: expertIndex
             ),
             up: loader.expertLinearWeight(
                 candidates: DeepSeekWeightNames.routedExpert(
@@ -198,9 +127,7 @@ public enum DeepSeekRoutedExperts {
                     projection: .up
                 ),
                 expectedShape: [spec.intermediateSize, spec.hiddenSize],
-                expertIndex: expertIndex,
-                preferStaged: preferStaged,
-                decodePrefetch: decodePrefetch
+                expertIndex: expertIndex
             ),
             down: loader.expertLinearWeight(
                 candidates: DeepSeekWeightNames.routedExpert(
@@ -209,17 +136,8 @@ public enum DeepSeekRoutedExperts {
                     projection: .down
                 ),
                 expectedShape: [spec.hiddenSize, spec.intermediateSize],
-                expertIndex: expertIndex,
-                preferStaged: preferStaged,
-                decodePrefetch: decodePrefetch
+                expertIndex: expertIndex
             )
         )
     }
 }
-
-/// Below this many tokens the unique-expert count is small enough that
-/// per-slice streaming reads less than a whole stacked tensor; decode and the
-/// hidden one-token gates stay on the existing path. At 64 tokens (384
-/// activations) the expected unique-expert coverage already exceeds 3/4 of
-/// the stack, and the scored 512-token prefills touch essentially all of it.
-private let stagingMinimumTokenCount = 64
