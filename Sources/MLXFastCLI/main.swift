@@ -337,7 +337,7 @@ private enum MLXFastCLI {
                 worker: try runtimeWorkerOptions(blockedGoldenPath: goldenPath)
             )
             try writeScorePayload(payload, to: scorePath)
-            try printScorePayload(at: scorePath)
+            try emitScorePayloadToStdout(payload)
             return
         }
         let semanticOutputPath = environmentValue("MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH", fallback: "")
@@ -393,19 +393,24 @@ private enum MLXFastCLI {
             worker: try runtimeWorkerOptions(blockedGoldenPath: goldenPath)
         )
         try writeScorePayload(payload, to: scorePath)
-        if localSubmit {
-            try printScorePayload(at: scorePath)
-        } else {
-            print("wrote \(scorePath)")
-        }
+        try emitScorePayloadToStdout(payload)
+        fputs("wrote \(scorePath)\n", stderr)
     }
 
-    private static func printScorePayload(at path: String) throws {
-        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+    // Emits the in-memory payload, not a re-read of scorePath: the benchmark
+    // process links the editable submission modules and runs unsandboxed, so a
+    // file it wrote to scorePath could be tampered with (e.g. via an atexit
+    // handler) between the write above and this call. Serializing the value
+    // already held in memory means stdout reflects exactly what this trusted
+    // process computed, independent of anything written to disk afterward.
+    // benchmark.sh captures this stdout, after the process has fully exited, as
+    // the sole source of truth for score.json.
+    private static func emitScorePayloadToStdout(_ payload: ScorePayload) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        let data = try encoder.encode(payload)
         FileHandle.standardOutput.write(data)
-        if data.last != 0x0a {
-            print("")
-        }
+        if data.last != 0x0a { print("") }
     }
 
     private static func runAttachGPQAGates(_ options: ParsedOptions) throws {

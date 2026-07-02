@@ -16,6 +16,18 @@ extension DeepSeekRuntime {
             weightsPath: weightsPath,
             expertStreamingConfig: ExpertStreamingConfig.fromEnvironment(recordsMetricsDefault: true)
         )
+        // Validate transformed-weight structure HERE, inside the sandboxed worker,
+        // rather than in the trusted parent. These checks execute editable
+        // MLXFastModel code (DenseTensorStore / DeepSeekWeightLoader) and read the
+        // expert manifest; the parent used to run the equivalent via
+        // BenchmarkPreflight.check, which meant submitted code ran in the
+        // unsandboxed process that authors score.json. Failing here throws before
+        // the protocol hello below, so the parent's worker client sees the worker
+        // fail to start and records a failed benchmark -- same coverage, no
+        // submitted code in the score-writing parent.
+        try loader.denseStore.validateReadableByteRanges()
+        try loader.expertBank.validateReadableByteRanges()
+        try loader.validateRequiredMetadata(config: config)
         let weightCache = DeepSeekRuntimeWeightCache(loader: loader, config: config)
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()

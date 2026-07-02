@@ -1066,7 +1066,14 @@ func benchmarkTimingChargesDecodeSetupAndSeparatesWorkers() throws {
     #expect(workerRuntime.contains("let ttftStart = DispatchTime.now().uptimeNanoseconds"))
     #expect(workerRuntime.contains("let ttftSeconds = secondsSince(ttftStart)"))
     #expect(!workerRuntime.contains("ttftSeconds: beginResponse.seconds"))
-    #expect(workerRuntime.contains("_ = try BenchmarkPreflight.check("))
+    // benchmarkWithWorker's preflight must not call BenchmarkPreflight.check --
+    // that helper loads DeepSeekConfig/DenseTensorStore/DeepSeekWeightLoader
+    // (editable MLXFastModel code) in this trusted, unsandboxed parent process.
+    // checkWorkerBenchmarkInputs is model-free: it only checks that required
+    // artifact paths exist, and lets the sandboxed worker itself validate
+    // config/dense/expert metadata when it starts.
+    #expect(!workerRuntime.contains("_ = try BenchmarkPreflight.check("))
+    #expect(workerRuntime.contains("try checkWorkerBenchmarkInputs("))
 
     let preflightRange = try #require(workerRuntime.range(of: "progress(\"preflight start\")"))
     let timedBenchmarkRange = try #require(workerRuntime.range(of: "progress(\"timed benchmark start\")"))
@@ -1547,6 +1554,34 @@ func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
 }
 
 @Test
+func runtimeWorkerValidatesTransformedWeightsAtStartup() throws {
+    let worker = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntimeWorker.swift",
+        encoding: .utf8
+    )
+    // The structural validation BenchmarkPreflight.check used to run in the
+    // trusted parent (which links editable MLXFastModel code) now runs inside the
+    // sandboxed worker at startup, before the protocol hello. This keeps the
+    // coverage without executing submitted code in the score-writing process.
+    let runWorkerStart = try #require(worker.range(of: "public static func runWorker"))
+    let helloAnchor = try #require(worker.range(of: "RuntimeWorkerResponse(\n            id: 0,"))
+    let startup = String(worker[runWorkerStart.lowerBound..<helloAnchor.lowerBound])
+    #expect(startup.contains("try loader.denseStore.validateReadableByteRanges()"))
+    #expect(startup.contains("try loader.expertBank.validateReadableByteRanges()"))
+    #expect(startup.contains("try loader.validateRequiredMetadata(config: config)"))
+
+    // The parent's worker decode path must not read the editable submission delay
+    // hook: DeepSeekSubmissionControls is editable MLXFastModel code and the worker
+    // itself already applies the delay inside its sandboxed decode step.
+    let runtime = try harnessRuntimeSource()
+    let decodeStart = try #require(runtime.range(of: "static func measureWorkerDecode"))
+    let decodeEnd = try #require(runtime.range(of: "static func expertStreamingBandwidthGBPerToken"))
+    let workerDecode = String(runtime[decodeStart.lowerBound..<decodeEnd.lowerBound])
+    #expect(!workerDecode.contains("submissionValidationDelayMilliseconds()"))
+    #expect(!workerDecode.contains("decode validation delay enabled"))
+}
+
+@Test
 func benchmarkLocalSubmitModeUsesLongLocalBenchmarkAndPrintsScore() throws {
     let contract = try String(
         contentsOfFile: "benchmark.json",
@@ -1579,7 +1614,7 @@ func benchmarkLocalSubmitModeUsesLongLocalBenchmarkAndPrintsScore() throws {
     #expect(cli.contains("timingRepeats: timingRepeats"))
     #expect(cli.contains("let runtime = localSubmit ? \"swift-local-submit\" : \"swift-local-iterate\""))
     #expect(cli.contains("DeepSeekRuntime.localIterate("))
-    #expect(cli.contains("printScorePayload(at: scorePath)"))
+    #expect(cli.contains("emitScorePayloadToStdout(payload)"))
     #expect(localRuntime.contains("runtime: runtime"))
     #expect(localRuntime.contains("modeName: String"))
     #expect(runtime.contains("correctness_steps=\\(options.correctnessSteps)"))
@@ -1659,18 +1694,13 @@ func benchmarkScriptForwardsLocalSubmitFlagToSwiftBenchmark() throws {
 
     let argLog = root.appendingPathComponent("args.txt")
     let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    // benchmark.sh now reconstructs score.json from the trusted process stdout
+    // (see emitScorePayloadToStdout), so the fake emits the payload there rather
+    // than writing the file itself.
     try """
     #!/bin/sh
     printf '%s\\n' "$@" > "\(argLog.path)"
-    score_path="score.json"
-    while [ "$#" -gt 0 ]; do
-      if [ "$1" = "--score-path" ]; then
-        shift
-        score_path="$1"
-      fi
-      shift || exit 1
-    done
-    cat > "$score_path" <<'JSON'
+    cat <<'JSON'
     {
       "score": 1,
       "passed": true,
@@ -1730,18 +1760,13 @@ func benchmarkScriptForwardsLocalIterateDefaultsToSwiftBenchmark() throws {
     let score = root.appendingPathComponent("score.local-iterate.json")
     let integrity = root.appendingPathComponent("benchmark-integrity.local-iterate.json")
     let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    // benchmark.sh now reconstructs score.json from the trusted process stdout
+    // (see emitScorePayloadToStdout), so the fake emits the payload there rather
+    // than writing the file itself.
     try """
     #!/bin/sh
     printf '%s\\n' "$@" > "\(argLog.path)"
-    score_path="score.json"
-    while [ "$#" -gt 0 ]; do
-      if [ "$1" = "--score-path" ]; then
-        shift
-        score_path="$1"
-      fi
-      shift || exit 1
-    done
-    cat > "$score_path" <<'JSON'
+    cat <<'JSON'
     {
       "score": null,
       "passed": true,
@@ -1835,17 +1860,12 @@ func benchmarkScriptFailsWhenScorePayloadFails() throws {
     try "{}".write(to: golden, atomically: true, encoding: .utf8)
 
     let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    // benchmark.sh reconstructs score.json from the trusted process stdout, so a
+    // failing payload must be emitted there for the post-hoc "passed": false gate
+    // to see it.
     try """
     #!/bin/sh
-    score_path="score.json"
-    while [ "$#" -gt 0 ]; do
-      if [ "$1" = "--score-path" ]; then
-        shift
-        score_path="$1"
-      fi
-      shift || exit 1
-    done
-    cat > "$score_path" <<'JSON'
+    cat <<'JSON'
     {
       "score": null,
       "passed": false,
@@ -1884,6 +1904,149 @@ func benchmarkScriptFailsWhenScorePayloadFails() throws {
     #expect(process.terminationStatus != 0)
     #expect(FileManager.default.fileExists(atPath: score.path))
     #expect(FileManager.default.fileExists(atPath: integrity.path))
+}
+
+@Test
+func benchmarkScriptSealsScoreFromStdoutDiscardingOnDiskTamper() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "{}".write(
+        to: weights.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+    let golden = root.appendingPathComponent("correctness_golden.json")
+    try "{}".write(to: golden, atomically: true, encoding: .utf8)
+
+    // The fake writes a TAMPERED score to the on-disk --score-path (score: 999,
+    // simulating an atexit rewrite by editable code running in the unsandboxed
+    // benchmark process) but emits the TRUSTED payload (score: 1) on stdout, the
+    // way the real emitScorePayloadToStdout does. benchmark.sh must rebuild
+    // score.json from stdout AFTER the process exits, so the tamper is discarded.
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    score_path="score.json"
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--score-path" ]; then
+        shift
+        score_path="$1"
+      fi
+      shift || exit 1
+    done
+    cat > "$score_path" <<'JSON'
+    {
+      "score": 999,
+      "passed": true,
+      "metrics": {
+        "weights_hash": "tampered",
+        "weights_file_count": 1,
+        "weights_byte_count": 2
+      }
+    }
+    JSON
+    cat <<'JSON'
+    {
+      "score": 1,
+      "passed": true,
+      "metrics": {
+        "weights_hash": "trusted",
+        "weights_file_count": 1,
+        "weights_byte_count": 2
+      }
+    }
+    JSON
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeSwift.path
+    )
+
+    let score = root.appendingPathComponent("score.json")
+    let integrity = root.appendingPathComponent("benchmark-integrity.json")
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = ["benchmark.sh"]
+    process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    process.environment = ProcessInfo.processInfo.environment.merging([
+        "MLXFAST_NO_SANDBOX": "1",
+        "MLXFAST_SKIP_TRANSFORM": "1",
+        "MLXFAST_SWIFT_BIN": fakeSwift.path,
+        "MLXFAST_WEIGHTS_PATH": weights.path,
+        "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
+        "MLXFAST_SCORE_PATH": score.path,
+        "MLXFAST_INTEGRITY_PATH": integrity.path,
+    ]) { _, new in new }
+
+    try process.run()
+    process.waitUntilExit()
+
+    #expect(process.terminationStatus == 0)
+    let sealed = try String(contentsOf: score, encoding: .utf8)
+    #expect(sealed.contains("\"score\": 1"))
+    #expect(sealed.contains("\"weights_hash\": \"trusted\""))
+    #expect(!sealed.contains("999"))
+    #expect(!sealed.contains("tampered"))
+}
+
+@Test
+func benchmarkScriptRejectsMultipleScoreObjectsOnStdout() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "{}".write(
+        to: weights.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+    let golden = root.appendingPathComponent("correctness_golden.json")
+    try "{}".write(to: golden, atomically: true, encoding: .utf8)
+
+    // Two concatenated score objects on stdout model an injected extra write
+    // trying to smuggle a second payload past the seal. benchmark.sh requires
+    // exactly one object and must fail closed.
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    cat <<'JSON'
+    {"score": 1, "passed": true, "metrics": {"weights_hash": "a", "weights_file_count": 1, "weights_byte_count": 2}}
+    {"score": 2, "passed": true, "metrics": {"weights_hash": "b", "weights_file_count": 1, "weights_byte_count": 2}}
+    JSON
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeSwift.path
+    )
+
+    let score = root.appendingPathComponent("score.json")
+    let integrity = root.appendingPathComponent("benchmark-integrity.json")
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = ["benchmark.sh"]
+    process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    process.environment = ProcessInfo.processInfo.environment.merging([
+        "MLXFAST_NO_SANDBOX": "1",
+        "MLXFAST_SKIP_TRANSFORM": "1",
+        "MLXFAST_SWIFT_BIN": fakeSwift.path,
+        "MLXFAST_WEIGHTS_PATH": weights.path,
+        "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
+        "MLXFAST_SCORE_PATH": score.path,
+        "MLXFAST_INTEGRITY_PATH": integrity.path,
+    ]) { _, new in new }
+
+    let stderr = Pipe()
+    process.standardError = stderr
+    try process.run()
+    process.waitUntilExit()
+
+    let error = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    #expect(process.terminationStatus != 0)
+    #expect(error.contains("did not emit a single valid score payload on stdout"))
 }
 
 @Test

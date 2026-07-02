@@ -345,15 +345,47 @@ fi
 
 rm -f "${SCORE_PATH}"
 
+# The Swift benchmark process links the editable model code paths, so any
+# score.json it leaves on disk is untrusted: submitted code running in that
+# unsandboxed process could overwrite the file (e.g. at exit) after the harness
+# wrote it. Capture the trusted score payload from the process stdout and, only
+# AFTER it has fully exited, re-materialize score.json from that payload here in
+# the trusted shell -- discarding any in-process tamper of the on-disk file.
+if ! command -v jq >/dev/null 2>&1; then
+  echo "benchmark.sh: jq is required to seal score.json from the benchmark process stdout" >&2
+  exit 1
+fi
+score_stdout="$(mktemp "${TMPDIR:-/tmp}/mlxfast-score.XXXXXX")"
+trap 'rm -f "${score_stdout}"' EXIT
+
 "${SWIFT_BIN}" benchmark \
   --weights "${WEIGHTS_PATH}" \
   --golden "${GOLDEN_PATH}" \
   --score-path "${SCORE_PATH}" \
-  "$@"
+  "$@" > "${score_stdout}"
+
+# Require exactly one JSON object shaped like a score payload; empty, non-JSON,
+# or multiple concatenated objects (an injected extra write) fail closed rather
+# than sealing an attacker-controlled or malformed score.
+if [[ "$(jq -s 'length' "${score_stdout}" 2>/dev/null)" != "1" ]] \
+    || ! jq -e '(.passed | type == "boolean") and has("score") and (.metrics | type == "object")' \
+        "${score_stdout}" >/dev/null 2>&1; then
+  echo "benchmark.sh: benchmark did not emit a single valid score payload on stdout" >&2
+  exit 1
+fi
+rm -f "${SCORE_PATH}"
+cp "${score_stdout}" "${SCORE_PATH}"
 
 if [[ ! -s "${SCORE_PATH}" ]]; then
   echo "benchmark.sh: benchmark did not produce ${SCORE_PATH}" >&2
   exit 1
+fi
+
+# stdout was redirected to capture the trusted payload above, so local modes
+# must explicitly replay it to the console to keep their existing behavior of
+# showing the score there.
+if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ]]; then
+  cat "${SCORE_PATH}"
 fi
 
 score_hash="$(shasum -a 256 "${SCORE_PATH}" | awk '{print $1}')"

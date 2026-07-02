@@ -400,7 +400,14 @@ extension DeepSeekRuntime {
             try validateBenchmarkOptions(options)
             progress("preflight start")
             let preflightStart = DispatchTime.now().uptimeNanoseconds
-            _ = try BenchmarkPreflight.check(
+            // Model-free preflight: verify required artifacts exist WITHOUT loading
+            // config/tensors here. BenchmarkPreflight.check() calls DeepSeekConfig.load,
+            // DenseTensorStore, and DeepSeekWeightLoader (all EDITABLE MLXFastModel code),
+            // which would execute submitted code in this trusted, unsandboxed parent. The
+            // sandboxed runtime worker loads and validates config/dense/expert metadata
+            // when it starts; malformed weights make it fail its protocol hello, surfacing
+            // as a failed benchmark.
+            try checkWorkerBenchmarkInputs(
                 weightsPath: options.weightsPath,
                 goldenPath: options.goldenPath
             )
@@ -967,10 +974,6 @@ extension DeepSeekRuntime {
 
         var actualTokens: [Int] = []
         actualTokens.reserveCapacity(decodeSteps)
-        let validationDelayMS = try submissionValidationDelayMilliseconds()
-        if validationDelayMS > 0 {
-            progress?("decode validation delay enabled milliseconds_per_token=\(validationDelayMS)")
-        }
         for decodedStep in 0..<decodeSteps {
             let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
             let response = try worker.decodeStep(inputToken: inputToken)
