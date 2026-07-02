@@ -550,6 +550,101 @@ extension ScorePayload {
     }
 }
 
+/// Monotone significant-figure rounding. Non-decreasing over the reals, so any
+/// ordering the scoring pipeline relies on (e.g. wall >= timed, ttft_max >= p50)
+/// is preserved when both sides are rounded to the same number of figures, and a
+/// positive value never rounds to zero (relative, not absolute, grid). Rounds via
+/// a formatted round-trip so the result is the clean nearest double to the
+/// N-significant-figure decimal (e.g. 0.38, not 0.38000000000000006) -- otherwise
+/// the low-order float noise would both survive into the JSON and hand back the
+/// precision this is meant to remove.
+public func roundedToSignificantFigures(_ value: Double, _ figures: Int) -> Double {
+    guard value.isFinite, value != 0, figures > 0 else {
+        return value
+    }
+    let formatted = String(format: "%.\(figures)g", locale: Locale(identifier: "en_US_POSIX"), value)
+    return Double(formatted) ?? value
+}
+
+extension ScoreMetrics {
+    /// Returns a copy with the diagnostic (non-ranking) real-valued fields rounded
+    /// to `figures` significant figures, to shrink the timing/memory covert channel
+    /// that submitted model code can drive. Ranking- and floor-critical fields
+    /// (decode/prefill seconds-per-token, speedups, floors, baselines) are left
+    /// untouched so scoring, the speedup-floor gate, and the parallel-combine merge
+    /// are all bit-unaffected. Ordering pairs the validators assert are re-clamped
+    /// after rounding as belt-and-suspenders.
+    public func withCoarsenedPublicDiagnostics(
+        figures: Int = MLXFastConstants.publicDiagnosticSignificantFigures
+    ) -> ScoreMetrics {
+        func r(_ value: Double) -> Double { roundedToSignificantFigures(value, figures) }
+
+        let roundedTimed = r(timedBenchmarkSeconds)
+        let roundedWall = max(r(benchmarkWallSeconds), roundedTimed)
+        let roundedP50 = r(gpqaTTFTP50Seconds)
+        let roundedTTFTMax = max(r(gpqaTTFTMaxSeconds), roundedP50)
+
+        return ScoreMetrics(
+            peakRamGB: r(peakRamGB),
+            bandwidthGBPerToken: r(bandwidthGBPerToken),
+            decodeSecondsPerToken: decodeSecondsPerToken,
+            prefillSecondsPerToken: prefillSecondsPerToken,
+            baselineDecodeSecondsPerToken: baselineDecodeSecondsPerToken,
+            baselinePrefillSecondsPerToken: baselinePrefillSecondsPerToken,
+            decodeSpeedup: decodeSpeedup,
+            prefillSpeedup: prefillSpeedup,
+            decodeSpeedupFloor: decodeSpeedupFloor,
+            prefillSpeedupFloor: prefillSpeedupFloor,
+            passedDecodeSpeedupFloor: passedDecodeSpeedupFloor,
+            passedPrefillSpeedupFloor: passedPrefillSpeedupFloor,
+            benchmarkWallSeconds: roundedWall,
+            preflightSeconds: r(preflightSeconds),
+            correctnessSeconds: r(correctnessSeconds),
+            timedBenchmarkSeconds: roundedTimed,
+            gpqaTTFTPassed: gpqaTTFTPassed,
+            gpqaTTFTPassCount: gpqaTTFTPassCount,
+            gpqaTTFTCaseCount: gpqaTTFTCaseCount,
+            gpqaTTFTSeconds: r(gpqaTTFTSeconds),
+            gpqaTTFTP50Seconds: roundedP50,
+            gpqaTTFTMaxSeconds: roundedTTFTMax,
+            gpqaTTFTSource: gpqaTTFTSource,
+            semanticGPQAPassed: semanticGPQAPassed,
+            semanticGPQAPassCount: semanticGPQAPassCount,
+            semanticGPQACaseCount: semanticGPQACaseCount,
+            semanticGPQAModel: semanticGPQAModel,
+            processResidentMemoryGB: r(processResidentMemoryGB),
+            passedCorrectness: passedCorrectness,
+            numLayers: numLayers,
+            checkedSteps: checkedSteps,
+            caseCount: caseCount,
+            expertCacheHits: expertCacheHits,
+            expertCacheMisses: expertCacheMisses,
+            expertCacheEvictions: expertCacheEvictions,
+            expertBytesRead: expertBytesRead,
+            expertReadSeconds: r(expertReadSeconds),
+            expertPeakCachedTensors: expertPeakCachedTensors,
+            expertHitRate: r(expertHitRate),
+            firstFailingLayer: firstFailingLayer,
+            firstFailingCase: firstFailingCase,
+            firstFailingStep: firstFailingStep,
+            expectedToken: expectedToken,
+            actualToken: actualToken,
+            maxAbsDiff: r(maxAbsDiff),
+            goldenHash: goldenHash,
+            bandwidthSource: bandwidthSource,
+            error: error,
+            commit: commit,
+            timestamp: timestamp,
+            harnessHash: harnessHash,
+            weightsHash: weightsHash,
+            weightsByteCount: weightsByteCount,
+            weightsFileCount: weightsFileCount,
+            runtime: runtime,
+            partialResult: partialResult
+        )
+    }
+}
+
 public func writeScorePayload(_ payload: ScorePayload, to path: String) throws {
     let url = URL(fileURLWithPath: path)
     let parent = url.deletingLastPathComponent()
@@ -560,8 +655,18 @@ public func writeScorePayload(_ payload: ScorePayload, to path: String) throws {
         )
     }
 
+    // Coarsen diagnostic analog fields before the payload is written/published so
+    // submitted model code cannot use them as a fine-grained timing/memory covert
+    // channel. Ranking fields are unchanged, so scoring and downstream validation
+    // are unaffected.
+    let publishedPayload = ScorePayload(
+        score: payload.score,
+        passed: payload.passed,
+        metrics: payload.metrics.withCoarsenedPublicDiagnostics()
+    )
+
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-    let data = try encoder.encode(payload)
+    let data = try encoder.encode(publishedPayload)
     try data.write(to: url)
 }
