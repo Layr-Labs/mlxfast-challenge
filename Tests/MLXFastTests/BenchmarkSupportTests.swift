@@ -229,6 +229,41 @@ func submissionValidationDelayDefaultsToZero() throws {
 }
 
 @Test
+func seedForwardExpertReadGateFlagsBypassedForward() throws {
+    // A real seed prefill reads far more expert bytes than one decode step: passes.
+    try DeepSeekRuntime.requirePlausibleSeedForwardExpertReads(
+        seedForwardBytesRead: 40 * (1 << 30),
+        decodeStepsBytesRead: 128 * (1 << 30),
+        decodeSteps: 128
+    )
+    // A seed served from an in-process memo reads ~0 expert bytes while the
+    // decode steps still stream: must be flagged.
+    #expect(throws: MLXFastError.self) {
+        try DeepSeekRuntime.requirePlausibleSeedForwardExpertReads(
+            seedForwardBytesRead: 0,
+            decodeStepsBytesRead: 128 * (1 << 30),
+            decodeSteps: 128
+        )
+    }
+    // A seed that read something but still below a single decode step's bytes is
+    // implausible for a 512-token forward: flagged.
+    #expect(throws: MLXFastError.self) {
+        try DeepSeekRuntime.requirePlausibleSeedForwardExpertReads(
+            seedForwardBytesRead: (1 << 30) - 1,
+            decodeStepsBytesRead: 128 * (1 << 30),
+            decodeSteps: 128
+        )
+    }
+    #expect(throws: MLXFastError.self) {
+        try DeepSeekRuntime.requirePlausibleSeedForwardExpertReads(
+            seedForwardBytesRead: 1,
+            decodeStepsBytesRead: 0,
+            decodeSteps: 0
+        )
+    }
+}
+
+@Test
 func benchmarkPromptPlanUsesHiddenBenchmarkOracle() throws {
     let prefill = Array(0..<MLXFastConstants.benchmarkPrefillPromptTokens)
     let seed = Array(0..<MLXFastConstants.benchmarkDecodeSeedTokens)

@@ -24,10 +24,16 @@ extension DeepSeekRuntime {
         // future request nonces or spoof JSON responses with normal stdio.
         let protocolIO = try RuntimeWorkerProtocolIO.isolatingStandardIO()
         let sessionNonce = generateRuntimeWorkerNonce()
+        // Report the expert-streaming counters as they stand BEFORE any forward
+        // runs. The parent uses this as the baseline for the seed prefill's
+        // incremental reads (see requirePlausibleSeedForwardExpertReads), so a
+        // submission cannot pre-stream experts at startup to inflate the cumulative
+        // counter and disguise a memoized/replayed seed forward as real work.
         try protocolIO.writeLine(try encoder.encode(RuntimeWorkerResponse(
             id: 0,
             nonce: sessionNonce,
-            ok: true
+            ok: true,
+            expertStats: expertStats(from: weightCache)
         )))
         var state = RuntimeWorkerState()
 
@@ -417,6 +423,9 @@ final class RuntimeWorkerClient {
     private var sessionNonce = ""
     private var nextID = 1
     private var closed = false
+    // Expert-streaming counters reported in the worker's protocol hello, before
+    // any forward has run. Baseline for the seed prefill's incremental reads.
+    private(set) var initialExpertStats: ExpertStreamingStats?
 
     init(options: RuntimeWorkerOptions, weightsPath: String) throws {
         let process = Process()
@@ -456,6 +465,7 @@ final class RuntimeWorkerClient {
             throw MLXFastError.invalidInput("runtime worker did not return a valid protocol hello")
         }
         self.sessionNonce = nonce
+        self.initialExpertStats = hello.expertStats
     }
 
     deinit {

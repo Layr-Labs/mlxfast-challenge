@@ -1007,6 +1007,28 @@ extension DeepSeekRuntime {
             after: expertStats,
             decodedTokens: decodeSteps
         )
+        // Physical-plausibility gate on the trusted expert-read counter. The seed
+        // prefill forwards every prompt token through the MoE, so its incremental
+        // reads cannot be below a single decode step's. A value at/near zero means
+        // the seed's logits+KV were served from an unaccounted in-process memo or
+        // replay instead of the trusted expert-streaming path -- the class of
+        // bypass submissions/0ddfcd37 used. Measured as the delta between the
+        // worker's pre-forward hello baseline and its post-seed counter, so a
+        // submission cannot pre-stream at startup to hide a memoized seed.
+        let initialExpertBytes = worker.initialExpertStats?.bytesRead ?? 0
+        let seedCumulativeBytes = statsBeforeDecode?.bytesRead ?? 0
+        let finalCumulativeBytes = expertStats.bytesRead
+        let seedForwardBytesRead = seedCumulativeBytes >= initialExpertBytes
+            ? seedCumulativeBytes - initialExpertBytes
+            : seedCumulativeBytes
+        let decodeStepsBytesRead = finalCumulativeBytes >= seedCumulativeBytes
+            ? finalCumulativeBytes - seedCumulativeBytes
+            : finalCumulativeBytes
+        try requirePlausibleSeedForwardExpertReads(
+            seedForwardBytesRead: seedForwardBytesRead,
+            decodeStepsBytesRead: decodeStepsBytesRead,
+            decodeSteps: decodeSteps
+        )
         let measuredSeconds = secondsSince(decodePhaseStart)
         let secondsPerToken = measuredSeconds / Double(decodeSteps)
         let actualTokensComparison = BenchmarkOutputValidator.compareDecodeTokens(
@@ -1025,6 +1047,32 @@ extension DeepSeekRuntime {
             bandwidthGBPerToken: bandwidth.gbPerToken,
             bandwidthSource: bandwidth.source
         )
+    }
+
+    // Physical-plausibility gate: a whole-prompt seed forward routes every prompt
+    // token through the MoE and therefore cannot read fewer expert bytes than a
+    // single-token decode step (in practice it reads far more, since a full prompt
+    // routes to many more unique experts per layer than one token does). A value
+    // below that floor means the seed forward's outputs were served from an
+    // unaccounted in-process memo/replay rather than the trusted expert-streaming
+    // path. Both inputs come from the trusted core's byte counter, which submitted
+    // code running in the sandboxed worker cannot fake. Pure/integer-only so it is
+    // unit-testable without MLX.
+    static func requirePlausibleSeedForwardExpertReads(
+        seedForwardBytesRead: UInt64,
+        decodeStepsBytesRead: UInt64,
+        decodeSteps: Int
+    ) throws {
+        guard decodeSteps > 0 else {
+            throw MLXFastError.invalidInput("benchmark decode steps must be positive")
+        }
+        let perStepBytesRead = decodeStepsBytesRead / UInt64(decodeSteps)
+        guard seedForwardBytesRead >= perStepBytesRead else {
+            throw MLXFastError.invalidInput(
+                "seed prefill read \(seedForwardBytesRead) expert bytes, below one decode step's "
+                    + "\(perStepBytesRead); the seed forward bypassed the trusted expert-streaming path"
+            )
+        }
     }
 
     static func expertStreamingBandwidthGBPerToken(
