@@ -39,6 +39,9 @@ private enum MLXFastCLI {
             case "attach-gpqa-gates":
                 try runAttachGPQAGates(options)
                 return 0
+            case "attach-free-run-gate":
+                try runAttachFreeRunGate(options)
+                return 0
             case "generate-gpqa-answers":
                 try runGenerateGPQAAnswers(options)
                 return 0
@@ -528,6 +531,159 @@ private enum MLXFastCLI {
             "attached GPQA behavior gates cases=\(behaviorCases.count) "
                 + "max_new_tokens=\(maxNewTokens) "
                 + "skipped_over_budget=\(skippedOverBudgetGPQACases) "
+                + "output=\(outputPath)"
+        )
+    }
+
+    // Operator tool: attach a free-run gate whose greedy continuation covers the
+    // timed decode offset range. The 64-step teacher-forced base case only
+    // exercises single-token forwards at offsets 512..575, while the timed
+    // decode reaches 512..639 -- a submission could special-case a cheaper model
+    // path for offsets only the (identifiable) timing worker ever visits and no
+    // structural gate would notice. A 512-token free-run case with >= 128
+    // generated-and-checked steps makes the unscored correctness gate exercise
+    // every timed decode offset with different prompt content, so an
+    // offset-gated fast path has to survive correctness too. Run this offline
+    // against the baseline reference weights, then upload the regenerated
+    // golden through the organizer process (docs/private-benchmark-security.md).
+    private static func runAttachFreeRunGate(_ options: ParsedOptions) throws {
+        try options.validate(
+            valueOptions: [
+                "--golden", "--weights", "--output", "--name", "--steps",
+                "--case", "--prompt-file", "--tokenizer", "--exact-prefix",
+            ]
+        )
+        let goldenPath = options.value(
+            for: "--golden",
+            default: environmentValue(
+                "MLXFAST_CORRECTNESS_GOLDEN_PATH",
+                fallback: MLXFastConstants.defaultGoldenPath
+            )
+        )
+        let weightsPath = options.value(
+            for: "--weights",
+            default: environmentValue("MLXFAST_WEIGHTS_PATH", fallback: MLXFastConstants.defaultWeightsPath)
+        )
+        let outputPath = options.value(for: "--output", default: goldenPath)
+        let caseName = options.value(for: "--name", default: "free-run-decode-offset-coverage")
+        let steps = try parsePositiveInt(
+            options.value(for: "--steps", default: "\(MLXFastConstants.benchmarkDecodeSteps)"),
+            optionName: "--steps"
+        )
+        guard steps <= MLXFastConstants.correctnessMaxFreeRunSteps else {
+            throw MLXFastError.invalidInput(
+                "--steps must be <= \(MLXFastConstants.correctnessMaxFreeRunSteps)"
+            )
+        }
+        if steps < MLXFastConstants.benchmarkDecodeSteps {
+            fputs(
+                "attach-free-run-gate: warning: --steps \(steps) is below "
+                    + "benchmarkDecodeSteps \(MLXFastConstants.benchmarkDecodeSteps); "
+                    + "the gate will not cover the full timed decode offset range\n",
+                stderr
+            )
+        }
+        let exactPrefixRaw = options.value(for: "--exact-prefix", default: "")
+        var exactPrefixTokens: Int?
+        if !exactPrefixRaw.isEmpty {
+            let parsed = try parsePositiveInt(exactPrefixRaw, optionName: "--exact-prefix")
+            guard parsed <= steps else {
+                throw MLXFastError.invalidInput("--exact-prefix must be <= --steps (\(steps))")
+            }
+            exactPrefixTokens = parsed
+        }
+
+        try requireFile(goldenPath, description: "correctness golden file")
+        try requireFile(
+            URL(fileURLWithPath: weightsPath).appendingPathComponent("config.json").path,
+            description: "weights config.json"
+        )
+        let goldenData = try Data(contentsOf: URL(fileURLWithPath: goldenPath))
+        let golden = try JSONDecoder().decode(GoldenDocument.self, from: goldenData)
+
+        let requiredPromptTokens = MLXFastConstants.correctnessPromptTokens
+        let promptTokens: [Int]
+        let promptFile = options.value(for: "--prompt-file", default: "")
+        let sourceCaseName = options.value(for: "--case", default: "")
+        if !promptFile.isEmpty {
+            let tokenizerPath = options.value(for: "--tokenizer", default: weightsPath)
+            try requireFile(
+                URL(fileURLWithPath: tokenizerPath).appendingPathComponent("tokenizer.json").path,
+                description: "tokenizer.json"
+            )
+            let tokenizer = try loadLocalTokenizer(at: tokenizerPath)
+            let promptText = try String(contentsOfFile: promptFile, encoding: .utf8)
+            let encoded = tokenizer.encode(text: promptText, addSpecialTokens: false)
+            guard encoded.count >= requiredPromptTokens else {
+                throw MLXFastError.invalidInput(
+                    "--prompt-file tokenized to \(encoded.count) tokens; free-run gates need at least \(requiredPromptTokens)"
+                )
+            }
+            promptTokens = Array(encoded.prefix(requiredPromptTokens))
+        } else if !sourceCaseName.isEmpty {
+            guard let sourceCase = golden.cases.first(where: { $0.name == sourceCaseName }) else {
+                throw MLXFastError.invalidInput("golden does not contain base case \(sourceCaseName)")
+            }
+            promptTokens = sourceCase.promptTokens
+        } else {
+            guard let firstCase = golden.cases.first else {
+                throw MLXFastError.invalidInput("golden contains no base cases to source a prompt from")
+            }
+            promptTokens = firstCase.promptTokens
+        }
+        guard promptTokens.count == requiredPromptTokens else {
+            throw MLXFastError.invalidInput(
+                "free-run prompt has \(promptTokens.count) tokens; need exactly \(requiredPromptTokens)"
+            )
+        }
+
+        fputs(
+            "attach-free-run-gate: generating \(steps) reference continuation tokens "
+                + "(covers decode offsets \(promptTokens.count)..<\(promptTokens.count + steps))\n",
+            stderr
+        )
+        let expectedTokens = try DeepSeekRuntime.generateGreedyTokens(
+            GreedyGenerationOptions(
+                weightsPath: weightsPath,
+                promptTokens: promptTokens,
+                steps: steps
+            ),
+            worker: try runtimeWorkerOptions(blockedGoldenPath: goldenPath)
+        )
+
+        let freeRunCase = GoldenFreeRunCase(
+            name: caseName,
+            promptTokens: promptTokens,
+            expectedTokens: expectedTokens,
+            exactPrefixTokens: exactPrefixTokens
+        )
+        let existingGates = golden.correctnessGates
+        let mergedGates = GoldenCorrectnessGates(
+            anchors: existingGates?.anchors,
+            freeRun: (existingGates?.freeRunCases ?? []) + [freeRunCase],
+            behavior: existingGates?.behavior
+        )
+        let merged = GoldenDocument(
+            version: golden.version ?? 1,
+            cases: golden.cases,
+            correctnessGates: mergedGates,
+            benchmark: golden.benchmark
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        let outputData = try encoder.encode(merged)
+        let outputURL = URL(fileURLWithPath: outputPath)
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try outputData.write(to: outputURL, options: [.atomic])
+        _ = try loadGoldenFixture(from: outputPath)
+        print(
+            "attached free-run gate name=\(caseName) steps=\(steps) "
+                + "decode_offsets=\(promptTokens.count)..<\(promptTokens.count + steps) "
+                + "exact_prefix=\(exactPrefixTokens.map(String.init) ?? "full") "
                 + "output=\(outputPath)"
         )
     }
@@ -1074,6 +1230,7 @@ private enum MLXFastCLI {
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
               mlxfast-swift benchmark [--local-submit|--local-iterate] [--weights PATH] [--golden PATH] [--score-path PATH]
               mlxfast-swift attach-gpqa-gates [--golden PATH] --gpqa PATH [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
+              mlxfast-swift attach-free-run-gate [--golden PATH] [--weights PATH] [--output PATH] [--name NAME] [--steps N] [--case NAME | --prompt-file PATH [--tokenizer PATH]] [--exact-prefix N]
               mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]
               mlxfast-swift checkpoint-shards --index PATH
 

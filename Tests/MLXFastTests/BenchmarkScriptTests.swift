@@ -811,6 +811,34 @@ func submissionStaticReviewDiffModeFailsClosedAndSendsOnlyChangedFiles() throws 
     #expect(!request.contains("prove the benchmark detects slower measured decode"))
 }
 
+// The 64-step teacher-forced base case only exercises single-token forwards at
+// offsets 512..575, while the timed decode reaches 512..639. attach-free-run-gate
+// lets the operator regenerate the private golden with a free-run case whose
+// greedy continuation covers the full timed decode offset range with different
+// prompt content, so an offset-gated cheap model path has to survive the
+// unscored correctness gate too instead of only the LLM static review.
+@Test
+func cliSupportsFreeRunGateAttachmentCoveringTimedDecodeOffsets() throws {
+    let cli = try String(
+        contentsOfFile: "Sources/MLXFastCLI/main.swift",
+        encoding: .utf8
+    )
+
+    #expect(cli.contains("case \"attach-free-run-gate\""))
+    #expect(cli.contains("func runAttachFreeRunGate"))
+    // Defaults to covering exactly the timed decode step count, capped at the
+    // free-run maximum, and warns when asked for less than full coverage.
+    #expect(cli.contains("options.value(for: \"--steps\", default: \"\\(MLXFastConstants.benchmarkDecodeSteps)\")"))
+    #expect(cli.contains("steps <= MLXFastConstants.correctnessMaxFreeRunSteps"))
+    #expect(cli.contains("the gate will not cover the full timed decode offset range"))
+    // Expected tokens come from actually running the reference model, with the
+    // golden blocked from the worker like every other generation tool.
+    #expect(cli.contains("runtimeWorkerOptions(blockedGoldenPath: goldenPath)"))
+    // The merged golden is re-validated through the strict loader before use.
+    #expect(cli.contains("_ = try loadGoldenFixture(from: outputPath)"))
+    #expect(cli.contains("attach-free-run-gate ["))
+}
+
 @Test
 func cliSupportsHiddenGPQAGateAttachment() throws {
     let cli = try String(
