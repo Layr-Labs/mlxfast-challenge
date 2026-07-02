@@ -1572,6 +1572,18 @@ func combineParallelCorrectnessSumsSliceTimingIntoCorrectnessSeconds() throws {
 // artifact still leaks a fine-grained timing/memory covert channel. Ranking fields
 // stay precise; validator ordering pairs stay ordered.
 @Test
+func sealedStdoutScoreIsCoarsenedLikeTheWrittenFile() throws {
+    // benchmark.sh rebuilds score.json from emitScorePayloadToStdout's output, so
+    // that emit -- not the discarded writeScorePayload file -- is the published
+    // per-machine artifact. It must apply the same diagnostic coarsening, or the
+    // covert-channel mitigation is bypassed on the sealed path.
+    let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
+    let start = try #require(cli.range(of: "private static func emitScorePayloadToStdout"))
+    let body = String(cli[start.lowerBound...].prefix(700))
+    #expect(body.contains("withCoarsenedPublicDiagnostics()"))
+}
+
+@Test
 func combineParallelCorrectnessCoarsensPublishedDiagnostics() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }

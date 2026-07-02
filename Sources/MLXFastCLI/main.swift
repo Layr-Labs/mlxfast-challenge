@@ -406,9 +406,19 @@ private enum MLXFastCLI {
     // benchmark.sh captures this stdout, after the process has fully exited, as
     // the sole source of truth for score.json.
     private static func emitScorePayloadToStdout(_ payload: ScorePayload) throws {
+        // benchmark.sh seals score.json from THIS stdout, so it -- not the
+        // writeScorePayload file it discards -- is the published per-machine
+        // artifact. Coarsen the diagnostic analog fields here too, or the
+        // timing/memory covert-channel coarsening applied in writeScorePayload
+        // (and the combined score) is bypassed on the sealed path.
+        let publishedPayload = ScorePayload(
+            score: payload.score,
+            passed: payload.passed,
+            metrics: payload.metrics.withCoarsenedPublicDiagnostics()
+        )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        let data = try encoder.encode(payload)
+        let data = try encoder.encode(publishedPayload)
         FileHandle.standardOutput.write(data)
         if data.last != 0x0a { print("") }
     }
