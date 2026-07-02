@@ -228,7 +228,7 @@ prefill_speedup >= 0.95
 ```
 
 With the current Blacksmith M4 baseline, those floors allow at most
-`4.442638496439145` seconds/token for decode and `0.18242698079358555`
+`3.8280590145312505` seconds/token for decode and `0.18242698079358555`
 seconds/token for prefill. A run below either floor fails eligibility even if
 the weighted score would otherwise be above baseline.
 

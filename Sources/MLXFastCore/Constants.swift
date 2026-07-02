@@ -69,8 +69,15 @@ public enum MLXFastConstants {
     // changing timed windows, run one trusted baseline validation before using
     // scores for the public leaderboard. Raw RAM, bandwidth, and read metrics
     // remain audit fields instead of primary score factors.
+    //
+    // Decode recalibrated after the decode_begin single-seed change (the warmup
+    // forward was removed, so the reference model now streams experts cold for
+    // the seed prefill and reads slower on the decode axis): re-measured on the
+    // baseline reference under the current harness at 3.6366560638046876 s/tok
+    // (yukon/baseline run). Prefill is unchanged -- that path did not change, and
+    // the baseline run's prefill was within single-shot noise of the value below.
     public static let officialBaselinePrefillSecondsPerToken = 0.17330563175390626
-    public static let officialBaselineDecodeSecondsPerToken = 4.220506571617188
+    public static let officialBaselineDecodeSecondsPerToken = 3.6366560638046876
     public static let scorePrefillWeight = 0.25
     public static let scoreDecodeWeight = 0.75
     public static let scorePrefillSpeedupFloor = 0.95

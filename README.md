@@ -234,7 +234,7 @@ The floor prevents a submission from sacrificing one serving phase badly to
 improve the other. The exact baseline timings are emitted in each `score.json`
 and kept in `MLXFastConstants` after trusted Blacksmith calibration.
 On the current Blacksmith M4 baseline, that means decode must be at most
-`4.442638496439145` seconds/token and prefill must be at most
+`3.8280590145312505` seconds/token and prefill must be at most
 `0.18242698079358555` seconds/token.
 For scoring, decode is trusted parent wall-clock time for decode setup plus the
 checked decode-token window, not worker-reported per-step time. That charges
