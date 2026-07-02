@@ -622,6 +622,32 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
 // happy path shims curl on PATH and asserts the judge request contains only
 // the changed editable file, never the unchanged suspicious baseline file.
 @Test
+func submissionStaticReviewPromptCoversMeasurementStructureExploitation() throws {
+    // The seed-forward memo (submissions/0ddfcd37) passed review as legitimate
+    // memoization because the rubric had no category for gains that come from
+    // the benchmark's own call pattern rather than real inference work, and
+    // the judge had no harness call-pattern context to decide "this cache can
+    // only hit when the harness repeats itself". Pin both additions.
+    let staticReview = try String(
+        contentsOfFile: ".github/scripts/run-submission-static-review.sh",
+        encoding: .utf8
+    )
+    #expect(staticReview.contains("measurement-structure exploitation"))
+    #expect(staticReview.contains("Bit-identical outputs do not make that legitimate"))
+    #expect(staticReview.contains("harness_protocol"))
+    #expect(staticReview.contains("decision_test"))
+    #expect(staticReview.contains("input-independent caching"))
+    // Attribution: the judge receives the base..head diff and is told to judge
+    // the CHANGES, so code inherited from trusted main inside a touched file
+    // cannot by itself fail an innocent submission.
+    #expect(staticReview.contains("submission_diff: $submission_diff"))
+    #expect(staticReview.contains("judge WHAT THIS SUBMISSION CHANGED"))
+    // The published participant rule the review cites must exist.
+    let contract = try String(contentsOfFile: "CLAUDE.md", encoding: .utf8)
+    #expect(contract.contains("whose only\npossible hit is the benchmark harness repeating an identical computation"))
+}
+
+@Test
 func submissionStaticReviewDiffModeFailsClosedAndSendsOnlyChangedFiles() throws {
     let fm = FileManager.default
     let scriptPath = URL(fileURLWithPath: fm.currentDirectoryPath)
