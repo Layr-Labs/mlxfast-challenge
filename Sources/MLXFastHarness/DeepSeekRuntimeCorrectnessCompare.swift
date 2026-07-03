@@ -124,18 +124,43 @@ extension DeepSeekRuntime {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness response missing token")
             }
             let expectedToken = testCase.expectedTokens[step]
+            // Same acceptance rule as the non-worker path (compareTeacherForcedCached):
+            // exact match, or a true top-logit tie within correctnessLogitTieTolerance.
+            // Cross-hardware Apple GPU/Metal builds break exact argmax near-ties
+            // differently, and a golden generated on one Apple Silicon generation
+            // can deterministically flip single near-tie steps on another (issue
+            // #83). The worker's reported top logits are validated for internal
+            // consistency first (top-1 must equal the returned token, sorted,
+            // finite, deduped, capped) and discarded if malformed, so a protocol
+            // violation degrades to the strict comparison, never to a wider
+            // acceptance. The worker cannot target the tolerance at the golden
+            // token: it answers before the expected token is ever sent to it, and
+            // fabricating flat logits to widen every step is caught by the strict
+            // free-run, behavior, and benchmark-oracle gates plus the static
+            // review. Either way the next teacher-forced input stays the GOLDEN
+            // token, so acceptance here never changes downstream state.
             if actualToken != expectedToken {
-                return WorkerCorrectnessResult(
-                    comparison: CorrectnessTokenComparison(
-                        passed: false,
-                        checkedSteps: step - startStep + 1,
-                        firstFailingStep: step,
-                        expectedToken: expectedToken,
-                        actualToken: actualToken
-                    ),
-                    expertStats: latestExpertStats,
-                    peakRamGB: peakRamGB
+                let tieTopLogits = try? validatedWorkerTopLogits(
+                    response.topLogits,
+                    actualToken: actualToken
                 )
+                if !correctnessTokenAccepted(
+                    expectedToken: expectedToken,
+                    actualToken: actualToken,
+                    topLogits: tieTopLogits
+                ) {
+                    return WorkerCorrectnessResult(
+                        comparison: CorrectnessTokenComparison(
+                            passed: false,
+                            checkedSteps: step - startStep + 1,
+                            firstFailingStep: step,
+                            expectedToken: expectedToken,
+                            actualToken: actualToken
+                        ),
+                        expertStats: latestExpertStats,
+                        peakRamGB: peakRamGB
+                    )
+                }
             }
             reportProgress(
                 step: step - startStep + 1,
@@ -166,11 +191,16 @@ extension DeepSeekRuntime {
         guard let actualToken = response.token else {
             throw MLXFastError.invalidInput("runtime worker anchor response missing token")
         }
+        // Parity with compareAnchorCached: without the validated worker top
+        // logits, the anchor's tie tolerance and max_expected_rank /
+        // max_top_logit_delta acceptance fields were silently inert on the
+        // worker path even when the golden carries them. Malformed logits
+        // degrade to the strict comparison (see compareTeacherForcedWithWorker).
         return WorkerCorrectnessResult(
             comparison: compareAnchorToken(
                 anchor: anchor,
                 actualToken: actualToken,
-                topLogits: nil
+                topLogits: try? validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)
             ),
             expertStats: response.expertStats ?? .zero,
             peakRamGB: response.peakRamGB ?? 0
@@ -214,10 +244,13 @@ extension DeepSeekRuntime {
         }
         let usesSemanticJudge = behaviorUsesSemanticJudge(testCase)
         if !usesSemanticJudge {
+            // Parity with compareBehaviorCached's maxNewTokens == 1 path: the
+            // tie tolerance applies against each accepted first token instead
+            // of being silently disabled on the worker path.
             let firstTokenComparison = compareBehaviorFirstToken(
                 testCase: testCase,
                 actualToken: firstToken,
-                topLogits: nil
+                topLogits: try? validatedWorkerTopLogits(beginResponse.topLogits, actualToken: firstToken)
             )
             if !firstTokenComparison.passed {
                 return WorkerCorrectnessResult(
