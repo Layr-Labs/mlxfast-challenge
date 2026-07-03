@@ -26,6 +26,11 @@ extension DeepSeekRuntime {
         var preflightSeconds = 0.0
         var correctnessSeconds = 0.0
         var timedBenchmarkSeconds = 0.0
+        // Overwritten with the golden oracle's per-prompt baselines (if it
+        // carries them) once the golden loads; until then failure payloads use
+        // the calibrated defaults.
+        var baselinePrefillSecondsPerToken = MLXFastConstants.officialBaselinePrefillSecondsPerToken
+        var baselineDecodeSecondsPerToken = MLXFastConstants.officialBaselineDecodeSecondsPerToken
 
         progress(
             "start correctness_steps=\(options.correctnessSteps) "
@@ -69,6 +74,8 @@ extension DeepSeekRuntime {
                 bandwidthGBPerToken: bandwidthGBPerToken,
                 decodeSecondsPerToken: decodeSecondsPerToken,
                 prefillSecondsPerToken: prefillSecondsPerToken,
+                baselinePrefillSecondsPerToken: baselinePrefillSecondsPerToken,
+                baselineDecodeSecondsPerToken: baselineDecodeSecondsPerToken,
                 bandwidthSource: bandwidthSource,
                 gpqaTTFT: gpqaTTFT
             )
@@ -150,10 +157,16 @@ extension DeepSeekRuntime {
                 throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
             }
             let promptPlan = try BenchmarkPrompt.plan(from: benchmarkGolden)
+            let pairedBaseline = try PairedBaselineOverride.fromEnvironment()
+            baselinePrefillSecondsPerToken = pairedBaseline?.prefillSecondsPerToken
+                ?? benchmarkGolden.resolvedBaselinePrefillSecondsPerToken
+            baselineDecodeSecondsPerToken = pairedBaseline?.decodeSecondsPerToken
+                ?? benchmarkGolden.resolvedBaselineDecodeSecondsPerToken
             progress(
                 "benchmark oracle ready prefill_tokens=\(promptPlan.prefillTokens.count) "
                     + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
-                    + "decode_tokens=\(options.benchmarkDecodeSteps)"
+                    + "decode_tokens=\(options.benchmarkDecodeSteps) "
+                    + "baseline_source=\(baselineSourceLabel(paired: pairedBaseline, golden: benchmarkGolden))"
             )
 
             Memory.peakMemory = 0
@@ -177,14 +190,16 @@ extension DeepSeekRuntime {
             let peakRamGB = Double(Memory.peakMemory) / Double(1 << 30)
             let score = BenchmarkScore.score(
                 decodeSecondsPerToken: decode.secondsPerToken,
-                prefillSecondsPerToken: prefillSecondsPerToken
+                prefillSecondsPerToken: prefillSecondsPerToken,
+                baselineDecodeSecondsPerToken: baselineDecodeSecondsPerToken,
+                baselinePrefillSecondsPerToken: baselinePrefillSecondsPerToken
             )
             let decodeSpeedup = BenchmarkScore.speedup(
-                baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+                baselineSecondsPerToken: baselineDecodeSecondsPerToken,
                 candidateSecondsPerToken: decode.secondsPerToken
             )
             let prefillSpeedup = BenchmarkScore.speedup(
-                baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken,
+                baselineSecondsPerToken: baselinePrefillSecondsPerToken,
                 candidateSecondsPerToken: prefillSecondsPerToken
             )
             let expertStats = expertStats(from: runtimeBenchmarkLoader)
@@ -232,6 +247,8 @@ extension DeepSeekRuntime {
                 bandwidthGBPerToken: decode.bandwidthGBPerToken,
                 decodeSecondsPerToken: decode.secondsPerToken,
                 prefillSecondsPerToken: prefillSecondsPerToken,
+                baselinePrefillSecondsPerToken: baselinePrefillSecondsPerToken,
+                baselineDecodeSecondsPerToken: baselineDecodeSecondsPerToken,
                 benchmarkWallSeconds: secondsSince(benchmarkStart),
                 preflightSeconds: preflightSeconds,
                 correctnessSeconds: correctnessSeconds,
@@ -350,6 +367,11 @@ extension DeepSeekRuntime {
         var timedBenchmarkSeconds = 0.0
         var lastExpertStats = ExpertStreamingStats.zero
         var peakRamGB = 0.0
+        // Overwritten with the golden oracle's per-prompt baselines (if it
+        // carries them) once the golden loads; until then failure payloads use
+        // the calibrated defaults.
+        var baselinePrefillSecondsPerToken = MLXFastConstants.officialBaselinePrefillSecondsPerToken
+        var baselineDecodeSecondsPerToken = MLXFastConstants.officialBaselineDecodeSecondsPerToken
 
         progress(
             "start correctness_steps=\(options.correctnessSteps) "
@@ -391,6 +413,8 @@ extension DeepSeekRuntime {
                 bandwidthGBPerToken: bandwidthGBPerToken,
                 decodeSecondsPerToken: decodeSecondsPerToken,
                 prefillSecondsPerToken: prefillSecondsPerToken,
+                baselinePrefillSecondsPerToken: baselinePrefillSecondsPerToken,
+                baselineDecodeSecondsPerToken: baselineDecodeSecondsPerToken,
                 bandwidthSource: bandwidthSource,
                 gpqaTTFT: gpqaTTFT
             )
@@ -438,10 +462,16 @@ extension DeepSeekRuntime {
                 throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
             }
             let promptPlan = try BenchmarkPrompt.plan(from: benchmarkGolden)
+            let pairedBaseline = try PairedBaselineOverride.fromEnvironment()
+            baselinePrefillSecondsPerToken = pairedBaseline?.prefillSecondsPerToken
+                ?? benchmarkGolden.resolvedBaselinePrefillSecondsPerToken
+            baselineDecodeSecondsPerToken = pairedBaseline?.decodeSecondsPerToken
+                ?? benchmarkGolden.resolvedBaselineDecodeSecondsPerToken
             progress(
                 "benchmark oracle ready prefill_tokens=\(promptPlan.prefillTokens.count) "
                     + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
-                    + "decode_tokens=\(options.benchmarkDecodeSteps)"
+                    + "decode_tokens=\(options.benchmarkDecodeSteps) "
+                    + "baseline_source=\(baselineSourceLabel(paired: pairedBaseline, golden: benchmarkGolden))"
             )
             peakRamGB = 0
             lastExpertStats = .zero
@@ -454,17 +484,17 @@ extension DeepSeekRuntime {
                 // This machine's role is the anchor/free-run/behavior/GPQA gates
                 // only -- a separate "timing-only" machine (checkGates: false)
                 // measures the real prefill/decode numbers. Placeholders here use
-                // the baseline seconds-per-token exactly (speedup == 1.0, always
-                // finite, always clears the floor) rather than 0 or some
-                // arbitrary value: 0 would divide-by-zero into +Infinity in
-                // BenchmarkScore.speedup, and Double.infinity fails JSON
-                // encoding outright. Whatever ships here is overwritten by the
-                // real timing-only machine's values when the two are merged
-                // before combine-parallel-correctness.sh runs.
+                // the golden-resolved baseline seconds-per-token exactly
+                // (speedup == 1.0, always finite, always clears the floor)
+                // rather than 0 or some arbitrary value: 0 would divide-by-zero
+                // into +Infinity in BenchmarkScore.speedup, and Double.infinity
+                // fails JSON encoding outright. Whatever ships here is
+                // overwritten by the real timing-only machine's values when the
+                // two are merged before combine-parallel-correctness.sh runs.
                 progress("timed benchmark skipped (gates-only machine)")
-                prefillSecondsPerToken = MLXFastConstants.officialBaselinePrefillSecondsPerToken
+                prefillSecondsPerToken = baselinePrefillSecondsPerToken
                 decode = DecodeMeasurement(
-                    secondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+                    secondsPerToken: baselineDecodeSecondsPerToken,
                     bandwidthGBPerToken: 0,
                     bandwidthSource: "skipped_gates_only_machine"
                 )
@@ -524,14 +554,16 @@ extension DeepSeekRuntime {
             // does not need its own skipTimedBenchmark branch.
             let score = BenchmarkScore.score(
                 decodeSecondsPerToken: decode.secondsPerToken,
-                prefillSecondsPerToken: prefillSecondsPerToken
+                prefillSecondsPerToken: prefillSecondsPerToken,
+                baselineDecodeSecondsPerToken: baselineDecodeSecondsPerToken,
+                baselinePrefillSecondsPerToken: baselinePrefillSecondsPerToken
             )
             let decodeSpeedup = BenchmarkScore.speedup(
-                baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+                baselineSecondsPerToken: baselineDecodeSecondsPerToken,
                 candidateSecondsPerToken: decode.secondsPerToken
             )
             let prefillSpeedup = BenchmarkScore.speedup(
-                baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken,
+                baselineSecondsPerToken: baselinePrefillSecondsPerToken,
                 candidateSecondsPerToken: prefillSecondsPerToken
             )
 
@@ -647,6 +679,8 @@ extension DeepSeekRuntime {
                 bandwidthGBPerToken: decode.bandwidthGBPerToken,
                 decodeSecondsPerToken: decode.secondsPerToken,
                 prefillSecondsPerToken: prefillSecondsPerToken,
+                baselinePrefillSecondsPerToken: baselinePrefillSecondsPerToken,
+                baselineDecodeSecondsPerToken: baselineDecodeSecondsPerToken,
                 benchmarkWallSeconds: secondsSince(benchmarkStart),
                 preflightSeconds: preflightSeconds,
                 correctnessSeconds: correctnessSeconds,
@@ -1146,6 +1180,8 @@ extension DeepSeekRuntime {
         bandwidthGBPerToken: Double,
         decodeSecondsPerToken: Double,
         prefillSecondsPerToken: Double,
+        baselinePrefillSecondsPerToken: Double = MLXFastConstants.officialBaselinePrefillSecondsPerToken,
+        baselineDecodeSecondsPerToken: Double = MLXFastConstants.officialBaselineDecodeSecondsPerToken,
         benchmarkWallSeconds: Double,
         preflightSeconds: Double,
         correctnessSeconds: Double,
@@ -1166,6 +1202,8 @@ extension DeepSeekRuntime {
                 bandwidthGBPerToken: bandwidthGBPerToken,
                 decodeSecondsPerToken: decodeSecondsPerToken,
                 prefillSecondsPerToken: prefillSecondsPerToken,
+                baselineDecodeSecondsPerToken: baselineDecodeSecondsPerToken,
+                baselinePrefillSecondsPerToken: baselinePrefillSecondsPerToken,
                 benchmarkWallSeconds: benchmarkWallSeconds,
                 preflightSeconds: preflightSeconds,
                 correctnessSeconds: correctnessSeconds,
@@ -1229,6 +1267,8 @@ extension DeepSeekRuntime {
         bandwidthGBPerToken: Double = 0,
         decodeSecondsPerToken: Double = 0,
         prefillSecondsPerToken: Double = 0,
+        baselinePrefillSecondsPerToken: Double = MLXFastConstants.officialBaselinePrefillSecondsPerToken,
+        baselineDecodeSecondsPerToken: Double = MLXFastConstants.officialBaselineDecodeSecondsPerToken,
         bandwidthSource: String = "",
         gpqaTTFT: GPQATTFTSummary = .zero,
         runtime: String = "swift"
@@ -1242,6 +1282,8 @@ extension DeepSeekRuntime {
                 bandwidthGBPerToken: bandwidthGBPerToken,
                 decodeSecondsPerToken: decodeSecondsPerToken,
                 prefillSecondsPerToken: prefillSecondsPerToken,
+                baselineDecodeSecondsPerToken: baselineDecodeSecondsPerToken,
+                baselinePrefillSecondsPerToken: baselinePrefillSecondsPerToken,
                 benchmarkWallSeconds: benchmarkWallSeconds,
                 preflightSeconds: preflightSeconds,
                 correctnessSeconds: correctnessSeconds,
@@ -1283,6 +1325,16 @@ extension DeepSeekRuntime {
                 runtime: runtime
             )
         )
+    }
+
+    static func baselineSourceLabel(
+        paired: PairedBaselineOverride?,
+        golden: BenchmarkGolden
+    ) -> String {
+        if paired != nil {
+            return "paired_env"
+        }
+        return golden.baselineDecodeSecondsPerToken == nil ? "constants" : "golden"
     }
 
     static func speedupFloorFailureMessage(

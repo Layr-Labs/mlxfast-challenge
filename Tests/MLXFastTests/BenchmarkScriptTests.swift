@@ -852,6 +852,42 @@ func gatesMachineRunsPublicBehaviorGateBeforeHiddenGates() throws {
         encoding: .utf8
     )
     #expect(benchmarkWorkflow.contains(fixtureHash))
+// The 64-step teacher-forced base case only exercises single-token forwards at
+// offsets 512..575, while the timed decode reaches 512..639. attach-free-run-gate
+// lets the operator regenerate the private golden with a free-run case whose
+// greedy continuation covers the full timed decode offset range with different
+// prompt content, so an offset-gated cheap model path has to survive the
+// unscored correctness gate too instead of only the LLM static review.
+@Test
+func cliSupportsFreeRunGateAttachmentCoveringTimedDecodeOffsets() throws {
+    let cli = try String(
+        contentsOfFile: "Sources/MLXFastCLI/main.swift",
+        encoding: .utf8
+    )
+
+    #expect(cli.contains("case \"attach-free-run-gate\""))
+    #expect(cli.contains("func runAttachFreeRunGate"))
+    // Defaults to covering exactly the timed decode step count, capped at the
+    // free-run maximum, and FAILS CLOSED when asked for less than full
+    // coverage unless the operator explicitly opts in with --allow-partial.
+    #expect(cli.contains("options.value(for: \"--steps\", default: \"\\(MLXFastConstants.benchmarkDecodeSteps)\")"))
+    #expect(cli.contains("steps <= MLXFastConstants.correctnessMaxFreeRunSteps"))
+    #expect(cli.contains("options.hasFlag(\"--allow-partial\")"))
+    #expect(cli.contains("pass --allow-partial to write it anyway"))
+    // Expected tokens come from actually running the reference model, with the
+    // golden blocked from the worker like every other generation tool.
+    #expect(cli.contains("runtimeWorkerOptions(blockedGoldenPath: goldenPath)"))
+    // The INPUT golden is strict-validated before any generation or write --
+    // --output defaults to the input path, so a malformed input must fail
+    // before it could be replaced on disk.
+    #expect(cli.contains("_ = try loadGoldenFixture(from: goldenPath)"))
+    // The merged golden is staged to a temp sibling and re-validated through
+    // the strict loader BEFORE it replaces the destination, so a failed
+    // validation can never destroy the original golden.
+    #expect(cli.contains("func writeValidatedGoldenDocument"))
+    #expect(cli.contains("_ = try loadGoldenFixture(from: temporaryURL.path)"))
+    #expect(!cli.contains("try outputData.write(to: outputURL, options: [.atomic])"))
+    #expect(cli.contains("attach-free-run-gate ["))
 }
 
 @Test
@@ -915,10 +951,20 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     let workerTeacherForced = String(runtime[workerTeacherForcedStart.lowerBound..<workerAnchorStart.lowerBound])
     let workerAnchor = String(runtime[workerAnchorStart.lowerBound..<workerBehaviorStart.lowerBound])
     let workerBehavior = String(runtime[workerBehaviorStart.lowerBound..<workerValidationStart.lowerBound])
+    // Worker/non-worker parity: every worker comparison applies the same
+    // acceptance rules as its cached counterpart (top-logit tie tolerance,
+    // anchor rank/delta fields), using worker-reported top logits only after
+    // validatedWorkerTopLogits vets them -- malformed logits degrade to the
+    // strict comparison (try?), never to a wider acceptance. A golden
+    // generated on one Apple Silicon generation must not hard-fail another
+    // over a true near-tie (issue #83).
     #expect(workerTeacherForced.contains("actualToken != expectedToken"))
-    #expect(!workerTeacherForced.contains("correctnessTokenAccepted("))
-    #expect(workerAnchor.contains("topLogits: nil"))
-    #expect(workerBehavior.contains("topLogits: nil"))
+    #expect(workerTeacherForced.contains("correctnessTokenAccepted("))
+    #expect(workerTeacherForced.contains("try? validatedWorkerTopLogits("))
+    #expect(!workerAnchor.contains("topLogits: nil"))
+    #expect(workerAnchor.contains("try? validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)"))
+    #expect(!workerBehavior.contains("topLogits: nil"))
+    #expect(workerBehavior.contains("try? validatedWorkerTopLogits(beginResponse.topLogits, actualToken: firstToken)"))
     #expect(workerBehavior.contains("let usesSemanticJudge = behaviorUsesSemanticJudge(testCase)"))
     #expect(workerBehavior.contains("if !usesSemanticJudge"))
     #expect(workerBehavior.contains("if usesSemanticJudge ||"))
@@ -1287,12 +1333,13 @@ func benchmarkSplitsGatesAndTimingOntoSeparateMachinesWithoutSpuriousSemanticCap
     #expect(runtime.contains("if checkGates, let semanticCapture {"))
     #expect(!runtime.contains("if let semanticCapture {\n                guard semanticAnswers.count == semanticCapture.caseCount else {"))
 
-    // Placeholder timing values for a gates-only machine must be the official
+    // Placeholder timing values for a gates-only machine must be the resolved
     // baseline exactly (speedup == 1.0, always finite) -- 0 would divide-by-
     // zero into +Infinity in BenchmarkScore.speedup, and Double.infinity fails
-    // JSON encoding outright.
-    #expect(runtime.contains("prefillSecondsPerToken = MLXFastConstants.officialBaselinePrefillSecondsPerToken"))
-    #expect(runtime.contains("secondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,"))
+    // JSON encoding outright. "Resolved" means the golden oracle's per-prompt
+    // baseline when it carries one, else the calibrated constants.
+    #expect(runtime.contains("prefillSecondsPerToken = baselinePrefillSecondsPerToken"))
+    #expect(runtime.contains("secondsPerToken: baselineDecodeSecondsPerToken,"))
 
     let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
     #expect(cli.contains("MLXFAST_BENCHMARK_CHECK_GATES"))

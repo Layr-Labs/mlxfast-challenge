@@ -253,6 +253,105 @@ jobs:
             public-gate-report.json || true
           echo "benchmark-timing-or-gates: public behavior gate finished in $((SECONDS - started))s"
           exit "${status}"
+      # Paired baseline measurement, timing machine only. Speedups and floors
+      # were previously computed against constants measured on a different
+      # physical host at a different hour; observed fleet drift is ~4-10% on
+      # prefill and ~4% on decode across one day (see the paired-baseline
+      # section of docs/benchmark-window-freeze.md), which made single-sample
+      # floor verdicts near the threshold a coin flip. Measuring the pinned
+      # reference implementation in the same session, on the same VM, minutes
+      # before the candidate cancels that drift for both the score and the
+      # floors. The ref below is trusted-workflow content (submission branches
+      # must match main outside editablePaths), so submitted code can neither
+      # repoint it nor observe the measured values (the env overrides are
+      # stripped from the sandboxed worker environment by the harness).
+      - name: Checkout paired baseline reference
+        if: ${{ inputs.mode == 'timing' }}
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          # Reference implementation: main at the e571ac1 editable-source
+          # restore point plus trusted harness updates (7e2191c). This is the
+          # same code the calibrated constants were measured against. Changing
+          # this ref is a ranking-contract change: follow the freeze doc's
+          # paired-baseline protocol and update the pinned guard test.
+          ref: 7e2191c229d0dcf6ea76cd1f78a93b50adb6c574
+          path: paired-baseline
+          persist-credentials: false
+
+      - name: Measure paired baseline
+        if: ${{ inputs.mode == 'timing' }}
+        env:
+          # Calibrated constants, used ONLY as a sanity band anchor here (the
+          # guard test pins these to MLXFastConstants). A baseline sample more
+          # than 1.5x slower or 0.66x faster than calibration means the VM or
+          # the baseline build is pathological; failing closed prevents a
+          # broken baseline from inflating or deflating every speedup.
+          MLXFAST_PAIRED_SANITY_PREFILL: "0.17330563175390626"
+          MLXFAST_PAIRED_SANITY_DECODE: "3.6366560638046876"
+        run: |
+          set -euo pipefail
+          started="${SECONDS}"
+          # Build FIRST: SwiftPM replaces .build/release with a symlink to the
+          # arch directory during the build, so anything copied in beforehand
+          # is wiped. Then reuse the already-built MLX metallib -- the baseline
+          # ref pins the same mlx-swift revision (guard-tested), so the
+          # artifact is identical and rebuilding it would waste ~minutes; a
+          # worker without it dies on its first Metal op.
+          (
+            cd paired-baseline
+            mkdir -p .build/clang-module-cache
+            export CLANG_MODULE_CACHE_PATH="${PWD}/.build/clang-module-cache"
+            swift build -c release
+          )
+          test -s .build/release/mlx.metallib
+          cp .build/release/mlx.metallib paired-baseline/.build/release/mlx.metallib
+          test -s paired-baseline/.build/release/mlx.metallib
+          baseline_score="${GITHUB_WORKSPACE}/paired-baseline-score.json"
+          status=0
+          (
+            cd paired-baseline
+            export MLXFAST_SCORE_PATH="${baseline_score}"
+            export MLXFAST_INTEGRITY_PATH="${GITHUB_WORKSPACE}/paired-baseline-integrity.json"
+            export MLXFAST_REFERENCE_DIR="${GITHUB_WORKSPACE}/${MLXFAST_REFERENCE_DIR}"
+            ./benchmark.sh
+          ) || status=$?
+          # The baseline's OWN floor verdict is measured against its checked-in
+          # constants and legitimately fails on a slow-fleet session -- exactly
+          # the drift this pairing exists to cancel -- so tolerate a floor
+          # failure but nothing else: token mismatches or harness errors must
+          # fail the run.
+          test -s "${baseline_score}"
+          jq -e '
+            (.metrics.first_failing_case == null)
+            and (.metrics.first_failing_step == null)
+            and (.metrics.expected_token == null)
+            and (.metrics.actual_token == null)
+            and ((.metrics.error == "") or (.metrics.error | startswith("performance floor failed")))
+            and (.metrics.prefill_seconds_per_token > 0)
+            and (.metrics.decode_seconds_per_token > 0)
+          ' "${baseline_score}" >/dev/null || {
+            echo "::error::paired baseline run did not produce a clean timed measurement (exit=${status})" >&2
+            exit 1
+          }
+          jq -e \
+            --argjson sanity_prefill "${MLXFAST_PAIRED_SANITY_PREFILL}" \
+            --argjson sanity_decode "${MLXFAST_PAIRED_SANITY_DECODE}" \
+            '
+            (.metrics.prefill_seconds_per_token / $sanity_prefill) as $prefill_ratio
+            | (.metrics.decode_seconds_per_token / $sanity_decode) as $decode_ratio
+            | ($prefill_ratio >= 0.66 and $prefill_ratio <= 1.5
+               and $decode_ratio >= 0.66 and $decode_ratio <= 1.5)
+            ' "${baseline_score}" >/dev/null || {
+            echo "::error::paired baseline measurement is outside the sanity band vs calibrated constants" >&2
+            exit 1
+          }
+          prefill="$(jq -r '.metrics.prefill_seconds_per_token' "${baseline_score}")"
+          decode="$(jq -r '.metrics.decode_seconds_per_token' "${baseline_score}")"
+          {
+            echo "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN=${prefill}"
+            echo "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN=${decode}"
+          } >> "${GITHUB_ENV}"
+          echo "benchmark-timing-or-gates: paired baseline prefill=${prefill} decode=${decode} baseline_exit=${status} seconds=$((SECONDS - started))"
 
       - name: Benchmark
         env:

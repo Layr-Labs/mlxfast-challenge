@@ -122,6 +122,90 @@ func timedPrefillChargesOneValidatedColdForward() throws {
 }
 
 @Test
+func scoredBaselinesResolveFromGoldenWithConstantsFallback() throws {
+    // Prompt-pool rotation: the golden oracle may carry per-prompt baselines
+    // (both axes together, validated positive at load). The scored speedups and
+    // floors must use the golden-resolved values, with the calibrated constants
+    // as the fallback for goldens that carry none -- so a pool prompt of
+    // different intrinsic difficulty ranks on its own calibration instead of
+    // the default prompt's.
+    let golden = try packageFile("Sources/MLXFastCore/Golden.swift")
+    #expect(golden.contains("baselinePrefillSecondsPerToken ?? MLXFastConstants.officialBaselinePrefillSecondsPerToken"))
+    #expect(golden.contains("baselineDecodeSecondsPerToken ?? MLXFastConstants.officialBaselineDecodeSecondsPerToken"))
+    #expect(golden.contains("must be provided together"))
+
+    let benchmark = try packageFile("Sources/MLXFastHarness/DeepSeekRuntimeBenchmark.swift")
+    // Both benchmark paths adopt the golden's resolved baselines...
+    #expect(benchmark.components(separatedBy: "benchmarkGolden.resolvedBaselinePrefillSecondsPerToken").count - 1 == 2)
+    #expect(benchmark.components(separatedBy: "benchmarkGolden.resolvedBaselineDecodeSecondsPerToken").count - 1 == 2)
+    // ...and every scored speedup uses the resolved values, never the raw constants.
+    #expect(benchmark.contains("baselineSecondsPerToken: baselineDecodeSecondsPerToken"))
+    #expect(benchmark.contains("baselineSecondsPerToken: baselinePrefillSecondsPerToken"))
+    #expect(!benchmark.contains("baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken"))
+    #expect(!benchmark.contains("baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken"))
+}
+
+@Test
+func officialTimingMachineMeasuresPairedBaseline() throws {
+    // The ranking contract on official runs: speedups and floors are computed
+    // against a baseline measured in the SAME session on the SAME VM (paired
+    // baseline), cancelling the ~4-10% fleet/time drift that made fixed-
+    // constant floor verdicts near the threshold a coin flip. See the
+    // paired-baseline section of docs/benchmark-window-freeze.md.
+    let workflow = try packageFile(".github/workflows/benchmark-timing-or-gates.yml")
+    let constants = try packageFile("Sources/MLXFastCore/Constants.swift")
+    let doc = try packageFile("docs/benchmark-window-freeze.md")
+
+    // Timing machine only, ordered before the candidate's Benchmark step, on a
+    // pinned trusted ref that submissions cannot repoint.
+    let checkout = try #require(workflow.range(of: "- name: Checkout paired baseline reference"))
+    let measure = try #require(workflow.range(of: "- name: Measure paired baseline"))
+    let candidate = try #require(workflow.range(of: "- name: Benchmark"))
+    #expect(checkout.lowerBound < measure.lowerBound)
+    #expect(measure.lowerBound < candidate.lowerBound)
+    let pairedBody = String(workflow[checkout.lowerBound..<candidate.lowerBound])
+    #expect(pairedBody.components(separatedBy: "if: ${{ inputs.mode == 'timing' }}").count - 1 == 2)
+    #expect(pairedBody.contains("ref: 7e2191c229d0dcf6ea76cd1f78a93b50adb6c574"))
+    #expect(pairedBody.contains("persist-credentials: false"))
+
+    // The measured pair reaches the candidate only through the env overrides,
+    // which the harness validates fail-closed and strips from the worker env.
+    #expect(pairedBody.contains("MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN="))
+    #expect(pairedBody.contains("MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN="))
+    // Baseline floor failures are tolerated (they are measured against the
+    // baseline's own constants); anything else fails the run, and a sanity
+    // band anchored to the calibrated constants rejects pathological sessions.
+    #expect(pairedBody.contains("startswith(\"performance floor failed\")"))
+    #expect(pairedBody.contains("$prefill_ratio >= 0.66 and $prefill_ratio <= 1.5"))
+    let sanityPrefill = try #require(
+        pairedBody.range(of: "MLXFAST_PAIRED_SANITY_PREFILL: \"").map { range in
+            String(pairedBody[range.upperBound...].prefix(while: { $0 != "\"" }))
+        }
+    )
+    let sanityDecode = try #require(
+        pairedBody.range(of: "MLXFAST_PAIRED_SANITY_DECODE: \"").map { range in
+            String(pairedBody[range.upperBound...].prefix(while: { $0 != "\"" }))
+        }
+    )
+    #expect(sanityPrefill == (try swiftConstantLiteral(constants, name: "officialBaselinePrefillSecondsPerToken")))
+    #expect(sanityDecode == (try swiftConstantLiteral(constants, name: "officialBaselineDecodeSecondsPerToken")))
+
+    // Harness side: paired override outranks golden-carried baselines, which
+    // outrank constants, and the override keys never reach the worker.
+    let benchmark = try packageFile("Sources/MLXFastHarness/DeepSeekRuntimeBenchmark.swift")
+    #expect(benchmark.components(separatedBy: "PairedBaselineOverride.fromEnvironment()").count - 1 == 2)
+    #expect(benchmark.contains("pairedBaseline?.prefillSecondsPerToken\n                ?? benchmarkGolden.resolvedBaselinePrefillSecondsPerToken"))
+    #expect(benchmark.contains("pairedBaseline?.decodeSecondsPerToken\n                ?? benchmarkGolden.resolvedBaselineDecodeSecondsPerToken"))
+    let worker = try packageFile("Sources/MLXFastHarness/DeepSeekRuntimeWorker.swift")
+    #expect(worker.contains("\"MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN\","))
+    #expect(worker.contains("\"MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN\","))
+
+    // The contract is documented in the freeze doc.
+    #expect(doc.contains("Paired baseline measurement (official timing machine)"))
+    #expect(doc.contains("paired override, then golden-carried baselines, then the\n  constants"))
+}
+
+@Test
 func decodeValidationDelayHookDefaultsToNoOp() {
     // The one editable-surface knob that can add time to the trusted decode loop
     // must read zero on main/baseline. It can only ever slow a submission down,

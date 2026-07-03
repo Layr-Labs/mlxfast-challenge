@@ -99,6 +99,21 @@ public final class ExpertLayerStager {
         condition.unlock()
     }
 
+    private final class StagerFailureFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var failed = false
+        var value: Bool {
+            lock.lock(); defer { lock.unlock() }; return failed
+        }
+        func set() {
+            lock.lock(); failed = true; lock.unlock()
+        }
+    }
+
+    private struct StagerResultSink: @unchecked Sendable {
+        let buffer: UnsafeMutableBufferPointer<Data?>
+    }
+
     private func scheduleLocked(_ plan: LayerPlan) {
         guard
             recordNamesByLayer[plan.layerIndex] == nil,
@@ -108,14 +123,36 @@ public final class ExpertLayerStager {
         }
         pendingLayers.insert(plan.layerIndex)
         queue.async { [self] in
-            var loaded: [String: Data] = [:]
-            var succeeded = true
-            for name in plan.recordNames {
-                guard let tensor = try? sideBank.materializedTensor(named: name) else {
-                    succeeded = false
-                    break
+            // Read the layer's ~1 GiB projection tensors concurrently instead
+            // of one after another. The side bank is capacity 0, so it never
+            // mutates its cache/LRU and each read is an independent
+            // open/pread/close through the trusted read path (metrics are
+            // NSLock-guarded); concurrent reads are therefore race-free and
+            // stage byte-identical data — only the order/overlap of the reads
+            // changes, so consumers see the exact same bytes.
+            let names = plan.recordNames
+            var results = [Data?](repeating: nil, count: names.count)
+            let failed = StagerFailureFlag()
+            results.withUnsafeMutableBufferPointer { buffer in
+                let sink = StagerResultSink(buffer: buffer)
+                DispatchQueue.concurrentPerform(iterations: names.count) { index in
+                    if let tensor = try? sideBank.materializedTensor(named: names[index]) {
+                        sink.buffer[index] = tensor.bytes
+                    } else {
+                        failed.set()
+                    }
                 }
-                loaded[name] = tensor.bytes
+            }
+            var loaded: [String: Data] = [:]
+            var succeeded = !failed.value
+            if succeeded {
+                for (index, name) in names.enumerated() {
+                    guard let bytes = results[index] else {
+                        succeeded = false
+                        break
+                    }
+                    loaded[name] = bytes
+                }
             }
             condition.lock()
             pendingLayers.remove(plan.layerIndex)
