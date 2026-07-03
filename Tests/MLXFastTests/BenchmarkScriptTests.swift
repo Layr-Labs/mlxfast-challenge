@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 @testable import MLXFastCore
 import Testing
@@ -809,6 +810,48 @@ func submissionStaticReviewDiffModeFailsClosedAndSendsOnlyChangedFiles() throws 
     #expect(request.contains("Sources/MLXFastModel/Changed.swift"))
     #expect(!request.contains("Baseline.swift"))
     #expect(!request.contains("prove the benchmark detects slower measured decode"))
+}
+
+// Ranked validation otherwise exercises only the hidden goldens, so numerics
+// drift on prompts they happen not to cover can be promoted into main and then
+// break every participant's local public gate (issue #83). The gates machine
+// must therefore also run the checked-in public fixture as an independent
+// drift tripwire -- before the hidden gates so honest drift fails fast, with
+// the fixture hash pinned to the actual checked-in file so a stale pin cannot
+// silently validate a different oracle.
+@Test
+func gatesMachineRunsPublicBehaviorGateBeforeHiddenGates() throws {
+    let timingOrGates = try String(
+        contentsOfFile: ".github/workflows/benchmark-timing-or-gates.yml",
+        encoding: .utf8
+    )
+
+    let publicGate = try #require(timingOrGates.range(of: "- name: Public behavior gate"))
+    let hiddenBenchmark = try #require(timingOrGates.range(of: "- name: Benchmark"))
+    #expect(publicGate.lowerBound < hiddenBenchmark.lowerBound)
+
+    let gateBody = String(timingOrGates[publicGate.lowerBound..<hiddenBenchmark.lowerBound])
+    // Gates machine only: the timing machine's pre-measurement state must stay
+    // untouched.
+    #expect(gateBody.contains("if: ${{ inputs.mode == 'gates' }}"))
+    #expect(gateBody.contains("--golden \"${public_golden}\""))
+    #expect(gateBody.contains("public-gate-report.json"))
+    // Submission branches must suppress the submitted process's own logs, same
+    // as every other step that executes submitted model code.
+    #expect(gateBody.contains("mlxfast-public-gate-private.log"))
+
+    // The pinned hash must match the actual checked-in fixture, so regenerating
+    // the fixture forces this workflow (and benchmark.yml's pin) to move too.
+    let fixtureData = try Data(
+        contentsOf: URL(fileURLWithPath: "correctness_prompts/public_longcopy_gate_english_512_256.json")
+    )
+    let fixtureHash = SHA256.hash(data: fixtureData).map { String(format: "%02x", $0) }.joined()
+    #expect(gateBody.contains(fixtureHash))
+    let benchmarkWorkflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+    #expect(benchmarkWorkflow.contains(fixtureHash))
 }
 
 // The 64-step teacher-forced base case only exercises single-token forwards at
