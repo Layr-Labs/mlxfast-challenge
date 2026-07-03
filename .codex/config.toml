@@ -1,0 +1,14 @@
+# >>> yukon trace hook (managed) >>>
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "sh '.yukon/hooks/yukon-trace.sh' codex UserPromptSubmit"
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "sh '.yukon/hooks/yukon-trace.sh' codex Stop"
+[[hooks.SubagentStop]]
+[[hooks.SubagentStop.hooks]]
+type = "command"
+command = "sh '.yukon/hooks/yukon-trace.sh' codex SubagentStop"
+# <<< yukon trace hook (managed) <<<

@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeSubmitPrompt": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+      }
+    ],
+    "afterAgentResponse": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+      }
+    ],
+    "afterAgentThought": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+      }
+    ],
+    "afterShellExecution": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+      }
+    ],
+    "afterFileEdit": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+      }
+    ],
+    "postToolUseFailure": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+      }
+    ],
+    "afterMCPExecution": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+      }
+    ],
+    "subagentStart": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+      }
+    ],
+    "sessionStart": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+      }
+    ],
+    "stop": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+      }
+    ]
+  }
+}
