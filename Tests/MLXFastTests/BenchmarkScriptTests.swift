@@ -872,10 +872,20 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     let workerTeacherForced = String(runtime[workerTeacherForcedStart.lowerBound..<workerAnchorStart.lowerBound])
     let workerAnchor = String(runtime[workerAnchorStart.lowerBound..<workerBehaviorStart.lowerBound])
     let workerBehavior = String(runtime[workerBehaviorStart.lowerBound..<workerValidationStart.lowerBound])
+    // Worker/non-worker parity: every worker comparison applies the same
+    // acceptance rules as its cached counterpart (top-logit tie tolerance,
+    // anchor rank/delta fields), using worker-reported top logits only after
+    // validatedWorkerTopLogits vets them -- malformed logits degrade to the
+    // strict comparison (try?), never to a wider acceptance. A golden
+    // generated on one Apple Silicon generation must not hard-fail another
+    // over a true near-tie (issue #83).
     #expect(workerTeacherForced.contains("actualToken != expectedToken"))
-    #expect(!workerTeacherForced.contains("correctnessTokenAccepted("))
-    #expect(workerAnchor.contains("topLogits: nil"))
-    #expect(workerBehavior.contains("topLogits: nil"))
+    #expect(workerTeacherForced.contains("correctnessTokenAccepted("))
+    #expect(workerTeacherForced.contains("try? validatedWorkerTopLogits("))
+    #expect(!workerAnchor.contains("topLogits: nil"))
+    #expect(workerAnchor.contains("try? validatedWorkerTopLogits(response.topLogits, actualToken: actualToken)"))
+    #expect(!workerBehavior.contains("topLogits: nil"))
+    #expect(workerBehavior.contains("try? validatedWorkerTopLogits(beginResponse.topLogits, actualToken: firstToken)"))
     #expect(workerBehavior.contains("let usesSemanticJudge = behaviorUsesSemanticJudge(testCase)"))
     #expect(workerBehavior.contains("if !usesSemanticJudge"))
     #expect(workerBehavior.contains("if usesSemanticJudge ||"))
