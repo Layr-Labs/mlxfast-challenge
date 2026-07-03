@@ -77,6 +77,33 @@ Measured on the baseline reference under the current (single-seed) harness:
 If either number here disagrees with `Sources/MLXFastCore/Constants.swift`, the
 freeze test fails on purpose -- the doc and the code must move together.
 
+### Per-prompt baselines in the golden oracle
+
+These constants are the **fallback**, not the only source. A golden's
+`benchmark` oracle may carry its own calibration:
+
+```json
+"benchmark": {
+  "...": "...",
+  "baseline_prefill_seconds_per_token": 0.17,
+  "baseline_decode_seconds_per_token": 3.63
+}
+```
+
+Rules, enforced at golden load and by the freeze tests:
+
+- Both fields must be present together or absent together, finite and positive.
+  A half-calibrated oracle would silently mix two calibration regimes.
+- When present, scored speedups, floors, the published `baseline_*` metrics,
+  and the gates-only machine's placeholder timing all resolve from the golden.
+  When absent, everything resolves from the constants above (the pre-pool
+  behavior; all public fixtures carry none).
+- Carrying baselines in the golden is what makes prompt-pool rotation rankable:
+  each pool prompt ships its own officially measured calibration, so rotating
+  prompts of different intrinsic difficulty keeps speedups comparable. It does
+  NOT change the charged window -- adding a pool prompt is baseline work for
+  that prompt only, never a re-baseline of the window itself.
+
 ## Re-baseline protocol (how to change the window)
 
 1. Make the window change and update the constants above in
@@ -103,6 +130,9 @@ interchangeable prompts, rotated one at a time**:
 - Calibrate the entire pool in one baseline session (all prompts measured under
   the same toolchain, runner, and thermal state). Never add a pool member later
   without a batched calibration -- a late addition is another baseline.
+- Each pool prompt's golden carries its own measured calibration via the
+  per-prompt baseline fields described above, so the harness scores every
+  rotation slot against that prompt's own baseline automatically.
 - At ranking time, select one pool prompt per run and rotate which one is active.
   Contestants get feedback on whichever prompt they were scored against but
   cannot select-overfit a fixed trajectory across repeated submissions.

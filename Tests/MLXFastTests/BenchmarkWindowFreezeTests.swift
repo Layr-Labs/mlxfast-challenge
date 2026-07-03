@@ -122,6 +122,30 @@ func timedPrefillChargesOneValidatedColdForward() throws {
 }
 
 @Test
+func scoredBaselinesResolveFromGoldenWithConstantsFallback() throws {
+    // Prompt-pool rotation: the golden oracle may carry per-prompt baselines
+    // (both axes together, validated positive at load). The scored speedups and
+    // floors must use the golden-resolved values, with the calibrated constants
+    // as the fallback for goldens that carry none -- so a pool prompt of
+    // different intrinsic difficulty ranks on its own calibration instead of
+    // the default prompt's.
+    let golden = try packageFile("Sources/MLXFastCore/Golden.swift")
+    #expect(golden.contains("baselinePrefillSecondsPerToken ?? MLXFastConstants.officialBaselinePrefillSecondsPerToken"))
+    #expect(golden.contains("baselineDecodeSecondsPerToken ?? MLXFastConstants.officialBaselineDecodeSecondsPerToken"))
+    #expect(golden.contains("must be provided together"))
+
+    let benchmark = try packageFile("Sources/MLXFastHarness/DeepSeekRuntimeBenchmark.swift")
+    // Both benchmark paths adopt the golden's resolved baselines...
+    #expect(benchmark.components(separatedBy: "benchmarkGolden.resolvedBaselinePrefillSecondsPerToken").count - 1 == 2)
+    #expect(benchmark.components(separatedBy: "benchmarkGolden.resolvedBaselineDecodeSecondsPerToken").count - 1 == 2)
+    // ...and every scored speedup uses the resolved values, never the raw constants.
+    #expect(benchmark.contains("baselineSecondsPerToken: baselineDecodeSecondsPerToken"))
+    #expect(benchmark.contains("baselineSecondsPerToken: baselinePrefillSecondsPerToken"))
+    #expect(!benchmark.contains("baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken"))
+    #expect(!benchmark.contains("baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken"))
+}
+
+@Test
 func decodeValidationDelayHookDefaultsToNoOp() {
     // The one editable-surface knob that can add time to the trusted decode loop
     // must read zero on main/baseline. It can only ever slow a submission down,

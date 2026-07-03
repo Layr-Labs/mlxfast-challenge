@@ -394,6 +394,162 @@ func loadGoldenFixtureAcceptsBenchmarkOracle() throws {
     #expect(fixture.benchmark?.decodeSeedTokens == seed)
     #expect(fixture.benchmark?.expectedDecodeSeedToken == 5)
     #expect(fixture.benchmark?.expectedDecodeTokens == decode)
+    // No per-prompt baselines carried: scoring resolves to the calibrated constants.
+    #expect(fixture.benchmark?.baselinePrefillSecondsPerToken == nil)
+    #expect(fixture.benchmark?.baselineDecodeSecondsPerToken == nil)
+    #expect(
+        fixture.benchmark?.resolvedBaselinePrefillSecondsPerToken
+            == MLXFastConstants.officialBaselinePrefillSecondsPerToken
+    )
+    #expect(
+        fixture.benchmark?.resolvedBaselineDecodeSecondsPerToken
+            == MLXFastConstants.officialBaselineDecodeSecondsPerToken
+    )
+}
+
+private func benchmarkOracleGoldenJSON(baselineFieldsJSON: String) -> String {
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+    let prefill = Array(repeating: 1, count: MLXFastConstants.benchmarkPrefillPromptTokens)
+    let seed = Array(repeating: 2, count: MLXFastConstants.benchmarkDecodeSeedTokens)
+    let decode = Array(repeating: 3, count: MLXFastConstants.benchmarkDecodeSteps)
+    return """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "hidden-0",
+          "prompt_tokens": \(correctnessPromptJSON()),
+          "expected_tokens": \(expected)
+        }
+      ],
+      "benchmark": {
+        "prefill_prompt_tokens": \(prefill),
+        "expected_prefill_token": 4,
+        "decode_seed_tokens": \(seed),
+        "expected_decode_seed_token": 5,
+        "expected_decode_tokens": \(decode)\(baselineFieldsJSON)
+      }
+    }
+    """
+}
+
+@Test
+func loadGoldenFixtureAcceptsPerPromptBenchmarkBaselines() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let json = benchmarkOracleGoldenJSON(baselineFieldsJSON: """
+    ,
+        "baseline_prefill_seconds_per_token": 0.25,
+        "baseline_decode_seconds_per_token": 4.5
+    """)
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    let fixture = try loadGoldenFixture(from: path.path)
+
+    #expect(fixture.benchmark?.baselinePrefillSecondsPerToken == 0.25)
+    #expect(fixture.benchmark?.baselineDecodeSecondsPerToken == 4.5)
+    // Carried baselines win over the calibrated constants.
+    #expect(fixture.benchmark?.resolvedBaselinePrefillSecondsPerToken == 0.25)
+    #expect(fixture.benchmark?.resolvedBaselineDecodeSecondsPerToken == 4.5)
+}
+
+@Test
+func loadGoldenFixtureRejectsUnknownBenchmarkKeys() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    // A typo'd scoring-critical key must fail loudly. Without strict nested
+    // key validation, JSONDecoder drops the unknown key, both baselines decode
+    // as nil, and the run silently scores against the calibrated constants
+    // instead of the intended per-prompt baseline.
+    let json = benchmarkOracleGoldenJSON(baselineFieldsJSON: """
+    ,
+        "baseline_decode_second_per_token": 4.5
+    """)
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    do {
+        _ = try loadGoldenFixture(from: path.path)
+        Issue.record("expected unknown benchmark key to be rejected")
+    } catch let MLXFastError.invalidInput(message) {
+        #expect(message.contains("unknown key"))
+        #expect(message.contains("baseline_decode_second_per_token"))
+    } catch {
+        Issue.record("expected MLXFastError.invalidInput, got \(error)")
+    }
+}
+
+@Test
+func loadGoldenFixtureRejectsNullBenchmarkObject() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "hidden-0",
+          "prompt_tokens": \(correctnessPromptJSON()),
+          "expected_tokens": \(expected)
+        }
+      ],
+      "benchmark": null
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    do {
+        _ = try loadGoldenFixture(from: path.path)
+        Issue.record("expected null benchmark object to be rejected")
+    } catch let MLXFastError.invalidInput(message) {
+        #expect(message.contains("benchmark must not be null"))
+    } catch {
+        Issue.record("expected MLXFastError.invalidInput, got \(error)")
+    }
+}
+
+@Test
+func loadGoldenFixtureRejectsHalfCalibratedBenchmarkBaselines() throws {
+    let directory = try temporaryDirectory()
+    for lonelyField in [
+        "\"baseline_prefill_seconds_per_token\": 0.25",
+        "\"baseline_decode_seconds_per_token\": 4.5",
+    ] {
+        let path = directory.appendingPathComponent("golden-\(UUID().uuidString).json")
+        let json = benchmarkOracleGoldenJSON(baselineFieldsJSON: ",\n    \(lonelyField)")
+        try json.write(to: path, atomically: true, encoding: .utf8)
+
+        do {
+            _ = try loadGoldenFixture(from: path.path)
+            Issue.record("expected half-calibrated baseline pair to be rejected")
+        } catch let MLXFastError.invalidInput(message) {
+            #expect(message.contains("must be provided together"))
+        } catch {
+            Issue.record("expected MLXFastError.invalidInput, got \(error)")
+        }
+    }
+}
+
+@Test
+func loadGoldenFixtureRejectsNonPositiveBenchmarkBaselines() throws {
+    let directory = try temporaryDirectory()
+    for badPair in [
+        "\"baseline_prefill_seconds_per_token\": 0, \"baseline_decode_seconds_per_token\": 4.5",
+        "\"baseline_prefill_seconds_per_token\": 0.25, \"baseline_decode_seconds_per_token\": -1.0",
+    ] {
+        let path = directory.appendingPathComponent("golden-\(UUID().uuidString).json")
+        let json = benchmarkOracleGoldenJSON(baselineFieldsJSON: ",\n    \(badPair)")
+        try json.write(to: path, atomically: true, encoding: .utf8)
+
+        do {
+            _ = try loadGoldenFixture(from: path.path)
+            Issue.record("expected non-positive baseline to be rejected")
+        } catch let MLXFastError.invalidInput(message) {
+            #expect(message.contains("must be finite and positive"))
+        } catch {
+            Issue.record("expected MLXFastError.invalidInput, got \(error)")
+        }
+    }
 }
 
 @Test
