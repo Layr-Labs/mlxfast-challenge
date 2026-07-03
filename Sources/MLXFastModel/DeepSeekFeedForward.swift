@@ -113,13 +113,9 @@ public enum DeepSeekMoE {
             topK: spec.expertsPerToken,
             routedScalingFactor: spec.routedScalingFactor,
             normTopKProb: spec.normTopKProb,
-            scoring: spec.scoring
+            scoring: spec.scoring,
+            asyncEvalIndices: true
         )
-        // Start the GPU on routing as soon as the indices graph exists. The
-        // shared expert graph construction below is CPU-side work, so this
-        // gives the routing eval a little more runway before indices.asArray
-        // blocks in RoutedExperts.forward.
-        asyncEval(routing.indices)
         // Build the shared expert graph up front: it depends only on x and
         // RAM-resident shared weights (no SSD read), so eval-ing it during
         // the routed experts' blocking SSD reads fills otherwise-idle GPU
