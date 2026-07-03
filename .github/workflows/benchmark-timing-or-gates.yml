@@ -238,11 +238,21 @@ jobs:
         run: |
           set -euo pipefail
           started="${SECONDS}"
-          # Reuse the already-built MLX metallib: the baseline ref pins the
-          # same mlx-swift revision (guard-tested), so the artifact is
-          # identical and rebuilding it would waste ~minutes.
-          mkdir -p paired-baseline/.build/release
+          # Build FIRST: SwiftPM replaces .build/release with a symlink to the
+          # arch directory during the build, so anything copied in beforehand
+          # is wiped. Then reuse the already-built MLX metallib -- the baseline
+          # ref pins the same mlx-swift revision (guard-tested), so the
+          # artifact is identical and rebuilding it would waste ~minutes; a
+          # worker without it dies on its first Metal op.
+          (
+            cd paired-baseline
+            mkdir -p .build/clang-module-cache
+            export CLANG_MODULE_CACHE_PATH="${PWD}/.build/clang-module-cache"
+            swift build -c release
+          )
+          test -s .build/release/mlx.metallib
           cp .build/release/mlx.metallib paired-baseline/.build/release/mlx.metallib
+          test -s paired-baseline/.build/release/mlx.metallib
           baseline_score="${GITHUB_WORKSPACE}/paired-baseline-score.json"
           status=0
           (
