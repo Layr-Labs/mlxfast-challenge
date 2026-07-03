@@ -125,6 +125,14 @@ public enum DeepSeekMoE {
             weights: weights.sharedExperts,
             swigluLimit: spec.routedExperts.swigluLimit
         )
+        // Start the GPU on the routing indices AND the shared expert now,
+        // before RoutedExperts.forward blocks on indices.asArray. The profile
+        // shows that sync dominating decode: the CPU sits in Event::wait
+        // while the GPU evaluates routing. asyncEval dispatches the same
+        // graph work early so the subsequent asArray finds it finished or
+        // in flight. Scheduling only — identical ops, identical values,
+        // identical eval order within the graph.
+        asyncEval([routing.indices, shared])
         let routed = try DeepSeekRoutedExperts.forward(
             x,
             expertIndices: routing.indices,
