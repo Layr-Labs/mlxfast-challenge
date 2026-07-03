@@ -40,10 +40,7 @@ public enum DeepSeekHyperConnection {
             eps: eps
         )
 
-        let collapsed = DeepSeekOps.cast(
-            (mix.pre.expandedDimensions(axis: -1) * y).sum(axis: 2),
-            to: x.dtype
-        )
+        let collapsed = compiledCollapseTail(hcMult: hcMult, outputDType: x.dtype)(mix.pre, y)
         return DeepSeekHyperConnectionOutput(
             collapsed: collapsed,
             post: mix.post,
@@ -99,6 +96,56 @@ public enum DeepSeekHyperConnection {
     private static let compiledSinkhornCache =
         LockedCache<SinkhornKey, @Sendable (MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray, MLXArray)>()
 
+    private struct ExpandKey: Hashable {
+        let dtype: DType
+    }
+
+    private static let compiledExpandCache =
+        LockedCache<ExpandKey, @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray>()
+
+    private struct CollapseTailKey: Hashable {
+        let hcMult: Int
+        let outputDType: DType
+    }
+
+    private static let compiledCollapseTailCache =
+        LockedCache<CollapseTailKey, @Sendable (MLXArray, MLXArray) -> MLXArray>()
+
+    /// Compiled collapse tail: fuses the pre*y multiply, sum over hc, and
+    /// dtype cast into one kernel. Runs 86x per decode step. Pure
+    /// elementwise (multiply + reduce + cast) with no accumulation-order
+    /// sensitivity beyond the existing compiled Sinkhorn.
+    private static func compiledCollapseTail(
+        hcMult: Int,
+        outputDType: DType
+    ) -> @Sendable (MLXArray, MLXArray) -> MLXArray {
+        let key = CollapseTailKey(hcMult: hcMult, outputDType: outputDType)
+        return compiledCollapseTailCache.value(for: key) {
+            compile { (pre: MLXArray, y: MLXArray) -> MLXArray in
+                return (pre.expandedDimensions(axis: -1) * y).sum(axis: 2).asType(outputDType)
+            }
+        }
+    }
+
+    /// Cached compiled expand: fuses the post*x scaling, residual matmul, and
+    /// final cast into one kernel set. The matmul stays a matmul (MLX keeps it
+    /// as a BLAS call under compile), but the surrounding elementwise ops
+    /// (cast, expandedDimensions multiply, add, cast) fuse. Shape-stable on
+    /// decode (inputs are always [1,1,hc,hidden] + [1,1,hc] + [hc,hc] +
+    /// [1,1,hidden]).
+    private static func compiledExpand(
+        outputDType: DType
+    ) -> @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray {
+        let key = ExpandKey(dtype: outputDType)
+        return compiledExpandCache.value(for: key) {
+            compile { (post: MLXArray, x: MLXArray, combination: MLXArray, residual: MLXArray) in
+                let postScaled = post.expandedDimensions(axis: -1) * x.expandedDimensions(axis: -2)
+                let residualMixed = matmul(combination.swappedAxes(-1, -2), residual)
+                return (postScaled + residualMixed).asType(outputDType)
+            }
+        }
+    }
+
     /// Cached, shape-specialized compiled Sinkhorn core. Inputs are the already
     /// f32-cast (mixes, scale, base); outputs are (pre, post, combination),
     /// identical in math to the inline loop above.
@@ -134,13 +181,10 @@ public enum DeepSeekHyperConnection {
         post: MLXArray,
         combination: MLXArray
     ) -> MLXArray {
-        let postScaled = post.expandedDimensions(axis: -1)
-            * DeepSeekOps.cast(x.expandedDimensions(axis: -2), to: .float32)
-        let residualMixed = matmul(
-            combination.swappedAxes(-1, -2),
-            DeepSeekOps.cast(residual, to: .float32)
-        )
-        return DeepSeekOps.cast(postScaled + residualMixed, to: x.dtype)
+        let xF32 = DeepSeekOps.cast(x, to: .float32)
+        let residualF32 = DeepSeekOps.cast(residual, to: .float32)
+        let expand = compiledExpand(outputDType: x.dtype)
+        return expand(post, xF32, combination, residualF32)
     }
 
     public static func head(

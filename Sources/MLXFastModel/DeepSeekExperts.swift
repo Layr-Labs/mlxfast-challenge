@@ -35,7 +35,8 @@ public enum DeepSeekRoutedExperts {
         _ x: MLXArray,
         expertIndices: MLXArray,
         loader: DeepSeekWeightLoader,
-        spec: DeepSeekRoutedExpertSpec
+        spec: DeepSeekRoutedExpertSpec,
+        onRoutingSynced: (() -> Void)? = nil
     ) throws -> MLXArray {
         guard x.shape.count == 3 else {
             throw MLXFastError.invalidInput("routed expert input must have shape [batch, length, hidden]")
@@ -107,6 +108,16 @@ public enum DeepSeekRoutedExperts {
         // flatIndex / topK. Gathering rows with a single `take` replaces the
         // per-token slice+concat that built each expert batch previously.
         let xFlat = x.reshaped([tokenCount, hiddenSize])
+
+        // The shared expert depends only on x (RAM-resident weights, no SSD
+        // read), so it is the one piece of GPU work that can run during the
+        // routed experts' blocking SSD reads below. Fire the overlap hook
+        // (which evals the already-built shared MLP graph) right before the
+        // concurrentPerform barrier, filling the GPU-idle read window. Only
+        // on the decode path where that idle window exists.
+        if tokenCount == 1, !useStaged {
+            onRoutingSynced?()
+        }
 
         // Decode/1-token path: the per-expert code slices are otherwise read
         // one blocking pread at a time on the compute thread. Read them
