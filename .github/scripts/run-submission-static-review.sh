@@ -210,7 +210,12 @@ jq -s \
   --rawfile submission_diff "${submission_diff_path}" \
   '{
     model: $model,
-    max_tokens: 1024,
+    # 1024 deterministically truncated the judge mid-JSON on large diffs
+    # (temperature 0 reproduces the same over-long analysis every retry), so
+    # every complex submission failed review with unparseable JSON. 4096
+    # leaves generous room for the verdict object while stop_reason is
+    # checked after the call to fail loudly on any remaining truncation.
+    max_tokens: 4096,
     temperature: 0,
     system: $system,
     messages: [
@@ -296,6 +301,14 @@ for attempt in 1 2 3; do
   review_json_text="$(printf '%s' "${review_text}" | extract_review_json)"
   if [[ -n "${review_json_text}" ]]; then
     break
+  fi
+  stop_reason="$(jq -r '.stop_reason // ""' "${response_path}")"
+  if [[ "${stop_reason}" == "max_tokens" ]]; then
+    # Deterministic at temperature 0: the same over-budget response comes
+    # back every retry, so surface the real cause instead of a generic
+    # parse failure and stop wasting attempts.
+    echo "::error::submission static review response was truncated at max_tokens; raise the request budget" >&2
+    exit 1
   fi
   if [[ "${attempt}" -lt 3 ]]; then
     echo "submission-review: judge response was not parseable JSON; retrying" >&2

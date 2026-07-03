@@ -73,6 +73,7 @@ jobs:
           bash -n .github/scripts/run-semantic-gpqa-gate.sh
           bash -n .github/scripts/run-submission-static-review.sh
           bash -n .github/scripts/deny-private-artifacts.sh
+          bash -n .github/scripts/redact-benchmark-failure.sh
           bash -n .github/scripts/stage-benchmark-artifacts.sh
           bash -n .github/scripts/download-r2-object.sh
           bash -n .github/scripts/upload-r2-object.sh

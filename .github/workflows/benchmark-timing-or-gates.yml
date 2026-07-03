@@ -484,6 +484,35 @@ jobs:
             ' \
             score.json >/dev/null
 
+      # A failing score.json cannot be uploaded (its error text and token
+      # fields can leak hidden-golden values or submitted-code-controlled
+      # content), and the private process log dies with the ephemeral runner
+      # -- so until now every benchmark failure surfaced as an
+      # indistinguishable "benchmark_failed". Derive and upload a REDACTED
+      # failure category (floor / token mismatch / crash / no score) so
+      # operators can tell WHY a run failed without widening the leak surface.
+      - name: Surface redacted benchmark failure
+        id: redact_benchmark_failure
+        if: ${{ failure() }}
+        env:
+          MLXFAST_BENCHMARK_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          .github/scripts/redact-benchmark-failure.sh benchmark-failure.json
+          .github/scripts/deny-private-artifacts.sh benchmark-failure.json
+
+      # Deliberately NOT named benchmark-parallel-*: combine downloads that
+      # prefix wholesale, and the failure record must never enter the combine
+      # or scoring path -- it exists only for post-mortem triage.
+      - name: Upload redacted benchmark failure
+        if: ${{ failure() && steps.redact_benchmark_failure.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: benchmark-failure-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.mode }}
+          path: benchmark-failure.json
+          if-no-files-found: error
+          retention-days: 90
+
       - name: Prepare golden expectations for combine
         id: prepare_golden_expectations
         if: always()
