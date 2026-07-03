@@ -852,6 +852,8 @@ func gatesMachineRunsPublicBehaviorGateBeforeHiddenGates() throws {
         encoding: .utf8
     )
     #expect(benchmarkWorkflow.contains(fixtureHash))
+}
+
 // The 64-step teacher-forced base case only exercises single-token forwards at
 // offsets 512..575, while the timed decode reaches 512..639. attach-free-run-gate
 // lets the operator regenerate the private golden with a free-run case whose
