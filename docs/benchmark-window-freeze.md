@@ -104,6 +104,40 @@ Rules, enforced at golden load and by the freeze tests:
   NOT change the charged window -- adding a pool prompt is baseline work for
   that prompt only, never a re-baseline of the window itself.
 
+### Paired baseline measurement (official timing machine)
+
+Fixed constants compare a live single sample against a number measured on a
+different physical host at a different hour. Measured fleet drift on identical
+code across one day: prefill 0.163 -> 0.190 seconds/token (~10%+), decode ~4% --
+enough to flip floor verdicts and swing scores for reasons unrelated to the
+submission. Official ranked runs therefore measure the baseline live:
+
+- The timing machine checks out the **pinned paired-baseline ref** (trusted
+  workflow content; submissions cannot repoint it), builds it, transforms its
+  own weights, and runs its timed benchmark against the same hidden golden in
+  the same session, minutes before the candidate.
+- The measured seconds-per-token are passed to the candidate benchmark through
+  `MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN` /
+  `MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN`. Resolution precedence in
+  the harness is **paired override, then golden-carried baselines, then the
+  constants**. The pair is fail-closed (both together, finite, positive) and
+  both variables are stripped from the sandboxed worker environment.
+- A **sanity band** guards the pairing: the baseline sample must fall within
+  [0.66x, 1.5x] of the calibrated constants on both axes, so a pathological VM
+  or broken baseline build fails the run instead of repricing every speedup.
+- The baseline's own floor verdict is ignored (it is measured against its
+  checked-in constants and legitimately fails on a slow-fleet session); token
+  mismatches or harness errors in the baseline run fail the whole run.
+- Changing the pinned ref is a ranking-contract change: it redefines what
+  "1.0x" means. Update the ref, this doc, and the pinned guard test together.
+
+With pairing active, the constants keep three roles: local-mode scoring (no
+second build available locally), the gates-only machine's placeholder timing,
+and the sanity-band anchor. Pool prompts no longer need pre-calibrated
+baselines on the official path -- the baseline is measured live against
+whichever prompt is active, which also removes the batched pool-calibration
+session as a hard prerequisite for rotation.
+
 ## Re-baseline protocol (how to change the window)
 
 1. Make the window change and update the constants above in

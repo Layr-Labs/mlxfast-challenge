@@ -42,6 +42,11 @@ func runtimeWorkerEnvironmentStripsOfficialRunAndCIIdentity() {
         // equivalents of the split-phase vars above.
         "MLXFAST_CORRECTNESS_BASE_CASE_ONLY": "1",
         "MLXFAST_CORRECTNESS_STEP_RANGE": "21-42",
+        // Same-session baseline timings from the trusted paired-baseline step;
+        // submitted code must not observe the reference implementation's live
+        // numbers (or that the run is paired at all).
+        "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN": "0.17",
+        "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN": "3.6",
     ])
 
     for key in [
@@ -62,12 +67,59 @@ func runtimeWorkerEnvironmentStripsOfficialRunAndCIIdentity() {
         "MLXFAST_BENCHMARK_SKIP_TIMED",
         "MLXFAST_CORRECTNESS_BASE_CASE_ONLY",
         "MLXFAST_CORRECTNESS_STEP_RANGE",
+        "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN",
+        "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN",
     ] {
         #expect(sanitized[key] == nil)
     }
     #expect(sanitized["MLXFAST_USE_RUNTIME_WORKER"] == "0")
     #expect(sanitized["MLXFAST_EXPERT_CACHE_TENSORS"] == "42")
     #expect(sanitized["PATH"] == "/usr/bin")
+}
+
+@Test
+func pairedBaselineOverrideParsesTrustedEnvironmentFailClosed() throws {
+    // Absent entirely: no pairing, callers fall back to golden/constants.
+    #expect(try PairedBaselineOverride.fromEnvironment([:]) == nil)
+    #expect(try PairedBaselineOverride.fromEnvironment([
+        "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN": "",
+        "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN": "  ",
+    ]) == nil)
+
+    // Present: both values parsed precisely.
+    let override = try #require(try PairedBaselineOverride.fromEnvironment([
+        "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN": "0.16518489738085937",
+        "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN": "3.6977511595078125",
+    ]))
+    #expect(override.prefillSecondsPerToken == 0.16518489738085937)
+    #expect(override.decodeSecondsPerToken == 3.6977511595078125)
+
+    // Half-set pairs and non-positive/non-finite values are operator wiring
+    // errors: fail closed rather than silently repricing against constants.
+    for badEnvironment: [String: String] in [
+        ["MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN": "0.17"],
+        ["MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN": "3.6"],
+        [
+            "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN": "0",
+            "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN": "3.6",
+        ],
+        [
+            "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN": "0.17",
+            "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN": "-1",
+        ],
+        [
+            "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN": "inf",
+            "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN": "3.6",
+        ],
+        [
+            "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN": "fast",
+            "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN": "3.6",
+        ],
+    ] {
+        #expect(throws: MLXFastError.self) {
+            _ = try PairedBaselineOverride.fromEnvironment(badEnvironment)
+        }
+    }
 }
 
 @Test
