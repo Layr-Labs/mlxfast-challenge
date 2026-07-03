@@ -519,14 +519,7 @@ private enum MLXFastCLI {
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        let outputData = try encoder.encode(merged)
-        let outputURL = URL(fileURLWithPath: outputPath)
-        try FileManager.default.createDirectory(
-            at: outputURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try outputData.write(to: outputURL, options: [.atomic])
-        _ = try loadGoldenFixture(from: outputPath)
+        try writeValidatedGoldenDocument(encoder.encode(merged), to: outputPath)
         print(
             "attached GPQA behavior gates cases=\(behaviorCases.count) "
                 + "max_new_tokens=\(maxNewTokens) "
@@ -551,7 +544,8 @@ private enum MLXFastCLI {
             valueOptions: [
                 "--golden", "--weights", "--output", "--name", "--steps",
                 "--case", "--prompt-file", "--tokenizer", "--exact-prefix",
-            ]
+            ],
+            flagOptions: ["--allow-partial"]
         )
         let goldenPath = options.value(
             for: "--golden",
@@ -576,10 +570,20 @@ private enum MLXFastCLI {
             )
         }
         if steps < MLXFastConstants.benchmarkDecodeSteps {
+            // The command exists to cover the timed decode offsets; a partial
+            // gate silently leaves the specialization gap open, so fail closed
+            // unless the operator explicitly opts in (debugging, staged runs).
+            guard options.hasFlag("--allow-partial") else {
+                throw MLXFastError.invalidInput(
+                    "--steps \(steps) is below benchmarkDecodeSteps "
+                        + "\(MLXFastConstants.benchmarkDecodeSteps), so the gate would not cover "
+                        + "the full timed decode offset range; pass --allow-partial to write it anyway"
+                )
+            }
             fputs(
                 "attach-free-run-gate: warning: --steps \(steps) is below "
                     + "benchmarkDecodeSteps \(MLXFastConstants.benchmarkDecodeSteps); "
-                    + "the gate will not cover the full timed decode offset range\n",
+                    + "the gate will NOT cover the full timed decode offset range (--allow-partial)\n",
                 stderr
             )
         }
@@ -598,6 +602,10 @@ private enum MLXFastCLI {
             URL(fileURLWithPath: weightsPath).appendingPathComponent("config.json").path,
             description: "weights config.json"
         )
+        // Strict-validate the INPUT before any generation or write. --output
+        // defaults to the input path, so a malformed input must fail here --
+        // never after the original has been replaced on disk.
+        _ = try loadGoldenFixture(from: goldenPath)
         let goldenData = try Data(contentsOf: URL(fileURLWithPath: goldenPath))
         let golden = try JSONDecoder().decode(GoldenDocument.self, from: goldenData)
 
@@ -672,20 +680,38 @@ private enum MLXFastCLI {
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        let outputData = try encoder.encode(merged)
-        let outputURL = URL(fileURLWithPath: outputPath)
-        try FileManager.default.createDirectory(
-            at: outputURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try outputData.write(to: outputURL, options: [.atomic])
-        _ = try loadGoldenFixture(from: outputPath)
+        try writeValidatedGoldenDocument(encoder.encode(merged), to: outputPath)
         print(
             "attached free-run gate name=\(caseName) steps=\(steps) "
                 + "decode_offsets=\(promptTokens.count)..<\(promptTokens.count + steps) "
                 + "exact_prefix=\(exactPrefixTokens.map(String.init) ?? "full") "
                 + "output=\(outputPath)"
         )
+    }
+
+    // Writes a merged golden by staging to a temp sibling and proving the
+    // result loads through the strict fixture loader BEFORE it can touch the
+    // destination. The attach commands default --output to the input golden,
+    // so an in-place write followed by a failed validation would destroy the
+    // original (typically the private golden) with nothing to roll back to.
+    private static func writeValidatedGoldenDocument(_ outputData: Data, to outputPath: String) throws {
+        let outputURL = URL(fileURLWithPath: outputPath)
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let temporaryURL = outputURL.deletingLastPathComponent()
+            .appendingPathComponent(".\(outputURL.lastPathComponent).attach-\(UUID().uuidString).tmp")
+        defer {
+            try? FileManager.default.removeItem(at: temporaryURL)
+        }
+        try outputData.write(to: temporaryURL, options: [.atomic])
+        _ = try loadGoldenFixture(from: temporaryURL.path)
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            _ = try FileManager.default.replaceItemAt(outputURL, withItemAt: temporaryURL)
+        } else {
+            try FileManager.default.moveItem(at: temporaryURL, to: outputURL)
+        }
     }
 
     private static func runGenerateGPQAAnswers(_ options: ParsedOptions) throws {
@@ -1230,7 +1256,7 @@ private enum MLXFastCLI {
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
               mlxfast-swift benchmark [--local-submit|--local-iterate] [--weights PATH] [--golden PATH] [--score-path PATH]
               mlxfast-swift attach-gpqa-gates [--golden PATH] --gpqa PATH [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
-              mlxfast-swift attach-free-run-gate [--golden PATH] [--weights PATH] [--output PATH] [--name NAME] [--steps N] [--case NAME | --prompt-file PATH [--tokenizer PATH]] [--exact-prefix N]
+              mlxfast-swift attach-free-run-gate [--golden PATH] [--weights PATH] [--output PATH] [--name NAME] [--steps N] [--allow-partial] [--case NAME | --prompt-file PATH [--tokenizer PATH]] [--exact-prefix N]
               mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]
               mlxfast-swift checkpoint-shards --index PATH
 

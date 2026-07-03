@@ -454,6 +454,61 @@ func loadGoldenFixtureAcceptsPerPromptBenchmarkBaselines() throws {
 }
 
 @Test
+func loadGoldenFixtureRejectsUnknownBenchmarkKeys() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    // A typo'd scoring-critical key must fail loudly. Without strict nested
+    // key validation, JSONDecoder drops the unknown key, both baselines decode
+    // as nil, and the run silently scores against the calibrated constants
+    // instead of the intended per-prompt baseline.
+    let json = benchmarkOracleGoldenJSON(baselineFieldsJSON: """
+    ,
+        "baseline_decode_second_per_token": 4.5
+    """)
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    do {
+        _ = try loadGoldenFixture(from: path.path)
+        Issue.record("expected unknown benchmark key to be rejected")
+    } catch let MLXFastError.invalidInput(message) {
+        #expect(message.contains("unknown key"))
+        #expect(message.contains("baseline_decode_second_per_token"))
+    } catch {
+        Issue.record("expected MLXFastError.invalidInput, got \(error)")
+    }
+}
+
+@Test
+func loadGoldenFixtureRejectsNullBenchmarkObject() throws {
+    let directory = try temporaryDirectory()
+    let path = directory.appendingPathComponent("golden.json")
+    let expected = Array(repeating: 7, count: MLXFastConstants.correctnessSteps)
+    let json = """
+    {
+      "version": 1,
+      "cases": [
+        {
+          "name": "hidden-0",
+          "prompt_tokens": \(correctnessPromptJSON()),
+          "expected_tokens": \(expected)
+        }
+      ],
+      "benchmark": null
+    }
+    """
+    try json.write(to: path, atomically: true, encoding: .utf8)
+
+    do {
+        _ = try loadGoldenFixture(from: path.path)
+        Issue.record("expected null benchmark object to be rejected")
+    } catch let MLXFastError.invalidInput(message) {
+        #expect(message.contains("benchmark must not be null"))
+    } catch {
+        Issue.record("expected MLXFastError.invalidInput, got \(error)")
+    }
+}
+
+@Test
 func loadGoldenFixtureRejectsHalfCalibratedBenchmarkBaselines() throws {
     let directory = try temporaryDirectory()
     for lonelyField in [

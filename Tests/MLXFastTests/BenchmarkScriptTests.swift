@@ -827,15 +827,25 @@ func cliSupportsFreeRunGateAttachmentCoveringTimedDecodeOffsets() throws {
     #expect(cli.contains("case \"attach-free-run-gate\""))
     #expect(cli.contains("func runAttachFreeRunGate"))
     // Defaults to covering exactly the timed decode step count, capped at the
-    // free-run maximum, and warns when asked for less than full coverage.
+    // free-run maximum, and FAILS CLOSED when asked for less than full
+    // coverage unless the operator explicitly opts in with --allow-partial.
     #expect(cli.contains("options.value(for: \"--steps\", default: \"\\(MLXFastConstants.benchmarkDecodeSteps)\")"))
     #expect(cli.contains("steps <= MLXFastConstants.correctnessMaxFreeRunSteps"))
-    #expect(cli.contains("the gate will not cover the full timed decode offset range"))
+    #expect(cli.contains("options.hasFlag(\"--allow-partial\")"))
+    #expect(cli.contains("pass --allow-partial to write it anyway"))
     // Expected tokens come from actually running the reference model, with the
     // golden blocked from the worker like every other generation tool.
     #expect(cli.contains("runtimeWorkerOptions(blockedGoldenPath: goldenPath)"))
-    // The merged golden is re-validated through the strict loader before use.
-    #expect(cli.contains("_ = try loadGoldenFixture(from: outputPath)"))
+    // The INPUT golden is strict-validated before any generation or write --
+    // --output defaults to the input path, so a malformed input must fail
+    // before it could be replaced on disk.
+    #expect(cli.contains("_ = try loadGoldenFixture(from: goldenPath)"))
+    // The merged golden is staged to a temp sibling and re-validated through
+    // the strict loader BEFORE it replaces the destination, so a failed
+    // validation can never destroy the original golden.
+    #expect(cli.contains("func writeValidatedGoldenDocument"))
+    #expect(cli.contains("_ = try loadGoldenFixture(from: temporaryURL.path)"))
+    #expect(!cli.contains("try outputData.write(to: outputURL, options: [.atomic])"))
     #expect(cli.contains("attach-free-run-gate ["))
 }
 

@@ -620,6 +620,35 @@ private func validateGoldenFixtureKeys(_ data: Data) throws {
     if let gates = root["correctness_gates"] {
         try validateGoldenCorrectnessGateKeys(gates)
     }
+    if let benchmark = root["benchmark"] {
+        try validateGoldenBenchmarkKeys(benchmark)
+    }
+}
+
+private func validateGoldenBenchmarkKeys(_ benchmark: Any) throws {
+    guard !(benchmark is NSNull) else {
+        throw MLXFastError.invalidInput("benchmark must not be null")
+    }
+    guard let object = benchmark as? [String: Any] else {
+        throw MLXFastError.invalidInput("benchmark must be a JSON object")
+    }
+    // The baseline_* fields are scoring-critical: JSONDecoder silently drops
+    // unknown keys, so a typo'd baseline key would make the run fall back to
+    // the calibrated constants and score against the wrong baseline. Reject
+    // anything not in the benchmark oracle contract.
+    try rejectUnknownKeys(
+        Set(object.keys),
+        allowed: [
+            "prefill_prompt_tokens",
+            "expected_prefill_token",
+            "decode_seed_tokens",
+            "expected_decode_seed_token",
+            "expected_decode_tokens",
+            "baseline_prefill_seconds_per_token",
+            "baseline_decode_seconds_per_token",
+        ],
+        field: "benchmark"
+    )
 }
 
 private func validateGoldenCorrectnessGateKeys(_ gates: Any) throws {
