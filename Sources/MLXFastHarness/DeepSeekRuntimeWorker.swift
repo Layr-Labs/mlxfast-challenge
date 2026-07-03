@@ -662,6 +662,12 @@ func sanitizedRuntimeWorkerEnvironment(_ environment: [String: String]) -> [Stri
         "MLXFAST_IN_SANDBOX",
         "MLXFAST_NO_SANDBOX",
         "MLXFAST_OFFICIAL_BENCHMARK_RUN",
+        // Same-session measured baseline supplied by the trusted workflow's
+        // paired-baseline step. Submitted model code must not observe the
+        // reference implementation's live timings (or even that this run is
+        // paired) from inside the sandboxed worker.
+        "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN",
+        "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN",
         "MLXFAST_PRIVATE_DIR",
         "MLXFAST_PRIVATE_PROMPTS_R2_PRESENT",
         "MLXFAST_REFERENCE_AUTH_HEADER",
