@@ -157,13 +157,16 @@ extension DeepSeekRuntime {
                 throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
             }
             let promptPlan = try BenchmarkPrompt.plan(from: benchmarkGolden)
-            baselinePrefillSecondsPerToken = benchmarkGolden.resolvedBaselinePrefillSecondsPerToken
-            baselineDecodeSecondsPerToken = benchmarkGolden.resolvedBaselineDecodeSecondsPerToken
+            let pairedBaseline = try PairedBaselineOverride.fromEnvironment()
+            baselinePrefillSecondsPerToken = pairedBaseline?.prefillSecondsPerToken
+                ?? benchmarkGolden.resolvedBaselinePrefillSecondsPerToken
+            baselineDecodeSecondsPerToken = pairedBaseline?.decodeSecondsPerToken
+                ?? benchmarkGolden.resolvedBaselineDecodeSecondsPerToken
             progress(
                 "benchmark oracle ready prefill_tokens=\(promptPlan.prefillTokens.count) "
                     + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
                     + "decode_tokens=\(options.benchmarkDecodeSteps) "
-                    + "baseline_source=\(benchmarkGolden.baselineDecodeSecondsPerToken == nil ? "constants" : "golden")"
+                    + "baseline_source=\(baselineSourceLabel(paired: pairedBaseline, golden: benchmarkGolden))"
             )
 
             Memory.peakMemory = 0
@@ -459,13 +462,16 @@ extension DeepSeekRuntime {
                 throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
             }
             let promptPlan = try BenchmarkPrompt.plan(from: benchmarkGolden)
-            baselinePrefillSecondsPerToken = benchmarkGolden.resolvedBaselinePrefillSecondsPerToken
-            baselineDecodeSecondsPerToken = benchmarkGolden.resolvedBaselineDecodeSecondsPerToken
+            let pairedBaseline = try PairedBaselineOverride.fromEnvironment()
+            baselinePrefillSecondsPerToken = pairedBaseline?.prefillSecondsPerToken
+                ?? benchmarkGolden.resolvedBaselinePrefillSecondsPerToken
+            baselineDecodeSecondsPerToken = pairedBaseline?.decodeSecondsPerToken
+                ?? benchmarkGolden.resolvedBaselineDecodeSecondsPerToken
             progress(
                 "benchmark oracle ready prefill_tokens=\(promptPlan.prefillTokens.count) "
                     + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
                     + "decode_tokens=\(options.benchmarkDecodeSteps) "
-                    + "baseline_source=\(benchmarkGolden.baselineDecodeSecondsPerToken == nil ? "constants" : "golden")"
+                    + "baseline_source=\(baselineSourceLabel(paired: pairedBaseline, golden: benchmarkGolden))"
             )
             peakRamGB = 0
             lastExpertStats = .zero
@@ -1319,6 +1325,16 @@ extension DeepSeekRuntime {
                 runtime: runtime
             )
         )
+    }
+
+    static func baselineSourceLabel(
+        paired: PairedBaselineOverride?,
+        golden: BenchmarkGolden
+    ) -> String {
+        if paired != nil {
+            return "paired_env"
+        }
+        return golden.baselineDecodeSecondsPerToken == nil ? "constants" : "golden"
     }
 
     static func speedupFloorFailureMessage(
