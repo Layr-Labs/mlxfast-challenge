@@ -108,6 +108,32 @@ public enum DeepSeekRoutedExperts {
         // per-token slice+concat that built each expert batch previously.
         let xFlat = x.reshaped([tokenCount, hiddenSize])
 
+        // Decode/1-token path: the per-expert code slices are otherwise read
+        // one blocking pread at a time on the compute thread. Read them
+        // concurrently up front through a capacity-0 side bank (byte-identical
+        // ranges), so the per-expert loop below builds its MLXArrays from
+        // already-fetched bytes instead of serializing on each pread. Anything
+        // not prefetched falls back to the normal per-expert bank read.
+        var decodePrefetch: [String: StagedExpertCode]?
+        if tokenCount == 1, !useStaged {
+            decodePrefetch = loader.prefetchDecodeExpertCodes(
+                layerIndex: spec.layerIndex,
+                expertIndices: Array(flatIndicesByExpert.keys),
+                hiddenSize: spec.hiddenSize,
+                intermediateSize: spec.intermediateSize
+            )
+        } else if useStaged {
+            // Prefill/warmup staged path: build the active experts' base
+            // MLXArrays from the staged layer buffer concurrently so the loop
+            // below skips the serial Data->Metal copy (same win as decode).
+            decodePrefetch = loader.prefetchStagedExpertCodes(
+                layerIndex: spec.layerIndex,
+                expertIndices: Array(flatIndicesByExpert.keys),
+                hiddenSize: spec.hiddenSize,
+                intermediateSize: spec.intermediateSize
+            )
+        }
+
         var expertOutputs: [MLXArray] = []
         expertOutputs.reserveCapacity(flatIndicesByExpert.count)
         var scatterOrder: [Int] = []
@@ -118,7 +144,8 @@ public enum DeepSeekRoutedExperts {
                 forExpert: expertIndex,
                 loader: loader,
                 spec: spec,
-                preferStaged: useStaged
+                preferStaged: useStaged,
+                decodePrefetch: decodePrefetch
             )
             let tokenRows = flatIndices.map { Int32($0 / topK) }
             let tokens = xFlat.take(MLXArray(tokenRows), axis: 0)
@@ -149,7 +176,8 @@ public enum DeepSeekRoutedExperts {
         forExpert expertIndex: Int,
         loader: DeepSeekWeightLoader,
         spec: DeepSeekRoutedExpertSpec,
-        preferStaged: Bool = false
+        preferStaged: Bool = false,
+        decodePrefetch: [String: StagedExpertCode]? = nil
     ) throws -> DeepSeekMLPWeights {
         try DeepSeekMLPWeights(
             gate: loader.expertLinearWeight(
@@ -160,7 +188,8 @@ public enum DeepSeekRoutedExperts {
                 ),
                 expectedShape: [spec.intermediateSize, spec.hiddenSize],
                 expertIndex: expertIndex,
-                preferStaged: preferStaged
+                preferStaged: preferStaged,
+                decodePrefetch: decodePrefetch
             ),
             up: loader.expertLinearWeight(
                 candidates: DeepSeekWeightNames.routedExpert(
@@ -170,7 +199,8 @@ public enum DeepSeekRoutedExperts {
                 ),
                 expectedShape: [spec.intermediateSize, spec.hiddenSize],
                 expertIndex: expertIndex,
-                preferStaged: preferStaged
+                preferStaged: preferStaged,
+                decodePrefetch: decodePrefetch
             ),
             down: loader.expertLinearWeight(
                 candidates: DeepSeekWeightNames.routedExpert(
@@ -180,7 +210,8 @@ public enum DeepSeekRoutedExperts {
                 ),
                 expectedShape: [spec.hiddenSize, spec.intermediateSize],
                 expertIndex: expertIndex,
-                preferStaged: preferStaged
+                preferStaged: preferStaged,
+                decodePrefetch: decodePrefetch
             )
         )
     }

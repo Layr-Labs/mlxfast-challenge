@@ -69,32 +69,63 @@ public enum DeepSeekHyperConnection {
             )
         }
 
-        let mixes = DeepSeekOps.cast(mixes, to: .float32)
-        let scale = DeepSeekOps.cast(scale, to: .float32)
-        let base = DeepSeekOps.cast(base, to: .float32)
-        let eps = Float(eps)
+        let mixesF32 = DeepSeekOps.cast(mixes, to: .float32)
+        let scaleF32 = DeepSeekOps.cast(scale, to: .float32)
+        let baseF32 = DeepSeekOps.cast(base, to: .float32)
 
-        let pre = sigmoid(mixes[.ellipsis, 0..<hcMult] * scale[0] + base[0..<hcMult]) + eps
-        let post = 2.0 * sigmoid(
-            mixes[.ellipsis, hcMult..<(2 * hcMult)] * scale[1] + base[hcMult..<(2 * hcMult)]
-        )
-
-        let combFlat = mixes[.ellipsis, (2 * hcMult)...] * scale[2] + base[(2 * hcMult)...]
-        let combShape = Array(mixes.shape.dropLast()) + [hcMult, hcMult]
-        var combination = combFlat.reshaped(combShape)
-        combination = softmax(combination, axis: -1, precise: true) + eps
-        combination = combination / (combination.sum(axis: -2, keepDims: true) + eps)
-
-        for _ in 0..<max(sinkhornIters - 1, 0) {
-            combination = combination / (combination.sum(axis: -1, keepDims: true) + eps)
-            combination = combination / (combination.sum(axis: -2, keepDims: true) + eps)
-        }
+        // Fuse the Sinkhorn elementwise storm into compiled kernels. On the
+        // decode path this collapse runs ~2x/layer (~86x/token) and the
+        // ~19-iteration loop otherwise launches thousands of tiny separate
+        // kernels; mx.compile fuses them, cutting dispatch overhead that grew
+        // to a larger share once the expert reads were parallelized. compile
+        // preserves op semantics; correctness gating confirms the token
+        // signature is unchanged (no FMA-reassociation drift).
+        let sinkhorn = Self.compiledSinkhorn(hcMult: hcMult, iters: sinkhornIters, eps: Float(eps))
+        let (pre, post, combination) = sinkhorn(mixesF32, scaleF32, baseF32)
 
         return DeepSeekHyperConnectionMix(
             pre: pre,
             post: post,
             combination: combination
         )
+    }
+
+    private struct SinkhornKey: Hashable {
+        let hcMult: Int
+        let iters: Int
+        let epsBits: UInt32
+    }
+
+    private static let compiledSinkhornCache =
+        LockedCache<SinkhornKey, @Sendable (MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray, MLXArray)>()
+
+    /// Cached, shape-specialized compiled Sinkhorn core. Inputs are the already
+    /// f32-cast (mixes, scale, base); outputs are (pre, post, combination),
+    /// identical in math to the inline loop above.
+    private static func compiledSinkhorn(
+        hcMult: Int,
+        iters: Int,
+        eps: Float
+    ) -> @Sendable (MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        let key = SinkhornKey(hcMult: hcMult, iters: iters, epsBits: eps.bitPattern)
+        return compiledSinkhornCache.value(for: key) {
+            compile { (mixes: MLXArray, scale: MLXArray, base: MLXArray) in
+                let pre = sigmoid(mixes[.ellipsis, 0..<hcMult] * scale[0] + base[0..<hcMult]) + eps
+                let post = 2.0 * sigmoid(
+                    mixes[.ellipsis, hcMult..<(2 * hcMult)] * scale[1] + base[hcMult..<(2 * hcMult)]
+                )
+                let combFlat = mixes[.ellipsis, (2 * hcMult)...] * scale[2] + base[(2 * hcMult)...]
+                let combShape = Array(mixes.shape.dropLast()) + [hcMult, hcMult]
+                var combination = combFlat.reshaped(combShape)
+                combination = softmax(combination, axis: -1, precise: true) + eps
+                combination = combination / (combination.sum(axis: -2, keepDims: true) + eps)
+                for _ in 0..<max(iters - 1, 0) {
+                    combination = combination / (combination.sum(axis: -1, keepDims: true) + eps)
+                    combination = combination / (combination.sum(axis: -2, keepDims: true) + eps)
+                }
+                return (pre, post, combination)
+            }
+        }
     }
 
     public static func expand(
