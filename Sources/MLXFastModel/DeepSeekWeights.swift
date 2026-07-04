@@ -662,6 +662,154 @@ public struct DeepSeekWeightLoader {
         return map.isEmpty ? nil : map
     }
 
+    /// One whole stacked routed-expert projection ([experts, rows, packed]
+    /// codes plus stacked scales/biases companions) built for the batched
+    /// prefill path. Byte sources are, in order: the staged whole-layer
+    /// buffer, the RAM-pinned hash-layer store, or (scales) the resident
+    /// scales store — all byte-identical stand-ins for the bank's stacked
+    /// tensor by the same slice arithmetic the per-expert path uses.
+    public struct StackedExpertProjection {
+        public let weight: MLXArray
+        public let scales: MLXArray
+        public let biases: MLXArray?
+        public let groupSize: Int
+        public let bits: Int
+        public let mode: QuantizationMode
+    }
+
+    /// Builds the whole stacked projection for a layer when every byte is
+    /// already in RAM (staged buffer, pinned codes, resident scales). Returns
+    /// nil when any piece is missing so callers fall back to the per-expert
+    /// path, which reproduces existing behavior exactly.
+    public func stackedExpertProjection(
+        layerIndex: Int,
+        projection: DeepSeekExpertProjection,
+        expectedShape: [Int]
+    ) -> StackedExpertProjection? {
+        let candidates = DeepSeekWeightNames.routedExpert(
+            layerIndex: layerIndex,
+            expertIndex: 0,
+            projection: projection
+        )
+        guard
+            let candidate = candidates.first(where: { expertBank.record(named: $0) != nil }),
+            let record = expertBank.record(named: candidate),
+            record.shape.count == expectedShape.count + 1,
+            record.dtype == "U32",
+            let logicalInput = expectedShape.last,
+            let packedInput = record.shape.last,
+            logicalInput > 0,
+            packedInput > 0,
+            (packedInput * 32) % logicalInput == 0
+        else {
+            return nil
+        }
+        let bits = packedInput * 32 / logicalInput
+        guard [2, 4, 8].contains(bits) else {
+            return nil
+        }
+
+        // Whole-tensor code bytes: staged layer buffer first, then the pinned
+        // hash-layer store. Both hold the exact stacked tensor bytes.
+        let codesTensor: MaterializedTensor?
+        if let staged = expertLayerStager?.stagedBytes(recordName: candidate),
+           staged.count == record.byteLength,
+           let dtype = try? TensorDType.parse(record.dtype) {
+            codesTensor = try? MaterializedTensor(
+                name: candidate,
+                dtype: dtype,
+                shape: record.shape,
+                bytes: staged
+            )
+        } else {
+            codesTensor = pinnedExpertCodes?.materializedTensor(named: candidate, firstAxisIndex: nil)
+        }
+        guard let codesTensor, let weightArray = try? bridge.makeArray(from: codesTensor) else {
+            return nil
+        }
+
+        let scalesName = companionName(for: candidate, suffix: "scales")
+        guard let scalesRecord = expertBank.record(named: scalesName),
+              scalesRecord.shape.count == expectedShape.count + 1,
+              let scaleGroups = scalesRecord.shape.last,
+              scaleGroups > 0,
+              logicalInput % scaleGroups == 0
+        else {
+            return nil
+        }
+        let scalesTensor: MaterializedTensor?
+        if let resident = residentExpertScales?.materializedTensor(named: scalesName, firstAxisIndex: nil) {
+            scalesTensor = resident
+        } else if let staged = expertLayerStager?.stagedBytes(recordName: scalesName),
+                  staged.count == scalesRecord.byteLength,
+                  let dtype = try? TensorDType.parse(scalesRecord.dtype) {
+            scalesTensor = try? MaterializedTensor(
+                name: scalesName,
+                dtype: dtype,
+                shape: scalesRecord.shape,
+                bytes: staged
+            )
+        } else {
+            scalesTensor = nil
+        }
+        guard let scalesTensor, let scalesArray = try? bridge.makeArray(from: scalesTensor) else {
+            return nil
+        }
+
+        let biasesName = companionName(for: candidate, suffix: "biases")
+        var biasesArray: MLXArray?
+        if let biasesRecord = expertBank.record(named: biasesName) {
+            // Biases exist but are only in RAM when staged; without them the
+            // batched path cannot reproduce the affine math — bail out.
+            guard let staged = expertLayerStager?.stagedBytes(recordName: biasesName),
+                  staged.count == biasesRecord.byteLength,
+                  let dtype = try? TensorDType.parse(biasesRecord.dtype),
+                  let tensor = try? MaterializedTensor(
+                      name: biasesName,
+                      dtype: dtype,
+                      shape: biasesRecord.shape,
+                      bytes: staged
+                  ),
+                  let array = try? bridge.makeArray(from: tensor)
+            else {
+                return nil
+            }
+            biasesArray = array
+        }
+
+        let mode: QuantizationMode = biasesArray == nil && scalesTensor.dtype == .u8 ? .mxfp4 : .affine
+        return StackedExpertProjection(
+            weight: weightArray,
+            scales: scalesArray,
+            biases: biasesArray,
+            groupSize: logicalInput / scaleGroups,
+            bits: bits,
+            mode: mode
+        )
+    }
+
+    /// True when every projection's stacked code tensor for the layer is
+    /// RAM-pinned, so the batched prefill path can serve the layer without
+    /// staging.
+    public func pinnedLayerIsFullyResident(layerIndex: Int) -> Bool {
+        guard let pinnedCodes = pinnedExpertCodes else {
+            return false
+        }
+        for projection in [DeepSeekExpertProjection.gate, .up, .down] {
+            let candidates = DeepSeekWeightNames.routedExpert(
+                layerIndex: layerIndex,
+                expertIndex: 0,
+                projection: projection
+            )
+            guard let candidate = candidates.first(where: { expertBank.record(named: $0) != nil }),
+                  pinnedCodes.isResident(name: candidate)
+            else {
+                return false
+            }
+        }
+        return true
+    }
+
     public func expertLinearWeight(
         candidates: [String],
         expectedShape: [Int],

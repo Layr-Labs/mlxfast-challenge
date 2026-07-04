@@ -95,6 +95,29 @@ public enum DeepSeekRoutedExperts {
             return zeros([batchSize, sequenceLength, topK, hiddenSize], dtype: x.dtype)
         }
 
+        // Prefill-shaped batched path: when the layer's stacked code tensors
+        // are already in RAM (staged whole-layer buffer or pinned hash-layer
+        // store) run all experts through three sorted gatherQuantizedMM calls
+        // instead of ~256 per-expert QMM dispatches plus per-expert
+        // SwiGLU/gather/concat chains. Row values are the same per-row
+        // quantized dot products over the same bytes; the correctness gate
+        // guards the math. Any missing piece falls through to the existing
+        // per-expert loop unchanged.
+        if tokenCount >= stagingMinimumTokenCount,
+           useStaged || loader.pinnedLayerIsFullyResident(layerIndex: spec.layerIndex),
+           let batched = batchedResidentForward(
+               x,
+               selectedExperts: selectedExperts,
+               batchSize: batchSize,
+               sequenceLength: sequenceLength,
+               topK: topK,
+               loader: loader,
+               spec: spec
+           )
+        {
+            return batched
+        }
+
         // Group activation flat-indices by expert so each expert runs one batched
         // matmul over all of its tokens instead of one matmul per token.
         var flatIndicesByExpert: [Int: [Int]] = [:]
@@ -185,6 +208,152 @@ public enum DeepSeekRoutedExperts {
         return ordered.reshaped([batchSize, sequenceLength, topK, hiddenSize])
     }
 
+    /// Whole-layer routed-expert forward over RAM-resident stacked tensors.
+    ///
+    /// Bit-identity contract: every expert still runs the SAME per-expert
+    /// quantizedMM kernel over the SAME token batch (an [n_e, hidden] GEMM)
+    /// and the same weight bytes — the weights are just zero-copy first-axis
+    /// views into ONE stacked MLXArray per projection instead of 256
+    /// separately copied slice buffers. The limitedSwiGLU chain is elementwise
+    /// and batch-size invariant, so evaluating it once over the concatenated
+    /// [N, intermediate] activations produces the same elements as 256
+    /// per-expert evaluations. gatherQuantizedMM is deliberately NOT used: its
+    /// per-row matvec accumulation order differs from the per-expert GEMM and
+    /// shifts bf16 argmax ties.
+    private static func batchedResidentForward(
+        _ x: MLXArray,
+        selectedExperts: [Int],
+        batchSize: Int,
+        sequenceLength: Int,
+        topK: Int,
+        loader: DeepSeekWeightLoader,
+        spec: DeepSeekRoutedExpertSpec
+    ) -> MLXArray? {
+        // Build the three stacked projections concurrently: each is one big
+        // Data->Metal copy (vs 256 slice copies on the per-expert path).
+        var projections = [DeepSeekWeightLoader.StackedExpertProjection?](repeating: nil, count: 3)
+        let expectedShapes: [[Int]] = [
+            [spec.intermediateSize, spec.hiddenSize],
+            [spec.intermediateSize, spec.hiddenSize],
+            [spec.hiddenSize, spec.intermediateSize],
+        ]
+        let kinds: [DeepSeekExpertProjection] = [.gate, .up, .down]
+        projections.withUnsafeMutableBufferPointer { buffer in
+            let sink = StackedProjectionSink(buffer: buffer)
+            DispatchQueue.concurrentPerform(iterations: 3) { index in
+                sink.buffer[index] = loader.stackedExpertProjection(
+                    layerIndex: spec.layerIndex,
+                    projection: kinds[index],
+                    expectedShape: expectedShapes[index]
+                )
+            }
+        }
+        guard let gate = projections[0], let up = projections[1], let down = projections[2] else {
+            return nil
+        }
+
+        let outputCount = selectedExperts.count
+        // Group activation flat-indices by expert exactly like the per-expert
+        // path; iteration order only affects concat order, which the inverse
+        // permutation undoes.
+        var flatIndicesByExpert: [Int: [Int]] = [:]
+        flatIndicesByExpert.reserveCapacity(min(outputCount, 256))
+        for (flatIndex, expertIndex) in selectedExperts.enumerated() {
+            flatIndicesByExpert[expertIndex, default: []].append(flatIndex)
+        }
+
+        let xFlat = x.reshaped([batchSize * sequenceLength, spec.hiddenSize])
+        let gateLogical = [spec.intermediateSize, spec.hiddenSize]
+        let downLogical = [spec.hiddenSize, spec.intermediateSize]
+
+        // One gather for every expert's token batch. Each expert's segment
+        // view of xSorted holds the same rows in the same within-expert order
+        // as the per-expert take, so the per-expert GEMM inputs are identical.
+        var scatterOrder: [Int] = []
+        scatterOrder.reserveCapacity(outputCount)
+        var segmentLengths: [Int] = []
+        segmentLengths.reserveCapacity(flatIndicesByExpert.count)
+        var expertOrder: [Int] = []
+        expertOrder.reserveCapacity(flatIndicesByExpert.count)
+        for (expertIndex, flatIndices) in flatIndicesByExpert {
+            expertOrder.append(expertIndex)
+            segmentLengths.append(flatIndices.count)
+            scatterOrder.append(contentsOf: flatIndices)
+        }
+        let sortedRows = scatterOrder.map { Int32($0 / topK) }
+        let xSorted = xFlat.take(MLXArray(sortedRows), axis: 0)
+
+        var gateOutputs: [MLXArray] = []
+        var upOutputs: [MLXArray] = []
+        var downWeights: [DeepSeekLinearWeight] = []
+        gateOutputs.reserveCapacity(expertOrder.count)
+        upOutputs.reserveCapacity(expertOrder.count)
+        downWeights.reserveCapacity(expertOrder.count)
+
+        var tokenStart = 0
+        for (position, expertIndex) in expertOrder.enumerated() {
+            let gateWeight = DeepSeekLinearWeight(
+                weight: gate.weight[expertIndex],
+                scales: gate.scales[expertIndex],
+                biases: gate.biases.map { $0[expertIndex] },
+                logicalShape: gateLogical,
+                groupSize: gate.groupSize,
+                bits: gate.bits,
+                mode: gate.mode
+            )
+            let upWeight = DeepSeekLinearWeight(
+                weight: up.weight[expertIndex],
+                scales: up.scales[expertIndex],
+                biases: up.biases.map { $0[expertIndex] },
+                logicalShape: gateLogical,
+                groupSize: up.groupSize,
+                bits: up.bits,
+                mode: up.mode
+            )
+            downWeights.append(
+                DeepSeekLinearWeight(
+                    weight: down.weight[expertIndex],
+                    scales: down.scales[expertIndex],
+                    biases: down.biases.map { $0[expertIndex] },
+                    logicalShape: downLogical,
+                    groupSize: down.groupSize,
+                    bits: down.bits,
+                    mode: down.mode
+                )
+            )
+            let tokens = xSorted[tokenStart..<(tokenStart + segmentLengths[position])]
+            tokenStart += segmentLengths[position]
+            gateOutputs.append(DeepSeekOps.linear(input: tokens, weight: gateWeight))
+            upOutputs.append(DeepSeekOps.linear(input: tokens, weight: upWeight))
+        }
+
+        // One elementwise SwiGLU over all experts' activations. Elementwise
+        // ops are batch-size invariant, so each row matches the per-expert
+        // evaluation bit for bit.
+        let hiddenAll = DeepSeekOps.limitedSwiGLU(
+            gate: concatenated(gateOutputs, axis: 0),
+            up: concatenated(upOutputs, axis: 0),
+            limit: spec.swigluLimit
+        )
+
+        var expertOutputs: [MLXArray] = []
+        expertOutputs.reserveCapacity(downWeights.count)
+        var segmentStart = 0
+        for (index, weight) in downWeights.enumerated() {
+            let segment = hiddenAll[segmentStart..<(segmentStart + segmentLengths[index])]
+            expertOutputs.append(DeepSeekOps.linear(input: segment, weight: weight))
+            segmentStart += segmentLengths[index]
+        }
+
+        let combined = concatenated(expertOutputs, axis: 0)
+        var inverse = [Int32](repeating: 0, count: outputCount)
+        for (row, flatIndex) in scatterOrder.enumerated() {
+            inverse[flatIndex] = Int32(row)
+        }
+        let ordered = combined.take(MLXArray(inverse), axis: 0)
+        return ordered.reshaped([batchSize, sequenceLength, topK, spec.hiddenSize])
+    }
+
     public static func weights(
         forExpert expertIndex: Int,
         loader: DeepSeekWeightLoader,
@@ -228,6 +397,12 @@ public enum DeepSeekRoutedExperts {
             )
         )
     }
+}
+
+// Lets concurrentPerform write the three stacked projections into distinct
+// slots from worker threads; each index is written by exactly one iteration.
+private struct StackedProjectionSink: @unchecked Sendable {
+    let buffer: UnsafeMutableBufferPointer<DeepSeekWeightLoader.StackedExpertProjection?>
 }
 
 /// Below this many tokens the unique-expert count is small enough that
