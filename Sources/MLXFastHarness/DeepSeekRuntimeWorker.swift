@@ -425,11 +425,129 @@ func redirectDescriptorToDevNull(_ descriptor: Int32, flags: Int32, label: Strin
     }
 }
 
+/// Continuously drains a runtime worker's stderr pipe on a background thread,
+/// forwarding each completed line to `emit` (prefixed and token-redacted) and
+/// keeping a capped raw tail for the exit diagnostic. Local modes attach this
+/// so participants' debug prints in model code show up live during the edit
+/// loop; it also means a chatty worker can no longer fill the undrained pipe
+/// buffer and stall the run. Official runs never attach it (the CLI forces
+/// forwardsWorkerStderr off there), so their stderr handling is unchanged.
+final class WorkerStderrDrain: @unchecked Sendable {
+    private let handle: FileHandle
+    private let emit: (String) -> Void
+    private let lock = NSLock()
+    private var tail = Data()
+    private var pendingLine = Data()
+    private let finished = DispatchSemaphore(value: 0)
+    static let tailByteLimit = 64 * 1024
+    static let forwardedLinePrefix = "mlxfast-worker: "
+
+    init(
+        handle: FileHandle,
+        emit: ((String) -> Void)? = nil
+    ) {
+        self.handle = handle
+        self.emit = emit ?? { line in
+            fputs(line, stderr)
+            fflush(stderr)
+        }
+        let thread = Thread { [self] in
+            drainToEOF()
+            finished.signal()
+        }
+        thread.name = "mlxfast.worker-stderr-drain"
+        thread.start()
+    }
+
+    /// Blocks until the reader thread hits EOF (the worker exited and all
+    /// output was ingested) or the timeout passes, then returns the raw tail
+    /// for the exit diagnostic (which applies its own sanitization).
+    func drainedOutput(timeoutSeconds: Double) -> String {
+        if finished.wait(timeout: .now() + timeoutSeconds) == .success {
+            // Re-signal so later calls (or repeated diagnostics) do not block.
+            finished.signal()
+        }
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        var data = tail
+        data.append(pendingLine)
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func drainToEOF() {
+        while true {
+            let chunk = handle.readData(ofLength: 8192)
+            if chunk.isEmpty {
+                break
+            }
+            ingest(chunk)
+        }
+        flushPendingLine()
+    }
+
+    private func ingest(_ chunk: Data) {
+        var completedLines: [String] = []
+        lock.lock()
+        pendingLine.append(chunk)
+        while let newlineIndex = pendingLine.firstIndex(of: 0x0a) {
+            let lineLength = pendingLine.distance(from: pendingLine.startIndex, to: newlineIndex)
+            let lineData = Data(pendingLine.prefix(lineLength))
+            pendingLine = Data(pendingLine.dropFirst(lineLength + 1))
+            appendToTailLocked(lineData + Data([0x0a]))
+            completedLines.append(String(decoding: lineData, as: UTF8.self))
+        }
+        lock.unlock()
+        for line in completedLines {
+            emitLine(line)
+        }
+    }
+
+    private func flushPendingLine() {
+        lock.lock()
+        let remainder = pendingLine
+        pendingLine = Data()
+        if !remainder.isEmpty {
+            appendToTailLocked(remainder + Data([0x0a]))
+        }
+        lock.unlock()
+        if !remainder.isEmpty {
+            emitLine(String(decoding: remainder, as: UTF8.self))
+        }
+    }
+
+    private func appendToTailLocked(_ data: Data) {
+        tail.append(data)
+        if tail.count > Self.tailByteLimit {
+            tail = Data(tail.suffix(Self.tailByteLimit))
+        }
+    }
+
+    private func emitLine(_ line: String) {
+        emit("\(Self.forwardedLinePrefix)\(redactedWorkerStderrLine(line))\n")
+    }
+}
+
+/// Per-line redaction for forwarded worker stderr: worker output comes from
+/// submitted model code that has seen the (possibly private) golden, so lines
+/// that look like token comparisons are collapsed exactly like the shared
+/// error-path redaction.
+func redactedWorkerStderrLine(_ line: String) -> String {
+    if line.range(of: "expected", options: .caseInsensitive) != nil
+        || line.range(of: "actual", options: .caseInsensitive) != nil
+    {
+        return "token-validation-failed"
+    }
+    return line
+}
+
 final class RuntimeWorkerClient {
     private let process: Process
     private let input: FileHandle
     private let output: FileHandle
     private let errorOutput: FileHandle
+    private let stderrDrain: WorkerStderrDrain?
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var sessionNonce = ""
@@ -472,6 +590,11 @@ final class RuntimeWorkerClient {
         self.input = stdin.fileHandleForWriting
         self.output = stdout.fileHandleForReading
         self.errorOutput = stderr.fileHandleForReading
+        // Attach the live drain before waiting for the protocol hello so even
+        // output printed during model/weights setup streams immediately.
+        self.stderrDrain = options.forwardsWorkerStderr
+            ? WorkerStderrDrain(handle: stderr.fileHandleForReading)
+            : nil
         let hello = try readResponseLine(validateNonce: false)
         guard hello.id == 0, hello.ok, let nonce = hello.nonce, !nonce.isEmpty else {
             throw MLXFastError.invalidInput("runtime worker did not return a valid protocol hello")
@@ -608,7 +731,10 @@ final class RuntimeWorkerClient {
             process.terminate()
         }
         process.waitUntilExit()
-        let stderr = String(data: errorOutput.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        // With a live drain attached, the pipe is consumed by its reader
+        // thread; take the retained tail from there instead of racing it.
+        let stderr = stderrDrain?.drainedOutput(timeoutSeconds: 2)
+            ?? (String(data: errorOutput.readDataToEndOfFile(), encoding: .utf8) ?? "")
         let trimmed = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         let redacted = sanitizeWorkerDiagnostic(trimmed)
         if redacted.isEmpty {

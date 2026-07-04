@@ -211,6 +211,34 @@ Neither local mode produces an official leaderboard score. Official ranking
 still runs the hidden benchmark oracle and hidden correctness gates on the
 trusted runner.
 
+Both local modes stream live numbers to stderr while they run, so you do not
+have to wait for the final JSON: the official baseline constants up front,
+prefill seconds-per-token and speedup the moment the measured prefill forward
+finishes, the decode seed-prefill charge, and a running line per checked decode
+token with the last-step latency, an ETA for the remaining decode tokens,
+projected charged decode seconds-per-token, projected decode speedup, a
+projected score under the official formula, and live expert-streaming numbers
+for the decode window (GB read per token and cache hit rate). Long silent
+phases (weights digest, prefill forward, decode seed prefill) print a heartbeat
+every 10 seconds, and the first teacher-forced token mismatch is reported
+immediately (token values stay in the score JSON only).
+
+Local modes also forward the runtime worker's stderr live with an
+`mlxfast-worker:` prefix, so debug prints added to model code under
+`Sources/MLXFastModel/` are visible while iterating instead of disappearing
+into the worker pipe. Lines that look like token comparisons are redacted the
+same way as harness error output, and official runs keep the old behavior
+where worker stderr surfaces only through the sanitized exit diagnostic.
+
+After the score JSON is sealed, `benchmark.sh` prints a compact summary with
+both speedups and the estimated score, and -- when a same-machine snapshot
+exists at `score.local-iterate.baseline.json` (record one with
+`cp score.local-iterate.json score.local-iterate.baseline.json` after a run on
+the synced tip) -- deltas against that baseline so a change reads as faster or
+slower at a glance. When that snapshot exists, the baseline numbers to beat are
+also printed at the start of the run, so the live projected score has a target
+from the first second.
+
 ## Scoring
 
 ```
