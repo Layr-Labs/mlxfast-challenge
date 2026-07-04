@@ -337,7 +337,13 @@ private enum MLXFastCLI {
                     modeName: modeName,
                     runtime: runtime
                 ),
-                worker: try runtimeWorkerOptions(blockedGoldenPath: goldenPath)
+                // Local edit loop: stream the worker's stderr live so debug
+                // prints in submitted model code are visible while iterating.
+                // runtimeWorkerOptions forces this off on official runs.
+                worker: try runtimeWorkerOptions(
+                    blockedGoldenPath: goldenPath,
+                    forwardsWorkerStderr: true
+                )
             )
             try writeScorePayload(payload, to: scorePath)
             try emitScorePayloadToStdout(payload)
@@ -1098,7 +1104,10 @@ private enum MLXFastCLI {
         return value
     }
 
-    private static func runtimeWorkerOptions(blockedGoldenPath: String? = nil) throws -> RuntimeWorkerOptions? {
+    private static func runtimeWorkerOptions(
+        blockedGoldenPath: String? = nil,
+        forwardsWorkerStderr: Bool = false
+    ) throws -> RuntimeWorkerOptions? {
         // benchmark.sh's enforce_official_sandbox refuses to run the timed benchmark
         // with the worker or its sandbox disabled on an official run, but the slice
         // machines invoke `mlxfast-swift correctness` directly, so the same policy
@@ -1163,7 +1172,13 @@ private enum MLXFastCLI {
         }
         return RuntimeWorkerOptions(
             executablePath: executablePath,
-            sandboxProfilePath: sandboxProfile.isEmpty ? nil : sandboxProfile
+            sandboxProfilePath: sandboxProfile.isEmpty ? nil : sandboxProfile,
+            // Fail closed: live worker-stderr forwarding is a local-edit-loop
+            // convenience only. Official runs keep today's behavior where
+            // worker stderr surfaces solely through the sanitized exit
+            // diagnostic, so submitted code cannot stream hidden-prompt
+            // content into CI logs.
+            forwardsWorkerStderr: forwardsWorkerStderr && !officialRun
         )
     }
 

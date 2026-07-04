@@ -952,13 +952,33 @@ func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
         stepOnlySecondsSoFar: 2,
         decodedTokens: 2,
         totalDecodeTokens: 16,
-        prefillSecondsPerToken: 0.05
+        prefillSecondsPerToken: 0.05,
+        decodeBytesReadSoFar: 4 * (1 << 30),
+        decodeWindowHitRate: 0.625
     )
     #expect(status.contains("last_step_seconds=0.900000"))
     #expect(status.contains("mean_step_seconds=1.000000"))
+    // 14 remaining tokens at 1s mean -> 14s ETA.
+    #expect(status.contains("decode_eta_seconds=14.0"))
     #expect(status.contains("projected_decode_seconds_per_token="))
     #expect(status.contains("projected_decode_speedup="))
     #expect(status.contains("projected_score="))
+    // 4 GiB over 2 decoded tokens -> 2 GiB/token.
+    #expect(status.contains("expert_gb_per_token=2.000000"))
+    #expect(status.contains("expert_hit_rate=0.625"))
+
+    // The final step has no ETA, and absent expert numbers are omitted.
+    let finalStep = DeepSeekRuntime.localIterateLiveDecodeStatus(
+        lastStepSeconds: 1,
+        chargedSecondsSoFar: 32,
+        stepOnlySecondsSoFar: 14,
+        decodedTokens: 16,
+        totalDecodeTokens: 16,
+        prefillSecondsPerToken: 0.05
+    )
+    #expect(!finalStep.contains("decode_eta_seconds="))
+    #expect(!finalStep.contains("expert_gb_per_token="))
+    #expect(!finalStep.contains("expert_hit_rate="))
 
     // Before prefill has a positive measurement there is no score estimate.
     let withoutPrefill = DeepSeekRuntime.localIterateLiveDecodeStatus(
@@ -982,6 +1002,92 @@ func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
             prefillSecondsPerToken: nil
         ).isEmpty
     )
+}
+
+@Test
+func expertWindowHitRateUsesDecodeWindowDeltasOnly() {
+    let before = ExpertStreamingStats(cacheHits: 100, cacheMisses: 50)
+    let after = ExpertStreamingStats(cacheHits: 130, cacheMisses: 60)
+    // Window: 30 hits, 10 misses -> 0.75, independent of the 100/50 prefix.
+    #expect(DeepSeekRuntime.expertWindowHitRate(before: before, after: after) == 0.75)
+
+    // No before-snapshot: the whole counter is the window.
+    #expect(DeepSeekRuntime.expertWindowHitRate(before: nil, after: after) == 130.0 / 190.0)
+
+    // No lookups in the window, missing after-stats, or counters that went
+    // backwards (worker restart) all yield nil instead of a bogus rate.
+    #expect(DeepSeekRuntime.expertWindowHitRate(before: after, after: after) == nil)
+    #expect(DeepSeekRuntime.expertWindowHitRate(before: before, after: nil) == nil)
+    #expect(DeepSeekRuntime.expertWindowHitRate(before: after, after: before) == nil)
+}
+
+@Test
+func workerStderrDrainForwardsRedactedLinesAndKeepsTailForDiagnostics() throws {
+    final class LineBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var lines: [String] = []
+        func append(_ line: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            lines.append(line)
+        }
+        func snapshot() -> [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return lines
+        }
+    }
+
+    let pipe = Pipe()
+    let box = LineBox()
+    let drain = WorkerStderrDrain(
+        handle: pipe.fileHandleForReading,
+        emit: { box.append($0) }
+    )
+
+    // Two complete lines (one needing token redaction) and one unterminated
+    // partial line that must still be flushed at EOF.
+    try pipe.fileHandleForWriting.write(contentsOf: Data("model debug: layer 3 routed\n".utf8))
+    try pipe.fileHandleForWriting.write(contentsOf: Data("expected 5 actual 7\npartial".utf8))
+    try pipe.fileHandleForWriting.close()
+
+    let tail = drain.drainedOutput(timeoutSeconds: 5)
+    let emitted = box.snapshot()
+
+    #expect(emitted == [
+        "mlxfast-worker: model debug: layer 3 routed\n",
+        "mlxfast-worker: token-validation-failed\n",
+        "mlxfast-worker: partial\n",
+    ])
+    // The diagnostic tail keeps the RAW content (workerExitDiagnostic applies
+    // its own whole-blob sanitization, unchanged from before).
+    #expect(tail.contains("model debug: layer 3 routed"))
+    #expect(tail.contains("expected 5 actual 7"))
+    #expect(tail.contains("partial"))
+
+    // A second read must not block or lose the tail.
+    #expect(drain.drainedOutput(timeoutSeconds: 1).contains("partial"))
+}
+
+@Test
+func workerStderrDrainCapsRetainedTail() throws {
+    let pipe = Pipe()
+    let drain = WorkerStderrDrain(
+        handle: pipe.fileHandleForReading,
+        emit: { _ in }
+    )
+
+    let filler = String(repeating: "x", count: 1024)
+    for index in 0..<128 {
+        try pipe.fileHandleForWriting.write(contentsOf: Data("line-\(index) \(filler)\n".utf8))
+    }
+    try pipe.fileHandleForWriting.write(contentsOf: Data("final-marker\n".utf8))
+    try pipe.fileHandleForWriting.close()
+
+    let tail = drain.drainedOutput(timeoutSeconds: 5)
+    #expect(tail.utf8.count <= WorkerStderrDrain.tailByteLimit + 16)
+    #expect(tail.contains("final-marker"))
+    #expect(!tail.contains("line-0 "))
 }
 
 @Test

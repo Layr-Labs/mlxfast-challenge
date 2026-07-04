@@ -2040,6 +2040,11 @@ func localIterateStreamsLiveNumbersDuringTheRun() throws {
     #expect(runtime.contains("(charged to decode)"))
     #expect(runtime.contains("projected_decode_seconds_per_token="))
     #expect(runtime.contains("projected_score="))
+    #expect(runtime.contains("decode_eta_seconds="))
+    #expect(runtime.contains("expert_gb_per_token="))
+    #expect(runtime.contains("expert_hit_rate="))
+    // Live expert numbers cover the decode window in both timing paths.
+    #expect(runtime.components(separatedBy: "decodeWindowHitRate: expertWindowHitRate(").count >= 3)
     #expect(runtime.contains("emitLocalIterateSummary(modeName: modeName, timing: timing, progress: progress)"))
     // Baseline constants are printed up front so live speedups have context.
     #expect(runtime.contains("official-runner constants; local speedups are directional"))
@@ -2053,6 +2058,9 @@ func benchmarkScriptPrintsLocalSummaryWithBaselineComparison() throws {
     let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
     #expect(script.contains("report_local_score_summary() {"))
     #expect(script.contains("cat \"${SCORE_PATH}\"\n  report_local_score_summary"))
+    // The baseline context prints BEFORE the timed run starts.
+    #expect(script.contains("report_local_baseline_context() {"))
+    #expect(script.contains("report_local_baseline_context\n\n\"${SWIFT_BIN}\" benchmark"))
 
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -2140,12 +2148,51 @@ func benchmarkScriptPrintsLocalSummaryWithBaselineComparison() throws {
 
     let second = try runLocalIterate()
     #expect(second.status == 0)
+    // The baseline target is announced BEFORE the run so the live per-token
+    // numbers have something to compare against from the first second.
+    #expect(second.stderr.contains(
+        "benchmark.sh: local baseline to beat (\(baseline.path)): "
+            + "prefill 0.2 s/token, decode 4 s/token, est score 1"
+    ))
     #expect(second.stderr.contains("benchmark.sh: local-iterate summary"))
     #expect(second.stderr.contains("vs \(baseline.path) (negative s/token deltas = faster)"))
     #expect(second.stderr.contains("prefill 0.2 -> 0.1 s/token (-50%)"))
     #expect(second.stderr.contains("decode  4 -> 2 s/token (-50%)"))
     #expect(second.stderr.contains("est score 1 -> 2 (+100%)"))
     #expect(!second.stderr.contains("no local baseline at"))
+}
+
+@Test
+func localModesForwardWorkerStderrLiveButOfficialRunsDoNot() throws {
+    let cli = try String(
+        contentsOfFile: "Sources/MLXFastCLI/main.swift",
+        encoding: .utf8
+    )
+    let worker = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntimeWorker.swift",
+        encoding: .utf8
+    )
+    let options = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
+        encoding: .utf8
+    )
+
+    // Only the local benchmark modes opt in; every other worker-options call
+    // site keeps the default (off), and the builder forces the flag off for
+    // official runs so submitted code cannot stream hidden-prompt content
+    // into CI logs.
+    #expect(options.contains("public let forwardsWorkerStderr: Bool"))
+    #expect(cli.components(separatedBy: "forwardsWorkerStderr: true").count == 2)
+    #expect(cli.contains("forwardsWorkerStderr: forwardsWorkerStderr && !officialRun"))
+
+    // The drain forwards each line with the worker prefix after per-line
+    // token redaction, keeps only a capped raw tail for the exit diagnostic,
+    // and is attached before the protocol hello so setup output streams too.
+    #expect(worker.contains("final class WorkerStderrDrain"))
+    #expect(worker.contains("static let forwardedLinePrefix = \"mlxfast-worker: \""))
+    #expect(worker.contains("redactedWorkerStderrLine(line)"))
+    #expect(worker.contains("options.forwardsWorkerStderr\n            ? WorkerStderrDrain(handle: stderr.fileHandleForReading)\n            : nil"))
+    #expect(worker.contains("stderrDrain?.drainedOutput(timeoutSeconds: 2)"))
 }
 
 @Test

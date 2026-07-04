@@ -82,6 +82,39 @@ json_string() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+# Local modes print the same-machine baseline snapshot (when one exists) BEFORE
+# the run starts, so the live per-token numbers streaming from the Swift
+# harness can be compared against a target from the first second instead of
+# only in the final summary. Diagnostic only: any failure here must never fail
+# the benchmark run.
+report_local_baseline_context() {
+  if [[ "${LOCAL_ITERATE}" != "1" && "${LOCAL_SUBMIT}" != "1" ]]; then
+    return 0
+  fi
+  local baseline_path="${SCORE_PATH%.json}.baseline.json"
+  if [[ ! -f "${baseline_path}" ]]; then
+    return 0
+  fi
+  local context
+  context="$(jq -r '
+    def r3: . * 1000 | round / 1000;
+    def r6: . * 1000000 | round / 1000000;
+    (.metrics // {}) as $m
+    | ($m.prefill_seconds_per_token // 0) as $p
+    | ($m.decode_seconds_per_token // 0) as $d
+    | select($p > 0 and $d > 0)
+    | ($m.prefill_speedup // 0) as $ps
+    | ($m.decode_speedup // 0) as $ds
+    | (if $ps > 0 and $ds > 0 then pow($ds; 0.75) * pow($ps; 0.25) else 0 end) as $est
+    | "prefill \($p | r6) s/token, decode \($d | r6) s/token"
+      + (if $est > 0 then ", est score \($est | r3)" else "" end)
+  ' "${baseline_path}" 2>/dev/null || true)"
+  if [[ -n "${context}" ]]; then
+    echo "benchmark.sh: local baseline to beat (${baseline_path}): ${context}" >&2
+  fi
+  return 0
+}
+
 # Local modes end with a compact human-readable summary on stderr so the score
 # does not have to be dug out of the JSON payload. The estimated score uses the
 # official formula against the official baseline constants carried inside the
@@ -444,6 +477,8 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 score_stdout="$(mktemp "${TMPDIR:-/tmp}/mlxfast-score.XXXXXX")"
 trap 'rm -f "${score_stdout}"' EXIT
+
+report_local_baseline_context
 
 "${SWIFT_BIN}" benchmark \
   --weights "${WEIGHTS_PATH}" \

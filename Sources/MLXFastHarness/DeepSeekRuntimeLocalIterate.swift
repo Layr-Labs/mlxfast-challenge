@@ -230,21 +230,26 @@ extension DeepSeekRuntime {
     }
 
     /// Builds the per-step live status suffix: last step latency, mean step
-    /// latency, projected charged decode seconds-per-token, and -- once prefill
-    /// has been measured -- the projected decode speedup and estimated score
-    /// under the official formula.
+    /// latency, ETA for the remaining decode tokens, projected charged decode
+    /// seconds-per-token, and -- once prefill has been measured -- the
+    /// projected decode speedup and estimated score under the official
+    /// formula, plus live expert-streaming numbers for the decode window when
+    /// they are available.
     static func localIterateLiveDecodeStatus(
         lastStepSeconds: Double,
         chargedSecondsSoFar: Double,
         stepOnlySecondsSoFar: Double,
         decodedTokens: Int,
         totalDecodeTokens: Int,
-        prefillSecondsPerToken: Double?
+        prefillSecondsPerToken: Double?,
+        decodeBytesReadSoFar: UInt64 = 0,
+        decodeWindowHitRate: Double? = nil
     ) -> String {
         guard decodedTokens > 0 else {
             return ""
         }
         let meanStepSeconds = stepOnlySecondsSoFar / Double(decodedTokens)
+        let remainingTokens = totalDecodeTokens - decodedTokens
         let projected = localIterateProjectedDecodeSecondsPerToken(
             chargedSecondsSoFar: chargedSecondsSoFar,
             stepOnlySecondsSoFar: stepOnlySecondsSoFar,
@@ -253,25 +258,58 @@ extension DeepSeekRuntime {
         )
         var status = "last_step_seconds=\(formatDouble(lastStepSeconds))"
             + " mean_step_seconds=\(formatDouble(meanStepSeconds))"
-            + " projected_decode_seconds_per_token=\(formatDouble(projected))"
-        guard projected > 0 else {
-            return status
+        if remainingTokens > 0 {
+            status += " decode_eta_seconds=\(formatSeconds(Double(remainingTokens) * meanStepSeconds))"
         }
-        let decodeSpeedup = BenchmarkScore.speedup(
-            baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,
-            candidateSecondsPerToken: projected
-        )
-        status += " projected_decode_speedup=\(formatRatio(decodeSpeedup))"
-        if let prefillSecondsPerToken, prefillSecondsPerToken > 0 {
-            let estScore = BenchmarkScore.score(
-                decodeSecondsPerToken: projected,
-                prefillSecondsPerToken: prefillSecondsPerToken
+        status += " projected_decode_seconds_per_token=\(formatDouble(projected))"
+        if projected > 0 {
+            let decodeSpeedup = BenchmarkScore.speedup(
+                baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+                candidateSecondsPerToken: projected
             )
-            if estScore.isFinite {
-                status += " projected_score=\(formatRatio(estScore))"
+            status += " projected_decode_speedup=\(formatRatio(decodeSpeedup))"
+            if let prefillSecondsPerToken, prefillSecondsPerToken > 0 {
+                let estScore = BenchmarkScore.score(
+                    decodeSecondsPerToken: projected,
+                    prefillSecondsPerToken: prefillSecondsPerToken
+                )
+                if estScore.isFinite {
+                    status += " projected_score=\(formatRatio(estScore))"
+                }
             }
         }
+        if decodeBytesReadSoFar > 0 {
+            let gbPerToken = Double(decodeBytesReadSoFar) / Double(1 << 30) / Double(decodedTokens)
+            status += " expert_gb_per_token=\(formatDouble(gbPerToken))"
+        }
+        if let decodeWindowHitRate {
+            status += " expert_hit_rate=\(formatRatio(decodeWindowHitRate))"
+        }
         return status
+    }
+
+    /// Hit rate for just the decode window (deltas between the pre-decode
+    /// snapshot and the latest counters), so tuning expert caching gets live
+    /// feedback about the phase being scored instead of a run-wide cumulative
+    /// value dominated by prefill.
+    static func expertWindowHitRate(
+        before: ExpertStreamingStats?,
+        after: ExpertStreamingStats?
+    ) -> Double? {
+        guard let after else {
+            return nil
+        }
+        let beforeHits = before?.cacheHits ?? 0
+        let beforeMisses = before?.cacheMisses ?? 0
+        guard after.cacheHits >= beforeHits, after.cacheMisses >= beforeMisses else {
+            return nil
+        }
+        let hits = after.cacheHits - beforeHits
+        let misses = after.cacheMisses - beforeMisses
+        guard hits + misses > 0 else {
+            return nil
+        }
+        return Double(hits) / Double(hits + misses)
     }
 
     static func localIteratePrefillStatus(
@@ -549,7 +587,15 @@ extension DeepSeekRuntime {
                                     stepOnlySecondsSoFar: totalStepOnlySeconds,
                                     decodedTokens: step,
                                     totalDecodeTokens: total,
-                                    prefillSecondsPerToken: runningPrefillSecondsPerToken
+                                    prefillSecondsPerToken: runningPrefillSecondsPerToken,
+                                    decodeBytesReadSoFar: totalDecodeBytesRead + expertBytesReadDelta(
+                                        before: metricsBeforeDecode?.stats,
+                                        after: latestStats
+                                    ),
+                                    decodeWindowHitRate: expertWindowHitRate(
+                                        before: metricsBeforeDecode?.stats,
+                                        after: latestStats
+                                    )
                                 )
                         )
                     }
@@ -744,7 +790,15 @@ extension DeepSeekRuntime {
                                     stepOnlySecondsSoFar: totalStepOnlySeconds,
                                     decodedTokens: step,
                                     totalDecodeTokens: total,
-                                    prefillSecondsPerToken: runningPrefillSecondsPerToken
+                                    prefillSecondsPerToken: runningPrefillSecondsPerToken,
+                                    decodeBytesReadSoFar: totalDecodeBytesRead + expertBytesReadDelta(
+                                        before: statsBeforeDecode,
+                                        after: latestStats
+                                    ),
+                                    decodeWindowHitRate: expertWindowHitRate(
+                                        before: statsBeforeDecode,
+                                        after: latestStats
+                                    )
                                 )
                         )
                     }
