@@ -212,14 +212,29 @@ public enum DeepSeekRoutedExperts {
 
         // scatterOrder[row] is the activation flat index that produced combined
         // row `row`. Invert it so a single gather places every output back into
-        // activation order, replacing the previous per-row scatter loop.
+        // activation order, replacing the previous per-row scatter loop. When
+        // the scatter order is already the identity (decode's first-seen
+        // expert order visits slots in order), the gather is a no-op node --
+        // skip it; the tensor values are identical by definition.
         var inverse = [Int32](repeating: 0, count: outputCount)
+        var isIdentity = true
         for (row, flatIndex) in scatterOrder.enumerated() {
             inverse[flatIndex] = Int32(row)
+            if flatIndex != row {
+                isIdentity = false
+            }
         }
-        let ordered = combined.take(MLXArray(inverse), axis: 0)
+        let ordered = isIdentity ? combined : combined.take(MLXArray(inverse), axis: 0)
 
-        return ordered.reshaped([batchSize, sequenceLength, topK, hiddenSize])
+        let result = ordered.reshaped([batchSize, sequenceLength, topK, hiddenSize])
+        // Decode path: dispatch this layer's routed-expert graph now so the
+        // GPU runs the QMMs while the CPU builds the next block's graph,
+        // matching the batched prefill path's layer-exit dispatch. Scheduling
+        // only; identical nodes evaluate either way.
+        if tokenCount == 1 {
+            asyncEval(result)
+        }
+        return result
     }
 
     /// Whole-layer routed-expert forward over RAM-resident stacked tensors.
