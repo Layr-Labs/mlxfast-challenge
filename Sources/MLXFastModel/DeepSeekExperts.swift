@@ -122,8 +122,14 @@ public enum DeepSeekRoutedExperts {
         // matmul over all of its tokens instead of one matmul per token.
         var flatIndicesByExpert: [Int: [Int]] = [:]
         flatIndicesByExpert.reserveCapacity(min(outputCount, 256))
+        var expertOrder: [Int] = []
+        expertOrder.reserveCapacity(min(outputCount, 256))
         for (flatIndex, expertIndex) in selectedExperts.enumerated() {
-            flatIndicesByExpert[expertIndex, default: []].append(flatIndex)
+            if flatIndicesByExpert[expertIndex] == nil {
+                flatIndicesByExpert[expertIndex] = []
+                expertOrder.append(expertIndex)
+            }
+            flatIndicesByExpert[expertIndex]?.append(flatIndex)
         }
 
         // Flatten the token axis once. Row (batch * sequenceLength + position)
@@ -154,7 +160,7 @@ public enum DeepSeekRoutedExperts {
                 layerIndex: spec.layerIndex
             ) ?? loader.prefetchDecodeExpertCodes(
                 layerIndex: spec.layerIndex,
-                expertIndices: Array(flatIndicesByExpert.keys),
+                expertIndices: expertOrder,
                 hiddenSize: spec.hiddenSize,
                 intermediateSize: spec.intermediateSize
             )
@@ -164,7 +170,7 @@ public enum DeepSeekRoutedExperts {
             // below skips the serial Data->Metal copy (same win as decode).
             decodePrefetch = loader.prefetchStagedExpertCodes(
                 layerIndex: spec.layerIndex,
-                expertIndices: Array(flatIndicesByExpert.keys),
+                expertIndices: expertOrder,
                 hiddenSize: spec.hiddenSize,
                 intermediateSize: spec.intermediateSize
             )
@@ -175,7 +181,10 @@ public enum DeepSeekRoutedExperts {
         var scatterOrder: [Int] = []
         scatterOrder.reserveCapacity(outputCount)
 
-        for (expertIndex, flatIndices) in flatIndicesByExpert {
+        for expertIndex in expertOrder {
+            guard let flatIndices = flatIndicesByExpert[expertIndex] else {
+                continue
+            }
             let expertWeights = try weights(
                 forExpert: expertIndex,
                 loader: loader,
@@ -183,8 +192,13 @@ public enum DeepSeekRoutedExperts {
                 preferStaged: useStaged,
                 decodePrefetch: decodePrefetch
             )
-            let tokenRows = flatIndices.map { Int32($0 / topK) }
-            let tokens = xFlat.take(MLXArray(tokenRows), axis: 0)
+            let tokens: MLXArray
+            if tokenCount == 1, flatIndices.count == 1 {
+                tokens = xFlat
+            } else {
+                let tokenRows = flatIndices.map { Int32($0 / topK) }
+                tokens = xFlat.take(MLXArray(tokenRows), axis: 0)
+            }
             let expertOutput = DeepSeekMLP.forward(
                 tokens,
                 weights: expertWeights,
@@ -251,11 +265,6 @@ public enum DeepSeekRoutedExperts {
         guard let gate = projections[0], let up = projections[1], let down = projections[2] else {
             return nil
         }
-        // The chunk arrays hold copies of the staged bytes; drop the staged
-        // Data now (keeping the layer marked staged) so it does not count
-        // against peak memory while the next layer stages. No-op for pinned
-        // layers, whose bytes live in the resident store.
-        loader.expertLayerStager?.releaseStagedBytesKeepingLayer(spec.layerIndex)
 
         let outputCount = selectedExperts.count
         // Group activation flat-indices by expert exactly like the per-expert
@@ -298,7 +307,7 @@ public enum DeepSeekRoutedExperts {
         var tokenStart = 0
         for (position, expertIndex) in expertOrder.enumerated() {
             let gateWeight = DeepSeekLinearWeight(
-                weight: gate.weight(forExpert: expertIndex),
+                weight: gate.weight[expertIndex],
                 scales: gate.scales[expertIndex],
                 biases: gate.biases.map { $0[expertIndex] },
                 logicalShape: gateLogical,
@@ -307,7 +316,7 @@ public enum DeepSeekRoutedExperts {
                 mode: gate.mode
             )
             let upWeight = DeepSeekLinearWeight(
-                weight: up.weight(forExpert: expertIndex),
+                weight: up.weight[expertIndex],
                 scales: up.scales[expertIndex],
                 biases: up.biases.map { $0[expertIndex] },
                 logicalShape: gateLogical,
@@ -317,7 +326,7 @@ public enum DeepSeekRoutedExperts {
             )
             downWeights.append(
                 DeepSeekLinearWeight(
-                    weight: down.weight(forExpert: expertIndex),
+                    weight: down.weight[expertIndex],
                     scales: down.scales[expertIndex],
                     biases: down.biases.map { $0[expertIndex] },
                     logicalShape: downLogical,
@@ -367,34 +376,25 @@ public enum DeepSeekRoutedExperts {
         decodePrefetch: [String: StagedExpertCode]? = nil
     ) throws -> DeepSeekMLPWeights {
         try DeepSeekMLPWeights(
-            gate: loader.expertLinearWeight(
-                candidates: DeepSeekWeightNames.routedExpert(
-                    layerIndex: spec.layerIndex,
-                    expertIndex: expertIndex,
-                    projection: .gate
-                ),
+            gate: loader.routedExpertLinearWeight(
+                layerIndex: spec.layerIndex,
+                projection: .gate,
                 expectedShape: [spec.intermediateSize, spec.hiddenSize],
                 expertIndex: expertIndex,
                 preferStaged: preferStaged,
                 decodePrefetch: decodePrefetch
             ),
-            up: loader.expertLinearWeight(
-                candidates: DeepSeekWeightNames.routedExpert(
-                    layerIndex: spec.layerIndex,
-                    expertIndex: expertIndex,
-                    projection: .up
-                ),
+            up: loader.routedExpertLinearWeight(
+                layerIndex: spec.layerIndex,
+                projection: .up,
                 expectedShape: [spec.intermediateSize, spec.hiddenSize],
                 expertIndex: expertIndex,
                 preferStaged: preferStaged,
                 decodePrefetch: decodePrefetch
             ),
-            down: loader.expertLinearWeight(
-                candidates: DeepSeekWeightNames.routedExpert(
-                    layerIndex: spec.layerIndex,
-                    expertIndex: expertIndex,
-                    projection: .down
-                ),
+            down: loader.routedExpertLinearWeight(
+                layerIndex: spec.layerIndex,
+                projection: .down,
                 expectedShape: [spec.hiddenSize, spec.intermediateSize],
                 expertIndex: expertIndex,
                 preferStaged: preferStaged,

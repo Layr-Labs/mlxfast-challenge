@@ -96,6 +96,28 @@ public enum DeepSeekExpertProjection: String, Equatable, Hashable {
     }
 }
 
+private struct RoutedExpertProjectionKey: Hashable {
+    let layerIndex: Int
+    let projection: DeepSeekExpertProjection
+}
+
+private struct RoutedExpertProjectionPlan {
+    let name: String
+    let record: ExpertTensorRecord
+    let scalesName: String
+    let scalesRecord: ExpertTensorRecord?
+    let biasesName: String
+    let biasesRecord: ExpertTensorRecord?
+    let decodePrefetchKeys: [String]
+
+    func decodePrefetchKey(for expertIndex: Int) -> String {
+        guard expertIndex >= 0, expertIndex < decodePrefetchKeys.count else {
+            return DeepSeekWeightLoader.decodePrefetchKey(name, expertIndex)
+        }
+        return decodePrefetchKeys[expertIndex]
+    }
+}
+
 public struct DeepSeekWeightLoader {
     public let denseStore: DenseTensorStore
     public let expertBank: ExpertSlotBank
@@ -111,6 +133,7 @@ public struct DeepSeekWeightLoader {
     private let decodeSideBank: ExpertSlotBank?
     private let bridge: MLXArrayTensorBridge
     private let scheduledPinnedDecodePrefetches = ScheduledDecodePrefetches()
+    private let routedExpertProjectionPlans: [RoutedExpertProjectionKey: RoutedExpertProjectionPlan]
 
     /// Sized for the official 48 GB runner: pin only where at least that
     /// budget exists, and never more than two layers of codes (~6.4 GiB).
@@ -134,6 +157,7 @@ public struct DeepSeekWeightLoader {
             metrics: metrics
         )
         self.expertBank = expertBank
+        self.routedExpertProjectionPlans = Self.buildRoutedExpertProjectionPlans(expertBank: expertBank)
         self.expertPrefetcher = ExpertPrefetcher(expertBank: expertBank)
         // Resident stores come from a process-wide registry: the trusted
         // benchmark harness keeps two loaders alive at once, and duplicating
@@ -179,6 +203,7 @@ public struct DeepSeekWeightLoader {
     ) {
         self.denseStore = denseStore
         self.expertBank = expertBank
+        self.routedExpertProjectionPlans = Self.buildRoutedExpertProjectionPlans(expertBank: expertBank)
         self.expertStreamingConfig = expertStreamingConfig
         self.expertStreamingMetrics = expertStreamingMetrics ?? expertBank.metrics
         self.expertPrefetcher = ExpertPrefetcher(expertBank: expertBank)
@@ -289,6 +314,55 @@ public struct DeepSeekWeightLoader {
         "\(name)#\(index)"
     }
 
+    private static func buildRoutedExpertProjectionPlans(
+        expertBank: ExpertSlotBank
+    ) -> [RoutedExpertProjectionKey: RoutedExpertProjectionPlan] {
+        let maxLayerIndex = expertBank.manifest.expertTensors.compactMap(\.layerIndex).max() ?? -1
+        guard maxLayerIndex >= 0 else {
+            return [:]
+        }
+        var plans: [RoutedExpertProjectionKey: RoutedExpertProjectionPlan] = [:]
+        plans.reserveCapacity((maxLayerIndex + 1) * 3)
+        for layerIndex in 0...maxLayerIndex {
+            for projection in [DeepSeekExpertProjection.gate, .up, .down] {
+                let candidates = DeepSeekWeightNames.routedExpert(
+                    layerIndex: layerIndex,
+                    expertIndex: 0,
+                    projection: projection
+                )
+                guard
+                    let candidate = candidates.first(where: { expertBank.record(named: $0) != nil }),
+                    let record = expertBank.record(named: candidate),
+                    record.shape.count >= 3,
+                    let expertCount = record.shape.first,
+                    expertCount > 0
+                else {
+                    continue
+                }
+                let scalesName = Self.companionName(for: candidate, suffix: "scales")
+                let biasesName = Self.companionName(for: candidate, suffix: "biases")
+                plans[RoutedExpertProjectionKey(layerIndex: layerIndex, projection: projection)] =
+                    RoutedExpertProjectionPlan(
+                        name: candidate,
+                        record: record,
+                        scalesName: scalesName,
+                        scalesRecord: expertBank.record(named: scalesName),
+                        biasesName: biasesName,
+                        biasesRecord: expertBank.record(named: biasesName),
+                        decodePrefetchKeys: (0..<expertCount).map { Self.decodePrefetchKey(candidate, $0) }
+                    )
+            }
+        }
+        return plans
+    }
+
+    private func routedExpertProjectionPlan(
+        layerIndex: Int,
+        projection: DeepSeekExpertProjection
+    ) -> RoutedExpertProjectionPlan? {
+        routedExpertProjectionPlans[RoutedExpertProjectionKey(layerIndex: layerIndex, projection: projection)]
+    }
+
     /// Builds the base scales MLXArray for a code tensor off the compute
     /// thread, but only when the scales are RAM-resident (the common frontier
     /// path). Thread-safe: the resident store is immutable and makeArray is a
@@ -343,6 +417,17 @@ public struct DeepSeekWeightLoader {
         var seen = Set<String>()
         for expertIndex in expertIndices {
             for (projection, expectedShape) in projections {
+                if let plan = routedExpertProjectionPlan(layerIndex: layerIndex, projection: projection),
+                   plan.record.shape.count == expectedShape.count + 1,
+                   plan.record.shape.first.map({ expertIndex < $0 }) == true {
+                    let key = plan.decodePrefetchKey(for: expertIndex)
+                    if seen.insert(key).inserted {
+                        keys.append(key)
+                        names.append(plan.name)
+                        indices.append(expertIndex)
+                    }
+                    continue
+                }
                 let candidates = DeepSeekWeightNames.routedExpert(
                     layerIndex: layerIndex,
                     expertIndex: expertIndex,
@@ -489,6 +574,20 @@ public struct DeepSeekWeightLoader {
         var seen = Set<String>()
         for expertIndex in expertIndices {
             for (projection, expectedShape) in projections {
+                if let plan = routedExpertProjectionPlan(layerIndex: layerIndex, projection: projection),
+                   plan.record.shape.count == expectedShape.count + 1,
+                   plan.record.shape.first.map({ expertIndex < $0 }) == true {
+                    guard pinnedCodes.isResident(name: plan.name) else {
+                        continue
+                    }
+                    let key = plan.decodePrefetchKey(for: expertIndex)
+                    if seen.insert(key).inserted {
+                        keys.append(key)
+                        names.append(plan.name)
+                        indices.append(expertIndex)
+                    }
+                    continue
+                }
                 let candidates = DeepSeekWeightNames.routedExpert(
                     layerIndex: layerIndex,
                     expertIndex: expertIndex,
@@ -669,22 +768,12 @@ public struct DeepSeekWeightLoader {
     /// scales store — all byte-identical stand-ins for the bank's stacked
     /// tensor by the same slice arithmetic the per-expert path uses.
     public struct StackedExpertProjection {
-        // The stacked code tensor split into first-axis chunks so the
-        // Data->Metal copies parallelize across ~4 workers per projection
-        // (~12 across the three projections) instead of one serial ~1 GiB
-        // copy each. A per-expert view of a chunk is byte-identical to the
-        // same view of one whole array.
-        public let weightChunks: [MLXArray]
-        public let chunkSize: Int
+        public let weight: MLXArray
         public let scales: MLXArray
         public let biases: MLXArray?
         public let groupSize: Int
         public let bits: Int
         public let mode: QuantizationMode
-
-        public func weight(forExpert expertIndex: Int) -> MLXArray {
-            weightChunks[expertIndex / chunkSize][expertIndex % chunkSize]
-        }
     }
 
     /// Builds the whole stacked projection for a layer when every byte is
@@ -721,73 +810,24 @@ public struct DeepSeekWeightLoader {
 
         // Whole-tensor code bytes: staged layer buffer first, then the pinned
         // hash-layer store. Both hold the exact stacked tensor bytes.
-        let codesBytes: Data?
+        let codesTensor: MaterializedTensor?
         if let staged = expertLayerStager?.stagedBytes(recordName: candidate),
-           staged.count == record.byteLength {
-            codesBytes = staged
+           staged.count == record.byteLength,
+           let dtype = try? TensorDType.parse(record.dtype) {
+            codesTensor = try? MaterializedTensor(
+                name: candidate,
+                dtype: dtype,
+                shape: record.shape,
+                bytes: staged
+            )
         } else {
-            codesBytes = pinnedExpertCodes?
-                .materializedTensor(named: candidate, firstAxisIndex: nil)?
-                .bytes
+            codesTensor = pinnedExpertCodes?.materializedTensor(named: candidate, firstAxisIndex: nil)
         }
-        guard
-            let codesBytes,
-            codesBytes.count == record.byteLength,
-            let expertCount = record.shape.first,
-            expertCount > 0,
-            record.byteLength % expertCount == 0,
-            let codesDType = try? TensorDType.parse(record.dtype)
-        else {
+        guard let codesTensor, let weightArray = try? bridge.makeArray(from: codesTensor) else {
             return nil
         }
 
-        // Split the ~1 GiB copy into first-axis chunks built concurrently.
-        // Chunk boundaries fall on expert boundaries, so every per-expert
-        // view is byte-identical to the whole-array view.
-        let chunkCount = min(4, expertCount)
-        let chunkSize = (expertCount + chunkCount - 1) / chunkCount
-        let sliceByteLength = record.byteLength / expertCount
-        let sliceShape = Array(record.shape.dropFirst())
-        var chunkArrays = [MLXArray?](repeating: nil, count: chunkCount)
-        let bridge = self.bridge
-        chunkArrays.withUnsafeMutableBufferPointer { buffer in
-            let sink = StackedChunkSink(buffer: buffer)
-            DispatchQueue.concurrentPerform(iterations: chunkCount) { chunkIndex in
-                let firstExpert = chunkIndex * chunkSize
-                let expertsInChunk = min(chunkSize, expertCount - firstExpert)
-                guard expertsInChunk > 0 else {
-                    return
-                }
-                let start = codesBytes.startIndex + firstExpert * sliceByteLength
-                let end = start + expertsInChunk * sliceByteLength
-                guard
-                    let tensor = try? MaterializedTensor(
-                        name: "\(candidate)[\(firstExpert)..<\(firstExpert + expertsInChunk)]",
-                        dtype: codesDType,
-                        shape: [expertsInChunk] + sliceShape,
-                        bytes: codesBytes[start..<end]
-                    ),
-                    let array = try? bridge.makeArray(from: tensor)
-                else {
-                    return
-                }
-                sink.buffer[chunkIndex] = array
-            }
-        }
-        var weightChunks: [MLXArray] = []
-        weightChunks.reserveCapacity(chunkCount)
-        for chunkIndex in 0..<chunkCount {
-            let firstExpert = chunkIndex * chunkSize
-            if firstExpert >= expertCount {
-                break
-            }
-            guard let array = chunkArrays[chunkIndex] else {
-                return nil
-            }
-            weightChunks.append(array)
-        }
-
-        let scalesName = companionName(for: candidate, suffix: "scales")
+        let scalesName = Self.companionName(for: candidate, suffix: "scales")
         guard let scalesRecord = expertBank.record(named: scalesName),
               scalesRecord.shape.count == expectedShape.count + 1,
               let scaleGroups = scalesRecord.shape.last,
@@ -815,7 +855,7 @@ public struct DeepSeekWeightLoader {
             return nil
         }
 
-        let biasesName = companionName(for: candidate, suffix: "biases")
+        let biasesName = Self.companionName(for: candidate, suffix: "biases")
         var biasesArray: MLXArray?
         if let biasesRecord = expertBank.record(named: biasesName) {
             // Biases exist but are only in RAM when staged; without them the
@@ -838,8 +878,7 @@ public struct DeepSeekWeightLoader {
 
         let mode: QuantizationMode = biasesArray == nil && scalesTensor.dtype == .u8 ? .mxfp4 : .affine
         return StackedExpertProjection(
-            weightChunks: weightChunks,
-            chunkSize: chunkSize,
+            weight: weightArray,
             scales: scalesArray,
             biases: biasesArray,
             groupSize: logicalInput / scaleGroups,
@@ -881,6 +920,64 @@ public struct DeepSeekWeightLoader {
             guard let record = expertBank.record(named: candidate) else {
                 continue
             }
+            return try buildExpertLinearWeight(
+                candidate: candidate,
+                record: record,
+                expectedShape: expectedShape,
+                expertIndex: expertIndex,
+                preferStaged: preferStaged,
+                decodePrefetch: decodePrefetch,
+                plan: nil
+            )
+        }
+        throw MLXFastError.invalidInput(
+            "expert tensor not found; tried \(candidates.joined(separator: ", "))"
+        )
+    }
+
+    public func routedExpertLinearWeight(
+        layerIndex: Int,
+        projection: DeepSeekExpertProjection,
+        expectedShape: [Int],
+        expertIndex: Int,
+        preferStaged: Bool = false,
+        decodePrefetch: [String: StagedExpertCode]? = nil
+    ) throws -> DeepSeekLinearWeight {
+        if let plan = routedExpertProjectionPlan(layerIndex: layerIndex, projection: projection),
+           plan.record.shape.count == expectedShape.count + 1,
+           plan.record.shape.first.map({ expertIndex < $0 }) == true {
+            return try buildExpertLinearWeight(
+                candidate: plan.name,
+                record: plan.record,
+                expectedShape: expectedShape,
+                expertIndex: expertIndex,
+                preferStaged: preferStaged,
+                decodePrefetch: decodePrefetch,
+                plan: plan
+            )
+        }
+        return try expertLinearWeight(
+            candidates: DeepSeekWeightNames.routedExpert(
+                layerIndex: layerIndex,
+                expertIndex: expertIndex,
+                projection: projection
+            ),
+            expectedShape: expectedShape,
+            expertIndex: expertIndex,
+            preferStaged: preferStaged,
+            decodePrefetch: decodePrefetch
+        )
+    }
+
+    private func buildExpertLinearWeight(
+        candidate: String,
+        record: ExpertTensorRecord,
+        expectedShape: [Int],
+        expertIndex: Int,
+        preferStaged: Bool,
+        decodePrefetch: [String: StagedExpertCode]?,
+        plan: RoutedExpertProjectionPlan?
+    ) throws -> DeepSeekLinearWeight {
             let isStacked = record.shape.count == expectedShape.count + 1
                 && record.shape.first.map { expertIndex < $0 } == true
             let tensor: MaterializedTensor
@@ -890,8 +987,10 @@ public struct DeepSeekWeightLoader {
             // Data->Metal copy here on the compute thread.
             var prebuiltWeightArray: MLXArray?
             var prebuiltScalesArray: MLXArray?
+            let prefetchKey = plan?.decodePrefetchKey(for: expertIndex)
+                ?? Self.decodePrefetchKey(candidate, expertIndex)
             if isStacked,
-               let prefetched = decodePrefetch?[Self.decodePrefetchKey(candidate, expertIndex)] {
+               let prefetched = decodePrefetch?[prefetchKey] {
                 // Concurrently pre-read slice + pre-built base arrays (decode
                 // side-bank, pinned resident prebuild, OR prefill staged-buffer).
                 // Checked before the resident/staged fallbacks so prebuilt base
@@ -930,11 +1029,27 @@ public struct DeepSeekWeightLoader {
                        let staged = stagedSliceTensor(
                            recordName: companionName,
                            expertIndex: expertIndex
-                       ) {
+                        ) {
                         return staged
                     }
-                    guard expertBank.record(named: companionName) != nil else {
-                        return nil
+                    if let plan {
+                        if companionName == plan.scalesName {
+                            guard plan.scalesRecord != nil else {
+                                return nil
+                            }
+                        } else if companionName == plan.biasesName {
+                            guard plan.biasesRecord != nil else {
+                                return nil
+                            }
+                        } else {
+                            guard expertBank.record(named: companionName) != nil else {
+                                return nil
+                            }
+                        }
+                    } else {
+                        guard expertBank.record(named: companionName) != nil else {
+                            return nil
+                        }
                     }
                     return try shouldSlice
                         ? expertBank.materializedTensor(named: companionName, firstAxisIndex: expertIndex)
@@ -942,10 +1057,6 @@ public struct DeepSeekWeightLoader {
                 },
                 shouldSliceCompanions: isStacked
             )
-        }
-        throw MLXFastError.invalidInput(
-            "expert tensor not found; tried \(candidates.joined(separator: ", "))"
-        )
     }
 
     /// Stacked expert record names for one layer, for whole-tensor staging:
@@ -978,7 +1089,7 @@ public struct DeepSeekWeightLoader {
             }
             if record.dtype == "U32" {
                 for suffix in ["scales", "biases"] {
-                    let companion = companionName(for: candidate, suffix: suffix)
+                    let companion = Self.companionName(for: candidate, suffix: suffix)
                     guard let companionRecord = expertBank.record(named: companion) else {
                         continue
                     }
@@ -1746,7 +1857,7 @@ public struct DeepSeekWeightLoader {
         companionMetadata: (_ companionName: String, _ shouldSlice: Bool) throws -> (dtype: TensorDType, shape: [Int])?,
         shouldSliceCompanions: Bool = false
     ) throws {
-        let scalesName = companionName(for: baseName, suffix: "scales")
+        let scalesName = Self.companionName(for: baseName, suffix: "scales")
         guard dtype == .u32,
               let scales = try companionMetadata(scalesName, shouldSliceCompanions)
         else {
@@ -1755,7 +1866,7 @@ public struct DeepSeekWeightLoader {
         }
 
         let biases = try companionMetadata(
-            companionName(for: baseName, suffix: "biases"),
+            Self.companionName(for: baseName, suffix: "biases"),
             shouldSliceCompanions
         )
         let expectedRows = expectedShape.dropLast().reduce(1, *)
@@ -1820,14 +1931,14 @@ public struct DeepSeekWeightLoader {
         companionTensor: (_ companionName: String, _ shouldSlice: Bool) throws -> MaterializedTensor?,
         shouldSliceCompanions: Bool = false
     ) throws -> DeepSeekLinearWeight {
-        let scalesName = companionName(for: baseName, suffix: "scales")
+        let scalesName = Self.companionName(for: baseName, suffix: "scales")
         guard tensor.dtype == .u32, let scalesTensor = try companionTensor(scalesName, shouldSliceCompanions) else {
             try validateShape(tensor.shape, expectedShape: expectedShape, tensorName: baseName)
             return DeepSeekLinearWeight(try prebuiltWeightArray ?? bridge.makeArray(from: tensor))
         }
 
         let biasesTensor = try companionTensor(
-            companionName(for: baseName, suffix: "biases"),
+            Self.companionName(for: baseName, suffix: "biases"),
             shouldSliceCompanions
         )
         let expectedRows = expectedShape.dropLast().reduce(1, *)
@@ -1892,7 +2003,7 @@ public struct DeepSeekWeightLoader {
         )
     }
 
-    private func companionName(for weightName: String, suffix: String) -> String {
+    private static func companionName(for weightName: String, suffix: String) -> String {
         if weightName.hasSuffix(".weight") {
             return String(weightName.dropLast(".weight".count)) + ".\(suffix)"
         }
@@ -1923,10 +2034,6 @@ public struct StagedExpertCode {
 // disjoint and the unchecked Sendable conformance is sound.
 private struct DecodePrefetchSink: @unchecked Sendable {
     let buffer: UnsafeMutableBufferPointer<StagedExpertCode?>
-}
-
-private struct StackedChunkSink: @unchecked Sendable {
-    let buffer: UnsafeMutableBufferPointer<MLXArray?>
 }
 
 private final class ScheduledDecodePrefetches {

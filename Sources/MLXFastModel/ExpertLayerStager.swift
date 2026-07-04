@@ -88,21 +88,6 @@ public final class ExpertLayerStager {
         return stagedBytesByRecordName[recordName]
     }
 
-    /// Frees a layer's staged byte buffers while keeping the layer marked as
-    /// staged (waitForLayer keeps returning true). For callers that already
-    /// copied the bytes into derived arrays, the staged Data is dead weight
-    /// until releaseLayer; dropping it early keeps ~3 GiB out of the peak
-    /// while the next layer stages.
-    public func releaseStagedBytesKeepingLayer(_ layerIndex: Int) {
-        condition.lock()
-        if let names = recordNamesByLayer[layerIndex] {
-            for name in names {
-                stagedBytesByRecordName.removeValue(forKey: name)
-            }
-        }
-        condition.unlock()
-    }
-
     /// Frees a consumed layer's staged buffers.
     public func releaseLayer(_ layerIndex: Int) {
         condition.lock()
