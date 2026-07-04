@@ -669,12 +669,22 @@ public struct DeepSeekWeightLoader {
     /// scales store — all byte-identical stand-ins for the bank's stacked
     /// tensor by the same slice arithmetic the per-expert path uses.
     public struct StackedExpertProjection {
-        public let weight: MLXArray
+        // The stacked code tensor split into first-axis chunks so the
+        // Data->Metal copies parallelize across ~4 workers per projection
+        // (~12 across the three projections) instead of one serial ~1 GiB
+        // copy each. A per-expert view of a chunk is byte-identical to the
+        // same view of one whole array.
+        public let weightChunks: [MLXArray]
+        public let chunkSize: Int
         public let scales: MLXArray
         public let biases: MLXArray?
         public let groupSize: Int
         public let bits: Int
         public let mode: QuantizationMode
+
+        public func weight(forExpert expertIndex: Int) -> MLXArray {
+            weightChunks[expertIndex / chunkSize][expertIndex % chunkSize]
+        }
     }
 
     /// Builds the whole stacked projection for a layer when every byte is
@@ -711,21 +721,70 @@ public struct DeepSeekWeightLoader {
 
         // Whole-tensor code bytes: staged layer buffer first, then the pinned
         // hash-layer store. Both hold the exact stacked tensor bytes.
-        let codesTensor: MaterializedTensor?
+        let codesBytes: Data?
         if let staged = expertLayerStager?.stagedBytes(recordName: candidate),
-           staged.count == record.byteLength,
-           let dtype = try? TensorDType.parse(record.dtype) {
-            codesTensor = try? MaterializedTensor(
-                name: candidate,
-                dtype: dtype,
-                shape: record.shape,
-                bytes: staged
-            )
+           staged.count == record.byteLength {
+            codesBytes = staged
         } else {
-            codesTensor = pinnedExpertCodes?.materializedTensor(named: candidate, firstAxisIndex: nil)
+            codesBytes = pinnedExpertCodes?
+                .materializedTensor(named: candidate, firstAxisIndex: nil)?
+                .bytes
         }
-        guard let codesTensor, let weightArray = try? bridge.makeArray(from: codesTensor) else {
+        guard
+            let codesBytes,
+            codesBytes.count == record.byteLength,
+            let expertCount = record.shape.first,
+            expertCount > 0,
+            record.byteLength % expertCount == 0,
+            let codesDType = try? TensorDType.parse(record.dtype)
+        else {
             return nil
+        }
+
+        // Split the ~1 GiB copy into first-axis chunks built concurrently.
+        // Chunk boundaries fall on expert boundaries, so every per-expert
+        // view is byte-identical to the whole-array view.
+        let chunkCount = min(4, expertCount)
+        let chunkSize = (expertCount + chunkCount - 1) / chunkCount
+        let sliceByteLength = record.byteLength / expertCount
+        let sliceShape = Array(record.shape.dropFirst())
+        var chunkArrays = [MLXArray?](repeating: nil, count: chunkCount)
+        let bridge = self.bridge
+        chunkArrays.withUnsafeMutableBufferPointer { buffer in
+            let sink = StackedChunkSink(buffer: buffer)
+            DispatchQueue.concurrentPerform(iterations: chunkCount) { chunkIndex in
+                let firstExpert = chunkIndex * chunkSize
+                let expertsInChunk = min(chunkSize, expertCount - firstExpert)
+                guard expertsInChunk > 0 else {
+                    return
+                }
+                let start = codesBytes.startIndex + firstExpert * sliceByteLength
+                let end = start + expertsInChunk * sliceByteLength
+                guard
+                    let tensor = try? MaterializedTensor(
+                        name: "\(candidate)[\(firstExpert)..<\(firstExpert + expertsInChunk)]",
+                        dtype: codesDType,
+                        shape: [expertsInChunk] + sliceShape,
+                        bytes: codesBytes[start..<end]
+                    ),
+                    let array = try? bridge.makeArray(from: tensor)
+                else {
+                    return
+                }
+                sink.buffer[chunkIndex] = array
+            }
+        }
+        var weightChunks: [MLXArray] = []
+        weightChunks.reserveCapacity(chunkCount)
+        for chunkIndex in 0..<chunkCount {
+            let firstExpert = chunkIndex * chunkSize
+            if firstExpert >= expertCount {
+                break
+            }
+            guard let array = chunkArrays[chunkIndex] else {
+                return nil
+            }
+            weightChunks.append(array)
         }
 
         let scalesName = companionName(for: candidate, suffix: "scales")
@@ -779,7 +838,8 @@ public struct DeepSeekWeightLoader {
 
         let mode: QuantizationMode = biasesArray == nil && scalesTensor.dtype == .u8 ? .mxfp4 : .affine
         return StackedExpertProjection(
-            weight: weightArray,
+            weightChunks: weightChunks,
+            chunkSize: chunkSize,
             scales: scalesArray,
             biases: biasesArray,
             groupSize: logicalInput / scaleGroups,
@@ -1863,6 +1923,10 @@ public struct StagedExpertCode {
 // disjoint and the unchecked Sendable conformance is sound.
 private struct DecodePrefetchSink: @unchecked Sendable {
     let buffer: UnsafeMutableBufferPointer<StagedExpertCode?>
+}
+
+private struct StackedChunkSink: @unchecked Sendable {
+    let buffer: UnsafeMutableBufferPointer<MLXArray?>
 }
 
 private final class ScheduledDecodePrefetches {
