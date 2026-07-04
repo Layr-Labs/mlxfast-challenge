@@ -33,7 +33,29 @@ elif [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" && "${LOCAL_ITERATE}" == "1" ]
 else
   GOLDEN_PATH="${MLXFAST_CORRECTNESS_GOLDEN_PATH:-correctness_golden.json}"
 fi
-REFERENCE_PATH="${MLXFAST_REFERENCE_DIR:-reference_weights/DeepSeek-V4-Flash-4bit}"
+# Resolve the reference checkpoint the same way setup.sh does. benchmark.sh used
+# to hard-default to the reference_weights/ compatibility symlink; when that
+# symlink is stale, dangling, or points at a non-directory, the Swift transform
+# fails with ENOTDIR ("Not a directory"). Prefer an explicit MLXFAST_REFERENCE_DIR;
+# else use reference_weights/ only when it actually holds a checkpoint, resolved to
+# its real target so the transform never opens a symlinked directory; else fall
+# back to the Hugging Face cache setup.sh downloads into.
+REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/DeepSeek-V4-Flash-4bit}"
+REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-main}"
+REFERENCE_DEFAULT_DIR="reference_weights/DeepSeek-V4-Flash-4bit"
+REFERENCE_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}"
+REFERENCE_HF_HUB_CACHE="${MLXFAST_HF_HUB_CACHE:-${HF_HUB_CACHE:-${REFERENCE_HF_HOME}/hub}}"
+REFERENCE_CACHE_DIR="${MLXFAST_REFERENCE_CACHE_DIR:-${REFERENCE_HF_HUB_CACHE}/models--${REFERENCE_MODEL_REPO//\//--}/snapshots/${REFERENCE_REVISION//\//--}}"
+if [[ -n "${MLXFAST_REFERENCE_DIR:-}" ]]; then
+  REFERENCE_PATH="${MLXFAST_REFERENCE_DIR}"
+elif [[ -f "${REFERENCE_DEFAULT_DIR}/config.json" ]]; then
+  REFERENCE_PATH="$(cd -P "${REFERENCE_DEFAULT_DIR}" 2>/dev/null && pwd -P)" \
+    || REFERENCE_PATH="${REFERENCE_DEFAULT_DIR}"
+elif [[ -f "${REFERENCE_CACHE_DIR}/config.json" ]]; then
+  REFERENCE_PATH="${REFERENCE_CACHE_DIR}"
+else
+  REFERENCE_PATH="${REFERENCE_DEFAULT_DIR}"
+fi
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
 MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
 SANDBOX_PROFILE="${MLXFAST_SANDBOX_PROFILE:-tools/deny-network.sb}"
