@@ -901,6 +901,194 @@ private func writeIndex(_ path: URL, tensors: [TensorFixture], shardName: String
     """.write(to: path, atomically: true, encoding: .utf8)
 }
 
+@Test
+func localIterateDecodeProgressIntervalReportsEveryStepForShortRuns() {
+    // local-iterate: 16 decode steps get a running-number line on every token.
+    #expect(DeepSeekRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 16, timingRepeats: 1) == 1)
+    #expect(DeepSeekRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 32, timingRepeats: 1) == 1)
+    // local-submit: 1023 steps keep the historical 8-step cadence.
+    #expect(DeepSeekRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 1023, timingRepeats: 1) == 8)
+    // Multi-repeat runs keep the sparser 64-step cadence.
+    #expect(DeepSeekRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 512, timingRepeats: 4) == 64)
+}
+
+@Test
+func localIterateProjectedDecodeSecondsPerTokenConvergesToChargedMean() {
+    // Mid-run: charged 20s so far (18s seed + 2s steps), 2 of 16 tokens done at
+    // 1s/step mean -> project 14 more step-seconds on top of the charged 20.
+    let projected = DeepSeekRuntime.localIterateProjectedDecodeSecondsPerToken(
+        chargedSecondsSoFar: 20,
+        stepOnlySecondsSoFar: 2,
+        decodedTokens: 2,
+        totalDecodeTokens: 16
+    )
+    #expect(abs(projected - (20.0 + 14.0) / 16.0) < 1e-12)
+
+    // Final token: exactly the charged mean the score payload will report.
+    let final = DeepSeekRuntime.localIterateProjectedDecodeSecondsPerToken(
+        chargedSecondsSoFar: 32,
+        stepOnlySecondsSoFar: 14,
+        decodedTokens: 16,
+        totalDecodeTokens: 16
+    )
+    #expect(final == 2.0)
+
+    // Guards.
+    #expect(
+        DeepSeekRuntime.localIterateProjectedDecodeSecondsPerToken(
+            chargedSecondsSoFar: 1,
+            stepOnlySecondsSoFar: 1,
+            decodedTokens: 0,
+            totalDecodeTokens: 16
+        ) == 0
+    )
+}
+
+@Test
+func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
+    let status = DeepSeekRuntime.localIterateLiveDecodeStatus(
+        lastStepSeconds: 0.9,
+        chargedSecondsSoFar: 20,
+        stepOnlySecondsSoFar: 2,
+        decodedTokens: 2,
+        totalDecodeTokens: 16,
+        prefillSecondsPerToken: 0.05
+    )
+    #expect(status.contains("last_step_seconds=0.900000"))
+    #expect(status.contains("mean_step_seconds=1.000000"))
+    #expect(status.contains("projected_decode_seconds_per_token="))
+    #expect(status.contains("projected_decode_speedup="))
+    #expect(status.contains("projected_score="))
+
+    // Before prefill has a positive measurement there is no score estimate.
+    let withoutPrefill = DeepSeekRuntime.localIterateLiveDecodeStatus(
+        lastStepSeconds: 0.9,
+        chargedSecondsSoFar: 20,
+        stepOnlySecondsSoFar: 2,
+        decodedTokens: 2,
+        totalDecodeTokens: 16,
+        prefillSecondsPerToken: nil
+    )
+    #expect(withoutPrefill.contains("projected_decode_speedup="))
+    #expect(!withoutPrefill.contains("projected_score="))
+
+    #expect(
+        DeepSeekRuntime.localIterateLiveDecodeStatus(
+            lastStepSeconds: 0,
+            chargedSecondsSoFar: 0,
+            stepOnlySecondsSoFar: 0,
+            decodedTokens: 0,
+            totalDecodeTokens: 16,
+            prefillSecondsPerToken: nil
+        ).isEmpty
+    )
+}
+
+@Test
+func localIteratePrefillStatusReportsPerTokenAndSpeedup() {
+    let status = DeepSeekRuntime.localIteratePrefillStatus(
+        elapsedSeconds: 51.2,
+        promptTokens: 512
+    )
+    #expect(status.contains("seconds=51.2"))
+    #expect(status.contains("seconds_per_token=0.100000"))
+    let expectedSpeedup = MLXFastConstants.officialBaselinePrefillSecondsPerToken / 0.1
+    #expect(status.contains("prefill_speedup=\(String(format: "%.3f", expectedSpeedup))"))
+
+    // Zero-duration or zero-token inputs fall back to the plain seconds field.
+    #expect(
+        DeepSeekRuntime.localIteratePrefillStatus(elapsedSeconds: 0, promptTokens: 512)
+            == "seconds=0.0"
+    )
+}
+
+@Test
+func localIterateSummaryEmitsSpeedupsEstimatedScoreAndExpertStats() {
+    let timing = DeepSeekRuntime.LocalIterateTimingResult(
+        correctness: DeepSeekRuntime.localIterateCorrectnessReport(
+            passed: true,
+            checkedSteps: 18,
+            caseCount: 1,
+            firstFailingStep: nil,
+            expectedToken: nil,
+            actualToken: nil,
+            goldenHash: "hash",
+            expertStats: ExpertStreamingStats(cacheHits: 3, cacheMisses: 1),
+            error: "",
+            modeName: "local-iterate"
+        ),
+        prefillSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken / 2,
+        decode: DeepSeekRuntime.DecodeMeasurement(
+            secondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken / 2,
+            bandwidthGBPerToken: 1.5,
+            bandwidthSource: "expert-streaming"
+        ),
+        expertStats: ExpertStreamingStats(cacheHits: 3, cacheMisses: 1),
+        peakRamGB: 24.5
+    )
+
+    var lines: [String] = []
+    DeepSeekRuntime.emitLocalIterateSummary(
+        modeName: "local-iterate",
+        timing: timing,
+        progress: { lines.append($0) }
+    )
+
+    let joined = lines.joined(separator: "\n")
+    #expect(joined.contains("local-iterate summary prefill_seconds_per_token="))
+    #expect(joined.contains("prefill_speedup=2.000"))
+    #expect(joined.contains("local-iterate summary decode_seconds_per_token="))
+    #expect(joined.contains("decode_speedup=2.000"))
+    // 2x on both axes -> estimated score 2 under decode^0.75 * prefill^0.25.
+    #expect(joined.contains("est_score=2.000"))
+    #expect(joined.contains("score stays null in local modes"))
+    #expect(joined.contains("expert_hit_rate=0.750"))
+    #expect(joined.contains("peak_ram_gb=24.500"))
+}
+
+@Test
+func localIteratePhaseHeartbeatFiresWhileBlockedAndStopsAfterCancel() throws {
+    final class MessageBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var messages: [String] = []
+        func append(_ message: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            messages.append(message)
+        }
+        func snapshot() -> [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return messages
+        }
+    }
+
+    // No progress sink means no timer at all.
+    #expect(DeepSeekRuntime.startPhaseHeartbeat(label: "x", progress: nil) == nil)
+
+    let box = MessageBox()
+    let heartbeat = try #require(
+        DeepSeekRuntime.startPhaseHeartbeat(
+            label: "local-iterate prefill measured",
+            intervalSeconds: 0.05,
+            progress: { box.append($0) }
+        )
+    )
+    Thread.sleep(forTimeInterval: 0.3)
+    heartbeat.cancel()
+    let firedWhileRunning = box.snapshot()
+    #expect(!firedWhileRunning.isEmpty)
+    #expect(
+        firedWhileRunning.allSatisfy {
+            $0.hasPrefix("local-iterate prefill measured still running phase_seconds=")
+        }
+    )
+
+    // After cancel the heartbeat must stay quiet.
+    Thread.sleep(forTimeInterval: 0.2)
+    #expect(box.snapshot().count == firedWhileRunning.count)
+}
+
 private func writeExpertManifest(
     _ path: URL,
     referencePath: String,

@@ -26,6 +26,13 @@ extension DeepSeekRuntime {
             "\(modeName) start checked_tokens=\(totalCheckedSteps) "
                 + "decode_steps=\(options.benchmarkDecodeSteps) repeats=\(options.timingRepeats)"
         )
+        progress(
+            "\(modeName) baseline prefill_seconds_per_token="
+                + formatDouble(MLXFastConstants.officialBaselinePrefillSecondsPerToken)
+                + " decode_seconds_per_token="
+                + formatDouble(MLXFastConstants.officialBaselineDecodeSecondsPerToken)
+                + " (official-runner constants; local speedups are directional)"
+        )
 
         func failed(
             _ error: String,
@@ -64,10 +71,18 @@ extension DeepSeekRuntime {
             let validationStart = DispatchTime.now().uptimeNanoseconds
             progress("\(modeName) validation start")
             try checkWorkerBenchmarkInputs(weightsPath: options.weightsPath, goldenPath: options.goldenPath)
+            let digestHeartbeat = startPhaseHeartbeat(
+                label: "\(modeName) weights digest",
+                progress: progress
+            )
+            defer {
+                digestHeartbeat?.cancel()
+            }
             transformedWeightsDigest = try directoryDigest(
                 rootPath: options.weightsPath,
                 ignoredRelativePaths: [".benchmark-source.sha256", ".gitkeep"]
             )
+            digestHeartbeat?.cancel()
             if let transformedWeightsDigest {
                 try enforceTransformedWeightsByteLimit(transformedWeightsDigest.byteCount)
                 progress(
@@ -126,6 +141,7 @@ extension DeepSeekRuntime {
                     + "decode_seconds_per_token=\(formatDouble(timing.decode.secondsPerToken)) "
                     + "seconds=\(formatSeconds(timedSeconds))"
             )
+            emitLocalIterateSummary(modeName: modeName, timing: timing, progress: progress)
             guard timing.correctness.passed else {
                 return failed(
                     timing.correctness.error.isEmpty ? "\(modeName) correctness failed" : timing.correctness.error,
@@ -166,6 +182,193 @@ extension DeepSeekRuntime {
         }
     }
 
+    // MARK: - Live progress helpers
+    //
+    // Local modes are the participant edit loop, so the run streams every
+    // useful number to stderr the moment it exists instead of holding
+    // everything for the final score JSON. All lines below are progress-only:
+    // they never feed the sealed score payload, and they never include
+    // expected/actual token values (mismatch details stay in the score JSON,
+    // matching the redaction the shared progress reporter applies to errors).
+
+    static func formatRatio(_ value: Double) -> String {
+        String(format: "%.3f", value)
+    }
+
+    /// Short runs print running numbers on every decoded token; longer runs
+    /// (local-submit's 1023 steps) keep the historical 8/64-step cadence so the
+    /// log stays readable.
+    static func localIterateDecodeProgressInterval(
+        totalDecodeSteps: Int,
+        timingRepeats: Int
+    ) -> Int {
+        if totalDecodeSteps <= 32 {
+            return 1
+        }
+        return timingRepeats > 1 ? 64 : 8
+    }
+
+    /// Projects the final charged decode seconds-per-token from the phase so
+    /// far: seed prefill/setup already charged, plus remaining steps assumed to
+    /// run at the mean per-step rate observed so far. Converges to the exact
+    /// final metric at the last step.
+    static func localIterateProjectedDecodeSecondsPerToken(
+        chargedSecondsSoFar: Double,
+        stepOnlySecondsSoFar: Double,
+        decodedTokens: Int,
+        totalDecodeTokens: Int
+    ) -> Double {
+        guard decodedTokens > 0, totalDecodeTokens > 0 else {
+            return 0
+        }
+        guard decodedTokens < totalDecodeTokens else {
+            return chargedSecondsSoFar / Double(totalDecodeTokens)
+        }
+        let meanStepSeconds = stepOnlySecondsSoFar / Double(decodedTokens)
+        let remainingTokens = Double(totalDecodeTokens - decodedTokens)
+        return (chargedSecondsSoFar + remainingTokens * meanStepSeconds) / Double(totalDecodeTokens)
+    }
+
+    /// Builds the per-step live status suffix: last step latency, mean step
+    /// latency, projected charged decode seconds-per-token, and -- once prefill
+    /// has been measured -- the projected decode speedup and estimated score
+    /// under the official formula.
+    static func localIterateLiveDecodeStatus(
+        lastStepSeconds: Double,
+        chargedSecondsSoFar: Double,
+        stepOnlySecondsSoFar: Double,
+        decodedTokens: Int,
+        totalDecodeTokens: Int,
+        prefillSecondsPerToken: Double?
+    ) -> String {
+        guard decodedTokens > 0 else {
+            return ""
+        }
+        let meanStepSeconds = stepOnlySecondsSoFar / Double(decodedTokens)
+        let projected = localIterateProjectedDecodeSecondsPerToken(
+            chargedSecondsSoFar: chargedSecondsSoFar,
+            stepOnlySecondsSoFar: stepOnlySecondsSoFar,
+            decodedTokens: decodedTokens,
+            totalDecodeTokens: totalDecodeTokens
+        )
+        var status = "last_step_seconds=\(formatDouble(lastStepSeconds))"
+            + " mean_step_seconds=\(formatDouble(meanStepSeconds))"
+            + " projected_decode_seconds_per_token=\(formatDouble(projected))"
+        guard projected > 0 else {
+            return status
+        }
+        let decodeSpeedup = BenchmarkScore.speedup(
+            baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+            candidateSecondsPerToken: projected
+        )
+        status += " projected_decode_speedup=\(formatRatio(decodeSpeedup))"
+        if let prefillSecondsPerToken, prefillSecondsPerToken > 0 {
+            let estScore = BenchmarkScore.score(
+                decodeSecondsPerToken: projected,
+                prefillSecondsPerToken: prefillSecondsPerToken
+            )
+            if estScore.isFinite {
+                status += " projected_score=\(formatRatio(estScore))"
+            }
+        }
+        return status
+    }
+
+    static func localIteratePrefillStatus(
+        elapsedSeconds: Double,
+        promptTokens: Int
+    ) -> String {
+        guard promptTokens > 0, elapsedSeconds > 0 else {
+            return "seconds=\(formatSeconds(elapsedSeconds))"
+        }
+        let secondsPerToken = elapsedSeconds / Double(promptTokens)
+        let speedup = BenchmarkScore.speedup(
+            baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken,
+            candidateSecondsPerToken: secondsPerToken
+        )
+        return "seconds=\(formatSeconds(elapsedSeconds))"
+            + " seconds_per_token=\(formatDouble(secondsPerToken))"
+            + " prefill_speedup=\(formatRatio(speedup))"
+    }
+
+    static func reportFirstTokenMismatch(
+        _ progress: ((String) -> Void)?,
+        modeName: String,
+        checkedStep: Int
+    ) {
+        progress?(
+            "\(modeName) correctness FAIL first token mismatch at checked_step=\(checkedStep) "
+                + "(run continues; expected/actual tokens are in the score JSON)"
+        )
+    }
+
+    /// Emits a heartbeat line every `intervalSeconds` while a long silent phase
+    /// (weights digest, measured prefill forward, decode seed prefill) is
+    /// blocking, so the console shows liveness before the phase completes.
+    /// Callers must `cancel()` the returned timer when the phase ends.
+    static func startPhaseHeartbeat(
+        label: String,
+        intervalSeconds: Double = 10,
+        progress: ((String) -> Void)?
+    ) -> DispatchSourceTimer? {
+        guard let progress, intervalSeconds > 0 else {
+            return nil
+        }
+        let phaseStart = DispatchTime.now().uptimeNanoseconds
+        let timer = DispatchSource.makeTimerSource(
+            queue: DispatchQueue(label: "mlxfast.local-iterate.heartbeat")
+        )
+        timer.schedule(
+            deadline: .now() + intervalSeconds,
+            repeating: intervalSeconds,
+            leeway: .milliseconds(250)
+        )
+        timer.setEventHandler {
+            progress("\(label) still running phase_seconds=\(formatSeconds(secondsSince(phaseStart)))")
+        }
+        timer.resume()
+        return timer
+    }
+
+    static func emitLocalIterateSummary(
+        modeName: String,
+        timing: LocalIterateTimingResult,
+        progress: (String) -> Void
+    ) {
+        let prefillSpeedup = BenchmarkScore.speedup(
+            baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken,
+            candidateSecondsPerToken: timing.prefillSecondsPerToken
+        )
+        let decodeSpeedup = BenchmarkScore.speedup(
+            baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+            candidateSecondsPerToken: timing.decode.secondsPerToken
+        )
+        let estScore = BenchmarkScore.score(
+            decodeSecondsPerToken: timing.decode.secondsPerToken,
+            prefillSecondsPerToken: timing.prefillSecondsPerToken
+        )
+        progress(
+            "\(modeName) summary prefill_seconds_per_token=\(formatDouble(timing.prefillSecondsPerToken)) "
+                + "prefill_speedup=\(formatRatio(prefillSpeedup))"
+        )
+        progress(
+            "\(modeName) summary decode_seconds_per_token=\(formatDouble(timing.decode.secondsPerToken)) "
+                + "decode_speedup=\(formatRatio(decodeSpeedup))"
+        )
+        if estScore.isFinite {
+            progress(
+                "\(modeName) summary est_score=\(formatRatio(estScore)) "
+                    + "(decode_speedup^0.75 * prefill_speedup^0.25 vs official baseline; "
+                    + "score stays null in local modes)"
+            )
+        }
+        progress(
+            "\(modeName) summary expert_hit_rate=\(formatRatio(timing.expertStats.hitRate)) "
+                + "decode_bandwidth_gb_per_token=\(formatDouble(timing.decode.bandwidthGBPerToken)) "
+                + "peak_ram_gb=\(formatRatio(timing.peakRamGB))"
+        )
+    }
+
     struct LocalIterateTimingResult {
         let correctness: CorrectnessReport
         let prefillSecondsPerToken: Double
@@ -201,6 +404,7 @@ extension DeepSeekRuntime {
 
         var totalPrefillSeconds = 0.0
         var totalDecodeSeconds = 0.0
+        var totalStepOnlySeconds = 0.0
         var totalDecodeBytesRead: UInt64 = 0
         var latestStats = ExpertStreamingStats.zero
         var failureStep: Int?
@@ -208,6 +412,10 @@ extension DeepSeekRuntime {
         var failureActual: Int?
         let checkedStepsPerPass = decodeSteps + 2
         let totalDecodeSteps = decodeSteps * timingRepeats
+        let decodeProgressInterval = localIterateDecodeProgressInterval(
+            totalDecodeSteps: totalDecodeSteps,
+            timingRepeats: timingRepeats
+        )
         let expectedSeedToken = testCase.expectedTokens[0]
         let expectedDecodeTokens = Array(testCase.expectedTokens.dropFirst().prefix(decodeSteps))
 
@@ -216,6 +424,13 @@ extension DeepSeekRuntime {
                 progress?("\(modeName) checked pass \(repeatIndex + 1)/\(timingRepeats) start")
             }
             progress?("\(modeName) prefill measured start prompt_tokens=\(testCase.promptTokens.count)")
+            let prefillHeartbeat = startPhaseHeartbeat(
+                label: "\(modeName) prefill measured",
+                progress: progress
+            )
+            defer {
+                prefillHeartbeat?.cancel()
+            }
             let prefillCache = DeepSeekModelCache(config: weightCache.config)
             let prefillStart = DispatchTime.now().uptimeNanoseconds
             let prefillLogits = try DeepSeekModel.logits(
@@ -227,6 +442,7 @@ extension DeepSeekRuntime {
             eval(prefillLogits)
             let prefillToken = try DeepSeekCorrectness.greedyToken(from: prefillLogits)
             let prefillElapsed = secondsSince(prefillStart)
+            prefillHeartbeat?.cancel()
             totalPrefillSeconds += prefillElapsed
             Memory.clearCache()
             latestStats = DeepSeekRuntime.expertStats(from: weightCache)
@@ -234,10 +450,17 @@ extension DeepSeekRuntime {
                 failureStep = repeatIndex * checkedStepsPerPass
                 failureExpected = expectedSeedToken
                 failureActual = prefillToken
+                reportFirstTokenMismatch(progress, modeName: modeName, checkedStep: failureStep! + 1)
             }
             progress?(
-                "\(modeName) prefill measured complete seconds=\(formatSeconds(prefillElapsed))"
+                "\(modeName) prefill measured complete "
+                    + localIteratePrefillStatus(
+                        elapsedSeconds: prefillElapsed,
+                        promptTokens: testCase.promptTokens.count
+                    )
             )
+            let runningPrefillSecondsPerToken =
+                totalPrefillSeconds / Double(testCase.promptTokens.count * (repeatIndex + 1))
 
             // Match official benchmark decode semantics: charge prompt-specific
             // setup, seed prefill, cache materialization, and checked token steps
@@ -245,6 +468,13 @@ extension DeepSeekRuntime {
             // the official benchmark charges.
             let decodePhaseStart = DispatchTime.now().uptimeNanoseconds
             progress?("\(modeName) decode measured start tokens=\(decodeSteps) includes_seed_prefill=true")
+            let seedHeartbeat = startPhaseHeartbeat(
+                label: "\(modeName) decode seed prefill",
+                progress: progress
+            )
+            defer {
+                seedHeartbeat?.cancel()
+            }
             let warmupCache = DeepSeekModelCache(config: weightCache.config)
             let warmupLogits = try DeepSeekModel.logits(
                 inputIDs: inputIDsArray(testCase.promptTokens),
@@ -268,8 +498,14 @@ extension DeepSeekRuntime {
                 failureStep = repeatIndex * checkedStepsPerPass + 1
                 failureExpected = expectedSeedToken
                 failureActual = actualToken
+                reportFirstTokenMismatch(progress, modeName: modeName, checkedStep: failureStep! + 1)
             }
             cache.materializeCachedState()
+            seedHeartbeat?.cancel()
+            progress?(
+                "\(modeName) decode seed prefill complete "
+                    + "seconds=\(formatSeconds(secondsSince(decodePhaseStart))) (charged to decode)"
+            )
             let metricsBeforeDecode = weightCache.loader.expertStreamingMetrics?.snapshot()
             let validationDelayMS = try submissionValidationDelayMilliseconds()
             if validationDelayMS > 0 {
@@ -278,6 +514,7 @@ extension DeepSeekRuntime {
 
             for decodedStep in 0..<decodeSteps {
                 let previousToken = decodedStep == 0 ? expectedSeedToken : expectedDecodeTokens[decodedStep - 1]
+                let stepStart = DispatchTime.now().uptimeNanoseconds
                 logits = try DeepSeekModel.logits(
                     inputIDs: inputIDsArray([previousToken]),
                     weightCache: weightCache,
@@ -290,17 +527,31 @@ extension DeepSeekRuntime {
                     failureStep = repeatIndex * checkedStepsPerPass + decodedStep + 2
                     failureExpected = expectedToken
                     failureActual = actualToken
+                    reportFirstTokenMismatch(progress, modeName: modeName, checkedStep: failureStep! + 1)
                 }
                 if validationDelayMS > 0 {
                     Thread.sleep(forTimeInterval: Double(validationDelayMS) / 1_000.0)
                 }
+                let stepElapsed = secondsSince(stepStart)
+                totalStepOnlySeconds += stepElapsed
                 latestStats = DeepSeekRuntime.expertStats(from: weightCache)
                 reportProgress(
                     step: repeatIndex * decodeSteps + decodedStep + 1,
                     total: totalDecodeSteps,
-                    intervalSteps: timingRepeats > 1 ? 64 : 8,
+                    intervalSteps: decodeProgressInterval,
                     progress: { step, total in
-                        progress?("\(modeName) checked decode \(step)/\(total) tokens")
+                        progress?(
+                            "\(modeName) checked decode \(step)/\(total) tokens "
+                                + localIterateLiveDecodeStatus(
+                                    lastStepSeconds: stepElapsed,
+                                    chargedSecondsSoFar: totalDecodeSeconds
+                                        + secondsSince(decodePhaseStart),
+                                    stepOnlySecondsSoFar: totalStepOnlySeconds,
+                                    decodedTokens: step,
+                                    totalDecodeTokens: total,
+                                    prefillSecondsPerToken: runningPrefillSecondsPerToken
+                                )
+                        )
                     }
                 )
             }
@@ -363,6 +614,7 @@ extension DeepSeekRuntime {
 
         var totalPrefillSeconds = 0.0
         var totalDecodeSeconds = 0.0
+        var totalStepOnlySeconds = 0.0
         var totalDecodeBytesRead: UInt64 = 0
         var latestStats = ExpertStreamingStats.zero
         var peakRamGB = 0.0
@@ -371,6 +623,10 @@ extension DeepSeekRuntime {
         var failureActual: Int?
         let checkedStepsPerPass = decodeSteps + 2
         let totalDecodeSteps = decodeSteps * timingRepeats
+        let decodeProgressInterval = localIterateDecodeProgressInterval(
+            totalDecodeSteps: totalDecodeSteps,
+            timingRepeats: timingRepeats
+        )
         let expectedSeedToken = testCase.expectedTokens[0]
         let expectedDecodeTokens = Array(testCase.expectedTokens.dropFirst().prefix(decodeSteps))
 
@@ -385,8 +641,16 @@ extension DeepSeekRuntime {
                 }
                 let prefillStart = DispatchTime.now().uptimeNanoseconds
                 progress?("\(modeName) prefill measured start prompt_tokens=\(testCase.promptTokens.count)")
+                let prefillHeartbeat = startPhaseHeartbeat(
+                    label: "\(modeName) prefill measured",
+                    progress: progress
+                )
+                defer {
+                    prefillHeartbeat?.cancel()
+                }
                 let response = try prefillWorker.prefill(promptTokens: testCase.promptTokens)
                 let prefillElapsed = secondsSince(prefillStart)
+                prefillHeartbeat?.cancel()
                 totalPrefillSeconds += prefillElapsed
                 latestStats = response.expertStats ?? latestStats
                 peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
@@ -397,11 +661,18 @@ extension DeepSeekRuntime {
                     failureStep = repeatIndex * checkedStepsPerPass
                     failureExpected = expectedSeedToken
                     failureActual = prefillToken
+                    reportFirstTokenMismatch(progress, modeName: modeName, checkedStep: failureStep! + 1)
                 }
                 progress?(
-                    "\(modeName) prefill measured complete seconds=\(formatSeconds(prefillElapsed))"
+                    "\(modeName) prefill measured complete "
+                        + localIteratePrefillStatus(
+                            elapsedSeconds: prefillElapsed,
+                            promptTokens: testCase.promptTokens.count
+                        )
                 )
             }
+            let runningPrefillSecondsPerToken =
+                totalPrefillSeconds / Double(testCase.promptTokens.count * (repeatIndex + 1))
 
             // Use the same decode protocol as the official benchmark and start
             // the parent timer before decode_begin so seed prefill/setup is
@@ -412,7 +683,22 @@ extension DeepSeekRuntime {
             }
             let decodePhaseStart = DispatchTime.now().uptimeNanoseconds
             progress?("\(modeName) decode measured start tokens=\(decodeSteps) includes_seed_prefill=true")
+            let seedHeartbeat = startPhaseHeartbeat(
+                label: "\(modeName) decode seed prefill",
+                progress: progress
+            )
+            // Cancel eagerly after the blocking call; the defer only covers the
+            // throwing path (defers run at end of the loop iteration, which
+            // would otherwise leave the heartbeat firing through decode steps).
+            defer {
+                seedHeartbeat?.cancel()
+            }
             var response = try decodeWorker.beginDecode(seedTokens: testCase.promptTokens)
+            seedHeartbeat?.cancel()
+            progress?(
+                "\(modeName) decode seed prefill complete "
+                    + "seconds=\(formatSeconds(secondsSince(decodePhaseStart))) (charged to decode)"
+            )
             latestStats = response.expertStats ?? latestStats
             peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
             guard let seedToken = response.seedToken else {
@@ -422,12 +708,16 @@ extension DeepSeekRuntime {
                 failureStep = repeatIndex * checkedStepsPerPass + 1
                 failureExpected = expectedSeedToken
                 failureActual = seedToken
+                reportFirstTokenMismatch(progress, modeName: modeName, checkedStep: failureStep! + 1)
             }
             let statsBeforeDecode = response.expertStats
 
             for decodedStep in 0..<decodeSteps {
                 let inputToken = decodedStep == 0 ? expectedSeedToken : expectedDecodeTokens[decodedStep - 1]
+                let stepStart = DispatchTime.now().uptimeNanoseconds
                 response = try decodeWorker.decodeStep(inputToken: inputToken)
+                let stepElapsed = secondsSince(stepStart)
+                totalStepOnlySeconds += stepElapsed
                 latestStats = response.expertStats ?? latestStats
                 peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
                 guard let token = response.token else {
@@ -438,13 +728,25 @@ extension DeepSeekRuntime {
                     failureStep = repeatIndex * checkedStepsPerPass + decodedStep + 2
                     failureExpected = expectedToken
                     failureActual = token
+                    reportFirstTokenMismatch(progress, modeName: modeName, checkedStep: failureStep! + 1)
                 }
                 reportProgress(
                     step: repeatIndex * decodeSteps + decodedStep + 1,
                     total: totalDecodeSteps,
-                    intervalSteps: timingRepeats > 1 ? 64 : 8,
+                    intervalSteps: decodeProgressInterval,
                     progress: { step, total in
-                        progress?("\(modeName) checked decode \(step)/\(total) tokens")
+                        progress?(
+                            "\(modeName) checked decode \(step)/\(total) tokens "
+                                + localIterateLiveDecodeStatus(
+                                    lastStepSeconds: stepElapsed,
+                                    chargedSecondsSoFar: totalDecodeSeconds
+                                        + secondsSince(decodePhaseStart),
+                                    stepOnlySecondsSoFar: totalStepOnlySeconds,
+                                    decodedTokens: step,
+                                    totalDecodeTokens: total,
+                                    prefillSecondsPerToken: runningPrefillSecondsPerToken
+                                )
+                        )
                     }
                 )
             }

@@ -2020,6 +2020,197 @@ func benchmarkScriptForwardsLocalIterateDefaultsToSwiftBenchmark() throws {
 }
 
 @Test
+func localIterateStreamsLiveNumbersDuringTheRun() throws {
+    // The local edit loop must show useful numbers the moment they exist, not
+    // only in the final score JSON: per-token prefill status with speedup, the
+    // seed prefill charge, per-step running decode numbers with a projected
+    // score, heartbeats during long silent forwards, an immediate (redacted)
+    // token-mismatch report, and a final summary block.
+    let runtime = try String(
+        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntimeLocalIterate.swift",
+        encoding: .utf8
+    )
+
+    // Both timing paths (in-process and runtime-worker) stream the same data.
+    #expect(runtime.components(separatedBy: "localIteratePrefillStatus(").count >= 4)
+    #expect(runtime.components(separatedBy: "decode seed prefill complete ").count >= 3)
+    #expect(runtime.components(separatedBy: "localIterateLiveDecodeStatus(").count >= 4)
+    #expect(runtime.components(separatedBy: "reportFirstTokenMismatch(").count >= 8)
+    #expect(runtime.components(separatedBy: "startPhaseHeartbeat(").count >= 6)
+    #expect(runtime.contains("(charged to decode)"))
+    #expect(runtime.contains("projected_decode_seconds_per_token="))
+    #expect(runtime.contains("projected_score="))
+    #expect(runtime.contains("emitLocalIterateSummary(modeName: modeName, timing: timing, progress: progress)"))
+    // Baseline constants are printed up front so live speedups have context.
+    #expect(runtime.contains("official-runner constants; local speedups are directional"))
+    // The immediate mismatch line must stay redacted like the shared error
+    // path: no expected/actual token values in the progress stream.
+    #expect(runtime.contains("expected/actual tokens are in the score JSON"))
+}
+
+@Test
+func benchmarkScriptPrintsLocalSummaryWithBaselineComparison() throws {
+    let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    #expect(script.contains("report_local_score_summary() {"))
+    #expect(script.contains("cat \"${SCORE_PATH}\"\n  report_local_score_summary"))
+
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "{}".write(
+        to: weights.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let score = root.appendingPathComponent("score.local-iterate.json")
+    let integrity = root.appendingPathComponent("benchmark-integrity.local-iterate.json")
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    cat <<'JSON'
+    {
+      "score": null,
+      "passed": true,
+      "metrics": {
+        "prefill_seconds_per_token": 0.1,
+        "decode_seconds_per_token": 2.0,
+        "prefill_speedup": 2.0,
+        "decode_speedup": 2.0,
+        "weights_hash": "fake-weights",
+        "weights_file_count": 1,
+        "weights_byte_count": 2
+      }
+    }
+    JSON
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeSwift.path
+    )
+
+    func runLocalIterate() throws -> (status: Int32, stderr: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = ["benchmark.sh", "--local-iterate"]
+        process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "MLXFAST_NO_SANDBOX": "1",
+            "MLXFAST_SKIP_TRANSFORM": "1",
+            "MLXFAST_SWIFT_BIN": fakeSwift.path,
+            "MLXFAST_WEIGHTS_PATH": weights.path,
+            "MLXFAST_SCORE_PATH": score.path,
+            "MLXFAST_INTEGRITY_PATH": integrity.path,
+        ]) { _, new in new }
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+        try process.run()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(data: stderrData, encoding: .utf8) ?? "")
+    }
+
+    // First run: no baseline snapshot yet, so the summary prints the current
+    // numbers plus a hint about recording one.
+    let first = try runLocalIterate()
+    #expect(first.status == 0)
+    #expect(first.stderr.contains("benchmark.sh: local-iterate summary"))
+    #expect(first.stderr.contains("prefill 0.1 s/token  speedup 2x"))
+    #expect(first.stderr.contains("decode  2 s/token  speedup 2x"))
+    // 2x on both axes -> estimated score 2 under decode^0.75 * prefill^0.25.
+    #expect(first.stderr.contains("est score 2 (decode_speedup^0.75 * prefill_speedup^0.25"))
+    #expect(first.stderr.contains("no local baseline at"))
+
+    // Second run: with a slower baseline snapshot the summary reports deltas.
+    let baseline = root.appendingPathComponent("score.local-iterate.baseline.json")
+    try """
+    {
+      "score": null,
+      "passed": true,
+      "metrics": {
+        "prefill_seconds_per_token": 0.2,
+        "decode_seconds_per_token": 4.0,
+        "prefill_speedup": 1.0,
+        "decode_speedup": 1.0
+      }
+    }
+    """.write(to: baseline, atomically: true, encoding: .utf8)
+
+    let second = try runLocalIterate()
+    #expect(second.status == 0)
+    #expect(second.stderr.contains("benchmark.sh: local-iterate summary"))
+    #expect(second.stderr.contains("vs \(baseline.path) (negative s/token deltas = faster)"))
+    #expect(second.stderr.contains("prefill 0.2 -> 0.1 s/token (-50%)"))
+    #expect(second.stderr.contains("decode  4 -> 2 s/token (-50%)"))
+    #expect(second.stderr.contains("est score 1 -> 2 (+100%)"))
+    #expect(!second.stderr.contains("no local baseline at"))
+}
+
+@Test
+func benchmarkScriptLocalSummarySkipsQuietlyWithoutTimingMetrics() throws {
+    // Failure payloads and minimal fixtures have no positive timing numbers;
+    // the summary must skip silently instead of printing zeros or failing the
+    // run (it is diagnostic-only output).
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "{}".write(
+        to: weights.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let score = root.appendingPathComponent("score.local-iterate.json")
+    let integrity = root.appendingPathComponent("benchmark-integrity.local-iterate.json")
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    cat <<'JSON'
+    {
+      "score": null,
+      "passed": true,
+      "metrics": {
+        "weights_hash": "fake-weights",
+        "weights_file_count": 1,
+        "weights_byte_count": 2
+      }
+    }
+    JSON
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeSwift.path
+    )
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = ["benchmark.sh", "--local-iterate"]
+    process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    process.environment = ProcessInfo.processInfo.environment.merging([
+        "MLXFAST_NO_SANDBOX": "1",
+        "MLXFAST_SKIP_TRANSFORM": "1",
+        "MLXFAST_SWIFT_BIN": fakeSwift.path,
+        "MLXFAST_WEIGHTS_PATH": weights.path,
+        "MLXFAST_SCORE_PATH": score.path,
+        "MLXFAST_INTEGRITY_PATH": integrity.path,
+    ]) { _, new in new }
+    let stderrPipe = Pipe()
+    process.standardError = stderrPipe
+    try process.run()
+    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    let stderr = String(data: stderrData, encoding: .utf8) ?? ""
+
+    #expect(process.terminationStatus == 0)
+    #expect(!stderr.contains("local-iterate summary"))
+    #expect(!stderr.contains("est score"))
+}
+
+@Test
 func benchmarkScriptRejectsPathFlagsBeforeForwardingToSwiftBenchmark() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }

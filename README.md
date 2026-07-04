@@ -211,6 +211,22 @@ Neither local mode produces an official leaderboard score. Official ranking
 still runs the hidden benchmark oracle and hidden correctness gates on the
 trusted runner.
 
+Both local modes stream live numbers to stderr while they run, so you do not
+have to wait for the final JSON: the official baseline constants up front,
+prefill seconds-per-token and speedup the moment the measured prefill forward
+finishes, the decode seed-prefill charge, and a running line per checked decode
+token with the last-step latency, projected charged decode seconds-per-token,
+projected decode speedup, and a projected score under the official formula.
+Long silent phases (weights digest, prefill forward, decode seed prefill) print
+a heartbeat every 10 seconds, and the first teacher-forced token mismatch is
+reported immediately (token values stay in the score JSON only). After the
+score JSON is sealed, `benchmark.sh` prints a compact summary with both
+speedups and the estimated score, and -- when a same-machine snapshot exists at
+`score.local-iterate.baseline.json` (record one with
+`cp score.local-iterate.json score.local-iterate.baseline.json` after a run on
+the synced tip) -- deltas against that baseline so a change reads as faster or
+slower at a glance.
+
 ## Scoring
 
 ```

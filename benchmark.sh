@@ -82,6 +82,93 @@ json_string() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+# Local modes end with a compact human-readable summary on stderr so the score
+# does not have to be dug out of the JSON payload. The estimated score uses the
+# official formula against the official baseline constants carried inside the
+# score payload; local modes still publish score: null because only the ranked
+# runner produces an official score. When a same-machine baseline snapshot
+# exists next to the score file (the documented
+# `cp score.local-iterate.json score.local-iterate.baseline.json` workflow),
+# the summary also prints deltas against it. Diagnostic only: any failure here
+# must never fail the benchmark run.
+report_local_score_summary() {
+  if [[ "${LOCAL_ITERATE}" != "1" && "${LOCAL_SUBMIT}" != "1" ]]; then
+    return 0
+  fi
+  local mode_name="local-submit"
+  if [[ "${LOCAL_ITERATE}" == "1" ]]; then
+    mode_name="local-iterate"
+  fi
+
+  local summary
+  summary="$(jq -r '
+    def r3: . * 1000 | round / 1000;
+    def r6: . * 1000000 | round / 1000000;
+    (.metrics // {}) as $m
+    | ($m.prefill_seconds_per_token // 0) as $p
+    | ($m.decode_seconds_per_token // 0) as $d
+    | select($p > 0 and $d > 0)
+    | ($m.prefill_speedup // 0) as $ps
+    | ($m.decode_speedup // 0) as $ds
+    | (if $ps > 0 and $ds > 0 then pow($ds; 0.75) * pow($ps; 0.25) else 0 end) as $est
+    | "  prefill \($p | r6) s/token  speedup \($ps | r3)x\n"
+      + "  decode  \($d | r6) s/token  speedup \($ds | r3)x"
+      + (if $est > 0
+         then "\n  est score \($est | r3) (decode_speedup^0.75 * prefill_speedup^0.25; official score comes from the ranked runner)"
+         else "" end)
+  ' "${SCORE_PATH}" 2>/dev/null || true)"
+  if [[ -z "${summary}" ]]; then
+    return 0
+  fi
+  {
+    echo "benchmark.sh: ${mode_name} summary"
+    printf '%s\n' "${summary}"
+  } >&2
+
+  local baseline_path="${SCORE_PATH%.json}.baseline.json"
+  if [[ ! -f "${baseline_path}" ]]; then
+    if [[ "${LOCAL_ITERATE}" == "1" ]]; then
+      echo "benchmark.sh: no local baseline at ${baseline_path}; run 'cp ${SCORE_PATH} ${baseline_path}' to compare future runs" >&2
+    fi
+    return 0
+  fi
+  local compare
+  compare="$(jq -r -n --slurpfile cur "${SCORE_PATH}" --slurpfile base "${baseline_path}" '
+    def r1: . * 10 | round / 10;
+    def r3: . * 1000 | round / 1000;
+    def r6: . * 1000000 | round / 1000000;
+    def sign: if . >= 0 then "+" else "" end;
+    ($cur[0].metrics // {}) as $c
+    | ($base[0].metrics // {}) as $b
+    | ($c.prefill_seconds_per_token // 0) as $cp
+    | ($c.decode_seconds_per_token // 0) as $cd
+    | ($b.prefill_seconds_per_token // 0) as $bp
+    | ($b.decode_seconds_per_token // 0) as $bd
+    | select($cp > 0 and $cd > 0 and $bp > 0 and $bd > 0)
+    | (($cp - $bp) / $bp * 100) as $pdelta
+    | (($cd - $bd) / $bd * 100) as $ddelta
+    | ($c.prefill_speedup // 0) as $cps
+    | ($c.decode_speedup // 0) as $cds
+    | ($b.prefill_speedup // 0) as $bps
+    | ($b.decode_speedup // 0) as $bds
+    | (if $cps > 0 and $cds > 0 then pow($cds; 0.75) * pow($cps; 0.25) else 0 end) as $cest
+    | (if $bps > 0 and $bds > 0 then pow($bds; 0.75) * pow($bps; 0.25) else 0 end) as $best
+    | "    prefill \($bp | r6) -> \($cp | r6) s/token (\($pdelta | sign)\($pdelta | r1)%)\n"
+      + "    decode  \($bd | r6) -> \($cd | r6) s/token (\($ddelta | sign)\($ddelta | r1)%)"
+      + (if $cest > 0 and $best > 0
+         then (((($cest - $best) / $best) * 100) as $edelta
+           | "\n    est score \($best | r3) -> \($cest | r3) (\($edelta | sign)\($edelta | r1)%)")
+         else "" end)
+  ' 2>/dev/null || true)"
+  if [[ -z "${compare}" ]]; then
+    return 0
+  fi
+  {
+    echo "benchmark.sh: vs ${baseline_path} (negative s/token deltas = faster)"
+    printf '%s\n' "${compare}"
+  } >&2
+}
+
 json_number_or_null() {
   local value="$1"
   if [[ -z "${value}" ]]; then
@@ -386,6 +473,7 @@ fi
 # showing the score there.
 if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ]]; then
   cat "${SCORE_PATH}"
+  report_local_score_summary
 fi
 
 score_hash="$(shasum -a 256 "${SCORE_PATH}" | awk '{print $1}')"
