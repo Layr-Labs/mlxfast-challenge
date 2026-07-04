@@ -2260,6 +2260,107 @@ func benchmarkScriptRejectsMultipleScoreObjectsOnStdout() throws {
 }
 
 @Test
+func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
+    // Regression: benchmark.sh used to hard-default its reference to the
+    // reference_weights/ compatibility symlink. When that symlink is broken (or
+    // points at a non-directory), the transform failed with ENOTDIR. The fix
+    // resolves the reference like setup.sh does, so a broken symlink falls back to
+    // the Hugging Face cache. Runs the real benchmark.sh with a fake swift binary
+    // that records the --reference it was handed for the transform.
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    // benchmark.sh's transform-cache hash runs `git ls-files`; real usage is
+    // always inside the repo, so make the temp working dir a git repo too.
+    let gitInit = Process()
+    gitInit.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    gitInit.arguments = ["init", "-q", root.path]
+    try gitInit.run()
+    gitInit.waitUntilExit()
+
+    // A broken compatibility symlink in the working directory.
+    let refWeights = root.appendingPathComponent("reference_weights")
+    try FileManager.default.createDirectory(at: refWeights, withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(
+        atPath: refWeights.appendingPathComponent("DeepSeek-V4-Flash-4bit").path,
+        withDestinationPath: root.appendingPathComponent("does-not-exist").path
+    )
+
+    // A real cache directory holding the checkpoint.
+    let cache = root.appendingPathComponent("hfcache/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main")
+    try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+    try "{}".write(to: cache.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    let golden = root.appendingPathComponent("golden.json")
+    try "{}".write(to: golden, atomically: true, encoding: .utf8)
+
+    let reflog = root.appendingPathComponent("transform-args.txt")
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    cmd="$1"
+    shift
+    if [ "$cmd" = "transform" ]; then
+      printf '%s\\n' "$@" >> "\(reflog.path)"
+      out=""
+      while [ "$#" -gt 0 ]; do
+        if [ "$1" = "--output" ]; then shift; out="$1"; fi
+        shift
+      done
+      [ -n "$out" ] && mkdir -p "$out" && printf '{}' > "$out/config.json"
+      exit 0
+    fi
+    cat <<'JSON'
+    {
+      "score": 1,
+      "passed": true,
+      "metrics": {
+        "weights_hash": "fake",
+        "weights_file_count": 1,
+        "weights_byte_count": 2
+      }
+    }
+    JSON
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeSwift.path)
+
+    let score = root.appendingPathComponent("score.json")
+    let integrity = root.appendingPathComponent("benchmark-integrity.json")
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = [
+        URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("benchmark.sh").path,
+    ]
+    // CWD is the temp dir so the broken reference_weights/ symlink is the one
+    // benchmark.sh resolves; NO_SANDBOX keeps the transform out of run-offline.sh.
+    process.currentDirectoryURL = root
+    process.environment = ProcessInfo.processInfo.environment.merging([
+        "MLXFAST_NO_SANDBOX": "1",
+        "MLXFAST_SWIFT_BIN": fakeSwift.path,
+        "MLXFAST_WEIGHTS_PATH": weights.path,
+        "MLXFAST_REFERENCE_CACHE_DIR": cache.path,
+        "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
+        "MLXFAST_SCORE_PATH": score.path,
+        "MLXFAST_INTEGRITY_PATH": integrity.path,
+    ]) { _, new in new }
+    // Ensure the resolution path (not an override) is exercised.
+    process.environment?.removeValue(forKey: "MLXFAST_REFERENCE_DIR")
+    process.environment?.removeValue(forKey: "MLXFAST_SKIP_TRANSFORM")
+
+    try process.run()
+    process.waitUntilExit()
+
+    #expect(process.terminationStatus == 0)
+    let recorded = (try? String(contentsOf: reflog, encoding: .utf8)) ?? ""
+    // The transform was handed the real cache dir, not the broken symlink.
+    #expect(recorded.contains(cache.path))
+    #expect(!recorded.contains("reference_weights/DeepSeek-V4-Flash-4bit"))
+}
+
+@Test
 func privateArtifactGuardRejectsRenamedGoldenAndPromptFiles() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
