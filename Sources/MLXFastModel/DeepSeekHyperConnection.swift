@@ -111,6 +111,15 @@ public enum DeepSeekHyperConnection {
     private static let compiledCollapseTailCache =
         LockedCache<CollapseTailKey, @Sendable (MLXArray, MLXArray) -> MLXArray>()
 
+    private struct HeadTailKey: Hashable {
+        let hcMult: Int
+        let epsBits: UInt32
+        let outputDType: DType
+    }
+
+    private static let compiledHeadTailCache =
+        LockedCache<HeadTailKey, @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray>()
+
     /// Compiled collapse tail: fuses the pre*y multiply, sum over hc, and
     /// dtype cast into one kernel. Runs 86x per decode step. Pure
     /// elementwise (multiply + reduce + cast) with no accumulation-order
@@ -122,6 +131,24 @@ public enum DeepSeekHyperConnection {
         let key = CollapseTailKey(hcMult: hcMult, outputDType: outputDType)
         return compiledCollapseTailCache.value(for: key) {
             compile { (pre: MLXArray, y: MLXArray) -> MLXArray in
+                return (pre.expandedDimensions(axis: -1) * y).sum(axis: 2).asType(outputDType)
+            }
+        }
+    }
+
+    /// Head hyperconnection post-mix tail. The block-level collapse path already
+    /// compiles the same multiply/sum/cast tail; the head path runs once per
+    /// forward at full sequence width, so fuse its sigmoid and postmix dispatches
+    /// without changing the preceding RMSNorm or matmul reductions.
+    private static func compiledHeadTail(
+        hcMult: Int,
+        eps: Float,
+        outputDType: DType
+    ) -> @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray {
+        let key = HeadTailKey(hcMult: hcMult, epsBits: eps.bitPattern, outputDType: outputDType)
+        return compiledHeadTailCache.value(for: key) {
+            compile { (mixes: MLXArray, scale: MLXArray, base: MLXArray, y: MLXArray) -> MLXArray in
+                let pre = sigmoid(mixes * scale[0] + base) + eps
                 return (pre.expandedDimensions(axis: -1) * y).sum(axis: 2).asType(outputDType)
             }
         }
@@ -202,11 +229,8 @@ public enum DeepSeekHyperConnection {
         let y = DeepSeekOps.cast(x, to: .float32)
         let normalized = weightlessRMSNorm(y.flattened(start: -2), eps: normEps)
         let mixes = matmul(normalized, fnTransposed ?? fn.T)
-        let pre = sigmoid(mixes * scale[0] + base) + Float(eps)
-        return DeepSeekOps.cast(
-            (pre.expandedDimensions(axis: -1) * y).sum(axis: 2),
-            to: x.dtype
-        )
+        let tail = compiledHeadTail(hcMult: hcMult, eps: Float(eps), outputDType: x.dtype)
+        return tail(mixes, scale, base, y)
     }
 
     public static func weightlessRMSNorm(_ x: MLXArray, eps: Double) -> MLXArray {

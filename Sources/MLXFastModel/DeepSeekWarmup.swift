@@ -28,6 +28,7 @@ enum DeepSeekWarmup {
             arrays.append(model.finalNorm)
             arrays += collect(model.headHyperConnection)
             eval(arrays)
+            warmHeadHyperConnection(model: model, config: weightCache.config)
         }
         for layerIndex in 0..<weightCache.config.numHiddenLayers {
             var arrays: [MLXArray] = []
@@ -131,6 +132,21 @@ enum DeepSeekWarmup {
             positionOffset: 0
         ) else { return }
         eval(logits)
+    }
+
+    private static func warmHeadHyperConnection(model: DeepSeekModelWeights, config: DeepSeekConfig) {
+        let hidden = zeros([1, 512, config.hcMult, config.hiddenSize], dtype: .bfloat16)
+        guard let collapsed = try? DeepSeekHyperConnection.head(
+            hidden,
+            fn: model.headHyperConnection.fn,
+            fnTransposed: model.headHyperConnection.fnTransposedF32,
+            base: model.headHyperConnection.baseF32,
+            scale: model.headHyperConnection.scaleF32,
+            hcMult: config.hcMult,
+            eps: config.hcEps,
+            normEps: config.rmsNormEps
+        ) else { return }
+        eval(collapsed)
     }
 
     private static func collect(_ weight: DeepSeekLinearWeight) -> [MLXArray] {
