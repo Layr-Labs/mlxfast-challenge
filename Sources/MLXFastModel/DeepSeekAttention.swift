@@ -589,6 +589,11 @@ public enum DeepSeekCompressedAttention {
         kv = kv.reshaped([batchSize, 1, sequenceLength, spec.headDim])
         kv = try rope.applied(to: kv, offset: positionOffset)
         var localMask = mask
+        // Set when localMask was produced by DeepSeekMaskCache.causal, whose
+        // values are fully determined by (queryLength, keyLength,
+        // offsetDelta, windowSize). Only masks with this known provenance may
+        // be memoized by DeepSeekExtendedMaskCache below.
+        var causalMaskProvenance: (keyLength: Int, offsetDelta: Int)?
         if let localCache = cache?.local {
             let cached = try localCache.updateAndFetch(kv)
             kv = cached.kv
@@ -598,6 +603,10 @@ public enum DeepSeekCompressedAttention {
                 queryOffset: positionOffset,
                 keyOffset: cached.keyOffset,
                 windowSize: windowSize
+            )
+            causalMaskProvenance = (
+                keyLength: kv.shape[2],
+                offsetDelta: positionOffset - cached.keyOffset
             )
         }
 
@@ -676,11 +685,42 @@ public enum DeepSeekCompressedAttention {
                     positionOffset: positionOffset
                 )
             }
-            let attentionMask = try extendMask(
-                localMask,
-                pooledLength: pooledLength,
-                pooledMask: pooledMask
-            )
+            let attentionMask: MLXArray?
+            if pooledLength > 0, let causalMask = localMask, let causal = causalMaskProvenance {
+                // Both mask inputs have known provenance here: causalMask is
+                // the cached causal mask (keyed by the causal tuple) and
+                // pooledMask, when present, came from makeMask on this
+                // layer's pooling cache (keyed by pooledLength, queryLength,
+                // positionOffset, ratio; pooledMask == nil for queryLength
+                // == 1 makes the pooled block all-ones, independent of the
+                // absolute offset). The extended mask is therefore a pure
+                // function of the key, and the maker runs the exact same
+                // extendMask construction as the uncached path.
+                let key = DeepSeekExtendedMaskCache.Key(
+                    queryLength: sequenceLength,
+                    keyLength: causal.keyLength,
+                    offsetDelta: causal.offsetDelta,
+                    windowSize: windowSize ?? -1,
+                    pooledLength: pooledLength,
+                    pooledMaskOffset: pooledMask == nil ? nil : positionOffset,
+                    poolRatio: pooledMask == nil ? 0 : (cache?.pooled?.ratio ?? -1)
+                )
+                attentionMask = try DeepSeekExtendedMaskCache.mask(for: key) {
+                    // extendMask never returns nil for a non-nil mask with
+                    // pooledLength > 0; the fallback only satisfies typing.
+                    try extendMask(
+                        causalMask,
+                        pooledLength: pooledLength,
+                        pooledMask: pooledMask
+                    ) ?? causalMask
+                }
+            } else {
+                attentionMask = try extendMask(
+                    localMask,
+                    pooledLength: pooledLength,
+                    pooledMask: pooledMask
+                )
+            }
             if pooledLength > 0 {
                 kv = concatenated([kv, pooled.expandedDimensions(axis: 1)], axis: 2)
             }

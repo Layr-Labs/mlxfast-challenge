@@ -100,7 +100,7 @@ public enum DeepSeekOps {
                 biases: weight.biases.map {
                     $0.reshaped([groupCount, outputDimensions, scaleGroups])
                 },
-                rhsIndices: MLXArray((0..<Int32(groupCount)).map { $0 }),
+                rhsIndices: identityIndices(count: groupCount),
                 transpose: true,
                 groupSize: weight.groupSize,
                 bits: weight.bits,
@@ -130,6 +130,19 @@ public enum DeepSeekOps {
 
     public static func rmsNorm(input: MLXArray, weight: MLXArray, eps: Double) -> MLXArray {
         MLXFast.rmsNorm(input, weight: weight, eps: Float(eps))
+    }
+
+    /// Process-wide cache of the tiny [0, 1, ..., count-1] int32 index arrays
+    /// consumed by grouped gatherQuantizedMM. The hot paths previously built a
+    /// fresh host array and re-uploaded it per attention output projection
+    /// (dozens of times per decode step); the values are a pure function of
+    /// `count`, so one shared array per count is byte-identical.
+    private static let identityIndicesCache = LockedCache<Int, MLXArray>()
+
+    static func identityIndices(count: Int) -> MLXArray {
+        identityIndicesCache.value(for: count) {
+            MLXArray((0..<Int32(count)).map { $0 })
+        }
     }
 
     public static func silu(_ input: MLXArray) -> MLXArray {

@@ -16,6 +16,11 @@ import MLXFastCore
 /// prompt-independent and cannot affect model output.
 enum DeepSeekWarmup {
     private static let pageCacheWarmMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
+    /// 10 is the officially mapped optimum (9 = 0.0564, 10 = 0.0549,
+    /// 11 = 0.0760, 12 = 0.0632 prefill s/tok) — keep the champion value.
+    /// The palette-packed resident scales free ~4.3 GiB of RAM which the
+    /// kernel spends on page cache adaptively; re-probing warm-11 under the
+    /// packed footprint is a separate experiment, not part of this change.
     private static let pageCacheWarmLayerCount = 10
 
     static func run(weightCache: DeepSeekRuntimeWeightCache) {

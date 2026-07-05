@@ -193,6 +193,17 @@ public enum DeepSeekModel {
             hidden = try layer(layerIndex, hidden)
         }
 
+        // Every consumer of multi-token logits (greedy next-token selection,
+        // top-logit traces, the benchmark oracle validators) reads only the
+        // LAST position's row. The head hyperconnection collapse, final norm,
+        // and lm head are all per-position maps, so slicing the dead
+        // positions off before them removes a [length-1, vocab]-sized slab of
+        // charged work from the scored prefill AND the decode-charged seed
+        // forward without touching the surviving position's math.
+        if hidden.shape[1] > 1 {
+            hidden = hidden[0..., (hidden.shape[1] - 1)..., 0..., 0...]
+        }
+
         let collapsed = try DeepSeekHyperConnection.head(
             hidden,
             fn: weights.headHyperConnection.fn,

@@ -9,7 +9,12 @@ public final class DeepSeekRoPE {
     public let freqScale: Int
 
     private let baseFrequencies: [Float]
-    private var frequencyCache: [FrequencyCacheKey: MLXArray] = [:]
+    /// Lock-guarded memo: instances are shared process-wide through
+    /// DeepSeekRoPECache, and parallel unit tests exercise the same instance
+    /// from multiple threads. A bare dictionary here corrupts under that
+    /// concurrent mutation; the model runtime itself stays single-threaded,
+    /// so the uncontended lock costs nothing on the hot path.
+    private let frequencyCache = LockedCache<FrequencyCacheKey, MLXArray>()
 
     public init(
         rotaryDimensions: Int,
@@ -176,13 +181,10 @@ public final class DeepSeekRoPE {
 
     private func frequencyArray(headDimension: Int, inverse: Bool) throws -> MLXArray {
         let key = FrequencyCacheKey(headDimension: headDimension, inverse: inverse)
-        if let cached = frequencyCache[key] {
-            return cached
+        return try frequencyCache.value(for: key) {
+            let values = try frequencies(headDimension: headDimension, inverse: inverse)
+            return MLXArray(values, [values.count])
         }
-        let values = try frequencies(headDimension: headDimension, inverse: inverse)
-        let array = MLXArray(values, [values.count])
-        frequencyCache[key] = array
-        return array
     }
 }
 

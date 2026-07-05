@@ -79,12 +79,84 @@ public enum DeepSeekMaskCache {
     }
 }
 
+/// Process-wide cache for pooled (compressed-KV) causal masks.
+///
+/// `DeepSeekPoolingCache.makeMask` output is a pure function of
+/// (pooledLength, queryLength, offset, ratio): it compares two fixed integer
+/// ranges, `arange(pooledLength) < arange(offset + 1, offset + queryLength +
+/// 1) / ratio`, so identical parameters always produce identical boolean
+/// values. Every layer of a given ratio class asks for the same mask at a
+/// given forward, so one entry serves all of them.
+enum DeepSeekPooledMaskCache {
+    private struct Key: Hashable {
+        let pooledLength: Int
+        let queryLength: Int
+        let offset: Int
+        let ratio: Int
+    }
+
+    private static let cache = LockedCache<Key, MLXArray>(capacity: 128)
+
+    static func mask(pooledLength: Int, queryLength: Int, offset: Int, ratio: Int) -> MLXArray {
+        let key = Key(
+            pooledLength: pooledLength,
+            queryLength: queryLength,
+            offset: offset,
+            ratio: ratio
+        )
+        return cache.value(for: key) {
+            let poolIndex = arange(pooledLength, dtype: .int32)
+            let queryIndex = arange(offset + 1, offset + queryLength + 1, dtype: .int32)
+                .expandedDimensions(axis: 1)
+            return poolIndex .< queryIndex.floorDivide(Int32(ratio))
+        }
+    }
+}
+
+/// Process-wide cache for the extended (local ++ pooled) attention masks that
+/// `DeepSeekCompressedAttention` feeds to scaled-dot-product attention.
+///
+/// The extended mask is `concatenated([causalMask, pooledBlock], axis: -1)`.
+/// Its causal part is a pure function of (queryLength, keyLength,
+/// queryOffset - keyOffset, windowSize) -- the shift-invariance argument on
+/// `DeepSeekMaskCache` -- and the pooled block is either all-ones (decode:
+/// `makeMask` returns nil for queryLength == 1) or the broadcast pooled
+/// causal mask, a pure function of (pooledLength, queryLength, absolute
+/// offset, ratio). The key carries every one of those value-determining
+/// parameters. Callers only consult this cache when both inputs came from
+/// `DeepSeekMaskCache.causal` and `DeepSeekPoolingCache.makeMask` (always
+/// `.bool`), so dtype is fixed by construction. During decode every
+/// compressed layer previously rebuilt an identical ones+concat chain each
+/// step; this memoizes one mask per shape class for all layers and steps.
+enum DeepSeekExtendedMaskCache {
+    struct Key: Hashable {
+        let queryLength: Int
+        let keyLength: Int
+        let offsetDelta: Int
+        let windowSize: Int
+        let pooledLength: Int
+        /// Absolute query offset, present only when a pooled causal mask
+        /// participates (queryLength > 1); nil when the pooled block is
+        /// all-ones and the absolute offset therefore cannot affect values.
+        let pooledMaskOffset: Int?
+        /// Pooling ratio backing `pooledMaskOffset`; 0 when the pooled block
+        /// is all-ones.
+        let poolRatio: Int
+    }
+
+    private static let cache = LockedCache<Key, MLXArray>(capacity: 256)
+
+    static func mask(for key: Key, make: () throws -> MLXArray) rethrows -> MLXArray {
+        try cache.value(for: key, make: make)
+    }
+}
+
 /// Process-wide cache of DeepSeekRoPE instances keyed by their construction
 /// parameters. The hot paths previously constructed a fresh instance per layer
 /// per forward, recomputing base frequencies host-side and re-uploading the
 /// frequency array to the GPU each time. Instances are immutable apart from an
-/// internal frequency-array memo, and the model executes single-threaded, so
-/// sharing instances is safe.
+/// internal lock-guarded frequency-array memo, so sharing instances is safe
+/// for the single-threaded model runtime and for parallel unit tests.
 public enum DeepSeekRoPECache {
     private struct Key: Hashable {
         let rotaryDimensions: Int

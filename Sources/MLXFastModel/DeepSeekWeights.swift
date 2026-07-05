@@ -663,6 +663,144 @@ public struct DeepSeekWeightLoader {
         return map
     }
 
+    /// Per-expert-completion variant of the decode-step slice prefetch:
+    /// schedules the SAME side-bank reads + base MLXArray builds as
+    /// prefetchDecodeExpertCodes (byte-identical worker bodies, same
+    /// decodePrefetchKey layout), but signals readiness PER EXPERT instead of
+    /// after the whole batch, so the decode compute thread can start building
+    /// an expert's subgraph as soon as that expert's OWN gate/up/down slices
+    /// are in RAM — overlapping graph-build CPU work with the SSD tail of the
+    /// remaining experts' reads. Slices already present in `consumed`
+    /// (scheduled pinned/predicted prebuilds, built by the same worker body)
+    /// are pre-populated into the stream and NOT re-read. Returns nil when the
+    /// fast path does not apply — same guards as prefetchDecodeExpertCodes,
+    /// plus nothing consumed to serve — and callers then fall back to
+    /// mergeMissingDecodeExpertCodes exactly as before. Correctness never
+    /// depends on the stream: a failed or slow slice is simply absent and the
+    /// consumer's normal bank read supplies the same bytes.
+    public func streamDecodeExpertCodes(
+        layerIndex: Int,
+        expertIndices: [Int],
+        hiddenSize: Int,
+        intermediateSize: Int,
+        consumed: [String: StagedExpertCode]? = nil
+    ) -> DecodeExpertCodeStream? {
+        guard let sideBank = decodeSideBank, expertBank.capacity > 0, !expertIndices.isEmpty else {
+            return nil
+        }
+        let projections: [(DeepSeekExpertProjection, [Int])] = [
+            (.gate, [intermediateSize, hiddenSize]),
+            (.up, [intermediateSize, hiddenSize]),
+            (.down, [hiddenSize, intermediateSize]),
+        ]
+        let prepopulated = consumed ?? [:]
+        var keys: [String] = []
+        var names: [String] = []
+        var indices: [Int] = []
+        var seen = Set<String>()
+        // Same (expert, projection) -> (key, name) resolution as
+        // prefetchDecodeExpertCodes; the only addition is skipping slices the
+        // consumed map already holds.
+        for expertIndex in expertIndices {
+            for (projection, expectedShape) in projections {
+                if let plan = routedExpertProjectionPlan(layerIndex: layerIndex, projection: projection),
+                   plan.record.shape.count == expectedShape.count + 1,
+                   plan.record.shape.first.map({ expertIndex < $0 }) == true {
+                    let key = plan.decodePrefetchKey(for: expertIndex)
+                    if seen.insert(key).inserted, prepopulated[key] == nil {
+                        keys.append(key)
+                        names.append(plan.name)
+                        indices.append(expertIndex)
+                    }
+                    continue
+                }
+                let candidates = DeepSeekWeightNames.routedExpert(
+                    layerIndex: layerIndex,
+                    expertIndex: expertIndex,
+                    projection: projection
+                )
+                for candidate in candidates {
+                    guard let record = expertBank.record(named: candidate) else {
+                        continue
+                    }
+                    let isStacked = record.shape.count == expectedShape.count + 1
+                        && record.shape.first.map { expertIndex < $0 } == true
+                    // Match expertLinearWeight: first matching candidate wins.
+                    guard isStacked else {
+                        break
+                    }
+                    let key = Self.decodePrefetchKey(candidate, expertIndex)
+                    if seen.insert(key).inserted, prepopulated[key] == nil {
+                        keys.append(key)
+                        names.append(candidate)
+                        indices.append(expertIndex)
+                    }
+                    break
+                }
+            }
+        }
+        guard !keys.isEmpty else {
+            // Nothing left to read: either every resolvable slice was already
+            // consumed (serve those prebuilt entries through a no-wait
+            // stream), or the layer resolves no stacked slices at all (nil ->
+            // caller fallback, which also resolves nothing, exactly as today).
+            return prepopulated.isEmpty
+                ? nil
+                : DecodeExpertCodeStream(results: prepopulated, expertGroups: [:])
+        }
+        var expertGroups: [Int: DispatchGroup] = [:]
+        for expertIndex in indices where expertGroups[expertIndex] == nil {
+            expertGroups[expertIndex] = DispatchGroup()
+        }
+        let stream = DecodeExpertCodeStream(results: prepopulated, expertGroups: expertGroups)
+        let bridge = self.bridge
+        let residentScales = self.residentExpertScales
+        let pinnedCodes = self.pinnedExpertCodes
+        // Every enter() happens before the stream is handed out (and thus
+        // before any waitForExpert can run); each worker leaves exactly once
+        // via defer, so an expert's group balances when its last slice lands.
+        for index in keys.indices {
+            let key = keys[index]
+            let name = names[index]
+            let expertIndex = indices[index]
+            guard let group = expertGroups[expertIndex] else {
+                continue
+            }
+            group.enter()
+            decodeExpertStreamQueue.async {
+                defer { group.leave() }
+                // Identical worker body to prefetchDecodeExpertCodes: read
+                // the slice AND build its base MLXArray (the eager
+                // Data->Metal copy) off the compute thread. Byte-identical:
+                // same bytes, same array constructor.
+                guard
+                    let tensor = pinnedCodes?.materializedTensor(
+                        named: name,
+                        firstAxisIndex: expertIndex
+                    ) ?? (try? sideBank.materializedTensor(
+                        named: name,
+                        firstAxisIndex: expertIndex
+                    )),
+                    let array = try? bridge.makeArray(from: tensor)
+                else {
+                    return
+                }
+                // Also build the resident scales' base array off-thread.
+                let scalesArray = Self.residentScalesArray(
+                    residentScales: residentScales,
+                    bridge: bridge,
+                    codeName: name,
+                    expertIndex: expertIndex
+                )
+                stream.store(
+                    key: key,
+                    code: StagedExpertCode(tensor: tensor, array: array, scalesArray: scalesArray)
+                )
+            }
+        }
+        return stream
+    }
+
     private func pinnedDecodeExpertCodePlan(
         pinnedCodes: ResidentExpertTensors,
         layerIndex: Int,
@@ -943,18 +1081,24 @@ public struct DeepSeekWeightLoader {
         else {
             return nil
         }
+        // Staged whole-tensor scale bytes first: packed-resident scales are
+        // deliberately kept in the staging plan so this no-decode byte path
+        // serves prefill; the packed store then only ever expands small
+        // per-expert slices on worker threads (decode steps), never whole
+        // tensors on a scored path. Raw-resident scales (excluded from the
+        // plan) fall through to the zero-copy resident branch as before.
         let scalesTensor: MaterializedTensor?
-        if let resident = residentExpertScales?.materializedTensor(named: scalesName, firstAxisIndex: nil) {
-            scalesTensor = resident
-        } else if let staged = expertLayerStager?.stagedBytes(recordName: scalesName),
-                  staged.count == scalesRecord.byteLength,
-                  let dtype = try? TensorDType.parse(scalesRecord.dtype) {
+        if let staged = expertLayerStager?.stagedBytes(recordName: scalesName),
+           staged.count == scalesRecord.byteLength,
+           let dtype = try? TensorDType.parse(scalesRecord.dtype) {
             scalesTensor = try? MaterializedTensor(
                 name: scalesName,
                 dtype: dtype,
                 shape: scalesRecord.shape,
                 bytes: staged
             )
+        } else if let resident = residentExpertScales?.materializedTensor(named: scalesName, firstAxisIndex: nil) {
+            scalesTensor = resident
         } else {
             scalesTensor = nil
         }
@@ -1200,8 +1344,14 @@ public struct DeepSeekWeightLoader {
                     guard let companionRecord = expertBank.record(named: companion) else {
                         continue
                     }
+                    // Scales skip staging only when the resident store can
+                    // hand back the whole tensor as zero-copy raw bytes.
+                    // Packed-resident scales stay IN the staging plan: the
+                    // prefill batched path then builds them from the staged
+                    // bytes (the no-decode byte path) instead of paying a
+                    // whole-tensor palette expansion per forward.
                     let scalesResident = suffix == "scales"
-                        && residentExpertScales?.isResident(name: companion) == true
+                        && residentExpertScales?.servesZeroCopyBytes(name: companion) == true
                     if !scalesResident, companionRecord.shape.count >= 2 {
                         names.append(companion)
                     }
@@ -2039,7 +2189,26 @@ public struct DeepSeekWeightLoader {
         shouldSliceCompanions: Bool = false
     ) throws -> DeepSeekLinearWeight {
         let scalesName = Self.companionName(for: baseName, suffix: "scales")
-        guard tensor.dtype == .u32, let scalesTensor = try companionTensor(scalesName, shouldSliceCompanions) else {
+
+        // Resolve the scales' shape/dtype and, only if we still need to build
+        // its MLXArray, the scales MaterializedTensor. When the scales array
+        // was already built off the compute thread (prebuiltScalesArray) we
+        // read its shape/dtype directly and DO NOT call the scales companion
+        // closure — for the palette-packed resident scales store that closure
+        // would otherwise redundantly expand the slice again on the compute
+        // thread just to discard its bytes.
+        let scalesShape: [Int]
+        let scalesIsU8: Bool
+        let scalesTensorForArray: MaterializedTensor?
+        if tensor.dtype == .u32, let prebuiltScalesArray {
+            scalesShape = prebuiltScalesArray.shape
+            scalesIsU8 = prebuiltScalesArray.dtype == .uint8
+            scalesTensorForArray = nil
+        } else if tensor.dtype == .u32, let scalesTensor = try companionTensor(scalesName, shouldSliceCompanions) {
+            scalesShape = scalesTensor.shape
+            scalesIsU8 = scalesTensor.dtype == .u8
+            scalesTensorForArray = scalesTensor
+        } else {
             try validateShape(tensor.shape, expectedShape: expectedShape, tensorName: baseName)
             return DeepSeekLinearWeight(try prebuiltWeightArray ?? bridge.makeArray(from: tensor))
         }
@@ -2073,12 +2242,12 @@ public struct DeepSeekWeightLoader {
         guard [2, 4, 8].contains(bits) else {
             throw MLXFastError.invalidInput("quantized tensor \(baseName) inferred unsupported bits=\(bits)")
         }
-        guard let scaleGroups = scalesTensor.shape.last, scaleGroups > 0, expectedInput % scaleGroups == 0 else {
+        guard let scaleGroups = scalesShape.last, scaleGroups > 0, expectedInput % scaleGroups == 0 else {
             throw MLXFastError.invalidInput(
-                "quantized tensor \(baseName) scales shape \(scalesTensor.shape) is incompatible with logical input \(expectedInput)"
+                "quantized tensor \(baseName) scales shape \(scalesShape) is incompatible with logical input \(expectedInput)"
             )
         }
-        let scaleRows = scalesTensor.shape.dropLast().reduce(1, *)
+        let scaleRows = scalesShape.dropLast().reduce(1, *)
         guard scaleRows == expectedRows else {
             throw MLXFastError.invalidInput(
                 "quantized tensor \(baseName) scales have \(scaleRows) rows; expected \(expectedRows)"
@@ -2088,15 +2257,15 @@ public struct DeepSeekWeightLoader {
             let biasRows = biasesTensor.shape.dropLast().reduce(1, *)
             guard biasRows == expectedRows, biasesTensor.shape.last == scaleGroups else {
                 throw MLXFastError.invalidInput(
-                    "quantized tensor \(baseName) biases shape \(biasesTensor.shape) does not match scales shape \(scalesTensor.shape)"
+                    "quantized tensor \(baseName) biases shape \(biasesTensor.shape) does not match scales shape \(scalesShape)"
                 )
             }
         }
 
-        let mode: QuantizationMode = biasesTensor == nil && scalesTensor.dtype == .u8 ? .mxfp4 : .affine
+        let mode: QuantizationMode = biasesTensor == nil && scalesIsU8 ? .mxfp4 : .affine
         let weightArray = try (prebuiltWeightArray ?? bridge.makeArray(from: tensor))
             .reshaped([expectedRows, packedInput])
-        let scalesArray = try (prebuiltScalesArray ?? bridge.makeArray(from: scalesTensor))
+        let scalesArray = try (prebuiltScalesArray ?? bridge.makeArray(from: scalesTensorForArray!))
             .reshaped([expectedRows, scaleGroups])
         let biasesArray = try biasesTensor.map { try bridge.makeArray(from: $0).reshaped([expectedRows, scaleGroups]) }
         return DeepSeekLinearWeight(
@@ -2142,6 +2311,68 @@ public struct StagedExpertCode {
 private struct DecodePrefetchSink: @unchecked Sendable {
     let buffer: UnsafeMutableBufferPointer<StagedExpertCode?>
 }
+
+/// Per-expert readiness view over the decode-step slice reads scheduled by
+/// streamDecodeExpertCodes. Worker threads store finished slice entries
+/// (tensor + base MLXArray) under the same decodePrefetchKey the batch
+/// prefetch would use; the compute thread blocks per EXPERT (not on the whole
+/// batch) and snapshots the map after each wait. Entries are only ever ADDED,
+/// never mutated or removed, so a snapshot taken after an expert's group wait
+/// always holds that expert's finished entries; other experts' keys are
+/// irrelevant to its lookup. Any slice that failed or timed out is simply
+/// absent and the consumer's normal bank-read fallback supplies the same
+/// bytes on the compute thread.
+public final class DecodeExpertCodeStream: @unchecked Sendable {
+    private let lock = NSLock()
+    private var results: [String: StagedExpertCode]
+    // Immutable after init: one group per expert with scheduled reads,
+    // entered once per slice before the stream is handed to the consumer.
+    private let expertGroups: [Int: DispatchGroup]
+
+    fileprivate init(results: [String: StagedExpertCode], expertGroups: [Int: DispatchGroup]) {
+        self.results = results
+        self.expertGroups = expertGroups
+    }
+
+    /// Blocks until every scheduled slice for the expert has finished (read +
+    /// base array build) or the safety timeout passes. Experts with no
+    /// scheduled reads (fully pre-populated, or nothing resolvable) return
+    /// immediately. On timeout the expert's entries may be missing from the
+    /// snapshot; consumers then fall back to the normal bank reads, so
+    /// correctness never depends on this wait.
+    public func waitForExpert(_ expertIndex: Int) {
+        guard let group = expertGroups[expertIndex] else {
+            return
+        }
+        _ = group.wait(timeout: .now() + .seconds(5))
+    }
+
+    /// Locked copy of the results map, in the exact shape
+    /// weights(forExpert:decodePrefetch:) consumes. Take it AFTER
+    /// waitForExpert so the expert's own entries are present (group.leave
+    /// orders each store before the wait returns).
+    public func snapshotResults() -> [String: StagedExpertCode] {
+        lock.lock()
+        defer { lock.unlock() }
+        return results
+    }
+
+    fileprivate func store(key: String, code: StagedExpertCode) {
+        lock.lock()
+        results[key] = code
+        lock.unlock()
+    }
+}
+
+// Concurrent worker queue for streamDecodeExpertCodes slice reads.
+// .userInitiated, never .background: background QoS on the shared pool can
+// priority-invert against the compute thread's per-expert wait on the
+// 12-vCPU official runner (same rationale as the other decode queues).
+private let decodeExpertStreamQueue = DispatchQueue(
+    label: "mlxfast.decode.expert-stream",
+    qos: .userInitiated,
+    attributes: .concurrent
+)
 
 /// Last decode step's routed experts per layer — a prefetch hint store.
 /// Lock-guarded; values are only ever used to pre-position weight bytes.
