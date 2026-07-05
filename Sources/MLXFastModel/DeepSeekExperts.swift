@@ -156,11 +156,26 @@ public enum DeepSeekRoutedExperts {
         // not prefetched falls back to the normal per-expert bank read.
         var decodePrefetch: [String: StagedExpertCode]?
         if tokenCount == 1, !useStaged {
-            decodePrefetch = loader.consumeScheduledPinnedDecodeExpertCodes(
+            // Record this layer's routing as the prefetch hint for the NEXT
+            // decode step, and kick off the background predicted build for the
+            // NEXT layer now, so its (step-local, strongly repeating) expert
+            // slices are read and built while this layer computes. Hints only
+            // pre-position bytes: actual routing always decides, mispredicted
+            // entries are discarded unconsumed, and missing experts are
+            // fetched on demand below — outputs unchanged by construction.
+            loader.recordDecodeExperts(layerIndex: spec.layerIndex, experts: expertOrder)
+            loader.schedulePredictedDecodeExpertCodes(
+                layerIndex: spec.layerIndex + 1,
+                hiddenSize: spec.hiddenSize,
+                intermediateSize: spec.intermediateSize
+            )
+            let consumed = loader.consumeScheduledPinnedDecodeExpertCodes(
                 layerIndex: spec.layerIndex
-            ) ?? loader.prefetchDecodeExpertCodes(
+            )
+            decodePrefetch = loader.mergeMissingDecodeExpertCodes(
+                consumed,
                 layerIndex: spec.layerIndex,
-                expertIndices: expertOrder,
+                experts: expertOrder,
                 hiddenSize: spec.hiddenSize,
                 intermediateSize: spec.intermediateSize
             )

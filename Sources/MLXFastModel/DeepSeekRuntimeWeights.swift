@@ -54,6 +54,15 @@ public final class DeepSeekRuntimeWeightCache {
                     layerIndex: entry.layerIndex,
                     expertIndices: experts
                 )
+                // Exact token-derived experts, known before the forward:
+                // background-build their slices now so the hash layers hit
+                // prebuilt arrays without RAM pinning.
+                loader.schedulePredictedDecodeExpertCodes(
+                    layerIndex: entry.layerIndex,
+                    experts: experts,
+                    hiddenSize: config.hiddenSize,
+                    intermediateSize: config.moeIntermediateSize
+                )
             }
         }
     }

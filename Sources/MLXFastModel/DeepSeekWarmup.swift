@@ -16,7 +16,7 @@ import MLXFastCore
 /// prompt-independent and cannot affect model output.
 enum DeepSeekWarmup {
     private static let pageCacheWarmMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
-    private static let pageCacheWarmLayerCount = 9
+    private static let pageCacheWarmLayerCount = 10
 
     static func run(weightCache: DeepSeekRuntimeWeightCache) {
         let config = weightCache.config
