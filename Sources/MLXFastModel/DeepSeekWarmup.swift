@@ -84,7 +84,7 @@ enum DeepSeekWarmup {
         // m=12 covers the batched staged prefill's per-expert GEMM shape
         // bucket (~512*6/256 rows per expert), so the first scored forward
         // pays no pipeline-state creation for it.
-        for m in [1, 12, 512] {
+        for m in [1, 512] {
             let x = zeros([1, m, hidden], dtype: .bfloat16)
             eval(quantizedMM(
                 x, affineWeight,
@@ -152,18 +152,24 @@ enum DeepSeekWarmup {
         else {
             return
         }
-        var warmed = 0
+        // Reverse order: any post-init eviction hits the deepest warmed
+        // layers first — the ones whose head-start loss costs the least.
+        var stageable: [Int] = []
         for layerIndex in 0..<weightCache.config.numHiddenLayers {
-            guard warmed < pageCacheWarmLayerCount else {
+            if weightCache.loader.stagedExpertLayerPlan(layerIndex: layerIndex) != nil {
+                stageable.append(layerIndex)
+            }
+            if stageable.count >= pageCacheWarmLayerCount {
                 break
             }
+        }
+        for layerIndex in stageable.reversed() {
             guard let plan = weightCache.loader.stagedExpertLayerPlan(layerIndex: layerIndex) else {
                 continue
             }
             stager.schedule(plan)
             if stager.waitForLayer(layerIndex) {
                 stager.releaseLayer(layerIndex)
-                warmed += 1
             }
         }
     }

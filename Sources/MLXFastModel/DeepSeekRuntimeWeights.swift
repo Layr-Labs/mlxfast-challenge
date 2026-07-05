@@ -67,6 +67,39 @@ public final class DeepSeekRuntimeWeightCache {
         }
     }
 
+    /// Tail capture across the prefill->seed boundary. At a prefill-shaped
+    /// forward's EXIT, the LAST stageable layers' file pages are the freshest
+    /// in the page cache — staging them now is a background memcpy (no disk
+    /// traffic), and they are exactly the layers the NEXT prefill-shaped
+    /// forward (the decode window's seed) would otherwise re-read from disk
+    /// after its own early reads LRU-evict them. Weights are
+    /// input-independent; the capture wins the eviction race by seconds; the
+    /// seed consumes and releases the buffers at its own tail; one-token
+    /// decode entry cancels anything stale. (Prior cross-boundary attempts
+    /// captured the HEAD layers — cold bytes, disk reads — and measured
+    /// negative; the tail is the cached end.)
+    public func scheduleSeedTailCapture() {
+        guard let stager = loader.expertLayerStager else {
+            return
+        }
+        var tail: [Int] = []
+        for layerIndex in stride(from: config.numHiddenLayers - 1, through: 0, by: -1) {
+            if loader.stagedExpertLayerPlan(layerIndex: layerIndex) != nil {
+                tail.append(layerIndex)
+            }
+            if tail.count >= 6 {
+                break
+            }
+        }
+        // Schedule shallowest-first so consumption order matches read order.
+        for layerIndex in tail.reversed() {
+            guard let plan = loader.stagedExpertLayerPlan(layerIndex: layerIndex) else {
+                continue
+            }
+            stager.schedule(plan)
+        }
+    }
+
     /// For full-size checkpoints, populate every memoized weight struct and
     /// spec and warm the hot Metal kernels during construction. The runtime
     /// worker constructs this cache before the benchmark handshake, so the

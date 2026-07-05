@@ -41,6 +41,10 @@ public final class ExpertLayerStager {
     private var recordNamesByLayer: [Int: [String]] = [:]
     private var pendingLayers: Set<Int> = []
     private var failedLayers: Set<Int> = []
+    // Bumped by releaseAllStagedLayers; staging jobs scheduled under an older
+    // generation bail at start and discard at store, so stale cross-forward
+    // captures cannot spill work into the decode window.
+    private var generation = 0
 
     public init?(manifestPath: String, metrics: ExpertStreamingMetrics?) {
         guard let bank = try? ExpertSlotBank(
@@ -88,6 +92,19 @@ public final class ExpertLayerStager {
         return stagedBytesByRecordName[recordName]
     }
 
+    /// Frees every staged layer and cancels queued stage jobs. Called at
+    /// one-token decode entry: decode never consumes staged data, so anything
+    /// staged there is a stale cross-forward capture.
+    public func releaseAllStagedLayers() {
+        condition.lock()
+        generation += 1
+        recordNamesByLayer.removeAll()
+        stagedBytesByRecordName.removeAll()
+        pendingLayers.removeAll()
+        condition.broadcast()
+        condition.unlock()
+    }
+
     /// Frees a consumed layer's staged buffers.
     public func releaseLayer(_ layerIndex: Int) {
         condition.lock()
@@ -122,7 +139,14 @@ public final class ExpertLayerStager {
             return
         }
         pendingLayers.insert(plan.layerIndex)
+        let scheduledGeneration = generation
         queue.async { [self] in
+            condition.lock()
+            let stale = scheduledGeneration != generation
+            condition.unlock()
+            if stale {
+                return
+            }
             // Read the layer's ~1 GiB projection tensors concurrently instead
             // of one after another. The side bank is capacity 0, so it never
             // mutates its cache/LRU and each read is an independent
@@ -156,7 +180,9 @@ public final class ExpertLayerStager {
             }
             condition.lock()
             pendingLayers.remove(plan.layerIndex)
-            if succeeded {
+            if scheduledGeneration != generation {
+                // Cancelled mid-read: discard rather than store stale bytes.
+            } else if succeeded {
                 recordNamesByLayer[plan.layerIndex] = plan.recordNames
                 for (name, bytes) in loaded {
                     stagedBytesByRecordName[name] = bytes
