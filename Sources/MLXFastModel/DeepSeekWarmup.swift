@@ -15,11 +15,15 @@ import MLXFastCore
 /// Synthetic inputs are all-zero and outputs are discarded, so this is
 /// prompt-independent and cannot affect model output.
 enum DeepSeekWarmup {
+    private static let pageCacheWarmMinimumPhysicalMemoryBytes: UInt64 = 40 << 30
+    private static let pageCacheWarmLayerCount = 9
+
     static func run(weightCache: DeepSeekRuntimeWeightCache) {
         let config = weightCache.config
         evalDerivedWeights(weightCache: weightCache)
         warmKernels(config: config)
         runThrowawayDecodeForward(weightCache: weightCache)
+        warmInitialExpertLayerPageCache(weightCache: weightCache)
     }
 
     private static func evalDerivedWeights(weightCache: DeepSeekRuntimeWeightCache) {
@@ -135,6 +139,28 @@ enum DeepSeekWarmup {
             positionOffset: 0
         ) else { return }
         eval(logits)
+    }
+
+    private static func warmInitialExpertLayerPageCache(weightCache: DeepSeekRuntimeWeightCache) {
+        guard ProcessInfo.processInfo.physicalMemory >= pageCacheWarmMinimumPhysicalMemoryBytes,
+              let stager = weightCache.loader.expertLayerStager
+        else {
+            return
+        }
+        var warmed = 0
+        for layerIndex in 0..<weightCache.config.numHiddenLayers {
+            guard warmed < pageCacheWarmLayerCount else {
+                break
+            }
+            guard let plan = weightCache.loader.stagedExpertLayerPlan(layerIndex: layerIndex) else {
+                continue
+            }
+            stager.schedule(plan)
+            if stager.waitForLayer(layerIndex) {
+                stager.releaseLayer(layerIndex)
+                warmed += 1
+            }
+        }
     }
 
     private static func warmHeadHyperConnection(model: DeepSeekModelWeights, config: DeepSeekConfig) {

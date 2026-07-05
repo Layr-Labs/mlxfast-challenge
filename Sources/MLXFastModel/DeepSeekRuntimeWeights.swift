@@ -58,30 +58,6 @@ public final class DeepSeekRuntimeWeightCache {
         }
     }
 
-    /// Cross-forward stage-ahead: schedule whole-layer expert staging for the
-    /// first few stageable layers. Weights are input-independent, so having
-    /// the NEXT prefill-shaped forward's opening layers already staged (from
-    /// untimed init, or from the tail of the previous forward) removes its
-    /// cold-start disk wait. Staged entries persist until consumed; one-token
-    /// decode entry releases any stale ones so they never crowd the decode
-    /// phase's page cache. Scheduling is idempotent.
-    public func scheduleUpcomingPrefillStaging() {
-        guard let stager = loader.expertLayerStager else {
-            return
-        }
-        var scheduled = 0
-        for layerIndex in 0..<config.numHiddenLayers {
-            guard let plan = loader.stagedExpertLayerPlan(layerIndex: layerIndex) else {
-                continue
-            }
-            stager.schedule(plan)
-            scheduled += 1
-            if scheduled >= 4 {
-                break
-            }
-        }
-    }
-
     /// For full-size checkpoints, populate every memoized weight struct and
     /// spec and warm the hot Metal kernels during construction. The runtime
     /// worker constructs this cache before the benchmark handshake, so the
@@ -131,47 +107,6 @@ public final class DeepSeekRuntimeWeightCache {
             }
         }
         DeepSeekWarmup.run(weightCache: self)
-        // NOTE: no init-time stage-ahead (held Data) here. The trusted
-        // harness keeps TWO loaders alive at once (see
-        // ResidentExpertStoreRegistry); holding staged bytes at init runs in
-        // BOTH loaders and doubles the held memory on the 48 GB runner. The
-        // forward-exit hook covers the seed prefill instead.
-        //
-        // Page-cache warming is different: read-and-release through the
-        // metered stager leaves NO app-held bytes (one layer transient) while
-        // the kernel retains the file pages. Warming twice (both loaders)
-        // touches the same pages — idempotent. The first scored prefill's
-        // opening layers then read at page-cache speed instead of cold disk.
-        // Weights are input-independent; every byte is metered as usual.
-        warmExpertPageCache()
-    }
-
-    /// Untimed init read-through of the first few stageable layers' expert
-    /// tensors: schedule -> wait -> release, one layer at a time, so at most
-    /// one layer's bytes are ever app-held while the kernel page cache keeps
-    /// the file pages for the first scored prefill. Gated to machines with
-    /// the official memory budget (same gate as pinning) — the value is the
-    /// 48 GB runner's cold start, and small machines should not spend cache.
-    private func warmExpertPageCache() {
-        guard ProcessInfo.processInfo.physicalMemory >= (40 << 30),
-              let stager = loader.expertLayerStager
-        else {
-            return
-        }
-        var warmed = 0
-        for layerIndex in 0..<config.numHiddenLayers {
-            guard let plan = loader.stagedExpertLayerPlan(layerIndex: layerIndex) else {
-                continue
-            }
-            stager.schedule(plan)
-            if stager.waitForLayer(layerIndex) {
-                stager.releaseLayer(layerIndex)
-            }
-            warmed += 1
-            if warmed >= 9 {
-                break
-            }
-        }
     }
 
     public func blockSpec() -> DeepSeekBlockSpec {
