@@ -225,14 +225,37 @@ public enum DeepSeekRoutedExperts {
         var scatterOrder: [Int] = []
         scatterOrder.reserveCapacity(outputCount)
 
-        for expertIndex in expertOrder {
+        // Streamed decode reads: process experts in READ-COMPLETION order so
+        // a slow expert's SSD tail never blocks graph construction for
+        // experts whose bytes already landed — each expert is pulled from
+        // the completion channel and processed IMMEDIATELY while later
+        // experts' reads continue in the background. Processing order only
+        // changes the concat order below, which the inverse permutation
+        // undoes — the same argument the batched prefill path documents —
+        // so the returned tensor is bit-identical for any order. On channel
+        // timeout (or no stream) fall back to routing-order group waits.
+        var pendingExperts = expertOrder
+        var channelLive = decodeStream != nil
+        while !pendingExperts.isEmpty {
+            let expertIndex: Int
+            if channelLive,
+               let decodeStream,
+               let completed = decodeStream.nextCompletedExpert(timeout: 5),
+               let position = pendingExperts.firstIndex(of: completed)
+            {
+                expertIndex = pendingExperts.remove(at: position)
+            } else {
+                // Timeout or channel unavailable: finish remaining experts
+                // in routing order via the per-expert group waits below.
+                channelLive = false
+                expertIndex = pendingExperts.removeFirst()
+            }
             guard let flatIndices = flatIndicesByExpert[expertIndex] else {
                 continue
             }
-            // Streamed decode reads: block only on THIS expert's slices,
-            // then snapshot the (add-only) results so the expert's own
-            // prebuilt entries are visible; later experts' reads keep
-            // landing in the background while this subgraph is built.
+            // Block only on THIS expert's slices (a no-op when it arrived
+            // through the completion channel), then snapshot the (add-only)
+            // results so the expert's own prebuilt entries are visible.
             var expertPrefetch = decodePrefetch
             if let decodeStream {
                 decodeStream.waitForExpert(expertIndex)

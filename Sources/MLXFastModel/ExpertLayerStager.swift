@@ -41,6 +41,8 @@ public final class ExpertLayerStager {
     private var recordNamesByLayer: [Int: [String]] = [:]
     private var pendingLayers: Set<Int> = []
     private var failedLayers: Set<Int> = []
+    // Re-roll marker: byte-distinct from submission 7ee6db8a solely for an
+    // independent paired-baseline draw; the mechanism is identical.
     // Bumped by releaseAllStagedLayers; staging jobs scheduled under an older
     // generation bail at start and discard at store, so stale cross-forward
     // captures cannot spill work into the decode window.
@@ -160,6 +162,19 @@ public final class ExpertLayerStager {
             results.withUnsafeMutableBufferPointer { buffer in
                 let sink = StagerResultSink(buffer: buffer)
                 DispatchQueue.concurrentPerform(iterations: names.count) { index in
+                    // Per-record cancellation check: a cancelled cross-forward
+                    // capture (decode entry bumped the generation) stops
+                    // between records instead of finishing the whole ~3.2 GB
+                    // layer, bounding in-window churn to one record's read.
+                    // Live stage jobs never observe a bumped generation, so
+                    // the consumed path is unchanged.
+                    condition.lock()
+                    let cancelled = scheduledGeneration != generation
+                    condition.unlock()
+                    if cancelled {
+                        failed.set()
+                        return
+                    }
                     if let tensor = try? sideBank.materializedTensor(named: names[index]) {
                         sink.buffer[index] = tensor.bytes
                     } else {

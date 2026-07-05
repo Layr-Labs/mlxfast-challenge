@@ -744,9 +744,17 @@ public struct DeepSeekWeightLoader {
             // consumed (serve those prebuilt entries through a no-wait
             // stream), or the layer resolves no stacked slices at all (nil ->
             // caller fallback, which also resolves nothing, exactly as today).
-            return prepopulated.isEmpty
-                ? nil
-                : DecodeExpertCodeStream(results: prepopulated, expertGroups: [:])
+            guard !prepopulated.isEmpty else {
+                return nil
+            }
+            let stream = DecodeExpertCodeStream(results: prepopulated, expertGroups: [:])
+            // No reads scheduled: every expert is complete immediately, so
+            // the consumer's completion channel never stalls on this layer.
+            var notifiedNow = Set<Int>()
+            for expertIndex in expertIndices where notifiedNow.insert(expertIndex).inserted {
+                stream.markExpertComplete(expertIndex)
+            }
+            return stream
         }
         var expertGroups: [Int: DispatchGroup] = [:]
         for expertIndex in indices where expertGroups[expertIndex] == nil {
@@ -796,6 +804,21 @@ public struct DeepSeekWeightLoader {
                     key: key,
                     code: StagedExpertCode(tensor: tensor, array: array, scalesArray: scalesArray)
                 )
+            }
+        }
+        // Completion-order channel. Registered AFTER every enter() above so
+        // a group can only fire once its expert's scheduled slices balance
+        // (a notify on a never-entered group would fire immediately).
+        // Experts with no scheduled reads (fully pre-populated by consumed
+        // prebuilds) are complete right away.
+        var notified = Set<Int>()
+        for expertIndex in expertIndices where notified.insert(expertIndex).inserted {
+            if let group = expertGroups[expertIndex] {
+                group.notify(queue: decodeExpertStreamQueue) {
+                    stream.markExpertComplete(expertIndex)
+                }
+            } else {
+                stream.markExpertComplete(expertIndex)
             }
         }
         return stream
@@ -2328,10 +2351,39 @@ public final class DecodeExpertCodeStream: @unchecked Sendable {
     // Immutable after init: one group per expert with scheduled reads,
     // entered once per slice before the stream is handed to the consumer.
     private let expertGroups: [Int: DispatchGroup]
+    // Completion-order channel: experts land here as their last slice
+    // finishes (group.notify), letting the consumer process whichever
+    // expert's bytes arrived first. Guarded by `completionCondition`.
+    private let completionCondition = NSCondition()
+    private var completedExperts: [Int] = []
 
     fileprivate init(results: [String: StagedExpertCode], expertGroups: [Int: DispatchGroup]) {
         self.results = results
         self.expertGroups = expertGroups
+    }
+
+    fileprivate func markExpertComplete(_ expertIndex: Int) {
+        completionCondition.lock()
+        completedExperts.append(expertIndex)
+        completionCondition.signal()
+        completionCondition.unlock()
+    }
+
+    /// Pops the next expert whose scheduled reads have all finished, waiting
+    /// up to the timeout. Returns nil on timeout; consumers then fall back to
+    /// routing-order waits (correctness never depends on this channel —
+    /// processing order only changes the concat order, which the caller's
+    /// inverse permutation undoes).
+    public func nextCompletedExpert(timeout: TimeInterval) -> Int? {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        completionCondition.lock()
+        defer { completionCondition.unlock() }
+        while completedExperts.isEmpty {
+            if !completionCondition.wait(until: deadline) {
+                return nil
+            }
+        }
+        return completedExperts.removeFirst()
     }
 
     /// Blocks until every scheduled slice for the expert has finished (read +
