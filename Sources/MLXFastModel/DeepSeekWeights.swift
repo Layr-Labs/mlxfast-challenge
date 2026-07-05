@@ -2170,7 +2170,11 @@ private final class ScheduledDecodePrefetches {
     }
 
     private let lock = NSLock()
-    private let queue = DispatchQueue(label: "mlxfast.decode.pinned-prefetch", qos: .userInitiated)
+    private let queue = DispatchQueue(
+        label: "mlxfast.decode.pinned-prefetch",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
     private var entries: [Int: Entry] = [:]
 
     func schedule(
