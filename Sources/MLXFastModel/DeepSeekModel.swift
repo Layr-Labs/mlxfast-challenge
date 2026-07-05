@@ -129,15 +129,20 @@ public enum DeepSeekModel {
         let spec = DeepSeekModelSpec(config: config)
         let weights = try weightCache.modelWeights()
         if inputIDs.shape == [1, 1] {
-            // Decode step: hash-layer routing depends only on the token id,
-            // so advise the kernel about those layers' expert ranges before
-            // the forward starts. inputIDs is a leaf array on every decode
-            // path, so this host read forces no GPU synchronization.
+            // Decode step: staged data is never consumed at one-token shapes,
+            // so anything still staged is a stale cross-forward prefetch --
+            // release it before it crowds the page cache the decode reads
+            // depend on.
+            weightCache.loader.expertLayerStager?.releaseAllStagedLayers()
+            // Hash-layer routing depends only on the token id, so advise the
+            // kernel about those layers' expert ranges before the forward
+            // starts. inputIDs is a leaf array on every decode path, so this
+            // host read forces no GPU synchronization.
             weightCache.prefetchHashLayerExperts(
                 token: Int(DeepSeekOps.cast(inputIDs, to: .int32).asArray(Int32.self)[0])
             )
         }
-        return try logits(
+        let result = try logits(
             inputIDs: inputIDs,
             weights: weights,
             spec: spec,
@@ -152,6 +157,15 @@ public enum DeepSeekModel {
                 positionOffset: positionOffset
             )
         }
+        if inputIDs.shape[1] >= 64 {
+            // Prefill-shaped forward complete (graph built): stage the first
+            // layers for the NEXT prefill-shaped forward, so the seed prefill
+            // after the measured prefill (and any later hidden prefill) skips
+            // its cold start. Weights are input-independent; a stale prefetch
+            // is released at one-token decode entry above.
+            weightCache.scheduleUpcomingPrefillStaging()
+        }
+        return result
     }
 
     public static func logits(

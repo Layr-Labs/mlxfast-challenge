@@ -41,6 +41,10 @@ public final class ExpertLayerStager {
     private var recordNamesByLayer: [Int: [String]] = [:]
     private var pendingLayers: Set<Int> = []
     private var failedLayers: Set<Int> = []
+    // Bumped by releaseAllStagedLayers; staging jobs scheduled under an older
+    // generation bail out at start (and discard at store) so stale
+    // cross-forward prefetch reads cannot spill into the decode window.
+    private var generation = 0
 
     public init?(manifestPath: String, metrics: ExpertStreamingMetrics?) {
         guard let bank = try? ExpertSlotBank(
@@ -88,6 +92,24 @@ public final class ExpertLayerStager {
         return stagedBytesByRecordName[recordName]
     }
 
+    /// Frees every staged layer's buffers. Called at one-token decode entry:
+    /// decode steps never consume staged data, so anything still staged there
+    /// is a stale cross-forward prefetch whose bytes would only crowd the
+    /// page cache the decode reads depend on.
+    public func releaseAllStagedLayers() {
+        condition.lock()
+        generation += 1
+        if !recordNamesByLayer.isEmpty {
+            recordNamesByLayer.removeAll()
+            stagedBytesByRecordName.removeAll()
+        }
+        // Pending jobs check the generation at start and at store; bumping it
+        // cancels queued stage-ahead reads before they issue.
+        pendingLayers.removeAll()
+        condition.broadcast()
+        condition.unlock()
+    }
+
     /// Frees a consumed layer's staged buffers.
     public func releaseLayer(_ layerIndex: Int) {
         condition.lock()
@@ -122,7 +144,14 @@ public final class ExpertLayerStager {
             return
         }
         pendingLayers.insert(plan.layerIndex)
+        let scheduledGeneration = generation
         queue.async { [self] in
+            condition.lock()
+            let stale = scheduledGeneration != generation
+            condition.unlock()
+            if stale {
+                return
+            }
             // Read the layer's ~1 GiB projection tensors concurrently instead
             // of one after another. The side bank is capacity 0, so it never
             // mutates its cache/LRU and each read is an independent
@@ -156,7 +185,9 @@ public final class ExpertLayerStager {
             }
             condition.lock()
             pendingLayers.remove(plan.layerIndex)
-            if succeeded {
+            if scheduledGeneration != generation {
+                // Cancelled mid-read: discard rather than store stale bytes.
+            } else if succeeded {
                 recordNamesByLayer[plan.layerIndex] = plan.recordNames
                 for (name, bytes) in loaded {
                     stagedBytesByRecordName[name] = bytes
