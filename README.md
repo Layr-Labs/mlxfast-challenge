@@ -128,11 +128,13 @@ only aggregate semantic counts and the judge model name; prompts, references,
 candidate answers, and judge text stay in the private runner directory.
 The private workflow keeps semantic GPQA wired as a required gate, calibrated
 to an unmodified Gemma 4 31B 4-bit baseline rather than to better-than-baseline
-GPQA answer quality. The measured Gemma baseline is 0/5 (ranked run
-28813130022, judged at the previous 10-token answer budget), so the current
-threshold is 0/5 with a 64-token answer budget; aggregate pass counts are still
-recorded, and the threshold is to be re-raised once a judged official-runner
-baseline at the 64-token budget establishes a nonzero floor (see
+GPQA answer quality. The measured Gemma baseline is 0/5 at the 64-token answer
+budget (official-runner verification run 28817200585; run 28813130022 had
+already judged 0/5 at the previous 10-token budget), so the threshold is 0/5:
+baseline Gemma expresses no judged-correct answers on these raw-completion
+prompts. Aggregate pass counts are still recorded, and the gate stays
+aggregate-recording until the hidden prompts change, after which a fresh judged
+official-runner baseline must recalibrate the threshold (see
 `MLXFastConstants.semanticGPQAMinPassCount`).
 When dispatched with `run_benchmark=true`, the workflow fans out across 5
 independent machines instead of running everything on one: three

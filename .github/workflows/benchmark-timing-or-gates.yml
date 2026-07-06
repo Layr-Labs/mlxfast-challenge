@@ -60,8 +60,9 @@ jobs:
       MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json
       MLXFAST_GPQA_CASE_COUNT: "5"
       # 64-token GPQA behavior/semantic budget and 0/5 threshold: calibrated
-      # to the unmodified Gemma 4 31B 4-bit baseline (ranked run 28813130022
-      # judged 0/5 at the old 10-token budget). Keep these three in sync with
+      # to the unmodified Gemma 4 31B 4-bit baseline (run 28817200585 judged
+      # 0/5 at this 64-token budget; run 28813130022 judged 0/5 at the old
+      # 10-token budget). Keep these three in sync with
       # MLXFastConstants.{correctnessGPQAMaxNewTokens,semanticGPQAMaxNewTokens,
       # semanticGPQAMinPassCount} -- the semantic capture is a prefix of the
       # behavior-gate generation, so the two MAX_NEW_TOKENS values move together.

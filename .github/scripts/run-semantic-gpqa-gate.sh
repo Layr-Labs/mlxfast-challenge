@@ -8,7 +8,8 @@ INTEGRITY_PATH="${MLXFAST_INTEGRITY_PATH:-benchmark-integrity.json}"
 RESULTS_PATH="${MLXFAST_SEMANTIC_GPQA_RESULTS_PATH:-${MLXFAST_PRIVATE_DIR:-/tmp}/semantic_gpqa_results.json}"
 MODEL="${MLXFAST_SEMANTIC_GPQA_MODEL:-claude-sonnet-4-5-20250929}"
 # Default mirrors MLXFastConstants.semanticGPQAMinPassCount (Gemma-baseline
-# calibrated; the DeepSeek-era default was 3).
+# calibrated: run 28817200585 judged the unmodified baseline 0/5 at the
+# 64-token budget; the DeepSeek-era default was 3).
 MIN_PASS="${MLXFAST_SEMANTIC_GPQA_MIN_PASS:-0}"
 REQUIRED="${MLXFAST_SEMANTIC_GPQA_REQUIRED:-1}"
 

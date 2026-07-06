@@ -63,13 +63,14 @@ verify them) must be regenerated.
 - **Recalibrate — DONE (2026-07-06):** the semantic-GPQA 3/5 threshold
   (`MLXFAST_SEMANTIC_GPQA_MIN_PASS`) was calibrated against the previous
   model's baseline answer quality. The unmodified Gemma baseline measured
-  0/5 on ranked run 28813130022 (judged at the 10-token budget), and a
-  baseline answer capture at 10/32/64-token budgets showed the raw-prompt
-  greedy continuations mostly never state the selected option. The threshold
-  is now 0 with a 64-token budget (`MLXFAST_GPQA_MAX_NEW_TOKENS` /
-  `MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS`); re-raise it once a judged
-  official-runner baseline at the new budget establishes a nonzero floor
-  (see the TODO on `MLXFastConstants.semanticGPQAMinPassCount`).
+  0/5 on ranked run 28813130022 (judged at the 10-token budget), and the
+  official-runner verification run 28817200585 confirmed 0/5 judged at the
+  64-token budget (`MLXFAST_GPQA_MAX_NEW_TOKENS` /
+  `MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS`): baseline Gemma expresses no
+  judged-correct answers on these raw-completion prompts. The threshold is 0
+  and the gate is aggregate-recording until the hidden prompts change, after
+  which a fresh judged official-runner baseline must recalibrate it (see
+  `MLXFastConstants.semanticGPQAMinPassCount`).
 
 ## 3. Private prompt manifest (organizer-side, not workflow-consumed)
 

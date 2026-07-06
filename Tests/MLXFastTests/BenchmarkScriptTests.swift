@@ -435,8 +435,9 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(timingOrGates.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json"))
     #expect(timingOrGates.contains("MLXFAST_GPQA_CASE_COUNT: \"5\""))
     // 64-token budget and 0/5 threshold are calibrated to the unmodified
-    // Gemma 4 31B 4-bit baseline (ranked run 28813130022 judged 0/5 at the
-    // old 10-token budget); see MLXFastConstants.semanticGPQAMinPassCount.
+    // Gemma 4 31B 4-bit baseline (run 28817200585 judged 0/5 at the 64-token
+    // budget; run 28813130022 judged 0/5 at the old 10-token budget); see
+    // MLXFastConstants.semanticGPQAMinPassCount.
     #expect(timingOrGates.contains("MLXFAST_GPQA_MAX_NEW_TOKENS: \"64\""))
     #expect(workflow.contains("MLXFAST_GPQA_TTFT_CASE_COUNT: \"5\""))
     #expect(timingOrGates.contains("MLXFAST_SEMANTIC_GPQA_CASE_COUNT: \"5\""))
