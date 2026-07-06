@@ -298,7 +298,7 @@ func publicDiagnosticsAreCoarsenedWhileRankingStaysPrecise() throws {
                 actualToken: nil,
                 maxAbsDiff: 0,
                 goldenHash: "g",
-                bandwidthSource: "trusted_core_expert_slot_bank_reads",
+                bandwidthSource: "ram_resident_model",
                 error: "",
                 commit: "c",
                 timestamp: "t",
