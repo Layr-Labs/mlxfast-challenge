@@ -161,10 +161,11 @@ the private prompt and artifact handling model.
 
 Gemma 4 31B is a dense (non-MoE) text+vision model; only the text tower is in
 scope here. In 4-bit the text tower is about 17 GB, small enough to load
-entirely into unified memory once at process startup on the official ≥256 GB
-Apple M3 Ultra runner (and on any local machine with enough RAM). There is no
-weight streaming of any kind: the whole model is RAM-resident before the first
-scored forward pass runs.
+entirely into unified memory once at process startup on the official runner
+(the hardware contract is Apple M4-generation silicon with at least 36 GB of
+unified memory; today's runner is Blacksmith's M4 Pro class with 48 GB) and on
+any local machine meeting that bar. There is no weight streaming of any kind:
+the whole model is RAM-resident before the first scored forward pass runs.
 
 That does not mean there is nothing left to optimize. Attention alternates
 five sliding-window layers (1024-token window, GQA with 16 KV heads) with one
@@ -405,7 +406,9 @@ tokenizer whitespace variants.
 
 ## Requirements
 
-- Apple Silicon Mac, 32 GB+ unified memory recommended (M2 or newer)
+- Apple Silicon Mac, 36 GB+ unified memory (matching the official hardware
+  contract: Apple M4-generation silicon with at least 36 GB; older Apple
+  Silicon works for iteration but timings are directional only)
 - macOS Sequoia or later
 - Swift 6 through Xcode or Xcode Command Line Tools
 - Xcode Metal Toolchain for `mlx.metallib`; `./setup.sh` tries
