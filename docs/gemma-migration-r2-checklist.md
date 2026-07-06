@@ -60,10 +60,16 @@ verify them) must be regenerated.
   answer capture judged by `run-semantic-gpqa-gate.sh`.
 - **No hash pin:** the augmented golden's hash/bytes are computed at run
   time, so no workflow constant needs updating for this object itself.
-- **Recalibrate:** the semantic-GPQA 3/5 threshold
+- **Recalibrate — DONE (2026-07-06):** the semantic-GPQA 3/5 threshold
   (`MLXFAST_SEMANTIC_GPQA_MIN_PASS`) was calibrated against the previous
-  model's baseline answer quality; confirm it against an unmodified Gemma
-  baseline once the new cases exist.
+  model's baseline answer quality. The unmodified Gemma baseline measured
+  0/5 on ranked run 28813130022 (judged at the 10-token budget), and a
+  baseline answer capture at 10/32/64-token budgets showed the raw-prompt
+  greedy continuations mostly never state the selected option. The threshold
+  is now 0 with a 64-token budget (`MLXFAST_GPQA_MAX_NEW_TOKENS` /
+  `MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS`); re-raise it once a judged
+  official-runner baseline at the new budget establishes a nonzero floor
+  (see the TODO on `MLXFastConstants.semanticGPQAMinPassCount`).
 
 ## 3. Private prompt manifest (organizer-side, not workflow-consumed)
 

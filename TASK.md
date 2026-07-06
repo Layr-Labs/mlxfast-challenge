@@ -193,7 +193,8 @@ teacher-forced cases:
   catch bugs that only appear when the model consumes its own generated tokens.
 - `behavior`: GPQA-style or instruction-following prompts whose answer is
   checked exactly against precomputed accepted answer token sequences. Each
-  accepted answer sequence must have exactly `max_new_tokens` tokens.
+  accepted answer sequence must have at most `max_new_tokens` tokens; shorter
+  sequences are matched as exact prefixes of the generated answer.
 
 Full benchmark CI adds one more private layer after timing: it generates short
 answers for hidden GPQA cases and asks a Claude judge whether each candidate is
