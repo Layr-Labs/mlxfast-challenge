@@ -84,8 +84,8 @@ private enum MLXFastCLI {
         print("reference: \(report.referencePath)")
         print("output: \(report.outputPath)")
         print("dense tensors: \(report.denseTensorCount) across \(report.denseShardCount) shard(s)")
-        print("expert tensors: \(report.expertTensorCount)")
-        print("expert manifest: \(report.manifestPath)")
+        print("config: \(report.configPath)")
+        print("index: \(report.indexPath)")
     }
 
     private static func runVerifyTransform(_ options: ParsedOptions) throws {
@@ -173,7 +173,7 @@ private enum MLXFastCLI {
             let sidecar = "{\"step_range_start\":\(stepStart),\"step_range_end\":\(stepStart + stepCount)}\n"
             try sidecar.write(toFile: stepRangeOutputPath, atomically: true, encoding: .utf8)
         }
-        let report = try DeepSeekRuntime.runCorrectness(
+        let report = try GemmaRuntime.runCorrectness(
             CorrectnessOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
@@ -239,7 +239,7 @@ private enum MLXFastCLI {
             throw MLXFastError.invalidInput("--top-k must be a positive integer")
         }
         let caseName = options.value(for: "--case", default: "")
-        let report = try DeepSeekRuntime.traceCorrectness(
+        let report = try GemmaRuntime.traceCorrectness(
             CorrectnessTraceOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
@@ -328,7 +328,7 @@ private enum MLXFastCLI {
             let timingRepeats = localSubmit ? MLXFastConstants.localSubmitBenchmarkRepeats : 1
             let modeName = localSubmit ? "local-submit" : "local-iterate"
             let runtime = localSubmit ? "swift-local-submit" : "swift-local-iterate"
-            let payload = DeepSeekRuntime.localIterate(
+            let payload = GemmaRuntime.localIterate(
                 LocalIterateOptions(
                     weightsPath: weightsPath,
                     goldenPath: goldenPath,
@@ -387,7 +387,7 @@ private enum MLXFastCLI {
         // reproducing the original, single-machine behavior exactly.
         let checkGates = environmentValue("MLXFAST_BENCHMARK_CHECK_GATES", fallback: "1") != "0"
         let skipTimedBenchmark = environmentValue("MLXFAST_BENCHMARK_SKIP_TIMED", fallback: "0") == "1"
-        let payload = DeepSeekRuntime.benchmark(
+        let payload = GemmaRuntime.benchmark(
             BenchmarkOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
@@ -656,7 +656,7 @@ private enum MLXFastCLI {
                 + "(covers decode offsets \(promptTokens.count)..<\(promptTokens.count + steps))\n",
             stderr
         )
-        let expectedTokens = try DeepSeekRuntime.generateGreedyTokens(
+        let expectedTokens = try GemmaRuntime.generateGreedyTokens(
             GreedyGenerationOptions(
                 weightsPath: weightsPath,
                 promptTokens: promptTokens,
@@ -797,7 +797,7 @@ private enum MLXFastCLI {
                 continue
             }
 
-            let generated = try DeepSeekRuntime.generateGreedyTokens(
+            let generated = try GemmaRuntime.generateGreedyTokens(
                 GreedyGenerationOptions(
                     weightsPath: weightsPath,
                     promptTokens: promptTokens,
@@ -1246,7 +1246,7 @@ private enum MLXFastCLI {
                 fallback: MLXFastConstants.defaultWeightsPath
             )
         )
-        try DeepSeekRuntime.runWorker(weightsPath: weightsPath)
+        try GemmaRuntime.runWorker(weightsPath: weightsPath)
     }
 
     private static func runCheckpointShards(_ options: ParsedOptions) throws {
@@ -1275,7 +1275,7 @@ private enum MLXFastCLI {
               mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]
               mlxfast-swift checkpoint-shards --index PATH
 
-            Swift-only DeepSeek V4 Flash harness entrypoint.
+            Swift-only Gemma 4 31B 4-bit harness entrypoint.
             """
         )
     }

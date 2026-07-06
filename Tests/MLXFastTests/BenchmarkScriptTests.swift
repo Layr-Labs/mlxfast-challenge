@@ -10,7 +10,7 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
         encoding: .utf8
     )
 
-    #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://ds4.darkbloom.ai/deepseek-v4-flash-4bit\""))
+    #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main\""))
     #expect(setup.contains("REFERENCE_BASE_URL=\"${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}\""))
     #expect(setup.contains("DEFAULT_HF_HOME=\"${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}\""))
     #expect(setup.contains("REFERENCE_CACHE_DIR=\"${MLXFAST_REFERENCE_CACHE_DIR:-${DEFAULT_HF_HUB_CACHE}/${REFERENCE_CACHE_REPO_DIR}/snapshots/${REFERENCE_CACHE_REVISION_DIR}}\""))
@@ -67,9 +67,9 @@ func rulesDocsQuoteCurrentSpeedupFloorLimits() throws {
         #expect(!document.contains("all 256 tokens produced"))
         #expect(!document.contains("256-token greedy continuation"))
     }
-    #expect(readme.contains("bandwidth_source=trusted_core_expert_slot_bank_reads"))
+    #expect(readme.contains("bandwidth_source=ram_resident_model"))
     #expect(readme.contains("bandwidth_gb_per_token"))
-    #expect(challenge.contains("bandwidth_source=trusted_core_expert_slot_bank_reads"))
+    #expect(challenge.contains("bandwidth_source=ram_resident_model"))
     #expect(challenge.contains("bandwidth_gb_per_token"))
     #expect(!challenge.contains("bandwidth_source=expert_streaming_reads"))
     #expect(!challenge.contains("bandwidth_GB_per_token"))
@@ -576,7 +576,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // Diff-only mode: when a base commit is provided the review must send only
     // the editable files CHANGED vs that base, not the whole editable surface.
     // This is the fix for the false positive where an unchanged baseline file
-    // (DeepSeekSubmissionControls.swift's validation hook, comment mentions
+    // (Gemma4SubmissionControls.swift's validation hook, comment mentions
     // benchmark timing) failed a submission that never touched it.
     #expect(staticReview.contains("review_base=\"${MLXFAST_SUBMISSION_REVIEW_BASE_SHA:-}\""))
     #expect(staticReview.contains("git diff --name-only -z --diff-filter=d \"${review_base}\" \"${review_head}\" -- \"${editable_path}\""))
@@ -911,7 +911,7 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(!cli.contains("case \"measure-gpqa-ttft\""))
     #expect(cli.contains("AutoTokenizer.from(modelFolder: modelFolder, strict: false)"))
     #expect(cli.contains("acceptedReferenceTokenSequences"))
-    #expect(cli.contains("DeepSeekRuntime.generateGreedyTokens"))
+    #expect(cli.contains("GemmaRuntime.generateGreedyTokens"))
     #expect(cli.contains("runtimeWorkerOptions(blockedGoldenPath: gpqaPath)"))
     #expect(!cli.contains("calibrated_reference_outputs"))
     #expect(cli.contains("SemanticGPQAAnswerDocument"))
@@ -1077,19 +1077,6 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
 }
 
 @Test
-func expertSlotBankUsesNoFollowPostOpenShardValidation() throws {
-    let source = try String(
-        contentsOfFile: "Sources/MLXFastCore/ExpertSlotBank.swift",
-        encoding: .utf8
-    )
-
-    #expect(source.contains("open(shardPath, O_RDONLY | O_NOFOLLOW)"))
-    #expect(source.contains("fstat(fd, &openedStat)"))
-    #expect(source.contains("(openedStat.st_mode & S_IFMT) == S_IFREG"))
-    #expect(source.contains("end <= Int(openedStat.st_size)"))
-}
-
-@Test
 func benchmarkScriptAvoidsNestedSandboxWithRuntimeWorker() throws {
     let benchmark = try String(
         contentsOfFile: "benchmark.sh",
@@ -1135,31 +1122,21 @@ func runtimeWorkerBenchmarkDecodeDoesNotReceiveBulkOracle() throws {
 }
 
 @Test
-func expertStreamingDiagnosticsUseTrustedCoreCounters() throws {
+func benchmarkKeepsZeroExpertStreamingSchemaWithoutStreamingMachinery() throws {
     let fileManager = FileManager.default
-    #expect(fileManager.fileExists(atPath: "Sources/MLXFastCore/ExpertSlotBank.swift"))
-    #expect(!fileManager.fileExists(atPath: "Sources/MLXFastModel/ExpertSlotBank.swift"))
-    #expect(fileManager.fileExists(atPath: "Sources/MLXFastCore/ExpertStreaming.swift"))
-    #expect(!fileManager.fileExists(atPath: "Sources/MLXFastModel/ExpertStreaming.swift"))
+    // The dense, RAM-resident runtime has no expert-cache/streaming machinery
+    // to audit; only the minimal all-zero stats struct remains (kept so the
+    // score schema's expert_* fields stay stable across the model migration).
+    #expect(!fileManager.fileExists(atPath: "Sources/MLXFastCore/ExpertSlotBank.swift"))
+    #expect(!fileManager.fileExists(atPath: "Sources/MLXFastCore/ExpertStreaming.swift"))
+    #expect(fileManager.fileExists(atPath: "Sources/MLXFastCore/ExpertStreamingStats.swift"))
 
     let contract = try String(contentsOfFile: "benchmark.json", encoding: .utf8)
     #expect(!contract.contains("Sources/MLXFastCore"))
 
-    let metrics = try String(
-        contentsOfFile: "Sources/MLXFastCore/ExpertStreaming.swift",
-        encoding: .utf8
-    )
-    #expect(metrics.contains("bandwidthSource = \"trusted_core_expert_slot_bank_reads\""))
-    #expect(!metrics.contains("public func recordCache"))
-
-    let slotBank = try String(
-        contentsOfFile: "Sources/MLXFastCore/ExpertSlotBank.swift",
-        encoding: .utf8
-    )
-    #expect(!slotBank.contains("public func tensorBytes"))
-
     let runtime = try harnessRuntimeSource()
-    #expect(runtime.contains("ExpertStreamingMetrics.bandwidthSource"))
+    #expect(runtime.contains("static let bandwidthSource = \"ram_resident_model\""))
+    #expect(!runtime.contains("requirePlausibleSeedForwardExpertReads"))
 }
 
 @Test
@@ -1184,7 +1161,7 @@ func benchmarkTimingChargesDecodeSetupAndSeparatesWorkers() throws {
     #expect(workerRuntime.contains("let ttftSeconds = secondsSince(ttftStart)"))
     #expect(!workerRuntime.contains("ttftSeconds: beginResponse.seconds"))
     // benchmarkWithWorker's preflight must not call BenchmarkPreflight.check --
-    // that helper loads DeepSeekConfig/DenseTensorStore/DeepSeekWeightLoader
+    // that helper loads Gemma4Config/DenseTensorStore/Gemma4WeightLoader
     // (editable MLXFastModel code) in this trusted, unsandboxed parent process.
     // checkWorkerBenchmarkInputs is model-free: it only checks that required
     // artifact paths exist, and lets the sandboxed worker itself validate
@@ -1209,7 +1186,7 @@ func decodeMeasurementRunsSingleUnmemoizableSeedForward() throws {
     // other from that memo, collapsing two decode-charged forwards into one and
     // inflating decode_speedup with no real speedup. Guard both decode paths.
     let worker = try String(
-        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntimeWorker.swift",
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeWorker.swift",
         encoding: .utf8
     )
     let beginStart = try #require(worker.range(of: "case \"decode_begin\":"))
@@ -1218,11 +1195,11 @@ func decodeMeasurementRunsSingleUnmemoizableSeedForward() throws {
     // Exactly one whole-prompt forward, and no warmup pass preceding the seed.
     #expect(!decodeBegin.contains("warmupCache"))
     #expect(!decodeBegin.contains("warmupLogits"))
-    #expect(decodeBegin.components(separatedBy: "DeepSeekModel.logits(").count - 1 == 1)
+    #expect(decodeBegin.components(separatedBy: "Gemma4Model.logits(").count - 1 == 1)
     #expect(decodeBegin.contains("with NO preceding"))
 
     let benchmark = try String(
-        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntimeBenchmark.swift",
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift",
         encoding: .utf8
     )
     let decodeStart = try #require(benchmark.range(of: "static func measureDecode("))
@@ -1766,7 +1743,7 @@ func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
 @Test
 func runtimeWorkerValidatesTransformedWeightsAtStartup() throws {
     let worker = try String(
-        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntimeWorker.swift",
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeWorker.swift",
         encoding: .utf8
     )
     // The structural validation BenchmarkPreflight.check used to run in the
@@ -1777,15 +1754,14 @@ func runtimeWorkerValidatesTransformedWeightsAtStartup() throws {
     let helloAnchor = try #require(worker.range(of: "RuntimeWorkerResponse(\n            id: 0,"))
     let startup = String(worker[runWorkerStart.lowerBound..<helloAnchor.lowerBound])
     #expect(startup.contains("try loader.denseStore.validateReadableByteRanges()"))
-    #expect(startup.contains("try loader.expertBank.validateReadableByteRanges()"))
     #expect(startup.contains("try loader.validateRequiredMetadata(config: config)"))
 
     // The parent's worker decode path must not read the editable submission delay
-    // hook: DeepSeekSubmissionControls is editable MLXFastModel code and the worker
+    // hook: Gemma4SubmissionControls is editable MLXFastModel code and the worker
     // itself already applies the delay inside its sandboxed decode step.
     let runtime = try harnessRuntimeSource()
     let decodeStart = try #require(runtime.range(of: "static func measureWorkerDecode"))
-    let decodeEnd = try #require(runtime.range(of: "static func expertStreamingBandwidthGBPerToken"))
+    let decodeEnd = try #require(runtime.range(of: "static let bandwidthSource"))
     let workerDecode = String(runtime[decodeStart.lowerBound..<decodeEnd.lowerBound])
     #expect(!workerDecode.contains("submissionValidationDelayMilliseconds()"))
     #expect(!workerDecode.contains("decode validation delay enabled"))
@@ -1807,7 +1783,7 @@ func benchmarkLocalSubmitModeUsesLongLocalBenchmarkAndPrintsScore() throws {
     )
     let runtime = try harnessRuntimeSource()
     let localRuntime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntimeLocalIterate.swift",
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeLocalIterate.swift",
         encoding: .utf8
     )
 
@@ -1823,7 +1799,7 @@ func benchmarkLocalSubmitModeUsesLongLocalBenchmarkAndPrintsScore() throws {
     #expect(cli.contains("let timingRepeats = localSubmit ? MLXFastConstants.localSubmitBenchmarkRepeats : 1"))
     #expect(cli.contains("timingRepeats: timingRepeats"))
     #expect(cli.contains("let runtime = localSubmit ? \"swift-local-submit\" : \"swift-local-iterate\""))
-    #expect(cli.contains("DeepSeekRuntime.localIterate("))
+    #expect(cli.contains("GemmaRuntime.localIterate("))
     #expect(cli.contains("emitScorePayloadToStdout(payload)"))
     #expect(localRuntime.contains("runtime: runtime"))
     #expect(localRuntime.contains("modeName: String"))
@@ -1845,11 +1821,11 @@ func benchmarkLocalIterateModeUsesPublicFixtureAndNonOfficialScore() throws {
         encoding: .utf8
     )
     let runtime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntimeLocalIterate.swift",
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeLocalIterate.swift",
         encoding: .utf8
     )
     let options = try String(
-        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntime.swift",
         encoding: .utf8
     )
 
@@ -1858,7 +1834,7 @@ func benchmarkLocalIterateModeUsesPublicFixtureAndNonOfficialScore() throws {
     #expect(script.contains("GOLDEN_PATH=\"correctness_prompts/public_longcopy_gate_english_512_256.json\""))
     #expect(constants.contains("public static let localIterateBenchmarkDecodeSteps = 16"))
     #expect(cli.contains("flagOptions: [\"--local-submit\", \"--local-iterate\"]"))
-    #expect(cli.contains("DeepSeekRuntime.localIterate("))
+    #expect(cli.contains("GemmaRuntime.localIterate("))
     #expect(cli.contains("MLXFastConstants.defaultLocalIterateScorePath"))
     #expect(runtime.contains("runLocalIterateCheckedTimingWithWorker("))
     #expect(runtime.contains("includes_seed_prefill=true"))
@@ -2027,7 +2003,7 @@ func localIterateStreamsLiveNumbersDuringTheRun() throws {
     // score, heartbeats during long silent forwards, an immediate (redacted)
     // token-mismatch report, and a final summary block.
     let runtime = try String(
-        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntimeLocalIterate.swift",
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeLocalIterate.swift",
         encoding: .utf8
     )
 
@@ -2041,10 +2017,10 @@ func localIterateStreamsLiveNumbersDuringTheRun() throws {
     #expect(runtime.contains("projected_decode_seconds_per_token="))
     #expect(runtime.contains("projected_score="))
     #expect(runtime.contains("decode_eta_seconds="))
-    #expect(runtime.contains("expert_gb_per_token="))
-    #expect(runtime.contains("expert_hit_rate="))
-    // Live expert numbers cover the decode window in both timing paths.
-    #expect(runtime.components(separatedBy: "decodeWindowHitRate: expertWindowHitRate(").count >= 3)
+    // The RAM-resident dense runtime has no expert-streaming machinery, so
+    // the live decode status no longer reports expert bandwidth/hit-rate.
+    #expect(!runtime.contains("expert_gb_per_token="))
+    #expect(!runtime.contains("expert_hit_rate="))
     #expect(runtime.contains("emitLocalIterateSummary(modeName: modeName, timing: timing, progress: progress)"))
     // Baseline constants are printed up front so live speedups have context.
     #expect(runtime.contains("official-runner constants; local speedups are directional"))
@@ -2169,11 +2145,11 @@ func localModesForwardWorkerStderrLiveButOfficialRunsDoNot() throws {
         encoding: .utf8
     )
     let worker = try String(
-        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntimeWorker.swift",
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeWorker.swift",
         encoding: .utf8
     )
     let options = try String(
-        contentsOfFile: "Sources/MLXFastHarness/DeepSeekRuntime.swift",
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntime.swift",
         encoding: .utf8
     )
 
@@ -2520,12 +2496,12 @@ func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
     let refWeights = root.appendingPathComponent("reference_weights")
     try FileManager.default.createDirectory(at: refWeights, withIntermediateDirectories: true)
     try FileManager.default.createSymbolicLink(
-        atPath: refWeights.appendingPathComponent("DeepSeek-V4-Flash-4bit").path,
+        atPath: refWeights.appendingPathComponent("gemma-4-31b-4bit").path,
         withDestinationPath: root.appendingPathComponent("does-not-exist").path
     )
 
     // A real cache directory holding the checkpoint.
-    let cache = root.appendingPathComponent("hfcache/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main")
+    let cache = root.appendingPathComponent("hfcache/models--mlx-community--gemma-4-31b-4bit/snapshots/main")
     try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
     try "{}".write(to: cache.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
 
@@ -2595,7 +2571,7 @@ func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
     let recorded = (try? String(contentsOf: reflog, encoding: .utf8)) ?? ""
     // The transform was handed the real cache dir, not the broken symlink.
     #expect(recorded.contains(cache.path))
-    #expect(!recorded.contains("reference_weights/DeepSeek-V4-Flash-4bit"))
+    #expect(!recorded.contains("reference_weights/gemma-4-31b-4bit"))
 }
 
 @Test
@@ -2879,12 +2855,12 @@ func staticReviewFailsClosedOnSelfContradictoryPassedTrueWithHighSeverity() thro
     #expect(crossCheckBlock.contains("passed=\"false\""))
 }
 
-// DeepSeekRuntime was split across DeepSeekRuntime*.swift; concatenate them so
+// GemmaRuntime was split across GemmaRuntime*.swift; concatenate them so
 // source-level assertions stay agnostic to which split file the code lives in.
 private func harnessRuntimeSource() throws -> String {
     let directory = "Sources/MLXFastHarness"
     let files = try FileManager.default.contentsOfDirectory(atPath: directory)
-        .filter { $0.hasPrefix("DeepSeekRuntime") && $0.hasSuffix(".swift") }
+        .filter { $0.hasPrefix("GemmaRuntime") && $0.hasSuffix(".swift") }
         .sorted()
     return try files
         .map { try String(contentsOfFile: "\(directory)/\($0)", encoding: .utf8) }

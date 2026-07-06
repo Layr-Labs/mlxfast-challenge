@@ -6,13 +6,13 @@ import Testing
 @testable import MLXFastTransform
 
 @Test
-func transformCopiesDenseTensorsAndWritesExpertManifest() throws {
+func transformSelectsTextTowerTensorsAndDropsVisionTensors() throws {
     let root = try temporaryDirectory()
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
 
-    try #"{"num_hidden_layers":43}"#.write(
+    try referenceConfigJSON().write(
         to: reference.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
@@ -23,22 +23,25 @@ func transformCopiesDenseTensorsAndWritesExpertManifest() throws {
         encoding: .utf8
     )
 
-    let denseName = "model.layers.0.self_attn.q_proj.weight"
-    let expertName = "model.layers.0.ffn.switch_mlp.gate_proj.weight"
+    let textName = "language_model.model.layers.0.self_attn.q_proj.weight"
+    let visionName = "vision_tower.encoder.layers.0.self_attn.q_proj.weight"
+    let embedVisionName = "embed_vision.embedding_projection.weight"
     let shardName = "model-00001-of-00001.safetensors"
     try writeSafetensors(
         reference.appendingPathComponent(shardName),
         tensors: [
-            TensorFixture(name: denseName, dtype: "U8", shape: [4], data: Data([1, 2, 3, 4])),
-            TensorFixture(name: expertName, dtype: "U8", shape: [3], data: Data([9, 8, 7])),
+            TensorFixture(name: textName, dtype: "U8", shape: [4], data: Data([1, 2, 3, 4])),
+            TensorFixture(name: visionName, dtype: "U8", shape: [3], data: Data([9, 8, 7])),
+            TensorFixture(name: embedVisionName, dtype: "U8", shape: [2], data: Data([5, 6])),
         ]
     )
     try """
     {
-      "metadata": {"total_size": 7},
+      "metadata": {"total_size": 9},
       "weight_map": {
-        "\(denseName)": "\(shardName)",
-        "\(expertName)": "\(shardName)"
+        "\(textName)": "\(shardName)",
+        "\(visionName)": "\(shardName)",
+        "\(embedVisionName)": "\(shardName)"
       }
     }
     """.write(
@@ -52,35 +55,90 @@ func transformCopiesDenseTensorsAndWritesExpertManifest() throws {
     )
 
     #expect(report.denseTensorCount == 1)
-    #expect(report.expertTensorCount == 1)
+    #expect(report.denseShardCount == 1)
     #expect(FileManager.default.fileExists(atPath: output.appendingPathComponent("config.json").path))
     #expect(FileManager.default.fileExists(atPath: output.appendingPathComponent("tokenizer.json").path))
+    #expect(!FileManager.default.fileExists(atPath: output.appendingPathComponent("experts").path))
 
     let outputShard = output.appendingPathComponent(shardName)
     let outputHeader = try Safetensors.readHeader(outputShard)
-    #expect(outputHeader.tensors.keys.sorted() == [denseName])
-    #expect(try tensorBytes(outputShard, header: outputHeader, name: denseName) == Data([1, 2, 3, 4]))
+    #expect(outputHeader.tensors.keys.sorted() == [textName])
+    #expect(try tensorBytes(outputShard, header: outputHeader, name: textName) == Data([1, 2, 3, 4]))
 
     let strippedIndexData = try Data(
         contentsOf: output.appendingPathComponent("model.safetensors.index.json")
     )
     let strippedIndex = try JSONSerialization.jsonObject(with: strippedIndexData) as? [String: Any]
     let weightMap = try #require(strippedIndex?["weight_map"] as? [String: String])
-    #expect(weightMap == [denseName: shardName])
+    #expect(weightMap == [textName: shardName])
+}
 
-    let manifestData = try Data(contentsOf: output.appendingPathComponent("experts/manifest.json"))
-    let manifest = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any]
-    let records = try #require(manifest?["expert_tensors"] as? [[String: Any]])
-    #expect(records.count == 1)
-    #expect(records[0]["name"] as? String == expertName)
-    #expect(records[0]["shard"] as? String == shardName)
-    #expect(records[0]["byte_length"] as? Int == 3)
-
-    let bank = try ExpertSlotBank(
-        manifestPath: output.appendingPathComponent("experts/manifest.json").path,
-        capacity: 1
+@Test
+func transformWritesFlattenedRuntimeConfigFromTextConfig() throws {
+    let root = try temporaryDirectory()
+    let reference = root.appendingPathComponent("reference", isDirectory: true)
+    let output = root.appendingPathComponent("weights", isDirectory: true)
+    try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
+    try referenceConfigJSON().write(
+        to: reference.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
     )
-    #expect(try bank.tensorBytes(named: expertName) == Data([9, 8, 7]))
+
+    let textName = "language_model.model.embed_tokens.weight"
+    let shardName = "model-00001-of-00001.safetensors"
+    try writeSafetensors(
+        reference.appendingPathComponent(shardName),
+        tensors: [TensorFixture(name: textName, dtype: "U8", shape: [1], data: Data([1]))]
+    )
+    try writeCheckpointIndex(
+        reference.appendingPathComponent("model.safetensors.index.json"),
+        weightMap: [textName: shardName]
+    )
+
+    _ = try SwiftTransform.run(
+        TransformOptions(referencePath: reference.path, outputPath: output.path)
+    )
+
+    let configData = try Data(contentsOf: output.appendingPathComponent("config.json"))
+    let config = try JSONSerialization.jsonObject(with: configData) as? [String: Any]
+    #expect(config?["num_hidden_layers"] as? Int == MLXFastConstants.numHiddenLayers)
+    #expect(config?["vocab_size"] as? Int == MLXFastConstants.vocabSize)
+    #expect(config?["text_config"] == nil)
+    let quantization = try #require(config?["quantization"] as? [String: Any])
+    #expect(quantization["group_size"] as? Int == 64)
+    #expect(quantization["bits"] as? Int == 4)
+}
+
+@Test
+func transformRejectsCheckpointWithoutTextTowerTensorsBeforeCreatingOutput() throws {
+    let root = try temporaryDirectory()
+    let reference = root.appendingPathComponent("reference", isDirectory: true)
+    let output = root.appendingPathComponent("weights", isDirectory: true)
+    try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
+    try referenceConfigJSON().write(
+        to: reference.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let visionName = "vision_tower.encoder.layers.0.self_attn.q_proj.weight"
+    let shardName = "model-00001-of-00001.safetensors"
+    try writeSafetensors(
+        reference.appendingPathComponent(shardName),
+        tensors: [TensorFixture(name: visionName, dtype: "U8", shape: [2], data: Data([1, 2]))]
+    )
+    try writeCheckpointIndex(
+        reference.appendingPathComponent("model.safetensors.index.json"),
+        weightMap: [visionName: shardName]
+    )
+
+    #expect(throws: MLXFastError.self) {
+        _ = try SwiftTransform.run(
+            TransformOptions(referencePath: reference.path, outputPath: output.path)
+        )
+    }
+    #expect(!FileManager.default.fileExists(atPath: output.path))
 }
 
 @Test
@@ -122,8 +180,8 @@ func transformVerifierRejectsOutputThatDiffersFromFreshTransformRun() throws {
     _ = try SwiftTransform.run(
         TransformOptions(referencePath: fixture.reference.path, outputPath: fixture.output.path)
     )
-    try #"{"changed":true}"#.write(
-        to: fixture.output.appendingPathComponent("config.json"),
+    try "changed".write(
+        to: fixture.output.appendingPathComponent("tokenizer.json"),
         atomically: true,
         encoding: .utf8
     )
@@ -187,11 +245,15 @@ func transformRejectsUnsupportedIndexShardBeforeCreatingOutput() throws {
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try writeReferenceConfig(reference)
+    try referenceConfigJSON().write(
+        to: reference.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
     try writeCheckpointIndex(
         reference.appendingPathComponent("model.safetensors.index.json"),
         weightMap: [
-            "model.layers.0.self_attn.q_proj.weight": "pytorch_model.bin",
+            "language_model.model.layers.0.self_attn.q_proj.weight": "pytorch_model.bin",
         ]
     )
 
@@ -209,11 +271,15 @@ func transformRejectsUnsafeIndexShardBeforeCreatingOutput() throws {
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try writeReferenceConfig(reference)
+    try referenceConfigJSON().write(
+        to: reference.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
     try writeCheckpointIndex(
         reference.appendingPathComponent("model.safetensors.index.json"),
         weightMap: [
-            "model.layers.0.self_attn.q_proj.weight": "../model-00001.safetensors",
+            "language_model.model.layers.0.self_attn.q_proj.weight": "../model-00001.safetensors",
         ]
     )
 
@@ -231,50 +297,23 @@ func transformRejectsIndexTensorMissingFromShardHeaderBeforeCreatingOutput() thr
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try writeReferenceConfig(reference)
+    try referenceConfigJSON().write(
+        to: reference.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
 
     let shardName = "model-00001-of-00001.safetensors"
     try writeSafetensors(
         reference.appendingPathComponent(shardName),
         tensors: [
-            TensorFixture(name: "model.layers.0.self_attn.k_proj.weight", dtype: "U8", shape: [2], data: Data([1, 2])),
+            TensorFixture(name: "language_model.model.layers.0.self_attn.k_proj.weight", dtype: "U8", shape: [2], data: Data([1, 2])),
         ]
     )
     try writeCheckpointIndex(
         reference.appendingPathComponent("model.safetensors.index.json"),
         weightMap: [
-            "model.layers.0.self_attn.q_proj.weight": shardName,
-        ]
-    )
-
-    #expect(throws: MLXFastError.self) {
-        _ = try SwiftTransform.run(
-            TransformOptions(referencePath: reference.path, outputPath: output.path)
-        )
-    }
-    #expect(!FileManager.default.fileExists(atPath: output.path))
-}
-
-@Test
-func transformRejectsCheckpointWithoutRoutedExpertsBeforeCreatingOutput() throws {
-    let root = try temporaryDirectory()
-    let reference = root.appendingPathComponent("reference", isDirectory: true)
-    let output = root.appendingPathComponent("weights", isDirectory: true)
-    try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try writeReferenceConfig(reference)
-
-    let denseName = "model.layers.0.self_attn.q_proj.weight"
-    let shardName = "model-00001-of-00001.safetensors"
-    try writeSafetensors(
-        reference.appendingPathComponent(shardName),
-        tensors: [
-            TensorFixture(name: denseName, dtype: "U8", shape: [2], data: Data([1, 2])),
-        ]
-    )
-    try writeCheckpointIndex(
-        reference.appendingPathComponent("model.safetensors.index.json"),
-        weightMap: [
-            denseName: shardName,
+            "language_model.model.layers.0.self_attn.q_proj.weight": shardName,
         ]
     )
 
@@ -293,25 +332,29 @@ func transformAcceptsSparseShardLargerThanInt32() throws {
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try writeReferenceConfig(reference)
+    try referenceConfigJSON().write(
+        to: reference.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
 
-    let denseName = "model.layers.0.self_attn.q_proj.weight"
-    let expertName = "model.layers.0.ffn.switch_mlp.gate_proj.weight"
+    let textName = "language_model.model.layers.0.self_attn.q_proj.weight"
+    let visionName = "vision_tower.encoder.layers.0.self_attn.q_proj.weight"
     let shardName = "model-00001-of-00001.safetensors"
     let shard = reference.appendingPathComponent(shardName)
     try writeSafetensors(
         shard,
         tensors: [
-            TensorFixture(name: denseName, dtype: "U8", shape: [1], data: Data([4])),
-            TensorFixture(name: expertName, dtype: "U8", shape: [1], data: Data([8])),
+            TensorFixture(name: textName, dtype: "U8", shape: [1], data: Data([4])),
+            TensorFixture(name: visionName, dtype: "U8", shape: [1], data: Data([8])),
         ]
     )
     try truncateFile(shard, toByteCount: Int64(Int32.max) + 1024)
     try writeCheckpointIndex(
         reference.appendingPathComponent("model.safetensors.index.json"),
         weightMap: [
-            denseName: shardName,
-            expertName: shardName,
+            textName: shardName,
+            visionName: shardName,
         ]
     )
 
@@ -320,7 +363,6 @@ func transformAcceptsSparseShardLargerThanInt32() throws {
     )
 
     #expect(report.denseTensorCount == 1)
-    #expect(report.expertTensorCount == 1)
 }
 
 private struct TensorFixture {
@@ -341,40 +383,49 @@ private func writeTransformFixture() throws -> TransformFixturePaths {
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try writeReferenceConfig(reference)
+    try referenceConfigJSON().write(
+        to: reference.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
     try #"{"tokenizer":"fixture"}"#.write(
         to: reference.appendingPathComponent("tokenizer.json"),
         atomically: true,
         encoding: .utf8
     )
 
-    let denseName = "model.layers.0.self_attn.q_proj.weight"
-    let expertName = "model.layers.0.ffn.switch_mlp.gate_proj.weight"
+    let textName = "language_model.model.layers.0.self_attn.q_proj.weight"
+    let visionName = "vision_tower.encoder.layers.0.self_attn.q_proj.weight"
     let shardName = "model-00001-of-00001.safetensors"
     try writeSafetensors(
         reference.appendingPathComponent(shardName),
         tensors: [
-            TensorFixture(name: denseName, dtype: "U8", shape: [4], data: Data([1, 2, 3, 4])),
-            TensorFixture(name: expertName, dtype: "U8", shape: [3], data: Data([9, 8, 7])),
+            TensorFixture(name: textName, dtype: "U8", shape: [4], data: Data([1, 2, 3, 4])),
+            TensorFixture(name: visionName, dtype: "U8", shape: [3], data: Data([9, 8, 7])),
         ]
     )
     try writeCheckpointIndex(
         reference.appendingPathComponent("model.safetensors.index.json"),
         weightMap: [
-            denseName: shardName,
-            expertName: shardName,
+            textName: shardName,
+            visionName: shardName,
         ]
     )
 
     return TransformFixturePaths(root: root, reference: reference, output: output)
 }
 
-private func writeReferenceConfig(_ reference: URL) throws {
-    try #"{"num_hidden_layers":43}"#.write(
-        to: reference.appendingPathComponent("config.json"),
-        atomically: true,
-        encoding: .utf8
-    )
+private func referenceConfigJSON() -> String {
+    """
+    {
+      "text_config": {
+        "num_hidden_layers": \(MLXFastConstants.numHiddenLayers),
+        "vocab_size": \(MLXFastConstants.vocabSize),
+        "hidden_size": \(MLXFastConstants.hiddenSize)
+      },
+      "quantization": {"group_size": 64, "bits": 4, "mode": "affine"}
+    }
+    """
 }
 
 private func writeCheckpointIndex(_ path: URL, weightMap: [String: String]) throws {

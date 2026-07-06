@@ -1,9 +1,11 @@
-# mlxfast — DeepSeek V4 Flash
+# mlxfast — Gemma 4 31B 4-bit
 
-A benchmark arena for memory-bandwidth-optimal LLM inference on Apple Silicon.
-Run DeepSeek V4 Flash without loading all 256 experts into RAM — and beat the baseline score.
+A benchmark arena for compute-optimal LLM inference on Apple Silicon.
+Run Gemma 4 31B (dense, 4-bit, text tower only) fully RAM-resident — and beat
+the baseline score.
 
-See [TASK.md](TASK.md) for the full problem statement, scoring formula, and approach space.
+See [TASK.md](TASK.md) for the full problem statement, scoring formula, and
+approach space.
 
 ## Quickstart
 
@@ -11,11 +13,11 @@ See [TASK.md](TASK.md) for the full problem statement, scoring formula, and appr
 # Check local tools, build the Swift harness/MLX metallib, and fetch weights if needed
 ./setup.sh
 
-# Optional: split dense weights into weights/ and write the expert streaming
-# manifest. setup.sh prints this command with the exact reference path it used.
+# Transform the reference checkpoint into weights/. setup.sh prints this
+# command with the exact reference path it used.
 MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
   .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
-  --reference .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main \
+  --reference .cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main \
   --output weights
 
 # Run the checked-in public correctness gate.
@@ -46,6 +48,13 @@ MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
 # score.json instead of a ranked score.
 ```
 
+> **Correctness fixtures are stale.** The checked-in prompt/golden fixtures
+> under `correctness_prompts/` were tokenized and generated against the
+> previous DeepSeek V4 Flash model. They MUST be regenerated against the
+> Gemma 4 31B 4-bit reference before local correctness can meaningfully pass;
+> see [TASK.md](TASK.md) for details. Fixture JSON files themselves are not
+> modified as part of this migration.
+
 The benchmark writes `score.json` in the format consumed by Darkbloom.
 `score.json` is a generated local output and is not tracked. Public
 correctness-only workflow runs use the checked-in
@@ -57,23 +66,23 @@ set with `MLXFAST_CORRECTNESS_GOLDEN_PATH=/path/to/correctness_golden.json`.
 which record the score file hash, golden hash, transformed `weights/` hash, and
 transform source hash for run auditing.
 
-Full model setup needs a large local or mounted SSD. The reference checkpoint is
-`mlx-community/DeepSeek-V4-Flash-4bit`, with 33 safetensors shards totaling about
-141 GiB. `setup.sh` downloads the checkpoint from the fast Darkbloom/R2 mirror by
+Full model setup needs a moderate local SSD. The reference checkpoint is
+`mlx-community/gemma-4-31b-4bit`, with 4 safetensors shards totaling about
+18.4 GB. `setup.sh` downloads the checkpoint directly from Hugging Face by
 default into a repo-local Hugging Face-style cache under
-`.cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main/`.
-It verifies cached files against `fixtures/reference_deepseek_v4_flash_4bit.sha256`
+`.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main/`.
+It verifies cached files against `fixtures/reference_gemma_4_31b_4bit.sha256`
 and redownloads only files that are missing, truncated, or hash-mismatched. A
-compatibility symlink is created at `reference_weights/DeepSeek-V4-Flash-4bit`
+compatibility symlink is created at `reference_weights/gemma-4-31b-4bit`
 for older commands, but current setup and CI pass the canonical cache directory
 to transform explicitly. The downloader uses resumable `curl` requests, prints
-numbered shard progress with elapsed time, and checks for at least 170 GiB free
+numbered shard progress with elapsed time, and checks for at least 40 GiB free
 by default. After a full SHA-256 verification, setup writes
 `.mlxfast-reference-cache.lock` next to the checkpoint; later setup runs use
-cheap size/mtime checks against that lock and skip the full 141 GiB hash pass
+cheap size/mtime checks against that lock and skip the full hash pass
 when the cache is unchanged. Use
 `MLXFAST_REFERENCE_CACHE_DIR=/Volumes/ssd/hf-cache/.../snapshots/main` or
-`MLXFAST_REFERENCE_DIR=/Volumes/ssd/DeepSeek-V4-Flash-4bit` to point at a larger
+`MLXFAST_REFERENCE_DIR=/Volumes/ssd/gemma-4-31b-4bit` to point at a larger
 volume, or `MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh` when the checkpoint will
 be supplied separately. If you use a custom cache path, either copy the exact
 transform command printed by `setup.sh` or set `MLXFAST_REFERENCE_DIR` before
@@ -84,13 +93,13 @@ explicit CLI flags take precedence. For `benchmark.sh`, use those `MLXFAST_*`
 environment variables for path overrides; pass `--weights`, `--golden`, and
 `--score-path` only to `.build/release/mlxfast-swift benchmark` directly. Set
 `MLXFAST_REFERENCE_BASE_URL` to use
-another HTTP checkpoint prefix, including Hugging Face. Run `./setup.sh --help`
+another HTTP checkpoint prefix. Run `./setup.sh --help`
 for the full local setup knobs.
 
 For manual GitHub Actions benchmark runs, dispatch `benchmark.yml` on the
 trusted repository workflow. The workflow uses the protected
-`MLXFAST_REFERENCE_BASE_URL` secret when present, otherwise the fixed Darkbloom
-reference mirror. It downloads the reference checkpoint into the same
+`MLXFAST_REFERENCE_BASE_URL` secret when present, otherwise the public Hugging
+Face mirror. It downloads the reference checkpoint into the same
 repo-local Hugging Face-style cache path used by local setup, passes that path
 explicitly to the offline transform, then prepares the correctness golden after
 transform completes. Correctness-only workflow runs use the checked-in public
@@ -116,8 +125,9 @@ requires the `ORG_ANTHROPIC_API_KEY` repository secret. The score artifact recor
 only aggregate semantic counts and the judge model name; prompts, references,
 candidate answers, and judge text stay in the private runner directory.
 The private workflow treats semantic GPQA as a hard gate with a 3/5 threshold,
-calibrated to the unmodified DeepSeek V4 Flash baseline rather than to
-better-than-baseline GPQA answer quality.
+calibrated to an unmodified Gemma 4 31B 4-bit baseline once that baseline is
+recalibrated (see TASK.md) rather than to better-than-baseline GPQA answer
+quality.
 When dispatched with `run_benchmark=true`, the workflow fans out across 5
 independent machines instead of running everything on one: three
 `correctness-slice-N` jobs each check one `range_N`-defined slice of the
@@ -141,19 +151,26 @@ the private prompt and artifact handling model.
 
 ## Why this challenge exists
 
-DeepSeek V4 Flash has 256 routed experts per layer, 6 activated per token.
-The checkpoint is too large to keep fully resident on typical Apple Silicon
-machines. The baseline ships with SSD streaming: expert tensors stay on disk and
-only the routed tensors needed for the current forward pass are materialized.
+Gemma 4 31B is a dense (non-MoE) text+vision model; only the text tower is in
+scope here. In 4-bit the text tower is about 17 GB, small enough to load
+entirely into unified memory once at process startup on the official ≥256 GB
+Apple M3 Ultra runner (and on any local machine with enough RAM). There is no
+weight streaming of any kind: the whole model is RAM-resident before the first
+scored forward pass runs.
 
-That baseline is functional but naive. Expert reads block the forward pass,
-there is no prefetching, no cross-layer reuse, and the weights are stored in
-their original 4-bit form. Every one of these is an optimisation target.
-The generated `weights/` tree is expected to stay small: it is a runtime
-artifact overlay on top of the frozen reference checkpoint, not a second full
-model copy. Submissions may change both the Swift transform and Swift runtime
-to adjust metadata, caching, or streaming strategy, as long as the generated
-runnable artifacts pass the hidden correctness and benchmark checks.
+That does not mean there is nothing left to optimize. Attention alternates
+five sliding-window layers (1024-token window, GQA with 16 KV heads) with one
+full-attention layer per block (GQA with 4 KV heads, a shared K/V projection,
+and a partial-rotation "proportional" RoPE), every projection is affine 4-bit
+quantized (group size 64), and the whole forward pass runs through MLX's
+kernel scheduler on every decode step. Kernel selection, quantized matmul
+dispatch, KV-cache handling, attention masking, and MLX graph/scheduling
+overhead are all optimisation targets. The generated `weights/` tree is
+expected to stay small: it is a runtime artifact overlay on top of the frozen
+reference checkpoint (a straight text-tensor subset plus a runtime-authored
+`config.json`), not a second full model copy. Submissions may change both the
+Swift transform and Swift runtime, as long as the generated runnable artifacts
+pass the hidden correctness and benchmark checks.
 
 ## The modifiable surface
 
@@ -163,7 +180,7 @@ in scope. Submissions should focus on the Swift targets listed in
 
 | Path | What it controls |
 |---|---|
-| `Sources/MLXFastModel/` | DeepSeek V4 Flash runtime, MLX Swift array bridge, dense/expert loading, SSD streaming, decode/prefill logic. **Primary target.** |
+| `Sources/MLXFastModel/` | Gemma 4 31B 4-bit runtime, MLX Swift array bridge, dense weight loading, attention/KV-cache/decode/prefill logic. **Primary target.** |
 | `Sources/MLXFastTransform/` | Offline weight transform from frozen reference safetensors into benchmark-ready `weights/`. |
 
 The repository is Swift-only: setup, transform, correctness, and benchmark all
@@ -180,7 +197,7 @@ benchmark, preflight, verify-transform) and no longer logs in or uploads.
 mlxfast login <api-key> --api https://yukon-api.fly.dev
 mlxfast clone <benchmark-id-or-name>     # fresh checkout; an existing repo auto-links by its git remote
 mlxfast submit --model "Claude Opus 4.8" \
-  --note "Changed expert streaming prefetch policy."
+  --note "Optimized quantized matmul dispatch for the sliding-window layers."
 mlxfast submissions
 ```
 
@@ -216,12 +233,14 @@ have to wait for the final JSON: the official baseline constants up front,
 prefill seconds-per-token and speedup the moment the measured prefill forward
 finishes, the decode seed-prefill charge, and a running line per checked decode
 token with the last-step latency, an ETA for the remaining decode tokens,
-projected charged decode seconds-per-token, projected decode speedup, a
-projected score under the official formula, and live expert-streaming numbers
-for the decode window (GB read per token and cache hit rate). Long silent
-phases (weights digest, prefill forward, decode seed prefill) print a heartbeat
-every 10 seconds, and the first teacher-forced token mismatch is reported
-immediately (token values stay in the score JSON only).
+projected charged decode seconds-per-token, projected decode speedup, and a
+projected score under the official formula. There is no weight streaming in
+this model, so there are no expert-bandwidth/cache-hit-rate live fields to
+report; `bandwidth_gb_per_token` is always `0` with
+`bandwidth_source=ram_resident_model`. Long silent phases (weights digest,
+prefill forward, decode seed prefill) print a heartbeat every 10 seconds, and
+the first teacher-forced token mismatch is reported immediately (token values
+stay in the score JSON only).
 
 Local modes also forward the runtime worker's stderr live with an
 `mlxfast-worker:` prefix, so debug prints added to model code under
@@ -260,17 +279,23 @@ prefill_speedup >= 0.95
 
 The floor prevents a submission from sacrificing one serving phase badly to
 improve the other. The exact baseline timings are emitted in each `score.json`
-and kept in `MLXFastConstants` after trusted Blacksmith calibration.
-On the current Blacksmith M4 baseline, that means decode must be at most
+and kept in `MLXFastConstants`. **Those constants are currently stale
+DeepSeek-V4-Flash-era placeholders and MUST be recalibrated against a trusted
+Gemma 4 31B baseline run on the official Blacksmith M3 Ultra hardware before
+ranked scoring is meaningful** -- see TASK.md. Until recalibration, the
+paired-baseline (same-session measured reference) and per-prompt golden
+baseline paths take precedence over the constants.
+On the stale (pre-recalibration) constants, that means decode must be at most
 `3.8280590145312505` seconds/token and prefill must be at most
-`0.18242698079358555` seconds/token.
+`0.18242698079358555` seconds/token; these thresholds will change once the
+Gemma 4 baseline is recalibrated.
 For scoring, decode is trusted parent wall-clock time for decode setup plus the
 checked decode-token window, not worker-reported per-step time. That charges
 prompt-specific seed prefill to the decode phase so submitted model code cannot
 hide speculative decode work before the timer starts.
-The harness records `bandwidth_source=trusted_core_expert_slot_bank_reads` and
-derives `bandwidth_gb_per_token` from trusted-core expert slot-bank file bytes
-during the decode window. Bandwidth, RAM, and expert-read metrics are reported
+The whole model is RAM-resident with no weight streaming, so the harness
+records `bandwidth_source=ram_resident_model` and reports
+`bandwidth_gb_per_token=0`. RAM and phase-timing metrics are still reported
 for operator review and future guardrails; they are not primary score factors.
 Correctness is a hard gate. See TASK.md for the full correctness specification.
 The official run times the benchmark before correctness so the correctness gate
@@ -287,35 +312,36 @@ teacher-forced decode tokens in one continuous trajectory, writes
 `score.json`, and also leaves `score` null because official ranking still
 requires the hidden benchmark oracle on the trusted runner.
 The score payload includes the official baseline timings, computed speedups,
-wall-clock phase timings, final process RSS, expert streaming counters, and
-transformed-weights digest.
+wall-clock phase timings, final process RSS, the (always-zero) expert
+streaming counters kept for schema stability, and transformed-weights digest.
 
 ## Architecture
 
 ```
 Sources/
   MLXFastCLI/                Swift command-line entrypoint
-  MLXFastCore/               score.json, golden cases, shared contracts
-  MLXFastTransform/          Swift offline weight transform
-  MLXFastModel/              editable DeepSeek V4 Flash Swift runtime
-  MLXFastHarness/            trusted correctness, golden, and benchmark runner
+  MLXFastCore/                score.json, golden cases, shared contracts
+  MLXFastTransform/           Swift offline weight transform
+  MLXFastModel/                editable Gemma 4 31B 4-bit Swift runtime
+  MLXFastHarness/             trusted correctness, golden, and benchmark runner
 weights/                     transformed weights (harness loads from here)
-  experts/
-    manifest.json            baseline byte ranges for streamed expert tensors
+  config.json                 runtime-authored text-tower config
+  model.safetensors.index.json
 .cache/huggingface/hub/...   canonical frozen 4-bit reference checkpoint cache
 reference_weights/...        compatibility symlink to the reference cache
-correctness_prompts/         public correctness prompt and checked-in golden
+correctness_prompts/         public correctness prompt and checked-in golden (stale; see TASK.md)
 correctness_golden.json      hidden benchmark correctness cases and token oracle
 score.json                   written after each benchmark run
 ```
 
-The baseline runtime loads dense/shared tensors from `weights/` and streams
-routed expert tensors from the frozen reference checkpoint named by
-`MLXFAST_REFERENCE_DIR`, falling back to the compatibility symlink when that
-environment variable is not set.
+The runtime loads every text-tower tensor from `weights/` into unified memory
+once at process init and keeps them resident for the process lifetime; there
+is no streaming path and no dependency on the frozen reference checkpoint at
+runtime (only the offline transform reads the reference checkpoint).
 
 The standard preflight/benchmark path enforces a default 25 GiB cap on the
-generated `weights/` tree before correctness or timing runs. Change it with
+generated `weights/` tree before correctness or timing runs (the text tower is
+about 17 GB, comfortably inside that cap). Change it with
 `MLXFAST_MAX_WEIGHTS_BYTES`; use `0`, `none`, or `unlimited` only for organizer
 debugging. For stricter organizer-side provenance, set
 `MLXFAST_VERIFY_TRANSFORM=1` when running `benchmark.sh`. That re-runs the
@@ -326,9 +352,13 @@ uses the same default cap and can also be changed with
 `mlxfast-swift verify-transform --max-bytes N`.
 
 The public correctness-only prompt and golden live in `correctness_prompts/`.
-Private prompt manifests and hidden benchmark golden files are not committed or
-generated by the benchmark workflow. In private benchmark CI, the normal path
-downloads the precomputed
+**These fixtures are stale**: they were tokenized and generated against the
+previous DeepSeek V4 Flash model, not Gemma 4. The fixture JSON files are not
+modified as part of this migration (see TASK.md for why and what regenerating
+them requires); local correctness runs will not pass until they are
+regenerated against the Gemma 4 reference. Private prompt manifests and hidden
+benchmark golden files are not committed or generated by the benchmark
+workflow. In private benchmark CI, the normal path downloads the precomputed
 `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`
 object from R2, then downloads
 `correctness_prompts/gpqa_reference_cases.json` and merges it into the local
@@ -369,7 +399,7 @@ tokenizer whitespace variants.
 
 ## Requirements
 
-- Apple Silicon Mac, 24 GB+ unified memory (M2 or newer)
+- Apple Silicon Mac, 32 GB+ unified memory recommended (M2 or newer)
 - macOS Sequoia or later
 - Swift 6 through Xcode or Xcode Command Line Tools
 - Xcode Metal Toolchain for `mlx.metallib`; `./setup.sh` tries

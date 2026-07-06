@@ -15,83 +15,100 @@ public struct TransformReport: Equatable {
     public let referencePath: String
     public let outputPath: String
     public let denseTensorCount: Int
-    public let expertTensorCount: Int
     public let denseShardCount: Int
-    public let manifestPath: String
+    public let configPath: String
+    public let indexPath: String
+
+    public init(
+        referencePath: String,
+        outputPath: String,
+        denseTensorCount: Int,
+        denseShardCount: Int,
+        configPath: String,
+        indexPath: String
+    ) {
+        self.referencePath = referencePath
+        self.outputPath = outputPath
+        self.denseTensorCount = denseTensorCount
+        self.denseShardCount = denseShardCount
+        self.configPath = configPath
+        self.indexPath = indexPath
+    }
 }
 
+/// Offline transform for the Gemma 4 31B 4-bit checkpoint: selects ONLY the
+/// text-tower tensors (the `language_model.` prefix in the source index),
+/// drops every vision/audio/multimodal-projector tensor, and rewrites the
+/// selected tensors into dense safetensors shard(s) plus a
+/// `model.safetensors.index.json` and a runtime-authored `config.json`
+/// (the flattened `text_config` fields the runtime needs, plus the
+/// checkpoint's quantization metadata). Text/audio/vision are the only kinds
+/// of tensors the reference checkpoint ships; there is no expert manifest --
+/// the whole selected tree is one flat set of dense tensors, matching how a
+/// single dense model (no MoE, no expert streaming) is loaded fully into RAM
+/// at runtime init.
 public enum SwiftTransform {
+    /// Tensor name prefix that marks a checkpoint tensor as part of the text
+    /// tower. Every other prefix (`vision_tower.`, `embed_vision.`,
+    /// `audio_tower.`, `multi_modal_projector.`, ...) is vision/audio/
+    /// multimodal-glue and is out of scope for this text-only challenge.
+    static let textTowerPrefix = "language_model."
+
     public static func run(_ options: TransformOptions) throws -> TransformReport {
         let referenceDirectory = try findReferenceDirectory(
             URL(fileURLWithPath: options.referencePath)
         )
         let outputDirectory = URL(fileURLWithPath: options.outputPath)
-        let expertsDirectory = outputDirectory.appendingPathComponent("experts", isDirectory: true)
 
         try requireFile(
             referenceDirectory.appendingPathComponent("config.json").path,
-            description: "DeepSeek V4 Flash reference config"
+            description: "Gemma 4 31B 4-bit reference config"
         )
 
         let index = try loadIndex(referenceDirectory)
         try validateCheckpointIndex(index, referenceDirectory: referenceDirectory)
-        let denseKeys = Set(index.weightMap.keys.filter { !isExpertKey($0) })
-        let expertKeys = Set(index.weightMap.keys.filter { isExpertKey($0) })
-        guard !denseKeys.isEmpty else {
-            throw MLXFastError.invalidInput("checkpoint index contains no dense tensors")
-        }
-        guard !expertKeys.isEmpty else {
-            throw MLXFastError.invalidInput("checkpoint index contains no routed expert tensors")
+        let textKeys = Set(index.weightMap.keys.filter(isTextTowerKey))
+        guard !textKeys.isEmpty else {
+            throw MLXFastError.invalidInput("checkpoint index contains no text-tower tensors")
         }
 
         try FileManager.default.createDirectory(
             at: outputDirectory,
             withIntermediateDirectories: true
         )
-        try FileManager.default.createDirectory(
-            at: expertsDirectory,
-            withIntermediateDirectories: true
-        )
 
-        let denseKeysByShard = Dictionary(grouping: denseKeys) { key in
+        let textKeysByShard = Dictionary(grouping: textKeys) { key in
             index.weightMap[key] ?? ""
         }
 
-        var copiedDenseTensors = 0
-        for shardName in denseKeysByShard.keys.sorted() {
+        var copiedTensors = 0
+        for shardName in textKeysByShard.keys.sorted() {
             let source = referenceDirectory.appendingPathComponent(shardName)
             let destination = outputDirectory.appendingPathComponent(shardName)
-            copiedDenseTensors += try Safetensors.copySubset(
+            copiedTensors += try Safetensors.copySubset(
                 from: source,
                 to: destination,
-                tensorNames: denseKeysByShard[shardName, default: []].sorted()
+                tensorNames: textKeysByShard[shardName, default: []].sorted()
             )
         }
 
-        try copyTokenizerAndConfigFiles(
-            from: referenceDirectory,
-            to: outputDirectory
-        )
-        try index.writeStripped(
-            to: outputDirectory.appendingPathComponent("model.safetensors.index.json"),
-            keeping: denseKeys
-        )
+        try copyTokenizerFiles(from: referenceDirectory, to: outputDirectory)
+        let indexPath = outputDirectory.appendingPathComponent("model.safetensors.index.json")
+        try index.writeStripped(to: indexPath, keeping: textKeys)
 
-        let manifestPath = expertsDirectory.appendingPathComponent("manifest.json")
-        try writeExpertManifest(
+        let configPath = outputDirectory.appendingPathComponent("config.json")
+        try writeRuntimeConfig(
             referenceDirectory: referenceDirectory,
-            manifestPath: manifestPath,
-            expertKeys: expertKeys,
-            index: index
+            configPath: configPath
         )
 
         return TransformReport(
             referencePath: referenceDirectory.path,
             outputPath: outputDirectory.path,
-            denseTensorCount: copiedDenseTensors,
-            expertTensorCount: expertKeys.count,
-            denseShardCount: denseKeysByShard.count,
-            manifestPath: manifestPath.path
+            denseTensorCount: copiedTensors,
+            denseShardCount: textKeysByShard.count,
+            configPath: configPath.path,
+            indexPath: indexPath.path
         )
     }
 
@@ -177,22 +194,21 @@ public enum SwiftTransform {
         }
 
         throw MLXFastError.missingFile(
-            "no config.json found under \(base.path); place the DeepSeek V4 Flash checkpoint there"
+            "no config.json found under \(base.path); place the Gemma 4 31B 4-bit checkpoint there"
         )
     }
 
-    static func isExpertKey(_ key: String) -> Bool {
-        (key.contains(".ffn.experts.") || key.contains(".ffn.switch_mlp."))
-            && !key.contains(".shared_experts.")
+    static func isTextTowerKey(_ key: String) -> Bool {
+        key.hasPrefix(textTowerPrefix)
     }
 
-    private static func copyTokenizerAndConfigFiles(from source: URL, to destination: URL) throws {
+    private static func copyTokenizerFiles(from source: URL, to destination: URL) throws {
         let files = try FileManager.default.contentsOfDirectory(
             at: source,
             includingPropertiesForKeys: [.isRegularFileKey]
         )
         for file in files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
-            if file.lastPathComponent == "model.safetensors.index.json" {
+            if file.lastPathComponent == "model.safetensors.index.json" || file.lastPathComponent == "config.json" {
                 continue
             }
             if shouldCopyMetadataFile(file) {
@@ -218,48 +234,35 @@ public enum SwiftTransform {
         }
     }
 
-    private static func writeExpertManifest(
-        referenceDirectory: URL,
-        manifestPath: URL,
-        expertKeys: Set<String>,
-        index: CheckpointIndex
-    ) throws {
-        var records: [[String: Any]] = []
-        let expertKeysByShard = Dictionary(grouping: expertKeys) { key in
-            index.weightMap[key] ?? ""
+    /// Writes the runtime's `config.json`: the source checkpoint's
+    /// `text_config` fields flattened to the top level (the exact schema
+    /// `Gemma4Config.load` reads), plus the checkpoint-wide `quantization`
+    /// block. The runtime controls this schema directly, so it carries only
+    /// what `Gemma4Config`/`Gemma4WeightLoader` actually need -- no vision or
+    /// audio config, no architecture/tokenizer metadata duplicated from
+    /// `tokenizer_config.json`.
+    private static func writeRuntimeConfig(referenceDirectory: URL, configPath: URL) throws {
+        let sourceConfigPath = referenceDirectory.appendingPathComponent("config.json")
+        let data = try Data(contentsOf: sourceConfigPath)
+        let object = try JSONSerialization.jsonObject(with: data)
+        guard let root = object as? [String: Any] else {
+            throw MLXFastError.invalidInput("reference config.json must be a JSON object")
+        }
+        guard let textConfig = root["text_config"] as? [String: Any] else {
+            throw MLXFastError.invalidInput("reference config.json is missing text_config")
         }
 
-        for shardName in expertKeysByShard.keys.sorted() {
-            let shardURL = referenceDirectory.appendingPathComponent(shardName)
-            let header = try Safetensors.readHeader(shardURL)
-            for key in expertKeysByShard[shardName, default: []].sorted() {
-                guard let info = header.tensors[key] else {
-                    throw MLXFastError.invalidInput(
-                        "expert tensor \(key) is listed in index but missing from \(shardName)"
-                    )
-                }
-                records.append([
-                    "name": key,
-                    "shard": shardName,
-                    "dtype": info.dtype,
-                    "shape": info.shape,
-                    "data_offsets": [info.dataStart, info.dataEnd],
-                    "byte_offset": Int(header.dataBaseOffset) + info.dataStart,
-                    "byte_length": info.byteCount,
-                ])
-            }
+        var runtimeConfig = textConfig
+        if let quantization = root["quantization"] {
+            runtimeConfig["quantization"] = quantization
+        } else if let quantizationConfig = root["quantization_config"] {
+            runtimeConfig["quantization"] = quantizationConfig
         }
 
-        let object: [String: Any] = [
-            "version": 1,
-            "source": "safetensors",
-            "reference_path": referenceDirectory.path,
-            "expert_tensors": records,
-        ]
-        let data = try JSONSerialization.data(
-            withJSONObject: object,
+        let output = try JSONSerialization.data(
+            withJSONObject: runtimeConfig,
             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         )
-        try data.write(to: manifestPath)
+        try output.write(to: configPath)
     }
 }

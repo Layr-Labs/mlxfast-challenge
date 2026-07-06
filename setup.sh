@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
-# Bootstrap system tools and build the Swift-only DeepSeek harness.
+# Bootstrap system tools and build the Swift-only Gemma 4 harness.
 set -euo pipefail
 
-REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/DeepSeek-V4-Flash-4bit}"
+REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/gemma-4-31b-4bit}"
 REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-main}"
 REFERENCE_CACHE_REPO_DIR="models--${REFERENCE_MODEL_REPO//\//--}"
 REFERENCE_CACHE_REVISION_DIR="${REFERENCE_REVISION//\//--}"
-DEFAULT_REFERENCE_BASE_URL="https://ds4.darkbloom.ai/deepseek-v4-flash-4bit"
+# No organizer-hosted mirror exists yet for this checkpoint (the previous
+# DeepSeek-era default pointed at a Darkbloom-hosted mirror); default straight
+# to the public Hugging Face repo. download_url_for_file appends
+# "?download=true" automatically for huggingface.co URLs so this resolves to
+# the raw LFS/Xet bytes.
+DEFAULT_REFERENCE_BASE_URL="https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main"
 REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}"
 REFERENCE_AUTH_HEADER="${MLXFAST_REFERENCE_AUTH_HEADER:-}"
 REFERENCE_APPEND_DOWNLOAD_QUERY="${MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY:-auto}"
-REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_deepseek_v4_flash_4bit.sha256}"
+REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_gemma_4_31b_4bit.sha256}"
 REFERENCE_HASH_VERIFY="${MLXFAST_REFERENCE_HASH_VERIFY:-1}"
 REFERENCE_POST_DOWNLOAD_FULL_VERIFY="${MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY:-1}"
-REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-170}"
+REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-40}"
 REFERENCE_DOWNLOAD_JOBS="${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-8}"
 SETUP_PARALLEL_METALLIB="${MLXFAST_SETUP_PARALLEL_METALLIB:-${MLXFAST_SETUP_PARALLEL_BUILD:-1}}"
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
 MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
-DEFAULT_REFERENCE_DIR="reference_weights/DeepSeek-V4-Flash-4bit"
+DEFAULT_REFERENCE_DIR="reference_weights/gemma-4-31b-4bit"
 DEFAULT_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}"
 DEFAULT_HF_HUB_CACHE="${MLXFAST_HF_HUB_CACHE:-${HF_HUB_CACHE:-${DEFAULT_HF_HOME}/hub}}"
 REFERENCE_CACHE_DIR="${MLXFAST_REFERENCE_CACHE_DIR:-${DEFAULT_HF_HUB_CACHE}/${REFERENCE_CACHE_REPO_DIR}/snapshots/${REFERENCE_CACHE_REVISION_DIR}}"
@@ -39,8 +44,8 @@ REFERENCE_REQUIRED_METADATA_FILES=(
 )
 REFERENCE_OPTIONAL_METADATA_FILES=(
   "README.md"
-  "chat_template.jinja"
   "generation_config.json"
+  "processor_config.json"
   "tokenizer.json"
   "tokenizer_config.json"
 )
@@ -50,7 +55,7 @@ print_help() {
 Usage: ./setup.sh
 
 Checks the local macOS/Apple Silicon toolchain, builds the Swift harness,
-builds mlx.metallib, and downloads the DeepSeek V4 Flash 4-bit reference
+builds mlx.metallib, and downloads the Gemma 4 31B 4-bit reference
 checkpoint when it is not already present.
 
 Important environment variables:

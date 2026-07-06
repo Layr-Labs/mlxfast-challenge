@@ -150,7 +150,6 @@ public enum BenchmarkPreflight {
         let requiredFiles = [
             ("\(weightsPath)/config.json", "transformed config"),
             ("\(weightsPath)/model.safetensors.index.json", "dense safetensors index"),
-            ("\(weightsPath)/experts/manifest.json", "expert manifest"),
             (goldenPath, "correctness golden file"),
         ]
         for (path, description) in requiredFiles {
@@ -170,20 +169,12 @@ public enum BenchmarkPreflight {
             }
             _ = try BenchmarkPrompt.plan(from: benchmark)
         }
-        let config = try DeepSeekConfig.load(from: weightsPath)
+        let config = try Gemma4Config.load(from: weightsPath)
 
         let denseStore = try DenseTensorStore(weightsPath: weightsPath)
         try denseStore.validateReadableByteRanges()
 
-        let expertBank = try ExpertSlotBank(
-            manifestPath: "\(weightsPath)/experts/manifest.json",
-            allowedReferenceRoots: allowedExpertReferenceRoots(
-                weightsPath: weightsPath,
-                environment: environment
-            )
-        )
-        try expertBank.validateReadableByteRanges()
-        try DeepSeekWeightLoader(denseStore: denseStore, expertBank: expertBank)
+        try Gemma4WeightLoader(denseStore: denseStore)
             .validateRequiredMetadata(config: config)
 
         return BenchmarkPreflightReport(
@@ -211,19 +202,6 @@ public enum BenchmarkPreflight {
             )
         }
         return value
-    }
-
-    private static func allowedExpertReferenceRoots(
-        weightsPath: String,
-        environment: [String: String]
-    ) -> [String] {
-        let referencePath = environment["MLXFAST_REFERENCE_DIR"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        var roots = [weightsPath]
-        roots.append(referencePath?.isEmpty == false ? referencePath! : MLXFastConstants.defaultReferencePath)
-        roots.append(MLXFastConstants.defaultReferenceCachePath)
-        var seen = Set<String>()
-        return roots.filter { seen.insert($0).inserted }
     }
 
     private static func transformedWeightsByteCount(
