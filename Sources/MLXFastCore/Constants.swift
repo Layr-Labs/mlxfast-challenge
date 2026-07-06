@@ -61,17 +61,21 @@ public enum MLXFastConstants {
     // and add minutes to the job -- keep zero warmup and one measured run.
     public static let benchmarkPrefillWarmupRuns = 0
     public static let benchmarkPrefillTimedRuns = 1
-    // STALE placeholders carried over from the previous challenge model era.
-    // These numeric values DO NOT reflect Gemma 4 31B 4-bit dense inference on
-    // the official runner. They MUST be recalibrated with a trusted Gemma
-    // baseline run (official Blacksmith M3 Ultra hardware) before any ranked
-    // scoring is meaningful.
-    // Until that recalibration lands, the paired-baseline (same-session
-    // measured reference) and per-prompt golden baseline paths -- both of
-    // which take precedence over these constants in the benchmark harness --
-    // cover the interim so a stale constant does not silently misprice a run.
-    public static let officialBaselinePrefillSecondsPerToken = 0.17330563175390626
-    public static let officialBaselineDecodeSecondsPerToken = 3.6366560638046876
+    // Official Gemma 4 31B 4-bit dense baseline, measured 2026-07-06 on the
+    // ranked Blacksmith runner class (blacksmith-12vcpu-macos-26) via
+    // gemma-baseline-timing-probe run 28809531890
+    // (https://github.com/Layr-Labs/mlxfast-challenge-dev/actions/runs/28809531890):
+    // the unmodified reference implementation at main commit
+    // eff7e7f2c85a5a6cef11110442ba4624a6ab3986 (the Gemma migration merge, the
+    // same commit the timing machine's paired-baseline ref pins), full
+    // official 128-step timing path under the official sandbox/worker posture.
+    // Supersedes the DeepSeek-era values (prefill 0.17330563175390626 /
+    // decode 3.6366560638046876). With paired-baseline measurement active,
+    // ranked speedups divide by the same-session measured reference; these
+    // constants keep three roles: local-mode scoring, the gates-only
+    // machine's placeholder timing, and the paired sanity-band anchor.
+    public static let officialBaselinePrefillSecondsPerToken = 0.01010573933984375
+    public static let officialBaselineDecodeSecondsPerToken = 0.131727461265625
     public static let scorePrefillWeight = 0.25
     public static let scoreDecodeWeight = 0.75
     public static let scorePrefillSpeedupFloor = 0.95

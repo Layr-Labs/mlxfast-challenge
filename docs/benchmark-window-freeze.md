@@ -67,22 +67,18 @@ same test:
 
 ## Current calibrated baseline
 
-Measured on the baseline reference under the current (single-seed) harness:
+Measured on the Gemma 4 31B 4-bit baseline reference (main commit
+`eff7e7f2c85a5a6cef11110442ba4624a6ab3986`, the migration merge and the
+timing machine's pinned paired-baseline ref) under the current (single-seed)
+harness, on the ranked Blacksmith runner class (`blacksmith-12vcpu-macos-26`)
+via `gemma-baseline-timing-probe` run 28809531890 on 2026-07-06:
 
-- `officialBaselineDecodeSecondsPerToken = 3.6366560638046876`
-  (recalibrated after the `decode_begin` warmup-forward removal).
-- `officialBaselinePrefillSecondsPerToken = 0.17330563175390626`
-  (prefill path unchanged; within single-shot noise of the prior value).
+- `officialBaselineDecodeSecondsPerToken = 0.131727461265625`
+- `officialBaselinePrefillSecondsPerToken = 0.01010573933984375`
 
-**Migration status:** these literals were measured against the previous
-challenge model (DeepSeek V4 Flash) and are stale placeholders for Gemma 4
-31B 4-bit — `Constants.swift` says the same. They must be recalibrated with
-a trusted Gemma baseline run on the official hardware, together with the
-pinned paired-baseline ref below; see item 5 of
-`docs/gemma-migration-r2-checklist.md`. Until then the paired-baseline and
-golden-carried baseline paths (which outrank the constants) cover the
-interim, and the constants' remaining roles (local-mode scoring, gates-only
-placeholder timing, sanity-band anchor) knowingly run on placeholder values.
+These supersede the DeepSeek V4 Flash-era values (decode
+3.6366560638046876 / prefill 0.17330563175390626), which were measured
+against the previous challenge model and could not price Gemma inference.
 
 If either number here disagrees with `Sources/MLXFastCore/Constants.swift`, the
 freeze test fails on purpose -- the doc and the code must move together.
@@ -95,8 +91,8 @@ These constants are the **fallback**, not the only source. A golden's
 ```json
 "benchmark": {
   "...": "...",
-  "baseline_prefill_seconds_per_token": 0.17,
-  "baseline_decode_seconds_per_token": 3.63
+  "baseline_prefill_seconds_per_token": 0.0101,
+  "baseline_decode_seconds_per_token": 0.1317
 }
 ```
 

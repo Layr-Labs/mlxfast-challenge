@@ -165,7 +165,7 @@ func officialTimingMachineMeasuresPairedBaseline() throws {
     #expect(measure.lowerBound < candidate.lowerBound)
     let pairedBody = String(workflow[checkout.lowerBound..<candidate.lowerBound])
     #expect(pairedBody.components(separatedBy: "if: ${{ inputs.mode == 'timing' }}").count - 1 == 2)
-    #expect(pairedBody.contains("ref: 7e2191c229d0dcf6ea76cd1f78a93b50adb6c574"))
+    #expect(pairedBody.contains("ref: eff7e7f2c85a5a6cef11110442ba4624a6ab3986"))
     #expect(pairedBody.contains("persist-credentials: false"))
 
     // The measured pair reaches the candidate only through the env overrides,

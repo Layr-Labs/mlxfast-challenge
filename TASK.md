@@ -248,17 +248,16 @@ prefill_speedup >= 0.95
 ```
 
 The baseline constants backing these floors (`MLXFastConstants.officialBaseline*`)
-are currently **stale placeholders carried over from the previous challenge
-model** and MUST be recalibrated against a trusted Gemma 4 31B 4-bit baseline
-run on the official Blacksmith M3 Ultra hardware before ranked scoring is
-meaningful. Until that recalibration lands, the paired-baseline (same-session
-measured reference) and per-prompt golden baseline paths -- both of which take
-precedence over the constants in the benchmark harness -- cover the interim.
+are calibrated against the unmodified Gemma 4 31B 4-bit reference
+implementation on the official Blacksmith runner class (see
+`docs/benchmark-window-freeze.md` for the measurement provenance). On official
+runs the paired-baseline (same-session measured reference) and per-prompt
+golden baseline paths -- both of which take precedence over the constants in
+the benchmark harness -- price the floors against a live same-session sample.
 A run below either floor fails eligibility even if the weighted score would
-otherwise be above baseline. On the stale (pre-recalibration) constants, those
-floors allow at most `3.8280590145312505` seconds/token for decode and
-`0.18242698079358555` seconds/token for prefill; these thresholds will change
-once the Gemma 4 baseline is recalibrated.
+otherwise be above baseline. On the calibrated constants, those floors allow
+at most `0.13866048554276317` seconds/token for decode and
+`0.010637620357730262` seconds/token for prefill.
 
 The whole model is RAM-resident with no weight streaming, so
 `bandwidth_gb_per_token` is always `0`, reported with

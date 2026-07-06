@@ -7,7 +7,7 @@ model-mismatched. This file is the consolidated operator checklist; each
 in-tree consumption site carries a matching greppable marker:
 
 ```bash
-rg -n "TODO\(gemma-r2\)|TODO\(gemma-golden\)|TODO\(gemma-baseline\)"
+rg -n "TODO\(gemma-r2\)|TODO\(gemma-golden\)"
 ```
 
 Nothing here changes the R2 secret/env plumbing (`R2_ACCESS_KEY_ID`,
@@ -78,19 +78,22 @@ verify them) must be regenerated.
   - `public_golden_sha256` in the "Public behavior gate" step of
     `.github/workflows/benchmark-timing-or-gates.yml`.
 
-## 5. Paired-baseline ref and calibrated constants — `TODO(gemma-baseline)`
+## 5. Paired-baseline ref and calibrated constants — DONE
 
-- The timing machine's pinned paired-baseline ref
-  (`7e2191c...` in `benchmark-timing-or-gates.yml`) still builds the
-  DeepSeek-era reference implementation and cannot run the Gemma
-  checkpoint. After the migration lands on `main`:
-  1. Run a trusted Gemma baseline on the official Blacksmith hardware.
-  2. Recalibrate `officialBaselinePrefillSecondsPerToken` /
-     `officialBaselineDecodeSecondsPerToken` in
-     `Sources/MLXFastCore/Constants.swift` (currently stale placeholders).
-  3. Repoint the paired-baseline `ref:` to the Gemma baseline commit and
-     update `MLXFAST_PAIRED_SANITY_PREFILL` / `MLXFAST_PAIRED_SANITY_DECODE`
-     to the new constants.
-  4. Update `docs/benchmark-window-freeze.md`, `README.md`, `TASK.md`, and
-     `Tests/MLXFastTests/BenchmarkWindowFreezeTests.swift` in the same
-     change (the freeze tests fail until doc and code agree).
+- The timing machine's pinned paired-baseline ref now points at the Gemma
+  migration merge (`eff7e7f2c85a5a6cef11110442ba4624a6ab3986`), and the
+  calibrated constants were re-measured against that exact commit on the
+  official Blacksmith runner class (`gemma-baseline-timing-probe` run
+  28809531890, 2026-07-06; a dispatch-only, secret-free timing fan-out of
+  unmodified `main` over the full official 128-step timing path). The same
+  change updated `officialBaselinePrefillSecondsPerToken` /
+  `officialBaselineDecodeSecondsPerToken` in
+  `Sources/MLXFastCore/Constants.swift`, the `MLXFAST_PAIRED_SANITY_PREFILL`
+  / `MLXFAST_PAIRED_SANITY_DECODE` anchors in
+  `benchmark-timing-or-gates.yml`, `docs/benchmark-window-freeze.md`,
+  `README.md`, `TASK.md`, and
+  `Tests/MLXFastTests/BenchmarkWindowFreezeTests.swift`.
+- Note: the ranked timing job's own end-to-end verification (a green
+  paired-baseline step inside `benchmark.yml`) still depends on items 1 and
+  2 above — the paired step measures the reference against the hidden R2
+  golden, which is still DeepSeek-tokenized.

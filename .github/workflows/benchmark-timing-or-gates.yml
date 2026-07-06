@@ -282,17 +282,13 @@ jobs:
         if: ${{ inputs.mode == 'timing' }}
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          # Reference implementation: main at the e571ac1 editable-source
-          # restore point plus trusted harness updates (7e2191c). This is the
-          # same code the calibrated constants were measured against. Changing
-          # this ref is a ranking-contract change: follow the freeze doc's
-          # paired-baseline protocol and update the pinned guard test.
-          # TODO(gemma-baseline): this pinned ref still builds the previous
-          # (DeepSeek-era) reference implementation and cannot run the Gemma
-          # checkpoint; repoint it to the trusted Gemma 4 baseline commit once
-          # the migration lands on main and the official baseline is
-          # recalibrated (update the freeze doc + pinned guard test together).
-          ref: 7e2191c229d0dcf6ea76cd1f78a93b50adb6c574
+          # Reference implementation: main at eff7e7f, the Gemma 4 31B 4-bit
+          # migration merge (PR #352). This is the same code the calibrated
+          # constants were measured against (gemma-baseline-timing-probe run
+          # 28809531890). Changing this ref is a ranking-contract change:
+          # follow the freeze doc's paired-baseline protocol and update the
+          # pinned guard test.
+          ref: eff7e7f2c85a5a6cef11110442ba4624a6ab3986
           path: paired-baseline
           persist-credentials: false
 
@@ -304,8 +300,8 @@ jobs:
           # than 1.5x slower or 0.66x faster than calibration means the VM or
           # the baseline build is pathological; failing closed prevents a
           # broken baseline from inflating or deflating every speedup.
-          MLXFAST_PAIRED_SANITY_PREFILL: "0.17330563175390626"
-          MLXFAST_PAIRED_SANITY_DECODE: "3.6366560638046876"
+          MLXFAST_PAIRED_SANITY_PREFILL: "0.01010573933984375"
+          MLXFAST_PAIRED_SANITY_DECODE: "0.131727461265625"
         run: |
           set -euo pipefail
           started="${SECONDS}"
