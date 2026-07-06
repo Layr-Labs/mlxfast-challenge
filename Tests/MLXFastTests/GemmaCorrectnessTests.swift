@@ -7,7 +7,7 @@ import MLXFastCore
 import Testing
 
 @Test
-func deepSeekCorrectnessComparesExpectedTokenSequences() {
+func gemmaCorrectnessComparesExpectedTokenSequences() {
     let pass = GemmaCorrectness.compareTokens(
         expected: [4, 5, 6],
         actual: [4, 5, 6],
@@ -63,7 +63,7 @@ func deepSeekCorrectnessComparesExpectedTokenSequences() {
 }
 
 @Test
-func deepSeekCorrectnessGeneratesGreedyTokensWithGrowingContext() throws {
+func gemmaCorrectnessGeneratesGreedyTokensWithGrowingContext() throws {
     var contexts: [[Int]] = []
     let generated = try GemmaCorrectness.generateGreedyNoCache(
         promptTokens: [10, 11],
@@ -78,7 +78,7 @@ func deepSeekCorrectnessGeneratesGreedyTokensWithGrowingContext() throws {
 }
 
 @Test
-func deepSeekCorrectnessTeacherForcedUsesGoldenPrefix() throws {
+func gemmaCorrectnessTeacherForcedUsesGoldenPrefix() throws {
     var contexts: [[Int]] = []
     let expected = [20, 21, 22]
     let comparison = try GemmaCorrectness.compareTeacherForcedNoCache(
@@ -283,7 +283,7 @@ func gemmaRuntimeCorrectnessReportsGoldenMetadataWhenWeightsAreMissing() throws 
 }
 
 @Test
-func deepSeekCorrectnessSelectsGreedyTokenWhenRuntimeTestsAreEnabled() throws {
+func gemmaCorrectnessSelectsGreedyTokenWhenRuntimeTestsAreEnabled() throws {
     guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
         return
     }

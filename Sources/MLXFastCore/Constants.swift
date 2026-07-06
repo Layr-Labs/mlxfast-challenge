@@ -61,11 +61,11 @@ public enum MLXFastConstants {
     // and add minutes to the job -- keep zero warmup and one measured run.
     public static let benchmarkPrefillWarmupRuns = 0
     public static let benchmarkPrefillTimedRuns = 1
-    // STALE DeepSeek-V4-Flash-era placeholders. These numeric values were
-    // calibrated against the previous MoE/SSD-streaming model and DO NOT
-    // reflect Gemma 4 31B 4-bit dense inference on the official runner. They
-    // MUST be recalibrated with a trusted Gemma baseline run (official
-    // Blacksmith M3 Ultra hardware) before any ranked scoring is meaningful.
+    // STALE placeholders carried over from the previous challenge model era.
+    // These numeric values DO NOT reflect Gemma 4 31B 4-bit dense inference on
+    // the official runner. They MUST be recalibrated with a trusted Gemma
+    // baseline run (official Blacksmith M3 Ultra hardware) before any ranked
+    // scoring is meaningful.
     // Until that recalibration lands, the paired-baseline (same-session
     // measured reference) and per-prompt golden baseline paths -- both of
     // which take precedence over these constants in the benchmark harness --

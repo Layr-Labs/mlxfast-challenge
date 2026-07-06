@@ -6,8 +6,7 @@ REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/gemma-4-31b-
 REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-main}"
 REFERENCE_CACHE_REPO_DIR="models--${REFERENCE_MODEL_REPO//\//--}"
 REFERENCE_CACHE_REVISION_DIR="${REFERENCE_REVISION//\//--}"
-# No organizer-hosted mirror exists yet for this checkpoint (the previous
-# DeepSeek-era default pointed at a Darkbloom-hosted mirror); default straight
+# No organizer-hosted mirror exists yet for this checkpoint; default straight
 # to the public Hugging Face repo. download_url_for_file appends
 # "?download=true" automatically for huggingface.co URLs so this resolves to
 # the raw LFS/Xet bytes.

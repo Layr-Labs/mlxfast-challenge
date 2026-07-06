@@ -252,12 +252,12 @@ prefill_speedup >= 0.95
 ```
 
 The baseline constants backing these floors (`MLXFastConstants.officialBaseline*`)
-are currently **stale DeepSeek-V4-Flash-era placeholders** and MUST be
-recalibrated against a trusted Gemma 4 31B 4-bit baseline run on the official
-Blacksmith M3 Ultra hardware before ranked scoring is meaningful. Until that
-recalibration lands, the paired-baseline (same-session measured reference) and
-per-prompt golden baseline paths -- both of which take precedence over the
-constants in the benchmark harness -- cover the interim.
+are currently **stale placeholders carried over from the previous challenge
+model** and MUST be recalibrated against a trusted Gemma 4 31B 4-bit baseline
+run on the official Blacksmith M3 Ultra hardware before ranked scoring is
+meaningful. Until that recalibration lands, the paired-baseline (same-session
+measured reference) and per-prompt golden baseline paths -- both of which take
+precedence over the constants in the benchmark harness -- cover the interim.
 A run below either floor fails eligibility even if the weighted score would
 otherwise be above baseline. On the stale (pre-recalibration) constants, those
 floors allow at most `3.8280590145312505` seconds/token for decode and

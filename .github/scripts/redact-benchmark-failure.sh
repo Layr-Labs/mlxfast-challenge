@@ -49,7 +49,7 @@ if [[ -s "${score_path}" ]]; then
     timed_benchmark_seconds="$(jq '.metrics.timed_benchmark_seconds' "${score_path}")"
 
     # Categories are matched ONLY against fixed prefixes that the trusted
-    # harness itself authors (DeepSeekRuntimeBenchmark). Anything else --
+    # harness itself authors (GemmaRuntimeBenchmark). Anything else --
     # including error text that originated inside the sandboxed worker -- is
     # deliberately collapsed to an opaque category.
     if [[ "${error_text}" == "performance floor failed"* ]]; then

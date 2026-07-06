@@ -280,9 +280,10 @@ prefill_speedup >= 0.95
 The floor prevents a submission from sacrificing one serving phase badly to
 improve the other. The exact baseline timings are emitted in each `score.json`
 and kept in `MLXFastConstants`. **Those constants are currently stale
-DeepSeek-V4-Flash-era placeholders and MUST be recalibrated against a trusted
-Gemma 4 31B baseline run on the official Blacksmith M3 Ultra hardware before
-ranked scoring is meaningful** -- see TASK.md. Until recalibration, the
+placeholders carried over from the previous challenge model and MUST be
+recalibrated against a trusted Gemma 4 31B baseline run on the official
+Blacksmith M3 Ultra hardware before ranked scoring is meaningful** -- see
+TASK.md. Until recalibration, the
 paired-baseline (same-session measured reference) and per-prompt golden
 baseline paths take precedence over the constants.
 On the stale (pre-recalibration) constants, that means decode must be at most

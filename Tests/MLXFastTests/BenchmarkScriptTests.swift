@@ -94,7 +94,7 @@ func benchmarkWorkflowRunsTransformOfflineAfterSetup() throws {
     #expect(setupRange.lowerBound < transformRange.lowerBound)
     #expect(setupRange.lowerBound < saveCacheRange.lowerBound)
     #expect(saveCacheRange.lowerBound < transformRange.lowerBound)
-    #expect(workflow.contains("MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main"))
     #expect(workflow.contains("MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: \"0\""))
     #expect(workflow.contains("default: \"12\""))
     #expect(workflow.contains("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))

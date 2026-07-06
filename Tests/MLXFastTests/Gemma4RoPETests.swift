@@ -75,7 +75,11 @@ func gemma4RoPEProportionalOnlyRotatesPartialDimensionsWhenRuntimeTestsAreEnable
 }
 
 @Test
-func gemma4RoPECacheReturnsSameInstanceForSameParameters() throws {
+func gemma4RoPECacheReturnsSameInstanceForSameParametersWhenRuntimeTestsAreEnabled() throws {
+    guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+        return
+    }
+
     let first = try Gemma4RoPECache.shared(
         dims: 256,
         spec: Gemma4RopeSpec(theta: 10_000, type: "default")
