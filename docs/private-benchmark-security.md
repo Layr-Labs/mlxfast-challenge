@@ -26,11 +26,12 @@ object from the private R2 bucket. Full private benchmark runs also download
 `correctness_prompts/gpqa_reference_cases.json` from the same private bucket
 and merge it into the local golden as 5 hidden multiple-choice behavior gates.
 
-> **Gemma migration status:** both R2 objects above still hold
-> DeepSeek-tokenized content and must be regenerated from the Gemma 4 31B
-> 4-bit reference before ranked runs can pass. The secret/credential model in
-> this document is unchanged by the migration. See
-> `docs/gemma-migration-r2-checklist.md` for the full regeneration checklist.
+> **Gemma migration status:** both R2 objects above have been regenerated
+> from the Gemma 4 31B 4-bit reference through the organizer-controlled
+> offline process; ranked runs pass once the regenerated objects are
+> uploaded to R2 (the workflow pins already match them). The
+> secret/credential model in this document is unchanged by the migration.
+> See `docs/gemma-migration-r2-checklist.md` for the full checklist.
 
 
 Each GPQA case must carry accepted reference-model output tokens or responses;

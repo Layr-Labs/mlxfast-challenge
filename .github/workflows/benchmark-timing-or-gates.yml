@@ -51,12 +51,11 @@ jobs:
       MLXFAST_IS_SUBMISSION_BRANCH: ${{ (startsWith(github.ref_name, 'submissions/')) && '1' || '0' }}
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
       MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}
-      # TODO(gemma-r2): regenerate/upload for Gemma. Both hidden R2 objects
-      # below (the benchmark/correctness golden with its embedded timed-prompt
-      # oracle, and the GPQA reference cases with accepted token sequences)
-      # are still DeepSeek-tokenized; they must be regenerated from the Gemma
-      # 4 31B 4-bit reference and re-uploaded before ranked runs can pass.
-      # See docs/gemma-migration-r2-checklist.md.
+      # Both hidden R2 objects below (the benchmark/correctness golden with
+      # its embedded timed-prompt oracle, and the GPQA reference cases with
+      # accepted token sequences) have been regenerated from the Gemma 4 31B
+      # 4-bit reference; these paths are valid once the regenerated objects
+      # are uploaded to R2. See docs/gemma-migration-r2-checklist.md.
       MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json
       MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases.json
       MLXFAST_GPQA_CASE_COUNT: "5"

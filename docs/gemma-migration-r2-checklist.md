@@ -16,15 +16,18 @@ Nothing here changes the R2 secret/env plumbing (`R2_ACCESS_KEY_ID`,
 correct. Only the *contents* of the private objects (and the pins that
 verify them) must be regenerated.
 
-## 1. Hidden correctness/benchmark golden (R2) — `TODO(gemma-r2)`
+## 1. Hidden correctness/benchmark golden (R2) — regenerated, pending upload
 
 - **Object:** `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`
-- **Contents to regenerate:** 512-token base prompt retokenized with the
-  Gemma tokenizer; 64 teacher-forced expected continuation tokens from the
-  trusted Gemma 4 31B 4-bit reference; hidden `correctness_gates` (anchors,
-  free-run prefixes, behavior cases); and the benchmark oracle (prefill
-  next token, 512-token decode seed next token, 128 timed decode tokens;
-  optionally per-prompt `baseline_*_seconds_per_token` calibration).
+- **Regenerated contents:** 512-token base prompt retokenized with the
+  Gemma tokenizer; 256 teacher-forced expected continuation tokens from the
+  trusted Gemma 4 31B 4-bit reference; a `correctness_gates.free_run` gate
+  covering the full timed decode offset range (`attach-free-run-gate`
+  defaults, 128 steps); and the benchmark oracle (prefill next token,
+  512-token decode seed next token, 256 timed decode tokens). Per-prompt
+  `baseline_*_seconds_per_token` calibration is intentionally omitted (the
+  previous object also omitted it); scoring falls back to the calibrated
+  constants until the Gemma baseline recalibration lands.
 - **Consumed by:**
   - `.github/workflows/benchmark-correctness-slice.yml` — "Download and
     verify hidden correctness golden" (all three slice machines, raw
@@ -35,18 +38,22 @@ verify them) must be regenerated.
   - `.github/workflows/benchmark.yml` — the `correctness-only` job declares
     the object path/pins in its env (defaults; the job itself runs on the
     public golden).
-- **Pins to update after upload:** `MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256`
-  (currently `8306702...bdbf067`) and `MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES`
-  (currently `26110`) in `benchmark.yml` and
-  `benchmark-correctness-slice.yml`.
+- **Pins:** `MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256`
+  (now `a593138...e92cb25`) and `MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES`
+  (now `38155`) in `benchmark.yml` and
+  `benchmark-correctness-slice.yml` match the regenerated object; they take
+  effect once the object is uploaded to R2.
 
-## 2. Hidden GPQA reference cases (R2) — `TODO(gemma-r2)`
+## 2. Hidden GPQA reference cases (R2) — regenerated, pending upload
 
 - **Object:** `correctness_prompts/gpqa_reference_cases.json`
-- **Contents to regenerate:** 5 token-budget-valid GPQA multiple-choice
-  prompts with `accepted_token_sequences` / `accepted_responses` captured
-  from the Gemma reference model (Gemma tokenizer, `max_new_tokens=10`),
-  plus the private reference answers the semantic judge compares against.
+- **Regenerated contents:** the 9 GPQA multiple-choice prompt cases (prompt
+  text, answer keys, domains unchanged) with each case's
+  `accepted_token_sequences` replaced by the first greedy answer token
+  captured from the Gemma 4 31B 4-bit reference (Gemma tokenizer,
+  `max_new_tokens=10` generation), preserving the previous artifact's
+  one-token-sequence shape; the semantic judge's reference answers continue
+  to derive from the answer keys.
 - **Consumed by:** `.github/workflows/benchmark-timing-or-gates.yml` —
   "Prepare correctness golden" (`attach-gpqa-gates`), which drives the
   hidden GPQA behavior gates, the TTFT guardrail, and the semantic-GPQA
