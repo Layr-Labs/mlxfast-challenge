@@ -18,7 +18,7 @@ verify them) must be regenerated.
 
 ## 1. Hidden correctness/benchmark golden (R2) — regenerated, pending upload
 
-- **Object:** `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`
+- **Object:** `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json`
 - **Regenerated contents:** 512-token base prompt retokenized with the
   Gemma tokenizer; 256 teacher-forced expected continuation tokens from the
   trusted Gemma 4 31B 4-bit reference; a `correctness_gates.free_run` gate
@@ -46,7 +46,7 @@ verify them) must be regenerated.
 
 ## 2. Hidden GPQA reference cases (R2) — regenerated, pending upload
 
-- **Object:** `correctness_prompts/gpqa_reference_cases.json`
+- **Object:** `correctness_prompts/gpqa_reference_cases-gemma.json`
 - **Regenerated contents:** the 9 GPQA multiple-choice prompt cases (prompt
   text, answer keys, domains unchanged) with each case's
   `accepted_token_sequences` replaced by the first greedy answer token

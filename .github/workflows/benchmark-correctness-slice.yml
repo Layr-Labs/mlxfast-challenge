@@ -51,7 +51,7 @@ jobs:
       # Hidden R2 golden regenerated from the Gemma 4 31B 4-bit reference;
       # the pins below match the regenerated object and are only valid once
       # it is uploaded to R2. See docs/gemma-migration-r2-checklist.md.
-      MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json
+      MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json
       # The RAW (pre-GPQA-augmentation) hidden golden's expected hash/bytes --
       # --base-case-only skips anchors/free-run/behavior/GPQA entirely, so this
       # slice only ever needs the base case, never the GPQA-attached variant

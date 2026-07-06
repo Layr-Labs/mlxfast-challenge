@@ -21,9 +21,9 @@ Configure the `benchmark-private-prompts` Environment with:
   - `R2_SECRET_ACCESS_KEY`
 
 Normal private benchmark runs download the precomputed
-`correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`
+`correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json`
 object from the private R2 bucket. Full private benchmark runs also download
-`correctness_prompts/gpqa_reference_cases.json` from the same private bucket
+`correctness_prompts/gpqa_reference_cases-gemma.json` from the same private bucket
 and merge it into the local golden as 5 hidden multiple-choice behavior gates.
 
 > **Gemma migration status:** both R2 objects above have been regenerated

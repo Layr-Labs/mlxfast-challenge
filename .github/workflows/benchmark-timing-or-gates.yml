@@ -56,8 +56,8 @@ jobs:
       # accepted token sequences) have been regenerated from the Gemma 4 31B
       # 4-bit reference; these paths are valid once the regenerated objects
       # are uploaded to R2. See docs/gemma-migration-r2-checklist.md.
-      MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json
-      MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases.json
+      MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json
+      MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json
       MLXFAST_GPQA_CASE_COUNT: "5"
       MLXFAST_GPQA_MAX_NEW_TOKENS: "10"
       MLXFAST_SEMANTIC_GPQA_CASE_COUNT: "5"
@@ -179,7 +179,7 @@ jobs:
           # behavior gates but MUST NOT mutate its .cases (the base teacher-forced
           # case). The three correctness-slice machines verify the base case
           # against the RAW golden (pinned by MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_
-          # SHA256 = 8306..bdbf067); this machine verifies gates against the
+          # SHA256 = a593..e92cb25); this machine verifies gates against the
           # augmented golden. Both must agree on .cases or the split would check
           # the base case against a different fixture than it reports. That
           # agreement is backstopped by checked_steps/case_count equality in
