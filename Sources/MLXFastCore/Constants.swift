@@ -30,14 +30,34 @@ public enum MLXFastConstants {
     // Swift/MLX. Semantic GPQA behavior captures a short continuation for the
     // private judge; exact token enforcement stays on the long copy gate and
     // non-semantic behavior fixtures.
-    public static let correctnessGPQAMaxNewTokens = 10
+    // 64 (was 10, DeepSeek-era): baseline Gemma 4 31B 4-bit greedy
+    // continuations of the raw (untemplated) hidden GPQA prompts rarely
+    // express the selected option within 10 tokens -- ranked run 28813130022
+    // judged 0/5 on an unmodified baseline. A 2026-07-06 baseline capture at
+    // budgets 10/32/64 confirmed most candidates are cut off mid-sentence and
+    // continue the option list rather than answer; 64 (the
+    // correctnessMaxBehaviorSteps ceiling) gives the judge the most usable
+    // candidate text at ~35s extra decode on the gates machine.
+    public static let correctnessGPQAMaxNewTokens = 64
     // Semantic judging uses short hidden GPQA answers as a baseline-calibrated
-    // hard gate for optimizations that preserve the exact prefix but damage
-    // answer sense. Five cases keeps the full GitHub job near the 30-minute
-    // budget.
+    // gate for optimizations that preserve the exact prefix but damage answer
+    // sense. Five cases keeps the full GitHub job near the 30-minute budget.
+    // The captured answer is a prefix of the behavior-gate generation, so
+    // semanticGPQAMaxNewTokens is only effective up to
+    // correctnessGPQAMaxNewTokens (and must stay <= correctnessMaxBehaviorSteps).
     public static let semanticGPQACaseCount = 5
-    public static let semanticGPQAMaxNewTokens = 10
-    public static let semanticGPQAMinPassCount = 3
+    public static let semanticGPQAMaxNewTokens = 64
+    // Baseline-calibrated threshold. The DeepSeek-era baseline established
+    // 3/5; the unmodified Gemma 4 31B 4-bit baseline measured 0/5 on the
+    // ranked runner (run 28813130022, judged at the old 10-token budget), and
+    // the 2026-07-06 structural baseline capture predicts at most 1/5 even at
+    // the 64-token budget, so the measured Gemma baseline is 0.
+    // TODO(semantic-gpqa-recalibration): 0 makes the gate vacuous as a
+    // pass/fail check (aggregates are still recorded). Re-raise it after
+    // either (a) a judged official-runner baseline run at the 64-token budget
+    // establishes a nonzero floor, or (b) the hidden GPQA prompts move to the
+    // Gemma chat template so the baseline reliably states its answer.
+    public static let semanticGPQAMinPassCount = 0
     public static let benchmarkPrefillPromptTokens = 512
     // Scored decode is parent-measured wall time for decode setup plus this
     // many checked token steps. Charging setup prevents submitted model code
