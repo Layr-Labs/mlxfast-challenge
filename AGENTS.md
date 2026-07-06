@@ -109,12 +109,12 @@ Correctness is a hard gate. Passing locally is necessary but not sufficient for
 ranking.
 
 The public local gate uses checked-in prompt/golden fixtures under
-`correctness_prompts/`. **These fixtures currently carry stale DeepSeek
-V4 Flash tokenization and expected tokens** and must be regenerated against
-the Gemma 4 31B 4-bit reference implementation before local correctness is
-meaningful; see `TASK.md`. The official benchmark uses private artifacts
-supplied by the organizer, which must likewise be regenerated for Gemma 4
-before ranked scoring.
+`correctness_prompts/`. These fixtures are Gemma-generated: the prompt text is
+tokenized with the Gemma 4 tokenizer and the expected tokens are greedy
+continuations captured from the Gemma 4 31B 4-bit reference implementation
+(`mlxfast-swift generate-golden`); see `TASK.md`. The official benchmark uses
+private artifacts supplied by the organizer, which must likewise be
+regenerated for Gemma 4 before ranked scoring.
 
 The official correctness stack includes:
 

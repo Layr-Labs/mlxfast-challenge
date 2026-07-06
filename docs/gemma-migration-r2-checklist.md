@@ -65,12 +65,14 @@ verify them) must be regenerated.
   workflows, but the organizer's offline regeneration pipeline must switch
   to the Gemma tokenizer/reference before producing items 1 and 2.
 
-## 4. Public fixtures (checked in, regenerated separately) — `TODO(gemma-golden)`
+## 4. Public fixtures (checked in) — DONE
 
 - `correctness_prompts/public_longcopy_gate_english_512_256.json` and
-  `correctness_prompts/public_longcopy_gate_english_512_1024.json` are being
-  regenerated in-repo (see the stale-fixture notes in `TASK.md`/`README.md`).
-  Once the regenerated files land, update the pins that verify them:
+  `correctness_prompts/public_longcopy_gate_english_512_1024.json` have been
+  regenerated against the Gemma 4 31B 4-bit reference with
+  `mlxfast-swift generate-golden` (Gemma-tokenized 512-token prompt, greedy
+  reference continuations; the 256 fixture is a greedy prefix of the 1024
+  one). The pins that verify them were moved in the same change:
   - `MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256` / `..._BYTES` in
     `.github/workflows/benchmark.yml` (`correctness-only` env).
   - `public_golden_sha256` in the "Public behavior gate" step of

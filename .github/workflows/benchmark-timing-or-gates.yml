@@ -234,11 +234,11 @@ jobs:
         # hidden gates, so submitted code gets no new phase-detection signal.
         run: |
           set -euo pipefail
-          # TODO(gemma-golden): this pin still describes the stale
-          # DeepSeek-tokenized public fixture; update the sha256 when the
-          # regenerated Gemma 4 public golden lands in correctness_prompts/.
+          # Pinned to the checked-in Gemma 4 31B 4-bit public fixture
+          # generated with `mlxfast-swift generate-golden`; regenerating the
+          # fixture must move this pin (enforced by BenchmarkScriptTests).
           public_golden="correctness_prompts/public_longcopy_gate_english_512_256.json"
-          public_golden_sha256="2a747bf797e16d58f5ffedacc0d4bf5ce0d14be00f2421dc04289a2154cb011d"
+          public_golden_sha256="7c33861bdf062b08a96a97bf5b388b541edc95b4cc46afc4f98ce9cb46856782"
           actual_hash="$(shasum -a 256 "${public_golden}" | awk '{print $1}')"
           if [[ "${actual_hash}" != "${public_golden_sha256}" ]]; then
             echo "benchmark-timing-or-gates: public correctness golden hash mismatch (${actual_hash})" >&2

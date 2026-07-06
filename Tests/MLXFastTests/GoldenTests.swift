@@ -20,7 +20,7 @@ func checkedInPublicCorrectnessGoldenIsValid() throws {
         .map { String(format: "%02x", $0) }
         .joined()
 
-    #expect(digest == "2a747bf797e16d58f5ffedacc0d4bf5ce0d14be00f2421dc04289a2154cb011d")
+    #expect(digest == "7c33861bdf062b08a96a97bf5b388b541edc95b4cc46afc4f98ce9cb46856782")
 
     let fixture = try loadGoldenFixture(from: path)
     #expect(fixture.sha256 == digest)
@@ -38,7 +38,7 @@ func checkedInPublicCorrectnessGoldenIsValid() throws {
         .map { String(format: "%02x", $0) }
         .joined()
 
-    #expect(localSubmitDigest == "9d167d1026dacc69c40fc0de98022def0fedb6aee3a23b714fcbbdf92e3da1f2")
+    #expect(localSubmitDigest == "139de2cd0c9d9f6f005feffb1872af0084312996a79708f3b8ca02f64b116536")
 
     let localSubmitFixture = try loadGoldenFixture(
         from: localSubmitPath,

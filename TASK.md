@@ -40,21 +40,17 @@ token plus 1023 teacher-forced decode tokens from a longer public fixture, and
 still writes and prints `score.json` with `score: null`; it is a directional
 local signal, not the official ranking run.
 
-> **Stale correctness fixtures.** `correctness_prompts/` currently contains
-> prompt/golden fixtures generated against the previous DeepSeek V4 Flash
-> model. Its 512-token prompts were tokenized with the DeepSeek tokenizer, and
-> the "expected" continuation tokens were captured from DeepSeek's forward
-> pass -- neither has any relationship to Gemma 4's tokenizer or output
-> distribution. **These fixtures MUST be regenerated against the Gemma 4 31B
-> 4-bit reference implementation before local (or hidden) correctness can
-> meaningfully pass.** This migration does not delete or rewrite the fixture
-> JSON files themselves; regenerating them (retokenizing the prompt text with
-> the Gemma tokenizer and recapturing golden continuations from a trusted
-> Gemma reference forward pass) is a deliberate follow-up left to the
-> benchmark operator. Some fixture-structure tests (e.g. "token IDs are within
-> vocab range") still pass against the stale fixtures because Gemma's
-> vocabulary is a superset in size, but the actual expected-token values are
-> not meaningful for Gemma until regenerated.
+> **Gemma-generated correctness fixtures.** `correctness_prompts/` contains
+> prompt/golden fixtures regenerated against the Gemma 4 31B 4-bit reference
+> implementation. The 512-token prompts were retokenized from the checked-in
+> prompt text with the Gemma tokenizer, and the expected continuation tokens
+> were captured from the reference model's greedy forward pass with
+> `mlxfast-swift generate-golden` (256 expected tokens for the local-iterate
+> fixture, 1024 for the local-submit fixture; the shorter fixture is a greedy
+> prefix of the longer one by construction). The hidden/private artifacts used
+> by ranked runs (R2 golden, GPQA references) are regenerated separately
+> through the organizer process and must likewise be Gemma-generated before
+> ranked scoring is meaningful.
 
 ## Model Artifacts
 
@@ -108,7 +104,7 @@ not byte equality with the baseline layout.
 
 The public correctness-only prompt and golden are committed under
 `correctness_prompts/` so participants can run a local correctness smoke test
-(subject to the stale-fixture caveat above). The timed benchmark token oracle
+(Gemma-generated; see the fixture note above). The timed benchmark token oracle
 is supplied by the benchmark operator and is intentionally not committed to
 the public repo:
 
