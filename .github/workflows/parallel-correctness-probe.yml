@@ -5,7 +5,7 @@ name: parallel-correctness-probe
 # exists to validate --base-case-only / --step-range / --step-range-output /
 # combine-parallel-correctness.sh end to end on real infrastructure, not just the
 # local bash/xctest simulation. Each of the three slice jobs independently
-# downloads and transforms the full ~141 GiB reference checkpoint (no shared
+# downloads and transforms the full ~18.4 GB reference checkpoint (no shared
 # cache between them yet -- see the parallelization plan's honest wall-clock
 # section on why that's a throughput lever, not a per-run latency one), so this
 # is expensive and deliberately dispatch-only.
@@ -47,7 +47,7 @@ on:
       reference_min_free_gib:
         description: "Minimum free GiB required before reference checkpoint download."
         required: false
-        default: "170"
+        default: "40"
         type: string
 
 concurrency:
@@ -111,7 +111,7 @@ jobs:
     # arithmetic must not be polluted by the unrelated --local-iterate smoke
     # check's own step count.
     runs-on: blacksmith-12vcpu-macos-26
-    timeout-minutes: 360
+    timeout-minutes: 180
     env:
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
@@ -234,7 +234,7 @@ jobs:
     # finding 2), a real full run over the same case would still check it and
     # the two verdicts would disagree.
     runs-on: blacksmith-12vcpu-macos-26
-    timeout-minutes: 360
+    timeout-minutes: 180
     env:
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256

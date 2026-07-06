@@ -34,7 +34,10 @@ permissions:
 jobs:
   slice:
     runs-on: blacksmith-12vcpu-macos-26
-    timeout-minutes: 360
+    # Reduced from the 360min expert-streaming-era budget: the dense Gemma
+    # model downloads ~18.4 GB and checks its slice from RAM. Still generous
+    # until the recalibrated Gemma baseline pins real phase timings.
+    timeout-minutes: 180
     environment: benchmark-private-prompts
     env:
       MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
@@ -45,6 +48,11 @@ jobs:
       # writeRuntimeWorkerSandboxProfile adds a subpath deny for this dir.
       MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.slice_name }}
       MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.slice_name }}/correctness_golden.json
+      # TODO(gemma-r2): regenerate/upload for Gemma. The hidden R2 golden at
+      # this object path (and its pinned SHA256/bytes below) is still the
+      # DeepSeek-tokenized fixture; it must be regenerated from the Gemma 4
+      # 31B 4-bit reference and re-uploaded before ranked runs can pass. See
+      # docs/gemma-migration-r2-checklist.md.
       MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json
       # The RAW (pre-GPQA-augmentation) hidden golden's expected hash/bytes --
       # --base-case-only skips anchors/free-run/behavior/GPQA entirely, so this
@@ -103,7 +111,7 @@ jobs:
 
       # Mirrors benchmark-timing-or-gates.yml's early check: without it, a run
       # missing the R2 secrets would only fail at "Download and verify hidden
-      # correctness golden" -- after the full ~141 GiB checkpoint download and
+      # correctness golden" -- after the full ~18.4 GB checkpoint download and
       # transform, times three slice machines.
       - name: Check correctness golden source
         run: |

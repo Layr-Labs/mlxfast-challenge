@@ -28,7 +28,7 @@ permissions:
 jobs:
   slice:
     runs-on: blacksmith-12vcpu-macos-26
-    timeout-minutes: 360
+    timeout-minutes: 180
     env:
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256

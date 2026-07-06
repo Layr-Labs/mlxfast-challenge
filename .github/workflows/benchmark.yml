@@ -17,9 +17,9 @@ on:
         default: "12"
         type: string
       reference_min_free_gib:
-        description: "Minimum free GiB required before reference checkpoint download."
+        description: "Minimum free GiB required before reference checkpoint download. Sized for the ~18.4 GB Gemma 4 31B 4-bit checkpoint plus the transformed weights/ tree."
         required: false
-        default: "170"
+        default: "40"
         type: string
       verify_transform:
         description: "Run deterministic transform verification before timing."
@@ -63,7 +63,7 @@ concurrency:
 
 jobs:
   # Cheap, checkout-free, secret-free sanity check that runs before any of the
-  # three expensive (up to 360min, full checkpoint download+transform) slice
+  # three expensive (up to 180min, full checkpoint download+transform) slice
   # machines start. combine-parallel-correctness.sh's own "Range coverage
   # check" catches a bad range_1/2/3 too, but only after all three slices (plus
   # benchmark-timing/benchmark-gates) have already run to completion -- a
@@ -176,7 +176,10 @@ jobs:
   correctness-only:
     if: ${{ !inputs.run_benchmark }}
     runs-on: blacksmith-12vcpu-macos-26
-    timeout-minutes: 720
+    # Reduced from the 720min expert-streaming-era budget: the dense Gemma
+    # model downloads ~18.4 GB and runs the whole gate from RAM. Still generous
+    # until the recalibrated Gemma baseline pins real phase timings.
+    timeout-minutes: 240
     environment: benchmark-private-prompts
     env:
       MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}
@@ -188,9 +191,17 @@ jobs:
       MLXFAST_IS_SUBMISSION_BRANCH: ${{ (startsWith(github.ref_name, 'submissions/')) && '1' || '0' }}
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
       MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt
+      # TODO(gemma-golden): the pinned SHA256/bytes below still describe the
+      # stale DeepSeek-tokenized public fixture; update them when the
+      # regenerated Gemma 4 public golden lands in correctness_prompts/.
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 2a747bf797e16d58f5ffedacc0d4bf5ce0d14be00f2421dc04289a2154cb011d
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: "10320"
+      # TODO(gemma-r2): regenerate/upload for Gemma. The hidden R2 golden at
+      # this object path (and its pinned SHA256/bytes) is still the
+      # DeepSeek-tokenized fixture; it must be regenerated from the Gemma 4
+      # 31B 4-bit reference and re-uploaded before ranked runs can pass. See
+      # docs/gemma-migration-r2-checklist.md.
       MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: 830670206859a1b221508ae44a031205a3eba6f5f13e05b40383bf781bdbf067
       MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: "26110"
@@ -606,12 +617,13 @@ jobs:
             exit 1
           }
 
-          # The expert_* sums below reproduce the serial run's timed-phase-only
-          # semantics ONLY because the gates machine (skipTimedBenchmark) reports
-          # structural zeros for all of them. If the gates machine ever starts
-          # reporting nonzero expert stats (e.g. a future change folds its
-          # correctness-phase reads into the published score), summing would
-          # silently double-count relative to serial -- fail loudly instead.
+          # The expert_* fields are legacy score-schema fields kept for backend
+          # compatibility; the dense RAM-resident Gemma runtime always reports
+          # structural zeros for all of them on every machine. The merge below
+          # still sums them, so if any machine ever starts reporting nonzero
+          # values (a schema regression, not a real streaming path), summing
+          # would silently diverge from the serial semantics -- fail loudly
+          # instead.
           jq -e '
             .metrics.expert_bytes_read == 0
             and .metrics.expert_cache_hits == 0
@@ -636,8 +648,8 @@ jobs:
           #    expert_peak_cached_tensors: max() across the two machines (a
           #    single serial process reported one number; the cross-machine max
           #    is the closest faithful aggregate and is diagnostic, not scored).
-          #  - expert_* counters: summed (gates contributes structural zeros,
-          #    asserted above), reproducing the serial timed-phase totals.
+          #  - expert_* counters: summed (all zeros for the dense model,
+          #    asserted above), keeping the legacy schema fields stable.
           jq -n \
             --slurpfile gates "${gates_dir}/score.json" \
             --slurpfile timing "${timing_dir}/score.json" \
