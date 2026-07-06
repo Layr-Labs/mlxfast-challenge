@@ -1,12 +1,13 @@
 # MLXFast Challenge Agent Guide
 
-This repository is the Swift-only DeepSeek V4 Flash 4-bit optimization challenge.
+This repository is the Swift-only Gemma 4 31B 4-bit dense inference
+optimization challenge.
 Use this file as the working contract for coding agents and participants.
 
 ## Goal
 
-Optimize DeepSeek V4 Flash 4-bit inference on Apple Silicon without changing the
-observable model behavior required by the correctness gates.
+Optimize Gemma 4 31B 4-bit (text tower only) inference on Apple Silicon without
+changing the observable model behavior required by the correctness gates.
 
 The official score rewards faster prefill and decode:
 
@@ -22,20 +23,31 @@ and prefill must also stay within the configured 0.95 speedup floors.
 
 ## Official Hardware
 
-Ranked benchmark runs execute through GitHub Actions on:
+Ranked benchmark runs execute through GitHub Actions on Blacksmith-hosted
+Apple Silicon runners, like the rest of the Darkbloom inference benchmarks.
+The runner label configured in `.github/` is the source of truth; today that
+is:
 
 ```text
 blacksmith-12vcpu-macos-26
 ```
 
-Treat this as the source of truth for performance. The ranked run is calibrated
-for a Blacksmith Apple Silicon M4 Pro runner with 48 GB unified memory. Local
-M2, M3, M4, or M5 machines are useful for iteration, but local speedups are only
-directional. A kernel, cache, or streaming strategy that helps on one Apple
-Silicon generation can move differently on the official runner, so always rely
-on the official benchmark for ranking. Do not design for a 64 GB, 96 GB, or
-128 GB local machine unless the same approach still fits the 48 GB official
-runner budget.
+The ranked hardware contract for this benchmark is an Apple M3 Ultra with at
+least 256 GB of unified memory (the label above moves to Blacksmith's M3 Ultra
+machine class when it is provisioned; Blacksmith stays the CI provider either
+way). Gemma 4 31B 4-bit is a dense model: the text tower is about 17 GB in
+4-bit, so on that contract it is fully RAM-resident: the runtime loads every
+text-tower tensor once during untimed initialization and keeps it resident for
+the whole process lifetime. There is no weight streaming of any kind, no
+expert cache, and no disk I/O on the scored prefill/decode path. Optimization
+effort should go into compute — attention kernels (sliding-window vs.
+full-attention dispatch, GQA, partial-rotary RoPE), quantized matmul dispatch,
+KV-cache handling, memory layout, and MLX scheduling — not disk I/O.
+
+Local machines need enough unified memory to hold the ~17 GB text tower plus
+KV cache and activation buffers; 32 GB+ is recommended. A kernel or layout
+strategy that helps on one Apple Silicon generation can move differently on the
+official runner, so always rely on the official benchmark for ranking.
 
 ## What You May Optimize
 
@@ -49,21 +61,26 @@ Sources/MLXFastTransform/
 Focus on:
 
 - Reducing scored prefill and decode seconds per token.
-- Optimizing kernels and hot-path MLX operations used by attention, MoE, dense
-  projections, KV-cache handling, and expert materialization.
+- Optimizing kernels and hot-path MLX operations used by attention (both the
+ sliding-window and full-attention layer types), the gated MLP, KV-cache
+ handling, and dense weight materialization.
 - Reducing model execution work on the hot path: MLX ops, synchronization,
-  materialization, copies, routing overhead, and cache misses.
-- Improving expert streaming, caching, prefetching, and layout only when it
-  shows up as lower scored prefill/decode latency.
+ materialization, copies, and cache misses.
+- Improving how RAM-resident dense weight bytes become MLXArrays (quantized
+ linear construction, fewer copies, lazier Data-to-Metal conversions).
 - Making the offline transform produce better runtime metadata or compact
-  transformed artifacts.
+ transformed artifacts.
 - Improving prefill and decode execution inside the Swift/MLX model path.
 
-The model is DeepSeek V4 Flash 4-bit. The frozen reference checkpoint is about
-141 GiB. `setup.sh` stores it in a repo-local Hugging Face-style cache by
-default and verifies it against the pinned manifest. The transformed `weights/`
-tree is an overlay/runtime artifact, not a second full copy of the model.
-Aim to keep generated transformed weights under 20 GB.
+The model is Gemma 4 31B, dense, 4-bit, text tower only (vision/audio are out
+of scope and are never loaded). The frozen reference checkpoint is about
+18.4 GB across 4 safetensors shards. `setup.sh` stores it in a repo-local
+Hugging Face-style cache by default and verifies it against the pinned
+manifest. The transformed `weights/` tree holds only the text-tower tensors
+(everything under the source checkpoint's `language_model.` prefix) plus a
+runtime-authored `config.json`; it is an overlay/runtime artifact, not a
+second full copy of the model. Aim to keep generated transformed weights under
+20 GB (the default cap is 25 GiB).
 
 ## What Not To Change
 
@@ -92,8 +109,12 @@ Correctness is a hard gate. Passing locally is necessary but not sufficient for
 ranking.
 
 The public local gate uses checked-in prompt/golden fixtures under
-`correctness_prompts/`. The official benchmark uses private artifacts supplied
-by the organizer.
+`correctness_prompts/`. These fixtures are Gemma-generated: the prompt text is
+tokenized with the Gemma 4 tokenizer and the expected tokens are greedy
+continuations captured from the Gemma 4 31B 4-bit reference implementation
+(`mlxfast-swift generate-golden`); see `TASK.md`. The official benchmark uses
+private artifacts supplied by the organizer, which must likewise be
+regenerated for Gemma 4 before ranked scoring.
 
 The official correctness stack includes:
 
@@ -116,11 +137,13 @@ The official benchmark measures:
 - Weighted score from prefill and decode speedups.
 - Pass/fail component speed floors.
 
-Diagnostic fields such as expert bytes read, memory, read timings, and
-bandwidth are recorded for audit and future guardrails, but are not the primary
-score unless the benchmark contract changes. Do not optimize for raw SSD speed
-as a standalone target; optimize changes that reduce the measured prefill and
-decode timings.
+Diagnostic fields such as memory and read timings are recorded for audit and
+future guardrails, but are not the primary score unless the benchmark contract
+changes. There is no expert/weight-streaming bandwidth to report for this
+dense model: `bandwidth_gb_per_token` is always `0` with
+`bandwidth_source=ram_resident_model`. Do not optimize for that diagnostic
+field as a standalone target; optimize changes that reduce the measured
+prefill and decode timings.
 
 The benchmark charges decode setup to the decode measurement so model code
 cannot hide future-token work in an unscored seed-prefill phase.
@@ -155,9 +178,9 @@ Start with:
 ```
 
 This checks the local Swift/Xcode toolchain, builds the Swift harness and MLX
-Metal library, downloads or verifies the DeepSeek V4 Flash 4-bit reference
+Metal library, downloads or verifies the Gemma 4 31B 4-bit reference
 checkpoint, and prepares the local cache. If the repo disk is too small, put the
-reference cache on a larger SSD and set `MLXFAST_REFERENCE_CACHE_DIR` or
+reference cache on a larger volume and set `MLXFAST_REFERENCE_CACHE_DIR` or
 `MLXFAST_REFERENCE_DIR`.
 
 Common commands:
@@ -224,13 +247,18 @@ uploads the editable-path archive for official validation.
 
 Good submissions are likely to improve one or more of:
 
-- Expert tensor layout that reduces blocking work in measured prefill/decode.
-- Per-layer or cross-step expert cache policy that fits the 48 GB runner.
-- Predictive expert prefetch that lowers measured latency without depending on
-  hidden prompts.
-- MoE routing and dispatch overhead on the hot path.
-- Dense/shared weight loading and reuse.
-- KV cache handling and attention hot paths.
+- Attention kernel dispatch: sliding-window vs. full-attention masking, GQA
+ head-group broadcasting, and the full-attention layers' partial-rotary
+ ("proportional") RoPE.
+- Quantized matmul dispatch for the affine 4-bit (group size 64) dense
+ projections: fewer dequantize/copy steps, better batching across the gated
+ MLP's `gate_proj`/`up_proj`, and reuse of derived weight views.
+- KV cache handling: the sliding-window cache only ever needs the last 1024
+ positions; a tighter ring-buffer implementation can reduce both memory and
+ copy overhead relative to the straightforward baseline.
+- Dense weight loading and reuse: eager preparation at init, warm kernels
+ before the first scored forward, and avoiding redundant Data-to-Metal
+ conversions.
 - MLX operation scheduling and synchronization.
 - Transform metadata that lets runtime skip work safely.
 
@@ -241,52 +269,29 @@ public local fixtures, and official scoring happens on the Blacksmith runner.
 ## Avoid These Wrong Strategies
 
 Do not assume the benchmark machine has the same memory budget as your local
-Mac. In particular, do not build a solution that relies on keeping thousands of
-expert `MLXArray`s resident because it happens to fit on a high-memory local
-machine. The challenge is about making DeepSeek V4 Flash fast under the official
-runner contract, not about replacing SSD streaming with an unbounded in-memory
-expert cache.
-
-Avoid double-caching and cache bypasses that make diagnostics misleading. If
-you add a cache, account for its memory use, eviction behavior, and interaction
-with `ExpertSlotBank`; do not simply disable the existing byte cache or report
-fake read/cache metrics to make the run look better.
-
-Do not copy strategies from files outside this checkout or from parent
-directories unless they are part of the public challenge repository. A
-participant submission is judged from the submitted editable paths in this repo,
-and relying on local-only source trees makes the implementation non-reproducible
-for reviewers and the official runner.
+Mac. The official contract is an M3 Ultra with at least 256 GB of unified
+memory; the ~17 GB text tower is comfortably RAM-resident there. Local
+machines with less memory can still run the full model (32 GB+ recommended),
+so unlike a large MoE checkpoint there is no meaningfully different
+"streaming fallback" regime here to mistune against.
 
 Do not specialize for the public correctness prompt. Optimizations should be
-prompt-independent and model-general for DeepSeek V4 Flash. Hidden correctness,
-GPQA, and benchmark prompts are different from the public fixtures.
-
-Do not add caches or memos keyed on a request's input tokens whose only
-possible hit is the benchmark harness repeating an identical computation — for
-example, memoizing a whole-prompt forward's logits or KV state so a repeated
-identical forward can skip the work. Bit-identical output does not make this
-legitimate. The benchmark measures single-pass inference: optimizations must
-save work that recurs in single-pass production inference (one prefill, then
-decode, per prompt), not work that only exists in the measurement protocol.
-The harness never legitimately issues the same whole-prompt forward twice to
-one worker process; any such repetition is a harness bug, never a contract to
-rely on. Input-independent caching (weights, dequantized tensors, RoPE/mask
-tables keyed on shapes and offsets) and within-request KV reuse remain fine.
-Submissions in this category fail the static review as bypass behavior.
+prompt-independent and model-general for Gemma 4. Hidden correctness, GPQA,
+and benchmark prompts are different from the public fixtures.
 
 Do not treat local-only environment overrides as proof of a valid improvement.
 Examples include disabling the sandbox, skipping transform without verifying
 the produced `weights/`, pointing at a user-specific reference path, or tuning
-with a large cache size that is not part of the official benchmark contract.
-Those can be useful for debugging one machine, but they do not establish a
-rankable optimization.
+with settings that are not part of the official benchmark contract. Those can
+be useful for debugging one machine, but they do not establish a rankable
+optimization.
 
 Do not draw conclusions from a tiny local iterate run alone. Short local modes
 are smoke tests for speed and correctness direction. They are not substitutes
 for the official hidden benchmark, and they are especially weak for testing
-cache strategies because they may not exercise the same expert routing,
-sequence length, or memory pressure as the ranked run.
+sequence-length-dependent optimizations (e.g. attention kernel changes) since
+they may not exercise the same sequence lengths or memory pressure as the
+ranked run.
 
 ## Before Submitting
 
@@ -302,3 +307,16 @@ swift test
 If the local correctness gate fails, the official benchmark will not rank the
 submission. If local performance improves but correctness is fragile, prefer a
 more conservative optimization.
+
+Do not add caches or memos keyed on a request's input tokens whose only
+possible hit is the benchmark harness repeating an identical computation — for
+example, memoizing a whole-prompt forward's logits or KV state so a repeated
+identical forward can skip the work. Bit-identical output does not make this
+legitimate. The benchmark measures single-pass inference: optimizations must
+save work that recurs in single-pass production inference (one prefill, then
+decode, per prompt), not work that only exists in the measurement protocol.
+The harness never legitimately issues the same whole-prompt forward twice to
+one worker process; any such repetition is a harness bug, never a contract to
+rely on. Input-independent caching (weights, dequantized tensors, RoPE/mask
+tables keyed on shapes and offsets) and within-request KV reuse remain fine.
+Submissions in this category fail the static review as bypass behavior.

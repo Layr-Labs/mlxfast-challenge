@@ -80,24 +80,24 @@ func benchmarkWindowFreezeDocMatchesConstants() throws {
 
 @Test
 func timedDecodeChargesOneValidatedSeedForward() throws {
-    let worker = try packageFile("Sources/MLXFastHarness/DeepSeekRuntimeWorker.swift")
+    let worker = try packageFile("Sources/MLXFastHarness/GemmaRuntimeWorker.swift")
     let decodeBegin = try slice(worker, from: "case \"decode_begin\":", to: "case \"decode_step\":")
     // The one-forward/no-warmup property is also guarded by
     // BenchmarkScriptTests.decodeMeasurementRunsSingleUnmemoizableSeedForward;
     // this test intentionally supersets it (it additionally pins parent-timed,
     // oracle-validated measurement) so the freeze guard stands on its own.
     // Exactly one whole-prompt forward, and no warmup pass to memoize against it.
-    #expect(decodeBegin.components(separatedBy: "DeepSeekModel.logits(").count - 1 == 1)
+    #expect(decodeBegin.components(separatedBy: "Gemma4Model.logits(").count - 1 == 1)
     #expect(!decodeBegin.contains("warmupCache"))
     #expect(!decodeBegin.contains("warmupLogits"))
 
     // The decode phase is parent-timed and validated; worker-reported seconds
     // must not be the scored value, and both the seed and the steps are checked.
-    let benchmark = try packageFile("Sources/MLXFastHarness/DeepSeekRuntimeBenchmark.swift")
+    let benchmark = try packageFile("Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift")
     let measureWorkerDecode = try slice(
         benchmark,
         from: "static func measureWorkerDecode(",
-        to: "static func expertStreamingBandwidthGBPerToken("
+        to: "static let bandwidthSource"
     )
     #expect(measureWorkerDecode.contains("secondsSince(decodePhaseStart)"))
     #expect(measureWorkerDecode.contains("compareDecodeSeedToken"))
@@ -107,7 +107,7 @@ func timedDecodeChargesOneValidatedSeedForward() throws {
 
 @Test
 func timedPrefillChargesOneValidatedColdForward() throws {
-    let benchmark = try packageFile("Sources/MLXFastHarness/DeepSeekRuntimeBenchmark.swift")
+    let benchmark = try packageFile("Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift")
     let measureWorkerPrefill = try slice(
         benchmark,
         from: "static func measureWorkerPrefillSecondsPerToken(",
@@ -134,7 +134,7 @@ func scoredBaselinesResolveFromGoldenWithConstantsFallback() throws {
     #expect(golden.contains("baselineDecodeSecondsPerToken ?? MLXFastConstants.officialBaselineDecodeSecondsPerToken"))
     #expect(golden.contains("must be provided together"))
 
-    let benchmark = try packageFile("Sources/MLXFastHarness/DeepSeekRuntimeBenchmark.swift")
+    let benchmark = try packageFile("Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift")
     // Both benchmark paths adopt the golden's resolved baselines...
     #expect(benchmark.components(separatedBy: "benchmarkGolden.resolvedBaselinePrefillSecondsPerToken").count - 1 == 2)
     #expect(benchmark.components(separatedBy: "benchmarkGolden.resolvedBaselineDecodeSecondsPerToken").count - 1 == 2)
@@ -192,11 +192,11 @@ func officialTimingMachineMeasuresPairedBaseline() throws {
 
     // Harness side: paired override outranks golden-carried baselines, which
     // outrank constants, and the override keys never reach the worker.
-    let benchmark = try packageFile("Sources/MLXFastHarness/DeepSeekRuntimeBenchmark.swift")
+    let benchmark = try packageFile("Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift")
     #expect(benchmark.components(separatedBy: "PairedBaselineOverride.fromEnvironment()").count - 1 == 2)
     #expect(benchmark.contains("pairedBaseline?.prefillSecondsPerToken\n                ?? benchmarkGolden.resolvedBaselinePrefillSecondsPerToken"))
     #expect(benchmark.contains("pairedBaseline?.decodeSecondsPerToken\n                ?? benchmarkGolden.resolvedBaselineDecodeSecondsPerToken"))
-    let worker = try packageFile("Sources/MLXFastHarness/DeepSeekRuntimeWorker.swift")
+    let worker = try packageFile("Sources/MLXFastHarness/GemmaRuntimeWorker.swift")
     #expect(worker.contains("\"MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN\","))
     #expect(worker.contains("\"MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN\","))
 
@@ -218,5 +218,5 @@ func decodeValidationDelayHookDefaultsToNoOp() {
     // re-assert here is intentional: this file is meant to be the single,
     // self-contained guard for everything the frozen window depends on, so it
     // does not rely on an unrelated test staying green.
-    #expect(DeepSeekSubmissionControls.measuredDecodeDelayMilliseconds == 0)
+    #expect(Gemma4SubmissionControls.measuredDecodeDelayMilliseconds == 0)
 }

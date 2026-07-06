@@ -1,7 +1,7 @@
 public enum MLXFastConstants {
-    public static let referenceModelName = "DeepSeek-V4-Flash-4bit"
-    public static let defaultReferencePath = "reference_weights/DeepSeek-V4-Flash-4bit"
-    public static let defaultReferenceCachePath = ".cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main"
+    public static let referenceModelName = "gemma-4-31b-4bit"
+    public static let defaultReferencePath = "reference_weights/gemma-4-31b-4bit"
+    public static let defaultReferenceCachePath = ".cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main"
     public static let defaultWeightsPath = "weights"
     public static let defaultGoldenPath = "correctness_golden.json"
     public static let defaultPublicCorrectnessPromptPath = "correctness_prompts/public_longcopy_gate_english_512.txt"
@@ -10,15 +10,11 @@ public enum MLXFastConstants {
     public static let defaultScorePath = "score.json"
     public static let defaultLocalIterateScorePath = "score.local-iterate.json"
 
-    public static let vocabSize = 129_280
-    public static let hiddenSize = 4_096
-    public static let intermediateSize = 18_432
-    public static let moeIntermediateSize = 2_048
-    public static let numHiddenLayers = 43
-    public static let attentionHeads = 64
-    public static let keyValueHeads = 1
-    public static let routedExperts = 256
-    public static let expertsPerToken = 6
+    public static let vocabSize = 262_144
+    public static let hiddenSize = 5_376
+    public static let intermediateSize = 21_504
+    public static let numHiddenLayers = 60
+    public static let attentionHeads = 32
     public static let correctnessPromptTokens = 512
     // Keep the public gate long enough to catch broad decode regressions while
     // leaving budget for the hidden GPQA behavior checks in the official job.
@@ -38,7 +34,7 @@ public enum MLXFastConstants {
     // Semantic judging uses short hidden GPQA answers as a baseline-calibrated
     // hard gate for optimizations that preserve the exact prefix but damage
     // answer sense. Five cases keeps the full GitHub job near the 30-minute
-    // budget; baseline DeepSeek currently establishes a 3/5 threshold.
+    // budget.
     public static let semanticGPQACaseCount = 5
     public static let semanticGPQAMaxNewTokens = 10
     public static let semanticGPQAMinPassCount = 3
@@ -65,23 +61,24 @@ public enum MLXFastConstants {
     // and add minutes to the job -- keep zero warmup and one measured run.
     public static let benchmarkPrefillWarmupRuns = 0
     public static let benchmarkPrefillTimedRuns = 1
-    // Official baseline measured on the Blacksmith runner for this model. After
-    // changing timed windows, run one trusted baseline validation before using
-    // scores for the public leaderboard. Raw RAM, bandwidth, and read metrics
-    // remain audit fields instead of primary score factors.
-    //
-    // Decode recalibrated after the decode_begin single-seed change (the warmup
-    // forward was removed, so the reference model now streams experts cold for
-    // the seed prefill and reads slower on the decode axis): re-measured on the
-    // baseline reference under the current harness at 3.6366560638046876 s/tok
-    // (yukon/baseline run). Prefill is unchanged -- that path did not change, and
-    // the baseline run's prefill was within single-shot noise of the value below.
+    // STALE placeholders carried over from the previous challenge model era.
+    // These numeric values DO NOT reflect Gemma 4 31B 4-bit dense inference on
+    // the official runner. They MUST be recalibrated with a trusted Gemma
+    // baseline run (official Blacksmith M3 Ultra hardware) before any ranked
+    // scoring is meaningful.
+    // Until that recalibration lands, the paired-baseline (same-session
+    // measured reference) and per-prompt golden baseline paths -- both of
+    // which take precedence over these constants in the benchmark harness --
+    // cover the interim so a stale constant does not silently misprice a run.
     public static let officialBaselinePrefillSecondsPerToken = 0.17330563175390626
     public static let officialBaselineDecodeSecondsPerToken = 3.6366560638046876
     public static let scorePrefillWeight = 0.25
     public static let scoreDecodeWeight = 0.75
     public static let scorePrefillSpeedupFloor = 0.95
     public static let scoreDecodeSpeedupFloor = 0.95
+    // The Gemma 4 31B 4-bit text tower is ~17 GB; 25 GiB keeps ample headroom
+    // for shard alignment/padding without approving a second full copy of the
+    // model.
     public static let defaultMaxTransformedWeightsBytes = 25 * 1024 * 1024 * 1024
     public static let defaultMaxSubmissionSourceBytes = 256 * 1024 * 1024
     // Diagnostic (non-ranking) real-valued score fields are published rounded to

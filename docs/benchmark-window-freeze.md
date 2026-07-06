@@ -74,6 +74,16 @@ Measured on the baseline reference under the current (single-seed) harness:
 - `officialBaselinePrefillSecondsPerToken = 0.17330563175390626`
   (prefill path unchanged; within single-shot noise of the prior value).
 
+**Migration status:** these literals were measured against the previous
+challenge model (DeepSeek V4 Flash) and are stale placeholders for Gemma 4
+31B 4-bit — `Constants.swift` says the same. They must be recalibrated with
+a trusted Gemma baseline run on the official hardware, together with the
+pinned paired-baseline ref below; see item 5 of
+`docs/gemma-migration-r2-checklist.md`. Until then the paired-baseline and
+golden-carried baseline paths (which outrank the constants) cover the
+interim, and the constants' remaining roles (local-mode scoring, gates-only
+placeholder timing, sanity-band anchor) knowingly run on placeholder values.
+
 If either number here disagrees with `Sources/MLXFastCore/Constants.swift`, the
 freeze test fails on purpose -- the doc and the code must move together.
 

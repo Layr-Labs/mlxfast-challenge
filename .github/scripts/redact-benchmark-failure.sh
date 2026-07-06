@@ -49,7 +49,7 @@ if [[ -s "${score_path}" ]]; then
     timed_benchmark_seconds="$(jq '.metrics.timed_benchmark_seconds' "${score_path}")"
 
     # Categories are matched ONLY against fixed prefixes that the trusted
-    # harness itself authors (DeepSeekRuntimeBenchmark). Anything else --
+    # harness itself authors (GemmaRuntimeBenchmark). Anything else --
     # including error text that originated inside the sandboxed worker -- is
     # deliberately collapsed to an opaque category.
     if [[ "${error_text}" == "performance floor failed"* ]]; then
@@ -64,8 +64,12 @@ if [[ -s "${score_path}" ]]; then
       if [[ "${first_failing_step}" =~ ^[0-9]+$ ]]; then
         step_bucket="$((first_failing_step / 32 * 32))"
       fi
-    elif [[ "${error_text}" == *"bypassed the trusted expert-streaming path"* ]]; then
-      category="seed_read_implausible"
+    # The expert-streaming byte-read plausibility category
+    # ("seed_read_implausible") was removed with the dense Gemma migration:
+    # the harness no longer authors that error prefix because there is no
+    # streaming path to meter. Its threat (hiding timed work outside the
+    # measured window) is covered by the single-seed timed decode protocol
+    # and the submission static review.
     elif [[ "${passed_correctness}" == "false" ]]; then
       category="correctness_failed"
     elif [[ -n "${error_text}" ]]; then

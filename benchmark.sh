@@ -40,9 +40,9 @@ fi
 # else use reference_weights/ only when it actually holds a checkpoint, resolved to
 # its real target so the transform never opens a symlinked directory; else fall
 # back to the Hugging Face cache setup.sh downloads into.
-REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/DeepSeek-V4-Flash-4bit}"
+REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/gemma-4-31b-4bit}"
 REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-main}"
-REFERENCE_DEFAULT_DIR="reference_weights/DeepSeek-V4-Flash-4bit"
+REFERENCE_DEFAULT_DIR="reference_weights/gemma-4-31b-4bit"
 REFERENCE_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}"
 REFERENCE_HF_HUB_CACHE="${MLXFAST_HF_HUB_CACHE:-${HF_HUB_CACHE:-${REFERENCE_HF_HOME}/hub}}"
 REFERENCE_CACHE_DIR="${MLXFAST_REFERENCE_CACHE_DIR:-${REFERENCE_HF_HUB_CACHE}/models--${REFERENCE_MODEL_REPO//\//--}/snapshots/${REFERENCE_REVISION//\//--}}"

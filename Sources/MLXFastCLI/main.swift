@@ -42,6 +42,9 @@ private enum MLXFastCLI {
             case "attach-free-run-gate":
                 try runAttachFreeRunGate(options)
                 return 0
+            case "generate-golden":
+                try runGenerateGolden(options)
+                return 0
             case "generate-gpqa-answers":
                 try runGenerateGPQAAnswers(options)
                 return 0
@@ -84,8 +87,8 @@ private enum MLXFastCLI {
         print("reference: \(report.referencePath)")
         print("output: \(report.outputPath)")
         print("dense tensors: \(report.denseTensorCount) across \(report.denseShardCount) shard(s)")
-        print("expert tensors: \(report.expertTensorCount)")
-        print("expert manifest: \(report.manifestPath)")
+        print("config: \(report.configPath)")
+        print("index: \(report.indexPath)")
     }
 
     private static func runVerifyTransform(_ options: ParsedOptions) throws {
@@ -173,7 +176,7 @@ private enum MLXFastCLI {
             let sidecar = "{\"step_range_start\":\(stepStart),\"step_range_end\":\(stepStart + stepCount)}\n"
             try sidecar.write(toFile: stepRangeOutputPath, atomically: true, encoding: .utf8)
         }
-        let report = try DeepSeekRuntime.runCorrectness(
+        let report = try GemmaRuntime.runCorrectness(
             CorrectnessOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
@@ -239,7 +242,7 @@ private enum MLXFastCLI {
             throw MLXFastError.invalidInput("--top-k must be a positive integer")
         }
         let caseName = options.value(for: "--case", default: "")
-        let report = try DeepSeekRuntime.traceCorrectness(
+        let report = try GemmaRuntime.traceCorrectness(
             CorrectnessTraceOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
@@ -328,7 +331,7 @@ private enum MLXFastCLI {
             let timingRepeats = localSubmit ? MLXFastConstants.localSubmitBenchmarkRepeats : 1
             let modeName = localSubmit ? "local-submit" : "local-iterate"
             let runtime = localSubmit ? "swift-local-submit" : "swift-local-iterate"
-            let payload = DeepSeekRuntime.localIterate(
+            let payload = GemmaRuntime.localIterate(
                 LocalIterateOptions(
                     weightsPath: weightsPath,
                     goldenPath: goldenPath,
@@ -387,7 +390,7 @@ private enum MLXFastCLI {
         // reproducing the original, single-machine behavior exactly.
         let checkGates = environmentValue("MLXFAST_BENCHMARK_CHECK_GATES", fallback: "1") != "0"
         let skipTimedBenchmark = environmentValue("MLXFAST_BENCHMARK_SKIP_TIMED", fallback: "0") == "1"
-        let payload = DeepSeekRuntime.benchmark(
+        let payload = GemmaRuntime.benchmark(
             BenchmarkOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
@@ -656,7 +659,7 @@ private enum MLXFastCLI {
                 + "(covers decode offsets \(promptTokens.count)..<\(promptTokens.count + steps))\n",
             stderr
         )
-        let expectedTokens = try DeepSeekRuntime.generateGreedyTokens(
+        let expectedTokens = try GemmaRuntime.generateGreedyTokens(
             GreedyGenerationOptions(
                 weightsPath: weightsPath,
                 promptTokens: promptTokens,
@@ -692,6 +695,118 @@ private enum MLXFastCLI {
                 + "decode_offsets=\(promptTokens.count)..<\(promptTokens.count + steps) "
                 + "exact_prefix=\(exactPrefixTokens.map(String.init) ?? "full") "
                 + "output=\(outputPath)"
+        )
+    }
+
+    // Operator tool: generate a BASE golden case (the version-1 cases[] shape
+    // consumed by `correctness` and the local benchmark modes) from a public
+    // prompt text file against the reference weights. This is how the
+    // checked-in public fixtures under correctness_prompts/ are produced:
+    // tokenize the prompt with the weights-dir tokenizer using the same
+    // addSpecialTokens convention as attach-free-run-gate's prompt-file path,
+    // keep exactly the required 512 prompt tokens, greedy-generate the
+    // requested continuation with the reference model, and write a fixture
+    // that passes the strict loader at that step count. Greedy decoding is
+    // deterministic, so fixtures generated from the same prompt at different
+    // step counts are prefix-identical by construction.
+    private static func runGenerateGolden(_ options: ParsedOptions) throws {
+        try options.validate(
+            valueOptions: ["--prompt-file", "--weights", "--tokenizer", "--output", "--name", "--steps"]
+        )
+        let promptFile = options.value(for: "--prompt-file", default: "")
+        guard !promptFile.isEmpty else {
+            throw MLXFastError.invalidInput("generate-golden requires --prompt-file PATH")
+        }
+        let weightsPath = options.value(
+            for: "--weights",
+            default: environmentValue("MLXFAST_WEIGHTS_PATH", fallback: MLXFastConstants.defaultWeightsPath)
+        )
+        let tokenizerPath = options.value(for: "--tokenizer", default: weightsPath)
+        let outputPath = options.value(for: "--output", default: "")
+        guard !outputPath.isEmpty else {
+            throw MLXFastError.invalidInput("generate-golden requires --output PATH")
+        }
+        let caseName = options.value(for: "--name", default: "")
+        guard !caseName.isEmpty else {
+            throw MLXFastError.invalidInput("generate-golden requires --name NAME")
+        }
+        let steps = try parsePositiveInt(
+            options.value(for: "--steps", default: ""),
+            optionName: "--steps"
+        )
+        guard steps >= MLXFastConstants.correctnessSteps else {
+            // The strict fixture loader rejects base cases shorter than the
+            // correctness window, so fail before spending any generation time.
+            throw MLXFastError.invalidInput(
+                "--steps must be >= correctnessSteps \(MLXFastConstants.correctnessSteps)"
+            )
+        }
+
+        try requireFile(promptFile, description: "golden prompt text file")
+        try requireFile(
+            URL(fileURLWithPath: tokenizerPath).appendingPathComponent("tokenizer.json").path,
+            description: "tokenizer.json"
+        )
+        try requireFile(
+            URL(fileURLWithPath: weightsPath).appendingPathComponent("config.json").path,
+            description: "weights config.json"
+        )
+
+        let requiredPromptTokens = MLXFastConstants.correctnessPromptTokens
+        let tokenizer = try loadLocalTokenizer(at: tokenizerPath)
+        let promptText = try String(contentsOfFile: promptFile, encoding: .utf8)
+        let encoded = tokenizer.encode(text: promptText, addSpecialTokens: false)
+        guard encoded.count >= requiredPromptTokens else {
+            throw MLXFastError.invalidInput(
+                "--prompt-file tokenized to \(encoded.count) tokens; base golden cases need at least \(requiredPromptTokens)"
+            )
+        }
+        let promptTokens = Array(encoded.prefix(requiredPromptTokens))
+
+        fputs(
+            "generate-golden: generating \(steps) reference continuation tokens "
+                + "for case \(caseName) (prompt_tokens=\(promptTokens.count))\n",
+            stderr
+        )
+        let expectedTokens = try GemmaRuntime.generateGreedyTokens(
+            GreedyGenerationOptions(
+                weightsPath: weightsPath,
+                promptTokens: promptTokens,
+                steps: steps
+            ),
+            // Block the output path like the attach tools block their input
+            // golden: when regenerating an existing fixture in place, the
+            // worker running submitted-surface model code must not be able to
+            // read the fixture it is being asked to reproduce.
+            worker: try runtimeWorkerOptions(blockedGoldenPath: outputPath)
+        )
+
+        let document = GoldenDocument(
+            version: 1,
+            cases: [
+                GoldenCase(
+                    name: caseName,
+                    promptTokens: promptTokens,
+                    expectedTokens: expectedTokens
+                )
+            ],
+            benchmark: nil
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        try writeValidatedGoldenDocument(encoder.encode(document), to: outputPath)
+        // The staging write above validates at the default correctness window;
+        // re-validate at the full generated step count so the written fixture
+        // provably satisfies the consumer that needs every step (local-submit
+        // requires benchmarkDecodeSteps + 1 expected tokens, etc.).
+        _ = try loadGoldenFixture(
+            from: outputPath,
+            requiredSteps: steps,
+            requiredPromptTokens: requiredPromptTokens
+        )
+        print(
+            "generated golden case=\(caseName) prompt_tokens=\(promptTokens.count) "
+                + "expected_tokens=\(expectedTokens.count) output=\(outputPath)"
         )
     }
 
@@ -797,7 +912,7 @@ private enum MLXFastCLI {
                 continue
             }
 
-            let generated = try DeepSeekRuntime.generateGreedyTokens(
+            let generated = try GemmaRuntime.generateGreedyTokens(
                 GreedyGenerationOptions(
                     weightsPath: weightsPath,
                     promptTokens: promptTokens,
@@ -1246,7 +1361,7 @@ private enum MLXFastCLI {
                 fallback: MLXFastConstants.defaultWeightsPath
             )
         )
-        try DeepSeekRuntime.runWorker(weightsPath: weightsPath)
+        try GemmaRuntime.runWorker(weightsPath: weightsPath)
     }
 
     private static func runCheckpointShards(_ options: ParsedOptions) throws {
@@ -1272,10 +1387,11 @@ private enum MLXFastCLI {
               mlxfast-swift benchmark [--local-submit|--local-iterate] [--weights PATH] [--golden PATH] [--score-path PATH]
               mlxfast-swift attach-gpqa-gates [--golden PATH] --gpqa PATH [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
               mlxfast-swift attach-free-run-gate [--golden PATH] [--weights PATH] [--output PATH] [--name NAME] [--steps N] [--allow-partial] [--case NAME | --prompt-file PATH [--tokenizer PATH]] [--exact-prefix N]
+              mlxfast-swift generate-golden --prompt-file PATH [--weights PATH] [--tokenizer PATH] --output PATH --name NAME --steps N
               mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]
               mlxfast-swift checkpoint-shards --index PATH
 
-            Swift-only DeepSeek V4 Flash harness entrypoint.
+            Swift-only Gemma 4 31B 4-bit harness entrypoint.
             """
         )
     }

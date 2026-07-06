@@ -100,4 +100,4 @@ jobs:
 
       - name: Unit tests without Metal runtime
         run: |
-          swift test --filter 'Transform|BenchmarkSupport|Golden|Score|CheckpointIndex|Safetensors|DenseTensorStore|ExpertSlotBank|DeepSeekConfig|DeepSeekCorrectness|CorrectnessReport|TensorData|MLXTensorBridgeMaps'
+          swift test --filter 'Transform|BenchmarkSupport|Golden|Score|CheckpointIndex|Safetensors|DenseTensorStore|gemma4Config|gemmaCorrectness|correctnessReport|TensorData|MLXTensorBridgeMaps'

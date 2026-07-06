@@ -34,7 +34,11 @@ permissions:
 jobs:
   run:
     runs-on: blacksmith-12vcpu-macos-26
-    timeout-minutes: 720
+    # Reduced from the 720min expert-streaming-era budget: the dense Gemma
+    # model downloads ~18.4 GB and runs timing/gates from RAM (the timing
+    # machine also builds and measures the paired baseline). Still generous
+    # until the recalibrated Gemma baseline pins real phase timings.
+    timeout-minutes: 360
     environment: benchmark-private-prompts
     env:
       MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.mode }}
@@ -47,6 +51,12 @@ jobs:
       MLXFAST_IS_SUBMISSION_BRANCH: ${{ (startsWith(github.ref_name, 'submissions/')) && '1' || '0' }}
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
       MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}
+      # TODO(gemma-r2): regenerate/upload for Gemma. Both hidden R2 objects
+      # below (the benchmark/correctness golden with its embedded timed-prompt
+      # oracle, and the GPQA reference cases with accepted token sequences)
+      # are still DeepSeek-tokenized; they must be regenerated from the Gemma
+      # 4 31B 4-bit reference and re-uploaded before ranked runs can pass.
+      # See docs/gemma-migration-r2-checklist.md.
       MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json
       MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases.json
       MLXFAST_GPQA_CASE_COUNT: "5"
@@ -56,8 +66,8 @@ jobs:
       MLXFAST_SEMANTIC_GPQA_MIN_PASS: "3"
       MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
       MLXFAST_SEMANTIC_GPQA_MODEL: claude-sonnet-4-5-20250929
-      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_deepseek_v4_flash_4bit.sha256
-      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/main
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
+      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
       MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}
       MLXFAST_VERIFY_TRANSFORM: ${{ inputs.verify_transform && '1' || '0' }}
@@ -132,7 +142,7 @@ jobs:
 
       - name: Setup Swift harness and reference checkpoint
         env:
-          MLXFAST_REFERENCE_BASE_URL: ${{ secrets.MLXFAST_REFERENCE_BASE_URL || 'https://ds4.darkbloom.ai/deepseek-v4-flash-4bit' }}
+          MLXFAST_REFERENCE_BASE_URL: ${{ secrets.MLXFAST_REFERENCE_BASE_URL || 'https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main' }}
           MLXFAST_REFERENCE_AUTH_HEADER: ${{ secrets.MLXFAST_REFERENCE_AUTH_HEADER }}
           MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
           MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
@@ -224,8 +234,11 @@ jobs:
         # hidden gates, so submitted code gets no new phase-detection signal.
         run: |
           set -euo pipefail
+          # Pinned to the checked-in Gemma 4 31B 4-bit public fixture
+          # generated with `mlxfast-swift generate-golden`; regenerating the
+          # fixture must move this pin (enforced by BenchmarkScriptTests).
           public_golden="correctness_prompts/public_longcopy_gate_english_512_256.json"
-          public_golden_sha256="2a747bf797e16d58f5ffedacc0d4bf5ce0d14be00f2421dc04289a2154cb011d"
+          public_golden_sha256="7c33861bdf062b08a96a97bf5b388b541edc95b4cc46afc4f98ce9cb46856782"
           actual_hash="$(shasum -a 256 "${public_golden}" | awk '{print $1}')"
           if [[ "${actual_hash}" != "${public_golden_sha256}" ]]; then
             echo "benchmark-timing-or-gates: public correctness golden hash mismatch (${actual_hash})" >&2
@@ -274,6 +287,11 @@ jobs:
           # same code the calibrated constants were measured against. Changing
           # this ref is a ranking-contract change: follow the freeze doc's
           # paired-baseline protocol and update the pinned guard test.
+          # TODO(gemma-baseline): this pinned ref still builds the previous
+          # (DeepSeek-era) reference implementation and cannot run the Gemma
+          # checkpoint; repoint it to the trusted Gemma 4 baseline commit once
+          # the migration lands on main and the official baseline is
+          # recalibrated (update the freeze doc + pinned guard test together).
           ref: 7e2191c229d0dcf6ea76cd1f78a93b50adb6c574
           path: paired-baseline
           persist-credentials: false

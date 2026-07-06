@@ -26,7 +26,7 @@ func runtimeWorkerEnvironmentStripsOfficialRunAndCIIdentity() {
         "MLXFAST_PRIVATE_DIR": "/private/golden",
         "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE": "/tmp/profile.sb",
         "R2_ACCESS_KEY_ID": "key",
-        "MLXFAST_EXPERT_CACHE_TENSORS": "42",
+        "MLXFAST_MAX_WEIGHTS_BYTES": "42",
         "PATH": "/usr/bin",
         // A gates-only or timing-only parallel-split machine sets these to
         // tell the trusted CLI which half of the original single-machine run
@@ -73,7 +73,7 @@ func runtimeWorkerEnvironmentStripsOfficialRunAndCIIdentity() {
         #expect(sanitized[key] == nil)
     }
     #expect(sanitized["MLXFAST_USE_RUNTIME_WORKER"] == "0")
-    #expect(sanitized["MLXFAST_EXPERT_CACHE_TENSORS"] == "42")
+    #expect(sanitized["MLXFAST_MAX_WEIGHTS_BYTES"] == "42")
     #expect(sanitized["PATH"] == "/usr/bin")
 }
 
@@ -146,9 +146,9 @@ func semanticBehaviorGateRequiresPromptAndReferenceAnswer() {
         semanticReferenceAnswer: "answer"
     )
 
-    #expect(!DeepSeekRuntime.behaviorUsesSemanticJudge(exactOnly))
-    #expect(!DeepSeekRuntime.behaviorUsesSemanticJudge(missingReference))
-    #expect(DeepSeekRuntime.behaviorUsesSemanticJudge(semantic))
+    #expect(!GemmaRuntime.behaviorUsesSemanticJudge(exactOnly))
+    #expect(!GemmaRuntime.behaviorUsesSemanticJudge(missingReference))
+    #expect(GemmaRuntime.behaviorUsesSemanticJudge(semantic))
 }
 
 @Test
@@ -178,13 +178,6 @@ func failedScoreRedactsCorrectnessTokenMismatchByDefault() {
         passed: false,
         checkedSteps: 7,
         caseCount: 1,
-        expertCacheHits: 0,
-        expertCacheMisses: 0,
-        expertCacheEvictions: 0,
-        expertBytesRead: 0,
-        expertReadSeconds: 0,
-        expertPeakCachedTensors: 0,
-        expertHitRate: 0,
         firstFailingCase: "local-iterate",
         firstFailingStep: 6,
         expectedToken: 123,
@@ -193,7 +186,7 @@ func failedScoreRedactsCorrectnessTokenMismatchByDefault() {
         error: "token mismatch"
     )
 
-    let payload = DeepSeekRuntime.failedScore(
+    let payload = GemmaRuntime.failedScore(
         error: "token mismatch",
         correctness: report,
         passedCorrectness: false,
@@ -207,6 +200,7 @@ func failedScoreRedactsCorrectnessTokenMismatchByDefault() {
     #expect(payload.metrics.firstFailingStep == 6)
     #expect(payload.metrics.expectedToken == nil)
     #expect(payload.metrics.actualToken == nil)
+    #expect(payload.metrics.bandwidthGBPerToken == 0)
 }
 
 @Test
@@ -215,13 +209,6 @@ func failedScorePreservesExplicitPublicMismatchTokensAndRuntimeLabel() {
         passed: false,
         checkedSteps: 7,
         caseCount: 1,
-        expertCacheHits: 0,
-        expertCacheMisses: 0,
-        expertCacheEvictions: 0,
-        expertBytesRead: 0,
-        expertReadSeconds: 0,
-        expertPeakCachedTensors: 0,
-        expertHitRate: 0,
         firstFailingCase: "local-iterate",
         firstFailingStep: 6,
         expectedToken: 123,
@@ -230,7 +217,7 @@ func failedScorePreservesExplicitPublicMismatchTokensAndRuntimeLabel() {
         error: "token mismatch"
     )
 
-    let payload = DeepSeekRuntime.failedScore(
+    let payload = GemmaRuntime.failedScore(
         error: "token mismatch",
         correctness: report,
         passedCorrectness: false,
@@ -276,43 +263,8 @@ func decodeTimingPlanRejectsInvalidRanges() throws {
 
 @Test
 func submissionValidationDelayDefaultsToZero() throws {
-    #expect(DeepSeekSubmissionControls.measuredDecodeDelayMilliseconds == 0)
-    #expect(try DeepSeekRuntime.submissionValidationDelayMilliseconds() == 0)
-}
-
-@Test
-func seedForwardExpertReadGateFlagsBypassedForward() throws {
-    // A real seed prefill reads far more expert bytes than one decode step: passes.
-    try DeepSeekRuntime.requirePlausibleSeedForwardExpertReads(
-        seedForwardBytesRead: 40 * (1 << 30),
-        decodeStepsBytesRead: 128 * (1 << 30),
-        decodeSteps: 128
-    )
-    // A seed served from an in-process memo reads ~0 expert bytes while the
-    // decode steps still stream: must be flagged.
-    #expect(throws: MLXFastError.self) {
-        try DeepSeekRuntime.requirePlausibleSeedForwardExpertReads(
-            seedForwardBytesRead: 0,
-            decodeStepsBytesRead: 128 * (1 << 30),
-            decodeSteps: 128
-        )
-    }
-    // A seed that read something but still below a single decode step's bytes is
-    // implausible for a 512-token forward: flagged.
-    #expect(throws: MLXFastError.self) {
-        try DeepSeekRuntime.requirePlausibleSeedForwardExpertReads(
-            seedForwardBytesRead: (1 << 30) - 1,
-            decodeStepsBytesRead: 128 * (1 << 30),
-            decodeSteps: 128
-        )
-    }
-    #expect(throws: MLXFastError.self) {
-        try DeepSeekRuntime.requirePlausibleSeedForwardExpertReads(
-            seedForwardBytesRead: 1,
-            decodeStepsBytesRead: 0,
-            decodeSteps: 0
-        )
-    }
+    #expect(Gemma4SubmissionControls.measuredDecodeDelayMilliseconds == 0)
+    #expect(try GemmaRuntime.submissionValidationDelayMilliseconds() == 0)
 }
 
 @Test
@@ -402,16 +354,6 @@ func benchmarkPreflightHonorsConfiguredWeightsByteLimit() throws {
 }
 
 @Test
-func benchmarkPreflightRejectsMissingExpertManifest() throws {
-    let fixture = try makePreflightFixture(writeManifest: false)
-    defer { try? FileManager.default.removeItem(at: fixture.root) }
-
-    #expect(throws: MLXFastError.self) {
-        _ = try checkPreflight(fixture)
-    }
-}
-
-@Test
 func benchmarkPreflightRejectsMalformedGolden() throws {
     let fixture = try makePreflightFixture(goldenContents: "{}")
     defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -465,22 +407,6 @@ func correctnessPreflightAcceptsPublicGoldenWithoutBenchmarkOracle() throws {
 }
 
 @Test
-func correctnessPreflightRejectsExpertManifestOutsideAllowedReferenceRoots() throws {
-    let fixture = try makePreflightFixture(goldenContents: correctnessOnlyGoldenJSON())
-    defer { try? FileManager.default.removeItem(at: fixture.root) }
-
-    #expect(throws: MLXFastError.self) {
-        _ = try BenchmarkPreflight.checkCorrectnessArtifacts(
-            weightsPath: fixture.weights.path,
-            goldenPath: fixture.golden.path,
-            environment: [
-                "MLXFAST_REFERENCE_DIR": fixture.root.appendingPathComponent("different-reference").path,
-            ]
-        )
-    }
-}
-
-@Test
 func correctnessPreflightHonorsConfiguredWeightsByteLimit() throws {
     let fixture = try makePreflightFixture(goldenContents: correctnessOnlyGoldenJSON())
     defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -512,7 +438,7 @@ func nonWorkerBenchmarkRejectsBehaviorGatesBecauseTTFTRequiresWorker() throws {
     let fixture = try makePreflightFixture(goldenContents: validGoldenJSON(correctnessGates: behaviorGate))
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
-    let score = DeepSeekRuntime.benchmark(
+    let score = GemmaRuntime.benchmark(
         BenchmarkOptions(
             weightsPath: fixture.weights.path,
             goldenPath: fixture.golden.path,
@@ -532,69 +458,18 @@ func nonWorkerBenchmarkRejectsBehaviorGatesBecauseTTFTRequiresWorker() throws {
 }
 
 @Test
-func runtimeCorrectnessRunsArtifactPreflightBeforeModelExecution() throws {
-    let fixture = try makePreflightFixture(goldenContents: correctnessOnlyGoldenJSON())
-    defer { try? FileManager.default.removeItem(at: fixture.root) }
-
-    let report = try DeepSeekRuntime.runCorrectness(
-        CorrectnessOptions(weightsPath: fixture.weights.path, goldenPath: fixture.golden.path)
-    )
-
-    #expect(!report.passed)
-    #expect(report.checkedSteps == 0)
-    #expect(report.error.contains("expert manifest reference_path must be under"))
-}
-
-@Test
 func benchmarkPreflightRejectsMissingSemanticTensor() throws {
-    let fixture = try makePreflightFixture(omitDenseTensorName: DeepSeekWeightNames.finalNorm[0])
+    let fixture = try makePreflightFixture(omitDenseTensorName: Gemma4WeightNames.finalNorm)
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: MLXFastError.self) {
         _ = try checkPreflight(fixture)
-    }
-}
-
-@Test
-func benchmarkPreflightRejectsUnreadableExpertByteRange() throws {
-    let fixture = try makePreflightFixture(expertByteLengthOverride: 1_000_000)
-    defer { try? FileManager.default.removeItem(at: fixture.root) }
-
-    #expect(throws: MLXFastError.self) {
-        _ = try checkPreflight(fixture)
-    }
-}
-
-@Test
-func benchmarkPreflightAllowsConfiguredExternalReferenceRoot() throws {
-    let fixture = try makePreflightFixture()
-    defer { try? FileManager.default.removeItem(at: fixture.root) }
-
-    let report = try checkPreflight(fixture)
-
-    #expect(report.weightsPath == fixture.weights.path)
-}
-
-@Test
-func benchmarkPreflightRejectsExpertManifestOutsideAllowedReferenceRoots() throws {
-    let fixture = try makePreflightFixture()
-    defer { try? FileManager.default.removeItem(at: fixture.root) }
-
-    #expect(throws: MLXFastError.self) {
-        _ = try BenchmarkPreflight.check(
-            weightsPath: fixture.weights.path,
-            goldenPath: fixture.golden.path,
-            environment: [
-                "MLXFAST_REFERENCE_DIR": fixture.root.appendingPathComponent("different-reference").path,
-            ]
-        )
     }
 }
 
 private struct PreflightFixture {
     let root: URL
     let weights: URL
-    let reference: URL
     let golden: URL
 }
 
@@ -602,16 +477,13 @@ private struct TensorFixture {
     let name: String
     let dtype: String
     let shape: [Int]
-    let data: Data
 }
 
 private func checkPreflight(
     _ fixture: PreflightFixture,
-    environment extraEnvironment: [String: String] = [:]
+    environment: [String: String] = [:]
 ) throws -> BenchmarkPreflightReport {
-    var environment = extraEnvironment
-    environment["MLXFAST_REFERENCE_DIR"] = fixture.reference.path
-    return try BenchmarkPreflight.check(
+    try BenchmarkPreflight.check(
         weightsPath: fixture.weights.path,
         goldenPath: fixture.golden.path,
         environment: environment
@@ -620,11 +492,9 @@ private func checkPreflight(
 
 private func checkCorrectnessPreflight(
     _ fixture: PreflightFixture,
-    environment extraEnvironment: [String: String] = [:]
+    environment: [String: String] = [:]
 ) throws -> BenchmarkPreflightReport {
-    var environment = extraEnvironment
-    environment["MLXFAST_REFERENCE_DIR"] = fixture.reference.path
-    return try BenchmarkPreflight.checkCorrectnessArtifacts(
+    try BenchmarkPreflight.checkCorrectnessArtifacts(
         weightsPath: fixture.weights.path,
         goldenPath: fixture.golden.path,
         environment: environment
@@ -632,26 +502,20 @@ private func checkCorrectnessPreflight(
 }
 
 private func makePreflightFixture(
-    writeManifest: Bool = true,
     goldenContents: String? = nil,
-    omitDenseTensorName: String? = nil,
-    expertByteLengthOverride: Int? = nil
+    omitDenseTensorName: String? = nil
 ) throws -> PreflightFixture {
     let directory = try temporaryDirectory()
     let weights = directory.appendingPathComponent("weights", isDirectory: true)
-    let reference = directory.appendingPathComponent("reference", isDirectory: true)
-    let experts = weights.appendingPathComponent("experts", isDirectory: true)
     try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
-    try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try FileManager.default.createDirectory(at: experts, withIntermediateDirectories: true)
 
-    try minimalDeepSeekConfigJSON().write(
+    try minimalGemma4ConfigJSON().write(
         to: weights.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
     )
 
-    var denseTensors = requiredDenseTensorFixtures()
+    var denseTensors = requiredGemma4DenseTensorFixtures()
     if let omitDenseTensorName {
         denseTensors.removeAll { $0.name == omitDenseTensorName }
     }
@@ -663,33 +527,28 @@ private func makePreflightFixture(
         shardName: denseShard
     )
 
-    let expertTensors = requiredStackedExpertTensorFixtures()
-    let expertShard = "expert-00001.safetensors"
-    try writeSafetensors(reference.appendingPathComponent(expertShard), tensors: expertTensors)
-    if writeManifest {
-        try writeExpertManifest(
-            experts.appendingPathComponent("manifest.json"),
-            referencePath: reference.path,
-            shardName: expertShard,
-            tensors: expertTensors,
-            expertByteLengthOverride: expertByteLengthOverride
-        )
-    }
-
     let golden = directory.appendingPathComponent("correctness_golden.json")
     try (goldenContents ?? validGoldenJSON()).write(to: golden, atomically: true, encoding: .utf8)
 
-    return PreflightFixture(root: directory, weights: weights, reference: reference, golden: golden)
+    return PreflightFixture(root: directory, weights: weights, golden: golden)
 }
 
-private func minimalDeepSeekConfigJSON() -> String {
+private func minimalGemma4ConfigJSON() -> String {
     """
     {
-      "model_type": "deepseek_v4",
+      "model_type": "gemma4_text",
       "vocab_size": \(MLXFastConstants.vocabSize),
+      "hidden_size": \(MLXFastConstants.hiddenSize),
+      "intermediate_size": \(MLXFastConstants.intermediateSize),
       "num_hidden_layers": \(MLXFastConstants.numHiddenLayers),
-      "n_routed_experts": \(MLXFastConstants.routedExperts),
-      "num_experts_per_tok": \(MLXFastConstants.expertsPerToken)
+      "num_attention_heads": \(MLXFastConstants.attentionHeads),
+      "num_key_value_heads": 16,
+      "num_global_key_value_heads": 4,
+      "head_dim": 256,
+      "global_head_dim": 512,
+      "attention_k_eq_v": true,
+      "sliding_window": 1024,
+      "tie_word_embeddings": true
     }
     """
 }
@@ -742,151 +601,97 @@ private func correctnessOnlyGoldenJSON() -> String {
     """
 }
 
-private func requiredDenseTensorFixtures() -> [TensorFixture] {
-    var tensors: [String: TensorFixture] = [:]
-    func add(_ candidates: [String], shape: [Int]) {
-        let name = candidates[0]
-        tensors[name] = TensorFixture(
-            name: name,
-            dtype: "U8",
-            shape: shape,
-            data: Data([UInt8((tensors.count % 251) + 1)])
-        )
-    }
-
+/// Every tensor `Gemma4WeightLoader.validateRequiredMetadata` requires for the
+/// full frozen shape (60 layers, alternating five sliding + one full-attention
+/// layer per block). Real byte contents do not matter for these preflight
+/// tests -- only declared dtype/shape -- so linear weights use the same
+/// packed `U32` (affine 4-bit, 8 values/word) layout the real checkpoint
+/// ships, which keeps the sparse fixture files under the default transformed-
+/// weights byte cap the way the small norm/scalar tensors alone could not.
+private func requiredGemma4DenseTensorFixtures() -> [TensorFixture] {
     let hidden = MLXFastConstants.hiddenSize
+    let intermediate = MLXFastConstants.intermediateSize
     let vocab = MLXFastConstants.vocabSize
     let layers = MLXFastConstants.numHiddenLayers
-    let routedExperts = MLXFastConstants.routedExperts
-    let moe = MLXFastConstants.moeIntermediateSize
     let heads = MLXFastConstants.attentionHeads
-    let headDim = 512
-    let qLoraRank = 1_024
-    let outputGroups = 8
-    let outputLoraRank = 1_024
-    let groupedInput = heads * headDim / outputGroups
-    let hcMult = 4
-    let hcMix = (2 + hcMult) * hcMult
-    let indexHeads = 64
-    let indexHeadDim = 128
-    let compressRatios = DeepSeekConfig.defaultCompressRatios(layerCount: layers)
+    let headDim = 256
+    let globalHeadDim = 512
+    let kvHeads = 16
+    let globalKVHeads = 4
 
-    add(DeepSeekWeightNames.embedTokens, shape: [vocab, hidden])
-    add(DeepSeekWeightNames.finalNorm, shape: [hidden])
-    add(DeepSeekWeightNames.hcHeadFn, shape: [hcMult, hcMult * hidden])
-    add(DeepSeekWeightNames.hcHeadBase, shape: [hcMult])
-    add(DeepSeekWeightNames.hcHeadScale, shape: [1])
-    add(DeepSeekWeightNames.lmHead, shape: [vocab, hidden])
+    func packedCols(_ inFeatures: Int) -> Int {
+        inFeatures / 8
+    }
+
+    var tensors: [TensorFixture] = [
+        TensorFixture(name: Gemma4WeightNames.embedTokens, dtype: "U32", shape: [vocab, packedCols(hidden)]),
+        TensorFixture(name: Gemma4WeightNames.finalNorm, dtype: "F32", shape: [hidden]),
+    ]
 
     for layerIndex in 0..<layers {
-        add(DeepSeekWeightNames.attentionNorm(layerIndex), shape: [hidden])
-        add(DeepSeekWeightNames.feedForwardNorm(layerIndex), shape: [hidden])
-        for block in [DeepSeekHyperConnectionBlock.attention, .feedForward] {
-            add(
-                DeepSeekWeightNames.hyperConnection(layerIndex: layerIndex, block: block, component: .fn),
-                shape: [hcMix, hcMult * hidden]
-            )
-            add(
-                DeepSeekWeightNames.hyperConnection(layerIndex: layerIndex, block: block, component: .base),
-                shape: [hcMix]
-            )
-            add(
-                DeepSeekWeightNames.hyperConnection(layerIndex: layerIndex, block: block, component: .scale),
-                shape: [3]
+        let isFull = layerIndex % 6 == 5
+        let effectiveHeadDim = isFull ? globalHeadDim : headDim
+        let effectiveKVHeads = isFull ? globalKVHeads : kvHeads
+
+        for suffix in [
+            "input_layernorm.weight", "post_attention_layernorm.weight",
+            "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
+        ] {
+            tensors.append(
+                TensorFixture(name: Gemma4WeightNames.layer(layerIndex, suffix), dtype: "F32", shape: [hidden])
             )
         }
-
-        add(DeepSeekWeightNames.attention(layerIndex, "wq_a.weight"), shape: [qLoraRank, hidden])
-        add(DeepSeekWeightNames.attention(layerIndex, "q_norm.weight"), shape: [qLoraRank])
-        add(DeepSeekWeightNames.attention(layerIndex, "wq_b.weight"), shape: [heads * headDim, qLoraRank])
-        add(DeepSeekWeightNames.attention(layerIndex, "wkv.weight"), shape: [headDim, hidden])
-        add(DeepSeekWeightNames.attention(layerIndex, "kv_norm.weight"), shape: [headDim])
-        add(
-            DeepSeekWeightNames.attention(layerIndex, "wo_a.weight"),
-            shape: [outputGroups, outputLoraRank, groupedInput]
-        )
-        add(
-            DeepSeekWeightNames.attention(layerIndex, "wo_b.weight"),
-            shape: [hidden, outputGroups * outputLoraRank]
+        tensors.append(
+            TensorFixture(name: Gemma4WeightNames.layer(layerIndex, "layer_scalar"), dtype: "F32", shape: [1])
         )
 
-        let ratio = compressRatios[layerIndex]
-        if ratio != 0 {
-            let outDim = headDim * (ratio == 4 ? 2 : 1)
-            add(DeepSeekWeightNames.attention(layerIndex, "compressor.wkv.weight"), shape: [outDim, hidden])
-            add(DeepSeekWeightNames.attention(layerIndex, "compressor.wgate.weight"), shape: [outDim, hidden])
-            add(DeepSeekWeightNames.attention(layerIndex, "compressor.ape"), shape: [ratio, outDim])
-            add(DeepSeekWeightNames.attention(layerIndex, "compressor.norm.weight"), shape: [headDim])
-
-            if ratio == 4 {
-                let indexOutDim = indexHeadDim * 2
-                add(
-                    DeepSeekWeightNames.attention(layerIndex, "indexer.wq_b.weight"),
-                    shape: [indexHeads * indexHeadDim, qLoraRank]
-                )
-                add(
-                    DeepSeekWeightNames.attention(layerIndex, "indexer.weights_proj.weight"),
-                    shape: [indexHeads, hidden]
-                )
-                add(
-                    DeepSeekWeightNames.attention(layerIndex, "indexer.compressor.wkv.weight"),
-                    shape: [indexOutDim, hidden]
-                )
-                add(
-                    DeepSeekWeightNames.attention(layerIndex, "indexer.compressor.wgate.weight"),
-                    shape: [indexOutDim, hidden]
-                )
-                add(
-                    DeepSeekWeightNames.attention(layerIndex, "indexer.compressor.ape"),
-                    shape: [ratio, indexOutDim]
-                )
-                add(
-                    DeepSeekWeightNames.attention(layerIndex, "indexer.compressor.norm.weight"),
-                    shape: [indexHeadDim]
-                )
-            }
+        tensors.append(TensorFixture(
+            name: Gemma4WeightNames.attention(layerIndex, "q_proj.weight"),
+            dtype: "U32",
+            shape: [heads * effectiveHeadDim, packedCols(hidden)]
+        ))
+        tensors.append(TensorFixture(
+            name: Gemma4WeightNames.attention(layerIndex, "k_proj.weight"),
+            dtype: "U32",
+            shape: [effectiveKVHeads * effectiveHeadDim, packedCols(hidden)]
+        ))
+        if !isFull {
+            tensors.append(TensorFixture(
+                name: Gemma4WeightNames.attention(layerIndex, "v_proj.weight"),
+                dtype: "U32",
+                shape: [effectiveKVHeads * effectiveHeadDim, packedCols(hidden)]
+            ))
         }
+        tensors.append(TensorFixture(
+            name: Gemma4WeightNames.attention(layerIndex, "o_proj.weight"),
+            dtype: "U32",
+            shape: [hidden, packedCols(heads * effectiveHeadDim)]
+        ))
+        tensors.append(TensorFixture(
+            name: Gemma4WeightNames.attention(layerIndex, "q_norm.weight"),
+            dtype: "F32",
+            shape: [effectiveHeadDim]
+        ))
+        tensors.append(TensorFixture(
+            name: Gemma4WeightNames.attention(layerIndex, "k_norm.weight"),
+            dtype: "F32",
+            shape: [effectiveHeadDim]
+        ))
 
-        add(DeepSeekWeightNames.feedForward(layerIndex, "gate.weight"), shape: [routedExperts, hidden])
-        add(DeepSeekWeightNames.feedForward(layerIndex, "shared_experts.gate_proj.weight"), shape: [moe, hidden])
-        add(DeepSeekWeightNames.feedForward(layerIndex, "shared_experts.up_proj.weight"), shape: [moe, hidden])
-        add(DeepSeekWeightNames.feedForward(layerIndex, "shared_experts.down_proj.weight"), shape: [hidden, moe])
+        for suffix in ["gate_proj", "up_proj"] {
+            tensors.append(TensorFixture(
+                name: Gemma4WeightNames.mlp(layerIndex, "\(suffix).weight"),
+                dtype: "U32",
+                shape: [intermediate, packedCols(hidden)]
+            ))
+        }
+        tensors.append(TensorFixture(
+            name: Gemma4WeightNames.mlp(layerIndex, "down_proj.weight"),
+            dtype: "U32",
+            shape: [hidden, packedCols(intermediate)]
+        ))
     }
 
-    return tensors.values.sorted { $0.name < $1.name }
-}
-
-private func requiredStackedExpertTensorFixtures() -> [TensorFixture] {
-    var tensors: [TensorFixture] = []
-    let routedExperts = MLXFastConstants.routedExperts
-    let hidden = MLXFastConstants.hiddenSize
-    let moe = MLXFastConstants.moeIntermediateSize
-    for layerIndex in 0..<MLXFastConstants.numHiddenLayers {
-        tensors.append(
-            TensorFixture(
-                name: DeepSeekWeightNames.routedExpert(layerIndex: layerIndex, expertIndex: 0, projection: .gate)[0],
-                dtype: "U8",
-                shape: [routedExperts, moe, hidden],
-                data: Data([1])
-            )
-        )
-        tensors.append(
-            TensorFixture(
-                name: DeepSeekWeightNames.routedExpert(layerIndex: layerIndex, expertIndex: 0, projection: .up)[0],
-                dtype: "U8",
-                shape: [routedExperts, moe, hidden],
-                data: Data([2])
-            )
-        )
-        tensors.append(
-            TensorFixture(
-                name: DeepSeekWeightNames.routedExpert(layerIndex: layerIndex, expertIndex: 0, projection: .down)[0],
-                dtype: "U8",
-                shape: [routedExperts, hidden, moe],
-                data: Data([3])
-            )
-        )
-    }
     return tensors
 }
 
@@ -904,19 +709,19 @@ private func writeIndex(_ path: URL, tensors: [TensorFixture], shardName: String
 @Test
 func localIterateDecodeProgressIntervalReportsEveryStepForShortRuns() {
     // local-iterate: 16 decode steps get a running-number line on every token.
-    #expect(DeepSeekRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 16, timingRepeats: 1) == 1)
-    #expect(DeepSeekRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 32, timingRepeats: 1) == 1)
+    #expect(GemmaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 16, timingRepeats: 1) == 1)
+    #expect(GemmaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 32, timingRepeats: 1) == 1)
     // local-submit: 1023 steps keep the historical 8-step cadence.
-    #expect(DeepSeekRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 1023, timingRepeats: 1) == 8)
+    #expect(GemmaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 1023, timingRepeats: 1) == 8)
     // Multi-repeat runs keep the sparser 64-step cadence.
-    #expect(DeepSeekRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 512, timingRepeats: 4) == 64)
+    #expect(GemmaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 512, timingRepeats: 4) == 64)
 }
 
 @Test
 func localIterateProjectedDecodeSecondsPerTokenConvergesToChargedMean() {
     // Mid-run: charged 20s so far (18s seed + 2s steps), 2 of 16 tokens done at
     // 1s/step mean -> project 14 more step-seconds on top of the charged 20.
-    let projected = DeepSeekRuntime.localIterateProjectedDecodeSecondsPerToken(
+    let projected = GemmaRuntime.localIterateProjectedDecodeSecondsPerToken(
         chargedSecondsSoFar: 20,
         stepOnlySecondsSoFar: 2,
         decodedTokens: 2,
@@ -925,7 +730,7 @@ func localIterateProjectedDecodeSecondsPerTokenConvergesToChargedMean() {
     #expect(abs(projected - (20.0 + 14.0) / 16.0) < 1e-12)
 
     // Final token: exactly the charged mean the score payload will report.
-    let final = DeepSeekRuntime.localIterateProjectedDecodeSecondsPerToken(
+    let final = GemmaRuntime.localIterateProjectedDecodeSecondsPerToken(
         chargedSecondsSoFar: 32,
         stepOnlySecondsSoFar: 14,
         decodedTokens: 16,
@@ -935,7 +740,7 @@ func localIterateProjectedDecodeSecondsPerTokenConvergesToChargedMean() {
 
     // Guards.
     #expect(
-        DeepSeekRuntime.localIterateProjectedDecodeSecondsPerToken(
+        GemmaRuntime.localIterateProjectedDecodeSecondsPerToken(
             chargedSecondsSoFar: 1,
             stepOnlySecondsSoFar: 1,
             decodedTokens: 0,
@@ -946,15 +751,13 @@ func localIterateProjectedDecodeSecondsPerTokenConvergesToChargedMean() {
 
 @Test
 func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
-    let status = DeepSeekRuntime.localIterateLiveDecodeStatus(
+    let status = GemmaRuntime.localIterateLiveDecodeStatus(
         lastStepSeconds: 0.9,
         chargedSecondsSoFar: 20,
         stepOnlySecondsSoFar: 2,
         decodedTokens: 2,
         totalDecodeTokens: 16,
-        prefillSecondsPerToken: 0.05,
-        decodeBytesReadSoFar: 4 * (1 << 30),
-        decodeWindowHitRate: 0.625
+        prefillSecondsPerToken: 0.05
     )
     #expect(status.contains("last_step_seconds=0.900000"))
     #expect(status.contains("mean_step_seconds=1.000000"))
@@ -963,12 +766,12 @@ func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
     #expect(status.contains("projected_decode_seconds_per_token="))
     #expect(status.contains("projected_decode_speedup="))
     #expect(status.contains("projected_score="))
-    // 4 GiB over 2 decoded tokens -> 2 GiB/token.
-    #expect(status.contains("expert_gb_per_token=2.000000"))
-    #expect(status.contains("expert_hit_rate=0.625"))
+    // The RAM-resident dense runtime reports no expert-bandwidth live fields.
+    #expect(!status.contains("expert_gb_per_token="))
+    #expect(!status.contains("expert_hit_rate="))
 
-    // The final step has no ETA, and absent expert numbers are omitted.
-    let finalStep = DeepSeekRuntime.localIterateLiveDecodeStatus(
+    // The final step has no ETA.
+    let finalStep = GemmaRuntime.localIterateLiveDecodeStatus(
         lastStepSeconds: 1,
         chargedSecondsSoFar: 32,
         stepOnlySecondsSoFar: 14,
@@ -977,11 +780,9 @@ func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
         prefillSecondsPerToken: 0.05
     )
     #expect(!finalStep.contains("decode_eta_seconds="))
-    #expect(!finalStep.contains("expert_gb_per_token="))
-    #expect(!finalStep.contains("expert_hit_rate="))
 
     // Before prefill has a positive measurement there is no score estimate.
-    let withoutPrefill = DeepSeekRuntime.localIterateLiveDecodeStatus(
+    let withoutPrefill = GemmaRuntime.localIterateLiveDecodeStatus(
         lastStepSeconds: 0.9,
         chargedSecondsSoFar: 20,
         stepOnlySecondsSoFar: 2,
@@ -993,7 +794,7 @@ func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
     #expect(!withoutPrefill.contains("projected_score="))
 
     #expect(
-        DeepSeekRuntime.localIterateLiveDecodeStatus(
+        GemmaRuntime.localIterateLiveDecodeStatus(
             lastStepSeconds: 0,
             chargedSecondsSoFar: 0,
             stepOnlySecondsSoFar: 0,
@@ -1002,23 +803,6 @@ func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
             prefillSecondsPerToken: nil
         ).isEmpty
     )
-}
-
-@Test
-func expertWindowHitRateUsesDecodeWindowDeltasOnly() {
-    let before = ExpertStreamingStats(cacheHits: 100, cacheMisses: 50)
-    let after = ExpertStreamingStats(cacheHits: 130, cacheMisses: 60)
-    // Window: 30 hits, 10 misses -> 0.75, independent of the 100/50 prefix.
-    #expect(DeepSeekRuntime.expertWindowHitRate(before: before, after: after) == 0.75)
-
-    // No before-snapshot: the whole counter is the window.
-    #expect(DeepSeekRuntime.expertWindowHitRate(before: nil, after: after) == 130.0 / 190.0)
-
-    // No lookups in the window, missing after-stats, or counters that went
-    // backwards (worker restart) all yield nil instead of a bogus rate.
-    #expect(DeepSeekRuntime.expertWindowHitRate(before: after, after: after) == nil)
-    #expect(DeepSeekRuntime.expertWindowHitRate(before: before, after: nil) == nil)
-    #expect(DeepSeekRuntime.expertWindowHitRate(before: after, after: before) == nil)
 }
 
 @Test
@@ -1092,7 +876,7 @@ func workerStderrDrainCapsRetainedTail() throws {
 
 @Test
 func localIteratePrefillStatusReportsPerTokenAndSpeedup() {
-    let status = DeepSeekRuntime.localIteratePrefillStatus(
+    let status = GemmaRuntime.localIteratePrefillStatus(
         elapsedSeconds: 51.2,
         promptTokens: 512
     )
@@ -1103,15 +887,15 @@ func localIteratePrefillStatusReportsPerTokenAndSpeedup() {
 
     // Zero-duration or zero-token inputs fall back to the plain seconds field.
     #expect(
-        DeepSeekRuntime.localIteratePrefillStatus(elapsedSeconds: 0, promptTokens: 512)
+        GemmaRuntime.localIteratePrefillStatus(elapsedSeconds: 0, promptTokens: 512)
             == "seconds=0.0"
     )
 }
 
 @Test
-func localIterateSummaryEmitsSpeedupsEstimatedScoreAndExpertStats() {
-    let timing = DeepSeekRuntime.LocalIterateTimingResult(
-        correctness: DeepSeekRuntime.localIterateCorrectnessReport(
+func localIterateSummaryEmitsSpeedupsAndEstimatedScore() {
+    let timing = GemmaRuntime.LocalIterateTimingResult(
+        correctness: GemmaRuntime.localIterateCorrectnessReport(
             passed: true,
             checkedSteps: 18,
             caseCount: 1,
@@ -1119,22 +903,22 @@ func localIterateSummaryEmitsSpeedupsEstimatedScoreAndExpertStats() {
             expectedToken: nil,
             actualToken: nil,
             goldenHash: "hash",
-            expertStats: ExpertStreamingStats(cacheHits: 3, cacheMisses: 1),
+            expertStats: .zero,
             error: "",
             modeName: "local-iterate"
         ),
         prefillSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken / 2,
-        decode: DeepSeekRuntime.DecodeMeasurement(
+        decode: GemmaRuntime.DecodeMeasurement(
             secondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken / 2,
-            bandwidthGBPerToken: 1.5,
-            bandwidthSource: "expert-streaming"
+            bandwidthGBPerToken: 0,
+            bandwidthSource: "ram_resident_model"
         ),
-        expertStats: ExpertStreamingStats(cacheHits: 3, cacheMisses: 1),
+        expertStats: .zero,
         peakRamGB: 24.5
     )
 
     var lines: [String] = []
-    DeepSeekRuntime.emitLocalIterateSummary(
+    GemmaRuntime.emitLocalIterateSummary(
         modeName: "local-iterate",
         timing: timing,
         progress: { lines.append($0) }
@@ -1148,8 +932,9 @@ func localIterateSummaryEmitsSpeedupsEstimatedScoreAndExpertStats() {
     // 2x on both axes -> estimated score 2 under decode^0.75 * prefill^0.25.
     #expect(joined.contains("est_score=2.000"))
     #expect(joined.contains("score stays null in local modes"))
-    #expect(joined.contains("expert_hit_rate=0.750"))
+    #expect(joined.contains("decode_bandwidth_gb_per_token=0"))
     #expect(joined.contains("peak_ram_gb=24.500"))
+    #expect(!joined.contains("expert_hit_rate="))
 }
 
 @Test
@@ -1170,11 +955,11 @@ func localIteratePhaseHeartbeatFiresWhileBlockedAndStopsAfterCancel() throws {
     }
 
     // No progress sink means no timer at all.
-    #expect(DeepSeekRuntime.startPhaseHeartbeat(label: "x", progress: nil) == nil)
+    #expect(GemmaRuntime.startPhaseHeartbeat(label: "x", progress: nil) == nil)
 
     let box = MessageBox()
     let heartbeat = try #require(
-        DeepSeekRuntime.startPhaseHeartbeat(
+        GemmaRuntime.startPhaseHeartbeat(
             label: "local-iterate prefill measured",
             intervalSeconds: 0.05,
             progress: { box.append($0) }
@@ -1193,42 +978,6 @@ func localIteratePhaseHeartbeatFiresWhileBlockedAndStopsAfterCancel() throws {
     // After cancel the heartbeat must stay quiet.
     Thread.sleep(forTimeInterval: 0.2)
     #expect(box.snapshot().count == firedWhileRunning.count)
-}
-
-private func writeExpertManifest(
-    _ path: URL,
-    referencePath: String,
-    shardName: String,
-    tensors: [TensorFixture],
-    expertByteLengthOverride: Int?
-) throws {
-    let header = try Safetensors.readHeader(URL(fileURLWithPath: referencePath).appendingPathComponent(shardName))
-    let overrideName = tensors.first?.name
-    let records = try tensors.map { tensor in
-        let info = try #require(header.tensors[tensor.name])
-        let byteLength = tensor.name == overrideName ? (expertByteLengthOverride ?? info.byteCount) : info.byteCount
-        return """
-        {
-          "name": "\(tensor.name)",
-          "shard": "\(shardName)",
-          "dtype": "\(tensor.dtype)",
-          "shape": \(arrayJSON(tensor.shape)),
-          "data_offsets": [\(info.dataStart), \(info.dataEnd)],
-          "byte_offset": \(Int(header.dataBaseOffset) + info.dataStart),
-          "byte_length": \(byteLength)
-        }
-        """
-    }.joined(separator: ",\n")
-    try """
-    {
-      "version": 1,
-      "source": "safetensors",
-      "reference_path": "\(referencePath)",
-      "expert_tensors": [
-        \(records)
-      ]
-    }
-    """.write(to: path, atomically: true, encoding: .utf8)
 }
 
 private func writeSafetensors(_ path: URL, tensors: [TensorFixture]) throws {
@@ -1268,15 +1017,6 @@ private func writeSafetensors(_ path: URL, tensors: [TensorFixture]) throws {
 
 private func arrayJSON(_ values: [Int]) -> String {
     "[\(values.map(String.init).joined(separator: ","))]"
-}
-
-private func writeExecutableScript(_ path: URL, contents: String) throws -> URL {
-    try contents.write(to: path, atomically: true, encoding: .utf8)
-    try FileManager.default.setAttributes(
-        [.posixPermissions: 0o755],
-        ofItemAtPath: path.path
-    )
-    return path
 }
 
 private func writeSparseFile(_ path: URL, byteCount: Int) throws {

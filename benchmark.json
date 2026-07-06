@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "name": "mlxfast-challenge-dev",
-  "description": "Optimize DeepSeek-V4-Flash MoE inference by transforming weights offline and reducing memory bandwidth without failing the correctness gate.",
+  "description": "Optimize Gemma 4 31B 4-bit dense inference by transforming weights offline and reducing compute latency without failing the correctness gate.",
   "category": "swift",
   "direction": "+",
   "editablePaths": [
