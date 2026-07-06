@@ -47,16 +47,18 @@ public enum MLXFastConstants {
     // correctnessGPQAMaxNewTokens (and must stay <= correctnessMaxBehaviorSteps).
     public static let semanticGPQACaseCount = 5
     public static let semanticGPQAMaxNewTokens = 64
-    // Baseline-calibrated threshold. The DeepSeek-era baseline established
-    // 3/5; the unmodified Gemma 4 31B 4-bit baseline measured 0/5 on the
-    // ranked runner (run 28813130022, judged at the old 10-token budget), and
-    // the 2026-07-06 structural baseline capture predicts at most 1/5 even at
-    // the 64-token budget, so the measured Gemma baseline is 0.
-    // TODO(semantic-gpqa-recalibration): 0 makes the gate vacuous as a
-    // pass/fail check (aggregates are still recorded). Re-raise it after
-    // either (a) a judged official-runner baseline run at the 64-token budget
-    // establishes a nonzero floor, or (b) the hidden GPQA prompts move to the
-    // Gemma chat template so the baseline reliably states its answer.
+    // Baseline-calibrated threshold, recalibrated at the 64-token budget from
+    // the official-runner baseline verification run 28817200585 (2026-07-06,
+    // https://github.com/Layr-Labs/mlxfast-challenge-dev/actions/runs/28817200585):
+    // unmodified baseline main judged 0/5. The DeepSeek-era baseline
+    // established 3/5; run 28813130022 judged the Gemma baseline 0/5 at the
+    // old 10-token budget, and the 64-token judged rerun confirms baseline
+    // Gemma expresses no judged-correct answers on these raw-completion
+    // hidden GPQA prompts, so the measured Gemma baseline -- and this gate's
+    // floor -- is 0. Aggregate pass counts are still recorded; the pass/fail
+    // check stays aggregate-recording until the hidden prompts change (for
+    // example to the Gemma chat template), after which a fresh judged
+    // official-runner baseline must recalibrate this threshold.
     public static let semanticGPQAMinPassCount = 0
     public static let benchmarkPrefillPromptTokens = 512
     // Scored decode is parent-measured wall time for decode setup plus this
