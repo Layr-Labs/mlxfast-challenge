@@ -428,8 +428,8 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(timingOrGates.contains("MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"))
-    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 2a747bf797e16d58f5ffedacc0d4bf5ce0d14be00f2421dc04289a2154cb011d"))
-    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"10320\""))
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 7c33861bdf062b08a96a97bf5b388b541edc95b4cc46afc4f98ce9cb46856782"))
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"11236\""))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json"))
     #expect(timingOrGates.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json"))
     #expect(timingOrGates.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases.json"))
@@ -890,6 +890,43 @@ func cliSupportsFreeRunGateAttachmentCoveringTimedDecodeOffsets() throws {
     #expect(cli.contains("_ = try loadGoldenFixture(from: temporaryURL.path)"))
     #expect(!cli.contains("try outputData.write(to: outputURL, options: [.atomic])"))
     #expect(cli.contains("attach-free-run-gate ["))
+}
+
+// The public fixtures under correctness_prompts/ are BASE golden cases (the
+// version-1 cases[] shape), not free-run gates, so the operator needs a
+// generation path that writes that shape directly from a prompt text file.
+// generate-golden mirrors attach-free-run-gate's prompt-file tokenization
+// (weights-dir tokenizer, addSpecialTokens: false, first 512 tokens), runs
+// the reference model through the same worker isolation, and only writes
+// output that passes the strict fixture loader at the generated step count.
+@Test
+func cliSupportsPublicBaseGoldenGeneration() throws {
+    let cli = try String(
+        contentsOfFile: "Sources/MLXFastCLI/main.swift",
+        encoding: .utf8
+    )
+
+    #expect(cli.contains("case \"generate-golden\""))
+    #expect(cli.contains("func runGenerateGolden"))
+    // Same prompt tokenization convention as attach-free-run-gate's
+    // prompt-file path: weights-dir tokenizer, no special tokens, exactly the
+    // required correctness prompt token count.
+    #expect(cli.contains("tokenizer.encode(text: promptText, addSpecialTokens: false)"))
+    #expect(cli.contains("Array(encoded.prefix(requiredPromptTokens))"))
+    // A base case shorter than the correctness window would be rejected by
+    // every consumer, so the command fails before generating anything.
+    #expect(cli.contains("--steps must be >= correctnessSteps"))
+    // Expected tokens come from actually running the reference model, with
+    // the output fixture blocked from the worker like the other generators.
+    #expect(cli.contains("runtimeWorkerOptions(blockedGoldenPath: outputPath)"))
+    // The written fixture is staged through the validated-write helper and
+    // re-validated at the full generated step count, so a fixture that would
+    // fail its consumer's requiredSteps can never land on disk.
+    #expect(cli.contains("generate-golden requires --output PATH"))
+    #expect(cli.contains("generate-golden requires --name NAME"))
+    #expect(cli.contains("generate-golden requires --prompt-file PATH"))
+    #expect(cli.contains("requiredSteps: steps,"))
+    #expect(cli.contains("generate-golden --prompt-file PATH"))
 }
 
 @Test
