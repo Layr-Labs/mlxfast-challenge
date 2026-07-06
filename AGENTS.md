@@ -32,22 +32,24 @@ is:
 blacksmith-12vcpu-macos-26
 ```
 
-The ranked hardware contract for this benchmark is an Apple M3 Ultra with at
-least 256 GB of unified memory (the label above moves to Blacksmith's M3 Ultra
-machine class when it is provisioned; Blacksmith stays the CI provider either
-way). Gemma 4 31B 4-bit is a dense model: the text tower is about 17 GB in
-4-bit, so on that contract it is fully RAM-resident: the runtime loads every
-text-tower tensor once during untimed initialization and keeps it resident for
-the whole process lifetime. There is no weight streaming of any kind, no
-expert cache, and no disk I/O on the scored prefill/decode path. Optimization
-effort should go into compute — attention kernels (sliding-window vs.
-full-attention dispatch, GQA, partial-rotary RoPE), quantized matmul dispatch,
-KV-cache handling, memory layout, and MLX scheduling — not disk I/O.
+The ranked hardware contract for this benchmark is Apple M4-generation
+silicon with at least 36 GB of unified memory; today's runner is Blacksmith's
+Apple M4 Pro class (48 GB), which is also the hardware the official baseline
+constants were calibrated on. Gemma 4 31B 4-bit is a dense model: the text
+tower is about 17 GB in 4-bit, so it is fully RAM-resident under that
+contract: the runtime loads every text-tower tensor once during untimed
+initialization and keeps it resident for the whole process lifetime. There is
+no weight streaming of any kind, no expert cache, and no disk I/O on the
+scored prefill/decode path. Optimization effort should go into compute —
+attention kernels (sliding-window vs. full-attention dispatch, GQA,
+partial-rotary RoPE), quantized matmul dispatch, KV-cache handling, memory
+layout, and MLX scheduling — not disk I/O.
 
 Local machines need enough unified memory to hold the ~17 GB text tower plus
-KV cache and activation buffers; 32 GB+ is recommended. A kernel or layout
-strategy that helps on one Apple Silicon generation can move differently on the
-official runner, so always rely on the official benchmark for ranking.
+KV cache and activation buffers; the 36 GB contract minimum is a practical
+local minimum too. A kernel or layout strategy that helps on one Apple Silicon
+generation can move differently on the official runner, so always rely on the
+official benchmark for ranking.
 
 ## What You May Optimize
 
@@ -269,11 +271,12 @@ public local fixtures, and official scoring happens on the Blacksmith runner.
 ## Avoid These Wrong Strategies
 
 Do not assume the benchmark machine has the same memory budget as your local
-Mac. The official contract is an M3 Ultra with at least 256 GB of unified
-memory; the ~17 GB text tower is comfortably RAM-resident there. Local
-machines with less memory can still run the full model (32 GB+ recommended),
-so unlike a large MoE checkpoint there is no meaningfully different
-"streaming fallback" regime here to mistune against.
+Mac. The official contract is Apple M4-generation silicon with at least 36 GB
+of unified memory (today's runner: Blacksmith M4 Pro, 48 GB); the ~17 GB text
+tower is comfortably RAM-resident there, but headroom for KV cache, buffers,
+and caches is finite — do not tune memory-hungry strategies against a larger
+local machine. Unlike a large MoE checkpoint there is no meaningfully
+different "streaming fallback" regime here to mistune against.
 
 Do not specialize for the public correctness prompt. Optimizations should be
 prompt-independent and model-general for Gemma 4. Hidden correctness, GPQA,
