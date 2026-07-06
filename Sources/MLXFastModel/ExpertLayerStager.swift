@@ -41,8 +41,8 @@ public final class ExpertLayerStager {
     private var recordNamesByLayer: [Int: [String]] = [:]
     private var pendingLayers: Set<Int> = []
     private var failedLayers: Set<Int> = []
-    // Re-roll marker: byte-distinct from submission 7ee6db8a solely for an
-    // independent paired-baseline draw; the mechanism is identical.
+    // Re-roll marker (6): byte-distinct from submissions 5260a8ed/38aca7da solely for
+    // an independent paired-baseline draw; the mechanism is identical.
     // Bumped by releaseAllStagedLayers; staging jobs scheduled under an older
     // generation bail at start and discard at store, so stale cross-forward
     // captures cannot spill work into the decode window.
