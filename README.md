@@ -71,8 +71,10 @@ transform source hash for run auditing.
 
 Full model setup needs a moderate local SSD. The reference checkpoint is
 `mlx-community/gemma-4-31b-4bit`, with 4 safetensors shards totaling about
-18.4 GB. `setup.sh` downloads the checkpoint directly from Hugging Face by
-default into a repo-local Hugging Face-style cache under
+18.4 GB. `setup.sh` downloads the checkpoint from the Darkbloom R2 mirror
+(`https://ds4.darkbloom.ai/gemma-4-31b-4bit`) by default, with up to 3 shard
+downloads in parallel (`MLXFAST_REFERENCE_DOWNLOAD_JOBS`), into a repo-local
+Hugging Face-style cache under
 `.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main/`.
 It verifies cached files against `fixtures/reference_gemma_4_31b_4bit.sha256`
 and redownloads only files that are missing, truncated, or hash-mismatched. A
@@ -96,13 +98,16 @@ explicit CLI flags take precedence. For `benchmark.sh`, use those `MLXFAST_*`
 environment variables for path overrides; pass `--weights`, `--golden`, and
 `--score-path` only to `.build/release/mlxfast-swift benchmark` directly. Set
 `MLXFAST_REFERENCE_BASE_URL` to use
-another HTTP checkpoint prefix. Run `./setup.sh --help`
+another HTTP checkpoint prefix (for example
+`https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main` to fetch
+from Hugging Face instead of the R2 mirror; both serve the same
+manifest-pinned files). Run `./setup.sh --help`
 for the full local setup knobs.
 
 For manual GitHub Actions benchmark runs, dispatch `benchmark.yml` on the
 trusted repository workflow. The workflow uses the protected
-`MLXFAST_REFERENCE_BASE_URL` secret when present, otherwise the public Hugging
-Face mirror. It downloads the reference checkpoint into the same
+`MLXFAST_REFERENCE_BASE_URL` secret when present, otherwise the default
+Darkbloom R2 mirror. It downloads the reference checkpoint into the same
 repo-local Hugging Face-style cache path used by local setup, passes that path
 explicitly to the offline transform, then prepares the correctness golden after
 transform completes. Correctness-only workflow runs use the checked-in public

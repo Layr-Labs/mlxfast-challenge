@@ -7,10 +7,14 @@ REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-main}"
 REFERENCE_CACHE_REPO_DIR="models--${REFERENCE_MODEL_REPO//\//--}"
 REFERENCE_CACHE_REVISION_DIR="${REFERENCE_REVISION//\//--}"
 # No organizer-hosted mirror exists yet for this checkpoint; default straight
-# to the public Hugging Face repo. download_url_for_file appends
-# "?download=true" automatically for huggingface.co URLs so this resolves to
+# to the Darkbloom R2 mirror (mlx-challenge bucket), which serves the same
+# manifest-pinned files as the public Hugging Face repo with higher parallel
+# throughput; set MLXFAST_REFERENCE_BASE_URL to
+# https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main to fall
+# back to Hugging Face. download_url_for_file appends
+# "?download=true" automatically for huggingface.co URLs so that resolves to
 # the raw LFS/Xet bytes.
-DEFAULT_REFERENCE_BASE_URL="https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main"
+DEFAULT_REFERENCE_BASE_URL="https://ds4.darkbloom.ai/gemma-4-31b-4bit"
 REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}"
 REFERENCE_AUTH_HEADER="${MLXFAST_REFERENCE_AUTH_HEADER:-}"
 REFERENCE_APPEND_DOWNLOAD_QUERY="${MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY:-auto}"
@@ -18,7 +22,10 @@ REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_g
 REFERENCE_HASH_VERIFY="${MLXFAST_REFERENCE_HASH_VERIFY:-1}"
 REFERENCE_POST_DOWNLOAD_FULL_VERIFY="${MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY:-1}"
 REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-40}"
-REFERENCE_DOWNLOAD_JOBS="${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-8}"
+# Default 3 parallel shard downloads: the R2 mirror sustains full throughput at
+# 3 streams, and higher fan-out mostly adds contention on home connections.
+# Override with MLXFAST_REFERENCE_DOWNLOAD_JOBS.
+REFERENCE_DOWNLOAD_JOBS="${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-3}"
 SETUP_PARALLEL_METALLIB="${MLXFAST_SETUP_PARALLEL_METALLIB:-${MLXFAST_SETUP_PARALLEL_BUILD:-1}}"
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
 MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"

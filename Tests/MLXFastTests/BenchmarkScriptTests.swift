@@ -10,8 +10,10 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
         encoding: .utf8
     )
 
-    #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main\""))
+    #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://ds4.darkbloom.ai/gemma-4-31b-4bit\""))
     #expect(setup.contains("REFERENCE_BASE_URL=\"${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}\""))
+    // 3 parallel shard downloads by default; env-overridable.
+    #expect(setup.contains("REFERENCE_DOWNLOAD_JOBS=\"${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-3}\""))
     #expect(setup.contains("DEFAULT_HF_HOME=\"${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}\""))
     #expect(setup.contains("REFERENCE_CACHE_DIR=\"${MLXFAST_REFERENCE_CACHE_DIR:-${DEFAULT_HF_HUB_CACHE}/${REFERENCE_CACHE_REPO_DIR}/snapshots/${REFERENCE_CACHE_REVISION_DIR}}\""))
     #expect(setup.contains("REFERENCE_CACHE_LOCK_PATH=\"${MLXFAST_REFERENCE_CACHE_LOCK_PATH:-${REFERENCE_DIR}/.mlxfast-reference-cache.lock}\""))
