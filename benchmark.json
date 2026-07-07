@@ -8,9 +8,9 @@
     "Sources/MLXFastModel",
     "Sources/MLXFastTransform"
   ],
-  "setupCommand": ["bash", "-lc", "./setup.sh"],
-  "preSubmitCommand": ["bash", "-lc", "./benchmark.sh --local-submit"],
-  "benchmarkCommand": ["bash", "-lc", "./benchmark.sh"],
+  "setupCommand": ["bash", "-c", "./setup.sh"],
+  "preSubmitCommand": ["bash", "-c", "./benchmark.sh --local-submit"],
+  "benchmarkCommand": ["bash", "-c", "./benchmark.sh --official"],
   "scorePath": "score.json",
   "runner": {
     "provider": "github-actions",
