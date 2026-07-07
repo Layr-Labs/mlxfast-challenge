@@ -4,12 +4,20 @@ set -euo pipefail
 
 LOCAL_ITERATE=0
 LOCAL_SUBMIT=0
+OFFICIAL=0
+# Arguments forwarded to `mlxfast-swift benchmark`. --official is a shell-level
+# mode selector only, so it is filtered out here; the Swift CLI does not know it.
+FORWARD_ARGS=()
 for arg in "$@"; do
   case "${arg}" in
     --weights|--weights=*|--golden|--golden=*|--score-path|--score-path=*)
       echo "benchmark.sh: use MLXFAST_WEIGHTS_PATH, MLXFAST_CORRECTNESS_GOLDEN_PATH, or MLXFAST_SCORE_PATH for shell path overrides" >&2
       echo "benchmark.sh: pass --weights/--golden/--score-path only to .build/release/mlxfast-swift benchmark" >&2
       exit 1
+      ;;
+    --official)
+      OFFICIAL=1
+      continue
       ;;
   esac
   if [[ "${arg}" == "--local-iterate" ]]; then
@@ -18,7 +26,28 @@ for arg in "$@"; do
   if [[ "${arg}" == "--local-submit" ]]; then
     LOCAL_SUBMIT=1
   fi
+  FORWARD_ARGS+=("${arg}")
 done
+
+if [[ "${OFFICIAL}" == "1" && ( "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ) ]]; then
+  echo "benchmark.sh: --official cannot be combined with --local-iterate/--local-submit" >&2
+  exit 1
+fi
+
+# Bare invocations default to the participant-friendly local edit loop. The
+# ranked full benchmark must be requested explicitly: with --official, by the
+# trusted workflow env (MLXFAST_OFFICIAL_BENCHMARK_RUN=1 -- also inherited by
+# the pinned paired-baseline checkout's own benchmark.sh), or implicitly by an
+# operator pointing MLXFAST_CORRECTNESS_GOLDEN_PATH at a provisioned oracle.
+if [[ "${LOCAL_ITERATE}" == "0" && "${LOCAL_SUBMIT}" == "0" && "${OFFICIAL}" == "0" ]]; then
+  if [[ "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == "1" || -n "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" ]]; then
+    OFFICIAL=1
+  else
+    echo "benchmark.sh: no mode given; defaulting to --local-iterate (use --official for the ranked entrypoint, which requires the private oracle)"
+    LOCAL_ITERATE=1
+    FORWARD_ARGS+=("--local-iterate")
+  fi
+fi
 
 if [[ "${LOCAL_ITERATE}" == "1" && -z "${MLXFAST_SCORE_PATH:-}" ]]; then
   SCORE_PATH="score.local-iterate.json"
@@ -35,10 +64,10 @@ else
 fi
 
 # Fail fast with actionable guidance when the golden fixture is missing,
-# BEFORE any build/transform work runs. Bare ./benchmark.sh is the official
-# ranked entrypoint and needs the private oracle, which is never in the public
-# repo -- participants running it locally used to burn minutes on the
-# transform and then hit a raw file-not-found error from the Swift harness.
+# BEFORE any build/transform work runs. The official mode needs the private
+# oracle, which is never in the public repo -- participants who reached it by
+# accident used to burn minutes on the transform and then hit a raw
+# file-not-found error from the Swift harness.
 if [[ ! -f "${GOLDEN_PATH}" ]]; then
   if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" || -n "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" ]]; then
     echo "benchmark.sh: correctness golden not found at ${GOLDEN_PATH}" >&2
@@ -48,12 +77,13 @@ if [[ ! -f "${GOLDEN_PATH}" ]]; then
     cat >&2 <<'EOF'
 benchmark.sh: correctness_golden.json is missing.
 
-Bare ./benchmark.sh is the OFFICIAL ranked entrypoint: it requires the private
-benchmark oracle, which is provisioned only on the official runner and is not
-part of the public repository.
+--official is the RANKED entrypoint: it requires the private benchmark
+oracle, which is provisioned only on the official runner and is not part of
+the public repository.
 
-For local development use one of the local modes instead, which run against
-the public fixtures checked into correctness_prompts/:
+For local development use one of the local modes, which run against the
+public fixtures checked into correctness_prompts/ (a bare ./benchmark.sh
+defaults to --local-iterate):
 
   ./benchmark.sh --local-iterate   # fast edit-loop signal (~2 minutes)
   ./benchmark.sh --local-submit    # pre-submit gate (longer decode window)
@@ -430,12 +460,20 @@ if [[ "${USE_RUNTIME_WORKER}" != "1" && "${MLXFAST_IN_SANDBOX:-0}" != "1" && "${
     exit 1
   fi
   echo "benchmark.sh: network egress is blocked; re-running inside the sandbox"
+  # Re-exec with the RESOLVED mode (not the raw "$@"): a bare invocation that
+  # defaulted to --local-iterate above must not re-default (and re-print the
+  # notice) in the sandboxed child. The ${arr[@]+...} idiom keeps the empty
+  # array expansion safe under set -u on macOS's bash 3.2.
+  RESOLVED_ARGS=(${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"})
+  if [[ "${OFFICIAL}" == "1" ]]; then
+    RESOLVED_ARGS+=("--official")
+  fi
   exec sandbox-exec -f "${SANDBOX_PROFILE}" env \
     MLXFAST_IN_SANDBOX=1 \
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
     http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 \
     HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
-    "$0" "$@"
+    "$0" ${RESOLVED_ARGS[@]+"${RESOLVED_ARGS[@]}"}
 fi
 
 enforce_official_sandbox
@@ -537,7 +575,7 @@ report_local_baseline_context
   --weights "${WEIGHTS_PATH}" \
   --golden "${GOLDEN_PATH}" \
   --score-path "${SCORE_PATH}" \
-  "$@" > "${score_stdout}"
+  ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"} > "${score_stdout}"
 
 # Require exactly one JSON object shaped like a score payload; empty, non-JSON,
 # or multiple concatenated objects (an injected extra write) fail closed rather
