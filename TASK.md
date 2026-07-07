@@ -9,8 +9,11 @@ Submissions are evaluated through the Swift harness:
 
 ```bash
 ./setup.sh
-./benchmark.sh
+./benchmark.sh --official
 ```
+
+(`--official` requires the organizer-provisioned hidden oracle; a bare
+`./benchmark.sh` defaults to the public `--local-iterate` mode.)
 
 The benchmark entrypoint:
 

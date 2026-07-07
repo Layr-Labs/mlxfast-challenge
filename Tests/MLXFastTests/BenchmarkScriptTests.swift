@@ -2319,6 +2319,132 @@ func benchmarkScriptRejectsPathFlagsBeforeForwardingToSwiftBenchmark() throws {
 }
 
 @Test
+func benchmarkScriptFailsFastWithGuidanceWhenGoldenIsMissing() throws {
+    // The official mode needs the private oracle. When it is absent the
+    // script must exit BEFORE any build/transform work, with guidance pointing
+    // at the local modes -- not let the Swift harness die minutes later on a
+    // raw file-not-found error. Bare invocations default to --local-iterate.
+    // Run from an empty temp cwd so the repo's own fixtures (or an operator's
+    // local golden) cannot leak into the check.
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let benchmarkScript = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent("benchmark.sh").path
+
+    func runBare(_ arguments: [String], environment: [String: String] = [:]) throws -> (Int32, String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [benchmarkScript] + arguments
+        process.currentDirectoryURL = root
+        process.environment = ProcessInfo.processInfo.environment
+            .merging(["MLXFAST_NO_SANDBOX": "1"]) { _, new in new }
+            .merging(environment) { _, new in new }
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+        try process.run()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(data: stderrData, encoding: .utf8) ?? "")
+    }
+
+    // Explicit --official without the private oracle: fail fast + guide.
+    let official = try runBare(["--official"])
+    #expect(official.0 != 0)
+    #expect(official.1.contains("correctness_golden.json is missing"))
+    #expect(official.1.contains("--local-iterate"))
+    #expect(official.1.contains("--local-submit"))
+    // Failed before doing any work: no weights/ or score artifacts created.
+    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("score.json").path))
+
+    // Bare invocation defaults to --local-iterate; from an empty cwd the
+    // public fixture is absent, so it takes the re-sync branch (never the
+    // official-oracle guidance).
+    let bare = try runBare([])
+    #expect(bare.0 != 0)
+    #expect(bare.1.contains("correctness golden not found at"))
+    #expect(!bare.1.contains("correctness_golden.json is missing"))
+
+    // --official cannot be combined with local modes.
+    let combined = try runBare(["--official", "--local-iterate"])
+    #expect(combined.0 != 0)
+    #expect(combined.1.contains("cannot be combined"))
+
+    // Explicit override pointing at a missing file: name the path, different hint.
+    let overridden = try runBare(
+        [],
+        environment: ["MLXFAST_CORRECTNESS_GOLDEN_PATH": root.appendingPathComponent("nope.json").path]
+    )
+    #expect(overridden.0 != 0)
+    #expect(overridden.1.contains("correctness golden not found at"))
+    #expect(overridden.1.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH"))
+
+    // Local mode from a directory without the public fixtures: re-sync hint.
+    let localIterate = try runBare(["--local-iterate"])
+    #expect(localIterate.0 != 0)
+    #expect(localIterate.1.contains("correctness golden not found at"))
+    #expect(localIterate.1.contains("correctness_prompts/"))
+}
+
+@Test
+func benchmarkScriptBareInvocationDefaultsToLocalIterate() throws {
+    // With the public fixtures present (repo-root cwd), a bare ./benchmark.sh
+    // must resolve to local-iterate and forward that mode to the Swift binary.
+    // The trusted-workflow env (MLXFAST_OFFICIAL_BENCHMARK_RUN=1) keeps its
+    // official semantics without any flag, so CI needs no changes.
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "{}".write(to: weights.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+
+    let argLog = root.appendingPathComponent("args.txt")
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    printf '%s\\n' "$@" > "\(argLog.path)"
+    cat <<'JSON'
+    {
+      "score": null,
+      "passed": true,
+      "metrics": {
+        "weights_hash": "fake-weights",
+        "weights_file_count": 1,
+        "weights_byte_count": 2
+      }
+    }
+    JSON
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeSwift.path)
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = ["benchmark.sh"]
+    process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    process.environment = ProcessInfo.processInfo.environment.merging([
+        "MLXFAST_NO_SANDBOX": "1",
+        "MLXFAST_SKIP_TRANSFORM": "1",
+        "MLXFAST_SWIFT_BIN": fakeSwift.path,
+        "MLXFAST_WEIGHTS_PATH": weights.path,
+        "MLXFAST_SCORE_PATH": root.appendingPathComponent("score.json").path,
+        "MLXFAST_INTEGRITY_PATH": root.appendingPathComponent("integrity.json").path,
+    ]) { _, new in new }
+    let stdoutPipe = Pipe()
+    process.standardOutput = stdoutPipe
+    try process.run()
+    let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
+
+    #expect(process.terminationStatus == 0)
+    #expect(stdout.contains("defaulting to --local-iterate"))
+    let args = try String(contentsOf: argLog, encoding: .utf8)
+    #expect(args.contains("--local-iterate\n"))
+    #expect(!args.contains("--official"))
+    #expect(args.contains("correctness_prompts/public_longcopy_gate_english_512_256.json\n"))
+}
+
+@Test
 func benchmarkScriptFailsWhenScorePayloadFails() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }

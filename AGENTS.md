@@ -195,7 +195,7 @@ swift build -c release
 .build/release/mlxfast-swift correctness --weights weights
 ./benchmark.sh --local-iterate
 ./benchmark.sh --local-submit
-./benchmark.sh
+./benchmark.sh --official
 ```
 
 `./benchmark.sh --local-iterate` is the fast local edit-loop signal.
@@ -203,8 +203,9 @@ Use it to compare the current working tree against the latest-tip baseline you
 recorded above, not against a result from an older branch.
 `./benchmark.sh --local-submit` is the Yukon pre-submit gate and is intended to
 be longer and closer to the official path while still producing `score: null`.
-`./benchmark.sh` is the full benchmark entrypoint and requires the required
-hidden golden artifacts for ranked scoring.
+`./benchmark.sh --official` is the full ranked entrypoint and requires the
+hidden golden artifacts provisioned on the official runner. A bare
+`./benchmark.sh` defaults to `--local-iterate`.
 
 ## Swift Tooling
 

@@ -28,9 +28,10 @@ MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
 # score.local-iterate.json, and prints it to stdout.
 ./benchmark.sh --local-iterate
 
-# Run the Darkbloom-compatible benchmark entrypoint.
-# Official benchmark runs use the organizer-supplied hidden correctness_golden.json.
-./benchmark.sh
+# Run the Darkbloom-compatible ranked benchmark entrypoint (official runner
+# only: requires the organizer-supplied hidden correctness_golden.json).
+# A bare ./benchmark.sh defaults to --local-iterate.
+./benchmark.sh --official
 
 # Local submit check used by Yukon before upload: runs the public 512-token
 # prompt through a longer checked timing window, writes score.json with
