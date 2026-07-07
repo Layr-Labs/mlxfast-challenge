@@ -227,6 +227,28 @@ extension GemmaRuntime {
                     bandwidthSource: decode.bandwidthSource
                 )
             }
+            // Prefill acceptance band: prefill is a single noisy cold forward, so
+            // gate it against the resolved baseline reference B. It may run faster,
+            // but a measurement more than +2% slower than B is a real slowdown and
+            // more than -5% faster is a suspiciously lucky reading -- fail either.
+            let prefillBand = PrefillBand.check(
+                prefill: prefillSecondsPerToken,
+                reference: baselinePrefillSecondsPerToken
+            )
+            guard prefillBand.passed else {
+                return makeFailedScore(
+                    error: "prefill acceptance band failed: \(prefillBand.reason)",
+                    correctness: correctnessReport,
+                    passedCorrectness: true,
+                    expertStats: expertStats,
+                    weightsDigest: transformedWeightsDigest,
+                    peakRamGB: peakRamGB,
+                    bandwidthGBPerToken: decode.bandwidthGBPerToken,
+                    decodeSecondsPerToken: decode.secondsPerToken,
+                    prefillSecondsPerToken: prefillSecondsPerToken,
+                    bandwidthSource: decode.bandwidthSource
+                )
+            }
             progress(
                 "complete score=\(formatDouble(score)) "
                     + "decode_speedup=\(formatDouble(decodeSpeedup)) "
@@ -582,6 +604,25 @@ extension GemmaRuntime {
                         decodeSpeedup: decodeSpeedup,
                         prefillSpeedup: prefillSpeedup
                     ),
+                    correctness: correctnessReport,
+                    passedCorrectness: false,
+                    peakRamGB: benchmarkPeakRamGB,
+                    bandwidthGBPerToken: decode.bandwidthGBPerToken,
+                    decodeSecondsPerToken: decode.secondsPerToken,
+                    prefillSecondsPerToken: prefillSecondsPerToken,
+                    bandwidthSource: decode.bandwidthSource
+                )
+            }
+            // Prefill acceptance band (see the identical guard on the single-machine
+            // path and PrefillBand): gate the single noisy prefill measurement
+            // against the resolved baseline reference.
+            let prefillBand = PrefillBand.check(
+                prefill: prefillSecondsPerToken,
+                reference: baselinePrefillSecondsPerToken
+            )
+            guard prefillBand.passed else {
+                return makeFailedScore(
+                    error: "prefill acceptance band failed: \(prefillBand.reason)",
                     correctness: correctnessReport,
                     passedCorrectness: false,
                     peakRamGB: benchmarkPeakRamGB,

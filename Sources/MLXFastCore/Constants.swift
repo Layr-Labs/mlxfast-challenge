@@ -83,6 +83,15 @@ public enum MLXFastConstants {
     // and add minutes to the job -- keep zero warmup and one measured run.
     public static let benchmarkPrefillWarmupRuns = 0
     public static let benchmarkPrefillTimedRuns = 1
+    // Prefill acceptance band (see PrefillBand + docs/thermal-variance-investigation.md).
+    // Prefill is a noisy single cold forward, measured ONCE per run. A robust
+    // reference B is calibrated once from a fleet (drop the single slowest, average
+    // the rest); each run's single prefill must land within [B*(1-down), B*(1+up)].
+    // > +2% of B is a real slowdown (fail); < -5% of B is a suspiciously lucky-fast
+    // reading (fail). Asymmetric: a small transient slowdown is normal noise, but a
+    // large lucky-fast reading must not be variance-harvested.
+    public static let prefillBandUpTolerance = 0.02
+    public static let prefillBandDownTolerance = 0.05
     // Official Gemma 4 31B 4-bit dense baseline, measured 2026-07-06 on the
     // ranked Blacksmith runner class (blacksmith-12vcpu-macos-26) via
     // gemma-baseline-timing-probe run 28809531890
