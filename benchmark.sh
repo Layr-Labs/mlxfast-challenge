@@ -33,6 +33,37 @@ elif [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" && "${LOCAL_ITERATE}" == "1" ]
 else
   GOLDEN_PATH="${MLXFAST_CORRECTNESS_GOLDEN_PATH:-correctness_golden.json}"
 fi
+
+# Fail fast with actionable guidance when the golden fixture is missing,
+# BEFORE any build/transform work runs. Bare ./benchmark.sh is the official
+# ranked entrypoint and needs the private oracle, which is never in the public
+# repo -- participants running it locally used to burn minutes on the
+# transform and then hit a raw file-not-found error from the Swift harness.
+if [[ ! -f "${GOLDEN_PATH}" ]]; then
+  if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" || -n "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" ]]; then
+    echo "benchmark.sh: correctness golden not found at ${GOLDEN_PATH}" >&2
+    echo "benchmark.sh: if you overrode MLXFAST_CORRECTNESS_GOLDEN_PATH, check the path;" >&2
+    echo "benchmark.sh: otherwise re-sync the repo (the public fixtures live in correctness_prompts/)." >&2
+  else
+    cat >&2 <<'EOF'
+benchmark.sh: correctness_golden.json is missing.
+
+Bare ./benchmark.sh is the OFFICIAL ranked entrypoint: it requires the private
+benchmark oracle, which is provisioned only on the official runner and is not
+part of the public repository.
+
+For local development use one of the local modes instead, which run against
+the public fixtures checked into correctness_prompts/:
+
+  ./benchmark.sh --local-iterate   # fast edit-loop signal (~2 minutes)
+  ./benchmark.sh --local-submit    # pre-submit gate (longer decode window)
+
+(Operators with a provisioned private oracle: set
+MLXFAST_CORRECTNESS_GOLDEN_PATH=/path/to/correctness_golden.json.)
+EOF
+  fi
+  exit 1
+fi
 # Resolve the reference checkpoint the same way setup.sh does. benchmark.sh used
 # to hard-default to the reference_weights/ compatibility symlink; when that
 # symlink is stale, dangling, or points at a non-directory, the Swift transform

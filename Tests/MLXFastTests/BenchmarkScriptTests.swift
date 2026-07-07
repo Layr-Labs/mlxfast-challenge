@@ -2319,6 +2319,59 @@ func benchmarkScriptRejectsPathFlagsBeforeForwardingToSwiftBenchmark() throws {
 }
 
 @Test
+func benchmarkScriptFailsFastWithGuidanceWhenGoldenIsMissing() throws {
+    // Bare ./benchmark.sh needs the private oracle. When it is absent the
+    // script must exit BEFORE any build/transform work, with guidance pointing
+    // at the local modes -- not let the Swift harness die minutes later on a
+    // raw file-not-found error. Run from an empty temp cwd so the repo's own
+    // fixtures (or an operator's local golden) cannot leak into the check.
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let benchmarkScript = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent("benchmark.sh").path
+
+    func runBare(_ arguments: [String], environment: [String: String] = [:]) throws -> (Int32, String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [benchmarkScript] + arguments
+        process.currentDirectoryURL = root
+        process.environment = ProcessInfo.processInfo.environment
+            .merging(["MLXFAST_NO_SANDBOX": "1"]) { _, new in new }
+            .merging(environment) { _, new in new }
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+        try process.run()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(data: stderrData, encoding: .utf8) ?? "")
+    }
+
+    // Bare official entrypoint without the private oracle: fail fast + guide.
+    let bare = try runBare([])
+    #expect(bare.0 != 0)
+    #expect(bare.1.contains("correctness_golden.json is missing"))
+    #expect(bare.1.contains("--local-iterate"))
+    #expect(bare.1.contains("--local-submit"))
+    // Failed before doing any work: no weights/ or score artifacts created.
+    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("score.json").path))
+
+    // Explicit override pointing at a missing file: name the path, different hint.
+    let overridden = try runBare(
+        [],
+        environment: ["MLXFAST_CORRECTNESS_GOLDEN_PATH": root.appendingPathComponent("nope.json").path]
+    )
+    #expect(overridden.0 != 0)
+    #expect(overridden.1.contains("correctness golden not found at"))
+    #expect(overridden.1.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH"))
+
+    // Local mode from a directory without the public fixtures: re-sync hint.
+    let localIterate = try runBare(["--local-iterate"])
+    #expect(localIterate.0 != 0)
+    #expect(localIterate.1.contains("correctness golden not found at"))
+    #expect(localIterate.1.contains("correctness_prompts/"))
+}
+
+@Test
 func benchmarkScriptFailsWhenScorePayloadFails() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
