@@ -78,23 +78,43 @@ optimization axis, and it caps a legitimate prefill improvement at ~5%; it is a
 ranking-contract change, so `B`'s robustness (ideally a drop-outlier-averaged
 calibration on the ranked runner) and the tolerances are an operator decision.
 
-## Current calibrated baseline
+## Current calibrated baseline (cached, tenki cold)
 
-Measured on the Gemma 4 31B 4-bit baseline reference (main commit
-`eff7e7f2c85a5a6cef11110442ba4624a6ab3986`, the migration merge and the
-timing machine's pinned paired-baseline ref) under the current (single-seed)
-harness, on the ranked Blacksmith runner class (`blacksmith-12vcpu-macos-26`)
-via `gemma-baseline-timing-probe` run 28809531890 on 2026-07-06:
+The ranked runner is now **tenki-macos-latest-xlarge only** (Blacksmith retired).
+The baseline is a **cached** value, calibrated from COLD single-benchmark runs --
+one full 128-step `./benchmark.sh` per fresh throwaway VM, which is exactly how the
+ranked candidate is measured now (see "Cached baseline" below). Values are the
+robust drop-outlier average of fresh-VM run 28893815980 (2026-07-07, 6 fresh VMs;
+corroborated by the cold run-1s of run 28898140493, 10 cold measurements total):
 
-- `officialBaselineDecodeSecondsPerToken = 0.131727461265625`
-- `officialBaselinePrefillSecondsPerToken = 0.01010573933984375`
+- `officialBaselineDecodeSecondsPerToken = 0.1336139485703125`
+- `officialBaselinePrefillSecondsPerToken = 0.010605031949609375`
 
-These supersede the DeepSeek V4 Flash-era values (decode
-3.6366560638046876 / prefill 0.17330563175390626), which were measured
-against the previous challenge model and could not price Gemma inference.
+These supersede the Blacksmith-era values (decode 0.131727461265625 / prefill
+0.01010573933984375), which priced a runner we no longer use.
 
 If either number here disagrees with `Sources/MLXFastCore/Constants.swift`, the
 freeze test fails on purpose -- the doc and the code must move together.
+
+### Paired baseline on a separate VM (the warming fix)
+
+The live paired baseline is **kept** -- it still re-measures the reference every
+run so it tracks per-run drift (no staleness) -- but it is measured on a
+**separate fresh VM from the candidate**. Why: running the baseline first on the
+*same* VM as the candidate warmed that VM, so the candidate (measured second) ran
+hot, systematically inflating its prefill by 1.5-2.8x purely from position (run
+28898140493). Splitting the baseline onto its own fresh VM means both the baseline
+and the candidate are measured **cold on their own VMs**; the paired ratio still
+cancels host/hour drift, and nothing warms the candidate.
+
+- Baseline: cold, its own fresh VM; exports its measured prefill/decode.
+- Candidate: cold, its own fresh VM; reads the baseline's values and scores the
+  ratio (and the prefill band checks the candidate's cold prefill against the
+  baseline's cold prefill -- cold vs cold, so it passes for a normal run).
+
+Cost: two fresh VMs per ranked timing run instead of one (run in parallel). The
+constants above remain the sanity-band anchor + local-mode/gates fallback, not the
+score denominator (the live same-session baseline is).
 
 ### Per-prompt baselines in the golden oracle
 

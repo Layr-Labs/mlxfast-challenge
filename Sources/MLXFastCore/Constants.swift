@@ -92,21 +92,25 @@ public enum MLXFastConstants {
     // large lucky-fast reading must not be variance-harvested.
     public static let prefillBandUpTolerance = 0.02
     public static let prefillBandDownTolerance = 0.05
-    // Official Gemma 4 31B 4-bit dense baseline, measured 2026-07-06 on the
-    // ranked Blacksmith runner class (blacksmith-12vcpu-macos-26) via
-    // gemma-baseline-timing-probe run 28809531890
-    // (https://github.com/Layr-Labs/mlxfast-challenge-dev/actions/runs/28809531890):
-    // the unmodified reference implementation at main commit
-    // eff7e7f2c85a5a6cef11110442ba4624a6ab3986 (the Gemma migration merge, the
-    // same commit the timing machine's paired-baseline ref pins), full
-    // official 128-step timing path under the official sandbox/worker posture.
-    // Supersedes the DeepSeek-era values (prefill 0.17330563175390626 /
-    // decode 3.6366560638046876). With paired-baseline measurement active,
-    // ranked speedups divide by the same-session measured reference; these
-    // constants keep three roles: local-mode scoring, the gates-only
-    // machine's placeholder timing, and the paired sanity-band anchor.
-    public static let officialBaselinePrefillSecondsPerToken = 0.01010573933984375
-    public static let officialBaselineDecodeSecondsPerToken = 0.131727461265625
+    // CACHED Gemma 4 31B 4-bit dense baseline, calibrated on the ranked runner
+    // (tenki-macos-latest-xlarge, the only ranked runner now) from COLD single-
+    // benchmark runs -- one full 128-step `./benchmark.sh` per fresh throwaway VM,
+    // which is exactly how the ranked candidate is measured now (one benchmark per
+    // fresh VM, no live paired baseline). Values are the robust drop-outlier
+    // average (drop the single slowest, average the rest) of fresh-VM run
+    // 28893815980 (2026-07-07, 6 fresh VMs), corroborated by the cold run-1s of
+    // run 28898140493 (10 cold measurements total): decode clustered 0.1332-0.1343
+    // (CV 0.3%); prefill floor ~0.0106 (one +44% spike dropped).
+    //
+    // Supersedes the Blacksmith-era values (prefill 0.01010573933984375 / decode
+    // 0.131727461265625): the ranked runner is tenki-only now. The live paired
+    // baseline is KEPT (it still tracks per-run drift) but measured on a SEPARATE
+    // fresh VM from the candidate, so the baseline run no longer warms the
+    // candidate's VM. These constants keep their three roles: local-mode scoring,
+    // the gates-only machine's placeholder timing, and the paired sanity-band
+    // anchor. See the paired-baseline section of docs/benchmark-window-freeze.md.
+    public static let officialBaselinePrefillSecondsPerToken = 0.010605031949609375
+    public static let officialBaselineDecodeSecondsPerToken = 0.1336139485703125
     public static let scorePrefillWeight = 0.25
     public static let scoreDecodeWeight = 0.75
     public static let scorePrefillSpeedupFloor = 0.95

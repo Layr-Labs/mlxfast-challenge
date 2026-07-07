@@ -306,8 +306,8 @@ jobs:
           # than 1.5x slower or 0.66x faster than calibration means the VM or
           # the baseline build is pathological; failing closed prevents a
           # broken baseline from inflating or deflating every speedup.
-          MLXFAST_PAIRED_SANITY_PREFILL: "0.01010573933984375"
-          MLXFAST_PAIRED_SANITY_DECODE: "0.131727461265625"
+          MLXFAST_PAIRED_SANITY_PREFILL: "0.010605031949609375"
+          MLXFAST_PAIRED_SANITY_DECODE: "0.1336139485703125"
         run: |
           set -euo pipefail
           started="${SECONDS}"
