@@ -154,6 +154,18 @@ public final class Gemma4ModelCache {
     /// positions for free.
     public private(set) var kvCaches: [any KVCache]?
 
+    /// Compiled single-token decode step (mlx-swift-lm `CompiledDecode`). Built
+    /// lazily on the first decode step, after the seed prefill has populated the
+    /// caches, then reused for every subsequent step. nil when compiled decode is
+    /// disabled/unsupported (the adapter falls back to the eager per-step forward).
+    var compiledDecodeStep: (@Sendable ([MLXArray]) -> [MLXArray])?
+
+    /// Adopt the compilable caches that `CompiledDecode.setupCompiledDecode`
+    /// promoted in place, so later steps and `materializeCachedState` see them.
+    func adoptKVCaches(_ caches: [any KVCache]) {
+        kvCaches = caches
+    }
+
     public init(config: Gemma4Config) {
         self.layers = config.layerTypes.map { layerType in
             let maxSize = layerType == .sliding ? config.slidingWindow : Gemma4ModelCache.unboundedCacheCap
