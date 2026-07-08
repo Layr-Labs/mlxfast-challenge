@@ -98,8 +98,27 @@ public final class Gemma4RuntimeWeightCache {
             sanitized["\(path).scales"] != nil ? quantization.asTuple : nil
         }
         try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
+
+        // Match the library's default (DARKBLOOM_BF16_WEIGHTS, on unless "0"):
+        // convert fp16 params -- notably the quantized scales/biases, whose dtype
+        // sets QuantizedMatmul's output dtype -- to bf16 so Metal does not promote
+        // mixed fp16/fp32 ops to fp32 and multiply kernel dispatches on decode.
+        if (ProcessInfo.processInfo.environment["DARKBLOOM_BF16_WEIGHTS"] ?? "1") != "0" {
+            convertParametersToBFloat16(model)
+        }
         eval(model)
         return model
+    }
+
+    /// Replicates the library's private `convertToBFloat16`: cast every fp16
+    /// parameter to bf16 and merge it back into the model.
+    private static func convertParametersToBFloat16(_ model: Module) {
+        var converted: [String: MLXArray] = [:]
+        for (key, array) in model.parameters().flattened() where array.dtype == .float16 {
+            converted[key] = array.asType(.bfloat16)
+        }
+        guard !converted.isEmpty else { return }
+        model.update(parameters: ModuleParameters.unflattened(converted))
     }
 
     public func attentionSpec(layerIndex: Int) -> Gemma4AttentionSpec {
