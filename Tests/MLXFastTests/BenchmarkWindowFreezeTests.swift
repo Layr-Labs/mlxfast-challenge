@@ -57,6 +57,8 @@ func benchmarkWindowConstantsAreFrozen() {
     #expect(MLXFastConstants.scorePrefillSpeedupFloor == 0.95)
     #expect(MLXFastConstants.prefillBandUpTolerance == 0.05)
     #expect(MLXFastConstants.prefillBandDownTolerance == 0.05)
+    #expect(MLXFastConstants.decodeBandUpTolerance == 0.02)
+    #expect(MLXFastConstants.decodeBandDownTolerance == 0.05)
 }
 
 @Test
@@ -73,6 +75,8 @@ func benchmarkWindowFreezeDocMatchesConstants() throws {
     #expect(doc.contains("benchmarkDecodeSteps = \(MLXFastConstants.benchmarkDecodeSteps)"))
     #expect(doc.contains("prefillBandUpTolerance = \(MLXFastConstants.prefillBandUpTolerance)"))
     #expect(doc.contains("prefillBandDownTolerance = \(MLXFastConstants.prefillBandDownTolerance)"))
+    #expect(doc.contains("decodeBandUpTolerance = \(MLXFastConstants.decodeBandUpTolerance)"))
+    #expect(doc.contains("decodeBandDownTolerance = \(MLXFastConstants.decodeBandDownTolerance)"))
 
     // The doc must quote the exact calibrated baseline literals from Constants,
     // so a re-baseline cannot land while the freeze doc still shows the old one.

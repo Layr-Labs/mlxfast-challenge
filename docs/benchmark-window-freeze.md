@@ -65,19 +65,27 @@ same test:
 - `scoreDecodeWeight = 0.75`, `scorePrefillWeight = 0.25`.
 - `scoreDecodeSpeedupFloor = 0.95`, `scorePrefillSpeedupFloor = 0.95`.
 - `prefillBandUpTolerance = 0.05`, `prefillBandDownTolerance = 0.05`.
+- `decodeBandUpTolerance = 0.02`, `decodeBandDownTolerance = 0.05`.
 
-Prefill acceptance band (see `PrefillBand`,
-`docs/thermal-variance-investigation.md`): prefill is a single noisy cold forward,
-measured once per run against the same-VM paired baseline `B` (which cancels
-host-speed differences). After the speedup floors, the run's measured prefill is
-gated to +/-5% of `B`: it fails if prefill exceeds `B * (1 + prefillBandUpTolerance)`
-(a real slowdown) or drops below `B * (1 - prefillBandDownTolerance)` (a
-suspiciously lucky-fast reading). Prefill is not a real optimization axis here, so
-it is a symmetric +/-5% health gate; decode's +5% slowdown cap is the 0.95 speedup
-floor (decode getting faster is unbounded -- the optimization the score rewards).
-Contestants must keep per-submission regressions on either axis under ~5%. It is a
-ranking-contract change, so `B`'s robustness and the tolerances are operator
-decisions.
+Acceptance bands (see `AcceptanceBand`,
+`docs/thermal-variance-investigation.md`): prefill and decode are single noisy
+measurements, each gated once per run against the same-VM paired baseline `B`
+(which cancels host-speed differences). After the speedup floors, each axis's
+measured value must land within `[B * (1 - downTolerance), B * (1 + upTolerance)]`:
+it fails if the value exceeds `B * (1 + upTolerance)` (a real slowdown /
+regression) or drops below `B * (1 - downTolerance)` (an improvement too large to
+trust in one submission, or a suspiciously lucky-fast reading).
+
+- **Prefill: +/-5% symmetric.** Prefill is not a real optimization axis here, so
+  it is a health gate -- both a regression and a lucky-fast reading past 5% fail.
+- **Decode: +2% regression / -5% gain.** Decode is the axis the score rewards, so
+  the up (regression) side is tight at +2%; the down (gain) side caps a *single
+  submission's* decode improvement at 5%. Larger wins are still welcome -- they
+  must be **chunked** across submissions so each step stays inside the band and is
+  independently verifiable. The cap is per-submission, not cumulative.
+
+`B`'s robustness (drop-slowest average) and the per-axis tolerances are
+ranking-contract decisions, so they are operator-owned and pinned here.
 
 ## Current calibrated baseline (cached, tenki cold)
 

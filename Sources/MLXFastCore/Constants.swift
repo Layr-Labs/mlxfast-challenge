@@ -83,18 +83,24 @@ public enum MLXFastConstants {
     // and add minutes to the job -- keep zero warmup and one measured run.
     public static let benchmarkPrefillWarmupRuns = 0
     public static let benchmarkPrefillTimedRuns = 1
-    // Prefill acceptance band (see PrefillBand + docs/thermal-variance-investigation.md).
-    // Prefill is a noisy single cold forward, measured ONCE per run against the
-    // same-VM paired baseline B (which cancels host-speed differences). Each run's
-    // prefill must land within [B*(1-down), B*(1+up)] = +/-5% of B: > +5% is a real
-    // slowdown (fail); < -5% is a suspiciously lucky-fast reading that must not be
-    // variance-harvested (fail). Prefill is not a real optimization axis here, so it
-    // is a symmetric +/-5% health gate. (Decode's +5% slowdown cap is the
-    // scoreDecodeSpeedupFloor 0.95 below; decode getting FASTER is unbounded -- that
-    // is the optimization the score rewards.) Contestants must keep per-submission
-    // regressions on either axis under ~5%.
+    // Acceptance bands (see AcceptanceBand + docs/thermal-variance-investigation.md).
+    // Prefill and decode are noisy single measurements, gated against the same-VM
+    // paired baseline B (which cancels host-speed differences). Each run's value must
+    // land within [B*(1-down), B*(1+up)]; > +up = slowdown/regression (fail),
+    // < -down = improvement too large for one submission / lucky reading (fail).
+    //
+    // Prefill: +/-5% symmetric -- prefill is not a real optimization axis, so it is a
+    // health gate (regression and lucky-fast both fail past 5%).
+    //
+    // Decode: +2% regression / -5% gain -- tight on regressions (decode is the primary
+    // scored axis), and a single submission's decode gain is capped at 5%; larger wins
+    // must be CHUNKED across submissions (bounds lucky-measurement inflation and forces
+    // incremental, verifiable progress). Decode is the axis the score rewards, but the
+    // per-submission step is capped, not the cumulative total across submissions.
     public static let prefillBandUpTolerance = 0.05
     public static let prefillBandDownTolerance = 0.05
+    public static let decodeBandUpTolerance = 0.02
+    public static let decodeBandDownTolerance = 0.05
     // CACHED Gemma 4 31B 4-bit dense baseline, calibrated on the ranked runner
     // (tenki-macos-latest-xlarge, the only ranked runner now) from COLD single-
     // benchmark runs -- one full 128-step `./benchmark.sh` per fresh throwaway VM,

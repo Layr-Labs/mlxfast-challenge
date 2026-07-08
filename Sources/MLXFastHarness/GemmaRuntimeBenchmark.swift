@@ -227,17 +227,22 @@ extension GemmaRuntime {
                     bandwidthSource: decode.bandwidthSource
                 )
             }
-            // Prefill acceptance band: prefill is a single noisy cold forward, so
-            // gate it against the resolved baseline reference B. It may run faster,
-            // but a measurement more than +2% slower than B is a real slowdown and
-            // more than -5% faster is a suspiciously lucky reading -- fail either.
-            let prefillBand = PrefillBand.check(
-                prefill: prefillSecondsPerToken,
-                reference: baselinePrefillSecondsPerToken
+            // Acceptance bands vs the resolved baseline B (see AcceptanceBand):
+            // prefill +/-5%; decode +2% regression / -5% gain (per-submission decode
+            // gain capped at 5% -> larger wins must be chunked). Fail closed on either.
+            let prefillBand = AcceptanceBand.check(
+                value: prefillSecondsPerToken, reference: baselinePrefillSecondsPerToken,
+                upTolerance: MLXFastConstants.prefillBandUpTolerance,
+                downTolerance: MLXFastConstants.prefillBandDownTolerance, label: "prefill"
             )
-            guard prefillBand.passed else {
+            let decodeBand = AcceptanceBand.check(
+                value: decode.secondsPerToken, reference: baselineDecodeSecondsPerToken,
+                upTolerance: MLXFastConstants.decodeBandUpTolerance,
+                downTolerance: MLXFastConstants.decodeBandDownTolerance, label: "decode"
+            )
+            guard prefillBand.passed, decodeBand.passed else {
                 return makeFailedScore(
-                    error: "prefill acceptance band failed: \(prefillBand.reason)",
+                    error: "acceptance band failed: \(prefillBand.passed ? decodeBand.reason : prefillBand.reason)",
                     correctness: correctnessReport,
                     passedCorrectness: true,
                     expertStats: expertStats,
@@ -613,16 +618,22 @@ extension GemmaRuntime {
                     bandwidthSource: decode.bandwidthSource
                 )
             }
-            // Prefill acceptance band (see the identical guard on the single-machine
-            // path and PrefillBand): gate the single noisy prefill measurement
-            // against the resolved baseline reference.
-            let prefillBand = PrefillBand.check(
-                prefill: prefillSecondsPerToken,
-                reference: baselinePrefillSecondsPerToken
+            // Acceptance bands vs the resolved baseline (see the identical guard on the
+            // single-machine path and AcceptanceBand): prefill +/-5%; decode +2%
+            // regression / -5% gain (per-submission decode gain capped at 5%).
+            let prefillBand = AcceptanceBand.check(
+                value: prefillSecondsPerToken, reference: baselinePrefillSecondsPerToken,
+                upTolerance: MLXFastConstants.prefillBandUpTolerance,
+                downTolerance: MLXFastConstants.prefillBandDownTolerance, label: "prefill"
             )
-            guard prefillBand.passed else {
+            let decodeBand = AcceptanceBand.check(
+                value: decode.secondsPerToken, reference: baselineDecodeSecondsPerToken,
+                upTolerance: MLXFastConstants.decodeBandUpTolerance,
+                downTolerance: MLXFastConstants.decodeBandDownTolerance, label: "decode"
+            )
+            guard prefillBand.passed, decodeBand.passed else {
                 return makeFailedScore(
-                    error: "prefill acceptance band failed: \(prefillBand.reason)",
+                    error: "acceptance band failed: \(prefillBand.passed ? decodeBand.reason : prefillBand.reason)",
                     correctness: correctnessReport,
                     passedCorrectness: false,
                     peakRamGB: benchmarkPeakRamGB,
