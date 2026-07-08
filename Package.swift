@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.3
 import PackageDescription
 
 let package = Package(
@@ -14,7 +14,13 @@ let package = Package(
         .library(name: "MLXFastHarness", targets: ["MLXFastHarness"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.31.4"),
+        // Layr-Labs forks: mlx-swift-lm carries the optimized Gemma 4 text tower
+        // this benchmark's reference is built on, and it pins mlx-swift to its
+        // own fork at branch main -- we must match that requirement (branch main)
+        // so SwiftPM resolves a single mlx-swift. Package.resolved pins the exact
+        // commit for reproducibility.
+        .package(url: "https://github.com/Layr-Labs/mlx-swift", branch: "main"),
+        .package(url: "https://github.com/Layr-Labs/mlx-swift-lm", branch: "main"),
         .package(url: "https://github.com/huggingface/swift-transformers", exact: "1.3.3"),
     ],
     targets: [
@@ -28,6 +34,9 @@ let package = Package(
             dependencies: [
                 "MLXFastCore",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
             ]
         ),
         .target(
