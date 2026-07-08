@@ -1,7 +1,9 @@
 import Foundation
 import MLX
+import MLXFastCore
 import MLXLLM
 import MLXLMCommon
+import MLXNN
 
 /// Eagerly-prepared, RAM-resident weight cache for the Gemma 4 text tower.
 ///
@@ -51,9 +53,13 @@ public final class Gemma4RuntimeWeightCache {
     }
 
     /// Construct and weight-load the mlx-swift-lm Gemma 4 text tower from the
-    /// transformed `weights/` tree: decode its flat `config.json`, build the
-    /// module, and let the library's `loadWeights` sanitize + apply 4-bit affine
-    /// quantization (group size / bits from our config) + update + eval.
+    /// transformed `weights/` tree. Mirrors the library's `loadWeights`
+    /// (sanitize -> 4-bit affine quantize -> update -> eval), but reads the
+    /// safetensor shards in memory first so we can strip the checkpoint's
+    /// `language_model.` text-tower prefix: our transform preserves the source
+    /// names (`language_model.model.layers...`), whereas `Gemma4TextModel`'s
+    /// parameter paths are `model.layers...`. Doing the rename here keeps the
+    /// transform output and the harness's DenseTensorStore validation unchanged.
     private static func loadLibraryModel(
         weightsPath: String,
         config: Gemma4Config
@@ -62,11 +68,37 @@ public final class Gemma4RuntimeWeightCache {
         let configData = try Data(contentsOf: directory.appendingPathComponent("config.json"))
         let textConfig = try JSONDecoder().decode(Gemma4TextConfiguration.self, from: configData)
         let model = Gemma4TextModel(textConfig)
+
+        let shardPrefix = "language_model."
+        var weights: [String: MLXArray] = [:]
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil
+        )
+        let shards = entries
+            .filter { $0.pathExtension == "safetensors" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        guard !shards.isEmpty else {
+            throw MLXFastError.missingFile("no safetensors shards in \(weightsPath)")
+        }
+        for shard in shards {
+            for (key, value) in try loadArrays(url: shard) {
+                let renamed = key.hasPrefix(shardPrefix)
+                    ? String(key.dropFirst(shardPrefix.count))
+                    : key
+                weights[renamed] = value
+            }
+        }
+
+        let sanitized = model.sanitize(weights: weights)
         let quantization = BaseConfiguration.Quantization(
             groupSize: config.quantizationGroupSize,
             bits: config.quantizationBits
         )
-        try loadWeights(modelDirectory: directory, model: model, quantization: quantization)
+        quantize(model: model) { path, _ in
+            sanitized["\(path).scales"] != nil ? quantization.asTuple : nil
+        }
+        try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
+        eval(model)
         return model
     }
 
