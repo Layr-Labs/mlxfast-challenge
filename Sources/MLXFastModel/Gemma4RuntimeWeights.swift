@@ -50,6 +50,33 @@ public final class Gemma4RuntimeWeightCache {
             libraryModel = nil
             loadError = error
         }
+        // Constructor-time warmup, replacing the bespoke path's Gemma4Warmup
+        // role for the library model: the runtime worker builds this cache
+        // before the benchmark protocol handshake, so the Metal pipeline-state
+        // creation and MLX kernel-cache population triggered by the first
+        // forward happen HERE, outside every scored window, instead of inside
+        // the first scored prefill.
+        if let model = libraryModel, config.numHiddenLayers >= 16 {
+            Self.warmLibraryModel(model)
+        }
+    }
+
+    /// One prefill-shaped forward (512 tokens) and one single-token decode
+    /// step against a throwaway cache, evaluated and discarded. Inputs are
+    /// constant BOS tokens, so this is prompt-independent and cannot affect
+    /// model output; the buffer cache is cleared afterwards so warmup
+    /// allocations do not linger into the measured run.
+    private static func warmLibraryModel(_ model: Gemma4TextModel) {
+        let bosToken = Int32(2)
+        let warmupCache = model.newCache(parameters: nil)
+        let prefillTokens = MLXArray(
+            Array(repeating: bosToken, count: 512),
+            [1, 512]
+        )
+        eval(model(prefillTokens, cache: warmupCache))
+        let decodeToken = MLXArray([bosToken], [1, 1])
+        eval(model(decodeToken, cache: warmupCache))
+        Memory.clearCache()
     }
 
     /// Construct and weight-load the mlx-swift-lm Gemma 4 text tower from the

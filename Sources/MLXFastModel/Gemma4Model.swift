@@ -83,21 +83,29 @@ public enum Gemma4Model {
             return model(inputIDs, cache: model.newCache(parameters: nil))
         }
 
-        // Single-token decode step: route through mlx-swift-lm's compiled decode
-        // (fused, no per-step graph rebuild). The compiled closure is built once,
-        // on the first step, from the seed-populated caches (promoted in place to
-        // compilable types); prefill and the seed forward (length > 1) stay eager.
+        // Single-token decode step: optionally route through mlx-swift-lm's
+        // compiled decode (fused, no per-step graph rebuild). The compiled
+        // closure is built once, on the first step, from the seed-populated
+        // caches (promoted in place to compilable types); prefill and the seed
+        // forward (length > 1) stay eager.
+        //
+        // Compiled decode is OPT-IN (DARKBLOOM_COMPILED_DECODE=1): its one-time
+        // compile cost lands inside the scored decode window, which is not
+        // amortized at the ranked 128-step length. Gating here in the harness
+        // adapter -- rather than relying on the fork's internal default --
+        // makes ranked runs deterministically eager wherever the env is unset.
         if inputIDs.dim(1) == 1 {
             if let step = cache.compiledDecodeStep {
                 return step([inputIDs])[0]
             }
             var kvCaches = cache.kvCache(for: model)
-            if let step = CompiledDecode.setupCompiledDecode(model: model, cache: &kvCaches) {
+            if ProcessInfo.processInfo.environment["DARKBLOOM_COMPILED_DECODE"] == "1",
+               let step = CompiledDecode.setupCompiledDecode(model: model, cache: &kvCaches) {
                 cache.adoptKVCaches(kvCaches)
                 cache.compiledDecodeStep = step
                 return step([inputIDs])[0]
             }
-            // Compiled decode unavailable (disabled/unsupported): eager fallback.
+            // Compiled decode disabled or unsupported: eager per-step forward.
             cache.adoptKVCaches(kvCaches)
             return model(inputIDs, cache: kvCaches)
         }
