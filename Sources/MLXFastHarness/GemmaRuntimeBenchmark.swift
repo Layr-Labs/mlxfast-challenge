@@ -227,6 +227,33 @@ extension GemmaRuntime {
                     bandwidthSource: decode.bandwidthSource
                 )
             }
+            // Acceptance bands vs the resolved baseline B (see AcceptanceBand):
+            // prefill +/-5%; decode +2% regression / -5% gain (per-submission decode
+            // gain capped at 5% -> larger wins must be chunked). Fail closed on either.
+            let prefillBand = AcceptanceBand.check(
+                value: prefillSecondsPerToken, reference: baselinePrefillSecondsPerToken,
+                upTolerance: MLXFastConstants.prefillBandUpTolerance,
+                downTolerance: MLXFastConstants.prefillBandDownTolerance, label: "prefill"
+            )
+            let decodeBand = AcceptanceBand.check(
+                value: decode.secondsPerToken, reference: baselineDecodeSecondsPerToken,
+                upTolerance: MLXFastConstants.decodeBandUpTolerance,
+                downTolerance: MLXFastConstants.decodeBandDownTolerance, label: "decode"
+            )
+            guard prefillBand.passed, decodeBand.passed else {
+                return makeFailedScore(
+                    error: "acceptance band failed: \(prefillBand.passed ? decodeBand.reason : prefillBand.reason)",
+                    correctness: correctnessReport,
+                    passedCorrectness: true,
+                    expertStats: expertStats,
+                    weightsDigest: transformedWeightsDigest,
+                    peakRamGB: peakRamGB,
+                    bandwidthGBPerToken: decode.bandwidthGBPerToken,
+                    decodeSecondsPerToken: decode.secondsPerToken,
+                    prefillSecondsPerToken: prefillSecondsPerToken,
+                    bandwidthSource: decode.bandwidthSource
+                )
+            }
             progress(
                 "complete score=\(formatDouble(score)) "
                     + "decode_speedup=\(formatDouble(decodeSpeedup)) "
@@ -582,6 +609,31 @@ extension GemmaRuntime {
                         decodeSpeedup: decodeSpeedup,
                         prefillSpeedup: prefillSpeedup
                     ),
+                    correctness: correctnessReport,
+                    passedCorrectness: false,
+                    peakRamGB: benchmarkPeakRamGB,
+                    bandwidthGBPerToken: decode.bandwidthGBPerToken,
+                    decodeSecondsPerToken: decode.secondsPerToken,
+                    prefillSecondsPerToken: prefillSecondsPerToken,
+                    bandwidthSource: decode.bandwidthSource
+                )
+            }
+            // Acceptance bands vs the resolved baseline (see the identical guard on the
+            // single-machine path and AcceptanceBand): prefill +/-5%; decode +2%
+            // regression / -5% gain (per-submission decode gain capped at 5%).
+            let prefillBand = AcceptanceBand.check(
+                value: prefillSecondsPerToken, reference: baselinePrefillSecondsPerToken,
+                upTolerance: MLXFastConstants.prefillBandUpTolerance,
+                downTolerance: MLXFastConstants.prefillBandDownTolerance, label: "prefill"
+            )
+            let decodeBand = AcceptanceBand.check(
+                value: decode.secondsPerToken, reference: baselineDecodeSecondsPerToken,
+                upTolerance: MLXFastConstants.decodeBandUpTolerance,
+                downTolerance: MLXFastConstants.decodeBandDownTolerance, label: "decode"
+            )
+            guard prefillBand.passed, decodeBand.passed else {
+                return makeFailedScore(
+                    error: "acceptance band failed: \(prefillBand.passed ? decodeBand.reason : prefillBand.reason)",
                     correctness: correctnessReport,
                     passedCorrectness: false,
                     peakRamGB: benchmarkPeakRamGB,

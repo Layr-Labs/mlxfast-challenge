@@ -253,15 +253,15 @@ prefill_speedup >= 0.95
 
 The baseline constants backing these floors (`MLXFastConstants.officialBaseline*`)
 are calibrated against the unmodified Gemma 4 31B 4-bit reference
-implementation on the official Blacksmith runner class (see
+implementation on the ranked runner (tenki-macos-latest-xlarge, cold; see
 `docs/benchmark-window-freeze.md` for the measurement provenance). On official
 runs the paired-baseline (same-session measured reference) and per-prompt
 golden baseline paths -- both of which take precedence over the constants in
 the benchmark harness -- price the floors against a live same-session sample.
 A run below either floor fails eligibility even if the weighted score would
 otherwise be above baseline. On the calibrated constants, those floors allow
-at most `0.13866048554276317` seconds/token for decode and
-`0.010637620357730262` seconds/token for prefill.
+at most `0.14064626165296054` seconds/token for decode and
+`0.011163191525904606` seconds/token for prefill.
 
 The whole model is RAM-resident with no weight streaming, so
 `bandwidth_gb_per_token` is always `0`, reported with

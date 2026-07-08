@@ -295,13 +295,13 @@ prefill_speedup >= 0.95
 The floor prevents a submission from sacrificing one serving phase badly to
 improve the other. The exact baseline timings are emitted in each `score.json`
 and kept in `MLXFastConstants`, calibrated against the unmodified Gemma 4 31B
-4-bit reference implementation on the official Blacksmith runner class (see
-`docs/benchmark-window-freeze.md` for the measurement provenance). On official
-runs the paired-baseline (same-session measured reference) and per-prompt
-golden baseline paths take precedence over the constants.
+4-bit reference implementation on the ranked runner (tenki-macos-latest-xlarge,
+cold; see `docs/benchmark-window-freeze.md` for the measurement provenance). On
+official runs the paired-baseline (same-session measured reference) and
+per-prompt golden baseline paths take precedence over the constants.
 On the calibrated constants, that means decode must be at most
-`0.13866048554276317` seconds/token and prefill must be at most
-`0.010637620357730262` seconds/token.
+`0.14064626165296054` seconds/token and prefill must be at most
+`0.011163191525904606` seconds/token.
 For scoring, decode is trusted parent wall-clock time for decode setup plus the
 checked decode-token window, not worker-reported per-step time. That charges
 prompt-specific seed prefill to the decode phase so submitted model code cannot
