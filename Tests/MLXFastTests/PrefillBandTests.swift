@@ -4,7 +4,7 @@ import Testing
 
 // Prefill acceptance band: a robust reference B is calibrated once from a fleet
 // (drop the single slowest, average the rest); each run's single prefill is then
-// checked against B ([-5%, +2%]). Numbers anchored on the real tenki fresh-VM run
+// checked against B (+/-5%). Numbers anchored on the real tenki fresh-VM run
 // 28893815980 (prefills: 5 tight at ~0.0106, one spike at 0.01532).
 
 private let freshVMPrefills = [
@@ -31,15 +31,16 @@ func robustReferenceRejectsTooFewOrInvalid() {
 func checkAcceptsAtReferenceAndModestlyFaster() {
     let B = 0.0106
     #expect(PrefillBand.check(prefill: B, reference: B).passed)          // exactly at B
-    #expect(PrefillBand.check(prefill: B * 1.01, reference: B).passed)   // +1% slow: ok
+    #expect(PrefillBand.check(prefill: B * 1.04, reference: B).passed)   // +4% slow: ok
     #expect(PrefillBand.check(prefill: B * 0.97, reference: B).passed)   // -3% fast: ok
 }
 
 @Test
-func checkFailsWhenMoreThan2PercentSlow() {
+func checkFailsWhenMoreThan5PercentSlow() {
     let B = 0.0106
-    #expect(!PrefillBand.check(prefill: B * 1.021, reference: B).passed)
-    #expect(PrefillBand.check(prefill: B * 1.021, reference: B).reason.contains("slowdown"))
+    #expect(PrefillBand.check(prefill: B * 1.04, reference: B).passed)   // +4% slow: still ok
+    #expect(!PrefillBand.check(prefill: B * 1.051, reference: B).passed) // +5.1% slow: fail
+    #expect(PrefillBand.check(prefill: B * 1.051, reference: B).reason.contains("slowdown"))
     // the real 0.01532 spike vs B=0.010605 is +44% -> fail
     #expect(!PrefillBand.check(prefill: 0.01532235343359375, reference: 0.0106048).passed)
 }
@@ -60,6 +61,6 @@ func checkRejectsNonFinite() {
 
 @Test
 func bandTolerancesMatchConstants() {
-    #expect(MLXFastConstants.prefillBandUpTolerance == 0.02)
+    #expect(MLXFastConstants.prefillBandUpTolerance == 0.05)
     #expect(MLXFastConstants.prefillBandDownTolerance == 0.05)
 }

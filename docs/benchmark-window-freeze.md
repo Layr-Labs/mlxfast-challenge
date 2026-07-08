@@ -64,19 +64,20 @@ same test:
 
 - `scoreDecodeWeight = 0.75`, `scorePrefillWeight = 0.25`.
 - `scoreDecodeSpeedupFloor = 0.95`, `scorePrefillSpeedupFloor = 0.95`.
-- `prefillBandUpTolerance = 0.02`, `prefillBandDownTolerance = 0.05`.
+- `prefillBandUpTolerance = 0.05`, `prefillBandDownTolerance = 0.05`.
 
 Prefill acceptance band (see `PrefillBand`,
 `docs/thermal-variance-investigation.md`): prefill is a single noisy cold forward,
-measured once per run. After the speedup floors, the run's measured prefill is
-gated against the resolved baseline reference `B` (paired baseline, else
-golden-carried, else `officialBaselinePrefillSecondsPerToken`): the run fails if
-prefill exceeds `B * (1 + prefillBandUpTolerance)` (a real slowdown) or drops
-below `B * (1 - prefillBandDownTolerance)` (a suspiciously lucky-fast reading).
-This treats prefill as a tight health gate around the reference rather than an
-optimization axis, and it caps a legitimate prefill improvement at ~5%; it is a
-ranking-contract change, so `B`'s robustness (ideally a drop-outlier-averaged
-calibration on the ranked runner) and the tolerances are an operator decision.
+measured once per run against the same-VM paired baseline `B` (which cancels
+host-speed differences). After the speedup floors, the run's measured prefill is
+gated to +/-5% of `B`: it fails if prefill exceeds `B * (1 + prefillBandUpTolerance)`
+(a real slowdown) or drops below `B * (1 - prefillBandDownTolerance)` (a
+suspiciously lucky-fast reading). Prefill is not a real optimization axis here, so
+it is a symmetric +/-5% health gate; decode's +5% slowdown cap is the 0.95 speedup
+floor (decode getting faster is unbounded -- the optimization the score rewards).
+Contestants must keep per-submission regressions on either axis under ~5%. It is a
+ranking-contract change, so `B`'s robustness and the tolerances are operator
+decisions.
 
 ## Current calibrated baseline (cached, tenki cold)
 

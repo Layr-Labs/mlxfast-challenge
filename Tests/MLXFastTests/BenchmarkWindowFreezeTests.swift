@@ -55,7 +55,7 @@ func benchmarkWindowConstantsAreFrozen() {
     #expect(MLXFastConstants.scorePrefillWeight == 0.25)
     #expect(MLXFastConstants.scoreDecodeSpeedupFloor == 0.95)
     #expect(MLXFastConstants.scorePrefillSpeedupFloor == 0.95)
-    #expect(MLXFastConstants.prefillBandUpTolerance == 0.02)
+    #expect(MLXFastConstants.prefillBandUpTolerance == 0.05)
     #expect(MLXFastConstants.prefillBandDownTolerance == 0.05)
 }
 
