@@ -1,5 +1,7 @@
 import Foundation
 import MLX
+import MLXLLM
+import MLXLMCommon
 
 /// Eagerly-prepared, RAM-resident weight cache for the Gemma 4 text tower.
 ///
@@ -13,6 +15,14 @@ public final class Gemma4RuntimeWeightCache {
     public let loader: Gemma4WeightLoader
     public let config: Gemma4Config
 
+    /// The mlx-swift-lm Gemma 4 text tower this benchmark's reference runs. It is
+    /// loaded once here at construction (outside every scored window), so no
+    /// checkpoint I/O or quantized-linear construction lands on the hot path.
+    /// nil only if the load failed, in which case `loadError` carries the reason
+    /// and the first `Gemma4Model.logits` rethrows it.
+    public let libraryModel: Gemma4TextModel?
+    public let loadError: Error?
+
     private var cachedModelWeights: Gemma4ModelWeights?
     private var cachedBlockWeights: [Int: Gemma4BlockWeights] = [:]
     private var cachedAttentionWeights: [Int: Gemma4AttentionWeights] = [:]
@@ -22,7 +32,42 @@ public final class Gemma4RuntimeWeightCache {
     public init(loader: Gemma4WeightLoader, config: Gemma4Config) {
         self.loader = loader
         self.config = config
-        eagerlyPrepareForFullModel()
+        // Bound the MLX buffer cache so resident memory stays near the ~17 GB
+        // checkpoint plus KV/activation buffers instead of growing without limit
+        // across a long decode run.
+        if config.numHiddenLayers >= 16 {
+            Memory.cacheLimit = 6 << 30
+        }
+        do {
+            libraryModel = try Gemma4RuntimeWeightCache.loadLibraryModel(
+                weightsPath: loader.denseStore.weightsPath,
+                config: config
+            )
+            loadError = nil
+        } catch {
+            libraryModel = nil
+            loadError = error
+        }
+    }
+
+    /// Construct and weight-load the mlx-swift-lm Gemma 4 text tower from the
+    /// transformed `weights/` tree: decode its flat `config.json`, build the
+    /// module, and let the library's `loadWeights` sanitize + apply 4-bit affine
+    /// quantization (group size / bits from our config) + update + eval.
+    private static func loadLibraryModel(
+        weightsPath: String,
+        config: Gemma4Config
+    ) throws -> Gemma4TextModel {
+        let directory = URL(fileURLWithPath: weightsPath)
+        let configData = try Data(contentsOf: directory.appendingPathComponent("config.json"))
+        let textConfig = try JSONDecoder().decode(Gemma4TextConfiguration.self, from: configData)
+        let model = Gemma4TextModel(textConfig)
+        let quantization = BaseConfiguration.Quantization(
+            groupSize: config.quantizationGroupSize,
+            bits: config.quantizationBits
+        )
+        try loadWeights(modelDirectory: directory, model: model, quantization: quantization)
+        return model
     }
 
     public func attentionSpec(layerIndex: Int) -> Gemma4AttentionSpec {
@@ -70,27 +115,4 @@ public final class Gemma4RuntimeWeightCache {
         return weights
     }
 
-    /// For the full-size checkpoint, populate every memoized weight struct
-    /// and warm the hot Metal kernels during construction. Small fixture
-    /// configs (unit tests, convenience callers) skip this entirely, and
-    /// every step is fail-soft so missing tensors surface on first use
-    /// exactly as before.
-    private func eagerlyPrepareForFullModel() {
-        guard config.numHiddenLayers >= 16 else {
-            return
-        }
-        // The default MLX buffer cache is effectively unbounded; bound it so
-        // resident memory stays close to the ~17 GB checkpoint plus KV cache
-        // and activation buffers instead of growing without limit across a
-        // long decode run.
-        Memory.cacheLimit = 6 << 30
-        _ = try? modelWeights()
-        for layerIndex in 0..<config.numHiddenLayers {
-            _ = try? blockWeights(layerIndex: layerIndex)
-            _ = try? attentionWeights(layerIndex: layerIndex)
-            _ = try? mlpWeights(layerIndex: layerIndex)
-            _ = attentionSpec(layerIndex: layerIndex)
-        }
-        Gemma4Warmup.run(weightCache: self)
-    }
 }

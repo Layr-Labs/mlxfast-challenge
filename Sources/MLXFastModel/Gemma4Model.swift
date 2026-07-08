@@ -1,6 +1,8 @@
 import Foundation
 import MLX
 import MLXFastCore
+import MLXLLM
+import MLXLMCommon
 
 public struct Gemma4ModelWeights {
     public let embedTokens: Gemma4LinearWeight
@@ -55,29 +57,29 @@ public struct Gemma4ModelSpec: Equatable {
 /// decoder layers, final RMSNorm, tied-embedding LM head, and final logit
 /// softcapping (`30 * tanh(x / 30)`).
 public enum Gemma4Model {
+    /// Reference forward, delegated to the mlx-swift-lm Gemma 4 text tower held
+    /// by `weightCache`. Returns `[1, length, vocab]` logits with the final
+    /// `30 * tanh(x / 30)` softcap already applied by the library; downstream
+    /// consumers read only the last position's row.
+    ///
+    /// `positionOffset` is intentionally not forwarded: the library derives each
+    /// layer's RoPE position from its KV cache `offset`, which advances in place
+    /// as the persistent `Gemma4ModelCache` is reused across the seed prefill and
+    /// every decode/correctness step. The parameter is retained only to keep the
+    /// harness call contract stable.
     public static func logits(
         inputIDs: MLXArray,
         weightCache: Gemma4RuntimeWeightCache,
         cache: Gemma4ModelCache? = nil,
         positionOffset: Int = 0
     ) throws -> MLXArray {
-        let config = weightCache.config
-        let spec = Gemma4ModelSpec(config: config)
-        let weights = try weightCache.modelWeights()
-        return try logits(
-            inputIDs: inputIDs,
-            weights: weights,
-            spec: spec,
-            positionOffset: positionOffset
-        ) { layerIndex, hidden in
-            try layer(
-                index: layerIndex,
-                hidden: hidden,
-                weightCache: weightCache,
-                cache: cache?.layers[layerIndex],
-                positionOffset: positionOffset
-            )
+        guard let model = weightCache.libraryModel else {
+            throw weightCache.loadError
+                ?? MLXFastError.invalidInput("Gemma 4 reference model was not loaded")
         }
+        _ = positionOffset
+        let kvCaches = cache?.kvCache(for: model) ?? model.newCache(parameters: nil)
+        return model(inputIDs, cache: kvCaches)
     }
 
     public static func logits(

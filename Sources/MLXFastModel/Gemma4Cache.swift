@@ -1,6 +1,8 @@
 import Foundation
 import MLX
 import MLXFastCore
+import MLXLLM
+import MLXLMCommon
 
 public struct Gemma4CachedArray {
     public let value: MLXArray
@@ -145,6 +147,13 @@ public final class Gemma4ModelCache {
     /// the buffer only grows in small on-demand increments.
     public static let unboundedCacheCap = 1 << 16
 
+    /// The mlx-swift-lm per-layer KV caches. Created lazily from the loaded
+    /// model on the first forward (the model owns `newCache`, which this holder's
+    /// `init(config:)` has no access to), then reused across the seed prefill and
+    /// every decode step so the cache offset advances and supplies RoPE
+    /// positions for free.
+    public private(set) var kvCaches: [any KVCache]?
+
     public init(config: Gemma4Config) {
         self.layers = config.layerTypes.map { layerType in
             let maxSize = layerType == .sliding ? config.slidingWindow : Gemma4ModelCache.unboundedCacheCap
@@ -155,13 +164,25 @@ public final class Gemma4ModelCache {
         }
     }
 
+    /// Bespoke per-layer KV arrays (retained for the standalone Gemma4KVCache
+    /// tests; the scored path uses the library `kvCaches` instead).
     func arraysForMaterialization() -> [MLXArray] {
         layers.flatMap { $0.arraysForMaterialization() }
     }
 
+    /// Return this cache's `[KVCache]`, creating it from the model on first use.
+    public func kvCache(for model: Gemma4TextModel) -> [any KVCache] {
+        if let kvCaches {
+            return kvCaches
+        }
+        let created = model.newCache(parameters: nil)
+        kvCaches = created
+        return created
+    }
+
     public func materializeCachedState() {
-        for array in arraysForMaterialization() {
-            eval(array)
+        if let kvCaches {
+            eval(kvCaches)
         }
     }
 }
