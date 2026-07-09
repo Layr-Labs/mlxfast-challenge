@@ -49,14 +49,16 @@ MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
 # score.json instead of a ranked score.
 ```
 
-> **Correctness fixtures are Gemma-generated.** The checked-in prompt/golden
-> fixtures under `correctness_prompts/` were regenerated against the Gemma 4
-> 31B 4-bit reference implementation (`mlxfast-swift generate-golden`): the
-> prompt text is tokenized with the Gemma tokenizer and the expected tokens
-> are greedy continuations from the reference forward pass, so local
-> correctness runs are meaningful again. The private/hidden artifacts used by
-> ranked runs are regenerated separately by the organizer; see
-> [TASK.md](TASK.md).
+> **Correctness fixtures are M5-generated.** The checked-in prompt/golden
+> fixtures under `correctness_prompts/` were generated on the ranked M5
+> hardware against the Gemma 4 31B 4-bit reference implementation
+> (`mlxfast-swift generate-golden`): the prompt text is tokenized with the
+> Gemma tokenizer and the expected tokens are greedy continuations from the
+> reference forward pass. On other Apple Silicon generations, near-tie greedy
+> argmaxes can diverge, so the local public gate may fail for a correct
+> build — local modes are directional; the ranked M5 runner is the source of
+> truth. The private/hidden artifacts used by ranked runs were regenerated
+> the same way by the organizer; see [TASK.md](TASK.md).
 
 The benchmark writes `score.json` in the format consumed by Darkbloom.
 `score.json` is a generated local output and is not tracked. Public
@@ -101,26 +103,36 @@ environment variables for path overrides; pass `--weights`, `--golden`, and
 another HTTP checkpoint prefix (for example
 `https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main` to fetch
 from Hugging Face instead of the R2 mirror; both serve the same
-manifest-pinned files). Run `./setup.sh --help`
+manifest-pinned files), and `MLXFAST_REFERENCE_AUTH_HEADER` to pass an auth
+header to a private checkpoint endpoint. Run `./setup.sh --help`
 for the full local setup knobs.
 
 For manual GitHub Actions benchmark runs, dispatch `benchmark.yml` on the
-trusted repository workflow. The workflow uses the protected
-`MLXFAST_REFERENCE_BASE_URL` secret when present, otherwise the default
-Darkbloom R2 mirror. It downloads the reference checkpoint into the same
-repo-local Hugging Face-style cache path used by local setup, passes that path
-explicitly to the offline transform, then prepares the correctness golden after
-transform completes. Correctness-only workflow runs use the checked-in public
-`correctness_prompts/public_longcopy_gate_english_512_256.json` fixture. Full
-benchmark runs require the precomputed hidden R2 object
-`correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`.
+trusted repository workflow. Ranked runs execute as one serial job on the
+single self-hosted M5 runner (label `m5-bench`); the reference checkpoint is
+pre-provisioned on that box and hash-verified against the pinned manifest
+every run, so the workflow never downloads it. The job order is: guard steps
+(quarantine/trusted-context/editable-surface/static-review checks), build and
+transform in the bench sandbox, the public correctness gate against the
+checked-in `correctness_prompts/public_longcopy_gate_english_512_256.json`
+fixture, the hidden correctness golden (fetched from R2 and pin-verified),
+the full 64-step hidden base case plus anchor/free-run/behavior/GPQA gates in
+one harness pass, the semantic GPQA judge, a scrub of all hidden material
+from the bench workspace, a quiescence wait plus a fixed 40C GPU thermal
+cool-gate, the paired timed measurement (pinned reference baseline then
+candidate, back to back on the same silicon), and finally the timing overlay
+that seals the score. Dispatching with the default `run_benchmark=false`
+runs only the public-fixture correctness gate.
+Full benchmark runs require the precomputed hidden R2 object
+`correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json`.
 Full benchmark runs also require the private R2
-`correctness_prompts/gpqa_reference_cases.json` object. The workflow tokenizes
-5 token-budget-valid hidden GPQA multiple-choice prompts locally and attaches
-them as short-answer behavior gates before correctness runs. Each private GPQA
-case must include precomputed reference `accepted_token_sequences` or
-`accepted_responses`; GPQA answer keys are metadata, not an exact-token oracle,
-and the benchmark workflow never regenerates this reference object.
+`correctness_prompts/gpqa_reference_cases-gemma.json` object. The workflow
+tokenizes 5 token-budget-valid hidden GPQA multiple-choice prompts locally and
+attaches them as short-answer behavior gates before correctness runs. Each
+private GPQA case must include precomputed reference
+`accepted_token_sequences` or `accepted_responses`; GPQA answer keys are
+metadata, not an exact-token oracle, and the benchmark workflow never
+regenerates this reference object.
 The official workflow checks the first generated GPQA answer token for each
 case, using the stable prefix of any longer precomputed reference sequence.
 During that hidden behavior correctness pass, it also records TTFT by timing
@@ -132,33 +144,15 @@ only those private answer bundles to Claude for a semantic pass/fail judge. This
 requires the `ORG_ANTHROPIC_API_KEY` repository secret. The score artifact records
 only aggregate semantic counts and the judge model name; prompts, references,
 candidate answers, and judge text stay in the private runner directory.
-The private workflow keeps semantic GPQA wired as a required gate, calibrated
-to an unmodified Gemma 4 31B 4-bit baseline rather than to better-than-baseline
-GPQA answer quality. The measured Gemma baseline is 0/5 at the 64-token answer
-budget (official-runner verification run 28817200585; run 28813130022 had
-already judged 0/5 at the previous 10-token budget), so the threshold is 0/5:
-baseline Gemma expresses no judged-correct answers on these raw-completion
-prompts. Aggregate pass counts are still recorded, and the gate stays
-aggregate-recording until the hidden prompts change, after which a fresh judged
-official-runner baseline must recalibrate the threshold (see
-`MLXFastConstants.semanticGPQAMinPassCount`).
-When dispatched with `run_benchmark=true`, the workflow fans out across 5
-independent machines instead of running everything on one: three
-`correctness-slice-N` jobs each check one `range_N`-defined slice of the
-hidden base correctness case, `benchmark-timing` runs only the timed
-prefill/decode measurement, and `benchmark-gates` runs only the anchor/
-free-run/behavior/GPQA gates. A cheap `validate-slice-ranges` job checks the
-three ranges before any of those machines start. A `combine` job (no
-checkpoint download, no private secrets) then downloads all 5 results and ANDs
-every machine's real verdict into the final score. Dispatching with the
-default `run_benchmark=false` instead runs the same checks serially on one
-machine.
-If none of those is configured, a full benchmark fails; it will not use a
-committed prompt, committed golden, or Actions cache fallback for ranked
-scoring. Final hidden goldens should come from protected storage. Private
-endpoints can pass headers through
-`MLXFAST_REFERENCE_AUTH_HEADER` and `MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER`
-repository secrets. Private R2 golden downloads use the `R2_ACCESS_KEY_ID`,
+The private workflow keeps semantic GPQA wired as a required gate, with a
+pass-count threshold calibrated against the unmodified Gemma 4 31B 4-bit
+baseline rather than against better-than-baseline GPQA answer quality; see
+`MLXFastConstants.semanticGPQAMinPassCount` for the current threshold and its
+calibration provenance.
+A full benchmark run fails without the hidden R2 objects and Anthropic key
+configured; it will not use a committed prompt, committed golden, or Actions
+cache fallback for ranked scoring. Final hidden goldens come from protected
+storage. Private R2 golden downloads use the `R2_ACCESS_KEY_ID`,
 `R2_BUCKET_ENDPOINT`, and `R2_SECRET_ACCESS_KEY` secrets. See
 [`docs/private-benchmark-security.md`](docs/private-benchmark-security.md) for
 the private prompt and artifact handling model.
@@ -168,10 +162,10 @@ the private prompt and artifact handling model.
 Gemma 4 31B is a dense (non-MoE) text+vision model; only the text tower is in
 scope here. In 4-bit the text tower is about 17 GB, small enough to load
 entirely into unified memory once at process startup on the official runner
-(the hardware contract is Apple M4-generation silicon with at least 36 GB of
-unified memory; today's runner is Blacksmith's M4 Pro class with 48 GB) and on
-any local machine meeting that bar. There is no weight streaming of any kind:
-the whole model is RAM-resident before the first scored forward pass runs.
+(a single self-hosted Apple M5 Max with 128 GB of unified memory, runner
+label `m5-bench`) and on any local machine with roughly 36 GB or more. There
+is no weight streaming of any kind: the whole model is RAM-resident before
+the first scored forward pass runs.
 
 That does not mean there is nothing left to optimize. Attention alternates
 five sliding-window layers (1024-token window, GQA with 16 KV heads) with one
@@ -281,11 +275,13 @@ prefill_speedup = baseline_prefill_sec_per_token / prefill_sec_per_token
 score = decode_speedup^0.75 * prefill_speedup^0.25
 ```
 
-Higher score is better. A baseline implementation on the official runner scores
-about `1.0`; improvements should move the score upward. Decode is weighted more
-heavily because it dominates interactive generation, while prefill still matters
-for prompt processing.
-Both phases must also stay within 5% of the official baseline:
+Higher score is better. The ranked score is **paired**: `baseline_*` is the
+pinned reference implementation, measured on the same M5 box in the same
+session as the candidate, each behind the same thermal gate, so an unmodified
+reference implementation scores about `1.0` and the ratio cancels host drift.
+Decode is weighted more heavily because it dominates interactive generation,
+while prefill still matters for prompt processing.
+Both phases must also stay within 5% of the paired baseline:
 
 ```
 decode_speedup >= 0.95
@@ -293,14 +289,13 @@ prefill_speedup >= 0.95
 ```
 
 The floor prevents a submission from sacrificing one serving phase badly to
-improve the other. The exact baseline timings are emitted in each `score.json`
-and kept in `MLXFastConstants`, calibrated against the unmodified Gemma 4 31B
-4-bit reference implementation on the ranked runner (tenki-macos-latest-xlarge,
-cold; see `docs/benchmark-window-freeze.md` for the measurement provenance). On
-official runs the paired-baseline (same-session measured reference) and
-per-prompt golden baseline paths take precedence over the constants.
-On the calibrated constants, that means decode must be at most
-`0.14064626165296054` seconds/token and prefill must be at most
+improve the other. The baseline timings used in each run are emitted in that
+run's `score.json`. The `MLXFastConstants.officialBaseline*` constants feed
+**local-mode estimates only** (no second build is available locally); the
+ranked denominator is the on-box measured reference (see
+`docs/benchmark-window-freeze.md` for the measurement contract). On the
+local-mode constants, the floors correspond to decode at most
+`0.14064626165296054` seconds/token and prefill at most
 `0.011163191525904606` seconds/token.
 For scoring, decode is trusted parent wall-clock time for decode setup plus the
 checked decode-token window, not worker-reported per-step time. That charges
@@ -311,9 +306,11 @@ records `bandwidth_source=ram_resident_model` and reports
 `bandwidth_gb_per_token=0`. RAM and phase-timing metrics are still reported
 for operator review and future guardrails; they are not primary score factors.
 Correctness is a hard gate. See TASK.md for the full correctness specification.
-The official run times the benchmark before correctness so the correctness gate
-cannot warm the measured model path. It then checks 64 public correctness
-positions plus the hidden GPQA behavior checks.
+On the ranked pipeline the correctness and gates pass (the hidden 64-step base
+case plus the GPQA behavior checks) runs first and the timed measurement runs
+last, in fresh worker processes behind a quiescence wait and a fixed 40C GPU
+thermal gate, so the correctness pass can neither warm nor perturb the
+measured model path.
 Public local correctness uses the checked-in correctness fixture. When a local
 edit-loop signal is enough, `--local-iterate` uses that public 512-token prompt,
 times standalone prefill separately, then times decode including seed prefill
@@ -324,9 +321,11 @@ fixture: it times the same standalone prefill and decode-seed phases plus 1023
 teacher-forced decode tokens in one continuous trajectory, writes
 `score.json`, and also leaves `score` null because official ranking still
 requires the hidden benchmark oracle on the trusted runner.
-The score payload includes the official baseline timings, computed speedups,
-wall-clock phase timings, final process RSS, the (always-zero) expert
-streaming counters kept for schema stability, and transformed-weights digest.
+The score payload includes the baseline timings used for scoring (the
+same-session measured reference on ranked runs, the calibrated constants in
+local modes), computed speedups, wall-clock phase timings, final process RSS,
+the (always-zero) expert streaming counters kept for schema stability, and
+transformed-weights digest.
 
 ## Architecture
 
@@ -365,23 +364,24 @@ uses the same default cap and can also be changed with
 `mlxfast-swift verify-transform --max-bytes N`.
 
 The public correctness-only prompt and golden live in `correctness_prompts/`.
-These fixtures are generated against the Gemma 4 31B 4-bit reference: the
-prompt text is tokenized with the Gemma tokenizer (512 prompt tokens) and the
-expected tokens are greedy reference continuations captured with
-`mlxfast-swift generate-golden` (256 tokens for local-iterate, 1024 for
-local-submit). Private prompt manifests and hidden
+These fixtures are generated on the ranked M5 hardware against the Gemma 4
+31B 4-bit reference: the prompt text is tokenized with the Gemma tokenizer
+(512 prompt tokens) and the expected tokens are greedy reference
+continuations captured with `mlxfast-swift generate-golden` (256 tokens for
+local-iterate, 1024 for local-submit). Private prompt manifests and hidden
 benchmark golden files are not committed or generated by the benchmark
 workflow. In private benchmark CI, the normal path downloads the precomputed
-`correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256.json`
+`correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json`
 object from R2, then downloads
-`correctness_prompts/gpqa_reference_cases.json` and merges it into the local
-golden as 5 hidden GPQA behavior checks. Generate
+`correctness_prompts/gpqa_reference_cases-gemma.json` and merges it into the
+local golden as 5 hidden GPQA behavior checks. Generate
 final hidden benchmark goldens outside the public repository and upload the
-resulting file to the protected private R2 path. The benchmark workflow stores
-its local golden copy under `$RUNNER_TEMP`, not the repository workspace, and
-uploads only hash and byte-count sidecars. The semantic GPQA answer and judge
-result files are also kept under the private runner directory and are not
-uploaded.
+resulting file to the protected private R2 path. The benchmark workflow keeps
+raw hidden material in a runner-only private directory, not the repository
+workspace, scrubs every hidden byte out of the bench workspace before the
+timed measurement, and uploads only hash and byte-count sidecars. The
+semantic GPQA answer and judge result files are also kept under the private
+runner directory and are not uploaded.
 
 The Swift `make-golden` generator has been removed from the public harness so CI
 only consumes precomputed fixtures. The last commit on this branch containing
@@ -412,9 +412,10 @@ tokenizer whitespace variants.
 
 ## Requirements
 
-- Apple Silicon Mac, 36 GB+ unified memory (matching the official hardware
-  contract: Apple M4-generation silicon with at least 36 GB; older Apple
-  Silicon works for iteration but timings are directional only)
+- Apple Silicon Mac, 36 GB+ unified memory (enough to hold the ~17 GB text
+  tower plus KV cache and buffers; the ranked runner is a single self-hosted
+  Apple M5 Max with 128 GB, so local timings — and, on non-M5 machines,
+  near-tie greedy tokens — are directional only)
 - macOS Sequoia or later
 - Swift 6 through Xcode or Xcode Command Line Tools
 - Xcode Metal Toolchain for `mlx.metallib`; `./setup.sh` tries

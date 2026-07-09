@@ -2,112 +2,101 @@
 
 The DeepSeek V4 Flash to Gemma 4 31B 4-bit migration changed the model,
 tokenizer, and layer count, so every private artifact that embeds prompt
-tokens, expected tokens, or model-derived calibration is now
-model-mismatched. This file is the consolidated operator checklist; each
-in-tree consumption site carries a matching greppable marker:
+tokens, expected tokens, or model-derived calibration was model-mismatched
+and had to be regenerated. This file is the consolidated operator checklist;
+all items are now **DONE**: the hidden goldens and GPQA references were
+regenerated on the ranked M5 hardware from the `mlx-swift-lm` rebase
+reference and uploaded to R2, and the checked-in public fixtures were
+regenerated the same way.
 
-```bash
-rg -n "TODO\(gemma-r2\)|TODO\(gemma-golden\)"
-```
-
-Nothing here changes the R2 secret/env plumbing (`R2_ACCESS_KEY_ID`,
+Nothing here changed the R2 secret/env plumbing (`R2_ACCESS_KEY_ID`,
 `R2_BUCKET_ENDPOINT`, `R2_SECRET_ACCESS_KEY` on the
 `benchmark-private-prompts` environment) — that structure is intact and
 correct. Only the *contents* of the private objects (and the pins that
-verify them) must be regenerated.
+verify them) were regenerated.
 
-## 1. Hidden correctness/benchmark golden (R2) — regenerated, pending upload
+## 1. Hidden correctness/benchmark golden (R2) — DONE (uploaded 2026-07-09)
 
 - **Object:** `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json`
-- **Regenerated contents:** 512-token base prompt retokenized with the
-  Gemma tokenizer; 256 teacher-forced expected continuation tokens from the
-  trusted Gemma 4 31B 4-bit reference; a `correctness_gates.free_run` gate
-  covering the full timed decode offset range (`attach-free-run-gate`
-  defaults, 128 steps); and the benchmark oracle (prefill next token,
-  512-token decode seed next token, 256 timed decode tokens). Per-prompt
-  `baseline_*_seconds_per_token` calibration is intentionally omitted (the
-  previous object also omitted it); scoring falls back to the calibrated
-  constants until the Gemma baseline recalibration lands.
-- **Consumed by:**
-  - `.github/workflows/benchmark-correctness-slice.yml` — "Download and
-    verify hidden correctness golden" (all three slice machines, raw
-    pre-GPQA form).
-  - `.github/workflows/benchmark-timing-or-gates.yml` — "Prepare
-    correctness golden" (timing and gates machines; gates additionally
-    augments it with GPQA gates via `attach-gpqa-gates`).
-  - `.github/workflows/benchmark.yml` — the `correctness-only` job declares
-    the object path/pins in its env (defaults; the job itself runs on the
-    public golden).
-- **Pins:** `MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256`
-  (now `56c282d...6eae9`) and `MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES`
-  (now `38162`) in `benchmark.yml` and
-  `benchmark-correctness-slice.yml` match the regenerated object; they take
-  effect once the object is uploaded to R2.
+- **Contents:** 512-token base prompt retokenized with the Gemma tokenizer;
+  256 teacher-forced expected continuation tokens captured on the M5 from
+  the trusted Gemma 4 31B 4-bit rebase reference; a
+  `correctness_gates.free_run` gate covering the full timed decode offset
+  range (`attach-free-run-gate` defaults, 128 steps); and the benchmark
+  oracle (prefill next token, 512-token decode seed next token, 256 timed
+  decode tokens). Per-prompt `baseline_*_seconds_per_token` calibration is
+  intentionally omitted: the ranked pipeline measures the pinned reference
+  baseline live on the same box, so no golden-carried calibration is needed
+  there, and local modes fall back to the calibrated constants.
+- **Consumed by:** `.github/workflows/benchmark.yml` — the single ranked
+  job's "Prepare hidden correctness golden" step downloads and pin-verifies
+  the raw object; "Attach GPQA gates and verify augmented golden" then
+  augments it with the GPQA behavior gates.
+- **Pins:** `MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256`
+  (`56c282dcaac433543ef0eecb625cd99bc20f1ae1f7b9415efe32a71e6eb4eae9`) and
+  `MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES` (`38162`) in `benchmark.yml` match
+  the uploaded object. The augmented golden's hash/bytes
+  (`MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_*`) are self-anchored at run time
+  right after augmentation, as before.
 
-## 2. Hidden GPQA reference cases (R2) — regenerated, pending upload
+## 2. Hidden GPQA reference cases (R2) — DONE (uploaded 2026-07-09)
 
 - **Object:** `correctness_prompts/gpqa_reference_cases-gemma.json`
-- **Regenerated contents:** the 9 GPQA multiple-choice prompt cases (prompt
-  text, answer keys, domains unchanged) with each case's
-  `accepted_token_sequences` replaced by the first greedy answer token
-  captured from the Gemma 4 31B 4-bit reference (Gemma tokenizer,
-  `max_new_tokens=10` generation), preserving the previous artifact's
-  one-token-sequence shape; the semantic judge's reference answers continue
-  to derive from the answer keys.
-- **Consumed by:** `.github/workflows/benchmark-timing-or-gates.yml` —
-  "Prepare correctness golden" (`attach-gpqa-gates`), which drives the
+- **Contents:** the 9 GPQA multiple-choice prompt cases (prompt text, answer
+  keys, domains unchanged) with each case's `accepted_token_sequences`
+  regenerated from the Gemma 4 31B 4-bit rebase reference on the M5 (Gemma
+  tokenizer, greedy first-answer-token capture), preserving the previous
+  artifact's one-token-sequence shape; the semantic judge's reference
+  answers continue to derive from the answer keys.
+- **Consumed by:** `.github/workflows/benchmark.yml` — "Attach GPQA gates
+  and verify augmented golden" (`attach-gpqa-gates`), which drives the
   hidden GPQA behavior gates, the TTFT guardrail, and the semantic-GPQA
   answer capture judged by `run-semantic-gpqa-gate.sh`.
 - **No hash pin:** the augmented golden's hash/bytes are computed at run
   time, so no workflow constant needs updating for this object itself.
-- **Recalibrate — DONE (2026-07-06):** the semantic-GPQA 3/5 threshold
-  (`MLXFAST_SEMANTIC_GPQA_MIN_PASS`) was calibrated against the previous
-  model's baseline answer quality. The unmodified Gemma baseline measured
-  0/5 on ranked run 28813130022 (judged at the 10-token budget), and the
-  official-runner verification run 28817200585 confirmed 0/5 judged at the
-  64-token budget (`MLXFAST_GPQA_MAX_NEW_TOKENS` /
-  `MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS`): baseline Gemma expresses no
-  judged-correct answers on these raw-completion prompts. The threshold is 0
-  and the gate is aggregate-recording until the hidden prompts change, after
-  which a fresh judged official-runner baseline must recalibrate it (see
-  `MLXFastConstants.semanticGPQAMinPassCount`).
+- **Semantic threshold:** the semantic-GPQA pass-count threshold is
+  calibrated against the unmodified baseline's judged answer quality, and a
+  regeneration of the hidden prompts/references requires a fresh judged
+  baseline on the ranked runner. See
+  `MLXFastConstants.semanticGPQAMinPassCount` for the current threshold and
+  its calibration provenance.
 
 ## 3. Private prompt manifest (organizer-side, not workflow-consumed)
 
 - The manifest of hidden prompt sources used to regenerate goldens offline
   (see `docs/private-benchmark-security.md`). It is never downloaded by the
-  workflows, but the organizer's offline regeneration pipeline must switch
-  to the Gemma tokenizer/reference before producing items 1 and 2.
+  workflows; the organizer's offline regeneration pipeline switched to the
+  Gemma tokenizer/reference before producing items 1 and 2.
 
-## 4. Public fixtures (checked in) — DONE
+## 4. Public fixtures (checked in) — DONE (regenerated on M5, 2026-07-09)
 
 - `correctness_prompts/public_longcopy_gate_english_512_256.json` and
-  `correctness_prompts/public_longcopy_gate_english_512_1024.json` have been
-  regenerated against the Gemma 4 31B 4-bit reference with
-  `mlxfast-swift generate-golden` (Gemma-tokenized 512-token prompt, greedy
-  reference continuations; the 256 fixture is a greedy prefix of the 1024
-  one). The pins that verify them were moved in the same change:
-  - `MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256` / `..._BYTES` in
-    `.github/workflows/benchmark.yml` (`correctness-only` env).
-  - `public_golden_sha256` in the "Public behavior gate" step of
-    `.github/workflows/benchmark-timing-or-gates.yml`.
+  `correctness_prompts/public_longcopy_gate_english_512_1024.json` were
+  regenerated on the ranked M5 hardware against the Gemma 4 31B 4-bit rebase
+  reference with `mlxfast-swift generate-golden` (Gemma-tokenized 512-token
+  prompt, greedy reference continuations; the 256 fixture is a greedy prefix
+  of the 1024 one). Because the expected tokens are M5 argmaxes, the local
+  public gate can fail on other Apple Silicon generations at near-tie
+  positions; that is a hardware divergence, not a fixture bug.
+- Pins moved with the fixtures:
+  - `MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256`
+    (`182a7f98d24cc8f26e8b08505fe7a8b6d825702f99d0b78a83f49dd42f1b2aea`) /
+    `..._BYTES` (`11140`) in `.github/workflows/benchmark.yml`.
+  - The fixture digests pinned in `Tests/MLXFastTests/GoldenTests.swift`
+    (the 1024 fixture's digest is
+    `2de5474bbe707bcb2e8b71d7d771ffd9be70c252d3ecce7f1511aa2a50933b4d`).
 
-## 5. Paired-baseline ref and calibrated constants — DONE
+## 5. Ranked baseline — DONE (superseded by the on-box pinned baseline)
 
-- The timing machine's pinned paired-baseline ref now points at the Gemma
-  migration merge (`eff7e7f2c85a5a6cef11110442ba4624a6ab3986`), and the
-  calibrated constants were re-measured against that exact commit on the
-  official Blacksmith runner class (`gemma-baseline-timing-probe` run
-  28809531890, 2026-07-06; a dispatch-only, secret-free timing fan-out of
-  unmodified `main` over the full official 128-step timing path). The same
-  change updated `officialBaselinePrefillSecondsPerToken` /
-  `officialBaselineDecodeSecondsPerToken` in
-  `Sources/MLXFastCore/Constants.swift`, the `MLXFAST_PAIRED_SANITY_PREFILL`
-  / `MLXFAST_PAIRED_SANITY_DECODE` anchors in
-  `benchmark-timing-or-gates.yml`, `docs/benchmark-window-freeze.md`,
-  `README.md`, `TASK.md`, and
-  `Tests/MLXFastTests/BenchmarkWindowFreezeTests.swift`.
-- Note: the ranked timing job's own end-to-end verification (a green
-  paired-baseline step inside `benchmark.yml`) still depends on items 1 and
-  2 above — the paired step measures the reference against the hidden R2
-  golden, which is still DeepSeek-tokenized.
+- The ranked score no longer prices against a repo-pinned baseline ref or
+  the calibrated constants: the single-machine pipeline measures the
+  **pinned reference baseline tree provisioned on the M5 box**
+  (`/opt/bench-runner/baseline/current`, sanity-banded against
+  `/opt/bench-runner/state/baseline-calibration.json`) in the same session
+  as the candidate. Regenerating that tree or its calibration is an
+  operator procedure (RUNBOOK) and a ranking-contract change.
+- The `officialBaselinePrefillSecondsPerToken` /
+  `officialBaselineDecodeSecondsPerToken` constants in
+  `Sources/MLXFastCore/Constants.swift` remain as local-mode estimates and
+  the gates pass's skip-timed placeholder timing only; see
+  `docs/benchmark-window-freeze.md`.

@@ -2,11 +2,11 @@
 
 This document is the frozen definition of the **timed benchmark window** -- the
 exact work the official runner charges to the prefill and decode scores -- and
-the protocol for changing it. It exists because the official baseline
-(`officialBaselineDecodeSecondsPerToken` /
-`officialBaselinePrefillSecondsPerToken`) is measured on the Blacksmith runner
-at real cost. Any change to the charged work makes the recorded baseline mean a
-different thing, which forces a new baseline run for every axis that moved.
+the protocol for changing it. It exists because the ranked score is paired
+against a **pinned reference baseline** provisioned on the official M5 box and
+calibrated at real cost. Any change to the charged work makes that baseline
+(and the cached local-mode constants) mean a different thing, which forces a
+new baseline for every axis that moved.
 
 Treat a re-baseline as expensive and rare. The goal of this freeze is to make
 the current calibration the last forced one: decide every window knob here, pin
@@ -69,12 +69,13 @@ same test:
 
 Acceptance bands (see `AcceptanceBand`,
 `docs/thermal-variance-investigation.md`): prefill and decode are single noisy
-measurements, each gated once per run against the same-VM paired baseline `B`
-(which cancels host-speed differences). After the speedup floors, each axis's
-measured value must land within `[B * (1 - downTolerance), B * (1 + upTolerance)]`:
-it fails if the value exceeds `B * (1 + upTolerance)` (a real slowdown /
-regression) or drops below `B * (1 - downTolerance)` (an improvement too large to
-trust in one submission, or a suspiciously lucky-fast reading).
+measurements, each gated against the same-session paired baseline `B` measured
+on the same silicon (which cancels host-speed differences). After the speedup
+floors, each axis's measured value must land within
+`[B * (1 - downTolerance), B * (1 + upTolerance)]`: it fails if the value
+exceeds `B * (1 + upTolerance)` (a real slowdown / regression) or drops below
+`B * (1 - downTolerance)` (an improvement too large to trust in one
+submission, or a suspiciously lucky-fast reading).
 
 - **Prefill: +/-5% symmetric.** Prefill is not a real optimization axis here, so
   it is a health gate -- both a regression and a lucky-fast reading past 5% fail.
@@ -84,50 +85,66 @@ trust in one submission, or a suspiciously lucky-fast reading).
   must be **chunked** across submissions so each step stays inside the band and is
   independently verifiable. The cap is per-submission, not cumulative.
 
-`B`'s robustness (drop-slowest average) and the per-axis tolerances are
-ranking-contract decisions, so they are operator-owned and pinned here.
+`B`'s robustness and the per-axis tolerances are ranking-contract decisions, so
+they are operator-owned and pinned here.
 
-## Current calibrated baseline (cached, tenki cold)
+## Cached local-mode constants
 
-The ranked runner is now **tenki-macos-latest-xlarge only** (Blacksmith retired).
-The baseline is a **cached** value, calibrated from COLD single-benchmark runs --
-one full 128-step `./benchmark.sh` per fresh throwaway VM, which is exactly how the
-ranked candidate is measured now (see "Cached baseline" below). Values are the
-robust drop-outlier average of fresh-VM run 28893815980 (2026-07-07, 6 fresh VMs;
-corroborated by the cold run-1s of run 28898140493, 10 cold measurements total):
+The `officialBaseline*` constants in `Sources/MLXFastCore/Constants.swift` are
+a **cached calibration retained for local-mode estimates and the gates pass's
+skip-timed placeholder timing only** -- the ranked score denominator is the
+live paired baseline measured on the M5 box (next section), never these
+numbers. They were last calibrated on the previous ranked runner generation
+(cold fresh-VM runs, 2026-07-07) and are kept so `--local-iterate` /
+`--local-submit` can print a directional speedup without a second local build:
 
 - `officialBaselineDecodeSecondsPerToken = 0.1336139485703125`
 - `officialBaselinePrefillSecondsPerToken = 0.010605031949609375`
 
-These supersede the Blacksmith-era values (decode 0.131727461265625 / prefill
-0.01010573933984375), which priced a runner we no longer use.
-
 If either number here disagrees with `Sources/MLXFastCore/Constants.swift`, the
 freeze test fails on purpose -- the doc and the code must move together.
 
-### Paired baseline on a separate VM (the warming fix)
+### Paired baseline on the single M5 box
 
-The live paired baseline is **kept** -- it still re-measures the reference every
-run so it tracks per-run drift (no staleness) -- but it is measured on a
-**separate fresh VM from the candidate**. Why: running the baseline first on the
-*same* VM as the candidate warmed that VM, so the candidate (measured second) ran
-hot, systematically inflating its prefill by 1.5-2.8x purely from position (run
-28898140493). Splitting the baseline onto its own fresh VM means both the baseline
-and the candidate are measured **cold on their own VMs**; the paired ratio still
-cancels host/hour drift, and nothing warms the candidate.
+The ranked runner is one self-hosted Apple M5 Max (label `m5-bench`). The
+paired baseline is a **pinned reference tree provisioned on that box**
+(`/opt/bench-runner/baseline/current`), and the timed measurement is owned by
+the on-box `measure-job` (trusted, runner-provisioned, fixed thermal
+contract). Per ranked run, after all correctness/gates work, a hidden-material
+scrub, and a quiescence wait, measure-job runs the pinned **baseline tree
+first, then the candidate workspace**, each as a full `./benchmark.sh
+--official` in fresh worker processes, each starting only once the GPU is
+below the fixed 40C gate (up to a 900s cooldown), each under 2 Hz telemetry.
+A measurement is rejected -- with one gated retry -- on GPU throttling under
+load, missing telemetry, or token mismatches. Because both sides run back to
+back on the same silicon behind the same gate, the paired ratio cancels
+common-mode host drift exactly like the old separate-VM pairing did
+(validated on this box at paired score 1.0507 with decode CV 0.13%).
 
-- Baseline: cold, its own fresh VM; exports its measured prefill/decode.
-- Candidate: cold, its own fresh VM; reads the baseline's values and scores the
-  ratio (and the prefill band checks the candidate's cold prefill against the
-  baseline's cold prefill -- cold vs cold, so it passes for a normal run).
+- The baseline sample is additionally sanity-checked against the box's
+  recorded calibration (`/opt/bench-runner/state/baseline-calibration.json`),
+  so a broken baseline build or a sick host fails the run instead of
+  repricing every speedup.
+- The baseline's own floor verdict is ignored; token mismatches or harness
+  errors in the baseline run fail the whole run.
+- The speedup floors and the `decode^0.75 * prefill^0.25` score are applied to
+  the paired ratio in the trusted shell
+  (`.github/scripts/overlay-paired-timing.sh`), with the same constants the
+  harness pins.
+- Changing the pinned baseline tree or its calibration is a ranking-contract
+  change: it redefines what "1.0x" means. Update the tree, its calibration,
+  this doc, and the pinned guard tests together (operator procedure: RUNBOOK).
 
-Cost: two fresh VMs per ranked timing run instead of one (run in parallel). The
-constants above remain the sanity-band anchor + local-mode/gates fallback, not the
-score denominator (the live same-session baseline is).
+The harness's own paired-override plumbing
+(`MLXFAST_PAIRED_BASELINE_{PREFILL,DECODE}_SECONDS_PER_TOKEN`) is still
+shipped and armed: a paired override outranks golden-carried baselines, which
+outrank the constants; the pair is fail-closed (both together, finite,
+positive) and both variables are stripped from the sandboxed worker
+environment.
 
 ### Per-prompt baselines in the golden oracle
 
-These constants are the **fallback**, not the only source. A golden's
+The constants are the **fallback**, not the only source. A golden's
 `benchmark` oracle may carry its own calibration:
 
 ```json
@@ -143,7 +160,7 @@ Rules, enforced at golden load and by the freeze tests:
 - Both fields must be present together or absent together, finite and positive.
   A half-calibrated oracle would silently mix two calibration regimes.
 - When present, scored speedups, floors, the published `baseline_*` metrics,
-  and the gates-only machine's placeholder timing all resolve from the golden.
+  and the gates pass's placeholder timing all resolve from the golden.
   When absent, everything resolves from the constants above (the pre-pool
   behavior; all public fixtures carry none).
 - Carrying baselines in the golden is what makes prompt-pool rotation rankable:
@@ -151,47 +168,18 @@ Rules, enforced at golden load and by the freeze tests:
   prompts of different intrinsic difficulty keeps speedups comparable. It does
   NOT change the charged window -- adding a pool prompt is baseline work for
   that prompt only, never a re-baseline of the window itself.
-
-### Paired baseline measurement (official timing machine)
-
-Fixed constants compare a live single sample against a number measured on a
-different physical host at a different hour. Measured fleet drift on identical
-code across one day: prefill 0.163 -> 0.190 seconds/token (~10%+), decode ~4% --
-enough to flip floor verdicts and swing scores for reasons unrelated to the
-submission. Official ranked runs therefore measure the baseline live:
-
-- The timing machine checks out the **pinned paired-baseline ref** (trusted
-  workflow content; submissions cannot repoint it), builds it, transforms its
-  own weights, and runs its timed benchmark against the same hidden golden in
-  the same session, minutes before the candidate.
-- The measured seconds-per-token are passed to the candidate benchmark through
-  `MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN` /
-  `MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN`. Resolution precedence in
-  the harness is **paired override, then golden-carried baselines, then the
-  constants**. The pair is fail-closed (both together, finite, positive) and
-  both variables are stripped from the sandboxed worker environment.
-- A **sanity band** guards the pairing: the baseline sample must fall within
-  [0.66x, 1.5x] of the calibrated constants on both axes, so a pathological VM
-  or broken baseline build fails the run instead of repricing every speedup.
-- The baseline's own floor verdict is ignored (it is measured against its
-  checked-in constants and legitimately fails on a slow-fleet session); token
-  mismatches or harness errors in the baseline run fail the whole run.
-- Changing the pinned ref is a ranking-contract change: it redefines what
-  "1.0x" means. Update the ref, this doc, and the pinned guard test together.
-
-With pairing active, the constants keep three roles: local-mode scoring (no
-second build available locally), the gates-only machine's placeholder timing,
-and the sanity-band anchor. Pool prompts no longer need pre-calibrated
-baselines on the official path -- the baseline is measured live against
-whichever prompt is active, which also removes the batched pool-calibration
-session as a hard prerequisite for rotation.
+- On the ranked path the live paired baseline outranks both the golden-carried
+  values and the constants, so pool prompts no longer need pre-calibrated
+  baselines there -- the baseline is measured live against whichever prompt is
+  active.
 
 ## Re-baseline protocol (how to change the window)
 
 1. Make the window change and update the constants above in
    `Sources/MLXFastCore/Constants.swift`.
-2. Re-measure the affected axis (or both) on the official Blacksmith runner with
-   the baseline reference model, all gates green.
+2. Rebuild and re-measure the pinned baseline tree on the official M5 box with
+   the reference model, all gates green, and refresh its recorded calibration
+   (operator procedure: RUNBOOK).
 3. Update `officialBaseline*SecondsPerToken` and the values quoted in this doc,
    `README.md`, and `TASK.md`.
 4. Update the pinned literals in `BenchmarkWindowFreezeTests.swift` in the same

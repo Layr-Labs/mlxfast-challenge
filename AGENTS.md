@@ -17,38 +17,53 @@ prefill_speedup = baseline_prefill_sec_per_token / prefill_sec_per_token
 score = decode_speedup^0.75 * prefill_speedup^0.25
 ```
 
-Higher is better. Baseline is about `1.0` on the official runner. Decode is
+Higher is better. The ranked score is paired: `baseline_*` is the pinned
+reference implementation, measured on the same machine in the same session as
+the submission, so unmodified reference code scores about `1.0`. Decode is
 weighted more heavily because it dominates interactive generation. Both decode
 and prefill must also stay within the configured 0.95 speedup floors.
 
 ## Official Hardware
 
-Ranked benchmark runs execute through GitHub Actions on Blacksmith-hosted
-Apple Silicon runners, like the rest of the Darkbloom inference benchmarks.
-The runner label configured in `.github/` is the source of truth; today that
-is:
+Ranked benchmark runs execute through GitHub Actions on a single self-hosted
+Apple M5 Max machine with 128 GB of unified memory. The runner label
+configured in `.github/` is the source of truth; today that is:
 
 ```text
-blacksmith-12vcpu-macos-26
+m5-bench
 ```
 
-The ranked hardware contract for this benchmark is Apple M4-generation
-silicon with at least 36 GB of unified memory; today's runner is Blacksmith's
-Apple M4 Pro class (48 GB), which is also the hardware the official baseline
-constants were calibrated on. Gemma 4 31B 4-bit is a dense model: the text
-tower is about 17 GB in 4-bit, so it is fully RAM-resident under that
-contract: the runtime loads every text-tower tensor once during untimed
-initialization and keeps it resident for the whole process lifetime. There is
-no weight streaming of any kind, no expert cache, and no disk I/O on the
-scored prefill/decode path. Optimization effort should go into compute —
-attention kernels (sliding-window vs. full-attention dispatch, GQA,
-partial-rotary RoPE), quantized matmul dispatch, KV-cache handling, memory
-layout, and MLX scheduling — not disk I/O.
+The box is operator-supervised: each ranked job runs on a fresh ephemeral
+runner registration, every invocation of submitted code (build, transform,
+correctness, benchmark) executes sandboxed, and the machine's protected
+surface is integrity-audited between jobs — drift quarantines the box instead
+of publishing a score. The whole ranked pipeline runs serially on that one
+machine: build and transform, the public correctness gate, the hidden
+64-step base case plus behavior/GPQA gates, the semantic judge, and — last,
+after a quiescence wait — the timed prefill/decode measurement, which starts
+each timed phase only once the GPU has cooled below a fixed 40C gate and
+rejects throttled or telemetry-invalid measurements. See
+`.github/workflows/benchmark.yml` for the exact step order.
+
+Because the candidate and the pinned reference are measured back to back on
+the same silicon behind the same thermal gate, the paired speedup ratio
+cancels host drift; the score is that ratio, not a comparison against a
+stored constant. Gemma 4 31B 4-bit is a dense model: the text tower is about
+17 GB in 4-bit, fully RAM-resident on the ranked box — the runtime loads
+every text-tower tensor once during untimed initialization and keeps it
+resident for the whole process lifetime. There is no weight streaming of any
+kind, no expert cache, and no disk I/O on the scored prefill/decode path.
+Optimization effort should go into compute — attention kernels
+(sliding-window vs. full-attention dispatch, GQA, partial-rotary RoPE),
+quantized matmul dispatch, KV-cache handling, memory layout, and MLX
+scheduling — not disk I/O.
 
 Local machines need enough unified memory to hold the ~17 GB text tower plus
-KV cache and activation buffers; the 36 GB contract minimum is a practical
-local minimum too. A kernel or layout strategy that helps on one Apple Silicon
-generation can move differently on the official runner, so always rely on the
+KV cache and activation buffers; about 36 GB is a practical local minimum.
+The ranked box has more headroom than that, but memory-hungry strategies
+tuned against a different machine still have to survive the paired
+measurement on the M5, and a kernel or layout strategy that helps on one
+Apple Silicon generation can move differently there — always rely on the
 official benchmark for ranking.
 
 ## What You May Optimize
@@ -111,12 +126,19 @@ Correctness is a hard gate. Passing locally is necessary but not sufficient for
 ranking.
 
 The public local gate uses checked-in prompt/golden fixtures under
-`correctness_prompts/`. These fixtures are Gemma-generated: the prompt text is
-tokenized with the Gemma 4 tokenizer and the expected tokens are greedy
-continuations captured from the Gemma 4 31B 4-bit reference implementation
-(`mlxfast-swift generate-golden`); see `TASK.md`. The official benchmark uses
-private artifacts supplied by the organizer, which must likewise be
-regenerated for Gemma 4 before ranked scoring.
+`correctness_prompts/`. These fixtures were generated on the ranked M5
+hardware from the reference implementation — the Layr-Labs `mlx-swift-lm`
+Gemma 4 text tower this package builds against: the prompt text is tokenized
+with the Gemma 4 tokenizer and the expected tokens are greedy continuations
+captured with `mlxfast-swift generate-golden`; see `TASK.md`. The hidden
+artifacts used by ranked runs were regenerated the same way from the same
+reference on the same hardware.
+
+Know this before debugging a local failure: greedy argmaxes with near-tie
+logits can diverge across Apple Silicon generations, so on non-M5 machines
+the local public gate may fail for a perfectly correct build. Local modes are
+directional; the ranked M5 runner is the source of truth for both correctness
+and timing.
 
 The official correctness stack includes:
 
@@ -127,8 +149,8 @@ The official correctness stack includes:
 - TTFT guardrails for hidden GPQA first-token behavior.
 - Benchmark oracle checks for the timed prefill/decode prompt.
 
-The source of truth for current token counts and baseline constants is
-`Sources/MLXFastCore/Constants.swift`.
+The source of truth for current token counts, gate thresholds, and baseline
+constants is `Sources/MLXFastCore/Constants.swift`.
 
 ## Timing And Score Measurement
 
@@ -138,6 +160,14 @@ The official benchmark measures:
 - Decode seconds per token.
 - Weighted score from prefill and decode speedups.
 - Pass/fail component speed floors.
+
+The timed measurement runs last in the ranked job, after all correctness and
+gate work, behind a fixed 40C GPU thermal gate with telemetry-validated
+acceptance; the pinned reference is measured the same way on the same box in
+the same session, and speedups (and the 0.95 floors) are computed from that
+paired ratio. The `officialBaseline*` constants in
+`Sources/MLXFastCore/Constants.swift` feed local-mode estimates only; they
+are not the ranked denominator.
 
 Diagnostic fields such as memory and read timings are recorded for audit and
 future guardrails, but are not the primary score unless the benchmark contract
@@ -205,7 +235,9 @@ recorded above, not against a result from an older branch.
 be longer and closer to the official path while still producing `score: null`.
 `./benchmark.sh --official` is the full ranked entrypoint and requires the
 hidden golden artifacts provisioned on the official runner. A bare
-`./benchmark.sh` defaults to `--local-iterate`.
+`./benchmark.sh` defaults to `--local-iterate`. Remember the public fixtures
+are M5-generated: a local correctness failure on non-M5 hardware can be a
+near-tie argmax divergence rather than a real bug (see Correctness Gates).
 
 ## Swift Tooling
 
@@ -267,34 +299,23 @@ Good submissions are likely to improve one or more of:
 
 Be careful with optimizations that only help a single public prompt or a single
 machine. The hidden correctness and benchmark prompts are different from the
-public local fixtures, and official scoring happens on the Blacksmith runner.
+public local fixtures, and official scoring happens on the single self-hosted
+M5 runner.
 
 ## Avoid These Wrong Strategies
 
 Do not assume the benchmark machine has the same memory budget as your local
-Mac. The official contract is Apple M4-generation silicon with at least 36 GB
-of unified memory (today's runner: Blacksmith M4 Pro, 48 GB); the ~17 GB text
-tower is comfortably RAM-resident there, but headroom for KV cache, buffers,
-and caches is finite — do not tune memory-hungry strategies against a larger
-local machine. Unlike a large MoE checkpoint there is no meaningfully
-different "streaming fallback" regime here to mistune against.
+Mac. The ranked box is one Apple M5 Max with 128 GB of unified memory; the
+~17 GB text tower is comfortably RAM-resident there, but do not treat that
+headroom as an invitation for memory-hungry strategies tuned on a different
+machine — KV cache, buffers, and caches still compete, and what is fast on
+your Apple Silicon generation can move differently on the M5. Unlike a large
+MoE checkpoint there is no meaningfully different "streaming fallback" regime
+here to mistune against.
 
 Do not specialize for the public correctness prompt. Optimizations should be
 prompt-independent and model-general for Gemma 4. Hidden correctness, GPQA,
 and benchmark prompts are different from the public fixtures.
-
-Do not add caches or memos keyed on a request's input tokens whose only
-possible hit is the benchmark harness repeating an identical computation — for
-example, memoizing a whole-prompt forward's logits or KV state so a repeated
-identical forward can skip the work. Bit-identical output does not make this
-legitimate. The benchmark measures single-pass inference: optimizations must
-save work that recurs in single-pass production inference (one prefill, then
-decode, per prompt), not work that only exists in the measurement protocol.
-The harness never legitimately issues the same whole-prompt forward twice to
-one worker process; any such repetition is a harness bug, never a contract to
-rely on. Input-independent caching (weights, dequantized tensors, RoPE/mask
-tables keyed on shapes and offsets) and within-request KV reuse remain fine.
-Submissions in this category fail the static review as bypass behavior.
 
 Do not treat local-only environment overrides as proof of a valid improvement.
 Examples include disabling the sandbox, skipping transform without verifying
@@ -324,3 +345,16 @@ swift test
 If the local correctness gate fails, the official benchmark will not rank the
 submission. If local performance improves but correctness is fragile, prefer a
 more conservative optimization.
+
+Do not add caches or memos keyed on a request's input tokens whose only
+possible hit is the benchmark harness repeating an identical computation — for
+example, memoizing a whole-prompt forward's logits or KV state so a repeated
+identical forward can skip the work. Bit-identical output does not make this
+legitimate. The benchmark measures single-pass inference: optimizations must
+save work that recurs in single-pass production inference (one prefill, then
+decode, per prompt), not work that only exists in the measurement protocol.
+The harness never legitimately issues the same whole-prompt forward twice to
+one worker process; any such repetition is a harness bug, never a contract to
+rely on. Input-independent caching (weights, dequantized tensors, RoPE/mask
+tables keyed on shapes and offsets) and within-request KV reuse remain fine.
+Submissions in this category fail the static review as bypass behavior.

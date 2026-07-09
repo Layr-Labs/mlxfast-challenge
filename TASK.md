@@ -43,17 +43,21 @@ token plus 1023 teacher-forced decode tokens from a longer public fixture, and
 still writes and prints `score.json` with `score: null`; it is a directional
 local signal, not the official ranking run.
 
-> **Gemma-generated correctness fixtures.** `correctness_prompts/` contains
-> prompt/golden fixtures regenerated against the Gemma 4 31B 4-bit reference
-> implementation. The 512-token prompts were retokenized from the checked-in
-> prompt text with the Gemma tokenizer, and the expected continuation tokens
-> were captured from the reference model's greedy forward pass with
-> `mlxfast-swift generate-golden` (256 expected tokens for the local-iterate
-> fixture, 1024 for the local-submit fixture; the shorter fixture is a greedy
-> prefix of the longer one by construction). The hidden/private artifacts used
-> by ranked runs (R2 golden, GPQA references) are regenerated separately
-> through the organizer process and must likewise be Gemma-generated before
-> ranked scoring is meaningful.
+> **M5-generated correctness fixtures.** `correctness_prompts/` contains
+> prompt/golden fixtures generated on the ranked M5 hardware against the
+> Gemma 4 31B 4-bit reference implementation (the Layr-Labs `mlx-swift-lm`
+> Gemma 4 text tower this package builds against). The 512-token prompts were
+> retokenized from the checked-in prompt text with the Gemma tokenizer, and
+> the expected continuation tokens were captured from the reference model's
+> greedy forward pass with `mlxfast-swift generate-golden` (256 expected
+> tokens for the local-iterate fixture, 1024 for the local-submit fixture;
+> the shorter fixture is a greedy prefix of the longer one by construction).
+> The hidden/private artifacts used by ranked runs (R2 golden, GPQA
+> references) were regenerated the same way through the organizer process.
+> One caveat for local work: near-tie greedy argmaxes can diverge across
+> Apple Silicon generations, so on non-M5 machines the local public gate may
+> fail for a correct build — local modes are directional, and the ranked M5
+> runner is the source of truth.
 
 ## Model Artifacts
 
@@ -199,11 +203,14 @@ teacher-forced cases:
   accepted answer sequence must have at most `max_new_tokens` tokens; shorter
   sequences are matched as exact prefixes of the generated answer.
 
-Full benchmark CI adds one more private layer after timing: it generates short
-answers for hidden GPQA cases and asks a Claude judge whether each candidate is
-semantically equivalent to the private reference answer. That semantic gate is
-pass/fail only and does not affect the timing score. The uploaded score records
-only aggregate semantic counts and the judge model name.
+Full benchmark CI adds one more private layer after the correctness and gates
+pass (and before the timed measurement, which runs last on the ranked
+pipeline): it captures short answers for hidden GPQA cases and asks a Claude
+judge whether each candidate is semantically equivalent to the private
+reference answer. That semantic gate is pass/fail only and does not affect
+the timing score; its pass-count threshold is baseline-calibrated (see
+`MLXFastConstants.semanticGPQAMinPassCount`). The uploaded score records only
+aggregate semantic counts and the judge model name.
 
 The same hidden GPQA cases are also used for a TTFT guardrail: during the
 hidden behavior correctness pass, the workflow times prompt prefill through
@@ -241,8 +248,12 @@ prefill_speedup = baseline_prefill_sec_per_token / prefill_sec_per_token
 score = decode_speedup^0.75 * prefill_speedup^0.25
 ```
 
-Higher is better. A baseline implementation on the official runner scores about
-`1.0`. Decode is weighted more heavily because it dominates interactive
+Higher is better. The ranked score is paired: the baseline is the pinned
+Gemma 4 31B 4-bit reference implementation, measured on the same self-hosted
+M5 box in the same session as the candidate (each timed phase behind the same
+fixed 40C thermal gate, with telemetry-validated acceptance), so an
+unmodified reference scores about `1.0` and host drift cancels out of the
+ratio. Decode is weighted more heavily because it dominates interactive
 generation, while prefill still contributes to the ranked score.
 The official run also enforces component floors:
 
@@ -251,16 +262,13 @@ decode_speedup >= 0.95
 prefill_speedup >= 0.95
 ```
 
-The baseline constants backing these floors (`MLXFastConstants.officialBaseline*`)
-are calibrated against the unmodified Gemma 4 31B 4-bit reference
-implementation on the ranked runner (tenki-macos-latest-xlarge, cold; see
-`docs/benchmark-window-freeze.md` for the measurement provenance). On official
-runs the paired-baseline (same-session measured reference) and per-prompt
-golden baseline paths -- both of which take precedence over the constants in
-the benchmark harness -- price the floors against a live same-session sample.
-A run below either floor fails eligibility even if the weighted score would
-otherwise be above baseline. On the calibrated constants, those floors allow
-at most `0.14064626165296054` seconds/token for decode and
+On ranked runs both floors are priced against that live same-session paired
+baseline. A run below either floor fails eligibility even if the weighted
+score would otherwise be above baseline. The
+`MLXFastConstants.officialBaseline*` constants feed local-mode estimates only
+(see `docs/benchmark-window-freeze.md` for the measurement contract); on
+those local-mode constants, the floors correspond to at most
+`0.14064626165296054` seconds/token for decode and
 `0.011163191525904606` seconds/token for prefill.
 
 The whole model is RAM-resident with no weight streaming, so
