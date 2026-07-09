@@ -39,8 +39,8 @@ verify them) must be regenerated.
     the object path/pins in its env (defaults; the job itself runs on the
     public golden).
 - **Pins:** `MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256`
-  (now `a593138...e92cb25`) and `MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES`
-  (now `38155`) in `benchmark.yml` and
+  (now `56c282d...6eae9`) and `MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES`
+  (now `38162`) in `benchmark.yml` and
   `benchmark-correctness-slice.yml` match the regenerated object; they take
   effect once the object is uploaded to R2.
 

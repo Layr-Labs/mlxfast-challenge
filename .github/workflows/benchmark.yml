@@ -169,8 +169,8 @@ jobs:
       # the old slices verified. The augmented golden is verified against a
       # self-anchored hash computed right after attach-gpqa-gates, exactly as
       # the old gates machine did.
-      MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 5c5bb073eaae10f4f2871c3b40f91d3dc7784bd3e6dc8ae0845e158493b6adaf
-      MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "38124"
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 56c282dcaac433543ef0eecb625cd99bc20f1ae1f7b9415efe32a71e6eb4eae9
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "38162"
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
       MLXFAST_GPQA_CASE_COUNT: "5"
       # 64-token GPQA behavior/semantic budget and 0/5 threshold: calibrated to
