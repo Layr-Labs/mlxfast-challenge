@@ -3,7 +3,11 @@
 set -euo pipefail
 
 CONTRACT_PATH="${CONTRACT_PATH:-benchmark.json}"
-MODEL="${MLXFAST_SUBMISSION_STATIC_REVIEW_MODEL:-${MLXFAST_SEMANTIC_GPQA_MODEL:-claude-sonnet-4-5-20250929}}"
+# Deliberately NOT chained to MLXFAST_SEMANTIC_GPQA_MODEL: the gates job
+# exports that (Sonnet, tuned for cheap per-case judging) as job-level env,
+# which would silently downgrade this review. Bypass review is the hardest
+# judgment call in the pipeline, so it defaults to the strongest model.
+MODEL="${MLXFAST_SUBMISSION_STATIC_REVIEW_MODEL:-claude-opus-4-8}"
 MAX_BYTES="${MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES:-1500000}"
 RESULTS_PATH="${MLXFAST_SUBMISSION_STATIC_REVIEW_RESULTS_PATH:-${MLXFAST_PRIVATE_DIR:-/tmp}/submission_static_review.json}"
 
@@ -210,13 +214,16 @@ jq -s \
   --rawfile submission_diff "${submission_diff_path}" \
   '{
     model: $model,
-    # 1024 deterministically truncated the judge mid-JSON on large diffs
-    # (temperature 0 reproduces the same over-long analysis every retry), so
-    # every complex submission failed review with unparseable JSON. 4096
-    # leaves generous room for the verdict object while stop_reason is
-    # checked after the call to fail loudly on any remaining truncation.
-    max_tokens: 4096,
-    temperature: 0,
+    # max_tokens covers thinking plus the response text on Opus 4.8, and max
+    # effort thinks extensively, so the budget is far above the 4096 that the
+    # verdict JSON alone needs. stop_reason is still checked after the call to
+    # fail loudly on any remaining truncation. Opus 4.8 rejects non-default
+    # temperature/top_p/top_k with a 400, so no temperature is set; adaptive
+    # thinking is the only thinking mode it supports (manual budget_tokens is
+    # also a 400).
+    max_tokens: 48000,
+    thinking: { type: "adaptive" },
+    output_config: { effort: "max" },
     system: $system,
     messages: [
       {
@@ -303,21 +310,21 @@ for attempt in 1 2 3; do
     break
   fi
   stop_reason="$(jq -r '.stop_reason // ""' "${response_path}")"
-  if [[ "${stop_reason}" == "max_tokens" ]]; then
-    # Deterministic at temperature 0: the same over-budget response comes
-    # back every retry, so surface the real cause instead of a generic
-    # parse failure and stop wasting attempts.
-    echo "::error::submission static review response was truncated at max_tokens; raise the request budget" >&2
-    exit 1
-  fi
   if [[ "${attempt}" -lt 3 ]]; then
-    echo "submission-review: judge response was not parseable JSON; retrying" >&2
+    # Adaptive thinking varies between attempts, so a truncated response is
+    # retryable (unlike the old temperature-0 setup where every retry
+    # reproduced the same over-budget output).
+    echo "submission-review: judge response was not parseable JSON (stop_reason=${stop_reason:-unknown}); retrying" >&2
     sleep 2
   fi
 done
 
 if [[ -z "${review_json_text}" ]]; then
-  echo "::error::submission static review did not return parseable JSON" >&2
+  if [[ "${stop_reason:-}" == "max_tokens" ]]; then
+    echo "::error::submission static review response was truncated at max_tokens; raise the request budget" >&2
+  else
+    echo "::error::submission static review did not return parseable JSON" >&2
+  fi
   exit 1
 fi
 

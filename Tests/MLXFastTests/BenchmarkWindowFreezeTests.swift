@@ -154,52 +154,59 @@ func scoredBaselinesResolveFromGoldenWithConstantsFallback() throws {
 }
 
 @Test
-func officialTimingMachineMeasuresPairedBaseline() throws {
+func officialRankedRunMeasuresPairedBaselineOnTheSameSilicon() throws {
     // The ranking contract on official runs: speedups and floors are computed
-    // against a baseline measured in the SAME session on the SAME VM (paired
-    // baseline), cancelling the ~4-10% fleet/time drift that made fixed-
-    // constant floor verdicts near the threshold a coin flip. See the
-    // paired-baseline section of docs/benchmark-window-freeze.md.
-    let workflow = try packageFile(".github/workflows/benchmark-timing-or-gates.yml")
+    // against a baseline measured in the SAME session on the SAME silicon
+    // (paired baseline), cancelling host/time drift that made fixed-constant
+    // floor verdicts near the threshold a coin flip. On the single-machine M5
+    // runner the pairing is owned by measure-job (trusted, runner-provisioned,
+    // fixed thermal contract): it measures the PINNED baseline tree and the
+    // candidate back to back, each behind the same thermal gate, and
+    // overlay-paired-timing.sh applies the paired ratio and the frozen floors
+    // in the trusted shell.
+    let workflow = try packageFile(".github/workflows/benchmark.yml")
+    let overlay = try packageFile(".github/scripts/overlay-paired-timing.sh")
     let constants = try packageFile("Sources/MLXFastCore/Constants.swift")
-    let doc = try packageFile("docs/benchmark-window-freeze.md")
 
-    // Timing machine only, ordered before the candidate's Benchmark step, on a
-    // pinned trusted ref that submissions cannot repoint.
-    let checkout = try #require(workflow.range(of: "- name: Checkout paired baseline reference"))
-    let measure = try #require(workflow.range(of: "- name: Measure paired baseline"))
-    let candidate = try #require(workflow.range(of: "- name: Benchmark"))
-    #expect(checkout.lowerBound < measure.lowerBound)
-    #expect(measure.lowerBound < candidate.lowerBound)
-    let pairedBody = String(workflow[checkout.lowerBound..<candidate.lowerBound])
-    #expect(pairedBody.components(separatedBy: "if: ${{ inputs.mode == 'timing' }}").count - 1 == 2)
-    #expect(pairedBody.contains("ref: eff7e7f2c85a5a6cef11110442ba4624a6ab3986"))
-    #expect(pairedBody.contains("persist-credentials: false"))
+    // The timed measurement runs LAST -- after the compute-heavy correctness/
+    // gates pass, the hidden-material scrub, and the quiescence wait -- and
+    // the overlay merges its result into the sealed gates score.
+    let gates = try #require(workflow.range(of: "- name: Correctness and gates"))
+    let scrub = try #require(workflow.range(of: "- name: Scrub hidden material from bench workspace"))
+    let quiescence = try #require(workflow.range(of: "- name: Wait for quiescence before timing"))
+    let measure = try #require(workflow.range(of: "- name: Timed paired benchmark (measure-job)"))
+    let overlayStep = try #require(workflow.range(of: "- name: Overlay paired timing into final score"))
+    #expect(gates.lowerBound < scrub.lowerBound)
+    #expect(scrub.lowerBound < quiescence.lowerBound)
+    #expect(quiescence.lowerBound < measure.lowerBound)
+    #expect(measure.lowerBound < overlayStep.lowerBound)
 
-    // The measured pair reaches the candidate only through the env overrides,
-    // which the harness validates fail-closed and strips from the worker env.
-    #expect(pairedBody.contains("MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN="))
-    #expect(pairedBody.contains("MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN="))
-    // Baseline floor failures are tolerated (they are measured against the
-    // baseline's own constants); anything else fails the run, and a sanity
-    // band anchored to the calibrated constants rejects pathological sessions.
-    #expect(pairedBody.contains("startswith(\"performance floor failed\")"))
-    #expect(pairedBody.contains("$prefill_ratio >= 0.66 and $prefill_ratio <= 1.5"))
-    let sanityPrefill = try #require(
-        pairedBody.range(of: "MLXFAST_PAIRED_SANITY_PREFILL: \"").map { range in
-            String(pairedBody[range.upperBound...].prefix(while: { $0 != "\"" }))
-        }
-    )
-    let sanityDecode = try #require(
-        pairedBody.range(of: "MLXFAST_PAIRED_SANITY_DECODE: \"").map { range in
-            String(pairedBody[range.upperBound...].prefix(while: { $0 != "\"" }))
-        }
-    )
-    #expect(sanityPrefill == (try swiftConstantLiteral(constants, name: "officialBaselinePrefillSecondsPerToken")))
-    #expect(sanityDecode == (try swiftConstantLiteral(constants, name: "officialBaselineDecodeSecondsPerToken")))
+    // The baseline is the PINNED tree provisioned on the box, sanity-banded
+    // against its recorded calibration -- both consumed from the host
+    // contract, never installed or repointable by the workflow run itself.
+    #expect(workflow.contains("MLXFAST_MEASURE_JOB: /opt/bench-runner/measure-job.sh"))
+    #expect(workflow.contains("MLXFAST_BASELINE_WS: /opt/bench-runner/baseline/current"))
+    #expect(workflow.contains("MLXFAST_BASELINE_CALIBRATION: /opt/bench-runner/state/baseline-calibration.json"))
+    let measureBody = String(workflow[measure.lowerBound..<overlayStep.lowerBound])
+    #expect(measureBody.contains("--candidate \"${MLXFAST_JOB_WS}\""))
+    #expect(measureBody.contains("--baseline \"${MLXFAST_BASELINE_WS}\""))
+    #expect(measureBody.contains("BASELINE_CALIBRATION=\"${MLXFAST_BASELINE_CALIBRATION}\""))
 
-    // Harness side: paired override outranks golden-carried baselines, which
-    // outrank constants, and the override keys never reach the worker.
+    // Floors applied at overlay time are the frozen ranking-contract floors,
+    // kept in sync with the constants; the paired score uses the frozen
+    // geometric weights.
+    let decodeFloor = try swiftConstantLiteral(constants, name: "scoreDecodeSpeedupFloor")
+    let prefillFloor = try swiftConstantLiteral(constants, name: "scorePrefillSpeedupFloor")
+    #expect(workflow.contains("MLXFAST_DECODE_SPEEDUP_FLOOR: \"\(decodeFloor)\""))
+    #expect(workflow.contains("MLXFAST_PREFILL_SPEEDUP_FLOOR: \"\(prefillFloor)\""))
+    #expect(overlay.contains("($ds >= $decode_floor) as $decode_ok"))
+    #expect(overlay.contains("($ps >= $prefill_floor) as $prefill_ok"))
+    #expect(overlay.contains(".score = (pow($ds; 0.75) * pow($ps; 0.25))"))
+    #expect(overlay.contains("performance floor failed"))
+
+    // Harness side (still shipped and armed): a paired override outranks
+    // golden-carried baselines, which outrank constants, the pair is
+    // fail-closed, and the override keys never reach the sandboxed worker.
     let benchmark = try packageFile("Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift")
     #expect(benchmark.components(separatedBy: "PairedBaselineOverride.fromEnvironment()").count - 1 == 2)
     #expect(benchmark.contains("pairedBaseline?.prefillSecondsPerToken\n                ?? benchmarkGolden.resolvedBaselinePrefillSecondsPerToken"))
@@ -207,10 +214,6 @@ func officialTimingMachineMeasuresPairedBaseline() throws {
     let worker = try packageFile("Sources/MLXFastHarness/GemmaRuntimeWorker.swift")
     #expect(worker.contains("\"MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN\","))
     #expect(worker.contains("\"MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN\","))
-
-    // The contract is documented in the freeze doc.
-    #expect(doc.contains("Paired baseline measurement (official timing machine)"))
-    #expect(doc.contains("paired override, then golden-carried baselines, then the\n  constants"))
 }
 
 @Test

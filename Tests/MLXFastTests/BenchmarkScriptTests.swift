@@ -78,7 +78,7 @@ func rulesDocsQuoteCurrentSpeedupFloorLimits() throws {
 }
 
 @Test
-func benchmarkWorkflowRunsTransformOfflineAfterSetup() throws {
+func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() throws {
     let workflow = try String(
         contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
@@ -87,28 +87,47 @@ func benchmarkWorkflowRunsTransformOfflineAfterSetup() throws {
         contentsOfFile: ".github/workflows/ci.yml",
         encoding: .utf8
     )
-    let setupRange = try #require(workflow.range(of: "- name: Setup Swift harness and reference checkpoint"))
-    let transformRange = try #require(workflow.range(of: "- name: Transform reference checkpoint"))
-    let restoreCacheRange = try #require(workflow.range(of: "- name: Restore SwiftPM cache"))
-    let saveCacheRange = try #require(workflow.range(of: "- name: Save SwiftPM cache"))
 
-    #expect(restoreCacheRange.lowerBound < setupRange.lowerBound)
-    #expect(setupRange.lowerBound < transformRange.lowerBound)
-    #expect(setupRange.lowerBound < saveCacheRange.lowerBound)
-    #expect(saveCacheRange.lowerBound < transformRange.lowerBound)
-    #expect(workflow.contains("MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main"))
-    #expect(workflow.contains("MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: \"0\""))
-    #expect(workflow.contains("default: \"12\""))
-    #expect(workflow.contains("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
-    #expect(workflow.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
-    #expect(workflow.contains(".build/checkouts"))
-    #expect(workflow.contains(".build/repositories"))
-    #expect(workflow.contains(".build/artifacts"))
-    #expect(!workflow.contains("path: .cache/huggingface"))
-    #expect(workflow.contains("MLXFAST_OFFLINE_WRITABLE_PATHS=\"${PWD}/weights\""))
-    #expect(workflow.contains(".github/scripts/run-offline.sh .build/release/mlxfast-swift transform"))
-    #expect(workflow.contains("--reference \"${MLXFAST_REFERENCE_DIR}\""))
-    #expect(workflow.contains("--output weights"))
+    // Single-machine layout: the reference checkpoint is pre-provisioned on the
+    // box and fully hash-verified against the pinned manifest every run, then
+    // SwiftPM dependencies resolve while the trusted shell still has network
+    // (the bench uid has a PF egress block), and only then does submitted code
+    // run -- build, transform -- through the bench-exec bridge.
+    let verifyReferenceRange = try #require(workflow.range(of: "- name: Verify reference checkpoint against pinned manifest"))
+    let prepareWorkspaceRange = try #require(workflow.range(of: "- name: Prepare bench workspace"))
+    let buildRange = try #require(workflow.range(of: "- name: Build harness in bench sandbox"))
+    let transformRange = try #require(workflow.range(of: "- name: Transform reference checkpoint in bench sandbox"))
+    let hashWeightsRange = try #require(workflow.range(of: "- name: Hash transformed weights"))
+
+    #expect(verifyReferenceRange.lowerBound < prepareWorkspaceRange.lowerBound)
+    #expect(prepareWorkspaceRange.lowerBound < buildRange.lowerBound)
+    #expect(buildRange.lowerBound < transformRange.lowerBound)
+    #expect(transformRange.lowerBound < hashWeightsRange.lowerBound)
+
+    // The reference comes from the runner-owned cache, never a download: no
+    // setup.sh invocation, no SwiftPM cache actions, full manifest hashing.
+    #expect(workflow.contains("MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256"))
+    #expect(workflow.contains("shasum -a 256 \"${path}\""))
+    #expect(workflow.contains("reference checkpoint failed manifest verification"))
+    #expect(!workflow.contains("./setup.sh"))
+    #expect(!workflow.contains("actions/cache/restore"))
+    #expect(!workflow.contains("actions/cache/save"))
+
+    // Dependencies are pre-fetched in the trusted shell; build and transform
+    // both execute as the bench uid through the bridge.
+    #expect(workflow.contains("(cd \"${MLXFAST_JOB_WS}\" && swift package resolve)"))
+    let buildStep = String(workflow[buildRange.lowerBound..<transformRange.lowerBound])
+    #expect(buildStep.contains("sudo -n \"${MLXFAST_BENCH_EXEC}\""))
+    #expect(buildStep.contains("/usr/bin/swift build -c release"))
+    #expect(buildStep.contains("tools/build-mlx-metallib.sh"))
+    let transformStep = String(workflow[transformRange.lowerBound..<hashWeightsRange.lowerBound])
+    #expect(transformStep.contains("sudo -n \"${MLXFAST_BENCH_EXEC}\""))
+    #expect(transformStep.contains("--reference \"${MLXFAST_REFERENCE_DIR}\""))
+    #expect(transformStep.contains("--output weights"))
+    #expect(transformStep.contains("test -f \"${MLXFAST_JOB_WS}/weights/config.json\""))
+
+    // ci.yml keeps its own SwiftPM cache and PR-safety configuration.
     #expect(ci.contains("push:\n    branches:\n      - main"))
     #expect(ci.contains("- name: Restore SwiftPM cache"))
     #expect(ci.contains("- name: Save SwiftPM cache"))
@@ -139,11 +158,13 @@ func benchmarkWorkflowProbesAndEnforcesRuntimeWorkerSandbox() throws {
         encoding: .utf8
     )
 
+    // The probe proves this host's sandbox-exec semantics before any build,
+    // transform, or hidden material reaches the bench workspace.
     let probeRange = try #require(workflow.range(of: "- name: Probe runtime worker sandbox"))
-    let goldenSourceRange = try #require(workflow.range(of: "- name: Check correctness golden source"))
-    let setupRange = try #require(workflow.range(of: "- name: Setup Swift harness and reference checkpoint"))
-    #expect(probeRange.lowerBound < goldenSourceRange.lowerBound)
-    #expect(probeRange.lowerBound < setupRange.lowerBound)
+    let prepareWorkspaceRange = try #require(workflow.range(of: "- name: Prepare bench workspace"))
+    let hiddenGoldenRange = try #require(workflow.range(of: "- name: Prepare hidden correctness golden"))
+    #expect(probeRange.lowerBound < prepareWorkspaceRange.lowerBound)
+    #expect(probeRange.lowerBound < hiddenGoldenRange.lowerBound)
     #expect(workflow.contains("run: .github/scripts/probe-runtime-worker-sandbox.sh"))
     #expect(workflow.contains("MLXFAST_OFFICIAL_BENCHMARK_RUN: \"1\""))
 
@@ -408,103 +429,100 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
         contentsOfFile: ".github/scripts/run-submission-static-review.sh",
         encoding: .utf8
     )
-    // GPQA/semantic-judge/timed-benchmark logic moved here when the base
-    // correctness case, the gates, and the timing measurement were split
-    // across three independent machines instead of running serially inside
-    // one "benchmark" job -- see benchmark.yml's own header comment on the
-    // benchmark-timing/benchmark-gates jobs for why.
-    let timingOrGates = try String(
-        contentsOfFile: ".github/workflows/benchmark-timing-or-gates.yml",
-        encoding: .utf8
-    )
 
     #expect(!workflow.contains("${{ runner.temp }}"))
     #expect(workflow.contains("MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}"))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json"))
-    #expect(timingOrGates.contains("MLXFAST_GPQA_REFERENCE_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.mode }}/gpqa_reference_cases.json"))
+    // The raw GPQA reference is downloaded straight into the runner-private
+    // dir; its accepted answers reach the bench workspace only inside the
+    // augmented golden.
+    #expect(workflow.contains("\"${MLXFAST_PRIVATE_DIR}/gpqa_reference.json\""))
     #expect(!workflow.contains("MLXFAST_GPQA_TTFT_RESULTS_PATH"))
-    #expect(!timingOrGates.contains("MLXFAST_GPQA_TTFT_RESULTS_PATH"))
-    #expect(timingOrGates.contains("MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.mode }}/semantic_gpqa_answers.json"))
-    #expect(timingOrGates.contains("MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.mode }}/semantic_gpqa_results.json"))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH: ${{ env.MLXFAST_JOB_WS }}/private/semantic_gpqa_answers.json"))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json"))
     #expect(workflow.contains("MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}"))
-    #expect(timingOrGates.contains("MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}"))
+    #expect(workflow.contains("MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 182a7f98d24cc8f26e8b08505fe7a8b6d825702f99d0b78a83f49dd42f1b2aea"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"11140\""))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"))
-    #expect(timingOrGates.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"))
-    #expect(timingOrGates.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json"))
-    #expect(timingOrGates.contains("MLXFAST_GPQA_CASE_COUNT: \"5\""))
+    #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json"))
+    #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"5\""))
     // 64-token budget and 0/5 threshold are calibrated to the unmodified
     // Gemma 4 31B 4-bit baseline (run 28817200585 judged 0/5 at the 64-token
     // budget; run 28813130022 judged 0/5 at the old 10-token budget); see
     // MLXFastConstants.semanticGPQAMinPassCount.
-    #expect(timingOrGates.contains("MLXFAST_GPQA_MAX_NEW_TOKENS: \"64\""))
+    #expect(workflow.contains("MLXFAST_GPQA_MAX_NEW_TOKENS: \"64\""))
     #expect(workflow.contains("MLXFAST_GPQA_TTFT_CASE_COUNT: \"5\""))
-    #expect(timingOrGates.contains("MLXFAST_SEMANTIC_GPQA_CASE_COUNT: \"5\""))
-    #expect(timingOrGates.contains("MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: \"64\""))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_CASE_COUNT: \"5\""))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: \"64\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MIN_PASS: \"0\""))
-    #expect(timingOrGates.contains("MLXFAST_SEMANTIC_GPQA_MIN_PASS: \"0\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_REQUIRED: \"1\""))
-    #expect(timingOrGates.contains("MLXFAST_SEMANTIC_GPQA_MODEL: claude-sonnet-4-5-20250929"))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MODEL: claude-sonnet-4-5-20250929"))
     #expect(!workflow.contains("calibrate_gpqa_reference"))
     #expect(!workflow.contains("MLXFAST_CALIBRATE_GPQA_REFERENCE"))
     #expect(!workflow.contains("mlxfast-swift calibrate-gpqa-gates"))
     #expect(!workflow.contains("mlxfast-gpqa-calibration-private.log"))
     #expect(!workflow.contains(".github/scripts/upload-r2-object.sh"))
     #expect(!workflow.contains("uploaded calibrated GPQA reference cases to private R2"))
-    #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: 56c282dcaac433543ef0eecb625cd99bc20f1ae1f7b9415efe32a71e6eb4eae9"))
-    #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: \"38162\""))
+    // The RAW (pre-GPQA-augmentation) hidden golden pins -- the same object the
+    // old parallel slices verified as MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_*.
+    // The augmented golden is pinned to a self-anchored hash exported into
+    // GITHUB_ENV right after attach-gpqa-gates, exactly as the old gates
+    // machine did.
+    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 56c282dcaac433543ef0eecb625cd99bc20f1ae1f7b9415efe32a71e6eb4eae9"))
+    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: \"38162\""))
+    #expect(workflow.contains("raw hidden correctness golden pin mismatch"))
+    #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${actual_hash}"))
+    #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${actual_bytes}"))
+    #expect(workflow.contains(".github/scripts/verify-correctness-golden.sh"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_STEPS: \"64\""))
     #expect(!workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_CASES: \"10\""))
-    #expect(workflow.contains("benchmark: using checked-in public correctness golden"))
-    #expect(timingOrGates.contains("hidden GPQA behavior gate requires private R2 secrets"))
-    #expect(timingOrGates.contains("semantic GPQA gate requires ORG_ANTHROPIC_API_KEY"))
+    #expect(workflow.contains("hidden correctness/GPQA gates require private R2 secrets"))
+    #expect(workflow.contains("semantic GPQA gate requires ORG_ANTHROPIC_API_KEY"))
     let staticReviewRange = try #require(workflow.range(of: "- name: Review submitted code for benchmark bypasses"))
     let modifiableSurfaceRange = try #require(workflow.range(of: "- name: Enforce modifiable surface"))
-    let goldenSourceRange = try #require(workflow.range(of: "- name: Check correctness golden source"))
+    let sandboxProbeRange = try #require(workflow.range(of: "- name: Probe runtime worker sandbox"))
     #expect(staticReviewRange.lowerBound < modifiableSurfaceRange.lowerBound)
-    #expect(modifiableSurfaceRange.lowerBound < goldenSourceRange.lowerBound)
+    #expect(modifiableSurfaceRange.lowerBound < sandboxProbeRange.lowerBound)
     #expect(workflow.contains("if: ${{ startsWith(github.ref_name, 'submissions/') }}"))
     #expect(workflow.contains(".github/scripts/run-submission-static-review.sh"))
-    #expect(timingOrGates.contains(".github/scripts/run-submission-static-review.sh"))
-    #expect(timingOrGates.contains("mlxfast-swift attach-gpqa-gates"))
-    #expect(timingOrGates.contains("--case-count \"${MLXFAST_GPQA_CASE_COUNT}\""))
-    #expect(timingOrGates.contains("--max-new-tokens \"${MLXFAST_GPQA_MAX_NEW_TOKENS}\""))
-    #expect(!timingOrGates.contains("- name: Generate semantic GPQA answers"))
-    #expect(!timingOrGates.contains("- name: Measure GPQA TTFT gate"))
-    #expect(timingOrGates.contains("- name: Semantic GPQA gate"))
-    #expect(!timingOrGates.contains("mlxfast-swift measure-gpqa-ttft"))
-    #expect(!timingOrGates.contains(".github/scripts/patch-gpqa-ttft-metrics.sh"))
+    #expect(workflow.contains("mlxfast-swift attach-gpqa-gates"))
+    #expect(workflow.contains("--case-count \"${MLXFAST_GPQA_CASE_COUNT}\""))
+    #expect(workflow.contains("--max-new-tokens \"${MLXFAST_GPQA_MAX_NEW_TOKENS}\""))
+    #expect(!workflow.contains("- name: Generate semantic GPQA answers"))
+    #expect(!workflow.contains("- name: Measure GPQA TTFT gate"))
+    #expect(workflow.contains("- name: Semantic GPQA gate"))
+    #expect(!workflow.contains("mlxfast-swift measure-gpqa-ttft"))
+    #expect(!workflow.contains(".github/scripts/patch-gpqa-ttft-metrics.sh"))
     #expect(workflow.contains("ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}"))
-    #expect(timingOrGates.contains("ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}"))
-    #expect(!timingOrGates.contains("mlxfast-swift generate-gpqa-answers"))
-    #expect(!timingOrGates.contains("--case-count \"${MLXFAST_SEMANTIC_GPQA_CASE_COUNT}\""))
-    #expect(!timingOrGates.contains("--max-new-tokens \"${MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS}\""))
-    #expect(timingOrGates.contains(".github/scripts/run-semantic-gpqa-gate.sh"))
-    #expect(timingOrGates.contains("using private GPQA-augmented correctness golden"))
+    #expect(!workflow.contains("mlxfast-swift generate-gpqa-answers"))
+    #expect(!workflow.contains("--case-count \"${MLXFAST_SEMANTIC_GPQA_CASE_COUNT}\""))
+    #expect(!workflow.contains("--max-new-tokens \"${MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS}\""))
+    #expect(workflow.contains(".github/scripts/run-semantic-gpqa-gate.sh"))
+    #expect(workflow.contains("using private GPQA-augmented correctness golden"))
     #expect(!workflow.contains("MLXFAST_RUN_BENCHMARK"))
-    #expect(!timingOrGates.contains("MLXFAST_RUN_BENCHMARK"))
     #expect(!workflow.contains("generate_golden_only"))
     #expect(!workflow.contains("MLXFAST_GENERATE_GOLDEN_ONLY"))
     #expect(workflow.contains("steps.validate_benchmark_artifacts.outcome == 'success'"))
     #expect(!workflow.contains("hashFiles('score.json') != '' && hashFiles('score.json.sha256') != '' && hashFiles('benchmark-integrity.json') != ''"))
     #expect(workflow.contains(".github/scripts/stage-benchmark-artifacts.sh"))
     #expect(workflow.contains("inputs.run_benchmark"))
-    // Exact per-job guard strings, not just substring presence -- a flipped
-    // `!inputs.run_benchmark` on the wrong job would still satisfy a bare
-    // "contains inputs.run_benchmark" check.
-    #expect(workflow.contains("    if: ${{ !inputs.run_benchmark }}"))
-    // Only validate-slice-ranges itself uses the bare run_benchmark guard now;
-    // all five expensive machines gate on the validator's success so a bad
-    // range_1/2/3 fails the whole run in ~3s instead of burning any machine.
+    // Exact per-step guard strings, not just substring presence -- a flipped
+    // `!inputs.run_benchmark` on the wrong step would still satisfy a bare
+    // "contains inputs.run_benchmark" check. The correctness-only artifact
+    // path validates/stages even on failure (always()) so the artifact
+    // reflects what ran, gated on validation for submission branches.
+    #expect(workflow.contains("if: ${{ always() && !inputs.run_benchmark }}"))
+    // Eleven ranked steps use the bare run_benchmark guard (no always(), so
+    // any failure stops the serial chain before the timed measurement):
+    // Check private material, Prepare hidden golden, Attach GPQA gates,
+    // Correctness and gates, Validate sealed gates score, Semantic GPQA gate,
+    // Scrub hidden material, Wait for quiescence, Timed paired benchmark,
+    // Overlay paired timing, Validate benchmark artifacts.
     let bareRunBenchmarkGuardCount = workflow.components(separatedBy: "if: ${{ inputs.run_benchmark }}").count - 1
-    #expect(bareRunBenchmarkGuardCount == 1) // validate-slice-ranges
-    let requireRangeValidationCount = workflow.components(
-        separatedBy: "if: ${{ inputs.run_benchmark && needs.validate-slice-ranges.result == 'success' }}"
-    ).count - 1
-    #expect(requireRangeValidationCount == 5) // correctness-slice-1/2/3 + benchmark-timing + benchmark-gates
+    #expect(bareRunBenchmarkGuardCount == 11)
     #expect(workflow.contains("if: ${{ always() && inputs.run_benchmark }}"))
     #expect(workflow.contains("golden.sha256=\"${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256\""))
     #expect(workflow.contains("path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results"))
@@ -626,20 +644,13 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(staticReview.contains("missing or not a regular file"))
     #expect(staticReview.contains("not the checked-out HEAD"))
 
-    // All three privileged workflows pass the merge-base so the review runs in
-    // diff-only mode on every machine that executes submitted code. The base is
-    // computed in a standalone assignment: as a command prefix a merge-base
+    // The single ranked workflow passes the merge-base so the review runs in
+    // diff-only mode on the one machine that executes submitted code. The base
+    // is computed in a standalone assignment: as a command prefix a merge-base
     // failure would be masked and the script would fall back to whole-surface.
-    for wf in [
-        ".github/workflows/benchmark.yml",
-        ".github/workflows/benchmark-timing-or-gates.yml",
-        ".github/workflows/benchmark-correctness-slice.yml",
-    ] {
-        let content = try String(contentsOfFile: wf, encoding: .utf8)
-        #expect(content.contains("base_sha=\"$(git merge-base origin/main \"${HEAD_SHA}\")\""))
-        #expect(content.contains("MLXFAST_SUBMISSION_REVIEW_BASE_SHA=\"${base_sha}\""))
-        #expect(!content.contains("MLXFAST_SUBMISSION_REVIEW_BASE_SHA=\"$(git merge-base"))
-    }
+    #expect(workflow.contains("base_sha=\"$(git merge-base origin/main \"${HEAD_SHA}\")\""))
+    #expect(workflow.contains("MLXFAST_SUBMISSION_REVIEW_BASE_SHA=\"${base_sha}\""))
+    #expect(!workflow.contains("MLXFAST_SUBMISSION_REVIEW_BASE_SHA=\"$(git merge-base"))
 }
 
 // Behavioral pin for run-submission-static-review.sh's diff-only mode, run
@@ -839,50 +850,50 @@ func submissionStaticReviewDiffModeFailsClosedAndSendsOnlyChangedFiles() throws 
 
 // Ranked validation otherwise exercises only the hidden goldens, so numerics
 // drift on prompts they happen not to cover can be promoted into main and then
-// break every participant's local public gate (issue #83). The gates machine
-// must therefore also run the checked-in public fixture as an independent
-// drift tripwire -- before the hidden gates so honest drift fails fast, with
-// the fixture hash pinned to the actual checked-in file so a stale pin cannot
-// silently validate a different oracle.
+// break every participant's local public gate (issue #83). The ranked job must
+// therefore also run the checked-in public fixture as an independent drift
+// tripwire -- before the hidden golden ever enters the bench workspace, so
+// honest drift fails fast and the worker running the public case cannot read
+// hidden bytes -- with the fixture hash pinned to the actual checked-in file
+// so a stale pin cannot silently validate a different oracle.
 @Test
-func gatesMachineRunsPublicBehaviorGateBeforeHiddenGates() throws {
-    let timingOrGates = try String(
-        contentsOfFile: ".github/workflows/benchmark-timing-or-gates.yml",
+func rankedJobRunsPublicBehaviorGateBeforeHiddenGates() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
 
-    let publicGate = try #require(timingOrGates.range(of: "- name: Public behavior gate"))
-    let hiddenBenchmark = try #require(timingOrGates.range(of: "- name: Benchmark"))
-    #expect(publicGate.lowerBound < hiddenBenchmark.lowerBound)
+    let publicGate = try #require(workflow.range(of: "- name: Public behavior gate"))
+    let hiddenGolden = try #require(workflow.range(of: "- name: Prepare hidden correctness golden"))
+    let hiddenGates = try #require(workflow.range(of: "- name: Correctness and gates"))
+    #expect(publicGate.lowerBound < hiddenGolden.lowerBound)
+    #expect(hiddenGolden.lowerBound < hiddenGates.lowerBound)
 
-    let gateBody = String(timingOrGates[publicGate.lowerBound..<hiddenBenchmark.lowerBound])
-    // Gates machine only: the timing machine's pre-measurement state must stay
-    // untouched.
-    #expect(gateBody.contains("if: ${{ inputs.mode == 'gates' }}"))
-    #expect(gateBody.contains("--golden \"${public_golden}\""))
+    let gateBody = String(workflow[publicGate.lowerBound..<hiddenGolden.lowerBound])
+    #expect(gateBody.contains("--golden \"${MLXFAST_PUBLIC_GOLDEN}\""))
     #expect(gateBody.contains("public-gate-report.json"))
+    // The worker Seatbelt profile denies the fixture under check by literal
+    // path, matching the harness's own blockedGoldenPath convention.
+    #expect(gateBody.contains("BENCH_GOLDEN_PATH: ${{ env.MLXFAST_JOB_WS }}/correctness_prompts/public_longcopy_gate_english_512_256.json"))
     // Submission branches must suppress the submitted process's own logs, same
     // as every other step that executes submitted model code.
-    #expect(gateBody.contains("mlxfast-public-gate-private.log"))
+    #expect(gateBody.contains("public-gate-private.log"))
 
     // The pinned hash must match the actual checked-in fixture, so regenerating
-    // the fixture forces this workflow (and benchmark.yml's pin) to move too.
+    // the fixture forces the workflow pin to move too.
     let fixtureData = try Data(
         contentsOf: URL(fileURLWithPath: "correctness_prompts/public_longcopy_gate_english_512_256.json")
     )
     let fixtureHash = SHA256.hash(data: fixtureData).map { String(format: "%02x", $0) }.joined()
-    #expect(gateBody.contains(fixtureHash))
-    let benchmarkWorkflow = try String(
-        contentsOfFile: ".github/workflows/benchmark.yml",
-        encoding: .utf8
-    )
-    #expect(benchmarkWorkflow.contains(fixtureHash))
-    // Same for the byte count: verify-correctness-golden.sh hard-checks bytes
-    // after the SHA, so a stale byte pin fails the correctness-only job even when
-    // the hash matches. Deriving it from the fixture forces the pin to move when
-    // the fixture is regenerated, instead of silently drifting.
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: \(fixtureHash)"))
+    // The gate re-hashes the fixture at run time against the pinned value.
+    #expect(gateBody.contains("public correctness golden hash mismatch"))
+    // Same for the byte count: the correctness-only validation hard-checks
+    // bytes after the SHA, so a stale byte pin fails the correctness-only run
+    // even when the hash matches. Deriving it from the fixture forces the pin
+    // to move when the fixture is regenerated, instead of silently drifting.
     #expect(
-        benchmarkWorkflow.contains(
+        workflow.contains(
             "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"\(fixtureData.count)\""
         )
     )
@@ -1068,15 +1079,17 @@ func offlineRunnerProvesNetworkIsBlockedBeforeRunningCommand() throws {
     #expect(runner.contains("export HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9"))
 }
 
-// The three correctness-slice machines invoke `mlxfast-swift correctness`
-// directly, not through benchmark.sh, so benchmark.sh's enforce_official_sandbox
+// Direct `mlxfast-swift correctness` invocations (the public behavior gate)
+// do not go through benchmark.sh, so benchmark.sh's enforce_official_sandbox
 // (which refuses to run an official benchmark with the worker or its sandbox
-// disabled) does not cover them. The CLI's runtimeWorkerOptions must fail closed
-// itself when MLXFAST_OFFICIAL_BENCHMARK_RUN=1, and the slice job must set
-// MLXFAST_PRIVATE_DIR so the worker profile denies the whole private subtree,
-// matching the benchmark/gates/timing machines.
+// disabled) does not cover them. The CLI's runtimeWorkerOptions must fail
+// closed itself when MLXFAST_OFFICIAL_BENCHMARK_RUN=1. On the single-machine
+// runner, every invocation of submitted/branch code -- build, transform,
+// attach-gpqa-gates, the public gate, correctness+gates, and cleanup -- must
+// additionally route through the bench-exec bridge, which drops to the
+// unprivileged bench uid and injects the hardened worker sandbox profile.
 @Test
-func sliceCorrectnessRunEnforcesOfficialSandboxLikeBenchmarkScript() throws {
+func officialCorrectnessRunsEnforceWorkerSandboxThroughBenchExec() throws {
     let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
 
     #expect(cli.contains("let officialRun = environmentValue(\"MLXFAST_OFFICIAL_BENCHMARK_RUN\", fallback: \"0\") == \"1\""))
@@ -1084,24 +1097,38 @@ func sliceCorrectnessRunEnforcesOfficialSandboxLikeBenchmarkScript() throws {
     #expect(cli.contains("official benchmark runs require the runtime worker sandbox; unset MLXFAST_NO_SANDBOX"))
     #expect(cli.contains("official benchmark runs require a runtime worker sandbox profile; none was configured or derivable"))
 
-    let slice = try String(
-        contentsOfFile: ".github/workflows/benchmark-correctness-slice.yml",
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
-    #expect(slice.contains("MLXFAST_OFFICIAL_BENCHMARK_RUN: \"1\""))
-    #expect(slice.contains("MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.slice_name }}"))
+    #expect(workflow.contains("MLXFAST_OFFICIAL_BENCHMARK_RUN: \"1\""))
+    #expect(workflow.contains("MLXFAST_BENCH_EXEC: /opt/bench/bench-exec.sh"))
 
-    // Because this job sets MLXFAST_PRIVATE_DIR (for the worker subtree-deny),
-    // the CLI's requirePrivateOutputPath forces --step-range-output under it.
-    // The sidecar is non-private assigned-range metadata that combine needs as
-    // a public artifact, so it is written into the private dir and copied out.
-    // Regression guard for the run 28554064321 failure, where setting
-    // MLXFAST_PRIVATE_DIR while still writing --step-range-output to the
-    // workspace made every slice throw before any model work.
-    #expect(slice.contains("step_range_private=\"${MLXFAST_PRIVATE_DIR}/step-range.json\""))
-    #expect(slice.contains("--step-range-output \"${step_range_private}\""))
-    #expect(slice.contains("cp \"${step_range_private}\" step-range.json"))
-    #expect(!slice.contains("--step-range-output step-range.json"))
+    // Every step that executes submitted/branch code crosses the bridge.
+    let benchExecSteps = [
+        "- name: Build harness in bench sandbox",
+        "- name: Transform reference checkpoint in bench sandbox",
+        "- name: Public behavior gate",
+        "- name: Attach GPQA gates and verify augmented golden",
+        "- name: Correctness and gates",
+        "- name: Cleanup bench workspace",
+    ]
+    for (index, stepName) in benchExecSteps.enumerated() {
+        let stepStart = try #require(workflow.range(of: stepName), "expected step \(stepName)")
+        let stepEnd = index + 1 < benchExecSteps.count
+            ? try #require(workflow.range(of: benchExecSteps[index + 1])).lowerBound
+            : workflow.endIndex
+        let stepBody = String(workflow[stepStart.lowerBound..<stepEnd])
+        #expect(stepBody.contains("sudo -n \"${MLXFAST_BENCH_EXEC}\""), "step \(stepName) must route through bench-exec")
+    }
+
+    // The hidden golden is denied to the worker by literal path during the
+    // gates pass, mirroring writeRuntimeWorkerSandboxProfile on the VM
+    // pipeline; only the harness parent may read it for teacher forcing.
+    #expect(workflow.contains("BENCH_GOLDEN_PATH: ${{ env.MLXFAST_JOB_WS }}/correctness_golden_ranked.json"))
+    // The direct benchmark invocation inside the gates pass keeps the official
+    // contract markers so the CLI's fail-closed checks stay armed.
+    #expect(workflow.contains("MLXFAST_OFFICIAL_BENCHMARK_RUN=1"))
 }
 
 @Test
@@ -1418,10 +1445,10 @@ func correctnessStepRangeOutputWritesSidecarSeparateFromReport() throws {
     #expect(cli.contains("[--step-range-output PATH]"))
 
     // correctness-report.json's schema must stay untouched by this feature --
-    // confirm the official validator's exact key list still has 16 entries and
-    // no step-range-specific key was added to it.
+    // the official correctness validation still checks golden_hash and no
+    // step-range-specific key leaked into the workflow's validation.
     let workflow = try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
-    #expect(workflow.contains("\"golden_hash\","))
+    #expect(workflow.contains(".golden_hash == $golden_hash"))
     #expect(!workflow.contains("step_range_start"))
     #expect(!workflow.contains("step_range_end"))
 }
@@ -2808,205 +2835,190 @@ func privateArtifactGuardRejectsRenamedGoldenAndPromptFiles() throws {
     #expect(process.terminationStatus != 0)
 }
 
+// A real hidden-gate mismatch populates first_failing_case/expected_token/
+// actual_token with actual golden-adjacent values -- deny-private-artifacts.sh
+// only checks filenames, not content, so the jq validation gates are the only
+// thing standing between a real failure and a public artifact upload. The
+// single-machine job has two artifact paths (correctness-only and ranked);
+// both must validate content before staging, and stage before uploading.
 @Test
-func correctnessSliceWorkflowGatesUploadOnContentValidation() throws {
-    let slice = try String(
-        contentsOfFile: ".github/workflows/benchmark-correctness-slice.yml",
-        encoding: .utf8
-    )
-
-    // A real hidden-step mismatch populates first_failing_case/expected_token/
-    // actual_token with actual golden-adjacent values -- deny-private-
-    // artifacts.sh only checks filenames, not content, so this jq gate is the
-    // only thing standing between a real failure and a public artifact upload.
-    let validateRange = try #require(slice.range(of: "- name: Validate correctness slice artifacts"))
-    let uploadRange = try #require(slice.range(of: "- name: Upload slice artifact"))
-    #expect(validateRange.lowerBound < uploadRange.lowerBound)
-
-    let validateStep = String(slice[validateRange.lowerBound..<uploadRange.lowerBound])
-    #expect(validateStep.contains("id: validate_correctness_slice"))
-    #expect(validateStep.contains("if: always()"))
-    #expect(validateStep.contains("and .passed == true"))
-    #expect(validateStep.contains("and .checked_steps == $checked_steps"))
-    #expect(validateStep.contains("and .error == \"\""))
-    #expect(validateStep.contains("and .first_failing_case == null"))
-    #expect(validateStep.contains("and .first_failing_step == null"))
-    #expect(validateStep.contains("and .expected_token == null"))
-    #expect(validateStep.contains("and .actual_token == null"))
-
-    // The deny-path check runs only when (non-submission || validation
-    // passed); the upload then requires the deny check to have PASSED, which
-    // transitively enforces the validation gate on submission branches AND
-    // restores main's deny-before-upload ordering.
-    let gateCondition = "if: ${{ always() && ((!(startsWith(github.ref_name, 'submissions/'))) || " +
-        "steps.validate_correctness_slice.outcome == 'success') }}"
-    #expect(slice.components(separatedBy: gateCondition).count - 1 == 1) // deny-path check
-    #expect(slice.contains("id: deny_slice_paths"))
-    #expect(slice.contains("if: ${{ always() && steps.deny_slice_paths.outcome == 'success' }}"))
-}
-
-@Test
-func combineJobFailsFastOnUpstreamJobFailure() throws {
+func singleMachineWorkflowGatesUploadsOnContentValidation() throws {
     let workflow = try String(
         contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
 
-    // Without this, combine's if: always() would let a failed upstream slice
-    // fall through to the download/merge steps and fail there with a raw
-    // "No such file or directory" instead of a clear diagnosis of which job
-    // actually failed.
-    let combineRange = try #require(workflow.range(of: "  combine:\n"))
-    let checkRange = try #require(
-        workflow.range(of: "- name: Check upstream jobs succeeded", range: combineRange.lowerBound..<workflow.endIndex)
-    )
-    let downloadRange = try #require(
-        workflow.range(of: "- name: Download parallel benchmark artifacts", range: combineRange.lowerBound..<workflow.endIndex)
-    )
-    #expect(combineRange.lowerBound < checkRange.lowerBound)
-    #expect(checkRange.lowerBound < downloadRange.lowerBound)
+    // Correctness-only path (run_benchmark=false): validate -> stage -> upload.
+    let validateCorrectnessRange = try #require(workflow.range(of: "- name: Validate correctness artifacts"))
+    let stageCorrectnessRange = try #require(workflow.range(of: "- name: Stage correctness artifacts"))
+    let uploadCorrectnessRange = try #require(workflow.range(of: "- name: Upload correctness artifacts"))
+    #expect(validateCorrectnessRange.lowerBound < stageCorrectnessRange.lowerBound)
+    #expect(stageCorrectnessRange.lowerBound < uploadCorrectnessRange.lowerBound)
 
-    let checkStep = String(workflow[checkRange.lowerBound..<downloadRange.lowerBound])
-    for job in ["correctness-slice-1", "correctness-slice-2", "correctness-slice-3", "benchmark-timing", "benchmark-gates"] {
-        #expect(checkStep.contains("needs.\(job).result"))
-    }
-    #expect(checkStep.contains("!= \"success\""))
-    #expect(checkStep.contains("exit \"${status}\""))
-}
+    let validateCorrectnessStep = String(workflow[validateCorrectnessRange.lowerBound..<stageCorrectnessRange.lowerBound])
+    #expect(validateCorrectnessStep.contains("id: validate_correctness_artifacts"))
+    #expect(validateCorrectnessStep.contains(".passed == true"))
+    #expect(validateCorrectnessStep.contains("and .checked_steps == $checked_steps"))
+    #expect(validateCorrectnessStep.contains("and .error == \"\""))
+    #expect(validateCorrectnessStep.contains("and .first_failing_case == null"))
+    #expect(validateCorrectnessStep.contains("and .first_failing_step == null"))
+    #expect(validateCorrectnessStep.contains("and .expected_token == null"))
+    #expect(validateCorrectnessStep.contains("and .actual_token == null"))
 
-@Test
-func timingOrGatesWorkflowGatesUploadOnContentValidation() throws {
-    let timingOrGates = try String(
-        contentsOfFile: ".github/workflows/benchmark-timing-or-gates.yml",
-        encoding: .utf8
-    )
-
-    // Mirrors correctnessSliceWorkflowGatesUploadOnContentValidation: a real
-    // gates-mode gate mismatch populates first_failing_case/first_failing_step
-    // with real hidden GPQA/case identifiers, and deny-private-artifacts.sh
-    // only checks filenames, not content.
-    let validateRange = try #require(timingOrGates.range(of: "- name: Validate intermediate benchmark artifact"))
-    let uploadRange = try #require(timingOrGates.range(of: "- name: Upload intermediate benchmark result"))
-    #expect(validateRange.lowerBound < uploadRange.lowerBound)
-
-    let validateStep = String(timingOrGates[validateRange.lowerBound..<uploadRange.lowerBound])
-    #expect(validateStep.contains("id: validate_intermediate_benchmark"))
-    #expect(validateStep.contains("if: always()"))
-    #expect(validateStep.contains("and .passed == true"))
-    #expect(validateStep.contains("and (.metrics.error == \"\")"))
-    #expect(validateStep.contains("and (.metrics.first_failing_case == null)"))
-    #expect(validateStep.contains("and (.metrics.first_failing_layer == null)"))
-    #expect(validateStep.contains("and (.metrics.first_failing_step == null)"))
-    #expect(validateStep.contains("and (.metrics.expected_token == null)"))
-    #expect(validateStep.contains("and (.metrics.actual_token == null)"))
-    #expect(validateStep.contains("\"partial_result\""))
-
-    // Deny-path check keeps the validation clause; the upload requires the
-    // deny check to have PASSED, which transitively enforces both the
-    // prepare_golden_expectations and (on submission branches) validation
-    // gates while restoring main's deny-before-upload ordering.
-    let validationClause = "((!(startsWith(github.ref_name, 'submissions/'))) || " +
-        "steps.validate_intermediate_benchmark.outcome == 'success')"
-    #expect(timingOrGates.components(separatedBy: validationClause).count - 1 == 1) // deny-path check
-    #expect(timingOrGates.contains(
-        "if: ${{ always() && steps.prepare_golden_expectations.outcome == 'success' && \(validationClause) }}"
+    // Staging runs only when (non-submission || validation passed), runs the
+    // deny-path check, and the upload requires staging to have PASSED, which
+    // transitively enforces the validation gate on submission branches.
+    #expect(workflow.contains(
+        "if: ${{ always() && !inputs.run_benchmark && ((!(startsWith(github.ref_name, 'submissions/'))) || "
+            + "steps.validate_correctness_artifacts.outcome == 'success') }}"
     ))
-    #expect(timingOrGates.contains("id: deny_intermediate_paths"))
-    #expect(timingOrGates.contains("if: ${{ always() && steps.deny_intermediate_paths.outcome == 'success' }}"))
+    #expect(workflow.contains("if: always() && steps.stage_correctness_artifacts.outcome == 'success'"))
+
+    // Ranked path: the sealed gates score is leak-checked BEFORE anything
+    // downstream (semantic judge, overlay) may consume it...
+    let gatesRunRange = try #require(workflow.range(of: "- name: Correctness and gates"))
+    let validateSealedRange = try #require(workflow.range(of: "- name: Validate sealed gates score"))
+    let semanticRange = try #require(workflow.range(of: "- name: Semantic GPQA gate"))
+    #expect(gatesRunRange.lowerBound < validateSealedRange.lowerBound)
+    #expect(validateSealedRange.lowerBound < semanticRange.lowerBound)
+    let validateSealedStep = String(workflow[validateSealedRange.lowerBound..<semanticRange.lowerBound])
+    #expect(validateSealedStep.contains(".passed == true"))
+    #expect(validateSealedStep.contains("and (.metrics.error == \"\")"))
+    #expect(validateSealedStep.contains("and (.metrics.first_failing_case == null)"))
+    #expect(validateSealedStep.contains("and (.metrics.first_failing_layer == null)"))
+    #expect(validateSealedStep.contains("and (.metrics.first_failing_step == null)"))
+    #expect(validateSealedStep.contains("and (.metrics.expected_token == null)"))
+    #expect(validateSealedStep.contains("and (.metrics.actual_token == null)"))
+    #expect(validateSealedStep.contains("and (.metrics.passed_correctness == true)"))
+
+    // ...and the final artifacts go through the full validator, then the
+    // deny-path check, then staging, each gated on the previous outcome.
+    let validateBenchmarkRange = try #require(workflow.range(of: "- name: Validate benchmark artifacts"))
+    let denyPathsRange = try #require(workflow.range(of: "- name: Check benchmark artifact paths"))
+    let stageBenchmarkRange = try #require(workflow.range(of: "- name: Stage benchmark artifacts"))
+    let uploadBenchmarkRange = try #require(workflow.range(of: "- name: Upload benchmark artifacts"))
+    #expect(validateBenchmarkRange.lowerBound < denyPathsRange.lowerBound)
+    #expect(denyPathsRange.lowerBound < stageBenchmarkRange.lowerBound)
+    #expect(stageBenchmarkRange.lowerBound < uploadBenchmarkRange.lowerBound)
+    #expect(workflow.contains("id: validate_benchmark_artifacts"))
+    #expect(
+        workflow.components(
+            separatedBy: "if: ${{ inputs.run_benchmark && steps.validate_benchmark_artifacts.outcome == 'success' }}"
+        ).count - 1 == 2 // deny-path check + stage
+    )
+    #expect(workflow.contains("if: ${{ inputs.run_benchmark && steps.stage_benchmark_artifacts.outcome == 'success' }}"))
+
+    // A failing run only ever uploads the REDACTED failure category, gated on
+    // the redaction itself having succeeded.
+    #expect(workflow.contains("- name: Surface redacted benchmark failure"))
+    #expect(workflow.contains(".github/scripts/redact-benchmark-failure.sh benchmark-failure.json"))
+    #expect(workflow.contains(".github/scripts/deny-private-artifacts.sh benchmark-failure.json"))
+    #expect(workflow.contains("if: ${{ failure() && steps.redact_benchmark_failure.outcome == 'success' }}"))
 }
 
+// The old parallel combine job re-checked the gates score.json before merging
+// the timing overlay and cleared the partial_result marker. In the single-
+// machine job that merge is overlay-paired-timing.sh; it must keep the same
+// pre-merge validation (leak fields, structural expert zeros), the floor
+// verdicts, the score formula, the partial_result clear, and the integrity
+// re-anchor -- and fail the job on a failed merged verdict.
 @Test
-func combineMergeStepChecksGatesScoreBeforeMergingAndClearsPartialResult() throws {
+func overlayPairedTimingValidatesInputsAppliesFloorsAndClearsPartialResult() throws {
+    let overlay = try String(
+        contentsOfFile: ".github/scripts/overlay-paired-timing.sh",
+        encoding: .utf8
+    )
     let workflow = try String(
         contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
 
-    let mergeRange = try #require(workflow.range(of: "- name: Merge gates and timing into machine1"))
-    let assembleRange = try #require(
-        workflow.range(of: "- name: Assemble machine directories", range: mergeRange.lowerBound..<workflow.endIndex)
-    )
-    let mergeStep = String(workflow[mergeRange.lowerBound..<assembleRange.lowerBound])
+    // Both sides of the paired measurement must have been ACCEPTed by
+    // measure-job's thermal/telemetry acceptance before any merge.
+    #expect(overlay.contains(".mode == \"paired\""))
+    #expect(overlay.contains("(.candidate.verdict == \"ACCEPT\")"))
+    #expect(overlay.contains("(.baseline.verdict == \"ACCEPT\")"))
 
-    // Defense-in-depth: even though benchmark-timing-or-gates.yml's own
-    // validation should already prevent a failing gates score.json from
-    // reaching this step, check again before merging.
-    #expect(mergeStep.contains(".passed == true"))
-    #expect(mergeStep.contains(".metrics.error == \"\""))
-    #expect(mergeStep.contains(".metrics.first_failing_case == null"))
-    #expect(mergeStep.contains(".metrics.first_failing_layer == null"))
-    #expect(mergeStep.contains(".metrics.first_failing_step == null"))
-    #expect(mergeStep.contains(".metrics.expected_token == null"))
-    #expect(mergeStep.contains(".metrics.actual_token == null"))
-    #expect(mergeStep.contains("gates_dir}/score.json") || mergeStep.contains("gates_dir\"/score.json"))
-    // Once merged, this is the real, final combined result -- clear the marker.
-    #expect(mergeStep.contains(".metrics.partial_result = false"))
+    // Pre-merge leak-field and structural-zero checks on the candidate's
+    // sealed timing score, mirroring the old combine's pre-merge validation.
+    #expect(overlay.contains("(.metrics.first_failing_case == null)"))
+    #expect(overlay.contains("and (.metrics.first_failing_step == null)"))
+    #expect(overlay.contains("and (.metrics.expected_token == null)"))
+    #expect(overlay.contains("and (.metrics.actual_token == null)"))
+    #expect(overlay.contains("and (.metrics.expert_bytes_read == 0)"))
+    #expect(overlay.contains("and (.metrics.bandwidth_source == \"ram_resident_model\")"))
+
+    // Floors and score formula match the frozen ranking contract; a failed
+    // floor produces the harness's own error prefix and a nonzero exit.
+    #expect(overlay.contains("($ds >= $decode_floor) as $decode_ok"))
+    #expect(overlay.contains("($ps >= $prefill_floor) as $prefill_ok"))
+    #expect(overlay.contains("($g.passed and $decode_ok and $prefill_ok) as $merged_passed"))
+    #expect(overlay.contains(".score = (pow($ds; 0.75) * pow($ps; 0.25))"))
+    #expect(overlay.contains("performance floor failed"))
+    #expect(overlay.contains("if [[ \"${merged_passed}\" != \"true\" ]]; then"))
+
+    // Once merged, this is the real, final result -- clear the marker and
+    // re-anchor the published integrity pair to the merged bytes.
+    #expect(overlay.contains(".metrics.partial_result = false"))
+    #expect(overlay.contains(".score_sha256 = $hash"))
+    #expect(overlay.contains("printf '%s  score.json\\n' \"${score_hash}\""))
+
+    // The workflow wires the overlay after the timed measurement, with the
+    // floor env pinned to the frozen constants.
+    let measureRange = try #require(workflow.range(of: "- name: Timed paired benchmark (measure-job)"))
+    let overlayRange = try #require(workflow.range(of: "- name: Overlay paired timing into final score"))
+    #expect(measureRange.lowerBound < overlayRange.lowerBound)
+    #expect(workflow.contains("run: .github/scripts/overlay-paired-timing.sh"))
+    #expect(workflow.contains("MLXFAST_DECODE_SPEEDUP_FLOOR: \"\(MLXFastConstants.scoreDecodeSpeedupFloor)\""))
+    #expect(workflow.contains("MLXFAST_PREFILL_SPEEDUP_FLOOR: \"\(MLXFastConstants.scorePrefillSpeedupFloor)\""))
 }
 
+// The parallel pipeline needed a validate-slice-ranges job to fail fast before
+// burning five rented machines. The single-machine equivalent: the cheap
+// preflight and secret checks run before any expensive build/transform work,
+// and the host preflight (quarantine + isolation stack) runs before checkout
+// or any secret use.
 @Test
-func validateSliceRangesJobRunsBeforeExpensiveSliceMachinesAndGatesThem() throws {
+func cheapPreflightChecksRunBeforeExpensiveWork() throws {
     let workflow = try String(
         contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
 
-    let validateRangesRange = try #require(workflow.range(of: "  validate-slice-ranges:\n"))
-    let slice1Range = try #require(
-        workflow.range(of: "  correctness-slice-1:\n", range: validateRangesRange.lowerBound..<workflow.endIndex)
-    )
-    #expect(validateRangesRange.lowerBound < slice1Range.lowerBound)
+    let hostPreflightRange = try #require(workflow.range(of: "- name: Host preflight"))
+    let checkoutRange = try #require(workflow.range(of: "uses: actions/checkout@"))
+    let secretsCheckRange = try #require(workflow.range(of: "- name: Check private material present"))
+    let prepareWorkspaceRange = try #require(workflow.range(of: "- name: Prepare bench workspace"))
+    let buildRange = try #require(workflow.range(of: "- name: Build harness in bench sandbox"))
 
-    let validateRangesJob = String(workflow[validateRangesRange.lowerBound..<slice1Range.lowerBound])
-    // Cheap and checkout-free: no reference checkpoint, no secrets, no environment: gate.
-    #expect(!validateRangesJob.contains("uses: actions/checkout"))
-    #expect(!validateRangesJob.contains("environment:"))
-    #expect(!validateRangesJob.contains("secrets."))
-    #expect(validateRangesJob.contains("runs-on: ubuntu-latest"))
-    #expect(validateRangesJob.contains("range_1"))
-    #expect(validateRangesJob.contains("range_2"))
-    #expect(validateRangesJob.contains("range_3"))
-    #expect(validateRangesJob.contains("sort_by(.start)"))
+    // Quarantined or drifted boxes fail before checkout or secrets.
+    #expect(hostPreflightRange.lowerBound < checkoutRange.lowerBound)
+    let hostPreflightStep = String(workflow[hostPreflightRange.lowerBound..<checkoutRange.lowerBound])
+    #expect(hostPreflightStep.contains("MLXFAST_QUARANTINE_FLAG"))
+    #expect(hostPreflightStep.contains("bench-exec bridge missing"))
+    #expect(hostPreflightStep.contains("janitor missing"))
+    #expect(hostPreflightStep.contains("measure-job missing"))
+    #expect(hostPreflightStep.contains("pinned baseline workspace missing"))
 
-    // All five expensive machines gate on the validator, not just the slices:
-    // timing/gates don't consume the ranges but a bad range dooms the run, so
-    // failing the validator must stop them too (else a typo still burns two
-    // Blacksmith jobs before combine reports the coverage failure).
-    for job in [
-        "correctness-slice-1", "correctness-slice-2", "correctness-slice-3",
-        "benchmark-timing", "benchmark-gates",
-    ] {
-        let jobRange = try #require(workflow.range(of: "  \(job):\n"))
-        let jobBody = String(workflow[jobRange.lowerBound...].prefix(400))
-        #expect(jobBody.contains("needs: validate-slice-ranges"))
-        #expect(jobBody.contains("if: ${{ inputs.run_benchmark && needs.validate-slice-ranges.result == 'success' }}"))
-    }
+    // Missing R2/Anthropic secrets fail before the ~25-minute build+transform.
+    #expect(secretsCheckRange.lowerBound < prepareWorkspaceRange.lowerBound)
+    #expect(prepareWorkspaceRange.lowerBound < buildRange.lowerBound)
+    let secretsStep = String(workflow[secretsCheckRange.lowerBound..<prepareWorkspaceRange.lowerBound])
+    #expect(secretsStep.contains("MLXFAST_PRIVATE_PROMPTS_R2_PRESENT"))
+    #expect(secretsStep.contains("MLXFAST_ANTHROPIC_PRESENT"))
 }
 
 @Test
-func parallelArtifactNamesIncludeRunAttemptToAvoidReRunCollisions() throws {
+func finalArtifactNamesStayRunIdOnlyAndAuditArtifactsEmbedRunAttempt() throws {
     let workflow = try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
-    let slice = try String(contentsOfFile: ".github/workflows/benchmark-correctness-slice.yml", encoding: .utf8)
-    let timingOrGates = try String(contentsOfFile: ".github/workflows/benchmark-timing-or-gates.yml", encoding: .utf8)
 
-    let runIdAttempt = "${{ github.run_id }}-${{ github.run_attempt }}"
-    #expect(slice.contains("name: benchmark-parallel-\(runIdAttempt)-${{ inputs.slice_name }}"))
-    #expect(timingOrGates.contains("name: benchmark-parallel-\(runIdAttempt)-${{ inputs.mode }}"))
-    // Uploads embed run_attempt (immutable names within a run), but combine's
-    // DOWNLOAD must be attempt-agnostic: on "Re-run failed jobs" only the
-    // re-run jobs execute under the new attempt -- jobs that succeeded earlier
-    // keep old-attempt artifact names, so a current-attempt-only pattern would
-    // make every partial re-run uncombinable. A resolve step then picks the
-    // highest-attempt artifact per machine role.
-    #expect(workflow.contains("pattern: benchmark-parallel-${{ github.run_id }}-*"))
-    #expect(!workflow.contains("pattern: benchmark-parallel-\(runIdAttempt)-*"))
-    #expect(workflow.contains("- name: Resolve newest artifact per machine role"))
-    #expect(workflow.contains("for role in gates timing machine2 machine3 machine4; do"))
-    #expect(workflow.contains("(( attempt > best_attempt ))"))
-    #expect(workflow.contains("no benchmark-parallel artifact found for role"))
-    for dir in ["gates", "timing", "machine2", "machine3", "machine4"] {
-        #expect(workflow.contains("benchmark-parallel-${{ github.run_id }}-resolved-\(dir)"))
-        #expect(!workflow.contains("slices/benchmark-parallel-\(runIdAttempt)-\(dir)"))
-    }
+    // The parallel benchmark-parallel-* intermediates (and their resolve/
+    // download machinery) are gone with the fan-out; the name survives only
+    // in the explanatory comment.
+    #expect(!workflow.contains("name: benchmark-parallel-"))
+    #expect(!workflow.contains("pattern: benchmark-parallel-"))
+    #expect(!workflow.contains("actions/download-artifact"))
+
     // The final artifacts keep run_id-only names (the orchestrator's lookup
     // contract) so a re-run reaching the upload again must overwrite, not 409.
     let benchmarkUploadRange = try #require(workflow.range(of: "name: benchmark-results-${{ github.run_id }}"))
@@ -3015,6 +3027,10 @@ func parallelArtifactNamesIncludeRunAttemptToAvoidReRunCollisions() throws {
     let correctnessUploadRange = try #require(workflow.range(of: "name: correctness-results-${{ github.run_id }}"))
     let correctnessUploadBlock = String(workflow[correctnessUploadRange.lowerBound...].prefix(400))
     #expect(correctnessUploadBlock.contains("overwrite: true"))
+
+    // Diagnostic artifacts embed run_attempt so re-runs never collide.
+    #expect(workflow.contains("name: benchmark-audit-${{ github.run_id }}-${{ github.run_attempt }}"))
+    #expect(workflow.contains("name: benchmark-failure-${{ github.run_id }}-${{ github.run_attempt }}-single-machine"))
 }
 
 @Test
