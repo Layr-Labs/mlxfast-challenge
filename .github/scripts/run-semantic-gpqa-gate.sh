@@ -8,9 +8,10 @@ INTEGRITY_PATH="${MLXFAST_INTEGRITY_PATH:-benchmark-integrity.json}"
 RESULTS_PATH="${MLXFAST_SEMANTIC_GPQA_RESULTS_PATH:-${MLXFAST_PRIVATE_DIR:-/tmp}/semantic_gpqa_results.json}"
 MODEL="${MLXFAST_SEMANTIC_GPQA_MODEL:-claude-sonnet-4-5-20250929}"
 # Default mirrors MLXFastConstants.semanticGPQAMinPassCount (Gemma-baseline
-# calibrated: run 28817200585 judged the unmodified baseline 0/5 at the
-# 64-token budget; the DeepSeek-era default was 3).
-MIN_PASS="${MLXFAST_SEMANTIC_GPQA_MIN_PASS:-0}"
+# calibrated: five 2026-07-09 official-runner baseline runs judged the
+# unmodified rebase reference 2/5 on the M5-regenerated hidden prompts, so
+# the threshold is min(observed) - 1 = 1; the pre-regeneration value was 0).
+MIN_PASS="${MLXFAST_SEMANTIC_GPQA_MIN_PASS:-1}"
 REQUIRED="${MLXFAST_SEMANTIC_GPQA_REQUIRED:-1}"
 
 : "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is required for the semantic GPQA gate}"

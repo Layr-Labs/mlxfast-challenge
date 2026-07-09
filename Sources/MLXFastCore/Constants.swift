@@ -47,19 +47,22 @@ public enum MLXFastConstants {
     // correctnessGPQAMaxNewTokens (and must stay <= correctnessMaxBehaviorSteps).
     public static let semanticGPQACaseCount = 5
     public static let semanticGPQAMaxNewTokens = 64
-    // Baseline-calibrated threshold, recalibrated at the 64-token budget from
-    // the official-runner baseline verification run 28817200585 (2026-07-06,
-    // https://github.com/Layr-Labs/mlxfast-challenge-dev/actions/runs/28817200585):
-    // unmodified baseline main judged 0/5. The DeepSeek-era baseline
-    // established 3/5; run 28813130022 judged the Gemma baseline 0/5 at the
-    // old 10-token budget, and the 64-token judged rerun confirms baseline
-    // Gemma expresses no judged-correct answers on these raw-completion
-    // hidden GPQA prompts, so the measured Gemma baseline -- and this gate's
-    // floor -- is 0. Aggregate pass counts are still recorded; the pass/fail
-    // check stays aggregate-recording until the hidden prompts change (for
-    // example to the Gemma chat template), after which a fresh judged
-    // official-runner baseline must recalibrate this threshold.
-    public static let semanticGPQAMinPassCount = 0
+    // Baseline-calibrated threshold, recalibrated 2026-07-09 after the hidden
+    // GPQA reference object was regenerated on the M5 ranked runner from the
+    // mlx-swift-lm-rebase reference model. Five judged official-runner
+    // baseline observations of unmodified main (tip 3c94f4e) all scored 2/5
+    // with identical per-case verdicts (cases 2 and 3 judged correct every
+    // time): runs 29040771374, 29048752714, 29051462434, 29052276465, and
+    // 29053091705. The threshold is min(observed) - 1 = 1: one judged case of
+    // margin below the stable 2/5 baseline floor absorbs single-case judge
+    // nondeterminism, while a submission that wrecks answer quality (0/5
+    // judged) now fails the gate instead of merely being recorded. The prior
+    // 0 ("aggregate-recording") value came from the pre-regeneration prompts,
+    // where runs 28813130022 and 28817200585 judged the raw-completion Gemma
+    // baseline 0/5. If the hidden prompts or the reference model change
+    // again, a fresh judged official-runner baseline must recalibrate this
+    // threshold.
+    public static let semanticGPQAMinPassCount = 1
     public static let benchmarkPrefillPromptTokens = 512
     // Scored decode is parent-measured wall time for decode setup plus this
     // many checked token steps. Charging setup prevents submitted model code

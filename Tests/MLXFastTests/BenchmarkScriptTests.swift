@@ -449,15 +449,15 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"))
     #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json"))
     #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"5\""))
-    // 64-token budget and 0/5 threshold are calibrated to the unmodified
-    // Gemma 4 31B 4-bit baseline (run 28817200585 judged 0/5 at the 64-token
-    // budget; run 28813130022 judged 0/5 at the old 10-token budget); see
-    // MLXFastConstants.semanticGPQAMinPassCount.
+    // 64-token budget and min-pass 1 threshold are calibrated to the
+    // unmodified Gemma 4 31B 4-bit rebase baseline, which stably judged 2/5
+    // across five official-runner runs on the M5-regenerated hidden prompts;
+    // see MLXFastConstants.semanticGPQAMinPassCount.
     #expect(workflow.contains("MLXFAST_GPQA_MAX_NEW_TOKENS: \"64\""))
     #expect(workflow.contains("MLXFAST_GPQA_TTFT_CASE_COUNT: \"5\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_CASE_COUNT: \"5\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: \"64\""))
-    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MIN_PASS: \"0\""))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MIN_PASS: \"1\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_REQUIRED: \"1\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MODEL: claude-sonnet-4-5-20250929"))
     #expect(!workflow.contains("calibrate_gpqa_reference"))
@@ -576,7 +576,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(semanticGate.contains("prefill_text='{\"passed\":'"))
     #expect(semanticGate.contains("attempt_request_path=\"${prefilled_request_path}\""))
     #expect(semanticGate.contains("printf '%s%s' \"${attempt_prefill}\" \"${judge_text}\""))
-    #expect(semanticGate.contains("MIN_PASS=\"${MLXFAST_SEMANTIC_GPQA_MIN_PASS:-0}\""))
+    #expect(semanticGate.contains("MIN_PASS=\"${MLXFAST_SEMANTIC_GPQA_MIN_PASS:-1}\""))
     #expect(semanticGate.contains("REQUIRED=\"${MLXFAST_SEMANTIC_GPQA_REQUIRED:-1}\""))
     #expect(semanticGate.contains("MLXFAST_SEMANTIC_GPQA_REQUIRED"))
     #expect(semanticGate.contains("invalid_judge_response"))

@@ -54,12 +54,16 @@ verify them) were regenerated.
   answer capture judged by `run-semantic-gpqa-gate.sh`.
 - **No hash pin:** the augmented golden's hash/bytes are computed at run
   time, so no workflow constant needs updating for this object itself.
-- **Semantic threshold:** the semantic-GPQA pass-count threshold is
-  calibrated against the unmodified baseline's judged answer quality, and a
-  regeneration of the hidden prompts/references requires a fresh judged
-  baseline on the ranked runner. See
-  `MLXFastConstants.semanticGPQAMinPassCount` for the current threshold and
-  its calibration provenance.
+- **Semantic threshold — recalibrated (2026-07-09):** the semantic-GPQA
+  pass-count threshold is calibrated against the unmodified baseline's
+  judged answer quality, and a regeneration of the hidden
+  prompts/references requires a fresh judged baseline on the ranked runner.
+  After this upload, five judged official-runner baseline runs of
+  unmodified main (29040771374, 29048752714, 29051462434, 29052276465,
+  29053091705) all scored 2/5 with identical per-case verdicts, so
+  `MLXFAST_SEMANTIC_GPQA_MIN_PASS` moved from 0 (aggregate-recording) to
+  min(observed) - 1 = 1. See `MLXFastConstants.semanticGPQAMinPassCount`
+  for the full calibration provenance.
 
 ## 3. Private prompt manifest (organizer-side, not workflow-consumed)
 

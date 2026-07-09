@@ -173,14 +173,16 @@ jobs:
       MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "38162"
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
       MLXFAST_GPQA_CASE_COUNT: "5"
-      # 64-token GPQA behavior/semantic budget and 0/5 threshold: calibrated to
-      # the unmodified Gemma 4 31B 4-bit baseline. Keep in sync with
+      # 64-token GPQA behavior/semantic budget and min-pass 1 threshold:
+      # calibrated to the unmodified Gemma 4 31B 4-bit rebase baseline, which
+      # stably judges 2/5 on the M5-regenerated hidden prompts (five runs, see
+      # MLXFastConstants.semanticGPQAMinPassCount). Keep in sync with
       # MLXFastConstants.{correctnessGPQAMaxNewTokens,semanticGPQAMaxNewTokens,
       # semanticGPQAMinPassCount}.
       MLXFAST_GPQA_MAX_NEW_TOKENS: "64"
       MLXFAST_SEMANTIC_GPQA_CASE_COUNT: "5"
       MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: "64"
-      MLXFAST_SEMANTIC_GPQA_MIN_PASS: "0"
+      MLXFAST_SEMANTIC_GPQA_MIN_PASS: "1"
       MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
       MLXFAST_SEMANTIC_GPQA_MODEL: claude-sonnet-4-5-20250929
       MLXFAST_GPQA_TTFT_CASE_COUNT: "5"
