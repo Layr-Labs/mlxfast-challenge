@@ -38,7 +38,7 @@ func checkedInPublicCorrectnessGoldenIsValid() throws {
         .map { String(format: "%02x", $0) }
         .joined()
 
-    #expect(localSubmitDigest == "e0dff2a608026f481870d9f4d90a84d9f23a1263dcd9b1b0ef8cccad516d2775")
+    #expect(localSubmitDigest == "139de2cd0c9d9f6f005feffb1872af0084312996a79708f3b8ca02f64b116536")
 
     let localSubmitFixture = try loadGoldenFixture(
         from: localSubmitPath,
