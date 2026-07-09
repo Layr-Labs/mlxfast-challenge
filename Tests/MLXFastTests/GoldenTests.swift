@@ -20,7 +20,7 @@ func checkedInPublicCorrectnessGoldenIsValid() throws {
         .map { String(format: "%02x", $0) }
         .joined()
 
-    #expect(digest == "475a20ccdfaaf4e5220cfef244fef18e906bb1799d0713ca4c783d8928099df0")
+    #expect(digest == "182a7f98d24cc8f26e8b08505fe7a8b6d825702f99d0b78a83f49dd42f1b2aea")
 
     let fixture = try loadGoldenFixture(from: path)
     #expect(fixture.sha256 == digest)
