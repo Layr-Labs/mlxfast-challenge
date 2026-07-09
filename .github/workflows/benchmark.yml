@@ -187,8 +187,8 @@ jobs:
       # Public drift-tripwire fixture, pinned (enforced by BenchmarkScriptTests).
       MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
-      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: c49e3df384c4088b7a33c7b321fb0b5e416a62d03fb14d5d83109d1f4860a18c
-      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: "5089"
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 475a20ccdfaaf4e5220cfef244fef18e906bb1799d0713ca4c783d8928099df0
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: "4907"
       # Speedup floors; keep in sync with
       # MLXFastConstants.{scoreDecodeSpeedupFloor,scorePrefillSpeedupFloor}.
       # The old timing machine computed floor verdicts inside the harness from

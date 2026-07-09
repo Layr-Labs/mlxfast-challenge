@@ -430,8 +430,8 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(timingOrGates.contains("MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"))
-    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 7c33861bdf062b08a96a97bf5b388b541edc95b4cc46afc4f98ce9cb46856782"))
-    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"11236\""))
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 475a20ccdfaaf4e5220cfef244fef18e906bb1799d0713ca4c783d8928099df0"))
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"4907\""))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"))
     #expect(timingOrGates.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"))
     #expect(timingOrGates.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json"))
@@ -454,8 +454,8 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(!workflow.contains("mlxfast-gpqa-calibration-private.log"))
     #expect(!workflow.contains(".github/scripts/upload-r2-object.sh"))
     #expect(!workflow.contains("uploaded calibrated GPQA reference cases to private R2"))
-    #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: a593138ca72cdf5f9f8cd9c6dbf6f1b1b8928794300a6cecf89bda961e92cb25"))
-    #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: \"38155\""))
+    #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256: 5c5bb073eaae10f4f2871c3b40f91d3dc7784bd3e6dc8ae0845e158493b6adaf"))
+    #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES: \"38124\""))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_STEPS: \"64\""))
     #expect(!workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_CASES: \"10\""))
     #expect(workflow.contains("benchmark: using checked-in public correctness golden"))
@@ -572,6 +572,15 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(!semanticGate.contains("--header \"x-api-key: ${ANTHROPIC_API_KEY}\""))
     #expect(!semanticGate.contains("--arg question \"$(jq"))
     #expect(!semanticGate.contains("candidate_answer\" >&2"))
+    // The bypass review runs on the strongest model at max reasoning effort,
+    // and must not inherit the cheaper Sonnet judge that the gates job exports
+    // as MLXFAST_SEMANTIC_GPQA_MODEL job-level env.
+    #expect(staticReview.contains("MODEL=\"${MLXFAST_SUBMISSION_STATIC_REVIEW_MODEL:-claude-opus-4-8}\""))
+    #expect(!staticReview.contains(":-${MLXFAST_SEMANTIC_GPQA_MODEL"))
+    #expect(staticReview.contains("thinking: { type: \"adaptive\" },"))
+    #expect(staticReview.contains("output_config: { effort: \"max\" },"))
+    // Opus 4.8 rejects non-default sampling params with a 400.
+    #expect(!staticReview.contains("temperature:"))
     #expect(staticReview.contains("ANTHROPIC_API_KEY is required for submission static review"))
     #expect(staticReview.contains("unset ANTHROPIC_API_KEY"))
     #expect(staticReview.contains("env -u ANTHROPIC_API_KEY curl"))
@@ -868,6 +877,15 @@ func gatesMachineRunsPublicBehaviorGateBeforeHiddenGates() throws {
         encoding: .utf8
     )
     #expect(benchmarkWorkflow.contains(fixtureHash))
+    // Same for the byte count: verify-correctness-golden.sh hard-checks bytes
+    // after the SHA, so a stale byte pin fails the correctness-only job even when
+    // the hash matches. Deriving it from the fixture forces the pin to move when
+    // the fixture is regenerated, instead of silently drifting.
+    #expect(
+        benchmarkWorkflow.contains(
+            "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"\(fixtureData.count)\""
+        )
+    )
 }
 
 // The 64-step teacher-forced base case only exercises single-token forwards at
