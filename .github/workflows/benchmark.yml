@@ -318,6 +318,62 @@ jobs:
             .build/workspace-state.json
           key: swiftpm-trusted-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
 
+      - name: Compute MLX Metal library cache fingerprint
+        id: mlx_metallib_fingerprint
+        run: |
+          set -euo pipefail
+          cmake_bin="$(command -v cmake 2>/dev/null || true)"
+          if [[ -z "${cmake_bin}" ]]; then
+            for candidate in /opt/homebrew/bin/cmake /usr/local/bin/cmake; do
+              if [[ -x "${candidate}" ]]; then
+                cmake_bin="${candidate}"
+                break
+              fi
+            done
+          fi
+          test -x "${cmake_bin}"
+          metal_toolchain_identifier="$(
+            xcodebuild -showComponent MetalToolchain 2>/dev/null \
+              | awk -F': ' '/Toolchain Identifier/ { print $2; exit }' \
+              || true
+          )"
+          fingerprint="$({
+            printf '%s\n' mlx-metallib-m5-max-v1
+            uname -m
+            sysctl -n machdep.cpu.brand_string
+            sw_vers -buildVersion
+            xcodebuild -version
+            printf 'METAL_TOOLCHAIN_IDENTIFIER=%s\n' "${metal_toolchain_identifier}"
+            xcrun --sdk macosx --show-sdk-build-version
+            if [[ -n "${metal_toolchain_identifier}" ]]; then
+              TOOLCHAINS="${metal_toolchain_identifier}" xcrun -sdk macosx metal -v 2>&1
+            else
+              xcrun -sdk macosx metal -v 2>&1
+            fi
+            "${cmake_bin}" --version
+            shasum -a 256 Package.swift Package.resolved tools/build-mlx-metallib.sh
+          } | shasum -a 256 | awk '{print $1}')"
+          test "${#fingerprint}" -eq 64
+          printf 'sha256=%s\n' "${fingerprint}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore trusted MLX Metal library cache
+        id: restore_mlx_metallib_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .mlxfast-cache/mlx.metallib
+          key: mlx-metallib-m5-max-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}
+
+      - name: Verify restored MLX Metal library
+        env:
+          CACHE_HIT: ${{ steps.restore_mlx_metallib_cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          if [[ "${CACHE_HIT}" == "true" ]]; then
+            test -s .mlxfast-cache/mlx.metallib
+          else
+            /bin/rm -f .mlxfast-cache/mlx.metallib
+          fi
+
       # Copy the dispatched checkout into the bench job root and resolve SwiftPM
       # dependencies THERE while still trusted-and-networked (the bench uid has
       # a PF egress block, so `swift build` under bench must find everything
@@ -356,10 +412,30 @@ jobs:
               set -euo pipefail
               cd "${MJOB_WS}"
               /usr/bin/swift build -c release
-              tools/build-mlx-metallib.sh
+              if [[ -s .mlxfast-cache/mlx.metallib ]]; then
+                /bin/cp .mlxfast-cache/mlx.metallib .build/release/mlx.metallib
+                echo "benchmark: restored trusted MLX Metal library"
+              else
+                tools/build-mlx-metallib.sh
+              fi
+              /bin/chmod 0644 .build/release/mlx.metallib
             '
           test -x "${MLXFAST_JOB_WS}/.build/release/mlxfast-swift"
           test -s "${MLXFAST_JOB_WS}/.build/release/mlx.metallib"
+
+      - name: Stage trusted MLX Metal library cache
+        if: steps.restore_mlx_metallib_cache.outputs.cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          mkdir -p .mlxfast-cache
+          /bin/cp "${MLXFAST_JOB_WS}/.build/release/mlx.metallib" .mlxfast-cache/mlx.metallib
+
+      - name: Save trusted MLX Metal library cache
+        if: steps.restore_mlx_metallib_cache.outputs.cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .mlxfast-cache/mlx.metallib
+          key: mlx-metallib-m5-max-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}
 
       - name: Transform reference checkpoint in bench sandbox
         env:
