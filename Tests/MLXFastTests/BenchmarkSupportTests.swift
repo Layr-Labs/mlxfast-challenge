@@ -11,6 +11,41 @@ func runtimeWorkerClientSkipsNonJSONStdoutLines() {
     #expect(!runtimeWorkerLineLooksLikeJSONResponse(Data("".utf8)))
 }
 
+// metrics.commit must come from the trusted dispatch context when the ranked
+// pipeline supplies it: on the ranked box the harness runs as the sandboxed
+// bench uid where `git rev-parse` fails (dubious ownership in the runner-owned
+// workspace copy), which produced empty commits that failed every ranked
+// score's commit binding. git stays the local/dev fallback only.
+@Test
+func commitIdentifierPrefersTrustedDispatchSHAOverGit() {
+    let fullSHA = "5f95c4bdce07a0ef79ea350c91d9eb0d7476cf2f"
+    #expect(GemmaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": fullSHA]) == fullSHA)
+    // Short (rev-parse --short style) values and surrounding whitespace are fine.
+    #expect(GemmaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": "5f95c4bdce07"]) == "5f95c4bdce07")
+    #expect(GemmaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": " \(fullSHA)\n"]) == fullSHA)
+
+    // Values that could not satisfy the trusted shell predicates fall back to
+    // git instead of being stamped verbatim into the sealed score.
+    for invalid in [
+        "",
+        "5f95c4",
+        fullSHA.uppercased(),
+        fullSHA + "0",
+        "not-a-commit-sha",
+        "5f95c4bdce07;rm -rf /",
+    ] {
+        let fallback = GemmaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": invalid])
+        #expect(fallback != invalid || invalid.isEmpty)
+        #expect(!fallback.contains(";"))
+    }
+
+    #expect(GemmaRuntime.isCommitSHAHex(fullSHA))
+    #expect(GemmaRuntime.isCommitSHAHex("abcdef0"))
+    #expect(!GemmaRuntime.isCommitSHAHex("abcdef"))
+    #expect(!GemmaRuntime.isCommitSHAHex(String(repeating: "a", count: 41)))
+    #expect(!GemmaRuntime.isCommitSHAHex("ABCDEF0"))
+}
+
 @Test
 func runtimeWorkerEnvironmentStripsOfficialRunAndCIIdentity() {
     let sanitized = sanitizedRuntimeWorkerEnvironment([

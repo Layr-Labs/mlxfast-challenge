@@ -859,6 +859,25 @@ export MLXFAST_USE_RUNTIME_WORKER="${USE_RUNTIME_WORKER}"
 MLXFAST_RUNTIME_WORKER_EXECUTABLE="$(absolute_path "${SWIFT_BIN}")"
 export MLXFAST_RUNTIME_WORKER_EXECUTABLE
 export MLXFAST_REFERENCE_DIR="${REFERENCE_PATH}"
+
+# Ranked commit provenance for the sealed score's metrics.commit. The ranked
+# workflow's trusted "Capture candidate commit" step writes the dispatched
+# commit (validated ^[0-9a-f]{40}$) to candidate.sha before any bench-uid
+# execution, and that file is copied into the bench workspace with the rest of
+# the tree. Official runs execute as the sandboxed bench uid where
+# `git rev-parse` fails (runner-owned .git, dubious ownership) and where the
+# measure-job timed path's `sudo env_reset` + `env -i` strip workflow env, so
+# recover the trusted commit from the file here and hand it to the harness.
+# An explicit MLXFAST_COMMIT_SHA (trusted argv env, as the gates step passes)
+# wins; local modes have neither and keep the harness's git fallback. A
+# malformed candidate.sha exports nothing, which fails closed downstream at
+# the trusted commit-binding checks.
+if [[ "${OFFICIAL}" == "1" && -z "${MLXFAST_COMMIT_SHA:-}" && -f candidate.sha ]]; then
+  candidate_commit_sha="$(head -c 64 candidate.sha | tr -d '[:space:]')"
+  if [[ "${candidate_commit_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+    export MLXFAST_COMMIT_SHA="${candidate_commit_sha}"
+  fi
+fi
 if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ]]; then
   if [[ -z "${MLXFAST_LOCAL_COOL_GATE_HELPER:-}" ]]; then
     MLXFAST_LOCAL_COOL_GATE_HELPER="$(absolute_path "${BASH_SOURCE[0]}")"

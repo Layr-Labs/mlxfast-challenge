@@ -10,8 +10,38 @@ import Tokenizers
 // Generated split; behavior identical to the original single file.
 
 extension GemmaRuntime {
-    static func commitIdentifier() -> String {
-        (try? runProcess("/usr/bin/git", arguments: ["rev-parse", "--short", "HEAD"])) ?? ""
+    /// The commit stamped into the sealed score's `metrics.commit`, which the
+    /// trusted workflow binds against the dispatched commit
+    /// (MLXFAST_EXPECTED_COMMIT in overlay-paired-timing.sh and
+    /// validate-benchmark-artifacts.sh).
+    ///
+    /// Ranked runs execute this process as the sandboxed `bench` uid inside a
+    /// runner-owned workspace copy, where `git rev-parse` fails (dubious
+    /// ownership under `env -i`), so git output is not a usable authority
+    /// there. Instead the trusted context supplies the dispatched commit via
+    /// MLXFAST_COMMIT_SHA: the ranked workflow threads it through the
+    /// bench-exec'd gates argv, and benchmark.sh --official recovers it from
+    /// the workflow-authored candidate.sha for the measure-job timed path.
+    /// `git rev-parse` remains the local/dev fallback only.
+    static func commitIdentifier(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String {
+        if let supplied = environment["MLXFAST_COMMIT_SHA"] {
+            let trimmed = supplied.trimmingCharacters(in: .whitespacesAndNewlines)
+            if isCommitSHAHex(trimmed) {
+                return trimmed
+            }
+        }
+        return (try? runProcess("/usr/bin/git", arguments: ["rev-parse", "--short", "HEAD"])) ?? ""
+    }
+
+    /// Matches the trusted shell predicates' `^[0-9a-f]{7,40}$` (lowercase
+    /// hex, short-to-full commit SHA).
+    static func isCommitSHAHex(_ value: String) -> Bool {
+        guard value.count >= 7, value.count <= 40 else {
+            return false
+        }
+        return value.allSatisfy { ("0"..."9").contains($0) || ("a"..."f").contains($0) }
     }
 
     static func harnessHash() -> String {

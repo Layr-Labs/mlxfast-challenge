@@ -833,6 +833,7 @@ jobs:
               MLXFAST_SCORE_PATH=score.gates.json \
               MLXFAST_INTEGRITY_PATH=benchmark-integrity.gates.json \
               MLXFAST_NOTE="${MLXFAST_NOTE}" \
+              MLXFAST_COMMIT_SHA="${MLXFAST_CANDIDATE_SHA}" \
               GIT_CONFIG_COUNT=1 \
               GIT_CONFIG_KEY_0=safe.directory \
               GIT_CONFIG_VALUE_0='*' \

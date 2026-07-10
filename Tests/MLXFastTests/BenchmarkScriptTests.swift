@@ -697,6 +697,32 @@ func benchmarkWorkflowBindsPublishedArtifactsToDispatchedCommit() throws {
     #expect(workflow.components(separatedBy: "test \"$(cat candidate.sha)\" = \"${MLXFAST_CANDIDATE_SHA}\"").count - 1 == 2)
     #expect(workflow.components(separatedBy: "candidate.sha=candidate.sha").count - 1 == 2)
     #expect(workflow.components(separatedBy: "            candidate.sha \\").count - 1 == 2)
+
+    // The commit the harness stamps into metrics.commit must come from the
+    // TRUSTED dispatch context, not `git rev-parse` inside the bench sandbox
+    // (where git fails as the bench uid in the runner-owned workspace copy and
+    // an empty commit rejects every ranked score). The gates step threads the
+    // dispatched SHA through the bench-exec argv (survives sudo env_reset +
+    // env -i); the measure-job timed path cannot receive workflow env, so
+    // benchmark.sh --official recovers the same SHA from the trusted
+    // workflow-authored candidate.sha; the harness prefers that env var and
+    // keeps git only as the local/dev fallback.
+    let gatesRange = try #require(workflow.range(of: "- name: Correctness and gates"))
+    let sealRange = try #require(workflow.range(of: "- name: Validate sealed gates score"))
+    let gatesStep = String(workflow[gatesRange.lowerBound..<sealRange.lowerBound])
+    #expect(gatesStep.contains("MLXFAST_COMMIT_SHA=\"${MLXFAST_CANDIDATE_SHA}\" \\"))
+
+    let benchmarkScript = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    #expect(benchmarkScript.contains(
+        "if [[ \"${OFFICIAL}\" == \"1\" && -z \"${MLXFAST_COMMIT_SHA:-}\" && -f candidate.sha ]]; then"
+    ))
+    #expect(benchmarkScript.contains("candidate_commit_sha=\"$(head -c 64 candidate.sha | tr -d '[:space:]')\""))
+    #expect(benchmarkScript.contains("if [[ \"${candidate_commit_sha}\" =~ ^[0-9a-f]{40}$ ]]; then"))
+    #expect(benchmarkScript.contains("export MLXFAST_COMMIT_SHA=\"${candidate_commit_sha}\""))
+
+    let harness = try harnessRuntimeSource()
+    #expect(harness.contains("environment[\"MLXFAST_COMMIT_SHA\"]"))
+    #expect(harness.contains("static func isCommitSHAHex"))
 }
 
 @Test
@@ -3291,6 +3317,150 @@ func overlayPairedTimingValidatesInputsAppliesFloorsAndClearsPartialResult() thr
     #expect(workflow.contains("run: .github/scripts/overlay-paired-timing.sh"))
     #expect(workflow.contains("MLXFAST_DECODE_SPEEDUP_FLOOR: \"\(MLXFastConstants.scoreDecodeSpeedupFloor)\""))
     #expect(workflow.contains("MLXFAST_PREFILL_SPEEDUP_FLOOR: \"\(MLXFastConstants.scorePrefillSpeedupFloor)\""))
+}
+
+// Execute the real overlay script against sealed-score fixtures to prove the
+// commit binding end to end: a candidate timing score stamped with the
+// trusted dispatch SHA (full or short prefix) merges, while empty, wrong,
+// uppercase, or too-short commits keep failing the pre-merge checks. This is
+// the regression test for the ranked-scoring outage where the harness's
+// git-in-sandbox commit came back empty and every ranked run was rejected.
+@Test
+func overlayPairedTimingAcceptsTrustedCommitAndRejectsForgedOrMissingCommit() throws {
+    let expectedCommit = "5f95c4bdce07a0ef79ea350c91d9eb0d7476cf2f"
+
+    func runOverlay(candidateCommit: String) throws -> (status: Int32, stderr: String, merged: String) {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let gatesScore = root.appendingPathComponent("score.json")
+        let candidateScore = root.appendingPathComponent("score-candidate.json")
+        let results = root.appendingPathComponent("results.json")
+        let integrity = root.appendingPathComponent("benchmark-integrity.json")
+
+        try """
+        {
+          "passed": true,
+          "score": null,
+          "metrics": {
+            "commit": "\(expectedCommit)",
+            "error": "",
+            "partial_result": true,
+            "benchmark_wall_seconds": 2400.0,
+            "peak_ram_gb": 21.5,
+            "process_resident_memory_gb": 20.5,
+            "expert_bytes_read": 0,
+            "expert_cache_hits": 0,
+            "expert_cache_misses": 0,
+            "expert_cache_evictions": 0,
+            "expert_read_seconds": 0,
+            "expert_peak_cached_tensors": 0
+          }
+        }
+        """.write(to: gatesScore, atomically: true, encoding: .utf8)
+
+        try """
+        {
+          "passed": false,
+          "score": null,
+          "metrics": {
+            "commit": "\(candidateCommit)",
+            "error": "performance floor failed (decode_speedup=0.5)",
+            "first_failing_case": null,
+            "first_failing_step": null,
+            "expected_token": null,
+            "actual_token": null,
+            "expert_bytes_read": 0,
+            "expert_cache_hits": 0,
+            "expert_cache_misses": 0,
+            "expert_cache_evictions": 0,
+            "expert_read_seconds": 0,
+            "expert_peak_cached_tensors": 0,
+            "bandwidth_source": "ram_resident_model",
+            "bandwidth_gb_per_token": 0,
+            "timed_benchmark_seconds": 42.5,
+            "benchmark_wall_seconds": 300.0,
+            "peak_ram_gb": 22.0,
+            "process_resident_memory_gb": 21.0
+          }
+        }
+        """.write(to: candidateScore, atomically: true, encoding: .utf8)
+
+        try """
+        {
+          "mode": "paired",
+          "paired": {
+            "decode_speedup": 1.0071896113655208,
+            "prefill_speedup": 1.0032593423660188,
+            "paired_score": 1.0062056030137094
+          },
+          "candidate": {
+            "decode_seconds_per_token": 0.0438,
+            "prefill_seconds_per_token": 0.00162,
+            "verdict": "ACCEPT"
+          },
+          "baseline": {
+            "decode_seconds_per_token": 0.0441,
+            "prefill_seconds_per_token": 0.001625,
+            "verdict": "ACCEPT"
+          }
+        }
+        """.write(to: results, atomically: true, encoding: .utf8)
+
+        try "{\"score_sha256\": \"stale\"}".write(to: integrity, atomically: true, encoding: .utf8)
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [".github/scripts/overlay-paired-timing.sh"]
+        process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "MLXFAST_SCORE_PATH": gatesScore.path,
+            "MLXFAST_MEASURE_RESULTS_PATH": results.path,
+            "MLXFAST_CANDIDATE_SCORE_PATH": candidateScore.path,
+            "MLXFAST_INTEGRITY_PATH": integrity.path,
+            "MLXFAST_DECODE_SPEEDUP_FLOOR": "0.95",
+            "MLXFAST_PREFILL_SPEEDUP_FLOOR": "0.95",
+            "MLXFAST_EXPECTED_COMMIT": expectedCommit,
+        ]) { _, new in new }
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+        process.standardOutput = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        let stderrText = String(
+            data: stderrPipe.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        ) ?? ""
+        let merged = (try? String(contentsOf: gatesScore, encoding: .utf8)) ?? ""
+        return (process.terminationStatus, stderrText, merged)
+    }
+
+    // Trusted full dispatch SHA: merges, applies the paired score, keeps the
+    // gates-score commit in the published result.
+    let full = try runOverlay(candidateCommit: expectedCommit)
+    #expect(full.status == 0, "expected trusted full-SHA commit to merge: \(full.stderr)")
+    #expect(full.merged.contains("\"passed\": true"))
+    #expect(full.merged.contains("\"commit\": \"\(expectedCommit)\""))
+    #expect(full.merged.contains("\"decode_speedup\": 1.0071896113655208"))
+    #expect(full.merged.contains("\"partial_result\": false"))
+
+    // A short prefix of the dispatched SHA (git rev-parse --short form from
+    // local/dev paths) is still accepted.
+    let prefix = try runOverlay(candidateCommit: String(expectedCommit.prefix(12)))
+    #expect(prefix.status == 0, "expected short-prefix commit to merge: \(prefix.stderr)")
+
+    // The regression shape: git failing inside the bench sandbox produced an
+    // empty commit; that (and any forged/wrong commit) must keep failing.
+    for rejected in [
+        "",
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        expectedCommit.uppercased(),
+        "5f95c4",
+    ] {
+        let outcome = try runOverlay(candidateCommit: rejected)
+        #expect(outcome.status != 0, "expected commit \"\(rejected)\" to be rejected")
+        #expect(outcome.stderr.contains("candidate timing score failed the pre-merge checks"))
+    }
 }
 
 // The parallel pipeline needed a validate-slice-ranges job to fail fast before
