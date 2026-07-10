@@ -239,6 +239,50 @@ hidden golden artifacts provisioned on the official runner. A bare
 are M5-generated: a local correctness failure on non-M5 hardware can be a
 near-tie argmax divergence rather than a real bug (see Correctness Gates).
 
+## Notes For Autonomous Agents
+
+Operational contract for coding agents iterating in this repo. These
+behaviors are expected, not bugs:
+
+- **The local GPU cool-down gate waits; let it.** `./benchmark.sh
+ --local-iterate` and `--local-submit` wait for the GPU to cool below 40C
+ before starting the timed run (read via `macmon`), printing a progress
+ line roughly every 10 seconds while waiting. A benchmark invocation that
+ pauses on "waiting for GPU to cool down" is working, not hung — do not
+ kill it or treat the wait as a failure. If the GPU stays hot and is not
+ trending down, the gate aborts with a non-zero exit after about 3
+ minutes; that abort means "something else is loading the GPU — free it
+ up and retry," not "the code change is wrong." (A hard 900-second
+ ceiling applies even while the GPU is still slowly cooling.) If `macmon`
+ is not installed the gate warns and skips; `./setup.sh` installs it (or
+ `brew install macmon`). The gate mirrors the ranked runner's fixed
+ 40C / 1600 MHz / 900 s thermal contract, which is operator-owned and
+ non-overridable.
+- **Measurement discipline.** Trust benchmark numbers only from a cool,
+ quiescent machine. Back-to-back runs heat the GPU and throttle it; a
+ 2-3 minute cool-down between local runs is normal and is exactly what
+ the gate enforces. Do not fight the gate to iterate faster:
+ `MLXFAST_LOCAL_COOL_GATE=0` is for debugging only and produces
+ hot-start timings that are not comparable to gated ones. The ranked
+ score is a paired speedup versus the on-box pinned reference measured
+ in the same session (~1.0 for unmodified code); the `officialBaseline*`
+ constants feed local-mode estimates only, so treat local absolute
+ numbers and local score estimates as directional.
+- **A local gate failure on non-M5 hardware may not be your bug.** The
+ public goldens are M5-generated greedy continuations of the
+ mlx-swift-lm reference; near-tie argmaxes can diverge on other Apple
+ Silicon generations even for correct code. Before treating a local
+ public-gate failure as a regression, check whether unmodified `main`
+ fails at the same token position on your machine; the ranked M5 runner
+ is the source of truth.
+- **Know the runnable surface.** Only `Sources/MLXFastModel/` and
+ `Sources/MLXFastTransform/` ship in a submission (`benchmark.json`
+ `editablePaths`); changes anywhere else will not upload even if they
+ help locally. `./benchmark.sh --official` requires the hidden goldens
+ and private oracle provisioned on the official runner and is not
+ runnable locally — use `--local-iterate` for the edit loop and
+ `--local-submit` as the pre-submit gate.
+
 ## Swift Tooling
 
 Use the Swift toolchain that `./setup.sh` validates. `sourcekit-lsp` is the
