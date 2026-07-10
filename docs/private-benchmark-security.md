@@ -2,7 +2,108 @@
 
 The private correctness prompts and private golden data must be treated as
 trusted harness material. They are not part of the contestant modifiable
-surface.
+surface. This document describes the security architecture of the ranked
+single-machine pipeline: how private material is handled, what confines
+submitted code while it runs, which output channels are closed, and which
+gaps are known and stated rather than papered over.
+
+## Single-machine ranked topology
+
+Ranked runs execute through `.github/workflows/benchmark.yml` as one serial
+job on a single operator-supervised, self-hosted Apple M5 Max machine
+(runner label `m5-bench`). Build, transform, the public correctness gate,
+the hidden 64-step base case plus behavior/GPQA gates, the semantic judge,
+and the timed paired measurement all run in order on that one box. The
+previous multi-VM topology — parallel correctness slices, a separate
+paired-baseline timing VM, and a combine job — is retired; the guards it
+duplicated across privileged jobs now run once inside the single job, in
+the order described below.
+
+The runner registration is ephemeral: a root supervisor on the box mints a
+single-use just-in-time (JIT) registration per job, authenticated through a
+GitHub App installation (no long-lived PAT). Each registration is consumed
+by exactly one job and a fresh one is minted for the next, so one job at a
+time is structural, a compromised job cannot accept a second job, and the
+workflow's concurrency group queues duplicate dispatches instead of
+cancelling an in-flight measurement.
+
+The workflow is `workflow_dispatch`-only with no PR or push triggers (fork
+code must never reach a self-hosted runner), and it verifies at runtime
+(see `enforce-trusted-benchmark-workflow.sh`) that it runs in this
+repository via a `workflow_dispatch` event. It benchmarks whatever ref it
+is dispatched on.
+
+Because the workflow runs the dispatched ref's own workflow file, the real
+boundary is the combination of:
+
+- the benchmark orchestrator (Yukon eigenbot) being the only creator of
+  `submissions/*` branches, built from remotely validated `editablePaths` so
+  their non-`editablePaths` files match `main`;
+- the `Enforce modifiable surface` step re-verifying at runtime that a
+  `submissions/*` branch changes only `editablePaths` relative to `main`; and
+- restricting who can push `submissions/*` branches and dispatch the workflow.
+
+## Privilege rings and the bench-exec bridge
+
+The box separates three privilege rings. The host layer is provisioned by
+the box operator and audited between jobs by a signed integrity manifest
+(next section); the workflow only ever consumes it, never installs or
+mutates it.
+
+- **Ring 0 — admin/root:** provisioning and the runner supervisor. Never
+  runs job code.
+- **Ring 1 — the `runner` account:** runs the GitHub Actions runner and all
+  trusted workflow steps — guard checks, private downloads and golden
+  verification, the semantic judge call, score sealing, artifact
+  validation. It holds the private secrets for the duration of those steps
+  and never executes submitted code.
+- **Ring 2 — the `bench` account:** a locked (no password, no ssh, no
+  login), ephemeral uid that is deleted and recreated between jobs. It is
+  the only context that ever executes submitted or branch-controlled code:
+  build, transform, GPQA-gate attachment, the public gate, the
+  correctness-plus-gates pass, and the timed benchmark.
+
+Submitted code reaches ring 2 through exactly one fixed bridge. A sudoers
+grant lets `runner` invoke two root-owned entry points and nothing else:
+`/opt/bench/bench-exec.sh` (the bridge) and `/opt/bench/janitor.sh` (the
+between-job reset). Every invocation of submitted code in the workflow goes
+through the bridge, which drops privilege to the bench uid, confines writes
+to the per-job workspace under a fixed job root (any other workspace path
+is refused), applies a per-uid process cap, starts from a clean environment
+(sudo `env_reset` plus the bridge's own secret denylist), and injects a
+hardened, merged Seatbelt worker profile into the harness via
+`MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE` / `MLXFAST_USE_RUNTIME_WORKER=1`.
+
+The runtime worker — the one child process that executes submitted model
+code — runs under that Seatbelt profile: no network, no fork/exec beyond
+its own binary, writes confined to the workspace, and the hidden golden
+denied by literal path (`BENCH_GOLDEN_PATH`). A sandbox probe step
+re-verifies on every run — before any private material is fetched — that
+the host's `sandbox-exec` still denies golden reads, private-directory
+reads, non-workspace writes, network, and fork/exec under a worker-shaped
+profile. A fourth designed layer, a uid-scoped PF network-egress block on
+the bench account, is staged but currently deferred; see "Current posture
+and known gaps".
+
+## Between jobs: janitor, signed audit, quarantine
+
+After every job — pass or fail — the janitor resets and audits the box. It
+runs as the workflow's final always-on step, and the supervisor runs it
+again between runner registrations:
+
+- **Reset:** kill every bench-owned process, delete and recreate the bench
+  account from a root-owned template, and purge bench-owned scratch and the
+  per-job rendered sandbox profiles.
+- **Audit:** verify the cryptographic signature over a baseline manifest of
+  the protected surface (the sudoers bridge, the `/opt/bench` payload, PF
+  wiring, launch daemons, the runner install), then diff a fresh scan of
+  that surface against the manifest.
+
+Any drift writes a quarantine flag, fails the run loudly, and parks the
+supervisor with an operator alert. The workflow's first step refuses to
+start while the flag exists, so a quarantined box takes no further ranked
+jobs until an operator explains the drift or re-images the machine. A
+compromised host must never silently publish a score.
 
 ## Required GitHub setup
 
@@ -15,147 +116,189 @@ Configure the `benchmark-private-prompts` Environment with:
 - Deployment branches limited to `main` and `submissions/*` (the refs the
   benchmark orchestrator dispatches). Do not grant fork access.
 - Required reviewers for private benchmark runs.
-- R2 prompt manifest credentials:
+- R2 private-object credentials:
   - `R2_ACCESS_KEY_ID`
   - `R2_BUCKET_ENDPOINT`
   - `R2_SECRET_ACCESS_KEY`
 
-Normal private benchmark runs download the precomputed
+The single ranked job declares `environment: benchmark-private-prompts`, so
+the deployment-branch policy and required reviewers gate every run that can
+read those secrets. The semantic GPQA judge additionally requires the
+`ORG_ANTHROPIC_API_KEY` secret. All of these are consumed only by trusted
+runner steps: they are never exported across the bench-exec bridge (sudo
+resets the environment at the bridge, and the bridge's denylist
+double-guards), so the bench uid — and therefore submitted code — never
+sees them.
+
+## Private golden and GPQA handling
+
+Full benchmark dispatches (`run_benchmark=true`) download two objects from
+the private R2 bucket in a trusted step:
 `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json`
-object from the private R2 bucket. Full private benchmark runs also download
-`correctness_prompts/gpqa_reference_cases-gemma.json` from the same private bucket
-and merge it into the local golden as 5 hidden multiple-choice behavior gates.
+(the hidden teacher-forced base case) and
+`correctness_prompts/gpqa_reference_cases-gemma.json` (the hidden GPQA
+reference cases, merged into the golden as 5 behavior gates).
+Correctness-only dispatches (`run_benchmark=false`) fetch no private
+material at all. Both objects were regenerated from the Gemma 4 31B 4-bit
+reference on the ranked hardware through the organizer-controlled offline
+process; `docs/gemma-migration-r2-checklist.md` records the provenance and
+the current pins.
 
-> **Gemma migration status:** both R2 objects above have been regenerated
-> from the Gemma 4 31B 4-bit reference through the organizer-controlled
-> offline process; ranked runs pass once the regenerated objects are
-> uploaded to R2 (the workflow pins already match them). The
-> secret/credential model in this document is unchanged by the migration.
-> See `docs/gemma-migration-r2-checklist.md` for the full checklist.
+Raw private bytes land only in a runner-only `0700` per-run directory; the
+raw golden is verified against a pinned SHA-256 and byte count before use.
+The GPQA augmentation step (`attach-gpqa-gates`) executes code from the
+submitted build (it loads the tokenizer), so it runs through the bench-exec
+bridge like every other untrusted invocation: the raw inputs are copied
+into the workspace as runner-owned files and removed again immediately
+after, and the augmented golden is hash-anchored in the trusted shell the
+moment it is produced (the workspace copy must remain byte-identical to the
+trusted copy).
 
+Each GPQA case must carry accepted reference-model output tokens or
+responses; the GPQA answer key alone is never used as an exact-token
+correctness oracle. The workflow treats the R2 objects as immutable trusted
+inputs and never regenerates or uploads them; update them only through the
+organizer-controlled offline process. The private prompt manifest is only
+an organizer input for regenerating goldens outside the benchmark workflow.
+It is never written into the repository workspace, uploaded, or cached.
 
-Each GPQA case must carry accepted reference-model output tokens or responses;
-the GPQA answer key alone is not used as an exact-token correctness oracle.
-The benchmark workflow treats that file as immutable trusted input and never
-regenerates or uploads it. Update it only through an organizer-controlled
-offline process, then upload the reviewed JSON to private R2.
-The private prompt manifest is only an organizer input for regenerating the
-golden outside the benchmark workflow. It should not be written into the
-repository workspace, uploaded, or cached. The workflow writes downloaded
-private files only under `$RUNNER_TEMP` and uploads only golden hash and
-byte-count sidecars after a deny-list check rejects prompt, golden, GPQA, model,
-symlink, and oversized artifact paths.
+The public behavior gate (the drift tripwire against the checked-in public
+fixture) deliberately runs before any hidden material enters the bench
+workspace. During the correctness-plus-gates pass the only hidden file in
+the workspace is the augmented golden: the harness parent process (bench
+uid) must read it to drive teacher forcing, but the runtime worker that
+executes submitted model code is denied it by literal path. The hidden GPQA
+gate checks one generated token per case (the stable prefix of any longer
+precomputed reference sequence) and measures hidden GPQA TTFT from prompt
+prefill through the first greedy answer token; only aggregate TTFT fields
+are written to `score.json` — no prompt text, expected or generated token
+IDs, accepted token sets, or per-case prompt lengths.
 
-Hidden behavioral correctness cases should use short accepted token prefixes
-captured from the official reference model on the official runner. The GPQA
-gate checks one generated token per case, which avoids cross-machine drift after
-the first answer token while still checking behavior across all 5 hidden
-questions. Longer precomputed reference sequences may be kept in private R2; the
-workflow uses their stable prefix. During the hidden behavior correctness pass,
-the workflow also measures hidden GPQA TTFT from prompt prefill through the
-first greedy answer token and fails the run if that first token is not accepted.
-Only aggregate TTFT fields are written to `score.json`; they do not contain
-prompt text, expected token IDs, generated token IDs, accepted token sets, or
-per-case prompt lengths.
+The semantic GPQA judge runs as a trusted step after the gates pass has
+written its private answer capture. The Anthropic key never crosses the
+bridge, and only aggregate semantic pass counts and the judge model name
+are patched into `score.json`; prompts, references, candidate answers, and
+judge transcripts stay in private runner paths covered by the artifact
+deny-list. One documented residual: the answer capture (which embeds hidden
+reference answers) is written into the bench workspace by the harness
+parent at the very end of the gates pass, after every behavior verdict is
+already final; a trusted step scrubs it — together with the augmented
+golden and all other hidden material — before any later phase spawns
+another worker.
 
-The semantic GPQA judge runs after candidate answers are written into the
-private runner directory. Only aggregate semantic pass counts and the judge
-model name are patched into `score.json`; prompts, references, candidate
-answers, and judge transcripts remain private and are covered by artifact
-deny-list checks.
+## Timed measurement and score sealing
 
-The benchmark workflow verifies at runtime (see
-`enforce-trusted-benchmark-workflow.sh`) that it runs in this repository via a
-`workflow_dispatch` event. It benchmarks whatever ref it is dispatched on.
+The timed prefill/decode measurement runs last: after all compute-heavy
+correctness and gate work, after the hidden-material scrub, and after a
+quiescence wait (the job fails rather than start timing on a machine with
+residual load or GPU utilization). It is executed by a trusted,
+runner-owned measurement wrapper whose thermal-stability contract is fixed
+in the script itself — readonly, not environment-overridable: every timed
+phase (pinned baseline and candidate, plus any oracle generation) starts
+only once the GPU has cooled below 40C (waiting up to 900 seconds), runs
+under 2 Hz GPU telemetry, and is rejected if any loaded sample shows GPU
+clocks below 1600 MHz (throttling), if telemetry is missing, or if the
+sealed score shows token mismatches; one gated retry is allowed.
 
-Because the workflow runs the dispatched ref's own workflow file, the real
-boundary is the combination of:
+The measurement is paired: the pinned reference baseline tree provisioned
+on the box is measured back to back with the candidate behind the same
+thermal gate, and the ranked speedups are that paired ratio. A calibration
+sanity band plus a pinned baseline binary hash guard against a swapped or
+pathological baseline silently rescaling every ratio. A trusted overlay
+step (`overlay-paired-timing.sh`) then merges the measured paired timing
+into the sealed gates score and applies the decode/prefill speedup floors
+(kept in sync with the harness constants). The benchmark oracle used by the
+timed run is self-generated per submitted binary and cached by binary
+hash — input-independent implementation keying, not a hidden secret and not
+request-keyed memoization.
 
-- the benchmark orchestrator (Yukon eigenbot) being the only creator of
-  `submissions/*` branches, built from remotely validated `editablePaths` so
-  their non-`editablePaths` files match `main`;
-- the `Enforce modifiable surface` step re-verifying at runtime that a
-  `submissions/*` branch changes only `editablePaths` relative to `main`; and
-- restricting who can push `submissions/*` branches and dispatch the workflow.
-
-The `benchmark-private-prompts` Environment deployment-branch policy and required
-reviewers remain the gate on private-secret access.
-
-## Parallel job topology
-
-When dispatched with `run_benchmark=true`, the trust boundary above applies
-independently to 5 privileged jobs instead of one. Each of the following
-separately declares `environment: benchmark-private-prompts` and separately
-re-runs the trusted-workflow check, the submission-branch static review, the
-modifiable-surface enforcement, and the sandbox probe: `correctness-slice-1`,
-`correctness-slice-2`, `correctness-slice-3` (each running the reusable
-`benchmark-correctness-slice.yml`), and `benchmark-timing`, `benchmark-gates`
-(both running the reusable `benchmark-timing-or-gates.yml`). A sixth job,
-`combine`, has no `environment:` gate and no private-secret access — it only
-downloads the already-computed, already-authenticated outputs the 5 privileged
-jobs uploaded (after each independently validated its own content, see
-`benchmark-correctness-slice.yml`'s "Validate correctness slice artifacts" and
-`benchmark-timing-or-gates.yml`'s "Validate intermediate benchmark artifact"),
-merges them, and re-verifies the combined result before it may be staged or
-uploaded. A `validate-slice-ranges` job runs before the three correctness-slice
-jobs with no checkout and no secrets at all — it only validates the numeric
-range inputs. Dispatching with the default `run_benchmark=false` instead runs
-everything on the single `correctness-only` job described elsewhere in this
-document. Any future change to this topology that drops the environment gate,
-the trusted-workflow check, the static/modifiable-surface guards, or the
-per-job content-validation gate from one of the 5 privileged jobs — without an
-equivalent guard elsewhere — reopens the exact channels this document
-describes.
+Scores are sealed from process stdout: the score payload is what the
+benchmark process wrote to stdout, captured in the trusted shell and
+validated as exactly one JSON object shaped like a score, and the
+harness-authored integrity record's score hash is cross-checked against the
+sealed bytes. On-disk files inside the bench-writable workspace are
+untrusted once submitted code has run; later tampering with a workspace
+`score.json` is discarded.
 
 ## Submission flow
 
-The benchmark orchestrator (Yukon eigenbot) creates a `submissions/*` branch that
-differs from `main` only in `benchmark.json` `editablePaths`, then dispatches
-`benchmark.yml` on that branch. The workflow benchmarks the checked-out branch
-directly.
+The benchmark orchestrator (Yukon eigenbot) creates a `submissions/*`
+branch that differs from `main` only in `benchmark.json` `editablePaths`,
+then dispatches `benchmark.yml` on that branch. The workflow benchmarks the
+checked-out branch directly.
 
 On `submissions/*` branches the workflow additionally:
 
-- runs the static cheat review over the editable files the submission changed
-  versus its merge-base with `main` (`run-submission-static-review.sh`;
-  unchanged editable files are byte-identical to trusted `main` content and are
-  not sent to the judge — only a no-base local/manual run reviews the whole
-  editable surface),
-- enforces the modifiable surface against `main` (`enforce-modifiable-surface.sh`),
+- runs the static cheat review over the editable files the submission
+  changed versus its merge-base with `main`
+  (`run-submission-static-review.sh`; unchanged editable files are
+  byte-identical to trusted `main` content and are not sent to the judge),
+- enforces the modifiable surface against `main`
+  (`enforce-modifiable-surface.sh`),
 - suppresses submitted correctness/benchmark process logs, and
-- uploads correctness artifacts only after validation succeeds.
+- uploads artifacts only after validation succeeds.
 
-Maintainers can also dispatch the workflow on `main` (baseline) or a dev branch;
-those runs skip the submission-only guards.
+Maintainers can also dispatch the workflow on `main` (baseline) or a dev
+branch; those runs skip the submission-only guards.
 
 ## Output policy
 
 For `submissions/*` runs:
 
-- Correctness and benchmark process logs are redirected to private runner temp
-  files and are not uploaded.
+- Correctness and benchmark process logs are redirected to private runner
+  temp files and are not uploaded.
 - The workflow prints only fixed heartbeat lines while submitted code is
   running.
-- `score.json`, `benchmark-integrity.json`, and golden hash/byte sidecars are
-  uploaded only after strict schema and hash validation succeeds.
-- Correctness traces are disabled for full benchmark runs.
-- Timed benchmark model execution runs in a child worker process that is denied
-  network access and direct reads of the private golden path. Submitted model
-  code necessarily sees hidden prompt tokens and teacher-forced previous tokens
-  while doing inference, but it does not receive the golden file path. The
-  trusted harness validates the resulting `score.json` before upload.
+- `score.json`, `benchmark-integrity.json`, and golden hash/byte sidecars
+  are uploaded only after strict schema and hash validation succeeds, and a
+  deny-list check rejects prompt, golden, GPQA, model, symlink, and
+  oversized artifact paths before every upload.
+- A failing `score.json` is never uploaded raw (its error and token fields
+  can carry hidden-golden values or submitted-code-controlled content); a
+  redacted failure category is derived and uploaded instead so operators
+  can tell why a run failed.
+- Audit artifacts (paired timing results with telemetry aggregates, the
+  transformed-weights hash, the public tripwire report) carry only
+  workspace paths, commit ids, timings, and telemetry statistics, and pass
+  the same deny-list check.
 
-This prevents submitted code from using GitHub logs or uploaded artifacts as a
-direct prompt-exfiltration channel.
+This prevents submitted code from using GitHub logs or uploaded artifacts
+as a direct prompt-exfiltration channel.
+
+## Current posture and known gaps
+
+Stated plainly so this document does not overclaim:
+
+- **The bench-uid PF network-egress block is designed and staged but
+  currently deferred; it is not enabled on the box today.** Until it is
+  turned on, bench-uid processes outside the runtime worker (the build, the
+  transform, the harness parent) have network egress. The controls that are
+  active: the runtime worker that executes submitted model code is denied
+  network by its Seatbelt profile; SwiftPM dependencies are resolved by a
+  trusted step before submitted code runs, so nothing on the bench side
+  needs the network; secrets never enter the bench environment; and the
+  sealed-stdout score path, artifact deny-list, and failure redaction close
+  the upload channels. Enabling the PF block closes the remaining
+  parent-process egress channel; it is operator work on the box, not a
+  workflow change.
+- **The pinned baseline, its calibration, the reference checkpoint cache,
+  and the hidden goldens are provisioned state, not repository content.**
+  The baseline tree and its calibration live on the box and are regenerated
+  through the operator runbook (changing them is a ranking-contract
+  change). The reference checkpoint cache is hash-verified against the
+  pinned manifest on every run, so a corrupted or swapped cache can never
+  feed the transform. The hidden goldens live in private R2 and are
+  pin-verified on every download. After a re-image, all of this is
+  re-provisioned by the operator before the box returns to ranked service.
 
 ## Residual channel
 
 Submitted code still participates in inference on hidden prompt tokens. Any
-public feedback from that run, including pass/fail, score, timing, or repeated
-submission attempts, is a possible low-bandwidth covert channel. The workflow
-hardening above blocks direct extraction paths, but competition policy should
-still limit repeated private benchmark attempts and avoid exposing per-case
-failure details for hidden cases.
+public feedback from that run, including pass/fail, score, timing, or
+repeated submission attempts, is a possible low-bandwidth covert channel.
+The hardening above blocks direct extraction paths, but competition policy
+should still limit repeated private benchmark attempts and avoid exposing
+per-case failure details for hidden cases.
 
-No prompt manifest or generated correctness golden should be committed to the
-public repository.
+No prompt manifest or generated correctness golden should be committed to
+the public repository.
