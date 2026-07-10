@@ -62,30 +62,27 @@ jobs:
 
       - name: Shell syntax
         run: |
-          bash -n setup.sh
-          bash -n benchmark.sh
-          bash -n tools/build-mlx-metallib.sh
-          bash -n .github/scripts/enforce-trusted-benchmark-workflow.sh
-          bash -n .github/scripts/enforce-modifiable-surface.sh
-          bash -n .github/scripts/overlay-editable-paths.sh
-          bash -n .github/scripts/verify-correctness-golden.sh
-          bash -n .github/scripts/validate-benchmark-artifacts.sh
-          bash -n .github/scripts/run-semantic-gpqa-gate.sh
-          bash -n .github/scripts/run-submission-static-review.sh
-          bash -n .github/scripts/deny-private-artifacts.sh
-          bash -n .github/scripts/redact-benchmark-failure.sh
-          bash -n .github/scripts/stage-benchmark-artifacts.sh
-          bash -n .github/scripts/download-r2-object.sh
-          bash -n .github/scripts/upload-r2-object.sh
-          bash -n .github/scripts/download-reference-cache-scope.sh
-          bash -n .github/scripts/probe-runtime-worker-sandbox.sh
-          bash -n .github/scripts/hash-weights-directory.sh
-          bash -n .github/scripts/combine-parallel-correctness.sh
+          set -euo pipefail
+          while IFS= read -r -d '' script; do
+            case "$(head -n 1 "${script}")" in
+              '#!/usr/bin/env bash')
+                bash -n "${script}"
+                ;;
+              '#!/usr/bin/env sh')
+                sh -n "${script}"
+                ;;
+              *)
+                echo "unsupported shell script interpreter: ${script}" >&2
+                exit 1
+                ;;
+            esac
+          done < <(git ls-files -z '*.sh')
 
-      - name: Build release CLI
+      - name: Build release CLI and run unit tests without Metal runtime
         run: |
           mkdir -p .build/clang-module-cache
-          swift build -c release
+          swift test -c release
+          test -x .build/release/mlxfast-swift
 
       - name: Save SwiftPM cache
         if: steps.restore_swiftpm_cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
@@ -97,7 +94,3 @@ jobs:
             .build/artifacts
             .build/workspace-state.json
           key: ${{ steps.restore_swiftpm_cache.outputs.cache-primary-key }}
-
-      - name: Unit tests without Metal runtime
-        run: |
-          swift test --filter 'Transform|BenchmarkSupport|Golden|Score|CheckpointIndex|Safetensors|DenseTensorStore|gemma4Config|gemmaCorrectness|correctnessReport|TensorData|MLXTensorBridgeMaps'

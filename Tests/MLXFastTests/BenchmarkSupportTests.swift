@@ -966,7 +966,12 @@ func localIteratePhaseHeartbeatFiresWhileBlockedAndStopsAfterCancel() throws {
         )
     )
     Thread.sleep(forTimeInterval: 0.3)
+    let cancellationDrained = DispatchSemaphore(value: 0)
+    heartbeat.setCancelHandler {
+        cancellationDrained.signal()
+    }
     heartbeat.cancel()
+    #expect(cancellationDrained.wait(timeout: .now() + 1) == .success)
     let firedWhileRunning = box.snapshot()
     #expect(!firedWhileRunning.isEmpty)
     #expect(
@@ -975,7 +980,7 @@ func localIteratePhaseHeartbeatFiresWhileBlockedAndStopsAfterCancel() throws {
         }
     )
 
-    // After cancel the heartbeat must stay quiet.
+    // After cancellation has drained, the heartbeat must stay quiet.
     Thread.sleep(forTimeInterval: 0.2)
     #expect(box.snapshot().count == firedWhileRunning.count)
 }
