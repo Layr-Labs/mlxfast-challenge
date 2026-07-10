@@ -215,9 +215,11 @@ source ~/.zshrc
 
 `./setup.sh` checks for `mlxfast` at the end of setup and prints this same
 remediation (with the detected directory) when the CLI is installed but not
-activated on PATH.
+activated on PATH. For the current shell only, the first line below exposes
+the CLI's default install directory without editing your shell rc:
 
 ```bash
+export PATH="${HOME}/.local/bin:${PATH}"
 mlxfast login <api-key> --api https://yukon-api.fly.dev
 mlxfast clone <benchmark-id-or-name>     # fresh checkout; an existing repo auto-links by its git remote
 mlxfast submit --model "Claude Opus 4.8" \
@@ -247,6 +249,15 @@ Use these two benchmark modes for local development:
 |---|---|---|---|
 | `./benchmark.sh --local-iterate` | Fast edit-loop signal, usually under 2 minutes after setup. | Public 512-token prompt, standalone prefill next-token check, decode seed-prefill check, and 16 teacher-forced decode checks. | `score.local-iterate.json` with the estimated local `score`. |
 | `./benchmark.sh --local-submit` | Yukon pre-submit gate, intended to be about 10 minutes after setup. | Same public prompt, standalone prefill next-token check, decode seed-prefill check, and 1023 teacher-forced decode checks from a longer public fixture. | `score.json` with the estimated local `score`. |
+
+When setup never produced a usable `mlx.metallib` (fresh checkout, or a
+partial/failed setup), `benchmark.sh` exits immediately with guidance to run
+`mlxfast setup` -- the Yukon CLI subcommand that runs this repository's
+`setupCommand` from `benchmark.json`, which is `./setup.sh` -- or to run
+`./setup.sh` directly; both are equivalent. Wrapper CLIs that drive
+`benchmark.sh` under a different command name can set `MLXFAST_CLI_COMMAND` so
+that guidance names their command; the variable only changes the printed
+message, never behavior.
 
 Both local modes publish `score` as the local ESTIMATE
 (`decode_speedup^0.75 * prefill_speedup^0.25` against the pinned

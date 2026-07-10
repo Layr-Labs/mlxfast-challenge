@@ -76,6 +76,74 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
 }
 
 @Test
+func benchmarkFailsFastWhenSetupArtifactsAreMissing() throws {
+    let benchmark = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    let prerequisite = try #require(
+        benchmark.range(of: "if [[ ! -s \"${MLX_METALLIB}\" ]]")
+    )
+    let automaticBuild = try #require(
+        benchmark.range(of: "benchmark.sh: Swift release binary missing; building")
+    )
+    #expect(prerequisite.lowerBound < automaticBuild.lowerBound)
+
+    let guardBody = String(benchmark[prerequisite.lowerBound..<automaticBuild.lowerBound])
+    #expect(guardBody.contains("MLXFAST_CLI_COMMAND"))
+    #expect(guardBody.contains("exit 1"))
+}
+
+@Test
+func benchmarkRejectsPartialSetupBeforeInvokingExistingBinary() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let invocation = root.appendingPathComponent("swift-invoked")
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    touch "\(invocation.path)"
+    exit 99
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeSwift.path
+    )
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = ["benchmark.sh", "--local-iterate"]
+    process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    process.environment = benchmarkTestEnvironment([
+        "MLXFAST_NO_SANDBOX": "1",
+        "MLXFAST_SWIFT_BIN": fakeSwift.path,
+        "MLXFAST_MLX_METALLIB": root.appendingPathComponent("missing.metallib").path,
+        "MLXFAST_CLI_COMMAND": "mlxfast-dev",
+        "MLXFAST_SCORE_PATH": root.appendingPathComponent("score.json").path,
+        "MLXFAST_INTEGRITY_PATH": root.appendingPathComponent("integrity.json").path,
+    ])
+    let stderr = Pipe()
+    process.standardError = stderr
+
+    try process.run()
+    process.waitUntilExit()
+    let stderrText = String(
+        data: stderr.fileHandleForReading.readDataToEndOfFile(),
+        encoding: .utf8
+    ) ?? ""
+
+    #expect(process.terminationStatus != 0)
+    #expect(stderrText.contains("mlxfast-dev setup"))
+    #expect(!FileManager.default.fileExists(atPath: invocation.path))
+}
+
+@Test
+func participantDocsExposeDefaultCLIInstallDirectory() throws {
+    let pathExport = #"export PATH="${HOME}/.local/bin:${PATH}""#
+    for path in ["README.md", "TASK.md", "AGENTS.md", "CLAUDE.md"] {
+        let document = try String(contentsOfFile: path, encoding: .utf8)
+        #expect(document.contains(pathExport), "\(path) must expose the default CLI install directory")
+    }
+}
+
+@Test
 func rulesDocsQuoteCurrentSpeedupFloorLimits() throws {
     let readme = try String(contentsOfFile: "README.md", encoding: .utf8)
     let challenge = try String(contentsOfFile: "TASK.md", encoding: .utf8)
@@ -267,7 +335,15 @@ func benchmarkWorkflowProbesAndEnforcesRuntimeWorkerSandbox() throws {
     #expect(benchmark.contains("MLXFAST_OFFICIAL_BENCHMARK_RUN"))
     #expect(benchmark.contains("official GitHub benchmark runs must not set MLXFAST_NO_SANDBOX=1"))
     #expect(benchmark.contains("official GitHub benchmark runs must use the runtime worker sandbox"))
-    #expect(benchmark.contains("enforce_official_sandbox\n\nif [[ \"${MLXFAST_IN_SANDBOX:-0}\" != \"1\" && ! -x \"${SWIFT_BIN}\" ]]; then"))
+    let setupGuard = try #require(
+        benchmark.range(
+            of: "enforce_official_sandbox\n\nif [[ ! -s \"${MLX_METALLIB}\" ]]"
+        )
+    )
+    let automaticBuild = try #require(
+        benchmark.range(of: "if [[ \"${MLXFAST_IN_SANDBOX:-0}\" != \"1\" && ! -x \"${SWIFT_BIN}\" ]]; then")
+    )
+    #expect(setupGuard.lowerBound < automaticBuild.lowerBound)
 
     #expect(probe.contains("(deny network*)"))
     #expect(probe.contains("(deny process-fork)"))
@@ -3365,6 +3441,17 @@ private func temporaryDirectory() throws -> URL {
     return url
 }
 
+private let benchmarkTestMetallibPath: String = {
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "mlxfast-benchmark-script-tests-\(ProcessInfo.processInfo.processIdentifier).metallib"
+    )
+    _ = FileManager.default.createFile(
+        atPath: url.path,
+        contents: Data("fixture metallib".utf8)
+    )
+    return url.path
+}()
+
 private func benchmarkTestEnvironment(
     _ overrides: [String: String] = [:]
 ) -> [String: String] {
@@ -3373,5 +3460,6 @@ private func benchmarkTestEnvironment(
         environment.removeValue(forKey: key)
     }
     environment["MLXFAST_GPU_TEMP_CMD"] = "printf 39"
+    environment["MLXFAST_MLX_METALLIB"] = benchmarkTestMetallibPath
     return environment.merging(overrides) { _, new in new }
 }

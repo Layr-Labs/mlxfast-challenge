@@ -375,6 +375,177 @@ func setupReferenceCacheStampUsesUniqueAtomicTemporaryFiles() throws {
 }
 
 @Test
+func setupFallsBackWhenPrimaryReferenceDownloadFails() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let fakeBin = root.appendingPathComponent("bin")
+    try FileManager.default.createDirectory(at: fakeBin, withIntermediateDirectories: true)
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("curl"),
+        contents: """
+        #!/usr/bin/env bash
+        set -euo pipefail
+        output=""
+        url=""
+        while [[ "$#" -gt 0 ]]; do
+          case "$1" in
+            --output) output="$2"; shift 2 ;;
+            http*) url="$1"; shift ;;
+            *) shift ;;
+          esac
+        done
+        printf '%s\n' "${url}" >> "${CURL_LOG}"
+        if [[ "${url}" == https://primary.invalid/* ]]; then
+          exit 28
+        fi
+        printf 'fallback fixture' > "${output}"
+        """
+    )
+
+    let output = root.appendingPathComponent("model.bin")
+    let curlLog = root.appendingPathComponent("curl.log")
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        download_reference_file "model.bin" "${OUTPUT_PATH}"
+        [[ "$(cat "${OUTPUT_PATH}")" == "fallback fixture" ]]
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "PATH": "\(fakeBin.path):/usr/bin:/bin:/usr/sbin:/sbin",
+            "CURL_LOG": curlLog.path,
+            "OUTPUT_PATH": output.path,
+            "MLXFAST_REFERENCE_BASE_URL": "https://primary.invalid",
+            "MLXFAST_REFERENCE_FALLBACK_BASE_URL": "https://fallback.invalid",
+            "MLXFAST_REFERENCE_HASH_VERIFY": "0",
+            "MLXFAST_REFERENCE_DOWNLOAD_PROGRESS_SECONDS": "1",
+            "MLXFAST_REFERENCE_DOWNLOAD_STALL_SECONDS": "1",
+            "MLXFAST_REFERENCE_DOWNLOAD_MIN_BYTES_PER_SECOND": "1",
+        ]
+    )
+
+    #expect(result.status == 0, "stderr: \(result.stderr)")
+    let requests = try String(contentsOf: curlLog, encoding: .utf8)
+    #expect(requests.contains("https://primary.invalid/model.bin"))
+    #expect(requests.contains("https://fallback.invalid/model.bin"))
+    #expect(result.stdout.contains("trying fallback source"))
+}
+
+@Test
+func setupDownloadContractReportsProgressAndDetectsStalls() throws {
+    let setup = try String(contentsOfFile: "setup.sh", encoding: .utf8)
+
+    #expect(setup.contains("MLXFAST_REFERENCE_DOWNLOAD_PROGRESS_SECONDS"))
+    #expect(setup.contains("MLXFAST_REFERENCE_DOWNLOAD_STALL_SECONDS"))
+    #expect(setup.contains("MLXFAST_REFERENCE_DOWNLOAD_MIN_BYTES_PER_SECOND"))
+    #expect(setup.contains("--speed-limit"))
+    #expect(setup.contains("--speed-time"))
+    // The parallel shard phase has exactly one progress reporter: the
+    // aggregate heartbeat, which also carries the transfer rate and ETA.
+    #expect(setup.contains("still downloading safetensors shard(s)"))
+    #expect(setup.contains("rate=%.1f MiB/s eta=%ds"))
+}
+
+@Test
+func setupParallelShardDownloadsEmitProgress() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let fakeBin = root.appendingPathComponent("bin")
+    let output = root.appendingPathComponent("output")
+    try FileManager.default.createDirectory(at: fakeBin, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("curl"),
+        contents: """
+        #!/usr/bin/env bash
+        set -euo pipefail
+        output=""
+        while [[ "$#" -gt 0 ]]; do
+          case "$1" in
+            --output) output="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        for chunk in 1 2 3 4; do
+          printf 'chunk-%s\n' "${chunk}" >> "${output}"
+          sleep 0.45
+        done
+        """
+    )
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        download_reference_shards "${OUTPUT_DIR}" file-a.safetensors file-b.safetensors
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "PATH": "\(fakeBin.path):/usr/bin:/bin:/usr/sbin:/sbin",
+            "OUTPUT_DIR": output.path,
+            "MLXFAST_REFERENCE_BASE_URL": "https://primary.invalid",
+            "MLXFAST_REFERENCE_FALLBACK_BASE_URL": "",
+            "MLXFAST_REFERENCE_HASH_VERIFY": "0",
+            "MLXFAST_REFERENCE_DOWNLOAD_JOBS": "2",
+            "MLXFAST_REFERENCE_DOWNLOAD_PROGRESS_SECONDS": "1",
+            "MLXFAST_REFERENCE_DOWNLOAD_STALL_SECONDS": "5",
+            "MLXFAST_REFERENCE_DOWNLOAD_MIN_BYTES_PER_SECOND": "1",
+        ]
+    )
+
+    #expect(result.status == 0, "stderr: \(result.stderr)")
+    #expect(result.stdout.contains("still downloading safetensors shard(s)"))
+    #expect(FileManager.default.fileExists(atPath: output.appendingPathComponent("file-a.safetensors").path))
+    #expect(FileManager.default.fileExists(atPath: output.appendingPathComponent("file-b.safetensors").path))
+}
+
+@Test
+func setupRejectsCommandLineToolsWithFullXcodeInstructions() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let fakeBin = root.appendingPathComponent("bin")
+    try FileManager.default.createDirectory(at: fakeBin, withIntermediateDirectories: true)
+
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("swift"),
+        contents: """
+        #!/usr/bin/env bash
+        exit 0
+        """
+    )
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("xcodebuild"),
+        contents: """
+        #!/usr/bin/env bash
+        echo "xcode-select: error: tool 'xcodebuild' requires Xcode, but active developer directory '/Library/Developer/CommandLineTools' is a command line tools instance" >&2
+        exit 1
+        """
+    )
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("xcode-select"),
+        contents: """
+        #!/usr/bin/env bash
+        printf '/Library/Developer/CommandLineTools\n'
+        """
+    )
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        ensure_swift_toolchain
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "PATH": "\(fakeBin.path):/usr/bin:/bin:/usr/sbin:/sbin",
+        ]
+    )
+
+    #expect(result.status != 0)
+    #expect(result.stderr.contains("full Xcode is required"))
+    #expect(result.stderr.contains("Command Line Tools alone"))
+    #expect(result.stderr.contains("sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"))
+}
+
+@Test
 func setupUsesDownloadedMetalToolchainIdentifierForCompilerProbe() throws {
     let result = try runSetupBash(
         """

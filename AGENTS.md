@@ -318,6 +318,7 @@ change touches MLX runtime behavior and the machine can run those tests.
 Use Yukon/Darkbloom submit commands through the Yukon CLI:
 
 ```bash
+export PATH="${HOME}/.local/bin:${PATH}"
 mlxfast login <api-key> --api <url>
 mlxfast clone <benchmark-id-or-name>
 mlxfast submit --model "<model name>" --note "describe optimization"

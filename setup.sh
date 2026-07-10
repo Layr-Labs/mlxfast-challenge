@@ -9,13 +9,21 @@ REFERENCE_CACHE_REVISION_DIR="${REFERENCE_REVISION//\//--}"
 # No organizer-hosted mirror exists yet for this checkpoint; default straight
 # to the Darkbloom R2 mirror (mlx-challenge bucket), which serves the same
 # manifest-pinned files as the public Hugging Face repo with higher parallel
-# throughput; set MLXFAST_REFERENCE_BASE_URL to
-# https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main to fall
-# back to Hugging Face. download_url_for_file appends
+# throughput. Stalled or failed downloads automatically fall back to the public
+# Hugging Face source; set MLXFAST_REFERENCE_FALLBACK_BASE_URL empty to disable
+# that fallback. download_url_for_file appends
 # "?download=true" automatically for huggingface.co URLs so that resolves to
 # the raw LFS/Xet bytes.
 DEFAULT_REFERENCE_BASE_URL="https://ds4.darkbloom.ai/gemma-4-31b-4bit"
+DEFAULT_REFERENCE_FALLBACK_BASE_URL="https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main"
 REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}"
+if [[ -n "${MLXFAST_REFERENCE_FALLBACK_BASE_URL+x}" ]]; then
+  REFERENCE_FALLBACK_BASE_URL="${MLXFAST_REFERENCE_FALLBACK_BASE_URL}"
+elif [[ "${REFERENCE_BASE_URL}" == "${DEFAULT_REFERENCE_BASE_URL}" ]]; then
+  REFERENCE_FALLBACK_BASE_URL="${DEFAULT_REFERENCE_FALLBACK_BASE_URL}"
+else
+  REFERENCE_FALLBACK_BASE_URL=""
+fi
 REFERENCE_AUTH_HEADER="${MLXFAST_REFERENCE_AUTH_HEADER:-}"
 REFERENCE_APPEND_DOWNLOAD_QUERY="${MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY:-auto}"
 REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_gemma_4_31b_4bit.sha256}"
@@ -26,6 +34,9 @@ REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-40}"
 # 3 streams, and higher fan-out mostly adds contention on home connections.
 # Override with MLXFAST_REFERENCE_DOWNLOAD_JOBS.
 REFERENCE_DOWNLOAD_JOBS="${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-3}"
+REFERENCE_DOWNLOAD_PROGRESS_SECONDS="${MLXFAST_REFERENCE_DOWNLOAD_PROGRESS_SECONDS:-15}"
+REFERENCE_DOWNLOAD_STALL_SECONDS="${MLXFAST_REFERENCE_DOWNLOAD_STALL_SECONDS:-120}"
+REFERENCE_DOWNLOAD_MIN_BYTES_PER_SECOND="${MLXFAST_REFERENCE_DOWNLOAD_MIN_BYTES_PER_SECOND:-1048576}"
 # macmon is optional (it only powers benchmark.sh's local GPU cool-down gate).
 # When missing it is installed as a single pinned, hash-verified release
 # binary dropped in ~/bin -- the same location the ranked boxes use and one
@@ -101,6 +112,11 @@ Important environment variables:
                                      Default: ${REFERENCE_CACHE_DIR}
   MLXFAST_REFERENCE_BASE_URL         HTTP prefix for checkpoint files.
                                      Default: ${DEFAULT_REFERENCE_BASE_URL}
+  MLXFAST_REFERENCE_FALLBACK_BASE_URL
+                                     Fallback HTTP prefix after a failed or
+                                     stalled primary download. Set empty to
+                                     disable. Default with the built-in mirror:
+                                     ${DEFAULT_REFERENCE_FALLBACK_BASE_URL}
   MLXFAST_REFERENCE_MANIFEST_PATH    SHA256 manifest for the reference files.
                                      Default: ${REFERENCE_MANIFEST_PATH}
   MLXFAST_REFERENCE_CACHE_LOCK_PATH  Local stamp proving the checkpoint was
@@ -118,6 +134,16 @@ Important environment variables:
                                      Default: ${REFERENCE_CACHE_MUTATION_LOCK_STALE_SECONDS}
   MLXFAST_REFERENCE_DOWNLOAD_JOBS    Parallel safetensors downloads.
                                      Default: ${REFERENCE_DOWNLOAD_JOBS}
+  MLXFAST_REFERENCE_DOWNLOAD_PROGRESS_SECONDS
+                                     Download progress heartbeat interval.
+                                     Default: ${REFERENCE_DOWNLOAD_PROGRESS_SECONDS}
+  MLXFAST_REFERENCE_DOWNLOAD_STALL_SECONDS
+                                     Abort a transfer that remains below the
+                                     minimum rate for this long, then fall back.
+                                     Default: ${REFERENCE_DOWNLOAD_STALL_SECONDS}
+  MLXFAST_REFERENCE_DOWNLOAD_MIN_BYTES_PER_SECOND
+                                     Minimum sustained per-transfer byte rate.
+                                     Default: ${REFERENCE_DOWNLOAD_MIN_BYTES_PER_SECOND}
   MLXFAST_REFERENCE_MIN_FREE_GIB     Required free space before download.
                                      Default: ${REFERENCE_MIN_FREE_GIB}
   MLXFAST_REFERENCE_HASH_VERIFY=0    Skip reference SHA256 verification.
@@ -471,6 +497,7 @@ mlx.metallib needs. Install full Xcode from the App Store or
 https://developer.apple.com/xcode/, then select it and retry:
 
   sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+  sudo xcodebuild -runFirstLaunch
 
 EOF
         ;;
@@ -980,14 +1007,41 @@ write_reference_cache_lock() {
   echo "setup.sh: wrote reference cache lock ${lock_path}"
 }
 
+validate_reference_download_settings() {
+  local name
+  local value
+
+  for name in \
+    REFERENCE_DOWNLOAD_PROGRESS_SECONDS \
+    REFERENCE_DOWNLOAD_STALL_SECONDS \
+    REFERENCE_DOWNLOAD_MIN_BYTES_PER_SECOND; do
+    value="${!name}"
+    if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "setup.sh: ${name} must be a positive integer" >&2
+      return 1
+    fi
+  done
+}
+
 download_reference_file() {
   local file="$1"
   local output_path="$2"
   local label="${3:-${file}}"
   local marker_path="${output_path}.complete"
-  local url="${REFERENCE_BASE_URL%/}/${file}"
+  local base_url
+  local url
   local started_seconds
-  local attempt=1
+  local attempt
+  local curl_status
+  local source_index=0
+  local source_count
+  local base_urls=("${REFERENCE_BASE_URL}")
+
+  validate_reference_download_settings || return 1
+  if [[ -n "${REFERENCE_FALLBACK_BASE_URL}" && "${REFERENCE_FALLBACK_BASE_URL}" != "${REFERENCE_BASE_URL}" ]]; then
+    base_urls+=("${REFERENCE_FALLBACK_BASE_URL}")
+  fi
+  source_count="${#base_urls[@]}"
 
   if reference_file_is_current "${file}" "${output_path}" "${label}"; then
     echo "setup.sh: using cached ${label}"
@@ -996,54 +1050,72 @@ download_reference_file() {
   fi
   rm -f "${marker_path}" || return 1
 
-  if ! url="$(download_url_for_file "${url}")"; then
-    return 1
-  fi
-
   mkdir -p "$(dirname "${output_path}")" || return 1
   started_seconds="${SECONDS}"
-  while [[ "${attempt}" -le 2 ]]; do
-    if [[ "${attempt}" == "1" ]]; then
-      echo "setup.sh: downloading ${label}"
-    else
-      echo "setup.sh: redownloading ${label} from scratch after hash verification failed"
+  for base_url in "${base_urls[@]}"; do
+    source_index=$((source_index + 1))
+    url="${base_url%/}/${file}"
+    if ! url="$(download_url_for_file "${url}")"; then
+      return 1
+    fi
+
+    if [[ "${source_index}" -gt 1 ]]; then
+      echo "setup.sh: trying fallback source for ${label}: ${base_url}"
+    fi
+
+    attempt=1
+    while [[ "${attempt}" -le 2 ]]; do
+      if [[ "${attempt}" == "1" ]]; then
+        echo "setup.sh: downloading ${label}"
+      else
+        echo "setup.sh: redownloading ${label} from scratch after hash verification failed"
+        rm -f "${output_path}" "${marker_path}" || return 1
+      fi
+
+      curl_status=0
+      if [[ "${source_index}" == "1" && -n "${REFERENCE_AUTH_HEADER}" ]]; then
+        curl \
+          --fail \
+          --location \
+          --retry 5 \
+          --retry-all-errors \
+          --retry-delay 2 \
+          --continue-at - \
+          --speed-limit "${REFERENCE_DOWNLOAD_MIN_BYTES_PER_SECOND}" \
+          --speed-time "${REFERENCE_DOWNLOAD_STALL_SECONDS}" \
+          -H "${REFERENCE_AUTH_HEADER}" \
+          --output "${output_path}" \
+          "${url}" || curl_status=$?
+      else
+        curl \
+          --fail \
+          --location \
+          --retry 5 \
+          --retry-all-errors \
+          --retry-delay 2 \
+          --continue-at - \
+          --speed-limit "${REFERENCE_DOWNLOAD_MIN_BYTES_PER_SECOND}" \
+          --speed-time "${REFERENCE_DOWNLOAD_STALL_SECONDS}" \
+          --output "${output_path}" \
+          "${url}" || curl_status=$?
+      fi
+      if [[ "${curl_status}" != "0" ]]; then
+        echo "setup.sh: ${label} source failed or stalled (status=${curl_status}, source=${base_url})" >&2
+        break
+      fi
+      touch "${marker_path}" || return 1
+
+      if reference_file_is_current "${file}" "${output_path}" "${label}"; then
+        echo "setup.sh: downloaded ${label} elapsed=$(format_duration "$((SECONDS - started_seconds))")"
+        return 0
+      fi
+
+      attempt=$((attempt + 1))
+    done
+
+    if [[ "${source_index}" -lt "${source_count}" && "${curl_status}" == "0" ]]; then
       rm -f "${output_path}" "${marker_path}" || return 1
     fi
-
-    if [[ -n "${REFERENCE_AUTH_HEADER}" ]]; then
-      if ! curl \
-        --fail \
-        --location \
-        --retry 5 \
-        --retry-all-errors \
-        --retry-delay 2 \
-        --continue-at - \
-        -H "${REFERENCE_AUTH_HEADER}" \
-        --output "${output_path}" \
-        "${url}"; then
-        return 1
-      fi
-    else
-      if ! curl \
-        --fail \
-        --location \
-        --retry 5 \
-        --retry-all-errors \
-        --retry-delay 2 \
-        --continue-at - \
-        --output "${output_path}" \
-        "${url}"; then
-        return 1
-      fi
-    fi
-    touch "${marker_path}" || return 1
-
-    if reference_file_is_current "${file}" "${output_path}" "${label}"; then
-      echo "setup.sh: downloaded ${label} elapsed=$(format_duration "$((SECONDS - started_seconds))")"
-      return 0
-    fi
-
-    attempt=$((attempt + 1))
   done
 
   echo "setup.sh: failed to download verified ${label}" >&2
@@ -1062,38 +1134,68 @@ download_optional_reference_file() {
   echo "setup.sh: optional metadata ${file} was not available; continuing"
 }
 
+reference_download_on_disk_bytes() {
+  local output_dir="$1"
+  shift
+  local total_bytes=0
+  local file_path
+  local shard_file
+
+  for shard_file in "$@"; do
+    file_path="${output_dir}/${shard_file}"
+    if [[ -f "${file_path}" ]]; then
+      total_bytes=$((total_bytes + $(wc -c < "${file_path}" | tr -d ' ')))
+    fi
+  done
+  printf '%s\n' "${total_bytes}"
+}
+
 start_reference_download_heartbeat() {
   # A cold checkpoint download is ~17 GiB and the parallel per-shard curls run
-  # silenced, which used to mean 10+ minutes with no output at all. Poll the
-  # on-disk shard bytes every 15 seconds and print one aggregate progress line
-  # so participants can see the download is alive.
+  # silenced, which used to mean 10+ minutes with no output at all. This
+  # heartbeat is the single progress reporter for the parallel shard phase:
+  # every REFERENCE_DOWNLOAD_PROGRESS_SECONDS it sums the on-disk shard bytes
+  # and prints one aggregate line with percentage, transfer rate, and ETA.
+  # The baseline is sampled before the transfers start, so bytes resumed from
+  # an earlier interrupted run do not inflate the reported rate. The
+  # per-shard curls themselves stay --silent; stall detection is curl's
+  # --speed-limit/--speed-time, not this reporter.
   local output_dir="$1"
   local expected_total_bytes="$2"
   shift 2
   local heartbeat_started_seconds="${SECONDS}"
+  local initial_bytes
+
+  initial_bytes="$(reference_download_on_disk_bytes "${output_dir}" "$@")"
 
   (
     local downloaded_bytes
-    local file_path
-    local shard_file
+    local elapsed
     local progress
     while :; do
-      sleep 15
+      sleep "${REFERENCE_DOWNLOAD_PROGRESS_SECONDS}"
       kill -0 "$$" 2>/dev/null || exit 0
-      downloaded_bytes=0
-      for shard_file in "$@"; do
-        file_path="${output_dir}/${shard_file}"
-        if [[ -f "${file_path}" ]]; then
-          downloaded_bytes=$((downloaded_bytes + $(wc -c < "${file_path}" | tr -d ' ')))
-        fi
-      done
+      downloaded_bytes="$(reference_download_on_disk_bytes "${output_dir}" "$@")"
+      elapsed=$((SECONDS - heartbeat_started_seconds))
       if [[ "${expected_total_bytes}" -gt 0 ]]; then
-        progress="$(awk -v done="${downloaded_bytes}" -v total="${expected_total_bytes}" \
-          'BEGIN { printf "%.1f of %.1f GiB (%d%%)", done / 1073741824, total / 1073741824, (done * 100) / total }')"
+        progress="$(awk \
+          -v done="${downloaded_bytes}" \
+          -v total="${expected_total_bytes}" \
+          -v initial="${initial_bytes}" \
+          -v elapsed="${elapsed}" \
+          'BEGIN {
+            added = done - initial
+            if (added < 0) added = 0
+            rate = elapsed > 0 ? added / elapsed : 0
+            eta = (total > done && rate > 0) ? (total - done) / rate : 0
+            printf "%.1f of %.1f GiB (%d%%) rate=%.1f MiB/s eta=%ds", \
+              done / 1073741824, total / 1073741824, (done * 100) / total, \
+              rate / 1048576, eta
+          }')"
       else
         progress="$(awk -v done="${downloaded_bytes}" 'BEGIN { printf "%.1f GiB so far", done / 1073741824 }')"
       fi
-      echo "setup.sh: still downloading safetensors shard(s): ${progress} elapsed=$(format_duration "$((SECONDS - heartbeat_started_seconds))")"
+      echo "setup.sh: still downloading safetensors shard(s): ${progress} elapsed=$(format_duration "${elapsed}")"
     done
   ) &
   REFERENCE_DOWNLOAD_HEARTBEAT_PID="$!"
@@ -1118,6 +1220,7 @@ download_reference_shards() {
     echo "setup.sh: MLXFAST_REFERENCE_DOWNLOAD_JOBS must be a positive integer" >&2
     return 1
   fi
+  validate_reference_download_settings || return 1
 
   if [[ "${jobs}" == "1" || "$#" -le 1 ]]; then
     local file
@@ -1157,14 +1260,17 @@ download_reference_shards() {
   fi
 
   if [[ "${expected_total_bytes}" -gt 0 ]]; then
-    echo "setup.sh: downloading ${total} safetensors shard(s) with ${jobs} parallel job(s) ($(awk -v total="${expected_total_bytes}" 'BEGIN { printf "%.1f", total / 1073741824 }') GiB total; progress prints every 15s)"
+    echo "setup.sh: downloading ${total} safetensors shard(s) with ${jobs} parallel job(s) ($(awk -v total="${expected_total_bytes}" 'BEGIN { printf "%.1f", total / 1073741824 }') GiB total; progress prints every ${REFERENCE_DOWNLOAD_PROGRESS_SECONDS}s)"
   else
     echo "setup.sh: downloading ${total} safetensors shard(s) with ${jobs} parallel job(s)"
   fi
   export REFERENCE_BASE_URL
+  export REFERENCE_FALLBACK_BASE_URL
   export REFERENCE_AUTH_HEADER
   export REFERENCE_APPEND_DOWNLOAD_QUERY
   export REFERENCE_HASH_VERIFY
+  export REFERENCE_DOWNLOAD_STALL_SECONDS
+  export REFERENCE_DOWNLOAD_MIN_BYTES_PER_SECOND
   start_reference_download_heartbeat "${output_dir}" "${expected_total_bytes}" "$@"
   # The embedded program expands these variables in each child Bash process.
   # shellcheck disable=SC2016
@@ -1189,9 +1295,13 @@ download_reference_shards() {
     expected_size="${remainder#*|}"
     output_path="${output_dir}/${file}"
     marker_path="${output_path}.complete"
-    url="${REFERENCE_BASE_URL%/}/${file}"
     started_seconds="${SECONDS}"
-    attempt=1
+    source_index=0
+    base_urls=("${REFERENCE_BASE_URL}")
+    if [[ -n "${REFERENCE_FALLBACK_BASE_URL:-}" && "${REFERENCE_FALLBACK_BASE_URL}" != "${REFERENCE_BASE_URL}" ]]; then
+      base_urls+=("${REFERENCE_FALLBACK_BASE_URL}")
+    fi
+    source_count="${#base_urls[@]}"
 
     download_url_for_file() {
       local url="$1"
@@ -1224,6 +1334,36 @@ download_reference_shards() {
       fi
 
       printf "%s\n" "${url}"
+    }
+
+    # Fetch one source attempt for this shard. Stall abort is delegated to
+    # curl (--speed-limit/--speed-time); the transfer itself stays --silent
+    # because the aggregate heartbeat in the parent process is the single
+    # progress reporter for the parallel shard phase. The auth header is only
+    # ever sent to the primary (private mirror) source; the public fallback
+    # must not receive those credentials.
+    fetch_shard_from_source() {
+      local download_url="$1"
+      local source_label="$2"
+      local curl_args=(
+        --fail
+        --location
+        --retry 5
+        --retry-all-errors
+        --retry-delay 2
+        --continue-at -
+        --speed-limit "${REFERENCE_DOWNLOAD_MIN_BYTES_PER_SECOND}"
+        --speed-time "${REFERENCE_DOWNLOAD_STALL_SECONDS}"
+        --silent
+        --show-error
+        --output "${output_path}"
+      )
+
+      if [[ "${source_label}" == "primary" && -n "${REFERENCE_AUTH_HEADER:-}" ]]; then
+        curl_args+=(-H "${REFERENCE_AUTH_HEADER}")
+      fi
+
+      curl "${curl_args[@]}" "${download_url}"
     }
 
     reference_file_is_current() {
@@ -1274,51 +1414,50 @@ download_reference_shards() {
     fi
     rm -f "${marker_path}"
 
-    url="$(download_url_for_file "${url}")"
-
     mkdir -p "$(dirname "${output_path}")"
-    while [[ "${attempt}" -le 2 ]]; do
-      if [[ "${attempt}" == "1" ]]; then
-        echo "setup.sh: downloading shard ${ordinal}/${total}: ${file}"
-      else
-        echo "setup.sh: redownloading shard ${ordinal}/${total}: ${file} from scratch after hash verification failed"
+    for base_url in "${base_urls[@]}"; do
+      source_index=$((source_index + 1))
+      source_label="primary"
+      if [[ "${source_index}" -gt 1 ]]; then
+        source_label="fallback"
+        echo "setup.sh: trying fallback source for shard ${ordinal}/${total}: ${file}: ${base_url}"
+      fi
+      url="${base_url%/}/${file}"
+      url="$(download_url_for_file "${url}")"
+
+      attempt=1
+      while [[ "${attempt}" -le 2 ]]; do
+        if [[ "${attempt}" == "1" ]]; then
+          echo "setup.sh: downloading shard ${ordinal}/${total}: ${file} source=${source_label}"
+        else
+          echo "setup.sh: redownloading shard ${ordinal}/${total}: ${file} from scratch after hash verification failed"
+          rm -f "${output_path}" "${marker_path}"
+        fi
+
+        curl_status=0
+        fetch_shard_from_source "${url}" "${source_label}" || curl_status=$?
+        if [[ "${curl_status}" != "0" ]]; then
+          echo "setup.sh: shard ${ordinal}/${total} source failed or stalled (status=${curl_status}, source=${base_url})" >&2
+          if [[ "${source_label}" == "fallback" && "${attempt}" == "1" ]]; then
+            rm -f "${output_path}" "${marker_path}"
+            attempt=$((attempt + 1))
+            continue
+          fi
+          break
+        fi
+        touch "${marker_path}"
+
+        if reference_file_is_current; then
+          echo "setup.sh: downloaded shard ${ordinal}/${total}: ${file} elapsed=$((SECONDS - started_seconds))s source=${source_label}"
+          exit 0
+        fi
+
+        attempt=$((attempt + 1))
+      done
+
+      if [[ "${source_index}" -lt "${source_count}" && "${curl_status}" == "0" ]]; then
         rm -f "${output_path}" "${marker_path}"
       fi
-
-      if [[ -n "${REFERENCE_AUTH_HEADER:-}" ]]; then
-        curl \
-          --fail \
-          --location \
-          --retry 5 \
-          --retry-all-errors \
-          --retry-delay 2 \
-          --continue-at - \
-          --silent \
-          --show-error \
-          -H "${REFERENCE_AUTH_HEADER}" \
-          --output "${output_path}" \
-          "${url}"
-      else
-        curl \
-          --fail \
-          --location \
-          --retry 5 \
-          --retry-all-errors \
-          --retry-delay 2 \
-          --continue-at - \
-          --silent \
-          --show-error \
-          --output "${output_path}" \
-          "${url}"
-      fi
-      touch "${marker_path}"
-
-      if reference_file_is_current; then
-        echo "setup.sh: downloaded shard ${ordinal}/${total}: ${file} elapsed=$((SECONDS - started_seconds))s"
-        exit 0
-      fi
-
-      attempt=$((attempt + 1))
     done
 
     echo "setup.sh: failed to download verified shard ${ordinal}/${total}: ${file}" >&2

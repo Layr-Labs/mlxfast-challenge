@@ -152,9 +152,11 @@ Account and submission management — login, clone, submit, and listing
 submissions — are handled by the **Yukon CLI (`mlxfast`)**, not by
 `mlxfast-swift`. The Swift binary now runs the benchmark domain only (transform,
 correctness, benchmark, preflight, verify-transform); it no longer logs in or
-uploads. Submit with:
+uploads. The CLI installer defaults to `~/.local/bin`, so expose that directory
+in the current shell before using it. Submit with:
 
 ```bash
+export PATH="${HOME}/.local/bin:${PATH}"
 mlxfast login <api-key> --api <url>
 mlxfast clone <benchmark-id-or-name>     # fresh checkout; an existing repo auto-links by its git remote
 mlxfast submit --model "<model name>" --note "..."

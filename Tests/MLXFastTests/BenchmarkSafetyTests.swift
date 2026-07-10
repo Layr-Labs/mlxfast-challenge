@@ -492,6 +492,7 @@ private struct BenchmarkScriptFixture {
     let reference: URL
     let golden: URL
     let swift: URL
+    let metallib: URL
     let score: URL
     let integrity: URL
 }
@@ -505,6 +506,7 @@ private func makeBenchmarkScriptFixture(
     let reference = root.appendingPathComponent("reference")
     let golden = root.appendingPathComponent("golden.json")
     let swift = root.appendingPathComponent("mlxfast-swift")
+    let metallib = root.appendingPathComponent("mlx.metallib")
     let score = root.appendingPathComponent("score.json")
     let integrity = root.appendingPathComponent("integrity.json")
     try FileManager.default.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
@@ -537,6 +539,7 @@ private func makeBenchmarkScriptFixture(
     try "{}".write(to: weights.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
     try "{}".write(to: reference.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
     try "{}".write(to: golden, atomically: true, encoding: .utf8)
+    try "fixture metallib".write(to: metallib, atomically: true, encoding: .utf8)
     return BenchmarkScriptFixture(
         root: root,
         workingDirectory: workingDirectory,
@@ -544,6 +547,7 @@ private func makeBenchmarkScriptFixture(
         reference: reference,
         golden: golden,
         swift: swift,
+        metallib: metallib,
         score: score,
         integrity: integrity
     )
@@ -565,6 +569,7 @@ private func runBenchmarkScript(
         "MLXFAST_NO_SANDBOX": "1",
         "MLXFAST_LOCAL_COOL_GATE": "0",
         "MLXFAST_SWIFT_BIN": fixture.swift.path,
+        "MLXFAST_MLX_METALLIB": fixture.metallib.path,
         "MLXFAST_WEIGHTS_PATH": fixture.weights.path,
         "MLXFAST_REFERENCE_DIR": fixture.reference.path,
         "MLXFAST_CORRECTNESS_GOLDEN_PATH": fixture.golden.path,

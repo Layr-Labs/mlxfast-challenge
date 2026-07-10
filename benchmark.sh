@@ -788,6 +788,24 @@ assert_safe_output_file_path \
 
 enforce_official_sandbox
 
+if [[ ! -s "${MLX_METALLIB}" ]]; then
+  # Fail fast when setup never completed (fresh checkout) or completed only
+  # partially: without mlx.metallib the runtime worker cannot run, so stop
+  # before the automatic `swift build` below spends minutes producing an
+  # unusable worker. MLXFAST_CLI_COMMAND only renames the CLI printed in
+  # this guidance (wrapper CLIs that drive benchmark.sh under another name
+  # set it); it never changes behavior. The Yukon CLI's `setup` subcommand
+  # runs this repository's benchmark.json setupCommand, which is ./setup.sh,
+  # so both suggested commands are equivalent.
+  cli_command="${MLXFAST_CLI_COMMAND:-mlxfast}"
+  echo "benchmark.sh: setup is incomplete; MLX metallib is missing at ${MLX_METALLIB}" >&2
+  echo "Run setup before benchmarking:" >&2
+  echo "  ${cli_command} setup" >&2
+  echo "or run the repository setup directly:" >&2
+  echo "  ./setup.sh" >&2
+  exit 1
+fi
+
 if [[ "${MLXFAST_IN_SANDBOX:-0}" != "1" && ! -x "${SWIFT_BIN}" ]]; then
   echo "benchmark.sh: Swift release binary missing; building"
   mkdir -p .build/clang-module-cache
@@ -834,10 +852,6 @@ report_local_iterate_git_base
 if [[ ! -x "${SWIFT_BIN}" ]]; then
   echo "benchmark.sh: Swift release binary missing at ${SWIFT_BIN}" >&2
   exit 1
-fi
-
-if [[ ! -f "${MLX_METALLIB}" ]]; then
-  echo "benchmark.sh: MLX metallib missing at ${MLX_METALLIB}; run ./setup.sh before ranked benchmark runs" >&2
 fi
 
 write_runtime_worker_sandbox_profile
