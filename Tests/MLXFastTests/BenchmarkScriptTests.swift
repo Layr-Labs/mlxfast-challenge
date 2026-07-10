@@ -36,7 +36,7 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("start_mlx_metallib_build"))
     #expect(setup.contains("MLXFAST_SETUP_PARALLEL_METALLIB must be 0 or 1"))
     #expect(setup.contains("setup.sh: mlx.metallib build running in background"))
-    let mainRange = try #require(setup.range(of: "ensure_swift_toolchain\ntrap cleanup_background_builds EXIT"))
+    let mainRange = try #require(setup.range(of: "ensure_swift_toolchain\nensure_macmon\ntrap cleanup_background_builds EXIT"))
     let main = String(setup[mainRange.lowerBound...])
     #expect(main.contains("build_swift_harness\nstart_mlx_metallib_build\ndownload_reference_weights \"${REFERENCE_DIR}\""))
     #expect(setup.contains("setup.sh: setup complete elapsed="))
@@ -2184,9 +2184,10 @@ func benchmarkScriptPrintsLocalSummaryWithBaselineComparison() throws {
     let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
     #expect(script.contains("report_local_score_summary() {"))
     #expect(script.contains("cat \"${SCORE_PATH}\"\n  report_local_score_summary"))
-    // The baseline context prints BEFORE the timed run starts.
+    // The baseline context prints BEFORE the timed run starts, with the
+    // local GPU cool-down gate between it and the timed swift invocation.
     #expect(script.contains("report_local_baseline_context() {"))
-    #expect(script.contains("report_local_baseline_context\n\n\"${SWIFT_BIN}\" benchmark"))
+    #expect(script.contains("report_local_baseline_context\nrun_local_cool_gate\n\n\"${SWIFT_BIN}\" benchmark"))
 
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
