@@ -308,6 +308,16 @@ jobs:
           fi
           echo "benchmark: reference checkpoint verified against pinned manifest (${checked} files)"
 
+      - name: Restore trusted SwiftPM dependency cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-trusted-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+
       # Copy the dispatched checkout into the bench job root and resolve SwiftPM
       # dependencies THERE while still trusted-and-networked (the bench uid has
       # a PF egress block, so `swift build` under bench must find everything

@@ -104,15 +104,21 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(buildRange.lowerBound < transformRange.lowerBound)
     #expect(transformRange.lowerBound < hashWeightsRange.lowerBound)
 
-    // The reference comes from the runner-owned cache, never a download: no
-    // setup.sh invocation, no SwiftPM cache actions, full manifest hashing.
+    // The reference comes from the runner-owned cache, never a download. The
+    // dependency-only SwiftPM cache is restored before the checkout is copied
+    // into the bench workspace; ranked jobs never save submission build output.
     #expect(workflow.contains("MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main"))
     #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256"))
     #expect(workflow.contains("shasum -a 256 \"${path}\""))
     #expect(workflow.contains("reference checkpoint failed manifest verification"))
     #expect(!workflow.contains("./setup.sh"))
-    #expect(!workflow.contains("actions/cache/restore"))
+    #expect(workflow.contains("- name: Restore trusted SwiftPM dependency cache"))
+    #expect(workflow.contains("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
+    #expect(workflow.contains("key: swiftpm-trusted-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}"))
     #expect(!workflow.contains("actions/cache/save"))
+    let restoreCacheRange = try #require(workflow.range(of: "- name: Restore trusted SwiftPM dependency cache"))
+    #expect(verifyReferenceRange.lowerBound < restoreCacheRange.lowerBound)
+    #expect(restoreCacheRange.lowerBound < prepareWorkspaceRange.lowerBound)
 
     // Dependencies are pre-fetched in the trusted shell; build and transform
     // both execute as the bench uid through the bridge.
@@ -127,13 +133,15 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(transformStep.contains("--output weights"))
     #expect(transformStep.contains("test -f \"${MLXFAST_JOB_WS}/weights/config.json\""))
 
-    // ci.yml keeps its own SwiftPM cache and PR-safety configuration.
+    // ci.yml is the sole producer for the trusted cache namespace. Pull
+    // requests may restore it, but only main can save dependency contents.
     #expect(ci.contains("push:\n    branches:\n      - main"))
     #expect(ci.contains("- name: Restore SwiftPM cache"))
     #expect(ci.contains("- name: Save SwiftPM cache"))
-    #expect(ci.contains("github.event.pull_request.head.repo.full_name == github.repository"))
     #expect(ci.contains("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
     #expect(ci.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
+    #expect(ci.contains("key: swiftpm-trusted-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}"))
+    #expect(ci.contains("github.ref == 'refs/heads/main'"))
     #expect(ci.contains(".build/checkouts"))
     #expect(ci.contains(".build/repositories"))
     #expect(ci.contains(".build/artifacts"))

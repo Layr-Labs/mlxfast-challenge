@@ -40,9 +40,9 @@ jobs:
             .build/repositories
             .build/artifacts
             .build/workspace-state.json
-          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          key: swiftpm-trusted-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
           restore-keys: |
-            swiftpm-${{ runner.os }}-${{ runner.arch }}-
+            swiftpm-trusted-v1-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Enforce contestant modifiable surface
         if: startsWith(github.head_ref, 'submissions/') || startsWith(github.ref_name, 'submissions/')
@@ -88,7 +88,7 @@ jobs:
           swift build -c release
 
       - name: Save SwiftPM cache
-        if: steps.restore_swiftpm_cache.outputs.cache-hit != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        if: steps.restore_swiftpm_cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
