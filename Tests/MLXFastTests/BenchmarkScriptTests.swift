@@ -42,6 +42,37 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("setup.sh: setup complete elapsed="))
     #expect(setup.contains("MLXFAST_OFFLINE_WRITABLE_PATHS=\"${PWD}/weights\" .github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference \"${REFERENCE_DIR}\" --output weights"))
     #expect(setup.contains("${SWIFT_BIN} correctness --weights weights"))
+
+    // macmon is optional (local thermal cool-gate only): installed as a
+    // pinned, hash-verified release binary dropped in ~/bin -- a location
+    // benchmark.sh's gate lookup already searches -- and never through
+    // Homebrew, so a normal setup run cannot mutate global Homebrew state.
+    #expect(setup.contains("MACMON_RELEASE_URL=\"https://github.com/vladkens/macmon/releases/download/v${MACMON_VERSION}/macmon-v${MACMON_VERSION}.tar.gz\""))
+    #expect(setup.contains("MACMON_RELEASE_SHA256="))
+    #expect(setup.contains("MACMON_INSTALL_DIR=\"${HOME}/bin\""))
+    #expect(setup.contains("install_macmon_release"))
+    #expect(setup.contains("macmon release sha256 mismatch"))
+    #expect(setup.contains("MLXFAST_SKIP_MACMON_INSTALL"))
+    #expect(!setup.contains("brew install macmon"))
+
+    // A CLT-only machine (xcodebuild present but "requires Xcode") must be
+    // diagnosed as missing full Xcode, distinct from an unaccepted license.
+    #expect(setup.contains("command line tools instance"))
+    #expect(setup.contains("sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"))
+    #expect(setup.contains("sudo xcodebuild -license accept"))
+
+    // The cold ~17 GiB parallel shard download prints an aggregate progress
+    // heartbeat instead of going silent for the whole transfer.
+    #expect(setup.contains("start_reference_download_heartbeat \"${output_dir}\" \"${expected_total_bytes}\" \"$@\""))
+    #expect(setup.contains("stop_reference_download_heartbeat"))
+    #expect(setup.contains("still downloading safetensors shard(s)"))
+
+    // The Yukon submission CLI (mlxfast) is installed by the external Yukon
+    // installer; setup only surfaces install/PATH-activation guidance and
+    // must never fail because of it.
+    #expect(main.contains("wait_for_mlx_metallib_build\ncheck_mlxfast_cli\nprint_setup_summary \"ready\""))
+    #expect(setup.contains("is not on PATH, so"))
+    #expect(setup.contains("external Yukon installer"))
 }
 
 @Test

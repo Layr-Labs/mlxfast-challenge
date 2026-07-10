@@ -203,6 +203,20 @@ manages your account and uploads across all Yukon benchmarks. The
 `mlxfast-swift` binary runs the benchmark domain only (transform, correctness,
 benchmark, preflight, verify-transform) and no longer logs in or uploads.
 
+The `mlxfast` CLI is installed by the external Yukon installer from your
+challenge onboarding instructions, not by this repository or `./setup.sh`. If
+`mlxfast` is not found after installing it, the installer's bin directory
+(typically `~/.local/bin`) is not on your PATH; activate it with:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+`./setup.sh` checks for `mlxfast` at the end of setup and prints this same
+remediation (with the detected directory) when the CLI is installed but not
+activated on PATH.
+
 ```bash
 mlxfast login <api-key> --api https://yukon-api.fly.dev
 mlxfast clone <benchmark-id-or-name>     # fresh checkout; an existing repo auto-links by its git remote

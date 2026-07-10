@@ -26,6 +26,16 @@ REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-40}"
 # 3 streams, and higher fan-out mostly adds contention on home connections.
 # Override with MLXFAST_REFERENCE_DOWNLOAD_JOBS.
 REFERENCE_DOWNLOAD_JOBS="${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-3}"
+# macmon is optional (it only powers benchmark.sh's local GPU cool-down gate).
+# When missing it is installed as a single pinned, hash-verified release
+# binary dropped in ~/bin -- the same location the ranked boxes use and one
+# benchmark.sh's gate lookup already searches -- never through Homebrew, so a
+# normal setup run cannot mutate global Homebrew state (taps, dependencies,
+# upgrades) for an optional tool. MLXFAST_SKIP_MACMON_INSTALL=1 skips it.
+MACMON_VERSION="0.7.2"
+MACMON_RELEASE_URL="https://github.com/vladkens/macmon/releases/download/v${MACMON_VERSION}/macmon-v${MACMON_VERSION}.tar.gz"
+MACMON_RELEASE_SHA256="c79fdc7ab02b456b897dcc3ea041678420d7a1d5bd669aaac36fda3885572ad6"
+MACMON_INSTALL_DIR="${HOME}/bin"
 SETUP_PARALLEL_METALLIB="${MLXFAST_SETUP_PARALLEL_METALLIB:-${MLXFAST_SETUP_PARALLEL_BUILD:-1}}"
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
 MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
@@ -60,6 +70,7 @@ SETUP_STARTED_SECONDS="${SECONDS}"
 METALLIB_BUILD_PID=""
 METALLIB_BUILD_STATE="not_started"
 REFERENCE_CACHE_MUTATION_LOCK_HELD=0
+REFERENCE_DOWNLOAD_HEARTBEAT_PID=""
 REFERENCE_REQUIRED_METADATA_FILES=(
   "config.json"
   "model.safetensors.index.json"
@@ -123,6 +134,10 @@ Important environment variables:
   MLXFAST_SKIP_MACMON_INSTALL=1      Do not install macmon (the GPU temperature
                                      reader benchmark.sh's local cool-down gate
                                      uses; the gate is skipped when absent).
+                                     When not skipped, macmon is installed as a
+                                     pinned, hash-verified release binary in
+                                     ~/bin; setup.sh never installs it through
+                                     Homebrew.
 
 After setup:
   MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" .github/scripts/run-offline.sh .build/release/mlxfast-swift transform --output weights
@@ -336,50 +351,88 @@ find_macmon() {
   return 1
 }
 
+install_macmon_release() {
+  # Self-contained install: fetch the pinned macmon release tarball, verify
+  # its SHA256 against the pin above, and drop the single arm64 binary in
+  # ~/bin -- a location both find_macmon here and benchmark.sh's cool-gate
+  # lookup already search, and the same drop convention the ranked boxes use.
+  # Deliberately no Homebrew: installing an optional tool must not tap,
+  # upgrade, or otherwise mutate the user's global package state.
+  local staging_dir
+  local tarball
+  local actual_hash
+
+  command -v curl >/dev/null 2>&1 || return 1
+  staging_dir="$(mktemp -d "${TMPDIR:-/tmp}/mlxfast-macmon.XXXXXX")" || return 1
+  tarball="${staging_dir}/macmon.tar.gz"
+
+  if ! curl \
+      --fail \
+      --location \
+      --silent \
+      --show-error \
+      --retry 3 \
+      --retry-delay 2 \
+      --output "${tarball}" \
+      "${MACMON_RELEASE_URL}"; then
+    rm -rf "${staging_dir}"
+    return 1
+  fi
+
+  actual_hash="$(shasum -a 256 "${tarball}" | awk '{print $1}')"
+  if [[ "${actual_hash}" != "${MACMON_RELEASE_SHA256}" ]]; then
+    echo "setup.sh: macmon release sha256 mismatch (expected ${MACMON_RELEASE_SHA256}, got ${actual_hash}); not installing" >&2
+    rm -rf "${staging_dir}"
+    return 1
+  fi
+
+  if ! tar -xzf "${tarball}" -C "${staging_dir}" macmon \
+      || [[ ! -f "${staging_dir}/macmon" ]]; then
+    rm -rf "${staging_dir}"
+    return 1
+  fi
+
+  if ! mkdir -p "${MACMON_INSTALL_DIR}" \
+      || ! chmod 0755 "${staging_dir}/macmon" \
+      || ! mv -f "${staging_dir}/macmon" "${MACMON_INSTALL_DIR}/macmon"; then
+    rm -rf "${staging_dir}"
+    return 1
+  fi
+
+  rm -rf "${staging_dir}"
+}
+
 ensure_macmon() {
   # macmon (https://github.com/vladkens/macmon) is the unprivileged GPU
   # temperature reader benchmark.sh's local cool-down gate uses to mirror the
   # ranked runner's 40C thermal gate. It is NOT required to run the benchmark:
   # if it stays missing, benchmark.sh warns and skips the gate, so a failed
-  # install must never fail setup.
+  # install must never fail setup. The install stays on by default because
+  # benchmark.sh directs participants to rerun ./setup.sh to get macmon, but
+  # it is a pinned ~/bin binary drop, never a Homebrew mutation.
   local macmon_path
   if macmon_path="$(find_macmon)"; then
     echo "setup.sh: macmon found at ${macmon_path} (GPU cool-down gate enabled for local benchmark modes)"
     return 0
   fi
 
-  # Auto-install only when Homebrew is already available: unlike cmake (a hard
-  # build requirement that justifies bootstrapping Homebrew), macmon is
-  # optional, so a missing brew only downgrades this to instructions.
   if [[ "${MLXFAST_SKIP_MACMON_INSTALL:-0}" != "1" && "$(uname -s)" == "Darwin" ]]; then
-    if command -v brew >/dev/null 2>&1 || load_homebrew_shellenv; then
-      echo "setup.sh: installing macmon with Homebrew (GPU temperature reader for the local benchmark cool-down gate)"
-      brew install macmon || true
-    fi
+    echo "setup.sh: installing macmon v${MACMON_VERSION} to ${MACMON_INSTALL_DIR}/macmon (GPU temperature reader for the local benchmark cool-down gate)"
+    install_macmon_release || true
     if macmon_path="$(find_macmon)"; then
       echo "setup.sh: macmon installed at ${macmon_path}"
       return 0
     fi
   fi
 
-  cat >&2 <<'EOF'
-setup.sh: warning: macmon is not installed.
-
-benchmark.sh's local modes (--local-iterate / --local-submit) use macmon to
-wait for the GPU to cool below 40C before timing, mirroring the ranked
-runner's thermal gate. Without it the gate is skipped and hot back-to-back
-runs can report misleading timings. Install it with:
-
-  brew install macmon
-
-or download a release from https://github.com/vladkens/macmon and put it on
-PATH (or set MLXFAST_MACMON_BIN=/path/to/macmon).
-
-EOF
+  echo "setup.sh: macmon not found; benchmark.sh's local GPU cool-down thermal gate will be skipped (install macmon on PATH or in ~/bin, or set MLXFAST_MACMON_BIN, to enable it)" >&2
   return 0
 }
 
 ensure_swift_toolchain() {
+  local developer_dir
+  local xcodebuild_output
+
   if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "setup.sh: this Swift harness targets macOS on Apple Silicon" >&2
     exit 1
@@ -400,15 +453,52 @@ ensure_swift_toolchain() {
     exit 1
   fi
 
-  if ! xcodebuild -version >/dev/null 2>&1; then
-    cat >&2 <<EOF
-setup.sh: xcodebuild is installed but not usable.
+  # Diagnose the actual xcodebuild failure instead of mapping everything to
+  # an unaccepted license. On a machine with only the Command Line Tools,
+  # xcodebuild exists as a shim but fails with "requires Xcode, but active
+  # developer directory ... is a command line tools instance" -- that is a
+  # missing/unselected full Xcode, not a license problem.
+  if ! xcodebuild_output="$(xcodebuild -version 2>&1)"; then
+    developer_dir="$(xcode-select -p 2>/dev/null || true)"
+    case "${xcodebuild_output}" in
+      *"command line tools instance"*|*"requires Xcode"*)
+        cat >&2 <<EOF
+setup.sh: full Xcode is required, but the active developer directory is the
+Command Line Tools (${developer_dir:-unknown}), so xcodebuild cannot run.
 
-Open Xcode once, select its command line tools, and accept the license, then retry:
+The Command Line Tools alone cannot provide the Metal toolchain that
+mlx.metallib needs. Install full Xcode from the App Store or
+https://developer.apple.com/xcode/, then select it and retry:
+
+  sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+EOF
+        ;;
+      *[Ll]icense*)
+        cat >&2 <<EOF
+setup.sh: the Xcode license has not been accepted for the selected Xcode
+(${developer_dir:-unknown}).
+
+Accept it and retry:
 
   sudo xcodebuild -license accept
 
 EOF
+        ;;
+      *)
+        cat >&2 <<EOF
+setup.sh: xcodebuild is installed but not usable (developer directory: ${developer_dir:-unknown}).
+
+xcodebuild -version failed with:
+
+  ${xcodebuild_output}
+
+If full Xcode is installed, open it once, select its command line tools, and
+accept the license (sudo xcodebuild -license accept), then retry.
+
+EOF
+        ;;
+    esac
     exit 1
   fi
 }
@@ -972,6 +1062,51 @@ download_optional_reference_file() {
   echo "setup.sh: optional metadata ${file} was not available; continuing"
 }
 
+start_reference_download_heartbeat() {
+  # A cold checkpoint download is ~17 GiB and the parallel per-shard curls run
+  # silenced, which used to mean 10+ minutes with no output at all. Poll the
+  # on-disk shard bytes every 15 seconds and print one aggregate progress line
+  # so participants can see the download is alive.
+  local output_dir="$1"
+  local expected_total_bytes="$2"
+  shift 2
+  local heartbeat_started_seconds="${SECONDS}"
+
+  (
+    local downloaded_bytes
+    local file_path
+    local shard_file
+    local progress
+    while :; do
+      sleep 15
+      kill -0 "$$" 2>/dev/null || exit 0
+      downloaded_bytes=0
+      for shard_file in "$@"; do
+        file_path="${output_dir}/${shard_file}"
+        if [[ -f "${file_path}" ]]; then
+          downloaded_bytes=$((downloaded_bytes + $(wc -c < "${file_path}" | tr -d ' ')))
+        fi
+      done
+      if [[ "${expected_total_bytes}" -gt 0 ]]; then
+        progress="$(awk -v done="${downloaded_bytes}" -v total="${expected_total_bytes}" \
+          'BEGIN { printf "%.1f of %.1f GiB (%d%%)", done / 1073741824, total / 1073741824, (done * 100) / total }')"
+      else
+        progress="$(awk -v done="${downloaded_bytes}" 'BEGIN { printf "%.1f GiB so far", done / 1073741824 }')"
+      fi
+      echo "setup.sh: still downloading safetensors shard(s): ${progress} elapsed=$(format_duration "$((SECONDS - heartbeat_started_seconds))")"
+    done
+  ) &
+  REFERENCE_DOWNLOAD_HEARTBEAT_PID="$!"
+}
+
+stop_reference_download_heartbeat() {
+  if [[ -n "${REFERENCE_DOWNLOAD_HEARTBEAT_PID}" ]]; then
+    kill "${REFERENCE_DOWNLOAD_HEARTBEAT_PID}" >/dev/null 2>&1 || true
+    wait "${REFERENCE_DOWNLOAD_HEARTBEAT_PID}" >/dev/null 2>&1 || true
+    REFERENCE_DOWNLOAD_HEARTBEAT_PID=""
+  fi
+}
+
 download_reference_shards() {
   local output_dir="$1"
   shift
@@ -996,26 +1131,52 @@ download_reference_shards() {
     return 0
   fi
 
-  echo "setup.sh: downloading ${total} safetensors shard(s) with ${jobs} parallel job(s)"
-  export REFERENCE_BASE_URL
-  export REFERENCE_AUTH_HEADER
-  export REFERENCE_APPEND_DOWNLOAD_QUERY
-  export REFERENCE_HASH_VERIFY
   local ordinal=0
   local manifest_entry
   local expected_hash
   local expected_size
+  local expected_total_bytes=0
+  local expected_total_known=1
+  local download_status=0
+
+  # Pre-compute the aggregate expected byte count from the pinned manifest so
+  # both the banner line and the progress heartbeat can report percentages.
+  for file in "$@"; do
+    expected_size=""
+    if manifest_entry="$(reference_manifest_entry "${file}")"; then
+      read -r expected_hash expected_size <<< "${manifest_entry}"
+    fi
+    if [[ "${expected_size}" =~ ^[0-9]+$ ]]; then
+      expected_total_bytes=$((expected_total_bytes + expected_size))
+    else
+      expected_total_known=0
+    fi
+  done
+  if [[ "${expected_total_known}" != "1" ]]; then
+    expected_total_bytes=0
+  fi
+
+  if [[ "${expected_total_bytes}" -gt 0 ]]; then
+    echo "setup.sh: downloading ${total} safetensors shard(s) with ${jobs} parallel job(s) ($(awk -v total="${expected_total_bytes}" 'BEGIN { printf "%.1f", total / 1073741824 }') GiB total; progress prints every 15s)"
+  else
+    echo "setup.sh: downloading ${total} safetensors shard(s) with ${jobs} parallel job(s)"
+  fi
+  export REFERENCE_BASE_URL
+  export REFERENCE_AUTH_HEADER
+  export REFERENCE_APPEND_DOWNLOAD_QUERY
+  export REFERENCE_HASH_VERIFY
+  start_reference_download_heartbeat "${output_dir}" "${expected_total_bytes}" "$@"
   # The embedded program expands these variables in each child Bash process.
   # shellcheck disable=SC2016
-  if ! for file in "$@"; do
-      ordinal=$((ordinal + 1))
-      expected_hash=""
-      expected_size=""
-      if manifest_entry="$(reference_manifest_entry "${file}")"; then
-        read -r expected_hash expected_size <<< "${manifest_entry}"
-      fi
-      printf "%s|%s|%s|%s\0" "${ordinal}" "${file}" "${expected_hash}" "${expected_size}"
-    done | xargs -0 -I{} -P "${jobs}" bash -c '
+  for file in "$@"; do
+    ordinal=$((ordinal + 1))
+    expected_hash=""
+    expected_size=""
+    if manifest_entry="$(reference_manifest_entry "${file}")"; then
+      read -r expected_hash expected_size <<< "${manifest_entry}"
+    fi
+    printf "%s|%s|%s|%s\0" "${ordinal}" "${file}" "${expected_hash}" "${expected_size}"
+  done | xargs -0 -I{} -P "${jobs}" bash -c '
     set -euo pipefail
     record="$1"
     output_dir="$2"
@@ -1162,8 +1323,10 @@ download_reference_shards() {
 
     echo "setup.sh: failed to download verified shard ${ordinal}/${total}: ${file}" >&2
     exit 1
-  ' _ {} "${output_dir}" "${total}"; then
-    return 1
+  ' _ {} "${output_dir}" "${total}" || download_status=$?
+  stop_reference_download_heartbeat
+  if [[ "${download_status}" != "0" ]]; then
+    return "${download_status}"
   fi
   echo "setup.sh: downloaded ${total}/${total} safetensors shard(s) elapsed=$(format_duration "$((SECONDS - started_seconds))")"
 }
@@ -1477,6 +1640,7 @@ release_reference_cache_mutation_lock() {
 
 cleanup_background_builds() {
   local status="$?"
+  stop_reference_download_heartbeat
   if [[ "${status}" != "0" ]]; then
     if [[ -n "${METALLIB_BUILD_PID}" ]] && kill -0 "${METALLIB_BUILD_PID}" >/dev/null 2>&1; then
       kill "${METALLIB_BUILD_PID}" >/dev/null 2>&1 || true
@@ -1837,6 +2001,43 @@ EOF
   return "${operation_status}"
 }
 
+check_mlxfast_cli() {
+  # Submissions use the Yukon CLI (mlxfast) for login/clone/submit (see
+  # README.md "Submitting"). That CLI is distributed by the external Yukon
+  # installer, not by this repository, so setup.sh cannot install it. This
+  # check only surfaces the common onboarding gap where the CLI was installed
+  # but its directory never made it onto PATH, which otherwise shows up much
+  # later as "command not found: mlxfast" at submit time. Informational only;
+  # never fails setup.
+  local candidate
+  local install_dir
+
+  if command -v mlxfast >/dev/null 2>&1; then
+    echo "setup.sh: mlxfast (Yukon submission CLI) found at $(command -v mlxfast)"
+    return 0
+  fi
+
+  for candidate in "${HOME}/.local/bin/mlxfast" "${HOME}/bin/mlxfast"; do
+    if [[ -x "${candidate}" ]]; then
+      install_dir="$(dirname "${candidate}")"
+      cat >&2 <<EOF
+setup.sh: warning: mlxfast (Yukon submission CLI) is installed at
+${candidate} but ${install_dir} is not on PATH, so
+'mlxfast clone/submit' will not work in this shell. Activate it with:
+
+  echo 'export PATH="${install_dir}:\$PATH"' >> ~/.zshrc
+
+then open a new shell (or 'source ~/.zshrc').
+
+EOF
+      return 0
+    fi
+  done
+
+  echo "setup.sh: note: mlxfast (Yukon submission CLI) is not on PATH; it is installed by the external Yukon installer, not by setup.sh. Build, transform, correctness, and local benchmarks work without it, but install it (and put its bin directory on PATH) before 'mlxfast submit' -- see README.md 'Submitting'."
+  return 0
+}
+
 ensure_swift_toolchain
 ensure_macmon
 trap cleanup_background_builds EXIT
@@ -1846,6 +2047,7 @@ if [[ "${MLXFAST_SKIP_WEIGHTS_DOWNLOAD:-0}" == "1" || "${SKIP_MODEL_DOWNLOAD:-0}
   start_mlx_metallib_build
   wait_for_mlx_metallib_build
   echo "setup.sh: skipping reference weight download"
+  check_mlxfast_cli
   print_setup_summary "skipped"
   exit 0
 fi
@@ -1854,4 +2056,5 @@ build_swift_harness
 start_mlx_metallib_build
 download_reference_weights "${REFERENCE_DIR}"
 wait_for_mlx_metallib_build
+check_mlxfast_cli
 print_setup_summary "ready"
