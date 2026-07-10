@@ -265,7 +265,8 @@ behaviors are expected, not bugs:
  `MLXFAST_LOCAL_COOL_GATE=0` is for debugging only and produces
  hot-start timings that are not comparable to gated ones. The ranked
  score is a paired speedup versus the on-box pinned reference measured
- in the same session (~1.0 for unmodified code); the `officialBaseline*`
+ in the same session (~1.0 for unmodified code, with decode variance
+ around 0.1% CV in validation runs); the `officialBaseline*`
  constants feed local-mode estimates only, so treat local absolute
  numbers and local score estimates as directional.
 - **A local gate failure on non-M5 hardware may not be your bug.** The
@@ -282,6 +283,11 @@ behaviors are expected, not bugs:
  and private oracle provisioned on the official runner and is not
  runnable locally — use `--local-iterate` for the edit loop and
  `--local-submit` as the pre-submit gate.
+- **One ranked machine, one queue.** Ranked runs execute serially on the
+ single M5 runner: one job at a time by construction, and duplicate
+ dispatches queue behind the in-flight run instead of cancelling it.
+ Expect queueing delays behind other submissions, and do not dispatch
+ multiple ranked runs in parallel expecting concurrent results.
 
 ## Swift Tooling
 

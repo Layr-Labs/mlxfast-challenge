@@ -181,10 +181,13 @@ are patched into `score.json`; prompts, references, candidate answers, and
 judge transcripts stay in private runner paths covered by the artifact
 deny-list. One documented residual: the answer capture (which embeds hidden
 reference answers) is written into the bench workspace by the harness
-parent at the very end of the gates pass, after every behavior verdict is
-already final; a trusted step scrubs it — together with the augmented
-golden and all other hidden material — before any later phase spawns
-another worker.
+parent at the very end of the gates pass, and — unlike on the VM pipeline,
+whose harness profile could subpath-deny it — it is briefly readable by the
+worker in the few seconds between that write and worker teardown. The
+window gains a submission nothing (every behavior verdict is already final
+by then), and a trusted step scrubs the capture — together with the
+augmented golden and all other hidden material — before any later phase
+spawns another worker.
 
 ## Timed measurement and score sealing
 
@@ -202,9 +205,15 @@ sealed score shows token mismatches; one gated retry is allowed.
 
 The measurement is paired: the pinned reference baseline tree provisioned
 on the box is measured back to back with the candidate behind the same
-thermal gate, and the ranked speedups are that paired ratio. A calibration
-sanity band plus a pinned baseline binary hash guard against a swapped or
-pathological baseline silently rescaling every ratio. A trusted overlay
+thermal gate, and the ranked speedups are that paired ratio. This is the
+single-machine replacement for the old pipeline's fresh timing VM: that VM
+bought thermal isolation but introduced a per-job hardware lottery the
+paired baseline then had to cancel, whereas here both sides run on the same
+silicon in the same session, so the ratio cancels common-mode host drift
+directly and the fixed cool-down gate keeps the earlier correctness pass's
+heat out of the timed window. A calibration sanity band plus a pinned
+baseline binary hash guard against a swapped or pathological baseline
+silently rescaling every ratio. A trusted overlay
 step (`overlay-paired-timing.sh`) then merges the measured paired timing
 into the sealed gates score and applies the decode/prefill speedup floors
 (kept in sync with the harness constants). The benchmark oracle used by the
