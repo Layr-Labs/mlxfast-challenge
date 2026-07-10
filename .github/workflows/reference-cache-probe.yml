@@ -17,7 +17,7 @@ on:
         default: "manual-v1"
         type: string
       reference_base_url:
-        description: "Optional HTTP base URL for reference checkpoint files. Defaults to MLXFAST_REFERENCE_BASE_URL or Darkbloom."
+        description: "Optional HTTP base URL for reference checkpoint files. Defaults to the public Hugging Face mirror."
         required: false
         type: string
       reference_download_jobs:
@@ -60,8 +60,19 @@ jobs:
     env:
       MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
-      MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || secrets.MLXFAST_REFERENCE_BASE_URL || 'https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main' }}
-      MLXFAST_REFERENCE_AUTH_HEADER: ${{ secrets.MLXFAST_REFERENCE_AUTH_HEADER }}
+      # Secret-free by design -- this dispatch-time workflow runs setup.sh and
+      # the download script FROM THE DISPATCHED REF with no approval
+      # environment gate and no modifiable-surface guard, so it must never be
+      # handed anything that authenticates as more than "the public checkpoint
+      # mirror" (a dispatched ref with a modified setup.sh could exfiltrate any
+      # injected credential). A prior version pulled the base-URL/auth-header
+      # repo credentials in here -- the same exposure already removed from
+      # parallel-correctness-probe-slice.yml. Removed: the probe exists to test
+      # the cache backend, not the private mirror, and both setup.sh and
+      # download-reference-cache-scope.sh verify every byte against the pinned
+      # manifest, so the public Hugging Face mirror (no auth header) is fully
+      # sufficient.
+      MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || 'https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main' }}
       MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
       MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
       MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"

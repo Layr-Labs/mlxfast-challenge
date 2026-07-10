@@ -96,7 +96,7 @@ jobs:
           "${MEASURE_JOB}" --preflight-only --tag "preflight-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
       - name: Checkout candidate
-        uses: actions/checkout@v4
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -186,11 +186,17 @@ jobs:
       # pairing run trusted as `runner`.
       - name: Measure (paired official benchmark)
         id: measure
+        env:
+          # Routed through env: rather than interpolated into the run: body --
+          # ${{ inputs.* }} substitutes as a literal string before bash ever
+          # sees it, so inlining it is a script-injection vector. Matches the
+          # convention of the challenge repo's active workflows.
+          CANDIDATE_ONLY: ${{ inputs.candidate_only }}
         run: |
           set -euo pipefail
           tag="run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           extra=()
-          if [[ "${{ inputs.candidate_only }}" == "true" ]]; then
+          if [[ "${CANDIDATE_ONLY}" == "true" ]]; then
             extra+=(--candidate-only)
           fi
           "${MEASURE_JOB}" \
@@ -202,14 +208,19 @@ jobs:
 
       - name: Report
         if: always()
+        env:
+          # inputs.note is free-form operator text; env-route it (and the step
+          # output, for consistency) instead of inlining into the script body.
+          NOTE: ${{ inputs.note }}
+          OUT_DIR: ${{ steps.measure.outputs.out_dir }}
         run: |
           set -euo pipefail
-          out="${{ steps.measure.outputs.out_dir }}"
+          out="${OUT_DIR}"
           {
             echo "## m5-bench-timing"
             echo '```'
             echo "ref:  ${GITHUB_REF_NAME} @ ${GITHUB_SHA}"
-            echo "note: ${{ inputs.note }}"
+            echo "note: ${NOTE}"
             if [[ -n "${out}" && -s "${out}/results.json" ]]; then
               jq -r '
                 "verdict:          ACCEPT",
@@ -236,7 +247,7 @@ jobs:
       # runner's are.
       - name: Upload measurement artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: m5-bench-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.measure.outputs.out_dir }}

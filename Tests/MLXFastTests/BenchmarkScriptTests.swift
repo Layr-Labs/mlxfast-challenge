@@ -298,6 +298,20 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
     #expect(workflow.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
     #expect(workflow.contains(".github/scripts/download-reference-cache-scope.sh \"${CACHE_SCOPE}\""))
     #expect(workflow.contains("MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: \"0\""))
+
+    // Secret-free by design, the same blanket `secrets.` ban already enforced
+    // on the parallel correctness probe: this workflow runs setup.sh and the
+    // download script FROM THE DISPATCHED REF with no `environment:` approval
+    // gate, so a repo credential injected here (as a prior version did with
+    // secrets.MLXFAST_REFERENCE_BASE_URL/MLXFAST_REFERENCE_AUTH_HEADER) would
+    // be exfiltratable by any ref with a modified setup.sh. The public
+    // Hugging Face mirror needs no credential and every downloaded byte is
+    // verified against the pinned manifest.
+    #expect(!workflow.contains("environment:"))
+    #expect(!workflow.contains("secrets."))
+    #expect(!workflow.contains("secrets: inherit"))
+    #expect(!workflow.contains("MLXFAST_REFERENCE_AUTH_HEADER"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || 'https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main' }}"))
 }
 
 @Test
@@ -677,6 +691,15 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${actual_hash}"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${actual_bytes}"))
     #expect(workflow.contains(".github/scripts/verify-correctness-golden.sh"))
+    // Defense in depth on top of the self-anchored augmented pin:
+    // attach-gpqa-gates executes the SUBMITTED build, so the workflow must
+    // independently re-pin the augmented golden's base .cases as identical
+    // (jq -S canonicalized) to the raw hash-pinned golden's .cases --
+    // augmentation may only append behavior gates, never mutate the
+    // teacher-forced base case coverage arithmetic is derived from.
+    #expect(workflow.contains("jq -S '.cases' \"${MLXFAST_PRIVATE_DIR}/raw_golden.json\""))
+    #expect(workflow.contains("jq -S '.cases' \"${MLXFAST_CORRECTNESS_GOLDEN_PATH}\""))
+    #expect(workflow.contains("attach-gpqa-gates mutated the pinned base .cases"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_STEPS: \"64\""))
     #expect(!workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_CASES: \"10\""))
     #expect(workflow.contains("hidden correctness/GPQA gates require private R2 secrets"))

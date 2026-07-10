@@ -700,9 +700,11 @@ jobs:
 
       # PARITY CONTRACT: attach-gpqa-gates augments the raw golden with GPQA
       # behavior gates but MUST NOT mutate its .cases (the base teacher-forced
-      # case) -- verify-correctness-golden.sh's coverage arithmetic plus the
-      # final checked_steps validation backstop that here, exactly as the old
-      # combine coverage check did. attach-gpqa-gates loads the tokenizer, i.e.
+      # case) -- enforced directly below by re-pinning the augmented golden's
+      # .cases against the raw hash-pinned golden, with
+      # verify-correctness-golden.sh's coverage arithmetic plus the final
+      # checked_steps validation as backstops, exactly as the old combine
+      # coverage check did. attach-gpqa-gates loads the tokenizer, i.e.
       # runs code from the submitted build, so it executes through bench-exec
       # like every other untrusted invocation (the VM pipeline ran it as the
       # workflow user; the bench uid is strictly less privileged). The raw
@@ -741,6 +743,19 @@ jobs:
           # Trusted copy is the pinned instance the artifacts reference; the
           # workspace copy is what the (bench) harness parent reads at run time.
           cp "${MLXFAST_JOB_WS}/correctness_golden_ranked.json" "${MLXFAST_CORRECTNESS_GOLDEN_PATH}"
+          # Defense in depth: attach-gpqa-gates executes the SUBMITTED build,
+          # so never trust its output to preserve the base case. Re-pin the
+          # augmented golden's .cases against the raw hash-pinned golden
+          # (canonicalized with jq -S, since augmentation re-encodes key order
+          # and whitespace): augmentation may only append behavior gates,
+          # never mutate the teacher-forced base .cases.
+          raw_cases_hash="$(jq -S '.cases' "${MLXFAST_PRIVATE_DIR}/raw_golden.json" | shasum -a 256 | awk '{print $1}')"
+          augmented_cases_hash="$(jq -S '.cases' "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | shasum -a 256 | awk '{print $1}')"
+          if [[ "${augmented_cases_hash}" != "${raw_cases_hash}" ]]; then
+            echo "::error::attach-gpqa-gates mutated the pinned base .cases (augmented ${augmented_cases_hash} != raw ${raw_cases_hash})" >&2
+            exit 1
+          fi
+          echo "benchmark: augmented golden base cases re-pinned to raw pinned golden (cases sha256 ${raw_cases_hash})"
           actual_hash="$(shasum -a 256 "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | awk '{print $1}')"
           actual_bytes="$(wc -c < "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | tr -d ' ')"
           export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256="${actual_hash}"
