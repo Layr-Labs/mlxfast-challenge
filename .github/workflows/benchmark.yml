@@ -85,18 +85,13 @@ name: benchmark
 # harness-authored benchmark-integrity score hash is cross-checked.
 #
 # Dispatch-only, like before: no PR/push triggers (GitHub self-hosted safety --
-# fork PRs must never reach this runner). The workflow itself always executes
-# from trusted main. A submission commit is an exact-SHA input: it is checked
-# out separately, verified against benchmark.json's modifiable surface, and
-# only editablePaths are overlaid into the trusted tree. Submitted-process logs
-# remain suppressed.
+# fork PRs must never reach this runner). Dispatches are restricted to main,
+# submissions/*, and baseline/*. Submission branches contribute only the exact
+# dispatched SHA's editablePaths over trusted main; main and baseline branches
+# run their exact dispatched SHA. Submitted-process logs remain suppressed.
 on:
   workflow_dispatch:
     inputs:
-      submission_ref:
-        description: "Exact 40-character candidate commit SHA. Use the current main SHA for an explicit trusted-main run."
-        required: true
-        type: string
       run_benchmark:
         description: "Run the private gates + timed benchmark after the public correctness gate. false = public-fixture correctness only."
         required: false
@@ -111,13 +106,11 @@ on:
 permissions:
   contents: read
 
-# One physical machine, one job at a time by construction (the supervisor
-# keeps a single ephemeral runner online). Queue duplicate dispatches instead
-# of cancelling the in-flight measurement; keyed on run_benchmark so a
-# correctness-only dispatch queues independently of full benchmark runs,
-# matching the previous pipeline's grouping.
+# The ranked M5 is a single physical machine. Use one repository-wide group so
+# every dispatch -- every ref and both full/correctness-only modes -- queues
+# behind the active run instead of competing for the host or cancelling it.
 concurrency:
-  group: benchmark-${{ github.ref }}-${{ inputs.run_benchmark }}
+  group: mlxfast-ranked-benchmark
   cancel-in-progress: false
 
 jobs:
@@ -202,9 +195,8 @@ jobs:
       MLXFAST_DECODE_SPEEDUP_FLOOR: "0.95"
       MLXFAST_PREFILL_SPEEDUP_FLOOR: "0.95"
       MLXFAST_RUN_BENCHMARK: ${{ inputs.run_benchmark && '1' || '0' }}
-      # Submitted code is data overlaid onto this main-owned workflow checkout.
-      MLXFAST_CANDIDATE_SHA: ${{ inputs.submission_ref }}
-      MLXFAST_IS_SUBMISSION_BRANCH: ${{ (inputs.submission_ref != github.sha) && '1' || '0' }}
+      MLXFAST_CANDIDATE_SHA: ${{ github.sha }}
+      MLXFAST_IS_SUBMISSION_BRANCH: ${{ startsWith(github.ref, 'refs/heads/submissions/') && '1' || '0' }}
       MLXFAST_VERIFY_TRANSFORM: ${{ inputs.verify_transform && '1' || '0' }}
     steps:
       # Fail fast if the box is quarantined or the isolation stack is missing,
@@ -230,38 +222,44 @@ jobs:
 
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
+          # Submission branches contribute editable paths only; trusted main is
+          # the harness/workflow base. Main and baseline/* run their exact SHA.
+          ref: ${{ startsWith(github.ref, 'refs/heads/submissions/') && 'main' || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Enforce trusted workflow context
         run: .github/scripts/enforce-trusted-benchmark-workflow.sh
 
-      - name: Validate candidate input
+      - name: Capture candidate commit
+        id: candidate_context
         env:
-          SUBMISSION_REF: ${{ inputs.submission_ref }}
+          CANDIDATE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ ! "${SUBMISSION_REF}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::submission_ref must be an exact 40-character lowercase commit SHA" >&2
+          if [[ ! "${CANDIDATE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::candidate SHA must be an exact 40-character lowercase commit SHA" >&2
             exit 1
           fi
-          printf '%s\n' "${SUBMISSION_REF}" > candidate.sha
+          trusted_main_sha="$(git rev-parse HEAD)"
+          printf '%s\n' "${CANDIDATE_SHA}" > candidate.sha
+          printf 'trusted_main_sha=%s\n' "${trusted_main_sha}" >> "${GITHUB_OUTPUT}"
 
       - name: Checkout submitted editable paths
-        if: ${{ inputs.submission_ref != github.sha }}
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          ref: ${{ inputs.submission_ref }}
+          ref: ${{ github.sha }}
           path: .mlxfast-submission-src
           fetch-depth: 0
           persist-credentials: false
 
       - name: Verify submitted commit and modifiable surface
         id: verify_submission
-        if: ${{ inputs.submission_ref != github.sha }}
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
         env:
-          SUBMISSION_REF: ${{ inputs.submission_ref }}
-          TRUSTED_MAIN_SHA: ${{ github.sha }}
+          SUBMISSION_REF: ${{ github.sha }}
+          TRUSTED_MAIN_SHA: ${{ steps.candidate_context.outputs.trusted_main_sha }}
         run: |
           set -euo pipefail
           actual_sha="$(git -C .mlxfast-submission-src rev-parse HEAD)"
@@ -293,10 +291,10 @@ jobs:
           echo "benchmark: verified submitted commit ${actual_sha} against base ${base_sha}"
 
       - name: Review submitted code for benchmark bypasses
-        if: ${{ inputs.submission_ref != github.sha }}
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
-          HEAD_SHA: ${{ inputs.submission_ref }}
+          HEAD_SHA: ${{ github.sha }}
           REVIEW_BASE_SHA: ${{ steps.verify_submission.outputs.base_sha }}
         run: |
           set -euo pipefail
@@ -307,7 +305,7 @@ jobs:
           )
 
       - name: Overlay submitted editable paths
-        if: ${{ inputs.submission_ref != github.sha }}
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
         env:
           SUBMISSION_WORKTREE: .mlxfast-submission-src
         run: .github/scripts/overlay-editable-paths.sh
@@ -315,7 +313,7 @@ jobs:
       # The bench workspace must contain the trusted tree plus overlaid editable
       # paths only, never the candidate's complete checkout.
       - name: Remove submitted checkout
-        if: ${{ always() && inputs.submission_ref != github.sha }}
+        if: ${{ always() && startsWith(github.ref, 'refs/heads/submissions/') }}
         run: |
           set -euo pipefail
           rm -rf .mlxfast-submission-src
@@ -647,7 +645,7 @@ jobs:
 
       - name: Stage correctness artifacts
         id: stage_correctness_artifacts
-        if: ${{ always() && !inputs.run_benchmark && (inputs.submission_ref == github.sha || steps.validate_correctness_artifacts.outcome == 'success') }}
+        if: ${{ always() && !inputs.run_benchmark && (!startsWith(github.ref, 'refs/heads/submissions/') || steps.validate_correctness_artifacts.outcome == 'success') }}
         run: |
           set -euo pipefail
           test "$(cat candidate.sha)" = "${MLXFAST_CANDIDATE_SHA}"

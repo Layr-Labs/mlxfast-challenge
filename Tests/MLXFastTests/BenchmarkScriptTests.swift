@@ -456,19 +456,15 @@ func benchmarkWorkflowRunsTrustedMainAndOverlaysOnlySubmittedEditablePaths() thr
         encoding: .utf8
     )
 
-    // The workflow itself is pinned to main. A submission is an immutable SHA
-    // input in this repository, never a branch-owned workflow checkout.
-    #expect(workflow.contains("submission_ref:"))
-    let submissionInputRange = try #require(workflow.range(of: "      submission_ref:"))
-    let runBenchmarkInputRange = try #require(workflow.range(of: "      run_benchmark:"))
-    let submissionInput = String(workflow[submissionInputRange.lowerBound..<runBenchmarkInputRange.lowerBound])
-    #expect(submissionInput.contains("required: true"))
-    #expect(!submissionInput.contains("required: false"))
-    #expect(workflow.contains("submission_ref must be an exact 40-character lowercase commit SHA"))
+    // The workflow uses the branch selected by workflow_dispatch. Only main,
+    // submissions/*, and baseline/* are admitted; no duplicate SHA input.
+    #expect(!workflow.contains("submission_ref:"))
     #expect(!workflow.contains("submission_repository"))
     #expect(!workflow.contains("allow_untrusted_workflow_testing"))
     #expect(!workflow.contains("MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}"))
-    #expect(guardScript.contains("readonly TRUSTED_REF=\"refs/heads/main\""))
+    #expect(guardScript.contains("refs/heads/main|refs/heads/submissions/*|refs/heads/baseline/*"))
+    #expect(guardScript.contains("allowed branches are main, submissions/*, and baseline/*"))
+    #expect(guardScript.contains("@${GITHUB_REF}"))
     #expect(!guardScript.contains("MLXFAST_TRUSTED_BENCHMARK_REF"))
 
     let trustedCheckoutRange = try #require(workflow.range(of: "- uses: actions/checkout@"))
@@ -485,8 +481,10 @@ func benchmarkWorkflowRunsTrustedMainAndOverlaysOnlySubmittedEditablePaths() thr
     #expect(overlayRange.lowerBound < removeCandidateRange.lowerBound)
     #expect(removeCandidateRange.lowerBound < prepareWorkspaceRange.lowerBound)
 
+    let trustedCheckout = String(workflow[trustedCheckoutRange.lowerBound..<candidateCheckoutRange.lowerBound])
     let candidatePipeline = String(workflow[candidateCheckoutRange.lowerBound..<prepareWorkspaceRange.lowerBound])
-    #expect(candidatePipeline.contains("ref: ${{ inputs.submission_ref }}"))
+    #expect(trustedCheckout.contains("startsWith(github.ref, 'refs/heads/submissions/') && 'main' || github.sha"))
+    #expect(candidatePipeline.contains("ref: ${{ github.sha }}"))
     #expect(candidatePipeline.contains("path: .mlxfast-submission-src"))
     #expect(candidatePipeline.contains("BASE_SHA=\"${base_sha}\" HEAD_SHA=\"${actual_sha}\""))
     #expect(candidatePipeline.contains("if [[ \"${base_sha}\" != \"${TRUSTED_MAIN_SHA}\" ]]; then"))
@@ -496,18 +494,17 @@ func benchmarkWorkflowRunsTrustedMainAndOverlaysOnlySubmittedEditablePaths() thr
     #expect(candidatePipeline.contains("run: .github/scripts/overlay-editable-paths.sh"))
     #expect(candidatePipeline.contains("rm -rf .mlxfast-submission-src"))
     #expect(candidatePipeline.contains("test ! -e .mlxfast-submission-src"))
-    #expect(workflow.contains("MLXFAST_CANDIDATE_SHA: ${{ inputs.submission_ref }}"))
-    #expect(!workflow.contains("inputs.submission_ref || github.sha"))
+    #expect(workflow.contains("MLXFAST_CANDIDATE_SHA: ${{ github.sha }}"))
     #expect(workflow.contains("git -C \"${MLXFAST_JOB_WS}\" update-ref --no-deref HEAD \"${MLXFAST_CANDIDATE_SHA}\""))
     #expect(!workflow.contains("git -C \"${MLXFAST_JOB_WS}\" checkout"))
     #expect(workflow.contains("MLXFAST_NOTE: \"ci ${{ github.event_name }} ${{ env.MLXFAST_CANDIDATE_SHA }} mode=single-machine-gates\""))
 
     // Submission runs retain surface enforcement, static bypass review, and
-    // submitted-process log suppression. An explicit current-main SHA is the
-    // only path that skips the candidate checkout and review.
-    #expect(workflow.contains("MLXFAST_IS_SUBMISSION_BRANCH: ${{ (inputs.submission_ref != github.sha) && '1' || '0' }}"))
-    #expect(candidatePipeline.contains("if: ${{ inputs.submission_ref != github.sha }}"))
-    #expect(candidatePipeline.contains("if: ${{ always() && inputs.submission_ref != github.sha }}"))
+    // submitted-process log suppression. Main and baseline/* run directly;
+    // submissions/* alone take the candidate checkout/review/overlay path.
+    #expect(workflow.contains("MLXFAST_IS_SUBMISSION_BRANCH: ${{ startsWith(github.ref, 'refs/heads/submissions/') && '1' || '0' }}"))
+    #expect(candidatePipeline.contains("if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}"))
+    #expect(candidatePipeline.contains("if: ${{ always() && startsWith(github.ref, 'refs/heads/submissions/') }}"))
     #expect(workflow.contains("- name: Review submitted code for benchmark bypasses"))
     #expect(workflow.contains("if [[ \"${MLXFAST_IS_SUBMISSION_BRANCH}\" == \"1\" ]]; then"))
     #expect(workflow.contains("if: ${{ always() && !inputs.run_benchmark }}"))
@@ -521,7 +518,51 @@ func benchmarkWorkflowRunsTrustedMainAndOverlaysOnlySubmittedEditablePaths() thr
 }
 
 @Test
-func benchmarkWorkflowBindsPublishedArtifactsToRequiredCandidateCommit() throws {
+func trustedBenchmarkWorkflowGuardAllowsOnlyPermittedBranches() throws {
+    let script = ".github/scripts/enforce-trusted-benchmark-workflow.sh"
+
+    func run(ref: String) throws -> (status: Int32, stderr: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [script]
+        process.currentDirectoryURL = URL(
+            fileURLWithPath: FileManager.default.currentDirectoryPath
+        )
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "GITHUB_REPOSITORY": "Layr-Labs/mlxfast-challenge-dev",
+            "GITHUB_REF": ref,
+            "GITHUB_WORKFLOW_REF":
+                "Layr-Labs/mlxfast-challenge-dev/.github/workflows/benchmark.yml@\(ref)",
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+        ]) { _, new in new }
+        let stderr = Pipe()
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            String(
+                data: stderr.fileHandleForReading.readDataToEndOfFile(),
+                encoding: .utf8
+            ) ?? ""
+        )
+    }
+
+    for ref in [
+        "refs/heads/main",
+        "refs/heads/submissions/example",
+        "refs/heads/baseline/reference",
+    ] {
+        #expect(try run(ref: ref).status == 0, "expected \(ref) to be allowed")
+    }
+
+    let rejected = try run(ref: "refs/heads/feature/not-allowed")
+    #expect(rejected.status != 0)
+    #expect(rejected.stderr.contains("allowed branches are main, submissions/*, and baseline/*"))
+}
+
+@Test
+func benchmarkWorkflowBindsPublishedArtifactsToDispatchedCommit() throws {
     let workflow = try String(
         contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
@@ -535,14 +576,15 @@ func benchmarkWorkflowBindsPublishedArtifactsToRequiredCandidateCommit() throws 
         encoding: .utf8
     )
 
-    let validateCandidateRange = try #require(workflow.range(of: "- name: Validate candidate input"))
+    let validateCandidateRange = try #require(workflow.range(of: "- name: Capture candidate commit"))
     let candidateCheckoutRange = try #require(workflow.range(of: "- name: Checkout submitted editable paths"))
     let validateCandidate = String(workflow[validateCandidateRange.lowerBound..<candidateCheckoutRange.lowerBound])
     #expect(validateCandidate.contains("^[0-9a-f]{40}$"))
-    #expect(validateCandidate.contains("printf '%s\\n' \"${SUBMISSION_REF}\" > candidate.sha"))
+    #expect(validateCandidate.contains("CANDIDATE_SHA: ${{ github.sha }}"))
+    #expect(validateCandidate.contains("printf '%s\\n' \"${CANDIDATE_SHA}\" > candidate.sha"))
+    #expect(validateCandidate.contains("trusted_main_sha=%s"))
 
-    #expect(workflow.contains("MLXFAST_CANDIDATE_SHA: ${{ inputs.submission_ref }}"))
-    #expect(!workflow.contains("inputs.submission_ref || github.sha"))
+    #expect(workflow.contains("MLXFAST_CANDIDATE_SHA: ${{ github.sha }}"))
     #expect(
         workflow.components(
             separatedBy: "MLXFAST_EXPECTED_COMMIT: ${{ env.MLXFAST_CANDIDATE_SHA }}"
@@ -644,7 +686,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     let sandboxProbeRange = try #require(workflow.range(of: "- name: Probe runtime worker sandbox"))
     #expect(modifiableSurfaceRange.lowerBound < staticReviewRange.lowerBound)
     #expect(staticReviewRange.lowerBound < sandboxProbeRange.lowerBound)
-    #expect(workflow.contains("if: ${{ inputs.submission_ref != github.sha }}"))
+    #expect(workflow.contains("if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}"))
     #expect(workflow.contains("${GITHUB_WORKSPACE}/.github/scripts/run-submission-static-review.sh"))
     #expect(workflow.contains("mlxfast-swift attach-gpqa-gates"))
     #expect(workflow.contains("--case-count \"${MLXFAST_GPQA_CASE_COUNT}\""))
@@ -3042,11 +3084,11 @@ func singleMachineWorkflowGatesUploadsOnContentValidation() throws {
     #expect(validateCorrectnessStep.contains("and .expected_token == null"))
     #expect(validateCorrectnessStep.contains("and .actual_token == null"))
 
-    // Staging runs only when (explicit trusted-main run || validation passed),
+    // Staging runs only when (trusted main/baseline run || validation passed),
     // runs the deny-path check, and the upload requires staging to have PASSED,
     // which transitively enforces the validation gate on candidate runs.
     #expect(workflow.contains(
-        "if: ${{ always() && !inputs.run_benchmark && (inputs.submission_ref == github.sha || "
+        "if: ${{ always() && !inputs.run_benchmark && (!startsWith(github.ref, 'refs/heads/submissions/') || "
             + "steps.validate_correctness_artifacts.outcome == 'success') }}"
     ))
     #expect(workflow.contains("if: always() && steps.stage_correctness_artifacts.outcome == 'success'"))
@@ -3246,11 +3288,11 @@ func finalArtifactNamesStayRunIdOnlyAndAuditArtifactsEmbedRunAttempt() throws {
 }
 
 @Test
-func benchmarkWorkflowHasConcurrencyGroupMatchingSiblingProbes() throws {
+func benchmarkWorkflowSerializesEveryDispatch() throws {
     let workflow = try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
-    // Keyed on run_benchmark so correctness-only dispatches keep main's
-    // concurrent behavior instead of queueing behind a full benchmark run.
-    #expect(workflow.contains("concurrency:\n  group: benchmark-${{ github.ref }}-${{ inputs.run_benchmark }}\n  cancel-in-progress: false"))
+    #expect(workflow.contains("concurrency:\n  group: mlxfast-ranked-benchmark\n  cancel-in-progress: false"))
+    #expect(!workflow.contains("group: benchmark-${{ github.ref }}"))
+    #expect(!workflow.contains("group: benchmark-${{ inputs.run_benchmark }}"))
 }
 
 @Test
