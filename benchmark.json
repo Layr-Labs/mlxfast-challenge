@@ -10,7 +10,7 @@
   ],
   "setupCommand": ["bash", "-c", "./setup.sh"],
   "preSubmitCommand": ["bash", "-c", "./benchmark.sh --local-submit"],
-  "benchmarkCommand": ["bash", "-c", "./benchmark.sh --official"],
+  "benchmarkCommand": ["bash", "-c", "MLXFAST_SCORE_PATH=score.json ./benchmark.sh --local-iterate"],
   "scorePath": "score.json",
   "runner": {
     "provider": "github-actions",

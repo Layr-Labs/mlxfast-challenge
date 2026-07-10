@@ -1921,6 +1921,17 @@ func benchmarkLocalSubmitModeUsesLongLocalBenchmarkAndPrintsScore() throws {
     )
 
     #expect(contract.contains("\"preSubmitCommand\": [\"bash\", \"-c\", \"./benchmark.sh --local-submit\"]"))
+    // The Yukon participant CLI (`mlxfast run`) executes benchmarkCommand and
+    // then reads the contract's scorePath, so the participant entrypoint must
+    // be a LOCAL mode (--official requires the private oracle, which is never
+    // in the public repo) AND must pin its score to scorePath explicitly:
+    // --local-iterate writes score.local-iterate.json when MLXFAST_SCORE_PATH
+    // is unset, which `mlxfast run` would fail to find at score.json. The
+    // ranked runner never consumes benchmarkCommand -- benchmark.yml and
+    // measure-job.sh invoke ./benchmark.sh --official themselves under
+    // MLXFAST_OFFICIAL_BENCHMARK_RUN=1.
+    #expect(contract.contains("\"benchmarkCommand\": [\"bash\", \"-c\", \"MLXFAST_SCORE_PATH=score.json ./benchmark.sh --local-iterate\"]"))
+    #expect(contract.contains("\"scorePath\": \"score.json\""))
     #expect(constants.contains("public static let defaultPublicLocalSubmitGoldenPath"))
     #expect(constants.contains("public static let localSubmitBenchmarkDecodeSteps = 1023"))
     #expect(constants.contains("public static let localSubmitBenchmarkRepeats = 1"))
