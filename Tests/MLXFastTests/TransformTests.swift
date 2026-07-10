@@ -111,6 +111,180 @@ func transformWritesFlattenedRuntimeConfigFromTextConfig() throws {
 }
 
 @Test
+func transformRejectsReferenceAsOutputWithoutMutatingCheckpoint() throws {
+    let fixture = try writeTransformFixture()
+    let originalConfig = try Data(
+        contentsOf: fixture.reference.appendingPathComponent("config.json")
+    )
+
+    #expect(throws: MLXFastError.self) {
+        _ = try SwiftTransform.run(
+            TransformOptions(
+                referencePath: fixture.reference.path,
+                outputPath: fixture.reference.path
+            )
+        )
+    }
+
+    #expect(
+        try Data(contentsOf: fixture.reference.appendingPathComponent("config.json"))
+            == originalConfig
+    )
+    #expect(
+        FileManager.default.fileExists(
+            atPath: fixture.reference.appendingPathComponent("model-00001-of-00001.safetensors").path
+        )
+    )
+}
+
+@Test
+func transformRejectsSymlinkAliasOfReferenceAsOutput() throws {
+    let fixture = try writeTransformFixture()
+    let outputAlias = fixture.root.appendingPathComponent("reference-alias", isDirectory: true)
+    try FileManager.default.createSymbolicLink(
+        at: outputAlias,
+        withDestinationURL: fixture.reference
+    )
+    let originalConfig = try Data(
+        contentsOf: fixture.reference.appendingPathComponent("config.json")
+    )
+
+    #expect(throws: MLXFastError.self) {
+        _ = try SwiftTransform.run(
+            TransformOptions(
+                referencePath: fixture.reference.path,
+                outputPath: outputAlias.path
+            )
+        )
+    }
+
+    #expect(
+        try Data(contentsOf: fixture.reference.appendingPathComponent("config.json"))
+            == originalConfig
+    )
+}
+
+@Test
+func transformRejectsOutputThatContainsWorkingDirectory() throws {
+    let root = try temporaryDirectory()
+    let reference = root.appendingPathComponent("reference")
+    let workingDirectory = root.appendingPathComponent("workspace/project")
+    try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
+
+    #expect(throws: MLXFastError.self) {
+        try SwiftTransform.validateDistinctDirectories(
+            referenceDirectory: reference,
+            outputDirectory: root,
+            workingDirectory: workingDirectory
+        )
+    }
+}
+
+@Test
+func transformRejectsOutputInsideReferenceDirectory() throws {
+    let root = try temporaryDirectory()
+    let reference = root.appendingPathComponent("reference")
+    let output = reference.appendingPathComponent("weights")
+    let workingDirectory = root.appendingPathComponent("workspace")
+    try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
+
+    #expect(throws: MLXFastError.self) {
+        try SwiftTransform.validateDistinctDirectories(
+            referenceDirectory: reference,
+            outputDirectory: output,
+            workingDirectory: workingDirectory
+        )
+    }
+}
+
+@Test
+func transformRejectsExistingRegularFileOutputWithoutReplacingIt() throws {
+    let fixture = try writeTransformFixture()
+    let outputFile = fixture.root.appendingPathComponent("existing-output")
+    try "preserve me".write(to: outputFile, atomically: true, encoding: .utf8)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try SwiftTransform.run(
+            TransformOptions(
+                referencePath: fixture.reference.path,
+                outputPath: outputFile.path
+            )
+        )
+    }
+
+    #expect(try String(contentsOf: outputFile, encoding: .utf8) == "preserve me")
+}
+
+@Test
+func transformAtomicallyReplacesExistingOutputAndRemovesStaleFiles() throws {
+    let fixture = try writeTransformFixture()
+    try FileManager.default.createDirectory(at: fixture.output, withIntermediateDirectories: true)
+    let staleFile = fixture.output.appendingPathComponent("stale.txt")
+    try "stale".write(to: staleFile, atomically: true, encoding: .utf8)
+
+    _ = try SwiftTransform.run(
+        TransformOptions(referencePath: fixture.reference.path, outputPath: fixture.output.path)
+    )
+
+    #expect(!FileManager.default.fileExists(atPath: staleFile.path))
+    #expect(
+        FileManager.default.fileExists(
+            atPath: fixture.output.appendingPathComponent("model.safetensors.index.json").path
+        )
+    )
+}
+
+@Test
+func transformFailurePreservesExistingOutputAndRemovesStagingDirectory() throws {
+    let fixture = try writeTransformFixture()
+    try #"{"vision_config":{}}"#.write(
+        to: fixture.reference.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+    try FileManager.default.createDirectory(at: fixture.output, withIntermediateDirectories: true)
+    let sentinel = fixture.output.appendingPathComponent("sentinel.txt")
+    try "original".write(to: sentinel, atomically: true, encoding: .utf8)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try SwiftTransform.run(
+            TransformOptions(referencePath: fixture.reference.path, outputPath: fixture.output.path)
+        )
+    }
+
+    #expect(try String(contentsOf: sentinel, encoding: .utf8) == "original")
+    let siblings = try FileManager.default.contentsOfDirectory(
+        at: fixture.output.deletingLastPathComponent(),
+        includingPropertiesForKeys: nil
+    )
+    #expect(
+        !siblings.contains {
+            $0.lastPathComponent.hasPrefix(".weights.mlxfast-transform-")
+        }
+    )
+}
+
+@Test
+func checkpointIndexBuildRejectsDuplicateTensorNamesAcrossShards() throws {
+    let root = try temporaryDirectory()
+    let tensorName = "language_model.model.embed_tokens.weight"
+    try writeSafetensors(
+        root.appendingPathComponent("model-00001-of-00002.safetensors"),
+        tensors: [TensorFixture(name: tensorName, dtype: "U8", shape: [1], data: Data([1]))]
+    )
+    try writeSafetensors(
+        root.appendingPathComponent("model-00002-of-00002.safetensors"),
+        tensors: [TensorFixture(name: tensorName, dtype: "U8", shape: [1], data: Data([2]))]
+    )
+
+    #expect(throws: MLXFastError.self) {
+        _ = try CheckpointIndex.buildFromSafetensors(in: root)
+    }
+}
+
+@Test
 func transformRejectsCheckpointWithoutTextTowerTensorsBeforeCreatingOutput() throws {
     let root = try temporaryDirectory()
     let reference = root.appendingPathComponent("reference", isDirectory: true)

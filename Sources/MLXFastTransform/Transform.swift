@@ -55,10 +55,23 @@ public enum SwiftTransform {
     static let textTowerPrefix = "language_model."
 
     public static func run(_ options: TransformOptions) throws -> TransformReport {
-        let referenceDirectory = try findReferenceDirectory(
-            URL(fileURLWithPath: options.referencePath)
+        let referenceDirectory = canonicalURL(
+            try findReferenceDirectory(URL(fileURLWithPath: options.referencePath))
         )
-        let outputDirectory = URL(fileURLWithPath: options.outputPath)
+        let outputDirectory = canonicalURL(URL(fileURLWithPath: options.outputPath))
+        try validateDistinctDirectories(
+            referenceDirectory: referenceDirectory,
+            outputDirectory: outputDirectory
+        )
+        var outputIsDirectory = ObjCBool(false)
+        if FileManager.default.fileExists(
+            atPath: outputDirectory.path,
+            isDirectory: &outputIsDirectory
+        ), !outputIsDirectory.boolValue {
+            throw MLXFastError.invalidInput(
+                "transform output exists and is not a directory: \(outputDirectory.path)"
+            )
+        }
 
         try requireFile(
             referenceDirectory.appendingPathComponent("config.json").path,
@@ -66,41 +79,70 @@ public enum SwiftTransform {
         )
 
         let index = try loadIndex(referenceDirectory)
-        try validateCheckpointIndex(index, referenceDirectory: referenceDirectory)
+        let validatedHeaders = try validateCheckpointIndex(
+            index,
+            referenceDirectory: referenceDirectory
+        )
         let textKeys = Set(index.weightMap.keys.filter(isTextTowerKey))
         guard !textKeys.isEmpty else {
             throw MLXFastError.invalidInput("checkpoint index contains no text-tower tensors")
         }
 
-        try FileManager.default.createDirectory(
-            at: outputDirectory,
-            withIntermediateDirectories: true
-        )
-
         let textKeysByShard = Dictionary(grouping: textKeys) { key in
             index.weightMap[key] ?? ""
+        }
+
+        let fileManager = FileManager.default
+        let stagingDirectory = outputDirectory.deletingLastPathComponent().appendingPathComponent(
+            ".\(outputDirectory.lastPathComponent).mlxfast-transform-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(
+            at: stagingDirectory.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try fileManager.createDirectory(at: stagingDirectory, withIntermediateDirectories: false)
+        var installed = false
+        defer {
+            if !installed {
+                try? fileManager.removeItem(at: stagingDirectory)
+            }
         }
 
         var copiedTensors = 0
         for shardName in textKeysByShard.keys.sorted() {
             let source = referenceDirectory.appendingPathComponent(shardName)
-            let destination = outputDirectory.appendingPathComponent(shardName)
+            let destination = stagingDirectory.appendingPathComponent(shardName)
+            guard let header = validatedHeaders[shardName] else {
+                throw MLXFastError.invalidInput("missing validated header for checkpoint shard \(shardName)")
+            }
             copiedTensors += try Safetensors.copySubset(
                 from: source,
                 to: destination,
-                tensorNames: textKeysByShard[shardName, default: []].sorted()
+                tensorNames: textKeysByShard[shardName, default: []].sorted(),
+                validatedHeader: header
             )
         }
 
-        try copyTokenizerFiles(from: referenceDirectory, to: outputDirectory)
-        let indexPath = outputDirectory.appendingPathComponent("model.safetensors.index.json")
-        try index.writeStripped(to: indexPath, keeping: textKeys)
+        try copyTokenizerFiles(from: referenceDirectory, to: stagingDirectory)
+        try index.writeStripped(
+            to: stagingDirectory.appendingPathComponent("model.safetensors.index.json"),
+            keeping: textKeys
+        )
 
-        let configPath = outputDirectory.appendingPathComponent("config.json")
         try writeRuntimeConfig(
             referenceDirectory: referenceDirectory,
-            configPath: configPath
+            configPath: stagingDirectory.appendingPathComponent("config.json")
         )
+        try installTransformedDirectory(
+            stagingDirectory,
+            at: outputDirectory,
+            fileManager: fileManager
+        )
+        installed = true
+
+        let indexPath = outputDirectory.appendingPathComponent("model.safetensors.index.json")
+        let configPath = outputDirectory.appendingPathComponent("config.json")
 
         return TransformReport(
             referencePath: referenceDirectory.path,
@@ -124,7 +166,7 @@ public enum SwiftTransform {
         _ index: CheckpointIndex,
         referenceDirectory: URL,
         fileManager: FileManager = .default
-    ) throws {
+    ) throws -> [String: SafetensorsHeader] {
         guard !index.weightMap.isEmpty else {
             throw MLXFastError.invalidInput("checkpoint index contains no tensors")
         }
@@ -132,18 +174,19 @@ public enum SwiftTransform {
         let keysByShard = Dictionary(grouping: index.weightMap.keys.sorted()) { key in
             index.weightMap[key] ?? ""
         }
+        var headersByShard: [String: SafetensorsHeader] = [:]
         for shardName in keysByShard.keys.sorted() {
             try validateSafetensorsShardName(shardName, context: "checkpoint index")
 
             let shardURL = referenceDirectory.appendingPathComponent(shardName)
             try requireFile(shardURL.path, description: "checkpoint shard \(shardName)")
             let header = try Safetensors.readHeader(shardURL)
+            headersByShard[shardName] = header
             let attributes = try fileManager.attributesOfItem(atPath: shardURL.path)
             let byteCount = try fileSizeByteCount(from: attributes, path: shardURL.path)
-            guard header.dataBaseOffset <= UInt64(Int.max) else {
+            guard let baseOffset = Int(exactly: header.dataBaseOffset) else {
                 throw MLXFastError.invalidInput("checkpoint shard header is too large: \(shardName)")
             }
-            let baseOffset = Int(header.dataBaseOffset)
 
             for key in keysByShard[shardName, default: []].sorted() {
                 guard let info = header.tensors[key] else {
@@ -162,13 +205,73 @@ public enum SwiftTransform {
                         "checkpoint tensor \(key) byte length \(info.byteCount) does not match dtype \(info.dtype) and shape \(info.shape) expected \(expectedByteLength)"
                     )
                 }
-                let end = baseOffset + info.dataEnd
-                guard info.dataStart >= 0, info.byteCount > 0, end <= byteCount else {
+                let (end, overflow) = baseOffset.addingReportingOverflow(info.dataEnd)
+                guard
+                    !overflow,
+                    info.dataStart >= 0,
+                    info.byteCount > 0,
+                    end <= byteCount
+                else {
                     throw MLXFastError.invalidInput(
                         "checkpoint tensor \(key) byte range \(info.dataStart)..<\(info.dataEnd) exceeds shard size \(byteCount)"
                     )
                 }
             }
+        }
+        return headersByShard
+    }
+
+    private static func canonicalURL(_ url: URL) -> URL {
+        url.standardizedFileURL.resolvingSymlinksInPath()
+    }
+
+    static func validateDistinctDirectories(
+        referenceDirectory: URL,
+        outputDirectory: URL,
+        workingDirectory: URL = URL(
+            fileURLWithPath: FileManager.default.currentDirectoryPath,
+            isDirectory: true
+        )
+    ) throws {
+        guard referenceDirectory.path != outputDirectory.path else {
+            throw MLXFastError.invalidInput(
+                "transform reference and output directories must be different: \(referenceDirectory.path)"
+            )
+        }
+        let outputPrefix = outputDirectory.path == "/" ? "/" : outputDirectory.path + "/"
+        guard !referenceDirectory.path.hasPrefix(outputPrefix) else {
+            throw MLXFastError.invalidInput(
+                "transform output directory cannot contain the reference directory: \(outputDirectory.path)"
+            )
+        }
+        let referencePrefix = referenceDirectory.path == "/"
+            ? "/"
+            : referenceDirectory.path + "/"
+        guard !outputDirectory.path.hasPrefix(referencePrefix) else {
+            throw MLXFastError.invalidInput(
+                "transform output directory cannot be inside the reference directory: \(outputDirectory.path)"
+            )
+        }
+
+        let canonicalWorkingDirectory = canonicalURL(workingDirectory)
+        guard canonicalWorkingDirectory.path != outputDirectory.path,
+              !canonicalWorkingDirectory.path.hasPrefix(outputPrefix)
+        else {
+            throw MLXFastError.invalidInput(
+                "transform output directory cannot contain the current working directory: \(outputDirectory.path)"
+            )
+        }
+    }
+
+    private static func installTransformedDirectory(
+        _ stagedDirectory: URL,
+        at outputDirectory: URL,
+        fileManager: FileManager
+    ) throws {
+        if fileManager.fileExists(atPath: outputDirectory.path) {
+            _ = try fileManager.replaceItemAt(outputDirectory, withItemAt: stagedDirectory)
+        } else {
+            try fileManager.moveItem(at: stagedDirectory, to: outputDirectory)
         }
     }
 

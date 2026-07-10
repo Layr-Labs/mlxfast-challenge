@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # Ensure private benchmark material is only used by this repository's benchmark
-# workflow file. Production orchestrators dispatch the trusted default branch;
-# PR-branch workflow testing must opt in explicitly via the workflow input.
+# workflow file on trusted main. Candidate commits are passed to that workflow
+# as data and cannot select the workflow ref.
 set -euo pipefail
 
-TRUSTED_REPOSITORY="${MLXFAST_TRUSTED_REPOSITORY:-Layr-Labs/mlxfast-challenge-dev}"
-WORKFLOW_PATH="${MLXFAST_TRUSTED_BENCHMARK_WORKFLOW:-.github/workflows/benchmark.yml}"
+readonly TRUSTED_REPOSITORY="Layr-Labs/mlxfast-challenge-dev"
+readonly WORKFLOW_PATH=".github/workflows/benchmark.yml"
+readonly TRUSTED_REF="refs/heads/main"
 
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 : "${GITHUB_REF:?GITHUB_REF is required}"
 : "${GITHUB_WORKFLOW_REF:?GITHUB_WORKFLOW_REF is required}"
 : "${GITHUB_EVENT_NAME:?GITHUB_EVENT_NAME is required}"
 
-TRUSTED_REF="${MLXFAST_TRUSTED_BENCHMARK_REF:-refs/heads/main}"
 expected_workflow_ref="${TRUSTED_REPOSITORY}/${WORKFLOW_PATH}@${TRUSTED_REF}"
 
 if [[ "${GITHUB_REPOSITORY}" != "${TRUSTED_REPOSITORY}" ]]; then

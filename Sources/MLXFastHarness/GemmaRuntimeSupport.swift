@@ -11,6 +11,20 @@ import Tokenizers
 
 extension GemmaRuntime {
     static func currentResidentMemoryGB() -> Double {
+        guard let info = processMemoryInfo() else {
+            return 0
+        }
+        return Double(info.resident_size) / Double(1 << 30)
+    }
+
+    static func peakResidentMemoryGB() -> Double {
+        guard let info = processMemoryInfo() else {
+            return 0
+        }
+        return Double(info.resident_size_max) / Double(1 << 30)
+    }
+
+    private static func processMemoryInfo() -> mach_task_basic_info? {
         var info = mach_task_basic_info()
         var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.stride / MemoryLayout<integer_t>.stride)
         let result = withUnsafeMutablePointer(to: &info) { pointer in
@@ -24,9 +38,9 @@ extension GemmaRuntime {
             }
         }
         guard result == KERN_SUCCESS else {
-            return 0
+            return nil
         }
-        return Double(info.resident_size) / Double(1 << 30)
+        return info
     }
 
     static func secondsSince(_ start: UInt64) -> Double {

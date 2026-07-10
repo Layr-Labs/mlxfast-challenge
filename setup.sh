@@ -41,9 +41,25 @@ else
   REFERENCE_DIR="${REFERENCE_CACHE_DIR}"
 fi
 REFERENCE_COMPAT_LINK="${MLXFAST_REFERENCE_COMPAT_LINK:-${DEFAULT_REFERENCE_DIR}}"
+# This is a verification stamp, retained under its original environment-variable
+# name for compatibility. It is not the inter-process mutation lock below.
 REFERENCE_CACHE_LOCK_PATH="${MLXFAST_REFERENCE_CACHE_LOCK_PATH:-${REFERENCE_DIR}/.mlxfast-reference-cache.lock}"
+if [[ -d "${REFERENCE_DIR}" ]]; then
+  CANONICAL_REFERENCE_LOCK_BASE="$(cd -P "${REFERENCE_DIR}" && pwd -P)"
+else
+  REFERENCE_LOCK_PARENT="$(dirname "${REFERENCE_DIR}")"
+  REFERENCE_LOCK_NAME="$(basename "${REFERENCE_DIR}")"
+  CANONICAL_REFERENCE_LOCK_PARENT="$(cd -P "${REFERENCE_LOCK_PARENT}" 2>/dev/null && pwd -P)" \
+    || CANONICAL_REFERENCE_LOCK_PARENT="${REFERENCE_LOCK_PARENT}"
+  CANONICAL_REFERENCE_LOCK_BASE="${CANONICAL_REFERENCE_LOCK_PARENT}/${REFERENCE_LOCK_NAME}"
+fi
+REFERENCE_CACHE_MUTATION_LOCK_DIR="${MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_DIR:-${CANONICAL_REFERENCE_LOCK_BASE}.mlxfast-setup.lock}"
+REFERENCE_CACHE_MUTATION_LOCK_TIMEOUT_SECONDS="${MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_TIMEOUT_SECONDS:-1800}"
+REFERENCE_CACHE_MUTATION_LOCK_STALE_SECONDS="${MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_STALE_SECONDS:-60}"
 SETUP_STARTED_SECONDS="${SECONDS}"
 METALLIB_BUILD_PID=""
+METALLIB_BUILD_STATE="not_started"
+REFERENCE_CACHE_MUTATION_LOCK_HELD=0
 REFERENCE_REQUIRED_METADATA_FILES=(
   "config.json"
   "model.safetensors.index.json"
@@ -76,9 +92,19 @@ Important environment variables:
                                      Default: ${DEFAULT_REFERENCE_BASE_URL}
   MLXFAST_REFERENCE_MANIFEST_PATH    SHA256 manifest for the reference files.
                                      Default: ${REFERENCE_MANIFEST_PATH}
-  MLXFAST_REFERENCE_CACHE_LOCK_PATH  Local lock proving the checkpoint was
+  MLXFAST_REFERENCE_CACHE_LOCK_PATH  Local stamp proving the checkpoint was
                                      fully verified by this manifest.
                                      Default: ${REFERENCE_CACHE_LOCK_PATH}
+  MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_DIR
+                                     Inter-process lock directory serializing
+                                     shared-cache downloads and repairs.
+                                     Default: ${REFERENCE_CACHE_MUTATION_LOCK_DIR}
+  MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_TIMEOUT_SECONDS
+                                     Maximum time to wait for another setup.
+                                     Default: ${REFERENCE_CACHE_MUTATION_LOCK_TIMEOUT_SECONDS}
+  MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_STALE_SECONDS
+                                     Age for reclaiming ownerless lock dirs.
+                                     Default: ${REFERENCE_CACHE_MUTATION_LOCK_STALE_SECONDS}
   MLXFAST_REFERENCE_DOWNLOAD_JOBS    Parallel safetensors downloads.
                                      Default: ${REFERENCE_DOWNLOAD_JOBS}
   MLXFAST_REFERENCE_MIN_FREE_GIB     Required free space before download.
@@ -387,8 +413,27 @@ EOF
   fi
 }
 
+metal_toolchain_identifier() {
+  xcodebuild -showComponent MetalToolchain 2>/dev/null \
+    | awk -F': ' '/Toolchain Identifier/ { print $2; exit }' \
+    || true
+}
+
+configure_metal_toolchain_environment() {
+  local identifier
+  identifier="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER:-$(metal_toolchain_identifier)}"
+  if [[ -n "${identifier}" ]]; then
+    export TOOLCHAINS="${TOOLCHAINS:-${identifier}}"
+  fi
+}
+
+metal_compiler_is_available() {
+  configure_metal_toolchain_environment
+  xcrun -sdk macosx metal -v >/dev/null 2>&1
+}
+
 ensure_metal_toolchain() {
-  if xcrun -sdk macosx metal -v >/dev/null 2>&1; then
+  if metal_compiler_is_available; then
     return 0
   fi
 
@@ -427,7 +472,7 @@ EOF
     return 1
   fi
 
-  if ! xcrun -sdk macosx metal -v >/dev/null 2>&1; then
+  if ! metal_compiler_is_available; then
     echo "setup.sh: Metal Toolchain installation finished, but xcrun still cannot execute metal" >&2
     return 1
   fi
@@ -767,7 +812,7 @@ reference_cache_lock_is_current() {
 write_reference_cache_lock() {
   local reference_dir="$1"
   local lock_path="${REFERENCE_CACHE_LOCK_PATH}"
-  local temp_path="${lock_path}.tmp"
+  local temp_path
   local manifest_hash
   local line
   local expected_hash
@@ -779,29 +824,38 @@ write_reference_cache_lock() {
   local actual_mtime
   local file_count=0
   local byte_count=0
-  local files_path="${temp_path}.files"
+  local files_path
 
   if ! manifest_hash="$(reference_manifest_hash)"; then
     return 1
   fi
 
   mkdir -p "$(dirname "${lock_path}")"
+  if ! temp_path="$(mktemp "${lock_path}.tmp.XXXXXX")"; then
+    echo "setup.sh: failed to create temporary reference cache stamp" >&2
+    return 1
+  fi
+  if ! files_path="$(mktemp "${lock_path}.files.XXXXXX")"; then
+    rm -f "${temp_path}"
+    echo "setup.sh: failed to create temporary reference cache file list" >&2
+    return 1
+  fi
   : > "${files_path}"
   while IFS= read -r line || [[ -n "${line}" ]]; do
     [[ -z "${line}" || "${line}" == \#* ]] && continue
     read -r expected_hash expected_size relative_path extra <<< "${line}"
     if [[ -n "${extra:-}" || -z "${expected_hash:-}" || -z "${expected_size:-}" || -z "${relative_path:-}" ]]; then
-      rm -f "${files_path}"
+      rm -f "${temp_path}" "${files_path}"
       return 1
     fi
     file_path="${reference_dir}/${relative_path}"
     [[ -f "${file_path}" ]] || {
-      rm -f "${files_path}"
+      rm -f "${temp_path}" "${files_path}"
       return 1
     }
     actual_size="$(wc -c < "${file_path}" | tr -d ' ')"
     if ! actual_mtime="$(file_mtime_seconds "${file_path}")"; then
-      rm -f "${files_path}"
+      rm -f "${temp_path}" "${files_path}"
       return 1
     fi
     printf '%s\t%s\t%s\n' "${relative_path}" "${actual_size}" "${actual_mtime}" >> "${files_path}"
@@ -810,11 +864,11 @@ write_reference_cache_lock() {
   done < "${REFERENCE_MANIFEST_PATH}"
 
   if [[ "${file_count}" -eq 0 ]]; then
-    rm -f "${files_path}"
+    rm -f "${temp_path}" "${files_path}"
     return 1
   fi
 
-  {
+  if ! {
     printf 'version=1\n'
     printf 'model_repo=%s\n' "${REFERENCE_MODEL_REPO}"
     printf 'revision=%s\n' "${REFERENCE_REVISION}"
@@ -824,9 +878,15 @@ write_reference_cache_lock() {
     printf 'verified_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf '%s\n' '--files--'
     cat "${files_path}"
-  } > "${temp_path}"
+  } > "${temp_path}"; then
+    rm -f "${temp_path}" "${files_path}"
+    return 1
+  fi
   rm -f "${files_path}"
-  mv "${temp_path}" "${lock_path}"
+  if ! mv "${temp_path}" "${lock_path}"; then
+    rm -f "${temp_path}"
+    return 1
+  fi
   echo "setup.sh: wrote reference cache lock ${lock_path}"
 }
 
@@ -841,27 +901,27 @@ download_reference_file() {
 
   if reference_file_is_current "${file}" "${output_path}" "${label}"; then
     echo "setup.sh: using cached ${label}"
-    touch "${marker_path}"
+    touch "${marker_path}" || return 1
     return 0
   fi
-  rm -f "${marker_path}"
+  rm -f "${marker_path}" || return 1
 
   if ! url="$(download_url_for_file "${url}")"; then
     return 1
   fi
 
-  mkdir -p "$(dirname "${output_path}")"
+  mkdir -p "$(dirname "${output_path}")" || return 1
   started_seconds="${SECONDS}"
   while [[ "${attempt}" -le 2 ]]; do
     if [[ "${attempt}" == "1" ]]; then
       echo "setup.sh: downloading ${label}"
     else
       echo "setup.sh: redownloading ${label} from scratch after hash verification failed"
-      rm -f "${output_path}" "${marker_path}"
+      rm -f "${output_path}" "${marker_path}" || return 1
     fi
 
     if [[ -n "${REFERENCE_AUTH_HEADER}" ]]; then
-      curl \
+      if ! curl \
         --fail \
         --location \
         --retry 5 \
@@ -870,9 +930,11 @@ download_reference_file() {
         --continue-at - \
         -H "${REFERENCE_AUTH_HEADER}" \
         --output "${output_path}" \
-        "${url}"
+        "${url}"; then
+        return 1
+      fi
     else
-      curl \
+      if ! curl \
         --fail \
         --location \
         --retry 5 \
@@ -880,9 +942,11 @@ download_reference_file() {
         --retry-delay 2 \
         --continue-at - \
         --output "${output_path}" \
-        "${url}"
+        "${url}"; then
+        return 1
+      fi
     fi
-    touch "${marker_path}"
+    touch "${marker_path}" || return 1
 
     if reference_file_is_current "${file}" "${output_path}" "${label}"; then
       echo "setup.sh: downloaded ${label} elapsed=$(format_duration "$((SECONDS - started_seconds))")"
@@ -926,7 +990,7 @@ download_reference_shards() {
     echo "setup.sh: downloading ${total} safetensors shard(s) with 1 parallel job"
     for file in "$@"; do
       ordinal=$((ordinal + 1))
-      download_reference_file "${file}" "${output_dir}/${file}" "shard ${ordinal}/${total}: ${file}"
+      download_reference_file "${file}" "${output_dir}/${file}" "shard ${ordinal}/${total}: ${file}" || return 1
     done
     echo "setup.sh: downloaded ${total}/${total} safetensors shard(s) elapsed=$(format_duration "$((SECONDS - started_seconds))")"
     return 0
@@ -941,15 +1005,17 @@ download_reference_shards() {
   local manifest_entry
   local expected_hash
   local expected_size
-  for file in "$@"; do
-    ordinal=$((ordinal + 1))
-    expected_hash=""
-    expected_size=""
-    if manifest_entry="$(reference_manifest_entry "${file}")"; then
-      read -r expected_hash expected_size <<< "${manifest_entry}"
-    fi
-    printf "%s|%s|%s|%s\0" "${ordinal}" "${file}" "${expected_hash}" "${expected_size}"
-  done | xargs -0 -I{} -P "${jobs}" bash -c '
+  # The embedded program expands these variables in each child Bash process.
+  # shellcheck disable=SC2016
+  if ! for file in "$@"; do
+      ordinal=$((ordinal + 1))
+      expected_hash=""
+      expected_size=""
+      if manifest_entry="$(reference_manifest_entry "${file}")"; then
+        read -r expected_hash expected_size <<< "${manifest_entry}"
+      fi
+      printf "%s|%s|%s|%s\0" "${ordinal}" "${file}" "${expected_hash}" "${expected_size}"
+    done | xargs -0 -I{} -P "${jobs}" bash -c '
     set -euo pipefail
     record="$1"
     output_dir="$2"
@@ -1096,7 +1162,9 @@ download_reference_shards() {
 
     echo "setup.sh: failed to download verified shard ${ordinal}/${total}: ${file}" >&2
     exit 1
-  ' _ {} "${output_dir}" "${total}"
+  ' _ {} "${output_dir}" "${total}"; then
+    return 1
+  fi
   echo "setup.sh: downloaded ${total}/${total} safetensors shard(s) elapsed=$(format_duration "$((SECONDS - started_seconds))")"
 }
 
@@ -1128,7 +1196,7 @@ verify_reference_weights() {
   if ! shard_list="$(list_reference_shards "${index_path}")"; then
     return 1
   fi
-  start_mlx_metallib_build
+  start_mlx_metallib_build || return 1
   while IFS= read -r file; do
     if [[ -n "${file}" ]]; then
       shard_files+=("${file}")
@@ -1195,7 +1263,7 @@ verify_reference_weights_after_verified_download() {
   if ! shard_list="$(list_reference_shards "${index_path}")"; then
     return 1
   fi
-  start_mlx_metallib_build
+  start_mlx_metallib_build || return 1
   while IFS= read -r file; do
     if [[ -n "${file}" ]]; then
       shard_files+=("${file}")
@@ -1299,6 +1367,114 @@ setup_parallel_metallib_enabled() {
   esac
 }
 
+recover_stale_reference_cache_mutation_lock() {
+  local lock_dir="${REFERENCE_CACHE_MUTATION_LOCK_DIR}"
+  local owner_path="${lock_dir}/owner"
+  local owner_line=""
+  local owner_pid=""
+  local owner_host=""
+  local field
+  local stale=0
+
+  if [[ -f "${owner_path}" ]]; then
+    owner_line="$(cat "${owner_path}" 2>/dev/null || true)"
+    for field in ${owner_line}; do
+      case "${field}" in
+        pid=*) owner_pid="${field#pid=}" ;;
+        host=*) owner_host="${field#host=}" ;;
+      esac
+    done
+    if [[ "${owner_host}" == "$(hostname)" \
+        && "${owner_pid}" =~ ^[1-9][0-9]*$ ]] \
+        && ! kill -0 "${owner_pid}" >/dev/null 2>&1; then
+      stale=1
+    fi
+  else
+    local lock_mtime
+    local now
+    if lock_mtime="$(file_mtime_seconds "${lock_dir}" 2>/dev/null)"; then
+      now="$(date +%s)"
+      if (( now - lock_mtime >= REFERENCE_CACHE_MUTATION_LOCK_STALE_SECONDS )); then
+        stale=1
+      fi
+    fi
+  fi
+
+  if [[ "${stale}" != "1" ]]; then
+    return 1
+  fi
+  rm -f "${owner_path}" || return 1
+  if rmdir "${lock_dir}" 2>/dev/null; then
+    echo "setup.sh: recovered stale reference cache mutation lock ${lock_dir}"
+    return 0
+  fi
+  return 1
+}
+
+acquire_reference_cache_mutation_lock() {
+  local lock_dir="${REFERENCE_CACHE_MUTATION_LOCK_DIR}"
+  local started_seconds="${SECONDS}"
+  local announced_wait=0
+
+  if ! [[ "${REFERENCE_CACHE_MUTATION_LOCK_TIMEOUT_SECONDS}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "setup.sh: MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_TIMEOUT_SECONDS must be a non-negative integer" >&2
+    return 1
+  fi
+  if ! [[ "${REFERENCE_CACHE_MUTATION_LOCK_STALE_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "setup.sh: MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_STALE_SECONDS must be a positive integer" >&2
+    return 1
+  fi
+  mkdir -p "$(dirname "${lock_dir}")" || return 1
+
+  while ! mkdir "${lock_dir}" 2>/dev/null; do
+    if [[ ! -d "${lock_dir}" ]]; then
+      echo "setup.sh: reference cache mutation lock path exists and is not a directory: ${lock_dir}" >&2
+      return 1
+    fi
+    if recover_stale_reference_cache_mutation_lock; then
+      continue
+    fi
+    if [[ "${announced_wait}" == "0" ]]; then
+      echo "setup.sh: waiting for reference cache mutation lock ${lock_dir}"
+      announced_wait=1
+    fi
+    if (( SECONDS - started_seconds >= REFERENCE_CACHE_MUTATION_LOCK_TIMEOUT_SECONDS )); then
+      echo "setup.sh: timed out waiting for reference cache mutation lock ${lock_dir}" >&2
+      if [[ -f "${lock_dir}/owner" ]]; then
+        echo "setup.sh: lock owner: $(cat "${lock_dir}/owner")" >&2
+      fi
+      return 1
+    fi
+    sleep 1
+  done
+
+  REFERENCE_CACHE_MUTATION_LOCK_HELD=1
+  if ! printf 'pid=%s host=%s started_at=%s\n' \
+      "$$" "$(hostname)" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "${lock_dir}/owner"; then
+    rm -f "${lock_dir}/owner"
+    rmdir "${lock_dir}" 2>/dev/null || true
+    REFERENCE_CACHE_MUTATION_LOCK_HELD=0
+    echo "setup.sh: failed to record reference cache mutation lock owner" >&2
+    return 1
+  fi
+  echo "setup.sh: acquired reference cache mutation lock ${lock_dir}"
+}
+
+release_reference_cache_mutation_lock() {
+  local lock_dir="${REFERENCE_CACHE_MUTATION_LOCK_DIR}"
+  if [[ "${REFERENCE_CACHE_MUTATION_LOCK_HELD}" != "1" ]]; then
+    return 0
+  fi
+
+  rm -f "${lock_dir}/owner"
+  if ! rmdir "${lock_dir}"; then
+    echo "setup.sh: failed to release reference cache mutation lock ${lock_dir}" >&2
+    return 1
+  fi
+  REFERENCE_CACHE_MUTATION_LOCK_HELD=0
+  echo "setup.sh: released reference cache mutation lock ${lock_dir}"
+}
+
 cleanup_background_builds() {
   local status="$?"
   if [[ "${status}" != "0" ]]; then
@@ -1308,6 +1484,11 @@ cleanup_background_builds() {
   fi
   if [[ -n "${METALLIB_BUILD_PID}" ]]; then
     wait "${METALLIB_BUILD_PID}" >/dev/null 2>&1 || true
+  fi
+  if ! release_reference_cache_mutation_lock; then
+    if [[ "${status}" == "0" ]]; then
+      status=1
+    fi
   fi
   return "${status}"
 }
@@ -1335,18 +1516,35 @@ build_mlx_metallib() {
     echo "setup.sh: skipping mlx.metallib build"
     return 0
   fi
-  ensure_cmake
-  ensure_metal_toolchain
+  ensure_cmake || return 1
+  ensure_metal_toolchain || return 1
   echo "setup.sh: building mlx.metallib for MLX Swift runtime"
-  tools/build-mlx-metallib.sh
+  tools/build-mlx-metallib.sh || return 1
 }
 
 start_mlx_metallib_build() {
   local parallel_status
-  if [[ "${MLXFAST_SKIP_MLX_METALLIB:-0}" == "1" || -n "${METALLIB_BUILD_PID}" ]]; then
+  if [[ "${MLXFAST_SKIP_MLX_METALLIB:-0}" == "1" ]]; then
+    METALLIB_BUILD_STATE="completed"
     return 0
   fi
+  case "${METALLIB_BUILD_STATE}" in
+    running|completed)
+      return 0
+      ;;
+    failed)
+      echo "setup.sh: mlx.metallib build already failed" >&2
+      return 1
+      ;;
+    not_started)
+      ;;
+    *)
+      echo "setup.sh: invalid mlx.metallib build state: ${METALLIB_BUILD_STATE}" >&2
+      return 1
+      ;;
+  esac
   if setup_parallel_metallib_enabled; then
+    METALLIB_BUILD_STATE="running"
     build_mlx_metallib &
     METALLIB_BUILD_PID="$!"
     echo "setup.sh: mlx.metallib build running in background pid=${METALLIB_BUILD_PID}"
@@ -1355,7 +1553,12 @@ start_mlx_metallib_build() {
     if [[ "${parallel_status}" != "1" ]]; then
       return "${parallel_status}"
     fi
-    build_mlx_metallib
+    METALLIB_BUILD_STATE="running"
+    if ! build_mlx_metallib; then
+      METALLIB_BUILD_STATE="failed"
+      return 1
+    fi
+    METALLIB_BUILD_STATE="completed"
   fi
 }
 
@@ -1363,15 +1566,38 @@ wait_for_mlx_metallib_build() {
   if [[ "${MLXFAST_SKIP_MLX_METALLIB:-0}" == "1" ]]; then
     return 0
   fi
-  if [[ -n "${METALLIB_BUILD_PID}" ]]; then
-    echo "setup.sh: waiting for mlx.metallib build"
-    if ! wait "${METALLIB_BUILD_PID}"; then
+  case "${METALLIB_BUILD_STATE}" in
+    running)
+      if [[ -z "${METALLIB_BUILD_PID}" ]]; then
+        echo "setup.sh: mlx.metallib build is running without a background pid" >&2
+        METALLIB_BUILD_STATE="failed"
+        return 1
+      fi
+      echo "setup.sh: waiting for mlx.metallib build"
+      if ! wait "${METALLIB_BUILD_PID}"; then
+        METALLIB_BUILD_PID=""
+        METALLIB_BUILD_STATE="failed"
+        echo "setup.sh: mlx.metallib build failed" >&2
+        return 1
+      fi
       METALLIB_BUILD_PID=""
+      METALLIB_BUILD_STATE="completed"
+      ;;
+    completed)
+      ;;
+    failed)
       echo "setup.sh: mlx.metallib build failed" >&2
       return 1
-    fi
-    METALLIB_BUILD_PID=""
-  fi
+      ;;
+    not_started)
+      echo "setup.sh: mlx.metallib build was not started" >&2
+      return 1
+      ;;
+    *)
+      echo "setup.sh: invalid mlx.metallib build state: ${METALLIB_BUILD_STATE}" >&2
+      return 1
+      ;;
+  esac
   if [[ ! -f "${MLX_METALLIB}" ]]; then
     echo "setup.sh: mlx.metallib missing at ${MLX_METALLIB}" >&2
     return 1
@@ -1460,24 +1686,32 @@ verify_reference_manifest() {
 ensure_reference_compat_link() {
   local reference_dir="$1"
   local link_path="${REFERENCE_COMPAT_LINK}"
+  local link_absolute
   local link_parent
+  local link_name
   local link_target
 
-  case "${reference_dir}" in
-    /*) ;;
-    *) reference_dir="${PWD}/${reference_dir}" ;;
-  esac
+  reference_dir="$(cd -P "${reference_dir}" 2>/dev/null && pwd -P)" || return 1
+  if [[ -d "${link_path}" ]]; then
+    link_absolute="$(cd -P "${link_path}" 2>/dev/null && pwd -P)" || return 1
+  else
+    link_parent="$(dirname "${link_path}")"
+    link_name="$(basename "${link_path}")"
+    mkdir -p "${link_parent}" || return 1
+    link_parent="$(cd -P "${link_parent}" 2>/dev/null && pwd -P)" || return 1
+    link_absolute="${link_parent}/${link_name}"
+  fi
 
-  if [[ "${reference_dir}" == "${link_path}" ]]; then
+  if [[ "${reference_dir}" == "${link_absolute}" ]]; then
     return 0
   fi
 
   if [[ -L "${link_path}" ]]; then
-    link_target="$(readlink "${link_path}")"
+    link_target="$(readlink "${link_path}")" || return 1
     if [[ "${link_target}" == "${reference_dir}" ]]; then
       return 0
     fi
-    rm -f "${link_path}"
+    rm -f "${link_path}" || return 1
   elif [[ -e "${link_path}" ]]; then
     cat >&2 <<EOF
 setup.sh: compatibility reference path exists and is not a symlink: ${link_path}
@@ -1491,12 +1725,12 @@ EOF
   fi
 
   link_parent="$(dirname "${link_path}")"
-  mkdir -p "${link_parent}"
-  ln -s "${reference_dir}" "${link_path}"
+  mkdir -p "${link_parent}" || return 1
+  ln -s "${reference_dir}" "${link_path}" || return 1
   echo "setup.sh: linked ${link_path} -> ${reference_dir}"
 }
 
-download_reference_weights() {
+download_reference_weights_locked() {
   local reference_dir="$1"
   local parent_dir
   local file
@@ -1505,35 +1739,14 @@ download_reference_weights() {
   local shard_list
   local shard_files=()
 
-  if [[ -f "${reference_dir}/config.json" ]]; then
-    if verify_reference_weights "${reference_dir}"; then
-      echo "setup.sh: reference weights already present at ${reference_dir}"
-      ensure_reference_compat_link "${reference_dir}"
-      return 0
-    fi
-    echo "setup.sh: reference cache at ${reference_dir} is incomplete or stale; repairing changed files"
-  fi
-
-  if [[ -e "${reference_dir}" && ! -d "${reference_dir}" ]]; then
-    cat >&2 <<EOF
-setup.sh: ${reference_dir} exists but is not a directory.
-
-Move it aside or set MLXFAST_REFERENCE_DIR to a checkpoint directory.
-
-EOF
-    return 1
-  fi
-
   parent_dir="$(dirname "${reference_dir}")"
-  mkdir -p "${parent_dir}"
-
-  ensure_reference_space "${parent_dir}"
-  mkdir -p "${reference_dir}"
+  ensure_reference_space "${parent_dir}" || return 1
+  mkdir -p "${reference_dir}" || return 1
 
   echo "setup.sh: downloading ${REFERENCE_MODEL_REPO} from ${REFERENCE_BASE_URL}"
   echo "setup.sh: reference cache path ${reference_dir}"
   for file in "${REFERENCE_REQUIRED_METADATA_FILES[@]}"; do
-    download_reference_file "${file}" "${reference_dir}/${file}"
+    download_reference_file "${file}" "${reference_dir}/${file}" || return 1
   done
   for file in "${REFERENCE_OPTIONAL_METADATA_FILES[@]}"; do
     download_optional_reference_file "${file}" "${reference_dir}/${file}"
@@ -1552,7 +1765,7 @@ EOF
   if ! shard_list="$(list_reference_shards "${index_path}")"; then
     return 1
   fi
-  start_mlx_metallib_build
+  start_mlx_metallib_build || return 1
   while IFS= read -r file; do
     if [[ -n "${file}" ]]; then
       shard_files+=("${file}")
@@ -1564,7 +1777,7 @@ EOF
   fi
 
   echo "setup.sh: checkpoint index lists ${#shard_files[@]} safetensors shard(s)"
-  download_reference_shards "${reference_dir}" "${shard_files[@]}"
+  download_reference_shards "${reference_dir}" "${shard_files[@]}" || return 1
   if reference_post_download_full_verify_enabled; then
     if ! verify_reference_weights "${reference_dir}"; then
       return 1
@@ -1580,9 +1793,48 @@ EOF
     fi
   fi
 
-  find "${reference_dir}" -name "*.complete" -type f -delete
-  ensure_reference_compat_link "${reference_dir}"
+  find "${reference_dir}" -name "*.complete" -type f -delete || return 1
+  ensure_reference_compat_link "${reference_dir}" || return 1
   echo "setup.sh: reference weights ready at ${reference_dir}"
+}
+
+download_reference_weights() {
+  local reference_dir="$1"
+  local parent_dir
+  local operation_status=0
+  local release_status=0
+
+  if [[ -e "${reference_dir}" && ! -d "${reference_dir}" ]]; then
+    cat >&2 <<EOF
+setup.sh: ${reference_dir} exists but is not a directory.
+
+Move it aside or set MLXFAST_REFERENCE_DIR to a checkpoint directory.
+
+EOF
+    return 1
+  fi
+
+  parent_dir="$(dirname "${reference_dir}")"
+  mkdir -p "${parent_dir}" || return 1
+  acquire_reference_cache_mutation_lock || return 1
+
+  # Every cache read is checked under the same mutex as repair so a setup using
+  # another manifest or path alias cannot mutate files during validation.
+  if [[ -f "${reference_dir}/config.json" ]] && verify_reference_weights "${reference_dir}"; then
+    echo "setup.sh: reference weights became ready while waiting at ${reference_dir}"
+    ensure_reference_compat_link "${reference_dir}" || operation_status=$?
+  else
+    if [[ -f "${reference_dir}/config.json" ]]; then
+      echo "setup.sh: reference cache at ${reference_dir} is incomplete or stale; repairing changed files"
+    fi
+    download_reference_weights_locked "${reference_dir}" || operation_status=$?
+  fi
+
+  release_reference_cache_mutation_lock || release_status=$?
+  if [[ "${operation_status}" == "0" && "${release_status}" != "0" ]]; then
+    operation_status="${release_status}"
+  fi
+  return "${operation_status}"
 }
 
 ensure_swift_toolchain
@@ -1591,7 +1843,8 @@ trap cleanup_background_builds EXIT
 
 if [[ "${MLXFAST_SKIP_WEIGHTS_DOWNLOAD:-0}" == "1" || "${SKIP_MODEL_DOWNLOAD:-0}" == "1" ]]; then
   build_swift_harness
-  build_mlx_metallib
+  start_mlx_metallib_build
+  wait_for_mlx_metallib_build
   echo "setup.sh: skipping reference weight download"
   print_setup_summary "skipped"
   exit 0

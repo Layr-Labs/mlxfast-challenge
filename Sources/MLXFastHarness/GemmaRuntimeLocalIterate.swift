@@ -104,7 +104,7 @@ extension GemmaRuntime {
                     + "seconds=\(formatSeconds(validationSeconds))"
             )
 
-            let timedStart = DispatchTime.now().uptimeNanoseconds
+            let timingWallStart = DispatchTime.now().uptimeNanoseconds
             progress("\(modeName) checked timing start")
             let timing: LocalIterateTimingResult
             if let worker {
@@ -129,7 +129,11 @@ extension GemmaRuntime {
                     progress: progress
                 )
             }
-            timedSeconds = secondsSince(timedStart)
+            let timingWallSeconds = secondsSince(timingWallStart)
+            timedSeconds = timing.prefillSecondsPerToken
+                * Double(localCase.promptTokens.count * options.timingRepeats)
+                + timing.decode.secondsPerToken
+                * Double(options.benchmarkDecodeSteps * options.timingRepeats)
             correctnessSeconds = timedSeconds
             correctnessReport = timing.correctness
             expertStats = timing.expertStats
@@ -139,7 +143,8 @@ extension GemmaRuntime {
                     + "checked_steps=\(timing.correctness.checkedSteps) "
                     + "prefill_seconds_per_token=\(formatDouble(timing.prefillSecondsPerToken)) "
                     + "decode_seconds_per_token=\(formatDouble(timing.decode.secondsPerToken)) "
-                    + "seconds=\(formatSeconds(timedSeconds))"
+                    + "measured_seconds=\(formatSeconds(timedSeconds)) "
+                    + "wall_seconds=\(formatSeconds(timingWallSeconds))"
             )
             emitLocalIterateSummary(modeName: modeName, timing: timing, progress: progress)
             guard timing.correctness.passed else {
@@ -381,6 +386,36 @@ extension GemmaRuntime {
         let peakRamGB: Double
     }
 
+    static func runLocalPhaseCoolGate(
+        phase: String,
+        progress: ((String) -> Void)? = nil
+    ) throws {
+        guard let helper = ProcessInfo.processInfo.environment["MLXFAST_LOCAL_COOL_GATE_HELPER"],
+              !helper.isEmpty
+        else {
+            return
+        }
+        guard FileManager.default.isExecutableFile(atPath: helper) else {
+            throw MLXFastError.invalidInput("local GPU cool-down helper is not executable: \(helper)")
+        }
+
+        progress?("local thermal gate start phase=\(phase)")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: helper)
+        process.arguments = ["--local-cool-gate-only"]
+        var environment = ProcessInfo.processInfo.environment
+        environment["MLXFAST_LOCAL_COOL_GATE_PHASE"] = phase
+        process.environment = environment
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+            throw MLXFastError.invalidInput(
+                "local GPU cool-down gate failed for \(phase) with status \(process.terminationStatus)"
+            )
+        }
+        progress?("local thermal gate complete phase=\(phase)")
+    }
+
     static func runLocalIterateCheckedTiming(
         weightsPath: String,
         testCase: GoldenCase,
@@ -423,6 +458,7 @@ extension GemmaRuntime {
             if timingRepeats > 1 {
                 progress?("\(modeName) checked pass \(repeatIndex + 1)/\(timingRepeats) start")
             }
+            try runLocalPhaseCoolGate(phase: "prefill", progress: progress)
             progress?("\(modeName) prefill measured start prompt_tokens=\(testCase.promptTokens.count)")
             let prefillHeartbeat = startPhaseHeartbeat(
                 label: "\(modeName) prefill measured",
@@ -466,6 +502,7 @@ extension GemmaRuntime {
             // setup, seed prefill, cache materialization, and checked token steps
             // to decode_seconds_per_token so local signals cannot hide work that
             // the official benchmark charges.
+            try runLocalPhaseCoolGate(phase: "decode", progress: progress)
             let decodePhaseStart = DispatchTime.now().uptimeNanoseconds
             progress?("\(modeName) decode measured start tokens=\(decodeSteps) includes_seed_prefill=true")
             let seedHeartbeat = startPhaseHeartbeat(
@@ -475,16 +512,6 @@ extension GemmaRuntime {
             defer {
                 seedHeartbeat?.cancel()
             }
-            let warmupCache = Gemma4ModelCache(config: weightCache.config)
-            let warmupLogits = try Gemma4Model.logits(
-                inputIDs: inputIDsArray(testCase.promptTokens),
-                weightCache: weightCache,
-                cache: warmupCache,
-                positionOffset: 0
-            )
-            _ = try GemmaCorrectness.greedyToken(from: warmupLogits)
-            Memory.clearCache()
-
             let cache = Gemma4ModelCache(config: weightCache.config)
             var logits = try Gemma4Model.logits(
                 inputIDs: inputIDsArray(testCase.promptTokens),
@@ -630,6 +657,7 @@ extension GemmaRuntime {
                 defer {
                     prefillWorker.close()
                 }
+                try runLocalPhaseCoolGate(phase: "prefill", progress: progress)
                 let prefillStart = DispatchTime.now().uptimeNanoseconds
                 progress?("\(modeName) prefill measured start prompt_tokens=\(testCase.promptTokens.count)")
                 let prefillHeartbeat = startPhaseHeartbeat(
@@ -643,8 +671,6 @@ extension GemmaRuntime {
                 let prefillElapsed = secondsSince(prefillStart)
                 prefillHeartbeat?.cancel()
                 totalPrefillSeconds += prefillElapsed
-                latestStats = response.expertStats ?? latestStats
-                peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
                 guard let prefillToken = response.token else {
                     throw MLXFastError.invalidInput("runtime worker \(modeName) prefill response missing token")
                 }
@@ -654,6 +680,9 @@ extension GemmaRuntime {
                     failureActual = prefillToken
                     reportFirstTokenMismatch(progress, modeName: modeName, checkedStep: failureStep! + 1)
                 }
+                let diagnostics = try prefillWorker.phaseDiagnostics()
+                latestStats = diagnostics.expertStats ?? latestStats
+                peakRamGB = max(peakRamGB, diagnostics.peakRamGB ?? 0)
                 progress?(
                     "\(modeName) prefill measured complete "
                         + localIteratePrefillStatus(
@@ -672,6 +701,7 @@ extension GemmaRuntime {
             defer {
                 decodeWorker.close()
             }
+            try runLocalPhaseCoolGate(phase: "decode", progress: progress)
             let decodePhaseStart = DispatchTime.now().uptimeNanoseconds
             progress?("\(modeName) decode measured start tokens=\(decodeSteps) includes_seed_prefill=true")
             let seedHeartbeat = startPhaseHeartbeat(
@@ -690,8 +720,6 @@ extension GemmaRuntime {
                 "\(modeName) decode seed prefill complete "
                     + "seconds=\(formatSeconds(secondsSince(decodePhaseStart))) (charged to decode)"
             )
-            latestStats = response.expertStats ?? latestStats
-            peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
             guard let seedToken = response.seedToken else {
                 throw MLXFastError.invalidInput("runtime worker \(modeName) decode_begin response missing seed token")
             }
@@ -708,8 +736,6 @@ extension GemmaRuntime {
                 response = try decodeWorker.decodeStep(inputToken: inputToken)
                 let stepElapsed = secondsSince(stepStart)
                 totalStepOnlySeconds += stepElapsed
-                latestStats = response.expertStats ?? latestStats
-                peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
                 guard let token = response.token else {
                     throw MLXFastError.invalidInput("runtime worker \(modeName) decode response missing token")
                 }
@@ -741,6 +767,9 @@ extension GemmaRuntime {
                 )
             }
             totalDecodeSeconds += secondsSince(decodePhaseStart)
+            let diagnostics = try decodeWorker.phaseDiagnostics()
+            latestStats = diagnostics.expertStats ?? latestStats
+            peakRamGB = max(peakRamGB, diagnostics.peakRamGB ?? 0)
             if timingRepeats > 1 {
                 progress?("\(modeName) checked pass \(repeatIndex + 1)/\(timingRepeats) complete")
             }

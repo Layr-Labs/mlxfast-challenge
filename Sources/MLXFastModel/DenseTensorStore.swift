@@ -37,7 +37,10 @@ public final class DenseTensorStore {
         defer {
             try? handle.close()
         }
-        try handle.seek(toOffset: UInt64(record.byteOffset))
+        guard let byteOffset = UInt64(exactly: record.byteOffset) else {
+            throw MLXFastError.invalidInput("negative byte offset for dense tensor \(name)")
+        }
+        try handle.seek(toOffset: byteOffset)
         let data = handle.readData(ofLength: record.byteLength)
         guard data.count == record.byteLength else {
             throw MLXFastError.invalidInput(
@@ -77,8 +80,13 @@ public final class DenseTensorStore {
                         "dense tensor \(record.name) byte length \(record.byteLength) does not match dtype \(record.dtype) and shape \(record.shape) expected \(expectedByteLength)"
                     )
                 }
-                let end = record.byteOffset + record.byteLength
-                guard record.byteOffset >= 0, record.byteLength > 0, end <= byteCount else {
+                let (end, overflow) = record.byteOffset.addingReportingOverflow(record.byteLength)
+                guard
+                    !overflow,
+                    record.byteOffset >= 0,
+                    record.byteLength > 0,
+                    end <= byteCount
+                else {
                     throw MLXFastError.invalidInput(
                         "dense tensor \(record.name) byte range \(record.byteOffset)..<\(end) exceeds shard size \(byteCount)"
                     )
@@ -114,12 +122,19 @@ public final class DenseTensorStore {
                         "tensor \(key) is listed in dense index but missing from \(shard)"
                     )
                 }
+                guard let baseOffset = Int(exactly: header.dataBaseOffset) else {
+                    throw MLXFastError.invalidInput("safetensors header offset exceeds Int range in \(shard)")
+                }
+                let (byteOffset, overflow) = baseOffset.addingReportingOverflow(info.dataStart)
+                guard !overflow else {
+                    throw MLXFastError.invalidInput("dense tensor byte offset overflows Int for \(key)")
+                }
                 records[key] = DenseTensorRecord(
                     name: key,
                     shard: shard,
                     dtype: info.dtype,
                     shape: info.shape,
-                    byteOffset: Int(header.dataBaseOffset) + info.dataStart,
+                    byteOffset: byteOffset,
                     byteLength: info.byteCount
                 )
             }

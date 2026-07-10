@@ -85,14 +85,18 @@ name: benchmark
 # harness-authored benchmark-integrity score hash is cross-checked.
 #
 # Dispatch-only, like before: no PR/push triggers (GitHub self-hosted safety --
-# fork PRs must never reach this runner). The workflow benchmarks whatever ref
-# it is dispatched on; submission branches (submissions/*) are bot-created and
-# differ from main only in benchmark.json editablePaths, re-verified here by
-# the modifiable-surface + static-review steps, with submitted-process logs
-# suppressed.
+# fork PRs must never reach this runner). The workflow itself always executes
+# from trusted main. A submission commit is an exact-SHA input: it is checked
+# out separately, verified against benchmark.json's modifiable surface, and
+# only editablePaths are overlaid into the trusted tree. Submitted-process logs
+# remain suppressed.
 on:
   workflow_dispatch:
     inputs:
+      submission_ref:
+        description: "Exact 40-character candidate commit SHA. Use the current main SHA for an explicit trusted-main run."
+        required: true
+        type: string
       run_benchmark:
         description: "Run the private gates + timed benchmark after the public correctness gate. false = public-fixture correctness only."
         required: false
@@ -160,7 +164,6 @@ jobs:
       MLXFAST_MEASURE_OUT: /tmp/mlxfast-measure-${{ github.run_id }}-${{ github.run_attempt }}
       # --- Benchmark contract (identical values to the previous pipeline).
       MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
-      MLXFAST_IS_SUBMISSION_BRANCH: ${{ (startsWith(github.ref_name, 'submissions/')) && '1' || '0' }}
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
       MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}
       MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json
@@ -198,10 +201,10 @@ jobs:
       # overlay-paired-timing.sh applies the same floors in the trusted shell.
       MLXFAST_DECODE_SPEEDUP_FLOOR: "0.95"
       MLXFAST_PREFILL_SPEEDUP_FLOOR: "0.95"
-      # Benchmark whatever ref is dispatched; enforce-trusted still pins repo +
-      # workflow_dispatch. Submission branches are bot-created and differ from
-      # main only in editablePaths (re-verified by the modifiable-surface step).
-      MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}
+      MLXFAST_RUN_BENCHMARK: ${{ inputs.run_benchmark && '1' || '0' }}
+      # Submitted code is data overlaid onto this main-owned workflow checkout.
+      MLXFAST_CANDIDATE_SHA: ${{ inputs.submission_ref }}
+      MLXFAST_IS_SUBMISSION_BRANCH: ${{ (inputs.submission_ref != github.sha) && '1' || '0' }}
       MLXFAST_VERIFY_TRANSFORM: ${{ inputs.verify_transform && '1' || '0' }}
     steps:
       # Fail fast if the box is quarantined or the isolation stack is missing,
@@ -217,10 +220,12 @@ jobs:
           fi
           test -e "${MLXFAST_BENCH_EXEC}" || { echo "::error::bench-exec bridge missing" >&2; exit 1; }
           test -e "${MLXFAST_JANITOR}" || { echo "::error::janitor missing" >&2; exit 1; }
-          test -x "${MLXFAST_MEASURE_JOB}" || { echo "::error::measure-job missing" >&2; exit 1; }
-          test -x "${MLXFAST_MACMON}" || { echo "::error::macmon missing" >&2; exit 1; }
-          test -d "${MLXFAST_BASELINE_WS}" || { echo "::error::pinned baseline workspace missing" >&2; exit 1; }
-          test -s "${MLXFAST_BASELINE_CALIBRATION}" || { echo "::error::baseline calibration missing" >&2; exit 1; }
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
+            test -x "${MLXFAST_MEASURE_JOB}" || { echo "::error::measure-job missing" >&2; exit 1; }
+            test -x "${MLXFAST_MACMON}" || { echo "::error::macmon missing" >&2; exit 1; }
+            test -d "${MLXFAST_BASELINE_WS}" || { echo "::error::pinned baseline workspace missing" >&2; exit 1; }
+            test -s "${MLXFAST_BASELINE_CALIBRATION}" || { echo "::error::baseline calibration missing" >&2; exit 1; }
+          fi
           test -f "${MLXFAST_REFERENCE_DIR}/config.json" || { echo "::error::reference checkpoint cache missing" >&2; exit 1; }
 
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -231,29 +236,90 @@ jobs:
       - name: Enforce trusted workflow context
         run: .github/scripts/enforce-trusted-benchmark-workflow.sh
 
-      - name: Review submitted code for benchmark bypasses
-        if: ${{ startsWith(github.ref_name, 'submissions/') }}
+      - name: Validate candidate input
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
-          HEAD_SHA: ${{ github.sha }}
+          SUBMISSION_REF: ${{ inputs.submission_ref }}
         run: |
           set -euo pipefail
-          # Review only the editable files changed vs the merge-base -- see the
-          # diff-only-mode comment in run-submission-static-review.sh. Standalone
-          # assignment: a merge-base failure must fail this step; as a command
-          # prefix its failure would be masked by bash and the review would
-          # silently fall back to the whole editable surface.
-          base_sha="$(git merge-base origin/main "${HEAD_SHA}")"
-          MLXFAST_SUBMISSION_REVIEW_BASE_SHA="${base_sha}" \
-            .github/scripts/run-submission-static-review.sh
+          if [[ ! "${SUBMISSION_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::submission_ref must be an exact 40-character lowercase commit SHA" >&2
+            exit 1
+          fi
+          printf '%s\n' "${SUBMISSION_REF}" > candidate.sha
 
-      - name: Enforce modifiable surface
-        if: ${{ startsWith(github.ref_name, 'submissions/') }}
+      - name: Checkout submitted editable paths
+        if: ${{ inputs.submission_ref != github.sha }}
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ inputs.submission_ref }}
+          path: .mlxfast-submission-src
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify submitted commit and modifiable surface
+        id: verify_submission
+        if: ${{ inputs.submission_ref != github.sha }}
         env:
-          HEAD_SHA: ${{ github.sha }}
+          SUBMISSION_REF: ${{ inputs.submission_ref }}
+          TRUSTED_MAIN_SHA: ${{ github.sha }}
         run: |
-          BASE_SHA="$(git merge-base origin/main "${HEAD_SHA}")" \
-            .github/scripts/enforce-modifiable-surface.sh
+          set -euo pipefail
+          actual_sha="$(git -C .mlxfast-submission-src rev-parse HEAD)"
+          if [[ "${actual_sha}" != "${SUBMISSION_REF}" ]]; then
+            echo "::error::submitted checkout resolved to ${actual_sha}, expected ${SUBMISSION_REF}" >&2
+            exit 1
+          fi
+          if ! git -C .mlxfast-submission-src cat-file -e "${TRUSTED_MAIN_SHA}^{commit}"; then
+            echo "::error::submitted checkout cannot resolve trusted main commit ${TRUSTED_MAIN_SHA}" >&2
+            exit 1
+          fi
+          base_sha="$(git -C .mlxfast-submission-src merge-base "${TRUSTED_MAIN_SHA}" "${actual_sha}")"
+          if [[ "${base_sha}" != "${TRUSTED_MAIN_SHA}" ]]; then
+            echo "::error::submission must be based on current trusted main ${TRUSTED_MAIN_SHA}; merge-base is ${base_sha}" >&2
+            exit 1
+          fi
+          (
+            cd .mlxfast-submission-src
+            BASE_SHA="${base_sha}" HEAD_SHA="${actual_sha}" \
+              "${GITHUB_WORKSPACE}/.github/scripts/enforce-modifiable-surface.sh"
+          )
+          # Keep the candidate commit object in the trusted repository for
+          # provenance only. No candidate tree is checked out here.
+          if ! git cat-file -e "${actual_sha}^{commit}"; then
+            git fetch --no-tags .mlxfast-submission-src "${actual_sha}"
+          fi
+          git cat-file -e "${actual_sha}^{commit}"
+          printf 'base_sha=%s\n' "${base_sha}" >> "${GITHUB_OUTPUT}"
+          echo "benchmark: verified submitted commit ${actual_sha} against base ${base_sha}"
+
+      - name: Review submitted code for benchmark bypasses
+        if: ${{ inputs.submission_ref != github.sha }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
+          HEAD_SHA: ${{ inputs.submission_ref }}
+          REVIEW_BASE_SHA: ${{ steps.verify_submission.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          (
+            cd .mlxfast-submission-src
+            MLXFAST_SUBMISSION_REVIEW_BASE_SHA="${REVIEW_BASE_SHA}" \
+              "${GITHUB_WORKSPACE}/.github/scripts/run-submission-static-review.sh"
+          )
+
+      - name: Overlay submitted editable paths
+        if: ${{ inputs.submission_ref != github.sha }}
+        env:
+          SUBMISSION_WORKTREE: .mlxfast-submission-src
+        run: .github/scripts/overlay-editable-paths.sh
+
+      # The bench workspace must contain the trusted tree plus overlaid editable
+      # paths only, never the candidate's complete checkout.
+      - name: Remove submitted checkout
+        if: ${{ always() && inputs.submission_ref != github.sha }}
+        run: |
+          set -euo pipefail
+          rm -rf .mlxfast-submission-src
+          test ! -e .mlxfast-submission-src
 
       # Same Seatbelt-semantics probe the VM pipeline ran: proves this host's
       # sandbox-exec still denies golden reads, private-dir reads, non-workspace
@@ -389,6 +455,11 @@ jobs:
           # clean slate so a partial clone can never nest.
           cp -c -R "${GITHUB_WORKSPACE}" "${MLXFAST_JOB_WS}" 2>/dev/null \
             || { rm -rf "${MLXFAST_JOB_WS}"; cp -R "${GITHUB_WORKSPACE}" "${MLXFAST_JOB_WS}"; }
+          # The work tree remains trusted-main plus the validated editable-path
+          # overlay. Detach only HEAD metadata so score/audit provenance records
+          # the candidate SHA, matching the former candidate-branch checkout.
+          git -C "${MLXFAST_JOB_WS}" cat-file -e "${MLXFAST_CANDIDATE_SHA}^{commit}"
+          git -C "${MLXFAST_JOB_WS}" update-ref --no-deref HEAD "${MLXFAST_CANDIDATE_SHA}"
           mkdir -p "${MLXFAST_PRIVATE_DIR}"
           chmod 700 "${MLXFAST_PRIVATE_DIR}"
           # Runner-owned so trusted steps can later scrub bench-written hidden
@@ -473,11 +544,11 @@ jobs:
           test "${status}" -eq 0
           test -f "${MLXFAST_JOB_WS}/weights/config.json"
 
-      # Single machine, single transform: the parallel pipeline's 5-way
-      # weights-hash equality tripwire is structurally unnecessary (every phase
-      # below consumes this exact tree), but the hash still ships in the audit
-      # artifact so a score dispute can be traced to the transformed bytes.
-      - name: Hash transformed weights
+      # Hash the immutable transform output before any model invocation can
+      # mutate the workspace. This is ranked-audit provenance only; public
+      # correctness dispatches skip the full-model read.
+      - name: Hash transformed weights for ranked audit
+        if: ${{ inputs.run_benchmark }}
         run: .github/scripts/hash-weights-directory.sh "${MLXFAST_JOB_WS}/weights" weights.sha256
 
       # Public drift tripwire (issue #83 class): one independent 64-step
@@ -576,15 +647,18 @@ jobs:
 
       - name: Stage correctness artifacts
         id: stage_correctness_artifacts
-        if: ${{ always() && !inputs.run_benchmark && ((!(startsWith(github.ref_name, 'submissions/'))) || steps.validate_correctness_artifacts.outcome == 'success') }}
+        if: ${{ always() && !inputs.run_benchmark && (inputs.submission_ref == github.sha || steps.validate_correctness_artifacts.outcome == 'success') }}
         run: |
           set -euo pipefail
+          test "$(cat candidate.sha)" = "${MLXFAST_CANDIDATE_SHA}"
           .github/scripts/deny-private-artifacts.sh \
+            candidate.sha \
             public-gate-report.json \
             public-golden.sha256 \
             public-golden.bytes
           .github/scripts/stage-benchmark-artifacts.sh \
             "${MLXFAST_ARTIFACT_ROOT}/correctness-results" \
+            candidate.sha=candidate.sha \
             correctness-report.json=public-gate-report.json \
             golden.sha256=public-golden.sha256 \
             golden.bytes=public-golden.bytes
@@ -708,7 +782,7 @@ jobs:
           # teacher forcing; the worker that executes submitted model code
           # cannot. Kept through sudo env_reset via the sudoers env_keep list.
           BENCH_GOLDEN_PATH: ${{ env.MLXFAST_JOB_WS }}/correctness_golden_ranked.json
-          MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ github.sha }} mode=single-machine-gates"
+          MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ env.MLXFAST_CANDIDATE_SHA }} mode=single-machine-gates"
         run: |
           set -euo pipefail
           # Known, documented residual: the semantic-answer capture (which
@@ -931,6 +1005,7 @@ jobs:
           MLXFAST_INTEGRITY_PATH: benchmark-integrity.json
           MLXFAST_MEASURE_RESULTS_PATH: ${{ env.MLXFAST_MEASURE_OUT }}/results.json
           MLXFAST_CANDIDATE_SCORE_PATH: ${{ env.MLXFAST_MEASURE_OUT }}/score-candidate.json
+          MLXFAST_EXPECTED_COMMIT: ${{ env.MLXFAST_CANDIDATE_SHA }}
         run: .github/scripts/overlay-paired-timing.sh
 
       - name: Validate benchmark artifacts
@@ -939,13 +1014,16 @@ jobs:
         env:
           MLXFAST_SCORE_PATH: score.json
           MLXFAST_INTEGRITY_PATH: benchmark-integrity.json
+          MLXFAST_EXPECTED_COMMIT: ${{ env.MLXFAST_CANDIDATE_SHA }}
         run: .github/scripts/validate-benchmark-artifacts.sh
 
       - name: Check benchmark artifact paths
         if: ${{ inputs.run_benchmark && steps.validate_benchmark_artifacts.outcome == 'success' }}
         run: |
           set -euo pipefail
+          test "$(cat candidate.sha)" = "${MLXFAST_CANDIDATE_SHA}"
           .github/scripts/deny-private-artifacts.sh \
+            candidate.sha \
             "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256" \
             "${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes" \
             score.json \
@@ -961,6 +1039,7 @@ jobs:
           set -euo pipefail
           .github/scripts/stage-benchmark-artifacts.sh \
             "${MLXFAST_ARTIFACT_ROOT}/benchmark-results" \
+            candidate.sha=candidate.sha \
             golden.sha256="${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256" \
             golden.bytes="${MLXFAST_CORRECTNESS_GOLDEN_PATH}.bytes" \
             score.json=score.json \
@@ -1061,7 +1140,25 @@ jobs:
               echo "::warning::bench workspace residue left at ${MLXFAST_JOB_WS}"
             fi
           fi
-          rm -rf "${MLXFAST_PRIVATE_DIR}" "${MLXFAST_MEASURE_OUT}" "${MLXFAST_ARTIFACT_ROOT}" || true
+          # These trees are runner-owned and may contain hidden fixtures,
+          # submission-review output, timing results, or staged artifacts.
+          # A deletion failure is an integrity failure, not best-effort cleanup.
+          private_cleanup_failed=0
+          for private_path in \
+            "${MLXFAST_PRIVATE_DIR}" \
+            "${MLXFAST_MEASURE_OUT}" \
+            "${MLXFAST_ARTIFACT_ROOT}"; do
+            if ! rm -rf -- "${private_path}"; then
+              echo "::error::could not remove runner-private artifact path: ${private_path}" >&2
+              private_cleanup_failed=1
+              continue
+            fi
+            if [[ -e "${private_path}" || -L "${private_path}" ]]; then
+              echo "::error::runner-private artifact cleanup failed: ${private_path}" >&2
+              private_cleanup_failed=1
+            fi
+          done
+          exit "${private_cleanup_failed}"
 
       # Post-job reset + signed integrity audit: wipe+recreate the bench uid,
       # then diff the protected surface (sudoers, /opt/bench, PF wiring, launch

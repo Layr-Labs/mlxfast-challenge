@@ -88,12 +88,11 @@ func gemma4ModelCacheMaterializesCollectedCachedStateWhenRuntimeTestsAreEnabled(
     defer { try? FileManager.default.removeItem(at: root) }
     try """
     {
-      "num_hidden_layers": 2,
+      "num_hidden_layers": \(MLXFastConstants.numHiddenLayers),
       "vocab_size": \(MLXFastConstants.vocabSize),
       "hidden_size": \(MLXFastConstants.hiddenSize),
       "intermediate_size": \(MLXFastConstants.intermediateSize),
       "num_attention_heads": \(MLXFastConstants.attentionHeads),
-      "layer_types": ["sliding_attention", "full_attention"],
       "sliding_window": 4
     }
     """.write(

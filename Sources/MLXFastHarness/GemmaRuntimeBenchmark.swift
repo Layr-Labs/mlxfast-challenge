@@ -870,8 +870,6 @@ extension GemmaRuntime {
             let prefillStart = DispatchTime.now().uptimeNanoseconds
             let response = try worker.prefill(promptTokens: promptTokens)
             let elapsed = secondsSince(prefillStart)
-            expertStats = response.expertStats ?? expertStats
-            peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
             guard let token = response.token else {
                 throw MLXFastError.invalidInput("runtime worker prefill response missing token")
             }
@@ -881,6 +879,9 @@ extension GemmaRuntime {
                     actualToken: token
                 )
             )
+            let diagnostics = try worker.phaseDiagnostics()
+            expertStats = diagnostics.expertStats ?? expertStats
+            peakRamGB = max(peakRamGB, diagnostics.peakRamGB ?? 0)
             progress?(
                 "prefill \(runLabel) \(runOrdinal)/\(runTotal) complete "
                     + "seconds=\(formatSeconds(elapsed))"
@@ -1032,8 +1033,6 @@ extension GemmaRuntime {
         let decodePhaseStart = DispatchTime.now().uptimeNanoseconds
         progress?("decode measured start tokens=\(decodeSteps) includes_seed_prefill=true")
         let beginResponse = try worker.beginDecode(seedTokens: seedTokens)
-        expertStats = beginResponse.expertStats ?? expertStats
-        peakRamGB = max(peakRamGB, beginResponse.peakRamGB ?? 0)
         guard let seedToken = beginResponse.seedToken else {
             throw MLXFastError.invalidInput("runtime worker decode_begin response missing seed token")
         }
@@ -1049,8 +1048,6 @@ extension GemmaRuntime {
         for decodedStep in 0..<decodeSteps {
             let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
             let response = try worker.decodeStep(inputToken: inputToken)
-            expertStats = response.expertStats ?? expertStats
-            peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
             guard let token = response.token else {
                 throw MLXFastError.invalidInput("runtime worker decode_step response missing token")
             }
@@ -1078,6 +1075,9 @@ extension GemmaRuntime {
         }
 
         let measuredSeconds = secondsSince(decodePhaseStart)
+        let diagnostics = try worker.phaseDiagnostics()
+        expertStats = diagnostics.expertStats ?? expertStats
+        peakRamGB = max(peakRamGB, diagnostics.peakRamGB ?? 0)
         let secondsPerToken = measuredSeconds / Double(decodeSteps)
         let actualTokensComparison = BenchmarkOutputValidator.compareDecodeTokens(
             expectedTokens: Array(expectedTokens.prefix(decodeSteps)),

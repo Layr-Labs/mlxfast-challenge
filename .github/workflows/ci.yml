@@ -56,7 +56,8 @@ jobs:
             export BASE_SHA="${PR_BASE_SHA}"
             export HEAD_SHA="${PR_HEAD_SHA}"
           else
-            export BASE_SHA="$(git merge-base origin/main "${HEAD_SHA}")"
+            BASE_SHA="$(git merge-base origin/main "${HEAD_SHA}")"
+            export BASE_SHA
           fi
           .github/scripts/enforce-modifiable-surface.sh
 

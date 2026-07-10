@@ -4,11 +4,10 @@ set -euo pipefail
 
 # --- Local-mode GPU cool-down gate (--local-iterate / --local-submit) --------
 # The ranked runner starts each timed phase only after the GPU has cooled
-# below a fixed 40C thermal gate. Local modes mirror that gate here in the
-# trusted outer script, right before the timed benchmark process starts, so
-# back-to-back local runs are not silently skewed by heat left over from a
-# previous run. Local-mode only: the ranked/official path never reaches this
-# code and keeps its own operator-side gate.
+# below a fixed 40C thermal gate. Local modes expose this trusted shell helper
+# to the Swift harness, which invokes it immediately before each measured
+# prefill and decode phase. Local-mode only: the ranked/official path keeps its
+# operator-side gate.
 #
 # Knobs (local debugging only; see run_local_cool_gate):
 #   MLXFAST_LOCAL_COOL_GATE=0   disable the gate (timings taken hot are not
@@ -26,6 +25,7 @@ readonly COOL_GATE_PROGRESS_EPSILON_C=0.25  # a new minimum must drop at least t
 LOCAL_ITERATE=0
 LOCAL_SUBMIT=0
 OFFICIAL=0
+LOCAL_COOL_GATE_ONLY=0
 # Arguments forwarded to `mlxfast-swift benchmark`. --official is a shell-level
 # mode selector only, so it is filtered out here; the Swift CLI does not know it.
 FORWARD_ARGS=()
@@ -38,6 +38,10 @@ for arg in "$@"; do
       ;;
     --official)
       OFFICIAL=1
+      continue
+      ;;
+    --local-cool-gate-only)
+      LOCAL_COOL_GATE_ONLY=1
       continue
       ;;
   esac
@@ -55,12 +59,17 @@ if [[ "${OFFICIAL}" == "1" && ( "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" =
   exit 1
 fi
 
+if [[ "${LOCAL_ITERATE}" == "1" && "${LOCAL_SUBMIT}" == "1" ]]; then
+  echo "benchmark.sh: --local-iterate and --local-submit cannot be used together" >&2
+  exit 1
+fi
+
 # Bare invocations default to the participant-friendly local edit loop. The
 # ranked full benchmark must be requested explicitly: with --official, by the
 # trusted workflow env (MLXFAST_OFFICIAL_BENCHMARK_RUN=1 -- also inherited by
 # the pinned paired-baseline checkout's own benchmark.sh), or implicitly by an
 # operator pointing MLXFAST_CORRECTNESS_GOLDEN_PATH at a provisioned oracle.
-if [[ "${LOCAL_ITERATE}" == "0" && "${LOCAL_SUBMIT}" == "0" && "${OFFICIAL}" == "0" ]]; then
+if [[ "${LOCAL_COOL_GATE_ONLY}" == "0" && "${LOCAL_ITERATE}" == "0" && "${LOCAL_SUBMIT}" == "0" && "${OFFICIAL}" == "0" ]]; then
   if [[ "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == "1" || -n "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" ]]; then
     OFFICIAL=1
   else
@@ -89,7 +98,7 @@ fi
 # oracle, which is never in the public repo -- participants who reached it by
 # accident used to burn minutes on the transform and then hit a raw
 # file-not-found error from the Swift harness.
-if [[ ! -f "${GOLDEN_PATH}" ]]; then
+if [[ "${LOCAL_COOL_GATE_ONLY}" == "0" && ! -f "${GOLDEN_PATH}" ]]; then
   if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" || -n "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" ]]; then
     echo "benchmark.sh: correctness golden not found at ${GOLDEN_PATH}" >&2
     echo "benchmark.sh: if you overrode MLXFAST_CORRECTNESS_GOLDEN_PATH, check the path;" >&2
@@ -180,10 +189,6 @@ benchmark.sh: warning: could not find origin/main for local-iterate baseline con
 benchmark.sh: run 'git fetch origin main' and measure the latest tip locally before comparing changes.
 EOF
   fi
-}
-
-json_string() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
 # Local modes print the same-machine baseline snapshot (when one exists) BEFORE
@@ -436,15 +441,6 @@ EOF
   done
 }
 
-json_number_or_null() {
-  local value="$1"
-  if [[ -z "${value}" ]]; then
-    printf 'null'
-  else
-    printf '%s' "${value}"
-  fi
-}
-
 absolute_path() {
   local path="$1"
   local dir
@@ -456,6 +452,186 @@ absolute_path() {
   else
     (cd -P "${dir}" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "${base}") || printf '%s\n' "${path}"
   fi
+}
+
+canonical_directory_path() {
+  local path="$1"
+  (cd -P "${path}" 2>/dev/null && pwd -P)
+}
+
+path_contains() {
+  local parent="$1"
+  local child="$2"
+  [[ "${child}" == "${parent}" || "${child}" == "${parent}/"* ]]
+}
+
+safe_clear_directory_path() {
+  local path="$1"
+  local label="$2"
+  shift 2
+
+  if [[ -z "${path}" ]]; then
+    echo "benchmark.sh: refusing to clear empty ${label}" >&2
+    return 1
+  fi
+
+  local target
+  local workspace
+  if [[ -d "${path}" ]]; then
+    target="$(canonical_directory_path "${path}")" || {
+      echo "benchmark.sh: could not resolve ${label} '${path}'" >&2
+      return 1
+    }
+  elif [[ -e "${path}" || -L "${path}" ]]; then
+    echo "benchmark.sh: refusing to clear ${label} '${path}'; it is not a directory" >&2
+    return 1
+  else
+    local parent
+    parent="$(dirname "${path}")"
+    if [[ ! -d "${parent}" ]]; then
+      echo "benchmark.sh: parent directory for ${label} does not exist: ${parent}" >&2
+      return 1
+    fi
+    parent="$(canonical_directory_path "${parent}")" || {
+      echo "benchmark.sh: could not resolve parent directory for ${label} '${path}'" >&2
+      return 1
+    }
+    target="${parent}/$(basename "${path}")"
+  fi
+  workspace="$(pwd -P)"
+  if [[ "${target}" == "/" ]] || path_contains "${target}" "${workspace}"; then
+    echo "benchmark.sh: refusing to clear unsafe ${label} '${path}' (resolved to ${target})" >&2
+    return 1
+  fi
+
+  if path_contains "${workspace}" "${target}"; then
+    local relative_target="${target#"${workspace}/"}"
+    if [[ "${relative_target}" == ".git" || "${relative_target}" == .git/* ]]; then
+      echo "benchmark.sh: refusing to clear Git metadata path '${path}'" >&2
+      return 1
+    fi
+    if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      local tracked_path
+      local tracked_paths_file
+      local unsafe_tracked_path=""
+      tracked_paths_file="$(mktemp "${TMPDIR:-/tmp}/mlxfast-tracked-paths.XXXXXX")" || return 1
+      if ! git ls-files -z -- "${relative_target}" > "${tracked_paths_file}"; then
+        rm -f "${tracked_paths_file}"
+        echo "benchmark.sh: could not inspect tracked files under ${label} '${path}'" >&2
+        return 1
+      fi
+      while IFS= read -r -d '' tracked_path; do
+        if [[ "${label}" == "weights path" && "${tracked_path}" == "${relative_target}/.gitkeep" ]]; then
+          continue
+        fi
+        unsafe_tracked_path="${tracked_path}"
+        break
+      done < "${tracked_paths_file}"
+      rm -f "${tracked_paths_file}"
+      if [[ -n "${unsafe_tracked_path}" ]]; then
+        echo "benchmark.sh: refusing to clear ${label} '${path}'; it contains tracked file ${unsafe_tracked_path}" >&2
+        return 1
+      fi
+    fi
+  fi
+
+  local protected
+  local protected_path
+  for protected in "$@"; do
+    [[ -n "${protected}" && -d "${protected}" ]] || continue
+    protected_path="$(canonical_directory_path "${protected}")" || continue
+    if path_contains "${target}" "${protected_path}" || path_contains "${protected_path}" "${target}"; then
+      echo "benchmark.sh: refusing to clear ${label} '${path}'; it overlaps protected path ${protected_path}" >&2
+      return 1
+    fi
+  done
+
+  if [[ ! -d "${target}" ]]; then
+    mkdir "${target}" || return 1
+  fi
+
+  printf '%s\n' "${target}"
+}
+
+assert_safe_output_file_path() {
+  local path="$1"
+  local label="$2"
+  shift 2
+  if [[ -z "${path}" || "${path}" == "/" || -d "${path}" || -L "${path}" ]]; then
+    echo "benchmark.sh: refusing unsafe ${label} '${path}'" >&2
+    return 1
+  fi
+  case "/${path}/" in
+    *"/.git/"*)
+      echo "benchmark.sh: refusing ${label} inside Git metadata: ${path}" >&2
+      return 1
+      ;;
+  esac
+
+  local parent
+  local target
+  local workspace
+  parent="$(dirname "${path}")"
+  if [[ ! -d "${parent}" ]]; then
+    echo "benchmark.sh: parent directory for ${label} does not exist: ${parent}" >&2
+    return 1
+  fi
+  parent="$(canonical_directory_path "${parent}")" || return 1
+  target="${parent}/$(basename "${path}")"
+  workspace="$(pwd -P)"
+
+  if path_contains "${workspace}" "${target}"; then
+    local relative_target="${target#"${workspace}/"}"
+    if [[ "${relative_target}" == ".git" || "${relative_target}" == .git/* ]]; then
+      echo "benchmark.sh: refusing ${label} inside Git metadata: ${path}" >&2
+      return 1
+    fi
+    if command -v git >/dev/null 2>&1 \
+        && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      local tracked_output
+      if ! tracked_output="$(git ls-files -- "${relative_target}")"; then
+        echo "benchmark.sh: could not inspect ${label} against tracked files: ${relative_target}" >&2
+        return 1
+      fi
+      if [[ -n "${tracked_output}" ]]; then
+        echo "benchmark.sh: refusing ${label} that would overwrite tracked file ${relative_target}" >&2
+        return 1
+      fi
+    fi
+  fi
+
+  local protected
+  local protected_path
+  for protected in "$@"; do
+    [[ -n "${protected}" ]] || continue
+    if [[ -d "${protected}" ]]; then
+      protected_path="$(canonical_directory_path "${protected}")" || return 1
+    else
+      protected_path="$(absolute_path "${protected}")"
+    fi
+    if [[ "${target}" == "${protected_path}" ]] \
+        || { [[ -d "${protected}" ]] && path_contains "${protected_path}" "${target}"; }; then
+      echo "benchmark.sh: refusing ${label} that overlaps protected path ${protected_path}" >&2
+      return 1
+    fi
+  done
+}
+
+RUNTIME_WORKER_SANDBOX_PROFILE_OWNED=""
+TRANSFORM_STAGING_PARENT_OWNED=""
+score_stdout=""
+cleanup_benchmark_temporaries() {
+  local status="$?"
+  if [[ -n "${RUNTIME_WORKER_SANDBOX_PROFILE_OWNED}" ]]; then
+    rm -f "${RUNTIME_WORKER_SANDBOX_PROFILE_OWNED}" || true
+  fi
+  if [[ -n "${score_stdout}" ]]; then
+    rm -f "${score_stdout}" || true
+  fi
+  if [[ -n "${TRANSFORM_STAGING_PARENT_OWNED}" ]]; then
+    rm -rf "${TRANSFORM_STAGING_PARENT_OWNED}" || true
+  fi
+  return "${status}"
 }
 
 sandbox_escape() {
@@ -493,6 +669,7 @@ write_runtime_worker_sandbox_profile() {
   local private_dir_absolute
   local swift_absolute
   profile="$(mktemp "${TMPDIR:-/tmp}/mlxfast-runtime-worker.XXXXXX")"
+  RUNTIME_WORKER_SANDBOX_PROFILE_OWNED="${profile}"
   golden_absolute="$(absolute_path "${GOLDEN_PATH}")"
   swift_absolute="$(absolute_path "${SWIFT_BIN}")"
   {
@@ -520,22 +697,14 @@ EOF
 
 run_offline_writable_command() {
   local writable_paths="$1"
+  local status
   shift
   if [[ "${MLXFAST_IN_SANDBOX:-0}" == "1" || "${MLXFAST_NO_SANDBOX:-0}" == "1" ]]; then
     "$@"
-    return 0
+    status="$?"
+    return "${status}"
   fi
   MLXFAST_OFFLINE_WRITABLE_PATHS="${writable_paths}" .github/scripts/run-offline.sh "$@"
-}
-
-score_metric_string() {
-  local key="$1"
-  sed -n "s/.*\"${key}\" : \"\\([^\"]*\\)\".*/\\1/p" "${SCORE_PATH}" | head -n 1
-}
-
-score_metric_number() {
-  local key="$1"
-  sed -n "s/.*\"${key}\" : \\([0-9][0-9]*\\).*/\\1/p" "${SCORE_PATH}" | head -n 1
 }
 
 source_hash() {
@@ -547,9 +716,11 @@ source_hash() {
     "Sources/MLXFastCore"
     "Sources/MLXFastTransform"
   )
+  local hash_status
 
   if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    git ls-files -z "${paths[@]}" | while IFS= read -r -d '' path; do
+    git ls-files --cached --others --exclude-standard -z "${paths[@]}" \
+      | while IFS= read -r -d '' path; do
       if [[ -f "${path}" ]]; then
         printf '%s\0' "${path}"
         shasum -a 256 "${path}"
@@ -557,7 +728,8 @@ source_hash() {
         printf '%s\0MISSING\0' "${path}"
       fi
     done | shasum -a 256 | awk '{print $1}'
-    return 0
+    hash_status="$?"
+    return "${hash_status}"
   fi
 
   find "${paths[@]}" -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r path; do
@@ -566,16 +738,50 @@ source_hash() {
   done | shasum -a 256 | awk '{print $1}'
 }
 
-clear_weights_dir() {
-  case "${WEIGHTS_PATH}" in
-    ""|"/")
-      echo "benchmark.sh: refusing to clear unsafe weights path '${WEIGHTS_PATH}'" >&2
-      exit 1
-      ;;
-  esac
-  mkdir -p "${WEIGHTS_PATH}"
-  find "${WEIGHTS_PATH}" -mindepth 1 ! -name .gitkeep -exec rm -rf {} +
+install_transformed_weights() {
+  local staged_weights="$1"
+  local safe_weights_path
+  local previous_weights
+  local had_previous=0
+  safe_weights_path="$(safe_clear_directory_path "${WEIGHTS_PATH}" "weights path" "${REFERENCE_PATH}")" || return 1
+  previous_weights="${TRANSFORM_STAGING_PARENT_OWNED}/previous-weights"
+  touch "${staged_weights}/.gitkeep" || return 1
+
+  if [[ -e "${safe_weights_path}" || -L "${safe_weights_path}" ]]; then
+    mv "${safe_weights_path}" "${previous_weights}" || return 1
+    had_previous=1
+  fi
+  if ! mv "${staged_weights}" "${safe_weights_path}"; then
+    if [[ "${had_previous}" == "1" ]]; then
+      mv "${previous_weights}" "${safe_weights_path}" || {
+        echo "benchmark.sh: failed to restore previous weights from ${previous_weights}" >&2
+        return 1
+      }
+    fi
+    return 1
+  fi
+  if [[ "${had_previous}" == "1" ]]; then
+    rm -rf "${previous_weights}" || return 1
+  fi
 }
+
+if [[ "${LOCAL_COOL_GATE_ONLY}" == "1" ]]; then
+  LOCAL_ITERATE=1
+  run_local_cool_gate
+  exit 0
+fi
+
+trap cleanup_benchmark_temporaries EXIT
+
+assert_safe_output_file_path \
+  "${SCORE_PATH}" "score path" \
+  "${GOLDEN_PATH}" "${INTEGRITY_PATH}" "${WEIGHTS_PATH}" "${REFERENCE_PATH}" || exit 1
+assert_safe_output_file_path \
+  "${SCORE_PATH}.sha256" "score checksum path" \
+  "${GOLDEN_PATH}" "${SCORE_PATH}" "${INTEGRITY_PATH}" "${WEIGHTS_PATH}" "${REFERENCE_PATH}" || exit 1
+assert_safe_output_file_path \
+  "${INTEGRITY_PATH}" "integrity path" \
+  "${GOLDEN_PATH}" "${SCORE_PATH}" "${SCORE_PATH}.sha256" "${WEIGHTS_PATH}" "${REFERENCE_PATH}" || exit 1
 
 enforce_official_sandbox
 
@@ -633,10 +839,17 @@ fi
 
 write_runtime_worker_sandbox_profile
 export MLXFAST_USE_RUNTIME_WORKER="${USE_RUNTIME_WORKER}"
-export MLXFAST_RUNTIME_WORKER_EXECUTABLE="$(absolute_path "${SWIFT_BIN}")"
+MLXFAST_RUNTIME_WORKER_EXECUTABLE="$(absolute_path "${SWIFT_BIN}")"
+export MLXFAST_RUNTIME_WORKER_EXECUTABLE
 export MLXFAST_REFERENCE_DIR="${REFERENCE_PATH}"
+if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ]]; then
+  if [[ -z "${MLXFAST_LOCAL_COOL_GATE_HELPER:-}" ]]; then
+    MLXFAST_LOCAL_COOL_GATE_HELPER="$(absolute_path "${BASH_SOURCE[0]}")"
+  fi
+  export MLXFAST_LOCAL_COOL_GATE_HELPER
+fi
 
-mkdir -p "${WEIGHTS_PATH}"
+safe_clear_directory_path "${WEIGHTS_PATH}" "weights path" "${REFERENCE_PATH}" >/dev/null || exit 1
 wanted_hash="$(source_hash)"
 current_hash="$(cat "${SOURCE_HASH_PATH}" 2>/dev/null || true)"
 
@@ -649,13 +862,19 @@ if [[ "${MLXFAST_SKIP_TRANSFORM:-0}" == "1" ]]; then
 elif [[ "${MLXFAST_FORCE_TRANSFORM:-0}" == "1" || ! -f "${WEIGHTS_PATH}/config.json" || "${current_hash}" != "${wanted_hash}" ]]; then
   if [[ -f "${REFERENCE_PATH}/config.json" ]]; then
     echo "benchmark.sh: regenerating weights with Swift transform"
-    clear_weights_dir
-    run_offline_writable_command "$(absolute_path "${WEIGHTS_PATH}")" \
-      "${SWIFT_BIN}" transform --reference "${REFERENCE_PATH}" --output "${WEIGHTS_PATH}"
-    if [[ ! -f "${WEIGHTS_PATH}/config.json" ]]; then
-      echo "benchmark.sh: Swift transform did not produce ${WEIGHTS_PATH}/config.json" >&2
+    safe_weights_path="$(safe_clear_directory_path "${WEIGHTS_PATH}" "weights path" "${REFERENCE_PATH}")" || exit 1
+    TRANSFORM_STAGING_PARENT_OWNED="$(mktemp -d \
+      "$(dirname "${safe_weights_path}")/.$(basename "${safe_weights_path}").mlxfast-transform.XXXXXX")"
+    staged_weights="${TRANSFORM_STAGING_PARENT_OWNED}/weights"
+    run_offline_writable_command "${TRANSFORM_STAGING_PARENT_OWNED}" \
+      "${SWIFT_BIN}" transform --reference "${REFERENCE_PATH}" --output "${staged_weights}"
+    if [[ ! -f "${staged_weights}/config.json" ]]; then
+      echo "benchmark.sh: Swift transform did not produce ${staged_weights}/config.json" >&2
       exit 1
     fi
+    install_transformed_weights "${staged_weights}"
+    rm -rf "${TRANSFORM_STAGING_PARENT_OWNED}"
+    TRANSFORM_STAGING_PARENT_OWNED=""
     printf '%s\n' "${wanted_hash}" > "${SOURCE_HASH_PATH}"
   else
     cat >&2 <<EOF
@@ -675,14 +894,12 @@ if [[ "${MLXFAST_VERIFY_TRANSFORM:-0}" == "1" ]]; then
     exit 1
   fi
   VERIFY_TRANSFORM_TMP_PARENT="${MLXFAST_VERIFY_TRANSFORM_TMP_PARENT:-.mlxfast-transform-verify}"
-  case "${VERIFY_TRANSFORM_TMP_PARENT}" in
-    ""|"/")
-      echo "benchmark.sh: refusing unsafe transform verification tmp parent '${VERIFY_TRANSFORM_TMP_PARENT}'" >&2
-      exit 1
-      ;;
-  esac
-  rm -rf "${VERIFY_TRANSFORM_TMP_PARENT}"
-  mkdir -p "${VERIFY_TRANSFORM_TMP_PARENT}"
+  VERIFY_TRANSFORM_TMP_PARENT="$(safe_clear_directory_path \
+    "${VERIFY_TRANSFORM_TMP_PARENT}" \
+    "transform verification temporary path" \
+    "${REFERENCE_PATH}" \
+    "${WEIGHTS_PATH}")" || exit 1
+  find "${VERIFY_TRANSFORM_TMP_PARENT}" -mindepth 1 -exec rm -rf {} +
   echo "benchmark.sh: verifying weights match a fresh run of the submitted Swift transform"
   if run_offline_writable_command "$(absolute_path "${VERIFY_TRANSFORM_TMP_PARENT}")" \
     "${SWIFT_BIN}" verify-transform \
@@ -710,10 +927,8 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 score_stdout="$(mktemp "${TMPDIR:-/tmp}/mlxfast-score.XXXXXX")"
-trap 'rm -f "${score_stdout}"' EXIT
 
 report_local_baseline_context
-run_local_cool_gate
 
 "${SWIFT_BIN}" benchmark \
   --weights "${WEIGHTS_PATH}" \
@@ -749,29 +964,45 @@ fi
 score_hash="$(shasum -a 256 "${SCORE_PATH}" | awk '{print $1}')"
 printf '%s  %s\n' "${score_hash}" "${SCORE_PATH}" > "${SCORE_PATH}.sha256"
 
-weights_hash="$(score_metric_string weights_hash)"
-weights_file_count="$(score_metric_number weights_file_count)"
-weights_byte_count="$(score_metric_number weights_byte_count)"
+if ! score_metrics="$(jq -er '
+    .metrics
+    | select((.weights_hash | type) == "string" and (.weights_hash | length) > 0)
+    | select((.weights_file_count | type) == "number" and .weights_file_count >= 0 and (.weights_file_count | floor) == .weights_file_count)
+    | select((.weights_byte_count | type) == "number" and .weights_byte_count >= 0 and (.weights_byte_count | floor) == .weights_byte_count)
+    | [.weights_hash, (.weights_file_count | tostring), (.weights_byte_count | tostring)]
+    | @tsv
+  ' "${SCORE_PATH}")"; then
+  echo "benchmark.sh: score payload has invalid weights integrity metrics" >&2
+  exit 1
+fi
+IFS=$'\t' read -r weights_hash weights_file_count weights_byte_count <<< "${score_metrics}"
 golden_hash=""
 if [[ -f "${GOLDEN_PATH}" ]]; then
   golden_hash="$(shasum -a 256 "${GOLDEN_PATH}" | awk '{print $1}')"
 fi
 
-cat > "${INTEGRITY_PATH}" <<EOF
-{
-  "score_path": "$(json_string "${SCORE_PATH}")",
-  "score_sha256": "$(json_string "${score_hash}")",
-  "weights_path": "$(json_string "${WEIGHTS_PATH}")",
-  "weights_sha256": "$(json_string "${weights_hash}")",
-  "weights_file_count": $(json_number_or_null "${weights_file_count}"),
-  "weights_byte_count": $(json_number_or_null "${weights_byte_count}"),
-  "golden_path": "[private]",
-  "golden_sha256": "$(json_string "${golden_hash}")",
-  "transform_source_sha256": "$(json_string "${wanted_hash}")"
-}
-EOF
+jq -n \
+  --arg score_path "${SCORE_PATH}" \
+  --arg score_sha256 "${score_hash}" \
+  --arg weights_path "${WEIGHTS_PATH}" \
+  --arg weights_sha256 "${weights_hash}" \
+  --argjson weights_file_count "${weights_file_count}" \
+  --argjson weights_byte_count "${weights_byte_count}" \
+  --arg golden_sha256 "${golden_hash}" \
+  --arg transform_source_sha256 "${wanted_hash}" \
+  '{
+    score_path: $score_path,
+    score_sha256: $score_sha256,
+    weights_path: $weights_path,
+    weights_sha256: $weights_sha256,
+    weights_file_count: $weights_file_count,
+    weights_byte_count: $weights_byte_count,
+    golden_path: "[private]",
+    golden_sha256: $golden_sha256,
+    transform_source_sha256: $transform_source_sha256
+  }' > "${INTEGRITY_PATH}"
 
-if grep -Eq '"passed"[[:space:]]*:[[:space:]]*false' "${SCORE_PATH}"; then
+if ! jq -e '.passed == true' "${SCORE_PATH}" >/dev/null; then
   echo "benchmark.sh: benchmark produced a failing score; see ${SCORE_PATH}" >&2
   exit 1
 fi

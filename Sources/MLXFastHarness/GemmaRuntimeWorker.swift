@@ -95,7 +95,7 @@ extension GemmaRuntime {
                 ok: true,
                 tokens: tokens,
                 expertStats: expertStats(from: weightCache),
-                peakRamGB: currentResidentMemoryGB()
+                peakRamGB: peakResidentMemoryGB()
             )
 
         case "correctness_begin":
@@ -103,7 +103,6 @@ extension GemmaRuntime {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness request missing prompt_tokens")
             }
             let cache = Gemma4ModelCache(config: weightCache.config)
-            let start = DispatchTime.now().uptimeNanoseconds
             let logits = try Gemma4Model.logits(
                 inputIDs: inputIDsArray(promptTokens),
                 weightCache: weightCache,
@@ -114,16 +113,14 @@ extension GemmaRuntime {
             state.correctnessCache = cache
             state.correctnessPromptTokenCount = promptTokens.count
             state.correctnessStep = 0
-            let elapsed = secondsSince(start)
             return RuntimeWorkerResponse(
                 id: request.id,
                 nonce: sessionNonce,
                 ok: true,
                 token: token,
                 topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
-                seconds: elapsed,
                 expertStats: expertStats(from: weightCache),
-                peakRamGB: currentResidentMemoryGB()
+                peakRamGB: peakResidentMemoryGB()
             )
 
         case "correctness_step":
@@ -148,7 +145,7 @@ extension GemmaRuntime {
                 token: token,
                 topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
                 expertStats: expertStats(from: weightCache),
-                peakRamGB: currentResidentMemoryGB()
+                peakRamGB: peakResidentMemoryGB()
             )
 
         case "prefill":
@@ -156,7 +153,6 @@ extension GemmaRuntime {
                 throw MLXFastError.invalidInput("runtime worker prefill request missing prompt_tokens")
             }
             let cache = Gemma4ModelCache(config: weightCache.config)
-            let start = DispatchTime.now().uptimeNanoseconds
             let logits = try Gemma4Model.logits(
                 inputIDs: inputIDsArray(promptTokens),
                 weightCache: weightCache,
@@ -165,16 +161,11 @@ extension GemmaRuntime {
             )
             eval(logits)
             let token = try GemmaCorrectness.greedyToken(from: logits)
-            let elapsed = secondsSince(start)
-            Memory.clearCache()
             return RuntimeWorkerResponse(
                 id: request.id,
                 nonce: sessionNonce,
                 ok: true,
-                token: token,
-                seconds: elapsed,
-                expertStats: expertStats(from: weightCache),
-                peakRamGB: currentResidentMemoryGB()
+                token: token
             )
 
         case "decode_begin":
@@ -196,7 +187,6 @@ extension GemmaRuntime {
             // precomputed. Prefill/decode/correctness each run in their own worker
             // process, so no memo persists across phases either.
             let cache = Gemma4ModelCache(config: weightCache.config)
-            let start = DispatchTime.now().uptimeNanoseconds
             let logits = try Gemma4Model.logits(
                 inputIDs: inputIDsArray(seedTokens),
                 weightCache: weightCache,
@@ -209,16 +199,11 @@ extension GemmaRuntime {
             state.decodeCache = cache
             state.decodeSeedTokenCount = seedTokens.count
             state.decodeStep = 0
-            let elapsed = secondsSince(start)
-
             return RuntimeWorkerResponse(
                 id: request.id,
                 nonce: sessionNonce,
                 ok: true,
-                seedToken: seedToken,
-                seconds: elapsed,
-                expertStats: expertStats(from: weightCache),
-                peakRamGB: currentResidentMemoryGB()
+                seedToken: seedToken
             )
 
         case "decode_step":
@@ -232,7 +217,6 @@ extension GemmaRuntime {
             guard validationDelayMS >= 0 else {
                 throw MLXFastError.invalidInput("runtime worker validation delay must be non-negative")
             }
-            let start = DispatchTime.now().uptimeNanoseconds
             let logits = try Gemma4Model.logits(
                 inputIDs: inputIDsArray([inputToken]),
                 weightCache: weightCache,
@@ -243,16 +227,24 @@ extension GemmaRuntime {
             if validationDelayMS > 0 {
                 Thread.sleep(forTimeInterval: Double(validationDelayMS) / 1_000.0)
             }
-            let elapsed = secondsSince(start)
             state.decodeStep += 1
             return RuntimeWorkerResponse(
                 id: request.id,
                 nonce: sessionNonce,
                 ok: true,
-                token: token,
-                seconds: elapsed,
-                expertStats: expertStats(from: weightCache),
-                peakRamGB: currentResidentMemoryGB()
+                token: token
+            )
+
+        case "phase_diagnostics":
+            let peakRamGB = peakResidentMemoryGB()
+            let stats = expertStats(from: weightCache)
+            Memory.clearCache()
+            return RuntimeWorkerResponse(
+                id: request.id,
+                nonce: sessionNonce,
+                ok: true,
+                expertStats: stats,
+                peakRamGB: peakRamGB
             )
 
         default:
@@ -299,7 +291,6 @@ struct RuntimeWorkerResponse: Codable {
     let topLogitRows: [[CorrectnessTraceLogit]]?
     let seedToken: Int?
     let tokens: [Int]?
-    let seconds: Double?
     let expertStats: ExpertStreamingStats?
     let peakRamGB: Double?
 
@@ -313,7 +304,6 @@ struct RuntimeWorkerResponse: Codable {
         topLogitRows: [[CorrectnessTraceLogit]]? = nil,
         seedToken: Int? = nil,
         tokens: [Int]? = nil,
-        seconds: Double? = nil,
         expertStats: ExpertStreamingStats? = nil,
         peakRamGB: Double? = nil
     ) {
@@ -326,7 +316,6 @@ struct RuntimeWorkerResponse: Codable {
         self.topLogitRows = topLogitRows
         self.seedToken = seedToken
         self.tokens = tokens
-        self.seconds = seconds
         self.expertStats = expertStats
         self.peakRamGB = peakRamGB
     }
@@ -341,7 +330,6 @@ struct RuntimeWorkerResponse: Codable {
         case topLogitRows = "top_logit_rows"
         case seedToken = "seed_token"
         case tokens
-        case seconds
         case expertStats = "expert_stats"
         case peakRamGB = "peak_ram_gb"
     }
@@ -654,6 +642,10 @@ final class RuntimeWorkerClient {
             kind: "decode_step",
             token: inputToken
         )
+    }
+
+    func phaseDiagnostics() throws -> RuntimeWorkerResponse {
+        try send(kind: "phase_diagnostics")
     }
 
     private func send(

@@ -47,7 +47,12 @@ extension CheckpointIndex {
         var weightMap: [String: String] = [:]
         for shard in shards {
             let header = try Safetensors.readHeader(shard)
-            for key in header.tensors.keys {
+            for key in header.tensors.keys.sorted() {
+                if let existingShard = weightMap[key] {
+                    throw MLXFastError.invalidInput(
+                        "duplicate tensor \(key) appears in safetensors shards \(existingShard) and \(shard.lastPathComponent)"
+                    )
+                }
                 weightMap[key] = shard.lastPathComponent
             }
         }

@@ -37,6 +37,11 @@ CANDIDATE_SCORE_PATH="${MLXFAST_CANDIDATE_SCORE_PATH:?MLXFAST_CANDIDATE_SCORE_PA
 INTEGRITY_PATH="${MLXFAST_INTEGRITY_PATH:-benchmark-integrity.json}"
 DECODE_FLOOR="${MLXFAST_DECODE_SPEEDUP_FLOOR:?MLXFAST_DECODE_SPEEDUP_FLOOR is required}"
 PREFILL_FLOOR="${MLXFAST_PREFILL_SPEEDUP_FLOOR:?MLXFAST_PREFILL_SPEEDUP_FLOOR is required}"
+EXPECTED_COMMIT="${MLXFAST_EXPECTED_COMMIT:?MLXFAST_EXPECTED_COMMIT is required}"
+if [[ ! "${EXPECTED_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "::error::MLXFAST_EXPECTED_COMMIT must be a full lowercase commit SHA" >&2
+  exit 1
+fi
 
 require_file() {
   if [[ ! -s "$1" ]]; then
@@ -70,8 +75,11 @@ jq -e '
 # combine job's pre-merge leak-field and expert-zero checks (the dense
 # RAM-resident runtime must report structural zeros; a nonzero value is a
 # schema regression that must fail loudly, not merge silently).
-jq -e '
-  (.metrics.first_failing_case == null)
+jq -e --arg expected_commit "${EXPECTED_COMMIT}" '
+  (.metrics.commit as $commit
+  | ($commit | test("^[0-9a-f]{7,40}$"))
+  and ($expected_commit | startswith($commit)))
+  and (.metrics.first_failing_case == null)
   and (.metrics.first_failing_step == null)
   and (.metrics.expected_token == null)
   and (.metrics.actual_token == null)

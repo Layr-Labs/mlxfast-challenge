@@ -27,6 +27,11 @@ require_file "${GOLDEN_PATH}.bytes"
 : "${MLXFAST_GPQA_TTFT_CASE_COUNT:?MLXFAST_GPQA_TTFT_CASE_COUNT is required}"
 : "${MLXFAST_SEMANTIC_GPQA_CASE_COUNT:?MLXFAST_SEMANTIC_GPQA_CASE_COUNT is required}"
 : "${MLXFAST_SEMANTIC_GPQA_MIN_PASS:?MLXFAST_SEMANTIC_GPQA_MIN_PASS is required}"
+: "${MLXFAST_EXPECTED_COMMIT:?MLXFAST_EXPECTED_COMMIT is required}"
+if [[ ! "${MLXFAST_EXPECTED_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "::error::MLXFAST_EXPECTED_COMMIT must be a full lowercase commit SHA" >&2
+  exit 1
+fi
 
 case "${MLXFAST_SEMANTIC_GPQA_REQUIRED:-1}" in
   1|true|TRUE|yes|YES)
@@ -64,11 +69,13 @@ jq -e \
   --argjson semantic_cases "${MLXFAST_SEMANTIC_GPQA_CASE_COUNT}" \
   --argjson semantic_min_pass "${MLXFAST_SEMANTIC_GPQA_MIN_PASS}" \
   --argjson semantic_required "${semantic_required}" \
+  --arg expected_commit "${MLXFAST_EXPECTED_COMMIT}" \
   '
   def same_keys($expected):
     (keys_unsorted | sort) == ($expected | sort);
 
-  same_keys(["metrics", "passed", "score"])
+  .metrics.commit as $commit
+  | same_keys(["metrics", "passed", "score"])
   and (.metrics | same_keys([
     "actual_token",
     "bandwidth_gb_per_token",
@@ -194,7 +201,8 @@ jq -e \
   and (.metrics.weights_byte_count > 0)
   and (.metrics.bandwidth_source == "ram_resident_model")
   and (.metrics.error == "")
-  and (.metrics.commit | test("^[0-9a-f]{7,40}$"))
+  and ($commit | test("^[0-9a-f]{7,40}$"))
+  and ($expected_commit | startswith($commit))
   and (.metrics.harness_hash | test("^[0-9a-f]{64}$"))
   and (.metrics.timestamp | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))
   and (.metrics.runtime == "swift")
