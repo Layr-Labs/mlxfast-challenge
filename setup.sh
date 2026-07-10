@@ -94,6 +94,9 @@ Important environment variables:
                                      as a deprecated alias.
   MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1    Build tools only; do not download weights.
   MLXFAST_SKIP_MLX_METALLIB=1        Skip mlx.metallib build.
+  MLXFAST_SKIP_MACMON_INSTALL=1      Do not install macmon (the GPU temperature
+                                     reader benchmark.sh's local cool-down gate
+                                     uses; the gate is skipped when absent).
 
 After setup:
   MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" .github/scripts/run-offline.sh .build/release/mlxfast-swift transform --output weights
@@ -280,6 +283,74 @@ ensure_cmake() {
     echo "setup.sh: cmake installation finished, but cmake was not found" >&2
     return 1
   fi
+}
+
+find_macmon() {
+  # Same lookup order as benchmark.sh's local cool-down gate: explicit
+  # override, PATH, then the usual install locations.
+  local candidate
+  if [[ -n "${MLXFAST_MACMON_BIN:-}" ]]; then
+    if [[ -x "${MLXFAST_MACMON_BIN}" ]]; then
+      printf '%s\n' "${MLXFAST_MACMON_BIN}"
+      return 0
+    fi
+    echo "setup.sh: MLXFAST_MACMON_BIN is set but not executable: ${MLXFAST_MACMON_BIN}" >&2
+    return 1
+  fi
+  if candidate="$(command -v macmon 2>/dev/null)"; then
+    printf '%s\n' "${candidate}"
+    return 0
+  fi
+  for candidate in /opt/homebrew/bin/macmon /usr/local/bin/macmon "${HOME}/bin/macmon"; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_macmon() {
+  # macmon (https://github.com/vladkens/macmon) is the unprivileged GPU
+  # temperature reader benchmark.sh's local cool-down gate uses to mirror the
+  # ranked runner's 40C thermal gate. It is NOT required to run the benchmark:
+  # if it stays missing, benchmark.sh warns and skips the gate, so a failed
+  # install must never fail setup.
+  local macmon_path
+  if macmon_path="$(find_macmon)"; then
+    echo "setup.sh: macmon found at ${macmon_path} (GPU cool-down gate enabled for local benchmark modes)"
+    return 0
+  fi
+
+  # Auto-install only when Homebrew is already available: unlike cmake (a hard
+  # build requirement that justifies bootstrapping Homebrew), macmon is
+  # optional, so a missing brew only downgrades this to instructions.
+  if [[ "${MLXFAST_SKIP_MACMON_INSTALL:-0}" != "1" && "$(uname -s)" == "Darwin" ]]; then
+    if command -v brew >/dev/null 2>&1 || load_homebrew_shellenv; then
+      echo "setup.sh: installing macmon with Homebrew (GPU temperature reader for the local benchmark cool-down gate)"
+      brew install macmon || true
+    fi
+    if macmon_path="$(find_macmon)"; then
+      echo "setup.sh: macmon installed at ${macmon_path}"
+      return 0
+    fi
+  fi
+
+  cat >&2 <<'EOF'
+setup.sh: warning: macmon is not installed.
+
+benchmark.sh's local modes (--local-iterate / --local-submit) use macmon to
+wait for the GPU to cool below 40C before timing, mirroring the ranked
+runner's thermal gate. Without it the gate is skipped and hot back-to-back
+runs can report misleading timings. Install it with:
+
+  brew install macmon
+
+or download a release from https://github.com/vladkens/macmon and put it on
+PATH (or set MLXFAST_MACMON_BIN=/path/to/macmon).
+
+EOF
+  return 0
 }
 
 ensure_swift_toolchain() {
@@ -1515,6 +1586,7 @@ EOF
 }
 
 ensure_swift_toolchain
+ensure_macmon
 trap cleanup_background_builds EXIT
 
 if [[ "${MLXFAST_SKIP_WEIGHTS_DOWNLOAD:-0}" == "1" || "${SKIP_MODEL_DOWNLOAD:-0}" == "1" ]]; then

@@ -2,6 +2,27 @@
 # Run the Swift benchmark and emit the benchmark.json scorePath.
 set -euo pipefail
 
+# --- Local-mode GPU cool-down gate (--local-iterate / --local-submit) --------
+# The ranked runner starts each timed phase only after the GPU has cooled
+# below a fixed 40C thermal gate. Local modes mirror that gate here in the
+# trusted outer script, right before the timed benchmark process starts, so
+# back-to-back local runs are not silently skewed by heat left over from a
+# previous run. Local-mode only: the ranked/official path never reaches this
+# code and keeps its own operator-side gate.
+#
+# Knobs (local debugging only; see run_local_cool_gate):
+#   MLXFAST_LOCAL_COOL_GATE=0   disable the gate (timings taken hot are not
+#                               comparable to gated runs)
+#   MLXFAST_MACMON_BIN=...      explicit macmon binary path
+#   MLXFAST_GPU_TEMP_CMD=...    testing/portability seam: shell command whose
+#                               stdout is the current GPU temperature in C
+readonly COOL_GATE_TEMP_C=40             # start timing only at/below this GPU temp (C); same 40C as the ranked gate
+readonly COOL_GATE_POLL_SECONDS=10       # temperature poll / progress-notification interval
+readonly COOL_GATE_ABORT_SECONDS=180     # minimum total wait before a stalled cool-down aborts
+readonly COOL_GATE_STALL_SECONDS=90      # abort once no new minimum temp has been seen for this long
+readonly COOL_GATE_MAX_WAIT_SECONDS=900  # hard wait ceiling even while temp is still (slowly) falling; matches the ranked COOL_TIMEOUT
+readonly COOL_GATE_PROGRESS_EPSILON_C=0.25  # a new minimum must drop at least this much to count as progress (sensor jitter is not progress)
+
 LOCAL_ITERATE=0
 LOCAL_SUBMIT=0
 OFFICIAL=0
@@ -283,6 +304,136 @@ report_local_score_summary() {
     echo "benchmark.sh: vs ${baseline_path} (negative s/token deltas = faster)"
     printf '%s\n' "${compare}"
   } >&2
+}
+
+find_macmon() {
+  # Prefer an explicit override, then PATH, then the usual install locations
+  # (Homebrew, and the ~/bin drop used on the ranked boxes).
+  local candidate
+  if [[ -n "${MLXFAST_MACMON_BIN:-}" ]]; then
+    if [[ -x "${MLXFAST_MACMON_BIN}" ]]; then
+      printf '%s\n' "${MLXFAST_MACMON_BIN}"
+      return 0
+    fi
+    echo "benchmark.sh: MLXFAST_MACMON_BIN is set but not executable: ${MLXFAST_MACMON_BIN}" >&2
+    return 1
+  fi
+  if candidate="$(command -v macmon 2>/dev/null)"; then
+    printf '%s\n' "${candidate}"
+    return 0
+  fi
+  for candidate in /opt/homebrew/bin/macmon /usr/local/bin/macmon "${HOME}/bin/macmon"; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Prints the current GPU temperature in C (one line), or nothing on failure.
+# MLXFAST_GPU_TEMP_CMD is a documented testing/portability seam: any shell
+# command whose stdout is a plain Celsius number can stand in for macmon.
+COOL_GATE_MACMON_BIN=""
+local_gpu_temp() {
+  if [[ -n "${MLXFAST_GPU_TEMP_CMD:-}" ]]; then
+    bash -c "${MLXFAST_GPU_TEMP_CMD}" 2>/dev/null | head -n 1 | tr -d '[:space:]'
+    return 0
+  fi
+  "${COOL_GATE_MACMON_BIN}" pipe -s1 2>/dev/null | jq -r '.temp.gpu_temp_avg // empty' 2>/dev/null
+}
+
+format_temp_c() {
+  awk -v t="$1" 'BEGIN { printf "%.1f", t }'
+}
+
+# Block the timed local run until the GPU has cooled to the gate temperature,
+# mirroring the ranked runner's thermal gate. Missing-tool policy: warn loudly
+# and SKIP (never hard-fail) -- a participant without macmon still gets a
+# working local benchmark, just without the thermal guarantee; setup.sh
+# installs/instructs about macmon so the tool being present is the normal
+# case. Abort policy: if the GPU is hot and NOT trending down, something else
+# is loading it and waiting longer will not help -- exit non-zero with an
+# actionable message so scripted loops stop instead of measuring a loaded GPU.
+run_local_cool_gate() {
+  if [[ "${LOCAL_ITERATE}" != "1" && "${LOCAL_SUBMIT}" != "1" ]]; then
+    return 0
+  fi
+  if [[ "${MLXFAST_LOCAL_COOL_GATE:-1}" == "0" ]]; then
+    echo "benchmark.sh: warning: local GPU cool-down gate disabled (MLXFAST_LOCAL_COOL_GATE=0); hot-start timings are not comparable to gated runs" >&2
+    return 0
+  fi
+
+  if [[ -z "${MLXFAST_GPU_TEMP_CMD:-}" ]]; then
+    if ! COOL_GATE_MACMON_BIN="$(find_macmon)"; then
+      cat >&2 <<EOF
+benchmark.sh: warning: skipping the GPU cool-down gate: no GPU temperature reader found.
+benchmark.sh: the ranked runner only starts timed runs below a ${COOL_GATE_TEMP_C}C GPU thermal gate;
+benchmark.sh: without the same gate, hot back-to-back local runs can look slower than
+benchmark.sh: they are. Install macmon (rerunning ./setup.sh does this for you):
+benchmark.sh:   brew install macmon
+benchmark.sh: or set MLXFAST_MACMON_BIN=/path/to/macmon.
+EOF
+      return 0
+    fi
+  fi
+
+  local temp waited=0 min_temp="" last_progress_waited=0 bad_samples=0
+  while :; do
+    temp="$(local_gpu_temp || true)"
+    if [[ ! "${temp}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      # Tolerate a couple of flaky reads, then skip the gate rather than hang
+      # a participant behind a broken sensor path.
+      bad_samples=$((bad_samples + 1))
+      if [[ "${bad_samples}" -ge 3 ]]; then
+        echo "benchmark.sh: warning: skipping the GPU cool-down gate: temperature reader returned no usable sample (reader: ${MLXFAST_GPU_TEMP_CMD:-${COOL_GATE_MACMON_BIN}})" >&2
+        return 0
+      fi
+      sleep 2
+      continue
+    fi
+    bad_samples=0
+
+    if awk -v t="${temp}" -v gate="${COOL_GATE_TEMP_C}" 'BEGIN { exit !(t <= gate) }'; then
+      echo "benchmark.sh: GPU cool-down gate passed (current $(format_temp_c "${temp}")C, target <=${COOL_GATE_TEMP_C}C, waited ${waited}s)" >&2
+      return 0
+    fi
+
+    # Progress heuristic: track the minimum temperature seen; only a new
+    # minimum at least COOL_GATE_PROGRESS_EPSILON_C below the previous one
+    # counts as progress, so sensor jitter around a plateau does not look
+    # like cooling.
+    if [[ -z "${min_temp}" ]] \
+        || awk -v t="${temp}" -v m="${min_temp}" -v e="${COOL_GATE_PROGRESS_EPSILON_C}" 'BEGIN { exit !(t <= m - e) }'; then
+      min_temp="${temp}"
+      last_progress_waited="${waited}"
+    fi
+
+    # Abort when BOTH the total wait exceeded the abort floor AND no progress
+    # has been made recently: still hot and not decreasing means an external
+    # GPU load, and more waiting will not fix that.
+    if [[ "${waited}" -ge "${COOL_GATE_ABORT_SECONDS}" \
+        && "$((waited - last_progress_waited))" -ge "${COOL_GATE_STALL_SECONDS}" ]]; then
+      cat >&2 <<EOF
+benchmark.sh: ERROR: GPU is hot and not cooling down (current $(format_temp_c "${temp}")C, min seen $(format_temp_c "${min_temp}")C, target <=${COOL_GATE_TEMP_C}C, waited ${waited}s).
+benchmark.sh: something else appears to be loading the GPU. Close GPU-heavy
+benchmark.sh: processes (other benchmarks, ML jobs, games, video encodes),
+benchmark.sh: let the machine cool, and rerun. To debug without the gate, set
+benchmark.sh: MLXFAST_LOCAL_COOL_GATE=0 (hot-start timings are not comparable).
+EOF
+      exit 1
+    fi
+    # Hard ceiling: even a slowly-cooling GPU should not stall the edit loop
+    # for more than the ranked runner's own cool timeout.
+    if [[ "${waited}" -ge "${COOL_GATE_MAX_WAIT_SECONDS}" ]]; then
+      echo "benchmark.sh: ERROR: GPU did not reach ${COOL_GATE_TEMP_C}C within ${COOL_GATE_MAX_WAIT_SECONDS}s (current $(format_temp_c "${temp}")C); reduce GPU load or ambient heat and rerun" >&2
+      exit 1
+    fi
+
+    echo "benchmark.sh: waiting for GPU to cool down before timing (current $(format_temp_c "${temp}")C, target <=${COOL_GATE_TEMP_C}C, waited ${waited}s)..." >&2
+    sleep "${COOL_GATE_POLL_SECONDS}"
+    waited=$((waited + COOL_GATE_POLL_SECONDS))
+  done
 }
 
 json_number_or_null() {
@@ -570,6 +721,7 @@ score_stdout="$(mktemp "${TMPDIR:-/tmp}/mlxfast-score.XXXXXX")"
 trap 'rm -f "${score_stdout}"' EXIT
 
 report_local_baseline_context
+run_local_cool_gate
 
 "${SWIFT_BIN}" benchmark \
   --weights "${WEIGHTS_PATH}" \
