@@ -369,7 +369,7 @@ extension GemmaRuntime {
             progress(
                 "\(modeName) summary est_score=\(formatRatio(estScore)) "
                     + "(decode_speedup^0.75 * prefill_speedup^0.25 vs official baseline; "
-                    + "score stays null in local modes)"
+                    + "published as this run's local estimated score, not a ranked score)"
             )
         }
         progress(
@@ -847,8 +847,28 @@ extension GemmaRuntime {
         weightsDigest: DirectoryDigest?,
         runtime: String
     ) -> ScorePayload {
-        ScorePayload(
-            score: nil,
+        // Local modes publish the ESTIMATED score: the same decode_speedup^0.75
+        // * prefill_speedup^0.25 estimate against the pinned officialBaseline*
+        // constants that the live progress stream and shell summary already
+        // print. The Yukon participant CLI (`mlxfast run`) executes
+        // benchmarkCommand and then validates the contract scorePath as
+        // `{ "score": <finite number>, ... }` -- `score: null` is rejected --
+        // so local modes must carry a numeric score to be consumable at all.
+        // This stays a directional local signal, never an official ranking:
+        // metrics.runtime ("swift-local-iterate"/"swift-local-submit") marks
+        // the payload as local-mode, submit never uploads local score files
+        // (only editablePaths), the ranked pipeline never runs this code path
+        // (benchmark.yml and measure-job.sh invoke --official, which routes to
+        // GemmaRuntime.benchmark), and the ranked artifact validator rejects
+        // this shape (runtime must be "swift" with the hidden-gate fields
+        // populated). The official score remains the paired-ratio overlay
+        // computed by the trusted ranked workflow, exactly as before.
+        let estimatedScore = BenchmarkScore.score(
+            decodeSecondsPerToken: decodeSecondsPerToken,
+            prefillSecondsPerToken: prefillSecondsPerToken
+        )
+        return ScorePayload(
+            score: estimatedScore.isFinite ? estimatedScore : nil,
             passed: true,
             metrics: ScoreMetrics(
                 peakRamGB: peakRamGB,

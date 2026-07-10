@@ -34,8 +34,9 @@ MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
 ./benchmark.sh --official
 
 # Local submit check used by Yukon before upload: runs the public 512-token
-# prompt through a longer checked timing window, writes score.json with
-# score: null, and prints it to stdout.
+# prompt through a longer checked timing window, writes score.json with the
+# estimated local score (never an official ranked score), and prints it to
+# stdout.
 ./benchmark.sh --local-submit
 
 # Or call the Swift CLI directly
@@ -230,12 +231,19 @@ Use these two benchmark modes for local development:
 
 | Command | Purpose | What it checks | Output |
 |---|---|---|---|
-| `./benchmark.sh --local-iterate` | Fast edit-loop signal, usually under 2 minutes after setup. | Public 512-token prompt, standalone prefill next-token check, decode seed-prefill check, and 16 teacher-forced decode checks. | `score.local-iterate.json` with `score: null`. |
-| `./benchmark.sh --local-submit` | Yukon pre-submit gate, intended to be about 10 minutes after setup. | Same public prompt, standalone prefill next-token check, decode seed-prefill check, and 1023 teacher-forced decode checks from a longer public fixture. | `score.json` with `score: null`. |
+| `./benchmark.sh --local-iterate` | Fast edit-loop signal, usually under 2 minutes after setup. | Public 512-token prompt, standalone prefill next-token check, decode seed-prefill check, and 16 teacher-forced decode checks. | `score.local-iterate.json` with the estimated local `score`. |
+| `./benchmark.sh --local-submit` | Yukon pre-submit gate, intended to be about 10 minutes after setup. | Same public prompt, standalone prefill next-token check, decode seed-prefill check, and 1023 teacher-forced decode checks from a longer public fixture. | `score.json` with the estimated local `score`. |
 
+Both local modes publish `score` as the local ESTIMATE
+(`decode_speedup^0.75 * prefill_speedup^0.25` against the pinned
+`officialBaseline*` constants), so the Yukon participant CLI (`mlxfast run`),
+which requires a finite numeric `score` at the contract `scorePath`, can
+consume local runs; `metrics.runtime`
+(`swift-local-iterate`/`swift-local-submit`) marks the payload as local.
 Neither local mode produces an official leaderboard score. Official ranking
 still runs the hidden benchmark oracle and hidden correctness gates on the
-trusted runner.
+trusted runner, and only that ranked run's paired measurement produces the
+official score.
 
 Both local modes stream live numbers to stderr while they run, so you do not
 have to wait for the final JSON: the official baseline constants up front,

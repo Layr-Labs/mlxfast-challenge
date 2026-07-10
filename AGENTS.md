@@ -232,7 +232,8 @@ swift build -c release
 Use it to compare the current working tree against the latest-tip baseline you
 recorded above, not against a result from an older branch.
 `./benchmark.sh --local-submit` is the Yukon pre-submit gate and is intended to
-be longer and closer to the official path while still producing `score: null`.
+be longer and closer to the official path; like `--local-iterate` it publishes
+only the estimated local score (never the official ranked score).
 `./benchmark.sh --official` is the full ranked entrypoint and requires the
 hidden golden artifacts provisioned on the official runner. A bare
 `./benchmark.sh` defaults to `--local-iterate`. Remember the public fixtures

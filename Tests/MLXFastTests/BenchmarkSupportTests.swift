@@ -931,10 +931,152 @@ func localIterateSummaryEmitsSpeedupsAndEstimatedScore() {
     #expect(joined.contains("decode_speedup=2.000"))
     // 2x on both axes -> estimated score 2 under decode^0.75 * prefill^0.25.
     #expect(joined.contains("est_score=2.000"))
-    #expect(joined.contains("score stays null in local modes"))
+    #expect(joined.contains("published as this run's local estimated score, not a ranked score"))
     #expect(joined.contains("decode_bandwidth_gb_per_token=0"))
     #expect(joined.contains("peak_ram_gb=24.500"))
     #expect(!joined.contains("expert_hit_rate="))
+}
+
+// The Yukon participant CLI (`mlxfast run`) executes benchmarkCommand and then
+// validates the contract scorePath as `{ "score": <finite number>, ... }`;
+// `score: null` fails its schema. Local modes therefore publish the estimated
+// score (the same decode_speedup^0.75 * prefill_speedup^0.25 estimate the
+// summary prints) as a numeric, CLI-usable score.
+@Test
+func localIterateScorePublishesCLIUsableEstimatedScore() throws {
+    let payload = GemmaRuntime.localIterateScore(
+        peakRamGB: 24.5,
+        bandwidthGBPerToken: 0,
+        decodeSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken / 2,
+        prefillSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken / 2,
+        wallSeconds: 10,
+        validationSeconds: 1,
+        correctnessSeconds: 5,
+        timedSeconds: 5,
+        correctness: GemmaRuntime.localIterateCorrectnessReport(
+            passed: true,
+            checkedSteps: 18,
+            caseCount: 1,
+            firstFailingStep: nil,
+            expectedToken: nil,
+            actualToken: nil,
+            goldenHash: "hash",
+            expertStats: .zero,
+            error: "",
+            modeName: "local-iterate"
+        ),
+        expertStats: .zero,
+        bandwidthSource: "ram_resident_model",
+        weightsDigest: nil,
+        runtime: "swift-local-iterate"
+    )
+
+    // 2x on both axes -> estimated score 2 under decode^0.75 * prefill^0.25.
+    let estimated = try #require(payload.score)
+    #expect(abs(estimated - 2) < 1e-9)
+    #expect(payload.passed)
+    // The runtime label is the local-mode marker that keeps the estimate
+    // clearly distinguishable from a ranked payload (runtime == "swift").
+    #expect(payload.metrics.runtime == "swift-local-iterate")
+
+    // The sealed scorePath JSON must carry the score as a finite JSON number
+    // -- the exact thing the CLI's schema checks -- and not null.
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let path = directory.appendingPathComponent("score.json").path
+    try writeScorePayload(payload, to: path)
+    let raw = try String(contentsOfFile: path, encoding: .utf8)
+    #expect(!raw.contains("\"score\" : null"))
+    let object = try #require(
+        try JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any]
+    )
+    let rawScore = try #require(object["score"] as? Double)
+    #expect(rawScore.isFinite)
+    let decoded = try JSONDecoder().decode(ScorePayload.self, from: Data(raw.utf8))
+    #expect(decoded.score == estimated)
+}
+
+@Test
+func localIterateScoreFallsBackToNullForUnusableTimings() {
+    // Zero/invalid timings make the estimate non-finite; publish null rather
+    // than a fabricated number (such runs are broken and should not read as
+    // scoreable).
+    let payload = GemmaRuntime.localIterateScore(
+        peakRamGB: 0,
+        bandwidthGBPerToken: 0,
+        decodeSecondsPerToken: 0,
+        prefillSecondsPerToken: 0,
+        wallSeconds: 0,
+        validationSeconds: 0,
+        correctnessSeconds: 0,
+        timedSeconds: 0,
+        correctness: GemmaRuntime.localIterateCorrectnessReport(
+            passed: true,
+            checkedSteps: 18,
+            caseCount: 1,
+            firstFailingStep: nil,
+            expectedToken: nil,
+            actualToken: nil,
+            goldenHash: "hash",
+            expertStats: .zero,
+            error: "",
+            modeName: "local-iterate"
+        ),
+        expertStats: .zero,
+        bandwidthSource: "ram_resident_model",
+        weightsDigest: nil,
+        runtime: "swift-local-iterate"
+    )
+
+    #expect(payload.score == nil)
+    #expect(payload.passed)
+}
+
+// Guard the ranked score semantics against the local-mode estimate: the
+// official benchmark path still publishes exactly the score it was given on
+// pass, and null on failure. Only localIterateScore (reached exclusively via
+// --local-iterate/--local-submit) synthesizes an estimate.
+@Test
+func rankedScoreSemanticsAreUnchangedByLocalEstimatedScore() {
+    let correctness = CorrectnessReport(
+        passed: true,
+        checkedSteps: 513,
+        caseCount: 1,
+        firstFailingCase: nil,
+        firstFailingStep: nil,
+        expectedToken: nil,
+        actualToken: nil,
+        goldenHash: "hash",
+        error: ""
+    )
+    let passed = GemmaRuntime.passedScore(
+        score: 1.25,
+        peakRamGB: 20,
+        bandwidthGBPerToken: 0,
+        decodeSecondsPerToken: 0.1,
+        prefillSecondsPerToken: 0.01,
+        benchmarkWallSeconds: 100,
+        preflightSeconds: 1,
+        correctnessSeconds: 50,
+        timedBenchmarkSeconds: 40,
+        numLayers: MLXFastConstants.numHiddenLayers,
+        correctness: correctness,
+        expertStats: .zero,
+        bandwidthSource: "ram_resident_model",
+        weightsDigest: nil,
+        gpqaTTFT: .zero
+    )
+    #expect(passed.score == 1.25)
+    #expect(passed.metrics.runtime == "swift")
+
+    let failed = GemmaRuntime.failedScore(
+        error: "boom",
+        correctness: nil,
+        passedCorrectness: false,
+        runtime: "swift"
+    )
+    #expect(failed.score == nil)
+    #expect(failed.passed == false)
 }
 
 @Test

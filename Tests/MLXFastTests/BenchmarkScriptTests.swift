@@ -2019,6 +2019,13 @@ func benchmarkLocalSubmitModeUsesLongLocalBenchmarkAndPrintsScore() throws {
     // MLXFAST_OFFICIAL_BENCHMARK_RUN=1.
     #expect(contract.contains("\"benchmarkCommand\": [\"bash\", \"-c\", \"MLXFAST_SCORE_PATH=score.json ./benchmark.sh --local-iterate\"]"))
     #expect(contract.contains("\"scorePath\": \"score.json\""))
+    // The CLI additionally validates the scorePath payload as
+    // `{ "score": <finite number>, ... }` (null is rejected), so the local
+    // modes must publish the estimated local score rather than score: null;
+    // see localIterateScorePublishesCLIUsableEstimatedScore for the payload
+    // behavior and rankedScoreSemanticsAreUnchangedByLocalEstimatedScore for
+    // the ranked-path guard.
+    #expect(localRuntime.contains("score: estimatedScore.isFinite ? estimatedScore : nil"))
     #expect(constants.contains("public static let defaultPublicLocalSubmitGoldenPath"))
     #expect(constants.contains("public static let localSubmitBenchmarkDecodeSteps = 1023"))
     #expect(constants.contains("public static let localSubmitBenchmarkRepeats = 1"))
@@ -2079,7 +2086,11 @@ func benchmarkLocalIterateModeUsesPublicFixtureAndNonOfficialScore() throws {
     #expect(runtime.contains("try decodeWorker.decodeStep(inputToken: inputToken)"))
     #expect(!runtime.contains("teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[decodedStep])"))
     #expect(!runtime.contains("topLogits(from:"))
-    #expect(runtime.contains("score: nil"))
+    // Local modes publish the estimated (non-official) score so the Yukon CLI
+    // (`mlxfast run`), which requires a finite numeric score at scorePath, can
+    // consume local runs; a non-finite estimate still falls back to null.
+    #expect(runtime.contains("let estimatedScore = BenchmarkScore.score("))
+    #expect(runtime.contains("score: estimatedScore.isFinite ? estimatedScore : nil"))
     #expect(options.contains("runtime: String = \"swift-local-iterate\""))
     let prefillStartRange = try #require(runtime.range(of: "\\(modeName) prefill measured start prompt_tokens="))
     let decodeStartRange = try #require(runtime.range(of: "\\(modeName) decode measured start tokens="))

@@ -227,8 +227,11 @@ report_local_baseline_context() {
 # Local modes end with a compact human-readable summary on stderr so the score
 # does not have to be dug out of the JSON payload. The estimated score uses the
 # official formula against the official baseline constants carried inside the
-# score payload; local modes still publish score: null because only the ranked
-# runner produces an official score. When a same-machine baseline snapshot
+# score payload; local modes publish that estimate as the payload's score so
+# the Yukon participant CLI (`mlxfast run`), which requires a finite numeric
+# score at the contract scorePath, can consume local runs. It is a directional
+# local estimate (metrics.runtime marks the mode), never the official score,
+# which only the ranked runner produces. When a same-machine baseline snapshot
 # exists next to the score file (the documented
 # `cp score.local-iterate.json score.local-iterate.baseline.json` workflow),
 # the summary also prints deltas against it. Diagnostic only: any failure here

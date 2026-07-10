@@ -35,13 +35,17 @@ After transform, local users can run the checked-in public correctness gate with
 iteration, `./benchmark.sh --local-iterate` uses that public 512-token prompt,
 checks the prefill next token plus 16 teacher-forced decode tokens, and writes
 the measured 512-token prefill and 16 one-token decode timings to
-`score.local-iterate.json`. It prints that file with `score: null` because it is
-a directional edit-loop signal, not a ranked score.
+`score.local-iterate.json`. That file's `score` is the local ESTIMATE
+(`decode_speedup^0.75 * prefill_speedup^0.25` vs the pinned `officialBaseline*`
+constants; `metrics.runtime` marks the local mode) so the Yukon participant CLI
+(`mlxfast run`), which requires a finite numeric `score`, can read it — it is a
+directional edit-loop signal, not a ranked score.
 For submit-loop iteration, `./benchmark.sh --local-submit` uses the same public
 512-token prompt as a longer pre-submit benchmark. It checks the prefill next
 token plus 1023 teacher-forced decode tokens from a longer public fixture, and
-still writes and prints `score.json` with `score: null`; it is a directional
-local signal, not the official ranking run.
+writes and prints `score.json` with the same estimated local `score`; it is a
+directional local signal, not the official ranking run. Only the ranked
+runner's paired measurement produces the official score.
 
 > **M5-generated correctness fixtures.** `correctness_prompts/` contains
 > prompt/golden fixtures generated on the ranked M5 hardware against the
