@@ -22,11 +22,11 @@ if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]]; then
 fi
 
 case "${GITHUB_REF}" in
-  refs/heads/main|refs/heads/submissions/*|refs/heads/baseline/*)
+  refs/heads/main|refs/heads/submissions/*|refs/heads/baseline/*|refs/heads/yukon/baseline/*)
     ;;
   *)
     echo "::error::private benchmark workflow ref is not allowed: ${GITHUB_REF}" >&2
-    echo "::error::allowed branches are main, submissions/*, and baseline/*" >&2
+    echo "::error::allowed branches are main, submissions/*, baseline/*, and yukon/baseline/*" >&2
     exit 1
     ;;
 esac

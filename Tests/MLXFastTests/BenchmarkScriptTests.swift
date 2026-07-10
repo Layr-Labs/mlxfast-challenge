@@ -547,13 +547,14 @@ func benchmarkWorkflowRunsTrustedMainAndOverlaysOnlySubmittedEditablePaths() thr
     )
 
     // The workflow uses the branch selected by workflow_dispatch. Only main,
-    // submissions/*, and baseline/* are admitted; no duplicate SHA input.
+    // submissions/*, baseline/*, and yukon/baseline/* are admitted; no
+    // duplicate SHA input.
     #expect(!workflow.contains("submission_ref:"))
     #expect(!workflow.contains("submission_repository"))
     #expect(!workflow.contains("allow_untrusted_workflow_testing"))
     #expect(!workflow.contains("MLXFAST_TRUSTED_BENCHMARK_REF: ${{ github.ref }}"))
-    #expect(guardScript.contains("refs/heads/main|refs/heads/submissions/*|refs/heads/baseline/*"))
-    #expect(guardScript.contains("allowed branches are main, submissions/*, and baseline/*"))
+    #expect(guardScript.contains("refs/heads/main|refs/heads/submissions/*|refs/heads/baseline/*|refs/heads/yukon/baseline/*"))
+    #expect(guardScript.contains("allowed branches are main, submissions/*, baseline/*, and yukon/baseline/*"))
     #expect(guardScript.contains("@${GITHUB_REF}"))
     #expect(!guardScript.contains("MLXFAST_TRUSTED_BENCHMARK_REF"))
 
@@ -642,13 +643,14 @@ func trustedBenchmarkWorkflowGuardAllowsOnlyPermittedBranches() throws {
         "refs/heads/main",
         "refs/heads/submissions/example",
         "refs/heads/baseline/reference",
+        "refs/heads/yukon/baseline/718528521cd7a7df341b750bc3ccb28478ff045b",
     ] {
         #expect(try run(ref: ref).status == 0, "expected \(ref) to be allowed")
     }
 
     let rejected = try run(ref: "refs/heads/feature/not-allowed")
     #expect(rejected.status != 0)
-    #expect(rejected.stderr.contains("allowed branches are main, submissions/*, and baseline/*"))
+    #expect(rejected.stderr.contains("allowed branches are main, submissions/*, baseline/*, and yukon/baseline/*"))
 }
 
 @Test

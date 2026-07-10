@@ -86,9 +86,10 @@ name: benchmark
 #
 # Dispatch-only, like before: no PR/push triggers (GitHub self-hosted safety --
 # fork PRs must never reach this runner). Dispatches are restricted to main,
-# submissions/*, and baseline/*. Submission branches contribute only the exact
-# dispatched SHA's editablePaths over trusted main; main and baseline branches
-# run their exact dispatched SHA. Submitted-process logs remain suppressed.
+# submissions/*, baseline/*, and yukon/baseline/*. Submission branches
+# contribute only the exact dispatched SHA's editablePaths over trusted main;
+# main and both baseline namespaces run their exact dispatched SHA.
+# Submitted-process logs remain suppressed.
 on:
   workflow_dispatch:
     inputs:
@@ -223,7 +224,8 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           # Submission branches contribute editable paths only; trusted main is
-          # the harness/workflow base. Main and baseline/* run their exact SHA.
+          # the harness/workflow base. Main, baseline/*, and yukon/baseline/*
+          # run their exact SHA.
           ref: ${{ startsWith(github.ref, 'refs/heads/submissions/') && 'main' || github.sha }}
           fetch-depth: 0
           persist-credentials: false
