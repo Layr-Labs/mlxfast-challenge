@@ -48,6 +48,13 @@ struct FastQuantizedProjection: @unchecked Sendable {
             mode: .affine
         )
     }
+
+}
+
+private struct FastMLPTailWeights: @unchecked Sendable {
+    let preNorm: MLXArray
+    let postNorm: MLXArray
+    let layerScalar: MLXArray
 }
 
 /// Approximate tanh-GELU using `x*x*x` (compile-safe), matching the library.
@@ -93,6 +100,7 @@ final class Gemma4FastLayer {
 
     let rope: RoPELayer
     let fusedMLP: @Sendable (MLXArray) -> MLXArray
+    let fusedMLPTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
 
     init(
         isSliding: Bool,
@@ -153,6 +161,28 @@ final class Gemma4FastLayer {
             compileEnabled = true
         }
         self.fusedMLP = compileEnabled ? compile(shapeless: true, body) : body
+
+        let tailWeights = FastMLPTailWeights(
+            preNorm: preFfnNorm.weight,
+            postNorm: postFfnNorm.weight,
+            layerScalar: layerScalar
+        )
+        let tailBody: @Sendable (MLXArray, MLXArray) -> MLXArray = { x, residual in
+            let normalized = MLXFast.rmsNorm(x, weight: tailWeights.preNorm, eps: eps)
+            let mlp = downP(gelu(gateP(normalized)) * upP(normalized))
+            let postNormalized = MLXFast.rmsNorm(mlp, weight: tailWeights.postNorm, eps: eps)
+            return (residual + postNormalized) * tailWeights.layerScalar
+        }
+        let tailEnabled: Bool
+        if let raw = ProcessInfo.processInfo.environment["MLX_COMPILED_MLP_TAIL"] {
+            tailEnabled = ["1", "true", "yes", "on"].contains(raw.lowercased())
+        } else {
+            // Keep the extra fusion aligned with the library's compiled
+            // decode capability switch. It preserves attention's eager
+            // reduction path while removing four MLP-side graph boundaries.
+            tailEnabled = compileEnabled
+        }
+        self.fusedMLPTail = tailEnabled ? compile(shapeless: true, tailBody) : nil
     }
 
     func callAsFunction(
@@ -169,8 +199,8 @@ final class Gemma4FastLayer {
         var queries = qProj(h).reshaped(B, L, nHeads, headDim)
         queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: eps)
 
-        let kRaw = kProj(h).reshaped(B, L, nKvHeads, headDim)
-        var keys = MLXFast.rmsNorm(kRaw, weight: kNormWeight!, eps: eps)
+        let rawKeys = kProj(h).reshaped(B, L, nKvHeads, headDim)
+        var keys = MLXFast.rmsNorm(rawKeys, weight: kNormWeight!, eps: eps)
         keys = keys.transposed(0, 2, 1, 3)
         keys = rope(keys, offset: offset)
 
@@ -178,7 +208,7 @@ final class Gemma4FastLayer {
         if let vProj {
             values = vProj(h).reshaped(B, L, nKvHeads, headDim)
         } else {
-            values = kRaw
+            values = rawKeys
         }
         values = MLXFast.rmsNorm(values, weight: MLXArray.mlxNone, eps: eps)
         values = values.transposed(0, 2, 1, 3)
@@ -212,7 +242,7 @@ final class Gemma4FastLayer {
         } else {
             // Prefer library SDPA: D=256 sliding uses fused vector kernel;
             // D=512 full uses its internal fallback. Compiling our own D=512
-            // fallback flips the public near-tie at step 30.
+            // fallback changes the public near-tie reduction order.
             attention = MLXFast.scaledDotProductAttention(
                 queries: queries,
                 keys: keys,
@@ -222,14 +252,20 @@ final class Gemma4FastLayer {
             )
         }
 
-        let attnOut = oProj(attention.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        let mergedAttention = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        let attnOut = oProj(mergedAttention)
         var out = residual + MLXFast.rmsNorm(attnOut, weight: postAttnNormWeight, eps: eps)
         let residual2 = out
-        out = MLXFast.rmsNorm(out, weight: preFfnNormWeight, eps: eps)
-        out = fusedMLP(out)
-        out = MLXFast.rmsNorm(out, weight: postFfnNormWeight, eps: eps)
-        out = residual2 + out
-        return out * layerScalar
+        if let fusedMLPTail {
+            out = fusedMLPTail(out, residual2)
+        } else {
+            out = MLXFast.rmsNorm(out, weight: preFfnNormWeight, eps: eps)
+            out = fusedMLP(out)
+            out = MLXFast.rmsNorm(out, weight: postFfnNormWeight, eps: eps)
+            out = residual2 + out
+            out = out * layerScalar
+        }
+        return out
     }
 }
 
@@ -457,8 +493,8 @@ final class Gemma4FastEngine {
             hidden = layer(hidden, mask: mask, cache: layerCache(index))
         }
 
-        hidden = MLXFast.rmsNorm(hidden, weight: finalNormWeight, eps: eps)
         hidden = gemma4LastTokenHidden(hidden)
+        hidden = MLXFast.rmsNorm(hidden, weight: finalNormWeight, eps: eps)
         let logits = embedTokens.asLinear(hidden)
         return logitSoftcap(logits, MLXArray(softcap))
     }
