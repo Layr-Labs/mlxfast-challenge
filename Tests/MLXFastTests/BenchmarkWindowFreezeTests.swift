@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 @testable import MLXFastCore
 @testable import MLXFastHarness
 @testable import MLXFastModel
@@ -128,6 +129,136 @@ func timedPrefillChargesOneValidatedColdForward() throws {
     #expect(measureWorkerPrefill.contains("secondsSince(prefillStart)"))
     #expect(measureWorkerPrefill.contains("comparePrefillToken"))
     #expect(!measureWorkerPrefill.contains("response.seconds"))
+}
+
+@Test
+func workerPhaseStartsResetTrustedAllocatorBeforeForwardSetup() throws {
+    let worker = try packageFile("Sources/MLXFastHarness/GemmaRuntimeWorker.swift")
+    let resetCall = "try resetRuntimeWorkerAllocatorForPhaseStart()"
+
+    // The phase-start value and reset live in the trusted harness, not in
+    // editable model construction. MLX documents clearCache() as synchronously
+    // deallocating every cached (free) buffer, so a nonzero postcondition must
+    // fail closed. The reset pins the sequence-boundary state only (editable
+    // code may change the limit inside the charged window); the doc must say
+    // so instead of claiming a phase-long "policy" that is not enforced.
+    #expect(worker.contains("static let trustedRuntimeWorkerPhaseStartCacheLimitBytes = 6 << 30"))
+    let allocatorReset = try slice(
+        worker,
+        from: "static func resetRuntimeWorkerAllocatorForPhaseStart()",
+        to: "static func handleWorkerRequest("
+    )
+    let setLimit = try #require(
+        allocatorReset.range(of: "Memory.cacheLimit = trustedRuntimeWorkerPhaseStartCacheLimitBytes")
+    )
+    let clearCache = try #require(allocatorReset.range(of: "Memory.clearCache()"))
+    let readCacheMemory = try #require(allocatorReset.range(of: "Memory.cacheMemory"))
+    let zeroCheck = try #require(allocatorReset.range(of: "guard remainingCacheBytes == 0 else"))
+    #expect(setLimit.lowerBound < clearCache.lowerBound)
+    #expect(clearCache.lowerBound < readCacheMemory.lowerBound)
+    #expect(readCacheMemory.lowerBound < zeroCheck.lowerBound)
+
+    // Every new sequence resets exactly once before constructing its request
+    // cache or entering the helper that performs the first logits call.
+    let phaseBegins = [
+        (
+            start: "case \"correctness\":",
+            end: "case \"correctness_begin\":",
+            firstForwardSetup: "let tokens = try generateGreedyCached("
+        ),
+        (
+            start: "case \"correctness_begin\":",
+            end: "case \"correctness_step\":",
+            firstForwardSetup: "let cache = Gemma4ModelCache("
+        ),
+        (
+            start: "case \"prefill\":",
+            end: "case \"decode_begin\":",
+            firstForwardSetup: "let cache = Gemma4ModelCache("
+        ),
+        (
+            start: "case \"decode_begin\":",
+            end: "case \"decode_step\":",
+            firstForwardSetup: "let cache = Gemma4ModelCache("
+        ),
+    ]
+    for phase in phaseBegins {
+        let body = try slice(worker, from: phase.start, to: phase.end)
+        #expect(body.components(separatedBy: resetCall).count - 1 == 1)
+        let reset = try #require(body.range(of: resetCall))
+        let firstForwardSetup = try #require(body.range(of: phase.firstForwardSetup))
+        #expect(reset.lowerBound < firstForwardSetup.lowerBound)
+    }
+
+    // Step requests are part of an already-started sequence. Clearing here
+    // would destroy legitimate, charged KV/intermediate reuse.
+    let correctnessStep = try slice(
+        worker,
+        from: "case \"correctness_step\":",
+        to: "case \"prefill\":"
+    )
+    let decodeStep = try slice(
+        worker,
+        from: "case \"decode_step\":",
+        to: "case \"phase_diagnostics\":"
+    )
+    #expect(!correctnessStep.contains(resetCall))
+    #expect(!decodeStep.contains(resetCall))
+
+    let doc = try packageFile("docs/benchmark-window-freeze.md")
+    #expect(doc.contains("trusted 6 GiB MLX free-buffer cache reset"))
+    #expect(doc.contains("The reset pins the phase-start state only"))
+    #expect(doc.contains("not an enforced cap for the rest of the phase"))
+    #expect(doc.contains("No allocator reset runs in `correctness_step` or `decode_step`"))
+}
+
+@Test
+func phaseStartAllocatorResetLeavesExactlyEmptyCacheWhenRuntimeTestsAreEnabled() throws {
+    guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+        return
+    }
+    // Pin the MLX contract the fail-closed guard relies on: with no MLX work in
+    // flight, clearCache() leaves cacheMemory at exactly zero even when free
+    // buffers were just returned to the pool (mirroring unscored init warmup
+    // residue), so the trusted reset must succeed rather than fail closed.
+    Memory.cacheLimit = 32 << 30
+    do {
+        let scratch = MLXArray(Array(repeating: Float(1), count: 1 << 20), [1024, 1024])
+        eval(scratch + scratch)
+    }
+    try GemmaRuntime.resetRuntimeWorkerAllocatorForPhaseStart()
+    #expect(Memory.cacheMemory == 0)
+    #expect(Memory.cacheLimit == GemmaRuntime.trustedRuntimeWorkerPhaseStartCacheLimitBytes)
+}
+
+@Test
+func trustedParentStartsPhaseTimerBeforeWorkerResetRequest() throws {
+    let benchmark = try packageFile("Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift")
+    let prefill = try slice(
+        benchmark,
+        from: "static func measureWorkerPrefillSecondsPerToken(",
+        to: "static func measureDecode("
+    )
+    let prefillTimer = try #require(
+        prefill.range(of: "let prefillStart = DispatchTime.now().uptimeNanoseconds")
+    )
+    let prefillRequest = try #require(
+        prefill.range(of: "let response = try worker.prefill(promptTokens: promptTokens)")
+    )
+    #expect(prefillTimer.lowerBound < prefillRequest.lowerBound)
+
+    let decode = try slice(
+        benchmark,
+        from: "static func measureWorkerDecode(",
+        to: "static let bandwidthSource"
+    )
+    let decodeTimer = try #require(
+        decode.range(of: "let decodePhaseStart = DispatchTime.now().uptimeNanoseconds")
+    )
+    let decodeRequest = try #require(
+        decode.range(of: "let beginResponse = try worker.beginDecode(seedTokens: seedTokens)")
+    )
+    #expect(decodeTimer.lowerBound < decodeRequest.lowerBound)
 }
 
 @Test

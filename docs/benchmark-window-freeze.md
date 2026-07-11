@@ -10,8 +10,8 @@ new baseline for every axis that moved.
 
 Treat a re-baseline as expensive and rare. The goal of this freeze is to make
 the current calibration the last forced one: decide every window knob here, pin
-it with `Tests/MLXFastTests/BenchmarkWindowFreezeTests.swift`, and afterwards add
-only defenses that do not touch the charged work.
+it with `Tests/MLXFastTests/BenchmarkWindowFreezeTests.swift`, and pin any later
+security defense that must add charged work as part of this contract.
 
 ## The soundness invariant
 
@@ -26,11 +26,29 @@ Every forward the timed window charges MUST be:
    process.** Two identical charged forwards let editable code memoize one and
    serve the other, collapsing two charged forwards into one with no real
    speedup. Prefill, decode, and correctness each run in their own worker
-   process, so no memo persists across phases.
+   process, so no model-owned memo persists across phases.
+3. **Begin at a trusted MLX free-buffer boundary.** Worker initialization is
+   unscored and executes editable model code, so the first request handler for
+   every new forward sequence performs a trusted 6 GiB MLX free-buffer cache reset:
+   set `Memory.cacheLimit` to the trusted phase-start value, call
+   `Memory.clearCache()`, and fail closed unless `Memory.cacheMemory == 0`. The
+   pinned MLX API defines `clearCache()` as synchronously deallocating all
+   cached (free) buffers; live model weights and KV state are active memory, so
+   exact zero is safe here. The reset pins the phase-start state only -- it is
+   not an enforced cap for the rest of the phase: editable code may change
+   `Memory.cacheLimit` again inside the charged window, and any allocation that
+   follows is charged like all other work. The substantive defense is the
+   free-buffer clear, which stops unscored initialization from subsidizing the
+   first charged forward. The fail-closed zero check also makes "no MLX
+   allocator activity in flight across a request boundary" part of the
+   submission contract: background work that repopulates the cache at a
+   sequence boundary fails the run.
 
-The current window satisfies both: one validated seed prefill plus 128 validated
-single-token decode steps (decode axis), and one validated cold prefill forward
-(prefill axis). Any future window change must preserve this invariant.
+The current window satisfies all three: one validated seed prefill plus 128
+validated single-token decode steps (decode axis), and one validated cold
+prefill forward (prefill axis). The trusted parent starts each scored timer
+before sending the phase-begin request, so the allocator reset is charged. Any
+future window change must preserve these invariants.
 
 ## Frozen window definition
 
@@ -42,6 +60,9 @@ Prefill axis (`measureWorkerPrefillSecondsPerToken`):
 - `benchmarkPrefillPromptTokens = 512` -- prompt length of the single timed forward.
 - `benchmarkPrefillWarmupRuns = 0` -- no warmup; the one timed run is cold.
 - `benchmarkPrefillTimedRuns = 1` -- exactly one measured, validated forward.
+- The `prefill` request applies the trusted phase-start allocator reset
+  (cache-limit set plus free-buffer clear) before constructing its model cache
+  or computing logits.
 
 Decode axis (`measureWorkerDecode` / worker `decode_begin` + `decode_step`):
 
@@ -50,11 +71,20 @@ Decode axis (`measureWorkerDecode` / worker `decode_begin` + `decode_step`):
 - `benchmarkDecodeSteps = 128` -- validated single-token teacher-forced steps.
 - Exactly one whole-prompt seed forward in `decode_begin`; the per-step forwards
   are single-token and input-dependent.
+- `decode_begin` applies the trusted phase-start allocator reset (cache-limit
+  set plus free-buffer clear) before constructing the decode cache or computing
+  seed logits.
 
 Measurement authority (not a constant, but part of the frozen contract):
 
 - The trusted parent measures wall time with its own clock across the whole
   phase. Worker-reported `seconds` are diagnostic only and never feed the score.
+- The parent starts the prefill/decode timer before `worker.prefill` /
+  `worker.beginDecode`, respectively. The trusted allocator reset therefore
+  belongs to the charged window, not unscored worker initialization.
+- No allocator reset runs in `correctness_step` or `decode_step`; those handlers
+  retain legitimate within-sequence KV and intermediate-buffer reuse, and their
+  work remains charged to the enclosing correctness/decode request sequence.
 
 ## Frozen ranking contract
 

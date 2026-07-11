@@ -42,6 +42,10 @@ public final class Gemma4RuntimeWeightCache {
         // The ranked M5 Max has enough headroom to retain more freed
         // intermediate buffers for reuse. This is a soft allocator-cache cap,
         // not a reservation; model weights remain active allocations.
+        // The trusted runtime-worker request handler re-normalizes the
+        // allocator at each sequence boundary (phase-start cache-limit set
+        // plus free-buffer clear). That reset pins the boundary state only,
+        // not a phase-long cap.
         if config.numHiddenLayers >= 16 {
             // The MLX M5 Max default commits after referencing 50 MiB. Many
             // 4-bit projections individually exceed that, so use a moderate
@@ -65,9 +69,10 @@ public final class Gemma4RuntimeWeightCache {
         // forward happen HERE, outside every scored window, instead of inside
         // the first scored prefill.
         //
-        // Retain freed, shape-relevant warmup buffers for the scored worker
-        // request. Metal libraries and pipeline state are process-lifetime
-        // caches independent of this allocator pool.
+        // Free buffers may remain after warmup, but trusted Harness code clears
+        // them inside the first request after the parent starts phase timing.
+        // Metal libraries and pipeline state are process-lifetime caches
+        // independent of this allocator pool.
         if let model = libraryModel, config.numHiddenLayers >= 16 {
             Self.warmLibraryModel(model)
         }
@@ -76,7 +81,8 @@ public final class Gemma4RuntimeWeightCache {
     /// One prefill-shaped forward (512 tokens) and one single-token decode
     /// step against a throwaway cache, evaluated and discarded. Inputs are
     /// constant BOS tokens, so this is prompt-independent and cannot affect
-    /// model output; freed warmup buffers remain eligible for allocator reuse.
+    /// model output. The trusted worker handler, not this editable constructor,
+    /// owns the required free-buffer clear before the next forward sequence.
     private static func warmLibraryModel(_ model: Gemma4RuntimeModel) {
         let bosToken = Int32(2)
         let warmupCache = model.newCache(parameters: nil)
@@ -87,6 +93,7 @@ public final class Gemma4RuntimeWeightCache {
         eval(model(prefillTokens, cache: warmupCache))
         let decodeToken = MLXArray([bosToken], [1, 1])
         eval(model(decodeToken, cache: warmupCache))
+        // The trusted phase-start request handler clears free buffers.
     }
 
     /// Construct and weight-load the mlx-swift-lm Gemma 4 text tower from the
