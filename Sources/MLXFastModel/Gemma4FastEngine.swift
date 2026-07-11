@@ -1,0 +1,465 @@
+import Foundation
+import MLX
+import MLXFastCore
+import MLXLLM
+import MLXLMCommon
+import MLXNN
+
+/// Affine 4-bit projection extracted from a loaded QuantizedLinear.
+struct FastQuantizedProjection: @unchecked Sendable {
+    let weight: MLXArray
+    let scales: MLXArray
+    let biases: MLXArray?
+    let groupSize: Int
+    let bits: Int
+
+    init(_ linear: QuantizedLinear) {
+        self.weight = linear.weight
+        self.scales = linear.scales
+        self.biases = linear.biases
+        self.groupSize = linear.groupSize
+        self.bits = linear.bits
+    }
+
+    init(
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) {
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.groupSize = groupSize
+        self.bits = bits
+    }
+
+    @inline(__always)
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        quantizedMM(
+            x,
+            weight,
+            scales: scales,
+            biases: biases,
+            transpose: true,
+            groupSize: groupSize,
+            bits: bits,
+            mode: .affine
+        )
+    }
+}
+
+/// Approximate tanh-GELU using `x*x*x` (compile-safe), matching the library.
+private let fastGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray) -> MLXArray = { x in
+        0.5 * x * (1 + tanh(sqrt(2 / Float.pi) * (x + 0.044715 * x * x * x)))
+    }
+    let enabled: Bool
+    if let raw = ProcessInfo.processInfo.environment["MLX_COMPILED_DECODE"] {
+        enabled = ["1", "true", "yes", "on"].contains(raw.lowercased())
+    } else {
+        enabled = true
+    }
+    return enabled ? compile(shapeless: true, body) : body
+}()
+
+/// One decoder layer rebuilt from the loaded library modules.
+///
+/// Attention stays eager with active-length KV caches (bit-parity with the
+/// baseline). The gated MLP is fused into one compiled closure to collapse
+/// gate/up/GELU/product/down graph-construction overhead.
+final class Gemma4FastLayer {
+    let isSliding: Bool
+    let nHeads: Int
+    let nKvHeads: Int
+    let headDim: Int
+    let useKEqV: Bool
+    let scale: Float = 1.0
+    let eps: Float
+
+    let qProj: FastQuantizedProjection
+    let kProj: FastQuantizedProjection
+    let vProj: FastQuantizedProjection?
+    let oProj: FastQuantizedProjection
+
+    let qNormWeight: MLXArray
+    let kNormWeight: MLXArray?
+    let inputNormWeight: MLXArray
+    let postAttnNormWeight: MLXArray
+    let preFfnNormWeight: MLXArray
+    let postFfnNormWeight: MLXArray
+    let layerScalar: MLXArray
+
+    let rope: RoPELayer
+    let fusedMLP: @Sendable (MLXArray) -> MLXArray
+
+    init(
+        isSliding: Bool,
+        nHeads: Int,
+        nKvHeads: Int,
+        headDim: Int,
+        useKEqV: Bool,
+        eps: Float,
+        qProj: QuantizedLinear,
+        kProj: QuantizedLinear,
+        vProj: QuantizedLinear?,
+        oProj: QuantizedLinear,
+        qNorm: RMSNorm,
+        kNorm: RMSNorm?,
+        inputNorm: RMSNorm,
+        postAttnNorm: RMSNorm,
+        preFfnNorm: RMSNorm,
+        postFfnNorm: RMSNorm,
+        gate: QuantizedLinear,
+        up: QuantizedLinear,
+        down: QuantizedLinear,
+        layerScalar: MLXArray,
+        rope: RoPELayer
+    ) {
+        self.isSliding = isSliding
+        self.nHeads = nHeads
+        self.nKvHeads = nKvHeads
+        self.headDim = headDim
+        self.useKEqV = useKEqV
+        self.eps = eps
+        self.qProj = FastQuantizedProjection(qProj)
+        self.kProj = FastQuantizedProjection(kProj)
+        self.vProj = vProj.map(FastQuantizedProjection.init)
+        self.oProj = FastQuantizedProjection(oProj)
+        self.qNormWeight = qNorm.weight
+        self.kNormWeight = kNorm?.weight
+        self.inputNormWeight = inputNorm.weight
+        self.postAttnNormWeight = postAttnNorm.weight
+        self.preFfnNormWeight = preFfnNorm.weight
+        self.postFfnNormWeight = postFfnNorm.weight
+        self.layerScalar = layerScalar
+        self.rope = rope
+
+        // Fuse the gated MLP into one compiled closure: collapses gate/up/GELU/
+        // product/down graph construction. Keep two quantizedMMs (not a packed
+        // gate+up): a single 2x-wide matmul was slower on this silicon.
+        let gateP = FastQuantizedProjection(gate)
+        let upP = FastQuantizedProjection(up)
+        let downP = FastQuantizedProjection(down)
+        let gelu = fastGeluApproximate
+        let body: @Sendable (MLXArray) -> MLXArray = { x in
+            downP(gelu(gateP(x)) * upP(x))
+        }
+        let compileEnabled: Bool
+        if let raw = ProcessInfo.processInfo.environment["MLX_COMPILED_DECODE"] {
+            compileEnabled = ["1", "true", "yes", "on"].contains(raw.lowercased())
+        } else {
+            compileEnabled = true
+        }
+        self.fusedMLP = compileEnabled ? compile(shapeless: true, body) : body
+    }
+
+    func callAsFunction(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?
+    ) -> MLXArray {
+        let residual = x
+        let h = MLXFast.rmsNorm(x, weight: inputNormWeight, eps: eps)
+
+        let (B, L, _) = (h.dim(0), h.dim(1), h.dim(2))
+        let offset = cache?.offset ?? 0
+
+        var queries = qProj(h).reshaped(B, L, nHeads, headDim)
+        queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: eps)
+
+        let kRaw = kProj(h).reshaped(B, L, nKvHeads, headDim)
+        var keys = MLXFast.rmsNorm(kRaw, weight: kNormWeight!, eps: eps)
+        keys = keys.transposed(0, 2, 1, 3)
+        keys = rope(keys, offset: offset)
+
+        var values: MLXArray
+        if let vProj {
+            values = vProj(h).reshaped(B, L, nKvHeads, headDim)
+        } else {
+            values = kRaw
+        }
+        values = MLXFast.rmsNorm(values, weight: MLXArray.mlxNone, eps: eps)
+        values = values.transposed(0, 2, 1, 3)
+
+        if let cache {
+            let updated = cache.update(keys: keys, values: values)
+            keys = updated.0
+            values = updated.1
+        }
+
+        queries = queries.transposed(0, 2, 1, 3)
+        queries = rope(queries, offset: offset)
+
+        var attentionMask = mask
+        if case .array(let maskArray) = mask {
+            let keysSeqLen = keys.dim(2)
+            if maskArray.dim(-1) != keysSeqLen {
+                attentionMask = .array(maskArray[.ellipsis, 0..<keysSeqLen])
+            }
+        }
+
+        let attention: MLXArray
+        if L > 1 && offset > 0 {
+            attention = gemma4FastAttentionFallback(
+                queries: queries,
+                keys: keys,
+                values: values,
+                scale: scale,
+                mask: attentionMask
+            )
+        } else {
+            // Prefer library SDPA: D=256 sliding uses fused vector kernel;
+            // D=512 full uses its internal fallback. Compiling our own D=512
+            // fallback flips the public near-tie at step 30.
+            attention = MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: keys,
+                values: values,
+                scale: scale,
+                mask: attentionMask
+            )
+        }
+
+        let attnOut = oProj(attention.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        var out = residual + MLXFast.rmsNorm(attnOut, weight: postAttnNormWeight, eps: eps)
+        let residual2 = out
+        out = MLXFast.rmsNorm(out, weight: preFfnNormWeight, eps: eps)
+        out = fusedMLP(out)
+        out = MLXFast.rmsNorm(out, weight: postFfnNormWeight, eps: eps)
+        out = residual2 + out
+        return out * layerScalar
+    }
+}
+
+/// Manual attention fallback matching the library's batched/ragged path.
+private func gemma4FastAttentionFallback(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray,
+    scale: Float,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode
+) -> MLXArray {
+    let (B, nQHeads, L, D) = (
+        queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3)
+    )
+    let nKVHeads = keys.dim(1)
+    let repeats = nQHeads / nKVHeads
+
+    var q = queries * scale
+    var k = keys
+    var v = values
+    if repeats > 1 {
+        q = q.reshaped([B, nKVHeads, repeats, L, D])
+        k = expandedDimensions(k, axis: 2)
+        v = expandedDimensions(v, axis: 2)
+    }
+
+    var scores = matmul(q, k.swappedAxes(-1, -2))
+
+    func applyMask(_ maskArray: MLXArray) {
+        var mask = maskArray
+        if scores.ndim == 5 && mask.ndim == 4 && mask.dim(0) == scores.dim(0) {
+            mask = expandedDimensions(mask, axis: 2)
+        }
+        if mask.dtype == .bool {
+            scores = MLX.where(
+                mask, scores, MLXArray(-Float.infinity, dtype: scores.dtype))
+        } else {
+            scores = scores + mask
+        }
+    }
+
+    switch mask {
+    case .none:
+        break
+    case .causal:
+        let qL = scores.dim(-2)
+        let kL = scores.dim(-1)
+        let qIndices = MLXArray(0..<qL) + MLXArray(kL - qL)
+        let kIndices = MLXArray(0..<kL)
+        let causalMask = greaterEqual(
+            expandedDimensions(qIndices, axis: -1),
+            expandedDimensions(kIndices, axis: -2))
+        applyMask(causalMask)
+    case .array(let maskArray):
+        applyMask(maskArray)
+    case .arrays(let maskArrays):
+        if let maskArray = maskArrays.first {
+            applyMask(maskArray)
+        }
+    }
+
+    var probs = softmax(scores.asType(.float32), axis: -1, precise: true)
+    probs = MLX.where(probs .!= probs, MLXArray(Float(0)), probs)
+    scores = probs.asType(scores.dtype)
+    var output = matmul(scores, v)
+    if repeats > 1 {
+        output = output.reshaped([B, nQHeads, L, values.dim(3)])
+    }
+    return output
+}
+
+/// High-performance Gemma 4 trunk built from the already-loaded library modules.
+final class Gemma4FastEngine {
+    let embedTokens: Embedding
+    let embedScale: Float
+    let finalNormWeight: MLXArray
+    let eps: Float
+    let softcap: Float
+    let layers: [Gemma4FastLayer]
+    let slidingWindow: Int
+    private let logitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray
+
+    init(model: Gemma4RuntimeModel) throws {
+        let config = model.configuration
+        self.embedScale = Float(config.hiddenSize).squareRoot()
+        self.eps = config.rmsNormEps
+        self.softcap = config.finalLogitSoftcapping
+        self.slidingWindow = config.slidingWindow
+
+        let modules = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
+        let params = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+
+        func module<T: Module>(_ key: String, as type: T.Type) throws -> T {
+            guard let value = modules[key] as? T else {
+                throw MLXFastError.invalidInput("missing module \(key) as \(T.self)")
+            }
+            return value
+        }
+
+        func array(_ key: String) throws -> MLXArray {
+            guard let value = params[key] else {
+                throw MLXFastError.invalidInput("missing parameter \(key)")
+            }
+            return value
+        }
+
+        self.embedTokens = try module("model.embed_tokens", as: Embedding.self)
+        let finalNorm = try module("model.norm", as: RMSNorm.self)
+        self.finalNormWeight = finalNorm.weight
+
+        var built: [Gemma4FastLayer] = []
+        built.reserveCapacity(config.numHiddenLayers)
+        for index in 0..<config.numHiddenLayers {
+            let prefix = "model.layers.\(index)"
+            let isSliding = config.layerTypes[index] == "sliding_attention"
+            let headDim = isSliding ? config.headDim : config.globalHeadDim
+            let useKEqV = config.attentionKeqV && !isSliding
+            let nKvHeads: Int
+            if useKEqV, let global = config.numGlobalKeyValueHeads {
+                nKvHeads = global
+            } else {
+                nKvHeads = config.numKeyValueHeads
+            }
+
+            let rope: RoPELayer
+            if isSliding {
+                rope = initializeRope(
+                    dims: headDim,
+                    base: config.slidingRopeTheta,
+                    traditional: false,
+                    scalingConfig: nil,
+                    maxPositionEmbeddings: nil
+                )
+            } else {
+                rope = initializeRope(
+                    dims: headDim,
+                    base: config.fullRopeTheta,
+                    traditional: false,
+                    scalingConfig: [
+                        "type": .string("proportional"),
+                        "partial_rotary_factor": .float(config.fullPartialRotaryFactor),
+                    ],
+                    maxPositionEmbeddings: nil
+                )
+            }
+
+            let vProj: QuantizedLinear?
+            if useKEqV {
+                vProj = nil
+            } else {
+                vProj = try module("\(prefix).self_attn.v_proj", as: QuantizedLinear.self)
+            }
+
+            let kNorm: RMSNorm?
+            if useKEqV {
+                // Still present for non-shared layers; k_eq_v still has k_norm.
+                kNorm = try module("\(prefix).self_attn.k_norm", as: RMSNorm.self)
+            } else {
+                kNorm = try module("\(prefix).self_attn.k_norm", as: RMSNorm.self)
+            }
+
+            built.append(
+                Gemma4FastLayer(
+                    isSliding: isSliding,
+                    nHeads: config.numAttentionHeads,
+                    nKvHeads: nKvHeads,
+                    headDim: headDim,
+                    useKEqV: useKEqV,
+                    eps: config.rmsNormEps,
+                    qProj: try module("\(prefix).self_attn.q_proj", as: QuantizedLinear.self),
+                    kProj: try module("\(prefix).self_attn.k_proj", as: QuantizedLinear.self),
+                    vProj: vProj,
+                    oProj: try module("\(prefix).self_attn.o_proj", as: QuantizedLinear.self),
+                    qNorm: try module("\(prefix).self_attn.q_norm", as: RMSNorm.self),
+                    kNorm: kNorm,
+                    inputNorm: try module("\(prefix).input_layernorm", as: RMSNorm.self),
+                    postAttnNorm: try module("\(prefix).post_attention_layernorm", as: RMSNorm.self),
+                    preFfnNorm: try module("\(prefix).pre_feedforward_layernorm", as: RMSNorm.self),
+                    postFfnNorm: try module("\(prefix).post_feedforward_layernorm", as: RMSNorm.self),
+                    gate: try module("\(prefix).mlp.gate_proj", as: QuantizedLinear.self),
+                    up: try module("\(prefix).mlp.up_proj", as: QuantizedLinear.self),
+                    down: try module("\(prefix).mlp.down_proj", as: QuantizedLinear.self),
+                    layerScalar: try array("\(prefix).layer_scalar"),
+                    rope: rope
+                )
+            )
+        }
+        self.layers = built
+
+        let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { logits, cap in
+            tanh(logits / cap) * cap
+        }
+        let compileEnabled: Bool
+        if let raw = ProcessInfo.processInfo.environment["MLX_COMPILED_DECODE"] {
+            compileEnabled = ["1", "true", "yes", "on"].contains(raw.lowercased())
+        } else {
+            compileEnabled = true
+        }
+        self.logitSoftcap = compileEnabled ? compile(shapeless: true, body) : body
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        var hidden = embedTokens(inputs) * embedScale
+
+        func layerCache(_ index: Int) -> KVCache? {
+            guard let cache, index < cache.count else { return nil }
+            return cache[index]
+        }
+
+        let slidingIndex = layers.firstIndex(where: \.isSliding)
+        let fullIndex = layers.firstIndex(where: { !$0.isSliding })
+        let slidingMask = slidingIndex.map {
+            createAttentionMask(
+                h: hidden,
+                cache: layerCache($0),
+                windowSize: slidingWindow
+            )
+        }
+        let fullMask = fullIndex.map {
+            createAttentionMask(h: hidden, cache: layerCache($0), windowSize: nil)
+        }
+
+        for (index, layer) in layers.enumerated() {
+            let mask = layer.isSliding ? (slidingMask ?? .none) : (fullMask ?? .none)
+            hidden = layer(hidden, mask: mask, cache: layerCache(index))
+        }
+
+        hidden = MLXFast.rmsNorm(hidden, weight: finalNormWeight, eps: eps)
+        hidden = gemma4LastTokenHidden(hidden)
+        let logits = embedTokens.asLinear(hidden)
+        return logitSoftcap(logits, MLXArray(softcap))
+    }
+}

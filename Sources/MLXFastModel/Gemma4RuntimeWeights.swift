@@ -146,6 +146,7 @@ public final class Gemma4RuntimeWeightCache {
         // conversion pass is a no-op here and is intentionally omitted.
         try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
         eval(model)
+        try model.prepareFastEngine()
         return model
     }
 
