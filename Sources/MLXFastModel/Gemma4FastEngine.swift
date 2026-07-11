@@ -101,6 +101,8 @@ final class Gemma4FastLayer {
     let rope: RoPELayer
     let fusedMLP: @Sendable (MLXArray) -> MLXArray
     let fusedMLPTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
+    let fusedGateUp: FusedGateUpProjection?
+    let fusedGateUpPostTail: (@Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray)?
 
     init(
         isSliding: Bool,
@@ -183,6 +185,30 @@ final class Gemma4FastLayer {
             tailEnabled = compileEnabled
         }
         self.fusedMLPTail = tailEnabled ? compile(shapeless: true, tailBody) : nil
+
+        let fusedGateUpEnabled: Bool
+        if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_GATE_UP"] {
+            fusedGateUpEnabled = ["1", "true", "yes", "on"].contains(raw.lowercased())
+        } else {
+            fusedGateUpEnabled = true
+        }
+        if fusedGateUpEnabled && tailEnabled {
+            self.fusedGateUp = FusedGateUpProjection(gate: gateP, up: upP)
+            let postTailBody: @Sendable (
+                MLXArray, MLXArray, MLXArray
+            ) -> MLXArray = { gateOutput, upOutput, residual in
+                let mlp = downP(gelu(gateOutput) * upOutput)
+                let postNormalized = MLXFast.rmsNorm(
+                    mlp, weight: tailWeights.postNorm, eps: eps)
+                return (residual + postNormalized) * tailWeights.layerScalar
+            }
+            // CustomKernel cannot participate in MLX compile because it cannot
+            // infer output shapes. Keep the QMV eager and compile its suffix.
+            self.fusedGateUpPostTail = compile(shapeless: true, postTailBody)
+        } else {
+            self.fusedGateUp = nil
+            self.fusedGateUpPostTail = nil
+        }
     }
 
     func callAsFunction(
@@ -256,7 +282,11 @@ final class Gemma4FastLayer {
         let attnOut = oProj(mergedAttention)
         var out = residual + MLXFast.rmsNorm(attnOut, weight: postAttnNormWeight, eps: eps)
         let residual2 = out
-        if let fusedMLPTail {
+        if B == 1, L == 1, let fusedGateUp, let fusedGateUpPostTail {
+            let normalized = MLXFast.rmsNorm(out, weight: preFfnNormWeight, eps: eps)
+            let (gateOutput, upOutput) = fusedGateUp(normalized)
+            out = fusedGateUpPostTail(gateOutput, upOutput, residual2)
+        } else if let fusedMLPTail {
             out = fusedMLPTail(out, residual2)
         } else {
             out = MLXFast.rmsNorm(out, weight: preFfnNormWeight, eps: eps)
