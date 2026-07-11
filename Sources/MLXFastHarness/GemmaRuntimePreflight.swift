@@ -134,6 +134,28 @@ extension GemmaRuntime {
         guard values.isRegularFile == true else {
             throw MLXFastError.missingFile("\(description) missing at \(path)")
         }
+        try requireSingleHardLink(path: url.path, description: description)
+    }
+
+    /// Reject files with a POSIX link count other than 1 (hardlinks). A
+    /// hardlink inside the transform output tree would let a second name --
+    /// potentially owned or planted by the sandboxed bench uid outside the
+    /// tree -- alias trusted bytes, mirroring the `find ... -type f -links +1`
+    /// guard `overlay-editable-paths.sh` already applies to the editable
+    /// overlay. Uses `lstat` so a symlink is never dereferenced here.
+    static func requireSingleHardLink(path: String, description: String) throws {
+        var info = stat()
+        guard lstat(path, &info) == 0 else {
+            throw MLXFastError.invalidInput("\(description) could not be stat'd: \(path)")
+        }
+        if (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFLNK) {
+            throw MLXFastError.invalidInput("\(description) must not be a symlink: \(path)")
+        }
+        if info.st_nlink != 1 {
+            throw MLXFastError.invalidInput(
+                "\(description) must not be hardlinked (link count \(info.st_nlink)): \(path)"
+            )
+        }
     }
 
     static func enforceTransformedWeightsByteLimit(_ byteCount: Int) throws {
@@ -206,6 +228,10 @@ extension GemmaRuntime {
             guard values.isRegularFile == true else {
                 throw MLXFastError.invalidInput("directory digest rejects non-regular file \(relativePath)")
             }
+            try requireSingleHardLink(
+                path: standardized.path,
+                description: "directory digest entry \(relativePath)"
+            )
             files.append((relativePath: relativePath, url: standardized))
         }
 

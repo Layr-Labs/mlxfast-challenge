@@ -27,6 +27,15 @@ if [[ -n "${invalid_entry}" ]]; then
   echo "hash-weights-directory: weights tree contains a symlink or non-regular entry: ${invalid_entry}" >&2
   exit 1
 fi
+# Reject hardlinked files (link count != 1): a second name aliasing these
+# bytes -- e.g. planted by the sandboxed bench uid -- must not slip through the
+# transform-output gate. Mirrors overlay-editable-paths.sh and
+# GemmaRuntime.directoryDigest / requireSingleHardLink.
+hardlinked_entry="$(find "${WEIGHTS_PATH}" -type f -links +1 -print -quit)"
+if [[ -n "${hardlinked_entry}" ]]; then
+  echo "hash-weights-directory: weights tree contains a hardlinked file: ${hardlinked_entry}" >&2
+  exit 1
+fi
 
 hash="$(
   find "${WEIGHTS_PATH}" -type f -print0 \

@@ -654,6 +654,215 @@ func trustedBenchmarkWorkflowGuardAllowsOnlyPermittedBranches() throws {
 }
 
 @Test
+func benchmarkWorkspaceACLLocksTrustedSurfacesAgainstBench() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+    let prepareRange = try #require(workflow.range(of: "- name: Prepare bench workspace"))
+    let buildRange = try #require(workflow.range(of: "- name: Build harness in bench sandbox"))
+    let prepare = String(workflow[prepareRange.lowerBound..<buildRange.lowerBound])
+
+    // The functional allow ACE still lets bench read/execute the tree and
+    // create its own build/transform/score outputs.
+    #expect(prepare.contains(
+        "/bin/chmod -R +a \"user:bench allow list,search,readattr,readextattr,read,execute,"
+            + "add_file,add_subdirectory,delete_child,write,append,writeattr,writeextattr,"
+            + "file_inherit,directory_inherit\" \"${MLXFAST_JOB_WS}\""
+    ))
+    // Defense-in-depth deny: bench cannot write/delete the trusted, runner-
+    // owned harness surfaces (scripts, tooling, public fixtures, the hidden-
+    // input staging dir, the driver, the contract). Deny ACEs on runner-owned
+    // paths cannot be stripped by the bench uid.
+    #expect(prepare.contains(
+        "/bin/chmod -R +a \"user:bench deny write,append,writeattr,writeextattr,delete,"
+            + "delete_child,add_file,add_subdirectory,chown,file_inherit,directory_inherit\""
+    ))
+    #expect(prepare.contains("\"${MLXFAST_JOB_WS}/.github\""))
+    #expect(prepare.contains("\"${MLXFAST_JOB_WS}/tools\""))
+    #expect(prepare.contains("\"${MLXFAST_JOB_WS}/Sources\""))
+    #expect(prepare.contains("\"${MLXFAST_JOB_WS}/correctness_prompts\""))
+    #expect(prepare.contains("\"${MLXFAST_JOB_WS}/.ranked-src\""))
+    #expect(prepare.contains(
+        "/bin/chmod +a \"user:bench deny write,append,writeattr,writeextattr,delete,chown\""
+    ))
+    #expect(prepare.contains("\"${MLXFAST_JOB_WS}/benchmark.sh\""))
+    #expect(prepare.contains("\"${MLXFAST_JOB_WS}/benchmark.json\""))
+    // The runner-owned, bench-non-writable staging dir for predictable-name
+    // hidden inputs is created before the ACL is applied.
+    #expect(prepare.contains("mkdir -p \"${MLXFAST_JOB_WS}/.ranked-src\""))
+}
+
+@Test
+func benchmarkPlacesHiddenGoldenInputsSymlinkSafely() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+    let attachRange = try #require(workflow.range(of: "- name: Attach GPQA gates and verify augmented golden"))
+    let gatesGuardRange = try #require(workflow.range(of: "- name: Verify trusted harness before gates"))
+    let attach = String(workflow[attachRange.lowerBound..<gatesGuardRange.lowerBound])
+
+    // Hidden inputs land in the runner-owned, bench-non-writable staging dir,
+    // never at a predictable workspace-root name the transform could pre-plant
+    // as a symlink.
+    #expect(attach.contains("golden_src=\"${MLXFAST_JOB_WS}/.ranked-src/golden.json\""))
+    #expect(attach.contains("gpqa_src=\"${MLXFAST_JOB_WS}/.ranked-src/gpqa.json\""))
+    // Reject-if-exists/symlink guard plus install(1) (fresh regular file, never
+    // writes through a symlink).
+    #expect(attach.contains("if [[ -e \"${hidden_target}\" || -L \"${hidden_target}\" ]]; then"))
+    #expect(attach.contains("refusing to place hidden input over pre-existing path"))
+    #expect(attach.contains("install -m 0444 \"${MLXFAST_PRIVATE_DIR}/raw_golden.json\" \"${golden_src}\""))
+    #expect(attach.contains("install -m 0444 \"${MLXFAST_PRIVATE_DIR}/gpqa_reference.json\" \"${gpqa_src}\""))
+    #expect(attach.contains("--golden .ranked-src/golden.json"))
+    #expect(attach.contains("--gpqa .ranked-src/gpqa.json"))
+    // Cleanup unlinks the runner-owned staging dir (never an attacker symlink).
+    #expect(attach.contains("rm -rf \"${MLXFAST_JOB_WS}/.ranked-src\""))
+    // The old predictable workspace-root names are gone entirely.
+    #expect(!workflow.contains(".ranked-golden-src.json"))
+    #expect(!workflow.contains(".ranked-gpqa-src.json"))
+}
+
+@Test
+func benchmarkPinsAndVerifiesTrustedHarnessAcrossScoredPhases() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+
+    // Pin is captured at the END of the trusted build, before the submitted
+    // transform (the first bench step that can tamper), and re-verified before
+    // every phase that runs the binary as bench.
+    #expect(workflow.contains(
+        ".github/scripts/pin-trusted-harness.sh write \\\n"
+            + "            \"${MLXFAST_JOB_WS}\" \"${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256\""
+    ))
+    let verifyInvocation =
+        ".github/scripts/pin-trusted-harness.sh verify \"${MLXFAST_JOB_WS}\" \"${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256\""
+    #expect(workflow.components(separatedBy: verifyInvocation).count - 1 == 3)
+
+    let buildRange = try #require(workflow.range(of: "- name: Build harness in bench sandbox"))
+    let transformRange = try #require(workflow.range(of: "- name: Transform reference checkpoint in bench sandbox"))
+    let verifyPublicRange = try #require(workflow.range(of: "- name: Verify trusted harness before public gate"))
+    let publicGateRange = try #require(workflow.range(of: "- name: Public behavior gate"))
+    let verifyGatesRange = try #require(workflow.range(of: "- name: Verify trusted harness before gates"))
+    let gatesRunRange = try #require(workflow.range(of: "- name: Correctness and gates"))
+    let verifyTimingRange = try #require(workflow.range(of: "- name: Verify trusted harness before timing"))
+    let timingRange = try #require(workflow.range(of: "- name: Timed paired benchmark (measure-job)"))
+
+    // write happens inside the build step (before transform).
+    let writeRange = try #require(workflow.range(of: "pin-trusted-harness.sh write"))
+    #expect(buildRange.lowerBound < writeRange.lowerBound)
+    #expect(writeRange.lowerBound < transformRange.lowerBound)
+    // Each verify immediately precedes the phase that executes the binary.
+    #expect(transformRange.lowerBound < verifyPublicRange.lowerBound)
+    #expect(verifyPublicRange.lowerBound < publicGateRange.lowerBound)
+    #expect(verifyGatesRange.lowerBound < gatesRunRange.lowerBound)
+    #expect(verifyTimingRange.lowerBound < timingRange.lowerBound)
+
+    // The ranked verifies are gated on run_benchmark; the public one always runs.
+    let verifyGates = String(workflow[verifyGatesRange.lowerBound..<gatesRunRange.lowerBound])
+    let verifyTiming = String(workflow[verifyTimingRange.lowerBound..<timingRange.lowerBound])
+    #expect(verifyGates.contains("if: ${{ inputs.run_benchmark }}"))
+    #expect(verifyTiming.contains("if: ${{ inputs.run_benchmark }}"))
+}
+
+@Test
+func pinTrustedHarnessScriptDetectsTamper() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let ws = root.appendingPathComponent("ws")
+    let releaseDir = ws.appendingPathComponent(".build/release")
+    try FileManager.default.createDirectory(at: releaseDir, withIntermediateDirectories: true)
+    try "driver\n".write(to: ws.appendingPathComponent("benchmark.sh"), atomically: true, encoding: .utf8)
+    try "BINARY".write(to: releaseDir.appendingPathComponent("mlxfast-swift"), atomically: true, encoding: .utf8)
+    try "METALLIB".write(to: releaseDir.appendingPathComponent("mlx.metallib"), atomically: true, encoding: .utf8)
+    let pin = root.appendingPathComponent("trusted-harness.sha256")
+
+    func run(_ mode: String) throws -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [".github/scripts/pin-trusted-harness.sh", mode, ws.path, pin.path]
+        process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        process.standardError = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
+    #expect(try run("write") == 0)
+    #expect(FileManager.default.fileExists(atPath: pin.path))
+    #expect(try run("verify") == 0)
+
+    // A swapped binary fails the verify closed.
+    try "EVIL".write(to: releaseDir.appendingPathComponent("mlxfast-swift"), atomically: true, encoding: .utf8)
+    #expect(try run("verify") != 0)
+
+    // A swapped driver fails too.
+    try "BINARY".write(to: releaseDir.appendingPathComponent("mlxfast-swift"), atomically: true, encoding: .utf8)
+    try "hacked\n".write(to: ws.appendingPathComponent("benchmark.sh"), atomically: true, encoding: .utf8)
+    #expect(try run("verify") != 0)
+
+    // A symlinked artifact is rejected (never dereferenced).
+    try "driver\n".write(to: ws.appendingPathComponent("benchmark.sh"), atomically: true, encoding: .utf8)
+    #expect(try run("verify") == 0)
+    try FileManager.default.removeItem(at: releaseDir.appendingPathComponent("mlx.metallib"))
+    try FileManager.default.createSymbolicLink(
+        atPath: releaseDir.appendingPathComponent("mlx.metallib").path,
+        withDestinationPath: "/etc/hosts"
+    )
+    #expect(try run("verify") != 0)
+}
+
+@Test
+func hashWeightsDirectoryRejectsHardlinks() throws {
+    let hashScript = try String(
+        contentsOfFile: ".github/scripts/hash-weights-directory.sh",
+        encoding: .utf8
+    )
+    // Mirrors overlay-editable-paths.sh and GemmaRuntime.directoryDigest.
+    #expect(hashScript.contains("-links +1"))
+    #expect(hashScript.contains("weights tree contains a hardlinked file"))
+
+    let preflight = try String(
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimePreflight.swift",
+        encoding: .utf8
+    )
+    #expect(preflight.contains("func requireSingleHardLink("))
+    #expect(preflight.contains("info.st_nlink != 1"))
+    #expect(preflight.contains("try requireSingleHardLink("))
+
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "content".write(to: weights.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+
+    func hashStatus() throws -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [".github/scripts/hash-weights-directory.sh", weights.path]
+        process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
+    // A clean single-link tree hashes fine.
+    #expect(try hashStatus() == 0)
+
+    // A hardlinked file (link count 2) is rejected.
+    try FileManager.default.linkItem(
+        atPath: weights.appendingPathComponent("config.json").path,
+        toPath: weights.appendingPathComponent("aliased.json").path
+    )
+    #expect(try hashStatus() != 0)
+}
+
+@Test
 func benchmarkWorkflowBindsPublishedArtifactsToDispatchedCommit() throws {
     let workflow = try String(
         contentsOfFile: ".github/workflows/benchmark.yml",
@@ -851,15 +1060,16 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // path validates/stages even on failure (always()) so the artifact
     // reflects what ran, gated on validation for submission branches.
     #expect(workflow.contains("if: ${{ always() && !inputs.run_benchmark }}"))
-    // Twelve ranked steps use the bare run_benchmark guard (no always(), so
+    // Fourteen ranked steps use the bare run_benchmark guard (no always(), so
     // any failure stops the serial chain before the timed measurement):
     // Check private material, hash transformed weights, Prepare hidden golden,
-    // Attach GPQA gates,
+    // Attach GPQA gates, Verify trusted harness before gates,
     // Correctness and gates, Validate sealed gates score, Semantic GPQA gate,
-    // Scrub hidden material, Wait for quiescence, Timed paired benchmark,
-    // Overlay paired timing, Validate benchmark artifacts.
+    // Scrub hidden material, Wait for quiescence, Verify trusted harness before
+    // timing, Timed paired benchmark, Overlay paired timing, Validate benchmark
+    // artifacts.
     let bareRunBenchmarkGuardCount = workflow.components(separatedBy: "if: ${{ inputs.run_benchmark }}").count - 1
-    #expect(bareRunBenchmarkGuardCount == 12)
+    #expect(bareRunBenchmarkGuardCount == 14)
     #expect(workflow.contains("if: ${{ always() && inputs.run_benchmark }}"))
     #expect(workflow.contains("golden.sha256=\"${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256\""))
     #expect(workflow.contains("path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results"))
@@ -3619,6 +3829,12 @@ func overlayPairedTimingValidatesInputsAppliesFloorsAndClearsPartialResult() thr
 @Test
 func overlayPairedTimingAcceptsTrustedCommitAndRejectsForgedOrMissingCommit() throws {
     let expectedCommit = "5f95c4bdce07a0ef79ea350c91d9eb0d7476cf2f"
+    // The overlay's pre-merge checks require the candidate timing score to
+    // repeat the gates score's harness/weights identity, so both fixtures
+    // carry matching values (mirrors runPairedTimingOverlay in
+    // BenchmarkSafetyTests).
+    let harnessHash = String(repeating: "a", count: 64)
+    let weightsHash = String(repeating: "b", count: 64)
 
     func runOverlay(candidateCommit: String) throws -> (status: Int32, stderr: String, merged: String) {
         let root = try temporaryDirectory()
@@ -3645,7 +3861,11 @@ func overlayPairedTimingAcceptsTrustedCommitAndRejectsForgedOrMissingCommit() th
             "expert_cache_misses": 0,
             "expert_cache_evictions": 0,
             "expert_read_seconds": 0,
-            "expert_peak_cached_tensors": 0
+            "expert_peak_cached_tensors": 0,
+            "harness_hash": "\(harnessHash)",
+            "weights_hash": "\(weightsHash)",
+            "weights_file_count": 4,
+            "weights_byte_count": 17000000000
           }
         }
         """.write(to: gatesScore, atomically: true, encoding: .utf8)
@@ -3672,7 +3892,11 @@ func overlayPairedTimingAcceptsTrustedCommitAndRejectsForgedOrMissingCommit() th
             "timed_benchmark_seconds": 42.5,
             "benchmark_wall_seconds": 300.0,
             "peak_ram_gb": 22.0,
-            "process_resident_memory_gb": 21.0
+            "process_resident_memory_gb": 21.0,
+            "harness_hash": "\(harnessHash)",
+            "weights_hash": "\(weightsHash)",
+            "weights_file_count": 4,
+            "weights_byte_count": 17000000000
           }
         }
         """.write(to: candidateScore, atomically: true, encoding: .utf8)
