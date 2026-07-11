@@ -55,11 +55,16 @@ public enum SwiftTransform {
     static let textTowerPrefix = "language_model."
 
     public static func run(_ options: TransformOptions) throws -> TransformReport {
-        try run(options, beforeSourceRevalidation: nil)
+        try run(
+            options,
+            beforeSidecarGeneration: nil,
+            beforeSourceRevalidation: nil
+        )
     }
 
     static func run(
         _ options: TransformOptions,
+        beforeSidecarGeneration: (() throws -> Void)? = nil,
         beforeSourceRevalidation: (() throws -> Void)?
     ) throws -> TransformReport {
         let referenceDirectory = canonicalURL(
@@ -140,6 +145,7 @@ public enum SwiftTransform {
         }
 
         var copiedTensors = 0
+        var stagedHeaders: [String: SafetensorsHeader] = [:]
         for shardName in textKeysByShard.keys.sorted() {
             let source = referenceDirectory.appendingPathComponent(shardName)
             let destination = stagingDirectory.appendingPathComponent(shardName)
@@ -152,13 +158,31 @@ public enum SwiftTransform {
                 tensorNames: textKeysByShard[shardName, default: []].sorted(),
                 validatedHeader: header
             )
+            stagedHeaders[shardName] = try Safetensors.readHeader(destination)
+        }
+
+        try beforeSidecarGeneration?()
+        let generatedMetadata = try AffineMetadataCoding.writeGateUpSidecar(
+            sourceDirectory: stagingDirectory,
+            index: index,
+            sourceHeaders: stagedHeaders,
+            selectedKeys: textKeys,
+            destinationDirectory: stagingDirectory
+        )
+        let (outputTensorByteCount, generatedSizeOverflow) =
+            totalTensorByteCount.addingReportingOverflow(
+                generatedMetadata.tensorByteCount
+            )
+        guard !generatedSizeOverflow else {
+            throw MLXFastError.invalidInput("transformed tensor byte count overflows Int")
         }
 
         try writeMetadataFiles(metadataSnapshot, to: stagingDirectory)
         try index.writeStripped(
             to: stagingDirectory.appendingPathComponent("model.safetensors.index.json"),
             keeping: textKeys,
-            totalTensorByteCount: totalTensorByteCount
+            totalTensorByteCount: outputTensorByteCount,
+            additionalWeightMap: generatedMetadata.weightMap
         )
 
         try runtimeConfigData.write(
@@ -203,8 +227,8 @@ public enum SwiftTransform {
         return TransformReport(
             referencePath: referenceDirectory.path,
             outputPath: outputDirectory.path,
-            denseTensorCount: copiedTensors,
-            denseShardCount: textKeysByShard.count,
+            denseTensorCount: copiedTensors + generatedMetadata.tensorCount,
+            denseShardCount: textKeysByShard.count + generatedMetadata.shardCount,
             configPath: configPath.path,
             indexPath: indexPath.path
         )
@@ -220,8 +244,7 @@ public enum SwiftTransform {
 
     private static func validateCheckpointIndex(
         _ index: CheckpointIndex,
-        referenceDirectory: URL,
-        fileManager: FileManager = .default
+        referenceDirectory: URL
     ) throws -> [String: SafetensorsHeader] {
         guard !index.weightMap.isEmpty else {
             throw MLXFastError.invalidInput("checkpoint index contains no tensors")
@@ -238,11 +261,6 @@ public enum SwiftTransform {
             try requireFile(shardURL.path, description: "checkpoint shard \(shardName)")
             let header = try Safetensors.readHeader(shardURL)
             headersByShard[shardName] = header
-            let attributes = try fileManager.attributesOfItem(atPath: shardURL.path)
-            let byteCount = try fileSizeByteCount(from: attributes, path: shardURL.path)
-            guard let baseOffset = Int(exactly: header.dataBaseOffset) else {
-                throw MLXFastError.invalidInput("checkpoint shard header is too large: \(shardName)")
-            }
 
             for key in keysByShard[shardName, default: []].sorted() {
                 guard let info = header.tensors[key] else {
@@ -261,15 +279,12 @@ public enum SwiftTransform {
                         "checkpoint tensor \(key) byte length \(info.byteCount) does not match dtype \(info.dtype) and shape \(info.shape) expected \(expectedByteLength)"
                     )
                 }
-                let (end, overflow) = baseOffset.addingReportingOverflow(info.dataEnd)
-                guard
-                    !overflow,
-                    info.dataStart >= 0,
-                    info.byteCount > 0,
-                    end <= byteCount
-                else {
+                // readHeader validated every data range against the opened
+                // target descriptor. Do not recheck via the shard pathname:
+                // FileManager reports a symlink's own size, not its target's.
+                guard info.dataStart >= 0, info.byteCount > 0 else {
                     throw MLXFastError.invalidInput(
-                        "checkpoint tensor \(key) byte range \(info.dataStart)..<\(info.dataEnd) exceeds shard size \(byteCount)"
+                        "checkpoint tensor \(key) has an empty or invalid byte range"
                     )
                 }
             }

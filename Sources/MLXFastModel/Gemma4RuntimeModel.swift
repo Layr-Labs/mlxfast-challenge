@@ -44,7 +44,16 @@ public final class Gemma4RuntimeModel: Module, LanguageModel {
 
     /// Build the fused-MLP engine after weights are loaded and quantized.
     public func prepareFastEngine() throws {
-        fastEngine = try Gemma4FastEngine(model: self)
+        try prepareFastEngine(indexedMetadata: [:])
+    }
+
+    func prepareFastEngine(
+        indexedMetadata: [String: IndexedAffineMetadata]
+    ) throws {
+        fastEngine = try Gemma4FastEngine(
+            model: self,
+            indexedMetadata: indexedMetadata
+        )
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {

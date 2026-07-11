@@ -125,7 +125,9 @@ final class Gemma4FastLayer {
         up: QuantizedLinear,
         down: QuantizedLinear,
         layerScalar: MLXArray,
-        rope: RoPELayer
+        rope: RoPELayer,
+        gateIndexedMetadata: IndexedAffineMetadata?,
+        upIndexedMetadata: IndexedAffineMetadata?
     ) {
         self.isSliding = isSliding
         self.nHeads = nHeads
@@ -192,8 +194,30 @@ final class Gemma4FastLayer {
         } else {
             fusedGateUpEnabled = true
         }
-        if fusedGateUpEnabled && tailEnabled {
-            self.fusedGateUp = FusedGateUpProjection(gate: gateP, up: upP)
+        if fusedGateUpEnabled && tailEnabled
+            && supportsGemma4FusedGateUp(gate: gateP, up: upP)
+        {
+            let metadataMode: FusedGateUpMetadataMode
+            if let raw = ProcessInfo.processInfo.environment[
+                "MLXFAST_FUSED_GATE_UP_METADATA"
+            ] {
+                guard let parsed = FusedGateUpMetadataMode(rawValue: raw.lowercased()) else {
+                    preconditionFailure(
+                        "MLXFAST_FUSED_GATE_UP_METADATA must be raw, pair, or indexed")
+                }
+                metadataMode = parsed
+            } else {
+                metadataMode = gateIndexedMetadata != nil && upIndexedMetadata != nil
+                    ? .indexed
+                    : .raw
+            }
+            self.fusedGateUp = FusedGateUpProjection(
+                gate: gateP,
+                up: upP,
+                metadataMode: metadataMode,
+                gateIndexedMetadata: gateIndexedMetadata,
+                upIndexedMetadata: upIndexedMetadata
+            )
             let postTailBody: @Sendable (
                 MLXArray, MLXArray, MLXArray
             ) -> MLXArray = { gateOutput, upOutput, residual in
@@ -379,7 +403,10 @@ final class Gemma4FastEngine {
     let asyncLayerGroup: Int
     private let logitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray
 
-    init(model: Gemma4RuntimeModel) throws {
+    init(
+        model: Gemma4RuntimeModel,
+        indexedMetadata: [String: IndexedAffineMetadata] = [:]
+    ) throws {
         let config = model.configuration
         self.embedScale = Float(config.hiddenSize).squareRoot()
         self.eps = config.rmsNormEps
@@ -485,7 +512,9 @@ final class Gemma4FastEngine {
                     up: try module("\(prefix).mlp.up_proj", as: QuantizedLinear.self),
                     down: try module("\(prefix).mlp.down_proj", as: QuantizedLinear.self),
                     layerScalar: try array("\(prefix).layer_scalar"),
-                    rope: rope
+                    rope: rope,
+                    gateIndexedMetadata: indexedMetadata["\(prefix).mlp.gate_proj"],
+                    upIndexedMetadata: indexedMetadata["\(prefix).mlp.up_proj"]
                 )
             )
         }

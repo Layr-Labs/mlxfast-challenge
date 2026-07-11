@@ -28,10 +28,20 @@ struct CheckpointIndex {
     func writeStripped(
         to path: URL,
         keeping keys: Set<String>,
-        totalTensorByteCount: Int
+        totalTensorByteCount: Int,
+        additionalWeightMap: [String: String] = [:]
     ) throws {
         var output = raw
-        output["weight_map"] = weightMap.filter { keys.contains($0.key) }
+        var outputWeightMap = weightMap.filter { keys.contains($0.key) }
+        for key in additionalWeightMap.keys.sorted() {
+            guard outputWeightMap[key] == nil else {
+                throw MLXFastError.invalidInput(
+                    "generated tensor name collides with checkpoint tensor \(key)"
+                )
+            }
+            outputWeightMap[key] = additionalWeightMap[key]
+        }
+        output["weight_map"] = outputWeightMap
         var metadata = output["metadata"] as? [String: Any] ?? [:]
         metadata["total_size"] = totalTensorByteCount
         output["metadata"] = metadata
