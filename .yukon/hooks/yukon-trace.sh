@@ -23,7 +23,9 @@ shift 2>/dev/null || true
 # immediately, closing its stdin).
 payload="$(cat 2>/dev/null || true)"
 # This script lives at <repo>/.yukon/hooks/yukon-trace.sh; resolve the repo root for the CLI.
-repo="$(CDPATH= cd -- "$(dirname -- "$0")/../.." 2>/dev/null && pwd)" || repo="$PWD"
+# `unset CDPATH` in the subshell keeps a caller-exported CDPATH from perturbing
+# `cd` (same intent as the older `CDPATH= cd` prefix, without tripping SC1007).
+repo="$(unset CDPATH; cd -- "$(dirname -- "$0")/../.." 2>/dev/null && pwd)" || repo="$PWD"
 # Upload in a detached background process so the hook returns instantly: it never adds latency to a
 # turn and is never "cancelled" for outliving the agent's shutdown grace. Fired on every user
 # message + turn end, so frequent uploads keep the server's merged transcript current.

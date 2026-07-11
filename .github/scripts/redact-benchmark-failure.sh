@@ -39,14 +39,24 @@ if [[ -s "${score_path}" ]]; then
     # Plain field access (no `//` fallback): jq's alternative operator treats
     # false as empty, which would silently rewrite `false` booleans to the
     # fallback. Missing keys already come back as literal `null`.
+    #
+    # Every field below is additionally coerced to its expected scalar type
+    # (booleans -> boolean-or-null, numbers -> number-or-null) before it is
+    # embedded in the redacted record. score.json here is the trusted sealed
+    # score, so these fields are already well-typed on a legitimate run and the
+    # coercion is a no-op; the guard is defense in depth so that a
+    # non-scalar/attacker-shaped value (object, array, or string) in any of
+    # these fields can never be passed through --argjson verbatim into the
+    # uploaded artifact as a covert exfiltration channel. The raw error string
+    # is still never emitted; it is only matched against fixed prefixes below.
     error_text="$(jq -r 'if (.metrics.error | type) == "string" then .metrics.error else "" end' "${score_path}")"
-    passed="$(jq '.passed' "${score_path}")"
-    passed_correctness="$(jq '.metrics.passed_correctness' "${score_path}")"
-    passed_decode_floor="$(jq '.metrics.passed_decode_speedup_floor' "${score_path}")"
-    passed_prefill_floor="$(jq '.metrics.passed_prefill_speedup_floor' "${score_path}")"
-    partial_result="$(jq '.metrics.partial_result' "${score_path}")"
-    benchmark_wall_seconds="$(jq '.metrics.benchmark_wall_seconds' "${score_path}")"
-    timed_benchmark_seconds="$(jq '.metrics.timed_benchmark_seconds' "${score_path}")"
+    passed="$(jq 'if (.passed | type) == "boolean" then .passed else null end' "${score_path}")"
+    passed_correctness="$(jq 'if (.metrics.passed_correctness | type) == "boolean" then .metrics.passed_correctness else null end' "${score_path}")"
+    passed_decode_floor="$(jq 'if (.metrics.passed_decode_speedup_floor | type) == "boolean" then .metrics.passed_decode_speedup_floor else null end' "${score_path}")"
+    passed_prefill_floor="$(jq 'if (.metrics.passed_prefill_speedup_floor | type) == "boolean" then .metrics.passed_prefill_speedup_floor else null end' "${score_path}")"
+    partial_result="$(jq 'if (.metrics.partial_result | type) == "boolean" then .metrics.partial_result else null end' "${score_path}")"
+    benchmark_wall_seconds="$(jq 'if (.metrics.benchmark_wall_seconds | type) == "number" then .metrics.benchmark_wall_seconds else null end' "${score_path}")"
+    timed_benchmark_seconds="$(jq 'if (.metrics.timed_benchmark_seconds | type) == "number" then .metrics.timed_benchmark_seconds else null end' "${score_path}")"
 
     # Categories are matched ONLY against fixed prefixes that the trusted
     # harness itself authors (GemmaRuntimeBenchmark). Anything else --

@@ -6,6 +6,7 @@ curl_profile=""
 command_profile=""
 command_pid=""
 pending_signal=""
+# shellcheck disable=SC2329  # invoked indirectly via `trap cleanup_profiles EXIT` below
 cleanup_profiles() {
   [[ -z "${curl_profile}" ]] || rm -f "${curl_profile}" || true
   [[ -z "${command_profile}" ]] || rm -f "${command_profile}" || true

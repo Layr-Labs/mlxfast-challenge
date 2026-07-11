@@ -39,6 +39,11 @@ submission_diff_path="${work_dir}/submission.diff"
 
 escaped_api_key="${anthropic_api_key//\\/\\\\}"
 escaped_api_key="${escaped_api_key//\"/\\\"}"
+# The curl config carries the Anthropic API key, so create it 0600 before any
+# bytes are written (the enclosing mktemp -d work_dir is already 0700; this is
+# belt-and-suspenders on the credential file itself).
+: > "${curl_config}"
+chmod 600 "${curl_config}"
 {
   printf 'header = "x-api-key: %s"\n' "${escaped_api_key}"
   printf 'header = "anthropic-version: 2023-06-01"\n'

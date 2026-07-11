@@ -97,7 +97,10 @@ for mapping in "$@"; do
     exit 1
   fi
 
-  cp "${source_path}" "${dest}/${name}"
+  # `--` terminates option parsing so a source path that begins with '-'
+  # cannot be reinterpreted as a cp flag. The mappings here are trusted
+  # workflow constants today; this keeps the copy safe if that ever changes.
+  cp -- "${source_path}" "${dest}/${name}"
 done
 
 .github/scripts/deny-private-artifacts.sh "${dest}"

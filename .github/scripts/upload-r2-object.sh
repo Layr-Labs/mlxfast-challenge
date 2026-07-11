@@ -9,6 +9,30 @@ fi
 object_path="${1#/}"
 input_path="$2"
 
+# Defense in depth: validate the object key before it is signed into the SigV4
+# canonical request and the request URL so a caller cannot smuggle path
+# traversal (`..`/`.` segments), an absolute path, or control characters (a
+# newline/CR would corrupt the canonical request or the HTTP request line)
+# into the R2 request.
+if [[ -z "${object_path}" ]]; then
+  echo "upload-r2-object: object path must not be empty" >&2
+  exit 2
+fi
+if [[ "${object_path}" == /* ]]; then
+  echo "upload-r2-object: object path must not be absolute: ${object_path}" >&2
+  exit 2
+fi
+case "/${object_path}/" in
+  *"/../"*|*"/./"*)
+    echo "upload-r2-object: object path must not contain . or .. segments: ${object_path}" >&2
+    exit 2
+    ;;
+esac
+if [[ "${object_path}" =~ [[:cntrl:]] ]]; then
+  echo "upload-r2-object: object path must not contain control characters" >&2
+  exit 2
+fi
+
 : "${R2_ACCESS_KEY_ID:?R2_ACCESS_KEY_ID is required}"
 : "${R2_BUCKET_ENDPOINT:?R2_BUCKET_ENDPOINT is required}"
 : "${R2_SECRET_ACCESS_KEY:?R2_SECRET_ACCESS_KEY is required}"
