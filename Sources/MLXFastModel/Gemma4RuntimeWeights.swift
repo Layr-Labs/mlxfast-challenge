@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import MLX
 import MLXFastCore
@@ -42,6 +43,10 @@ public final class Gemma4RuntimeWeightCache {
         // intermediate buffers for reuse. This is a soft allocator-cache cap,
         // not a reservation; model weights remain active allocations.
         if config.numHiddenLayers >= 16 {
+            // The MLX M5 Max default commits after referencing 50 MiB. Many
+            // 4-bit projections individually exceed that, so use a moderate
+            // limit that can group adjacent kernels without long command buffers.
+            setenv("MLX_MAX_MB_PER_BUFFER", "128", 1)
             Memory.cacheLimit = 32 << 30
         }
         do {
