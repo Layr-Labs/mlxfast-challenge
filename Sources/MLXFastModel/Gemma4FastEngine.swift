@@ -90,6 +90,7 @@ final class Gemma4FastLayer {
     let vProj: FastQuantizedProjection?
     let oProj: FastQuantizedProjection
     let fusedQKV: FusedSlidingQKVProjection?
+    let fusedQK: FusedFullQKProjection?
 
     let qNormWeight: MLXArray
     let kNormWeight: MLXArray?
@@ -183,6 +184,34 @@ final class Gemma4FastLayer {
             )
         } else {
             self.fusedQKV = nil
+        }
+        let fusedQKEnabled: Bool
+        if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_FULL_QK"] {
+            fusedQKEnabled = ["1", "true", "yes", "on"].contains(
+                raw.lowercased())
+        } else {
+            fusedQKEnabled = true
+        }
+        if fusedQKEnabled,
+           !isSliding,
+           useKEqV,
+           let qIndexedMetadata,
+           let kIndexedMetadata,
+           supportsGemma4FusedFullQK(
+               q: qProjection,
+               k: kProjection,
+               qMetadata: qIndexedMetadata,
+               kMetadata: kIndexedMetadata
+           )
+        {
+            self.fusedQK = FusedFullQKProjection(
+                q: qProjection,
+                k: kProjection,
+                qMetadata: qIndexedMetadata,
+                kMetadata: kIndexedMetadata
+            )
+        } else {
+            self.fusedQK = nil
         }
         self.qNormWeight = qNorm.weight
         self.kNormWeight = kNorm?.weight
@@ -355,6 +384,11 @@ final class Gemma4FastLayer {
             rawQueries = projected.0
             rawKeys = projected.1
             rawValues = projected.2
+        } else if B == 1, L == 1, let fusedQK {
+            let projected = fusedQK(h)
+            rawQueries = projected.0
+            rawKeys = projected.1
+            rawValues = nil
         } else {
             rawQueries = qProj(h)
             rawKeys = kProj(h)
