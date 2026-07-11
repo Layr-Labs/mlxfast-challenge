@@ -22,7 +22,7 @@ public final class Gemma4RuntimeWeightCache {
     /// checkpoint I/O or quantized-linear construction lands on the hot path.
     /// nil only if the load failed, in which case `loadError` carries the reason
     /// and the first `Gemma4Model.logits` rethrows it.
-    public let libraryModel: Gemma4TextModel?
+    public let libraryModel: Gemma4RuntimeModel?
     public let loadError: Error?
 
     private var cachedModelWeights: Gemma4ModelWeights?
@@ -38,12 +38,9 @@ public final class Gemma4RuntimeWeightCache {
         // checkpoint plus KV/activation buffers instead of growing without limit
         // across a long decode run.
         //
-        // Optimization: Increase cache limit to reduce per-step allocation
-        // overhead during decode. With 128 GB unified memory on the M5 Max,
-        // a larger cache pool (32 GB) allows more aggressive buffer reuse
-        // without memory pressure, reducing Metal allocation calls during
-        // the 60-layer forward pass. The MLX buffer cache is for intermediate
-        // computation buffers, not the model weights themselves.
+        // The ranked M5 Max has enough headroom to retain more freed
+        // intermediate buffers for reuse. This is a soft allocator-cache cap,
+        // not a reservation; model weights remain active allocations.
         if config.numHiddenLayers >= 16 {
             Memory.cacheLimit = 32 << 30
         }
@@ -63,10 +60,9 @@ public final class Gemma4RuntimeWeightCache {
         // forward happen HERE, outside every scored window, instead of inside
         // the first scored prefill.
         //
-        // Optimization: Do NOT clear the cache after warmup - retaining warm
-        // buffers across the transition to the timed run eliminates repeated
-        // Metal kernel compiles and buffer allocations that would otherwise
-        // occur at the first scored forward.
+        // Retain freed, shape-relevant warmup buffers for the scored worker
+        // request. Metal libraries and pipeline state are process-lifetime
+        // caches independent of this allocator pool.
         if let model = libraryModel, config.numHiddenLayers >= 16 {
             Self.warmLibraryModel(model)
         }
@@ -75,9 +71,8 @@ public final class Gemma4RuntimeWeightCache {
     /// One prefill-shaped forward (512 tokens) and one single-token decode
     /// step against a throwaway cache, evaluated and discarded. Inputs are
     /// constant BOS tokens, so this is prompt-independent and cannot affect
-    /// model output; warm buffers are RETAINED so the first scored forward
-    /// reuses them instead of allocating fresh Metal buffers.
-    private static func warmLibraryModel(_ model: Gemma4TextModel) {
+    /// model output; freed warmup buffers remain eligible for allocator reuse.
+    private static func warmLibraryModel(_ model: Gemma4RuntimeModel) {
         let bosToken = Int32(2)
         let warmupCache = model.newCache(parameters: nil)
         let prefillTokens = MLXArray(
@@ -87,7 +82,6 @@ public final class Gemma4RuntimeWeightCache {
         eval(model(prefillTokens, cache: warmupCache))
         let decodeToken = MLXArray([bosToken], [1, 1])
         eval(model(decodeToken, cache: warmupCache))
-        // Do NOT clear cache - retain warm buffers for the scored run
     }
 
     /// Construct and weight-load the mlx-swift-lm Gemma 4 text tower from the
@@ -101,12 +95,12 @@ public final class Gemma4RuntimeWeightCache {
     private static func loadLibraryModel(
         denseStore: DenseTensorStore,
         config: Gemma4Config
-    ) throws -> Gemma4TextModel {
+    ) throws -> Gemma4RuntimeModel {
         let weightsPath = denseStore.weightsPath
         let directory = URL(fileURLWithPath: weightsPath)
         let configData = try Data(contentsOf: directory.appendingPathComponent("config.json"))
         let textConfig = try JSONDecoder().decode(Gemma4TextConfiguration.self, from: configData)
-        let model = Gemma4TextModel(textConfig)
+        let model = Gemma4RuntimeModel(textConfig)
 
         var weights: [String: MLXArray] = [:]
         let entries = try FileManager.default.contentsOfDirectory(
@@ -150,7 +144,7 @@ public final class Gemma4RuntimeWeightCache {
         return model
     }
 
-    public func requireLibraryModel() throws -> Gemma4TextModel {
+    public func requireLibraryModel() throws -> Gemma4RuntimeModel {
         guard let libraryModel else {
             throw loadError
                 ?? MLXFastError.invalidInput("Gemma 4 reference model was not loaded")

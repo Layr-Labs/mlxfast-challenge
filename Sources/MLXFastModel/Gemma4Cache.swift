@@ -204,7 +204,7 @@ public final class Gemma4ModelCache {
     }
 
     /// Return this cache's `[KVCache]`, creating it from the model on first use.
-    public func kvCache(for model: Gemma4TextModel) -> [any KVCache] {
+    public func kvCache(for model: Gemma4RuntimeModel) -> [any KVCache] {
         if let kvCaches {
             return kvCaches
         }
