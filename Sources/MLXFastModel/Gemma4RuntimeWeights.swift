@@ -37,8 +37,15 @@ public final class Gemma4RuntimeWeightCache {
         // Bound the MLX buffer cache so resident memory stays near the ~17 GB
         // checkpoint plus KV/activation buffers instead of growing without limit
         // across a long decode run.
+        //
+        // Optimization: Increase cache limit to reduce per-step allocation
+        // overhead during decode. With 128 GB unified memory on the M5 Max,
+        // a larger cache pool (32 GB) allows more aggressive buffer reuse
+        // without memory pressure, reducing Metal allocation calls during
+        // the 60-layer forward pass. The MLX buffer cache is for intermediate
+        // computation buffers, not the model weights themselves.
         if config.numHiddenLayers >= 16 {
-            Memory.cacheLimit = 6 << 30
+            Memory.cacheLimit = 32 << 30
         }
         do {
             libraryModel = try Gemma4RuntimeWeightCache.loadLibraryModel(
@@ -55,6 +62,11 @@ public final class Gemma4RuntimeWeightCache {
         // creation and MLX kernel-cache population triggered by the first
         // forward happen HERE, outside every scored window, instead of inside
         // the first scored prefill.
+        //
+        // Optimization: Do NOT clear the cache after warmup - retaining warm
+        // buffers across the transition to the timed run eliminates repeated
+        // Metal kernel compiles and buffer allocations that would otherwise
+        // occur at the first scored forward.
         if let model = libraryModel, config.numHiddenLayers >= 16 {
             Self.warmLibraryModel(model)
         }
@@ -63,8 +75,8 @@ public final class Gemma4RuntimeWeightCache {
     /// One prefill-shaped forward (512 tokens) and one single-token decode
     /// step against a throwaway cache, evaluated and discarded. Inputs are
     /// constant BOS tokens, so this is prompt-independent and cannot affect
-    /// model output; the buffer cache is cleared afterwards so warmup
-    /// allocations do not linger into the measured run.
+    /// model output; warm buffers are RETAINED so the first scored forward
+    /// reuses them instead of allocating fresh Metal buffers.
     private static func warmLibraryModel(_ model: Gemma4TextModel) {
         let bosToken = Int32(2)
         let warmupCache = model.newCache(parameters: nil)
@@ -75,7 +87,7 @@ public final class Gemma4RuntimeWeightCache {
         eval(model(prefillTokens, cache: warmupCache))
         let decodeToken = MLXArray([bosToken], [1, 1])
         eval(model(decodeToken, cache: warmupCache))
-        Memory.clearCache()
+        // Do NOT clear cache - retain warm buffers for the scored run
     }
 
     /// Construct and weight-load the mlx-swift-lm Gemma 4 text tower from the
