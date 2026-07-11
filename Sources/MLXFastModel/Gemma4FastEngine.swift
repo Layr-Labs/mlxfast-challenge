@@ -89,6 +89,7 @@ final class Gemma4FastLayer {
     let kProj: FastQuantizedProjection
     let vProj: FastQuantizedProjection?
     let oProj: FastQuantizedProjection
+    let indexedOutput: IndexedOutputProjection?
     let fusedQKV: FusedSlidingQKVProjection?
     let fusedQK: FusedFullQKProjection?
 
@@ -151,7 +152,18 @@ final class Gemma4FastLayer {
         self.qProj = qProjection
         self.kProj = kProjection
         self.vProj = vProjection
-        self.oProj = FastQuantizedProjection(oProj)
+        let outputProjection = FastQuantizedProjection(oProj)
+        self.oProj = outputProjection
+        let indexedOutputEnabled: Bool
+        if let raw = ProcessInfo.processInfo.environment["MLXFAST_INDEXED_OUTPUT_FAST"] {
+            indexedOutputEnabled = ["1", "true", "yes", "on"].contains(
+                raw.lowercased())
+        } else {
+            indexedOutputEnabled = true
+        }
+        self.indexedOutput = indexedOutputEnabled
+            ? IndexedOutputProjection(projection: outputProjection)
+            : nil
         let fusedQKVEnabled: Bool
         if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_QKV"] {
             fusedQKVEnabled = ["1", "true", "yes", "on"].contains(
@@ -452,7 +464,12 @@ final class Gemma4FastLayer {
         }
 
         let mergedAttention = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
-        let attnOut = oProj(mergedAttention)
+        let attnOut: MLXArray
+        if B == 1, L == 1, let indexedOutput {
+            attnOut = indexedOutput(mergedAttention)
+        } else {
+            attnOut = oProj(mergedAttention)
+        }
         var out = residual + MLXFast.rmsNorm(attnOut, weight: postAttnNormWeight, eps: eps)
         let residual2 = out
         if B == 1, L == 1, let fusedGateUp, let fusedGateUpPostTail {
