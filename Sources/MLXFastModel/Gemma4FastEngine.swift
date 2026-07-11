@@ -37,7 +37,7 @@ struct FastQuantizedProjection: @unchecked Sendable {
 
     @inline(__always)
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        quantizedMM(
+        return quantizedMM(
             x,
             weight,
             scales: scales,
@@ -346,6 +346,7 @@ final class Gemma4FastEngine {
     let softcap: Float
     let layers: [Gemma4FastLayer]
     let slidingWindow: Int
+    let asyncLayerGroup: Int
     private let logitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray
 
     init(model: Gemma4RuntimeModel) throws {
@@ -354,6 +355,10 @@ final class Gemma4FastEngine {
         self.eps = config.rmsNormEps
         self.softcap = config.finalLogitSoftcapping
         self.slidingWindow = config.slidingWindow
+        self.asyncLayerGroup = max(
+            0,
+            Int(ProcessInfo.processInfo.environment["MLXFAST_ASYNC_LAYER_GROUP"] ?? "10") ?? 10
+        )
 
         let modules = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
         let params = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
@@ -372,7 +377,8 @@ final class Gemma4FastEngine {
             return value
         }
 
-        self.embedTokens = try module("model.embed_tokens", as: Embedding.self)
+        let loadedEmbedTokens = try module("model.embed_tokens", as: Embedding.self)
+        self.embedTokens = loadedEmbedTokens
         let finalNorm = try module("model.norm", as: RMSNorm.self)
         self.finalNormWeight = finalNorm.weight
 
@@ -491,6 +497,12 @@ final class Gemma4FastEngine {
         for (index, layer) in layers.enumerated() {
             let mask = layer.isSliding ? (slidingMask ?? .none) : (fullMask ?? .none)
             hidden = layer(hidden, mask: mask, cache: layerCache(index))
+            if inputs.dim(1) == 1,
+               asyncLayerGroup > 0,
+               (index + 1).isMultiple(of: asyncLayerGroup)
+            {
+                asyncEval(hidden)
+            }
         }
 
         hidden = gemma4LastTokenHidden(hidden)
