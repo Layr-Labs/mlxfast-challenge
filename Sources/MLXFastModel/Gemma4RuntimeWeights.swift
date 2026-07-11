@@ -42,7 +42,7 @@ public final class Gemma4RuntimeWeightCache {
         }
         do {
             libraryModel = try Gemma4RuntimeWeightCache.loadLibraryModel(
-                weightsPath: loader.denseStore.weightsPath,
+                denseStore: loader.denseStore,
                 config: config
             )
             loadError = nil
@@ -50,8 +50,7 @@ public final class Gemma4RuntimeWeightCache {
             libraryModel = nil
             loadError = error
         }
-        // Constructor-time warmup, replacing the bespoke path's Gemma4Warmup
-        // role for the library model: the runtime worker builds this cache
+        // Constructor-time warmup for the library model: the runtime worker builds this cache
         // before the benchmark protocol handshake, so the Metal pipeline-state
         // creation and MLX kernel-cache population triggered by the first
         // forward happen HERE, outside every scored window, instead of inside
@@ -88,33 +87,40 @@ public final class Gemma4RuntimeWeightCache {
     /// parameter paths are `model.layers...`. Doing the rename here keeps the
     /// transform output and the harness's DenseTensorStore validation unchanged.
     private static func loadLibraryModel(
-        weightsPath: String,
+        denseStore: DenseTensorStore,
         config: Gemma4Config
     ) throws -> Gemma4TextModel {
+        let weightsPath = denseStore.weightsPath
         let directory = URL(fileURLWithPath: weightsPath)
         let configData = try Data(contentsOf: directory.appendingPathComponent("config.json"))
         let textConfig = try JSONDecoder().decode(Gemma4TextConfiguration.self, from: configData)
         let model = Gemma4TextModel(textConfig)
 
-        let shardPrefix = "language_model."
         var weights: [String: MLXArray] = [:]
         let entries = try FileManager.default.contentsOfDirectory(
             at: directory, includingPropertiesForKeys: nil
         )
-        let shards = entries
+        let discoveredShards = entries
             .filter { $0.pathExtension == "safetensors" }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        guard !shards.isEmpty else {
-            throw MLXFastError.missingFile("no safetensors shards in \(weightsPath)")
-        }
-        for shard in shards {
+            .map(\.lastPathComponent)
+        let shardNames = try validateRuntimeShardInventory(
+            referencedShards: denseStore.shardNames,
+            discoveredShards: discoveredShards
+        )
+        var nameTracker = RuntimeWeightNameTracker()
+        for shardName in shardNames {
+            let shard = directory.appendingPathComponent(shardName)
+            let expectedNames = denseStore.tensorNames(inShard: shardName)
             for (key, value) in try loadArrays(url: shard) {
-                let renamed = key.hasPrefix(shardPrefix)
-                    ? String(key.dropFirst(shardPrefix.count))
-                    : key
+                let renamed = try nameTracker.register(
+                    originalName: key,
+                    shardName: shardName,
+                    expectedNames: expectedNames
+                )
                 weights[renamed] = value
             }
         }
+        try nameTracker.validateComplete(expectedNames: Set(denseStore.tensorNames))
 
         let sanitized = model.sanitize(weights: weights)
         let quantization = BaseConfiguration.Quantization(
@@ -130,6 +136,14 @@ public final class Gemma4RuntimeWeightCache {
         try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
         eval(model)
         return model
+    }
+
+    public func requireLibraryModel() throws -> Gemma4TextModel {
+        guard let libraryModel else {
+            throw loadError
+                ?? MLXFastError.invalidInput("Gemma 4 reference model was not loaded")
+        }
+        return libraryModel
     }
 
     public func attentionSpec(layerIndex: Int) -> Gemma4AttentionSpec {
@@ -177,4 +191,67 @@ public final class Gemma4RuntimeWeightCache {
         return weights
     }
 
+}
+
+func validateRuntimeShardInventory(
+    referencedShards: [String],
+    discoveredShards: [String]
+) throws -> [String] {
+    let referenced = Set(referencedShards)
+    let discovered = Set(discoveredShards)
+    guard !referenced.isEmpty else {
+        throw MLXFastError.missingFile("dense safetensors index references no shards")
+    }
+    let missing = referenced.subtracting(discovered).sorted()
+    guard missing.isEmpty else {
+        throw MLXFastError.missingFile(
+            "dense safetensors index references missing shards: \(missing.joined(separator: ", "))"
+        )
+    }
+    let unindexed = discovered.subtracting(referenced).sorted()
+    guard unindexed.isEmpty else {
+        throw MLXFastError.invalidInput(
+            "weights directory contains unindexed safetensors shards: \(unindexed.joined(separator: ", "))"
+        )
+    }
+    return referenced.sorted()
+}
+
+struct RuntimeWeightNameTracker {
+    private static let languageModelPrefix = "language_model."
+    private var originalNames: Set<String> = []
+    private var runtimeNames: Set<String> = []
+
+    mutating func register(
+        originalName: String,
+        shardName: String,
+        expectedNames: Set<String>
+    ) throws -> String {
+        guard expectedNames.contains(originalName) else {
+            throw MLXFastError.invalidInput(
+                "safetensors shard \(shardName) contains unindexed or misplaced tensor \(originalName)"
+            )
+        }
+        guard originalNames.insert(originalName).inserted else {
+            throw MLXFastError.invalidInput("duplicate safetensors tensor \(originalName)")
+        }
+        let runtimeName = originalName.hasPrefix(Self.languageModelPrefix)
+            ? String(originalName.dropFirst(Self.languageModelPrefix.count))
+            : originalName
+        guard runtimeNames.insert(runtimeName).inserted else {
+            throw MLXFastError.invalidInput(
+                "safetensors tensor names collide after runtime rename: \(runtimeName)"
+            )
+        }
+        return runtimeName
+    }
+
+    func validateComplete(expectedNames: Set<String>) throws {
+        let missing = expectedNames.subtracting(originalNames).sorted()
+        guard missing.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "indexed safetensors tensors were not loaded: \(missing.joined(separator: ", "))"
+            )
+        }
+    }
 }

@@ -23,6 +23,14 @@ public final class DenseTensorStore {
         recordsByName.keys.sorted()
     }
 
+    var shardNames: [String] {
+        Set(recordsByName.values.map(\.shard)).sorted()
+    }
+
+    func tensorNames(inShard shard: String) -> Set<String> {
+        Set(recordsByName.values.lazy.filter { $0.shard == shard }.map(\.name))
+    }
+
     public func record(named name: String) -> DenseTensorRecord? {
         recordsByName[name]
     }

@@ -140,6 +140,12 @@ public final class Gemma4LayerCache {
 public final class Gemma4ModelCache {
     public let layers: [Gemma4LayerCache]
 
+    /// Host-side mirror of the library KV-cache position. Compilable caches
+    /// store their offset in an MLXArray, so reading `KVCache.offset` after
+    /// compilation synchronizes the GPU on every decode step. Keep the cheap
+    /// caller-contract check without that readback.
+    public private(set) var expectedPositionOffset = 0
+
     /// A cap for full-attention layers' non-windowed cache, comfortably
     /// above every scored sequence length used by the correctness, GPQA, and
     /// benchmark protocols (see `MLXFastCore.Constants`), while staying small
@@ -164,6 +170,21 @@ public final class Gemma4ModelCache {
     /// promoted in place, so later steps and `materializeCachedState` see them.
     func adoptKVCaches(_ caches: [any KVCache]) {
         kvCaches = caches
+    }
+
+    func nextExpectedPositionOffset(
+        positionOffset: Int,
+        inputLength: Int
+    ) throws -> Int {
+        try advancedCachePosition(
+            positionOffset: positionOffset,
+            expectedPositionOffset: expectedPositionOffset,
+            inputLength: inputLength
+        )
+    }
+
+    func commitExpectedPositionOffset(_ positionOffset: Int) {
+        expectedPositionOffset = positionOffset
     }
 
     public init(config: Gemma4Config) {
@@ -197,4 +218,29 @@ public final class Gemma4ModelCache {
             eval(kvCaches)
         }
     }
+}
+
+func advancedCachePosition(
+    positionOffset: Int,
+    expectedPositionOffset: Int,
+    inputLength: Int
+) throws -> Int {
+    guard positionOffset >= 0, expectedPositionOffset >= 0 else {
+        throw MLXFastError.invalidInput("Gemma 4 position offset must be non-negative")
+    }
+    guard positionOffset == expectedPositionOffset else {
+        throw MLXFastError.invalidInput(
+            "Gemma 4 position offset \(positionOffset) does not match expected cache offset \(expectedPositionOffset)"
+        )
+    }
+    guard inputLength > 0 else {
+        throw MLXFastError.invalidInput("Gemma 4 cached input length must be positive")
+    }
+    let (nextPositionOffset, overflow) = expectedPositionOffset.addingReportingOverflow(
+        inputLength
+    )
+    guard !overflow else {
+        throw MLXFastError.invalidInput("Gemma 4 cache position offset overflows Int")
+    }
+    return nextPositionOffset
 }

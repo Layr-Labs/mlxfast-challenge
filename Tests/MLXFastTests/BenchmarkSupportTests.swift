@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 @testable import MLXFastCore
 @testable import MLXFastModel
@@ -44,6 +45,230 @@ func commitIdentifierPrefersTrustedDispatchSHAOverGit() {
     #expect(!GemmaRuntime.isCommitSHAHex("abcdef"))
     #expect(!GemmaRuntime.isCommitSHAHex(String(repeating: "a", count: 41)))
     #expect(!GemmaRuntime.isCommitSHAHex("ABCDEF0"))
+}
+
+@Test
+func runtimeWorkerPrivateDescriptorUsesPortableLowerBoundAndCloseOnExec() throws {
+    let pipe = Pipe()
+    let descriptor = try duplicatePrivateDescriptor(
+        pipe.fileHandleForReading.fileDescriptor,
+        label: "test"
+    )
+    defer { Darwin.close(descriptor) }
+
+    #expect(descriptor >= STDERR_FILENO + 1)
+    let flags = fcntl(descriptor, F_GETFD)
+    #expect(flags >= 0)
+    #expect(flags & FD_CLOEXEC == FD_CLOEXEC)
+}
+
+@Test
+func runtimeWorkerProtocolDescriptorAllocationClosesInputWhenOutputFails() {
+    var attempts: [String] = []
+    var closed: [Int32] = []
+
+    #expect(throws: RuntimeWorkerDescriptorTestError.self) {
+        _ = try duplicateRuntimeWorkerProtocolDescriptors(
+            inputDescriptor: STDIN_FILENO,
+            outputDescriptor: STDOUT_FILENO,
+            duplicate: { _, label in
+                attempts.append(label)
+                if label == "stdin" {
+                    return 91
+                }
+                throw RuntimeWorkerDescriptorTestError.expected
+            },
+            closeDescriptor: { closed.append($0) }
+        )
+    }
+    #expect(attempts == ["stdin", "stdout"])
+    #expect(closed == [91])
+}
+
+private enum RuntimeWorkerDescriptorTestError: Error {
+    case expected
+}
+
+@Test
+func runtimeWorkerPinnedConfigurationAcceptsDense31BArchitecture() throws {
+    let data = try JSONSerialization.data(
+        withJSONObject: pinnedRuntimeWorkerConfigurationObject()
+    )
+    try validateRuntimeWorkerPinnedConfigurationData(data)
+}
+
+@Test
+func runtimeWorkerPinnedConfigurationRejectsUnsafeLibraryOnlyFields() throws {
+    var cases: [(String, [String: Any])] = []
+
+    func addCase(_ name: String, _ mutate: (inout [String: Any]) -> Void) {
+        var object = pinnedRuntimeWorkerConfigurationObject()
+        mutate(&object)
+        cases.append((name, object))
+    }
+
+    addCase("model-type") { $0["model_type"] = "other" }
+    addCase("hidden-size") { $0["hidden_size"] = MLXFastConstants.hiddenSize - 1 }
+    addCase("hidden-layers") { $0["num_hidden_layers"] = MLXFastConstants.numHiddenLayers - 1 }
+    addCase("intermediate-size") { $0["intermediate_size"] = MLXFastConstants.intermediateSize - 1 }
+    addCase("attention-heads") { $0["num_attention_heads"] = MLXFastConstants.attentionHeads - 1 }
+    addCase("head-dim") { $0["head_dim"] = 128 }
+    addCase("global-head-dim") { $0["global_head_dim"] = 256 }
+    addCase("global-partial-rotary") { $0["global_partial_rotary_factor"] = 0.5 }
+    addCase("rms-norm") { $0["rms_norm_eps"] = 1e-5 }
+    addCase("vocab") { $0["vocab_size"] = MLXFastConstants.vocabSize - 1 }
+    addCase("kv-heads") { $0["num_key_value_heads"] = 8 }
+    addCase("global-kv-heads") { $0["num_global_key_value_heads"] = 8 }
+    addCase("zero-pattern") { $0["sliding_window_pattern"] = 0 }
+    addCase("wrong-pattern") { $0["sliding_window_pattern"] = 5 }
+    addCase("shared-kv") { $0["num_kv_shared_layers"] = 1 }
+    addCase("per-layer-input") { $0["hidden_size_per_layer_input"] = 1 }
+    addCase("oversized-per-layer-vocab") { $0["vocab_size_per_layer_input"] = Int.max }
+    addCase("sliding-window") { $0["sliding_window"] = 1 }
+    addCase("max-position") { $0["max_position_embeddings"] = 131_072 }
+    addCase("attention-k-eq-v") { $0["attention_k_eq_v"] = false }
+    addCase("logit-softcap") { $0["final_logit_softcapping"] = 50 }
+    addCase("double-wide") { $0["use_double_wide_mlp"] = true }
+    addCase("missing-layer-types") { $0.removeValue(forKey: "layer_types") }
+    addCase("layer-pattern") {
+        var layerTypes = $0["layer_types"] as! [String]
+        layerTypes[0] = "full_attention"
+        $0["layer_types"] = layerTypes
+    }
+    addCase("tie-embeddings") { $0["tie_word_embeddings"] = false }
+    addCase("sliding-rope-theta") {
+        var rope = $0["rope_parameters"] as! [String: Any]
+        var sliding = rope["sliding_attention"] as! [String: Any]
+        sliding["rope_theta"] = 20_000
+        rope["sliding_attention"] = sliding
+        $0["rope_parameters"] = rope
+    }
+    addCase("sliding-rope-type") {
+        var rope = $0["rope_parameters"] as! [String: Any]
+        var sliding = rope["sliding_attention"] as! [String: Any]
+        sliding["rope_type"] = "proportional"
+        rope["sliding_attention"] = sliding
+        $0["rope_parameters"] = rope
+    }
+    addCase("sliding-partial-rotary") {
+        var rope = $0["rope_parameters"] as! [String: Any]
+        var sliding = rope["sliding_attention"] as! [String: Any]
+        sliding["partial_rotary_factor"] = 0.5
+        rope["sliding_attention"] = sliding
+        $0["rope_parameters"] = rope
+    }
+    addCase("full-rope-theta") {
+        var rope = $0["rope_parameters"] as! [String: Any]
+        var full = rope["full_attention"] as! [String: Any]
+        full["rope_theta"] = 10_000
+        rope["full_attention"] = full
+        $0["rope_parameters"] = rope
+    }
+    addCase("full-rope-type") {
+        var rope = $0["rope_parameters"] as! [String: Any]
+        var full = rope["full_attention"] as! [String: Any]
+        full["rope_type"] = "default"
+        rope["full_attention"] = full
+        $0["rope_parameters"] = rope
+    }
+    addCase("full-partial-rotary") {
+        var rope = $0["rope_parameters"] as! [String: Any]
+        var full = rope["full_attention"] as! [String: Any]
+        full["partial_rotary_factor"] = 0.5
+        rope["full_attention"] = full
+        $0["rope_parameters"] = rope
+    }
+    addCase("quantization-bits") {
+        var quantization = $0["quantization"] as! [String: Any]
+        quantization["bits"] = 8
+        $0["quantization"] = quantization
+    }
+    addCase("quantization-group") {
+        var quantization = $0["quantization"] as! [String: Any]
+        quantization["group_size"] = 32
+        $0["quantization"] = quantization
+    }
+    addCase("quantization-mode") {
+        var quantization = $0["quantization"] as! [String: Any]
+        quantization["mode"] = "symmetric"
+        $0["quantization"] = quantization
+    }
+    addCase("missing-quantization") { $0.removeValue(forKey: "quantization") }
+    addCase("moe") { $0["enable_moe_block"] = true }
+    addCase("experts") { $0["num_experts"] = 8 }
+    addCase("top-k-experts") { $0["top_k_experts"] = 2 }
+    addCase("moe-intermediate") { $0["moe_intermediate_size"] = 1_024 }
+    addCase("bidirectional-attention") { $0["use_bidirectional_attention"] = "unsupported" }
+
+    for (name, object) in cases {
+        let data = try JSONSerialization.data(withJSONObject: object)
+        #expect(throws: MLXFastError.self, "case \(name)") {
+            try validateRuntimeWorkerPinnedConfigurationData(data)
+        }
+    }
+}
+
+@Test
+func runtimeWorkerPinnedConfigurationAcceptsSafeOptionalRepresentations() throws {
+    var object = pinnedRuntimeWorkerConfigurationObject()
+    object["global_partial_rotary_factor"] = 0.25
+    object["sliding_window_pattern"] = 6
+    object["use_bidirectional_attention"] = "vision"
+    object["quantization_config"] = object.removeValue(forKey: "quantization")
+    var rope = object["rope_parameters"] as! [String: Any]
+    var sliding = rope["sliding_attention"] as! [String: Any]
+    sliding["partial_rotary_factor"] = 1.0
+    rope["sliding_attention"] = sliding
+    object["rope_parameters"] = rope
+
+    try validateRuntimeWorkerPinnedConfigurationData(
+        JSONSerialization.data(withJSONObject: object)
+    )
+}
+
+@Test
+func runtimeWorkerPinnedConfigurationPathRejectsUnsafeFilesystemEntries() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let validData = try JSONSerialization.data(
+        withJSONObject: pinnedRuntimeWorkerConfigurationObject()
+    )
+
+    let validDirectory = root.appendingPathComponent("valid", isDirectory: true)
+    try FileManager.default.createDirectory(at: validDirectory, withIntermediateDirectories: true)
+    try validData.write(to: validDirectory.appendingPathComponent("config.json"))
+    try validateRuntimeWorkerPinnedConfiguration(weightsPath: validDirectory.path)
+
+    let symlinkTarget = root.appendingPathComponent("config-target.json")
+    try validData.write(to: symlinkTarget)
+    let symlinkDirectory = root.appendingPathComponent("symlink", isDirectory: true)
+    try FileManager.default.createDirectory(at: symlinkDirectory, withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(
+        at: symlinkDirectory.appendingPathComponent("config.json"),
+        withDestinationURL: symlinkTarget
+    )
+
+    let directoryEntry = root.appendingPathComponent("directory-entry", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: directoryEntry.appendingPathComponent("config.json", isDirectory: true),
+        withIntermediateDirectories: true
+    )
+
+    let emptyDirectory = root.appendingPathComponent("empty", isDirectory: true)
+    try FileManager.default.createDirectory(at: emptyDirectory, withIntermediateDirectories: true)
+    try Data().write(to: emptyDirectory.appendingPathComponent("config.json"))
+
+    let oversizedDirectory = root.appendingPathComponent("oversized", isDirectory: true)
+    try FileManager.default.createDirectory(at: oversizedDirectory, withIntermediateDirectories: true)
+    var oversizedData = validData
+    oversizedData.append(Data(repeating: 0x20, count: 1 * 1024 * 1024 + 1))
+    try oversizedData.write(to: oversizedDirectory.appendingPathComponent("config.json"))
+
+    for directory in [symlinkDirectory, directoryEntry, emptyDirectory, oversizedDirectory] {
+        #expect(throws: MLXFastError.self, "unsafe config at \(directory.lastPathComponent)") {
+            try validateRuntimeWorkerPinnedConfiguration(weightsPath: directory.path)
+        }
+    }
 }
 
 @Test
@@ -727,6 +952,25 @@ private func requiredGemma4DenseTensorFixtures() -> [TensorFixture] {
         ))
     }
 
+    let quantizedTensors = tensors.filter { $0.dtype == "U32" }
+    for tensor in quantizedTensors {
+        let baseName = tensor.name.hasSuffix(".weight")
+            ? String(tensor.name.dropLast(".weight".count))
+            : tensor.name
+        let groupCount = tensor.shape[1] / 8
+        let companionShape = [tensor.shape[0], groupCount]
+        tensors.append(TensorFixture(
+            name: "\(baseName).scales",
+            dtype: "BF16",
+            shape: companionShape
+        ))
+        tensors.append(TensorFixture(
+            name: "\(baseName).biases",
+            dtype: "BF16",
+            shape: companionShape
+        ))
+    }
+
     return tensors
 }
 
@@ -910,6 +1154,203 @@ func workerStderrDrainCapsRetainedTail() throws {
 }
 
 @Test
+func workerStderrDrainCapsUnterminatedLine() throws {
+    let pipe = Pipe()
+    let drain = WorkerStderrDrain(
+        handle: pipe.fileHandleForReading,
+        emit: { _ in }
+    )
+    try pipe.fileHandleForWriting.write(
+        contentsOf: Data(repeating: 0x78, count: WorkerStderrDrain.tailByteLimit * 3)
+    )
+    try pipe.fileHandleForWriting.close()
+
+    let tail = drain.drainedOutput(timeoutSeconds: 5)
+    #expect(tail.contains(WorkerStderrDrain.truncatedLine))
+    #expect(tail.utf8.count <= WorkerStderrDrain.tailByteLimit)
+}
+
+@Test
+func bufferedFileLineReaderPreservesBufferedLinesAndEOFFragment() throws {
+    let pipe = Pipe()
+    let reader = BufferedFileLineReader(handle: pipe.fileHandleForReading, maximumLineByteCount: 32)
+    try pipe.fileHandleForWriting.write(contentsOf: Data("first\nsecond\nthird".utf8))
+    try pipe.fileHandleForWriting.close()
+
+    #expect(try reader.readLine() == Data("first".utf8))
+    #expect(try reader.readLine() == Data("second".utf8))
+    #expect(try reader.readLine() == Data("third".utf8))
+    #expect(try reader.readLine() == nil)
+}
+
+@Test
+func bufferedFileLineReaderRejectsOversizedLine() throws {
+    let pipe = Pipe()
+    let reader = BufferedFileLineReader(handle: pipe.fileHandleForReading, maximumLineByteCount: 8)
+    try pipe.fileHandleForWriting.write(contentsOf: Data("123456789\n".utf8))
+    try pipe.fileHandleForWriting.close()
+
+    #expect(throws: MLXFastError.self) {
+        _ = try reader.readLine()
+    }
+}
+
+@Test
+func runtimeWorkerClientTimesOutWaitingForHello() throws {
+    let executable = try makeRuntimeWorkerScript("""
+    #!/bin/sh
+    trap '' TERM
+    while :; do :; done
+    """)
+    defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
+    let start = Date()
+    var message = ""
+    do {
+        _ = try RuntimeWorkerClient(
+            options: shortRuntimeWorkerOptions(executable: executable),
+            weightsPath: executable.deletingLastPathComponent().path
+        )
+    } catch {
+        message = String(describing: error)
+    }
+    #expect(message.contains("timed out waiting for protocol hello"))
+    #expect(Date().timeIntervalSince(start) < 3)
+}
+
+@Test
+func runtimeWorkerWatchdogAtomicCancellationDisarmsTimer() {
+    let watchdog = RuntimeWorkerWatchdog(
+        process: Process(),
+        timeoutSeconds: 0.05,
+        terminationGraceSeconds: 0
+    )
+
+    #expect(!watchdog.cancelAndReturnDidFire())
+    Thread.sleep(forTimeInterval: 0.1)
+    #expect(!watchdog.cancelAndReturnDidFire())
+}
+
+@Test
+func runtimeWorkerClientCancelsSuccessfulRequestWatchdogs() throws {
+    let executable = try makeRuntimeWorkerScript("""
+    #!/bin/sh
+    printf '%s\\n' '{"id":0,"nonce":"test-nonce","ok":true}'
+    IFS= read -r first_request || exit 0
+    printf '%s\\n' '{"id":1,"nonce":"test-nonce","ok":true}'
+    IFS= read -r second_request || exit 0
+    printf '%s\\n' '{"id":2,"nonce":"test-nonce","ok":true}'
+    IFS= read -r final_request || exit 0
+    """)
+    defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
+    let client = try RuntimeWorkerClient(
+        options: RuntimeWorkerOptions(
+            executablePath: executable.path,
+            helloTimeoutSeconds: 2,
+            requestTimeoutSeconds: 0.1,
+            shutdownTimeoutSeconds: 0.1,
+            terminationGraceSeconds: 0.05
+        ),
+        weightsPath: executable.deletingLastPathComponent().path
+    )
+    defer { client.close() }
+
+    _ = try client.prefill(promptTokens: [1])
+    // A stale watchdog from the first request would terminate the worker while
+    // it is idle and make this second request fail before receiving id 2.
+    Thread.sleep(forTimeInterval: 0.25)
+    _ = try client.prefill(promptTokens: [2])
+}
+
+@Test
+func runtimeWorkerClientTimesOutStalledRequest() throws {
+    let executable = try makeRuntimeWorkerScript("""
+    #!/bin/sh
+    trap '' TERM
+    printf '%s\\n' '{"id":0,"nonce":"test-nonce","ok":true}'
+    IFS= read -r request || exit 0
+    while :; do :; done
+    """)
+    defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
+    let client = try RuntimeWorkerClient(
+        options: RuntimeWorkerOptions(
+            executablePath: executable.path,
+            helloTimeoutSeconds: 2,
+            requestTimeoutSeconds: 0.1,
+            shutdownTimeoutSeconds: 0.1,
+            terminationGraceSeconds: 0.05
+        ),
+        weightsPath: executable.deletingLastPathComponent().path
+    )
+    defer { client.close() }
+    let start = Date()
+    var message = ""
+    do {
+        _ = try client.prefill(promptTokens: [1])
+    } catch {
+        message = String(describing: error)
+    }
+    #expect(message.contains("timed out handling request prefill"))
+    #expect(Date().timeIntervalSince(start) < 3)
+}
+
+@Test
+func runtimeWorkerClientCloseEscalatesPastIgnoredTerminate() throws {
+    let executable = try makeRuntimeWorkerScript("""
+    #!/bin/sh
+    trap '' TERM
+    printf '%s\\n' '{"id":0,"nonce":"test-nonce","ok":true}'
+    while :; do :; done
+    """)
+    defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
+    let client = try RuntimeWorkerClient(
+        options: RuntimeWorkerOptions(
+            executablePath: executable.path,
+            helloTimeoutSeconds: 2,
+            requestTimeoutSeconds: 0.1,
+            shutdownTimeoutSeconds: 0.1,
+            terminationGraceSeconds: 0.05
+        ),
+        weightsPath: executable.deletingLastPathComponent().path
+    )
+    let start = Date()
+    client.close()
+    #expect(Date().timeIntervalSince(start) < 3)
+}
+
+@Test
+func runtimeWorkerClientDrainsLargeStderrBeforeHelloWhenForwardingIsOff() throws {
+    let executable = try makeRuntimeWorkerScript("""
+    #!/bin/sh
+    /usr/bin/yes x | /usr/bin/head -c 196608 | /usr/bin/tr -d '\\n' >&2
+    printf '%s\\n' '{"id":0,"nonce":"test-nonce","ok":true}'
+    IFS= read -r request || exit 0
+    """)
+    defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
+    let client = try RuntimeWorkerClient(
+        options: RuntimeWorkerOptions(
+            executablePath: executable.path,
+            helloTimeoutSeconds: 2,
+            requestTimeoutSeconds: 0.1,
+            shutdownTimeoutSeconds: 0.1,
+            terminationGraceSeconds: 0.05
+        ),
+        weightsPath: executable.deletingLastPathComponent().path
+    )
+    client.close()
+}
+
+@Test
+func runtimeWorkerClientRejectsNonfiniteTimeoutsBeforeLaunch() throws {
+    let options = RuntimeWorkerOptions(
+        executablePath: "/does/not/exist",
+        helloTimeoutSeconds: .infinity
+    )
+    #expect(throws: MLXFastError.self) {
+        _ = try RuntimeWorkerClient(options: options, weightsPath: "/does/not/exist")
+    }
+}
+
+@Test
 func localIteratePrefillStatusReportsPerTokenAndSpeedup() {
     let status = GemmaRuntime.localIteratePrefillStatus(
         elapsedSeconds: 51.2,
@@ -1032,10 +1473,9 @@ func localIterateScorePublishesCLIUsableEstimatedScore() throws {
 }
 
 @Test
-func localIterateScoreFallsBackToNullForUnusableTimings() {
-    // Zero/invalid timings make the estimate non-finite; publish null rather
-    // than a fabricated number (such runs are broken and should not read as
-    // scoreable).
+func localIterateScoreFailsForUnusableTimings() {
+    // Zero/invalid timings make the estimate non-finite. The payload must be a
+    // failed run, not a passing result that merely omits its score.
     let payload = GemmaRuntime.localIterateScore(
         peakRamGB: 0,
         bandwidthGBPerToken: 0,
@@ -1064,7 +1504,73 @@ func localIterateScoreFallsBackToNullForUnusableTimings() {
     )
 
     #expect(payload.score == nil)
-    #expect(payload.passed)
+    #expect(!payload.passed)
+    #expect(payload.metrics.passedCorrectness)
+    #expect(payload.metrics.error.contains("timing metrics must be finite and positive"))
+}
+
+@Test
+func localIterateScoreSanitizesNonfiniteFailureMetricsForJSON() throws {
+    let payload = GemmaRuntime.localIterateScore(
+        peakRamGB: .nan,
+        bandwidthGBPerToken: .infinity,
+        decodeSecondsPerToken: .nan,
+        prefillSecondsPerToken: -.infinity,
+        wallSeconds: -.infinity,
+        validationSeconds: .nan,
+        correctnessSeconds: .infinity,
+        timedSeconds: -1,
+        correctness: GemmaRuntime.localIterateCorrectnessReport(
+            passed: true,
+            checkedSteps: 18,
+            caseCount: 1,
+            firstFailingStep: nil,
+            expectedToken: nil,
+            actualToken: nil,
+            goldenHash: "hash",
+            expertStats: .zero,
+            error: "",
+            modeName: "local-iterate"
+        ),
+        expertStats: .zero,
+        bandwidthSource: "ram_resident_model",
+        weightsDigest: nil,
+        runtime: "swift-local-iterate"
+    )
+
+    #expect(payload.score == nil)
+    #expect(!payload.passed)
+    #expect(payload.metrics.peakRamGB == 0)
+    #expect(payload.metrics.bandwidthGBPerToken == 0)
+    #expect(payload.metrics.decodeSecondsPerToken == 0)
+    #expect(payload.metrics.prefillSecondsPerToken == 0)
+    #expect(payload.metrics.benchmarkWallSeconds == 0)
+    #expect(payload.metrics.preflightSeconds == 0)
+    #expect(payload.metrics.correctnessSeconds == 0)
+    #expect(payload.metrics.timedBenchmarkSeconds == 0)
+
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let path = directory.appendingPathComponent("score.json").path
+    try writeScorePayload(payload, to: path)
+    let encoded = try Data(contentsOf: URL(fileURLWithPath: path))
+    let encodedText = String(decoding: encoded, as: UTF8.self).lowercased()
+    #expect(!encodedText.contains("nan"))
+    #expect(!encodedText.contains("infinity"))
+    let decoded = try JSONDecoder().decode(
+        ScorePayload.self,
+        from: encoded
+    )
+    #expect(decoded.score == nil)
+    #expect(!decoded.passed)
+    #expect(decoded.metrics.peakRamGB == 0)
+    #expect(decoded.metrics.bandwidthGBPerToken == 0)
+    #expect(decoded.metrics.decodeSecondsPerToken == 0)
+    #expect(decoded.metrics.prefillSecondsPerToken == 0)
+    #expect(decoded.metrics.benchmarkWallSeconds == 0)
+    #expect(decoded.metrics.preflightSeconds == 0)
+    #expect(decoded.metrics.correctnessSeconds == 0)
+    #expect(decoded.metrics.timedBenchmarkSeconds == 0)
 }
 
 // Guard the ranked score semantics against the local-mode estimate: the
@@ -1217,4 +1723,73 @@ private func temporaryDirectory() throws -> URL {
     )
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
+}
+
+private func makeRuntimeWorkerScript(_ contents: String) throws -> URL {
+    let directory = try temporaryDirectory()
+    let executable = directory.appendingPathComponent("fake-runtime-worker")
+    try contents.write(to: executable, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: executable.path
+    )
+    return executable
+}
+
+private func pinnedRuntimeWorkerConfigurationObject() -> [String: Any] {
+    [
+        "model_type": "gemma4_text",
+        "hidden_size": MLXFastConstants.hiddenSize,
+        "num_hidden_layers": MLXFastConstants.numHiddenLayers,
+        "intermediate_size": MLXFastConstants.intermediateSize,
+        "num_attention_heads": MLXFastConstants.attentionHeads,
+        "head_dim": 256,
+        "global_head_dim": 512,
+        "rms_norm_eps": 1e-6,
+        "vocab_size": MLXFastConstants.vocabSize,
+        "num_key_value_heads": 16,
+        "num_global_key_value_heads": 4,
+        "num_kv_shared_layers": 0,
+        "hidden_size_per_layer_input": 0,
+        "vocab_size_per_layer_input": MLXFastConstants.vocabSize,
+        "sliding_window": 1_024,
+        "max_position_embeddings": 262_144,
+        "attention_k_eq_v": true,
+        "final_logit_softcapping": 30.0,
+        "use_double_wide_mlp": false,
+        "tie_word_embeddings": true,
+        "enable_moe_block": false,
+        "num_experts": NSNull(),
+        "top_k_experts": NSNull(),
+        "moe_intermediate_size": NSNull(),
+        "layer_types": (0..<MLXFastConstants.numHiddenLayers).map {
+            $0 % 6 == 5 ? "full_attention" : "sliding_attention"
+        },
+        "rope_parameters": [
+            "sliding_attention": [
+                "rope_theta": 10_000.0,
+                "rope_type": "default",
+            ],
+            "full_attention": [
+                "rope_theta": 1_000_000.0,
+                "rope_type": "proportional",
+                "partial_rotary_factor": 0.25,
+            ],
+        ],
+        "quantization": [
+            "group_size": 64,
+            "bits": 4,
+            "mode": "affine",
+        ],
+    ]
+}
+
+private func shortRuntimeWorkerOptions(executable: URL) -> RuntimeWorkerOptions {
+    RuntimeWorkerOptions(
+        executablePath: executable.path,
+        helloTimeoutSeconds: 0.1,
+        requestTimeoutSeconds: 0.1,
+        shutdownTimeoutSeconds: 0.1,
+        terminationGraceSeconds: 0.05
+    )
 }

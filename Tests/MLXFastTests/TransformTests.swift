@@ -71,6 +71,8 @@ func transformSelectsTextTowerTensorsAndDropsVisionTensors() throws {
     let strippedIndex = try JSONSerialization.jsonObject(with: strippedIndexData) as? [String: Any]
     let weightMap = try #require(strippedIndex?["weight_map"] as? [String: String])
     #expect(weightMap == [textName: shardName])
+    let metadata = try #require(strippedIndex?["metadata"] as? [String: Any])
+    #expect(metadata["total_size"] as? Int == 4)
 }
 
 @Test
@@ -108,6 +110,142 @@ func transformWritesFlattenedRuntimeConfigFromTextConfig() throws {
     let quantization = try #require(config?["quantization"] as? [String: Any])
     #expect(quantization["group_size"] as? Int == 64)
     #expect(quantization["bits"] as? Int == 4)
+}
+
+@Test
+func transformRuntimeConfigCaptureDoesNotRereadChangedSource() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let configPath = root.appendingPathComponent("config.json")
+    try referenceConfigJSON().write(
+        to: configPath,
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let captured = try SwiftTransform.makeRuntimeConfigData(sourceConfigPath: configPath)
+    try #"{"text_config":{"num_hidden_layers":1}}"#.write(
+        to: configPath,
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let object = try JSONSerialization.jsonObject(with: captured) as? [String: Any]
+    #expect(object?["num_hidden_layers"] as? Int == MLXFastConstants.numHiddenLayers)
+}
+
+@Test
+func transformRejectsSourceMetadataMutationsBeforePublishingOutput() throws {
+    enum Mutation: CaseIterable {
+        case config
+        case index
+        case tokenizer
+    }
+
+    for mutation in Mutation.allCases {
+        let expectedError: String
+        switch mutation {
+        case .config:
+            expectedError = "reference config changed while transform was running"
+        case .index:
+            expectedError = "checkpoint index changed while transform was running"
+        case .tokenizer:
+            expectedError = "reference tokenizer metadata changed while transform was running"
+        }
+        let fixture = try writeTransformFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try FileManager.default.createDirectory(
+            at: fixture.output,
+            withIntermediateDirectories: true
+        )
+        let sentinel = fixture.output.appendingPathComponent("sentinel.txt")
+        try "preserve \(mutation)".write(to: sentinel, atomically: true, encoding: .utf8)
+
+        var rejection: MLXFastError?
+        do {
+            _ = try SwiftTransform.run(
+                TransformOptions(
+                    referencePath: fixture.reference.path,
+                    outputPath: fixture.output.path
+                ),
+                beforeSourceRevalidation: {
+                    switch mutation {
+                    case .config:
+                        try #"{"text_config":{"num_hidden_layers":1}}"#.write(
+                            to: fixture.reference.appendingPathComponent("config.json"),
+                            atomically: true,
+                            encoding: .utf8
+                        )
+                    case .index:
+                        try writeCheckpointIndex(
+                            fixture.reference.appendingPathComponent(
+                                "model.safetensors.index.json"
+                            ),
+                            weightMap: [
+                                "language_model.model.layers.0.self_attn.q_proj.weight":
+                                    "model-00001-of-00001.safetensors",
+                            ],
+                            metadata: ["generation": 2]
+                        )
+                    case .tokenizer:
+                        try #"{"tokenizer":"changed"}"#.write(
+                            to: fixture.reference.appendingPathComponent("tokenizer.json"),
+                            atomically: true,
+                            encoding: .utf8
+                        )
+                    }
+                }
+            )
+        } catch let error as MLXFastError {
+            rejection = error
+        } catch {
+            throw error
+        }
+        #expect(rejection?.description == expectedError, "mutation: \(mutation)")
+
+        #expect(
+            try String(contentsOf: sentinel, encoding: .utf8) == "preserve \(mutation)",
+            "mutation: \(mutation)"
+        )
+        #expect(
+            try transformStagingDirectories(nextTo: fixture.output).isEmpty,
+            "mutation: \(mutation)"
+        )
+    }
+}
+
+@Test
+func transformRejectsSymlinkedTokenizerMetadataAndPreservesOutput() throws {
+    let fixture = try writeTransformFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let tokenizer = fixture.reference.appendingPathComponent("tokenizer.json")
+    let tokenizerTarget = fixture.root.appendingPathComponent("tokenizer-target.json")
+    try #"{"tokenizer":"external"}"#.write(
+        to: tokenizerTarget,
+        atomically: true,
+        encoding: .utf8
+    )
+    try FileManager.default.removeItem(at: tokenizer)
+    try FileManager.default.createSymbolicLink(at: tokenizer, withDestinationURL: tokenizerTarget)
+
+    try FileManager.default.createDirectory(at: fixture.output, withIntermediateDirectories: true)
+    let sentinel = fixture.output.appendingPathComponent("sentinel.txt")
+    try "preserve".write(to: sentinel, atomically: true, encoding: .utf8)
+
+    var rejection: MLXFastError?
+    do {
+        _ = try SwiftTransform.run(
+            TransformOptions(referencePath: fixture.reference.path, outputPath: fixture.output.path)
+        )
+    } catch let error as MLXFastError {
+        rejection = error
+    } catch {
+        throw error
+    }
+
+    #expect(rejection?.description.contains("reference metadata is not a regular file") == true)
+    #expect(try String(contentsOf: sentinel, encoding: .utf8) == "preserve")
+    #expect(try transformStagingDirectories(nextTo: fixture.output).isEmpty)
 }
 
 @Test
@@ -602,12 +740,27 @@ private func referenceConfigJSON() -> String {
     """
 }
 
-private func writeCheckpointIndex(_ path: URL, weightMap: [String: String]) throws {
+private func writeCheckpointIndex(
+    _ path: URL,
+    weightMap: [String: String],
+    metadata: [String: Any]? = nil
+) throws {
+    var object: [String: Any] = ["weight_map": weightMap]
+    object["metadata"] = metadata
     let data = try JSONSerialization.data(
-        withJSONObject: ["weight_map": weightMap],
+        withJSONObject: object,
         options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
     )
     try data.write(to: path)
+}
+
+private func transformStagingDirectories(nextTo output: URL) throws -> [URL] {
+    try FileManager.default.contentsOfDirectory(
+        at: output.deletingLastPathComponent(),
+        includingPropertiesForKeys: nil
+    ).filter {
+        $0.lastPathComponent.hasPrefix(".\(output.lastPathComponent).mlxfast-transform-")
+    }
 }
 
 private func writeSafetensors(_ path: URL, tensors: [TensorFixture]) throws {

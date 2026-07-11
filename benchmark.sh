@@ -480,7 +480,10 @@ safe_clear_directory_path() {
 
   local target
   local workspace
-  if [[ -d "${path}" ]]; then
+  if [[ -L "${path}" ]]; then
+    echo "benchmark.sh: refusing to clear ${label} '${path}'; symlink directories are not allowed" >&2
+    return 1
+  elif [[ -d "${path}" ]]; then
     target="$(canonical_directory_path "${path}")" || {
       echo "benchmark.sh: could not resolve ${label} '${path}'" >&2
       return 1
@@ -556,6 +559,41 @@ safe_clear_directory_path() {
   printf '%s\n' "${target}"
 }
 
+assert_directory_replacement_owned() {
+  local target="$1"
+  local label="$2"
+  local workspace
+  local marker
+  local marker_hash
+  local first_entry
+
+  [[ -d "${target}" ]] || return 0
+  workspace="$(pwd -P)"
+  if path_contains "${workspace}" "${target}"; then
+    return 0
+  fi
+
+  first_entry="$(find "${target}" -mindepth 1 -maxdepth 1 -print -quit)" || return 1
+  if [[ -z "${first_entry}" ]]; then
+    return 0
+  fi
+
+  marker="${target}/.benchmark-source.sha256"
+  if [[ -f "${marker}" && ! -L "${marker}" \
+      && -f "${target}/config.json" && ! -L "${target}/config.json" \
+      && -f "${target}/model.safetensors.index.json" \
+      && ! -L "${target}/model.safetensors.index.json" ]]; then
+    marker_hash="$(tr -d '[:space:]' < "${marker}")"
+    if [[ "${marker_hash}" =~ ^[0-9a-f]{64}$ ]]; then
+      return 0
+    fi
+  fi
+
+  echo "benchmark.sh: refusing to replace ${label} '${target}'; existing directories outside the workspace must be MLXFast-managed" >&2
+  echo "benchmark.sh: choose a new/empty MLXFAST_WEIGHTS_PATH instead of reusing an unrelated directory" >&2
+  return 1
+}
+
 assert_safe_output_file_path() {
   local path="$1"
   local label="$2"
@@ -622,6 +660,7 @@ assert_safe_output_file_path() {
 
 RUNTIME_WORKER_SANDBOX_PROFILE_OWNED=""
 TRANSFORM_STAGING_PARENT_OWNED=""
+VERIFY_TRANSFORM_TMP_PARENT_OWNED=""
 score_stdout=""
 cleanup_benchmark_temporaries() {
   local status="$?"
@@ -633,6 +672,9 @@ cleanup_benchmark_temporaries() {
   fi
   if [[ -n "${TRANSFORM_STAGING_PARENT_OWNED}" ]]; then
     rm -rf "${TRANSFORM_STAGING_PARENT_OWNED}" || true
+  fi
+  if [[ -n "${VERIFY_TRANSFORM_TMP_PARENT_OWNED}" ]]; then
+    rm -rf "${VERIFY_TRANSFORM_TMP_PARENT_OWNED}" || true
   fi
   return "${status}"
 }
@@ -741,14 +783,257 @@ source_hash() {
   done | shasum -a 256 | awk '{print $1}'
 }
 
+publish_new_staged_metadata_file() {
+  local target="$1"
+  local contents="$2"
+  local label="$3"
+
+  if [[ -e "${target}" || -L "${target}" ]]; then
+    echo "benchmark.sh: submitted transform created reserved ${label} path ${target}" >&2
+    return 1
+  fi
+  # noclobber maps this create to O_EXCL, so a submitted symlink or a path
+  # raced into place is rejected rather than followed.
+  if ! (set -o noclobber; printf '%s' "${contents}" > "${target}"); then
+    echo "benchmark.sh: failed to publish reserved ${label} metadata" >&2
+    return 1
+  fi
+  if ! chmod 0644 "${target}"; then
+    rm -f "${target}"
+    return 1
+  fi
+}
+
+validate_staged_safetensors_shard() {
+  local shard_path="$1"
+  local index_path="$2"
+  local shard_name
+  local file_size
+  local header_length
+  local data_byte_count
+  local header_path
+  local extracted_size
+
+  shard_name="$(basename "${shard_path}")"
+  file_size="$(wc -c < "${shard_path}" | tr -d ' ')" || return 1
+  if ! [[ "${file_size}" =~ ^[0-9]+$ ]] || (( file_size < 9 )); then
+    echo "benchmark.sh: staged safetensors shard is too small: ${shard_name}" >&2
+    return 1
+  fi
+  header_length="$(od -An -tu8 -N 8 "${shard_path}" | tr -d '[:space:]')" || return 1
+  if ! [[ "${header_length}" =~ ^[0-9]+$ ]] \
+      || (( header_length == 0 || header_length > 100000000 )) \
+      || (( header_length > file_size - 8 )); then
+    echo "benchmark.sh: staged safetensors shard has an invalid header length: ${shard_name}" >&2
+    return 1
+  fi
+  data_byte_count=$((file_size - 8 - header_length))
+  header_path="$(mktemp "${TRANSFORM_STAGING_PARENT_OWNED}/.safetensors-header.XXXXXX")" \
+    || return 1
+  if ! (set +o pipefail; tail -c +9 "${shard_path}" | head -c "${header_length}") \
+      > "${header_path}"; then
+    rm -f "${header_path}"
+    return 1
+  fi
+  extracted_size="$(wc -c < "${header_path}" | tr -d ' ')" || {
+    rm -f "${header_path}"
+    return 1
+  }
+  if [[ "${extracted_size}" != "${header_length}" ]]; then
+    rm -f "${header_path}"
+    echo "benchmark.sh: staged safetensors shard has a truncated header: ${shard_name}" >&2
+    return 1
+  fi
+  # POLICY (gap-free shard tiling) — APPROVED, gap-free tiling retained:
+  # beyond per-tensor bounds/dtype checks, the final clause requires the
+  # sorted tensor ranges to tile the data section exactly — first range
+  # starts at byte 0, each range ends where the next begins, and the last
+  # range ends at the file's final data byte. This rejects overlapping
+  # tensors and any unindexed byte spans, so a staged shard cannot smuggle
+  # payload bytes that no tensor accounts for past the weights gate. It is
+  # intentionally stricter than the safetensors format itself, which
+  # tolerates padding/alignment gaps between tensors: shards from writers
+  # that emit such gaps fail this gate even though standard parsers accept
+  # them. The Swift transform always emits gap-free shards, so this only
+  # constrains what hand-crafted staged artifacts can look like —
+  # stricter-than-spec is intended.
+  if ! jq -e --argjson data_bytes "${data_byte_count}" '
+      def integer: type == "number" and . == floor;
+      def dtype_width:
+        if IN("BOOL", "U8", "I8") then 1
+        elif IN("I16", "U16", "F16", "BF16") then 2
+        elif IN("I32", "U32", "F32") then 4
+        elif IN("I64", "U64", "F64") then 8
+        else null
+        end;
+      type == "object"
+      and ([to_entries[] | select(.key != "__metadata__")] | length > 0)
+      and all(to_entries[] | select(.key != "__metadata__");
+        (.value | type == "object")
+        and (.value.dtype | type == "string")
+        and ((.value.dtype | dtype_width) as $width | $width != null)
+        and (.value.shape | type == "array" and all(.[]; integer and . >= 0))
+        and (.value.data_offsets | type == "array" and length == 2)
+        and (.value.data_offsets[0] | integer and . >= 0)
+        and (.value.data_offsets[1] | integer)
+        and (.value.data_offsets[1] > .value.data_offsets[0])
+        and (.value.data_offsets[1] <= $data_bytes)
+        and ((.value.dtype | dtype_width) as $width
+          | (reduce .value.shape[] as $dimension (1; . * $dimension)) as $elements
+          | $elements > 0
+          and (.value.data_offsets[1] - .value.data_offsets[0]) == ($elements * $width))
+      )
+      and (([to_entries[] | select(.key != "__metadata__")
+        | {start: .value.data_offsets[0], end: .value.data_offsets[1]}]
+        | sort_by(.start, .end)) as $ranges
+        | ($ranges[0].start == 0)
+          and ($ranges[-1].end == $data_bytes)
+          and all(range(1; $ranges | length); $ranges[. - 1].end == $ranges[.].start))
+    ' "${header_path}" >/dev/null; then
+    rm -f "${header_path}"
+    echo "benchmark.sh: staged safetensors shard has an invalid header: ${shard_name}" >&2
+    return 1
+  fi
+  if ! jq -e -n \
+      --arg shard "${shard_name}" \
+      --slurpfile index "${index_path}" \
+      --slurpfile header "${header_path}" '
+      [$index[0].weight_map | to_entries[] | select(.value == $shard) | .key] as $expected
+      | [$header[0] | keys[] | select(. != "__metadata__")] as $actual
+      | ($expected | length > 0)
+      and (($expected | sort) == ($actual | sort))
+    ' >/dev/null; then
+    rm -f "${header_path}"
+    echo "benchmark.sh: staged safetensors shard tensor inventory disagrees with the index: ${shard_name}" >&2
+    return 1
+  fi
+  rm -f "${header_path}"
+}
+
+validate_staged_transform_contents() {
+  local staged_weights="$1"
+  local config_path="${staged_weights}/config.json"
+  local index_path="${staged_weights}/model.safetensors.index.json"
+  local shard_list
+  local shard_name
+  local actual_shard
+  local actual_name
+
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "benchmark.sh: jq is required to validate transformed weights" >&2
+    return 1
+  fi
+  jq -e 'type == "object"' "${config_path}" >/dev/null || {
+    echo "benchmark.sh: staged transform config.json is not a JSON object" >&2
+    return 1
+  }
+  if ! jq -e '
+      type == "object"
+      and (.weight_map | type == "object" and length > 0)
+      and all(.weight_map | to_entries[];
+        (.key | type == "string" and length > 0)
+        and (.value | type == "string" and test("^[A-Za-z0-9._-]+[.]safetensors$"))
+      )
+    ' "${index_path}" >/dev/null; then
+    echo "benchmark.sh: staged transform index has an invalid weight_map" >&2
+    return 1
+  fi
+
+  shard_list="$(mktemp "${TRANSFORM_STAGING_PARENT_OWNED}/.safetensors-shards.XXXXXX")" \
+    || return 1
+  if ! jq -r '.weight_map | [.[]] | unique[]' "${index_path}" > "${shard_list}"; then
+    rm -f "${shard_list}"
+    return 1
+  fi
+  while IFS= read -r shard_name; do
+    if [[ ! -f "${staged_weights}/${shard_name}" \
+        || -L "${staged_weights}/${shard_name}" ]]; then
+      rm -f "${shard_list}"
+      echo "benchmark.sh: staged transform index references missing shard ${shard_name}" >&2
+      return 1
+    fi
+    if ! validate_staged_safetensors_shard \
+        "${staged_weights}/${shard_name}" "${index_path}"; then
+      rm -f "${shard_list}"
+      return 1
+    fi
+  done < "${shard_list}"
+
+  while IFS= read -r -d '' actual_shard; do
+    actual_name="$(basename "${actual_shard}")"
+    if ! jq -e --arg shard "${actual_name}" \
+        '[.weight_map[]] | index($shard) != null' "${index_path}" >/dev/null; then
+      rm -f "${shard_list}"
+      echo "benchmark.sh: staged transform contains unindexed shard ${actual_name}" >&2
+      return 1
+    fi
+  done < <(find "${staged_weights}" -maxdepth 1 -type f -name '*.safetensors' -print0)
+  rm -f "${shard_list}"
+}
+
 install_transformed_weights() {
   local staged_weights="$1"
+  local source_hash="$2"
   local safe_weights_path
+  local canonical_staged_weights
+  local expected_staged_weights
+  local invalid_staged_entry
+  local staged_shard
   local previous_weights
   local had_previous=0
+
+  if [[ ! -d "${staged_weights}" || -L "${staged_weights}" ]]; then
+    echo "benchmark.sh: submitted transform output is not a regular directory: ${staged_weights}" >&2
+    return 1
+  fi
+  canonical_staged_weights="$(canonical_directory_path "${staged_weights}")" || return 1
+  expected_staged_weights="$(canonical_directory_path "${TRANSFORM_STAGING_PARENT_OWNED}")/weights"
+  if [[ "${canonical_staged_weights}" != "${expected_staged_weights}" ]]; then
+    echo "benchmark.sh: submitted transform output escaped its staging directory" >&2
+    return 1
+  fi
+  if [[ -e "${staged_weights}/.gitkeep" || -L "${staged_weights}/.gitkeep" ]]; then
+    echo "benchmark.sh: submitted transform created reserved .gitkeep path ${staged_weights}/.gitkeep" >&2
+    return 1
+  fi
+  if [[ -e "${staged_weights}/.benchmark-source.sha256" \
+      || -L "${staged_weights}/.benchmark-source.sha256" ]]; then
+    echo "benchmark.sh: submitted transform created reserved .benchmark-source.sha256 path ${staged_weights}/.benchmark-source.sha256" >&2
+    return 1
+  fi
+  invalid_staged_entry="$(find "${staged_weights}" -mindepth 1 \
+    ! -type d ! -type f -print -quit)" || return 1
+  if [[ -n "${invalid_staged_entry}" ]]; then
+    echo "benchmark.sh: submitted transform output contains a symlink or non-regular entry: ${invalid_staged_entry}" >&2
+    return 1
+  fi
+  if [[ ! -f "${staged_weights}/config.json" \
+      || -L "${staged_weights}/config.json" \
+      || ! -f "${staged_weights}/model.safetensors.index.json" \
+      || -L "${staged_weights}/model.safetensors.index.json" ]]; then
+    echo "benchmark.sh: submitted transform output is missing regular config/index files" >&2
+    return 1
+  fi
+  staged_shard="$(find "${staged_weights}" -maxdepth 1 -type f \
+    -name '*.safetensors' -print -quit)" || return 1
+  if [[ -z "${staged_shard}" ]]; then
+    echo "benchmark.sh: submitted transform output contains no safetensors shard" >&2
+    return 1
+  fi
+  validate_staged_transform_contents "${staged_weights}" || return 1
+
   safe_weights_path="$(safe_clear_directory_path "${WEIGHTS_PATH}" "weights path" "${REFERENCE_PATH}")" || return 1
+  assert_directory_replacement_owned "${safe_weights_path}" "weights path" || return 1
   previous_weights="${TRANSFORM_STAGING_PARENT_OWNED}/previous-weights"
-  touch "${staged_weights}/.gitkeep" || return 1
+  if [[ -e "${previous_weights}" || -L "${previous_weights}" ]]; then
+    echo "benchmark.sh: submitted transform created reserved rollback path ${previous_weights}" >&2
+    return 1
+  fi
+  publish_new_staged_metadata_file \
+    "${staged_weights}/.gitkeep" "" ".gitkeep" || return 1
+  publish_new_staged_metadata_file \
+    "${staged_weights}/.benchmark-source.sha256" "${source_hash}"$'\n' \
+    ".benchmark-source.sha256" || return 1
 
   if [[ -e "${safe_weights_path}" || -L "${safe_weights_path}" ]]; then
     mv "${safe_weights_path}" "${previous_weights}" || return 1
@@ -899,19 +1184,15 @@ elif [[ "${MLXFAST_FORCE_TRANSFORM:-0}" == "1" || ! -f "${WEIGHTS_PATH}/config.j
   if [[ -f "${REFERENCE_PATH}/config.json" ]]; then
     echo "benchmark.sh: regenerating weights with Swift transform"
     safe_weights_path="$(safe_clear_directory_path "${WEIGHTS_PATH}" "weights path" "${REFERENCE_PATH}")" || exit 1
+    assert_directory_replacement_owned "${safe_weights_path}" "weights path" || exit 1
     TRANSFORM_STAGING_PARENT_OWNED="$(mktemp -d \
       "$(dirname "${safe_weights_path}")/.$(basename "${safe_weights_path}").mlxfast-transform.XXXXXX")"
     staged_weights="${TRANSFORM_STAGING_PARENT_OWNED}/weights"
     run_offline_writable_command "${TRANSFORM_STAGING_PARENT_OWNED}" \
       "${SWIFT_BIN}" transform --reference "${REFERENCE_PATH}" --output "${staged_weights}"
-    if [[ ! -f "${staged_weights}/config.json" ]]; then
-      echo "benchmark.sh: Swift transform did not produce ${staged_weights}/config.json" >&2
-      exit 1
-    fi
-    install_transformed_weights "${staged_weights}"
+    install_transformed_weights "${staged_weights}" "${wanted_hash}"
     rm -rf "${TRANSFORM_STAGING_PARENT_OWNED}"
     TRANSFORM_STAGING_PARENT_OWNED=""
-    printf '%s\n' "${wanted_hash}" > "${SOURCE_HASH_PATH}"
   else
     cat >&2 <<EOF
 benchmark.sh: reference weights not found at ${REFERENCE_PATH}, needed to regenerate weights/.
@@ -930,22 +1211,25 @@ if [[ "${MLXFAST_VERIFY_TRANSFORM:-0}" == "1" ]]; then
     exit 1
   fi
   VERIFY_TRANSFORM_TMP_PARENT="${MLXFAST_VERIFY_TRANSFORM_TMP_PARENT:-.mlxfast-transform-verify}"
-  VERIFY_TRANSFORM_TMP_PARENT="$(safe_clear_directory_path \
+  VERIFY_TRANSFORM_TMP_ROOT="$(safe_clear_directory_path \
     "${VERIFY_TRANSFORM_TMP_PARENT}" \
     "transform verification temporary path" \
     "${REFERENCE_PATH}" \
     "${WEIGHTS_PATH}")" || exit 1
-  find "${VERIFY_TRANSFORM_TMP_PARENT}" -mindepth 1 -exec rm -rf {} +
+  VERIFY_TRANSFORM_TMP_PARENT_OWNED="$(mktemp -d \
+    "${VERIFY_TRANSFORM_TMP_ROOT%/}/mlxfast-transform-verify.XXXXXX")"
   echo "benchmark.sh: verifying weights match a fresh run of the submitted Swift transform"
-  if run_offline_writable_command "$(absolute_path "${VERIFY_TRANSFORM_TMP_PARENT}")" \
+  if run_offline_writable_command "$(absolute_path "${VERIFY_TRANSFORM_TMP_PARENT_OWNED}")" \
     "${SWIFT_BIN}" verify-transform \
     --reference "${REFERENCE_PATH}" \
     --weights "${WEIGHTS_PATH}" \
-    --tmp-parent "${VERIFY_TRANSFORM_TMP_PARENT}"; then
-    rm -rf "${VERIFY_TRANSFORM_TMP_PARENT}"
+    --tmp-parent "${VERIFY_TRANSFORM_TMP_PARENT_OWNED}"; then
+    rm -rf "${VERIFY_TRANSFORM_TMP_PARENT_OWNED}"
+    VERIFY_TRANSFORM_TMP_PARENT_OWNED=""
   else
     status="$?"
-    rm -rf "${VERIFY_TRANSFORM_TMP_PARENT}"
+    rm -rf "${VERIFY_TRANSFORM_TMP_PARENT_OWNED}"
+    VERIFY_TRANSFORM_TMP_PARENT_OWNED=""
     exit "${status}"
   fi
 fi

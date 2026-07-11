@@ -67,9 +67,13 @@ public struct Gemma4WeightLoader {
     /// `DenseTensorStore`-backed loaders elsewhere in this package use for
     /// affine 4-bit quantized checkpoints.
     public func linearWeight(named baseName: String, outFeatures: Int, inFeatures: Int) throws -> Gemma4LinearWeight {
+        let quantization = try validateLinearMetadata(
+            named: baseName,
+            expectedRows: outFeatures,
+            expectedInputFeatures: inFeatures
+        )
         let tensor = try materializedTensor(named: baseName)
-        guard tensor.dtype == .u32 else {
-            try validateShape(tensor.shape, expectedShape: [outFeatures, inFeatures], tensorName: baseName)
+        guard let quantization else {
             return Gemma4LinearWeight(try bridge.makeArray(from: tensor))
         }
 
@@ -78,39 +82,13 @@ public struct Gemma4WeightLoader {
         let scalesTensor = try materializedTensor(named: scalesName)
         let biasesTensor = try materializedTensor(named: biasesName)
 
-        let actualRows = tensor.shape.dropLast().reduce(1, *)
-        guard actualRows == outFeatures else {
-            throw MLXFastError.invalidInput(
-                "quantized tensor \(baseName) has \(actualRows) output rows; expected \(outFeatures)"
-            )
-        }
-        guard let packedInput = tensor.shape.last, packedInput > 0, inFeatures > 0 else {
-            throw MLXFastError.invalidInput("quantized tensor \(baseName) has an invalid packed shape \(tensor.shape)")
-        }
-        let packedBits = packedInput * 32
-        guard packedBits % inFeatures == 0 else {
-            throw MLXFastError.invalidInput(
-                "quantized tensor \(baseName) packed input \(packedInput) is incompatible with logical input \(inFeatures)"
-            )
-        }
-        let bits = packedBits / inFeatures
-        guard [2, 4, 8].contains(bits) else {
-            throw MLXFastError.invalidInput("quantized tensor \(baseName) has unsupported bit width \(bits)")
-        }
-        guard let groupCount = scalesTensor.shape.last, groupCount > 0, inFeatures % groupCount == 0 else {
-            throw MLXFastError.invalidInput(
-                "quantized tensor \(baseName) scales shape \(scalesTensor.shape) is incompatible with logical input \(inFeatures)"
-            )
-        }
-        let groupSize = inFeatures / groupCount
-
         return Gemma4LinearWeight(
             weight: try bridge.makeArray(from: tensor),
             scales: try bridge.makeArray(from: scalesTensor),
             biases: try bridge.makeArray(from: biasesTensor),
             logicalShape: [outFeatures, inFeatures],
-            groupSize: groupSize,
-            bits: bits
+            groupSize: quantization.groupSize,
+            bits: quantization.bits
         )
     }
 
@@ -226,20 +204,24 @@ public struct Gemma4WeightLoader {
     /// preflight/worker-boundary checks that must fail fast on a malformed
     /// transformed weights directory before the (expensive) full weight load.
     public func validateRequiredMetadata(config: Gemma4Config) throws {
-        try validateDenseTensorMetadata(
+        try validateLinearMetadata(
             named: Gemma4WeightNames.embedTokens,
             expectedRows: config.vocabSize,
-            expectedInputFeatures: config.hiddenSize
+            expectedInputFeatures: config.hiddenSize,
+            expectedGroupSize: config.quantizationGroupSize,
+            expectedBits: config.quantizationBits
         )
         try validateDenseTensorMetadata(
             named: Gemma4WeightNames.finalNorm,
             expectedShape: [config.hiddenSize]
         )
         if !config.tieWordEmbeddings {
-            try validateDenseTensorMetadata(
+            try validateLinearMetadata(
                 named: Gemma4WeightNames.lmHead,
                 expectedRows: config.vocabSize,
-                expectedInputFeatures: config.hiddenSize
+                expectedInputFeatures: config.hiddenSize,
+                expectedGroupSize: config.quantizationGroupSize,
+                expectedBits: config.quantizationBits
             )
         }
 
@@ -263,27 +245,35 @@ public struct Gemma4WeightLoader {
                 expectedShape: [1]
             )
 
-            try validateDenseTensorMetadata(
+            try validateLinearMetadata(
                 named: Gemma4WeightNames.attention(layerIndex, "q_proj.weight"),
                 expectedRows: config.numAttentionHeads * headDim,
-                expectedInputFeatures: config.hiddenSize
+                expectedInputFeatures: config.hiddenSize,
+                expectedGroupSize: config.quantizationGroupSize,
+                expectedBits: config.quantizationBits
             )
-            try validateDenseTensorMetadata(
+            try validateLinearMetadata(
                 named: Gemma4WeightNames.attention(layerIndex, "k_proj.weight"),
                 expectedRows: kvHeads * headDim,
-                expectedInputFeatures: config.hiddenSize
+                expectedInputFeatures: config.hiddenSize,
+                expectedGroupSize: config.quantizationGroupSize,
+                expectedBits: config.quantizationBits
             )
             if !useKEqV {
-                try validateDenseTensorMetadata(
+                try validateLinearMetadata(
                     named: Gemma4WeightNames.attention(layerIndex, "v_proj.weight"),
                     expectedRows: kvHeads * headDim,
-                    expectedInputFeatures: config.hiddenSize
+                    expectedInputFeatures: config.hiddenSize,
+                    expectedGroupSize: config.quantizationGroupSize,
+                    expectedBits: config.quantizationBits
                 )
             }
-            try validateDenseTensorMetadata(
+            try validateLinearMetadata(
                 named: Gemma4WeightNames.attention(layerIndex, "o_proj.weight"),
                 expectedRows: config.hiddenSize,
-                expectedInputFeatures: config.numAttentionHeads * headDim
+                expectedInputFeatures: config.numAttentionHeads * headDim,
+                expectedGroupSize: config.quantizationGroupSize,
+                expectedBits: config.quantizationBits
             )
             try validateDenseTensorMetadata(
                 named: Gemma4WeightNames.attention(layerIndex, "q_norm.weight"),
@@ -294,20 +284,26 @@ public struct Gemma4WeightLoader {
                 expectedShape: [headDim]
             )
 
-            try validateDenseTensorMetadata(
+            try validateLinearMetadata(
                 named: Gemma4WeightNames.mlp(layerIndex, "gate_proj.weight"),
                 expectedRows: config.intermediateSize,
-                expectedInputFeatures: config.hiddenSize
+                expectedInputFeatures: config.hiddenSize,
+                expectedGroupSize: config.quantizationGroupSize,
+                expectedBits: config.quantizationBits
             )
-            try validateDenseTensorMetadata(
+            try validateLinearMetadata(
                 named: Gemma4WeightNames.mlp(layerIndex, "up_proj.weight"),
                 expectedRows: config.intermediateSize,
-                expectedInputFeatures: config.hiddenSize
+                expectedInputFeatures: config.hiddenSize,
+                expectedGroupSize: config.quantizationGroupSize,
+                expectedBits: config.quantizationBits
             )
-            try validateDenseTensorMetadata(
+            try validateLinearMetadata(
                 named: Gemma4WeightNames.mlp(layerIndex, "down_proj.weight"),
                 expectedRows: config.hiddenSize,
-                expectedInputFeatures: config.intermediateSize
+                expectedInputFeatures: config.intermediateSize,
+                expectedGroupSize: config.quantizationGroupSize,
+                expectedBits: config.quantizationBits
             )
         }
     }
@@ -329,33 +325,84 @@ public struct Gemma4WeightLoader {
     /// dimensions without materializing it. Quantized tensors are packed
     /// (`U32` codes), so their on-disk shape does not equal the logical
     /// `[outFeatures, inFeatures]` shape directly.
-    private func validateDenseTensorMetadata(
+    @discardableResult
+    func validateLinearMetadata(
         named name: String,
         expectedRows: Int,
-        expectedInputFeatures: Int
-    ) throws {
+        expectedInputFeatures: Int,
+        expectedGroupSize: Int? = nil,
+        expectedBits: Int? = nil
+    ) throws -> (groupSize: Int, bits: Int)? {
         guard let record = denseStore.record(named: name) else {
             throw MLXFastError.invalidInput("dense tensor not found: \(name)")
         }
         if record.dtype != "U32" {
             try validateDenseTensorMetadata(named: name, expectedShape: [expectedRows, expectedInputFeatures])
-            return
+            return nil
         }
-        let actualRows = record.shape.dropLast().reduce(1, *)
-        guard actualRows == expectedRows else {
+        guard expectedInputFeatures > 0 else {
+            throw MLXFastError.invalidInput("quantized tensor \(name) logical input must be positive")
+        }
+        guard record.shape.count == 2, record.shape[0] == expectedRows, record.shape[1] > 0 else {
             throw MLXFastError.invalidInput(
-                "quantized tensor \(name) has \(actualRows) output rows; expected \(expectedRows)"
+                "quantized tensor \(name) shape \(record.shape) must be [\(expectedRows), packedInput]"
             )
         }
-        guard let packedInput = record.shape.last, packedInput > 0 else {
-            throw MLXFastError.invalidInput("quantized tensor \(name) has an invalid packed shape \(record.shape)")
-        }
-        let packedBits = packedInput * 32
-        guard packedBits % expectedInputFeatures == 0 else {
+        let (packedBits, overflow) = record.shape[1].multipliedReportingOverflow(by: 32)
+        guard !overflow, packedBits % expectedInputFeatures == 0 else {
             throw MLXFastError.invalidInput(
-                "quantized tensor \(name) packed input \(packedInput) is incompatible with logical input \(expectedInputFeatures)"
+                "quantized tensor \(name) packed input \(record.shape[1]) is incompatible with logical input \(expectedInputFeatures)"
             )
         }
+        let bits = packedBits / expectedInputFeatures
+        guard [2, 4, 8].contains(bits) else {
+            throw MLXFastError.invalidInput("quantized tensor \(name) has unsupported bit width \(bits)")
+        }
+
+        let scalesName = Self.companionName(for: name, suffix: "scales")
+        let biasesName = Self.companionName(for: name, suffix: "biases")
+        guard let scales = denseStore.record(named: scalesName) else {
+            throw MLXFastError.invalidInput("quantized tensor \(name) is missing companion \(scalesName)")
+        }
+        guard let biases = denseStore.record(named: biasesName) else {
+            throw MLXFastError.invalidInput("quantized tensor \(name) is missing companion \(biasesName)")
+        }
+        guard scales.dtype == "BF16" else {
+            throw MLXFastError.invalidInput(
+                "quantized tensor \(name) scales must use BF16, found \(scales.dtype)"
+            )
+        }
+        guard biases.dtype == "BF16" else {
+            throw MLXFastError.invalidInput(
+                "quantized tensor \(name) biases must use BF16, found \(biases.dtype)"
+            )
+        }
+        guard scales.shape.count == 2,
+              scales.shape[0] == expectedRows,
+              scales.shape[1] > 0,
+              expectedInputFeatures % scales.shape[1] == 0
+        else {
+            throw MLXFastError.invalidInput(
+                "quantized tensor \(name) scales shape \(scales.shape) is incompatible with [\(expectedRows), groups] and logical input \(expectedInputFeatures)"
+            )
+        }
+        guard biases.shape == scales.shape else {
+            throw MLXFastError.invalidInput(
+                "quantized tensor \(name) biases shape \(biases.shape) does not match scales shape \(scales.shape)"
+            )
+        }
+        let groupSize = expectedInputFeatures / scales.shape[1]
+        if let expectedGroupSize, groupSize != expectedGroupSize {
+            throw MLXFastError.invalidInput(
+                "quantized tensor \(name) group size \(groupSize) does not match configured group size \(expectedGroupSize)"
+            )
+        }
+        if let expectedBits, bits != expectedBits {
+            throw MLXFastError.invalidInput(
+                "quantized tensor \(name) bit width \(bits) does not match configured bit width \(expectedBits)"
+            )
+        }
+        return (groupSize: groupSize, bits: bits)
     }
 
     // MARK: - Helpers

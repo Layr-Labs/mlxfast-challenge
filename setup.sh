@@ -79,9 +79,22 @@ REFERENCE_CACHE_MUTATION_LOCK_TIMEOUT_SECONDS="${MLXFAST_REFERENCE_CACHE_MUTATIO
 REFERENCE_CACHE_MUTATION_LOCK_STALE_SECONDS="${MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_STALE_SECONDS:-60}"
 SETUP_STARTED_SECONDS="${SECONDS}"
 METALLIB_BUILD_PID=""
+METALLIB_BUILD_PROCESS_GROUP=""
 METALLIB_BUILD_STATE="not_started"
 REFERENCE_CACHE_MUTATION_LOCK_HELD=0
 REFERENCE_DOWNLOAD_HEARTBEAT_PID=""
+REFERENCE_CACHE_MUTATION_LOCK_TOKEN=""
+REFERENCE_CACHE_MUTATION_OWNER_TEMP=""
+REFERENCE_CACHE_MUTATION_LOCK_GENERATION_DIR=""
+REFERENCE_CACHE_MUTATION_LOCK_INITIALIZING_DIR=""
+CURRENT_SHELL_PID=""
+REFERENCE_VERIFIED_SIGNATURES_PATH=""
+REFERENCE_VERIFIED_MANIFEST_PATH=""
+REFERENCE_VERIFIED_MANIFEST_HASH=""
+REFERENCE_VERIFIED_CONTENT_IDENTITY=""
+REFERENCE_VERIFIED_EXPECTED_HASH=""
+REFERENCE_VERIFIED_EXPECTED_SIZE=""
+REFERENCE_VERIFIED_FILE_MANIFEST_HASH=""
 REFERENCE_REQUIRED_METADATA_FILES=(
   "config.json"
   "model.safetensors.index.json"
@@ -536,11 +549,25 @@ metal_toolchain_identifier() {
     || true
 }
 
+# POLICY (TOOLCHAINS override) — APPROVED: on macOS 26+ the Metal compiler
+# ships as a separately installed "Metal Toolchain" component that xcrun only
+# finds when TOOLCHAINS selects it. This helper exports TOOLCHAINS
+# process-wide so every later xcrun/metal invocation in this script resolves
+# the same pinned compiler, which keeps metallib builds deterministic. Two
+# consequences to be aware of: (1) any TOOLCHAINS value the caller already
+# exported (e.g. a custom Swift toolchain selection) is silently replaced for
+# the rest of this script, and (2) MLXFAST_METAL_TOOLCHAIN_IDENTIFIER lets
+# the environment choose which toolchain identifier gets exported. On
+# participant machines that override is deliberate and supported. The ranked
+# M5 runner does not honor ad-hoc values: .github/workflows/benchmark.yml
+# pins MLXFAST_METAL_TOOLCHAIN_IDENTIFIER to the operator-chosen toolchain in
+# the trusted build step, and the bench-exec bridge's env -i child
+# environment means submitted code cannot substitute its own.
 configure_metal_toolchain_environment() {
   local identifier
   identifier="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER:-$(metal_toolchain_identifier)}"
   if [[ -n "${identifier}" ]]; then
-    export TOOLCHAINS="${TOOLCHAINS:-${identifier}}"
+    export TOOLCHAINS="${identifier}"
   fi
 }
 
@@ -685,13 +712,14 @@ reference_post_download_full_verify_enabled() {
 
 reference_manifest_entry() {
   local relative_path="$1"
+  local source_manifest="${2:-${REFERENCE_MANIFEST_PATH}}"
   local line
   local expected_hash
   local expected_size
   local manifest_path
   local extra
 
-  [[ -f "${REFERENCE_MANIFEST_PATH}" ]] || return 1
+  [[ -f "${source_manifest}" ]] || return 1
   while IFS= read -r line || [[ -n "${line}" ]]; do
     [[ -z "${line}" || "${line}" == \#* ]] && continue
     read -r expected_hash expected_size manifest_path extra <<< "${line}"
@@ -699,7 +727,7 @@ reference_manifest_entry() {
       printf '%s %s\n' "${expected_hash}" "${expected_size}"
       return 0
     fi
-  done < "${REFERENCE_MANIFEST_PATH}"
+  done < "${source_manifest}"
 
   return 1
 }
@@ -713,7 +741,18 @@ reference_file_is_current() {
   local expected_size
   local actual_size
   local actual_hash
+  local before_signature
+  local after_signature
+  local before_content_identity
+  local after_content_identity
+  local manifest_snapshot
+  local verified_manifest_hash
   local hash_status
+
+  REFERENCE_VERIFIED_CONTENT_IDENTITY=""
+  REFERENCE_VERIFIED_EXPECTED_HASH=""
+  REFERENCE_VERIFIED_EXPECTED_SIZE=""
+  REFERENCE_VERIFIED_FILE_MANIFEST_HASH=""
 
   if reference_hash_verification_enabled; then
     hash_status=0
@@ -721,8 +760,9 @@ reference_file_is_current() {
     hash_status="$?"
   fi
   if [[ "${hash_status}" == "1" ]]; then
-    [[ -s "${output_path}" ]]
-    return $?
+    [[ -s "${output_path}" ]] || return 1
+    REFERENCE_VERIFIED_CONTENT_IDENTITY="$(file_content_identity_signature "${output_path}")" || return 1
+    return 0
   elif [[ "${hash_status}" != "0" ]]; then
     return 1
   fi
@@ -731,30 +771,78 @@ reference_file_is_current() {
     echo "setup.sh: reference manifest missing at ${REFERENCE_MANIFEST_PATH}" >&2
     return 1
   fi
-  if ! manifest_entry="$(reference_manifest_entry "${relative_path}")"; then
+  manifest_snapshot="$(mktemp "${TMPDIR:-/tmp}/mlxfast-reference-manifest.XXXXXX")" || return 1
+  if ! cp "${REFERENCE_MANIFEST_PATH}" "${manifest_snapshot}"; then
+    rm -f "${manifest_snapshot}"
+    return 1
+  fi
+  verified_manifest_hash="$(shasum -a 256 "${manifest_snapshot}" | awk '{print $1}')" || {
+    rm -f "${manifest_snapshot}"
+    return 1
+  }
+  if ! manifest_entry="$(reference_manifest_entry "${relative_path}" "${manifest_snapshot}")"; then
+    rm -f "${manifest_snapshot}"
     echo "setup.sh: reference manifest has no entry for ${relative_path}" >&2
     return 1
   fi
   read -r expected_hash expected_size <<< "${manifest_entry}"
 
   if [[ ! -f "${output_path}" ]]; then
+    rm -f "${manifest_snapshot}"
     return 1
   fi
 
   actual_size="$(wc -c < "${output_path}" | tr -d ' ')"
   if [[ "${actual_size}" != "${expected_size}" ]]; then
     echo "setup.sh: cached ${label} size mismatch: expected ${expected_size}, got ${actual_size}"
+    rm -f "${manifest_snapshot}"
     return 1
   fi
 
-  actual_hash="$(shasum -a 256 "${output_path}" | awk '{print $1}')"
+  before_signature="$(file_metadata_signature "${output_path}")" || {
+    rm -f "${manifest_snapshot}"
+    return 1
+  }
+  before_content_identity="$(file_content_identity_signature "${output_path}")" || {
+    rm -f "${manifest_snapshot}"
+    return 1
+  }
+  actual_hash="$(shasum -a 256 "${output_path}" | awk '{print $1}')" || {
+    rm -f "${manifest_snapshot}"
+    return 1
+  }
+  after_signature="$(file_metadata_signature "${output_path}")" || {
+    rm -f "${manifest_snapshot}"
+    return 1
+  }
+  after_content_identity="$(file_content_identity_signature "${output_path}")" || {
+    rm -f "${manifest_snapshot}"
+    return 1
+  }
+  if [[ "${before_signature}" != "${after_signature}" \
+      || "${before_content_identity}" != "${after_content_identity}" ]]; then
+    echo "setup.sh: cached ${label} changed while SHA256 was being verified" >&2
+    rm -f "${manifest_snapshot}"
+    return 1
+  fi
   if [[ "${actual_hash}" != "${expected_hash}" ]]; then
     echo "setup.sh: cached ${label} sha256 mismatch"
     echo "setup.sh: expected ${expected_hash}"
     echo "setup.sh: actual   ${actual_hash}"
+    rm -f "${manifest_snapshot}"
+    return 1
+  fi
+  if [[ "$(reference_manifest_hash 2>/dev/null || true)" != "${verified_manifest_hash}" ]]; then
+    echo "setup.sh: reference manifest changed while ${label} was being verified" >&2
+    rm -f "${manifest_snapshot}"
     return 1
   fi
 
+  rm -f "${manifest_snapshot}"
+  REFERENCE_VERIFIED_CONTENT_IDENTITY="${after_content_identity}"
+  REFERENCE_VERIFIED_EXPECTED_HASH="${expected_hash}"
+  REFERENCE_VERIFIED_EXPECTED_SIZE="${expected_size}"
+  REFERENCE_VERIFIED_FILE_MANIFEST_HASH="${verified_manifest_hash}"
   return 0
 }
 
@@ -767,6 +855,7 @@ reference_manifest_hash() {
 }
 
 reference_manifest_totals() {
+  local source_manifest="${1:-${REFERENCE_MANIFEST_PATH}}"
   local line
   local expected_hash
   local expected_size
@@ -775,8 +864,8 @@ reference_manifest_totals() {
   local file_count=0
   local byte_count=0
 
-  if [[ ! -f "${REFERENCE_MANIFEST_PATH}" ]]; then
-    echo "setup.sh: reference manifest missing at ${REFERENCE_MANIFEST_PATH}" >&2
+  if [[ ! -f "${source_manifest}" ]]; then
+    echo "setup.sh: reference manifest missing at ${source_manifest}" >&2
     return 1
   fi
 
@@ -798,7 +887,7 @@ reference_manifest_totals() {
 
     file_count=$((file_count + 1))
     byte_count=$((byte_count + expected_size))
-  done < "${REFERENCE_MANIFEST_PATH}"
+  done < "${source_manifest}"
 
   [[ "${file_count}" -gt 0 ]] || return 1
   printf '%s %s\n' "${file_count}" "${byte_count}"
@@ -809,14 +898,157 @@ file_mtime_seconds() {
   stat -f '%m' "${file_path}" 2>/dev/null || stat -c '%Y' "${file_path}"
 }
 
-reference_cache_lock_is_current() {
-  local reference_dir="$1"
-  local lock_path="${REFERENCE_CACHE_LOCK_PATH}"
+file_metadata_signature() {
+  local file_path="$1"
+  stat -f '%d:%i:%z:%Fm:%Fc:%v' "${file_path}" 2>/dev/null \
+    || stat -c '%d:%i:%s:%Y:%Z:0' "${file_path}"
+}
+
+file_content_identity_signature() {
+  local file_path="$1"
+  stat -f '%d:%i:%z:%Fm:%v' "${file_path}" 2>/dev/null \
+    || stat -c '%d:%i:%s:%Y:0' "${file_path}"
+}
+
+discard_reference_verified_signatures() {
+  if [[ -n "${REFERENCE_VERIFIED_SIGNATURES_PATH}" ]]; then
+    rm -f "${REFERENCE_VERIFIED_SIGNATURES_PATH}" || true
+    REFERENCE_VERIFIED_SIGNATURES_PATH=""
+  fi
+  if [[ -n "${REFERENCE_VERIFIED_MANIFEST_PATH}" ]]; then
+    rm -f "${REFERENCE_VERIFIED_MANIFEST_PATH}" || true
+    REFERENCE_VERIFIED_MANIFEST_PATH=""
+  fi
+  REFERENCE_VERIFIED_MANIFEST_HASH=""
+}
+
+create_reference_verified_manifest_snapshot() {
+  local parent
+  parent="$(dirname "${REFERENCE_CACHE_LOCK_PATH}")"
+  mkdir -p "${parent}" || return 1
+  REFERENCE_VERIFIED_MANIFEST_PATH="$(
+    mktemp "${REFERENCE_CACHE_LOCK_PATH}.manifest.XXXXXX"
+  )" || {
+    REFERENCE_VERIFIED_MANIFEST_PATH=""
+    return 1
+  }
+  if ! cp "${REFERENCE_MANIFEST_PATH}" "${REFERENCE_VERIFIED_MANIFEST_PATH}"; then
+    rm -f "${REFERENCE_VERIFIED_MANIFEST_PATH}"
+    REFERENCE_VERIFIED_MANIFEST_PATH=""
+    return 1
+  fi
+  REFERENCE_VERIFIED_MANIFEST_HASH="$(
+    shasum -a 256 "${REFERENCE_VERIFIED_MANIFEST_PATH}" | awk '{print $1}'
+  )" || {
+    rm -f "${REFERENCE_VERIFIED_MANIFEST_PATH}"
+    REFERENCE_VERIFIED_MANIFEST_PATH=""
+    REFERENCE_VERIFIED_MANIFEST_HASH=""
+    return 1
+  }
+}
+
+create_reference_verified_signatures_path() {
+  local parent
+  parent="$(dirname "${REFERENCE_CACHE_LOCK_PATH}")"
+  mkdir -p "${parent}" || return 1
+  REFERENCE_VERIFIED_SIGNATURES_PATH="$(
+    mktemp "${REFERENCE_CACHE_LOCK_PATH}.verified.XXXXXX"
+  )" || {
+    REFERENCE_VERIFIED_SIGNATURES_PATH=""
+    return 1
+  }
+  : > "${REFERENCE_VERIFIED_SIGNATURES_PATH}"
+}
+
+write_verified_reference_marker() {
+  local relative_path="$1"
+  local file_path="$2"
+  local marker_path="$3"
+  local expected_content_identity="$4"
+  local expected_hash="$5"
+  local expected_size="$6"
+  local expected_manifest_hash="$7"
+  local current_content_identity
+  local current_signature
+  local marker_temp
+
+  if [[ -z "${expected_hash}" || -z "${expected_size}" \
+      || -z "${expected_manifest_hash}" ]]; then
+    return 1
+  fi
+  if [[ "$(reference_manifest_hash 2>/dev/null || true)" != "${expected_manifest_hash}" ]]; then
+    echo "setup.sh: reference manifest changed before ${relative_path} marker publication" >&2
+    return 1
+  fi
+  current_content_identity="$(file_content_identity_signature "${file_path}")" || return 1
+  if [[ -z "${expected_content_identity}" \
+      || "${current_content_identity}" != "${expected_content_identity}" ]]; then
+    echo "setup.sh: ${relative_path} changed before its verification marker was written" >&2
+    return 1
+  fi
+  current_signature="$(file_metadata_signature "${file_path}")" || return 1
+  marker_temp="$(mktemp "${marker_path}.tmp.XXXXXX")" || return 1
+  if ! printf 'version=2\t%s\t%s\t%s\t%s\n' \
+      "${expected_manifest_hash}" "${expected_hash}" "${expected_size}" "${current_signature}" > "${marker_temp}" \
+      || ! mv "${marker_temp}" "${marker_path}"; then
+    rm -f "${marker_temp}"
+    return 1
+  fi
+}
+
+mark_reference_file_complete() {
+  local relative_path="$1"
+  local file_path="$2"
+  local marker_path="$3"
+  local expected_content_identity="$4"
+  local expected_hash="$5"
+  local expected_size="$6"
+  local expected_manifest_hash="$7"
   local hash_status
-  local expected_manifest_hash
-  local expected_manifest_totals
-  local manifest_file_count
-  local manifest_byte_count
+
+  if reference_hash_verification_enabled; then
+    hash_status=0
+  else
+    hash_status="$?"
+  fi
+  if [[ "${hash_status}" == "0" ]]; then
+    write_verified_reference_marker \
+      "${relative_path}" "${file_path}" "${marker_path}" "${expected_content_identity}" \
+      "${expected_hash}" "${expected_size}" "${expected_manifest_hash}"
+  elif [[ "${hash_status}" == "1" ]]; then
+    touch "${marker_path}"
+  else
+    return 1
+  fi
+}
+
+directory_identity() {
+  local directory="$1"
+  stat -f '%d:%i' "${directory}" 2>/dev/null \
+    || stat -c '%d:%i' "${directory}"
+}
+
+current_shell_pid() {
+  local pid_path
+  if ! pid_path="$(mktemp "${TMPDIR:-/tmp}/mlxfast-shell-pid.XXXXXX")"; then
+    return 1
+  fi
+  if ! /bin/sh -c 'printf "%s\n" "$PPID" > "$1"' _ "${pid_path}" \
+      || ! IFS= read -r CURRENT_SHELL_PID < "${pid_path}"; then
+    rm -f "${pid_path}"
+    return 1
+  fi
+  rm -f "${pid_path}"
+  [[ "${CURRENT_SHELL_PID}" =~ ^[1-9][0-9]*$ ]]
+}
+
+reference_cache_lock_matches_manifest_snapshot() {
+  local reference_dir="$1"
+  local lock_path="$2"
+  local manifest_snapshot="$3"
+  local expected_manifest_hash="$4"
+  local manifest_file_count="$5"
+  local manifest_byte_count="$6"
   local line
   local key
   local value
@@ -831,32 +1063,14 @@ reference_cache_lock_is_current() {
   local actual_byte_count=0
   local relative_path
   local expected_size
-  local expected_mtime
+  local expected_signature
   local extra
   local file_path
   local actual_size
-  local actual_mtime
+  local actual_signature
   local manifest_entry
   local manifest_expected_hash
   local manifest_expected_size
-
-  if reference_hash_verification_enabled; then
-    hash_status=0
-  else
-    hash_status="$?"
-  fi
-  if [[ "${hash_status}" != "0" ]]; then
-    return 1
-  fi
-
-  [[ -f "${lock_path}" ]] || return 1
-  if ! expected_manifest_hash="$(reference_manifest_hash)"; then
-    return 1
-  fi
-  if ! expected_manifest_totals="$(reference_manifest_totals)"; then
-    return 1
-  fi
-  read -r manifest_file_count manifest_byte_count <<< "${expected_manifest_totals}"
 
   while IFS= read -r line || [[ -n "${line}" ]]; do
     [[ -z "${line}" ]] && continue
@@ -879,19 +1093,19 @@ reference_cache_lock_is_current() {
       continue
     fi
 
-    IFS=$'\t' read -r relative_path expected_size expected_mtime extra <<< "${line}"
-    if [[ -n "${extra:-}" || -z "${relative_path:-}" || -z "${expected_size:-}" || -z "${expected_mtime:-}" ]]; then
+    IFS=$'\t' read -r relative_path expected_size expected_signature extra <<< "${line}"
+    if [[ -n "${extra:-}" || -z "${relative_path:-}" || -z "${expected_size:-}" || -z "${expected_signature:-}" ]]; then
       return 1
     fi
     if [[ "${relative_path}" == /* || "${relative_path}" == *\\* ]]; then
       return 1
     fi
     [[ "${expected_size}" =~ ^[0-9]+$ ]] || return 1
-    [[ "${expected_mtime}" =~ ^[0-9]+$ ]] || return 1
+    [[ "${expected_signature}" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+([.][0-9]+)?:[0-9]+([.][0-9]+)?:[0-9]+$ ]] || return 1
     case "/${relative_path}/" in
       *"/../"*|*"/./"*) return 1 ;;
     esac
-    if ! manifest_entry="$(reference_manifest_entry "${relative_path}")"; then
+    if ! manifest_entry="$(reference_manifest_entry "${relative_path}" "${manifest_snapshot}")"; then
       return 1
     fi
     read -r manifest_expected_hash manifest_expected_size <<< "${manifest_entry}"
@@ -902,16 +1116,16 @@ reference_cache_lock_is_current() {
     [[ -f "${file_path}" ]] || return 1
     actual_size="$(wc -c < "${file_path}" | tr -d ' ')"
     [[ "${actual_size}" == "${expected_size}" ]] || return 1
-    if ! actual_mtime="$(file_mtime_seconds "${file_path}")"; then
+    if ! actual_signature="$(file_metadata_signature "${file_path}")"; then
       return 1
     fi
-    [[ "${actual_mtime}" == "${expected_mtime}" ]] || return 1
+    [[ "${actual_signature}" == "${expected_signature}" ]] || return 1
 
     actual_file_count=$((actual_file_count + 1))
     actual_byte_count=$((actual_byte_count + actual_size))
   done < "${lock_path}"
 
-  [[ "${version}" == "1" ]] || return 1
+  [[ "${version}" == "3" ]] || return 1
   [[ "${model_repo}" == "${REFERENCE_MODEL_REPO}" ]] || return 1
   [[ "${revision}" == "${REFERENCE_REVISION}" ]] || return 1
   [[ "${manifest_hash}" == "${expected_manifest_hash}" ]] || return 1
@@ -922,6 +1136,70 @@ reference_cache_lock_is_current() {
   [[ "${actual_file_count}" == "${lock_file_count}" ]] || return 1
   [[ "${actual_byte_count}" == "${lock_byte_count}" ]] || return 1
 
+  return 0
+}
+
+reference_cache_lock_is_current() {
+  local reference_dir="$1"
+  local lock_path="${REFERENCE_CACHE_LOCK_PATH}"
+  local hash_status
+  local manifest_snapshot
+  local expected_manifest_hash
+  local current_manifest_hash
+  local expected_manifest_totals
+  local manifest_file_count
+  local manifest_byte_count
+  local validation_status
+
+  if reference_hash_verification_enabled; then
+    hash_status=0
+  else
+    hash_status="$?"
+  fi
+  if [[ "${hash_status}" != "0" ]]; then
+    return 1
+  fi
+  [[ -f "${lock_path}" ]] || return 1
+  [[ -f "${REFERENCE_MANIFEST_PATH}" ]] || return 1
+
+  manifest_snapshot="$(mktemp "${TMPDIR:-/tmp}/mlxfast-cache-lock-manifest.XXXXXX")" \
+    || return 1
+  if ! cp "${REFERENCE_MANIFEST_PATH}" "${manifest_snapshot}"; then
+    rm -f "${manifest_snapshot}"
+    return 1
+  fi
+  if ! expected_manifest_hash="$(shasum -a 256 "${manifest_snapshot}" | awk '{print $1}')"; then
+    rm -f "${manifest_snapshot}"
+    return 1
+  fi
+  if ! expected_manifest_totals="$(reference_manifest_totals "${manifest_snapshot}")"; then
+    rm -f "${manifest_snapshot}"
+    return 1
+  fi
+  read -r manifest_file_count manifest_byte_count <<< "${expected_manifest_totals}"
+
+  validation_status=0
+  reference_cache_lock_matches_manifest_snapshot \
+    "${reference_dir}" \
+    "${lock_path}" \
+    "${manifest_snapshot}" \
+    "${expected_manifest_hash}" \
+    "${manifest_file_count}" \
+    "${manifest_byte_count}" || validation_status=$?
+  rm -f "${manifest_snapshot}"
+  if [[ "${validation_status}" != "0" ]]; then
+    return "${validation_status}"
+  fi
+
+  # The snapshot binds every entry used above. Re-read the live manifest only
+  # after validation so a concurrent checkout/update cannot make an old stamp
+  # authorize a different same-shape manifest for this invocation.
+  current_manifest_hash="$(reference_manifest_hash 2>/dev/null || true)"
+  if [[ "${current_manifest_hash}" != "${expected_manifest_hash}" ]]; then
+    echo "setup.sh: reference manifest changed while the cache lock was being validated" >&2
+    return 1
+  fi
+
   echo "setup.sh: trusted reference cache lock at ${lock_path}; skipping full SHA256 verification"
   return 0
 }
@@ -931,62 +1209,133 @@ write_reference_cache_lock() {
   local lock_path="${REFERENCE_CACHE_LOCK_PATH}"
   local temp_path
   local manifest_hash
-  local line
-  local expected_hash
   local expected_size
   local relative_path
   local extra
   local file_path
   local actual_size
-  local actual_mtime
+  local actual_signature
+  local manifest_entry
+  local manifest_expected_hash
+  local manifest_expected_size
+  local manifest_totals
+  local manifest_file_count
+  local manifest_byte_count
   local file_count=0
   local byte_count=0
-  local files_path
+  local files_path="${REFERENCE_VERIFIED_SIGNATURES_PATH}"
+  local capture_epoch
 
-  if ! manifest_hash="$(reference_manifest_hash)"; then
+  if [[ -z "${files_path}" || ! -f "${files_path}" \
+      || -z "${REFERENCE_VERIFIED_MANIFEST_HASH}" ]]; then
+    echo "setup.sh: refusing to stamp reference files without bound SHA256 verification" >&2
     return 1
   fi
+  if ! manifest_hash="$(reference_manifest_hash)"; then
+    discard_reference_verified_signatures
+    return 1
+  fi
+  if [[ "${manifest_hash}" != "${REFERENCE_VERIFIED_MANIFEST_HASH}" ]]; then
+    discard_reference_verified_signatures
+    echo "setup.sh: reference manifest changed after SHA256 verification" >&2
+    return 1
+  fi
+  if ! manifest_totals="$(reference_manifest_totals)"; then
+    discard_reference_verified_signatures
+    return 1
+  fi
+  read -r manifest_file_count manifest_byte_count <<< "${manifest_totals}"
+
+  capture_epoch="$(date +%s)"
 
   mkdir -p "$(dirname "${lock_path}")"
   if ! temp_path="$(mktemp "${lock_path}.tmp.XXXXXX")"; then
+    discard_reference_verified_signatures
     echo "setup.sh: failed to create temporary reference cache stamp" >&2
     return 1
   fi
-  if ! files_path="$(mktemp "${lock_path}.files.XXXXXX")"; then
-    rm -f "${temp_path}"
-    echo "setup.sh: failed to create temporary reference cache file list" >&2
-    return 1
-  fi
-  : > "${files_path}"
-  while IFS= read -r line || [[ -n "${line}" ]]; do
-    [[ -z "${line}" || "${line}" == \#* ]] && continue
-    read -r expected_hash expected_size relative_path extra <<< "${line}"
-    if [[ -n "${extra:-}" || -z "${expected_hash:-}" || -z "${expected_size:-}" || -z "${relative_path:-}" ]]; then
-      rm -f "${temp_path}" "${files_path}"
+  while IFS=$'\t' read -r relative_path expected_size actual_signature extra \
+      || [[ -n "${relative_path:-}" ]]; do
+    if [[ -n "${extra:-}" || -z "${relative_path:-}" \
+        || -z "${expected_size:-}" || -z "${actual_signature:-}" ]]; then
+      rm -f "${temp_path}"
+      discard_reference_verified_signatures
+      return 1
+    fi
+    if ! manifest_entry="$(reference_manifest_entry "${relative_path}")"; then
+      rm -f "${temp_path}"
+      discard_reference_verified_signatures
+      return 1
+    fi
+    read -r manifest_expected_hash manifest_expected_size <<< "${manifest_entry}"
+    if [[ -z "${manifest_expected_hash}" || "${expected_size}" != "${manifest_expected_size}" ]]; then
+      rm -f "${temp_path}"
+      discard_reference_verified_signatures
       return 1
     fi
     file_path="${reference_dir}/${relative_path}"
     [[ -f "${file_path}" ]] || {
-      rm -f "${temp_path}" "${files_path}"
+      rm -f "${temp_path}"
+      discard_reference_verified_signatures
       return 1
     }
     actual_size="$(wc -c < "${file_path}" | tr -d ' ')"
-    if ! actual_mtime="$(file_mtime_seconds "${file_path}")"; then
-      rm -f "${temp_path}" "${files_path}"
+    if [[ "${actual_size}" != "${expected_size}" ]]; then
+      rm -f "${temp_path}"
+      discard_reference_verified_signatures
       return 1
     fi
-    printf '%s\t%s\t%s\n' "${relative_path}" "${actual_size}" "${actual_mtime}" >> "${files_path}"
+    if [[ "$(file_metadata_signature "${file_path}" 2>/dev/null || true)" != "${actual_signature}" ]]; then
+      rm -f "${temp_path}"
+      discard_reference_verified_signatures
+      return 1
+    fi
     file_count=$((file_count + 1))
     byte_count=$((byte_count + actual_size))
-  done < "${REFERENCE_MANIFEST_PATH}"
+  done < "${files_path}"
 
-  if [[ "${file_count}" -eq 0 ]]; then
-    rm -f "${temp_path}" "${files_path}"
+  if [[ "${file_count}" -eq 0 \
+      || "${file_count}" != "${manifest_file_count}" \
+      || "${byte_count}" != "${manifest_byte_count}" ]]; then
+    rm -f "${temp_path}"
+    discard_reference_verified_signatures
+    return 1
+  fi
+
+  # GNU stat falls back to second-resolution timestamps. Cross a clock
+  # boundary, then prove the SHA-bound signatures are still unchanged before
+  # publishing. Darwin signatures additionally carry nanosecond timestamps.
+  while (( $(date +%s) <= capture_epoch )); do
+    sleep 0.1
+  done
+  while IFS=$'\t' read -r relative_path expected_size actual_signature extra \
+      || [[ -n "${relative_path:-}" ]]; do
+    if [[ -n "${extra:-}" || -z "${relative_path:-}" \
+        || -z "${expected_size:-}" || -z "${actual_signature:-}" ]]; then
+      rm -f "${temp_path}"
+      discard_reference_verified_signatures
+      return 1
+    fi
+    file_path="${reference_dir}/${relative_path}"
+    if [[ ! -f "${file_path}" \
+        || "$(wc -c < "${file_path}" | tr -d ' ')" != "${expected_size}" \
+        || "$(file_metadata_signature "${file_path}" 2>/dev/null || true)" != "${actual_signature}" ]]; then
+      rm -f "${temp_path}"
+      discard_reference_verified_signatures
+      return 1
+    fi
+  done < "${files_path}"
+
+  if [[ "$(reference_manifest_hash 2>/dev/null || true)" \
+      != "${REFERENCE_VERIFIED_MANIFEST_HASH}" ]]; then
+    rm -f "${temp_path}"
+    discard_reference_verified_signatures
+    echo "setup.sh: reference manifest changed before cache stamp publication" >&2
     return 1
   fi
 
   if ! {
-    printf 'version=1\n'
+    printf 'version=3\n'
     printf 'model_repo=%s\n' "${REFERENCE_MODEL_REPO}"
     printf 'revision=%s\n' "${REFERENCE_REVISION}"
     printf 'manifest_sha256=%s\n' "${manifest_hash}"
@@ -996,10 +1345,11 @@ write_reference_cache_lock() {
     printf '%s\n' '--files--'
     cat "${files_path}"
   } > "${temp_path}"; then
-    rm -f "${temp_path}" "${files_path}"
+    rm -f "${temp_path}"
+    discard_reference_verified_signatures
     return 1
   fi
-  rm -f "${files_path}"
+  discard_reference_verified_signatures
   if ! mv "${temp_path}" "${lock_path}"; then
     rm -f "${temp_path}"
     return 1
@@ -1028,6 +1378,7 @@ download_reference_file() {
   local output_path="$2"
   local label="${3:-${file}}"
   local marker_path="${output_path}.complete"
+  local partial_path="${output_path}.partial"
   local base_url
   local url
   local started_seconds
@@ -1036,6 +1387,10 @@ download_reference_file() {
   local source_index=0
   local source_count
   local base_urls=("${REFERENCE_BASE_URL}")
+  local verified_content_identity
+  local verified_expected_hash
+  local verified_expected_size
+  local verified_manifest_hash
 
   validate_reference_download_settings || return 1
   if [[ -n "${REFERENCE_FALLBACK_BASE_URL}" && "${REFERENCE_FALLBACK_BASE_URL}" != "${REFERENCE_BASE_URL}" ]]; then
@@ -1045,7 +1400,12 @@ download_reference_file() {
 
   if reference_file_is_current "${file}" "${output_path}" "${label}"; then
     echo "setup.sh: using cached ${label}"
-    touch "${marker_path}" || return 1
+    mark_reference_file_complete \
+      "${file}" "${output_path}" "${marker_path}" \
+      "${REFERENCE_VERIFIED_CONTENT_IDENTITY}" \
+      "${REFERENCE_VERIFIED_EXPECTED_HASH}" \
+      "${REFERENCE_VERIFIED_EXPECTED_SIZE}" \
+      "${REFERENCE_VERIFIED_FILE_MANIFEST_HASH}" || return 1
     return 0
   fi
   rm -f "${marker_path}" || return 1
@@ -1069,7 +1429,7 @@ download_reference_file() {
         echo "setup.sh: downloading ${label}"
       else
         echo "setup.sh: redownloading ${label} from scratch after hash verification failed"
-        rm -f "${output_path}" "${marker_path}" || return 1
+        rm -f "${partial_path}" "${marker_path}" || return 1
       fi
 
       curl_status=0
@@ -1084,7 +1444,7 @@ download_reference_file() {
           --speed-limit "${REFERENCE_DOWNLOAD_MIN_BYTES_PER_SECOND}" \
           --speed-time "${REFERENCE_DOWNLOAD_STALL_SECONDS}" \
           -H "${REFERENCE_AUTH_HEADER}" \
-          --output "${output_path}" \
+          --output "${partial_path}" \
           "${url}" || curl_status=$?
       else
         curl \
@@ -1096,16 +1456,26 @@ download_reference_file() {
           --continue-at - \
           --speed-limit "${REFERENCE_DOWNLOAD_MIN_BYTES_PER_SECOND}" \
           --speed-time "${REFERENCE_DOWNLOAD_STALL_SECONDS}" \
-          --output "${output_path}" \
+          --output "${partial_path}" \
           "${url}" || curl_status=$?
       fi
       if [[ "${curl_status}" != "0" ]]; then
         echo "setup.sh: ${label} source failed or stalled (status=${curl_status}, source=${base_url})" >&2
         break
       fi
-      touch "${marker_path}" || return 1
 
-      if reference_file_is_current "${file}" "${output_path}" "${label}"; then
+      if reference_file_is_current "${file}" "${partial_path}" "${label}"; then
+        verified_content_identity="${REFERENCE_VERIFIED_CONTENT_IDENTITY}"
+        verified_expected_hash="${REFERENCE_VERIFIED_EXPECTED_HASH}"
+        verified_expected_size="${REFERENCE_VERIFIED_EXPECTED_SIZE}"
+        verified_manifest_hash="${REFERENCE_VERIFIED_FILE_MANIFEST_HASH}"
+        mv "${partial_path}" "${output_path}" || return 1
+        mark_reference_file_complete \
+          "${file}" "${output_path}" "${marker_path}" \
+          "${verified_content_identity}" \
+          "${verified_expected_hash}" \
+          "${verified_expected_size}" \
+          "${verified_manifest_hash}" || return 1
         echo "setup.sh: downloaded ${label} elapsed=$(format_duration "$((SECONDS - started_seconds))")"
         return 0
       fi
@@ -1114,7 +1484,7 @@ download_reference_file() {
     done
 
     if [[ "${source_index}" -lt "${source_count}" && "${curl_status}" == "0" ]]; then
-      rm -f "${output_path}" "${marker_path}" || return 1
+      rm -f "${partial_path}" "${marker_path}" || return 1
     fi
   done
 
@@ -1130,7 +1500,7 @@ download_optional_reference_file() {
     return 0
   fi
 
-  rm -f "${output_path}" "${output_path}.complete"
+  rm -f "${output_path}" "${output_path}.partial" "${output_path}.complete"
   echo "setup.sh: optional metadata ${file} was not available; continuing"
 }
 
@@ -1241,12 +1611,25 @@ download_reference_shards() {
   local expected_total_bytes=0
   local expected_total_known=1
   local download_status=0
+  local download_manifest_snapshot
+  local download_manifest_hash
+  download_manifest_snapshot="$(mktemp "${TMPDIR:-/tmp}/mlxfast-download-manifest.XXXXXX")" || return 1
+  if ! cp "${REFERENCE_MANIFEST_PATH}" "${download_manifest_snapshot}"; then
+    rm -f "${download_manifest_snapshot}"
+    return 1
+  fi
+  download_manifest_hash="$(
+    shasum -a 256 "${download_manifest_snapshot}" | awk '{print $1}'
+  )" || {
+    rm -f "${download_manifest_snapshot}"
+    return 1
+  }
 
   # Pre-compute the aggregate expected byte count from the pinned manifest so
   # both the banner line and the progress heartbeat can report percentages.
   for file in "$@"; do
     expected_size=""
-    if manifest_entry="$(reference_manifest_entry "${file}")"; then
+    if manifest_entry="$(reference_manifest_entry "${file}" "${download_manifest_snapshot}")"; then
       read -r expected_hash expected_size <<< "${manifest_entry}"
     fi
     if [[ "${expected_size}" =~ ^[0-9]+$ ]]; then
@@ -1271,6 +1654,8 @@ download_reference_shards() {
   export REFERENCE_HASH_VERIFY
   export REFERENCE_DOWNLOAD_STALL_SECONDS
   export REFERENCE_DOWNLOAD_MIN_BYTES_PER_SECOND
+  export REFERENCE_MANIFEST_PATH
+  export REFERENCE_DOWNLOAD_MANIFEST_HASH="${download_manifest_hash}"
   start_reference_download_heartbeat "${output_dir}" "${expected_total_bytes}" "$@"
   # The embedded program expands these variables in each child Bash process.
   # shellcheck disable=SC2016
@@ -1278,7 +1663,7 @@ download_reference_shards() {
     ordinal=$((ordinal + 1))
     expected_hash=""
     expected_size=""
-    if manifest_entry="$(reference_manifest_entry "${file}")"; then
+    if manifest_entry="$(reference_manifest_entry "${file}" "${download_manifest_snapshot}")"; then
       read -r expected_hash expected_size <<< "${manifest_entry}"
     fi
     printf "%s|%s|%s|%s\0" "${ordinal}" "${file}" "${expected_hash}" "${expected_size}"
@@ -1295,6 +1680,7 @@ download_reference_shards() {
     expected_size="${remainder#*|}"
     output_path="${output_dir}/${file}"
     marker_path="${output_path}.complete"
+    partial_path="${output_path}.partial"
     started_seconds="${SECONDS}"
     source_index=0
     base_urls=("${REFERENCE_BASE_URL}")
@@ -1302,6 +1688,51 @@ download_reference_shards() {
       base_urls+=("${REFERENCE_FALLBACK_BASE_URL}")
     fi
     source_count="${#base_urls[@]}"
+    verified_content_identity=""
+
+    file_metadata_signature() {
+      stat -f "%d:%i:%z:%Fm:%Fc:%v" "$1" 2>/dev/null \
+        || stat -c "%d:%i:%s:%Y:%Z:0" "$1"
+    }
+
+    file_content_identity_signature() {
+      stat -f "%d:%i:%z:%Fm:%v" "$1" 2>/dev/null \
+        || stat -c "%d:%i:%s:%Y:0" "$1"
+    }
+
+    mark_complete() {
+      local candidate_path="$1"
+      local expected_content_identity="$2"
+      local current_content_identity
+      local current_signature
+      local marker_temp
+      case "${REFERENCE_HASH_VERIFY:-1}" in
+        0|false|FALSE|no|NO)
+          touch "${marker_path}"
+          return
+          ;;
+      esac
+      if [[ "$(shasum -a 256 "${REFERENCE_MANIFEST_PATH}" | awk "{print \$1}")" \
+          != "${REFERENCE_DOWNLOAD_MANIFEST_HASH}" ]]; then
+        echo "setup.sh: reference manifest changed before ${file} marker publication" >&2
+        return 1
+      fi
+      current_content_identity="$(file_content_identity_signature "${candidate_path}")"
+      if [[ -z "${expected_content_identity}" \
+          || "${current_content_identity}" != "${expected_content_identity}" ]]; then
+        echo "setup.sh: ${file} changed before its verification marker was written" >&2
+        return 1
+      fi
+      current_signature="$(file_metadata_signature "${candidate_path}")"
+      marker_temp="$(mktemp "${marker_path}.tmp.XXXXXX")"
+      if ! printf "version=2\t%s\t%s\t%s\t%s\n" \
+          "${REFERENCE_DOWNLOAD_MANIFEST_HASH}" "${expected_hash}" \
+          "${expected_size}" "${current_signature}" > "${marker_temp}" \
+          || ! mv "${marker_temp}" "${marker_path}"; then
+        rm -f "${marker_temp}"
+        return 1
+      fi
+    }
 
     download_url_for_file() {
       local url="$1"
@@ -1356,7 +1787,7 @@ download_reference_shards() {
         --speed-time "${REFERENCE_DOWNLOAD_STALL_SECONDS}"
         --silent
         --show-error
-        --output "${output_path}"
+        --output "${partial_path}"
       )
 
       if [[ "${source_label}" == "primary" && -n "${REFERENCE_AUTH_HEADER:-}" ]]; then
@@ -1367,13 +1798,21 @@ download_reference_shards() {
     }
 
     reference_file_is_current() {
+      local candidate_path="$1"
       local actual_size
       local actual_hash
+      local before_signature
+      local after_signature
+      local before_content_identity
+      local after_content_identity
+
+      verified_content_identity=""
 
       case "${REFERENCE_HASH_VERIFY:-1}" in
         0|false|FALSE|no|NO)
-          [[ -s "${output_path}" ]]
-          return $?
+          [[ -s "${candidate_path}" ]] || return 1
+          verified_content_identity="$(file_content_identity_signature "${candidate_path}")"
+          return 0
           ;;
         1|true|TRUE|yes|YES)
           ;;
@@ -1387,29 +1826,44 @@ download_reference_shards() {
         echo "setup.sh: reference manifest has no entry for ${file}" >&2
         return 1
       fi
-      if [[ ! -f "${output_path}" ]]; then
+      if [[ ! -f "${candidate_path}" ]]; then
         return 1
       fi
 
-      actual_size="$(wc -c < "${output_path}" | tr -d " ")"
+      actual_size="$(wc -c < "${candidate_path}" | tr -d " ")"
       if [[ "${actual_size}" != "${expected_size}" ]]; then
         echo "setup.sh: cached shard ${ordinal}/${total}: ${file} size mismatch: expected ${expected_size}, got ${actual_size}"
         return 1
       fi
-      actual_hash="$(shasum -a 256 "${output_path}" | awk "{print \$1}")"
+      before_signature="$(file_metadata_signature "${candidate_path}")"
+      before_content_identity="$(file_content_identity_signature "${candidate_path}")"
+      actual_hash="$(shasum -a 256 "${candidate_path}" | awk "{print \$1}")"
+      after_signature="$(file_metadata_signature "${candidate_path}")"
+      after_content_identity="$(file_content_identity_signature "${candidate_path}")"
+      if [[ "${before_signature}" != "${after_signature}" \
+          || "${before_content_identity}" != "${after_content_identity}" ]]; then
+        echo "setup.sh: cached shard ${ordinal}/${total}: ${file} changed while SHA256 was being verified" >&2
+        return 1
+      fi
       if [[ "${actual_hash}" != "${expected_hash}" ]]; then
         echo "setup.sh: cached shard ${ordinal}/${total}: ${file} sha256 mismatch"
         echo "setup.sh: expected ${expected_hash}"
         echo "setup.sh: actual   ${actual_hash}"
         return 1
       fi
+      if [[ "$(shasum -a 256 "${REFERENCE_MANIFEST_PATH}" | awk "{print \$1}")" \
+          != "${REFERENCE_DOWNLOAD_MANIFEST_HASH}" ]]; then
+        echo "setup.sh: reference manifest changed while shard ${ordinal}/${total}: ${file} was verified" >&2
+        return 1
+      fi
 
+      verified_content_identity="${after_content_identity}"
       return 0
     }
 
-    if reference_file_is_current; then
+    if reference_file_is_current "${output_path}"; then
       echo "setup.sh: using cached shard ${ordinal}/${total}: ${file}"
-      touch "${marker_path}"
+      mark_complete "${output_path}" "${verified_content_identity}"
       exit 0
     fi
     rm -f "${marker_path}"
@@ -1431,7 +1885,7 @@ download_reference_shards() {
           echo "setup.sh: downloading shard ${ordinal}/${total}: ${file} source=${source_label}"
         else
           echo "setup.sh: redownloading shard ${ordinal}/${total}: ${file} from scratch after hash verification failed"
-          rm -f "${output_path}" "${marker_path}"
+          rm -f "${partial_path}" "${marker_path}"
         fi
 
         curl_status=0
@@ -1439,15 +1893,17 @@ download_reference_shards() {
         if [[ "${curl_status}" != "0" ]]; then
           echo "setup.sh: shard ${ordinal}/${total} source failed or stalled (status=${curl_status}, source=${base_url})" >&2
           if [[ "${source_label}" == "fallback" && "${attempt}" == "1" ]]; then
-            rm -f "${output_path}" "${marker_path}"
+            rm -f "${partial_path}" "${marker_path}"
             attempt=$((attempt + 1))
             continue
           fi
           break
         fi
-        touch "${marker_path}"
 
-        if reference_file_is_current; then
+        if reference_file_is_current "${partial_path}"; then
+          verified_partial_identity="${verified_content_identity}"
+          mv "${partial_path}" "${output_path}"
+          mark_complete "${output_path}" "${verified_partial_identity}"
           echo "setup.sh: downloaded shard ${ordinal}/${total}: ${file} elapsed=$((SECONDS - started_seconds))s source=${source_label}"
           exit 0
         fi
@@ -1456,7 +1912,7 @@ download_reference_shards() {
       done
 
       if [[ "${source_index}" -lt "${source_count}" && "${curl_status}" == "0" ]]; then
-        rm -f "${output_path}" "${marker_path}"
+        rm -f "${partial_path}" "${marker_path}"
       fi
     done
 
@@ -1465,8 +1921,15 @@ download_reference_shards() {
   ' _ {} "${output_dir}" "${total}" || download_status=$?
   stop_reference_download_heartbeat
   if [[ "${download_status}" != "0" ]]; then
+    rm -f "${download_manifest_snapshot}"
     return "${download_status}"
   fi
+  if [[ "$(reference_manifest_hash 2>/dev/null || true)" != "${download_manifest_hash}" ]]; then
+    rm -f "${download_manifest_snapshot}"
+    echo "setup.sh: reference manifest changed during parallel shard verification" >&2
+    return 1
+  fi
+  rm -f "${download_manifest_snapshot}"
   echo "setup.sh: downloaded ${total}/${total} safetensors shard(s) elapsed=$(format_duration "$((SECONDS - started_seconds))")"
 }
 
@@ -1528,8 +1991,12 @@ verify_reference_weights() {
     rm -f "${REFERENCE_CACHE_LOCK_PATH}"
     return 1
   fi
-  if ! write_reference_cache_lock "${reference_dir}"; then
-    return 1
+  if [[ -n "${REFERENCE_VERIFIED_SIGNATURES_PATH}" ]]; then
+    if ! write_reference_cache_lock "${reference_dir}"; then
+      return 1
+    fi
+  else
+    rm -f "${REFERENCE_CACHE_LOCK_PATH}"
   fi
   echo "setup.sh: verified reference checkpoint at ${reference_dir} (${#shard_files[@]} safetensors shard(s))"
 }
@@ -1604,11 +2071,34 @@ verify_reference_manifest_sizes() {
   local relative_path
   local extra
   local file_path
+  local marker_path
+  local marker_line
+  local marker_version
+  local marker_manifest_hash
+  local marker_hash
+  local marker_size
+  local marker_signature
+  local marker_extra
   local actual_size
+  local actual_signature
+  local verified_manifest_hash
   local checked=0
+
+  discard_reference_verified_signatures
 
   if [[ ! -f "${REFERENCE_MANIFEST_PATH}" ]]; then
     echo "setup.sh: reference manifest missing at ${REFERENCE_MANIFEST_PATH}" >&2
+    return 1
+  fi
+  if ! create_reference_verified_manifest_snapshot; then
+    echo "setup.sh: failed to snapshot reference manifest" >&2
+    discard_reference_verified_signatures
+    return 1
+  fi
+  verified_manifest_hash="${REFERENCE_VERIFIED_MANIFEST_HASH}"
+  if ! create_reference_verified_signatures_path; then
+    echo "setup.sh: failed to create verified download signature record" >&2
+    discard_reference_verified_signatures
     return 1
   fi
 
@@ -1617,19 +2107,23 @@ verify_reference_manifest_sizes() {
     read -r expected_hash expected_size relative_path extra <<< "${line}"
     if [[ -n "${extra:-}" || -z "${expected_hash:-}" || -z "${expected_size:-}" || -z "${relative_path:-}" ]]; then
       echo "setup.sh: malformed reference manifest line: ${line}" >&2
+      discard_reference_verified_signatures
       return 1
     fi
     if [[ ! "${expected_hash}" =~ ^[0-9a-f]{64}$ || ! "${expected_size}" =~ ^[0-9]+$ ]]; then
       echo "setup.sh: malformed reference manifest line: ${line}" >&2
+      discard_reference_verified_signatures
       return 1
     fi
     if [[ "${relative_path}" == /* || "${relative_path}" == *\\* ]]; then
       echo "setup.sh: unsafe reference manifest path: ${relative_path}" >&2
+      discard_reference_verified_signatures
       return 1
     fi
     case "/${relative_path}/" in
       *"/../"*|*"/./"*)
         echo "setup.sh: unsafe reference manifest path: ${relative_path}" >&2
+        discard_reference_verified_signatures
         return 1
         ;;
     esac
@@ -1637,21 +2131,62 @@ verify_reference_manifest_sizes() {
     file_path="${reference_dir}/${relative_path}"
     if [[ ! -f "${file_path}" ]]; then
       echo "setup.sh: reference checkpoint is missing manifest file ${relative_path}" >&2
+      discard_reference_verified_signatures
       return 1
     fi
     actual_size="$(wc -c < "${file_path}" | tr -d ' ')"
     if [[ "${actual_size}" != "${expected_size}" ]]; then
       echo "setup.sh: reference file ${relative_path} size mismatch: expected ${expected_size}, got ${actual_size}" >&2
+      discard_reference_verified_signatures
       return 1
     fi
+    marker_path="${file_path}.complete"
+    if [[ ! -f "${marker_path}" ]]; then
+      echo "setup.sh: verified download marker missing for ${relative_path}" >&2
+      discard_reference_verified_signatures
+      return 1
+    fi
+    IFS= read -r marker_line < "${marker_path}" || {
+      discard_reference_verified_signatures
+      return 1
+    }
+    IFS=$'\t' read -r marker_version marker_manifest_hash marker_hash marker_size marker_signature marker_extra \
+      <<< "${marker_line}"
+    if [[ "${marker_version}" != "version=2" \
+        || "${marker_manifest_hash}" != "${verified_manifest_hash}" \
+        || "${marker_hash}" != "${expected_hash}" \
+        || "${marker_size}" != "${expected_size}" \
+        || -z "${marker_signature}" || -n "${marker_extra:-}" ]]; then
+      echo "setup.sh: invalid verified download marker for ${relative_path}" >&2
+      discard_reference_verified_signatures
+      return 1
+    fi
+    actual_signature="$(file_metadata_signature "${file_path}")" || {
+      discard_reference_verified_signatures
+      return 1
+    }
+    if [[ "${actual_signature}" != "${marker_signature}" ]]; then
+      echo "setup.sh: reference file ${relative_path} changed after download verification" >&2
+      discard_reference_verified_signatures
+      return 1
+    fi
+    printf '%s\t%s\t%s\n' \
+      "${relative_path}" "${expected_size}" "${marker_signature}" \
+      >> "${REFERENCE_VERIFIED_SIGNATURES_PATH}"
     checked=$((checked + 1))
-  done < "${REFERENCE_MANIFEST_PATH}"
+  done < "${REFERENCE_VERIFIED_MANIFEST_PATH}"
 
   if [[ "${checked}" -eq 0 ]]; then
     echo "setup.sh: reference manifest contained no files: ${REFERENCE_MANIFEST_PATH}" >&2
+    discard_reference_verified_signatures
     return 1
   fi
-  echo "setup.sh: verified ${checked} reference file size(s)"
+  if [[ "$(reference_manifest_hash 2>/dev/null || true)" != "${verified_manifest_hash}" ]]; then
+    echo "setup.sh: reference manifest changed while download markers were aggregated" >&2
+    discard_reference_verified_signatures
+    return 1
+  fi
+  echo "setup.sh: verified ${checked} downloaded reference file signature(s)"
 }
 
 setup_parallel_metallib_enabled() {
@@ -1669,34 +2204,200 @@ setup_parallel_metallib_enabled() {
   esac
 }
 
+reference_cache_lock_generation_path() {
+  local lock_dir="${REFERENCE_CACHE_MUTATION_LOCK_DIR}"
+  local raw_target
+  local candidate
+  local canonical_lock_parent
+  local canonical_candidate
+  local expected_prefix
+  local lock_uid
+
+  [[ -L "${lock_dir}" ]] || return 1
+  raw_target="$(readlink "${lock_dir}")" || return 1
+  [[ "${raw_target}" == /* ]] || return 1
+  candidate="${raw_target}"
+  canonical_lock_parent="$(cd -P "$(dirname "${lock_dir}")" && pwd -P)" || return 1
+  [[ -d "$(dirname "${candidate}")" ]] || return 1
+  canonical_candidate="$(cd -P "$(dirname "${candidate}")" && pwd -P)/$(basename "${candidate}")"
+  expected_prefix="$(basename "${lock_dir}").generation."
+  [[ "$(dirname "${canonical_candidate}")" == "${canonical_lock_parent}" ]] || return 1
+  [[ "$(basename "${canonical_candidate}")" == "${expected_prefix}"* ]] || return 1
+  lock_uid="$(stat -f '%u' "${lock_dir}" 2>/dev/null || stat -c '%u' "${lock_dir}")" \
+    || return 1
+  [[ "${lock_uid}" == "$(id -u)" ]] || return 1
+  if [[ -e "${canonical_candidate}" || -L "${canonical_candidate}" ]]; then
+    [[ -d "${canonical_candidate}" && ! -L "${canonical_candidate}" \
+        && -O "${canonical_candidate}" ]] || return 1
+  fi
+  printf '%s\n' "${canonical_candidate}"
+}
+
+remove_reference_cache_lock_generation() {
+  local generation_dir="$1"
+  local published_target=""
+
+  if [[ -L "${REFERENCE_CACHE_MUTATION_LOCK_DIR}" ]]; then
+    published_target="$(readlink "${REFERENCE_CACHE_MUTATION_LOCK_DIR}" 2>/dev/null || true)"
+  fi
+  if [[ -n "${generation_dir}" && "${published_target}" == "${generation_dir}" ]]; then
+    rm -f "${REFERENCE_CACHE_MUTATION_LOCK_DIR}" || return 1
+  fi
+  if [[ -n "${generation_dir}" ]]; then
+    rm -rf "${generation_dir}" || return 1
+  fi
+}
+
+reclaim_orphaned_reference_cache_lock_generations() {
+  local lock_dir="${REFERENCE_CACHE_MUTATION_LOCK_DIR}"
+  local lock_parent
+  local lock_name
+  local local_host_hash
+  local initializing_prefix
+  local initializing_dir
+  local initializing_name
+  local initializing_remainder
+  local initializing_pid
+  local published_target=""
+  local generation_dir
+  local canonical_generation
+  local owner_path
+  local owner_line
+  local owner_pid
+  local owner_host
+  local owner_token
+  local field
+  local claim_dir
+
+  lock_parent="$(cd -P "$(dirname "${lock_dir}")" && pwd -P)" || return 1
+  lock_name="$(basename "${lock_dir}")"
+  local_host_hash="$(printf '%s' "$(hostname)" | shasum -a 256 | awk '{print substr($1, 1, 16)}')" \
+    || return 1
+  initializing_prefix="${lock_name}.initializing.${local_host_hash}."
+  if [[ -L "${lock_dir}" ]]; then
+    published_target="$(readlink "${lock_dir}" 2>/dev/null || true)"
+  fi
+
+  # Initializing directories encode their creator's host and PID before they
+  # exist. A scan can therefore reclaim an empty SIGKILL orphan without ever
+  # touching a live creator paused before its owner file is moved into place.
+  while IFS= read -r -d '' initializing_dir; do
+    [[ ! -L "${initializing_dir}" && -d "${initializing_dir}" \
+        && -O "${initializing_dir}" ]] || continue
+    initializing_name="$(basename "${initializing_dir}")"
+    initializing_remainder="${initializing_name#"${initializing_prefix}"}"
+    initializing_pid="${initializing_remainder%%.*}"
+    [[ "${initializing_pid}" =~ ^[1-9][0-9]*$ ]] || continue
+    kill -0 "${initializing_pid}" >/dev/null 2>&1 && continue
+    [[ "$(cd -P "${initializing_dir}" && pwd -P)" == "${lock_parent}/${initializing_name}" ]] \
+      || continue
+    rm -rf "${initializing_dir}" || return 1
+  done < <(find "${lock_parent}" -mindepth 1 -maxdepth 1 -type d \
+    -name "${initializing_prefix}*" -print0)
+
+  while IFS= read -r -d '' generation_dir; do
+    [[ ! -L "${generation_dir}" && -d "${generation_dir}" && -O "${generation_dir}" ]] \
+      || continue
+    canonical_generation="$(cd -P "${generation_dir}" && pwd -P)" || continue
+    [[ "$(dirname "${canonical_generation}")" == "${lock_parent}" ]] || continue
+    [[ "${canonical_generation}" != "${published_target}" ]] || continue
+
+    owner_path="${canonical_generation}/owner"
+    [[ -f "${owner_path}" && ! -L "${owner_path}" ]] || continue
+    owner_line="$(cat "${owner_path}" 2>/dev/null || true)"
+    owner_pid=""
+    owner_host=""
+    owner_token=""
+    for field in ${owner_line}; do
+      case "${field}" in
+        pid=*) owner_pid="${field#pid=}" ;;
+        host=*) owner_host="${field#host=}" ;;
+        token=*) owner_token="${field#token=}" ;;
+      esac
+    done
+    [[ -n "${owner_token}" && "${owner_pid}" =~ ^[1-9][0-9]*$ \
+        && "${owner_host}" == "$(hostname)" ]] || continue
+    kill -0 "${owner_pid}" >/dev/null 2>&1 && continue
+
+    claim_dir="${canonical_generation}/.orphan-cleanup-claim"
+    mkdir "${claim_dir}" 2>/dev/null || continue
+    if [[ -L "${lock_dir}" ]]; then
+      published_target="$(readlink "${lock_dir}" 2>/dev/null || true)"
+    else
+      published_target=""
+    fi
+    if [[ "${canonical_generation}" == "${published_target}" \
+        || "$(cat "${owner_path}" 2>/dev/null || true)" != "${owner_line}" ]]; then
+      rmdir "${claim_dir}" 2>/dev/null || true
+      continue
+    fi
+    rm -rf "${canonical_generation}" || return 1
+  done < <(find "${lock_parent}" -mindepth 1 -maxdepth 1 -type d \
+    -name "${lock_name}.generation.*" -print0)
+}
+
 recover_stale_reference_cache_mutation_lock() {
   local lock_dir="${REFERENCE_CACHE_MUTATION_LOCK_DIR}"
   local owner_path="${lock_dir}/owner"
   local owner_line=""
   local owner_pid=""
   local owner_host=""
+  local owner_token=""
+  local observed_identity
+  local claimed_identity
+  local claim_dir
+  local quarantine_dir
   local field
   local stale=0
+  local owner_is_well_formed=0
+  local owner_existed=0
+  local metadata_path="${lock_dir}"
+  local generation_dir=""
+  local generation_missing=0
+
+  observed_identity="$(directory_identity "${lock_dir}" 2>/dev/null)" || return 1
+  if [[ -L "${lock_dir}" ]]; then
+    generation_dir="$(reference_cache_lock_generation_path)" || return 1
+    if [[ ! -e "${generation_dir}" && ! -L "${generation_dir}" ]]; then
+      generation_missing=1
+    fi
+  fi
+  if [[ "${generation_missing}" == "1" ]]; then
+    claim_dir="${lock_dir}.recovery-claim"
+  else
+    claim_dir="${lock_dir}/.recovery-claim"
+  fi
 
   if [[ -f "${owner_path}" ]]; then
+    owner_existed=1
     owner_line="$(cat "${owner_path}" 2>/dev/null || true)"
     for field in ${owner_line}; do
       case "${field}" in
         pid=*) owner_pid="${field#pid=}" ;;
         host=*) owner_host="${field#host=}" ;;
+        token=*) owner_token="${field#token=}" ;;
       esac
     done
-    if [[ "${owner_host}" == "$(hostname)" \
-        && "${owner_pid}" =~ ^[1-9][0-9]*$ ]] \
-        && ! kill -0 "${owner_pid}" >/dev/null 2>&1; then
-      stale=1
+    if [[ -n "${owner_token}" && -n "${owner_host}" \
+        && "${owner_pid}" =~ ^[1-9][0-9]*$ ]]; then
+      owner_is_well_formed=1
+      if [[ "${owner_host}" == "$(hostname)" ]] \
+          && ! kill -0 "${owner_pid}" >/dev/null 2>&1; then
+        stale=1
+      fi
+    else
+      metadata_path="${owner_path}"
     fi
-  else
-    local lock_mtime
+  fi
+
+  if [[ "${generation_missing}" == "1" ]]; then
+    stale=1
+  elif [[ "${stale}" != "1" && "${owner_is_well_formed}" != "1" ]]; then
+    local metadata_mtime
     local now
-    if lock_mtime="$(file_mtime_seconds "${lock_dir}" 2>/dev/null)"; then
+    if metadata_mtime="$(file_mtime_seconds "${metadata_path}" 2>/dev/null)"; then
       now="$(date +%s)"
-      if (( now - lock_mtime >= REFERENCE_CACHE_MUTATION_LOCK_STALE_SECONDS )); then
+      if (( now - metadata_mtime >= REFERENCE_CACHE_MUTATION_LOCK_STALE_SECONDS )); then
         stale=1
       fi
     fi
@@ -1705,18 +2406,58 @@ recover_stale_reference_cache_mutation_lock() {
   if [[ "${stale}" != "1" ]]; then
     return 1
   fi
-  rm -f "${owner_path}" || return 1
-  if rmdir "${lock_dir}" 2>/dev/null; then
-    echo "setup.sh: recovered stale reference cache mutation lock ${lock_dir}"
-    return 0
+  # Pin this exact directory instance before deleting anything. If another
+  # waiter already replaced the stale directory, the inode comparison fails;
+  # once the claim exists, the directory cannot be removed out from under us.
+  if ! mkdir "${claim_dir}" 2>/dev/null; then
+    return 1
   fi
-  return 1
+  claimed_identity="$(directory_identity "${lock_dir}" 2>/dev/null || true)"
+  if [[ "${claimed_identity}" != "${observed_identity}" ]]; then
+    rmdir "${claim_dir}" 2>/dev/null || true
+    return 1
+  fi
+  if [[ "${owner_existed}" == "1" ]]; then
+    if [[ "$(cat "${owner_path}" 2>/dev/null || true)" != "${owner_line}" ]]; then
+      rmdir "${claim_dir}" 2>/dev/null || true
+      return 1
+    fi
+  elif [[ -e "${owner_path}" ]]; then
+    rmdir "${claim_dir}" 2>/dev/null || true
+    return 1
+  fi
+
+  quarantine_dir="${lock_dir}.stale-$$-${RANDOM}"
+  if ! mv "${lock_dir}" "${quarantine_dir}"; then
+    rmdir "${claim_dir}" 2>/dev/null || true
+    return 1
+  fi
+  if [[ "${generation_missing}" == "1" ]]; then
+    rmdir "${claim_dir}" 2>/dev/null || true
+  fi
+  if [[ -n "${generation_dir}" ]]; then
+    rm -f "${quarantine_dir}" || return 1
+    rm -rf "${generation_dir}" || return 1
+  else
+    rm -rf "${quarantine_dir}" || return 1
+  fi
+  echo "setup.sh: recovered stale reference cache mutation lock ${lock_dir}"
+  return 0
 }
 
 acquire_reference_cache_mutation_lock() {
   local lock_dir="${REFERENCE_CACHE_MUTATION_LOCK_DIR}"
   local started_seconds="${SECONDS}"
   local announced_wait=0
+  local owner_temp
+  local owner_pid
+  local token
+  local generation_dir
+  local generation_dir_raw
+  local initializing_dir
+  local initializing_dir_raw
+  local local_host_hash
+  local nested_publication
 
   if ! [[ "${REFERENCE_CACHE_MUTATION_LOCK_TIMEOUT_SECONDS}" =~ ^(0|[1-9][0-9]*)$ ]]; then
     echo "setup.sh: MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_TIMEOUT_SECONDS must be a non-negative integer" >&2
@@ -1727,10 +2468,89 @@ acquire_reference_cache_mutation_lock() {
     return 1
   fi
   mkdir -p "$(dirname "${lock_dir}")" || return 1
+  reclaim_orphaned_reference_cache_lock_generations || return 1
+  if ! current_shell_pid; then
+    return 1
+  fi
+  owner_pid="${CURRENT_SHELL_PID}"
+  token="${owner_pid}-$(date +%s)-${RANDOM}-${RANDOM}"
+  local_host_hash="$(printf '%s' "$(hostname)" | shasum -a 256 | awk '{print substr($1, 1, 16)}')" \
+    || return 1
 
-  while ! mkdir "${lock_dir}" 2>/dev/null; do
-    if [[ ! -d "${lock_dir}" ]]; then
-      echo "setup.sh: reference cache mutation lock path exists and is not a directory: ${lock_dir}" >&2
+  while true; do
+    owner_temp="$(mktemp "${lock_dir}.owner.XXXXXX")" || {
+      echo "setup.sh: failed to create reference cache mutation owner record" >&2
+      return 1
+    }
+    REFERENCE_CACHE_MUTATION_OWNER_TEMP="${owner_temp}"
+    if ! printf 'token=%s pid=%s host=%s started_at=%s\n' \
+        "${token}" "${owner_pid}" "$(hostname)" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "${owner_temp}"; then
+      rm -f "${owner_temp}"
+      REFERENCE_CACHE_MUTATION_OWNER_TEMP=""
+      echo "setup.sh: failed to initialize reference cache mutation lock owner" >&2
+      return 1
+    fi
+    initializing_dir_raw="$(mktemp -d \
+      "${lock_dir}.initializing.${local_host_hash}.${owner_pid}.XXXXXX")" || {
+      rm -f "${owner_temp}"
+      REFERENCE_CACHE_MUTATION_OWNER_TEMP=""
+      echo "setup.sh: failed to create reference cache mutation lock generation" >&2
+      return 1
+    }
+    initializing_dir="$(cd -P "${initializing_dir_raw}" && pwd -P)" || {
+      rm -f "${owner_temp}"
+      rm -rf "${initializing_dir_raw}"
+      REFERENCE_CACHE_MUTATION_OWNER_TEMP=""
+      return 1
+    }
+    REFERENCE_CACHE_MUTATION_LOCK_INITIALIZING_DIR="${initializing_dir}"
+    if ! mv "${owner_temp}" "${initializing_dir}/owner"; then
+      rm -f "${owner_temp}"
+      rm -rf "${initializing_dir}"
+      REFERENCE_CACHE_MUTATION_OWNER_TEMP=""
+      REFERENCE_CACHE_MUTATION_LOCK_INITIALIZING_DIR=""
+      return 1
+    fi
+    REFERENCE_CACHE_MUTATION_OWNER_TEMP=""
+    generation_dir_raw="${lock_dir}.generation.${token}-${RANDOM}"
+    if [[ -e "${generation_dir_raw}" || -L "${generation_dir_raw}" ]] \
+        || ! mv "${initializing_dir}" "${generation_dir_raw}"; then
+      rm -rf "${initializing_dir}"
+      REFERENCE_CACHE_MUTATION_LOCK_INITIALIZING_DIR=""
+      echo "setup.sh: failed to publish initialized reference cache lock generation" >&2
+      return 1
+    fi
+    REFERENCE_CACHE_MUTATION_LOCK_INITIALIZING_DIR=""
+    REFERENCE_CACHE_MUTATION_LOCK_GENERATION_DIR="${generation_dir_raw}"
+    generation_dir="$(cd -P "${generation_dir_raw}" && pwd -P)" || return 1
+    REFERENCE_CACHE_MUTATION_LOCK_GENERATION_DIR="${generation_dir}"
+
+    # The public lock appears in one symlink(2) operation only after its unique
+    # generation already contains a complete owner record. A stalled creator
+    # therefore has no ownerless public directory that recovery can replace.
+    if [[ ! -e "${lock_dir}" && ! -L "${lock_dir}" ]] \
+        && ln -s -h -- "${generation_dir}" "${lock_dir}" 2>/dev/null; then
+      if [[ -L "${lock_dir}" \
+          && "$(readlink "${lock_dir}" 2>/dev/null || true)" == "${generation_dir}" ]]; then
+        REFERENCE_CACHE_MUTATION_LOCK_TOKEN="${token}"
+        REFERENCE_CACHE_MUTATION_LOCK_HELD=1
+        echo "setup.sh: acquired reference cache mutation lock ${lock_dir}"
+        return 0
+      fi
+      # A legacy creator can race the precheck by mkdir'ing the fixed path.
+      # BSD ln then places our symlink inside that directory; remove only that
+      # exact self-target and continue through legacy stale-lock recovery.
+      nested_publication="${lock_dir}/$(basename "${generation_dir}")"
+      if [[ -L "${nested_publication}" \
+          && "$(readlink "${nested_publication}" 2>/dev/null || true)" == "${generation_dir}" ]]; then
+        rm -f "${nested_publication}" || return 1
+      fi
+    fi
+
+    rm -rf "${generation_dir}" || return 1
+    REFERENCE_CACHE_MUTATION_LOCK_GENERATION_DIR=""
+    if [[ ! -d "${lock_dir}" && ! -L "${lock_dir}" ]]; then
+      echo "setup.sh: reference cache mutation lock path exists and is not a lock directory: ${lock_dir}" >&2
       return 1
     fi
     if recover_stale_reference_cache_mutation_lock; then
@@ -1749,40 +2569,96 @@ acquire_reference_cache_mutation_lock() {
     fi
     sleep 1
   done
-
-  REFERENCE_CACHE_MUTATION_LOCK_HELD=1
-  if ! printf 'pid=%s host=%s started_at=%s\n' \
-      "$$" "$(hostname)" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "${lock_dir}/owner"; then
-    rm -f "${lock_dir}/owner"
-    rmdir "${lock_dir}" 2>/dev/null || true
-    REFERENCE_CACHE_MUTATION_LOCK_HELD=0
-    echo "setup.sh: failed to record reference cache mutation lock owner" >&2
-    return 1
-  fi
-  echo "setup.sh: acquired reference cache mutation lock ${lock_dir}"
 }
 
 release_reference_cache_mutation_lock() {
   local lock_dir="${REFERENCE_CACHE_MUTATION_LOCK_DIR}"
+  local owner_path="${lock_dir}/owner"
+  local owner_line
+  local owner_token=""
+  local published_target=""
+  local field
   if [[ "${REFERENCE_CACHE_MUTATION_LOCK_HELD}" != "1" ]]; then
     return 0
   fi
 
-  rm -f "${lock_dir}/owner"
-  if ! rmdir "${lock_dir}"; then
-    echo "setup.sh: failed to release reference cache mutation lock ${lock_dir}" >&2
+  owner_line="$(cat "${owner_path}" 2>/dev/null || true)"
+  for field in ${owner_line}; do
+    case "${field}" in
+      token=*) owner_token="${field#token=}" ;;
+    esac
+  done
+  if [[ -z "${REFERENCE_CACHE_MUTATION_LOCK_TOKEN}" \
+      || "${owner_token}" != "${REFERENCE_CACHE_MUTATION_LOCK_TOKEN}" ]]; then
+    echo "setup.sh: refusing to release reference cache mutation lock owned by another process: ${lock_dir}" >&2
     return 1
   fi
-  REFERENCE_CACHE_MUTATION_LOCK_HELD=0
+
+  if [[ -L "${lock_dir}" ]]; then
+    published_target="$(readlink "${lock_dir}" 2>/dev/null || true)"
+    if [[ -z "${REFERENCE_CACHE_MUTATION_LOCK_GENERATION_DIR}" \
+        || "${published_target}" != "${REFERENCE_CACHE_MUTATION_LOCK_GENERATION_DIR}" ]]; then
+      echo "setup.sh: refusing to release a replaced reference cache mutation lock: ${lock_dir}" >&2
+      return 1
+    fi
+    rm -f "${lock_dir}" || return 1
+    REFERENCE_CACHE_MUTATION_LOCK_HELD=0
+    REFERENCE_CACHE_MUTATION_LOCK_TOKEN=""
+    if ! rm -rf "${REFERENCE_CACHE_MUTATION_LOCK_GENERATION_DIR}"; then
+      echo "setup.sh: failed to remove released reference cache lock generation" >&2
+      return 1
+    fi
+    REFERENCE_CACHE_MUTATION_LOCK_GENERATION_DIR=""
+  else
+    rm -f "${owner_path}" || return 1
+    if ! rmdir "${lock_dir}"; then
+      echo "setup.sh: failed to release reference cache mutation lock ${lock_dir}" >&2
+      return 1
+    fi
+    REFERENCE_CACHE_MUTATION_LOCK_HELD=0
+    REFERENCE_CACHE_MUTATION_LOCK_TOKEN=""
+  fi
   echo "setup.sh: released reference cache mutation lock ${lock_dir}"
+}
+
+terminate_metallib_process_group() {
+  local process_group="$1"
+  local attempt
+  kill -TERM -- "-${process_group}" >/dev/null 2>&1 || return 0
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if ! kill -0 -- "-${process_group}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  kill -KILL -- "-${process_group}" >/dev/null 2>&1 || true
 }
 
 cleanup_background_builds() {
   local status="$?"
   stop_reference_download_heartbeat
+  discard_reference_verified_signatures
+  if [[ -n "${REFERENCE_CACHE_MUTATION_OWNER_TEMP}" ]]; then
+    rm -f "${REFERENCE_CACHE_MUTATION_OWNER_TEMP}" || true
+    REFERENCE_CACHE_MUTATION_OWNER_TEMP=""
+  fi
+  if [[ -n "${REFERENCE_CACHE_MUTATION_LOCK_INITIALIZING_DIR}" ]]; then
+    rm -rf "${REFERENCE_CACHE_MUTATION_LOCK_INITIALIZING_DIR}" || true
+    REFERENCE_CACHE_MUTATION_LOCK_INITIALIZING_DIR=""
+  fi
+  if [[ "${REFERENCE_CACHE_MUTATION_LOCK_HELD}" != "1" \
+      && -n "${REFERENCE_CACHE_MUTATION_LOCK_GENERATION_DIR}" ]]; then
+    remove_reference_cache_lock_generation \
+      "${REFERENCE_CACHE_MUTATION_LOCK_GENERATION_DIR}" || true
+    REFERENCE_CACHE_MUTATION_LOCK_GENERATION_DIR=""
+  fi
   if [[ "${status}" != "0" ]]; then
     if [[ -n "${METALLIB_BUILD_PID}" ]] && kill -0 "${METALLIB_BUILD_PID}" >/dev/null 2>&1; then
-      kill "${METALLIB_BUILD_PID}" >/dev/null 2>&1 || true
+      if [[ -n "${METALLIB_BUILD_PROCESS_GROUP}" ]]; then
+        terminate_metallib_process_group "${METALLIB_BUILD_PROCESS_GROUP}"
+      else
+        kill "${METALLIB_BUILD_PID}" >/dev/null 2>&1 || true
+      fi
     fi
   fi
   if [[ -n "${METALLIB_BUILD_PID}" ]]; then
@@ -1848,8 +2724,13 @@ start_mlx_metallib_build() {
   esac
   if setup_parallel_metallib_enabled; then
     METALLIB_BUILD_STATE="running"
+    # Monitor mode gives the background build its own process group, allowing
+    # failure cleanup to terminate CMake and compiler descendants as a unit.
+    set -m
     build_mlx_metallib &
     METALLIB_BUILD_PID="$!"
+    METALLIB_BUILD_PROCESS_GROUP="${METALLIB_BUILD_PID}"
+    set +m
     echo "setup.sh: mlx.metallib build running in background pid=${METALLIB_BUILD_PID}"
   else
     parallel_status="$?"
@@ -1879,11 +2760,13 @@ wait_for_mlx_metallib_build() {
       echo "setup.sh: waiting for mlx.metallib build"
       if ! wait "${METALLIB_BUILD_PID}"; then
         METALLIB_BUILD_PID=""
+        METALLIB_BUILD_PROCESS_GROUP=""
         METALLIB_BUILD_STATE="failed"
         echo "setup.sh: mlx.metallib build failed" >&2
         return 1
       fi
       METALLIB_BUILD_PID=""
+      METALLIB_BUILD_PROCESS_GROUP=""
       METALLIB_BUILD_STATE="completed"
       ;;
     completed)
@@ -1917,7 +2800,14 @@ verify_reference_manifest() {
   local file_path
   local actual_size
   local actual_hash
+  local before_signature
+  local after_signature
+  local before_content_identity
+  local after_content_identity
+  local verified_manifest_hash
   local checked=0
+
+  discard_reference_verified_signatures
 
   case "${REFERENCE_HASH_VERIFY}" in
     0|false|FALSE|no|NO)
@@ -1934,6 +2824,17 @@ verify_reference_manifest() {
 
   if [[ ! -f "${REFERENCE_MANIFEST_PATH}" ]]; then
     echo "setup.sh: reference manifest missing at ${REFERENCE_MANIFEST_PATH}" >&2
+    return 1
+  fi
+  if ! create_reference_verified_manifest_snapshot; then
+    echo "setup.sh: failed to snapshot reference manifest" >&2
+    discard_reference_verified_signatures
+    return 1
+  fi
+  verified_manifest_hash="${REFERENCE_VERIFIED_MANIFEST_HASH}"
+  if ! create_reference_verified_signatures_path; then
+    echo "setup.sh: failed to create bound reference verification record" >&2
+    discard_reference_verified_signatures
     return 1
   fi
 
@@ -1962,25 +2863,62 @@ verify_reference_manifest() {
     file_path="${reference_dir}/${relative_path}"
     if [[ ! -f "${file_path}" ]]; then
       echo "setup.sh: reference checkpoint is missing manifest file ${relative_path}" >&2
+      discard_reference_verified_signatures
       return 1
     fi
     actual_size="$(wc -c < "${file_path}" | tr -d ' ')"
     if [[ "${actual_size}" != "${expected_size}" ]]; then
       echo "setup.sh: reference file ${relative_path} size mismatch: expected ${expected_size}, got ${actual_size}" >&2
+      discard_reference_verified_signatures
       return 1
     fi
-    actual_hash="$(shasum -a 256 "${file_path}" | awk '{print $1}')"
+    before_signature="$(file_metadata_signature "${file_path}")" || {
+      discard_reference_verified_signatures
+      return 1
+    }
+    before_content_identity="$(file_content_identity_signature "${file_path}")" || {
+      discard_reference_verified_signatures
+      return 1
+    }
+    if ! actual_hash="$(shasum -a 256 "${file_path}" | awk '{print $1}')"; then
+      discard_reference_verified_signatures
+      return 1
+    fi
+    after_signature="$(file_metadata_signature "${file_path}")" || {
+      discard_reference_verified_signatures
+      return 1
+    }
+    after_content_identity="$(file_content_identity_signature "${file_path}")" || {
+      discard_reference_verified_signatures
+      return 1
+    }
+    if [[ "${before_signature}" != "${after_signature}" \
+        || "${before_content_identity}" != "${after_content_identity}" ]]; then
+      echo "setup.sh: reference file ${relative_path} changed while SHA256 was being verified" >&2
+      discard_reference_verified_signatures
+      return 1
+    fi
     if [[ "${actual_hash}" != "${expected_hash}" ]]; then
       echo "setup.sh: reference file ${relative_path} sha256 mismatch" >&2
       echo "setup.sh: expected ${expected_hash}" >&2
       echo "setup.sh: actual   ${actual_hash}" >&2
+      discard_reference_verified_signatures
       return 1
     fi
+    printf '%s\t%s\t%s\n' \
+      "${relative_path}" "${expected_size}" "${after_signature}" \
+      >> "${REFERENCE_VERIFIED_SIGNATURES_PATH}"
     checked=$((checked + 1))
-  done < "${REFERENCE_MANIFEST_PATH}"
+  done < "${REFERENCE_VERIFIED_MANIFEST_PATH}"
 
   if [[ "${checked}" -eq 0 ]]; then
     echo "setup.sh: reference manifest contained no files: ${REFERENCE_MANIFEST_PATH}" >&2
+    discard_reference_verified_signatures
+    return 1
+  fi
+  if [[ "$(reference_manifest_hash 2>/dev/null || true)" != "${verified_manifest_hash}" ]]; then
+    echo "setup.sh: reference manifest changed while SHA256 verification was running" >&2
+    discard_reference_verified_signatures
     return 1
   fi
   echo "setup.sh: verified ${checked} reference file hash(es)"

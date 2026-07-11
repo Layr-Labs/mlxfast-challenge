@@ -867,8 +867,34 @@ extension GemmaRuntime {
             decodeSecondsPerToken: decodeSecondsPerToken,
             prefillSecondsPerToken: prefillSecondsPerToken
         )
+        guard decodeSecondsPerToken.isFinite,
+              decodeSecondsPerToken > 0,
+              prefillSecondsPerToken.isFinite,
+              prefillSecondsPerToken > 0,
+              estimatedScore.isFinite,
+              estimatedScore > 0
+        else {
+            return failedScore(
+                error: "local estimated score is invalid: timing metrics must be finite and positive",
+                correctness: correctness,
+                passedCorrectness: correctness.passed,
+                expertStats: expertStats,
+                weightsDigest: weightsDigest,
+                benchmarkWallSeconds: finiteNonnegativeMetric(wallSeconds),
+                preflightSeconds: finiteNonnegativeMetric(validationSeconds),
+                correctnessSeconds: finiteNonnegativeMetric(correctnessSeconds),
+                timedBenchmarkSeconds: finiteNonnegativeMetric(timedSeconds),
+                processResidentMemoryGB: finiteNonnegativeMetric(currentResidentMemoryGB()),
+                peakRamGB: finiteNonnegativeMetric(peakRamGB),
+                bandwidthGBPerToken: finiteNonnegativeMetric(bandwidthGBPerToken),
+                decodeSecondsPerToken: finiteNonnegativeMetric(decodeSecondsPerToken),
+                prefillSecondsPerToken: finiteNonnegativeMetric(prefillSecondsPerToken),
+                bandwidthSource: bandwidthSource,
+                runtime: runtime
+            )
+        }
         return ScorePayload(
-            score: estimatedScore.isFinite ? estimatedScore : nil,
+            score: estimatedScore,
             passed: true,
             metrics: ScoreMetrics(
                 peakRamGB: peakRamGB,
@@ -910,4 +936,8 @@ extension GemmaRuntime {
             )
         )
     }
+}
+
+private func finiteNonnegativeMetric(_ value: Double) -> Double {
+    value.isFinite && value >= 0 ? value : 0
 }

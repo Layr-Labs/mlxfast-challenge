@@ -17,7 +17,7 @@ func setupScriptCoordinatesCacheAndMetallibState() throws {
     #expect(setup.contains("recover_stale_reference_cache_mutation_lock"))
     #expect(setup.contains("mktemp \"${lock_path}.tmp.XXXXXX\""))
     #expect(setup.contains("metal_toolchain_identifier"))
-    #expect(setup.contains("export TOOLCHAINS=\"${TOOLCHAINS:-${identifier}}\""))
+    #expect(setup.contains("export TOOLCHAINS=\"${identifier}\""))
     #expect(metallibBuilder.contains("-DMLX_BUILD_GGUF=OFF"))
     #expect(metallibBuilder.contains("export CLANG_MODULE_CACHE_PATH="))
     #expect(metallibBuilder.contains("HOME=\"${METAL_COMPILER_HOME}\" \"${CMAKE_BIN}\""))
@@ -100,6 +100,48 @@ func setupRetainsFailedMetallibStateInSynchronousAndParallelModes() throws {
         )
         #expect(result.status == 0, "parallel=\(parallel): \(result.stderr)")
     }
+}
+
+@Test
+func setupFailureCleanupTerminatesMetallibProcessGroup() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        build_mlx_metallib() {
+          sleep 30 &
+          child_pid=$!
+          printf '%s\n' "${child_pid}" > "${CHILD_PID_PATH}"
+          wait "${child_pid}"
+        }
+
+        start_mlx_metallib_build
+        for attempt in 1 2 3 4 5 6 7 8 9 10; do
+          [[ -s "${CHILD_PID_PATH}" ]] && break
+          sleep 0.05
+        done
+        [[ -s "${CHILD_PID_PATH}" ]]
+
+        set +e
+        false
+        cleanup_background_builds
+        cleanup_status=$?
+        set -e
+        [[ "${cleanup_status}" != "0" ]]
+        child_pid="$(cat "${CHILD_PID_PATH}")"
+        ! kill -0 "${child_pid}" 2>/dev/null
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "CHILD_PID_PATH": root.appendingPathComponent("child.pid").path,
+            "MLXFAST_MLX_METALLIB": root.appendingPathComponent("mlx.metallib").path,
+            "MLXFAST_SETUP_PARALLEL_METALLIB": "1",
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
 }
 
 @Test
@@ -221,12 +263,13 @@ func setupRecoversMutationLockOwnedByDeadLocalProcess() throws {
         """
         eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
         mkdir -p "${REFERENCE_CACHE_MUTATION_LOCK_DIR}"
-        printf 'pid=99999999 host=%s started_at=2000-01-01T00:00:00Z\n' "$(hostname)" \
+        printf 'token=dead-token pid=99999999 host=%s started_at=2000-01-01T00:00:00Z\n' "$(hostname)" \
           > "${REFERENCE_CACHE_MUTATION_LOCK_DIR}/owner"
 
         acquire_reference_cache_mutation_lock
         [[ "${REFERENCE_CACHE_MUTATION_LOCK_HELD}" == "1" ]]
-        grep -q "^pid=$$ " "${REFERENCE_CACHE_MUTATION_LOCK_DIR}/owner"
+        grep -q "token=${REFERENCE_CACHE_MUTATION_LOCK_TOKEN} pid=$$ " \
+          "${REFERENCE_CACHE_MUTATION_LOCK_DIR}/owner"
         release_reference_cache_mutation_lock
         [[ ! -e "${REFERENCE_CACHE_MUTATION_LOCK_DIR}" ]]
         """,
@@ -240,6 +283,264 @@ func setupRecoversMutationLockOwnedByDeadLocalProcess() throws {
 
     #expect(result.status == 0, "stderr: \(result.stderr)")
     #expect(result.stdout.contains("recovered stale reference cache mutation lock"))
+}
+
+@Test
+func setupAllowsOnlyOneCompetingStaleLockRecoverer() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        mkdir -p "${REFERENCE_CACHE_MUTATION_LOCK_DIR}"
+        printf 'token=dead-token pid=99999999 host=%s started_at=2000-01-01T00:00:00Z\n' \
+          "$(hostname)" > "${REFERENCE_CACHE_MUTATION_LOCK_DIR}/owner"
+        : > "${RECOVERY_LOG}"
+
+        pids=()
+        for ordinal in 1 2 3 4 5 6 7 8; do
+          (
+            if recover_stale_reference_cache_mutation_lock; then
+              printf '%s\n' "${ordinal}" >> "${RECOVERY_LOG}"
+            fi
+          ) &
+          pids+=("$!")
+        done
+        for pid in "${pids[@]}"; do
+          wait "${pid}" || true
+        done
+
+        [[ "$(wc -l < "${RECOVERY_LOG}" | tr -d ' ')" == "1" ]]
+        [[ ! -e "${REFERENCE_CACHE_MUTATION_LOCK_DIR}" ]]
+        acquire_reference_cache_mutation_lock
+        grep -q "token=${REFERENCE_CACHE_MUTATION_LOCK_TOKEN}" \
+          "${REFERENCE_CACHE_MUTATION_LOCK_DIR}/owner"
+        release_reference_cache_mutation_lock
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "RECOVERY_LOG": root.appendingPathComponent("recoveries.log").path,
+            "MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_DIR": root.appendingPathComponent("cache.lock").path,
+            "MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_TIMEOUT_SECONDS": "2",
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+}
+
+@Test
+func setupStalledLockCreatorCannotPublishIntoReplacementLock() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        ln() {
+          local slot=""
+          local status=0
+          if mkdir "${FIRST_LINK_SLOT}" 2>/dev/null; then
+            slot=first
+            : > "${FIRST_STALLED}"
+            while [[ ! -f "${RESUME_FIRST}" ]]; do sleep 0.05; done
+          elif mkdir "${SECOND_LINK_SLOT}" 2>/dev/null; then
+            slot=second
+            : > "${SECOND_STALLED}"
+            while [[ ! -f "${RESUME_SECOND}" ]]; do sleep 0.05; done
+          fi
+          command ln "$@" || status=$?
+          if [[ "${slot}" == "first" ]]; then
+            : > "${FIRST_ATTEMPTED}"
+          elif [[ "${slot}" == "second" ]]; then
+            : > "${SECOND_ATTEMPTED}"
+          fi
+          return "${status}"
+        }
+
+        (status=0
+         if acquire_reference_cache_mutation_lock; then
+           cat "${REFERENCE_CACHE_MUTATION_LOCK_DIR}/owner" > "${FIRST_OWNER}"
+           : > "${FIRST_ACQUIRED}"
+           while [[ ! -f "${RELEASE_FIRST}" ]]; do sleep 0.05; done
+           release_reference_cache_mutation_lock || status=$?
+         else
+           status=$?
+         fi
+         printf '%s\n' "${status}" > "${FIRST_STATUS}") &
+        first_pid=$!
+        while [[ ! -f "${FIRST_STALLED}" ]]; do sleep 0.05; done
+
+        (status=0
+         if acquire_reference_cache_mutation_lock; then
+           cat "${REFERENCE_CACHE_MUTATION_LOCK_DIR}/owner" > "${SECOND_OWNER}"
+           : > "${SECOND_ACQUIRED}"
+           while [[ ! -f "${RELEASE_SECOND}" ]]; do sleep 0.05; done
+           release_reference_cache_mutation_lock || status=$?
+         else
+           status=$?
+         fi
+         printf '%s\n' "${status}" > "${SECOND_STATUS}") &
+        second_pid=$!
+        while [[ ! -f "${SECOND_STALLED}" ]]; do sleep 0.05; done
+
+        : > "${RESUME_FIRST}"
+        while [[ ! -f "${FIRST_ACQUIRED}" ]] && kill -0 "${first_pid}" 2>/dev/null; do
+          sleep 0.05
+        done
+        if [[ ! -f "${FIRST_ACQUIRED}" ]]; then
+          : > "${RESUME_SECOND}"
+          : > "${RELEASE_FIRST}"
+          : > "${RELEASE_SECOND}"
+          wait "${first_pid}" || true
+          wait "${second_pid}" || true
+          exit 1
+        fi
+        : > "${RESUME_SECOND}"
+        while [[ ! -f "${SECOND_ATTEMPTED}" ]]; do sleep 0.05; done
+
+        : > "${RELEASE_FIRST}"
+        wait "${first_pid}"
+        [[ "$(cat "${FIRST_STATUS}")" == "0" ]]
+        while [[ ! -f "${SECOND_ACQUIRED}" ]] && kill -0 "${second_pid}" 2>/dev/null; do
+          sleep 0.05
+        done
+        [[ -f "${SECOND_ACQUIRED}" ]]
+        ! cmp -s "${FIRST_OWNER}" "${SECOND_OWNER}"
+        : > "${RELEASE_SECOND}"
+        wait "${second_pid}"
+        [[ "$(cat "${SECOND_STATUS}")" == "0" ]]
+        [[ ! -e "${REFERENCE_CACHE_MUTATION_LOCK_DIR}" ]]
+        [[ -z "$(find "$(dirname "${REFERENCE_CACHE_MUTATION_LOCK_DIR}")" \
+          -maxdepth 1 -name "$(basename "${REFERENCE_CACHE_MUTATION_LOCK_DIR}").generation.*" -print -quit)" ]]
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_DIR": root.appendingPathComponent("cache.lock").path,
+            "MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_STALE_SECONDS": "1",
+            "FIRST_LINK_SLOT": root.appendingPathComponent("first-link-slot").path,
+            "SECOND_LINK_SLOT": root.appendingPathComponent("second-link-slot").path,
+            "FIRST_STALLED": root.appendingPathComponent("first-stalled").path,
+            "SECOND_STALLED": root.appendingPathComponent("second-stalled").path,
+            "RESUME_FIRST": root.appendingPathComponent("resume-first").path,
+            "RESUME_SECOND": root.appendingPathComponent("resume-second").path,
+            "FIRST_ATTEMPTED": root.appendingPathComponent("first-attempted").path,
+            "SECOND_ATTEMPTED": root.appendingPathComponent("second-attempted").path,
+            "FIRST_STATUS": root.appendingPathComponent("first-status").path,
+            "SECOND_STATUS": root.appendingPathComponent("second-status").path,
+            "FIRST_OWNER": root.appendingPathComponent("first-owner").path,
+            "SECOND_OWNER": root.appendingPathComponent("second-owner").path,
+            "FIRST_ACQUIRED": root.appendingPathComponent("first-acquired").path,
+            "SECOND_ACQUIRED": root.appendingPathComponent("second-acquired").path,
+            "RELEASE_FIRST": root.appendingPathComponent("release-first").path,
+            "RELEASE_SECOND": root.appendingPathComponent("release-second").path,
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+}
+
+@Test
+func setupReclaimsOnlyDeadOrBrokenAtomicLockGenerations() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        host_hash="$(printf '%s' "$(hostname)" | shasum -a 256 | awk '{print substr($1, 1, 16)}')"
+        dead_pid=999999
+        while kill -0 "${dead_pid}" 2>/dev/null; do dead_pid=$((dead_pid + 1)); done
+        dead_generation="${REFERENCE_CACHE_MUTATION_LOCK_DIR}.generation.dead"
+        live_generation="${REFERENCE_CACHE_MUTATION_LOCK_DIR}.generation.live"
+        dead_initializing="${REFERENCE_CACHE_MUTATION_LOCK_DIR}.initializing.${host_hash}.${dead_pid}.dead"
+        live_initializing="${REFERENCE_CACHE_MUTATION_LOCK_DIR}.initializing.${host_hash}.$$.live"
+        mkdir "${dead_generation}" "${live_generation}" \
+          "${dead_initializing}" "${live_initializing}"
+        printf 'token=dead pid=%s host=%s started_at=now\n' "${dead_pid}" "$(hostname)" \
+          > "${dead_generation}/owner"
+        printf 'token=live pid=%s host=%s started_at=now\n' "$$" "$(hostname)" \
+          > "${live_generation}/owner"
+        broken_target="${REFERENCE_CACHE_MUTATION_LOCK_DIR}.generation.broken"
+        ln -s -h -- "${broken_target}" "${REFERENCE_CACHE_MUTATION_LOCK_DIR}"
+
+        acquire_reference_cache_mutation_lock
+        [[ ! -e "${dead_generation}" ]]
+        [[ ! -e "${dead_initializing}" ]]
+        [[ -d "${live_generation}" ]]
+        [[ -d "${live_initializing}" ]]
+        release_reference_cache_mutation_lock
+        [[ ! -e "${REFERENCE_CACHE_MUTATION_LOCK_DIR}" && ! -L "${REFERENCE_CACHE_MUTATION_LOCK_DIR}" ]]
+        rm -rf "${live_generation}" "${live_initializing}"
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_DIR": root.appendingPathComponent("cache.lock").path,
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+}
+
+@Test
+func setupRecoversAgedMalformedMutationLockOwner() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        mkdir -p "${REFERENCE_CACHE_MUTATION_LOCK_DIR}"
+        : > "${REFERENCE_CACHE_MUTATION_LOCK_DIR}/owner"
+        touch -t 200001010000.00 "${REFERENCE_CACHE_MUTATION_LOCK_DIR}/owner"
+
+        acquire_reference_cache_mutation_lock
+        [[ "${REFERENCE_CACHE_MUTATION_LOCK_HELD}" == "1" ]]
+        grep -q "token=${REFERENCE_CACHE_MUTATION_LOCK_TOKEN}" \
+          "${REFERENCE_CACHE_MUTATION_LOCK_DIR}/owner"
+        release_reference_cache_mutation_lock
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_DIR": root.appendingPathComponent("cache.lock").path,
+            "MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_TIMEOUT_SECONDS": "2",
+            "MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_STALE_SECONDS": "1",
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+}
+
+@Test
+func setupRefusesToReleaseMutationLockWithDifferentOwnerToken() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        acquire_reference_cache_mutation_lock
+        original_token="${REFERENCE_CACHE_MUTATION_LOCK_TOKEN}"
+        printf 'token=other-token pid=%s host=%s started_at=now\n' "$$" "$(hostname)" \
+          > "${REFERENCE_CACHE_MUTATION_LOCK_DIR}/owner"
+
+        release_status=0
+        release_reference_cache_mutation_lock || release_status=$?
+        [[ "${release_status}" != "0" ]]
+        [[ -d "${REFERENCE_CACHE_MUTATION_LOCK_DIR}" ]]
+
+        printf 'token=%s pid=%s host=%s started_at=now\n' \
+          "${original_token}" "$$" "$(hostname)" > "${REFERENCE_CACHE_MUTATION_LOCK_DIR}/owner"
+        release_reference_cache_mutation_lock
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_DIR": root.appendingPathComponent("cache.lock").path,
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+    #expect(result.stderr.contains("owned by another process"))
 }
 
 @Test
@@ -351,9 +652,15 @@ func setupReferenceCacheStampUsesUniqueAtomicTemporaryFiles() throws {
         fixture_size="$(wc -c < "${REFERENCE_DIR}/config.json" | tr -d ' ')"
         printf '%s %s config.json\n' "${fixture_hash}" "${fixture_size}" > "${REFERENCE_MANIFEST_PATH}"
 
-        write_reference_cache_lock "${REFERENCE_DIR}" &
+        (acquire_reference_cache_mutation_lock
+         verify_reference_manifest "${REFERENCE_DIR}"
+         write_reference_cache_lock "${REFERENCE_DIR}"
+         release_reference_cache_mutation_lock) &
         first_pid=$!
-        write_reference_cache_lock "${REFERENCE_DIR}" &
+        (acquire_reference_cache_mutation_lock
+         verify_reference_manifest "${REFERENCE_DIR}"
+         write_reference_cache_lock "${REFERENCE_DIR}"
+         release_reference_cache_mutation_lock) &
         second_pid=$!
         wait "${first_pid}"
         wait "${second_pid}"
@@ -368,6 +675,7 @@ func setupReferenceCacheStampUsesUniqueAtomicTemporaryFiles() throws {
             "MLXFAST_REFERENCE_DIR": referenceDir.path,
             "MLXFAST_REFERENCE_MANIFEST_PATH": root.appendingPathComponent("manifest.sha256").path,
             "MLXFAST_REFERENCE_CACHE_LOCK_PATH": referenceDir.appendingPathComponent(".mlxfast-reference-cache.lock").path,
+            "MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_DIR": root.appendingPathComponent("cache-mutation.lock").path,
         ]
     )
 
@@ -546,6 +854,422 @@ func setupRejectsCommandLineToolsWithFullXcodeInstructions() throws {
 }
 
 @Test
+func setupReferenceCacheStampRejectsSameSizeImmediateMutation() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let referenceDir = root.appendingPathComponent("reference")
+    try FileManager.default.createDirectory(at: referenceDir, withIntermediateDirectories: true)
+    try "fixture".write(
+        to: referenceDir.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        fixture_hash="$(shasum -a 256 "${REFERENCE_DIR}/config.json" | awk '{print $1}')"
+        printf '%s 7 config.json\n' "${fixture_hash}" > "${REFERENCE_MANIFEST_PATH}"
+        verify_reference_manifest "${REFERENCE_DIR}"
+        write_reference_cache_lock "${REFERENCE_DIR}"
+        reference_cache_lock_is_current "${REFERENCE_DIR}"
+
+        printf 'changed' > "${REFERENCE_DIR}/config.json"
+        if reference_cache_lock_is_current "${REFERENCE_DIR}"; then
+          echo "cache stamp accepted changed content" >&2
+          exit 1
+        fi
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "MLXFAST_REFERENCE_DIR": referenceDir.path,
+            "MLXFAST_REFERENCE_MANIFEST_PATH": root.appendingPathComponent("manifest.sha256").path,
+            "MLXFAST_REFERENCE_CACHE_LOCK_PATH": referenceDir.appendingPathComponent(".mlxfast-reference-cache.lock").path,
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+}
+
+@Test
+func setupReferenceCacheStampRejectsMutationAfterHashBeforePublication() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let referenceDir = root.appendingPathComponent("reference")
+    try FileManager.default.createDirectory(at: referenceDir, withIntermediateDirectories: true)
+    try "fixture".write(
+        to: referenceDir.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        fixture_hash="$(shasum -a 256 "${REFERENCE_DIR}/config.json" | awk '{print $1}')"
+        printf '%s 7 config.json\n' "${fixture_hash}" > "${REFERENCE_MANIFEST_PATH}"
+        verify_reference_manifest "${REFERENCE_DIR}"
+
+        printf 'changed' > "${REFERENCE_DIR}/config.json"
+        if write_reference_cache_lock "${REFERENCE_DIR}"; then
+          echo "cache stamp accepted bytes changed after hash verification" >&2
+          exit 1
+        fi
+        [[ ! -e "${REFERENCE_CACHE_LOCK_PATH}" ]]
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "MLXFAST_REFERENCE_DIR": referenceDir.path,
+            "MLXFAST_REFERENCE_MANIFEST_PATH": root.appendingPathComponent("manifest.sha256").path,
+            "MLXFAST_REFERENCE_CACHE_LOCK_PATH": root.appendingPathComponent("cache.stamp").path,
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+}
+
+@Test
+func setupReferenceCacheStampRejectsManifestSwapAfterVerification() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let referenceDir = root.appendingPathComponent("reference")
+    try FileManager.default.createDirectory(at: referenceDir, withIntermediateDirectories: true)
+    try "fixture".write(
+        to: referenceDir.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        fixture_hash="$(shasum -a 256 "${REFERENCE_DIR}/config.json" | awk '{print $1}')"
+        printf '%s 7 config.json\n' "${fixture_hash}" > "${REFERENCE_MANIFEST_PATH}"
+        verify_reference_manifest "${REFERENCE_DIR}"
+
+        printf '%s 7 config.json\n' \
+          '0000000000000000000000000000000000000000000000000000000000000000' \
+          > "${REFERENCE_MANIFEST_PATH}"
+        if write_reference_cache_lock "${REFERENCE_DIR}"; then
+          echo "cache stamp accepted a different manifest" >&2
+          exit 1
+        fi
+        [[ ! -e "${REFERENCE_CACHE_LOCK_PATH}" ]]
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "MLXFAST_REFERENCE_DIR": referenceDir.path,
+            "MLXFAST_REFERENCE_MANIFEST_PATH": root.appendingPathComponent("manifest.sha256").path,
+            "MLXFAST_REFERENCE_CACHE_LOCK_PATH": root.appendingPathComponent("cache.stamp").path,
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+}
+
+@Test
+func setupReferenceCacheStampRejectsManifestSwapDuringFastValidation() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let referenceDir = root.appendingPathComponent("reference")
+    try FileManager.default.createDirectory(at: referenceDir, withIntermediateDirectories: true)
+    try "fixture".write(
+        to: referenceDir.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        fixture_hash="$(printf fixture | shasum -a 256 | awk '{print $1}')"
+        printf '%s 7 config.json\n' "${fixture_hash}" > "${REFERENCE_MANIFEST_PATH}"
+        printf '%s 7 config.json\n' \
+          '0000000000000000000000000000000000000000000000000000000000000000' \
+          > "${MANIFEST_B}"
+        verify_reference_manifest "${REFERENCE_DIR}"
+        write_reference_cache_lock "${REFERENCE_DIR}"
+
+        file_metadata_signature() {
+          if mkdir "${SWAP_ONCE}" 2>/dev/null; then
+            cp "${MANIFEST_B}" "${REFERENCE_MANIFEST_PATH}"
+          fi
+          stat -f '%d:%i:%z:%Fm:%Fc:%v' "$1" 2>/dev/null \
+            || stat -c '%d:%i:%s:%Y:%Z:0' "$1"
+        }
+        if reference_cache_lock_is_current "${REFERENCE_DIR}"; then
+          echo "cache stamp accepted a manifest swapped during validation" >&2
+          exit 1
+        fi
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "MLXFAST_REFERENCE_DIR": referenceDir.path,
+            "MLXFAST_REFERENCE_MANIFEST_PATH": root.appendingPathComponent("manifest.sha256").path,
+            "MLXFAST_REFERENCE_CACHE_LOCK_PATH": root.appendingPathComponent("cache.stamp").path,
+            "MANIFEST_B": root.appendingPathComponent("manifest-b.sha256").path,
+            "SWAP_ONCE": root.appendingPathComponent("swap-once").path,
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+    #expect(result.stderr.contains("manifest changed while the cache lock was being validated"))
+}
+
+@Test
+func setupReferenceVerificationRejectsManifestABA() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let referenceDir = root.appendingPathComponent("reference")
+    try FileManager.default.createDirectory(at: referenceDir, withIntermediateDirectories: true)
+    try "fixture".write(
+        to: referenceDir.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        fixture_hash="$(printf 'fixture' | shasum -a 256 | awk '{print $1}')"
+        changed_hash="$(printf 'changed' | shasum -a 256 | awk '{print $1}')"
+        printf '%s 7 config.json\n' "${fixture_hash}" > "${REFERENCE_MANIFEST_PATH}"
+        cp "${REFERENCE_MANIFEST_PATH}" "${MANIFEST_A}"
+
+        eval "$(declare -f create_reference_verified_signatures_path \
+          | sed '1s/create_reference_verified_signatures_path/create_reference_verified_signatures_path_original/')"
+        create_reference_verified_signatures_path() {
+          create_reference_verified_signatures_path_original
+          printf '%s 7 config.json\n' "${changed_hash}" > "${REFERENCE_MANIFEST_PATH}"
+          printf 'changed' > "${REFERENCE_DIR}/config.json"
+        }
+        file_metadata_signature() {
+          count=0
+          [[ -f "${SIGNATURE_COUNT}" ]] && count="$(cat "${SIGNATURE_COUNT}")"
+          count=$((count + 1))
+          printf '%s\n' "${count}" > "${SIGNATURE_COUNT}"
+          if [[ "${count}" == "2" ]]; then
+            cp "${MANIFEST_A}" "${REFERENCE_MANIFEST_PATH}"
+          fi
+          stat -f '%d:%i:%z:%Fm:%Fc:%v' "$1"
+        }
+
+        if verify_reference_manifest "${REFERENCE_DIR}" \
+            && write_reference_cache_lock "${REFERENCE_DIR}"; then
+          echo "cache stamp accepted A/B/A manifest verification" >&2
+          exit 1
+        fi
+        [[ ! -e "${REFERENCE_CACHE_LOCK_PATH}" ]]
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "MLXFAST_REFERENCE_DIR": referenceDir.path,
+            "MLXFAST_REFERENCE_MANIFEST_PATH": root.appendingPathComponent("manifest.sha256").path,
+            "MLXFAST_REFERENCE_CACHE_LOCK_PATH": root.appendingPathComponent("cache.stamp").path,
+            "MANIFEST_A": root.appendingPathComponent("manifest-a.sha256").path,
+            "SIGNATURE_COUNT": root.appendingPathComponent("signature-count").path,
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+}
+
+@Test
+func setupVerifiedDownloadMarkerRejectsManifestABA() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let referenceDir = root.appendingPathComponent("reference")
+    try FileManager.default.createDirectory(at: referenceDir, withIntermediateDirectories: true)
+    try "fixture".write(
+        to: referenceDir.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        fixture_hash="$(printf 'fixture' | shasum -a 256 | awk '{print $1}')"
+        changed_hash="$(printf 'changed' | shasum -a 256 | awk '{print $1}')"
+        printf '%s 7 config.json\n' "${fixture_hash}" > "${REFERENCE_MANIFEST_PATH}"
+        cp "${REFERENCE_MANIFEST_PATH}" "${MANIFEST_A}"
+        printf '%s 7 config.json\n' "${changed_hash}" > "${REFERENCE_MANIFEST_PATH}"
+        printf 'changed' > "${REFERENCE_DIR}/config.json"
+
+        file_metadata_signature() {
+          count=0
+          [[ -f "${SIGNATURE_COUNT}" ]] && count="$(cat "${SIGNATURE_COUNT}")"
+          count=$((count + 1))
+          printf '%s\n' "${count}" > "${SIGNATURE_COUNT}"
+          if [[ "${count}" == "2" ]]; then
+            cp "${MANIFEST_A}" "${REFERENCE_MANIFEST_PATH}"
+          fi
+          stat -f '%d:%i:%z:%Fm:%Fc:%v' "$1"
+        }
+
+        marker="${REFERENCE_DIR}/config.json.complete"
+        if reference_file_is_current config.json "${REFERENCE_DIR}/config.json" \
+            && mark_reference_file_complete \
+              config.json "${REFERENCE_DIR}/config.json" "${marker}" \
+              "${REFERENCE_VERIFIED_CONTENT_IDENTITY}" \
+              "${REFERENCE_VERIFIED_EXPECTED_HASH}" \
+              "${REFERENCE_VERIFIED_EXPECTED_SIZE}" \
+              "${REFERENCE_VERIFIED_FILE_MANIFEST_HASH}"; then
+          echo "verified marker accepted A/B/A manifest verification" >&2
+          exit 1
+        fi
+        [[ ! -e "${marker}" ]]
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "MLXFAST_REFERENCE_DIR": referenceDir.path,
+            "MLXFAST_REFERENCE_MANIFEST_PATH": root.appendingPathComponent("manifest.sha256").path,
+            "MLXFAST_REFERENCE_CACHE_LOCK_PATH": root.appendingPathComponent("cache.stamp").path,
+            "MANIFEST_A": root.appendingPathComponent("manifest-a.sha256").path,
+            "SIGNATURE_COUNT": root.appendingPathComponent("signature-count").path,
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+}
+
+@Test
+func setupReferenceCacheStampDoesNotModifyReadOnlyCheckpoint() throws {
+    let root = try setupTemporaryDirectory()
+    let referenceDir = root.appendingPathComponent("reference")
+    try FileManager.default.createDirectory(at: referenceDir, withIntermediateDirectories: true)
+    let fixture = referenceDir.appendingPathComponent("config.json")
+    try "fixture".write(to: fixture, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o444],
+        ofItemAtPath: fixture.path
+    )
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o555],
+        ofItemAtPath: referenceDir.path
+    )
+    defer {
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: referenceDir.path
+        )
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: fixture.path
+        )
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        fixture_hash="$(shasum -a 256 "${REFERENCE_DIR}/config.json" | awk '{print $1}')"
+        printf '%s 7 config.json\n' "${fixture_hash}" > "${REFERENCE_MANIFEST_PATH}"
+
+        before_signature="$(file_metadata_signature "${REFERENCE_DIR}/config.json")"
+        verify_reference_manifest "${REFERENCE_DIR}"
+        write_reference_cache_lock "${REFERENCE_DIR}"
+        after_signature="$(file_metadata_signature "${REFERENCE_DIR}/config.json")"
+
+        [[ "${before_signature}" == "${after_signature}" ]]
+        reference_cache_lock_is_current "${REFERENCE_DIR}"
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "MLXFAST_REFERENCE_DIR": referenceDir.path,
+            "MLXFAST_REFERENCE_MANIFEST_PATH": root.appendingPathComponent("manifest.sha256").path,
+            "MLXFAST_REFERENCE_CACHE_LOCK_PATH": root.appendingPathComponent("cache.stamp").path,
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+}
+
+@Test
+func setupDownloadPublishesVerifiedPartialAtomically() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let published = root.appendingPathComponent("config.json")
+    try "old-data".write(to: published, atomically: true, encoding: .utf8)
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        new_hash="$(printf 'new-data' | shasum -a 256 | awk '{print $1}')"
+        printf '%s 8 config.json\n' "${new_hash}" > "${REFERENCE_MANIFEST_PATH}"
+        curl() {
+          output=""
+          while [[ "$#" -gt 0 ]]; do
+            if [[ "$1" == "--output" ]]; then
+              output="$2"
+              shift 2
+            else
+              shift
+            fi
+          done
+          [[ "${output}" == "${PUBLISHED_PATH}.partial" ]]
+          [[ "$(cat "${PUBLISHED_PATH}")" == "old-data" ]]
+          printf 'new-data' > "${output}"
+        }
+
+        download_reference_file config.json "${PUBLISHED_PATH}"
+        [[ "$(cat "${PUBLISHED_PATH}")" == "new-data" ]]
+        [[ ! -e "${PUBLISHED_PATH}.partial" ]]
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "PUBLISHED_PATH": published.path,
+            "MLXFAST_REFERENCE_MANIFEST_PATH": root.appendingPathComponent("manifest.sha256").path,
+            "MLXFAST_REFERENCE_BASE_URL": "https://invalid.example",
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+}
+
+@Test
+func setupFailedDownloadPreservesPreviouslyPublishedFile() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let published = root.appendingPathComponent("config.json")
+    try "old-data".write(to: published, atomically: true, encoding: .utf8)
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        new_hash="$(printf 'new-data' | shasum -a 256 | awk '{print $1}')"
+        printf '%s 8 config.json\n' "${new_hash}" > "${REFERENCE_MANIFEST_PATH}"
+        curl() {
+          output=""
+          while [[ "$#" -gt 0 ]]; do
+            if [[ "$1" == "--output" ]]; then
+              output="$2"
+              shift 2
+            else
+              shift
+            fi
+          done
+          printf 'partial' > "${output}"
+          return 22
+        }
+
+        download_status=0
+        download_reference_file config.json "${PUBLISHED_PATH}" || download_status=$?
+        [[ "${download_status}" != "0" ]]
+        [[ "$(cat "${PUBLISHED_PATH}")" == "old-data" ]]
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "PUBLISHED_PATH": published.path,
+            "MLXFAST_REFERENCE_MANIFEST_PATH": root.appendingPathComponent("manifest.sha256").path,
+            "MLXFAST_REFERENCE_BASE_URL": "https://invalid.example",
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+}
+
+@Test
 func setupUsesDownloadedMetalToolchainIdentifierForCompilerProbe() throws {
     let result = try runSetupBash(
         """
@@ -559,6 +1283,26 @@ func setupUsesDownloadedMetalToolchainIdentifierForCompilerProbe() throws {
         unset TOOLCHAINS
         metal_compiler_is_available
         [[ "${TOOLCHAINS}" == "com.apple.dt.toolchain.Metal.1" ]]
+        """,
+        environment: ["REPO_ROOT": FileManager.default.currentDirectoryPath]
+    )
+
+    #expect(result.status == 0, "stderr: \(result.stderr)")
+}
+
+@Test
+func setupDetectedMetalToolchainOverridesUnrelatedToolchainsEnvironment() throws {
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        xcodebuild() {
+          printf 'Toolchain Identifier: com.apple.dt.toolchain.Metal.1\n'
+        }
+        xcrun() {
+          [[ "${TOOLCHAINS:-}" == "com.apple.dt.toolchain.Metal.1" ]]
+        }
+        export TOOLCHAINS="org.swift.unrelated"
+        metal_compiler_is_available
         """,
         environment: ["REPO_ROOT": FileManager.default.currentDirectoryPath]
     )
@@ -590,6 +1334,7 @@ func metallibBuilderRejectsAmbiguousCMakeOutputs() throws {
         contents: """
         #!/usr/bin/env bash
         set -euo pipefail
+        printf '%s\n' "$*" >> "${CMAKE_ARGUMENT_LOG}"
         if [[ " $* " == *" --build "* ]]; then
           mkdir -p "${MLXFAST_MLX_METAL_BUILD_DIR}/first" "${MLXFAST_MLX_METAL_BUILD_DIR}/second"
           printf 'first' > "${MLXFAST_MLX_METAL_BUILD_DIR}/first/mlx.metallib"
@@ -608,7 +1353,7 @@ func metallibBuilderRejectsAmbiguousCMakeOutputs() throws {
         at: fakeBin.appendingPathComponent("xcrun"),
         contents: """
         #!/usr/bin/env bash
-        exit 0
+        [[ "${TOOLCHAINS:-}" == "com.apple.dt.toolchain.Metal.1" ]]
         """
     )
 
@@ -624,12 +1369,363 @@ func metallibBuilderRejectsAmbiguousCMakeOutputs() throws {
             "MLXFAST_MLX_SWIFT_CHECKOUT": checkout.path,
             "MLXFAST_MLX_METAL_BUILD_DIR": root.appendingPathComponent("metal-build").path,
             "MLXFAST_MLX_METALLIB": output.path,
+            "CMAKE_ARGUMENT_LOG": root.appendingPathComponent("cmake-arguments.log").path,
+            "TOOLCHAINS": "org.swift.unrelated",
         ]
     )
 
     #expect(result.status != 0)
     #expect(result.stderr.contains("produced multiple mlx.metallib files"))
     #expect(!FileManager.default.fileExists(atPath: output.path))
+    let arguments = try String(
+        contentsOf: root.appendingPathComponent("cmake-arguments.log"),
+        encoding: .utf8
+    )
+    #expect(
+        arguments.contains(
+            "/mlx-swift/Source/Cmlx/metal-cpp"
+        )
+    )
+    #expect(!arguments.contains("\(FileManager.default.currentDirectoryPath)/\(checkout.path)"))
+}
+
+@Test
+func metallibBuilderSerializesConcurrentProcesses() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let fakeBin = root.appendingPathComponent("bin")
+    let checkout = root.appendingPathComponent("mlx-swift")
+    for path in [
+        "Source/Cmlx/mlx",
+        "Source/Cmlx/metal-cpp",
+        "Source/Cmlx/json",
+        "Source/Cmlx/fmt",
+    ] {
+        try FileManager.default.createDirectory(
+            at: checkout.appendingPathComponent(path),
+            withIntermediateDirectories: true
+        )
+    }
+    try FileManager.default.createDirectory(at: fakeBin, withIntermediateDirectories: true)
+
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("cmake"),
+        contents: """
+        #!/usr/bin/env bash
+        set -euo pipefail
+        if [[ " $* " == *" --build "* ]]; then
+          if ! mkdir "${ACTIVE_BUILD_DIR}" 2>/dev/null; then
+            : > "${OVERLAP_LOG}"
+          else
+            sleep 0.3
+            rmdir "${ACTIVE_BUILD_DIR}"
+          fi
+          mkdir -p "${MLXFAST_MLX_METAL_BUILD_DIR}/result"
+          printf 'metallib' > "${MLXFAST_MLX_METAL_BUILD_DIR}/result/mlx.metallib"
+        fi
+        """
+    )
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("xcodebuild"),
+        contents: "#!/usr/bin/env bash\nprintf 'Toolchain Identifier: metal.test\\n'\n"
+    )
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("xcrun"),
+        contents: "#!/usr/bin/env bash\nexit 0\n"
+    )
+
+    let output = root.appendingPathComponent("output/mlx.metallib")
+    let result = try runSetupBash(
+        """
+        "${REPO_ROOT}/tools/build-mlx-metallib.sh" &
+        first_pid=$!
+        "${REPO_ROOT}/tools/build-mlx-metallib.sh" &
+        second_pid=$!
+        wait "${first_pid}"
+        wait "${second_pid}"
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "PATH": "\(fakeBin.path):/usr/bin:/bin",
+            "MLXFAST_CMAKE_BIN": fakeBin.appendingPathComponent("cmake").path,
+            "MLXFAST_MLX_SWIFT_CHECKOUT": checkout.path,
+            "MLXFAST_MLX_METAL_BUILD_DIR": root.appendingPathComponent("metal-build").path,
+            "MLXFAST_MLX_METALLIB": output.path,
+            "ACTIVE_BUILD_DIR": root.appendingPathComponent("active-build").path,
+            "OVERLAP_LOG": root.appendingPathComponent("overlap").path,
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("overlap").path))
+    #expect(try String(contentsOf: output, encoding: .utf8) == "metallib")
+    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("metal-build.mlxfast-build.lock").path))
+}
+
+@Test
+func metallibBuilderStalledLockCreatorCannotPublishIntoReplacementLock() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed \
+          -e 's|^ROOT_DIR=.*|ROOT_DIR="${REPO_ROOT}"|' \
+          -e '/^METAL_TOOLCHAIN_IDENTIFIER=/,$d' \
+          "${REPO_ROOT}/tools/build-mlx-metallib.sh")"
+        ln() {
+          local slot=""
+          local status=0
+          if mkdir "${FIRST_LINK_SLOT}" 2>/dev/null; then
+            slot=first
+            : > "${FIRST_STALLED}"
+            while [[ ! -f "${RESUME_FIRST}" ]]; do sleep 0.05; done
+          elif mkdir "${SECOND_LINK_SLOT}" 2>/dev/null; then
+            slot=second
+            : > "${SECOND_STALLED}"
+            while [[ ! -f "${RESUME_SECOND}" ]]; do sleep 0.05; done
+          fi
+          command ln "$@" || status=$?
+          if [[ "${slot}" == "first" ]]; then
+            : > "${FIRST_ATTEMPTED}"
+          elif [[ "${slot}" == "second" ]]; then
+            : > "${SECOND_ATTEMPTED}"
+          fi
+          return "${status}"
+        }
+
+        (status=0
+         if acquire_build_lock; then
+           cat "${BUILD_LOCK_DIR}/owner" > "${FIRST_OWNER}"
+           : > "${FIRST_ACQUIRED}"
+           while [[ ! -f "${RELEASE_FIRST}" ]]; do sleep 0.05; done
+           release_build_lock || status=$?
+         else
+           status=$?
+         fi
+         printf '%s\n' "${status}" > "${FIRST_STATUS}") &
+        first_pid=$!
+        while [[ ! -f "${FIRST_STALLED}" ]]; do sleep 0.05; done
+
+        (status=0
+         if acquire_build_lock; then
+           cat "${BUILD_LOCK_DIR}/owner" > "${SECOND_OWNER}"
+           : > "${SECOND_ACQUIRED}"
+           while [[ ! -f "${RELEASE_SECOND}" ]]; do sleep 0.05; done
+           release_build_lock || status=$?
+         else
+           status=$?
+         fi
+         printf '%s\n' "${status}" > "${SECOND_STATUS}") &
+        second_pid=$!
+        while [[ ! -f "${SECOND_STALLED}" ]]; do sleep 0.05; done
+
+        : > "${RESUME_FIRST}"
+        while [[ ! -f "${FIRST_ACQUIRED}" ]] && kill -0 "${first_pid}" 2>/dev/null; do
+          sleep 0.05
+        done
+        if [[ ! -f "${FIRST_ACQUIRED}" ]]; then
+          : > "${RESUME_SECOND}"
+          : > "${RELEASE_FIRST}"
+          : > "${RELEASE_SECOND}"
+          wait "${first_pid}" || true
+          wait "${second_pid}" || true
+          exit 1
+        fi
+        : > "${RESUME_SECOND}"
+        while [[ ! -f "${SECOND_ATTEMPTED}" ]]; do sleep 0.05; done
+
+        : > "${RELEASE_FIRST}"
+        wait "${first_pid}"
+        [[ "$(cat "${FIRST_STATUS}")" == "0" ]]
+        while [[ ! -f "${SECOND_ACQUIRED}" ]] && kill -0 "${second_pid}" 2>/dev/null; do
+          sleep 0.05
+        done
+        [[ -f "${SECOND_ACQUIRED}" ]]
+        ! cmp -s "${FIRST_OWNER}" "${SECOND_OWNER}"
+        : > "${RELEASE_SECOND}"
+        wait "${second_pid}"
+        [[ "$(cat "${SECOND_STATUS}")" == "0" ]]
+        [[ ! -e "${BUILD_LOCK_DIR}" ]]
+        [[ -z "$(find "$(dirname "${BUILD_LOCK_DIR}")" \
+          -maxdepth 1 -name "$(basename "${BUILD_LOCK_DIR}").generation.*" -print -quit)" ]]
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "MLXFAST_MLX_METAL_BUILD_DIR": root.appendingPathComponent("metal-build").path,
+            "MLXFAST_MLX_METAL_BUILD_LOCK_DIR": root.appendingPathComponent("metal-build.lock").path,
+            "MLXFAST_MLX_METAL_BUILD_LOCK_STALE_SECONDS": "1",
+            "MLXFAST_MLX_METALLIB": root.appendingPathComponent("mlx.metallib").path,
+            "MLXFAST_CLANG_MODULE_CACHE": root.appendingPathComponent("clang-cache").path,
+            "MLXFAST_METAL_COMPILER_HOME": root.appendingPathComponent("metal-home").path,
+            "FIRST_LINK_SLOT": root.appendingPathComponent("first-link-slot").path,
+            "SECOND_LINK_SLOT": root.appendingPathComponent("second-link-slot").path,
+            "FIRST_STALLED": root.appendingPathComponent("first-stalled").path,
+            "SECOND_STALLED": root.appendingPathComponent("second-stalled").path,
+            "RESUME_FIRST": root.appendingPathComponent("resume-first").path,
+            "RESUME_SECOND": root.appendingPathComponent("resume-second").path,
+            "FIRST_ATTEMPTED": root.appendingPathComponent("first-attempted").path,
+            "SECOND_ATTEMPTED": root.appendingPathComponent("second-attempted").path,
+            "FIRST_STATUS": root.appendingPathComponent("first-status").path,
+            "SECOND_STATUS": root.appendingPathComponent("second-status").path,
+            "FIRST_OWNER": root.appendingPathComponent("first-owner").path,
+            "SECOND_OWNER": root.appendingPathComponent("second-owner").path,
+            "FIRST_ACQUIRED": root.appendingPathComponent("first-acquired").path,
+            "SECOND_ACQUIRED": root.appendingPathComponent("second-acquired").path,
+            "RELEASE_FIRST": root.appendingPathComponent("release-first").path,
+            "RELEASE_SECOND": root.appendingPathComponent("release-second").path,
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+}
+
+@Test
+func metallibBuilderReclaimsOnlyDeadOrBrokenAtomicLockGenerations() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed \
+          -e 's|^ROOT_DIR=.*|ROOT_DIR="${REPO_ROOT}"|' \
+          -e '/^METAL_TOOLCHAIN_IDENTIFIER=/,$d' \
+          "${REPO_ROOT}/tools/build-mlx-metallib.sh")"
+        host_hash="$(printf '%s' "$(hostname)" | shasum -a 256 | awk '{print substr($1, 1, 16)}')"
+        dead_pid=999999
+        while kill -0 "${dead_pid}" 2>/dev/null; do dead_pid=$((dead_pid + 1)); done
+        dead_generation="${BUILD_LOCK_DIR}.generation.dead"
+        live_generation="${BUILD_LOCK_DIR}.generation.live"
+        dead_initializing="${BUILD_LOCK_DIR}.initializing.${host_hash}.${dead_pid}.dead"
+        live_initializing="${BUILD_LOCK_DIR}.initializing.${host_hash}.$$.live"
+        mkdir "${dead_generation}" "${live_generation}" \
+          "${dead_initializing}" "${live_initializing}"
+        printf 'token=dead pid=%s host=%s started_at=now\n' "${dead_pid}" "$(hostname)" \
+          > "${dead_generation}/owner"
+        printf 'token=live pid=%s host=%s started_at=now\n' "$$" "$(hostname)" \
+          > "${live_generation}/owner"
+        broken_target="${BUILD_LOCK_DIR}.generation.broken"
+        ln -s -h -- "${broken_target}" "${BUILD_LOCK_DIR}"
+
+        acquire_build_lock
+        [[ ! -e "${dead_generation}" ]]
+        [[ ! -e "${dead_initializing}" ]]
+        [[ -d "${live_generation}" ]]
+        [[ -d "${live_initializing}" ]]
+        release_build_lock
+        [[ ! -e "${BUILD_LOCK_DIR}" && ! -L "${BUILD_LOCK_DIR}" ]]
+        rm -rf "${live_generation}" "${live_initializing}"
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "MLXFAST_MLX_METAL_BUILD_DIR": root.appendingPathComponent("metal-build").path,
+            "MLXFAST_MLX_METAL_BUILD_LOCK_DIR": root.appendingPathComponent("metal-build.lock").path,
+            "MLXFAST_MLX_METALLIB": root.appendingPathComponent("mlx.metallib").path,
+            "MLXFAST_CLANG_MODULE_CACHE": root.appendingPathComponent("clang-cache").path,
+            "MLXFAST_METAL_COMPILER_HOME": root.appendingPathComponent("metal-home").path,
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+}
+
+@Test
+func metallibBuilderPreservesPublishedOutputWhenCopyFails() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let fakeBin = root.appendingPathComponent("bin")
+    let checkout = root.appendingPathComponent("mlx-swift")
+    for path in [
+        "Source/Cmlx/mlx",
+        "Source/Cmlx/metal-cpp",
+        "Source/Cmlx/json",
+        "Source/Cmlx/fmt",
+    ] {
+        try FileManager.default.createDirectory(
+            at: checkout.appendingPathComponent(path),
+            withIntermediateDirectories: true
+        )
+    }
+    try FileManager.default.createDirectory(at: fakeBin, withIntermediateDirectories: true)
+
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("cmake"),
+        contents: """
+        #!/usr/bin/env bash
+        set -euo pipefail
+        if [[ " $* " == *" --build "* ]]; then
+          mkdir -p "${MLXFAST_MLX_METAL_BUILD_DIR}/result"
+          printf 'replacement' > "${MLXFAST_MLX_METAL_BUILD_DIR}/result/mlx.metallib"
+        fi
+        """
+    )
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("xcodebuild"),
+        contents: "#!/usr/bin/env bash\nprintf 'Toolchain Identifier: metal.test\\n'\n"
+    )
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("xcrun"),
+        contents: "#!/usr/bin/env bash\nexit 0\n"
+    )
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("cp"),
+        contents: "#!/usr/bin/env bash\nprintf 'partial' > \"$2\"\nexit 23\n"
+    )
+
+    let output = root.appendingPathComponent("output/mlx.metallib")
+    try FileManager.default.createDirectory(
+        at: output.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    try "original".write(to: output, atomically: true, encoding: .utf8)
+    let result = try runSetupBash(
+        """
+        "${REPO_ROOT}/tools/build-mlx-metallib.sh"
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "PATH": "\(fakeBin.path):/usr/bin:/bin",
+            "MLXFAST_CMAKE_BIN": fakeBin.appendingPathComponent("cmake").path,
+            "MLXFAST_MLX_SWIFT_CHECKOUT": checkout.path,
+            "MLXFAST_MLX_METAL_BUILD_DIR": root.appendingPathComponent("metal-build").path,
+            "MLXFAST_MLX_METALLIB": output.path,
+        ]
+    )
+
+    #expect(result.status != 0)
+    #expect(try String(contentsOf: output, encoding: .utf8) == "original")
+    let outputFiles = try FileManager.default.contentsOfDirectory(
+        atPath: output.deletingLastPathComponent().path
+    )
+    #expect(outputFiles == ["mlx.metallib"])
+
+    let directoryOutput = root.appendingPathComponent("directory-output/mlx.metallib")
+    try FileManager.default.createDirectory(
+        at: directoryOutput,
+        withIntermediateDirectories: true
+    )
+    let sentinel = directoryOutput.appendingPathComponent("sentinel")
+    try "preserve".write(to: sentinel, atomically: true, encoding: .utf8)
+    let directoryResult = try runSetupBash(
+        """
+        "${REPO_ROOT}/tools/build-mlx-metallib.sh"
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "PATH": "\(fakeBin.path):/usr/bin:/bin",
+            "MLXFAST_CMAKE_BIN": fakeBin.appendingPathComponent("cmake").path,
+            "MLXFAST_MLX_SWIFT_CHECKOUT": checkout.path,
+            "MLXFAST_MLX_METAL_BUILD_DIR": root.appendingPathComponent("metal-build").path,
+            "MLXFAST_MLX_METALLIB": directoryOutput.path,
+        ]
+    )
+
+    #expect(directoryResult.status != 0)
+    #expect(try String(contentsOf: sentinel, encoding: .utf8) == "preserve")
+    #expect(
+        try FileManager.default.contentsOfDirectory(atPath: directoryOutput.path)
+            == ["sentinel"]
+    )
 }
 
 private struct SetupBashResult {
@@ -647,6 +1743,9 @@ private func runSetupBash(
     process.arguments = ["-c", script]
     process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     var environment = ProcessInfo.processInfo.environment
+    for key in environment.keys.filter({ $0.hasPrefix("MLXFAST_") }) {
+        environment.removeValue(forKey: key)
+    }
     for (key, value) in overrides {
         environment[key] = value
     }

@@ -85,6 +85,212 @@ func gemma4WeightLoaderBuildsAffineQuantizedLinearWeightWhenRuntimeTestsAreEnabl
     #expect(weight.groupSize == 4)
 }
 
+@Test
+func gemma4WeightLoaderValidatesAffineQuantizedMetadataWithoutMaterializing() throws {
+    let weights = try makeWeightsFixture(tensors: validQuantizedLinearFixtures())
+    defer { try? FileManager.default.removeItem(at: weights.deletingLastPathComponent()) }
+    let loader = try Gemma4WeightLoader(weightsPath: weights.path)
+
+    let quantization = try loader.validateLinearMetadata(
+        named: quantizedLinearName,
+        expectedRows: 2,
+        expectedInputFeatures: 8
+    )
+
+    #expect(quantization?.groupSize == 4)
+    #expect(quantization?.bits == 4)
+}
+
+@Test
+func gemma4WeightLoaderRejectsQuantizationMetadataThatDisagreesWithConfig() throws {
+    let weights = try makeWeightsFixture(tensors: validQuantizedLinearFixtures())
+    defer { try? FileManager.default.removeItem(at: weights.deletingLastPathComponent()) }
+    let loader = try Gemma4WeightLoader(weightsPath: weights.path)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try loader.validateLinearMetadata(
+            named: quantizedLinearName,
+            expectedRows: 2,
+            expectedInputFeatures: 8,
+            expectedGroupSize: 8,
+            expectedBits: 4
+        )
+    }
+    #expect(throws: MLXFastError.self) {
+        _ = try loader.validateLinearMetadata(
+            named: quantizedLinearName,
+            expectedRows: 2,
+            expectedInputFeatures: 8,
+            expectedGroupSize: 4,
+            expectedBits: 8
+        )
+    }
+}
+
+@Test
+func gemma4WeightLoaderRequiresBothAffineQuantizationCompanions() throws {
+    let weight = quantizedWeightFixture()
+    let scales = quantizedCompanionFixture(suffix: "scales")
+    let malformedFixtures = [
+        [weight],
+        [weight, scales],
+    ]
+
+    for tensors in malformedFixtures {
+        let weights = try makeWeightsFixture(tensors: tensors)
+        defer { try? FileManager.default.removeItem(at: weights.deletingLastPathComponent()) }
+        let loader = try Gemma4WeightLoader(weightsPath: weights.path)
+
+        #expect(throws: MLXFastError.self) {
+            _ = try loader.validateLinearMetadata(
+                named: quantizedLinearName,
+                expectedRows: 2,
+                expectedInputFeatures: 8
+            )
+        }
+    }
+}
+
+@Test
+func gemma4WeightLoaderRejectsNonBF16AffineQuantizationCompanions() throws {
+    let malformedCompanions = [
+        (
+            quantizedCompanionFixture(suffix: "scales", dtype: "F16"),
+            quantizedCompanionFixture(suffix: "biases")
+        ),
+        (
+            quantizedCompanionFixture(suffix: "scales"),
+            quantizedCompanionFixture(suffix: "biases", dtype: "F16")
+        ),
+    ]
+
+    for (scales, biases) in malformedCompanions {
+        let weights = try makeWeightsFixture(tensors: [quantizedWeightFixture(), scales, biases])
+        defer { try? FileManager.default.removeItem(at: weights.deletingLastPathComponent()) }
+        let loader = try Gemma4WeightLoader(weightsPath: weights.path)
+
+        #expect(throws: MLXFastError.self) {
+            _ = try loader.validateLinearMetadata(
+                named: quantizedLinearName,
+                expectedRows: 2,
+                expectedInputFeatures: 8
+            )
+        }
+    }
+}
+
+@Test
+func gemma4WeightLoaderRejectsMalformedAffineQuantizationCompanionShapes() throws {
+    let malformedCompanions = [
+        (
+            quantizedCompanionFixture(suffix: "scales", shape: [4]),
+            quantizedCompanionFixture(suffix: "biases", shape: [4])
+        ),
+        (
+            quantizedCompanionFixture(suffix: "scales", shape: [1, 4]),
+            quantizedCompanionFixture(suffix: "biases", shape: [1, 4])
+        ),
+        (
+            quantizedCompanionFixture(suffix: "scales"),
+            quantizedCompanionFixture(suffix: "biases", shape: [2, 1])
+        ),
+    ]
+
+    for (scales, biases) in malformedCompanions {
+        let weights = try makeWeightsFixture(tensors: [quantizedWeightFixture(), scales, biases])
+        defer { try? FileManager.default.removeItem(at: weights.deletingLastPathComponent()) }
+        let loader = try Gemma4WeightLoader(weightsPath: weights.path)
+
+        #expect(throws: MLXFastError.self) {
+            _ = try loader.validateLinearMetadata(
+                named: quantizedLinearName,
+                expectedRows: 2,
+                expectedInputFeatures: 8
+            )
+        }
+    }
+}
+
+@Test
+func runtimeShardInventoryRejectsMissingAndUnindexedShards() throws {
+    #expect(try validateRuntimeShardInventory(
+        referencedShards: ["b.safetensors", "a.safetensors"],
+        discoveredShards: ["a.safetensors", "b.safetensors"]
+    ) == ["a.safetensors", "b.safetensors"])
+
+    #expect(throws: MLXFastError.self) {
+        _ = try validateRuntimeShardInventory(
+            referencedShards: ["a.safetensors", "missing.safetensors"],
+            discoveredShards: ["a.safetensors"]
+        )
+    }
+    #expect(throws: MLXFastError.self) {
+        _ = try validateRuntimeShardInventory(
+            referencedShards: ["a.safetensors"],
+            discoveredShards: ["a.safetensors", "unindexed.safetensors"]
+        )
+    }
+}
+
+@Test
+func runtimeWeightNameTrackerRejectsMisplacedDuplicateAndRenamedCollisions() throws {
+    var misplaced = RuntimeWeightNameTracker()
+    #expect(throws: MLXFastError.self) {
+        _ = try misplaced.register(
+            originalName: "tensor.b",
+            shardName: "a.safetensors",
+            expectedNames: Set(["tensor.a"])
+        )
+    }
+
+    var duplicate = RuntimeWeightNameTracker()
+    let duplicateNames = Set(["language_model.model.tensor"])
+    #expect(try duplicate.register(
+        originalName: "language_model.model.tensor",
+        shardName: "a.safetensors",
+        expectedNames: duplicateNames
+    ) == "model.tensor")
+    #expect(throws: MLXFastError.self) {
+        _ = try duplicate.register(
+            originalName: "language_model.model.tensor",
+            shardName: "b.safetensors",
+            expectedNames: duplicateNames
+        )
+    }
+
+    var renamedCollision = RuntimeWeightNameTracker()
+    let collidingNames = Set(["language_model.model.tensor", "model.tensor"])
+    _ = try renamedCollision.register(
+        originalName: "language_model.model.tensor",
+        shardName: "a.safetensors",
+        expectedNames: collidingNames
+    )
+    #expect(throws: MLXFastError.self) {
+        _ = try renamedCollision.register(
+            originalName: "model.tensor",
+            shardName: "a.safetensors",
+            expectedNames: collidingNames
+        )
+    }
+}
+
+@Test
+func runtimeWeightNameTrackerRequiresEveryIndexedTensor() throws {
+    var tracker = RuntimeWeightNameTracker()
+    _ = try tracker.register(
+        originalName: "language_model.model.present",
+        shardName: "a.safetensors",
+        expectedNames: Set(["language_model.model.present"])
+    )
+
+    #expect(throws: MLXFastError.self) {
+        try tracker.validateComplete(expectedNames: Set([
+            "language_model.model.present",
+            "language_model.model.missing",
+        ]))
+    }
+}
+
 // A full end-to-end `validateRequiredMetadata` pass against the frozen (60
 // real-size layer) config is covered by BenchmarkSupportTests'
 // `benchmarkPreflightAcceptsRequiredArtifacts` and friends -- `Gemma4Config`
@@ -96,6 +302,39 @@ private struct TensorFixture {
     let dtype: String
     let shape: [Int]
     let data: Data
+}
+
+private let quantizedLinearName = "language_model.model.layers.0.self_attn.q_proj.weight"
+
+private func quantizedWeightFixture() -> TensorFixture {
+    TensorFixture(
+        name: quantizedLinearName,
+        dtype: "U32",
+        shape: [2, 1],
+        data: uint32Bytes([1, 2])
+    )
+}
+
+private func quantizedCompanionFixture(
+    suffix: String,
+    dtype: String = "BF16",
+    shape: [Int] = [2, 2]
+) -> TensorFixture {
+    let elementWidth = 2
+    return TensorFixture(
+        name: quantizedLinearName.replacingOccurrences(of: ".weight", with: ".\(suffix)"),
+        dtype: dtype,
+        shape: shape,
+        data: Data(repeating: 0, count: shape.reduce(1, *) * elementWidth)
+    )
+}
+
+private func validQuantizedLinearFixtures() -> [TensorFixture] {
+    [
+        quantizedWeightFixture(),
+        quantizedCompanionFixture(suffix: "scales"),
+        quantizedCompanionFixture(suffix: "biases"),
+    ]
 }
 
 private func makeWeightsFixture(tensors: [TensorFixture]) throws -> URL {

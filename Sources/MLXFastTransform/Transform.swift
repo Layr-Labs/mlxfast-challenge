@@ -55,6 +55,13 @@ public enum SwiftTransform {
     static let textTowerPrefix = "language_model."
 
     public static func run(_ options: TransformOptions) throws -> TransformReport {
+        try run(options, beforeSourceRevalidation: nil)
+    }
+
+    static func run(
+        _ options: TransformOptions,
+        beforeSourceRevalidation: (() throws -> Void)?
+    ) throws -> TransformReport {
         let referenceDirectory = canonicalURL(
             try findReferenceDirectory(URL(fileURLWithPath: options.referencePath))
         )
@@ -73,12 +80,16 @@ public enum SwiftTransform {
             )
         }
 
+        let referenceConfigPath = referenceDirectory.appendingPathComponent("config.json")
         try requireFile(
-            referenceDirectory.appendingPathComponent("config.json").path,
+            referenceConfigPath.path,
             description: "Gemma 4 31B 4-bit reference config"
         )
+        let runtimeConfigData = try makeRuntimeConfigData(sourceConfigPath: referenceConfigPath)
+        let metadataSnapshot = try captureMetadataFiles(from: referenceDirectory)
 
         let index = try loadIndex(referenceDirectory)
+        let indexSnapshot = try index.canonicalData()
         let validatedHeaders = try validateCheckpointIndex(
             index,
             referenceDirectory: referenceDirectory
@@ -90,6 +101,25 @@ public enum SwiftTransform {
 
         let textKeysByShard = Dictionary(grouping: textKeys) { key in
             index.weightMap[key] ?? ""
+        }
+        var totalTensorByteCount = 0
+        for key in textKeys.sorted() {
+            guard let shardName = index.weightMap[key],
+                  let info = validatedHeaders[shardName]?.tensors[key]
+            else {
+                throw MLXFastError.invalidInput(
+                    "missing validated tensor metadata for \(key)"
+                )
+            }
+            let (nextTotal, overflow) = totalTensorByteCount.addingReportingOverflow(
+                info.byteCount
+            )
+            guard !overflow else {
+                throw MLXFastError.invalidInput(
+                    "transformed tensor byte count overflows Int"
+                )
+            }
+            totalTensorByteCount = nextTotal
         }
 
         let fileManager = FileManager.default
@@ -124,15 +154,41 @@ public enum SwiftTransform {
             )
         }
 
-        try copyTokenizerFiles(from: referenceDirectory, to: stagingDirectory)
+        try writeMetadataFiles(metadataSnapshot, to: stagingDirectory)
         try index.writeStripped(
             to: stagingDirectory.appendingPathComponent("model.safetensors.index.json"),
-            keeping: textKeys
+            keeping: textKeys,
+            totalTensorByteCount: totalTensorByteCount
         )
 
-        try writeRuntimeConfig(
+        try runtimeConfigData.write(
+            to: stagingDirectory.appendingPathComponent("config.json")
+        )
+        try beforeSourceRevalidation?()
+        try validateConfigAndIndexSnapshot(
             referenceDirectory: referenceDirectory,
-            configPath: stagingDirectory.appendingPathComponent("config.json")
+            referenceConfigPath: referenceConfigPath,
+            runtimeConfigData: runtimeConfigData,
+            indexSnapshot: indexSnapshot,
+            metadataSnapshot: metadataSnapshot
+        )
+        for shardName in validatedHeaders.keys.sorted() {
+            guard let header = validatedHeaders[shardName] else {
+                throw MLXFastError.invalidInput(
+                    "missing validated header for checkpoint shard \(shardName)"
+                )
+            }
+            try Safetensors.validateSourceIdentity(
+                referenceDirectory.appendingPathComponent(shardName),
+                against: header
+            )
+        }
+        try validateConfigAndIndexSnapshot(
+            referenceDirectory: referenceDirectory,
+            referenceConfigPath: referenceConfigPath,
+            runtimeConfigData: runtimeConfigData,
+            indexSnapshot: indexSnapshot,
+            metadataSnapshot: metadataSnapshot
         )
         try installTransformedDirectory(
             stagingDirectory,
@@ -305,22 +361,37 @@ public enum SwiftTransform {
         key.hasPrefix(textTowerPrefix)
     }
 
-    private static func copyTokenizerFiles(from source: URL, to destination: URL) throws {
+    private static func captureMetadataFiles(from source: URL) throws -> [String: Data] {
         let files = try FileManager.default.contentsOfDirectory(
             at: source,
-            includingPropertiesForKeys: [.isRegularFileKey]
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]
         )
+        var snapshot: [String: Data] = [:]
         for file in files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
             if file.lastPathComponent == "model.safetensors.index.json" || file.lastPathComponent == "config.json" {
                 continue
             }
             if shouldCopyMetadataFile(file) {
-                let target = destination.appendingPathComponent(file.lastPathComponent)
-                if FileManager.default.fileExists(atPath: target.path) {
-                    try FileManager.default.removeItem(at: target)
+                let values = try file.resourceValues(
+                    forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+                )
+                guard values.isRegularFile == true, values.isSymbolicLink != true else {
+                    throw MLXFastError.invalidInput(
+                        "reference metadata is not a regular file: \(file.path)"
+                    )
                 }
-                try FileManager.default.copyItem(at: file, to: target)
+                snapshot[file.lastPathComponent] = try Data(contentsOf: file)
             }
+        }
+        return snapshot
+    }
+
+    private static func writeMetadataFiles(
+        _ snapshot: [String: Data],
+        to destination: URL
+    ) throws {
+        for name in snapshot.keys.sorted() {
+            try snapshot[name]?.write(to: destination.appendingPathComponent(name))
         }
     }
 
@@ -344,8 +415,7 @@ public enum SwiftTransform {
     /// what `Gemma4Config`/`Gemma4WeightLoader` actually need -- no vision or
     /// audio config, no architecture/tokenizer metadata duplicated from
     /// `tokenizer_config.json`.
-    private static func writeRuntimeConfig(referenceDirectory: URL, configPath: URL) throws {
-        let sourceConfigPath = referenceDirectory.appendingPathComponent("config.json")
+    static func makeRuntimeConfigData(sourceConfigPath: URL) throws -> Data {
         let data = try Data(contentsOf: sourceConfigPath)
         let object = try JSONSerialization.jsonObject(with: data)
         guard let root = object as? [String: Any] else {
@@ -362,10 +432,35 @@ public enum SwiftTransform {
             runtimeConfig["quantization"] = quantizationConfig
         }
 
-        let output = try JSONSerialization.data(
+        return try JSONSerialization.data(
             withJSONObject: runtimeConfig,
             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         )
-        try output.write(to: configPath)
+    }
+
+    private static func validateConfigAndIndexSnapshot(
+        referenceDirectory: URL,
+        referenceConfigPath: URL,
+        runtimeConfigData: Data,
+        indexSnapshot: Data,
+        metadataSnapshot: [String: Data]
+    ) throws {
+        guard try makeRuntimeConfigData(sourceConfigPath: referenceConfigPath)
+            == runtimeConfigData
+        else {
+            throw MLXFastError.invalidInput(
+                "reference config changed while transform was running"
+            )
+        }
+        guard try loadIndex(referenceDirectory).canonicalData() == indexSnapshot else {
+            throw MLXFastError.invalidInput(
+                "checkpoint index changed while transform was running"
+            )
+        }
+        guard try captureMetadataFiles(from: referenceDirectory) == metadataSnapshot else {
+            throw MLXFastError.invalidInput(
+                "reference tokenizer metadata changed while transform was running"
+            )
+        }
     }
 }

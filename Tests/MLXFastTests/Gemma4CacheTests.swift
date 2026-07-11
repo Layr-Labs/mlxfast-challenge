@@ -1,4 +1,5 @@
 import Foundation
+import Dispatch
 import MLX
 @testable import MLXFastCore
 @testable import MLXFastModel
@@ -109,6 +110,56 @@ func gemma4ModelCacheMaterializesCollectedCachedStateWhenRuntimeTestsAreEnabled(
 
     #expect(cache.arraysForMaterialization().count == 2)
     cache.materializeCachedState()
+}
+
+@Test
+func lockedCacheConcurrentMissInstantiatesValueExactlyOnce() {
+    let cache = LockedCache<String, LockedCacheTestValue>()
+    let probe = LockedCacheTestProbe()
+
+    DispatchQueue.concurrentPerform(iterations: 32) { _ in
+        let value = cache.value(for: "shared") {
+            probe.recordConstruction()
+            Thread.sleep(forTimeInterval: 0.01)
+            return LockedCacheTestValue()
+        }
+        probe.recordResult(value)
+    }
+
+    let snapshot = probe.snapshot()
+    #expect(snapshot.constructionCount == 1)
+    #expect(snapshot.resultCount == 32)
+    #expect(snapshot.uniqueResultCount == 1)
+}
+
+private final class LockedCacheTestValue {}
+
+private final class LockedCacheTestProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var constructionCount = 0
+    private var resultIdentifiers: [ObjectIdentifier] = []
+
+    func recordConstruction() {
+        lock.lock()
+        constructionCount += 1
+        lock.unlock()
+    }
+
+    func recordResult(_ value: LockedCacheTestValue) {
+        lock.lock()
+        resultIdentifiers.append(ObjectIdentifier(value))
+        lock.unlock()
+    }
+
+    func snapshot() -> (constructionCount: Int, resultCount: Int, uniqueResultCount: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (
+            constructionCount,
+            resultIdentifiers.count,
+            Set(resultIdentifiers).count
+        )
+    }
 }
 
 private func temporaryDirectory() throws -> URL {

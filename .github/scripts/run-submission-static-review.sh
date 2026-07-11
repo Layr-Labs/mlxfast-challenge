@@ -29,6 +29,7 @@ mkdir -p "${private_root}" "$(dirname "${RESULTS_PATH}")"
 work_dir="$(mktemp -d "${private_root%/}/submission-review.XXXXXX")"
 trap 'rm -rf "${work_dir}"' EXIT
 files_ndjson="${work_dir}/files.ndjson"
+: > "${files_ndjson}"
 curl_config="${work_dir}/anthropic-curl.conf"
 request_path="${work_dir}/request.json"
 # Empty by default; diff-only mode overwrites it with the base..head diff.
@@ -146,28 +147,39 @@ if (( ${#editable_paths[@]} == 0 )); then
 fi
 
 if [[ -n "${review_base}" ]]; then
+  changed_paths_file="${work_dir}/changed-paths.z"
+  changed_present_paths_file="${work_dir}/changed-present-paths.z"
+  changed_path_count=0
   for editable_path in "${editable_paths[@]}"; do
     validate_contract_path "${editable_path}"
-    # --diff-filter=d keeps every changed-and-still-present file (excludes only
-    # deletions -- a removed file has nothing to review). Paths are repo-relative
-    # and pathspec-scoped to the editable surface, matching the fallback below.
-    while IFS= read -r -d '' file_path; do
-      # Every path the diff lists exists in the review head commit; a missing
-      # or non-regular work-tree file is divergence (or a symlink) and must
-      # fail the review, not silently shrink what the judge sees.
-      if [[ -h "${file_path}" || ! -f "${file_path}" ]]; then
-        echo "::error file=${file_path}::changed editable path is missing or not a regular file in the checkout" >&2
-        exit 1
-      fi
-      collect_file "${file_path}"
-    done < <(git diff --name-only -z --diff-filter=d "${review_base}" "${review_head}" -- "${editable_path}")
   done
 
-  if (( file_count == 0 )); then
+  # Capture both the complete changed-path set (including deletions) and the
+  # changed files still present in the head. Use regular temporary files so a
+  # git failure cannot disappear inside process-substitution status handling.
+  git diff --name-only -z "${review_base}" "${review_head}" -- "${editable_paths[@]}" \
+    > "${changed_paths_file}"
+  git diff --name-only -z --diff-filter=d "${review_base}" "${review_head}" -- "${editable_paths[@]}" \
+    > "${changed_present_paths_file}"
+
+  while IFS= read -r -d '' file_path; do
+    changed_path_count=$((changed_path_count + 1))
+  done < "${changed_paths_file}"
+
+  if (( changed_path_count == 0 )); then
     echo "submission-review: no editable files changed versus ${review_base}; nothing to review"
     printf '{"passed":true,"severity":"none","summary":"no editable files changed versus base %s","findings":[]}' "${review_base}" > "${RESULTS_PATH}"
     exit 0
   fi
+
+  while IFS= read -r -d '' file_path; do
+    # Every non-deleted path the diff lists must agree with the review head.
+    if [[ -h "${file_path}" || ! -f "${file_path}" ]]; then
+      echo "::error file=${file_path}::changed editable path is missing or not a regular file in the checkout" >&2
+      exit 1
+    fi
+    collect_file "${file_path}"
+  done < "${changed_present_paths_file}"
 
   # Also send the unified diff so the judge can attribute: changed FILES are
   # sent whole (context), but verdicts must be about what this submission

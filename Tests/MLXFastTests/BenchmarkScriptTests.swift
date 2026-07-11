@@ -687,10 +687,18 @@ func benchmarkWorkflowBindsPublishedArtifactsToDispatchedCommit() throws {
     #expect(overlay.contains("MLXFAST_EXPECTED_COMMIT must be a full lowercase commit SHA"))
     #expect(overlay.contains("--arg expected_commit \"${EXPECTED_COMMIT}\""))
     #expect(overlay.contains("($expected_commit | startswith($commit))"))
+    #expect(overlay.contains("--slurpfile gates \"${SCORE_PATH}\""))
+    #expect(overlay.contains(".metrics.harness_hash == $gates[0].metrics.harness_hash"))
+    #expect(overlay.contains(".metrics.weights_hash == $gates[0].metrics.weights_hash"))
+    #expect(overlay.contains(".metrics.weights_file_count == $gates[0].metrics.weights_file_count"))
+    #expect(overlay.contains(".metrics.weights_byte_count == $gates[0].metrics.weights_byte_count"))
     #expect(validator.contains("MLXFAST_EXPECTED_COMMIT:?MLXFAST_EXPECTED_COMMIT is required"))
     #expect(validator.contains("MLXFAST_EXPECTED_COMMIT must be a full lowercase commit SHA"))
     #expect(validator.contains("--arg expected_commit \"${MLXFAST_EXPECTED_COMMIT}\""))
     #expect(validator.contains("($expected_commit | startswith($commit))"))
+    #expect(validator.contains("$score[0].metrics.weights_hash == $integrity[0].weights_sha256"))
+    #expect(validator.contains("$score[0].metrics.golden_hash == $integrity[0].golden_sha256"))
+    #expect(workflow.contains("transformed weights changed between trusted hashing and the gates run"))
 
     // The trusted input file is checked before staging and is included in both
     // correctness-only and ranked result artifacts.
@@ -882,7 +890,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     let scoreArtifactCheck = try #require(validator.range(of: "require_file \"${SCORE_PATH}\""))
     let checkedStepsEnvCheck = try #require(validator.range(of: "MLXFAST_EXPECTED_CORRECTNESS_CHECKED_STEPS is required"))
     #expect(scoreArtifactCheck.lowerBound < checkedStepsEnvCheck.lowerBound)
-    #expect(stageArtifacts.contains("/tmp/mlxfast-artifacts-*"))
+    #expect(stageArtifacts.contains("one direct child of /tmp/mlxfast-artifacts-RUN"))
     #expect(stageArtifacts.contains(".github/scripts/deny-private-artifacts.sh \"${dest}\""))
     #expect(semanticGate.contains("ANTHROPIC_API_KEY is required"))
     #expect(semanticGate.contains("unset ANTHROPIC_API_KEY"))
@@ -947,7 +955,8 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // (Gemma4SubmissionControls.swift's validation hook, comment mentions
     // benchmark timing) failed a submission that never touched it.
     #expect(staticReview.contains("review_base=\"${MLXFAST_SUBMISSION_REVIEW_BASE_SHA:-}\""))
-    #expect(staticReview.contains("git diff --name-only -z --diff-filter=d \"${review_base}\" \"${review_head}\" -- \"${editable_path}\""))
+    #expect(staticReview.contains("git diff --name-only -z \"${review_base}\" \"${review_head}\" -- \"${editable_paths[@]}\""))
+    #expect(staticReview.contains("changed_path_count=$((changed_path_count + 1))"))
     // A resolvable base is mandatory once provided (fail closed, never silently
     // fall back to whole-surface which would resurrect the false positive).
     #expect(staticReview.contains("is not a resolvable commit"))
@@ -1170,6 +1179,24 @@ func submissionStaticReviewDiffModeFailsClosedAndSendsOnlyChangedFiles() throws 
     #expect(request.contains("Sources/MLXFastModel/Changed.swift"))
     #expect(!request.contains("Baseline.swift"))
     #expect(!request.contains("prove the benchmark detects slower measured decode"))
+
+    // A deletion-only submission still has executable meaning and must reach
+    // the judge through submission_diff instead of taking the no-files pass.
+    try git(["checkout", "-q", "-b", "deletion-only", baseSha])
+    try fm.removeItem(atPath: repo + "/Sources/MLXFastModel/Baseline.swift")
+    try git(["add", "-A"])
+    try git(["commit", "-q", "-m", "delete editable source"])
+    let deletionHead = try git(["rev-parse", "HEAD"])
+    let deletionCapture = root.appendingPathComponent("deletion-request.json").path
+    let deletion = try review(
+        base: baseSha,
+        head: deletionHead,
+        env: ["PATH": shimDir + ":" + inheritedPath, "CURL_SHIM_CAPTURE": deletionCapture]
+    )
+    #expect(deletion.status == 0, deletion.output.isEmpty ? "no output" : "\(deletion.output)")
+    let deletionRequest = try String(contentsOfFile: deletionCapture, encoding: .utf8)
+    #expect(deletionRequest.contains("Sources/MLXFastModel/Baseline.swift"))
+    #expect(deletionRequest.contains("prove the benchmark detects slower measured decode"))
 }
 
 // Ranked validation otherwise exercises only the hidden goldens, so numerics
@@ -1401,6 +1428,9 @@ func offlineRunnerProvesNetworkIsBlockedBeforeRunningCommand() throws {
     #expect(runner.contains("network egress and child process execution are blocked"))
     #expect(runner.contains("export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1"))
     #expect(runner.contains("export HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9"))
+    #expect(runner.contains("trap cleanup_profiles EXIT"))
+    #expect(runner.contains("rm -f \"${curl_profile}\""))
+    #expect(runner.contains("rm -f \"${command_profile}\""))
 }
 
 // Direct `mlxfast-swift correctness` invocations (the public behavior gate)
@@ -1510,8 +1540,8 @@ func benchmarkScriptAvoidsNestedSandboxWithRuntimeWorker() throws {
     #expect(benchmark.contains("if [[ \"${USE_RUNTIME_WORKER}\" != \"1\" && \"${MLXFAST_IN_SANDBOX:-0}\" != \"1\" && \"${MLXFAST_NO_SANDBOX:-0}\" != \"1\" ]]; then"))
     #expect(benchmark.contains("run_offline_writable_command \"${TRANSFORM_STAGING_PARENT_OWNED}\""))
     #expect(benchmark.contains("--output \"${staged_weights}\""))
-    #expect(benchmark.contains("run_offline_writable_command \"$(absolute_path \"${VERIFY_TRANSFORM_TMP_PARENT}\")\""))
-    #expect(benchmark.contains("--tmp-parent \"${VERIFY_TRANSFORM_TMP_PARENT}\""))
+    #expect(benchmark.contains("run_offline_writable_command \"$(absolute_path \"${VERIFY_TRANSFORM_TMP_PARENT_OWNED}\")\""))
+    #expect(benchmark.contains("--tmp-parent \"${VERIFY_TRANSFORM_TMP_PARENT_OWNED}\""))
 }
 
 @Test
@@ -1890,6 +1920,62 @@ func hashWeightsDirectoryIsIndependentOfWeightsPathButSensitiveToContent() throw
     let hashB = try hash(rootB)
     #expect(!hashA.isEmpty)
     #expect(hashA == hashB)
+    var expectedTreeBytes = Data("config.json".utf8)
+    expectedTreeBytes.append(0)
+    expectedTreeBytes.append(contentsOf: SHA256.hash(data: Data("identical content".utf8)))
+    expectedTreeBytes.append(0)
+    let expectedTreeHash = SHA256.hash(data: expectedTreeBytes)
+        .map { String(format: "%02x", $0) }
+        .joined()
+    #expect(hashA == expectedTreeHash)
+
+    // Exercise the complete framing contract, including lexical path order,
+    // with files created in deliberately different and nested order.
+    let multi = root.appendingPathComponent("multi-\(UUID().uuidString)/weights")
+    try FileManager.default.createDirectory(
+        at: multi.appendingPathComponent("nested"),
+        withIntermediateDirectories: true
+    )
+    let multiFiles: [(path: String, contents: String)] = [
+        ("z-last.bin", "z"),
+        ("nested/a-first.bin", "a"),
+        ("middle.txt", "m"),
+    ]
+    for file in multiFiles {
+        try file.contents.write(
+            to: multi.appendingPathComponent(file.path),
+            atomically: true,
+            encoding: .utf8
+        )
+    }
+    var expectedMultiTreeBytes = Data()
+    for file in multiFiles.sorted(by: { $0.path < $1.path }) {
+        expectedMultiTreeBytes.append(Data(file.path.utf8))
+        expectedMultiTreeBytes.append(0)
+        expectedMultiTreeBytes.append(
+            contentsOf: SHA256.hash(data: Data(file.contents.utf8))
+        )
+        expectedMultiTreeBytes.append(0)
+    }
+    let expectedMultiTreeHash = SHA256.hash(data: expectedMultiTreeBytes)
+        .map { String(format: "%02x", $0) }
+        .joined()
+    #expect(try hash(multi) == expectedMultiTreeHash)
+
+    try "ignored".write(
+        to: rootA.appendingPathComponent(".benchmark-source.sha256"),
+        atomically: true,
+        encoding: .utf8
+    )
+    #expect(try hash(rootA) == hashA)
+    let nested = rootA.appendingPathComponent("nested")
+    try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+    try "included".write(
+        to: nested.appendingPathComponent(".gitkeep"),
+        atomically: true,
+        encoding: .utf8
+    )
+    #expect(try hash(rootA) != hashA)
 
     let differentContent = try makeWeights(named: "different-\(UUID().uuidString)", content: "not the same")
     #expect(try hash(differentContent) != hashA)
@@ -2144,13 +2230,19 @@ func combineParallelCorrectnessCoarsensPublishedDiagnostics() throws {
 
 @Test
 func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
-    let runtime = try harnessRuntimeSource()
+    let runtime = try String(
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeWorker.swift",
+        encoding: .utf8
+    )
 
-    #expect(runtime.contains("let hello = try readResponseLine(validateNonce: false)"))
+    #expect(runtime.contains("hello = try readResponseLine(validateNonce: false)"))
     #expect(runtime.contains("self.sessionNonce = nonce"))
     #expect(!runtime.contains("RuntimeWorkerRequest(\n            id: id,\n            nonce"))
     #expect(runtime.contains("response.nonce != sessionNonce"))
     #expect(runtime.contains("RuntimeWorkerProtocolIO.isolatingStandardIO()"))
+    let protocolIsolation = try #require(runtime.range(of: "RuntimeWorkerProtocolIO.isolatingStandardIO()"))
+    let configLoad = try #require(runtime.range(of: "Gemma4Config.load(from: weightsPath)"))
+    #expect(protocolIsolation.lowerBound < configLoad.lowerBound)
     #expect(runtime.contains("F_DUPFD_CLOEXEC"))
     #expect(runtime.contains("arc4random_buf(baseAddress, buffer.count)"))
     #expect(runtime.contains("redirectDescriptorToDevNull(STDIN_FILENO, flags: O_RDONLY"))
@@ -2175,6 +2267,7 @@ func runtimeWorkerValidatesTransformedWeightsAtStartup() throws {
     let startup = String(worker[runWorkerStart.lowerBound..<helloAnchor.lowerBound])
     #expect(startup.contains("try loader.denseStore.validateReadableByteRanges()"))
     #expect(startup.contains("try loader.validateRequiredMetadata(config: config)"))
+    #expect(startup.contains("try weightCache.requireLibraryModel()"))
 
     // The parent's worker decode path must not read the editable submission delay
     // hook: Gemma4SubmissionControls is editable MLXFastModel code and the worker
@@ -2185,6 +2278,18 @@ func runtimeWorkerValidatesTransformedWeightsAtStartup() throws {
     let workerDecode = String(runtime[decodeStart.lowerBound..<decodeEnd.lowerBound])
     #expect(!workerDecode.contains("submissionValidationDelayMilliseconds()"))
     #expect(!workerDecode.contains("decode validation delay enabled"))
+}
+
+@Test
+func compiledDecodeSkipsSynchronousHostOffsetValidation() throws {
+    let model = try String(
+        contentsOfFile: "Sources/MLXFastModel/Gemma4Model.swift",
+        encoding: .utf8
+    )
+    #expect(model.contains("let compiledDecodeStep = cache.compiledDecodeStep"))
+    #expect(model.contains("if compiledDecodeStep == nil {"))
+    #expect(model.contains("cacheOffsets: kvCaches.map(\\.offset)"))
+    #expect(model.contains("if let step = compiledDecodeStep {"))
 }
 
 @Test
@@ -2225,7 +2330,8 @@ func benchmarkLocalSubmitModeUsesLongLocalBenchmarkAndPrintsScore() throws {
     // see localIterateScorePublishesCLIUsableEstimatedScore for the payload
     // behavior and rankedScoreSemanticsAreUnchangedByLocalEstimatedScore for
     // the ranked-path guard.
-    #expect(localRuntime.contains("score: estimatedScore.isFinite ? estimatedScore : nil"))
+    #expect(localRuntime.contains("error: \"local estimated score is invalid:"))
+    #expect(localRuntime.contains("score: estimatedScore"))
     #expect(constants.contains("public static let defaultPublicLocalSubmitGoldenPath"))
     #expect(constants.contains("public static let localSubmitBenchmarkDecodeSteps = 1023"))
     #expect(constants.contains("public static let localSubmitBenchmarkRepeats = 1"))
@@ -2288,9 +2394,10 @@ func benchmarkLocalIterateModeUsesPublicFixtureAndNonOfficialScore() throws {
     #expect(!runtime.contains("topLogits(from:"))
     // Local modes publish the estimated (non-official) score so the Yukon CLI
     // (`mlxfast run`), which requires a finite numeric score at scorePath, can
-    // consume local runs; a non-finite estimate still falls back to null.
+    // consume valid local runs; invalid timing produces an explicit failed payload.
     #expect(runtime.contains("let estimatedScore = BenchmarkScore.score("))
-    #expect(runtime.contains("score: estimatedScore.isFinite ? estimatedScore : nil"))
+    #expect(runtime.contains("error: \"local estimated score is invalid:"))
+    #expect(runtime.contains("score: estimatedScore"))
     #expect(options.contains("runtime: String = \"swift-local-iterate\""))
     let prefillStartRange = try #require(runtime.range(of: "\\(modeName) prefill measured start prompt_tokens="))
     let decodeStartRange = try #require(runtime.range(of: "\\(modeName) decode measured start tokens="))
@@ -2608,12 +2715,14 @@ func localModesForwardWorkerStderrLiveButOfficialRunsDoNot() throws {
 
     // The drain forwards each line with the worker prefix after per-line
     // token redaction, keeps only a capped raw tail for the exit diagnostic,
-    // and is attached before the protocol hello so setup output streams too.
+    // and is attached before the protocol hello so setup output is drained too.
     #expect(worker.contains("final class WorkerStderrDrain"))
     #expect(worker.contains("static let forwardedLinePrefix = \"mlxfast-worker: \""))
     #expect(worker.contains("redactedWorkerStderrLine(line)"))
-    #expect(worker.contains("options.forwardsWorkerStderr\n            ? WorkerStderrDrain(handle: stderr.fileHandleForReading)\n            : nil"))
-    #expect(worker.contains("stderrDrain?.drainedOutput(timeoutSeconds: 2)"))
+    #expect(worker.contains("self.stderrDrain = WorkerStderrDrain("))
+    #expect(worker.contains("emit: options.forwardsWorkerStderr ? nil : { _ in }"))
+    #expect(worker.contains("private let stderrDrain: WorkerStderrDrain"))
+    #expect(!worker.contains("private let stderrDrain: WorkerStderrDrain?"))
 }
 
 @Test
@@ -3093,7 +3202,14 @@ func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
         if [ "$1" = "--output" ]; then shift; out="$1"; fi
         shift
       done
-      [ -n "$out" ] && mkdir -p "$out" && printf '{}' > "$out/config.json"
+      if [ -n "$out" ]; then
+        mkdir -p "$out"
+        printf '{}' > "$out/config.json"
+        printf '%s\n' '{"weight_map":{"tensor":"model.safetensors"}}' > "$out/model.safetensors.index.json"
+        printf '\\100\\000\\000\\000\\000\\000\\000\\000' > "$out/model.safetensors"
+        printf '%s' '{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}      ' >> "$out/model.safetensors"
+        printf '\\001' >> "$out/model.safetensors"
+      fi
       exit 0
     fi
     cat <<'JSON'
@@ -3518,6 +3634,8 @@ func benchmarkWorkflowFailsClosedWhenRunnerPrivateArtifactCleanupFails() throws 
 
     // Bench-owned residue remains best-effort because the runner uid may not be
     // able to unlink it; runner-owned private roots must be removed and checked.
+    #expect(cleanup.contains("find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +"))
+    #expect(!cleanup.contains("rm -rf ./* ./.??*"))
     #expect(cleanup.contains("rm -rf \"${MLXFAST_JOB_WS}\" || true"))
     #expect(cleanup.contains("for private_path in \\"))
     #expect(cleanup.contains("\"${MLXFAST_PRIVATE_DIR}\" \\"))

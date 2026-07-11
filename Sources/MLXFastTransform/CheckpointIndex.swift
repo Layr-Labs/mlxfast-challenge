@@ -18,9 +18,23 @@ struct CheckpointIndex {
         return CheckpointIndex(raw: raw, weightMap: weightMap)
     }
 
-    func writeStripped(to path: URL, keeping keys: Set<String>) throws {
+    func canonicalData() throws -> Data {
+        try JSONSerialization.data(
+            withJSONObject: raw,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+    }
+
+    func writeStripped(
+        to path: URL,
+        keeping keys: Set<String>,
+        totalTensorByteCount: Int
+    ) throws {
         var output = raw
         output["weight_map"] = weightMap.filter { keys.contains($0.key) }
+        var metadata = output["metadata"] as? [String: Any] ?? [:]
+        metadata["total_size"] = totalTensorByteCount
+        output["metadata"] = metadata
         let data = try JSONSerialization.data(
             withJSONObject: output,
             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]

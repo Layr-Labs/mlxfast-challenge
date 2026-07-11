@@ -233,4 +233,13 @@ jq -e '
   and (.weights_byte_count > 0)
   ' "${INTEGRITY_PATH}" >/dev/null
 
+jq -e -n \
+  --slurpfile score "${SCORE_PATH}" \
+  --slurpfile integrity "${INTEGRITY_PATH}" '
+  ($score[0].metrics.weights_hash == $integrity[0].weights_sha256)
+  and ($score[0].metrics.weights_file_count == $integrity[0].weights_file_count)
+  and ($score[0].metrics.weights_byte_count == $integrity[0].weights_byte_count)
+  and ($score[0].metrics.golden_hash == $integrity[0].golden_sha256)
+' >/dev/null
+
 echo "benchmark: validated score and integrity artifacts"

@@ -199,6 +199,19 @@ jobs:
       MLXFAST_CANDIDATE_SHA: ${{ github.sha }}
       MLXFAST_IS_SUBMISSION_BRANCH: ${{ startsWith(github.ref, 'refs/heads/submissions/') && '1' || '0' }}
       MLXFAST_VERIFY_TRANSFORM: ${{ inputs.verify_transform && '1' || '0' }}
+      # POLICY (TOOLCHAINS override, ranked side): the ranked build must use
+      # exactly ONE operator-chosen Metal toolchain. This pin is the
+      # operator-installed Metal Toolchain on the m5-bench box (Metal build
+      # 17E188); tools/build-mlx-metallib.sh exports TOOLCHAINS from it. The
+      # value is injected into the bench build below as trusted argv through
+      # the bench-exec bridge (sudo env_reset + env -i mean nothing submitted
+      # code exports can reach that environment), so submissions cannot select
+      # a different compiler. Participants remain free to override
+      # MLXFAST_METAL_TOOLCHAIN_IDENTIFIER on their own machines. Update this
+      # pin deliberately when the box's Metal Toolchain is upgraded; the
+      # fingerprint step below fails fast if the pin and the installed
+      # toolchain ever disagree.
+      MLXFAST_METAL_TOOLCHAIN_IDENTIFIER: com.apple.dt.toolchain.Metal.32023.883
     steps:
       # Fail fast if the box is quarantined or the isolation stack is missing,
       # before any checkout or secret use. The bridge is root-only (0750
@@ -403,6 +416,14 @@ jobs:
               | awk -F': ' '/Toolchain Identifier/ { print $2; exit }' \
               || true
           )"
+          # The ranked pin and the box's installed Metal Toolchain must agree;
+          # otherwise the cache fingerprint (detected toolchain) and the bench
+          # build (pinned toolchain) could silently diverge.
+          if [[ -n "${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" \
+              && "${metal_toolchain_identifier}" != "${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" ]]; then
+            echo "::error::installed Metal toolchain (${metal_toolchain_identifier:-none}) does not match the ranked pin (${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}); update the pin or the box deliberately" >&2
+            exit 1
+          fi
           fingerprint="$({
             printf '%s\n' mlx-metallib-m5-max-v1
             uname -m
@@ -478,8 +499,13 @@ jobs:
           BENCH_JOB_ID: ranked-${{ github.run_id }}-${{ github.run_attempt }}-build
         run: |
           set -euo pipefail
+          # The Metal toolchain pin rides the trusted argv into the bridge's
+          # env -i child environment (sudo env_reset strips job env, so this
+          # explicit /usr/bin/env assignment is the only way it gets there,
+          # and nothing submitted code exports can replace it).
           sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
-            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" /bin/bash -c '
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" \
+              MLXFAST_METAL_TOOLCHAIN_IDENTIFIER="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" /bin/bash -c '
               set -euo pipefail
               cd "${MJOB_WS}"
               /usr/bin/swift build -c release
@@ -884,6 +910,14 @@ jobs:
             echo "::error::sealed gates score hash does not match harness integrity record (possible in-workspace tamper)" >&2
             exit 1
           fi
+          trusted_weights_hash="$(tr -d '[:space:]' < weights.sha256)"
+          gates_weights_hash="$(jq -r '.metrics.weights_hash // empty' score.json)"
+          integrity_weights_hash="$(jq -r '.weights_sha256 // empty' benchmark-integrity.json)"
+          if [[ "${gates_weights_hash}" != "${trusted_weights_hash}" \
+              || "${integrity_weights_hash}" != "${trusted_weights_hash}" ]]; then
+            echo "::error::transformed weights changed between trusted hashing and the gates run" >&2
+            exit 1
+          fi
           echo "benchmark: correctness+gates finished exit=${status} seconds=$((SECONDS - started))"
           exit "${status}"
 
@@ -1150,7 +1184,7 @@ jobs:
           set -euo pipefail
           if [[ -d "${MLXFAST_JOB_WS}" ]]; then
             sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
-              /bin/sh -c 'rm -rf ./* ./.??* 2>/dev/null; true' || true
+              /bin/sh -c 'find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null; true' || true
             rm -rf "${MLXFAST_JOB_WS}" || true
             if [[ -d "${MLXFAST_JOB_WS}" ]]; then
               echo "::warning::bench workspace residue left at ${MLXFAST_JOB_WS}"

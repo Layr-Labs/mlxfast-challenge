@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 import MLXFastCore
 
@@ -136,6 +137,11 @@ public struct Gemma4Config: Equatable {
         }
 
         let numHiddenLayers = try intField("num_hidden_layers", root: root, defaultValue: MLXFastConstants.numHiddenLayers)
+        guard numHiddenLayers == MLXFastConstants.numHiddenLayers else {
+            throw MLXFastError.invalidInput(
+                "Gemma 4 config invariant check failed: num_hidden_layers=\(numHiddenLayers) expected \(MLXFastConstants.numHiddenLayers)"
+            )
+        }
         let ropeParameters = root["rope_parameters"] as? [String: Any]
         let slidingRopeObject = ropeParameters?["sliding_attention"] as? [String: Any] ?? [:]
         let fullRopeObject = ropeParameters?["full_attention"] as? [String: Any] ?? [:]
@@ -176,6 +182,7 @@ public struct Gemma4Config: Equatable {
             quantizationBits: try intField("bits", root: quantization, defaultValue: 4)
         )
         try config.validateFrozenInvariants()
+        try config.validateStructuralValues()
         return config
     }
 
@@ -197,6 +204,76 @@ public struct Gemma4Config: Equatable {
         if !allErrors.isEmpty {
             throw MLXFastError.invalidInput(
                 "Gemma 4 config invariant check failed: \(allErrors.joined(separator: ", "))"
+            )
+        }
+    }
+
+    public func validateStructuralValues() throws {
+        guard numAttentionHeads > 0, numKeyValueHeads > 0, numGlobalKeyValueHeads > 0 else {
+            throw MLXFastError.invalidInput("Gemma 4 attention and KV head counts must be positive")
+        }
+        guard headDim > 0, headDim.isMultiple(of: 2),
+              globalHeadDim > 0, globalHeadDim.isMultiple(of: 2)
+        else {
+            throw MLXFastError.invalidInput("Gemma 4 attention head dimensions must be positive and even")
+        }
+        let projectionDimensions = [
+            numAttentionHeads.multipliedReportingOverflow(by: headDim),
+            numAttentionHeads.multipliedReportingOverflow(by: globalHeadDim),
+            numKeyValueHeads.multipliedReportingOverflow(by: headDim),
+            numGlobalKeyValueHeads.multipliedReportingOverflow(by: globalHeadDim),
+        ]
+        guard projectionDimensions.allSatisfy({ !$0.overflow && $0.partialValue > 0 }) else {
+            throw MLXFastError.invalidInput("Gemma 4 attention projection dimensions overflow Int")
+        }
+        guard numAttentionHeads.isMultiple(of: numKeyValueHeads),
+              numAttentionHeads.isMultiple(of: numGlobalKeyValueHeads)
+        else {
+            throw MLXFastError.invalidInput("Gemma 4 attention heads must be divisible by both KV head counts")
+        }
+        guard maxPositionEmbeddings > 0,
+              slidingWindow > 0,
+              slidingWindow <= maxPositionEmbeddings
+        else {
+            throw MLXFastError.invalidInput(
+                "Gemma 4 sliding window must be positive and no larger than max_position_embeddings"
+            )
+        }
+        guard rmsNormEps.isFinite, rmsNormEps > 0 else {
+            throw MLXFastError.invalidInput("Gemma 4 rms_norm_eps must be finite and positive")
+        }
+        guard attentionDropout.isFinite, attentionDropout >= 0, attentionDropout < 1 else {
+            throw MLXFastError.invalidInput("Gemma 4 attention_dropout must be finite and in 0..<1")
+        }
+        guard finalLogitSoftcapping.isFinite, finalLogitSoftcapping > 0 else {
+            throw MLXFastError.invalidInput("Gemma 4 final_logit_softcapping must be finite and positive")
+        }
+        try validateRopeSpec(slidingRope, dims: headDim, label: "sliding_attention")
+        try validateRopeSpec(fullRope, dims: globalHeadDim, label: "full_attention")
+        guard quantizationGroupSize > 0,
+              hiddenSize.isMultiple(of: quantizationGroupSize),
+              intermediateSize.isMultiple(of: quantizationGroupSize)
+        else {
+            throw MLXFastError.invalidInput(
+                "Gemma 4 quantization group_size must divide hidden and intermediate dimensions"
+            )
+        }
+        guard [2, 4, 8].contains(quantizationBits) else {
+            throw MLXFastError.invalidInput("Gemma 4 quantization bits must be 2, 4, or 8")
+        }
+    }
+
+    private func validateRopeSpec(_ spec: Gemma4RopeSpec, dims: Int, label: String) throws {
+        guard spec.theta.isFinite, spec.theta > 0 else {
+            throw MLXFastError.invalidInput("Gemma 4 \(label) rope_theta must be finite and positive")
+        }
+        guard spec.partialRotaryFactor.isFinite,
+              spec.partialRotaryFactor > 0,
+              spec.partialRotaryFactor <= 1,
+              spec.partialRotaryFactor * Double(dims) >= 2
+        else {
+            throw MLXFastError.invalidInput(
+                "Gemma 4 \(label) partial_rotary_factor must rotate at least one pair and no more than the head"
             )
         }
     }
@@ -227,10 +304,12 @@ private func boolField(_ key: String, root: [String: Any], defaultValue: Bool) t
     guard let value = fieldValue(key, root: root) else {
         return defaultValue
     }
-    guard let bool = value as? Bool else {
+    guard let number = value as? NSNumber,
+          CFGetTypeID(number) == CFBooleanGetTypeID()
+    else {
         throw MLXFastError.invalidInput("config field \(key) must be a boolean")
     }
-    return bool
+    return number.boolValue
 }
 
 private func stringField(_ key: String, root: [String: Any], defaultValue: String) throws -> String {
@@ -260,24 +339,25 @@ private func layerTypesField(_ key: String, root: [String: Any], layerCount: Int
 }
 
 private func parseInt(_ value: Any, field: String) throws -> Int {
-    if let int = value as? Int {
-        return int
+    guard let number = value as? NSNumber,
+          CFGetTypeID(number) != CFBooleanGetTypeID(),
+          !CFNumberIsFloatType(number),
+          let integer = Int(number.stringValue)
+    else {
+        throw MLXFastError.invalidInput("config field \(field) must be a finite integer in Int range")
     }
-    if let number = value as? NSNumber {
-        return number.intValue
-    }
-    throw MLXFastError.invalidInput("config field \(field) must be an integer")
+    return integer
 }
 
 private func parseDouble(_ value: Any, field: String) throws -> Double {
-    if let double = value as? Double {
-        return double
+    guard let number = value as? NSNumber,
+          CFGetTypeID(number) != CFBooleanGetTypeID()
+    else {
+        throw MLXFastError.invalidInput("config field \(field) must be a finite number")
     }
-    if let int = value as? Int {
-        return Double(int)
+    let double = number.doubleValue
+    guard double.isFinite else {
+        throw MLXFastError.invalidInput("config field \(field) must be a finite number")
     }
-    if let number = value as? NSNumber {
-        return number.doubleValue
-    }
-    throw MLXFastError.invalidInput("config field \(field) must be a number")
+    return double
 }

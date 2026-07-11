@@ -16,6 +16,15 @@ METAL_CPP_SOURCE="${MLX_SWIFT_CHECKOUT}/Source/Cmlx/metal-cpp"
 JSON_SOURCE="${MLX_SWIFT_CHECKOUT}/Source/Cmlx/json"
 FMT_SOURCE="${MLX_SWIFT_CHECKOUT}/Source/Cmlx/fmt"
 CMAKE_BUILD_DIR="${MLXFAST_MLX_METAL_BUILD_DIR:-.build/mlx-metal}"
+BUILD_LOCK_DIR="${MLXFAST_MLX_METAL_BUILD_LOCK_DIR:-${CMAKE_BUILD_DIR}.mlxfast-build.lock}"
+BUILD_LOCK_TIMEOUT_SECONDS="${MLXFAST_MLX_METAL_BUILD_LOCK_TIMEOUT_SECONDS:-1800}"
+BUILD_LOCK_STALE_SECONDS="${MLXFAST_MLX_METAL_BUILD_LOCK_STALE_SECONDS:-60}"
+BUILD_LOCK_HELD=0
+BUILD_LOCK_TOKEN=""
+BUILD_LOCK_OWNER_TEMP=""
+BUILD_LOCK_GENERATION_DIR=""
+BUILD_LOCK_INITIALIZING_DIR=""
+PUBLISH_TEMP_PATH=""
 export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${ROOT_DIR}/.build/clang-module-cache}"
 mkdir -p "${CLANG_MODULE_CACHE_PATH}"
 METAL_COMPILER_HOME="${MLXFAST_METAL_COMPILER_HOME:-${CMAKE_BUILD_DIR}/.mlxfast-home}"
@@ -47,6 +56,408 @@ find_cmake() {
   return 1
 }
 
+lock_directory_identity() {
+  local directory="$1"
+  stat -f '%d:%i' "${directory}" 2>/dev/null \
+    || stat -c '%d:%i' "${directory}"
+}
+
+lock_mtime_seconds() {
+  local path="$1"
+  stat -f '%m' "${path}" 2>/dev/null || stat -c '%Y' "${path}"
+}
+
+build_lock_generation_path() {
+  local raw_target
+  local candidate
+  local canonical_lock_parent
+  local canonical_candidate
+  local expected_prefix
+  local lock_uid
+
+  [[ -L "${BUILD_LOCK_DIR}" ]] || return 1
+  raw_target="$(readlink "${BUILD_LOCK_DIR}")" || return 1
+  [[ "${raw_target}" == /* ]] || return 1
+  candidate="${raw_target}"
+  canonical_lock_parent="$(cd -P "$(dirname "${BUILD_LOCK_DIR}")" && pwd -P)" || return 1
+  [[ -d "$(dirname "${candidate}")" ]] || return 1
+  canonical_candidate="$(cd -P "$(dirname "${candidate}")" && pwd -P)/$(basename "${candidate}")"
+  expected_prefix="$(basename "${BUILD_LOCK_DIR}").generation."
+  [[ "$(dirname "${canonical_candidate}")" == "${canonical_lock_parent}" ]] || return 1
+  [[ "$(basename "${canonical_candidate}")" == "${expected_prefix}"* ]] || return 1
+  lock_uid="$(stat -f '%u' "${BUILD_LOCK_DIR}" 2>/dev/null || stat -c '%u' "${BUILD_LOCK_DIR}")" \
+    || return 1
+  [[ "${lock_uid}" == "$(id -u)" ]] || return 1
+  if [[ -e "${canonical_candidate}" || -L "${canonical_candidate}" ]]; then
+    [[ -d "${canonical_candidate}" && ! -L "${canonical_candidate}" \
+        && -O "${canonical_candidate}" ]] || return 1
+  fi
+  printf '%s\n' "${canonical_candidate}"
+}
+
+remove_build_lock_generation() {
+  local generation_dir="$1"
+  local published_target=""
+
+  if [[ -L "${BUILD_LOCK_DIR}" ]]; then
+    published_target="$(readlink "${BUILD_LOCK_DIR}" 2>/dev/null || true)"
+  fi
+  if [[ -n "${generation_dir}" && "${published_target}" == "${generation_dir}" ]]; then
+    rm -f "${BUILD_LOCK_DIR}" || return 1
+  fi
+  if [[ -n "${generation_dir}" ]]; then
+    rm -rf "${generation_dir}" || return 1
+  fi
+}
+
+reclaim_orphaned_build_lock_generations() {
+  local lock_parent
+  local lock_name
+  local local_host_hash
+  local initializing_prefix
+  local initializing_dir
+  local initializing_name
+  local initializing_remainder
+  local initializing_pid
+  local published_target=""
+  local generation_dir
+  local canonical_generation
+  local owner_path
+  local owner_line
+  local owner_pid
+  local owner_host
+  local owner_token
+  local field
+  local claim_dir
+
+  lock_parent="$(cd -P "$(dirname "${BUILD_LOCK_DIR}")" && pwd -P)" || return 1
+  lock_name="$(basename "${BUILD_LOCK_DIR}")"
+  local_host_hash="$(printf '%s' "$(hostname)" | shasum -a 256 | awk '{print substr($1, 1, 16)}')" \
+    || return 1
+  initializing_prefix="${lock_name}.initializing.${local_host_hash}."
+  if [[ -L "${BUILD_LOCK_DIR}" ]]; then
+    published_target="$(readlink "${BUILD_LOCK_DIR}" 2>/dev/null || true)"
+  fi
+
+  while IFS= read -r -d '' initializing_dir; do
+    [[ ! -L "${initializing_dir}" && -d "${initializing_dir}" \
+        && -O "${initializing_dir}" ]] || continue
+    initializing_name="$(basename "${initializing_dir}")"
+    initializing_remainder="${initializing_name#"${initializing_prefix}"}"
+    initializing_pid="${initializing_remainder%%.*}"
+    [[ "${initializing_pid}" =~ ^[1-9][0-9]*$ ]] || continue
+    kill -0 "${initializing_pid}" >/dev/null 2>&1 && continue
+    [[ "$(cd -P "${initializing_dir}" && pwd -P)" == "${lock_parent}/${initializing_name}" ]] \
+      || continue
+    rm -rf "${initializing_dir}" || return 1
+  done < <(find "${lock_parent}" -mindepth 1 -maxdepth 1 -type d \
+    -name "${initializing_prefix}*" -print0)
+
+  while IFS= read -r -d '' generation_dir; do
+    [[ ! -L "${generation_dir}" && -d "${generation_dir}" && -O "${generation_dir}" ]] \
+      || continue
+    canonical_generation="$(cd -P "${generation_dir}" && pwd -P)" || continue
+    [[ "$(dirname "${canonical_generation}")" == "${lock_parent}" ]] || continue
+    [[ "${canonical_generation}" != "${published_target}" ]] || continue
+
+    owner_path="${canonical_generation}/owner"
+    [[ -f "${owner_path}" && ! -L "${owner_path}" ]] || continue
+    owner_line="$(cat "${owner_path}" 2>/dev/null || true)"
+    owner_pid=""
+    owner_host=""
+    owner_token=""
+    for field in ${owner_line}; do
+      case "${field}" in
+        pid=*) owner_pid="${field#pid=}" ;;
+        host=*) owner_host="${field#host=}" ;;
+        token=*) owner_token="${field#token=}" ;;
+      esac
+    done
+    [[ -n "${owner_token}" && "${owner_pid}" =~ ^[1-9][0-9]*$ \
+        && "${owner_host}" == "$(hostname)" ]] || continue
+    kill -0 "${owner_pid}" >/dev/null 2>&1 && continue
+
+    claim_dir="${canonical_generation}/.orphan-cleanup-claim"
+    mkdir "${claim_dir}" 2>/dev/null || continue
+    if [[ -L "${BUILD_LOCK_DIR}" ]]; then
+      published_target="$(readlink "${BUILD_LOCK_DIR}" 2>/dev/null || true)"
+    else
+      published_target=""
+    fi
+    if [[ "${canonical_generation}" == "${published_target}" \
+        || "$(cat "${owner_path}" 2>/dev/null || true)" != "${owner_line}" ]]; then
+      rmdir "${claim_dir}" 2>/dev/null || true
+      continue
+    fi
+    rm -rf "${canonical_generation}" || return 1
+  done < <(find "${lock_parent}" -mindepth 1 -maxdepth 1 -type d \
+    -name "${lock_name}.generation.*" -print0)
+}
+
+recover_stale_build_lock() {
+  local lock_dir="${BUILD_LOCK_DIR}"
+  local owner_path="${lock_dir}/owner"
+  local owner_line=""
+  local owner_pid=""
+  local owner_host=""
+  local owner_token=""
+  local owner_existed=0
+  local owner_is_well_formed=0
+  local stale=0
+  local metadata_path="${lock_dir}"
+  local observed_identity
+  local claimed_identity
+  local claim_dir
+  local quarantine_dir
+  local metadata_mtime
+  local now
+  local field
+  local generation_dir=""
+  local generation_missing=0
+
+  observed_identity="$(lock_directory_identity "${lock_dir}" 2>/dev/null)" || return 1
+  if [[ -L "${lock_dir}" ]]; then
+    generation_dir="$(build_lock_generation_path)" || return 1
+    if [[ ! -e "${generation_dir}" && ! -L "${generation_dir}" ]]; then
+      generation_missing=1
+    fi
+  fi
+  if [[ "${generation_missing}" == "1" ]]; then
+    claim_dir="${lock_dir}.recovery-claim"
+  else
+    claim_dir="${lock_dir}/.recovery-claim"
+  fi
+  if [[ -f "${owner_path}" ]]; then
+    owner_existed=1
+    metadata_path="${owner_path}"
+    owner_line="$(cat "${owner_path}" 2>/dev/null || true)"
+    for field in ${owner_line}; do
+      case "${field}" in
+        token=*) owner_token="${field#token=}" ;;
+        pid=*) owner_pid="${field#pid=}" ;;
+        host=*) owner_host="${field#host=}" ;;
+      esac
+    done
+    if [[ -n "${owner_token}" && -n "${owner_host}" \
+        && "${owner_pid}" =~ ^[1-9][0-9]*$ ]]; then
+      owner_is_well_formed=1
+      if [[ "${owner_host}" == "$(hostname)" ]] \
+          && ! kill -0 "${owner_pid}" >/dev/null 2>&1; then
+        stale=1
+      fi
+    fi
+  fi
+  if [[ "${generation_missing}" == "1" ]]; then
+    stale=1
+  elif [[ "${stale}" != "1" && "${owner_is_well_formed}" != "1" ]]; then
+    if metadata_mtime="$(lock_mtime_seconds "${metadata_path}" 2>/dev/null)"; then
+      now="$(date +%s)"
+      if (( now - metadata_mtime >= BUILD_LOCK_STALE_SECONDS )); then
+        stale=1
+      fi
+    fi
+  fi
+  [[ "${stale}" == "1" ]] || return 1
+
+  mkdir "${claim_dir}" 2>/dev/null || return 1
+  claimed_identity="$(lock_directory_identity "${lock_dir}" 2>/dev/null || true)"
+  if [[ "${claimed_identity}" != "${observed_identity}" ]]; then
+    rmdir "${claim_dir}" 2>/dev/null || true
+    return 1
+  fi
+  if [[ "${owner_existed}" == "1" ]]; then
+    if [[ "$(cat "${owner_path}" 2>/dev/null || true)" != "${owner_line}" ]]; then
+      rmdir "${claim_dir}" 2>/dev/null || true
+      return 1
+    fi
+  elif [[ -e "${owner_path}" ]]; then
+    rmdir "${claim_dir}" 2>/dev/null || true
+    return 1
+  fi
+
+  quarantine_dir="${lock_dir}.stale-$$-${RANDOM}"
+  if ! mv "${lock_dir}" "${quarantine_dir}"; then
+    rmdir "${claim_dir}" 2>/dev/null || true
+    return 1
+  fi
+  if [[ "${generation_missing}" == "1" ]]; then
+    rmdir "${claim_dir}" 2>/dev/null || true
+  fi
+  if [[ -n "${generation_dir}" ]]; then
+    rm -f "${quarantine_dir}" || return 1
+    rm -rf "${generation_dir}" || return 1
+  else
+    rm -rf "${quarantine_dir}" || return 1
+  fi
+}
+
+acquire_build_lock() {
+  local started_seconds="${SECONDS}"
+  local announced_wait=0
+  local owner_temp
+  local token
+  local generation_dir
+  local generation_dir_raw
+  local initializing_dir
+  local initializing_dir_raw
+  local local_host_hash
+  local nested_publication
+
+  [[ "${BUILD_LOCK_TIMEOUT_SECONDS}" =~ ^(0|[1-9][0-9]*)$ ]] || {
+    echo "build-mlx-metallib.sh: build lock timeout must be a non-negative integer" >&2
+    return 1
+  }
+  [[ "${BUILD_LOCK_STALE_SECONDS}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "build-mlx-metallib.sh: build lock stale threshold must be a positive integer" >&2
+    return 1
+  }
+  mkdir -p "$(dirname "${BUILD_LOCK_DIR}")" || return 1
+  reclaim_orphaned_build_lock_generations || return 1
+  token="$$-$(date +%s)-${RANDOM}-${RANDOM}"
+  local_host_hash="$(printf '%s' "$(hostname)" | shasum -a 256 | awk '{print substr($1, 1, 16)}')" \
+    || return 1
+
+  while true; do
+    owner_temp="$(mktemp "${BUILD_LOCK_DIR}.owner.XXXXXX")" || return 1
+    BUILD_LOCK_OWNER_TEMP="${owner_temp}"
+    if ! printf 'token=%s pid=%s host=%s started_at=%s\n' \
+        "${token}" "$$" "$(hostname)" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "${owner_temp}"; then
+      rm -f "${owner_temp}"
+      BUILD_LOCK_OWNER_TEMP=""
+      return 1
+    fi
+    initializing_dir_raw="$(mktemp -d \
+      "${BUILD_LOCK_DIR}.initializing.${local_host_hash}.$$.XXXXXX")" || {
+      rm -f "${owner_temp}"
+      BUILD_LOCK_OWNER_TEMP=""
+      return 1
+    }
+    initializing_dir="$(cd -P "${initializing_dir_raw}" && pwd -P)" || {
+      rm -f "${owner_temp}"
+      rm -rf "${initializing_dir_raw}"
+      BUILD_LOCK_OWNER_TEMP=""
+      return 1
+    }
+    BUILD_LOCK_INITIALIZING_DIR="${initializing_dir}"
+    if ! mv "${owner_temp}" "${initializing_dir}/owner"; then
+      rm -f "${owner_temp}"
+      rm -rf "${initializing_dir}"
+      BUILD_LOCK_OWNER_TEMP=""
+      BUILD_LOCK_INITIALIZING_DIR=""
+      return 1
+    fi
+    BUILD_LOCK_OWNER_TEMP=""
+    generation_dir_raw="${BUILD_LOCK_DIR}.generation.${token}-${RANDOM}"
+    if [[ -e "${generation_dir_raw}" || -L "${generation_dir_raw}" ]] \
+        || ! mv "${initializing_dir}" "${generation_dir_raw}"; then
+      rm -rf "${initializing_dir}"
+      BUILD_LOCK_INITIALIZING_DIR=""
+      return 1
+    fi
+    BUILD_LOCK_INITIALIZING_DIR=""
+    BUILD_LOCK_GENERATION_DIR="${generation_dir_raw}"
+    generation_dir="$(cd -P "${generation_dir_raw}" && pwd -P)" || return 1
+    BUILD_LOCK_GENERATION_DIR="${generation_dir}"
+
+    if [[ ! -e "${BUILD_LOCK_DIR}" && ! -L "${BUILD_LOCK_DIR}" ]] \
+        && ln -s -h -- "${generation_dir}" "${BUILD_LOCK_DIR}" 2>/dev/null; then
+      if [[ -L "${BUILD_LOCK_DIR}" \
+          && "$(readlink "${BUILD_LOCK_DIR}" 2>/dev/null || true)" == "${generation_dir}" ]]; then
+        BUILD_LOCK_TOKEN="${token}"
+        BUILD_LOCK_HELD=1
+        return 0
+      fi
+      nested_publication="${BUILD_LOCK_DIR}/$(basename "${generation_dir}")"
+      if [[ -L "${nested_publication}" \
+          && "$(readlink "${nested_publication}" 2>/dev/null || true)" == "${generation_dir}" ]]; then
+        rm -f "${nested_publication}" || return 1
+      fi
+    fi
+
+    rm -rf "${generation_dir}" || return 1
+    BUILD_LOCK_GENERATION_DIR=""
+    if [[ ! -d "${BUILD_LOCK_DIR}" && ! -L "${BUILD_LOCK_DIR}" ]]; then
+      echo "build-mlx-metallib.sh: build lock path is not a lock directory: ${BUILD_LOCK_DIR}" >&2
+      return 1
+    fi
+    if recover_stale_build_lock; then
+      continue
+    fi
+    if [[ "${announced_wait}" == "0" ]]; then
+      echo "build-mlx-metallib.sh: waiting for build lock ${BUILD_LOCK_DIR}"
+      announced_wait=1
+    fi
+    if (( SECONDS - started_seconds >= BUILD_LOCK_TIMEOUT_SECONDS )); then
+      echo "build-mlx-metallib.sh: timed out waiting for build lock ${BUILD_LOCK_DIR}" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+release_build_lock() {
+  local owner_line
+  local owner_token=""
+  local published_target=""
+  local field
+  [[ "${BUILD_LOCK_HELD}" == "1" ]] || return 0
+  owner_line="$(cat "${BUILD_LOCK_DIR}/owner" 2>/dev/null || true)"
+  for field in ${owner_line}; do
+    case "${field}" in
+      token=*) owner_token="${field#token=}" ;;
+    esac
+  done
+  if [[ -z "${BUILD_LOCK_TOKEN}" || "${owner_token}" != "${BUILD_LOCK_TOKEN}" ]]; then
+    echo "build-mlx-metallib.sh: refusing to release a build lock owned by another process" >&2
+    return 1
+  fi
+  if [[ -L "${BUILD_LOCK_DIR}" ]]; then
+    published_target="$(readlink "${BUILD_LOCK_DIR}" 2>/dev/null || true)"
+    if [[ -z "${BUILD_LOCK_GENERATION_DIR}" \
+        || "${published_target}" != "${BUILD_LOCK_GENERATION_DIR}" ]]; then
+      echo "build-mlx-metallib.sh: refusing to release a replaced build lock" >&2
+      return 1
+    fi
+    rm -f "${BUILD_LOCK_DIR}" || return 1
+    BUILD_LOCK_HELD=0
+    BUILD_LOCK_TOKEN=""
+    rm -rf "${BUILD_LOCK_GENERATION_DIR}" || return 1
+    BUILD_LOCK_GENERATION_DIR=""
+  else
+    rm -f "${BUILD_LOCK_DIR}/owner" || return 1
+    rmdir "${BUILD_LOCK_DIR}" || return 1
+    BUILD_LOCK_HELD=0
+    BUILD_LOCK_TOKEN=""
+  fi
+}
+
+cleanup_builder() {
+  local status="$?"
+  trap - EXIT
+  if [[ -n "${PUBLISH_TEMP_PATH}" ]]; then
+    rm -f "${PUBLISH_TEMP_PATH}" || true
+  fi
+  if [[ -n "${BUILD_LOCK_OWNER_TEMP}" ]]; then
+    rm -f "${BUILD_LOCK_OWNER_TEMP}" || true
+  fi
+  if [[ -n "${BUILD_LOCK_INITIALIZING_DIR}" ]]; then
+    rm -rf "${BUILD_LOCK_INITIALIZING_DIR}" || true
+    BUILD_LOCK_INITIALIZING_DIR=""
+  fi
+  if [[ "${BUILD_LOCK_HELD}" != "1" && -n "${BUILD_LOCK_GENERATION_DIR}" ]]; then
+    remove_build_lock_generation "${BUILD_LOCK_GENERATION_DIR}" || true
+    BUILD_LOCK_GENERATION_DIR=""
+  fi
+  if ! release_build_lock && [[ "${status}" == "0" ]]; then
+    status=1
+  fi
+  exit "${status}"
+}
+
+trap cleanup_builder EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 metal_toolchain_identifier() {
   xcodebuild -showComponent MetalToolchain 2>/dev/null \
     | awk -F': ' '/Toolchain Identifier/ { print $2; exit }' \
@@ -65,10 +476,22 @@ EOF
   exit 1
 }
 
+# POLICY (TOOLCHAINS override) — APPROVED: pin the separately installed Metal
+# Toolchain for every xcrun/metal/cmake invocation below so the produced
+# mlx.metallib is built by a deterministic compiler. This intentionally
+# replaces any TOOLCHAINS value inherited from the caller for the remainder
+# of this build, and MLXFAST_METAL_TOOLCHAIN_IDENTIFIER allows the
+# environment to select the identifier that gets pinned — supported for
+# participants on their own machines. On the ranked M5 runner the identifier
+# is not environment-chosen in any meaningful sense: the trusted build step
+# in .github/workflows/benchmark.yml injects the operator-pinned value
+# through the bench-exec bridge (env -i + controlled assignments), so
+# submitted code cannot select a different compiler there. See the matching
+# note in setup.sh's configure_metal_toolchain_environment.
 METAL_TOOLCHAIN_IDENTIFIER="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER:-$(metal_toolchain_identifier)}"
 
 if [[ -n "${METAL_TOOLCHAIN_IDENTIFIER}" ]]; then
-  export TOOLCHAINS="${TOOLCHAINS:-${METAL_TOOLCHAIN_IDENTIFIER}}"
+  export TOOLCHAINS="${METAL_TOOLCHAIN_IDENTIFIER}"
 fi
 
 if ! xcrun -sdk macosx metal -v >/dev/null 2>&1; then
@@ -86,6 +509,8 @@ EOF
   exit 1
 fi
 
+acquire_build_lock
+
 if [[ ! -d "${MLX_SOURCE}" ]]; then
   echo "build-mlx-metallib.sh: resolving Swift package dependencies"
   swift package resolve
@@ -98,6 +523,11 @@ for required_path in "${MLX_SOURCE}" "${METAL_CPP_SOURCE}" "${JSON_SOURCE}" "${F
   fi
 done
 
+MLX_SOURCE="$(cd "${MLX_SOURCE}" && pwd -P)"
+METAL_CPP_SOURCE="$(cd "${METAL_CPP_SOURCE}" && pwd -P)"
+JSON_SOURCE="$(cd "${JSON_SOURCE}" && pwd -P)"
+FMT_SOURCE="$(cd "${FMT_SOURCE}" && pwd -P)"
+
 JOBS="${MLXFAST_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 
 HOME="${METAL_COMPILER_HOME}" "${CMAKE_BIN}" \
@@ -109,9 +539,9 @@ HOME="${METAL_COMPILER_HOME}" "${CMAKE_BIN}" \
   -DMLX_BUILD_BENCHMARKS=OFF \
   -DMLX_BUILD_PYTHON_BINDINGS=OFF \
   -DMLX_BUILD_GGUF=OFF \
-  -DFETCHCONTENT_SOURCE_DIR_METAL_CPP="${ROOT_DIR}/${METAL_CPP_SOURCE}" \
-  -DFETCHCONTENT_SOURCE_DIR_JSON="${ROOT_DIR}/${JSON_SOURCE}" \
-  -DFETCHCONTENT_SOURCE_DIR_FMT="${ROOT_DIR}/${FMT_SOURCE}"
+  -DFETCHCONTENT_SOURCE_DIR_METAL_CPP="${METAL_CPP_SOURCE}" \
+  -DFETCHCONTENT_SOURCE_DIR_JSON="${JSON_SOURCE}" \
+  -DFETCHCONTENT_SOURCE_DIR_FMT="${FMT_SOURCE}"
 
 HOME="${METAL_COMPILER_HOME}" "${CMAKE_BIN}" \
   --build "${CMAKE_BUILD_DIR}" --target mlx-metallib --parallel "${JOBS}"
@@ -132,13 +562,33 @@ if [[ "${#METALLIB_PATHS[@]}" -ne 1 ]]; then
 fi
 METALLIB_PATH="${METALLIB_PATHS[0]}"
 
-mkdir -p "$(dirname "${OUTPUT_PATH}")"
-cp "${METALLIB_PATH}" "${OUTPUT_PATH}"
+publish_metallib() {
+  local source="$1"
+  local destination="$2"
+  local destination_parent
+  if [[ -d "${destination}" ]]; then
+    echo "build-mlx-metallib.sh: output path is a directory: ${destination}" >&2
+    return 1
+  fi
+  destination_parent="$(dirname "${destination}")"
+  mkdir -p "${destination_parent}"
+  PUBLISH_TEMP_PATH="$(mktemp "${destination}.tmp.XXXXXX")"
+  cp "${source}" "${PUBLISH_TEMP_PATH}"
+  chmod 0644 "${PUBLISH_TEMP_PATH}"
+  if [[ -d "${destination}" ]]; then
+    echo "build-mlx-metallib.sh: output path became a directory: ${destination}" >&2
+    return 1
+  fi
+  mv -f "${PUBLISH_TEMP_PATH}" "${destination}"
+  PUBLISH_TEMP_PATH=""
+}
+
+publish_metallib "${METALLIB_PATH}" "${OUTPUT_PATH}"
 echo "build-mlx-metallib.sh: wrote ${OUTPUT_PATH}"
 
 if [[ "${BUILD_CONFIGURATION}" == "debug" ]]; then
   while IFS= read -r test_binary_dir; do
-    cp "${METALLIB_PATH}" "${test_binary_dir}/mlx.metallib"
+    publish_metallib "${METALLIB_PATH}" "${test_binary_dir}/mlx.metallib"
     echo "build-mlx-metallib.sh: wrote ${test_binary_dir}/mlx.metallib"
   done < <(find .build -path "*.xctest/Contents/MacOS" -type d)
 fi

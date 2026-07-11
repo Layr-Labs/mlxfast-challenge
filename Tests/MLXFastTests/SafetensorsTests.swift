@@ -30,6 +30,193 @@ func safetensorsCopySubsetPreservesBytesForUnsortedTensorNames() throws {
 }
 
 @Test
+func safetensorsCopySubsetRejectsDuplicateNamesWithoutMutatingDestination() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let source = root.appendingPathComponent("source.safetensors")
+    let destination = root.appendingPathComponent("destination.safetensors")
+    try writeSafetensors(
+        source,
+        tensors: [
+            TensorFixture(name: "a.weight", dtype: "U8", shape: [2], data: Data([1, 2])),
+        ]
+    )
+    try Data([9, 8, 7]).write(to: destination)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try Safetensors.copySubset(
+            from: source,
+            to: destination,
+            tensorNames: ["a.weight", "a.weight"]
+        )
+    }
+    #expect(try Data(contentsOf: destination) == Data([9, 8, 7]))
+    #expect(
+        try FileManager.default.contentsOfDirectory(atPath: root.path)
+            .allSatisfy { !$0.contains(".mlxfast-copy-") }
+    )
+}
+
+@Test
+func safetensorsCopySubsetRejectsReplacedValidatedSourceAndPreservesDestination() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let source = root.appendingPathComponent("source.safetensors")
+    let replacement = root.appendingPathComponent("replacement.safetensors")
+    let destination = root.appendingPathComponent("destination.safetensors")
+    try writeSafetensors(
+        source,
+        tensors: [
+            TensorFixture(name: "a.weight", dtype: "U8", shape: [2], data: Data([1, 2])),
+        ]
+    )
+    try writeSafetensors(
+        replacement,
+        tensors: [
+            TensorFixture(name: "a.weight", dtype: "U8", shape: [2], data: Data([3, 4])),
+        ]
+    )
+    let header = try Safetensors.readHeader(source)
+    try FileManager.default.removeItem(at: source)
+    try FileManager.default.moveItem(at: replacement, to: source)
+    try Data([9, 8, 7]).write(to: destination)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try Safetensors.copySubset(
+            from: source,
+            to: destination,
+            tensorNames: ["a.weight"],
+            validatedHeader: header
+        )
+    }
+    #expect(try Data(contentsOf: destination) == Data([9, 8, 7]))
+}
+
+@Test
+func safetensorsCopySubsetRejectsSourceMutationBeforePublishAndRemovesTemporaryFile() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let source = root.appendingPathComponent("source.safetensors")
+    let destination = root.appendingPathComponent("destination.safetensors")
+    try writeSafetensors(
+        source,
+        tensors: [
+            TensorFixture(
+                name: "a.weight",
+                dtype: "U8",
+                shape: [4],
+                data: Data([1, 2, 3, 4])
+            ),
+        ]
+    )
+    let validatedHeader = try Safetensors.readHeader(source)
+    let originalDestination = Data([9, 8, 7])
+    try originalDestination.write(to: destination)
+
+    var rejection: MLXFastError?
+    do {
+        _ = try Safetensors.copySubset(
+            from: source,
+            to: destination,
+            tensorNames: ["a.weight"],
+            validatedHeader: validatedHeader,
+            beforeFinalSourceIdentityValidation: {
+                let mutator = try FileHandle(forWritingTo: source)
+                defer { try? mutator.close() }
+                try mutator.seekToEnd()
+                try mutator.write(contentsOf: Data([5]))
+                try mutator.synchronize()
+            }
+        )
+    } catch let error as MLXFastError {
+        rejection = error
+    } catch {
+        throw error
+    }
+
+    #expect(
+        rejection?.description
+            == "safetensors source changed while tensor bytes were copied: \(source.path)"
+    )
+    #expect(try Data(contentsOf: destination) == originalDestination)
+    #expect(
+        try FileManager.default.contentsOfDirectory(atPath: root.path)
+            .allSatisfy { !$0.contains(".mlxfast-copy-") }
+    )
+}
+
+@Test
+func safetensorsCopySubsetAtomicallyReplacesExistingDestination() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let source = root.appendingPathComponent("source.safetensors")
+    let destination = root.appendingPathComponent("destination.safetensors")
+    try writeSafetensors(
+        source,
+        tensors: [
+            TensorFixture(name: "a.weight", dtype: "U8", shape: [2], data: Data([1, 2])),
+        ]
+    )
+    try Data([9, 8, 7]).write(to: destination)
+
+    #expect(
+        try Safetensors.copySubset(
+            from: source,
+            to: destination,
+            tensorNames: ["a.weight"]
+        ) == 1
+    )
+    let header = try Safetensors.readHeader(destination)
+    #expect(try tensorBytes(destination, header: header, name: "a.weight") == Data([1, 2]))
+}
+
+@Test
+func safetensorsHeaderEqualityIgnoresSourceFileIdentity() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let first = root.appendingPathComponent("first.safetensors")
+    let second = root.appendingPathComponent("second.safetensors")
+    let tensors = [
+        TensorFixture(name: "a.weight", dtype: "U8", shape: [2], data: Data([1, 2])),
+    ]
+    try writeSafetensors(first, tensors: tensors)
+    try writeSafetensors(second, tensors: tensors)
+
+    #expect(try Safetensors.readHeader(first) == Safetensors.readHeader(second))
+}
+
+@Test
+func safetensorsCopySubsetRebindsPublicHeaderToMatchingSource() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let source = root.appendingPathComponent("source.safetensors")
+    let destination = root.appendingPathComponent("destination.safetensors")
+    try writeSafetensors(
+        source,
+        tensors: [
+            TensorFixture(name: "a.weight", dtype: "U8", shape: [2], data: Data([1, 2])),
+        ]
+    )
+    let parsed = try Safetensors.readHeader(source)
+    let publicHeader = SafetensorsHeader(
+        headerLength: parsed.headerLength,
+        metadata: parsed.metadata,
+        tensors: parsed.tensors
+    )
+
+    #expect(
+        try Safetensors.copySubset(
+            from: source,
+            to: destination,
+            tensorNames: ["a.weight"],
+            validatedHeader: publicHeader
+        ) == 1
+    )
+    let outputHeader = try Safetensors.readHeader(destination)
+    #expect(try tensorBytes(destination, header: outputHeader, name: "a.weight") == Data([1, 2]))
+}
+
+@Test
 func safetensorsCopySubsetRejectsMissingRequestedTensor() throws {
     let root = try temporaryDirectory()
     let source = root.appendingPathComponent("source.safetensors")
@@ -57,7 +244,8 @@ func safetensorsCopySubsetUsesThrowingDestinationCreate() throws {
         encoding: .utf8
     )
 
-    #expect(source.contains("try Data().write(to: destination"))
+    #expect(source.contains("try Data().write(to: temporaryDestination"))
+    #expect(source.contains("try atomicRename(from: temporaryDestination, to: destination)"))
     #expect(!source.contains("createFile(atPath: destination.path"))
 }
 
@@ -91,6 +279,32 @@ func safetensorsRejectsTensorRangePastEndOfFile() throws {
 
     #expect(throws: MLXFastError.self) {
         _ = try Safetensors.readHeader(path)
+    }
+}
+
+@Test
+func safetensorsRejectsBooleanAndFloatingPointIntegerFields() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let invalidHeaders = [
+        #"{"a.weight":{"dtype":"U8","shape":[true],"data_offsets":[0,1]}}"#,
+        #"{"a.weight":{"dtype":"U8","shape":[1.0],"data_offsets":[0,1]}}"#,
+        #"{"a.weight":{"dtype":"U8","shape":[1.5],"data_offsets":[0,1]}}"#,
+        #"{"a.weight":{"dtype":"U8","shape":[1],"data_offsets":[false,1]}}"#,
+        #"{"a.weight":{"dtype":"U8","shape":[1],"data_offsets":[0.0,1]}}"#,
+        #"{"a.weight":{"dtype":"U8","shape":[1],"data_offsets":[0,1.5]}}"#,
+    ]
+
+    for (index, headerJSON) in invalidHeaders.enumerated() {
+        let path = root.appendingPathComponent("invalid-integer-\(index).safetensors")
+        try writeRawSafetensors(
+            path,
+            headerJSON: headerJSON,
+            data: Data([1])
+        )
+        #expect(throws: MLXFastError.self, "invalid header case \(index)") {
+            _ = try Safetensors.readHeader(path)
+        }
     }
 }
 
@@ -262,6 +476,23 @@ private func writeRawSafetensors(
     data: Data
 ) throws {
     var header = try JSONSerialization.data(withJSONObject: headerObject, options: [.sortedKeys])
+    while header.count % 8 != 0 {
+        header.append(0x20)
+    }
+    var output = Data()
+    var headerLength = UInt64(header.count).littleEndian
+    output.append(Data(bytes: &headerLength, count: 8))
+    output.append(header)
+    output.append(data)
+    try output.write(to: path)
+}
+
+private func writeRawSafetensors(
+    _ path: URL,
+    headerJSON: String,
+    data: Data
+) throws {
+    var header = Data(headerJSON.utf8)
     while header.count % 8 != 0 {
         header.append(0x20)
     }

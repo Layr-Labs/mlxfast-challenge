@@ -62,55 +62,79 @@ public enum Gemma4Model {
     /// `30 * tanh(x / 30)` softcap already applied by the library; downstream
     /// consumers read only the last position's row.
     ///
-    /// `positionOffset` is intentionally not forwarded: the library derives each
-    /// layer's RoPE position from its KV cache `offset`, which advances in place
-    /// as the persistent `Gemma4ModelCache` is reused across the seed prefill and
-    /// every decode/correctness step. The parameter is retained only to keep the
-    /// harness call contract stable.
+    /// The library derives each layer's RoPE position from its KV cache offset.
+    /// `positionOffset` is checked against those offsets so a stale or reused
+    /// harness cache fails before silently producing logits at the wrong position.
     public static func logits(
         inputIDs: MLXArray,
         weightCache: Gemma4RuntimeWeightCache,
         cache: Gemma4ModelCache? = nil,
         positionOffset: Int = 0
     ) throws -> MLXArray {
-        guard let model = weightCache.libraryModel else {
-            throw weightCache.loadError
-                ?? MLXFastError.invalidInput("Gemma 4 reference model was not loaded")
+        guard positionOffset >= 0 else {
+            throw MLXFastError.invalidInput("Gemma 4 position offset must be non-negative")
         }
-        _ = positionOffset
+        let model = try weightCache.requireLibraryModel()
 
         guard let cache else {
-            return model(inputIDs, cache: model.newCache(parameters: nil))
-        }
-
-        // Single-token decode step: optionally route through mlx-swift-lm's
-        // compiled decode (fused, no per-step graph rebuild). The compiled
-        // closure is built once, on the first step, from the seed-populated
-        // caches (promoted in place to compilable types); prefill and the seed
-        // forward (length > 1) stay eager.
-        //
-        // Compiled decode is OPT-IN (DARKBLOOM_COMPILED_DECODE=1): its one-time
-        // compile cost lands inside the scored decode window, which is not
-        // amortized at the ranked 128-step length. Gating here in the harness
-        // adapter -- rather than relying on the fork's internal default --
-        // makes ranked runs deterministically eager wherever the env is unset.
-        if inputIDs.dim(1) == 1 {
-            if let step = cache.compiledDecodeStep {
-                return step([inputIDs])[0]
-            }
-            var kvCaches = cache.kvCache(for: model)
-            if ProcessInfo.processInfo.environment["DARKBLOOM_COMPILED_DECODE"] == "1",
-               let step = CompiledDecode.setupCompiledDecode(model: model, cache: &kvCaches) {
-                cache.adoptKVCaches(kvCaches)
-                cache.compiledDecodeStep = step
-                return step([inputIDs])[0]
-            }
-            // Compiled decode disabled or unsupported: eager per-step forward.
-            cache.adoptKVCaches(kvCaches)
+            let kvCaches = model.newCache(parameters: nil)
+            try verifyCachePosition(
+                positionOffset: positionOffset,
+                cacheOffsets: kvCaches.map(\.offset)
+            )
             return model(inputIDs, cache: kvCaches)
         }
 
-        return model(inputIDs, cache: cache.kvCache(for: model))
+        let inputLength = inputIDs.dim(1)
+        let compiledDecodeStep = cache.compiledDecodeStep
+        let validatesLibraryCacheOffsets: Bool
+        if compiledDecodeStep == nil {
+            validatesLibraryCacheOffsets = true
+        } else {
+            validatesLibraryCacheOffsets = false
+        }
+        return try executeGemma4CachedForward(
+            cache: cache,
+            positionOffset: positionOffset,
+            inputLength: inputLength,
+            validatesLibraryCacheOffsets: validatesLibraryCacheOffsets,
+            validateLibraryCacheOffsets: {
+                let kvCaches = cache.kvCache(for: model)
+                try verifyCachePosition(
+                    positionOffset: positionOffset,
+                    cacheOffsets: kvCaches.map(\.offset)
+                )
+            },
+            forward: {
+                var kvCaches = cache.kvCache(for: model)
+                // Single-token decode step: optionally route through mlx-swift-lm's
+                // compiled decode (fused, no per-step graph rebuild). The compiled
+                // closure is built once, on the first step, from the seed-populated
+                // caches (promoted in place to compilable types); prefill and the seed
+                // forward (length > 1) stay eager.
+                //
+                // Compiled decode is OPT-IN (DARKBLOOM_COMPILED_DECODE=1): its one-time
+                // compile cost lands inside the scored decode window, which is not
+                // amortized at the ranked 128-step length. Gating here in the harness
+                // adapter -- rather than relying on the fork's internal default --
+                // makes ranked runs deterministically eager wherever the env is unset.
+                if inputLength == 1 {
+                    if let step = compiledDecodeStep {
+                        return step([inputIDs])[0]
+                    }
+                    if ProcessInfo.processInfo.environment["DARKBLOOM_COMPILED_DECODE"] == "1",
+                       let step = CompiledDecode.setupCompiledDecode(model: model, cache: &kvCaches) {
+                        cache.adoptKVCaches(kvCaches)
+                        cache.compiledDecodeStep = step
+                        return step([inputIDs])[0]
+                    }
+                    // Compiled decode disabled or unsupported: eager per-step forward.
+                    cache.adoptKVCaches(kvCaches)
+                    return model(inputIDs, cache: kvCaches)
+                }
+                return model(inputIDs, cache: kvCaches)
+            }
+        )
     }
 
     public static func logits(
@@ -229,5 +253,43 @@ public enum Gemma4Model {
         guard spec.vocabSize > 0, spec.hiddenSize > 0 else {
             throw MLXFastError.invalidInput("Gemma 4 model spec dimensions must be positive")
         }
+    }
+}
+
+@inline(__always)
+func executeGemma4CachedForward<Result>(
+    cache: Gemma4ModelCache,
+    positionOffset: Int,
+    inputLength: Int,
+    validatesLibraryCacheOffsets: Bool,
+    validateLibraryCacheOffsets: () throws -> Void,
+    forward: () throws -> Result
+) throws -> Result {
+    let nextExpectedPositionOffset = try cache.nextExpectedPositionOffset(
+        positionOffset: positionOffset,
+        inputLength: inputLength
+    )
+    if validatesLibraryCacheOffsets {
+        try validateLibraryCacheOffsets()
+    }
+    let result = try forward()
+    cache.commitExpectedPositionOffset(nextExpectedPositionOffset)
+    return result
+}
+
+func verifyCachePosition(positionOffset: Int, cacheOffsets: [Int]) throws {
+    guard positionOffset >= 0 else {
+        throw MLXFastError.invalidInput("Gemma 4 position offset must be non-negative")
+    }
+    guard let cacheOffset = cacheOffsets.first else {
+        throw MLXFastError.invalidInput("Gemma 4 model returned no KV caches")
+    }
+    guard cacheOffsets.allSatisfy({ $0 == cacheOffset }) else {
+        throw MLXFastError.invalidInput("Gemma 4 KV cache layer offsets are inconsistent")
+    }
+    guard positionOffset == cacheOffset else {
+        throw MLXFastError.invalidInput(
+            "Gemma 4 position offset \(positionOffset) does not match KV cache offset \(cacheOffset)"
+        )
     }
 }

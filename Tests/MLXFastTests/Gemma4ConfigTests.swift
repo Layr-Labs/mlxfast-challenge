@@ -134,6 +134,117 @@ func gemma4ConfigRejectsMismatchedLayerTypeCount() throws {
     }
 }
 
+@Test
+func gemma4ConfigRejectsFractionalAndOutOfRangeIntegers() throws {
+    let valid = fullConfigJSON()
+    let fractional = valid.replacingOccurrences(
+        of: "\"num_key_value_heads\": 16",
+        with: "\"num_key_value_heads\": 1.5"
+    )
+    let outOfRange = valid.replacingOccurrences(
+        of: "\"num_key_value_heads\": 16",
+        with: "\"num_key_value_heads\": 9223372036854775808"
+    )
+
+    #expect(throws: MLXFastError.self) {
+        _ = try loadConfigJSON(fractional)
+    }
+    #expect(throws: MLXFastError.self) {
+        _ = try loadConfigJSON(outOfRange)
+    }
+}
+
+@Test
+func gemma4ConfigRejectsNumericBooleanFields() throws {
+    let valid = fullConfigJSON()
+    for numericBoolean in ["0", "1", "0.0", "1.0"] {
+        let invalid = valid.replacingOccurrences(
+            of: "\"attention_bias\": false",
+            with: "\"attention_bias\": \(numericBoolean)"
+        )
+        #expect(throws: MLXFastError.self, "numeric boolean \(numericBoolean)") {
+            _ = try loadConfigJSON(invalid)
+        }
+    }
+}
+
+@Test
+func gemma4ConfigRejectsUnsafeLayerCountsBeforeDefaultLayerAllocation() {
+    for layerCount in ["-1", "1000000000"] {
+        let json = """
+        {
+          "num_hidden_layers": \(layerCount),
+          "vocab_size": \(MLXFastConstants.vocabSize),
+          "hidden_size": \(MLXFastConstants.hiddenSize),
+          "intermediate_size": \(MLXFastConstants.intermediateSize),
+          "num_attention_heads": \(MLXFastConstants.attentionHeads)
+        }
+        """
+        #expect(throws: MLXFastError.self) {
+            _ = try loadConfigJSON(json)
+        }
+    }
+}
+
+@Test
+func gemma4ConfigRejectsOverflowingAttentionDimensions() throws {
+    let invalid = fullConfigJSON().replacingOccurrences(
+        of: "\"num_attention_heads\": \(MLXFastConstants.attentionHeads)",
+        with: "\"num_attention_heads\": 9223372036854775807"
+    )
+    #expect(throws: MLXFastError.self) {
+        _ = try loadConfigJSON(invalid)
+    }
+}
+
+@Test
+func gemma4ConfigRejectsNonFiniteNumbers() throws {
+    let nonFinite = fullConfigJSON().replacingOccurrences(
+        of: "\"rms_norm_eps\": 1e-6",
+        with: "\"rms_norm_eps\": 1e400"
+    )
+
+    // Foundation rejects a JSON number that overflows Double before the
+    // model parser sees it. Either way, a non-finite value cannot load.
+    #expect(throws: Error.self) {
+        _ = try loadConfigJSON(nonFinite)
+    }
+}
+
+@Test
+func gemma4ConfigRejectsInvalidStructuralValues() throws {
+    let replacements: [(String, String)] = [
+        ("\"num_key_value_heads\": 16", "\"num_key_value_heads\": 0"),
+        ("\"num_global_key_value_heads\": 4", "\"num_global_key_value_heads\": 5"),
+        ("\"head_dim\": 256", "\"head_dim\": 255"),
+        ("\"global_head_dim\": 512", "\"global_head_dim\": 0"),
+        ("\"rms_norm_eps\": 1e-6", "\"rms_norm_eps\": 0"),
+        ("\"max_position_embeddings\": 262144", "\"max_position_embeddings\": 1000"),
+        ("\"attention_dropout\": 0.0", "\"attention_dropout\": 1.0"),
+        ("\"final_logit_softcapping\": 30.0", "\"final_logit_softcapping\": 0"),
+        (
+            "\"partial_rotary_factor\": 0.25",
+            "\"partial_rotary_factor\": 0"
+        ),
+        (
+            "\"quantization\": {\"group_size\": 64, \"bits\": 4, \"mode\": \"affine\"}",
+            "\"quantization\": {\"group_size\": 63, \"bits\": 4, \"mode\": \"affine\"}"
+        ),
+        (
+            "\"quantization\": {\"group_size\": 64, \"bits\": 4, \"mode\": \"affine\"}",
+            "\"quantization\": {\"group_size\": 64, \"bits\": 3, \"mode\": \"affine\"}"
+        ),
+    ]
+
+    for (validField, invalidField) in replacements {
+        let invalid = fullConfigJSON().replacingOccurrences(of: validField, with: invalidField)
+        #expect(invalid != fullConfigJSON())
+        #expect(throws: MLXFastError.self) {
+            _ = try loadConfigJSON(invalid)
+        }
+    }
+}
+
 private func fullConfigJSON(layers: Int = MLXFastConstants.numHiddenLayers) -> String {
     """
     {
@@ -163,6 +274,17 @@ private func fullConfigJSON(layers: Int = MLXFastConstants.numHiddenLayers) -> S
       "quantization": {"group_size": 64, "bits": 4, "mode": "affine"}
     }
     """
+}
+
+private func loadConfigJSON(_ json: String) throws -> Gemma4Config {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try json.write(
+        to: root.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+    return try Gemma4Config.load(from: root.path)
 }
 
 private func temporaryDirectory() throws -> URL {

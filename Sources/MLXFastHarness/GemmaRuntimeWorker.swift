@@ -11,6 +11,11 @@ import Tokenizers
 
 extension GemmaRuntime {
     public static func runWorker(weightsPath: String) throws {
+        // Move the protocol away from fd 0/1 before any editable model code
+        // runs. Startup validation and model construction may log or otherwise
+        // use standard I/O; none of that may be confused with protocol traffic.
+        let protocolIO = try RuntimeWorkerProtocolIO.isolatingStandardIO()
+        try validateRuntimeWorkerPinnedConfiguration(weightsPath: weightsPath)
         let config = try Gemma4Config.load(from: weightsPath)
         let loader = try Gemma4WeightLoader(weightsPath: weightsPath)
         // Validate transformed-weight structure HERE, inside the sandboxed worker,
@@ -25,12 +30,10 @@ extension GemmaRuntime {
         try loader.denseStore.validateReadableByteRanges()
         try loader.validateRequiredMetadata(config: config)
         let weightCache = Gemma4RuntimeWeightCache(loader: loader, config: config)
+        _ = try weightCache.requireLibraryModel()
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.withoutEscapingSlashes]
-        // Keep protocol I/O off fd 0/1 so submitted model code cannot read
-        // future request nonces or spoof JSON responses with normal stdio.
-        let protocolIO = try RuntimeWorkerProtocolIO.isolatingStandardIO()
         let sessionNonce = generateRuntimeWorkerNonce()
         // expertStats is always the zero struct for this RAM-resident dense
         // runtime (no expert-streaming machinery); kept in the protocol hello
@@ -254,6 +257,195 @@ extension GemmaRuntime {
 
 }
 
+private struct RuntimeWorkerPinnedConfiguration: Decodable {
+    let modelType: String
+    let hiddenSize: Int
+    let numHiddenLayers: Int
+    let intermediateSize: Int
+    let numAttentionHeads: Int
+    let headDim: Int
+    let globalHeadDim: Int
+    let globalPartialRotaryFactor: Double?
+    let rmsNormEps: Double
+    let vocabSize: Int
+    let numKeyValueHeads: Int
+    let numGlobalKeyValueHeads: Int
+    let numKVSharedLayers: Int
+    let hiddenSizePerLayerInput: Int
+    let vocabSizePerLayerInput: Int
+    let slidingWindow: Int
+    let maxPositionEmbeddings: Int
+    let attentionKEqV: Bool
+    let finalLogitSoftcapping: Double
+    let useDoubleWideMLP: Bool
+    let tieWordEmbeddings: Bool
+    let enableMoEBlock: Bool
+    let numExperts: Int?
+    let topKExperts: Int?
+    let moeIntermediateSize: Int?
+    let slidingWindowPattern: Int?
+    let layerTypes: [String]
+    let ropeParameters: RuntimeWorkerPinnedRopeParameters
+    let quantization: RuntimeWorkerPinnedQuantization?
+    let quantizationConfig: RuntimeWorkerPinnedQuantization?
+    let useBidirectionalAttention: String?
+
+    enum CodingKeys: String, CodingKey {
+        case modelType = "model_type"
+        case hiddenSize = "hidden_size"
+        case numHiddenLayers = "num_hidden_layers"
+        case intermediateSize = "intermediate_size"
+        case numAttentionHeads = "num_attention_heads"
+        case headDim = "head_dim"
+        case globalHeadDim = "global_head_dim"
+        case globalPartialRotaryFactor = "global_partial_rotary_factor"
+        case rmsNormEps = "rms_norm_eps"
+        case vocabSize = "vocab_size"
+        case numKeyValueHeads = "num_key_value_heads"
+        case numGlobalKeyValueHeads = "num_global_key_value_heads"
+        case numKVSharedLayers = "num_kv_shared_layers"
+        case hiddenSizePerLayerInput = "hidden_size_per_layer_input"
+        case vocabSizePerLayerInput = "vocab_size_per_layer_input"
+        case slidingWindow = "sliding_window"
+        case maxPositionEmbeddings = "max_position_embeddings"
+        case attentionKEqV = "attention_k_eq_v"
+        case finalLogitSoftcapping = "final_logit_softcapping"
+        case useDoubleWideMLP = "use_double_wide_mlp"
+        case tieWordEmbeddings = "tie_word_embeddings"
+        case enableMoEBlock = "enable_moe_block"
+        case numExperts = "num_experts"
+        case topKExperts = "top_k_experts"
+        case moeIntermediateSize = "moe_intermediate_size"
+        case slidingWindowPattern = "sliding_window_pattern"
+        case layerTypes = "layer_types"
+        case ropeParameters = "rope_parameters"
+        case quantization
+        case quantizationConfig = "quantization_config"
+        case useBidirectionalAttention = "use_bidirectional_attention"
+    }
+}
+
+private struct RuntimeWorkerPinnedRopeParameters: Decodable {
+    let slidingAttention: RuntimeWorkerPinnedRopeSpec
+    let fullAttention: RuntimeWorkerPinnedRopeSpec
+
+    enum CodingKeys: String, CodingKey {
+        case slidingAttention = "sliding_attention"
+        case fullAttention = "full_attention"
+    }
+}
+
+private struct RuntimeWorkerPinnedRopeSpec: Decodable {
+    let ropeTheta: Double
+    let ropeType: String
+    let partialRotaryFactor: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case ropeTheta = "rope_theta"
+        case ropeType = "rope_type"
+        case partialRotaryFactor = "partial_rotary_factor"
+    }
+}
+
+private struct RuntimeWorkerPinnedQuantization: Decodable {
+    let bits: Int
+    let groupSize: Int
+    let mode: String?
+
+    enum CodingKeys: String, CodingKey {
+        case bits
+        case groupSize = "group_size"
+        case mode
+    }
+}
+
+func validateRuntimeWorkerPinnedConfiguration(weightsPath: String) throws {
+    let path = URL(fileURLWithPath: weightsPath).appendingPathComponent("config.json")
+    let values = try path.resourceValues(
+        forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey]
+    )
+    let maximumConfigByteCount = 1 * 1024 * 1024
+    guard values.isRegularFile == true,
+          values.isSymbolicLink != true,
+          let byteCount = values.fileSize,
+          byteCount > 0,
+          byteCount <= maximumConfigByteCount
+    else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json must be a non-symlink regular file no larger than \(maximumConfigByteCount) bytes"
+        )
+    }
+    try validateRuntimeWorkerPinnedConfigurationData(Data(contentsOf: path))
+}
+
+func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
+    let decoded: RuntimeWorkerPinnedConfiguration
+    do {
+        decoded = try JSONDecoder().decode(RuntimeWorkerPinnedConfiguration.self, from: data)
+    } catch {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json is missing or has invalid pinned architecture fields"
+        )
+    }
+
+    let expectedLayerTypes = (0..<MLXFastConstants.numHiddenLayers).map {
+        $0 % 6 == 5 ? "full_attention" : "sliding_attention"
+    }
+    let quantizations = [decoded.quantization, decoded.quantizationConfig].compactMap { $0 }
+    guard decoded.modelType == "gemma4_text",
+          decoded.hiddenSize == MLXFastConstants.hiddenSize,
+          decoded.numHiddenLayers == MLXFastConstants.numHiddenLayers,
+          decoded.intermediateSize == MLXFastConstants.intermediateSize,
+          decoded.numAttentionHeads == MLXFastConstants.attentionHeads,
+          decoded.headDim == 256,
+          decoded.globalHeadDim == 512,
+          decoded.globalPartialRotaryFactor == nil
+              || decoded.globalPartialRotaryFactor == 0.25,
+          decoded.rmsNormEps == 1e-6,
+          decoded.vocabSize == MLXFastConstants.vocabSize,
+          decoded.numKeyValueHeads == 16,
+          decoded.numGlobalKeyValueHeads == 4,
+          decoded.numKVSharedLayers == 0,
+          decoded.hiddenSizePerLayerInput == 0,
+          decoded.vocabSizePerLayerInput == MLXFastConstants.vocabSize,
+          decoded.slidingWindow == 1_024,
+          decoded.maxPositionEmbeddings == 262_144,
+          decoded.attentionKEqV,
+          decoded.finalLogitSoftcapping == 30,
+          decoded.useDoubleWideMLP == false,
+          decoded.tieWordEmbeddings,
+          decoded.enableMoEBlock == false,
+          decoded.numExperts == nil,
+          decoded.topKExperts == nil,
+          decoded.moeIntermediateSize == nil,
+          decoded.layerTypes == expectedLayerTypes,
+          decoded.ropeParameters.slidingAttention.ropeTheta == 10_000,
+          decoded.ropeParameters.slidingAttention.ropeType == "default",
+          decoded.ropeParameters.slidingAttention.partialRotaryFactor == nil
+              || decoded.ropeParameters.slidingAttention.partialRotaryFactor == 1,
+          decoded.ropeParameters.fullAttention.ropeTheta == 1_000_000,
+          decoded.ropeParameters.fullAttention.ropeType == "proportional",
+          decoded.ropeParameters.fullAttention.partialRotaryFactor == 0.25,
+          !quantizations.isEmpty,
+          quantizations.allSatisfy({
+              $0.bits == 4
+                  && $0.groupSize == 64
+                  && ($0.mode == nil || $0.mode == "affine")
+          }),
+          decoded.useBidirectionalAttention == nil
+              || decoded.useBidirectionalAttention == "vision"
+    else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json does not match the pinned dense Gemma 4 31B architecture"
+        )
+    }
+    if let pattern = decoded.slidingWindowPattern, pattern != 6 {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json has an unexpected sliding_window_pattern"
+        )
+    }
+}
+
 struct RuntimeWorkerRequest: Codable {
     let id: Int
     let kind: String
@@ -288,7 +480,6 @@ struct RuntimeWorkerResponse: Codable {
     let error: String?
     let token: Int?
     let topLogits: [CorrectnessTraceLogit]?
-    let topLogitRows: [[CorrectnessTraceLogit]]?
     let seedToken: Int?
     let tokens: [Int]?
     let expertStats: ExpertStreamingStats?
@@ -301,7 +492,6 @@ struct RuntimeWorkerResponse: Codable {
         error: String? = nil,
         token: Int? = nil,
         topLogits: [CorrectnessTraceLogit]? = nil,
-        topLogitRows: [[CorrectnessTraceLogit]]? = nil,
         seedToken: Int? = nil,
         tokens: [Int]? = nil,
         expertStats: ExpertStreamingStats? = nil,
@@ -313,7 +503,6 @@ struct RuntimeWorkerResponse: Codable {
         self.error = error
         self.token = token
         self.topLogits = topLogits
-        self.topLogitRows = topLogitRows
         self.seedToken = seedToken
         self.tokens = tokens
         self.expertStats = expertStats
@@ -327,7 +516,6 @@ struct RuntimeWorkerResponse: Codable {
         case error
         case token
         case topLogits = "top_logits"
-        case topLogitRows = "top_logit_rows"
         case seedToken = "seed_token"
         case tokens
         case expertStats = "expert_stats"
@@ -335,18 +523,78 @@ struct RuntimeWorkerResponse: Codable {
     }
 }
 
+final class BufferedFileLineReader {
+    static let defaultMaximumLineByteCount = 4 * 1024 * 1024
+
+    private let handle: FileHandle
+    private let maximumLineByteCount: Int
+    private var buffer = Data()
+
+    init(
+        handle: FileHandle,
+        maximumLineByteCount: Int = BufferedFileLineReader.defaultMaximumLineByteCount
+    ) {
+        self.handle = handle
+        self.maximumLineByteCount = maximumLineByteCount
+    }
+
+    func readLine() throws -> Data? {
+        guard maximumLineByteCount > 0 else {
+            throw MLXFastError.invalidInput("runtime worker protocol line limit must be positive")
+        }
+        while true {
+            if let newlineIndex = buffer.firstIndex(of: 0x0a) {
+                let lineByteCount = buffer.distance(from: buffer.startIndex, to: newlineIndex)
+                guard lineByteCount <= maximumLineByteCount else {
+                    throw MLXFastError.invalidInput(
+                        "runtime worker protocol line exceeds \(maximumLineByteCount) bytes"
+                    )
+                }
+                let line = Data(buffer.prefix(lineByteCount))
+                buffer.removeSubrange(buffer.startIndex...newlineIndex)
+                return line
+            }
+            guard buffer.count <= maximumLineByteCount else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker protocol line exceeds \(maximumLineByteCount) bytes"
+                )
+            }
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                guard !buffer.isEmpty else {
+                    return nil
+                }
+                guard buffer.count <= maximumLineByteCount else {
+                    throw MLXFastError.invalidInput(
+                        "runtime worker protocol line exceeds \(maximumLineByteCount) bytes"
+                    )
+                }
+                defer { buffer.removeAll(keepingCapacity: true) }
+                return buffer
+            }
+            buffer.append(chunk)
+        }
+    }
+}
+
 final class RuntimeWorkerProtocolIO {
-    private let input: FileHandle
+    private let input: BufferedFileLineReader
     private let output: FileHandle
 
     private init(inputDescriptor: Int32, outputDescriptor: Int32) {
-        self.input = FileHandle(fileDescriptor: inputDescriptor, closeOnDealloc: true)
+        self.input = BufferedFileLineReader(
+            handle: FileHandle(fileDescriptor: inputDescriptor, closeOnDealloc: true)
+        )
         self.output = FileHandle(fileDescriptor: outputDescriptor, closeOnDealloc: true)
     }
 
     static func isolatingStandardIO() throws -> RuntimeWorkerProtocolIO {
-        let inputFD = try duplicatePrivateDescriptor(STDIN_FILENO, label: "stdin")
-        let outputFD = try duplicatePrivateDescriptor(STDOUT_FILENO, label: "stdout")
+        let descriptors = try duplicateRuntimeWorkerProtocolDescriptors(
+            inputDescriptor: STDIN_FILENO,
+            outputDescriptor: STDOUT_FILENO
+        )
+        let inputFD = descriptors.input
+        let outputFD = descriptors.output
         do {
             try redirectDescriptorToDevNull(STDIN_FILENO, flags: O_RDONLY, label: "stdin")
             try redirectDescriptorToDevNull(STDOUT_FILENO, flags: O_WRONLY, label: "stdout")
@@ -359,19 +607,8 @@ final class RuntimeWorkerProtocolIO {
     }
 
     func readLine() throws -> String? {
-        var data = Data()
-        while true {
-            let byte = input.readData(ofLength: 1)
-            if byte.isEmpty {
-                if data.isEmpty {
-                    return nil
-                }
-                break
-            }
-            if byte[byte.startIndex] == 0x0a {
-                break
-            }
-            data.append(byte)
+        guard let data = try input.readLine() else {
+            return nil
         }
         guard let line = String(data: data, encoding: .utf8) else {
             throw MLXFastError.invalidInput("runtime worker received non-UTF8 protocol input")
@@ -385,8 +622,27 @@ final class RuntimeWorkerProtocolIO {
     }
 }
 
+func duplicateRuntimeWorkerProtocolDescriptors(
+    inputDescriptor: Int32,
+    outputDescriptor: Int32,
+    duplicate: (_ descriptor: Int32, _ label: String) throws -> Int32 = duplicatePrivateDescriptor,
+    closeDescriptor: (_ descriptor: Int32) -> Void = { _ = Darwin.close($0) }
+) throws -> (input: Int32, output: Int32) {
+    let input = try duplicate(inputDescriptor, "stdin")
+    do {
+        let output = try duplicate(outputDescriptor, "stdout")
+        return (input: input, output: output)
+    } catch {
+        closeDescriptor(input)
+        throw error
+    }
+}
+
 func duplicatePrivateDescriptor(_ descriptor: Int32, label: String) throws -> Int32 {
-    let lowerBound = Int32(64 + Int(arc4random_uniform(449)))
+    // F_DUPFD requires its lower bound to be below RLIMIT_NOFILE. Standard
+    // macOS launchd jobs may inherit a soft limit of 256, so a randomized
+    // 64...512 bound makes worker startup fail nondeterministically.
+    let lowerBound = STDERR_FILENO + 1
     let duplicatedFD = fcntl(descriptor, F_DUPFD_CLOEXEC, lowerBound)
     guard duplicatedFD >= 0 else {
         throw MLXFastError.invalidInput("runtime worker failed to duplicate \(label) for protocol I/O")
@@ -412,17 +668,19 @@ func redirectDescriptorToDevNull(_ descriptor: Int32, flags: Int32, label: Strin
 /// keeping a capped raw tail for the exit diagnostic. Local modes attach this
 /// so participants' debug prints in model code show up live during the edit
 /// loop; it also means a chatty worker can no longer fill the undrained pipe
-/// buffer and stall the run. Official runs never attach it (the CLI forces
-/// forwardsWorkerStderr off there), so their stderr handling is unchanged.
+/// buffer and stall the run. Official runs attach the same drain with a no-op
+/// emitter, so submitted output is consumed but never forwarded to CI logs.
 final class WorkerStderrDrain: @unchecked Sendable {
     private let handle: FileHandle
     private let emit: (String) -> Void
     private let lock = NSLock()
     private var tail = Data()
     private var pendingLine = Data()
+    private var pendingLineWasTruncated = false
     private let finished = DispatchSemaphore(value: 0)
     static let tailByteLimit = 64 * 1024
     static let forwardedLinePrefix = "mlxfast-worker: "
+    static let truncatedLine = "[worker stderr line exceeded 65536 bytes]"
 
     init(
         handle: FileHandle,
@@ -454,7 +712,14 @@ final class WorkerStderrDrain: @unchecked Sendable {
             lock.unlock()
         }
         var data = tail
-        data.append(pendingLine)
+        if pendingLineWasTruncated {
+            data.append(Data(Self.truncatedLine.utf8))
+        } else {
+            data.append(pendingLine)
+        }
+        if data.count > Self.tailByteLimit {
+            data = Data(data.suffix(Self.tailByteLimit))
+        }
         return String(decoding: data, as: UTF8.self)
     }
 
@@ -475,10 +740,18 @@ final class WorkerStderrDrain: @unchecked Sendable {
         pendingLine.append(chunk)
         while let newlineIndex = pendingLine.firstIndex(of: 0x0a) {
             let lineLength = pendingLine.distance(from: pendingLine.startIndex, to: newlineIndex)
-            let lineData = Data(pendingLine.prefix(lineLength))
+            let lineWasTruncated = pendingLineWasTruncated || lineLength > Self.tailByteLimit
+            let lineData = lineWasTruncated
+                ? Data(Self.truncatedLine.utf8)
+                : Data(pendingLine.prefix(lineLength))
             pendingLine = Data(pendingLine.dropFirst(lineLength + 1))
+            pendingLineWasTruncated = false
             appendToTailLocked(lineData + Data([0x0a]))
             completedLines.append(String(decoding: lineData, as: UTF8.self))
+        }
+        if pendingLine.count > Self.tailByteLimit {
+            pendingLine.removeAll(keepingCapacity: true)
+            pendingLineWasTruncated = true
         }
         lock.unlock()
         for line in completedLines {
@@ -488,8 +761,11 @@ final class WorkerStderrDrain: @unchecked Sendable {
 
     private func flushPendingLine() {
         lock.lock()
-        let remainder = pendingLine
+        let remainder = pendingLineWasTruncated
+            ? Data(Self.truncatedLine.utf8)
+            : pendingLine
         pendingLine = Data()
+        pendingLineWasTruncated = false
         if !remainder.isEmpty {
             appendToTailLocked(remainder + Data([0x0a]))
         }
@@ -524,12 +800,94 @@ func redactedWorkerStderrLine(_ line: String) -> String {
     return line
 }
 
+final class RuntimeWorkerWatchdog: @unchecked Sendable {
+    private let process: Process
+    private let timer: DispatchSourceTimer
+    private let lock = NSLock()
+    private var active = true
+    private var fired = false
+
+    init(process: Process, timeoutSeconds: Double, terminationGraceSeconds: Double) {
+        self.process = process
+        self.timer = DispatchSource.makeTimerSource(queue: .global(qos: .userInitiated))
+        timer.schedule(deadline: .now() + timeoutSeconds)
+        timer.setEventHandler { [weak self] in
+            self?.fire(terminationGraceSeconds: terminationGraceSeconds)
+        }
+        timer.resume()
+    }
+
+    @discardableResult
+    func cancelAndReturnDidFire() -> Bool {
+        lock.lock()
+        active = false
+        let result = fired
+        lock.unlock()
+        timer.cancel()
+        return result
+    }
+
+    private func fire(terminationGraceSeconds: Double) {
+        lock.lock()
+        guard active else {
+            lock.unlock()
+            return
+        }
+        active = false
+        fired = true
+        lock.unlock()
+
+        if process.isRunning {
+            process.terminate()
+        }
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(
+            deadline: .now() + max(terminationGraceSeconds, 0)
+        ) { [process] in
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
+        }
+    }
+}
+
+@discardableResult
+func stopRuntimeWorkerProcess(
+    _ process: Process,
+    timeoutSeconds: Double,
+    pollIntervalMicroseconds: useconds_t = 10_000
+) -> Bool {
+    guard process.isRunning else {
+        return true
+    }
+    process.terminate()
+    let boundedTimeout = timeoutSeconds.isFinite
+        ? min(max(timeoutSeconds, 0), 24 * 60 * 60)
+        : 0
+    let now = DispatchTime.now().uptimeNanoseconds
+    let timeoutNanoseconds = UInt64(boundedTimeout * 1_000_000_000)
+    let (deadline, overflow) = now.addingReportingOverflow(timeoutNanoseconds)
+    let resolvedDeadline = overflow ? UInt64.max : deadline
+    while process.isRunning, DispatchTime.now().uptimeNanoseconds < resolvedDeadline {
+        usleep(pollIntervalMicroseconds)
+    }
+    if process.isRunning {
+        kill(process.processIdentifier, SIGKILL)
+    }
+    let killDeadline = DispatchTime.now().uptimeNanoseconds + 2_000_000_000
+    while process.isRunning, DispatchTime.now().uptimeNanoseconds < killDeadline {
+        usleep(pollIntervalMicroseconds)
+    }
+    return !process.isRunning
+}
+
 final class RuntimeWorkerClient {
     private let process: Process
     private let input: FileHandle
-    private let output: FileHandle
-    private let errorOutput: FileHandle
-    private let stderrDrain: WorkerStderrDrain?
+    private let output: BufferedFileLineReader
+    private let stderrDrain: WorkerStderrDrain
+    private let requestTimeoutSeconds: Double
+    private let shutdownTimeoutSeconds: Double
+    private let terminationGraceSeconds: Double
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var sessionNonce = ""
@@ -540,6 +898,17 @@ final class RuntimeWorkerClient {
     private(set) var initialExpertStats: ExpertStreamingStats?
 
     init(options: RuntimeWorkerOptions, weightsPath: String) throws {
+        guard options.helloTimeoutSeconds.isFinite,
+              options.helloTimeoutSeconds > 0,
+              options.requestTimeoutSeconds.isFinite,
+              options.requestTimeoutSeconds > 0,
+              options.shutdownTimeoutSeconds.isFinite,
+              options.shutdownTimeoutSeconds >= 0,
+              options.terminationGraceSeconds.isFinite,
+              options.terminationGraceSeconds >= 0
+        else {
+            throw MLXFastError.invalidInput("runtime worker timeouts must be positive")
+        }
         let process = Process()
         let stdin = Pipe()
         let stdout = Pipe()
@@ -570,19 +939,43 @@ final class RuntimeWorkerClient {
 
         self.process = process
         self.input = stdin.fileHandleForWriting
-        self.output = stdout.fileHandleForReading
-        self.errorOutput = stderr.fileHandleForReading
-        // Attach the live drain before waiting for the protocol hello so even
-        // output printed during model/weights setup streams immediately.
-        self.stderrDrain = options.forwardsWorkerStderr
-            ? WorkerStderrDrain(handle: stderr.fileHandleForReading)
-            : nil
-        let hello = try readResponseLine(validateNonce: false)
-        guard hello.id == 0, hello.ok, let nonce = hello.nonce, !nonce.isEmpty else {
-            throw MLXFastError.invalidInput("runtime worker did not return a valid protocol hello")
+        self.output = BufferedFileLineReader(handle: stdout.fileHandleForReading)
+        self.requestTimeoutSeconds = options.requestTimeoutSeconds
+        self.shutdownTimeoutSeconds = options.shutdownTimeoutSeconds
+        self.terminationGraceSeconds = options.terminationGraceSeconds
+        // Always consume the pipe. Official runs use a no-op emitter so worker
+        // output cannot reach logs, while local modes retain live forwarding.
+        self.stderrDrain = WorkerStderrDrain(
+            handle: stderr.fileHandleForReading,
+            emit: options.forwardsWorkerStderr ? nil : { _ in }
+        )
+        let helloWatchdog = RuntimeWorkerWatchdog(
+            process: process,
+            timeoutSeconds: options.helloTimeoutSeconds,
+            terminationGraceSeconds: options.terminationGraceSeconds
+        )
+        let hello: RuntimeWorkerResponse
+        do {
+            hello = try readResponseLine(validateNonce: false)
+            if helloWatchdog.cancelAndReturnDidFire() {
+                throw MLXFastError.invalidInput("runtime worker timed out waiting for protocol hello")
+            }
+            guard hello.id == 0, hello.ok, let nonce = hello.nonce, !nonce.isEmpty else {
+                throw MLXFastError.invalidInput("runtime worker did not return a valid protocol hello")
+            }
+            self.sessionNonce = nonce
+            self.initialExpertStats = hello.expertStats
+        } catch {
+            let helloTimedOut = helloWatchdog.cancelAndReturnDidFire()
+            _ = stopRuntimeWorkerProcess(process, timeoutSeconds: options.shutdownTimeoutSeconds)
+            _ = stderrDrain.drainedOutput(
+                timeoutSeconds: options.shutdownTimeoutSeconds + options.terminationGraceSeconds + 1
+            )
+            if helloTimedOut {
+                throw MLXFastError.invalidInput("runtime worker timed out waiting for protocol hello")
+            }
+            throw error
         }
-        self.sessionNonce = nonce
-        self.initialExpertStats = hello.expertStats
     }
 
     deinit {
@@ -596,9 +989,9 @@ final class RuntimeWorkerClient {
         closed = true
         try? input.close()
         if process.isRunning {
-            process.terminate()
-            process.waitUntilExit()
+            _ = stopRuntimeWorkerProcess(process, timeoutSeconds: shutdownTimeoutSeconds)
         }
+        _ = stderrDrain.drainedOutput(timeoutSeconds: shutdownTimeoutSeconds + terminationGraceSeconds + 1)
     }
 
     func generateCorrectness(promptTokens: [Int], steps: Int) throws -> RuntimeWorkerResponse {
@@ -670,9 +1063,24 @@ final class RuntimeWorkerClient {
         )
         var data = try encoder.encode(request)
         data.append(0x0a)
-        try input.write(contentsOf: data)
-
-        let response = try readResponseLine(validateNonce: true)
+        let watchdog = RuntimeWorkerWatchdog(
+            process: process,
+            timeoutSeconds: requestTimeoutSeconds,
+            terminationGraceSeconds: terminationGraceSeconds
+        )
+        let response: RuntimeWorkerResponse
+        do {
+            try input.write(contentsOf: data)
+            response = try readResponseLine(validateNonce: true)
+        } catch {
+            if watchdog.cancelAndReturnDidFire() {
+                throw MLXFastError.invalidInput("runtime worker timed out handling request \(kind)")
+            }
+            throw error
+        }
+        guard !watchdog.cancelAndReturnDidFire() else {
+            throw MLXFastError.invalidInput("runtime worker timed out handling request \(kind)")
+        }
         guard response.id == id else {
             throw MLXFastError.invalidInput("runtime worker returned response id \(response.id), expected \(id)")
         }
@@ -697,36 +1105,28 @@ final class RuntimeWorkerClient {
     }
 
     private func readWorkerOutputLine() throws -> Data {
-        var data = Data()
-        while true {
-            let byte = output.readData(ofLength: 1)
-            if byte.isEmpty {
-                throw MLXFastError.invalidInput(
-                    "runtime worker closed stdout before returning a response: \(workerExitDiagnostic())"
-                )
-            }
-            if byte[byte.startIndex] == 0x0a {
-                return data
-            }
-            data.append(byte)
+        guard let data = try output.readLine() else {
+            throw MLXFastError.invalidInput(
+                "runtime worker closed stdout before returning a response: \(workerExitDiagnostic())"
+            )
         }
+        return data
     }
 
     private func workerExitDiagnostic() -> String {
         if process.isRunning {
-            process.terminate()
+            _ = stopRuntimeWorkerProcess(process, timeoutSeconds: shutdownTimeoutSeconds)
         }
-        process.waitUntilExit()
-        // With a live drain attached, the pipe is consumed by its reader
-        // thread; take the retained tail from there instead of racing it.
-        let stderr = stderrDrain?.drainedOutput(timeoutSeconds: 2)
-            ?? (String(data: errorOutput.readDataToEndOfFile(), encoding: .utf8) ?? "")
+        let stderr = stderrDrain.drainedOutput(
+            timeoutSeconds: shutdownTimeoutSeconds + terminationGraceSeconds + 1
+        )
         let trimmed = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         let redacted = sanitizeWorkerDiagnostic(trimmed)
+        let status = process.isRunning ? "timeout" : String(process.terminationStatus)
         if redacted.isEmpty {
-            return "exit_status=\(process.terminationStatus)"
+            return "exit_status=\(status)"
         }
-        return "exit_status=\(process.terminationStatus) stderr=\(redacted)"
+        return "exit_status=\(status) stderr=\(redacted)"
     }
 
     private func sanitizeWorkerDiagnostic(_ value: String) -> String {

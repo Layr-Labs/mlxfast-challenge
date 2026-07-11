@@ -308,24 +308,39 @@ public struct LocalIterateOptions: Equatable {
 }
 
 public struct RuntimeWorkerOptions: Equatable {
+    public static let defaultHelloTimeoutSeconds = 15 * 60.0
+    public static let defaultRequestTimeoutSeconds = 15 * 60.0
+    public static let defaultShutdownTimeoutSeconds = 2.0
+    public static let defaultTerminationGraceSeconds = 1.0
+
     public let executablePath: String
     public let sandboxProfilePath: String?
     // Local modes only: stream the worker's stderr lines to the parent's
-    // stderr live (with per-line token redaction) instead of holding them for
-    // the exit diagnostic. Participants' debug prints in model code become
-    // visible during the edit loop, and a chatty worker can no longer fill the
-    // undrained pipe and stall. The CLI forces this OFF for official runs so
-    // worker output never reaches CI logs beyond today's sanitized diagnostic.
+    // stderr while retaining the capped diagnostic tail. The pipe is always
+    // drained so verbose model code cannot stall the worker; this flag controls
+    // forwarding only and stays off for official/hidden runs.
     public let forwardsWorkerStderr: Bool
+    public let helloTimeoutSeconds: Double
+    public let requestTimeoutSeconds: Double
+    public let shutdownTimeoutSeconds: Double
+    public let terminationGraceSeconds: Double
 
     public init(
         executablePath: String,
         sandboxProfilePath: String? = nil,
-        forwardsWorkerStderr: Bool = false
+        forwardsWorkerStderr: Bool = false,
+        helloTimeoutSeconds: Double = RuntimeWorkerOptions.defaultHelloTimeoutSeconds,
+        requestTimeoutSeconds: Double = RuntimeWorkerOptions.defaultRequestTimeoutSeconds,
+        shutdownTimeoutSeconds: Double = RuntimeWorkerOptions.defaultShutdownTimeoutSeconds,
+        terminationGraceSeconds: Double = RuntimeWorkerOptions.defaultTerminationGraceSeconds
     ) {
         self.executablePath = executablePath
         self.sandboxProfilePath = sandboxProfilePath
         self.forwardsWorkerStderr = forwardsWorkerStderr
+        self.helloTimeoutSeconds = helloTimeoutSeconds
+        self.requestTimeoutSeconds = requestTimeoutSeconds
+        self.shutdownTimeoutSeconds = shutdownTimeoutSeconds
+        self.terminationGraceSeconds = terminationGraceSeconds
     }
 }
 

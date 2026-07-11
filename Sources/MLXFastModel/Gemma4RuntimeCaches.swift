@@ -17,20 +17,15 @@ final class LockedCache<Key: Hashable, Value>: @unchecked Sendable {
 
     func value(for key: Key, make: () throws -> Value) rethrows -> Value {
         lock.lock()
+        defer { lock.unlock() }
         if let value = storage[key] {
-            lock.unlock()
             return value
         }
-        lock.unlock()
-
         let value = try make()
-
-        lock.lock()
         if storage.count >= capacity {
             storage.removeAll(keepingCapacity: true)
         }
         storage[key] = value
-        lock.unlock()
         return value
     }
 }

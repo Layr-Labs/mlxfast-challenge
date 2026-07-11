@@ -75,7 +75,8 @@ jq -e '
 # combine job's pre-merge leak-field and expert-zero checks (the dense
 # RAM-resident runtime must report structural zeros; a nonzero value is a
 # schema regression that must fail loudly, not merge silently).
-jq -e --arg expected_commit "${EXPECTED_COMMIT}" '
+jq -e --arg expected_commit "${EXPECTED_COMMIT}" \
+  --slurpfile gates "${SCORE_PATH}" '
   (.metrics.commit as $commit
   | ($commit | test("^[0-9a-f]{7,40}$"))
   and ($expected_commit | startswith($commit)))
@@ -91,6 +92,16 @@ jq -e --arg expected_commit "${EXPECTED_COMMIT}" '
   and (.metrics.expert_peak_cached_tensors == 0)
   and (.metrics.bandwidth_source == "ram_resident_model")
   and (.metrics.timed_benchmark_seconds > 0)
+  and (.metrics.harness_hash | test("^[0-9a-f]{64}$"))
+  and (.metrics.harness_hash == $gates[0].metrics.harness_hash)
+  and (.metrics.weights_hash | test("^[0-9a-f]{64}$"))
+  and (.metrics.weights_file_count | type == "number")
+  and (.metrics.weights_file_count > 0)
+  and (.metrics.weights_byte_count | type == "number")
+  and (.metrics.weights_byte_count > 0)
+  and (.metrics.weights_hash == $gates[0].metrics.weights_hash)
+  and (.metrics.weights_file_count == $gates[0].metrics.weights_file_count)
+  and (.metrics.weights_byte_count == $gates[0].metrics.weights_byte_count)
 ' "${CANDIDATE_SCORE_PATH}" >/dev/null || {
   echo "::error file=${CANDIDATE_SCORE_PATH}::candidate timing score failed the pre-merge checks" >&2
   exit 1
