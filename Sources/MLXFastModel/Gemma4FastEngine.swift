@@ -106,6 +106,7 @@ final class Gemma4FastLayer {
     let fusedGateUpActivation: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let indexedDown: IndexedDownProjection?
     let indexedDownPostTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
+    let useFusedGateUpActivation: Bool
 
     init(
         isSliding: Bool,
@@ -271,10 +272,19 @@ final class Gemma4FastLayer {
                     shapeless: true,
                     postDownBody
                 )
+                if let raw = ProcessInfo.processInfo.environment[
+                    "MLXFAST_FUSED_GATE_UP_ACTIVATION"
+                ] {
+                    self.useFusedGateUpActivation = ["1", "true", "yes", "on"]
+                        .contains(raw.lowercased())
+                } else {
+                    self.useFusedGateUpActivation = true
+                }
             } else {
                 self.fusedGateUpActivation = nil
                 self.indexedDown = nil
                 self.indexedDownPostTail = nil
+                self.useFusedGateUpActivation = false
             }
         } else {
             self.fusedGateUp = nil
@@ -282,6 +292,7 @@ final class Gemma4FastLayer {
             self.fusedGateUpActivation = nil
             self.indexedDown = nil
             self.indexedDownPostTail = nil
+            self.useFusedGateUpActivation = false
         }
     }
 
@@ -358,12 +369,18 @@ final class Gemma4FastLayer {
         let residual2 = out
         if B == 1, L == 1, let fusedGateUp, let fusedGateUpPostTail {
             let normalized = MLXFast.rmsNorm(out, weight: preFfnNormWeight, eps: eps)
-            let (gateOutput, upOutput) = fusedGateUp(normalized)
             if let fusedGateUpActivation, let indexedDown, let indexedDownPostTail {
-                let activated = fusedGateUpActivation(gateOutput, upOutput)
+                let activated: MLXArray
+                if useFusedGateUpActivation {
+                    activated = fusedGateUp.activated(normalized)
+                } else {
+                    let (gateOutput, upOutput) = fusedGateUp(normalized)
+                    activated = fusedGateUpActivation(gateOutput, upOutput)
+                }
                 let mlp = indexedDown(activated)
                 out = indexedDownPostTail(mlp, residual2)
             } else {
+                let (gateOutput, upOutput) = fusedGateUp(normalized)
                 out = fusedGateUpPostTail(gateOutput, upOutput, residual2)
             }
         } else if let fusedMLPTail {
