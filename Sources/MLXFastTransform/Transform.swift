@@ -162,7 +162,7 @@ public enum SwiftTransform {
         }
 
         try beforeSidecarGeneration?()
-        let generatedMetadata = try AffineMetadataCoding.writeGateUpSidecar(
+        let generatedMetadata = try AffineMetadataCoding.writeMLPSidecar(
             sourceDirectory: stagingDirectory,
             index: index,
             sourceHeaders: stagedHeaders,

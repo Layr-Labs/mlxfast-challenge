@@ -110,7 +110,7 @@ public final class Gemma4RuntimeWeightCache {
         let loadedWeights = try loadRuntimeWeightArrays(denseStore: denseStore)
         let partition = try partitionRuntimeWeights(
             loadedWeights,
-            expectedIndexedStems: expectedGateUpIndexedStems(
+            expectedIndexedStems: expectedMLPIndexedStems(
                 layerCount: config.numHiddenLayers
             )
         )
@@ -314,11 +314,12 @@ private struct RuntimeIndexedMetadataParts {
     var lut: MLXArray?
 }
 
-func expectedGateUpIndexedStems(layerCount: Int) -> Set<String> {
+func expectedMLPIndexedStems(layerCount: Int) -> Set<String> {
     Set((0..<layerCount).flatMap { layerIndex in
         [
             "model.layers.\(layerIndex).mlp.gate_proj",
             "model.layers.\(layerIndex).mlp.up_proj",
+            "model.layers.\(layerIndex).mlp.down_proj",
         ]
     })
 }

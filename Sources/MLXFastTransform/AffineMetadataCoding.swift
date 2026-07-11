@@ -15,7 +15,7 @@ struct GeneratedAffineMetadataReport {
 }
 
 enum AffineMetadataCoding {
-    static let shardName = "mlxfast-gate-up-metadata.safetensors"
+    static let shardName = "mlxfast-mlp-metadata.safetensors"
 
     private enum TensorKind {
         case indices
@@ -39,14 +39,14 @@ enum AffineMetadataCoding {
         let kind: TensorKind
     }
 
-    static func writeGateUpSidecar(
+    static func writeMLPSidecar(
         sourceDirectory: URL,
         index: CheckpointIndex,
         sourceHeaders: [String: SafetensorsHeader],
         selectedKeys: Set<String>,
         destinationDirectory: URL
     ) throws -> GeneratedAffineMetadataReport {
-        let stems = selectedKeys.compactMap(gateUpProjectionStem).sorted()
+        let stems = selectedKeys.compactMap(mlpProjectionStem).sorted()
         guard !stems.isEmpty else {
             return GeneratedAffineMetadataReport(weightMap: [:], tensorByteCount: 0)
         }
@@ -93,7 +93,7 @@ enum AffineMetadataCoding {
                   scalesInfo.shape.allSatisfy({ $0 > 0 })
             else {
                 throw MLXFastError.invalidInput(
-                    "gate/up projection \(stem) has incompatible weight, scale, or bias metadata"
+                    "MLP projection \(stem) has incompatible weight, scale, or bias metadata"
                 )
             }
 
@@ -168,7 +168,7 @@ enum AffineMetadataCoding {
         )
     }
 
-    private static func gateUpProjectionStem(_ name: String) -> String? {
+    private static func mlpProjectionStem(_ name: String) -> String? {
         let prefix = "language_model.model.layers."
         guard name.hasPrefix(prefix), name.hasSuffix(".weight") else {
             return nil
@@ -180,7 +180,10 @@ enum AffineMetadataCoding {
             return nil
         }
         let suffix = remainder[separator...]
-        guard suffix == ".mlp.gate_proj.weight" || suffix == ".mlp.up_proj.weight" else {
+        guard suffix == ".mlp.gate_proj.weight"
+                || suffix == ".mlp.up_proj.weight"
+                || suffix == ".mlp.down_proj.weight"
+        else {
             return nil
         }
         return String(name.dropLast(".weight".count))
@@ -297,7 +300,7 @@ enum AffineMetadataCoding {
         sourceHeaders: [String: SafetensorsHeader]
     ) throws {
         var headerObject: [String: Any] = [
-            "__metadata__": ["format": "mlxfast-gate-up-indexed-v1"]
+            "__metadata__": ["format": "mlxfast-mlp-indexed-v2"]
         ]
         var cursor = 0
         for tensor in tensors {

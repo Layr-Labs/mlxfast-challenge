@@ -103,6 +103,9 @@ final class Gemma4FastLayer {
     let fusedMLPTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let fusedGateUp: FusedGateUpProjection?
     let fusedGateUpPostTail: (@Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray)?
+    let fusedGateUpActivation: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
+    let indexedDown: IndexedDownProjection?
+    let indexedDownPostTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
 
     init(
         isSliding: Bool,
@@ -127,7 +130,8 @@ final class Gemma4FastLayer {
         layerScalar: MLXArray,
         rope: RoPELayer,
         gateIndexedMetadata: IndexedAffineMetadata?,
-        upIndexedMetadata: IndexedAffineMetadata?
+        upIndexedMetadata: IndexedAffineMetadata?,
+        downIndexedMetadata: IndexedAffineMetadata?
     ) {
         self.isSliding = isSliding
         self.nHeads = nHeads
@@ -229,9 +233,55 @@ final class Gemma4FastLayer {
             // CustomKernel cannot participate in MLX compile because it cannot
             // infer output shapes. Keep the QMV eager and compile its suffix.
             self.fusedGateUpPostTail = compile(shapeless: true, postTailBody)
+
+            let indexedDownEnabled: Bool
+            if let raw = ProcessInfo.processInfo.environment["MLXFAST_INDEXED_DOWN"] {
+                indexedDownEnabled = ["1", "true", "yes", "on"].contains(
+                    raw.lowercased())
+            } else {
+                indexedDownEnabled = downIndexedMetadata != nil
+            }
+            if indexedDownEnabled,
+               metadataMode == .indexed,
+               let downIndexedMetadata,
+               supportsGemma4IndexedDown(
+                   projection: downP,
+                   metadata: downIndexedMetadata
+               )
+            {
+                let activationBody: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+                    gateOutput, upOutput in
+                    gelu(gateOutput) * upOutput
+                }
+                self.fusedGateUpActivation = compile(
+                    shapeless: true,
+                    activationBody
+                )
+                self.indexedDown = IndexedDownProjection(
+                    projection: downP,
+                    metadata: downIndexedMetadata
+                )
+                let postDownBody: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+                    mlp, residual in
+                    let postNormalized = MLXFast.rmsNorm(
+                        mlp, weight: tailWeights.postNorm, eps: eps)
+                    return (residual + postNormalized) * tailWeights.layerScalar
+                }
+                self.indexedDownPostTail = compile(
+                    shapeless: true,
+                    postDownBody
+                )
+            } else {
+                self.fusedGateUpActivation = nil
+                self.indexedDown = nil
+                self.indexedDownPostTail = nil
+            }
         } else {
             self.fusedGateUp = nil
             self.fusedGateUpPostTail = nil
+            self.fusedGateUpActivation = nil
+            self.indexedDown = nil
+            self.indexedDownPostTail = nil
         }
     }
 
@@ -309,7 +359,13 @@ final class Gemma4FastLayer {
         if B == 1, L == 1, let fusedGateUp, let fusedGateUpPostTail {
             let normalized = MLXFast.rmsNorm(out, weight: preFfnNormWeight, eps: eps)
             let (gateOutput, upOutput) = fusedGateUp(normalized)
-            out = fusedGateUpPostTail(gateOutput, upOutput, residual2)
+            if let fusedGateUpActivation, let indexedDown, let indexedDownPostTail {
+                let activated = fusedGateUpActivation(gateOutput, upOutput)
+                let mlp = indexedDown(activated)
+                out = indexedDownPostTail(mlp, residual2)
+            } else {
+                out = fusedGateUpPostTail(gateOutput, upOutput, residual2)
+            }
         } else if let fusedMLPTail {
             out = fusedMLPTail(out, residual2)
         } else {
@@ -514,7 +570,8 @@ final class Gemma4FastEngine {
                     layerScalar: try array("\(prefix).layer_scalar"),
                     rope: rope,
                     gateIndexedMetadata: indexedMetadata["\(prefix).mlp.gate_proj"],
-                    upIndexedMetadata: indexedMetadata["\(prefix).mlp.up_proj"]
+                    upIndexedMetadata: indexedMetadata["\(prefix).mlp.up_proj"],
+                    downIndexedMetadata: indexedMetadata["\(prefix).mlp.down_proj"]
                 )
             )
         }
