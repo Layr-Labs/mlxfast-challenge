@@ -271,70 +271,193 @@ func runtimeWorkerPinnedConfigurationPathRejectsUnsafeFilesystemEntries() throws
     }
 }
 
+// The worker environment filter is a strict ALLOWLIST: submitted model code
+// executes inside the worker and can read its whole environment, so every
+// harness/CI/phase/identity variable must be dropped -- not just a hand-picked
+// denylist. Any keep-by-default behavior is a regression: a variable whose
+// value differs between the correctness/gates pass and the timed pass (e.g.
+// MLXFAST_NOTE, MLXFAST_SCORE_PATH, MLXFAST_INTEGRITY_PATH) is a phase oracle
+// that lets a submission serve a correct path while checked and a cheaper
+// path while timed.
 @Test
-func runtimeWorkerEnvironmentStripsOfficialRunAndCIIdentity() {
+func runtimeWorkerEnvironmentDropsEverythingOutsideTheAllowlist() {
     let sanitized = sanitizedRuntimeWorkerEnvironment([
-        "ANTHROPIC_API_KEY": "secret",
+        // Confirmed phase-distinct leaks under the previous denylist: these
+        // differ between the gates pass and the timed pass (or exist in only
+        // one of them).
+        "MLXFAST_NOTE": "ci workflow_dispatch 5f95c4bdce07 mode=single-machine-gates",
+        "MLXFAST_SCORE_PATH": "score.gates.json",
+        "MLXFAST_INTEGRITY_PATH": "benchmark-integrity.gates.json",
+        "MLXFAST_SEMANTIC_GPQA_CASE_COUNT": "8",
+        "MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS": "512",
+        // Official-run identity: same value in both phases, but submitted
+        // code must not observe that it runs under the ranked pipeline.
+        "MLXFAST_COMMIT_SHA": "5f95c4bdce07a0ef79ea350c91d9eb0d7476cf2f",
+        "MLXFAST_CANDIDATE_SHA": "5f95c4bdce07a0ef79ea350c91d9eb0d7476cf2f",
+        "GITHUB_SHA": "5f95c4bdce07a0ef79ea350c91d9eb0d7476cf2f",
         "CI": "true",
         "GITHUB_ACTIONS": "true",
         "GITHUB_RUN_ID": "123",
         "RUNNER_TEMP": "/tmp/runner",
         "BLACKSMITH_RUNNER": "1",
+        // An UNKNOWN future harness variable must be dropped by default;
+        // this is the property the old denylist could not provide.
+        "MLXFAST_FUTURE_PHASE_MARKER": "x",
+        // Trusted-shell wiring around the bench bridge, not for the worker.
+        "BENCH_GOLDEN_PATH": "/ws/correctness_golden_ranked.json",
+        "BENCH_JOB_ID": "ranked-123-1-gates",
+        "MJOB_WS": "/Users/Shared/bench-jobs/ranked-123-1",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": "*",
+        // Secrets and private-material locations.
+        "ANTHROPIC_API_KEY": "secret",
+        "R2_ACCESS_KEY_ID": "key",
+        "MLXFAST_PRIVATE_DIR": "/private/golden",
+        "MLXFAST_CORRECTNESS_GOLDEN_PATH": "/private/golden/correctness_golden.json",
+        // Harness configuration the worker does not read (weights arrive via
+        // argv; the byte cap is enforced in the trusted parent).
         "MLXFAST_OFFICIAL_BENCHMARK_RUN": "1",
         "MLXFAST_RUN_BENCHMARK": "1",
-        "MLXFAST_REFERENCE_DIR": "/private/reference",
-        "MLXFAST_PRIVATE_DIR": "/private/golden",
-        "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE": "/tmp/profile.sb",
-        "R2_ACCESS_KEY_ID": "key",
-        "MLXFAST_MAX_WEIGHTS_BYTES": "42",
-        "PATH": "/usr/bin",
-        // A gates-only or timing-only parallel-split machine sets these to
-        // tell the trusted CLI which half of the original single-machine run
-        // this process covers -- on one machine, decode/prefill was always
-        // timed at the same time gates were checked, so submitted code could
-        // never previously tell "my speed doesn't count right now" from "my
-        // correctness doesn't count right now." These must not reach the
-        // sandboxed worker submitted code executes in.
-        "MLXFAST_BENCHMARK_CHECK_GATES": "0",
-        "MLXFAST_BENCHMARK_CORRECTNESS_STEPS": "0",
+        "MLXFAST_BENCHMARK_CHECK_GATES": "1",
         "MLXFAST_BENCHMARK_SKIP_TIMED": "1",
-        // Env-var forms of --base-case-only/--step-range: the slice machines'
-        // equivalents of the split-phase vars above.
+        "MLXFAST_BENCHMARK_CORRECTNESS_STEPS": "64",
         "MLXFAST_CORRECTNESS_BASE_CASE_ONLY": "1",
         "MLXFAST_CORRECTNESS_STEP_RANGE": "21-42",
-        // Same-session baseline timings from the trusted paired-baseline step;
-        // submitted code must not observe the reference implementation's live
-        // numbers (or that the run is paired at all).
         "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN": "0.17",
         "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN": "3.6",
+        "MLXFAST_REFERENCE_DIR": "/private/reference",
+        "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE": "/tmp/profile.sb",
+        "MLXFAST_RUNTIME_WORKER_EXECUTABLE": "/ws/.build/release/mlxfast-swift",
+        "MLXFAST_WEIGHTS_PATH": "weights",
+        "MLXFAST_MAX_WEIGHTS_BYTES": "42",
+        // Allowlisted entries that must survive with their exact values.
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/bench",
+        "TMPDIR": "/var/folders/xx/T/",
+        "USER": "bench",
+        "LOGNAME": "bench",
+        "SHELL": "/bin/zsh",
+        "LANG": "en_US.UTF-8",
+        "LC_ALL": "en_US.UTF-8",
+        "TERM": "xterm-256color",
+        "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+        "__CF_USER_TEXT_ENCODING": "0x1F5:0x0:0x0",
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "DYLD_LIBRARY_PATH": "/opt/lib",
+        "MTL_SHADER_VALIDATION": "0",
+        "METAL_DEVICE_WRAPPER_TYPE": "0",
+        "MLX_DISABLE_COMPILE": "1",
+        "MLX_RESOURCE_LIMIT": "17179869184",
+        "DARKBLOOM_COMPILED_DECODE": "1",
     ])
 
-    for key in [
-        "ANTHROPIC_API_KEY",
-        "CI",
-        "GITHUB_ACTIONS",
-        "GITHUB_RUN_ID",
-        "RUNNER_TEMP",
-        "BLACKSMITH_RUNNER",
-        "MLXFAST_OFFICIAL_BENCHMARK_RUN",
-        "MLXFAST_RUN_BENCHMARK",
-        "MLXFAST_REFERENCE_DIR",
-        "MLXFAST_PRIVATE_DIR",
-        "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE",
-        "R2_ACCESS_KEY_ID",
-        "MLXFAST_BENCHMARK_CHECK_GATES",
-        "MLXFAST_BENCHMARK_CORRECTNESS_STEPS",
-        "MLXFAST_BENCHMARK_SKIP_TIMED",
-        "MLXFAST_CORRECTNESS_BASE_CASE_ONLY",
-        "MLXFAST_CORRECTNESS_STEP_RANGE",
-        "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN",
-        "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN",
-    ] {
-        #expect(sanitized[key] == nil)
-    }
-    #expect(sanitized["MLXFAST_USE_RUNTIME_WORKER"] == "0")
-    #expect(sanitized["MLXFAST_MAX_WEIGHTS_BYTES"] == "42")
-    #expect(sanitized["PATH"] == "/usr/bin")
+    // NOTHING outside the allowlist survives -- asserted structurally, not
+    // via a hand-picked list, so a future leak cannot slip between cases.
+    let expected: [String: String] = [
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/bench",
+        "TMPDIR": "/var/folders/xx/T/",
+        "USER": "bench",
+        "LOGNAME": "bench",
+        "SHELL": "/bin/zsh",
+        "LANG": "en_US.UTF-8",
+        "LC_ALL": "en_US.UTF-8",
+        "TERM": "xterm-256color",
+        "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+        "__CF_USER_TEXT_ENCODING": "0x1F5:0x0:0x0",
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "DYLD_LIBRARY_PATH": "/opt/lib",
+        "MTL_SHADER_VALIDATION": "0",
+        "METAL_DEVICE_WRAPPER_TYPE": "0",
+        "MLX_DISABLE_COMPILE": "1",
+        "MLX_RESOURCE_LIMIT": "17179869184",
+        "DARKBLOOM_COMPILED_DECODE": "1",
+        "MLXFAST_USE_RUNTIME_WORKER": "0",
+    ]
+    #expect(sanitized == expected)
+}
+
+// "MLX_"-prefixed tuning knobs are allowlisted, but that prefix must never
+// admit harness "MLXFAST_*" names ("MLXFAST_" does not start with "MLX_").
+@Test
+func runtimeWorkerEnvironmentAllowlistPrefixDoesNotAdmitHarnessNames() {
+    let sanitized = sanitizedRuntimeWorkerEnvironment([
+        "MLX_METAL_FAST_SYNCH": "1",
+        "MLXFAST_NOTE": "ci mode=single-machine-gates",
+        "MLXFAST_SCORE_PATH": "score.gates.json",
+        "MLXFAST_FUTURE_PHASE_MARKER": "x",
+    ])
+    #expect(sanitized["MLX_METAL_FAST_SYNCH"] == "1")
+    #expect(sanitized["MLXFAST_NOTE"] == nil)
+    #expect(sanitized["MLXFAST_SCORE_PATH"] == nil)
+    #expect(sanitized["MLXFAST_FUTURE_PHASE_MARKER"] == nil)
+    #expect(sanitized == [
+        "MLX_METAL_FAST_SYNCH": "1",
+        "MLXFAST_USE_RUNTIME_WORKER": "0",
+    ])
+}
+
+// The property that kills the phase oracle: the gates pass and the timed pass
+// hand the worker BYTE-IDENTICAL environments, so submitted code cannot tell
+// which pipeline phase it is running in. The two parent environments below
+// differ exactly the way the ranked pipeline's do (benchmark.yml gates step
+// vs. measure-job's timed invocation); shared host basics are identical
+// because both phases go through the same bench-exec bridge.
+@Test
+func runtimeWorkerEnvironmentIsIdenticalAcrossPipelinePhases() {
+    let sharedHostEnvironment: [String: String] = [
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME": "/Users/bench",
+        "TMPDIR": "/var/folders/bench/T/",
+        "USER": "bench",
+        "LOGNAME": "bench",
+        "SHELL": "/bin/bash",
+        "__CF_USER_TEXT_ENCODING": "0x1F5:0x0:0x0",
+        "MLXFAST_OFFICIAL_BENCHMARK_RUN": "1",
+        "MLXFAST_USE_RUNTIME_WORKER": "1",
+        "MLXFAST_RUNTIME_WORKER_EXECUTABLE": "/ws/.build/release/mlxfast-swift",
+        "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE": "/tmp/mlxfast-runtime-worker.gates.sb",
+        "MLXFAST_REFERENCE_DIR": "/opt/bench-runner/cache/reference",
+        "MLXFAST_COMMIT_SHA": "5f95c4bdce07a0ef79ea350c91d9eb0d7476cf2f",
+        "MLXFAST_SKIP_TRANSFORM": "1",
+        "MJOB_WS": "/Users/Shared/bench-jobs/ranked-123-1",
+    ]
+
+    var gatesEnvironment = sharedHostEnvironment
+    gatesEnvironment["MLXFAST_NOTE"] = "ci workflow_dispatch 5f95c4bdce07 mode=single-machine-gates"
+    gatesEnvironment["MLXFAST_SCORE_PATH"] = "score.gates.json"
+    gatesEnvironment["MLXFAST_INTEGRITY_PATH"] = "benchmark-integrity.gates.json"
+    gatesEnvironment["MLXFAST_SEMANTIC_GPQA_CASE_COUNT"] = "5"
+    gatesEnvironment["MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS"] = "64"
+    gatesEnvironment["MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH"] = "/ws/private/semantic_gpqa_answers.json"
+    gatesEnvironment["MLXFAST_BENCHMARK_CHECK_GATES"] = "1"
+    gatesEnvironment["MLXFAST_BENCHMARK_SKIP_TIMED"] = "1"
+    gatesEnvironment["MLXFAST_BENCHMARK_CORRECTNESS_STEPS"] = "64"
+    gatesEnvironment["MLXFAST_CORRECTNESS_GOLDEN_PATH"] = "correctness_golden_ranked.json"
+    gatesEnvironment["MLXFAST_WEIGHTS_PATH"] = "weights"
+    gatesEnvironment["MLXFAST_PRIVATE_DIR"] = "/ws/private"
+    gatesEnvironment["BENCH_GOLDEN_PATH"] = "/ws/correctness_golden_ranked.json"
+    gatesEnvironment["BENCH_JOB_ID"] = "ranked-123-1-gates"
+    gatesEnvironment["GIT_CONFIG_COUNT"] = "1"
+    gatesEnvironment["GIT_CONFIG_KEY_0"] = "safe.directory"
+    gatesEnvironment["GIT_CONFIG_VALUE_0"] = "*"
+
+    var timedEnvironment = sharedHostEnvironment
+    timedEnvironment["MLXFAST_SCORE_PATH"] = "score.mjob.json"
+    timedEnvironment["MLXFAST_INTEGRITY_PATH"] = "benchmark-integrity.mjob.json"
+    timedEnvironment["MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE"] = "/tmp/mlxfast-runtime-worker.timed.sb"
+    timedEnvironment["BENCH_GOLDEN_PATH"] = "/ws/bench_oracle.json"
+    timedEnvironment["BENCH_JOB_ID"] = "ranked-123-1-timing"
+
+    let gatesWorkerEnvironment = sanitizedRuntimeWorkerEnvironment(gatesEnvironment)
+    let timedWorkerEnvironment = sanitizedRuntimeWorkerEnvironment(timedEnvironment)
+    #expect(gatesWorkerEnvironment == timedWorkerEnvironment)
+    #expect(gatesWorkerEnvironment["MLXFAST_USE_RUNTIME_WORKER"] == "0")
+    #expect(gatesWorkerEnvironment["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin")
+    #expect(gatesWorkerEnvironment["HOME"] == "/Users/bench")
 }
 
 @Test

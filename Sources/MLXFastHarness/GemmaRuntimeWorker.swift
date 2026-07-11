@@ -1142,75 +1142,85 @@ final class RuntimeWorkerClient {
     }
 }
 
+/// Runtime-worker child environment policy: STRICT ALLOWLIST, not a denylist.
+///
+/// The runtime worker is the only process that executes submitted model code,
+/// and submitted code can read its whole environment via
+/// `ProcessInfo.processInfo.environment`. The ranked pipeline runs that same
+/// code in two separate passes with different harness environments -- the
+/// unscored correctness/gates pass and the scored timed pass -- so ANY
+/// inherited variable whose value differs between the passes is a phase
+/// oracle: a submission could serve correct-but-slow behavior while its
+/// tokens are checked and a cheaper path while its speed is measured,
+/// inflating the paired score without a real optimization.
+///
+/// A remove-by-default denylist structurally cannot close that class: every
+/// new harness/CI/workflow variable reopens it by default (MLXFAST_NOTE,
+/// MLXFAST_SCORE_PATH, MLXFAST_INTEGRITY_PATH, the semantic-GPQA knobs,
+/// BENCH_GOLDEN_PATH, and GIT_CONFIG_* all leaked through the previous
+/// denylist, and the first three differ between the gates and timed passes).
+/// So this filter starts from an EMPTY environment and copies in only the
+/// names below, which makes the child environment byte-identical across
+/// phases by construction -- the phase-isolation property is tested directly
+/// by `runtimeWorkerEnvironmentIsIdenticalAcrossPipelinePhases`.
+///
+/// Keep-set rationale (everything else is dropped):
+/// - Exact POSIX/login/session basics (`PATH`, `HOME`, `TMPDIR`, ...): the
+///   dynamic loader, Foundation, and Metal's shader-cache paths rely on
+///   them; their values are fixed per host/user, never per phase.
+/// - `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`: constant "1" wherever trusted
+///   scripts set them; they only ever remove (network) work.
+/// - `LC_`/`DYLD_`/`MTL_`/`METAL_` prefixes: locale, dynamic-loader, and
+///   Metal-framework configuration families. System-level, operator-owned,
+///   phase-independent; dropping loader/Metal config could break how the
+///   worker loads MLX and its metallib.
+/// - `MLX_` prefix: MLX core tuning knobs read by mlx::core (e.g.
+///   MLX_DISABLE_COMPILE, MLX_MAX_OPS_PER_BUFFER, MLX_RESOURCE_LIMIT) and by
+///   the mlx-swift-lm fork (MLX_COMPILED_DECODE). Note "MLX_" does NOT match
+///   harness "MLXFAST_*" names -- harness variables stay excluded.
+/// - `DARKBLOOM_` prefix: model-runtime opt-ins read only by model-side code
+///   (DARKBLOOM_COMPILED_DECODE in Gemma4Model.swift and the mlx-swift-lm
+///   fork's DARKBLOOM_* knobs). The ranked workflow never sets them (absent
+///   in BOTH ranked phases); they exist for operator/participant tuning on
+///   local machines and must keep reaching the worker there.
+/// - `MLXFAST_USE_RUNTIME_WORKER` is force-set to "0" so the child can never
+///   recursively spawn another worker.
+///
+/// Maintainer contract: do NOT regress this to keep-by-default, do NOT add a
+/// broad `MLXFAST_` (or `BENCH_`) allowance, and never allowlist a name whose
+/// value trusted code could set differently between the gates and timed
+/// passes. The worker itself needs no MLXFAST_* configuration: its weights
+/// path arrives via argv (`runtime-worker --weights ...`).
 func sanitizedRuntimeWorkerEnvironment(_ environment: [String: String]) -> [String: String] {
-    var sanitized = environment
-    let blockedExactKeys: Set<String> = [
-        "ANTHROPIC_API_KEY",
-        "CI",
-        "MLXFAST_ANTHROPIC_PRESENT",
-        // The gates/timing parallel split reads these three to decide which
-        // half of the original single-machine run this process covers. On one
-        // machine, decode/prefill was ALWAYS timed at the same time gates were
-        // checked, so there was no way for submitted code to tell "my speed
-        // doesn't count right now" from "my correctness doesn't count right
-        // now" -- these vars make exactly that distinction newly observable,
-        // so they must be blocked the same way MLXFAST_RUN_BENCHMARK already is.
-        "MLXFAST_BENCHMARK_CHECK_GATES",
-        "MLXFAST_BENCHMARK_CORRECTNESS_STEPS",
-        "MLXFAST_BENCHMARK_SKIP_TIMED",
-        // The env-var forms of --base-case-only/--step-range are the slice
-        // machines' equivalents of the three split-phase vars above: they let
-        // submitted code detect "I am an unscored correctness slice checking
-        // exactly steps N-M". Latent today (the slice workflow passes flags,
-        // not env), but an operator using the documented env form must not
-        // reopen the side channel.
-        "MLXFAST_CORRECTNESS_BASE_CASE_ONLY",
-        "MLXFAST_CORRECTNESS_STEP_RANGE",
-        "MLXFAST_CORRECTNESS_GOLDEN_AUTH_HEADER",
-        "MLXFAST_CORRECTNESS_GOLDEN_PATH",
-        "MLXFAST_CORRECTNESS_GOLDEN_URL",
-        "MLXFAST_FORCE_TRANSFORM",
-        "MLXFAST_GPQA_REFERENCE_PATH",
-        "MLXFAST_IN_SANDBOX",
-        "MLXFAST_NO_SANDBOX",
-        "MLXFAST_OFFICIAL_BENCHMARK_RUN",
-        // Same-session measured baseline supplied by the trusted workflow's
-        // paired-baseline step. Submitted model code must not observe the
-        // reference implementation's live timings (or even that this run is
-        // paired) from inside the sandboxed worker.
-        "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN",
-        "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN",
-        "MLXFAST_PRIVATE_DIR",
-        "MLXFAST_PRIVATE_PROMPTS_R2_PRESENT",
-        "MLXFAST_REFERENCE_AUTH_HEADER",
-        "MLXFAST_REFERENCE_BASE_URL",
-        "MLXFAST_REFERENCE_DIR",
-        "MLXFAST_RUN_BENCHMARK",
-        "MLXFAST_RUNTIME_WORKER_EXECUTABLE",
-        "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE",
-        "MLXFAST_SEMANTIC_GPQA_MODEL",
-        "MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH",
-        "MLXFAST_SEMANTIC_GPQA_RESULTS_PATH",
-        "MLXFAST_SKIP_TRANSFORM",
-        "MLXFAST_SUBMISSION_REF",
-        "MLXFAST_TRUSTED_BENCHMARK_REF",
-        "MLXFAST_TRUSTED_BENCHMARK_WORKFLOW",
-        "MLXFAST_TRUSTED_REPOSITORY",
-        "MLXFAST_VERIFY_TRANSFORM",
-        "R2_ACCESS_KEY_ID",
-        "R2_BUCKET_ENDPOINT",
-        "R2_SECRET_ACCESS_KEY",
+    let allowedExactKeys: Set<String> = [
+        "HF_HUB_OFFLINE",
+        "HOME",
+        "LANG",
+        "LOGNAME",
+        "PATH",
+        "SHELL",
+        "SSH_AUTH_SOCK",
+        "TERM",
+        "TMPDIR",
+        "TRANSFORMERS_OFFLINE",
+        "USER",
+        // macOS per-user default text encoding consulted by CoreFoundation.
+        "__CF_USER_TEXT_ENCODING",
     ]
-    let blockedPrefixes = [
-        "ACTIONS_",
-        "BLACKSMITH_",
-        "GITHUB_",
-        "RUNNER_",
+    let allowedPrefixes = [
+        "DARKBLOOM_",
+        "DYLD_",
+        "LC_",
+        "METAL_",
+        "MLX_",
+        "MTL_",
     ]
-    for key in sanitized.keys where blockedExactKeys.contains(key)
-        || blockedPrefixes.contains(where: { key.hasPrefix($0) })
+    var sanitized: [String: String] = [:]
+    for (key, value) in environment
+        where allowedExactKeys.contains(key)
+        || allowedPrefixes.contains(where: { key.hasPrefix($0) })
     {
-        sanitized.removeValue(forKey: key)
+        sanitized[key] = value
     }
     sanitized["MLXFAST_USE_RUNTIME_WORKER"] = "0"
     return sanitized

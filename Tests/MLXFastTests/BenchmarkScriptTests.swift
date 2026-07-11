@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 @testable import MLXFastCore
+@testable import MLXFastHarness
 import Testing
 
 @Test
@@ -1897,11 +1898,21 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
     #expect(benchmark.contains("(allow process-exec (literal"))
     #expect(!benchmark.contains("(allow network* (remote ip \"localhost:*\"))"))
     #expect(!benchmark.contains("(allow network* (local unix-socket))"))
-    #expect(runtime.contains("\"MLXFAST_PRIVATE_DIR\""))
-    #expect(runtime.contains("\"ANTHROPIC_API_KEY\""))
-    #expect(runtime.contains("\"MLXFAST_GPQA_REFERENCE_PATH\""))
-    #expect(runtime.contains("\"MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH\""))
-    #expect(runtime.contains("\"MLXFAST_SEMANTIC_GPQA_RESULTS_PATH\""))
+    // Private-material locations and secrets must not reach the worker's
+    // environment. The filter is a strict allowlist, so assert the property
+    // against the real function instead of pinning denylist source text.
+    let workerEnvironment = sanitizedRuntimeWorkerEnvironment([
+        "MLXFAST_PRIVATE_DIR": "/private/golden",
+        "ANTHROPIC_API_KEY": "secret",
+        "MLXFAST_GPQA_REFERENCE_PATH": "/private/golden/gpqa.json",
+        "MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH": "/ws/private/semantic_gpqa_answers.json",
+        "MLXFAST_SEMANTIC_GPQA_RESULTS_PATH": "/private/semantic_gpqa_results.json",
+    ])
+    #expect(workerEnvironment["MLXFAST_PRIVATE_DIR"] == nil)
+    #expect(workerEnvironment["ANTHROPIC_API_KEY"] == nil)
+    #expect(workerEnvironment["MLXFAST_GPQA_REFERENCE_PATH"] == nil)
+    #expect(workerEnvironment["MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH"] == nil)
+    #expect(workerEnvironment["MLXFAST_SEMANTIC_GPQA_RESULTS_PATH"] == nil)
     #expect(runtime.contains("gpqaTTFT: correctnessResult.gpqaTTFT"))
     #expect(runtime.contains("gpqaTTFTSource: gpqaTTFT.source"))
     #expect(cli.contains("resolvingSymlinksInPath()"))

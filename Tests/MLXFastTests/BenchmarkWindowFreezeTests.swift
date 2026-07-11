@@ -1,5 +1,6 @@
 import Foundation
 @testable import MLXFastCore
+@testable import MLXFastHarness
 @testable import MLXFastModel
 import Testing
 
@@ -211,9 +212,16 @@ func officialRankedRunMeasuresPairedBaselineOnTheSameSilicon() throws {
     #expect(benchmark.components(separatedBy: "PairedBaselineOverride.fromEnvironment()").count - 1 == 2)
     #expect(benchmark.contains("pairedBaseline?.prefillSecondsPerToken\n                ?? benchmarkGolden.resolvedBaselinePrefillSecondsPerToken"))
     #expect(benchmark.contains("pairedBaseline?.decodeSecondsPerToken\n                ?? benchmarkGolden.resolvedBaselineDecodeSecondsPerToken"))
-    let worker = try packageFile("Sources/MLXFastHarness/GemmaRuntimeWorker.swift")
-    #expect(worker.contains("\"MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN\","))
-    #expect(worker.contains("\"MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN\","))
+    // The worker environment filter is a strict allowlist (see
+    // sanitizedRuntimeWorkerEnvironment), so the override keys are excluded
+    // structurally; assert that against the real filter rather than pinning
+    // denylist source text.
+    let workerEnvironment = sanitizedRuntimeWorkerEnvironment([
+        "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN": "3.6977511595078125",
+        "MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN": "0.16518489738085937",
+    ])
+    #expect(workerEnvironment["MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN"] == nil)
+    #expect(workerEnvironment["MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN"] == nil)
 }
 
 @Test
