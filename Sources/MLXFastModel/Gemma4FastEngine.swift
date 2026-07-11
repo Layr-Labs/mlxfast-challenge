@@ -89,6 +89,7 @@ final class Gemma4FastLayer {
     let kProj: FastQuantizedProjection
     let vProj: FastQuantizedProjection?
     let oProj: FastQuantizedProjection
+    let fusedQKV: FusedSlidingQKVProjection?
 
     let qNormWeight: MLXArray
     let kNormWeight: MLXArray?
@@ -130,6 +131,9 @@ final class Gemma4FastLayer {
         down: QuantizedLinear,
         layerScalar: MLXArray,
         rope: RoPELayer,
+        qIndexedMetadata: IndexedAffineMetadata?,
+        kIndexedMetadata: IndexedAffineMetadata?,
+        vIndexedMetadata: IndexedAffineMetadata?,
         gateIndexedMetadata: IndexedAffineMetadata?,
         upIndexedMetadata: IndexedAffineMetadata?,
         downIndexedMetadata: IndexedAffineMetadata?
@@ -140,10 +144,46 @@ final class Gemma4FastLayer {
         self.headDim = headDim
         self.useKEqV = useKEqV
         self.eps = eps
-        self.qProj = FastQuantizedProjection(qProj)
-        self.kProj = FastQuantizedProjection(kProj)
-        self.vProj = vProj.map(FastQuantizedProjection.init)
+        let qProjection = FastQuantizedProjection(qProj)
+        let kProjection = FastQuantizedProjection(kProj)
+        let vProjection = vProj.map(FastQuantizedProjection.init)
+        self.qProj = qProjection
+        self.kProj = kProjection
+        self.vProj = vProjection
         self.oProj = FastQuantizedProjection(oProj)
+        let fusedQKVEnabled: Bool
+        if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_QKV"] {
+            fusedQKVEnabled = ["1", "true", "yes", "on"].contains(
+                raw.lowercased())
+        } else {
+            fusedQKVEnabled = true
+        }
+        if fusedQKVEnabled,
+           isSliding,
+           let vProjection,
+           let qIndexedMetadata,
+           let kIndexedMetadata,
+           let vIndexedMetadata,
+           supportsGemma4FusedSlidingQKV(
+               q: qProjection,
+               k: kProjection,
+               v: vProjection,
+               qMetadata: qIndexedMetadata,
+               kMetadata: kIndexedMetadata,
+               vMetadata: vIndexedMetadata
+           )
+        {
+            self.fusedQKV = FusedSlidingQKVProjection(
+                q: qProjection,
+                k: kProjection,
+                v: vProjection,
+                qMetadata: qIndexedMetadata,
+                kMetadata: kIndexedMetadata,
+                vMetadata: vIndexedMetadata
+            )
+        } else {
+            self.fusedQKV = nil
+        }
         self.qNormWeight = qNorm.weight
         self.kNormWeight = kNorm?.weight
         self.inputNormWeight = inputNorm.weight
@@ -307,19 +347,33 @@ final class Gemma4FastLayer {
         let (B, L, _) = (h.dim(0), h.dim(1), h.dim(2))
         let offset = cache?.offset ?? 0
 
-        var queries = qProj(h).reshaped(B, L, nHeads, headDim)
+        let rawQueries: MLXArray
+        let rawKeys: MLXArray
+        let rawValues: MLXArray?
+        if B == 1, L == 1, let fusedQKV {
+            let projected = fusedQKV(h)
+            rawQueries = projected.0
+            rawKeys = projected.1
+            rawValues = projected.2
+        } else {
+            rawQueries = qProj(h)
+            rawKeys = kProj(h)
+            rawValues = vProj?(h)
+        }
+
+        var queries = rawQueries.reshaped(B, L, nHeads, headDim)
         queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: eps)
 
-        let rawKeys = kProj(h).reshaped(B, L, nKvHeads, headDim)
-        var keys = MLXFast.rmsNorm(rawKeys, weight: kNormWeight!, eps: eps)
+        let shapedKeys = rawKeys.reshaped(B, L, nKvHeads, headDim)
+        var keys = MLXFast.rmsNorm(shapedKeys, weight: kNormWeight!, eps: eps)
         keys = keys.transposed(0, 2, 1, 3)
         keys = rope(keys, offset: offset)
 
         var values: MLXArray
-        if let vProj {
-            values = vProj(h).reshaped(B, L, nKvHeads, headDim)
+        if let rawValues {
+            values = rawValues.reshaped(B, L, nKvHeads, headDim)
         } else {
-            values = rawKeys
+            values = shapedKeys
         }
         values = MLXFast.rmsNorm(values, weight: MLXArray.mlxNone, eps: eps)
         values = values.transposed(0, 2, 1, 3)
@@ -586,6 +640,9 @@ final class Gemma4FastEngine {
                     down: try module("\(prefix).mlp.down_proj", as: QuantizedLinear.self),
                     layerScalar: try array("\(prefix).layer_scalar"),
                     rope: rope,
+                    qIndexedMetadata: indexedMetadata["\(prefix).self_attn.q_proj"],
+                    kIndexedMetadata: indexedMetadata["\(prefix).self_attn.k_proj"],
+                    vIndexedMetadata: indexedMetadata["\(prefix).self_attn.v_proj"],
                     gateIndexedMetadata: indexedMetadata["\(prefix).mlp.gate_proj"],
                     upIndexedMetadata: indexedMetadata["\(prefix).mlp.up_proj"],
                     downIndexedMetadata: indexedMetadata["\(prefix).mlp.down_proj"]

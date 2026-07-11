@@ -110,9 +110,7 @@ public final class Gemma4RuntimeWeightCache {
         let loadedWeights = try loadRuntimeWeightArrays(denseStore: denseStore)
         let partition = try partitionRuntimeWeights(
             loadedWeights,
-            expectedIndexedStems: expectedMLPIndexedStems(
-                layerCount: config.numHiddenLayers
-            )
+            expectedIndexedStems: expectedIndexedProjectionStems(config: config)
         )
         let weights = partition.modelParameters
 
@@ -314,13 +312,19 @@ private struct RuntimeIndexedMetadataParts {
     var lut: MLXArray?
 }
 
-func expectedMLPIndexedStems(layerCount: Int) -> Set<String> {
-    Set((0..<layerCount).flatMap { layerIndex in
-        [
+func expectedIndexedProjectionStems(config: Gemma4Config) -> Set<String> {
+    Set((0..<config.numHiddenLayers).flatMap { layerIndex in
+        var stems = [
             "model.layers.\(layerIndex).mlp.gate_proj",
             "model.layers.\(layerIndex).mlp.up_proj",
             "model.layers.\(layerIndex).mlp.down_proj",
+            "model.layers.\(layerIndex).self_attn.q_proj",
+            "model.layers.\(layerIndex).self_attn.k_proj",
         ]
+        if !config.usesKEqV(for: config.layerTypes[layerIndex]) {
+            stems.append("model.layers.\(layerIndex).self_attn.v_proj")
+        }
+        return stems
     })
 }
 

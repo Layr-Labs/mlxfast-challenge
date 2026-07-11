@@ -15,7 +15,7 @@ struct GeneratedAffineMetadataReport {
 }
 
 enum AffineMetadataCoding {
-    static let shardName = "mlxfast-mlp-metadata.safetensors"
+    static let shardName = "mlxfast-projection-metadata.safetensors"
 
     private enum TensorKind {
         case indices
@@ -39,14 +39,14 @@ enum AffineMetadataCoding {
         let kind: TensorKind
     }
 
-    static func writeMLPSidecar(
+    static func writeProjectionSidecar(
         sourceDirectory: URL,
         index: CheckpointIndex,
         sourceHeaders: [String: SafetensorsHeader],
         selectedKeys: Set<String>,
         destinationDirectory: URL
     ) throws -> GeneratedAffineMetadataReport {
-        let stems = selectedKeys.compactMap(mlpProjectionStem).sorted()
+        let stems = selectedKeys.compactMap(indexedProjectionStem).sorted()
         guard !stems.isEmpty else {
             return GeneratedAffineMetadataReport(weightMap: [:], tensorByteCount: 0)
         }
@@ -63,6 +63,13 @@ enum AffineMetadataCoding {
             let scalesName = "\(stem).scales"
             let biasesName = "\(stem).biases"
             guard selectedKeys.contains(scalesName), selectedKeys.contains(biasesName) else {
+                // Some valid non-production/synthetic checkpoints expose an
+                // unquantized attention projection with no affine companions.
+                // It is not eligible for indexed routing. MLP projections are
+                // fixed quantized invariants and remain fail-closed.
+                if stem.contains(".self_attn.") {
+                    continue
+                }
                 throw MLXFastError.invalidInput(
                     "quantized projection \(weightName) is missing BF16 scales or biases"
                 )
@@ -93,7 +100,7 @@ enum AffineMetadataCoding {
                   scalesInfo.shape.allSatisfy({ $0 > 0 })
             else {
                 throw MLXFastError.invalidInput(
-                    "MLP projection \(stem) has incompatible weight, scale, or bias metadata"
+                    "indexed projection \(stem) has incompatible weight, scale, or bias metadata"
                 )
             }
 
@@ -168,7 +175,7 @@ enum AffineMetadataCoding {
         )
     }
 
-    private static func mlpProjectionStem(_ name: String) -> String? {
+    private static func indexedProjectionStem(_ name: String) -> String? {
         let prefix = "language_model.model.layers."
         guard name.hasPrefix(prefix), name.hasSuffix(".weight") else {
             return nil
@@ -183,6 +190,9 @@ enum AffineMetadataCoding {
         guard suffix == ".mlp.gate_proj.weight"
                 || suffix == ".mlp.up_proj.weight"
                 || suffix == ".mlp.down_proj.weight"
+                || suffix == ".self_attn.q_proj.weight"
+                || suffix == ".self_attn.k_proj.weight"
+                || suffix == ".self_attn.v_proj.weight"
         else {
             return nil
         }
@@ -300,7 +310,7 @@ enum AffineMetadataCoding {
         sourceHeaders: [String: SafetensorsHeader]
     ) throws {
         var headerObject: [String: Any] = [
-            "__metadata__": ["format": "mlxfast-mlp-indexed-v2"]
+            "__metadata__": ["format": "mlxfast-projection-indexed-v3"]
         ]
         var cursor = 0
         for tensor in tensors {
