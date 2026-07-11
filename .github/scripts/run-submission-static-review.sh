@@ -4,9 +4,10 @@ set -euo pipefail
 
 CONTRACT_PATH="${CONTRACT_PATH:-benchmark.json}"
 # Deliberately NOT chained to MLXFAST_SEMANTIC_GPQA_MODEL: the gates job
-# exports that (Sonnet, tuned for cheap per-case judging) as job-level env,
-# which would silently downgrade this review. Bypass review is the hardest
-# judgment call in the pipeline, so it defaults to the strongest model.
+# exports that as job-level env, and retuning the per-case GPQA judge (or
+# pointing it at a cheaper model) must never silently change which model
+# performs bypass review. Both currently default to Opus 4.8, but each pin
+# is owned independently.
 MODEL="${MLXFAST_SUBMISSION_STATIC_REVIEW_MODEL:-claude-opus-4-8}"
 MAX_BYTES="${MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES:-1500000}"
 RESULTS_PATH="${MLXFAST_SUBMISSION_STATIC_REVIEW_RESULTS_PATH:-${MLXFAST_PRIVATE_DIR:-/tmp}/submission_static_review.json}"

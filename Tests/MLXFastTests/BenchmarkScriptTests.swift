@@ -785,7 +785,8 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: \"64\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MIN_PASS: \"1\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_REQUIRED: \"1\""))
-    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MODEL: claude-sonnet-4-5-20250929"))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MODEL: claude-opus-4-8"))
+    #expect(!workflow.contains("claude-sonnet"))
     #expect(!workflow.contains("calibrate_gpqa_reference"))
     #expect(!workflow.contains("MLXFAST_CALIBRATE_GPQA_REFERENCE"))
     #expect(!workflow.contains("mlxfast-swift calibrate-gpqa-gates"))
@@ -899,16 +900,28 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(semanticGate.contains("anthropic-version: 2023-06-01"))
     #expect(semanticGate.contains("extract_judge_json()"))
     #expect(semanticGate.contains("```(?:json)?"))
-    #expect(semanticGate.contains("judge response was not parseable JSON; retrying"))
-    // Parse hardening after run 28813130022 lost a case to a deterministically
-    // unparseable judge response: a lenient "passed": true/false scan for
-    // truncated/prose-wrapped verdicts, and assistant-prefilled retries
-    // (temperature-0 makes a byte-identical retry pointless).
-    #expect(semanticGate.contains("\\\"passed\\\"[[:space:]]*:[[:space:]]*(?<value>true|false)"))
-    #expect(semanticGate.contains("max_tokens: 256,"))
-    #expect(semanticGate.contains("prefill_text='{\"passed\":'"))
-    #expect(semanticGate.contains("attempt_request_path=\"${prefilled_request_path}\""))
-    #expect(semanticGate.contains("printf '%s%s' \"${attempt_prefill}\" \"${judge_text}\""))
+    #expect(semanticGate.contains("judge response was not parseable JSON (stop_reason=${stop_reason}); retrying"))
+    // Parse hardening after runs 28813130022 and 29124417146 lost cases to
+    // prose-wrapped/truncated judge responses: fenced/prose/balanced-object
+    // extraction preferring the LAST verdict, plus a lenient trailing
+    // "passed": true/false scan for truncation.
+    #expect(semanticGate.contains("\\\"passed\\\"[[:space:]]*:[[:space:]]*(true|false)"))
+    // Opus 4.8 judge: adaptive thinking at max effort, and a max_tokens
+    // budget (thinking + reply text) big enough that the verdict can never
+    // be truncated the way the Sonnet-era 256 cap truncated it. Opus 4.8
+    // rejects non-default sampling params and assistant prefill with a 400,
+    // so the request must carry neither.
+    #expect(semanticGate.contains("MODEL=\"${MLXFAST_SEMANTIC_GPQA_MODEL:-claude-opus-4-8}\""))
+    #expect(semanticGate.contains("max_tokens: 32000,"))
+    #expect(semanticGate.contains("thinking: { type: \"adaptive\" },"))
+    #expect(semanticGate.contains("output_config: { effort: \"max\" },"))
+    #expect(!semanticGate.contains("temperature:"))
+    #expect(!semanticGate.contains("prefill_text"))
+    #expect(!semanticGate.contains("role: \"assistant\""))
+    #expect(!semanticGate.contains("budget_tokens"))
+    // A hung connection must fail the attempt (and trip the retry loop), not
+    // stall the serial ranked job.
+    #expect(semanticGate.contains("--max-time 900"))
     #expect(semanticGate.contains("MIN_PASS=\"${MLXFAST_SEMANTIC_GPQA_MIN_PASS:-1}\""))
     #expect(semanticGate.contains("REQUIRED=\"${MLXFAST_SEMANTIC_GPQA_REQUIRED:-1}\""))
     #expect(semanticGate.contains("MLXFAST_SEMANTIC_GPQA_REQUIRED"))
@@ -924,8 +937,8 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(!semanticGate.contains("--arg question \"$(jq"))
     #expect(!semanticGate.contains("candidate_answer\" >&2"))
     // The bypass review runs on the strongest model at max reasoning effort,
-    // and must not inherit the cheaper Sonnet judge that the gates job exports
-    // as MLXFAST_SEMANTIC_GPQA_MODEL job-level env.
+    // and must keep its own pin rather than inherit whatever judge the gates
+    // job exports as MLXFAST_SEMANTIC_GPQA_MODEL job-level env.
     #expect(staticReview.contains("MODEL=\"${MLXFAST_SUBMISSION_STATIC_REVIEW_MODEL:-claude-opus-4-8}\""))
     #expect(!staticReview.contains(":-${MLXFAST_SEMANTIC_GPQA_MODEL"))
     #expect(staticReview.contains("thinking: { type: \"adaptive\" },"))
@@ -1197,6 +1210,168 @@ func submissionStaticReviewDiffModeFailsClosedAndSendsOnlyChangedFiles() throws 
     let deletionRequest = try String(contentsOfFile: deletionCapture, encoding: .utf8)
     #expect(deletionRequest.contains("Sources/MLXFastModel/Baseline.swift"))
     #expect(deletionRequest.contains("prove the benchmark detects slower measured decode"))
+}
+
+// Behavioral pin for run-semantic-gpqa-gate.sh's Opus 4.8 judge request and
+// its parse hardening, via a curl shim serving canned Opus-shaped responses
+// (thinking block first, verdict in the trailing text block). Covers the
+// verdict shapes run 29124417146 tripped over: bare JSON, a ```json fence,
+// JSON preceded/followed by prose, a verdict split across text blocks, and
+// truncated garbage that must burn all retries and fail just that one case
+// without changing gate semantics.
+@Test
+func semanticGPQAGateParsesOpusVerdictShapesAndFailsUnparseableCaseClosed() throws {
+    let fm = FileManager.default
+    let scriptPath = URL(fileURLWithPath: fm.currentDirectoryPath)
+        .appendingPathComponent(".github/scripts/run-semantic-gpqa-gate.sh").path
+
+    let root = fm.temporaryDirectory
+        .appendingPathComponent("semantic-gate-\(UUID().uuidString)")
+    try fm.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: root) }
+
+    func run(_ argv: [String], env extra: [String: String]) throws -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = argv
+        process.currentDirectoryURL = root
+        var env = ProcessInfo.processInfo.environment
+        let strayKeys = env.keys.filter {
+            $0.hasPrefix("MLXFAST_") || $0.hasPrefix("ANTHROPIC_")
+        }
+        for key in strayKeys { env.removeValue(forKey: key) }
+        env.merge(extra) { _, override in override }
+        process.environment = env
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    for tool in ["jq", "bash"] {
+        guard try run(["sh", "-c", "command -v \(tool)"], env: [:]).status == 0 else { return }
+    }
+
+    let answersPath = root.appendingPathComponent("answers.json").path
+    func answerCase(_ id: String) -> String {
+        #"{"id":"\#(id)","prompt":"marker-\#(id) question","answer_key":"C","reference_answer":"option C","candidate_answer":"C"}"#
+    }
+    let answers = #"{"version":1,"cases":["# +
+        [
+            answerCase("case-bare"), answerCase("case-fenced"), answerCase("case-prose"),
+            answerCase("case-garbage"), answerCase("case-split"),
+        ].joined(separator: ",") + "]}"
+    try answers.write(toFile: answersPath, atomically: true, encoding: .utf8)
+    let scorePath = root.appendingPathComponent("score.json").path
+    try #"{"passed":true,"score":1.0,"metrics":{"error":""}}"#
+        .write(toFile: scorePath, atomically: true, encoding: .utf8)
+
+    // Canned Opus-shaped responses: thinking first, verdict in text block(s).
+    let shimDir = root.appendingPathComponent("bin").path
+    try fm.createDirectory(atPath: shimDir, withIntermediateDirectories: true)
+    let responses: [String: String] = [
+        "bare": #"{"content":[{"type":"thinking","thinking":"weighing the options"},{"type":"text","text":"{\"passed\":true}"}],"stop_reason":"end_turn"}"#,
+        "fenced": #"{"content":[{"type":"thinking","thinking":"comparing answers"},{"type":"text","text":"Here is the verdict:\n```json\n{\"passed\": true}\n```"}],"stop_reason":"end_turn"}"#,
+        "prose": #"{"content":[{"type":"text","text":"The candidate names the wrong mechanism, so the verdict is {\"passed\": false}. Final."}],"stop_reason":"end_turn"}"#,
+        "garbage": #"{"content":[{"type":"thinking","thinking":"long think"},{"type":"text","text":"The candidate answer begins by discussing the reaction order and"}],"stop_reason":"max_tokens"}"#,
+        "split": #"{"content":[{"type":"thinking","thinking":"t"},{"type":"text","text":"Considering the equivalence carefully."},{"type":"text","text":"{\"passed\":true}"}],"stop_reason":"end_turn"}"#,
+    ]
+    for (name, body) in responses {
+        try body.write(toFile: shimDir + "/response-\(name).json", atomically: true, encoding: .utf8)
+    }
+    let shim = """
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=""
+    data=""
+    prev=""
+    for arg in "$@"; do
+      case "${prev}" in
+        --output) out="${arg}" ;;
+        --data) data="${arg}" ;;
+      esac
+      prev="${arg}"
+    done
+    req="${data#@}"
+    cp "${req}" "${SHIM_DIR}/last-request.json"
+    for name in bare fenced prose garbage split; do
+      if grep -q "marker-case-${name}" "${req}"; then
+        if [[ "${name}" == "garbage" ]]; then
+          echo attempt >> "${SHIM_DIR}/garbage-attempts"
+        fi
+        cp "${SHIM_DIR}/response-${name}.json" "${out}"
+        exit 0
+      fi
+    done
+    echo "curl shim: unmatched request" >&2
+    exit 1
+    """
+    try shim.write(toFile: shimDir + "/curl", atomically: true, encoding: .utf8)
+    try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shimDir + "/curl")
+
+    let inheritedPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"
+    let resultsPath = root.appendingPathComponent("results.json").path
+    let gate = try run(
+        ["bash", scriptPath],
+        env: [
+            "PATH": shimDir + ":" + inheritedPath,
+            "SHIM_DIR": shimDir,
+            "ANTHROPIC_API_KEY": "test-key-never-sent",
+            "MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH": answersPath,
+            "MLXFAST_SCORE_PATH": scorePath,
+            "MLXFAST_INTEGRITY_PATH": root.appendingPathComponent("absent-integrity.json").path,
+            "MLXFAST_SEMANTIC_GPQA_RESULTS_PATH": resultsPath,
+            "MLXFAST_PRIVATE_DIR": root.appendingPathComponent("private").path,
+            "MLXFAST_SEMANTIC_GPQA_MIN_PASS": "1",
+            "MLXFAST_SEMANTIC_GPQA_REQUIRED": "1",
+        ])
+    #expect(gate.status == 0, gate.output.isEmpty ? "no output" : "\(gate.output)")
+
+    // Every parseable verdict shape lands, prose-wrapped false stays false,
+    // and only the garbage case fails -- after burning all three attempts.
+    #expect(gate.output.contains("judging 5 hidden cases with claude-opus-4-8"))
+    #expect(gate.output.contains("case 1/5 passed=true"))
+    #expect(gate.output.contains("case 2/5 passed=true"))
+    #expect(gate.output.contains("case 3/5 passed=false"))
+    #expect(!gate.output.contains("case 3/5 passed=false reason=invalid_judge_response"))
+    #expect(gate.output.contains("case 4/5 judge response was not parseable JSON (stop_reason=max_tokens); retrying"))
+    #expect(gate.output.contains("case 4/5 passed=false reason=invalid_judge_response"))
+    #expect(gate.output.contains("case 5/5 passed=true"))
+    #expect(gate.output.contains("semantic-gpqa: passed 3/5"))
+    let garbageAttempts = try String(contentsOfFile: shimDir + "/garbage-attempts", encoding: .utf8)
+    #expect(garbageAttempts.components(separatedBy: "\n").filter { !$0.isEmpty }.count == 3)
+
+    // The judge request is the documented Opus 4.8 shape: adaptive thinking
+    // at max effort, an untruncatable max_tokens, and none of the fields
+    // Opus 4.8 rejects with a 400 (sampling params, assistant prefill).
+    let requestData = try Data(contentsOf: URL(fileURLWithPath: shimDir + "/last-request.json"))
+    let request = try #require(
+        try JSONSerialization.jsonObject(with: requestData) as? [String: Any])
+    #expect(request["model"] as? String == "claude-opus-4-8")
+    #expect(request["max_tokens"] as? Int == 32000)
+    #expect((request["thinking"] as? [String: Any])?["type"] as? String == "adaptive")
+    #expect((request["output_config"] as? [String: Any])?["effort"] as? String == "max")
+    #expect(request["temperature"] == nil)
+    #expect(request["top_p"] == nil)
+    #expect(request["top_k"] == nil)
+    let messages = try #require(request["messages"] as? [[String: Any]])
+    #expect(messages.count == 1)
+    #expect(messages[0]["role"] as? String == "user")
+    let system = try #require(request["system"] as? String)
+    #expect(system.contains("exactly one JSON object"))
+
+    // score.json is patched with the aggregate verdict and the new model pin;
+    // the gate stays green because pass_count 3 >= min_pass 1.
+    let score = try String(contentsOfFile: scorePath, encoding: .utf8)
+    #expect(score.contains("\"semantic_gpqa_passed\": true"))
+    #expect(score.contains("\"semantic_gpqa_pass_count\": 3"))
+    #expect(score.contains("\"semantic_gpqa_case_count\": 5"))
+    #expect(score.contains("\"semantic_gpqa_model\": \"claude-opus-4-8\""))
+    let results = try String(contentsOfFile: resultsPath, encoding: .utf8)
+    #expect(results.contains("\"error\": \"invalid_judge_response\""))
 }
 
 // Ranked validation otherwise exercises only the hidden goldens, so numerics

@@ -126,7 +126,7 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
                 semanticGPQAPassed: true,
                 semanticGPQAPassCount: 8,
                 semanticGPQACaseCount: 9,
-                semanticGPQAModel: "claude-sonnet-4-5-20250929",
+                semanticGPQAModel: "claude-opus-4-8",
                 processResidentMemoryGB: 3.5,
                 passedCorrectness: false,
                 numLayers: MLXFastConstants.numHiddenLayers,
@@ -206,7 +206,7 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(raw.contains("\"semantic_gpqa_passed\" : true"))
     #expect(raw.contains("\"semantic_gpqa_pass_count\" : 8"))
     #expect(raw.contains("\"semantic_gpqa_case_count\" : 9"))
-    #expect(raw.contains("\"semantic_gpqa_model\" : \"claude-sonnet-4-5-20250929\""))
+    #expect(raw.contains("\"semantic_gpqa_model\" : \"claude-opus-4-8\""))
     #expect(raw.contains("\"process_resident_memory_gb\" : 3.5"))
     #expect(decoded.metrics.firstFailingLayer == nil)
     #expect(decoded.metrics.firstFailingCase == "case-b")
@@ -249,7 +249,7 @@ func writeScorePayloadKeepsTokenStepSeparateFromLayerFailures() throws {
     #expect(decoded.metrics.semanticGPQAPassed == true)
     #expect(decoded.metrics.semanticGPQAPassCount == 8)
     #expect(decoded.metrics.semanticGPQACaseCount == 9)
-    #expect(decoded.metrics.semanticGPQAModel == "claude-sonnet-4-5-20250929")
+    #expect(decoded.metrics.semanticGPQAModel == "claude-opus-4-8")
     #expect(decoded.metrics.processResidentMemoryGB == 3.5)
 }
 
