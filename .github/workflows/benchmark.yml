@@ -107,11 +107,15 @@ on:
 permissions:
   contents: read
 
-# The ranked M5 is a single physical machine. Use one repository-wide group so
-# every dispatch -- every ref and both full/correctness-only modes -- queues
-# behind the active run instead of competing for the host or cancelling it.
+# Ranked serving now spans two hardened, at-parity M5 boxes (both PF-locked-down,
+# same pinned baseline ref 4475b88, cross-box timing measured ~0.01% decode /
+# ~0.09% prefill apart). A per-run concurrency group lets dispatches run
+# concurrently -- one per box -- instead of serializing behind a single global
+# queue; actual concurrency is naturally bounded by the number of online
+# m5-bench runners (2). cancel-in-progress stays false so no ranked run is ever
+# cancelled out from under a box mid-measurement.
 concurrency:
-  group: mlxfast-ranked-benchmark
+  group: mlxfast-ranked-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
