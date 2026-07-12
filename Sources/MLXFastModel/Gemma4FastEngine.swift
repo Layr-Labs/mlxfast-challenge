@@ -430,11 +430,15 @@ final class Gemma4FastLayer {
         var queries: MLXArray
         var keys: MLXArray
         var values: MLXArray
-        if B == 1, L == 1, let fusedAttentionRMS {
+        let usesFusedAttentionPreparation = B == 1
+            && L == 1
+            && fusedAttentionRMS?.supports(offset: offset) == true
+        if usesFusedAttentionPreparation, let fusedAttentionRMS {
             let prepared = fusedAttentionRMS(
                 rawQueries: rawQueries,
                 rawKeys: rawKeys,
-                rawValues: rawValues
+                rawValues: rawValues,
+                offset: offset
             )
             queries = prepared.0
             keys = prepared.1
@@ -456,7 +460,9 @@ final class Gemma4FastLayer {
                 values, weight: MLXArray.mlxNone, eps: eps)
             values = values.transposed(0, 2, 1, 3)
         }
-        keys = rope(keys, offset: offset)
+        if !usesFusedAttentionPreparation {
+            keys = rope(keys, offset: offset)
+        }
 
         if let cache {
             let updated = cache.update(keys: keys, values: values)
@@ -464,10 +470,12 @@ final class Gemma4FastLayer {
             values = updated.1
         }
 
-        if !(B == 1 && L == 1 && fusedAttentionRMS != nil) {
+        if !usesFusedAttentionPreparation {
             queries = queries.transposed(0, 2, 1, 3)
         }
-        queries = rope(queries, offset: offset)
+        if !usesFusedAttentionPreparation {
+            queries = rope(queries, offset: offset)
+        }
 
         var attentionMask = mask
         if case .array(let maskArray) = mask {
