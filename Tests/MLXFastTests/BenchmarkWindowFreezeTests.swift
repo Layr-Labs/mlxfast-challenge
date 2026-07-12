@@ -92,10 +92,6 @@ func benchmarkWindowFreezeDocMatchesConstants() throws {
 func timedDecodeChargesOneValidatedSeedForward() throws {
     let worker = try packageFile("Sources/MLXFastHarness/GemmaRuntimeWorker.swift")
     let decodeBegin = try slice(worker, from: "case \"decode_begin\":", to: "case \"decode_step\":")
-    // The one-forward/no-warmup property is also guarded by
-    // BenchmarkScriptTests.decodeMeasurementRunsSingleUnmemoizableSeedForward;
-    // this test intentionally supersets it (it additionally pins parent-timed,
-    // oracle-validated measurement) so the freeze guard stands on its own.
     // Exactly one whole-prompt forward, and no warmup pass to memoize against it.
     #expect(decodeBegin.components(separatedBy: "Gemma4Model.logits(").count - 1 == 1)
     #expect(!decodeBegin.contains("warmupCache"))
@@ -113,6 +109,23 @@ func timedDecodeChargesOneValidatedSeedForward() throws {
     #expect(measureWorkerDecode.contains("compareDecodeSeedToken"))
     #expect(measureWorkerDecode.contains("compareDecodeTokens"))
     #expect(!measureWorkerDecode.contains("response.seconds"))
+
+    // The in-process (non-worker) decode path must also run its single seed
+    // forward with NO preceding warmup pass. A second identical whole-prompt
+    // forward would let submitted model code memoize one pass and serve the
+    // other from that memo, collapsing two charged forwards into one. (Unlike
+    // decode_begin, this path inlines the per-step decode loop with its own
+    // single-token logits calls, so assert the absence of the warmup rather
+    // than a whole-prompt forward count.)
+    let measureDecode = try slice(
+        benchmark,
+        from: "static func measureDecode(",
+        to: "static func measureWorkerDecode("
+    )
+    #expect(!measureDecode.contains("warmupCache"))
+    #expect(!measureDecode.contains("warmupLogits"))
+    #expect(!measureDecode.contains("decode warmup start"))
+    #expect(measureDecode.contains("preceding warmup pass"))
 }
 
 @Test
@@ -275,14 +288,23 @@ func scoredBaselinesResolveFromGoldenWithConstantsFallback() throws {
     #expect(golden.contains("must be provided together"))
 
     let benchmark = try packageFile("Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift")
+    let score = try packageFile("Sources/MLXFastCore/Score.swift")
     // Both benchmark paths adopt the golden's resolved baselines...
     #expect(benchmark.components(separatedBy: "benchmarkGolden.resolvedBaselinePrefillSecondsPerToken").count - 1 == 2)
     #expect(benchmark.components(separatedBy: "benchmarkGolden.resolvedBaselineDecodeSecondsPerToken").count - 1 == 2)
     // ...and every scored speedup uses the resolved values, never the raw constants.
-    #expect(benchmark.contains("baselineSecondsPerToken: baselineDecodeSecondsPerToken"))
-    #expect(benchmark.contains("baselineSecondsPerToken: baselinePrefillSecondsPerToken"))
-    #expect(!benchmark.contains("baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken"))
-    #expect(!benchmark.contains("baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken"))
+    #expect(score.contains("baselineSecondsPerToken: baselineDecodeSecondsPerToken"))
+    #expect(score.contains("baselineSecondsPerToken: baselinePrefillSecondsPerToken"))
+    #expect(benchmark.contains("BenchmarkScore.evaluateTimedRun("))
+    #expect(!score.contains("baselineSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken"))
+    #expect(!score.contains("baselineSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken"))
+    // The benchmark file feeds the baselines into BenchmarkScore/ScorePayload;
+    // no call site there may bind a baseline argument straight to the raw
+    // constants (parameter DEFAULTS spell ": Double = MLXFastConstants.", so
+    // they do not match). Without this the two negative checks above are
+    // vacuous: Score.swift only ever sees baselines as parameters.
+    #expect(!benchmark.contains("baselineDecodeSecondsPerToken: MLXFastConstants."))
+    #expect(!benchmark.contains("baselinePrefillSecondsPerToken: MLXFastConstants."))
 }
 
 @Test

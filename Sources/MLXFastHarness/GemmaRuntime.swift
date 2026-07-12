@@ -1,5 +1,6 @@
 import Foundation
 import MLXFastCore
+import MLXFastModel
 
 public struct CorrectnessOptions: Equatable {
     public let weightsPath: String
@@ -318,3 +319,20 @@ public struct RuntimeWorkerOptions: Equatable {
 
 // Implementation lives in the GemmaRuntime*.swift split files.
 public enum GemmaRuntime {}
+
+extension GemmaRuntime {
+    /// Dense Gemma 4 keeps every text-tower weight RAM-resident; there is no
+    /// expert streaming machinery, so score/worker protocol fields stay zero.
+    /// Convention: call sites with a live weight cache/loader in scope go
+    /// through these helpers; paths with no such handle (worker-backed
+    /// benchmark phases and early failure payloads) inline
+    /// `ExpertStreamingStats.zero` directly, which is identical by
+    /// construction.
+    static func expertStats(from _: Gemma4RuntimeWeightCache) -> ExpertStreamingStats {
+        .zero
+    }
+
+    static func expertStats(from _: Gemma4WeightLoader?) -> ExpertStreamingStats {
+        .zero
+    }
+}

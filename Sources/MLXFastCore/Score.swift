@@ -62,6 +62,101 @@ public enum BenchmarkScore {
         }
         return decodeSpeedup >= decodeFloor && prefillSpeedup >= prefillFloor
     }
+
+    public static func speedupFloorFailureMessage(
+        decodeSpeedup: Double,
+        prefillSpeedup: Double,
+        decodeFloor: Double = MLXFastConstants.scoreDecodeSpeedupFloor,
+        prefillFloor: Double = MLXFastConstants.scorePrefillSpeedupFloor
+    ) -> String {
+        func format(_ value: Double) -> String {
+            String(format: "%.6f", locale: Locale(identifier: "en_US_POSIX"), value)
+        }
+        return "performance floor failed: decode_speedup=\(format(decodeSpeedup)) "
+            + "floor=\(format(decodeFloor)) "
+            + "prefill_speedup=\(format(prefillSpeedup)) "
+            + "floor=\(format(prefillFloor))"
+    }
+
+    public static func evaluateTimedRun(
+        decodeSecondsPerToken: Double,
+        prefillSecondsPerToken: Double,
+        baselineDecodeSecondsPerToken: Double,
+        baselinePrefillSecondsPerToken: Double
+    ) -> TimedRunScoreEvaluation {
+        let score = score(
+            decodeSecondsPerToken: decodeSecondsPerToken,
+            prefillSecondsPerToken: prefillSecondsPerToken,
+            baselineDecodeSecondsPerToken: baselineDecodeSecondsPerToken,
+            baselinePrefillSecondsPerToken: baselinePrefillSecondsPerToken
+        )
+        let decodeSpeedup = speedup(
+            baselineSecondsPerToken: baselineDecodeSecondsPerToken,
+            candidateSecondsPerToken: decodeSecondsPerToken
+        )
+        let prefillSpeedup = speedup(
+            baselineSecondsPerToken: baselinePrefillSecondsPerToken,
+            candidateSecondsPerToken: prefillSecondsPerToken
+        )
+        let prefillBand = AcceptanceBand.check(
+            value: prefillSecondsPerToken,
+            reference: baselinePrefillSecondsPerToken,
+            upTolerance: MLXFastConstants.prefillBandUpTolerance,
+            downTolerance: MLXFastConstants.prefillBandDownTolerance,
+            label: "prefill"
+        )
+        let decodeBand = AcceptanceBand.check(
+            value: decodeSecondsPerToken,
+            reference: baselineDecodeSecondsPerToken,
+            upTolerance: MLXFastConstants.decodeBandUpTolerance,
+            downTolerance: MLXFastConstants.decodeBandDownTolerance,
+            label: "decode"
+        )
+        return TimedRunScoreEvaluation(
+            score: score,
+            decodeSpeedup: decodeSpeedup,
+            prefillSpeedup: prefillSpeedup,
+            passesFloors: passesSpeedupFloors(
+                decodeSpeedup: decodeSpeedup,
+                prefillSpeedup: prefillSpeedup
+            ),
+            prefillBand: prefillBand,
+            decodeBand: decodeBand
+        )
+    }
+}
+
+public struct TimedRunScoreEvaluation: Equatable {
+    public let score: Double
+    public let decodeSpeedup: Double
+    public let prefillSpeedup: Double
+    public let passesFloors: Bool
+    public let prefillBand: AcceptanceBandResult
+    public let decodeBand: AcceptanceBandResult
+
+    public var hasFiniteScore: Bool {
+        score.isFinite && score >= 0
+    }
+
+    public var passesAcceptanceBands: Bool {
+        prefillBand.passed && decodeBand.passed
+    }
+
+    public func firstFailureReason() -> String? {
+        if !hasFiniteScore {
+            return "computed score was not finite"
+        }
+        if !passesFloors {
+            return BenchmarkScore.speedupFloorFailureMessage(
+                decodeSpeedup: decodeSpeedup,
+                prefillSpeedup: prefillSpeedup
+            )
+        }
+        if !passesAcceptanceBands {
+            return "acceptance band failed: \(prefillBand.passed ? decodeBand.reason : prefillBand.reason)"
+        }
+        return nil
+    }
 }
 
 public struct ScorePayload: Codable, Equatable {

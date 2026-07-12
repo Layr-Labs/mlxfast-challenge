@@ -18,7 +18,6 @@ extension GemmaRuntime {
         let benchmarkStart = DispatchTime.now().uptimeNanoseconds
         let progress = makeBenchmarkProgressReporter(startedAt: benchmarkStart)
         var correctnessReport: CorrectnessReport?
-        var benchmarkLoader: Gemma4WeightLoader?
         var transformedWeightsDigest: DirectoryDigest?
         var preflightSeconds = 0.0
         var correctnessSeconds = 0.0
@@ -142,20 +141,18 @@ extension GemmaRuntime {
             }
 
             let runtimeBenchmarkLoader = try Gemma4WeightLoader(weightsPath: options.weightsPath)
-            benchmarkLoader = runtimeBenchmarkLoader
             let benchmarkCache = Gemma4RuntimeWeightCache(loader: runtimeBenchmarkLoader, config: config)
             guard let benchmarkGolden = golden.benchmark else {
                 throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
             }
-            let promptPlan = try BenchmarkPrompt.plan(from: benchmarkGolden)
             let pairedBaseline = try PairedBaselineOverride.fromEnvironment()
             baselinePrefillSecondsPerToken = pairedBaseline?.prefillSecondsPerToken
                 ?? benchmarkGolden.resolvedBaselinePrefillSecondsPerToken
             baselineDecodeSecondsPerToken = pairedBaseline?.decodeSecondsPerToken
                 ?? benchmarkGolden.resolvedBaselineDecodeSecondsPerToken
             progress(
-                "benchmark oracle ready prefill_tokens=\(promptPlan.prefillTokens.count) "
-                    + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
+                "benchmark oracle ready prefill_tokens=\(benchmarkGolden.prefillPromptTokens.count) "
+                    + "decode_seed_tokens=\(benchmarkGolden.decodeSeedTokens.count) "
                     + "decode_tokens=\(options.benchmarkDecodeSteps) "
                     + "baseline_source=\(baselineSourceLabel(paired: pairedBaseline, golden: benchmarkGolden))"
             )
@@ -164,103 +161,54 @@ extension GemmaRuntime {
             let timedBenchmarkStart = DispatchTime.now().uptimeNanoseconds
             progress("timed benchmark start")
             let prefillSecondsPerToken = try measurePrefillSecondsPerToken(
-                promptTokens: promptPlan.prefillTokens,
-                expectedToken: promptPlan.expectedPrefillToken,
+                promptTokens: benchmarkGolden.prefillPromptTokens,
+                expectedToken: benchmarkGolden.expectedPrefillToken,
                 weightCache: benchmarkCache,
                 progress: progress
             )
             let decode = try measureDecode(
-                seedTokens: promptPlan.decodeSeedTokens,
-                expectedSeedToken: promptPlan.expectedDecodeSeedToken,
-                expectedTokens: promptPlan.expectedDecodeTokens,
+                seedTokens: benchmarkGolden.decodeSeedTokens,
+                expectedSeedToken: benchmarkGolden.expectedDecodeSeedToken,
+                expectedTokens: benchmarkGolden.expectedDecodeTokens,
                 decodeSteps: options.benchmarkDecodeSteps,
                 weightCache: benchmarkCache,
                 progress: progress
             )
             timedBenchmarkSeconds = secondsSince(timedBenchmarkStart)
             let peakRamGB = Double(Memory.peakMemory) / Double(1 << 30)
-            let score = BenchmarkScore.score(
+            let evaluation = BenchmarkScore.evaluateTimedRun(
                 decodeSecondsPerToken: decode.secondsPerToken,
                 prefillSecondsPerToken: prefillSecondsPerToken,
                 baselineDecodeSecondsPerToken: baselineDecodeSecondsPerToken,
                 baselinePrefillSecondsPerToken: baselinePrefillSecondsPerToken
             )
-            let decodeSpeedup = BenchmarkScore.speedup(
-                baselineSecondsPerToken: baselineDecodeSecondsPerToken,
-                candidateSecondsPerToken: decode.secondsPerToken
-            )
-            let prefillSpeedup = BenchmarkScore.speedup(
-                baselineSecondsPerToken: baselinePrefillSecondsPerToken,
-                candidateSecondsPerToken: prefillSecondsPerToken
-            )
-            let expertStats = expertStats(from: runtimeBenchmarkLoader)
+            let expertStats = expertStats(from: benchmarkCache)
 
-            guard score.isFinite, score >= 0 else {
+            if let failureReason = evaluation.firstFailureReason() {
+                let includeTimings = evaluation.hasFiniteScore
                 return makeFailedScore(
-                    error: "computed score was not finite",
-                    correctness: correctnessReport,
-                    passedCorrectness: true,
-                    expertStats: expertStats,
-                    weightsDigest: transformedWeightsDigest
-                )
-            }
-            guard BenchmarkScore.passesSpeedupFloors(
-                decodeSpeedup: decodeSpeedup,
-                prefillSpeedup: prefillSpeedup
-            ) else {
-                return makeFailedScore(
-                    error: speedupFloorFailureMessage(
-                        decodeSpeedup: decodeSpeedup,
-                        prefillSpeedup: prefillSpeedup
-                    ),
+                    error: failureReason,
                     correctness: correctnessReport,
                     passedCorrectness: true,
                     expertStats: expertStats,
                     weightsDigest: transformedWeightsDigest,
-                    peakRamGB: peakRamGB,
-                    bandwidthGBPerToken: decode.bandwidthGBPerToken,
-                    decodeSecondsPerToken: decode.secondsPerToken,
-                    prefillSecondsPerToken: prefillSecondsPerToken,
-                    bandwidthSource: decode.bandwidthSource
-                )
-            }
-            // Acceptance bands vs the resolved baseline B (see AcceptanceBand):
-            // prefill +/-5%; decode +2% regression / -5% gain (per-submission decode
-            // gain capped at 5% -> larger wins must be chunked). Fail closed on either.
-            let prefillBand = AcceptanceBand.check(
-                value: prefillSecondsPerToken, reference: baselinePrefillSecondsPerToken,
-                upTolerance: MLXFastConstants.prefillBandUpTolerance,
-                downTolerance: MLXFastConstants.prefillBandDownTolerance, label: "prefill"
-            )
-            let decodeBand = AcceptanceBand.check(
-                value: decode.secondsPerToken, reference: baselineDecodeSecondsPerToken,
-                upTolerance: MLXFastConstants.decodeBandUpTolerance,
-                downTolerance: MLXFastConstants.decodeBandDownTolerance, label: "decode"
-            )
-            guard prefillBand.passed, decodeBand.passed else {
-                return makeFailedScore(
-                    error: "acceptance band failed: \(prefillBand.passed ? decodeBand.reason : prefillBand.reason)",
-                    correctness: correctnessReport,
-                    passedCorrectness: true,
-                    expertStats: expertStats,
-                    weightsDigest: transformedWeightsDigest,
-                    peakRamGB: peakRamGB,
-                    bandwidthGBPerToken: decode.bandwidthGBPerToken,
-                    decodeSecondsPerToken: decode.secondsPerToken,
-                    prefillSecondsPerToken: prefillSecondsPerToken,
-                    bandwidthSource: decode.bandwidthSource
+                    peakRamGB: includeTimings ? peakRamGB : 0,
+                    bandwidthGBPerToken: includeTimings ? decode.bandwidthGBPerToken : 0,
+                    decodeSecondsPerToken: includeTimings ? decode.secondsPerToken : 0,
+                    prefillSecondsPerToken: includeTimings ? prefillSecondsPerToken : 0,
+                    bandwidthSource: includeTimings ? decode.bandwidthSource : ""
                 )
             }
             progress(
-                "complete score=\(formatDouble(score)) "
-                    + "decode_speedup=\(formatDouble(decodeSpeedup)) "
-                    + "prefill_speedup=\(formatDouble(prefillSpeedup)) "
+                "complete score=\(formatDouble(evaluation.score)) "
+                    + "decode_speedup=\(formatDouble(evaluation.decodeSpeedup)) "
+                    + "prefill_speedup=\(formatDouble(evaluation.prefillSpeedup)) "
                     + "wall_seconds=\(formatSeconds(secondsSince(benchmarkStart))) "
                     + "timed_seconds=\(formatSeconds(timedBenchmarkSeconds))"
             )
 
             return passedScore(
-                score: score,
+                score: evaluation.score,
                 peakRamGB: peakRamGB,
                 bandwidthGBPerToken: decode.bandwidthGBPerToken,
                 decodeSecondsPerToken: decode.secondsPerToken,
@@ -284,7 +232,7 @@ extension GemmaRuntime {
                 error: mismatch.description,
                 correctness: correctnessReport,
                 passedCorrectness: correctnessReport?.passed == true,
-                expertStats: expertStats(from: benchmarkLoader),
+                expertStats: .zero,
                 firstFailingCase: "benchmark",
                 firstFailingStep: mismatch.step,
                 expectedToken: nil,
@@ -296,7 +244,7 @@ extension GemmaRuntime {
                 error: "\(error)",
                 correctness: correctnessReport,
                 passedCorrectness: correctnessReport?.passed == true,
-                expertStats: expertStats(from: benchmarkLoader),
+                expertStats: .zero,
                 weightsDigest: transformedWeightsDigest
             )
         }
@@ -383,7 +331,6 @@ extension GemmaRuntime {
         var preflightSeconds = 0.0
         var correctnessSeconds = 0.0
         var timedBenchmarkSeconds = 0.0
-        var lastExpertStats = ExpertStreamingStats.zero
         var peakRamGB = 0.0
         // Overwritten with the golden oracle's per-prompt baselines (if it
         // carries them) once the golden loads; until then failure payloads use
@@ -416,7 +363,7 @@ extension GemmaRuntime {
                 error: error,
                 correctness: correctness,
                 passedCorrectness: passedCorrectness,
-                expertStats: lastExpertStats,
+                expertStats: ExpertStreamingStats.zero,
                 firstFailingCase: explicitFirstFailingCase,
                 firstFailingStep: explicitFirstFailingStep,
                 expectedToken: explicitExpectedToken,
@@ -479,25 +426,22 @@ extension GemmaRuntime {
             guard let benchmarkGolden = golden.benchmark else {
                 throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
             }
-            let promptPlan = try BenchmarkPrompt.plan(from: benchmarkGolden)
             let pairedBaseline = try PairedBaselineOverride.fromEnvironment()
             baselinePrefillSecondsPerToken = pairedBaseline?.prefillSecondsPerToken
                 ?? benchmarkGolden.resolvedBaselinePrefillSecondsPerToken
             baselineDecodeSecondsPerToken = pairedBaseline?.decodeSecondsPerToken
                 ?? benchmarkGolden.resolvedBaselineDecodeSecondsPerToken
             progress(
-                "benchmark oracle ready prefill_tokens=\(promptPlan.prefillTokens.count) "
-                    + "decode_seed_tokens=\(promptPlan.decodeSeedTokens.count) "
+                "benchmark oracle ready prefill_tokens=\(benchmarkGolden.prefillPromptTokens.count) "
+                    + "decode_seed_tokens=\(benchmarkGolden.decodeSeedTokens.count) "
                     + "decode_tokens=\(options.benchmarkDecodeSteps) "
                     + "baseline_source=\(baselineSourceLabel(paired: pairedBaseline, golden: benchmarkGolden))"
             )
             peakRamGB = 0
-            lastExpertStats = .zero
 
             let prefillSecondsPerToken: Double
             let decode: DecodeMeasurement
             let benchmarkPeakRamGB: Double
-            let benchmarkExpertStats: ExpertStreamingStats
             if options.skipTimedBenchmark {
                 // This pass's role is the base case + anchor/free-run/behavior/
                 // GPQA gates only -- the ranked pipeline measures the real
@@ -509,7 +453,7 @@ extension GemmaRuntime {
                 // fails JSON encoding outright. Whatever ships here is
                 // overwritten by the measured paired timing when
                 // overlay-paired-timing.sh assembles the final score.
-                progress("timed benchmark skipped (gates-only machine)")
+                progress("timed benchmark skipped (gates-only phase)")
                 prefillSecondsPerToken = baselinePrefillSecondsPerToken
                 decode = DecodeMeasurement(
                     secondsPerToken: baselineDecodeSecondsPerToken,
@@ -518,7 +462,6 @@ extension GemmaRuntime {
                 )
                 timedBenchmarkSeconds = 0
                 benchmarkPeakRamGB = 0
-                benchmarkExpertStats = .zero
             } else {
                 let timedBenchmarkStart = DispatchTime.now().uptimeNanoseconds
                 progress("timed benchmark start")
@@ -532,12 +475,11 @@ extension GemmaRuntime {
                         prefillWorker.close()
                     }
                     prefillSecondsPerToken = try measureWorkerPrefillSecondsPerToken(
-                        promptTokens: promptPlan.prefillTokens,
-                        expectedToken: promptPlan.expectedPrefillToken,
+                        promptTokens: benchmarkGolden.prefillPromptTokens,
+                        expectedToken: benchmarkGolden.expectedPrefillToken,
                         worker: prefillWorker,
                         progress: progress,
-                        peakRamGB: &peakRamGB,
-                        expertStats: &lastExpertStats
+                        peakRamGB: &peakRamGB
                     )
                 }
                 progress("benchmark decode worker start")
@@ -550,42 +492,32 @@ extension GemmaRuntime {
                         decodeWorker.close()
                     }
                     decode = try measureWorkerDecode(
-                        seedTokens: promptPlan.decodeSeedTokens,
-                        expectedSeedToken: promptPlan.expectedDecodeSeedToken,
-                        expectedTokens: promptPlan.expectedDecodeTokens,
+                        seedTokens: benchmarkGolden.decodeSeedTokens,
+                        expectedSeedToken: benchmarkGolden.expectedDecodeSeedToken,
+                        expectedTokens: benchmarkGolden.expectedDecodeTokens,
                         decodeSteps: options.benchmarkDecodeSteps,
                         worker: decodeWorker,
                         progress: progress,
-                        peakRamGB: &peakRamGB,
-                        expertStats: &lastExpertStats
+                        peakRamGB: &peakRamGB
                     )
                 }
                 timedBenchmarkSeconds = secondsSince(timedBenchmarkStart)
                 benchmarkPeakRamGB = peakRamGB
-                benchmarkExpertStats = lastExpertStats
             }
 
             // Computed unconditionally from whatever `decode`/prefillSecondsPerToken
-            // ended up holding, real or (for a gates-only machine) the baseline
+            // ended up holding, real or (for the gates-only phase) the baseline
             // placeholder -- the placeholder yields score/speedups of exactly 1.0,
             // which trivially clears the floor checks below, so this guard logic
             // does not need its own skipTimedBenchmark branch.
-            let score = BenchmarkScore.score(
+            let evaluation = BenchmarkScore.evaluateTimedRun(
                 decodeSecondsPerToken: decode.secondsPerToken,
                 prefillSecondsPerToken: prefillSecondsPerToken,
                 baselineDecodeSecondsPerToken: baselineDecodeSecondsPerToken,
                 baselinePrefillSecondsPerToken: baselinePrefillSecondsPerToken
             )
-            let decodeSpeedup = BenchmarkScore.speedup(
-                baselineSecondsPerToken: baselineDecodeSecondsPerToken,
-                candidateSecondsPerToken: decode.secondsPerToken
-            )
-            let prefillSpeedup = BenchmarkScore.speedup(
-                baselineSecondsPerToken: baselinePrefillSecondsPerToken,
-                candidateSecondsPerToken: prefillSecondsPerToken
-            )
 
-            guard score.isFinite, score >= 0 else {
+            if !evaluation.hasFiniteScore {
                 return makeFailedScore(
                     error: "computed score was not finite",
                     correctness: correctnessReport,
@@ -597,14 +529,11 @@ extension GemmaRuntime {
                     bandwidthSource: decode.bandwidthSource
                 )
             }
-            guard BenchmarkScore.passesSpeedupFloors(
-                decodeSpeedup: decodeSpeedup,
-                prefillSpeedup: prefillSpeedup
-            ) else {
+            if !evaluation.passesFloors {
                 return makeFailedScore(
-                    error: speedupFloorFailureMessage(
-                        decodeSpeedup: decodeSpeedup,
-                        prefillSpeedup: prefillSpeedup
+                    error: BenchmarkScore.speedupFloorFailureMessage(
+                        decodeSpeedup: evaluation.decodeSpeedup,
+                        prefillSpeedup: evaluation.prefillSpeedup
                     ),
                     correctness: correctnessReport,
                     passedCorrectness: false,
@@ -615,22 +544,9 @@ extension GemmaRuntime {
                     bandwidthSource: decode.bandwidthSource
                 )
             }
-            // Acceptance bands vs the resolved baseline (see the identical guard on the
-            // single-machine path and AcceptanceBand): prefill +/-5%; decode +2%
-            // regression / -5% gain (per-submission decode gain capped at 5%).
-            let prefillBand = AcceptanceBand.check(
-                value: prefillSecondsPerToken, reference: baselinePrefillSecondsPerToken,
-                upTolerance: MLXFastConstants.prefillBandUpTolerance,
-                downTolerance: MLXFastConstants.prefillBandDownTolerance, label: "prefill"
-            )
-            let decodeBand = AcceptanceBand.check(
-                value: decode.secondsPerToken, reference: baselineDecodeSecondsPerToken,
-                upTolerance: MLXFastConstants.decodeBandUpTolerance,
-                downTolerance: MLXFastConstants.decodeBandDownTolerance, label: "decode"
-            )
-            guard prefillBand.passed, decodeBand.passed else {
+            if !evaluation.passesAcceptanceBands {
                 return makeFailedScore(
-                    error: "acceptance band failed: \(prefillBand.passed ? decodeBand.reason : prefillBand.reason)",
+                    error: evaluation.firstFailureReason() ?? "acceptance band failed",
                     correctness: correctnessReport,
                     passedCorrectness: false,
                     peakRamGB: benchmarkPeakRamGB,
@@ -721,15 +637,15 @@ extension GemmaRuntime {
             }
 
             progress(
-                "complete score=\(formatDouble(score)) "
-                    + "decode_speedup=\(formatDouble(decodeSpeedup)) "
-                    + "prefill_speedup=\(formatDouble(prefillSpeedup)) "
+                "complete score=\(formatDouble(evaluation.score)) "
+                    + "decode_speedup=\(formatDouble(evaluation.decodeSpeedup)) "
+                    + "prefill_speedup=\(formatDouble(evaluation.prefillSpeedup)) "
                     + "wall_seconds=\(formatSeconds(secondsSince(benchmarkStart))) "
                     + "timed_seconds=\(formatSeconds(timedBenchmarkSeconds))"
             )
 
             return passedScore(
-                score: score,
+                score: evaluation.score,
                 peakRamGB: benchmarkPeakRamGB,
                 bandwidthGBPerToken: decode.bandwidthGBPerToken,
                 decodeSecondsPerToken: decode.secondsPerToken,
@@ -742,7 +658,7 @@ extension GemmaRuntime {
                 timedBenchmarkSeconds: timedBenchmarkSeconds,
                 numLayers: MLXFastConstants.numHiddenLayers,
                 correctness: correctness,
-                expertStats: benchmarkExpertStats,
+                expertStats: .zero,
                 bandwidthSource: decode.bandwidthSource,
                 weightsDigest: transformedWeightsDigest,
                 gpqaTTFT: correctnessResult.gpqaTTFT,
@@ -849,8 +765,7 @@ extension GemmaRuntime {
         expectedToken: Int,
         worker: RuntimeWorkerClient,
         progress: ((String) -> Void)? = nil,
-        peakRamGB: inout Double,
-        expertStats: inout ExpertStreamingStats
+        peakRamGB: inout Double
     ) throws -> Double {
         guard !promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("benchmark prefill prompt must not be empty")
@@ -889,7 +804,6 @@ extension GemmaRuntime {
                 )
             )
             let diagnostics = try worker.phaseDiagnostics()
-            expertStats = diagnostics.expertStats ?? expertStats
             peakRamGB = max(peakRamGB, diagnostics.peakRamGB ?? 0)
             progress?(
                 "prefill \(runLabel) \(runOrdinal)/\(runTotal) complete "
@@ -1018,8 +932,7 @@ extension GemmaRuntime {
         decodeSteps: Int = MLXFastConstants.benchmarkDecodeSteps,
         worker: RuntimeWorkerClient,
         progress: ((String) -> Void)? = nil,
-        peakRamGB: inout Double,
-        expertStats: inout ExpertStreamingStats
+        peakRamGB: inout Double
     ) throws -> DecodeMeasurement {
         guard !seedTokens.isEmpty else {
             throw MLXFastError.invalidInput("benchmark decode seed must not be empty")
@@ -1078,7 +991,6 @@ extension GemmaRuntime {
 
         let measuredSeconds = secondsSince(decodePhaseStart)
         let diagnostics = try worker.phaseDiagnostics()
-        expertStats = diagnostics.expertStats ?? expertStats
         peakRamGB = max(peakRamGB, diagnostics.peakRamGB ?? 0)
         let secondsPerToken = measuredSeconds / Double(decodeSteps)
         let actualTokensComparison = BenchmarkOutputValidator.compareDecodeTokens(
@@ -1103,17 +1015,6 @@ extension GemmaRuntime {
     /// is no expert-streaming byte counter to report: this is a fixed,
     /// non-ranking audit field (see `AGENTS.md`/`CLAUDE.md`).
     static let bandwidthSource = "ram_resident_model"
-
-    /// The dense, RAM-resident runtime has no expert-cache/streaming machinery
-    /// (see `AGENTS.md`/`CLAUDE.md`); this always returns the zero struct so
-    /// the score schema keeps its `expert_*` fields (all zero) unchanged.
-    static func expertStats(from weightCache: Gemma4RuntimeWeightCache) -> ExpertStreamingStats {
-        .zero
-    }
-
-    static func expertStats(from loader: Gemma4WeightLoader?) -> ExpertStreamingStats {
-        .zero
-    }
 
     static func passedScore(
         score: Double,
@@ -1276,16 +1177,6 @@ extension GemmaRuntime {
             return "paired_env"
         }
         return golden.baselineDecodeSecondsPerToken == nil ? "constants" : "golden"
-    }
-
-    static func speedupFloorFailureMessage(
-        decodeSpeedup: Double,
-        prefillSpeedup: Double
-    ) -> String {
-        "performance floor failed: decode_speedup=\(formatDouble(decodeSpeedup)) "
-            + "floor=\(formatDouble(MLXFastConstants.scoreDecodeSpeedupFloor)) "
-            + "prefill_speedup=\(formatDouble(prefillSpeedup)) "
-            + "floor=\(formatDouble(MLXFastConstants.scorePrefillSpeedupFloor))"
     }
 
 }

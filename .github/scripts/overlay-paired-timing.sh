@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Overlay the measure-job paired timing into the sealed gates score -- the
-# single-machine replacement for the old combine job's "Merge gates and timing
-# into machine1" step plus the timing machine's harness-side floor check.
+# Overlay the measure-job paired timing into the sealed gates score (gates +
+# paired timing merge and harness-side floor check).
 #
 # Inputs (all runner-owned, produced earlier in the same job):
 #   MLXFAST_SCORE_PATH             sealed gates+semantic score.json (base case
@@ -71,10 +70,10 @@ jq -e '
   exit 1
 }
 
-# Defense-in-depth on the candidate's sealed timing score, mirroring the old
-# combine job's pre-merge leak-field and expert-zero checks (the dense
-# RAM-resident runtime must report structural zeros; a nonzero value is a
-# schema regression that must fail loudly, not merge silently).
+# Defense-in-depth on the candidate's sealed timing score: leak-field and
+# expert-zero checks (the dense RAM-resident runtime must report structural
+# zeros; a nonzero value is a schema regression that must fail loudly, not
+# merge silently).
 jq -e --arg expected_commit "${EXPECTED_COMMIT}" \
   --slurpfile gates "${SCORE_PATH}" '
   (.metrics.commit as $commit
@@ -108,14 +107,11 @@ jq -e --arg expected_commit "${EXPECTED_COMMIT}" \
 }
 
 # Base the merged score on the gates score ($g) and overlay only the
-# timing-derived fields, with the same provenance rules the old combine used:
+# timing-derived fields:
 #   - decode/prefill seconds per token: the candidate's measured timing.
-#   - baseline_*: the pinned baseline's MEASURED same-session timing (the old
-#     pipeline injected these via MLXFAST_PAIRED_BASELINE_*; the harness then
-#     published them in exactly these fields).
+#   - baseline_*: the pinned baseline's measured same-session timing.
 #   - speedups/score: the paired ratio (ranking fields, full precision).
-#   - floors: applied here in the trusted shell; the old timing machine's
-#     harness applied the identical constants in-process.
+#   - floors: applied here in the trusted shell with the same constants.
 #   - timed_benchmark_seconds / bandwidth_*: candidate harness diagnostics
 #     (already coarsened by the harness).
 #   - benchmark_wall_seconds, peak_ram_gb, process_resident_memory_gb: max()

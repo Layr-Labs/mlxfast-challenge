@@ -21,41 +21,6 @@ public struct BenchmarkPreflightReport: Codable, Equatable {
     }
 }
 
-public struct BenchmarkPromptPlan: Equatable {
-    public let prefillTokens: [Int]
-    public let expectedPrefillToken: Int
-    public let decodeSeedTokens: [Int]
-    public let expectedDecodeSeedToken: Int
-    public let expectedDecodeTokens: [Int]
-
-    public init(
-        prefillTokens: [Int],
-        expectedPrefillToken: Int,
-        decodeSeedTokens: [Int],
-        expectedDecodeSeedToken: Int,
-        expectedDecodeTokens: [Int]
-    ) {
-        self.prefillTokens = prefillTokens
-        self.expectedPrefillToken = expectedPrefillToken
-        self.decodeSeedTokens = decodeSeedTokens
-        self.expectedDecodeSeedToken = expectedDecodeSeedToken
-        self.expectedDecodeTokens = expectedDecodeTokens
-    }
-}
-
-public enum BenchmarkPrompt {
-    public static func plan(from benchmark: BenchmarkGolden) throws -> BenchmarkPromptPlan {
-        try validateBenchmarkGolden(benchmark)
-        return BenchmarkPromptPlan(
-            prefillTokens: benchmark.prefillPromptTokens,
-            expectedPrefillToken: benchmark.expectedPrefillToken,
-            decodeSeedTokens: benchmark.decodeSeedTokens,
-            expectedDecodeSeedToken: benchmark.expectedDecodeSeedToken,
-            expectedDecodeTokens: benchmark.expectedDecodeTokens
-        )
-    }
-}
-
 /// Same-session baseline measurement supplied by the trusted workflow (see
 /// docs/benchmark-window-freeze.md, "Paired baseline measurement"). The official
 /// timing machine measures the pinned reference implementation immediately
@@ -156,7 +121,7 @@ public enum BenchmarkPreflight {
             try requireFile(path, description: description)
         }
 
-        let maxWeightsByteCount = try transformedWeightsByteLimit(environment: environment)
+        let maxWeightsByteCount = try transformedWeightsByteLimit(from: environment)
         let weightsByteCount = try transformedWeightsByteCount(
             weightsPath: weightsPath,
             maxByteCount: maxWeightsByteCount
@@ -164,10 +129,9 @@ public enum BenchmarkPreflight {
 
         let golden = try loadGoldenFixture(from: goldenPath)
         if requiresBenchmarkOracle {
-            guard let benchmark = golden.benchmark else {
+            guard golden.benchmark != nil else {
                 throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
             }
-            _ = try BenchmarkPrompt.plan(from: benchmark)
         }
         let config = try Gemma4Config.load(from: weightsPath)
 
@@ -183,25 +147,6 @@ public enum BenchmarkPreflight {
             weightsByteCount: weightsByteCount,
             maxWeightsByteCount: maxWeightsByteCount
         )
-    }
-
-    private static func transformedWeightsByteLimit(environment: [String: String]) throws -> Int? {
-        let raw = environment["MLXFAST_MAX_WEIGHTS_BYTES"] ?? ""
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return MLXFastConstants.defaultMaxTransformedWeightsBytes
-        }
-
-        let lowercased = trimmed.lowercased()
-        if lowercased == "0" || lowercased == "none" || lowercased == "unlimited" {
-            return nil
-        }
-        guard let value = Int(trimmed), value > 0 else {
-            throw MLXFastError.invalidInput(
-                "MLXFAST_MAX_WEIGHTS_BYTES must be a positive byte count, 0, none, or unlimited"
-            )
-        }
-        return value
     }
 
     private static func transformedWeightsByteCount(

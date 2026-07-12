@@ -115,10 +115,10 @@ private enum MLXFastCLI {
                 fallback: "\(MLXFastConstants.defaultMaxTransformedWeightsBytes)"
             )
         )
-        let maxByteCount = try parseMaxByteCount(
-            maxBytesRaw,
+        let maxByteCount = try parseTransformedWeightsByteLimit(
+            raw: maxBytesRaw,
             defaultByteCount: MLXFastConstants.defaultMaxTransformedWeightsBytes,
-            optionName: "--max-bytes"
+            optionLabel: "--max-bytes"
         )
         let report = try TransformVerifier.verify(
             TransformVerificationOptions(
@@ -1307,27 +1307,6 @@ private enum MLXFastCLI {
             return publicPath
         }
         return MLXFastConstants.defaultGoldenPath
-    }
-
-    private static func parseMaxByteCount(
-        _ raw: String,
-        defaultByteCount: Int?,
-        optionName: String
-    ) throws -> Int? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            return defaultByteCount
-        }
-        let lowercased = trimmed.lowercased()
-        if lowercased == "0" || lowercased == "none" || lowercased == "unlimited" {
-            return nil
-        }
-        guard let value = Int(trimmed), value > 0 else {
-            throw MLXFastError.invalidInput(
-                "\(optionName) must be a positive byte count, 0, none, or unlimited"
-            )
-        }
-        return value
     }
 
     private static func trimmedNonEmpty(_ value: String?) -> String? {

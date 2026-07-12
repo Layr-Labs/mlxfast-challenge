@@ -180,13 +180,12 @@ extension GemmaRuntime {
         golden: GoldenFixture,
         weightCache: Gemma4RuntimeWeightCache,
         steps: Int = MLXFastConstants.correctnessSteps,
-        checkGates: Bool = true,
         progress: ((String) -> Void)? = nil
     ) -> CorrectnessReport {
-        // checkGates: false skips anchors/free-run/behavior entirely and reports
-        // caseCount/checkedSteps for golden.cases alone -- for a timing-only run
-        // (see BenchmarkOptions.checkGates) whose oracle golden carries no gates.
-        let caseCount = checkGates ? golden.totalCorrectnessCaseCount : golden.cases.count
+        // This in-process path always checks every gate the golden carries.
+        // Only the worker variant supports the gates-skipped timing phase
+        // (see runLayeredCorrectnessWithWorker's checkGates).
+        let caseCount = golden.totalCorrectnessCaseCount
         var checkedSteps = 0
         var currentCase: String?
 
@@ -248,7 +247,7 @@ extension GemmaRuntime {
                 checkedSteps += comparison.checkedSteps
             }
 
-            let gates = checkGates ? golden.correctnessGates : nil
+            let gates = golden.correctnessGates
             for (caseIndex, anchor) in (gates?.anchorCases ?? []).enumerated() {
                 currentCase = anchor.name
                 let caseLabel = "\(caseIndex + 1)/\(gates?.anchorCases.count ?? 0)"
@@ -350,8 +349,10 @@ extension GemmaRuntime {
         semanticCapture: SemanticGPQACaptureOptions? = nil,
         progress: ((String) -> Void)? = nil
     ) -> WorkerLayeredCorrectnessResult {
-        // checkGates: false skips anchors/free-run/behavior/GPQA entirely -- see the
-        // matching comment on runLayeredCorrectness.
+        // checkGates: false is the gates-skipped timing phase of the phased
+        // ranked run (gates were checked by an earlier invocation; see
+        // BenchmarkOptions.checkGates): it skips anchors/free-run/behavior/GPQA
+        // entirely and reports caseCount/checkedSteps for golden.cases alone.
         let caseCount = checkGates ? golden.totalCorrectnessCaseCount : golden.cases.count
         var checkedSteps = 0
         var currentCase: String?
@@ -522,12 +523,11 @@ extension GemmaRuntime {
                 checkedSteps += check.comparison.checkedSteps
                 progress?("correctness behavior \(caseLabel) complete checked_steps=\(check.comparison.checkedSteps)")
             }
-            // checkGates false means the behavior loop above never ran (a
-            // "timing-only" machine, correctness/gates split elsewhere), so
+            // checkGates false means the behavior loop above never ran, so
             // semanticAnswers is always empty here regardless of caseCount --
             // that is not a capture failure, there was simply nothing to
-            // capture on this machine, and enforcing the count would turn a
-            // valid timing-only run into a spurious hard failure.
+            // capture in this phase, and enforcing the count would turn a
+            // valid gates-skipped timing phase into a spurious hard failure.
             if checkGates, let semanticCapture {
                 guard semanticAnswers.count == semanticCapture.caseCount else {
                     throw MLXFastError.invalidInput(

@@ -861,7 +861,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(!workflow.contains(".github/scripts/upload-r2-object.sh"))
     #expect(!workflow.contains("uploaded calibrated GPQA reference cases to private R2"))
     // The RAW (pre-GPQA-augmentation) hidden golden pins -- the same object the
-    // old parallel slices verified as MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_*.
+    // prior shard goldens verified as MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_*.
     // The augmented golden is pinned to a self-anchored hash exported into
     // GITHUB_ENV right after attach-gpqa-gates, exactly as the old gates
     // machine did.
@@ -1886,6 +1886,19 @@ func benchmarkTimingChargesDecodeSetupAndSeparatesWorkers() throws {
 }
 
 @Test
+func compareTeacherForcedWithWorkerUsesSerialTeacherForcedSteps() throws {
+    let runtime = try harnessRuntimeSource()
+
+    #expect(runtime.contains("static func compareTeacherForcedWithWorker("))
+    #expect(runtime.contains("try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)"))
+    #expect(runtime.contains("for step in 0..<steps {"))
+    #expect(runtime.contains("teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[step - 1])"))
+    #expect(!runtime.contains("startStep: Int = 0,"))
+    #expect(!runtime.contains("for seedStep in 0..<startStep {"))
+    #expect(!runtime.contains("testCase.promptTokens + Array(testCase.expectedTokens[0..<startStep])"))
+}
+
+@Test
 func decodeMeasurementRunsSingleUnmemoizableSeedForward() throws {
     // The decode measurement must run exactly ONE whole-prompt (seed) forward in
     // the timed window. A second identical forward (the warmup this used to run
@@ -1954,14 +1967,14 @@ func correctnessCheckGatesFalseSkipsGateLoopsAndReportsBaseCaseCountAlone() thro
 // locally without a live worker + real weights, hence a source-text check
 // rather than a behavioral one -- see BenchmarkOptions.checkGates/
 // skipTimedBenchmark for the harness-level design these fields support):
-// a "timing-only" machine (checkGates: false, so the behavior-gate loop that
+// a gates-only run (checkGates: false, so the behavior-gate loop that
 // captures semantic GPQA answers never runs) still built a non-nil
 // SemanticGPQACaptureOptions whenever MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH was
 // set, and then unconditionally required semanticAnswers.count to equal
-// caseCount -- turning a correct, nothing-to-capture timing-only run into a
+// caseCount -- turning a correct, nothing-to-capture gates-only run into a
 // hard failure ("captured 0 semantic GPQA answers; expected 5").
 @Test
-func benchmarkSplitsGatesAndTimingOntoSeparateMachinesWithoutSpuriousSemanticCaptureFailure() throws {
+func benchmarkGatesOnlyRunSkipsSpuriousSemanticCaptureFailure() throws {
     let runtime = try harnessRuntimeSource()
 
     #expect(runtime.contains("public let checkGates: Bool"))
@@ -1975,7 +1988,7 @@ func benchmarkSplitsGatesAndTimingOntoSeparateMachinesWithoutSpuriousSemanticCap
     #expect(runtime.contains("if checkGates, let semanticCapture {"))
     #expect(!runtime.contains("if let semanticCapture {\n                guard semanticAnswers.count == semanticCapture.caseCount else {"))
 
-    // Placeholder timing values for a gates-only machine must be the resolved
+    // Placeholder timing values for the gates-only phase must be the resolved
     // baseline exactly (speedup == 1.0, always finite) -- 0 would divide-by-
     // zero into +Infinity in BenchmarkScore.speedup, and Double.infinity fails
     // JSON encoding outright. "Resolved" means the golden oracle's per-prompt
@@ -2009,17 +2022,15 @@ func benchmarkWorkflowValidatesCorrectnessReportGoldenHash() throws {
     #expect(workflow.contains(".golden_hash == $golden_hash"))
 }
 
-// Regression test for a review finding: shasum's own printed output line embeds
-// the exact path it was given ("<hash>  <path>"), so hashing "shasum -a 256
-// ${WEIGHTS_PATH}/file" output directly makes the final digest depend on
-// WEIGHTS_PATH itself -- two machines with byte-identical weights/ under
-// different root paths (an unavoidable difference between independent
-// machines/temp dirs) would then hash differently, making the combiner's
-// weights-hash tripwire reject every legitimate multi-machine run. Runs the
-// actual script against real byte-identical fixture trees under different
-// roots to prove the fix, not just check the source for a keyword.
 @Test
 func hashWeightsDirectoryIsIndependentOfWeightsPathButSensitiveToContent() throws {
+    let hashScript = try String(
+        contentsOfFile: ".github/scripts/hash-weights-directory.sh",
+        encoding: .utf8
+    )
+    #expect(hashScript.contains("shasum -a 256"))
+    #expect(hashScript.contains("LC_ALL=C sort -z"))
+
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
 
@@ -2114,10 +2125,8 @@ func hashWeightsDirectoryIsIndependentOfWeightsPathButSensitiveToContent() throw
     #expect(try hash(renamedFile) != hashA)
 }
 
-// Regression test for a review finding, run against the real script: two
-// machines both assigned/reporting range [0, 32) with expected=64 must NOT
-// combine to passed=true just because their checked_steps happen to sum to 64.
-// This is the exact false-pass the review reported reproducing.
+// Published score payloads must apply the same diagnostic coarsening whether
+// they are written to disk or emitted on stdout.
 @Test
 func sealedStdoutScoreIsCoarsenedLikeTheWrittenFile() throws {
     // benchmark.sh rebuilds score.json from emitScorePayloadToStdout's output, so
@@ -3559,9 +3568,8 @@ func singleMachineWorkflowGatesUploadsOnContentValidation() throws {
     #expect(workflow.contains("if: ${{ failure() && steps.redact_benchmark_failure.outcome == 'success' }}"))
 }
 
-// The old parallel combine job re-checked the gates score.json before merging
-// the timing overlay and cleared the partial_result marker. In the single-
-// machine job that merge is overlay-paired-timing.sh; it must keep the same
+// overlay-paired-timing.sh re-checks the gates score.json before merging the
+// timed measurement and clears the partial_result marker. It must keep the
 // pre-merge validation (leak fields, structural expert zeros), the floor
 // verdicts, the score formula, the partial_result clear, and the integrity
 // re-anchor -- and fail the job on a failed merged verdict.
@@ -3583,7 +3591,7 @@ func overlayPairedTimingValidatesInputsAppliesFloorsAndClearsPartialResult() thr
     #expect(overlay.contains("(.baseline.verdict == \"ACCEPT\")"))
 
     // Pre-merge leak-field and structural-zero checks on the candidate's
-    // sealed timing score, mirroring the old combine's pre-merge validation.
+    // sealed timing score pre-merge validation.
     #expect(overlay.contains("(.metrics.first_failing_case == null)"))
     #expect(overlay.contains("and (.metrics.first_failing_step == null)"))
     #expect(overlay.contains("and (.metrics.expected_token == null)"))
@@ -3774,9 +3782,7 @@ func overlayPairedTimingAcceptsTrustedCommitAndRejectsForgedOrMissingCommit() th
     }
 }
 
-// The parallel pipeline needed a validate-slice-ranges job to fail fast before
-// burning five rented machines. The single-machine equivalent: the cheap
-// preflight and secret checks run before any expensive build/transform work,
+// Cheap preflight and secret checks must run before build/transform work,
 // and the host preflight (quarantine + isolation stack) runs before checkout
 // or any secret use.
 @Test
@@ -3872,9 +3878,15 @@ func finalArtifactNamesStayRunIdOnlyAndAuditArtifactsEmbedRunAttempt() throws {
 }
 
 @Test
-func benchmarkWorkflowSerializesEveryDispatch() throws {
+func benchmarkWorkflowUsesPerRunConcurrencyGroupWithoutCancellation() throws {
+    // Ranked serving spans two at-parity m5-bench boxes: the concurrency group
+    // is per-run so a second online runner can claim queued work (per-box
+    // serialization is enforced by the self-hosted runner label queue, one job
+    // per box), and cancel-in-progress stays false so no ranked run is ever
+    // cancelled out from under a box mid-measurement.
     let workflow = try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
-    #expect(workflow.contains("concurrency:\n  group: mlxfast-ranked-benchmark\n  cancel-in-progress: false"))
+    #expect(workflow.contains("concurrency:\n  group: mlxfast-ranked-${{ github.run_id }}\n  cancel-in-progress: false"))
+    #expect(!workflow.contains("group: mlxfast-ranked-benchmark"))
     #expect(!workflow.contains("group: benchmark-${{ github.ref }}"))
     #expect(!workflow.contains("group: benchmark-${{ inputs.run_benchmark }}"))
 }

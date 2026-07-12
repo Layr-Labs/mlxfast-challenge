@@ -2,16 +2,12 @@ name: benchmark
 
 # SINGLE-MACHINE RANKED PIPELINE (self-hosted Apple M5 Max, label m5-bench).
 #
-# This replaces the previous 6-job fan-out (validate-slice-ranges +
-# correctness-slice-1/2/3 + benchmark-timing [with its own separate paired-
-# baseline VM] + benchmark-gates + combine) with ONE serial job on ONE
-# self-hosted runner. The parallel split existed purely for wall-clock speed on
-# rented per-job VMs; on a dedicated box the serial order is what buys us a
+# This replaces the previous multi-job fan-out with ONE serial job on ONE
+# self-hosted runner. On a dedicated box the serial order is what buys us a
 # clean measurement (see "MEASUREMENT-DELTA ORDERING" below).
 #
-# Verdict semantics are unchanged from the parallel pipeline:
-#   final pass = full 64-step teacher-forced base case (previously sliced 3
-#                ways -- run whole here, same hidden golden, same verdict)
+# Verdict semantics:
+#   final pass = full 64-step teacher-forced base case
 #              AND anchor/free-run/behavior/GPQA gates + GPQA TTFT
 #              AND semantic GPQA judge (Anthropic)
 #              AND public-fixture drift tripwire
@@ -19,15 +15,10 @@ name: benchmark
 #              AND both 0.95 speedup floors
 #   score = decode_speedup^0.75 * prefill_speedup^0.25 from the paired timing,
 #           null when any gate fails.
-# The old `combine` job's AND-of-verdicts + timing overlay is folded into this
-# job: the gates/base-case pass produces one harness score.json (base case and
-# gates run in ONE `mlxfast-swift benchmark` invocation, so passed_correctness
-# and correctness_seconds natively cover base+gates -- the serial semantics the
-# combiner used to reconstruct), the semantic judge patches it, and
-# overlay-paired-timing.sh overlays the measured paired timing (the old
-# combine "Merge gates and timing into machine1" step, without the cross-
-# machine weights-hash tripwire, which is structurally unnecessary here: one
-# transform produces the one weights/ tree every phase uses).
+# The gates/base-case pass produces one harness score.json (base case and gates
+# run in ONE `mlxfast-swift benchmark` invocation, so passed_correctness and
+# correctness_seconds natively cover base+gates), the semantic judge patches
+# it, and overlay-paired-timing.sh overlays the measured paired timing.
 #
 # MEASUREMENT-DELTA ORDERING (the crux):
 # The timed prefill/decode measurement runs LAST, after all compute-heavy
@@ -789,8 +780,7 @@ jobs:
       # case) -- enforced directly below by re-pinning the augmented golden's
       # .cases against the raw hash-pinned golden, with
       # verify-correctness-golden.sh's coverage arithmetic plus the final
-      # checked_steps validation as backstops, exactly as the old combine
-      # coverage check did. attach-gpqa-gates loads the tokenizer, i.e.
+      # checked_steps validation as backstops. attach-gpqa-gates loads the tokenizer, i.e.
       # runs code from the submitted build, so it executes through bench-exec
       # like every other untrusted invocation (the VM pipeline ran it as the
       # workflow user; the bench uid is strictly less privileged). The raw
@@ -892,9 +882,8 @@ jobs:
       # parallel wall-clock speed; teacher forcing makes the verdict identical
       # run whole or sliced) AND runs the anchor/free-run/behavior/GPQA gates,
       # GPQA TTFT, and the semantic-answer capture, while SKIPPING the timed
-      # benchmark (MLXFAST_BENCHMARK_SKIP_TIMED=1). This restores the original
-      # serial semantics the parallel combine had to reconstruct:
-      # passed_correctness and correctness_seconds natively cover base + gates.
+      # benchmark (MLXFAST_BENCHMARK_SKIP_TIMED=1). passed_correctness and
+      # correctness_seconds natively cover base + gates in one invocation.
       # The timed measurement deliberately does NOT happen here -- it runs LAST,
       # behind measure-job's fixed 40C thermal gate (see header).
       - name: Correctness and gates (full base case + hidden gates, no timing)
@@ -1138,11 +1127,9 @@ jobs:
           test -s "${MLXFAST_MEASURE_OUT}/results.json"
           jq -c '{mode, paired}' "${MLXFAST_MEASURE_OUT}/results.json"
 
-      # The old combine job's timing overlay, folded in: take the sealed
-      # gates+semantic score and overlay the measured paired timing (candidate
-      # seconds/token, measured baseline seconds/token, speedups, floors,
-      # score). Fails the job when a speedup floor fails, exactly like the old
-      # timing machine's harness-side floor check did.
+      # Overlay measured paired timing onto the sealed gates+semantic score
+      # (candidate and baseline seconds/token, speedups, floors, score). Fails
+      # the job when a speedup floor fails.
       - name: Overlay paired timing into final score
         if: ${{ inputs.run_benchmark }}
         env:

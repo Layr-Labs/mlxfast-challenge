@@ -201,53 +201,6 @@ public enum Gemma4Model {
         return embedded * scale
     }
 
-    public static func layer(
-        index layerIndex: Int,
-        hidden: MLXArray,
-        weightCache: Gemma4RuntimeWeightCache,
-        cache: Gemma4LayerCache? = nil,
-        positionOffset: Int = 0
-    ) throws -> MLXArray {
-        let config = weightCache.config
-        let blockWeights = try weightCache.blockWeights(layerIndex: layerIndex)
-        let attentionWeights = try weightCache.attentionWeights(layerIndex: layerIndex)
-        let mlpWeights = try weightCache.mlpWeights(layerIndex: layerIndex)
-        let attentionSpec = weightCache.attentionSpec(layerIndex: layerIndex)
-        let layerType = config.layerTypes[layerIndex]
-
-        // Both attention paths rebuild their mask from the KV cache's key
-        // offset whenever a cache is present, so this mask is consumed only
-        // on the cache-free path (used by tests and single-shot forwards).
-        let mask = cache == nil
-            ? try Gemma4MaskCache.causal(
-                queryLength: hidden.shape[1],
-                keyLength: hidden.shape[1],
-                queryOffset: positionOffset,
-                keyOffset: positionOffset,
-                windowSize: layerType == .sliding ? config.slidingWindow : nil
-            )
-            : nil
-
-        return try Gemma4Block.forward(
-            hidden: hidden,
-            weights: blockWeights,
-            rmsNormEps: config.rmsNormEps,
-            attention: { normalized in
-                try Gemma4Attention.forward(
-                    normalized,
-                    weights: attentionWeights,
-                    spec: attentionSpec,
-                    mask: mask,
-                    cache: cache,
-                    positionOffset: positionOffset
-                )
-            },
-            feedForward: { normalized in
-                Gemma4MLP.forward(normalized, weights: mlpWeights)
-            }
-        )
-    }
-
     private static func validateInputIDs(_ inputIDs: MLXArray, spec: Gemma4ModelSpec) throws {
         guard inputIDs.shape.count == 2 else {
             throw MLXFastError.invalidInput("Gemma 4 input IDs must have shape [batch, length]")

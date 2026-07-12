@@ -930,9 +930,6 @@ final class RuntimeWorkerClient {
     private var sessionNonce = ""
     private var nextID = 1
     private var closed = false
-    // Expert-streaming counters reported in the worker's protocol hello, before
-    // any forward has run. Baseline for the seed prefill's incremental reads.
-    private(set) var initialExpertStats: ExpertStreamingStats?
 
     init(options: RuntimeWorkerOptions, weightsPath: String) throws {
         guard options.helloTimeoutSeconds.isFinite,
@@ -1001,7 +998,6 @@ final class RuntimeWorkerClient {
                 throw MLXFastError.invalidInput("runtime worker did not return a valid protocol hello")
             }
             self.sessionNonce = nonce
-            self.initialExpertStats = hello.expertStats
         } catch {
             let helloTimedOut = helloWatchdog.cancelAndReturnDidFire()
             _ = stopRuntimeWorkerProcess(process, timeoutSeconds: options.shutdownTimeoutSeconds)

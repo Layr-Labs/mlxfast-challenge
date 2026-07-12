@@ -3,15 +3,12 @@ import Foundation
 public enum MLXFastError: Error, CustomStringConvertible {
     case missingFile(String)
     case invalidInput(String)
-    case notImplemented(String)
 
     public var description: String {
         switch self {
         case .missingFile(let message):
             return message
         case .invalidInput(let message):
-            return message
-        case .notImplemented(let message):
             return message
         }
     }
