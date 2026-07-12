@@ -212,7 +212,8 @@ Start with:
 
 This checks the local Swift/Xcode toolchain, builds the Swift harness and MLX
 Metal library, downloads or verifies the Gemma 4 31B 4-bit reference
-checkpoint, and prepares the local cache. If the repo disk is too small, put the
+checkpoint, and prepares the local cache. The reference cache defaults to a
+shared location under your home directory; if that disk is too small, put the
 reference cache on a larger volume and set `MLXFAST_REFERENCE_CACHE_DIR` or
 `MLXFAST_REFERENCE_DIR`.
 
