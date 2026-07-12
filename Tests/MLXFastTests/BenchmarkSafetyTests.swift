@@ -1135,7 +1135,7 @@ struct BenchmarkSafetyTests {
         let measuredDecode = try sourceSlice(
             benchmark,
             from: "static func measureWorkerDecode(",
-            to: "static func submissionValidationDelayMilliseconds()"
+            to: "static let bandwidthSource"
         )
         let timerEnd = try #require(measuredDecode.range(of: "let measuredSeconds = secondsSince(decodePhaseStart)"))
         let diagnostics = try #require(measuredDecode.range(of: "worker.phaseDiagnostics()"))

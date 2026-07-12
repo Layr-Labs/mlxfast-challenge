@@ -957,10 +957,6 @@ extension GemmaRuntime {
 
         var actualTokens: [Int] = []
         actualTokens.reserveCapacity(timingPlan.decodeSteps)
-        let validationDelayMS = try submissionValidationDelayMilliseconds()
-        if validationDelayMS > 0 {
-            progress?("decode validation delay enabled milliseconds_per_token=\(validationDelayMS)")
-        }
         for decodedStep in 0..<timingPlan.decodeSteps {
             let inputToken = decodedStep == 0 ? expectedSeedToken : expectedTokens[decodedStep - 1]
             logits = try Gemma4Model.logits(
@@ -982,9 +978,6 @@ extension GemmaRuntime {
                         actualToken: token
                     )
                 )
-            }
-            if validationDelayMS > 0 {
-                Thread.sleep(forTimeInterval: Double(validationDelayMS) / 1_000.0)
             }
             reportProgress(
                 step: decodedStep + 1,
@@ -1101,16 +1094,6 @@ extension GemmaRuntime {
     /// is no expert-streaming byte counter to report: this is a fixed,
     /// non-ranking audit field (see `AGENTS.md`/`CLAUDE.md`).
     static let bandwidthSource = "ram_resident_model"
-
-    static func submissionValidationDelayMilliseconds() throws -> Int {
-        let milliseconds = Gemma4SubmissionControls.measuredDecodeDelayMilliseconds
-        guard milliseconds >= 0 else {
-            throw MLXFastError.invalidInput(
-                "Gemma4SubmissionControls.measuredDecodeDelayMilliseconds must be non-negative"
-            )
-        }
-        return milliseconds
-    }
 
     /// The dense, RAM-resident runtime has no expert-cache/streaming machinery
     /// (see `AGENTS.md`/`CLAUDE.md`); this always returns the zero struct so

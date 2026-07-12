@@ -253,10 +253,15 @@ extension GemmaRuntime {
             guard let cache = state.decodeCache else {
                 throw MLXFastError.invalidInput("runtime worker decode_step before decode_begin")
             }
-            let validationDelayMS = try submissionValidationDelayMilliseconds()
-            guard validationDelayMS >= 0 else {
-                throw MLXFastError.invalidInput("runtime worker validation delay must be non-negative")
-            }
+            // decode_step invokes only the same editable entry points the
+            // correctness path invokes (Gemma4Model.logits / greedyToken); it
+            // must never call an editable hook that is unique to the scored
+            // decode path. The former editable decode-delay knob (removed) was
+            // exactly such a phase oracle: because submitted model code is
+            // editable, the mere fact that it was invoked ONLY on the timed
+            // decode path told the submission "I am being scored now", which
+            // lets it serve a slow/correct path while checked and a cheap path
+            // while timed. Keep trusted->editable calls phase-agnostic.
             let logits = try Gemma4Model.logits(
                 inputIDs: inputIDsArray([inputToken]),
                 weightCache: weightCache,
@@ -264,9 +269,6 @@ extension GemmaRuntime {
                 positionOffset: state.decodeSeedTokenCount + state.decodeStep
             )
             let token = try GemmaCorrectness.greedyToken(from: logits)
-            if validationDelayMS > 0 {
-                Thread.sleep(forTimeInterval: Double(validationDelayMS) / 1_000.0)
-            }
             state.decodeStep += 1
             return RuntimeWorkerResponse(
                 id: request.id,

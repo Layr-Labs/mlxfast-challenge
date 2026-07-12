@@ -533,11 +533,6 @@ extension GemmaRuntime {
                 "\(modeName) decode seed prefill complete "
                     + "seconds=\(formatSeconds(secondsSince(decodePhaseStart))) (charged to decode)"
             )
-            let validationDelayMS = try submissionValidationDelayMilliseconds()
-            if validationDelayMS > 0 {
-                progress?("\(modeName) decode validation delay enabled milliseconds_per_token=\(validationDelayMS)")
-            }
-
             for decodedStep in 0..<decodeSteps {
                 let previousToken = decodedStep == 0 ? expectedSeedToken : expectedDecodeTokens[decodedStep - 1]
                 let stepStart = DispatchTime.now().uptimeNanoseconds
@@ -554,9 +549,6 @@ extension GemmaRuntime {
                     failureExpected = expectedToken
                     failureActual = actualToken
                     reportFirstTokenMismatch(progress, modeName: modeName, checkedStep: failureStep! + 1)
-                }
-                if validationDelayMS > 0 {
-                    Thread.sleep(forTimeInterval: Double(validationDelayMS) / 1_000.0)
                 }
                 let stepElapsed = secondsSince(stepStart)
                 totalStepOnlySeconds += stepElapsed

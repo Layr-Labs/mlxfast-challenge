@@ -356,17 +356,39 @@ func officialRankedRunMeasuresPairedBaselineOnTheSameSilicon() throws {
 }
 
 @Test
-func decodeValidationDelayHookDefaultsToNoOp() {
-    // The one editable-surface knob that can add time to the trusted decode loop
-    // must read zero on main/baseline. It can only ever slow a submission down,
-    // never speed it up, but the frozen baseline is measured at zero delay, so a
-    // nonzero default here would mean the baseline and submissions were timed
-    // through different decode loops.
-    //
-    // BenchmarkSupportTests.submissionValidationDelayDefaultsToZero asserts the
-    // same literal for a different reason (the general default of the hook). The
-    // re-assert here is intentional: this file is meant to be the single,
-    // self-contained guard for everything the frozen window depends on, so it
-    // does not rely on an unrelated test staying green.
-    #expect(Gemma4SubmissionControls.measuredDecodeDelayMilliseconds == 0)
+func decodeMeasurementInvokesNoPhaseVaryingEditableHook() throws {
+    // The scored decode loop must invoke NO editable hook that is unique to it.
+    // The former editable knob (Gemma4SubmissionControls.measuredDecodeDelay-
+    // Milliseconds, read via submissionValidationDelayMilliseconds) was model
+    // code called by trusted code ONLY on the timed decode path -- so "my getter
+    // was invoked" was an unambiguous "I am being scored now" signal, and the
+    // submission could run arbitrary phase-detection inside the getter. It is
+    // removed entirely (editable file deleted, no trusted call site remains).
+    // This file is the single self-contained guard for the frozen window, so it
+    // freezes phase-independence here directly rather than relying on an
+    // unrelated test.
+    #expect(!FileManager.default.fileExists(
+        atPath: "Sources/MLXFastModel/Gemma4SubmissionControls.swift"
+    ))
+    let worker = try packageFile("Sources/MLXFastHarness/GemmaRuntimeWorker.swift")
+    let benchmark = try packageFile("Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift")
+    let localIterate = try packageFile("Sources/MLXFastHarness/GemmaRuntimeLocalIterate.swift")
+    for source in [worker, benchmark, localIterate] {
+        #expect(!source.contains("submissionValidationDelayMilliseconds"))
+        #expect(!source.contains("measuredDecodeDelayMilliseconds"))
+        #expect(!source.contains("Gemma4SubmissionControls"))
+    }
+    // The worker decode_step case invokes only the same editable entry points
+    // the correctness path also invokes (Gemma4Model.logits / greedyToken), and
+    // no per-token sleep that a delay hook used to drive.
+    let decodeStepStart = try #require(worker.range(of: "case \"decode_step\":"))
+    let decodeStepEnd = try #require(
+        worker.range(
+            of: "case \"phase_diagnostics\":",
+            range: decodeStepStart.upperBound..<worker.endIndex
+        )
+    )
+    let decodeStep = String(worker[decodeStepStart.upperBound..<decodeStepEnd.lowerBound])
+    #expect(decodeStep.contains("Gemma4Model.logits("))
+    #expect(!decodeStep.contains("Thread.sleep"))
 }

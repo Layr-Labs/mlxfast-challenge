@@ -2665,15 +2665,16 @@ func runtimeWorkerValidatesTransformedWeightsAtStartup() throws {
     #expect(startup.contains("try loader.validateRequiredMetadata(config: config)"))
     #expect(startup.contains("try weightCache.requireLibraryModel()"))
 
-    // The parent's worker decode path must not read the editable submission delay
-    // hook: Gemma4SubmissionControls is editable MLXFastModel code and the worker
-    // itself already applies the delay inside its sandboxed decode step.
+    // The parent's worker decode path must not read any editable submission
+    // hook. The former editable decode-delay knob (Gemma4SubmissionControls) is
+    // removed entirely; assert no residual reference survives on this path.
     let runtime = try harnessRuntimeSource()
     let decodeStart = try #require(runtime.range(of: "static func measureWorkerDecode"))
     let decodeEnd = try #require(runtime.range(of: "static let bandwidthSource"))
     let workerDecode = String(runtime[decodeStart.lowerBound..<decodeEnd.lowerBound])
     #expect(!workerDecode.contains("submissionValidationDelayMilliseconds()"))
     #expect(!workerDecode.contains("decode validation delay enabled"))
+    #expect(!workerDecode.contains("Gemma4SubmissionControls"))
 }
 
 @Test

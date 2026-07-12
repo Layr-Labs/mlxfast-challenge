@@ -644,10 +644,27 @@ func decodeTimingPlanRejectsInvalidRanges() throws {
     }
 }
 
+// The former editable decode-delay knob (Gemma4SubmissionControls
+// .measuredDecodeDelayMilliseconds, read via
+// GemmaRuntime.submissionValidationDelayMilliseconds) was model code invoked by
+// trusted code ONLY on the scored decode path. Because submitted model code is
+// editable, being invoked only while timed was itself a phase oracle. The hook
+// is now removed entirely: the editable file is gone and no trusted harness
+// code invokes it. See decodeMeasurementInvokesNoPhaseVaryingEditableHook for
+// the structural phase-independence guard.
 @Test
-func submissionValidationDelayDefaultsToZero() throws {
-    #expect(Gemma4SubmissionControls.measuredDecodeDelayMilliseconds == 0)
-    #expect(try GemmaRuntime.submissionValidationDelayMilliseconds() == 0)
+func editableDecodeDelayHookIsFullyRemoved() throws {
+    #expect(!FileManager.default.fileExists(
+        atPath: "Sources/MLXFastModel/Gemma4SubmissionControls.swift"
+    ))
+    let harnessDirectory = "Sources/MLXFastHarness"
+    let harnessFiles = try FileManager.default.contentsOfDirectory(atPath: harnessDirectory)
+        .filter { $0.hasSuffix(".swift") }
+    for file in harnessFiles {
+        let source = try String(contentsOfFile: "\(harnessDirectory)/\(file)", encoding: .utf8)
+        #expect(!source.contains("submissionValidationDelayMilliseconds"))
+        #expect(!source.contains("measuredDecodeDelayMilliseconds"))
+    }
 }
 
 @Test
