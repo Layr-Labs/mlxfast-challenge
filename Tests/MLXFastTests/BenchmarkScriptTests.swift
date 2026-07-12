@@ -3024,6 +3024,236 @@ func coolGateFanBoostIsOptInSudoSafeAndHardCappedAtSeventyPercent() throws {
     #expect(fan.contains("-k \"F${i}Tg\" -w \"${hex}\""))
 }
 
+// Robustness contract layered on top of the boost: (1) `smc -w` is
+// fire-and-forget, so every boost write is read back and a fan whose write
+// did not stick fails the boost loudly instead of reporting a
+// silently-ineffective 70%; (2) mode inspection covers EVERY fan (a foreign
+// controller or a partially-restored boost can hold any subset manual), and
+// `boost` refuses to overwrite another controller's targets; (3) benchmark.sh
+// tracks whether THIS run applied a boost so a completed run ends with a
+// restore reminder and an INT/TERM abort restores automatic control instead
+// of leaving the machine pinned at 70%.
+@Test
+func fanBoostVerifiesWritesInspectsAllFansAndTracksRunRestoreState() throws {
+    let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    let fan = try String(contentsOfFile: "tools/fan-control.sh", encoding: .utf8)
+
+    // (1) Write verification: both SMC keys are read back per fan, compared
+    // within a small float-rounding tolerance, and a non-stuck write names
+    // the fan and fails the boost (non-zero exit), rolling every fan back to
+    // automatic so no half-boosted state survives a reported failure.
+    #expect(fan.contains("verify_fan_boost_write() {"))
+    #expect(fan.contains("if verify_fan_boost_write \"${i}\" \"${target}\"; then"))
+    #expect(fan.contains("smc_read_number \"F${fan_index}Md\""))
+    #expect(fan.contains("smc_read_number \"F${fan_index}Tg\""))
+    #expect(fan.contains("readonly FAN_TARGET_VERIFY_TOLERANCE_RPM="))
+    #expect(fan.contains("write did not stick"))
+    #expect(fan.contains("boost may not have taken effect for fan(s) ${failed_fans}"))
+    #expect(fan.contains("if [[ -n \"${failed_fans}\" ]]; then"))
+
+    // (2) Foreign-controller detection: every fan's mode bit is inspected
+    // (fan 0 alone no longer decides `status`), and `boost` refuses to
+    // overwrite a manual hold it does not own instead of clobbering it.
+    #expect(fan.contains("list_manual_fans() {"))
+    #expect(fan.contains("fan_mode_is_manual \"${i}\""))
+    #expect(fan.contains("manual_fans=\"$(list_manual_fans \"${fan_count}\")\""))
+    #expect(!fan.contains("smc_read_number \"F0Md\""))
+    #expect(fan.contains("already in manual mode; another fan controller"))
+    // benchmark.sh's offer reconciles with that refusal: a hold this run did
+    // not create skips the offer with one warning (no sudo prompt destined to
+    // be refused, no double-warn) and does not reset the stall clock.
+    #expect(script.contains("if fan_boost_recorded; then"))
+    #expect(script.contains("another fan controller (or a prior un-restored boost) already holds the fans in manual mode"))
+
+    // (3) Run-scoped restore tracking: the top-level local run owns a state
+    // file, gate children record an applied boost into it, a completed run
+    // prints the restore reminder (fans intentionally stay forced -- no
+    // auto-restore on the normal path), and INT/TERM restores ONLY when this
+    // run applied a boost.
+    #expect(script.contains("setup_fan_boost_run_tracking() {"))
+    #expect(script.contains("export MLXFAST_FAN_BOOST_STATE_FILE="))
+    #expect(script.contains("record_fan_boost_applied"))
+    #expect(script.contains("report_fan_boost_restore_reminder"))
+    #expect(script.contains("still forced to 70% of max"))
+    #expect(script.contains("trap 'handle_benchmark_abort_signal INT' INT"))
+    #expect(script.contains("trap 'handle_benchmark_abort_signal TERM' TERM"))
+    #expect(script.contains("if [[ -n \"${FAN_BOOST_STATE_FILE_OWNED}\" ]] && fan_boost_recorded; then"))
+    #expect(script.contains("returning them to macOS automatic control"))
+}
+
+// End-to-end over the real script: a local run that recorded a fan boost
+// finishes successfully, prints the restore reminder, and does NOT hand the
+// fans back automatically -- staying forced through the timed phases (and
+// past exit) is the intended behavior; only the reminder tells the user how
+// to undo it.
+@Test
+func benchmarkPrintsFanRestoreReminderAfterBoostWithoutAutoRestoring() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "{}".write(
+        to: weights.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let score = root.appendingPathComponent("score.local-iterate.json")
+    let integrity = root.appendingPathComponent("benchmark-integrity.local-iterate.json")
+    let fanLog = root.appendingPathComponent("fan-helper-invocations.log")
+    let fakeFanHelper = root.appendingPathComponent("fake-fan-control.sh")
+    try """
+    #!/bin/sh
+    printf '%s\\n' "$1" >> "\(fanLog.path)"
+    if [ "$1" = "status" ]; then echo auto; fi
+    exit 0
+    """.write(to: fakeFanHelper, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeFanHelper.path
+    )
+
+    // The fake benchmark stands in for the cool-gate child that applies a
+    // boost mid-run: it records into the state file benchmark.sh exported,
+    // then completes normally with a passing score payload.
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    printf 'applied\\n' >> "${MLXFAST_FAN_BOOST_STATE_FILE}"
+    cat <<'JSON'
+    {
+      "score": null,
+      "passed": true,
+      "metrics": {
+        "weights_hash": "fake-weights",
+        "weights_file_count": 1,
+        "weights_byte_count": 2
+      }
+    }
+    JSON
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeSwift.path
+    )
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = ["benchmark.sh", "--local-iterate"]
+    process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    process.environment = benchmarkTestEnvironment([
+        "MLXFAST_NO_SANDBOX": "1",
+        "MLXFAST_SKIP_TRANSFORM": "1",
+        "MLXFAST_SWIFT_BIN": fakeSwift.path,
+        "MLXFAST_WEIGHTS_PATH": weights.path,
+        "MLXFAST_SCORE_PATH": score.path,
+        "MLXFAST_INTEGRITY_PATH": integrity.path,
+        "MLXFAST_FAN_CONTROL_HELPER": fakeFanHelper.path,
+    ])
+    let stderrPipe = Pipe()
+    process.standardError = stderrPipe
+    try process.run()
+    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    let stderr = String(data: stderrData, encoding: .utf8) ?? ""
+
+    #expect(process.terminationStatus == 0)
+    #expect(stderr.contains("this run boosted the fans; they are still forced to 70% of max"))
+    #expect(stderr.contains("./benchmark.sh --fan-speed-normal"))
+    // No automatic restore on the normal path: the helper is never asked to
+    // hand control back (the log records every helper invocation).
+    let helperInvocations = (try? String(contentsOf: fanLog, encoding: .utf8)) ?? ""
+    #expect(!helperInvocations.contains("normal"))
+}
+
+// End-to-end over the real script: TERM during a run that recorded a fan
+// boost restores automatic fan control through the same helper path
+// --fan-speed-normal uses, says so, and exits with the conventional
+// 128+SIGTERM status. Runs that never boosted are untouched by the handler.
+@Test
+func benchmarkRestoresFansWhenAbortedAfterBoost() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "{}".write(
+        to: weights.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let score = root.appendingPathComponent("score.local-iterate.json")
+    let integrity = root.appendingPathComponent("benchmark-integrity.local-iterate.json")
+    let fanLog = root.appendingPathComponent("fan-helper-invocations.log")
+    let fakeFanHelper = root.appendingPathComponent("fake-fan-control.sh")
+    try """
+    #!/bin/sh
+    printf '%s\\n' "$1" >> "\(fanLog.path)"
+    if [ "$1" = "status" ]; then echo manual; fi
+    exit 0
+    """.write(to: fakeFanHelper, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeFanHelper.path
+    )
+
+    // The fake benchmark records a boost, signals it is mid-run via a marker
+    // file, then idles so the test can deliver TERM while the run is live.
+    let marker = root.appendingPathComponent("benchmark-running.marker")
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    printf 'applied\\n' >> "${MLXFAST_FAN_BOOST_STATE_FILE}"
+    : > "\(marker.path)"
+    sleep 5
+    exit 0
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeSwift.path
+    )
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = ["benchmark.sh", "--local-iterate"]
+    process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    process.environment = benchmarkTestEnvironment([
+        "MLXFAST_NO_SANDBOX": "1",
+        "MLXFAST_SKIP_TRANSFORM": "1",
+        "MLXFAST_SWIFT_BIN": fakeSwift.path,
+        "MLXFAST_WEIGHTS_PATH": weights.path,
+        "MLXFAST_SCORE_PATH": score.path,
+        "MLXFAST_INTEGRITY_PATH": integrity.path,
+        "MLXFAST_FAN_CONTROL_HELPER": fakeFanHelper.path,
+    ])
+    let stderrPipe = Pipe()
+    process.standardError = stderrPipe
+    try process.run()
+
+    var markerSeen = false
+    for _ in 0..<100 {
+        if FileManager.default.fileExists(atPath: marker.path) {
+            markerSeen = true
+            break
+        }
+        usleep(100_000)
+    }
+    #expect(markerSeen)
+    process.terminate()
+
+    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    let stderr = String(data: stderrData, encoding: .utf8) ?? ""
+
+    #expect(process.terminationStatus == 143)
+    #expect(stderr.contains("TERM received after this run boosted the fans"))
+    #expect(stderr.contains("fans restored to macOS automatic control"))
+    let helperInvocations = (try? String(contentsOf: fanLog, encoding: .utf8)) ?? ""
+    #expect(helperInvocations.contains("normal"))
+}
+
 @Test
 func benchmarkScriptPrintsLocalSummaryWithBaselineComparison() throws {
     let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)

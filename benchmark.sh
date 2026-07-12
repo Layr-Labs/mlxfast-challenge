@@ -18,6 +18,13 @@ set -euo pipefail
 #   MLXFAST_FAN_CONTROL_HELPER=...  override tools/fan-control.sh, used by the
 #                               stalled-cool-down fan-boost offer and by
 #                               ./benchmark.sh --fan-speed-normal
+#   MLXFAST_FAN_BOOST_STATE_FILE  internal parent->child contract (not a
+#                               knob): the top-level local run exports a
+#                               state file; the cool-gate child processes the
+#                               harness spawns before each timed phase record
+#                               an applied fan boost there so the parent can
+#                               print the restore reminder on completion and
+#                               restore automatic fan control on INT/TERM
 readonly COOL_GATE_TEMP_C=40             # start timing only at/below this GPU temp (C); same 40C as the ranked gate
 readonly COOL_GATE_POLL_SECONDS=10       # temperature poll / progress-notification interval
 readonly COOL_GATE_ABORT_SECONDS=180     # minimum total wait before a stalled cool-down aborts
@@ -385,6 +392,92 @@ fan_control_helper() {
   printf '%s/tools/fan-control.sh\n' "$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 }
 
+# --- Fan-boost run lifecycle --------------------------------------------------
+# The boost itself is applied inside the cool-gate child process the Swift
+# harness spawns before each timed phase (`benchmark.sh --local-cool-gate-only`),
+# but "did THIS run boost the fans?" is a whole-run question that the
+# top-level local benchmark.sh must answer at exit. The top-level run creates
+# an empty state file and exports its path as MLXFAST_FAN_BOOST_STATE_FILE;
+# any gate invocation that applies a boost records it there; ONLY the process
+# that created the file (the owner) reads it back, so nested cool-gate
+# children never double-handle the same boost.
+FAN_BOOST_STATE_FILE_OWNED=""
+FAN_BOOST_ABORT_HANDLED=0
+
+fan_boost_recorded() {
+  [[ -n "${MLXFAST_FAN_BOOST_STATE_FILE:-}" && -s "${MLXFAST_FAN_BOOST_STATE_FILE}" ]]
+}
+
+record_fan_boost_applied() {
+  if [[ -n "${MLXFAST_FAN_BOOST_STATE_FILE:-}" ]]; then
+    printf 'applied\n' >> "${MLXFAST_FAN_BOOST_STATE_FILE}" 2>/dev/null || true
+  fi
+}
+
+# Creates the run-scoped boost state file and installs the INT/TERM abort
+# handler. Only the top-level local run creates (owns) the file: cool-gate
+# children the harness spawns inherit MLXFAST_FAN_BOOST_STATE_FILE from the
+# environment, skip creation here, and leave signal handling to the owner so
+# a group-wide Ctrl-C triggers exactly one restore.
+setup_fan_boost_run_tracking() {
+  if [[ -n "${MLXFAST_FAN_BOOST_STATE_FILE:-}" ]]; then
+    return 0
+  fi
+  if ! FAN_BOOST_STATE_FILE_OWNED="$(mktemp "${TMPDIR:-/tmp}/mlxfast-fan-boost-state.XXXXXX")"; then
+    FAN_BOOST_STATE_FILE_OWNED=""
+    echo "benchmark.sh: warning: could not create the fan-boost state file; an interrupted run will not auto-restore a fan boost" >&2
+    return 0
+  fi
+  export MLXFAST_FAN_BOOST_STATE_FILE="${FAN_BOOST_STATE_FILE_OWNED}"
+  trap 'handle_benchmark_abort_signal INT' INT
+  trap 'handle_benchmark_abort_signal TERM' TERM
+}
+
+# Printed on the owner's EXIT path (success or failure alike, as long as no
+# abort handler ran): after a boost the fans intentionally STAY forced at 70%
+# through the later timed phases and past process exit -- restoring mid-run
+# would change the thermal conditions being measured -- so the run must end
+# by telling the user the fans are still forced and how to undo it. This
+# deliberately does NOT restore automatic control itself.
+report_fan_boost_restore_reminder() {
+  if [[ "${FAN_BOOST_ABORT_HANDLED}" == "1" ]]; then
+    return 0
+  fi
+  if [[ -z "${FAN_BOOST_STATE_FILE_OWNED}" ]] || ! fan_boost_recorded; then
+    return 0
+  fi
+  cat >&2 <<EOF
+benchmark.sh: REMINDER: this run boosted the fans; they are still forced to 70% of max.
+benchmark.sh: restore macOS automatic fan control with: ./benchmark.sh --fan-speed-normal
+EOF
+}
+
+# INT/TERM handler for the run that owns the boost state: an aborted run must
+# not leave the machine pinned at 70%, so ONLY IF this run applied a boost,
+# hand fan control back to macOS (the same helper path --fan-speed-normal
+# uses) before exiting. Exits with the conventional 128+signal status through
+# the normal EXIT cleanup trap; runs that never boosted just exit.
+handle_benchmark_abort_signal() {
+  local signal_name="$1"
+  local exit_status=130
+  if [[ "${signal_name}" == "TERM" ]]; then
+    exit_status=143
+  fi
+  FAN_BOOST_ABORT_HANDLED=1
+  if [[ -n "${FAN_BOOST_STATE_FILE_OWNED}" ]] && fan_boost_recorded; then
+    local helper
+    helper="$(fan_control_helper)"
+    echo "benchmark.sh: ${signal_name} received after this run boosted the fans; returning them to macOS automatic control (the SMC write needs sudo)" >&2
+    if [[ -x "${helper}" ]] && "${helper}" normal; then
+      echo "benchmark.sh: fans restored to macOS automatic control before aborting" >&2
+    else
+      echo "benchmark.sh: WARNING: could not restore the fans; they remain forced at 70% of max" >&2
+      echo "benchmark.sh: restore manually with: ./benchmark.sh --fan-speed-normal" >&2
+    fi
+  fi
+  exit "${exit_status}"
+}
+
 # One-time, opt-in fan boost for a stalled cool-down. Interactive only: the
 # user must approve on the terminal because the SMC fan write needs sudo (see
 # tools/fan-control.sh for the full sudo/password-handling contract: sudo's
@@ -401,12 +494,23 @@ offer_fan_boost() {
     return 1
   fi
   # One boost per benchmark run: the fans stay forced across the later timed
-  # phases, so if a previous phase (or the user) already boosted them, do not
-  # prompt for sudo again.
+  # phases, so if a previous gate invocation this run already boosted them,
+  # do not prompt for sudo again -- just grant the cool-down a fresh stall
+  # window. `status` reports manual when ANY fan's mode bit is set, so a
+  # foreign fan controller (or a prior un-restored boost) also lands here:
+  # the helper's own `boost` would refuse to overwrite it, so skip the offer
+  # with one warning instead of prompting for sudo only to be refused. The
+  # foreign hold gets no fresh stall window: unlike our just-boosted fans, it
+  # is not new cooling capacity worth waiting on.
   fan_status="$("${helper}" status 2>/dev/null || true)"
   if [[ "${fan_status}" == "manual" ]]; then
-    echo "benchmark.sh: fans are already under manual control; giving the boost more time to cool the GPU" >&2
-    return 0
+    if fan_boost_recorded; then
+      echo "benchmark.sh: fans are already boosted by this run; giving the boost more time to cool the GPU" >&2
+      return 0
+    fi
+    echo "benchmark.sh: another fan controller (or a prior un-restored boost) already holds the fans in manual mode; not boosting over it" >&2
+    echo "benchmark.sh: if that hold is stale, restore macOS automatic fan control with: ./benchmark.sh --fan-speed-normal" >&2
+    return 1
   fi
   if [[ "${fan_status}" != "auto" ]]; then
     return 1
@@ -434,10 +538,14 @@ EOF
   case "${reply}" in
     y|Y|yes|YES|Yes)
       if "${helper}" boost; then
+        # The helper read the SMC writes back and verified they took, so this
+        # run now owns a live boost: record it for the top-level run's restore
+        # reminder and abort-restore handling.
+        record_fan_boost_applied
         echo "benchmark.sh: fan boost active for the rest of this run (./benchmark.sh --fan-speed-normal restores automatic control)" >&2
         return 0
       fi
-      echo "benchmark.sh: warning: fan boost failed; continuing to wait without it" >&2
+      echo "benchmark.sh: warning: fan boost failed or did not verify; continuing to wait without it" >&2
       return 1
       ;;
     *)
@@ -769,6 +877,12 @@ VERIFY_TRANSFORM_TMP_PARENT_OWNED=""
 score_stdout=""
 cleanup_benchmark_temporaries() {
   local status="$?"
+  # A completed run that boosted the fans ends with the restore reminder
+  # (no-op for runs that never boosted or that already restored on abort).
+  report_fan_boost_restore_reminder
+  if [[ -n "${FAN_BOOST_STATE_FILE_OWNED}" ]]; then
+    rm -f "${FAN_BOOST_STATE_FILE_OWNED}" || true
+  fi
   if [[ -n "${RUNTIME_WORKER_SANDBOX_PROFILE_OWNED}" ]]; then
     rm -f "${RUNTIME_WORKER_SANDBOX_PROFILE_OWNED}" || true
   fi
@@ -1160,6 +1274,12 @@ install_transformed_weights() {
 
 if [[ "${LOCAL_COOL_GATE_ONLY}" == "1" ]]; then
   LOCAL_ITERATE=1
+  # Harness-spawned gate children inherit MLXFAST_FAN_BOOST_STATE_FILE from
+  # the top-level run and skip both steps inside; a standalone
+  # --local-cool-gate-only invocation owns its boost here, so aborting it
+  # restores the fans and completing it prints the restore reminder.
+  setup_fan_boost_run_tracking
+  trap cleanup_benchmark_temporaries EXIT
   run_local_cool_gate
   exit 0
 fi
@@ -1273,6 +1393,12 @@ if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ]]; then
     MLXFAST_LOCAL_COOL_GATE_HELPER="$(absolute_path "${BASH_SOURCE[0]}")"
   fi
   export MLXFAST_LOCAL_COOL_GATE_HELPER
+  # Own the fan-boost state for this run: the cool-gate children the harness
+  # spawns record a boost into the exported state file, and this top-level
+  # process prints the restore reminder at exit (fans intentionally stay
+  # forced through the timed phases) or restores automatic control on
+  # INT/TERM so an aborted run is not left pinned at 70%.
+  setup_fan_boost_run_tracking
 fi
 
 safe_clear_directory_path "${WEIGHTS_PATH}" "weights path" "${REFERENCE_PATH}" >/dev/null || exit 1
