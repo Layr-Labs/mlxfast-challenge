@@ -352,7 +352,7 @@ final class Gemma4FastLayer {
             ] {
                 guard let parsed = FusedGateUpMetadataMode(rawValue: raw.lowercased()) else {
                     preconditionFailure(
-                        "MLXFAST_FUSED_GATE_UP_METADATA must be raw, pair, or indexed")
+                        "MLXFAST_FUSED_GATE_UP_METADATA must be raw or indexed")
                 }
                 metadataMode = parsed
             } else {

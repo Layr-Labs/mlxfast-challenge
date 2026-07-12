@@ -22,11 +22,6 @@ public struct MLXArrayTensorBridge: MLXTensorBridge {
     }
 }
 
-public enum MLXTensorBridgeStatus {
-    public static let message =
-        "MLX Swift array bridge is linked; MaterializedTensor is converted directly from safetensors bytes into MLXArray."
-}
-
 private extension TensorDType {
     var mlxDType: DType {
         switch self {

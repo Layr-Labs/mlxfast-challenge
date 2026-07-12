@@ -188,8 +188,7 @@ public final class Gemma4RuntimeWeightCache {
 }
 
 func loadRuntimeWeightArrays(
-    denseStore: DenseTensorStore,
-    restrictingTo requestedShards: Set<String>? = nil
+    denseStore: DenseTensorStore
 ) throws -> [String: MLXArray] {
     let directory = URL(fileURLWithPath: denseStore.weightsPath)
     let entries = try FileManager.default.contentsOfDirectory(
@@ -198,26 +197,10 @@ func loadRuntimeWeightArrays(
     let discoveredShards = entries
         .filter { $0.pathExtension == "safetensors" }
         .map(\.lastPathComponent)
-    let allShardNames = try validateRuntimeShardInventory(
+    let shardNames = try validateRuntimeShardInventory(
         referencedShards: denseStore.shardNames,
         discoveredShards: discoveredShards
     )
-
-    let shardNames: [String]
-    if let requestedShards {
-        let unknown = requestedShards.subtracting(allShardNames).sorted()
-        guard unknown.isEmpty else {
-            throw MLXFastError.invalidInput(
-                "requested runtime shards are not indexed: \(unknown.joined(separator: ", "))"
-            )
-        }
-        guard !requestedShards.isEmpty else {
-            throw MLXFastError.invalidInput("requested runtime shard set is empty")
-        }
-        shardNames = allShardNames.filter(requestedShards.contains)
-    } else {
-        shardNames = allShardNames
-    }
 
     var loadedWeights: [String: MLXArray] = [:]
     var expectedLoadedNames: Set<String> = []

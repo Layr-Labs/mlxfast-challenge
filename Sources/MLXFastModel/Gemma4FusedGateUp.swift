@@ -1,10 +1,6 @@
 import MLX
 import MLXNN
 
-struct PackedAffineMetadata: @unchecked Sendable {
-    let pairs: MLXArray
-}
-
 struct IndexedAffineMetadata: @unchecked Sendable {
     let indices: MLXArray
     let lut: MLXArray
@@ -75,22 +71,6 @@ func supportsGemma4FusedGateUp(
         && up.scales.shape == metadataShape
 }
 
-func makePackedAffineMetadata(
-    scales: MLXArray,
-    biases: MLXArray
-) -> PackedAffineMetadata {
-    precondition(scales.dtype == .bfloat16)
-    precondition(biases.dtype == .bfloat16)
-    precondition(scales.shape == biases.shape)
-
-    let scaleBits = scales.view(dtype: .uint16).asArray(UInt16.self)
-    let biasBits = biases.view(dtype: .uint16).asArray(UInt16.self)
-    let pairs = zip(scaleBits, biasBits).map {
-        UInt32($0.0) | (UInt32($0.1) << 16)
-    }
-    return PackedAffineMetadata(pairs: MLXArray(pairs, scales.shape))
-}
-
 func makeIndexedAffineMetadata(
     scales: MLXArray,
     biases: MLXArray
@@ -129,7 +109,6 @@ func makeIndexedAffineMetadata(
 
 enum FusedGateUpMetadataMode: String {
     case raw
-    case packedPair = "pair"
     case indexed
 }
 
@@ -196,114 +175,6 @@ private let gemma4FusedGateUpQMV = MLXFast.metalKernel(
         """,
     header: """
         using namespace metal;
-
-        inline float gemma4_load_qmv_values(
-            const device bfloat* input,
-            thread float* values
-        ) {
-            float sum = 0;
-            for (int index = 0; index < 8; index += 4) {
-                sum += input[index] + input[index + 1]
-                    + input[index + 2] + input[index + 3];
-                values[index] = input[index];
-                values[index + 1] = input[index + 1] / 16.0f;
-                values[index + 2] = input[index + 2] / 256.0f;
-                values[index + 3] = input[index + 3] / 4096.0f;
-            }
-            return sum;
-        }
-
-        inline float gemma4_qdot_4bit(
-            const device uchar* weight,
-            const thread float* values,
-            float scale,
-            float bias,
-            float input_sum
-        ) {
-            const device ushort* packed =
-                reinterpret_cast<const device ushort*>(weight);
-            float accumulator = 0;
-            for (int index = 0; index < 2; ++index) {
-                accumulator +=
-                    (values[4 * index] * (packed[index] & 0x000f)
-                    + values[4 * index + 1] * (packed[index] & 0x00f0)
-                    + values[4 * index + 2] * (packed[index] & 0x0f00)
-                    + values[4 * index + 3] * (packed[index] & 0xf000));
-            }
-            return scale * accumulator + input_sum * bias;
-        }
-        """,
-    ensureRowContiguous: true
-)
-
-private let gemma4PackedPairFusedGateUpQMV = MLXFast.metalKernel(
-    name: "gemma4_packed_pair_fused_gate_up_qmv_5376_v1",
-    inputNames: [
-        "gate_weight", "gate_pairs",
-        "up_weight", "up_pairs", "x",
-    ],
-    outputNames: ["gate_output", "up_output"],
-    source: """
-        constexpr int kInputWidth = 5376;
-        constexpr int kGroupsPerRow = 84;
-        constexpr int kWeightBytesPerRow = 2688;
-        constexpr int kRowsPerSIMD = 4;
-
-        const bool is_up = simdgroup_index_in_threadgroup == 1;
-        const int output_row = threadgroup_position_in_grid.y * kRowsPerSIMD;
-        const device uint* weight = is_up ? up_weight : gate_weight;
-        const device uint* pairs = is_up ? up_pairs : gate_pairs;
-        device bfloat* output = is_up ? up_output : gate_output;
-
-        const device uchar* weight_bytes =
-            reinterpret_cast<const device uchar*>(weight)
-            + output_row * kWeightBytesPerRow
-            + thread_index_in_simdgroup * 4;
-        const device uint* row_pairs =
-            pairs + output_row * kGroupsPerRow
-            + thread_index_in_simdgroup / 8;
-        const device bfloat* input = x + thread_index_in_simdgroup * 8;
-
-        float result[kRowsPerSIMD] = {0};
-        for (int block = 0; block < 21; ++block) {
-            float values[8];
-            const float input_sum = gemma4_load_qmv_values(input, values);
-
-            for (int row = 0; row < kRowsPerSIMD; ++row) {
-                const device uchar* row_weight =
-                    weight_bytes + row * kWeightBytesPerRow;
-                const uint pair = row_pairs[row * kGroupsPerRow];
-                result[row] += gemma4_qdot_4bit(
-                    row_weight,
-                    values,
-                    gemma4_pair_scale(pair),
-                    gemma4_pair_bias(pair),
-                    input_sum);
-            }
-
-            weight_bytes += 128;
-            row_pairs += 4;
-            input += 256;
-        }
-
-        for (int row = 0; row < kRowsPerSIMD; ++row) {
-            result[row] = simd_sum(result[row]);
-            if (thread_index_in_simdgroup == 0) {
-                output[output_row + row] = static_cast<bfloat>(result[row]);
-            }
-        }
-        """,
-    header: """
-        using namespace metal;
-
-        inline float gemma4_pair_scale(uint pair) {
-            return static_cast<float>(as_type<bfloat>(static_cast<ushort>(pair)));
-        }
-
-        inline float gemma4_pair_bias(uint pair) {
-            return static_cast<float>(
-                as_type<bfloat>(static_cast<ushort>(pair >> 16)));
-        }
 
         inline float gemma4_load_qmv_values(
             const device bfloat* input,
@@ -593,8 +464,6 @@ struct FusedGateUpProjection: @unchecked Sendable {
     let gate: FastQuantizedProjection
     let up: FastQuantizedProjection
     let metadataMode: FusedGateUpMetadataMode
-    let packedGate: PackedAffineMetadata?
-    let packedUp: PackedAffineMetadata?
     let indexedGate: IndexedAffineMetadata?
     let indexedUp: IndexedAffineMetadata?
 
@@ -626,20 +495,9 @@ struct FusedGateUpProjection: @unchecked Sendable {
         }
         switch metadataMode {
         case .raw:
-            self.packedGate = nil
-            self.packedUp = nil
-            self.indexedGate = nil
-            self.indexedUp = nil
-        case .packedPair:
-            self.packedGate = makePackedAffineMetadata(
-                scales: gate.scales, biases: gateBiases)
-            self.packedUp = makePackedAffineMetadata(
-                scales: up.scales, biases: upBiases)
             self.indexedGate = nil
             self.indexedUp = nil
         case .indexed:
-            self.packedGate = nil
-            self.packedUp = nil
             let indexedGate = gateIndexedMetadata ?? makeIndexedAffineMetadata(
                 scales: gate.scales,
                 biases: gateBiases
@@ -673,20 +531,6 @@ struct FusedGateUpProjection: @unchecked Sendable {
                 [
                     gate.weight, gate.scales, gateBiases,
                     up.weight, up.scales, upBiases, input,
-                ],
-                grid: (32, outputWidth / 2, 1),
-                threadGroup: (32, 2, 1),
-                outputShapes: [outputShape, outputShape],
-                outputDTypes: [.bfloat16, .bfloat16]
-            )
-        case .packedPair:
-            guard let packedGate, let packedUp else {
-                preconditionFailure("packed gate/up metadata was not prepared")
-            }
-            outputs = gemma4PackedPairFusedGateUpQMV(
-                [
-                    gate.weight, packedGate.pairs,
-                    up.weight, packedUp.pairs, input,
                 ],
                 grid: (32, outputWidth / 2, 1),
                 threadGroup: (32, 2, 1),
