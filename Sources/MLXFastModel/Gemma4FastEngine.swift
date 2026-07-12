@@ -623,6 +623,7 @@ final class Gemma4FastEngine {
     let layers: [Gemma4FastLayer]
     let slidingWindow: Int
     let asyncLayerGroup: Int
+    let asyncLayerLead: Int
     private let logitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray
 
     init(
@@ -634,10 +635,24 @@ final class Gemma4FastEngine {
         self.eps = config.rmsNormEps
         self.softcap = config.finalLogitSoftcapping
         self.slidingWindow = config.slidingWindow
-        self.asyncLayerGroup = max(
+        let asyncLayerGroup = max(
             0,
             Int(ProcessInfo.processInfo.environment["MLXFAST_ASYNC_LAYER_GROUP"] ?? "10") ?? 10
         )
+        self.asyncLayerGroup = asyncLayerGroup
+        if asyncLayerGroup > 0 {
+            self.asyncLayerLead = min(
+                asyncLayerGroup,
+                max(
+                    1,
+                    Int(ProcessInfo.processInfo.environment[
+                        "MLXFAST_ASYNC_LAYER_LEAD"
+                    ] ?? "1") ?? 1
+                )
+            )
+        } else {
+            self.asyncLayerLead = 0
+        }
 
         let modules = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
         let params = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
@@ -782,9 +797,11 @@ final class Gemma4FastEngine {
         for (index, layer) in layers.enumerated() {
             let mask = layer.isSliding ? (slidingMask ?? .none) : (fullMask ?? .none)
             hidden = layer(hidden, mask: mask, cache: layerCache(index))
+            let layerNumber = index + 1
             if inputs.dim(1) == 1,
                asyncLayerGroup > 0,
-               (index + 1).isMultiple(of: asyncLayerGroup)
+               layerNumber >= asyncLayerLead,
+               (layerNumber - asyncLayerLead).isMultiple(of: asyncLayerGroup)
             {
                 asyncEval(hidden)
             }
