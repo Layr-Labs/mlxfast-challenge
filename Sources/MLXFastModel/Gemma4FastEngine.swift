@@ -521,7 +521,33 @@ final class Gemma4FastLayer {
         let usesFusedAttentionPreparation = B == 1
             && L == 1
             && fusedAttentionRMS?.supports(offset: offset) == true
-        if usesFusedAttentionPreparation, let fusedAttentionRMS {
+        let combinedCache = gemma4CombinedKVDirectEnabled()
+            ? cache as? Gemma4CombinedKVCache
+            : nil
+        let usesCombinedKVDecodePreparation = usesFusedAttentionPreparation
+            && combinedCache != nil
+        let combinedPrefillCapacity = B == 1
+            && L > 1
+            && gemma4CombinedKVPrefillEnabled()
+            && fusedAttentionRMS?.supportsPrefill(offset: offset, length: L) == true
+            ? combinedCache?.directPrefillCapacity(for: L)
+            : nil
+        let usesCombinedKVPrefillPreparation = combinedPrefillCapacity != nil
+        if usesCombinedKVDecodePreparation,
+           let fusedAttentionRMS,
+           let combinedCache
+        {
+            let prepared = fusedAttentionRMS.callCombined(
+                rawQueries: rawQueries,
+                rawKeys: rawKeys,
+                rawValues: rawValues,
+                offset: offset
+            )
+            queries = prepared.queries
+            let updated = combinedCache.updateCombined(prepared.combinedKV)
+            keys = updated.0
+            values = updated.1
+        } else if usesFusedAttentionPreparation, let fusedAttentionRMS {
             let prepared = fusedAttentionRMS(
                 rawQueries: rawQueries,
                 rawKeys: rawKeys,
@@ -531,6 +557,56 @@ final class Gemma4FastLayer {
             queries = prepared.0
             keys = prepared.1
             values = prepared.2
+        } else if usesCombinedKVPrefillPreparation,
+                  let fusedAttentionRMS,
+                  let combinedCache,
+                  let combinedPrefillCapacity
+        {
+            // Preserve the stock query path exactly. K/V normalization,
+            // transposition, RoPE, cache layout, and capacity reservation are
+            // emitted directly by one multi-token Metal kernel. `rawQueries`
+            // may come from the promoted combined Q/K/V prefill projection;
+            // keeping it here preserves that dispatch and its single QMM.
+            queries = rawQueries.reshaped(B, L, nHeads, headDim)
+            queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: eps)
+            let combined = fusedAttentionRMS.callCombinedPrefill(
+                rawKeys: rawKeys,
+                rawValues: rawValues,
+                offset: offset,
+                length: L,
+                capacity: combinedPrefillCapacity
+            )
+            let updated = combinedCache.adoptDirectPrefill(combined, length: L)
+            keys = updated.0
+            values = updated.1
+            if gemma4VerifyCombinedKVPrefillBitsEnabled() {
+                let shapedKeys = rawKeys.reshaped(B, L, nKvHeads, headDim)
+                var referenceKeys = MLXFast.rmsNorm(
+                    shapedKeys, weight: kNormWeight!, eps: eps)
+                    .transposed(0, 2, 1, 3)
+                referenceKeys = rope(referenceKeys, offset: offset)
+                let referenceValueInput = rawValues?.reshaped(
+                    B, L, nKvHeads, headDim
+                ) ?? shapedKeys
+                let referenceValues = MLXFast.rmsNorm(
+                    referenceValueInput,
+                    weight: MLXArray.mlxNone,
+                    eps: eps
+                ).transposed(0, 2, 1, 3)
+                let keysMatch = arrayEqual(
+                    keys.view(dtype: .uint16),
+                    referenceKeys.view(dtype: .uint16)
+                )
+                let valuesMatch = arrayEqual(
+                    values.view(dtype: .uint16),
+                    referenceValues.view(dtype: .uint16)
+                )
+                eval(keysMatch, valuesMatch)
+                precondition(
+                    keysMatch.item(Bool.self) && valuesMatch.item(Bool.self),
+                    "direct combined KV prefill differs from stock RMSNorm/RoPE"
+                )
+            }
         } else {
             queries = rawQueries.reshaped(B, L, nHeads, headDim)
             queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: eps)
@@ -548,11 +624,14 @@ final class Gemma4FastLayer {
                 values, weight: MLXArray.mlxNone, eps: eps)
             values = values.transposed(0, 2, 1, 3)
         }
-        if !usesFusedAttentionPreparation {
+        if !usesFusedAttentionPreparation && !usesCombinedKVPrefillPreparation {
             keys = rope(keys, offset: offset)
         }
 
-        if let cache {
+        if let cache,
+           !usesCombinedKVDecodePreparation,
+           !usesCombinedKVPrefillPreparation
+        {
             let updated = cache.update(keys: keys, values: values)
             keys = updated.0
             values = updated.1

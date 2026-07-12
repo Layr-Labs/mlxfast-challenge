@@ -74,11 +74,24 @@ public final class Gemma4RuntimeModel: Module, LanguageModel {
 
     public func newCache(parameters _: GenerateParameters?) -> [KVCache] {
         let firstSharedLayer = configuration.numHiddenLayers - configuration.numKvSharedLayers
+        let useCombinedCache = gemma4CombinedKVCacheEnabled()
         return (0..<firstSharedLayer).map { layerIndex in
             if configuration.layerTypes[layerIndex] == Gemma4LayerType.full.rawValue {
-                StandardKVCache()
+                if useCombinedCache {
+                    Gemma4CombinedKVCache(fullStep: 256)
+                } else {
+                    StandardKVCache()
+                }
             } else {
-                RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
+                if useCombinedCache {
+                    Gemma4CombinedKVCache(
+                        rotatingMaxSize: configuration.slidingWindow,
+                        keep: 0,
+                        step: 256
+                    )
+                } else {
+                    RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
+                }
             }
         }
     }

@@ -172,6 +172,18 @@ public final class Gemma4ModelCache {
         kvCaches = caches
     }
 
+    /// CompiledDecode only promotes its own concrete split-cache classes.
+    /// Restore those types immediately before setup; eager decode otherwise
+    /// keeps the K/V-major combined allocation.
+    func convertCombinedCachesToUpstream(_ caches: inout [any KVCache]) {
+        for index in caches.indices {
+            if let combined = caches[index] as? Gemma4CombinedKVCache {
+                caches[index] = combined.makeUpstreamCache()
+            }
+        }
+        kvCaches = caches
+    }
+
     func nextExpectedPositionOffset(
         positionOffset: Int,
         inputLength: Int

@@ -122,11 +122,16 @@ public enum Gemma4Model {
                     if let step = compiledDecodeStep {
                         return step([inputIDs])[0]
                     }
-                    if ProcessInfo.processInfo.environment["DARKBLOOM_COMPILED_DECODE"] == "1",
-                       let step = CompiledDecode.setupCompiledDecode(model: model, cache: &kvCaches) {
-                        cache.adoptKVCaches(kvCaches)
-                        cache.compiledDecodeStep = step
-                        return step([inputIDs])[0]
+                    if ProcessInfo.processInfo.environment["DARKBLOOM_COMPILED_DECODE"] == "1" {
+                        cache.convertCombinedCachesToUpstream(&kvCaches)
+                        if let step = CompiledDecode.setupCompiledDecode(
+                            model: model,
+                            cache: &kvCaches
+                        ) {
+                            cache.adoptKVCaches(kvCaches)
+                            cache.compiledDecodeStep = step
+                            return step([inputIDs])[0]
+                        }
                     }
                     // Compiled decode disabled or unsupported: eager per-step forward.
                     cache.adoptKVCaches(kvCaches)
