@@ -309,7 +309,13 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(verifyBuildProductsStep.contains("/bin/rm -rf .mlxfast-cache/trusted-build"))
     let stageBuildProductsStep = String(workflow[stageBuildProductsRange.lowerBound..<saveBuildProductsRange.lowerBound])
     #expect(stageBuildProductsStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
-    #expect(stageBuildProductsStep.contains("/bin/cp -c -R \"${MLXFAST_JOB_WS}/.build\" .mlxfast-cache/trusted-build"))
+    // rsync with module-cache excludes: clang creates ModuleCache mode-700
+    // under the bench uid, which a runner-uid cp cannot read (this failed the
+    // first live seeding run); the caches are transient and rebuilt cheaply.
+    #expect(stageBuildProductsStep.contains("/usr/bin/rsync -a \\"))
+    #expect(stageBuildProductsStep.contains("--exclude='ModuleCache'"))
+    #expect(stageBuildProductsStep.contains("--exclude='clang-module-cache'"))
+    #expect(stageBuildProductsStep.contains("\"${MLXFAST_JOB_WS}/.build/\" .mlxfast-cache/trusted-build/"))
     #expect(stageBuildProductsStep.contains("test -d .mlxfast-cache/trusted-build/release"))
     let saveBuildProductsStep = String(workflow[saveBuildProductsRange.lowerBound..<transformRange.lowerBound])
     #expect(saveBuildProductsStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))

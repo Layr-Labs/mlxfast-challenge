@@ -668,14 +668,19 @@ jobs:
       # save above): on main there is no submitted overlay, so the staged
       # .build tree derives purely from trusted sources. Submission runs can
       # execute submitted code as bench inside .build, but they can never save.
+      # Clang module caches are excluded: clang creates them mode-700 under the
+      # bench uid (unreadable to the runner-uid copy), and they are transient
+      # compiler caches the next build recreates cheaply.
       - name: Stage trusted build products cache
         if: steps.restore_build_products_cache.outputs.cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
           /bin/rm -rf .mlxfast-cache/trusted-build
-          /bin/mkdir -p .mlxfast-cache
-          /bin/cp -c -R "${MLXFAST_JOB_WS}/.build" .mlxfast-cache/trusted-build 2>/dev/null \
-            || { /bin/rm -rf .mlxfast-cache/trusted-build; /bin/cp -R "${MLXFAST_JOB_WS}/.build" .mlxfast-cache/trusted-build; }
+          /bin/mkdir -p .mlxfast-cache/trusted-build
+          /usr/bin/rsync -a \
+            --exclude='ModuleCache' \
+            --exclude='clang-module-cache' \
+            "${MLXFAST_JOB_WS}/.build/" .mlxfast-cache/trusted-build/
           test -d .mlxfast-cache/trusted-build/release
 
       - name: Save trusted build products cache
