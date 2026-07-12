@@ -259,6 +259,18 @@ behaviors are expected, not bugs:
  `brew install macmon`). The gate mirrors the ranked runner's fixed
  40C / 1600 MHz / 900 s thermal contract, which is operator-owned and
  non-overridable.
+- **Optional fan boost for a stalled local cool-down.** If the local gate
+ sits hot for ~60 seconds with no cooling progress, it offers — once per
+ run, interactive terminal only — to force the Mac's fans to a hard-coded
+ 70% of their maximum speed via `tools/fan-control.sh`. Fan targets are
+ SMC keys that macOS only lets root write, so accepting the offer
+ triggers sudo's own password prompt; the scripts never read, store, or
+ log the password, and the cached credential is dropped (`sudo -k`)
+ right after the write. `./benchmark.sh --fan-speed-normal` removes the
+ 70% override and returns the fans to macOS's automatic curve (no pinned
+ RPM). Manual control uses the same helper:
+ `tools/fan-control.sh boost|normal|status` (needs an `smc` CLI, e.g.
+ from smcFanControl; fanless Macs are refused cleanly).
 - **Measurement discipline.** Trust benchmark numbers only from a cool,
  quiescent machine. Back-to-back runs heat the GPU and throttle it; a
  2-3 minute cool-down between local runs is normal and is exactly what
