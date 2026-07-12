@@ -137,10 +137,7 @@ private enum MLXFastCLI {
     }
 
     private static func runCorrectness(_ options: ParsedOptions) throws -> Int {
-        try options.validate(
-            valueOptions: ["--weights", "--golden", "--step-range", "--step-range-output"],
-            flagOptions: ["--base-case-only"]
-        )
+        try options.validate(valueOptions: ["--weights", "--golden"])
         let weightsPath = options.value(
             for: "--weights",
             default: environmentValue(
@@ -155,34 +152,10 @@ private enum MLXFastCLI {
                 fallback: defaultCorrectnessGoldenPath()
             )
         )
-        let (stepStart, stepCount) = try parseCorrectnessStepRange(
-            options.value(
-                for: "--step-range",
-                default: environmentValue("MLXFAST_CORRECTNESS_STEP_RANGE", fallback: "")
-            )
-        )
-        let baseCaseOnly = options.hasFlag("--base-case-only")
-            || environmentValue("MLXFAST_CORRECTNESS_BASE_CASE_ONLY", fallback: "0") == "1"
-        // Recorded independent of pass/fail and before the check even runs: a
-        // combiner verifying range coverage across machines needs to know what was
-        // actually ASSIGNED, not derive it from checked_steps, which is truncated on
-        // a real failure and must not be confused with an unassigned/uncovered range.
-        let stepRangeOutputPath = options.value(for: "--step-range-output", default: "")
-        if !stepRangeOutputPath.isEmpty {
-            guard let stepCount else {
-                throw MLXFastError.invalidInput("--step-range-output requires --step-range")
-            }
-            try requirePrivateOutputPath(stepRangeOutputPath, description: "step-range report")
-            let sidecar = "{\"step_range_start\":\(stepStart),\"step_range_end\":\(stepStart + stepCount)}\n"
-            try sidecar.write(toFile: stepRangeOutputPath, atomically: true, encoding: .utf8)
-        }
         let report = try GemmaRuntime.runCorrectness(
             CorrectnessOptions(
                 weightsPath: weightsPath,
-                goldenPath: goldenPath,
-                stepStart: stepStart,
-                stepCount: stepCount,
-                baseCaseOnly: baseCaseOnly
+                goldenPath: goldenPath
             ),
             worker: try runtimeWorkerOptions(blockedGoldenPath: goldenPath)
         )
@@ -193,28 +166,6 @@ private enum MLXFastCLI {
         FileHandle.standardOutput.write(data)
         print("")
         return report.passed ? 0 : 1
-    }
-
-    // Parses "START-END" (e.g. "21-43") into a half-open [start, end) range passed to
-    // CorrectnessOptions as (stepStart, stepCount). Empty input means "full range" --
-    // (0, nil), matching the pre-existing default behavior.
-    private static func parseCorrectnessStepRange(_ raw: String) throws -> (start: Int, count: Int?) {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return (0, nil)
-        }
-        let parts = trimmed.split(separator: "-", maxSplits: 1)
-        guard parts.count == 2,
-              let start = Int(parts[0]),
-              let end = Int(parts[1]),
-              start >= 0,
-              end > start
-        else {
-            throw MLXFastError.invalidInput(
-                "--step-range must be START-END with 0 <= START < END, got \"\(raw)\""
-            )
-        }
-        return (start, end - start)
     }
 
     private static func runCorrectnessTrace(_ options: ParsedOptions) throws {
@@ -371,12 +322,11 @@ private enum MLXFastCLI {
             try requirePrivateOutputPath(semanticOutputPath, description: "semantic GPQA answer output")
         }
         // Lets a run skip the base teacher-forced case (still runs behavior/GPQA/TTFT/
-        // timing) when a separate fleet of machines verifies that case's step range in
-        // parallel. Defaults to the full official window, unchanged from before this
-        // existed. See the comment on BenchmarkPreflight/validateBenchmarkOptions for why
-        // 0 is accepted: the harness never treats a steps=0 run as self-certifying
-        // correctness, only the combiner that ANDs every machine's real result together
-        // may do that.
+        // timing) when that case is verified in a separate phase of the ranked
+        // pipeline. Defaults to the full official window. See the comment on
+        // BenchmarkPreflight/validateBenchmarkOptions for why 0 is accepted: the
+        // harness never treats a steps=0 run as self-certifying correctness; only the
+        // trusted pipeline that assembles the final score may do that.
         let correctnessSteps = try parseNonNegativeInt(
             environmentValue(
                 "MLXFAST_BENCHMARK_CORRECTNESS_STEPS",
@@ -384,10 +334,11 @@ private enum MLXFastCLI {
             ),
             optionName: "MLXFAST_BENCHMARK_CORRECTNESS_STEPS"
         )
-        // Lets the anchor/free-run/behavior/GPQA gates and the timed prefill/
-        // decode measurement each run on their own machine too, same rationale
-        // as MLXFAST_BENCHMARK_CORRECTNESS_STEPS above. Both default to
-        // reproducing the original, single-machine behavior exactly.
+        // Phase controls for the single-machine ranked pipeline: benchmark.yml's
+        // gates pass runs with CHECK_GATES=1 SKIP_TIMED=1 (base case + hidden gates,
+        // no timing), and the timed measurement runs later through measure-job's
+        // own ./benchmark.sh --official invocation. Both default to the original
+        // everything-in-one-run behavior.
         let checkGates = environmentValue("MLXFAST_BENCHMARK_CHECK_GATES", fallback: "1") != "0"
         let skipTimedBenchmark = environmentValue("MLXFAST_BENCHMARK_SKIP_TIMED", fallback: "0") == "1"
         let payload = GemmaRuntime.benchmark(
@@ -1167,9 +1118,9 @@ private enum MLXFastCLI {
         forwardsWorkerStderr: Bool = false
     ) throws -> RuntimeWorkerOptions? {
         // benchmark.sh's enforce_official_sandbox refuses to run the timed benchmark
-        // with the worker or its sandbox disabled on an official run, but the slice
-        // machines invoke `mlxfast-swift correctness` directly, so the same policy
-        // must fail closed here too rather than silently falling back to an
+        // with the worker or its sandbox disabled on an official run, but the public
+        // behavior gate invokes `mlxfast-swift correctness` directly, so the same
+        // policy must fail closed here too rather than silently falling back to an
         // unsandboxed (or worker-less) path. MLXFAST_OFFICIAL_BENCHMARK_RUN is set
         // by trusted workflow env and stripped from the worker's own environment by
         // sanitizedRuntimeWorkerEnvironment, so submitted code cannot observe it.
@@ -1324,7 +1275,7 @@ private enum MLXFastCLI {
             Usage:
               mlxfast-swift transform [--reference PATH] [--output PATH]
               mlxfast-swift verify-transform [--reference PATH] [--weights PATH] [--tmp-parent PATH] [--max-bytes N]
-              mlxfast-swift correctness [--weights PATH] [--golden PATH] [--step-range START-END] [--step-range-output PATH] [--base-case-only]
+              mlxfast-swift correctness [--weights PATH] [--golden PATH]
               mlxfast-swift correctness-trace [--weights PATH] [--golden PATH] [--case NAME] --step N [--top-k N]
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
               mlxfast-swift benchmark [--local-submit|--local-iterate] [--weights PATH] [--golden PATH] [--score-path PATH]

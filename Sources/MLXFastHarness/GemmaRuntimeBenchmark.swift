@@ -304,10 +304,10 @@ extension GemmaRuntime {
 
     static func validateBenchmarkOptions(_ options: BenchmarkOptions) throws {
         // 0 is allowed deliberately: it means "skip the base teacher-forced case on this
-        // run" (still runs anchors/free-run/behavior/GPQA/TTFT/timing), for a machine that
-        // relies on a separate fleet to verify the base case's step range in parallel.
-        // Skipping is a caller decision, not a harness one -- the harness never treats a
-        // steps=0 run as having actually verified correctness by itself.
+        // run" (still runs anchors/free-run/behavior/GPQA/TTFT/timing), for a run whose
+        // base case is verified in a separate phase of the ranked pipeline. Skipping is
+        // a caller decision, not a harness one -- the harness never treats a steps=0
+        // run as having actually verified correctness by itself.
         guard options.correctnessSteps >= 0 else {
             throw MLXFastError.invalidInput("benchmark correctness steps must be >= 0")
         }
@@ -499,16 +499,16 @@ extension GemmaRuntime {
             let benchmarkPeakRamGB: Double
             let benchmarkExpertStats: ExpertStreamingStats
             if options.skipTimedBenchmark {
-                // This machine's role is the anchor/free-run/behavior/GPQA gates
-                // only -- a separate "timing-only" machine (checkGates: false)
-                // measures the real prefill/decode numbers. Placeholders here use
-                // the golden-resolved baseline seconds-per-token exactly
+                // This pass's role is the base case + anchor/free-run/behavior/
+                // GPQA gates only -- the ranked pipeline measures the real
+                // prefill/decode numbers afterwards via measure-job. Placeholders
+                // here use the golden-resolved baseline seconds-per-token exactly
                 // (speedup == 1.0, always finite, always clears the floor)
                 // rather than 0 or some arbitrary value: 0 would divide-by-zero
                 // into +Infinity in BenchmarkScore.speedup, and Double.infinity
                 // fails JSON encoding outright. Whatever ships here is
-                // overwritten by the real timing-only machine's values when the
-                // two are merged before combine-parallel-correctness.sh runs.
+                // overwritten by the measured paired timing when
+                // overlay-paired-timing.sh assembles the final score.
                 progress("timed benchmark skipped (gates-only machine)")
                 prefillSecondsPerToken = baselinePrefillSecondsPerToken
                 decode = DecodeMeasurement(

@@ -157,13 +157,13 @@ public struct ScoreMetrics: Codable, Equatable {
     public let weightsFileCount: Int
     public let runtime: String
     // True whenever this metrics payload still contains baseline-placeholder
-    // values for the fields a gates-only or timing-only machine did not itself
+    // values for the fields a gates-only or timing-only run did not itself
     // measure (see BenchmarkOptions.checkGates/skipTimedBenchmark). The ONLY
-    // thing that clears this to false today is benchmark.yml's "Merge gates and
-    // timing into machine1" step -- a defense-in-depth marker so a future
-    // regression there (or anywhere combine assembles the final score) has a
-    // structural signal to check, instead of relying solely on the YAML wiring
-    // being correct.
+    // thing that clears this to false today is overlay-paired-timing.sh, when
+    // it overlays measure-job's paired timing into the sealed gates score --
+    // a defense-in-depth marker so a future regression there (or anywhere the
+    // final score is assembled) has a structural signal to check, instead of
+    // relying solely on the YAML wiring being correct.
     public let partialResult: Bool
 
     enum CodingKeys: String, CodingKey {
@@ -571,7 +571,7 @@ extension ScoreMetrics {
     /// to `figures` significant figures, to shrink the timing/memory covert channel
     /// that submitted model code can drive. Ranking- and floor-critical fields
     /// (decode/prefill seconds-per-token, speedups, floors, baselines) are left
-    /// untouched so scoring, the speedup-floor gate, and the parallel-combine merge
+    /// untouched so scoring, the speedup-floor gate, and the paired-timing overlay
     /// are all bit-unaffected. Ordering pairs the validators assert are re-clamped
     /// after rounding as belt-and-suspenders.
     public func withCoarsenedPublicDiagnostics(

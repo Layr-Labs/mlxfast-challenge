@@ -104,23 +104,26 @@ public enum MLXFastConstants {
     public static let prefillBandDownTolerance = 0.05
     public static let decodeBandUpTolerance = 0.02
     public static let decodeBandDownTolerance = 0.05
-    // CACHED Gemma 4 31B 4-bit dense baseline, calibrated on the ranked runner
-    // (tenki-macos-latest-xlarge, the only ranked runner now) from COLD single-
-    // benchmark runs -- one full 128-step `./benchmark.sh` per fresh throwaway VM,
-    // which is exactly how the ranked candidate is measured now (one benchmark per
-    // fresh VM, no live paired baseline). Values are the robust drop-outlier
-    // average (drop the single slowest, average the rest) of fresh-VM run
-    // 28893815980 (2026-07-07, 6 fresh VMs), corroborated by the cold run-1s of
-    // run 28898140493 (10 cold measurements total): decode clustered 0.1332-0.1343
-    // (CV 0.3%); prefill floor ~0.0106 (one +44% spike dropped).
+    // CACHED Gemma 4 31B 4-bit dense baseline. Calibration provenance: measured
+    // on the since-retired tenki-macos-latest-xlarge VM runner class from COLD
+    // single-benchmark runs (one full 128-step `./benchmark.sh` per fresh
+    // throwaway VM). Values are the robust drop-outlier average (drop the
+    // single slowest, average the rest) of fresh-VM run 28893815980
+    // (2026-07-07, 6 fresh VMs), corroborated by the cold run-1s of run
+    // 28898140493 (10 cold measurements total): decode clustered 0.1332-0.1343
+    // (CV 0.3%); prefill floor ~0.0106 (one +44% spike dropped). Supersedes the
+    // Blacksmith-era values (prefill 0.01010573933984375 / decode
+    // 0.131727461265625).
     //
-    // Supersedes the Blacksmith-era values (prefill 0.01010573933984375 / decode
-    // 0.131727461265625): the ranked runner is tenki-only now. The live paired
-    // baseline is KEPT (it still tracks per-run drift) but measured on a SEPARATE
-    // fresh VM from the candidate, so the baseline run no longer warms the
-    // candidate's VM. These constants keep their three roles: local-mode scoring,
-    // the gates-only machine's placeholder timing, and the paired sanity-band
-    // anchor. See the paired-baseline section of docs/benchmark-window-freeze.md.
+    // These constants are NOT the ranked scoring denominator. The ranked runner
+    // is the single self-hosted M5 Max (m5-bench), where measure-job times the
+    // candidate and the PINNED on-box reference tree back to back in the same
+    // session behind the same 40C thermal gate; the paired ratio against that
+    // live same-session baseline is what overlay-paired-timing.sh folds into
+    // the final score. These constants keep two roles: local-mode score
+    // estimates (--local-iterate / --local-submit) and the gates-only pass's
+    // placeholder timing fields, which the paired-timing overlay replaces. See
+    // the paired-baseline section of docs/benchmark-window-freeze.md.
     public static let officialBaselinePrefillSecondsPerToken = 0.010605031949609375
     public static let officialBaselineDecodeSecondsPerToken = 0.1336139485703125
     public static let scorePrefillWeight = 0.25

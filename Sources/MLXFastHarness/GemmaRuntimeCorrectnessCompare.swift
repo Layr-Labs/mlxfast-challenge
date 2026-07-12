@@ -60,56 +60,27 @@ extension GemmaRuntime {
         testCase: GoldenCase,
         worker: RuntimeWorkerClient,
         steps: Int = MLXFastConstants.correctnessSteps,
-        startStep: Int = 0,
         progressIntervalSteps: Int = 0,
         progress: ((Int, Int) -> Void)? = nil
     ) throws -> WorkerCorrectnessResult {
-        // `startStep`/`endStep` let a caller check a contiguous slice [startStep, endStep)
-        // of the full teacher-forced window instead of always starting at position 0. This
-        // is safe because teacher forcing always feeds the golden token as input for the
-        // next step (testCase.expectedTokens[...]), never the model's own prediction --
-        // so what the model should see at step N never depends on whether steps before N
-        // were themselves checked or even correct.
-        let endStep = startStep + steps
         guard !testCase.promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("teacher-forced correctness prompt must not be empty")
-        }
-        guard startStep >= 0 else {
-            throw MLXFastError.invalidInput("teacher-forced correctness startStep must be >= 0")
         }
         guard steps > 0 else {
             throw MLXFastError.invalidInput("teacher-forced correctness steps must be positive")
         }
-        guard testCase.expectedTokens.count >= endStep else {
+        guard testCase.expectedTokens.count >= steps else {
             throw MLXFastError.invalidInput(
                 "\(testCase.name).expected_tokens has \(testCase.expectedTokens.count) tokens; "
-                    + "need at least \(endStep) for range [\(startStep), \(endStep))"
+                    + "need at least \(steps)"
             )
         }
 
-        // Seed with the bare prompt and then advance through [0, startStep) using the
-        // same single-token teacher-forced steps a full serial run would have used --
-        // feeding the GOLDEN token each time and ignoring the model's own predictions,
-        // which are earlier slices' responsibility to check. This costs startStep
-        // unchecked decode steps (well inside the slice machines' wall-clock headroom
-        // against the timing machine's critical path) but makes the KV-cache state at
-        // every CHECKED step bit-identical in floating-point provenance to the serial
-        // run: one batched prefill over prompt+prefix goes through different kernel
-        // dispatch and reduction orders than incremental single-token decode, and
-        // under strict argmax equality a near-tie logit could otherwise flip a checked
-        // token in either direction relative to what serial would have found.
         var response = try worker.beginTeacherForcedCorrectness(promptTokens: testCase.promptTokens)
         var latestExpertStats = response.expertStats ?? .zero
         var peakRamGB = response.peakRamGB ?? 0
-        for seedStep in 0..<startStep {
-            response = try worker.teacherForcedCorrectnessStep(
-                previousToken: testCase.expectedTokens[seedStep]
-            )
-            latestExpertStats = response.expertStats ?? latestExpertStats
-            peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
-        }
-        for step in startStep..<endStep {
-            if step > startStep {
+        for step in 0..<steps {
+            if step > 0 {
                 response = try worker.teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[step - 1])
                 latestExpertStats = response.expertStats ?? latestExpertStats
                 peakRamGB = max(peakRamGB, response.peakRamGB ?? 0)
@@ -146,7 +117,7 @@ extension GemmaRuntime {
                     return WorkerCorrectnessResult(
                         comparison: CorrectnessTokenComparison(
                             passed: false,
-                            checkedSteps: step - startStep + 1,
+                            checkedSteps: step + 1,
                             firstFailingStep: step,
                             expectedToken: expectedToken,
                             actualToken: actualToken
@@ -157,7 +128,7 @@ extension GemmaRuntime {
                 }
             }
             reportProgress(
-                step: step - startStep + 1,
+                step: step + 1,
                 total: steps,
                 intervalSteps: progressIntervalSteps,
                 progress: progress

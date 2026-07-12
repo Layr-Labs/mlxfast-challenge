@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Write a reproducible content hash of a transformed weights/ tree to stdout (or a file
-# if given a second argument). Run identically on every machine in a parallel-correctness
-# fleet so combine-parallel-correctness.sh can confirm they all transformed to
-# byte-identical output before trusting any of their results together.
+# if given a second argument). The ranked benchmark.yml hashes the transform output
+# with this immediately after the (untrusted) transform runs, and the gates run's
+# reported weights hash is cross-checked against it before any score is trusted.
 set -euo pipefail
 
 WEIGHTS_PATH="${1:?usage: hash-weights-directory.sh WEIGHTS_PATH [OUTPUT_PATH]}"
