@@ -162,35 +162,19 @@ public enum SwiftTransform {
         }
 
         try beforeSidecarGeneration?()
-        let generatedProjectionMetadata = try AffineMetadataCoding.writeProjectionSidecar(
+        let generatedMetadata = try AffineMetadataCoding.writeProjectionSidecar(
             sourceDirectory: stagingDirectory,
             index: index,
             sourceHeaders: stagedHeaders,
             selectedKeys: textKeys,
             destinationDirectory: stagingDirectory
         )
-        let generatedTiedHeadMetadata = try TiedHeadMetadataCoding.writeSidecar(
-            sourceDirectory: stagingDirectory,
-            index: index,
-            sourceHeaders: stagedHeaders,
-            selectedKeys: textKeys,
-            destinationDirectory: stagingDirectory
-        )
-        let (projectionOutputByteCount, projectionSizeOverflow) =
+        let (outputTensorByteCount, generatedSizeOverflow) =
             totalTensorByteCount.addingReportingOverflow(
-                generatedProjectionMetadata.tensorByteCount
+                generatedMetadata.tensorByteCount
             )
-        let (outputTensorByteCount, tiedHeadSizeOverflow) =
-            projectionOutputByteCount.addingReportingOverflow(
-                generatedTiedHeadMetadata.tensorByteCount
-            )
-        guard !projectionSizeOverflow, !tiedHeadSizeOverflow else {
+        guard !generatedSizeOverflow else {
             throw MLXFastError.invalidInput("transformed tensor byte count overflows Int")
-        }
-        let generatedWeightMap = generatedProjectionMetadata.weightMap.merging(
-            generatedTiedHeadMetadata.weightMap
-        ) { _, _ in
-            preconditionFailure("generated metadata tensor names collide")
         }
 
         try writeMetadataFiles(metadataSnapshot, to: stagingDirectory)
@@ -198,7 +182,7 @@ public enum SwiftTransform {
             to: stagingDirectory.appendingPathComponent("model.safetensors.index.json"),
             keeping: textKeys,
             totalTensorByteCount: outputTensorByteCount,
-            additionalWeightMap: generatedWeightMap
+            additionalWeightMap: generatedMetadata.weightMap
         )
 
         try runtimeConfigData.write(
@@ -243,12 +227,8 @@ public enum SwiftTransform {
         return TransformReport(
             referencePath: referenceDirectory.path,
             outputPath: outputDirectory.path,
-            denseTensorCount: copiedTensors
-                + generatedProjectionMetadata.tensorCount
-                + generatedTiedHeadMetadata.tensorCount,
-            denseShardCount: textKeysByShard.count
-                + generatedProjectionMetadata.shardCount
-                + generatedTiedHeadMetadata.shardCount,
+            denseTensorCount: copiedTensors + generatedMetadata.tensorCount,
+            denseShardCount: textKeysByShard.count + generatedMetadata.shardCount,
             configPath: configPath.path,
             indexPath: indexPath.path
         )

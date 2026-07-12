@@ -97,6 +97,7 @@ final class Gemma4FastLayer {
     let indexedOutput: IndexedOutputProjection?
     let fusedQKV: FusedSlidingQKVProjection?
     let fusedQK: FusedFullQKProjection?
+    let combinedAttentionPrefill: CombinedAttentionPrefillProjection?
     let fusedAttentionRMS: FusedAttentionRMSPreparation?
     let fusedAttentionToMLPBoundary: FusedAttentionToMLPBoundary?
     let fusedMLPToNextBoundary: FusedMLPToNextBoundary?
@@ -234,6 +235,32 @@ final class Gemma4FastLayer {
         } else {
             self.fusedQK = nil
         }
+        let combinedAttentionPrefillEnabled: Bool
+        if let raw = ProcessInfo.processInfo.environment[
+            "MLXFAST_COMBINED_ATTENTION_PREFILL"
+        ] {
+            combinedAttentionPrefillEnabled = ["1", "true", "yes", "on"]
+                .contains(raw.lowercased())
+        } else {
+            combinedAttentionPrefillEnabled = true
+        }
+        let verifyCombinedAttentionPrefill: Bool
+        if let raw = ProcessInfo.processInfo.environment[
+            "MLXFAST_VERIFY_COMBINED_ATTENTION_PREFILL"
+        ] {
+            verifyCombinedAttentionPrefill = ["1", "true", "yes", "on"]
+                .contains(raw.lowercased())
+        } else {
+            verifyCombinedAttentionPrefill = false
+        }
+        self.combinedAttentionPrefill = combinedAttentionPrefillEnabled
+            ? CombinedAttentionPrefillProjection(
+                q: qProjection,
+                k: kProjection,
+                v: vProjection,
+                verifyBits: verifyCombinedAttentionPrefill
+            )
+            : nil
         self.qNormWeight = qNorm.weight
         self.kNormWeight = kNorm?.weight
         let fusedAttentionRMSEnabled: Bool
@@ -473,6 +500,15 @@ final class Gemma4FastLayer {
             rawQueries = projected.0
             rawKeys = projected.1
             rawValues = nil
+        } else if B == 1,
+                  L > 1,
+                  h.dtype == .bfloat16,
+                  let combinedAttentionPrefill
+        {
+            let projected = combinedAttentionPrefill(h)
+            rawQueries = projected.queries
+            rawKeys = projected.keys
+            rawValues = projected.values
         } else {
             rawQueries = qProj(h)
             rawKeys = kProj(h)
@@ -710,15 +746,11 @@ final class Gemma4FastEngine {
     let slidingWindow: Int
     let asyncLayerGroup: Int
     let asyncLayerLead: Int
-    let tiedVocabularyHead: Gemma4TiedVocabularyHead?
-    let usePacked13TiedVocabularyHead: Bool
-    let verifyTiedVocabularyHead: Bool
     private let logitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray
 
     init(
         model: Gemma4RuntimeModel,
-        indexedMetadata: [String: IndexedAffineMetadata] = [:],
-        tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata? = nil
+        indexedMetadata: [String: IndexedAffineMetadata] = [:]
     ) throws {
         let config = model.configuration
         self.embedScale = Float(config.hiddenSize).squareRoot()
@@ -763,64 +795,6 @@ final class Gemma4FastEngine {
 
         let loadedEmbedTokens = try module("model.embed_tokens", as: Embedding.self)
         self.embedTokens = loadedEmbedTokens
-        let tiedHeadRequested = ["1", "true", "yes", "on"].contains(
-            ProcessInfo.processInfo.environment["DARKBLOOM_TIED_HEAD_QMV"]?
-                .lowercased() ?? "0"
-        )
-        let verifyTiedHead = ["1", "true", "yes", "on"].contains(
-            ProcessInfo.processInfo.environment["DARKBLOOM_VERIFY_TIED_HEAD_BITS"]?
-                .lowercased() ?? "0"
-        )
-        let packed13Rollback: Bool
-        if let rawPacked13 = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_TIED_HEAD_PACKED13"
-        ]?.lowercased() {
-            switch rawPacked13 {
-            case "0", "false", "no", "off":
-                packed13Rollback = true
-            case "1", "true", "yes", "on":
-                packed13Rollback = false
-            default:
-                throw MLXFastError.invalidInput(
-                    "DARKBLOOM_TIED_HEAD_PACKED13 must be 0 or 1"
-                )
-            }
-        } else {
-            packed13Rollback = false
-        }
-        let productionTiedHead = isGemma4ProductionTiedVocabularyHead(
-            loadedEmbedTokens
-        )
-        self.usePacked13TiedVocabularyHead = productionTiedHead
-            && !packed13Rollback
-        self.verifyTiedVocabularyHead = verifyTiedHead
-        if productionTiedHead || tiedHeadRequested || verifyTiedHead {
-            guard let tiedVocabularyHead = Gemma4TiedVocabularyHead(
-                loadedEmbedTokens,
-                packed13Metadata: tiedHeadPacked13Metadata
-            ) else {
-                throw MLXFastError.invalidInput(
-                    "opt-in tied vocabulary head requires affine 4-bit "
-                        + "QuantizedEmbedding [262144, 672] with BF16 "
-                        + "scales and biases [262144, 84]"
-                )
-            }
-            guard !usePacked13TiedVocabularyHead
-                    || tiedVocabularyHead.packed13Metadata != nil
-            else {
-                throw MLXFastError.invalidInput(
-                    "default tied vocabulary packed13 head requires validated "
-                        + "transform-authored metadata"
-                )
-            }
-            self.tiedVocabularyHead = usePacked13TiedVocabularyHead
-                    || tiedHeadRequested
-                    || verifyTiedHead
-                ? tiedVocabularyHead
-                : nil
-        } else {
-            self.tiedVocabularyHead = nil
-        }
         let finalNorm = try module("model.norm", as: RMSNorm.self)
         self.finalNormWeight = finalNorm.weight
 
@@ -985,39 +959,7 @@ final class Gemma4FastEngine {
             hidden = gemma4LastTokenHidden(hidden)
             hidden = MLXFast.rmsNorm(hidden, weight: finalNormWeight, eps: eps)
         }
-        let cap = MLXArray(softcap)
-        if let tiedVocabularyHead, usePacked13TiedVocabularyHead {
-            let candidate = tiedVocabularyHead.packed13Softcapped(
-                hidden,
-                cap: cap
-            )
-            if verifyTiedVocabularyHead {
-                let stock = logitSoftcap(embedTokens.asLinear(hidden), cap)
-                tiedVocabularyHead.verifyRawFloat32(
-                    candidate,
-                    stock: stock,
-                    candidateName: "packed13 fused-softcap",
-                    stockName: "embedTokens.asLinear + compiled softcap"
-                )
-            }
-            return candidate
-        }
-
-        let logits: MLXArray
-        if let tiedVocabularyHead {
-            let candidate = tiedVocabularyHead(hidden)
-            if verifyTiedVocabularyHead {
-                tiedVocabularyHead.verifyRawBF16(
-                    candidate,
-                    stock: embedTokens.asLinear(hidden),
-                    candidateName: "stock-metadata custom",
-                    stockName: "embedTokens.asLinear"
-                )
-            }
-            logits = candidate
-        } else {
-            logits = embedTokens.asLinear(hidden)
-        }
-        return logitSoftcap(logits, cap)
+        let logits = embedTokens.asLinear(hidden)
+        return logitSoftcap(logits, MLXArray(softcap))
     }
 }
