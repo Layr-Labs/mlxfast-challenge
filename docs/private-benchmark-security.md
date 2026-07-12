@@ -328,5 +328,14 @@ The hardening above blocks direct extraction paths, but competition policy
 should still limit repeated private benchmark attempts and avoid exposing
 per-case failure details for hidden cases.
 
+The published ranking timings (`decode`/`prefill_seconds_per_token` and the
+speedups/score) are currently full-precision, which widens this channel:
+submitted code can drive data-dependent timing and read it back at high
+resolution. Coarsening them is a scoring-backend publishing decision (the
+harness must keep full precision internally to rank and to check the speedup
+floors), so it is written up as a recommendation rather than fixed in-repo —
+see
+[`docs/ranked-timing-covert-channel-recommendation.md`](ranked-timing-covert-channel-recommendation.md).
+
 No prompt manifest or generated correctness golden should be committed to
 the public repository.
