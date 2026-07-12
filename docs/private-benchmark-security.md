@@ -30,8 +30,13 @@ cancelling an in-flight measurement.
 The workflow is `workflow_dispatch`-only with no PR or push triggers (fork
 code must never reach a self-hosted runner), and it verifies at runtime
 (see `enforce-trusted-benchmark-workflow.sh`) that it runs in this
-repository via a `workflow_dispatch` event. It benchmarks whatever ref it
-is dispatched on.
+repository via a `workflow_dispatch` event, that the dispatched ref is in
+an explicitly permitted branch namespace — `main`, `submissions/*`
+(orchestrator-created submission branches), `baseline/*` (operator
+verification/measurement dispatches), or `yukon/baseline/*`
+(platform-authored baseline refs) — and that the executing workflow file
+is the dispatched ref's own. It benchmarks the permitted ref it is
+dispatched on.
 
 Because the workflow runs the dispatched ref's own workflow file, the real
 boundary is the combination of:
@@ -41,7 +46,11 @@ boundary is the combination of:
   their non-`editablePaths` files match `main`;
 - the `Enforce modifiable surface` step re-verifying at runtime that a
   `submissions/*` branch changes only `editablePaths` relative to `main`; and
-- restricting who can push `submissions/*` branches and dispatch the workflow.
+- restricting who can push `submissions/*` — and the operator/platform
+  `baseline/*` and `yukon/baseline/*` — branches and dispatch the workflow.
+  Non-submission refs run their exact dispatched SHA (including their own
+  workflow file), so creating them is a write-access-only, trusted-role
+  operation.
 
 ## Privilege rings and the bench-exec bridge
 
@@ -113,8 +122,16 @@ repository-wide or organization-wide secrets.
 
 Configure the `benchmark-private-prompts` Environment with:
 
-- Deployment branches limited to `main` and `submissions/*` (the refs the
-  benchmark orchestrator dispatches). Do not grant fork access.
+- Deployment branches limited to the same namespaces the runtime guard
+  (`enforce-trusted-benchmark-workflow.sh`) admits: `main`, `submissions/*`
+  (orchestrator-created submission branches), `baseline/*` (operator
+  verification/measurement dispatches), and `yukon/baseline/*`
+  (platform-authored baseline refs). Keep this policy and the guard script
+  in sync. Do not grant fork access. Pushing any of these refs and
+  dispatching the workflow both require write access to this repository —
+  contestants have neither, and submissions enter only through the
+  orchestrator — and required reviewers still gate each run's access to
+  the secrets.
 - Required reviewers for private benchmark runs.
 - R2 private-object credentials:
   - `R2_ACCESS_KEY_ID`
@@ -247,8 +264,10 @@ On `submissions/*` branches the workflow additionally:
 - suppresses submitted correctness/benchmark process logs, and
 - uploads artifacts only after validation succeeds.
 
-Maintainers can also dispatch the workflow on `main` (baseline) or a dev
-branch; those runs skip the submission-only guards.
+Maintainers can also dispatch the workflow on `main`, an operator
+`baseline/*` ref, or a platform-authored `yukon/baseline/*` ref; the
+trusted-context guard rejects every other namespace. Those runs execute
+their exact dispatched SHA and skip the submission-only guards.
 
 ## Output policy
 

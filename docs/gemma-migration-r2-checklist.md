@@ -51,7 +51,12 @@ verify them) were regenerated.
 - **Consumed by:** `.github/workflows/benchmark.yml` — "Attach GPQA gates
   and verify augmented golden" (`attach-gpqa-gates`), which drives the
   hidden GPQA behavior gates, the TTFT guardrail, and the semantic-GPQA
-  answer capture judged by `run-semantic-gpqa-gate.sh`.
+  answer capture judged by `run-semantic-gpqa-gate.sh`. The object carries
+  9 cases, but each ranked run attaches and judges only the first 5
+  token-budget-valid ones: `MLXFAST_GPQA_CASE_COUNT`,
+  `MLXFAST_SEMANTIC_GPQA_CASE_COUNT`, and `MLXFAST_GPQA_TTFT_CASE_COUNT`
+  are all `5` in `benchmark.yml`, so per-run "N/5" gate results are
+  consistent with the 9-case object.
 - **No hash pin:** the augmented golden's hash/bytes are computed at run
   time, so no workflow constant needs updating for this object itself.
 - **Semantic threshold — recalibrated (2026-07-09):** the semantic-GPQA
