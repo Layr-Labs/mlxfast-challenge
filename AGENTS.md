@@ -298,6 +298,20 @@ behaviors are expected, not bugs:
  and private oracle provisioned on the official runner and is not
  runnable locally — use `--local-iterate` for the edit loop and
  `--local-submit` as the pre-submit gate.
+- **One local run at a time; the memory guard is protecting your RAM.** The
+ ~17 GB RAM-resident text tower means two simultaneous model residencies
+ (an overlapping second local run, or a new run started while an orphaned
+ model-holding worker from an aborted run lingers) can out-of-memory a
+ 36 GB machine. Local modes therefore take a per-user run lock and refuse
+ to start while a model-holding mlxfast process is still alive, printing
+ the offending pid/rss/command list. Read that list before reacting: a
+ ppid of 1 is usually an orphan from an aborted run (verify, then
+ `kill <pid>`); a live ppid is usually a legitimately concurrent run
+ (wait for it). The guard warns and aborts -- it never kills anything
+ itself. Aborted local runs now reap their own worker on INT/TERM/EXIT
+ and the worker exits if its parent dies, so the guard should fire
+ rarely. `MLXFAST_LOCAL_RUN_GUARD=0` disables it (debugging only); the
+ ranked --official path is unaffected.
 - **One ranked machine, one queue.** Ranked runs execute serially on the
  single M5 runner: one job at a time by construction, and duplicate
  dispatches queue behind the in-flight run instead of cancelling it.

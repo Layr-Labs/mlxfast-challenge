@@ -404,6 +404,12 @@ fan_control_helper() {
 FAN_BOOST_STATE_FILE_OWNED=""
 FAN_BOOST_ABORT_HANDLED=0
 
+# PID of the in-flight `mlxfast-swift benchmark` child. Local modes launch it
+# as a monitored background child (see the invocation site) so the INT/TERM
+# abort handler and the EXIT cleanup can reap the model-holding process tree
+# instead of leaving a ~17 GB runtime worker behind on an aborted run.
+BENCHMARK_CHILD_PID=""
+
 fan_boost_recorded() {
   [[ -n "${MLXFAST_FAN_BOOST_STATE_FILE:-}" && -s "${MLXFAST_FAN_BOOST_STATE_FILE}" ]]
 }
@@ -423,14 +429,18 @@ setup_fan_boost_run_tracking() {
   if [[ -n "${MLXFAST_FAN_BOOST_STATE_FILE:-}" ]]; then
     return 0
   fi
+  # Install the abort handler before the state-file mktemp: the handler also
+  # reaps the in-flight benchmark child tree (see
+  # terminate_benchmark_child_tree), which must work even when fan-boost
+  # tracking could not be set up.
+  trap 'handle_benchmark_abort_signal INT' INT
+  trap 'handle_benchmark_abort_signal TERM' TERM
   if ! FAN_BOOST_STATE_FILE_OWNED="$(mktemp "${TMPDIR:-/tmp}/mlxfast-fan-boost-state.XXXXXX")"; then
     FAN_BOOST_STATE_FILE_OWNED=""
     echo "benchmark.sh: warning: could not create the fan-boost state file; an interrupted run will not auto-restore a fan boost" >&2
     return 0
   fi
   export MLXFAST_FAN_BOOST_STATE_FILE="${FAN_BOOST_STATE_FILE_OWNED}"
-  trap 'handle_benchmark_abort_signal INT' INT
-  trap 'handle_benchmark_abort_signal TERM' TERM
 }
 
 # Printed on the owner's EXIT path (success or failure alike, as long as no
@@ -452,11 +462,18 @@ benchmark.sh: restore macOS automatic fan control with: ./benchmark.sh --fan-spe
 EOF
 }
 
-# INT/TERM handler for the run that owns the boost state: an aborted run must
-# not leave the machine pinned at 70%, so ONLY IF this run applied a boost,
-# hand fan control back to macOS (the same helper path --fan-speed-normal
-# uses) before exiting. Exits with the conventional 128+signal status through
-# the normal EXIT cleanup trap; runs that never boosted just exit.
+# INT/TERM handler for the run that owns the abort traps. Two duties:
+# 1) Reap the in-flight benchmark process tree. Local modes run the Swift
+#    benchmark as a monitored background child (see the invocation site), and
+#    that child's runtime worker holds the ~17 GB model. An aborted run that
+#    leaves the worker behind makes the NEXT run load a second copy of the
+#    model and can out-of-memory the machine, so the tree is torn down here
+#    on every abort.
+# 2) Fan restore: an aborted run must not leave the machine pinned at 70%,
+#    so ONLY IF this run applied a boost, hand fan control back to macOS
+#    (the same helper path --fan-speed-normal uses) before exiting.
+# Exits with the conventional 128+signal status through the normal EXIT
+# cleanup trap; runs that never boosted just reap and exit.
 handle_benchmark_abort_signal() {
   local signal_name="$1"
   local exit_status=130
@@ -464,6 +481,7 @@ handle_benchmark_abort_signal() {
     exit_status=143
   fi
   FAN_BOOST_ABORT_HANDLED=1
+  terminate_benchmark_child_tree
   if [[ -n "${FAN_BOOST_STATE_FILE_OWNED}" ]] && fan_boost_recorded; then
     local helper
     helper="$(fan_control_helper)"
@@ -476,6 +494,192 @@ handle_benchmark_abort_signal() {
     fi
   fi
   exit "${exit_status}"
+}
+
+# --- Local run memory guard and worker teardown --------------------------------
+# The Gemma 4 31B text tower is ~17 GB and RAM-resident: in the default
+# configuration it lives inside the `mlxfast-swift runtime-worker` subprocess
+# a run spawns (with MLXFAST_USE_RUNTIME_WORKER=0 it lives in the
+# `mlxfast-swift benchmark` process itself). ONE resident copy fits a 36 GB
+# machine; TWO do not. Two copies happen when local runs overlap, or when a
+# new run starts while an orphaned model-holding process from a previous
+# aborted run is still alive. Local modes therefore:
+#   1. take a per-user run lock so two local runs cannot overlap
+#      (acquire_local_run_lock), with stale-lock reclaim when the recorded
+#      holder pid is gone;
+#   2. refuse to start while a model-holding mlxfast process is already
+#      running (abort_if_model_already_resident) -- WARN-AND-ABORT only,
+#      never auto-kill: benchmark.sh cannot prove a detected process is a
+#      dead run's orphan rather than someone's legitimate concurrent work;
+#   3. reap the spawned benchmark process tree (the Swift benchmark child
+#      and its runtime worker) on INT/TERM and on EXIT
+#      (terminate_benchmark_child_tree), so an interrupted edit-loop run
+#      cannot orphan a 17 GB process in the first place.
+# Local modes only: the ranked --official path is operator-supervised and is
+# not touched by any of this.
+#
+# Knobs (local debugging/testing only):
+#   MLXFAST_LOCAL_RUN_GUARD=0        disable the lock and the resident scan
+#   MLXFAST_LOCAL_RUN_LOCK_DIR=...   lock parent directory (default TMPDIR)
+#   MLXFAST_LOCAL_ORPHAN_SCAN_CMD=.. testing seam: shell command whose stdout
+#                                    replaces the pgrep/ps resident-process
+#                                    listing (empty output = nothing found)
+LOCAL_RUN_LOCK_OWNED=""
+# Matches the argv of every mlxfast process that holds (or is loading) the
+# model: the runtime worker in any wrapping (bare or under sandbox-exec), and
+# the in-process model-holding CLI subcommands used when the worker is
+# disabled or by golden-generation tooling.
+readonly RESIDENT_MODEL_PROCESS_PATTERN='runtime-worker[[:space:]]+--weights|mlxfast-swift[[:space:]]+(benchmark|correctness|correctness-trace|generate-golden|generate-gpqa-answers|attach-free-run-gate)'
+
+local_run_guard_enabled() {
+  [[ "${MLXFAST_LOCAL_RUN_GUARD:-1}" != "0" ]] || return 1
+  [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ]]
+}
+
+local_run_lock_path() {
+  local lock_root="${MLXFAST_LOCAL_RUN_LOCK_DIR:-${TMPDIR:-/tmp}}"
+  printf '%s/mlxfast-local-benchmark-%s.lock\n' "${lock_root%/}" "$(id -u)"
+}
+
+# mkdir-based mutual exclusion between local benchmark runs of the same user.
+# The lock directory records the holder's pid; a lock whose holder is no
+# longer alive (a killed run never runs its EXIT cleanup) is reclaimed
+# instead of wedging the edit loop forever.
+acquire_local_run_lock() {
+  local_run_guard_enabled || return 0
+  local lock_path holder_pid
+  lock_path="$(local_run_lock_path)"
+  for _ in 1 2; do
+    if mkdir "${lock_path}" 2>/dev/null; then
+      printf '%s\n' "$$" > "${lock_path}/pid" 2>/dev/null || true
+      LOCAL_RUN_LOCK_OWNED="${lock_path}"
+      return 0
+    fi
+    holder_pid="$(cat "${lock_path}/pid" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ -z "${holder_pid}" ]]; then
+      # The holder may be between mkdir and writing its pid; give it a moment
+      # before treating the empty lock as debris from a killed run.
+      sleep 0.2
+      holder_pid="$(cat "${lock_path}/pid" 2>/dev/null | tr -d '[:space:]' || true)"
+    fi
+    if [[ "${holder_pid}" =~ ^[0-9]+$ ]] && ps -p "${holder_pid}" >/dev/null 2>&1; then
+      cat >&2 <<EOF
+benchmark.sh: ERROR: another local benchmark run (pid ${holder_pid}) already holds ${lock_path}.
+benchmark.sh: two overlapping local runs would hold two ~17 GB copies of the model, which can
+benchmark.sh: out-of-memory this machine (and they would share one GPU, invalidating both timings).
+benchmark.sh: wait for that run to finish and rerun. If pid ${holder_pid} is not a benchmark run,
+benchmark.sh: remove the stale lock with: rm -rf "${lock_path}"
+benchmark.sh: (MLXFAST_LOCAL_RUN_GUARD=0 skips this guard; not recommended.)
+EOF
+      exit 1
+    fi
+    echo "benchmark.sh: removing stale local run lock ${lock_path} (holder pid ${holder_pid:-unknown} is gone)" >&2
+    rm -rf "${lock_path}"
+  done
+  echo "benchmark.sh: ERROR: could not acquire the local run lock at ${lock_path}; another local run is starting concurrently -- wait for it and rerun" >&2
+  exit 1
+}
+
+release_local_run_lock() {
+  if [[ -n "${LOCAL_RUN_LOCK_OWNED}" ]]; then
+    rm -rf "${LOCAL_RUN_LOCK_OWNED}" || true
+    LOCAL_RUN_LOCK_OWNED=""
+  fi
+}
+
+# Prints one `pid ppid rss command` line per same-user process whose argv
+# matches RESIDENT_MODEL_PROCESS_PATTERN (excluding this shell and its
+# parent). Empty output means no resident model holder was found. NOTE:
+# pgrep exits non-zero when nothing matches -- the expected case -- so its
+# output is captured with `|| true` rather than piped, or `set -o pipefail`
+# would abort the run exactly when the machine is clean.
+list_resident_model_processes() {
+  if [[ -n "${MLXFAST_LOCAL_ORPHAN_SCAN_CMD:-}" ]]; then
+    bash -c "${MLXFAST_LOCAL_ORPHAN_SCAN_CMD}" 2>/dev/null || true
+    return 0
+  fi
+  if ! command -v pgrep >/dev/null 2>&1; then
+    return 0
+  fi
+  local matched_pids matched_pid
+  matched_pids="$(pgrep -U "$(id -u)" -f -- "${RESIDENT_MODEL_PROCESS_PATTERN}" 2>/dev/null || true)"
+  if [[ -z "${matched_pids}" ]]; then
+    return 0
+  fi
+  while IFS= read -r matched_pid; do
+    if [[ -z "${matched_pid}" || "${matched_pid}" == "$$" || "${matched_pid}" == "${PPID:-}" ]]; then
+      continue
+    fi
+    ps -o pid=,ppid=,rss=,command= -p "${matched_pid}" 2>/dev/null || true
+  done <<< "${matched_pids}"
+  return 0
+}
+
+abort_if_model_already_resident() {
+  local_run_guard_enabled || return 0
+  local resident
+  resident="$(list_resident_model_processes)"
+  if [[ -z "${resident}" ]]; then
+    return 0
+  fi
+  {
+    echo "benchmark.sh: ERROR: a model-holding mlxfast process is already running (pid ppid rss_kb command):"
+    printf '%s\n' "${resident}" | sed 's/^/benchmark.sh:   /'
+    cat <<EOF
+benchmark.sh: the Gemma model is ~17 GB RAM-resident per process; starting another local run
+benchmark.sh: now would load a second copy and can out-of-memory this machine.
+benchmark.sh: - a ppid of 1 usually means an orphan left by a previous aborted run: verify with
+benchmark.sh:   'ps -p <pid> -o pid,ppid,rss,command' and stop it with 'kill <pid>'.
+benchmark.sh: - a live ppid usually means another run is legitimately in flight: wait for it.
+benchmark.sh: rerun once nothing matching the list above is running.
+benchmark.sh: (MLXFAST_LOCAL_RUN_GUARD=0 skips this check; risky on <36 GB machines.)
+EOF
+  } >&2
+  exit 1
+}
+
+# Depth-first TERM/KILL of a process and its descendants, children first so a
+# reparented-to-launchd worker cannot slip through between enumerating and
+# signaling its parent. Runs from the INT/TERM trap under `set -euo
+# pipefail`, so every probe that legitimately "fails" (pgrep finds no
+# children for a leaf, the pid already exited) is captured with `|| true` --
+# an errexit abort here would skip the kills it exists to deliver.
+signal_process_tree() {
+  local root_pid="$1"
+  local signal="$2"
+  local child_pids child_pid
+  child_pids="$(pgrep -P "${root_pid}" 2>/dev/null || true)"
+  if [[ -n "${child_pids}" ]]; then
+    while IFS= read -r child_pid; do
+      if [[ -n "${child_pid}" ]]; then
+        signal_process_tree "${child_pid}" "${signal}"
+      fi
+    done <<< "${child_pids}"
+  fi
+  kill -s "${signal}" "${root_pid}" 2>/dev/null || true
+  return 0
+}
+
+# Reaps the monitored Swift benchmark child and everything under it (the
+# sandbox wrapper and the model-holding runtime worker). TERM first with a
+# ~2 s grace, then KILL. No-op when no child is in flight or it already
+# exited. Called from the INT/TERM abort handler and, last-resort, from the
+# EXIT cleanup.
+terminate_benchmark_child_tree() {
+  local child_pid="${BENCHMARK_CHILD_PID}"
+  [[ -n "${child_pid}" ]] || return 0
+  BENCHMARK_CHILD_PID=""
+  kill -0 "${child_pid}" 2>/dev/null || return 0
+  echo "benchmark.sh: stopping the in-flight benchmark process tree (pid ${child_pid}) so no model-holding worker stays resident" >&2
+  signal_process_tree "${child_pid}" TERM
+  local waited_deciseconds=0
+  while kill -0 "${child_pid}" 2>/dev/null && [[ "${waited_deciseconds}" -lt 20 ]]; do
+    sleep 0.1
+    waited_deciseconds=$((waited_deciseconds + 1))
+  done
+  if kill -0 "${child_pid}" 2>/dev/null; then
+    signal_process_tree "${child_pid}" KILL
+  fi
 }
 
 # One-time, opt-in fan boost for a stalled cool-down. Interactive only: the
@@ -877,6 +1081,12 @@ VERIFY_TRANSFORM_TMP_PARENT_OWNED=""
 score_stdout=""
 cleanup_benchmark_temporaries() {
   local status="$?"
+  # Last-resort reap of the monitored benchmark child tree (normally already
+  # empty: the invocation site clears it after wait, and the INT/TERM abort
+  # handler reaps it first on aborts). Runs before anything else so a
+  # model-holding worker is never left behind by an unexpected exit path.
+  terminate_benchmark_child_tree
+  release_local_run_lock
   # A completed run that boosted the fans ends with the restore reminder
   # (no-op for runs that never boosted or that already restored on abort).
   report_fan_boost_restore_reminder
@@ -1399,6 +1609,12 @@ if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ]]; then
   # forced through the timed phases) or restores automatic control on
   # INT/TERM so an aborted run is not left pinned at 70%.
   setup_fan_boost_run_tracking
+  # Memory guard for the ~17 GB RAM-resident model (local modes only, before
+  # any transform/model work): serialize local runs behind a per-user lock,
+  # then refuse to start while a model-holding process from a previous or
+  # parallel run is still alive. See the guard section above for the policy.
+  acquire_local_run_lock
+  abort_if_model_already_resident
 fi
 
 safe_clear_directory_path "${WEIGHTS_PATH}" "weights path" "${REFERENCE_PATH}" >/dev/null || exit 1
@@ -1481,11 +1697,36 @@ score_stdout="$(mktemp "${TMPDIR:-/tmp}/mlxfast-score.XXXXXX")"
 
 report_local_baseline_context
 
-"${SWIFT_BIN}" benchmark \
-  --weights "${WEIGHTS_PATH}" \
-  --golden "${GOLDEN_PATH}" \
-  --score-path "${SCORE_PATH}" \
-  ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"} > "${score_stdout}"
+if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ]]; then
+  # Local modes run the Swift benchmark as a monitored background child and
+  # wait on it, for two reasons a foreground child cannot provide:
+  # 1. bash defers trap handlers until a foreground command completes, so a
+  #    plain `kill` of an in-flight local run used to be silently ignored
+  #    until the whole run finished on its own;
+  # 2. on INT/TERM the abort handler must reap the model-holding process tree
+  #    (the Swift benchmark and its ~17 GB runtime worker) so an aborted
+  #    edit-loop run cannot orphan a resident model and out-of-memory the
+  #    next run. The ranked --official invocation below keeps its original
+  #    foreground semantics, unchanged.
+  "${SWIFT_BIN}" benchmark \
+    --weights "${WEIGHTS_PATH}" \
+    --golden "${GOLDEN_PATH}" \
+    --score-path "${SCORE_PATH}" \
+    ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"} > "${score_stdout}" &
+  BENCHMARK_CHILD_PID="$!"
+  benchmark_status=0
+  wait "${BENCHMARK_CHILD_PID}" || benchmark_status="$?"
+  BENCHMARK_CHILD_PID=""
+  if [[ "${benchmark_status}" != "0" ]]; then
+    exit "${benchmark_status}"
+  fi
+else
+  "${SWIFT_BIN}" benchmark \
+    --weights "${WEIGHTS_PATH}" \
+    --golden "${GOLDEN_PATH}" \
+    --score-path "${SCORE_PATH}" \
+    ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"} > "${score_stdout}"
+fi
 
 # Require exactly one JSON object shaped like a score payload; empty, non-JSON,
 # or multiple concatenated objects (an injected extra write) fail closed rather

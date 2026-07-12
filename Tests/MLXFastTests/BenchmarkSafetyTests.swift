@@ -1307,6 +1307,9 @@ private func runBenchmarkScript(
     process.environment = ProcessInfo.processInfo.environment.merging([
         "MLXFAST_NO_SANDBOX": "1",
         "MLXFAST_LOCAL_COOL_GATE": "0",
+        // Parallel tests must not contend on the per-user local run lock or
+        // abort on a genuinely resident model on the host machine.
+        "MLXFAST_LOCAL_RUN_GUARD": "0",
         "MLXFAST_SWIFT_BIN": fixture.swift.path,
         "MLXFAST_MLX_METALLIB": fixture.metallib.path,
         "MLXFAST_WEIGHTS_PATH": fixture.weights.path,

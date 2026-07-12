@@ -2769,6 +2769,309 @@ func benchmarkRestoresFansWhenAbortedAfterBoost() throws {
     #expect(helperInvocations.contains("normal"))
 }
 
+// The ~17 GB RAM-resident model means TWO simultaneous residencies (an
+// overlapping second local run, or a new run started while an orphaned
+// model-holding worker from an aborted run lingers) can out-of-memory a
+// 36 GB machine. Local modes must therefore (1) serialize runs behind a
+// per-user lock, (2) refuse to start while a model-holding process is
+// already alive -- warn-and-abort, never auto-kill -- and (3) reap the
+// spawned benchmark process tree on INT/TERM/EXIT so aborted runs cannot
+// orphan the worker in the first place. All of it is scoped to local modes;
+// the ranked --official invocation stays byte-identical foreground.
+@Test
+func localModesGuardAgainstDoubleModelResidency() throws {
+    let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+
+    // Startup guard: per-user run lock with stale-holder reclaim, plus a
+    // resident-model process scan with a documented testing seam.
+    #expect(script.contains("local_run_guard_enabled() {"))
+    #expect(script.contains("acquire_local_run_lock() {"))
+    #expect(script.contains("release_local_run_lock() {"))
+    #expect(script.contains("abort_if_model_already_resident() {"))
+    #expect(script.contains("list_resident_model_processes() {"))
+    #expect(script.contains("readonly RESIDENT_MODEL_PROCESS_PATTERN="))
+    #expect(script.contains("runtime-worker[[:space:]]+--weights"))
+    #expect(script.contains("MLXFAST_LOCAL_RUN_GUARD"))
+    #expect(script.contains("MLXFAST_LOCAL_RUN_LOCK_DIR"))
+    #expect(script.contains("MLXFAST_LOCAL_ORPHAN_SCAN_CMD"))
+    #expect(script.contains("removing stale local run lock"))
+    // Conservative policy: detection warns and aborts with instructions; the
+    // script must never kill a process it did not spawn.
+    #expect(script.contains("WARN-AND-ABORT only"))
+    #expect(script.contains("never auto-kill"))
+    // Wired into the local-mode setup block (after fan tracking), so the
+    // ranked --official path never runs the guard.
+    #expect(script.contains("acquire_local_run_lock\n  abort_if_model_already_resident"))
+    let guardScope = try #require(script.range(of: "local_run_guard_enabled() {"))
+    let guardScopeBody = String(script[guardScope.lowerBound...].prefix(220))
+    #expect(guardScopeBody.contains("LOCAL_ITERATE"))
+    #expect(guardScopeBody.contains("LOCAL_SUBMIT"))
+
+    // Guaranteed teardown: local modes run the Swift benchmark as a monitored
+    // background child; INT/TERM reap the tree before the fan restore, and
+    // the EXIT cleanup reaps last-resort and releases the lock.
+    #expect(script.contains("signal_process_tree() {"))
+    #expect(script.contains("terminate_benchmark_child_tree() {"))
+    #expect(script.contains("BENCHMARK_CHILD_PID=\"$!\""))
+    #expect(script.contains("wait \"${BENCHMARK_CHILD_PID}\""))
+    #expect(script.contains("FAN_BOOST_ABORT_HANDLED=1\n  terminate_benchmark_child_tree"))
+    #expect(script.contains("terminate_benchmark_child_tree\n  release_local_run_lock"))
+
+    // The monitored-background-child launch exists only on the local branch;
+    // the official path keeps the original foreground invocation.
+    let localLaunch = try #require(
+        script.range(of: "${FORWARD_ARGS[@]+\"${FORWARD_ARGS[@]}\"} > \"${score_stdout}\" &")
+    )
+    let officialLaunch = try #require(
+        script.range(
+            of: "${FORWARD_ARGS[@]+\"${FORWARD_ARGS[@]}\"} > \"${score_stdout}\"\nfi"
+        )
+    )
+    #expect(localLaunch.lowerBound < officialLaunch.lowerBound)
+}
+
+@Test
+func localRunLockRejectsOverlappingRunAndReclaimsStaleLock() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "{}".write(
+        to: weights.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+    let lockRoot = root.appendingPathComponent("locks")
+    try FileManager.default.createDirectory(at: lockRoot, withIntermediateDirectories: true)
+    let lockPath = lockRoot.appendingPathComponent("mlxfast-local-benchmark-\(getuid()).lock")
+
+    let invocation = root.appendingPathComponent("swift-invoked")
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    : > "\(invocation.path)"
+    cat <<'JSON'
+    {
+      "score": null,
+      "passed": true,
+      "metrics": {
+        "weights_hash": "fake-weights",
+        "weights_file_count": 1,
+        "weights_byte_count": 2
+      }
+    }
+    JSON
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeSwift.path
+    )
+
+    func runLocalIterate() throws -> (status: Int32, stderr: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = ["benchmark.sh", "--local-iterate"]
+        process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        process.environment = benchmarkTestEnvironment([
+            "MLXFAST_NO_SANDBOX": "1",
+            "MLXFAST_SKIP_TRANSFORM": "1",
+            "MLXFAST_SWIFT_BIN": fakeSwift.path,
+            "MLXFAST_WEIGHTS_PATH": weights.path,
+            "MLXFAST_SCORE_PATH": root.appendingPathComponent("score.json").path,
+            "MLXFAST_INTEGRITY_PATH": root.appendingPathComponent("integrity.json").path,
+            "MLXFAST_LOCAL_RUN_GUARD": "1",
+            "MLXFAST_LOCAL_RUN_LOCK_DIR": lockRoot.path,
+            // The resident scan is exercised by its own test; keep this one
+            // about the lock alone.
+            "MLXFAST_LOCAL_ORPHAN_SCAN_CMD": "true",
+        ])
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+        try process.run()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(data: stderrData, encoding: .utf8) ?? "")
+    }
+
+    // A lock held by a LIVE pid (this test process) rejects the overlapping
+    // run before any benchmark work starts.
+    try FileManager.default.createDirectory(at: lockPath, withIntermediateDirectories: true)
+    try "\(ProcessInfo.processInfo.processIdentifier)\n".write(
+        to: lockPath.appendingPathComponent("pid"),
+        atomically: true,
+        encoding: .utf8
+    )
+    let rejected = try runLocalIterate()
+    #expect(rejected.status != 0)
+    #expect(rejected.stderr.contains("another local benchmark run (pid"))
+    #expect(rejected.stderr.contains("two overlapping local runs"))
+    #expect(!FileManager.default.fileExists(atPath: invocation.path))
+
+    // A lock whose recorded holder is gone (a killed run never cleans up) is
+    // reclaimed instead of wedging the edit loop; the run then completes and
+    // the EXIT cleanup removes the lock again.
+    try "999999\n".write(
+        to: lockPath.appendingPathComponent("pid"),
+        atomically: true,
+        encoding: .utf8
+    )
+    let reclaimed = try runLocalIterate()
+    #expect(reclaimed.status == 0)
+    #expect(reclaimed.stderr.contains("removing stale local run lock"))
+    #expect(FileManager.default.fileExists(atPath: invocation.path))
+    #expect(!FileManager.default.fileExists(atPath: lockPath.path))
+}
+
+@Test
+func localRunAbortsWhenAModelHoldingProcessIsAlreadyResident() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "{}".write(
+        to: weights.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+    let lockRoot = root.appendingPathComponent("locks")
+    try FileManager.default.createDirectory(at: lockRoot, withIntermediateDirectories: true)
+
+    let invocation = root.appendingPathComponent("swift-invoked")
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    : > "\(invocation.path)"
+    exit 0
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeSwift.path
+    )
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = ["benchmark.sh", "--local-iterate"]
+    process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    process.environment = benchmarkTestEnvironment([
+        "MLXFAST_NO_SANDBOX": "1",
+        "MLXFAST_SKIP_TRANSFORM": "1",
+        "MLXFAST_SWIFT_BIN": fakeSwift.path,
+        "MLXFAST_WEIGHTS_PATH": weights.path,
+        "MLXFAST_SCORE_PATH": root.appendingPathComponent("score.json").path,
+        "MLXFAST_INTEGRITY_PATH": root.appendingPathComponent("integrity.json").path,
+        "MLXFAST_LOCAL_RUN_GUARD": "1",
+        "MLXFAST_LOCAL_RUN_LOCK_DIR": lockRoot.path,
+        // Testing seam (same pattern as MLXFAST_GPU_TEMP_CMD): stand in for
+        // the pgrep/ps listing with one fake resident worker line.
+        "MLXFAST_LOCAL_ORPHAN_SCAN_CMD":
+            "printf '12345 1 17301504 mlxfast-swift runtime-worker --weights weights\\n'",
+    ])
+    let stderrPipe = Pipe()
+    process.standardError = stderrPipe
+    try process.run()
+    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    let stderr = String(data: stderrData, encoding: .utf8) ?? ""
+
+    #expect(process.terminationStatus != 0)
+    #expect(stderr.contains("a model-holding mlxfast process is already running"))
+    #expect(stderr.contains("mlxfast-swift runtime-worker --weights weights"))
+    #expect(stderr.contains("kill <pid>"))
+    #expect(stderr.contains("MLXFAST_LOCAL_RUN_GUARD=0"))
+    // The guard fires before any benchmark work: the Swift binary never ran,
+    // and the aborted run released its lock for the next attempt.
+    #expect(!FileManager.default.fileExists(atPath: invocation.path))
+    let lockPath = lockRoot.appendingPathComponent("mlxfast-local-benchmark-\(getuid()).lock")
+    #expect(!FileManager.default.fileExists(atPath: lockPath.path))
+}
+
+@Test
+func terminatedLocalRunReapsTheModelHoldingProcessTree() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "{}".write(
+        to: weights.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    // The fake benchmark stands in for `mlxfast-swift benchmark`: it spawns a
+    // long-lived child (the stand-in for the ~17 GB runtime worker), records
+    // both pids, then idles like a real run mid-measurement.
+    let workerPidFile = root.appendingPathComponent("worker.pid")
+    let marker = root.appendingPathComponent("benchmark-running.marker")
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    /bin/sh -c 'echo $$ > "\(workerPidFile.path)"; exec sleep 300' &
+    : > "\(marker.path)"
+    sleep 300
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeSwift.path
+    )
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = ["benchmark.sh", "--local-iterate"]
+    process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    process.environment = benchmarkTestEnvironment([
+        "MLXFAST_NO_SANDBOX": "1",
+        "MLXFAST_SKIP_TRANSFORM": "1",
+        "MLXFAST_SWIFT_BIN": fakeSwift.path,
+        "MLXFAST_WEIGHTS_PATH": weights.path,
+        "MLXFAST_SCORE_PATH": root.appendingPathComponent("score.json").path,
+        "MLXFAST_INTEGRITY_PATH": root.appendingPathComponent("integrity.json").path,
+    ])
+    let stderrPipe = Pipe()
+    process.standardError = stderrPipe
+    try process.run()
+
+    var workerPid: Int32 = 0
+    for _ in 0..<100 {
+        if FileManager.default.fileExists(atPath: marker.path),
+           let recorded = try? String(contentsOf: workerPidFile, encoding: .utf8),
+           let parsed = Int32(recorded.trimmingCharacters(in: .whitespacesAndNewlines))
+        {
+            workerPid = parsed
+            break
+        }
+        usleep(100_000)
+    }
+    #expect(workerPid > 0)
+    defer {
+        // Never leave the fixture behind if an assertion fails mid-test.
+        if workerPid > 0 { _ = kill(workerPid, SIGKILL) }
+    }
+
+    // TERM only the top-level benchmark.sh -- exactly what an agent or
+    // process manager does to abort a run. Before the teardown fix, bash
+    // deferred the trap until the foreground Swift child finished and the
+    // worker stand-in survived as an orphan.
+    process.terminate()
+    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    let stderr = String(data: stderrData, encoding: .utf8) ?? ""
+
+    #expect(process.terminationStatus == 143)
+    #expect(stderr.contains("stopping the in-flight benchmark process tree"))
+    var workerReaped = false
+    for _ in 0..<100 {
+        if kill(workerPid, 0) != 0 {
+            workerReaped = true
+            break
+        }
+        usleep(100_000)
+    }
+    #expect(workerReaped)
+}
+
 @Test
 func benchmarkScriptPrintsLocalSummaryWithBaselineComparison() throws {
     let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
@@ -2778,7 +3081,9 @@ func benchmarkScriptPrintsLocalSummaryWithBaselineComparison() throws {
     // thermal helper, and the harness invokes it at each timed phase boundary.
     #expect(script.contains("report_local_baseline_context() {"))
     #expect(script.contains("export MLXFAST_LOCAL_COOL_GATE_HELPER"))
-    #expect(script.contains("report_local_baseline_context\n\n\"${SWIFT_BIN}\" benchmark"))
+    let baselineContext = try #require(script.range(of: "\nreport_local_baseline_context\n"))
+    let swiftInvocation = try #require(script.range(of: "\"${SWIFT_BIN}\" benchmark \\"))
+    #expect(baselineContext.lowerBound < swiftInvocation.lowerBound)
 
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -3958,5 +4263,10 @@ private func benchmarkTestEnvironment(
     }
     environment["MLXFAST_GPU_TEMP_CMD"] = "printf 39"
     environment["MLXFAST_MLX_METALLIB"] = benchmarkTestMetallibPath
+    // Tests run in parallel and would contend on the real per-user local run
+    // lock (and a genuinely resident model on the host would abort unrelated
+    // tests), so the local memory guard defaults OFF here; guard-specific
+    // tests re-enable it with their own lock dir / scan seam.
+    environment["MLXFAST_LOCAL_RUN_GUARD"] = "0"
     return environment.merging(overrides) { _, new in new }
 }

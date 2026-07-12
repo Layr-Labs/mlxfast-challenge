@@ -9,6 +9,14 @@ import MLXFastModel
 
 extension GemmaRuntime {
     public static func runWorker(weightsPath: String) throws {
+        // The worker holds the ~17 GB model for its whole lifetime, so it must
+        // never outlive the harness parent that spawned it. Reading protocol
+        // stdin already ends the worker on parent death (pipe EOF), but only
+        // while the worker is blocked reading -- NOT during the minutes-long
+        // model load below, or while a forward is in flight. Start the orphan
+        // self-reaper first so a parent that dies during those windows cannot
+        // leave a resident-model orphan that out-of-memories the next run.
+        startRuntimeWorkerOrphanReaper()
         // Move the protocol away from fd 0/1 before any editable model code
         // runs. Startup validation and model construction may log or otherwise
         // use standard I/O; none of that may be confused with protocol traffic.
@@ -72,6 +80,48 @@ extension GemmaRuntime {
             let data = try encoder.encode(response)
             try protocolIO.writeLine(data)
         }
+    }
+
+    /// Poll interval for the worker's orphan self-reaper. Coarse on purpose:
+    /// the check is two syscalls, and a couple of seconds of residual
+    /// residency after a dead parent is harmless.
+    static let runtimeWorkerOrphanPollSeconds = 2.0
+
+    /// Background self-reaper: exit the worker promptly once the spawning
+    /// parent is gone, instead of relying solely on protocol-stdin EOF (which
+    /// the worker only observes while blocked reading between requests).
+    ///
+    /// The worker is always spawned by the harness's RuntimeWorkerClient, so
+    /// on macOS its parent dying re-parents it to launchd and `getppid()`
+    /// becomes 1 -- an unambiguous "the harness that owns me is dead" signal
+    /// that cannot fire in any healthy run (local or ranked). Exiting frees
+    /// the ~17 GB model residency so the next run cannot double-load into an
+    /// out-of-memory. The seams exist for tests only; production callers use
+    /// the defaults.
+    @discardableResult
+    static func startRuntimeWorkerOrphanReaper(
+        pollIntervalSeconds: Double = GemmaRuntime.runtimeWorkerOrphanPollSeconds,
+        isOrphaned: @escaping () -> Bool = { getppid() == 1 },
+        onOrphaned: @escaping () -> Void = {
+            fputs(
+                "mlxfast-swift: runtime worker parent exited; shutting down to release model memory\n",
+                stderr
+            )
+            exit(1)
+        }
+    ) -> Thread {
+        let thread = Thread {
+            while !Thread.current.isCancelled {
+                if isOrphaned() {
+                    onOrphaned()
+                    return
+                }
+                Thread.sleep(forTimeInterval: pollIntervalSeconds)
+            }
+        }
+        thread.name = "mlxfast.worker-orphan-reaper"
+        thread.start()
+        return thread
     }
 
     /// Trusted allocator state applied at the START of every new worker forward

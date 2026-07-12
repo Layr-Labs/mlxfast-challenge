@@ -1336,10 +1336,15 @@ func bufferedFileLineReaderRejectsOversizedLine() throws {
 
 @Test
 func runtimeWorkerClientTimesOutWaitingForHello() throws {
+    // The fixture ignores TERM to force the client's SIGKILL escalation, but
+    // it must NOT live forever: an interrupted test run cannot reap it, and
+    // unbounded `while :; do :; done` fixtures have been observed lingering
+    // as ppid-1 orphans burning a CPU core for days. Sleep-loop for a
+    // bounded lifetime instead (worst case ~2 minutes if orphaned).
     let executable = try makeRuntimeWorkerScript("""
     #!/bin/sh
     trap '' TERM
-    while :; do :; done
+    \(boundedFixtureIdleLoop)
     """)
     defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
     let start = Date()
@@ -1402,12 +1407,14 @@ func runtimeWorkerClientCancelsSuccessfulRequestWatchdogs() throws {
 
 @Test
 func runtimeWorkerClientTimesOutStalledRequest() throws {
+    // Bounded stall (see runtimeWorkerClientTimesOutWaitingForHello): the
+    // client SIGKILLs it within the test, and an orphaned copy self-expires.
     let executable = try makeRuntimeWorkerScript("""
     #!/bin/sh
     trap '' TERM
     printf '%s\\n' '{"id":0,"nonce":"test-nonce","ok":true}'
     IFS= read -r request || exit 0
-    while :; do :; done
+    \(boundedFixtureIdleLoop)
     """)
     defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
     let client = try RuntimeWorkerClient(
@@ -1434,11 +1441,13 @@ func runtimeWorkerClientTimesOutStalledRequest() throws {
 
 @Test
 func runtimeWorkerClientCloseEscalatesPastIgnoredTerminate() throws {
+    // Bounded stall (see runtimeWorkerClientTimesOutWaitingForHello): the
+    // client SIGKILLs it within the test, and an orphaned copy self-expires.
     let executable = try makeRuntimeWorkerScript("""
     #!/bin/sh
     trap '' TERM
     printf '%s\\n' '{"id":0,"nonce":"test-nonce","ok":true}'
-    while :; do :; done
+    \(boundedFixtureIdleLoop)
     """)
     defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
     let client = try RuntimeWorkerClient(
@@ -1487,6 +1496,52 @@ func runtimeWorkerClientRejectsNonfiniteTimeoutsBeforeLaunch() throws {
     #expect(throws: MLXFastError.self) {
         _ = try RuntimeWorkerClient(options: options, weightsPath: "/does/not/exist")
     }
+}
+
+// The worker's orphan self-reaper is what frees the ~17 GB model residency
+// when the harness parent dies while the worker is NOT blocked on protocol
+// stdin (most importantly during the minutes-long model load): stdin EOF is
+// never observed there, so without the reaper the orphan keeps the model
+// resident and the next local run double-loads into an out-of-memory.
+@Test
+func runtimeWorkerOrphanReaperFiresOnceTheParentIsGone() {
+    let fired = DispatchSemaphore(value: 0)
+    let thread = GemmaRuntime.startRuntimeWorkerOrphanReaper(
+        pollIntervalSeconds: 0.01,
+        isOrphaned: { true },
+        onOrphaned: { fired.signal() }
+    )
+    defer { thread.cancel() }
+    #expect(fired.wait(timeout: .now() + 2) == .success)
+}
+
+@Test
+func runtimeWorkerOrphanReaperStaysQuietWhileTheParentIsAlive() {
+    let fired = DispatchSemaphore(value: 0)
+    let thread = GemmaRuntime.startRuntimeWorkerOrphanReaper(
+        pollIntervalSeconds: 0.01,
+        isOrphaned: { false },
+        onOrphaned: { fired.signal() }
+    )
+    defer { thread.cancel() }
+    #expect(fired.wait(timeout: .now() + 0.3) == .timedOut)
+}
+
+@Test
+func runtimeWorkerStartsTheOrphanReaperBeforeLoadingTheModel() throws {
+    // Source-level guard: runWorker must arm the reaper BEFORE any of the
+    // model-loading work, or the load window (the exact window stdin-EOF
+    // cannot cover) is left unprotected.
+    let worker = try String(
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeWorker.swift",
+        encoding: .utf8
+    )
+    let reaperCall = try #require(worker.range(of: "startRuntimeWorkerOrphanReaper()"))
+    let protocolIO = try #require(worker.range(of: "RuntimeWorkerProtocolIO.isolatingStandardIO()"))
+    let weightCache = try #require(worker.range(of: "Gemma4RuntimeWeightCache(loader:"))
+    #expect(reaperCall.lowerBound < protocolIO.lowerBound)
+    #expect(reaperCall.lowerBound < weightCache.lowerBound)
+    #expect(worker.contains("getppid() == 1"))
 }
 
 @Test
@@ -1863,6 +1918,19 @@ private func temporaryDirectory() throws -> URL {
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
 }
+
+/// Idle loop for fake workers that must stay unresponsive while the client
+/// times out / escalates to SIGKILL, without becoming immortal debris: it
+/// ignores nothing itself (TERM handling is up to the fixture), burns no CPU
+/// (sleep, not a busy loop), and self-expires after ~2 minutes so a fixture
+/// orphaned by an interrupted `swift test` run disappears on its own.
+private let boundedFixtureIdleLoop = """
+idle_iterations=0
+while [ "${idle_iterations}" -lt 1200 ]; do
+  sleep 0.1
+  idle_iterations=$((idle_iterations + 1))
+done
+"""
 
 private func makeRuntimeWorkerScript(_ contents: String) throws -> URL {
     let directory = try temporaryDirectory()
