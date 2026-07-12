@@ -2976,6 +2976,54 @@ func localIterateStreamsLiveNumbersDuringTheRun() throws {
     #expect(runtime.contains("expected/actual tokens are in the score JSON"))
 }
 
+// The local cool gate can offer a ONE-TIME fan boost when the GPU sits hot
+// without cooling progress: opt-in on the terminal, sudo-gated (SMC fan
+// writes are root-only), hard-capped at 70% of each fan's maximum speed, and
+// reversible with `./benchmark.sh --fan-speed-normal`, which returns the fans
+// to macOS's automatic curve without pinning any RPM. Password-handling
+// contract: sudo prompts on the tty itself; the scripts never pipe, read,
+// store, or log the password, and the cached credential is dropped with
+// `sudo -k` right after the writes.
+@Test
+func coolGateFanBoostIsOptInSudoSafeAndHardCappedAtSeventyPercent() throws {
+    let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    let fan = try String(contentsOfFile: "tools/fan-control.sh", encoding: .utf8)
+
+    // benchmark.sh wiring: offer threshold constant, a single offer per gate
+    // invocation (before the stall abort can fire), and the restore flag that
+    // execs the helper's `normal` command.
+    #expect(script.contains("readonly COOL_GATE_FAN_OFFER_STALL_SECONDS=60"))
+    #expect(script.contains("--fan-speed-normal"))
+    #expect(script.contains("exec \"${fan_helper}\" normal"))
+    #expect(script.contains("fan_boost_offered=1"))
+    #expect(script.contains("if offer_fan_boost \"${temp}\"; then"))
+    // A boost that engages resets the stall clock so the fans get a fresh
+    // window before the abort.
+    #expect(script.contains("last_progress_waited=\"${waited}\""))
+    // Interactive-only: without a tty there is no sudo prompt, just a hint.
+    #expect(script.contains(": < /dev/tty"))
+    #expect(script.contains("read -r -t 30 -p"))
+    // The sudo reasoning is printed before any password prompt can appear.
+    #expect(script.contains("the password is never read, stored,"))
+    // Never wire a password into sudo from the shell.
+    #expect(!script.contains("sudo -S"))
+    #expect(!script.contains("SUDO_ASKPASS"))
+
+    // Helper contract: hard 70% cap, explained sudo, credential hygiene.
+    #expect(fan.contains("readonly FAN_BOOST_PERCENT=70"))
+    #expect(fan.contains("sudo -k"))
+    #expect(!fan.contains("sudo -S"))
+    #expect(!fan.contains("SUDO_ASKPASS"))
+    #expect(fan.contains("never reads, stores"))
+    #expect(fan.contains("explain_sudo"))
+    // `normal` only clears the manual-mode bit (macOS's automatic fan curve
+    // takes over); it never pins an RPM of its own, and `boost` writes the
+    // target through the same root-only SMC keys.
+    #expect(fan.contains("-k \"F${i}Md\" -w 00"))
+    #expect(fan.contains("-k \"F${i}Md\" -w 01"))
+    #expect(fan.contains("-k \"F${i}Tg\" -w \"${hex}\""))
+}
+
 @Test
 func benchmarkScriptPrintsLocalSummaryWithBaselineComparison() throws {
     let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)

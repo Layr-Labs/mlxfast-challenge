@@ -15,17 +15,22 @@ set -euo pipefail
 #   MLXFAST_MACMON_BIN=...      explicit macmon binary path
 #   MLXFAST_GPU_TEMP_CMD=...    testing/portability seam: shell command whose
 #                               stdout is the current GPU temperature in C
+#   MLXFAST_FAN_CONTROL_HELPER=...  override tools/fan-control.sh, used by the
+#                               stalled-cool-down fan-boost offer and by
+#                               ./benchmark.sh --fan-speed-normal
 readonly COOL_GATE_TEMP_C=40             # start timing only at/below this GPU temp (C); same 40C as the ranked gate
 readonly COOL_GATE_POLL_SECONDS=10       # temperature poll / progress-notification interval
 readonly COOL_GATE_ABORT_SECONDS=180     # minimum total wait before a stalled cool-down aborts
 readonly COOL_GATE_STALL_SECONDS=90      # abort once no new minimum temp has been seen for this long
 readonly COOL_GATE_MAX_WAIT_SECONDS=900  # hard wait ceiling even while temp is still (slowly) falling; matches the ranked COOL_TIMEOUT
 readonly COOL_GATE_PROGRESS_EPSILON_C=0.25  # a new minimum must drop at least this much to count as progress (sensor jitter is not progress)
+readonly COOL_GATE_FAN_OFFER_STALL_SECONDS=60  # offer the one-time fan boost after this long without cooling progress (before the stall abort can fire)
 
 LOCAL_ITERATE=0
 LOCAL_SUBMIT=0
 OFFICIAL=0
 LOCAL_COOL_GATE_ONLY=0
+FAN_SPEED_NORMAL=0
 # Arguments forwarded to `mlxfast-swift benchmark`. --official is a shell-level
 # mode selector only, so it is filtered out here; the Swift CLI does not know it.
 FORWARD_ARGS=()
@@ -42,6 +47,10 @@ for arg in "$@"; do
       ;;
     --local-cool-gate-only)
       LOCAL_COOL_GATE_ONLY=1
+      continue
+      ;;
+    --fan-speed-normal)
+      FAN_SPEED_NORMAL=1
       continue
       ;;
   esac
@@ -62,6 +71,19 @@ fi
 if [[ "${LOCAL_ITERATE}" == "1" && "${LOCAL_SUBMIT}" == "1" ]]; then
   echo "benchmark.sh: --local-iterate and --local-submit cannot be used together" >&2
   exit 1
+fi
+
+# --fan-speed-normal undoes the cool gate's optional 70% fan boost: it hands
+# fan control back to macOS's automatic curve (no pinned RPM) and exits.
+# Handled before any build/transform work; requires sudo for the SMC write,
+# which tools/fan-control.sh explains before sudo prompts.
+if [[ "${FAN_SPEED_NORMAL}" == "1" ]]; then
+  fan_helper="${MLXFAST_FAN_CONTROL_HELPER:-$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/tools/fan-control.sh}"
+  if [[ ! -x "${fan_helper}" ]]; then
+    echo "benchmark.sh: fan control helper not found or not executable: ${fan_helper}" >&2
+    exit 1
+  fi
+  exec "${fan_helper}" normal
 fi
 
 # Bare invocations default to the participant-friendly local edit loop. The
@@ -355,6 +377,76 @@ format_temp_c() {
   awk -v t="$1" 'BEGIN { printf "%.1f", t }'
 }
 
+fan_control_helper() {
+  if [[ -n "${MLXFAST_FAN_CONTROL_HELPER:-}" ]]; then
+    printf '%s\n' "${MLXFAST_FAN_CONTROL_HELPER}"
+    return 0
+  fi
+  printf '%s/tools/fan-control.sh\n' "$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+}
+
+# One-time, opt-in fan boost for a stalled cool-down. Interactive only: the
+# user must approve on the terminal because the SMC fan write needs sudo (see
+# tools/fan-control.sh for the full sudo/password-handling contract: sudo's
+# own secure prompt, never read/stored/logged here, credential dropped with
+# `sudo -k` right after the write). The boost target is hard-capped at 70% of
+# each fan's maximum speed inside the helper. Returns 0 only when the fans
+# are (already or newly) boosted, so the caller can grant the cool-down a
+# fresh stall window.
+offer_fan_boost() {
+  local current_temp="$1"
+  local helper fan_status reply=""
+  helper="$(fan_control_helper)"
+  if [[ ! -x "${helper}" ]]; then
+    return 1
+  fi
+  # One boost per benchmark run: the fans stay forced across the later timed
+  # phases, so if a previous phase (or the user) already boosted them, do not
+  # prompt for sudo again.
+  fan_status="$("${helper}" status 2>/dev/null || true)"
+  if [[ "${fan_status}" == "manual" ]]; then
+    echo "benchmark.sh: fans are already under manual control; giving the boost more time to cool the GPU" >&2
+    return 0
+  fi
+  if [[ "${fan_status}" != "auto" ]]; then
+    return 1
+  fi
+  if ! { : < /dev/tty; } 2>/dev/null; then
+    echo "benchmark.sh: GPU cool-down is stalled and no interactive terminal is attached;" >&2
+    echo "benchmark.sh: to force the fans to 70% manually, run: ${helper} boost" >&2
+    return 1
+  fi
+  cat >&2 <<EOF
+benchmark.sh: the GPU is stuck at $(format_temp_c "${current_temp}")C (target <=${COOL_GATE_TEMP_C}C) and is not cooling.
+benchmark.sh: you can force this Mac's fans to 70% of their maximum speed to help
+benchmark.sh: (hard-capped at 70%). Fan targets live in the SMC, and macOS only
+benchmark.sh: accepts SMC writes from root, so sudo will ask for your password.
+benchmark.sh: that is sudo's own secure prompt: the password is never read, stored,
+benchmark.sh: or logged by benchmark.sh or tools/fan-control.sh, and the cached
+benchmark.sh: sudo credential is dropped (sudo -k) right after the one-time write.
+benchmark.sh: restore macOS automatic fan control later with:
+benchmark.sh:   ./benchmark.sh --fan-speed-normal
+EOF
+  if ! read -r -t 30 -p "benchmark.sh: boost fans to 70% of max now? [y/N] (auto-continues in 30s) " reply < /dev/tty; then
+    reply=""
+    echo >&2
+  fi
+  case "${reply}" in
+    y|Y|yes|YES|Yes)
+      if "${helper}" boost; then
+        echo "benchmark.sh: fan boost active for the rest of this run (./benchmark.sh --fan-speed-normal restores automatic control)" >&2
+        return 0
+      fi
+      echo "benchmark.sh: warning: fan boost failed; continuing to wait without it" >&2
+      return 1
+      ;;
+    *)
+      echo "benchmark.sh: fan boost declined; continuing to wait" >&2
+      return 1
+      ;;
+  esac
+}
+
 # Block the timed local run until the GPU has cooled to the gate temperature,
 # mirroring the ranked runner's thermal gate. Missing-tool policy: warn loudly
 # and SKIP (never hard-fail) -- a participant without macmon still gets a
@@ -386,7 +478,7 @@ EOF
     fi
   fi
 
-  local temp waited=0 min_temp="" last_progress_waited=0 bad_samples=0
+  local temp waited=0 min_temp="" last_progress_waited=0 bad_samples=0 fan_boost_offered=0
   while :; do
     temp="$(local_gpu_temp || true)"
     if [[ ! "${temp}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
@@ -415,6 +507,19 @@ EOF
         || awk -v t="${temp}" -v m="${min_temp}" -v e="${COOL_GATE_PROGRESS_EPSILON_C}" 'BEGIN { exit !(t <= m - e) }'; then
       min_temp="${temp}"
       last_progress_waited="${waited}"
+    fi
+
+    # Before the stall abort can fire, offer the one-time fan boost: a GPU
+    # that has sat hot with no cooling progress for a minute may still be
+    # rescued by forcing the fans to 70%. Offered at most once per gate; a
+    # boost that engages resets the stall clock so the faster fans get a
+    # fresh window to show progress.
+    if [[ "${fan_boost_offered}" == "0" \
+        && "$((waited - last_progress_waited))" -ge "${COOL_GATE_FAN_OFFER_STALL_SECONDS}" ]]; then
+      fan_boost_offered=1
+      if offer_fan_boost "${temp}"; then
+        last_progress_waited="${waited}"
+      fi
     fi
 
     # Abort when BOTH the total wait exceeded the abort floor AND no progress
