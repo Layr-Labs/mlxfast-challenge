@@ -93,6 +93,7 @@ final class Gemma4FastLayer {
     let fusedQKV: FusedSlidingQKVProjection?
     let fusedQK: FusedFullQKProjection?
     let fusedAttentionRMS: FusedAttentionRMSPreparation?
+    let fusedAttentionToMLPBoundary: FusedAttentionToMLPBoundary?
 
     let qNormWeight: MLXArray
     let kNormWeight: MLXArray?
@@ -252,6 +253,22 @@ final class Gemma4FastLayer {
         self.preFfnNormWeight = preFfnNorm.weight
         self.postFfnNormWeight = postFfnNorm.weight
         self.layerScalar = layerScalar
+        let fusedAttentionToMLPBoundaryEnabled: Bool
+        if let raw = ProcessInfo.processInfo.environment[
+            "MLXFAST_FUSED_ATTENTION_TO_MLP_BOUNDARY"
+        ] {
+            fusedAttentionToMLPBoundaryEnabled = ["1", "true", "yes", "on"]
+                .contains(raw.lowercased())
+        } else {
+            fusedAttentionToMLPBoundaryEnabled = true
+        }
+        self.fusedAttentionToMLPBoundary = fusedAttentionToMLPBoundaryEnabled
+            ? FusedAttentionToMLPBoundary(
+                postAttentionWeight: postAttnNorm.weight,
+                preFFNWeight: preFfnNorm.weight,
+                eps: eps
+            )
+            : nil
         self.rope = rope
 
         // Fuse the gated MLP into one compiled closure: collapses gate/up/GELU/
@@ -514,10 +531,31 @@ final class Gemma4FastLayer {
         } else {
             attnOut = oProj(mergedAttention)
         }
-        var out = residual + MLXFast.rmsNorm(attnOut, weight: postAttnNormWeight, eps: eps)
-        let residual2 = out
+        var out: MLXArray
+        let residual2: MLXArray
+        let fusedPreFFNNormalized: MLXArray?
+        if B == 1,
+           L == 1,
+           fusedGateUp != nil,
+           fusedGateUpPostTail != nil,
+           let fusedAttentionToMLPBoundary
+        {
+            let prepared = fusedAttentionToMLPBoundary(
+                attentionOutput: attnOut,
+                residual: residual
+            )
+            out = prepared.0
+            residual2 = prepared.0
+            fusedPreFFNNormalized = prepared.1
+        } else {
+            out = residual + MLXFast.rmsNorm(
+                attnOut, weight: postAttnNormWeight, eps: eps)
+            residual2 = out
+            fusedPreFFNNormalized = nil
+        }
         if B == 1, L == 1, let fusedGateUp, let fusedGateUpPostTail {
-            let normalized = MLXFast.rmsNorm(out, weight: preFfnNormWeight, eps: eps)
+            let normalized = fusedPreFFNNormalized ?? MLXFast.rmsNorm(
+                out, weight: preFfnNormWeight, eps: eps)
             if let fusedGateUpActivation, let indexedDown, let indexedDownPostTail {
                 let activated: MLXArray
                 if useFusedGateUpActivation {
