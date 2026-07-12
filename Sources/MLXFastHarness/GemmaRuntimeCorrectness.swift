@@ -157,6 +157,13 @@ extension GemmaRuntime {
         let expertStats: ExpertStreamingStats
         let peakRamGB: Double
         let gpqaTTFT: GPQATTFTSummary
+        // Collected + validated hidden-GPQA answers, returned to the trusted
+        // caller so it can write the capture AFTER the correctness worker (the
+        // only process running editable model code) is closed. Non-nil only on
+        // a fully-successful capture run; nil when no capture was requested or
+        // correctness failed before the capture completed. See the write site
+        // in benchmarkWithWorker and writeSemanticGPQAAnswers.
+        let semanticGPQAAnswers: [SemanticGPQAAnswerCase]?
     }
 
     struct GPQATTFTSummary {
@@ -382,6 +389,10 @@ extension GemmaRuntime {
         var gpqaTTFTCaseCount = 0
         var gpqaTTFTSeconds: [Double] = []
         var semanticAnswers: [SemanticGPQAAnswerCase] = []
+        // Set only on the fully-successful capture path (see the write site
+        // below); left nil on every failure/no-capture path so the trusted
+        // caller never writes a partial or absent capture.
+        var capturedSemanticAnswers: [SemanticGPQAAnswerCase]?
 
         func result(report: CorrectnessReport) -> WorkerLayeredCorrectnessResult {
             WorkerLayeredCorrectnessResult(
@@ -392,7 +403,8 @@ extension GemmaRuntime {
                     passCount: gpqaTTFTPassCount,
                     caseCount: gpqaTTFTCaseCount,
                     seconds: gpqaTTFTSeconds
-                )
+                ),
+                semanticGPQAAnswers: capturedSemanticAnswers
             )
         }
 
@@ -552,7 +564,13 @@ extension GemmaRuntime {
                         "captured \(semanticAnswers.count) semantic GPQA answers; expected \(semanticCapture.caseCount)"
                     )
                 }
-                try writeSemanticGPQAAnswers(semanticAnswers, to: semanticCapture.outputPath)
+                // Do NOT write the capture here: this runs while the correctness
+                // worker (which executes editable model code) is still alive. The
+                // capture embeds hidden prompt text, answer keys, and reference
+                // answers, so it must not exist on disk while submitted code can
+                // run. Return the validated answers to the trusted caller, which
+                // writes them only after closing the worker.
+                capturedSemanticAnswers = semanticAnswers
                 progress?("correctness semantic GPQA answers captured cases=\(semanticAnswers.count)")
             }
         } catch {

@@ -1163,6 +1163,65 @@ struct BenchmarkSafetyTests {
         #expect(!local.contains("let warmupCache = Gemma4ModelCache"))
         #expect(local.components(separatedBy: "runLocalPhaseCoolGate(phase:").count == 5)
     }
+
+    // The hidden-GPQA capture embeds hidden prompt text, answer keys, and
+    // reference answers. It must never exist on disk while the correctness
+    // worker -- the only process that runs editable model code in this phase --
+    // is alive. runLayeredCorrectnessWithWorker therefore only COLLECTS and
+    // validates the answers and returns them in its result; the trusted
+    // benchmark caller writes them only AFTER closing/reaping the worker. This
+    // is a source-ordering guard because the exposure requires a live worker
+    // plus real weights to reproduce behaviorally (see the sibling comment on
+    // benchmarkSplitsGatesAndTimingOntoSeparateMachinesWithoutSpuriousSemantic-
+    // CaptureFailure).
+    @Test
+    func semanticGPQACaptureIsWrittenOnlyAfterCorrectnessWorkerCloses() throws {
+        let correctness = try String(
+            contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeCorrectness.swift",
+            encoding: .utf8
+        )
+        let benchmark = try String(
+            contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift",
+            encoding: .utf8
+        )
+
+        // The result struct carries the collected answers back to the caller.
+        #expect(correctness.contains("let semanticGPQAAnswers: [SemanticGPQAAnswerCase]?"))
+
+        // runLayeredCorrectnessWithWorker collects + returns the answers and
+        // never writes them from inside the live-worker window.
+        let layered = try sourceSlice(
+            correctness,
+            from: "static func runLayeredCorrectnessWithWorker(",
+            to: "static func failedCorrectnessReport("
+        )
+        #expect(!layered.contains("writeSemanticGPQAAnswers"))
+        #expect(layered.contains("capturedSemanticAnswers = semanticAnswers"))
+        #expect(layered.contains("semanticGPQAAnswers: capturedSemanticAnswers"))
+        // The count guard that fails a bad capture still runs inside the worker
+        // window; only the disk write is deferred.
+        #expect(layered.contains("guard semanticAnswers.count == semanticCapture.caseCount else {"))
+
+        // In benchmarkWithWorker the single capture write happens only AFTER the
+        // worker-closing defer, guarded on the returned answers.
+        let benchmarkTail = try sourceSlice(
+            benchmark,
+            from: "let correctnessResult: WorkerLayeredCorrectnessResult",
+            to: "correctnessSeconds = secondsSince(correctnessStart)"
+        )
+        let close = try #require(benchmarkTail.range(of: "correctnessWorker.close()"))
+        let write = try #require(benchmarkTail.range(of: "writeSemanticGPQAAnswers("))
+        #expect(close.lowerBound < write.lowerBound)
+        #expect(benchmarkTail.contains(
+            "if let semanticCapture, let semanticAnswers = correctnessResult.semanticGPQAAnswers"
+        ))
+        // Exactly one worker is created in this window, and its close() is a
+        // defer, so the write provably runs after the worker is reaped.
+        #expect(benchmarkTail.components(separatedBy: "RuntimeWorkerClient(").count - 1 == 1)
+        #expect(benchmarkTail.components(separatedBy: "writeSemanticGPQAAnswers(").count - 1 == 1)
+        let deferClose = try #require(benchmarkTail.range(of: "defer {"))
+        #expect(deferClose.lowerBound < write.lowerBound)
+    }
 }
 
 private struct BenchmarkScriptFixture {
