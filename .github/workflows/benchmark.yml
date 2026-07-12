@@ -136,10 +136,16 @@ jobs:
       # reference_download_jobs/reference_min_free_gib inputs are gone.
       MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
       MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
-      # Per-run bench workspace: the ONLY place submitted code executes and
-      # writes. Must live under /Users/Shared/bench-jobs (bench-exec refuses
-      # anything else).
-      MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-${{ github.run_id }}-${{ github.run_attempt }}
+      # Bench workspace: the ONLY place submitted code executes and writes.
+      # Must live under /Users/Shared/bench-jobs (bench-exec refuses anything
+      # else). The path is STABLE across runs (not per-run) because llbuild's
+      # build records store absolute paths: the trusted build-products cache
+      # below only avoids recompiling ~235 dependency modules if the workspace
+      # sits at the same absolute path every run. Safe because each box runs
+      # exactly one ranked job at a time (one ephemeral runner registration per
+      # box) and "Prepare bench workspace" starts with rm -rf; per-run identity
+      # lives in BENCH_JOB_ID and the per-run private/artifact dirs below.
+      MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-current
       # --- Runner-only private material, same /tmp/mlxfast-private-* naming
       # convention as the VM pipeline. The directory is created 0700 runner,
       # so neither the bench parent nor the worker (both the bench uid) can
@@ -461,6 +467,44 @@ jobs:
             /bin/rm -f .mlxfast-cache/mlx.metallib
           fi
 
+      # Trusted compiled build products (the whole .build tree: dependency
+      # object files, build database, release products), saved ONLY from
+      # main-ref dispatches -- the same anti-poisoning gate as the metallib
+      # cache: on main there is no submitted overlay, so the staged .build
+      # derives purely from trusted sources. Submission runs restore it and
+      # `swift build` then recompiles only the overlaid editable modules plus
+      # the link, instead of all ~235 modules (~10 minutes -> ~1-2 minutes).
+      # The key reuses the metallib fingerprint (toolchain + OS + Package
+      # manifests): dependency objects are exactly as reusable as the
+      # metallib. Trusted first-party modules that changed since the cache was
+      # saved are recompiled incrementally by llbuild -- staleness costs time,
+      # never correctness.
+      #
+      # GITHUB_WORKSPACE persists across jobs on the self-hosted box, so the
+      # staging path is wiped before the restore: tar extraction overwrites
+      # but never deletes, and a stale staged tree from a prior run must not
+      # leak files into this run's restored products.
+      - name: Reset staged trusted build products
+        run: /bin/rm -rf .mlxfast-cache/trusted-build
+
+      - name: Restore trusted build products cache
+        id: restore_build_products_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .mlxfast-cache/trusted-build
+          key: bench-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}
+
+      - name: Verify restored build products
+        env:
+          CACHE_HIT: ${{ steps.restore_build_products_cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          if [[ "${CACHE_HIT}" == "true" ]]; then
+            test -d .mlxfast-cache/trusted-build/release
+          else
+            /bin/rm -rf .mlxfast-cache/trusted-build
+          fi
+
       # Copy the dispatched checkout into the bench job root and resolve SwiftPM
       # dependencies THERE while still trusted-and-networked (the bench uid has
       # a PF egress block, so `swift build` under bench must find everything
@@ -471,7 +515,15 @@ jobs:
       - name: Prepare bench workspace
         run: |
           set -euo pipefail
-          rm -rf "${MLXFAST_JOB_WS}"
+          rm -rf "${MLXFAST_JOB_WS}" || true
+          # The workspace path is stable across runs, so a fresh start must be
+          # PROVEN, not assumed: bench-owned residue from an interrupted prior
+          # job can survive a runner-uid rm -rf. Fail closed to the janitor
+          # instead of building on top of another run's leftovers.
+          if [[ -e "${MLXFAST_JOB_WS}" || -L "${MLXFAST_JOB_WS}" ]]; then
+            echo "::error::stale bench workspace at ${MLXFAST_JOB_WS} could not be fully removed; run the janitor and retry" >&2
+            exit 1
+          fi
           # APFS clonefile when possible; plain copy fallback starts from a
           # clean slate so a partial clone can never nest.
           cp -c -R "${GITHUB_WORKSPACE}" "${MLXFAST_JOB_WS}" 2>/dev/null \
@@ -481,6 +533,17 @@ jobs:
           # the candidate SHA, matching the former candidate-branch checkout.
           git -C "${MLXFAST_JOB_WS}" cat-file -e "${MLXFAST_CANDIDATE_SHA}^{commit}"
           git -C "${MLXFAST_JOB_WS}" update-ref --no-deref HEAD "${MLXFAST_CANDIDATE_SHA}"
+          # Seed the trusted build products (when the cache restored them, the
+          # clone above carried them along) so the bench build only recompiles
+          # the overlaid editable modules and the link. Same-volume mv is a
+          # rename; the restored tree replaces the dependency-only .build the
+          # SwiftPM source cache may have left. .mlxfast-cache itself stays:
+          # the build step still reads .mlxfast-cache/mlx.metallib from it.
+          if [[ -d "${MLXFAST_JOB_WS}/.mlxfast-cache/trusted-build/release" ]]; then
+            rm -rf "${MLXFAST_JOB_WS}/.build"
+            mv "${MLXFAST_JOB_WS}/.mlxfast-cache/trusted-build" "${MLXFAST_JOB_WS}/.build"
+            echo "benchmark: seeded trusted build products into bench workspace"
+          fi
           mkdir -p "${MLXFAST_PRIVATE_DIR}"
           chmod 700 "${MLXFAST_PRIVATE_DIR}"
           # Runner-owned so trusted steps can later scrub bench-written hidden
@@ -576,6 +639,27 @@ jobs:
         with:
           path: .mlxfast-cache/mlx.metallib
           key: mlx-metallib-m5-max-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}
+
+      # Main-ref dispatches only (same gate and same reasoning as the metallib
+      # save above): on main there is no submitted overlay, so the staged
+      # .build tree derives purely from trusted sources. Submission runs can
+      # execute submitted code as bench inside .build, but they can never save.
+      - name: Stage trusted build products cache
+        if: steps.restore_build_products_cache.outputs.cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          /bin/rm -rf .mlxfast-cache/trusted-build
+          /bin/mkdir -p .mlxfast-cache
+          /bin/cp -c -R "${MLXFAST_JOB_WS}/.build" .mlxfast-cache/trusted-build 2>/dev/null \
+            || { /bin/rm -rf .mlxfast-cache/trusted-build; /bin/cp -R "${MLXFAST_JOB_WS}/.build" .mlxfast-cache/trusted-build; }
+          test -d .mlxfast-cache/trusted-build/release
+
+      - name: Save trusted build products cache
+        if: steps.restore_build_products_cache.outputs.cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .mlxfast-cache/trusted-build
+          key: bench-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}
 
       - name: Transform reference checkpoint in bench sandbox
         env:
