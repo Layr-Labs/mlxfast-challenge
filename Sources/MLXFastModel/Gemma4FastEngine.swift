@@ -92,6 +92,7 @@ final class Gemma4FastLayer {
     let indexedOutput: IndexedOutputProjection?
     let fusedQKV: FusedSlidingQKVProjection?
     let fusedQK: FusedFullQKProjection?
+    let fusedAttentionRMS: FusedAttentionRMSPreparation?
 
     let qNormWeight: MLXArray
     let kNormWeight: MLXArray?
@@ -227,6 +228,25 @@ final class Gemma4FastLayer {
         }
         self.qNormWeight = qNorm.weight
         self.kNormWeight = kNorm?.weight
+        let fusedAttentionRMSEnabled: Bool
+        if let raw = ProcessInfo.processInfo.environment[
+            "MLXFAST_FUSED_ATTENTION_RMS"
+        ] {
+            fusedAttentionRMSEnabled = ["1", "true", "yes", "on"]
+                .contains(raw.lowercased())
+        } else {
+            fusedAttentionRMSEnabled = true
+        }
+        self.fusedAttentionRMS = fusedAttentionRMSEnabled
+            ? FusedAttentionRMSPreparation(
+                isSliding: isSliding,
+                headDim: headDim,
+                kvHeads: nKvHeads,
+                qNormWeight: qNorm.weight,
+                kNormWeight: kNorm?.weight,
+                eps: eps
+            )
+            : nil
         self.inputNormWeight = inputNorm.weight
         self.postAttnNormWeight = postAttnNorm.weight
         self.preFfnNormWeight = preFfnNorm.weight
@@ -407,22 +427,36 @@ final class Gemma4FastLayer {
             rawValues = vProj?(h)
         }
 
-        var queries = rawQueries.reshaped(B, L, nHeads, headDim)
-        queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: eps)
-
-        let shapedKeys = rawKeys.reshaped(B, L, nKvHeads, headDim)
-        var keys = MLXFast.rmsNorm(shapedKeys, weight: kNormWeight!, eps: eps)
-        keys = keys.transposed(0, 2, 1, 3)
-        keys = rope(keys, offset: offset)
-
+        var queries: MLXArray
+        var keys: MLXArray
         var values: MLXArray
-        if let rawValues {
-            values = rawValues.reshaped(B, L, nKvHeads, headDim)
+        if B == 1, L == 1, let fusedAttentionRMS {
+            let prepared = fusedAttentionRMS(
+                rawQueries: rawQueries,
+                rawKeys: rawKeys,
+                rawValues: rawValues
+            )
+            queries = prepared.0
+            keys = prepared.1
+            values = prepared.2
         } else {
-            values = shapedKeys
+            queries = rawQueries.reshaped(B, L, nHeads, headDim)
+            queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: eps)
+
+            let shapedKeys = rawKeys.reshaped(B, L, nKvHeads, headDim)
+            keys = MLXFast.rmsNorm(shapedKeys, weight: kNormWeight!, eps: eps)
+            keys = keys.transposed(0, 2, 1, 3)
+
+            if let rawValues {
+                values = rawValues.reshaped(B, L, nKvHeads, headDim)
+            } else {
+                values = shapedKeys
+            }
+            values = MLXFast.rmsNorm(
+                values, weight: MLXArray.mlxNone, eps: eps)
+            values = values.transposed(0, 2, 1, 3)
         }
-        values = MLXFast.rmsNorm(values, weight: MLXArray.mlxNone, eps: eps)
-        values = values.transposed(0, 2, 1, 3)
+        keys = rope(keys, offset: offset)
 
         if let cache {
             let updated = cache.update(keys: keys, values: values)
@@ -430,7 +464,9 @@ final class Gemma4FastLayer {
             values = updated.1
         }
 
-        queries = queries.transposed(0, 2, 1, 3)
+        if !(B == 1 && L == 1 && fusedAttentionRMS != nil) {
+            queries = queries.transposed(0, 2, 1, 3)
+        }
         queries = rope(queries, offset: offset)
 
         var attentionMask = mask
