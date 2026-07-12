@@ -76,6 +76,11 @@ private let fastGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
 /// Attention stays eager with active-length KV caches (bit-parity with the
 /// baseline). The gated MLP is fused into one compiled closure to collapse
 /// gate/up/GELU/product/down graph-construction overhead.
+struct Gemma4FastLayerResult {
+    let hidden: MLXArray
+    let nextNormalized: MLXArray?
+}
+
 final class Gemma4FastLayer {
     let isSliding: Bool
     let nHeads: Int
@@ -94,6 +99,7 @@ final class Gemma4FastLayer {
     let fusedQK: FusedFullQKProjection?
     let fusedAttentionRMS: FusedAttentionRMSPreparation?
     let fusedAttentionToMLPBoundary: FusedAttentionToMLPBoundary?
+    let fusedMLPToNextBoundary: FusedMLPToNextBoundary?
 
     let qNormWeight: MLXArray
     let kNormWeight: MLXArray?
@@ -134,6 +140,7 @@ final class Gemma4FastLayer {
         up: QuantizedLinear,
         down: QuantizedLinear,
         layerScalar: MLXArray,
+        nextInputNormWeight: MLXArray?,
         rope: RoPELayer,
         qIndexedMetadata: IndexedAffineMetadata?,
         kIndexedMetadata: IndexedAffineMetadata?,
@@ -268,6 +275,25 @@ final class Gemma4FastLayer {
                 preFFNWeight: preFfnNorm.weight,
                 eps: eps
             )
+            : nil
+        let fusedMLPToNextBoundaryEnabled: Bool
+        if let raw = ProcessInfo.processInfo.environment[
+            "MLXFAST_FUSED_MLP_TO_NEXT_BOUNDARY"
+        ] {
+            fusedMLPToNextBoundaryEnabled = ["1", "true", "yes", "on"]
+                .contains(raw.lowercased())
+        } else {
+            fusedMLPToNextBoundaryEnabled = true
+        }
+        self.fusedMLPToNextBoundary = fusedMLPToNextBoundaryEnabled
+            ? nextInputNormWeight.flatMap {
+                FusedMLPToNextBoundary(
+                    postFFNWeight: postFfnNorm.weight,
+                    layerScalar: layerScalar,
+                    nextNormWeight: $0,
+                    eps: eps
+                )
+            }
             : nil
         self.rope = rope
 
@@ -416,11 +442,20 @@ final class Gemma4FastLayer {
 
     func callAsFunction(
         _ x: MLXArray,
+        normalizedInput: MLXArray?,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?
-    ) -> MLXArray {
+    ) -> Gemma4FastLayerResult {
         let residual = x
-        let h = MLXFast.rmsNorm(x, weight: inputNormWeight, eps: eps)
+        let h: MLXArray
+        if let normalizedInput {
+            precondition(x.dim(0) == 1 && x.dim(1) == 1)
+            precondition(normalizedInput.shape == x.shape)
+            precondition(normalizedInput.dtype == .bfloat16)
+            h = normalizedInput
+        } else {
+            h = MLXFast.rmsNorm(x, weight: inputNormWeight, eps: eps)
+        }
 
         let (B, L, _) = (h.dim(0), h.dim(1), h.dim(2))
         let offset = cache?.offset ?? 0
@@ -534,6 +569,7 @@ final class Gemma4FastLayer {
         var out: MLXArray
         let residual2: MLXArray
         let fusedPreFFNNormalized: MLXArray?
+        var nextNormalized: MLXArray? = nil
         if B == 1,
            L == 1,
            fusedGateUp != nil,
@@ -565,7 +601,16 @@ final class Gemma4FastLayer {
                     activated = fusedGateUpActivation(gateOutput, upOutput)
                 }
                 let mlp = indexedDown(activated)
-                out = indexedDownPostTail(mlp, residual2)
+                if let fusedMLPToNextBoundary {
+                    let prepared = fusedMLPToNextBoundary(
+                        mlpOutput: mlp,
+                        residual: residual2
+                    )
+                    out = prepared.0
+                    nextNormalized = prepared.1
+                } else {
+                    out = indexedDownPostTail(mlp, residual2)
+                }
             } else {
                 let (gateOutput, upOutput) = fusedGateUp(normalized)
                 out = fusedGateUpPostTail(gateOutput, upOutput, residual2)
@@ -579,7 +624,10 @@ final class Gemma4FastLayer {
             out = residual2 + out
             out = out * layerScalar
         }
-        return out
+        return Gemma4FastLayerResult(
+            hidden: out,
+            nextNormalized: nextNormalized
+        )
     }
 }
 
@@ -765,6 +813,17 @@ final class Gemma4FastEngine {
                 kNorm = try module("\(prefix).self_attn.k_norm", as: RMSNorm.self)
             }
 
+            let nextInputNormWeight: MLXArray?
+            if index + 1 < config.numHiddenLayers {
+                let nextPrefix = "model.layers.\(index + 1)"
+                nextInputNormWeight = try module(
+                    "\(nextPrefix).input_layernorm",
+                    as: RMSNorm.self
+                ).weight
+            } else {
+                nextInputNormWeight = finalNorm.weight
+            }
+
             built.append(
                 Gemma4FastLayer(
                     isSliding: isSliding,
@@ -787,6 +846,7 @@ final class Gemma4FastEngine {
                     up: try module("\(prefix).mlp.up_proj", as: QuantizedLinear.self),
                     down: try module("\(prefix).mlp.down_proj", as: QuantizedLinear.self),
                     layerScalar: try array("\(prefix).layer_scalar"),
+                    nextInputNormWeight: nextInputNormWeight,
                     rope: rope,
                     qIndexedMetadata: indexedMetadata["\(prefix).self_attn.q_proj"],
                     kIndexedMetadata: indexedMetadata["\(prefix).self_attn.k_proj"],
@@ -832,21 +892,37 @@ final class Gemma4FastEngine {
             createAttentionMask(h: hidden, cache: layerCache($0), windowSize: nil)
         }
 
+        var normalizedInput: MLXArray? = nil
         for (index, layer) in layers.enumerated() {
             let mask = layer.isSliding ? (slidingMask ?? .none) : (fullMask ?? .none)
-            hidden = layer(hidden, mask: mask, cache: layerCache(index))
+            let result = layer(
+                hidden,
+                normalizedInput: normalizedInput,
+                mask: mask,
+                cache: layerCache(index)
+            )
+            hidden = result.hidden
+            normalizedInput = result.nextNormalized
             let layerNumber = index + 1
             if inputs.dim(1) == 1,
                asyncLayerGroup > 0,
                layerNumber >= asyncLayerLead,
                (layerNumber - asyncLayerLead).isMultiple(of: asyncLayerGroup)
             {
-                asyncEval(hidden)
+                if let normalizedInput {
+                    asyncEval(hidden, normalizedInput)
+                } else {
+                    asyncEval(hidden)
+                }
             }
         }
 
-        hidden = gemma4LastTokenHidden(hidden)
-        hidden = MLXFast.rmsNorm(hidden, weight: finalNormWeight, eps: eps)
+        if inputs.dim(1) == 1, let normalizedInput {
+            hidden = normalizedInput
+        } else {
+            hidden = gemma4LastTokenHidden(hidden)
+            hidden = MLXFast.rmsNorm(hidden, weight: finalNormWeight, eps: eps)
+        }
         let logits = embedTokens.asLinear(hidden)
         return logitSoftcap(logits, MLXArray(softcap))
     }
