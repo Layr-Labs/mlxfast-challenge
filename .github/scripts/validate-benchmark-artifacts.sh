@@ -208,6 +208,69 @@ jq -e \
   and (.metrics.runtime == "swift")
   ' "${SCORE_PATH}" >/dev/null
 
+# ---------------------------------------------------------------------------
+# Timing plausibility ceiling (defense in depth).
+#
+# The block above asserts the scored timing fields are positive numbers that
+# clear the 0.95 speedup FLOORS, but nothing bounded them from ABOVE: the
+# decode/prefill seconds-per-token originate in the bench-executed benchmark
+# process's own stdout, so an implausibly-fast fabricated result would
+# previously sail through this validator. The AUTHORITATIVE guard runs on the
+# ranked box itself (m5-machine-scripts, opt/bench-runner/measure-job.sh
+# "SCORE PLAUSIBILITY GUARDS": an independent telemetry-window cross-check
+# plus the same numeric bounds, readonly there); this block is the
+# challenge-repo backstop over the final merged artifact so the two layers
+# enforce the same bounds independently. The telemetry cross-check cannot be
+# mirrored here (this validator sees no telemetry), only the numeric bounds.
+#
+# The bounds mirror the measure-job constants and are deliberately LOOSE so
+# an honest run can never trip them: honest paired speedups sit near 1.0-1.1,
+# and baseline decode/prefill are ~0.044 / ~0.0016 s per token (~9x / ~8x
+# above the minimums). They reject fabrication, not real optimizations.
+# Env-overridable for operator tuning only (the workflow env is trusted);
+# the defaults FAIL CLOSED on the values mirrored from measure-job.
+MAX_PLAUSIBLE_SPEEDUP="${MLXFAST_MAX_PLAUSIBLE_SPEEDUP:-5.0}"                    # mirrors measure-job MAX_PLAUSIBLE_SPEEDUP
+MIN_DECODE_SECONDS_PER_TOKEN="${MLXFAST_MIN_DECODE_SECONDS_PER_TOKEN:-0.005}"    # mirrors measure-job MIN_DECODE_SPT
+MIN_PREFILL_SECONDS_PER_TOKEN="${MLXFAST_MIN_PREFILL_SECONDS_PER_TOKEN:-0.0002}" # mirrors measure-job MIN_PREFILL_SPT
+for bound in \
+  "${MAX_PLAUSIBLE_SPEEDUP}" \
+  "${MIN_DECODE_SECONDS_PER_TOKEN}" \
+  "${MIN_PREFILL_SECONDS_PER_TOKEN}"; do
+  if [[ ! "${bound}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "::error::plausibility bound override must be a plain non-negative decimal, got: ${bound}" >&2
+    exit 1
+  fi
+done
+
+# jq compares native JSON numbers, so scientific-notation values in the score
+# (e.g. a fabricated 1e-8 seconds per token) are parsed and bounded
+# correctly. Bounds apply to the candidate timing, the paired ratio, and the
+# measured baseline timing (measure-job floor-checks both runs the same way).
+jq -e \
+  --argjson max_speedup "${MAX_PLAUSIBLE_SPEEDUP}" \
+  --argjson min_decode_spt "${MIN_DECODE_SECONDS_PER_TOKEN}" \
+  --argjson min_prefill_spt "${MIN_PREFILL_SECONDS_PER_TOKEN}" \
+  '
+  (.metrics.decode_speedup <= $max_speedup)
+  and (.metrics.prefill_speedup <= $max_speedup)
+  and (.metrics.decode_seconds_per_token >= $min_decode_spt)
+  and (.metrics.prefill_seconds_per_token >= $min_prefill_spt)
+  and (.metrics.baseline_decode_seconds_per_token >= $min_decode_spt)
+  and (.metrics.baseline_prefill_seconds_per_token >= $min_prefill_spt)
+  ' "${SCORE_PATH}" >/dev/null || {
+  # Safe to print: the shape check above already asserted these six fields
+  # are numbers, so no free-text can flow into the log through them.
+  observed="$(jq -r '.metrics
+    | "decode_speedup=\(.decode_speedup) prefill_speedup=\(.prefill_speedup)"
+      + " decode_s_per_token=\(.decode_seconds_per_token)"
+      + " prefill_s_per_token=\(.prefill_seconds_per_token)"
+      + " baseline_decode_s_per_token=\(.baseline_decode_seconds_per_token)"
+      + " baseline_prefill_s_per_token=\(.baseline_prefill_seconds_per_token)"' \
+    "${SCORE_PATH}")"
+  echo "::error file=${SCORE_PATH}::scored timing failed the plausibility ceiling (${observed}; bounds: speedup <= ${MAX_PLAUSIBLE_SPEEDUP}, decode >= ${MIN_DECODE_SECONDS_PER_TOKEN} s/token, prefill >= ${MIN_PREFILL_SECONDS_PER_TOKEN} s/token, mirroring the m5 measure-job plausibility guards)" >&2
+  exit 1
+}
+
 jq -e '
   def same_keys($expected):
     (keys_unsorted | sort) == ($expected | sort);
