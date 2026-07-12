@@ -92,6 +92,113 @@ public struct Gemma4WeightLoader {
         )
     }
 
+    // MARK: - Model-level weights
+
+    public func modelWeights(config: Gemma4Config) throws -> Gemma4ModelWeights {
+        let embedTokens = try linearWeight(
+            named: Gemma4WeightNames.embedTokens,
+            outFeatures: config.vocabSize,
+            inFeatures: config.hiddenSize
+        )
+        let finalNorm = try denseArray(named: Gemma4WeightNames.finalNorm, expectedShape: [config.hiddenSize])
+        let lmHead: Gemma4LinearWeight? = config.tieWordEmbeddings
+            ? nil
+            : try linearWeight(named: Gemma4WeightNames.lmHead, outFeatures: config.vocabSize, inFeatures: config.hiddenSize)
+        return Gemma4ModelWeights(embedTokens: embedTokens, finalNorm: finalNorm, lmHead: lmHead)
+    }
+
+    public func blockWeights(layerIndex: Int, config: Gemma4Config) throws -> Gemma4BlockWeights {
+        Gemma4BlockWeights(
+            inputLayerNorm: try denseArray(
+                named: Gemma4WeightNames.layer(layerIndex, "input_layernorm.weight"),
+                expectedShape: [config.hiddenSize]
+            ),
+            postAttentionLayerNorm: try denseArray(
+                named: Gemma4WeightNames.layer(layerIndex, "post_attention_layernorm.weight"),
+                expectedShape: [config.hiddenSize]
+            ),
+            preFeedForwardLayerNorm: try denseArray(
+                named: Gemma4WeightNames.layer(layerIndex, "pre_feedforward_layernorm.weight"),
+                expectedShape: [config.hiddenSize]
+            ),
+            postFeedForwardLayerNorm: try denseArray(
+                named: Gemma4WeightNames.layer(layerIndex, "post_feedforward_layernorm.weight"),
+                expectedShape: [config.hiddenSize]
+            ),
+            layerScalar: try denseArray(
+                named: Gemma4WeightNames.layer(layerIndex, "layer_scalar"),
+                expectedShape: [1]
+            )
+        )
+    }
+
+    public func attentionWeights(layerIndex: Int, config: Gemma4Config) throws -> Gemma4AttentionWeights {
+        let layerType = config.layerTypes[layerIndex]
+        let headDim = config.headDim(for: layerType)
+        let kvHeads = config.numKeyValueHeads(for: layerType)
+        let useKEqV = config.usesKEqV(for: layerType)
+
+        let qProj = try linearWeight(
+            named: Gemma4WeightNames.attention(layerIndex, "q_proj.weight"),
+            outFeatures: config.numAttentionHeads * headDim,
+            inFeatures: config.hiddenSize
+        )
+        let kProj = try linearWeight(
+            named: Gemma4WeightNames.attention(layerIndex, "k_proj.weight"),
+            outFeatures: kvHeads * headDim,
+            inFeatures: config.hiddenSize
+        )
+        let vProj: Gemma4LinearWeight? = useKEqV
+            ? nil
+            : try linearWeight(
+                named: Gemma4WeightNames.attention(layerIndex, "v_proj.weight"),
+                outFeatures: kvHeads * headDim,
+                inFeatures: config.hiddenSize
+            )
+        let oProj = try linearWeight(
+            named: Gemma4WeightNames.attention(layerIndex, "o_proj.weight"),
+            outFeatures: config.hiddenSize,
+            inFeatures: config.numAttentionHeads * headDim
+        )
+        let qNorm = try denseArray(
+            named: Gemma4WeightNames.attention(layerIndex, "q_norm.weight"),
+            expectedShape: [headDim]
+        )
+        let kNorm = try denseArray(
+            named: Gemma4WeightNames.attention(layerIndex, "k_norm.weight"),
+            expectedShape: [headDim]
+        )
+
+        return Gemma4AttentionWeights(
+            qProj: qProj,
+            kProj: kProj,
+            vProj: vProj,
+            oProj: oProj,
+            qNorm: qNorm,
+            kNorm: kNorm
+        )
+    }
+
+    public func mlpWeights(layerIndex: Int, config: Gemma4Config) throws -> Gemma4MLPWeights {
+        Gemma4MLPWeights(
+            gate: try linearWeight(
+                named: Gemma4WeightNames.mlp(layerIndex, "gate_proj.weight"),
+                outFeatures: config.intermediateSize,
+                inFeatures: config.hiddenSize
+            ),
+            up: try linearWeight(
+                named: Gemma4WeightNames.mlp(layerIndex, "up_proj.weight"),
+                outFeatures: config.intermediateSize,
+                inFeatures: config.hiddenSize
+            ),
+            down: try linearWeight(
+                named: Gemma4WeightNames.mlp(layerIndex, "down_proj.weight"),
+                outFeatures: config.hiddenSize,
+                inFeatures: config.intermediateSize
+            )
+        )
+    }
+
     /// Validates that every tensor the model needs is present with the
     /// expected shape, without materializing any `MLXArray`s. Used by
     /// preflight/worker-boundary checks that must fail fast on a malformed

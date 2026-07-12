@@ -26,6 +26,12 @@ public final class Gemma4RuntimeWeightCache {
     public let libraryModel: Gemma4RuntimeModel?
     public let loadError: Error?
 
+    private var cachedModelWeights: Gemma4ModelWeights?
+    private var cachedBlockWeights: [Int: Gemma4BlockWeights] = [:]
+    private var cachedAttentionWeights: [Int: Gemma4AttentionWeights] = [:]
+    private var cachedMLPWeights: [Int: Gemma4MLPWeights] = [:]
+    private var cachedAttentionSpecs: [Int: Gemma4AttentionSpec] = [:]
+
     public init(loader: Gemma4WeightLoader, config: Gemma4Config) {
         self.loader = loader
         self.config = config
@@ -141,6 +147,51 @@ public final class Gemma4RuntimeWeightCache {
                 ?? MLXFastError.invalidInput("Gemma 4 reference model was not loaded")
         }
         return libraryModel
+    }
+
+    public func attentionSpec(layerIndex: Int) -> Gemma4AttentionSpec {
+        if let spec = cachedAttentionSpecs[layerIndex] {
+            return spec
+        }
+        let spec = Gemma4AttentionSpec(layerIndex: layerIndex, config: config)
+        cachedAttentionSpecs[layerIndex] = spec
+        return spec
+    }
+
+    public func modelWeights() throws -> Gemma4ModelWeights {
+        if let cachedModelWeights {
+            return cachedModelWeights
+        }
+        let weights = try loader.modelWeights(config: config)
+        cachedModelWeights = weights
+        return weights
+    }
+
+    public func blockWeights(layerIndex: Int) throws -> Gemma4BlockWeights {
+        if let weights = cachedBlockWeights[layerIndex] {
+            return weights
+        }
+        let weights = try loader.blockWeights(layerIndex: layerIndex, config: config)
+        cachedBlockWeights[layerIndex] = weights
+        return weights
+    }
+
+    public func attentionWeights(layerIndex: Int) throws -> Gemma4AttentionWeights {
+        if let weights = cachedAttentionWeights[layerIndex] {
+            return weights
+        }
+        let weights = try loader.attentionWeights(layerIndex: layerIndex, config: config)
+        cachedAttentionWeights[layerIndex] = weights
+        return weights
+    }
+
+    public func mlpWeights(layerIndex: Int) throws -> Gemma4MLPWeights {
+        if let weights = cachedMLPWeights[layerIndex] {
+            return weights
+        }
+        let weights = try loader.mlpWeights(layerIndex: layerIndex, config: config)
+        cachedMLPWeights[layerIndex] = weights
+        return weights
     }
 
 }
