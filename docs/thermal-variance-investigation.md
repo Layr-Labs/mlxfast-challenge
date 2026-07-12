@@ -1,5 +1,16 @@
 # Timing Variance in Timed Benchmarks (tenki M4 Pro) — Investigation & Recommendation
 
+> **HISTORICAL RUNNER NOTE (2026-07-11).** This investigation analyzed the
+> retired Blacksmith/tenki M4 Pro *VM* runner class. Ranked runs have since
+> moved to a single self-hosted Apple M5 Max (`m5-bench`), where the timed
+> windows run last, pinned baseline then candidate back to back, each behind a
+> fixed 40C thermal gate with telemetry-validated acceptance (see
+> `.github/workflows/benchmark.yml` and `benchmark-window-freeze.md`). The
+> analysis below is kept as the measurement record behind the per-axis
+> acceptance bands (`AcceptanceBand`, the `*BandTolerance` constants), which
+> remain in force; the runner-class specifics below no longer describe the
+> ranked box.
+
 > **FINAL root cause (fresh-VM control, run 28893815980): the dominant ~2–3×
 > decode variance was a CONTINUOUS-RUNNING ARTIFACT of the back-to-back probing,
 > NOT the real ranked path.** On the real cadence — one full `./benchmark.sh` per

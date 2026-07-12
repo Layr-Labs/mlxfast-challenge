@@ -91,8 +91,9 @@ Focus on:
 
 The model is Gemma 4 31B, dense, 4-bit, text tower only (vision/audio are out
 of scope and are never loaded). The frozen reference checkpoint is about
-18.4 GB across 4 safetensors shards. `setup.sh` stores it in a repo-local
-Hugging Face-style cache by default and verifies it against the pinned
+18.4 GB across 4 safetensors shards. `setup.sh` stores it in a shared
+Hugging Face-style cache under `$HOME` by default (so parallel clones reuse
+one checkpoint) and verifies it against the pinned
 manifest. The transformed `weights/` tree holds only the text-tower tensors
 (everything under the source checkpoint's `language_model.` prefix) plus a
 runtime-authored `config.json`; it is an overlay/runtime artifact, not a

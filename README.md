@@ -17,7 +17,7 @@ approach space.
 # command with the exact reference path it used.
 MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
   .github/scripts/run-offline.sh .build/release/mlxfast-swift transform \
-  --reference .cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main \
+  --reference "${HOME}/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main" \
   --output weights
 
 # Run the checked-in public correctness gate.
@@ -76,9 +76,10 @@ Full model setup needs a moderate local SSD. The reference checkpoint is
 `mlx-community/gemma-4-31b-4bit`, with 4 safetensors shards totaling about
 18.4 GB. `setup.sh` downloads the checkpoint from the Darkbloom R2 mirror
 (`https://ds4.darkbloom.ai/gemma-4-31b-4bit`) by default, with up to 3 shard
-downloads in parallel (`MLXFAST_REFERENCE_DOWNLOAD_JOBS`), into a repo-local
+downloads in parallel (`MLXFAST_REFERENCE_DOWNLOAD_JOBS`), into a shared
 Hugging Face-style cache under
-`.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main/`.
+`~/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main/`
+(in `$HOME` by default so parallel clones reuse one checkpoint).
 It verifies cached files against `fixtures/reference_gemma_4_31b_4bit.sha256`
 and redownloads only files that are missing, truncated, or hash-mismatched. A
 compatibility symlink is created at `reference_weights/gemma-4-31b-4bit`
@@ -122,8 +123,8 @@ one harness pass, the semantic GPQA judge, a scrub of all hidden material
 from the bench workspace, a quiescence wait plus a fixed 40C GPU thermal
 cool-gate, the paired timed measurement (pinned reference baseline then
 candidate, back to back on the same silicon), and finally the timing overlay
-that seals the score. Dispatching with the default `run_benchmark=false`
-runs only the public-fixture correctness gate.
+that seals the score. Dispatching with `run_benchmark=false` (the default is
+`true`) runs only the public-fixture correctness gate.
 Full benchmark runs require the precomputed hidden R2 object
 `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json`.
 Full benchmark runs also require the private R2
@@ -348,11 +349,12 @@ Public local correctness uses the checked-in correctness fixture. When a local
 edit-loop signal is enough, `--local-iterate` uses that public 512-token prompt,
 times standalone prefill separately, then times decode including seed prefill
 plus 16 teacher-forced decode tokens, writes `score.local-iterate.json`, prints
-it, and leaves `score` null because it is not a ranked benchmark score. The
-submit hook `--local-submit` uses the same public prompt with a longer 1024-token
+it, and publishes `score` as the estimated local score (never a ranked
+benchmark score). The submit hook `--local-submit` uses the same public prompt
+with a longer 1024-token
 fixture: it times the same standalone prefill and decode-seed phases plus 1023
-teacher-forced decode tokens in one continuous trajectory, writes
-`score.json`, and also leaves `score` null because official ranking still
+teacher-forced decode tokens in one continuous trajectory, and writes
+`score.json` with the same estimated local `score`; official ranking still
 requires the hidden benchmark oracle on the trusted runner.
 The score payload includes the baseline timings used for scoring (the
 same-session measured reference on ranked runs, the calibrated constants in
@@ -372,7 +374,7 @@ Sources/
 weights/                     transformed weights (harness loads from here)
   config.json                 runtime-authored text-tower config
   model.safetensors.index.json
-.cache/huggingface/hub/...   canonical frozen 4-bit reference checkpoint cache
+~/.cache/huggingface/hub/... canonical frozen 4-bit reference checkpoint cache
 reference_weights/...        compatibility symlink to the reference cache
 correctness_prompts/         public correctness prompt and checked-in Gemma-generated golden
 correctness_golden.json      hidden benchmark correctness cases and token oracle
@@ -416,9 +418,14 @@ timed measurement, and uploads only hash and byte-count sidecars. The
 semantic GPQA answer and judge result files are also kept under the private
 runner directory and are not uploaded.
 
-The Swift `make-golden` generator has been removed from the public harness so CI
-only consumes precomputed fixtures. The last commit on this branch containing
-that generator is `bcc9438fabf95a9b371d5749dd64f2f5ccc60fd5`.
+The older participant-facing Swift `make-golden` generator has been removed
+from the public harness; the last commit on this branch containing it is
+`bcc9438fabf95a9b371d5749dd64f2f5ccc60fd5`. Golden generation is operator work
+(the `generate-golden` capture tool described above): benchmark CI consumes
+precomputed, pin-verified correctness fixtures and never regenerates them,
+while the ranked timed run's benchmark oracle is self-generated per submitted
+binary by the trusted on-box measure-job (see
+[`docs/private-benchmark-security.md`](docs/private-benchmark-security.md)).
 
 Each base correctness prompt must contain exactly 512 token IDs. The benchmark
 prompt must contain at least 512 token IDs. The precomputed golden file stores

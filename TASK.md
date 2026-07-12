@@ -18,7 +18,8 @@ Submissions are evaluated through the Swift harness:
 The benchmark entrypoint:
 
 1. Builds `mlxfast-swift` when needed.
-2. Runs the Swift transform if `weights/` is missing or `MLXFAST_FORCE_TRANSFORM=1`.
+2. Runs the Swift transform if `weights/` is missing, the recorded transform
+   source hash changed, or `MLXFAST_FORCE_TRANSFORM=1`.
 3. Runs the correctness gate against `correctness_golden.json`.
 4. Validates the benchmark prefill/decode tokens against the hidden benchmark
    oracle in `correctness_golden.json`.
@@ -65,11 +66,12 @@ runner's paired measurement produces the official score.
 
 ## Model Artifacts
 
-By default, `setup.sh` stores the frozen reference checkpoint in a repo-local
-Hugging Face-style cache:
+By default, `setup.sh` stores the frozen reference checkpoint in a shared
+Hugging Face-style cache under your home directory (so parallel clones reuse
+one checkpoint):
 
 ```text
-.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main/
+~/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main/
 ```
 
 It also creates this compatibility symlink unless the path already exists:
@@ -78,9 +80,10 @@ It also creates this compatibility symlink unless the path already exists:
 reference_weights/gemma-4-31b-4bit/
 ```
 
-By default `setup.sh` downloads `mlx-community/gemma-4-31b-4bit` directly from
-Hugging Face with resumable `curl` requests. It checks cached files against
-the pinned SHA256 manifest and redownloads only missing, truncated, or
+By default `setup.sh` downloads `mlx-community/gemma-4-31b-4bit` from the
+Darkbloom R2 mirror with resumable `curl` requests, falling back to the public
+Hugging Face source on failed or stalled transfers. It checks cached files
+against the pinned SHA256 manifest and redownloads only missing, truncated, or
 hash-mismatched files. The safetensors payload is about 18.4 GB across 4
 shards; `setup.sh` requires 40 GiB free by default before starting. After a
 full verification, setup writes `.mlxfast-reference-cache.lock`; later setup
