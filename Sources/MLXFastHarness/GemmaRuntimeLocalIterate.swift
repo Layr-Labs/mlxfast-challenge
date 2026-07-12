@@ -1,4 +1,3 @@
-import Darwin
 import Foundation
 import MLX
 import MLXFastCore

@@ -1,10 +1,7 @@
-import CryptoKit
-import Darwin
 import Foundation
 import MLX
 import MLXFastCore
 import MLXFastModel
-import Tokenizers
 
 // GemmaRuntime is split across GemmaRuntime*.swift for auditability.
 // Generated split; behavior identical to the original single file.
@@ -685,18 +682,6 @@ extension GemmaRuntime {
         }
         let rows = logits.reshaped([-1, vocabSize])
         return try topLogits(fromRows: rows, row: rows.shape[0] - 1, vocabSize: vocabSize, topK: topK)
-    }
-
-    static func topLogits(
-        from logits: MLXArray,
-        row: Int,
-        topK: Int
-    ) throws -> [CorrectnessTraceLogit] {
-        guard let vocabSize = logits.shape.last, vocabSize > 0 else {
-            throw MLXFastError.invalidInput("correctness logits must have a non-empty vocab dimension")
-        }
-        let rows = logits.reshaped([-1, vocabSize])
-        return try topLogits(fromRows: rows, row: row, vocabSize: vocabSize, topK: topK)
     }
 
     static func topLogits(

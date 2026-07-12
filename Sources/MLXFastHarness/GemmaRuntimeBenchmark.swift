@@ -1,10 +1,7 @@
-import CryptoKit
-import Darwin
 import Foundation
 import MLX
 import MLXFastCore
 import MLXFastModel
-import Tokenizers
 
 // GemmaRuntime is split across GemmaRuntime*.swift for auditability.
 // Generated split; behavior identical to the original single file.
