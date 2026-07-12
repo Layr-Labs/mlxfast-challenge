@@ -602,8 +602,32 @@ jobs:
           # env -i child environment (sudo env_reset strips job env, so this
           # explicit /usr/bin/env assignment is the only way it gets there,
           # and nothing submitted code exports can replace it).
+          #
+          # GIT_CONFIG_*: the janitor recreates the bench user fresh each job,
+          # so bench has NO gitconfig, and everything the runner's `swift
+          # package resolve` authored in .build/ (checkouts, bare repositories,
+          # workspace-state.json) is runner-owned. git >= 2.35.2 refuses to
+          # operate on repositories owned by another uid ("detected dubious
+          # ownership"), so every git call SwiftPM makes as bench inside the
+          # runner-resolved .build fails, SwiftPM concludes the resolved state
+          # is unusable, and re-resolves over the network -- which PF correctly
+          # blocks for uid 560, wasting ~75 s per parallel fetch batch (~5 min
+          # per build) on connect timeouts before SwiftPM's fallback happens to
+          # reuse the on-disk repos (incident 2026-07-12). Scoping git's
+          # safe.directory trust to exactly this workspace (and its subrepos)
+          # for the build lets bench's SwiftPM validate the runner-authored
+          # resolve state offline, restoring "network-free by construction".
+          # Verified on-box: bench resolve goes from a 5-minute github timeout
+          # storm to a 10 s offline no-op; full bench `swift build -c release`
+          # completes with ZERO fetches and an unchanged Package.resolved.
+          # This is a git-trust knob only -- filesystem ACLs (including the
+          # bench deny ACEs on trusted surfaces) are untouched, and bench
+          # gains no access it did not already have.
           sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
             /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" \
+              GIT_CONFIG_COUNT=2 \
+              GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="${MLXFAST_JOB_WS}" \
+              GIT_CONFIG_KEY_1=safe.directory GIT_CONFIG_VALUE_1="${MLXFAST_JOB_WS}/*" \
               MLXFAST_METAL_TOOLCHAIN_IDENTIFIER="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" /bin/bash -c '
               set -euo pipefail
               cd "${MJOB_WS}"
