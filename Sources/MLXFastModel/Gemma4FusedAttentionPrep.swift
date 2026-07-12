@@ -325,6 +325,204 @@ private let gemma4FullCombinedKVPrefill = makeGemma4CombinedKVPrefillKernel(
     sharesFullKVReduction: true
 )
 
+/// Prefill preparation for all attention projections. Q/K/V remain strided
+/// slices of the combined projection; each threadgroup owns one token/head row
+/// and writes the final query/cache layouts directly.
+private func makeGemma4CombinedQKVPrefillPreparationKernel(
+    name: String,
+    headDim: Int,
+    kvHeads: Int,
+    sharesFullKVReduction: Bool
+) -> MLXFast.MLXFastKernel {
+    precondition(headDim == 256 || headDim == 512)
+    precondition(kvHeads == 16 || kvHeads == 4)
+    return MLXFast.metalKernel(
+        name: name,
+        inputNames: [
+            "raw_q", "raw_k", "raw_v", "q_weight", "k_weight",
+            "start_position", "valid_length", "capacity", "rope_cosines",
+            "rope_sines",
+        ],
+        outputNames: ["queries", "combined_kv"],
+        source: """
+            constexpr uint kHeadDim = \(headDim);
+            constexpr uint kQHeads = 32;
+            constexpr uint kKVHeads = \(kvHeads);
+            constexpr uint kKVRowsPerToken =
+                kKVHeads * (\(sharesFullKVReduction) ? 1 : 2);
+            constexpr uint kReads = 4;
+            constexpr uint kSIMDSize = 32;
+            constexpr bool kSharesFullKVReduction = \(sharesFullKVReduction);
+
+            const uint combined_row = threadgroup_position_in_grid.y;
+            const uint input_length = static_cast<uint>(valid_length);
+            const uint output_capacity = static_cast<uint>(capacity);
+            const uint query_rows = input_length * kQHeads;
+            const bool is_q = combined_row < query_rows;
+
+            uint token;
+            uint projection_head;
+            bool is_k;
+            if (is_q) {
+                token = combined_row / kQHeads;
+                projection_head = combined_row - token * kQHeads;
+                is_k = false;
+            } else {
+                const uint kv_row = combined_row - query_rows;
+                token = kv_row / kKVRowsPerToken;
+                const uint token_row = kv_row - token * kKVRowsPerToken;
+                is_k = kSharesFullKVReduction || token_row < kKVHeads;
+                projection_head = is_k
+                    ? token_row
+                    : token_row - kKVHeads;
+            }
+
+            const uint slab_elements =
+                kKVHeads * output_capacity * kHeadDim;
+            device bfloat* output = is_q
+                ? queries + (projection_head * input_length + token) * kHeadDim
+                : combined_kv
+                    + (is_k ? 0 : slab_elements)
+                    + (projection_head * output_capacity + token) * kHeadDim;
+
+            // Query rows exist only for valid tokens. K/V rows span capacity so
+            // the reserved cache suffix is initialized without a concatenate.
+            if (!is_q && token >= input_length) {
+                for (uint index = 0; index < kReads; ++index) {
+                    const uint dimension =
+                        thread_position_in_threadgroup.x * kReads + index;
+                    output[dimension] = static_cast<bfloat>(0.0f);
+                    if (kSharesFullKVReduction && is_k) {
+                        combined_kv[
+                            slab_elements
+                            + (projection_head * output_capacity + token)
+                                * kHeadDim
+                            + dimension
+                        ] = static_cast<bfloat>(0.0f);
+                    }
+                }
+                return;
+            }
+
+            // Q/K/V are last-axis views of a wider combined projection. Use
+            // their signed MLX strides rather than materializing contiguous
+            // copies before normalization.
+            const constant int64_t* input_strides = is_q
+                ? raw_q_strides
+                : (is_k ? raw_k_strides : raw_v_strides);
+            const int64_t dimension_stride = input_strides[2];
+            const device bfloat* input_base = is_q
+                ? raw_q
+                : (is_k ? raw_k : raw_v);
+            const device bfloat* input = input_base
+                + static_cast<int64_t>(token) * input_strides[1]
+                + static_cast<int64_t>(projection_head * kHeadDim)
+                    * dimension_stride;
+
+            float accumulator = 0;
+            input += static_cast<int64_t>(
+                thread_position_in_threadgroup.x * kReads
+            ) * dimension_stride;
+            if (thread_position_in_threadgroup.x * kReads + kReads <= kHeadDim) {
+                for (uint index = 0; index < kReads; ++index) {
+                    const float value = input[
+                        static_cast<int64_t>(index) * dimension_stride];
+                    accumulator += value * value;
+                }
+            }
+            accumulator = simd_sum(accumulator);
+
+            // Match MLXFast.rmsNorm's established reduction/cast topology used
+            // by the exact single-token and K/V-prefill preparation kernels.
+            threadgroup float inverse_mean[1];
+            threadgroup float local_sums[kSIMDSize];
+            threadgroup bfloat normalized_row[kHeadDim];
+            if (simdgroup_index_in_threadgroup == 0) {
+                local_sums[thread_index_in_simdgroup] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (thread_index_in_simdgroup == 0) {
+                local_sums[simdgroup_index_in_threadgroup] = accumulator;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simdgroup_index_in_threadgroup == 0) {
+                accumulator = simd_sum(local_sums[thread_index_in_simdgroup]);
+                if (thread_index_in_simdgroup == 0) {
+                    inverse_mean[0] = metal::precise::rsqrt(
+                        accumulator / kHeadDim + 1.0e-6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const bool has_weight = is_q || is_k;
+            const device bfloat* weight = is_q ? q_weight : k_weight;
+            const device bfloat* row_weight =
+                weight + thread_position_in_threadgroup.x * kReads;
+            for (uint index = 0; index < kReads; ++index) {
+                const uint dimension =
+                    thread_position_in_threadgroup.x * kReads + index;
+                const bfloat normalized = static_cast<bfloat>(
+                    input[static_cast<int64_t>(index) * dimension_stride]
+                        * inverse_mean[0]);
+                const bfloat weighted = has_weight
+                    ? row_weight[index] * normalized
+                    : static_cast<bfloat>(1.0f) * normalized;
+                normalized_row[dimension] = weighted;
+                if (!has_weight) {
+                    output[dimension] = weighted;
+                }
+                if (kSharesFullKVReduction && is_k) {
+                    combined_kv[
+                        slab_elements
+                        + (projection_head * output_capacity + token) * kHeadDim
+                        + dimension
+                    ] = static_cast<bfloat>(1.0f) * normalized;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (has_weight) {
+                constexpr uint kPairs = kHeadDim / 2;
+                constexpr uint kThreads = kHeadDim / kReads;
+                for (uint pair = thread_position_in_threadgroup.x;
+                     pair < kPairs;
+                     pair += kThreads) {
+                    const uint rope_index =
+                        (static_cast<uint>(start_position) + token)
+                            * kPairs + pair;
+                    const float cosine = rope_cosines[rope_index];
+                    const float sine = rope_sines[rope_index];
+                    const float left = static_cast<float>(normalized_row[pair]);
+                    const float right = static_cast<float>(
+                        normalized_row[pair + kPairs]);
+                    output[pair] = static_cast<bfloat>(
+                        left * cosine - right * sine);
+                    output[pair + kPairs] = static_cast<bfloat>(
+                        left * sine + right * cosine);
+                }
+            }
+            """,
+        header: "using namespace metal;",
+        ensureRowContiguous: false
+    )
+}
+
+private let gemma4SlidingCombinedQKVPrefillPreparation =
+    makeGemma4CombinedQKVPrefillPreparationKernel(
+        name: "gemma4_sliding_combined_qkv_prefill_prep_strided_256_v1",
+        headDim: 256,
+        kvHeads: 16,
+        sharesFullKVReduction: false
+    )
+
+private let gemma4FullCombinedQKVPrefillPreparation =
+    makeGemma4CombinedQKVPrefillPreparationKernel(
+        name: "gemma4_full_combined_qkv_prefill_prep_shared_strided_512_v1",
+        headDim: 512,
+        kvHeads: 4,
+        sharesFullKVReduction: true
+    )
+
 private struct Gemma4PreparedArray: @unchecked Sendable {
     let value: MLXArray
 }
@@ -578,5 +776,50 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
             outputShapes: [[2, 1, kvHeads, capacity, headDim]],
             outputDTypes: [.bfloat16]
         )[0]
+    }
+
+    /// Multi-token Q/K/V preparation. Queries are emitted as `[1,32,L,D]`
+    /// after RMSNorm, transpose, and RoPE; K/V are emitted directly into the
+    /// reserved combined-cache parent allocation.
+    func callCombinedQKVPrefill(
+        rawQueries: MLXArray,
+        rawKeys: MLXArray,
+        rawValues: MLXArray?,
+        offset: Int,
+        length: Int,
+        capacity: Int
+    ) -> (queries: MLXArray, combinedKV: MLXArray) {
+        let queryWidth = 32 * headDim
+        let kvWidth = kvHeads * headDim
+        precondition(rawQueries.dtype == .bfloat16)
+        precondition(rawQueries.shape == [1, length, queryWidth])
+        precondition(rawKeys.dtype == .bfloat16)
+        precondition(rawKeys.shape == [1, length, kvWidth])
+        let valueInput = rawValues ?? rawKeys
+        precondition(valueInput.dtype == .bfloat16)
+        precondition(valueInput.shape == [1, length, kvWidth])
+        precondition(capacity >= length)
+        precondition(supportsPrefill(offset: offset, length: length))
+
+        let threads = headDim / 4
+        let kvRowsPerToken = isSliding ? 2 * kvHeads : kvHeads
+        let kernel = isSliding
+            ? gemma4SlidingCombinedQKVPrefillPreparation
+            : gemma4FullCombinedQKVPrefillPreparation
+        let outputs = kernel(
+            [
+                rawQueries, rawKeys, valueInput, qNormWeight, kNormWeight,
+                positionViews[offset], MLXArray(Int32(length)),
+                MLXArray(Int32(capacity)), ropeCosines, ropeSines,
+            ],
+            grid: (threads, length * 32 + capacity * kvRowsPerToken, 1),
+            threadGroup: (threads, 1, 1),
+            outputShapes: [
+                [1, 32, length, headDim],
+                [2, 1, kvHeads, capacity, headDim],
+            ],
+            outputDTypes: [.bfloat16, .bfloat16]
+        )
+        return (outputs[0], outputs[1])
     }
 }

@@ -5,6 +5,24 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 
+private let gemma4CombinedQKVPrefillPreparationEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_COMBINED_QKV_PREFILL_PREP"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+private let gemma4VerifyCombinedQKVPrefillPreparationBits: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_VERIFY_COMBINED_QKV_PREFILL_PREP_BITS"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -533,6 +551,13 @@ final class Gemma4FastLayer {
             ? combinedCache?.directPrefillCapacity(for: L)
             : nil
         let usesCombinedKVPrefillPreparation = combinedPrefillCapacity != nil
+        let usesCombinedQKVPrefillPreparation =
+            usesCombinedKVPrefillPreparation
+            && offset == 0
+            && h.dtype == .bfloat16
+            && combinedAttentionPrefill != nil
+            && (gemma4CombinedQKVPrefillPreparationEnabled
+                || gemma4VerifyCombinedQKVPrefillPreparationBits)
         if usesCombinedKVDecodePreparation,
            let fusedAttentionRMS,
            let combinedCache
@@ -557,6 +582,64 @@ final class Gemma4FastLayer {
             queries = prepared.0
             keys = prepared.1
             values = prepared.2
+        } else if usesCombinedQKVPrefillPreparation,
+                  let fusedAttentionRMS,
+                  let combinedCache,
+                  let combinedPrefillCapacity
+        {
+            let candidate = fusedAttentionRMS.callCombinedQKVPrefill(
+                rawQueries: rawQueries,
+                rawKeys: rawKeys,
+                rawValues: rawValues,
+                offset: offset,
+                length: L,
+                capacity: combinedPrefillCapacity
+            )
+            var selectedQueries = candidate.queries
+            var selectedCombinedKV = candidate.combinedKV
+
+            if gemma4VerifyCombinedQKVPrefillPreparationBits {
+                var referenceQueries = rawQueries.reshaped(
+                    B, L, nHeads, headDim)
+                referenceQueries = MLXFast.rmsNorm(
+                    referenceQueries, weight: qNormWeight, eps: eps)
+                referenceQueries = referenceQueries.transposed(0, 2, 1, 3)
+                referenceQueries = rope(referenceQueries, offset: offset)
+                let referenceCombinedKV = fusedAttentionRMS.callCombinedPrefill(
+                    rawKeys: rawKeys,
+                    rawValues: rawValues,
+                    offset: offset,
+                    length: L,
+                    capacity: combinedPrefillCapacity
+                )
+                let queriesMatch = arrayEqual(
+                    candidate.queries.view(dtype: .uint16),
+                    referenceQueries.view(dtype: .uint16)
+                )
+                let combinedKVMatches = arrayEqual(
+                    candidate.combinedKV.view(dtype: .uint16),
+                    referenceCombinedKV.view(dtype: .uint16)
+                )
+                eval(queriesMatch, combinedKVMatches)
+                precondition(
+                    queriesMatch.item(Bool.self),
+                    "combined QKV prefill queries differ from stock RMSNorm/RoPE"
+                )
+                precondition(
+                    combinedKVMatches.item(Bool.self),
+                    "combined QKV prefill cache differs from K/V-only preparation"
+                )
+                if !gemma4CombinedQKVPrefillPreparationEnabled {
+                    selectedQueries = referenceQueries
+                    selectedCombinedKV = referenceCombinedKV
+                }
+            }
+
+            queries = selectedQueries
+            let updated = combinedCache.adoptDirectPrefill(
+                selectedCombinedKV, length: L)
+            keys = updated.0
+            values = updated.1
         } else if usesCombinedKVPrefillPreparation,
                   let fusedAttentionRMS,
                   let combinedCache,
@@ -637,10 +720,10 @@ final class Gemma4FastLayer {
             values = updated.1
         }
 
-        if !usesFusedAttentionPreparation {
+        if !usesFusedAttentionPreparation && !usesCombinedQKVPrefillPreparation {
             queries = queries.transposed(0, 2, 1, 3)
         }
-        if !usesFusedAttentionPreparation {
+        if !usesFusedAttentionPreparation && !usesCombinedQKVPrefillPreparation {
             queries = rope(queries, offset: offset)
         }
 
