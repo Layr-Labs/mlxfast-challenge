@@ -1312,6 +1312,16 @@ private enum MLXFastCLI {
                 "(deny file-read* (subpath \"\(seatbeltEscaped(absolutePath(privateDir)))\"))"
             )
         }
+        // `(deny network*)` blocks the worker's OWN sockets, but getaddrinfo(3)
+        // resolves via IPC to mDNSResponder, which egresses from ITS uid -- so a
+        // uid/socket-scoped block never sees the DNS query and submitted code
+        // could exfiltrate over DNS. Deny the worker's mach-lookup of the
+        // resolver (canonical name, legacy alias, and the
+        // com.apple.mDNSResponder.* family), matching the parent-tool profile in
+        // writeParentToolSandboxProfile and the operator-layer worker profile
+        // used on the ranked box. This keeps the harness-generated FALLBACK
+        // profile (local runs / any path where the operator template is not
+        // injected via MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE) resolver-safe too.
         let profile = """
         (version 1)
         (allow default)
@@ -1319,6 +1329,9 @@ private enum MLXFastCLI {
         (deny process-fork)
         (deny process-exec*)
         (allow process-exec (literal "\(seatbeltEscaped(absoluteExecutablePath))"))
+        (deny mach-lookup (global-name "com.apple.mDNSResponder"))
+        (deny mach-lookup (global-name "com.apple.system.mDNSResponder"))
+        (deny mach-lookup (global-name-prefix "com.apple.mDNSResponder"))
         (deny file-write*)
         (allow file-write* (literal "/dev/null"))
         \(deniedReadRules.joined(separator: "\n"))

@@ -87,6 +87,42 @@ struct ParentToolSandboxTests {
     }
 
     @Test
+    func runtimeWorkerFallbackProfileDeniesResolverMachLookup() throws {
+        let cli = try cliSource()
+        // Scope the assertions to the runtime-worker profile builder's own body
+        // (up to its `try profile.write`), so a match against the parent-tool
+        // profile cannot satisfy this test -- it must be the FALLBACK worker
+        // profile that carries the resolver denies.
+        let profileRange = try #require(
+            cli.range(of: "private static func writeRuntimeWorkerSandboxProfile(")
+        )
+        let profileTail = String(cli[profileRange.lowerBound...])
+        let writeRange = try #require(profileTail.range(of: "try profile.write("))
+        let profileBody = String(profileTail[..<writeRange.lowerBound])
+
+        // Pre-existing worker-profile guarantees remain, proving the denies were
+        // added to this profile without disturbing its structure.
+        #expect(profileBody.contains("(deny network*)"))
+        #expect(profileBody.contains("(deny process-fork)"))
+        #expect(profileBody.contains("(deny process-exec*)"))
+        #expect(profileBody.contains("(deny file-write*)"))
+        // All three mDNSResponder mach-lookup deny variants, matching the
+        // parent-tool profile (#494) and the operator-layer worker profile:
+        // getaddrinfo(3) egresses through mDNSResponder from ITS own uid, so a
+        // uid/socket-scoped block never sees the DNS query -- the mach-lookup
+        // deny is what actually closes the DNS side channel for this profile.
+        #expect(profileBody.contains(
+            "(deny mach-lookup (global-name \"com.apple.mDNSResponder\"))"
+        ))
+        #expect(profileBody.contains(
+            "(deny mach-lookup (global-name \"com.apple.system.mDNSResponder\"))"
+        ))
+        #expect(profileBody.contains(
+            "(deny mach-lookup (global-name-prefix \"com.apple.mDNSResponder\"))"
+        ))
+    }
+
+    @Test
     func workflowArmsParentToolSandboxOnTransformAndAttachSteps() throws {
         let workflow = try workflowSource()
 
