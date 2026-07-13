@@ -10,7 +10,7 @@ enum Gemma4PromptLookupPendingResolution: Equatable {
 /// Request-local token history for generic one-token prompt lookup.
 ///
 /// A draft is the token following the most recent prior occurrence of the
-/// longest suffix up to three tokens. Pending drafts are not added to history
+/// longest suffix up to six tokens. Pending drafts are not added to history
 /// until the caller presents that token on the next model invocation.
 struct Gemma4PromptLookupState: Equatable {
     private(set) var tokens: [Int32] = []
@@ -53,11 +53,11 @@ struct Gemma4PromptLookupState: Equatable {
     }
 }
 
-/// Fixed generic N=3, k=1 lookup. Suffix lengths are tried longest-first, then
+/// Fixed generic N=6, k=1 lookup. Suffix lengths are tried longest-first, then
 /// prior starts newest-first, exactly matching the offline policy evaluator.
 func gemma4PromptLookupDraft(tokens: [Int32]) -> Int32? {
     guard tokens.count >= 2 else { return nil }
-    for length in stride(from: min(3, tokens.count), through: 1, by: -1) {
+    for length in stride(from: min(6, tokens.count), through: 1, by: -1) {
         let suffixStart = tokens.count - length
         guard suffixStart > 0 else { continue }
         for start in stride(from: suffixStart - 1, through: 0, by: -1) {

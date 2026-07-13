@@ -1,9 +1,12 @@
 import MLX
 
-/// Runs the promoted one-query attention primitive independently for each
-/// speculative row. Token zero excludes the draft K/V row; token one includes
-/// it. This preserves the single-token reduction path instead of selecting a
-/// numerically different batched attention implementation.
+/// Runs both sliding-attention queries in one causal vector-attention dispatch
+/// while both rows use the one-pass MLX kernel. Its causal branch skips the
+/// draft key for token zero, preserving the promoted one-query arithmetic and
+/// reduction order. Full D=512 attention stays serialized because its fallback
+/// matmuls can change reduction order when the key length changes. The final
+/// sliding pre-wrap pair also stays serialized because MLX switches D=256 to
+/// its two-pass kernel at 1,024 keys while token zero's reference does not.
 func gemma4ExactTwoTokenAttention(
     queries: MLXArray,
     keysBeforeDraft: MLXArray,
@@ -23,17 +26,25 @@ func gemma4ExactTwoTokenAttention(
     precondition(keysWithDraft.dim(3) == queries.dim(3))
     precondition(keysWithDraft.dim(2) == keysBeforeDraft.dim(2) + 1)
 
-    let query0 = queries[0..., 0..., 0..<1, 0...]
-    let query1 = queries[0..., 0..., 1..<2, 0...]
+    if queries.dim(3) == 256 && keysWithDraft.dim(2) < 1_024 {
+        return MLXFast.scaledDotProductAttention(
+            queries: queries,
+            keys: keysWithDraft,
+            values: valuesWithDraft,
+            scale: scale,
+            mask: .causal
+        )
+    }
+
     let attention0 = MLXFast.scaledDotProductAttention(
-        queries: query0,
+        queries: queries[0..., 0..., 0..<1, 0...],
         keys: keysBeforeDraft,
         values: valuesBeforeDraft,
         scale: scale,
         mask: .none
     )
     let attention1 = MLXFast.scaledDotProductAttention(
-        queries: query1,
+        queries: queries[0..., 0..., 1..<2, 0...],
         keys: keysWithDraft,
         values: valuesWithDraft,
         scale: scale,
