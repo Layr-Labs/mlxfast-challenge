@@ -46,7 +46,10 @@ public final class Gemma4RuntimeWeightCache {
             // The MLX M5 Max default commits after referencing 50 MiB. Many
             // 4-bit projections individually exceed that, so use a moderate
             // limit that can group adjacent kernels without long command buffers.
-            setenv("MLX_MAX_MB_PER_BUFFER", "128", 1)
+            setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
+            // Decode's explicit async-eval groups remain the outer command-
+            // buffer boundary; let the referenced-buffer budget govern within them.
+            setenv("MLX_MAX_OPS_PER_BUFFER", "128", 1)
             Memory.cacheLimit = 32 << 30
         }
         do {
