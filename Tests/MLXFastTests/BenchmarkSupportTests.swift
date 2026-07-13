@@ -339,6 +339,9 @@ func runtimeWorkerEnvironmentDropsEverythingOutsideTheAllowlist() {
         "LANG": "en_US.UTF-8",
         "LC_ALL": "en_US.UTF-8",
         "TERM": "xterm-256color",
+        // A live SSH agent socket must be dropped: the worker never needs it
+        // and forwarding it hands submitted code a usable auth channel wherever
+        // the parent holds one.
         "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
         "__CF_USER_TEXT_ENCODING": "0x1F5:0x0:0x0",
         "HF_HUB_OFFLINE": "1",
@@ -363,7 +366,8 @@ func runtimeWorkerEnvironmentDropsEverythingOutsideTheAllowlist() {
         "LANG": "en_US.UTF-8",
         "LC_ALL": "en_US.UTF-8",
         "TERM": "xterm-256color",
-        "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+        // SSH_AUTH_SOCK is intentionally absent: it is supplied above but must
+        // be dropped by the allowlist.
         "__CF_USER_TEXT_ENCODING": "0x1F5:0x0:0x0",
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",

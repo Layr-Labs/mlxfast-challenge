@@ -66,6 +66,7 @@ private enum MLXFastCLI {
     }
 
     private static func runTransform(_ options: ParsedOptions) throws {
+        try reexecUnderParentToolSandboxIfRequested(subcommand: "transform")
         try options.validate(valueOptions: ["--reference", "--output"])
         let referencePath = options.value(
             for: "--reference",
@@ -387,6 +388,7 @@ private enum MLXFastCLI {
     }
 
     private static func runAttachGPQAGates(_ options: ParsedOptions) throws {
+        try reexecUnderParentToolSandboxIfRequested(subcommand: "attach-gpqa-gates")
         try options.validate(
             valueOptions: ["--golden", "--gpqa", "--tokenizer", "--output", "--case-count", "--max-new-tokens"]
         )
@@ -1189,6 +1191,104 @@ private enum MLXFastCLI {
             // content into CI logs.
             forwardsWorkerStderr: forwardsWorkerStderr && !officialRun
         )
+    }
+
+    // Confine the `transform` and `attach-gpqa-gates` command paths behind a
+    // Seatbelt profile before they touch any input. Unlike `correctness`/
+    // `benchmark`, these subcommands run the submission-built binary directly
+    // (they do not spawn the separately sandboxed runtime worker), so on the
+    // ranked box they execute as an UNSANDBOXED bench parent that reads the raw
+    // hidden golden + GPQA answer key. This re-executes the current process
+    // under `/usr/bin/sandbox-exec` with a profile that denies network,
+    // process-fork, process-exec (of anything but this binary), and DNS
+    // resolver mach-lookup -- the same guarantees the retired run-offline.sh
+    // wrapper gave the transform, plus the mDNSResponder mach-lookup deny the
+    // operator worker profile also carries. Reads/writes stay default-allowed
+    // (transform legitimately reads the reference checkpoint and writes
+    // weights/; a read allowlist would break dyld/Metal/tokenizer loading), so
+    // the uid, workspace-write-confinement, and PF-egress layers remain the
+    // filesystem boundary.
+    //
+    // Trigger + fail-closed policy: the trusted workflow sets
+    // MLXFAST_SANDBOX_PARENT_TOOLS=1 on exactly the transform/attach steps (and
+    // MLXFAST_OFFICIAL_BENCHMARK_RUN=1 also arms it). When armed, a missing
+    // sandbox-exec or MLXFAST_NO_SANDBOX=1 aborts the run rather than executing
+    // unsandboxed. Local invocations set neither, so participant workflows are
+    // unchanged. MLXFAST_PARENT_SANDBOX_ACTIVE=1 is set on the re-exec so the
+    // sandboxed child does not recurse.
+    private static func reexecUnderParentToolSandboxIfRequested(subcommand: String) throws {
+        if environmentValue("MLXFAST_PARENT_SANDBOX_ACTIVE", fallback: "0") == "1" {
+            return
+        }
+        let officialRun = environmentValue("MLXFAST_OFFICIAL_BENCHMARK_RUN", fallback: "0") == "1"
+        let requested = officialRun
+            || environmentValue("MLXFAST_SANDBOX_PARENT_TOOLS", fallback: "0") == "1"
+        guard requested else {
+            return
+        }
+        if environmentValue("MLXFAST_NO_SANDBOX", fallback: "0") == "1" {
+            throw MLXFastError.invalidInput(
+                "\(subcommand) in a benchmark context requires the parent-tool sandbox; unset MLXFAST_NO_SANDBOX"
+            )
+        }
+        let sandboxExecutable = "/usr/bin/sandbox-exec"
+        guard FileManager.default.isExecutableFile(atPath: sandboxExecutable) else {
+            throw MLXFastError.invalidInput(
+                "\(subcommand) in a benchmark context requires sandbox-exec for the parent-tool sandbox"
+            )
+        }
+        guard let rawExecutable = CommandLine.arguments.first, !rawExecutable.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "\(subcommand) parent-tool sandbox could not determine its own executable path"
+            )
+        }
+        let executablePath = absolutePath(rawExecutable)
+        guard FileManager.default.isExecutableFile(atPath: executablePath) else {
+            throw MLXFastError.invalidInput(
+                "\(subcommand) parent-tool sandbox resolved a non-executable self path: \(executablePath)"
+            )
+        }
+        let profilePath = try writeParentToolSandboxProfile(allowedExecutablePath: executablePath)
+        let argv = [sandboxExecutable, "-f", profilePath, executablePath]
+            + Array(CommandLine.arguments.dropFirst())
+        setenv("MLXFAST_PARENT_SANDBOX_ACTIVE", "1", 1)
+        var cArgs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) }
+        cArgs.append(nil)
+        defer {
+            for pointer in cArgs {
+                if let pointer {
+                    free(pointer)
+                }
+            }
+        }
+        _ = sandboxExecutable.withCString { pathPointer in
+            execv(pathPointer, cArgs)
+        }
+        // execv only returns on failure.
+        throw MLXFastError.invalidInput(
+            "\(subcommand) failed to re-exec under sandbox-exec (errno=\(errno))"
+        )
+    }
+
+    private static func writeParentToolSandboxProfile(
+        allowedExecutablePath: String
+    ) throws -> String {
+        let profileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mlxfast-parent-tool-\(UUID().uuidString).sb")
+        let absoluteExecutablePath = absolutePath(allowedExecutablePath)
+        let profile = """
+        (version 1)
+        (allow default)
+        (deny network*)
+        (deny process-fork)
+        (deny process-exec*)
+        (allow process-exec (literal "\(seatbeltEscaped(absoluteExecutablePath))"))
+        (deny mach-lookup (global-name "com.apple.mDNSResponder"))
+        (deny mach-lookup (global-name "com.apple.system.mDNSResponder"))
+        (deny mach-lookup (global-name-prefix "com.apple.mDNSResponder"))
+        """
+        try profile.write(to: profileURL, atomically: true, encoding: .utf8)
+        return profileURL.path
     }
 
     private static func writeRuntimeWorkerSandboxProfile(

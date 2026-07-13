@@ -1269,11 +1269,20 @@ final class RuntimeWorkerClient {
 /// - `MLXFAST_USE_RUNTIME_WORKER` is force-set to "0" so the child can never
 ///   recursively spawn another worker.
 ///
+/// `SSH_AUTH_SOCK` is deliberately NOT allowlisted. The worker needs no SSH
+/// agent (weights arrive via argv, dependencies are pre-resolved, network is
+/// denied by its Seatbelt profile), and forwarding a live agent socket hands
+/// submitted model code a usable authentication channel in any context where
+/// the parent process happens to hold one. It is harmless on the ranked box
+/// (no agent is present and PF blocks egress) but has no legitimate use here,
+/// so it is dropped like every other non-essential name.
+///
 /// Maintainer contract: do NOT regress this to keep-by-default, do NOT add a
-/// broad `MLXFAST_` (or `BENCH_`) allowance, and never allowlist a name whose
-/// value trusted code could set differently between the gates and timed
-/// passes. The worker itself needs no MLXFAST_* configuration: its weights
-/// path arrives via argv (`runtime-worker --weights ...`).
+/// broad `MLXFAST_` (or `BENCH_`) allowance, do NOT re-add `SSH_AUTH_SOCK` (or
+/// any other credential/agent socket), and never allowlist a name whose value
+/// trusted code could set differently between the gates and timed passes. The
+/// worker itself needs no MLXFAST_* configuration: its weights path arrives
+/// via argv (`runtime-worker --weights ...`).
 func sanitizedRuntimeWorkerEnvironment(_ environment: [String: String]) -> [String: String] {
     let allowedExactKeys: Set<String> = [
         "HF_HUB_OFFLINE",
@@ -1282,7 +1291,6 @@ func sanitizedRuntimeWorkerEnvironment(_ environment: [String: String]) -> [Stri
         "LOGNAME",
         "PATH",
         "SHELL",
-        "SSH_AUTH_SOCK",
         "TERM",
         "TMPDIR",
         "TRANSFORMERS_OFFLINE",

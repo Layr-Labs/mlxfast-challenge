@@ -699,12 +699,18 @@ jobs:
           # network deny). Here the bench uid's PF egress block plus workspace
           # write confinement provide the same guarantees at the uid layer, and
           # the reference cache is read-only to bench (runner-owned).
+          # MLXFAST_SANDBOX_PARENT_TOOLS=1 arms the CLI's parent-tool Seatbelt
+          # sandbox: transform runs the submission-built binary directly (no
+          # runtime worker), so it self-confines (deny network/fork/exec/DNS
+          # mach-lookup) before reading the reference or writing weights. Any
+          # missing sandbox-exec fails the run closed.
           status=0
           if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then
             echo "benchmark: running submitted transform with private process logs suppressed"
             # shellcheck disable=SC2024  # trusted shell owns the capture files
             sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
-              /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" MLXFAST_REFERENCE_DIR="${MLXFAST_REFERENCE_DIR}" /bin/bash -c '
+              /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" MLXFAST_REFERENCE_DIR="${MLXFAST_REFERENCE_DIR}" \
+                MLXFAST_SANDBOX_PARENT_TOOLS=1 /bin/bash -c '
                 set -euo pipefail
                 cd "${MJOB_WS}"
                 mkdir -p weights
@@ -714,7 +720,8 @@ jobs:
               ' > "${MLXFAST_PRIVATE_DIR}/transform-private.log" 2>&1 || status=$?
           else
             sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
-              /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" MLXFAST_REFERENCE_DIR="${MLXFAST_REFERENCE_DIR}" /bin/bash -c '
+              /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" MLXFAST_REFERENCE_DIR="${MLXFAST_REFERENCE_DIR}" \
+                MLXFAST_SANDBOX_PARENT_TOOLS=1 /bin/bash -c '
                 set -euo pipefail
                 cd "${MJOB_WS}"
                 mkdir -p weights
@@ -926,11 +933,16 @@ jobs:
           install -m 0444 "${MLXFAST_PRIVATE_DIR}/raw_golden.json" "${golden_src}"
           install -m 0444 "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json" "${gpqa_src}"
           status=0
+          # MLXFAST_SANDBOX_PARENT_TOOLS=1 arms the CLI's parent-tool Seatbelt
+          # sandbox: attach-gpqa-gates runs the submission-built binary directly
+          # to read the raw hidden golden + GPQA answer key, so it self-confines
+          # (deny network/fork/exec/DNS mach-lookup) before opening those inputs.
           # shellcheck disable=SC2024  # trusted shell owns the capture files
           sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
             /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" \
               MLXFAST_GPQA_CASE_COUNT="${MLXFAST_GPQA_CASE_COUNT}" \
-              MLXFAST_GPQA_MAX_NEW_TOKENS="${MLXFAST_GPQA_MAX_NEW_TOKENS}" /bin/bash -c '
+              MLXFAST_GPQA_MAX_NEW_TOKENS="${MLXFAST_GPQA_MAX_NEW_TOKENS}" \
+              MLXFAST_SANDBOX_PARENT_TOOLS=1 /bin/bash -c '
               set -u
               cd "${MJOB_WS}" || exit 97
               exec .build/release/mlxfast-swift attach-gpqa-gates \
