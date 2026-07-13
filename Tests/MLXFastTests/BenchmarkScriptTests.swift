@@ -495,7 +495,9 @@ func benchmarkWorkflowRunsTrustedMainAndOverlaysOnlySubmittedEditablePaths() thr
     #expect(candidatePipeline.contains("rm -rf .mlxfast-submission-src"))
     #expect(candidatePipeline.contains("test ! -e .mlxfast-submission-src"))
     #expect(workflow.contains("MLXFAST_CANDIDATE_SHA: ${{ github.sha }}"))
-    #expect(workflow.contains("git -C \"${MLXFAST_JOB_WS}\" update-ref --no-deref HEAD \"${MLXFAST_CANDIDATE_SHA}\""))
+    // git against the (untrusted) bench workspace is hardened against planted
+    // .git/config / hooks / filters executing as the runner uid.
+    #expect(workflow.contains(".github/scripts/hardened-git.sh -C \"${MLXFAST_JOB_WS}\" update-ref --no-deref HEAD \"${MLXFAST_CANDIDATE_SHA}\""))
     #expect(!workflow.contains("git -C \"${MLXFAST_JOB_WS}\" checkout"))
     #expect(workflow.contains("MLXFAST_NOTE: \"ci ${{ github.event_name }} ${{ env.MLXFAST_CANDIDATE_SHA }} mode=single-machine-gates\""))
 
@@ -972,16 +974,19 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // path validates/stages even on failure (always()) so the artifact
     // reflects what ran, gated on validation for submission branches.
     #expect(workflow.contains("if: ${{ always() && !inputs.run_benchmark }}"))
-    // Fourteen ranked steps use the bare run_benchmark guard (no always(), so
+    // Seventeen ranked steps use the bare run_benchmark guard (no always(), so
     // any failure stops the serial chain before the timed measurement):
-    // Check private material, hash transformed weights, Prepare hidden golden,
+    // Check private material, hash transformed weights,
+    // Reap lingering bench processes before hidden material,
+    // Snapshot post-transform workspace, Prepare hidden golden,
     // Attach GPQA gates, Verify trusted harness before gates,
     // Correctness and gates, Validate sealed gates score, Semantic GPQA gate,
-    // Scrub hidden material, Wait for quiescence, Verify trusted harness before
-    // timing, Timed paired benchmark, Overlay paired timing, Validate benchmark
+    // Scrub hidden material, Reap lingering bench processes before timing,
+    // Wait for quiescence, Verify trusted harness before timing,
+    // Timed paired benchmark, Overlay paired timing, Validate benchmark
     // artifacts.
     let bareRunBenchmarkGuardCount = workflow.components(separatedBy: "if: ${{ inputs.run_benchmark }}").count - 1
-    #expect(bareRunBenchmarkGuardCount == 14)
+    #expect(bareRunBenchmarkGuardCount == 17)
     #expect(workflow.contains("if: ${{ always() && inputs.run_benchmark }}"))
     #expect(workflow.contains("golden.sha256=\"${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256\""))
     #expect(workflow.contains("path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results"))
@@ -1116,7 +1121,9 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // The trusted workflow computes a merge-base inside the separately checked
     // out candidate repository and passes it to the trusted review script, so
     // review still runs in diff-only mode without executing candidate scripts.
-    #expect(workflow.contains("base_sha=\"$(git -C .mlxfast-submission-src merge-base \"${TRUSTED_MAIN_SHA}\" \"${actual_sha}\")\""))
+    // The merge-base against the untrusted submission worktree runs through the
+    // hardened git wrapper (neutralized .git/config, hooks, filters, fsmonitor).
+    #expect(workflow.contains("base_sha=\"$(\"${hardened_git}\" -C .mlxfast-submission-src merge-base \"${TRUSTED_MAIN_SHA}\" \"${actual_sha}\")\""))
     #expect(workflow.contains("MLXFAST_SUBMISSION_REVIEW_BASE_SHA=\"${REVIEW_BASE_SHA}\""))
     #expect(!workflow.contains("MLXFAST_SUBMISSION_REVIEW_BASE_SHA=\"$(git merge-base"))
 }
