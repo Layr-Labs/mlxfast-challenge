@@ -180,6 +180,55 @@ func gemma4CachedForwardValidatesEagerPathAndCommitsAfterSuccess() throws {
 }
 
 @Test
+func gemma4SerialDecodeAdvancesOneLogicalAndPhysicalPositionWithoutFutureKVState() throws {
+    guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+        return
+    }
+
+    let logicalCache = makeGemma4ModelCacheFixture()
+    let physicalCache = Gemma4CombinedKVCache(fullStep: 4)
+    var forwardCount = 0
+
+    for position in 0..<3 {
+        var validated = false
+        let visibleKVLength: Int = try executeGemma4CachedForward(
+            cache: logicalCache,
+            positionOffset: position,
+            inputLength: 1,
+            validatesLibraryCacheOffsets: true,
+            validateLibraryCacheOffsets: {
+                validated = true
+                try verifyCachePosition(
+                    positionOffset: position,
+                    cacheOffsets: [physicalCache.offset]
+                )
+            },
+            forward: {
+                forwardCount += 1
+                let currentRow = MLXArray(
+                    [Float(position + 1), Float(position + 101)],
+                    [2, 1, 1, 1, 1]
+                )
+                let visible = physicalCache.updateCombined(currentRow)
+                eval(visible.0, visible.1)
+                #expect(visible.0.shape == [1, 1, position + 1, 1])
+                #expect(visible.1.shape == [1, 1, position + 1, 1])
+                return visible.0.dim(2)
+            }
+        )
+
+        #expect(validated)
+        #expect(forwardCount == position + 1)
+        #expect(logicalCache.expectedPositionOffset == position + 1)
+        #expect(physicalCache.offset == position + 1)
+        #expect(visibleKVLength == position + 1)
+        let visibleState = physicalCache.state
+        #expect(visibleState.count == 2)
+        #expect(visibleState.allSatisfy { $0.dim(2) == position + 1 })
+    }
+}
+
+@Test
 func gemma4CachedForwardCommitsOnlyAfterValidationAndForwardSucceed() {
     let cache = makeGemma4ModelCacheFixture()
     var forwardRan = false

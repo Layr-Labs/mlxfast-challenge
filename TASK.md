@@ -244,6 +244,37 @@ out of scope for this challenge. Only the Gemma 4 text tower is in scope; the
 vision tower is never loaded or executed. These should only be added if the
 official benchmark contract changes to score those paths.
 
+### Serial non-speculative decode rule
+
+**Controlling rule:** In the current serial non-speculative track, each model
+invocation may compute logits and KV rows only for tokens supplied in that
+invocation, and must advance logical and physical KV position by exactly the
+supplied input length. A one-token decode request therefore advances exactly
+one position and leaves no pending future token, logits, or KV state for a
+later request.
+
+This excludes prompt-lookup decoding; n-gram, suffix, or other token-history
+drafting; same-target lookahead; and any other mechanism that selects or
+evaluates an unsupplied future token. It also excludes two-, three-, or
+more-row target-model execution used to verify a draft from a one-token
+request, plus cross-request future-logit/KV buffering, deferred cache rows,
+and commit, rollback, recommit, or discard markers for such rows. These
+mechanisms remain excluded when they are generic, bit-exact, or useful in
+production. Warming an excluded speculative pipeline before the worker
+protocol hello or during model initialization does not make it eligible.
+
+Ordinary within-request KV reuse remains allowed, as do current-token-only
+decode execution and input-independent caches for weights, dequantized
+tensors, kernels, masks, or RoPE tables. Multi-row kernels are allowed when
+every row corresponds to a token actually supplied in that same invocation,
+such as ordinary prefill; the prohibited case is using extra rows to compute
+or verify future tokens for a serial one-token request.
+
+Organizer-provided MTP or other speculative decoding belongs in a separate,
+explicitly declared track with a trusted variable-length block protocol,
+separate correctness rules, and separate scoring. It is not an optimization
+within this track.
+
 The hidden golden file also includes a benchmark oracle. The benchmark validates
 the greedy token after the fixed 512-token prefill prompt, the greedy token
 after the fixed 512-token decode seed, and all 128 tokens produced inside the

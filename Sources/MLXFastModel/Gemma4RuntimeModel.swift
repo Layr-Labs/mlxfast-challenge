@@ -64,24 +64,6 @@ public final class Gemma4RuntimeModel: Module, LanguageModel {
         return Self.logitSoftcap(model.embedTokens.asLinear(hidden), cap)
     }
 
-    var supportsExactPromptLookup: Bool {
-        fastEngine?.supportsExactTwoVector == true
-    }
-
-    func exactPromptLookupPair(
-        _ inputs: MLXArray,
-        cache: [KVCache]
-    ) -> MLXArray {
-        guard let fastEngine, fastEngine.supportsExactTwoVector else {
-            preconditionFailure("exact prompt-lookup engine is unavailable")
-        }
-        return fastEngine.exactTwoVector(inputs, cache: cache)
-    }
-
-    func canRunExactPromptLookup(cache: [KVCache]) -> Bool {
-        fastEngine?.canRunExactTwoVector(cache: cache) == true
-    }
-
     public func prepare(
         _ input: LMInput,
         cache _: [KVCache],

@@ -93,23 +93,19 @@ public enum Gemma4Model {
         } else {
             validatesLibraryCacheOffsets = false
         }
-
-        func validateLibraryCacheOffsets() throws {
-            let kvCaches = cache.kvCache(for: model)
-            try verifyCachePosition(
-                positionOffset: positionOffset,
-                cacheOffsets: kvCaches.map(\.offset)
-            )
-        }
-
-        func ordinaryCachedForward() throws -> MLXArray {
-            try executeGemma4CachedForward(
-                cache: cache,
-                positionOffset: positionOffset,
-                inputLength: inputLength,
-                validatesLibraryCacheOffsets: validatesLibraryCacheOffsets,
-                validateLibraryCacheOffsets: validateLibraryCacheOffsets,
-                forward: {
+        return try executeGemma4CachedForward(
+            cache: cache,
+            positionOffset: positionOffset,
+            inputLength: inputLength,
+            validatesLibraryCacheOffsets: validatesLibraryCacheOffsets,
+            validateLibraryCacheOffsets: {
+                let kvCaches = cache.kvCache(for: model)
+                try verifyCachePosition(
+                    positionOffset: positionOffset,
+                    cacheOffsets: kvCaches.map(\.offset)
+                )
+            },
+            forward: {
                 var kvCaches = cache.kvCache(for: model)
                 // Single-token decode step: optionally route through mlx-swift-lm's
                 // compiled decode (fused, no per-step graph rebuild). The compiled
@@ -142,190 +138,8 @@ public enum Gemma4Model {
                     return model(inputIDs, cache: kvCaches)
                 }
                 return model(inputIDs, cache: kvCaches)
-                }
-            )
-        }
-
-        let hasPendingPromptLookup = cache.promptLookupState.pendingDraft != nil
-            || cache.promptLookupPendingLogits != nil
-        let promptLookupActive = model.supportsExactPromptLookup
-            && gemma4PromptLookupEnvironmentEnabled(ProcessInfo.processInfo.environment)
-            && ProcessInfo.processInfo.environment["DARKBLOOM_COMPILED_DECODE"] != "1"
-        guard promptLookupActive || hasPendingPromptLookup else {
-            return try ordinaryCachedForward()
-        }
-        let inputTokens = gemma4PromptLookupInputTokens(inputIDs)
-        if hasPendingPromptLookup {
-            guard let pendingDraft = cache.promptLookupState.pendingDraft,
-                  let pendingLogits = cache.promptLookupPendingLogits,
-                  let combinedCaches = cache.promptLookupCombinedCaches(
-                      expectedCount: model.configuration.numHiddenLayers),
-                  combinedCaches.allSatisfy(\.hasDeferredCombinedPosition)
-            else {
-                throw MLXFastError.invalidInput(
-                    "prompt-lookup pending state is inconsistent with KV caches")
             }
-            _ = try cache.nextExpectedPositionOffset(
-                positionOffset: positionOffset,
-                inputLength: inputLength
-            )
-            if validatesLibraryCacheOffsets {
-                try validateLibraryCacheOffsets()
-            }
-
-            if inputLength == 1,
-               let actualInput = inputTokens?.first,
-               actualInput == pendingDraft
-            {
-                guard combinedCaches.allSatisfy({
-                    $0.canRecommitDeferredCombinedPosition()
-                }) else {
-                    throw MLXFastError.invalidInput(
-                        "prompt-lookup deferred cache row cannot be recommitted")
-                }
-                let result = try executeGemma4CachedForward(
-                    cache: cache,
-                    positionOffset: positionOffset,
-                    inputLength: 1,
-                    validatesLibraryCacheOffsets: validatesLibraryCacheOffsets,
-                    validateLibraryCacheOffsets: validateLibraryCacheOffsets,
-                    forward: {
-                        for layerCache in combinedCaches {
-                            precondition(layerCache.recommitDeferredCombinedPosition())
-                        }
-                        precondition(combinedCaches.allSatisfy {
-                            $0.offset == positionOffset + 1
-                                && !$0.hasDeferredCombinedPosition
-                        })
-                        return pendingLogits
-                    }
-                )
-                precondition(
-                    cache.promptLookupState.resolvePending(actualInput: actualInput)
-                        == .accepted)
-                cache.promptLookupPendingLogits = nil
-                return result
-            }
-
-            guard combinedCaches.allSatisfy({
-                $0.canDiscardDeferredCombinedPosition()
-            }) else {
-                throw MLXFastError.invalidInput(
-                    "prompt-lookup deferred cache row cannot be discarded")
-            }
-            for layerCache in combinedCaches {
-                precondition(layerCache.discardDeferredCombinedPosition())
-            }
-            precondition(combinedCaches.allSatisfy {
-                $0.offset == positionOffset && !$0.hasDeferredCombinedPosition
-            })
-            cache.promptLookupState.cancelPending()
-            cache.promptLookupPendingLogits = nil
-            // Re-enter the ordinary lookup decision with the actual token.
-            // A rejected draft must not force an otherwise avoidable one-token
-            // model step before the next eligible suffix lookup.
-        }
-
-        if inputLength == 1,
-           compiledDecodeStep == nil,
-           promptLookupActive,
-           cache.promptLookupTrackingValid,
-           cache.promptLookupState.tokens.count == positionOffset,
-           let actualInput = inputTokens?.first,
-           let draft = cache.promptLookupState.draft(appending: actualInput),
-           let combinedCaches = cache.promptLookupCombinedCaches(
-               expectedCount: model.configuration.numHiddenLayers),
-           model.canRunExactPromptLookup(cache: cache.kvCache(for: model)),
-           combinedCaches.allSatisfy({
-               $0.offset == positionOffset
-                   && !$0.hasDeferredCombinedPosition
-                   && $0.canAppendCombinedPair()
-           })
-        {
-            let pairInputs = MLXArray([actualInput, draft], [1, 2])
-            let verifyBits = gemma4PromptLookupVerificationEnabled(
-                ProcessInfo.processInfo.environment)
-            let referenceCaches = verifyBits
-                ? cache.kvCache(for: model).map { $0.copy() }
-                : nil
-            var pendingCandidate: MLXArray?
-            let result = try executeGemma4CachedForward(
-                cache: cache,
-                positionOffset: positionOffset,
-                inputLength: 1,
-                validatesLibraryCacheOffsets: true,
-                validateLibraryCacheOffsets: validateLibraryCacheOffsets,
-                forward: {
-                    let pairLogits = model.exactPromptLookupPair(
-                        pairInputs,
-                        cache: cache.kvCache(for: model)
-                    )
-                    precondition(
-                        pairLogits.dtype == .float32
-                            && pairLogits.shape == [2, 262_144])
-
-                    // The deferred cache bytes must be complete before a later
-                    // mismatch is allowed to overwrite their logical slot.
-                    eval(pairLogits)
-                    cache.materializeCachedState()
-
-                    if let referenceCaches {
-                        let current = MLXArray([actualInput], [1, 1])
-                        let drafted = MLXArray([draft], [1, 1])
-                        let reference0 = model(current, cache: referenceCaches)
-                        eval(reference0)
-                        let reference1 = model(drafted, cache: referenceCaches)
-                        eval(reference1)
-                        gemma4VerifyPromptLookupPair(
-                            pairLogits,
-                            reference0: reference0,
-                            reference1: reference1,
-                            candidateOffsets: cache.kvCache(for: model).map(\.offset),
-                            referenceOffsets: referenceCaches.map(\.offset)
-                        )
-                    }
-
-                    guard combinedCaches.allSatisfy({
-                        $0.offset == positionOffset + 2
-                            && $0.canDeferNewestCombinedPosition()
-                    }) else {
-                        preconditionFailure(
-                            "prompt-lookup pair cannot defer its second cache row")
-                    }
-                    for layerCache in combinedCaches {
-                        precondition(layerCache.deferNewestCombinedPosition())
-                    }
-                    precondition(combinedCaches.allSatisfy {
-                        $0.offset == positionOffset + 1
-                            && $0.hasDeferredCombinedPosition
-                    })
-                    pendingCandidate = pairLogits[1..<2, 0...]
-                        .reshaped(1, 1, 262_144)
-                    return pairLogits[0..<1, 0...]
-                        .reshaped(1, 1, 262_144)
-                }
-            )
-            guard let pendingCandidate else {
-                preconditionFailure("prompt-lookup pair did not retain row-1 logits")
-            }
-            cache.promptLookupState.recordInput(actualInput)
-            cache.promptLookupState.setPendingDraft(draft)
-            cache.promptLookupPendingLogits = pendingCandidate
-            return result
-        }
-
-        let result = try ordinaryCachedForward()
-        if let inputTokens {
-            cache.recordPromptLookupInputs(
-                inputTokens,
-                positionOffset: positionOffset
-            )
-        } else {
-            cache.promptLookupState.reset()
-            cache.promptLookupPendingLogits = nil
-            cache.promptLookupTrackingValid = false
-        }
-        return result
+        )
     }
 
     public static func logits(

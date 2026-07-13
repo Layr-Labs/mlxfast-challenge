@@ -1149,6 +1149,28 @@ func submissionStaticReviewPromptCoversMeasurementStructureExploitation() throws
     #expect(staticReview.contains("harness_protocol"))
     #expect(staticReview.contains("decision_test"))
     #expect(staticReview.contains("input-independent caching"))
+    let speculativeCategories = [
+        "prompt-lookup decoding",
+        "n-gram, suffix, or token-history drafting",
+        "same-target lookahead",
+        "two-, three-, or more-row target-model paths",
+        "cross-request future-token, future-logit, or future-KV buffering",
+        "deferred KV rows and commit, rollback, recommit, or discard markers",
+        "pre-hello or initialization warmup",
+    ]
+    for category in speculativeCategories {
+        #expect(
+            staticReview.contains(category),
+            "static-review policy is missing explicit category: \(category)"
+        )
+    }
+    #expect(staticReview.contains("Controlling serial-track rule: ${serial_decode_rule}"))
+    #expect(staticReview.contains("controlling_serial_track_rule: $serial_decode_rule"))
+    #expect(staticReview.contains("generic, bit-exact, or production-useful"))
+    #expect(staticReview.contains("current-token-only serial decode"))
+    #expect(staticReview.contains("ordinary within-request KV reuse"))
+    #expect(staticReview.contains("every row corresponds to a token supplied in that same invocation"))
+    #expect(staticReview.contains("separate_mtp_track"))
     // Attribution: the judge receives the base..head diff and is told to judge
     // the CHANGES, so code inherited from trusted main inside a touched file
     // cannot by itself fail an innocent submission.
@@ -1157,6 +1179,21 @@ func submissionStaticReviewPromptCoversMeasurementStructureExploitation() throws
     // The published participant rule the review cites must exist.
     let contract = try String(contentsOfFile: "CLAUDE.md", encoding: .utf8)
     #expect(contract.contains("whose only\npossible hit is the benchmark harness repeating an identical computation"))
+
+    for path in ["TASK.md", "AGENTS.md", "CLAUDE.md"] {
+        let publishedRule = try String(contentsOfFile: path, encoding: .utf8)
+        let normalizedRule = publishedRule.lowercased()
+        #expect(
+            normalizedRule.contains("current serial non-speculative track"),
+            "\(path) is missing the controlling serial-track rule"
+        )
+        #expect(normalizedRule.contains("prompt-lookup decoding"))
+        #expect(normalizedRule.contains("same-target lookahead"))
+        #expect(normalizedRule.contains("deferred cache rows"))
+        #expect(normalizedRule.contains("one position and leaves no pending future token"))
+        #expect(normalizedRule.contains("separate"))
+        #expect(normalizedRule.contains("variable-length block protocol"))
+    }
 }
 
 @Test
@@ -1321,6 +1358,54 @@ func submissionStaticReviewDiffModeFailsClosedAndSendsOnlyChangedFiles() throws 
     #expect(request.contains("Sources/MLXFastModel/Changed.swift"))
     #expect(!request.contains("Baseline.swift"))
     #expect(!request.contains("prove the benchmark detects slower measured decode"))
+
+    // Assert the actual API payload, not merely inert strings in the script,
+    // carries the controlling rule and every serial-track category in both the
+    // system instruction and structured user policy.
+    let requestObject = try #require(
+        try JSONSerialization.jsonObject(with: Data(request.utf8)) as? [String: Any]
+    )
+    let systemPrompt = try #require(requestObject["system"] as? String)
+    let messages = try #require(requestObject["messages"] as? [[String: Any]])
+    let content = try #require(messages.first?["content"] as? [[String: Any]])
+    let userText = try #require(content.first?["text"] as? String)
+    let userPolicy = try #require(
+        try JSONSerialization.jsonObject(with: Data(userText.utf8)) as? [String: Any]
+    )
+    let controllingRule = try #require(
+        userPolicy["controlling_serial_track_rule"] as? String
+    )
+    #expect(systemPrompt.contains(controllingRule))
+    #expect(controllingRule.contains("only for tokens supplied in that invocation"))
+    #expect(controllingRule.contains("exactly the supplied input length"))
+    #expect(controllingRule.contains("leaves no pending future token, logits, or KV state"))
+
+    let policy = try #require(userPolicy["policy"] as? [String: Any])
+    let failOn = try #require(policy["fail_on"] as? [String])
+    let allowed = try #require(policy["allow"] as? [String])
+    for category in [
+        "prompt-lookup decoding",
+        "same-target lookahead",
+        "two-, three-, or more-row target-model paths",
+        "cross-request future-token, future-logit, or future-KV buffering",
+        "pre-hello or initialization warmup",
+    ] {
+        #expect(
+            failOn.contains { $0.contains(category) },
+            "outbound static-review policy is missing category: \(category)"
+        )
+        #expect(systemPrompt.contains(category))
+    }
+    for category in [
+        "ordinary within-request KV reuse",
+        "current-token-only serial decode",
+        "multi-row kernels or batching",
+    ] {
+        #expect(
+            allowed.contains { $0.contains(category) },
+            "outbound static-review allowlist is missing category: \(category)"
+        )
+    }
 
     // A deletion-only submission still has executable meaning and must reach
     // the judge through submission_diff instead of taking the no-files pass.

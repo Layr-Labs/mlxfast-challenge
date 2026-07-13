@@ -166,10 +166,6 @@ public final class Gemma4ModelCache {
     /// disabled/unsupported (the adapter falls back to the eager per-step forward).
     var compiledDecodeStep: (@Sendable ([MLXArray]) -> [MLXArray])?
 
-    var promptLookupState = Gemma4PromptLookupState()
-    var promptLookupPendingLogits: MLXArray?
-    var promptLookupTrackingValid = true
-
     /// Adopt the compilable caches that `CompiledDecode.setupCompiledDecode`
     /// promoted in place, so later steps and `materializeCachedState` see them.
     func adoptKVCaches(_ caches: [any KVCache]) {
@@ -201,40 +197,6 @@ public final class Gemma4ModelCache {
 
     func commitExpectedPositionOffset(_ positionOffset: Int) {
         expectedPositionOffset = positionOffset
-    }
-
-    func promptLookupCombinedCaches(expectedCount: Int) -> [Gemma4CombinedKVCache]? {
-        guard compiledDecodeStep == nil,
-              let kvCaches,
-              kvCaches.count == expectedCount
-        else { return nil }
-        let combined = kvCaches.compactMap { $0 as? Gemma4CombinedKVCache }
-        return combined.count == expectedCount ? combined : nil
-    }
-
-    func recordPromptLookupInputs(
-        _ tokens: [Int32],
-        positionOffset: Int
-    ) {
-        guard !tokens.isEmpty else { return }
-        if positionOffset == 0 {
-            promptLookupState.reset(tokens: tokens)
-            promptLookupPendingLogits = nil
-            promptLookupTrackingValid = true
-            return
-        }
-        guard promptLookupTrackingValid,
-              promptLookupState.pendingDraft == nil,
-              promptLookupState.tokens.count == positionOffset
-        else {
-            promptLookupState.reset()
-            promptLookupPendingLogits = nil
-            promptLookupTrackingValid = false
-            return
-        }
-        for token in tokens {
-            promptLookupState.recordInput(token)
-        }
     }
 
     public init(config: Gemma4Config) {

@@ -885,163 +885,6 @@ final class Gemma4FastLayer {
             nextNormalized: nextNormalized
         )
     }
-
-    var supportsExactTwoVector: Bool {
-        let hasQKV = isSliding ? fusedQKV != nil : fusedQK != nil
-        return gemma4ExactTwoVectorLayerIsEligible(
-            hasQKV: hasQKV,
-            hasAttentionPreparation: fusedAttentionRMS != nil,
-            hasAttentionBoundary: fusedAttentionToMLPBoundary != nil,
-            hasNextBoundary: fusedMLPToNextBoundary != nil,
-            hasOutput: indexedOutput?.supportsExactTwoVector == true,
-            hasGateUp: fusedGateUp?.supportsExactTwoVector == true,
-            hasDown: indexedDown?.supportsExactTwoVector == true,
-            usesFusedActivation: useFusedGateUpActivation
-        )
-    }
-
-    func canRunExactTwoVector(offset: Int) -> Bool {
-        supportsExactTwoVector
-            && fusedAttentionRMS?.supportsPrefill(offset: offset, length: 2) == true
-    }
-
-    func exactTwoVector(
-        _ x: MLXArray,
-        normalizedInput: MLXArray?,
-        cache: Gemma4CombinedKVCache
-    ) -> Gemma4FastLayerResult {
-        precondition(supportsExactTwoVector)
-        precondition(x.dtype == .bfloat16 && x.shape == [2, 5_376])
-        precondition(cache.canAppendCombinedPair())
-        let offset = cache.offset
-
-        let h: MLXArray
-        if let normalizedInput {
-            precondition(
-                normalizedInput.dtype == .bfloat16
-                    && normalizedInput.shape == x.shape)
-            h = normalizedInput
-        } else {
-            h = gemma4SerializedTwoRowRMSNorm(
-                x,
-                weight: inputNormWeight,
-                eps: eps
-            )
-        }
-
-        let rawQueries: MLXArray
-        let rawKeys: MLXArray
-        let rawValues: MLXArray?
-        if isSliding, let fusedQKV {
-            let projected = fusedQKV.exactTwoVector(h)
-            rawQueries = projected.queries.reshaped(1, 2, 8_192)
-            rawKeys = projected.keys.reshaped(1, 2, 4_096)
-            rawValues = projected.values.reshaped(1, 2, 4_096)
-        } else if let fusedQK {
-            let projected = fusedQK.exactTwoVector(h)
-            rawQueries = projected.queries.reshaped(1, 2, 16_384)
-            rawKeys = projected.keys.reshaped(1, 2, 2_048)
-            rawValues = nil
-        } else {
-            preconditionFailure("exact two-vector QKV projection is unavailable")
-        }
-
-        guard let fusedAttentionRMS,
-              fusedAttentionRMS.supportsPrefill(offset: offset, length: 2)
-        else {
-            preconditionFailure("exact two-vector attention preparation is unavailable")
-        }
-        let prepared = fusedAttentionRMS.callCombinedQKVPrefill(
-            rawQueries: rawQueries,
-            rawKeys: rawKeys,
-            rawValues: rawValues,
-            offset: offset,
-            length: 2,
-            capacity: 2
-        )
-        let updated = cache.updateCombined(prepared.combinedKV)
-        let beforeDraft = cache.viewsExcludingNewest(1)
-        let attention = gemma4ExactTwoTokenAttention(
-            queries: prepared.queries,
-            keysBeforeDraft: beforeDraft.0,
-            valuesBeforeDraft: beforeDraft.1,
-            keysWithDraft: updated.0,
-            valuesWithDraft: updated.1,
-            scale: scale
-        )
-        let mergedAttention = attention.transposed(0, 2, 1, 3)
-            .reshaped(2, nHeads * headDim)
-        guard let indexedOutput,
-              let fusedAttentionToMLPBoundary,
-              let fusedGateUp,
-              let indexedDown,
-              let fusedMLPToNextBoundary
-        else {
-            preconditionFailure("exact two-vector layer payload is unavailable")
-        }
-        let attentionOutput = indexedOutput.exactTwoVector(mergedAttention)
-        let attentionBoundary = fusedAttentionToMLPBoundary(
-            attentionOutput: attentionOutput,
-            residual: x
-        )
-        let activated = fusedGateUp.exactTwoVectorActivated(attentionBoundary.1)
-        let mlp = indexedDown.exactTwoVector(activated)
-        let mlpBoundary = fusedMLPToNextBoundary(
-            mlpOutput: mlp,
-            residual: attentionBoundary.0
-        )
-        return Gemma4FastLayerResult(
-            hidden: mlpBoundary.0,
-            nextNormalized: mlpBoundary.1
-        )
-    }
-}
-
-func gemma4ExactTwoVectorLayerIsEligible(
-    hasQKV: Bool,
-    hasAttentionPreparation: Bool,
-    hasAttentionBoundary: Bool,
-    hasNextBoundary: Bool,
-    hasOutput: Bool,
-    hasGateUp: Bool,
-    hasDown: Bool,
-    usesFusedActivation: Bool
-) -> Bool {
-    hasQKV
-        && hasAttentionPreparation
-        && hasAttentionBoundary
-        && hasNextBoundary
-        && hasOutput
-        && hasGateUp
-        && hasDown
-        && usesFusedActivation
-}
-
-func gemma4ExactTwoVectorShapeIsSupported(
-    _ shape: [Int],
-    width: Int
-) -> Bool {
-    width > 0 && shape == [2, width]
-}
-
-private func gemma4SerializedTwoRowRMSNorm(
-    _ input: MLXArray,
-    weight: MLXArray,
-    eps: Float
-) -> MLXArray {
-    precondition(input.dtype == .bfloat16 && input.shape == [2, 5_376])
-    let shaped = input.reshaped(1, 2, 5_376)
-    let first = MLXFast.rmsNorm(
-        shaped[0..., 0..<1, 0...],
-        weight: weight,
-        eps: eps
-    )
-    let second = MLXFast.rmsNorm(
-        shaped[0..., 1..<2, 0...],
-        weight: weight,
-        eps: eps
-    )
-    return concatenated([first, second], axis: 1).reshaped(2, 5_376)
 }
 
 /// Manual attention fallback matching the library's batched/ragged path.
@@ -1126,7 +969,6 @@ final class Gemma4FastEngine {
     let tiedVocabularyHead: Gemma4TiedVocabularyHead?
     let usePacked13TiedVocabularyHead: Bool
     let verifyTiedVocabularyHead: Bool
-    let supportsExactTwoVector: Bool
     private let logitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray
 
     init(
@@ -1334,10 +1176,6 @@ final class Gemma4FastEngine {
             )
         }
         self.layers = built
-        self.supportsExactTwoVector = usePacked13TiedVocabularyHead
-            && !verifyTiedVocabularyHead
-            && tiedVocabularyHead?.supportsExactTwoVectorPacked13 == true
-            && built.allSatisfy(\.supportsExactTwoVector)
 
         let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { logits, cap in
             tanh(logits / cap) * cap
@@ -1437,57 +1275,5 @@ final class Gemma4FastEngine {
             logits = embedTokens.asLinear(hidden)
         }
         return logitSoftcap(logits, cap)
-    }
-
-    func exactTwoVector(_ inputs: MLXArray, cache: [KVCache]) -> MLXArray {
-        precondition(canRunExactTwoVector(cache: cache))
-        precondition(inputs.shape == [1, 2])
-        let combinedCaches = cache.compactMap { $0 as? Gemma4CombinedKVCache }
-
-        // Embedding lookup and scaling are deliberately serialized by row. The
-        // paired projection kernels save dense weight traversal; batching this
-        // tiny gather would introduce an unverified shape-dependent boundary.
-        let first = embedTokens(inputs[0..., 0..<1]) * embedScale
-        let second = embedTokens(inputs[0..., 1..<2]) * embedScale
-        var hidden = concatenated([first, second], axis: 1).reshaped(2, 5_376)
-        var normalizedInput: MLXArray?
-        for (index, layer) in layers.enumerated() {
-            let result = layer.exactTwoVector(
-                hidden,
-                normalizedInput: normalizedInput,
-                cache: combinedCaches[index]
-            )
-            hidden = result.hidden
-            normalizedInput = result.nextNormalized
-            let layerNumber = index + 1
-            if asyncLayerGroup > 0,
-               layerNumber >= asyncLayerLead,
-               (layerNumber - asyncLayerLead).isMultiple(of: asyncLayerGroup)
-            {
-                if let normalizedInput {
-                    asyncEval(hidden, normalizedInput)
-                } else {
-                    asyncEval(hidden)
-                }
-            }
-        }
-        guard let normalizedInput, let tiedVocabularyHead else {
-            preconditionFailure("exact two-vector final boundary is unavailable")
-        }
-        return tiedVocabularyHead.exactTwoVectorPacked13Softcapped(
-            normalizedInput,
-            cap: MLXArray(softcap)
-        )
-    }
-
-    func canRunExactTwoVector(cache: [KVCache]) -> Bool {
-        guard supportsExactTwoVector, cache.count == layers.count else { return false }
-        let combinedCaches = cache.compactMap { $0 as? Gemma4CombinedKVCache }
-        guard combinedCaches.count == layers.count,
-              combinedCaches.allSatisfy({ $0.canAppendCombinedPair() })
-        else { return false }
-        return layers.indices.allSatisfy {
-            layers[$0].canRunExactTwoVector(offset: combinedCaches[$0].offset)
-        }
     }
 }

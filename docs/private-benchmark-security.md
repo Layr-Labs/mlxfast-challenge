@@ -269,6 +269,34 @@ Maintainers can also dispatch the workflow on `main`, an operator
 trusted-context guard rejects every other namespace. Those runs execute
 their exact dispatched SHA and skip the submission-only guards.
 
+### Serial-track speculative boundary
+
+The published serial track does not permit prompt-lookup or other
+cross-request speculative decoding. The controlling rule is that each model
+invocation may compute logits and KV rows only for tokens supplied in that
+invocation and must advance logical and physical KV position by exactly that
+input length. A one-token request may not select or evaluate an unsupplied
+future token, run a two-/three-/more-row target verification path, or retain
+future logits/KV and deferred-row commit/rollback state for the next request.
+Pre-hello warmup does not make such a pipeline eligible. Ordinary
+within-request KV reuse, current-token-only execution, input-independent
+caches, and multi-row prefill kernels backed entirely by supplied tokens remain
+allowed.
+
+`run-submission-static-review.sh` quotes this controlling rule and names each
+excluded mechanism in both the system prompt and the structured user policy.
+That review is a detection control. The trusted worker structurally issues
+serial one-token requests and owns the request counter, but submitted model and
+cache code is editable; it can perform hidden extra target work and can lie
+through any pending-state accessor added to that editable surface. The current
+process boundary therefore cannot enforce a truthful in-process
+"no speculative state" attestation. Maintainer frontier audit remains required.
+
+A future organizer MTP track should use a separate trusted variable-length
+block protocol that authorizes draft rows and validates every accepted token
+and position transition. It must define its own correctness and score contract;
+it cannot silently reuse this serial track.
+
 ## Output policy
 
 For `submissions/*` runs:

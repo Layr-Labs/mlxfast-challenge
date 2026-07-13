@@ -86,6 +86,40 @@ Measurement authority (not a constant, but part of the frozen contract):
   retain legitimate within-sequence KV and intermediate-buffer reuse, and their
   work remains charged to the enclosing correctness/decode request sequence.
 
+## Serial decode integrity boundary
+
+The current track is serial and non-speculative. Its controlling rule is that
+each model invocation may compute logits and KV rows only for tokens supplied
+in that invocation, and must advance logical and physical KV position by
+exactly the supplied input length. A one-token decode request therefore
+advances exactly one position and leaves no pending future token, logits, or
+KV state for a later request.
+
+Prompt-lookup or n-gram/history drafting, same-target lookahead, multi-row
+target verification of an unsupplied draft, and cross-request future-logit/KV
+buffering are outside this window. The exclusion is about what work the serial
+request authorizes, not whether an implementation is generic or bit-exact.
+Ordinary within-request KV reuse, input-independent caches, and multi-row
+kernels whose rows all correspond to supplied prefill tokens remain valid.
+
+The trusted worker already controls the protocol shape and advances its own
+decode-step counter one request at a time. It cannot, however, inspect the
+editable model's graph deeply enough to prove that the model did not compute an
+extra target row and hide its logits or KV bytes behind an editable cache
+abstraction. A pending-state accessor or attestation implemented in
+`Sources/MLXFastModel/` would be forgeable and is not a security boundary.
+Static review, source-policy regression tests, and maintainer audit therefore
+remain detection controls, not structural isolation; no brittle keyword
+scanner is represented as a proof of compliance.
+
+Organizer-provided MTP or other speculative execution needs a separate track
+with a trusted variable-length block request/response protocol. That protocol
+must explicitly authorize draft rows, validate each proposed/accepted token
+and resulting position transition, and define separate correctness and scoring
+semantics before it can be ranked. Adding that track would be a benchmark
+contract and baseline decision. This policy clarification does not change the
+current ranked window, score formula, or paired baseline.
+
 ## Frozen ranking contract
 
 Changing these does not require a re-baseline, but it does change how a fixed

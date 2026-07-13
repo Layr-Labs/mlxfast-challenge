@@ -438,3 +438,29 @@ one worker process; any such repetition is a harness bug, never a contract to
 rely on. Input-independent caching (weights, dequantized tensors, RoPE/mask
 tables keyed on shapes and offsets) and within-request KV reuse remain fine.
 Submissions in this category fail the static review as bypass behavior.
+
+### Serial Non-Speculative Track
+
+**Controlling rule:** In the current serial non-speculative track, each model
+invocation may compute logits and KV rows only for tokens supplied in that
+invocation, and must advance logical and physical KV position by exactly the
+supplied input length. A one-token decode request therefore advances exactly
+one position and leaves no pending future token, logits, or KV state for a
+later request.
+
+Prompt-lookup decoding; n-gram, suffix, or token-history drafting;
+same-target lookahead; and any other selection or evaluation of an unsupplied
+future token are excluded. So are two-, three-, or more-row target-model paths
+used to verify a draft from a one-token request, cross-request future-logit/KV
+buffers, deferred cache rows, and commit, rollback, recommit, or discard
+markers for those rows. Generic, bit-exact, or production-useful
+implementations are still excluded under this track. Pre-hello or
+initialization warmup of an excluded speculative pipeline is also excluded.
+
+Ordinary within-request KV reuse, current-token-only decode, and
+input-independent weight, dequantization, kernel, mask, or RoPE caches remain
+allowed. Multi-row kernels remain allowed when every row is backed by a token
+supplied in that same invocation, such as prefill. Organizer-provided MTP or
+other speculative decoding requires a separate explicit track with a trusted
+variable-length block protocol, correctness contract, and score; it is not an
+optimization within this serial track.
