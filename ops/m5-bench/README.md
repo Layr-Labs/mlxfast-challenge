@@ -1,1 +1,0 @@
-`m5-bench-timing.yml` is the operator timing workflow for the self-hosted M5 bench runner, kept here as a reference artifact (intentionally outside `.github/workflows/` so it never runs from this repo); to activate it, copy it into an operator ops repo's `.github/workflows/`.
