@@ -1,4 +1,205 @@
+import Foundation
 import MLX
+
+private func gemma4PrefillAttentionEnvironmentFlag(
+    _ name: String,
+    default defaultValue: Bool
+) -> Bool {
+    guard let raw = ProcessInfo.processInfo.environment[name] else {
+        return defaultValue
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}
+
+// Raw BF16 exact against the promoted path at L512 for both attention modes,
+// both prefill preparation routes, and on the real 31B public prefill.
+private let gemma4DirectPrefillAttentionRMSRoPEDefault = true
+
+private func gemma4RecordDirectPrefillAttentionRMSRoPEVerification(
+    kind: String,
+    arrays: Int,
+    values: Int
+) {
+    FileHandle.standardError.write(Data(
+        (
+            "verify_direct_prefill_attention_rms_rope kind=\(kind) "
+                + "arrays=\(arrays) values=\(values)\n"
+        ).utf8
+    ))
+}
+
+/// Replaces only the final BF16 staging/redistribution portion of the K/V
+/// prefill kernel. The exact promoted per-row RMS reduction remains byte-for-
+/// byte unchanged. RoPE-owning threads reload their two source elements and
+/// recreate the same explicit BF16 normalization and weight multiplications.
+func gemma4DirectCombinedKVPrefillRMSRoPESource(
+    _ reference: String
+) -> String {
+    var source = reference
+
+    let declaration = "threadgroup bfloat normalized_row[kHeadDim];"
+    precondition(source.components(separatedBy: declaration).count == 2)
+    source = source.replacingOccurrences(of: declaration, with: "")
+
+    let stagedBodyStart = "const device bfloat* row_weight ="
+    precondition(source.components(separatedBy: stagedBodyStart).count == 2)
+    guard let stagedRange = source.range(of: stagedBodyStart) else {
+        preconditionFailure("missing staged combined K/V prefill body")
+    }
+
+    let directBody = """
+    if (!is_k) {
+                    for (uint index = 0; index < kReads; ++index) {
+                        const uint dimension =
+                            thread_position_in_threadgroup.x * kReads + index;
+                        const bfloat normalized = static_cast<bfloat>(
+                            input[static_cast<int64_t>(index) * dimension_stride]
+                                * inverse_mean[0]);
+                        output[dimension] =
+                            static_cast<bfloat>(1.0f) * normalized;
+                    }
+                } else {
+                    constexpr uint kPairs = kHeadDim / 2;
+                    constexpr uint kThreads = kHeadDim / kReads;
+                    const device bfloat* row_input = input
+                        - static_cast<int64_t>(
+                            thread_position_in_threadgroup.x * kReads
+                        ) * dimension_stride;
+                    for (uint pair = thread_position_in_threadgroup.x;
+                         pair < kPairs;
+                         pair += kThreads) {
+                        const bfloat normalized_left = static_cast<bfloat>(
+                            row_input[static_cast<int64_t>(pair)
+                                * dimension_stride] * inverse_mean[0]);
+                        const bfloat normalized_right = static_cast<bfloat>(
+                            row_input[static_cast<int64_t>(pair + kPairs)
+                                * dimension_stride] * inverse_mean[0]);
+                        const bfloat weighted_left =
+                            k_weight[pair] * normalized_left;
+                        const bfloat weighted_right =
+                            k_weight[pair + kPairs] * normalized_right;
+                        if (kSharesFullKVReduction) {
+                            combined_kv[
+                                slab_elements
+                                + (projection_head * output_capacity + token)
+                                    * kHeadDim
+                                + pair
+                            ] = static_cast<bfloat>(1.0f) * normalized_left;
+                            combined_kv[
+                                slab_elements
+                                + (projection_head * output_capacity + token)
+                                    * kHeadDim
+                                + pair + kPairs
+                            ] = static_cast<bfloat>(1.0f) * normalized_right;
+                        }
+                        const uint rope_index =
+                            (static_cast<uint>(start_position) + token)
+                                * kPairs + pair;
+                        const float cosine = rope_cosines[rope_index];
+                        const float sine = rope_sines[rope_index];
+                        const float left = static_cast<float>(weighted_left);
+                        const float right = static_cast<float>(weighted_right);
+                        output[pair] = static_cast<bfloat>(
+                            left * cosine - right * sine);
+                        output[pair + kPairs] = static_cast<bfloat>(
+                            left * sine + right * cosine);
+                    }
+                }
+    """
+    source.replaceSubrange(
+        stagedRange.lowerBound..<source.endIndex,
+        with: directBody
+    )
+    precondition(!source.contains("normalized_row"))
+    return source
+}
+
+/// Direct-normalization specialization for the combined Q/K/V prefill kernel.
+/// Like the K/V-only variant, it changes no accumulation, SIMD reduction,
+/// reciprocal-square-root, or BF16 conversion boundary.
+func gemma4DirectCombinedQKVPrefillRMSRoPESource(
+    _ reference: String
+) -> String {
+    var source = reference
+
+    let declaration = "threadgroup bfloat normalized_row[kHeadDim];"
+    precondition(source.components(separatedBy: declaration).count == 2)
+    source = source.replacingOccurrences(of: declaration, with: "")
+
+    let stagedBodyStart = "const bool has_weight = is_q || is_k;"
+    precondition(source.components(separatedBy: stagedBodyStart).count == 2)
+    guard let stagedRange = source.range(of: stagedBodyStart) else {
+        preconditionFailure("missing staged combined Q/K/V prefill body")
+    }
+
+    let directBody = """
+    const bool has_weight = is_q || is_k;
+                const device bfloat* weight = is_q ? q_weight : k_weight;
+                if (!has_weight) {
+                    for (uint index = 0; index < kReads; ++index) {
+                        const uint dimension =
+                            thread_position_in_threadgroup.x * kReads + index;
+                        const bfloat normalized = static_cast<bfloat>(
+                            input[static_cast<int64_t>(index) * dimension_stride]
+                                * inverse_mean[0]);
+                        output[dimension] =
+                            static_cast<bfloat>(1.0f) * normalized;
+                    }
+                } else {
+                    constexpr uint kPairs = kHeadDim / 2;
+                    constexpr uint kThreads = kHeadDim / kReads;
+                    const device bfloat* row_input = input
+                        - static_cast<int64_t>(
+                            thread_position_in_threadgroup.x * kReads
+                        ) * dimension_stride;
+                    for (uint pair = thread_position_in_threadgroup.x;
+                         pair < kPairs;
+                         pair += kThreads) {
+                        const bfloat normalized_left = static_cast<bfloat>(
+                            row_input[static_cast<int64_t>(pair)
+                                * dimension_stride] * inverse_mean[0]);
+                        const bfloat normalized_right = static_cast<bfloat>(
+                            row_input[static_cast<int64_t>(pair + kPairs)
+                                * dimension_stride] * inverse_mean[0]);
+                        const bfloat weighted_left =
+                            weight[pair] * normalized_left;
+                        const bfloat weighted_right =
+                            weight[pair + kPairs] * normalized_right;
+                        if (kSharesFullKVReduction && is_k) {
+                            combined_kv[
+                                slab_elements
+                                + (projection_head * output_capacity + token)
+                                    * kHeadDim
+                                + pair
+                            ] = static_cast<bfloat>(1.0f) * normalized_left;
+                            combined_kv[
+                                slab_elements
+                                + (projection_head * output_capacity + token)
+                                    * kHeadDim
+                                + pair + kPairs
+                            ] = static_cast<bfloat>(1.0f) * normalized_right;
+                        }
+                        const uint rope_index =
+                            (static_cast<uint>(start_position) + token)
+                                * kPairs + pair;
+                        const float cosine = rope_cosines[rope_index];
+                        const float sine = rope_sines[rope_index];
+                        const float left = static_cast<float>(weighted_left);
+                        const float right = static_cast<float>(weighted_right);
+                        output[pair] = static_cast<bfloat>(
+                            left * cosine - right * sine);
+                        output[pair + kPairs] = static_cast<bfloat>(
+                            left * sine + right * cosine);
+                    }
+                }
+    """
+    source.replaceSubrange(
+        stagedRange.lowerBound..<source.endIndex,
+        with: directBody
+    )
+    precondition(!source.contains("normalized_row"))
+    return source
+}
 
 private func makeGemma4FusedAttentionRMSKernel(
     name: String,
@@ -163,18 +364,12 @@ private func makeGemma4CombinedKVPrefillKernel(
     name: String,
     headDim: Int,
     kvHeads: Int,
-    sharesFullKVReduction: Bool
+    sharesFullKVReduction: Bool,
+    directRMSRoPE: Bool = false
 ) -> MLXFast.MLXFastKernel {
     precondition(headDim == 256 || headDim == 512)
     precondition(kvHeads == 16 || kvHeads == 4)
-    return MLXFast.metalKernel(
-        name: name,
-        inputNames: [
-            "raw_k", "raw_v", "k_weight", "start_position", "valid_length",
-            "capacity", "rope_cosines", "rope_sines",
-        ],
-        outputNames: ["combined_kv"],
-        source: """
+    let referenceSource = """
             constexpr uint kHeadDim = \(headDim);
             constexpr uint kKVHeads = \(kvHeads);
             constexpr uint kRowsPerToken =
@@ -305,7 +500,18 @@ private func makeGemma4CombinedKVPrefillKernel(
                         left * sine + right * cosine);
                 }
             }
-            """,
+            """
+    let source = directRMSRoPE
+        ? gemma4DirectCombinedKVPrefillRMSRoPESource(referenceSource)
+        : referenceSource
+    return MLXFast.metalKernel(
+        name: name,
+        inputNames: [
+            "raw_k", "raw_v", "k_weight", "start_position", "valid_length",
+            "capacity", "rope_cosines", "rope_sines",
+        ],
+        outputNames: ["combined_kv"],
+        source: source,
         header: "using namespace metal;",
         ensureRowContiguous: false
     )
@@ -325,6 +531,24 @@ private let gemma4FullCombinedKVPrefill = makeGemma4CombinedKVPrefillKernel(
     sharesFullKVReduction: true
 )
 
+private let gemma4DirectSlidingCombinedKVPrefill =
+    makeGemma4CombinedKVPrefillKernel(
+        name: "gemma4_direct_sliding_combined_kv_prefill_strided_256_v1",
+        headDim: 256,
+        kvHeads: 16,
+        sharesFullKVReduction: false,
+        directRMSRoPE: true
+    )
+
+private let gemma4DirectFullCombinedKVPrefill =
+    makeGemma4CombinedKVPrefillKernel(
+        name: "gemma4_direct_full_combined_kv_prefill_shared_strided_512_v1",
+        headDim: 512,
+        kvHeads: 4,
+        sharesFullKVReduction: true,
+        directRMSRoPE: true
+    )
+
 /// Prefill preparation for all attention projections. Q/K/V remain strided
 /// slices of the combined projection; each threadgroup owns one token/head row
 /// and writes the final query/cache layouts directly.
@@ -332,19 +556,12 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
     name: String,
     headDim: Int,
     kvHeads: Int,
-    sharesFullKVReduction: Bool
+    sharesFullKVReduction: Bool,
+    directRMSRoPE: Bool = false
 ) -> MLXFast.MLXFastKernel {
     precondition(headDim == 256 || headDim == 512)
     precondition(kvHeads == 16 || kvHeads == 4)
-    return MLXFast.metalKernel(
-        name: name,
-        inputNames: [
-            "raw_q", "raw_k", "raw_v", "q_weight", "k_weight",
-            "start_position", "valid_length", "capacity", "rope_cosines",
-            "rope_sines",
-        ],
-        outputNames: ["queries", "combined_kv"],
-        source: """
+    let referenceSource = """
             constexpr uint kHeadDim = \(headDim);
             constexpr uint kQHeads = 32;
             constexpr uint kKVHeads = \(kvHeads);
@@ -501,7 +718,19 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
                         left * sine + right * cosine);
                 }
             }
-            """,
+            """
+    let source = directRMSRoPE
+        ? gemma4DirectCombinedQKVPrefillRMSRoPESource(referenceSource)
+        : referenceSource
+    return MLXFast.metalKernel(
+        name: name,
+        inputNames: [
+            "raw_q", "raw_k", "raw_v", "q_weight", "k_weight",
+            "start_position", "valid_length", "capacity", "rope_cosines",
+            "rope_sines",
+        ],
+        outputNames: ["queries", "combined_kv"],
+        source: source,
         header: "using namespace metal;",
         ensureRowContiguous: false
     )
@@ -521,6 +750,24 @@ private let gemma4FullCombinedQKVPrefillPreparation =
         headDim: 512,
         kvHeads: 4,
         sharesFullKVReduction: true
+    )
+
+private let gemma4DirectSlidingCombinedQKVPrefillPreparation =
+    makeGemma4CombinedQKVPrefillPreparationKernel(
+        name: "gemma4_direct_sliding_combined_qkv_prefill_strided_256_v1",
+        headDim: 256,
+        kvHeads: 16,
+        sharesFullKVReduction: false,
+        directRMSRoPE: true
+    )
+
+private let gemma4DirectFullCombinedQKVPrefillPreparation =
+    makeGemma4CombinedQKVPrefillPreparationKernel(
+        name: "gemma4_direct_full_combined_qkv_prefill_shared_strided_512_v1",
+        headDim: 512,
+        kvHeads: 4,
+        sharesFullKVReduction: true,
+        directRMSRoPE: true
     )
 
 private struct Gemma4PreparedArray: @unchecked Sendable {
@@ -607,6 +854,46 @@ private let gemma4AttentionRopeTables: Gemma4AttentionRopeTables = {
     )
 }()
 
+private func gemma4VerifyDirectPrefillAttentionRMSRoPEOutputs(
+    candidate: [MLXArray],
+    reference: [MLXArray],
+    kind: String
+) {
+    precondition(candidate.count == reference.count)
+    var valueCount = 0
+    for (outputIndex, pair) in zip(candidate, reference).enumerated() {
+        let candidateOutput = pair.0
+        let referenceOutput = pair.1
+        precondition(candidateOutput.dtype == .bfloat16)
+        precondition(referenceOutput.dtype == .bfloat16)
+        precondition(candidateOutput.shape == referenceOutput.shape)
+        valueCount += candidateOutput.size
+        let candidateBits = candidateOutput.view(dtype: .uint16)
+        let referenceBits = referenceOutput.view(dtype: .uint16)
+        let matches = arrayEqual(candidateBits, referenceBits)
+        eval(matches)
+        guard matches.item(Bool.self) else {
+            let candidateValues = candidateBits.asArray(UInt16.self)
+            let referenceValues = referenceBits.asArray(UInt16.self)
+            let mismatch = zip(candidateValues, referenceValues)
+                .enumerated()
+                .first { $0.element.0 != $0.element.1 }
+            preconditionFailure(
+                "direct prefill attention RMS/RoPE raw BF16 mismatch "
+                    + "kind=\(kind) output=\(outputIndex) "
+                    + "index=\(mismatch?.offset ?? -1) "
+                    + "candidate=\(mismatch?.element.0 ?? 0) "
+                    + "reference=\(mismatch?.element.1 ?? 0)"
+            )
+        }
+    }
+    gemma4RecordDirectPrefillAttentionRMSRoPEVerification(
+        kind: kind,
+        arrays: candidate.count,
+        values: valueCount
+    )
+}
+
 struct FusedAttentionRMSPreparation: @unchecked Sendable {
     let isSliding: Bool
     let headDim: Int
@@ -617,6 +904,8 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
     let positionViews: [MLXArray]
     let ropeCosines: MLXArray
     let ropeSines: MLXArray
+    private let directPrefillRMSRoPE: Bool
+    private let verifyDirectPrefillRMSRoPEBits: Bool
 
     init?(
         isSliding: Bool,
@@ -648,6 +937,15 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
         self.ropeSines = isSliding
             ? gemma4AttentionRopeTables.slidingSines
             : gemma4AttentionRopeTables.fullSines
+        self.directPrefillRMSRoPE = gemma4PrefillAttentionEnvironmentFlag(
+            "DARKBLOOM_DIRECT_PREFILL_ATTENTION_RMS_ROPE",
+            default: gemma4DirectPrefillAttentionRMSRoPEDefault
+        )
+        self.verifyDirectPrefillRMSRoPEBits =
+            gemma4PrefillAttentionEnvironmentFlag(
+                "DARKBLOOM_VERIFY_DIRECT_PREFILL_ATTENTION_RMS_ROPE_BITS",
+                default: false
+            )
     }
 
     func supports(offset: Int) -> Bool {
@@ -762,20 +1060,62 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
 
         let threads = headDim / 4
         let rowsPerToken = isSliding ? 2 * kvHeads : kvHeads
-        let kernel = isSliding
-            ? gemma4SlidingCombinedKVPrefill
-            : gemma4FullCombinedKVPrefill
-        return kernel(
-            [
-                rawKeys, valueInput, kNormWeight, positionViews[offset],
-                MLXArray(Int32(length)), MLXArray(Int32(capacity)),
-                ropeCosines, ropeSines,
-            ],
-            grid: (threads, capacity * rowsPerToken, 1),
-            threadGroup: (threads, 1, 1),
-            outputShapes: [[2, 1, kvHeads, capacity, headDim]],
-            outputDTypes: [.bfloat16]
-        )[0]
+        let inputs = [
+            rawKeys, valueInput, kNormWeight, positionViews[offset],
+            MLXArray(Int32(length)), MLXArray(Int32(capacity)),
+            ropeCosines, ropeSines,
+        ]
+        let grid = (threads, capacity * rowsPerToken, 1)
+        let shapes = [[2, 1, kvHeads, capacity, headDim]]
+        let candidate: [MLXArray]?
+        if directPrefillRMSRoPE || verifyDirectPrefillRMSRoPEBits {
+            let candidateKernel = isSliding
+                ? gemma4DirectSlidingCombinedKVPrefill
+                : gemma4DirectFullCombinedKVPrefill
+            candidate = candidateKernel(
+                inputs,
+                grid: grid,
+                threadGroup: (threads, 1, 1),
+                outputShapes: shapes,
+                outputDTypes: [.bfloat16]
+            )
+        } else {
+            candidate = nil
+        }
+        let reference: [MLXArray]?
+        if !directPrefillRMSRoPE || verifyDirectPrefillRMSRoPEBits {
+            let referenceKernel = isSliding
+                ? gemma4SlidingCombinedKVPrefill
+                : gemma4FullCombinedKVPrefill
+            reference = referenceKernel(
+                inputs,
+                grid: grid,
+                threadGroup: (threads, 1, 1),
+                outputShapes: shapes,
+                outputDTypes: [.bfloat16]
+            )
+        } else {
+            reference = nil
+        }
+        if verifyDirectPrefillRMSRoPEBits,
+           let candidate,
+           let reference
+        {
+            gemma4VerifyDirectPrefillAttentionRMSRoPEOutputs(
+                candidate: candidate,
+                reference: reference,
+                kind: isSliding ? "sliding_kv" : "full_kv"
+            )
+        }
+        let outputs = directPrefillRMSRoPE
+            ? (candidate ?? reference)
+            : (reference ?? candidate)
+        guard let outputs else {
+            preconditionFailure(
+                "combined K/V prefill RMS/RoPE kernel was not selected"
+            )
+        }
+        return outputs[0]
     }
 
     /// Multi-token Q/K/V preparation. Queries are emitted as `[1,32,L,D]`
@@ -803,23 +1143,68 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
 
         let threads = headDim / 4
         let kvRowsPerToken = isSliding ? 2 * kvHeads : kvHeads
-        let kernel = isSliding
-            ? gemma4SlidingCombinedQKVPrefillPreparation
-            : gemma4FullCombinedQKVPrefillPreparation
-        let outputs = kernel(
-            [
-                rawQueries, rawKeys, valueInput, qNormWeight, kNormWeight,
-                positionViews[offset], MLXArray(Int32(length)),
-                MLXArray(Int32(capacity)), ropeCosines, ropeSines,
-            ],
-            grid: (threads, length * 32 + capacity * kvRowsPerToken, 1),
-            threadGroup: (threads, 1, 1),
-            outputShapes: [
-                [1, 32, length, headDim],
-                [2, 1, kvHeads, capacity, headDim],
-            ],
-            outputDTypes: [.bfloat16, .bfloat16]
+        let inputs = [
+            rawQueries, rawKeys, valueInput, qNormWeight, kNormWeight,
+            positionViews[offset], MLXArray(Int32(length)),
+            MLXArray(Int32(capacity)), ropeCosines, ropeSines,
+        ]
+        let grid = (
+            threads,
+            length * 32 + capacity * kvRowsPerToken,
+            1
         )
+        let shapes = [
+            [1, 32, length, headDim],
+            [2, 1, kvHeads, capacity, headDim],
+        ]
+        let candidate: [MLXArray]?
+        if directPrefillRMSRoPE || verifyDirectPrefillRMSRoPEBits {
+            let candidateKernel = isSliding
+                ? gemma4DirectSlidingCombinedQKVPrefillPreparation
+                : gemma4DirectFullCombinedQKVPrefillPreparation
+            candidate = candidateKernel(
+                inputs,
+                grid: grid,
+                threadGroup: (threads, 1, 1),
+                outputShapes: shapes,
+                outputDTypes: [.bfloat16, .bfloat16]
+            )
+        } else {
+            candidate = nil
+        }
+        let reference: [MLXArray]?
+        if !directPrefillRMSRoPE || verifyDirectPrefillRMSRoPEBits {
+            let referenceKernel = isSliding
+                ? gemma4SlidingCombinedQKVPrefillPreparation
+                : gemma4FullCombinedQKVPrefillPreparation
+            reference = referenceKernel(
+                inputs,
+                grid: grid,
+                threadGroup: (threads, 1, 1),
+                outputShapes: shapes,
+                outputDTypes: [.bfloat16, .bfloat16]
+            )
+        } else {
+            reference = nil
+        }
+        if verifyDirectPrefillRMSRoPEBits,
+           let candidate,
+           let reference
+        {
+            gemma4VerifyDirectPrefillAttentionRMSRoPEOutputs(
+                candidate: candidate,
+                reference: reference,
+                kind: isSliding ? "sliding_qkv" : "full_qkv"
+            )
+        }
+        let outputs = directPrefillRMSRoPE
+            ? (candidate ?? reference)
+            : (reference ?? candidate)
+        guard let outputs else {
+            preconditionFailure(
+                "combined Q/K/V prefill RMS/RoPE kernel was not selected"
+            )
+        }
         return (outputs[0], outputs[1])
     }
 }
