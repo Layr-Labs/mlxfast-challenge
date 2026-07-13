@@ -536,8 +536,24 @@ private let gemma4OutputCoTiledEnabled = gemma4OutputEnvironmentFlag(
     default: true
 )
 
+// Keep the two decode geometries independently fail-closed while preserving
+// the promoted master switch as their production default.
+private let gemma4OutputCoTiledSlidingEnabled = gemma4OutputEnvironmentFlag(
+    "DARKBLOOM_OUTPUT_COTILED_SLIDING",
+    default: gemma4OutputCoTiledEnabled
+)
+private let gemma4OutputCoTiledFullEnabled = gemma4OutputEnvironmentFlag(
+    "DARKBLOOM_OUTPUT_COTILED_FULL",
+    default: gemma4OutputCoTiledEnabled
+)
+
 private let gemma4VerifyOutputCoTiledBits = gemma4OutputEnvironmentFlag(
     "DARKBLOOM_VERIFY_OUTPUT_COTILED_BITS",
+    default: false
+)
+
+private let gemma4VerifyOutputStockBits = gemma4OutputEnvironmentFlag(
+    "DARKBLOOM_VERIFY_OUTPUT_STOCK_BITS",
     default: false
 )
 
@@ -647,6 +663,8 @@ struct IndexedOutputProjection: @unchecked Sendable {
     private let coTiled: CoTiledOutputPayload?
     private let verifyPacked12Bits: Bool
     private let verifyCoTiledBits: Bool
+    private let verifyStockBits: Bool
+    private let coTiledEnabled: Bool
 
     init?(projection: FastQuantizedProjection) {
         guard let biases = projection.biases else { return nil }
@@ -688,9 +706,15 @@ struct IndexedOutputProjection: @unchecked Sendable {
         )
         self.verifyPacked12Bits = verifyPacked12Bits
         self.verifyCoTiledBits = gemma4VerifyOutputCoTiledBits
+        self.verifyStockBits = gemma4VerifyOutputStockBits
+        let coTiledEnabled = inputWidth == 8_192
+            ? gemma4OutputCoTiledSlidingEnabled
+            : gemma4OutputCoTiledFullEnabled
+        self.coTiledEnabled = coTiledEnabled
 
-        let wantsCoTiled = gemma4OutputCoTiledEnabled
+        let wantsCoTiled = coTiledEnabled
             || gemma4VerifyOutputCoTiledBits
+            || gemma4VerifyOutputStockBits
         let coTiled = wantsCoTiled
             ? CoTiledOutputPayload(
                 projection: projection,
@@ -705,7 +729,7 @@ struct IndexedOutputProjection: @unchecked Sendable {
         // always remain resident for prefill, raw verification, and fallback.
         let needsPacked12 = packed12Enabled
             && (coTiled == nil
-                || !gemma4OutputCoTiledEnabled
+                || !coTiledEnabled
                 || verifyPacked12Bits)
         self.packed12 = needsPacked12
             ? Packed12OutputMetadata(
@@ -737,8 +761,19 @@ struct IndexedOutputProjection: @unchecked Sendable {
                 )
                 rawReference = reference
             }
+            if verifyStockBits {
+                let stock = projection(input)
+                gemma4VerifyRawOutputBF16(
+                    candidate,
+                    reference: stock,
+                    candidateName: "co-tiled fixed\(coTiled.indexBits)",
+                    referenceName: "stock quantizedMM"
+                )
+                // Qualification mode deliberately consumes the trusted oracle.
+                return stock
+            }
 
-            if gemma4OutputCoTiledEnabled {
+            if coTiledEnabled {
                 if verifyPacked12Bits, let packed12 {
                     let packedOutput = packed12Output(
                         input,
@@ -756,6 +791,11 @@ struct IndexedOutputProjection: @unchecked Sendable {
             }
         }
 
+        if verifyStockBits {
+            // A missing co-tiled payload cannot be qualified; still preserve the
+            // verifier contract that only stock output reaches the model.
+            return projection(input)
+        }
         guard let packed12 else {
             return rawReference ?? rawOutput(input, outputShape: outputShape)
         }
