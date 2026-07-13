@@ -329,8 +329,8 @@ run's `score.json`. The `MLXFastConstants.officialBaseline*` constants feed
 ranked denominator is the on-box measured reference (see
 `docs/benchmark-window-freeze.md` for the measurement contract). On the
 local-mode constants, the floors correspond to decode at most
-`0.14064626165296054` seconds/token and prefill at most
-`0.011163191525904606` seconds/token.
+`0.04637500805235746` seconds/token and prefill at most
+`0.0017070057649739585` seconds/token.
 For scoring, decode is trusted parent wall-clock time for decode setup plus the
 checked decode-token window, not worker-reported per-step time. That charges
 prompt-specific seed prefill to the decode phase so submitted model code cannot

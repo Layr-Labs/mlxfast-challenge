@@ -124,12 +124,16 @@ The `officialBaseline*` constants in `Sources/MLXFastCore/Constants.swift` are
 a **cached calibration retained for local-mode estimates and the gates pass's
 skip-timed placeholder timing only** -- the ranked score denominator is the
 live paired baseline measured on the M5 box (next section), never these
-numbers. They were last calibrated on the previous ranked runner generation
-(cold fresh-VM runs, 2026-07-07) and are kept so `--local-iterate` /
-`--local-submit` can print a directional speedup without a second local build:
+numbers. They were last calibrated 2026-07-12 as the mean of the on-box M5
+paired-baseline timings published by 12 consecutive successful ranked runs
+(29179374395 through 29197772284; decode CV 0.08%, prefill CV 0.17%),
+replacing the retired VM-era 2026-07-07 values (decode 0.1336139485703125 /
+prefill 0.010605031949609375) that inflated local estimates ~3.7x. They are
+kept so `--local-iterate` / `--local-submit` can print a directional speedup
+without a second local build:
 
-- `officialBaselineDecodeSecondsPerToken = 0.1336139485703125`
-- `officialBaselinePrefillSecondsPerToken = 0.010605031949609375`
+- `officialBaselineDecodeSecondsPerToken = 0.04405625764973958`
+- `officialBaselinePrefillSecondsPerToken = 0.0016216554767252605`
 
 If either number here disagrees with `Sources/MLXFastCore/Constants.swift`, the
 freeze test fails on purpose -- the doc and the code must move together.

@@ -277,8 +277,8 @@ score would otherwise be above baseline. The
 `MLXFastConstants.officialBaseline*` constants feed local-mode estimates only
 (see `docs/benchmark-window-freeze.md` for the measurement contract); on
 those local-mode constants, the floors correspond to at most
-`0.14064626165296054` seconds/token for decode and
-`0.011163191525904606` seconds/token for prefill.
+`0.04637500805235746` seconds/token for decode and
+`0.0017070057649739585` seconds/token for prefill.
 
 The whole model is RAM-resident with no weight streaming, so
 `bandwidth_gb_per_token` is always `0`, reported with

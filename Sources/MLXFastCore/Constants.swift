@@ -104,16 +104,18 @@ public enum MLXFastConstants {
     public static let prefillBandDownTolerance = 0.05
     public static let decodeBandUpTolerance = 0.02
     public static let decodeBandDownTolerance = 0.05
-    // CACHED Gemma 4 31B 4-bit dense baseline. Calibration provenance: measured
-    // on the since-retired tenki-macos-latest-xlarge VM runner class from COLD
-    // single-benchmark runs (one full 128-step `./benchmark.sh` per fresh
-    // throwaway VM). Values are the robust drop-outlier average (drop the
-    // single slowest, average the rest) of fresh-VM run 28893815980
-    // (2026-07-07, 6 fresh VMs), corroborated by the cold run-1s of run
-    // 28898140493 (10 cold measurements total): decode clustered 0.1332-0.1343
-    // (CV 0.3%); prefill floor ~0.0106 (one +44% spike dropped). Supersedes the
-    // Blacksmith-era values (prefill 0.01010573933984375 / decode
-    // 0.131727461265625).
+    // CACHED Gemma 4 31B 4-bit dense baseline. Calibration provenance: the
+    // live M5 paired baseline as of 2026-07-12 -- the mean of the
+    // `baseline_decode_seconds_per_token` / `baseline_prefill_seconds_per_token`
+    // fields published by 12 consecutive successful ranked runs on the
+    // self-hosted M5 Max (m5-bench), runs 29179374395 through 29197772284
+    // (each field is measure-job's on-box timing of the pinned reference tree
+    // in that run's session): decode clustered 0.04401-0.04411 (CV 0.08%),
+    // prefill 0.001618-0.001626 (CV 0.17%). Supersedes the retired
+    // tenki-macos-latest-xlarge VM-era values (prefill 0.010605031949609375 /
+    // decode 0.1336139485703125, 2026-07-07), which were ~6.5x / ~3.0x slower
+    // than the M5 and inflated local score estimates to ~3.7 for code that
+    // ranks ~1.0.
     //
     // These constants are NOT the ranked scoring denominator. The ranked runner
     // is the single self-hosted M5 Max (m5-bench), where measure-job times the
@@ -124,8 +126,8 @@ public enum MLXFastConstants {
     // estimates (--local-iterate / --local-submit) and the gates-only pass's
     // placeholder timing fields, which the paired-timing overlay replaces. See
     // the paired-baseline section of docs/benchmark-window-freeze.md.
-    public static let officialBaselinePrefillSecondsPerToken = 0.010605031949609375
-    public static let officialBaselineDecodeSecondsPerToken = 0.1336139485703125
+    public static let officialBaselinePrefillSecondsPerToken = 0.0016216554767252605
+    public static let officialBaselineDecodeSecondsPerToken = 0.04405625764973958
     public static let scorePrefillWeight = 0.25
     public static let scoreDecodeWeight = 0.75
     public static let scorePrefillSpeedupFloor = 0.95
