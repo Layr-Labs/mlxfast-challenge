@@ -3,72 +3,78 @@
   "hooks": {
     "beforeSubmitPrompt": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ],
     "afterAgentResponse": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ],
     "afterAgentThought": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ],
     "beforeShellExecution": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ],
     "afterShellExecution": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ],
     "afterFileEdit": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ],
     "postToolUse": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ],
     "postToolUseFailure": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ],
     "afterMCPExecution": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ],
     "subagentStart": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor session"
+      },
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ],
     "subagentStop": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ],
     "sessionStart": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor session"
+      },
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ],
     "sessionEnd": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ],
     "stop": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ]
   }

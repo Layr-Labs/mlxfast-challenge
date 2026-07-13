@@ -1,14 +1,22 @@
 # >>> yukon trace hook (managed) >>>
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "sh \".yukon/hooks/yukon-trace.sh\" codex session"
+[[hooks.SubagentStart]]
+[[hooks.SubagentStart.hooks]]
+type = "command"
+command = "sh \".yukon/hooks/yukon-trace.sh\" codex session"
 [[hooks.UserPromptSubmit]]
 [[hooks.UserPromptSubmit.hooks]]
 type = "command"
-command = "sh '.yukon/hooks/yukon-trace.sh' codex UserPromptSubmit"
+command = "sh \".yukon/hooks/yukon-trace.sh\" codex capture UserPromptSubmit"
 [[hooks.Stop]]
 [[hooks.Stop.hooks]]
 type = "command"
-command = "sh '.yukon/hooks/yukon-trace.sh' codex Stop"
+command = "sh \".yukon/hooks/yukon-trace.sh\" codex capture Stop"
 [[hooks.SubagentStop]]
 [[hooks.SubagentStop.hooks]]
 type = "command"
-command = "sh '.yukon/hooks/yukon-trace.sh' codex SubagentStop"
+command = "sh \".yukon/hooks/yukon-trace.sh\" codex capture SubagentStop"
 # <<< yukon trace hook (managed) <<<
