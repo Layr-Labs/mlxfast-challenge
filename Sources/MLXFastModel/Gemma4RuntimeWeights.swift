@@ -76,9 +76,9 @@ public final class Gemma4RuntimeWeightCache {
         }
     }
 
-    /// One prefill-shaped forward (512 tokens) and one single-token decode
-    /// step against a throwaway cache, evaluated and discarded. Inputs are
-    /// constant BOS tokens, so this is prompt-independent and cannot affect
+    /// One prefill-shaped forward (512 tokens), one single-token decode step,
+    /// and the optional exact two-token path against a throwaway cache. Inputs
+    /// are constant BOS tokens, so this is prompt-independent and cannot affect
     /// model output; freed warmup buffers remain eligible for allocator reuse.
     private static func warmLibraryModel(_ model: Gemma4RuntimeModel) {
         let bosToken = Int32(2)
@@ -90,6 +90,12 @@ public final class Gemma4RuntimeWeightCache {
         eval(model(prefillTokens, cache: warmupCache))
         let decodeToken = MLXArray([bosToken], [1, 1])
         eval(model(decodeToken, cache: warmupCache))
+        if gemma4PromptLookupEnvironmentEnabled(ProcessInfo.processInfo.environment),
+           model.canRunExactPromptLookup(cache: warmupCache)
+        {
+            let pair = MLXArray([bosToken, bosToken], [1, 2])
+            eval(model.exactPromptLookupPair(pair, cache: warmupCache))
+        }
     }
 
     /// Construct and weight-load the mlx-swift-lm Gemma 4 text tower from the

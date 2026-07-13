@@ -907,4 +907,27 @@ struct IndexedOutputProjection: @unchecked Sendable {
             referenceName: "U16 indexed qmv_fast"
         )
     }
+
+    var supportsExactTwoVector: Bool {
+        coTiledEnabled
+            && coTiled != nil
+            && !verifyPacked12Bits
+            && !verifyCoTiledBits
+            && !verifyStockBits
+    }
+
+    func exactTwoVector(_ input: MLXArray) -> MLXArray {
+        precondition(input.dtype == .bfloat16)
+        precondition(input.shape == [2, inputWidth])
+        guard supportsExactTwoVector, let coTiled else {
+            preconditionFailure("exact two-vector output payload is unavailable")
+        }
+        return gemma4ExactTwoVectorIndexedOutput(
+            payload: coTiled.words,
+            lut: metadata.lut,
+            input: input,
+            inputWidth: inputWidth,
+            indexBits: coTiled.indexBits
+        )
+    }
 }

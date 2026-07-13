@@ -351,6 +351,28 @@ struct Gemma4TiedVocabularyHead: @unchecked Sendable {
         )[0]
     }
 
+    var supportsExactTwoVectorPacked13: Bool {
+        packed13Metadata != nil
+    }
+
+    func exactTwoVectorPacked13Softcapped(
+        _ input: MLXArray,
+        cap: MLXArray
+    ) -> MLXArray {
+        precondition(input.dtype == .bfloat16 && input.shape == [2, 5_376])
+        precondition(cap.dtype == .float32 && cap.size == 1)
+        guard let packed13Metadata else {
+            preconditionFailure("exact two-vector tied-head metadata is unavailable")
+        }
+        return gemma4ExactTwoVectorTiedHead(
+            weight: weight,
+            packedIndices: packed13Metadata.packedIndices,
+            lut: packed13Metadata.lut,
+            input: input,
+            cap: cap
+        )
+    }
+
     func verifyRawFloat32(
         _ candidate: MLXArray,
         stock: MLXArray,
