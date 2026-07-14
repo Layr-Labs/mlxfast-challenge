@@ -142,6 +142,24 @@ final class Gemma4CombinedKVCache: KVCache {
         precondition(keys.dtype == values.dtype)
 
         if combinedStorage != nil {
+            let length = keys.dim(2)
+            let canUpdateCombined: Bool
+            switch kind {
+            case .full:
+                canUpdateCombined = length > 0
+            case .rotating(let maxSize, _, _):
+                canUpdateCombined =
+                    length > 0 && rotatingIndex + length <= maxSize
+            }
+            if canUpdateCombined {
+                let combined = stacked([keys, values], axis: 0)
+                switch kind {
+                case .full(let step):
+                    return updateFull(combined, step: step)
+                case .rotating:
+                    return updateRotating(combined)
+                }
+            }
             splitCache = makeUpstreamCache()
             combinedStorage = nil
         }
@@ -153,13 +171,14 @@ final class Gemma4CombinedKVCache: KVCache {
         return result
     }
 
-    /// Single-write optimized path. `combined` must be direct output from the
-    /// fused attention-preparation kernel, with shape `[2,B,Hkv,1,D]`.
+    /// Optimized path for one ordinary or two exact-pair positions.
+    /// `combined` must be direct output from fused attention preparation, with
+    /// shape `[2,B,Hkv,L,D]` where `L` is one or two.
     func updateCombined(_ combined: MLXArray) -> (MLXArray, MLXArray) {
         precondition(combined.ndim == 5)
         precondition(combined.dim(0) == 2)
         precondition(combined.dim(1) == 1)
-        precondition(combined.dim(3) == 1)
+        precondition((1...2).contains(combined.dim(3)))
 
         convertSplitStorageIfNeeded(matching: combined)
         switch kind {
@@ -168,6 +187,33 @@ final class Gemma4CombinedKVCache: KVCache {
         case .rotating:
             return updateRotating(combined)
         }
+    }
+
+    /// Exact-pair verification can grow full storage, but rotating storage must
+    /// remain before its first wrap so row zero can view the serial prefix and
+    /// a rejected row one can be removed by offset-only rollback.
+    func canAppendExactPair() -> Bool {
+        guard combinedStorage != nil, splitCache == nil else { return false }
+        switch kind {
+        case .full:
+            return true
+        case .rotating(let maxSize, _, _):
+            return offset == rotatingIndex && offset + 2 <= maxSize
+        }
+    }
+
+    /// Materialized prefix before the newest exact-pair rows. Rotating caches
+    /// use this only before their first wrap.
+    func viewsExcludingNewest(_ count: Int) -> (MLXArray, MLXArray) {
+        precondition(count >= 0 && count <= offset)
+        guard let combinedStorage else {
+            preconditionFailure("combined KV storage is empty")
+        }
+        if let maxSize = rotatingMaxSize {
+            precondition(offset <= maxSize)
+            precondition(offset <= combinedStorage.dim(3))
+        }
+        return views(range: 0..<(offset - count))
     }
 
     private func convertSplitStorageIfNeeded(matching incoming: MLXArray) {
@@ -198,7 +244,7 @@ final class Gemma4CombinedKVCache: KVCache {
     private func updateFull(_ incoming: MLXArray, step: Int) -> (MLXArray, MLXArray) {
         let previous = offset
         let length = incoming.dim(3)
-        precondition(length == 1)
+        precondition(length > 0)
 
         if combinedStorage == nil || previous + length > combinedStorage!.dim(3) {
             let chunks = (step + length - 1) / step
@@ -228,12 +274,17 @@ final class Gemma4CombinedKVCache: KVCache {
         }
         let previous = offset
         let length = incoming.dim(3)
-        precondition(length == 1)
+        precondition(length > 0)
 
         if combinedStorage == nil
-            || (previous >= combinedStorage!.dim(3) && combinedStorage!.dim(3) < maxSize)
+            || (rotatingIndex + length > combinedStorage!.dim(3)
+                && combinedStorage!.dim(3) < maxSize)
         {
-            let newSize = min(rotatingStep, maxSize - previous)
+            let currentCapacity = combinedStorage?.dim(3) ?? 0
+            let newSize = min(
+                max(rotatingStep, length),
+                maxSize - currentCapacity
+            )
             precondition(newSize > 0)
             let newSpace = MLXArray.zeros(
                 [2, incoming.dim(1), incoming.dim(2), newSize, incoming.dim(4)],

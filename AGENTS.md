@@ -464,3 +464,51 @@ supplied in that same invocation, such as prefill. Organizer-provided MTP or
 other speculative decoding requires a separate explicit track with a trusted
 variable-length block protocol, correctness contract, and score; it is not an
 optimization within this serial track.
+
+### Gemma 4 31B-IT MTP Track (separate, experimental)
+
+That separate track exists as an experimental, not-yet-ranked surface with
+track ID `gemma4-31b-it-mtp-v1`; `docs/experimental-mtp-track.md` is its
+contract. In one paragraph: an organizer-pinned Gemma 4 31B-IT target is
+paired with Google's matched trained assistant (~939 MB organizer-provisioned
+sidecar); a trusted parent drives a block protocol (`mtp_decode_begin`, then
+`mtp_decode_block` carrying only the last committed token and a max block
+size of 4), owns the timer and an independent serial-oracle check of every
+returned token, and divides its own wall time by its configured decode total
+(`--tokens`, default 128, max 512). The participant surface is the drafting
+and verification strategy inside `Sources/MLXFastModel/` — the
+`Gemma4TrainedMTPBlockSession` block decoder and the bit-exact exact-pair
+verification kernels (`Gemma4ExactTwo*.swift`), which verify two target rows
+per dispatch while preserving each row's serial K=1 accumulation order so
+accepted tokens are bit-identical to serial decode. Bit-exactness is a hard
+gate: one token diverging from the parent oracle fails the run, so the track
+cannot be won by degrading output. Proposed scoring (pending operator
+calibration; see the contract fixture's `proposed_scoring`) is decode-only
+paired speedup versus the trusted serial K=1 reference in the same session,
+floor 1.0, on a leaderboard namespace never mixed with the serial track. The
+serial track's rules above are unaffected; MTP mechanisms remain excluded
+from serial submissions.
+
+### Gemma 4 31B-IT MTP Track (separate, experimental)
+
+That separate track exists as an experimental, not-yet-ranked surface with
+track ID `gemma4-31b-it-mtp-v1`; `docs/experimental-mtp-track.md` is its
+contract. In one paragraph: an organizer-pinned Gemma 4 31B-IT target is
+paired with Google's matched trained assistant (~939 MB organizer-provisioned
+sidecar); a trusted parent drives a block protocol (`mtp_decode_begin`, then
+`mtp_decode_block` carrying only the last committed token and a max block
+size of 4), owns the timer and an independent serial-oracle check of every
+returned token, and divides its own wall time by its configured decode total
+(`--tokens`, default 128, max 512). The participant surface is the drafting
+and verification strategy inside `Sources/MLXFastModel/` — the
+`Gemma4TrainedMTPBlockSession` block decoder and the bit-exact exact-pair
+verification kernels (`Gemma4ExactTwo*.swift`), which verify two target rows
+per dispatch while preserving each row's serial K=1 accumulation order so
+accepted tokens are bit-identical to serial decode. Bit-exactness is a hard
+gate: one token diverging from the parent oracle fails the run, so the track
+cannot be won by degrading output. Proposed scoring (pending operator
+calibration; see the contract fixture's `proposed_scoring`) is decode-only
+paired speedup versus the trusted serial K=1 reference in the same session,
+floor 1.0, on a leaderboard namespace never mixed with the serial track. The
+serial track's rules above are unaffected; MTP mechanisms remain excluded
+from serial submissions.

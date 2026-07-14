@@ -744,4 +744,55 @@ struct IndexedDownProjection: @unchecked Sendable {
             "packed 12-bit down projection differs from U16 indexed qmv_fast"
         )
     }
+
+    var supportsExactTwoVector: Bool {
+        !verifyPacked12Bits
+            && !verifyCoTiledFixed12Bits
+            && gemma4ExactTwoVectorDownMode(
+                lutCount: metadata.lut.size,
+                hasFixed12CoTile: coTiledFixed12 != nil,
+                fixed12CoTileEnabled: gemma4DownCoTiledFixed12Enabled
+            ) != nil
+    }
+
+    func exactTwoVector(_ input: MLXArray) -> MLXArray {
+        precondition(input.dtype == .bfloat16 && input.shape == [2, 21_504])
+        guard supportsExactTwoVector else {
+            preconditionFailure("exact two-vector down payload is unavailable")
+        }
+        let mode = gemma4ExactTwoVectorDownMode(
+            lutCount: metadata.lut.size,
+            hasFixed12CoTile: coTiledFixed12 != nil,
+            fixed12CoTileEnabled: gemma4DownCoTiledFixed12Enabled
+        )
+        if mode == .fixed12, let coTiledFixed12 {
+            return gemma4ExactTwoVectorIndexedDown(
+                payload: coTiledFixed12.words,
+                lut: metadata.lut,
+                input: input
+            )
+        }
+        return gemma4ExactTwoVectorU16IndexedDown(
+            weight: projection.weight,
+            indices: metadata.indices,
+            lut: metadata.lut,
+            input: input
+        )
+    }
+}
+
+enum Gemma4ExactTwoVectorDownMode: Equatable {
+    case fixed12
+    case u16
+}
+
+func gemma4ExactTwoVectorDownMode(
+    lutCount: Int,
+    hasFixed12CoTile: Bool,
+    fixed12CoTileEnabled: Bool
+) -> Gemma4ExactTwoVectorDownMode? {
+    if (1...4_096).contains(lutCount) {
+        return hasFixed12CoTile && fixed12CoTileEnabled ? .fixed12 : nil
+    }
+    return (4_097...65_536).contains(lutCount) ? .u16 : nil
 }

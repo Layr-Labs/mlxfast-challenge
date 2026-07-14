@@ -68,6 +68,17 @@ public enum MLXFastConstants {
     // many checked token steps. Charging setup prevents submitted model code
     // from precomputing future decode tokens in an unscored seed-prefill phase.
     public static let benchmarkDecodeSteps = 128
+    // EXPERIMENTAL MTP track limits. This track is deliberately separate from
+    // the frozen one-token benchmark above: it emits diagnostics only and does
+    // not contribute to score.json. Keep the total explicit (rather than
+    // deriving it) so changing either protocol requires a conscious rebaseline.
+    public static let experimentalMTPMaxBlockSize = 4
+    // Compatibility default for callers that do not select an explicit public
+    // oracle length.
+    public static let experimentalMTPMaxTotalTokens = 128
+    // Trusted-parent configured experimental runs may exercise longer tail
+    // boundaries when the selected oracle contains enough tokens.
+    public static let experimentalMTPMaxConfiguredTotalTokens = 512
     public static let localIterateBenchmarkDecodeSteps = 16
     // Local submit uses a longer public fixture so the Yukon pre-submit hook
     // exercises one continuous decode trajectory for about ten minutes instead

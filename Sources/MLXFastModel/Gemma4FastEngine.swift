@@ -115,6 +115,7 @@ private let fastGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
 struct Gemma4FastLayerResult {
     let hidden: MLXArray
     let nextNormalized: MLXArray?
+    let keyValue: (MLXArray, MLXArray)
 }
 
 final class Gemma4FastLayer {
@@ -882,9 +883,179 @@ final class Gemma4FastLayer {
         }
         return Gemma4FastLayerResult(
             hidden: out,
-            nextNormalized: nextNormalized
+            nextNormalized: nextNormalized,
+            keyValue: (keys, values)
         )
     }
+
+    var supportsExactMTPPair: Bool {
+        let hasQKV = isSliding ? fusedQKV != nil : fusedQK != nil
+        return gemma4ExactTwoVectorLayerIsEligible(
+            hasQKV: hasQKV,
+            hasAttentionPreparation: fusedAttentionRMS != nil,
+            hasAttentionBoundary: fusedAttentionToMLPBoundary != nil,
+            hasNextBoundary: fusedMLPToNextBoundary != nil,
+            hasOutput: indexedOutput?.supportsExactTwoVector == true,
+            hasGateUp: fusedGateUp?.supportsExactTwoVector == true,
+            hasDown: indexedDown?.supportsExactTwoVector == true,
+            usesFusedActivation: useFusedGateUpActivation
+        )
+    }
+
+    func canRunExactMTPPair(offset: Int) -> Bool {
+        supportsExactMTPPair
+            && fusedAttentionRMS?.supportsPrefill(
+                offset: offset,
+                length: 2
+            ) == true
+    }
+
+    /// Two MTP target rows with the same per-row accumulation order as K=1.
+    /// Dense projections share each packed-weight traversal; normalization and
+    /// attention retain serial row boundaries.
+    func exactMTPPair(
+        _ x: MLXArray,
+        normalizedInput: MLXArray?,
+        cache: Gemma4CombinedKVCache
+    ) -> Gemma4FastLayerResult {
+        precondition(supportsExactMTPPair)
+        precondition(x.dtype == .bfloat16 && x.shape == [2, 5_376])
+        precondition(cache.canAppendExactPair())
+        let offset = cache.offset
+
+        let h: MLXArray
+        if let normalizedInput {
+            precondition(
+                normalizedInput.dtype == .bfloat16
+                    && normalizedInput.shape == x.shape
+            )
+            h = normalizedInput
+        } else {
+            h = gemma4SerializedTwoRowRMSNorm(
+                x,
+                weight: inputNormWeight,
+                eps: eps
+            )
+        }
+
+        let rawQueries: MLXArray
+        let rawKeys: MLXArray
+        let rawValues: MLXArray?
+        if isSliding, let fusedQKV {
+            let projected = fusedQKV.exactTwoVector(h)
+            rawQueries = projected.queries.reshaped(1, 2, 8_192)
+            rawKeys = projected.keys.reshaped(1, 2, 4_096)
+            rawValues = projected.values.reshaped(1, 2, 4_096)
+        } else if let fusedQK {
+            let projected = fusedQK.exactTwoVector(h)
+            rawQueries = projected.queries.reshaped(1, 2, 16_384)
+            rawKeys = projected.keys.reshaped(1, 2, 2_048)
+            rawValues = nil
+        } else {
+            preconditionFailure("exact MTP pair QKV projection is unavailable")
+        }
+
+        guard let fusedAttentionRMS,
+              fusedAttentionRMS.supportsPrefill(offset: offset, length: 2)
+        else {
+            preconditionFailure(
+                "exact MTP pair attention preparation is unavailable"
+            )
+        }
+        let prepared = fusedAttentionRMS.callCombinedQKVPrefill(
+            rawQueries: rawQueries,
+            rawKeys: rawKeys,
+            rawValues: rawValues,
+            offset: offset,
+            length: 2,
+            capacity: 2
+        )
+        let updated = cache.updateCombined(prepared.combinedKV)
+        let beforeSecondRow = cache.viewsExcludingNewest(1)
+        let attention = gemma4ExactTwoTokenAttention(
+            queries: prepared.queries,
+            keysBeforeDraft: beforeSecondRow.0,
+            valuesBeforeDraft: beforeSecondRow.1,
+            keysWithDraft: updated.0,
+            valuesWithDraft: updated.1,
+            scale: scale
+        )
+        let mergedAttention = attention.transposed(0, 2, 1, 3)
+            .reshaped(2, nHeads * headDim)
+        guard let indexedOutput,
+              let fusedAttentionToMLPBoundary,
+              let fusedGateUp,
+              let indexedDown,
+              let fusedMLPToNextBoundary
+        else {
+            preconditionFailure("exact MTP pair layer payload is unavailable")
+        }
+        let attentionOutput = indexedOutput.exactTwoVector(mergedAttention)
+        let attentionBoundary = fusedAttentionToMLPBoundary(
+            attentionOutput: attentionOutput,
+            residual: x
+        )
+        let activated = fusedGateUp.exactTwoVectorActivated(
+            attentionBoundary.1
+        )
+        let mlp = indexedDown.exactTwoVector(activated)
+        let mlpBoundary = fusedMLPToNextBoundary(
+            mlpOutput: mlp,
+            residual: attentionBoundary.0
+        )
+        return Gemma4FastLayerResult(
+            hidden: mlpBoundary.0,
+            nextNormalized: mlpBoundary.1,
+            keyValue: updated
+        )
+    }
+}
+
+func gemma4ExactTwoVectorLayerIsEligible(
+    hasQKV: Bool,
+    hasAttentionPreparation: Bool,
+    hasAttentionBoundary: Bool,
+    hasNextBoundary: Bool,
+    hasOutput: Bool,
+    hasGateUp: Bool,
+    hasDown: Bool,
+    usesFusedActivation: Bool
+) -> Bool {
+    hasQKV
+        && hasAttentionPreparation
+        && hasAttentionBoundary
+        && hasNextBoundary
+        && hasOutput
+        && hasGateUp
+        && hasDown
+        && usesFusedActivation
+}
+
+func gemma4ExactTwoVectorShapeIsSupported(
+    _ shape: [Int],
+    width: Int
+) -> Bool {
+    width > 0 && shape == [2, width]
+}
+
+private func gemma4SerializedTwoRowRMSNorm(
+    _ input: MLXArray,
+    weight: MLXArray,
+    eps: Float
+) -> MLXArray {
+    precondition(input.dtype == .bfloat16 && input.shape == [2, 5_376])
+    let shaped = input.reshaped(1, 2, 5_376)
+    let first = MLXFast.rmsNorm(
+        shaped[0..., 0..<1, 0...],
+        weight: weight,
+        eps: eps
+    )
+    let second = MLXFast.rmsNorm(
+        shaped[0..., 1..<2, 0...],
+        weight: weight,
+        eps: eps
+    )
+    return concatenated([first, second], axis: 1).reshaped(2, 5_376)
 }
 
 /// Manual attention fallback matching the library's batched/ragged path.
@@ -969,6 +1140,7 @@ final class Gemma4FastEngine {
     let tiedVocabularyHead: Gemma4TiedVocabularyHead?
     let usePacked13TiedVocabularyHead: Bool
     let verifyTiedVocabularyHead: Bool
+    let supportsExactMTPPair: Bool
     private let logitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray
 
     init(
@@ -1176,6 +1348,10 @@ final class Gemma4FastEngine {
             )
         }
         self.layers = built
+        self.supportsExactMTPPair = usePacked13TiedVocabularyHead
+            && !verifyTiedVocabularyHead
+            && tiedVocabularyHead?.supportsExactTwoVectorPacked13 == true
+            && built.allSatisfy(\.supportsExactMTPPair)
 
         let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { logits, cap in
             tanh(logits / cap) * cap
@@ -1275,5 +1451,199 @@ final class Gemma4FastEngine {
             logits = embedTokens.asLinear(hidden)
         }
         return logitSoftcap(logits, cap)
+    }
+
+    func canRunExactMTPPair(cache: [KVCache]) -> Bool {
+        guard supportsExactMTPPair, cache.count == layers.count else {
+            return false
+        }
+        let combinedCaches = cache.compactMap {
+            $0 as? Gemma4CombinedKVCache
+        }
+        guard combinedCaches.count == layers.count,
+              combinedCaches.allSatisfy({ $0.canAppendExactPair() })
+        else {
+            return false
+        }
+        return layers.indices.allSatisfy {
+            layers[$0].canRunExactMTPPair(
+                offset: combinedCaches[$0].offset
+            )
+        }
+    }
+
+    /// MTP-only exact pair target forward. It shares packed weight reads while
+    /// retaining K=1 arithmetic independently for each row.
+    func exactMTPPair(
+        _ inputs: MLXArray,
+        cache: [KVCache]
+    ) -> Gemma4MTPForward {
+        precondition(canRunExactMTPPair(cache: cache))
+        precondition(inputs.dtype == .int32 && inputs.shape == [1, 2])
+        let combinedCaches = cache.compactMap {
+            $0 as? Gemma4CombinedKVCache
+        }
+
+        // Preserve the serial gather/scaling boundary. Weight-sharing begins
+        // only at the dense projections where the exact kernels retain each
+        // row's K=1 reduction order.
+        let first = embedTokens(inputs[0..., 0..<1]) * embedScale
+        let second = embedTokens(inputs[0..., 1..<2]) * embedScale
+        var hidden = concatenated([first, second], axis: 1)
+            .reshaped(2, 5_376)
+        var normalizedInput: MLXArray?
+        var capturedFull: (MLXArray, MLXArray)?
+        var capturedSliding: (MLXArray, MLXArray)?
+        for (index, layer) in layers.enumerated() {
+            let result = layer.exactMTPPair(
+                hidden,
+                normalizedInput: normalizedInput,
+                cache: combinedCaches[index]
+            )
+            hidden = result.hidden
+            normalizedInput = result.nextNormalized
+            if layer.isSliding {
+                capturedSliding = result.keyValue
+            } else {
+                capturedFull = result.keyValue
+            }
+            let layerNumber = index + 1
+            if asyncLayerGroup > 0,
+               layerNumber >= asyncLayerLead,
+               (layerNumber - asyncLayerLead).isMultiple(of: asyncLayerGroup)
+            {
+                if let normalizedInput {
+                    asyncEval(hidden, normalizedInput)
+                } else {
+                    asyncEval(hidden)
+                }
+            }
+        }
+        guard let normalizedInput,
+              let tiedVocabularyHead,
+              let capturedFull,
+              let capturedSliding
+        else {
+            preconditionFailure("exact MTP pair final state is unavailable")
+        }
+        let logits = tiedVocabularyHead.exactTwoVectorPacked13Softcapped(
+            normalizedInput,
+            cap: MLXArray(softcap)
+        )
+        return Gemma4MTPForward(
+            logits: logits.reshaped(1, 2, logits.dim(-1)),
+            lastHidden: hidden.reshaped(1, 2, hidden.dim(-1)),
+            capturedSharedKV: Gemma4SharedKV(
+                fullAttention: capturedFull,
+                slidingAttention: capturedSliding
+            )
+        )
+    }
+
+    /// Multi-position target verification for the trained Gemma 4 assistant.
+    ///
+    /// Unlike the ordinary runtime entry point, this preserves every verify
+    /// position and captures the last full/sliding K/V views. Long prompt
+    /// prefill still projects only its final position because the MTP session
+    /// consumes only the seed logit; K<=4 verification projects every row.
+    func forwardForMTP(
+        _ inputs: MLXArray,
+        cache: [KVCache]
+    ) -> Gemma4MTPForward {
+        precondition(inputs.dim(0) == 1)
+        var hidden = embedTokens(inputs) * embedScale
+
+        func layerCache(_ index: Int) -> KVCache? {
+            index < cache.count ? cache[index] : nil
+        }
+
+        let slidingIndex = layers.firstIndex(where: \.isSliding)
+        let fullIndex = layers.firstIndex(where: { !$0.isSliding })
+        let slidingMask = slidingIndex.map {
+            createAttentionMask(
+                h: hidden,
+                cache: layerCache($0),
+                windowSize: slidingWindow
+            )
+        }
+        let fullMask = fullIndex.map {
+            createAttentionMask(
+                h: hidden,
+                cache: layerCache($0),
+                windowSize: nil
+            )
+        }
+
+        var normalizedInput: MLXArray? = nil
+        var capturedFull: (MLXArray, MLXArray)?
+        var capturedSliding: (MLXArray, MLXArray)?
+        for (index, layer) in layers.enumerated() {
+            let mask = layer.isSliding
+                ? (slidingMask ?? .none)
+                : (fullMask ?? .none)
+            let result = layer(
+                hidden,
+                normalizedInput: normalizedInput,
+                mask: mask,
+                cache: layerCache(index)
+            )
+            hidden = result.hidden
+            normalizedInput = result.nextNormalized
+            if layer.isSliding {
+                capturedSliding = result.keyValue
+            } else {
+                capturedFull = result.keyValue
+            }
+        }
+
+        guard let capturedFull, let capturedSliding else {
+            preconditionFailure(
+                "Gemma 4 MTP verification requires full and sliding K/V"
+            )
+        }
+        let preNorm = inputs.dim(1) > 16
+            ? gemma4LastTokenHidden(hidden)
+            : hidden
+        let postNorm: MLXArray
+        if inputs.dim(1) == 1, let normalizedInput {
+            postNorm = normalizedInput
+        } else {
+            postNorm = MLXFast.rmsNorm(
+                preNorm,
+                weight: finalNormWeight,
+                eps: eps
+            )
+        }
+        let cap = MLXArray(softcap)
+        let logits: MLXArray
+        if let tiedVocabularyHead, usePacked13TiedVocabularyHead {
+            let positionLogits = (0..<postNorm.dim(1)).map {
+                positionIndex in
+                tiedVocabularyHead.packed13Softcapped(
+                    postNorm[
+                        0...,
+                        positionIndex..<(positionIndex + 1),
+                        0...
+                    ],
+                    cap: cap
+                )
+            }
+            logits = positionLogits.count == 1
+                ? positionLogits[0]
+                : concatenated(positionLogits, axis: 1)
+        } else {
+            logits = logitSoftcap(
+                embedTokens.asLinear(postNorm),
+                cap
+            )
+        }
+        return Gemma4MTPForward(
+            logits: logits,
+            lastHidden: preNorm,
+            capturedSharedKV: Gemma4SharedKV(
+                fullAttention: capturedFull,
+                slidingAttention: capturedSliding
+            )
+        )
     }
 }

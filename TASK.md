@@ -275,6 +275,19 @@ explicitly declared track with a trusted variable-length block protocol,
 separate correctness rules, and separate scoring. It is not an optimization
 within this track.
 
+An unranked prototype of that separate track is documented in
+`docs/experimental-mtp-track.md`. Its track ID is
+`gemma4-31b-it-mtp-v1`: it pairs an organizer-pinned Gemma 4 31B-IT target
+with Google's matched organizer-provisioned assistant, permits only
+target-verified blocks of at most four positions, and retains no authority to
+publish a score until a separate M5 reference baseline is established. The
+trusted parent owns the oracle, timer, and denominator; the participant
+surface is the drafting/verification strategy inside
+`Sources/MLXFastModel/` (the block session and the bit-exact exact-pair
+verification kernels), measured decode-only against a same-session paired
+serial reference with a hard bit-exact token gate. This prototype does not
+relax any rule above for the current serial track.
+
 The hidden golden file also includes a benchmark oracle. The benchmark validates
 the greedy token after the fixed 512-token prefill prompt, the greedy token
 after the fixed 512-token decode seed, and all 128 tokens produced inside the
