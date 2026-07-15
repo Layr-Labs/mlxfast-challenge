@@ -1,0 +1,1149 @@
+name: mtp-benchmark
+
+# SEPARATE RANKED TRACK: Gemma 4 31B-IT MTP (track id gemma4-31b-it-mtp-v1).
+#
+# This workflow is the DISTINCT ranked entrypoint for the trusted MTP block
+# track described in docs/experimental-mtp-track.md and pinned by
+# fixtures/gemma_4_31b_it_mtp_track.json. It is fully separate from the
+# serial ranked pipeline (.github/workflows/benchmark.yml): its own track id,
+# its own leaderboard namespace, its own artifacts, its own paired baseline,
+# and its own score shape. Nothing here reads or writes the serial track's
+# score, baseline tree, calibration, or artifact names, and benchmark.json's
+# runner.workflow continues to point at benchmark.yml.
+#
+# INERT UNTIL OPERATOR GO-LIVE (the primary contract of this file today):
+#   The "Enforce MTP track enablement" step below fails closed while the
+#   trusted contract fixture on main still carries
+#   official_scoring_enabled=false or reference_baseline.publication_allowed
+#   =false, while any hidden-golden pin env below is empty, or while the
+#   dispatch lacks confirm_track_enabled=true. Until the operator completes
+#   docs/mtp-track-golive-runbook.md (post-stall-fix validation matrix ->
+#   frozen IT goldens -> floor calibration -> serving-box provisioning) and
+#   flips those trusted fields
+#   in one deliberate commit on main, every dispatch of this workflow stops
+#   at that step: no secrets are used, no submitted code runs, no artifact is
+#   published, and no score exists. For submissions/* dispatches the contract
+#   is read from trusted main, so a submission cannot flip the track on.
+#
+# WHAT A LIVE RUN DOES (after go-live):
+#   1. Verifies the operator-provisioned 31B-IT target + assistant caches
+#      against the checked-in byte manifests (every file, every run).
+#   2. Builds the candidate through the bench-exec bridge and transforms the
+#      IT target source into mtp-weights (sandboxed, network-denied).
+#   3. Runs the untimed MTP correctness/parity gate: one full-length
+#      mtp-benchmark pass over the hidden IT correctness golden. The trusted
+#      parent (GemmaRuntimeMTP) owns the timer, the serial oracle, and the
+#      denominator; a single divergent token fails the run. Report stdout is
+#      sealed in the trusted shell exactly like the serial gates score.
+#   4. Scrubs hidden material back to the post-transform snapshot, reaps
+#      bench processes, and waits for quiescence.
+#   5. Runs the timed paired measurement LAST via the box-owned
+#      MLXFAST_MTP_MEASURE_JOB (fixed 40C thermal contract, 2 Hz macmon
+#      telemetry, throttle/telemetry rejection). Pairing discipline mirrors
+#      the serial track: the decode-only denominator is the trusted serial
+#      K=1 target decode (the mtp-probe path) executed from the PINNED,
+#      operator-owned MTP baseline tree; the numerator is the candidate's
+#      mtp-benchmark decode over the SAME hidden benchmark golden, same
+#      session, same silicon, alternating order, at least
+#      MLXFAST_MTP_MIN_ACCEPTED_PAIRS accepted pairs. Worker-reported timing
+#      has no authority anywhere; the parent divides its own wall time by
+#      its own configured token total.
+#   6. Applies the decode-only score contract in the trusted shell:
+#        mtp_decode_speedup = serial_sec_per_token / mtp_sec_per_token
+#        score = mtp_decode_speedup            (floor >= 1.0, hard)
+#        bit-exact gate: parity_all_ok must be true across every timed run.
+#      There is no prefill component: the MTP protocol charges seed prefill
+#      inside the decode measurement.
+#
+# HOST CONTRACT (operator-provisioned, janitor-audited; consumed, never
+# installed, by this workflow — see docs/mtp-track-golive-runbook.md):
+#   MLXFAST_MTP_TARGET_DIR / MLXFAST_MTP_ASSISTANT_DIR
+#       Read-only runner-owned caches holding exactly the files pinned by
+#       fixtures/mtp_gemma_4_31b_it_4bit.sha256 and
+#       fixtures/mtp_gemma_4_31b_it_assistant_bf16.sha256 (setup-mtp.sh
+#       layout).
+#   MLXFAST_MTP_BASELINE_WS
+#       Pinned prebuilt challenge-repo tree (trusted ref) with mtp-weights
+#       already transformed; the serial mtp-probe denominator runs from
+#       here, never from the candidate workspace, so a submission cannot
+#       slow the reference to inflate its ratio.
+#   MLXFAST_MTP_BASELINE_CALIBRATION
+#       Operator calibration (fresh gated sessions, authored per the go-live
+#       runbook at a ref containing the block-0 stall fix) with sanity bands
+#       for the serial denominator.
+#   MLXFAST_MTP_MEASURE_JOB
+#       Box-owned timing wrapper (sibling of measure-job.sh) with the same
+#       FIXED, non-overridable thermal-stability contract: per-phase
+#       quiescence + reap, GPU < 40C gate before every timed phase (900 s
+#       ceiling), 2 Hz macmon telemetry, throttle/telemetry rejection, one
+#       gated retry, baseline calibration band check, alternating-order
+#       pairs, per-side BENCH_GOLDEN_PATH worker denial of the hidden
+#       benchmark golden, and a sealed results.json of the shape consumed by
+#       "Compute MTP score" below.
+#
+# Dispatch-only, same self-hosted safety rules as the serial pipeline: no
+# PR/push triggers, refs restricted to main, submissions/*, baseline/*, and
+# yukon/baseline/*. Submission branches contribute only the exact dispatched
+# SHA's editablePaths over trusted main. Submitted-process logs are
+# suppressed on submission branches. The static review runs with the MTP
+# track policy (MLXFAST_SUBMISSION_TRACK_ID=gemma4-31b-it-mtp-v1).
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_track_enabled:
+        description: "Operator interlock: confirm the MTP track has been enabled through the go-live runbook. Dispatches without this are refused."
+        required: false
+        default: false
+        type: boolean
+      run_benchmark:
+        description: "Run the timed paired MTP measurement after the correctness/parity gate. false = correctness/parity only."
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mlxfast-mtp-ranked-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  mtp-ranked:
+    name: "single-machine MTP ranked benchmark (m5-bench)"
+    runs-on: [self-hosted, m5-bench]
+    # Serial budget: build (~15m) + IT transform (~10m) + artifact hashing of
+    # the 18.4 GB source (~3m) + full-length parity pass (~15m) + cooldowns
+    # (up to 900s per timed phase) + >=3 alternating timed pairs. Generous
+    # until the track has its own timing history.
+    timeout-minutes: 360
+    environment: benchmark-private-prompts
+    env:
+      # --- Host contract (see header; operator-provisioned, janitor-audited).
+      MLXFAST_BENCH_EXEC: /opt/bench/bench-exec.sh
+      MLXFAST_JANITOR: /opt/bench/janitor.sh
+      MLXFAST_QUARANTINE_FLAG: /opt/bench/quarantine.flag
+      MLXFAST_MACMON: /opt/bench-runner/bin/macmon
+      MLXFAST_MTP_MEASURE_JOB: /opt/bench-runner/measure-mtp-job.sh
+      MLXFAST_MTP_BASELINE_WS: /opt/bench-runner/mtp-baseline/current
+      MLXFAST_MTP_BASELINE_CALIBRATION: /opt/bench-runner/state/mtp-baseline-calibration.json
+      MLXFAST_MEASURE_STATE_DIR: /opt/bench-runner/state
+      MLXFAST_MTP_TARGET_DIR: /opt/bench-runner/cache/mtp/gemma4-31b-it-mtp-v1/target
+      MLXFAST_MTP_ASSISTANT_DIR: /opt/bench-runner/cache/mtp/gemma4-31b-it-mtp-v1/assistant
+      # Bench workspace: distinct stable path from the serial track's
+      # ranked-current (same /Users/Shared/bench-jobs confinement contract,
+      # same absolute-path build-cache reasoning as benchmark.yml).
+      MLXFAST_JOB_WS: /Users/Shared/bench-jobs/mtp-ranked-current
+      # --- Runner-only private material (0700 runner).
+      MLXFAST_PRIVATE_DIR: /tmp/mlxfast-mtp-private-${{ github.run_id }}-${{ github.run_attempt }}
+      MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-mtp-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+      MLXFAST_MEASURE_OUT: /tmp/mlxfast-mtp-measure-${{ github.run_id }}-${{ github.run_attempt }}
+      # --- Track contract.
+      MLXFAST_MTP_TRACK_ID: gemma4-31b-it-mtp-v1
+      MLXFAST_MTP_CONTRACT_PATH: fixtures/gemma_4_31b_it_mtp_track.json
+      MLXFAST_MTP_TARGET_MANIFEST_PATH: fixtures/mtp_gemma_4_31b_it_4bit.sha256
+      MLXFAST_MTP_ASSISTANT_MANIFEST_PATH: fixtures/mtp_gemma_4_31b_it_assistant_bf16.sha256
+      # Decode-only score contract. Keep in sync with the contract fixture's
+      # protocol block; the floor is HARD (an MTP submission that is not
+      # actually faster than trusted serial decode does not rank).
+      MLXFAST_MTP_BLOCK_SIZE: "4"
+      MLXFAST_MTP_DECODE_TOKENS: "128"
+      MLXFAST_MTP_CORRECTNESS_TOKENS: "512"
+      MLXFAST_MTP_DECODE_SPEEDUP_FLOOR: "1.0"
+      MLXFAST_MTP_MIN_ACCEPTED_PAIRS: "3"
+      # Hidden IT-target golden pins — EMPTY until the operator freezes the
+      # goldens (go-live runbook step B) and fills them in the same trusted
+      # commit that flips the contract fixture. The enablement gate fails
+      # closed while any pin is empty, so the workflow cannot run against
+      # unpinned hidden inputs. (The R2 object KEYS are deliberately scoped
+      # to the one trusted download step, exactly like the serial pipeline.)
+      MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256: ""
+      MLXFAST_MTP_CORRECTNESS_GOLDEN_BYTES: ""
+      MLXFAST_MTP_BENCH_GOLDEN_SHA256: ""
+      MLXFAST_MTP_BENCH_GOLDEN_BYTES: ""
+      # --- Benchmark plumbing (identical values/semantics to benchmark.yml).
+      MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+      MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
+      MLXFAST_RUN_BENCHMARK: ${{ inputs.run_benchmark && '1' || '0' }}
+      MLXFAST_CANDIDATE_SHA: ${{ github.sha }}
+      MLXFAST_IS_SUBMISSION_BRANCH: ${{ startsWith(github.ref, 'refs/heads/submissions/') && '1' || '0' }}
+      # Same operator-pinned Metal toolchain as the serial ranked build.
+      MLXFAST_METAL_TOOLCHAIN_IDENTIFIER: com.apple.dt.toolchain.Metal.32023.883
+    steps:
+      # Fail fast if the box is quarantined or the isolation stack is missing,
+      # before any checkout or secret use. MTP-specific host paths are only
+      # asserted after the enablement gate (they do not exist until go-live).
+      - name: Host preflight
+        run: |
+          set -euo pipefail
+          echo "host=$(hostname) chip=$(sysctl -n machdep.cpu.brand_string) user=$(id -un) uid=$(id -u)"
+          if [[ -e "${MLXFAST_QUARANTINE_FLAG}" ]]; then
+            echo "::error::box is quarantined (${MLXFAST_QUARANTINE_FLAG}); janitor detected drift -- see RUNBOOK" >&2
+            exit 1
+          fi
+          test -e "${MLXFAST_BENCH_EXEC}" || { echo "::error::bench-exec bridge missing" >&2; exit 1; }
+          test -e "${MLXFAST_JANITOR}" || { echo "::error::janitor missing" >&2; exit 1; }
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          # Submission branches contribute editable paths only; trusted main
+          # is the harness/workflow/contract base (including the enablement
+          # fixture read below). Main, baseline/*, and yukon/baseline/* run
+          # their exact SHA.
+          ref: ${{ startsWith(github.ref, 'refs/heads/submissions/') && 'main' || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Enforce trusted workflow context
+        run: .github/scripts/enforce-trusted-mtp-benchmark-workflow.sh
+
+      # THE INERT GATE. Everything below this step is unreachable until the
+      # operator deliberately enables the track on trusted main. Order
+      # matters: this runs before any secret use, any submitted-code
+      # handling, and any bench execution.
+      - name: Enforce MTP track enablement
+        env:
+          CONFIRM_TRACK_ENABLED: ${{ inputs.confirm_track_enabled && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          test -s "${MLXFAST_MTP_CONTRACT_PATH}"
+          track_id="$(jq -r '.track_id' "${MLXFAST_MTP_CONTRACT_PATH}")"
+          if [[ "${track_id}" != "${MLXFAST_MTP_TRACK_ID}" ]]; then
+            echo "::error::contract track_id ${track_id} does not match workflow track ${MLXFAST_MTP_TRACK_ID}" >&2
+            exit 1
+          fi
+          scoring_enabled="$(jq -r '.official_scoring_enabled' "${MLXFAST_MTP_CONTRACT_PATH}")"
+          publication_allowed="$(jq -r '.reference_baseline.publication_allowed' "${MLXFAST_MTP_CONTRACT_PATH}")"
+          if [[ "${scoring_enabled}" != "true" || "${publication_allowed}" != "true" ]]; then
+            echo "::error::MTP track ${MLXFAST_MTP_TRACK_ID} is NOT enabled (official_scoring_enabled=${scoring_enabled}, reference_baseline.publication_allowed=${publication_allowed}). This workflow is deliberately inert until the operator completes docs/mtp-track-golive-runbook.md and flips both trusted-contract fields on main." >&2
+            exit 1
+          fi
+          for pin_name in \
+            MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256 \
+            MLXFAST_MTP_CORRECTNESS_GOLDEN_BYTES \
+            MLXFAST_MTP_BENCH_GOLDEN_SHA256 \
+            MLXFAST_MTP_BENCH_GOLDEN_BYTES; do
+            if [[ -z "${!pin_name}" ]]; then
+              echo "::error::hidden MTP golden pin ${pin_name} is empty; freeze the IT-target goldens (go-live runbook step B) and pin them here before enabling the track" >&2
+              exit 1
+            fi
+          done
+          if [[ "${CONFIRM_TRACK_ENABLED}" != "1" ]]; then
+            echo "::error::operator interlock: dispatch requires confirm_track_enabled=true" >&2
+            exit 1
+          fi
+          echo "mtp-benchmark: track ${MLXFAST_MTP_TRACK_ID} enablement verified"
+
+      # MTP-specific host contract, asserted only once the track is live.
+      - name: MTP host preflight
+        run: |
+          set -euo pipefail
+          test -x "${MLXFAST_MTP_MEASURE_JOB}" || { echo "::error::measure-mtp-job missing" >&2; exit 1; }
+          test -x "${MLXFAST_MACMON}" || { echo "::error::macmon missing" >&2; exit 1; }
+          test -f "${MLXFAST_MTP_TARGET_DIR}/config.json" || { echo "::error::MTP target cache missing" >&2; exit 1; }
+          test -f "${MLXFAST_MTP_ASSISTANT_DIR}/config.json" || { echo "::error::MTP assistant cache missing" >&2; exit 1; }
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
+            test -d "${MLXFAST_MTP_BASELINE_WS}" || { echo "::error::pinned MTP baseline workspace missing" >&2; exit 1; }
+            test -s "${MLXFAST_MTP_BASELINE_CALIBRATION}" || { echo "::error::MTP baseline calibration missing" >&2; exit 1; }
+          fi
+
+      - name: Capture candidate commit
+        id: candidate_context
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${CANDIDATE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::candidate SHA must be an exact 40-character lowercase commit SHA" >&2
+            exit 1
+          fi
+          trusted_main_sha="$(git rev-parse HEAD)"
+          printf '%s\n' "${CANDIDATE_SHA}" > candidate.sha
+          printf 'trusted_main_sha=%s\n' "${trusted_main_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout submitted editable paths
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          path: .mlxfast-submission-src
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify submitted commit and modifiable surface
+        id: verify_submission
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        env:
+          SUBMISSION_REF: ${{ github.sha }}
+          TRUSTED_MAIN_SHA: ${{ steps.candidate_context.outputs.trusted_main_sha }}
+        run: |
+          set -euo pipefail
+          hardened_git="${GITHUB_WORKSPACE}/.github/scripts/hardened-git.sh"
+          actual_sha="$("${hardened_git}" -C .mlxfast-submission-src rev-parse HEAD)"
+          if [[ "${actual_sha}" != "${SUBMISSION_REF}" ]]; then
+            echo "::error::submitted checkout resolved to ${actual_sha}, expected ${SUBMISSION_REF}" >&2
+            exit 1
+          fi
+          if ! "${hardened_git}" -C .mlxfast-submission-src cat-file -e "${TRUSTED_MAIN_SHA}^{commit}"; then
+            echo "::error::submitted checkout cannot resolve trusted main commit ${TRUSTED_MAIN_SHA}" >&2
+            exit 1
+          fi
+          base_sha="$("${hardened_git}" -C .mlxfast-submission-src merge-base "${TRUSTED_MAIN_SHA}" "${actual_sha}")"
+          if [[ "${base_sha}" != "${TRUSTED_MAIN_SHA}" ]]; then
+            echo "::error::submission must be based on current trusted main ${TRUSTED_MAIN_SHA}; merge-base is ${base_sha}" >&2
+            exit 1
+          fi
+          (
+            cd .mlxfast-submission-src
+            BASE_SHA="${base_sha}" HEAD_SHA="${actual_sha}" \
+              "${GITHUB_WORKSPACE}/.github/scripts/enforce-modifiable-surface.sh"
+          )
+          if ! "${hardened_git}" cat-file -e "${actual_sha}^{commit}"; then
+            "${hardened_git}" fetch --no-tags .mlxfast-submission-src "${actual_sha}"
+          fi
+          "${hardened_git}" cat-file -e "${actual_sha}^{commit}"
+          printf 'base_sha=%s\n' "${base_sha}" >> "${GITHUB_OUTPUT}"
+          echo "mtp-benchmark: verified submitted commit ${actual_sha} against base ${base_sha}"
+
+      # Static review with the MTP-track policy: organizer-assistant,
+      # target-verified block speculation is permitted; prompt lookup,
+      # assistant substitution, unverified drafts, timing forgery, and
+      # cross-request future state remain fail-worthy.
+      - name: Review submitted code for benchmark bypasses (MTP policy)
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
+          HEAD_SHA: ${{ github.sha }}
+          REVIEW_BASE_SHA: ${{ steps.verify_submission.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          (
+            cd .mlxfast-submission-src
+            MLXFAST_SUBMISSION_TRACK_ID="${MLXFAST_MTP_TRACK_ID}" \
+            MLXFAST_SUBMISSION_REVIEW_BASE_SHA="${REVIEW_BASE_SHA}" \
+              "${GITHUB_WORKSPACE}/.github/scripts/run-submission-static-review.sh"
+          )
+
+      - name: Overlay submitted editable paths
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        env:
+          SUBMISSION_WORKTREE: .mlxfast-submission-src
+        run: .github/scripts/overlay-editable-paths.sh
+
+      - name: Remove submitted checkout
+        if: ${{ always() && startsWith(github.ref, 'refs/heads/submissions/') }}
+        run: |
+          set -euo pipefail
+          rm -rf .mlxfast-submission-src
+          test ! -e .mlxfast-submission-src
+
+      # Same Seatbelt-semantics probe as the serial pipeline: this host's
+      # sandbox-exec must still deny golden reads, private-dir reads,
+      # non-workspace writes, network, and fork/exec under a worker profile.
+      - name: Probe runtime worker sandbox
+        run: .github/scripts/probe-runtime-worker-sandbox.sh
+
+      # The hidden MTP goldens come from R2 in both correctness-only and
+      # timed dispatches, so the secrets must be present either way.
+      - name: Check private material present
+        run: |
+          set -euo pipefail
+          if [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" ]]; then
+            echo "::error::hidden MTP goldens require private R2 secrets" >&2
+            exit 1
+          fi
+
+      # Full content hash of every target and assistant cache file against
+      # the checked-in manifests, every run, plus a strict flat-inventory
+      # check — a corrupted or swapped cache can never feed the transform or
+      # the assistant load. (The runtime revalidates through
+      # GemmaRuntimeMTPProvenance as well; this is the trusted-shell anchor.)
+      - name: Verify MTP target and assistant caches against pinned manifests
+        run: |
+          set -euo pipefail
+          verify_cache() {
+            local manifest="$1" root="$2" label="$3"
+            test -s "${manifest}"
+            local failures=0 checked=0
+            local expected_names=()
+            while read -r want_hash want_bytes rel_path; do
+              [[ -z "${want_hash}" || "${want_hash}" == \#* ]] && continue
+              expected_names+=("${rel_path}")
+              local path="${root}/${rel_path}"
+              if [[ ! -f "${path}" || -L "${path}" ]]; then
+                echo "::error::${label} file missing or not a regular file: ${rel_path}" >&2
+                failures=$((failures + 1))
+                continue
+              fi
+              local actual_bytes actual_hash
+              actual_bytes="$(wc -c < "${path}" | tr -d ' ')"
+              actual_hash="$(shasum -a 256 "${path}" | awk '{print $1}')"
+              if [[ "${actual_bytes}" != "${want_bytes}" || "${actual_hash}" != "${want_hash}" ]]; then
+                echo "::error::${label} file mismatch: ${rel_path}" >&2
+                failures=$((failures + 1))
+              fi
+              checked=$((checked + 1))
+            done < "${manifest}"
+            while IFS= read -r existing; do
+              local name found expected
+              name="$(basename "${existing}")"
+              found=0
+              for expected in "${expected_names[@]}"; do
+                if [[ "${name}" == "${expected}" ]]; then
+                  found=1
+                  break
+                fi
+              done
+              if [[ "${found}" != "1" ]]; then
+                echo "::error::unexpected file in ${label} cache: ${existing}" >&2
+                failures=$((failures + 1))
+              fi
+            done < <(find "${root}" -mindepth 1 -maxdepth 1 -print)
+            if [[ "${failures}" -ne 0 || "${checked}" -eq 0 ]]; then
+              echo "::error::${label} cache failed manifest verification (checked=${checked} failures=${failures})" >&2
+              exit 1
+            fi
+            echo "mtp-benchmark: ${label} cache verified against pinned manifest (${checked} files)"
+          }
+          verify_cache "${MLXFAST_MTP_TARGET_MANIFEST_PATH}" "${MLXFAST_MTP_TARGET_DIR}" "MTP target"
+          verify_cache "${MLXFAST_MTP_ASSISTANT_MANIFEST_PATH}" "${MLXFAST_MTP_ASSISTANT_DIR}" "MTP assistant"
+
+      # Trusted caches are RESTORE-ONLY here: only main-ref dispatches of the
+      # serial benchmark.yml may save into the trusted cache namespaces (the
+      # same anti-poisoning gate), and this workflow never saves at all.
+      - name: Restore trusted SwiftPM dependency cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-trusted-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+
+      - name: Compute MLX Metal library cache fingerprint
+        id: mlx_metallib_fingerprint
+        run: |
+          set -euo pipefail
+          cmake_bin="$(command -v cmake 2>/dev/null || true)"
+          if [[ -z "${cmake_bin}" ]]; then
+            for candidate in /opt/homebrew/bin/cmake /usr/local/bin/cmake; do
+              if [[ -x "${candidate}" ]]; then
+                cmake_bin="${candidate}"
+                break
+              fi
+            done
+          fi
+          test -x "${cmake_bin}"
+          metal_toolchain_identifier="$(
+            xcodebuild -showComponent MetalToolchain 2>/dev/null \
+              | awk -F': ' '/Toolchain Identifier/ { print $2; exit }' \
+              || true
+          )"
+          if [[ -n "${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" \
+              && "${metal_toolchain_identifier}" != "${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" ]]; then
+            echo "::error::installed Metal toolchain (${metal_toolchain_identifier:-none}) does not match the ranked pin (${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}); update the pin or the box deliberately" >&2
+            exit 1
+          fi
+          fingerprint="$({
+            printf '%s\n' mlx-metallib-m5-max-v1
+            uname -m
+            sysctl -n machdep.cpu.brand_string
+            sw_vers -buildVersion
+            xcodebuild -version
+            printf 'METAL_TOOLCHAIN_IDENTIFIER=%s\n' "${metal_toolchain_identifier}"
+            xcrun --sdk macosx --show-sdk-build-version
+            if [[ -n "${metal_toolchain_identifier}" ]]; then
+              TOOLCHAINS="${metal_toolchain_identifier}" xcrun -sdk macosx metal -v 2>&1
+            else
+              xcrun -sdk macosx metal -v 2>&1
+            fi
+            "${cmake_bin}" --version
+            shasum -a 256 Package.swift Package.resolved tools/build-mlx-metallib.sh
+          } | shasum -a 256 | awk '{print $1}')"
+          test "${#fingerprint}" -eq 64
+          printf 'sha256=%s\n' "${fingerprint}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore trusted MLX Metal library cache
+        id: restore_mlx_metallib_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .mlxfast-cache/mlx.metallib
+          key: mlx-metallib-m5-max-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}
+
+      - name: Verify restored MLX Metal library
+        env:
+          CACHE_HIT: ${{ steps.restore_mlx_metallib_cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          if [[ "${CACHE_HIT}" == "true" ]]; then
+            test -s .mlxfast-cache/mlx.metallib
+          else
+            /bin/rm -f .mlxfast-cache/mlx.metallib
+          fi
+
+      - name: Reset staged trusted build products
+        run: /bin/rm -rf .mlxfast-cache/trusted-build
+
+      - name: Restore trusted build products cache
+        id: restore_build_products_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .mlxfast-cache/trusted-build
+          key: bench-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}
+
+      - name: Verify restored build products
+        env:
+          CACHE_HIT: ${{ steps.restore_build_products_cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          if [[ "${CACHE_HIT}" == "true" ]]; then
+            test -d .mlxfast-cache/trusted-build/release
+          else
+            /bin/rm -rf .mlxfast-cache/trusted-build
+          fi
+
+      # Same workspace discipline as the serial pipeline: proven-fresh stable
+      # path, trusted resolve while networked, bench ACL grant, then explicit
+      # bench-deny of every trusted surface (including fixtures/, which
+      # carries the MTP contract and manifests) and a runner-owned
+      # bench-NON-writable staging dir for the predictable-name hidden golden.
+      - name: Prepare bench workspace
+        run: |
+          set -euo pipefail
+          rm -rf "${MLXFAST_JOB_WS}" || true
+          if [[ -e "${MLXFAST_JOB_WS}" || -L "${MLXFAST_JOB_WS}" ]]; then
+            echo "::error::stale bench workspace at ${MLXFAST_JOB_WS} could not be fully removed; run the janitor and retry" >&2
+            exit 1
+          fi
+          cp -c -R "${GITHUB_WORKSPACE}" "${MLXFAST_JOB_WS}" 2>/dev/null \
+            || { rm -rf "${MLXFAST_JOB_WS}"; cp -R "${GITHUB_WORKSPACE}" "${MLXFAST_JOB_WS}"; }
+          .github/scripts/hardened-git.sh -C "${MLXFAST_JOB_WS}" cat-file -e "${MLXFAST_CANDIDATE_SHA}^{commit}"
+          .github/scripts/hardened-git.sh -C "${MLXFAST_JOB_WS}" update-ref --no-deref HEAD "${MLXFAST_CANDIDATE_SHA}"
+          if [[ -d "${MLXFAST_JOB_WS}/.mlxfast-cache/trusted-build/release" ]]; then
+            rm -rf "${MLXFAST_JOB_WS}/.build"
+            mv "${MLXFAST_JOB_WS}/.mlxfast-cache/trusted-build" "${MLXFAST_JOB_WS}/.build"
+            echo "mtp-benchmark: seeded trusted build products into bench workspace"
+          fi
+          mkdir -p "${MLXFAST_PRIVATE_DIR}"
+          chmod 700 "${MLXFAST_PRIVATE_DIR}"
+          mkdir -p "${MLXFAST_JOB_WS}/private"
+          mkdir -p "${MLXFAST_JOB_WS}/.mtp-ranked-src"
+          (cd "${MLXFAST_JOB_WS}" && swift package resolve)
+          /bin/chmod -R +a "user:bench allow list,search,readattr,readextattr,read,execute,add_file,add_subdirectory,delete_child,write,append,writeattr,writeextattr,file_inherit,directory_inherit" "${MLXFAST_JOB_WS}"
+          /bin/chmod -R +a "user:bench deny write,append,writeattr,writeextattr,delete,delete_child,add_file,add_subdirectory,chown,file_inherit,directory_inherit" \
+            "${MLXFAST_JOB_WS}/.github" \
+            "${MLXFAST_JOB_WS}/tools" \
+            "${MLXFAST_JOB_WS}/Sources" \
+            "${MLXFAST_JOB_WS}/correctness_prompts" \
+            "${MLXFAST_JOB_WS}/fixtures" \
+            "${MLXFAST_JOB_WS}/.mtp-ranked-src"
+          /bin/chmod +a "user:bench deny write,append,writeattr,writeextattr,delete,chown" \
+            "${MLXFAST_JOB_WS}/benchmark.sh" \
+            "${MLXFAST_JOB_WS}/benchmark.json" \
+            "${MLXFAST_JOB_WS}/setup-mtp.sh"
+          echo "mtp-benchmark: bench workspace ready at ${MLXFAST_JOB_WS} (trusted harness surfaces ACL-locked against bench writes)"
+
+      # Same conditional-until-live PF egress preflight as the serial
+      # pipeline, run before the first execution of submission-built code.
+      - name: Assert bench network egress lockdown
+        run: |
+          set -euo pipefail
+          probe="$(cat <<'PROBE'
+            set -u
+            [ -x /usr/bin/curl ] || exit 2
+            rc=1
+            for target in https://1.1.1.1 https://8.8.8.8; do
+              if /usr/bin/curl --silent --show-error --max-time 5 --output /dev/null "${target}" 2>/dev/null; then
+                echo "bench egress reached ${target}"
+                rc=0
+                break
+              fi
+            done
+            exit "${rc}"
+          PROBE
+          )"
+          runner_egress=0
+          for target in https://1.1.1.1 https://8.8.8.8; do
+            if /usr/bin/curl --silent --max-time 5 --output /dev/null "${target}" 2>/dev/null; then
+              runner_egress=1
+              break
+            fi
+          done
+          if [[ "${runner_egress}" -ne 1 ]]; then
+            echo "::warning::bench egress preflight cannot assess PF lockdown (trusted-uid egress probe failed; box appears offline); continuing -- trusted network steps will fail closed if the box is truly offline"
+            exit 0
+          fi
+          bench_rc=0
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" /bin/bash -c "${probe}" || bench_rc=$?
+          if [[ "${bench_rc}" -eq 1 ]]; then
+            echo "mtp-benchmark: bench network egress lockdown verified (bench-uid egress blocked)"
+            exit 0
+          fi
+          if [[ "${bench_rc}" -ne 0 ]]; then
+            echo "::warning::bench egress preflight cannot assess PF lockdown (bench probe exited ${bench_rc}: curl unavailable or bridge error); continuing without a verdict"
+            exit 0
+          fi
+          pf_provisioned=0
+          if grep -Eisq 'mlxfast|darkbloom|bench[-_.]?egress|egress[-_.]?bench|uid[-_.]?560|user[[:space:]]+bench|user[[:space:]]+560([^0-9]|$)' /etc/pf.conf /etc/pf.anchors/* 2>/dev/null; then
+            pf_provisioned=1
+          fi
+          if [[ "${MLXFAST_REQUIRE_BENCH_EGRESS_LOCKDOWN:-0}" == "1" ]]; then
+            pf_provisioned=1
+          fi
+          if [[ "${pf_provisioned}" -eq 1 ]]; then
+            echo "::error::bench network egress is NOT locked down (a bench-uid outbound connection succeeded) although the PF bench-egress lockdown is provisioned on this box; refusing to run submitted code" >&2
+            exit 1
+          fi
+          echo "::warning::PF bench-egress lockdown not yet active on this box; egress preflight is dormant (bench-uid egress currently open). It will enforce automatically once the operator ships the PF lockdown."
+
+      - name: Build harness in bench sandbox
+        env:
+          BENCH_JOB_ID: mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-build
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" \
+              GIT_CONFIG_COUNT=2 \
+              GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="${MLXFAST_JOB_WS}" \
+              GIT_CONFIG_KEY_1=safe.directory GIT_CONFIG_VALUE_1="${MLXFAST_JOB_WS}/*" \
+              MLXFAST_METAL_TOOLCHAIN_IDENTIFIER="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" /bin/bash -c '
+              set -euo pipefail
+              cd "${MJOB_WS}"
+              /usr/bin/swift build -c release
+              if [[ -s .mlxfast-cache/mlx.metallib ]]; then
+                /bin/cp .mlxfast-cache/mlx.metallib .build/release/mlx.metallib
+                echo "mtp-benchmark: restored trusted MLX Metal library"
+              else
+                tools/build-mlx-metallib.sh
+              fi
+              /bin/chmod 0644 .build/release/mlx.metallib
+            '
+          test -x "${MLXFAST_JOB_WS}/.build/release/mlxfast-swift"
+          test -s "${MLXFAST_JOB_WS}/.build/release/mlx.metallib"
+          # Pin the trusted harness artifacts NOW (TOCTOU defense); every
+          # later phase that executes the binary as bench re-verifies.
+          .github/scripts/pin-trusted-harness.sh write \
+            "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256"
+
+      # Transform the pinned 31B-IT target source (NOT the serial track's
+      # base checkpoint) into the candidate's runtime weights.
+      - name: Transform MTP target in bench sandbox
+        env:
+          BENCH_JOB_ID: mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-transform
+        run: |
+          set -euo pipefail
+          status=0
+          if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then
+            echo "mtp-benchmark: running submitted transform with private process logs suppressed"
+            # shellcheck disable=SC2024  # trusted shell owns the capture files
+            sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+              /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" MLXFAST_MTP_TARGET_DIR="${MLXFAST_MTP_TARGET_DIR}" \
+                MLXFAST_SANDBOX_PARENT_TOOLS=1 /bin/bash -c '
+                set -euo pipefail
+                cd "${MJOB_WS}"
+                mkdir -p mtp-weights
+                exec .build/release/mlxfast-swift transform \
+                  --reference "${MLXFAST_MTP_TARGET_DIR}" \
+                  --output mtp-weights
+              ' > "${MLXFAST_PRIVATE_DIR}/transform-private.log" 2>&1 || status=$?
+          else
+            sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+              /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" MLXFAST_MTP_TARGET_DIR="${MLXFAST_MTP_TARGET_DIR}" \
+                MLXFAST_SANDBOX_PARENT_TOOLS=1 /bin/bash -c '
+                set -euo pipefail
+                cd "${MJOB_WS}"
+                mkdir -p mtp-weights
+                exec .build/release/mlxfast-swift transform \
+                  --reference "${MLXFAST_MTP_TARGET_DIR}" \
+                  --output mtp-weights
+              ' || status=$?
+          fi
+          test "${status}" -eq 0
+          test -f "${MLXFAST_JOB_WS}/mtp-weights/config.json"
+
+      - name: Hash transformed MTP weights for ranked audit
+        run: .github/scripts/hash-weights-directory.sh "${MLXFAST_JOB_WS}/mtp-weights" mtp-weights.sha256
+
+      # Record every file in the bench workspace BEFORE any hidden material
+      # enters it, for the allowlist scrub before timing (same design and
+      # same reasoning as the serial pipeline).
+      - name: Snapshot post-transform workspace
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" /bin/bash -c '
+              set -u
+              if [ -d "${MJOB_WS}/tmp" ]; then
+                find "${MJOB_WS}/tmp" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
+              fi
+            '
+          manifest="${MLXFAST_PRIVATE_DIR}/post-transform-manifest.nul"
+          find_err="${MLXFAST_PRIVATE_DIR}/post-transform-find.err"
+          set +e
+          ( cd "${MLXFAST_JOB_WS}" && find . -mindepth 1 \( -type f -o -type l \) -print0 2> "${find_err}" ) \
+            | LC_ALL=C sort -z > "${manifest}"
+          set -e
+          if [[ -s "${find_err}" ]]; then
+            if grep -vq 'Permission denied' "${find_err}"; then
+              echo "::error::workspace snapshot hit unexpected find errors (only bench-private Permission denied subtrees are tolerated):" >&2
+              cat "${find_err}" >&2
+              exit 1
+            fi
+            skipped="$(grep -c 'Permission denied' "${find_err}" | tr -d ' ')"
+            echo "mtp-benchmark: snapshot skipped ${skipped} bench-private (0700) subtrees the runner cannot read; the scrub is equally blind there and end-of-job cleanup wipes them"
+          fi
+          test -s "${manifest}"
+          count="$(tr -cd '\0' < "${manifest}" | wc -c | tr -d ' ')"
+          echo "mtp-benchmark: snapshotted ${count} pre-hidden workspace files for the allowlist scrub"
+
+      # Reap stragglers from the unsandboxed build/transform BEFORE hidden
+      # material enters the workspace.
+      - name: Reap lingering bench processes before hidden material
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /bin/bash "${MLXFAST_JOB_WS}/.github/scripts/reap-bench-processes.sh"
+
+      # Trusted download + pin of the hidden IT-target goldens. Raw bytes
+      # live runner-private; only the correctness golden is installed into
+      # the workspace (into the bench-NON-writable .mtp-ranked-src staging
+      # dir, symlink-guarded), because the bench harness PARENT must read it
+      # to drive the oracle. The worker Seatbelt profile denies it by
+      # literal path (BENCH_GOLDEN_PATH). The benchmark golden never enters
+      # the workspace here; measure-mtp-job installs and scrubs it per timed
+      # side.
+      - name: Prepare hidden MTP goldens
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          # Private object keys scoped to this trusted download step only.
+          MLXFAST_MTP_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/mtp_correctness_golden_gemma4_31b_it-v1.json
+          MLXFAST_MTP_BENCH_GOLDEN_R2_PATH: correctness_prompts/mtp_benchmark_golden_gemma4_31b_it-v1.json
+        run: |
+          set -euo pipefail
+          .github/scripts/download-r2-object.sh \
+            "${MLXFAST_MTP_CORRECTNESS_GOLDEN_R2_PATH}" \
+            "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden.json"
+          correctness_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden.json" | awk '{print $1}')"
+          correctness_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden.json" | tr -d ' ')"
+          if [[ "${correctness_hash}" != "${MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256}" || "${correctness_bytes}" != "${MLXFAST_MTP_CORRECTNESS_GOLDEN_BYTES}" ]]; then
+            echo "::error::hidden MTP correctness golden pin mismatch" >&2
+            exit 1
+          fi
+          .github/scripts/download-r2-object.sh \
+            "${MLXFAST_MTP_BENCH_GOLDEN_R2_PATH}" \
+            "${MLXFAST_PRIVATE_DIR}/mtp_benchmark_golden.json"
+          bench_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/mtp_benchmark_golden.json" | awk '{print $1}')"
+          bench_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/mtp_benchmark_golden.json" | tr -d ' ')"
+          if [[ "${bench_hash}" != "${MLXFAST_MTP_BENCH_GOLDEN_SHA256}" || "${bench_bytes}" != "${MLXFAST_MTP_BENCH_GOLDEN_BYTES}" ]]; then
+            echo "::error::hidden MTP benchmark golden pin mismatch" >&2
+            exit 1
+          fi
+          golden_dst="${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json"
+          if [[ -e "${golden_dst}" || -L "${golden_dst}" ]]; then
+            echo "::error::refusing to place hidden input over pre-existing path ${golden_dst}" >&2
+            exit 1
+          fi
+          install -m 0444 "${MLXFAST_PRIVATE_DIR}/mtp_correctness_golden.json" "${golden_dst}"
+          echo "mtp-benchmark: hidden goldens verified (correctness ${correctness_hash}, benchmark ${bench_hash})"
+
+      # TOCTOU guard: the submitted transform ran with workspace write access
+      # since the post-build pin.
+      - name: Verify trusted harness before MTP correctness gate
+        run: .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256"
+
+      # The untimed MTP correctness/parity gate: one full-length trained-MTP
+      # pass over the hidden correctness golden. The trusted parent checks
+      # every returned token against the serial oracle (a single divergence
+      # fails), enforces the block protocol, and re-validates target and
+      # assistant artifacts before and after load. Stdout (the diagnostic
+      # report JSON) is sealed in this trusted shell; on-disk files are never
+      # trusted. Ordered BEFORE the timed phase so a broken submission never
+      # burns gated thermal time.
+      - name: MTP correctness and parity gate (untimed)
+        env:
+          BENCH_JOB_ID: mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-gates
+          # Worker Seatbelt literal deny for the hidden correctness golden:
+          # only the harness parent may read it. Kept through sudo env_reset
+          # via the sudoers env_keep list, exactly like the serial pipeline.
+          BENCH_GOLDEN_PATH: ${{ env.MLXFAST_JOB_WS }}/.mtp-ranked-src/mtp_correctness_golden.json
+        run: |
+          set -euo pipefail
+          raw_stdout="${MLXFAST_PRIVATE_DIR}/mtp-gates-stdout.raw"
+          gates_log="${MLXFAST_PRIVATE_DIR}/mtp-gates-private.log"
+          started="${SECONDS}"
+          status=0
+          # shellcheck disable=SC2024  # trusted shell owns the capture files
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env \
+              MJOB_WS="${MLXFAST_JOB_WS}" \
+              MLXFAST_MTP_TARGET_DIR="${MLXFAST_MTP_TARGET_DIR}" \
+              MLXFAST_MTP_ASSISTANT_DIR="${MLXFAST_MTP_ASSISTANT_DIR}" \
+              MLXFAST_MTP_CONTRACT_PATH="${MLXFAST_MTP_CONTRACT_PATH}" \
+              MLXFAST_MTP_BLOCK_SIZE="${MLXFAST_MTP_BLOCK_SIZE}" \
+              MLXFAST_MTP_CORRECTNESS_TOKENS="${MLXFAST_MTP_CORRECTNESS_TOKENS}" \
+              /bin/bash -c '
+                set -u
+                cd "${MJOB_WS}" || exit 97
+                exec .build/release/mlxfast-swift mtp-benchmark \
+                  --target-source "${MLXFAST_MTP_TARGET_DIR}" \
+                  --weights mtp-weights \
+                  --assistant "${MLXFAST_MTP_ASSISTANT_DIR}" \
+                  --contract "${MLXFAST_MTP_CONTRACT_PATH}" \
+                  --golden .mtp-ranked-src/mtp_correctness_golden.json \
+                  --block-size "${MLXFAST_MTP_BLOCK_SIZE}" \
+                  --tokens "${MLXFAST_MTP_CORRECTNESS_TOKENS}" \
+                  --target-verification exact-pair \
+                  --require-trained-assistant
+              ' > "${raw_stdout}" 2> "${gates_log}" || status=$?
+          if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" != "1" ]]; then
+            cat "${gates_log}" || true
+          fi
+          # Seal + validate: exactly one JSON object with the MTP report
+          # shape, every token matched, trained drafter in use, and no score
+          # fields (this phase is a gate, not a measurement).
+          if [[ "$(jq -s 'length' "${raw_stdout}" 2>/dev/null)" != "1" ]]; then
+            echo "::error::MTP correctness gate did not emit a single valid report payload (exit=${status})" >&2
+            exit 1
+          fi
+          jq -e \
+            --arg track "${MLXFAST_MTP_TRACK_ID}" \
+            --argjson tokens "${MLXFAST_MTP_CORRECTNESS_TOKENS}" \
+            '
+            .experimental == true
+            and .track_id == $track
+            and .uses_trained_drafter == true
+            and .target_verification_mode == "exact-pair"
+            and .decode_token_count == $tokens
+            and .all_tokens_matched == true
+            and .official_score_produced == false
+            and (has("score") | not)
+            and (has("speedup") | not)
+            ' "${raw_stdout}" >/dev/null || {
+              echo "::error::MTP correctness gate report failed validation (exit=${status})" >&2
+              exit 1
+            }
+          cp "${raw_stdout}" mtp-gates-report.json
+          echo "mtp-benchmark: correctness/parity gate passed in $((SECONDS - started))s (exit=${status})"
+          exit "${status}"
+
+      # ---- correctness-only (run_benchmark=false) artifact path ------------
+      - name: Stage MTP correctness artifacts
+        id: stage_mtp_correctness_artifacts
+        if: ${{ !inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          test "$(cat candidate.sha)" = "${MLXFAST_CANDIDATE_SHA}"
+          .github/scripts/deny-private-artifacts.sh \
+            candidate.sha \
+            mtp-gates-report.json \
+            mtp-weights.sha256
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/mtp-correctness-results" \
+            candidate.sha=candidate.sha \
+            mtp-gates-report.json=mtp-gates-report.json \
+            mtp-weights.sha256=mtp-weights.sha256
+
+      - name: Upload MTP correctness artifacts
+        if: always() && steps.stage_mtp_correctness_artifacts.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: mtp-correctness-results-${{ github.run_id }}
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/mtp-correctness-results
+          if-no-files-found: error
+          overwrite: true
+
+      # ---- ranked path (run_benchmark=true) ---------------------------------
+      # Restore the workspace to its pre-hidden snapshot BEFORE the timed
+      # phase: remove the hidden correctness golden, purge bench scratch
+      # through the bridge, allowlist-delete every gates-phase file, and
+      # re-verify mtp-weights against its pinned hash.
+      - name: Scrub hidden material from bench workspace
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          rm -f "${MLXFAST_JOB_WS}/.mtp-ranked-src/mtp_correctness_golden.json"
+          rm -rf "${MLXFAST_JOB_WS}/private"
+          mkdir -p "${MLXFAST_JOB_WS}/private"
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" /bin/bash -c '
+              set -u
+              if [ -d "${MJOB_WS}/tmp" ]; then
+                find "${MJOB_WS}/tmp" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
+              fi
+            '
+          manifest="${MLXFAST_PRIVATE_DIR}/post-transform-manifest.nul"
+          test -s "${manifest}"
+          scrub_failed=0
+          while IFS= read -r -d '' rel; do
+            case "${rel}" in
+              ./mtp-weights/*|./.build/*|./correctness_prompts/*) continue ;;
+              ./private/*) continue ;;
+            esac
+            if grep -zqxF -- "${rel}" "${manifest}"; then
+              continue
+            fi
+            target="${MLXFAST_JOB_WS}/${rel#./}"
+            rm -f -- "${target}" 2>/dev/null || true
+            if [[ -e "${target}" || -L "${target}" ]]; then
+              echo "::error::allowlist scrub could not remove gates-phase workspace file: ${rel}" >&2
+              scrub_failed=1
+            fi
+          done < <(cd "${MLXFAST_JOB_WS}" && find . -mindepth 1 \( -type f -o -type l \) -print0 | LC_ALL=C sort -z)
+          if [[ "${scrub_failed}" -ne 0 ]]; then
+            echo "::error::allowlist scrub left gates-phase workspace files it could not delete" >&2
+            exit 1
+          fi
+          test -s mtp-weights.sha256
+          scrub_weights_hash="$(.github/scripts/hash-weights-directory.sh "${MLXFAST_JOB_WS}/mtp-weights")"
+          trusted_weights_hash="$(tr -d '[:space:]' < mtp-weights.sha256)"
+          if [[ "${scrub_weights_hash}" != "${trusted_weights_hash}" ]]; then
+            echo "::error::transformed MTP weights changed before timing (hash ${scrub_weights_hash} != ${trusted_weights_hash})" >&2
+            exit 1
+          fi
+          leftovers="$(find "${MLXFAST_JOB_WS}" -maxdepth 2 -name '*golden*' ! -path "*/correctness_prompts/*" | grep -v '^$' || true)"
+          if [[ -n "${leftovers}" ]]; then
+            echo "::error::hidden-material scrub left candidates behind: ${leftovers}" >&2
+            exit 1
+          fi
+          echo "mtp-benchmark: bench workspace restored to pre-hidden snapshot before timing"
+
+      - name: Reap lingering bench processes before timing
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /bin/bash "${MLXFAST_JOB_WS}/.github/scripts/reap-bench-processes.sh"
+
+      - name: Wait for quiescence before timing
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          waited=0
+          while :; do
+            load="$(sysctl -n vm.loadavg | awk '{print $2}')"
+            util="$("${MLXFAST_MACMON}" pipe -s1 2>/dev/null | jq -r '.gpu_usage[1] // 1' || true)"
+            [[ -n "${util}" ]] || util=1
+            if [[ "$(echo "${load} < 2.0" | bc -l)" == "1" && "$(echo "${util} < 0.10" | bc -l)" == "1" ]]; then
+              break
+            fi
+            sleep 15
+            waited=$((waited + 15))
+            if [[ "${waited}" -ge 900 ]]; then
+              echo "::error::machine did not reach quiescence within 900s (load=${load} gpu_util=${util})" >&2
+              exit 1
+            fi
+          done
+          temp="$("${MLXFAST_MACMON}" pipe -s1 2>/dev/null | jq -r '.temp.gpu_temp_avg // "?"')"
+          echo "mtp-benchmark: quiescent after ${waited}s (load=${load} gpu_util=${util} gpu_temp=${temp}C); thermal gate is enforced inside measure-mtp-job"
+
+      - name: Verify trusted harness before timing
+        if: ${{ inputs.run_benchmark }}
+        run: .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256"
+
+      # THE TIMED MTP MEASUREMENT -- LAST, via the box-owned wrapper with the
+      # fixed thermal contract. Per accepted pair, alternating order:
+      #   baseline: pinned MTP baseline tree, serial K=1 target decode
+      #             (mtp-probe) over the hidden benchmark golden;
+      #   candidate: this workspace, mtp-benchmark (exact-pair) over the
+      #             SAME golden, same --tokens denominator.
+      # measure-mtp-job enforces per-phase quiescence + the 40C gate + 2 Hz
+      # telemetry acceptance, requires all_tokens_matched=true from every
+      # run, checks the baseline calibration band, and seals results.json.
+      - name: Timed paired MTP benchmark (measure-mtp-job)
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          MEASURE_STATE_DIR="${MLXFAST_MEASURE_STATE_DIR}" \
+          BASELINE_WS="${MLXFAST_MTP_BASELINE_WS}" \
+          BASELINE_CALIBRATION="${MLXFAST_MTP_BASELINE_CALIBRATION}" \
+          MTP_TARGET_DIR="${MLXFAST_MTP_TARGET_DIR}" \
+          MTP_ASSISTANT_DIR="${MLXFAST_MTP_ASSISTANT_DIR}" \
+          GPU_LOADED_UTIL=0.95 \
+            "${MLXFAST_MTP_MEASURE_JOB}" \
+              --candidate "${MLXFAST_JOB_WS}" \
+              --baseline "${MLXFAST_MTP_BASELINE_WS}" \
+              --golden "${MLXFAST_PRIVATE_DIR}/mtp_benchmark_golden.json" \
+              --contract "${MLXFAST_MTP_CONTRACT_PATH}" \
+              --tokens "${MLXFAST_MTP_DECODE_TOKENS}" \
+              --block-size "${MLXFAST_MTP_BLOCK_SIZE}" \
+              --min-pairs "${MLXFAST_MTP_MIN_ACCEPTED_PAIRS}" \
+              --tag "mtp-ranked-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+              --out "${MLXFAST_MEASURE_OUT}"
+          test -s "${MLXFAST_MEASURE_OUT}/results.json"
+          jq -c '{mode, accepted_pair_count, parity_all_ok}' "${MLXFAST_MEASURE_OUT}/results.json"
+
+      # Decode-only score contract, applied in the trusted shell from the
+      # sealed paired results: hard bit-exact gate, minimum accepted pairs,
+      # and the 1.0 floor. The published mtp-score.json carries the track id
+      # so the leaderboard namespace can never be confused with the serial
+      # track's score.json.
+      - name: Compute MTP score and enforce floor
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          results="${MLXFAST_MEASURE_OUT}/results.json"
+          test -s "${results}"
+          jq -e \
+            --arg track "${MLXFAST_MTP_TRACK_ID}" \
+            --argjson min_pairs "${MLXFAST_MTP_MIN_ACCEPTED_PAIRS}" \
+            '
+            .track_id == $track
+            and .parity_all_ok == true
+            and (.accepted_pair_count >= $min_pairs)
+            and (.aggregate.mtp_decode_speedup_mean | type == "number")
+            and (.aggregate.baseline_serial_seconds_per_token_mean | type == "number")
+            and (.aggregate.candidate_mtp_seconds_per_token_mean | type == "number")
+            ' "${results}" >/dev/null || {
+              echo "::error::paired MTP results failed validation (bit-exact gate, pair count, or schema)" >&2
+              exit 1
+            }
+          speedup="$(jq -r '.aggregate.mtp_decode_speedup_mean' "${results}")"
+          floor_ok="$(echo "${speedup} >= ${MLXFAST_MTP_DECODE_SPEEDUP_FLOOR}" | bc -l)"
+          if [[ "${floor_ok}" != "1" ]]; then
+            echo "::error::mtp_decode_speedup ${speedup} is below the ${MLXFAST_MTP_DECODE_SPEEDUP_FLOOR} floor; an MTP submission that is not faster than trusted serial decode does not rank" >&2
+            exit 1
+          fi
+          jq -n \
+            --arg track "${MLXFAST_MTP_TRACK_ID}" \
+            --arg commit "${MLXFAST_CANDIDATE_SHA}" \
+            --arg weights_hash "$(tr -d '[:space:]' < mtp-weights.sha256)" \
+            --argjson floor "${MLXFAST_MTP_DECODE_SPEEDUP_FLOOR}" \
+            --argjson decode_tokens "${MLXFAST_MTP_DECODE_TOKENS}" \
+            --slurpfile results "${results}" \
+            '
+            {
+              score: $results[0].aggregate.mtp_decode_speedup_mean,
+              passed: true,
+              track_id: $track,
+              metrics: {
+                mode: "mtp-paired-decode-only",
+                commit: $commit,
+                decode_tokens: $decode_tokens,
+                decode_speedup_floor: $floor,
+                accepted_pair_count: $results[0].accepted_pair_count,
+                parity_all_ok: $results[0].parity_all_ok,
+                mtp_decode_speedup_mean: $results[0].aggregate.mtp_decode_speedup_mean,
+                mtp_decode_speedup_median: $results[0].aggregate.mtp_decode_speedup_median,
+                mtp_decode_speedup_min: $results[0].aggregate.mtp_decode_speedup_min,
+                baseline_serial_seconds_per_token_mean: $results[0].aggregate.baseline_serial_seconds_per_token_mean,
+                candidate_mtp_seconds_per_token_mean: $results[0].aggregate.candidate_mtp_seconds_per_token_mean,
+                mtp_weights_hash: $weights_hash
+              }
+            }
+            ' > mtp-score.json
+          shasum -a 256 mtp-score.json | awk '{print $1}' > mtp-score.json.sha256
+          jq -c '{track_id, score, passed}' mtp-score.json
+
+      - name: Check MTP benchmark artifact paths
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          test "$(cat candidate.sha)" = "${MLXFAST_CANDIDATE_SHA}"
+          .github/scripts/deny-private-artifacts.sh \
+            candidate.sha \
+            mtp-score.json \
+            mtp-score.json.sha256 \
+            mtp-gates-report.json \
+            mtp-weights.sha256
+
+      - name: Stage MTP benchmark artifacts
+        id: stage_mtp_benchmark_artifacts
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/mtp-benchmark-results" \
+            candidate.sha=candidate.sha \
+            mtp-score.json=mtp-score.json \
+            mtp-score.sha256=mtp-score.json.sha256 \
+            mtp-gates-report.json=mtp-gates-report.json \
+            mtp-weights.sha256=mtp-weights.sha256
+
+      - name: Upload MTP benchmark artifacts
+        if: ${{ inputs.run_benchmark && steps.stage_mtp_benchmark_artifacts.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: mtp-benchmark-results-${{ github.run_id }}
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/mtp-benchmark-results
+          if-no-files-found: error
+          overwrite: true
+
+      # Timing provenance for audit/disputes: sealed paired results (paths,
+      # commit ids, timings, telemetry aggregates only) and the measure
+      # verdict. Content-vetted by deny-private-artifacts.
+      - name: Stage MTP audit artifacts
+        id: stage_mtp_audit_artifacts
+        if: ${{ always() && inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          staged=()
+          if [[ -s "${MLXFAST_MEASURE_OUT}/results.json" ]]; then
+            cp "${MLXFAST_MEASURE_OUT}/results.json" mtp-paired-results.json
+            staged+=(mtp-paired-results.json=mtp-paired-results.json)
+          fi
+          if [[ -s "${MLXFAST_MEASURE_OUT}/verdict.txt" ]]; then
+            cp "${MLXFAST_MEASURE_OUT}/verdict.txt" mtp-measure-verdict.txt
+            staged+=(mtp-measure-verdict.txt=mtp-measure-verdict.txt)
+          fi
+          if [[ -s mtp-weights.sha256 ]]; then
+            staged+=(mtp-weights.sha256=mtp-weights.sha256)
+          fi
+          if [[ "${#staged[@]}" -eq 0 ]]; then
+            echo "mtp-benchmark: no audit artifacts to stage"
+            exit 0
+          fi
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/mtp-benchmark-audit" \
+            "${staged[@]}"
+
+      - name: Upload MTP audit artifacts
+        if: ${{ always() && inputs.run_benchmark && steps.stage_mtp_audit_artifacts.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: mtp-benchmark-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/mtp-benchmark-audit
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Cleanup bench workspace
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -d "${MLXFAST_JOB_WS}" ]]; then
+            sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+              /bin/sh -c 'find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null; true' || true
+            rm -rf "${MLXFAST_JOB_WS}" || true
+            if [[ -d "${MLXFAST_JOB_WS}" ]]; then
+              echo "::warning::bench workspace residue left at ${MLXFAST_JOB_WS}"
+            fi
+          fi
+          private_cleanup_failed=0
+          for private_path in \
+            "${MLXFAST_PRIVATE_DIR}" \
+            "${MLXFAST_MEASURE_OUT}" \
+            "${MLXFAST_ARTIFACT_ROOT}"; do
+            if ! rm -rf -- "${private_path}"; then
+              echo "::error::could not remove runner-private artifact path: ${private_path}" >&2
+              private_cleanup_failed=1
+              continue
+            fi
+            if [[ -e "${private_path}" || -L "${private_path}" ]]; then
+              echo "::error::runner-private artifact cleanup failed: ${private_path}" >&2
+              private_cleanup_failed=1
+            fi
+          done
+          exit "${private_cleanup_failed}"
+
+      - name: Janitor reset and integrity audit
+        if: always()
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_JANITOR}"
+          if [[ -e "${MLXFAST_QUARANTINE_FLAG}" ]]; then
+            echo "::error::janitor quarantined the box after this run" >&2
+            exit 1
+          fi
+          echo "mtp-benchmark: janitor reset + integrity audit clean"

@@ -535,6 +535,12 @@ Before publication, organizers must:
    remains, so still require the multi-pair alternating-order protocol above
    before quoting single-pair scores.
 
+The distinct workflow for item 6 is drafted at
+`.github/workflows/mtp-benchmark.yml` (track `gemma4-31b-it-mtp-v1`,
+deliberately inert while `official_scoring_enabled` is false), and the
+operator procedure covering items 1-7 is
+`docs/mtp-track-golive-runbook.md`.
+
 The base leaderboard and its paired serial reference are never mixed with MTP
 results.
 
