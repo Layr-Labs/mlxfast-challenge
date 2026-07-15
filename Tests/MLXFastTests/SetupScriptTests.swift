@@ -544,6 +544,57 @@ func setupRefusesToReleaseMutationLockWithDifferentOwnerToken() throws {
 }
 
 @Test
+func setupMutationLockWaiterRetriesWhenHolderReleasesDuringPublishAttempt() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        holder_generation="${REFERENCE_CACHE_MUTATION_LOCK_DIR}.generation.holder"
+        mkdir "${holder_generation}"
+        printf 'token=holder pid=%s host=%s started_at=now\n' "$$" "$(hostname)" \
+          > "${holder_generation}/owner"
+        ln -s -h -- "${holder_generation}" "${REFERENCE_CACHE_MUTATION_LOCK_DIR}"
+        lock_name="$(basename "${REFERENCE_CACHE_MUTATION_LOCK_DIR}")"
+
+        # Deterministically land a concurrent holder's release inside the
+        # waiter's race window: the waiter's first removal of its own
+        # unpublished generation directory happens between its failed publish
+        # attempt and the obstruction check, so dropping the published lock
+        # there reproduces the transient absent-path state that used to be
+        # misclassified as a fatal non-directory obstruction.
+        rm() {
+          if [[ ! -e "${RELEASE_SENTINEL}" && "${1:-}" == "-rf" \
+              && "$(basename "${2:-none}")" == "${lock_name}.generation."* ]]; then
+            : > "${RELEASE_SENTINEL}"
+            command rm -f "${REFERENCE_CACHE_MUTATION_LOCK_DIR}"
+            command rm -rf "${holder_generation}"
+          fi
+          command rm "$@"
+        }
+
+        acquire_reference_cache_mutation_lock
+        [[ "${REFERENCE_CACHE_MUTATION_LOCK_HELD}" == "1" ]]
+        [[ -e "${RELEASE_SENTINEL}" ]]
+        release_reference_cache_mutation_lock
+        [[ ! -e "${REFERENCE_CACHE_MUTATION_LOCK_DIR}" && ! -L "${REFERENCE_CACHE_MUTATION_LOCK_DIR}" ]]
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "RELEASE_SENTINEL": root.appendingPathComponent("released").path,
+            "MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_DIR": root.appendingPathComponent("cache-mutation.lock").path,
+            "MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_TIMEOUT_SECONDS": "10",
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+    #expect(result.stdout.contains("waiting for reference cache mutation lock"))
+    #expect(result.stdout.contains("acquired reference cache mutation lock"))
+    #expect(!result.stderr.contains("is not a lock directory"))
+}
+
+@Test
 func setupRejectsZeroMutationLockStaleThreshold() throws {
     let root = try setupTemporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }

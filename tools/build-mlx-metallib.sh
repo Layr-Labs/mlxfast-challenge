@@ -376,7 +376,11 @@ acquire_build_lock() {
 
     rm -rf "${generation_dir}" || return 1
     BUILD_LOCK_GENERATION_DIR=""
-    if [[ ! -d "${BUILD_LOCK_DIR}" && ! -L "${BUILD_LOCK_DIR}" ]]; then
+    # Fatal only for a genuine obstruction (an existing non-directory,
+    # non-symlink entry such as a plain file). An absent path here is the
+    # normal transient state after a concurrent holder released the lock
+    # between our failed publish attempt and this check; retry instead.
+    if [[ -e "${BUILD_LOCK_DIR}" && ! -d "${BUILD_LOCK_DIR}" && ! -L "${BUILD_LOCK_DIR}" ]]; then
       echo "build-mlx-metallib.sh: build lock path is not a lock directory: ${BUILD_LOCK_DIR}" >&2
       return 1
     fi

@@ -2549,7 +2549,11 @@ acquire_reference_cache_mutation_lock() {
 
     rm -rf "${generation_dir}" || return 1
     REFERENCE_CACHE_MUTATION_LOCK_GENERATION_DIR=""
-    if [[ ! -d "${lock_dir}" && ! -L "${lock_dir}" ]]; then
+    # Fatal only for a genuine obstruction (an existing non-directory,
+    # non-symlink entry such as a plain file). An absent path here is the
+    # normal transient state after a concurrent holder released the lock
+    # between our failed publish attempt and this check; retry instead.
+    if [[ -e "${lock_dir}" && ! -d "${lock_dir}" && ! -L "${lock_dir}" ]]; then
       echo "setup.sh: reference cache mutation lock path exists and is not a lock directory: ${lock_dir}" >&2
       return 1
     fi
