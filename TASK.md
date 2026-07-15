@@ -175,9 +175,11 @@ benchmark checkout and re-enforces the editable surface server-side before
 running hidden validation. `--model` is required and is recorded for the
 leaderboard; pass `--note-file PATH` or `--claimed-score N` as needed.
 The benchmark contract also declares a local `preSubmitCommand`:
-`./benchmark.sh --local-submit`. Yukon runs that command before upload so
-participants get a roughly 10-minute local correctness and timing check during
-the submit loop without running the full official hidden benchmark.
+`./benchmark.sh --local-submit`. `mlxfast submit` does not run it — the upload
+goes directly to official validation, and no local run blocks it. Running that
+command yourself before submitting is the recommended roughly 10-minute local
+correctness and timing check, without running the full official hidden
+benchmark.
 
 `mlxfast-swift verify-transform` is an organizer/debug check for deterministic
 transform output. It re-runs the submitted transform and compares the generated

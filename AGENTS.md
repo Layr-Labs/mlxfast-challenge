@@ -233,9 +233,10 @@ swift build -c release
 `./benchmark.sh --local-iterate` is the fast local edit-loop signal.
 Use it to compare the current working tree against the latest-tip baseline you
 recorded above, not against a result from an older branch.
-`./benchmark.sh --local-submit` is the Yukon pre-submit gate and is intended to
-be longer and closer to the official path; like `--local-iterate` it publishes
-only the estimated local score (never the official ranked score).
+`./benchmark.sh --local-submit` is the recommended manual pre-submit check
+(`mlxfast submit` does not run it for you) and is intended to be longer and
+closer to the official path; like `--local-iterate` it publishes only the
+estimated local score (never the official ranked score).
 `./benchmark.sh --official` is the full ranked entrypoint and requires the
 hidden golden artifacts provisioned on the official runner. A bare
 `./benchmark.sh` defaults to `--local-iterate`. Remember the public fixtures
@@ -297,7 +298,7 @@ behaviors are expected, not bugs:
  help locally. `./benchmark.sh --official` requires the hidden goldens
  and private oracle provisioned on the official runner and is not
  runnable locally — use `--local-iterate` for the edit loop and
- `--local-submit` as the pre-submit gate.
+ `--local-submit` as the recommended manual pre-submit check.
 - **One local run at a time; the memory guard is protecting your RAM.** The
  ~17 GB RAM-resident text tower means two simultaneous model residencies
  (an overlapping second local run, or a new run started while an orphaned
@@ -355,8 +356,10 @@ mlxfast submissions
 
 Submit packages only `editablePaths`. It rejects generated artifacts, symlinks,
 local scores, reference checkpoints, and source changes outside the editable
-surface. Live submit first runs the configured local pre-submit benchmark, then
-uploads the editable-path archive for official validation.
+surface. `mlxfast submit` uploads the editable-path archive directly for
+official validation; it does not run a local benchmark first, and no local run
+blocks the upload. Run `./benchmark.sh --local-submit` yourself before
+submitting — the official M5 run is the gate that ranks the submission.
 
 ## Practical Optimization Ideas
 

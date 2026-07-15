@@ -33,10 +33,10 @@ MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" \
 # A bare ./benchmark.sh defaults to --local-iterate.
 ./benchmark.sh --official
 
-# Local submit check used by Yukon before upload: runs the public 512-token
-# prompt through a longer checked timing window, writes score.json with the
-# estimated local score (never an official ranked score), and prints it to
-# stdout.
+# Recommended manual pre-submit check (mlxfast submit does not run it for
+# you): runs the public 512-token prompt through a longer checked timing
+# window, writes score.json with the estimated local score (never an official
+# ranked score), and prints it to stdout.
 ./benchmark.sh --local-submit
 
 # Or call the Swift CLI directly
@@ -239,11 +239,12 @@ reference checkpoints, golden files, and local scores live outside
 surface server-side after upload. `--model` is required and is recorded for the
 leaderboard. `MLXFAST_API_URL` / `MLXFAST_API_TOKEN` (or the `YUKON_*`
 equivalents) configure the endpoint and token for scripted runs.
-Before uploading, Yukon runs the contract `preSubmitCommand`, which is
-`./benchmark.sh --local-submit` for this benchmark. That local-submit pass is
-the local submit gate: it uses the public/local oracle, writes and prints
-`score.json`, and stops obviously broken or slower changes before they spend
-official runner time.
+`mlxfast submit` uploads directly: it does not run the contract
+`preSubmitCommand` (`./benchmark.sh --local-submit`), and no local run blocks
+the upload — the official M5 run is the gate. Run
+`./benchmark.sh --local-submit` yourself before submitting: it uses the
+public/local oracle, writes and prints `score.json`, and catches obviously
+broken or slower changes before they spend official runner time.
 
 ## Local Commands
 
@@ -252,7 +253,7 @@ Use these two benchmark modes for local development:
 | Command | Purpose | What it checks | Output |
 |---|---|---|---|
 | `./benchmark.sh --local-iterate` | Fast edit-loop signal, usually under 2 minutes after setup. | Public 512-token prompt, standalone prefill next-token check, decode seed-prefill check, and 16 teacher-forced decode checks. | `score.local-iterate.json` with the estimated local `score`. |
-| `./benchmark.sh --local-submit` | Yukon pre-submit gate, intended to be about 10 minutes after setup. | Same public prompt, standalone prefill next-token check, decode seed-prefill check, and 1023 teacher-forced decode checks from a longer public fixture. | `score.json` with the estimated local `score`. |
+| `./benchmark.sh --local-submit` | Recommended manual pre-submit check, intended to be about 10 minutes after setup. | Same public prompt, standalone prefill next-token check, decode seed-prefill check, and 1023 teacher-forced decode checks from a longer public fixture. | `score.json` with the estimated local `score`. |
 
 When setup never produced a usable `mlx.metallib` (fresh checkout, or a
 partial/failed setup), `benchmark.sh` exits immediately with guidance to run
@@ -353,7 +354,7 @@ edit-loop signal is enough, `--local-iterate` uses that public 512-token prompt,
 times standalone prefill separately, then times decode including seed prefill
 plus 16 teacher-forced decode tokens, writes `score.local-iterate.json`, prints
 it, and publishes `score` as the estimated local score (never a ranked
-benchmark score). The submit hook `--local-submit` uses the same public prompt
+benchmark score). The pre-submit check `--local-submit` uses the same public prompt
 with a longer 1024-token
 fixture: it times the same standalone prefill and decode-seed phases plus 1023
 teacher-forced decode tokens in one continuous trajectory, and writes
