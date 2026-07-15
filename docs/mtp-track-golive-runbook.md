@@ -87,7 +87,7 @@ scoring.
       (`warmWorkingSetAfterAllocatorReset`); `swift build -c release` clean.
 - [ ] `./setup-mtp.sh --verify-only` passes on box 1 (both caches byte-exact
       against `fixtures/mtp_gemma_4_31b_it_4bit.sha256` and
-      `fixtures/mtp_gemma_4_31b_it_assistant_bf16.sha256`).
+      `fixtures/mtp_gemma_4_31b_it_assistant_qat4bit.sha256`).
 - [ ] For the calibration part only: sequence step 1's post-fix validation
       matrix is complete (CV <= 5%, no block-0 outlier). Golden capture
       (B.1-B.3) may run before that; **floor calibration (B.6) must not.**
@@ -281,7 +281,7 @@ manifest re-sign before the next job's janitor audit.
 test ! -e /opt/bench/quarantine.flag
 sudo /opt/bench/janitor.sh --audit-only        # clean before starting
 df -h /opt /Users/Shared                       # need ~45 GB free:
-#   18.4 GB target + 0.94 GB assistant + ~17.2 GB baseline mtp-weights + slack
+#   18.4 GB target + 0.27 GB assistant + ~17.2 GB baseline mtp-weights + slack
 ```
 
 ### C.2 Create the runner-owned MTP cache

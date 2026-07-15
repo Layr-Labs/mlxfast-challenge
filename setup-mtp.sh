@@ -10,10 +10,10 @@ umask 022
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 TARGET_MODEL_ID="mlx-community/gemma-4-31b-it-4bit"
 TARGET_REVISION="696d436c404745a59f30e4939a658162b0a9e57f"
-ASSISTANT_MODEL_ID="google/gemma-4-31B-it-assistant"
-ASSISTANT_REVISION="6c9152a7639e1f87626e4d4fd4dd9f3e20c9f3fb"
+ASSISTANT_MODEL_ID="mlx-community/gemma-4-31B-it-qat-assistant-4bit"
+ASSISTANT_REVISION="5234fd588403c9b68f3bd20a140b7e61700cb7e2"
 TARGET_MANIFEST="${ROOT_DIR}/fixtures/mtp_gemma_4_31b_it_4bit.sha256"
-ASSISTANT_MANIFEST="${ROOT_DIR}/fixtures/mtp_gemma_4_31b_it_assistant_bf16.sha256"
+ASSISTANT_MANIFEST="${ROOT_DIR}/fixtures/mtp_gemma_4_31b_it_assistant_qat4bit.sha256"
 
 DEFAULT_CACHE_ROOT="${HOME}/.cache/mlxfast/gemma4-31b-it-mtp-v1"
 CACHE_ROOT="${MLXFAST_MTP_CACHE_ROOT:-${DEFAULT_CACHE_ROOT}}"
@@ -287,6 +287,6 @@ cat <<EOF
 setup-mtp.sh: MTP artifacts ready
   target:    ${TARGET_DIR}
   assistant: ${ASSISTANT_DIR}
-  source bytes: target=18444420181 assistant=939044876
+  source bytes: target=18444420181 assistant=264144321
   official score: disabled until a paired M5 rebaseline is established
 EOF

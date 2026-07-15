@@ -1,7 +1,0 @@
-# Organizer-pinned drafter sidecar for the experimental Gemma 4 31B-IT MTP track.
-# Repository: google/gemma-4-31B-it-assistant
-# Revision: 6c9152a7639e1f87626e4d4fd4dd9f3e20c9f3fb
-# The model card explicitly pairs this drafter with google/gemma-4-31B-it.
-# Format: <sha256> <byte_count> <relative_path>
-d09487c1083a334a97545f204dd41ab1a40b0438bdead19558f0e1357e26d66a 2316 config.json
-9f80df6099fa1fd7db71220ec9ee864d5ecff769878697dd5763e4285b15a1da 939042560 model.safetensors

@@ -81,6 +81,8 @@ struct ExperimentalMTPTrackContract: Decodable {
         let numHiddenLayers: Int
         let numKVSharedLayers: Int
         let vocabSize: Int
+        let quantizationBits: Int
+        let quantizationGroupSize: Int
         let files: [AssistantFile]
 
         enum CodingKeys: String, CodingKey {
@@ -97,6 +99,8 @@ struct ExperimentalMTPTrackContract: Decodable {
             case numHiddenLayers = "num_hidden_layers"
             case numKVSharedLayers = "num_kv_shared_layers"
             case vocabSize = "vocab_size"
+            case quantizationBits = "quantization_bits"
+            case quantizationGroupSize = "quantization_group_size"
             case files
         }
     }
@@ -153,6 +157,18 @@ struct ExperimentalMTPTrackContract: Decodable {
 }
 
 private struct ExperimentalMTPAssistantConfig: Decodable {
+    struct Quantization: Decodable {
+        let groupSize: Int
+        let bits: Int
+        let mode: String?
+
+        enum CodingKeys: String, CodingKey {
+            case groupSize = "group_size"
+            case bits
+            case mode
+        }
+    }
+
     struct TextConfig: Decodable {
         let modelType: String
         let hiddenSize: Int
@@ -191,11 +207,13 @@ private struct ExperimentalMTPAssistantConfig: Decodable {
 
     let modelType: String
     let backboneHiddenSize: Int
+    let quantization: Quantization
     let textConfig: TextConfig
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case backboneHiddenSize = "backbone_hidden_size"
+        case quantization
         case textConfig = "text_config"
     }
 }
@@ -213,9 +231,9 @@ extension GemmaRuntime {
     static let experimentalMTPUpstreamTargetRevision =
         "518276fb130dc81caf9a4f772e65e63ef2526493"
     static let experimentalMTPAssistantModelID =
-        "google/gemma-4-31B-it-assistant"
+        "mlx-community/gemma-4-31B-it-qat-assistant-4bit"
     static let experimentalMTPAssistantRevision =
-        "6c9152a7639e1f87626e4d4fd4dd9f3e20c9f3fb"
+        "5234fd588403c9b68f3bd20a140b7e61700cb7e2"
 
     static func validateExperimentalMTPSourceTarget(
         sourceTargetPath: String,
@@ -395,23 +413,24 @@ extension GemmaRuntime {
             ExperimentalMTPTrackContract.AssistantFile(
                 path: "config.json",
                 sha256:
-                    "d09487c1083a334a97545f204dd41ab1a40b0438bdead19558f0e1357e26d66a",
-                bytes: 2_316
+                    "b4023f8991570a8e92fc164f72b0952b4d8afb1fa597c16a06690b69637a026e",
+                bytes: 2_962
             ),
             ExperimentalMTPTrackContract.AssistantFile(
                 path: "model.safetensors",
                 sha256:
-                    "9f80df6099fa1fd7db71220ec9ee864d5ecff769878697dd5763e4285b15a1da",
-                bytes: 939_042_560
+                    "2c0252eb9b57efe6dd9005c83863e16a3e58b9a21ce25e3880e2cc324f64aead",
+                bytes: 264_141_359
             ),
         ]
         guard contract.schemaVersion == 1,
               contract.trackID == experimentalMTPTrackID,
-              // Enablement commit: the organizer-pinned identity now carries
-              // official scoring ENABLED with an established, publishable
-              // reference baseline. A contract claiming anything else is not
+              // Assistant-swap re-baseline window: the organizer-pinned
+              // identity carries official scoring DISABLED while the paired
+              // M5 reference baseline is re-established against the QAT
+              // 4-bit assistant. A contract claiming anything else is not
               // the pinned track identity and fails closed.
-              contract.officialScoringEnabled,
+              !contract.officialScoringEnabled,
               contract.mlxSwiftLMRevision == experimentalMTPDependencyRevision,
               contract.target.upstreamModelID
                   == experimentalMTPUpstreamTargetModelID,
@@ -437,11 +456,11 @@ extension GemmaRuntime {
               contract.assistant.modelID == experimentalMTPAssistantModelID,
               contract.assistant.revision == experimentalMTPAssistantRevision,
               contract.assistant.manifestPath
-                  == "fixtures/mtp_gemma_4_31b_it_assistant_bf16.sha256",
+                  == "fixtures/mtp_gemma_4_31b_it_assistant_qat4bit.sha256",
               contract.assistant.manifestSHA256
-                  == "9dde96d9e236bae641f54cb972b704cfeaceee305f700b0fd790e397e71fed50",
-              contract.assistant.expectedTotalBytes == 939_044_876,
-              contract.assistant.maximumTotalBytes == 1_000_000_000,
+                  == "37f9c485bcb1c04a609519852c2a95c638dffb19fd4ddc3e5fb44667fc8b4125",
+              contract.assistant.expectedTotalBytes == 264_144_321,
+              contract.assistant.maximumTotalBytes == 300_000_000,
               contract.assistant.modelType == "gemma4_assistant",
               contract.assistant.backboneHiddenSize
                   == MLXFastConstants.hiddenSize,
@@ -450,6 +469,8 @@ extension GemmaRuntime {
               contract.assistant.numHiddenLayers == 4,
               contract.assistant.numKVSharedLayers == 4,
               contract.assistant.vocabSize == MLXFastConstants.vocabSize,
+              contract.assistant.quantizationBits == 4,
+              contract.assistant.quantizationGroupSize == 64,
               contract.assistant.files == expectedFiles,
               contract.protocolContract.name == "trusted_mtp_block_v1",
               contract.protocolContract.maximumBlockSize
@@ -460,8 +481,8 @@ extension GemmaRuntime {
                   == MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens,
               contract.protocolContract.parentOracleRequired,
               !contract.protocolContract.workerTimingIsAuthoritative,
-              contract.referenceBaseline.status == "established",
-              contract.referenceBaseline.publicationAllowed,
+              contract.referenceBaseline.status == "not_established",
+              !contract.referenceBaseline.publicationAllowed,
               contract.referenceBaseline.requiredRebaselineHardware
                   == "m5-bench"
         else {
@@ -572,6 +593,11 @@ extension GemmaRuntime {
         guard config.modelType == contract.assistant.modelType,
               config.backboneHiddenSize
                   == contract.assistant.backboneHiddenSize,
+              config.quantization.bits
+                  == contract.assistant.quantizationBits,
+              config.quantization.groupSize
+                  == contract.assistant.quantizationGroupSize,
+              config.quantization.mode ?? "affine" == "affine",
               text.modelType == "gemma4_text",
               text.hiddenSize == contract.assistant.hiddenSize,
               text.intermediateSize == contract.assistant.intermediateSize,
@@ -586,7 +612,11 @@ extension GemmaRuntime {
               text.globalHeadDim == 512,
               text.attentionKEqV,
               text.slidingWindow == 1_024,
-              text.maxPositionEmbeddings == 262_144,
+              // The QAT drafter checkpoint declares 131072; the bf16 one
+              // declared 262144. The field is decoded but functionally inert
+              // for a fully KV-shared drafter (no own cache, RoPE ignores
+              // it); pin the shipped value.
+              text.maxPositionEmbeddings == 131_072,
               text.layerTypes == [
                   "sliding_attention",
                   "sliding_attention",

@@ -314,7 +314,7 @@ jq -s \
                   "current-token-only serial decode where a one-token request computes one target row and advances one logical and physical KV position",
                   "multi-row kernels or batching when every row corresponds to a token supplied in that same invocation, including ordinary prefill"
                 ] else [
-                  "loading only the organizer-pinned google/gemma-4-31B-it-assistant sidecar after trusted provenance validation",
+                  "loading only the organizer-pinned mlx-community/gemma-4-31B-it-qat-assistant-4bit sidecar after trusted provenance validation",
                   "drafting at most three positions and verifying a block of at most four positions with the matched Gemma 4 31B-IT target",
                   "emitting only the nonempty target-confirmed prefix and rolling rejected target/shared-KV state back before returning",
                   "persisting drafter hidden, target cache, shared K/V, and last committed token within one request across trusted protocol blocks",

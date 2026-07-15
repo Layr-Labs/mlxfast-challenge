@@ -593,19 +593,22 @@ func trainedMTPContractPinsMatchedITPairAndDependency() throws {
     #expect(contract.target.upstreamModelID == "google/gemma-4-31B-it")
     #expect(
         contract.assistant.modelID
-            == "google/gemma-4-31B-it-assistant"
+            == "mlx-community/gemma-4-31B-it-qat-assistant-4bit"
     )
+    #expect(contract.assistant.quantizationBits == 4)
+    #expect(contract.assistant.quantizationGroupSize == 64)
     #expect(
         contract.mlxSwiftLMRevision
             == "bc1c0ee67d15798343be17c9f8f61f7c0d977149"
     )
-    // Enablement commit: official scoring is ON with an established,
-    // publishable reference baseline. The ranked decode window (512) is
-    // owned by the workflow env; the contract's decode_tokens stays the
-    // 128-token compatibility default with a 512 trusted-parent maximum.
-    #expect(contract.officialScoringEnabled)
-    #expect(contract.referenceBaseline.status == "established")
-    #expect(contract.referenceBaseline.publicationAllowed)
+    // Assistant-swap re-baseline window: official scoring is OFF until the
+    // paired M5 reference baseline is re-established against the QAT 4-bit
+    // assistant. The ranked decode window (512) is owned by the workflow
+    // env; the contract's decode_tokens stays the 128-token compatibility
+    // default with a 512 trusted-parent maximum.
+    #expect(!contract.officialScoringEnabled)
+    #expect(contract.referenceBaseline.status == "not_established")
+    #expect(!contract.referenceBaseline.publicationAllowed)
     #expect(contract.protocolContract.decodeTokens == 128)
     #expect(contract.protocolContract.maximumDecodeTokens == 512)
 }
@@ -615,7 +618,7 @@ func trainedMTPContractRejectsAssistantReplacement() throws {
     let path = "fixtures/gemma_4_31b_it_mtp_track.json"
     let original = try String(contentsOfFile: path, encoding: .utf8)
     let tampered = original.replacingOccurrences(
-        of: "google/gemma-4-31B-it-assistant",
+        of: "mlx-community/gemma-4-31B-it-qat-assistant-4bit",
         with: "participant/arbitrary-assistant"
     )
     let contract = try JSONDecoder().decode(
@@ -797,7 +800,7 @@ func mtpProvisioningIsPinnedResumableAndSeparate() throws {
     )
     #expect(
         script.contains(
-            "ASSISTANT_REVISION=\"6c9152a7639e1f87626e4d4fd4dd9f3e20c9f3fb\""
+            "ASSISTANT_REVISION=\"5234fd588403c9b68f3bd20a140b7e61700cb7e2\""
         )
     )
     #expect(script.contains("--continue-at -"))
@@ -811,7 +814,7 @@ func mtpProvisioningIsPinnedResumableAndSeparate() throws {
         encoding: .utf8
     )
     #expect(!normalSetup.contains("gemma4-31b-it-mtp-v1"))
-    #expect(!normalSetup.contains("gemma-4-31B-it-assistant"))
+    #expect(!normalSetup.contains("assistant"))
 }
 
 @Test
@@ -861,7 +864,7 @@ func trainedMTPArtifactValidationRuntimeGate() throws {
         contractPath: "fixtures/gemma_4_31b_it_mtp_track.json"
     )
     #expect(report.trackID == "gemma4-31b-it-mtp-v1")
-    #expect(report.assistantByteCount == 939_044_876)
+    #expect(report.assistantByteCount == 264_144_321)
     #expect(report.targetByteCount <= 20 * (1 << 30))
 }
 

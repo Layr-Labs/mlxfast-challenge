@@ -26,13 +26,16 @@ The current challenge target is:
 - Checked-in byte manifest:
   `fixtures/reference_gemma_4_31b_4bit.sha256`
 
-Google's public MTP drafter is explicitly paired by its model card with the
-instruction-tuned target, not the base target:
+Google's public MTP drafter family is explicitly paired by its model cards
+with the instruction-tuned target, not the base target:
 
 - Target:
   `google/gemma-4-31B-it@518276fb130dc81caf9a4f772e65e63ef2526493`
-- Assistant:
-  `google/gemma-4-31B-it-assistant@6c9152a7639e1f87626e4d4fd4dd9f3e20c9f3fb`
+- Assistant (organizer-pinned QAT 4-bit conversion):
+  `mlx-community/gemma-4-31B-it-qat-assistant-4bit@5234fd588403c9b68f3bd20a140b7e61700cb7e2`
+  (affine 4-bit, group size 64; converted from Google's QAT drafter
+  `google/gemma-4-31B-it-qat-q4_0-unquantized-assistant`, which the model
+  card pairs with `google/gemma-4-31B-it`)
 
 No matched public 31B base assistant was found. Architecture compatibility
 alone does not prove training compatibility, so this prototype does not bind
@@ -44,9 +47,11 @@ The MLX target conversion is pinned independently:
 - `mlx-community/gemma-4-31b-it-4bit@696d436c404745a59f30e4939a658162b0a9e57f`
 - Declared base model: `google/gemma-4-31B-it`
 
-All three model cards currently declare Apache-2.0 and link the Gemma license
-at <https://ai.google.dev/gemma/docs/gemma_4_license>. Operators must still
-review the license terms before enabling a public ranked track.
+The target model cards declare Apache-2.0 and link the Gemma license at
+<https://ai.google.dev/gemma/docs/gemma_4_license>; the QAT assistant
+conversion's card declares the Gemma license and derives from Google's
+Apache-2.0 QAT drafter. Operators must still review the license terms before
+enabling a public ranked track.
 
 ## Provenance contract
 
@@ -65,16 +70,17 @@ review the license terms before enabling a public ranked track.
 Byte manifests:
 
 - `fixtures/mtp_gemma_4_31b_it_4bit.sha256`
-- `fixtures/mtp_gemma_4_31b_it_assistant_bf16.sha256`
+- `fixtures/mtp_gemma_4_31b_it_assistant_qat4bit.sha256`
 
 The assistant runtime inventory is exactly two regular, single-link files:
 
-- `config.json`: 2,316 bytes
-- `model.safetensors`: 939,042,560 bytes
+- `config.json`: 2,962 bytes
+- `model.safetensors`: 264,141,359 bytes
 
-The combined assistant directory is exactly 939,044,876 bytes. Extra files,
+The combined assistant directory is exactly 264,144,321 bytes. Extra files,
 symlinks, hardlinks, size mismatches, hash mismatches, incompatible config
-fields, or a total above 1,000,000,000 bytes fail before model load.
+fields (including the pinned affine 4-bit group-64 quantization block), or a
+total above 300,000,000 bytes fail before model load.
 
 The target source manifest totals 18,444,420,181 bytes. The transformed
 text-only target is capped at 20 GiB. The assistant remains an
@@ -243,11 +249,12 @@ and fixed timing/count contract remain the substantive runtime controls.
 Known on-disk bytes:
 
 - target source: 18,444,420,181 bytes;
-- assistant sidecar: 939,044,876 bytes;
-- combined: 19,383,465,057 bytes (about 18.1 GiB).
+- assistant sidecar: 264,144,321 bytes;
+- combined: 18,708,564,502 bytes (about 17.4 GiB).
 
-The assistant has 469,518,596 BF16 parameters according to its repository
-metadata. The M5 matrix measured up to 47.6 GiB peak process RSS,
+The assistant is the ~470M-parameter drafter stored as affine 4-bit
+(group size 64) packed U32 weights with BF16 scales/biases according to its
+repository metadata. The M5 matrix measured up to 47.6 GiB peak process RSS,
 31.2 GiB MLX active memory, 3.4 GiB MLX cache memory, and 34.1 GiB MLX allocator
 peak. Runtime peak is higher than file size because target and assistant
 weights, target KV, shared K/V, verification logits/activations, and allocator

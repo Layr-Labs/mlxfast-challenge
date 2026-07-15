@@ -24,7 +24,8 @@ Artifacts referenced (and hash-pinned) by this repository:
 | `mlx-community/gemma-4-31b-4bit` @ `e236b3eb2f9567ded5875cfa89f1666afa1acbf1` (serial-track reference checkpoint) | mlx-community conversion of the above | Apache-2.0 + Gemma terms |
 | `google/gemma-4-31B-it` @ `518276fb130dc81caf9a4f772e65e63ef2526493` (MTP-track upstream target) | Google DeepMind | Apache-2.0 + Gemma terms |
 | `mlx-community/gemma-4-31b-it-4bit` @ `696d436c404745a59f30e4939a658162b0a9e57f` (MTP-track runtime target) | mlx-community conversion of the above | Apache-2.0 + Gemma terms |
-| `google/gemma-4-31B-it-assistant` @ `6c9152a7639e1f87626e4d4fd4dd9f3e20c9f3fb` (MTP-track trained drafter) | Google DeepMind | Apache-2.0 + Gemma terms |
+| `google/gemma-4-31B-it-qat-q4_0-unquantized-assistant` (upstream of the MTP-track trained drafter) | Google DeepMind | Apache-2.0 + Gemma terms |
+| `mlx-community/gemma-4-31B-it-qat-assistant-4bit` @ `5234fd588403c9b68f3bd20a140b7e61700cb7e2` (MTP-track trained drafter, affine 4-bit group-64 conversion) | mlx-community conversion of the above | Gemma terms (card) over Apache-2.0 upstream |
 
 Attribution statement (Apache-2.0 §4(c)): "Gemma 4 31B, Gemma 4 31B-IT, and
 Gemma 4 31B-IT-assistant © Google DeepMind, licensed under the Apache

@@ -1,0 +1,9 @@
+# Organizer-pinned drafter sidecar for the experimental Gemma 4 31B-IT MTP track.
+# Repository: mlx-community/gemma-4-31B-it-qat-assistant-4bit
+# Revision: 5234fd588403c9b68f3bd20a140b7e61700cb7e2
+# Affine 4-bit QAT quantization (group size 64) of the drafter Google pairs
+# with google/gemma-4-31B-it (base model
+# google/gemma-4-31B-it-qat-q4_0-unquantized-assistant per the model card).
+# Format: <sha256> <byte_count> <relative_path>
+b4023f8991570a8e92fc164f72b0952b4d8afb1fa597c16a06690b69637a026e 2962 config.json
+2c0252eb9b57efe6dd9005c83863e16a3e58b9a21ce25e3880e2cc324f64aead 264141359 model.safetensors

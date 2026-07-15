@@ -72,7 +72,7 @@ name: mtp-benchmark
 #   MLXFAST_MTP_TARGET_DIR / MLXFAST_MTP_ASSISTANT_DIR
 #       Read-only runner-owned caches holding exactly the files pinned by
 #       fixtures/mtp_gemma_4_31b_it_4bit.sha256 and
-#       fixtures/mtp_gemma_4_31b_it_assistant_bf16.sha256 (setup-mtp.sh
+#       fixtures/mtp_gemma_4_31b_it_assistant_qat4bit.sha256 (setup-mtp.sh
 #       layout).
 #   MLXFAST_MTP_BASELINE_WS
 #       Pinned prebuilt challenge-repo tree (trusted ref) with mtp-weights
@@ -159,7 +159,7 @@ jobs:
       MLXFAST_MTP_TRACK_ID: gemma4-31b-it-mtp-v1
       MLXFAST_MTP_CONTRACT_PATH: fixtures/gemma_4_31b_it_mtp_track.json
       MLXFAST_MTP_TARGET_MANIFEST_PATH: fixtures/mtp_gemma_4_31b_it_4bit.sha256
-      MLXFAST_MTP_ASSISTANT_MANIFEST_PATH: fixtures/mtp_gemma_4_31b_it_assistant_bf16.sha256
+      MLXFAST_MTP_ASSISTANT_MANIFEST_PATH: fixtures/mtp_gemma_4_31b_it_assistant_qat4bit.sha256
       # Decode-only score contract (adopted 2026-07-14; see header). Keep in
       # sync with the contract fixture's proposed_scoring block; the floor is
       # HARD (an MTP submission that is not actually faster than trusted

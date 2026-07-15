@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "track_id": "gemma4-31b-it-mtp-v1",
-  "official_scoring_enabled": true,
+  "official_scoring_enabled": false,
   "mlx_swift_lm_revision": "bc1c0ee67d15798343be17c9f8f61f7c0d977149",
   "target": {
     "upstream_model_id": "google/gemma-4-31B-it",
@@ -21,12 +21,12 @@
     "quantization_group_size": 64
   },
   "assistant": {
-    "model_id": "google/gemma-4-31B-it-assistant",
-    "revision": "6c9152a7639e1f87626e4d4fd4dd9f3e20c9f3fb",
-    "manifest_path": "fixtures/mtp_gemma_4_31b_it_assistant_bf16.sha256",
-    "manifest_sha256": "9dde96d9e236bae641f54cb972b704cfeaceee305f700b0fd790e397e71fed50",
-    "expected_total_bytes": 939044876,
-    "maximum_total_bytes": 1000000000,
+    "model_id": "mlx-community/gemma-4-31B-it-qat-assistant-4bit",
+    "revision": "5234fd588403c9b68f3bd20a140b7e61700cb7e2",
+    "manifest_path": "fixtures/mtp_gemma_4_31b_it_assistant_qat4bit.sha256",
+    "manifest_sha256": "37f9c485bcb1c04a609519852c2a95c638dffb19fd4ddc3e5fb44667fc8b4125",
+    "expected_total_bytes": 264144321,
+    "maximum_total_bytes": 300000000,
     "model_type": "gemma4_assistant",
     "backbone_hidden_size": 5376,
     "hidden_size": 1024,
@@ -34,16 +34,18 @@
     "num_hidden_layers": 4,
     "num_kv_shared_layers": 4,
     "vocab_size": 262144,
+    "quantization_bits": 4,
+    "quantization_group_size": 64,
     "files": [
       {
         "path": "config.json",
-        "sha256": "d09487c1083a334a97545f204dd41ab1a40b0438bdead19558f0e1357e26d66a",
-        "bytes": 2316
+        "sha256": "b4023f8991570a8e92fc164f72b0952b4d8afb1fa597c16a06690b69637a026e",
+        "bytes": 2962
       },
       {
         "path": "model.safetensors",
-        "sha256": "9f80df6099fa1fd7db71220ec9ee864d5ecff769878697dd5763e4285b15a1da",
-        "bytes": 939042560
+        "sha256": "2c0252eb9b57efe6dd9005c83863e16a3e58b9a21ce25e3880e2cc324f64aead",
+        "bytes": 264141359
       }
     ]
   },
@@ -56,8 +58,8 @@
     "worker_timing_is_authoritative": false
   },
   "reference_baseline": {
-    "status": "established",
-    "publication_allowed": true,
+    "status": "not_established",
+    "publication_allowed": false,
     "required_rebaseline_hardware": "m5-bench"
   },
   "proposed_scoring": {

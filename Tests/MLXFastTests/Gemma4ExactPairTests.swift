@@ -5,6 +5,7 @@ import MLX
 @testable import MLXFastModel
 import MLXLLM
 import MLXLMCommon
+import MLXNN
 import Testing
 
 @Test
@@ -815,4 +816,75 @@ private func expectExactCacheState(
             )
         }
     }
+}
+
+/// Load-path gate for the organizer-pinned QAT 4-bit assistant: proves the
+/// pinned mlx-swift-lm revision materializes the quantized drafter
+/// checkpoint (QuantizedLinear/QuantizedEmbedding construction from the
+/// config's affine 4-bit group-64 quantization block) and that one drafter
+/// forward over fabricated shared-KV produces a well-formed logits row.
+/// Needs only the ~264 MB assistant sidecar, never the 17 GB target.
+@Test
+func qatAssistantCheckpointLoadsQuantizedAndForwards() async throws {
+    let environment = ProcessInfo.processInfo.environment
+    guard environment["MLXFAST_RUN_MTP_ASSISTANT_LOAD_TESTS"] == "1" else {
+        return
+    }
+    let assistantPath = try #require(
+        environment["MLXFAST_MTP_ASSISTANT_DIR"]
+    )
+    let drafter = try await Gemma4AssistantDraftModel.load(
+        from: URL(fileURLWithPath: assistantPath)
+    )
+    let text = drafter.config.textConfig
+    // The QAT checkpoint declares its quantization at the top level of
+    // config.json (the level Gemma4AssistantDraftModel.load consumes via
+    // BaseConfiguration), not inside text_config.
+    let base = try JSONDecoder().decode(
+        BaseConfiguration.self,
+        from: Data(
+            contentsOf: URL(fileURLWithPath: assistantPath)
+                .appendingPathComponent("config.json")
+        )
+    )
+    let quantization = try #require(
+        base.perLayerQuantization?.quantization
+    )
+    #expect(quantization.bits == 4)
+    #expect(quantization.groupSize == 64)
+    // The load-time quantization pass must swap every module that ships
+    // `.scales` tensors: the projections and the tied token embedding
+    // become their Quantized counterparts.
+    #expect(drafter.preProjection is QuantizedLinear)
+    #expect(drafter.postProjection is QuantizedLinear)
+    #expect(drafter.model.embedTokens is QuantizedEmbedding)
+
+    // One drafter forward over fabricated, fixed shared-KV (target-free):
+    // shapes follow Gemma4SharedKV's documented [B, heads, T, headDim]
+    // layout for the 31B-IT tower (4x512 full, 16x256 sliding).
+    let backbone = drafter.config.backboneHiddenSize
+    let sharedKV = Gemma4SharedKV(
+        fullAttention: (
+            MLXArray.zeros([1, 4, 8, 512], dtype: .bfloat16),
+            MLXArray.zeros([1, 4, 8, 512], dtype: .bfloat16)
+        ),
+        slidingAttention: (
+            MLXArray.zeros([1, 16, 8, 256], dtype: .bfloat16),
+            MLXArray.zeros([1, 16, 8, 256], dtype: .bfloat16)
+        )
+    )
+    let output = drafter(
+        inputsEmbeds: MLXArray.zeros([1, 1, 2 * backbone], dtype: .bfloat16),
+        sharedKV: sharedKV,
+        positionOffset: Gemma4.PositionOffset.scalar(8)
+    )
+    eval(output.logits, output.lastHidden)
+    #expect(output.logits.shape == [1, 1, text.vocabSize])
+    #expect(output.lastHidden.shape == [1, 1, backbone])
+    let draft = output.logits[0..., -1, 0...].argMax(axis: -1)
+    let token = Int(draft.item(Int32.self))
+    #expect(token >= 0 && token < text.vocabSize)
+    #expect(
+        output.logits.asType(.float32).sum().item(Float.self).isFinite
+    )
 }
