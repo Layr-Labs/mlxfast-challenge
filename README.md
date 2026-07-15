@@ -450,6 +450,17 @@ accepted answer prefixes against up to `max_new_tokens` generated tokens, which
 lets hidden GPQA questions require only a one-letter answer while tolerating
 tokenizer whitespace variants.
 
+## License and attribution
+
+This repository's harness code is licensed per [LICENSE](LICENSE). The Gemma 4
+models the harness downloads and benchmarks (Gemma 4 31B, Gemma 4 31B-IT, and
+the Gemma 4 31B-IT assistant, © Google DeepMind, plus the mlx-community 4-bit
+conversions) are Apache-2.0 with usage terms at
+<https://ai.google.dev/gemma/docs/gemma_4_license>; no model weights are
+distributed in this repository. Full third-party attribution — models,
+linked Swift packages, and the Apache-2.0 text — is in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## Requirements
 
 - Apple Silicon Mac, 36 GB+ unified memory (enough to hold the ~17 GB text
