@@ -599,8 +599,13 @@ func trainedMTPContractPinsMatchedITPairAndDependency() throws {
         contract.mlxSwiftLMRevision
             == "bc1c0ee67d15798343be17c9f8f61f7c0d977149"
     )
-    #expect(!contract.officialScoringEnabled)
-    #expect(contract.referenceBaseline.status == "not_established")
+    // Enablement commit: official scoring is ON with an established,
+    // publishable reference baseline. The ranked decode window (512) is
+    // owned by the workflow env; the contract's decode_tokens stays the
+    // 128-token compatibility default with a 512 trusted-parent maximum.
+    #expect(contract.officialScoringEnabled)
+    #expect(contract.referenceBaseline.status == "established")
+    #expect(contract.referenceBaseline.publicationAllowed)
     #expect(contract.protocolContract.decodeTokens == 128)
     #expect(contract.protocolContract.maximumDecodeTokens == 512)
 }

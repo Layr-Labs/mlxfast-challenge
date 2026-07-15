@@ -11,19 +11,29 @@ name: mtp-benchmark
 # score, baseline tree, calibration, or artifact names, and benchmark.json's
 # runner.workflow continues to point at benchmark.yml.
 #
-# INERT UNTIL OPERATOR GO-LIVE (the primary contract of this file today):
-#   The "Enforce MTP track enablement" step below fails closed while the
-#   trusted contract fixture on main still carries
+# ENABLEMENT STATE: this file carries the go-live configuration (contract
+#   flags flipped on main, hidden-golden pins filled below, scoring decisions
+#   adopted). The "Enforce MTP track enablement" step remains the standing
+#   guard: it fails closed if the trusted contract fixture ever reverts to
 #   official_scoring_enabled=false or reference_baseline.publication_allowed
-#   =false, while any hidden-golden pin env below is empty, or while the
-#   dispatch lacks confirm_track_enabled=true. Until the operator completes
-#   docs/mtp-track-golive-runbook.md (post-stall-fix validation matrix ->
-#   frozen IT goldens -> floor calibration -> serving-box provisioning) and
-#   flips those trusted fields
-#   in one deliberate commit on main, every dispatch of this workflow stops
-#   at that step: no secrets are used, no submitted code runs, no artifact is
-#   published, and no score exists. For submissions/* dispatches the contract
-#   is read from trusted main, so a submission cannot flip the track on.
+#   =false, if any hidden-golden pin env below is emptied, or if a dispatch
+#   lacks confirm_track_enabled=true (the per-dispatch operator interlock —
+#   deliberate dispatches only, no default-on runs). For submissions/*
+#   dispatches the contract is read from trusted main, so a submission can
+#   neither flip the track on nor off. Rollback remains one revert of the
+#   enablement commit; see docs/mtp-track-golive-runbook.md.
+#
+# ADOPTED SCORING (2026-07-14 scoring-decision memo; mirrors the serial
+#   track's paired mechanics):
+#   - ranked decode window: 512 parent-counted tokens (contract max);
+#   - aggregation: RATIO-OF-MEANS across accepted pairs —
+#       score = mean(serial s/tok) / mean(mtp s/tok);
+#   - floor: aggregate >= 1.0 (floor applies to the aggregate, not per pair);
+#   - pairs: minimum 3 accepted, target 4, alternating order;
+#   - stall guardrail: a run with max block latency > 4x its p50 is rejected
+#     as measurement-invalid, with one gated retry (owned by measure-mtp-job,
+#     same class as its throttle rejection);
+#   - hard bit-exact token gate across every timed run (parity_all_ok).
 #
 # WHAT A LIVE RUN DOES (after go-live):
 #   1. Verifies the operator-provisioned 31B-IT target + assistant caches
@@ -49,8 +59,10 @@ name: mtp-benchmark
 #      has no authority anywhere; the parent divides its own wall time by
 #      its own configured token total.
 #   6. Applies the decode-only score contract in the trusted shell:
-#        mtp_decode_speedup = serial_sec_per_token / mtp_sec_per_token
-#        score = mtp_decode_speedup            (floor >= 1.0, hard)
+#        score = mtp_decode_speedup
+#              = mean(serial s/tok over accepted pairs)
+#                / mean(mtp s/tok over accepted pairs)   [ratio-of-means]
+#        floor >= 1.0 on that aggregate, hard;
 #        bit-exact gate: parity_all_ok must be true across every timed run.
 #      There is no prefill component: the MTP protocol charges seed prefill
 #      inside the decode measurement.
@@ -76,10 +88,12 @@ name: mtp-benchmark
 #       FIXED, non-overridable thermal-stability contract: per-phase
 #       quiescence + reap, GPU < 40C gate before every timed phase (900 s
 #       ceiling), 2 Hz macmon telemetry, throttle/telemetry rejection, one
-#       gated retry, baseline calibration band check, alternating-order
-#       pairs, per-side BENCH_GOLDEN_PATH worker denial of the hidden
-#       benchmark golden, and a sealed results.json of the shape consumed by
-#       "Compute MTP score" below.
+#       gated retry, the 4x-p50 stall-guardrail rejection (also one gated
+#       retry), baseline calibration band check, alternating-order pairs
+#       (target --target-pairs, minimum --min-pairs accepted), per-side
+#       BENCH_GOLDEN_PATH worker denial of the hidden benchmark golden, and
+#       a sealed results.json whose aggregate carries the per-side
+#       seconds/token means consumed by "Compute MTP score" below.
 #
 # Dispatch-only, same self-hosted safety rules as the serial pipeline: no
 # PR/push triggers, refs restricted to main, submissions/*, baseline/*, and
@@ -136,31 +150,39 @@ jobs:
       MLXFAST_JOB_WS: /Users/Shared/bench-jobs/mtp-ranked-current
       # --- Runner-only private material (0700 runner).
       MLXFAST_PRIVATE_DIR: /tmp/mlxfast-mtp-private-${{ github.run_id }}-${{ github.run_attempt }}
-      MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-mtp-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+      # Distinct from the serial track's artifact run root while satisfying
+      # stage-benchmark-artifacts.sh's /tmp/mlxfast-artifacts- prefix contract
+      # (run component "mtp-<run>-<attempt>").
+      MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-mtp-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_MEASURE_OUT: /tmp/mlxfast-mtp-measure-${{ github.run_id }}-${{ github.run_attempt }}
       # --- Track contract.
       MLXFAST_MTP_TRACK_ID: gemma4-31b-it-mtp-v1
       MLXFAST_MTP_CONTRACT_PATH: fixtures/gemma_4_31b_it_mtp_track.json
       MLXFAST_MTP_TARGET_MANIFEST_PATH: fixtures/mtp_gemma_4_31b_it_4bit.sha256
       MLXFAST_MTP_ASSISTANT_MANIFEST_PATH: fixtures/mtp_gemma_4_31b_it_assistant_bf16.sha256
-      # Decode-only score contract. Keep in sync with the contract fixture's
-      # protocol block; the floor is HARD (an MTP submission that is not
-      # actually faster than trusted serial decode does not rank).
+      # Decode-only score contract (adopted 2026-07-14; see header). Keep in
+      # sync with the contract fixture's proposed_scoring block; the floor is
+      # HARD (an MTP submission that is not actually faster than trusted
+      # serial decode does not rank) and applies to the ratio-of-means
+      # aggregate over the accepted pairs.
       MLXFAST_MTP_BLOCK_SIZE: "4"
-      MLXFAST_MTP_DECODE_TOKENS: "128"
+      MLXFAST_MTP_DECODE_TOKENS: "512"
       MLXFAST_MTP_CORRECTNESS_TOKENS: "512"
       MLXFAST_MTP_DECODE_SPEEDUP_FLOOR: "1.0"
       MLXFAST_MTP_MIN_ACCEPTED_PAIRS: "3"
-      # Hidden IT-target golden pins — EMPTY until the operator freezes the
-      # goldens (go-live runbook step B) and fills them in the same trusted
-      # commit that flips the contract fixture. The enablement gate fails
-      # closed while any pin is empty, so the workflow cannot run against
-      # unpinned hidden inputs. (The R2 object KEYS are deliberately scoped
-      # to the one trusted download step, exactly like the serial pipeline.)
-      MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256: ""
-      MLXFAST_MTP_CORRECTNESS_GOLDEN_BYTES: ""
-      MLXFAST_MTP_BENCH_GOLDEN_SHA256: ""
-      MLXFAST_MTP_BENCH_GOLDEN_BYTES: ""
+      MLXFAST_MTP_TARGET_PAIRS: "4"
+      # Hidden IT-target golden pins, frozen 2026-07-15 on M5 silicon from the
+      # pinned IT target at the post-stall-fix tip (go-live runbook step B;
+      # capture record in the operator private store). PENDING box-2 replay
+      # confirmation: if the serving box's stack diverges on any near-tie
+      # argmax, the goldens are regenerated there and these pins updated
+      # before this change merges. The enablement gate fails closed if any
+      # pin is emptied. (The R2 object KEYS are deliberately scoped to the
+      # one trusted download step, exactly like the serial pipeline.)
+      MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256: d4fff3fe015123c395be68cb19401709ec288e44a04e52c2ea36c32220356862
+      MLXFAST_MTP_CORRECTNESS_GOLDEN_BYTES: "14683"
+      MLXFAST_MTP_BENCH_GOLDEN_SHA256: a472d6e40c3bada936fa39535753fec609d836e709db03274222a4a303ae6f58
+      MLXFAST_MTP_BENCH_GOLDEN_BYTES: "14982"
       # --- Benchmark plumbing (identical values/semantics to benchmark.yml).
       MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
@@ -970,16 +992,19 @@ jobs:
               --tokens "${MLXFAST_MTP_DECODE_TOKENS}" \
               --block-size "${MLXFAST_MTP_BLOCK_SIZE}" \
               --min-pairs "${MLXFAST_MTP_MIN_ACCEPTED_PAIRS}" \
+              --target-pairs "${MLXFAST_MTP_TARGET_PAIRS}" \
               --tag "mtp-ranked-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
               --out "${MLXFAST_MEASURE_OUT}"
           test -s "${MLXFAST_MEASURE_OUT}/results.json"
           jq -c '{mode, accepted_pair_count, parity_all_ok}' "${MLXFAST_MEASURE_OUT}/results.json"
 
-      # Decode-only score contract, applied in the trusted shell from the
-      # sealed paired results: hard bit-exact gate, minimum accepted pairs,
-      # and the 1.0 floor. The published mtp-score.json carries the track id
-      # so the leaderboard namespace can never be confused with the serial
-      # track's score.json.
+      # Decode-only score contract (adopted 2026-07-14 memo), applied in the
+      # trusted shell from the sealed paired results: hard bit-exact gate,
+      # minimum accepted pairs, RATIO-OF-MEANS aggregation computed HERE from
+      # the sealed per-side seconds/token means (never trusted from a
+      # pre-aggregated field), and the 1.0 floor on that aggregate. The
+      # published mtp-score.json carries the track id so the leaderboard
+      # namespace can never be confused with the serial track's score.json.
       - name: Compute MTP score and enforce floor
         if: ${{ inputs.run_benchmark }}
         run: |
@@ -993,39 +1018,49 @@ jobs:
             .track_id == $track
             and .parity_all_ok == true
             and (.accepted_pair_count >= $min_pairs)
-            and (.aggregate.mtp_decode_speedup_mean | type == "number")
-            and (.aggregate.baseline_serial_seconds_per_token_mean | type == "number")
-            and (.aggregate.candidate_mtp_seconds_per_token_mean | type == "number")
+            and ((.pairs | type) == "array")
+            and ((.pairs | length) == .accepted_pair_count)
+            and (.aggregate.baseline_serial_seconds_per_token_mean | type == "number" and . > 0)
+            and (.aggregate.candidate_mtp_seconds_per_token_mean | type == "number" and . > 0)
+            and (.aggregate.mtp_decode_speedup_median | type == "number")
+            and (.aggregate.mtp_decode_speedup_min | type == "number")
             ' "${results}" >/dev/null || {
               echo "::error::paired MTP results failed validation (bit-exact gate, pair count, or schema)" >&2
               exit 1
             }
-          speedup="$(jq -r '.aggregate.mtp_decode_speedup_mean' "${results}")"
+          # Ratio-of-means: mean serial s/tok over accepted pairs divided by
+          # mean MTP s/tok over the same pairs (equivalently total serial
+          # decode time / total MTP decode time for the fixed token total).
+          speedup="$(jq -r '.aggregate.baseline_serial_seconds_per_token_mean / .aggregate.candidate_mtp_seconds_per_token_mean' "${results}")"
           floor_ok="$(echo "${speedup} >= ${MLXFAST_MTP_DECODE_SPEEDUP_FLOOR}" | bc -l)"
           if [[ "${floor_ok}" != "1" ]]; then
-            echo "::error::mtp_decode_speedup ${speedup} is below the ${MLXFAST_MTP_DECODE_SPEEDUP_FLOOR} floor; an MTP submission that is not faster than trusted serial decode does not rank" >&2
+            echo "::error::mtp_decode_speedup (ratio-of-means) ${speedup} is below the ${MLXFAST_MTP_DECODE_SPEEDUP_FLOOR} floor; an MTP submission that is not faster than trusted serial decode does not rank" >&2
             exit 1
           fi
           jq -n \
             --arg track "${MLXFAST_MTP_TRACK_ID}" \
             --arg commit "${MLXFAST_CANDIDATE_SHA}" \
             --arg weights_hash "$(tr -d '[:space:]' < mtp-weights.sha256)" \
+            --argjson score "${speedup}" \
             --argjson floor "${MLXFAST_MTP_DECODE_SPEEDUP_FLOOR}" \
             --argjson decode_tokens "${MLXFAST_MTP_DECODE_TOKENS}" \
+            --argjson target_pairs "${MLXFAST_MTP_TARGET_PAIRS}" \
             --slurpfile results "${results}" \
             '
             {
-              score: $results[0].aggregate.mtp_decode_speedup_mean,
+              score: $score,
               passed: true,
               track_id: $track,
               metrics: {
                 mode: "mtp-paired-decode-only",
+                aggregation: "ratio_of_means",
                 commit: $commit,
                 decode_tokens: $decode_tokens,
                 decode_speedup_floor: $floor,
                 accepted_pair_count: $results[0].accepted_pair_count,
+                target_pair_count: $target_pairs,
                 parity_all_ok: $results[0].parity_all_ok,
-                mtp_decode_speedup_mean: $results[0].aggregate.mtp_decode_speedup_mean,
+                mtp_decode_speedup_ratio_of_means: $score,
                 mtp_decode_speedup_median: $results[0].aggregate.mtp_decode_speedup_median,
                 mtp_decode_speedup_min: $results[0].aggregate.mtp_decode_speedup_min,
                 baseline_serial_seconds_per_token_mean: $results[0].aggregate.baseline_serial_seconds_per_token_mean,

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "track_id": "gemma4-31b-it-mtp-v1",
-  "official_scoring_enabled": false,
+  "official_scoring_enabled": true,
   "mlx_swift_lm_revision": "bc1c0ee67d15798343be17c9f8f61f7c0d977149",
   "target": {
     "upstream_model_id": "google/gemma-4-31B-it",
@@ -56,20 +56,23 @@
     "worker_timing_is_authoritative": false
   },
   "reference_baseline": {
-    "status": "not_established",
-    "publication_allowed": false,
+    "status": "established",
+    "publication_allowed": true,
     "required_rebaseline_hardware": "m5-bench"
   },
   "proposed_scoring": {
-    "status": "proposal_pending_operator_calibration",
+    "status": "adopted_2026-07-14_scoring_decision_memo",
     "score": "mtp_decode_speedup = paired_serial_decode_sec_per_token / mtp_decode_sec_per_token",
+    "ranked_decode_window_tokens": 512,
+    "aggregation": "ratio_of_means: mean(serial seconds/token across accepted pairs) / mean(mtp seconds/token across accepted pairs)",
     "paired_serial_reference": "trusted serial K=1 target decode (mtp-probe path) over the same golden, same session, same thermal gate, same box",
     "denominator_authority": "trusted parent wall time divided by the parent-configured decode total",
-    "component_floor": "mtp_decode_speedup >= 1.0",
+    "component_floor": "aggregate mtp_decode_speedup >= 1.0 (floor applies to the ratio-of-means aggregate, not per pair)",
     "bit_exact_gate": "every returned token must match the parent-owned serial oracle; any mismatch fails the run before scoring",
+    "stall_guardrail": "a run whose max block latency exceeds 4x its p50 block latency is rejected as measurement-invalid with one gated retry",
     "prefill_component": "none; seed prefill is charged inside the decode measurement",
     "leaderboard": "separate gemma4-31b-it-mtp-v1 namespace, never mixed with the serial track",
-    "measurement_protocol": "minimum three accepted thermal-gated pairs per session with alternating order; single-pair scores are not publishable"
+    "measurement_protocol": "minimum three accepted thermal-gated pairs per session (target four) with alternating order; single-pair scores are not publishable"
   },
   "license": {
     "spdx": "Apache-2.0",

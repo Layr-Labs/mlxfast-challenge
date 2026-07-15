@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "name": "mlxfast-challenge-dev-mtp",
+  "trackId": "gemma4-31b-it-mtp-v1",
+  "description": "Gemma 4 31B-IT MTP track: optimize organizer-assistant, target-verified block decode (drafting strategy and bit-exact multi-row verification kernels in the editable surface) against the trusted serial K=1 oracle. Decode-only paired scoring; every returned token must match the parent-owned serial oracle.",
+  "category": "swift",
+  "direction": "+",
+  "editablePaths": [
+    "Sources/MLXFastModel",
+    "Sources/MLXFastTransform"
+  ],
+  "contractPath": "fixtures/gemma_4_31b_it_mtp_track.json",
+  "setupCommand": ["bash", "-c", "./setup.sh && ./setup-mtp.sh"],
+  "runner": {
+    "provider": "github-actions",
+    "workflow": "mtp-benchmark.yml"
+  },
+  "scoreArtifact": "mtp-benchmark-results-<run_id>/mtp-score.json",
+  "scorePath": "mtp-score.json",
+  "scoring": {
+    "mode": "mtp-paired-decode-only",
+    "decodeTokens": 512,
+    "aggregation": "ratio_of_means",
+    "decodeSpeedupFloor": 1.0,
+    "minAcceptedPairs": 3,
+    "targetPairs": 4,
+    "bitExactTokenGate": true,
+    "stallGuardrail": "max block latency > 4x p50 rejects the run (one gated retry)"
+  },
+  "leaderboard": {
+    "namespace": "gemma4-31b-it-mtp-v1",
+    "separateFromSerialTrack": true
+  },
+  "staticReviewTrackId": "gemma4-31b-it-mtp-v1"
+}

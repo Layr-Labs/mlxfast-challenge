@@ -586,7 +586,10 @@ extension GemmaRuntime {
             mlxCacheMemoryBytes: measurement.mlxCacheMemoryBytes,
             mlxPeakMemoryBytes: measurement.mlxPeakMemoryBytes,
             allTokensMatched: true,
-            referenceBaselineStatus: "not_established",
+            referenceBaselineStatus: artifacts.referenceBaselineStatus,
+            // This CLI invocation never emits the official score even on the
+            // enabled track: the trusted workflow computes the paired score
+            // from measure-mtp-job's sealed results, never from this report.
             officialScoreProduced: false
         )
     }

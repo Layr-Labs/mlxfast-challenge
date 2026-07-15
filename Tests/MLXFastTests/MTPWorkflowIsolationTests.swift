@@ -1,13 +1,15 @@
 import Foundation
 import Testing
 
-// Structural guards for the DISTINCT MTP ranked workflow draft
-// (.github/workflows/mtp-benchmark.yml): it must stay inert until the
-// operator deliberately enables the track on trusted main, it must remain
-// fully separate from the serial ranked pipeline (its own track id,
-// workspace, artifacts, and baseline), and the serial pipeline must remain
-// MTP-free. These pin the wiring so a refactor cannot silently enable
-// scoring or blend the two tracks.
+// Structural guards for the DISTINCT MTP ranked workflow
+// (.github/workflows/mtp-benchmark.yml): the track is enabled only through
+// the deliberate trusted-contract enablement (with a standing fail-closed
+// gate and a per-dispatch operator interlock), it must remain fully separate
+// from the serial ranked pipeline (its own track id, workspace, artifacts,
+// baseline, and leaderboard registration), and the serial pipeline must
+// remain MTP-free. These pin the wiring so a refactor cannot silently
+// weaken the gate, change the adopted scoring contract, or blend the two
+// tracks.
 @Suite
 struct MTPWorkflowIsolationTests {
     private func mtpWorkflow() throws -> String {
@@ -56,13 +58,14 @@ struct MTPWorkflowIsolationTests {
         #expect(serialScript.contains("WORKFLOW_PATH=\".github/workflows/benchmark.yml\""))
     }
 
-    // THE INERT GATE: the enablement step fails closed while the trusted
-    // contract fixture carries official_scoring_enabled=false or
-    // publication_allowed=false, while any hidden-golden pin is empty, or
-    // without the explicit operator dispatch interlock — and it is ordered
-    // before any secret use, submitted-code handling, or bench execution.
+    // THE ENABLEMENT GATE (post-go-live shape): the track is enabled on the
+    // trusted contract and the hidden-golden pins are filled with the frozen
+    // values, while the gate itself remains standing and fail-closed — it
+    // still refuses a reverted contract, an emptied pin, or a dispatch
+    // without the explicit operator interlock — and it stays ordered before
+    // any secret use, submitted-code handling, or bench execution.
     @Test
-    func mtpWorkflowIsInertUntilOperatorEnablement() throws {
+    func mtpTrackIsEnabledWithPinnedGoldensAndStandingFailClosedGate() throws {
         let workflow = try mtpWorkflow()
 
         let enablement = try #require(workflow.range(of: "- name: Enforce MTP track enablement"))
@@ -83,20 +86,24 @@ struct MTPWorkflowIsolationTests {
         #expect(gate.contains("jq -r '.official_scoring_enabled'"))
         #expect(gate.contains("jq -r '.reference_baseline.publication_allowed'"))
         #expect(gate.contains("!= \"true\""))
-        #expect(gate.contains("deliberately inert until the operator completes"))
         #expect(gate.contains("confirm_track_enabled=true"))
         #expect(gate.contains("MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256"))
         #expect(gate.contains("MLXFAST_MTP_BENCH_GOLDEN_SHA256"))
         #expect(gate.contains("is empty; freeze the IT-target goldens"))
 
-        // The pins ship EMPTY in this draft: the operator fills them in the
-        // same trusted commit that flips the contract fixture.
-        #expect(workflow.contains("MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256: \"\""))
-        #expect(workflow.contains("MLXFAST_MTP_CORRECTNESS_GOLDEN_BYTES: \"\""))
-        #expect(workflow.contains("MLXFAST_MTP_BENCH_GOLDEN_SHA256: \"\""))
-        #expect(workflow.contains("MLXFAST_MTP_BENCH_GOLDEN_BYTES: \"\""))
+        // The pins carry the frozen 2026-07-15 golden identities (pending
+        // box-2 replay confirmation; re-pinned there on any divergence).
+        #expect(workflow.contains(
+            "MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256: d4fff3fe015123c395be68cb19401709ec288e44a04e52c2ea36c32220356862"
+        ))
+        #expect(workflow.contains("MLXFAST_MTP_CORRECTNESS_GOLDEN_BYTES: \"14683\""))
+        #expect(workflow.contains(
+            "MLXFAST_MTP_BENCH_GOLDEN_SHA256: a472d6e40c3bada936fa39535753fec609d836e709db03274222a4a303ae6f58"
+        ))
+        #expect(workflow.contains("MLXFAST_MTP_BENCH_GOLDEN_BYTES: \"14982\""))
 
-        // The dispatch interlock defaults to false.
+        // The per-dispatch operator interlock still defaults to false: an
+        // enabled track never runs from a default-parameter dispatch.
         let confirmInput = try stepBody(
             workflow,
             from: "confirm_track_enabled:",
@@ -104,14 +111,15 @@ struct MTPWorkflowIsolationTests {
         )
         #expect(confirmInput.contains("default: false"))
 
-        // And the trusted contract the gate reads is still disabled (the
+        // And the trusted contract the gate reads is ENABLED (the
         // ExperimentalMTPTests contract test pins this too; asserting here
         // keeps workflow + fixture in one reviewable invariant).
         let contract = try Data(contentsOf: URL(fileURLWithPath: "fixtures/gemma_4_31b_it_mtp_track.json"))
         let json = try #require(try JSONSerialization.jsonObject(with: contract) as? [String: Any])
-        #expect(json["official_scoring_enabled"] as? Bool == false)
+        #expect(json["official_scoring_enabled"] as? Bool == true)
         let baseline = try #require(json["reference_baseline"] as? [String: Any])
-        #expect(baseline["publication_allowed"] as? Bool == false)
+        #expect(baseline["publication_allowed"] as? Bool == true)
+        #expect(baseline["status"] as? String == "established")
     }
 
     // The two ranked tracks never share mutable identity: distinct workspace,
@@ -151,6 +159,25 @@ struct MTPWorkflowIsolationTests {
         // main-ref dispatches may populate the trusted cache namespaces.
         #expect(workflow.contains("actions/cache/restore@"))
         #expect(!workflow.contains("actions/cache/save@"))
+
+        // The leaderboard registration record is its own track config: the
+        // MTP track id, workflow, and score artifact live in
+        // benchmark.mtp.json, while the serial benchmark.json remains
+        // pointed at benchmark.yml/score.json untouched.
+        let registration = try Data(contentsOf: URL(fileURLWithPath: "benchmark.mtp.json"))
+        let track = try #require(try JSONSerialization.jsonObject(with: registration) as? [String: Any])
+        #expect(track["trackId"] as? String == "gemma4-31b-it-mtp-v1")
+        let runner = try #require(track["runner"] as? [String: Any])
+        #expect(runner["workflow"] as? String == "mtp-benchmark.yml")
+        #expect(track["scorePath"] as? String == "mtp-score.json")
+        let leaderboard = try #require(track["leaderboard"] as? [String: Any])
+        #expect(leaderboard["namespace"] as? String == "gemma4-31b-it-mtp-v1")
+        #expect(leaderboard["separateFromSerialTrack"] as? Bool == true)
+
+        let serialConfig = try String(contentsOfFile: "benchmark.json", encoding: .utf8)
+        #expect(serialConfig.contains("\"workflow\": \"benchmark.yml\""))
+        #expect(serialConfig.contains("\"scorePath\": \"score.json\""))
+        #expect(!serialConfig.contains("mtp"))
     }
 
     // The serial ranked pipeline stays MTP-free: enabling, disabling, or
@@ -189,16 +216,22 @@ struct MTPWorkflowIsolationTests {
         #expect(reviewScript.contains("serial|gemma4-31b-it-mtp-v1"))
     }
 
-    // Decode-only paired scoring with the hard gates: bit-exact parity across
-    // every timed run, a minimum accepted pair count, and the 1.0 floor. The
-    // hidden benchmark golden reaches the workspace only inside measure-job's
-    // timed sides, and the correctness golden is scrubbed before timing.
+    // Decode-only paired scoring per the adopted 2026-07-14 decision memo:
+    // 512-token decode window, ratio-of-means aggregation computed in the
+    // trusted shell from the sealed per-side means, floor 1.0 on that
+    // aggregate, minimum 3 / target 4 accepted pairs, and the hard bit-exact
+    // parity gate across every timed run. The hidden benchmark golden
+    // reaches the workspace only inside measure-job's timed sides, and the
+    // correctness golden is scrubbed before timing.
     @Test
     func mtpScoringEnforcesBitExactGateMinimumPairsAndFloor() throws {
         let workflow = try mtpWorkflow()
 
+        #expect(workflow.contains("MLXFAST_MTP_DECODE_TOKENS: \"512\""))
         #expect(workflow.contains("MLXFAST_MTP_DECODE_SPEEDUP_FLOOR: \"1.0\""))
         #expect(workflow.contains("MLXFAST_MTP_MIN_ACCEPTED_PAIRS: \"3\""))
+        #expect(workflow.contains("MLXFAST_MTP_TARGET_PAIRS: \"4\""))
+        #expect(workflow.contains("--target-pairs \"${MLXFAST_MTP_TARGET_PAIRS}\""))
 
         let score = try stepBody(
             workflow,
@@ -208,7 +241,15 @@ struct MTPWorkflowIsolationTests {
         #expect(score.contains(".parity_all_ok == true"))
         #expect(score.contains(".accepted_pair_count >= $min_pairs"))
         #expect(score.contains("is below the ${MLXFAST_MTP_DECODE_SPEEDUP_FLOOR} floor"))
-        #expect(score.contains("mtp_decode_speedup_mean"))
+        // Ratio-of-means is computed in the trusted shell from the sealed
+        // per-side seconds/token means, never read from a pre-aggregated
+        // speedup field.
+        #expect(score.contains(
+            ".aggregate.baseline_serial_seconds_per_token_mean / .aggregate.candidate_mtp_seconds_per_token_mean"
+        ))
+        #expect(score.contains("aggregation: \"ratio_of_means\""))
+        #expect(score.contains("mtp_decode_speedup_ratio_of_means"))
+        #expect(!score.contains("score: $results[0].aggregate.mtp_decode_speedup_mean"))
 
         // Ordering: correctness gate -> scrub -> reap -> quiescence ->
         // harness re-verify -> timed measurement -> score.

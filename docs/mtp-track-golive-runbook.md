@@ -18,20 +18,24 @@ Box naming used throughout (no hostnames in this public doc):
   intentional change requires a manifest re-sign or the janitor quarantines
   the box. Do not touch it except inside step C's provisioning window.
 
-Current state (what this runbook starts from):
+Current state (updated by the enablement change this document rides in):
 
 - The MTP track code, contract, manifests, and provisioner are merged behind
   explicit `mtp-probe` / `mtp-benchmark` commands; serial `benchmark` cannot
   reach them.
-- `fixtures/gemma_4_31b_it_mtp_track.json` carries
-  `official_scoring_enabled=false` and
-  `reference_baseline.publication_allowed=false`.
-- `.github/workflows/mtp-benchmark.yml` exists but is deliberately inert: its
-  enablement gate fails while those contract fields are false, while its four
-  hidden-golden pin env values are empty, and without the
-  `confirm_track_enabled=true` dispatch input.
-- No hidden IT-target goldens exist; no MTP baseline tree, calibration, or
-  `measure-mtp-job.sh` exists on box 2.
+- The hidden IT-target goldens are FROZEN (captured and self-validated on
+  drained M5 silicon per step B; pins carried in `mtp-benchmark.yml`,
+  pending box-2 replay confirmation).
+- The enablement change flips `fixtures/gemma_4_31b_it_mtp_track.json` to
+  `official_scoring_enabled=true` /
+  `reference_baseline.publication_allowed=true`, fills the golden pins, and
+  adopts the 2026-07-14 scoring decisions; until it MERGES, `main` stays
+  inert (flags false, pins empty). The workflow's enablement gate remains
+  standing either way: it fails closed on a reverted contract, an emptied
+  pin, or a dispatch without `confirm_track_enabled=true`.
+- Box 2 still has no MTP caches, baseline tree, calibration, or
+  `measure-mtp-job.sh`; provisioning (step C) is a merge PRECONDITION of the
+  enablement change.
 - The serial ranked pipeline (`benchmark.yml`) is untouched by all of this
   and must remain untouched by every step below.
 
@@ -343,38 +347,43 @@ contract) and install to `/opt/bench-runner/measure-mtp-job.sh`
 (root:wheel 0755). Required behavior, which `mtp-benchmark.yml` consumes:
 
 - args: `--candidate WS --baseline WS --golden PATH --contract PATH
-  --tokens N --block-size K --min-pairs N --tag T --out DIR`;
+  --tokens N --block-size K --min-pairs N --target-pairs N --tag T
+  --out DIR` (the adopted ranked configuration is `--tokens 512
+  --min-pairs 3 --target-pairs 4`);
 - per accepted pair, alternating order across pairs: baseline side runs
   `mtp-probe --tokens N` from an APFS clone of the pinned baseline tree;
   candidate side runs `mtp-benchmark --target-verification exact-pair
   --require-trained-assistant --tokens N` from the candidate workspace —
   both through the bench-exec bridge, each phase behind per-phase
   quiescence + reap, the 40C gate (900 s ceiling), 2 Hz macmon telemetry
-  with the throttle/steady-sample rules, one gated retry;
+  with the throttle/steady-sample rules, one gated retry; it attempts
+  `--target-pairs` pairs and succeeds with at least `--min-pairs` accepted;
 - exports `BENCH_GOLDEN_PATH=<installed golden path>` per side so the
   rendered worker Seatbelt profile denies the hidden benchmark golden to
   the worker (the parent legitimately reads it as the oracle); installs the
   golden 0444 per side and scrubs it after;
 - requires `all_tokens_matched=true` from every run (a single divergent
   token invalidates the pair and the job);
-- stall guardrail (post-fix): reject a run whose
+- stall guardrail (adopted): reject a run whose
   `max_block_request_seconds > 4 x p50_block_request_seconds` as
-  measurement-invalid (same class as throttle rejection);
+  measurement-invalid, with ONE gated retry — the same rejection-and-retry
+  class as throttle rejection;
 - checks the serial-side seconds/token against the calibration band in
   `/opt/bench-runner/state/mtp-baseline-calibration.json`;
-- seals `results.json`:
+- seals `results.json` (the workflow computes the published ratio-of-means
+  score in the trusted shell from the two aggregate per-side means; the
+  per-pair `speedup` values and their median/min are diagnostics):
 
 ```json
 {
   "track_id": "gemma4-31b-it-mtp-v1",
   "mode": "mtp-paired",
-  "accepted_pair_count": 3,
+  "accepted_pair_count": 4,
   "parity_all_ok": true,
   "pairs": [ { "serial_seconds_per_token": 0.0, "mtp_seconds_per_token": 0.0, "speedup": 0.0, "order": "serial-first" } ],
   "aggregate": {
     "baseline_serial_seconds_per_token_mean": 0.0,
     "candidate_mtp_seconds_per_token_mean": 0.0,
-    "mtp_decode_speedup_mean": 0.0,
     "mtp_decode_speedup_median": 0.0,
     "mtp_decode_speedup_min": 0.0
   },
@@ -411,26 +420,37 @@ no timing drift — proof the provisioning did not perturb the serving path.
 
 ## Step 4 (enablement — the operator flip) and validation
 
-One trusted commit on `main`, reviewed like any ranking-contract change:
+The enablement change is ASSEMBLED AS A DRAFT PR (one trusted commit,
+reviewed like any ranking-contract change) and merges only after the box-2
+preconditions in C are complete. It contains:
 
 1. `fixtures/gemma_4_31b_it_mtp_track.json`:
    `official_scoring_enabled: true`; `reference_baseline` -> `status:
-   "established"`, `publication_allowed: true`, plus the calibrated
-   serial-denominator stats and calibration date.
-2. `.github/workflows/mtp-benchmark.yml`: fill the four golden pins
-   (`MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256/BYTES`,
-   `MLXFAST_MTP_BENCH_GOLDEN_SHA256/BYTES`). Set
-   `MLXFAST_MTP_DECODE_TOKENS` to the decided denominator (see open
-   decisions).
-3. Update the tests that deliberately pin the disabled state
+   "established"`, `publication_allowed: true`; the `proposed_scoring`
+   block updated to the ADOPTED 2026-07-14 decisions (512-token ranked
+   decode window, ratio-of-means aggregation, floor on the aggregate,
+   minimum 3 / target 4 pairs, 4x-p50 stall guardrail with one gated
+   retry). The harness contract validator
+   (`validateExperimentalMTPContract`) pins the enabled identity in the
+   same commit. The calibrated serial-denominator stats live in the box's
+   `mtp-baseline-calibration.json` (C.5/B.6), not the fixture.
+2. `.github/workflows/mtp-benchmark.yml`: the four golden pins filled from
+   the freeze record (`MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256/BYTES`,
+   `MLXFAST_MTP_BENCH_GOLDEN_SHA256/BYTES` — pending box-2 replay
+   confirmation; re-pin if box 2 diverges), `MLXFAST_MTP_DECODE_TOKENS=512`,
+   `MLXFAST_MTP_TARGET_PAIRS=4`, and the ratio-of-means score computation.
+3. The tests that deliberately pinned the disabled state updated to pin the
+   enabled state instead
    (`ExperimentalMTPTests.trainedMTPContractPinsMatchedITPairAndDependency`,
-   `MTPWorkflowIsolationTests.mtpWorkflowIsInertUntilOperatorEnablement`) to
-   pin the enabled state instead; `swift test` green.
-4. Register the `gemma4-31b-it-mtp-v1` leaderboard namespace with the
-   orchestrator/Yukon backend: score artifact
+   `MTPWorkflowIsolationTests`); `swift test` green;
+   `serialRankedPipelineRemainsMTPFree` unchanged and passing.
+4. The leaderboard registration record `benchmark.mtp.json` (track id
+   `gemma4-31b-it-mtp-v1`, workflow `mtp-benchmark.yml`, score artifact
    `mtp-benchmark-results-<run_id>/mtp-score.json`, score field `score`,
-   verdict `passed`, floor semantics "null/failed below 1.0". The serial
-   leaderboard ingestion is untouched.
+   verdict `passed`, floor semantics "failed below 1.0"). The operator
+   registers this namespace with the orchestrator/Yukon backend at merge
+   time; the serial `benchmark.json` and its leaderboard ingestion are
+   untouched.
 
 Validation ladder after merge (each step must pass before the next):
 
@@ -443,27 +463,33 @@ Validation ladder after merge (each step must pass before the next):
    smoke test.
 4. Only then announce and accept `submissions/*` dispatches on the track.
 
-## Open operator decisions (blocking or shaping go-live)
+## Operator decisions — status
 
-1. **Ranked decode denominator:** keep the contract default 128 tokens, or
-   raise to 256/512 (goldens capture 512 decode tokens so this is decidable
-   at enablement without recapture; longer = more stable ratio, more
-   thermal budget per pair).
-2. **Aggregation for the published score:** the draft workflow publishes
-   `aggregate.mtp_decode_speedup_mean` over >= 3 accepted pairs; decide
-   mean vs median vs ratio-of-means and lock it in `measure-mtp-job.sh` +
-   the workflow together.
-3. **Stall guardrail constant:** the proposed `max_block > 4 x p50`
-   run-rejection threshold needs a value confirmed against post-fix
-   distributions.
-4. **License review:** confirm the Gemma license terms permit the IT target
-   + assistant redistribution/leaderboard use before public announcement
-   (all three model cards declare Apache-2.0 + the Gemma license link).
-5. **Track memory contract:** observed peak 47.5 GiB RSS; publish a
+Decided by the 2026-07-14 scoring-decision memo (adopted in the enablement
+change):
+
+1. **Ranked decode denominator: 512 tokens** (`MLXFAST_MTP_DECODE_TOKENS`;
+   the goldens carry 512 decode tokens, the contract's `decode_tokens: 128`
+   remains the CLI compatibility default with `maximum_decode_tokens: 512`).
+2. **Aggregation: ratio-of-means** — the published score is
+   `mean(serial s/tok) / mean(mtp s/tok)` over the accepted pairs, computed
+   in the trusted shell from the sealed per-side means; per-pair
+   median/min stay as diagnostics.
+3. **Stall guardrail: `max_block > 4 x p50` rejects the run** as
+   measurement-invalid with one gated retry (owned by `measure-mtp-job.sh`).
+4. **Pairs: minimum 3 accepted, target 4**, alternating order; floor 1.0 on
+   the aggregate.
+5. **License review: complete** — Gemma 4 models are Apache-2.0 with the
+   Gemma terms; the repo carries `LICENSE`, `THIRD_PARTY_NOTICES.md`, and a
+   README attribution note (license-hygiene PR).
+
+Still open (non-blocking for the enablement draft):
+
+6. **Track memory contract:** observed peak 47.5 GiB RSS; publish a
    participant-facing local minimum (64 GiB practical) and decide whether
    the box enforces a cap.
-6. **Second-box MTP serving:** if box 1 later serves the MTP track too, it
+7. **Second-box MTP serving:** if box 1 later serves the MTP track too, it
    needs its OWN calibration file and baseline tree (never copy
    calibrations across boxes — same rule as the serial track).
-7. **Public IT fixture:** whether to check in a public IT-target golden for
+8. **Public IT fixture:** whether to check in a public IT-target golden for
    participant local iteration at go-live or later.

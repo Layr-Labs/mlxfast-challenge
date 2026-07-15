@@ -5,6 +5,7 @@ import MLXFastCore
 
 public struct ExperimentalMTPArtifactReport: Equatable, Sendable {
     public let trackID: String
+    public let referenceBaselineStatus: String
     public let targetModelID: String
     public let targetRevision: String
     public let targetByteCount: Int
@@ -375,6 +376,7 @@ extension GemmaRuntime {
         )
         return ExperimentalMTPArtifactReport(
             trackID: contract.trackID,
+            referenceBaselineStatus: contract.referenceBaseline.status,
             targetModelID: contract.target.runtimeModelID,
             targetRevision: contract.target.runtimeRevision,
             targetByteCount: targetDigest.byteCount,
@@ -405,7 +407,11 @@ extension GemmaRuntime {
         ]
         guard contract.schemaVersion == 1,
               contract.trackID == experimentalMTPTrackID,
-              !contract.officialScoringEnabled,
+              // Enablement commit: the organizer-pinned identity now carries
+              // official scoring ENABLED with an established, publishable
+              // reference baseline. A contract claiming anything else is not
+              // the pinned track identity and fails closed.
+              contract.officialScoringEnabled,
               contract.mlxSwiftLMRevision == experimentalMTPDependencyRevision,
               contract.target.upstreamModelID
                   == experimentalMTPUpstreamTargetModelID,
@@ -454,8 +460,8 @@ extension GemmaRuntime {
                   == MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens,
               contract.protocolContract.parentOracleRequired,
               !contract.protocolContract.workerTimingIsAuthoritative,
-              contract.referenceBaseline.status == "not_established",
-              !contract.referenceBaseline.publicationAllowed,
+              contract.referenceBaseline.status == "established",
+              contract.referenceBaseline.publicationAllowed,
               contract.referenceBaseline.requiredRebaselineHardware
                   == "m5-bench"
         else {
