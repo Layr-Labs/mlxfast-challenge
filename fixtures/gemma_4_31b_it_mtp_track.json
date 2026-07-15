@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "track_id": "gemma4-31b-it-mtp-v1",
-  "official_scoring_enabled": false,
+  "official_scoring_enabled": true,
   "mlx_swift_lm_revision": "bc1c0ee67d15798343be17c9f8f61f7c0d977149",
   "target": {
     "upstream_model_id": "google/gemma-4-31B-it",
@@ -58,8 +58,8 @@
     "worker_timing_is_authoritative": false
   },
   "reference_baseline": {
-    "status": "not_established",
-    "publication_allowed": false,
+    "status": "established",
+    "publication_allowed": true,
     "required_rebaseline_hardware": "m5-bench"
   },
   "proposed_scoring": {

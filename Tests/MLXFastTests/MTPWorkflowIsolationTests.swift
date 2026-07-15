@@ -111,18 +111,17 @@ struct MTPWorkflowIsolationTests {
         )
         #expect(confirmInput.contains("default: false"))
 
-        // Assistant-swap re-baseline window: the trusted contract the gate
-        // reads is DISABLED until the paired M5 reference baseline is
-        // re-established against the QAT 4-bit assistant (the
-        // ExperimentalMTPTests contract test pins this too; asserting here
-        // keeps workflow + fixture in one reviewable invariant). The gate
-        // therefore fails closed on any ranked dispatch in this window.
+        // And the trusted contract the gate reads is ENABLED — the QAT
+        // 4-bit assistant's paired reference baseline was re-established on
+        // the ranked box (the ExperimentalMTPTests contract test pins this
+        // too; asserting here keeps workflow + fixture in one reviewable
+        // invariant).
         let contract = try Data(contentsOf: URL(fileURLWithPath: "fixtures/gemma_4_31b_it_mtp_track.json"))
         let json = try #require(try JSONSerialization.jsonObject(with: contract) as? [String: Any])
-        #expect(json["official_scoring_enabled"] as? Bool == false)
+        #expect(json["official_scoring_enabled"] as? Bool == true)
         let baseline = try #require(json["reference_baseline"] as? [String: Any])
-        #expect(baseline["publication_allowed"] as? Bool == false)
-        #expect(baseline["status"] as? String == "not_established")
+        #expect(baseline["publication_allowed"] as? Bool == true)
+        #expect(baseline["status"] as? String == "established")
     }
 
     // The two ranked tracks never share mutable identity: distinct workspace,

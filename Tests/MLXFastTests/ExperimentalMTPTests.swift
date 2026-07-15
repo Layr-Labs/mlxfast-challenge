@@ -601,14 +601,14 @@ func trainedMTPContractPinsMatchedITPairAndDependency() throws {
         contract.mlxSwiftLMRevision
             == "bc1c0ee67d15798343be17c9f8f61f7c0d977149"
     )
-    // Assistant-swap re-baseline window: official scoring is OFF until the
-    // paired M5 reference baseline is re-established against the QAT 4-bit
-    // assistant. The ranked decode window (512) is owned by the workflow
-    // env; the contract's decode_tokens stays the 128-token compatibility
-    // default with a 512 trusted-parent maximum.
-    #expect(!contract.officialScoringEnabled)
-    #expect(contract.referenceBaseline.status == "not_established")
-    #expect(!contract.referenceBaseline.publicationAllowed)
+    // QAT-assistant re-enablement: official scoring is ON with the
+    // reference baseline re-established on the ranked box against the QAT
+    // 4-bit assistant. The ranked decode window (512) is owned by the
+    // workflow env; the contract's decode_tokens stays the 128-token
+    // compatibility default with a 512 trusted-parent maximum.
+    #expect(contract.officialScoringEnabled)
+    #expect(contract.referenceBaseline.status == "established")
+    #expect(contract.referenceBaseline.publicationAllowed)
     #expect(contract.protocolContract.decodeTokens == 128)
     #expect(contract.protocolContract.maximumDecodeTokens == 512)
 }

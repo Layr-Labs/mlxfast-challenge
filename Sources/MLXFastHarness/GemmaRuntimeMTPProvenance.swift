@@ -425,12 +425,14 @@ extension GemmaRuntime {
         ]
         guard contract.schemaVersion == 1,
               contract.trackID == experimentalMTPTrackID,
-              // Assistant-swap re-baseline window: the organizer-pinned
-              // identity carries official scoring DISABLED while the paired
-              // M5 reference baseline is re-established against the QAT
-              // 4-bit assistant. A contract claiming anything else is not
-              // the pinned track identity and fails closed.
-              !contract.officialScoringEnabled,
+              // QAT-assistant re-enablement: the paired M5 reference
+              // baseline was re-established on the ranked box against the
+              // QAT 4-bit assistant, so the organizer-pinned identity again
+              // carries official scoring ENABLED with an established,
+              // publishable reference baseline. A contract claiming
+              // anything else is not the pinned track identity and fails
+              // closed.
+              contract.officialScoringEnabled,
               contract.mlxSwiftLMRevision == experimentalMTPDependencyRevision,
               contract.target.upstreamModelID
                   == experimentalMTPUpstreamTargetModelID,
@@ -481,8 +483,8 @@ extension GemmaRuntime {
                   == MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens,
               contract.protocolContract.parentOracleRequired,
               !contract.protocolContract.workerTimingIsAuthoritative,
-              contract.referenceBaseline.status == "not_established",
-              !contract.referenceBaseline.publicationAllowed,
+              contract.referenceBaseline.status == "established",
+              contract.referenceBaseline.publicationAllowed,
               contract.referenceBaseline.requiredRebaselineHardware
                   == "m5-bench"
         else {
