@@ -149,20 +149,24 @@ sees them.
 
 ## Private golden and GPQA handling
 
-Full benchmark dispatches (`run_benchmark=true`) download two objects from
-the private R2 bucket in a trusted step:
+Full benchmark dispatches (`run_benchmark=true`) download three objects from
+the private R2 bucket in trusted steps:
 `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json`
 (the hidden teacher-forced base case) and
 `correctness_prompts/gpqa_reference_cases-gemma.json` (the hidden GPQA
-reference cases, merged into the golden as 5 behavior gates).
+reference cases, merged into the golden as 5 behavior gates), followed after
+the correctness scrub by
+`correctness_prompts/timed_decode_lowsim_prose_v1.txt` (the independent
+timed prefill/decode target).
 Correctness-only dispatches (`run_benchmark=false`) fetch no private
-material at all. Both objects were regenerated from the Gemma 4 31B 4-bit
+material at all. The correctness objects were regenerated from the Gemma 4 31B 4-bit
 reference on the ranked hardware through the organizer-controlled offline
 process; `docs/gemma-migration-r2-checklist.md` records the provenance and
 the current pins.
 
 Raw private bytes land only in a runner-only `0700` per-run directory; the
-raw golden is verified against a pinned SHA-256 and byte count before use.
+raw golden and timed prompt are each verified against a SHA-256 and byte
+count before use.
 The GPQA augmentation step (`attach-gpqa-gates`) executes code from the
 submitted build (it loads the tokenizer), so it runs through the bench-exec
 bridge like every other untrusted invocation: the raw inputs are copied
@@ -209,9 +213,10 @@ spawns another worker.
 ## Timed measurement and score sealing
 
 The timed prefill/decode measurement runs last: after all compute-heavy
-correctness and gate work, after the hidden-material scrub, and after a
-quiescence wait (the job fails rather than start timing on a machine with
-residual load or GPU utilization). It is executed by a trusted,
+correctness and gate work, after the correctness-hidden-material scrub, after
+the separately pinned timed prompt is downloaded to the runner-only private
+directory, and after a quiescence wait (the job fails rather than start timing
+on a machine with residual load or GPU utilization). It is executed by a trusted,
 runner-owned measurement wrapper whose thermal-stability contract is fixed
 in the script itself — readonly, not environment-overridable: every timed
 phase (pinned baseline and candidate, plus any oracle generation) starts
@@ -233,10 +238,12 @@ baseline binary hash guard against a swapped or pathological baseline
 silently rescaling every ratio. A trusted overlay
 step (`overlay-paired-timing.sh`) then merges the measured paired timing
 into the sealed gates score and applies the decode/prefill speedup floors
-(kept in sync with the harness constants). The benchmark oracle used by the
-timed run is self-generated per submitted binary and cached by binary
-hash — input-independent implementation keying, not a hidden secret and not
-request-keyed memoization.
+(kept in sync with the harness constants). The workflow passes the private
+timed prompt, its SHA-256, and the stable evaluation-target ID explicitly to
+the wrapper. The benchmark oracle used by the timed run is self-generated per
+binary. Its cache identity includes the binary hash, prompt hash, and target
+ID — input-independent implementation keying, not request-keyed memoization.
+The hidden teacher-forced and GPQA fixtures are not inputs to this oracle.
 
 Scores are sealed from process stdout: the score payload is what the
 benchmark process wrote to stdout, captured in the trusted shell and

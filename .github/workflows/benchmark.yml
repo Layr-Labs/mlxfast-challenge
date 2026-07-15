@@ -153,6 +153,7 @@ jobs:
       # files.
       MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}
       MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json
+      MLXFAST_TIMED_DECODE_PROMPT_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/timed_decode_prompt.txt
       MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json
       MLXFAST_SUBMISSION_STATIC_REVIEW_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/submission_static_review.json
       MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
@@ -161,13 +162,21 @@ jobs:
       MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
       MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}
+      # The timed target's bytes remain private in R2. Its digest and byte count
+      # are non-secret Environment variables so the trusted workflow can pin
+      # the exact fixture while operators rotate it without publishing it.
+      # Keep the ID in sync with
+      # MLXFastConstants.benchmarkEvaluationTargetID.
+      MLXFAST_TIMED_DECODE_TARGET_ID: lowsim-prose-v1
+      MLXFAST_TIMED_DECODE_PROMPT_SHA256: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}
+      MLXFAST_TIMED_DECODE_PROMPT_BYTES: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_BYTES }}
       # The private R2 object KEYS (MLXFAST_CORRECTNESS_GOLDEN_R2_PATH /
-      # MLXFAST_GPQA_R2_PATH) are deliberately NOT set at job level: job env is
-      # ambient to every step, including the bench phases, so the private object
-      # names would needlessly reach the untrusted bench environment. They are
-      # scoped to the one trusted step that downloads them ("Prepare hidden
-      # correctness golden"). (The operator denylist blocks them at the bridge
-      # as defense in depth.)
+      # MLXFAST_GPQA_R2_PATH / MLXFAST_TIMED_DECODE_PROMPT_R2_PATH) are
+      # deliberately NOT set at job level: job env is ambient to every step,
+      # including the bench phases, so the private object names would
+      # needlessly reach the untrusted bench environment. They are scoped to
+      # their trusted download steps. (The operator denylist blocks them at the
+      # bridge as defense in depth.)
       # The RAW (pre-GPQA-augmentation) hidden golden's pins -- the same object
       # the old slices verified. The augmented golden is verified against a
       # self-anchored hash computed right after attach-gpqa-gates, exactly as
@@ -368,6 +377,14 @@ jobs:
           fi
           if [[ "${MLXFAST_ANTHROPIC_PRESENT}" != "1" ]]; then
             echo "::error::semantic GPQA gate requires ORG_ANTHROPIC_API_KEY" >&2
+            exit 1
+          fi
+          if [[ ! "${MLXFAST_TIMED_DECODE_PROMPT_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::timed decode prompt requires a pinned 64-character SHA-256 in the benchmark-private-prompts Environment" >&2
+            exit 1
+          fi
+          if [[ ! "${MLXFAST_TIMED_DECODE_PROMPT_BYTES}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::timed decode prompt requires a positive byte-count pin in the benchmark-private-prompts Environment" >&2
             exit 1
           fi
 
@@ -1327,19 +1344,21 @@ jobs:
           fi
           .github/scripts/run-semantic-gpqa-gate.sh
 
-      # Restore the bench workspace to its pre-hidden snapshot BEFORE the timed
-      # phase spawns new workers. This is an ALLOWLIST scrub, not the old
-      # golden-name denylist: the augmented golden and the semantic-answer
-      # capture are removed explicitly, weights/ is re-verified against its
-      # pinned hash, and EVERY other file present now but absent from the
-      # post-transform snapshot (i.e. written while hidden tokens were in the
-      # workspace during the gates phase) is deleted -- so an arbitrary
-      # bench-written file cannot bridge "saw hidden tokens" into "controls the
-      # published timing". Only the caches the timed phase legitimately keeps or
-      # regenerates are preserved: weights/ (hash-verified below), .build/ (its
-      # binary + metallib are separately pin-verified), the self-generated
-      # benchmark oracle, and the checked-in public fixtures. All top-level paths
-      # sit in runner-owned directories, so the trusted shell can unlink
+      # Restore the bench workspace to its pre-correctness-hidden snapshot
+      # BEFORE the timed phase spawns new workers. This is an ALLOWLIST scrub,
+      # not the old golden-name denylist: the augmented golden and the
+      # semantic-answer capture are removed explicitly, weights/ is re-verified
+      # against its pinned hash, and EVERY other file present now but absent
+      # from the post-transform snapshot (i.e. written while hidden correctness
+      # tokens were in the gates phase) is deleted -- so an arbitrary
+      # bench-written file cannot bridge "saw hidden correctness tokens" into
+      # "controls the published timing". The separate private timed prompt is
+      # downloaded only after this scrub and is handed directly to the trusted
+      # measurement wrapper. Only the caches the timed phase legitimately keeps
+      # or regenerates are preserved: weights/ (hash-verified below), .build/
+      # (its binary + metallib are separately pin-verified), the self-generated
+      # benchmark oracle, and the checked-in public fixtures. All top-level
+      # paths sit in runner-owned directories, so the trusted shell can unlink
       # bench-written files; a straggler it cannot remove fails the run closed.
       - name: Scrub hidden material from bench workspace
         if: ${{ inputs.run_benchmark }}
@@ -1412,6 +1431,31 @@ jobs:
           sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
             /bin/bash "${MLXFAST_JOB_WS}/.github/scripts/reap-bench-processes.sh"
 
+      # The timed prompt is independent of every correctness/QA fixture. Keep
+      # its object key scoped to this trusted download step and its bytes under
+      # the runner-only private directory; measure-job receives the explicit
+      # path and generates each binary's checked oracle from this target.
+      - name: Prepare hidden timed decode prompt
+        if: ${{ inputs.run_benchmark }}
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1.txt
+        run: |
+          set -euo pipefail
+          .github/scripts/download-r2-object.sh \
+            "${MLXFAST_TIMED_DECODE_PROMPT_R2_PATH}" \
+            "${MLXFAST_TIMED_DECODE_PROMPT_PATH}"
+          actual_hash="$(shasum -a 256 "${MLXFAST_TIMED_DECODE_PROMPT_PATH}" | awk '{print $1}')"
+          actual_bytes="$(wc -c < "${MLXFAST_TIMED_DECODE_PROMPT_PATH}" | tr -d ' ')"
+          if [[ "${actual_hash}" != "${MLXFAST_TIMED_DECODE_PROMPT_SHA256}" \
+              || "${actual_bytes}" != "${MLXFAST_TIMED_DECODE_PROMPT_BYTES}" ]]; then
+            echo "::error::hidden timed decode prompt pin mismatch" >&2
+            exit 1
+          fi
+          echo "benchmark: hidden timed decode target verified id=${MLXFAST_TIMED_DECODE_TARGET_ID} sha256=${actual_hash} bytes=${actual_bytes}"
+
       # The compute-heavy pass above leaves CPU load and scheduler churn behind
       # for a minute or two. measure-job's preflight fails closed on load >=
       # 2.0 or GPU util >= 10%, so wait for quiescence here instead of burning
@@ -1455,12 +1499,13 @@ jobs:
       # THE TIMED MEASUREMENT -- LAST, via the validated clean path. measure-job
       # (trusted, runner-owned, fixed thermal contract) runs, in order: pinned
       # BASELINE tree then CANDIDATE workspace, each as `./benchmark.sh
-      # --official` through bench-exec with a per-binary self-generated oracle,
-      # each behind the 40C gate with 2 Hz telemetry, throttle/telemetry/token
-      # acceptance and one gated retry, a baseline calibration-band check, and
-      # a sealed results.json with the paired ratio. Baseline-first mirrors the
-      # old pipeline's "measure the pinned reference minutes before the
-      # candidate". Changing the pinned baseline tree or its calibration is a
+      # --official` through bench-exec with a per-binary self-generated oracle
+      # derived from the explicit private --prompt target, each behind the 40C
+      # gate with 2 Hz telemetry, throttle/telemetry/token acceptance and one
+      # gated retry, a baseline calibration-band check, and a sealed results.json
+      # with the paired ratio. Baseline-first mirrors the old pipeline's
+      # "measure the pinned reference minutes before the candidate". Changing
+      # the timed target, pinned baseline tree, or its calibration is a
       # ranking-contract change (see RUNBOOK).
       - name: Timed paired benchmark (measure-job)
         if: ${{ inputs.run_benchmark }}
@@ -1480,6 +1525,9 @@ jobs:
             "${MLXFAST_MEASURE_JOB}" \
               --candidate "${MLXFAST_JOB_WS}" \
               --baseline "${MLXFAST_BASELINE_WS}" \
+              --prompt "${MLXFAST_TIMED_DECODE_PROMPT_PATH}" \
+              --prompt-sha256 "${MLXFAST_TIMED_DECODE_PROMPT_SHA256}" \
+              --target-id "${MLXFAST_TIMED_DECODE_TARGET_ID}" \
               --tag "ranked-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
               --out "${MLXFAST_MEASURE_OUT}"
           test -s "${MLXFAST_MEASURE_OUT}/results.json"

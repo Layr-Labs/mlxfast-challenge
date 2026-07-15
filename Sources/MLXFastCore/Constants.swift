@@ -64,6 +64,17 @@ public enum MLXFastConstants {
     // threshold.
     public static let semanticGPQAMinPassCount = 1
     public static let benchmarkPrefillPromptTokens = 512
+    // Stable public identifier for the private timed-evaluation prompt. The
+    // prompt bytes remain operator-provisioned; changing this identifier is a
+    // ranking-contract change and forces build-hash-keyed timed oracles to be
+    // regenerated.
+    public static let benchmarkEvaluationTargetID = "lowsim-prose-v1"
+    // Offline prompt-lookup susceptibility gate. The analyzer simulates a
+    // longest recurrent suffix predictor over these orders. At <= 3% accepted
+    // draft tokens, even an idealized zero-overhead predictor is capped near
+    // 1.03x before verification and lookup overhead.
+    public static let benchmarkNGramSelfSimilarityOrders = [1, 2, 3]
+    public static let benchmarkMaxPromptLookupHitRate = 0.03
     // Scored decode is parent-measured wall time for decode setup plus this
     // many checked token steps. Charging setup prevents submitted model code
     // from precomputing future decode tokens in an unscored seed-prefill phase.

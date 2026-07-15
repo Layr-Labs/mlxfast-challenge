@@ -118,7 +118,7 @@ not byte equality with the baseline layout.
 
 The public correctness-only prompt and golden are committed under
 `correctness_prompts/` so participants can run a local correctness smoke test
-(Gemma-generated; see the fixture note above). The timed benchmark token oracle
+(Gemma-generated; see the fixture note above). The official correctness golden
 is supplied by the benchmark operator and is intentionally not committed to
 the public repo:
 
@@ -129,11 +129,14 @@ correctness_golden.json
 Use `MLXFAST_CORRECTNESS_GOLDEN_PATH=/path/to/correctness_golden.json` when the
 file is provisioned outside the repository root.
 Benchmark CI consumes the checked-in public golden for correctness-only runs and
-downloads the private precomputed golden from protected storage for full
-benchmark runs. Private prompt manifests and hidden benchmark goldens are not
-committed to the public repository. The workflow does not generate goldens;
-organizers regenerate them offline and upload the resulting file to protected
-storage.
+downloads the private precomputed correctness golden from protected storage for
+full benchmark runs. The timed phase separately downloads a pinned private
+evaluation prompt after the correctness scrub. The trusted box-side measurement
+wrapper generates and caches a benchmark token oracle for that prompt per binary
+and validates all charged outputs against it. Private prompt manifests, the
+timed prompt, and hidden correctness goldens are not committed to the public
+repository. Organizers regenerate correctness fixtures and rotate the timed
+target through the controlled operator process.
 
 ## Editable Surface
 
@@ -288,10 +291,12 @@ verification kernels), measured decode-only against a same-session paired
 serial reference with a hard bit-exact token gate. This prototype does not
 relax any rule above for the current serial track.
 
-The hidden golden file also includes a benchmark oracle. The benchmark validates
-the greedy token after the fixed 512-token prefill prompt, the greedy token
-after the fixed 512-token decode seed, and all 128 tokens produced inside the
-timed decode window before accepting a score.
+The gates-only hidden golden retains a benchmark section because the common
+harness schema requires it, but the ranked timed phase uses a separate
+self-generated oracle derived from the private timed target. The benchmark
+validates the greedy token after the fixed 512-token prefill prompt, the greedy
+token after the fixed 512-token decode seed, and all 128 tokens produced inside
+the timed decode window before accepting a score.
 
 ## Score
 

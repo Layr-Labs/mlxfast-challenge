@@ -15,7 +15,7 @@ Nothing here changed the R2 secret/env plumbing (`R2_ACCESS_KEY_ID`,
 correct. Only the *contents* of the private objects (and the pins that
 verify them) were regenerated.
 
-## 1. Hidden correctness/benchmark golden (R2) — DONE (uploaded 2026-07-09)
+## 1. Hidden correctness golden (R2) — DONE (uploaded 2026-07-09)
 
 - **Object:** `correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json`
 - **Contents:** 512-token base prompt retokenized with the Gemma tokenizer;
@@ -23,11 +23,12 @@ verify them) were regenerated.
   the trusted Gemma 4 31B 4-bit rebase reference; a
   `correctness_gates.free_run` gate covering the full timed decode offset
   range (`attach-free-run-gate` defaults, 128 steps); and the benchmark
-  oracle (prefill next token, 512-token decode seed next token, 256 timed
-  decode tokens). Per-prompt `baseline_*_seconds_per_token` calibration is
-  intentionally omitted: the ranked pipeline measures the pinned reference
-  baseline live on the same box, so no golden-carried calibration is needed
-  there, and local modes fall back to the calibrated constants.
+  section required by the common harness schema. That section is not the
+  ranked timed target: the ranked measurement wrapper self-generates its own
+  oracle from the separately provisioned private timed prompt. Per-prompt
+  `baseline_*_seconds_per_token` calibration is intentionally omitted: the
+  ranked pipeline measures the pinned reference baseline live on the same box,
+  and local modes fall back to the calibrated constants.
 - **Consumed by:** `.github/workflows/benchmark.yml` — the single ranked
   job's "Prepare hidden correctness golden" step downloads and pin-verifies
   the raw object; "Attach GPQA gates and verify augmented golden" then
@@ -94,6 +95,21 @@ verify them) were regenerated.
   - The fixture digests pinned in `Tests/MLXFastTests/GoldenTests.swift`
     (the 1024 fixture's digest is
     `2de5474bbe707bcb2e8b71d7d771ffd9be70c252d3ecce7f1511aa2a50933b4d`).
+
+## 4b. Private timed decode target (R2) — STAGED, not yet uploaded
+
+- **Object:** `correctness_prompts/timed_decode_lowsim_prose_v1.txt` (the
+  independent timed prefill/decode target introduced by the timed-decode
+  fairness change; see `docs/timed-decode-evaluation.md`).
+- **Pins:** `MLXFAST_TIMED_DECODE_PROMPT_SHA256` / `_BYTES` variables on the
+  `benchmark-private-prompts` environment. Set at upload time from the staged
+  artifact; validated by the workflow before any bench phase runs.
+- **Gate:** the target activates only after its M5-generated greedy
+  continuation passes `analyze-ngram-similarity` at
+  `benchmarkMaxPromptLookupHitRate` (3%), and after the coordinated
+  measure-job wrapper (explicit `--prompt/--prompt-sha256/--target-id`
+  interface, per-target oracle-cache identity) is deployed and the box
+  baseline calibration is refreshed on the new target per the RUNBOOK.
 
 ## 5. Ranked baseline — DONE (superseded by the on-box pinned baseline)
 

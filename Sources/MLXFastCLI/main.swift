@@ -52,6 +52,9 @@ private enum MLXFastCLI {
             case "generate-golden":
                 try runGenerateGolden(options)
                 return 0
+            case "analyze-ngram-similarity":
+                try runAnalyzeNGramSimilarity(options)
+                return 0
             case "generate-gpqa-answers":
                 try runGenerateGPQAAnswers(options)
                 return 0
@@ -934,6 +937,104 @@ private enum MLXFastCLI {
         )
     }
 
+    private static func runAnalyzeNGramSimilarity(_ options: ParsedOptions) throws {
+        try options.validate(
+            valueOptions: ["--golden", "--case", "--orders", "--max-hit-rate"]
+        )
+        let goldenPath = options.value(for: "--golden", default: "")
+        guard !goldenPath.isEmpty else {
+            throw MLXFastError.invalidInput("analyze-ngram-similarity requires --golden PATH")
+        }
+        let orderText = options.value(
+            for: "--orders",
+            default: MLXFastConstants.benchmarkNGramSelfSimilarityOrders
+                .map(String.init)
+                .joined(separator: ",")
+        )
+        let orders = try orderText.split(separator: ",").map { component in
+            guard let order = Int(component), order > 0 else {
+                throw MLXFastError.invalidInput(
+                    "--orders must be a comma-separated list of positive integers"
+                )
+            }
+            return order
+        }
+        let maximumHitRateText = options.value(
+            for: "--max-hit-rate",
+            default: "\(MLXFastConstants.benchmarkMaxPromptLookupHitRate)"
+        )
+        guard let maximumHitRate = Double(maximumHitRateText),
+              maximumHitRate.isFinite,
+              (0...1).contains(maximumHitRate)
+        else {
+            throw MLXFastError.invalidInput("--max-hit-rate must be a finite value in 0...1")
+        }
+
+        let fixture = try loadGoldenFixture(from: goldenPath)
+        let requestedCase = options.value(for: "--case", default: "")
+        let contextTokens: [Int]
+        let continuationTokens: [Int]
+        let source: String
+        if !requestedCase.isEmpty {
+            guard let goldenCase = fixture.cases.first(where: { $0.name == requestedCase }) else {
+                throw MLXFastError.invalidInput("golden does not contain base case \(requestedCase)")
+            }
+            contextTokens = goldenCase.promptTokens
+            continuationTokens = try benchmarkAnalysisContinuation(from: goldenCase)
+            source = "case:\(goldenCase.name)"
+        } else if let benchmark = fixture.benchmark {
+            contextTokens = benchmark.decodeSeedTokens
+            continuationTokens = [benchmark.expectedDecodeSeedToken]
+                + Array(benchmark.expectedDecodeTokens.prefix(MLXFastConstants.benchmarkDecodeSteps))
+            source = "benchmark"
+        } else {
+            guard let goldenCase = fixture.cases.first else {
+                throw MLXFastError.invalidInput("golden contains no base case to analyze")
+            }
+            contextTokens = goldenCase.promptTokens
+            continuationTokens = try benchmarkAnalysisContinuation(from: goldenCase)
+            source = "case:\(goldenCase.name)"
+        }
+
+        let report = try NGramSelfSimilarity.analyze(
+            contextTokens: contextTokens,
+            continuationTokens: continuationTokens,
+            orders: orders
+        )
+        let passed = report.passes(maximumHitRate: maximumHitRate)
+        let output = NGramSimilarityAnalysisOutput(
+            targetID: MLXFastConstants.benchmarkEvaluationTargetID,
+            source: source,
+            maximumHitRate: maximumHitRate,
+            passed: passed,
+            report: report
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        var encoded = try encoder.encode(output)
+        encoded.append(0x0A)
+        FileHandle.standardOutput.write(encoded)
+
+        guard passed else {
+            throw MLXFastError.invalidInput(
+                "prompt-lookup hit rate \(report.longestMatchMostRecentHitRate) "
+                    + "exceeds maximum \(maximumHitRate)"
+            )
+        }
+    }
+
+    private static func benchmarkAnalysisContinuation(from goldenCase: GoldenCase) throws -> [Int] {
+        let requiredTokens = MLXFastConstants.benchmarkDecodeSteps + 1
+        guard goldenCase.expectedTokens.count >= requiredTokens else {
+            throw MLXFastError.invalidInput(
+                "base case \(goldenCase.name) has \(goldenCase.expectedTokens.count) continuation tokens; "
+                    + "need at least \(requiredTokens) to score the decode seed token plus "
+                    + "\(MLXFastConstants.benchmarkDecodeSteps) timed tokens"
+            )
+        }
+        return Array(goldenCase.expectedTokens.prefix(requiredTokens))
+    }
+
     // Writes a merged golden by staging to a temp sibling and proving the
     // result loads through the strict fixture loader BEFORE it can touch the
     // destination. The attach commands default --output to the input golden,
@@ -1613,6 +1714,7 @@ private enum MLXFastCLI {
               mlxfast-swift attach-gpqa-gates [--golden PATH] --gpqa PATH [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
               mlxfast-swift attach-free-run-gate [--golden PATH] [--weights PATH] [--output PATH] [--name NAME] [--steps N] [--allow-partial] [--case NAME | --prompt-file PATH [--tokenizer PATH]] [--exact-prefix N]
               mlxfast-swift generate-golden --prompt-file PATH [--weights PATH] [--tokenizer PATH] --output PATH --name NAME --steps N
+              mlxfast-swift analyze-ngram-similarity --golden PATH [--case NAME] [--orders 1,2,3] [--max-hit-rate RATE]
               mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]
               mlxfast-swift checkpoint-shards --index PATH
 
@@ -1645,6 +1747,22 @@ private enum MLXFastCLI {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+}
+
+private struct NGramSimilarityAnalysisOutput: Codable {
+    let targetID: String
+    let source: String
+    let maximumHitRate: Double
+    let passed: Bool
+    let report: NGramSelfSimilarityReport
+
+    enum CodingKeys: String, CodingKey {
+        case targetID = "target_id"
+        case source
+        case maximumHitRate = "maximum_hit_rate"
+        case passed
+        case report
+    }
 }
 
 private struct GPQAReferenceDocument: Decodable {

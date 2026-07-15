@@ -895,6 +895,10 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 182a7f98d24cc8f26e8b08505fe7a8b6d825702f99d0b78a83f49dd42f1b2aea"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"11140\""))
+    #expect(workflow.contains("MLXFAST_TIMED_DECODE_TARGET_ID: \(MLXFastConstants.benchmarkEvaluationTargetID)"))
+    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_SHA256: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}"))
+    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_BYTES: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_BYTES }}"))
+    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1.txt"))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"))
     #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json"))
     #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"5\""))
@@ -982,11 +986,11 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // Attach GPQA gates, Verify trusted harness before gates,
     // Correctness and gates, Validate sealed gates score, Semantic GPQA gate,
     // Scrub hidden material, Reap lingering bench processes before timing,
-    // Wait for quiescence, Verify trusted harness before timing,
+    // Prepare hidden timed decode prompt, Wait for quiescence, Verify trusted harness before timing,
     // Timed paired benchmark, Overlay paired timing, Validate benchmark
     // artifacts.
     let bareRunBenchmarkGuardCount = workflow.components(separatedBy: "if: ${{ inputs.run_benchmark }}").count - 1
-    #expect(bareRunBenchmarkGuardCount == 17)
+    #expect(bareRunBenchmarkGuardCount == 18)
     #expect(workflow.contains("if: ${{ always() && inputs.run_benchmark }}"))
     #expect(workflow.contains("golden.sha256=\"${MLXFAST_CORRECTNESS_GOLDEN_PATH}.sha256\""))
     #expect(workflow.contains("path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results"))
