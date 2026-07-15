@@ -42,7 +42,7 @@ extension GemmaRuntime {
             bandwidthSource: String = ""
         ) -> ScorePayload {
             progress("\(modeName) failed error=\(redactedProgressError(error))")
-            return failedScore(
+            let payload = failedScore(
                 error: error,
                 correctness: correctnessReport,
                 passedCorrectness: passedCorrectness,
@@ -61,6 +61,11 @@ extension GemmaRuntime {
                 prefillSecondsPerToken: prefillSecondsPerToken,
                 bandwidthSource: bandwidthSource,
                 runtime: options.runtime
+            )
+            return localModeFailedPayloadWithEstimatedScore(
+                payload,
+                modeName: modeName,
+                progress: progress
             )
         }
 
@@ -300,6 +305,17 @@ extension GemmaRuntime {
             + " prefill_speedup=\(formatRatio(speedup))"
     }
 
+    /// One-sentence caveat printed wherever a local public-gate token mismatch
+    /// is reported: the checked-in goldens are greedy continuations captured on
+    /// the ranked M5 hardware, so on other Apple Silicon generations near-tie
+    /// argmaxes can diverge deterministically for a perfectly correct build.
+    /// Messaging only -- the gate itself still fails.
+    public static let nonM5GoldenMismatchCaveat =
+        "note: the public goldens are M5-generated, so on non-M5 Apple Silicon "
+        + "a deterministic near-tie token mismatch is expected for a correct build "
+        + "(see \"Correctness fixtures are M5-generated\" in README.md); "
+        + "the ranked M5 runner is the source of truth"
+
     static func reportFirstTokenMismatch(
         _ progress: ((String) -> Void)?,
         modeName: String,
@@ -309,6 +325,7 @@ extension GemmaRuntime {
             "\(modeName) correctness FAIL first token mismatch at checked_step=\(checkedStep) "
                 + "(run continues; expected/actual tokens are in the score JSON)"
         )
+        progress?("\(modeName) \(nonM5GoldenMismatchCaveat)")
     }
 
     /// Emits a heartbeat line every `intervalSeconds` while a long silent phase
@@ -820,6 +837,58 @@ extension GemmaRuntime {
             actualToken: actualToken,
             goldenHash: goldenHash,
             error: error
+        )
+    }
+
+    /// LOCAL MODES ONLY: attach the finite estimated score to a FAILED local
+    /// payload whose timings were still measured (the common case: the public
+    /// gate's teacher-forced check failed -- e.g. the deterministic non-M5
+    /// near-tie divergence -- but prefill/decode completed). The Yukon
+    /// participant CLI (`mlxfast run`) validates the contract scorePath as
+    /// `{ "score": <finite number>, ... }`, so a `score: null` failure payload
+    /// makes every local run on non-M5 hardware error at the contract layer
+    /// instead of reporting the measured timings. `passed` stays false and
+    /// every failure field (error, passed_correctness, first_failing_step,
+    /// expected/actual token) is preserved, so the failure remains
+    /// unmistakable; only the score becomes the same directional
+    /// decode_speedup^0.75 * prefill_speedup^0.25 estimate that passing local
+    /// runs publish. Official/ranked scoring is untouched: this is reached
+    /// exclusively from localIterate's failure path, and GemmaRuntime.benchmark
+    /// keeps publishing score: null on failure (see
+    /// rankedScoreSemanticsAreUnchangedByLocalEstimatedScore).
+    static func localModeFailedPayloadWithEstimatedScore(
+        _ payload: ScorePayload,
+        modeName: String,
+        progress: ((String) -> Void)? = nil
+    ) -> ScorePayload {
+        guard payload.score == nil, !payload.passed else {
+            return payload
+        }
+        let decodeSecondsPerToken = payload.metrics.decodeSecondsPerToken
+        let prefillSecondsPerToken = payload.metrics.prefillSecondsPerToken
+        guard decodeSecondsPerToken.isFinite,
+              decodeSecondsPerToken > 0,
+              prefillSecondsPerToken.isFinite,
+              prefillSecondsPerToken > 0
+        else {
+            return payload
+        }
+        let estimatedScore = BenchmarkScore.score(
+            decodeSecondsPerToken: decodeSecondsPerToken,
+            prefillSecondsPerToken: prefillSecondsPerToken
+        )
+        guard estimatedScore.isFinite, estimatedScore > 0 else {
+            return payload
+        }
+        progress?(
+            "\(modeName) publishing est_score=\(formatRatio(estimatedScore)) with passed=false "
+                + "(local modes always carry the numeric local estimate for the CLI contract; "
+                + "the run still failed -- see the error field in the score JSON)"
+        )
+        return ScorePayload(
+            score: estimatedScore,
+            passed: false,
+            metrics: payload.metrics
         )
     }
 

@@ -1771,6 +1771,122 @@ func localIterateScoreSanitizesNonfiniteFailureMetricsForJSON() throws {
     #expect(decoded.metrics.timedBenchmarkSeconds == 0)
 }
 
+// The immediate token-mismatch report carries the non-M5 caveat: the public
+// goldens are M5-generated greedy continuations, so near-tie argmaxes diverge
+// deterministically on other Apple Silicon generations even for a correct
+// build. Messaging only -- the mismatch still fails the gate, and the line
+// stays redacted (no expected/actual token values in the progress stream).
+@Test
+func firstTokenMismatchReportIncludesNonM5GoldenCaveat() {
+    var lines: [String] = []
+    GemmaRuntime.reportFirstTokenMismatch(
+        { lines.append($0) },
+        modeName: "local-iterate",
+        checkedStep: 17
+    )
+
+    #expect(lines.count == 2)
+    #expect(lines[0].contains("local-iterate correctness FAIL first token mismatch at checked_step=17"))
+    #expect(lines[1].contains("local-iterate note: the public goldens are M5-generated"))
+    #expect(lines[1].contains("deterministic near-tie token mismatch is expected for a correct build"))
+    #expect(lines[1].contains("Correctness fixtures are M5-generated"))
+    #expect(lines[1].contains("the ranked M5 runner is the source of truth"))
+}
+
+// A local run whose public-gate correctness check failed but whose timings
+// were measured (the deterministic non-M5 near-tie divergence is exactly this
+// shape) must still publish the finite estimated score: the Yukon CLI
+// validates scorePath as `{ "score": <finite number>, ... }`, and score: null
+// used to make `mlxfast run` error at the contract layer on every non-M5 box.
+// passed stays false and every failure field survives, so the failure remains
+// unmistakable.
+@Test
+func localFailedRunWithMeasuredTimingsStillPublishesNumericEstimatedScore() throws {
+    let report = CorrectnessReport(
+        passed: false,
+        checkedSteps: 17,
+        caseCount: 1,
+        firstFailingCase: "local-iterate",
+        firstFailingStep: 16,
+        expectedToken: 236761,
+        actualToken: 618,
+        goldenHash: "golden",
+        error: "local-iterate teacher-forced token mismatch"
+    )
+    let failed = GemmaRuntime.failedScore(
+        error: "local-iterate teacher-forced token mismatch",
+        correctness: report,
+        passedCorrectness: false,
+        expectedToken: report.expectedToken,
+        actualToken: report.actualToken,
+        decodeSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken / 2,
+        prefillSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken / 2,
+        runtime: "swift-local-iterate"
+    )
+
+    var lines: [String] = []
+    let payload = GemmaRuntime.localModeFailedPayloadWithEstimatedScore(
+        failed,
+        modeName: "local-iterate",
+        progress: { lines.append($0) }
+    )
+
+    // 2x on both axes -> estimated score 2 under decode^0.75 * prefill^0.25.
+    let estimated = try #require(payload.score)
+    #expect(abs(estimated - 2) < 1e-9)
+    #expect(!payload.passed)
+    #expect(!payload.metrics.passedCorrectness)
+    #expect(payload.metrics.error == "local-iterate teacher-forced token mismatch")
+    #expect(payload.metrics.firstFailingStep == 16)
+    #expect(payload.metrics.expectedToken == 236761)
+    #expect(payload.metrics.actualToken == 618)
+    #expect(payload.metrics.runtime == "swift-local-iterate")
+    #expect(lines.joined(separator: "\n").contains("publishing est_score=2.000 with passed=false"))
+
+    // The sealed scorePath JSON carries the score as a finite JSON number --
+    // the exact thing the CLI's schema checks -- while staying a failed run.
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let path = directory.appendingPathComponent("score.json").path
+    try writeScorePayload(payload, to: path)
+    let raw = try String(contentsOfFile: path, encoding: .utf8)
+    #expect(!raw.contains("\"score\" : null"))
+    let decoded = try JSONDecoder().decode(ScorePayload.self, from: Data(raw.utf8))
+    #expect(decoded.score == estimated)
+    #expect(!decoded.passed)
+}
+
+// Failure payloads without measured timings (validation errors, missing
+// artifacts) cannot carry a meaningful estimate and keep score: null; passing
+// payloads are never touched.
+@Test
+func localFailedPayloadWithoutTimingsKeepsNullScore() {
+    let noTimings = GemmaRuntime.failedScore(
+        error: "local-iterate public golden must contain at least one case",
+        correctness: nil,
+        passedCorrectness: false,
+        runtime: "swift-local-iterate"
+    )
+    var lines: [String] = []
+    let unchanged = GemmaRuntime.localModeFailedPayloadWithEstimatedScore(
+        noTimings,
+        modeName: "local-iterate",
+        progress: { lines.append($0) }
+    )
+    #expect(unchanged.score == nil)
+    #expect(!unchanged.passed)
+    #expect(lines.isEmpty)
+
+    let passing = ScorePayload(score: 1.5, passed: true, metrics: noTimings.metrics)
+    let stillPassing = GemmaRuntime.localModeFailedPayloadWithEstimatedScore(
+        passing,
+        modeName: "local-iterate",
+        progress: { lines.append($0) }
+    )
+    #expect(stillPassing == passing)
+    #expect(lines.isEmpty)
+}
+
 // Guard the ranked score semantics against the local-mode estimate: the
 // official benchmark path still publishes exactly the score it was given on
 // pass, and null on failure. Only localIterateScore (reached exclusively via

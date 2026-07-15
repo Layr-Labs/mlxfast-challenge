@@ -43,6 +43,11 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("setup.sh: setup complete elapsed="))
     #expect(setup.contains("MLXFAST_OFFLINE_WRITABLE_PATHS=\"${PWD}/weights\" .github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference \"${REFERENCE_DIR}\" --output weights"))
     #expect(setup.contains("${SWIFT_BIN} correctness --weights weights"))
+    // The summary's benchmark hint must reflect reality: a bare ./benchmark.sh
+    // defaults to --local-iterate against the checked-in public fixtures; only
+    // --official needs the organizer-provisioned oracle.
+    #expect(setup.contains("./benchmark.sh  # defaults to --local-iterate against the public fixtures"))
+    #expect(!setup.contains("requires organizer-supplied correctness_golden.json"))
 
     // macmon is optional (local thermal cool-gate only): installed as a
     // pinned, hash-verified release binary dropped in ~/bin -- a location
@@ -2639,6 +2644,172 @@ func localIterateStreamsLiveNumbersDuringTheRun() throws {
     // The immediate mismatch line must stay redacted like the shared error
     // path: no expected/actual token values in the progress stream.
     #expect(runtime.contains("expected/actual tokens are in the score JSON"))
+}
+
+// The first-run experience on non-M5 Apple Silicon is a deterministic public
+// gate failure (M5-generated goldens; near-tie argmax divergence -- observed
+// on an M4 Pro at checked_step=17 on unmodified main). Every
+// participant-visible failure surface -- the immediate harness FAIL line, the
+// shell's failing-score summary, and the standalone correctness command --
+// carries the one-sentence caveat pointing at the README callout and naming
+// the ranked M5 runner as the source of truth. Messaging only: the gate is
+// not weakened and failing runs still exit non-zero.
+@Test
+func localCorrectnessFailureSurfacesCarryNonM5GoldenCaveat() throws {
+    let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    let runtime = try String(
+        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeLocalIterate.swift",
+        encoding: .utf8
+    )
+    let cli = try String(
+        contentsOfFile: "Sources/MLXFastCLI/main.swift",
+        encoding: .utf8
+    )
+    let readme = try String(contentsOfFile: "README.md", encoding: .utf8)
+
+    // Harness: the caveat is emitted with every first-token-mismatch report;
+    // both local modes (and both timing paths) route through
+    // reportFirstTokenMismatch.
+    #expect(runtime.contains("public static let nonM5GoldenMismatchCaveat"))
+    #expect(runtime.contains("progress?(\"\\(modeName) \\(nonM5GoldenMismatchCaveat)\")"))
+    #expect(runtime.contains("a deterministic near-tie token mismatch is expected for a correct build"))
+
+    // Shell: the failing-score summary is followed by the caveat for
+    // local-mode token-mismatch failures only.
+    #expect(script.contains("benchmark produced a failing score; see ${SCORE_PATH}"))
+    #expect(script.contains("(.metrics.error // \"\") | test(\"token mismatch\")"))
+    #expect(script.contains(
+        "the public goldens are M5-generated, so on non-M5 Apple Silicon a deterministic "
+            + "near-tie token mismatch is expected for a correct build"
+    ))
+    #expect(script.contains("the ranked M5 runner is the source of truth"))
+
+    // Standalone correctness command: same sentence on stderr for mismatch
+    // failures, with the exit code unchanged.
+    #expect(cli.contains("if !report.passed, report.error.contains(\"token mismatch\")"))
+    #expect(cli.contains("GemmaRuntime.nonM5GoldenMismatchCaveat"))
+    #expect(cli.contains("return report.passed ? 0 : 1"))
+
+    // The caveat points at a README callout that actually exists.
+    #expect(readme.contains("**Correctness fixtures are M5-generated.**"))
+}
+
+@Test
+func benchmarkScriptPrintsNonM5CaveatOnlyForLocalTokenMismatchFailures() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "{}".write(
+        to: weights.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    func runLocalIterate(failureError: String) throws -> (status: Int32, stderr: String) {
+        let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+        try """
+        #!/bin/sh
+        cat <<'JSON'
+        {
+          "score": 0.998,
+          "passed": false,
+          "metrics": {
+            "error": "\(failureError)",
+            "weights_hash": "fake-weights",
+            "weights_file_count": 1,
+            "weights_byte_count": 2
+          }
+        }
+        JSON
+        """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fakeSwift.path
+        )
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = ["benchmark.sh", "--local-iterate"]
+        process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        process.environment = benchmarkTestEnvironment([
+            "MLXFAST_NO_SANDBOX": "1",
+            "MLXFAST_SKIP_TRANSFORM": "1",
+            "MLXFAST_SWIFT_BIN": fakeSwift.path,
+            "MLXFAST_WEIGHTS_PATH": weights.path,
+            "MLXFAST_SCORE_PATH": root.appendingPathComponent("score.local-iterate.json").path,
+            "MLXFAST_INTEGRITY_PATH": root.appendingPathComponent("integrity.local-iterate.json").path,
+        ])
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+        try process.run()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(data: stderrData, encoding: .utf8) ?? "")
+    }
+
+    // A local token-mismatch failure gets the caveat and still fails the run.
+    let mismatch = try runLocalIterate(failureError: "local-iterate teacher-forced token mismatch")
+    #expect(mismatch.status != 0)
+    #expect(mismatch.stderr.contains("benchmark produced a failing score"))
+    #expect(mismatch.stderr.contains("the public goldens are M5-generated"))
+    #expect(mismatch.stderr.contains("the ranked M5 runner is the source of truth"))
+
+    // Unrelated local failures keep the original message without the caveat.
+    let unrelated = try runLocalIterate(failureError: "weights digest failed")
+    #expect(unrelated.status != 0)
+    #expect(unrelated.stderr.contains("benchmark produced a failing score"))
+    #expect(!unrelated.stderr.contains("the public goldens are M5-generated"))
+}
+
+// Frozen or near-zero GPU temperature telemetry (observed: macmon 0.7.2 on
+// macOS 26 / M4 Pro reporting a constant 3.657C for 20+ minutes) makes the
+// local thermal gate pass instantly and silently, so gated timings are
+// effectively ungated. The gate prints one calm warning when the reading
+// looks implausible -- at/below the 5C plausibility floor or exactly constant
+// across the gate's samples -- without failing the run and without touching
+// the ranked box-side gate.
+@Test
+func coolGateWarnsOnceWhenGpuTelemetryLooksImplausible() throws {
+    let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    #expect(script.contains("warn_if_gpu_telemetry_implausible() {"))
+    #expect(script.contains("at or below the 5C plausibility floor"))
+    #expect(script.contains("has read a constant $(format_temp_c \"${temp}\")C across ${sample_count} samples"))
+    #expect(script.contains("gated timings may effectively be ungated"))
+    // Warn-once bookkeeping; the warning never changes the gate outcome.
+    #expect(script.contains("telemetry_warned=1"))
+
+    func runCoolGateOnly(gpuTempCommand: String) throws -> (status: Int32, stderr: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = ["benchmark.sh", "--local-cool-gate-only"]
+        process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        process.environment = benchmarkTestEnvironment([
+            "MLXFAST_GPU_TEMP_CMD": gpuTempCommand,
+        ])
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+        try process.run()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(data: stderrData, encoding: .utf8) ?? "")
+    }
+
+    // The observed M4 Pro shape: a frozen 3.657C reading passes the gate
+    // immediately, so the warning must ride along with the pass.
+    let frozen = try runCoolGateOnly(gpuTempCommand: "printf 3.657")
+    #expect(frozen.status == 0)
+    #expect(frozen.stderr.contains(
+        "benchmark.sh: warning: the GPU temperature reads 3.7C, at or below the 5C plausibility floor"
+    ))
+    #expect(frozen.stderr.contains("temperature reading looks implausible on this hardware/OS"))
+    #expect(frozen.stderr.contains("GPU cool-down gate passed"))
+
+    // A plausible reading passes quietly, exactly as before.
+    let plausible = try runCoolGateOnly(gpuTempCommand: "printf 39")
+    #expect(plausible.status == 0)
+    #expect(!plausible.stderr.contains("looks implausible"))
+    #expect(plausible.stderr.contains("GPU cool-down gate passed"))
 }
 
 // The local cool gate can offer a ONE-TIME fan boost when the GPU sits hot

@@ -759,6 +759,31 @@ EOF
   esac
 }
 
+# Some hardware/OS combinations report frozen or near-zero GPU temperature
+# telemetry (observed: macmon 0.7.2 on macOS 26 / M4 Pro reads a constant
+# 3.657C for tens of minutes), which makes the local gate pass instantly and
+# turns the thermal guarantee decorative. Warn -- once per gate, calmly --
+# when the readings look implausible: at or below a 5C plausibility floor, or
+# exactly constant across the gate's samples. Never fails the run, and only
+# affects this local helper; the ranked M5 box keeps its own operator-side
+# gate and contract.
+warn_if_gpu_telemetry_implausible() {
+  local temp="$1"
+  local sample_count="$2"
+  local temp_varied="$3"
+  local reason=""
+  if awk -v t="${temp}" 'BEGIN { exit !(t <= 5) }'; then
+    reason="the GPU temperature reads $(format_temp_c "${temp}")C, at or below the 5C plausibility floor"
+  elif [[ "${sample_count}" -ge 3 && "${temp_varied}" == "0" ]]; then
+    reason="the GPU temperature has read a constant $(format_temp_c "${temp}")C across ${sample_count} samples"
+  fi
+  if [[ -n "${reason}" ]]; then
+    echo "benchmark.sh: warning: ${reason}; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated" >&2
+    return 0
+  fi
+  return 1
+}
+
 # Block the timed local run until the GPU has cooled to the gate temperature,
 # mirroring the ranked runner's thermal gate. Missing-tool policy: warn loudly
 # and SKIP (never hard-fail) -- a participant without macmon still gets a
@@ -791,6 +816,7 @@ EOF
   fi
 
   local temp waited=0 min_temp="" last_progress_waited=0 bad_samples=0 fan_boost_offered=0
+  local first_temp="" temp_varied=0 sample_count=0 telemetry_warned=0
   while :; do
     temp="$(local_gpu_temp || true)"
     if [[ ! "${temp}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
@@ -805,6 +831,16 @@ EOF
       continue
     fi
     bad_samples=0
+    sample_count=$((sample_count + 1))
+    if [[ -z "${first_temp}" ]]; then
+      first_temp="${temp}"
+    elif [[ "${temp}" != "${first_temp}" ]]; then
+      temp_varied=1
+    fi
+    if [[ "${telemetry_warned}" == "0" ]] \
+        && warn_if_gpu_telemetry_implausible "${temp}" "${sample_count}" "${temp_varied}"; then
+      telemetry_warned=1
+    fi
 
     if awk -v t="${temp}" -v gate="${COOL_GATE_TEMP_C}" 'BEGIN { exit !(t <= gate) }'; then
       echo "benchmark.sh: GPU cool-down gate passed (current $(format_temp_c "${temp}")C, target <=${COOL_GATE_TEMP_C}C, waited ${waited}s)" >&2
@@ -1796,5 +1832,14 @@ jq -n \
 
 if ! jq -e '.passed == true' "${SCORE_PATH}" >/dev/null; then
   echo "benchmark.sh: benchmark produced a failing score; see ${SCORE_PATH}" >&2
+  # Local public-gate token mismatches deserve the non-M5 caveat: the goldens
+  # are greedy continuations captured on the ranked M5 box, and near-tie
+  # argmaxes diverge deterministically on other Apple Silicon generations, so
+  # a first run of unmodified main can fail here on a perfectly good machine.
+  # Messaging only; the run still exits non-zero.
+  if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ]] \
+      && jq -e '(.metrics.error // "") | test("token mismatch")' "${SCORE_PATH}" >/dev/null 2>&1; then
+    echo "benchmark.sh: note: the public goldens are M5-generated, so on non-M5 Apple Silicon a deterministic near-tie token mismatch is expected for a correct build (see \"Correctness fixtures are M5-generated\" in README.md); the ranked M5 runner is the source of truth" >&2
+  fi
   exit 1
 fi

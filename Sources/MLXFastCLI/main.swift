@@ -179,6 +179,9 @@ private enum MLXFastCLI {
         let data = try encoder.encode(report)
         FileHandle.standardOutput.write(data)
         print("")
+        if !report.passed, report.error.contains("token mismatch") {
+            fputs("mlxfast-swift: \(GemmaRuntime.nonM5GoldenMismatchCaveat)\n", stderr)
+        }
         return report.passed ? 0 : 1
     }
 

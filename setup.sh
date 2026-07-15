@@ -253,7 +253,7 @@ setup.sh: summary
   next:
     MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" .github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference "${REFERENCE_DIR}" --output weights
     ${SWIFT_BIN} correctness --weights weights
-    ./benchmark.sh  # requires organizer-supplied correctness_golden.json
+    ./benchmark.sh  # defaults to --local-iterate against the public fixtures (--official needs the organizer-provisioned oracle)
 EOF
 }
 
@@ -1515,6 +1515,14 @@ reference_download_on_disk_bytes() {
     file_path="${output_dir}/${shard_file}"
     if [[ -f "${file_path}" ]]; then
       total_bytes=$((total_bytes + $(wc -c < "${file_path}" | tr -d ' ')))
+    elif [[ -f "${file_path}.partial" ]]; then
+      # In-flight curl transfers write to <shard>.partial and only rename on
+      # verified completion; counting those bytes keeps the heartbeat moving
+      # from the first transferred byte instead of reporting 0% until a whole
+      # shard completes. elif, not a second if: a redownload can briefly leave
+      # a stale final file next to a fresh .partial, and double-counting would
+      # overstate progress.
+      total_bytes=$((total_bytes + $(wc -c < "${file_path}.partial" | tr -d ' ')))
     fi
   done
   printf '%s\n' "${total_bytes}"

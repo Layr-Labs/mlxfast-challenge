@@ -803,6 +803,49 @@ func setupDownloadContractReportsProgressAndDetectsStalls() throws {
     // aggregate heartbeat, which also carries the transfer rate and ETA.
     #expect(setup.contains("still downloading safetensors shard(s)"))
     #expect(setup.contains("rate=%.1f MiB/s eta=%ds"))
+    // The heartbeat's byte counter includes in-flight .partial transfers, so
+    // progress moves from the first transferred byte instead of printing 0%
+    // until a whole shard completes and is renamed.
+    #expect(setup.contains("elif [[ -f \"${file_path}.partial\" ]]; then"))
+}
+
+@Test
+func setupDownloadHeartbeatCountsInProgressPartialBytes() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let output = root.appendingPathComponent("output")
+    try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+
+    // Shard A is mid-transfer (curl still writing the .partial); shard B has
+    // completed (renamed to its final name) and also has a stale leftover
+    // .partial, which must NOT be double counted. Expected: 7 + 5 = 12.
+    try Data(repeating: 0x61, count: 7).write(
+        to: output.appendingPathComponent("file-a.safetensors.partial")
+    )
+    try Data(repeating: 0x62, count: 5).write(
+        to: output.appendingPathComponent("file-b.safetensors")
+    )
+    try Data(repeating: 0x63, count: 9).write(
+        to: output.appendingPathComponent("file-b.safetensors.partial")
+    )
+
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        reference_download_on_disk_bytes "${OUTPUT_DIR}" file-a.safetensors file-b.safetensors
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "OUTPUT_DIR": output.path,
+        ]
+    )
+
+    #expect(result.status == 0, "stderr: \(result.stderr)")
+    let lastLine = result.stdout
+        .split(separator: "\n", omittingEmptySubsequences: true)
+        .last
+        .map(String.init)
+    #expect(lastLine == "12", "stdout: \(result.stdout)")
 }
 
 @Test
