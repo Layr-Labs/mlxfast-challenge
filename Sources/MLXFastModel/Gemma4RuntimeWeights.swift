@@ -35,22 +35,24 @@ public final class Gemma4RuntimeWeightCache {
     public init(loader: Gemma4WeightLoader, config: Gemma4Config) {
         self.loader = loader
         self.config = config
-        // Bound the MLX buffer cache so resident memory stays near the ~17 GB
-        // checkpoint plus KV/activation buffers instead of growing without limit
-        // across a long decode run.
-        //
-        // The ranked M5 Max has enough headroom to retain more freed
-        // intermediate buffers for reuse. This is a soft allocator-cache cap,
-        // not a reservation; model weights remain active allocations.
+        let startupMemoryPolicy: Gemma4StartupMemoryPolicy?
         if config.numHiddenLayers >= 16 {
-            // The MLX M5 Max default commits after referencing 50 MiB. Many
-            // 4-bit projections individually exceed that, so use a moderate
-            // limit that can group adjacent kernels without long command buffers.
-            setenv("MLX_MAX_MB_PER_BUFFER", "320", 1)
-            // Decode's explicit async-eval groups remain the outer command-
-            // buffer boundary; let the referenced-buffer budget govern within them.
-            setenv("MLX_MAX_OPS_PER_BUFFER", "128", 1)
-            Memory.cacheLimit = 32 << 30
+            // Keep the ranked 128 GiB machine's full optimized layout, but
+            // protect local Macs from retaining ~14.5 GiB of alternate weight
+            // layouts on top of the ~16.9 GiB source model. The policy is
+            // selected before model loading so file-global feature switches are
+            // first observed after their low-memory defaults are installed;
+            // the defaults never overwrite flags the user set explicitly.
+            let policy = Gemma4StartupMemoryPolicy.resolve(
+                physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+                requestedProfile: ProcessInfo.processInfo.environment[
+                    Gemma4StartupMemoryPolicy.profileOverrideEnvironmentName
+                ]
+            )
+            policy.apply()
+            startupMemoryPolicy = policy
+        } else {
+            startupMemoryPolicy = nil
         }
         do {
             libraryModel = try Gemma4RuntimeWeightCache.loadLibraryModel(
@@ -73,6 +75,12 @@ public final class Gemma4RuntimeWeightCache {
         // caches independent of this allocator pool.
         if let model = libraryModel, config.numHiddenLayers >= 16 {
             Self.warmLibraryModel(model)
+            if startupMemoryPolicy?.clearAllocatorCacheAfterWarmup == true {
+                // Pipeline state is process-lifetime state, while free warmup
+                // allocations are exactly the pressure a low-memory machine
+                // cannot afford to retain before the worker protocol hello.
+                Memory.clearCache()
+            }
         }
     }
 
