@@ -7,6 +7,43 @@ import Testing
 @Suite(.serialized)
 struct BenchmarkSafetyTests {
     @Test
+    func directoryDigestPreservesLegacyDigestWithBoundedUncachedReads() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let nested = root.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try Data([0, 1, 2, 3, 255]).write(to: nested.appendingPathComponent("b.bin"))
+        try Data("alpha\n".utf8).write(to: root.appendingPathComponent("a.txt"))
+        try Data("ignored".utf8).write(to: root.appendingPathComponent(".gitkeep"))
+
+        let digest = try GemmaRuntime.directoryDigest(
+            rootPath: root.path,
+            ignoredRelativePaths: [".gitkeep"]
+        )
+
+        // Golden from the pre-change recipe: sorted relative path + NUL +
+        // raw per-file SHA-256 + NUL. The read strategy must not alter it.
+        #expect(
+            digest == GemmaRuntime.DirectoryDigest(
+                fileCount: 2,
+                byteCount: 11,
+                sha256: "bc1b1f56a33b786645d24771234b988228e7b97266ba74337fc2329ea7101134"
+            )
+        )
+
+        let source = try String(
+            contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimePreflight.swift",
+            encoding: .utf8
+        )
+        let noCache = try #require(
+            source.range(of: "Darwin.fcntl(handle.fileDescriptor, F_NOCACHE, 1)")
+        )
+        let read = try #require(source.range(of: "handle.readData(ofLength: chunkSize)"))
+        #expect(noCache.lowerBound < read.lowerBound)
+        #expect(source.contains("let reachedEOF = autoreleasepool {"))
+    }
+
+    @Test
     func localThermalGateRunsAtEveryPhaseBoundary() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
