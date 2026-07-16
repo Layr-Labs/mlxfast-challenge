@@ -78,16 +78,64 @@ official benchmark for ranking.
 
 ## What You May Optimize
 
-The submitted editable surface is defined in `benchmark.json`:
+The submitted editable surface is defined by `editablePaths` in
+`benchmark.json` — that list (currently 66 entries) is the source of truth.
+It covers four groups:
 
 ```text
-Sources/MLXFastModel/
-Sources/MLXFastTransform/
+Sources/MLXFastModel/     Gemma 4 runtime glue, custom kernels, decode path
+Sources/MLXFastTransform/ offline weight transform
+Vendor/mlx-swift-lm/      the Gemma 4 model files + MLXLMCommon plumbing
+Vendor/mlx-swift/         the MLX Metal kernels Gemma 4 dispatches
 ```
+
+The vendored model surface is `Libraries/MLXLLM/Models/Gemma4Text.swift`,
+`Gemma4MTP.swift`, and `Gemma4MTPTarget.swift`, plus the `MLXLMCommon` files
+they use directly (KV caches, RoPE utilities and application, compiled
+decode, evaluation plumbing; the exact file list is in `benchmark.json`).
+
+The vendored kernel surface is the kernel families the Gemma 4 forward pass
+actually dispatches — SDPA (`scaled_dot_product_attention.metal`,
+`sdpa_vector.h`), affine-quantized matmul (`quantized*` including the `_nax`
+variants), `steel/gemm/`, `gemv`, `rope`, `rms_norm`, `softmax`, `copy`,
+elementwise (`unary`/`binary`/`ternary`), `arg_reduce`, and gather indexing
+— in both forms the build uses: the AOT `.metal`/`.h` sources under
+`Vendor/mlx-swift/.../backend/metal/kernels/` and their JIT twins under
+`Vendor/mlx-swift/Source/Cmlx/mlx-generated/*.cpp`. (`steel/attn` is not
+included: its dispatch requires head dim 64/80/128 and this Gemma 4 runs
+256/512, so prefill attention always executes the composite `steel/gemm` +
+`softmax` path — which is editable.)
+
+Know how a kernel edit becomes the running kernel. The vendored MLX Swift
+package builds in JIT mode: families with an `mlx-generated/*.cpp` twin
+(quantized, steel/gemm, gemv, softmax, copy, elementwise, gather) are
+compiled at runtime from the C++ source strings embedded in those files, so
+for them the twin is the runtime-effective source — editing only the
+`.h`/`.metal` form does not change what runs; edit the pair together.
+Families without a twin (RoPE, RMSNorm, the SDPA vector kernel,
+`arg_reduce`) are served ahead-of-time from `mlx.metallib`, built from the
+vendored `.metal` sources by `tools/build-mlx-metallib.sh` (invoked by
+`./setup.sh`; rerun either after editing an AOT `.metal`/`.h` file). `_nax`
+names are the M5-generation kernel variants; the ranked M5 box selects
+them, so tune the `_nax` twin as well as the plain one. Then rebuild
+(`swift build -c release`) and test with
+`.build/release/mlxfast-swift correctness --weights weights` and
+`./benchmark.sh --local-iterate`.
+
+All participant model and kernel code — `MLXFastModel` plus the vendored
+forks — compiles into the sandboxed `mlxfast-runtime-worker` binary. The
+trusted `mlxfast-swift` binary (timing, gates, scoring) links no MLX,
+model, or kernel code and drives the worker over a JSON protocol; your
+hot-path code runs only inside the worker.
 
 Focus on:
 
 - Reducing scored prefill and decode seconds per token.
+- Optimizing the vendored Metal kernels on the hot path. Most remaining
+ headroom is at kernel level, and mostly in prefill: decode already sits
+ near the memory-bandwidth floor implied by the ~17 GB weight read per
+ token, while the prefill quantized/steel GEMM path is compute-bound with
+ more slack.
 - Optimizing kernels and hot-path MLX operations used by attention (both the
  sliding-window and full-attention layer types), the gated MLP, KV-cache
  handling, and dense weight materialization.
@@ -115,9 +163,14 @@ second full copy of the model. Aim to keep generated transformed weights under
 Do not spend time modifying files outside `editablePaths` for a submission.
 They are trusted harness/operator code and are not packaged by submit:
 
-- `Sources/MLXFastCore/`
-- `Sources/MLXFastHarness/`
-- `Sources/MLXFastCLI/`
+- `Sources/MLXFastCore/`, `Sources/MLXFastCLI/`,
+ `Sources/MLXFastTrustedHarness/`, `Sources/MLXFastHarness/`, and
+ `Sources/MLXFastRuntimeWorkerCLI/`
+- `Package.swift` and `Package.resolved` — the dependency graph is frozen
+ (the vendored forks are consumed as pinned local path dependencies)
+- Everything in `Vendor/` not listed in `editablePaths`: other model
+ families, shared model-factory/tokenizer plumbing, and kernels Gemma 4
+ does not dispatch (including `steel/attn`)
 - `.github/`, scripts, tests, docs, `benchmark.json`
 - `weights/`, reference checkpoints, scores, golden files, local caches
 
@@ -233,6 +286,7 @@ Common commands:
 swift test
 MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test
 swift build -c release
+tools/build-mlx-metallib.sh
 .build/release/mlxfast-swift transform --output weights
 .build/release/mlxfast-swift correctness --weights weights
 ./benchmark.sh --local-iterate
@@ -302,13 +356,15 @@ behaviors are expected, not bugs:
  public-gate failure as a regression, check whether unmodified `main`
  fails at the same token position on your machine; the ranked M5 runner
  is the source of truth.
-- **Know the runnable surface.** Only `Sources/MLXFastModel/` and
- `Sources/MLXFastTransform/` ship in a submission (`benchmark.json`
- `editablePaths`); changes anywhere else will not upload even if they
- help locally. `./benchmark.sh --official` requires the hidden goldens
- and private oracle provisioned on the official runner and is not
- runnable locally — use `--local-iterate` for the edit loop and
- `--local-submit` as the recommended manual pre-submit check.
+- **Know the runnable surface.** Only the `benchmark.json` `editablePaths`
+ entries ship in a submission: `Sources/MLXFastModel/`,
+ `Sources/MLXFastTransform/`, the vendored Gemma 4 model and `MLXLMCommon`
+ files, and the listed vendored kernel sources (both AOT `.metal`/`.h`
+ and JIT `mlx-generated/*.cpp` forms); changes anywhere else will not
+ upload even if they help locally. `./benchmark.sh --official` requires
+ the hidden goldens and private oracle provisioned on the official runner
+ and is not runnable locally — use `--local-iterate` for the edit loop
+ and `--local-submit` as the recommended manual pre-submit check.
 - **One local run at a time; the memory guard is protecting your RAM.** The
  ~17 GB RAM-resident text tower means two simultaneous model residencies
  (an overlapping second local run, or a new run started while an orphaned
@@ -377,6 +433,12 @@ submitting — the official M5 run is the gate that ranks the submission.
 
 Good submissions are likely to improve one or more of:
 
+- Kernel-level optimization inside the vendored Metal sources, now that
+ they are editable. The prefill quantized/steel GEMM path has the most
+ slack (prefill is compute-bound; decode is close to the memory-bandwidth
+ floor), with the decode `sdpa_vector` and quantized `qmv`/`qvm` kernels
+ as secondary targets. For the JIT families, edit the
+ `mlx-generated/*.cpp` twin — that string is what compiles at runtime.
 - Attention kernel dispatch: sliding-window vs. full-attention masking, GQA
  head-group broadcasting, and the full-attention layers' partial-rotary
  ("proportional") RoPE.
@@ -395,7 +457,10 @@ Good submissions are likely to improve one or more of:
 Be careful with optimizations that only help a single public prompt or a single
 machine. The hidden correctness and benchmark prompts are different from the
 public local fixtures, and official scoring happens on the single self-hosted
-M5 runner.
+M5 runner. Kernel edits are bound by the same correctness gates as model
+edits: keep them prompt-independent and model-general for Gemma 4, and be
+conservative with numeric reassociation — a changed accumulation order can
+flip near-tie greedy argmaxes on the M5 and fail the exact-token gates.
 
 ## Avoid These Wrong Strategies
 
@@ -479,30 +544,6 @@ supplied in that same invocation, such as prefill. Organizer-provided MTP or
 other speculative decoding requires a separate explicit track with a trusted
 variable-length block protocol, correctness contract, and score; it is not an
 optimization within this serial track.
-
-### Gemma 4 31B-IT MTP Track (separate, experimental)
-
-That separate track exists as an experimental, not-yet-ranked surface with
-track ID `gemma4-31b-it-mtp-v1`; `docs/experimental-mtp-track.md` is its
-contract. In one paragraph: an organizer-pinned Gemma 4 31B-IT target is
-paired with Google's matched trained assistant (~939 MB organizer-provisioned
-sidecar); a trusted parent drives a block protocol (`mtp_decode_begin`, then
-`mtp_decode_block` carrying only the last committed token and a max block
-size of 4), owns the timer and an independent serial-oracle check of every
-returned token, and divides its own wall time by its configured decode total
-(`--tokens`, default 128, max 512). The participant surface is the drafting
-and verification strategy inside `Sources/MLXFastModel/` — the
-`Gemma4TrainedMTPBlockSession` block decoder and the bit-exact exact-pair
-verification kernels (`Gemma4ExactTwo*.swift`), which verify two target rows
-per dispatch while preserving each row's serial K=1 accumulation order so
-accepted tokens are bit-identical to serial decode. Bit-exactness is a hard
-gate: one token diverging from the parent oracle fails the run, so the track
-cannot be won by degrading output. Proposed scoring (pending operator
-calibration; see the contract fixture's `proposed_scoring`) is decode-only
-paired speedup versus the trusted serial K=1 reference in the same session,
-floor 1.0, on a leaderboard namespace never mixed with the serial track. The
-serial track's rules above are unaffected; MTP mechanisms remain excluded
-from serial submissions.
 
 ### Gemma 4 31B-IT MTP Track (separate, experimental)
 

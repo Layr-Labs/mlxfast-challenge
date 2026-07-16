@@ -190,28 +190,61 @@ and a partial-rotation "proportional" RoPE), every projection is affine 4-bit
 quantized (group size 64), and the whole forward pass runs through MLX's
 kernel scheduler on every decode step. Kernel selection, quantized matmul
 dispatch, KV-cache handling, attention masking, and MLX graph/scheduling
-overhead are all optimisation targets. The generated `weights/` tree is
+overhead are all optimisation targets — and so are the vendored MLX Metal
+kernels themselves, which are now part of the editable surface (see "The
+modifiable surface" below). The generated `weights/` tree is
 expected to stay small: it is a runtime artifact overlay on top of the frozen
 reference checkpoint (a straight text-tensor subset plus a runtime-authored
-`config.json`), not a second full model copy. Submissions may change both the
-Swift transform and Swift runtime, as long as the generated runnable artifacts
-pass the hidden correctness and benchmark checks.
+`config.json`), not a second full model copy. Submissions may change the
+Swift transform, the Swift runtime, and the vendored Gemma 4 model and
+kernel sources, as long as the generated runnable artifacts pass the hidden
+correctness and benchmark checks.
 
 ## The modifiable surface
 
 Unlike typical inference benchmarks, the entire model execution pipeline is
-in scope. Submissions should focus on the Swift targets listed in
-`benchmark.json`:
+in scope — including the vendored Gemma 4 model code and the MLX Metal
+kernels it runs on. The authoritative list is `editablePaths` in
+`benchmark.json` (currently 66 entries), in four groups:
 
 | Path | What it controls |
 |---|---|
 | `Sources/MLXFastModel/` | Gemma 4 31B 4-bit runtime, MLX Swift array bridge, dense weight loading, attention/KV-cache/decode/prefill logic. **Primary target.** |
 | `Sources/MLXFastTransform/` | Offline weight transform from frozen reference safetensors into benchmark-ready `weights/`. |
+| `Vendor/mlx-swift-lm/Libraries/` (listed files) | The vendored Gemma 4 model implementation (`MLXLLM/Models/Gemma4Text.swift`, `Gemma4MTP.swift`, `Gemma4MTPTarget.swift`) plus the `MLXLMCommon` plumbing it uses directly (KV caches, RoPE utilities/application, compiled decode, evaluation). |
+| `Vendor/mlx-swift/Source/Cmlx/` (listed files) | The MLX Metal kernels Gemma 4 dispatches — SDPA/`sdpa_vector`, affine-quantized matmul (incl. `_nax`), `steel/gemm`, `gemv`, `rope`, `rms_norm`, `softmax`, `copy`, elementwise, `arg_reduce`, gather indexing — as AOT `.metal`/`.h` sources and their JIT `mlx-generated/*.cpp` twins. |
 
-The repository is Swift-only: setup, transform, correctness, and benchmark all
-run through the Swift package. Correctness, scoring, timing, and provenance are
-trusted harness code outside `editablePaths`; only the model and transform
-targets are contestant-editable.
+Two build forms matter for kernel edits, because the vendored MLX package
+builds in JIT mode. Families with an `mlx-generated/*.cpp` twin (quantized,
+steel/gemm, gemv, softmax, copy, elementwise, gather) are compiled at
+runtime from the C++ source strings embedded in those files — the twin is
+the runtime-effective source, so edit it (and keep the readable
+`.metal`/`.h` pair in sync). RoPE, RMSNorm, the SDPA vector kernel, and
+`arg_reduce` load ahead-of-time from `mlx.metallib`, which
+`tools/build-mlx-metallib.sh` (run by `./setup.sh`) compiles from the
+vendored `.metal` sources — rerun it after editing those. `_nax` names are
+the M5-generation kernel variants the ranked runner selects. After a kernel
+edit: `swift build -c release` (plus the metallib rebuild for AOT edits),
+then the correctness gate and `./benchmark.sh --local-iterate`. Kernel-level
+headroom is mostly in prefill: decode already sits near the
+memory-bandwidth floor of the ~17 GB per-token weight read, while the
+prefill quantized/steel GEMM path is compute-bound with more slack.
+
+Participant model and kernel code — `MLXFastModel` plus the vendored forks
+— builds into the sandboxed `mlxfast-runtime-worker` binary. The trusted
+`mlxfast-swift` binary owns correctness, scoring, timing, and provenance,
+links no MLX, model, or kernel code, and drives the worker over a JSON
+protocol. `Package.swift`/`Package.resolved` and the dependency graph are
+frozen, and the rest of the vendored forks (other model families, shared
+factory/tokenizer plumbing, kernels Gemma 4 does not dispatch such as
+`steel/attn`) stay non-editable. Kernel changes are bound by the same
+hidden correctness gates as model changes: keep them prompt-independent and
+model-general, and be conservative with numeric reassociation, which can
+flip near-tie greedy argmaxes on the M5.
+
+The repository is Swift-only (no Python): setup, transform, correctness,
+and benchmark all run through the Swift package, plus the
+`tools/build-mlx-metallib.sh` step for the vendored AOT Metal sources.
 
 Submissions are made with the **Yukon CLI (`mlxfast`)**, a separate tool that
 manages your account and uploads across all Yukon benchmarks. The
@@ -382,11 +415,16 @@ transformed-weights digest.
 
 ```
 Sources/
-  MLXFastCLI/                Swift command-line entrypoint
-  MLXFastCore/                score.json, golden cases, shared contracts
-  MLXFastTransform/           Swift offline weight transform
-  MLXFastModel/                editable Gemma 4 31B 4-bit Swift runtime
-  MLXFastHarness/             trusted correctness, golden, and benchmark runner
+  MLXFastCLI/                trusted CLI entrypoint (mlxfast-swift)
+  MLXFastCore/               score.json, golden cases, shared contracts
+  MLXFastTransform/          editable Swift offline weight transform
+  MLXFastModel/              editable Gemma 4 31B 4-bit Swift runtime
+  MLXFastTrustedHarness/     trusted correctness, golden, and benchmark runner
+  MLXFastHarness/            worker-side runtime support (builds into the worker)
+  MLXFastRuntimeWorkerCLI/   sandboxed participant worker (mlxfast-runtime-worker)
+Vendor/
+  mlx-swift/                 pinned MLX fork; the listed kernel sources are editable
+  mlx-swift-lm/              pinned mlx-swift-lm fork; the Gemma 4 model files are editable
 weights/                     transformed weights (harness loads from here)
   config.json                 runtime-authored text-tower config
   model.safetensors.index.json
