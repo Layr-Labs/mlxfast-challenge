@@ -2,21 +2,24 @@
 [[hooks.SessionStart]]
 [[hooks.SessionStart.hooks]]
 type = "command"
-command = "sh \".yukon/hooks/yukon-trace.sh\" codex session"
+command = "repo=\"$(git rev-parse --show-toplevel 2>/dev/null)\" && sh \"$repo/.yukon/hooks/yukon-trace.sh\" codex session"
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "repo=\"$(git rev-parse --show-toplevel 2>/dev/null)\" && sh \"$repo/.yukon/hooks/yukon-trace.sh\" codex capture SessionStart"
 [[hooks.SubagentStart]]
 [[hooks.SubagentStart.hooks]]
 type = "command"
-command = "sh \".yukon/hooks/yukon-trace.sh\" codex session"
+command = "repo=\"$(git rev-parse --show-toplevel 2>/dev/null)\" && sh \"$repo/.yukon/hooks/yukon-trace.sh\" codex session"
 [[hooks.UserPromptSubmit]]
 [[hooks.UserPromptSubmit.hooks]]
 type = "command"
-command = "sh \".yukon/hooks/yukon-trace.sh\" codex capture UserPromptSubmit"
+command = "repo=\"$(git rev-parse --show-toplevel 2>/dev/null)\" && sh \"$repo/.yukon/hooks/yukon-trace.sh\" codex capture UserPromptSubmit"
 [[hooks.Stop]]
 [[hooks.Stop.hooks]]
 type = "command"
-command = "sh \".yukon/hooks/yukon-trace.sh\" codex capture Stop"
+command = "repo=\"$(git rev-parse --show-toplevel 2>/dev/null)\" && sh \"$repo/.yukon/hooks/yukon-trace.sh\" codex capture Stop"
 [[hooks.SubagentStop]]
 [[hooks.SubagentStop.hooks]]
 type = "command"
-command = "sh \".yukon/hooks/yukon-trace.sh\" codex capture SubagentStop"
+command = "repo=\"$(git rev-parse --show-toplevel 2>/dev/null)\" && sh \"$repo/.yukon/hooks/yukon-trace.sh\" codex capture SubagentStop"
 # <<< yukon trace hook (managed) <<<

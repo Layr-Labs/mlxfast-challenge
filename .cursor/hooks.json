@@ -1,68 +1,26 @@
 {
   "version": 1,
   "hooks": {
-    "beforeSubmitPrompt": [
+    "sessionStart": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
-      }
-    ],
-    "afterAgentResponse": [
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
-      }
-    ],
-    "afterAgentThought": [
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor session"
+      },
       {
         "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ],
     "beforeShellExecution": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor session",
+        "matcher": "mlxfast"
       }
     ],
-    "afterShellExecution": [
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
-      }
-    ],
-    "afterFileEdit": [
+    "beforeSubmitPrompt": [
       {
         "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ],
-    "postToolUse": [
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
-      }
-    ],
-    "postToolUseFailure": [
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
-      }
-    ],
-    "afterMCPExecution": [
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
-      }
-    ],
-    "subagentStart": [
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor session"
-      },
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
-      }
-    ],
-    "subagentStop": [
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
-      }
-    ],
-    "sessionStart": [
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor session"
-      },
+    "stop": [
       {
         "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
@@ -72,7 +30,7 @@
         "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }
     ],
-    "stop": [
+    "subagentStop": [
       {
         "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
       }

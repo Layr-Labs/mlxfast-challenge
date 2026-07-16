@@ -1,55 +1,15 @@
 {
   "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude capture",
-            "async": true
-          }
-        ]
-      }
-    ],
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
             "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude session"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
+          },
           {
             "type": "command",
-            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude capture",
-            "async": true
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude capture",
-            "async": true
-          }
-        ]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude capture",
-            "async": true
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude capture"
           }
         ]
       }
@@ -60,6 +20,56 @@
           {
             "type": "command",
             "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude session"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude capture"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude capture"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude capture"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude capture"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude capture"
           }
         ]
       }
