@@ -1,5 +1,5 @@
 {
-  "originHash" : "a3bb65b232fc526f47f7f699f85df6cb5b7bef3f1ea629f89f6cfe6b22129c28",
+  "originHash" : "2ff558b55d41428704937665471e187364b68f4fac4fdbfdf37405b2844cebd7",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -26,24 +26,6 @@
       "state" : {
         "revision" : "eebb5ecf8a39beea87401f014fdf87f0ce5b159d",
         "version" : "2.25.0"
-      }
-    },
-    {
-      "identity" : "mlx-swift",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/Layr-Labs/mlx-swift",
-      "state" : {
-        "branch" : "main",
-        "revision" : "df1fdc5f7821a1fabe921fdefbc42ac74dcfb6bc"
-      }
-    },
-    {
-      "identity" : "mlx-swift-lm",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/Layr-Labs/mlx-swift-lm",
-      "state" : {
-        "branch" : "main",
-        "revision" : "bc1c0ee67d15798343be17c9f8f61f7c0d977149"
       }
     },
     {

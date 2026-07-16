@@ -28,6 +28,8 @@ func validateExperimentalTrainedMTPBlockRequest(
     guard request.promptTokens == nil,
           request.seedTokens == nil,
           request.steps == nil,
+          request.topK == nil,
+          request.expectedToken == nil,
           let previousToken = request.token,
           previousToken >= 0,
           previousToken < MLXFastConstants.vocabSize,
@@ -225,7 +227,9 @@ extension GemmaRuntime {
                   request.promptTokens == nil,
                   request.token == nil,
                   request.steps == nil,
-                  request.maxBlockSize == nil
+                  request.maxBlockSize == nil,
+                  request.topK == nil,
+                  request.expectedToken == nil
             else {
                 throw MLXFastError.invalidInput(
                     "trained MTP begin request is repeated or malformed"
@@ -311,7 +315,9 @@ extension GemmaRuntime {
                   request.seedTokens == nil,
                   request.token == nil,
                   request.steps == nil,
-                  request.maxBlockSize == nil
+                  request.maxBlockSize == nil,
+                  request.topK == nil,
+                  request.expectedToken == nil
             else {
                 throw MLXFastError.invalidInput(
                     "trained MTP diagnostics request is malformed or before begin"

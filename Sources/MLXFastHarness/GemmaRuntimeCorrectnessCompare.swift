@@ -580,22 +580,61 @@ extension GemmaRuntime {
         return expectedRank <= maxExpectedRank && expectedDelta <= maxDelta
     }
 
-    static func topLogits(from logits: MLXArray, topK: Int) throws -> [CorrectnessTraceLogit] {
+    struct CorrectnessLogitDiagnostics {
+        let topLogits: [CorrectnessTraceLogit]
+        let expectedTokenLogit: Double?
+        let expectedTokenRank: Int?
+        let topLogitMargin: Double?
+    }
+
+    static func topLogits(
+        from logits: MLXArray,
+        topK: Int
+    ) throws -> [CorrectnessTraceLogit] {
+        try correctnessLogitDiagnostics(
+            from: logits,
+            topK: topK,
+            expectedToken: nil
+        ).topLogits
+    }
+
+    static func correctnessLogitDiagnostics(
+        from logits: MLXArray,
+        topK: Int,
+        expectedToken: Int?
+    ) throws -> CorrectnessLogitDiagnostics {
         guard let vocabSize = logits.shape.last, vocabSize > 0 else {
             throw MLXFastError.invalidInput("correctness logits must have a non-empty vocab dimension")
         }
         let rows = logits.reshaped([-1, vocabSize])
-        return try topLogits(fromRows: rows, row: rows.shape[0] - 1, vocabSize: vocabSize, topK: topK)
+        return try correctnessLogitDiagnostics(
+            fromRows: rows,
+            row: rows.shape[0] - 1,
+            vocabSize: vocabSize,
+            topK: topK,
+            expectedToken: expectedToken
+        )
     }
 
-    static func topLogits(
+    static func correctnessLogitDiagnostics(
         fromRows rows: MLXArray,
         row: Int,
         vocabSize: Int,
-        topK: Int
-    ) throws -> [CorrectnessTraceLogit] {
+        topK: Int,
+        expectedToken: Int?
+    ) throws -> CorrectnessLogitDiagnostics {
         guard row >= 0, row < rows.shape[0] else {
             throw MLXFastError.invalidInput("correctness logits row \(row) is outside available rows \(rows.shape[0])")
+        }
+        guard topK > 0 else {
+            throw MLXFastError.invalidInput("correctness topK must be positive")
+        }
+        if let expectedToken {
+            guard expectedToken >= 0, expectedToken < vocabSize else {
+                throw MLXFastError.invalidInput(
+                    "correctness expected token \(expectedToken) is outside vocab size \(vocabSize)"
+                )
+            }
         }
         let selected = rows[row]
         eval(selected)
@@ -605,15 +644,58 @@ extension GemmaRuntime {
                 "correctness logits materialized \(values.count) values, expected \(vocabSize)"
             )
         }
+        return try correctnessLogitDiagnostics(
+            values: values,
+            topK: topK,
+            expectedToken: expectedToken
+        )
+    }
 
+    static func correctnessLogitDiagnostics(
+        values: [Double],
+        topK: Int,
+        expectedToken: Int?
+    ) throws -> CorrectnessLogitDiagnostics {
+        guard !values.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "correctness logits must not be empty"
+            )
+        }
+        guard topK > 0 else {
+            throw MLXFastError.invalidInput(
+                "correctness topK must be positive"
+            )
+        }
+        if let expectedToken {
+            guard expectedToken >= 0,
+                  expectedToken < values.count
+            else {
+                throw MLXFastError.invalidInput(
+                    "correctness expected token \(expectedToken) is outside vocab size \(values.count)"
+                )
+            }
+        }
         let sortedIndices = values.indices.sorted {
             let lhs = values[$0]
             let rhs = values[$1]
             return lhs == rhs ? $0 < $1 : lhs > rhs
         }
-        return sortedIndices.prefix(min(topK, sortedIndices.count)).map {
+        let topLogits = sortedIndices.prefix(min(topK, sortedIndices.count)).map {
             CorrectnessTraceLogit(token: $0, logit: values[$0])
         }
+        let expectedTokenLogit = expectedToken.map { values[$0] }
+        let expectedTokenRank = expectedToken.map {
+            (sortedIndices.firstIndex(of: $0) ?? sortedIndices.count - 1) + 1
+        }
+        let topLogitMargin = sortedIndices.count >= 2
+            ? values[sortedIndices[0]] - values[sortedIndices[1]]
+            : nil
+        return CorrectnessLogitDiagnostics(
+            topLogits: topLogits,
+            expectedTokenLogit: expectedTokenLogit,
+            expectedTokenRank: expectedTokenRank,
+            topLogitMargin: topLogitMargin
+        )
     }
 
     static func traceGreedyCached(

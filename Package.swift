@@ -8,19 +8,23 @@ let package = Package(
     ],
     products: [
         .executable(name: "mlxfast-swift", targets: ["MLXFastCLI"]),
+        .executable(
+            name: "mlxfast-runtime-worker",
+            targets: ["MLXFastRuntimeWorkerCLI"]
+        ),
         .library(name: "MLXFastCore", targets: ["MLXFastCore"]),
         .library(name: "MLXFastTransform", targets: ["MLXFastTransform"]),
         .library(name: "MLXFastModel", targets: ["MLXFastModel"]),
         .library(name: "MLXFastHarness", targets: ["MLXFastHarness"]),
     ],
     dependencies: [
-        // Layr-Labs forks: mlx-swift-lm carries the optimized Gemma 4 text tower
-        // this benchmark's reference is built on, and it pins mlx-swift to its
-        // own fork at branch main -- we must match that requirement (branch main)
-        // so SwiftPM resolves a single mlx-swift. Package.resolved pins the exact
-        // commit for reproducibility.
-        .package(url: "https://github.com/Layr-Labs/mlx-swift", branch: "main"),
-        .package(url: "https://github.com/Layr-Labs/mlx-swift-lm", branch: "main"),
+        // Exact vendored revisions:
+        // mlx-swift df1fdc5f7821a1fabe921fdefbc42ac74dcfb6bc
+        // mlx-swift-lm bc1c0ee67d15798343be17c9f8f61f7c0d977149
+        .package(path: "Vendor/mlx-swift"),
+        .package(path: "Vendor/mlx-swift-lm"),
+        // TODO(security): Assert the resolved dependency graph before either
+        // trusted-harness or participant-worker builds begin.
         .package(url: "https://github.com/huggingface/swift-transformers", exact: "1.3.3"),
     ],
     targets: [
@@ -40,13 +44,29 @@ let package = Package(
             ]
         ),
         .target(
-            name: "MLXFastHarness",
+            name: "MLXFastRuntimeWorkerSupport",
             dependencies: [
                 "MLXFastCore",
                 "MLXFastTransform",
                 "MLXFastModel",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Sources/MLXFastHarness"
+        ),
+        // TODO(security): Pin the trusted-harness source scope independently of
+        // participant-controlled package and source manifests.
+        .target(
+            name: "MLXFastHarness",
+            dependencies: [
+                "MLXFastCore",
+                "MLXFastTransform",
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Sources/MLXFastTrustedHarness",
+            swiftSettings: [
+                .define("MLXFAST_TRUSTED_HARNESS")
             ]
         ),
         .executableTarget(
@@ -58,6 +78,14 @@ let package = Package(
                 .product(name: "Tokenizers", package: "swift-transformers"),
             ]
         ),
+        .executableTarget(
+            name: "MLXFastRuntimeWorkerCLI",
+            dependencies: [
+                "MLXFastCore",
+                "MLXFastModel",
+                "MLXFastRuntimeWorkerSupport",
+            ]
+        ),
         .testTarget(
             name: "MLXFastTests",
             dependencies: [
@@ -65,6 +93,7 @@ let package = Package(
                 "MLXFastTransform",
                 "MLXFastModel",
                 "MLXFastHarness",
+                "MLXFastRuntimeWorkerSupport",
             ]
         ),
     ]

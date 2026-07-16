@@ -2,7 +2,6 @@ import Darwin
 import Foundation
 import MLXFastCore
 import MLXFastHarness
-import MLXFastModel
 import MLXFastTransform
 import Tokenizers
 
@@ -57,12 +56,6 @@ private enum MLXFastCLI {
                 return 0
             case "generate-gpqa-answers":
                 try runGenerateGPQAAnswers(options)
-                return 0
-            case "runtime-worker":
-                try runRuntimeWorker(options)
-                return 0
-            case "mtp-runtime-worker":
-                try runExperimentalMTPRuntimeWorker(options)
                 return 0
             case "checkpoint-shards":
                 try runCheckpointShards(options)
@@ -217,6 +210,9 @@ private enum MLXFastCLI {
                 caseName: caseName.isEmpty ? nil : caseName,
                 step: step,
                 topK: topK
+            ),
+            worker: try runtimeWorkerOptions(
+                blockedGoldenPath: goldenPath
             )
         )
 
@@ -246,6 +242,17 @@ private enum MLXFastCLI {
         let report = try BenchmarkPreflight.check(
             weightsPath: weightsPath,
             goldenPath: goldenPath
+        )
+        guard let worker = try runtimeWorkerOptions(
+            blockedGoldenPath: goldenPath
+        ) else {
+            throw MLXFastError.invalidInput(
+                "preflight requires the participant runtime worker"
+            )
+        }
+        try GemmaRuntime.runPreflightWithWorker(
+            weightsPath: weightsPath,
+            worker: worker
         )
 
         let encoder = JSONEncoder()
@@ -1394,43 +1401,28 @@ private enum MLXFastCLI {
         blockedGoldenPath: String? = nil,
         forwardsWorkerStderr: Bool = false
     ) throws -> RuntimeWorkerOptions? {
-        // benchmark.sh's enforce_official_sandbox refuses to run the timed benchmark
-        // with the worker or its sandbox disabled on an official run, but the public
-        // behavior gate invokes `mlxfast-swift correctness` directly, so the same
-        // policy must fail closed here too rather than silently falling back to an
-        // unsandboxed (or worker-less) path. MLXFAST_OFFICIAL_BENCHMARK_RUN is set
-        // by trusted workflow env and stripped from the worker's own environment by
-        // sanitizedRuntimeWorkerEnvironment, so submitted code cannot observe it.
+        // The trusted binary has no in-process model target. Disabling the worker
+        // therefore fails closed in every mode rather than selecting an editable
+        // model path inside the timer/gate/score process.
         let officialRun = environmentValue("MLXFAST_OFFICIAL_BENCHMARK_RUN", fallback: "0") == "1"
         let enabled = environmentValue("MLXFAST_USE_RUNTIME_WORKER", fallback: "1")
         guard enabled != "0" && enabled.lowercased() != "false" else {
-            if officialRun {
-                throw MLXFastError.invalidInput(
-                    "official benchmark runs require the runtime worker; unset MLXFAST_USE_RUNTIME_WORKER"
-                )
-            }
-            return nil
+            throw MLXFastError.invalidInput(
+                "mlxfast-swift requires the participant runtime worker; unset MLXFAST_USE_RUNTIME_WORKER"
+            )
         }
         if officialRun, environmentValue("MLXFAST_NO_SANDBOX", fallback: "0") == "1" {
             throw MLXFastError.invalidInput(
                 "official benchmark runs require the runtime worker sandbox; unset MLXFAST_NO_SANDBOX"
             )
         }
-        let executable = environmentValue(
+        let configuredExecutable = environmentValue(
             "MLXFAST_RUNTIME_WORKER_EXECUTABLE",
-            fallback: CommandLine.arguments.first ?? ""
+            fallback: ""
         )
-        guard !executable.isEmpty else {
-            // Every no-worker exit must be fail-closed on an official run, not
-            // just the explicit-disable ones above -- returning nil here means
-            // "run the model in-process, no worker, no sandbox".
-            if officialRun {
-                throw MLXFastError.invalidInput(
-                    "official benchmark runs require a runtime worker executable; none was configured or derivable"
-                )
-            }
-            return nil
-        }
+        let executable = configuredExecutable.isEmpty
+            ? try siblingParticipantWorkerExecutablePath()
+            : configuredExecutable
         let executablePath: String
         if executable.hasPrefix("/") {
             executablePath = executable
@@ -1440,6 +1432,17 @@ private enum MLXFastCLI {
                 relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             ).standardizedFileURL.path
         }
+        guard FileManager.default.isExecutableFile(atPath: executablePath) else {
+            throw MLXFastError.invalidInput(
+                "participant runtime worker is not executable at \(executablePath)"
+            )
+        }
+        // TODO(security): Fingerprint the metallib over every vendored Metal
+        // source before the participant worker is spawned.
+        // TODO(security): Separate trusted and participant build caches in the
+        // final launcher/build orchestration.
+        // TODO(security): Enforce the static-review byte cap and kernel-bypass
+        // policy before allowing this participant worker launch.
         var sandboxProfile = environmentValue("MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE", fallback: "")
         if sandboxProfile.isEmpty,
            environmentValue("MLXFAST_NO_SANDBOX", fallback: "0") != "1",
@@ -1465,6 +1468,81 @@ private enum MLXFastCLI {
             // diagnostic, so submitted code cannot stream hidden-prompt
             // content into CI logs.
             forwardsWorkerStderr: forwardsWorkerStderr && !officialRun
+        )
+    }
+
+    private static func siblingParticipantWorkerExecutablePath() throws -> String {
+        URL(fileURLWithPath: try currentExecutablePath())
+            .deletingLastPathComponent()
+            .appendingPathComponent("mlxfast-runtime-worker")
+            .path
+    }
+
+    private static func currentExecutablePath() throws -> String {
+        if let executableURL = Bundle.main.executableURL {
+            let path = executableURL.standardizedFileURL
+                .resolvingSymlinksInPath().path
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+
+        var requiredSize: UInt32 = 0
+        _ = _NSGetExecutablePath(nil, &requiredSize)
+        if requiredSize > 0 {
+            var buffer = [CChar](
+                repeating: 0,
+                count: Int(requiredSize)
+            )
+            if _NSGetExecutablePath(&buffer, &requiredSize) == 0 {
+                let executableBytes = buffer
+                    .prefix { $0 != 0 }
+                    .map { UInt8(bitPattern: $0) }
+                let path = URL(
+                    fileURLWithPath: String(
+                        decoding: executableBytes,
+                        as: UTF8.self
+                    )
+                ).standardizedFileURL.resolvingSymlinksInPath().path
+                if FileManager.default.isExecutableFile(atPath: path) {
+                    return path
+                }
+            }
+        }
+
+        if let rawExecutable = CommandLine.arguments.first,
+           !rawExecutable.isEmpty
+        {
+            if rawExecutable.contains("/") {
+                let path = absolutePath(rawExecutable)
+                if FileManager.default.isExecutableFile(atPath: path) {
+                    return path
+                }
+            } else {
+                let searchPath = ProcessInfo.processInfo.environment[
+                    "PATH"
+                ] ?? ""
+                for directory in searchPath.split(
+                    separator: ":",
+                    omittingEmptySubsequences: false
+                ) {
+                    let root = directory.isEmpty
+                        ? FileManager.default.currentDirectoryPath
+                        : String(directory)
+                    let path = URL(fileURLWithPath: root)
+                        .appendingPathComponent(rawExecutable).path
+                    if FileManager.default.isExecutableFile(atPath: path) {
+                        return URL(fileURLWithPath: path)
+                            .standardizedFileURL
+                            .resolvingSymlinksInPath().path
+                    }
+                }
+            }
+        }
+
+        throw MLXFastError.invalidInput(
+            "mlxfast-swift could not resolve its actual executable path "
+                + "from Bundle.main, _NSGetExecutablePath, argv[0], or PATH"
         )
     }
 
@@ -1512,12 +1590,7 @@ private enum MLXFastCLI {
                 "\(subcommand) in a benchmark context requires sandbox-exec for the parent-tool sandbox"
             )
         }
-        guard let rawExecutable = CommandLine.arguments.first, !rawExecutable.isEmpty else {
-            throw MLXFastError.invalidInput(
-                "\(subcommand) parent-tool sandbox could not determine its own executable path"
-            )
-        }
-        let executablePath = absolutePath(rawExecutable)
+        let executablePath = try currentExecutablePath()
         guard FileManager.default.isExecutableFile(atPath: executablePath) else {
             throw MLXFastError.invalidInput(
                 "\(subcommand) parent-tool sandbox resolved a non-executable self path: \(executablePath)"
@@ -1632,63 +1705,6 @@ private enum MLXFastCLI {
         value
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
-    }
-
-    private static func runRuntimeWorker(_ options: ParsedOptions) throws {
-        try options.validate(valueOptions: ["--weights"])
-        let weightsPath = options.value(
-            for: "--weights",
-            default: environmentValue(
-                "MLXFAST_WEIGHTS_PATH",
-                fallback: MLXFastConstants.defaultWeightsPath
-            )
-        )
-        try GemmaRuntime.runWorker(weightsPath: weightsPath)
-    }
-
-    private static func runExperimentalMTPRuntimeWorker(
-        _ options: ParsedOptions
-    ) throws {
-        try options.validate(
-            valueOptions: [
-                "--weights",
-                "--assistant",
-                "--contract",
-                "--target-verification",
-            ],
-            flagOptions: ["--require-trained-assistant"]
-        )
-        let weightsPath = options.value(for: "--weights", default: "")
-        let assistantPath = options.value(for: "--assistant", default: "")
-        let contractPath = options.value(for: "--contract", default: "")
-        let verificationValue = options.value(
-            for: "--target-verification",
-            default: Gemma4MTPVerificationMode.exactPair.rawValue
-        ).lowercased()
-        guard let verificationMode = Gemma4MTPVerificationMode(
-            rawValue: verificationValue
-        ) else {
-            throw MLXFastError.invalidInput(
-                "--target-verification must be exact-pair or serial"
-            )
-        }
-        guard !weightsPath.isEmpty,
-              !assistantPath.isEmpty,
-              !contractPath.isEmpty
-        else {
-            throw MLXFastError.invalidInput(
-                "mtp-runtime-worker requires weights, assistant, and contract paths"
-            )
-        }
-        try GemmaRuntime.runExperimentalMTPWorker(
-            targetWeightsPath: weightsPath,
-            assistantPath: assistantPath,
-            contractPath: contractPath,
-            verificationMode: verificationMode,
-            requireTrainedAssistant: options.hasFlag(
-                "--require-trained-assistant"
-            )
-        )
     }
 
     private static func runCheckpointShards(_ options: ParsedOptions) throws {

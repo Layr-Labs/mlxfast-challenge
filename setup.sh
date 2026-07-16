@@ -49,7 +49,8 @@ MACMON_RELEASE_SHA256="c79fdc7ab02b456b897dcc3ea041678420d7a1d5bd669aaac36fda388
 MACMON_INSTALL_DIR="${HOME}/bin"
 SETUP_PARALLEL_METALLIB="${MLXFAST_SETUP_PARALLEL_METALLIB:-${MLXFAST_SETUP_PARALLEL_BUILD:-1}}"
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
-MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
+RUNTIME_WORKER_BIN="${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-$(dirname "${SWIFT_BIN}")/mlxfast-runtime-worker}"
+MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${RUNTIME_WORKER_BIN}")/mlx.metallib}"
 DEFAULT_REFERENCE_DIR="reference_weights/gemma-4-31b-4bit"
 DEFAULT_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}"
 DEFAULT_HF_HUB_CACHE="${MLXFAST_HF_HUB_CACHE:-${HF_HUB_CACHE:-${DEFAULT_HF_HOME}/hub}}"
@@ -168,6 +169,10 @@ Important environment variables:
                                      with reference checkpoint download.
                                      MLXFAST_SETUP_PARALLEL_BUILD is accepted
                                      as a deprecated alias.
+  MLXFAST_SWIFT_BIN                  Trusted user-facing Swift CLI.
+                                     Default: ${SWIFT_BIN}
+  MLXFAST_RUNTIME_WORKER_EXECUTABLE  Participant worker executable.
+                                     Default: ${RUNTIME_WORKER_BIN}
   MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1    Build tools only; do not download weights.
   MLXFAST_SKIP_MLX_METALLIB=1        Skip mlx.metallib build.
   MLXFAST_SKIP_MACMON_INSTALL=1      Do not install macmon (the GPU temperature
@@ -247,7 +252,8 @@ print_setup_summary() {
   cat <<EOF
 setup.sh: setup complete elapsed=$(format_duration "${elapsed}")
 setup.sh: summary
-  binary: ${SWIFT_BIN}
+  trusted CLI: ${SWIFT_BIN}
+  participant worker: ${RUNTIME_WORKER_BIN}
   mlx.metallib: ${metallib_line}
   reference checkpoint: ${reference_line}
   next:
@@ -2685,19 +2691,30 @@ cleanup_background_builds() {
 }
 
 build_swift_harness() {
-  echo "setup.sh: building Swift harness"
+  echo "setup.sh: building trusted Swift harness and participant runtime worker"
   mkdir -p .build/clang-module-cache
   export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build/clang-module-cache}"
-  swift build -c release
+  # TODO(security): Give the trusted CLI and participant worker independent
+  # SwiftPM build/cache roots instead of sharing .build.
+  swift build -c release --product mlxfast-swift
+  swift build -c release --product mlxfast-runtime-worker
   if [[ ! -x "${SWIFT_BIN}" ]]; then
-    echo "setup.sh: Swift binary missing at ${SWIFT_BIN}; build failed or MLXFAST_SWIFT_BIN is wrong" >&2
+    echo "setup.sh: trusted Swift CLI missing at ${SWIFT_BIN}; build failed or MLXFAST_SWIFT_BIN is wrong" >&2
+    return 1
+  fi
+  if [[ ! -x "${RUNTIME_WORKER_BIN}" ]]; then
+    echo "setup.sh: participant runtime worker missing at ${RUNTIME_WORKER_BIN}; build failed or MLXFAST_RUNTIME_WORKER_EXECUTABLE is wrong" >&2
     return 1
   fi
 }
 
 ensure_swift_harness_ready() {
   if [[ ! -x "${SWIFT_BIN}" ]]; then
-    echo "setup.sh: Swift binary missing at ${SWIFT_BIN}; build failed or MLXFAST_SWIFT_BIN is wrong" >&2
+    echo "setup.sh: trusted Swift CLI missing at ${SWIFT_BIN}; build failed or MLXFAST_SWIFT_BIN is wrong" >&2
+    return 1
+  fi
+  if [[ ! -x "${RUNTIME_WORKER_BIN}" ]]; then
+    echo "setup.sh: participant runtime worker missing at ${RUNTIME_WORKER_BIN}; build failed or MLXFAST_RUNTIME_WORKER_EXECUTABLE is wrong" >&2
     return 1
   fi
 }

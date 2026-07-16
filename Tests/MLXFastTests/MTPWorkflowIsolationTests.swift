@@ -77,6 +77,19 @@ struct MTPWorkflowIsolationTests {
         #expect(enablement.lowerBound < privateMaterial.lowerBound)
         #expect(enablement.lowerBound < workspace.lowerBound)
         #expect(enablement.lowerBound < build.lowerBound)
+        #expect(workflow.contains(
+            "/usr/bin/swift build -c release --product mlxfast-swift"
+        ))
+        #expect(workflow.contains(
+            "/usr/bin/swift build -c release --product mlxfast-runtime-worker"
+        ))
+        #expect(workflow.contains(
+            "test -x \"${MLXFAST_JOB_WS}/.build/release/mlxfast-runtime-worker\""
+        ))
+        #expect(workflow.contains("exec .build/release/mlxfast-swift transform"))
+        #expect(workflow.contains("exec .build/release/mlxfast-swift mtp-benchmark"))
+        #expect(!workflow.contains("mlxfast-runtime-worker transform"))
+        #expect(!workflow.contains("mlxfast-runtime-worker mtp-benchmark"))
 
         let gate = try stepBody(
             workflow,

@@ -226,25 +226,6 @@ func workerPhaseStartsResetTrustedAllocatorBeforeForwardSetup() throws {
 }
 
 @Test
-func phaseStartAllocatorResetLeavesExactlyEmptyCacheWhenRuntimeTestsAreEnabled() throws {
-    guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
-        return
-    }
-    // Pin the MLX contract the fail-closed guard relies on: with no MLX work in
-    // flight, clearCache() leaves cacheMemory at exactly zero even when free
-    // buffers were just returned to the pool (mirroring unscored init warmup
-    // residue), so the trusted reset must succeed rather than fail closed.
-    Memory.cacheLimit = 32 << 30
-    do {
-        let scratch = MLXArray(Array(repeating: Float(1), count: 1 << 20), [1024, 1024])
-        eval(scratch + scratch)
-    }
-    try GemmaRuntime.resetRuntimeWorkerAllocatorForPhaseStart()
-    #expect(Memory.cacheMemory == 0)
-    #expect(Memory.cacheLimit == GemmaRuntime.trustedRuntimeWorkerPhaseStartCacheLimitBytes)
-}
-
-@Test
 func trustedParentStartsPhaseTimerBeforeWorkerResetRequest() throws {
     let benchmark = try packageFile("Sources/MLXFastHarness/GemmaRuntimeBenchmark.swift")
     let prefill = try slice(

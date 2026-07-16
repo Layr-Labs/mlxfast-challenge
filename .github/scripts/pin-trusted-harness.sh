@@ -23,6 +23,9 @@ MODE="${1:?usage: pin-trusted-harness.sh <write|verify> WORKSPACE PIN_FILE}"
 WORKSPACE="${2:?workspace path is required}"
 PIN_FILE="${3:?pin file path is required}"
 
+# TODO(security): Revisit this pin's scope when trusted and participant build
+# products have independent caches. The participant runtime worker must remain
+# outside the trusted-artifact pin unless it receives a separate attestation.
 # The trusted driver + built artifacts every scored phase depends on.
 PINNED_RELATIVE_PATHS=(
   "benchmark.sh"

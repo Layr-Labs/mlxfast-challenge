@@ -194,20 +194,6 @@ func gemmaRuntimeCorrectnessReportsGoldenMetadataWhenWeightsAreMissing() throws 
     #expect(report.firstFailingCase == nil)
 }
 
-@Test
-func gemmaCorrectnessSelectsGreedyTokenWhenRuntimeTestsAreEnabled() throws {
-    guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
-        return
-    }
-
-    #expect(try GemmaCorrectness.greedyToken(
-        from: MLXArray([Float(0.1), 2.0, 1.0], [3])
-    ) == 1)
-    #expect(try GemmaCorrectness.greedyToken(
-        from: MLXArray([Float(1), 2, 3, 2], [2, 2])
-    ) == 0)
-}
-
 private func temporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent(
         UUID().uuidString,

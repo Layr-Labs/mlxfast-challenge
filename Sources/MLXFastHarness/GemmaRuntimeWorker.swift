@@ -82,6 +82,36 @@ extension GemmaRuntime {
         }
     }
 
+    /// One-shot structural validation used by the trusted `preflight` command.
+    /// Protocol stdout is isolated before any editable model code runs so
+    /// participant logging cannot forge the JSON result.
+    public static func runPreflightWorker(weightsPath: String) throws {
+        startRuntimeWorkerOrphanReaper()
+        let protocolIO = try RuntimeWorkerProtocolIO.isolatingStandardIO()
+        let response: RuntimeWorkerPreflightResponse
+        do {
+            try validateRuntimeWorkerPinnedConfiguration(weightsPath: weightsPath)
+            let config = try Gemma4Config.load(from: weightsPath)
+            let loader = try Gemma4WeightLoader(weightsPath: weightsPath)
+            try loader.denseStore.validateReadableByteRanges()
+            try loader.validateRequiredMetadata(config: config)
+            response = RuntimeWorkerPreflightResponse(ok: true)
+        } catch {
+            response = RuntimeWorkerPreflightResponse(
+                ok: false,
+                error: "\(error)"
+            )
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        try protocolIO.writeLine(try encoder.encode(response))
+        if let error = response.error {
+            throw MLXFastError.invalidInput(
+                "participant worker preflight failed: \(error)"
+            )
+        }
+    }
+
     /// Poll interval for the worker's orphan self-reaper. Coarse on purpose:
     /// the check is two syscalls, and a couple of seconds of residual
     /// residency after a dead parent is harmless.
@@ -101,8 +131,8 @@ extension GemmaRuntime {
     @discardableResult
     static func startRuntimeWorkerOrphanReaper(
         pollIntervalSeconds: Double = GemmaRuntime.runtimeWorkerOrphanPollSeconds,
-        isOrphaned: @escaping () -> Bool = { getppid() == 1 },
-        onOrphaned: @escaping () -> Void = {
+        isOrphaned: @escaping @Sendable () -> Bool = { getppid() == 1 },
+        onOrphaned: @escaping @Sendable () -> Void = {
             fputs(
                 "mlxfast-swift: runtime worker parent exited; shutting down to release model memory\n",
                 stderr
@@ -167,6 +197,26 @@ extension GemmaRuntime {
                 "runtime worker max_block_size is valid only for decode_block"
             )
         }
+        let carriesTraceDiagnostics =
+            request.topK != nil || request.expectedToken != nil
+        if carriesTraceDiagnostics {
+            guard request.kind == "correctness_begin"
+                || request.kind == "correctness_step"
+            else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker trace diagnostics are valid only for correctness requests"
+                )
+            }
+            guard let topK = request.topK, topK > 0,
+                  let expectedToken = request.expectedToken,
+                  expectedToken >= 0,
+                  expectedToken < MLXFastConstants.vocabSize
+            else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker trace diagnostics require positive top_k and a valid expected_token"
+                )
+            }
+        }
         switch request.kind {
         case "correctness":
             guard let promptTokens = request.promptTokens, let steps = request.steps else {
@@ -200,6 +250,12 @@ extension GemmaRuntime {
                 positionOffset: 0
             )
             let token = try GemmaCorrectness.greedyToken(from: logits)
+            let diagnostics = try correctnessLogitDiagnostics(
+                from: logits,
+                topK: request.topK
+                    ?? MLXFastConstants.correctnessTopLogits,
+                expectedToken: request.expectedToken
+            )
             state.correctnessCache = cache
             state.correctnessPromptTokenCount = promptTokens.count
             state.correctnessStep = 0
@@ -208,7 +264,10 @@ extension GemmaRuntime {
                 nonce: sessionNonce,
                 ok: true,
                 token: token,
-                topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
+                topLogits: diagnostics.topLogits,
+                expectedTokenLogit: diagnostics.expectedTokenLogit,
+                expectedTokenRank: diagnostics.expectedTokenRank,
+                topLogitMargin: diagnostics.topLogitMargin,
                 expertStats: expertStats(from: weightCache),
                 peakRamGB: peakResidentMemoryGB()
             )
@@ -227,13 +286,22 @@ extension GemmaRuntime {
                 positionOffset: state.correctnessPromptTokenCount + state.correctnessStep
             )
             let token = try GemmaCorrectness.greedyToken(from: logits)
+            let diagnostics = try correctnessLogitDiagnostics(
+                from: logits,
+                topK: request.topK
+                    ?? MLXFastConstants.correctnessTopLogits,
+                expectedToken: request.expectedToken
+            )
             state.correctnessStep += 1
             return RuntimeWorkerResponse(
                 id: request.id,
                 nonce: sessionNonce,
                 ok: true,
                 token: token,
-                topLogits: try topLogits(from: logits, topK: MLXFastConstants.correctnessTopLogits),
+                topLogits: diagnostics.topLogits,
+                expectedTokenLogit: diagnostics.expectedTokenLogit,
+                expectedTokenRank: diagnostics.expectedTokenRank,
+                topLogitMargin: diagnostics.topLogitMargin,
                 expertStats: expertStats(from: weightCache),
                 peakRamGB: peakResidentMemoryGB()
             )
@@ -611,6 +679,8 @@ struct RuntimeWorkerRequest: Codable {
     let seedTokens: [Int]?
     let steps: Int?
     let maxBlockSize: Int?
+    let topK: Int?
+    let expectedToken: Int?
 
     init(
         id: Int,
@@ -619,7 +689,9 @@ struct RuntimeWorkerRequest: Codable {
         token: Int? = nil,
         seedTokens: [Int]? = nil,
         steps: Int? = nil,
-        maxBlockSize: Int? = nil
+        maxBlockSize: Int? = nil,
+        topK: Int? = nil,
+        expectedToken: Int? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -628,6 +700,8 @@ struct RuntimeWorkerRequest: Codable {
         self.seedTokens = seedTokens
         self.steps = steps
         self.maxBlockSize = maxBlockSize
+        self.topK = topK
+        self.expectedToken = expectedToken
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -664,6 +738,11 @@ struct RuntimeWorkerRequest: Codable {
             Int.self,
             forKey: .maxBlockSize
         )
+        topK = try container.decodeIfPresent(Int.self, forKey: .topK)
+        expectedToken = try container.decodeIfPresent(
+            Int.self,
+            forKey: .expectedToken
+        )
     }
 
     func encode(to encoder: Swift.Encoder) throws {
@@ -675,6 +754,8 @@ struct RuntimeWorkerRequest: Codable {
         try container.encodeIfPresent(seedTokens, forKey: .seedTokens)
         try container.encodeIfPresent(steps, forKey: .steps)
         try container.encodeIfPresent(maxBlockSize, forKey: .maxBlockSize)
+        try container.encodeIfPresent(topK, forKey: .topK)
+        try container.encodeIfPresent(expectedToken, forKey: .expectedToken)
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -685,6 +766,8 @@ struct RuntimeWorkerRequest: Codable {
         case seedTokens = "seed_tokens"
         case steps
         case maxBlockSize = "max_block_size"
+        case topK = "top_k"
+        case expectedToken = "expected_token"
     }
 }
 
@@ -724,7 +807,9 @@ func validateExperimentalDecodeBlockRequest(
     }
     guard request.promptTokens == nil,
           request.seedTokens == nil,
-          request.steps == nil
+          request.steps == nil,
+          request.topK == nil,
+          request.expectedToken == nil
     else {
         throw MLXFastError.invalidInput(
             "runtime worker decode_block request contains fields for another request kind"
@@ -777,6 +862,16 @@ struct RuntimeWorkerState {
     var decodeStep = 0
 }
 
+struct RuntimeWorkerPreflightResponse: Codable, Equatable {
+    let ok: Bool
+    let error: String?
+
+    init(ok: Bool, error: String? = nil) {
+        self.ok = ok
+        self.error = error
+    }
+}
+
 struct RuntimeWorkerResponse: Codable {
     let id: Int
     let nonce: String?
@@ -784,6 +879,9 @@ struct RuntimeWorkerResponse: Codable {
     let error: String?
     let token: Int?
     let topLogits: [CorrectnessTraceLogit]?
+    let expectedTokenLogit: Double?
+    let expectedTokenRank: Int?
+    let topLogitMargin: Double?
     let seedToken: Int?
     let tokens: [Int]?
     let expertStats: ExpertStreamingStats?
@@ -803,6 +901,9 @@ struct RuntimeWorkerResponse: Codable {
         error: String? = nil,
         token: Int? = nil,
         topLogits: [CorrectnessTraceLogit]? = nil,
+        expectedTokenLogit: Double? = nil,
+        expectedTokenRank: Int? = nil,
+        topLogitMargin: Double? = nil,
         seedToken: Int? = nil,
         tokens: [Int]? = nil,
         expertStats: ExpertStreamingStats? = nil,
@@ -821,6 +922,9 @@ struct RuntimeWorkerResponse: Codable {
         self.error = error
         self.token = token
         self.topLogits = topLogits
+        self.expectedTokenLogit = expectedTokenLogit
+        self.expectedTokenRank = expectedTokenRank
+        self.topLogitMargin = topLogitMargin
         self.seedToken = seedToken
         self.tokens = tokens
         self.expertStats = expertStats
@@ -861,6 +965,18 @@ struct RuntimeWorkerResponse: Codable {
         topLogits = try container.decodeIfPresent(
             [CorrectnessTraceLogit].self,
             forKey: .topLogits
+        )
+        expectedTokenLogit = try container.decodeIfPresent(
+            Double.self,
+            forKey: .expectedTokenLogit
+        )
+        expectedTokenRank = try container.decodeIfPresent(
+            Int.self,
+            forKey: .expectedTokenRank
+        )
+        topLogitMargin = try container.decodeIfPresent(
+            Double.self,
+            forKey: .topLogitMargin
         )
         seedToken = try container.decodeIfPresent(Int.self, forKey: .seedToken)
         tokens = try container.decodeIfPresent([Int].self, forKey: .tokens)
@@ -910,6 +1026,18 @@ struct RuntimeWorkerResponse: Codable {
         try container.encodeIfPresent(error, forKey: .error)
         try container.encodeIfPresent(token, forKey: .token)
         try container.encodeIfPresent(topLogits, forKey: .topLogits)
+        try container.encodeIfPresent(
+            expectedTokenLogit,
+            forKey: .expectedTokenLogit
+        )
+        try container.encodeIfPresent(
+            expectedTokenRank,
+            forKey: .expectedTokenRank
+        )
+        try container.encodeIfPresent(
+            topLogitMargin,
+            forKey: .topLogitMargin
+        )
         try container.encodeIfPresent(seedToken, forKey: .seedToken)
         try container.encodeIfPresent(tokens, forKey: .tokens)
         try container.encodeIfPresent(expertStats, forKey: .expertStats)
@@ -951,6 +1079,9 @@ struct RuntimeWorkerResponse: Codable {
         case error
         case token
         case topLogits = "top_logits"
+        case expectedTokenLogit = "expected_token_logit"
+        case expectedTokenRank = "expected_token_rank"
+        case topLogitMargin = "top_logit_margin"
         case seedToken = "seed_token"
         case tokens
         case expertStats = "expert_stats"
@@ -1365,6 +1496,111 @@ enum RuntimeWorkerLaunch: Equatable {
     }
 }
 
+extension GemmaRuntime {
+    public static func runPreflightWithWorker(
+        weightsPath: String,
+        worker options: RuntimeWorkerOptions
+    ) throws {
+        guard options.requestTimeoutSeconds.isFinite,
+              options.requestTimeoutSeconds > 0,
+              options.shutdownTimeoutSeconds.isFinite,
+              options.shutdownTimeoutSeconds >= 0,
+              options.terminationGraceSeconds.isFinite,
+              options.terminationGraceSeconds >= 0
+        else {
+            throw MLXFastError.invalidInput(
+                "runtime worker preflight timeouts must be valid"
+            )
+        }
+
+        let process = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        let workerArguments = [
+            "preflight",
+            "--weights",
+            weightsPath,
+        ]
+        if let sandboxProfilePath = options.sandboxProfilePath {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
+            process.arguments = [
+                "-f",
+                sandboxProfilePath,
+                options.executablePath,
+            ] + workerArguments
+        } else {
+            process.executableURL = URL(fileURLWithPath: options.executablePath)
+            process.arguments = workerArguments
+        }
+        process.environment = sanitizedRuntimeWorkerEnvironment(
+            ProcessInfo.processInfo.environment
+        )
+        process.standardInput = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+
+        let stderrDrain = WorkerStderrDrain(
+            handle: stderr.fileHandleForReading,
+            emit: options.forwardsWorkerStderr ? nil : { _ in }
+        )
+        let watchdog = RuntimeWorkerWatchdog(
+            process: process,
+            timeoutSeconds: options.requestTimeoutSeconds,
+            terminationGraceSeconds: options.terminationGraceSeconds
+        )
+        let output = BufferedFileLineReader(
+            handle: stdout.fileHandleForReading
+        )
+        do {
+            guard let data = try output.readLine() else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker preflight closed stdout without a response"
+                )
+            }
+            let response = try JSONDecoder().decode(
+                RuntimeWorkerPreflightResponse.self,
+                from: data
+            )
+            process.waitUntilExit()
+            if watchdog.cancelAndReturnDidFire() {
+                throw MLXFastError.invalidInput(
+                    "runtime worker preflight timed out"
+                )
+            }
+            _ = stderrDrain.drainedOutput(
+                timeoutSeconds: options.shutdownTimeoutSeconds
+                    + options.terminationGraceSeconds + 1
+            )
+            guard response.ok, process.terminationStatus == 0 else {
+                throw MLXFastError.invalidInput(
+                    response.error
+                        ?? "runtime worker preflight exited with status "
+                        + "\(process.terminationStatus)"
+                )
+            }
+        } catch {
+            let timedOut = watchdog.cancelAndReturnDidFire()
+            if process.isRunning {
+                _ = stopRuntimeWorkerProcess(
+                    process,
+                    timeoutSeconds: options.shutdownTimeoutSeconds
+                )
+            }
+            _ = stderrDrain.drainedOutput(
+                timeoutSeconds: options.shutdownTimeoutSeconds
+                    + options.terminationGraceSeconds + 1
+            )
+            if timedOut {
+                throw MLXFastError.invalidInput(
+                    "runtime worker preflight timed out"
+                )
+            }
+            throw error
+        }
+    }
+}
+
 final class RuntimeWorkerClient {
     private let process: Process
     private let input: FileHandle
@@ -1481,17 +1717,29 @@ final class RuntimeWorkerClient {
         )
     }
 
-    func beginTeacherForcedCorrectness(promptTokens: [Int]) throws -> RuntimeWorkerResponse {
+    func beginTeacherForcedCorrectness(
+        promptTokens: [Int],
+        topK: Int? = nil,
+        expectedToken: Int? = nil
+    ) throws -> RuntimeWorkerResponse {
         try send(
             kind: "correctness_begin",
-            promptTokens: promptTokens
+            promptTokens: promptTokens,
+            topK: topK,
+            expectedToken: expectedToken
         )
     }
 
-    func teacherForcedCorrectnessStep(previousToken: Int) throws -> RuntimeWorkerResponse {
+    func teacherForcedCorrectnessStep(
+        previousToken: Int,
+        topK: Int? = nil,
+        expectedToken: Int? = nil
+    ) throws -> RuntimeWorkerResponse {
         try send(
             kind: "correctness_step",
-            token: previousToken
+            token: previousToken,
+            topK: topK,
+            expectedToken: expectedToken
         )
     }
 
@@ -1561,7 +1809,9 @@ final class RuntimeWorkerClient {
         token: Int? = nil,
         seedTokens: [Int]? = nil,
         steps: Int? = nil,
-        maxBlockSize: Int? = nil
+        maxBlockSize: Int? = nil,
+        topK: Int? = nil,
+        expectedToken: Int? = nil
     ) throws -> RuntimeWorkerResponse {
         guard process.isRunning else {
             throw MLXFastError.invalidInput("runtime worker exited before request \(kind): \(workerExitDiagnostic())")
@@ -1575,7 +1825,9 @@ final class RuntimeWorkerClient {
             token: token,
             seedTokens: seedTokens,
             steps: steps,
-            maxBlockSize: maxBlockSize
+            maxBlockSize: maxBlockSize,
+            topK: topK,
+            expectedToken: expectedToken
         )
         var data = try encoder.encode(request)
         guard data.count <= BufferedFileLineReader.defaultMaximumLineByteCount else {

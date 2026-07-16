@@ -632,7 +632,10 @@ jobs:
               MLXFAST_METAL_TOOLCHAIN_IDENTIFIER="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" /bin/bash -c '
               set -euo pipefail
               cd "${MJOB_WS}"
-              /usr/bin/swift build -c release
+              # TODO(security): Move trusted and participant products to
+              # independent SwiftPM build/cache roots.
+              /usr/bin/swift build -c release --product mlxfast-swift
+              /usr/bin/swift build -c release --product mlxfast-runtime-worker
               if [[ -s .mlxfast-cache/mlx.metallib ]]; then
                 /bin/cp .mlxfast-cache/mlx.metallib .build/release/mlx.metallib
                 echo "mtp-benchmark: restored trusted MLX Metal library"
@@ -642,6 +645,7 @@ jobs:
               /bin/chmod 0644 .build/release/mlx.metallib
             '
           test -x "${MLXFAST_JOB_WS}/.build/release/mlxfast-swift"
+          test -x "${MLXFAST_JOB_WS}/.build/release/mlxfast-runtime-worker"
           test -s "${MLXFAST_JOB_WS}/.build/release/mlx.metallib"
           # Pin the trusted harness artifacts NOW (TOCTOU defense); every
           # later phase that executes the binary as bench re-verifies.

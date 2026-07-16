@@ -177,7 +177,8 @@ else
   REFERENCE_PATH="${REFERENCE_DEFAULT_DIR}"
 fi
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
-MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
+RUNTIME_WORKER_BIN="${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-$(dirname "${SWIFT_BIN}")/mlxfast-runtime-worker}"
+MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${RUNTIME_WORKER_BIN}")/mlx.metallib}"
 SANDBOX_PROFILE="${MLXFAST_SANDBOX_PROFILE:-tools/deny-network.sb}"
 SOURCE_HASH_PATH="${WEIGHTS_PATH}/.benchmark-source.sha256"
 if [[ "${LOCAL_ITERATE}" == "1" && -z "${MLXFAST_INTEGRITY_PATH:-}" ]]; then
@@ -497,10 +498,9 @@ handle_benchmark_abort_signal() {
 }
 
 # --- Local run memory guard and worker teardown --------------------------------
-# The Gemma 4 31B text tower is ~17 GB and RAM-resident: in the default
-# configuration it lives inside the `mlxfast-swift runtime-worker` subprocess
-# a run spawns (with MLXFAST_USE_RUNTIME_WORKER=0 it lives in the
-# `mlxfast-swift benchmark` process itself). ONE resident copy fits a 36 GB
+# The Gemma 4 31B text tower is ~17 GB and RAM-resident: it lives inside the
+# sibling `mlxfast-runtime-worker runtime-worker` subprocess that the trusted
+# `mlxfast-swift benchmark` process spawns. ONE resident copy fits a 36 GB
 # machine; TWO do not. Two copies happen when local runs overlap, or when a
 # new run starts while an orphaned model-holding process from a previous
 # aborted run is still alive. Local modes therefore:
@@ -525,11 +525,10 @@ handle_benchmark_abort_signal() {
 #                                    replaces the pgrep/ps resident-process
 #                                    listing (empty output = nothing found)
 LOCAL_RUN_LOCK_OWNED=""
-# Matches the argv of every mlxfast process that holds (or is loading) the
-# model: the runtime worker in any wrapping (bare or under sandbox-exec), and
-# the in-process model-holding CLI subcommands used when the worker is
-# disabled or by golden-generation tooling.
-readonly RESIDENT_MODEL_PROCESS_PATTERN='runtime-worker[[:space:]]+--weights|mlxfast-swift[[:space:]]+(benchmark|correctness|correctness-trace|generate-golden|generate-gpqa-answers|attach-free-run-gate)'
+# Matches the argv of the participant worker in any wrapping (bare or under
+# sandbox-exec). The command-name suffix also keeps detection compatible with
+# workers launched by an older checkout.
+readonly RESIDENT_MODEL_PROCESS_PATTERN='runtime-worker[[:space:]]+--weights'
 
 local_run_guard_enabled() {
   [[ "${MLXFAST_LOCAL_RUN_GUARD:-1}" != "0" ]] || return 1
@@ -1177,11 +1176,11 @@ write_runtime_worker_sandbox_profile() {
   local profile
   local golden_absolute
   local private_dir_absolute
-  local swift_absolute
+  local worker_absolute
   profile="$(mktemp "${TMPDIR:-/tmp}/mlxfast-runtime-worker.XXXXXX")"
   RUNTIME_WORKER_SANDBOX_PROFILE_OWNED="${profile}"
   golden_absolute="$(absolute_path "${GOLDEN_PATH}")"
-  swift_absolute="$(absolute_path "${SWIFT_BIN}")"
+  worker_absolute="$(absolute_path "${RUNTIME_WORKER_BIN}")"
   {
     cat <<EOF
 (version 1)
@@ -1189,7 +1188,7 @@ write_runtime_worker_sandbox_profile() {
 (deny network*)
 (deny process-fork)
 (deny process-exec*)
-(allow process-exec (literal "$(sandbox_escape "${swift_absolute}")"))
+(allow process-exec (literal "$(sandbox_escape "${worker_absolute}")"))
 (deny file-write*)
 (allow file-write* (literal "/dev/null"))
 (deny file-read* (literal "$(sandbox_escape "${golden_absolute}")"))
@@ -1562,17 +1561,26 @@ if [[ ! -s "${MLX_METALLIB}" ]]; then
   exit 1
 fi
 
-if [[ "${MLXFAST_IN_SANDBOX:-0}" != "1" && ! -x "${SWIFT_BIN}" ]]; then
-  echo "benchmark.sh: Swift release binary missing; building"
+swift_build_required() {
+  [[ ! -x "${SWIFT_BIN}" ]] \
+    || [[ "${USE_RUNTIME_WORKER}" == "1" && ! -x "${RUNTIME_WORKER_BIN}" ]]
+}
+
+if [[ "${MLXFAST_IN_SANDBOX:-0}" != "1" ]] && swift_build_required; then
+  echo "benchmark.sh: trusted CLI or participant runtime worker missing; building"
   mkdir -p .build/clang-module-cache
   export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build/clang-module-cache}"
-  swift build -c release
+  # TODO(security): Give the trusted CLI and participant worker independent
+  # SwiftPM build/cache roots instead of sharing .build.
+  swift build -c release --product mlxfast-swift
+  swift build -c release --product mlxfast-runtime-worker
 fi
 
-# When the runtime worker is disabled, sandbox this whole script so model code
-# cannot use the network. With the worker enabled, do not sandbox the parent:
-# Blacksmith rejects nested sandbox-exec. Submitted transform runs through
-# run-offline.sh below, and submitted model execution runs in the worker sandbox.
+# Preserve the legacy no-worker wrapper path under the whole-script sandbox
+# while it reaches the trusted CLI's fail-closed rejection. With the worker
+# enabled, do not sandbox the parent: Blacksmith rejects nested sandbox-exec.
+# Submitted transform runs through run-offline.sh below, and submitted model
+# execution runs in the participant worker sandbox.
 if [[ "${USE_RUNTIME_WORKER}" != "1" && "${MLXFAST_IN_SANDBOX:-0}" != "1" && "${MLXFAST_NO_SANDBOX:-0}" != "1" ]]; then
   if ! command -v sandbox-exec >/dev/null 2>&1; then
     echo "benchmark.sh: sandbox-exec not found (the benchmark requires macOS)." >&2
@@ -1606,13 +1614,17 @@ enforce_official_sandbox
 report_local_iterate_git_base
 
 if [[ ! -x "${SWIFT_BIN}" ]]; then
-  echo "benchmark.sh: Swift release binary missing at ${SWIFT_BIN}" >&2
+  echo "benchmark.sh: trusted Swift CLI missing at ${SWIFT_BIN}" >&2
+  exit 1
+fi
+if [[ "${USE_RUNTIME_WORKER}" == "1" && ! -x "${RUNTIME_WORKER_BIN}" ]]; then
+  echo "benchmark.sh: participant runtime worker missing at ${RUNTIME_WORKER_BIN}" >&2
   exit 1
 fi
 
 write_runtime_worker_sandbox_profile
 export MLXFAST_USE_RUNTIME_WORKER="${USE_RUNTIME_WORKER}"
-MLXFAST_RUNTIME_WORKER_EXECUTABLE="$(absolute_path "${SWIFT_BIN}")"
+MLXFAST_RUNTIME_WORKER_EXECUTABLE="$(absolute_path "${RUNTIME_WORKER_BIN}")"
 export MLXFAST_RUNTIME_WORKER_EXECUTABLE
 export MLXFAST_REFERENCE_DIR="${REFERENCE_PATH}"
 

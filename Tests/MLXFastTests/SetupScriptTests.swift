@@ -18,8 +18,15 @@ func setupScriptCoordinatesCacheAndMetallibState() throws {
     #expect(setup.contains("mktemp \"${lock_path}.tmp.XXXXXX\""))
     #expect(setup.contains("metal_toolchain_identifier"))
     #expect(setup.contains("export TOOLCHAINS=\"${identifier}\""))
+    #expect(setup.contains("RUNTIME_WORKER_BIN=\"${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-$(dirname \"${SWIFT_BIN}\")/mlxfast-runtime-worker}\""))
+    #expect(setup.contains("MLX_METALLIB=\"${MLXFAST_MLX_METALLIB:-$(dirname \"${RUNTIME_WORKER_BIN}\")/mlx.metallib}\""))
+    #expect(setup.contains("swift build -c release --product mlxfast-swift"))
+    #expect(setup.contains("swift build -c release --product mlxfast-runtime-worker"))
+    #expect(setup.contains("participant runtime worker missing at ${RUNTIME_WORKER_BIN}"))
+    #expect(setup.contains("TODO(security): Give the trusted CLI and participant worker independent"))
     #expect(metallibBuilder.contains("-DMLX_BUILD_GGUF=OFF"))
-    #expect(metallibBuilder.contains("export CLANG_MODULE_CACHE_PATH="))
+    #expect(metallibBuilder.contains("export CLANG_MODULE_CACHE_PATH"))
+    #expect(metallibBuilder.contains("CLANG_MODULE_CACHE_PATH=\"$(repository_path"))
     #expect(metallibBuilder.contains("HOME=\"${METAL_COMPILER_HOME}\" \"${CMAKE_BIN}\""))
 }
 

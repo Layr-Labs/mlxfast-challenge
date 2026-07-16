@@ -1,7 +1,7 @@
 import Foundation
 @testable import MLXFastCore
-@testable import MLXFastHarness
 @testable import MLXFastModel
+@testable import MLXFastRuntimeWorkerSupport
 import Testing
 
 @Test
@@ -707,29 +707,44 @@ func trainedMTPOptionsFailClosedWithoutAssistantRequirement() throws {
 
 @Test
 func trainedMTPTrackIsExplicitAndSerialBenchmarkRemainsUnchanged() throws {
-    let source = try String(
+    let trustedSource = try String(
         contentsOfFile: "Sources/MLXFastCLI/main.swift",
         encoding: .utf8
     )
-    #expect(source.contains("case \"mtp-benchmark\":"))
-    #expect(source.contains("case \"mtp-runtime-worker\":"))
-    #expect(source.contains("--require-trained-assistant"))
-    #expect(source.contains("[--block-size N] [--tokens N]"))
-    #expect(source.contains("[--target-verification exact-pair|serial]"))
-    #expect(source.contains("mtp-benchmark requires --target-source PATH"))
-    #expect(source.contains("mtp-benchmark requires --assistant PATH"))
+    let workerSource = try String(
+        contentsOfFile: "Sources/MLXFastRuntimeWorkerCLI/main.swift",
+        encoding: .utf8
+    )
+    #expect(trustedSource.contains("case \"mtp-benchmark\":"))
+    #expect(!trustedSource.contains("case \"runtime-worker\":"))
+    #expect(!trustedSource.contains("case \"mtp-runtime-worker\":"))
+    #expect(workerSource.contains("case \"runtime-worker\":"))
+    #expect(workerSource.contains("case \"preflight\":"))
+    #expect(workerSource.contains("case \"mtp-runtime-worker\":"))
+    #expect(workerSource.contains("GemmaRuntime.runPreflightWorker"))
+    #expect(trustedSource.contains("GemmaRuntime.runPreflightWithWorker"))
+    #expect(workerSource.contains("mlxfast-runtime-worker runtime-worker"))
+    #expect(workerSource.contains("[\"help\", \"--help\", \"-h\"]"))
+    #expect(trustedSource.contains("Bundle.main.executableURL"))
+    #expect(trustedSource.contains("_NSGetExecutablePath"))
+    #expect(trustedSource.contains("try currentExecutablePath()"))
+    #expect(trustedSource.contains("--require-trained-assistant"))
+    #expect(trustedSource.contains("[--block-size N] [--tokens N]"))
+    #expect(trustedSource.contains("[--target-verification exact-pair|serial]"))
+    #expect(trustedSource.contains("mtp-benchmark requires --target-source PATH"))
+    #expect(trustedSource.contains("mtp-benchmark requires --assistant PATH"))
 
     let benchmarkStart = try #require(
-        source.range(of: "private static func runBenchmark(")
+        trustedSource.range(of: "private static func runBenchmark(")
     )
     let trainedStart = try #require(
-        source.range(
+        trustedSource.range(
             of: "private static func runExperimentalTrainedMTPBenchmark(",
-            range: benchmarkStart.upperBound..<source.endIndex
+            range: benchmarkStart.upperBound..<trustedSource.endIndex
         )
     )
     let serialBenchmarkBody =
-        source[benchmarkStart.lowerBound..<trainedStart.lowerBound]
+        trustedSource[benchmarkStart.lowerBound..<trainedStart.lowerBound]
     #expect(!serialBenchmarkBody.contains("experimentalTrainedMTPBenchmark"))
     #expect(!serialBenchmarkBody.contains("--assistant"))
     #expect(!serialBenchmarkBody.contains("mtp_decode_block"))
@@ -887,7 +902,7 @@ func trainedMTPPublicParityRuntimeGate() throws {
         environment["MLXFAST_MTP_PARITY_GOLDEN_PATH"]
     )
     let executable = environment["MLXFAST_MTP_EXECUTABLE"]
-        ?? ".build/release/mlxfast-swift"
+        ?? ".build/release/mlxfast-runtime-worker"
     let totalTokenCount = Int(
         environment["MLXFAST_MTP_PARITY_TOKENS"] ?? "128"
     ) ?? 128

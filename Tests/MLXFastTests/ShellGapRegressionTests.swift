@@ -421,6 +421,7 @@ private func runShellGapBenchmark(
         // abort on a genuinely resident model on the host machine.
         "MLXFAST_LOCAL_RUN_GUARD": "0",
         "MLXFAST_SWIFT_BIN": fixture.swift.path,
+        "MLXFAST_RUNTIME_WORKER_EXECUTABLE": fixture.swift.path,
         "MLXFAST_MLX_METALLIB": fixture.metallib.path,
         "MLXFAST_WEIGHTS_PATH": fixture.weights.path,
         "MLXFAST_REFERENCE_DIR": fixture.reference.path,

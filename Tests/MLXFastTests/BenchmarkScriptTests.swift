@@ -88,7 +88,10 @@ func benchmarkFailsFastWhenSetupArtifactsAreMissing() throws {
         benchmark.range(of: "if [[ ! -s \"${MLX_METALLIB}\" ]]")
     )
     let automaticBuild = try #require(
-        benchmark.range(of: "benchmark.sh: Swift release binary missing; building")
+        benchmark.range(
+            of:
+                "benchmark.sh: trusted CLI or participant runtime worker missing; building"
+        )
     )
     #expect(prerequisite.lowerBound < automaticBuild.lowerBound)
 
@@ -278,7 +281,9 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(workflow.contains("(cd \"${MLXFAST_JOB_WS}\" && swift package resolve)"))
     let buildStep = String(workflow[buildRange.lowerBound..<stageMetalCacheRange.lowerBound])
     #expect(buildStep.contains("sudo -n \"${MLXFAST_BENCH_EXEC}\""))
-    #expect(buildStep.contains("/usr/bin/swift build -c release"))
+    #expect(buildStep.contains("/usr/bin/swift build -c release --product mlxfast-swift"))
+    #expect(buildStep.contains("/usr/bin/swift build -c release --product mlxfast-runtime-worker"))
+    #expect(buildStep.contains("TODO(security): Move trusted and participant products"))
     #expect(buildStep.contains("if [[ -s .mlxfast-cache/mlx.metallib ]]"))
     #expect(buildStep.contains("/bin/cp .mlxfast-cache/mlx.metallib .build/release/mlx.metallib"))
     #expect(buildStep.contains("tools/build-mlx-metallib.sh"))
@@ -338,9 +343,13 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(prepareStep.contains("mv \"${MLXFAST_JOB_WS}/.mlxfast-cache/trusted-build\" \"${MLXFAST_JOB_WS}/.build\""))
     let transformStep = String(workflow[transformRange.lowerBound..<publicGateRange.lowerBound])
     #expect(transformStep.contains("sudo -n \"${MLXFAST_BENCH_EXEC}\""))
+    #expect(transformStep.contains("exec .build/release/mlxfast-swift transform"))
     #expect(transformStep.contains("--reference \"${MLXFAST_REFERENCE_DIR}\""))
     #expect(transformStep.contains("--output weights"))
     #expect(transformStep.contains("test -f \"${MLXFAST_JOB_WS}/weights/config.json\""))
+    #expect(workflow.contains("exec .build/release/mlxfast-swift correctness"))
+    #expect(!workflow.contains("mlxfast-runtime-worker transform"))
+    #expect(!workflow.contains("mlxfast-runtime-worker correctness"))
     let hashWeightsStep = String(workflow[hashWeightsRange.lowerBound..<stageAuditRange.lowerBound])
     #expect(hashWeightsStep.contains("if: ${{ inputs.run_benchmark }}"))
     #expect(hashWeightsStep.contains("hash-weights-directory.sh \"${MLXFAST_JOB_WS}/weights\" weights.sha256"))
@@ -362,8 +371,11 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(ci.contains("'#!/usr/bin/env sh'"))
     #expect(ci.contains("\n                bash -n \"${script}\"\n"))
     #expect(ci.contains("\n                sh -n \"${script}\"\n"))
+    #expect(ci.contains("swift build -c release --product mlxfast-swift"))
+    #expect(ci.contains("swift build -c release --product mlxfast-runtime-worker"))
     #expect(ci.contains("swift test -c release"))
     #expect(ci.contains("test -x .build/release/mlxfast-swift"))
+    #expect(ci.contains("test -x .build/release/mlxfast-runtime-worker"))
     #expect(!ci.contains("swift test --filter"))
 }
 
@@ -401,7 +413,9 @@ func benchmarkWorkflowProbesAndEnforcesRuntimeWorkerSandbox() throws {
         )
     )
     let automaticBuild = try #require(
-        benchmark.range(of: "if [[ \"${MLXFAST_IN_SANDBOX:-0}\" != \"1\" && ! -x \"${SWIFT_BIN}\" ]]; then")
+        benchmark.range(
+            of: "if [[ \"${MLXFAST_IN_SANDBOX:-0}\" != \"1\" ]] && swift_build_required; then"
+        )
     )
     #expect(setupGuard.lowerBound < automaticBuild.lowerBound)
 
@@ -645,6 +659,12 @@ func benchmarkPinsAndVerifiesTrustedHarnessAcrossScoredPhases() throws {
         contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
+    let pinScript = try String(
+        contentsOfFile: ".github/scripts/pin-trusted-harness.sh",
+        encoding: .utf8
+    )
+    #expect(pinScript.contains("TODO(security): Revisit this pin's scope"))
+    #expect(!pinScript.contains("\".build/release/mlxfast-runtime-worker\""))
 
     // Pin is captured at the END of the trusted build, before the submitted
     // transform (the first bench step that can tamper), and re-verified before
@@ -1845,9 +1865,10 @@ func officialCorrectnessRunsEnforceWorkerSandboxThroughBenchExec() throws {
     let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
 
     #expect(cli.contains("let officialRun = environmentValue(\"MLXFAST_OFFICIAL_BENCHMARK_RUN\", fallback: \"0\") == \"1\""))
-    #expect(cli.contains("official benchmark runs require the runtime worker; unset MLXFAST_USE_RUNTIME_WORKER"))
+    #expect(cli.contains("mlxfast-swift requires the participant runtime worker; unset MLXFAST_USE_RUNTIME_WORKER"))
     #expect(cli.contains("official benchmark runs require the runtime worker sandbox; unset MLXFAST_NO_SANDBOX"))
     #expect(cli.contains("official benchmark runs require a runtime worker sandbox profile; none was configured or derivable"))
+    #expect(cli.contains(".appendingPathComponent(\"mlxfast-runtime-worker\")"))
 
     let workflow = try String(
         contentsOfFile: ".github/workflows/benchmark.yml",
@@ -1898,7 +1919,8 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
     #expect(benchmark.contains("MLXFAST_PRIVATE_DIR"))
     #expect(benchmark.contains("pwd -P"))
     #expect(benchmark.contains("cd -P"))
-    #expect(benchmark.contains("MLXFAST_RUNTIME_WORKER_EXECUTABLE=\"$(absolute_path \"${SWIFT_BIN}\")\""))
+    #expect(benchmark.contains("RUNTIME_WORKER_BIN=\"${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-$(dirname \"${SWIFT_BIN}\")/mlxfast-runtime-worker}\""))
+    #expect(benchmark.contains("MLXFAST_RUNTIME_WORKER_EXECUTABLE=\"$(absolute_path \"${RUNTIME_WORKER_BIN}\")\""))
     #expect(benchmark.contains("export MLXFAST_RUNTIME_WORKER_EXECUTABLE"))
     #expect(benchmark.contains("export MLXFAST_REFERENCE_DIR=\"${REFERENCE_PATH}\""))
     #expect(benchmark.contains("(deny file-read* (subpath"))
@@ -1908,6 +1930,8 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
     #expect(benchmark.contains("(deny file-write*)"))
     #expect(benchmark.contains("(allow file-write* (literal \"/dev/null\"))"))
     #expect(benchmark.contains("(allow process-exec (literal"))
+    #expect(benchmark.contains("worker_absolute=\"$(absolute_path \"${RUNTIME_WORKER_BIN}\")\""))
+    #expect(!benchmark.contains("swift_absolute=\"$(absolute_path \"${SWIFT_BIN}\")\""))
     #expect(!benchmark.contains("(allow network* (remote ip \"localhost:*\"))"))
     #expect(!benchmark.contains("(allow network* (local unix-socket))"))
     // Private-material locations and secrets must not reach the worker's
@@ -3287,7 +3311,7 @@ func localRunAbortsWhenAModelHoldingProcessIsAlreadyResident() throws {
         // Testing seam (same pattern as MLXFAST_GPU_TEMP_CMD): stand in for
         // the pgrep/ps listing with one fake resident worker line.
         "MLXFAST_LOCAL_ORPHAN_SCAN_CMD":
-            "printf '12345 1 17301504 mlxfast-swift runtime-worker --weights weights\\n'",
+            "printf '12345 1 17301504 mlxfast-runtime-worker runtime-worker --weights weights\\n'",
     ])
     let stderrPipe = Pipe()
     process.standardError = stderrPipe
@@ -3298,7 +3322,7 @@ func localRunAbortsWhenAModelHoldingProcessIsAlreadyResident() throws {
 
     #expect(process.terminationStatus != 0)
     #expect(stderr.contains("a model-holding mlxfast process is already running"))
-    #expect(stderr.contains("mlxfast-swift runtime-worker --weights weights"))
+    #expect(stderr.contains("mlxfast-runtime-worker runtime-worker --weights weights"))
     #expect(stderr.contains("kill <pid>"))
     #expect(stderr.contains("MLXFAST_LOCAL_RUN_GUARD=0"))
     // The guard fires before any benchmark work: the Swift binary never ran,
@@ -4589,5 +4613,14 @@ private func benchmarkTestEnvironment(
     // tests), so the local memory guard defaults OFF here; guard-specific
     // tests re-enable it with their own lock dir / scan seam.
     environment["MLXFAST_LOCAL_RUN_GUARD"] = "0"
-    return environment.merging(overrides) { _, new in new }
+    var merged = environment.merging(overrides) { _, new in new }
+    // Fake trusted CLIs in shell tests do not spawn a model process. Point the
+    // compatibility override at that executable so benchmark.sh's paired
+    // product readiness check does not attempt a real Swift build.
+    if merged["MLXFAST_RUNTIME_WORKER_EXECUTABLE"] == nil,
+       let swiftBinary = merged["MLXFAST_SWIFT_BIN"]
+    {
+        merged["MLXFAST_RUNTIME_WORKER_EXECUTABLE"] = swiftBinary
+    }
+    return merged
 }

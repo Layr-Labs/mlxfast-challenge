@@ -1,22 +1,36 @@
 #!/usr/bin/env bash
 # Build mlx.metallib for the SwiftPM-linked MLX runtime and place it next to
-# the mlxfast-swift executable, where Cmlx searches first.
+# the participant worker (and the sibling mlxfast-swift executable), where
+# Cmlx searches first.
 set -euo pipefail
 
-ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd)
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
 cd "${ROOT_DIR}"
 
-BUILD_CONFIGURATION="${MLXFAST_SWIFT_CONFIGURATION:-release}"
-SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/${BUILD_CONFIGURATION}/mlxfast-swift}"
-OUTPUT_PATH="${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}"
+repository_path() {
+  local candidate="$1"
+  if [[ "${candidate}" == /* ]]; then
+    printf '%s\n' "${candidate}"
+  else
+    printf '%s/%s\n' "${ROOT_DIR}" "${candidate#./}"
+  fi
+}
 
-MLX_SWIFT_CHECKOUT="${MLXFAST_MLX_SWIFT_CHECKOUT:-.build/checkouts/mlx-swift}"
-MLX_SOURCE="${MLX_SWIFT_CHECKOUT}/Source/Cmlx/mlx"
-METAL_CPP_SOURCE="${MLX_SWIFT_CHECKOUT}/Source/Cmlx/metal-cpp"
-JSON_SOURCE="${MLX_SWIFT_CHECKOUT}/Source/Cmlx/json"
-FMT_SOURCE="${MLX_SWIFT_CHECKOUT}/Source/Cmlx/fmt"
-CMAKE_BUILD_DIR="${MLXFAST_MLX_METAL_BUILD_DIR:-.build/mlx-metal}"
-BUILD_LOCK_DIR="${MLXFAST_MLX_METAL_BUILD_LOCK_DIR:-${CMAKE_BUILD_DIR}.mlxfast-build.lock}"
+BUILD_CONFIGURATION="${MLXFAST_SWIFT_CONFIGURATION:-release}"
+SWIFT_BIN="$(repository_path "${MLXFAST_SWIFT_BIN:-.build/${BUILD_CONFIGURATION}/mlxfast-swift}")"
+OUTPUT_PATH="$(repository_path \
+  "${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}")"
+
+MLX_SWIFT_VENDOR="${ROOT_DIR}/Vendor/mlx-swift"
+# TODO(security): Extend fingerprint/hash coverage over every vendored Metal
+# source consumed by this AOT build before relying on cached metallib artifacts.
+MLX_SOURCE="${MLX_SWIFT_VENDOR}/Source/Cmlx/mlx"
+METAL_CPP_SOURCE="${MLX_SWIFT_VENDOR}/Source/Cmlx/metal-cpp"
+JSON_SOURCE="${MLX_SWIFT_VENDOR}/Source/Cmlx/json"
+FMT_SOURCE="${MLX_SWIFT_VENDOR}/Source/Cmlx/fmt"
+CMAKE_BUILD_DIR="$(repository_path "${MLXFAST_MLX_METAL_BUILD_DIR:-.build/mlx-metal}")"
+BUILD_LOCK_DIR="$(repository_path \
+  "${MLXFAST_MLX_METAL_BUILD_LOCK_DIR:-${CMAKE_BUILD_DIR}.mlxfast-build.lock}")"
 BUILD_LOCK_TIMEOUT_SECONDS="${MLXFAST_MLX_METAL_BUILD_LOCK_TIMEOUT_SECONDS:-1800}"
 BUILD_LOCK_STALE_SECONDS="${MLXFAST_MLX_METAL_BUILD_LOCK_STALE_SECONDS:-60}"
 BUILD_LOCK_HELD=0
@@ -25,9 +39,12 @@ BUILD_LOCK_OWNER_TEMP=""
 BUILD_LOCK_GENERATION_DIR=""
 BUILD_LOCK_INITIALIZING_DIR=""
 PUBLISH_TEMP_PATH=""
-export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${ROOT_DIR}/.build/clang-module-cache}"
+export CLANG_MODULE_CACHE_PATH
+CLANG_MODULE_CACHE_PATH="$(repository_path \
+  "${CLANG_MODULE_CACHE_PATH:-.build/clang-module-cache}")"
 mkdir -p "${CLANG_MODULE_CACHE_PATH}"
-METAL_COMPILER_HOME="${MLXFAST_METAL_COMPILER_HOME:-${CMAKE_BUILD_DIR}/.mlxfast-home}"
+METAL_COMPILER_HOME="$(repository_path \
+  "${MLXFAST_METAL_COMPILER_HOME:-${CMAKE_BUILD_DIR}/.mlxfast-home}")"
 mkdir -p "${METAL_COMPILER_HOME}"
 
 find_cmake() {
@@ -515,14 +532,9 @@ fi
 
 acquire_build_lock
 
-if [[ ! -d "${MLX_SOURCE}" ]]; then
-  echo "build-mlx-metallib.sh: resolving Swift package dependencies"
-  swift package resolve
-fi
-
 for required_path in "${MLX_SOURCE}" "${METAL_CPP_SOURCE}" "${JSON_SOURCE}" "${FMT_SOURCE}"; do
   if [[ ! -d "${required_path}" ]]; then
-    echo "build-mlx-metallib.sh: required MLX Swift source path is missing: ${required_path}" >&2
+    echo "build-mlx-metallib.sh: required vendored MLX Swift source path is missing: ${required_path}" >&2
     exit 1
   fi
 done

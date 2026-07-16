@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 @testable import MLXFastCore
 @testable import MLXFastModel
-@testable import MLXFastHarness
+@testable import MLXFastRuntimeWorkerSupport
 import Testing
 
 @Test
@@ -326,7 +326,7 @@ func runtimeWorkerEnvironmentDropsEverythingOutsideTheAllowlist() {
         "MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN": "3.6",
         "MLXFAST_REFERENCE_DIR": "/private/reference",
         "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE": "/tmp/profile.sb",
-        "MLXFAST_RUNTIME_WORKER_EXECUTABLE": "/ws/.build/release/mlxfast-swift",
+        "MLXFAST_RUNTIME_WORKER_EXECUTABLE": "/ws/.build/release/mlxfast-runtime-worker",
         "MLXFAST_WEIGHTS_PATH": "weights",
         "MLXFAST_MAX_WEIGHTS_BYTES": "42",
         // Allowlisted entries that must survive with their exact values.
@@ -420,7 +420,7 @@ func runtimeWorkerEnvironmentIsIdenticalAcrossPipelinePhases() {
         "__CF_USER_TEXT_ENCODING": "0x1F5:0x0:0x0",
         "MLXFAST_OFFICIAL_BENCHMARK_RUN": "1",
         "MLXFAST_USE_RUNTIME_WORKER": "1",
-        "MLXFAST_RUNTIME_WORKER_EXECUTABLE": "/ws/.build/release/mlxfast-swift",
+        "MLXFAST_RUNTIME_WORKER_EXECUTABLE": "/ws/.build/release/mlxfast-runtime-worker",
         "MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE": "/tmp/mlxfast-runtime-worker.gates.sb",
         "MLXFAST_REFERENCE_DIR": "/opt/bench-runner/cache/reference",
         "MLXFAST_COMMIT_SHA": "5f95c4bdce07a0ef79ea350c91d9eb0d7476cf2f",
@@ -1500,35 +1500,6 @@ func runtimeWorkerClientRejectsNonfiniteTimeoutsBeforeLaunch() throws {
     #expect(throws: MLXFastError.self) {
         _ = try RuntimeWorkerClient(options: options, weightsPath: "/does/not/exist")
     }
-}
-
-// The worker's orphan self-reaper is what frees the ~17 GB model residency
-// when the harness parent dies while the worker is NOT blocked on protocol
-// stdin (most importantly during the minutes-long model load): stdin EOF is
-// never observed there, so without the reaper the orphan keeps the model
-// resident and the next local run double-loads into an out-of-memory.
-@Test
-func runtimeWorkerOrphanReaperFiresOnceTheParentIsGone() {
-    let fired = DispatchSemaphore(value: 0)
-    let thread = GemmaRuntime.startRuntimeWorkerOrphanReaper(
-        pollIntervalSeconds: 0.01,
-        isOrphaned: { true },
-        onOrphaned: { fired.signal() }
-    )
-    defer { thread.cancel() }
-    #expect(fired.wait(timeout: .now() + 2) == .success)
-}
-
-@Test
-func runtimeWorkerOrphanReaperStaysQuietWhileTheParentIsAlive() {
-    let fired = DispatchSemaphore(value: 0)
-    let thread = GemmaRuntime.startRuntimeWorkerOrphanReaper(
-        pollIntervalSeconds: 0.01,
-        isOrphaned: { false },
-        onOrphaned: { fired.signal() }
-    )
-    defer { thread.cancel() }
-    #expect(fired.wait(timeout: .now() + 0.3) == .timedOut)
 }
 
 @Test

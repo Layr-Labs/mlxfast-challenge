@@ -66,11 +66,14 @@ jobs:
           set -euo pipefail
           while IFS= read -r -d '' script; do
             case "$(head -n 1 "${script}")" in
-              '#!/usr/bin/env bash')
+              '#!/usr/bin/env bash'|'#!/bin/bash')
                 bash -n "${script}"
                 ;;
-              '#!/usr/bin/env sh')
+              '#!/usr/bin/env sh'|'#!/bin/sh')
                 sh -n "${script}"
+                ;;
+              '#!/usr/bin/env zsh'|'#!/bin/zsh')
+                zsh -n "${script}"
                 ;;
               *)
                 echo "unsupported shell script interpreter: ${script}" >&2
@@ -82,8 +85,11 @@ jobs:
       - name: Build release CLI and run unit tests without Metal runtime
         run: |
           mkdir -p .build/clang-module-cache
+          swift build -c release --product mlxfast-swift
+          swift build -c release --product mlxfast-runtime-worker
           swift test -c release
           test -x .build/release/mlxfast-swift
+          test -x .build/release/mlxfast-runtime-worker
 
       - name: Save SwiftPM cache
         if: steps.restore_swiftpm_cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
