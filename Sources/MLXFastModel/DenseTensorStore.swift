@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import MLXFastCore
 
@@ -31,6 +32,45 @@ public final class DenseTensorStore {
         Set(recordsByName.values.lazy.filter { $0.shard == shard }.map(\.name))
     }
 
+    /// Visits a shard in file order while keeping each tensor's source `Data`
+    /// inside its own autorelease pool. Callers that copy the tensor into its
+    /// final runtime representation during `body` never retain source bytes
+    /// beyond one tensor.
+    func forEachMaterializedTensor(
+        inShard shard: String,
+        _ body: (DenseTensorRecord, MaterializedTensor) throws -> Void
+    ) throws {
+        let records = recordsByName.values
+            .filter { $0.shard == shard }
+            .sorted {
+                if $0.byteOffset == $1.byteOffset {
+                    return $0.name < $1.name
+                }
+                return $0.byteOffset < $1.byteOffset
+            }
+        guard !records.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "dense safetensors index references no tensors in \(shard)"
+            )
+        }
+
+        let handle = try uncachedReadHandle(forShard: shard)
+        defer {
+            try? handle.close()
+        }
+        for record in records {
+            try autoreleasepool {
+                let tensor = try materializeTensor(
+                    name: record.name,
+                    dtype: record.dtype,
+                    shape: record.shape,
+                    bytes: readBytes(for: record, from: handle)
+                )
+                try body(record, tensor)
+            }
+        }
+    }
+
     public func record(named name: String) -> DenseTensorRecord? {
         recordsByName[name]
     }
@@ -40,19 +80,39 @@ public final class DenseTensorStore {
             throw MLXFastError.invalidInput("dense tensor not found: \(name)")
         }
 
-        let shardURL = URL(fileURLWithPath: weightsPath).appendingPathComponent(record.shard)
-        let handle = try FileHandle(forReadingFrom: shardURL)
+        let handle = try uncachedReadHandle(forShard: record.shard)
         defer {
             try? handle.close()
         }
+        return try readBytes(for: record, from: handle)
+    }
+
+    private func uncachedReadHandle(forShard shard: String) throws -> FileHandle {
+        let shardURL = URL(fileURLWithPath: weightsPath).appendingPathComponent(shard)
+        let handle = try FileHandle(forReadingFrom: shardURL)
+        // These descriptors feed short-lived staging buffers that are
+        // immediately copied into long-lived MLX allocations. Retaining the
+        // same bytes in the unified buffer cache can otherwise double the
+        // model-load footprint on memory-constrained Apple Silicon.
+        _ = Darwin.fcntl(handle.fileDescriptor, F_NOCACHE, 1)
+        _ = Darwin.fcntl(handle.fileDescriptor, F_RDAHEAD, 0)
+        return handle
+    }
+
+    private func readBytes(
+        for record: DenseTensorRecord,
+        from handle: FileHandle
+    ) throws -> Data {
         guard let byteOffset = UInt64(exactly: record.byteOffset) else {
-            throw MLXFastError.invalidInput("negative byte offset for dense tensor \(name)")
+            throw MLXFastError.invalidInput(
+                "negative byte offset for dense tensor \(record.name)"
+            )
         }
         try handle.seek(toOffset: byteOffset)
         let data = handle.readData(ofLength: record.byteLength)
         guard data.count == record.byteLength else {
             throw MLXFastError.invalidInput(
-                "short read for dense tensor \(name): \(data.count)/\(record.byteLength)"
+                "short read for dense tensor \(record.name): \(data.count)/\(record.byteLength)"
             )
         }
         return data

@@ -233,6 +233,63 @@ func runtimeShardInventoryRejectsMissingAndUnindexedShards() throws {
 }
 
 @Test
+func runtimeTensorInventoryRejectsMissingAndUnindexedTensors() throws {
+    try validateRuntimeTensorInventory(
+        shardName: "a.safetensors",
+        expectedNames: Set(["tensor.a", "tensor.b"]),
+        discoveredNames: Set(["tensor.a", "tensor.b"])
+    )
+    #expect(throws: MLXFastError.self) {
+        try validateRuntimeTensorInventory(
+            shardName: "a.safetensors",
+            expectedNames: Set(["tensor.a", "tensor.missing"]),
+            discoveredNames: Set(["tensor.a"])
+        )
+    }
+    #expect(throws: MLXFastError.self) {
+        try validateRuntimeTensorInventory(
+            shardName: "a.safetensors",
+            expectedNames: Set(["tensor.a"]),
+            discoveredNames: Set(["tensor.a", "tensor.unindexed"])
+        )
+    }
+}
+
+@Test
+func runtimeWeightLoaderStreamsIndexedTensorsWithoutMLX() throws {
+    let firstName = "language_model.model.a.weight"
+    let secondName = "language_model.model.b.weight"
+    let weights = try makeWeightsFixture(tensors: [
+        TensorFixture(
+            name: firstName,
+            dtype: "U8",
+            shape: [3],
+            data: Data([1, 2, 3])
+        ),
+        TensorFixture(
+            name: secondName,
+            dtype: "U8",
+            shape: [2],
+            data: Data([4, 5])
+        ),
+    ])
+    defer { try? FileManager.default.removeItem(at: weights.deletingLastPathComponent()) }
+    let store = try DenseTensorStore(weightsPath: weights.path)
+    var materializedNames: [String] = []
+
+    let values: [String: [UInt8]] = try loadRuntimeWeightValues(
+        denseStore: store
+    ) { tensor in
+        materializedNames.append(tensor.name)
+        return Array(tensor.bytes)
+    }
+
+    #expect(materializedNames == [firstName, secondName])
+    #expect(values["model.a.weight"] == [1, 2, 3])
+    #expect(values["model.b.weight"] == [4, 5])
+}
+
+@Test
 func runtimeWeightNameTrackerRejectsMisplacedDuplicateAndRenamedCollisions() throws {
     var misplaced = RuntimeWeightNameTracker()
     #expect(throws: MLXFastError.self) {

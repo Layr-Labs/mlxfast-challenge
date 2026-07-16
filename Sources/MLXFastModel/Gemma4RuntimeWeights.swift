@@ -94,10 +94,10 @@ public final class Gemma4RuntimeWeightCache {
 
     /// Construct and weight-load the mlx-swift-lm Gemma 4 text tower from the
     /// transformed `weights/` tree. Mirrors the library's `loadWeights`
-    /// (sanitize -> 4-bit affine quantize -> update -> eval), but reads the
-    /// safetensor shards in memory first so we can strip the checkpoint's
-    /// `language_model.` text-tower prefix: our transform preserves the source
-    /// names (`language_model.model.layers...`), whereas `Gemma4TextModel`'s
+    /// (sanitize -> 4-bit affine quantize -> update -> eval), but streams each
+    /// tensor from its shard into MLX-owned storage while stripping the
+    /// checkpoint's `language_model.` text-tower prefix: our transform
+    /// preserves the source names (`language_model.model.layers...`), whereas `Gemma4TextModel`'s
     /// parameter paths are `model.layers...`. Doing the rename here keeps the
     /// transform output and the harness's DenseTensorStore validation unchanged.
     private static func loadLibraryModel(
@@ -202,6 +202,21 @@ public final class Gemma4RuntimeWeightCache {
 func loadRuntimeWeightArrays(
     denseStore: DenseTensorStore
 ) throws -> [String: MLXArray] {
+    let bridge = MLXArrayTensorBridge()
+    return try loadRuntimeWeightValues(denseStore: denseStore) { tensor in
+        try bridge.makeArray(from: tensor)
+    }
+}
+
+/// Materializes runtime weights one tensor at a time. `DenseTensorStore`
+/// drains the source buffer's autorelease pool before visiting the next
+/// tensor; only the detached value returned by `makeValue` remains resident.
+/// The production value is an `MLXArray`, whose Data initializer copies the
+/// bytes into MLX-owned storage.
+func loadRuntimeWeightValues<Value>(
+    denseStore: DenseTensorStore,
+    makeValue: (MaterializedTensor) throws -> Value
+) throws -> [String: Value] {
     let directory = URL(fileURLWithPath: denseStore.weightsPath)
     let entries = try FileManager.default.contentsOfDirectory(
         at: directory, includingPropertiesForKeys: nil
@@ -214,24 +229,52 @@ func loadRuntimeWeightArrays(
         discoveredShards: discoveredShards
     )
 
-    var loadedWeights: [String: MLXArray] = [:]
+    var loadedWeights: [String: Value] = [:]
+    loadedWeights.reserveCapacity(denseStore.tensorNames.count)
     var expectedLoadedNames: Set<String> = []
     var nameTracker = RuntimeWeightNameTracker()
     for shardName in shardNames {
         let expectedNames = denseStore.tensorNames(inShard: shardName)
         expectedLoadedNames.formUnion(expectedNames)
         let shard = directory.appendingPathComponent(shardName)
-        for (key, value) in try loadArrays(url: shard) {
+        let discoveredNames = Set(try Safetensors.readHeader(shard).tensors.keys)
+        try validateRuntimeTensorInventory(
+            shardName: shardName,
+            expectedNames: expectedNames,
+            discoveredNames: discoveredNames
+        )
+        try denseStore.forEachMaterializedTensor(inShard: shardName) { record, tensor in
             let renamed = try nameTracker.register(
-                originalName: key,
+                originalName: record.name,
                 shardName: shardName,
                 expectedNames: expectedNames
             )
-            loadedWeights[renamed] = value
+            loadedWeights[renamed] = try makeValue(tensor)
         }
     }
     try nameTracker.validateComplete(expectedNames: expectedLoadedNames)
     return loadedWeights
+}
+
+func validateRuntimeTensorInventory(
+    shardName: String,
+    expectedNames: Set<String>,
+    discoveredNames: Set<String>
+) throws {
+    let missing = expectedNames.subtracting(discoveredNames).sorted()
+    guard missing.isEmpty else {
+        throw MLXFastError.invalidInput(
+            "safetensors shard \(shardName) is missing indexed tensors: "
+                + missing.joined(separator: ", ")
+        )
+    }
+    let unindexed = discoveredNames.subtracting(expectedNames).sorted()
+    guard unindexed.isEmpty else {
+        throw MLXFastError.invalidInput(
+            "safetensors shard \(shardName) contains unindexed or misplaced tensors: "
+                + unindexed.joined(separator: ", ")
+        )
+    }
 }
 
 func validateRuntimeShardInventory(
