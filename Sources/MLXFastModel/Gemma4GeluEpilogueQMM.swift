@@ -676,6 +676,8 @@ func gemma4PrefillUpGeluEpilogue(
 /// contract at the top of this file).
 struct Gemma4PrefillGeluEpilogueMLPTail: @unchecked Sendable {
     let head: @Sendable (MLXArray) -> (MLXArray, MLXArray)
+    let bn32NormalizationHead: (@Sendable (MLXArray) -> MLXArray)?
+    let bn32Gate: Gemma4PrefillBN32GateProjection?
     let tail: @Sendable (MLXArray, MLXArray) -> MLXArray
     let stockTail: @Sendable (MLXArray, MLXArray) -> MLXArray
     let upWeight: MLXArray
@@ -727,6 +729,23 @@ struct Gemma4PrefillGeluEpilogueMLPTail: @unchecked Sendable {
             let normalized = MLXFast.rmsNorm(x, weight: preNormWeight, eps: eps)
             return (normalized, gateP(normalized))
         }
+        // A CustomKernel cannot participate in MLX compile because output
+        // shape inference stops at that node. Keep the compiled
+        // `(RMSNorm, stock gate)` rollback head above intact, and construct a
+        // compiled normalization-only head only while the promoted BN32 route
+        // is enabled. DARKBLOOM_PREFILL_BN32_GATE=0 therefore restores the
+        // prior topology structurally, not merely numerically.
+        if gemma4PrefillBN32GateEnabled,
+           let bn32Gate = Gemma4PrefillBN32GateProjection(gate: gateP)
+        {
+            self.bn32Gate = bn32Gate
+            self.bn32NormalizationHead = compile(shapeless: true) { x in
+                MLXFast.rmsNorm(x, weight: preNormWeight, eps: eps)
+            }
+        } else {
+            self.bn32Gate = nil
+            self.bn32NormalizationHead = nil
+        }
         self.tail = compile(shapeless: true) { act, residual in
             let mlp = downP(act)
             let postNormalized = MLXFast.rmsNorm(mlp, weight: postNormWeight, eps: eps)
@@ -740,8 +759,12 @@ struct Gemma4PrefillGeluEpilogueMLPTail: @unchecked Sendable {
         B == 1 && L > 1 && L % 64 == 0
     }
 
-    func callAsFunction(_ x: MLXArray, _ residual: MLXArray) -> MLXArray {
-        // x is [B=1, L, hidden]; the fused kernel consumes 2-D tiles.
+    /// The currently promoted segmented head+up path. Both this reference arm
+    /// and the candidate below deliberately call the same up dispatcher, so
+    /// M512 keeps the promoted BN32 up kernel and its BN64 rollback switch.
+    func promotedHeadAndActivation(
+        _ x: MLXArray
+    ) -> (normalized: MLXArray, gate: MLXArray, activated: MLXArray) {
         let L = x.shape[x.shape.count - 2]
         let (normalized, gate) = head(x)
         let activated = gemma4PrefillUpGeluEpilogue(
@@ -751,6 +774,80 @@ struct Gemma4PrefillGeluEpilogueMLPTail: @unchecked Sendable {
             biases: upBiases,
             gate: gate.reshaped([L, intermediateSize])
         )
-        return tail(activated.reshaped([1, L, intermediateSize]), residual)
+        return (normalized, gate, activated)
+    }
+
+    /// Promoted second-stage arm: compiled RMSNorm-only, exact BN32 gate, then
+    /// the unchanged promoted up+LUT epilogue dispatcher.
+    func bn32HeadAndActivation(
+        _ x: MLXArray
+    ) -> (normalized: MLXArray, gate: MLXArray, activated: MLXArray)? {
+        guard let bn32NormalizationHead, let bn32Gate,
+              x.shape == [1, 512, hiddenSize]
+        else { return nil }
+        let normalized = bn32NormalizationHead(x)
+        let normalized2D = normalized.reshaped([512, hiddenSize])
+        guard bn32Gate.supports(normalized2D) else { return nil }
+        let gate = bn32Gate(normalized2D)
+        let activated = gemma4PrefillUpGeluEpilogue(
+            x: normalized2D,
+            weight: upWeight,
+            scales: upScales,
+            biases: upBiases,
+            gate: gate
+        )
+        return (normalized, gate, activated)
+    }
+
+    func callAsFunction(_ x: MLXArray, _ residual: MLXArray) -> MLXArray {
+        // x is [B=1, L, hidden]; the fused kernel consumes 2-D tiles.
+        let L = x.shape[x.shape.count - 2]
+        if let candidate = bn32HeadAndActivation(x) {
+            let candidateFinal = tail(
+                candidate.activated.reshaped([1, L, intermediateSize]),
+                residual
+            )
+            if gemma4VerifyPrefillBN32GateBits {
+                let reference = promotedHeadAndActivation(x)
+                let referenceFinal = tail(
+                    reference.activated.reshaped([1, L, intermediateSize]),
+                    residual
+                )
+
+                let normalizedMatches = arrayEqual(
+                    candidate.normalized.view(dtype: .uint16),
+                    reference.normalized.view(dtype: .uint16)
+                )
+                let gateMatches = arrayEqual(
+                    candidate.gate.view(dtype: .uint16),
+                    reference.gate.reshaped([L, intermediateSize])
+                        .view(dtype: .uint16)
+                )
+                let finalMatches = arrayEqual(
+                    candidateFinal.view(dtype: .uint16),
+                    referenceFinal.view(dtype: .uint16)
+                )
+                eval(normalizedMatches, gateMatches, finalMatches)
+                precondition(
+                    normalizedMatches.item(Bool.self),
+                    "BN32 gate path changed pre-FFN RMSNorm bits"
+                )
+                precondition(
+                    gateMatches.item(Bool.self),
+                    "BN32 gate QMM differs from the promoted gate bits"
+                )
+                precondition(
+                    finalMatches.item(Bool.self),
+                    "BN32 gate path differs from the promoted final MLP bits"
+                )
+            }
+            return candidateFinal
+        }
+
+        let promoted = promotedHeadAndActivation(x)
+        return tail(
+            promoted.activated.reshaped([1, L, intermediateSize]),
+            residual
+        )
     }
 }
