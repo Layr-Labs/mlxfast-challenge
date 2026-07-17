@@ -1319,6 +1319,29 @@ template <
 
   threadgroup T Ws[BN * BK_padded];
 
+  // The host dispatches an (N tile, M tile, batch) grid with N in the
+  // physically contiguous x dimension.  For Gemma's aligned BF16 affine-4
+  // path, linearize that unchanged physical grid and decode it with M tiles
+  // as the minor coordinate.  Consecutive threadgroups then consume the same
+  // weight tile across all M tiles before advancing N, while the helper still
+  // receives the original logical (N tile, M tile, batch) coordinate shape.
+  constexpr bool gemma4_m_major = gemma4_bk128;
+  uint3 logical_tid = tid;
+  if constexpr (gemma4_m_major) {
+    const uint m_tiles = (uint(M) + BM - 1) / BM;
+    const uint n_tiles = uint(N) / BN;
+    const uint physical_linear = tid.y * n_tiles + tid.x;
+    if (M == 512) {
+      // The scored prefill has exactly eight M tiles. Avoid an integer divide
+      // in every threadgroup on that hot shape.
+      logical_tid = uint3(physical_linear >> 3, physical_linear & 7, tid.z);
+    } else {
+      const uint logical_n = physical_linear / m_tiles;
+      const uint logical_m = physical_linear - logical_n * m_tiles;
+      logical_tid = uint3(logical_n, logical_m, tid.z);
+    }
+  }
+
   if (batched) {
     adjust_matrix_offsets<T>(
         x,
@@ -1340,12 +1363,13 @@ template <
   if constexpr (gemma4_bk128) {
     if (K == 5376 || K == 8192 || K == 16384 || K == 21504) {
       qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, 128, BN, WM, WN>(
-          w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+          w, scales, biases, x, y, Ws, K, N, M, logical_tid, lid, simd_gid,
+          simd_lid);
       return;
     }
   }
   qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
-      w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+      w, scales, biases, x, y, Ws, K, N, M, logical_tid, lid, simd_gid, simd_lid);
 }
 
 template <
