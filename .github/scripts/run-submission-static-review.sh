@@ -77,6 +77,12 @@ validate_contract_path() {
 
 total_bytes=0
 file_count=0
+# Diff-mode staleness diagnostic (see below): populated when the submission
+# deletes editable files that exist on the trusted base, so oversize failures
+# can explain the usual real cause (a stale clone) instead of only accusing
+# the submission of hiding lookup tables.
+deleted_path_count=0
+stale_clone_hint=""
 
 # Append one file to the review payload (size-capped, aborts on overflow).
 collect_file() {
@@ -91,7 +97,7 @@ collect_file() {
   total_bytes=$((total_bytes + bytes))
   file_count=$((file_count + 1))
   if (( total_bytes > MAX_BYTES )); then
-    echo "::error::editable submission source is ${total_bytes} bytes, above static review limit ${MAX_BYTES}; refusing oversized source that could hide lookup tables" >&2
+    echo "::error::editable submission source is ${total_bytes} bytes, above static review limit ${MAX_BYTES}; refusing oversized source that could hide lookup tables${stale_clone_hint}" >&2
     exit 1
   fi
   jq -n \
@@ -182,6 +188,29 @@ if [[ -n "${review_base}" ]]; then
     changed_path_count=$((changed_path_count + 1))
   done < "${changed_paths_file}"
 
+  # Editable files DELETED versus the trusted base are the signature of a
+  # submission packaged from a stale clone: the submit pipeline rebuilds the
+  # full editable surface from the archive on top of current main, so a clone
+  # that predates an editable-surface expansion (e.g. the Vendor/ kernel
+  # vendoring) silently deletes every editable file it never had. Those
+  # deletion hunks are trusted-base content, but they still inflate the
+  # reviewed diff far past the size cap, so surface the real cause and the
+  # remedy instead of only the lookup-table refusal.
+  deleted_paths_file="${work_dir}/deleted-paths.z"
+  git diff --name-only -z --diff-filter=D "${review_base}" "${review_head}" -- "${editable_paths[@]}" \
+    > "${deleted_paths_file}"
+  first_deleted_path=""
+  while IFS= read -r -d '' file_path; do
+    deleted_path_count=$((deleted_path_count + 1))
+    if [[ -z "${first_deleted_path}" ]]; then
+      first_deleted_path="${file_path}"
+    fi
+  done < "${deleted_paths_file}"
+  if (( deleted_path_count > 0 )); then
+    stale_clone_hint=". Note: this submission deletes ${deleted_path_count} editable file(s) that exist on the trusted base (first: ${first_deleted_path}); that usually means it was packaged from a stale clone that predates the current editablePaths surface, not deliberate deletion. Re-sync the clone with current main (mlxfast sync, or re-clone), rebase the changes, and resubmit"
+    echo "submission-review: ${deleted_path_count} editable file(s) deleted versus base ${review_base} (first: ${first_deleted_path}); if unintentional, the submission likely came from a stale clone" >&2
+  fi
+
   if (( changed_path_count == 0 )); then
     echo "submission-review: no editable files changed versus ${review_base}; nothing to review"
     printf '{"passed":true,"severity":"none","summary":"no editable files changed versus base %s","findings":[]}' "${review_base}" > "${RESULTS_PATH}"
@@ -210,7 +239,7 @@ if [[ -n "${review_base}" ]]; then
   fi
   total_bytes=$((total_bytes + diff_bytes))
   if (( total_bytes > MAX_BYTES )); then
-    echo "::error::editable submission source plus diff is ${total_bytes} bytes, above static review limit ${MAX_BYTES}; refusing oversized source that could hide lookup tables" >&2
+    echo "::error::editable submission source plus diff is ${total_bytes} bytes, above static review limit ${MAX_BYTES}; refusing oversized source that could hide lookup tables${stale_clone_hint}" >&2
     exit 1
   fi
 else

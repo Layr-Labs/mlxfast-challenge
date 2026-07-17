@@ -1453,6 +1453,115 @@ func submissionStaticReviewDiffModeFailsClosedAndSendsOnlyChangedFiles() throws 
     let deletionRequest = try String(contentsOfFile: deletionCapture, encoding: .utf8)
     #expect(deletionRequest.contains("Sources/MLXFastModel/Baseline.swift"))
     #expect(deletionRequest.contains("prove the benchmark detects slower measured decode"))
+    // Any deletion of trusted-base editable files also prints the stale-clone
+    // note, even when the review itself passes.
+    #expect(deletion.output.contains("1 editable file(s) deleted versus base"))
+}
+
+// Behavioral pin for the stale-clone diagnostic in run-submission-static-
+// review.sh's diff-only mode. Run 29549885232 (submission cbe5c48e) failed the
+// byte cap with only "refusing oversized source that could hide lookup
+// tables": the participant's clone predated the #630 Vendor/ editable-surface
+// expansion, so the rebuilt submission commit deleted all 89 vendored editable
+// files and the deletion hunks alone (~1.39 MB of trusted-base content) blew
+// the 1.5 MB cap. The oversize refusal must keep failing closed, but it must
+// name the deletions and the re-sync remedy instead of only implying cheating.
+@Test
+func submissionStaticReviewOversizeFailureExplainsStaleCloneDeletions() throws {
+    let fm = FileManager.default
+    let scriptPath = URL(fileURLWithPath: fm.currentDirectoryPath)
+        .appendingPathComponent(".github/scripts/run-submission-static-review.sh").path
+
+    let root = fm.temporaryDirectory
+        .appendingPathComponent("static-review-stale-\(UUID().uuidString)")
+    try fm.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: root) }
+    let repo = root.appendingPathComponent("repo").path
+    let privatePath = root.appendingPathComponent("private").path
+    try fm.createDirectory(atPath: repo, withIntermediateDirectories: true)
+
+    func run(
+        _ argv: [String], env extra: [String: String] = [:]
+    ) throws -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = argv
+        process.currentDirectoryURL = URL(fileURLWithPath: repo)
+        var env = ProcessInfo.processInfo.environment
+        let strayKeys = env.keys.filter {
+            $0.hasPrefix("MLXFAST_") || $0.hasPrefix("ANTHROPIC_")
+        }
+        for key in strayKeys { env.removeValue(forKey: key) }
+        env.merge(extra) { _, override in override }
+        process.environment = env
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    @discardableResult
+    func git(_ args: [String]) throws -> String {
+        let result = try run(
+            ["git", "-c", "user.email=test@test", "-c", "user.name=test",
+             "-c", "commit.gpgsign=false"] + args)
+        #expect(result.status == 0, "git \(args.joined(separator: " ")): \(result.output)")
+        return result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    for tool in ["git", "jq", "bash"] {
+        guard try run(["sh", "-c", "command -v \(tool)"]).status == 0 else { return }
+    }
+
+    // Trusted base: a small hand-written source plus a vendored editable file
+    // (stands in for the #630 Vendor/ kernel surface).
+    try git(["init", "-q"])
+    try #"{"editablePaths":["Sources/MLXFastModel","Vendor/mlx-swift"]}"#
+        .write(toFile: repo + "/benchmark.json", atomically: true, encoding: .utf8)
+    try fm.createDirectory(
+        atPath: repo + "/Sources/MLXFastModel", withIntermediateDirectories: true)
+    try fm.createDirectory(
+        atPath: repo + "/Vendor/mlx-swift", withIntermediateDirectories: true)
+    try "let model = 1\n".write(
+        toFile: repo + "/Sources/MLXFastModel/Model.swift", atomically: true, encoding: .utf8)
+    try String(repeating: "// vendored kernel line\n", count: 64).write(
+        toFile: repo + "/Vendor/mlx-swift/Kernel.metal", atomically: true, encoding: .utf8)
+    try git(["add", "."])
+    try git(["commit", "-q", "-m", "trusted base with vendored surface"])
+    let baseSha = try git(["rev-parse", "HEAD"])
+
+    // Stale-clone shaped head: edits the model source but deletes the vendored
+    // file it never had. The deletion hunk (trusted-base content) dominates
+    // the reviewed bytes, exactly like run 29549885232.
+    try "let model = 2\n".write(
+        toFile: repo + "/Sources/MLXFastModel/Model.swift", atomically: true, encoding: .utf8)
+    try fm.removeItem(atPath: repo + "/Vendor/mlx-swift/Kernel.metal")
+    try git(["add", "-A"])
+    try git(["commit", "-q", "-m", "stale-clone submission"])
+    let headSha = try git(["rev-parse", "HEAD"])
+
+    let oversize = try run(
+        ["bash", scriptPath],
+        env: [
+            "ANTHROPIC_API_KEY": "test-key-never-sent",
+            "MLXFAST_PRIVATE_DIR": privatePath,
+            "MLXFAST_SUBMISSION_REVIEW_BASE_SHA": baseSha,
+            "HEAD_SHA": headSha,
+            // Below the deletion-dominated diff size, so the cap trips before
+            // any network call (a real curl would fail on the dummy key).
+            "MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES": "512",
+        ])
+    #expect(oversize.status != 0)
+    #expect(oversize.output.contains("above static review limit 512"))
+    #expect(oversize.output.contains("refusing oversized source that could hide lookup tables"))
+    #expect(oversize.output.contains("deletes 1 editable file(s) that exist on the trusted base"))
+    #expect(oversize.output.contains("Vendor/mlx-swift/Kernel.metal"))
+    #expect(oversize.output.contains("stale clone"))
+    #expect(oversize.output.contains("mlxfast sync"))
+    #expect(oversize.output.contains("resubmit"))
 }
 
 // Behavioral pin for run-semantic-gpqa-gate.sh's Opus 4.8 judge request and
