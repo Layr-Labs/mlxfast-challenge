@@ -1001,7 +1001,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
-  constexpr short SK = 32;
+  constexpr short SK = (BK % 64 == 0) ? 64 : 32;
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;

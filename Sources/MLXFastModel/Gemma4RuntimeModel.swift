@@ -45,12 +45,18 @@ public final class Gemma4RuntimeModel: Module, LanguageModel {
     /// Build the fused-MLP engine after weights are loaded and quantized.
     func prepareFastEngine(
         indexedMetadata: [String: IndexedAffineMetadata],
-        tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata?
+        packedIndexMetadata: [String: Gemma4PackedQKVIndexMetadata] = [:],
+        coTiledAttentionPayloads: [String: Gemma4CoTiledAttentionPayload] = [:],
+        tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata?,
+        tiedHeadCoTiledPayload: Gemma4TiedHeadCoTiledPayload? = nil
     ) throws {
         fastEngine = try Gemma4FastEngine(
             model: self,
             indexedMetadata: indexedMetadata,
-            tiedHeadPacked13Metadata: tiedHeadPacked13Metadata
+            packedIndexMetadata: packedIndexMetadata,
+            coTiledAttentionPayloads: coTiledAttentionPayloads,
+            tiedHeadPacked13Metadata: tiedHeadPacked13Metadata,
+            tiedHeadCoTiledPayload: tiedHeadCoTiledPayload
         )
     }
 

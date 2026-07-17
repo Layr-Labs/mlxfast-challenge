@@ -41,6 +41,24 @@ private let gemma4VerifyStagedSlidingPrefillAttentionBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+private let gemma4StagedFullPrefillAttentionEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_STAGED_FULL_PREFILL_ATTENTION"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+private let gemma4VerifyStagedFullPrefillAttentionBits: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_VERIFY_STAGED_FULL_PREFILL_ATTENTION_BITS"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -185,7 +203,11 @@ final class Gemma4FastLayer {
         vIndexedMetadata: IndexedAffineMetadata?,
         gateIndexedMetadata: IndexedAffineMetadata?,
         upIndexedMetadata: IndexedAffineMetadata?,
-        downIndexedMetadata: IndexedAffineMetadata?
+        downIndexedMetadata: IndexedAffineMetadata?,
+        qPackedIndexMetadata: Gemma4PackedQKVIndexMetadata? = nil,
+        kPackedIndexMetadata: Gemma4PackedQKVIndexMetadata? = nil,
+        vPackedIndexMetadata: Gemma4PackedQKVIndexMetadata? = nil,
+        coTiledAttentionPayload: Gemma4CoTiledAttentionPayload? = nil
     ) {
         self.isSliding = isSliding
         self.nHeads = nHeads
@@ -239,7 +261,13 @@ final class Gemma4FastLayer {
                 v: vProjection,
                 qMetadata: qIndexedMetadata,
                 kMetadata: kIndexedMetadata,
-                vMetadata: vIndexedMetadata
+                vMetadata: vIndexedMetadata,
+                qPackedMetadata: qPackedIndexMetadata,
+                kPackedMetadata: kPackedIndexMetadata,
+                vPackedMetadata: vPackedIndexMetadata,
+                coTiledPayload: coTiledAttentionPayload?.kind == .slidingQKV
+                    ? coTiledAttentionPayload
+                    : nil
             )
         } else {
             self.fusedQKV = nil
@@ -267,7 +295,12 @@ final class Gemma4FastLayer {
                 q: qProjection,
                 k: kProjection,
                 qMetadata: qIndexedMetadata,
-                kMetadata: kIndexedMetadata
+                kMetadata: kIndexedMetadata,
+                qPackedMetadata: qPackedIndexMetadata,
+                kPackedMetadata: kPackedIndexMetadata,
+                coTiledPayload: coTiledAttentionPayload?.kind == .fullQK
+                    ? coTiledAttentionPayload
+                    : nil
             )
         } else {
             self.fusedQK = nil
@@ -754,7 +787,7 @@ final class Gemma4FastLayer {
             }
         }
 
-        let attention: MLXArray
+        let mergedAttention: MLXArray
         let canUseStagedSlidingPrefill = B == 1
             && L == 512
             && offset == 0
@@ -763,15 +796,39 @@ final class Gemma4FastLayer {
             && queries.shape == [1, 32, 512, 256]
             && keys.shape == [1, 16, 512, 256]
             && values.shape == [1, 16, 512, 256]
+        // Full-attention analog (P2): the ten full layers at the ranked
+        // prefill shape. At B=1, L=512, offset 0 the engine-constructed full
+        // mask is always the symbolic `.causal` (no window), which is exactly
+        // the mask the staged kernel reproduces.
+        let canUseStagedFullPrefill = B == 1
+            && L == 512
+            && offset == 0
+            && !isSliding
+            && queries.dtype == .bfloat16
+            && queries.shape == [1, 32, 512, 512]
+            && keys.shape == [1, 4, 512, 512]
+            && values.shape == [1, 4, 512, 512]
         if canUseStagedSlidingPrefill
             && (gemma4StagedSlidingPrefillAttentionEnabled
                 || gemma4VerifyStagedSlidingPrefillAttentionBits)
         {
+            // Merges head-major [1, 32, 512, 256] attention into the
+            // token-major [1, 512, 32*256] layout o_proj consumes. The
+            // reshape of the transposed view materializes a copy.
+            func mergeHeadMajor(_ attention: MLXArray) -> MLXArray {
+                attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            }
+            // With token-major emission enabled the staged kernel already
+            // writes [1, 512, 32*256] directly (identical values, different
+            // addresses), so no transpose-reshape copy is needed here.
             let candidate = gemma4StagedSlidingPrefill512(
                 queries: queries,
                 keys: keys,
                 values: values
             )
+            let mergedCandidate = gemma4StagedPrefillTokenMajorOutputEnabled
+                ? candidate
+                : mergeHeadMajor(candidate)
             if gemma4VerifyStagedSlidingPrefillAttentionBits {
                 let reference = MLXFast.scaledDotProductAttention(
                     queries: queries,
@@ -780,43 +837,103 @@ final class Gemma4FastLayer {
                     scale: scale,
                     mask: attentionMask
                 )
+                // Compare raw bits in the staged kernel's own output layout.
+                // For token-major emission the reference is relaid out with
+                // the same transpose+reshape merge -- a bijective relayout,
+                // so every element is still compared exactly once.
+                let comparisonReference = gemma4StagedPrefillTokenMajorOutputEnabled
+                    ? mergeHeadMajor(reference)
+                    : reference
                 let matches = arrayEqual(
                     candidate.view(dtype: .uint16),
-                    reference.view(dtype: .uint16)
+                    comparisonReference.view(dtype: .uint16)
                 )
                 eval(matches)
                 precondition(
                     matches.item(Bool.self),
                     "staged sliding prefill attention differs from stock SDPA"
                 )
-                attention = gemma4StagedSlidingPrefillAttentionEnabled
-                    ? candidate
-                    : reference
+                mergedAttention = gemma4StagedSlidingPrefillAttentionEnabled
+                    ? mergedCandidate
+                    : mergeHeadMajor(reference)
             } else {
-                attention = candidate
+                mergedAttention = mergedCandidate
             }
-        } else if L > 1 && offset > 0 {
-            attention = gemma4FastAttentionFallback(
+        } else if canUseStagedFullPrefill
+            && (gemma4StagedFullPrefillAttentionEnabled
+                || gemma4VerifyStagedFullPrefillAttentionBits)
+        {
+            // Merges head-major [1, 32, 512, 512] attention into the
+            // token-major [1, 512, 32*512] layout o_proj consumes. The
+            // reshape of the transposed view materializes a copy.
+            func mergeHeadMajor(_ attention: MLXArray) -> MLXArray {
+                attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            }
+            // With token-major emission enabled the staged kernel already
+            // writes [1, 512, 32*512] directly (identical values, different
+            // addresses), so no transpose-reshape copy is needed here.
+            let candidate = gemma4StagedFullPrefill512(
                 queries: queries,
                 keys: keys,
-                values: values,
-                scale: scale,
-                mask: attentionMask
+                values: values
             )
+            let mergedCandidate = gemma4StagedPrefillTokenMajorOutputEnabled
+                ? candidate
+                : mergeHeadMajor(candidate)
+            if gemma4VerifyStagedFullPrefillAttentionBits {
+                let reference = MLXFast.scaledDotProductAttention(
+                    queries: queries,
+                    keys: keys,
+                    values: values,
+                    scale: scale,
+                    mask: attentionMask
+                )
+                // Compare raw bits in the staged kernel's own output layout.
+                // For token-major emission the reference is relaid out with
+                // the same transpose+reshape merge -- a bijective relayout,
+                // so every element is still compared exactly once.
+                let comparisonReference = gemma4StagedPrefillTokenMajorOutputEnabled
+                    ? mergeHeadMajor(reference)
+                    : reference
+                let matches = arrayEqual(
+                    candidate.view(dtype: .uint16),
+                    comparisonReference.view(dtype: .uint16)
+                )
+                eval(matches)
+                precondition(
+                    matches.item(Bool.self),
+                    "staged full prefill attention differs from stock SDPA"
+                )
+                mergedAttention = gemma4StagedFullPrefillAttentionEnabled
+                    ? mergedCandidate
+                    : mergeHeadMajor(reference)
+            } else {
+                mergedAttention = mergedCandidate
+            }
         } else {
-            // Prefer library SDPA: D=256 sliding uses fused vector kernel;
-            // D=512 full uses its internal fallback. Compiling our own D=512
-            // fallback changes the public near-tie reduction order.
-            attention = MLXFast.scaledDotProductAttention(
-                queries: queries,
-                keys: keys,
-                values: values,
-                scale: scale,
-                mask: attentionMask
-            )
+            let attention: MLXArray
+            if L > 1 && offset > 0 {
+                attention = gemma4FastAttentionFallback(
+                    queries: queries,
+                    keys: keys,
+                    values: values,
+                    scale: scale,
+                    mask: attentionMask
+                )
+            } else {
+                // Prefer library SDPA: D=256 sliding uses fused vector kernel;
+                // D=512 full uses its internal fallback. Compiling our own D=512
+                // fallback changes the public near-tie reduction order.
+                attention = MLXFast.scaledDotProductAttention(
+                    queries: queries,
+                    keys: keys,
+                    values: values,
+                    scale: scale,
+                    mask: attentionMask
+                )
+            }
+            mergedAttention = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         }
-
-        let mergedAttention = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         let attnOut: MLXArray
         if B == 1, L == 1, let indexedOutput {
             attnOut = indexedOutput(mergedAttention)
@@ -1146,7 +1263,10 @@ final class Gemma4FastEngine {
     init(
         model: Gemma4RuntimeModel,
         indexedMetadata: [String: IndexedAffineMetadata] = [:],
-        tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata? = nil
+        packedIndexMetadata: [String: Gemma4PackedQKVIndexMetadata] = [:],
+        coTiledAttentionPayloads: [String: Gemma4CoTiledAttentionPayload] = [:],
+        tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata? = nil,
+        tiedHeadCoTiledPayload: Gemma4TiedHeadCoTiledPayload? = nil
     ) throws {
         let config = model.configuration
         self.embedScale = Float(config.hiddenSize).squareRoot()
@@ -1225,7 +1345,8 @@ final class Gemma4FastEngine {
         if productionTiedHead || tiedHeadRequested || verifyTiedHead {
             guard let tiedVocabularyHead = Gemma4TiedVocabularyHead(
                 loadedEmbedTokens,
-                packed13Metadata: tiedHeadPacked13Metadata
+                packed13Metadata: tiedHeadPacked13Metadata,
+                coTiledPayload: tiedHeadCoTiledPayload
             ) else {
                 throw MLXFastError.invalidInput(
                     "opt-in tied vocabulary head requires affine 4-bit "
@@ -1343,7 +1464,12 @@ final class Gemma4FastEngine {
                     vIndexedMetadata: indexedMetadata["\(prefix).self_attn.v_proj"],
                     gateIndexedMetadata: indexedMetadata["\(prefix).mlp.gate_proj"],
                     upIndexedMetadata: indexedMetadata["\(prefix).mlp.up_proj"],
-                    downIndexedMetadata: indexedMetadata["\(prefix).mlp.down_proj"]
+                    downIndexedMetadata: indexedMetadata["\(prefix).mlp.down_proj"],
+                    qPackedIndexMetadata: packedIndexMetadata["\(prefix).self_attn.q_proj"],
+                    kPackedIndexMetadata: packedIndexMetadata["\(prefix).self_attn.k_proj"],
+                    vPackedIndexMetadata: packedIndexMetadata["\(prefix).self_attn.v_proj"],
+                    coTiledAttentionPayload:
+                        coTiledAttentionPayloads["\(prefix).self_attn"]
                 )
             )
         }
