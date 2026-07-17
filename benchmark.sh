@@ -520,15 +520,22 @@ handle_benchmark_abort_signal() {
 #
 # Knobs (local debugging/testing only):
 #   MLXFAST_LOCAL_RUN_GUARD=0        disable the lock and the resident scan
-#   MLXFAST_LOCAL_RUN_LOCK_DIR=...   lock parent directory (default TMPDIR)
+#   MLXFAST_LOCAL_RUN_LOCK_DIR=...   lock parent directory (default
+#                                    ~/.cache/mlxfast; TMPDIR-independent so
+#                                    GUI/ssh/sandboxed shells share one lock)
 #   MLXFAST_LOCAL_ORPHAN_SCAN_CMD=.. testing seam: shell command whose stdout
 #                                    replaces the pgrep/ps resident-process
 #                                    listing (empty output = nothing found)
 LOCAL_RUN_LOCK_OWNED=""
-# Matches the argv of the participant worker in any wrapping (bare or under
-# sandbox-exec). The command-name suffix also keeps detection compatible with
-# workers launched by an older checkout.
-readonly RESIDENT_MODEL_PROCESS_PATTERN='runtime-worker[[:space:]]+--weights'
+# Matches the argv of every mlxfast process that holds or is about to hold
+# the model: the participant worker in any wrapping (bare or under
+# sandbox-exec; the command-name suffix also keeps detection compatible with
+# workers launched by an older checkout), plus the trusted mlxfast-swift
+# subcommands that own an imminent worker. The trusted binary never holds
+# the model in-process, but a run in its pre-worker phase (validation,
+# weights digest) is about to spawn a ~17 GB worker and would otherwise be
+# invisible to this scan until that load has already started.
+readonly RESIDENT_MODEL_PROCESS_PATTERN='runtime-worker[[:space:]]+--weights|mlxfast-swift[[:space:]]+(benchmark|correctness|correctness-trace|generate-golden|generate-gpqa-answers|attach-free-run-gate|mtp-probe|mtp-benchmark)'
 
 local_run_guard_enabled() {
   [[ "${MLXFAST_LOCAL_RUN_GUARD:-1}" != "0" ]] || return 1
@@ -536,7 +543,11 @@ local_run_guard_enabled() {
 }
 
 local_run_lock_path() {
-  local lock_root="${MLXFAST_LOCAL_RUN_LOCK_DIR:-${TMPDIR:-/tmp}}"
+  # Home-anchored default: GUI, ssh, and sandboxed agent shells resolve
+  # divergent TMPDIRs, which would shard the per-user lock into per-session
+  # locks that cannot see each other. ${HOME} is stable across all of them
+  # (and across clones/worktrees, which intentionally share one lock).
+  local lock_root="${MLXFAST_LOCAL_RUN_LOCK_DIR:-${HOME:-${TMPDIR:-/tmp}}/.cache/mlxfast}"
   printf '%s/mlxfast-local-benchmark-%s.lock\n' "${lock_root%/}" "$(id -u)"
 }
 
@@ -548,6 +559,10 @@ acquire_local_run_lock() {
   local_run_guard_enabled || return 0
   local lock_path holder_pid
   lock_path="$(local_run_lock_path)"
+  if ! mkdir -p "$(dirname "${lock_path}")" 2>/dev/null; then
+    echo "benchmark.sh: ERROR: cannot create the local run lock directory $(dirname "${lock_path}"); set MLXFAST_LOCAL_RUN_LOCK_DIR to a writable directory" >&2
+    exit 1
+  fi
   for _ in 1 2; do
     if mkdir "${lock_path}" 2>/dev/null; then
       printf '%s\n' "$$" > "${lock_path}/pid" 2>/dev/null || true
@@ -568,7 +583,8 @@ benchmark.sh: two overlapping local runs would hold two ~17 GB copies of the mod
 benchmark.sh: out-of-memory this machine (and they would share one GPU, invalidating both timings).
 benchmark.sh: wait for that run to finish and rerun. If pid ${holder_pid} is not a benchmark run,
 benchmark.sh: remove the stale lock with: rm -rf "${lock_path}"
-benchmark.sh: (MLXFAST_LOCAL_RUN_GUARD=0 skips this guard; not recommended.)
+benchmark.sh: (MLXFAST_LOCAL_RUN_GUARD=0 disables this guard for harness debugging only; never
+benchmark.sh: set it to resolve contention -- wait for the other run to finish instead.)
 EOF
       exit 1
     fi
@@ -631,7 +647,8 @@ benchmark.sh: - a ppid of 1 usually means an orphan left by a previous aborted r
 benchmark.sh:   'ps -p <pid> -o pid,ppid,rss,command' and stop it with 'kill <pid>'.
 benchmark.sh: - a live ppid usually means another run is legitimately in flight: wait for it.
 benchmark.sh: rerun once nothing matching the list above is running.
-benchmark.sh: (MLXFAST_LOCAL_RUN_GUARD=0 skips this check; risky on <36 GB machines.)
+benchmark.sh: (MLXFAST_LOCAL_RUN_GUARD=0 disables this check for harness debugging only; never
+benchmark.sh: set it to resolve contention -- a second resident model can OOM this machine.)
 EOF
   } >&2
   exit 1

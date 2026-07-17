@@ -319,6 +319,11 @@ public enum Safetensors {
         defer {
             try? input.close()
         }
+        // Copied bytes are short-lived. Keeping a second copy of the ~18 GB
+        // source in the unified buffer cache can exhaust 36 GB machines, so
+        // match the digest path's uncached read treatment (see #636).
+        _ = Darwin.fcntl(input.fileDescriptor, F_NOCACHE, 1)
+        _ = Darwin.fcntl(input.fileDescriptor, F_RDAHEAD, 0)
         let openedSourceIdentity = try fileIdentity(for: input, path: source.path)
         guard openedSourceIdentity == expectedSourceIdentity else {
             throw MLXFastError.invalidInput(
@@ -341,6 +346,10 @@ public enum Safetensors {
         }
         try Data().write(to: temporaryDestination, options: [.withoutOverwriting])
         let output = try FileHandle(forWritingTo: temporaryDestination)
+        // The staged ~18 GB copy is synchronized and reopened later; keeping
+        // its dirty pages out of the buffer cache avoids stacking a second
+        // tree of cached pages next to a resident model.
+        _ = Darwin.fcntl(output.fileDescriptor, F_NOCACHE, 1)
 
         do {
             let outputHeader = try makeHeaderData(
@@ -480,12 +489,20 @@ public enum Safetensors {
         var remaining = count
         let chunkSize = 8 * 1024 * 1024
         while remaining > 0 {
-            let data = input.readData(ofLength: min(chunkSize, remaining))
-            if data.isEmpty {
-                throw MLXFastError.invalidInput("unexpected EOF while copying safetensors tensor data")
+            // Drain each chunk's autoreleased buffer per iteration so RSS
+            // stays bounded over multi-GB copies (same treatment as the #636
+            // digest fix; readData(ofLength:) returns autoreleased storage).
+            let copied = try autoreleasepool { () throws -> Int in
+                let data = input.readData(ofLength: min(chunkSize, remaining))
+                if data.isEmpty {
+                    throw MLXFastError.invalidInput(
+                        "unexpected EOF while copying safetensors tensor data"
+                    )
+                }
+                try output.write(contentsOf: data)
+                return data.count
             }
-            try output.write(contentsOf: data)
-            remaining -= data.count
+            remaining -= copied
         }
     }
 

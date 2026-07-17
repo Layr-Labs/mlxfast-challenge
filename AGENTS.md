@@ -379,8 +379,15 @@ behaviors are expected, not bugs:
  (wait for it). The guard warns and aborts -- it never kills anything
  itself. Aborted local runs now reap their own worker on INT/TERM/EXIT
  and the worker exits if its parent dies, so the guard should fire
- rarely. `MLXFAST_LOCAL_RUN_GUARD=0` disables it (debugging only); the
- ranked --official path is unaffected.
+ rarely. Know its scope: the lock lives in `benchmark.sh`, so direct
+ `mlxfast-swift` model commands (`correctness`, `correctness-trace`,
+ `generate-golden`, `generate-gpqa-answers`, `mtp-*`) take no lock and
+ do not check for other runs -- run one model-holding command at a
+ time, never concurrently with a local benchmark or with each other.
+ (`swift test` never loads the real model and is safe alongside.)
+ `MLXFAST_LOCAL_RUN_GUARD=0` disables the guard for harness debugging
+ only -- never set it to resolve contention; wait for the other run
+ instead. The ranked --official path is unaffected.
 - **One ranked machine, one queue.** Ranked runs execute serially on the
  single M5 runner: one job at a time by construction, and duplicate
  dispatches queue behind the in-flight run instead of cancelling it.

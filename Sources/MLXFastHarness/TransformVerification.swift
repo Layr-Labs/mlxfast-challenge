@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import MLXFastCore
 import MLXFastTransform
@@ -251,21 +252,35 @@ public enum TransformVerifier {
             try? expectedHandle.close()
             try? actualHandle.close()
         }
+        // Compared bytes are short-lived. Verification streams both ~18 GB
+        // trees; keeping either in the unified buffer cache can exhaust
+        // 36 GB machines, so match the digest path's uncached read
+        // treatment (see #636).
+        _ = Darwin.fcntl(expectedHandle.fileDescriptor, F_NOCACHE, 1)
+        _ = Darwin.fcntl(expectedHandle.fileDescriptor, F_RDAHEAD, 0)
+        _ = Darwin.fcntl(actualHandle.fileDescriptor, F_NOCACHE, 1)
+        _ = Darwin.fcntl(actualHandle.fileDescriptor, F_RDAHEAD, 0)
 
         var hasher = SHA256()
         let chunkSize = 8 * 1024 * 1024
         while true {
-            let expectedData = expectedHandle.readData(ofLength: chunkSize)
-            let actualData = actualHandle.readData(ofLength: chunkSize)
-            guard expectedData == actualData else {
-                throw MLXFastError.invalidInput(
-                    "transform verification byte mismatch for \(relativePath)"
-                )
+            let reachedEOF = try autoreleasepool { () throws -> Bool in
+                let expectedData = expectedHandle.readData(ofLength: chunkSize)
+                let actualData = actualHandle.readData(ofLength: chunkSize)
+                guard expectedData == actualData else {
+                    throw MLXFastError.invalidInput(
+                        "transform verification byte mismatch for \(relativePath)"
+                    )
+                }
+                if expectedData.isEmpty {
+                    return true
+                }
+                hasher.update(data: expectedData)
+                return false
             }
-            if expectedData.isEmpty {
+            if reachedEOF {
                 return hasher.finalize()
             }
-            hasher.update(data: expectedData)
         }
     }
 
