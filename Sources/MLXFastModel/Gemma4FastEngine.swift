@@ -148,7 +148,9 @@ private struct FastMLPTailWeights: @unchecked Sendable {
 }
 
 /// Approximate tanh-GELU using `x*x*x` (compile-safe), matching the library.
-private let fastGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
+/// Internal (not private) so GPU verification harnesses can reference the
+/// exact closure the engine compiles into its MLP tails.
+let fastGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray) -> MLXArray = { x in
         0.5 * x * (1 + tanh(sqrt(2 / Float.pi) * (x + 0.044715 * x * x * x)))
     }
@@ -204,6 +206,7 @@ final class Gemma4FastLayer {
     let rope: RoPELayer
     let fusedMLP: @Sendable (MLXArray) -> MLXArray
     let fusedMLPTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
+    let prefillGeluEpilogue: Gemma4PrefillGeluEpilogueMLPTail?
     let fusedGateUp: FusedGateUpProjection?
     let fusedGateUpPostTail: (@Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray)?
     let fusedGateUpActivation: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
@@ -469,6 +472,28 @@ final class Gemma4FastLayer {
             tailEnabled = compileEnabled
         }
         self.fusedMLPTail = tailEnabled ? compile(shapeless: true, tailBody) : nil
+
+        // Fused prefill up-projection with GELU(gate)*up store epilogue
+        // (DARKBLOOM_PREFILL_GELU_EPILOGUE, default on): replaces the stock
+        // up qmm + compiled gelu·mul inside the prefill MLP tail with one NAX
+        // qmm clone whose store epilogue emits the activation directly,
+        // bit-exactly. Requires the stock compiled tail as the verify
+        // reference and the standard affine g64/b4 projection layouts;
+        // anything else keeps the stock tail.
+        if gemma4PrefillGeluEpilogueEnabled, let stockTail = self.fusedMLPTail {
+            self.prefillGeluEpilogue = Gemma4PrefillGeluEpilogueMLPTail(
+                gate: gateP,
+                up: upP,
+                down: downP,
+                preNormWeight: preFfnNorm.weight,
+                postNormWeight: postFfnNorm.weight,
+                layerScalar: layerScalar,
+                eps: eps,
+                stockTail: stockTail
+            )
+        } else {
+            self.prefillGeluEpilogue = nil
+        }
 
         let fusedGateUpEnabled: Bool
         if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_GATE_UP"] {
@@ -1080,7 +1105,26 @@ final class Gemma4FastLayer {
                 out = fusedGateUpPostTail(gateOutput, upOutput, residual2)
             }
         } else if let fusedMLPTail {
-            out = fusedMLPTail(out, residual2)
+            if let geluEpilogue = prefillGeluEpilogue, geluEpilogue.supports(B: B, L: L) {
+                if gemma4VerifyPrefillGeluEpilogueBits {
+                    let reference = fusedMLPTail(out, residual2)
+                    let candidate = geluEpilogue(out, residual2)
+                    let matches = arrayEqual(
+                        candidate.view(dtype: .uint16),
+                        reference.view(dtype: .uint16)
+                    )
+                    eval(matches)
+                    precondition(
+                        matches.item(Bool.self),
+                        "prefill GELU epilogue differs from stock MLP tail"
+                    )
+                    out = candidate
+                } else {
+                    out = geluEpilogue(out, residual2)
+                }
+            } else {
+                out = fusedMLPTail(out, residual2)
+            }
         } else {
             out = MLXFast.rmsNorm(out, weight: preFfnNormWeight, eps: eps)
             out = fusedMLP(out)
