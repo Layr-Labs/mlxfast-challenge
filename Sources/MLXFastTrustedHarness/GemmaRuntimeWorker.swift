@@ -1464,6 +1464,55 @@ func stopRuntimeWorkerProcess(
     return !process.isRunning
 }
 
+/// Reassert the actual runtime-worker executable as the final Seatbelt exec
+/// rule. Operator-provided profiles can outlive a binary-layout change; a
+/// stale allow would otherwise make sandbox-exec die before the protocol hello.
+/// Strip every earlier exec exception, then append a deny plus one literal
+/// allow so the resulting profile admits exactly this worker.
+func runtimeWorkerSandboxProfile(
+    rebinding profilePath: String,
+    toExecutableAt executablePath: String
+) throws -> String {
+    let source = try String(contentsOfFile: profilePath, encoding: .utf8)
+    var retainedLines: [Substring] = []
+    for line in source.split(separator: "\n", omittingEmptySubsequences: false) {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("(allow process-exec") {
+            guard trimmed.hasSuffix(")") else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker sandbox profile has an unsupported multiline process-exec allow"
+                )
+            }
+            continue
+        }
+        retainedLines.append(line)
+    }
+    let sourceWithoutExecAllows = retainedLines.joined(separator: "\n")
+    let resolvedExecutablePath = URL(fileURLWithPath: executablePath)
+        .standardizedFileURL
+        .resolvingSymlinksInPath()
+        .path
+    let escapedExecutablePath = resolvedExecutablePath
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+    let separator = sourceWithoutExecAllows.hasSuffix("\n") ? "" : "\n"
+    let rebound = sourceWithoutExecAllows + separator + """
+    ;; Trusted-harness executable binding (must remain the final exec rules).
+    (deny process-exec*)
+    (allow process-exec (literal "\(escapedExecutablePath)"))
+    """
+    let outputURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent(
+            "mlxfast-runtime-worker-bound-\(UUID().uuidString).sb"
+        )
+    try rebound.write(to: outputURL, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o400],
+        ofItemAtPath: outputURL.path
+    )
+    return outputURL.path
+}
+
 enum RuntimeWorkerLaunch: Equatable {
     case serial
     case trainedMTP(
@@ -1526,7 +1575,11 @@ extension GemmaRuntime {
             "--weights",
             weightsPath,
         ]
-        if let sandboxProfilePath = options.sandboxProfilePath {
+        if let configuredSandboxProfilePath = options.sandboxProfilePath {
+            let sandboxProfilePath = try runtimeWorkerSandboxProfile(
+                rebinding: configuredSandboxProfilePath,
+                toExecutableAt: options.executablePath
+            )
             process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
             process.arguments = [
                 "-f",
@@ -1641,7 +1694,11 @@ final class RuntimeWorkerClient {
         let stdout = Pipe()
         let stderr = Pipe()
         let workerArguments = launch.arguments(weightsPath: weightsPath)
-        if let sandboxProfilePath = options.sandboxProfilePath {
+        if let configuredSandboxProfilePath = options.sandboxProfilePath {
+            let sandboxProfilePath = try runtimeWorkerSandboxProfile(
+                rebinding: configuredSandboxProfilePath,
+                toExecutableAt: options.executablePath
+            )
             process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
             process.arguments = [
                 "-f",

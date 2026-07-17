@@ -121,6 +121,66 @@ func trustedTracePreservesLargeTopKAndOutOfSubsetExpectedDiagnostics() throws {
     #expect(request.contains(#""expected_token":19"#))
 }
 
+@Test
+func trustedSandboxRebindsExecPermissionToTheRuntimeWorker() throws {
+    let sandboxExecutable = "/usr/bin/sandbox-exec"
+    guard FileManager.default.isExecutableFile(atPath: sandboxExecutable) else {
+        return
+    }
+    let root = try trustedWorkerTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let staleExecutable = "/usr/bin/false"
+    let runtimeWorkerExecutable = "/usr/bin/true"
+    let staleProfile = root.appendingPathComponent("stale-worker.sb")
+    try """
+    (version 1)
+    (allow default)
+    (deny network*)
+    (deny process-fork)
+    (deny process-exec*)
+    (allow process-exec (literal "\(staleExecutable)"))
+    """.write(to: staleProfile, atomically: true, encoding: .utf8)
+
+    let reboundProfilePath = try runtimeWorkerSandboxProfile(
+        rebinding: staleProfile.path,
+        toExecutableAt: runtimeWorkerExecutable
+    )
+    defer { try? FileManager.default.removeItem(atPath: reboundProfilePath) }
+    let reboundProfile = try String(
+        contentsOfFile: reboundProfilePath,
+        encoding: .utf8
+    )
+    #expect(reboundProfile.contains("(deny network*)"))
+    #expect(!reboundProfile.contains(
+        "(allow process-exec (literal \"\(staleExecutable)\"))"
+    ))
+    #expect(reboundProfile.hasSuffix(
+        """
+        (deny process-exec*)
+        (allow process-exec (literal "\(runtimeWorkerExecutable)"))
+        """
+    ))
+
+    let allowed = Process()
+    allowed.executableURL = URL(fileURLWithPath: sandboxExecutable)
+    allowed.arguments = ["-f", reboundProfilePath, runtimeWorkerExecutable]
+    allowed.standardError = Pipe()
+    try allowed.run()
+    allowed.waitUntilExit()
+    #expect(allowed.terminationStatus == 0)
+
+    let denied = Process()
+    denied.executableURL = URL(fileURLWithPath: sandboxExecutable)
+    denied.arguments = ["-f", reboundProfilePath, staleExecutable]
+    denied.standardError = Pipe()
+    try denied.run()
+    denied.waitUntilExit()
+    // sandbox-exec returns EX_OSERR (71) when its profile rejects exec. If the
+    // stale allow still won, /usr/bin/false would run and return 1 instead.
+    #expect(denied.terminationStatus == 71)
+}
+
 private func trustedWorkerTemporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
