@@ -11,6 +11,21 @@ private func gemma4PrefillAttentionEnvironmentFlag(
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }
 
+/// Rollback switch for the KV reserved-suffix zero-fill removal (C2).
+///
+/// Default ON. The combined KV prefill kernels grid the reserved capacity
+/// rows (tokens >= valid_length) and used to zero-fill them in the same
+/// dispatch. Those rows are never read before a later decode append writes
+/// them (cache views expose only 0..<offset; decode direct-writes each
+/// reserved row before any trim/wrap can copy it; MTP exact-pair appends
+/// also only write), so the fill is dead traffic. Set
+/// `DARKBLOOM_KV_SKIP_SUFFIX_ZEROFILL=0` to restore the fill.
+let gemma4KVSkipSuffixZeroFillEnabled: Bool =
+    gemma4PrefillAttentionEnvironmentFlag(
+        "DARKBLOOM_KV_SKIP_SUFFIX_ZEROFILL",
+        default: true
+    )
+
 private let gemma4PrecomputedScalarViewsFeatureEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_PRECOMPUTED_SCALAR_VIEWS"
@@ -498,6 +513,7 @@ private func makeGemma4CombinedKVPrefillKernel(
             constexpr uint kReads = 4;
             constexpr uint kSIMDSize = 32;
             constexpr bool kSharesFullKVReduction = \(sharesFullKVReduction);
+            constexpr bool kSkipSuffixZeroFill = \(gemma4KVSkipSuffixZeroFillEnabled);
 
             const uint combined_row = threadgroup_position_in_grid.y;
             const uint token = combined_row / kRowsPerToken;
@@ -514,17 +530,21 @@ private func makeGemma4CombinedKVPrefillKernel(
                 + (is_k ? 0 : slab_elements)
                 + (projection_head * output_capacity + token) * kHeadDim;
             if (token >= input_length) {
-                for (uint index = 0; index < kReads; ++index) {
-                    const uint dimension =
-                        thread_position_in_threadgroup.x * kReads + index;
-                    output[dimension] = static_cast<bfloat>(0.0f);
-                    if (kSharesFullKVReduction && is_k) {
-                        combined_kv[
-                            slab_elements
-                            + (projection_head * output_capacity + token)
-                                * kHeadDim
-                            + dimension
-                        ] = static_cast<bfloat>(0.0f);
+                // Reserved capacity suffix: never read before being written
+                // by a later decode append, so the zero-fill is skippable.
+                if (!kSkipSuffixZeroFill) {
+                    for (uint index = 0; index < kReads; ++index) {
+                        const uint dimension =
+                            thread_position_in_threadgroup.x * kReads + index;
+                        output[dimension] = static_cast<bfloat>(0.0f);
+                        if (kSharesFullKVReduction && is_k) {
+                            combined_kv[
+                                slab_elements
+                                + (projection_head * output_capacity + token)
+                                    * kHeadDim
+                                + dimension
+                            ] = static_cast<bfloat>(0.0f);
+                        }
                     }
                 }
                 return;
@@ -639,14 +659,14 @@ private func makeGemma4CombinedKVPrefillKernel(
 }
 
 private let gemma4SlidingCombinedKVPrefill = makeGemma4CombinedKVPrefillKernel(
-    name: "gemma4_sliding_combined_kv_prefill_strided_256_v3",
+    name: "gemma4_sliding_combined_kv_prefill_strided_256_v4",
     headDim: 256,
     kvHeads: 16,
     sharesFullKVReduction: false
 )
 
 private let gemma4FullCombinedKVPrefill = makeGemma4CombinedKVPrefillKernel(
-    name: "gemma4_full_combined_kv_prefill_shared_strided_512_v3",
+    name: "gemma4_full_combined_kv_prefill_shared_strided_512_v4",
     headDim: 512,
     kvHeads: 4,
     sharesFullKVReduction: true
@@ -654,7 +674,7 @@ private let gemma4FullCombinedKVPrefill = makeGemma4CombinedKVPrefillKernel(
 
 private let gemma4DirectSlidingCombinedKVPrefill =
     makeGemma4CombinedKVPrefillKernel(
-        name: "gemma4_direct_sliding_combined_kv_prefill_strided_256_v1",
+        name: "gemma4_direct_sliding_combined_kv_prefill_strided_256_v2",
         headDim: 256,
         kvHeads: 16,
         sharesFullKVReduction: false,
@@ -663,7 +683,7 @@ private let gemma4DirectSlidingCombinedKVPrefill =
 
 private let gemma4DirectFullCombinedKVPrefill =
     makeGemma4CombinedKVPrefillKernel(
-        name: "gemma4_direct_full_combined_kv_prefill_shared_strided_512_v1",
+        name: "gemma4_direct_full_combined_kv_prefill_shared_strided_512_v2",
         headDim: 512,
         kvHeads: 4,
         sharesFullKVReduction: true,
@@ -691,6 +711,7 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
             constexpr uint kReads = 4;
             constexpr uint kSIMDSize = 32;
             constexpr bool kSharesFullKVReduction = \(sharesFullKVReduction);
+            constexpr bool kSkipSuffixZeroFill = \(gemma4KVSkipSuffixZeroFillEnabled);
 
             const uint combined_row = threadgroup_position_in_grid.y;
             const uint input_length = static_cast<uint>(valid_length);
@@ -723,20 +744,23 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
                     + (is_k ? 0 : slab_elements)
                     + (projection_head * output_capacity + token) * kHeadDim;
 
-            // Query rows exist only for valid tokens. K/V rows span capacity so
-            // the reserved cache suffix is initialized without a concatenate.
+            // Query rows exist only for valid tokens. K/V rows span capacity;
+            // the reserved suffix is never read before a later decode append
+            // writes it, so its zero-fill is skippable.
             if (!is_q && token >= input_length) {
-                for (uint index = 0; index < kReads; ++index) {
-                    const uint dimension =
-                        thread_position_in_threadgroup.x * kReads + index;
-                    output[dimension] = static_cast<bfloat>(0.0f);
-                    if (kSharesFullKVReduction && is_k) {
-                        combined_kv[
-                            slab_elements
-                            + (projection_head * output_capacity + token)
-                                * kHeadDim
-                            + dimension
-                        ] = static_cast<bfloat>(0.0f);
+                if (!kSkipSuffixZeroFill) {
+                    for (uint index = 0; index < kReads; ++index) {
+                        const uint dimension =
+                            thread_position_in_threadgroup.x * kReads + index;
+                        output[dimension] = static_cast<bfloat>(0.0f);
+                        if (kSharesFullKVReduction && is_k) {
+                            combined_kv[
+                                slab_elements
+                                + (projection_head * output_capacity + token)
+                                    * kHeadDim
+                                + dimension
+                            ] = static_cast<bfloat>(0.0f);
+                        }
                     }
                 }
                 return;
@@ -859,7 +883,7 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
 
 private let gemma4SlidingCombinedQKVPrefillPreparation =
     makeGemma4CombinedQKVPrefillPreparationKernel(
-        name: "gemma4_sliding_combined_qkv_prefill_prep_strided_256_v1",
+        name: "gemma4_sliding_combined_qkv_prefill_prep_strided_256_v2",
         headDim: 256,
         kvHeads: 16,
         sharesFullKVReduction: false
@@ -867,7 +891,7 @@ private let gemma4SlidingCombinedQKVPrefillPreparation =
 
 private let gemma4FullCombinedQKVPrefillPreparation =
     makeGemma4CombinedQKVPrefillPreparationKernel(
-        name: "gemma4_full_combined_qkv_prefill_prep_shared_strided_512_v1",
+        name: "gemma4_full_combined_qkv_prefill_prep_shared_strided_512_v2",
         headDim: 512,
         kvHeads: 4,
         sharesFullKVReduction: true
@@ -875,7 +899,7 @@ private let gemma4FullCombinedQKVPrefillPreparation =
 
 private let gemma4DirectSlidingCombinedQKVPrefillPreparation =
     makeGemma4CombinedQKVPrefillPreparationKernel(
-        name: "gemma4_direct_sliding_combined_qkv_prefill_strided_256_v1",
+        name: "gemma4_direct_sliding_combined_qkv_prefill_strided_256_v2",
         headDim: 256,
         kvHeads: 16,
         sharesFullKVReduction: false,
@@ -884,7 +908,7 @@ private let gemma4DirectSlidingCombinedQKVPrefillPreparation =
 
 private let gemma4DirectFullCombinedQKVPrefillPreparation =
     makeGemma4CombinedQKVPrefillPreparationKernel(
-        name: "gemma4_direct_full_combined_qkv_prefill_shared_strided_512_v1",
+        name: "gemma4_direct_full_combined_qkv_prefill_shared_strided_512_v2",
         headDim: 512,
         kvHeads: 4,
         sharesFullKVReduction: true,
@@ -985,13 +1009,21 @@ private let gemma4AttentionRopeTables: Gemma4AttentionRopeTables = {
 private func gemma4VerifyDirectPrefillAttentionRMSRoPEOutputs(
     candidate: [MLXArray],
     reference: [MLXArray],
-    kind: String
+    kind: String,
+    liveTokens: Int
 ) {
     precondition(candidate.count == reference.count)
     var valueCount = 0
     for (outputIndex, pair) in zip(candidate, reference).enumerated() {
-        let candidateOutput = pair.0
-        let referenceOutput = pair.1
+        // Compare only live token rows: reserved capacity rows past
+        // liveTokens are never written when the suffix zero-fill is skipped,
+        // so their (stale, unread) contents are allowed to differ.
+        let candidateOutput = pair.0.ndim == 5
+            ? pair.0[0..., 0..., 0..., 0..<liveTokens, 0...]
+            : pair.0
+        let referenceOutput = pair.1.ndim == 5
+            ? pair.1[0..., 0..., 0..., 0..<liveTokens, 0...]
+            : pair.1
         precondition(candidateOutput.dtype == .bfloat16)
         precondition(referenceOutput.dtype == .bfloat16)
         precondition(candidateOutput.shape == referenceOutput.shape)
@@ -1339,7 +1371,8 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
             gemma4VerifyDirectPrefillAttentionRMSRoPEOutputs(
                 candidate: candidate,
                 reference: reference,
-                kind: isSliding ? "sliding_kv" : "full_kv"
+                kind: isSliding ? "sliding_kv" : "full_kv",
+                liveTokens: length
             )
         }
         let outputs = directPrefillRMSRoPE
@@ -1429,7 +1462,8 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
             gemma4VerifyDirectPrefillAttentionRMSRoPEOutputs(
                 candidate: candidate,
                 reference: reference,
-                kind: isSliding ? "sliding_qkv" : "full_qkv"
+                kind: isSliding ? "sliding_qkv" : "full_qkv",
+                liveTokens: length
             )
         }
         let outputs = directPrefillRMSRoPE

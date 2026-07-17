@@ -106,6 +106,86 @@ func gemma4Pack12BitGateUpIndexWords(
     return words
 }
 
+/// Rollback switch for the 12-bit gate/up co-tile tail packing (C3).
+///
+/// Default ON. The 21st block's four tail indexes per row are stored at 12
+/// bits (6 bytes/row) instead of lane-major U16 (8 bytes/row), saving
+/// 2 B/row/projection across the co-tiled gate/up payload (~4.8 MB/token
+/// over 56 layers). The decoded LUT indexes are identical; only the
+/// payload encoding changes (runtime-side repack from the same packed12
+/// stream; no transform change). Set `DARKBLOOM_GATEUP_COTILE_TAIL12=0`
+/// to restore the U16 tail layout.
+let gemma4GateUpCoTileTail12Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GATEUP_COTILE_TAIL12"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+/// Repack the packed12 gate/up streams' U16 tail blocks (words 30-31 of
+/// each 32-word row) at 12 bits: four indexes per row become six bytes
+/// (`b0 = t0.lo, b1 = t1.lo, b2 = t0.hi | t1.hi << 4`, then the same for
+/// t2/t3), matching the co-tiled kernel's nibble extraction. The per-
+/// threadgroup region is the gate rows' 24 bytes followed by the up rows'
+/// 24 bytes, little-endian packed into twelve U32 words. Returns nil if
+/// any tail index needs more than 12 bits (impossible for a validated
+/// packed12 stream).
+func gemma4MakeCoTiledGateUpTail12Metadata(
+    gatePacked: [UInt32],
+    upPacked: [UInt32],
+    threadgroupCount: Int
+) -> MLXArray? {
+    let wordsPerRow = 32
+    let rowsPerThreadgroup = 4
+    let rowCount = threadgroupCount * rowsPerThreadgroup
+    guard gatePacked.count == rowCount * wordsPerRow,
+          upPacked.count == rowCount * wordsPerRow
+    else { return nil }
+
+    func tailBytes(_ packed: [UInt32], _ row: Int) -> [UInt8]? {
+        let base = row * wordsPerRow + 30
+        let t0 = Int(packed[base] & 0xFFFF)
+        let t1 = Int(packed[base] >> 16)
+        let t2 = Int(packed[base + 1] & 0xFFFF)
+        let t3 = Int(packed[base + 1] >> 16)
+        guard t0 < 4_096, t1 < 4_096, t2 < 4_096, t3 < 4_096 else {
+            return nil
+        }
+        return [
+            UInt8(truncatingIfNeeded: t0),
+            UInt8(truncatingIfNeeded: t1),
+            UInt8((t0 >> 8) | ((t1 >> 8) << 4)),
+            UInt8(truncatingIfNeeded: t2),
+            UInt8(truncatingIfNeeded: t3),
+            UInt8((t2 >> 8) | ((t3 >> 8) << 4)),
+        ]
+    }
+
+    var bytes = [UInt8]()
+    bytes.reserveCapacity(threadgroupCount * 48)
+    for threadgroup in 0..<threadgroupCount {
+        for packed in [gatePacked, upPacked] {
+            for rowWithin in 0..<rowsPerThreadgroup {
+                guard let tail = tailBytes(
+                    packed, threadgroup * rowsPerThreadgroup + rowWithin)
+                else { return nil }
+                bytes.append(contentsOf: tail)
+            }
+        }
+    }
+    var words = [UInt32](repeating: 0, count: bytes.count / 4)
+    for wordIndex in words.indices {
+        let byteIndex = wordIndex * 4
+        words[wordIndex] = UInt32(bytes[byteIndex])
+            | (UInt32(bytes[byteIndex + 1]) << 8)
+            | (UInt32(bytes[byteIndex + 2]) << 16)
+            | (UInt32(bytes[byteIndex + 3]) << 24)
+    }
+    return MLXArray(words, [threadgroupCount, 12])
+}
+
 /// Fixed13 sibling of `gemma4Pack12BitGateUpIndices` for the U16-fallback
 /// layers whose LUT needs more than 12 bits: the same three coalesced byte
 /// planes per two-block pair, plus one trailing byte carrying the eight top
@@ -270,20 +350,36 @@ func gemma4MakeCoTiledFixed12GateUpPayload(
         .reshaped(threadgroupCount, 4, 32)
     let tailWeights = stacked([gateTail, upTail], axis: 1)
         .reshaped(threadgroupCount, 256)
-    let gateTailMetadata = gatePackedRows[0..., 0..., 30..<32]
-    let upTailMetadata = upPackedRows[0..., 0..., 30..<32]
-    let tailMetadata = stacked(
-        [gateTailMetadata, upTailMetadata],
-        axis: 1
-    ).reshaped(threadgroupCount, 16)
-    let tailPayload = concatenated(
-        [tailWeights, tailMetadata],
-        axis: 1
-    )
+    let tailPayload: MLXArray
+    let expectedPayloadWords: Int
+    if gemma4GateUpCoTileTail12Enabled,
+       let tail12Metadata = gemma4MakeCoTiledGateUpTail12Metadata(
+           gatePacked: gatePacked,
+           upPacked: upPacked,
+           threadgroupCount: threadgroupCount
+       )
+    {
+        // 12-bit tail packing: 6 B/row/projection (24 B region per
+        // projection), twelve U32 words per threadgroup.
+        tailPayload = concatenated([tailWeights, tail12Metadata], axis: 1)
+        expectedPayloadWords = 5_628
+    } else {
+        let gateTailMetadata = gatePackedRows[0..., 0..., 30..<32]
+        let upTailMetadata = upPackedRows[0..., 0..., 30..<32]
+        let tailMetadata = stacked(
+            [gateTailMetadata, upTailMetadata],
+            axis: 1
+        ).reshaped(threadgroupCount, 16)
+        tailPayload = concatenated(
+            [tailWeights, tailMetadata],
+            axis: 1
+        )
+        expectedPayloadWords = 5_632
+    }
 
     let payload = concatenated([pairedPayload, tailPayload], axis: 1)
     precondition(payload.dtype == .uint32)
-    precondition(payload.shape == [threadgroupCount, 5_632])
+    precondition(payload.shape == [threadgroupCount, expectedPayloadWords])
     if materialize {
         eval(payload)
     }
@@ -410,13 +506,20 @@ private struct CoTiledFixed12GateUpPayload: @unchecked Sendable {
                   upWeight: up.weight,
                   gateIndices: gateMetadata.indices,
                   upIndices: upMetadata.indices
-              )
+              ),
+              words.shape == gemma4CoTiledGateUpPayloadShape
         else {
             return nil
         }
         self.words = words
     }
 }
+
+/// Expected shape of the runtime-built co-tiled gate/up payload: 5,376
+/// threadgroups of 5,632 U32 words with the lane-major U16 tail metadata,
+/// or 5,628 with the 12-bit tail packing (DARKBLOOM_GATEUP_COTILE_TAIL12).
+let gemma4CoTiledGateUpPayloadShape: [Int] =
+    gemma4GateUpCoTileTail12Enabled ? [5_376, 5_628] : [5_376, 5_632]
 
 func supportsGemma4FusedGateUpInput(_ input: MLXArray) -> Bool {
     input.dtype == .bfloat16
@@ -1177,7 +1280,8 @@ private let gemma4PackedWideGateUpActivationKernels:
     }()
 
 private let gemma4CoTiledFixed12FusedGateUpActivationQMV = MLXFast.metalKernel(
-    name: "gemma4_cotiled_fixed12_fused_gate_up_activation_qmv_5376_v1",
+    name: "gemma4_cotiled_fixed12_fused_gate_up_activation_qmv_5376"
+        + "_t12\(gemma4GateUpCoTileTail12Enabled ? 1 : 0)_v1",
     inputNames: ["cotiled_payload", "gate_lut", "up_lut", "x"],
     outputNames: ["activated"],
     source: """
@@ -1192,8 +1296,10 @@ private let gemma4CoTiledFixed12FusedGateUpActivationQMV = MLXFast.metalKernel(
         constexpr int kPairCount = 10;
         constexpr int kTailWeightWords =
             2 * kWordsPerProjectionBlock;
-        constexpr int kTailMetadataBytesPerProjection = 32;
-        constexpr int kWordsPerTail = 272;
+        constexpr bool kTail12 = \(gemma4GateUpCoTileTail12Enabled);
+        constexpr int kTailMetadataBytesPerProjection =
+            kTail12 ? 24 : 32;
+        constexpr int kWordsPerTail = kTail12 ? 268 : 272;
         constexpr int kWordsPerThreadgroup =
             kPairCount * kWordsPerPair + kWordsPerTail;
 
@@ -1289,10 +1395,23 @@ private let gemma4CoTiledFixed12FusedGateUpActivationQMV = MLXFast.metalKernel(
         const uint tail_lane_offset = lane_group << 1;
         #pragma clang loop unroll(full)
         for (int row = 0; row < kRowsPerSIMD; ++row) {
-            const device uchar* row_metadata = tail_metadata + row * 8;
-            const uint low = row_metadata[tail_lane_offset];
-            const uint high = row_metadata[tail_lane_offset + 1];
-            const uint metadata_index = low | (high << 8);
+            uint metadata_index;
+            if (kTail12) {
+                // Four tail indexes per row packed at 12 bits: three bytes
+                // per index pair, two pairs per row.
+                const device uchar* row_metadata = tail_metadata + row * 6;
+                const uint pair_base = (lane_group >> 1) * 3;
+                const uint low = row_metadata[pair_base + (lane_group & 1)];
+                const uint middle = row_metadata[pair_base + 2];
+                metadata_index = (lane_group & 1) == 0
+                    ? low | ((middle & 0x0f) << 8)
+                    : low | ((middle >> 4) << 8);
+            } else {
+                const device uchar* row_metadata = tail_metadata + row * 8;
+                const uint low = row_metadata[tail_lane_offset];
+                const uint high = row_metadata[tail_lane_offset + 1];
+                metadata_index = low | (high << 8);
+            }
             const uint pair = lut[metadata_index];
             const device uchar* row_weight =
                 reinterpret_cast<const device uchar*>(
