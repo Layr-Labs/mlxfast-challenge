@@ -133,6 +133,24 @@ let gemma4VerifyLastLayerQPruneBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+/// Prefill pipeline chunk size, in layers. Default 20.
+///
+/// The ranked prefill is one lazy graph evaluated once at the head; the
+/// graph-end-to-final-eval boundary leaves dispatch bubbles. A
+/// scheduling-only `asyncEval` every N layers pulls GPU execution into the
+/// layer loop (measured +2.5% prefill at N=20 locally; the computed values
+/// are unchanged -- same kernels, same accumulation order). Only engages
+/// for multi-token forwards (L > 1); decode is untouched. Set
+/// `DARKBLOOM_PREFILL_CHUNK_EVAL=0` to restore the single-eval schedule.
+let gemma4PrefillChunkEvalLayers: Int = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_CHUNK_EVAL"
+    ], let value = Int(raw) else {
+        return 20
+    }
+    return max(0, value)
+}()
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -1896,6 +1914,19 @@ final class Gemma4FastEngine {
             hidden = result.hidden
             normalizedInput = result.nextNormalized
             let layerNumber = index + 1
+            // Prefill pipeline chunking: the ranked prefill is one lazy
+            // graph evaluated once at the head, which leaves dispatch
+            // bubbles between graph-end and the giant final eval. A
+            // scheduling-only asyncEval every N layers pulls that GPU
+            // execution into the layer loop and overlaps it with the
+            // remaining graph construction (measured +2.5% prefill locally,
+            // chunk=20; same kernels and accumulation order either way).
+            if gemma4PrefillChunkEvalLayers > 0,
+               inputs.dim(1) > 1,
+               layerNumber.isMultiple(of: gemma4PrefillChunkEvalLayers)
+            {
+                asyncEval(hidden)
+            }
             if inputs.dim(1) == 1,
                asyncLayerGroup > 0,
                layerNumber >= asyncLayerLead,
