@@ -697,8 +697,12 @@ final class Gemma4FastLayer {
             // CombinedAttentionPrefillProjection.verifyBits invariant), and
             // qmm_splitk selects split_k=1 at both M=512 and M=64 for
             // N=16384 and N=2048, so the retained rows are bit-identical.
-            rawQueries = qProj(h[0..., qPruneStart..<L, 0...])
-            rawKeys = kProj(h)
+            // The BN32 clone dispatches are bit-identical to those stock
+            // QMMs at both widths, so the invariant is preserved.
+            rawQueries = gemma4PrefillBN32QMMDispatchIfSupported(
+                h[0..., qPruneStart..<L, 0...], projection: qProj)
+            rawKeys = gemma4PrefillBN32QMMDispatchIfSupported(
+                h, projection: kProj)
             rawValues = nil
         } else if B == 1,
                   L > 1,
@@ -1165,7 +1169,12 @@ final class Gemma4FastLayer {
         if B == 1, L == 1, let indexedOutput {
             attnOut = indexedOutput(mergedAttention)
         } else {
-            attnOut = oProj(chainAttention)
+            // BN32 narrow-residency qmm clone
+            // (DARKBLOOM_PREFILL_BN32_QMM, default on): bit-exact vs the
+            // stock o_proj quantizedMM at both full width and the M=64
+            // pruned tail.
+            attnOut = gemma4PrefillBN32QMMDispatchIfSupported(
+                chainAttention, projection: oProj)
         }
         var out: MLXArray
         let residual2: MLXArray
