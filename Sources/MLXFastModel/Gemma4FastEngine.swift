@@ -59,6 +59,42 @@ private let gemma4VerifyStagedFullPrefillAttentionBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+/// Rollback switch for the last-layer M=64 tail prune.
+///
+/// Default ON. At prefill lengths >= 128 the final transformer layer's
+/// post-attention chain (o_proj -> post-attn boundary -> gate/up -> gelu*mul
+/// -> down -> post-FFN boundary) influences only the last row's logits, so
+/// the chain runs on the last 64 supplied rows instead of all L. The
+/// layer's qkv/prep/attention/KV-write stays full-width (decode needs KV at
+/// every position). Every dispatched op in the pruned chain is
+/// row-independent at M=64 vs M=512: the frozen host dispatch sends both to
+/// the identical `affine_qmm_t_nax` pipeline (qmm_splitk picks split_k=1
+/// for N=5376 and N=21504 at both M values, and the kernel has a strictly
+/// ascending per-element K chain with no cross-row reduction), and the
+/// RMS/elementwise ops are per-row at any M, so the retained rows are
+/// bit-identical to the full-width chain. Set
+/// `DARKBLOOM_LAST_LAYER_TAIL_PRUNE=0` to restore the full-width chain.
+let gemma4LastLayerTailPruneEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LAST_LAYER_TAIL_PRUNE"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+/// Raw-bit verify switch for the last-layer tail prune. Default OFF. When
+/// enabled, the final layer additionally runs the unpruned full-width chain
+/// and preconditions that its last 64 rows bit-match the pruned output.
+let gemma4VerifyLastLayerTailPruneBits: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_VERIFY_LAST_LAYER_TAIL_PRUNE_BITS"
+    ] else {
+        return false
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -541,7 +577,8 @@ final class Gemma4FastLayer {
         _ x: MLXArray,
         normalizedInput: MLXArray?,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        cache: KVCache?
+        cache: KVCache?,
+        pruneTail: Bool = false
     ) -> Gemma4FastLayerResult {
         let residual = x
         let h: MLXArray
@@ -614,16 +651,49 @@ final class Gemma4FastLayer {
            let fusedAttentionRMS,
            let combinedCache
         {
-            let prepared = fusedAttentionRMS.callCombined(
-                rawQueries: rawQueries,
-                rawKeys: rawKeys,
-                rawValues: rawValues,
-                offset: offset
-            )
-            queries = prepared.queries
-            let updated = combinedCache.updateCombined(prepared.combinedKV)
-            keys = updated.0
-            values = updated.1
+            if gemma4DecodeKVDirectWriteEnabled(),
+               let target = combinedCache.directDecodeWriteTarget()
+            {
+                // The preparation kernel writes the K/V rows straight into the
+                // combined slab at `target.position`; no slice update dispatch.
+                queries = fusedAttentionRMS.callCombinedDecodeDirect(
+                    rawQueries: rawQueries,
+                    rawKeys: rawKeys,
+                    rawValues: rawValues,
+                    offset: offset,
+                    cacheStorage: target.storage,
+                    writePosition: target.position,
+                    capacity: target.storage.dim(3)
+                )
+                let updated = combinedCache.adoptDirectDecodeWrite(
+                    position: target.position
+                )
+                keys = updated.0
+                values = updated.1
+                if gemma4VerifyDecodeKVDirectWriteBitsEnabled() {
+                    gemma4VerifyDecodeKVDirectWrite(
+                        queries: queries,
+                        cacheStorage: target.storage,
+                        position: target.position,
+                        fusedAttentionRMS: fusedAttentionRMS,
+                        rawQueries: rawQueries,
+                        rawKeys: rawKeys,
+                        rawValues: rawValues,
+                        offset: offset
+                    )
+                }
+            } else {
+                let prepared = fusedAttentionRMS.callCombined(
+                    rawQueries: rawQueries,
+                    rawKeys: rawKeys,
+                    rawValues: rawValues,
+                    offset: offset
+                )
+                queries = prepared.queries
+                let updated = combinedCache.updateCombined(prepared.combinedKV)
+                keys = updated.0
+                values = updated.1
+            }
         } else if usesFusedAttentionPreparation, let fusedAttentionRMS {
             let prepared = fusedAttentionRMS(
                 rawQueries: rawQueries,
@@ -934,11 +1004,31 @@ final class Gemma4FastLayer {
             }
             mergedAttention = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         }
+        // Last-layer tail prune: at prefill lengths >= 128 the post-attention
+        // chain of the final layer influences only the last row's logits, so
+        // o_proj, the boundary, and the whole MLP tail run on the last 64
+        // supplied rows (a metadata-only view -- 64 real rows, no padding).
+        // The qkv/prep/attention/KV-write above already ran full-width, so
+        // decode keeps KV at every position. Every op in the pruned chain is
+        // row-independent at M=64 vs full width: the frozen host dispatch
+        // (QuantizedMatmul::eval_gpu -> qmm_splitk) selects split_k=1 for
+        // N=5376 and N=21504 at both M=512 and M=64 and forwards to the same
+        // affine_qmm_t_nax pipeline, whose per-element K chain is strictly
+        // ascending with no cross-row reduction; RMS norms and elementwise
+        // ops are per-row at any M. The retained rows are therefore
+        // bit-identical to the full-width chain.
+        let tailStart = pruneTail && B == 1 && L >= 128 ? L - 64 : 0
+        let chainAttention = tailStart > 0
+            ? mergedAttention[0..., tailStart..<L, 0...]
+            : mergedAttention
+        let chainResidual = tailStart > 0
+            ? residual[0..., tailStart..<L, 0...]
+            : residual
         let attnOut: MLXArray
         if B == 1, L == 1, let indexedOutput {
             attnOut = indexedOutput(mergedAttention)
         } else {
-            attnOut = oProj(mergedAttention)
+            attnOut = oProj(chainAttention)
         }
         var out: MLXArray
         let residual2: MLXArray
@@ -958,7 +1048,7 @@ final class Gemma4FastLayer {
             residual2 = prepared.0
             fusedPreFFNNormalized = prepared.1
         } else {
-            out = residual + MLXFast.rmsNorm(
+            out = chainResidual + MLXFast.rmsNorm(
                 attnOut, weight: postAttnNormWeight, eps: eps)
             residual2 = out
             fusedPreFFNNormalized = nil
@@ -997,6 +1087,35 @@ final class Gemma4FastLayer {
             out = MLXFast.rmsNorm(out, weight: postFfnNormWeight, eps: eps)
             out = residual2 + out
             out = out * layerScalar
+        }
+        if tailStart > 0 && gemma4VerifyLastLayerTailPruneBits {
+            // Full-width reference over the identical post-attention ops:
+            // the pruned output must bit-match its last 64 rows. The layer's
+            // KV slabs are upstream of the prune point (attention ran
+            // full-width), so they are identical by construction.
+            let referenceAttnOut = oProj(mergedAttention)
+            let referenceBoundary = residual + MLXFast.rmsNorm(
+                referenceAttnOut, weight: postAttnNormWeight, eps: eps)
+            let referenceOut: MLXArray
+            if let fusedMLPTail {
+                referenceOut = fusedMLPTail(referenceBoundary, referenceBoundary)
+            } else {
+                var full = MLXFast.rmsNorm(
+                    referenceBoundary, weight: preFfnNormWeight, eps: eps)
+                full = fusedMLP(full)
+                full = MLXFast.rmsNorm(full, weight: postFfnNormWeight, eps: eps)
+                referenceOut = (referenceBoundary + full) * layerScalar
+            }
+            let reference = referenceOut[0..., tailStart..<L, 0...]
+            let matches = arrayEqual(
+                out.view(dtype: .uint16),
+                reference.view(dtype: .uint16)
+            )
+            eval(matches)
+            precondition(
+                matches.item(Bool.self),
+                "last-layer tail prune output differs from the full-width chain"
+            )
         }
         return Gemma4FastLayerResult(
             hidden: out,
@@ -1259,6 +1378,13 @@ final class Gemma4FastEngine {
     let verifyTiedVocabularyHead: Bool
     let supportsExactMTPPair: Bool
     private let logitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray
+    /// Persistent 0-d softcap array reused on every decode step when
+    /// `DARKBLOOM_PRECOMPUTED_SCALAR_VIEWS` is on; nil restores the per-call
+    /// `MLXArray(softcap)` allocation. Same value, same kernel input.
+    private let precomputedSoftcap: MLXArray?
+    /// Fused single-dispatch decode embedding (gather + dequantize + scale).
+    /// nil when unsupported or `DARKBLOOM_FUSED_DECODE_EMBED=0`.
+    private let fusedDecodeEmbed: Gemma4FusedDecodeEmbed?
 
     init(
         model: Gemma4RuntimeModel,
@@ -1311,6 +1437,17 @@ final class Gemma4FastEngine {
 
         let loadedEmbedTokens = try module("model.embed_tokens", as: Embedding.self)
         self.embedTokens = loadedEmbedTokens
+        if gemma4PrecomputedScalarViewsEnabled() {
+            let cap = MLXArray(softcap)
+            eval(cap)
+            self.precomputedSoftcap = cap
+        } else {
+            self.precomputedSoftcap = nil
+        }
+        self.fusedDecodeEmbed = Gemma4FusedDecodeEmbed(
+            loadedEmbedTokens,
+            embedScale: embedScale
+        )
         let tiedHeadRequested = ["1", "true", "yes", "on"].contains(
             ProcessInfo.processInfo.environment["DARKBLOOM_TIED_HEAD_QMV"]?
                 .lowercased() ?? "0"
@@ -1492,7 +1629,16 @@ final class Gemma4FastEngine {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var hidden = embedTokens(inputs) * embedScale
+        var hidden: MLXArray
+        if inputs.ndim == 2, inputs.dim(0) == 1, inputs.dim(1) == 1,
+           inputs.dtype == .int32, let fusedDecodeEmbed
+        {
+            // Single-token decode: one fused gather+dequantize+scale kernel
+            // replaces the five-dispatch stock chain, bit-identical output.
+            hidden = fusedDecodeEmbed(inputs)
+        } else {
+            hidden = embedTokens(inputs) * embedScale
+        }
 
         func layerCache(_ index: Int) -> KVCache? {
             guard let cache, index < cache.count else { return nil }
@@ -1519,7 +1665,9 @@ final class Gemma4FastEngine {
                 hidden,
                 normalizedInput: normalizedInput,
                 mask: mask,
-                cache: layerCache(index)
+                cache: layerCache(index),
+                pruneTail: gemma4LastLayerTailPruneEnabled
+                    && index == layers.count - 1
             )
             hidden = result.hidden
             normalizedInput = result.nextNormalized
@@ -1543,7 +1691,7 @@ final class Gemma4FastEngine {
             hidden = gemma4LastTokenHidden(hidden)
             hidden = MLXFast.rmsNorm(hidden, weight: finalNormWeight, eps: eps)
         }
-        let cap = MLXArray(softcap)
+        let cap = precomputedSoftcap ?? MLXArray(softcap)
         if let tiedVocabularyHead, usePacked13TiedVocabularyHead {
             let candidate = tiedVocabularyHead.packed13Softcapped(
                 hidden,
@@ -1654,7 +1802,7 @@ final class Gemma4FastEngine {
         }
         let logits = tiedVocabularyHead.exactTwoVectorPacked13Softcapped(
             normalizedInput,
-            cap: MLXArray(softcap)
+            cap: precomputedSoftcap ?? MLXArray(softcap)
         )
         return Gemma4MTPForward(
             logits: logits.reshaped(1, 2, logits.dim(-1)),
@@ -1740,7 +1888,7 @@ final class Gemma4FastEngine {
                 eps: eps
             )
         }
-        let cap = MLXArray(softcap)
+        let cap = precomputedSoftcap ?? MLXArray(softcap)
         let logits: MLXArray
         if let tiedVocabularyHead, usePacked13TiedVocabularyHead {
             let positionLogits = (0..<postNorm.dim(1)).map {
