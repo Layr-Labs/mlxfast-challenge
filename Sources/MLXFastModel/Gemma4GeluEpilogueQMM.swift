@@ -15,12 +15,13 @@ import MLXFast
 // affine_qmm_t_nax's gemma4_bk128 dispatch ->
 // qmm_t_nax_tgp_impl<bfloat16_t, 64, 4, aligned_N=true, 64, 128, 64, 2, 2> --
 // the exact template the stock dispatch selects for the up-projection at
-// K=5376, N=21504, M=512-class prefill shapes on M5; host dispatch geometry
-// bm=bn=64, bk=128 staging, wm=wn=2, threadgroup (32, 2, 2), grid
-// (N/64, M/64, B) with the gemma4_m_major logical decode) whose store
-// epilogue additionally loads the already-rounded bf16 gate tile and emits
-// only GELU(gate) * up. The up-out write and the tail's gate/up re-read
-// (44 MB/layer) disappear.
+// K=5376, N=21504, M=512-class prefill shapes on M5. The promoted fallback
+// keeps its BM64/BN64/BK128, WM2/WN2, 128-thread geometry. The scored M=512
+// path narrows only the threadgroup-owned N tile to BN32/WN1 and 64 threads;
+// every SIMDgroup still owns the same M32xN32 accumulator tile and executes
+// the same BK128/SK64/K16 reduction order. Its store epilogue additionally
+// loads the already-rounded bf16 gate tile and emits only GELU(gate) * up.
+// The up-out write and the tail's gate/up re-read (44 MB/layer) disappear.
 //
 // BIT-EXACTNESS CONTRACT
 // ----------------------
@@ -70,6 +71,34 @@ import MLXFast
 let gemma4PrefillGeluEpilogueEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_PREFILL_GELU_EPILOGUE"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+/// Narrower threadgroup geometry for the scored M=512 up projection.
+///
+/// Qualification on the local M4 Max used the full real component (unchanged
+/// d7 gate QMM followed by up QMM + staged exact-BF16 LUT epilogue), not an
+/// isolated synthetic store:
+///
+/// - all 11,010,048 BF16 outputs and both guard regions matched d7 exactly;
+/// - 21/21 balanced pairs won;
+/// - d7 median 21.772750 ms, BN32 median 21.438625 ms;
+/// - paired median speedup 1.015788, IQR [1.013863, 1.017492].
+///
+/// This was promoted despite narrowly missing the provisional 1.02 combined
+/// component bar because the unchanged gate QMM dilutes the separately proven
+/// 1.030926x up-QMM gain, while the full result is exact, uniformly positive,
+/// and has an IQR floor above 1.013. Compiler evidence also retained the same
+/// 96 temporary registers and 208 spilled bytes while halving static
+/// threadgroup memory from 17,408 B to 8,704 B. The promoted BN64 path remains
+/// the fallback for every non-M512 shape; set
+/// `DARKBLOOM_PREFILL_GELU_EPILOGUE_BN32=0` for a complete runtime rollback.
+let gemma4PrefillGeluEpilogueBN32Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_GELU_EPILOGUE_BN32"
     ] else {
         return true
     }
@@ -168,11 +197,85 @@ let gemma4GeluMulEpilogueFunction: String = #"""
     }
     """#
 
+/// BN32/BK128 affine-4/group-64 loader.
+///
+/// BK128 contains exactly two complete quantization groups per output row.
+/// The 64-thread BN32 geometry maps one thread to each `(row, group)` pair,
+/// preserving the promoted loader's scalar-byte dequantization spelling and
+/// destination order while halving the staged row count.
+let gemma4PrefillUpBN32QuantizedLoader: String = #"""
+    template <short dst_ld>
+    struct QuantizedBlockLoader<
+        bfloat16_t,
+        32,
+        128,
+        dst_ld,
+        1,
+        64,
+        64,
+        4> {
+      static_assert(dst_ld >= 128, "Gemma 4 BN32/BK128 loader needs a full row");
+
+      const short row;
+      const short group;
+
+      threadgroup bfloat16_t* dst;
+      const device uint8_t* src;
+      const device bfloat16_t* scales;
+      const device bfloat16_t* biases;
+
+      QuantizedBlockLoader(
+          const device uint8_t* src_,
+          const device bfloat16_t* scales_,
+          const device bfloat16_t* biases_,
+          const int src_ld_,
+          threadgroup bfloat16_t* dst_,
+          ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+          ushort simd_lane_id [[thread_index_in_simdgroup]])
+          : row((simd_group_id * 32 + simd_lane_id) / 2),
+            group((simd_group_id * 32 + simd_lane_id) % 2),
+            dst(dst_ + row * dst_ld + group * 64),
+            src(src_ + row * src_ld_ / 2 + group * 32),
+            scales(scales_ + row * src_ld_ / 64 + group),
+            biases(biases_ + row * src_ld_ / 64 + group) {}
+
+      void load_unsafe() const {
+        const bfloat16_t scale = *scales;
+        const bfloat16_t bias = *biases;
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < 32; ++i) {
+          dequantize<bfloat16_t, 2, 4>(
+              src + i, scale, bias, dst + 2 * i);
+        }
+      }
+
+      void load_safe(short2 src_tile_dim) const {
+        if (row >= src_tile_dim.x) {
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < 64; ++i) {
+            dst[i] = bfloat16_t(0);
+          }
+          return;
+        }
+        load_unsafe();
+      }
+
+      void next() {
+        src += 64;
+        scales += 2;
+        biases += 2;
+      }
+    };
+    """#
+
 /// The cloned aligned BK128 NAX qmm implementation with the fused store
 /// epilogue. Requires the full gemma4GeluEpilogueNAXStack header environment.
+/// `BN=64, WN=2` is the promoted d7 geometry; `BN=32, WN=1` retains the same
+/// M32xN32 per-SIMD accumulator while halving scratch and thread count.
 let gemma4PrefillUpGeluEpilogueImpl: String = #"""
     // Verbatim clone of the aligned fast path of the stock JIT twin's BK128
-    // production instantiation
+    // production instantiation, generalized only across the threadgroup-owned
+    // N tile (promoted d7 BN64/WN2 or qualified BN32/WN1):
     // qmm_t_nax_tgp_impl<bfloat16_t, group_size=64, bits=4, aligned_N=true,
     // BM=64, BK=128, BN=64, WM=2, WN=2> (mlx-generated/quantized_nax.cpp,
     // selected by affine_qmm_t_nax's gemma4_bk128 runtime-K dispatch for
@@ -182,11 +285,12 @@ let gemma4PrefillUpGeluEpilogueImpl: String = #"""
     // takes its kAlignedM/kAlignedN branch. The gemma4_m_major logical decode
     // from the stock entry point is reproduced verbatim above the tile math.
     //
-    // MODE is a diagnostic/verification knob: 2 is the production fused
-    // epilogue; 0 stores the plain rounded up tile (twin behavior, ignores
-    // gate); 1 reads gate but stores the plain rounded up tile (isolates the
-    // gate traffic from the GELU ALU in perf attribution runs).
-    template <const int MODE>
+    // MODE is a diagnostic/verification knob: 3 is the production exact-LUT
+    // fused epilogue; 2 uses bit-identical metal::precise::tanh directly;
+    // 0 stores the plain rounded up tile (twin behavior, ignores gate); 1
+    // reads gate but stores the plain rounded up tile (isolates gate traffic
+    // from GELU ALU in perf-attribution runs).
+    template <const int MODE, const int BN, const int WN>
     METAL_FUNC void gemma4_qmm_t_nax_gelu_impl(
         const device uint32_t* w,
         const device bfloat16_t* scales,
@@ -207,14 +311,24 @@ let gemma4PrefillUpGeluEpilogueImpl: String = #"""
       constexpr int bits = 4;
       constexpr int BM = 64;
       constexpr int BK = 128;
-      constexpr int BN = 64;
       constexpr int WM = 2;
-      constexpr int WN = 2;
+
+      static_assert(
+          (BN == 64 && WN == 2) || (BN == 32 && WN == 1),
+          "supported Gemma 4 up-projection geometries are BN64/WN2 and BN32/WN1");
 
       constexpr int pack_factor = get_pack_factor<bits, 8>();
       constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
       constexpr int BK_padded = (BK + 16 / sizeof(T));
+      constexpr int GATE_LD = BN == 32 ? 32 : BK_padded;
+      static_assert(GATE_LD % 8 == 0, "gate rows must remain uint4 aligned");
+      static_assert(
+          BM * GATE_LD <= BN * BK_padded,
+          "the aliased weight stage must contain the complete gate tile");
+      static_assert(
+          (BM - 1) * GATE_LD + (BN - 1) < BN * BK_padded,
+          "the final gate element must remain inside the aliased weight stage");
 
       using loader_w_t = QuantizedBlockLoader<
           T,
@@ -320,24 +434,24 @@ let gemma4PrefillUpGeluEpilogueImpl: String = #"""
       // Store results to device memory with the fused GELU(gate)*up epilogue.
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
-      // Stage this threadgroup's 64x64 bf16 gate tile into the now-free
-      // weight staging buffer with fully coalesced 16-byte loads (each row
-      // is 128 contiguous bytes), then emit GELU(gate)*up with the exact
+      // Stage this threadgroup's 64xBN bf16 gate tile into the now-free
+      // weight staging buffer with fully coalesced 16-byte loads, then emit
+      // GELU(gate)*up with the exact
       // element addressing of NAXTile<float, TM, TN>::store(y + tm * N +
       // tn, N) -- the twin's aligned store. The fp32 accumulator rounds to
       // bf16 exactly like the store's static_cast, then GELU(gate)*up is
       // emitted instead of the raw up tile.
       //
       // Gs reuses Ws: the barrier above guarantees the last MMA tile read
-      // has completed, and the buffer is BN * BK_padded = 64 * 136 bf16,
-      // larger than the padded gate tile footprint (64 * 136 with the same
-      // stride).
+      // has completed. BN64 retains the promoted padded gate stride 136;
+      // BN32 packs the 64x32 gate tile densely with stride 32, so its 2,048
+      // bf16 values fit inside the 32x136 (4,352-value) weight stage.
       if constexpr (MODE > 0) {
         threadgroup T* Gs = Ws;
         const device uint4* gate_words =
             reinterpret_cast<const device uint4*>(gate);
         // gate is [M, N] bf16 row-major; this tile starts at
-        // (y_row, y_col). N and 64 are multiples of 8, so word addressing
+        // (y_row, y_col). N and BN are multiples of 8, so word addressing
         // (8 bf16 per uint4) is exact.
         const int word_row_stride = N / 8;
         const int tgp_threads = WM * WN * SIMD_SIZE;
@@ -350,14 +464,14 @@ let gemma4PrefillUpGeluEpilogueImpl: String = #"""
           const uint4 packed =
               gate_words[row * word_row_stride + word];
           *(reinterpret_cast<threadgroup uint4*>(
-              Gs + row * BK_padded + word * 8)) = packed;
+              Gs + row * GATE_LD + word * 8)) = packed;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         const short2 sc = BaseNAXFrag::get_coord();
         device T* y_tile = y + tm * N + tn + sc.y * N + sc.x;
-        const threadgroup T* g_tile = Gs + tm * BK_padded + tn
-            + sc.y * BK_padded + sc.x;
+        const threadgroup T* g_tile = Gs + tm * GATE_LD + tn
+            + sc.y * GATE_LD + sc.x;
         STEEL_PRAGMA_UNROLL
         for (short i = 0; i < TM; ++i) {
           STEEL_PRAGMA_UNROLL
@@ -370,7 +484,7 @@ let gemma4PrefillUpGeluEpilogueImpl: String = #"""
               if constexpr (MODE == 2) {
                 // 4-wide lanes: same element map, one vector store per row.
                 const vec<T, 4> g4 = *reinterpret_cast<const threadgroup vec<T, 4>*>(
-                    g_tile + r * BK_padded + c);
+                    g_tile + r * GATE_LD + c);
                 const vec<T, 4> u4 = vec<T, 4>(
                     static_cast<T>(frag[ii * 4 + 0]),
                     static_cast<T>(frag[ii * 4 + 1]),
@@ -380,7 +494,7 @@ let gemma4PrefillUpGeluEpilogueImpl: String = #"""
                     gemma4_gelu_mul_bf16x4(g4, u4);
               } else if constexpr (MODE == 3) {
                 const vec<T, 4> g4 = *reinterpret_cast<const threadgroup vec<T, 4>*>(
-                    g_tile + r * BK_padded + c);
+                    g_tile + r * GATE_LD + c);
                 const vec<T, 4> u4 = vec<T, 4>(
                     static_cast<T>(frag[ii * 4 + 0]),
                     static_cast<T>(frag[ii * 4 + 1]),
@@ -408,15 +522,39 @@ let gemma4PrefillUpGeluEpilogueImpl: String = #"""
 /// The complete additional header for the fused kernel: epilogue function
 /// plus the cloned qmm implementation, appended after the verbatim NAX stack.
 let gemma4PrefillUpGeluEpilogueHeader: String =
-    gemma4GeluMulEpilogueFunction + gemma4PrefillUpGeluEpilogueImpl
+    gemma4GeluMulEpilogueFunction
+        + gemma4PrefillUpBN32QuantizedLoader
+        + gemma4PrefillUpGeluEpilogueImpl
 
-/// Kernel body: dispatch the cloned implementation with the stock twin's
-/// threadgroup geometry (32, 2, 2) and Ws[BN * BK_padded] (64 * 136 bf16 =
-/// 17,408 B, the exact scratch reservation the stock gemma4_bk128 dispatch
-/// makes).
-private let gemma4PrefillUpGeluEpilogueSource: String = #"""
+/// Promoted fallback body: dispatch the cloned implementation with the stock
+/// twin's threadgroup geometry (32, 2, 2) and Ws[BN * BK_padded]
+/// (64 * 136 bf16 = 17,408 B, the exact scratch reservation the stock
+/// gemma4_bk128 dispatch makes).
+private let gemma4PrefillUpGeluEpilogueBN64Source: String = #"""
         threadgroup bfloat16_t Ws[64 * 136];
-        gemma4_qmm_t_nax_gelu_impl<MODE>(
+        gemma4_qmm_t_nax_gelu_impl<MODE, 64, 2>(
+            w,
+            scales,
+            biases,
+            x,
+            gate,
+            tanh_lut,
+            output,
+            Ws,
+            K,
+            N,
+            M,
+            threadgroup_position_in_grid,
+            simdgroup_index_in_threadgroup,
+            thread_index_in_simdgroup);
+        """#
+
+/// Candidate body: the same M32xN32 NAX accumulator per SIMDgroup, but one N
+/// SIMDgroup column and two M SIMDgroup rows.  The 32x136 BF16 weight stage is
+/// 8,704 bytes and is subsequently reused as a dense-stride 64x32 gate tile.
+private let gemma4PrefillUpGeluEpilogueBN32Source: String = #"""
+        threadgroup bfloat16_t Ws[32 * 136];
+        gemma4_qmm_t_nax_gelu_impl<MODE, 32, 1>(
             w,
             scales,
             biases,
@@ -454,11 +592,20 @@ private let gemma4TanhBFloat16LUT = Gemma4TanhBFloat16LUTBox(
     }()
 )
 
-private let gemma4PrefillUpGeluEpilogueKernel = MLXFast.metalKernel(
+private let gemma4PrefillUpGeluEpilogueBN64Kernel = MLXFast.metalKernel(
     name: "gemma4_prefill_up_gelu_epilogue_nax_bk128_v1",
     inputNames: ["w", "scales", "biases", "x", "gate", "tanh_lut", "K", "N", "M"],
     outputNames: ["output"],
-    source: gemma4PrefillUpGeluEpilogueSource,
+    source: gemma4PrefillUpGeluEpilogueBN64Source,
+    header: gemma4GeluEpilogueNAXStack + gemma4PrefillUpGeluEpilogueHeader,
+    ensureRowContiguous: true
+)
+
+private let gemma4PrefillUpGeluEpilogueBN32Kernel = MLXFast.metalKernel(
+    name: "gemma4_prefill_up_gelu_epilogue_nax_bn32_bk128_v1",
+    inputNames: ["w", "scales", "biases", "x", "gate", "tanh_lut", "K", "N", "M"],
+    outputNames: ["output"],
+    source: gemma4PrefillUpGeluEpilogueBN32Source,
     header: gemma4GeluEpilogueNAXStack + gemma4PrefillUpGeluEpilogueHeader,
     ensureRowContiguous: true
 )
@@ -494,11 +641,22 @@ func gemma4PrefillUpGeluEpilogue(
     precondition(biases.dtype == .bfloat16 && biases.shape == [N, K / 64])
     precondition(gate.shape == [M, N])
     precondition((0...3).contains(mode))
-    return gemma4PrefillUpGeluEpilogueKernel(
-        [
-            weight, scales, biases, x, gate, gemma4TanhBFloat16LUT.table,
-            MLXArray(Int32(K)), MLXArray(Int32(N)), MLXArray(Int32(M)),
-        ],
+    let inputs = [
+        weight, scales, biases, x, gate, gemma4TanhBFloat16LUT.table,
+        MLXArray(Int32(K)), MLXArray(Int32(N)), MLXArray(Int32(M)),
+    ]
+    if gemma4PrefillGeluEpilogueBN32Enabled && M == 512 {
+        return gemma4PrefillUpGeluEpilogueBN32Kernel(
+            inputs,
+            template: [("MODE", mode)],
+            grid: ((N / 32) * 32, (M / 64), 2),
+            threadGroup: (32, 1, 2),
+            outputShapes: [[M, N]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+    return gemma4PrefillUpGeluEpilogueBN64Kernel(
+        inputs,
         template: [("MODE", mode)],
         grid: ((N / 64) * 32, (M / 64) * 2, 2),
         threadGroup: (32, 2, 2),
