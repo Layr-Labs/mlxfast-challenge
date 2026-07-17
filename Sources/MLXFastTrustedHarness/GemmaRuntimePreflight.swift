@@ -241,15 +241,26 @@ extension GemmaRuntime {
         defer {
             try? handle.close()
         }
+        // Digest bytes are short-lived. Keeping a second copy in the unified
+        // buffer cache while the model is about to load can exhaust 36 GB
+        // machines, so match the runtime weight loader's uncached read path.
+        _ = Darwin.fcntl(handle.fileDescriptor, F_NOCACHE, 1)
+        _ = Darwin.fcntl(handle.fileDescriptor, F_RDAHEAD, 0)
 
         var hasher = SHA256()
         let chunkSize = 8 * 1024 * 1024
         while true {
-            let data = handle.readData(ofLength: chunkSize)
-            if data.isEmpty {
+            let reachedEOF = autoreleasepool {
+                let data = handle.readData(ofLength: chunkSize)
+                if data.isEmpty {
+                    return true
+                }
+                hasher.update(data: data)
+                return false
+            }
+            if reachedEOF {
                 return hasher.finalize()
             }
-            hasher.update(data: data)
         }
     }
 
