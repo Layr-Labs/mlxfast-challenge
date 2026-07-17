@@ -19,8 +19,38 @@ DEFAULT_CACHE_ROOT="${HOME}/.cache/mlxfast/gemma4-31b-it-mtp-v1"
 CACHE_ROOT="${MLXFAST_MTP_CACHE_ROOT:-${DEFAULT_CACHE_ROOT}}"
 TARGET_DIR="${MLXFAST_MTP_TARGET_DIR:-${CACHE_ROOT}/target}"
 ASSISTANT_DIR="${MLXFAST_MTP_ASSISTANT_DIR:-${CACHE_ROOT}/assistant}"
-TARGET_BASE_URL="https://huggingface.co/${TARGET_MODEL_ID}/resolve/${TARGET_REVISION}"
-ASSISTANT_BASE_URL="https://huggingface.co/${ASSISTANT_MODEL_ID}/resolve/${ASSISTANT_REVISION}"
+
+# The target checkpoint is not mirrored yet. Keep Hugging Face primary and the
+# fallback slot empty so a future flat mirror only requires changing/overriding
+# the primary URL (and optionally retaining this Hugging Face URL as fallback).
+DEFAULT_TARGET_BASE_URL="https://huggingface.co/${TARGET_MODEL_ID}/resolve/${TARGET_REVISION}"
+DEFAULT_TARGET_FALLBACK_BASE_URL=""
+TARGET_BASE_URL="${MLXFAST_MTP_TARGET_BASE_URL:-${DEFAULT_TARGET_BASE_URL}}"
+if [[ -n "${MLXFAST_MTP_TARGET_FALLBACK_BASE_URL+x}" ]]; then
+  TARGET_FALLBACK_BASE_URL="${MLXFAST_MTP_TARGET_FALLBACK_BASE_URL}"
+elif [[ "${TARGET_BASE_URL}" == "${DEFAULT_TARGET_BASE_URL}" ]]; then
+  TARGET_FALLBACK_BASE_URL="${DEFAULT_TARGET_FALLBACK_BASE_URL}"
+else
+  TARGET_FALLBACK_BASE_URL=""
+fi
+
+# The assistant is mirrored as flat, manifest-pinned files in Darkbloom R2.
+# Stalled or failed mirror downloads fall back to the pinned Hugging Face
+# revision. An explicitly overridden primary has no implicit fallback.
+DEFAULT_ASSISTANT_BASE_URL="https://ds4.darkbloom.ai/gemma-4-31B-it-qat-assistant-4bit"
+DEFAULT_ASSISTANT_FALLBACK_BASE_URL="https://huggingface.co/${ASSISTANT_MODEL_ID}/resolve/${ASSISTANT_REVISION}"
+ASSISTANT_BASE_URL="${MLXFAST_MTP_ASSISTANT_BASE_URL:-${DEFAULT_ASSISTANT_BASE_URL}}"
+if [[ -n "${MLXFAST_MTP_ASSISTANT_FALLBACK_BASE_URL+x}" ]]; then
+  ASSISTANT_FALLBACK_BASE_URL="${MLXFAST_MTP_ASSISTANT_FALLBACK_BASE_URL}"
+elif [[ "${ASSISTANT_BASE_URL}" == "${DEFAULT_ASSISTANT_BASE_URL}" ]]; then
+  ASSISTANT_FALLBACK_BASE_URL="${DEFAULT_ASSISTANT_FALLBACK_BASE_URL}"
+else
+  ASSISTANT_FALLBACK_BASE_URL=""
+fi
+
+MTP_APPEND_DOWNLOAD_QUERY="${MLXFAST_MTP_APPEND_DOWNLOAD_QUERY:-auto}"
+MTP_DOWNLOAD_STALL_SECONDS="${MLXFAST_MTP_DOWNLOAD_STALL_SECONDS:-120}"
+MTP_DOWNLOAD_MIN_BYTES_PER_SECOND="${MLXFAST_MTP_DOWNLOAD_MIN_BYTES_PER_SECOND:-1048576}"
 
 VERIFY_ONLY=0
 PROVISION_TARGET=1
@@ -43,6 +73,13 @@ Overrides:
   MLXFAST_MTP_CACHE_ROOT
   MLXFAST_MTP_TARGET_DIR
   MLXFAST_MTP_ASSISTANT_DIR
+  MLXFAST_MTP_TARGET_BASE_URL
+  MLXFAST_MTP_TARGET_FALLBACK_BASE_URL
+  MLXFAST_MTP_ASSISTANT_BASE_URL
+  MLXFAST_MTP_ASSISTANT_FALLBACK_BASE_URL
+  MLXFAST_MTP_APPEND_DOWNLOAD_QUERY
+  MLXFAST_MTP_DOWNLOAD_STALL_SECONDS
+  MLXFAST_MTP_DOWNLOAD_MIN_BYTES_PER_SECOND
 
 This command does not alter or replace the normal base-track reference cache.
 EOF
@@ -182,14 +219,75 @@ verify_file() {
   [[ "${actual_hash}" == "${expected_hash}" ]]
 }
 
+validate_download_settings() {
+  local name
+  local value
+
+  for name in \
+    MTP_DOWNLOAD_STALL_SECONDS \
+    MTP_DOWNLOAD_MIN_BYTES_PER_SECOND; do
+    value="${!name}"
+    if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "setup-mtp.sh: ${name} must be a positive integer" >&2
+      return 1
+    fi
+  done
+}
+
+download_url_for_file() {
+  local url="$1"
+  local append_query=0
+  local separator="?"
+
+  case "${MTP_APPEND_DOWNLOAD_QUERY}" in
+    1|true|TRUE|yes|YES)
+      append_query=1
+      ;;
+    0|false|FALSE|no|NO)
+      append_query=0
+      ;;
+    auto|"")
+      if [[ "${url}" == https://huggingface.co/* || "${url}" == http://huggingface.co/* ]]; then
+        append_query=1
+      fi
+      ;;
+    *)
+      echo "setup-mtp.sh: MLXFAST_MTP_APPEND_DOWNLOAD_QUERY must be auto, true, or false" >&2
+      return 1
+      ;;
+  esac
+
+  if [[ "${append_query}" == "1" ]]; then
+    if [[ "${url}" == *\?* ]]; then
+      separator="&"
+    fi
+    url="${url}${separator}download=true"
+  fi
+
+  printf '%s\n' "${url}"
+}
+
 download_file() {
   local base_url="$1"
-  local relative="$2"
-  local output="$3"
-  local expected_hash="$4"
-  local expected_size="$5"
-  local label="$6"
+  local fallback_base_url="$2"
+  local relative="$3"
+  local output="$4"
+  local expected_hash="$5"
+  local expected_size="$6"
+  local label="$7"
   local partial="${output}.partial"
+  local source_base_url
+  local url
+  local attempt
+  local curl_status
+  local source_index=0
+  local source_count
+  local base_urls=("${base_url}")
+
+  if [[ -n "${fallback_base_url}" && "${fallback_base_url}" != "${base_url}" ]]; then
+    base_urls+=("${fallback_base_url}")
+  fi
+  source_count="${#base_urls[@]}"
 
   if verify_file "${output}" "${expected_hash}" "${expected_size}" "${label}"; then
     echo "setup-mtp.sh: using verified ${label}"
@@ -208,28 +306,67 @@ download_file() {
     return 1
   fi
 
-  echo "setup-mtp.sh: downloading ${label}"
-  if ! curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
-      --continue-at - --output "${partial}" "${base_url}/${relative}"; then
-    echo "setup-mtp.sh: resume failed for ${label}; retrying from byte zero" >&2
-    rm -f "${partial}"
-    curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
-      --output "${partial}" "${base_url}/${relative}"
-  fi
-  if ! verify_file "${partial}" "${expected_hash}" "${expected_size}" "${label}"; then
-    echo "setup-mtp.sh: downloaded ${label} failed size/SHA256 verification" >&2
-    rm -f "${partial}"
-    return 1
-  fi
-  mv -f "${partial}" "${output}"
-  verify_file "${output}" "${expected_hash}" "${expected_size}" "${label}"
+  for source_base_url in "${base_urls[@]}"; do
+    source_index=$((source_index + 1))
+    url="${source_base_url%/}/${relative}"
+    if ! url="$(download_url_for_file "${url}")"; then
+      return 1
+    fi
+
+    if [[ "${source_index}" -gt 1 ]]; then
+      echo "setup-mtp.sh: trying fallback source for ${label}: ${source_base_url}"
+    fi
+
+    attempt=1
+    while [[ "${attempt}" -le 2 ]]; do
+      if [[ "${attempt}" == "1" ]]; then
+        echo "setup-mtp.sh: downloading ${label}"
+      else
+        echo "setup-mtp.sh: redownloading ${label} from scratch after hash verification failed"
+        rm -f "${partial}"
+      fi
+
+      curl_status=0
+      curl \
+        --fail \
+        --location \
+        --retry 5 \
+        --retry-all-errors \
+        --retry-delay 2 \
+        --continue-at - \
+        --speed-limit "${MTP_DOWNLOAD_MIN_BYTES_PER_SECOND}" \
+        --speed-time "${MTP_DOWNLOAD_STALL_SECONDS}" \
+        --output "${partial}" \
+        "${url}" || curl_status=$?
+      if [[ "${curl_status}" != "0" ]]; then
+        echo "setup-mtp.sh: ${label} source failed or stalled (status=${curl_status}, source=${source_base_url})" >&2
+        break
+      fi
+
+      if verify_file "${partial}" "${expected_hash}" "${expected_size}" "${label}"; then
+        mv -f "${partial}" "${output}"
+        verify_file "${output}" "${expected_hash}" "${expected_size}" "${label}"
+        return
+      fi
+
+      attempt=$((attempt + 1))
+    done
+
+    if [[ "${source_index}" -lt "${source_count}" && "${curl_status}" == "0" ]]; then
+      rm -f "${partial}"
+    fi
+  done
+
+  echo "setup-mtp.sh: failed to download verified ${label}" >&2
+  return 1
 }
 
 provision_manifest() {
   local manifest="$1"
   local destination="$2"
   local base_url="$3"
-  local label="$4"
+  local fallback_base_url="$4"
+  local label="$5"
   local line
   local hash
   local size
@@ -245,7 +382,7 @@ provision_manifest() {
     read -r hash size relative extra <<< "${line}"
     expected_files+=("${relative}")
     download_file \
-      "${base_url}" "${relative}" "${destination}/${relative}" \
+      "${base_url}" "${fallback_base_url}" "${relative}" "${destination}/${relative}" \
       "${hash}" "${size}" "${label} ${relative}"
   done < "${manifest}"
 
@@ -272,14 +409,18 @@ provision_manifest() {
   echo "setup-mtp.sh: verified ${label} at ${destination}"
 }
 
+validate_download_settings
+
 if [[ "${PROVISION_TARGET}" == "1" ]]; then
   provision_manifest \
-    "${TARGET_MANIFEST}" "${TARGET_DIR}" "${TARGET_BASE_URL}" \
+    "${TARGET_MANIFEST}" "${TARGET_DIR}" \
+    "${TARGET_BASE_URL}" "${TARGET_FALLBACK_BASE_URL}" \
     "Gemma 4 31B-IT target"
 fi
 if [[ "${PROVISION_ASSISTANT}" == "1" ]]; then
   provision_manifest \
-    "${ASSISTANT_MANIFEST}" "${ASSISTANT_DIR}" "${ASSISTANT_BASE_URL}" \
+    "${ASSISTANT_MANIFEST}" "${ASSISTANT_DIR}" \
+    "${ASSISTANT_BASE_URL}" "${ASSISTANT_FALLBACK_BASE_URL}" \
     "Gemma 4 31B-IT assistant"
 fi
 
