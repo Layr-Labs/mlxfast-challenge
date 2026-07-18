@@ -23,6 +23,11 @@ private let gemma4VerifyTiedHeadCoTiledBits = gemma4TiedHeadEnvironmentFlag(
     default: false
 )
 
+private let gemma4TiedHeadEightSIMDGroups = gemma4TiedHeadEnvironmentFlag(
+    "DARKBLOOM_TIED_HEAD_EIGHT_SIMDGROUPS",
+    default: true
+)
+
 private let gemma4TiedVocabularyHeadQMV = MLXFast.metalKernel(
     name: "gemma4_tied_vocabulary_head_qmv_262144x5376_v1",
     inputNames: ["weight", "scales", "biases", "x"],
@@ -272,38 +277,42 @@ private let gemma4TiedVocabularyHeadPacked13SoftcapQMV = MLXFast.metalKernel(
 /// extraction below reconstructs the exact 13-bit indexes the packed13
 /// kernel's word-based extraction produces.
 private let gemma4CoTiledTiedVocabularyHeadPacked13SoftcapQMV = MLXFast.metalKernel(
-    name: "gemma4_cotiled_tied_vocabulary_head_packed13_softcap_qmv_262144x5376_v1",
+    name: "gemma4_cotiled_tied_vocabulary_head_packed13_softcap_qmv_262144x5376_v2",
     inputNames: ["cotiled_payload", "lut", "x", "cap"],
     outputNames: ["output"],
     source: """
         constexpr int kRowsPerSIMD = 4;
         constexpr int kSIMDSize = 32;
         constexpr int kSlotWeightWords = kRowsPerSIMD * kSIMDSize;
-        constexpr int kSlotsPerThreadgroup = 4;
+        // The transformed stream is authored in four-slot payload tiles.
+        // Launch topology is independent: adjacent tiles can share a larger
+        // threadgroup without changing any payload address or arithmetic.
+        constexpr int kPayloadSlots = 4;
         constexpr int kBlockWeightWords =
-            kSlotsPerThreadgroup * kSlotWeightWords;
+            kPayloadSlots * kSlotWeightWords;
         constexpr int kPairWeightWords = 2 * kBlockWeightWords;
         constexpr int kPairCount = 10;
         constexpr int kPairMetadataBytesPerRow = 13;
         constexpr int kSlotPairMetadataBytes =
             kRowsPerSIMD * kPairMetadataBytesPerRow;
         constexpr int kWordsPerPair = kPairWeightWords
-            + kSlotsPerThreadgroup * kSlotPairMetadataBytes / 4;
+            + kPayloadSlots * kSlotPairMetadataBytes / 4;
         constexpr int kWordsPerTail =
-            kBlockWeightWords + 8 * kSlotsPerThreadgroup;
-        constexpr int kWordsPerThreadgroup =
+            kBlockWeightWords + 8 * kPayloadSlots;
+        constexpr int kWordsPerPayloadTile =
             kPairCount * kWordsPerPair + kWordsPerTail;
 
-        const int slot = simdgroup_index_in_threadgroup;
-        const int output_row =
-            threadgroup_position_in_grid.y
-                * kRowsPerSIMD * kSlotsPerThreadgroup
-            + slot * kRowsPerSIMD;
+        const uint global_slot =
+            threadgroup_position_in_grid.y * threads_per_threadgroup.y
+            + simdgroup_index_in_threadgroup;
+        const uint payload_tile = global_slot / kPayloadSlots;
+        const uint payload_slot = global_slot % kPayloadSlots;
+        const uint output_row = global_slot * kRowsPerSIMD;
 
         const uint lane = thread_index_in_simdgroup;
         const uint lane_group = lane >> 3;
         const device uint* tile_words = cotiled_payload
-            + threadgroup_position_in_grid.y * kWordsPerThreadgroup;
+            + payload_tile * kWordsPerPayloadTile;
         const device bfloat* input = x + lane * 8;
 
         float result[kRowsPerSIMD] = {0};
@@ -314,13 +323,13 @@ private let gemma4CoTiledTiedVocabularyHeadPacked13SoftcapQMV = MLXFast.metalKer
             uint odd_luts[kRowsPerSIMD];
 
             const device uint* even_weight_words = tile_words
-                + slot * kSlotWeightWords + lane;
+                + payload_slot * kSlotWeightWords + lane;
             const device uint* odd_weight_words = tile_words
-                + kBlockWeightWords + slot * kSlotWeightWords + lane;
+                + kBlockWeightWords + payload_slot * kSlotWeightWords + lane;
             const device uchar* metadata_bytes =
                 reinterpret_cast<const device uchar*>(
                     tile_words + kPairWeightWords)
-                + slot * kSlotPairMetadataBytes;
+                + payload_slot * kSlotPairMetadataBytes;
 
             #pragma clang loop unroll(full)
             for (int row = 0; row < kRowsPerSIMD; ++row) {
@@ -374,11 +383,11 @@ private let gemma4CoTiledTiedVocabularyHeadPacked13SoftcapQMV = MLXFast.metalKer
         const float tail_input_sum =
             gemma4_cotiled_tied_head_load_values(input, tail_values);
         const device uint* tail_weight_words = tile_words
-            + slot * kSlotWeightWords + lane;
+            + payload_slot * kSlotWeightWords + lane;
         const device uchar* tail_metadata =
             reinterpret_cast<const device uchar*>(
                 tile_words + kBlockWeightWords)
-            + slot * 32;
+            + payload_slot * 32;
         #pragma clang loop unroll(full)
         for (int row = 0; row < kRowsPerSIMD; ++row) {
             const device uchar* row_tail = tail_metadata + row * 8;
@@ -688,10 +697,11 @@ struct Gemma4TiedVocabularyHead: @unchecked Sendable {
         payload: Gemma4TiedHeadCoTiledPayload,
         metadata: Gemma4TiedHeadPacked13Metadata
     ) -> MLXArray {
-        gemma4CoTiledTiedVocabularyHeadPacked13SoftcapQMV(
+        let simdGroups = gemma4TiedHeadEightSIMDGroups ? 8 : 4
+        return gemma4CoTiledTiedVocabularyHeadPacked13SoftcapQMV(
             [payload.words, metadata.lut, input, cap],
             grid: (32, 65_536, 1),
-            threadGroup: (32, 4, 1),
+            threadGroup: (32, simdGroups, 1),
             outputShapes: [[1, 1, 262_144]],
             outputDTypes: [.float32]
         )[0]
