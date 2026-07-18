@@ -133,20 +133,23 @@ let gemma4VerifyLastLayerQPruneBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
-/// Prefill pipeline chunk size, in layers. Default 20.
+/// Prefill pipeline chunk size, in layers. Default 18.
 ///
 /// The ranked prefill is one lazy graph evaluated once at the head; the
 /// graph-end-to-final-eval boundary leaves dispatch bubbles. A
 /// scheduling-only `asyncEval` every N layers pulls GPU execution into the
-/// layer loop (measured +2.5% prefill at N=20 locally; the computed values
-/// are unchanged -- same kernels, same accumulation order). Only engages
-/// for multi-token forwards (L > 1); decode is untouched. Set
+/// layer loop. Eighteen layers contain exactly three of Gemma 4's repeating
+/// five-sliding-plus-one-full attention motifs, making the first three chunks
+/// compute-balanced while preserving the promoted path's three intermediate
+/// evaluations. The computed values are unchanged -- same kernels, same
+/// accumulation order. Only engages for multi-token forwards (L > 1); decode
+/// is untouched. Set
 /// `DARKBLOOM_PREFILL_CHUNK_EVAL=0` to restore the single-eval schedule.
 let gemma4PrefillChunkEvalLayers: Int = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_PREFILL_CHUNK_EVAL"
     ], let value = Int(raw) else {
-        return 20
+        return 18
     }
     return max(0, value)
 }()
@@ -1919,8 +1922,9 @@ final class Gemma4FastEngine {
             // bubbles between graph-end and the giant final eval. A
             // scheduling-only asyncEval every N layers pulls that GPU
             // execution into the layer loop and overlaps it with the
-            // remaining graph construction (measured +2.5% prefill locally,
-            // chunk=20; same kernels and accumulation order either way).
+            // remaining graph construction. The default 18-layer chunks each
+            // contain three complete 5-sliding + 1-full attention motifs;
+            // kernels and accumulation order are unchanged.
             if gemma4PrefillChunkEvalLayers > 0,
                inputs.dim(1) > 1,
                layerNumber.isMultiple(of: gemma4PrefillChunkEvalLayers)
