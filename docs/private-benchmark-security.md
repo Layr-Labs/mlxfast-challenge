@@ -7,13 +7,17 @@ single-machine pipeline: how private material is handled, what confines
 submitted code while it runs, which output channels are closed, and which
 gaps are known and stated rather than papered over.
 
+The MTP-default migration reused the same runner, sandbox, hidden-material,
+and artifact controls. Sections below that discuss GPQA or teacher-forced
+base-model gates describe the archived `serial-benchmark.yml` path; the live
+default substitutes the pinned MTP correctness and benchmark goldens.
+
 ## Single-machine ranked topology
 
-Ranked runs execute through `.github/workflows/benchmark.yml` as one serial
-job on a single operator-supervised, self-hosted Apple M5 Max machine
-(runner label `m5-bench`). Build, transform, the public correctness gate,
-the hidden 64-step base case plus behavior/GPQA gates, the semantic judge,
-and the timed paired measurement all run in order on that one box. The
+Ranked runs execute through `.github/workflows/benchmark.yml` as one MTP
+track job on a single operator-supervised, self-hosted Apple M5 Max machine
+(runner label `m5-bench`). Build, IT-target transform, hidden MTP correctness,
+and alternating serial-K1/MTP paired timing all run in order on that box. The
 previous multi-VM topology — parallel correctness slices, a separate
 paired-baseline timing VM, and a combine job — is retired; the guards it
 duplicated across privileged jobs now run once inside the single job, in

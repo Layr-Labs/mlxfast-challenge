@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Ensure private MTP-track benchmark material is only used by this repository's
-# MTP benchmark workflow on an explicitly permitted branch namespace. Sibling
-# of enforce-trusted-benchmark-workflow.sh (which pins the SERIAL ranked
-# workflow); the two tracks stay pinned to their own distinct workflow files.
+# Ensure private serial-track benchmark material is only used by this
+# repository's legacy serial workflow on an explicitly permitted branch
+# namespace. The Yukon-default MTP workflow is pinned independently by
+# enforce-trusted-benchmark-workflow.sh.
 set -euo pipefail
 
 readonly TRUSTED_REPOSITORY="Layr-Labs/mlxfast-challenge-dev"
-readonly WORKFLOW_PATH=".github/workflows/mtp-benchmark.yml"
+readonly WORKFLOW_PATH=".github/workflows/serial-benchmark.yml"
 
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 : "${GITHUB_REF:?GITHUB_REF is required}"
@@ -14,12 +14,12 @@ readonly WORKFLOW_PATH=".github/workflows/mtp-benchmark.yml"
 : "${GITHUB_EVENT_NAME:?GITHUB_EVENT_NAME is required}"
 
 if [[ "${GITHUB_REPOSITORY}" != "${TRUSTED_REPOSITORY}" ]]; then
-  echo "::error::private MTP benchmark workflow must run in ${TRUSTED_REPOSITORY}, not ${GITHUB_REPOSITORY}" >&2
+  echo "::error::private serial benchmark workflow must run in ${TRUSTED_REPOSITORY}, not ${GITHUB_REPOSITORY}" >&2
   exit 1
 fi
 
 if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]]; then
-  echo "::error::private MTP benchmark workflow only supports workflow_dispatch" >&2
+  echo "::error::private serial benchmark workflow only supports workflow_dispatch" >&2
   exit 1
 fi
 
@@ -27,7 +27,7 @@ case "${GITHUB_REF}" in
   refs/heads/main|refs/heads/submissions/*|refs/heads/baseline/*|refs/heads/yukon/baseline/*)
     ;;
   *)
-    echo "::error::private MTP benchmark workflow ref is not allowed: ${GITHUB_REF}" >&2
+    echo "::error::private serial benchmark workflow ref is not allowed: ${GITHUB_REF}" >&2
     echo "::error::allowed branches are main, submissions/*, baseline/*, and yukon/baseline/*" >&2
     exit 1
     ;;
@@ -40,4 +40,4 @@ if [[ "${GITHUB_WORKFLOW_REF}" != "${expected_workflow_ref}" ]]; then
   exit 1
 fi
 
-echo "mtp-benchmark: trusted workflow verified ${GITHUB_WORKFLOW_REF}"
+echo "serial-benchmark: trusted workflow verified ${GITHUB_WORKFLOW_REF}"

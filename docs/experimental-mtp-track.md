@@ -1,11 +1,13 @@
-# Experimental Gemma 4 31B-IT MTP Track
+# Gemma 4 31B-IT MTP Track
 
-## Status and isolation
+## Status and default routing
 
-This is a Phase 1, opt-in prototype. It is not an official ranked track and
-cannot emit a score. The existing base-model `benchmark`,
-`--local-iterate`, `--local-submit`, worker protocol, score formula, baseline,
-and speculation ban remain unchanged.
+This is the default official ranked track, with track ID
+`gemma4-31b-it-mtp-v1`. Yukon reads `benchmark.json`, dispatches
+`.github/workflows/benchmark.yml`, and ingests `score.json`. Official scoring
+is decode-only paired speedup against the pinned serial K=1 target baseline.
+The former base-model serial challenge is archived as
+`benchmark.serial.json` and `.github/workflows/serial-benchmark.yml`.
 
 The two experimental commands are:
 
@@ -13,7 +15,8 @@ The two experimental commands are:
 - `mtp-benchmark`: a real trained-assistant MTP path that refuses to run
   without `--require-trained-assistant`.
 
-No environment variable can turn serial `benchmark` into MTP.
+The `mtp-*` commands remain protocol-explicit; no environment variable can
+turn the archived serial `benchmark` command into MTP.
 
 ## Compatibility conclusion
 
@@ -337,7 +340,7 @@ already fixed; see "First-block stall: root cause and fix".)
 
 ### Proposed scoring (pending operator calibration)
 
-The contract's `proposed_scoring` block records the intended ranked form:
+The contract's `proposed_scoring` block records the adopted ranked form:
 
 ```text
 mtp_decode_speedup = paired_serial_decode_sec_per_token / mtp_decode_sec_per_token
@@ -362,9 +365,8 @@ score = mtp_decode_speedup          (decode-only; floor >= 1.0)
   (~1.5s run-to-run) still needs multi-pair averaging (see "First-block
   stall: root cause and fix").
 - The leaderboard namespace is `gemma4-31b-it-mtp-v1`, fully separate from
-  the serial leaderboard; `official_scoring_enabled` stays false until the
-  operator freezes hidden IT-target goldens and calibrates floors from
-  fresh gated sessions.
+  the archived serial configuration; `official_scoring_enabled` is true
+  after the hidden IT-target goldens and M5 floors were frozen.
 
 ## Scoring and rebaseline contract
 
@@ -542,21 +544,20 @@ Before publication, organizers must:
    remains, so still require the multi-pair alternating-order protocol above
    before quoting single-pair scores.
 
-The distinct workflow for item 6 is drafted at
-`.github/workflows/mtp-benchmark.yml` (track `gemma4-31b-it-mtp-v1`,
-deliberately inert while `official_scoring_enabled` is false), and the
-operator procedure covering items 1-7 is
+Items 1–7 are complete. The live default workflow is
+`.github/workflows/benchmark.yml`; the contract has
+`official_scoring_enabled=true` and the hidden pins are populated. The
+historical operator procedure is retained in
 `docs/mtp-track-golive-runbook.md`.
 
-The base leaderboard and its paired serial reference are never mixed with MTP
-results.
+The archived serial configuration remains separate from MTP results.
 
 ## Local/operator workflow
 
 Provisioning (large download; do not run merely to compile the prototype):
 
 ```bash
-./setup.sh
+MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
 ./setup-mtp.sh
 eval "$(./setup-mtp.sh --print-paths)"
 

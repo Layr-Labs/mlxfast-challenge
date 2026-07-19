@@ -9,7 +9,7 @@ import Testing
 @Suite
 struct RankedWorkflowIsolationTests {
     private func workflow() throws -> String {
-        try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
+        try String(contentsOfFile: ".github/workflows/serial-benchmark.yml", encoding: .utf8)
     }
 
     private func stepBody(_ workflow: String, from stepName: String, to nextStepName: String) throws -> String {

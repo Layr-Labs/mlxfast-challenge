@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "name": "mlxfast-challenge-dev-mtp",
-  "trackId": "gemma4-31b-it-mtp-v1",
-  "description": "Gemma 4 31B-IT MTP track: optimize organizer-assistant, target-verified block decode (drafting strategy and bit-exact multi-row verification kernels in the editable surface) against the trusted serial K=1 oracle. Decode-only paired scoring; every returned token must match the parent-owned serial oracle.",
+  "name": "mlxfast-challenge-dev-serial",
+  "trackId": "gemma4-31b-serial-v1",
+  "description": "Optimize Gemma 4 31B 4-bit dense inference by transforming weights offline and reducing compute latency without failing the correctness gate.",
   "category": "swift",
   "direction": "+",
   "editablePaths": [
@@ -73,29 +73,16 @@
     "Vendor/mlx-swift/Source/Cmlx/mlx-generated/steel_gemm_splitk_nax.cpp",
     "Vendor/mlx-swift/Source/Cmlx/mlx-generated/gemv.cpp"
   ],
-  "contractPath": "fixtures/gemma_4_31b_it_mtp_track.json",
-  "setupCommand": ["bash", "-c", "MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh && ./setup-mtp.sh"],
-  "preSubmitCommand": ["bash", "-c", "./benchmark-mtp.sh --local-submit"],
-  "benchmarkCommand": ["bash", "-c", "MLXFAST_SCORE_PATH=score.json ./benchmark-mtp.sh --local-iterate"],
+  "setupCommand": ["bash", "-c", "./setup.sh"],
+  "preSubmitCommand": ["bash", "-c", "./benchmark.sh --local-submit"],
+  "benchmarkCommand": ["bash", "-c", "MLXFAST_SCORE_PATH=score.json ./benchmark.sh --local-iterate"],
+  "scorePath": "score.json",
   "runner": {
     "provider": "github-actions",
-    "workflow": "benchmark.yml"
-  },
-  "scoreArtifact": "benchmark-results-<run_id>/score.json",
-  "scorePath": "score.json",
-  "scoring": {
-    "mode": "mtp-paired-decode-only",
-    "decodeTokens": 512,
-    "aggregation": "ratio_of_means",
-    "decodeSpeedupFloor": 1.0,
-    "minAcceptedPairs": 3,
-    "targetPairs": 4,
-    "bitExactTokenGate": true,
-    "stallGuardrail": "max block latency > 4x p50 rejects the run (one gated retry)"
+    "workflow": "serial-benchmark.yml"
   },
   "leaderboard": {
-    "namespace": "gemma4-31b-it-mtp-v1",
-    "separateFromSerialTrack": true
-  },
-  "staticReviewTrackId": "gemma4-31b-it-mtp-v1"
+    "namespace": "gemma4-31b-serial-v1",
+    "separateFromMTPTrack": true
+  }
 }

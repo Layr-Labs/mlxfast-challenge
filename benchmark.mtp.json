@@ -74,13 +74,15 @@
     "Vendor/mlx-swift/Source/Cmlx/mlx-generated/gemv.cpp"
   ],
   "contractPath": "fixtures/gemma_4_31b_it_mtp_track.json",
-  "setupCommand": ["bash", "-c", "./setup.sh && ./setup-mtp.sh"],
+  "setupCommand": ["bash", "-c", "MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh && ./setup-mtp.sh"],
+  "preSubmitCommand": ["bash", "-c", "./benchmark-mtp.sh --local-submit"],
+  "benchmarkCommand": ["bash", "-c", "MLXFAST_SCORE_PATH=score.json ./benchmark-mtp.sh --local-iterate"],
   "runner": {
     "provider": "github-actions",
-    "workflow": "mtp-benchmark.yml"
+    "workflow": "benchmark.yml"
   },
-  "scoreArtifact": "mtp-benchmark-results-<run_id>/mtp-score.json",
-  "scorePath": "mtp-score.json",
+  "scoreArtifact": "benchmark-results-<run_id>/score.json",
+  "scorePath": "score.json",
   "scoring": {
     "mode": "mtp-paired-decode-only",
     "decodeTokens": 512,

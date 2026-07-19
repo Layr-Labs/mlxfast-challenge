@@ -1939,8 +1939,8 @@ func buildEntrypointsAssertFrozenDependencyGraph() throws {
 
     // Every ranked resolve/build passes --force-resolved-versions too.
     for workflowPath in [
+        ".github/workflows/serial-benchmark.yml",
         ".github/workflows/benchmark.yml",
-        ".github/workflows/mtp-benchmark.yml",
     ] {
         let workflow = try String(contentsOfFile: workflowPath, encoding: .utf8)
         #expect(

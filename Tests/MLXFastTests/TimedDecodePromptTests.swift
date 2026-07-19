@@ -3,7 +3,7 @@ import Foundation
 import Testing
 
 private func timedPromptWorkflow() throws -> String {
-    try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
+    try String(contentsOfFile: ".github/workflows/serial-benchmark.yml", encoding: .utf8)
 }
 
 private func timedPromptStep(

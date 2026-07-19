@@ -299,7 +299,7 @@ func officialRankedRunMeasuresPairedBaselineOnTheSameSilicon() throws {
     // candidate back to back, each behind the same thermal gate, and
     // overlay-paired-timing.sh applies the paired ratio and the frozen floors
     // in the trusted shell.
-    let workflow = try packageFile(".github/workflows/benchmark.yml")
+    let workflow = try packageFile(".github/workflows/serial-benchmark.yml")
     let overlay = try packageFile(".github/scripts/overlay-paired-timing.sh")
     let constants = try packageFile("Sources/MLXFastCore/Constants.swift")
 

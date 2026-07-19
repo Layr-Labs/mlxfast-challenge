@@ -198,9 +198,9 @@ flowchart LR
 9. Memory bomb/cache subsidy: initialization retains huge free buffers or
    active asynchronous allocations → allocator free cache is cleared at begin;
    active state is only partly observable and needs M5 limits/telemetry.
-10. Serial-track contamination: code routes ordinary `benchmark` into MTP →
-    distinct option types, subcommands, protocol kinds, default serial static
-    policy, and regression tests prevent implicit opt-in.
+10. Cross-track contamination: code blends archived serial scoring or state
+    into the MTP default → distinct option types, subcommands, protocol kinds,
+    manifests, workflows, and regression tests keep the tracks isolated.
 
 ## Threat model table
 
@@ -214,7 +214,7 @@ flowchart LR
 | TM-006 | Participant | Prompt supplied at begin | Precompute future tokens before timer or across requests | Uncharged work | Score | Timer before begin; fresh worker; no prompt before timer; allocator clear | Active background GPU allocations are not fully cleared/provable | Process isolation before prompt; active-memory baseline; GPU quiescence check | Metal/GPU activity before begin | Medium | High | High |
 | TM-007 | Participant | Known token/block shape | Special-case call count, offset, prompt length, or final tail | Benchmark-only speedup | Score | Trusted totals up to 512; variable 255/256/257 tail tests; static MTP policy | Shape itself is necessarily observable | Rotate hidden lengths and prompts; manual branch audit | Timing discontinuities by shape | High | Medium | High |
 | TM-008 | Participant | Resource access in worker | Memory bomb, allocator-state subsidy, background threads | OOM, unfair cache state, runner DoS | M5 availability, score | Sandbox, orphan reaper, allocator clear, watchdog | No hard active-memory cap in Phase 1 | Peak/active memory cap; terminate unexpected threads/process activity; fresh runner | Memory/threads sampled at phase boundaries | Medium | High | High |
-| TM-009 | Integration error | Shared CLI/workflow | Enable MTP under serial track or compare to serial baseline | Corrupt existing leaderboard | Serial leaderboard | Separate commands/types/kinds; score disabled; static track default serial | Future workflow not implemented | Dedicated workflow and score namespace; contract tests; release approval | Assert serial source/path hashes and track ID | Low | High | Medium |
+| TM-009 | Integration error | Shared CLI/workflow | Mix MTP and archived serial manifests, baselines, or scores | Corrupt either leaderboard | Track identity | Separate commands/types/kinds, workflows, manifests, baselines, and track-tagged score | Operator registration can still be misconfigured | Contract tests; release approval; verify namespace during import | Assert source/path hashes and track ID | Low | High | Medium |
 | TM-010 | Submitted code | Error/log path sees hidden prompt | Exfiltrate prompt through stderr, DNS, files, or protocol framing | Private benchmark disclosure | Oracle/prompts/secrets | FD isolation, stderr redaction, DNS/network/write/process denial, line bounds | OS sandbox defects remain platform risk | Retain uid/PF/operator sandbox probes; no secret-bearing env | Sandbox probe and egress telemetry | Low | High | Medium |
 
 ## Criticality calibration
@@ -243,7 +243,7 @@ flowchart LR
 | `Sources/MLXFastCLI/main.swift` | Track dispatch and sandbox profile | TM-006, TM-009, TM-010 |
 | `setup-mtp.sh` | Download integrity and cache path safety | TM-004 |
 | `.github/scripts/run-submission-static-review.sh` | Distinct serial/MTP allow-deny policy | TM-001, TM-002, TM-003, TM-007, TM-009 |
-| `.github/workflows/benchmark.yml` | Future track identity, isolation, pairing, publication | TM-006, TM-008, TM-009, TM-010 |
+| `.github/workflows/benchmark.yml` | Default-track identity, isolation, pairing, publication | TM-006, TM-008, TM-009, TM-010 |
 | `Tests/MLXFastTests/ExperimentalMTPTests.swift` | Adversarial protocol and isolation regression suite | TM-003, TM-004, TM-005, TM-009 |
 
 ## Quality check

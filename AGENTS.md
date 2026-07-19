@@ -9,19 +9,19 @@ Use this file as the working contract for coding agents and participants.
 Optimize Gemma 4 31B 4-bit (text tower only) inference on Apple Silicon without
 changing the observable model behavior required by the correctness gates.
 
-The official score rewards faster prefill and decode:
+The default official track is `gemma4-31b-it-mtp-v1`. It rewards faster
+trained-assistant block decode against a paired serial K=1 target baseline:
 
 ```text
-decode_speedup = baseline_decode_sec_per_token / decode_sec_per_token
-prefill_speedup = baseline_prefill_sec_per_token / prefill_sec_per_token
-score = decode_speedup^0.75 * prefill_speedup^0.25
+score = mean(serial_K1_seconds_per_token) / mean(MTP_seconds_per_token)
 ```
 
-Higher is better. The ranked score is paired: `baseline_*` is the pinned
-reference implementation, measured on the same machine in the same session as
-the submission, so unmodified reference code scores about `1.0`. Decode is
-weighted more heavily because it dominates interactive generation. Both decode
-and prefill must also stay within the configured 0.95 speedup floors.
+Higher is better. Both sides are measured in alternating order on the same
+machine and session behind the same thermal gate. The floor is `1.0`, and
+every returned token must match the trusted serial oracle. The former
+prefill/decode weighted serial track remains available explicitly through
+`benchmark.serial.json` and `serial-benchmark.yml`; it is not the Yukon
+default.
 
 ## Official Hardware
 
@@ -37,11 +37,10 @@ The box is operator-supervised: each ranked job runs on a fresh ephemeral
 runner registration, every invocation of submitted code (build, transform,
 correctness, benchmark) executes sandboxed, and the machine's protected
 surface is integrity-audited between jobs — drift quarantines the box instead
-of publishing a score. The whole ranked pipeline runs serially on that one
-machine: build and transform, the public correctness gate, the hidden
-64-step base case plus behavior/GPQA gates, the semantic judge, and — last,
-after a quiescence wait — the timed prefill/decode measurement, which starts
-each timed phase only once the GPU has cooled below a fixed 40C gate and
+of publishing a score. The default pipeline validates the pinned IT target and
+assistant, builds and transforms, replays the hidden MTP correctness golden,
+then runs at least three accepted alternating serial/MTP timing pairs. Every
+timed phase starts only once the GPU has cooled below a fixed 40C gate and
 rejects throttled or telemetry-invalid measurements. See
 `.github/workflows/benchmark.yml` for the exact step order.
 
@@ -58,8 +57,9 @@ Optimization effort should go into compute — attention kernels
 quantized matmul dispatch, KV-cache handling, memory layout, and MLX
 scheduling — not disk I/O.
 
-Local machines need enough unified memory to hold the ~17 GB text tower plus
-KV cache and activation buffers; about 36 GB is a practical local minimum.
+Local MTP work needs enough unified memory for the ~17 GB target, assistant,
+KV state, and verification buffers; 64 GiB is the practical local minimum.
+The archived serial track can still run at roughly 36 GiB.
 Machines below 64 GiB automatically use a low-memory startup profile: retained
 co-tiled/combined weight layouts and compiled decode are disabled, the MLX
 allocator cache is capped at 6 GiB, and free warmup buffers are cleared before
@@ -119,8 +119,7 @@ vendored `.metal` sources by `tools/build-mlx-metallib.sh` (invoked by
 names are the M5-generation kernel variants; the ranked M5 box selects
 them, so tune the `_nax` twin as well as the plain one. Then rebuild
 (`swift build -c release`) and test with
-`.build/release/mlxfast-swift correctness --weights weights` and
-`./benchmark.sh --local-iterate`.
+`./benchmark-mtp.sh --local-iterate`.
 
 All participant model and kernel code — `MLXFastModel` plus the vendored
 forks — compiles into the sandboxed `mlxfast-runtime-worker` binary. The
@@ -130,12 +129,10 @@ hot-path code runs only inside the worker.
 
 Focus on:
 
-- Reducing scored prefill and decode seconds per token.
-- Optimizing the vendored Metal kernels on the hot path. Most remaining
- headroom is at kernel level, and mostly in prefill: decode already sits
- near the memory-bandwidth floor implied by the ~17 GB weight read per
- token, while the prefill quantized/steel GEMM path is compute-bound with
- more slack.
+- Reducing scored MTP seconds per committed token.
+- Increasing safe draft acceptance and reducing target verification work
+ without changing the serial K=1 accumulation order.
+- Optimizing the vendored Metal kernels on the decode and exact-pair paths.
 - Optimizing kernels and hot-path MLX operations used by attention (both the
  sliding-window and full-attention layer types), the gated MLP, KV-cache
  handling, and dense weight materialization.
@@ -145,14 +142,13 @@ Focus on:
  linear construction, fewer copies, lazier Data-to-Metal conversions).
 - Making the offline transform produce better runtime metadata or compact
  transformed artifacts.
-- Improving prefill and decode execution inside the Swift/MLX model path.
+- Improving seed prefill and block decode inside the Swift/MLX model path.
 
-The model is Gemma 4 31B, dense, 4-bit, text tower only (vision/audio are out
-of scope and are never loaded). The frozen reference checkpoint is about
-18.4 GB across 4 safetensors shards. `setup.sh` stores it in a shared
-Hugging Face-style cache under `$HOME` by default (so parallel clones reuse
-one checkpoint) and verifies it against the pinned
-manifest. The transformed `weights/` tree holds only the text-tower tensors
+The target is Gemma 4 31B-IT, dense, 4-bit, text tower only (vision/audio are
+out of scope and are never loaded). The frozen target checkpoint is about
+18.4 GB across 4 safetensors shards; `setup-mtp.sh` also provisions the
+matched ~939 MB assistant and verifies both against pinned manifests. The
+transformed `mtp-weights/` tree holds only the text-tower tensors
 (everything under the source checkpoint's `language_model.` prefix) plus a
 runtime-authored `config.json`; it is an overlay/runtime artifact, not a
 second full copy of the model. Aim to keep generated transformed weights under
@@ -171,7 +167,7 @@ They are trusted harness/operator code and are not packaged by submit:
 - Everything in `Vendor/` not listed in `editablePaths`: other model
  families, shared model-factory/tokenizer plumbing, and kernels Gemma 4
  does not dispatch (including `steel/attn`)
-- `.github/`, scripts, tests, docs, `benchmark.json`
+- `.github/`, scripts, tests, docs, and all `benchmark*.json` manifests
 - `weights/`, reference checkpoints, scores, golden files, local caches
 
 Do not try to hardcode hidden prompts, hidden token IDs, GPQA answers, timing
@@ -186,52 +182,29 @@ use the Yukon CLI (`mlxfast`).
 
 ## Correctness Gates
 
-Correctness is a hard gate. Passing locally is necessary but not sufficient for
-ranking.
-
-The public local gate uses checked-in prompt/golden fixtures under
-`correctness_prompts/`. These fixtures were generated on the ranked M5
-hardware from the reference implementation — the Layr-Labs `mlx-swift-lm`
-Gemma 4 text tower this package builds against: the prompt text is tokenized
-with the Gemma 4 tokenizer and the expected tokens are greedy continuations
-captured with `mlxfast-swift generate-golden`; see `TASK.md`. The hidden
-artifacts used by ranked runs were regenerated the same way from the same
-reference on the same hardware.
-
-Know this before debugging a local failure: greedy argmaxes with near-tie
-logits can diverge across Apple Silicon generations, so on non-M5 machines
-the local public gate may fail for a perfectly correct build. Local modes are
-directional; the ranked M5 runner is the source of truth for both correctness
-and timing.
+Correctness is a hard gate. Local MTP runs generate their oracle from the
+current candidate, so they prove block/serial parity only. They do not prove
+fidelity to the pinned 31B-IT target. The ranked M5 runner is the authority.
 
 The official correctness stack includes:
 
-- Teacher-forced token checks on 512-token prompt cases.
-- Hidden behavior checks, including GPQA-style prompts.
-- Short exact-token GPQA prefix checks from the private reference fixture.
-- Semantic GPQA judging through a private judge path.
-- TTFT guardrails for hidden GPQA first-token behavior.
-- Benchmark oracle checks for the timed prefill/decode prompt.
-
-The source of truth for current token counts, gate thresholds, and baseline
-constants is `Sources/MLXFastCore/Constants.swift`.
+- Hidden 512-token MTP correctness replay.
+- A distinct hidden 512-token timed golden.
+- Trained-assistant requirement and exact-pair target verification.
+- Parent-owned serial oracle comparison for every returned token.
+- Cache offset, rollback, block-size, and acceptance-accounting invariants.
 
 ## Timing And Score Measurement
 
-The official benchmark measures:
-
-- Prefill seconds per token.
-- Decode seconds per token.
-- Weighted score from prefill and decode speedups.
-- Pass/fail component speed floors.
+The official benchmark measures serial K=1 and candidate MTP decode
+seconds/token over alternating accepted pairs, then publishes the ratio of
+their means. The floor is `1.0`.
 
 The timed measurement runs last in the ranked job, after all correctness and
 gate work, behind a fixed 40C GPU thermal gate with telemetry-validated
 acceptance; the pinned reference is measured the same way on the same box in
-the same session, and speedups (and the 0.95 floors) are computed from that
-paired ratio. The `officialBaseline*` constants in
-`Sources/MLXFastCore/Constants.swift` feed local-mode estimates only; they
-are not the ranked denominator.
+the same session. At least three pairs must pass parity, stall, thermal, and
+telemetry validation.
 
 Diagnostic fields such as memory and read timings are recorded for audit and
 future guardrails, but are not the primary score unless the benchmark contract
@@ -239,7 +212,7 @@ changes. There is no expert/weight-streaming bandwidth to report for this
 dense model: `bandwidth_gb_per_token` is always `0` with
 `bandwidth_source=ram_resident_model`. Do not optimize for that diagnostic
 field as a standalone target; optimize changes that reduce the measured
-prefill and decode timings.
+MTP decode time.
 
 The benchmark charges decode setup to the decode measurement so model code
 cannot hide future-token work in an unscored seed-prefill phase.
@@ -254,14 +227,15 @@ local run:
 git fetch origin main
 git switch main
 git pull --ff-only
-./setup.sh
-./benchmark.sh --local-iterate
-cp score.local-iterate.json score.local-iterate.baseline.json
+MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
+./setup-mtp.sh
+./benchmark-mtp.sh --local-iterate
+cp score.json score.mtp.baseline.json
 ```
 
 Create your working branch from that synced commit, or rebase/merge your
 existing branch onto `origin/main` before trusting local timings. Every
-`./benchmark.sh --local-iterate` result should be interpreted as performance on
+`./benchmark-mtp.sh --local-iterate` result should be interpreted as performance on
 top of the latest synced base commit measured on the same local machine, with
 the same toolchain, model cache, power state, and thermal conditions. If the
 base commit changes, rerun the local baseline before deciding whether an
@@ -270,15 +244,15 @@ optimization is faster.
 Start with:
 
 ```bash
-./setup.sh
+MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
+./setup-mtp.sh
 ```
 
 This checks the local Swift/Xcode toolchain, builds the Swift harness and MLX
-Metal library, downloads or verifies the Gemma 4 31B 4-bit reference
-checkpoint, and prepares the local cache. The reference cache defaults to a
-shared location under your home directory; if that disk is too small, put the
-reference cache on a larger volume and set `MLXFAST_REFERENCE_CACHE_DIR` or
-`MLXFAST_REFERENCE_DIR`.
+Metal library, then downloads and verifies the pinned Gemma 4 31B-IT target
+and trained assistant. The MTP cache defaults under
+`~/.cache/mlxfast/gemma4-31b-it-mtp-v1`; override it with
+`MLXFAST_MTP_CACHE_ROOT`.
 
 Common commands:
 
@@ -287,32 +261,26 @@ swift test
 MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test
 swift build -c release
 tools/build-mlx-metallib.sh
-.build/release/mlxfast-swift transform --output weights
-.build/release/mlxfast-swift correctness --weights weights
-./benchmark.sh --local-iterate
-./benchmark.sh --local-submit
-./benchmark.sh --official
+./benchmark-mtp.sh --local-iterate
+./benchmark-mtp.sh --local-submit
 ```
 
-`./benchmark.sh --local-iterate` is the fast local edit-loop signal.
+`./benchmark-mtp.sh --local-iterate` is the fast local edit-loop signal.
 Use it to compare the current working tree against the latest-tip baseline you
 recorded above, not against a result from an older branch.
-`./benchmark.sh --local-submit` is the recommended manual pre-submit check
+`./benchmark-mtp.sh --local-submit` is the recommended manual pre-submit check
 (`mlxfast submit` does not run it for you) and is intended to be longer and
 closer to the official path; like `--local-iterate` it publishes only the
-estimated local score (never the official ranked score).
-`./benchmark.sh --official` is the full ranked entrypoint and requires the
-hidden golden artifacts provisioned on the official runner. A bare
-`./benchmark.sh` defaults to `--local-iterate`. Remember the public fixtures
-are M5-generated: a local correctness failure on non-M5 hardware can be a
-near-tie argmax divergence rather than a real bug (see Correctness Gates).
+candidate-local paired score (never the official ranked score). It generates
+its own serial oracle, so the hidden M5 golden remains the fidelity authority.
+The former `benchmark.sh` commands belong to `benchmark.serial.json`.
 
 ## Notes For Autonomous Agents
 
 Operational contract for coding agents iterating in this repo. These
 behaviors are expected, not bugs:
 
-- **The local GPU cool-down gate waits; let it.** `./benchmark.sh
+- **Legacy serial cool-down gate.** `./benchmark.sh
  --local-iterate` and `--local-submit` wait for the GPU to cool below 40C
  before starting the timed run (read via `macmon`), printing a progress
  line roughly every 10 seconds while waiting. A benchmark invocation that
@@ -338,17 +306,15 @@ behaviors are expected, not bugs:
  RPM). Manual control uses the same helper:
  `tools/fan-control.sh boost|normal|status` (needs an `smc` CLI, e.g.
  from smcFanControl; fanless Macs are refused cleanly).
-- **Measurement discipline.** Trust benchmark numbers only from a cool,
+- **Measurement discipline.** Trust MTP and serial numbers only from a cool,
  quiescent machine. Back-to-back runs heat the GPU and throttle it; a
- 2-3 minute cool-down between local runs is normal and is exactly what
- the gate enforces. Do not fight the gate to iterate faster:
+ 2-3 minute cool-down between local runs is normal. The legacy serial wrapper
+ enforces this automatically; cool the machine before `benchmark-mtp.sh`.
+ Do not fight the serial gate to iterate faster:
  `MLXFAST_LOCAL_COOL_GATE=0` is for debugging only and produces
  hot-start timings that are not comparable to gated ones. The ranked
  score is a paired speedup versus the on-box pinned reference measured
- in the same session (~1.0 for unmodified code, with decode variance
- around 0.1% CV in validation runs); the `officialBaseline*`
- constants feed local-mode estimates only, so treat local absolute
- numbers and local score estimates as directional.
+ in the same session. Treat candidate-local MTP ratios as directional.
 - **A local gate failure on non-M5 hardware may not be your bug.** The
  public goldens are M5-generated greedy continuations of the
  mlx-swift-lm reference; near-tie argmaxes can diverge on other Apple
@@ -361,15 +327,15 @@ behaviors are expected, not bugs:
  `Sources/MLXFastTransform/`, the vendored Gemma 4 model and `MLXLMCommon`
  files, and the listed vendored kernel sources (both AOT `.metal`/`.h`
  and JIT `mlx-generated/*.cpp` forms); changes anywhere else will not
- upload even if they help locally. `./benchmark.sh --official` requires
- the hidden goldens and private oracle provisioned on the official runner
- and is not runnable locally — use `--local-iterate` for the edit loop
- and `--local-submit` as the recommended manual pre-submit check.
+ upload even if they help locally. Official MTP ranking requires hidden
+ organizer goldens and is not runnable locally — use
+ `./benchmark-mtp.sh --local-iterate` for the edit loop and
+ `--local-submit` as the recommended pre-submit check.
 - **One local run at a time; the memory guard is protecting your RAM.** The
  ~17 GB RAM-resident text tower means two simultaneous model residencies
  (an overlapping second local run, or a new run started while an orphaned
  model-holding worker from an aborted run lingers) can out-of-memory a
- 36 GB machine. A single worker is separately protected by the automatic
+ local machine. A single worker is separately protected by the automatic
  low-memory startup profile described above. Local modes take a per-user
  run lock and refuse to start while a model-holding mlxfast process is
  still alive, printing the offending pid/rss/command list. Read that list
@@ -379,7 +345,8 @@ behaviors are expected, not bugs:
  (wait for it). The guard warns and aborts -- it never kills anything
  itself. Aborted local runs now reap their own worker on INT/TERM/EXIT
  and the worker exits if its parent dies, so the guard should fire
- rarely. Know its scope: the lock lives in `benchmark.sh`, so direct
+ rarely. Know its scope: the lock lives in `benchmark.sh`, so
+ `benchmark-mtp.sh` and direct
  `mlxfast-swift` model commands (`correctness`, `correctness-trace`,
  `generate-golden`, `generate-gpqa-answers`, `mtp-*`) take no lock and
  do not check for other runs -- run one model-holding command at a
@@ -433,18 +400,19 @@ Submit packages only `editablePaths`. It rejects generated artifacts, symlinks,
 local scores, reference checkpoints, and source changes outside the editable
 surface. `mlxfast submit` uploads the editable-path archive directly for
 official validation; it does not run a local benchmark first, and no local run
-blocks the upload. Run `./benchmark.sh --local-submit` yourself before
+blocks the upload. Run `./benchmark-mtp.sh --local-submit` yourself before
 submitting — the official M5 run is the gate that ranks the submission.
 
 ## Practical Optimization Ideas
 
 Good submissions are likely to improve one or more of:
 
+- Trained-assistant drafting, target-confirmed-prefix handling, exact-pair
+ verification, rollback, and shared K/V reuse inside
+ `Gemma4TrainedMTPBlockSession` and `Gemma4ExactTwo*.swift`.
 - Kernel-level optimization inside the vendored Metal sources, now that
- they are editable. The prefill quantized/steel GEMM path has the most
- slack (prefill is compute-bound; decode is close to the memory-bandwidth
- floor), with the decode `sdpa_vector` and quantized `qmv`/`qvm` kernels
- as secondary targets. For the JIT families, edit the
+ they are editable. Prioritize kernels reached by block decode, target
+ exact-pair verification, and the assistant. For the JIT families, edit the
  `mlx-generated/*.cpp` twin — that string is what compiles at runtime.
 - Attention kernel dispatch: sliding-window vs. full-attention masking, GQA
  head-group broadcasting, and the full-attention layers' partial-rotary
@@ -504,14 +472,15 @@ Run at least:
 
 ```bash
 swift test
-./setup.sh
-.build/release/mlxfast-swift correctness --weights weights
-./benchmark.sh --local-submit
+MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
+./setup-mtp.sh
+./benchmark-mtp.sh --local-submit
 ```
 
-If the local correctness gate fails, the official benchmark will not rank the
-submission. If local performance improves but correctness is fragile, prefer a
-more conservative optimization.
+If local MTP parity fails, the official benchmark will not rank the
+submission. Local parity uses a candidate-generated oracle and is weaker than
+the hidden M5 golden; if performance improves but correctness is fragile,
+prefer a more conservative optimization.
 
 Do not add caches or memos keyed on a request's input tokens whose only
 possible hit is the benchmark harness repeating an identical computation — for
@@ -526,9 +495,9 @@ rely on. Input-independent caching (weights, dequantized tensors, RoPE/mask
 tables keyed on shapes and offsets) and within-request KV reuse remain fine.
 Submissions in this category fail the static review as bypass behavior.
 
-### Serial Non-Speculative Track
+### Archived Serial Non-Speculative Track
 
-**Controlling rule:** In the current serial non-speculative track, each model
+In `benchmark.serial.json`, each model
 invocation may compute logits and KV rows only for tokens supplied in that
 invocation, and must advance logical and physical KV position by exactly the
 supplied input length. A one-token decode request therefore advances exactly
@@ -552,11 +521,11 @@ other speculative decoding requires a separate explicit track with a trusted
 variable-length block protocol, correctness contract, and score; it is not an
 optimization within this serial track.
 
-### Gemma 4 31B-IT MTP Track (separate, experimental)
+### Default Gemma 4 31B-IT MTP Track
 
-That separate track exists as an experimental, not-yet-ranked surface with
-track ID `gemma4-31b-it-mtp-v1`; `docs/experimental-mtp-track.md` is its
-contract. In one paragraph: an organizer-pinned Gemma 4 31B-IT target is
+The Yukon-default ranked surface has track ID
+`gemma4-31b-it-mtp-v1`; `docs/experimental-mtp-track.md` is its detailed
+contract. An organizer-pinned Gemma 4 31B-IT target is
 paired with Google's matched trained assistant (~939 MB organizer-provisioned
 sidecar); a trusted parent drives a block protocol (`mtp_decode_begin`, then
 `mtp_decode_block` carrying only the last committed token and a max block
@@ -569,9 +538,7 @@ verification kernels (`Gemma4ExactTwo*.swift`), which verify two target rows
 per dispatch while preserving each row's serial K=1 accumulation order so
 accepted tokens are bit-identical to serial decode. Bit-exactness is a hard
 gate: one token diverging from the parent oracle fails the run, so the track
-cannot be won by degrading output. Proposed scoring (pending operator
-calibration; see the contract fixture's `proposed_scoring`) is decode-only
+cannot be won by degrading output. Scoring is decode-only
 paired speedup versus the trusted serial K=1 reference in the same session,
-floor 1.0, on a leaderboard namespace never mixed with the serial track. The
-serial track's rules above are unaffected; MTP mechanisms remain excluded
-from serial submissions.
+with a floor of 1.0. The archived serial rules above still apply to explicit
+serial-track submissions only.

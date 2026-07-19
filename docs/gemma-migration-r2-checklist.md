@@ -29,13 +29,13 @@ verify them) were regenerated.
   `baseline_*_seconds_per_token` calibration is intentionally omitted: the
   ranked pipeline measures the pinned reference baseline live on the same box,
   and local modes fall back to the calibrated constants.
-- **Consumed by:** `.github/workflows/benchmark.yml` — the single ranked
+- **Consumed by:** `.github/workflows/serial-benchmark.yml` — the single ranked
   job's "Prepare hidden correctness golden" step downloads and pin-verifies
   the raw object; "Attach GPQA gates and verify augmented golden" then
   augments it with the GPQA behavior gates.
 - **Pins:** `MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256`
   (`56c282dcaac433543ef0eecb625cd99bc20f1ae1f7b9415efe32a71e6eb4eae9`) and
-  `MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES` (`38162`) in `benchmark.yml` match
+  `MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES` (`38162`) in `serial-benchmark.yml` match
   the uploaded object. The augmented golden's hash/bytes
   (`MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_*`) are self-anchored at run time
   right after augmentation, as before.
@@ -49,14 +49,14 @@ verify them) were regenerated.
   tokenizer, greedy first-answer-token capture), preserving the previous
   artifact's one-token-sequence shape; the semantic judge's reference
   answers continue to derive from the answer keys.
-- **Consumed by:** `.github/workflows/benchmark.yml` — "Attach GPQA gates
+- **Consumed by:** `.github/workflows/serial-benchmark.yml` — "Attach GPQA gates
   and verify augmented golden" (`attach-gpqa-gates`), which drives the
   hidden GPQA behavior gates, the TTFT guardrail, and the semantic-GPQA
   answer capture judged by `run-semantic-gpqa-gate.sh`. The object carries
   9 cases, but each ranked run attaches and judges only the first 5
   token-budget-valid ones: `MLXFAST_GPQA_CASE_COUNT`,
   `MLXFAST_SEMANTIC_GPQA_CASE_COUNT`, and `MLXFAST_GPQA_TTFT_CASE_COUNT`
-  are all `5` in `benchmark.yml`, so per-run "N/5" gate results are
+  are all `5` in `serial-benchmark.yml`, so per-run "N/5" gate results are
   consistent with the 9-case object.
 - **No hash pin:** the augmented golden's hash/bytes are computed at run
   time, so no workflow constant needs updating for this object itself.
@@ -91,7 +91,7 @@ verify them) were regenerated.
 - Pins moved with the fixtures:
   - `MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256`
     (`182a7f98d24cc8f26e8b08505fe7a8b6d825702f99d0b78a83f49dd42f1b2aea`) /
-    `..._BYTES` (`11140`) in `.github/workflows/benchmark.yml`.
+    `..._BYTES` (`11140`) in `.github/workflows/serial-benchmark.yml`.
   - The fixture digests pinned in `Tests/MLXFastTests/GoldenTests.swift`
     (the 1024 fixture's digest is
     `2de5474bbe707bcb2e8b71d7d771ffd9be70c252d3ecce7f1511aa2a50933b4d`).

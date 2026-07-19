@@ -1,10 +1,12 @@
-# MTP Track Go-Live Runbook (Operator Only)
+# MTP Track Go-Live Runbook (Archived Operator Record)
 
-Operator procedure for taking the Gemma 4 31B-IT MTP track
-(`gemma4-31b-it-mtp-v1`) from its current merged-but-inert state to a live
-ranked track. Nothing in this document is participant-executable: every step
-is operator-gated, and the track's scoring stays disabled until the final
-enablement commit described in step 4.
+This records the completed procedure that brought
+`gemma4-31b-it-mtp-v1` live. MTP is now the default declared by
+`benchmark.json` and `.github/workflows/benchmark.yml`; the former serial
+entrypoint is archived as `benchmark.serial.json` and
+`.github/workflows/serial-benchmark.yml`. The remaining sections preserve the
+original go-live evidence and should be read historically, not as current
+enablement instructions.
 
 Box naming used throughout (no hostnames in this public doc):
 
@@ -13,31 +15,26 @@ Box naming used throughout (no hostnames in this public doc):
   dev user's `~/.cache/mlxfast/gemma4-31b-it-mtp-v1/`). The first-block
   stall was root-caused and fixed here; the post-fix validation matrix runs
   here too.
-- **Box 2 — ranked serving box.** Serves live ranked serial-decode jobs
-  (`benchmark.yml`). Protected surface is integrity-manifest-signed; any
+- **Box 2 — ranked serving box.** Serves live ranked jobs. Protected surface
+  is integrity-manifest-signed; any
   intentional change requires a manifest re-sign or the janitor quarantines
   the box. Do not touch it except inside step C's provisioning window.
 
-Current state (updated by the enablement change this document rides in):
+Final state:
 
-- The MTP track code, contract, manifests, and provisioner are merged behind
-  explicit `mtp-probe` / `mtp-benchmark` commands; serial `benchmark` cannot
-  reach them.
-- The hidden IT-target goldens are FROZEN (captured and self-validated on
-  drained M5 silicon per step B; pins carried in `mtp-benchmark.yml`,
-  pending box-2 replay confirmation).
-- The enablement change flips `fixtures/gemma_4_31b_it_mtp_track.json` to
+- The MTP track code, contract, manifests, and provisioner are enabled behind
+  explicit `mtp-probe` / `mtp-benchmark` commands.
+- The hidden IT-target goldens are frozen and pinned in `benchmark.yml`.
+- The enablement change flipped `fixtures/gemma_4_31b_it_mtp_track.json` to
   `official_scoring_enabled=true` /
   `reference_baseline.publication_allowed=true`, fills the golden pins, and
-  adopts the 2026-07-14 scoring decisions; until it MERGES, `main` stays
-  inert (flags false, pins empty). The workflow's enablement gate remains
-  standing either way: it fails closed on a reverted contract, an emptied
-  pin, or a dispatch without `confirm_track_enabled=true`.
-- Box 2 still has no MTP caches, baseline tree, calibration, or
-  `measure-mtp-job.sh`; provisioning (step C) is a merge PRECONDITION of the
-  enablement change.
-- The serial ranked pipeline (`benchmark.yml`) is untouched by all of this
-  and must remain untouched by every step below.
+  adopted the 2026-07-14 scoring decisions. The workflow's standing gate
+  still fails closed on a reverted contract, an empty pin, or an explicitly
+  disabled `confirm_track_enabled` input; Yukon dispatches use its live
+  default of `true`.
+- Box 2 has the MTP caches, baseline tree, calibration, and
+  `measure-mtp-job.sh` provisioned by step C.
+- The serial ranked pipeline is retained at `serial-benchmark.yml`.
 
 ## 0. Go-live sequence (the one-page version)
 
@@ -64,7 +61,7 @@ Strictly ordered; each step is a precondition of the next:
    floor-calibration sessions (B's methodology, clean post-stall-fix data),
    then the manifest re-sign.
 4. **Step A/enablement** — one trusted commit on `main` flips the contract
-   fixture, fills the golden pins in `mtp-benchmark.yml`, and updates the
+   fixture, fills the golden pins in `benchmark.yml`, and updates the
    tests that pin the disabled state. Register the
    `gemma4-31b-it-mtp-v1` leaderboard namespace with the orchestrator.
 5. **Validate** — correctness-only dispatch, then a full timed main-ref
@@ -98,7 +95,7 @@ scoring.
 |---|---|---|---|
 | Hidden MTP **correctness** golden | private prompt, 512-token seed, 1 seed token + 512 greedy IT-target decode tokens | R2 object `correctness_prompts/mtp_correctness_golden_gemma4_31b_it-v1.json` | Never (hidden; pins only) |
 | Hidden MTP **benchmark** golden | different private prompt, 512-token seed, 1 + 512 greedy decode tokens (captures headroom above the 128-token ranked denominator) | R2 object `correctness_prompts/mtp_benchmark_golden_gemma4_31b_it-v1.json` | Never (hidden; pins only) |
-| Their SHA256 + byte pins | 4 values | `mtp-benchmark.yml` env (`MLXFAST_MTP_{CORRECTNESS,BENCH}_GOLDEN_{SHA256,BYTES}`) | Yes, in the enablement commit |
+| Their SHA256 + byte pins | 4 values | `benchmark.yml` env (`MLXFAST_MTP_{CORRECTNESS,BENCH}_GOLDEN_{SHA256,BYTES}`) | Yes, in the enablement commit |
 | Public IT fixture (optional, participant UX) | public prompt + 129-token golden for local `mtp-probe`/`mtp-benchmark` iteration | `correctness_prompts/` | Yes (optional, non-blocking) |
 | Serial oracle | not a separate artifact: the goldens ARE the serial oracle (greedy K=1 continuations of the pinned IT target); the trusted parent validates every returned token against them | — | — |
 
@@ -182,7 +179,7 @@ aws s3 cp mtp_benchmark_golden_gemma4_31b_it-v1.json \
 
 Keep offline copies in the operator private store; delete every on-box copy
 outside the runner-private paths. The four pins go into
-`mtp-benchmark.yml` in the enablement commit (step 4), not before.
+`benchmark.yml` in the enablement commit (step 4), not before.
 
 ### B.5 Cross-box replay verification (mandatory if captured on box 1)
 
@@ -292,7 +289,7 @@ sudo install -d -o runner -g staff -m 0755 \
   /opt/bench-runner/cache/mtp/gemma4-31b-it-mtp-v1/assistant
 ```
 
-These are the exact paths `mtp-benchmark.yml` pins as
+These are the exact paths `benchmark.yml` pins as
 `MLXFAST_MTP_TARGET_DIR` / `MLXFAST_MTP_ASSISTANT_DIR`.
 
 ### C.3 Stage the artifacts (prefer box-to-box copy; verify identically)
@@ -344,7 +341,7 @@ sudo ln -sfn /Users/Shared/bench-jobs/mtp-baseline/<SHA> /opt/bench-runner/mtp-b
 
 Author from `measure-job.sh` as the base (same fixed, readonly thermal
 contract) and install to `/opt/bench-runner/measure-mtp-job.sh`
-(root:wheel 0755). Required behavior, which `mtp-benchmark.yml` consumes:
+(root:wheel 0755). Required behavior, which `benchmark.yml` consumes:
 
 - args: `--candidate WS --baseline WS --golden PATH --contract PATH
   --tokens N --block-size K --min-pairs N --target-pairs N --tag T
@@ -434,7 +431,7 @@ preconditions in C are complete. It contains:
    (`validateExperimentalMTPContract`) pins the enabled identity in the
    same commit. The calibrated serial-denominator stats live in the box's
    `mtp-baseline-calibration.json` (C.5/B.6), not the fixture.
-2. `.github/workflows/mtp-benchmark.yml`: the four golden pins filled from
+2. `.github/workflows/benchmark.yml`: the four golden pins filled from
    the freeze record (`MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256/BYTES`,
    `MLXFAST_MTP_BENCH_GOLDEN_SHA256/BYTES` — pending box-2 replay
    confirmation; re-pin if box 2 diverges), `MLXFAST_MTP_DECODE_TOKENS=512`,
@@ -444,17 +441,17 @@ preconditions in C are complete. It contains:
    (`ExperimentalMTPTests.trainedMTPContractPinsMatchedITPairAndDependency`,
    `MTPWorkflowIsolationTests`); `swift test` green;
    `serialRankedPipelineRemainsMTPFree` unchanged and passing.
-4. The leaderboard registration record `benchmark.mtp.json` (track id
-   `gemma4-31b-it-mtp-v1`, workflow `mtp-benchmark.yml`, score artifact
-   `mtp-benchmark-results-<run_id>/mtp-score.json`, score field `score`,
-   verdict `passed`, floor semantics "failed below 1.0"). The operator
+4. The leaderboard registration record is now the default `benchmark.json`
+   (with `benchmark.mtp.json` retained as a compatibility alias): track id
+   `gemma4-31b-it-mtp-v1`, workflow `benchmark.yml`, score artifact
+   `benchmark-results-<run_id>/score.json`, score field `score`,
+   verdict `passed`, floor semantics "failed below 1.0". The operator
    registers this namespace with the orchestrator/Yukon backend at merge
-   time; the serial `benchmark.json` and its leaderboard ingestion are
-   untouched.
+   time; serial is retained in `benchmark.serial.json`.
 
 Validation ladder after merge (each step must pass before the next):
 
-1. Dispatch `mtp-benchmark.yml` on `main`, `confirm_track_enabled=true`,
+1. Dispatch `benchmark.yml` on `main`, `confirm_track_enabled=true`,
    `run_benchmark=false` — correctness/parity gate only.
 2. Same on `main` with `run_benchmark=true` — full timed run; expect
    reference-vs-reference score ~1.2-1.3x, floor cleared, artifacts sealed,

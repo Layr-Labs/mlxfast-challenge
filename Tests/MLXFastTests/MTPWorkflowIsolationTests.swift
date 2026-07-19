@@ -1,23 +1,18 @@
 import Foundation
 import Testing
 
-// Structural guards for the DISTINCT MTP ranked workflow
-// (.github/workflows/mtp-benchmark.yml): the track is enabled only through
-// the deliberate trusted-contract enablement (with a standing fail-closed
-// gate and a per-dispatch operator interlock), it must remain fully separate
-// from the serial ranked pipeline (its own track id, workspace, artifacts,
-// baseline, and leaderboard registration), and the serial pipeline must
-// remain MTP-free. These pin the wiring so a refactor cannot silently
-// weaken the gate, change the adopted scoring contract, or blend the two
-// tracks.
+// Structural guards for the DEFAULT MTP ranked workflow
+// (.github/workflows/benchmark.yml): it remains fail-closed on the trusted
+// contract and hidden pins, accepts Yukon's input-less workflow dispatch, and
+// stays isolated from the archived serial workflow and manifest.
 @Suite
 struct MTPWorkflowIsolationTests {
     private func mtpWorkflow() throws -> String {
-        try String(contentsOfFile: ".github/workflows/mtp-benchmark.yml", encoding: .utf8)
+        try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
     }
 
     private func serialWorkflow() throws -> String {
-        try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
+        try String(contentsOfFile: ".github/workflows/serial-benchmark.yml", encoding: .utf8)
     }
 
     private func stepBody(_ workflow: String, from stepName: String, to nextStepName: String) throws -> String {
@@ -38,24 +33,24 @@ struct MTPWorkflowIsolationTests {
         #expect(workflow.contains("workflow_dispatch:"))
         #expect(!workflow.contains("pull_request"))
         #expect(!workflow.contains("\n  push:"))
-        #expect(workflow.contains(".github/scripts/enforce-trusted-mtp-benchmark-workflow.sh"))
+        #expect(workflow.contains(".github/scripts/enforce-trusted-benchmark-workflow.sh"))
 
         let script = try String(
-            contentsOfFile: ".github/scripts/enforce-trusted-mtp-benchmark-workflow.sh",
-            encoding: .utf8
-        )
-        #expect(script.contains("WORKFLOW_PATH=\".github/workflows/mtp-benchmark.yml\""))
-        #expect(script.contains("workflow_dispatch"))
-        #expect(script.contains("refs/heads/main|refs/heads/submissions/*|refs/heads/baseline/*|refs/heads/yukon/baseline/*"))
-
-        // The serial pipeline's pin still points at benchmark.yml: neither
-        // track can dispatch the other's workflow against its private
-        // material.
-        let serialScript = try String(
             contentsOfFile: ".github/scripts/enforce-trusted-benchmark-workflow.sh",
             encoding: .utf8
         )
-        #expect(serialScript.contains("WORKFLOW_PATH=\".github/workflows/benchmark.yml\""))
+        #expect(script.contains("WORKFLOW_PATH=\".github/workflows/benchmark.yml\""))
+        #expect(script.contains("workflow_dispatch"))
+        #expect(script.contains("refs/heads/main|refs/heads/submissions/*|refs/heads/baseline/*|refs/heads/yukon/baseline/*"))
+
+        // The serial pipeline's pin points at serial-benchmark.yml: neither
+        // track can dispatch the other's workflow against its private
+        // material.
+        let serialScript = try String(
+            contentsOfFile: ".github/scripts/enforce-trusted-serial-benchmark-workflow.sh",
+            encoding: .utf8
+        )
+        #expect(serialScript.contains("WORKFLOW_PATH=\".github/workflows/serial-benchmark.yml\""))
     }
 
     // THE ENABLEMENT GATE (post-go-live shape): the track is enabled on the
@@ -117,14 +112,15 @@ struct MTPWorkflowIsolationTests {
         ))
         #expect(workflow.contains("MLXFAST_MTP_BENCH_GOLDEN_BYTES: \"14982\""))
 
-        // The per-dispatch operator interlock still defaults to false: an
-        // enabled track never runs from a default-parameter dispatch.
+        // Yukon dispatches runner.workflow with no custom inputs. The live
+        // default therefore opts in by default while the trusted contract,
+        // publication flag, and hidden pins remain fail-closed controls.
         let confirmInput = try stepBody(
             workflow,
             from: "confirm_track_enabled:",
             to: "run_benchmark:"
         )
-        #expect(confirmInput.contains("default: false"))
+        #expect(confirmInput.contains("default: true"))
 
         // And the trusted contract the gate reads is ENABLED — the QAT
         // 4-bit assistant's paired reference baseline was re-established on
@@ -139,10 +135,10 @@ struct MTPWorkflowIsolationTests {
         #expect(baseline["status"] as? String == "established")
     }
 
-    // The two ranked tracks never share mutable identity: distinct workspace,
-    // concurrency group, artifact names, baseline tree, calibration, and
-    // score file. The MTP score carries its own track id and never writes
-    // score.json.
+    // The two ranked tracks never share mutable runtime identity: distinct
+    // workspace, concurrency group, baseline tree, and calibration. The
+    // default MTP score uses Yukon's conventional score.json path and carries
+    // its track id inside the payload.
     @Test
     func mtpTrackIdentityIsFullySeparateFromSerialTrack() throws {
         let workflow = try mtpWorkflow()
@@ -152,20 +148,18 @@ struct MTPWorkflowIsolationTests {
         #expect(workflow.contains("group: mlxfast-mtp-ranked-"))
         #expect(workflow.contains("MLXFAST_MTP_BASELINE_WS: /opt/bench-runner/mtp-baseline/current"))
         #expect(workflow.contains("MLXFAST_MTP_BASELINE_CALIBRATION: /opt/bench-runner/state/mtp-baseline-calibration.json"))
-        #expect(workflow.contains("name: mtp-benchmark-results-"))
+        #expect(workflow.contains("name: benchmark-results-"))
         #expect(workflow.contains("name: mtp-correctness-results-"))
         #expect(workflow.contains("name: mtp-benchmark-audit-"))
         #expect(workflow.contains("track_id: $track"))
-        #expect(workflow.contains("> mtp-score.json"))
+        #expect(workflow.contains("> score.json"))
 
         // Never the serial track's identity: the serial workspace, the
         // serial baseline, the serial artifact namespaces, or the serial
         // score file name.
         #expect(!workflow.contains("/Users/Shared/bench-jobs/ranked-current"))
         #expect(!workflow.contains("/opt/bench-runner/baseline/current"))
-        #expect(!workflow.contains("name: benchmark-results-"))
         #expect(!workflow.contains("state/baseline-calibration.json"))
-        #expect(!workflow.contains("> score.json"))
 
         // The MTP measurement is owned by the MTP measure wrapper, not the
         // serial track's measure-job.sh.
@@ -177,24 +171,51 @@ struct MTPWorkflowIsolationTests {
         #expect(workflow.contains("actions/cache/restore@"))
         #expect(!workflow.contains("actions/cache/save@"))
 
-        // The leaderboard registration record is its own track config: the
-        // MTP track id, workflow, and score artifact live in
-        // benchmark.mtp.json, while the serial benchmark.json remains
-        // pointed at benchmark.yml/score.json untouched.
-        let registration = try Data(contentsOf: URL(fileURLWithPath: "benchmark.mtp.json"))
+        // benchmark.json is Yukon's authoritative default registration.
+        let registration = try Data(contentsOf: URL(fileURLWithPath: "benchmark.json"))
         let track = try #require(try JSONSerialization.jsonObject(with: registration) as? [String: Any])
         #expect(track["trackId"] as? String == "gemma4-31b-it-mtp-v1")
+        #expect(track["name"] as? String == "mlxfast-challenge-dev-mtp")
         let runner = try #require(track["runner"] as? [String: Any])
-        #expect(runner["workflow"] as? String == "mtp-benchmark.yml")
-        #expect(track["scorePath"] as? String == "mtp-score.json")
+        #expect(runner["workflow"] as? String == "benchmark.yml")
+        #expect(track["scorePath"] as? String == "score.json")
+        #expect(
+            track["benchmarkCommand"] as? [String]
+                == ["bash", "-c", "MLXFAST_SCORE_PATH=score.json ./benchmark-mtp.sh --local-iterate"]
+        )
+        #expect(
+            track["setupCommand"] as? [String]
+                == ["bash", "-c", "MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh && ./setup-mtp.sh"]
+        )
         let leaderboard = try #require(track["leaderboard"] as? [String: Any])
         #expect(leaderboard["namespace"] as? String == "gemma4-31b-it-mtp-v1")
         #expect(leaderboard["separateFromSerialTrack"] as? Bool == true)
+        #expect(
+            registration
+                == (try Data(contentsOf: URL(fileURLWithPath: "benchmark.mtp.json"))),
+            "benchmark.mtp.json must remain a byte-identical compatibility alias"
+        )
 
-        let serialConfig = try String(contentsOfFile: "benchmark.json", encoding: .utf8)
-        #expect(serialConfig.contains("\"workflow\": \"benchmark.yml\""))
+        let serialConfig = try String(contentsOfFile: "benchmark.serial.json", encoding: .utf8)
+        #expect(serialConfig.contains("\"workflow\": \"serial-benchmark.yml\""))
         #expect(serialConfig.contains("\"scorePath\": \"score.json\""))
         #expect(!serialConfig.contains("mtp"))
+    }
+
+    @Test
+    func defaultMTPLocalRunnerProducesYukonScorePayload() throws {
+        let path = "benchmark-mtp.sh"
+        let source = try String(contentsOfFile: path, encoding: .utf8)
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        let permissions = try #require(attributes[.posixPermissions] as? NSNumber).intValue
+
+        #expect(permissions & 0o111 != 0)
+        #expect(source.contains("mtp-probe"))
+        #expect(source.contains("mtp-benchmark"))
+        #expect(source.contains("--require-trained-assistant"))
+        #expect(source.contains(".all_tokens_matched == true"))
+        #expect(source.contains("score: $score"))
+        #expect(source.contains("official_score: false"))
     }
 
     // The serial ranked pipeline stays MTP-free: enabling, disabling, or
