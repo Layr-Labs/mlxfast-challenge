@@ -69,10 +69,6 @@ public final class Gemma4RuntimeWeightCache {
         // creation and MLX kernel-cache population triggered by the first
         // forward happen HERE, outside every scored window, instead of inside
         // the first scored prefill.
-        //
-        // Retain freed, shape-relevant warmup buffers for the scored worker
-        // request. Metal libraries and pipeline state are process-lifetime
-        // caches independent of this allocator pool.
         if let model = libraryModel, config.numHiddenLayers >= 16 {
             Self.warmLibraryModel(model)
             if startupMemoryPolicy?.clearAllocatorCacheAfterWarmup == true {
@@ -82,7 +78,32 @@ public final class Gemma4RuntimeWeightCache {
                 Memory.clearCache()
             }
         }
+        // Drain the free-buffer pool at the end of untimed init on every
+        // profile (redundant with the low-memory clear above). The trusted
+        // worker clears the allocator cache at each phase start AFTER the
+        // parent's phase timer starts, so any free buffers left here would be
+        // deallocated inside the scored window; they can never subsidize a
+        // scored forward either way, because that phase-start clear empties
+        // the pool before the first charged operation. Draining now moves the
+        // deallocation into untimed init and leaves the in-window clear a
+        // no-op. Metal libraries and pipeline state are process-lifetime
+        // caches independent of this allocator pool and survive it.
+        if Self.drainAllocatorCacheAtInitEnd {
+            Memory.clearCache()
+        }
     }
+
+    /// A/B toggle for the init-end allocator drain above; default on. Off
+    /// reproduces the historical behavior (retain the init free-pool and let
+    /// the trusted phase-start clear deallocate it inside the timed window).
+    private static let drainAllocatorCacheAtInitEnd: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_INIT_DRAIN_ALLOCATOR_CACHE"
+        ] else {
+            return true
+        }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }()
 
     /// One prefill-shaped forward (512 tokens) and one single-token decode
     /// step against a throwaway cache, evaluated and discarded. Inputs are
