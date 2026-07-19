@@ -1137,6 +1137,8 @@ final class Gemma4FastEngine {
     let slidingWindow: Int
     let asyncLayerGroup: Int
     let asyncLayerLead: Int
+    let exactPairAsyncLayerGroup: Int
+    let exactPairAsyncLayerLead: Int
     let tiedVocabularyHead: Gemma4TiedVocabularyHead?
     let usePacked13TiedVocabularyHead: Bool
     let verifyTiedVocabularyHead: Bool
@@ -1158,8 +1160,9 @@ final class Gemma4FastEngine {
             Int(ProcessInfo.processInfo.environment["MLXFAST_ASYNC_LAYER_GROUP"] ?? "10") ?? 10
         )
         self.asyncLayerGroup = asyncLayerGroup
+        let asyncLayerLead: Int
         if asyncLayerGroup > 0 {
-            self.asyncLayerLead = min(
+            asyncLayerLead = min(
                 asyncLayerGroup,
                 max(
                     1,
@@ -1169,8 +1172,19 @@ final class Gemma4FastEngine {
                 )
             )
         } else {
-            self.asyncLayerLead = 0
+            asyncLayerLead = 0
         }
+        self.asyncLayerLead = asyncLayerLead
+        let exactPairAsyncLayerGroup = max(
+            0,
+            Int(ProcessInfo.processInfo.environment[
+                "DARKBLOOM_MTP_EXACT_PAIR_ASYNC_LAYER_GROUP"
+            ] ?? "12") ?? 12
+        )
+        self.exactPairAsyncLayerGroup = exactPairAsyncLayerGroup
+        self.exactPairAsyncLayerLead = exactPairAsyncLayerGroup > 0
+            ? min(exactPairAsyncLayerGroup, max(1, asyncLayerLead))
+            : 0
 
         let modules = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
         let params = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
@@ -1508,9 +1522,10 @@ final class Gemma4FastEngine {
                 capturedFull = result.keyValue
             }
             let layerNumber = index + 1
-            if asyncLayerGroup > 0,
-               layerNumber >= asyncLayerLead,
-               (layerNumber - asyncLayerLead).isMultiple(of: asyncLayerGroup)
+            if exactPairAsyncLayerGroup > 0,
+               layerNumber >= exactPairAsyncLayerLead,
+               (layerNumber - exactPairAsyncLayerLead)
+                    .isMultiple(of: exactPairAsyncLayerGroup)
             {
                 if let normalizedInput {
                     asyncEval(hidden, normalizedInput)
