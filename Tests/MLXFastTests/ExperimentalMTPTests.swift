@@ -902,7 +902,7 @@ func trainedMTPPublicParityRuntimeGate() throws {
         environment["MLXFAST_MTP_PARITY_GOLDEN_PATH"]
     )
     let executable = environment["MLXFAST_MTP_EXECUTABLE"]
-        ?? ".build/release/mlxfast-runtime-worker"
+        ?? ".build-worker/release/mlxfast-runtime-worker"
     let totalTokenCount = Int(
         environment["MLXFAST_MTP_PARITY_TOKENS"] ?? "128"
     ) ?? 128

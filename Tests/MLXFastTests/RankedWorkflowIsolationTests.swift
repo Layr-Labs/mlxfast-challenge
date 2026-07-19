@@ -153,7 +153,7 @@ struct RankedWorkflowIsolationTests {
         // Allowlist diff against the pre-hidden snapshot, fail-closed.
         #expect(scrubStep.contains("post-transform-manifest.nul"))
         #expect(scrubStep.contains("grep -zqxF -- \"${rel}\" \"${manifest}\""))
-        #expect(scrubStep.contains("./weights/*|./.build/*|./correctness_prompts/*"))
+        #expect(scrubStep.contains("./weights/*|./.build/*|./.build-worker/*|./correctness_prompts/*"))
         #expect(scrubStep.contains("./bench_oracle*|./private/*"))
         #expect(scrubStep.contains("allowlist scrub could not remove gates-phase workspace file"))
         // weights/ re-verified against the pinned post-transform hash.
@@ -217,7 +217,7 @@ struct RankedWorkflowIsolationTests {
 
         let egressRange = try #require(workflow.range(of: "- name: Assert bench network egress lockdown"))
         let prepareWorkspaceRange = try #require(workflow.range(of: "- name: Prepare bench workspace"))
-        let buildRange = try #require(workflow.range(of: "- name: Build harness in bench sandbox"))
+        let buildRange = try #require(workflow.range(of: "- name: Build trusted CLI in bench sandbox"))
 
         // After the workspace exists (bench-exec needs it) but before the first
         // submission-built-code execution (build).
@@ -227,7 +227,7 @@ struct RankedWorkflowIsolationTests {
         let egressStep = try stepBody(
             workflow,
             from: "- name: Assert bench network egress lockdown",
-            to: "- name: Build harness in bench sandbox"
+            to: "- name: Build trusted CLI in bench sandbox"
         )
         // Functional probe AS bench through the bridge, with a trusted-uid
         // control probe so "box offline" is never mistaken for "PF live".

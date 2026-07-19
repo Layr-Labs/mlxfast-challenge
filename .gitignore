@@ -3,6 +3,7 @@
 build/
 dist/
 .build/
+.build-worker/
 .tools/
 .mlxfast-cache/
 .mlxfast-private/

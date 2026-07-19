@@ -208,13 +208,17 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     let verifyMetalCacheRange = try #require(workflow.range(of: "- name: Verify restored MLX Metal library"))
     let resetBuildProductsRange = try #require(workflow.range(of: "- name: Reset staged trusted build products"))
     let restoreBuildProductsRange = try #require(workflow.range(of: "- name: Restore trusted build products cache"))
+    let restoreWorkerBuildProductsRange = try #require(workflow.range(of: "- name: Restore worker build products cache"))
     let verifyBuildProductsRange = try #require(workflow.range(of: "- name: Verify restored build products"))
     let prepareWorkspaceRange = try #require(workflow.range(of: "- name: Prepare bench workspace"))
-    let buildRange = try #require(workflow.range(of: "- name: Build harness in bench sandbox"))
+    let trustedBuildRange = try #require(workflow.range(of: "- name: Build trusted CLI in bench sandbox"))
+    let workerBuildRange = try #require(workflow.range(of: "- name: Build participant worker in bench sandbox"))
     let stageMetalCacheRange = try #require(workflow.range(of: "- name: Stage trusted MLX Metal library cache"))
     let saveMetalCacheRange = try #require(workflow.range(of: "- name: Save trusted MLX Metal library cache"))
     let stageBuildProductsRange = try #require(workflow.range(of: "- name: Stage trusted build products cache"))
     let saveBuildProductsRange = try #require(workflow.range(of: "- name: Save trusted build products cache"))
+    let stageWorkerBuildProductsRange = try #require(workflow.range(of: "- name: Stage worker build products cache"))
+    let saveWorkerBuildProductsRange = try #require(workflow.range(of: "- name: Save worker build products cache"))
     let transformRange = try #require(workflow.range(of: "- name: Transform reference checkpoint in bench sandbox"))
     let publicGateRange = try #require(workflow.range(of: "- name: Public behavior gate"))
     let timedBenchmarkRange = try #require(workflow.range(of: "- name: Timed paired benchmark"))
@@ -227,14 +231,18 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(restoreMetalCacheRange.lowerBound < verifyMetalCacheRange.lowerBound)
     #expect(verifyMetalCacheRange.lowerBound < resetBuildProductsRange.lowerBound)
     #expect(resetBuildProductsRange.lowerBound < restoreBuildProductsRange.lowerBound)
-    #expect(restoreBuildProductsRange.lowerBound < verifyBuildProductsRange.lowerBound)
+    #expect(restoreBuildProductsRange.lowerBound < restoreWorkerBuildProductsRange.lowerBound)
+    #expect(restoreWorkerBuildProductsRange.lowerBound < verifyBuildProductsRange.lowerBound)
     #expect(verifyBuildProductsRange.lowerBound < prepareWorkspaceRange.lowerBound)
-    #expect(prepareWorkspaceRange.lowerBound < buildRange.lowerBound)
-    #expect(buildRange.lowerBound < stageMetalCacheRange.lowerBound)
+    #expect(prepareWorkspaceRange.lowerBound < trustedBuildRange.lowerBound)
+    #expect(trustedBuildRange.lowerBound < workerBuildRange.lowerBound)
+    #expect(workerBuildRange.lowerBound < stageMetalCacheRange.lowerBound)
     #expect(stageMetalCacheRange.lowerBound < saveMetalCacheRange.lowerBound)
     #expect(saveMetalCacheRange.lowerBound < stageBuildProductsRange.lowerBound)
     #expect(stageBuildProductsRange.lowerBound < saveBuildProductsRange.lowerBound)
-    #expect(saveBuildProductsRange.lowerBound < transformRange.lowerBound)
+    #expect(saveBuildProductsRange.lowerBound < stageWorkerBuildProductsRange.lowerBound)
+    #expect(stageWorkerBuildProductsRange.lowerBound < saveWorkerBuildProductsRange.lowerBound)
+    #expect(saveWorkerBuildProductsRange.lowerBound < transformRange.lowerBound)
     #expect(transformRange.lowerBound < hashWeightsRange.lowerBound)
     #expect(hashWeightsRange.lowerBound < publicGateRange.lowerBound)
     #expect(publicGateRange.lowerBound < timedBenchmarkRange.lowerBound)
@@ -250,10 +258,13 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(!workflow.contains("./setup.sh"))
     #expect(workflow.contains("- name: Restore trusted SwiftPM dependency cache"))
     #expect(workflow.contains("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
-    #expect(workflow.contains("key: swiftpm-trusted-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}"))
+    #expect(workflow.contains("key: swiftpm-trusted-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}"))
+    // Both SwiftPM roots' dependency checkouts ride the same trusted cache.
+    #expect(workflow.contains(".build-worker/checkouts"))
+    #expect(workflow.contains(".build-worker/workspace-state.json"))
 
     let metalFingerprintStep = String(workflow[metalFingerprintRange.lowerBound..<restoreMetalCacheRange.lowerBound])
-    #expect(metalFingerprintStep.contains("mlx-metallib-m5-max-v1"))
+    #expect(metalFingerprintStep.contains("mlx-metallib-m5-max-v2"))
     #expect(metalFingerprintStep.contains("sysctl -n machdep.cpu.brand_string"))
     #expect(metalFingerprintStep.contains("sw_vers -buildVersion"))
     #expect(metalFingerprintStep.contains("xcodebuild -showComponent MetalToolchain"))
@@ -265,58 +276,96 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(metalFingerprintStep.contains("/opt/homebrew/bin/cmake /usr/local/bin/cmake"))
     #expect(metalFingerprintStep.contains("\"${cmake_bin}\" --version"))
     #expect(metalFingerprintStep.contains("shasum -a 256 Package.swift Package.resolved tools/build-mlx-metallib.sh"))
+    // The metallib cache key folds in the vendored kernel sources of THIS
+    // (post-overlay) work tree so a cached metallib can never mask
+    // participant edits to the AOT-served kernels; the build-products caches
+    // stay on the base fingerprint because llbuild rebuilds source changes
+    // incrementally.
+    #expect(metalFingerprintStep.contains(
+        "vendored_metal_fingerprint=\"$(tools/build-mlx-metallib.sh --print-fingerprint)\""
+    ))
+    #expect(metalFingerprintStep.contains("VENDORED_METAL_FINGERPRINT=%s"))
+    #expect(metalFingerprintStep.contains("BASE_FINGERPRINT=%s"))
+    #expect(metalFingerprintStep.contains("printf 'base_sha256=%s\\n' \"${base_fingerprint}\" >> \"${GITHUB_OUTPUT}\""))
 
     let restoreMetalCacheStep = String(workflow[restoreMetalCacheRange.lowerBound..<verifyMetalCacheRange.lowerBound])
-    #expect(restoreMetalCacheStep.contains("path: .mlxfast-cache/mlx.metallib"))
+    #expect(restoreMetalCacheStep.contains(".mlxfast-cache/mlx.metallib"))
+    #expect(restoreMetalCacheStep.contains(".mlxfast-cache/mlx.metallib.fingerprint"))
     #expect(!restoreMetalCacheStep.contains(".build/release"))
-    #expect(restoreMetalCacheStep.contains("key: mlx-metallib-m5-max-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
+    #expect(restoreMetalCacheStep.contains("key: mlx-metallib-m5-max-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
     let verifyMetalCacheStep = String(workflow[verifyMetalCacheRange.lowerBound..<prepareWorkspaceRange.lowerBound])
     #expect(verifyMetalCacheStep.contains("CACHE_HIT: ${{ steps.restore_mlx_metallib_cache.outputs.cache-hit }}"))
     #expect(verifyMetalCacheStep.contains("if [[ \"${CACHE_HIT}\" == \"true\" ]]"))
     #expect(verifyMetalCacheStep.contains("test -s .mlxfast-cache/mlx.metallib"))
-    #expect(verifyMetalCacheStep.contains("/bin/rm -f .mlxfast-cache/mlx.metallib"))
+    #expect(verifyMetalCacheStep.contains("test -s .mlxfast-cache/mlx.metallib.fingerprint"))
+    // A restored metallib whose recorded source fingerprint disagrees with
+    // the work tree is discarded, never trusted.
+    #expect(verifyMetalCacheStep.contains(
+        "expected_record=\"mlxfast-metallib-fingerprint-v1 $(tools/build-mlx-metallib.sh --print-fingerprint)\""
+    ))
+    #expect(verifyMetalCacheStep.contains("does not match the vendored Metal sources"))
+    #expect(verifyMetalCacheStep.contains("/bin/rm -f .mlxfast-cache/mlx.metallib .mlxfast-cache/mlx.metallib.fingerprint"))
 
-    // Dependencies are pre-fetched in the trusted shell; build and transform
-    // both execute as the bench uid through the bridge.
-    #expect(workflow.contains("(cd \"${MLXFAST_JOB_WS}\" && swift package resolve)"))
-    let buildStep = String(workflow[buildRange.lowerBound..<stageMetalCacheRange.lowerBound])
-    #expect(buildStep.contains("sudo -n \"${MLXFAST_BENCH_EXEC}\""))
-    #expect(buildStep.contains("/usr/bin/swift build -c release --product mlxfast-swift"))
-    #expect(buildStep.contains("/usr/bin/swift build -c release --product mlxfast-runtime-worker"))
-    #expect(buildStep.contains("TODO(security): Move trusted and participant products"))
-    #expect(buildStep.contains("if [[ -s .mlxfast-cache/mlx.metallib ]]"))
-    #expect(buildStep.contains("/bin/cp .mlxfast-cache/mlx.metallib .build/release/mlx.metallib"))
-    #expect(buildStep.contains("tools/build-mlx-metallib.sh"))
-    #expect(buildStep.contains("/bin/chmod 0644 .build/release/mlx.metallib"))
+    // Dependencies are pre-fetched in the trusted shell for both SwiftPM
+    // roots; the trusted CLI and the participant worker build as separate
+    // bench-exec invocations into independent scratch roots.
+    #expect(workflow.contains("(cd \"${MLXFAST_JOB_WS}\" && swift package resolve --force-resolved-versions)"))
+    #expect(workflow.contains("(cd \"${MLXFAST_JOB_WS}\" && swift package resolve --force-resolved-versions --scratch-path .build-worker)"))
+    let trustedBuildStep = String(workflow[trustedBuildRange.lowerBound..<workerBuildRange.lowerBound])
+    #expect(trustedBuildStep.contains("sudo -n \"${MLXFAST_BENCH_EXEC}\""))
+    #expect(trustedBuildStep.contains("/usr/bin/swift build -c release --force-resolved-versions --product mlxfast-swift"))
+    #expect(!trustedBuildStep.contains("--product mlxfast-runtime-worker"))
+    #expect(!trustedBuildStep.contains("cp .mlxfast-cache/mlx.metallib"))
+    let workerBuildStep = String(workflow[workerBuildRange.lowerBound..<stageMetalCacheRange.lowerBound])
+    #expect(workerBuildStep.contains("sudo -n \"${MLXFAST_BENCH_EXEC}\""))
+    #expect(workerBuildStep.contains("/usr/bin/swift build -c release --force-resolved-versions --scratch-path .build-worker --product mlxfast-runtime-worker"))
+    #expect(workerBuildStep.contains("if [[ -s .mlxfast-cache/mlx.metallib && -s .mlxfast-cache/mlx.metallib.fingerprint ]]"))
+    #expect(workerBuildStep.contains("/bin/cp .mlxfast-cache/mlx.metallib .build-worker/release/mlx.metallib"))
+    #expect(workerBuildStep.contains("/bin/cp .mlxfast-cache/mlx.metallib.fingerprint .build-worker/release/mlx.metallib.fingerprint"))
+    #expect(workerBuildStep.contains("tools/build-mlx-metallib.sh"))
+    #expect(workerBuildStep.contains("/bin/chmod 0644 .build-worker/release/mlx.metallib .build-worker/release/mlx.metallib.fingerprint"))
+    #expect(workerBuildStep.contains("test -s \"${MLXFAST_JOB_WS}/.build-worker/release/mlx.metallib.fingerprint\""))
+    #expect(!workflow.contains("TODO(security): Move trusted and participant products"))
 
     let stageMetalCacheStep = String(workflow[stageMetalCacheRange.lowerBound..<saveMetalCacheRange.lowerBound])
     #expect(stageMetalCacheStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
-    #expect(stageMetalCacheStep.contains("/bin/cp \"${MLXFAST_JOB_WS}/.build/release/mlx.metallib\" .mlxfast-cache/mlx.metallib"))
+    #expect(stageMetalCacheStep.contains("/bin/cp \"${MLXFAST_JOB_WS}/.build-worker/release/mlx.metallib\" .mlxfast-cache/mlx.metallib"))
+    #expect(stageMetalCacheStep.contains("/bin/cp \"${MLXFAST_JOB_WS}/.build-worker/release/mlx.metallib.fingerprint\" .mlxfast-cache/mlx.metallib.fingerprint"))
     let saveMetalCacheStep = String(workflow[saveMetalCacheRange.lowerBound..<stageBuildProductsRange.lowerBound])
     #expect(saveMetalCacheStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
     #expect(saveMetalCacheStep.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
-    #expect(saveMetalCacheStep.contains("path: .mlxfast-cache/mlx.metallib"))
-    #expect(saveMetalCacheStep.contains("key: mlx-metallib-m5-max-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
+    #expect(saveMetalCacheStep.contains(".mlxfast-cache/mlx.metallib"))
+    #expect(saveMetalCacheStep.contains(".mlxfast-cache/mlx.metallib.fingerprint"))
+    #expect(saveMetalCacheStep.contains("key: mlx-metallib-m5-max-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
 
-    // Trusted build products cache: the workspace path must be STABLE across
-    // runs (llbuild records absolute paths; a per-run path would force a full
-    // recompile and make the cache useless), the staging area is wiped before
-    // restore (tar extraction never deletes stale files), submission runs
-    // seed .build from the restored products, and -- like the metallib --
-    // only main-ref dispatches may stage/save, so submission build output can
-    // never enter the trusted cache namespace.
+    // Build products caches: the workspace path must be STABLE across runs
+    // (llbuild records absolute paths; a per-run path would force a full
+    // recompile and make the caches useless), the staging areas are wiped
+    // before restore (tar extraction never deletes stale files), submission
+    // runs seed both roots from the restored products, and -- like the
+    // metallib -- only main-ref dispatches may stage/save, so submission
+    // build output can never enter the trusted cache namespaces. The trusted
+    // CLI root and the participant worker root are cached as two separate
+    // entries.
     #expect(workflow.contains("MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-current"))
     #expect(!workflow.contains("MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-${{"))
     let resetBuildProductsStep = String(workflow[resetBuildProductsRange.lowerBound..<restoreBuildProductsRange.lowerBound])
-    #expect(resetBuildProductsStep.contains("run: /bin/rm -rf .mlxfast-cache/trusted-build"))
-    let restoreBuildProductsStep = String(workflow[restoreBuildProductsRange.lowerBound..<verifyBuildProductsRange.lowerBound])
+    #expect(resetBuildProductsStep.contains("run: /bin/rm -rf .mlxfast-cache/trusted-build .mlxfast-cache/worker-build"))
+    let restoreBuildProductsStep = String(workflow[restoreBuildProductsRange.lowerBound..<restoreWorkerBuildProductsRange.lowerBound])
     #expect(restoreBuildProductsStep.contains("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
     #expect(restoreBuildProductsStep.contains("path: .mlxfast-cache/trusted-build"))
-    #expect(restoreBuildProductsStep.contains("key: bench-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
+    #expect(restoreBuildProductsStep.contains("key: bench-trusted-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.base_sha256 }}"))
+    let restoreWorkerBuildProductsStep = String(workflow[restoreWorkerBuildProductsRange.lowerBound..<verifyBuildProductsRange.lowerBound])
+    #expect(restoreWorkerBuildProductsStep.contains("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
+    #expect(restoreWorkerBuildProductsStep.contains("path: .mlxfast-cache/worker-build"))
+    #expect(restoreWorkerBuildProductsStep.contains("key: bench-worker-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.base_sha256 }}"))
     let verifyBuildProductsStep = String(workflow[verifyBuildProductsRange.lowerBound..<prepareWorkspaceRange.lowerBound])
-    #expect(verifyBuildProductsStep.contains("CACHE_HIT: ${{ steps.restore_build_products_cache.outputs.cache-hit }}"))
+    #expect(verifyBuildProductsStep.contains("TRUSTED_CACHE_HIT: ${{ steps.restore_build_products_cache.outputs.cache-hit }}"))
+    #expect(verifyBuildProductsStep.contains("WORKER_CACHE_HIT: ${{ steps.restore_worker_build_products_cache.outputs.cache-hit }}"))
     #expect(verifyBuildProductsStep.contains("test -d .mlxfast-cache/trusted-build/release"))
     #expect(verifyBuildProductsStep.contains("/bin/rm -rf .mlxfast-cache/trusted-build"))
+    #expect(verifyBuildProductsStep.contains("test -d .mlxfast-cache/worker-build/release"))
+    #expect(verifyBuildProductsStep.contains("/bin/rm -rf .mlxfast-cache/worker-build"))
     let stageBuildProductsStep = String(workflow[stageBuildProductsRange.lowerBound..<saveBuildProductsRange.lowerBound])
     #expect(stageBuildProductsStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
     // rsync with module-cache excludes: clang creates ModuleCache mode-700
@@ -327,20 +376,35 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(stageBuildProductsStep.contains("--exclude='clang-module-cache'"))
     #expect(stageBuildProductsStep.contains("\"${MLXFAST_JOB_WS}/.build/\" .mlxfast-cache/trusted-build/"))
     #expect(stageBuildProductsStep.contains("test -d .mlxfast-cache/trusted-build/release"))
-    let saveBuildProductsStep = String(workflow[saveBuildProductsRange.lowerBound..<transformRange.lowerBound])
+    let saveBuildProductsStep = String(workflow[saveBuildProductsRange.lowerBound..<stageWorkerBuildProductsRange.lowerBound])
     #expect(saveBuildProductsStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
     #expect(saveBuildProductsStep.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
     #expect(saveBuildProductsStep.contains("path: .mlxfast-cache/trusted-build"))
-    #expect(saveBuildProductsStep.contains("key: bench-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}"))
+    #expect(saveBuildProductsStep.contains("key: bench-trusted-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.base_sha256 }}"))
+    let stageWorkerBuildProductsStep = String(workflow[stageWorkerBuildProductsRange.lowerBound..<saveWorkerBuildProductsRange.lowerBound])
+    #expect(stageWorkerBuildProductsStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
+    #expect(stageWorkerBuildProductsStep.contains("/usr/bin/rsync -a \\"))
+    #expect(stageWorkerBuildProductsStep.contains("--exclude='ModuleCache'"))
+    #expect(stageWorkerBuildProductsStep.contains("--exclude='clang-module-cache'"))
+    #expect(stageWorkerBuildProductsStep.contains("\"${MLXFAST_JOB_WS}/.build-worker/\" .mlxfast-cache/worker-build/"))
+    #expect(stageWorkerBuildProductsStep.contains("test -d .mlxfast-cache/worker-build/release"))
+    let saveWorkerBuildProductsStep = String(workflow[saveWorkerBuildProductsRange.lowerBound..<transformRange.lowerBound])
+    #expect(saveWorkerBuildProductsStep.contains("cache-hit != 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"))
+    #expect(saveWorkerBuildProductsStep.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
+    #expect(saveWorkerBuildProductsStep.contains("path: .mlxfast-cache/worker-build"))
+    #expect(saveWorkerBuildProductsStep.contains("key: bench-worker-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.base_sha256 }}"))
 
     // Prepare must prove the stable workspace path is actually fresh (fail
     // closed on undeletable residue from a prior run) and seed the restored
-    // trusted products as the bench build's starting .build.
-    let prepareStep = String(workflow[prepareWorkspaceRange.lowerBound..<buildRange.lowerBound])
+    // products as each root's starting build tree.
+    let prepareStep = String(workflow[prepareWorkspaceRange.lowerBound..<trustedBuildRange.lowerBound])
     #expect(prepareStep.contains("stale bench workspace at ${MLXFAST_JOB_WS} could not be fully removed"))
     #expect(prepareStep.contains("if [[ -d \"${MLXFAST_JOB_WS}/.mlxfast-cache/trusted-build/release\" ]]; then"))
     #expect(prepareStep.contains("rm -rf \"${MLXFAST_JOB_WS}/.build\""))
     #expect(prepareStep.contains("mv \"${MLXFAST_JOB_WS}/.mlxfast-cache/trusted-build\" \"${MLXFAST_JOB_WS}/.build\""))
+    #expect(prepareStep.contains("if [[ -d \"${MLXFAST_JOB_WS}/.mlxfast-cache/worker-build/release\" ]]; then"))
+    #expect(prepareStep.contains("rm -rf \"${MLXFAST_JOB_WS}/.build-worker\""))
+    #expect(prepareStep.contains("mv \"${MLXFAST_JOB_WS}/.mlxfast-cache/worker-build\" \"${MLXFAST_JOB_WS}/.build-worker\""))
     let transformStep = String(workflow[transformRange.lowerBound..<publicGateRange.lowerBound])
     #expect(transformStep.contains("sudo -n \"${MLXFAST_BENCH_EXEC}\""))
     #expect(transformStep.contains("exec .build/release/mlxfast-swift transform"))
@@ -361,7 +425,7 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(ci.contains("- name: Save SwiftPM cache"))
     #expect(ci.contains("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
     #expect(ci.contains("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"))
-    #expect(ci.contains("key: swiftpm-trusted-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}"))
+    #expect(ci.contains("key: swiftpm-trusted-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}"))
     #expect(ci.contains("github.ref == 'refs/heads/main'"))
     #expect(ci.contains(".build/checkouts"))
     #expect(ci.contains(".build/repositories"))
@@ -371,11 +435,11 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(ci.contains("'#!/usr/bin/env sh'"))
     #expect(ci.contains("\n                bash -n \"${script}\"\n"))
     #expect(ci.contains("\n                sh -n \"${script}\"\n"))
-    #expect(ci.contains("swift build -c release --product mlxfast-swift"))
-    #expect(ci.contains("swift build -c release --product mlxfast-runtime-worker"))
+    #expect(ci.contains("swift build -c release --force-resolved-versions --product mlxfast-swift"))
+    #expect(ci.contains("swift build -c release --force-resolved-versions --scratch-path .build-worker --product mlxfast-runtime-worker"))
     #expect(ci.contains("swift test -c release"))
     #expect(ci.contains("test -x .build/release/mlxfast-swift"))
-    #expect(ci.contains("test -x .build/release/mlxfast-runtime-worker"))
+    #expect(ci.contains("test -x .build-worker/release/mlxfast-runtime-worker"))
     #expect(!ci.contains("swift test --filter"))
 }
 
@@ -590,7 +654,7 @@ func benchmarkWorkspaceACLLocksTrustedSurfacesAgainstBench() throws {
         encoding: .utf8
     )
     let prepareRange = try #require(workflow.range(of: "- name: Prepare bench workspace"))
-    let buildRange = try #require(workflow.range(of: "- name: Build harness in bench sandbox"))
+    let buildRange = try #require(workflow.range(of: "- name: Build trusted CLI in bench sandbox"))
     let prepare = String(workflow[prepareRange.lowerBound..<buildRange.lowerBound])
 
     // The functional allow ACE still lets bench read/execute the tree and
@@ -663,21 +727,46 @@ func benchmarkPinsAndVerifiesTrustedHarnessAcrossScoredPhases() throws {
         contentsOfFile: ".github/scripts/pin-trusted-harness.sh",
         encoding: .utf8
     )
-    #expect(pinScript.contains("TODO(security): Revisit this pin's scope"))
-    #expect(!pinScript.contains("\".build/release/mlxfast-runtime-worker\""))
+    // Two separately attested artifact sets: the trusted set carries only
+    // the driver + trusted CLI binary; the participant worker binary and
+    // metallib live in their own worker attestation and never inside the
+    // trusted pin.
+    #expect(!pinScript.contains("TODO(security)"))
+    #expect(pinScript.contains("ARTIFACT_SET=\"${4:-trusted}\""))
+    let trustedSetRange = try #require(pinScript.range(of: "  trusted)"))
+    let workerSetRange = try #require(pinScript.range(of: "  worker)"))
+    let trustedSet = String(pinScript[trustedSetRange.lowerBound..<workerSetRange.lowerBound])
+    #expect(trustedSet.contains("\"benchmark.sh\""))
+    #expect(trustedSet.contains("\".build/release/mlxfast-swift\""))
+    #expect(!trustedSet.contains("mlxfast-runtime-worker"))
+    #expect(!trustedSet.contains("mlx.metallib"))
+    let workerSet = String(pinScript[workerSetRange.lowerBound...])
+    #expect(workerSet.contains("\".build-worker/release/mlxfast-runtime-worker\""))
+    #expect(workerSet.contains("\".build-worker/release/mlx.metallib\""))
 
-    // Pin is captured at the END of the trusted build, before the submitted
-    // transform (the first bench step that can tamper), and re-verified before
-    // every phase that runs the binary as bench.
+    // The trusted pin is captured at the END of the trusted CLI build and
+    // BEFORE the participant worker build (worker-build-time code execution
+    // must not be able to tamper the trusted binary pre-pin); the worker
+    // attestation is captured at the end of the worker build, before the
+    // submitted transform. Both are re-verified before every phase that runs
+    // the binaries as bench.
     #expect(workflow.contains(
         ".github/scripts/pin-trusted-harness.sh write \\\n"
-            + "            \"${MLXFAST_JOB_WS}\" \"${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256\""
+            + "            \"${MLXFAST_JOB_WS}\" \"${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256\" trusted"
     ))
-    let verifyInvocation =
-        ".github/scripts/pin-trusted-harness.sh verify \"${MLXFAST_JOB_WS}\" \"${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256\""
-    #expect(workflow.components(separatedBy: verifyInvocation).count - 1 == 3)
+    #expect(workflow.contains(
+        ".github/scripts/pin-trusted-harness.sh write \\\n"
+            + "            \"${MLXFAST_JOB_WS}\" \"${MLXFAST_PRIVATE_DIR}/participant-worker.sha256\" worker"
+    ))
+    let verifyTrustedInvocation =
+        ".github/scripts/pin-trusted-harness.sh verify \"${MLXFAST_JOB_WS}\" \"${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256\" trusted"
+    let verifyWorkerInvocation =
+        ".github/scripts/pin-trusted-harness.sh verify \"${MLXFAST_JOB_WS}\" \"${MLXFAST_PRIVATE_DIR}/participant-worker.sha256\" worker"
+    #expect(workflow.components(separatedBy: verifyTrustedInvocation).count - 1 == 3)
+    #expect(workflow.components(separatedBy: verifyWorkerInvocation).count - 1 == 3)
 
-    let buildRange = try #require(workflow.range(of: "- name: Build harness in bench sandbox"))
+    let trustedBuildRange = try #require(workflow.range(of: "- name: Build trusted CLI in bench sandbox"))
+    let workerBuildRange = try #require(workflow.range(of: "- name: Build participant worker in bench sandbox"))
     let transformRange = try #require(workflow.range(of: "- name: Transform reference checkpoint in bench sandbox"))
     let verifyPublicRange = try #require(workflow.range(of: "- name: Verify trusted harness before public gate"))
     let publicGateRange = try #require(workflow.range(of: "- name: Public behavior gate"))
@@ -686,10 +775,15 @@ func benchmarkPinsAndVerifiesTrustedHarnessAcrossScoredPhases() throws {
     let verifyTimingRange = try #require(workflow.range(of: "- name: Verify trusted harness before timing"))
     let timingRange = try #require(workflow.range(of: "- name: Timed paired benchmark (measure-job)"))
 
-    // write happens inside the build step (before transform).
-    let writeRange = try #require(workflow.range(of: "pin-trusted-harness.sh write"))
-    #expect(buildRange.lowerBound < writeRange.lowerBound)
-    #expect(writeRange.lowerBound < transformRange.lowerBound)
+    // The trusted write happens inside the trusted build step, before the
+    // worker build; the worker write happens inside the worker build step,
+    // before the transform.
+    let trustedWriteRange = try #require(workflow.range(of: "trusted-harness.sha256\" trusted"))
+    let workerWriteRange = try #require(workflow.range(of: "participant-worker.sha256\" worker"))
+    #expect(trustedBuildRange.lowerBound < trustedWriteRange.lowerBound)
+    #expect(trustedWriteRange.lowerBound < workerBuildRange.lowerBound)
+    #expect(workerBuildRange.lowerBound < workerWriteRange.lowerBound)
+    #expect(workerWriteRange.lowerBound < transformRange.lowerBound)
     // Each verify immediately precedes the phase that executes the binary.
     #expect(transformRange.lowerBound < verifyPublicRange.lowerBound)
     #expect(verifyPublicRange.lowerBound < publicGateRange.lowerBound)
@@ -710,16 +804,23 @@ func pinTrustedHarnessScriptDetectsTamper() throws {
 
     let ws = root.appendingPathComponent("ws")
     let releaseDir = ws.appendingPathComponent(".build/release")
+    let workerReleaseDir = ws.appendingPathComponent(".build-worker/release")
     try FileManager.default.createDirectory(at: releaseDir, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: workerReleaseDir, withIntermediateDirectories: true)
     try "driver\n".write(to: ws.appendingPathComponent("benchmark.sh"), atomically: true, encoding: .utf8)
     try "BINARY".write(to: releaseDir.appendingPathComponent("mlxfast-swift"), atomically: true, encoding: .utf8)
-    try "METALLIB".write(to: releaseDir.appendingPathComponent("mlx.metallib"), atomically: true, encoding: .utf8)
-    let pin = root.appendingPathComponent("trusted-harness.sha256")
+    try "WORKER".write(to: workerReleaseDir.appendingPathComponent("mlxfast-runtime-worker"), atomically: true, encoding: .utf8)
+    try "METALLIB".write(to: workerReleaseDir.appendingPathComponent("mlx.metallib"), atomically: true, encoding: .utf8)
+    let trustedPin = root.appendingPathComponent("trusted-harness.sha256")
+    let workerPin = root.appendingPathComponent("participant-worker.sha256")
 
-    func run(_ mode: String) throws -> Int32 {
+    func run(_ mode: String, _ artifactSet: String) throws -> Int32 {
+        let pin = artifactSet == "trusted" ? trustedPin : workerPin
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [".github/scripts/pin-trusted-harness.sh", mode, ws.path, pin.path]
+        process.arguments = [
+            ".github/scripts/pin-trusted-harness.sh", mode, ws.path, pin.path, artifactSet,
+        ]
         process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         process.standardError = Pipe()
         try process.run()
@@ -727,28 +828,241 @@ func pinTrustedHarnessScriptDetectsTamper() throws {
         return process.terminationStatus
     }
 
-    #expect(try run("write") == 0)
-    #expect(FileManager.default.fileExists(atPath: pin.path))
-    #expect(try run("verify") == 0)
+    #expect(try run("write", "trusted") == 0)
+    #expect(try run("write", "worker") == 0)
+    #expect(FileManager.default.fileExists(atPath: trustedPin.path))
+    #expect(FileManager.default.fileExists(atPath: workerPin.path))
+    #expect(try run("verify", "trusted") == 0)
+    #expect(try run("verify", "worker") == 0)
 
-    // A swapped binary fails the verify closed.
+    // A swapped trusted binary fails the trusted verify closed and leaves the
+    // worker attestation untouched (the sets are independent).
     try "EVIL".write(to: releaseDir.appendingPathComponent("mlxfast-swift"), atomically: true, encoding: .utf8)
-    #expect(try run("verify") != 0)
+    #expect(try run("verify", "trusted") != 0)
+    #expect(try run("verify", "worker") == 0)
 
     // A swapped driver fails too.
     try "BINARY".write(to: releaseDir.appendingPathComponent("mlxfast-swift"), atomically: true, encoding: .utf8)
     try "hacked\n".write(to: ws.appendingPathComponent("benchmark.sh"), atomically: true, encoding: .utf8)
-    #expect(try run("verify") != 0)
+    #expect(try run("verify", "trusted") != 0)
+
+    // A swapped worker binary fails the worker attestation, not the trusted pin.
+    try "driver\n".write(to: ws.appendingPathComponent("benchmark.sh"), atomically: true, encoding: .utf8)
+    #expect(try run("verify", "trusted") == 0)
+    try "EVILWORKER".write(
+        to: workerReleaseDir.appendingPathComponent("mlxfast-runtime-worker"),
+        atomically: true,
+        encoding: .utf8
+    )
+    #expect(try run("verify", "worker") != 0)
+    #expect(try run("verify", "trusted") == 0)
 
     // A symlinked artifact is rejected (never dereferenced).
-    try "driver\n".write(to: ws.appendingPathComponent("benchmark.sh"), atomically: true, encoding: .utf8)
-    #expect(try run("verify") == 0)
-    try FileManager.default.removeItem(at: releaseDir.appendingPathComponent("mlx.metallib"))
+    try "WORKER".write(
+        to: workerReleaseDir.appendingPathComponent("mlxfast-runtime-worker"),
+        atomically: true,
+        encoding: .utf8
+    )
+    #expect(try run("verify", "worker") == 0)
+    try FileManager.default.removeItem(at: workerReleaseDir.appendingPathComponent("mlx.metallib"))
     try FileManager.default.createSymbolicLink(
-        atPath: releaseDir.appendingPathComponent("mlx.metallib").path,
+        atPath: workerReleaseDir.appendingPathComponent("mlx.metallib").path,
         withDestinationPath: "/etc/hosts"
     )
-    #expect(try run("verify") != 0)
+    #expect(try run("verify", "worker") != 0)
+
+    // An unknown artifact set is rejected.
+    #expect(try run("verify", "everything") == 2)
+}
+
+// The trusted-harness source scope (manifests + timer/gates/score sources) is
+// byte-verified against trusted git content in the trusted shell before every
+// ranked build, independently of the overlay and surface-enforcement scripts,
+// and the manifests are ACL-locked against bench writes.
+@Test
+func benchmarkWorkflowsPinTrustedSourceScopeBeforeBuilding() throws {
+    let script = try String(
+        contentsOfFile: ".github/scripts/verify-trusted-source-scope.sh",
+        encoding: .utf8
+    )
+    #expect(script.contains("\"Package.swift\""))
+    #expect(script.contains("\"Package.resolved\""))
+    #expect(script.contains("\"Sources/MLXFastCLI\""))
+    #expect(script.contains("\"Sources/MLXFastTrustedHarness\""))
+    #expect(script.contains("\"Sources/MLXFastCore\""))
+    // Sources/MLXFastTransform is participant-editable by contract and is
+    // deliberately outside the trusted scope pin.
+    #expect(script.contains("Sources/MLXFastTransform is deliberately OUT of scope"))
+    #expect(!script.contains("\"Sources/MLXFastTransform\""))
+    // Byte comparison against trusted git content, through the hardened git
+    // wrapper, plus inventory and non-regular-entry checks.
+    #expect(script.contains("hardened-git.sh"))
+    #expect(script.contains("cat-file blob \"HEAD:${rel}\" | cmp -s - \"${ws_path}\""))
+    #expect(script.contains("ls-tree -r --name-only \"HEAD\" --"))
+    #expect(script.contains("find \"${BENCH_WORKSPACE}/${dir}\" -mindepth 1 ! -type d ! -type f"))
+    // The editable contract comes from the trusted ref, never the work tree,
+    // and must not overlap the trusted scope.
+    #expect(script.contains("cat-file blob \"HEAD:benchmark.json\""))
+    #expect(script.contains("overlaps trusted scope path"))
+
+    // The manifest replaces the old TODO with a pointer at the enforcement.
+    let manifest = try String(contentsOfFile: "Package.swift", encoding: .utf8)
+    #expect(!manifest.contains("TODO(security): Pin the trusted-harness source scope"))
+    #expect(manifest.contains("verify-trusted-source-scope.sh"))
+
+    for workflowPath in [
+        ".github/workflows/benchmark.yml",
+        ".github/workflows/mtp-benchmark.yml",
+    ] {
+        let workflow = try String(contentsOfFile: workflowPath, encoding: .utf8)
+        let prepareRange = try #require(
+            workflow.range(of: "- name: Prepare bench workspace"),
+            "expected prepare step in \(workflowPath)"
+        )
+        let scopeRange = try #require(
+            workflow.range(of: "- name: Verify trusted source scope"),
+            "expected source-scope step in \(workflowPath)"
+        )
+        let buildRange = try #require(
+            workflow.range(of: "- name: Build trusted CLI in bench sandbox"),
+            "expected trusted build step in \(workflowPath)"
+        )
+        // After the workspace copy exists, before anything is compiled.
+        #expect(prepareRange.lowerBound < scopeRange.lowerBound)
+        #expect(scopeRange.lowerBound < buildRange.lowerBound)
+        #expect(workflow.contains(
+            ".github/scripts/verify-trusted-source-scope.sh \"${GITHUB_WORKSPACE}\" \"${MLXFAST_JOB_WS}\""
+        ))
+        // The frozen manifests are also bench-deny ACL-locked like the driver
+        // and the contract.
+        #expect(workflow.contains("\"${MLXFAST_JOB_WS}/Package.swift\""))
+        #expect(workflow.contains("\"${MLXFAST_JOB_WS}/Package.resolved\""))
+    }
+}
+
+@Test
+func verifyTrustedSourceScopeScriptDetectsScopeTamper() throws {
+    let fm = FileManager.default
+    let scriptPath = URL(fileURLWithPath: fm.currentDirectoryPath)
+        .appendingPathComponent(".github/scripts/verify-trusted-source-scope.sh").path
+
+    let root = try temporaryDirectory()
+    defer { try? fm.removeItem(at: root) }
+    let trusted = root.appendingPathComponent("trusted")
+    let ws = root.appendingPathComponent("ws")
+
+    func run(
+        _ argv: [String], cwd: String
+    ) throws -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = argv
+        process.currentDirectoryURL = URL(fileURLWithPath: cwd)
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+    for tool in ["git", "jq"] {
+        guard try run(["sh", "-c", "command -v \(tool)"], cwd: fm.currentDirectoryPath).status == 0
+        else { return }
+    }
+
+    @discardableResult
+    func git(_ args: [String]) throws -> String {
+        let result = try run(
+            ["git", "-c", "user.email=test@test", "-c", "user.name=test",
+             "-c", "commit.gpgsign=false"] + args,
+            cwd: trusted.path
+        )
+        #expect(result.status == 0, "git \(args.joined(separator: " ")): \(result.output)")
+        return result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func write(_ relative: String, _ contents: String, under base: URL) throws {
+        let url = base.appendingPathComponent(relative)
+        try fm.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try contents.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    try fm.createDirectory(at: trusted, withIntermediateDirectories: true)
+    try write("Package.swift", "// manifest v1\n", under: trusted)
+    try write("Package.resolved", "{\"pins\":[]}\n", under: trusted)
+    try write(
+        "benchmark.json",
+        #"{"editablePaths":["Sources/MLXFastModel","Sources/MLXFastTransform"]}"#,
+        under: trusted)
+    try write("Sources/MLXFastCLI/main.swift", "// cli\n", under: trusted)
+    try write("Sources/MLXFastTrustedHarness/Runtime.swift", "// harness\n", under: trusted)
+    try write("Sources/MLXFastCore/Core.swift", "// core\n", under: trusted)
+    try write("Sources/MLXFastModel/Editable.swift", "// editable v1\n", under: trusted)
+    try git(["init", "-q"])
+    try git(["add", "."])
+    try git(["commit", "-q", "-m", "trusted base"])
+
+    func resetWorkspace() throws {
+        try? fm.removeItem(at: ws)
+        try fm.copyItem(at: trusted, to: ws)
+        try? fm.removeItem(at: ws.appendingPathComponent(".git"))
+    }
+    func verify() throws -> (status: Int32, output: String) {
+        try run(["bash", scriptPath, trusted.path, ws.path], cwd: fm.currentDirectoryPath)
+    }
+
+    // Clean copy passes; an overlaid EDITABLE path does not trip the check.
+    try resetWorkspace()
+    #expect(try verify().status == 0)
+    try write("Sources/MLXFastModel/Editable.swift", "// editable v2 overlay\n", under: ws)
+    #expect(try verify().status == 0)
+
+    // A mutated manifest fails.
+    try write("Package.swift", "// manifest TAMPERED\n", under: ws)
+    let manifestTamper = try verify()
+    #expect(manifestTamper.status != 0)
+    #expect(manifestTamper.output.contains("Package.swift"))
+
+    // A new source added under a trusted dir fails (scope expansion).
+    try resetWorkspace()
+    try write("Sources/MLXFastCore/Injected.swift", "// injected\n", under: ws)
+    let injected = try verify()
+    #expect(injected.status != 0)
+    #expect(injected.output.contains("file inventory under Sources/MLXFastCore differs"))
+
+    // A mutated trusted source fails.
+    try resetWorkspace()
+    try write("Sources/MLXFastCLI/main.swift", "// cli TAMPERED\n", under: ws)
+    #expect(try verify().status != 0)
+
+    // A symlink inside the trusted scope fails (redirection).
+    try resetWorkspace()
+    try fm.removeItem(at: ws.appendingPathComponent("Sources/MLXFastTrustedHarness/Runtime.swift"))
+    try fm.createSymbolicLink(
+        atPath: ws.appendingPathComponent("Sources/MLXFastTrustedHarness/Runtime.swift").path,
+        withDestinationPath: "../MLXFastModel/Editable.swift"
+    )
+    let symlinked = try verify()
+    #expect(symlinked.status != 0)
+    #expect(symlinked.output.contains("non-regular entry"))
+
+    // A trusted contract that exposes the trusted scope as editable fails,
+    // even when the workspace bytes all match.
+    try resetWorkspace()
+    try write(
+        "benchmark.json",
+        #"{"editablePaths":["Sources/MLXFastModel","Sources/MLXFastCore"]}"#,
+        under: trusted)
+    try git(["commit", "-q", "-am", "expose trusted scope"])
+    try write(
+        "benchmark.json",
+        #"{"editablePaths":["Sources/MLXFastModel","Sources/MLXFastCore"]}"#,
+        under: ws)
+    let exposed = try verify()
+    #expect(exposed.status != 0)
+    #expect(exposed.output.contains("overlaps trusted scope path"))
 }
 
 @Test
@@ -1564,6 +1878,243 @@ func submissionStaticReviewOversizeFailureExplainsStaleCloneDeletions() throws {
     #expect(oversize.output.contains("resubmit"))
 }
 
+// Mechanical byte budgets for the enlarged editable surface: the per-file cap
+// and the base-to-head growth cap must fail closed BEFORE any judge call, so
+// a submission cannot smuggle a lookup table under the total cap by touching
+// only a few files.
+@Test
+func submissionStaticReviewCapsFileSizeAndSurfaceGrowth() throws {
+    let fm = FileManager.default
+    let scriptPath = URL(fileURLWithPath: fm.currentDirectoryPath)
+        .appendingPathComponent(".github/scripts/run-submission-static-review.sh").path
+
+    let root = fm.temporaryDirectory
+        .appendingPathComponent("static-review-caps-\(UUID().uuidString)")
+    try fm.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: root) }
+    let repo = root.appendingPathComponent("repo").path
+    let privatePath = root.appendingPathComponent("private").path
+    try fm.createDirectory(atPath: repo, withIntermediateDirectories: true)
+
+    func run(
+        _ argv: [String], env extra: [String: String] = [:]
+    ) throws -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = argv
+        process.currentDirectoryURL = URL(fileURLWithPath: repo)
+        var env = ProcessInfo.processInfo.environment
+        let strayKeys = env.keys.filter {
+            $0.hasPrefix("MLXFAST_") || $0.hasPrefix("ANTHROPIC_")
+        }
+        for key in strayKeys { env.removeValue(forKey: key) }
+        env.merge(extra) { _, override in override }
+        process.environment = env
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+    for tool in ["git", "jq", "bash"] {
+        guard try run(["sh", "-c", "command -v \(tool)"]).status == 0 else { return }
+    }
+
+    @discardableResult
+    func git(_ args: [String]) throws -> String {
+        let result = try run(
+            ["git", "-c", "user.email=test@test", "-c", "user.name=test",
+             "-c", "commit.gpgsign=false"] + args)
+        #expect(result.status == 0, "git \(args.joined(separator: " ")): \(result.output)")
+        return result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func review(
+        base: String, head: String, env extra: [String: String] = [:]
+    ) throws -> (status: Int32, output: String) {
+        var env: [String: String] = [
+            "ANTHROPIC_API_KEY": "test-key-never-sent",
+            "MLXFAST_PRIVATE_DIR": privatePath,
+            "HEAD_SHA": head,
+            "MLXFAST_SUBMISSION_REVIEW_BASE_SHA": base,
+        ]
+        env.merge(extra) { _, override in override }
+        return try run(["bash", scriptPath], env: env)
+    }
+
+    try git(["init", "-q"])
+    try #"{"editablePaths":["Sources/MLXFastModel"]}"#
+        .write(toFile: repo + "/benchmark.json", atomically: true, encoding: .utf8)
+    try fm.createDirectory(
+        atPath: repo + "/Sources/MLXFastModel", withIntermediateDirectories: true)
+    try "let base = 1\n".write(
+        toFile: repo + "/Sources/MLXFastModel/Kernel.swift", atomically: true, encoding: .utf8)
+    try git(["add", "."])
+    try git(["commit", "-q", "-m", "base"])
+    let baseSha = try git(["rev-parse", "HEAD"])
+
+    // Head adds ~300 KB of new "table" bytes inside one editable file.
+    let table = "// table\n" + String(repeating: "0123456789abcdef", count: 19_000)
+    try table.write(
+        toFile: repo + "/Sources/MLXFastModel/Kernel.swift", atomically: true, encoding: .utf8)
+    try git(["commit", "-q", "-am", "grow"])
+    let grownHead = try git(["rev-parse", "HEAD"])
+
+    // Default growth cap (256 KiB) rejects the ~300 KB addition before any
+    // network call (no curl shim exists; reaching curl would fail the test
+    // differently).
+    let growth = try review(base: baseSha, head: grownHead)
+    #expect(growth.status != 0)
+    #expect(growth.output.contains("above the growth limit"))
+
+    // With the growth cap raised, the per-file cap still rejects the file.
+    let perFile = try review(
+        base: baseSha, head: grownHead,
+        env: [
+            "MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_GROWTH_BYTES": "10000000",
+            "MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_FILE_BYTES": "200000",
+        ])
+    #expect(perFile.status != 0)
+    #expect(perFile.output.contains("above the per-file static review limit"))
+
+    // Malformed cap knobs fail closed.
+    let badKnob = try review(
+        base: baseSha, head: grownHead,
+        env: ["MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_GROWTH_BYTES": "lots"])
+    #expect(badKnob.status != 0)
+    #expect(badKnob.output.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_GROWTH_BYTES must be a positive integer"))
+}
+
+// The kernel-bypass policy for the enlarged (vendored-kernel) editable
+// surface reaches the judge, and the deterministic byte budgets are enforced
+// twice: in the review script and again at participant-worker launch in the
+// trusted CLI, with identical env knobs and defaults.
+@Test
+func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
+    let staticReview = try String(
+        contentsOfFile: ".github/scripts/run-submission-static-review.sh",
+        encoding: .utf8
+    )
+    // Mechanical caps: total, per-file, and base-to-head growth, all
+    // validated and enforced before any judge call.
+    #expect(staticReview.contains("MAX_FILE_BYTES=\"${MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_FILE_BYTES:-524288}\""))
+    #expect(staticReview.contains("MAX_GROWTH_BYTES=\"${MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_GROWTH_BYTES:-262144}\""))
+    #expect(staticReview.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_FILE_BYTES must be a positive integer"))
+    #expect(staticReview.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_GROWTH_BYTES must be a positive integer"))
+    #expect(staticReview.contains("above the per-file static review limit"))
+    #expect(staticReview.contains("git cat-file -s \"${review_base}:${changed_path}\""))
+    #expect(staticReview.contains("git cat-file -s \"${review_head}:${changed_path}\""))
+    #expect(staticReview.contains("surface_growth_bytes=$((head_surface_bytes - base_surface_bytes))"))
+    #expect(staticReview.contains("above the growth limit"))
+
+    // Kernel-bypass categories in both the system prompt and the structured
+    // fail_on policy, plus the matching allowances for real kernel work.
+    for category in [
+        "kernel or kernel-dispatch edits that special-case benchmark-shaped inputs",
+        "kernel edits that detect timed-versus-warmup execution",
+        "masked only for the public or golden shapes",
+        "runtime-effective JIT string (mlx-generated/*.cpp)",
+    ] {
+        #expect(
+            staticReview.components(separatedBy: category).count - 1 >= 2,
+            "kernel policy category must appear in system prompt and fail_on: \(category)"
+        )
+    }
+    #expect(staticReview.contains("Metal kernel tuning"))
+    #expect(staticReview.contains("M5 (_nax) kernel variants"))
+    #expect(staticReview.contains("matched edits applied consistently to a kernel AOT .metal/.h source and its JIT mlx-generated twin"))
+
+    // Launch-time backstop in the trusted CLI: same knobs, same defaults,
+    // official fail-closed, and the TODO marker resolved.
+    let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
+    #expect(!cli.contains("TODO(security)"))
+    #expect(cli.contains("try enforceEditableSurfaceByteBudget(officialRun: officialRun)"))
+    #expect(cli.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES"))
+    #expect(cli.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_FILE_BYTES"))
+    #expect(cli.contains(
+        "official benchmark runs require the editable-surface byte budget check"
+    ))
+    #expect(EditableSurfaceByteBudget.defaultMaxTotalBytes == 2_500_000)
+    #expect(EditableSurfaceByteBudget.defaultMaxFileBytes == 524_288)
+    #expect(staticReview.contains("MAX_BYTES=\"${MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES:-2500000}\""))
+
+    // The current editable surface must actually FIT the launch budget with
+    // the shipped defaults, or every official worker launch would fail.
+    let verdict = verifyEditableSurfaceByteBudget(
+        contractPath: "benchmark.json",
+        maxTotalBytes: EditableSurfaceByteBudget.defaultMaxTotalBytes,
+        maxFileBytes: EditableSurfaceByteBudget.defaultMaxFileBytes
+    )
+    guard case .verified(let totalBytes, let fileCount) = verdict else {
+        Issue.record("editable surface exceeds the shipped launch budget: \(verdict)")
+        return
+    }
+    #expect(totalBytes > 0)
+    #expect(fileCount > 0)
+}
+
+@Test
+func editableSurfaceByteBudgetEnforcesCapsAtWorkerLaunch() throws {
+    let fm = FileManager.default
+    let root = try temporaryDirectory()
+    defer { try? fm.removeItem(at: root) }
+    let contract = root.appendingPathComponent("benchmark.json")
+    let model = root.appendingPathComponent("Sources/MLXFastModel")
+    try fm.createDirectory(at: model, withIntermediateDirectories: true)
+    try #"{"editablePaths":["Sources/MLXFastModel","kernel.h"]}"#
+        .write(to: contract, atomically: true, encoding: .utf8)
+    try Data(repeating: 0x61, count: 100).write(to: model.appendingPathComponent("Engine.swift"))
+    try Data(repeating: 0x62, count: 50).write(to: root.appendingPathComponent("kernel.h"))
+    // A symlink never counts toward the budget.
+    try fm.createSymbolicLink(
+        atPath: model.appendingPathComponent("alias.swift").path,
+        withDestinationPath: "Engine.swift"
+    )
+
+    func verdict(maxTotal: Int, maxFile: Int) -> EditableSurfaceBudgetVerification {
+        verifyEditableSurfaceByteBudget(
+            contractPath: contract.path,
+            maxTotalBytes: maxTotal,
+            maxFileBytes: maxFile
+        )
+    }
+
+    #expect(verdict(maxTotal: 1000, maxFile: 500) == .verified(totalBytes: 150, fileCount: 2))
+
+    // Per-file cap.
+    guard case .exceeded(let perFileReason) = verdict(maxTotal: 1000, maxFile: 99) else {
+        Issue.record("expected per-file cap to fire")
+        return
+    }
+    #expect(perFileReason.contains("per-file static review limit"))
+
+    // Total cap.
+    guard case .exceeded(let totalReason) = verdict(maxTotal: 149, maxFile: 500) else {
+        Issue.record("expected total cap to fire")
+        return
+    }
+    #expect(totalReason.contains("static review limit"))
+
+    // Missing contract skips (the caller decides whether that is fatal);
+    // a malformed contract fails.
+    guard case .skipped = verifyEditableSurfaceByteBudget(
+        contractPath: root.appendingPathComponent("missing.json").path,
+        maxTotalBytes: 1000,
+        maxFileBytes: 500
+    ) else {
+        Issue.record("expected skipped without a contract")
+        return
+    }
+    try #"{"schemaVersion":1}"#.write(to: contract, atomically: true, encoding: .utf8)
+    guard case .exceeded(let malformedReason) = verdict(maxTotal: 1000, maxFile: 500) else {
+        Issue.record("expected a malformed contract to fail")
+        return
+    }
+    #expect(malformedReason.contains("no usable editablePaths"))
+}
+
 // Behavioral pin for run-semantic-gpqa-gate.sh's Opus 4.8 judge request and
 // its parse hardening, via a curl shim serving canned Opus-shaped responses
 // (thinking block first, verdict in the trailing text block). Covers the
@@ -1988,7 +2539,8 @@ func officialCorrectnessRunsEnforceWorkerSandboxThroughBenchExec() throws {
 
     // Every step that executes submitted/branch code crosses the bridge.
     let benchExecSteps = [
-        "- name: Build harness in bench sandbox",
+        "- name: Build trusted CLI in bench sandbox",
+        "- name: Build participant worker in bench sandbox",
         "- name: Transform reference checkpoint in bench sandbox",
         "- name: Public behavior gate",
         "- name: Attach GPQA gates and verify augmented golden",
@@ -2013,6 +2565,38 @@ func officialCorrectnessRunsEnforceWorkerSandboxThroughBenchExec() throws {
     #expect(workflow.contains("MLXFAST_OFFICIAL_BENCHMARK_RUN=1"))
 }
 
+// Before any participant worker is spawned, the trusted CLI re-verifies the
+// metallib the worker will load against the vendored Metal sources (the
+// published mlx.metallib.fingerprint sidecar): official runs fail closed on a
+// stale, missing, or unverifiable metallib so a cached artifact can never
+// mask kernel edits; local runs warn.
+@Test
+func cliVerifiesMetallibFingerprintBeforeWorkerLaunch() throws {
+    let cli = try String(contentsOfFile: "Sources/MLXFastCLI/main.swift", encoding: .utf8)
+    #expect(!cli.contains("TODO(security): Fingerprint the metallib"))
+    #expect(!cli.contains("TODO(security): Separate trusted and participant build caches"))
+    #expect(cli.contains("try enforceMetallibFingerprint("))
+    #expect(cli.contains("VendoredMetalFingerprint.defaultCmlxRelativePath"))
+    #expect(cli.contains("verifyMetallibFingerprintRecord("))
+    #expect(cli.contains(
+        "official benchmark runs require the metallib fingerprint check"
+    ))
+    #expect(cli.contains("refusing to spawn the participant worker: "))
+    #expect(cli.contains("mlxfast-swift: warning: "))
+
+    let fingerprintSource = try String(
+        contentsOfFile: "Sources/MLXFastTrustedHarness/VendoredMetalFingerprint.swift",
+        encoding: .utf8
+    )
+    #expect(fingerprintSource.contains("recordPrefix = \"mlxfast-metallib-fingerprint-v1\""))
+    #expect(fingerprintSource.contains("fingerprintedSubtrees = [\"mlx\", \"mlx-generated\"]"))
+    #expect(fingerprintSource.contains("defaultCmlxRelativePath = \"Vendor/mlx-swift/Source/Cmlx\""))
+    // Byte-order path sort and shasum-format lines: the exact contract shared
+    // with tools/build-mlx-metallib.sh's compute_vendored_metal_fingerprint.
+    #expect(fingerprintSource.contains("lhs.utf8.lexicographicallyPrecedes(rhs.utf8)"))
+    #expect(fingerprintSource.contains("\\(hexEncoded(digest))  \\(relativePath)\\n"))
+}
+
 @Test
 func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
     let benchmark = try String(
@@ -2028,7 +2612,7 @@ func benchmarkScriptHidesPrivateDirectoryFromRuntimeWorker() throws {
     #expect(benchmark.contains("MLXFAST_PRIVATE_DIR"))
     #expect(benchmark.contains("pwd -P"))
     #expect(benchmark.contains("cd -P"))
-    #expect(benchmark.contains("RUNTIME_WORKER_BIN=\"${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-$(dirname \"${SWIFT_BIN}\")/mlxfast-runtime-worker}\""))
+    #expect(benchmark.contains("RUNTIME_WORKER_BIN=\"${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-.build-worker/release/mlxfast-runtime-worker}\""))
     #expect(benchmark.contains("MLXFAST_RUNTIME_WORKER_EXECUTABLE=\"$(absolute_path \"${RUNTIME_WORKER_BIN}\")\""))
     #expect(benchmark.contains("export MLXFAST_RUNTIME_WORKER_EXECUTABLE"))
     #expect(benchmark.contains("export MLXFAST_REFERENCE_DIR=\"${REFERENCE_PATH}\""))
@@ -4555,7 +5139,7 @@ func cheapPreflightChecksRunBeforeExpensiveWork() throws {
     let checkoutRange = try #require(workflow.range(of: "uses: actions/checkout@"))
     let secretsCheckRange = try #require(workflow.range(of: "- name: Check private material present"))
     let prepareWorkspaceRange = try #require(workflow.range(of: "- name: Prepare bench workspace"))
-    let buildRange = try #require(workflow.range(of: "- name: Build harness in bench sandbox"))
+    let buildRange = try #require(workflow.range(of: "- name: Build trusted CLI in bench sandbox"))
 
     // Quarantined or drifted boxes fail before checkout or secrets.
     #expect(hostPreflightRange.lowerBound < checkoutRange.lowerBound)

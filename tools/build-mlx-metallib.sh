@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Build mlx.metallib for the SwiftPM-linked MLX runtime and place it next to
-# the participant worker (and the sibling mlxfast-swift executable), where
-# Cmlx searches first.
+# the participant worker, where Cmlx searches first. The metallib is compiled
+# from participant-editable vendored Metal sources, so every default below
+# lives under the participant worker's build root (.build-worker), never
+# under the trusted CLI's .build tree.
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
@@ -17,18 +19,66 @@ repository_path() {
 }
 
 BUILD_CONFIGURATION="${MLXFAST_SWIFT_CONFIGURATION:-release}"
-SWIFT_BIN="$(repository_path "${MLXFAST_SWIFT_BIN:-.build/${BUILD_CONFIGURATION}/mlxfast-swift}")"
+RUNTIME_WORKER_BIN="$(repository_path \
+  "${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-.build-worker/${BUILD_CONFIGURATION}/mlxfast-runtime-worker}")"
 OUTPUT_PATH="$(repository_path \
-  "${MLXFAST_MLX_METALLIB:-$(dirname "${SWIFT_BIN}")/mlx.metallib}")"
+  "${MLXFAST_MLX_METALLIB:-$(dirname "${RUNTIME_WORKER_BIN}")/mlx.metallib}")"
 
-MLX_SWIFT_VENDOR="${ROOT_DIR}/Vendor/mlx-swift"
-# TODO(security): Extend fingerprint/hash coverage over every vendored Metal
-# source consumed by this AOT build before relying on cached metallib artifacts.
+MLX_SWIFT_VENDOR="$(repository_path "${MLXFAST_MLX_SWIFT_VENDOR:-Vendor/mlx-swift}")"
 MLX_SOURCE="${MLX_SWIFT_VENDOR}/Source/Cmlx/mlx"
 METAL_CPP_SOURCE="${MLX_SWIFT_VENDOR}/Source/Cmlx/metal-cpp"
 JSON_SOURCE="${MLX_SWIFT_VENDOR}/Source/Cmlx/json"
 FMT_SOURCE="${MLX_SWIFT_VENDOR}/Source/Cmlx/fmt"
-CMAKE_BUILD_DIR="$(repository_path "${MLXFAST_MLX_METAL_BUILD_DIR:-.build/mlx-metal}")"
+
+# Content fingerprint over every vendored source that can influence the AOT
+# metallib (the whole vendored mlx tree) plus the runtime-effective JIT
+# kernel strings (mlx-generated). Deliberately an over-approximation: a
+# changed file that does not feed the metallib merely forces a rebuild,
+# while any under-approximation would let a cached mlx.metallib mask a
+# participant kernel edit. The recipe (per-file sha256 lines over
+# byte-sorted relative paths, hashed again) is mirrored bit-for-bit by
+# VendoredMetalFingerprint in Sources/MLXFastTrustedHarness, which the
+# trusted CLI uses to re-verify the published fingerprint sidecar before
+# spawning the participant worker. Keep the two implementations in sync.
+FINGERPRINT_RECORD_PREFIX="mlxfast-metallib-fingerprint-v1"
+compute_vendored_metal_fingerprint() {
+  local cmlx_root="${MLX_SWIFT_VENDOR}/Source/Cmlx"
+  local subtree
+  local file_count
+  for subtree in mlx mlx-generated; do
+    if [[ ! -d "${cmlx_root}/${subtree}" ]]; then
+      echo "build-mlx-metallib.sh: vendored source tree missing for fingerprint: ${cmlx_root}/${subtree}" >&2
+      return 1
+    fi
+  done
+  # An empty tree can only mean a broken checkout; never fingerprint it.
+  file_count="$(cd "${cmlx_root}" && find mlx mlx-generated -type f | wc -l | tr -d ' ')"
+  if [[ "${file_count}" -eq 0 ]]; then
+    echo "build-mlx-metallib.sh: vendored source trees contain no files to fingerprint under ${cmlx_root}" >&2
+    return 1
+  fi
+  (
+    cd "${cmlx_root}"
+    find mlx mlx-generated -type f -print0 \
+      | LC_ALL=C sort -z \
+      | xargs -0 shasum -a 256 \
+      | shasum -a 256 \
+      | awk '{print $1}'
+  )
+}
+
+# --print-fingerprint prints the vendored-source fingerprint and exits
+# without building anything (no lock, no toolchain requirements). The ranked
+# workflows use it for the metallib cache key and cache verification.
+if [[ "${1:-}" == "--print-fingerprint" ]]; then
+  compute_vendored_metal_fingerprint
+  exit 0
+fi
+if [[ "$#" -gt 0 ]]; then
+  echo "build-mlx-metallib.sh: unknown argument '$1' (supported: --print-fingerprint)" >&2
+  exit 2
+fi
+CMAKE_BUILD_DIR="$(repository_path "${MLXFAST_MLX_METAL_BUILD_DIR:-.build-worker/mlx-metal}")"
 BUILD_LOCK_DIR="$(repository_path \
   "${MLXFAST_MLX_METAL_BUILD_LOCK_DIR:-${CMAKE_BUILD_DIR}.mlxfast-build.lock}")"
 BUILD_LOCK_TIMEOUT_SECONDS="${MLXFAST_MLX_METAL_BUILD_LOCK_TIMEOUT_SECONDS:-1800}"
@@ -41,7 +91,7 @@ BUILD_LOCK_INITIALIZING_DIR=""
 PUBLISH_TEMP_PATH=""
 export CLANG_MODULE_CACHE_PATH
 CLANG_MODULE_CACHE_PATH="$(repository_path \
-  "${CLANG_MODULE_CACHE_PATH:-.build/clang-module-cache}")"
+  "${CLANG_MODULE_CACHE_PATH:-.build-worker/clang-module-cache}")"
 mkdir -p "${CLANG_MODULE_CACHE_PATH}"
 METAL_COMPILER_HOME="$(repository_path \
   "${MLXFAST_METAL_COMPILER_HOME:-${CMAKE_BUILD_DIR}/.mlxfast-home}")"
@@ -544,6 +594,11 @@ METAL_CPP_SOURCE="$(cd "${METAL_CPP_SOURCE}" && pwd -P)"
 JSON_SOURCE="$(cd "${JSON_SOURCE}" && pwd -P)"
 FMT_SOURCE="$(cd "${FMT_SOURCE}" && pwd -P)"
 
+# Capture the fingerprint BEFORE compiling: the published sidecar must
+# describe the sources this build actually consumed, so a source edited
+# mid-build yields a sidecar that later verification correctly rejects.
+VENDORED_METAL_FINGERPRINT="$(compute_vendored_metal_fingerprint)"
+
 JOBS="${MLXFAST_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 
 HOME="${METAL_COMPILER_HOME}" "${CMAKE_BIN}" \
@@ -599,12 +654,29 @@ publish_metallib() {
   PUBLISH_TEMP_PATH=""
 }
 
+# The fingerprint sidecar rides next to the metallib so consumers (the
+# ranked cache verification and the trusted CLI's pre-spawn check) can tell
+# whether this metallib still corresponds to the vendored sources on disk.
+publish_fingerprint_record() {
+  local destination="$1"
+  local record_temp
+  record_temp="$(mktemp "${destination}.tmp.XXXXXX")"
+  PUBLISH_TEMP_PATH="${record_temp}"
+  printf '%s %s\n' "${FINGERPRINT_RECORD_PREFIX}" "${VENDORED_METAL_FINGERPRINT}" \
+    > "${record_temp}"
+  chmod 0644 "${record_temp}"
+  mv -f "${record_temp}" "${destination}"
+  PUBLISH_TEMP_PATH=""
+}
+
 publish_metallib "${METALLIB_PATH}" "${OUTPUT_PATH}"
+publish_fingerprint_record "${OUTPUT_PATH}.fingerprint"
 echo "build-mlx-metallib.sh: wrote ${OUTPUT_PATH}"
 
 if [[ "${BUILD_CONFIGURATION}" == "debug" ]]; then
   while IFS= read -r test_binary_dir; do
     publish_metallib "${METALLIB_PATH}" "${test_binary_dir}/mlx.metallib"
+    publish_fingerprint_record "${test_binary_dir}/mlx.metallib.fingerprint"
     echo "build-mlx-metallib.sh: wrote ${test_binary_dir}/mlx.metallib"
   done < <(find .build -path "*.xctest/Contents/MacOS" -type d)
 fi

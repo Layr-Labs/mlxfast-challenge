@@ -72,19 +72,21 @@ struct MTPWorkflowIsolationTests {
         let submissionCheckout = try #require(workflow.range(of: "- name: Checkout submitted editable paths"))
         let privateMaterial = try #require(workflow.range(of: "- name: Check private material present"))
         let workspace = try #require(workflow.range(of: "- name: Prepare bench workspace"))
-        let build = try #require(workflow.range(of: "- name: Build harness in bench sandbox"))
+        let build = try #require(workflow.range(of: "- name: Build trusted CLI in bench sandbox"))
+        let workerBuild = try #require(workflow.range(of: "- name: Build participant worker in bench sandbox"))
         #expect(enablement.lowerBound < submissionCheckout.lowerBound)
         #expect(enablement.lowerBound < privateMaterial.lowerBound)
         #expect(enablement.lowerBound < workspace.lowerBound)
         #expect(enablement.lowerBound < build.lowerBound)
+        #expect(build.lowerBound < workerBuild.lowerBound)
         #expect(workflow.contains(
-            "/usr/bin/swift build -c release --product mlxfast-swift"
+            "/usr/bin/swift build -c release --force-resolved-versions --product mlxfast-swift"
         ))
         #expect(workflow.contains(
-            "/usr/bin/swift build -c release --product mlxfast-runtime-worker"
+            "/usr/bin/swift build -c release --force-resolved-versions --scratch-path .build-worker --product mlxfast-runtime-worker"
         ))
         #expect(workflow.contains(
-            "test -x \"${MLXFAST_JOB_WS}/.build/release/mlxfast-runtime-worker\""
+            "test -x \"${MLXFAST_JOB_WS}/.build-worker/release/mlxfast-runtime-worker\""
         ))
         #expect(workflow.contains("exec .build/release/mlxfast-swift transform"))
         #expect(workflow.contains("exec .build/release/mlxfast-swift mtp-benchmark"))

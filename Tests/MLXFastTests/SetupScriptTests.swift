@@ -1,4 +1,5 @@
 import Foundation
+@testable import MLXFastHarness
 import Testing
 
 @Test
@@ -18,16 +19,42 @@ func setupScriptCoordinatesCacheAndMetallibState() throws {
     #expect(setup.contains("mktemp \"${lock_path}.tmp.XXXXXX\""))
     #expect(setup.contains("metal_toolchain_identifier"))
     #expect(setup.contains("export TOOLCHAINS=\"${identifier}\""))
-    #expect(setup.contains("RUNTIME_WORKER_BIN=\"${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-$(dirname \"${SWIFT_BIN}\")/mlxfast-runtime-worker}\""))
+    // Independent SwiftPM build/cache roots: the trusted CLI builds in .build
+    // and the participant worker in its own .build-worker scratch root with
+    // its own clang module cache, so a participant-code build never writes
+    // into the trusted product tree. mlx.metallib (a participant artifact)
+    // colocates with the worker binary.
+    #expect(setup.contains("RUNTIME_WORKER_BIN=\"${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-.build-worker/release/mlxfast-runtime-worker}\""))
     #expect(setup.contains("MLX_METALLIB=\"${MLXFAST_MLX_METALLIB:-$(dirname \"${RUNTIME_WORKER_BIN}\")/mlx.metallib}\""))
-    #expect(setup.contains("swift build -c release --product mlxfast-swift"))
-    #expect(setup.contains("swift build -c release --product mlxfast-runtime-worker"))
+    #expect(setup.contains("swift build -c release --force-resolved-versions --product mlxfast-swift"))
+    #expect(setup.contains("swift build -c release --force-resolved-versions --scratch-path .build-worker --product mlxfast-runtime-worker"))
+    #expect(setup.contains("mkdir -p .build/clang-module-cache .build-worker/clang-module-cache"))
+    #expect(setup.contains("CLANG_MODULE_CACHE_PATH=\"${CLANG_MODULE_CACHE_PATH:-${PWD}/.build/clang-module-cache}\" \\"))
+    #expect(setup.contains("CLANG_MODULE_CACHE_PATH=\"${CLANG_MODULE_CACHE_PATH:-${PWD}/.build-worker/clang-module-cache}\" \\"))
     #expect(setup.contains("participant runtime worker missing at ${RUNTIME_WORKER_BIN}"))
-    #expect(setup.contains("TODO(security): Give the trusted CLI and participant worker independent"))
+    #expect(!setup.contains("TODO(security): Give the trusted CLI and participant worker independent"))
     #expect(metallibBuilder.contains("-DMLX_BUILD_GGUF=OFF"))
     #expect(metallibBuilder.contains("export CLANG_MODULE_CACHE_PATH"))
     #expect(metallibBuilder.contains("CLANG_MODULE_CACHE_PATH=\"$(repository_path"))
+    // The metallib compiles participant-editable vendored Metal sources, so
+    // its build tree, module cache, and output live under the worker root.
+    #expect(metallibBuilder.contains("${CLANG_MODULE_CACHE_PATH:-.build-worker/clang-module-cache}"))
+    #expect(metallibBuilder.contains("${MLXFAST_MLX_METAL_BUILD_DIR:-.build-worker/mlx-metal}"))
+    #expect(metallibBuilder.contains("${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-.build-worker/${BUILD_CONFIGURATION}/mlxfast-runtime-worker}"))
     #expect(metallibBuilder.contains("HOME=\"${METAL_COMPILER_HOME}\" \"${CMAKE_BIN}\""))
+    // Every published metallib carries a fingerprint sidecar over the
+    // vendored kernel sources (the AOT tree plus the runtime-effective JIT
+    // strings); --print-fingerprint exposes the same recipe to the ranked
+    // cache key and verification steps, and the marker TODO is resolved.
+    #expect(!metallibBuilder.contains("TODO(security)"))
+    #expect(metallibBuilder.contains("FINGERPRINT_RECORD_PREFIX=\"mlxfast-metallib-fingerprint-v1\""))
+    #expect(metallibBuilder.contains("compute_vendored_metal_fingerprint()"))
+    #expect(metallibBuilder.contains("find mlx mlx-generated -type f -print0"))
+    #expect(metallibBuilder.contains("LC_ALL=C sort -z"))
+    #expect(metallibBuilder.contains("xargs -0 shasum -a 256"))
+    #expect(metallibBuilder.contains("if [[ \"${1:-}\" == \"--print-fingerprint\" ]]; then"))
+    #expect(metallibBuilder.contains("publish_fingerprint_record \"${OUTPUT_PATH}.fingerprint\""))
+    #expect(metallibBuilder.contains("VENDORED_METAL_FINGERPRINT=\"$(compute_vendored_metal_fingerprint)\""))
 }
 
 @Test
@@ -1417,17 +1444,7 @@ func metallibBuilderRejectsAmbiguousCMakeOutputs() throws {
     defer { try? FileManager.default.removeItem(at: root) }
     let fakeBin = root.appendingPathComponent("bin")
     let checkout = root.appendingPathComponent("mlx-swift")
-    for path in [
-        "Source/Cmlx/mlx",
-        "Source/Cmlx/metal-cpp",
-        "Source/Cmlx/json",
-        "Source/Cmlx/fmt",
-    ] {
-        try FileManager.default.createDirectory(
-            at: checkout.appendingPathComponent(path),
-            withIntermediateDirectories: true
-        )
-    }
+    try writeSetupVendoredFixture(at: checkout)
     try FileManager.default.createDirectory(at: fakeBin, withIntermediateDirectories: true)
 
     try writeSetupExecutable(
@@ -1467,7 +1484,7 @@ func metallibBuilderRejectsAmbiguousCMakeOutputs() throws {
             "REPO_ROOT": FileManager.default.currentDirectoryPath,
             "PATH": "\(fakeBin.path):/usr/bin:/bin",
             "MLXFAST_CMAKE_BIN": fakeBin.appendingPathComponent("cmake").path,
-            "MLXFAST_MLX_SWIFT_CHECKOUT": checkout.path,
+            "MLXFAST_MLX_SWIFT_VENDOR": checkout.path,
             "MLXFAST_MLX_METAL_BUILD_DIR": root.appendingPathComponent("metal-build").path,
             "MLXFAST_MLX_METALLIB": output.path,
             "CMAKE_ARGUMENT_LOG": root.appendingPathComponent("cmake-arguments.log").path,
@@ -1496,17 +1513,7 @@ func metallibBuilderSerializesConcurrentProcesses() throws {
     defer { try? FileManager.default.removeItem(at: root) }
     let fakeBin = root.appendingPathComponent("bin")
     let checkout = root.appendingPathComponent("mlx-swift")
-    for path in [
-        "Source/Cmlx/mlx",
-        "Source/Cmlx/metal-cpp",
-        "Source/Cmlx/json",
-        "Source/Cmlx/fmt",
-    ] {
-        try FileManager.default.createDirectory(
-            at: checkout.appendingPathComponent(path),
-            withIntermediateDirectories: true
-        )
-    }
+    try writeSetupVendoredFixture(at: checkout)
     try FileManager.default.createDirectory(at: fakeBin, withIntermediateDirectories: true)
 
     try writeSetupExecutable(
@@ -1549,7 +1556,7 @@ func metallibBuilderSerializesConcurrentProcesses() throws {
             "REPO_ROOT": FileManager.default.currentDirectoryPath,
             "PATH": "\(fakeBin.path):/usr/bin:/bin",
             "MLXFAST_CMAKE_BIN": fakeBin.appendingPathComponent("cmake").path,
-            "MLXFAST_MLX_SWIFT_CHECKOUT": checkout.path,
+            "MLXFAST_MLX_SWIFT_VENDOR": checkout.path,
             "MLXFAST_MLX_METAL_BUILD_DIR": root.appendingPathComponent("metal-build").path,
             "MLXFAST_MLX_METALLIB": output.path,
             "ACTIVE_BUILD_DIR": root.appendingPathComponent("active-build").path,
@@ -1560,6 +1567,13 @@ func metallibBuilderSerializesConcurrentProcesses() throws {
     #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
     #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("overlap").path))
     #expect(try String(contentsOf: output, encoding: .utf8) == "metallib")
+    // The publish also records the vendored-source fingerprint sidecar the
+    // ranked cache and the trusted CLI verify against.
+    let record = try String(
+        contentsOf: root.appendingPathComponent("output/mlx.metallib.fingerprint"),
+        encoding: .utf8
+    )
+    #expect(record.hasPrefix("mlxfast-metallib-fingerprint-v1 "))
     #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("metal-build.mlxfast-build.lock").path))
 }
 
@@ -1736,17 +1750,7 @@ func metallibBuilderPreservesPublishedOutputWhenCopyFails() throws {
     defer { try? FileManager.default.removeItem(at: root) }
     let fakeBin = root.appendingPathComponent("bin")
     let checkout = root.appendingPathComponent("mlx-swift")
-    for path in [
-        "Source/Cmlx/mlx",
-        "Source/Cmlx/metal-cpp",
-        "Source/Cmlx/json",
-        "Source/Cmlx/fmt",
-    ] {
-        try FileManager.default.createDirectory(
-            at: checkout.appendingPathComponent(path),
-            withIntermediateDirectories: true
-        )
-    }
+    try writeSetupVendoredFixture(at: checkout)
     try FileManager.default.createDirectory(at: fakeBin, withIntermediateDirectories: true)
 
     try writeSetupExecutable(
@@ -1787,7 +1791,7 @@ func metallibBuilderPreservesPublishedOutputWhenCopyFails() throws {
             "REPO_ROOT": FileManager.default.currentDirectoryPath,
             "PATH": "\(fakeBin.path):/usr/bin:/bin",
             "MLXFAST_CMAKE_BIN": fakeBin.appendingPathComponent("cmake").path,
-            "MLXFAST_MLX_SWIFT_CHECKOUT": checkout.path,
+            "MLXFAST_MLX_SWIFT_VENDOR": checkout.path,
             "MLXFAST_MLX_METAL_BUILD_DIR": root.appendingPathComponent("metal-build").path,
             "MLXFAST_MLX_METALLIB": output.path,
         ]
@@ -1815,7 +1819,7 @@ func metallibBuilderPreservesPublishedOutputWhenCopyFails() throws {
             "REPO_ROOT": FileManager.default.currentDirectoryPath,
             "PATH": "\(fakeBin.path):/usr/bin:/bin",
             "MLXFAST_CMAKE_BIN": fakeBin.appendingPathComponent("cmake").path,
-            "MLXFAST_MLX_SWIFT_CHECKOUT": checkout.path,
+            "MLXFAST_MLX_SWIFT_VENDOR": checkout.path,
             "MLXFAST_MLX_METAL_BUILD_DIR": root.appendingPathComponent("metal-build").path,
             "MLXFAST_MLX_METALLIB": directoryOutput.path,
         ]
@@ -1880,4 +1884,251 @@ private func writeSetupExecutable(at url: URL, contents: String) throws {
         [.posixPermissions: 0o755],
         ofItemAtPath: url.path
     )
+}
+
+/// Minimal vendored mlx-swift layout for build-mlx-metallib.sh fixtures: the
+/// CMake source dirs the builder requires plus non-empty kernel/JIT trees the
+/// vendored-source fingerprint hashes.
+private func writeSetupVendoredFixture(at checkout: URL) throws {
+    for path in [
+        "Source/Cmlx/mlx",
+        "Source/Cmlx/mlx-generated",
+        "Source/Cmlx/metal-cpp",
+        "Source/Cmlx/json",
+        "Source/Cmlx/fmt",
+    ] {
+        try FileManager.default.createDirectory(
+            at: checkout.appendingPathComponent(path),
+            withIntermediateDirectories: true
+        )
+    }
+    try "kernel void fixture() {}\n".write(
+        to: checkout.appendingPathComponent("Source/Cmlx/mlx/rope.metal"),
+        atomically: true,
+        encoding: .utf8
+    )
+    try "const char* fixture = \"jit\";\n".write(
+        to: checkout.appendingPathComponent("Source/Cmlx/mlx-generated/quantized.cpp"),
+        atomically: true,
+        encoding: .utf8
+    )
+}
+
+// The dependency graph is frozen by challenge policy: both build entrypoints
+// assert Package.swift/Package.resolved match the committed state before
+// building and pass --force-resolved-versions so SwiftPM fails closed instead
+// of silently re-resolving an out-of-date graph.
+@Test
+func buildEntrypointsAssertFrozenDependencyGraph() throws {
+    let setup = try String(contentsOfFile: "setup.sh", encoding: .utf8)
+    let benchmark = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    for script in [setup, benchmark] {
+        #expect(script.contains("assert_frozen_dependency_graph"))
+        #expect(script.contains("for manifest in Package.swift Package.resolved; do"))
+        #expect(script.contains("git diff --quiet HEAD -- \"${manifest}\""))
+        #expect(script.contains("the dependency graph is frozen by challenge policy"))
+    }
+    // benchmark.sh asserts before its fallback build; setup.sh inside
+    // build_swift_harness, before any swift build runs.
+    #expect(benchmark.contains("  assert_frozen_dependency_graph\n"))
+    #expect(setup.contains("  assert_frozen_dependency_graph || return 1\n"))
+
+    let manifest = try String(contentsOfFile: "Package.swift", encoding: .utf8)
+    #expect(!manifest.contains("TODO(security): Assert the resolved dependency graph"))
+    #expect(manifest.contains("--force-resolved-versions"))
+
+    // Every ranked resolve/build passes --force-resolved-versions too.
+    for workflowPath in [
+        ".github/workflows/benchmark.yml",
+        ".github/workflows/mtp-benchmark.yml",
+    ] {
+        let workflow = try String(contentsOfFile: workflowPath, encoding: .utf8)
+        #expect(
+            !workflow.contains("swift package resolve)"),
+            "\(workflowPath) must resolve with --force-resolved-versions"
+        )
+        #expect(
+            !workflow.contains("swift build -c release --product"),
+            "\(workflowPath) must build with --force-resolved-versions"
+        )
+    }
+}
+
+@Test
+func frozenDependencyGraphAssertionDetectsManifestDrift() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let repo = root.appendingPathComponent("repo")
+    try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+    try "// manifest\n".write(
+        to: repo.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
+    try "{\"pins\":[]}\n".write(
+        to: repo.appendingPathComponent("Package.resolved"), atomically: true, encoding: .utf8)
+
+    let script = """
+    eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+    cd "${FIXTURE_REPO}"
+    git init -q
+    git -c user.email=t@t -c user.name=t -c commit.gpgsign=false add .
+    git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m base
+    # Clean tree passes.
+    assert_frozen_dependency_graph
+    # A drifted resolved file (e.g. SwiftPM silently re-resolving) fails.
+    printf '{"pins":["drift"]}\\n' > Package.resolved
+    drift_status=0
+    assert_frozen_dependency_graph || drift_status=$?
+    [[ "${drift_status}" != "0" ]]
+    git checkout -q -- Package.resolved
+    assert_frozen_dependency_graph
+    """
+    let result = try runSetupBash(
+        script,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "FIXTURE_REPO": repo.path,
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+        ]
+    )
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+    #expect(result.stderr.contains("dependency graph is frozen by challenge policy"))
+}
+
+// The bash fingerprint recipe in tools/build-mlx-metallib.sh and its Swift
+// twin (VendoredMetalFingerprint, used by the trusted CLI before every worker
+// spawn) must agree bit for bit, stay sensitive to kernel edits, and ignore
+// symlinks.
+@Test
+func metallibFingerprintScriptAndSwiftTwinAgree() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let vendor = root.appendingPathComponent("mlx-swift")
+    let cmlx = vendor.appendingPathComponent("Source/Cmlx")
+    try writeSetupVendoredFixture(at: vendor)
+    try FileManager.default.createDirectory(
+        at: cmlx.appendingPathComponent("mlx/backend/metal/kernels"),
+        withIntermediateDirectories: true
+    )
+    try "sdpa kernel v1\n".write(
+        to: cmlx.appendingPathComponent("mlx/backend/metal/kernels/sdpa_vector.h"),
+        atomically: true,
+        encoding: .utf8
+    )
+    try "dotfile\n".write(
+        to: cmlx.appendingPathComponent("mlx/.hidden"),
+        atomically: true,
+        encoding: .utf8
+    )
+    // A symlink must not contribute to the fingerprint in either recipe.
+    try FileManager.default.createSymbolicLink(
+        atPath: cmlx.appendingPathComponent("mlx/alias.metal").path,
+        withDestinationPath: "rope.metal"
+    )
+
+    func scriptFingerprint() throws -> String {
+        let result = try runSetupBash(
+            """
+            "${REPO_ROOT}/tools/build-mlx-metallib.sh" --print-fingerprint
+            """,
+            environment: [
+                "REPO_ROOT": FileManager.default.currentDirectoryPath,
+                "MLXFAST_MLX_SWIFT_VENDOR": vendor.path,
+            ]
+        )
+        #expect(result.status == 0, "stderr: \(result.stderr)")
+        return result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    let initialScript = try scriptFingerprint()
+    let initialSwift = try VendoredMetalFingerprint.compute(cmlxRoot: cmlx.path)
+    #expect(initialScript == initialSwift)
+    #expect(initialScript.count == 64)
+
+    // A kernel edit changes the fingerprint identically in both recipes.
+    try "sdpa kernel v2 (edited)\n".write(
+        to: cmlx.appendingPathComponent("mlx/backend/metal/kernels/sdpa_vector.h"),
+        atomically: true,
+        encoding: .utf8
+    )
+    let editedScript = try scriptFingerprint()
+    let editedSwift = try VendoredMetalFingerprint.compute(cmlxRoot: cmlx.path)
+    #expect(editedScript == editedSwift)
+    #expect(editedScript != initialScript)
+
+    // A JIT-twin edit is covered too.
+    try "const char* fixture = \"jit v2\";\n".write(
+        to: cmlx.appendingPathComponent("mlx-generated/quantized.cpp"),
+        atomically: true,
+        encoding: .utf8
+    )
+    let jitEditedScript = try scriptFingerprint()
+    let jitEditedSwift = try VendoredMetalFingerprint.compute(cmlxRoot: cmlx.path)
+    #expect(jitEditedScript == jitEditedSwift)
+    #expect(jitEditedScript != editedScript)
+}
+
+// The pre-spawn record check the trusted CLI runs: verified on a matching
+// sidecar, mismatch on stale/missing/malformed records, skipped only when the
+// check has nothing to verify (no vendored tree / no metallib).
+@Test
+func metallibFingerprintRecordVerificationFailsClosedOnStaleRecord() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let vendor = root.appendingPathComponent("mlx-swift")
+    let cmlx = vendor.appendingPathComponent("Source/Cmlx")
+    try writeSetupVendoredFixture(at: vendor)
+    let metallib = root.appendingPathComponent("mlx.metallib")
+    try Data("metallib".utf8).write(to: metallib)
+    let record = metallib.path + ".fingerprint"
+
+    func outcome() -> MetallibFingerprintVerification {
+        verifyMetallibFingerprintRecord(metallibPath: metallib.path, cmlxRoot: cmlx.path)
+    }
+
+    // No record at all: fails (never trust an unattributed metallib).
+    guard case .mismatch(let missingReason) = outcome() else {
+        Issue.record("expected mismatch without a fingerprint record")
+        return
+    }
+    #expect(missingReason.contains("no fingerprint record"))
+
+    // A record matching the sources verifies.
+    let fingerprint = try VendoredMetalFingerprint.compute(cmlxRoot: cmlx.path)
+    try VendoredMetalFingerprint.recordLine(fingerprint: fingerprint)
+        .write(toFile: record, atomically: true, encoding: .utf8)
+    #expect(outcome() == .verified)
+
+    // Editing a kernel after the build makes the record stale.
+    try "kernel void fixture() { /* edited */ }\n".write(
+        to: cmlx.appendingPathComponent("mlx/rope.metal"),
+        atomically: true,
+        encoding: .utf8
+    )
+    guard case .mismatch(let staleReason) = outcome() else {
+        Issue.record("expected mismatch after a kernel edit")
+        return
+    }
+    #expect(staleReason.contains("built from different"))
+
+    // A malformed or wrong-version record is a mismatch, not a pass.
+    try "not-a-record\n".write(toFile: record, atomically: true, encoding: .utf8)
+    guard case .mismatch(let malformedReason) = outcome() else {
+        Issue.record("expected mismatch for a malformed record")
+        return
+    }
+    #expect(malformedReason.contains("malformed"))
+
+    // Nothing to verify: missing metallib or missing vendored tree skip, and
+    // the caller (official runs) decides that skipping is fatal.
+    try FileManager.default.removeItem(at: metallib)
+    guard case .skipped = outcome() else {
+        Issue.record("expected skipped without a metallib")
+        return
+    }
+    try Data("metallib".utf8).write(to: metallib)
+    try FileManager.default.removeItem(at: cmlx.appendingPathComponent("mlx-generated"))
+    guard case .skipped = outcome() else {
+        Issue.record("expected skipped without the vendored tree")
+        return
+    }
 }

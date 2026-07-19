@@ -441,7 +441,11 @@ jobs:
             .build/repositories
             .build/artifacts
             .build/workspace-state.json
-          key: swiftpm-trusted-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+            .build-worker/checkouts
+            .build-worker/repositories
+            .build-worker/artifacts
+            .build-worker/workspace-state.json
+          key: swiftpm-trusted-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
 
       - name: Compute MLX Metal library cache fingerprint
         id: mlx_metallib_fingerprint
@@ -467,8 +471,14 @@ jobs:
             echo "::error::installed Metal toolchain (${metal_toolchain_identifier:-none}) does not match the ranked pin (${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}); update the pin or the box deliberately" >&2
             exit 1
           fi
-          fingerprint="$({
-            printf '%s\n' mlx-metallib-m5-max-v1
+          # Same two-fingerprint scheme as the serial pipeline: the vendored
+          # kernel sources of THIS (overlaid) work tree key the metallib
+          # cache so a cached mlx.metallib can never mask participant kernel
+          # edits; the base fingerprint keys the build-products caches.
+          vendored_metal_fingerprint="$(tools/build-mlx-metallib.sh --print-fingerprint)"
+          test "${#vendored_metal_fingerprint}" -eq 64
+          base_fingerprint="$({
+            printf '%s\n' mlx-metallib-m5-max-v2
             uname -m
             sysctl -n machdep.cpu.brand_string
             sw_vers -buildVersion
@@ -483,15 +493,23 @@ jobs:
             "${cmake_bin}" --version
             shasum -a 256 Package.swift Package.resolved tools/build-mlx-metallib.sh
           } | shasum -a 256 | awk '{print $1}')"
+          test "${#base_fingerprint}" -eq 64
+          fingerprint="$({
+            printf 'BASE_FINGERPRINT=%s\n' "${base_fingerprint}"
+            printf 'VENDORED_METAL_FINGERPRINT=%s\n' "${vendored_metal_fingerprint}"
+          } | shasum -a 256 | awk '{print $1}')"
           test "${#fingerprint}" -eq 64
           printf 'sha256=%s\n' "${fingerprint}" >> "${GITHUB_OUTPUT}"
+          printf 'base_sha256=%s\n' "${base_fingerprint}" >> "${GITHUB_OUTPUT}"
 
       - name: Restore trusted MLX Metal library cache
         id: restore_mlx_metallib_cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .mlxfast-cache/mlx.metallib
-          key: mlx-metallib-m5-max-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}
+          path: |
+            .mlxfast-cache/mlx.metallib
+            .mlxfast-cache/mlx.metallib.fingerprint
+          key: mlx-metallib-m5-max-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}
 
       - name: Verify restored MLX Metal library
         env:
@@ -500,29 +518,49 @@ jobs:
           set -euo pipefail
           if [[ "${CACHE_HIT}" == "true" ]]; then
             test -s .mlxfast-cache/mlx.metallib
+            test -s .mlxfast-cache/mlx.metallib.fingerprint
+            expected_record="mlxfast-metallib-fingerprint-v1 $(tools/build-mlx-metallib.sh --print-fingerprint)"
+            restored_record="$(cat .mlxfast-cache/mlx.metallib.fingerprint)"
+            if [[ "${restored_record}" != "${expected_record}" ]]; then
+              echo "::warning::restored mlx.metallib does not match the vendored Metal sources in this work tree; discarding it so the bench build recompiles"
+              /bin/rm -f .mlxfast-cache/mlx.metallib .mlxfast-cache/mlx.metallib.fingerprint
+            fi
           else
-            /bin/rm -f .mlxfast-cache/mlx.metallib
+            /bin/rm -f .mlxfast-cache/mlx.metallib .mlxfast-cache/mlx.metallib.fingerprint
           fi
 
       - name: Reset staged trusted build products
-        run: /bin/rm -rf .mlxfast-cache/trusted-build
+        run: /bin/rm -rf .mlxfast-cache/trusted-build .mlxfast-cache/worker-build
 
       - name: Restore trusted build products cache
         id: restore_build_products_cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .mlxfast-cache/trusted-build
-          key: bench-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}
+          key: bench-trusted-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.base_sha256 }}
+
+      - name: Restore worker build products cache
+        id: restore_worker_build_products_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .mlxfast-cache/worker-build
+          key: bench-worker-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.base_sha256 }}
 
       - name: Verify restored build products
         env:
-          CACHE_HIT: ${{ steps.restore_build_products_cache.outputs.cache-hit }}
+          TRUSTED_CACHE_HIT: ${{ steps.restore_build_products_cache.outputs.cache-hit }}
+          WORKER_CACHE_HIT: ${{ steps.restore_worker_build_products_cache.outputs.cache-hit }}
         run: |
           set -euo pipefail
-          if [[ "${CACHE_HIT}" == "true" ]]; then
+          if [[ "${TRUSTED_CACHE_HIT}" == "true" ]]; then
             test -d .mlxfast-cache/trusted-build/release
           else
             /bin/rm -rf .mlxfast-cache/trusted-build
+          fi
+          if [[ "${WORKER_CACHE_HIT}" == "true" ]]; then
+            test -d .mlxfast-cache/worker-build/release
+          else
+            /bin/rm -rf .mlxfast-cache/worker-build
           fi
 
       # Same workspace discipline as the serial pipeline: proven-fresh stable
@@ -547,11 +585,19 @@ jobs:
             mv "${MLXFAST_JOB_WS}/.mlxfast-cache/trusted-build" "${MLXFAST_JOB_WS}/.build"
             echo "mtp-benchmark: seeded trusted build products into bench workspace"
           fi
+          if [[ -d "${MLXFAST_JOB_WS}/.mlxfast-cache/worker-build/release" ]]; then
+            rm -rf "${MLXFAST_JOB_WS}/.build-worker"
+            mv "${MLXFAST_JOB_WS}/.mlxfast-cache/worker-build" "${MLXFAST_JOB_WS}/.build-worker"
+            echo "mtp-benchmark: seeded worker build products into bench workspace"
+          fi
           mkdir -p "${MLXFAST_PRIVATE_DIR}"
           chmod 700 "${MLXFAST_PRIVATE_DIR}"
           mkdir -p "${MLXFAST_JOB_WS}/private"
           mkdir -p "${MLXFAST_JOB_WS}/.mtp-ranked-src"
-          (cd "${MLXFAST_JOB_WS}" && swift package resolve)
+          # Resolve dependencies for both SwiftPM roots while still trusted
+          # and networked (the bench uid has a PF egress block).
+          (cd "${MLXFAST_JOB_WS}" && swift package resolve --force-resolved-versions)
+          (cd "${MLXFAST_JOB_WS}" && swift package resolve --force-resolved-versions --scratch-path .build-worker)
           /bin/chmod -R +a "user:bench allow list,search,readattr,readextattr,read,execute,add_file,add_subdirectory,delete_child,write,append,writeattr,writeextattr,file_inherit,directory_inherit" "${MLXFAST_JOB_WS}"
           /bin/chmod -R +a "user:bench deny write,append,writeattr,writeextattr,delete,delete_child,add_file,add_subdirectory,chown,file_inherit,directory_inherit" \
             "${MLXFAST_JOB_WS}/.github" \
@@ -563,8 +609,16 @@ jobs:
           /bin/chmod +a "user:bench deny write,append,writeattr,writeextattr,delete,chown" \
             "${MLXFAST_JOB_WS}/benchmark.sh" \
             "${MLXFAST_JOB_WS}/benchmark.json" \
-            "${MLXFAST_JOB_WS}/setup-mtp.sh"
+            "${MLXFAST_JOB_WS}/setup-mtp.sh" \
+            "${MLXFAST_JOB_WS}/Package.swift" \
+            "${MLXFAST_JOB_WS}/Package.resolved"
           echo "mtp-benchmark: bench workspace ready at ${MLXFAST_JOB_WS} (trusted harness surfaces ACL-locked against bench writes)"
+
+      # Same trusted-source-scope pin as the serial pipeline: the manifests
+      # and the trusted-harness source trees the bench build will compile
+      # must match the trusted git content byte for byte.
+      - name: Verify trusted source scope
+        run: .github/scripts/verify-trusted-source-scope.sh "${GITHUB_WORKSPACE}" "${MLXFAST_JOB_WS}"
 
       # Same conditional-until-live PF egress preflight as the serial
       # pipeline, run before the first execution of submission-built code.
@@ -619,7 +673,11 @@ jobs:
           fi
           echo "::warning::PF bench-egress lockdown not yet active on this box; egress preflight is dormant (bench-uid egress currently open). It will enforce automatically once the operator ships the PF lockdown."
 
-      - name: Build harness in bench sandbox
+      # Same two-root build discipline as the serial pipeline: the trusted
+      # CLI builds in .build and the participant worker (which compiles the
+      # participant-editable vendored MLX forks) in its own .build-worker
+      # scratch root, as two separate bench-exec invocations.
+      - name: Build trusted CLI in bench sandbox
         env:
           BENCH_JOB_ID: mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-build
         run: |
@@ -632,25 +690,48 @@ jobs:
               MLXFAST_METAL_TOOLCHAIN_IDENTIFIER="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" /bin/bash -c '
               set -euo pipefail
               cd "${MJOB_WS}"
-              # TODO(security): Move trusted and participant products to
-              # independent SwiftPM build/cache roots.
-              /usr/bin/swift build -c release --product mlxfast-swift
-              /usr/bin/swift build -c release --product mlxfast-runtime-worker
-              if [[ -s .mlxfast-cache/mlx.metallib ]]; then
-                /bin/cp .mlxfast-cache/mlx.metallib .build/release/mlx.metallib
+              /usr/bin/swift build -c release --force-resolved-versions --product mlxfast-swift
+            '
+          test -x "${MLXFAST_JOB_WS}/.build/release/mlxfast-swift"
+          # Pin the trusted timer/gates/score artifacts before the
+          # participant worker build runs (same reasoning as the serial
+          # pipeline: worker-build-time code execution must not be able to
+          # alter the trusted binary between its build and its pin).
+          .github/scripts/pin-trusted-harness.sh write \
+            "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+
+      - name: Build participant worker in bench sandbox
+        env:
+          BENCH_JOB_ID: mtp-ranked-${{ github.run_id }}-${{ github.run_attempt }}-buildworker
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" \
+              GIT_CONFIG_COUNT=2 \
+              GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="${MLXFAST_JOB_WS}" \
+              GIT_CONFIG_KEY_1=safe.directory GIT_CONFIG_VALUE_1="${MLXFAST_JOB_WS}/*" \
+              MLXFAST_METAL_TOOLCHAIN_IDENTIFIER="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" /bin/bash -c '
+              set -euo pipefail
+              cd "${MJOB_WS}"
+              /usr/bin/swift build -c release --force-resolved-versions --scratch-path .build-worker --product mlxfast-runtime-worker
+              if [[ -s .mlxfast-cache/mlx.metallib && -s .mlxfast-cache/mlx.metallib.fingerprint ]]; then
+                /bin/cp .mlxfast-cache/mlx.metallib .build-worker/release/mlx.metallib
+                /bin/cp .mlxfast-cache/mlx.metallib.fingerprint .build-worker/release/mlx.metallib.fingerprint
                 echo "mtp-benchmark: restored trusted MLX Metal library"
               else
                 tools/build-mlx-metallib.sh
               fi
-              /bin/chmod 0644 .build/release/mlx.metallib
+              /bin/chmod 0644 .build-worker/release/mlx.metallib .build-worker/release/mlx.metallib.fingerprint
             '
-          test -x "${MLXFAST_JOB_WS}/.build/release/mlxfast-swift"
-          test -x "${MLXFAST_JOB_WS}/.build/release/mlxfast-runtime-worker"
-          test -s "${MLXFAST_JOB_WS}/.build/release/mlx.metallib"
-          # Pin the trusted harness artifacts NOW (TOCTOU defense); every
-          # later phase that executes the binary as bench re-verifies.
+          test -x "${MLXFAST_JOB_WS}/.build-worker/release/mlxfast-runtime-worker"
+          test -s "${MLXFAST_JOB_WS}/.build-worker/release/mlx.metallib"
+          test -s "${MLXFAST_JOB_WS}/.build-worker/release/mlx.metallib.fingerprint"
+          # Separate participant-worker attestation (TOCTOU defense): every
+          # scored phase must execute exactly the worker binary and metallib
+          # built from the reviewed source tree; the worker stays OUT of the
+          # trusted pin.
           .github/scripts/pin-trusted-harness.sh write \
-            "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256"
+            "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
 
       # Transform the pinned 31B-IT target source (NOT the serial track's
       # base checkpoint) into the candidate's runtime weights.
@@ -776,9 +857,11 @@ jobs:
           echo "mtp-benchmark: hidden goldens verified (correctness ${correctness_hash}, benchmark ${bench_hash})"
 
       # TOCTOU guard: the submitted transform ran with workspace write access
-      # since the post-build pin.
+      # since the post-build pins.
       - name: Verify trusted harness before MTP correctness gate
-        run: .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256"
+        run: |
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
 
       # The untimed MTP correctness/parity gate: one full-length trained-MTP
       # pass over the hidden correctness golden. The trusted parent checks
@@ -905,7 +988,7 @@ jobs:
           scrub_failed=0
           while IFS= read -r -d '' rel; do
             case "${rel}" in
-              ./mtp-weights/*|./.build/*|./correctness_prompts/*) continue ;;
+              ./mtp-weights/*|./.build/*|./.build-worker/*|./correctness_prompts/*) continue ;;
               ./private/*) continue ;;
             esac
             if grep -zqxF -- "${rel}" "${manifest}"; then
@@ -967,7 +1050,9 @@ jobs:
 
       - name: Verify trusted harness before timing
         if: ${{ inputs.run_benchmark }}
-        run: .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256"
+        run: |
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
 
       # THE TIMED MTP MEASUREMENT -- LAST, via the box-owned wrapper with the
       # fixed thermal contract. Per accepted pair, alternating order:

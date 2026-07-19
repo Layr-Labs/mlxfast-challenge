@@ -49,7 +49,11 @@ MACMON_RELEASE_SHA256="c79fdc7ab02b456b897dcc3ea041678420d7a1d5bd669aaac36fda388
 MACMON_INSTALL_DIR="${HOME}/bin"
 SETUP_PARALLEL_METALLIB="${MLXFAST_SETUP_PARALLEL_METALLIB:-${MLXFAST_SETUP_PARALLEL_BUILD:-1}}"
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
-RUNTIME_WORKER_BIN="${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-$(dirname "${SWIFT_BIN}")/mlxfast-runtime-worker}"
+# The participant runtime worker builds under its own SwiftPM scratch root
+# (.build-worker) so a participant-code build never writes into the trusted
+# CLI's build tree (.build). mlx.metallib is a participant artifact and lives
+# next to the worker binary, where Cmlx searches first.
+RUNTIME_WORKER_BIN="${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-.build-worker/release/mlxfast-runtime-worker}"
 MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${RUNTIME_WORKER_BIN}")/mlx.metallib}"
 DEFAULT_REFERENCE_DIR="reference_weights/gemma-4-31b-4bit"
 DEFAULT_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}"
@@ -2690,14 +2694,39 @@ cleanup_background_builds() {
   return "${status}"
 }
 
+# The dependency graph is frozen by challenge policy: before either build
+# begins, Package.swift and Package.resolved must match the committed state
+# (SwiftPM re-resolution, a submission, or local edits all show up as a
+# work-tree diff). Skips quietly where git is unavailable, and
+# --force-resolved-versions on the builds makes SwiftPM itself fail closed
+# instead of silently re-resolving an out-of-date graph.
+assert_frozen_dependency_graph() {
+  command -v git >/dev/null 2>&1 || return 0
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  local manifest
+  for manifest in Package.swift Package.resolved; do
+    git cat-file -e "HEAD:${manifest}" 2>/dev/null || return 0
+    if ! git diff --quiet HEAD -- "${manifest}" 2>/dev/null; then
+      echo "setup.sh: ${manifest} differs from the committed state; the dependency graph is frozen by challenge policy" >&2
+      echo "setup.sh: restore it (git checkout -- ${manifest}) and rerun" >&2
+      return 1
+    fi
+  done
+}
+
 build_swift_harness() {
   echo "setup.sh: building trusted Swift harness and participant runtime worker"
-  mkdir -p .build/clang-module-cache
-  export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build/clang-module-cache}"
-  # TODO(security): Give the trusted CLI and participant worker independent
-  # SwiftPM build/cache roots instead of sharing .build.
-  swift build -c release --product mlxfast-swift
-  swift build -c release --product mlxfast-runtime-worker
+  assert_frozen_dependency_graph || return 1
+  # Independent SwiftPM build/cache roots: the trusted CLI builds in .build
+  # and the participant worker (which compiles the vendored MLX forks) in
+  # .build-worker, each with its own clang module cache, so a
+  # participant-code build can never write into the trusted product tree.
+  # An explicitly exported CLANG_MODULE_CACHE_PATH wins for both builds.
+  mkdir -p .build/clang-module-cache .build-worker/clang-module-cache
+  CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build/clang-module-cache}" \
+    swift build -c release --force-resolved-versions --product mlxfast-swift
+  CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build-worker/clang-module-cache}" \
+    swift build -c release --force-resolved-versions --scratch-path .build-worker --product mlxfast-runtime-worker
   if [[ ! -x "${SWIFT_BIN}" ]]; then
     echo "setup.sh: trusted Swift CLI missing at ${SWIFT_BIN}; build failed or MLXFAST_SWIFT_BIN is wrong" >&2
     return 1
