@@ -692,75 +692,6 @@ struct QuantizedBlockLoader {
   }
 };
 
-// Gemma 4's aligned affine BF16 QMM can stage two complete group-64
-// quantization groups per output row.  The stock 128-thread geometry assigns
-// two adjacent threads to each of 64 rows; at BK=128 each thread therefore
-// owns one full group, including its distinct scale and bias.  Keep the
-// scalar-byte dequantization spelling and destination order of the generic
-// loader so that only staging depth and barrier frequency change.
-template <short dst_ld>
-struct QuantizedBlockLoader<
-    bfloat16_t,
-    64,
-    128,
-    dst_ld,
-    1,
-    128,
-    64,
-    4> {
-  static_assert(dst_ld >= 128, "Gemma 4 BK=128 loader requires a full row");
-
-  const short row;
-  const short group;
-
-  threadgroup bfloat16_t* dst;
-  const device uint8_t* src;
-  const device bfloat16_t* scales;
-  const device bfloat16_t* biases;
-
-  QuantizedBlockLoader(
-      const device uint8_t* src_,
-      const device bfloat16_t* scales_,
-      const device bfloat16_t* biases_,
-      const int src_ld_,
-      threadgroup bfloat16_t* dst_,
-      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
-      ushort simd_lane_id [[thread_index_in_simdgroup]])
-      : row((simd_group_id * 32 + simd_lane_id) / 2),
-        group((simd_group_id * 32 + simd_lane_id) % 2),
-        dst(dst_ + row * dst_ld + group * 64),
-        src(src_ + row * src_ld_ / 2 + group * 32),
-        scales(scales_ + row * src_ld_ / 64 + group),
-        biases(biases_ + row * src_ld_ / 64 + group) {}
-
-  void load_unsafe() const {
-    const bfloat16_t scale = *scales;
-    const bfloat16_t bias = *biases;
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < 32; ++i) {
-      dequantize<bfloat16_t, 2, 4>(
-          src + i, scale, bias, dst + 2 * i);
-    }
-  }
-
-  void load_safe(short2 src_tile_dim) const {
-    if (row >= src_tile_dim.x) {
-      STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < 64; ++i) {
-        dst[i] = bfloat16_t(0);
-      }
-      return;
-    }
-    load_unsafe();
-  }
-
-  void next() {
-    src += 64;
-    scales += 2;
-    biases += 2;
-  }
-};
-
 template <
     typename T,
     short BROWS,
@@ -1057,7 +988,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
-  constexpr short SK = (BK % 64 == 0) ? 64 : 32;
+  constexpr short SK = 32;
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
@@ -1294,40 +1225,9 @@ template <
     uint simd_lid [[thread_index_in_simdgroup]]) {
   (void)lid;
 
-  // Host dispatch and its pipeline key remain the stock BK=64 shape.  Only
-  // this exact Gemma instantiation reserves the larger staging tile; a
-  // uniform runtime K check below selects BK=128 for known production widths.
-  constexpr bool gemma4_bk128 =
-      metal::is_same_v<T, bfloat16_t> && group_size == 64 && bits == 4 &&
-      aligned_N && !batched && BM == 64 && BK == 64 && BN == 64 && WM == 2 &&
-      WN == 2;
-  constexpr int scratch_bk = gemma4_bk128 ? 128 : BK;
-  constexpr int BK_padded = (scratch_bk + 16 / sizeof(T));
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
 
   threadgroup T Ws[BN * BK_padded];
-
-  // The host dispatches an (N tile, M tile, batch) grid with N in the
-  // physically contiguous x dimension.  For Gemma's aligned BF16 affine-4
-  // path, linearize that unchanged physical grid and decode it with M tiles
-  // as the minor coordinate.  Consecutive threadgroups then consume the same
-  // weight tile across all M tiles before advancing N, while the helper still
-  // receives the original logical (N tile, M tile, batch) coordinate shape.
-  constexpr bool gemma4_m_major = gemma4_bk128;
-  uint3 logical_tid = tid;
-  if constexpr (gemma4_m_major) {
-    const uint m_tiles = (uint(M) + BM - 1) / BM;
-    const uint n_tiles = uint(N) / BN;
-    const uint physical_linear = tid.y * n_tiles + tid.x;
-    if (M == 512) {
-      // The scored prefill has exactly eight M tiles. Avoid an integer divide
-      // in every threadgroup on that hot shape.
-      logical_tid = uint3(physical_linear >> 3, physical_linear & 7, tid.z);
-    } else {
-      const uint logical_n = physical_linear / m_tiles;
-      const uint logical_m = physical_linear - logical_n * m_tiles;
-      logical_tid = uint3(logical_n, logical_m, tid.z);
-    }
-  }
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1347,16 +1247,8 @@ template <
         b_strides,
         tid);
   }
-  if constexpr (gemma4_bk128) {
-    if (K == 5376 || K == 8192 || K == 16384 || K == 21504) {
-      qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, 128, BN, WM, WN>(
-          w, scales, biases, x, y, Ws, K, N, M, logical_tid, lid, simd_gid,
-          simd_lid);
-      return;
-    }
-  }
   qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
-      w, scales, biases, x, y, Ws, K, N, M, logical_tid, lid, simd_gid, simd_lid);
+      w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
 template <

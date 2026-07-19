@@ -20,7 +20,6 @@ enum AffineMetadataCoding {
     private enum TensorKind {
         case indices
         case lut
-        case packedIndices(indexBits: Int)
     }
 
     private struct Projection {
@@ -29,7 +28,6 @@ enum AffineMetadataCoding {
         let biasesName: String
         let shape: [Int]
         let lut: [UInt32]
-        let packedIndexBits: Int?
     }
 
     private struct GeneratedTensor {
@@ -125,12 +123,7 @@ enum AffineMetadataCoding {
                     scalesName: scalesName,
                     biasesName: biasesName,
                     shape: scalesInfo.shape,
-                    lut: lut,
-                    packedIndexBits: packedIndexBits(
-                        stem: stem,
-                        shape: scalesInfo.shape,
-                        lutCount: lut.count
-                    )
+                    lut: lut
                 )
             )
         }
@@ -162,35 +155,6 @@ enum AffineMetadataCoding {
                     kind: .lut
                 )
             )
-            if let indexBits = projection.packedIndexBits {
-                guard let suffix = PackedProjectionMetadataCoding.suffix(
-                    indexBits: indexBits
-                ), let bytesPerRow = PackedProjectionMetadataCoding.packedBytesPerRow(
-                    groupsPerRow: projection.shape[1],
-                    indexBits: indexBits
-                ) else {
-                    throw MLXFastError.invalidInput(
-                        "packed metadata layout is invalid for \(projection.stem)"
-                    )
-                }
-                let (packedByteCount, packedOverflow) =
-                    projection.shape[0].multipliedReportingOverflow(by: bytesPerRow)
-                guard !packedOverflow else {
-                    throw MLXFastError.invalidInput(
-                        "packed metadata shape overflows for \(projection.stem)"
-                    )
-                }
-                tensors.append(
-                    GeneratedTensor(
-                        name: "\(projection.stem)\(suffix)",
-                        dtype: .u8,
-                        shape: [projection.shape[0], bytesPerRow],
-                        byteCount: packedByteCount,
-                        projectionIndex: projectionIndex,
-                        kind: .packedIndices(indexBits: indexBits)
-                    )
-                )
-            }
         }
         tensors.sort { $0.name < $1.name }
 
@@ -211,7 +175,8 @@ enum AffineMetadataCoding {
         )
     }
 
-    private static func indexedProjectionStem(_ name: String) -> String? {        let prefix = "language_model.model.layers."
+    private static func indexedProjectionStem(_ name: String) -> String? {
+        let prefix = "language_model.model.layers."
         guard name.hasPrefix(prefix), name.hasSuffix(".weight") else {
             return nil
         }
@@ -232,33 +197,6 @@ enum AffineMetadataCoding {
             return nil
         }
         return String(name.dropLast(".weight".count))
-    }
-
-    /// Fixed-width packed authoring targets the fused attention-projection
-    /// decode kernels, whose per-block metadata consumption matches the
-    /// pair/tail layout in `PackedProjectionMetadataCoding`. MLP streams keep
-    /// their runtime-packed promoted forms. nil skips packed authoring
-    /// (fail-open to the runtime U16 path) for incompatible geometry or a LUT
-    /// wider than 13 bits.
-    private static func packedIndexBits(
-        stem: String,
-        shape: [Int],
-        lutCount: Int
-    ) -> Int? {
-        guard stem.contains(".self_attn."),
-              shape.count == 2,
-              shape[0] > 0,
-              let indexBits = PackedProjectionMetadataCoding.indexBits(
-                  forLUTCount: lutCount
-              ),
-              PackedProjectionMetadataCoding.packedBytesPerRow(
-                  groupsPerRow: shape[1],
-                  indexBits: indexBits
-              ) != nil
-        else {
-            return nil
-        }
-        return indexBits
     }
 
     private static func tensorInfo(
@@ -426,37 +364,6 @@ enum AffineMetadataCoding {
                 ))
             case .lut:
                 try output.write(contentsOf: littleEndianData(projection.lut))
-            case .packedIndices(let indexBits):
-                let scales = try tensorBytes(
-                    named: projection.scalesName,
-                    sourceDirectory: sourceDirectory,
-                    index: index,
-                    sourceHeaders: sourceHeaders
-                )
-                let biases = try tensorBytes(
-                    named: projection.biasesName,
-                    sourceDirectory: sourceDirectory,
-                    index: index,
-                    sourceHeaders: sourceHeaders
-                )
-                let indices = try makeIndices(
-                    scales: scales,
-                    biases: biases,
-                    lut: projection.lut,
-                    name: projection.stem
-                )
-                let packed = try makePackedIndices(
-                    indices: indices,
-                    shape: projection.shape,
-                    indexBits: indexBits,
-                    name: projection.stem
-                )
-                guard packed.count == tensor.byteCount else {
-                    throw MLXFastError.invalidInput(
-                        "packed metadata byte count mismatch for \(projection.stem)"
-                    )
-                }
-                try output.write(contentsOf: packed)
             }
         }
         try output.synchronize()
@@ -507,45 +414,6 @@ enum AffineMetadataCoding {
             }
         }
         return output
-    }
-
-    /// Re-encode a little-endian U16 index payload into the fixed 12/13-bit
-    /// layout. Fail-closed: authoring was declared in the shard header, so a
-    /// pack failure aborts the transform instead of truncating the sidecar.
-    private static func makePackedIndices(
-        indices: Data,
-        shape: [Int],
-        indexBits: Int,
-        name: String
-    ) throws -> Data {
-        guard shape.count == 2,
-              indices.count.isMultiple(of: 2),
-              indices.count / 2 == shape[0] * shape[1]
-        else {
-            throw MLXFastError.invalidInput(
-                "packed metadata source shape is invalid for \(name)"
-            )
-        }
-        var values = [UInt16](repeating: 0, count: indices.count / 2)
-        indices.withUnsafeBytes { bytes in
-            for element in values.indices {
-                values[element] = bytes.loadUnaligned(
-                    fromByteOffset: element * 2,
-                    as: UInt16.self
-                ).littleEndian
-            }
-        }
-        guard let packed = PackedProjectionMetadataCoding.packFixedWidthIndices(
-            values,
-            rows: shape[0],
-            groupsPerRow: shape[1],
-            indexBits: indexBits
-        ) else {
-            throw MLXFastError.invalidInput(
-                "packed metadata does not fit fixed\(indexBits) form for \(name)"
-            )
-        }
-        return Data(packed)
     }
 
     private static func littleEndianData(_ values: [UInt32]) -> Data {

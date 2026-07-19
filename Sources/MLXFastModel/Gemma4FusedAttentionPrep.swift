@@ -11,40 +11,6 @@ private func gemma4PrefillAttentionEnvironmentFlag(
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }
 
-/// Rollback switch for the KV reserved-suffix zero-fill removal (C2).
-///
-/// Default ON. The combined KV prefill kernels grid the reserved capacity
-/// rows (tokens >= valid_length) and used to zero-fill them in the same
-/// dispatch. Those rows are never read before a later decode append writes
-/// them (cache views expose only 0..<offset; decode direct-writes each
-/// reserved row before any trim/wrap can copy it; MTP exact-pair appends
-/// also only write), so the fill is dead traffic. Set
-/// `DARKBLOOM_KV_SKIP_SUFFIX_ZEROFILL=0` to restore the fill.
-let gemma4KVSkipSuffixZeroFillEnabled: Bool =
-    gemma4PrefillAttentionEnvironmentFlag(
-        "DARKBLOOM_KV_SKIP_SUFFIX_ZEROFILL",
-        default: true
-    )
-
-private let gemma4PrecomputedScalarViewsFeatureEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_PRECOMPUTED_SCALAR_VIEWS"
-    ] else {
-        return true
-    }
-    return !["0", "false", "no", "off"].contains(raw.lowercased())
-}()
-
-/// Shared rollback switch for the decode hot path's precomputed 0-d scalar
-/// arrays (KV write-position views and the persistent logit softcap). Default
-/// on; set `DARKBLOOM_PRECOMPUTED_SCALAR_VIEWS=0` to restore the per-call
-/// `MLXArray(Int32(...))`/`MLXArray(softcap)` allocations. Pure addressing/
-/// precompute — the bound values and every kernel input are unchanged.
-@inline(__always)
-func gemma4PrecomputedScalarViewsEnabled() -> Bool {
-    gemma4PrecomputedScalarViewsFeatureEnabled
-}
-
 // Raw BF16 exact against the promoted path at L512 for both attention modes,
 // both prefill preparation routes, and on the real 31B public prefill.
 private let gemma4DirectPrefillAttentionRMSRoPEDefault = true
@@ -240,118 +206,31 @@ private func makeGemma4FusedAttentionRMSKernel(
     headDim: Int,
     kvHeads: Int,
     sharesFullKVReduction: Bool,
-    combinedKVOutput: Bool = false,
-    directCacheWrite: Bool = false
+    combinedKVOutput: Bool = false
 ) -> MLXFast.MLXFastKernel {
     precondition(headDim == 256 || headDim == 512)
     precondition(kvHeads == 16 || kvHeads == 4)
-    precondition(!(directCacheWrite && combinedKVOutput))
-    let outputNames: [String]
-    if directCacheWrite {
-        outputNames = ["queries"]
-    } else {
-        outputNames = combinedKVOutput
-            ? ["queries", "combined_kv"]
-            : ["queries", "keys", "values"]
-    }
-    let kvOutputPointer: String
-    let sharedValueOutput: String
-    let slabConstants: String
-    let strideDeclarations: String
-    let inputDeclaration: String
-    let inputAdvance: String
-    let inputLoad: String
-    let dimensionStore: String
-    let pairStore: String
-    let pairOffsetStore: String
-    if directCacheWrite {
-        // The direct cache-write variant mirrors the promoted strided prefill
-        // kernels: raw inputs are read through their signed MLX strides and
-        // K/V rows are stored through the combined slab's own strides, so any
-        // slab layout is addressed correctly with no Swift-side layout check.
-        // Every stride is one for the actual decode inputs and cache storage,
-        // making each load/store address identical to the staging kernels.
-        slabConstants = ""
-        strideDeclarations = """
-            const constant int64_t* cache_strides = combined_cache_strides;
-            const int64_t output_dimension_stride = is_q ? 1 : cache_strides[4];
-            const uint kWritePosition = static_cast<uint>(write_position);
-            device bfloat* combined_cache_mutable =
-                const_cast<device bfloat*>(combined_cache);
-        """
-        inputDeclaration = """
-            const constant int64_t* input_strides = is_q
-                ? raw_q_strides
-                : (is_k ? raw_k_strides : raw_v_strides);
-            const int64_t input_dimension_stride = input_strides[2];
-            const device bfloat* input = (is_q ? raw_q : (is_k ? raw_k : raw_v))
-                + static_cast<int64_t>(projection_row * kHeadDim)
-                    * input_dimension_stride;
-        """
-        inputAdvance =
-            "input += static_cast<int64_t>(thread_position_in_threadgroup.x"
-            + " * kReads) * input_dimension_stride;"
-        inputLoad = "input[static_cast<int64_t>(index) * input_dimension_stride]"
-        dimensionStore =
-            "output[static_cast<int64_t>(dimension) * output_dimension_stride]"
-        pairStore =
-            "output[static_cast<int64_t>(pair) * output_dimension_stride]"
-        pairOffsetStore =
-            "output[static_cast<int64_t>(pair + kPairs)"
-            + " * output_dimension_stride]"
-        kvOutputPointer =
-            "(combined_cache_mutable + (is_k ? 0 : cache_strides[0])"
-            + " + projection_row * cache_strides[2]"
-            + " + kWritePosition * cache_strides[3])"
-        sharedValueOutput =
-            "combined_cache_mutable[cache_strides[0]"
-            + " + projection_row * cache_strides[2]"
-            + " + kWritePosition * cache_strides[3]"
-            + " + static_cast<int64_t>(dimension) * cache_strides[4]]"
-    } else {
-        slabConstants = """
-            constexpr uint kKVSlabElements = kKVHeads * kHeadDim;
-        """
-        strideDeclarations = ""
-        inputDeclaration = """
-            const device bfloat* input = is_q
-                ? raw_q + projection_row * kHeadDim
-                : (is_k ? raw_k : raw_v) + projection_row * kHeadDim;
-        """
-        inputAdvance = "input += thread_position_in_threadgroup.x * kReads;"
-        inputLoad = "input[index]"
-        dimensionStore = "output[dimension]"
-        pairStore = "output[pair]"
-        pairOffsetStore = "output[pair + kPairs]"
-        if combinedKVOutput {
-            kvOutputPointer =
-                "(combined_kv + (is_k ? 0 : kKVSlabElements) + projection_row * kHeadDim)"
-            sharedValueOutput =
-                "combined_kv[kKVSlabElements + projection_row * kHeadDim + dimension]"
-        } else {
-            kvOutputPointer = "(is_k ? keys : values) + projection_row * kHeadDim"
-            sharedValueOutput = "values[projection_row * kHeadDim + dimension]"
-        }
-    }
-    let inputNames = directCacheWrite
-        ? [
-            "raw_q", "raw_k", "raw_v", "q_weight", "k_weight",
-            "position", "rope_cosines", "rope_sines", "combined_cache",
-            "write_position",
-        ]
-        : [
-            "raw_q", "raw_k", "raw_v", "q_weight", "k_weight",
-            "position", "rope_cosines", "rope_sines",
-        ]
+    let outputNames = combinedKVOutput
+        ? ["queries", "combined_kv"]
+        : ["queries", "keys", "values"]
+    let kvOutputPointer = combinedKVOutput
+        ? "(combined_kv + (is_k ? 0 : kKVSlabElements) + projection_row * kHeadDim)"
+        : "(is_k ? keys : values) + projection_row * kHeadDim"
+    let sharedValueOutput = combinedKVOutput
+        ? "combined_kv[kKVSlabElements + projection_row * kHeadDim + dimension]"
+        : "values[projection_row * kHeadDim + dimension]"
     return MLXFast.metalKernel(
         name: name,
-        inputNames: inputNames,
+        inputNames: [
+            "raw_q", "raw_k", "raw_v", "q_weight", "k_weight",
+            "position", "rope_cosines", "rope_sines",
+        ],
         outputNames: outputNames,
         source: """
             constexpr uint kHeadDim = \(headDim);
             constexpr uint kQHeads = 32;
             constexpr uint kKVHeads = \(kvHeads);
-            \(slabConstants)
+            constexpr uint kKVSlabElements = kKVHeads * kHeadDim;
             constexpr uint kReads = 4;
             constexpr uint kSIMDSize = 32;
             constexpr bool kSharesFullKVReduction = \(sharesFullKVReduction);
@@ -366,8 +245,9 @@ private func makeGemma4FusedAttentionRMSKernel(
                 : (is_k ? combined_row - kQHeads
                         : combined_row - kQHeads - kKVHeads);
 
-            \(strideDeclarations)
-            \(inputDeclaration)
+            const device bfloat* input = is_q
+                ? raw_q + projection_row * kHeadDim
+                : (is_k ? raw_k : raw_v) + projection_row * kHeadDim;
             const device bfloat* weight = is_q ? q_weight : k_weight;
             device bfloat* output = is_q
                 ? queries + projection_row * kHeadDim
@@ -375,10 +255,10 @@ private func makeGemma4FusedAttentionRMSKernel(
             const bool has_weight = is_q || is_k;
 
             float accumulator = 0;
-            \(inputAdvance)
+            input += thread_position_in_threadgroup.x * kReads;
             if (thread_position_in_threadgroup.x * kReads + kReads <= kHeadDim) {
                 for (uint index = 0; index < kReads; ++index) {
-                    const float value = \(inputLoad);
+                    const float value = input[index];
                     accumulator += value * value;
                 }
             }
@@ -410,13 +290,13 @@ private func makeGemma4FusedAttentionRMSKernel(
                 const uint dimension =
                     thread_position_in_threadgroup.x * kReads + index;
                 const bfloat normalized = static_cast<bfloat>(
-                    \(inputLoad) * inverse_mean[0]);
+                    input[index] * inverse_mean[0]);
                 const bfloat weighted = has_weight
                     ? row_weight[index] * normalized
                     : static_cast<bfloat>(1.0f) * normalized;
                 normalized_row[dimension] = weighted;
                 if (!has_weight) {
-                    \(dimensionStore) = weighted;
+                    output[dimension] = weighted;
                 }
                 if (kSharesFullKVReduction && is_k) {
                     \(sharedValueOutput) =
@@ -438,15 +318,15 @@ private func makeGemma4FusedAttentionRMSKernel(
                     const float left = static_cast<float>(normalized_row[pair]);
                     const float right = static_cast<float>(
                         normalized_row[pair + kPairs]);
-                    \(pairStore) = static_cast<bfloat>(
+                    output[pair] = static_cast<bfloat>(
                         left * cosine - right * sine);
-                    \(pairOffsetStore) = static_cast<bfloat>(
+                    output[pair + kPairs] = static_cast<bfloat>(
                         left * sine + right * cosine);
                 }
             }
             """,
         header: "using namespace metal;",
-        ensureRowContiguous: !directCacheWrite
+        ensureRowContiguous: true
     )
 }
 
@@ -480,22 +360,6 @@ private let gemma4FusedFullAttentionRMSCombined = makeGemma4FusedAttentionRMSKer
     combinedKVOutput: true
 )
 
-private let gemma4FusedSlidingAttentionRMSCombinedDirect = makeGemma4FusedAttentionRMSKernel(
-    name: "gemma4_fused_sliding_attention_rms_rope_table_combined_kv_direct_256_v1",
-    headDim: 256,
-    kvHeads: 16,
-    sharesFullKVReduction: false,
-    directCacheWrite: true
-)
-
-private let gemma4FusedFullAttentionRMSCombinedDirect = makeGemma4FusedAttentionRMSKernel(
-    name: "gemma4_fused_full_attention_rms_rope_table_shared_combined_kv_direct_512_v1",
-    headDim: 512,
-    kvHeads: 4,
-    sharesFullKVReduction: true,
-    directCacheWrite: true
-)
-
 private func makeGemma4CombinedKVPrefillKernel(
     name: String,
     headDim: Int,
@@ -513,7 +377,6 @@ private func makeGemma4CombinedKVPrefillKernel(
             constexpr uint kReads = 4;
             constexpr uint kSIMDSize = 32;
             constexpr bool kSharesFullKVReduction = \(sharesFullKVReduction);
-            constexpr bool kSkipSuffixZeroFill = \(gemma4KVSkipSuffixZeroFillEnabled);
 
             const uint combined_row = threadgroup_position_in_grid.y;
             const uint token = combined_row / kRowsPerToken;
@@ -530,21 +393,17 @@ private func makeGemma4CombinedKVPrefillKernel(
                 + (is_k ? 0 : slab_elements)
                 + (projection_head * output_capacity + token) * kHeadDim;
             if (token >= input_length) {
-                // Reserved capacity suffix: never read before being written
-                // by a later decode append, so the zero-fill is skippable.
-                if (!kSkipSuffixZeroFill) {
-                    for (uint index = 0; index < kReads; ++index) {
-                        const uint dimension =
-                            thread_position_in_threadgroup.x * kReads + index;
-                        output[dimension] = static_cast<bfloat>(0.0f);
-                        if (kSharesFullKVReduction && is_k) {
-                            combined_kv[
-                                slab_elements
-                                + (projection_head * output_capacity + token)
-                                    * kHeadDim
-                                + dimension
-                            ] = static_cast<bfloat>(0.0f);
-                        }
+                for (uint index = 0; index < kReads; ++index) {
+                    const uint dimension =
+                        thread_position_in_threadgroup.x * kReads + index;
+                    output[dimension] = static_cast<bfloat>(0.0f);
+                    if (kSharesFullKVReduction && is_k) {
+                        combined_kv[
+                            slab_elements
+                            + (projection_head * output_capacity + token)
+                                * kHeadDim
+                            + dimension
+                        ] = static_cast<bfloat>(0.0f);
                     }
                 }
                 return;
@@ -659,14 +518,14 @@ private func makeGemma4CombinedKVPrefillKernel(
 }
 
 private let gemma4SlidingCombinedKVPrefill = makeGemma4CombinedKVPrefillKernel(
-    name: "gemma4_sliding_combined_kv_prefill_strided_256_v4",
+    name: "gemma4_sliding_combined_kv_prefill_strided_256_v3",
     headDim: 256,
     kvHeads: 16,
     sharesFullKVReduction: false
 )
 
 private let gemma4FullCombinedKVPrefill = makeGemma4CombinedKVPrefillKernel(
-    name: "gemma4_full_combined_kv_prefill_shared_strided_512_v4",
+    name: "gemma4_full_combined_kv_prefill_shared_strided_512_v3",
     headDim: 512,
     kvHeads: 4,
     sharesFullKVReduction: true
@@ -674,7 +533,7 @@ private let gemma4FullCombinedKVPrefill = makeGemma4CombinedKVPrefillKernel(
 
 private let gemma4DirectSlidingCombinedKVPrefill =
     makeGemma4CombinedKVPrefillKernel(
-        name: "gemma4_direct_sliding_combined_kv_prefill_strided_256_v2",
+        name: "gemma4_direct_sliding_combined_kv_prefill_strided_256_v1",
         headDim: 256,
         kvHeads: 16,
         sharesFullKVReduction: false,
@@ -683,7 +542,7 @@ private let gemma4DirectSlidingCombinedKVPrefill =
 
 private let gemma4DirectFullCombinedKVPrefill =
     makeGemma4CombinedKVPrefillKernel(
-        name: "gemma4_direct_full_combined_kv_prefill_shared_strided_512_v2",
+        name: "gemma4_direct_full_combined_kv_prefill_shared_strided_512_v1",
         headDim: 512,
         kvHeads: 4,
         sharesFullKVReduction: true,
@@ -711,7 +570,6 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
             constexpr uint kReads = 4;
             constexpr uint kSIMDSize = 32;
             constexpr bool kSharesFullKVReduction = \(sharesFullKVReduction);
-            constexpr bool kSkipSuffixZeroFill = \(gemma4KVSkipSuffixZeroFillEnabled);
 
             const uint combined_row = threadgroup_position_in_grid.y;
             const uint input_length = static_cast<uint>(valid_length);
@@ -744,23 +602,20 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
                     + (is_k ? 0 : slab_elements)
                     + (projection_head * output_capacity + token) * kHeadDim;
 
-            // Query rows exist only for valid tokens. K/V rows span capacity;
-            // the reserved suffix is never read before a later decode append
-            // writes it, so its zero-fill is skippable.
+            // Query rows exist only for valid tokens. K/V rows span capacity so
+            // the reserved cache suffix is initialized without a concatenate.
             if (!is_q && token >= input_length) {
-                if (!kSkipSuffixZeroFill) {
-                    for (uint index = 0; index < kReads; ++index) {
-                        const uint dimension =
-                            thread_position_in_threadgroup.x * kReads + index;
-                        output[dimension] = static_cast<bfloat>(0.0f);
-                        if (kSharesFullKVReduction && is_k) {
-                            combined_kv[
-                                slab_elements
-                                + (projection_head * output_capacity + token)
-                                    * kHeadDim
-                                + dimension
-                            ] = static_cast<bfloat>(0.0f);
-                        }
+                for (uint index = 0; index < kReads; ++index) {
+                    const uint dimension =
+                        thread_position_in_threadgroup.x * kReads + index;
+                    output[dimension] = static_cast<bfloat>(0.0f);
+                    if (kSharesFullKVReduction && is_k) {
+                        combined_kv[
+                            slab_elements
+                            + (projection_head * output_capacity + token)
+                                * kHeadDim
+                            + dimension
+                        ] = static_cast<bfloat>(0.0f);
                     }
                 }
                 return;
@@ -883,7 +738,7 @@ private func makeGemma4CombinedQKVPrefillPreparationKernel(
 
 private let gemma4SlidingCombinedQKVPrefillPreparation =
     makeGemma4CombinedQKVPrefillPreparationKernel(
-        name: "gemma4_sliding_combined_qkv_prefill_prep_strided_256_v2",
+        name: "gemma4_sliding_combined_qkv_prefill_prep_strided_256_v1",
         headDim: 256,
         kvHeads: 16,
         sharesFullKVReduction: false
@@ -891,7 +746,7 @@ private let gemma4SlidingCombinedQKVPrefillPreparation =
 
 private let gemma4FullCombinedQKVPrefillPreparation =
     makeGemma4CombinedQKVPrefillPreparationKernel(
-        name: "gemma4_full_combined_qkv_prefill_prep_shared_strided_512_v2",
+        name: "gemma4_full_combined_qkv_prefill_prep_shared_strided_512_v1",
         headDim: 512,
         kvHeads: 4,
         sharesFullKVReduction: true
@@ -899,7 +754,7 @@ private let gemma4FullCombinedQKVPrefillPreparation =
 
 private let gemma4DirectSlidingCombinedQKVPrefillPreparation =
     makeGemma4CombinedQKVPrefillPreparationKernel(
-        name: "gemma4_direct_sliding_combined_qkv_prefill_strided_256_v2",
+        name: "gemma4_direct_sliding_combined_qkv_prefill_strided_256_v1",
         headDim: 256,
         kvHeads: 16,
         sharesFullKVReduction: false,
@@ -908,7 +763,7 @@ private let gemma4DirectSlidingCombinedQKVPrefillPreparation =
 
 private let gemma4DirectFullCombinedQKVPrefillPreparation =
     makeGemma4CombinedQKVPrefillPreparationKernel(
-        name: "gemma4_direct_full_combined_qkv_prefill_shared_strided_512_v2",
+        name: "gemma4_direct_full_combined_qkv_prefill_shared_strided_512_v1",
         headDim: 512,
         kvHeads: 4,
         sharesFullKVReduction: true,
@@ -974,12 +829,6 @@ private struct Gemma4AttentionRopeTables: @unchecked Sendable {
     let slidingSines: MLXArray
     let fullCosines: MLXArray
     let fullSines: MLXArray
-    /// Precomputed 0-d int32 views holding values 0..<4096, reused as the
-    /// decode KV write-position scalar so the per-layer decode step does not
-    /// allocate and upload a fresh `MLXArray(Int32(writePosition))`. The
-    /// values are exactly the positions table's, so this aliases
-    /// `positionViews`; a second table would hold the same integers.
-    let writePositionViews: [MLXArray]
 }
 
 private let gemma4AttentionRopeTables: Gemma4AttentionRopeTables = {
@@ -1001,29 +850,20 @@ private let gemma4AttentionRopeTables: Gemma4AttentionRopeTables = {
         slidingCosines: outputs[0],
         slidingSines: outputs[1],
         fullCosines: outputs[2],
-        fullSines: outputs[3],
-        writePositionViews: positionViews
+        fullSines: outputs[3]
     )
 }()
 
 private func gemma4VerifyDirectPrefillAttentionRMSRoPEOutputs(
     candidate: [MLXArray],
     reference: [MLXArray],
-    kind: String,
-    liveTokens: Int
+    kind: String
 ) {
     precondition(candidate.count == reference.count)
     var valueCount = 0
     for (outputIndex, pair) in zip(candidate, reference).enumerated() {
-        // Compare only live token rows: reserved capacity rows past
-        // liveTokens are never written when the suffix zero-fill is skipped,
-        // so their (stale, unread) contents are allowed to differ.
-        let candidateOutput = pair.0.ndim == 5
-            ? pair.0[0..., 0..., 0..., 0..<liveTokens, 0...]
-            : pair.0
-        let referenceOutput = pair.1.ndim == 5
-            ? pair.1[0..., 0..., 0..., 0..<liveTokens, 0...]
-            : pair.1
+        let candidateOutput = pair.0
+        let referenceOutput = pair.1
         precondition(candidateOutput.dtype == .bfloat16)
         precondition(referenceOutput.dtype == .bfloat16)
         precondition(candidateOutput.shape == referenceOutput.shape)
@@ -1054,49 +894,6 @@ private func gemma4VerifyDirectPrefillAttentionRMSRoPEOutputs(
     )
 }
 
-/// Runtime bit check for the direct decode cache write: reruns the staging
-/// preparation and compares raw BF16 bits of the queries and of the freshly
-/// written cache row. The slab comparison is sequenced after the direct
-/// kernel through a zero-valued function of its queries output, so lazy
-/// evaluation cannot read the slab row before the direct write executes.
-func gemma4VerifyDecodeKVDirectWrite(
-    queries: MLXArray,
-    cacheStorage: MLXArray,
-    position: Int,
-    fusedAttentionRMS: FusedAttentionRMSPreparation,
-    rawQueries: MLXArray,
-    rawKeys: MLXArray,
-    rawValues: MLXArray?,
-    offset: Int
-) {
-    let reference = fusedAttentionRMS.callCombined(
-        rawQueries: rawQueries,
-        rawKeys: rawKeys,
-        rawValues: rawValues,
-        offset: offset
-    )
-    let sequencingZero = queries.sum().asType(.int32) * Int32(0)
-    let slabRowBits = cacheStorage[
-        0..., 0..., 0..., position..<(position + 1), 0...
-    ].view(dtype: .uint16).asType(.int32) + sequencingZero
-    let referenceBits = reference.combinedKV.view(dtype: .uint16)
-        .asType(.int32) + sequencingZero
-    let cacheMatches = arrayEqual(slabRowBits, referenceBits)
-    let queriesMatch = arrayEqual(
-        queries.view(dtype: .uint16),
-        reference.queries.view(dtype: .uint16)
-    )
-    eval(cacheMatches, queriesMatch)
-    precondition(
-        cacheMatches.item(Bool.self),
-        "decode KV direct write cache row differs from staging preparation"
-    )
-    precondition(
-        queriesMatch.item(Bool.self),
-        "decode KV direct write queries differ from staging preparation"
-    )
-}
-
 struct FusedAttentionRMSPreparation: @unchecked Sendable {
     let isSliding: Bool
     let headDim: Int
@@ -1105,7 +902,6 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
     let kNormWeight: MLXArray
     let positions: MLXArray
     let positionViews: [MLXArray]
-    let writePositionViews: [MLXArray]
     let ropeCosines: MLXArray
     let ropeSines: MLXArray
     private let directPrefillRMSRoPE: Bool
@@ -1135,7 +931,6 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
         self.kNormWeight = kNormWeight
         self.positions = gemma4AttentionRopeTables.positions
         self.positionViews = gemma4AttentionRopeTables.positionViews
-        self.writePositionViews = gemma4AttentionRopeTables.writePositionViews
         self.ropeCosines = isSliding
             ? gemma4AttentionRopeTables.slidingCosines
             : gemma4AttentionRopeTables.fullCosines
@@ -1244,68 +1039,6 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
         return (outputs[0], outputs[1])
     }
 
-    /// Direct cache-write decode variant for `Gemma4CombinedKVCache`. The K/V
-    /// rows are written in place into the combined cache slab at
-    /// `writePosition`, so no slice update dispatch is needed afterwards; only
-    /// the queries are returned. `cacheStorage` must be the cache's combined
-    /// `[2,1,Hkv,capacity,D]` storage; the kernel addresses it through its own
-    /// MLX strides, like the promoted strided prefill kernels. `offset` remains
-    /// the logical sequence position used for RoPE; `writePosition` is the
-    /// physical row inside the slab, which differs after a rotating-cache wrap.
-    func callCombinedDecodeDirect(
-        rawQueries: MLXArray,
-        rawKeys: MLXArray,
-        rawValues: MLXArray?,
-        offset: Int,
-        cacheStorage: MLXArray,
-        writePosition: Int,
-        capacity: Int
-    ) -> MLXArray {
-        let queryWidth = 32 * headDim
-        let kvWidth = kvHeads * headDim
-        precondition(rawQueries.dtype == .bfloat16)
-        precondition(rawKeys.dtype == .bfloat16)
-        precondition(rawQueries.shape == [1, 1, queryWidth])
-        precondition(rawKeys.shape == [1, 1, kvWidth])
-        let valueInput = rawValues ?? rawKeys
-        precondition(valueInput.dtype == .bfloat16)
-        precondition(valueInput.shape == [1, 1, kvWidth])
-        precondition(supports(offset: offset))
-        precondition(cacheStorage.dtype == .bfloat16)
-        precondition(cacheStorage.shape == [2, 1, kvHeads, capacity, headDim])
-        precondition(writePosition >= 0 && writePosition < capacity)
-
-        let threads = headDim / 4
-        let kernel = isSliding
-            ? gemma4FusedSlidingAttentionRMSCombinedDirect
-            : gemma4FusedFullAttentionRMSCombinedDirect
-        // The kernel binds the write position as a 0-d constant int32; serve
-        // it from the precomputed view table instead of allocating and
-        // uploading a fresh scalar array on every layer of every token.
-        let writePositionScalar: MLXArray
-        if gemma4PrecomputedScalarViewsEnabled(),
-           writePosition < writePositionViews.count
-        {
-            writePositionScalar = writePositionViews[writePosition]
-        } else {
-            writePositionScalar = MLXArray(Int32(writePosition))
-        }
-        let outputs = kernel(
-            [
-                rawQueries, rawKeys, valueInput, qNormWeight, kNormWeight,
-                positionViews[offset], ropeCosines, ropeSines,
-                cacheStorage, writePositionScalar,
-            ],
-            grid: (threads, 32 + (isSliding ? 2 * kvHeads : kvHeads), 1),
-            threadGroup: (threads, 1, 1),
-            outputShapes: [
-                [1, 32, 1, headDim]
-            ],
-            outputDTypes: [.bfloat16]
-        )
-        return outputs[0]
-    }
-
     /// Multi-token K/V preparation that writes the seed cache in its final
     /// K/V-major layout. The reserved suffix is zero-filled in the same kernel
     /// so the entire cache allocation is deterministic without a concatenate.
@@ -1371,8 +1104,7 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
             gemma4VerifyDirectPrefillAttentionRMSRoPEOutputs(
                 candidate: candidate,
                 reference: reference,
-                kind: isSliding ? "sliding_kv" : "full_kv",
-                liveTokens: length
+                kind: isSliding ? "sliding_kv" : "full_kv"
             )
         }
         let outputs = directPrefillRMSRoPE
@@ -1462,8 +1194,7 @@ struct FusedAttentionRMSPreparation: @unchecked Sendable {
             gemma4VerifyDirectPrefillAttentionRMSRoPEOutputs(
                 candidate: candidate,
                 reference: reference,
-                kind: isSliding ? "sliding_qkv" : "full_qkv",
-                liveTokens: length
+                kind: isSliding ? "sliding_qkv" : "full_qkv"
             )
         }
         let outputs = directPrefillRMSRoPE

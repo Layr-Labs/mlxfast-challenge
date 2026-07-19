@@ -101,10 +101,7 @@ struct CombinedAttentionPrefillProjection: @unchecked Sendable {
         precondition(input.ndim == 3 && input.dim(0) == 1 && input.dim(1) > 1)
         precondition(input.dim(2) == combined.weight.dim(1) * 8)
 
-        // BN32 narrow-residency qmm clone (DARKBLOOM_PREFILL_BN32_QMM,
-        // default on): bit-exact vs the stock combined quantizedMM.
-        let projected = gemma4PrefillBN32QMMDispatchIfSupported(
-            input, projection: combined)
+        let projected = combined(input)
         let qEnd = qWidth
         let kEnd = qEnd + kWidth
         let queries = projected[.ellipsis, 0..<qEnd]

@@ -41,119 +41,6 @@ private let gemma4VerifyStagedSlidingPrefillAttentionBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
-private let gemma4StagedFullPrefillAttentionEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_STAGED_FULL_PREFILL_ATTENTION"
-    ] else {
-        return true
-    }
-    return ["1", "true", "yes", "on"].contains(raw.lowercased())
-}()
-
-private let gemma4VerifyStagedFullPrefillAttentionBits: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_VERIFY_STAGED_FULL_PREFILL_ATTENTION_BITS"
-    ] else {
-        return false
-    }
-    return ["1", "true", "yes", "on"].contains(raw.lowercased())
-}()
-
-/// Rollback switch for the last-layer M=64 tail prune.
-///
-/// Default ON. At prefill lengths >= 128 the final transformer layer's
-/// post-attention chain (o_proj -> post-attn boundary -> gate/up -> gelu*mul
-/// -> down -> post-FFN boundary) influences only the last row's logits, so
-/// the chain runs on the last 64 supplied rows instead of all L. The
-/// layer's qkv/prep/attention/KV-write stays full-width (decode needs KV at
-/// every position). Every dispatched op in the pruned chain is
-/// row-independent at M=64 vs M=512: the frozen host dispatch sends both to
-/// the identical `affine_qmm_t_nax` pipeline (qmm_splitk picks split_k=1
-/// for N=5376 and N=21504 at both M values, and the kernel has a strictly
-/// ascending per-element K chain with no cross-row reduction), and the
-/// RMS/elementwise ops are per-row at any M, so the retained rows are
-/// bit-identical to the full-width chain. Set
-/// `DARKBLOOM_LAST_LAYER_TAIL_PRUNE=0` to restore the full-width chain.
-let gemma4LastLayerTailPruneEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_LAST_LAYER_TAIL_PRUNE"
-    ] else {
-        return true
-    }
-    return ["1", "true", "yes", "on"].contains(raw.lowercased())
-}()
-
-/// Raw-bit verify switch for the last-layer tail prune. Default OFF. When
-/// enabled, the final layer additionally runs the unpruned full-width chain
-/// and preconditions that its last 64 rows bit-match the pruned output.
-let gemma4VerifyLastLayerTailPruneBits: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_VERIFY_LAST_LAYER_TAIL_PRUNE_BITS"
-    ] else {
-        return false
-    }
-    return ["1", "true", "yes", "on"].contains(raw.lowercased())
-}()
-
-/// Rollback switch for the last-layer Q-side prune.
-///
-/// Default ON. At prefill lengths >= 128 the final layer (full attention,
-/// K==V shared) computes Q only for the last 64 supplied rows: the pruned
-/// post-attention chain consumes only those rows, Q is never cached, and
-/// logits are last-row only. K/V projection, K/V preparation, and the KV
-/// cache write stay full-width (decode needs KV at every position). The
-/// pruned attention runs the stock C++ SDPA fallback at [1, 32, 64, 512]
-/// with `.causal` (whose mask offset kL - qL = L - 64 is exactly the global
-/// causal bound of the retained rows). Every dispatched op is
-/// row-independent: separate q/k QMMs preserve the combined projection's
-/// per-element K chains (the CombinedAttentionPrefillProjection.verifyBits
-/// invariant), qmm_splitk selects split_k=1 at both M=512 and M=64 for
-/// N=16384/2048, and the attention fallback does not split K at these
-/// shapes, so the retained rows are bit-identical to the full-width path.
-/// Set `DARKBLOOM_LAST_LAYER_Q_PRUNE=0` to restore full-width Q.
-let gemma4LastLayerQPruneEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_LAST_LAYER_Q_PRUNE"
-    ] else {
-        return true
-    }
-    return ["1", "true", "yes", "on"].contains(raw.lowercased())
-}()
-
-/// Raw-bit verify switch for the last-layer Q-side prune. Default OFF. When
-/// enabled, the final layer additionally runs the full-width stock-SDPA
-/// attention and chain, and preconditions that the pruned 64-row attention
-/// output and the pruned layer output bit-match its last 64 rows.
-let gemma4VerifyLastLayerQPruneBits: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_VERIFY_LAST_LAYER_Q_PRUNE_BITS"
-    ] else {
-        return false
-    }
-    return ["1", "true", "yes", "on"].contains(raw.lowercased())
-}()
-
-/// Prefill pipeline chunk size, in layers. Default 18.
-///
-/// The ranked prefill is one lazy graph evaluated once at the head; the
-/// graph-end-to-final-eval boundary leaves dispatch bubbles. A
-/// scheduling-only `asyncEval` every N layers pulls GPU execution into the
-/// layer loop. Eighteen layers contain exactly three of Gemma 4's repeating
-/// five-sliding-plus-one-full attention motifs, making the first three chunks
-/// compute-balanced while preserving the promoted path's three intermediate
-/// evaluations. The computed values are unchanged -- same kernels, same
-/// accumulation order. Only engages for multi-token forwards (L > 1); decode
-/// is untouched. Set
-/// `DARKBLOOM_PREFILL_CHUNK_EVAL=0` to restore the single-eval schedule.
-let gemma4PrefillChunkEvalLayers: Int = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_PREFILL_CHUNK_EVAL"
-    ], let value = Int(raw) else {
-        return 18
-    }
-    return max(0, value)
-}()
-
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -207,9 +94,7 @@ private struct FastMLPTailWeights: @unchecked Sendable {
 }
 
 /// Approximate tanh-GELU using `x*x*x` (compile-safe), matching the library.
-/// Internal (not private) so GPU verification harnesses can reference the
-/// exact closure the engine compiles into its MLP tails.
-let fastGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
+private let fastGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray) -> MLXArray = { x in
         0.5 * x * (1 + tanh(sqrt(2 / Float.pi) * (x + 0.044715 * x * x * x)))
     }
@@ -265,7 +150,6 @@ final class Gemma4FastLayer {
     let rope: RoPELayer
     let fusedMLP: @Sendable (MLXArray) -> MLXArray
     let fusedMLPTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
-    let prefillGeluEpilogue: Gemma4PrefillGeluEpilogueMLPTail?
     let fusedGateUp: FusedGateUpProjection?
     let fusedGateUpPostTail: (@Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray)?
     let fusedGateUpActivation: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
@@ -301,11 +185,7 @@ final class Gemma4FastLayer {
         vIndexedMetadata: IndexedAffineMetadata?,
         gateIndexedMetadata: IndexedAffineMetadata?,
         upIndexedMetadata: IndexedAffineMetadata?,
-        downIndexedMetadata: IndexedAffineMetadata?,
-        qPackedIndexMetadata: Gemma4PackedQKVIndexMetadata? = nil,
-        kPackedIndexMetadata: Gemma4PackedQKVIndexMetadata? = nil,
-        vPackedIndexMetadata: Gemma4PackedQKVIndexMetadata? = nil,
-        coTiledAttentionPayload: Gemma4CoTiledAttentionPayload? = nil
+        downIndexedMetadata: IndexedAffineMetadata?
     ) {
         self.isSliding = isSliding
         self.nHeads = nHeads
@@ -359,13 +239,7 @@ final class Gemma4FastLayer {
                 v: vProjection,
                 qMetadata: qIndexedMetadata,
                 kMetadata: kIndexedMetadata,
-                vMetadata: vIndexedMetadata,
-                qPackedMetadata: qPackedIndexMetadata,
-                kPackedMetadata: kPackedIndexMetadata,
-                vPackedMetadata: vPackedIndexMetadata,
-                coTiledPayload: coTiledAttentionPayload?.kind == .slidingQKV
-                    ? coTiledAttentionPayload
-                    : nil
+                vMetadata: vIndexedMetadata
             )
         } else {
             self.fusedQKV = nil
@@ -393,12 +267,7 @@ final class Gemma4FastLayer {
                 q: qProjection,
                 k: kProjection,
                 qMetadata: qIndexedMetadata,
-                kMetadata: kIndexedMetadata,
-                qPackedMetadata: qPackedIndexMetadata,
-                kPackedMetadata: kPackedIndexMetadata,
-                coTiledPayload: coTiledAttentionPayload?.kind == .fullQK
-                    ? coTiledAttentionPayload
-                    : nil
+                kMetadata: kIndexedMetadata
             )
         } else {
             self.fusedQK = nil
@@ -532,28 +401,6 @@ final class Gemma4FastLayer {
         }
         self.fusedMLPTail = tailEnabled ? compile(shapeless: true, tailBody) : nil
 
-        // Fused prefill up-projection with GELU(gate)*up store epilogue
-        // (DARKBLOOM_PREFILL_GELU_EPILOGUE, default on): replaces the stock
-        // up qmm + compiled gelu·mul inside the prefill MLP tail with one NAX
-        // qmm clone whose store epilogue emits the activation directly,
-        // bit-exactly. Requires the stock compiled tail as the verify
-        // reference and the standard affine g64/b4 projection layouts;
-        // anything else keeps the stock tail.
-        if gemma4PrefillGeluEpilogueEnabled, let stockTail = self.fusedMLPTail {
-            self.prefillGeluEpilogue = Gemma4PrefillGeluEpilogueMLPTail(
-                gate: gateP,
-                up: upP,
-                down: downP,
-                preNormWeight: preFfnNorm.weight,
-                postNormWeight: postFfnNorm.weight,
-                layerScalar: layerScalar,
-                eps: eps,
-                stockTail: stockTail
-            )
-        } else {
-            self.prefillGeluEpilogue = nil
-        }
-
         let fusedGateUpEnabled: Bool
         if let raw = ProcessInfo.processInfo.environment["MLXFAST_FUSED_GATE_UP"] {
             fusedGateUpEnabled = ["1", "true", "yes", "on"].contains(raw.lowercased())
@@ -661,8 +508,7 @@ final class Gemma4FastLayer {
         _ x: MLXArray,
         normalizedInput: MLXArray?,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        cache: KVCache?,
-        pruneTail: Bool = false
+        cache: KVCache?
     ) -> Gemma4FastLayerResult {
         let residual = x
         let h: MLXArray
@@ -678,26 +524,6 @@ final class Gemma4FastLayer {
         let (B, L, _) = (h.dim(0), h.dim(1), h.dim(2))
         let offset = cache?.offset ?? 0
 
-        // C1: last-layer Q-side prune. Only full-attention K==V layers at
-        // prefill lengths >= 128, and only when the K/V-only combined
-        // prefill path is available (the ranked prefill shape always has
-        // both). The retained Q rows are the last 64 supplied rows, at their
-        // global RoPE offset.
-        let qPruneCapacity = pruneTail
-            && gemma4LastLayerQPruneEnabled
-            && B == 1
-            && L >= 128
-            && !isSliding
-            && vProj == nil
-            && h.dtype == .bfloat16
-            && gemma4CombinedKVPrefillEnabled()
-            && fusedAttentionRMS?.supportsPrefill(
-                offset: offset, length: L) == true
-            ? (cache as? Gemma4CombinedKVCache)?.directPrefillCapacity(for: L)
-            : nil
-        let qPruneRows = qPruneCapacity != nil ? 64 : 0
-        let qPruneStart = L - qPruneRows
-
         let rawQueries: MLXArray
         let rawKeys: MLXArray
         let rawValues: MLXArray?
@@ -710,20 +536,6 @@ final class Gemma4FastLayer {
             let projected = fusedQK(h)
             rawQueries = projected.0
             rawKeys = projected.1
-            rawValues = nil
-        } else if qPruneRows > 0 {
-            // K full-width (decode needs every row's KV); Q on the retained
-            // 64 rows only. Separate q/k QMMs preserve the combined
-            // projection's per-element K chains (the
-            // CombinedAttentionPrefillProjection.verifyBits invariant), and
-            // qmm_splitk selects split_k=1 at both M=512 and M=64 for
-            // N=16384 and N=2048, so the retained rows are bit-identical.
-            // The BN32 clone dispatches are bit-identical to those stock
-            // QMMs at both widths, so the invariant is preserved.
-            rawQueries = gemma4PrefillBN32QMMDispatchIfSupported(
-                h[0..., qPruneStart..<L, 0...], projection: qProj)
-            rawKeys = gemma4PrefillBN32QMMDispatchIfSupported(
-                h, projection: kProj)
             rawValues = nil
         } else if B == 1,
                   L > 1,
@@ -769,49 +581,16 @@ final class Gemma4FastLayer {
            let fusedAttentionRMS,
            let combinedCache
         {
-            if gemma4DecodeKVDirectWriteEnabled(),
-               let target = combinedCache.directDecodeWriteTarget()
-            {
-                // The preparation kernel writes the K/V rows straight into the
-                // combined slab at `target.position`; no slice update dispatch.
-                queries = fusedAttentionRMS.callCombinedDecodeDirect(
-                    rawQueries: rawQueries,
-                    rawKeys: rawKeys,
-                    rawValues: rawValues,
-                    offset: offset,
-                    cacheStorage: target.storage,
-                    writePosition: target.position,
-                    capacity: target.storage.dim(3)
-                )
-                let updated = combinedCache.adoptDirectDecodeWrite(
-                    position: target.position
-                )
-                keys = updated.0
-                values = updated.1
-                if gemma4VerifyDecodeKVDirectWriteBitsEnabled() {
-                    gemma4VerifyDecodeKVDirectWrite(
-                        queries: queries,
-                        cacheStorage: target.storage,
-                        position: target.position,
-                        fusedAttentionRMS: fusedAttentionRMS,
-                        rawQueries: rawQueries,
-                        rawKeys: rawKeys,
-                        rawValues: rawValues,
-                        offset: offset
-                    )
-                }
-            } else {
-                let prepared = fusedAttentionRMS.callCombined(
-                    rawQueries: rawQueries,
-                    rawKeys: rawKeys,
-                    rawValues: rawValues,
-                    offset: offset
-                )
-                queries = prepared.queries
-                let updated = combinedCache.updateCombined(prepared.combinedKV)
-                keys = updated.0
-                values = updated.1
-            }
+            let prepared = fusedAttentionRMS.callCombined(
+                rawQueries: rawQueries,
+                rawKeys: rawKeys,
+                rawValues: rawValues,
+                offset: offset
+            )
+            queries = prepared.queries
+            let updated = combinedCache.updateCombined(prepared.combinedKV)
+            keys = updated.0
+            values = updated.1
         } else if usesFusedAttentionPreparation, let fusedAttentionRMS {
             let prepared = fusedAttentionRMS(
                 rawQueries: rawQueries,
@@ -822,30 +601,6 @@ final class Gemma4FastLayer {
             queries = prepared.0
             keys = prepared.1
             values = prepared.2
-        } else if qPruneRows > 0,
-                  let fusedAttentionRMS,
-                  let combinedCache,
-                  let qPruneCapacity
-        {
-            // Q: stock eager path on the 64 retained rows at their global
-            // RoPE offset (rmsNorm and RoPE are row-independent, so these
-            // rows are bit-identical to the full-width preparation).
-            queries = rawQueries.reshaped(B, qPruneRows, nHeads, headDim)
-            queries = MLXFast.rmsNorm(queries, weight: qNormWeight, eps: eps)
-            queries = queries.transposed(0, 2, 1, 3)
-            queries = rope(queries, offset: qPruneStart)
-            // K/V: the same K/V-only combined prefill the unpruned path
-            // uses, full-width, so decode keeps KV at every position.
-            let combined = fusedAttentionRMS.callCombinedPrefill(
-                rawKeys: rawKeys,
-                rawValues: rawValues,
-                offset: offset,
-                length: L,
-                capacity: qPruneCapacity
-            )
-            let updated = combinedCache.adoptDirectPrefill(combined, length: L)
-            keys = updated.0
-            values = updated.1
         } else if usesCombinedQKVPrefillPreparation,
                   let fusedAttentionRMS,
                   let combinedCache,
@@ -881,10 +636,8 @@ final class Gemma4FastLayer {
                     referenceQueries.view(dtype: .uint16)
                 )
                 let combinedKVMatches = arrayEqual(
-                    candidate.combinedKV[0..., 0..., 0..., 0..<L, 0...]
-                        .view(dtype: .uint16),
-                    referenceCombinedKV[0..., 0..., 0..., 0..<L, 0...]
-                        .view(dtype: .uint16)
+                    candidate.combinedKV.view(dtype: .uint16),
+                    referenceCombinedKV.view(dtype: .uint16)
                 )
                 eval(queriesMatch, combinedKVMatches)
                 precondition(
@@ -1001,7 +754,7 @@ final class Gemma4FastLayer {
             }
         }
 
-        let mergedAttention: MLXArray
+        let attention: MLXArray
         let canUseStagedSlidingPrefill = B == 1
             && L == 512
             && offset == 0
@@ -1010,54 +763,15 @@ final class Gemma4FastLayer {
             && queries.shape == [1, 32, 512, 256]
             && keys.shape == [1, 16, 512, 256]
             && values.shape == [1, 16, 512, 256]
-        // Full-attention analog (P2): the ten full layers at the ranked
-        // prefill shape. At B=1, L=512, offset 0 the engine-constructed full
-        // mask is always the symbolic `.causal` (no window), which is exactly
-        // the mask the staged kernel reproduces.
-        let canUseStagedFullPrefill = B == 1
-            && L == 512
-            && offset == 0
-            && !isSliding
-            && queries.dtype == .bfloat16
-            && queries.shape == [1, 32, 512, 512]
-            && keys.shape == [1, 4, 512, 512]
-            && values.shape == [1, 4, 512, 512]
-        if qPruneRows > 0 {
-            // Stock C++ SDPA fallback on the 64 retained query rows. Its
-            // `.causal` mask uses offset kL - qL = L - 64 (fast.cpp), which
-            // is exactly the retained rows' global causal bound; every row's
-            // QK/softmax/PV reduction is row-independent, so the output rows
-            // are bit-identical to the full-width attention's last 64 rows.
-            let attention = MLXFast.scaledDotProductAttention(
-                queries: queries,
-                keys: keys,
-                values: values,
-                scale: scale,
-                mask: .causal
-            )
-            mergedAttention = attention.transposed(0, 2, 1, 3)
-                .reshaped(B, qPruneRows, -1)
-        } else if canUseStagedSlidingPrefill
+        if canUseStagedSlidingPrefill
             && (gemma4StagedSlidingPrefillAttentionEnabled
                 || gemma4VerifyStagedSlidingPrefillAttentionBits)
         {
-            // Merges head-major [1, 32, 512, 256] attention into the
-            // token-major [1, 512, 32*256] layout o_proj consumes. The
-            // reshape of the transposed view materializes a copy.
-            func mergeHeadMajor(_ attention: MLXArray) -> MLXArray {
-                attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
-            }
-            // With token-major emission enabled the staged kernel already
-            // writes [1, 512, 32*256] directly (identical values, different
-            // addresses), so no transpose-reshape copy is needed here.
             let candidate = gemma4StagedSlidingPrefill512(
                 queries: queries,
                 keys: keys,
                 values: values
             )
-            let mergedCandidate = gemma4StagedPrefillTokenMajorOutputEnabled
-                ? candidate
-                : mergeHeadMajor(candidate)
             if gemma4VerifyStagedSlidingPrefillAttentionBits {
                 let reference = MLXFast.scaledDotProductAttention(
                     queries: queries,
@@ -1066,136 +780,48 @@ final class Gemma4FastLayer {
                     scale: scale,
                     mask: attentionMask
                 )
-                // Compare raw bits in the staged kernel's own output layout.
-                // For token-major emission the reference is relaid out with
-                // the same transpose+reshape merge -- a bijective relayout,
-                // so every element is still compared exactly once.
-                let comparisonReference = gemma4StagedPrefillTokenMajorOutputEnabled
-                    ? mergeHeadMajor(reference)
-                    : reference
                 let matches = arrayEqual(
                     candidate.view(dtype: .uint16),
-                    comparisonReference.view(dtype: .uint16)
+                    reference.view(dtype: .uint16)
                 )
                 eval(matches)
                 precondition(
                     matches.item(Bool.self),
                     "staged sliding prefill attention differs from stock SDPA"
                 )
-                mergedAttention = gemma4StagedSlidingPrefillAttentionEnabled
-                    ? mergedCandidate
-                    : mergeHeadMajor(reference)
+                attention = gemma4StagedSlidingPrefillAttentionEnabled
+                    ? candidate
+                    : reference
             } else {
-                mergedAttention = mergedCandidate
+                attention = candidate
             }
-        } else if canUseStagedFullPrefill
-            && (gemma4StagedFullPrefillAttentionEnabled
-                || gemma4VerifyStagedFullPrefillAttentionBits)
-        {
-            // Merges head-major [1, 32, 512, 512] attention into the
-            // token-major [1, 512, 32*512] layout o_proj consumes. The
-            // reshape of the transposed view materializes a copy.
-            func mergeHeadMajor(_ attention: MLXArray) -> MLXArray {
-                attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
-            }
-            // With token-major emission enabled the staged kernel already
-            // writes [1, 512, 32*512] directly (identical values, different
-            // addresses), so no transpose-reshape copy is needed here.
-            let candidate = gemma4StagedFullPrefill512(
+        } else if L > 1 && offset > 0 {
+            attention = gemma4FastAttentionFallback(
                 queries: queries,
                 keys: keys,
-                values: values
+                values: values,
+                scale: scale,
+                mask: attentionMask
             )
-            let mergedCandidate = gemma4StagedPrefillTokenMajorOutputEnabled
-                ? candidate
-                : mergeHeadMajor(candidate)
-            if gemma4VerifyStagedFullPrefillAttentionBits {
-                let reference = MLXFast.scaledDotProductAttention(
-                    queries: queries,
-                    keys: keys,
-                    values: values,
-                    scale: scale,
-                    mask: attentionMask
-                )
-                // Compare raw bits in the staged kernel's own output layout.
-                // For token-major emission the reference is relaid out with
-                // the same transpose+reshape merge -- a bijective relayout,
-                // so every element is still compared exactly once.
-                let comparisonReference = gemma4StagedPrefillTokenMajorOutputEnabled
-                    ? mergeHeadMajor(reference)
-                    : reference
-                let matches = arrayEqual(
-                    candidate.view(dtype: .uint16),
-                    comparisonReference.view(dtype: .uint16)
-                )
-                eval(matches)
-                precondition(
-                    matches.item(Bool.self),
-                    "staged full prefill attention differs from stock SDPA"
-                )
-                mergedAttention = gemma4StagedFullPrefillAttentionEnabled
-                    ? mergedCandidate
-                    : mergeHeadMajor(reference)
-            } else {
-                mergedAttention = mergedCandidate
-            }
         } else {
-            let attention: MLXArray
-            if L > 1 && offset > 0 {
-                attention = gemma4FastAttentionFallback(
-                    queries: queries,
-                    keys: keys,
-                    values: values,
-                    scale: scale,
-                    mask: attentionMask
-                )
-            } else {
-                // Prefer library SDPA: D=256 sliding uses fused vector kernel;
-                // D=512 full uses its internal fallback. Compiling our own D=512
-                // fallback changes the public near-tie reduction order.
-                attention = MLXFast.scaledDotProductAttention(
-                    queries: queries,
-                    keys: keys,
-                    values: values,
-                    scale: scale,
-                    mask: attentionMask
-                )
-            }
-            mergedAttention = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            // Prefer library SDPA: D=256 sliding uses fused vector kernel;
+            // D=512 full uses its internal fallback. Compiling our own D=512
+            // fallback changes the public near-tie reduction order.
+            attention = MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: keys,
+                values: values,
+                scale: scale,
+                mask: attentionMask
+            )
         }
-        // Last-layer tail prune: at prefill lengths >= 128 the post-attention
-        // chain of the final layer influences only the last row's logits, so
-        // o_proj, the boundary, and the whole MLP tail run on the last 64
-        // supplied rows (a metadata-only view -- 64 real rows, no padding).
-        // The qkv/prep/attention/KV-write above already ran full-width, so
-        // decode keeps KV at every position. Every op in the pruned chain is
-        // row-independent at M=64 vs full width: the frozen host dispatch
-        // (QuantizedMatmul::eval_gpu -> qmm_splitk) selects split_k=1 for
-        // N=5376 and N=21504 at both M=512 and M=64 and forwards to the same
-        // affine_qmm_t_nax pipeline, whose per-element K chain is strictly
-        // ascending with no cross-row reduction; RMS norms and elementwise
-        // ops are per-row at any M. The retained rows are therefore
-        // bit-identical to the full-width chain.
-        let tailStart = pruneTail && gemma4LastLayerTailPruneEnabled
-            && qPruneRows == 0 && B == 1 && L >= 128 ? L - 64 : 0
-        let chainAttention = tailStart > 0
-            ? mergedAttention[0..., tailStart..<L, 0...]
-            : mergedAttention
-        let chainResidual = tailStart > 0
-            ? residual[0..., tailStart..<L, 0...]
-            : qPruneRows > 0
-                ? residual[0..., qPruneStart..<L, 0...]
-                : residual
+
+        let mergedAttention = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         let attnOut: MLXArray
         if B == 1, L == 1, let indexedOutput {
             attnOut = indexedOutput(mergedAttention)
         } else {
-            // BN32 narrow-residency qmm clone
-            // (DARKBLOOM_PREFILL_BN32_QMM, default on): bit-exact vs the
-            // stock o_proj quantizedMM at both full width and the M=64
-            // pruned tail.
-            attnOut = gemma4PrefillBN32QMMDispatchIfSupported(
-                chainAttention, projection: oProj)
+            attnOut = oProj(mergedAttention)
         }
         var out: MLXArray
         let residual2: MLXArray
@@ -1215,7 +841,7 @@ final class Gemma4FastLayer {
             residual2 = prepared.0
             fusedPreFFNNormalized = prepared.1
         } else {
-            out = chainResidual + MLXFast.rmsNorm(
+            out = residual + MLXFast.rmsNorm(
                 attnOut, weight: postAttnNormWeight, eps: eps)
             residual2 = out
             fusedPreFFNNormalized = nil
@@ -1247,121 +873,13 @@ final class Gemma4FastLayer {
                 out = fusedGateUpPostTail(gateOutput, upOutput, residual2)
             }
         } else if let fusedMLPTail {
-            if let geluEpilogue = prefillGeluEpilogue, geluEpilogue.supports(B: B, L: L) {
-                if gemma4VerifyPrefillGeluEpilogueBits {
-                    let reference = fusedMLPTail(out, residual2)
-                    let candidate = geluEpilogue(out, residual2)
-                    let matches = arrayEqual(
-                        candidate.view(dtype: .uint16),
-                        reference.view(dtype: .uint16)
-                    )
-                    eval(matches)
-                    precondition(
-                        matches.item(Bool.self),
-                        "prefill GELU epilogue differs from stock MLP tail"
-                    )
-                    out = candidate
-                } else {
-                    out = geluEpilogue(out, residual2)
-                }
-            } else {
-                out = fusedMLPTail(out, residual2)
-            }
+            out = fusedMLPTail(out, residual2)
         } else {
             out = MLXFast.rmsNorm(out, weight: preFfnNormWeight, eps: eps)
             out = fusedMLP(out)
             out = MLXFast.rmsNorm(out, weight: postFfnNormWeight, eps: eps)
             out = residual2 + out
             out = out * layerScalar
-        }
-        if qPruneRows > 0 && gemma4VerifyLastLayerQPruneBits {
-            // Full-width reference: stock eager Q over every row plus the
-            // stock C++ SDPA fallback -- the unpruned path. The reference Q
-            // projection is bit-identical to the combined projection's Q
-            // slice (the CombinedAttentionPrefillProjection.verifyBits
-            // invariant), and the K/V arrays are the same ones the pruned
-            // attention consumed.
-            var referenceQueries = qProj(h).reshaped(B, L, nHeads, headDim)
-            referenceQueries = MLXFast.rmsNorm(
-                referenceQueries, weight: qNormWeight, eps: eps)
-            referenceQueries = referenceQueries.transposed(0, 2, 1, 3)
-            referenceQueries = rope(referenceQueries, offset: offset)
-            let referenceAttention = MLXFast.scaledDotProductAttention(
-                queries: referenceQueries,
-                keys: keys,
-                values: values,
-                scale: scale,
-                mask: .causal
-            )
-            let referenceMerged = referenceAttention.transposed(0, 2, 1, 3)
-                .reshaped(B, L, -1)
-            let attentionMatches = arrayEqual(
-                mergedAttention.view(dtype: .uint16),
-                referenceMerged[0..., qPruneStart..<L, 0...].view(dtype: .uint16)
-            )
-            eval(attentionMatches)
-            precondition(
-                attentionMatches.item(Bool.self),
-                "last-layer Q-side prune attention differs from full-width"
-            )
-            // Chain-level reference: the full-width post-attention chain's
-            // last 64 rows must bit-match the pruned chain output. The
-            // fusedMLPTail reference is bit-identical to the production
-            // chain (the GELU epilogue carries its own raw-bit contract
-            // against fusedMLPTail).
-            let referenceAttnOut = oProj(referenceMerged)
-            let referenceBoundary = residual + MLXFast.rmsNorm(
-                referenceAttnOut, weight: postAttnNormWeight, eps: eps)
-            let referenceOut: MLXArray
-            if let fusedMLPTail {
-                referenceOut = fusedMLPTail(
-                    referenceBoundary, referenceBoundary)
-            } else {
-                var full = MLXFast.rmsNorm(
-                    referenceBoundary, weight: preFfnNormWeight, eps: eps)
-                full = fusedMLP(full)
-                full = MLXFast.rmsNorm(
-                    full, weight: postFfnNormWeight, eps: eps)
-                referenceOut = (referenceBoundary + full) * layerScalar
-            }
-            let chainMatches = arrayEqual(
-                out.view(dtype: .uint16),
-                referenceOut[0..., qPruneStart..<L, 0...].view(dtype: .uint16)
-            )
-            eval(chainMatches)
-            precondition(
-                chainMatches.item(Bool.self),
-                "last-layer Q-side prune output differs from full-width chain"
-            )
-        }
-        if tailStart > 0 && gemma4VerifyLastLayerTailPruneBits {
-            // Full-width reference over the identical post-attention ops:
-            // the pruned output must bit-match its last 64 rows. The layer's
-            // KV slabs are upstream of the prune point (attention ran
-            // full-width), so they are identical by construction.
-            let referenceAttnOut = oProj(mergedAttention)
-            let referenceBoundary = residual + MLXFast.rmsNorm(
-                referenceAttnOut, weight: postAttnNormWeight, eps: eps)
-            let referenceOut: MLXArray
-            if let fusedMLPTail {
-                referenceOut = fusedMLPTail(referenceBoundary, referenceBoundary)
-            } else {
-                var full = MLXFast.rmsNorm(
-                    referenceBoundary, weight: preFfnNormWeight, eps: eps)
-                full = fusedMLP(full)
-                full = MLXFast.rmsNorm(full, weight: postFfnNormWeight, eps: eps)
-                referenceOut = (referenceBoundary + full) * layerScalar
-            }
-            let reference = referenceOut[0..., tailStart..<L, 0...]
-            let matches = arrayEqual(
-                out.view(dtype: .uint16),
-                reference.view(dtype: .uint16)
-            )
-            eval(matches)
-            precondition(
-                matches.item(Bool.self),
-                "last-layer tail prune output differs from the full-width chain"
-            )
         }
         return Gemma4FastLayerResult(
             hidden: out,
@@ -1624,21 +1142,11 @@ final class Gemma4FastEngine {
     let verifyTiedVocabularyHead: Bool
     let supportsExactMTPPair: Bool
     private let logitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray
-    /// Persistent 0-d softcap array reused on every decode step when
-    /// `DARKBLOOM_PRECOMPUTED_SCALAR_VIEWS` is on; nil restores the per-call
-    /// `MLXArray(softcap)` allocation. Same value, same kernel input.
-    private let precomputedSoftcap: MLXArray?
-    /// Fused single-dispatch decode embedding (gather + dequantize + scale).
-    /// nil when unsupported or `DARKBLOOM_FUSED_DECODE_EMBED=0`.
-    private let fusedDecodeEmbed: Gemma4FusedDecodeEmbed?
 
     init(
         model: Gemma4RuntimeModel,
         indexedMetadata: [String: IndexedAffineMetadata] = [:],
-        packedIndexMetadata: [String: Gemma4PackedQKVIndexMetadata] = [:],
-        coTiledAttentionPayloads: [String: Gemma4CoTiledAttentionPayload] = [:],
-        tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata? = nil,
-        tiedHeadCoTiledPayload: Gemma4TiedHeadCoTiledPayload? = nil
+        tiedHeadPacked13Metadata: Gemma4TiedHeadPacked13Metadata? = nil
     ) throws {
         let config = model.configuration
         self.embedScale = Float(config.hiddenSize).squareRoot()
@@ -1683,17 +1191,6 @@ final class Gemma4FastEngine {
 
         let loadedEmbedTokens = try module("model.embed_tokens", as: Embedding.self)
         self.embedTokens = loadedEmbedTokens
-        if gemma4PrecomputedScalarViewsEnabled() {
-            let cap = MLXArray(softcap)
-            eval(cap)
-            self.precomputedSoftcap = cap
-        } else {
-            self.precomputedSoftcap = nil
-        }
-        self.fusedDecodeEmbed = Gemma4FusedDecodeEmbed(
-            loadedEmbedTokens,
-            embedScale: embedScale
-        )
         let tiedHeadRequested = ["1", "true", "yes", "on"].contains(
             ProcessInfo.processInfo.environment["DARKBLOOM_TIED_HEAD_QMV"]?
                 .lowercased() ?? "0"
@@ -1728,8 +1225,7 @@ final class Gemma4FastEngine {
         if productionTiedHead || tiedHeadRequested || verifyTiedHead {
             guard let tiedVocabularyHead = Gemma4TiedVocabularyHead(
                 loadedEmbedTokens,
-                packed13Metadata: tiedHeadPacked13Metadata,
-                coTiledPayload: tiedHeadCoTiledPayload
+                packed13Metadata: tiedHeadPacked13Metadata
             ) else {
                 throw MLXFastError.invalidInput(
                     "opt-in tied vocabulary head requires affine 4-bit "
@@ -1847,12 +1343,7 @@ final class Gemma4FastEngine {
                     vIndexedMetadata: indexedMetadata["\(prefix).self_attn.v_proj"],
                     gateIndexedMetadata: indexedMetadata["\(prefix).mlp.gate_proj"],
                     upIndexedMetadata: indexedMetadata["\(prefix).mlp.up_proj"],
-                    downIndexedMetadata: indexedMetadata["\(prefix).mlp.down_proj"],
-                    qPackedIndexMetadata: packedIndexMetadata["\(prefix).self_attn.q_proj"],
-                    kPackedIndexMetadata: packedIndexMetadata["\(prefix).self_attn.k_proj"],
-                    vPackedIndexMetadata: packedIndexMetadata["\(prefix).self_attn.v_proj"],
-                    coTiledAttentionPayload:
-                        coTiledAttentionPayloads["\(prefix).self_attn"]
+                    downIndexedMetadata: indexedMetadata["\(prefix).mlp.down_proj"]
                 )
             )
         }
@@ -1875,16 +1366,7 @@ final class Gemma4FastEngine {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var hidden: MLXArray
-        if inputs.ndim == 2, inputs.dim(0) == 1, inputs.dim(1) == 1,
-           inputs.dtype == .int32, let fusedDecodeEmbed
-        {
-            // Single-token decode: one fused gather+dequantize+scale kernel
-            // replaces the five-dispatch stock chain, bit-identical output.
-            hidden = fusedDecodeEmbed(inputs)
-        } else {
-            hidden = embedTokens(inputs) * embedScale
-        }
+        var hidden = embedTokens(inputs) * embedScale
 
         func layerCache(_ index: Int) -> KVCache? {
             guard let cache, index < cache.count else { return nil }
@@ -1911,26 +1393,11 @@ final class Gemma4FastEngine {
                 hidden,
                 normalizedInput: normalizedInput,
                 mask: mask,
-                cache: layerCache(index),
-                pruneTail: index == layers.count - 1
+                cache: layerCache(index)
             )
             hidden = result.hidden
             normalizedInput = result.nextNormalized
             let layerNumber = index + 1
-            // Prefill pipeline chunking: the ranked prefill is one lazy
-            // graph evaluated once at the head, which leaves dispatch
-            // bubbles between graph-end and the giant final eval. A
-            // scheduling-only asyncEval every N layers pulls that GPU
-            // execution into the layer loop and overlaps it with the
-            // remaining graph construction. The default 18-layer chunks each
-            // contain three complete 5-sliding + 1-full attention motifs;
-            // kernels and accumulation order are unchanged.
-            if gemma4PrefillChunkEvalLayers > 0,
-               inputs.dim(1) > 1,
-               layerNumber.isMultiple(of: gemma4PrefillChunkEvalLayers)
-            {
-                asyncEval(hidden)
-            }
             if inputs.dim(1) == 1,
                asyncLayerGroup > 0,
                layerNumber >= asyncLayerLead,
@@ -1950,7 +1417,7 @@ final class Gemma4FastEngine {
             hidden = gemma4LastTokenHidden(hidden)
             hidden = MLXFast.rmsNorm(hidden, weight: finalNormWeight, eps: eps)
         }
-        let cap = precomputedSoftcap ?? MLXArray(softcap)
+        let cap = MLXArray(softcap)
         if let tiedVocabularyHead, usePacked13TiedVocabularyHead {
             let candidate = tiedVocabularyHead.packed13Softcapped(
                 hidden,
@@ -2061,7 +1528,7 @@ final class Gemma4FastEngine {
         }
         let logits = tiedVocabularyHead.exactTwoVectorPacked13Softcapped(
             normalizedInput,
-            cap: precomputedSoftcap ?? MLXArray(softcap)
+            cap: MLXArray(softcap)
         )
         return Gemma4MTPForward(
             logits: logits.reshaped(1, 2, logits.dim(-1)),
@@ -2147,7 +1614,7 @@ final class Gemma4FastEngine {
                 eps: eps
             )
         }
-        let cap = precomputedSoftcap ?? MLXArray(softcap)
+        let cap = MLXArray(softcap)
         let logits: MLXArray
         if let tiedVocabularyHead, usePacked13TiedVocabularyHead {
             let positionLogits = (0..<postNorm.dim(1)).map {

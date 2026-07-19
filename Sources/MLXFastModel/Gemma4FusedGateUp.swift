@@ -106,164 +106,6 @@ func gemma4Pack12BitGateUpIndexWords(
     return words
 }
 
-/// Rollback switch for the 12-bit gate/up co-tile tail packing (C3).
-///
-/// Default ON. The 21st block's four tail indexes per row are stored at 12
-/// bits (6 bytes/row) instead of lane-major U16 (8 bytes/row), saving
-/// 2 B/row/projection across the co-tiled gate/up payload (~4.8 MB/token
-/// over 56 layers). The decoded LUT indexes are identical; only the
-/// payload encoding changes (runtime-side repack from the same packed12
-/// stream; no transform change). Set `DARKBLOOM_GATEUP_COTILE_TAIL12=0`
-/// to restore the U16 tail layout.
-let gemma4GateUpCoTileTail12Enabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_GATEUP_COTILE_TAIL12"
-    ] else {
-        return true
-    }
-    return ["1", "true", "yes", "on"].contains(raw.lowercased())
-}()
-
-/// Repack the packed12 gate/up streams' U16 tail blocks (words 30-31 of
-/// each 32-word row) at 12 bits: four indexes per row become six bytes
-/// (`b0 = t0.lo, b1 = t1.lo, b2 = t0.hi | t1.hi << 4`, then the same for
-/// t2/t3), matching the co-tiled kernel's nibble extraction. The per-
-/// threadgroup region is the gate rows' 24 bytes followed by the up rows'
-/// 24 bytes, little-endian packed into twelve U32 words. Returns nil if
-/// any tail index needs more than 12 bits (impossible for a validated
-/// packed12 stream).
-func gemma4MakeCoTiledGateUpTail12Metadata(
-    gatePacked: [UInt32],
-    upPacked: [UInt32],
-    threadgroupCount: Int
-) -> MLXArray? {
-    let wordsPerRow = 32
-    let rowsPerThreadgroup = 4
-    let rowCount = threadgroupCount * rowsPerThreadgroup
-    guard gatePacked.count == rowCount * wordsPerRow,
-          upPacked.count == rowCount * wordsPerRow
-    else { return nil }
-
-    func tailBytes(_ packed: [UInt32], _ row: Int) -> [UInt8]? {
-        let base = row * wordsPerRow + 30
-        let t0 = Int(packed[base] & 0xFFFF)
-        let t1 = Int(packed[base] >> 16)
-        let t2 = Int(packed[base + 1] & 0xFFFF)
-        let t3 = Int(packed[base + 1] >> 16)
-        guard t0 < 4_096, t1 < 4_096, t2 < 4_096, t3 < 4_096 else {
-            return nil
-        }
-        return [
-            UInt8(truncatingIfNeeded: t0),
-            UInt8(truncatingIfNeeded: t1),
-            UInt8((t0 >> 8) | ((t1 >> 8) << 4)),
-            UInt8(truncatingIfNeeded: t2),
-            UInt8(truncatingIfNeeded: t3),
-            UInt8((t2 >> 8) | ((t3 >> 8) << 4)),
-        ]
-    }
-
-    var bytes = [UInt8]()
-    bytes.reserveCapacity(threadgroupCount * 48)
-    for threadgroup in 0..<threadgroupCount {
-        for packed in [gatePacked, upPacked] {
-            for rowWithin in 0..<rowsPerThreadgroup {
-                guard let tail = tailBytes(
-                    packed, threadgroup * rowsPerThreadgroup + rowWithin)
-                else { return nil }
-                bytes.append(contentsOf: tail)
-            }
-        }
-    }
-    var words = [UInt32](repeating: 0, count: bytes.count / 4)
-    for wordIndex in words.indices {
-        let byteIndex = wordIndex * 4
-        words[wordIndex] = UInt32(bytes[byteIndex])
-            | (UInt32(bytes[byteIndex + 1]) << 8)
-            | (UInt32(bytes[byteIndex + 2]) << 16)
-            | (UInt32(bytes[byteIndex + 3]) << 24)
-    }
-    return MLXArray(words, [threadgroupCount, 12])
-}
-
-/// Fixed13 sibling of `gemma4Pack12BitGateUpIndices` for the U16-fallback
-/// layers whose LUT needs more than 12 bits: the same three coalesced byte
-/// planes per two-block pair, plus one trailing byte carrying the eight top
-/// bits (bit `g` = even index bit 12, bit `4+g` = odd index bit 12), for
-/// thirteen bytes per pair. The unpaired final block keeps the eight
-/// lane-major bytes (two bytes natively carry 13 bits). Rows are padded to
-/// four-byte alignment, so Gemma's 84 indexes occupy 140 bytes.
-///
-/// The byte layout is identical to the transform-authored QKV fixed13 form
-/// (`PackedProjectionMetadataCoding`, `indexBits == 13`); a CPU test pins the
-/// two implementations together.
-func gemma4Pack13BitGateUpIndices(
-    _ indices: [UInt16],
-    rows: Int,
-    groupsPerRow: Int
-) -> [UInt8]? {
-    guard rows > 0,
-          groupsPerRow > 0,
-          groupsPerRow.isMultiple(of: 4)
-    else {
-        return nil
-    }
-    let (elementCount, elementOverflow) = rows.multipliedReportingOverflow(
-        by: groupsPerRow)
-    guard !elementOverflow, indices.count == elementCount else { return nil }
-
-    let blockCount = groupsPerRow / 4
-    let blockPairCount = blockCount / 2
-    let tailBlockCount = blockCount % 2
-    let (pairBytes, pairBytesOverflow) = blockPairCount.multipliedReportingOverflow(by: 13)
-    guard !pairBytesOverflow else { return nil }
-    let (payloadBytes, payloadOverflow) = pairBytes.addingReportingOverflow(
-        tailBlockCount * 8)
-    guard !payloadOverflow else { return nil }
-    let (roundedBytes, roundedOverflow) = payloadBytes.addingReportingOverflow(3)
-    guard !roundedOverflow else { return nil }
-    let bytesPerRow = (roundedBytes / 4) * 4
-    let (byteCount, byteOverflow) = rows.multipliedReportingOverflow(by: bytesPerRow)
-    guard !byteOverflow else { return nil }
-
-    var bytes = [UInt8](repeating: 0, count: byteCount)
-    for row in 0..<rows {
-        let inputBase = row * groupsPerRow
-        let outputBase = row * bytesPerRow
-
-        for blockPair in 0..<blockPairCount {
-            let inputPairBase = inputBase + blockPair * 8
-            let outputPairBase = outputBase + blockPair * 13
-            var topBits: UInt8 = 0
-            for laneGroup in 0..<4 {
-                let even = indices[inputPairBase + laneGroup]
-                let odd = indices[inputPairBase + 4 + laneGroup]
-                guard even < 8_192, odd < 8_192 else { return nil }
-                bytes[outputPairBase + laneGroup] = UInt8(truncatingIfNeeded: even)
-                bytes[outputPairBase + 4 + laneGroup] =
-                    UInt8(((even >> 8) & 0x0f) | ((odd & 0x000f) << 4))
-                bytes[outputPairBase + 8 + laneGroup] = UInt8((odd >> 4) & 0xff)
-                topBits |= UInt8((even >> 12) & 1) << laneGroup
-                topBits |= UInt8((odd >> 12) & 1) << (4 + laneGroup)
-            }
-            bytes[outputPairBase + 12] = topBits
-        }
-
-        if tailBlockCount == 1 {
-            let inputTailBase = inputBase + blockPairCount * 8
-            let outputTailBase = outputBase + blockPairCount * 13
-            for laneGroup in 0..<4 {
-                let value = indices[inputTailBase + laneGroup]
-                guard value < 8_192 else { return nil }
-                let laneOffset = outputTailBase + laneGroup * 2
-                bytes[laneOffset] = UInt8(truncatingIfNeeded: value)
-                bytes[laneOffset + 1] = UInt8(value >> 8)
-            }
-        }
-    }
-    return bytes
-}
-
 /// Build one tight threadgroup-major decode sidecar containing both 4-bit
 /// projections and both fixed12 metadata streams. Each threadgroup owns four
 /// output rows. Ten 512-input tiles contain:
@@ -350,36 +192,20 @@ func gemma4MakeCoTiledFixed12GateUpPayload(
         .reshaped(threadgroupCount, 4, 32)
     let tailWeights = stacked([gateTail, upTail], axis: 1)
         .reshaped(threadgroupCount, 256)
-    let tailPayload: MLXArray
-    let expectedPayloadWords: Int
-    if gemma4GateUpCoTileTail12Enabled,
-       let tail12Metadata = gemma4MakeCoTiledGateUpTail12Metadata(
-           gatePacked: gatePacked,
-           upPacked: upPacked,
-           threadgroupCount: threadgroupCount
-       )
-    {
-        // 12-bit tail packing: 6 B/row/projection (24 B region per
-        // projection), twelve U32 words per threadgroup.
-        tailPayload = concatenated([tailWeights, tail12Metadata], axis: 1)
-        expectedPayloadWords = 5_628
-    } else {
-        let gateTailMetadata = gatePackedRows[0..., 0..., 30..<32]
-        let upTailMetadata = upPackedRows[0..., 0..., 30..<32]
-        let tailMetadata = stacked(
-            [gateTailMetadata, upTailMetadata],
-            axis: 1
-        ).reshaped(threadgroupCount, 16)
-        tailPayload = concatenated(
-            [tailWeights, tailMetadata],
-            axis: 1
-        )
-        expectedPayloadWords = 5_632
-    }
+    let gateTailMetadata = gatePackedRows[0..., 0..., 30..<32]
+    let upTailMetadata = upPackedRows[0..., 0..., 30..<32]
+    let tailMetadata = stacked(
+        [gateTailMetadata, upTailMetadata],
+        axis: 1
+    ).reshaped(threadgroupCount, 16)
+    let tailPayload = concatenated(
+        [tailWeights, tailMetadata],
+        axis: 1
+    )
 
     let payload = concatenated([pairedPayload, tailPayload], axis: 1)
     precondition(payload.dtype == .uint32)
-    precondition(payload.shape == [threadgroupCount, expectedPayloadWords])
+    precondition(payload.shape == [threadgroupCount, 5_632])
     if materialize {
         eval(payload)
     }
@@ -427,67 +253,6 @@ private struct Packed12GateUpMetadataPair: @unchecked Sendable {
     let up: Packed12GateUpMetadata
 }
 
-/// Packed metadata for one projection of a U16-fallback layer (a gate/up
-/// LUT wider than 12 bits disqualifies the promoted fixed12 forms). Each
-/// projection independently keeps the narrowest width that carries its LUT,
-/// mirroring the per-tensor fixed12/13 selection of the o_proj family.
-private struct PackedWideGateUpMetadata: @unchecked Sendable {
-    let bytes: MLXArray
-    let indexBits: Int
-
-    init?(metadata: IndexedAffineMetadata) {
-        guard metadata.indices.dtype == .uint16,
-              metadata.indices.shape == [21_504, 84],
-              metadata.lut.dtype == .uint32,
-              metadata.lut.ndim == 1,
-              (1...8_192).contains(metadata.lut.size)
-        else {
-            return nil
-        }
-        let indexBits = metadata.lut.size <= 4_096 ? 12 : 13
-        let indices = metadata.indices.asArray(UInt16.self)
-        let packed: [UInt8]?
-        if indexBits == 12 {
-            packed = gemma4Pack12BitGateUpIndices(
-                indices,
-                rows: 21_504,
-                groupsPerRow: 84
-            )
-        } else {
-            packed = gemma4Pack13BitGateUpIndices(
-                indices,
-                rows: 21_504,
-                groupsPerRow: 84
-            )
-        }
-        guard let packed else { return nil }
-        let bytes = MLXArray(packed, [21_504, indexBits == 12 ? 128 : 140])
-        // Packing happens during untimed model initialization. Materialize
-        // the input-independent buffer now so first decode cannot inherit a
-        // lazy host-to-Metal upload.
-        eval(bytes)
-        self.bytes = bytes
-        self.indexBits = indexBits
-    }
-}
-
-private struct PackedWideGateUpMetadataPair: @unchecked Sendable {
-    let gate: PackedWideGateUpMetadata
-    let up: PackedWideGateUpMetadata
-
-    var formats: Gemma4PackedWideGateUpFormats {
-        Gemma4PackedWideGateUpFormats(
-            gateBits: gate.indexBits,
-            upBits: up.indexBits
-        )
-    }
-}
-
-struct Gemma4PackedWideGateUpFormats: Hashable {
-    let gateBits: Int
-    let upBits: Int
-}
-
 private struct CoTiledFixed12GateUpPayload: @unchecked Sendable {
     let words: MLXArray
 
@@ -506,20 +271,13 @@ private struct CoTiledFixed12GateUpPayload: @unchecked Sendable {
                   upWeight: up.weight,
                   gateIndices: gateMetadata.indices,
                   upIndices: upMetadata.indices
-              ),
-              words.shape == gemma4CoTiledGateUpPayloadShape
+              )
         else {
             return nil
         }
         self.words = words
     }
 }
-
-/// Expected shape of the runtime-built co-tiled gate/up payload: 5,376
-/// threadgroups of 5,632 U32 words with the lane-major U16 tail metadata,
-/// or 5,628 with the 12-bit tail packing (DARKBLOOM_GATEUP_COTILE_TAIL12).
-let gemma4CoTiledGateUpPayloadShape: [Int] =
-    gemma4GateUpCoTileTail12Enabled ? [5_376, 5_628] : [5_376, 5_632]
 
 func supportsGemma4FusedGateUpInput(_ input: MLXArray) -> Bool {
     input.dtype == .bfloat16
@@ -1037,251 +795,8 @@ private let gemma4Packed12IndexedFusedGateUpActivationQMV = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// Fixed 12/13-bit fallback-layer variant of the promoted packed12
-/// activation kernel: identical weight traversal, per-row accumulation order
-/// (block 2p, then 2p+1, then the tail block 20), reductions, and GELU
-/// epilogue; only the metadata byte decode is parameterized per projection.
-private func gemma4PackedWideGateUpActivationBody(
-    gateBits: Int,
-    upBits: Int
-) -> String {
-    func constants(_ prefix: String, _ indexBits: Int) -> String {
-        precondition(indexBits == 12 || indexBits == 13)
-        let bytesPerRow = indexBits == 12 ? 128 : 140
-        return """
-            constexpr int k\(prefix)PackedBytesPerRow = \(bytesPerRow);
-            constexpr int k\(prefix)PairStride = \(indexBits);
-            constexpr bool k\(prefix)HasTopBits = \(indexBits == 13 ? "true" : "false");
-            """
-    }
-    return """
-        constexpr int kWeightBytesPerRow = 2688;
-        constexpr int kRowsPerSIMD = 4;
-        constexpr int kPairCount = 10;
-        \(constants("Gate", gateBits))
-        \(constants("Up", upBits))
-
-        const bool is_up = simdgroup_index_in_threadgroup == 1;
-        const int output_row = threadgroup_position_in_grid.y * kRowsPerSIMD;
-        const device uint* weight = is_up ? up_weight : gate_weight;
-        const device uchar* packed_indices = is_up
-            ? up_packed_indices
-            : gate_packed_indices;
-        const device uint* lut = is_up ? up_lut : gate_lut;
-        const int packed_bytes_per_row = is_up
-            ? kUpPackedBytesPerRow
-            : kGatePackedBytesPerRow;
-        const int pair_stride = is_up ? kUpPairStride : kGatePairStride;
-        const bool has_top_bits = is_up ? kUpHasTopBits : kGateHasTopBits;
-
-        const device uchar* weight_bytes =
-            reinterpret_cast<const device uchar*>(weight)
-            + output_row * kWeightBytesPerRow
-            + thread_index_in_simdgroup * 4;
-        const device uchar* row_packed_indices =
-            packed_indices + output_row * packed_bytes_per_row;
-        const device bfloat* input = x + thread_index_in_simdgroup * 8;
-        const uint lane_group = thread_index_in_simdgroup >> 3;
-
-        float result[kRowsPerSIMD] = {0};
-        for (int block_pair = 0; block_pair < kPairCount; ++block_pair) {
-            float even_values[8];
-            const float even_input_sum =
-                gemma4_load_qmv_values(input, even_values);
-            uint odd_pairs[kRowsPerSIMD];
-
-            // One pair tile encodes the eight metadata indexes consumed by
-            // two consecutive 256-input blocks; the three byte planes (plus
-            // the fixed13 top-bit byte) reconstruct both indexes without
-            // variable bit offsets or word-crossing control.
-            #pragma clang loop unroll(full)
-            for (int row = 0; row < kRowsPerSIMD; ++row) {
-                const device uchar* row_weight =
-                    weight_bytes + row * kWeightBytesPerRow;
-                const device uchar* row_tile =
-                    row_packed_indices + row * packed_bytes_per_row;
-                const uint even_low = row_tile[lane_group];
-                const uint middle = row_tile[4 + lane_group];
-                const uint odd_high = row_tile[8 + lane_group];
-                uint even_index = even_low | ((middle & 0x0f) << 8);
-                uint odd_index = (middle >> 4) | (odd_high << 4);
-                if (has_top_bits) {
-                    const uint top = row_tile[12];
-                    even_index |= ((top >> lane_group) & 1) << 12;
-                    odd_index |= ((top >> (4 + lane_group)) & 1) << 12;
-                }
-                const uint even_pair = lut[even_index];
-                odd_pairs[row] = lut[odd_index];
-                result[row] += gemma4_qdot_4bit(
-                    row_weight,
-                    even_values,
-                    gemma4_pair_scale(even_pair),
-                    gemma4_pair_bias(even_pair),
-                    even_input_sum);
-            }
-
-            weight_bytes += 128;
-            input += 256;
-            float odd_values[8];
-            const float odd_input_sum =
-                gemma4_load_qmv_values(input, odd_values);
-            #pragma clang loop unroll(full)
-            for (int row = 0; row < kRowsPerSIMD; ++row) {
-                const device uchar* row_weight =
-                    weight_bytes + row * kWeightBytesPerRow;
-                const uint odd_pair = odd_pairs[row];
-                result[row] += gemma4_qdot_4bit(
-                    row_weight,
-                    odd_values,
-                    gemma4_pair_scale(odd_pair),
-                    gemma4_pair_bias(odd_pair),
-                    odd_input_sum);
-            }
-
-            weight_bytes += 128;
-            input += 256;
-            row_packed_indices += pair_stride;
-        }
-
-        // The 21st block is the unpaired tail: two lane-major bytes per
-        // index (natively wide enough for both fixed12 and fixed13).
-        float tail_values[8];
-        const float tail_input_sum =
-            gemma4_load_qmv_values(input, tail_values);
-        const uint tail_lane_offset = lane_group << 1;
-        #pragma clang loop unroll(full)
-        for (int row = 0; row < kRowsPerSIMD; ++row) {
-            const device uchar* row_weight =
-                weight_bytes + row * kWeightBytesPerRow;
-            const device uchar* row_tail =
-                row_packed_indices + row * packed_bytes_per_row;
-            const uint low = row_tail[tail_lane_offset];
-            const uint high = row_tail[tail_lane_offset + 1];
-            const uint metadata_index = low | (high << 8);
-            const uint pair = lut[metadata_index];
-            result[row] += gemma4_qdot_4bit(
-                row_weight,
-                tail_values,
-                gemma4_pair_scale(pair),
-                gemma4_pair_bias(pair),
-                tail_input_sum);
-        }
-
-        threadgroup bfloat projections[2][kRowsPerSIMD];
-        #pragma clang loop unroll(full)
-        for (int row = 0; row < kRowsPerSIMD; ++row) {
-            result[row] = simd_sum(result[row]);
-            if (thread_index_in_simdgroup == 0) {
-                projections[is_up ? 1 : 0][row] =
-                    static_cast<bfloat>(result[row]);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (simdgroup_index_in_threadgroup == 0
-            && thread_index_in_simdgroup < kRowsPerSIMD
-        ) {
-            const int row = thread_index_in_simdgroup;
-            const bfloat gate = projections[0][row];
-            const bfloat up = projections[1][row];
-
-            const bfloat cubic0 = static_cast<bfloat>(0.044715f) * gate;
-            const bfloat cubic1 = cubic0 * gate;
-            const bfloat cubic2 = cubic1 * gate;
-            const bfloat inner0 = gate + cubic2;
-            const bfloat inner1 =
-                static_cast<bfloat>(0.7978845834732056f) * inner0;
-            const bfloat tanh_value =
-                static_cast<bfloat>(metal::precise::tanh(inner1));
-            const bfloat shifted = static_cast<bfloat>(1.0f) + tanh_value;
-            const bfloat scaled = static_cast<bfloat>(0.5f) * gate;
-            const bfloat gelu = scaled * shifted;
-            activated[output_row + row] = gelu * up;
-        }
-        """
-}
-
-private let gemma4PackedWideGateUpHeader = """
-    using namespace metal;
-
-    inline float gemma4_pair_scale(uint pair) {
-        return static_cast<float>(as_type<bfloat>(static_cast<ushort>(pair)));
-    }
-
-    inline float gemma4_pair_bias(uint pair) {
-        return static_cast<float>(
-            as_type<bfloat>(static_cast<ushort>(pair >> 16)));
-    }
-
-    inline float gemma4_load_qmv_values(
-        const device bfloat* input,
-        thread float* values
-    ) {
-        float sum = 0;
-        for (int index = 0; index < 8; index += 4) {
-            sum += input[index] + input[index + 1]
-                + input[index + 2] + input[index + 3];
-            values[index] = input[index];
-            values[index + 1] = input[index + 1] / 16.0f;
-            values[index + 2] = input[index + 2] / 256.0f;
-            values[index + 3] = input[index + 3] / 4096.0f;
-        }
-        return sum;
-    }
-
-    inline float gemma4_qdot_4bit(
-        const device uchar* weight,
-        const thread float* values,
-        float scale,
-        float bias,
-        float input_sum
-    ) {
-        const device ushort* packed =
-            reinterpret_cast<const device ushort*>(weight);
-        float accumulator = 0;
-        for (int index = 0; index < 2; ++index) {
-            accumulator +=
-                (values[4 * index] * (packed[index] & 0x000f)
-                + values[4 * index + 1] * (packed[index] & 0x00f0)
-                + values[4 * index + 2] * (packed[index] & 0x0f00)
-                + values[4 * index + 3] * (packed[index] & 0xf000));
-        }
-        return scale * accumulator + input_sum * bias;
-    }
-    """
-
-private let gemma4PackedWideGateUpActivationKernels:
-    [Gemma4PackedWideGateUpFormats: MLXFast.MLXFastKernel] = {
-        var kernels = [Gemma4PackedWideGateUpFormats: MLXFast.MLXFastKernel]()
-        for gateBits in [12, 13] {
-            for upBits in [12, 13] {
-                let formats = Gemma4PackedWideGateUpFormats(
-                    gateBits: gateBits,
-                    upBits: upBits
-                )
-                kernels[formats] = MLXFast.metalKernel(
-                    name: "gemma4_packed_wide_fused_gate_up_activation_qmv_5376"
-                        + "_g\(gateBits)_u\(upBits)_v1",
-                    inputNames: [
-                        "gate_weight", "gate_packed_indices", "gate_lut",
-                        "up_weight", "up_packed_indices", "up_lut", "x",
-                    ],
-                    outputNames: ["activated"],
-                    source: gemma4PackedWideGateUpActivationBody(
-                        gateBits: gateBits,
-                        upBits: upBits
-                    ),
-                    header: gemma4PackedWideGateUpHeader,
-                    ensureRowContiguous: true
-                )
-            }
-        }
-        return kernels
-    }()
-
 private let gemma4CoTiledFixed12FusedGateUpActivationQMV = MLXFast.metalKernel(
-    name: "gemma4_cotiled_fixed12_fused_gate_up_activation_qmv_5376"
-        + "_t12\(gemma4GateUpCoTileTail12Enabled ? 1 : 0)_v1",
+    name: "gemma4_cotiled_fixed12_fused_gate_up_activation_qmv_5376_v1",
     inputNames: ["cotiled_payload", "gate_lut", "up_lut", "x"],
     outputNames: ["activated"],
     source: """
@@ -1296,10 +811,8 @@ private let gemma4CoTiledFixed12FusedGateUpActivationQMV = MLXFast.metalKernel(
         constexpr int kPairCount = 10;
         constexpr int kTailWeightWords =
             2 * kWordsPerProjectionBlock;
-        constexpr bool kTail12 = \(gemma4GateUpCoTileTail12Enabled);
-        constexpr int kTailMetadataBytesPerProjection =
-            kTail12 ? 24 : 32;
-        constexpr int kWordsPerTail = kTail12 ? 268 : 272;
+        constexpr int kTailMetadataBytesPerProjection = 32;
+        constexpr int kWordsPerTail = 272;
         constexpr int kWordsPerThreadgroup =
             kPairCount * kWordsPerPair + kWordsPerTail;
 
@@ -1395,23 +908,10 @@ private let gemma4CoTiledFixed12FusedGateUpActivationQMV = MLXFast.metalKernel(
         const uint tail_lane_offset = lane_group << 1;
         #pragma clang loop unroll(full)
         for (int row = 0; row < kRowsPerSIMD; ++row) {
-            uint metadata_index;
-            if (kTail12) {
-                // Four tail indexes per row packed at 12 bits: three bytes
-                // per index pair, two pairs per row.
-                const device uchar* row_metadata = tail_metadata + row * 6;
-                const uint pair_base = (lane_group >> 1) * 3;
-                const uint low = row_metadata[pair_base + (lane_group & 1)];
-                const uint middle = row_metadata[pair_base + 2];
-                metadata_index = (lane_group & 1) == 0
-                    ? low | ((middle & 0x0f) << 8)
-                    : low | ((middle >> 4) << 8);
-            } else {
-                const device uchar* row_metadata = tail_metadata + row * 8;
-                const uint low = row_metadata[tail_lane_offset];
-                const uint high = row_metadata[tail_lane_offset + 1];
-                metadata_index = low | (high << 8);
-            }
+            const device uchar* row_metadata = tail_metadata + row * 8;
+            const uint low = row_metadata[tail_lane_offset];
+            const uint high = row_metadata[tail_lane_offset + 1];
+            const uint metadata_index = low | (high << 8);
             const uint pair = lut[metadata_index];
             const device uchar* row_weight =
                 reinterpret_cast<const device uchar*>(
@@ -1650,13 +1150,10 @@ struct FusedGateUpProjection: @unchecked Sendable {
     let indexedUp: IndexedAffineMetadata?
     private let packed12IndexedGateUp: Packed12GateUpMetadataPair?
     private let coTiledFixed12GateUp: CoTiledFixed12GateUpPayload?
-    private let packedWideGateUp: PackedWideGateUpMetadataPair?
     private let usePacked12IndexedGateUp: Bool
     private let verifyPacked12IndexedBits: Bool
     private let useCoTiledFixed12GateUp: Bool
     private let verifyCoTiledFixed12GateUpBits: Bool
-    private let usePackedWideGateUp: Bool
-    private let verifyPackedWideGateUpBits: Bool
 
     init(
         gate: QuantizedLinear,
@@ -1700,17 +1197,8 @@ struct FusedGateUpProjection: @unchecked Sendable {
             "DARKBLOOM_VERIFY_GATE_UP_COTILED_FIXED12_BITS",
             default: false
         )
-        let usePackedWideGateUp = gemma4GateUpEnvironmentFlag(
-            "DARKBLOOM_GATE_UP_PACKED13",
-            default: true
-        )
-        let verifyPackedWideGateUpBits = gemma4GateUpEnvironmentFlag(
-            "DARKBLOOM_VERIFY_GATE_UP_PACKED13_BITS",
-            default: false
-        )
         var packed12IndexedGateUp: Packed12GateUpMetadataPair?
         var coTiledFixed12GateUp: CoTiledFixed12GateUpPayload?
-        var packedWideGateUp: PackedWideGateUpMetadataPair?
         switch metadataMode {
         case .raw:
             self.indexedGate = nil
@@ -1758,35 +1246,14 @@ struct FusedGateUpProjection: @unchecked Sendable {
                     up: packedUp
                 )
             }
-            // U16-fallback layers only: a LUT wider than 12 bits disqualifies
-            // every promoted fixed12 form above, so this pair can never
-            // coexist with (or shadow) the fixed12 co-tile or packed12
-            // sidecar and their rollback switches.
-            let needsWideFallback = max(
-                indexedGate.lut.size,
-                indexedUp.lut.size
-            ) > 4_096
-            if needsWideFallback,
-               usePackedWideGateUp || verifyPackedWideGateUpBits,
-               let packedGate = PackedWideGateUpMetadata(metadata: indexedGate),
-               let packedUp = PackedWideGateUpMetadata(metadata: indexedUp)
-            {
-                packedWideGateUp = PackedWideGateUpMetadataPair(
-                    gate: packedGate,
-                    up: packedUp
-                )
-            }
         }
         self.packed12IndexedGateUp = packed12IndexedGateUp
         self.coTiledFixed12GateUp = coTiledFixed12GateUp
-        self.packedWideGateUp = packedWideGateUp
         self.usePacked12IndexedGateUp = usePacked12IndexedGateUp
         self.verifyPacked12IndexedBits = verifyPacked12IndexedBits
         self.useCoTiledFixed12GateUp = useCoTiledFixed12GateUp
         self.verifyCoTiledFixed12GateUpBits =
             verifyCoTiledFixed12GateUpBits
-        self.usePackedWideGateUp = usePackedWideGateUp
-        self.verifyPackedWideGateUpBits = verifyPackedWideGateUpBits
     }
 
     func callAsFunction(_ input: MLXArray) -> (MLXArray, MLXArray) {
@@ -1838,55 +1305,6 @@ struct FusedGateUpProjection: @unchecked Sendable {
         var outputShape = input.shape
         let outputWidth = gate.weight.dim(0)
         outputShape[outputShape.count - 1] = outputWidth
-
-        // U16-fallback layers (a LUT wider than 12 bits): the fixed12 forms
-        // below are structurally absent, so this packed 12/13 pair is the
-        // only alternative to the promoted U16 kernel.
-        if let packedWideGateUp {
-            guard let kernel = gemma4PackedWideGateUpActivationKernels[
-                packedWideGateUp.formats
-            ] else {
-                preconditionFailure("missing packed wide gate/up kernel variant")
-            }
-            let candidate = kernel(
-                [
-                    gate.weight, packedWideGateUp.gate.bytes, indexedGate.lut,
-                    up.weight, packedWideGateUp.up.bytes, indexedUp.lut, input,
-                ],
-                grid: (32, outputWidth / 2, 1),
-                threadGroup: (32, 2, 1),
-                outputShapes: [outputShape],
-                outputDTypes: [.bfloat16]
-            )[0]
-            if verifyPackedWideGateUpBits {
-                let reference = gemma4IndexedFusedGateUpActivationQMV(
-                    [
-                        gate.weight, indexedGate.indices, indexedGate.lut,
-                        up.weight, indexedUp.indices, indexedUp.lut, input,
-                    ],
-                    grid: (32, outputWidth / 2, 1),
-                    threadGroup: (32, 2, 1),
-                    outputShapes: [outputShape],
-                    outputDTypes: [.bfloat16]
-                )[0]
-                let matches = arrayEqual(
-                    candidate.view(dtype: .uint16),
-                    reference.view(dtype: .uint16)
-                )
-                eval(matches)
-                precondition(
-                    matches.item(Bool.self),
-                    "packed wide gate/up activation differs from promoted "
-                        + "U16 kernel"
-                )
-                if !usePackedWideGateUp {
-                    // Verifier-only mode must not change the selected output.
-                    return reference
-                }
-            }
-            return candidate
-        }
-
         let coTiledOutput: MLXArray?
         if let coTiledFixed12GateUp {
             coTiledOutput = gemma4CoTiledFixed12FusedGateUpActivationQMV(
@@ -1996,12 +1414,7 @@ struct FusedGateUpProjection: @unchecked Sendable {
     }
 
     private var exactTwoVectorMode: Gemma4ExactTwoVectorGateUpMode? {
-        // Verify mode exercises the standard single-vector paths; keep the
-        // exact-pair surface disabled while it is armed (family precedent).
-        if verifyPackedWideGateUpBits {
-            return nil
-        }
-        return gemma4ExactTwoVectorGateUpMode(
+        gemma4ExactTwoVectorGateUpMode(
             metadataMode: metadataMode,
             gateLUTCount: indexedGate?.lut.size,
             upLUTCount: indexedUp?.lut.size,

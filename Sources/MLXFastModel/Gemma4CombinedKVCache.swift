@@ -202,60 +202,6 @@ final class Gemma4CombinedKVCache: KVCache {
         }
     }
 
-    /// Target for an in-place one-token decode write by the fused attention
-    /// preparation kernel. Returns the combined slab and the physical write
-    /// position, or nil when a structural update (split conversion, growth, or
-    /// trim) must run first — callers then use the staging `updateCombined`
-    /// path, which performs the structural change and leaves the cache in a
-    /// state the next token can write directly. The direct kernel addresses
-    /// the slab through its own MLX strides, so no layout check is needed
-    /// here; every assignment of `combinedStorage` in this class produces
-    /// contiguous combined-layout storage anyway.
-    func directDecodeWriteTarget() -> (storage: MLXArray, position: Int)? {
-        guard let storage = combinedStorage else { return nil }
-        let capacity = storage.dim(3)
-        let position: Int
-        switch kind {
-        case .full:
-            guard offset + 1 <= capacity else { return nil }
-            position = offset
-        case .rotating(let maxSize, _, _):
-            guard capacity <= maxSize else { return nil }
-            var index = rotatingIndex
-            if index == maxSize { index = keep }
-            guard index + 1 <= capacity else { return nil }
-            position = index
-        }
-        return (storage, position)
-    }
-
-    /// Advance cache metadata after the fused attention preparation kernel
-    /// wrote one token directly into the slab at `position`. Mirrors the
-    /// offset/cursor updates of `updateFull`/`updateRotating` exactly; the
-    /// returned views are the same slices `updateCombined` would return.
-    func adoptDirectDecodeWrite(position: Int) -> (MLXArray, MLXArray) {
-        guard let storage = combinedStorage else {
-            preconditionFailure("combined KV storage is empty")
-        }
-        switch kind {
-        case .full:
-            precondition(position == offset)
-            precondition(offset + 1 <= storage.dim(3))
-            offset += 1
-            return views(range: 0..<offset)
-        case .rotating(let maxSize, _, _):
-            let capacity = storage.dim(3)
-            var index = rotatingIndex
-            if index == maxSize { index = keep }
-            precondition(position == index)
-            precondition(index + 1 <= capacity)
-            offset += 1
-            rotatingIndex = index + 1
-            let validLength = offset < maxSize ? offset : capacity
-            return views(range: 0..<validLength)
-        }
-    }
-
     /// Materialized prefix before the newest exact-pair rows. Rotating caches
     /// use this only before their first wrap.
     func viewsExcludingNewest(_ count: Int) -> (MLXArray, MLXArray) {
@@ -606,16 +552,6 @@ func gemma4VerifyCombinedKVPrefillBitsEnabled() -> Bool {
     gemma4VerifyCombinedKVPrefillBitsFeatureEnabled
 }
 
-@inline(__always)
-func gemma4DecodeKVDirectWriteEnabled() -> Bool {
-    gemma4DecodeKVDirectWriteFeatureEnabled
-}
-
-@inline(__always)
-func gemma4VerifyDecodeKVDirectWriteBitsEnabled() -> Bool {
-    gemma4VerifyDecodeKVDirectWriteBitsFeatureEnabled
-}
-
 private let gemma4CombinedKVCacheFeatureEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_COMBINED_KV_CACHE"] else {
         return true
@@ -642,24 +578,6 @@ private let gemma4CombinedKVPrefillFeatureEnabled: Bool = {
 private let gemma4VerifyCombinedKVPrefillBitsFeatureEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_VERIFY_COMBINED_KV_PREFILL_BITS"
-    ] else {
-        return false
-    }
-    return ["1", "true", "yes", "on"].contains(raw.lowercased())
-}()
-
-private let gemma4DecodeKVDirectWriteFeatureEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_DECODE_KV_DIRECT_WRITE"
-    ] else {
-        return true
-    }
-    return !["0", "false", "no", "off"].contains(raw.lowercased())
-}()
-
-private let gemma4VerifyDecodeKVDirectWriteBitsFeatureEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_VERIFY_DECODE_KV_DIRECT_WRITE_BITS"
     ] else {
         return false
     }

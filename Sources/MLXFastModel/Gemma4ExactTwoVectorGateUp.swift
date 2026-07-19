@@ -14,10 +14,8 @@ private let gemma4ExactTwoVectorGateUpSource = """
     constexpr int kPairCount = 10;
     constexpr int kTailWeightWords =
         2 * kWordsPerProjectionBlock;
-    constexpr bool kTail12 = \(gemma4GateUpCoTileTail12Enabled);
-    constexpr int kTailMetadataBytesPerProjection =
-        kTail12 ? 24 : 32;
-    constexpr int kWordsPerTail = kTail12 ? 268 : 272;
+    constexpr int kTailMetadataBytesPerProjection = 32;
+    constexpr int kWordsPerTail = 272;
     constexpr int kWordsPerThreadgroup =
         kPairCount * kWordsPerPair + kWordsPerTail;
 
@@ -137,23 +135,10 @@ private let gemma4ExactTwoVectorGateUpSource = """
     const uint tail_lane_offset = lane_group << 1;
     #pragma clang loop unroll(full)
     for (int row = 0; row < kRowsPerSIMD; ++row) {
-        uint metadata_index;
-        if (kTail12) {
-            // Four tail indexes per row packed at 12 bits: three bytes
-            // per index pair, two pairs per row.
-            const device uchar* row_metadata = tail_metadata + row * 6;
-            const uint pair_base = (lane_group >> 1) * 3;
-            const uint low = row_metadata[pair_base + (lane_group & 1)];
-            const uint middle = row_metadata[pair_base + 2];
-            metadata_index = (lane_group & 1) == 0
-                ? low | ((middle & 0x0f) << 8)
-                : low | ((middle >> 4) << 8);
-        } else {
-            const device uchar* row_metadata = tail_metadata + row * 8;
-            const uint low = row_metadata[tail_lane_offset];
-            const uint high = row_metadata[tail_lane_offset + 1];
-            metadata_index = low | (high << 8);
-        }
+        const device uchar* row_metadata = tail_metadata + row * 8;
+        const uint low = row_metadata[tail_lane_offset];
+        const uint high = row_metadata[tail_lane_offset + 1];
+        const uint metadata_index = low | (high << 8);
         const uint pair = lut[metadata_index];
         const device uint* row_weight_words =
             tail_weight_words + row * kSIMDSize;
@@ -409,8 +394,7 @@ private let gemma4ExactTwoVectorGateUpHeader = """
     """
 
 private let gemma4ExactTwoVectorGateUpKernel = MLXFast.metalKernel(
-    name: "gemma4_exact_two_vector_cotiled_fixed12_gate_up_activation_qmv_5376"
-        + "_t12\(gemma4GateUpCoTileTail12Enabled ? 1 : 0)_mtp_v2",
+    name: "gemma4_exact_two_vector_cotiled_fixed12_gate_up_activation_qmv_5376_mtp_v2",
     inputNames: ["cotiled_payload", "gate_lut", "up_lut", "x"],
     outputNames: ["activated"],
     source: gemma4ExactTwoVectorGateUpSource,
@@ -436,9 +420,7 @@ func gemma4ExactTwoVectorGateUpActivated(
     upLUT: MLXArray,
     input: MLXArray
 ) -> MLXArray {
-    precondition(
-        payload.dtype == .uint32
-            && payload.shape == gemma4CoTiledGateUpPayloadShape)
+    precondition(payload.dtype == .uint32 && payload.shape == [5_376, 5_632])
     precondition(gateLUT.dtype == .uint32 && gateLUT.ndim == 1)
     precondition(upLUT.dtype == .uint32 && upLUT.ndim == 1)
     precondition(input.dtype == .bfloat16 && input.shape == [2, 5_376])
