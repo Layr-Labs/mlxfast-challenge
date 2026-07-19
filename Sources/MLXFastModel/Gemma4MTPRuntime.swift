@@ -35,7 +35,7 @@ private let gemma4MTPExactFourMarginThreshold: Float = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_MTP_EXACT_FOUR_MARGIN_THRESHOLD"
     ], let value = Float(raw), value.isFinite, value >= 0 else {
-        return 4.0
+        return 3.8125
     }
     return value
 }()
