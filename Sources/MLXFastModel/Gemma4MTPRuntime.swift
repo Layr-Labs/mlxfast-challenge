@@ -40,6 +40,15 @@ private let gemma4MTPExactFourMarginThreshold: Float = {
     return value
 }()
 
+private let gemma4MTPLeadingMarginSelectorEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_MTP_LEADING_MARGIN_SELECTOR"
+    ] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private let gemma4MTPTopTwoMarginKernel = MLXFast.metalKernel(
     name: "gemma4_mtp_top_two_margin_262144_v1",
     inputNames: ["logits"],
@@ -126,10 +135,22 @@ func gemma4MTPTopTwoMargin(_ logits: MLXArray) -> MLXArray {
 
 func gemma4MTPShouldUseExactFour(
     draftMargins: [Float],
-    threshold: Float
+    threshold: Float,
+    leadingMarginSelectorEnabled: Bool = true
 ) -> Bool {
-    draftMargins.count == 3
-        && draftMargins.allSatisfy { $0 >= threshold }
+    guard draftMargins.count == 3 else {
+        return false
+    }
+    if draftMargins.allSatisfy({ $0 >= threshold }) {
+        return true
+    }
+    // Exact-pair verification needs a second target traversal whenever the
+    // first two drafts survive; the third draft's outcome does not affect that
+    // cost. High confidence in those two leading drafts can therefore select
+    // exact-four independently of the third margin.
+    return leadingMarginSelectorEnabled
+        && draftMargins[0] >= 6.0
+        && draftMargins[1] >= 8.0
 }
 
 public enum Gemma4MTPVerificationMode: String, Sendable {
@@ -699,7 +720,9 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
                 preferExactFour: !gemma4MTPAdaptiveExactFourEnabled
                     || gemma4MTPShouldUseExactFour(
                         draftMargins: draftMargins,
-                        threshold: gemma4MTPExactFourMarginThreshold
+                        threshold: gemma4MTPExactFourMarginThreshold,
+                        leadingMarginSelectorEnabled:
+                            gemma4MTPLeadingMarginSelectorEnabled
                     )
             )
         case .serial:
