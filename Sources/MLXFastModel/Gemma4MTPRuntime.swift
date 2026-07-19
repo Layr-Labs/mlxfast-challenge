@@ -49,6 +49,15 @@ private let gemma4MTPLeadingMarginSelectorEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+private let gemma4MTPSecondaryMarginSelectorEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_MTP_SECONDARY_MARGIN_SELECTOR"
+    ] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private let gemma4MTPTopTwoMarginKernel = MLXFast.metalKernel(
     name: "gemma4_mtp_top_two_margin_262144_v1",
     inputNames: ["logits"],
@@ -136,7 +145,8 @@ func gemma4MTPTopTwoMargin(_ logits: MLXArray) -> MLXArray {
 func gemma4MTPShouldUseExactFour(
     draftMargins: [Float],
     threshold: Float,
-    leadingMarginSelectorEnabled: Bool = true
+    leadingMarginSelectorEnabled: Bool = true,
+    secondaryMarginSelectorEnabled: Bool = true
 ) -> Bool {
     guard draftMargins.count == 3 else {
         return false
@@ -148,9 +158,20 @@ func gemma4MTPShouldUseExactFour(
     // first two drafts survive; the third draft's outcome does not affect that
     // cost. High confidence in those two leading drafts can therefore select
     // exact-four independently of the third margin.
-    return leadingMarginSelectorEnabled
+    if leadingMarginSelectorEnabled
         && draftMargins[0] >= 6.0
         && draftMargins[1] >= 8.0
+    {
+        return true
+    }
+    // A second, disjoint high-confidence region recovers cases where the
+    // second margin is moderate but the first and third are both strong.
+    // This selects the same bit-exact four-row verifier; it cannot alter the
+    // draft tokens or acceptance decision.
+    return secondaryMarginSelectorEnabled
+        && draftMargins[0] >= 7.125
+        && draftMargins[1] >= 3.25
+        && draftMargins[2] >= 6.0
 }
 
 public enum Gemma4MTPVerificationMode: String, Sendable {
@@ -722,7 +743,9 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
                         draftMargins: draftMargins,
                         threshold: gemma4MTPExactFourMarginThreshold,
                         leadingMarginSelectorEnabled:
-                            gemma4MTPLeadingMarginSelectorEnabled
+                            gemma4MTPLeadingMarginSelectorEnabled,
+                        secondaryMarginSelectorEnabled:
+                            gemma4MTPSecondaryMarginSelectorEnabled
                     )
             )
         case .serial:
