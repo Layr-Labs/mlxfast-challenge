@@ -1,6 +1,6 @@
 import MLX
 
-private let gemma4ExactTwoVectorGateUpSource = """
+let gemma4ExactTwoVectorGateUpSource = """
     constexpr int kInputWidth = 5376;
     constexpr int kOutputRows = 21504;
     constexpr int kRowsPerSIMD = 4;

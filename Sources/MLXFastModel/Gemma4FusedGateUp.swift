@@ -1429,6 +1429,10 @@ struct FusedGateUpProjection: @unchecked Sendable {
         exactTwoVectorMode != nil
     }
 
+    var supportsExactFourVector: Bool {
+        supportsExactTwoVector
+    }
+
     func exactTwoVectorActivated(_ input: MLXArray) -> MLXArray {
         precondition(input.dtype == .bfloat16 && input.shape == [2, 5_376])
         guard let mode = exactTwoVectorMode,
@@ -1450,6 +1454,38 @@ struct FusedGateUpProjection: @unchecked Sendable {
             )
         case .u16:
             return gemma4ExactTwoVectorU16GateUpActivated(
+                gateWeight: gate.weight,
+                gateIndices: indexedGate.indices,
+                gateLUT: indexedGate.lut,
+                upWeight: up.weight,
+                upIndices: indexedUp.indices,
+                upLUT: indexedUp.lut,
+                input: input
+            )
+        }
+    }
+
+    func exactFourVectorActivated(_ input: MLXArray) -> MLXArray {
+        precondition(input.dtype == .bfloat16 && input.shape == [4, 5_376])
+        guard let mode = exactTwoVectorMode,
+              let indexedGate,
+              let indexedUp
+        else {
+            preconditionFailure("exact four-vector gate/up payload is unavailable")
+        }
+        switch mode {
+        case .fixed12:
+            guard let coTiledFixed12GateUp else {
+                preconditionFailure("exact fixed12 gate/up payload is unavailable")
+            }
+            return gemma4ExactFourVectorGateUpActivated(
+                payload: coTiledFixed12GateUp.words,
+                gateLUT: indexedGate.lut,
+                upLUT: indexedUp.lut,
+                input: input
+            )
+        case .u16:
+            return gemma4ExactFourVectorU16GateUpActivated(
                 gateWeight: gate.weight,
                 gateIndices: indexedGate.indices,
                 gateLUT: indexedGate.lut,

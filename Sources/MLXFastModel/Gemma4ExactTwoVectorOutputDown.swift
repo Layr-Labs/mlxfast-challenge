@@ -659,7 +659,7 @@ func gemma4ExactTwoVectorU16IndexedDown(
     precondition(weight.dtype == .uint32 && weight.shape == [5_376, 2_688])
     precondition(indices.dtype == .uint16 && indices.shape == [5_376, 336])
     precondition(lut.dtype == .uint32 && lut.ndim == 1)
-    precondition((4_097...65_536).contains(lut.size))
+    precondition((1...65_536).contains(lut.size))
     precondition(input.dtype == .bfloat16 && input.shape == [2, 21_504])
     return gemma4ExactTwoVectorU16DownKernel(
         [weight, indices, lut, input],

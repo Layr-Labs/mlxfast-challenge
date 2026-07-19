@@ -13,6 +13,125 @@ private let gemma4MTPFastTargetEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+private let gemma4MTPExactFourEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_MTP_EXACT_FOUR"
+    ] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gemma4MTPAdaptiveExactFourEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_MTP_ADAPTIVE_EXACT_FOUR"
+    ] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gemma4MTPExactFourMarginThreshold: Float = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_MTP_EXACT_FOUR_MARGIN_THRESHOLD"
+    ], let value = Float(raw), value.isFinite, value >= 0 else {
+        return 4.0
+    }
+    return value
+}()
+
+private let gemma4MTPTopTwoMarginKernel = MLXFast.metalKernel(
+    name: "gemma4_mtp_top_two_margin_262144_v1",
+    inputNames: ["logits"],
+    outputNames: ["margin"],
+    source: """
+        threadgroup float group_best[8];
+        threadgroup float group_second[8];
+
+        float best = -INFINITY;
+        float second = -INFINITY;
+        for (uint index = thread_position_in_threadgroup.x;
+             index < 262144;
+             index += threads_per_threadgroup.x) {
+            gemma4_mtp_insert_top_two(
+                static_cast<float>(logits[index]),
+                best,
+                second
+            );
+        }
+
+        for (ushort delta = 16; delta > 0; delta >>= 1) {
+            const float other_best = simd_shuffle_down(best, delta);
+            const float other_second = simd_shuffle_down(second, delta);
+            if (thread_index_in_simdgroup + delta < 32) {
+                gemma4_mtp_insert_top_two(other_best, best, second);
+                gemma4_mtp_insert_top_two(other_second, best, second);
+            }
+        }
+        if (thread_index_in_simdgroup == 0) {
+            group_best[simdgroup_index_in_threadgroup] = best;
+            group_second[simdgroup_index_in_threadgroup] = second;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simdgroup_index_in_threadgroup == 0) {
+            if (thread_index_in_simdgroup < 8) {
+                best = group_best[thread_index_in_simdgroup];
+                second = group_second[thread_index_in_simdgroup];
+            } else {
+                best = -INFINITY;
+                second = -INFINITY;
+            }
+            for (ushort delta = 16; delta > 0; delta >>= 1) {
+                const float other_best = simd_shuffle_down(best, delta);
+                const float other_second = simd_shuffle_down(second, delta);
+                if (thread_index_in_simdgroup + delta < 32) {
+                    gemma4_mtp_insert_top_two(other_best, best, second);
+                    gemma4_mtp_insert_top_two(other_second, best, second);
+                }
+            }
+            if (thread_index_in_simdgroup == 0) {
+                margin[0] = best - second;
+            }
+        }
+        """,
+    header: """
+        using namespace metal;
+
+        inline void gemma4_mtp_insert_top_two(
+            float value,
+            thread float& best,
+            thread float& second
+        ) {
+            if (value > best) {
+                second = best;
+                best = value;
+            } else if (value > second) {
+                second = value;
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+func gemma4MTPTopTwoMargin(_ logits: MLXArray) -> MLXArray {
+    gemma4MTPTopTwoMarginKernel(
+        [logits],
+        grid: (256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1]],
+        outputDTypes: [.float32]
+    )[0]
+}
+
+func gemma4MTPShouldUseExactFour(
+    draftMargins: [Float],
+    threshold: Float
+) -> Bool {
+    draftMargins.count == 3
+        && draftMargins.allSatisfy { $0 >= threshold }
+}
+
 public enum Gemma4MTPVerificationMode: String, Sendable {
     case exactPair = "exact-pair"
     case serial
@@ -146,6 +265,19 @@ extension Gemma4RuntimeModel: Gemma4MTPTarget {
             )
         }
         if includeExactPair {
+            if gemma4MTPExactFourEnabled {
+                let fourInput = MLXArray([bos, bos, bos, bos], [1, 4])
+                if let four = exactMTPFour(fourInput, cache: cache) {
+                    eval(
+                        four.logits,
+                        four.lastHidden,
+                        four.capturedSharedKV.fullAttention.0,
+                        four.capturedSharedKV.fullAttention.1,
+                        four.capturedSharedKV.slidingAttention.0,
+                        four.capturedSharedKV.slidingAttention.1
+                    )
+                }
+            }
             let pairInput = MLXArray([bos, bos], [1, 2])
             for _ in 0..<2 {
                 guard let pair = exactMTPPair(pairInput, cache: cache) else {
@@ -362,10 +494,13 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
                 sharedKV: sharedKV,
                 positionOffset: Gemma4.PositionOffset.scalar(1)
             )
-            let draft = output.logits[0..., -1, 0...]
-                .argMax(axis: -1)
-                .reshaped([1, 1])
-            eval(draft, output.lastHidden)
+            let logits = output.logits[0..., -1, 0...]
+            let draft = logits.argMax(axis: -1).reshaped([1, 1])
+            if gemma4MTPExactFourEnabled && gemma4MTPAdaptiveExactFourEnabled {
+                eval(draft, output.lastHidden, gemma4MTPTopTwoMargin(logits))
+            } else {
+                eval(draft, output.lastHidden)
+            }
             draftInput = draft
             draftHidden = output.lastHidden
         }
@@ -504,7 +639,14 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
         let positionOffset = Gemma4.PositionOffset.scalar(hostCacheOffset)
         var draftInput = MLXArray([Int32(previousToken)], [1, 1])
         var draftTokens: [MLXArray] = []
+        var draftMarginArrays: [MLXArray] = []
         draftTokens.reserveCapacity(draftCount)
+        draftMarginArrays.reserveCapacity(draftCount)
+
+        let collectExactFourMargins = verificationMode == .exactPair
+            && gemma4MTPExactFourEnabled
+            && gemma4MTPAdaptiveExactFourEnabled
+            && draftCount == 3
 
         for _ in 0..<draftCount {
             let targetEmbedding = target.embedTokensForDrafter(draftInput)
@@ -517,9 +659,11 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
                 sharedKV: currentSharedKV,
                 positionOffset: positionOffset
             )
-            let draft = assistantOutput.logits[
-                0..., -1, 0...
-            ].argMax(axis: -1)
+            let draftLogits = assistantOutput.logits[0..., -1, 0...]
+            let draft = draftLogits.argMax(axis: -1)
+            if collectExactFourMargins {
+                draftMarginArrays.append(gemma4MTPTopTwoMargin(draftLogits))
+            }
             let draft2D = draft.reshaped([1, 1])
             draftTokens.append(draft2D)
             draftInput = draft2D
@@ -527,7 +671,15 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
         }
 
         let draftConcat = concatenated(draftTokens, axis: 1)
-        eval(draftConcat)
+        let draftMargins: [Float]
+        if collectExactFourMargins {
+            let marginArray = concatenated(draftMarginArrays, axis: 0)
+            eval(draftConcat, marginArray)
+            draftMargins = marginArray.asArray(Float.self)
+        } else {
+            eval(draftConcat)
+            draftMargins = []
+        }
         let draftValues = draftConcat
             .squeezed(axis: 0)
             .asArray(Int32.self)
@@ -543,7 +695,12 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
         case .exactPair:
             verified = try verifyWithExactPairs(
                 previousToken: previousToken,
-                drafts: draftValues
+                drafts: draftValues,
+                preferExactFour: !gemma4MTPAdaptiveExactFourEnabled
+                    || gemma4MTPShouldUseExactFour(
+                        draftMargins: draftMargins,
+                        threshold: gemma4MTPExactFourMarginThreshold
+                    )
             )
         case .serial:
             verified = try verifySerially(
@@ -619,12 +776,75 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
     // on assistant draft behavior.
     func verifyWithExactPairs(
         previousToken: Int,
-        drafts: [Int]
+        drafts: [Int],
+        preferExactFour: Bool = true
     ) throws -> Gemma4MTPVerifiedBlock {
         guard !drafts.isEmpty else {
             throw MLXFastError.invalidInput(
                 "exact-pair MTP verification requires at least one draft"
             )
+        }
+
+        if gemma4MTPExactFourEnabled, preferExactFour, drafts.count == 3 {
+            let fourInput = MLXArray(
+                ([previousToken] + drafts).map(Int32.init),
+                [1, 4]
+            )
+            if let output = target.exactMTPFour(
+                fourInput,
+                cache: targetCache
+            ) {
+                exactPairSegmentCount += 2
+                let tokenArray = output.logits
+                    .asType(.float32)
+                    .argMax(axis: -1)
+                let fourHidden = output.lastHidden
+                let fourSharedKV = output.capturedSharedKV
+                eval(
+                    tokenArray,
+                    fourHidden,
+                    fourSharedKV.fullAttention.0,
+                    fourSharedKV.fullAttention.1,
+                    fourSharedKV.slidingAttention.0,
+                    fourSharedKV.slidingAttention.1
+                )
+                let targets = tokenArray.asArray(Int32.self).map(Int.init)
+                guard targets.count == 4 else {
+                    throw MLXFastError.invalidInput(
+                        "exact-four MTP returned an unexpected logits shape"
+                    )
+                }
+                let accepted = drafts.indices.first {
+                    drafts[$0] != targets[$0]
+                } ?? drafts.count
+                let rejectedRows = drafts.count - accepted
+                if rejectedRows > 0 {
+                    for cache in targetCache {
+                        guard let combined = cache as? Gemma4CombinedKVCache,
+                              combined.trim(rejectedRows) == rejectedRows
+                        else {
+                            throw MLXFastError.invalidInput(
+                                "exact-four MTP could not roll back rejected rows"
+                            )
+                        }
+                    }
+                    exactPairRollbackRowCount += rejectedRows
+                }
+                let retainedSharedKV = rejectedRows > 0
+                    ? Gemma4SharedKV.sliceTail(
+                        from: fourSharedKV,
+                        rejected: rejectedRows
+                    )
+                    : fourSharedKV
+                return Gemma4MTPVerifiedBlock(
+                    committedTokens: Array(targets.prefix(accepted + 1)),
+                    acceptedDrafts: accepted,
+                    hidden: fourHidden[
+                        0..., accepted..<(accepted + 1), 0...
+                    ],
+                    sharedKV: retainedSharedKV
+                )
+            }
         }
         var draftIndex = 0
         var currentInput = previousToken

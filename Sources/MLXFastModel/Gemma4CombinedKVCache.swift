@@ -171,14 +171,15 @@ final class Gemma4CombinedKVCache: KVCache {
         return result
     }
 
-    /// Optimized path for one ordinary or two exact-pair positions.
+    /// Optimized path for one ordinary position or a bounded exact-verification
+    /// block. Four is the experimental MTP protocol's maximum block size.
     /// `combined` must be direct output from fused attention preparation, with
-    /// shape `[2,B,Hkv,L,D]` where `L` is one or two.
+    /// shape `[2,B,Hkv,L,D]` where `L` is in `1...4`.
     func updateCombined(_ combined: MLXArray) -> (MLXArray, MLXArray) {
         precondition(combined.ndim == 5)
         precondition(combined.dim(0) == 2)
         precondition(combined.dim(1) == 1)
-        precondition((1...2).contains(combined.dim(3)))
+        precondition((1...4).contains(combined.dim(3)))
 
         convertSplitStorageIfNeeded(matching: combined)
         switch kind {
@@ -189,17 +190,22 @@ final class Gemma4CombinedKVCache: KVCache {
         }
     }
 
-    /// Exact-pair verification can grow full storage, but rotating storage must
-    /// remain before its first wrap so row zero can view the serial prefix and
-    /// a rejected row one can be removed by offset-only rollback.
-    func canAppendExactPair() -> Bool {
+    /// Exact multi-row verification can grow full storage, but rotating storage
+    /// must remain before its first wrap so every row can view its serial prefix
+    /// and rejected tail rows can be removed by offset-only rollback.
+    func canAppendExactRows(_ count: Int) -> Bool {
+        guard (1...4).contains(count) else { return false }
         guard combinedStorage != nil, splitCache == nil else { return false }
         switch kind {
         case .full:
             return true
         case .rotating(let maxSize, _, _):
-            return offset == rotatingIndex && offset + 2 <= maxSize
+            return offset == rotatingIndex && offset + count <= maxSize
         }
+    }
+
+    func canAppendExactPair() -> Bool {
+        canAppendExactRows(2)
     }
 
     /// Materialized prefix before the newest exact-pair rows. Rotating caches

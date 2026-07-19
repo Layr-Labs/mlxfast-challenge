@@ -916,6 +916,10 @@ struct IndexedOutputProjection: @unchecked Sendable {
             && !verifyStockBits
     }
 
+    var supportsExactFourVector: Bool {
+        supportsExactTwoVector
+    }
+
     func exactTwoVector(_ input: MLXArray) -> MLXArray {
         precondition(input.dtype == .bfloat16)
         precondition(input.shape == [2, inputWidth])
@@ -923,6 +927,21 @@ struct IndexedOutputProjection: @unchecked Sendable {
             preconditionFailure("exact two-vector output payload is unavailable")
         }
         return gemma4ExactTwoVectorIndexedOutput(
+            payload: coTiled.words,
+            lut: metadata.lut,
+            input: input,
+            inputWidth: inputWidth,
+            indexBits: coTiled.indexBits
+        )
+    }
+
+    func exactFourVector(_ input: MLXArray) -> MLXArray {
+        precondition(input.dtype == .bfloat16)
+        precondition(input.shape == [4, inputWidth])
+        guard supportsExactFourVector, let coTiled else {
+            preconditionFailure("exact four-vector output payload is unavailable")
+        }
+        return gemma4ExactFourVectorIndexedOutput(
             payload: coTiled.words,
             lut: metadata.lut,
             input: input,

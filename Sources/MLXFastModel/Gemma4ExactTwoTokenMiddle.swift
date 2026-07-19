@@ -52,3 +52,38 @@ func gemma4ExactTwoTokenAttention(
     )
     return concatenated([attention0, attention1], axis: 2)
 }
+
+/// Four serial-causal attention rows composed from the proven exact-two
+/// primitive. Dense projections use native four-row kernels; attention keeps
+/// the established arithmetic and dispatch boundaries for rows 0/1 and 2/3.
+func gemma4ExactFourTokenAttention(
+    queries: MLXArray,
+    keysThroughRow0: MLXArray,
+    valuesThroughRow0: MLXArray,
+    keysThroughRow1: MLXArray,
+    valuesThroughRow1: MLXArray,
+    keysThroughRow2: MLXArray,
+    valuesThroughRow2: MLXArray,
+    keysThroughRow3: MLXArray,
+    valuesThroughRow3: MLXArray,
+    scale: Float
+) -> MLXArray {
+    precondition(queries.ndim == 4 && queries.dim(2) == 4)
+    let first = gemma4ExactTwoTokenAttention(
+        queries: queries[0..., 0..., 0..<2, 0...],
+        keysBeforeDraft: keysThroughRow0,
+        valuesBeforeDraft: valuesThroughRow0,
+        keysWithDraft: keysThroughRow1,
+        valuesWithDraft: valuesThroughRow1,
+        scale: scale
+    )
+    let second = gemma4ExactTwoTokenAttention(
+        queries: queries[0..., 0..., 2..<4, 0...],
+        keysBeforeDraft: keysThroughRow2,
+        valuesBeforeDraft: valuesThroughRow2,
+        keysWithDraft: keysThroughRow3,
+        valuesWithDraft: valuesThroughRow3,
+        scale: scale
+    )
+    return concatenated([first, second], axis: 2)
+}

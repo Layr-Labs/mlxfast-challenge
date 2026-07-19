@@ -41,6 +41,15 @@ private let gemma4VerifyStagedSlidingPrefillAttentionBits: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+private let gemma4MTPExactFourBoundariesEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_MTP_EXACT_FOUR_BOUNDARIES"
+    ] else {
+        return true
+    }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -910,6 +919,21 @@ final class Gemma4FastLayer {
             ) == true
     }
 
+    var supportsExactMTPFour: Bool {
+        supportsExactMTPPair
+            && indexedOutput?.supportsExactFourVector == true
+            && fusedGateUp?.supportsExactFourVector == true
+            && indexedDown?.supportsExactFourVector == true
+    }
+
+    func canRunExactMTPFour(offset: Int) -> Bool {
+        supportsExactMTPFour
+            && fusedAttentionRMS?.supportsPrefill(
+                offset: offset,
+                length: 4
+            ) == true
+    }
+
     /// Two MTP target rows with the same per-row accumulation order as K=1.
     /// Dense projections share each packed-weight traversal; normalization and
     /// attention retain serial row boundaries.
@@ -1006,6 +1030,139 @@ final class Gemma4FastLayer {
         return Gemma4FastLayerResult(
             hidden: mlpBoundary.0,
             nextNormalized: mlpBoundary.1,
+            keyValue: updated
+        )
+    }
+
+    /// Four serial-arithmetic MTP rows. Quantized projections consume all four
+    /// rows per dispatch; normalization, attention, and residual boundaries
+    /// retain the already-proven exact-two arithmetic in two row pairs.
+    func exactMTPFour(
+        _ x: MLXArray,
+        normalizedInput: MLXArray?,
+        cache: Gemma4CombinedKVCache
+    ) -> Gemma4FastLayerResult {
+        precondition(supportsExactMTPFour)
+        precondition(x.dtype == .bfloat16 && x.shape == [4, 5_376])
+        precondition(cache.canAppendExactRows(4))
+        let offset = cache.offset
+
+        let h: MLXArray
+        if let normalizedInput {
+            precondition(
+                normalizedInput.dtype == .bfloat16
+                    && normalizedInput.shape == x.shape
+            )
+            h = normalizedInput
+        } else {
+            h = concatenated(
+                [
+                    gemma4SerializedTwoRowRMSNorm(
+                        x[0..<2], weight: inputNormWeight, eps: eps),
+                    gemma4SerializedTwoRowRMSNorm(
+                        x[2..<4], weight: inputNormWeight, eps: eps),
+                ],
+                axis: 0
+            )
+        }
+
+        let rawQueries: MLXArray
+        let rawKeys: MLXArray
+        let rawValues: MLXArray?
+        if isSliding, let fusedQKV {
+            let projected = fusedQKV.exactFourVector(h)
+            rawQueries = projected.queries.reshaped(1, 4, 8_192)
+            rawKeys = projected.keys.reshaped(1, 4, 4_096)
+            rawValues = projected.values.reshaped(1, 4, 4_096)
+        } else if let fusedQK {
+            let projected = fusedQK.exactFourVector(h)
+            rawQueries = projected.queries.reshaped(1, 4, 16_384)
+            rawKeys = projected.keys.reshaped(1, 4, 2_048)
+            rawValues = nil
+        } else {
+            preconditionFailure("exact-four MTP QKV projection is unavailable")
+        }
+
+        guard let fusedAttentionRMS,
+              fusedAttentionRMS.supportsPrefill(offset: offset, length: 4),
+              let indexedOutput,
+              let fusedAttentionToMLPBoundary,
+              let fusedGateUp,
+              let indexedDown,
+              let fusedMLPToNextBoundary
+        else {
+            preconditionFailure("exact-four MTP layer payload is unavailable")
+        }
+        let prepared = fusedAttentionRMS.callCombinedQKVPrefill(
+            rawQueries: rawQueries,
+            rawKeys: rawKeys,
+            rawValues: rawValues,
+            offset: offset,
+            length: 4,
+            capacity: 4
+        )
+        let updated = cache.updateCombined(prepared.combinedKV)
+        let throughRow0 = cache.viewsExcludingNewest(3)
+        let throughRow1 = cache.viewsExcludingNewest(2)
+        let throughRow2 = cache.viewsExcludingNewest(1)
+        let attention = gemma4ExactFourTokenAttention(
+            queries: prepared.queries,
+            keysThroughRow0: throughRow0.0,
+            valuesThroughRow0: throughRow0.1,
+            keysThroughRow1: throughRow1.0,
+            valuesThroughRow1: throughRow1.1,
+            keysThroughRow2: throughRow2.0,
+            valuesThroughRow2: throughRow2.1,
+            keysThroughRow3: updated.0,
+            valuesThroughRow3: updated.1,
+            scale: scale
+        )
+        let mergedAttention = attention.transposed(0, 2, 1, 3)
+            .reshaped(4, nHeads * headDim)
+        let attentionOutput = indexedOutput.exactFourVector(mergedAttention)
+        let attentionResidual: MLXArray
+        let preFFN: MLXArray
+        if gemma4MTPExactFourBoundariesEnabled {
+            (attentionResidual, preFFN) = fusedAttentionToMLPBoundary(
+                attentionOutput: attentionOutput,
+                residual: x
+            )
+        } else {
+            let first = fusedAttentionToMLPBoundary(
+                attentionOutput: attentionOutput[0..<2],
+                residual: x[0..<2]
+            )
+            let second = fusedAttentionToMLPBoundary(
+                attentionOutput: attentionOutput[2..<4],
+                residual: x[2..<4]
+            )
+            attentionResidual = concatenated([first.0, second.0], axis: 0)
+            preFFN = concatenated([first.1, second.1], axis: 0)
+        }
+        let activated = fusedGateUp.exactFourVectorActivated(preFFN)
+        let mlp = indexedDown.exactFourVector(activated)
+        let hidden: MLXArray
+        let nextNormalized: MLXArray
+        if gemma4MTPExactFourBoundariesEnabled {
+            (hidden, nextNormalized) = fusedMLPToNextBoundary(
+                mlpOutput: mlp,
+                residual: attentionResidual
+            )
+        } else {
+            let first = fusedMLPToNextBoundary(
+                mlpOutput: mlp[0..<2],
+                residual: attentionResidual[0..<2]
+            )
+            let second = fusedMLPToNextBoundary(
+                mlpOutput: mlp[2..<4],
+                residual: attentionResidual[2..<4]
+            )
+            hidden = concatenated([first.0, second.0], axis: 0)
+            nextNormalized = concatenated([first.1, second.1], axis: 0)
+        }
+        return Gemma4FastLayerResult(
+            hidden: hidden,
+            nextNormalized: nextNormalized,
             keyValue: updated
         )
     }
@@ -1486,6 +1643,25 @@ final class Gemma4FastEngine {
         }
     }
 
+    func canRunExactMTPFour(cache: [KVCache]) -> Bool {
+        guard supportsExactMTPPair, cache.count == layers.count else {
+            return false
+        }
+        let combinedCaches = cache.compactMap {
+            $0 as? Gemma4CombinedKVCache
+        }
+        guard combinedCaches.count == layers.count,
+              combinedCaches.allSatisfy({ $0.canAppendExactRows(4) })
+        else {
+            return false
+        }
+        return layers.indices.allSatisfy {
+            layers[$0].canRunExactMTPFour(
+                offset: combinedCaches[$0].offset
+            )
+        }
+    }
+
     /// MTP-only exact pair target forward. It shares packed weight reads while
     /// retaining K=1 arithmetic independently for each row.
     func exactMTPPair(
@@ -1548,6 +1724,70 @@ final class Gemma4FastEngine {
         return Gemma4MTPForward(
             logits: logits.reshaped(1, 2, logits.dim(-1)),
             lastHidden: hidden.reshaped(1, 2, hidden.dim(-1)),
+            capturedSharedKV: Gemma4SharedKV(
+                fullAttention: capturedFull,
+                slidingAttention: capturedSliding
+            )
+        )
+    }
+
+    func exactMTPFour(
+        _ inputs: MLXArray,
+        cache: [KVCache]
+    ) -> Gemma4MTPForward {
+        precondition(canRunExactMTPFour(cache: cache))
+        precondition(inputs.dtype == .int32 && inputs.shape == [1, 4])
+        let combinedCaches = cache.compactMap {
+            $0 as? Gemma4CombinedKVCache
+        }
+        let embeddedRows = (0..<4).map {
+            embedTokens(inputs[0..., $0..<($0 + 1)]) * embedScale
+        }
+        var hidden = concatenated(embeddedRows, axis: 1)
+            .reshaped(4, 5_376)
+        var normalizedInput: MLXArray?
+        var capturedFull: (MLXArray, MLXArray)?
+        var capturedSliding: (MLXArray, MLXArray)?
+        for (index, layer) in layers.enumerated() {
+            let result = layer.exactMTPFour(
+                hidden,
+                normalizedInput: normalizedInput,
+                cache: combinedCaches[index]
+            )
+            hidden = result.hidden
+            normalizedInput = result.nextNormalized
+            if layer.isSliding {
+                capturedSliding = result.keyValue
+            } else {
+                capturedFull = result.keyValue
+            }
+            let layerNumber = index + 1
+            if exactPairAsyncLayerGroup > 0,
+               layerNumber >= exactPairAsyncLayerLead,
+               (layerNumber - exactPairAsyncLayerLead)
+                    .isMultiple(of: exactPairAsyncLayerGroup)
+            {
+                if let normalizedInput {
+                    asyncEval(hidden, normalizedInput)
+                } else {
+                    asyncEval(hidden)
+                }
+            }
+        }
+        guard let normalizedInput,
+              let tiedVocabularyHead,
+              let capturedFull,
+              let capturedSliding
+        else {
+            preconditionFailure("exact-four MTP final state is unavailable")
+        }
+        let logits = tiedVocabularyHead.exactFourVectorPacked13Softcapped(
+            normalizedInput,
+            cap: MLXArray(softcap)
+        )
+        return Gemma4MTPForward(
+            logits: logits.reshaped(1, 4, logits.dim(-1)),
+            lastHidden: hidden.reshaped(1, 4, hidden.dim(-1)),
             capturedSharedKV: Gemma4SharedKV(
                 fullAttention: capturedFull,
                 slidingAttention: capturedSliding

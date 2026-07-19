@@ -366,12 +366,16 @@ struct FusedAttentionToMLPBoundary: @unchecked Sendable {
             )
             return (outputs[0], outputs[1])
         }
-        precondition(attentionOutput.shape == [2, 5376])
+        precondition(
+            attentionOutput.shape == [2, 5376]
+                || attentionOutput.shape == [4, 5376]
+        )
+        let rows = attentionOutput.shape[0]
         let outputs = gemma4FusedAttentionToMLPBoundaryPairKernel(
             [attentionOutput, residual, postAttentionWeight, preFFNWeight],
-            grid: (1024, 2, 1),
+            grid: (1024, rows, 1),
             threadGroup: (1024, 1, 1),
-            outputShapes: [[2, 5376], [2, 5376]],
+            outputShapes: [[rows, 5376], [rows, 5376]],
             outputDTypes: [.bfloat16, .bfloat16]
         )
         return (outputs[0], outputs[1])
@@ -753,12 +757,16 @@ struct FusedMLPToNextBoundary: @unchecked Sendable {
             )
             return (outputs[0], outputs[1])
         }
-        precondition(mlpOutput.shape == [2, 5376])
+        precondition(
+            mlpOutput.shape == [2, 5376]
+                || mlpOutput.shape == [4, 5376]
+        )
+        let rows = mlpOutput.shape[0]
         let outputs = gemma4FusedMLPToNextBoundaryPairKernel(
             [mlpOutput, residual, postFFNWeight, layerScalar, nextNormWeight],
-            grid: (1024, 2, 1),
+            grid: (1024, rows, 1),
             threadGroup: (1024, 1, 1),
-            outputShapes: [[2, 5376], [2, 5376]],
+            outputShapes: [[rows, 5376], [rows, 5376]],
             outputDTypes: [.bfloat16, .bfloat16]
         )
         return (outputs[0], outputs[1])

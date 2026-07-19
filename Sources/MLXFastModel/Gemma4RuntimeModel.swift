@@ -77,6 +77,18 @@ public final class Gemma4RuntimeModel: Module, LanguageModel {
         return fastEngine.exactMTPPair(inputs, cache: cache)
     }
 
+    func exactMTPFour(
+        _ inputs: MLXArray,
+        cache: [KVCache]
+    ) -> Gemma4MTPForward? {
+        guard let fastEngine,
+              fastEngine.canRunExactMTPFour(cache: cache)
+        else {
+            return nil
+        }
+        return fastEngine.exactMTPFour(inputs, cache: cache)
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         if let fastEngine {
             return fastEngine(inputs, cache: cache)
