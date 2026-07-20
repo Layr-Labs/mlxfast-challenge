@@ -58,6 +58,15 @@ private let gemma4MTPSecondaryMarginSelectorEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+private let gemma4MTPDrafterAsyncEvalEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_MTP_DRAFTER_ASYNC_EVAL"
+    ] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private let gemma4MTPTopTwoMarginKernel = MLXFast.metalKernel(
     name: "gemma4_mtp_top_two_margin_262144_v1",
     inputNames: ["logits"],
@@ -710,6 +719,17 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
             draftTokens.append(draft2D)
             draftInput = draft2D
             draftHidden = assistantOutput.lastHidden
+            // Dispatch this draft's subgraph while the host constructs the
+            // next draft's graph, mirroring the exact-pair verify path's
+            // async cadence. Scheduling only: the per-array dependency graph
+            // is unchanged, so drafted tokens and margins are bit-identical.
+            if gemma4MTPDrafterAsyncEvalEnabled {
+                if collectExactFourMargins, let margin = draftMarginArrays.last {
+                    asyncEval(draft2D, margin)
+                } else {
+                    asyncEval(draft2D)
+                }
+            }
         }
 
         let draftConcat = concatenated(draftTokens, axis: 1)
