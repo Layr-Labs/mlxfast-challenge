@@ -50,6 +50,17 @@ private let gemma4MTPExactFourBoundariesEnabled: Bool = {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }()
 
+// These two projections are faster as two exact-two launches than as one
+// four-accumulator kernel, while retaining the same per-row reduction order.
+private let gemma4MTPExactFourOutputDownPairsEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_MTP_EXACT_FOUR_OUTPUT_DOWN_PAIRS"
+    ] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Affine 4-bit projection extracted from a loaded QuantizedLinear.
 struct FastQuantizedProjection: @unchecked Sendable {
     let weight: MLXArray
@@ -1119,7 +1130,19 @@ final class Gemma4FastLayer {
         )
         let mergedAttention = attention.transposed(0, 2, 1, 3)
             .reshaped(4, nHeads * headDim)
-        let attentionOutput = indexedOutput.exactFourVector(mergedAttention)
+        let attentionOutput: MLXArray
+        if gemma4MTPExactFourOutputDownPairsEnabled {
+            let candidate = concatenated(
+                [
+                    indexedOutput.exactTwoVector(mergedAttention[0..<2]),
+                    indexedOutput.exactTwoVector(mergedAttention[2..<4]),
+                ],
+                axis: 0
+            )
+            attentionOutput = candidate
+        } else {
+            attentionOutput = indexedOutput.exactFourVector(mergedAttention)
+        }
         let attentionResidual: MLXArray
         let preFFN: MLXArray
         if gemma4MTPExactFourBoundariesEnabled {
@@ -1140,7 +1163,19 @@ final class Gemma4FastLayer {
             preFFN = concatenated([first.1, second.1], axis: 0)
         }
         let activated = fusedGateUp.exactFourVectorActivated(preFFN)
-        let mlp = indexedDown.exactFourVector(activated)
+        let mlp: MLXArray
+        if gemma4MTPExactFourOutputDownPairsEnabled {
+            let candidate = concatenated(
+                [
+                    indexedDown.exactTwoVector(activated[0..<2]),
+                    indexedDown.exactTwoVector(activated[2..<4]),
+                ],
+                axis: 0
+            )
+            mlp = candidate
+        } else {
+            mlp = indexedDown.exactFourVector(activated)
+        }
         let hidden: MLXArray
         let nextNormalized: MLXArray
         if gemma4MTPExactFourBoundariesEnabled {
