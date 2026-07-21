@@ -1132,16 +1132,15 @@ final class Gemma4FastLayer {
             .reshaped(4, nHeads * headDim)
         let attentionOutput: MLXArray
         if gemma4MTPExactFourOutputDownPairsEnabled {
-            let candidate = concatenated(
+            attentionOutput = indexedOutput.exactFourVector(mergedAttention)
+        } else {
+            attentionOutput = concatenated(
                 [
                     indexedOutput.exactTwoVector(mergedAttention[0..<2]),
                     indexedOutput.exactTwoVector(mergedAttention[2..<4]),
                 ],
                 axis: 0
             )
-            attentionOutput = candidate
-        } else {
-            attentionOutput = indexedOutput.exactFourVector(mergedAttention)
         }
         let attentionResidual: MLXArray
         let preFFN: MLXArray
@@ -1165,16 +1164,15 @@ final class Gemma4FastLayer {
         let activated = fusedGateUp.exactFourVectorActivated(preFFN)
         let mlp: MLXArray
         if gemma4MTPExactFourOutputDownPairsEnabled {
-            let candidate = concatenated(
+            mlp = indexedDown.exactFourVector(activated)
+        } else {
+            mlp = concatenated(
                 [
                     indexedDown.exactTwoVector(activated[0..<2]),
                     indexedDown.exactTwoVector(activated[2..<4]),
                 ],
                 axis: 0
             )
-            mlp = candidate
-        } else {
-            mlp = indexedDown.exactFourVector(activated)
         }
         let hidden: MLXArray
         let nextNormalized: MLXArray
@@ -1709,18 +1707,55 @@ final class Gemma4FastEngine {
         _ inputs: MLXArray,
         cache: [KVCache]
     ) -> Gemma4MTPForward {
+        let result = exactMTPPairTrunk(inputs, cache: cache)
+        guard let tiedVocabularyHead else {
+            preconditionFailure("exact MTP pair tied head is unavailable")
+        }
+        let logits = tiedVocabularyHead.exactTwoVectorPacked13Softcapped(
+            result.normalizedInput,
+            cap: MLXArray(softcap)
+        )
+        return Gemma4MTPForward(
+            logits: logits.reshaped(1, 2, logits.dim(-1)),
+            lastHidden: result.lastHidden,
+            capturedSharedKV: result.capturedSharedKV
+        )
+    }
+
+    func exactMTPPairTokens(
+        _ inputs: MLXArray,
+        cache: [KVCache]
+    ) -> Gemma4MTPTokenForward {
+        let result = exactMTPPairTrunk(inputs, cache: cache)
+        guard let tiedVocabularyHead else {
+            preconditionFailure("exact MTP pair tied head is unavailable")
+        }
+        let tokenIDs = tiedVocabularyHead.exactTwoVectorPacked13Argmax(
+            result.normalizedInput,
+            cap: MLXArray(softcap)
+        )
+        return Gemma4MTPTokenForward(
+            tokenIDs: tokenIDs,
+            lastHidden: result.lastHidden,
+            capturedSharedKV: result.capturedSharedKV
+        )
+    }
+
+    private func exactMTPPairTrunk(
+        _ inputs: MLXArray,
+        cache: [KVCache]
+    ) -> (
+        normalizedInput: MLXArray,
+        lastHidden: MLXArray,
+        capturedSharedKV: Gemma4SharedKV
+    ) {
         precondition(canRunExactMTPPair(cache: cache))
         precondition(inputs.dtype == .int32 && inputs.shape == [1, 2])
         let combinedCaches = cache.compactMap {
             $0 as? Gemma4CombinedKVCache
         }
 
-        // Preserve the serial gather/scaling boundary. Weight-sharing begins
-        // only at the dense projections where the exact kernels retain each
-        // row's K=1 reduction order.
-        let first = embedTokens(inputs[0..., 0..<1]) * embedScale
-        let second = embedTokens(inputs[0..., 1..<2]) * embedScale
-        var hidden = concatenated([first, second], axis: 1)
+        var hidden = (embedTokens(inputs) * embedScale)
             .reshaped(2, 5_376)
         var normalizedInput: MLXArray?
         var capturedFull: (MLXArray, MLXArray)?
@@ -1752,18 +1787,13 @@ final class Gemma4FastEngine {
             }
         }
         guard let normalizedInput,
-              let tiedVocabularyHead,
               let capturedFull,
               let capturedSliding
         else {
             preconditionFailure("exact MTP pair final state is unavailable")
         }
-        let logits = tiedVocabularyHead.exactTwoVectorPacked13Softcapped(
-            normalizedInput,
-            cap: MLXArray(softcap)
-        )
-        return Gemma4MTPForward(
-            logits: logits.reshaped(1, 2, logits.dim(-1)),
+        return (
+            normalizedInput: normalizedInput,
             lastHidden: hidden.reshaped(1, 2, hidden.dim(-1)),
             capturedSharedKV: Gemma4SharedKV(
                 fullAttention: capturedFull,
@@ -1823,10 +1853,7 @@ final class Gemma4FastEngine {
         let combinedCaches = cache.compactMap {
             $0 as? Gemma4CombinedKVCache
         }
-        let embeddedRows = (0..<4).map {
-            embedTokens(inputs[0..., $0..<($0 + 1)]) * embedScale
-        }
-        var hidden = concatenated(embeddedRows, axis: 1)
+        var hidden = (embedTokens(inputs) * embedScale)
             .reshaped(4, 5_376)
         var normalizedInput: MLXArray?
         var capturedFull: (MLXArray, MLXArray)?

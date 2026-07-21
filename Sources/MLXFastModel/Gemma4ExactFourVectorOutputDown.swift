@@ -306,15 +306,15 @@ func gemma4ExactFourVectorIndexedOutput(
     precondition(lut.dtype == .uint32 && lut.ndim == 1)
     let kernel: MLXFast.MLXFastKernel
     switch (inputWidth, indexBits) {
-    case (8_192, 12): kernel = gemma4ExactFourVectorSlidingFixed12Output
-    case (8_192, 13): kernel = gemma4ExactFourVectorSlidingFixed13Output
-    case (16_384, 12): kernel = gemma4ExactFourVectorFullFixed12Output
-    case (16_384, 13): kernel = gemma4ExactFourVectorFullFixed13Output
+    case (8_192, 12): kernel = gemma4ExactTwoVectorSlidingFixed12Output
+    case (8_192, 13): kernel = gemma4ExactTwoVectorSlidingFixed13Output
+    case (16_384, 12): kernel = gemma4ExactTwoVectorFullFixed12Output
+    case (16_384, 13): kernel = gemma4ExactTwoVectorFullFixed13Output
     default: preconditionFailure("unsupported exact four-vector output layout")
     }
     return kernel(
         [payload, lut, input],
-        grid: (32, 1_344, 1),
+        grid: (32, 1_344, 2),
         threadGroup: (32, 2, 1),
         outputShapes: [[4, 5_376]],
         outputDTypes: [.bfloat16]
@@ -329,9 +329,9 @@ func gemma4ExactFourVectorIndexedDown(
     precondition(payload.dtype == .uint32 && payload.shape == [672, 42, 536])
     precondition(lut.dtype == .uint32 && lut.ndim == 1)
     precondition(input.dtype == .bfloat16 && input.shape == [4, 21_504])
-    return gemma4ExactFourVectorFixed12Down(
+    return gemma4ExactTwoVectorDownKernel(
         [payload, lut, input],
-        grid: (32, 1_344, 1),
+        grid: (32, 1_344, 2),
         threadGroup: (32, 2, 1),
         outputShapes: [[4, 5_376]],
         outputDTypes: [.bfloat16]
@@ -465,9 +465,9 @@ func gemma4ExactFourVectorU16IndexedDown(
     precondition(lut.dtype == .uint32 && lut.ndim == 1)
     precondition((1...65_536).contains(lut.size))
     precondition(input.dtype == .bfloat16 && input.shape == [4, 21_504])
-    return gemma4ExactFourVectorU16Down(
+    return gemma4ExactTwoVectorU16DownKernel(
         [weight, indices, lut, input],
-        grid: (32, 1_344, 1),
+        grid: (32, 1_344, 2),
         threadGroup: (32, 2, 1),
         outputShapes: [[4, 5_376]],
         outputDTypes: [.bfloat16]

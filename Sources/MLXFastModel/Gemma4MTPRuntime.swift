@@ -933,10 +933,25 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
                 [Int32(currentInput), Int32(drafts[draftIndex])],
                 [1, 2]
             )
-            guard let output = target.exactMTPPair(
+            let pairOutput: Gemma4MTPTokenForward?
+            if gemma4MTPExactPairFusedArgmaxEnabled {
+                pairOutput = target.exactMTPPairTokens(
+                    pairInput,
+                    cache: targetCache
+                )
+            } else if let fullOutput = target.exactMTPPair(
                 pairInput,
                 cache: targetCache
-            ) else {
+            ) {
+                pairOutput = Gemma4MTPTokenForward(
+                    tokenIDs: fullOutput.logits.asType(.float32).argMax(axis: -1),
+                    lastHidden: fullOutput.lastHidden,
+                    capturedSharedKV: fullOutput.capturedSharedKV
+                )
+            } else {
+                pairOutput = nil
+            }
+            guard let output = pairOutput else {
                 // Only deterministic cache geometry may serialize: a rotating
                 // cache at its wrap boundary cannot retain the prefix view
                 // needed by exact-pair attention. Engine-level ineligibility
@@ -960,9 +975,7 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
             }
             exactPairSegmentCount += 1
 
-            let tokenArray = output.logits
-                .asType(.float32)
-                .argMax(axis: -1)
+            let tokenArray = output.tokenIDs
             let pairHidden = output.lastHidden
             let pairSharedKV = output.capturedSharedKV
             eval(

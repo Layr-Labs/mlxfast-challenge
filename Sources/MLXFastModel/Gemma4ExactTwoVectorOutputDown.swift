@@ -41,15 +41,16 @@ private func gemma4ExactTwoVectorOutputSource(
             kWeightWordsPerTile + kMetadataWordsPerTile;
         constexpr int kWordsPerThreadgroup = kBlocks * kPayloadWords;
 
+        const int pair_index = threadgroup_position_in_grid.z;
         const int threadgroup_row = threadgroup_position_in_grid.y;
         const int simd_group = simdgroup_index_in_threadgroup;
         const int output_row =
             threadgroup_row * 8 + simd_group * kRowsPerSIMD;
         const uint lane_group = thread_index_in_simdgroup / 4;
         const device bfloat* input0 =
-            x + thread_index_in_simdgroup * 16;
+            x + pair_index * 2 * kInputWidth + thread_index_in_simdgroup * 16;
         const device bfloat* input1 =
-            x + kInputWidth + thread_index_in_simdgroup * 16;
+            x + (pair_index * 2 + 1) * kInputWidth + thread_index_in_simdgroup * 16;
         const device uint* tile_words =
             cotiled_payload + threadgroup_row * kWordsPerThreadgroup;
 
@@ -101,9 +102,9 @@ private func gemma4ExactTwoVectorOutputSource(
             result0[row] = simd_sum(result0[row]);
             result1[row] = simd_sum(result1[row]);
             if (thread_index_in_simdgroup == 0) {
-                output[output_row + row] =
+                output[pair_index * 2 * kOutputRows + output_row + row] =
                     static_cast<bfloat>(result0[row]);
-                output[kOutputRows + output_row + row] =
+                output[(pair_index * 2 + 1) * kOutputRows + output_row + row] =
                     static_cast<bfloat>(result1[row]);
             }
         }
@@ -204,7 +205,7 @@ private let gemma4ExactTwoVectorOutputHeader = """
     }
     """
 
-private let gemma4ExactTwoVectorSlidingFixed12Output = MLXFast.metalKernel(
+let gemma4ExactTwoVectorSlidingFixed12Output = MLXFast.metalKernel(
     name: "gemma4_exact_two_vector_cotiled_fixed12_indexed_output_qmv_8192_mtp_v2",
     inputNames: ["cotiled_payload", "lut", "x"],
     outputNames: ["output"],
@@ -213,7 +214,7 @@ private let gemma4ExactTwoVectorSlidingFixed12Output = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-private let gemma4ExactTwoVectorSlidingFixed13Output = MLXFast.metalKernel(
+let gemma4ExactTwoVectorSlidingFixed13Output = MLXFast.metalKernel(
     name: "gemma4_exact_two_vector_cotiled_fixed13_indexed_output_qmv_8192_mtp_v2",
     inputNames: ["cotiled_payload", "lut", "x"],
     outputNames: ["output"],
@@ -222,7 +223,7 @@ private let gemma4ExactTwoVectorSlidingFixed13Output = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-private let gemma4ExactTwoVectorFullFixed12Output = MLXFast.metalKernel(
+let gemma4ExactTwoVectorFullFixed12Output = MLXFast.metalKernel(
     name: "gemma4_exact_two_vector_cotiled_fixed12_indexed_output_qmv_16384_mtp_v2",
     inputNames: ["cotiled_payload", "lut", "x"],
     outputNames: ["output"],
@@ -231,7 +232,7 @@ private let gemma4ExactTwoVectorFullFixed12Output = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-private let gemma4ExactTwoVectorFullFixed13Output = MLXFast.metalKernel(
+let gemma4ExactTwoVectorFullFixed13Output = MLXFast.metalKernel(
     name: "gemma4_exact_two_vector_cotiled_fixed13_indexed_output_qmv_16384_mtp_v2",
     inputNames: ["cotiled_payload", "lut", "x"],
     outputNames: ["output"],
@@ -282,77 +283,78 @@ private let gemma4ExactTwoVectorDownSource = """
         kWeightWordsPerTile + kMetadataWordsPerTile;
     constexpr int kWordsPerThreadgroup = kBlocks * kPayloadWords;
 
-    const int threadgroup_row = threadgroup_position_in_grid.y;
-    const int simd_group = simdgroup_index_in_threadgroup;
-    const int output_row =
-        threadgroup_row * 8 + simd_group * kRowsPerSIMD;
-    const uint lane_group = thread_index_in_simdgroup / 4;
-    const device bfloat* input0 =
-        x + thread_index_in_simdgroup * 16;
-    const device bfloat* input1 =
-        x + kInputWidth + thread_index_in_simdgroup * 16;
-    const device uint* tile_words =
-        cotiled_payload + threadgroup_row * kWordsPerThreadgroup;
+        const int pair_index = threadgroup_position_in_grid.z;
+        const int threadgroup_row = threadgroup_position_in_grid.y;
+        const int simd_group = simdgroup_index_in_threadgroup;
+        const int output_row =
+            threadgroup_row * 8 + simd_group * kRowsPerSIMD;
+        const uint lane_group = thread_index_in_simdgroup / 4;
+        const device bfloat* input0 =
+            x + pair_index * 2 * kInputWidth + thread_index_in_simdgroup * 16;
+        const device bfloat* input1 =
+            x + (pair_index * 2 + 1) * kInputWidth + thread_index_in_simdgroup * 16;
+        const device uint* tile_words =
+            cotiled_payload + threadgroup_row * kWordsPerThreadgroup;
 
-    float result0[kRowsPerSIMD] = {0};
-    float result1[kRowsPerSIMD] = {0};
-    for (int block = 0; block < kInputWidth; block += kBlockSize) {
-        float values0[16];
-        float values1[16];
-        const float input_sum0 =
-            gemma4_exact_two_vector_down_load_values(input0, values0);
-        const float input_sum1 =
-            gemma4_exact_two_vector_down_load_values(input1, values1);
-        const device uint* weight_words = tile_words
-            + simd_group * kWordsPerSIMD
-            + thread_index_in_simdgroup * kWordsPerLane;
-        const device uchar* metadata_bytes =
-            reinterpret_cast<const device uchar*>(
-                tile_words + kWeightWordsPerTile)
-            + simd_group * kRowsPerSIMD * kMetadataBytesPerRow;
+        float result0[kRowsPerSIMD] = {0};
+        float result1[kRowsPerSIMD] = {0};
+        for (int block = 0; block < kInputWidth; block += kBlockSize) {
+            float values0[16];
+            float values1[16];
+            const float input_sum0 =
+                gemma4_exact_two_vector_down_load_values(input0, values0);
+            const float input_sum1 =
+                gemma4_exact_two_vector_down_load_values(input1, values1);
+            const device uint* weight_words = tile_words
+                + simd_group * kWordsPerSIMD
+                + thread_index_in_simdgroup * kWordsPerLane;
+            const device uchar* metadata_bytes =
+                reinterpret_cast<const device uchar*>(
+                    tile_words + kWeightWordsPerTile)
+                + simd_group * kRowsPerSIMD * kMetadataBytesPerRow;
+
+            for (int row = 0; row < kRowsPerSIMD; ++row) {
+                const device uint* row_weight_words =
+                    weight_words + row * kWordsPerRow;
+                const device uchar* row_metadata =
+                    metadata_bytes + row * kMetadataBytesPerRow;
+                const uint low = row_metadata[lane_group];
+                const uint packed_high =
+                    row_metadata[8 + lane_group / 2];
+                const uint high =
+                    (packed_high >> ((lane_group & 1) * 4)) & 0x0f;
+                const uint metadata_index = low | (high << 8);
+                const uint pair = lut[metadata_index];
+                const uint packed_word0 = row_weight_words[0];
+                const uint packed_word1 = row_weight_words[1];
+                gemma4_exact_two_vector_down_qdot_4bit(
+                    packed_word0,
+                    packed_word1,
+                    values0,
+                    values1,
+                    gemma4_exact_two_vector_down_pair_scale(pair),
+                    gemma4_exact_two_vector_down_pair_bias(pair),
+                    input_sum0,
+                    input_sum1,
+                    result0[row],
+                    result1[row]);
+            }
+
+            tile_words += kPayloadWords;
+            input0 += kBlockSize;
+            input1 += kBlockSize;
+        }
 
         for (int row = 0; row < kRowsPerSIMD; ++row) {
-            const device uint* row_weight_words =
-                weight_words + row * kWordsPerRow;
-            const device uchar* row_metadata =
-                metadata_bytes + row * kMetadataBytesPerRow;
-            const uint low = row_metadata[lane_group];
-            const uint packed_high =
-                row_metadata[8 + lane_group / 2];
-            const uint high =
-                (packed_high >> ((lane_group & 1) * 4)) & 0x0f;
-            const uint metadata_index = low | (high << 8);
-            const uint pair = lut[metadata_index];
-            const uint packed_word0 = row_weight_words[0];
-            const uint packed_word1 = row_weight_words[1];
-            gemma4_exact_two_vector_down_qdot_4bit(
-                packed_word0,
-                packed_word1,
-                values0,
-                values1,
-                gemma4_exact_two_vector_down_pair_scale(pair),
-                gemma4_exact_two_vector_down_pair_bias(pair),
-                input_sum0,
-                input_sum1,
-                result0[row],
-                result1[row]);
+            result0[row] = simd_sum(result0[row]);
+            result1[row] = simd_sum(result1[row]);
+            if (thread_index_in_simdgroup == 0) {
+                output[pair_index * 2 * kOutputRows + output_row + row] =
+                    static_cast<bfloat>(result0[row]);
+                output[(pair_index * 2 + 1) * kOutputRows + output_row + row] =
+                    static_cast<bfloat>(result1[row]);
+            }
         }
-
-        tile_words += kPayloadWords;
-        input0 += kBlockSize;
-        input1 += kBlockSize;
-    }
-
-    for (int row = 0; row < kRowsPerSIMD; ++row) {
-        result0[row] = simd_sum(result0[row]);
-        result1[row] = simd_sum(result1[row]);
-        if (thread_index_in_simdgroup == 0) {
-            output[output_row + row] =
-                static_cast<bfloat>(result0[row]);
-            output[kOutputRows + output_row + row] =
-                static_cast<bfloat>(result1[row]);
-        }
-    }
     """
 
 private let gemma4ExactTwoVectorDownHeader = """
@@ -448,7 +450,7 @@ private let gemma4ExactTwoVectorDownHeader = """
     }
     """
 
-private let gemma4ExactTwoVectorDownKernel = MLXFast.metalKernel(
+let gemma4ExactTwoVectorDownKernel = MLXFast.metalKernel(
     name: "gemma4_exact_two_vector_cotiled_fixed12_indexed_down_qmv_21504_mtp_v2",
     inputNames: ["cotiled_payload", "lut", "x"],
     outputNames: ["output"],
@@ -482,6 +484,7 @@ private let gemma4ExactTwoVectorU16DownSource = """
     constexpr int kRowsPerSIMD = 4;
     constexpr int kBlockSize = 512;
 
+    const int pair_index = threadgroup_position_in_grid.z;
     const int output_row =
         threadgroup_position_in_grid.y * 8
         + simdgroup_index_in_threadgroup * kRowsPerSIMD;
@@ -493,9 +496,9 @@ private let gemma4ExactTwoVectorU16DownSource = """
         indices + output_row * kGroupsPerRow
         + thread_index_in_simdgroup / 4;
     const device bfloat* input0 =
-        x + thread_index_in_simdgroup * 16;
+        x + pair_index * 2 * kInputWidth + thread_index_in_simdgroup * 16;
     const device bfloat* input1 =
-        x + kInputWidth + thread_index_in_simdgroup * 16;
+        x + (pair_index * 2 + 1) * kInputWidth + thread_index_in_simdgroup * 16;
 
     float result0[kRowsPerSIMD] = {0};
     float result1[kRowsPerSIMD] = {0};
@@ -539,9 +542,9 @@ private let gemma4ExactTwoVectorU16DownSource = """
         result0[row] = simd_sum(result0[row]);
         result1[row] = simd_sum(result1[row]);
         if (thread_index_in_simdgroup == 0) {
-            output[output_row + row] =
+            output[pair_index * 2 * kOutputRows + output_row + row] =
                 static_cast<bfloat>(result0[row]);
-            output[kOutputRows + output_row + row] =
+            output[(pair_index * 2 + 1) * kOutputRows + output_row + row] =
                 static_cast<bfloat>(result1[row]);
         }
     }
@@ -641,7 +644,7 @@ private let gemma4ExactTwoVectorU16DownHeader = """
     }
     """
 
-private let gemma4ExactTwoVectorU16DownKernel = MLXFast.metalKernel(
+let gemma4ExactTwoVectorU16DownKernel = MLXFast.metalKernel(
     name: "gemma4_exact_two_vector_u16_indexed_down_qmv_21504_mtp_v2",
     inputNames: ["weight", "indices", "lut", "x"],
     outputNames: ["output"],

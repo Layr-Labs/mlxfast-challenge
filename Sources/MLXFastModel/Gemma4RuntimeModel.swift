@@ -13,6 +13,15 @@ private let gemma4MTPExactFourFusedArgmaxEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+let gemma4MTPExactPairFusedArgmaxEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_MTP_EXACT_PAIR_FUSED_ARGMAX"
+    ] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 func gemma4LastTokenRange(sequenceLength: Int) -> Range<Int>? {
     sequenceLength > 1 ? (sequenceLength - 1)..<sequenceLength : nil
 }
@@ -84,6 +93,26 @@ public final class Gemma4RuntimeModel: Module, LanguageModel {
             return nil
         }
         return fastEngine.exactMTPPair(inputs, cache: cache)
+    }
+
+    func exactMTPPairTokens(
+        _ inputs: MLXArray,
+        cache: [KVCache]
+    ) -> Gemma4MTPTokenForward? {
+        guard let fastEngine,
+              fastEngine.canRunExactMTPPair(cache: cache)
+        else {
+            return nil
+        }
+        if gemma4MTPExactPairFusedArgmaxEnabled {
+            return fastEngine.exactMTPPairTokens(inputs, cache: cache)
+        }
+        let output = fastEngine.exactMTPPair(inputs, cache: cache)
+        return Gemma4MTPTokenForward(
+            tokenIDs: output.logits.asType(.float32).argMax(axis: -1),
+            lastHidden: output.lastHidden,
+            capturedSharedKV: output.capturedSharedKV
+        )
     }
 
     func exactMTPFour(
