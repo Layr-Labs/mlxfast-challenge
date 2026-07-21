@@ -18,7 +18,6 @@ private let gemma4FusedAttentionToMLPBoundaryKernel = MLXFast.metalKernel(
 
         threadgroup float inverse_mean[1];
         threadgroup float local_sums[kSIMDSize];
-        threadgroup bfloat residual_row[kWidth];
 
         float accumulator = 0;
         for (uint row_offset = 0;
@@ -71,7 +70,6 @@ private let gemma4FusedAttentionToMLPBoundaryKernel = MLXFast.metalKernel(
                         post_attention_weight[dimension] * unit_normalized;
                     const bfloat combined =
                         residual[dimension] + post_normalized;
-                    residual_row[dimension] = combined;
                     residual_output[dimension] = combined;
                 }
             } else {
@@ -84,7 +82,6 @@ private let gemma4FusedAttentionToMLPBoundaryKernel = MLXFast.metalKernel(
                             post_attention_weight[dimension] * unit_normalized;
                         const bfloat combined =
                             residual[dimension] + post_normalized;
-                        residual_row[dimension] = combined;
                         residual_output[dimension] = combined;
                     }
                 }
@@ -99,13 +96,13 @@ private let gemma4FusedAttentionToMLPBoundaryKernel = MLXFast.metalKernel(
             const uint base = row_offset + thread_index * kReads;
             if (base + kReads <= kWidth) {
                 for (uint index = 0; index < kReads; ++index) {
-                    const float value = residual_row[base + index];
+                    const float value = residual_output[base + index];
                     accumulator += value * value;
                 }
             } else {
                 for (uint index = 0; index < kReads; ++index) {
                     if (base + index < kWidth) {
-                        const float value = residual_row[base + index];
+                        const float value = residual_output[base + index];
                         accumulator += value * value;
                     }
                 }
@@ -138,7 +135,7 @@ private let gemma4FusedAttentionToMLPBoundaryKernel = MLXFast.metalKernel(
                 for (uint index = 0; index < kReads; ++index) {
                     const uint dimension = base + index;
                     const bfloat unit_normalized = static_cast<bfloat>(
-                        residual_row[dimension] * inverse_mean[0]);
+                        residual_output[dimension] * inverse_mean[0]);
                     normalized_output[dimension] =
                         pre_ffn_weight[dimension] * unit_normalized;
                 }
@@ -147,7 +144,7 @@ private let gemma4FusedAttentionToMLPBoundaryKernel = MLXFast.metalKernel(
                     const uint dimension = base + index;
                     if (dimension < kWidth) {
                         const bfloat unit_normalized = static_cast<bfloat>(
-                            residual_row[dimension] * inverse_mean[0]);
+                            residual_output[dimension] * inverse_mean[0]);
                         normalized_output[dimension] =
                             pre_ffn_weight[dimension] * unit_normalized;
                     }
@@ -187,7 +184,6 @@ private let gemma4FusedAttentionToMLPBoundaryPairKernel = MLXFast.metalKernel(
 
         threadgroup float inverse_mean[1];
         threadgroup float local_sums[kSIMDSize];
-        threadgroup bfloat residual_row[kWidth];
 
         float accumulator = 0;
         for (uint row_offset = 0;
@@ -240,7 +236,6 @@ private let gemma4FusedAttentionToMLPBoundaryPairKernel = MLXFast.metalKernel(
                         post_attention_weight[dimension] * unit_normalized;
                     const bfloat combined =
                         token_residual[dimension] + post_normalized;
-                    residual_row[dimension] = combined;
                     token_residual_output[dimension] = combined;
                 }
             } else {
@@ -253,7 +248,6 @@ private let gemma4FusedAttentionToMLPBoundaryPairKernel = MLXFast.metalKernel(
                             post_attention_weight[dimension] * unit_normalized;
                         const bfloat combined =
                             token_residual[dimension] + post_normalized;
-                        residual_row[dimension] = combined;
                         token_residual_output[dimension] = combined;
                     }
                 }
@@ -268,13 +262,13 @@ private let gemma4FusedAttentionToMLPBoundaryPairKernel = MLXFast.metalKernel(
             const uint base = row_offset + thread_index * kReads;
             if (base + kReads <= kWidth) {
                 for (uint index = 0; index < kReads; ++index) {
-                    const float value = residual_row[base + index];
+                    const float value = token_residual_output[base + index];
                     accumulator += value * value;
                 }
             } else {
                 for (uint index = 0; index < kReads; ++index) {
                     if (base + index < kWidth) {
-                        const float value = residual_row[base + index];
+                        const float value = token_residual_output[base + index];
                         accumulator += value * value;
                     }
                 }
@@ -307,7 +301,7 @@ private let gemma4FusedAttentionToMLPBoundaryPairKernel = MLXFast.metalKernel(
                 for (uint index = 0; index < kReads; ++index) {
                     const uint dimension = base + index;
                     const bfloat unit_normalized = static_cast<bfloat>(
-                        residual_row[dimension] * inverse_mean[0]);
+                        token_residual_output[dimension] * inverse_mean[0]);
                     token_normalized_output[dimension] =
                         pre_ffn_weight[dimension] * unit_normalized;
                 }
@@ -316,7 +310,7 @@ private let gemma4FusedAttentionToMLPBoundaryPairKernel = MLXFast.metalKernel(
                     const uint dimension = base + index;
                     if (dimension < kWidth) {
                         const bfloat unit_normalized = static_cast<bfloat>(
-                            residual_row[dimension] * inverse_mean[0]);
+                            token_residual_output[dimension] * inverse_mean[0]);
                         token_normalized_output[dimension] =
                             pre_ffn_weight[dimension] * unit_normalized;
                     }
@@ -401,7 +395,6 @@ private let gemma4FusedMLPToNextBoundaryKernel = MLXFast.metalKernel(
 
         threadgroup float inverse_mean[1];
         threadgroup float local_sums[kSIMDSize];
-        threadgroup bfloat hidden_row[kWidth];
 
         float accumulator = 0;
         for (uint row_offset = 0;
@@ -455,7 +448,6 @@ private let gemma4FusedMLPToNextBoundaryKernel = MLXFast.metalKernel(
                     const bfloat combined =
                         residual[dimension] + post_normalized;
                     const bfloat scaled = combined * layer_scalar[0];
-                    hidden_row[dimension] = scaled;
                     hidden_output[dimension] = scaled;
                 }
             } else {
@@ -469,7 +461,6 @@ private let gemma4FusedMLPToNextBoundaryKernel = MLXFast.metalKernel(
                         const bfloat combined =
                             residual[dimension] + post_normalized;
                         const bfloat scaled = combined * layer_scalar[0];
-                        hidden_row[dimension] = scaled;
                         hidden_output[dimension] = scaled;
                     }
                 }
@@ -484,13 +475,13 @@ private let gemma4FusedMLPToNextBoundaryKernel = MLXFast.metalKernel(
             const uint base = row_offset + thread_index * kReads;
             if (base + kReads <= kWidth) {
                 for (uint index = 0; index < kReads; ++index) {
-                    const float value = hidden_row[base + index];
+                    const float value = hidden_output[base + index];
                     accumulator += value * value;
                 }
             } else {
                 for (uint index = 0; index < kReads; ++index) {
                     if (base + index < kWidth) {
-                        const float value = hidden_row[base + index];
+                        const float value = hidden_output[base + index];
                         accumulator += value * value;
                     }
                 }
@@ -523,7 +514,7 @@ private let gemma4FusedMLPToNextBoundaryKernel = MLXFast.metalKernel(
                 for (uint index = 0; index < kReads; ++index) {
                     const uint dimension = base + index;
                     const bfloat unit_normalized = static_cast<bfloat>(
-                        hidden_row[dimension] * inverse_mean[0]);
+                        hidden_output[dimension] * inverse_mean[0]);
                     next_normalized_output[dimension] =
                         next_norm_weight[dimension] * unit_normalized;
                 }
@@ -532,7 +523,7 @@ private let gemma4FusedMLPToNextBoundaryKernel = MLXFast.metalKernel(
                     const uint dimension = base + index;
                     if (dimension < kWidth) {
                         const bfloat unit_normalized = static_cast<bfloat>(
-                            hidden_row[dimension] * inverse_mean[0]);
+                            hidden_output[dimension] * inverse_mean[0]);
                         next_normalized_output[dimension] =
                             next_norm_weight[dimension] * unit_normalized;
                     }
@@ -571,7 +562,6 @@ private let gemma4FusedMLPToNextBoundaryPairKernel = MLXFast.metalKernel(
 
         threadgroup float inverse_mean[1];
         threadgroup float local_sums[kSIMDSize];
-        threadgroup bfloat hidden_row[kWidth];
 
         float accumulator = 0;
         for (uint row_offset = 0;
@@ -625,7 +615,6 @@ private let gemma4FusedMLPToNextBoundaryPairKernel = MLXFast.metalKernel(
                     const bfloat combined =
                         token_residual[dimension] + post_normalized;
                     const bfloat scaled = combined * layer_scalar[0];
-                    hidden_row[dimension] = scaled;
                     token_hidden_output[dimension] = scaled;
                 }
             } else {
@@ -639,7 +628,6 @@ private let gemma4FusedMLPToNextBoundaryPairKernel = MLXFast.metalKernel(
                         const bfloat combined =
                             token_residual[dimension] + post_normalized;
                         const bfloat scaled = combined * layer_scalar[0];
-                        hidden_row[dimension] = scaled;
                         token_hidden_output[dimension] = scaled;
                     }
                 }
@@ -654,13 +642,13 @@ private let gemma4FusedMLPToNextBoundaryPairKernel = MLXFast.metalKernel(
             const uint base = row_offset + thread_index * kReads;
             if (base + kReads <= kWidth) {
                 for (uint index = 0; index < kReads; ++index) {
-                    const float value = hidden_row[base + index];
+                    const float value = token_hidden_output[base + index];
                     accumulator += value * value;
                 }
             } else {
                 for (uint index = 0; index < kReads; ++index) {
                     if (base + index < kWidth) {
-                        const float value = hidden_row[base + index];
+                        const float value = token_hidden_output[base + index];
                         accumulator += value * value;
                     }
                 }
@@ -693,7 +681,7 @@ private let gemma4FusedMLPToNextBoundaryPairKernel = MLXFast.metalKernel(
                 for (uint index = 0; index < kReads; ++index) {
                     const uint dimension = base + index;
                     const bfloat unit_normalized = static_cast<bfloat>(
-                        hidden_row[dimension] * inverse_mean[0]);
+                        token_hidden_output[dimension] * inverse_mean[0]);
                     token_next_normalized_output[dimension] =
                         next_norm_weight[dimension] * unit_normalized;
                 }
@@ -702,7 +690,7 @@ private let gemma4FusedMLPToNextBoundaryPairKernel = MLXFast.metalKernel(
                     const uint dimension = base + index;
                     if (dimension < kWidth) {
                         const bfloat unit_normalized = static_cast<bfloat>(
-                            hidden_row[dimension] * inverse_mean[0]);
+                            token_hidden_output[dimension] * inverse_mean[0]);
                         token_next_normalized_output[dimension] =
                             next_norm_weight[dimension] * unit_normalized;
                     }
