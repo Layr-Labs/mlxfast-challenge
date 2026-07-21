@@ -324,9 +324,9 @@ extension Gemma4RuntimeModel: Gemma4MTPTarget {
         if includeExactPair {
             if gemma4MTPExactFourEnabled {
                 let fourInput = MLXArray([bos, bos, bos, bos], [1, 4])
-                if let four = exactMTPFour(fourInput, cache: cache) {
+                if let four = exactMTPFourTokens(fourInput, cache: cache) {
                     eval(
-                        four.logits,
+                        four.tokenIDs,
                         four.lastHidden,
                         four.capturedSharedKV.fullAttention.0,
                         four.capturedSharedKV.fullAttention.1,
@@ -869,14 +869,12 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
                 ([previousToken] + drafts).map(Int32.init),
                 [1, 4]
             )
-            if let output = target.exactMTPFour(
+            if let output = target.exactMTPFourTokens(
                 fourInput,
                 cache: targetCache
             ) {
                 exactPairSegmentCount += 2
-                let tokenArray = output.logits
-                    .asType(.float32)
-                    .argMax(axis: -1)
+                let tokenArray = output.tokenIDs
                 let fourHidden = output.lastHidden
                 let fourSharedKV = output.capturedSharedKV
                 eval(

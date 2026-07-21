@@ -1318,6 +1318,12 @@ private func gemma4FastAttentionFallback(
     return output
 }
 
+struct Gemma4MTPTokenForward: @unchecked Sendable {
+    let tokenIDs: MLXArray
+    let lastHidden: MLXArray
+    let capturedSharedKV: Gemma4SharedKV
+}
+
 /// High-performance Gemma 4 trunk built from the already-loaded library modules.
 final class Gemma4FastEngine {
     let embedTokens: Embedding
@@ -1770,6 +1776,48 @@ final class Gemma4FastEngine {
         _ inputs: MLXArray,
         cache: [KVCache]
     ) -> Gemma4MTPForward {
+        let result = exactMTPFourTrunk(inputs, cache: cache)
+        guard let tiedVocabularyHead else {
+            preconditionFailure("exact-four MTP tied head is unavailable")
+        }
+        let logits = tiedVocabularyHead.exactFourVectorPacked13Softcapped(
+            result.normalizedInput,
+            cap: MLXArray(softcap)
+        )
+        return Gemma4MTPForward(
+            logits: logits.reshaped(1, 4, logits.dim(-1)),
+            lastHidden: result.lastHidden,
+            capturedSharedKV: result.capturedSharedKV
+        )
+    }
+
+    func exactMTPFourTokens(
+        _ inputs: MLXArray,
+        cache: [KVCache]
+    ) -> Gemma4MTPTokenForward {
+        let result = exactMTPFourTrunk(inputs, cache: cache)
+        guard let tiedVocabularyHead else {
+            preconditionFailure("exact-four MTP tied head is unavailable")
+        }
+        let tokenIDs = tiedVocabularyHead.exactFourVectorPacked13Argmax(
+            result.normalizedInput,
+            cap: MLXArray(softcap)
+        )
+        return Gemma4MTPTokenForward(
+            tokenIDs: tokenIDs,
+            lastHidden: result.lastHidden,
+            capturedSharedKV: result.capturedSharedKV
+        )
+    }
+
+    private func exactMTPFourTrunk(
+        _ inputs: MLXArray,
+        cache: [KVCache]
+    ) -> (
+        normalizedInput: MLXArray,
+        lastHidden: MLXArray,
+        capturedSharedKV: Gemma4SharedKV
+    ) {
         precondition(canRunExactMTPFour(cache: cache))
         precondition(inputs.dtype == .int32 && inputs.shape == [1, 4])
         let combinedCaches = cache.compactMap {
@@ -1810,18 +1858,13 @@ final class Gemma4FastEngine {
             }
         }
         guard let normalizedInput,
-              let tiedVocabularyHead,
               let capturedFull,
               let capturedSliding
         else {
             preconditionFailure("exact-four MTP final state is unavailable")
         }
-        let logits = tiedVocabularyHead.exactFourVectorPacked13Softcapped(
-            normalizedInput,
-            cap: MLXArray(softcap)
-        )
-        return Gemma4MTPForward(
-            logits: logits.reshaped(1, 4, logits.dim(-1)),
+        return (
+            normalizedInput: normalizedInput,
             lastHidden: hidden.reshaped(1, 4, hidden.dim(-1)),
             capturedSharedKV: Gemma4SharedKV(
                 fullAttention: capturedFull,

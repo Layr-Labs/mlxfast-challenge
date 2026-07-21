@@ -391,6 +391,24 @@ struct Gemma4TiedVocabularyHead: @unchecked Sendable {
         )
     }
 
+    func exactFourVectorPacked13Argmax(
+        _ input: MLXArray,
+        cap: MLXArray
+    ) -> MLXArray {
+        precondition(input.dtype == .bfloat16 && input.shape == [4, 5_376])
+        precondition(cap.dtype == .float32 && cap.size == 1)
+        guard let packed13Metadata else {
+            preconditionFailure("exact four-vector tied-head metadata is unavailable")
+        }
+        return gemma4ExactFourVectorTiedHeadArgmax(
+            weight: weight,
+            packedIndices: packed13Metadata.packedIndices,
+            lut: packed13Metadata.lut,
+            input: input,
+            cap: cap
+        )
+    }
+
     func verifyRawFloat32(
         _ candidate: MLXArray,
         stock: MLXArray,

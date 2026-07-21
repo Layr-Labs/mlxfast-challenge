@@ -223,6 +223,189 @@ private let gemma4ExactFourVectorTiedHeadKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+// Production exact-four verification consumes only the winning vocabulary
+// index from each row. Reduce every threadgroup's 16 adjacent vocabulary rows
+// in place, then let MLX argmax the 16,384 compact group winners. This retains
+// the projection, BF16, precise-softcap, and first-index tie boundaries of the
+// full-logit kernel while avoiding four 262,144-element Float32 outputs.
+private let gemma4ExactFourVectorTiedHeadArgmaxSource = """
+    constexpr int kInputWidth = 5376;
+    constexpr int kOutputWidth = 262144;
+    constexpr int kPackedWordsPerRow = 35;
+    constexpr int kWeightBytesPerRow = 2688;
+    constexpr int kRowsPerSIMD = 4;
+    constexpr int kSIMDGroupsPerThreadgroup = 4;
+    constexpr int kPartialCount = 16384;
+
+    const int group_index = threadgroup_position_in_grid.y;
+    const int output_row =
+        group_index * kRowsPerSIMD * kSIMDGroupsPerThreadgroup
+        + simdgroup_index_in_threadgroup * kRowsPerSIMD;
+
+    const device uchar* weight_bytes =
+        reinterpret_cast<const device uchar*>(weight)
+        + output_row * kWeightBytesPerRow
+        + thread_index_in_simdgroup * 4;
+    const device uint* row_packed_indices =
+        packed_indices + output_row * kPackedWordsPerRow;
+    const device bfloat* input0 = x + thread_index_in_simdgroup * 8;
+    const device bfloat* input1 =
+        x + kInputWidth + thread_index_in_simdgroup * 8;
+    const device bfloat* input2 =
+        x + 2 * kInputWidth + thread_index_in_simdgroup * 8;
+    const device bfloat* input3 =
+        x + 3 * kInputWidth + thread_index_in_simdgroup * 8;
+
+    float result0[kRowsPerSIMD] = {0};
+    float result1[kRowsPerSIMD] = {0};
+    float result2[kRowsPerSIMD] = {0};
+    float result3[kRowsPerSIMD] = {0};
+    for (int block = 0; block < 21; ++block) {
+        const uint metadata_column =
+            block * 4 + thread_index_in_simdgroup / 8;
+        {
+            float values0[8];
+            float values1[8];
+            const float input_sum0 =
+                gemma4_exact_four_vector_tied_head_load_values(input0, values0);
+            const float input_sum1 =
+                gemma4_exact_four_vector_tied_head_load_values(input1, values1);
+            for (int row = 0; row < kRowsPerSIMD; ++row) {
+                const device uchar* row_weight =
+                    weight_bytes + row * kWeightBytesPerRow;
+                const ushort metadata_index =
+                    gemma4_exact_four_vector_tied_head_extract_packed13(
+                        row_packed_indices + row * kPackedWordsPerRow,
+                        metadata_column);
+                const uint pair = lut[metadata_index];
+                const uint packed_word =
+                    reinterpret_cast<const device uint*>(row_weight)[0];
+                gemma4_exact_four_vector_tied_head_qdot_pair_4bit(
+                    packed_word,
+                    values0,
+                    values1,
+                    gemma4_exact_four_vector_tied_head_pair_scale(pair),
+                    gemma4_exact_four_vector_tied_head_pair_bias(pair),
+                    input_sum0,
+                    input_sum1,
+                    result0[row],
+                    result1[row]);
+            }
+        }
+        {
+            float values2[8];
+            float values3[8];
+            const float input_sum2 =
+                gemma4_exact_four_vector_tied_head_load_values(input2, values2);
+            const float input_sum3 =
+                gemma4_exact_four_vector_tied_head_load_values(input3, values3);
+            for (int row = 0; row < kRowsPerSIMD; ++row) {
+                const device uchar* row_weight =
+                    weight_bytes + row * kWeightBytesPerRow;
+                const ushort metadata_index =
+                    gemma4_exact_four_vector_tied_head_extract_packed13(
+                        row_packed_indices + row * kPackedWordsPerRow,
+                        metadata_column);
+                const uint pair = lut[metadata_index];
+                const uint packed_word =
+                    reinterpret_cast<const device uint*>(row_weight)[0];
+                gemma4_exact_four_vector_tied_head_qdot_pair_4bit(
+                    packed_word,
+                    values2,
+                    values3,
+                    gemma4_exact_four_vector_tied_head_pair_scale(pair),
+                    gemma4_exact_four_vector_tied_head_pair_bias(pair),
+                    input_sum2,
+                    input_sum3,
+                    result2[row],
+                    result3[row]);
+            }
+        }
+
+        weight_bytes += 128;
+        input0 += 256;
+        input1 += 256;
+        input2 += 256;
+        input3 += 256;
+    }
+
+    for (int row = 0; row < kRowsPerSIMD; ++row) {
+        result0[row] = simd_sum(result0[row]);
+        result1[row] = simd_sum(result1[row]);
+        result2[row] = simd_sum(result2[row]);
+        result3[row] = simd_sum(result3[row]);
+    }
+
+    threadgroup float group_values[16];
+    threadgroup uint group_indices[16];
+    if (thread_index_in_simdgroup == 0) {
+        float best0 = -INFINITY;
+        float best1 = -INFINITY;
+        float best2 = -INFINITY;
+        float best3 = -INFINITY;
+        uint index0 = static_cast<uint>(output_row);
+        uint index1 = index0;
+        uint index2 = index0;
+        uint index3 = index0;
+        for (int row = 0; row < kRowsPerSIMD; ++row) {
+            const uint vocabulary_index = static_cast<uint>(output_row + row);
+            const bfloat projected0 = static_cast<bfloat>(result0[row]);
+            const bfloat projected1 = static_cast<bfloat>(result1[row]);
+            const bfloat projected2 = static_cast<bfloat>(result2[row]);
+            const bfloat projected3 = static_cast<bfloat>(result3[row]);
+            const float value0 = metal::precise::tanh(
+                static_cast<float>(projected0) / cap) * cap;
+            const float value1 = metal::precise::tanh(
+                static_cast<float>(projected1) / cap) * cap;
+            const float value2 = metal::precise::tanh(
+                static_cast<float>(projected2) / cap) * cap;
+            const float value3 = metal::precise::tanh(
+                static_cast<float>(projected3) / cap) * cap;
+            if (value0 > best0) { best0 = value0; index0 = vocabulary_index; }
+            if (value1 > best1) { best1 = value1; index1 = vocabulary_index; }
+            if (value2 > best2) { best2 = value2; index2 = vocabulary_index; }
+            if (value3 > best3) { best3 = value3; index3 = vocabulary_index; }
+        }
+        const uint slot = simdgroup_index_in_threadgroup;
+        group_values[slot] = best0;
+        group_values[4 + slot] = best1;
+        group_values[8 + slot] = best2;
+        group_values[12 + slot] = best3;
+        group_indices[slot] = index0;
+        group_indices[4 + slot] = index1;
+        group_indices[8 + slot] = index2;
+        group_indices[12 + slot] = index3;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_index_in_threadgroup == 0
+        && thread_index_in_simdgroup < 4) {
+        const uint token = thread_index_in_simdgroup;
+        float best = -INFINITY;
+        uint best_index = 0;
+        for (uint group = 0; group < 4; ++group) {
+            const uint slot = token * 4 + group;
+            const float value = group_values[slot];
+            if (value > best) {
+                best = value;
+                best_index = group_indices[slot];
+            }
+        }
+        const uint destination = token * kPartialCount + group_index;
+        partial_values[destination] = best;
+        partial_indices[destination] = best_index;
+    }
+    """
+
+private let gemma4ExactFourVectorTiedHeadArgmaxKernel = MLXFast.metalKernel(
+    name: "gemma4_exact_four_vector_tied_head_packed13_argmax_262144x5376_mtp_v1",
+    inputNames: ["weight", "packed_indices", "lut", "x", "cap"],
+    outputNames: ["partial_values", "partial_indices"],
+    source: gemma4ExactFourVectorTiedHeadArgmaxSource,
+    header: gemma4ExactFourVectorTiedHeadHeader,
+    ensureRowContiguous: true
+)
+
 func gemma4ExactFourVectorTiedHead(
     weight: MLXArray,
     packedIndices: MLXArray,
@@ -243,4 +426,30 @@ func gemma4ExactFourVectorTiedHead(
         outputShapes: [[4, 262_144]],
         outputDTypes: [.float32]
     )[0]
+}
+
+func gemma4ExactFourVectorTiedHeadArgmax(
+    weight: MLXArray,
+    packedIndices: MLXArray,
+    lut: MLXArray,
+    input: MLXArray,
+    cap: MLXArray
+) -> MLXArray {
+    precondition(weight.dtype == .uint32 && weight.shape == [262_144, 672])
+    precondition(packedIndices.dtype == .uint32)
+    precondition(packedIndices.shape == [262_144, 35])
+    precondition(lut.dtype == .uint32 && lut.ndim == 1)
+    precondition(input.dtype == .bfloat16 && input.shape == [4, 5_376])
+    precondition(cap.dtype == .float32 && cap.size == 1)
+    let partials = gemma4ExactFourVectorTiedHeadArgmaxKernel(
+        [weight, packedIndices, lut, input, cap],
+        grid: (32, 65_536, 1),
+        threadGroup: (32, 4, 1),
+        outputShapes: [[4, 16_384], [4, 16_384]],
+        outputDTypes: [.float32, .uint32]
+    )
+    let localWinners = partials[0].argMax(axis: -1).reshaped([4, 1])
+    return takeAlong(partials[1], localWinners, axis: 1)
+        .squeezed(axis: 1)
+        .asType(.int32)
 }

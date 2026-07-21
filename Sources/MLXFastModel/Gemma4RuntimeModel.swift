@@ -4,6 +4,15 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 
+private let gemma4MTPExactFourFusedArgmaxEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_MTP_EXACT_FOUR_FUSED_ARGMAX"
+    ] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 func gemma4LastTokenRange(sequenceLength: Int) -> Range<Int>? {
     sequenceLength > 1 ? (sequenceLength - 1)..<sequenceLength : nil
 }
@@ -87,6 +96,26 @@ public final class Gemma4RuntimeModel: Module, LanguageModel {
             return nil
         }
         return fastEngine.exactMTPFour(inputs, cache: cache)
+    }
+
+    func exactMTPFourTokens(
+        _ inputs: MLXArray,
+        cache: [KVCache]
+    ) -> Gemma4MTPTokenForward? {
+        guard let fastEngine,
+              fastEngine.canRunExactMTPFour(cache: cache)
+        else {
+            return nil
+        }
+        if gemma4MTPExactFourFusedArgmaxEnabled {
+            return fastEngine.exactMTPFourTokens(inputs, cache: cache)
+        }
+        let output = fastEngine.exactMTPFour(inputs, cache: cache)
+        return Gemma4MTPTokenForward(
+            tokenIDs: output.logits.asType(.float32).argMax(axis: -1),
+            lastHidden: output.lastHidden,
+            capturedSharedKV: output.capturedSharedKV
+        )
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
