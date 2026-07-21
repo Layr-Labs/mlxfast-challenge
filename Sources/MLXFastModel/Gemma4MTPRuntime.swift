@@ -67,13 +67,10 @@ private let gemma4MTPDrafterAsyncEvalEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
-private let gemma4MTPHoistedDraftMasksEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_MTP_HOISTED_DRAFT_MASKS"
-    ] else {
-        return true
-    }
-    return !["0", "false", "no", "off"].contains(raw.lowercased())
+private let gemma4MTPAssistantPositionDelta: Int = {
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_MTP_ASSISTANT_POSITION_DELTA"
+    ] == "0" ? 0 : -1
 }()
 
 private let gemma4MTPTopTwoMarginKernel = MLXFast.metalKernel(
@@ -552,7 +549,9 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
             let output = drafter(
                 inputsEmbeds: assistantInput,
                 sharedKV: sharedKV,
-                positionOffset: Gemma4.PositionOffset.scalar(1)
+                positionOffset: Gemma4.PositionOffset.scalar(
+                    1 + gemma4MTPAssistantPositionDelta
+                )
             )
             let logits = output.logits[0..., -1, 0...]
             let draft = logits.argMax(axis: -1).reshaped([1, 1])
@@ -696,7 +695,12 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
         }
 
         let draftCount = blockSize - 1
-        let positionOffset = Gemma4.PositionOffset.scalar(hostCacheOffset)
+        // The assistant consumes the target hidden captured at the preceding
+        // input row. Align RoPE to that hidden-state position, not to the
+        // bonus token predicted one position later.
+        let positionOffset = Gemma4.PositionOffset.scalar(
+            hostCacheOffset + gemma4MTPAssistantPositionDelta
+        )
         var draftInput = MLXArray([Int32(previousToken)], [1, 1])
         var draftTokens: [MLXArray] = []
         var draftMarginArrays: [MLXArray] = []
@@ -708,40 +712,17 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
             && gemma4MTPAdaptiveExactFourEnabled
             && draftCount == 3
 
-        // The drafter masks depend only on round-constant state (queryLen 1,
-        // the shared-KV snapshot lengths, and the block's position offset —
-        // documented as held constant across all drafter steps within a
-        // block), so build them once per round instead of once per draft.
-        let hoistedMasks: Gemma4DrafterMasks? = gemma4MTPHoistedDraftMasksEnabled
-            ? drafter.makeMasks(
-                queryLen: 1,
-                sharedKV: currentSharedKV,
-                positionOffset: positionOffset,
-                dtype: .bfloat16
-            )
-            : nil
-
         for _ in 0..<draftCount {
             let targetEmbedding = target.embedTokensForDrafter(draftInput)
             let assistantInput = concatenated(
                 [targetEmbedding, draftHidden],
                 axis: -1
             )
-            let assistantOutput: (lastHidden: MLXArray, logits: MLXArray)
-            if let hoistedMasks {
-                assistantOutput = drafter(
-                    inputsEmbeds: assistantInput,
-                    sharedKV: currentSharedKV,
-                    positionOffset: positionOffset,
-                    masks: hoistedMasks
-                )
-            } else {
-                assistantOutput = drafter(
-                    inputsEmbeds: assistantInput,
-                    sharedKV: currentSharedKV,
-                    positionOffset: positionOffset
-                )
-            }
+            let assistantOutput = drafter(
+                inputsEmbeds: assistantInput,
+                sharedKV: currentSharedKV,
+                positionOffset: positionOffset
+            )
             let draftLogits = assistantOutput.logits[0..., -1, 0...]
             let draft = draftLogits.argMax(axis: -1)
             if collectExactFourMargins {

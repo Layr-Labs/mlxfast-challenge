@@ -942,7 +942,7 @@ public struct Gemma4AssistantConfiguration: Codable, Sendable {
 
 // MARK: - Assistant Draft Model
 
-public struct Gemma4DrafterMasks {
+internal struct Gemma4DrafterMasks {
     let full: MLXFast.ScaledDotProductAttentionMaskMode
     let sliding: MLXFast.ScaledDotProductAttentionMaskMode
 }
@@ -1051,7 +1051,7 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
             masks: masks)
     }
 
-    public func callAsFunction(
+    internal func callAsFunction(
         inputsEmbeds: MLXArray,
         sharedKV: Gemma4SharedKV,
         positionOffset: Gemma4.PositionOffset,
@@ -1065,7 +1065,7 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
             masks: masks)
     }
 
-    public func makeMasks(
+    internal func makeMasks(
         queryLen: Int,
         sharedKV: Gemma4SharedKV,
         positionOffset: Gemma4.PositionOffset,
