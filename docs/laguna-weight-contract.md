@@ -2,7 +2,8 @@
 
 Interface between the offline transform (`Sources/MLXFastTransform/`) and the
 Laguna runtime (`LagunaConfig` / `LagunaWeightLoader` /
-`LagunaRuntimeWeightCache` / `LagunaRuntimeModel` in this directory). The
+`LagunaRuntimeWeightCache` / `LagunaRuntimeModel` in
+`Sources/MLXFastModel/`). The
 transform must produce a weights directory that satisfies everything below;
 the runtime validates all of it (`LagunaWeightLoader.validateRequiredMetadata`
 plus the shard/tensor inventory checks in `loadRuntimeWeightValues`) before

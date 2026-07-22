@@ -9,8 +9,6 @@
     "Sources/MLXFastModel",
     "Sources/MLXFastTransform",
     "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Laguna.swift",
-    "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/LagunaMTP.swift",
-    "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/LagunaMTPTarget.swift",
     "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/KVCache.swift",
     "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/LanguageModel.swift",
     "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/Evaluate.swift",

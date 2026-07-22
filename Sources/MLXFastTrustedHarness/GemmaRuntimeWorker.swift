@@ -91,6 +91,9 @@ extension GemmaRuntime {
         }
     }
 
+    /// One-shot structural validation used by the trusted `preflight` command.
+    /// Protocol stdout is isolated before any editable model code runs so
+    /// participant logging cannot forge the JSON result.
     public static func runPreflightWorker(weightsPath: String) throws {
         startRuntimeWorkerOrphanReaper()
         let protocolIO = try RuntimeWorkerProtocolIO.isolatingStandardIO()

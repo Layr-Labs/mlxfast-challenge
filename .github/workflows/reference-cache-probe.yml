@@ -58,8 +58,8 @@ jobs:
     runs-on: blacksmith-12vcpu-macos-26
     timeout-minutes: 120
     env:
-      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
-      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
+      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_4bit.sha256
       # Secret-free by design -- this dispatch-time workflow runs setup.sh and
       # the download script FROM THE DISPATCHED REF with no approval
       # environment gate and no modifiable-surface guard, so it must never be
@@ -72,7 +72,7 @@ jobs:
       # download-reference-cache-scope.sh verify every byte against the pinned
       # manifest, so the public Hugging Face mirror (no auth header) is fully
       # sufficient.
-      MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || 'https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main' }}
+      MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || 'https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/main' }}
       MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
       MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
       MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
@@ -100,7 +100,7 @@ jobs:
 
           manifest_hash="$(shasum -a 256 "${MLXFAST_REFERENCE_MANIFEST_PATH}" | awk '{print $1}')"
           safe_suffix="$(printf '%s' "${CACHE_KEY_SUFFIX}" | tr -c 'A-Za-z0-9_.-' '-')"
-          cache_key="gemma-4-31b-4bit-${CACHE_SCOPE}-${manifest_hash}-${safe_suffix}"
+          cache_key="laguna-xs-2.1-4bit-${CACHE_SCOPE}-${manifest_hash}-${safe_suffix}"
           echo "key=${cache_key}" >> "${GITHUB_OUTPUT}"
           echo "manifest_hash=${manifest_hash}" >> "${GITHUB_OUTPUT}"
 

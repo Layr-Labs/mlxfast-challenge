@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Download a small, manifest-verified subset of the Gemma 4 31B 4-bit
+# Download a small, manifest-verified subset of the Laguna XS 2.1 4-bit
 # reference checkpoint for cache experiments. The full checkpoint path
 # intentionally stays in setup.sh so full downloads keep the same
 # lock/verification behavior.
 set -euo pipefail
 
 SCOPE="${1:-}"
-REFERENCE_DIR="${MLXFAST_REFERENCE_DIR:-.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main}"
-REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main}"
+REFERENCE_DIR="${MLXFAST_REFERENCE_DIR:-.cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main}"
+REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/main}"
 REFERENCE_AUTH_HEADER="${MLXFAST_REFERENCE_AUTH_HEADER:-}"
 REFERENCE_APPEND_DOWNLOAD_QUERY="${MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY:-auto}"
-REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_gemma_4_31b_4bit.sha256}"
+REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_laguna_xs_2_1_4bit.sha256}"
 
 usage() {
   cat >&2 <<EOF
