@@ -34,7 +34,7 @@ struct LagunaTransformQuantizationSpec: Equatable {
 }
 
 /// Transform-side structural validation of the Laguna text-tower tensor set
-/// against `docs/laguna-weight-contract.md`. The source
+/// against `Sources/MLXFastModel/LAGUNA_WEIGHT_CONTRACT.md`. The source
 /// checkpoint (`mlx-community/Laguna-XS-2.1-4bit`) is already MLX
 /// affine-quantized, so the transform passes tensors through unchanged; this
 /// pass fails fast -- before the multi-GB copy -- when the set it would copy

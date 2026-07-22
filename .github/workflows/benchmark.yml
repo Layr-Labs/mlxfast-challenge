@@ -1658,8 +1658,8 @@ jobs:
       # BASELINE tree then CANDIDATE workspace, each as `./benchmark.sh
       # --official` through bench-exec with a per-binary self-generated oracle
       # derived from the explicit private --prompt target, each behind the 40C
-      # gate with 100 ms macmon telemetry, throttle/telemetry/token acceptance
-      # and one gated retry, a baseline calibration-band check, and a sealed results.json
+      # gate with 2 Hz telemetry, throttle/telemetry/token acceptance and one
+      # gated retry, a baseline calibration-band check, and a sealed results.json
       # with the paired ratio. Baseline-first mirrors the old pipeline's
       # "measure the pinned reference minutes before the candidate". Changing
       # the timed target, pinned baseline tree, or its calibration is a

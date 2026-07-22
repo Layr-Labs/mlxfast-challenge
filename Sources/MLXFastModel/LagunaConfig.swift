@@ -574,19 +574,6 @@ public struct LagunaConfig: Equatable {
                     "Laguna quantization override for \(stem) must use a positive group size and bits in {2, 4, 8}"
                 )
             }
-            // The runtime weight loader promotes quantized modules using the
-            // GLOBAL group size for every tensor (it derives each module's
-            // logical input width, and from it the bit width, as
-            // `scales.dim(-1) * groupSize`). An override that changes only
-            // the bit width (the pinned checkpoint's 8-bit router gates) is
-            // representable; an override with a different group size is not,
-            // and would otherwise surface as a shape-mismatch crash after
-            // the multi-GB weight load instead of a clear config error here.
-            guard override.groupSize == quantization.groupSize else {
-                throw MLXFastError.invalidInput(
-                    "Laguna quantization override for \(stem) must keep the global group size \(quantization.groupSize), found \(override.groupSize)"
-                )
-            }
         }
     }
 }

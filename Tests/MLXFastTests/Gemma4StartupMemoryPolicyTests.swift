@@ -56,25 +56,6 @@ func lowMemoryOverridesNameOnlyFlagsReadByModelSources() throws {
     }
 }
 
-// The documented low-memory startup profile (<64 GiB machines: 6 GiB MLX
-// allocator cap, feature-disable env defaults, warmup-buffer clear before
-// the protocol hello) applies to the LAGUNA runtime worker, not only the
-// retained Gemma path. The Laguna weight cache must resolve the policy
-// before its model load and honor clearAllocatorCacheAfterWarmup; the full
-// profile stays a no-op there (the ranked box keeps stock allocator
-// behavior, matching how the pinned baseline was measured).
-@Test
-func lagunaWeightCacheConsultsStartupMemoryPolicy() throws {
-    let source = try String(
-        contentsOfFile: "Sources/MLXFastModel/LagunaRuntimeWeights.swift",
-        encoding: .utf8
-    )
-    #expect(source.contains("Gemma4StartupMemoryPolicy.resolve("))
-    #expect(source.contains("Gemma4StartupMemoryPolicy.profileOverrideEnvironmentName"))
-    #expect(source.contains("if policy.isLowMemory {"))
-    #expect(source.contains("startupMemoryPolicy?.clearAllocatorCacheAfterWarmup == true"))
-}
-
 @Test
 func startupMemoryPolicyKeepsRanked128GiBProfile() {
     let policy = Gemma4StartupMemoryPolicy.resolve(

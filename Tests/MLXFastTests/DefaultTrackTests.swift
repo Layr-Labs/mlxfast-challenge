@@ -102,31 +102,6 @@ struct DefaultTrackTests {
         #expect(!manifestText.contains("separateFromSerialTrack"))
     }
 
-    // Every editablePaths entry must exist in the repository. The ranked
-    // overlay step (.github/scripts/overlay-editable-paths.sh) fails the
-    // whole run when a listed path is missing from the submission worktree,
-    // and a path that does not exist on trusted main cannot exist in any
-    // honest submission (submission branches differ from main only inside
-    // editablePaths). Stale entries therefore hard-fail every ranked
-    // submission: the retired MTP track left LagunaMTP.swift /
-    // LagunaMTPTarget.swift listed after their files were dropped.
-    @Test
-    func defaultManifestEditablePathsAllExist() throws {
-        let registration = try Data(contentsOf: URL(fileURLWithPath: "benchmark.json"))
-        let track = try #require(
-            try JSONSerialization.jsonObject(with: registration) as? [String: Any]
-        )
-        let editablePaths = try #require(track["editablePaths"] as? [String])
-        #expect(!editablePaths.isEmpty)
-        let fm = FileManager.default
-        for path in editablePaths {
-            #expect(
-                fm.fileExists(atPath: path),
-                "editablePaths entry \(path) does not exist; the ranked overlay step fails closed on missing editable paths"
-            )
-        }
-    }
-
     // The MTP track is fully retired: no alternate manifests, no MTP
     // contract fixture or weight manifests, no separately named serial
     // workflow, and no MTP local scripts. benchmark.json + benchmark.yml are

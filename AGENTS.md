@@ -86,7 +86,7 @@ official benchmark for ranking.
 ## What You May Optimize
 
 The submitted editable surface is defined by `editablePaths` in
-`benchmark.json` — that list (currently 75 entries) is the source of truth.
+`benchmark.json` — that list (currently 77 entries) is the source of truth.
 It covers four groups:
 
 ```text
@@ -96,10 +96,10 @@ Vendor/mlx-swift-lm/ the Laguna model files + MLXLMCommon plumbing
 Vendor/mlx-swift/ the MLX Metal kernels Laguna dispatches
 ```
 
-The vendored model surface is `Libraries/MLXLLM/Models/Laguna.swift` plus
-the `MLXLMCommon` files it uses directly (KV caches, RoPE utilities and
-application, compiled decode, evaluation plumbing; the exact file list is in
-`benchmark.json`).
+The vendored model surface is `Libraries/MLXLLM/Models/Laguna.swift`,
+`LagunaMTP.swift`, and `LagunaMTPTarget.swift`, plus the `MLXLMCommon` files
+they use directly (KV caches, RoPE utilities and application, compiled
+decode, evaluation plumbing; the exact file list is in `benchmark.json`).
 
 The vendored kernel surface is the kernel families the Laguna forward pass
 actually dispatches — SDPA (`scaled_dot_product_attention.metal`,

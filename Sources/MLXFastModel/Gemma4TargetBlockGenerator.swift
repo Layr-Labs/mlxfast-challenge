@@ -59,7 +59,7 @@ public enum Gemma4TargetBlockGeneration {
     ) throws -> [Int] {
         guard previousToken >= 0, previousToken < MLXFastConstants.vocabSize else {
             throw MLXFastError.invalidInput(
-                "experimental block input token is outside the model vocabulary"
+                "experimental block input token is outside the Gemma 4 vocabulary"
             )
         }
         guard maxBlockSize > 0,
@@ -88,7 +88,7 @@ public enum Gemma4TargetBlockGeneration {
             let token = try nextToken(inputToken, stepOffset)
             guard token >= 0, token < MLXFastConstants.vocabSize else {
                 throw MLXFastError.invalidInput(
-                    "experimental block generator returned a token outside the model vocabulary"
+                    "experimental block generator returned a token outside the Gemma 4 vocabulary"
                 )
             }
             generated.append(token)

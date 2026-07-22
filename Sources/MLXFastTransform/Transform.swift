@@ -55,10 +55,10 @@ enum TransformModelFamily: Equatable {
 /// config.json:
 ///
 /// - Poolside Laguna XS 2.1 4-bit (flat config, `model_type` "laguna"): the
-///   ranked serial-track target. The source is already MLX affine-quantized,
+///   default MTP-track target. The source is already MLX affine-quantized,
 ///   so the transform validates and passes through -- byte-for-byte, source
 ///   tensor names unchanged -- the quantized triplet set described by
-///   `docs/laguna-weight-contract.md`: attention
+///   `Sources/MLXFastModel/LAGUNA_WEIGHT_CONTRACT.md`: attention
 ///   q/k/v/o projections plus the per-head `g_proj` gates and q/k norms,
 ///   the layer-0 dense MLP, the SwitchGLU-STACKED `mlp.switch_mlp.*` expert
 ///   tensors (leading experts axis; never split per expert), the 8-bit
@@ -233,8 +233,8 @@ public enum SwiftTransform {
                 destinationDirectory: stagingDirectory
             )
         case .laguna:
-            // docs/laguna-weight-contract.md forbids derived layouts and
-            // metadata sidecars in v1, and the Laguna runtime loads exactly the
+            // LAGUNA_WEIGHT_CONTRACT.md forbids derived layouts and metadata
+            // sidecars in v1, and the Laguna runtime loads exactly the
             // indexed checkpoint tensors (its untied lm_head makes the
             // Gemma tied-head packed13 sidecar meaningless anyway). Emit
             // nothing beyond the pass-through tensor set.
@@ -570,7 +570,7 @@ public enum SwiftTransform {
     /// `tokenizer_config.json`.
     ///
     /// Laguna: the source config is already the flat schema
-    /// `LagunaConfig.load` parses (per docs/laguna-weight-contract.md the
+    /// `LagunaConfig.load` parses (per LAGUNA_WEIGHT_CONTRACT.md the
     /// transform may copy the source fields directly), so it is passed
     /// through minus the empty multimodal `vision_config` stub. The
     /// checkpoint's `quantization` block -- global affine 4-bit group-64
