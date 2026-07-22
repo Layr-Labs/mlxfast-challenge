@@ -521,7 +521,12 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
     #expect(!workflow.contains("secrets."))
     #expect(!workflow.contains("secrets: inherit"))
     #expect(!workflow.contains("MLXFAST_REFERENCE_AUTH_HEADER"))
-    #expect(workflow.contains("MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || 'https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main' }}"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || 'https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/main' }}"))
+    // The probe must target the LAGUNA reference checkpoint: the Gemma-era
+    // manifest and cache directory were deleted with the migration, so stale
+    // defaults would fail every dispatch at the manifest hash step.
+    #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_4bit.sha256"))
+    #expect(!workflow.contains("gemma-4-31b-4bit"))
 }
 
 @Test

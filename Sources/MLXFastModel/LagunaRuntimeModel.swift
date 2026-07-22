@@ -355,14 +355,13 @@ final class LagunaRuntimeModelInner: Module {
 /// Scored Laguna runtime model: last-token vocabulary head over the
 /// reimplemented Laguna text tower.
 ///
-/// Interface shape mirrors `Gemma4RuntimeModel` so the worker / MTP-target
-/// wiring waves can swap the model type: `callAsFunction(_:cache:)` serves
-/// both prompt prefill (`[1, L]`) and single-token decode steps (`[1, 1]`)
-/// and returns `[1, 1, vocab]` last-token logits; `newCache(parameters:)`
-/// creates the per-layer cache stack (unbounded `StandardKVCache` for
-/// full-attention layers, `RotatingKVCache(512)` for sliding layers);
-/// `embedTokensForDrafter(_:)` exposes the embedding table for a future
-/// drafter. Laguna applies NO final logit softcap and NO embedding scaling.
+/// Interface shape mirrors `Gemma4RuntimeModel` so the worker can swap the
+/// model type: `callAsFunction(_:cache:)` serves both prompt prefill
+/// (`[1, L]`) and single-token decode steps (`[1, 1]`) and returns
+/// `[1, 1, vocab]` last-token logits; `newCache(parameters:)` creates the
+/// per-layer cache stack (unbounded `StandardKVCache` for full-attention
+/// layers, `RotatingKVCache(512)` for sliding layers). Laguna applies NO
+/// final logit softcap and NO embedding scaling.
 public final class LagunaRuntimeModel: Module, LanguageModel {
     @ModuleInfo(key: "model") var model: LagunaRuntimeModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
@@ -388,13 +387,6 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
             return lmHead(hidden)
         }
         return model.embedTokens.asLinear(hidden)
-    }
-
-    /// Raw token embeddings (Laguna does not scale embeddings). Exposed for
-    /// the future drafter/MTP wiring, mirroring
-    /// `Gemma4TextModel.embedTokensForDrafter`.
-    public func embedTokensForDrafter(_ tokens: MLXArray) -> MLXArray {
-        model.embedTokens(tokens)
     }
 
     public func prepare(
