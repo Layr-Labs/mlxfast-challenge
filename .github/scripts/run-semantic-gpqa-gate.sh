@@ -7,10 +7,9 @@ SCORE_PATH="${MLXFAST_SCORE_PATH:-score.json}"
 INTEGRITY_PATH="${MLXFAST_INTEGRITY_PATH:-benchmark-integrity.json}"
 RESULTS_PATH="${MLXFAST_SEMANTIC_GPQA_RESULTS_PATH:-${MLXFAST_PRIVATE_DIR:-/tmp}/semantic_gpqa_results.json}"
 MODEL="${MLXFAST_SEMANTIC_GPQA_MODEL:-claude-opus-4-8}"
-# Default mirrors MLXFastConstants.semanticGPQAMinPassCount (Gemma-baseline
-# calibrated: five 2026-07-09 official-runner baseline runs judged the
-# unmodified rebase reference 2/5 on the M5-regenerated hidden prompts, so
-# the threshold is min(observed) - 1 = 1; the pre-regeneration value was 0).
+# Default mirrors MLXFastConstants.semanticGPQAMinPassCount. Four 2026-07-22
+# official-runner Laguna baseline observations judged 2/5, 2/5, 1/5, and 2/5
+# with Opus 4.8, so the observed minimum remains the conservative floor of 1.
 MIN_PASS="${MLXFAST_SEMANTIC_GPQA_MIN_PASS:-1}"
 REQUIRED="${MLXFAST_SEMANTIC_GPQA_REQUIRED:-1}"
 
@@ -105,14 +104,14 @@ for index in $(seq 0 $((case_count - 1))); do
     --argjson index "${index}" \
     '.cases[$index] as $case | {
       model: $model,
-      # max_tokens caps thinking plus the reply text on Opus 4.8. The verdict
-      # object alone needs a few dozen tokens; the rest is headroom so a long
-      # max-effort think can never truncate the response (the Sonnet-era 256
-      # cap is what produced unparseable truncated verdicts in run
-      # 29124417146). Opus 4.8 rejects non-default temperature/top_p/top_k
-      # with a 400, so no sampling params are set; adaptive thinking is its
-      # only thinking mode (a manual thinking budget is also a 400), and
-      # effort max gives unconstrained reasoning depth.
+      # max_tokens caps thinking plus the reply text on Opus 4.8. 32,000 gives
+      # substantial headroom over the Sonnet-era 256 cap that produced
+      # unparseable truncated verdicts in run 29124417146, but remains a hard
+      # cap; an exhausted response is retried and then fails that case if no
+      # verdict can be extracted. Opus 4.8 rejects non-default
+      # temperature/top_p/top_k with a 400, so no sampling params are set;
+      # adaptive thinking is its only thinking mode (a manual thinking budget
+      # is also a 400), and effort max gives unconstrained reasoning depth.
       max_tokens: 32000,
       thinking: { type: "adaptive" },
       output_config: { effort: "max" },

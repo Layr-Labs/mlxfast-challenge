@@ -206,11 +206,10 @@ jobs:
       MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: "64"
       MLXFAST_SEMANTIC_GPQA_MIN_PASS: "1"
       MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
-      # Opus 4.8 at max effort (adaptive thinking): the Sonnet 4.5 judge
-      # produced prose-wrapped/truncated verdicts (3 unparseable first
-      # attempts in run 29124417146). The threshold calibration above was
-      # judged by Sonnet; watch the first Opus-judged baseline runs against
-      # the 2/5 expectation before trusting the margin.
+      # Opus 4.8 at max effort (adaptive thinking) replaced the Sonnet 4.5
+      # judge after that model produced prose-wrapped/truncated verdicts
+      # (3 unparseable first attempts in run 29124417146). The Laguna
+      # threshold calibration above was judged by Opus 4.8 across four runs.
       MLXFAST_SEMANTIC_GPQA_MODEL: claude-opus-4-8
       MLXFAST_GPQA_TTFT_CASE_COUNT: "5"
       # Public drift-tripwire fixture, pinned (enforced by BenchmarkScriptTests).
