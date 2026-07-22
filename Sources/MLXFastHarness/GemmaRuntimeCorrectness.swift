@@ -36,9 +36,9 @@ extension GemmaRuntime {
             return tokens
         }
 
-        let config = try Gemma4Config.load(from: options.weightsPath)
-        let loader = try Gemma4WeightLoader(weightsPath: options.weightsPath)
-        let weightCache = Gemma4RuntimeWeightCache(loader: loader, config: config)
+        let config = try LagunaConfig.load(from: options.weightsPath)
+        let loader = try LagunaWeightLoader(weightsPath: options.weightsPath)
+        let weightCache = LagunaRuntimeWeightCache(loader: loader, config: config)
         return try generateGreedyCached(
             promptTokens: options.promptTokens,
             steps: options.steps,
@@ -57,7 +57,7 @@ extension GemmaRuntime {
         }
 
         var loadedGolden: GoldenFixture?
-        var loader: Gemma4WeightLoader?
+        var loader: LagunaWeightLoader?
         do {
             try requireFile(options.goldenPath, description: "correctness golden file")
             let golden = try loadGoldenFixture(from: options.goldenPath)
@@ -66,10 +66,10 @@ extension GemmaRuntime {
                 weightsPath: options.weightsPath,
                 goldenPath: options.goldenPath
             )
-            let config = try Gemma4Config.load(from: options.weightsPath)
-            let runtimeLoader = try Gemma4WeightLoader(weightsPath: options.weightsPath)
+            let config = try LagunaConfig.load(from: options.weightsPath)
+            let runtimeLoader = try LagunaWeightLoader(weightsPath: options.weightsPath)
             loader = runtimeLoader
-            let weightCache = Gemma4RuntimeWeightCache(loader: runtimeLoader, config: config)
+            let weightCache = LagunaRuntimeWeightCache(loader: runtimeLoader, config: config)
             return runLayeredCorrectness(
                 golden: golden,
                 weightCache: weightCache,
@@ -178,7 +178,7 @@ extension GemmaRuntime {
 
     static func runLayeredCorrectness(
         golden: GoldenFixture,
-        weightCache: Gemma4RuntimeWeightCache,
+        weightCache: LagunaRuntimeWeightCache,
         steps: Int = MLXFastConstants.correctnessSteps,
         progress: ((String) -> Void)? = nil
     ) -> CorrectnessReport {

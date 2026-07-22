@@ -160,9 +160,9 @@ fi
 # else use reference_weights/ only when it actually holds a checkpoint, resolved to
 # its real target so the transform never opens a symlinked directory; else fall
 # back to the Hugging Face cache setup.sh downloads into.
-REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/gemma-4-31b-4bit}"
+REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/Laguna-XS-2.1-4bit}"
 REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-main}"
-REFERENCE_DEFAULT_DIR="reference_weights/gemma-4-31b-4bit"
+REFERENCE_DEFAULT_DIR="reference_weights/laguna-xs-2.1-4bit"
 REFERENCE_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}"
 REFERENCE_HF_HUB_CACHE="${MLXFAST_HF_HUB_CACHE:-${HF_HUB_CACHE:-${REFERENCE_HF_HOME}/hub}}"
 REFERENCE_CACHE_DIR="${MLXFAST_REFERENCE_CACHE_DIR:-${REFERENCE_HF_HUB_CACHE}/models--${REFERENCE_MODEL_REPO//\//--}/snapshots/${REFERENCE_REVISION//\//--}}"
@@ -503,7 +503,7 @@ handle_benchmark_abort_signal() {
 }
 
 # --- Local run memory guard and worker teardown --------------------------------
-# The Gemma 4 31B text tower is ~17 GB and RAM-resident: it lives inside the
+# The Laguna XS 2.1 text tower is ~19 GB and RAM-resident: it lives inside the
 # sibling `mlxfast-runtime-worker runtime-worker` subprocess that the trusted
 # `mlxfast-swift benchmark` process spawns. ONE resident copy fits a 36 GB
 # machine; TWO do not. Two copies happen when local runs overlap, or when a
@@ -646,7 +646,7 @@ abort_if_model_already_resident() {
     echo "benchmark.sh: ERROR: a model-holding mlxfast process is already running (pid ppid rss_kb command):"
     printf '%s\n' "${resident}" | sed 's/^/benchmark.sh:   /'
     cat <<EOF
-benchmark.sh: the Gemma model is ~17 GB RAM-resident per process; starting another local run
+benchmark.sh: the Laguna model is ~19 GB RAM-resident per process; starting another local run
 benchmark.sh: now would load a second copy and can out-of-memory this machine.
 benchmark.sh: - a ppid of 1 usually means an orphan left by a previous aborted run: verify with
 benchmark.sh:   'ps -p <pid> -o pid,ppid,rss,command' and stop it with 'kill <pid>'.

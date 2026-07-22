@@ -1,0 +1,9 @@
+# TODO(operator): regenerate on m5-bench for mlx-community/Laguna-XS-2.1-4bit
+# Placeholder manifest for the Laguna XS 2.1 MTP runtime target. It contains
+# no entries on purpose: hashes are only ever pinned from an on-box download
+# on m5-bench, never pre-filled off-box. setup-mtp.sh fails closed on an
+# entry-less manifest until this file is regenerated.
+# Repository: mlx-community/Laguna-XS-2.1-4bit
+# Revision: c42e0a8f8d504ceacde015a535dcb286d65c8799
+# Upstream target: poolside/Laguna-XS-2.1@c405648833500615a2efde76886b8aed4fb9324e
+# Format: <sha256> <byte_count> <relative_path>

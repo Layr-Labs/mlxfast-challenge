@@ -1,12 +1,44 @@
 # MTP Track Go-Live Runbook (Archived Operator Record)
 
-This records the completed procedure that brought
-`gemma4-31b-it-mtp-v1` live. MTP is now the default declared by
+> **Laguna XS 2.1 re-pin (2026-07): this runbook must be re-executed.**
+> The track has been re-pinned from Gemma 4 31B-IT to Poolside Laguna XS 2.1
+> (target `mlx-community/Laguna-XS-2.1-4bit`, upstream
+> `poolside/Laguna-XS-2.1`, assistant `poolside/Laguna-XS-2.1-DFlash`
+> downloaded as the BF16 upstream and converted to MLX 4-bit at setup) under
+> the new track ID `laguna-xs-2.1-mtp-v1`
+> (serial: `laguna-xs-2.1-serial-v1`). Everything M5-derived below is stale
+> for the new model and must be regenerated on `m5-bench` with the real
+> Laguna weights before the track can go live again:
+>
+> - the hidden correctness + benchmark goldens and their SHA256/byte pins in
+>   `benchmark.yml` (Laguna uses a NEW tokenizer with vocab 100352 — no
+>   Gemma-era token IDs or expected-token sequences carry over);
+> - the public local fixtures under `correctness_prompts/` (same reason);
+> - the weight manifests `fixtures/mtp_laguna_xs_2_1_4bit.sha256`,
+>   `fixtures/mtp_laguna_xs_2_1_dflash.sha256`, and
+>   `fixtures/reference_laguna_xs_2_1_4bit.sha256` (checked in as entry-less
+>   placeholder headers; hashes are only ever pinned from on-box downloads,
+>   and setup fails closed until they are regenerated), plus the
+>   `manifest_sha256`, assistant file pins, and `expected_source_bytes`
+>   confirmation in `fixtures/laguna_xs_2_1_mtp_track.json`;
+> - the paired serial K=1 baseline tree, floor calibration, and box-2 MTP
+>   caches (`/opt/bench-runner/cache/mtp/laguna-xs-2.1-mtp-v1/...`);
+> - the enablement commit that flips the contract fixture back to
+>   `official_scoring_enabled=true` /
+>   `reference_baseline.status=established` / `publication_allowed=true`.
+>
+> Until then `fixtures/laguna_xs_2_1_mtp_track.json` ships fail-closed
+> (`official_scoring_enabled=false`, `reference_baseline.status=
+> pending_m5_rebaseline`). Re-run the B/C/A sequence below with the Laguna
+> names substituted.
+
+This records the completed procedure that brought the previous pin,
+`gemma4-31b-it-mtp-v1`, live. MTP is now the default declared by
 `benchmark.json` and `.github/workflows/benchmark.yml`; the former serial
 entrypoint is archived as `benchmark.serial.json` and
 `.github/workflows/serial-benchmark.yml`. The remaining sections preserve the
-original go-live evidence and should be read historically, not as current
-enablement instructions.
+original (Gemma-era) go-live evidence and should be read historically — as
+the template for the Laguna re-run — not as current enablement state.
 
 Box naming used throughout (no hostnames in this public doc):
 
@@ -421,13 +453,15 @@ The enablement change is ASSEMBLED AS A DRAFT PR (one trusted commit,
 reviewed like any ranking-contract change) and merges only after the box-2
 preconditions in C are complete. It contains:
 
-1. `fixtures/gemma_4_31b_it_mtp_track.json`:
+1. the contract fixture (now `fixtures/laguna_xs_2_1_mtp_track.json`):
    `official_scoring_enabled: true`; `reference_baseline` -> `status:
    "established"`, `publication_allowed: true`; the `proposed_scoring`
    block updated to the ADOPTED 2026-07-14 decisions (512-token ranked
    decode window, ratio-of-means aggregation, floor on the aggregate,
    minimum 3 / target 4 pairs, 4x-p50 stall guardrail with one gated
-   retry). The harness contract validator
+   retry); for the Laguna re-pin also replace every `REGENERATE_ON_M5`
+   placeholder (manifest self-hashes, assistant bytes/hashes, confirmed
+   source-byte totals). The harness contract validator
    (`validateExperimentalMTPContract`) pins the enabled identity in the
    same commit. The calibrated serial-denominator stats live in the box's
    `mtp-baseline-calibration.json` (C.5/B.6), not the fixture.
@@ -436,6 +470,11 @@ preconditions in C are complete. It contains:
    `MLXFAST_MTP_BENCH_GOLDEN_SHA256/BYTES` — pending box-2 replay
    confirmation; re-pin if box 2 diverges), `MLXFAST_MTP_DECODE_TOKENS=512`,
    `MLXFAST_MTP_TARGET_PAIRS=4`, and the ratio-of-means score computation.
+   For the Laguna re-pin the same commit must also rotate the workflow's
+   track/identity env (`MLXFAST_MTP_TRACK_ID`, `MLXFAST_MTP_CONTRACT_PATH`,
+   `MLXFAST_MTP_TARGET_MANIFEST_PATH`, `MLXFAST_MTP_ASSISTANT_MANIFEST_PATH`,
+   `MLXFAST_MTP_TARGET_DIR`/`MLXFAST_MTP_ASSISTANT_DIR` cache paths, and the
+   R2 golden object keys) from the gemma values to the laguna ones.
 3. The tests that deliberately pinned the disabled state updated to pin the
    enabled state instead
    (`ExperimentalMTPTests.trainedMTPContractPinsMatchedITPairAndDependency`,
@@ -443,7 +482,7 @@ preconditions in C are complete. It contains:
    `serialRankedPipelineRemainsMTPFree` unchanged and passing.
 4. The leaderboard registration record is now the default `benchmark.json`
    (with `benchmark.mtp.json` retained as a compatibility alias): track id
-   `gemma4-31b-it-mtp-v1`, workflow `benchmark.yml`, score artifact
+   `laguna-xs-2.1-mtp-v1`, workflow `benchmark.yml`, score artifact
    `benchmark-results-<run_id>/score.json`, score field `score`,
    verdict `passed`, floor semantics "failed below 1.0". The operator
    registers this namespace with the orchestrator/Yukon backend at merge
@@ -467,7 +506,9 @@ change):
 
 1. **Ranked decode denominator: 512 tokens** (`MLXFAST_MTP_DECODE_TOKENS`;
    the goldens carry 512 decode tokens, the contract's `decode_tokens: 128`
-   remains the CLI compatibility default with `maximum_decode_tokens: 512`).
+   remains the CLI compatibility default; the Laguna re-pin raises
+   `maximum_decode_tokens` to 1,536 for untimed trusted-parent correctness
+   legs).
 2. **Aggregation: ratio-of-means** — the published score is
    `mean(serial s/tok) / mean(mtp s/tok)` over the accepted pairs, computed
    in the trusted shell from the sealed per-side means; per-pair
@@ -476,9 +517,11 @@ change):
    measurement-invalid with one gated retry (owned by `measure-mtp-job.sh`).
 4. **Pairs: minimum 3 accepted, target 4**, alternating order; floor 1.0 on
    the aggregate.
-5. **License review: complete** — Gemma 4 models are Apache-2.0 with the
-   Gemma terms; the repo carries `LICENSE`, `THIRD_PARTY_NOTICES.md`, and a
-   README attribution note (license-hygiene PR).
+5. **License review: complete for the Gemma-era pin** (Apache-2.0 with the
+   Gemma terms). The Laguna re-pin needs its own pass: Poolside Laguna
+   XS 2.1 and the DFlash speculator are OpenMDW-1.1
+   (<https://huggingface.co/poolside/Laguna-XS-2.1>); update
+   `THIRD_PARTY_NOTICES.md` and the README attribution before go-live.
 
 Still open (non-blocking for the enablement draft):
 

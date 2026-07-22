@@ -53,14 +53,16 @@ struct MTPWorkflowIsolationTests {
         #expect(serialScript.contains("WORKFLOW_PATH=\".github/workflows/serial-benchmark.yml\""))
     }
 
-    // THE ENABLEMENT GATE (post-go-live shape): the track is enabled on the
-    // trusted contract and the hidden-golden pins are filled with the frozen
-    // values, while the gate itself remains standing and fail-closed — it
-    // still refuses a reverted contract, an emptied pin, or a dispatch
-    // without the explicit operator interlock — and it stays ordered before
-    // any secret use, submitted-code handling, or bench execution.
+    // THE ENABLEMENT GATE (Laguna pre-go-live shape): the gate is standing
+    // and fail-closed — it refuses a disabled contract, an emptied pin, or
+    // a dispatch without the explicit operator interlock — and it stays
+    // ordered before any secret use, submitted-code handling, or bench
+    // execution. The Laguna trusted contract ships DISABLED until the
+    // hidden goldens and paired baseline are regenerated on m5-bench
+    // (docs/mtp-track-golive-runbook.md), so the workflow is deliberately
+    // inert while the gate structure stays pinned.
     @Test
-    func mtpTrackIsEnabledWithPinnedGoldensAndStandingFailClosedGate() throws {
+    func mtpTrackGateStandsFailClosedWithPinnedGoldensPendingLagunaGoLive() throws {
         let workflow = try mtpWorkflow()
 
         let enablement = try #require(workflow.range(of: "- name: Enforce MTP track enablement"))
@@ -101,8 +103,11 @@ struct MTPWorkflowIsolationTests {
         #expect(gate.contains("MLXFAST_MTP_BENCH_GOLDEN_SHA256"))
         #expect(gate.contains("is empty; freeze the IT-target goldens"))
 
-        // The pins carry the frozen 2026-07-15 golden identities (pending
-        // box-2 replay confirmation; re-pinned there on any divergence).
+        // The pins still carry the frozen 2026-07-15 Gemma-era golden
+        // identities. TODO(operator): they are regenerated for Laguna on
+        // m5-bench together with the workflow env re-pin (go-live runbook
+        // step B); until then a dispatch fails closed on the disabled
+        // contract before any golden is fetched.
         #expect(workflow.contains(
             "MLXFAST_MTP_CORRECTNESS_GOLDEN_SHA256: d4fff3fe015123c395be68cb19401709ec288e44a04e52c2ea36c32220356862"
         ))
@@ -122,17 +127,19 @@ struct MTPWorkflowIsolationTests {
         )
         #expect(confirmInput.contains("default: true"))
 
-        // And the trusted contract the gate reads is ENABLED — the QAT
-        // 4-bit assistant's paired reference baseline was re-established on
-        // the ranked box (the ExperimentalMTPTests contract test pins this
-        // too; asserting here keeps workflow + fixture in one reviewable
-        // invariant).
-        let contract = try Data(contentsOf: URL(fileURLWithPath: "fixtures/gemma_4_31b_it_mtp_track.json"))
+        // And the trusted contract the gate reads is DISABLED: the Laguna
+        // re-pin ships fail-closed until the m5-bench go-live regenerates
+        // the hidden goldens, weight manifests, and paired baseline (the
+        // ExperimentalMTPTests contract test pins this too; asserting here
+        // keeps workflow + fixture in one reviewable invariant).
+        // TODO(operator): the enablement commit flips these to
+        // true/true/"established".
+        let contract = try Data(contentsOf: URL(fileURLWithPath: "fixtures/laguna_xs_2_1_mtp_track.json"))
         let json = try #require(try JSONSerialization.jsonObject(with: contract) as? [String: Any])
-        #expect(json["official_scoring_enabled"] as? Bool == true)
+        #expect(json["official_scoring_enabled"] as? Bool == false)
         let baseline = try #require(json["reference_baseline"] as? [String: Any])
-        #expect(baseline["publication_allowed"] as? Bool == true)
-        #expect(baseline["status"] as? String == "established")
+        #expect(baseline["publication_allowed"] as? Bool == false)
+        #expect(baseline["status"] as? String == "pending_m5_rebaseline")
     }
 
     // The two ranked tracks never share mutable runtime identity: distinct
@@ -143,6 +150,10 @@ struct MTPWorkflowIsolationTests {
     func mtpTrackIdentityIsFullySeparateFromSerialTrack() throws {
         let workflow = try mtpWorkflow()
 
+        // TODO(operator): the workflow env still carries the retired
+        // gemma4-31b-it-mtp-v1 id; it rotates to laguna-xs-2.1-mtp-v1 with
+        // the .github workflow re-pin (go-live runbook), which keeps the
+        // workflow inert against the Laguna contract's track_id until then.
         #expect(workflow.contains("MLXFAST_MTP_TRACK_ID: gemma4-31b-it-mtp-v1"))
         #expect(workflow.contains("MLXFAST_JOB_WS: /Users/Shared/bench-jobs/mtp-ranked-current"))
         #expect(workflow.contains("group: mlxfast-mtp-ranked-"))
@@ -174,7 +185,7 @@ struct MTPWorkflowIsolationTests {
         // benchmark.json is Yukon's authoritative default registration.
         let registration = try Data(contentsOf: URL(fileURLWithPath: "benchmark.json"))
         let track = try #require(try JSONSerialization.jsonObject(with: registration) as? [String: Any])
-        #expect(track["trackId"] as? String == "gemma4-31b-it-mtp-v1")
+        #expect(track["trackId"] as? String == "laguna-xs-2.1-mtp-v1")
         #expect(track["name"] as? String == "mlxfast-challenge-dev-mtp")
         let runner = try #require(track["runner"] as? [String: Any])
         #expect(runner["workflow"] as? String == "benchmark.yml")
@@ -188,7 +199,7 @@ struct MTPWorkflowIsolationTests {
                 == ["bash", "-c", "MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh && ./setup-mtp.sh"]
         )
         let leaderboard = try #require(track["leaderboard"] as? [String: Any])
-        #expect(leaderboard["namespace"] as? String == "gemma4-31b-it-mtp-v1")
+        #expect(leaderboard["namespace"] as? String == "laguna-xs-2.1-mtp-v1")
         #expect(leaderboard["separateFromSerialTrack"] as? Bool == true)
         #expect(
             registration
@@ -226,7 +237,11 @@ struct MTPWorkflowIsolationTests {
         #expect(!serial.contains("mtp"))
         #expect(!serial.contains("MTP"))
         #expect(!serial.contains("MLXFAST_MTP_"))
+        // Neither the retired nor the current MTP track namespace may leak
+        // into the serial pipeline ("laguna-xs-2.1" alone stays legal there:
+        // the serial track shares the Laguna target model).
         #expect(!serial.contains("gemma4-31b-it"))
+        #expect(!serial.contains("laguna-xs-2.1-mtp"))
     }
 
     // Submission dispatches run the static review under the MTP track policy

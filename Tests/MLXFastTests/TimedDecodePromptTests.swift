@@ -40,10 +40,10 @@ func hiddenTimedPromptIsIndependentOfCorrectnessFixtures() throws {
         "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"
     ))
     #expect(workflow.contains(
-        "MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"
+        "MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json"
     ))
     #expect(workflow.contains(
-        "MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json"
+        "MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna.json"
     ))
 }
 
@@ -61,7 +61,7 @@ func hiddenTimedPromptIsPinnedAndScopedToTrustedSteps() throws {
     #expect(!jobHeader.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH:"))
     #expect(
         workflow.components(
-            separatedBy: "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1.txt"
+            separatedBy: "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_gc_runtimes_essay-laguna.txt"
         ).count - 1 == 1
     )
     #expect(prepare.contains(".github/scripts/download-r2-object.sh"))

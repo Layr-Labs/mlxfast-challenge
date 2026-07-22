@@ -1,5 +1,14 @@
 # Gemma 4 MTP Track Threat Model
 
+> **Historical (Gemma-era) record.** This threat model was written for the
+> previous pin, `gemma4-31b-it-mtp-v1` (Gemma 4 31B-IT dense target with the
+> QAT trained assistant). The track is now `laguna-xs-2.1-mtp-v1`: Poolside
+> Laguna XS 2.1 (256-expert MoE, untied head, YaRN full-attention RoPE,
+> sliding window 512) with the 5-layer DFlash Eagle-style draft
+> (`poolside/Laguna-XS-2.1-DFlash`). The threat classes and controls below
+> carry over, but model-specific numbers, symbol names, and assistant
+> details are stale until this document is re-validated for Laguna.
+
 ## Executive summary
 
 The highest risks are integrity attacks that make a candidate appear faster

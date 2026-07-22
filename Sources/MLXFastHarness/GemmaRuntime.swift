@@ -321,18 +321,19 @@ public struct RuntimeWorkerOptions: Equatable {
 public enum GemmaRuntime {}
 
 extension GemmaRuntime {
-    /// Dense Gemma 4 keeps every text-tower weight RAM-resident; there is no
-    /// expert streaming machinery, so score/worker protocol fields stay zero.
+    /// The Laguna runtime keeps every text-tower weight (including all 256
+    /// routed experts) RAM-resident; there is no expert streaming machinery,
+    /// so score/worker protocol fields stay zero.
     /// Convention: call sites with a live weight cache/loader in scope go
     /// through these helpers; paths with no such handle (worker-backed
     /// benchmark phases and early failure payloads) inline
     /// `ExpertStreamingStats.zero` directly, which is identical by
     /// construction.
-    static func expertStats(from _: Gemma4RuntimeWeightCache) -> ExpertStreamingStats {
+    static func expertStats(from _: LagunaRuntimeWeightCache) -> ExpertStreamingStats {
         .zero
     }
 
-    static func expertStats(from _: Gemma4WeightLoader?) -> ExpertStreamingStats {
+    static func expertStats(from _: LagunaWeightLoader?) -> ExpertStreamingStats {
         .zero
     }
 }

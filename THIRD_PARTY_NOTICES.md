@@ -8,45 +8,38 @@ the setup scripts (`setup.sh`, `setup-mtp.sh`) download the pinned artifacts
 from their upstream repositories and verify them against checked-in SHA256
 manifests.
 
-## Gemma 4 models (Google DeepMind)
+## Poolside Laguna XS 2.1 models
 
-Gemma 4 31B, Gemma 4 31B-IT, and the Gemma 4 31B-IT assistant are
-© Google DeepMind, licensed under the Apache License, Version 2.0, with usage
-terms published at <https://ai.google.dev/gemma/docs/gemma_4_license>. The
-4-bit MLX conversions are by the mlx-community, likewise published under
-Apache-2.0.
+Laguna XS 2.1 and the Laguna XS 2.1 DFlash speculator are © Poolside,
+published under the OpenMDW-1.1 license with terms on the model cards at
+<https://huggingface.co/poolside/Laguna-XS-2.1>. The 4-bit MLX target
+conversion is by the mlx-community, published under the same license tag.
 
 Artifacts referenced (and hash-pinned) by this repository:
 
 | Artifact | Upstream | License |
 |---|---|---|
-| `google/gemma-4-31B` (base; upstream of the serial-track checkpoint) | Google DeepMind | Apache-2.0 + Gemma terms |
-| `mlx-community/gemma-4-31b-4bit` @ `e236b3eb2f9567ded5875cfa89f1666afa1acbf1` (serial-track reference checkpoint) | mlx-community conversion of the above | Apache-2.0 + Gemma terms |
-| `google/gemma-4-31B-it` @ `518276fb130dc81caf9a4f772e65e63ef2526493` (MTP-track upstream target) | Google DeepMind | Apache-2.0 + Gemma terms |
-| `mlx-community/gemma-4-31b-it-4bit` @ `696d436c404745a59f30e4939a658162b0a9e57f` (MTP-track runtime target) | mlx-community conversion of the above | Apache-2.0 + Gemma terms |
-| `google/gemma-4-31B-it-qat-q4_0-unquantized-assistant` (upstream of the MTP-track trained drafter) | Google DeepMind | Apache-2.0 + Gemma terms |
-| `mlx-community/gemma-4-31B-it-qat-assistant-4bit` @ `5234fd588403c9b68f3bd20a140b7e61700cb7e2` (MTP-track trained drafter, affine 4-bit group-64 conversion) | mlx-community conversion of the above | Gemma terms (card) over Apache-2.0 upstream |
+| `poolside/Laguna-XS-2.1` @ `c405648833500615a2efde76886b8aed4fb9324e` (MTP-track upstream target, BF16) | Poolside | OpenMDW-1.1 |
+| `mlx-community/Laguna-XS-2.1-4bit` @ `c42e0a8f8d504ceacde015a535dcb286d65c8799` (MTP-track runtime target and serial-track reference checkpoint; MLX affine 4-bit, group size 64) | mlx-community conversion of the above | OpenMDW-1.1 |
+| `poolside/Laguna-XS-2.1-DFlash` @ `5c36361aab23c8ed3afbd079c10c426b677bc607` (MTP-track draft/assistant; BF16 upstream, converted to MLX 4-bit at setup) | Poolside | OpenMDW-1.1 |
 
-Attribution statement (Apache-2.0 §4(c)): "Gemma 4 31B, Gemma 4 31B-IT, and
-Gemma 4 31B-IT-assistant © Google DeepMind, licensed under the Apache
-License 2.0 (<https://ai.google.dev/gemma/docs/gemma_4_license>); 4-bit
-conversions by mlx-community, Apache-2.0."
+Attribution statement: "Laguna XS 2.1 and Laguna XS 2.1 DFlash © Poolside,
+licensed OpenMDW-1.1 (<https://huggingface.co/poolside/Laguna-XS-2.1>);
+4-bit MLX target conversion by mlx-community."
 
-Apache-2.0 compliance notes for anyone redistributing these models or
-derivative weights obtained through this harness (e.g. a transformed
-`weights/` or `mtp-weights/` tree):
+Compliance notes for anyone redistributing these models or derivative
+weights obtained through this harness (e.g. a transformed `weights/` or
+`mtp-weights/` tree):
 
-- **§4(a)** — provide recipients a copy of the Apache License 2.0. The full
-  license text is included in the appendix of this file.
-- **§4(b)** — mark modified files as changed (the harness's `transform`
-  output is a repacked/derivative artifact of the pinned checkpoint; its
-  provenance is recorded in the emitted `config.json` and hash manifests).
-- **§4(c)** — retain the attribution statement above.
-- **§4(d)** — the upstream model repositories do not currently ship a
-  separate `NOTICE` file; if one is added upstream, its contents must be
-  carried along with redistributions.
-- The Gemma terms of use at the URL above apply to use of the models in
-  addition to Apache-2.0.
+- Review and satisfy the OpenMDW-1.1 terms published on the model cards
+  before redistribution. TODO(operator): confirm the SPDX identifier and a
+  canonical license-text URL before public go-live.
+- Mark modified files as changed (the harness's `transform` output is a
+  repacked/derivative artifact of the pinned checkpoint; its provenance is
+  recorded in the emitted `config.json` and hash manifests).
+- Retain the attribution statement above.
+- The Apache License 2.0 appendix below is retained for the Swift package
+  dependencies listed in the next section.
 
 ## Swift package dependencies
 

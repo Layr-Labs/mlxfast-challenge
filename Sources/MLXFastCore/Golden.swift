@@ -893,7 +893,7 @@ private func validateTokens(_ tokens: [Int], field: String) throws {
     for (index, token) in tokens.enumerated() {
         if token < 0 || token >= MLXFastConstants.vocabSize {
             throw MLXFastError.invalidInput(
-                "\(field)[\(index)]=\(token) is outside Gemma 4 vocab range 0..<\(MLXFastConstants.vocabSize)"
+                "\(field)[\(index)]=\(token) is outside Laguna vocab range 0..<\(MLXFastConstants.vocabSize)"
             )
         }
     }

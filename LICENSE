@@ -24,6 +24,6 @@ SOFTWARE.
 
 This license covers the mlxfast challenge harness, benchmark pipeline, model
 runtime, transform, tests, and documentation in this repository. Model
-weights are NOT distributed in this repository; the Gemma 4 models this
-harness downloads and benchmarks are third-party works — see
+weights are NOT distributed in this repository; the Poolside Laguna models
+this harness downloads and benchmarks are third-party works — see
 THIRD_PARTY_NOTICES.md for their licenses and attribution.

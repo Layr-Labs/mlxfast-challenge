@@ -1868,7 +1868,7 @@ private enum MLXFastCLI {
               mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]
               mlxfast-swift checkpoint-shards --index PATH
 
-            Swift-only Gemma 4 31B 4-bit harness entrypoint.
+            Swift-only Poolside Laguna XS 2.1 4-bit harness entrypoint.
             """
         )
     }

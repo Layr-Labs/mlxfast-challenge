@@ -34,13 +34,13 @@ struct RankedWorkflowIsolationTests {
         let stepsMarker = try #require(workflow.range(of: "\n    steps:"))
         let jobHeader = String(workflow[workflow.startIndex..<stepsMarker.lowerBound])
         #expect(!jobHeader.contains(
-            "MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"
+            "MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json"
         ))
         #expect(!jobHeader.contains(
-            "MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json"
+            "MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna.json"
         ))
         #expect(!jobHeader.contains(
-            "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1.txt"
+            "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_gc_runtimes_essay-laguna.txt"
         ))
 
         let prepareStep = try stepBody(
@@ -49,10 +49,10 @@ struct RankedWorkflowIsolationTests {
             to: "- name: Attach GPQA gates and verify augmented golden"
         )
         #expect(prepareStep.contains(
-            "MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"
+            "MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json"
         ))
         #expect(prepareStep.contains(
-            "MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json"
+            "MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna.json"
         ))
         let prepareTimedPromptStep = try stepBody(
             workflow,
@@ -60,7 +60,7 @@ struct RankedWorkflowIsolationTests {
             to: "- name: Wait for quiescence before timing"
         )
         #expect(prepareTimedPromptStep.contains(
-            "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1.txt"
+            "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_gc_runtimes_essay-laguna.txt"
         ))
     }
 

@@ -167,11 +167,11 @@ extension GemmaRuntime {
         }
 
         #if !MLXFAST_TRUSTED_HARNESS
-            let config = try Gemma4Config.load(from: options.weightsPath)
-            let loader = try Gemma4WeightLoader(
+            let config = try LagunaConfig.load(from: options.weightsPath)
+            let loader = try LagunaWeightLoader(
                 weightsPath: options.weightsPath
             )
-            let weightCache = Gemma4RuntimeWeightCache(
+            let weightCache = LagunaRuntimeWeightCache(
                 loader: loader,
                 config: config
             )
@@ -481,7 +481,7 @@ extension GemmaRuntime {
     #if !MLXFAST_TRUSTED_HARNESS
         static func compareTeacherForcedCached(
         testCase: GoldenCase,
-        weightCache: Gemma4RuntimeWeightCache,
+        weightCache: LagunaRuntimeWeightCache,
         steps: Int = MLXFastConstants.correctnessSteps,
         progressIntervalSteps: Int = 0,
         progress: ((Int, Int) -> Void)? = nil
@@ -495,10 +495,11 @@ extension GemmaRuntime {
             )
         }
 
-        let cache = Gemma4ModelCache(config: weightCache.config)
-        var logits = try Gemma4Model.logits(
+        let model = try weightCache.requireLibraryModel()
+        let cache = model.newCache(parameters: nil)
+        var logits = try lagunaLogits(
             inputIDs: inputIDsArray(testCase.promptTokens),
-            weightCache: weightCache,
+            model: model,
             cache: cache,
             positionOffset: 0
         )
@@ -530,9 +531,9 @@ extension GemmaRuntime {
                 break
             }
 
-            logits = try Gemma4Model.logits(
+            logits = try lagunaLogits(
                 inputIDs: inputIDsArray([expectedToken]),
-                weightCache: weightCache,
+                model: model,
                 cache: cache,
                 positionOffset: testCase.promptTokens.count + step
             )
@@ -550,12 +551,13 @@ extension GemmaRuntime {
 
     static func compareAnchorCached(
         anchor: GoldenAnchorCase,
-        weightCache: Gemma4RuntimeWeightCache
+        weightCache: LagunaRuntimeWeightCache
     ) throws -> CorrectnessTokenComparison {
-        let cache = Gemma4ModelCache(config: weightCache.config)
-        let logits = try Gemma4Model.logits(
+        let model = try weightCache.requireLibraryModel()
+        let cache = model.newCache(parameters: nil)
+        let logits = try lagunaLogits(
             inputIDs: inputIDsArray(anchor.contextTokens),
-            weightCache: weightCache,
+            model: model,
             cache: cache,
             positionOffset: 0
         )
@@ -569,7 +571,7 @@ extension GemmaRuntime {
 
     static func compareFreeRunCached(
         testCase: GoldenFreeRunCase,
-        weightCache: Gemma4RuntimeWeightCache,
+        weightCache: LagunaRuntimeWeightCache,
         progressIntervalSteps: Int = 0,
         progress: ((Int, Int) -> Void)? = nil
     ) throws -> CorrectnessTokenComparison {
@@ -585,13 +587,14 @@ extension GemmaRuntime {
 
         static func compareBehaviorCached(
         testCase: GoldenBehaviorCase,
-        weightCache: Gemma4RuntimeWeightCache
+        weightCache: LagunaRuntimeWeightCache
     ) throws -> CorrectnessTokenComparison {
         if testCase.maxNewTokens == 1 {
-            let cache = Gemma4ModelCache(config: weightCache.config)
-            let logits = try Gemma4Model.logits(
+            let model = try weightCache.requireLibraryModel()
+            let cache = model.newCache(parameters: nil)
+            let logits = try lagunaLogits(
                 inputIDs: inputIDsArray(testCase.promptTokens),
-                weightCache: weightCache,
+                model: model,
                 cache: cache,
                 positionOffset: 0
             )
@@ -861,7 +864,7 @@ extension GemmaRuntime {
         testCase: GoldenCase,
         step: Int,
         topK: Int,
-        weightCache: Gemma4RuntimeWeightCache,
+        weightCache: LagunaRuntimeWeightCache,
         goldenHash: String
     ) throws -> CorrectnessTraceReport {
         guard !testCase.promptTokens.isEmpty else {
@@ -876,10 +879,11 @@ extension GemmaRuntime {
             throw MLXFastError.invalidInput("trace topK must be positive")
         }
 
-        let cache = Gemma4ModelCache(config: weightCache.config)
-        var logits = try Gemma4Model.logits(
+        let model = try weightCache.requireLibraryModel()
+        let cache = model.newCache(parameters: nil)
+        var logits = try lagunaLogits(
             inputIDs: inputIDsArray(testCase.promptTokens),
-            weightCache: weightCache,
+            model: model,
             cache: cache,
             positionOffset: 0
         )
@@ -900,9 +904,9 @@ extension GemmaRuntime {
                 )
             }
 
-            logits = try Gemma4Model.logits(
+            logits = try lagunaLogits(
                 inputIDs: inputIDsArray([token]),
-                weightCache: weightCache,
+                model: model,
                 cache: cache,
                 positionOffset: testCase.promptTokens.count + currentStep
             )
@@ -983,7 +987,7 @@ extension GemmaRuntime {
         static func generateGreedyCached(
         promptTokens: [Int],
         steps: Int,
-        weightCache: Gemma4RuntimeWeightCache,
+        weightCache: LagunaRuntimeWeightCache,
         progressIntervalSteps: Int = 0,
         progress: ((Int, Int) -> Void)? = nil
     ) throws -> [Int] {
@@ -994,10 +998,11 @@ extension GemmaRuntime {
             throw MLXFastError.invalidInput("greedy correctness steps must be non-negative")
         }
 
-        let cache = Gemma4ModelCache(config: weightCache.config)
-        var logits = try Gemma4Model.logits(
+        let model = try weightCache.requireLibraryModel()
+        let cache = model.newCache(parameters: nil)
+        var logits = try lagunaLogits(
             inputIDs: inputIDsArray(promptTokens),
-            weightCache: weightCache,
+            model: model,
             cache: cache,
             positionOffset: 0
         )
@@ -1016,9 +1021,9 @@ extension GemmaRuntime {
             if step == steps - 1 {
                 break
             }
-            logits = try Gemma4Model.logits(
+            logits = try lagunaLogits(
                 inputIDs: inputIDsArray([token]),
-                weightCache: weightCache,
+                model: model,
                 cache: cache,
                 positionOffset: promptTokens.count + step
             )

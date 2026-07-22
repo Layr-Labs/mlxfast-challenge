@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local directional runner for the default Gemma 4 31B-IT MTP track.
+# Local directional runner for the default Laguna XS 2.1 MTP track.
 set -euo pipefail
 
 usage() {
@@ -42,7 +42,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${repo_root}"
 
 swift_bin="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
-contract_path="${MLXFAST_MTP_CONTRACT_PATH:-fixtures/gemma_4_31b_it_mtp_track.json}"
+contract_path="${MLXFAST_MTP_CONTRACT_PATH:-fixtures/laguna_xs_2_1_mtp_track.json}"
 prompt_path="${MLXFAST_MTP_LOCAL_PROMPT_PATH:-correctness_prompts/public_longcopy_gate_english.txt}"
 score_path="${MLXFAST_SCORE_PATH:-score.json}"
 work_root="${MLXFAST_MTP_LOCAL_WORK_DIR:-.mlxfast-local-mtp}"
@@ -85,7 +85,7 @@ serial_report="${run_dir}/serial.json"
 mtp_report="${run_dir}/mtp.json"
 score_tmp="${score_path}.tmp"
 
-echo "benchmark-mtp: transforming the pinned IT target" >&2
+echo "benchmark-mtp: transforming the pinned Laguna target" >&2
 "${swift_bin}" transform \
   --reference "${MLXFAST_MTP_TARGET_DIR}" \
   --output "${weights_path}"
@@ -96,7 +96,7 @@ echo "benchmark-mtp: generating a candidate-local serial oracle (${token_count} 
   --weights "${weights_path}" \
   --tokenizer "${MLXFAST_MTP_TARGET_DIR}" \
   --output "${golden_path}" \
-  --name "gemma4-31b-it-mtp-local" \
+  --name "laguna-xs-2.1-mtp-local" \
   --steps "$((token_count + 1))"
 
 echo "benchmark-mtp: measuring serial K=1 control" >&2
@@ -123,7 +123,7 @@ jq -e '
   and .official_score_produced == false
   and (.parent_measured_seconds_per_token | type == "number" and . > 0)
 ' "${serial_report}" >/dev/null
-jq -e --arg track "gemma4-31b-it-mtp-v1" '
+jq -e --arg track "laguna-xs-2.1-mtp-v1" '
   .track_id == $track
   and .uses_trained_drafter == true
   and .all_tokens_matched == true
@@ -137,7 +137,7 @@ score="$(jq -n --argjson serial "${serial_spt}" --argjson mtp "${mtp_spt}" '$ser
 jq -e 'type == "number" and . > 0' <<<"${score}" >/dev/null
 
 jq -n \
-  --arg track "gemma4-31b-it-mtp-v1" \
+  --arg track "laguna-xs-2.1-mtp-v1" \
   --arg mode "${mode#--}" \
   --argjson score "${score}" \
   --argjson token_count "${token_count}" \

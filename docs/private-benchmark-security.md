@@ -155,18 +155,21 @@ sees them.
 
 Full benchmark dispatches (`run_benchmark=true`) download three objects from
 the private R2 bucket in trusted steps:
-`correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json`
+`correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json`
 (the hidden teacher-forced base case) and
-`correctness_prompts/gpqa_reference_cases-gemma.json` (the hidden GPQA
+`correctness_prompts/gpqa_reference_cases-laguna.json` (the hidden GPQA
 reference cases, merged into the golden as 5 behavior gates), followed after
 the correctness scrub by
-`correctness_prompts/timed_decode_lowsim_prose_v1.txt` (the independent
-timed prefill/decode target).
+`correctness_prompts/timed_decode_gc_runtimes_essay-laguna.txt` (the
+independent timed prefill/decode target).
 Correctness-only dispatches (`run_benchmark=false`) fetch no private
-material at all. The correctness objects were regenerated from the Gemma 4 31B 4-bit
-reference on the ranked hardware through the organizer-controlled offline
-process; `docs/gemma-migration-r2-checklist.md` records the provenance and
-the current pins.
+material at all. The 2026-07 Poolside Laguna XS 2.1 re-pin rotated these
+object keys from their former `-gemma` names: the correctness objects are
+regenerated from the Laguna reference — new tokenizer, vocab 100352 —
+through the same organizer-controlled offline process that
+`docs/gemma-migration-r2-checklist.md` records for the previous Gemma
+migration (that checklist is the template for this pass; see
+`docs/mtp-track-golive-runbook.md`).
 
 Raw private bytes land only in a runner-only `0700` per-run directory; the
 raw golden and timed prompt are each verified against a SHA-256 and byte

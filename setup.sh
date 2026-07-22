@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# Bootstrap system tools and build the Swift-only Gemma 4 harness.
+# Bootstrap system tools and build the Swift-only Laguna harness.
 set -euo pipefail
 
-REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/gemma-4-31b-4bit}"
+REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/Laguna-XS-2.1-4bit}"
 REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-main}"
 REFERENCE_CACHE_REPO_DIR="models--${REFERENCE_MODEL_REPO//\//--}"
 REFERENCE_CACHE_REVISION_DIR="${REFERENCE_REVISION//\//--}"
-# No organizer-hosted mirror exists yet for this checkpoint; default straight
-# to the Darkbloom R2 mirror (mlx-challenge bucket), which serves the same
-# manifest-pinned files as the public Hugging Face repo with higher parallel
-# throughput. Stalled or failed downloads automatically fall back to the public
-# Hugging Face source; set MLXFAST_REFERENCE_FALLBACK_BASE_URL empty to disable
-# that fallback. download_url_for_file appends
+# No organizer-hosted mirror exists yet for this checkpoint; default to the
+# pinned Hugging Face revision as primary (the manifest pins every byte) with
+# the repo's main branch as fallback.
+# TODO(operator): add a Darkbloom R2 mirror (as the gemma track had) and make
+# it the primary once it is provisioned, keeping this Hugging Face URL as the
+# fallback. download_url_for_file appends
 # "?download=true" automatically for huggingface.co URLs so that resolves to
 # the raw LFS/Xet bytes.
-DEFAULT_REFERENCE_BASE_URL="https://ds4.darkbloom.ai/gemma-4-31b-4bit"
-DEFAULT_REFERENCE_FALLBACK_BASE_URL="https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main"
+DEFAULT_REFERENCE_BASE_URL="https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/c42e0a8f8d504ceacde015a535dcb286d65c8799"
+DEFAULT_REFERENCE_FALLBACK_BASE_URL="https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/main"
 REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}"
 if [[ -n "${MLXFAST_REFERENCE_FALLBACK_BASE_URL+x}" ]]; then
   REFERENCE_FALLBACK_BASE_URL="${MLXFAST_REFERENCE_FALLBACK_BASE_URL}"
@@ -26,7 +26,7 @@ else
 fi
 REFERENCE_AUTH_HEADER="${MLXFAST_REFERENCE_AUTH_HEADER:-}"
 REFERENCE_APPEND_DOWNLOAD_QUERY="${MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY:-auto}"
-REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_gemma_4_31b_4bit.sha256}"
+REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_laguna_xs_2_1_4bit.sha256}"
 REFERENCE_HASH_VERIFY="${MLXFAST_REFERENCE_HASH_VERIFY:-1}"
 REFERENCE_POST_DOWNLOAD_FULL_VERIFY="${MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY:-1}"
 REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-40}"
@@ -55,7 +55,7 @@ SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
 # next to the worker binary, where Cmlx searches first.
 RUNTIME_WORKER_BIN="${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-.build-worker/release/mlxfast-runtime-worker}"
 MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${RUNTIME_WORKER_BIN}")/mlx.metallib}"
-DEFAULT_REFERENCE_DIR="reference_weights/gemma-4-31b-4bit"
+DEFAULT_REFERENCE_DIR="reference_weights/laguna-xs-2.1-4bit"
 DEFAULT_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}"
 DEFAULT_HF_HUB_CACHE="${MLXFAST_HF_HUB_CACHE:-${HF_HUB_CACHE:-${DEFAULT_HF_HOME}/hub}}"
 REFERENCE_CACHE_DIR="${MLXFAST_REFERENCE_CACHE_DIR:-${DEFAULT_HF_HUB_CACHE}/${REFERENCE_CACHE_REPO_DIR}/snapshots/${REFERENCE_CACHE_REVISION_DIR}}"
@@ -106,8 +106,9 @@ REFERENCE_REQUIRED_METADATA_FILES=(
 )
 REFERENCE_OPTIONAL_METADATA_FILES=(
   "README.md"
+  "chat_template.jinja"
   "generation_config.json"
-  "processor_config.json"
+  "special_tokens_map.json"
   "tokenizer.json"
   "tokenizer_config.json"
 )
@@ -117,7 +118,7 @@ print_help() {
 Usage: ./setup.sh
 
 Checks the local macOS/Apple Silicon toolchain, builds the Swift harness,
-builds mlx.metallib, and downloads the Gemma 4 31B 4-bit reference
+builds mlx.metallib, and downloads the Laguna XS 2.1 4-bit reference
 checkpoint when it is not already present.
 
 Important environment variables:

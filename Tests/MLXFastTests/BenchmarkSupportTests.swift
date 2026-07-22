@@ -90,7 +90,7 @@ private enum RuntimeWorkerDescriptorTestError: Error {
 }
 
 @Test
-func runtimeWorkerPinnedConfigurationAcceptsDense31BArchitecture() throws {
+func runtimeWorkerPinnedConfigurationAcceptsLagunaMoEArchitecture() throws {
     let data = try JSONSerialization.data(
         withJSONObject: pinnedRuntimeWorkerConfigurationObject()
     )
@@ -98,7 +98,7 @@ func runtimeWorkerPinnedConfigurationAcceptsDense31BArchitecture() throws {
 }
 
 @Test
-func runtimeWorkerPinnedConfigurationRejectsUnsafeLibraryOnlyFields() throws {
+func runtimeWorkerPinnedConfigurationRejectsNonLagunaArchitectures() throws {
     var cases: [(String, [String: Any])] = []
 
     func addCase(_ name: String, _ mutate: (inout [String: Any]) -> Void) {
@@ -107,35 +107,62 @@ func runtimeWorkerPinnedConfigurationRejectsUnsafeLibraryOnlyFields() throws {
         cases.append((name, object))
     }
 
-    addCase("model-type") { $0["model_type"] = "other" }
-    addCase("hidden-size") { $0["hidden_size"] = MLXFastConstants.hiddenSize - 1 }
+    // A dense Gemma-4-shaped config (the previous pinned target) must be
+    // rejected wholesale, not merely on the model_type string.
+    addCase("model-type") { $0["model_type"] = "gemma4_text" }
+    addCase("hidden-size") { $0["hidden_size"] = 5_376 }
     addCase("hidden-layers") { $0["num_hidden_layers"] = MLXFastConstants.numHiddenLayers - 1 }
     addCase("intermediate-size") { $0["intermediate_size"] = MLXFastConstants.intermediateSize - 1 }
-    addCase("attention-heads") { $0["num_attention_heads"] = MLXFastConstants.attentionHeads - 1 }
-    addCase("head-dim") { $0["head_dim"] = 128 }
-    addCase("global-head-dim") { $0["global_head_dim"] = 256 }
-    addCase("global-partial-rotary") { $0["global_partial_rotary_factor"] = 0.5 }
+    addCase("attention-heads") { $0["num_attention_heads"] = 64 }
+    addCase("uniform-heads-per-layer") {
+        $0["num_attention_heads_per_layer"] =
+            [Int](repeating: 48, count: MLXFastConstants.numHiddenLayers)
+    }
+    addCase("short-heads-per-layer") {
+        $0["num_attention_heads_per_layer"] =
+            [Int](repeating: 48, count: MLXFastConstants.numHiddenLayers - 1)
+    }
+    addCase("missing-heads-per-layer") {
+        $0.removeValue(forKey: "num_attention_heads_per_layer")
+    }
+    addCase("kv-heads") { $0["num_key_value_heads"] = 16 }
+    addCase("head-dim") { $0["head_dim"] = 256 }
     addCase("rms-norm") { $0["rms_norm_eps"] = 1e-5 }
-    addCase("vocab") { $0["vocab_size"] = MLXFastConstants.vocabSize - 1 }
-    addCase("kv-heads") { $0["num_key_value_heads"] = 8 }
-    addCase("global-kv-heads") { $0["num_global_key_value_heads"] = 8 }
-    addCase("zero-pattern") { $0["sliding_window_pattern"] = 0 }
-    addCase("wrong-pattern") { $0["sliding_window_pattern"] = 5 }
-    addCase("shared-kv") { $0["num_kv_shared_layers"] = 1 }
-    addCase("per-layer-input") { $0["hidden_size_per_layer_input"] = 1 }
-    addCase("oversized-per-layer-vocab") { $0["vocab_size_per_layer_input"] = Int.max }
-    addCase("sliding-window") { $0["sliding_window"] = 1 }
+    addCase("vocab") { $0["vocab_size"] = 262_144 }
+    addCase("sliding-window") { $0["sliding_window"] = 1_024 }
     addCase("max-position") { $0["max_position_embeddings"] = 131_072 }
-    addCase("attention-k-eq-v") { $0["attention_k_eq_v"] = false }
-    addCase("logit-softcap") { $0["final_logit_softcapping"] = 50 }
-    addCase("double-wide") { $0["use_double_wide_mlp"] = true }
+    addCase("attention-bias") { $0["attention_bias"] = true }
+    addCase("qkv-bias") { $0["qkv_bias"] = true }
+    addCase("attention-dropout") { $0["attention_dropout"] = 0.1 }
+    addCase("per-element-gating") { $0["gating"] = "per-element" }
+    addCase("disabled-gating") { $0["gating"] = false }
+    // Laguna's lm_head is untied; a tied-embedding config is a different
+    // (dense-era) checkpoint layout.
+    addCase("tie-embeddings") { $0["tie_word_embeddings"] = true }
+    addCase("moe-disabled") { $0["num_experts"] = 0 }
+    addCase("experts") { $0["num_experts"] = 8 }
+    addCase("top-k-experts") { $0["num_experts_per_tok"] = 2 }
+    addCase("moe-intermediate") { $0["moe_intermediate_size"] = 1_024 }
+    addCase("shared-expert-intermediate") {
+        $0["shared_expert_intermediate_size"] = 1_024
+    }
+    addCase("routed-scaling") { $0["moe_routed_scaling_factor"] = 1.0 }
+    addCase("norm-topk") { $0["norm_topk_prob"] = false }
+    addCase("router-softcap") { $0["moe_router_logit_softcapping"] = 30.0 }
     addCase("missing-layer-types") { $0.removeValue(forKey: "layer_types") }
     addCase("layer-pattern") {
-        var layerTypes = $0["layer_types"] as! [String]
-        layerTypes[0] = "full_attention"
-        $0["layer_types"] = layerTypes
+        // The dense Gemma 4 schedule (full attention every 6th layer) is
+        // not Laguna's every-4th-full schedule.
+        $0["layer_types"] = (0..<MLXFastConstants.numHiddenLayers).map { index in
+            index % 6 == 5 ? "full_attention" : "sliding_attention"
+        }
     }
-    addCase("tie-embeddings") { $0["tie_word_embeddings"] = false }
+    addCase("all-sparse-mlp") {
+        $0["mlp_layer_types"] =
+            [String](repeating: "sparse", count: MLXFastConstants.numHiddenLayers)
+    }
+    addCase("mlp-only-layers") { $0["mlp_only_layers"] = [0, 1] }
+    addCase("decoder-sparse-step") { $0["decoder_sparse_step"] = 2 }
     addCase("sliding-rope-theta") {
         var rope = $0["rope_parameters"] as! [String: Any]
         var sliding = rope["sliding_attention"] as! [String: Any]
@@ -146,7 +173,7 @@ func runtimeWorkerPinnedConfigurationRejectsUnsafeLibraryOnlyFields() throws {
     addCase("sliding-rope-type") {
         var rope = $0["rope_parameters"] as! [String: Any]
         var sliding = rope["sliding_attention"] as! [String: Any]
-        sliding["rope_type"] = "proportional"
+        sliding["rope_type"] = "yarn"
         rope["sliding_attention"] = sliding
         $0["rope_parameters"] = rope
     }
@@ -174,7 +201,35 @@ func runtimeWorkerPinnedConfigurationRejectsUnsafeLibraryOnlyFields() throws {
     addCase("full-partial-rotary") {
         var rope = $0["rope_parameters"] as! [String: Any]
         var full = rope["full_attention"] as! [String: Any]
-        full["partial_rotary_factor"] = 0.5
+        full["partial_rotary_factor"] = 1.0
+        rope["full_attention"] = full
+        $0["rope_parameters"] = rope
+    }
+    addCase("yarn-factor") {
+        var rope = $0["rope_parameters"] as! [String: Any]
+        var full = rope["full_attention"] as! [String: Any]
+        full["factor"] = 8.0
+        rope["full_attention"] = full
+        $0["rope_parameters"] = rope
+    }
+    addCase("yarn-original-max-position") {
+        var rope = $0["rope_parameters"] as! [String: Any]
+        var full = rope["full_attention"] as! [String: Any]
+        full["original_max_position_embeddings"] = 4_096
+        rope["full_attention"] = full
+        $0["rope_parameters"] = rope
+    }
+    addCase("yarn-beta-fast") {
+        var rope = $0["rope_parameters"] as! [String: Any]
+        var full = rope["full_attention"] as! [String: Any]
+        full["beta_fast"] = 32.0
+        rope["full_attention"] = full
+        $0["rope_parameters"] = rope
+    }
+    addCase("yarn-beta-slow") {
+        var rope = $0["rope_parameters"] as! [String: Any]
+        var full = rope["full_attention"] as! [String: Any]
+        full["beta_slow"] = 2.0
         rope["full_attention"] = full
         $0["rope_parameters"] = rope
     }
@@ -194,11 +249,6 @@ func runtimeWorkerPinnedConfigurationRejectsUnsafeLibraryOnlyFields() throws {
         $0["quantization"] = quantization
     }
     addCase("missing-quantization") { $0.removeValue(forKey: "quantization") }
-    addCase("moe") { $0["enable_moe_block"] = true }
-    addCase("experts") { $0["num_experts"] = 8 }
-    addCase("top-k-experts") { $0["top_k_experts"] = 2 }
-    addCase("moe-intermediate") { $0["moe_intermediate_size"] = 1_024 }
-    addCase("bidirectional-attention") { $0["use_bidirectional_attention"] = "unsupported" }
 
     for (name, object) in cases {
         let data = try JSONSerialization.data(withJSONObject: object)
@@ -210,19 +260,51 @@ func runtimeWorkerPinnedConfigurationRejectsUnsafeLibraryOnlyFields() throws {
 
 @Test
 func runtimeWorkerPinnedConfigurationAcceptsSafeOptionalRepresentations() throws {
+    // The alternate spelling: quantization under quantization_config, the
+    // boolean gating form, and every optional field absent (the validator
+    // treats absence as the pinned default).
     var object = pinnedRuntimeWorkerConfigurationObject()
-    object["global_partial_rotary_factor"] = 0.25
-    object["sliding_window_pattern"] = 6
-    object["use_bidirectional_attention"] = "vision"
     object["quantization_config"] = object.removeValue(forKey: "quantization")
+    object["gating"] = true
+    for optionalKey in [
+        "attention_bias",
+        "qkv_bias",
+        "attention_dropout",
+        "moe_routed_scaling_factor",
+        "norm_topk_prob",
+        "moe_router_logit_softcapping",
+        "mlp_layer_types",
+        "mlp_only_layers",
+        "decoder_sparse_step",
+    ] {
+        object.removeValue(forKey: optionalKey)
+    }
     var rope = object["rope_parameters"] as! [String: Any]
     var sliding = rope["sliding_attention"] as! [String: Any]
-    sliding["partial_rotary_factor"] = 1.0
+    var full = rope["full_attention"] as! [String: Any]
+    sliding.removeValue(forKey: "partial_rotary_factor")
+    for yarnKey in [
+        "factor",
+        "original_max_position_embeddings",
+        "beta_fast",
+        "beta_slow",
+        "attention_factor",
+    ] {
+        full.removeValue(forKey: yarnKey)
+    }
     rope["sliding_attention"] = sliding
+    rope["full_attention"] = full
     object["rope_parameters"] = rope
 
     try validateRuntimeWorkerPinnedConfigurationData(
         JSONSerialization.data(withJSONObject: object)
+    )
+
+    // Missing gating is also the pinned per-head default.
+    var withoutGating = pinnedRuntimeWorkerConfigurationObject()
+    withoutGating.removeValue(forKey: "gating")
+    try validateRuntimeWorkerPinnedConfigurationData(
+        JSONSerialization.data(withJSONObject: withoutGating)
     )
 }
 
@@ -862,7 +944,7 @@ func nonWorkerBenchmarkRejectsBehaviorGatesBecauseTTFTRequiresWorker() throws {
 
 @Test
 func benchmarkPreflightRejectsMissingSemanticTensor() throws {
-    let fixture = try makePreflightFixture(omitDenseTensorName: Gemma4WeightNames.finalNorm)
+    let fixture = try makePreflightFixture(omitDenseTensorName: LagunaWeightNames.finalNorm)
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     #expect(throws: MLXFastError.self) {
@@ -912,13 +994,13 @@ private func makePreflightFixture(
     let weights = directory.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
 
-    try minimalGemma4ConfigJSON().write(
+    try lagunaPreflightConfigJSON().write(
         to: weights.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
     )
 
-    var denseTensors = requiredGemma4DenseTensorFixtures()
+    var denseTensors = requiredLagunaDenseTensorFixtures()
     if let omitDenseTensorName {
         denseTensors.removeAll { $0.name == omitDenseTensorName }
     }
@@ -936,24 +1018,23 @@ private func makePreflightFixture(
     return PreflightFixture(root: directory, weights: weights, golden: golden)
 }
 
-private func minimalGemma4ConfigJSON() -> String {
-    """
-    {
-      "model_type": "gemma4_text",
-      "vocab_size": \(MLXFastConstants.vocabSize),
-      "hidden_size": \(MLXFastConstants.hiddenSize),
-      "intermediate_size": \(MLXFastConstants.intermediateSize),
-      "num_hidden_layers": \(MLXFastConstants.numHiddenLayers),
-      "num_attention_heads": \(MLXFastConstants.attentionHeads),
-      "num_key_value_heads": 16,
-      "num_global_key_value_heads": 4,
-      "head_dim": 256,
-      "global_head_dim": 512,
-      "attention_k_eq_v": true,
-      "sliding_window": 1024,
-      "tie_word_embeddings": true
+/// The pinned Laguna runtime config as the transform writes it, with the
+/// 8-bit router-gate quantization override present for every sparse layer
+/// (the shared `pinnedRuntimeWorkerConfigurationObject()` carries a single
+/// representative override; the preflight weight validation resolves the
+/// expected router bit width per layer from these entries).
+private func lagunaPreflightConfigJSON() throws -> String {
+    var root = pinnedRuntimeWorkerConfigurationObject()
+    var quantization = root["quantization"] as? [String: Any] ?? [:]
+    for layerIndex in 1..<MLXFastConstants.numHiddenLayers {
+        quantization["language_model.model.layers.\(layerIndex).mlp.gate.proj"] = [
+            "group_size": 64,
+            "bits": 8,
+        ]
     }
-    """
+    root["quantization"] = quantization
+    let data = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
+    return String(decoding: data, as: UTF8.self)
 }
 
 private func validGoldenJSON(
@@ -1004,114 +1085,147 @@ private func correctnessOnlyGoldenJSON() -> String {
     """
 }
 
-/// Every tensor `Gemma4WeightLoader.validateRequiredMetadata` requires for the
-/// full frozen shape (60 layers, alternating five sliding + one full-attention
-/// layer per block). Real byte contents do not matter for these preflight
-/// tests -- only declared dtype/shape -- so linear weights use the same
-/// packed `U32` (affine 4-bit, 8 values/word) layout the real checkpoint
-/// ships, which keeps the sparse fixture files under the default transformed-
-/// weights byte cap the way the small norm/scalar tensors alone could not.
-private func requiredGemma4DenseTensorFixtures() -> [TensorFixture] {
+/// Every tensor `LagunaWeightLoader.validateRequiredMetadata` requires for a
+/// synthetic Laguna-shaped checkpoint built from the pinned geometry (40
+/// layers, one full-attention layer per block of four, dense MLP at layer 0,
+/// 256-expert MoE with a shared expert elsewhere, per-head attention
+/// gating, untied lm_head). Real byte contents do not matter for these
+/// preflight tests -- only declared dtype/shape -- so the shard is written
+/// sparse: quantized projections use the packed `U32` affine layout the
+/// real checkpoint ships (4-bit group-64 everywhere, 8-bit router gates)
+/// with BF16 `.scales`/`.biases` companions.
+private func requiredLagunaDenseTensorFixtures() -> [TensorFixture] {
     let hidden = MLXFastConstants.hiddenSize
-    let intermediate = MLXFastConstants.intermediateSize
+    let denseIntermediate = MLXFastConstants.intermediateSize
     let vocab = MLXFastConstants.vocabSize
     let layers = MLXFastConstants.numHiddenLayers
-    let heads = MLXFastConstants.attentionHeads
-    let headDim = 256
-    let globalHeadDim = 512
-    let kvHeads = 16
-    let globalKVHeads = 4
+    let kvHeads = 8
+    let headDim = 128
+    let experts = 256
+    let expertIntermediate = 512
+    let sharedExpertIntermediate = 512
+    let groupSize = 64
 
-    func packedCols(_ inFeatures: Int) -> Int {
-        inFeatures / 8
+    var tensors: [TensorFixture] = []
+
+    func appendQuantized(
+        _ name: String,
+        leadingShape: [Int],
+        inputFeatures: Int,
+        bits: Int = 4
+    ) {
+        tensors.append(TensorFixture(
+            name: name,
+            dtype: "U32",
+            shape: leadingShape + [inputFeatures * bits / 32]
+        ))
+        let stem = name.hasSuffix(".weight") ? String(name.dropLast(".weight".count)) : name
+        let companionShape = leadingShape + [inputFeatures / groupSize]
+        for suffix in ["scales", "biases"] {
+            tensors.append(TensorFixture(
+                name: "\(stem).\(suffix)",
+                dtype: "BF16",
+                shape: companionShape
+            ))
+        }
     }
 
-    var tensors: [TensorFixture] = [
-        TensorFixture(name: Gemma4WeightNames.embedTokens, dtype: "U32", shape: [vocab, packedCols(hidden)]),
-        TensorFixture(name: Gemma4WeightNames.finalNorm, dtype: "F32", shape: [hidden]),
-    ]
+    appendQuantized(LagunaWeightNames.embedTokens, leadingShape: [vocab], inputFeatures: hidden)
+    tensors.append(TensorFixture(name: LagunaWeightNames.finalNorm, dtype: "BF16", shape: [hidden]))
+    appendQuantized(LagunaWeightNames.lmHead, leadingShape: [vocab], inputFeatures: hidden)
 
     for layerIndex in 0..<layers {
-        let isFull = layerIndex % 6 == 5
-        let effectiveHeadDim = isFull ? globalHeadDim : headDim
-        let effectiveKVHeads = isFull ? globalKVHeads : kvHeads
+        let layerHeads = layerIndex % 4 == 0 ? 48 : 64
 
-        for suffix in [
-            "input_layernorm.weight", "post_attention_layernorm.weight",
-            "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
-        ] {
-            tensors.append(
-                TensorFixture(name: Gemma4WeightNames.layer(layerIndex, suffix), dtype: "F32", shape: [hidden])
+        for suffix in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
+            tensors.append(TensorFixture(
+                name: LagunaWeightNames.layer(layerIndex, suffix),
+                dtype: "BF16",
+                shape: [hidden]
+            ))
+        }
+
+        appendQuantized(
+            LagunaWeightNames.attention(layerIndex, "q_proj.weight"),
+            leadingShape: [layerHeads * headDim],
+            inputFeatures: hidden
+        )
+        for suffix in ["k_proj.weight", "v_proj.weight"] {
+            appendQuantized(
+                LagunaWeightNames.attention(layerIndex, suffix),
+                leadingShape: [kvHeads * headDim],
+                inputFeatures: hidden
             )
         }
-        tensors.append(
-            TensorFixture(name: Gemma4WeightNames.layer(layerIndex, "layer_scalar"), dtype: "F32", shape: [1])
+        appendQuantized(
+            LagunaWeightNames.attention(layerIndex, "o_proj.weight"),
+            leadingShape: [hidden],
+            inputFeatures: layerHeads * headDim
         )
-
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.attention(layerIndex, "q_proj.weight"),
-            dtype: "U32",
-            shape: [heads * effectiveHeadDim, packedCols(hidden)]
-        ))
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.attention(layerIndex, "k_proj.weight"),
-            dtype: "U32",
-            shape: [effectiveKVHeads * effectiveHeadDim, packedCols(hidden)]
-        ))
-        if !isFull {
+        // Per-head attention gating: one gate per query head.
+        appendQuantized(
+            LagunaWeightNames.attention(layerIndex, "g_proj.weight"),
+            leadingShape: [layerHeads],
+            inputFeatures: hidden
+        )
+        for suffix in ["q_norm.weight", "k_norm.weight"] {
             tensors.append(TensorFixture(
-                name: Gemma4WeightNames.attention(layerIndex, "v_proj.weight"),
-                dtype: "U32",
-                shape: [effectiveKVHeads * effectiveHeadDim, packedCols(hidden)]
+                name: LagunaWeightNames.attention(layerIndex, suffix),
+                dtype: "BF16",
+                shape: [headDim]
             ))
         }
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.attention(layerIndex, "o_proj.weight"),
-            dtype: "U32",
-            shape: [hidden, packedCols(heads * effectiveHeadDim)]
-        ))
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.attention(layerIndex, "q_norm.weight"),
-            dtype: "F32",
-            shape: [effectiveHeadDim]
-        ))
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.attention(layerIndex, "k_norm.weight"),
-            dtype: "F32",
-            shape: [effectiveHeadDim]
-        ))
 
-        for suffix in ["gate_proj", "up_proj"] {
+        if layerIndex == 0 {
+            for suffix in ["gate_proj.weight", "up_proj.weight"] {
+                appendQuantized(
+                    LagunaWeightNames.mlp(layerIndex, suffix),
+                    leadingShape: [denseIntermediate],
+                    inputFeatures: hidden
+                )
+            }
+            appendQuantized(
+                LagunaWeightNames.mlp(layerIndex, "down_proj.weight"),
+                leadingShape: [hidden],
+                inputFeatures: denseIntermediate
+            )
+        } else {
+            appendQuantized(
+                LagunaWeightNames.mlp(layerIndex, "gate.proj.weight"),
+                leadingShape: [experts],
+                inputFeatures: hidden,
+                bits: 8
+            )
             tensors.append(TensorFixture(
-                name: Gemma4WeightNames.mlp(layerIndex, "\(suffix).weight"),
-                dtype: "U32",
-                shape: [intermediate, packedCols(hidden)]
+                name: LagunaWeightNames.mlp(layerIndex, "gate.e_score_correction_bias"),
+                dtype: "F32",
+                shape: [experts]
             ))
+            for suffix in ["switch_mlp.gate_proj.weight", "switch_mlp.up_proj.weight"] {
+                appendQuantized(
+                    LagunaWeightNames.mlp(layerIndex, suffix),
+                    leadingShape: [experts, expertIntermediate],
+                    inputFeatures: hidden
+                )
+            }
+            appendQuantized(
+                LagunaWeightNames.mlp(layerIndex, "switch_mlp.down_proj.weight"),
+                leadingShape: [experts, hidden],
+                inputFeatures: expertIntermediate
+            )
+            for suffix in ["shared_expert.gate_proj.weight", "shared_expert.up_proj.weight"] {
+                appendQuantized(
+                    LagunaWeightNames.mlp(layerIndex, suffix),
+                    leadingShape: [sharedExpertIntermediate],
+                    inputFeatures: hidden
+                )
+            }
+            appendQuantized(
+                LagunaWeightNames.mlp(layerIndex, "shared_expert.down_proj.weight"),
+                leadingShape: [hidden],
+                inputFeatures: sharedExpertIntermediate
+            )
         }
-        tensors.append(TensorFixture(
-            name: Gemma4WeightNames.mlp(layerIndex, "down_proj.weight"),
-            dtype: "U32",
-            shape: [hidden, packedCols(intermediate)]
-        ))
-    }
-
-    let quantizedTensors = tensors.filter { $0.dtype == "U32" }
-    for tensor in quantizedTensors {
-        let baseName = tensor.name.hasSuffix(".weight")
-            ? String(tensor.name.dropLast(".weight".count))
-            : tensor.name
-        let groupCount = tensor.shape[1] / 8
-        let companionShape = [tensor.shape[0], groupCount]
-        tensors.append(TensorFixture(
-            name: "\(baseName).scales",
-            dtype: "BF16",
-            shape: companionShape
-        ))
-        tensors.append(TensorFixture(
-            name: "\(baseName).biases",
-            dtype: "BF16",
-            shape: companionShape
-        ))
     }
 
     return tensors
@@ -1513,7 +1627,7 @@ func runtimeWorkerStartsTheOrphanReaperBeforeLoadingTheModel() throws {
     )
     let reaperCall = try #require(worker.range(of: "startRuntimeWorkerOrphanReaper()"))
     let protocolIO = try #require(worker.range(of: "RuntimeWorkerProtocolIO.isolatingStandardIO()"))
-    let weightCache = try #require(worker.range(of: "Gemma4RuntimeWeightCache(loader:"))
+    let weightCache = try #require(worker.range(of: "LagunaRuntimeWeightCache(loader:"))
     #expect(reaperCall.lowerBound < protocolIO.lowerBound)
     #expect(reaperCall.lowerBound < weightCache.lowerBound)
     #expect(worker.contains("getppid() == 1"))
@@ -2034,50 +2148,76 @@ private func makeRuntimeWorkerScript(_ contents: String) throws -> URL {
     return executable
 }
 
+/// The pinned Laguna XS 2.1 MoE architecture as the transformed runtime
+/// config declares it (mirroring mlx-community/Laguna-XS-2.1-4bit's
+/// config.json): a full-attention layer with 48 query heads and YaRN
+/// partial RoPE at layers 0, 4, ..., 36, sliding-window layers with 64
+/// query heads and default RoPE elsewhere, a dense MLP only at layer 0,
+/// and 256-expert top-8 MoE blocks with a 512-wide shared expert on the
+/// other 39 layers.
 private func pinnedRuntimeWorkerConfigurationObject() -> [String: Any] {
     [
-        "model_type": "gemma4_text",
+        "model_type": "laguna",
         "hidden_size": MLXFastConstants.hiddenSize,
         "num_hidden_layers": MLXFastConstants.numHiddenLayers,
         "intermediate_size": MLXFastConstants.intermediateSize,
         "num_attention_heads": MLXFastConstants.attentionHeads,
-        "head_dim": 256,
-        "global_head_dim": 512,
+        "num_attention_heads_per_layer": (0..<MLXFastConstants.numHiddenLayers).map {
+            $0 % 4 == 0 ? 48 : 64
+        },
+        "num_key_value_heads": 8,
+        "head_dim": 128,
         "rms_norm_eps": 1e-6,
         "vocab_size": MLXFastConstants.vocabSize,
-        "num_key_value_heads": 16,
-        "num_global_key_value_heads": 4,
-        "num_kv_shared_layers": 0,
-        "hidden_size_per_layer_input": 0,
-        "vocab_size_per_layer_input": MLXFastConstants.vocabSize,
-        "sliding_window": 1_024,
+        "sliding_window": 512,
         "max_position_embeddings": 262_144,
-        "attention_k_eq_v": true,
-        "final_logit_softcapping": 30.0,
-        "use_double_wide_mlp": false,
-        "tie_word_embeddings": true,
-        "enable_moe_block": false,
-        "num_experts": NSNull(),
-        "top_k_experts": NSNull(),
-        "moe_intermediate_size": NSNull(),
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "gating": "per-head",
+        "tie_word_embeddings": false,
+        "num_experts": 256,
+        "num_experts_per_tok": 8,
+        "moe_intermediate_size": 512,
+        "shared_expert_intermediate_size": 512,
+        "moe_routed_scaling_factor": 2.5,
+        "norm_topk_prob": true,
+        "mlp_layer_types": (0..<MLXFastConstants.numHiddenLayers).map {
+            $0 == 0 ? "dense" : "sparse"
+        },
+        "mlp_only_layers": [0],
+        "decoder_sparse_step": 1,
         "layer_types": (0..<MLXFastConstants.numHiddenLayers).map {
-            $0 % 6 == 5 ? "full_attention" : "sliding_attention"
+            $0 % 4 == 0 ? "full_attention" : "sliding_attention"
         },
         "rope_parameters": [
             "sliding_attention": [
                 "rope_theta": 10_000.0,
                 "rope_type": "default",
+                "partial_rotary_factor": 1.0,
             ],
             "full_attention": [
-                "rope_theta": 1_000_000.0,
-                "rope_type": "proportional",
-                "partial_rotary_factor": 0.25,
+                "rope_theta": 500_000.0,
+                "rope_type": "yarn",
+                "factor": 32.0,
+                "original_max_position_embeddings": 8_192,
+                "beta_fast": 64.0,
+                "beta_slow": 1.0,
+                "attention_factor": 1.0,
+                "partial_rotary_factor": 0.5,
             ],
         ],
         "quantization": [
             "group_size": 64,
             "bits": 4,
             "mode": "affine",
+            // The shipped checkpoint declares per-tensor 8-bit overrides for
+            // the MoE router gates; the global pinned-config gate tolerates
+            // them (the runtime weight loader validates them against the
+            // stored tensor geometry).
+            "language_model.model.layers.1.mlp.gate.proj": [
+                "group_size": 64,
+                "bits": 8,
+            ],
         ],
     ]
 }

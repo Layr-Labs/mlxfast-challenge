@@ -39,11 +39,11 @@ extension GemmaRuntime {
         }
 
         #if !MLXFAST_TRUSTED_HARNESS
-            let config = try Gemma4Config.load(from: options.weightsPath)
-            let loader = try Gemma4WeightLoader(
+            let config = try LagunaConfig.load(from: options.weightsPath)
+            let loader = try LagunaWeightLoader(
                 weightsPath: options.weightsPath
             )
-            let weightCache = Gemma4RuntimeWeightCache(
+            let weightCache = LagunaRuntimeWeightCache(
                 loader: loader,
                 config: config
             )
@@ -71,7 +71,7 @@ extension GemmaRuntime {
 
         #if !MLXFAST_TRUSTED_HARNESS
             var loadedGolden: GoldenFixture?
-            var loader: Gemma4WeightLoader?
+            var loader: LagunaWeightLoader?
             do {
                 try requireFile(
                     options.goldenPath,
@@ -83,12 +83,12 @@ extension GemmaRuntime {
                     weightsPath: options.weightsPath,
                     goldenPath: options.goldenPath
                 )
-                let config = try Gemma4Config.load(from: options.weightsPath)
-                let runtimeLoader = try Gemma4WeightLoader(
+                let config = try LagunaConfig.load(from: options.weightsPath)
+                let runtimeLoader = try LagunaWeightLoader(
                     weightsPath: options.weightsPath
                 )
                 loader = runtimeLoader
-                let weightCache = Gemma4RuntimeWeightCache(
+                let weightCache = LagunaRuntimeWeightCache(
                     loader: runtimeLoader,
                     config: config
                 )
@@ -235,7 +235,7 @@ extension GemmaRuntime {
     #if !MLXFAST_TRUSTED_HARNESS
         static func runLayeredCorrectness(
         golden: GoldenFixture,
-        weightCache: Gemma4RuntimeWeightCache,
+        weightCache: LagunaRuntimeWeightCache,
         steps: Int = MLXFastConstants.correctnessSteps,
         progress: ((String) -> Void)? = nil
     ) -> CorrectnessReport {

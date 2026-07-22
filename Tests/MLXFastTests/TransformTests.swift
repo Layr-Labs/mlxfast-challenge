@@ -12,7 +12,7 @@ func transformSelectsTextTowerTensorsAndDropsVisionTensors() throws {
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
 
-    try referenceConfigJSON().write(
+    try lagunaReferenceConfigJSON().write(
         to: reference.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
@@ -81,7 +81,7 @@ func transformWritesFlattenedRuntimeConfigFromTextConfig() throws {
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try referenceConfigJSON().write(
+    try gemmaReferenceConfigJSON().write(
         to: reference.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
@@ -113,11 +113,401 @@ func transformWritesFlattenedRuntimeConfigFromTextConfig() throws {
 }
 
 @Test
+func transformDetectsModelFamilyFromSourceConfig() throws {
+    let laguna = try #require(
+        try JSONSerialization.jsonObject(
+            with: Data(lagunaReferenceConfigJSON().utf8)
+        ) as? [String: Any]
+    )
+    #expect(try SwiftTransform.detectModelFamily(sourceConfigRoot: laguna) == .laguna)
+
+    let gemma = try #require(
+        try JSONSerialization.jsonObject(
+            with: Data(gemmaReferenceConfigJSON().utf8)
+        ) as? [String: Any]
+    )
+    #expect(try SwiftTransform.detectModelFamily(sourceConfigRoot: gemma) == .gemma4)
+
+    #expect(throws: MLXFastError.self) {
+        _ = try SwiftTransform.detectModelFamily(sourceConfigRoot: ["model_type": "qwen3"])
+    }
+}
+
+@Test
+func transformKeySelectionDropsRotaryInvFreqOnlyForLaguna() {
+    let invFreq = "language_model.model.layers.3.self_attn.rotary_emb.inv_freq"
+    #expect(!SwiftTransform.isSelectedTextTowerKey(invFreq, family: .laguna))
+    #expect(SwiftTransform.isSelectedTextTowerKey(invFreq, family: .gemma4))
+    #expect(
+        SwiftTransform.isSelectedTextTowerKey(
+            "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight",
+            family: .laguna
+        )
+    )
+    #expect(
+        !SwiftTransform.isSelectedTextTowerKey(
+            "vision_tower.encoder.layers.0.self_attn.q_proj.weight",
+            family: .laguna
+        )
+    )
+}
+
+@Test
+func transformWritesLagunaRuntimeConfigPassthroughWithRouterOverrides() throws {
+    let fixture = try writeLagunaCheckpointFixture(
+        tensors: [
+            TensorFixture(
+                name: "language_model.model.embed_tokens.weight",
+                dtype: "U8",
+                shape: [1],
+                data: Data([1])
+            )
+        ]
+    )
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    _ = try SwiftTransform.run(
+        TransformOptions(referencePath: fixture.reference.path, outputPath: fixture.output.path)
+    )
+
+    let configData = try Data(contentsOf: fixture.output.appendingPathComponent("config.json"))
+    let config = try JSONSerialization.jsonObject(with: configData) as? [String: Any]
+    #expect(config?["model_type"] as? String == LagunaConstants.modelType)
+    #expect(config?["vocab_size"] as? Int == LagunaConstants.vocabSize)
+    #expect(config?["hidden_size"] as? Int == LagunaConstants.hiddenSize)
+    #expect(config?["intermediate_size"] as? Int == LagunaConstants.denseIntermediateSize)
+    #expect(config?["num_hidden_layers"] as? Int == LagunaConstants.numHiddenLayers)
+    #expect(config?["num_experts"] as? Int == LagunaConstants.numExperts)
+    #expect(config?["num_experts_per_tok"] as? Int == LagunaConstants.numExpertsPerTok)
+    #expect(config?["tie_word_embeddings"] as? Bool == false)
+    #expect(config?["gating"] as? String == "per-head")
+    #expect(config?["text_config"] == nil)
+    #expect(config?["vision_config"] == nil)
+    let layerTypes = try #require(config?["layer_types"] as? [String])
+    #expect(layerTypes.count == LagunaConstants.numHiddenLayers)
+    #expect(layerTypes[0] == "full_attention")
+    #expect(layerTypes[1] == "sliding_attention")
+    let mlpLayerTypes = try #require(config?["mlp_layer_types"] as? [String])
+    #expect(mlpLayerTypes.count == LagunaConstants.numHiddenLayers)
+    #expect(mlpLayerTypes.first == "dense")
+    #expect(mlpLayerTypes.dropFirst().allSatisfy({ $0 == "sparse" }))
+
+    let quantization = try #require(config?["quantization"] as? [String: Any])
+    #expect(quantization["group_size"] as? Int == LagunaConstants.quantizationGroupSize)
+    #expect(quantization["bits"] as? Int == LagunaConstants.quantizationBits)
+    #expect(quantization["mode"] as? String == "affine")
+    let overrideKeys = quantization.compactMap { key, value in
+        value is [String: Any] ? key : nil
+    }
+    #expect(
+        Set(overrideKeys) == Set(
+            (1...39).map { "language_model.model.layers.\($0).mlp.gate.proj" }
+        )
+    )
+    for key in overrideKeys.sorted() {
+        let override = try #require(quantization[key] as? [String: Any])
+        #expect(override["group_size"] as? Int == LagunaConstants.quantizationGroupSize)
+        #expect(override["bits"] as? Int == LagunaConstants.routerGateQuantizationBits)
+    }
+}
+
+@Test
+func transformPassesThroughLagunaMoEInventoryWithoutSidecars() throws {
+    var tensors: [TensorFixture] = []
+    tensors += quantizedTensorTriplet(
+        stem: "language_model.model.embed_tokens",
+        leadingShape: [8],
+        inputFeatures: 128,
+        bits: 4
+    )
+    // Untied head: a separate quantized triplet, passed through as-is.
+    tensors += quantizedTensorTriplet(
+        stem: "language_model.lm_head",
+        leadingShape: [8],
+        inputFeatures: 128,
+        bits: 4
+    )
+    tensors.append(bf16Tensor(name: "language_model.model.norm.weight", shape: [4]))
+
+    for layer in [0, 1] {
+        let prefix = "language_model.model.layers.\(layer)"
+        tensors.append(bf16Tensor(name: "\(prefix).input_layernorm.weight", shape: [4]))
+        tensors.append(
+            bf16Tensor(name: "\(prefix).post_attention_layernorm.weight", shape: [4])
+        )
+        for projection in ["q_proj", "k_proj", "v_proj", "o_proj", "g_proj"] {
+            tensors += quantizedTensorTriplet(
+                stem: "\(prefix).self_attn.\(projection)",
+                leadingShape: [8],
+                inputFeatures: 128,
+                bits: 4
+            )
+        }
+        tensors.append(bf16Tensor(name: "\(prefix).self_attn.q_norm.weight", shape: [2]))
+        tensors.append(bf16Tensor(name: "\(prefix).self_attn.k_norm.weight", shape: [2]))
+    }
+
+    // Layer 0: dense MLP.
+    for projection in ["gate_proj", "up_proj", "down_proj"] {
+        tensors += quantizedTensorTriplet(
+            stem: "language_model.model.layers.0.mlp.\(projection)",
+            leadingShape: [8],
+            inputFeatures: 128,
+            bits: 4
+        )
+    }
+    // Layer 1: sparse MoE -- 8-bit router + correction bias, SwitchGLU
+    // stacked experts (3D, leading experts axis), and the shared expert.
+    tensors += quantizedTensorTriplet(
+        stem: "language_model.model.layers.1.mlp.gate.proj",
+        leadingShape: [4],
+        inputFeatures: 128,
+        bits: 8
+    )
+    tensors.append(
+        bf16Tensor(
+            name: "language_model.model.layers.1.mlp.gate.e_score_correction_bias",
+            shape: [4]
+        )
+    )
+    for projection in ["gate_proj", "up_proj"] {
+        tensors += quantizedTensorTriplet(
+            stem: "language_model.model.layers.1.mlp.switch_mlp.\(projection)",
+            leadingShape: [4, 6],
+            inputFeatures: 128,
+            bits: 4
+        )
+    }
+    tensors += quantizedTensorTriplet(
+        stem: "language_model.model.layers.1.mlp.switch_mlp.down_proj",
+        leadingShape: [4, 8],
+        inputFeatures: 128,
+        bits: 4
+    )
+    for projection in ["gate_proj", "up_proj"] {
+        tensors += quantizedTensorTriplet(
+            stem: "language_model.model.layers.1.mlp.shared_expert.\(projection)",
+            leadingShape: [6],
+            inputFeatures: 128,
+            bits: 4
+        )
+    }
+    tensors += quantizedTensorTriplet(
+        stem: "language_model.model.layers.1.mlp.shared_expert.down_proj",
+        leadingShape: [8],
+        inputFeatures: 128,
+        bits: 4
+    )
+    let expectedNames = Set(tensors.map(\.name))
+
+    // Both must be dropped: inv_freq per the Laguna weight contract, the
+    // vision tensor because it is outside the text tower.
+    tensors.append(
+        TensorFixture(
+            name: "language_model.model.rotary_emb.inv_freq",
+            dtype: "F32",
+            shape: [4],
+            data: Data(count: 16)
+        )
+    )
+    tensors.append(
+        TensorFixture(
+            name: "vision_tower.encoder.layers.0.self_attn.q_proj.weight",
+            dtype: "U8",
+            shape: [2],
+            data: Data([1, 2])
+        )
+    )
+
+    let fixture = try writeLagunaCheckpointFixture(tensors: tensors)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let report = try SwiftTransform.run(
+        TransformOptions(referencePath: fixture.reference.path, outputPath: fixture.output.path)
+    )
+
+    #expect(report.denseTensorCount == expectedNames.count)
+    #expect(report.denseShardCount == 1)
+
+    let outputShard = fixture.output.appendingPathComponent(fixture.shardName)
+    let header = try Safetensors.readHeader(outputShard)
+    #expect(Set(header.tensors.keys) == expectedNames)
+
+    let indexData = try Data(
+        contentsOf: fixture.output.appendingPathComponent("model.safetensors.index.json")
+    )
+    let index = try JSONSerialization.jsonObject(with: indexData) as? [String: Any]
+    let weightMap = try #require(index?["weight_map"] as? [String: String])
+    #expect(Set(weightMap.keys) == expectedNames)
+    #expect(Set(weightMap.values) == [fixture.shardName])
+    #expect(!weightMap.keys.contains(where: { $0.contains("metadata_indices") }))
+    #expect(!weightMap.keys.contains(where: { $0.contains("metadata_lut") }))
+    #expect(!weightMap.keys.contains(where: { $0.contains("tied_head_packed13") }))
+
+    // No derived metadata sidecars for Laguna (the Gemma projection and
+    // tied-head shards must not exist).
+    #expect(
+        !FileManager.default.fileExists(
+            atPath: fixture.output.appendingPathComponent(
+                "mlxfast-projection-metadata.safetensors"
+            ).path
+        )
+    )
+    #expect(
+        !FileManager.default.fileExists(
+            atPath: fixture.output.appendingPathComponent(
+                "mlxfast-tied-head-metadata.safetensors"
+            ).path
+        )
+    )
+}
+
+@Test
+func transformRejectsQuantizedLagunaExpertStackMissingScales() throws {
+    let stem = "language_model.model.layers.1.mlp.switch_mlp.gate_proj"
+    var tensors = quantizedTensorTriplet(
+        stem: stem,
+        leadingShape: [4, 6],
+        inputFeatures: 128,
+        bits: 4
+    )
+    tensors.removeAll { $0.name == "\(stem).scales" }
+    let fixture = try writeLagunaCheckpointFixture(tensors: tensors)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    var rejection: MLXFastError?
+    do {
+        _ = try SwiftTransform.run(
+            TransformOptions(
+                referencePath: fixture.reference.path,
+                outputPath: fixture.output.path
+            )
+        )
+    } catch let error as MLXFastError {
+        rejection = error
+    } catch {
+        throw error
+    }
+
+    #expect(rejection?.description.contains("missing BF16 scales or biases") == true)
+    #expect(!FileManager.default.fileExists(atPath: fixture.output.path))
+}
+
+@Test
+func transformRejectsLagunaRouterBitWidthMismatchAgainstConfigOverrides() throws {
+    // An 8-bit router without the matching config override must fail: the
+    // emitted config would declare 4-bit for this stem.
+    var tensors = quantizedTensorTriplet(
+        stem: "language_model.model.layers.1.mlp.gate.proj",
+        leadingShape: [4],
+        inputFeatures: 128,
+        bits: 8
+    )
+    tensors.append(
+        bf16Tensor(
+            name: "language_model.model.layers.1.mlp.gate.e_score_correction_bias",
+            shape: [4]
+        )
+    )
+    let fixture = try writeLagunaCheckpointFixture(
+        tensors: tensors,
+        configJSON: lagunaReferenceConfigJSON(routerOverrideLayers: [])
+    )
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    var rejection: MLXFastError?
+    do {
+        _ = try SwiftTransform.run(
+            TransformOptions(
+                referencePath: fixture.reference.path,
+                outputPath: fixture.output.path
+            )
+        )
+    } catch let error as MLXFastError {
+        rejection = error
+    } catch {
+        throw error
+    }
+
+    #expect(rejection?.description.contains("does not match config quantization") == true)
+    #expect(!FileManager.default.fileExists(atPath: fixture.output.path))
+}
+
+@Test
+func transformRejectsQuantizedLagunaRouterMissingCorrectionBias() throws {
+    let tensors = quantizedTensorTriplet(
+        stem: "language_model.model.layers.1.mlp.gate.proj",
+        leadingShape: [4],
+        inputFeatures: 128,
+        bits: 8
+    )
+    let fixture = try writeLagunaCheckpointFixture(tensors: tensors)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    var rejection: MLXFastError?
+    do {
+        _ = try SwiftTransform.run(
+            TransformOptions(
+                referencePath: fixture.reference.path,
+                outputPath: fixture.output.path
+            )
+        )
+    } catch let error as MLXFastError {
+        rejection = error
+    } catch {
+        throw error
+    }
+
+    #expect(rejection?.description.contains("missing its e_score_correction_bias") == true)
+    #expect(!FileManager.default.fileExists(atPath: fixture.output.path))
+}
+
+@Test
+func transformRejectsLagunaRouterAndStackedExpertCountMismatch() throws {
+    var tensors = quantizedTensorTriplet(
+        stem: "language_model.model.layers.1.mlp.gate.proj",
+        leadingShape: [4],
+        inputFeatures: 128,
+        bits: 8
+    )
+    tensors.append(
+        bf16Tensor(
+            name: "language_model.model.layers.1.mlp.gate.e_score_correction_bias",
+            shape: [4]
+        )
+    )
+    tensors += quantizedTensorTriplet(
+        stem: "language_model.model.layers.1.mlp.switch_mlp.gate_proj",
+        leadingShape: [3, 6],
+        inputFeatures: 128,
+        bits: 4
+    )
+    let fixture = try writeLagunaCheckpointFixture(tensors: tensors)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+    var rejection: MLXFastError?
+    do {
+        _ = try SwiftTransform.run(
+            TransformOptions(
+                referencePath: fixture.reference.path,
+                outputPath: fixture.output.path
+            )
+        )
+    } catch let error as MLXFastError {
+        rejection = error
+    } catch {
+        throw error
+    }
+
+    #expect(rejection?.description.contains("do not match the stacked expert count") == true)
+    #expect(!FileManager.default.fileExists(atPath: fixture.output.path))
+}
+
+@Test
 func transformRuntimeConfigCaptureDoesNotRereadChangedSource() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
     let configPath = root.appendingPathComponent("config.json")
-    try referenceConfigJSON().write(
+    try lagunaReferenceConfigJSON().write(
         to: configPath,
         atomically: true,
         encoding: .utf8
@@ -131,7 +521,7 @@ func transformRuntimeConfigCaptureDoesNotRereadChangedSource() throws {
     )
 
     let object = try JSONSerialization.jsonObject(with: captured) as? [String: Any]
-    #expect(object?["num_hidden_layers"] as? Int == MLXFastConstants.numHiddenLayers)
+    #expect(object?["num_hidden_layers"] as? Int == LagunaConstants.numHiddenLayers)
 }
 
 @Test
@@ -428,7 +818,7 @@ func transformRejectsCheckpointWithoutTextTowerTensorsBeforeCreatingOutput() thr
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try referenceConfigJSON().write(
+    try lagunaReferenceConfigJSON().write(
         to: reference.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
@@ -557,7 +947,7 @@ func transformRejectsUnsupportedIndexShardBeforeCreatingOutput() throws {
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try referenceConfigJSON().write(
+    try lagunaReferenceConfigJSON().write(
         to: reference.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
@@ -583,7 +973,7 @@ func transformRejectsUnsafeIndexShardBeforeCreatingOutput() throws {
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try referenceConfigJSON().write(
+    try lagunaReferenceConfigJSON().write(
         to: reference.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
@@ -609,7 +999,7 @@ func transformRejectsIndexTensorMissingFromShardHeaderBeforeCreatingOutput() thr
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try referenceConfigJSON().write(
+    try lagunaReferenceConfigJSON().write(
         to: reference.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
@@ -644,7 +1034,7 @@ func transformAcceptsSparseShardLargerThanInt32() throws {
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try referenceConfigJSON().write(
+    try lagunaReferenceConfigJSON().write(
         to: reference.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
@@ -695,7 +1085,7 @@ private func writeTransformFixture() throws -> TransformFixturePaths {
     let reference = root.appendingPathComponent("reference", isDirectory: true)
     let output = root.appendingPathComponent("weights", isDirectory: true)
     try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
-    try referenceConfigJSON().write(
+    try lagunaReferenceConfigJSON().write(
         to: reference.appendingPathComponent("config.json"),
         atomically: true,
         encoding: .utf8
@@ -727,7 +1117,9 @@ private func writeTransformFixture() throws -> TransformFixturePaths {
     return TransformFixturePaths(root: root, reference: reference, output: output)
 }
 
-private func referenceConfigJSON() -> String {
+/// Legacy Gemma 4 multimodal source-config layout (nested `text_config`),
+/// kept to cover the transform's `.gemma4` family path.
+private func gemmaReferenceConfigJSON() -> String {
     """
     {
       "text_config": {
@@ -738,6 +1130,165 @@ private func referenceConfigJSON() -> String {
       "quantization": {"group_size": 64, "bits": 4, "mode": "affine"}
     }
     """
+}
+
+/// Flat Poolside Laguna XS 2.1 source config mirroring the pinned
+/// `mlx-community/Laguna-XS-2.1-4bit` checkpoint schema: Laguna geometry,
+/// the empty multimodal `vision_config` stub the transform must drop, and
+/// the `quantization` block (global affine 4-bit group-64 plus the 8-bit
+/// per-router-gate overrides, mirrored in `quantization_config`).
+private func lagunaReferenceConfigJSON(
+    routerOverrideLayers: [Int] = Array(1...39)
+) throws -> String {
+    var quantization: [String: Any] = [
+        "group_size": LagunaConstants.quantizationGroupSize,
+        "bits": LagunaConstants.quantizationBits,
+        "mode": "affine",
+    ]
+    for layer in routerOverrideLayers {
+        quantization["language_model.model.layers.\(layer).mlp.gate.proj"] = [
+            "group_size": LagunaConstants.quantizationGroupSize,
+            "bits": LagunaConstants.routerGateQuantizationBits,
+        ]
+    }
+
+    let layerCount = LagunaConstants.numHiddenLayers
+    var root: [String: Any] = [:]
+    root["architectures"] = ["LagunaForCausalLM"]
+    root["model_type"] = LagunaConstants.modelType
+    root["vocab_size"] = LagunaConstants.vocabSize
+    root["hidden_size"] = LagunaConstants.hiddenSize
+    root["intermediate_size"] = LagunaConstants.denseIntermediateSize
+    root["num_hidden_layers"] = layerCount
+    root["num_attention_heads"] = LagunaConstants.fullAttentionHeads
+    root["num_attention_heads_per_layer"] = (0..<layerCount).map {
+        $0 % 4 == 0 ? LagunaConstants.fullAttentionHeads : LagunaConstants.slidingAttentionHeads
+    }
+    root["num_key_value_heads"] = LagunaConstants.numKeyValueHeads
+    root["head_dim"] = LagunaConstants.headDim
+    root["rms_norm_eps"] = 1e-6
+    root["max_position_embeddings"] = 262_144
+    root["attention_bias"] = false
+    root["attention_dropout"] = 0.0
+    root["sliding_window"] = LagunaConstants.slidingWindow
+    root["layer_types"] = (0..<layerCount).map {
+        $0 % 4 == 0 ? "full_attention" : "sliding_attention"
+    }
+    root["mlp_layer_types"] = (0..<layerCount).map { $0 == 0 ? "dense" : "sparse" }
+    root["gating"] = "per-head"
+    root["tie_word_embeddings"] = false
+    root["num_experts"] = LagunaConstants.numExperts
+    root["num_experts_per_tok"] = LagunaConstants.numExpertsPerTok
+    root["moe_intermediate_size"] = LagunaConstants.moeIntermediateSize
+    root["shared_expert_intermediate_size"] = LagunaConstants.sharedExpertIntermediateSize
+    root["moe_routed_scaling_factor"] = LagunaConstants.moeRoutedScalingFactor
+    root["norm_topk_prob"] = true
+    root["moe_router_logit_softcapping"] = 0.0
+    root["rope_parameters"] = [
+        "sliding_attention": [
+            "rope_type": "default",
+            "rope_theta": 10_000.0,
+            "partial_rotary_factor": 1.0,
+        ] as [String: Any],
+        "full_attention": [
+            "rope_type": "yarn",
+            "rope_theta": 500_000.0,
+            "factor": 32.0,
+            "original_max_position_embeddings": 8_192,
+            "beta_fast": 64.0,
+            "beta_slow": 1.0,
+            "partial_rotary_factor": 0.5,
+            "attention_factor": 1.0,
+        ] as [String: Any],
+    ]
+    root["vision_config"] = [String: Any]()
+    root["quantization"] = quantization
+    root["quantization_config"] = quantization
+
+    let data = try JSONSerialization.data(
+        withJSONObject: root,
+        options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+    )
+    return String(decoding: data, as: UTF8.self)
+}
+
+/// Affine-quantized triplet fixture with valid Laguna packing geometry:
+/// `.weight` U32 `[leading..., in * bits / 32]` plus BF16 `.scales`/`.biases`
+/// `[leading..., in / 64]`.
+private func quantizedTensorTriplet(
+    stem: String,
+    leadingShape: [Int],
+    inputFeatures: Int,
+    bits: Int
+) -> [TensorFixture] {
+    let packedWidth = inputFeatures * bits / 32
+    let groupWidth = inputFeatures / LagunaConstants.quantizationGroupSize
+    let weightShape = leadingShape + [packedWidth]
+    let companionShape = leadingShape + [groupWidth]
+    return [
+        TensorFixture(
+            name: "\(stem).weight",
+            dtype: "U32",
+            shape: weightShape,
+            data: Data(count: weightShape.reduce(1, *) * 4)
+        ),
+        TensorFixture(
+            name: "\(stem).scales",
+            dtype: "BF16",
+            shape: companionShape,
+            data: Data(count: companionShape.reduce(1, *) * 2)
+        ),
+        TensorFixture(
+            name: "\(stem).biases",
+            dtype: "BF16",
+            shape: companionShape,
+            data: Data(count: companionShape.reduce(1, *) * 2)
+        ),
+    ]
+}
+
+private func bf16Tensor(name: String, shape: [Int]) -> TensorFixture {
+    TensorFixture(
+        name: name,
+        dtype: "BF16",
+        shape: shape,
+        data: Data(count: shape.reduce(1, *) * 2)
+    )
+}
+
+private struct LagunaFixturePaths {
+    let root: URL
+    let reference: URL
+    let output: URL
+    let shardName: String
+}
+
+private func writeLagunaCheckpointFixture(
+    tensors: [TensorFixture],
+    configJSON: String? = nil
+) throws -> LagunaFixturePaths {
+    let root = try temporaryDirectory()
+    let reference = root.appendingPathComponent("reference", isDirectory: true)
+    let output = root.appendingPathComponent("weights", isDirectory: true)
+    try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
+    let effectiveConfigJSON = try configJSON ?? lagunaReferenceConfigJSON()
+    try effectiveConfigJSON.write(
+        to: reference.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+    let shardName = "model-00001-of-00001.safetensors"
+    try writeSafetensors(reference.appendingPathComponent(shardName), tensors: tensors)
+    try writeCheckpointIndex(
+        reference.appendingPathComponent("model.safetensors.index.json"),
+        weightMap: Dictionary(uniqueKeysWithValues: tensors.map { ($0.name, shardName) })
+    )
+    return LagunaFixturePaths(
+        root: root,
+        reference: reference,
+        output: output,
+        shardName: shardName
+    )
 }
 
 private func writeCheckpointIndex(

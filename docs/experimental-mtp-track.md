@@ -1,9 +1,9 @@
-# Gemma 4 31B-IT MTP Track
+# Poolside Laguna XS 2.1 MTP Track
 
 ## Status and default routing
 
 This is the default official ranked track, with track ID
-`gemma4-31b-it-mtp-v1`. Yukon reads `benchmark.json`, dispatches
+`laguna-xs-2.1-mtp-v1`. Yukon reads `benchmark.json`, dispatches
 `.github/workflows/benchmark.yml`, and ingests `score.json`. Official scoring
 is decode-only paired speedup against the pinned serial K=1 target baseline.
 The former base-model serial challenge is archived as
@@ -23,69 +23,91 @@ turn the archived serial `benchmark` command into MTP.
 The current challenge target is:
 
 - Runtime checkpoint:
-  `mlx-community/gemma-4-31b-4bit@e236b3eb2f9567ded5875cfa89f1666afa1acbf1`
+  `mlx-community/Laguna-XS-2.1-4bit@c42e0a8f8d504ceacde015a535dcb286d65c8799`
+  (MLX affine 4-bit, group size 64; the per-layer MoE router gates are
+  8-bit; keeps the `language_model.` tensor prefix)
 - Declared upstream base:
-  `google/gemma-4-31B`
+  `poolside/Laguna-XS-2.1@c405648833500615a2efde76886b8aed4fb9324e`
 - Checked-in byte manifest:
-  `fixtures/reference_gemma_4_31b_4bit.sha256`
+  `fixtures/reference_laguna_xs_2_1_4bit.sha256`
 
-Google's public MTP drafter family is explicitly paired by its model cards
-with the instruction-tuned target, not the base target:
+Poolside's public DFlash speculator is explicitly paired by its model card
+and the target's `generation_config` speculative block with this target:
 
 - Target:
-  `google/gemma-4-31B-it@518276fb130dc81caf9a4f772e65e63ef2526493`
-- Assistant (organizer-pinned QAT 4-bit conversion):
-  `mlx-community/gemma-4-31B-it-qat-assistant-4bit@5234fd588403c9b68f3bd20a140b7e61700cb7e2`
-  (affine 4-bit, group size 64; converted from Google's QAT drafter
-  `google/gemma-4-31B-it-qat-q4_0-unquantized-assistant`, which the model
-  card pairs with `google/gemma-4-31B-it`)
+  `poolside/Laguna-XS-2.1@c405648833500615a2efde76886b8aed4fb9324e`
+  (model_type `laguna`: hidden 2048, 40 layers, 48 full-attention /
+  64 sliding-attention heads with 8 KV heads at head_dim 128, vocab 100352,
+  untied embeddings, sliding_window 512 with a 3:1 sliding:full layer
+  pattern — full attention at layers 0, 4, 8, ..., 36 — YaRN partial-rotary
+  0.5 on full-attention layers and plain RoPE theta 10000 on sliding layers,
+  MoE with 256 routed experts + 1 shared expert, 8 experts per token,
+  moe_intermediate 512, shared_expert_intermediate 512, per-head gating,
+  and a dense-MLP layer 0 with intermediate 8192)
+- Assistant (draft):
+  `poolside/Laguna-XS-2.1-DFlash@5c36361aab23c8ed3afbd079c10c426b677bc607`
+  (5-layer DFlash Eagle-style speculator, BF16 upstream
+  `model.safetensors` = 924,135,848 bytes; dflash_config: block_size 16,
+  mask_token_id 12, num_target_layers 40, target_layer_ids [1,13,25,33,39],
+  causal; draft_vocab_size 100352; aux hidden-state layer ids
+  [2,14,26,34,40]. The draft is downloaded as the BF16 upstream and
+  converted to MLX affine 4-bit, group size 64, at setup.)
 
-No matched public 31B base assistant was found. Architecture compatibility
-alone does not prove training compatibility, so this prototype does not bind
-the IT assistant to the base challenge checkpoint. It defines a separate
-Gemma 4 31B-IT MTP track instead.
+The DFlash speculator is trained against this exact target, so the track
+binds the pinned pair directly; there is no separate base-vs-IT pairing
+question for Laguna.
 
 The MLX target conversion is pinned independently:
 
-- `mlx-community/gemma-4-31b-it-4bit@696d436c404745a59f30e4939a658162b0a9e57f`
-- Declared base model: `google/gemma-4-31B-it`
+- `mlx-community/Laguna-XS-2.1-4bit@c42e0a8f8d504ceacde015a535dcb286d65c8799`
+- Declared base model: `poolside/Laguna-XS-2.1`
 
-The target model cards declare Apache-2.0 and link the Gemma license at
-<https://ai.google.dev/gemma/docs/gemma_4_license>; the QAT assistant
-conversion's card declares the Gemma license and derives from Google's
-Apache-2.0 QAT drafter. Operators must still review the license terms before
-enabling a public ranked track.
+The target and DFlash model cards declare OpenMDW-1.1 with terms at
+<https://huggingface.co/poolside/Laguna-XS-2.1>. Operators must still review
+the license terms before enabling a public ranked track.
 
 ## Provenance contract
 
-`fixtures/gemma_4_31b_it_mtp_track.json` binds:
+`fixtures/laguna_xs_2_1_mtp_track.json` binds:
 
 - track identity and disabled-scoring state;
 - target and assistant model IDs plus immutable repository revisions;
 - the exact pinned `mlx-swift-lm` revision
   `bc1c0ee67d15798343be17c9f8f61f7c0d977149`;
-- frozen Gemma 4 target and assistant architecture fields;
+- frozen Laguna target and DFlash assistant architecture fields (including
+  the MoE fields: 256 experts, 8 per token, moe_intermediate 512, shared
+  expert 512, dense-MLP layer 0);
 - SHA256 manifest identities and artifact byte budgets;
 - block size four, a compatibility default of 128 parent-counted decode
-  tokens, and a hard trusted-parent cap of 512;
-- the missing-reference-baseline status.
+  tokens, and a hard trusted-parent cap of 1,536 (ranked timed decode stays
+  fixed at 512);
+- the pending-M5-rebaseline status.
 
 Byte manifests:
 
-- `fixtures/mtp_gemma_4_31b_it_4bit.sha256`
-- `fixtures/mtp_gemma_4_31b_it_assistant_qat4bit.sha256`
+- `fixtures/mtp_laguna_xs_2_1_4bit.sha256`
+- `fixtures/mtp_laguna_xs_2_1_dflash.sha256`
 
-The assistant runtime inventory is exactly two regular, single-link files:
+Both manifests are entry-less placeholder headers, and the manifest
+self-hashes and assistant byte pins in the contract fixture are TODO markers,
+until they are regenerated on m5-bench with the real weights (hashes are
+never pre-filled off-box; setup fails closed on an entry-less manifest).
 
-- `config.json`: 2,962 bytes
-- `model.safetensors`: 264,141,359 bytes
+The assistant source inventory is exactly two regular, single-link files:
 
-The combined assistant directory is exactly 264,144,321 bytes. Extra files,
+- `config.json`: bytes pinned on m5-bench (the upstream file is 963 bytes)
+- `model.safetensors`: bytes pinned on m5-bench (the BF16 upstream payload
+  is 924,135,848 bytes per Hugging Face LFS metadata; setup converts it to
+  MLX affine 4-bit, group size 64, on-box)
+
+Extra files,
 symlinks, hardlinks, size mismatches, hash mismatches, incompatible config
-fields (including the pinned affine 4-bit group-64 quantization block), or a
-total above 300,000,000 bytes fail before model load.
+fields (including the runtime affine 4-bit group-64 quantization contract),
+or a total above the pinned maximum fail before model load.
 
-The target source manifest totals 18,444,420,181 bytes. The transformed
+The target source totals 18,829,720,326 bytes per Hugging Face API metadata
+at the pinned revision (confirm on m5-bench when the manifest is
+regenerated). The transformed
 text-only target is capped at 20 GiB. The assistant remains an
 organizer-provisioned read-only sidecar and is not copied into participant
 submission artifacts.
@@ -96,14 +118,23 @@ downloads, exact size/SHA256 verification, and strict flat inventories. It
 never changes `setup.sh`'s base checkpoint.
 
 `mtp-benchmark` also requires `--target-source` and revalidates that complete
-18.4 GB source inventory in the trusted parent. This prevents an accidental
-base-target/IT-assistant pairing. In an official pipeline, the trusted
+18.8 GB source inventory in the trusted parent. This prevents an accidental
+mispairing of a different checkpoint with the DFlash assistant. In an
+official pipeline, the trusted
 transform step must consume that same validated source; returned-token parity
-then binds the transformed runtime to the IT oracle.
+then binds the transformed runtime to the Laguna oracle.
 
 No weights are committed to this repository.
 
 ## Pinned MLX APIs and model integration
+
+Note: the Swift symbol names in this section and below (`Gemma4*`,
+`GemmaRuntimeMTP*`) are the pre-port implementation names. The Laguna/DFlash
+Swift port replaces them with Laguna equivalents
+(`Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Laguna.swift`,
+`LagunaMTP.swift`, `LagunaMTPTarget.swift`, and the corresponding
+`Sources/MLXFastModel/` session types); the roles and guarantees described
+here carry over unchanged.
 
 The Package.resolved revision exposes:
 
@@ -158,11 +189,12 @@ For configured block size `K` in `2...4`, one round:
 
 The exact-pair kernels share packed weight traversal while preserving each
 row's K=1 accumulation and reduction order. They cover sliding Q/K/V, full
-Q/K, attention output, gate/up activation, down projection, layer boundaries,
-and the tied packed13 vocabulary head. RMS normalization remains row-serial.
-Full D=512 attention remains two K=1 calls. Sliding D=256 attention uses one
-causal two-query dispatch only below the library's 1,024-key shape switch;
-otherwise it is row-serial. Row two therefore sees row one's K/V exactly as it
+Q/K, attention output, the MLP path, layer boundaries,
+and the vocabulary head. RMS normalization remains row-serial.
+(This paragraph describes the pre-port Gemma pair kernels; the Laguna port
+re-derives the same row-exactness guarantees for head_dim 128 attention,
+the untied lm_head, and the MoE expert path.) Row two therefore sees row
+one's K/V exactly as it
 does in serial decoding.
 
 The expanded M5 pilot proved why an ordinary mathematical K-row target
@@ -228,7 +260,7 @@ operator-owned read-only cache permissions remain required.
 ban on all speculation. Trusted rollout code may set:
 
 ```text
-MLXFAST_SUBMISSION_TRACK_ID=gemma4-31b-it-mtp-v1
+MLXFAST_SUBMISSION_TRACK_ID=laguna-xs-2.1-mtp-v1
 ```
 
 The MTP policy permits only organizer-assistant, target-verified block
@@ -251,15 +283,20 @@ and fixed timing/count contract remain the substantive runtime controls.
 
 Known on-disk bytes:
 
-- target source: 18,444,420,181 bytes;
-- assistant sidecar: 264,144,321 bytes;
-- combined: 18,708,564,502 bytes (about 17.4 GiB).
+- target source: 18,829,720,326 bytes per Hugging Face API metadata at the
+  pinned revision (confirm on m5-bench);
+- assistant draft download: 924,135,848 bytes BF16 per Hugging Face LFS
+  metadata (converted to MLX affine 4-bit at setup; the converted runtime
+  form is smaller);
+- combined source: about 18.4 GiB.
 
-The assistant is the ~470M-parameter drafter stored as affine 4-bit
-(group size 64) packed U32 weights with BF16 scales/biases according to its
-repository metadata. The M5 matrix measured up to 47.6 GiB peak process RSS,
+The assistant is the 5-layer DFlash Eagle-style speculator, stored at
+runtime as affine 4-bit
+(group size 64) packed U32 weights with scales/biases after the on-box
+setup conversion. The old-target M5 matrix measured up to 47.6 GiB peak process RSS,
 31.2 GiB MLX active memory, 3.4 GiB MLX cache memory, and 34.1 GiB MLX allocator
-peak. Runtime peak is higher than file size because target and assistant
+peak; expect the Laguna numbers to be re-measured during the M5 rebaseline.
+Runtime peak is higher than file size because target and assistant
 weights, target KV, shared K/V, verification logits/activations, and allocator
 state coexist. This fits the 128 GiB runner but exceeds the base track's
 practical 36 GiB local budget; a public track needs its own documented memory
@@ -285,8 +322,8 @@ submission; they live outside `benchmark.json` `editablePaths`:
   enforces the strict `mtp_decode_begin`/`mtp_decode_block` request schema,
   monotonic request IDs, in-vocabulary bounded blocks, the cache-offset
   ledger, and session poisoning after any failure.
-- `Sources/MLXFastHarness/GemmaRuntimeMTPProvenance.swift`,
-  `fixtures/gemma_4_31b_it_mtp_track.json`, and the SHA256 manifests: the
+- `Sources/MLXFastHarness/GemmaRuntimeMTPProvenance.swift` (pre-port name),
+  `fixtures/laguna_xs_2_1_mtp_track.json`, and the SHA256 manifests: the
   pinned target/assistant identity and architecture contract.
 - `Sources/MLXFastCLI/main.swift`: track dispatch and the worker Seatbelt
   sandbox profile.
@@ -364,9 +401,10 @@ score = mtp_decode_speedup          (decode-only; floor >= 1.0)
   are not publishable because a bounded one-time seed-prefill first-touch
   (~1.5s run-to-run) still needs multi-pair averaging (see "First-block
   stall: root cause and fix").
-- The leaderboard namespace is `gemma4-31b-it-mtp-v1`, fully separate from
-  the archived serial configuration; `official_scoring_enabled` is true
-  after the hidden IT-target goldens and M5 floors were frozen.
+- The leaderboard namespace is `laguna-xs-2.1-mtp-v1`, fully separate from
+  the archived serial configuration; `official_scoring_enabled` flips to
+  true only after the hidden Laguna-target goldens and M5 floors are frozen
+  (see the go-live runbook).
 
 ## Scoring and rebaseline contract
 
@@ -544,9 +582,12 @@ Before publication, organizers must:
    remains, so still require the multi-pair alternating-order protocol above
    before quoting single-pair scores.
 
-Items 1–7 are complete. The live default workflow is
-`.github/workflows/benchmark.yml`; the contract has
-`official_scoring_enabled=true` and the hidden pins are populated. The
+Items 1–7 were completed for the previous (Gemma) pin and must be repeated
+for the Laguna re-pin: the hidden goldens, serial oracle, floor calibration,
+weight manifests, and box provisioning all must be regenerated on m5-bench
+with the real Laguna weights before `official_scoring_enabled` flips back to
+true. The default workflow remains
+`.github/workflows/benchmark.yml`. The
 historical operator procedure is retained in
 `docs/mtp-track-golive-runbook.md`.
 
@@ -574,8 +615,8 @@ Generate a target-matched public oracle on the M5 from a prompt of at least
   --prompt-file correctness_prompts/public_longcopy_gate_english.txt \
   --weights mtp-weights \
   --tokenizer "${MLXFAST_MTP_TARGET_DIR}" \
-  --output /tmp/gemma4-31b-it-mtp-public.json \
-  --name gemma4-31b-it-mtp-public \
+  --output /tmp/laguna-xs-2.1-mtp-public.json \
+  --name laguna-xs-2.1-mtp-public \
   --steps 129
 ```
 
@@ -584,7 +625,7 @@ Run the serial block control first:
 ```bash
 .build/release/mlxfast-swift mtp-probe \
   --weights mtp-weights \
-  --golden /tmp/gemma4-31b-it-mtp-public.json \
+  --golden /tmp/laguna-xs-2.1-mtp-public.json \
   --block-size 4 \
   --tokens 128
 ```
@@ -596,15 +637,16 @@ Then run the trained-assistant prototype:
   --target-source "${MLXFAST_MTP_TARGET_DIR}" \
   --weights mtp-weights \
   --assistant "${MLXFAST_MTP_ASSISTANT_DIR}" \
-  --contract fixtures/gemma_4_31b_it_mtp_track.json \
-  --golden /tmp/gemma4-31b-it-mtp-public.json \
+  --contract fixtures/laguna_xs_2_1_mtp_track.json \
+  --golden /tmp/laguna-xs-2.1-mtp-public.json \
   --block-size 4 \
   --tokens 128 \
   --target-verification exact-pair \
   --require-trained-assistant
 ```
 
-`--tokens` defaults to 128 and accepts `1...512`; the selected golden must
+`--tokens` defaults to 128 and accepts `1...1536` (the trusted-parent cap;
+ranked timed decode stays fixed at 512); the selected golden must
 contain one seed token plus the requested number of decode tokens. The parent
 owns this total, validates every token, and uses it as the fixed denominator.
 `--block-size` accepts `2...4`. A one-position block is used only internally
@@ -625,13 +667,13 @@ swift test -c release --filter trainedMTPArtifactValidationRuntimeGate
 
 MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1 \
 MLXFAST_MTP_WEIGHTS_PATH="${PWD}/mtp-weights" \
-MLXFAST_MTP_PAIR_GOLDEN_PATH=/tmp/gemma4-31b-it-mtp-public.json \
+MLXFAST_MTP_PAIR_GOLDEN_PATH=/tmp/laguna-xs-2.1-mtp-public.json \
 swift test --filter exactPairRuntimeMatchesTwoSerialRowsBitForBit
 
 MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1 \
 MLXFAST_MTP_WEIGHTS_PATH="${PWD}/mtp-weights" \
 MLXFAST_MTP_ASSISTANT_DIR="${MLXFAST_MTP_ASSISTANT_DIR}" \
-MLXFAST_MTP_PAIR_GOLDEN_PATH=/tmp/gemma4-31b-it-mtp-public.json \
+MLXFAST_MTP_PAIR_GOLDEN_PATH=/tmp/laguna-xs-2.1-mtp-public.json \
 swift test --filter exactPairSessionForcedAcceptanceSeamsMatchSerial
 
 MLXFAST_RUN_MTP_EXACT_PAIR_TESTS=1 \
@@ -654,9 +696,11 @@ benchmark host before a kernel change ships.
   time; they are proven bit-identical by runtime gates, not by construction.
   Any future kernel change must rerun the exact-pair parity gates before it
   can ship, and the serial K=1 mode remains the fail-closed control.
-- Decodes whose sliding offset crosses the 1,024-position window wrap lose
-  pair eligibility and serialize the remaining rows; within the current
-  512-seed/512-decode contract this affects only the final pair position.
+- Decodes whose sliding offset crosses the sliding-window wrap (512
+  positions for Laguna) lose
+  pair eligibility and serialize the remaining rows; with a 512-token window
+  the wrap occurs earlier than the old 1,024-window pin, so the Laguna port
+  must re-verify wrap-seam behavior on m5-bench.
 - The path-based upstream loader cannot atomically bind open descriptors;
   before/after hash validation plus read-only operator ownership mitigates
   TOCTOU, but official provisioning must enforce ownership and permissions.

@@ -292,8 +292,11 @@ func trustedMTPBlockValidatorRejectsOverrunAndMismatch() throws {
 func experimentalMTPUsesTrustedConfigurableLengthAndBoundedBlocks() throws {
     #expect(MLXFastConstants.experimentalMTPMaxBlockSize == 4)
     #expect(MLXFastConstants.experimentalMTPMaxTotalTokens == 128)
+    // 1,536 = 3x Laguna's 512-position sliding window: the trusted-parent
+    // maximum keeps the untimed correctness legs able to wrap the rotating
+    // cache while ranked timed decode stays fixed at 512 by workflow env.
     #expect(
-        MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens == 512
+        MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens == 1_536
     )
     #expect(
         MLXFastConstants.experimentalMTPMaxTotalTokens
@@ -581,7 +584,7 @@ func trainedMTPMemoryDiagnosticsRemainNonScoringProtocolFields() throws {
 func trainedMTPContractPinsMatchedITPairAndDependency() throws {
     let data = try Data(
         contentsOf: URL(
-            fileURLWithPath: "fixtures/gemma_4_31b_it_mtp_track.json"
+            fileURLWithPath: "fixtures/laguna_xs_2_1_mtp_track.json"
         )
     )
     let contract = try JSONDecoder().decode(
@@ -589,36 +592,41 @@ func trainedMTPContractPinsMatchedITPairAndDependency() throws {
         from: data
     )
     try GemmaRuntime.validateExperimentalMTPContract(contract)
-    #expect(contract.trackID == "gemma4-31b-it-mtp-v1")
-    #expect(contract.target.upstreamModelID == "google/gemma-4-31B-it")
+    #expect(contract.trackID == "laguna-xs-2.1-mtp-v1")
+    #expect(contract.target.upstreamModelID == "poolside/Laguna-XS-2.1")
     #expect(
-        contract.assistant.modelID
-            == "mlx-community/gemma-4-31B-it-qat-assistant-4bit"
+        contract.target.runtimeModelID == "mlx-community/Laguna-XS-2.1-4bit"
     )
+    #expect(
+        contract.assistant.modelID == "poolside/Laguna-XS-2.1-DFlash"
+    )
+    #expect(contract.assistant.expectedTotalBytes == 924_135_848)
     #expect(contract.assistant.quantizationBits == 4)
     #expect(contract.assistant.quantizationGroupSize == 64)
     #expect(
         contract.mlxSwiftLMRevision
             == "bc1c0ee67d15798343be17c9f8f61f7c0d977149"
     )
-    // QAT-assistant re-enablement: official scoring is ON with the
-    // reference baseline re-established on the ranked box against the QAT
-    // 4-bit assistant. The ranked decode window (512) is owned by the
-    // workflow env; the contract's decode_tokens stays the 128-token
-    // compatibility default with a 512 trusted-parent maximum.
-    #expect(contract.officialScoringEnabled)
-    #expect(contract.referenceBaseline.status == "established")
-    #expect(contract.referenceBaseline.publicationAllowed)
+    // Laguna re-pin: official scoring is OFF, fail-closed, until the hidden
+    // goldens, weight manifests, and paired reference baseline are
+    // regenerated on m5-bench (docs/mtp-track-golive-runbook.md). The
+    // ranked decode window (512) is owned by the workflow env; the
+    // contract's decode_tokens stays the 128-token compatibility default
+    // with a 1536 trusted-parent maximum (3x Laguna's 512-position sliding
+    // window, for the untimed wrap legs).
+    #expect(!contract.officialScoringEnabled)
+    #expect(contract.referenceBaseline.status == "pending_m5_rebaseline")
+    #expect(!contract.referenceBaseline.publicationAllowed)
     #expect(contract.protocolContract.decodeTokens == 128)
-    #expect(contract.protocolContract.maximumDecodeTokens == 512)
+    #expect(contract.protocolContract.maximumDecodeTokens == 1_536)
 }
 
 @Test
 func trainedMTPContractRejectsAssistantReplacement() throws {
-    let path = "fixtures/gemma_4_31b_it_mtp_track.json"
+    let path = "fixtures/laguna_xs_2_1_mtp_track.json"
     let original = try String(contentsOfFile: path, encoding: .utf8)
     let tampered = original.replacingOccurrences(
-        of: "mlx-community/gemma-4-31B-it-qat-assistant-4bit",
+        of: "poolside/Laguna-XS-2.1-DFlash",
         with: "participant/arbitrary-assistant"
     )
     let contract = try JSONDecoder().decode(
@@ -698,7 +706,7 @@ func trainedMTPOptionsFailClosedWithoutAssistantRequirement() throws {
                 contractPath: "contract.json",
                 goldenPath: "it-golden.json",
                 maxBlockSize: 4,
-                totalTokenCount: 513,
+                totalTokenCount: 1_537,
                 requireTrainedAssistant: true
             )
         )
@@ -810,12 +818,12 @@ func mtpProvisioningIsPinnedResumableAndSeparate() throws {
     )
     #expect(
         script.contains(
-            "TARGET_REVISION=\"696d436c404745a59f30e4939a658162b0a9e57f\""
+            "TARGET_REVISION=\"c42e0a8f8d504ceacde015a535dcb286d65c8799\""
         )
     )
     #expect(
         script.contains(
-            "ASSISTANT_REVISION=\"5234fd588403c9b68f3bd20a140b7e61700cb7e2\""
+            "ASSISTANT_REVISION=\"5c36361aab23c8ed3afbd079c10c426b677bc607\""
         )
     )
     #expect(script.contains("--continue-at -"))
@@ -828,7 +836,7 @@ func mtpProvisioningIsPinnedResumableAndSeparate() throws {
         contentsOfFile: "setup.sh",
         encoding: .utf8
     )
-    #expect(!normalSetup.contains("gemma4-31b-it-mtp-v1"))
+    #expect(!normalSetup.contains("laguna-xs-2.1-mtp-v1"))
     #expect(!normalSetup.contains("assistant"))
 }
 
@@ -840,6 +848,11 @@ func staticReviewHasDistinctSerialAndMTPPolicies() throws {
         encoding: .utf8
     )
     #expect(script.contains("MLXFAST_SUBMISSION_TRACK_ID"))
+    // TODO(operator): the review script's track-id allowlist still carries
+    // the retired gemma4-31b-it-mtp-v1 id; it rotates to
+    // laguna-xs-2.1-mtp-v1 with the .github workflow re-pin (a separate
+    // workstream from the Swift-side Laguna port). Update this expectation
+    // together with that script change.
     #expect(script.contains("serial|gemma4-31b-it-mtp-v1"))
     #expect(
         script.contains(
@@ -868,18 +881,22 @@ func trainedMTPArtifactValidationRuntimeGate() throws {
     let assistant = try #require(
         ProcessInfo.processInfo.environment["MLXFAST_MTP_ASSISTANT_DIR"]
     )
+    // NOTE: this runtime-gated leg can only pass once the operator has
+    // regenerated the Laguna weight manifests on m5-bench: the checked-in
+    // contract still carries REGENERATE_ON_M5 placeholder pins that make
+    // artifact validation fail closed by design.
     let sourceReport = try GemmaRuntime.validateExperimentalMTPSourceTarget(
         sourceTargetPath: sourceTarget,
-        contractPath: "fixtures/gemma_4_31b_it_mtp_track.json"
+        contractPath: "fixtures/laguna_xs_2_1_mtp_track.json"
     )
-    #expect(sourceReport.byteCount == 18_444_420_181)
+    #expect(sourceReport.byteCount == 18_829_720_326)
     let report = try GemmaRuntime.validateExperimentalMTPArtifacts(
         targetWeightsPath: target,
         assistantPath: assistant,
-        contractPath: "fixtures/gemma_4_31b_it_mtp_track.json"
+        contractPath: "fixtures/laguna_xs_2_1_mtp_track.json"
     )
-    #expect(report.trackID == "gemma4-31b-it-mtp-v1")
-    #expect(report.assistantByteCount == 264_144_321)
+    #expect(report.trackID == "laguna-xs-2.1-mtp-v1")
+    #expect(report.assistantByteCount == 924_135_848)
     #expect(report.targetByteCount <= 20 * (1 << 30))
 }
 
@@ -912,7 +929,7 @@ func trainedMTPPublicParityRuntimeGate() throws {
             sourceTargetPath: sourceTarget,
             targetWeightsPath: weights,
             assistantPath: assistant,
-            contractPath: "fixtures/gemma_4_31b_it_mtp_track.json",
+            contractPath: "fixtures/laguna_xs_2_1_mtp_track.json",
             goldenPath: golden,
             maxBlockSize: 4,
             totalTokenCount: totalTokenCount,

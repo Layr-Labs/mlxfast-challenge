@@ -136,12 +136,12 @@ public enum BenchmarkPreflight {
             }
         }
         #if !MLXFAST_TRUSTED_HARNESS
-            let config = try Gemma4Config.load(from: weightsPath)
+            let config = try LagunaConfig.load(from: weightsPath)
 
             let denseStore = try DenseTensorStore(weightsPath: weightsPath)
             try denseStore.validateReadableByteRanges()
 
-            try Gemma4WeightLoader(denseStore: denseStore)
+            try LagunaWeightLoader(denseStore: denseStore)
                 .validateRequiredMetadata(config: config)
         #endif
 

@@ -1,15 +1,15 @@
-# mlxfast — Gemma 4 31B-IT MTP Swift Challenge
+# mlxfast — Poolside Laguna XS 2.1 MTP Swift Challenge
 
-Optimize trained-assistant block decode for Gemma 4 31B-IT (dense text tower,
-4-bit target) on Apple Silicon while preserving the target model's exact
-serial greedy output.
+Optimize trained-assistant block decode for Poolside Laguna XS 2.1 (MoE text
+tower, 4-bit target) on Apple Silicon while preserving the target model's
+exact serial greedy output.
 
 ## Default ranked contract
 
 `benchmark.json` and `.github/workflows/benchmark.yml` define the default
-Yukon track, `gemma4-31b-it-mtp-v1`. The organizer supplies a pinned 31B-IT
-target, Google's matched QAT assistant, two hidden M5-generated goldens, and a
-pinned serial K=1 baseline.
+Yukon track, `laguna-xs-2.1-mtp-v1`. The organizer supplies a pinned Laguna
+target, Poolside's matched DFlash speculator (as the assistant), two hidden
+M5-generated goldens, and a pinned serial K=1 baseline.
 
 The trusted parent drives:
 
@@ -40,7 +40,7 @@ The serial non-speculative challenge remains available explicitly through
 ## Model Artifacts
 
 The default MTP target and assistant are provisioned by `setup-mtp.sh` and
-pinned by `fixtures/gemma_4_31b_it_mtp_track.json`. The base-checkpoint layout
+pinned by `fixtures/laguna_xs_2_1_mtp_track.json`. The base-checkpoint layout
 below documents the archived serial track.
 
 By default, `setup.sh` stores the frozen reference checkpoint in a shared
@@ -48,20 +48,22 @@ Hugging Face-style cache under your home directory (so parallel clones reuse
 one checkpoint):
 
 ```text
-~/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main/
+~/.cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main/
 ```
 
 It also creates this compatibility symlink unless the path already exists:
 
 ```text
-reference_weights/gemma-4-31b-4bit/
+reference_weights/laguna-xs-2.1-4bit/
 ```
 
-By default `setup.sh` downloads `mlx-community/gemma-4-31b-4bit` from the
-Darkbloom R2 mirror with resumable `curl` requests, falling back to the public
-Hugging Face source on failed or stalled transfers. It checks cached files
+By default `setup.sh` downloads `mlx-community/Laguna-XS-2.1-4bit` from the
+pinned Hugging Face revision with resumable `curl` requests (no organizer
+mirror exists yet; one may be added later). It checks cached files
 against the pinned SHA256 manifest and redownloads only missing, truncated, or
-hash-mismatched files. The safetensors payload is about 18.4 GB across 4
+hash-mismatched files. (The checked-in Laguna weight manifests are entry-less
+placeholders until the operator regenerates them on m5-bench; setup fails
+closed on an entry-less manifest.) The safetensors payload is about 18.8 GB across 4
 shards; `setup.sh` requires 40 GiB free by default before starting. After a
 full verification, setup writes `.mlxfast-reference-cache.lock`; later setup
 runs use cheap size/mtime checks from that lock and skip the full checkpoint
@@ -83,11 +85,11 @@ weights/
 
 The generated `weights/` tree is a compact runtime artifact set, not a second
 full copy of the checkpoint: it holds only the text-tower tensors (the
-`language_model.` prefix in the source checkpoint), with every
-vision/audio/multimodal-projector tensor dropped, plus a runtime-authored
-`config.json` (the flattened Gemma 4 `text_config` fields the runtime needs,
-plus the checkpoint's quantization metadata). There is no expert manifest --
-the whole model is one flat set of dense tensors loaded fully into RAM at
+`language_model.` prefix in the source checkpoint), plus a runtime-authored
+`config.json` (the Laguna geometry fields the runtime needs,
+plus the checkpoint's quantization metadata). There is no expert
+streaming manifest -- the whole model, including every routed expert, is
+loaded fully into RAM at
 init; there is no weight streaming of any kind. Submissions may adjust this
 overlay by changing both `Sources/MLXFastTransform/` and
 `Sources/MLXFastModel/`; correctness and benchmark results are the authority,
@@ -95,7 +97,9 @@ not byte equality with the baseline layout.
 
 The public correctness-only prompt and golden are committed under
 `correctness_prompts/` so participants can run a local correctness smoke test
-(Gemma-generated; see the fixture note above). The official correctness golden
+(the checked-in fixtures are still legacy Gemma-generated and must be
+regenerated on m5-bench with the Laguna tokenizer, vocab 100352, before they
+gate Laguna code). The official correctness golden
 is supplied by the benchmark operator and is intentionally not committed to
 the public repo:
 
@@ -121,7 +125,7 @@ The active editable surface is Swift-only and is defined by `benchmark.json`:
 
 | Path | Scope |
 |---|---|
-| `Sources/MLXFastModel/` | Gemma 4 31B 4-bit model implementation: attention (sliding-window + full, GQA, partial-rotary RoPE), gated MLP, RMSNorm, KV caches, dense weight loading, and prefill/decode execution. |
+| `Sources/MLXFastModel/` | Laguna XS 2.1 4-bit model implementation: attention (sliding-window + full, GQA, YaRN partial-rotary RoPE on full-attention layers), MoE MLP (256 routed experts + shared expert, per-head gating), RMSNorm, KV caches, weight loading, and prefill/decode execution. |
 | `Sources/MLXFastTransform/` | Offline safetensors transform (text-tensor selection, config/tokenizer emission). |
 
 `Sources/MLXFastCore/`, `Sources/MLXFastHarness/`,
@@ -162,7 +166,7 @@ transform output. It re-runs the submitted transform and compares the generated
 `weights/` tree against that fresh run. It is not a baseline-layout requirement.
 The normal preflight/benchmark path also rejects generated `weights/` above the
 default 25 GiB transformed-output cap before correctness or timing runs (the
-text tower is about 17 GB, comfortably under that cap).
+text tower is about 18.8 GB, comfortably under that cap).
 Override it with `MLXFAST_MAX_WEIGHTS_BYTES`; `verify-transform` additionally
 accepts `--max-bytes`.
 
@@ -224,12 +228,12 @@ prompts, accepted answer sequences, reference answers, and judge transcripts
 outside the public repository.
 
 The gate intentionally does not port a hidden-state comparison layer. The
-benchmark contract cares about the externally observable text-to-text Gemma 4
+benchmark contract cares about the externally observable text-to-text Laguna
 output path, and hidden-state tensors are easier to make ambiguous around
-normalization/softcapping than token-level or logit-anchor checks.
+normalization than token-level or logit-anchor checks.
 
-VLM/image and audio inputs remain out of scope. Only the Gemma 4 text tower
-and organizer-provided MTP assistant execute.
+VLM/image and audio inputs remain out of scope. Only the Laguna text tower
+and organizer-provided DFlash MTP assistant execute.
 
 ### Default MTP decode rule
 
@@ -243,7 +247,7 @@ rollback, or protocol drift.
 
 Prompt lookup, token-history drafting, a different assistant, hidden-prompt
 specialization, and precomputed future outputs remain forbidden. Kernel edits
-are allowed when they are input-general for Gemma 4 and matched across AOT
+are allowed when they are input-general for Laguna and matched across AOT
 sources and JIT twins.
 
 ### Archived serial non-speculative rule

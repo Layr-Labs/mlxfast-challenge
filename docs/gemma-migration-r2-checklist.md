@@ -1,5 +1,12 @@
 # Gemma Migration: R2 / Private Artifact Checklist
 
+> **Historical record.** This checklist covers the DeepSeek-to-Gemma
+> migration and is complete. The 2026-07 re-pin to Poolside Laguna XS 2.1
+> (`laguna-xs-2.1-mtp-v1`, new tokenizer with vocab 100352) requires the
+> same regeneration pass again — hidden goldens, GPQA references, public
+> fixtures, and pins — executed per
+> `docs/mtp-track-golive-runbook.md`; use this file as the template.
+
 The DeepSeek V4 Flash to Gemma 4 31B 4-bit migration changed the model,
 tokenizer, and layer count, so every private artifact that embeds prompt
 tokens, expected tokens, or model-derived calibration was model-mismatched

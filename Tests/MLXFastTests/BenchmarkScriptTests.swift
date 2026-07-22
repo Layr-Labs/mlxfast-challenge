@@ -11,7 +11,12 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
         encoding: .utf8
     )
 
-    #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://ds4.darkbloom.ai/gemma-4-31b-4bit\""))
+    // TODO(operator): once a Darkbloom R2 mirror is provisioned for the Laguna
+    // checkpoint, re-pin this to the mirror URL (the Gemma track used
+    // https://ds4.darkbloom.ai/<model>). Until then the pinned Hugging Face
+    // revision is the primary source.
+    #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/c42e0a8f8d504ceacde015a535dcb286d65c8799\""))
+    #expect(setup.contains("DEFAULT_REFERENCE_FALLBACK_BASE_URL=\"https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/main\""))
     #expect(setup.contains("REFERENCE_BASE_URL=\"${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}\""))
     // 3 parallel shard downloads by default; env-overridable.
     #expect(setup.contains("REFERENCE_DOWNLOAD_JOBS=\"${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-3}\""))
@@ -239,8 +244,8 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     // The reference comes from the runner-owned cache, never a download. The
     // dependency-only SwiftPM cache is restored before the checkout is copied
     // into the bench workspace; ranked jobs never save submission build output.
-    #expect(workflow.contains("MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main"))
-    #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_4bit.sha256"))
     #expect(workflow.contains("shasum -a 256 \"${path}\""))
     #expect(workflow.contains("reference checkpoint failed manifest verification"))
     #expect(!workflow.contains("./setup.sh"))
@@ -1234,14 +1239,14 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"))
-    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 182a7f98d24cc8f26e8b08505fe7a8b6d825702f99d0b78a83f49dd42f1b2aea"))
-    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"11140\""))
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 679ba44220d581316c752533472883f4905a1b6a30f5f657a25f1177ae6247c1"))
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"10519\""))
     #expect(workflow.contains("MLXFAST_TIMED_DECODE_TARGET_ID: \(MLXFastConstants.benchmarkEvaluationTargetID)"))
     #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_SHA256: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}"))
     #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_BYTES: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_BYTES }}"))
-    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1.txt"))
-    #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json"))
-    #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json"))
+    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_gc_runtimes_essay-laguna.txt"))
+    #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json"))
+    #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna.json"))
     #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"5\""))
     // 64-token budget and min-pass 1 threshold are calibrated to the
     // unmodified Gemma 4 31B 4-bit rebase baseline, which stably judged 2/5
@@ -1266,8 +1271,8 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // The augmented golden is pinned to a self-anchored hash exported into
     // GITHUB_ENV right after attach-gpqa-gates, exactly as the old gates
     // machine did.
-    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 56c282dcaac433543ef0eecb625cd99bc20f1ae1f7b9415efe32a71e6eb4eae9"))
-    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: \"38162\""))
+    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 96689a9ceaf7cc813174d0a6cb2ab650454d7d031f88514cbd222bcb17bb4d7e"))
+    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: \"35749\""))
     #expect(workflow.contains("raw hidden correctness golden pin mismatch"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${actual_hash}"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${actual_bytes}"))
@@ -1537,7 +1542,7 @@ func submissionStaticReviewPromptCoversMeasurementStructureExploitation() throws
         #expect(normalizedRule.contains("deferred cache rows"))
         #expect(normalizedRule.contains("one position and leaves no pending future token"))
         #expect(normalizedRule.contains("default"))
-        #expect(normalizedRule.contains("gemma 4 31b-it"))
+        #expect(normalizedRule.contains("laguna xs 2.1"))
         #expect(normalizedRule.contains("mtp_decode_block"))
         #expect(normalizedRule.contains("last committed token"))
     }
@@ -2791,7 +2796,7 @@ func decodeMeasurementRunsSingleUnmemoizableSeedForward() throws {
     // Exactly one whole-prompt forward, and no warmup pass preceding the seed.
     #expect(!decodeBegin.contains("warmupCache"))
     #expect(!decodeBegin.contains("warmupLogits"))
-    #expect(decodeBegin.components(separatedBy: "Gemma4Model.logits(").count - 1 == 1)
+    #expect(decodeBegin.components(separatedBy: "lagunaLogits(").count - 1 == 1)
     #expect(decodeBegin.contains("with NO preceding"))
 
     let benchmark = try String(
@@ -3028,7 +3033,7 @@ func runtimeWorkerProtocolUsesAuthenticatedPrivateIO() throws {
     #expect(runtime.contains("response.nonce != sessionNonce"))
     #expect(runtime.contains("RuntimeWorkerProtocolIO.isolatingStandardIO()"))
     let protocolIsolation = try #require(runtime.range(of: "RuntimeWorkerProtocolIO.isolatingStandardIO()"))
-    let configLoad = try #require(runtime.range(of: "Gemma4Config.load(from: weightsPath)"))
+    let configLoad = try #require(runtime.range(of: "LagunaConfig.load(from: weightsPath)"))
     #expect(protocolIsolation.lowerBound < configLoad.lowerBound)
     #expect(runtime.contains("F_DUPFD_CLOEXEC"))
     #expect(runtime.contains("arc4random_buf(baseAddress, buffer.count)"))
@@ -4712,12 +4717,12 @@ func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
     let refWeights = root.appendingPathComponent("reference_weights")
     try FileManager.default.createDirectory(at: refWeights, withIntermediateDirectories: true)
     try FileManager.default.createSymbolicLink(
-        atPath: refWeights.appendingPathComponent("gemma-4-31b-4bit").path,
+        atPath: refWeights.appendingPathComponent("laguna-xs-2.1-4bit").path,
         withDestinationPath: root.appendingPathComponent("does-not-exist").path
     )
 
     // A real cache directory holding the checkpoint.
-    let cache = root.appendingPathComponent("hfcache/models--mlx-community--gemma-4-31b-4bit/snapshots/main")
+    let cache = root.appendingPathComponent("hfcache/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main")
     try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
     try "{}".write(to: cache.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
 
@@ -4794,7 +4799,7 @@ func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
     let recorded = (try? String(contentsOf: reflog, encoding: .utf8)) ?? ""
     // The transform was handed the real cache dir, not the broken symlink.
     #expect(recorded.contains(cache.path))
-    #expect(!recorded.contains("reference_weights/gemma-4-31b-4bit"))
+    #expect(!recorded.contains("reference_weights/laguna-xs-2.1-4bit"))
 }
 
 @Test

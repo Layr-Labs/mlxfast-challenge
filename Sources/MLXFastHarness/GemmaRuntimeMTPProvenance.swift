@@ -39,6 +39,13 @@ struct ExperimentalMTPTrackContract: Decodable {
         let intermediateSize: Int
         let numHiddenLayers: Int
         let vocabSize: Int
+        let headDim: Int
+        let slidingWindow: Int
+        let numExperts: Int
+        let numExpertsPerTok: Int
+        let moeIntermediateSize: Int
+        let sharedExpertIntermediateSize: Int
+        let mlpOnlyLayers: [Int]
         let quantizationBits: Int
         let quantizationGroupSize: Int
 
@@ -56,6 +63,13 @@ struct ExperimentalMTPTrackContract: Decodable {
             case intermediateSize = "intermediate_size"
             case numHiddenLayers = "num_hidden_layers"
             case vocabSize = "vocab_size"
+            case headDim = "head_dim"
+            case slidingWindow = "sliding_window"
+            case numExperts = "num_experts"
+            case numExpertsPerTok = "num_experts_per_tok"
+            case moeIntermediateSize = "moe_intermediate_size"
+            case sharedExpertIntermediateSize = "shared_expert_intermediate_size"
+            case mlpOnlyLayers = "mlp_only_layers"
             case quantizationBits = "quantization_bits"
             case quantizationGroupSize = "quantization_group_size"
         }
@@ -64,7 +78,40 @@ struct ExperimentalMTPTrackContract: Decodable {
     struct AssistantFile: Decodable, Equatable {
         let path: String
         let sha256: String
-        let bytes: Int
+        /// Pinned byte count, or nil while the contract carries the
+        /// operator placeholder string ("REGENERATE_ON_M5") instead of an
+        /// on-box pin. Identity validation tolerates the placeholder;
+        /// artifact validation fails closed on a nil byte pin.
+        let bytes: Int?
+
+        init(path: String, sha256: String, bytes: Int?) {
+            self.path = path
+            self.sha256 = sha256
+            self.bytes = bytes
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            path = try container.decode(String.self, forKey: .path)
+            sha256 = try container.decode(String.self, forKey: .sha256)
+            if let pinnedBytes = try? container.decode(
+                Int.self,
+                forKey: .bytes
+            ) {
+                bytes = pinnedBytes
+            } else {
+                // The placeholder must still be a string; anything else is
+                // a malformed contract and fails decoding outright.
+                _ = try container.decode(String.self, forKey: .bytes)
+                bytes = nil
+            }
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case path
+            case sha256
+            case bytes
+        }
     }
 
     struct Assistant: Decodable {
@@ -79,8 +126,20 @@ struct ExperimentalMTPTrackContract: Decodable {
         let hiddenSize: Int
         let intermediateSize: Int
         let numHiddenLayers: Int
-        let numKVSharedLayers: Int
+        let numAttentionHeads: Int
+        let numKeyValueHeads: Int
+        let headDim: Int
+        let slidingWindow: Int
+        let layerTypes: [String]
         let vocabSize: Int
+        let draftVocabSize: Int
+        let numTargetLayers: Int
+        let blockSize: Int
+        let maskTokenID: Int
+        let targetLayerIDs: [Int]
+        let eagleAuxHiddenStateLayerIDs: [Int]
+        let causal: Bool
+        let sourceDtype: String
         let quantizationBits: Int
         let quantizationGroupSize: Int
         let files: [AssistantFile]
@@ -97,8 +156,21 @@ struct ExperimentalMTPTrackContract: Decodable {
             case hiddenSize = "hidden_size"
             case intermediateSize = "intermediate_size"
             case numHiddenLayers = "num_hidden_layers"
-            case numKVSharedLayers = "num_kv_shared_layers"
+            case numAttentionHeads = "num_attention_heads"
+            case numKeyValueHeads = "num_key_value_heads"
+            case headDim = "head_dim"
+            case slidingWindow = "sliding_window"
+            case layerTypes = "layer_types"
             case vocabSize = "vocab_size"
+            case draftVocabSize = "draft_vocab_size"
+            case numTargetLayers = "num_target_layers"
+            case blockSize = "block_size"
+            case maskTokenID = "mask_token_id"
+            case targetLayerIDs = "target_layer_ids"
+            case eagleAuxHiddenStateLayerIDs =
+                "eagle_aux_hidden_state_layer_ids"
+            case causal
+            case sourceDtype = "source_dtype"
             case quantizationBits = "quantization_bits"
             case quantizationGroupSize = "quantization_group_size"
             case files
@@ -156,6 +228,12 @@ struct ExperimentalMTPTrackContract: Decodable {
     }
 }
 
+/// The pinned DFlash speculator ships a flat Laguna-family config.json
+/// (model_type "laguna", architectures ["DFlashLagunaForCausalLM"]) rather
+/// than a nested assistant wrapper: backbone geometry, the drafter's own
+/// attention geometry, and the DFlash pairing metadata (block size, mask
+/// token, target layer taps) all live at the top level or under
+/// `dflash_config`.
 private struct ExperimentalMTPAssistantConfig: Decodable {
     struct Quantization: Decodable {
         let groupSize: Int
@@ -169,71 +247,110 @@ private struct ExperimentalMTPAssistantConfig: Decodable {
         }
     }
 
-    struct TextConfig: Decodable {
-        let modelType: String
-        let hiddenSize: Int
-        let intermediateSize: Int
-        let numHiddenLayers: Int
-        let numKVSharedLayers: Int
-        let vocabSize: Int
-        let numAttentionHeads: Int
-        let numKeyValueHeads: Int
-        let numGlobalKeyValueHeads: Int
-        let headDim: Int
-        let globalHeadDim: Int
-        let attentionKEqV: Bool
-        let slidingWindow: Int
-        let maxPositionEmbeddings: Int
-        let layerTypes: [String]
+    struct DFlashConfig: Decodable {
+        let blockSize: Int
+        let maskTokenID: Int
+        let numTargetLayers: Int
+        let targetLayerIDs: [Int]
+        let causal: Bool
 
         enum CodingKeys: String, CodingKey {
-            case modelType = "model_type"
-            case hiddenSize = "hidden_size"
-            case intermediateSize = "intermediate_size"
-            case numHiddenLayers = "num_hidden_layers"
-            case numKVSharedLayers = "num_kv_shared_layers"
-            case vocabSize = "vocab_size"
-            case numAttentionHeads = "num_attention_heads"
-            case numKeyValueHeads = "num_key_value_heads"
-            case numGlobalKeyValueHeads = "num_global_key_value_heads"
-            case headDim = "head_dim"
-            case globalHeadDim = "global_head_dim"
-            case attentionKEqV = "attention_k_eq_v"
-            case slidingWindow = "sliding_window"
-            case maxPositionEmbeddings = "max_position_embeddings"
-            case layerTypes = "layer_types"
+            case blockSize = "block_size"
+            case maskTokenID = "mask_token_id"
+            case numTargetLayers = "num_target_layers"
+            case targetLayerIDs = "target_layer_ids"
+            case causal
         }
     }
 
     let modelType: String
-    let backboneHiddenSize: Int
-    let quantization: Quantization
-    let textConfig: TextConfig
+    let architectures: [String]?
+    let hiddenSize: Int
+    let intermediateSize: Int
+    let numHiddenLayers: Int
+    let numAttentionHeads: Int
+    let numKeyValueHeads: Int
+    let headDim: Int
+    let rmsNormEps: Double
+    let ropeTheta: Double
+    let slidingWindow: Int
+    let maxPositionEmbeddings: Int
+    let attentionBias: Bool?
+    let gating: ExperimentalMTPAssistantGating?
+    let layerTypes: [String]
+    let vocabSize: Int
+    let draftVocabSize: Int
+    let eagleAuxHiddenStateLayerIDs: [Int]
+    let dflashConfig: DFlashConfig
+    let numExperts: Int?
+    let torchDtype: String?
+    let quantization: Quantization?
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
-        case backboneHiddenSize = "backbone_hidden_size"
+        case architectures
+        case hiddenSize = "hidden_size"
+        case intermediateSize = "intermediate_size"
+        case numHiddenLayers = "num_hidden_layers"
+        case numAttentionHeads = "num_attention_heads"
+        case numKeyValueHeads = "num_key_value_heads"
+        case headDim = "head_dim"
+        case rmsNormEps = "rms_norm_eps"
+        case ropeTheta = "rope_theta"
+        case slidingWindow = "sliding_window"
+        case maxPositionEmbeddings = "max_position_embeddings"
+        case attentionBias = "attention_bias"
+        case gating
+        case layerTypes = "layer_types"
+        case vocabSize = "vocab_size"
+        case draftVocabSize = "draft_vocab_size"
+        case eagleAuxHiddenStateLayerIDs =
+            "eagle_aux_hidden_state_layer_ids"
+        case dflashConfig = "dflash_config"
+        case numExperts = "num_experts"
+        case torchDtype = "torch_dtype"
         case quantization
-        case textConfig = "text_config"
+    }
+}
+
+/// Attention output gating flag: the Laguna family encodes per-head gating
+/// as either a bool (`true`) or a string (`"per-head"` / `"per_head"`; any
+/// other non-empty, non-disabling string also selects the default per-head
+/// mode). Mirrors the runtime worker's pinned-config gating decoder.
+private struct ExperimentalMTPAssistantGating: Decodable {
+    let isPerHead: Bool
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let flag = try? container.decode(Bool.self) {
+            isPerHead = flag
+            return
+        }
+        switch try container.decode(String.self) {
+        case "per-element", "per_element", "false", "none", "":
+            isPerHead = false
+        default:
+            isPerHead = true
+        }
     }
 }
 
 extension GemmaRuntime {
-    static let experimentalMTPTrackID = "gemma4-31b-it-mtp-v1"
+    static let experimentalMTPTrackID = "laguna-xs-2.1-mtp-v1"
     static let experimentalMTPDependencyRevision =
         "bc1c0ee67d15798343be17c9f8f61f7c0d977149"
     static let experimentalMTPTargetModelID =
-        "mlx-community/gemma-4-31b-it-4bit"
+        "mlx-community/Laguna-XS-2.1-4bit"
     static let experimentalMTPTargetRevision =
-        "696d436c404745a59f30e4939a658162b0a9e57f"
+        "c42e0a8f8d504ceacde015a535dcb286d65c8799"
     static let experimentalMTPUpstreamTargetModelID =
-        "google/gemma-4-31B-it"
+        "poolside/Laguna-XS-2.1"
     static let experimentalMTPUpstreamTargetRevision =
-        "518276fb130dc81caf9a4f772e65e63ef2526493"
+        "c405648833500615a2efde76886b8aed4fb9324e"
     static let experimentalMTPAssistantModelID =
-        "mlx-community/gemma-4-31B-it-qat-assistant-4bit"
+        "poolside/Laguna-XS-2.1-DFlash"
     static let experimentalMTPAssistantRevision =
-        "5234fd588403c9b68f3bd20a140b7e61700cb7e2"
+        "5c36361aab23c8ed3afbd079c10c426b677bc607"
 
     static func validateExperimentalMTPSourceTarget(
         sourceTargetPath: String,
@@ -409,30 +526,39 @@ extension GemmaRuntime {
     static func validateExperimentalMTPContract(
         _ contract: ExperimentalMTPTrackContract
     ) throws {
+        // TODO(operator): the DFlash file pins below carry the
+        // REGENERATE_ON_M5 placeholders (nil byte counts) until the
+        // assistant manifest is regenerated from an on-box download on
+        // m5-bench (go-live runbook step A). Identity validation accepts
+        // the placeholder so provenance-only callers keep working;
+        // artifact validation fails closed on the nil byte pins.
         let expectedFiles = [
             ExperimentalMTPTrackContract.AssistantFile(
                 path: "config.json",
-                sha256:
-                    "b4023f8991570a8e92fc164f72b0952b4d8afb1fa597c16a06690b69637a026e",
-                bytes: 2_962
+                sha256: "REGENERATE_ON_M5",
+                bytes: nil
             ),
             ExperimentalMTPTrackContract.AssistantFile(
                 path: "model.safetensors",
-                sha256:
-                    "2c0252eb9b57efe6dd9005c83863e16a3e58b9a21ce25e3880e2cc324f64aead",
-                bytes: 264_141_359
+                sha256: "REGENERATE_ON_M5",
+                bytes: nil
             ),
         ]
+        let expectedAssistantLayerTypes = [String](
+            repeating: "sliding_attention",
+            count: 5
+        )
         guard contract.schemaVersion == 1,
               contract.trackID == experimentalMTPTrackID,
-              // QAT-assistant re-enablement: the paired M5 reference
-              // baseline was re-established on the ranked box against the
-              // QAT 4-bit assistant, so the organizer-pinned identity again
-              // carries official scoring ENABLED with an established,
-              // publishable reference baseline. A contract claiming
-              // anything else is not the pinned track identity and fails
-              // closed.
-              contract.officialScoringEnabled,
+              // Laguna re-pin: official scoring is DISABLED, fail closed,
+              // until the hidden goldens, the weight manifests, and the
+              // paired M5 reference baseline are regenerated on m5-bench
+              // with the real Laguna weights
+              // (docs/mtp-track-golive-runbook.md). TODO(operator): the
+              // enablement commit flips the contract fixture and this pin
+              // together. A contract claiming anything else is not the
+              // pinned track identity and fails closed.
+              !contract.officialScoringEnabled,
               contract.mlxSwiftLMRevision == experimentalMTPDependencyRevision,
               contract.target.upstreamModelID
                   == experimentalMTPUpstreamTargetModelID,
@@ -441,36 +567,66 @@ extension GemmaRuntime {
               contract.target.runtimeModelID == experimentalMTPTargetModelID,
               contract.target.runtimeRevision == experimentalMTPTargetRevision,
               contract.target.manifestPath
-                  == "fixtures/mtp_gemma_4_31b_it_4bit.sha256",
-              contract.target.manifestSHA256
-                  == "71c9cfe815075dbe072f4d9fcedae4452d7efea2720ee1f6feb0199c18bed5a9",
-              contract.target.expectedSourceBytes == 18_444_420_181,
+                  == "fixtures/mtp_laguna_xs_2_1_4bit.sha256",
+              // TODO(operator): pin the real manifest-file SHA-256 once the
+              // target manifest is regenerated and byte-verified on
+              // m5-bench; until then the placeholder makes every manifest
+              // digest comparison fail closed.
+              contract.target.manifestSHA256 == "REGENERATE_ON_M5",
+              contract.target.expectedSourceBytes == 18_829_720_326,
               contract.target.maximumTransformedBytes == 20 * (1 << 30),
-              contract.target.modelType == "gemma4_text",
+              contract.target.modelType == "laguna",
               contract.target.hiddenSize == MLXFastConstants.hiddenSize,
               contract.target.intermediateSize
                   == MLXFastConstants.intermediateSize,
               contract.target.numHiddenLayers
                   == MLXFastConstants.numHiddenLayers,
               contract.target.vocabSize == MLXFastConstants.vocabSize,
+              contract.target.headDim == 128,
+              contract.target.slidingWindow == 512,
+              contract.target.numExperts == 256,
+              contract.target.numExpertsPerTok == 8,
+              contract.target.moeIntermediateSize == 512,
+              contract.target.sharedExpertIntermediateSize == 512,
+              contract.target.mlpOnlyLayers == [0],
               contract.target.quantizationBits == 4,
               contract.target.quantizationGroupSize == 64,
               contract.assistant.modelID == experimentalMTPAssistantModelID,
               contract.assistant.revision == experimentalMTPAssistantRevision,
               contract.assistant.manifestPath
-                  == "fixtures/mtp_gemma_4_31b_it_assistant_qat4bit.sha256",
-              contract.assistant.manifestSHA256
-                  == "37f9c485bcb1c04a609519852c2a95c638dffb19fd4ddc3e5fb44667fc8b4125",
-              contract.assistant.expectedTotalBytes == 264_144_321,
-              contract.assistant.maximumTotalBytes == 300_000_000,
-              contract.assistant.modelType == "gemma4_assistant",
+                  == "fixtures/mtp_laguna_xs_2_1_dflash.sha256",
+              // TODO(operator): pin the real manifest-file SHA-256 once the
+              // DFlash manifest is regenerated on m5-bench.
+              contract.assistant.manifestSHA256 == "REGENERATE_ON_M5",
+              // The upstream BF16 model.safetensors payload at the pinned
+              // revision (Hugging Face LFS metadata); setup converts it to
+              // MLX affine 4-bit group-64 on-box.
+              contract.assistant.expectedTotalBytes == 924_135_848,
+              contract.assistant.maximumTotalBytes == 1_073_741_824,
+              contract.assistant.modelType == "laguna_dflash",
+              // The DFlash drafter consumes target hidden states, so its
+              // widths are the backbone's, not a narrowed drafter tower.
               contract.assistant.backboneHiddenSize
                   == MLXFastConstants.hiddenSize,
-              contract.assistant.hiddenSize == 1_024,
+              contract.assistant.hiddenSize == MLXFastConstants.hiddenSize,
               contract.assistant.intermediateSize == 8_192,
-              contract.assistant.numHiddenLayers == 4,
-              contract.assistant.numKVSharedLayers == 4,
+              contract.assistant.numHiddenLayers == 5,
+              contract.assistant.numAttentionHeads == 64,
+              contract.assistant.numKeyValueHeads == 8,
+              contract.assistant.headDim == 128,
+              contract.assistant.slidingWindow == 512,
+              contract.assistant.layerTypes == expectedAssistantLayerTypes,
               contract.assistant.vocabSize == MLXFastConstants.vocabSize,
+              contract.assistant.draftVocabSize == MLXFastConstants.vocabSize,
+              contract.assistant.numTargetLayers
+                  == MLXFastConstants.numHiddenLayers,
+              contract.assistant.blockSize == 16,
+              contract.assistant.maskTokenID == 12,
+              contract.assistant.targetLayerIDs == [1, 13, 25, 33, 39],
+              contract.assistant.eagleAuxHiddenStateLayerIDs
+                  == [2, 14, 26, 34, 40],
+              contract.assistant.causal,
+              contract.assistant.sourceDtype == "bfloat16",
               contract.assistant.quantizationBits == 4,
               contract.assistant.quantizationGroupSize == 64,
               contract.assistant.files == expectedFiles,
@@ -483,8 +639,12 @@ extension GemmaRuntime {
                   == MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens,
               contract.protocolContract.parentOracleRequired,
               !contract.protocolContract.workerTimingIsAuthoritative,
-              contract.referenceBaseline.status == "established",
-              contract.referenceBaseline.publicationAllowed,
+              // TODO(operator): flips to "established" with
+              // publication_allowed=true in the enablement commit after the
+              // paired Laguna baseline is re-established on m5-bench
+              // (runbook steps B-C).
+              contract.referenceBaseline.status == "pending_m5_rebaseline",
+              !contract.referenceBaseline.publicationAllowed,
               contract.referenceBaseline.requiredRebaselineHardware
                   == "m5-bench"
         else {
@@ -533,6 +693,12 @@ extension GemmaRuntime {
                     "experimental MTP assistant contract contains an unsafe file path"
                 )
             }
+            guard let expectedBytes = expected.bytes else {
+                throw MLXFastError.invalidInput(
+                    "experimental MTP assistant \(expected.path) byte pin is an "
+                        + "operator placeholder; regenerate the manifest on m5-bench"
+                )
+            }
             let url = root.appendingPathComponent(expected.path)
             try requireRegularFile(
                 url.path,
@@ -542,7 +708,7 @@ extension GemmaRuntime {
                 from: FileManager.default.attributesOfItem(atPath: url.path),
                 path: url.path
             )
-            guard actualBytes == expected.bytes,
+            guard actualBytes == expectedBytes,
                   byteCount <= Int.max - actualBytes
             else {
                 throw MLXFastError.invalidInput(
@@ -591,40 +757,53 @@ extension GemmaRuntime {
             ExperimentalMTPAssistantConfig.self,
             from: Data(contentsOf: url)
         )
-        let text = config.textConfig
-        guard config.modelType == contract.assistant.modelType,
-              config.backboneHiddenSize
-                  == contract.assistant.backboneHiddenSize,
-              config.quantization.bits
-                  == contract.assistant.quantizationBits,
-              config.quantization.groupSize
-                  == contract.assistant.quantizationGroupSize,
-              config.quantization.mode ?? "affine" == "affine",
-              text.modelType == "gemma4_text",
-              text.hiddenSize == contract.assistant.hiddenSize,
-              text.intermediateSize == contract.assistant.intermediateSize,
-              text.numHiddenLayers == contract.assistant.numHiddenLayers,
-              text.numKVSharedLayers
-                  == contract.assistant.numKVSharedLayers,
-              text.vocabSize == contract.assistant.vocabSize,
-              text.numAttentionHeads == 32,
-              text.numKeyValueHeads == 16,
-              text.numGlobalKeyValueHeads == 4,
-              text.headDim == 256,
-              text.globalHeadDim == 512,
-              text.attentionKEqV,
-              text.slidingWindow == 1_024,
-              // The QAT drafter checkpoint declares 131072; the bf16 one
-              // declared 262144. The field is decoded but functionally inert
-              // for a fully KV-shared drafter (no own cache, RoPE ignores
-              // it); pin the shipped value.
-              text.maxPositionEmbeddings == 131_072,
-              text.layerTypes == [
-                  "sliding_attention",
-                  "sliding_attention",
-                  "sliding_attention",
-                  "full_attention",
-              ]
+        // The checkpoint config declares the Laguna model family; the
+        // contract's "laguna_dflash" model_type is the track's own artifact
+        // label. Optional fields follow the pinned BF16 upstream: absent
+        // means the pinned default, present must equal the pinned value.
+        // Quantization metadata is absent in the BF16 upstream and must
+        // match the contract if the on-disk checkpoint is the converted MLX
+        // 4-bit form.
+        guard config.modelType == "laguna",
+              config.architectures == nil
+                  || config.architectures == ["DFlashLagunaForCausalLM"],
+              config.hiddenSize == contract.assistant.hiddenSize,
+              config.hiddenSize == contract.assistant.backboneHiddenSize,
+              config.intermediateSize == contract.assistant.intermediateSize,
+              config.numHiddenLayers == contract.assistant.numHiddenLayers,
+              config.numAttentionHeads
+                  == contract.assistant.numAttentionHeads,
+              config.numKeyValueHeads
+                  == contract.assistant.numKeyValueHeads,
+              config.headDim == contract.assistant.headDim,
+              config.rmsNormEps == 1e-6,
+              config.ropeTheta == 500_000,
+              config.slidingWindow == contract.assistant.slidingWindow,
+              config.maxPositionEmbeddings == 262_144,
+              config.attentionBias == nil || config.attentionBias == false,
+              config.gating?.isPerHead ?? true,
+              config.layerTypes == contract.assistant.layerTypes,
+              config.vocabSize == contract.assistant.vocabSize,
+              config.draftVocabSize == contract.assistant.draftVocabSize,
+              config.eagleAuxHiddenStateLayerIDs
+                  == contract.assistant.eagleAuxHiddenStateLayerIDs,
+              config.dflashConfig.blockSize == contract.assistant.blockSize,
+              config.dflashConfig.maskTokenID
+                  == contract.assistant.maskTokenID,
+              config.dflashConfig.numTargetLayers
+                  == contract.assistant.numTargetLayers,
+              config.dflashConfig.targetLayerIDs
+                  == contract.assistant.targetLayerIDs,
+              config.dflashConfig.causal == contract.assistant.causal,
+              config.numExperts == nil || config.numExperts == 0,
+              config.torchDtype == nil
+                  || config.torchDtype == contract.assistant.sourceDtype,
+              config.quantization == nil
+                  || (config.quantization?.bits
+                      == contract.assistant.quantizationBits
+                      && config.quantization?.groupSize
+                          == contract.assistant.quantizationGroupSize
+                      && (config.quantization?.mode ?? "affine") == "affine")
         else {
             throw MLXFastError.invalidInput(
                 "experimental MTP assistant config is incompatible with the pinned target"

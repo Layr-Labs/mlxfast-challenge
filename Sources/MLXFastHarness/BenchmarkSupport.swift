@@ -133,12 +133,12 @@ public enum BenchmarkPreflight {
                 throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
             }
         }
-        let config = try Gemma4Config.load(from: weightsPath)
+        let config = try LagunaConfig.load(from: weightsPath)
 
         let denseStore = try DenseTensorStore(weightsPath: weightsPath)
         try denseStore.validateReadableByteRanges()
 
-        try Gemma4WeightLoader(denseStore: denseStore)
+        try LagunaWeightLoader(denseStore: denseStore)
             .validateRequiredMetadata(config: config)
 
         return BenchmarkPreflightReport(

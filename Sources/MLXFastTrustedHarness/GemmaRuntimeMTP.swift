@@ -552,7 +552,7 @@ extension GemmaRuntime {
             trackID: artifacts.trackID,
             protocolName: "trusted_mtp_block_v1",
             generator:
-                "google_gemma4_trained_mtp_\(measurement.targetVerificationMode)",
+                "poolside_laguna_dflash_mtp_\(measurement.targetVerificationMode)",
             usesTrainedDrafter: true,
             targetModelID: artifacts.targetModelID,
             targetRevision: artifacts.targetRevision,

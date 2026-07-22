@@ -99,6 +99,10 @@ benchmark window / ranked workflow.
 
 ## Context
 
+(Historical: this investigation predates the Laguna XS 2.1 re-pin and
+measured the then-current Gemma pin; the thermal conclusions are
+model-independent.)
+
 - Model: Gemma 4 31B 4-bit, dense, text tower only (~17 GB, fully RAM-resident).
 - Score: `decode_speedup^0.75 * prefill_speedup^0.25`, per-axis 0.95 floors.
 - Scoring uses a **paired baseline**: the pinned reference is built and timed on

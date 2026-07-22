@@ -1,7 +1,7 @@
 public enum MLXFastConstants {
-    public static let referenceModelName = "gemma-4-31b-4bit"
-    public static let defaultReferencePath = "reference_weights/gemma-4-31b-4bit"
-    public static let defaultReferenceCachePath = ".cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main"
+    public static let referenceModelName = "laguna-xs-2.1-4bit"
+    public static let defaultReferencePath = "reference_weights/laguna-xs-2.1-4bit"
+    public static let defaultReferenceCachePath = ".cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main"
     public static let defaultWeightsPath = "weights"
     public static let defaultGoldenPath = "correctness_golden.json"
     public static let defaultPublicCorrectnessPromptPath = "correctness_prompts/public_longcopy_gate_english_512.txt"
@@ -10,11 +10,20 @@ public enum MLXFastConstants {
     public static let defaultScorePath = "score.json"
     public static let defaultLocalIterateScorePath = "score.local-iterate.json"
 
-    public static let vocabSize = 262_144
-    public static let hiddenSize = 5_376
-    public static let intermediateSize = 21_504
-    public static let numHiddenLayers = 60
-    public static let attentionHeads = 32
+    // Frozen text-tower geometry of the pinned Poolside Laguna XS 2.1 4-bit
+    // target (mlx-community/Laguna-XS-2.1-4bit), mirrored from
+    // Sources/MLXFastModel/LagunaConfig.swift's LagunaConstants (MLXFastCore
+    // is trusted and cannot import the editable model target).
+    // `intermediateSize` is the dense MLP width used only by layer 0 -- the
+    // 39 sparse layers use the MoE widths pinned in the track contract.
+    // `attentionHeads` is the checkpoint's top-level `num_attention_heads`
+    // fallback (48); per-layer counts are 48 on full-attention layers
+    // (0, 4, 8, ..., 36) and 64 on the 30 sliding-window layers.
+    public static let vocabSize = 100_352
+    public static let hiddenSize = 2_048
+    public static let intermediateSize = 8_192
+    public static let numHiddenLayers = 40
+    public static let attentionHeads = 48
     public static let correctnessPromptTokens = 512
     // Keep the public gate long enough to catch broad decode regressions while
     // leaving budget for the hidden GPQA behavior checks in the official job.
@@ -30,14 +39,14 @@ public enum MLXFastConstants {
     // Swift/MLX. Semantic GPQA behavior captures a short continuation for the
     // private judge; exact token enforcement stays on the long copy gate and
     // non-semantic behavior fixtures.
-    // 64 (was 10, DeepSeek-era): baseline Gemma 4 31B 4-bit greedy
-    // continuations of the raw (untemplated) hidden GPQA prompts rarely
-    // express the selected option within 10 tokens -- ranked run 28813130022
-    // judged 0/5 on an unmodified baseline. A 2026-07-06 baseline capture at
-    // budgets 10/32/64 confirmed most candidates are cut off mid-sentence and
-    // continue the option list rather than answer; 64 (the
-    // correctnessMaxBehaviorSteps ceiling) gives the judge the most usable
-    // candidate text at ~35s extra decode on the gates machine.
+    // 64 (was 10, DeepSeek-era): historical Gemma-era calibration -- baseline
+    // Gemma 4 31B 4-bit greedy continuations of the raw (untemplated) hidden
+    // GPQA prompts rarely express the selected option within 10 tokens; a
+    // 2026-07-06 baseline capture at budgets 10/32/64 confirmed most
+    // candidates are cut off mid-sentence, and 64 (the
+    // correctnessMaxBehaviorSteps ceiling) gave the judge the most usable
+    // candidate text. TODO(operator): revisit against the Laguna XS 2.1
+    // hidden GPQA regeneration on m5-bench (go-live runbook step B).
     public static let correctnessGPQAMaxNewTokens = 64
     // Semantic judging uses short hidden GPQA answers as a baseline-calibrated
     // gate for optimizations that preserve the exact prefix but damage answer
@@ -49,19 +58,20 @@ public enum MLXFastConstants {
     public static let semanticGPQAMaxNewTokens = 64
     // Baseline-calibrated threshold, recalibrated 2026-07-09 after the hidden
     // GPQA reference object was regenerated on the M5 ranked runner from the
-    // mlx-swift-lm-rebase reference model. Five judged official-runner
-    // baseline observations of unmodified main (tip 3c94f4e) all scored 2/5
-    // with identical per-case verdicts (cases 2 and 3 judged correct every
-    // time): runs 29040771374, 29048752714, 29051462434, 29052276465, and
-    // 29053091705. The threshold is min(observed) - 1 = 1: one judged case of
-    // margin below the stable 2/5 baseline floor absorbs single-case judge
-    // nondeterminism, while a submission that wrecks answer quality (0/5
-    // judged) now fails the gate instead of merely being recorded. The prior
-    // 0 ("aggregate-recording") value came from the pre-regeneration prompts,
-    // where runs 28813130022 and 28817200585 judged the raw-completion Gemma
-    // baseline 0/5. If the hidden prompts or the reference model change
-    // again, a fresh judged official-runner baseline must recalibrate this
-    // threshold.
+    // mlx-swift-lm-rebase reference model (then Gemma 4 31B-IT). Five judged
+    // official-runner baseline observations of unmodified main (tip 3c94f4e)
+    // all scored 2/5 with identical per-case verdicts (cases 2 and 3 judged
+    // correct every time): runs 29040771374, 29048752714, 29051462434,
+    // 29052276465, and 29053091705. The threshold is min(observed) - 1 = 1:
+    // one judged case of margin below the stable 2/5 baseline floor absorbs
+    // single-case judge nondeterminism, while a submission that wrecks answer
+    // quality (0/5 judged) fails the gate instead of merely being recorded.
+    // If the hidden prompts or the reference model change, a fresh judged
+    // official-runner baseline must recalibrate this threshold.
+    // TODO(operator): the Laguna XS 2.1 re-pin changes the reference model
+    // and tokenizer, so the GPQA reference regeneration on m5-bench (go-live
+    // runbook step B) must re-run this judged-baseline calibration before
+    // trusting the threshold for ranked Laguna runs.
     public static let semanticGPQAMinPassCount = 1
     public static let benchmarkPrefillPromptTokens = 512
     // Stable public identifier for the private timed-evaluation prompt. The
@@ -88,8 +98,12 @@ public enum MLXFastConstants {
     // oracle length.
     public static let experimentalMTPMaxTotalTokens = 128
     // Trusted-parent configured experimental runs may exercise longer tail
-    // boundaries when the selected oracle contains enough tokens.
-    public static let experimentalMTPMaxConfiguredTotalTokens = 512
+    // boundaries when the selected oracle contains enough tokens. 1,536 is
+    // the laguna-xs-2.1-mtp-v1 contract's `maximum_decode_tokens`: it keeps
+    // the untimed correctness legs able to wrap Laguna's 512-position
+    // sliding-window cache (3x the window) while ranked timed decode stays
+    // fixed at 512 by the workflow env.
+    public static let experimentalMTPMaxConfiguredTotalTokens = 1_536
     public static let localIterateBenchmarkDecodeSteps = 16
     // Local submit uses a longer public fixture so the Yukon pre-submit hook
     // exercises one continuous decode trajectory for about ten minutes instead
@@ -126,18 +140,24 @@ public enum MLXFastConstants {
     public static let prefillBandDownTolerance = 0.05
     public static let decodeBandUpTolerance = 0.02
     public static let decodeBandDownTolerance = 0.05
-    // CACHED Gemma 4 31B 4-bit dense baseline. Calibration provenance: the
-    // live M5 paired baseline as of 2026-07-12 -- the mean of the
-    // `baseline_decode_seconds_per_token` / `baseline_prefill_seconds_per_token`
-    // fields published by 12 consecutive successful ranked runs on the
-    // self-hosted M5 Max (m5-bench), runs 29179374395 through 29197772284
-    // (each field is measure-job's on-box timing of the pinned reference tree
-    // in that run's session): decode clustered 0.04401-0.04411 (CV 0.08%),
-    // prefill 0.001618-0.001626 (CV 0.17%). Supersedes the retired
-    // tenki-macos-latest-xlarge VM-era values (prefill 0.010605031949609375 /
-    // decode 0.1336139485703125, 2026-07-07), which were ~6.5x / ~3.0x slower
-    // than the M5 and inflated local score estimates to ~3.7 for code that
-    // ranks ~1.0.
+    // CACHED serial baseline, still the GEMMA 4 31B 4-bit dense calibration.
+    // Calibration provenance: the live M5 paired baseline as of 2026-07-12 --
+    // the mean of the `baseline_decode_seconds_per_token` /
+    // `baseline_prefill_seconds_per_token` fields published by 12 consecutive
+    // successful ranked runs on the self-hosted M5 Max (m5-bench), runs
+    // 29179374395 through 29197772284 (each field is measure-job's on-box
+    // timing of the pinned reference tree in that run's session): decode
+    // clustered 0.04401-0.04411 (CV 0.08%), prefill 0.001618-0.001626 (CV
+    // 0.17%). Supersedes the retired tenki-macos-latest-xlarge VM-era values
+    // (prefill 0.010605031949609375 / decode 0.1336139485703125, 2026-07-07),
+    // which were ~6.5x / ~3.0x slower than the M5 and inflated local score
+    // estimates to ~3.7 for code that ranks ~1.0.
+    //
+    // TODO(operator): STALE FOR LAGUNA XS 2.1. These literals were measured
+    // against the Gemma reference tree; the Laguna re-baseline on m5-bench
+    // (go-live runbook steps B-C) must re-measure them (and update
+    // docs/benchmark-window-freeze.md, which quotes the exact literals)
+    // before local-mode score estimates mean anything for the new target.
     //
     // These constants are NOT the ranked scoring denominator. The ranked runner
     // is the single self-hosted M5 Max (m5-bench), where measure-job times the
@@ -154,9 +174,10 @@ public enum MLXFastConstants {
     public static let scoreDecodeWeight = 0.75
     public static let scorePrefillSpeedupFloor = 0.95
     public static let scoreDecodeSpeedupFloor = 0.95
-    // The Gemma 4 31B 4-bit text tower is ~17 GB; 25 GiB keeps ample headroom
-    // for shard alignment/padding without approving a second full copy of the
-    // model.
+    // The Laguna XS 2.1 4-bit text tower is ~19 GB; 25 GiB keeps ample
+    // headroom for shard alignment/padding without approving a second full
+    // copy of the model. (The MTP track contract enforces its own tighter
+    // 20 GiB `maximum_transformed_bytes` cap separately.)
     public static let defaultMaxTransformedWeightsBytes = 25 * 1024 * 1024 * 1024
     public static let defaultMaxSubmissionSourceBytes = 256 * 1024 * 1024
     // Diagnostic (non-ranking) real-valued score fields are published rounded to

@@ -1,8 +1,9 @@
-# mlxfast — Gemma 4 31B-IT MTP
+# mlxfast — Poolside Laguna XS 2.1 MTP
 
 A benchmark arena for compute-optimal LLM inference on Apple Silicon.
-Run Gemma 4 31B-IT with Google's matched trained assistant, verify every
-returned token against the target model, and make block decode faster.
+Run Poolside Laguna XS 2.1 with Poolside's matched trained DFlash speculator,
+verify every returned token against the target model, and make block decode
+faster.
 
 See [TASK.md](TASK.md) for the full problem statement, scoring formula, and
 approach space.
@@ -13,7 +14,7 @@ approach space.
 # Build the Swift/Metal runtime without downloading the legacy base checkpoint.
 MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
 
-# Download and verify the pinned 31B-IT target and trained assistant.
+# Download and verify the pinned Laguna target and trained DFlash assistant.
 ./setup-mtp.sh
 
 # Directional local MTP-vs-serial control (64 decoded tokens).
@@ -26,7 +27,7 @@ MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
 The local wrapper generates a temporary serial oracle from the current
 candidate, then requires the trained-assistant path to match it exactly. That
 is useful for parity and speed direction but is not an official correctness
-oracle. Ranked runs use organizer-pinned M5 goldens from the frozen 31B-IT
+oracle. Ranked runs use organizer-pinned M5 goldens from the frozen Laguna
 target; one divergent token fails the run.
 
 ### Legacy serial local setup
@@ -35,16 +36,20 @@ The archived serial track (`benchmark.serial.json` and
 `serial-benchmark.yml`) still uses the following base checkpoint and local
 commands. Full model setup needs a moderate local SSD. The reference
 checkpoint is
-`mlx-community/gemma-4-31b-4bit`, with 4 safetensors shards totaling about
-18.4 GB. `setup.sh` downloads the checkpoint from the Darkbloom R2 mirror
-(`https://ds4.darkbloom.ai/gemma-4-31b-4bit`) by default, with up to 3 shard
+`mlx-community/Laguna-XS-2.1-4bit`, with 4 safetensors shards totaling about
+18.8 GB. `setup.sh` downloads the checkpoint from the pinned Hugging Face
+revision by default (no organizer mirror exists yet for this checkpoint),
+with up to 3 shard
 downloads in parallel (`MLXFAST_REFERENCE_DOWNLOAD_JOBS`), into a shared
 Hugging Face-style cache under
-`~/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main/`
+`~/.cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main/`
 (in `$HOME` by default so parallel clones reuse one checkpoint).
-It verifies cached files against `fixtures/reference_gemma_4_31b_4bit.sha256`
-and redownloads only files that are missing, truncated, or hash-mismatched. A
-compatibility symlink is created at `reference_weights/gemma-4-31b-4bit`
+It verifies cached files against `fixtures/reference_laguna_xs_2_1_4bit.sha256`
+and redownloads only files that are missing, truncated, or hash-mismatched.
+(The checked-in Laguna weight manifests are entry-less placeholders until the
+operator regenerates them on m5-bench; setup fails closed on an entry-less
+manifest, so use `MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1` until then.) A
+compatibility symlink is created at `reference_weights/laguna-xs-2.1-4bit`
 for older commands, but current setup and CI pass the canonical cache directory
 to transform explicitly. The downloader uses resumable `curl` requests, prints
 numbered shard progress with elapsed time, and checks for at least 40 GiB free
@@ -53,7 +58,7 @@ by default. After a full SHA-256 verification, setup writes
 cheap size/mtime checks against that lock and skip the full hash pass
 when the cache is unchanged. Use
 `MLXFAST_REFERENCE_CACHE_DIR=/Volumes/ssd/hf-cache/.../snapshots/main` or
-`MLXFAST_REFERENCE_DIR=/Volumes/ssd/gemma-4-31b-4bit` to point at a larger
+`MLXFAST_REFERENCE_DIR=/Volumes/ssd/laguna-xs-2.1-4bit` to point at a larger
 volume, or `MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh` when the checkpoint will
 be supplied separately. If you use a custom cache path, either copy the exact
 transform command printed by `setup.sh` or set `MLXFAST_REFERENCE_DIR` before
@@ -64,10 +69,10 @@ explicit CLI flags take precedence. For `benchmark.sh`, use those `MLXFAST_*`
 environment variables for path overrides; pass `--weights`, `--golden`, and
 `--score-path` only to `.build/release/mlxfast-swift benchmark` directly. Set
 `MLXFAST_REFERENCE_BASE_URL` to use
-another HTTP checkpoint prefix (for example
-`https://huggingface.co/mlx-community/gemma-4-31b-4bit/resolve/main` to fetch
-from Hugging Face instead of the R2 mirror; both serve the same
-manifest-pinned files), and `MLXFAST_REFERENCE_AUTH_HEADER` to pass an auth
+another HTTP checkpoint prefix (for example a future operator mirror serving
+the same manifest-pinned files as
+`https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit`),
+and `MLXFAST_REFERENCE_AUTH_HEADER` to pass an auth
 header to a private checkpoint endpoint. Run `./setup.sh --help`
 for the full local setup knobs.
 
@@ -78,7 +83,7 @@ for the full local setup knobs.
 ### Ranked MTP workflow
 
 Yukon dispatches `.github/workflows/benchmark.yml`, the default MTP workflow.
-It validates the pinned 31B-IT target and organizer-owned QAT assistant,
+It validates the pinned Laguna target and organizer-owned DFlash assistant,
 builds and transforms submitted code in the sandbox, and replays a hidden
 512-token correctness golden through trained-assistant block decode. The
 trusted parent accepts only a target-confirmed prefix and compares every
@@ -93,20 +98,22 @@ score = mean(serial_K1_seconds_per_token) / mean(MTP_seconds_per_token)
 
 The hard floor is `1.0`; parity failure, invalid cache rollback, throttling,
 or invalid telemetry fails the run. `score.json` carries
-`track_id=gemma4-31b-it-mtp-v1`. See
+`track_id=laguna-xs-2.1-mtp-v1`. See
 [`docs/experimental-mtp-track.md`](docs/experimental-mtp-track.md) for the
 protocol and [`docs/private-benchmark-security.md`](docs/private-benchmark-security.md)
 for isolation details.
 
 ## Why this challenge exists
 
-Gemma 4 31B is a dense (non-MoE) text+vision model; only the text tower is in
-scope here. In 4-bit the text tower is about 17 GB, small enough to load
+Poolside Laguna XS 2.1 is a fine-grained MoE text model (256 routed experts
+plus one shared expert per sparse layer, 8 experts per token, per-head
+gating); only the text tower (`language_model.` tensors) is in scope here. In
+MLX affine 4-bit the checkpoint is about 18.8 GB, small enough to load
 entirely into unified memory once at process startup on the official runner
 (a self-hosted Apple M5 Max with 128 GB of unified memory, runner label
 `m5-bench`). MTP keeps the target, assistant, target KV, shared K/V, and
 verification activations resident together; 64 GiB is the practical local
-minimum. The archived serial track can still run on roughly 36 GiB. There is
+minimum. There is
 no weight streaming: the target is RAM-resident before scored decode.
 
 The optimized runtime also has alternate combined/co-tiled weight layouts that
@@ -121,39 +128,46 @@ with `DARKBLOOM_STARTUP_MEMORY_PROFILE=full|low`. This changes local speed
 only; the 128 GB ranked runner keeps the full optimized profile.
 
 That does not mean there is nothing left to optimize. Attention alternates
-five sliding-window layers (1024-token window, GQA with 16 KV heads) with one
-full-attention layer per block (GQA with 4 KV heads, a shared K/V projection,
-and a partial-rotation "proportional" RoPE), every projection is affine 4-bit
-quantized (group size 64), and the whole forward pass runs through MLX's
-kernel scheduler on every decode step. Kernel selection, quantized matmul
-dispatch, KV-cache handling, attention masking, and MLX graph/scheduling
+three sliding-window layers (512-token window, 64 heads) with one
+full-attention layer per block of four (48 heads, YaRN rotary with a 0.5
+partial-rotary factor; sliding layers use plain RoPE at theta 10000). All
+layers are GQA with 8 KV heads at head_dim 128. Layer 0 has a dense MLP
+(intermediate 8192); every other layer routes tokens through 8 of 256
+experts plus a shared expert (per-head gating, MoE intermediate 512).
+Projections are affine 4-bit quantized (group size 64; the per-layer MoE
+router gates are 8-bit), embeddings are untied, and the whole forward pass
+runs through MLX's kernel scheduler on every decode step. Kernel selection,
+quantized matmul
+dispatch, MoE expert gathering, KV-cache handling, attention masking, and MLX
+graph/scheduling
 overhead are all optimisation targets — and so are the vendored MLX Metal
 kernels themselves, which are now part of the editable surface (see "The
 modifiable surface" below). The generated `weights/` tree is
 expected to stay small: it is a runtime artifact overlay on top of the frozen
 reference checkpoint (a straight text-tensor subset plus a runtime-authored
 `config.json`), not a second full model copy. Submissions may change the
-Swift transform, the Swift runtime, and the vendored Gemma 4 model and
+Swift transform, the Swift runtime, and the vendored Laguna model and
 kernel sources, as long as the generated runnable artifacts pass the hidden
 correctness and benchmark checks.
 
 ## The modifiable surface
 
 Unlike typical inference benchmarks, the entire model execution pipeline is
-in scope — including the vendored Gemma 4 model code and the MLX Metal
+in scope — including the vendored Laguna model code and the MLX Metal
 kernels it runs on. The authoritative list is `editablePaths` in
-`benchmark.json` (currently 66 entries), in four groups:
+`benchmark.json` (currently 77 entries), in four groups:
 
 | Path | What it controls |
 |---|---|
-| `Sources/MLXFastModel/` | Gemma 4 31B-IT target runtime, trained-assistant block session, exact-pair verification, MLX Swift array bridge, attention, and KV-cache logic. **Primary target.** |
+| `Sources/MLXFastModel/` | Laguna XS 2.1 target runtime, trained-assistant block session, exact-pair verification, MLX Swift array bridge, attention, and KV-cache logic. **Primary target.** |
 | `Sources/MLXFastTransform/` | Offline target transform into benchmark-ready `mtp-weights/`. |
-| `Vendor/mlx-swift-lm/Libraries/` (listed files) | The vendored Gemma 4 model implementation (`MLXLLM/Models/Gemma4Text.swift`, `Gemma4MTP.swift`, `Gemma4MTPTarget.swift`) plus the `MLXLMCommon` plumbing it uses directly (KV caches, RoPE utilities/application, compiled decode, evaluation). |
-| `Vendor/mlx-swift/Source/Cmlx/` (listed files) | The MLX Metal kernels Gemma 4 dispatches — SDPA/`sdpa_vector`, affine-quantized matmul (incl. `_nax`), `steel/gemm`, `gemv`, `rope`, `rms_norm`, `softmax`, `copy`, elementwise, `arg_reduce`, gather indexing — as AOT `.metal`/`.h` sources and their JIT `mlx-generated/*.cpp` twins. |
+| `Vendor/mlx-swift-lm/Libraries/` (listed files) | The vendored Laguna model implementation (`MLXLLM/Models/Laguna.swift`, `LagunaMTP.swift`, `LagunaMTPTarget.swift`) plus the `MLXLMCommon` plumbing it uses directly (KV caches, RoPE utilities/application, compiled decode, evaluation). |
+| `Vendor/mlx-swift/Source/Cmlx/` (listed files) | The MLX Metal kernels Laguna dispatches — SDPA (`steel/attn`, `sdpa_vector`), affine-quantized matmul (incl. `_nax` and the `fp_quantized` families), MoE gather GEMM (`steel_gemm_gather*`), `steel/gemm`, `gemv`, `rope`, `rms_norm`, `softmax`, `copy`, elementwise, `arg_reduce`, gather indexing — as AOT `.metal`/`.h` sources and their JIT `mlx-generated/*.cpp` twins. |
 
 Two build forms matter for kernel edits, because the vendored MLX package
-builds in JIT mode. Families with an `mlx-generated/*.cpp` twin (quantized,
-steel/gemm, gemv, softmax, copy, elementwise, gather) are compiled at
+builds in JIT mode. Families with an `mlx-generated/*.cpp` twin (quantized
+incl. `fp_quantized`, steel/gemm incl. the gather GEMM, steel/attn, gemv,
+softmax, copy, elementwise, gather) are compiled at
 runtime from the C++ source strings embedded in those files — the twin is
 the runtime-effective source, so edit it (and keep the readable
 `.metal`/`.h` pair in sync). RoPE, RMSNorm, the SDPA vector kernel, and
@@ -171,8 +185,8 @@ Participant model and kernel code — `MLXFastModel` plus the vendored forks
 links no MLX, model, or kernel code, and drives the worker over a JSON
 protocol. `Package.swift`/`Package.resolved` and the dependency graph are
 frozen, and the rest of the vendored forks (other model families, shared
-factory/tokenizer plumbing, kernels Gemma 4 does not dispatch such as
-`steel/attn`) stay non-editable. Kernel changes are bound by the same
+factory/tokenizer plumbing, and kernels Laguna does not dispatch) stay
+non-editable. Kernel changes are bound by the same
 hidden correctness gates as model changes: keep them prompt-independent and
 model-general, and be conservative with numeric reassociation, which can
 flip near-tie greedy argmaxes on the M5.
@@ -235,7 +249,7 @@ Use these MTP modes for local development:
 | `./benchmark-mtp.sh --local-iterate` | Fast directional edit loop. | Candidate-local serial oracle, 64 exact tokens, trained assistant, exact-pair verification. | `score.json` with local MTP speedup. |
 | `./benchmark-mtp.sh --local-submit` | Longer pre-submit signal. | Same checks over 128 exact tokens. | `score.json` with local MTP speedup. |
 
-Both modes transform the pinned IT target, generate a temporary oracle from
+Both modes transform the pinned Laguna target, generate a temporary oracle from
 the current candidate, run serial K=1 and trained-assistant exact-pair decode,
 and publish their ratio. The generated oracle deliberately cannot establish
 official target fidelity; only the hidden M5 golden can do that. The archived
@@ -275,19 +289,19 @@ Sources/
   MLXFastCLI/                trusted CLI entrypoint (mlxfast-swift)
   MLXFastCore/               score.json, golden cases, shared contracts
   MLXFastTransform/          editable Swift offline weight transform
-  MLXFastModel/              editable Gemma 4 31B 4-bit Swift runtime
+  MLXFastModel/              editable Laguna XS 2.1 4-bit Swift runtime
   MLXFastTrustedHarness/     trusted correctness, golden, and benchmark runner
   MLXFastHarness/            worker-side runtime support (builds into the worker)
   MLXFastRuntimeWorkerCLI/   sandboxed participant worker (mlxfast-runtime-worker)
 Vendor/
   mlx-swift/                 pinned MLX fork; the listed kernel sources are editable
-  mlx-swift-lm/              pinned mlx-swift-lm fork; the Gemma 4 model files are editable
+  mlx-swift-lm/              pinned mlx-swift-lm fork; the Laguna model files are editable
 weights/                     transformed weights (harness loads from here)
   config.json                 runtime-authored text-tower config
   model.safetensors.index.json
 ~/.cache/huggingface/hub/... canonical frozen 4-bit reference checkpoint cache
 reference_weights/...        compatibility symlink to the reference cache
-correctness_prompts/         public correctness prompt and checked-in Gemma-generated golden
+correctness_prompts/         public correctness prompt and checked-in golden (legacy Gemma-generated; regenerate for Laguna on m5-bench)
 correctness_golden.json      hidden benchmark correctness cases
 score.json                   written after each benchmark run
 ```
@@ -299,7 +313,7 @@ runtime (only the offline transform reads the reference checkpoint).
 
 The standard preflight/benchmark path enforces a default 25 GiB cap on the
 generated `weights/` tree before correctness or timing runs (the text tower is
-about 17 GB, comfortably inside that cap). Change it with
+about 18.8 GB, comfortably inside that cap). Change it with
 `MLXFAST_MAX_WEIGHTS_BYTES`; use `0`, `none`, or `unlimited` only for organizer
 debugging. For stricter organizer-side provenance, set
 `MLXFAST_VERIFY_TRANSFORM=1` when running `benchmark.sh`. That re-runs the
@@ -313,16 +327,20 @@ uses the same default cap and can also be changed with
 
 The archived serial track's public correctness prompt and golden live in
 `correctness_prompts/`.
-These fixtures are generated on the ranked M5 hardware against the Gemma 4
-31B 4-bit reference: the prompt text is tokenized with the Gemma tokenizer
+These fixtures are generated on the ranked M5 hardware against the 4-bit
+reference: the prompt text is tokenized with the target tokenizer
 (512 prompt tokens) and the expected tokens are greedy reference
 continuations captured with `mlxfast-swift generate-golden` (256 tokens for
-local-iterate, 1024 for local-submit). Private prompt manifests and hidden
+local-iterate, 1024 for local-submit). The checked-in fixtures are still the
+legacy Gemma-generated ones; they must be regenerated on m5-bench with the
+Laguna tokenizer (vocab 100352) and model before the serial track can gate
+Laguna code. Private prompt manifests and hidden
 benchmark golden files are not committed or generated by the benchmark
 workflow. In private benchmark CI, the normal path downloads the precomputed
-`correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json`
-object from R2, then downloads
-`correctness_prompts/gpqa_reference_cases-gemma.json` and merges it into the
+`correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json`
+object from R2 (rotated from the former `-gemma` name by the Laguna
+regeneration), then downloads
+`correctness_prompts/gpqa_reference_cases-laguna.json` and merges it into the
 local golden as 5 hidden GPQA behavior checks. Generate
 final hidden benchmark goldens outside the public repository and upload the
 resulting file to the protected private R2 path. `serial-benchmark.yml` keeps
@@ -366,21 +384,21 @@ tokenizer whitespace variants.
 
 ## License and attribution
 
-This repository's harness code is licensed per [LICENSE](LICENSE). The Gemma 4
-models the harness downloads and benchmarks (Gemma 4 31B, Gemma 4 31B-IT, and
-the Gemma 4 31B-IT assistant, © Google DeepMind, plus the mlx-community 4-bit
-conversions) are Apache-2.0 with usage terms at
-<https://ai.google.dev/gemma/docs/gemma_4_license>; no model weights are
+This repository's harness code is licensed per [LICENSE](LICENSE). The
+Poolside Laguna models the harness downloads and benchmarks
+(Laguna XS 2.1 and the Laguna XS 2.1 DFlash speculator, © Poolside, plus the
+mlx-community 4-bit conversion) are licensed OpenMDW-1.1 with terms at
+<https://huggingface.co/poolside/Laguna-XS-2.1>; no model weights are
 distributed in this repository. Full third-party attribution — models,
 linked Swift packages, and the Apache-2.0 text — is in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Requirements
 
-- Apple Silicon Mac, 36 GB+ unified memory (enough to hold the ~17 GB text
-  tower plus KV cache and buffers; the ranked runner is a single self-hosted
-  Apple M5 Max with 128 GB, so local timings — and, on non-M5 machines,
-  near-tie greedy tokens — are directional only)
+- Apple Silicon Mac, 64 GB+ unified memory recommended for MTP (enough to
+  hold the ~18.8 GB target plus assistant, KV cache, and buffers; the ranked
+  runner is a single self-hosted Apple M5 Max with 128 GB, so local timings —
+  and, on non-M5 machines, near-tie greedy tokens — are directional only)
 - macOS Sequoia or later
 - Swift 6 through Xcode or Xcode Command Line Tools
 - Xcode Metal Toolchain for `mlx.metallib`; `./setup.sh` tries

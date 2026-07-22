@@ -1,15 +1,16 @@
 # MLXFast Challenge Agent Guide
 
-This repository is the Swift-only Gemma 4 31B 4-bit dense inference
+This repository is the Swift-only Poolside Laguna XS 2.1 4-bit MoE inference
 optimization challenge.
 Use this file as the working contract for coding agents and participants.
 
 ## Goal
 
-Optimize Gemma 4 31B 4-bit (text tower only) inference on Apple Silicon without
+Optimize Poolside Laguna XS 2.1 4-bit (text tower only) inference on Apple
+Silicon without
 changing the observable model behavior required by the correctness gates.
 
-The default official track is `gemma4-31b-it-mtp-v1`. It rewards faster
+The default official track is `laguna-xs-2.1-mtp-v1`. It rewards faster
 trained-assistant block decode against a paired serial K=1 target baseline:
 
 ```text
@@ -37,8 +38,9 @@ The box is operator-supervised: each ranked job runs on a fresh ephemeral
 runner registration, every invocation of submitted code (build, transform,
 correctness, benchmark) executes sandboxed, and the machine's protected
 surface is integrity-audited between jobs — drift quarantines the box instead
-of publishing a score. The default pipeline validates the pinned IT target and
-assistant, builds and transforms, replays the hidden MTP correctness golden,
+of publishing a score. The default pipeline validates the pinned Laguna target
+and DFlash assistant, builds and transforms, replays the hidden MTP
+correctness golden,
 then runs at least three accepted alternating serial/MTP timing pairs. Every
 timed phase starts only once the GPU has cooled below a fixed 40C gate and
 rejects throttled or telemetry-invalid measurements. See
@@ -47,17 +49,21 @@ rejects throttled or telemetry-invalid measurements. See
 Because the candidate and the pinned reference are measured back to back on
 the same silicon behind the same thermal gate, the paired speedup ratio
 cancels host drift; the score is that ratio, not a comparison against a
-stored constant. Gemma 4 31B 4-bit is a dense model: the text tower is about
-17 GB in 4-bit, fully RAM-resident on the ranked box — the runtime loads
-every text-tower tensor once during untimed initialization and keeps it
+stored constant. Laguna XS 2.1 4-bit is a fine-grained MoE model (256 routed
+experts plus one shared expert per sparse layer, 8 experts per token,
+per-head gating; layer 0 is a dense MLP): the text tower is about
+18.8 GB in 4-bit, fully RAM-resident on the ranked box — the runtime loads
+every text-tower tensor, including all experts, once during untimed
+initialization and keeps it
 resident for the whole process lifetime. There is no weight streaming of any
 kind, no expert cache, and no disk I/O on the scored prefill/decode path.
 Optimization effort should go into compute — attention kernels
-(sliding-window vs. full-attention dispatch, GQA, partial-rotary RoPE),
-quantized matmul dispatch, KV-cache handling, memory layout, and MLX
+(sliding-window vs. full-attention dispatch, GQA, YaRN partial-rotary RoPE on
+full-attention layers), quantized matmul and MoE gather-GEMM dispatch,
+KV-cache handling, memory layout, and MLX
 scheduling — not disk I/O.
 
-Local MTP work needs enough unified memory for the ~17 GB target, assistant,
+Local MTP work needs enough unified memory for the ~18.8 GB target, assistant,
 KV state, and verification buffers; 64 GiB is the practical local minimum.
 The archived serial track can still run at roughly 36 GiB.
 Machines below 64 GiB automatically use a low-memory startup profile: retained
@@ -79,36 +85,38 @@ official benchmark for ranking.
 ## What You May Optimize
 
 The submitted editable surface is defined by `editablePaths` in
-`benchmark.json` — that list (currently 66 entries) is the source of truth.
+`benchmark.json` — that list (currently 77 entries) is the source of truth.
 It covers four groups:
 
 ```text
-Sources/MLXFastModel/     Gemma 4 runtime glue, custom kernels, decode path
+Sources/MLXFastModel/     Laguna runtime glue, custom kernels, decode path
 Sources/MLXFastTransform/ offline weight transform
-Vendor/mlx-swift-lm/      the Gemma 4 model files + MLXLMCommon plumbing
-Vendor/mlx-swift/         the MLX Metal kernels Gemma 4 dispatches
+Vendor/mlx-swift-lm/      the Laguna model files + MLXLMCommon plumbing
+Vendor/mlx-swift/         the MLX Metal kernels Laguna dispatches
 ```
 
-The vendored model surface is `Libraries/MLXLLM/Models/Gemma4Text.swift`,
-`Gemma4MTP.swift`, and `Gemma4MTPTarget.swift`, plus the `MLXLMCommon` files
+The vendored model surface is `Libraries/MLXLLM/Models/Laguna.swift`,
+`LagunaMTP.swift`, and `LagunaMTPTarget.swift`, plus the `MLXLMCommon` files
 they use directly (KV caches, RoPE utilities and application, compiled
 decode, evaluation plumbing; the exact file list is in `benchmark.json`).
 
-The vendored kernel surface is the kernel families the Gemma 4 forward pass
+The vendored kernel surface is the kernel families the Laguna forward pass
 actually dispatches — SDPA (`scaled_dot_product_attention.metal`,
-`sdpa_vector.h`), affine-quantized matmul (`quantized*` including the `_nax`
-variants), `steel/gemm/`, `gemv`, `rope`, `rms_norm`, `softmax`, `copy`,
+`sdpa_vector.h`, and `steel/attn/` with its `steel_attention*.cpp` twins:
+Laguna's head dim is 128, so the fused steel attention kernels are
+dispatchable at prefill), affine-quantized matmul (`quantized*` and
+`fp_quantized*` including the `_nax`
+variants), the MoE gather GEMM (`steel_gemm_gather*.cpp`), `steel/gemm/`,
+`gemv`, `rope`, `rms_norm`, `softmax`, `copy`,
 elementwise (`unary`/`binary`/`ternary`), `arg_reduce`, and gather indexing
 — in both forms the build uses: the AOT `.metal`/`.h` sources under
 `Vendor/mlx-swift/.../backend/metal/kernels/` and their JIT twins under
-`Vendor/mlx-swift/Source/Cmlx/mlx-generated/*.cpp`. (`steel/attn` is not
-included: its dispatch requires head dim 64/80/128 and this Gemma 4 runs
-256/512, so prefill attention always executes the composite `steel/gemm` +
-`softmax` path — which is editable.)
+`Vendor/mlx-swift/Source/Cmlx/mlx-generated/*.cpp`.
 
 Know how a kernel edit becomes the running kernel. The vendored MLX Swift
 package builds in JIT mode: families with an `mlx-generated/*.cpp` twin
-(quantized, steel/gemm, gemv, softmax, copy, elementwise, gather) are
+(quantized incl. fp_quantized, steel/gemm incl. the gather GEMM, steel/attn,
+gemv, softmax, copy, elementwise, gather) are
 compiled at runtime from the C++ source strings embedded in those files, so
 for them the twin is the runtime-effective source — editing only the
 `.h`/`.metal` form does not change what runs; edit the pair together.
@@ -134,25 +142,30 @@ Focus on:
  without changing the serial K=1 accumulation order.
 - Optimizing the vendored Metal kernels on the decode and exact-pair paths.
 - Optimizing kernels and hot-path MLX operations used by attention (both the
- sliding-window and full-attention layer types), the gated MLP, KV-cache
- handling, and dense weight materialization.
+ sliding-window and full-attention layer types), the MoE MLP (routing,
+ expert gather GEMM, shared expert), KV-cache
+ handling, and weight materialization.
 - Reducing model execution work on the hot path: MLX ops, synchronization,
  materialization, copies, and cache misses.
-- Improving how RAM-resident dense weight bytes become MLXArrays (quantized
+- Improving how RAM-resident weight bytes become MLXArrays (quantized
  linear construction, fewer copies, lazier Data-to-Metal conversions).
 - Making the offline transform produce better runtime metadata or compact
  transformed artifacts.
 - Improving seed prefill and block decode inside the Swift/MLX model path.
 
-The target is Gemma 4 31B-IT, dense, 4-bit, text tower only (vision/audio are
-out of scope and are never loaded). The frozen target checkpoint is about
-18.4 GB across 4 safetensors shards; `setup-mtp.sh` also provisions the
-matched ~939 MB assistant and verifies both against pinned manifests. The
+The target is Poolside Laguna XS 2.1, MoE, 4-bit (untied embeddings, vocab
+100352), text tower only (the empty `vision_config` is out of scope and never
+loaded). The frozen target checkpoint is about
+18.8 GB across 4 safetensors shards; `setup-mtp.sh` also provisions the
+matched DFlash speculator (the 924,135,848-byte BF16 upstream, converted to
+MLX affine 4-bit group-64 at setup) as the assistant and verifies both
+against pinned manifests. The
 transformed `mtp-weights/` tree holds only the text-tower tensors
 (everything under the source checkpoint's `language_model.` prefix) plus a
 runtime-authored `config.json`; it is an overlay/runtime artifact, not a
 second full copy of the model. Aim to keep generated transformed weights under
-20 GB (the default cap is 25 GiB).
+20 GB (the default cap is 25 GiB; the MTP contract caps transformed output at
+20 GiB).
 
 ## What Not To Change
 
@@ -165,8 +178,8 @@ They are trusted harness/operator code and are not packaged by submit:
 - `Package.swift` and `Package.resolved` — the dependency graph is frozen
  (the vendored forks are consumed as pinned local path dependencies)
 - Everything in `Vendor/` not listed in `editablePaths`: other model
- families, shared model-factory/tokenizer plumbing, and kernels Gemma 4
- does not dispatch (including `steel/attn`)
+ families, shared model-factory/tokenizer plumbing, and kernels Laguna
+ does not dispatch
 - `.github/`, scripts, tests, docs, and all `benchmark*.json` manifests
 - `weights/`, reference checkpoints, scores, golden files, local caches
 
@@ -184,7 +197,7 @@ use the Yukon CLI (`mlxfast`).
 
 Correctness is a hard gate. Local MTP runs generate their oracle from the
 current candidate, so they prove block/serial parity only. They do not prove
-fidelity to the pinned 31B-IT target. The ranked M5 runner is the authority.
+fidelity to the pinned Laguna target. The ranked M5 runner is the authority.
 
 The official correctness stack includes:
 
@@ -208,8 +221,8 @@ telemetry validation.
 
 Diagnostic fields such as memory and read timings are recorded for audit and
 future guardrails, but are not the primary score unless the benchmark contract
-changes. There is no expert/weight-streaming bandwidth to report for this
-dense model: `bandwidth_gb_per_token` is always `0` with
+changes. There is no expert/weight-streaming bandwidth to report — every
+routed expert is RAM-resident: `bandwidth_gb_per_token` is always `0` with
 `bandwidth_source=ram_resident_model`. Do not optimize for that diagnostic
 field as a standalone target; optimize changes that reduce the measured
 MTP decode time.
@@ -249,9 +262,9 @@ MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
 ```
 
 This checks the local Swift/Xcode toolchain, builds the Swift harness and MLX
-Metal library, then downloads and verifies the pinned Gemma 4 31B-IT target
-and trained assistant. The MTP cache defaults under
-`~/.cache/mlxfast/gemma4-31b-it-mtp-v1`; override it with
+Metal library, then downloads and verifies the pinned Laguna XS 2.1 target
+and trained DFlash assistant. The MTP cache defaults under
+`~/.cache/mlxfast/laguna-xs-2.1-mtp-v1`; override it with
 `MLXFAST_MTP_CACHE_ROOT`.
 
 Common commands:
@@ -324,7 +337,7 @@ behaviors are expected, not bugs:
  is the source of truth.
 - **Know the runnable surface.** Only the `benchmark.json` `editablePaths`
  entries ship in a submission: `Sources/MLXFastModel/`,
- `Sources/MLXFastTransform/`, the vendored Gemma 4 model and `MLXLMCommon`
+ `Sources/MLXFastTransform/`, the vendored Laguna model and `MLXLMCommon`
  files, and the listed vendored kernel sources (both AOT `.metal`/`.h`
  and JIT `mlx-generated/*.cpp` forms); changes anywhere else will not
  upload even if they help locally. Official MTP ranking requires hidden
@@ -332,7 +345,7 @@ behaviors are expected, not bugs:
  `./benchmark-mtp.sh --local-iterate` for the edit loop and
  `--local-submit` as the recommended pre-submit check.
 - **One local run at a time; the memory guard is protecting your RAM.** The
- ~17 GB RAM-resident text tower means two simultaneous model residencies
+ ~18.8 GB RAM-resident text tower means two simultaneous model residencies
  (an overlapping second local run, or a new run started while an orphaned
  model-holding worker from an aborted run lingers) can out-of-memory a
  local machine. A single worker is separately protected by the automatic
@@ -408,22 +421,23 @@ submitting — the official M5 run is the gate that ranks the submission.
 Good submissions are likely to improve one or more of:
 
 - Trained-assistant drafting, target-confirmed-prefix handling, exact-pair
- verification, rollback, and shared K/V reuse inside
- `Gemma4TrainedMTPBlockSession` and `Gemma4ExactTwo*.swift`.
+ verification, rollback, and shared K/V reuse inside the trained-MTP block
+ session and behavior-exact pair kernels in `Sources/MLXFastModel/`.
 - Kernel-level optimization inside the vendored Metal sources, now that
  they are editable. Prioritize kernels reached by block decode, target
  exact-pair verification, and the assistant. For the JIT families, edit the
  `mlx-generated/*.cpp` twin — that string is what compiles at runtime.
 - Attention kernel dispatch: sliding-window vs. full-attention masking, GQA
- head-group broadcasting, and the full-attention layers' partial-rotary
- ("proportional") RoPE.
-- Quantized matmul dispatch for the affine 4-bit (group size 64) dense
- projections: fewer dequantize/copy steps, better batching across the gated
- MLP's `gate_proj`/`up_proj`, and reuse of derived weight views.
-- KV cache handling: the sliding-window cache only ever needs the last 1024
+ head-group broadcasting (8 KV heads at head_dim 128), and the
+ full-attention layers' YaRN partial-rotary (0.5) RoPE.
+- Quantized matmul and MoE dispatch for the affine 4-bit (group size 64)
+ projections: fewer dequantize/copy steps, better expert gather-GEMM
+ batching across the routed experts, the 8-bit per-layer router gates, the
+ shared expert, and reuse of derived weight views.
+- KV cache handling: the sliding-window cache only ever needs the last 512
  positions; a tighter ring-buffer implementation can reduce both memory and
  copy overhead relative to the straightforward baseline.
-- Dense weight loading and reuse: eager preparation at init, warm kernels
+- Weight loading and reuse: eager preparation at init, warm kernels
  before the first scored forward, and avoiding redundant Data-to-Metal
  conversions.
 - MLX operation scheduling and synchronization.
@@ -433,7 +447,7 @@ Be careful with optimizations that only help a single public prompt or a single
 machine. The hidden correctness and benchmark prompts are different from the
 public local fixtures, and official scoring happens on the single self-hosted
 M5 runner. Kernel edits are bound by the same correctness gates as model
-edits: keep them prompt-independent and model-general for Gemma 4, and be
+edits: keep them prompt-independent and model-general for Laguna, and be
 conservative with numeric reassociation — a changed accumulation order can
 flip near-tie greedy argmaxes on the M5 and fail the exact-token gates.
 
@@ -441,15 +455,15 @@ flip near-tie greedy argmaxes on the M5 and fail the exact-token gates.
 
 Do not assume the benchmark machine has the same memory budget as your local
 Mac. The ranked box is one Apple M5 Max with 128 GB of unified memory; the
-~17 GB text tower is comfortably RAM-resident there, but do not treat that
+~18.8 GB text tower is comfortably RAM-resident there, but do not treat that
 headroom as an invitation for memory-hungry strategies tuned on a different
 machine — KV cache, buffers, and caches still compete, and what is fast on
-your Apple Silicon generation can move differently on the M5. Unlike a large
-MoE checkpoint there is no meaningfully different "streaming fallback" regime
-here to mistune against.
+your Apple Silicon generation can move differently on the M5. Although Laguna
+is an MoE checkpoint, every expert is RAM-resident: there is no
+"streaming fallback" regime here to mistune against.
 
 Do not specialize for the public correctness prompt. Optimizations should be
-prompt-independent and model-general for Gemma 4. Hidden correctness, GPQA,
+prompt-independent and model-general for Laguna. Hidden correctness, GPQA,
 and benchmark prompts are different from the public fixtures.
 
 Do not treat local-only environment overrides as proof of a valid improvement.
@@ -521,20 +535,26 @@ other speculative decoding requires a separate explicit track with a trusted
 variable-length block protocol, correctness contract, and score; it is not an
 optimization within this serial track.
 
-### Default Gemma 4 31B-IT MTP Track
+### Default Laguna XS 2.1 MTP Track
 
 The Yukon-default ranked surface has track ID
-`gemma4-31b-it-mtp-v1`; `docs/experimental-mtp-track.md` is its detailed
-contract. An organizer-pinned Gemma 4 31B-IT target is
-paired with Google's matched trained assistant (~939 MB organizer-provisioned
-sidecar); a trusted parent drives a block protocol (`mtp_decode_begin`, then
+`laguna-xs-2.1-mtp-v1`; `docs/experimental-mtp-track.md` is its detailed
+contract. An organizer-pinned Laguna XS 2.1 target
+(`mlx-community/Laguna-XS-2.1-4bit`, MLX affine 4-bit group-64) is
+paired with Poolside's matched trained DFlash speculator
+(`poolside/Laguna-XS-2.1-DFlash`, a 5-layer Eagle-style draft over target
+layers [1,13,25,33,39] with block_size 16 and mask token 12, downloaded as
+the BF16 upstream and converted to MLX 4-bit at setup); a trusted parent
+drives a block protocol
+(`mtp_decode_begin`, then
 `mtp_decode_block` carrying only the last committed token and a max block
 size of 4), owns the timer and an independent serial-oracle check of every
 returned token, and divides its own wall time by its configured decode total
-(`--tokens`, default 128, max 512). The participant surface is the drafting
+(`--tokens`, default 128, trusted-parent max 1536; ranked timed decode stays
+fixed at 512). The participant surface is the drafting
 and verification strategy inside `Sources/MLXFastModel/` — the
-`Gemma4TrainedMTPBlockSession` block decoder and the bit-exact exact-pair
-verification kernels (`Gemma4ExactTwo*.swift`), which verify two target rows
+trained-MTP block decoder and the bit-exact exact-pair
+verification kernels, which verify two target rows
 per dispatch while preserving each row's serial K=1 accumulation order so
 accepted tokens are bit-identical to serial decode. Bit-exactness is a hard
 gate: one token diverging from the parent oracle fails the run, so the track

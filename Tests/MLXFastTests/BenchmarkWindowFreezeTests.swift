@@ -93,7 +93,7 @@ func timedDecodeChargesOneValidatedSeedForward() throws {
     let worker = try packageFile("Sources/MLXFastHarness/GemmaRuntimeWorker.swift")
     let decodeBegin = try slice(worker, from: "case \"decode_begin\":", to: "case \"decode_step\":")
     // Exactly one whole-prompt forward, and no warmup pass to memoize against it.
-    #expect(decodeBegin.components(separatedBy: "Gemma4Model.logits(").count - 1 == 1)
+    #expect(decodeBegin.components(separatedBy: "lagunaLogits(").count - 1 == 1)
     #expect(!decodeBegin.contains("warmupCache"))
     #expect(!decodeBegin.contains("warmupLogits"))
 
@@ -182,17 +182,17 @@ func workerPhaseStartsResetTrustedAllocatorBeforeForwardSetup() throws {
         (
             start: "case \"correctness_begin\":",
             end: "case \"correctness_step\":",
-            firstForwardSetup: "let cache = Gemma4ModelCache("
+            firstForwardSetup: "let cache = model.newCache("
         ),
         (
             start: "case \"prefill\":",
             end: "case \"decode_begin\":",
-            firstForwardSetup: "let cache = Gemma4ModelCache("
+            firstForwardSetup: "let cache = model.newCache("
         ),
         (
             start: "case \"decode_begin\":",
             end: "case \"decode_step\":",
-            firstForwardSetup: "let cache = Gemma4ModelCache("
+            firstForwardSetup: "let cache = model.newCache("
         ),
     ]
     for phase in phaseBegins {
@@ -382,8 +382,9 @@ func decodeMeasurementInvokesNoPhaseVaryingEditableHook() throws {
         #expect(!source.contains("Gemma4SubmissionControls"))
     }
     // The worker decode_step case invokes only the same editable entry points
-    // the correctness path also invokes (Gemma4Model.logits / greedyToken), and
-    // no per-token sleep that a delay hook used to drive.
+    // the correctness path also invokes (the Laguna model forward via
+    // lagunaLogits / greedyToken), and no per-token sleep that a delay hook
+    // used to drive.
     let decodeStepStart = try #require(worker.range(of: "case \"decode_step\":"))
     let decodeStepEnd = try #require(
         worker.range(
@@ -392,6 +393,6 @@ func decodeMeasurementInvokesNoPhaseVaryingEditableHook() throws {
         )
     )
     let decodeStep = String(worker[decodeStepStart.upperBound..<decodeStepEnd.lowerBound])
-    #expect(decodeStep.contains("Gemma4Model.logits("))
+    #expect(decodeStep.contains("lagunaLogits("))
     #expect(!decodeStep.contains("Thread.sleep"))
 }

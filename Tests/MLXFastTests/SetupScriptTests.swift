@@ -279,7 +279,7 @@ func setupAcceptsLegacyReferenceDirectoryAsItsOwnCompatibilityPath() throws {
         environment: [
             "REPO_ROOT": FileManager.default.currentDirectoryPath,
             "TEST_ROOT": root.path,
-            "MLXFAST_REFERENCE_DIR": "reference_weights/gemma-4-31b-4bit",
+            "MLXFAST_REFERENCE_DIR": "reference_weights/laguna-xs-2.1-4bit",
         ]
     )
 

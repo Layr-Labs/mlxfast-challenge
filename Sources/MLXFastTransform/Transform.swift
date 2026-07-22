@@ -36,17 +36,47 @@ public struct TransformReport: Equatable {
     }
 }
 
-/// Offline transform for the Gemma 4 31B 4-bit checkpoint: selects ONLY the
+/// Model family of the source reference checkpoint, detected from its
+/// config.json. The transform supports the pinned Poolside Laguna XS 2.1
+/// MoE target (flat config with `model_type` "laguna", untied head) and the
+/// legacy Gemma 4 multimodal layout (nested `text_config`, tied head).
+enum TransformModelFamily: Equatable {
+    case gemma4
+    case laguna
+}
+
+/// Offline transform for the pinned reference checkpoint: selects ONLY the
 /// text-tower tensors (the `language_model.` prefix in the source index),
 /// drops every vision/audio/multimodal-projector tensor, and rewrites the
 /// selected tensors into dense safetensors shard(s) plus a
-/// `model.safetensors.index.json` and a runtime-authored `config.json`
-/// (the flattened `text_config` fields the runtime needs, plus the
-/// checkpoint's quantization metadata). Text/audio/vision are the only kinds
-/// of tensors the reference checkpoint ships; there is no expert manifest --
-/// the whole selected tree is one flat set of dense tensors, matching how a
-/// single dense model (no MoE, no expert streaming) is loaded fully into RAM
-/// at runtime init.
+/// `model.safetensors.index.json` and a runtime-authored `config.json`.
+///
+/// Two source checkpoint families are supported, detected from the source
+/// config.json:
+///
+/// - Poolside Laguna XS 2.1 4-bit (flat config, `model_type` "laguna"): the
+///   default MTP-track target. The source is already MLX affine-quantized,
+///   so the transform validates and passes through -- byte-for-byte, source
+///   tensor names unchanged -- the quantized triplet set described by
+///   `Sources/MLXFastModel/LAGUNA_WEIGHT_CONTRACT.md`: attention
+///   q/k/v/o projections plus the per-head `g_proj` gates and q/k norms,
+///   the layer-0 dense MLP, the SwitchGLU-STACKED `mlp.switch_mlp.*` expert
+///   tensors (leading experts axis; never split per expert), the 8-bit
+///   `mlp.gate.proj` routers with their `mlp.gate.e_score_correction_bias`
+///   vectors, the shared experts, and the untied quantized `lm_head`. The
+///   contract forbids derived metadata sidecars (the Gemma projection and
+///   tied-head packed13 sidecars are never emitted for Laguna) and requires
+///   `rotary_emb.inv_freq` tables to be left out. The runtime config.json is
+///   the flat source config minus the empty `vision_config`, carrying the
+///   checkpoint's `quantization` block: global affine 4-bit group-64 plus
+///   the per-router-gate 8-bit overrides.
+/// - Legacy Gemma 4 31B 4-bit (nested `text_config`): the archived dense
+///   path, unchanged: flattened `text_config` runtime config plus the
+///   projection/tied-head metadata sidecars.
+///
+/// There is no expert streaming manifest -- the whole selected tree is one
+/// flat set of dense tensors, matching how the model (including every routed
+/// Laguna expert) is loaded fully into RAM at runtime init.
 public enum SwiftTransform {
     /// Tensor name prefix that marks a checkpoint tensor as part of the text
     /// tower. Every other prefix (`vision_tower.`, `embed_vision.`,
@@ -88,9 +118,14 @@ public enum SwiftTransform {
         let referenceConfigPath = referenceDirectory.appendingPathComponent("config.json")
         try requireFile(
             referenceConfigPath.path,
-            description: "Gemma 4 31B 4-bit reference config"
+            description: "reference checkpoint config"
         )
-        let runtimeConfigData = try makeRuntimeConfigData(sourceConfigPath: referenceConfigPath)
+        let sourceConfigRoot = try loadReferenceConfigRoot(referenceConfigPath)
+        let modelFamily = try detectModelFamily(sourceConfigRoot: sourceConfigRoot)
+        let runtimeConfigData = try makeRuntimeConfigData(
+            sourceConfigRoot: sourceConfigRoot,
+            family: modelFamily
+        )
         let metadataSnapshot = try captureMetadataFiles(from: referenceDirectory)
 
         let index = try loadIndex(referenceDirectory)
@@ -99,7 +134,9 @@ public enum SwiftTransform {
             index,
             referenceDirectory: referenceDirectory
         )
-        let textKeys = Set(index.weightMap.keys.filter(isTextTowerKey))
+        let textKeys = Set(
+            index.weightMap.keys.filter { isSelectedTextTowerKey($0, family: modelFamily) }
+        )
         guard !textKeys.isEmpty else {
             throw MLXFastError.invalidInput("checkpoint index contains no text-tower tensors")
         }
@@ -125,6 +162,21 @@ public enum SwiftTransform {
                 )
             }
             totalTensorByteCount = nextTotal
+        }
+
+        if modelFamily == .laguna {
+            // Fail before the multi-GB copy if the selected tensor set is
+            // structurally inconsistent with the quantization spec the
+            // emitted config.json declares (the runtime re-validates the
+            // full geometry against LagunaConfig at load).
+            try LagunaCheckpointValidation.validateSelectedTensors(
+                selectedKeys: textKeys,
+                index: index,
+                headers: validatedHeaders,
+                quantization: LagunaCheckpointValidation.quantizationSpec(
+                    fromConfigRoot: sourceConfigRoot
+                )
+            )
         }
 
         let fileManager = FileManager.default
@@ -162,20 +214,39 @@ public enum SwiftTransform {
         }
 
         try beforeSidecarGeneration?()
-        let generatedProjectionMetadata = try AffineMetadataCoding.writeProjectionSidecar(
-            sourceDirectory: stagingDirectory,
-            index: index,
-            sourceHeaders: stagedHeaders,
-            selectedKeys: textKeys,
-            destinationDirectory: stagingDirectory
-        )
-        let generatedTiedHeadMetadata = try TiedHeadMetadataCoding.writeSidecar(
-            sourceDirectory: stagingDirectory,
-            index: index,
-            sourceHeaders: stagedHeaders,
-            selectedKeys: textKeys,
-            destinationDirectory: stagingDirectory
-        )
+        let generatedProjectionMetadata: GeneratedAffineMetadataReport
+        let generatedTiedHeadMetadata: GeneratedAffineMetadataReport
+        switch modelFamily {
+        case .gemma4:
+            generatedProjectionMetadata = try AffineMetadataCoding.writeProjectionSidecar(
+                sourceDirectory: stagingDirectory,
+                index: index,
+                sourceHeaders: stagedHeaders,
+                selectedKeys: textKeys,
+                destinationDirectory: stagingDirectory
+            )
+            generatedTiedHeadMetadata = try TiedHeadMetadataCoding.writeSidecar(
+                sourceDirectory: stagingDirectory,
+                index: index,
+                sourceHeaders: stagedHeaders,
+                selectedKeys: textKeys,
+                destinationDirectory: stagingDirectory
+            )
+        case .laguna:
+            // LAGUNA_WEIGHT_CONTRACT.md forbids derived layouts and metadata
+            // sidecars in v1, and the Laguna runtime loads exactly the
+            // indexed checkpoint tensors (its untied lm_head makes the
+            // Gemma tied-head packed13 sidecar meaningless anyway). Emit
+            // nothing beyond the pass-through tensor set.
+            generatedProjectionMetadata = GeneratedAffineMetadataReport(
+                weightMap: [:],
+                tensorByteCount: 0
+            )
+            generatedTiedHeadMetadata = GeneratedAffineMetadataReport(
+                weightMap: [:],
+                tensorByteCount: 0
+            )
+        }
         let (projectionOutputByteCount, projectionSizeOverflow) =
             totalTensorByteCount.addingReportingOverflow(
                 generatedProjectionMetadata.tensorByteCount
@@ -388,12 +459,28 @@ public enum SwiftTransform {
         }
 
         throw MLXFastError.missingFile(
-            "no config.json found under \(base.path); place the Gemma 4 31B 4-bit checkpoint there"
+            "no config.json found under \(base.path); place the pinned reference checkpoint there"
         )
     }
 
     static func isTextTowerKey(_ key: String) -> Bool {
         key.hasPrefix(textTowerPrefix)
+    }
+
+    /// Laguna keeps the same `language_model.` text-tower prefix as the
+    /// Gemma 4 checkpoint, so prefix selection is shared. The Laguna weight
+    /// contract additionally requires precomputed `rotary_emb.inv_freq`
+    /// tables to be left out of the transformed tree: the runtime's shard/
+    /// tensor inventory check runs before its `sanitize` pass would drop
+    /// them.
+    static func isSelectedTextTowerKey(_ key: String, family: TransformModelFamily) -> Bool {
+        guard isTextTowerKey(key) else {
+            return false
+        }
+        if family == .laguna, key.contains("rotary_emb.inv_freq") {
+            return false
+        }
+        return true
     }
 
     private static func captureMetadataFiles(from source: URL) throws -> [String: Data] {
@@ -443,24 +530,69 @@ public enum SwiftTransform {
         }
     }
 
-    /// Writes the runtime's `config.json`: the source checkpoint's
-    /// `text_config` fields flattened to the top level (the exact schema
-    /// `Gemma4Config.load` reads), plus the checkpoint-wide `quantization`
-    /// block. The runtime controls this schema directly, so it carries only
-    /// what `Gemma4Config`/`Gemma4WeightLoader` actually need -- no vision or
-    /// audio config, no architecture/tokenizer metadata duplicated from
-    /// `tokenizer_config.json`.
-    static func makeRuntimeConfigData(sourceConfigPath: URL) throws -> Data {
+    private static func loadReferenceConfigRoot(_ sourceConfigPath: URL) throws -> [String: Any] {
         let data = try Data(contentsOf: sourceConfigPath)
         let object = try JSONSerialization.jsonObject(with: data)
         guard let root = object as? [String: Any] else {
             throw MLXFastError.invalidInput("reference config.json must be a JSON object")
         }
-        guard let textConfig = root["text_config"] as? [String: Any] else {
-            throw MLXFastError.invalidInput("reference config.json is missing text_config")
-        }
+        return root
+    }
 
-        var runtimeConfig = textConfig
+    static func detectModelFamily(
+        sourceConfigRoot root: [String: Any]
+    ) throws -> TransformModelFamily {
+        if root["text_config"] is [String: Any] {
+            return .gemma4
+        }
+        if let modelType = root["model_type"] as? String, modelType == "laguna" {
+            return .laguna
+        }
+        throw MLXFastError.invalidInput(
+            "reference config.json is missing text_config and does not declare model_type laguna"
+        )
+    }
+
+    static func makeRuntimeConfigData(sourceConfigPath: URL) throws -> Data {
+        let root = try loadReferenceConfigRoot(sourceConfigPath)
+        return try makeRuntimeConfigData(
+            sourceConfigRoot: root,
+            family: detectModelFamily(sourceConfigRoot: root)
+        )
+    }
+
+    /// Writes the runtime's `config.json`.
+    ///
+    /// Gemma 4: the source checkpoint's `text_config` fields flattened to the
+    /// top level (the exact schema `Gemma4Config.load` reads), plus the
+    /// checkpoint-wide `quantization` block -- no vision or audio config, no
+    /// architecture/tokenizer metadata duplicated from
+    /// `tokenizer_config.json`.
+    ///
+    /// Laguna: the source config is already the flat schema
+    /// `LagunaConfig.load` parses (per LAGUNA_WEIGHT_CONTRACT.md the
+    /// transform may copy the source fields directly), so it is passed
+    /// through minus the empty multimodal `vision_config` stub. The
+    /// checkpoint's `quantization` block -- global affine 4-bit group-64
+    /// plus the per-tensor 8-bit router-gate overrides
+    /// (`language_model.model.layers.<N>.mlp.gate.proj`) -- is normalized
+    /// under the `quantization` key (filled from `quantization_config` when
+    /// only the mirror is present).
+    static func makeRuntimeConfigData(
+        sourceConfigRoot root: [String: Any],
+        family: TransformModelFamily
+    ) throws -> Data {
+        var runtimeConfig: [String: Any]
+        switch family {
+        case .gemma4:
+            guard let textConfig = root["text_config"] as? [String: Any] else {
+                throw MLXFastError.invalidInput("reference config.json is missing text_config")
+            }
+            runtimeConfig = textConfig
+        case .laguna:
+            runtimeConfig = root
+            runtimeConfig["vision_config"] = nil
+        }
         if let quantization = root["quantization"] {
             runtimeConfig["quantization"] = quantization
         } else if let quantizationConfig = root["quantization_config"] {

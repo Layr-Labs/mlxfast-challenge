@@ -138,8 +138,8 @@ jobs:
       # (world-readable; verified against the pinned manifest below every
       # run). No download happens on this box, so the old
       # reference_download_jobs/reference_min_free_gib inputs are gone.
-      MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--gemma-4-31b-4bit/snapshots/main
-      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_gemma_4_31b_4bit.sha256
+      MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_4bit.sha256
       # Bench workspace: the ONLY place submitted code executes and writes.
       # Must live under /Users/Shared/bench-jobs (bench-exec refuses anything
       # else). The path is STABLE across runs (not per-run) because llbuild's
@@ -185,8 +185,8 @@ jobs:
       # the old slices verified. The augmented golden is verified against a
       # self-anchored hash computed right after attach-gpqa-gates, exactly as
       # the old gates machine did.
-      MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 56c282dcaac433543ef0eecb625cd99bc20f1ae1f7b9415efe32a71e6eb4eae9
-      MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "38162"
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 96689a9ceaf7cc813174d0a6cb2ab650454d7d031f88514cbd222bcb17bb4d7e
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "35749"
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
       MLXFAST_GPQA_CASE_COUNT: "5"
       # 64-token GPQA behavior/semantic budget and min-pass 1 threshold:
@@ -210,8 +210,8 @@ jobs:
       # Public drift-tripwire fixture, pinned (enforced by BenchmarkScriptTests).
       MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
-      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 182a7f98d24cc8f26e8b08505fe7a8b6d825702f99d0b78a83f49dd42f1b2aea
-      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: "11140"
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 679ba44220d581316c752533472883f4905a1b6a30f5f657a25f1177ae6247c1
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: "10519"
       # Speedup floors; keep in sync with
       # MLXFastConstants.{scoreDecodeSpeedupFloor,scorePrefillSpeedupFloor}.
       # The old timing machine computed floor verdicts inside the harness from
@@ -1208,8 +1208,8 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           # Private object keys scoped to this trusted download step only (not
           # job-level), so untrusted bench phases never receive the object names.
-          MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-gemma.json
-          MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-gemma.json
+          MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json
+          MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna.json
         run: |
           set -euo pipefail
           .github/scripts/download-r2-object.sh \
@@ -1591,7 +1591,7 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1.txt
+          MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_gc_runtimes_essay-laguna.txt
         run: |
           set -euo pipefail
           .github/scripts/download-r2-object.sh \
