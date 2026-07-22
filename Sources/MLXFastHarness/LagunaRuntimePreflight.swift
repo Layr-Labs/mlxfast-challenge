@@ -3,10 +3,10 @@ import Darwin
 import Foundation
 import MLXFastCore
 
-// GemmaRuntime is split across GemmaRuntime*.swift for auditability.
+// LagunaRuntime is split across LagunaRuntime*.swift for auditability.
 // Generated split; behavior identical to the original single file.
 
-extension GemmaRuntime {
+extension LagunaRuntime {
     /// The commit stamped into the sealed score's `metrics.commit`, which the
     /// trusted workflow binds against the dispatched commit
     /// (MLXFAST_EXPECTED_COMMIT in overlay-paired-timing.sh and

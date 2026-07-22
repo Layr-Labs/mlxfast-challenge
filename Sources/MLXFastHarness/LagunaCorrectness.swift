@@ -1,7 +1,5 @@
 import Foundation
-#if !MLXFAST_TRUSTED_HARNESS
 import MLX
-#endif
 import MLXFastCore
 
 public struct CorrectnessTokenComparison: Equatable {
@@ -26,7 +24,7 @@ public struct CorrectnessTokenComparison: Equatable {
     }
 }
 
-public enum GemmaCorrectness {
+public enum LagunaCorrectness {
     public static func generateGreedyNoCache(
         promptTokens: [Int],
         steps: Int = MLXFastConstants.correctnessSteps,
@@ -101,16 +99,14 @@ public enum GemmaCorrectness {
         )
     }
 
-    #if !MLXFAST_TRUSTED_HARNESS
-        public static func greedyToken(from logits: MLXArray) throws -> Int {
-            guard let vocabSize = logits.shape.last, vocabSize > 0 else {
-                throw MLXFastError.invalidInput("greedy logits must have a non-empty vocab dimension")
-            }
-            let rows = logits.reshaped([-1, vocabSize])
-            let last = rows[-1]
-            return Int(last.argMax().item(Int32.self))
+    public static func greedyToken(from logits: MLXArray) throws -> Int {
+        guard let vocabSize = logits.shape.last, vocabSize > 0 else {
+            throw MLXFastError.invalidInput("greedy logits must have a non-empty vocab dimension")
         }
-    #endif
+        let rows = logits.reshaped([-1, vocabSize])
+        let last = rows[-1]
+        return Int(last.argMax().item(Int32.self))
+    }
 
     public static func compareTokens(
         expected: [Int],

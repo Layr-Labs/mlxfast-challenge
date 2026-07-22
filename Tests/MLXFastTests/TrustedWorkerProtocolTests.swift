@@ -18,7 +18,7 @@ func trustedPreflightUsesOneShotWorkerProtocolAndPropagatesFailure() throws {
         """,
         to: successWorker
     )
-    try GemmaRuntime.runPreflightWithWorker(
+    try LagunaRuntime.runPreflightWithWorker(
         weightsPath: "/tmp/weights",
         worker: RuntimeWorkerOptions(
             executablePath: successWorker.path,
@@ -41,7 +41,7 @@ func trustedPreflightUsesOneShotWorkerProtocolAndPropagatesFailure() throws {
         to: failingWorker
     )
     #expect(throws: MLXFastError.self) {
-        try GemmaRuntime.runPreflightWithWorker(
+        try LagunaRuntime.runPreflightWithWorker(
             weightsPath: "/tmp/weights",
             worker: RuntimeWorkerOptions(
                 executablePath: failingWorker.path,
@@ -94,7 +94,7 @@ func trustedTracePreservesLargeTopKAndOutOfSubsetExpectedDiagnostics() throws {
     }
     """.write(to: golden, atomically: true, encoding: .utf8)
 
-    let report = try GemmaRuntime.traceCorrectness(
+    let report = try LagunaRuntime.traceCorrectness(
         CorrectnessTraceOptions(
             weightsPath: "/tmp/weights",
             goldenPath: golden.path,

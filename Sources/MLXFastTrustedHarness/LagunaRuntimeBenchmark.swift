@@ -7,10 +7,10 @@ import MLXFastCore
 import MLXFastModel
 #endif
 
-// GemmaRuntime is split across GemmaRuntime*.swift for auditability.
+// LagunaRuntime is split across LagunaRuntime*.swift for auditability.
 // Generated split; behavior identical to the original single file.
 
-extension GemmaRuntime {
+extension LagunaRuntime {
     public static func benchmark(
         _ options: BenchmarkOptions,
         worker: RuntimeWorkerOptions? = nil
@@ -746,7 +746,7 @@ extension GemmaRuntime {
                 positionOffset: 0
             )
             eval(logits)
-            let token = try GemmaCorrectness.greedyToken(from: logits)
+            let token = try LagunaCorrectness.greedyToken(from: logits)
             try requireBenchmarkMatch(
                 BenchmarkOutputValidator.comparePrefillToken(
                     expectedToken: expectedToken,
@@ -885,7 +885,7 @@ extension GemmaRuntime {
             cache: cache,
             positionOffset: 0
         )
-        var token = try GemmaCorrectness.greedyToken(from: logits)
+        var token = try LagunaCorrectness.greedyToken(from: logits)
         try requireBenchmarkMatch(
             BenchmarkOutputValidator.compareDecodeSeedToken(
                 expectedToken: expectedSeedToken,
@@ -905,7 +905,7 @@ extension GemmaRuntime {
                 cache: cache,
                 positionOffset: try timingPlan.positionOffset(forDecodedStep: decodedStep)
             )
-            token = try GemmaCorrectness.greedyToken(from: logits)
+            token = try LagunaCorrectness.greedyToken(from: logits)
             actualTokens.append(token)
             let expectedToken = expectedTokens[decodedStep]
             if token != expectedToken {

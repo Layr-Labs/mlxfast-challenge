@@ -301,8 +301,8 @@ final class LagunaRuntimeDecoderLayer: Module {
 
 // MARK: - Model
 
-/// The Laguna text tower: embedding (NOT scaled -- unlike Gemma there is no
-/// `sqrt(hidden)` embedding multiplier), 40 decoder layers, final RMSNorm.
+/// The Laguna text tower: unscaled embedding, 40 decoder layers, final
+/// RMSNorm.
 /// Returns post-norm hidden states for every input position.
 final class LagunaRuntimeModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
@@ -355,8 +355,7 @@ final class LagunaRuntimeModelInner: Module {
 /// Scored Laguna runtime model: last-token vocabulary head over the
 /// reimplemented Laguna text tower.
 ///
-/// Interface shape mirrors `Gemma4RuntimeModel` so the worker can swap the
-/// model type: `callAsFunction(_:cache:)` serves both prompt prefill
+/// `callAsFunction(_:cache:)` serves both prompt prefill
 /// (`[1, L]`) and single-token decode steps (`[1, 1]`) and returns
 /// `[1, 1, vocab]` last-token logits; `newCache(parameters:)` creates the
 /// per-layer cache stack (unbounded `StandardKVCache` for full-attention

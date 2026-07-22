@@ -27,11 +27,10 @@ public struct Gemma4RopeSpec: Equatable {
     }
 }
 
-/// Text-tower configuration for Gemma 4 (dense, 31B, 4-bit). Parsed from the
-/// config.json written by `SwiftTransform` into the transformed weights
-/// directory -- the transform controls this schema directly, so it mirrors
-/// the source Hugging Face `text_config` fields the runtime actually needs
-/// rather than the full multimodal config.
+/// Legacy Gemma 4 text-tower configuration retained for the unranked
+/// experimental MTP worker. The ranked Laguna serial path does not use it.
+/// Parsed from the config.json written by `SwiftTransform` into the
+/// transformed weights directory.
 public struct Gemma4Config: Equatable {
     public let modelType: String
     public let vocabSize: Int

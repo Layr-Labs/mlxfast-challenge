@@ -113,11 +113,11 @@ public enum Gemma4Model {
                 // caches (promoted in place to compilable types); prefill and the seed
                 // forward (length > 1) stay eager.
                 //
-                // Compiled decode is OPT-IN (DARKBLOOM_COMPILED_DECODE=1): its one-time
-                // compile cost lands inside the scored decode window, which is not
-                // amortized at the ranked 128-step length. Gating here in the harness
-                // adapter -- rather than relying on the fork's internal default --
-                // makes ranked runs deterministically eager wherever the env is unset.
+                // Compiled decode is OPT-IN (DARKBLOOM_COMPILED_DECODE=1):
+                // its one-time compile cost lands inside the short decode
+                // window. Gating here in the adapter -- rather than relying
+                // on the fork's internal default -- keeps the legacy path
+                // deterministically eager wherever the env is unset.
                 if inputLength == 1 {
                     if let step = compiledDecodeStep {
                         return step([inputIDs])[0]
@@ -176,7 +176,7 @@ public enum Gemma4Model {
         // Every consumer of multi-token logits (greedy next-token selection,
         // top-logit traces, the benchmark oracle validators) reads only the
         // LAST position's row; slicing before the final norm/head removes a
-        // [length-1, vocab]-sized slab of dead work from every scored forward.
+        // [length-1, vocab]-sized slab of dead work from every forward.
         if hidden.shape[1] > 1 {
             hidden = hidden[0..., (hidden.shape[1] - 1)..., 0...]
         }

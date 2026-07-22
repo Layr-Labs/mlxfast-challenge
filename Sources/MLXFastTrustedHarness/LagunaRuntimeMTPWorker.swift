@@ -1,3 +1,4 @@
+#if !MLXFAST_TRUSTED_HARNESS
 import Foundation
 import MLX
 import MLXFastCore
@@ -62,12 +63,12 @@ func validateExperimentalTrainedMTPBlockRequest(
     )
 }
 
-extension GemmaRuntime {
+extension LagunaRuntime {
     public static func runExperimentalMTPWorker(
         targetWeightsPath: String,
         assistantPath: String,
         contractPath: String,
-        verificationMode: Gemma4MTPVerificationMode,
+        verificationMode: MTPVerificationMode,
         requireTrainedAssistant: Bool
     ) throws {
         guard requireTrainedAssistant else {
@@ -370,3 +371,4 @@ private func waitForExperimentalMTPAsync<T: Sendable>(
     }
     return try result.get()
 }
+#endif

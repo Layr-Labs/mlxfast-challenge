@@ -41,7 +41,7 @@ private enum ParticipantWorkerCLI {
                         "MLXFAST_WEIGHTS_PATH"
                     ] ?? MLXFastConstants.defaultWeightsPath
                 )
-                try GemmaRuntime.runWorker(weightsPath: weightsPath)
+                try LagunaRuntime.runWorker(weightsPath: weightsPath)
 
             case "preflight":
                 try options.requireOnly(
@@ -54,7 +54,7 @@ private enum ParticipantWorkerCLI {
                         "MLXFAST_WEIGHTS_PATH"
                     ] ?? MLXFastConstants.defaultWeightsPath
                 )
-                try GemmaRuntime.runPreflightWorker(
+                try LagunaRuntime.runPreflightWorker(
                     weightsPath: weightsPath
                 )
 
@@ -81,16 +81,16 @@ private enum ParticipantWorkerCLI {
                 }
                 let verificationValue = options.value(
                     for: "--target-verification",
-                    default: Gemma4MTPVerificationMode.exactPair.rawValue
+                    default: MTPVerificationMode.exactPair.rawValue
                 ).lowercased()
-                guard let verificationMode = Gemma4MTPVerificationMode(
+                guard let verificationMode = MTPVerificationMode(
                     rawValue: verificationValue
                 ) else {
                     throw MLXFastError.invalidInput(
                         "--target-verification must be exact-pair or serial"
                     )
                 }
-                try GemmaRuntime.runExperimentalMTPWorker(
+                try LagunaRuntime.runExperimentalMTPWorker(
                     targetWeightsPath: weightsPath,
                     assistantPath: assistantPath,
                     contractPath: contractPath,

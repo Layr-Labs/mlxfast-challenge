@@ -31,8 +31,8 @@ public enum LagunaWeightNames {
 }
 
 /// Metadata-level access and validation for the transformed Laguna weights
-/// tree. Mirrors `Gemma4WeightLoader`'s role: `validateRequiredMetadata`
-/// checks that every tensor the runtime model needs is present with the
+/// tree. `validateRequiredMetadata` checks that every tensor the runtime model
+/// needs is present with the
 /// expected dtype/shape/quantization WITHOUT materializing any `MLXArray`s,
 /// so a malformed weights directory fails fast before the (expensive) full
 /// weight load.
@@ -260,9 +260,8 @@ public struct LagunaWeightLoader {
     }
 }
 
-/// Eagerly-prepared, RAM-resident weight cache for the Laguna text tower,
-/// mirroring `Gemma4RuntimeWeightCache`'s construction contract: the whole
-/// 4-bit checkpoint (~18.8 GB) is loaded once at construction time (outside
+/// Eagerly-prepared, RAM-resident weight cache for the Laguna text tower. The
+/// whole 4-bit checkpoint (~18.8 GB) is loaded once at construction time (outside
 /// every scored window -- the runtime worker builds this before the
 /// benchmark protocol handshake), so every scored forward pays no dense
 /// loads or quantized-module construction. All expert tensors are
@@ -282,21 +281,21 @@ public final class LagunaRuntimeWeightCache {
     public init(loader: LagunaWeightLoader, config: LagunaConfig) {
         self.loader = loader
         self.config = config
-        // Select the startup memory profile BEFORE the model load, mirroring
-        // `Gemma4RuntimeWeightCache`. Laguna retains no alternate weight
-        // layouts, so the full profile is deliberately a no-op here (the
+        // Select the startup memory profile BEFORE the model load. Laguna
+        // retains no alternate weight layouts, so the full profile is
+        // deliberately a no-op here (the
         // ranked 128 GiB box keeps stock allocator behavior); the documented
         // low-memory profile for <64 GiB machines caps the MLX allocator
         // cache at 6 GiB, shortens command buffers, installs the
         // feature-disable env defaults (no-overwrite), and clears free
         // warmup buffers before the worker protocol hello. The layer-count
         // guard keeps tiny unit-test configurations on stock behavior.
-        let startupMemoryPolicy: Gemma4StartupMemoryPolicy?
+        let startupMemoryPolicy: RuntimeStartupMemoryPolicy?
         if config.numHiddenLayers >= 16 {
-            let policy = Gemma4StartupMemoryPolicy.resolve(
+            let policy = RuntimeStartupMemoryPolicy.resolve(
                 physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
                 requestedProfile: ProcessInfo.processInfo.environment[
-                    Gemma4StartupMemoryPolicy.profileOverrideEnvironmentName
+                    RuntimeStartupMemoryPolicy.profileOverrideEnvironmentName
                 ]
             )
             if policy.isLowMemory {
@@ -392,7 +391,7 @@ public final class LagunaRuntimeWeightCache {
         // The mlx-community Laguna checkpoint already stores scales/biases
         // and norms in bf16 (only the packed codes are U32), so the
         // library's fp16->bf16 conversion pass is a no-op here and is
-        // intentionally omitted -- same reasoning as the Gemma 4 loader.
+        // intentionally omitted.
         try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
         eval(model)
         return model

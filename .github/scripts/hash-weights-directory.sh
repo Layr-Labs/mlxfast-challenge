@@ -20,7 +20,7 @@ if [[ -z "${XXD_BIN}" ]]; then
   exit 1
 fi
 
-# Match GemmaRuntime.directoryDigest exactly: for every sorted relative path,
+# Match LagunaRuntime.directoryDigest exactly: for every sorted relative path,
 # hash path bytes + NUL + the raw 32-byte file SHA256 + NUL.
 invalid_entry="$(find "${WEIGHTS_PATH}" -mindepth 1 ! -type d ! -type f -print -quit)"
 if [[ -n "${invalid_entry}" ]]; then
@@ -30,7 +30,7 @@ fi
 # Reject hardlinked files (link count != 1): a second name aliasing these
 # bytes -- e.g. planted by the sandboxed bench uid -- must not slip through the
 # transform-output gate. Mirrors overlay-editable-paths.sh and
-# GemmaRuntime.directoryDigest / requireSingleHardLink.
+# LagunaRuntime.directoryDigest / requireSingleHardLink.
 hardlinked_entry="$(find "${WEIGHTS_PATH}" -type f -links +1 -print -quit)"
 if [[ -n "${hardlinked_entry}" ]]; then
   echo "hash-weights-directory: weights tree contains a hardlinked file: ${hardlinked_entry}" >&2

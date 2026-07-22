@@ -3,7 +3,7 @@ import MLXFastCore
 #if !MLXFAST_TRUSTED_HARNESS
 import MLXFastModel
 #else
-public enum Gemma4MTPVerificationMode: String, Sendable {
+public enum MTPVerificationMode: String, Sendable {
     case exactPair = "exact-pair"
     case serial
 }
@@ -95,7 +95,7 @@ public struct ExperimentalTrainedMTPOptions: Equatable {
     public let goldenPath: String
     public let maxBlockSize: Int
     public let totalTokenCount: Int
-    public let verificationMode: Gemma4MTPVerificationMode
+    public let verificationMode: MTPVerificationMode
     public let requireTrainedAssistant: Bool
 
     public init(
@@ -106,7 +106,7 @@ public struct ExperimentalTrainedMTPOptions: Equatable {
         goldenPath: String,
         maxBlockSize: Int = MLXFastConstants.experimentalMTPMaxBlockSize,
         totalTokenCount: Int = MLXFastConstants.experimentalMTPMaxTotalTokens,
-        verificationMode: Gemma4MTPVerificationMode = .exactPair,
+        verificationMode: MTPVerificationMode = .exactPair,
         requireTrainedAssistant: Bool
     ) {
         self.sourceTargetPath = sourceTargetPath
@@ -501,7 +501,7 @@ struct ExperimentalMTPAcceptanceAccumulator: Equatable {
     }
 }
 
-extension GemmaRuntime {
+extension LagunaRuntime {
     public static func experimentalTrainedMTPBenchmark(
         _ options: ExperimentalTrainedMTPOptions,
         worker workerOptions: RuntimeWorkerOptions
@@ -649,7 +649,7 @@ extension GemmaRuntime {
         plan: ExperimentalMTPPromptPlan,
         maxBlockSize: Int,
         totalTokenCount: Int,
-        verificationMode: Gemma4MTPVerificationMode,
+        verificationMode: MTPVerificationMode,
         worker: RuntimeWorkerClient
     ) throws -> ExperimentalMTPDecodeMeasurement {
         var validator = try ExperimentalMTPBlockValidator(
@@ -832,8 +832,8 @@ extension GemmaRuntime {
             worker: worker
         )
         let assistantUnavailableReason =
-            "assistant weights unavailable/incompatible: the shipped Gemma 4 31B base checkpoint "
-            + "contains no drafter weights, and the known public Gemma 4 assistant targets are IT models"
+            "assistant weights unavailable/incompatible: the shipped base checkpoint "
+            + "contains no drafter weights"
         return ExperimentalMTPProbeReport(
             experimental: true,
             protocolName: "decode_block_v1",

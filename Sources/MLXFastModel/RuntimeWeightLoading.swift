@@ -2,12 +2,11 @@ import Foundation
 import MLX
 import MLXFastCore
 
-// Model-agnostic transformed-weight loading helpers shared by the Gemma 4 and
-// Laguna runtime weight caches. Everything here is keyed only on the
+// Model-agnostic transformed-weight loading helpers shared by the runtime
+// weight caches. Everything here is keyed only on the
 // safetensors index/shard structure and the `language_model.` text-tower
 // prefix convention -- nothing is specific to one architecture, so the
-// per-model loaders (`Gemma4RuntimeWeights.swift`, `LagunaRuntimeWeights.swift`)
-// can come and go without touching this file.
+// model-specific loaders can come and go without touching this file.
 
 func loadRuntimeWeightArrays(
     denseStore: DenseTensorStore

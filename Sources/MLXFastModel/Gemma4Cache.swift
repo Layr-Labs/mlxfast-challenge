@@ -146,9 +146,8 @@ public final class Gemma4ModelCache {
     /// caller-contract check without that readback.
     public private(set) var expectedPositionOffset = 0
 
-    /// A cap for full-attention layers' non-windowed cache, comfortably
-    /// above every scored sequence length used by the correctness, GPQA, and
-    /// benchmark protocols (see `MLXFastCore.Constants`), while staying small
+    /// A cap for full-attention layers' non-windowed cache, comfortably above
+    /// every configured experimental sequence length, while staying small
     /// enough that pre-allocation never approaches this bound in practice --
     /// the buffer only grows in small on-demand increments.
     public static let unboundedCacheCap = 1 << 16
@@ -209,8 +208,8 @@ public final class Gemma4ModelCache {
         }
     }
 
-    /// Bespoke per-layer KV arrays (retained for the standalone Gemma4KVCache
-    /// tests; the scored path uses the library `kvCaches` instead).
+    /// Bespoke per-layer KV arrays retained for standalone cache tests; the
+    /// experimental MTP path uses the library `kvCaches` instead.
     func arraysForMaterialization() -> [MLXArray] {
         layers.flatMap { $0.arraysForMaterialization() }
     }

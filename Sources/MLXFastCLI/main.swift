@@ -159,7 +159,7 @@ private enum MLXFastCLI {
                 fallback: defaultCorrectnessGoldenPath()
             )
         )
-        let report = try GemmaRuntime.runCorrectness(
+        let report = try LagunaRuntime.runCorrectness(
             CorrectnessOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath
@@ -173,7 +173,7 @@ private enum MLXFastCLI {
         FileHandle.standardOutput.write(data)
         print("")
         if !report.passed, report.error.contains("token mismatch") {
-            fputs("mlxfast-swift: \(GemmaRuntime.nonM5GoldenMismatchCaveat)\n", stderr)
+            fputs("mlxfast-swift: \(LagunaRuntime.nonM5GoldenMismatchCaveat)\n", stderr)
         }
         return report.passed ? 0 : 1
     }
@@ -203,7 +203,7 @@ private enum MLXFastCLI {
             throw MLXFastError.invalidInput("--top-k must be a positive integer")
         }
         let caseName = options.value(for: "--case", default: "")
-        let report = try GemmaRuntime.traceCorrectness(
+        let report = try LagunaRuntime.traceCorrectness(
             CorrectnessTraceOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
@@ -250,7 +250,7 @@ private enum MLXFastCLI {
                 "preflight requires the participant runtime worker"
             )
         }
-        try GemmaRuntime.runPreflightWithWorker(
+        try LagunaRuntime.runPreflightWithWorker(
             weightsPath: weightsPath,
             worker: worker
         )
@@ -306,7 +306,7 @@ private enum MLXFastCLI {
             let timingRepeats = localSubmit ? MLXFastConstants.localSubmitBenchmarkRepeats : 1
             let modeName = localSubmit ? "local-submit" : "local-iterate"
             let runtime = localSubmit ? "swift-local-submit" : "swift-local-iterate"
-            let payload = GemmaRuntime.localIterate(
+            let payload = LagunaRuntime.localIterate(
                 LocalIterateOptions(
                     weightsPath: weightsPath,
                     goldenPath: goldenPath,
@@ -365,7 +365,7 @@ private enum MLXFastCLI {
         // everything-in-one-run behavior.
         let checkGates = environmentValue("MLXFAST_BENCHMARK_CHECK_GATES", fallback: "1") != "0"
         let skipTimedBenchmark = environmentValue("MLXFAST_BENCHMARK_SKIP_TIMED", fallback: "0") == "1"
-        let payload = GemmaRuntime.benchmark(
+        let payload = LagunaRuntime.benchmark(
             BenchmarkOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
@@ -417,7 +417,7 @@ private enum MLXFastCLI {
                 "mtp-probe requires the runtime worker; MLXFAST_USE_RUNTIME_WORKER=0 is unsupported"
             )
         }
-        let report = try GemmaRuntime.experimentalMTPProbe(
+        let report = try LagunaRuntime.experimentalMTPProbe(
             ExperimentalMTPProbeOptions(
                 weightsPath: weightsPath,
                 goldenPath: goldenPath,
@@ -500,9 +500,9 @@ private enum MLXFastCLI {
         )
         let verificationValue = options.value(
             for: "--target-verification",
-            default: Gemma4MTPVerificationMode.exactPair.rawValue
+            default: MTPVerificationMode.exactPair.rawValue
         ).lowercased()
-        guard let verificationMode = Gemma4MTPVerificationMode(
+        guard let verificationMode = MTPVerificationMode(
             rawValue: verificationValue
         ) else {
             throw MLXFastError.invalidInput(
@@ -516,7 +516,7 @@ private enum MLXFastCLI {
                 "mtp-benchmark requires the sandboxed runtime worker"
             )
         }
-        let report = try GemmaRuntime.experimentalTrainedMTPBenchmark(
+        let report = try LagunaRuntime.experimentalTrainedMTPBenchmark(
             ExperimentalTrainedMTPOptions(
                 sourceTargetPath: sourceTargetPath,
                 targetWeightsPath: weightsPath,
@@ -796,7 +796,7 @@ private enum MLXFastCLI {
                 + "(covers decode offsets \(promptTokens.count)..<\(promptTokens.count + steps))\n",
             stderr
         )
-        let expectedTokens = try GemmaRuntime.generateGreedyTokens(
+        let expectedTokens = try LagunaRuntime.generateGreedyTokens(
             GreedyGenerationOptions(
                 weightsPath: weightsPath,
                 promptTokens: promptTokens,
@@ -905,7 +905,7 @@ private enum MLXFastCLI {
                 + "for case \(caseName) (prompt_tokens=\(promptTokens.count))\n",
             stderr
         )
-        let expectedTokens = try GemmaRuntime.generateGreedyTokens(
+        let expectedTokens = try LagunaRuntime.generateGreedyTokens(
             GreedyGenerationOptions(
                 weightsPath: weightsPath,
                 promptTokens: promptTokens,
@@ -1147,7 +1147,7 @@ private enum MLXFastCLI {
                 continue
             }
 
-            let generated = try GemmaRuntime.generateGreedyTokens(
+            let generated = try LagunaRuntime.generateGreedyTokens(
                 GreedyGenerationOptions(
                     weightsPath: weightsPath,
                     promptTokens: promptTokens,

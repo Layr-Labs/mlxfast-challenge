@@ -33,8 +33,8 @@ func gemma4LastTokenHidden(_ hidden: MLXArray) -> MLXArray {
     return hidden[0..., range, 0...]
 }
 
-/// Scored runtime model: last-token vocabulary head plus optional fused-MLP
-/// engine built from the loaded quantized modules.
+/// Legacy target model retained for the unranked experimental MTP commands.
+/// The ranked serial worker uses `LagunaRuntimeModel`.
 public final class Gemma4RuntimeModel: Module, LanguageModel {
     @ModuleInfo(key: "model") var model: Gemma4TextModelInner
 

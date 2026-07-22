@@ -96,11 +96,9 @@ overlay by changing both `Sources/MLXFastTransform/` and
 `Sources/MLXFastModel/`; correctness and benchmark results are the authority,
 not byte equality with the baseline layout.
 
-The public correctness-only prompt and golden are committed under
-`correctness_prompts/` so participants can run a local correctness smoke test
-(the checked-in fixtures are still legacy Gemma-generated and must be
-regenerated on m5-bench with the Laguna tokenizer, vocab 100352, before they
-gate Laguna code). The official correctness golden
+The public correctness-only prompt and Laguna-tokenized golden are committed
+under `correctness_prompts/` so participants can run a local correctness smoke
+test. The official correctness golden
 is supplied by the benchmark operator and is intentionally not committed to
 the public repo:
 

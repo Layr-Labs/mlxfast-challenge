@@ -20,10 +20,10 @@ func runtimeWorkerClientSkipsNonJSONStdoutLines() {
 @Test
 func commitIdentifierPrefersTrustedDispatchSHAOverGit() {
     let fullSHA = "5f95c4bdce07a0ef79ea350c91d9eb0d7476cf2f"
-    #expect(GemmaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": fullSHA]) == fullSHA)
+    #expect(LagunaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": fullSHA]) == fullSHA)
     // Short (rev-parse --short style) values and surrounding whitespace are fine.
-    #expect(GemmaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": "5f95c4bdce07"]) == "5f95c4bdce07")
-    #expect(GemmaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": " \(fullSHA)\n"]) == fullSHA)
+    #expect(LagunaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": "5f95c4bdce07"]) == "5f95c4bdce07")
+    #expect(LagunaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": " \(fullSHA)\n"]) == fullSHA)
 
     // Values that could not satisfy the trusted shell predicates fall back to
     // git instead of being stamped verbatim into the sealed score.
@@ -35,16 +35,16 @@ func commitIdentifierPrefersTrustedDispatchSHAOverGit() {
         "not-a-commit-sha",
         "5f95c4bdce07;rm -rf /",
     ] {
-        let fallback = GemmaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": invalid])
+        let fallback = LagunaRuntime.commitIdentifier(environment: ["MLXFAST_COMMIT_SHA": invalid])
         #expect(fallback != invalid || invalid.isEmpty)
         #expect(!fallback.contains(";"))
     }
 
-    #expect(GemmaRuntime.isCommitSHAHex(fullSHA))
-    #expect(GemmaRuntime.isCommitSHAHex("abcdef0"))
-    #expect(!GemmaRuntime.isCommitSHAHex("abcdef"))
-    #expect(!GemmaRuntime.isCommitSHAHex(String(repeating: "a", count: 41)))
-    #expect(!GemmaRuntime.isCommitSHAHex("ABCDEF0"))
+    #expect(LagunaRuntime.isCommitSHAHex(fullSHA))
+    #expect(LagunaRuntime.isCommitSHAHex("abcdef0"))
+    #expect(!LagunaRuntime.isCommitSHAHex("abcdef"))
+    #expect(!LagunaRuntime.isCommitSHAHex(String(repeating: "a", count: 41)))
+    #expect(!LagunaRuntime.isCommitSHAHex("ABCDEF0"))
 }
 
 @Test
@@ -613,9 +613,9 @@ func semanticBehaviorGateRequiresPromptAndReferenceAnswer() {
         semanticReferenceAnswer: "answer"
     )
 
-    #expect(!GemmaRuntime.behaviorUsesSemanticJudge(exactOnly))
-    #expect(!GemmaRuntime.behaviorUsesSemanticJudge(missingReference))
-    #expect(GemmaRuntime.behaviorUsesSemanticJudge(semantic))
+    #expect(!LagunaRuntime.behaviorUsesSemanticJudge(exactOnly))
+    #expect(!LagunaRuntime.behaviorUsesSemanticJudge(missingReference))
+    #expect(LagunaRuntime.behaviorUsesSemanticJudge(semantic))
 }
 
 @Test
@@ -653,7 +653,7 @@ func failedScoreRedactsCorrectnessTokenMismatchByDefault() {
         error: "token mismatch"
     )
 
-    let payload = GemmaRuntime.failedScore(
+    let payload = LagunaRuntime.failedScore(
         error: "token mismatch",
         correctness: report,
         passedCorrectness: false,
@@ -684,7 +684,7 @@ func failedScorePreservesExplicitPublicMismatchTokensAndRuntimeLabel() {
         error: "token mismatch"
     )
 
-    let payload = GemmaRuntime.failedScore(
+    let payload = LagunaRuntime.failedScore(
         error: "token mismatch",
         correctness: report,
         passedCorrectness: false,
@@ -730,7 +730,7 @@ func decodeTimingPlanRejectsInvalidRanges() throws {
 
 // The former editable decode-delay knob (Gemma4SubmissionControls
 // .measuredDecodeDelayMilliseconds, read via
-// GemmaRuntime.submissionValidationDelayMilliseconds) was model code invoked by
+// LagunaRuntime.submissionValidationDelayMilliseconds) was model code invoked by
 // trusted code ONLY on the scored decode path. Because submitted model code is
 // editable, being invoked only while timed was itself a phase oracle. The hook
 // is now removed entirely: the editable file is gone and no trusted harness
@@ -923,7 +923,7 @@ func nonWorkerBenchmarkRejectsBehaviorGatesBecauseTTFTRequiresWorker() throws {
     let fixture = try makePreflightFixture(goldenContents: validGoldenJSON(correctnessGates: behaviorGate))
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
-    let score = GemmaRuntime.benchmark(
+    let score = LagunaRuntime.benchmark(
         BenchmarkOptions(
             weightsPath: fixture.weights.path,
             goldenPath: fixture.golden.path,
@@ -1245,19 +1245,19 @@ private func writeIndex(_ path: URL, tensors: [TensorFixture], shardName: String
 @Test
 func localIterateDecodeProgressIntervalReportsEveryStepForShortRuns() {
     // local-iterate: 16 decode steps get a running-number line on every token.
-    #expect(GemmaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 16, timingRepeats: 1) == 1)
-    #expect(GemmaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 32, timingRepeats: 1) == 1)
+    #expect(LagunaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 16, timingRepeats: 1) == 1)
+    #expect(LagunaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 32, timingRepeats: 1) == 1)
     // local-submit: 1023 steps keep the historical 8-step cadence.
-    #expect(GemmaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 1023, timingRepeats: 1) == 8)
+    #expect(LagunaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 1023, timingRepeats: 1) == 8)
     // Multi-repeat runs keep the sparser 64-step cadence.
-    #expect(GemmaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 512, timingRepeats: 4) == 64)
+    #expect(LagunaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 512, timingRepeats: 4) == 64)
 }
 
 @Test
 func localIterateProjectedDecodeSecondsPerTokenConvergesToChargedMean() {
     // Mid-run: charged 20s so far (18s seed + 2s steps), 2 of 16 tokens done at
     // 1s/step mean -> project 14 more step-seconds on top of the charged 20.
-    let projected = GemmaRuntime.localIterateProjectedDecodeSecondsPerToken(
+    let projected = LagunaRuntime.localIterateProjectedDecodeSecondsPerToken(
         chargedSecondsSoFar: 20,
         stepOnlySecondsSoFar: 2,
         decodedTokens: 2,
@@ -1266,7 +1266,7 @@ func localIterateProjectedDecodeSecondsPerTokenConvergesToChargedMean() {
     #expect(abs(projected - (20.0 + 14.0) / 16.0) < 1e-12)
 
     // Final token: exactly the charged mean the score payload will report.
-    let final = GemmaRuntime.localIterateProjectedDecodeSecondsPerToken(
+    let final = LagunaRuntime.localIterateProjectedDecodeSecondsPerToken(
         chargedSecondsSoFar: 32,
         stepOnlySecondsSoFar: 14,
         decodedTokens: 16,
@@ -1276,7 +1276,7 @@ func localIterateProjectedDecodeSecondsPerTokenConvergesToChargedMean() {
 
     // Guards.
     #expect(
-        GemmaRuntime.localIterateProjectedDecodeSecondsPerToken(
+        LagunaRuntime.localIterateProjectedDecodeSecondsPerToken(
             chargedSecondsSoFar: 1,
             stepOnlySecondsSoFar: 1,
             decodedTokens: 0,
@@ -1287,7 +1287,7 @@ func localIterateProjectedDecodeSecondsPerTokenConvergesToChargedMean() {
 
 @Test
 func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
-    let status = GemmaRuntime.localIterateLiveDecodeStatus(
+    let status = LagunaRuntime.localIterateLiveDecodeStatus(
         lastStepSeconds: 0.9,
         chargedSecondsSoFar: 20,
         stepOnlySecondsSoFar: 2,
@@ -1307,7 +1307,7 @@ func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
     #expect(!status.contains("expert_hit_rate="))
 
     // The final step has no ETA.
-    let finalStep = GemmaRuntime.localIterateLiveDecodeStatus(
+    let finalStep = LagunaRuntime.localIterateLiveDecodeStatus(
         lastStepSeconds: 1,
         chargedSecondsSoFar: 32,
         stepOnlySecondsSoFar: 14,
@@ -1318,7 +1318,7 @@ func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
     #expect(!finalStep.contains("decode_eta_seconds="))
 
     // Before prefill has a positive measurement there is no score estimate.
-    let withoutPrefill = GemmaRuntime.localIterateLiveDecodeStatus(
+    let withoutPrefill = LagunaRuntime.localIterateLiveDecodeStatus(
         lastStepSeconds: 0.9,
         chargedSecondsSoFar: 20,
         stepOnlySecondsSoFar: 2,
@@ -1330,7 +1330,7 @@ func localIterateLiveDecodeStatusIncludesProjectedSpeedupAndScore() {
     #expect(!withoutPrefill.contains("projected_score="))
 
     #expect(
-        GemmaRuntime.localIterateLiveDecodeStatus(
+        LagunaRuntime.localIterateLiveDecodeStatus(
             lastStepSeconds: 0,
             chargedSecondsSoFar: 0,
             stepOnlySecondsSoFar: 0,
@@ -1622,7 +1622,7 @@ func runtimeWorkerStartsTheOrphanReaperBeforeLoadingTheModel() throws {
     // model-loading work, or the load window (the exact window stdin-EOF
     // cannot cover) is left unprotected.
     let worker = try String(
-        contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeWorker.swift",
+        contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimeWorker.swift",
         encoding: .utf8
     )
     let reaperCall = try #require(worker.range(of: "startRuntimeWorkerOrphanReaper()"))
@@ -1635,7 +1635,7 @@ func runtimeWorkerStartsTheOrphanReaperBeforeLoadingTheModel() throws {
 
 @Test
 func localIteratePrefillStatusReportsPerTokenAndSpeedup() {
-    let status = GemmaRuntime.localIteratePrefillStatus(
+    let status = LagunaRuntime.localIteratePrefillStatus(
         elapsedSeconds: 51.2,
         promptTokens: 512
     )
@@ -1646,15 +1646,15 @@ func localIteratePrefillStatusReportsPerTokenAndSpeedup() {
 
     // Zero-duration or zero-token inputs fall back to the plain seconds field.
     #expect(
-        GemmaRuntime.localIteratePrefillStatus(elapsedSeconds: 0, promptTokens: 512)
+        LagunaRuntime.localIteratePrefillStatus(elapsedSeconds: 0, promptTokens: 512)
             == "seconds=0.0"
     )
 }
 
 @Test
 func localIterateSummaryEmitsSpeedupsAndEstimatedScore() {
-    let timing = GemmaRuntime.LocalIterateTimingResult(
-        correctness: GemmaRuntime.localIterateCorrectnessReport(
+    let timing = LagunaRuntime.LocalIterateTimingResult(
+        correctness: LagunaRuntime.localIterateCorrectnessReport(
             passed: true,
             checkedSteps: 18,
             caseCount: 1,
@@ -1667,7 +1667,7 @@ func localIterateSummaryEmitsSpeedupsAndEstimatedScore() {
             modeName: "local-iterate"
         ),
         prefillSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken / 2,
-        decode: GemmaRuntime.DecodeMeasurement(
+        decode: LagunaRuntime.DecodeMeasurement(
             secondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken / 2,
             bandwidthGBPerToken: 0,
             bandwidthSource: "ram_resident_model"
@@ -1677,7 +1677,7 @@ func localIterateSummaryEmitsSpeedupsAndEstimatedScore() {
     )
 
     var lines: [String] = []
-    GemmaRuntime.emitLocalIterateSummary(
+    LagunaRuntime.emitLocalIterateSummary(
         modeName: "local-iterate",
         timing: timing,
         progress: { lines.append($0) }
@@ -1703,7 +1703,7 @@ func localIterateSummaryEmitsSpeedupsAndEstimatedScore() {
 // summary prints) as a numeric, CLI-usable score.
 @Test
 func localIterateScorePublishesCLIUsableEstimatedScore() throws {
-    let payload = GemmaRuntime.localIterateScore(
+    let payload = LagunaRuntime.localIterateScore(
         peakRamGB: 24.5,
         bandwidthGBPerToken: 0,
         decodeSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken / 2,
@@ -1712,7 +1712,7 @@ func localIterateScorePublishesCLIUsableEstimatedScore() throws {
         validationSeconds: 1,
         correctnessSeconds: 5,
         timedSeconds: 5,
-        correctness: GemmaRuntime.localIterateCorrectnessReport(
+        correctness: LagunaRuntime.localIterateCorrectnessReport(
             passed: true,
             checkedSteps: 18,
             caseCount: 1,
@@ -1759,7 +1759,7 @@ func localIterateScorePublishesCLIUsableEstimatedScore() throws {
 func localIterateScoreFailsForUnusableTimings() {
     // Zero/invalid timings make the estimate non-finite. The payload must be a
     // failed run, not a passing result that merely omits its score.
-    let payload = GemmaRuntime.localIterateScore(
+    let payload = LagunaRuntime.localIterateScore(
         peakRamGB: 0,
         bandwidthGBPerToken: 0,
         decodeSecondsPerToken: 0,
@@ -1768,7 +1768,7 @@ func localIterateScoreFailsForUnusableTimings() {
         validationSeconds: 0,
         correctnessSeconds: 0,
         timedSeconds: 0,
-        correctness: GemmaRuntime.localIterateCorrectnessReport(
+        correctness: LagunaRuntime.localIterateCorrectnessReport(
             passed: true,
             checkedSteps: 18,
             caseCount: 1,
@@ -1794,7 +1794,7 @@ func localIterateScoreFailsForUnusableTimings() {
 
 @Test
 func localIterateScoreSanitizesNonfiniteFailureMetricsForJSON() throws {
-    let payload = GemmaRuntime.localIterateScore(
+    let payload = LagunaRuntime.localIterateScore(
         peakRamGB: .nan,
         bandwidthGBPerToken: .infinity,
         decodeSecondsPerToken: .nan,
@@ -1803,7 +1803,7 @@ func localIterateScoreSanitizesNonfiniteFailureMetricsForJSON() throws {
         validationSeconds: .nan,
         correctnessSeconds: .infinity,
         timedSeconds: -1,
-        correctness: GemmaRuntime.localIterateCorrectnessReport(
+        correctness: LagunaRuntime.localIterateCorrectnessReport(
             passed: true,
             checkedSteps: 18,
             caseCount: 1,
@@ -1864,7 +1864,7 @@ func localIterateScoreSanitizesNonfiniteFailureMetricsForJSON() throws {
 @Test
 func firstTokenMismatchReportIncludesNonM5GoldenCaveat() {
     var lines: [String] = []
-    GemmaRuntime.reportFirstTokenMismatch(
+    LagunaRuntime.reportFirstTokenMismatch(
         { lines.append($0) },
         modeName: "local-iterate",
         checkedStep: 17
@@ -1898,7 +1898,7 @@ func localFailedRunWithMeasuredTimingsStillPublishesNumericEstimatedScore() thro
         goldenHash: "golden",
         error: "local-iterate teacher-forced token mismatch"
     )
-    let failed = GemmaRuntime.failedScore(
+    let failed = LagunaRuntime.failedScore(
         error: "local-iterate teacher-forced token mismatch",
         correctness: report,
         passedCorrectness: false,
@@ -1910,7 +1910,7 @@ func localFailedRunWithMeasuredTimingsStillPublishesNumericEstimatedScore() thro
     )
 
     var lines: [String] = []
-    let payload = GemmaRuntime.localModeFailedPayloadWithEstimatedScore(
+    let payload = LagunaRuntime.localModeFailedPayloadWithEstimatedScore(
         failed,
         modeName: "local-iterate",
         progress: { lines.append($0) }
@@ -1946,14 +1946,14 @@ func localFailedRunWithMeasuredTimingsStillPublishesNumericEstimatedScore() thro
 // payloads are never touched.
 @Test
 func localFailedPayloadWithoutTimingsKeepsNullScore() {
-    let noTimings = GemmaRuntime.failedScore(
+    let noTimings = LagunaRuntime.failedScore(
         error: "local-iterate public golden must contain at least one case",
         correctness: nil,
         passedCorrectness: false,
         runtime: "swift-local-iterate"
     )
     var lines: [String] = []
-    let unchanged = GemmaRuntime.localModeFailedPayloadWithEstimatedScore(
+    let unchanged = LagunaRuntime.localModeFailedPayloadWithEstimatedScore(
         noTimings,
         modeName: "local-iterate",
         progress: { lines.append($0) }
@@ -1963,7 +1963,7 @@ func localFailedPayloadWithoutTimingsKeepsNullScore() {
     #expect(lines.isEmpty)
 
     let passing = ScorePayload(score: 1.5, passed: true, metrics: noTimings.metrics)
-    let stillPassing = GemmaRuntime.localModeFailedPayloadWithEstimatedScore(
+    let stillPassing = LagunaRuntime.localModeFailedPayloadWithEstimatedScore(
         passing,
         modeName: "local-iterate",
         progress: { lines.append($0) }
@@ -1989,7 +1989,7 @@ func rankedScoreSemanticsAreUnchangedByLocalEstimatedScore() {
         goldenHash: "hash",
         error: ""
     )
-    let passed = GemmaRuntime.passedScore(
+    let passed = LagunaRuntime.passedScore(
         score: 1.25,
         peakRamGB: 20,
         bandwidthGBPerToken: 0,
@@ -2009,7 +2009,7 @@ func rankedScoreSemanticsAreUnchangedByLocalEstimatedScore() {
     #expect(passed.score == 1.25)
     #expect(passed.metrics.runtime == "swift")
 
-    let failed = GemmaRuntime.failedScore(
+    let failed = LagunaRuntime.failedScore(
         error: "boom",
         correctness: nil,
         passedCorrectness: false,
@@ -2037,11 +2037,11 @@ func localIteratePhaseHeartbeatFiresWhileBlockedAndStopsAfterCancel() throws {
     }
 
     // No progress sink means no timer at all.
-    #expect(GemmaRuntime.startPhaseHeartbeat(label: "x", progress: nil) == nil)
+    #expect(LagunaRuntime.startPhaseHeartbeat(label: "x", progress: nil) == nil)
 
     let box = MessageBox()
     let heartbeat = try #require(
-        GemmaRuntime.startPhaseHeartbeat(
+        LagunaRuntime.startPhaseHeartbeat(
             label: "local-iterate prefill measured",
             intervalSeconds: 0.05,
             progress: { box.append($0) }

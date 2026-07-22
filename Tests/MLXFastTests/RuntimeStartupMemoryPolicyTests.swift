@@ -4,7 +4,7 @@ import Testing
 
 @Test
 func startupMemoryPolicyProtectsDocumented36GiBLocalMachine() {
-    let policy = Gemma4StartupMemoryPolicy.resolve(
+    let policy = RuntimeStartupMemoryPolicy.resolve(
         physicalMemoryBytes: UInt64(36) << 30
     )
 
@@ -39,13 +39,13 @@ func lowMemoryOverridesNameOnlyFlagsReadByModelSources() throws {
     let modelSourcesDirectory = "Sources/MLXFastModel"
     let sourceFiles = try FileManager.default
         .contentsOfDirectory(atPath: modelSourcesDirectory)
-        .filter { $0.hasSuffix(".swift") && $0 != "Gemma4StartupMemoryPolicy.swift" }
+        .filter { $0.hasSuffix(".swift") && $0 != "RuntimeStartupMemoryPolicy.swift" }
     #expect(!sourceFiles.isEmpty)
     let combinedSources = try sourceFiles
         .map { try String(contentsOfFile: "\(modelSourcesDirectory)/\($0)", encoding: .utf8) }
         .joined(separator: "\n")
 
-    let policy = Gemma4StartupMemoryPolicy.resolve(
+    let policy = RuntimeStartupMemoryPolicy.resolve(
         physicalMemoryBytes: UInt64(36) << 30
     )
     for name in policy.environmentOverrides.keys.sorted() {
@@ -59,7 +59,7 @@ func lowMemoryOverridesNameOnlyFlagsReadByModelSources() throws {
 // The documented low-memory startup profile (<64 GiB machines: 6 GiB MLX
 // allocator cap, feature-disable env defaults, warmup-buffer clear before
 // the protocol hello) applies to the LAGUNA runtime worker, not only the
-// retained Gemma path. The Laguna weight cache must resolve the policy
+// retained experimental MTP path. The Laguna weight cache must resolve the policy
 // before its model load and honor clearAllocatorCacheAfterWarmup; the full
 // profile stays a no-op there (the ranked box keeps stock allocator
 // behavior, matching how the pinned baseline was measured).
@@ -69,15 +69,15 @@ func lagunaWeightCacheConsultsStartupMemoryPolicy() throws {
         contentsOfFile: "Sources/MLXFastModel/LagunaRuntimeWeights.swift",
         encoding: .utf8
     )
-    #expect(source.contains("Gemma4StartupMemoryPolicy.resolve("))
-    #expect(source.contains("Gemma4StartupMemoryPolicy.profileOverrideEnvironmentName"))
+    #expect(source.contains("RuntimeStartupMemoryPolicy.resolve("))
+    #expect(source.contains("RuntimeStartupMemoryPolicy.profileOverrideEnvironmentName"))
     #expect(source.contains("if policy.isLowMemory {"))
     #expect(source.contains("startupMemoryPolicy?.clearAllocatorCacheAfterWarmup == true"))
 }
 
 @Test
 func startupMemoryPolicyKeepsRanked128GiBProfile() {
-    let policy = Gemma4StartupMemoryPolicy.resolve(
+    let policy = RuntimeStartupMemoryPolicy.resolve(
         physicalMemoryBytes: UInt64(128) << 30
     )
 
@@ -98,12 +98,12 @@ func startupMemoryPolicyKeepsRanked128GiBProfile() {
 @Test
 func startupMemoryPolicyUses64GiBAsFullProfileBoundary() {
     #expect(
-        Gemma4StartupMemoryPolicy.resolve(
+        RuntimeStartupMemoryPolicy.resolve(
             physicalMemoryBytes: (UInt64(64) << 30) - 1
         ).isLowMemory
     )
     #expect(
-        !Gemma4StartupMemoryPolicy.resolve(
+        !RuntimeStartupMemoryPolicy.resolve(
             physicalMemoryBytes: UInt64(64) << 30
         ).isLowMemory
     )
@@ -112,31 +112,31 @@ func startupMemoryPolicyUses64GiBAsFullProfileBoundary() {
 @Test
 func startupMemoryPolicyHonorsExplicitProfileRequest() {
     #expect(
-        !Gemma4StartupMemoryPolicy.resolve(
+        !RuntimeStartupMemoryPolicy.resolve(
             physicalMemoryBytes: UInt64(36) << 30,
             requestedProfile: "full"
         ).isLowMemory
     )
     #expect(
-        Gemma4StartupMemoryPolicy.resolve(
+        RuntimeStartupMemoryPolicy.resolve(
             physicalMemoryBytes: UInt64(128) << 30,
             requestedProfile: "low"
         ).isLowMemory
     )
     #expect(
-        !Gemma4StartupMemoryPolicy.resolve(
+        !RuntimeStartupMemoryPolicy.resolve(
             physicalMemoryBytes: UInt64(36) << 30,
             requestedProfile: "FULL"
         ).isLowMemory
     )
     #expect(
-        Gemma4StartupMemoryPolicy.resolve(
+        RuntimeStartupMemoryPolicy.resolve(
             physicalMemoryBytes: UInt64(36) << 30,
             requestedProfile: "auto"
         ).isLowMemory
     )
     #expect(
-        Gemma4StartupMemoryPolicy.resolve(
+        RuntimeStartupMemoryPolicy.resolve(
             physicalMemoryBytes: UInt64(36) << 30,
             requestedProfile: ""
         ).isLowMemory
@@ -145,14 +145,14 @@ func startupMemoryPolicyHonorsExplicitProfileRequest() {
     // environment allowlist forwards that family, so renaming it (e.g. to
     // MLXFAST_*) would silently stop it from ever reaching the worker.
     #expect(
-        Gemma4StartupMemoryPolicy.profileOverrideEnvironmentName
+        RuntimeStartupMemoryPolicy.profileOverrideEnvironmentName
             == "DARKBLOOM_STARTUP_MEMORY_PROFILE"
     )
 }
 
 @Test
 func lowMemoryPlanPreservesUserSetFlagsAndReportsThem() throws {
-    let policy = Gemma4StartupMemoryPolicy.resolve(
+    let policy = RuntimeStartupMemoryPolicy.resolve(
         physicalMemoryBytes: UInt64(36) << 30
     )
     let userSet = "DARKBLOOM_GATE_UP_COTILED_FIXED12"
@@ -176,7 +176,7 @@ func lowMemoryPlanPreservesUserSetFlagsAndReportsThem() throws {
 
 @Test
 func lowMemoryPlanAppliesAllDefaultsWhenNoneAreUserSet() throws {
-    let policy = Gemma4StartupMemoryPolicy.resolve(
+    let policy = RuntimeStartupMemoryPolicy.resolve(
         physicalMemoryBytes: UInt64(36) << 30
     )
     let plan = policy.environmentPlan { _ in nil }
@@ -198,7 +198,7 @@ func startupMemoryPolicyIsAppliedBeforeModelLoadAndCleansWarmupCache() throws {
     let initBody = try initializerBody(of: source)
 
     let resolve = try #require(
-        initBody.range(of: "Gemma4StartupMemoryPolicy.resolve(")
+        initBody.range(of: "RuntimeStartupMemoryPolicy.resolve(")
     )
     let apply = try #require(initBody.range(of: "policy.apply()"))
     let load = try #require(initBody.range(of: "loadLibraryModel("))
@@ -207,7 +207,7 @@ func startupMemoryPolicyIsAppliedBeforeModelLoadAndCleansWarmupCache() throws {
     // The explicit profile request must come from the worker-reachable
     // DARKBLOOM_ override name, not a hardcoded or harness-only variable.
     #expect(
-        initBody.contains("Gemma4StartupMemoryPolicy.profileOverrideEnvironmentName")
+        initBody.contains("RuntimeStartupMemoryPolicy.profileOverrideEnvironmentName")
     )
 
     let warmup = try #require(initBody.range(of: "Self.warmLibraryModel(model)"))

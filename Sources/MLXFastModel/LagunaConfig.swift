@@ -3,8 +3,7 @@ import Foundation
 import MLXFastCore
 
 /// Frozen invariants of the pinned Poolside Laguna XS 2.1 4-bit target
-/// (`mlx-community/Laguna-XS-2.1-4bit`). These mirror the role
-/// `MLXFastConstants` plays for the Gemma 4 runtime, but live here because
+/// (`mlx-community/Laguna-XS-2.1-4bit`). They live here because
 /// `MLXFastCore` is trusted harness code outside the editable surface.
 ///
 /// Laguna is a 256-expert MoE decoder: 40 layers, hidden 2048, GQA with 8 KV

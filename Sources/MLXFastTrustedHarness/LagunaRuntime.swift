@@ -319,11 +319,11 @@ public struct RuntimeWorkerOptions: Equatable {
     }
 }
 
-// Implementation lives in the GemmaRuntime*.swift split files.
-public enum GemmaRuntime {}
+// Implementation lives in the LagunaRuntime*.swift split files.
+public enum LagunaRuntime {}
 
 #if !MLXFAST_TRUSTED_HARNESS
-extension GemmaRuntime {
+extension LagunaRuntime {
     /// The Laguna runtime keeps every text-tower weight (including all 256
     /// routed experts) RAM-resident; there is no expert streaming machinery,
     /// so score/worker protocol fields stay zero.

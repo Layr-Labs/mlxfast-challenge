@@ -592,7 +592,7 @@ private struct Packed12OutputMetadata: @unchecked Sendable {
 
         let words = MLXArray(packed, [5_376, wordsPerRow])
         // Packing and host-to-Metal materialization happen while the model is
-        // initialized, before any scored prefill or decode phase begins.
+        // initialized, before any prefill or decode request begins.
         eval(words)
         self.words = words
     }

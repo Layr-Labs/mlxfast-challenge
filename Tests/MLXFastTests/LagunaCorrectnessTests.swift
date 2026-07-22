@@ -7,8 +7,8 @@ import MLXFastCore
 import Testing
 
 @Test
-func gemmaCorrectnessComparesExpectedTokenSequences() {
-    let pass = GemmaCorrectness.compareTokens(
+func lagunaCorrectnessComparesExpectedTokenSequences() {
+    let pass = LagunaCorrectness.compareTokens(
         expected: [4, 5, 6],
         actual: [4, 5, 6],
         steps: 3
@@ -17,7 +17,7 @@ func gemmaCorrectnessComparesExpectedTokenSequences() {
     #expect(pass.checkedSteps == 3)
     #expect(pass.firstFailingStep == nil)
 
-    let fail = GemmaCorrectness.compareTokens(
+    let fail = LagunaCorrectness.compareTokens(
         expected: [4, 5, 6],
         actual: [4, 9, 6],
         steps: 3
@@ -28,7 +28,7 @@ func gemmaCorrectnessComparesExpectedTokenSequences() {
     #expect(fail.expectedToken == 5)
     #expect(fail.actualToken == 9)
 
-    let short = GemmaCorrectness.compareTokens(
+    let short = LagunaCorrectness.compareTokens(
         expected: [4, 5, 6],
         actual: [4],
         steps: 3
@@ -39,7 +39,7 @@ func gemmaCorrectnessComparesExpectedTokenSequences() {
     #expect(short.expectedToken == 5)
     #expect(short.actualToken == nil)
 
-    let expectedShort = GemmaCorrectness.compareTokens(
+    let expectedShort = LagunaCorrectness.compareTokens(
         expected: [4],
         actual: [4, 5],
         steps: 2
@@ -50,7 +50,7 @@ func gemmaCorrectnessComparesExpectedTokenSequences() {
     #expect(expectedShort.expectedToken == nil)
     #expect(expectedShort.actualToken == 5)
 
-    let bothShort = GemmaCorrectness.compareTokens(
+    let bothShort = LagunaCorrectness.compareTokens(
         expected: [4],
         actual: [4],
         steps: 2
@@ -63,9 +63,9 @@ func gemmaCorrectnessComparesExpectedTokenSequences() {
 }
 
 @Test
-func gemmaCorrectnessGeneratesGreedyTokensWithGrowingContext() throws {
+func lagunaCorrectnessGeneratesGreedyTokensWithGrowingContext() throws {
     var contexts: [[Int]] = []
-    let generated = try GemmaCorrectness.generateGreedyNoCache(
+    let generated = try LagunaCorrectness.generateGreedyNoCache(
         promptTokens: [10, 11],
         steps: 3
     ) { context in
@@ -78,10 +78,10 @@ func gemmaCorrectnessGeneratesGreedyTokensWithGrowingContext() throws {
 }
 
 @Test
-func gemmaCorrectnessTeacherForcedUsesGoldenPrefix() throws {
+func lagunaCorrectnessTeacherForcedUsesGoldenPrefix() throws {
     var contexts: [[Int]] = []
     let expected = [20, 21, 22]
-    let comparison = try GemmaCorrectness.compareTeacherForcedNoCache(
+    let comparison = try LagunaCorrectness.compareTeacherForcedNoCache(
         promptTokens: [10, 11],
         expectedTokens: expected,
         steps: expected.count
@@ -140,11 +140,11 @@ func correctnessReportEncodesStableFailureFields() throws {
 }
 
 @Test
-func gemmaRuntimeCorrectnessReportsMissingArtifacts() throws {
+func lagunaRuntimeCorrectnessReportsMissingArtifacts() throws {
     let directory = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
 
-    let report = try GemmaRuntime.runCorrectness(
+    let report = try LagunaRuntime.runCorrectness(
         CorrectnessOptions(
             weightsPath: directory.appendingPathComponent("missing-weights").path,
             goldenPath: directory.appendingPathComponent("missing-golden.json").path
@@ -158,7 +158,7 @@ func gemmaRuntimeCorrectnessReportsMissingArtifacts() throws {
 }
 
 @Test
-func gemmaRuntimeCorrectnessReportsGoldenMetadataWhenWeightsAreMissing() throws {
+func lagunaRuntimeCorrectnessReportsGoldenMetadataWhenWeightsAreMissing() throws {
     let directory = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
 
@@ -178,7 +178,7 @@ func gemmaRuntimeCorrectnessReportsGoldenMetadataWhenWeightsAreMissing() throws 
     """
     try json.write(to: goldenPath, atomically: true, encoding: .utf8)
 
-    let report = try GemmaRuntime.runCorrectness(
+    let report = try LagunaRuntime.runCorrectness(
         CorrectnessOptions(
             weightsPath: directory.appendingPathComponent("missing-weights").path,
             goldenPath: goldenPath.path

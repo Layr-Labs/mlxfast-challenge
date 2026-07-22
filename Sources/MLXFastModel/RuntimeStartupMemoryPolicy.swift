@@ -3,11 +3,11 @@ import MLX
 
 /// Selects a model-startup profile from the machine's physical-memory budget.
 ///
-/// The optimized Gemma runtime can retain roughly 14.5 GiB of alternate
-/// co-tiled/combined weight layouts in addition to the ~16.9 GiB checkpoint.
-/// That full profile is appropriate for the 128 GiB ranked runner, but leaves
-/// too little headroom for macOS, warmup activations, KV state, and Metal
-/// buffers on the documented 36 GiB local minimum.
+/// Editable runtime paths may retain large alternate weight layouts in
+/// addition to the ~18.8 GiB Laguna checkpoint. The full profile is
+/// appropriate for the 128 GiB ranked runner, but may leave too little
+/// headroom for macOS, warmup activations, KV state, and Metal buffers on the
+/// documented 36 GiB local minimum.
 ///
 /// The low-memory feature defaults never clobber explicit settings: a flag
 /// the user already exported keeps its value (so, for example, verifying a
@@ -16,7 +16,7 @@ import MLX
 /// `DARKBLOOM_STARTUP_MEMORY_PROFILE=full|low|auto`. When the low-memory
 /// profile engages it announces itself on stderr, including any user-set
 /// flags it preserved.
-public struct Gemma4StartupMemoryPolicy: Equatable, Sendable {
+public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
     public static let fullProfileMinimumPhysicalMemoryBytes = UInt64(64) << 30
 
     /// Environment name for the explicit profile override. It must keep the
@@ -39,7 +39,7 @@ public struct Gemma4StartupMemoryPolicy: Equatable, Sendable {
     public static func resolve(
         physicalMemoryBytes: UInt64,
         requestedProfile: String? = nil
-    ) -> Gemma4StartupMemoryPolicy {
+    ) -> RuntimeStartupMemoryPolicy {
         let lowMemory: Bool
         let selectionReason: String
         switch requestedProfile?.lowercased() ?? "" {
@@ -61,7 +61,7 @@ public struct Gemma4StartupMemoryPolicy: Equatable, Sendable {
         }
 
         if lowMemory {
-            return Gemma4StartupMemoryPolicy(
+            return RuntimeStartupMemoryPolicy(
                 isLowMemory: true,
                 selectionReason: selectionReason,
                 cacheLimitBytes: 6 << 30,
@@ -108,7 +108,7 @@ public struct Gemma4StartupMemoryPolicy: Equatable, Sendable {
             )
         }
 
-        return Gemma4StartupMemoryPolicy(
+        return RuntimeStartupMemoryPolicy(
             isLowMemory: false,
             selectionReason: selectionReason,
             // Ranked/full profile -- byte-identical to the constants this
@@ -136,7 +136,7 @@ public struct Gemma4StartupMemoryPolicy: Equatable, Sendable {
     /// the notice without mutating process state.
     func environmentPlan(
         existingValue: (String) -> String?
-    ) -> Gemma4StartupMemoryEnvironmentPlan {
+    ) -> RuntimeStartupMemoryEnvironmentPlan {
         var defaultsToApply: [String: String] = [:]
         var preservedUserValues: [String: String] = [:]
         for (name, value) in environmentOverrides {
@@ -164,7 +164,7 @@ public struct Gemma4StartupMemoryPolicy: Equatable, Sendable {
                 )
             }
         }
-        return Gemma4StartupMemoryEnvironmentPlan(
+        return RuntimeStartupMemoryEnvironmentPlan(
             defaultsToApply: defaultsToApply,
             preservedUserValues: preservedUserValues,
             noticeLines: noticeLines
@@ -198,8 +198,8 @@ public struct Gemma4StartupMemoryPolicy: Equatable, Sendable {
     }
 }
 
-/// See `Gemma4StartupMemoryPolicy.environmentPlan(existingValue:)`.
-struct Gemma4StartupMemoryEnvironmentPlan: Equatable, Sendable {
+/// See `RuntimeStartupMemoryPolicy.environmentPlan(existingValue:)`.
+struct RuntimeStartupMemoryEnvironmentPlan: Equatable, Sendable {
     let defaultsToApply: [String: String]
     let preservedUserValues: [String: String]
     let noticeLines: [String]

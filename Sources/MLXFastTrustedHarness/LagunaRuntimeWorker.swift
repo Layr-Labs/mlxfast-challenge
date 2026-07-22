@@ -9,11 +9,11 @@ import MLXFastModel
 import MLXLMCommon
 #endif
 
-// GemmaRuntime is split across GemmaRuntime*.swift for auditability.
+// LagunaRuntime is split across LagunaRuntime*.swift for auditability.
 // Generated split; behavior identical to the original single file.
 
 #if !MLXFAST_TRUSTED_HARNESS
-extension GemmaRuntime {
+extension LagunaRuntime {
     public static func runWorker(weightsPath: String) throws {
         // The worker holds the ~19 GB model for its whole lifetime, so it must
         // never outlive the harness parent that spawned it. Reading protocol
@@ -139,7 +139,7 @@ extension GemmaRuntime {
     /// the defaults.
     @discardableResult
     static func startRuntimeWorkerOrphanReaper(
-        pollIntervalSeconds: Double = GemmaRuntime.runtimeWorkerOrphanPollSeconds,
+        pollIntervalSeconds: Double = LagunaRuntime.runtimeWorkerOrphanPollSeconds,
         isOrphaned: @escaping @Sendable () -> Bool = { getppid() == 1 },
         onOrphaned: @escaping @Sendable () -> Void = {
             fputs(
@@ -195,10 +195,8 @@ extension GemmaRuntime {
         }
     }
 
-    /// One forward through the RAM-resident Laguna runtime model. This is
-    /// the harness-side replacement for the former static
-    /// `Gemma4Model.logits(inputIDs:weightCache:cache:positionOffset:)`
-    /// adapter: Laguna is an INSTANCE model whose per-layer `[KVCache]`
+    /// One forward through the RAM-resident Laguna runtime model. Laguna is
+    /// an INSTANCE model whose per-layer `[KVCache]`
     /// stack both stores K/V and supplies RoPE positions, so the model
     /// takes no explicit offset. `positionOffset` is kept as the caller's
     /// statement of where the sequence should be and is validated against
@@ -215,8 +213,7 @@ extension GemmaRuntime {
         return model(inputIDs, cache: cache)
     }
 
-    /// Mirrors the former `verifyCachePosition` check inside the Gemma 4
-    /// adapter: every layer cache must agree on one logical offset
+    /// Every layer cache must agree on one logical offset
     /// (`StandardKVCache` and `RotatingKVCache` both count total positions
     /// seen), and it must equal the caller's expected position.
     static func verifyLagunaCachePosition(
@@ -239,10 +236,8 @@ extension GemmaRuntime {
         }
     }
 
-    /// Force-evaluate the per-layer KV state (the Laguna analog of the
-    /// former `Gemma4ModelCache.materializeCachedState()`), so the seed
-    /// prefill's cache writes are complete before decode steps are timed
-    /// against it.
+    /// Force-evaluate the per-layer KV state so the seed prefill's cache
+    /// writes are complete before decode steps are timed against it.
     static func materializeLagunaCacheState(_ cache: [KVCache]) {
         eval(cache)
     }
@@ -311,7 +306,7 @@ extension GemmaRuntime {
                 cache: cache,
                 positionOffset: 0
             )
-            let token = try GemmaCorrectness.greedyToken(from: logits)
+            let token = try LagunaCorrectness.greedyToken(from: logits)
             let diagnostics = try correctnessLogitDiagnostics(
                 from: logits,
                 topK: request.topK
@@ -347,7 +342,7 @@ extension GemmaRuntime {
                 cache: cache,
                 positionOffset: state.correctnessPromptTokenCount + state.correctnessStep
             )
-            let token = try GemmaCorrectness.greedyToken(from: logits)
+            let token = try LagunaCorrectness.greedyToken(from: logits)
             let diagnostics = try correctnessLogitDiagnostics(
                 from: logits,
                 topK: request.topK
@@ -382,7 +377,7 @@ extension GemmaRuntime {
                 positionOffset: 0
             )
             eval(logits)
-            let token = try GemmaCorrectness.greedyToken(from: logits)
+            let token = try LagunaCorrectness.greedyToken(from: logits)
             return RuntimeWorkerResponse(
                 id: request.id,
                 nonce: sessionNonce,
@@ -418,7 +413,7 @@ extension GemmaRuntime {
                 cache: cache,
                 positionOffset: 0
             )
-            let token = try GemmaCorrectness.greedyToken(from: logits)
+            let token = try LagunaCorrectness.greedyToken(from: logits)
             let seedToken = token
             materializeLagunaCacheState(cache)
             state.decodeCache = cache
@@ -454,7 +449,7 @@ extension GemmaRuntime {
                 cache: cache,
                 positionOffset: state.decodeSeedTokenCount + state.decodeStep
             )
-            let token = try GemmaCorrectness.greedyToken(from: logits)
+            let token = try LagunaCorrectness.greedyToken(from: logits)
             state.decodeStep += 1
             return RuntimeWorkerResponse(
                 id: request.id,
@@ -485,10 +480,9 @@ extension GemmaRuntime {
             do {
                 // Serial target-only block fallback (one Laguna forward per
                 // returned token) through the shared pure block-generation
-                // helper, replacing the Gemma4SerialTargetBlockGenerator
-                // whose signature is bound to the Gemma 4 cache types.
+                // helper.
                 let model = try weightCache.requireLibraryModel()
-                tokens = try Gemma4TargetBlockGeneration.generateSerialBlock(
+                tokens = try TargetBlockGeneration.generateSerialBlock(
                     previousToken: blockRequest.previousToken,
                     maxBlockSize: blockRequest.maxBlockSize,
                     positionOffset: positionOffset
@@ -499,7 +493,7 @@ extension GemmaRuntime {
                         cache: cache,
                         positionOffset: stepOffset
                     )
-                    return try GemmaCorrectness.greedyToken(from: logits)
+                    return try LagunaCorrectness.greedyToken(from: logits)
                 }
             } catch {
                 // A failed multi-forward request may have partially advanced
@@ -1645,7 +1639,7 @@ enum RuntimeWorkerLaunch: Equatable {
     case trainedMTP(
         assistantPath: String,
         contractPath: String,
-        verificationMode: Gemma4MTPVerificationMode
+        verificationMode: MTPVerificationMode
     )
 
     func arguments(weightsPath: String) -> [String] {
@@ -1677,7 +1671,7 @@ enum RuntimeWorkerLaunch: Equatable {
     }
 }
 
-extension GemmaRuntime {
+extension LagunaRuntime {
     public static func runPreflightWithWorker(
         weightsPath: String,
         worker options: RuntimeWorkerOptions
@@ -2142,8 +2136,7 @@ final class RuntimeWorkerClient {
 ///   the mlx-swift-lm fork (MLX_COMPILED_DECODE). Note "MLX_" does NOT match
 ///   harness "MLXFAST_*" names -- harness variables stay excluded.
 /// - `DARKBLOOM_` prefix: model-runtime opt-ins read only by model-side code
-///   (DARKBLOOM_COMPILED_DECODE in Gemma4Model.swift and the mlx-swift-lm
-///   fork's DARKBLOOM_* knobs). The ranked workflow never sets them (absent
+///   and the mlx-swift-lm fork. The ranked workflow never sets them (absent
 ///   in BOTH ranked phases); they exist for operator/participant tuning on
 ///   local machines and must keep reaching the worker there.
 /// - `MLXFAST_USE_RUNTIME_WORKER` is force-set to "0" so the child can never

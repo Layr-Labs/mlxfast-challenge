@@ -9,9 +9,9 @@ REFERENCE_CACHE_REVISION_DIR="${REFERENCE_REVISION//\//--}"
 # No organizer-hosted mirror exists yet for this checkpoint; default to the
 # pinned Hugging Face revision as primary (the manifest pins every byte) with
 # the repo's main branch as fallback.
-# TODO(operator): add a Darkbloom R2 mirror (as the gemma track had) and make
-# it the primary once it is provisioned, keeping this Hugging Face URL as the
-# fallback. download_url_for_file appends
+# TODO(operator): add a Darkbloom R2 mirror and make it the primary once it is
+# provisioned, keeping this Hugging Face URL as the fallback.
+# download_url_for_file appends
 # "?download=true" automatically for huggingface.co URLs so that resolves to
 # the raw LFS/Xet bytes.
 DEFAULT_REFERENCE_BASE_URL="https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/c42e0a8f8d504ceacde015a535dcb286d65c8799"

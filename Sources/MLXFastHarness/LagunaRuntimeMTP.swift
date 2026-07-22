@@ -88,7 +88,7 @@ public struct ExperimentalTrainedMTPOptions: Equatable {
     public let goldenPath: String
     public let maxBlockSize: Int
     public let totalTokenCount: Int
-    public let verificationMode: Gemma4MTPVerificationMode
+    public let verificationMode: MTPVerificationMode
     public let requireTrainedAssistant: Bool
 
     public init(
@@ -99,7 +99,7 @@ public struct ExperimentalTrainedMTPOptions: Equatable {
         goldenPath: String,
         maxBlockSize: Int = MLXFastConstants.experimentalMTPMaxBlockSize,
         totalTokenCount: Int = MLXFastConstants.experimentalMTPMaxTotalTokens,
-        verificationMode: Gemma4MTPVerificationMode = .exactPair,
+        verificationMode: MTPVerificationMode = .exactPair,
         requireTrainedAssistant: Bool
     ) {
         self.sourceTargetPath = sourceTargetPath
@@ -494,7 +494,7 @@ struct ExperimentalMTPAcceptanceAccumulator: Equatable {
     }
 }
 
-extension GemmaRuntime {
+extension LagunaRuntime {
     public static func experimentalTrainedMTPBenchmark(
         _ options: ExperimentalTrainedMTPOptions,
         worker workerOptions: RuntimeWorkerOptions
@@ -642,7 +642,7 @@ extension GemmaRuntime {
         plan: ExperimentalMTPPromptPlan,
         maxBlockSize: Int,
         totalTokenCount: Int,
-        verificationMode: Gemma4MTPVerificationMode,
+        verificationMode: MTPVerificationMode,
         worker: RuntimeWorkerClient
     ) throws -> ExperimentalMTPDecodeMeasurement {
         var validator = try ExperimentalMTPBlockValidator(
@@ -824,7 +824,7 @@ extension GemmaRuntime {
             totalTokenCount: options.totalTokenCount,
             worker: worker
         )
-        let availability = Gemma4MTPAssistantAvailability.shippedCheckpoint
+        let availability = MTPAssistantAvailability.shippedCheckpoint
         return ExperimentalMTPProbeReport(
             experimental: true,
             protocolName: "decode_block_v1",

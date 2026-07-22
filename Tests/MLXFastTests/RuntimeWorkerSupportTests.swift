@@ -5,15 +5,15 @@ import MLX
 import Testing
 
 @Test
-func gemmaCorrectnessSelectsGreedyTokenWhenRuntimeTestsAreEnabled() throws {
+func lagunaCorrectnessSelectsGreedyTokenWhenRuntimeTestsAreEnabled() throws {
     guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
         return
     }
 
-    #expect(try GemmaCorrectness.greedyToken(
+    #expect(try LagunaCorrectness.greedyToken(
         from: MLXArray([Float(0.1), 2.0, 1.0], [3])
     ) == 1)
-    #expect(try GemmaCorrectness.greedyToken(
+    #expect(try LagunaCorrectness.greedyToken(
         from: MLXArray([Float(1), 2, 3, 2], [2, 2])
     ) == 0)
 }
@@ -24,7 +24,7 @@ func gemmaCorrectnessSelectsGreedyTokenWhenRuntimeTestsAreEnabled() throws {
 @Test
 func runtimeWorkerOrphanReaperFiresOnceTheParentIsGone() {
     let fired = DispatchSemaphore(value: 0)
-    let thread = GemmaRuntime.startRuntimeWorkerOrphanReaper(
+    let thread = LagunaRuntime.startRuntimeWorkerOrphanReaper(
         pollIntervalSeconds: 0.01,
         isOrphaned: { true },
         onOrphaned: { fired.signal() }
@@ -36,7 +36,7 @@ func runtimeWorkerOrphanReaperFiresOnceTheParentIsGone() {
 @Test
 func runtimeWorkerOrphanReaperStaysQuietWhileTheParentIsAlive() {
     let fired = DispatchSemaphore(value: 0)
-    let thread = GemmaRuntime.startRuntimeWorkerOrphanReaper(
+    let thread = LagunaRuntime.startRuntimeWorkerOrphanReaper(
         pollIntervalSeconds: 0.01,
         isOrphaned: { false },
         onOrphaned: { fired.signal() }
@@ -55,9 +55,9 @@ func phaseStartAllocatorResetLeavesExactlyEmptyCacheWhenRuntimeTestsAreEnabled()
         let scratch = MLXArray(Array(repeating: Float(1), count: 1 << 20), [1024, 1024])
         eval(scratch + scratch)
     }
-    try GemmaRuntime.resetRuntimeWorkerAllocatorForPhaseStart()
+    try LagunaRuntime.resetRuntimeWorkerAllocatorForPhaseStart()
     #expect(Memory.cacheMemory == 0)
-    #expect(Memory.cacheLimit == GemmaRuntime.trustedRuntimeWorkerPhaseStartCacheLimitBytes)
+    #expect(Memory.cacheLimit == LagunaRuntime.trustedRuntimeWorkerPhaseStartCacheLimitBytes)
 }
 
 @Test
@@ -100,7 +100,7 @@ func traceProtocolCarriesRequestedTopKAndExpectedTokenDiagnostics() throws {
 
 @Test
 func workerComputesExpectedTokenDiagnosticsOutsideReturnedTopSubset() throws {
-    let diagnostics = try GemmaRuntime.correctnessLogitDiagnostics(
+    let diagnostics = try LagunaRuntime.correctnessLogitDiagnostics(
         values: (0..<20).map { Double(20 - $0) },
         topK: 12,
         expectedToken: 19

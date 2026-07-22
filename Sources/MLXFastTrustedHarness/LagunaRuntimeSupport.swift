@@ -1,13 +1,15 @@
 import Darwin
 import Foundation
+#if !MLXFAST_TRUSTED_HARNESS
 import MLX
+#endif
 import MLXFastCore
 import Tokenizers
 
-// GemmaRuntime is split across GemmaRuntime*.swift for auditability.
+// LagunaRuntime is split across LagunaRuntime*.swift for auditability.
 // Generated split; behavior identical to the original single file.
 
-extension GemmaRuntime {
+extension LagunaRuntime {
     static func currentResidentMemoryGB() -> Double {
         guard let info = processMemoryInfo() else {
             return 0
@@ -137,20 +139,22 @@ extension GemmaRuntime {
         }
     }
 
-    static func inputIDsArray(_ tokens: [Int]) throws -> MLXArray {
-        guard !tokens.isEmpty else {
-            throw MLXFastError.invalidInput("input token array must not be empty")
-        }
-        let values = try tokens.enumerated().map { index, token -> Int32 in
-            guard token >= 0, token < MLXFastConstants.vocabSize else {
-                throw MLXFastError.invalidInput(
-                    "input token[\(index)]=\(token) is outside Laguna vocab range 0..<\(MLXFastConstants.vocabSize)"
-                )
+    #if !MLXFAST_TRUSTED_HARNESS
+        static func inputIDsArray(_ tokens: [Int]) throws -> MLXArray {
+            guard !tokens.isEmpty else {
+                throw MLXFastError.invalidInput("input token array must not be empty")
             }
-            return Int32(token)
+            let values = try tokens.enumerated().map { index, token -> Int32 in
+                guard token >= 0, token < MLXFastConstants.vocabSize else {
+                    throw MLXFastError.invalidInput(
+                        "input token[\(index)]=\(token) is outside Laguna vocab range 0..<\(MLXFastConstants.vocabSize)"
+                    )
+                }
+                return Int32(token)
+            }
+            return MLXArray(values, [1, values.count])
         }
-        return MLXArray(values, [1, values.count])
-    }
+    #endif
 
 }
 

@@ -7,7 +7,7 @@ import MLXFastCore
 import MLXFastModel
 #endif
 
-extension GemmaRuntime {
+extension LagunaRuntime {
     public static func localIterate(
         _ options: LocalIterateOptions,
         worker: RuntimeWorkerOptions? = nil
@@ -504,12 +504,12 @@ extension GemmaRuntime {
                 positionOffset: 0
             )
             eval(prefillLogits)
-            let prefillToken = try GemmaCorrectness.greedyToken(from: prefillLogits)
+            let prefillToken = try LagunaCorrectness.greedyToken(from: prefillLogits)
             let prefillElapsed = secondsSince(prefillStart)
             prefillHeartbeat?.cancel()
             totalPrefillSeconds += prefillElapsed
             Memory.clearCache()
-            latestStats = GemmaRuntime.expertStats(from: weightCache)
+            latestStats = LagunaRuntime.expertStats(from: weightCache)
             if failureStep == nil, prefillToken != expectedSeedToken {
                 failureStep = repeatIndex * checkedStepsPerPass
                 failureExpected = expectedSeedToken
@@ -547,8 +547,8 @@ extension GemmaRuntime {
                 cache: cache,
                 positionOffset: 0
             )
-            var actualToken = try GemmaCorrectness.greedyToken(from: logits)
-            latestStats = GemmaRuntime.expertStats(from: weightCache)
+            var actualToken = try LagunaCorrectness.greedyToken(from: logits)
+            latestStats = LagunaRuntime.expertStats(from: weightCache)
             if failureStep == nil, actualToken != expectedSeedToken {
                 failureStep = repeatIndex * checkedStepsPerPass + 1
                 failureExpected = expectedSeedToken
@@ -570,7 +570,7 @@ extension GemmaRuntime {
                     cache: cache,
                     positionOffset: testCase.promptTokens.count + decodedStep
                 )
-                actualToken = try GemmaCorrectness.greedyToken(from: logits)
+                actualToken = try LagunaCorrectness.greedyToken(from: logits)
                 let expectedToken = expectedDecodeTokens[decodedStep]
                 if failureStep == nil, actualToken != expectedToken {
                     failureStep = repeatIndex * checkedStepsPerPass + decodedStep + 2
@@ -580,7 +580,7 @@ extension GemmaRuntime {
                 }
                 let stepElapsed = secondsSince(stepStart)
                 totalStepOnlySeconds += stepElapsed
-                latestStats = GemmaRuntime.expertStats(from: weightCache)
+                latestStats = LagunaRuntime.expertStats(from: weightCache)
                 reportProgress(
                     step: repeatIndex * decodeSteps + decodedStep + 1,
                     total: totalDecodeSteps,
@@ -604,8 +604,8 @@ extension GemmaRuntime {
             totalDecodeSeconds += secondsSince(decodePhaseStart)
         }
 
-        let bandwidth = (gbPerToken: 0.0, source: GemmaRuntime.bandwidthSource)
-        latestStats = GemmaRuntime.expertStats(from: weightCache)
+        let bandwidth = (gbPerToken: 0.0, source: LagunaRuntime.bandwidthSource)
+        latestStats = LagunaRuntime.expertStats(from: weightCache)
         let correctness = localIterateCorrectnessReport(
             passed: failureStep == nil,
             checkedSteps: failureStep.map { $0 + 1 } ?? checkedStepsPerPass * timingRepeats,
@@ -795,7 +795,7 @@ extension GemmaRuntime {
                 progress?("\(modeName) checked pass \(repeatIndex + 1)/\(timingRepeats) complete")
             }
         }
-        let bandwidth = (gbPerToken: 0.0, source: GemmaRuntime.bandwidthSource)
+        let bandwidth = (gbPerToken: 0.0, source: LagunaRuntime.bandwidthSource)
         let correctness = localIterateCorrectnessReport(
             passed: failureStep == nil,
             checkedSteps: failureStep.map { $0 + 1 } ?? checkedStepsPerPass * timingRepeats,
@@ -866,7 +866,7 @@ extension GemmaRuntime {
     /// unmistakable; only the score becomes the same directional
     /// decode_speedup^0.75 * prefill_speedup^0.25 estimate that passing local
     /// runs publish. Official/ranked scoring is untouched: this is reached
-    /// exclusively from localIterate's failure path, and GemmaRuntime.benchmark
+    /// exclusively from localIterate's failure path, and LagunaRuntime.benchmark
     /// keeps publishing score: null on failure (see
     /// rankedScoreSemanticsAreUnchangedByLocalEstimatedScore).
     static func localModeFailedPayloadWithEstimatedScore(
@@ -932,7 +932,7 @@ extension GemmaRuntime {
         // the payload as local-mode, submit never uploads local score files
         // (only editablePaths), the ranked pipeline never runs this code path
         // (benchmark.yml and measure-job.sh invoke --official, which routes to
-        // GemmaRuntime.benchmark), and the ranked artifact validator rejects
+        // LagunaRuntime.benchmark), and the ranked artifact validator rejects
         // this shape (runtime must be "swift" with the hidden-gate fields
         // populated). The official score remains the paired-ratio overlay
         // computed by the trusted ranked workflow, exactly as before.

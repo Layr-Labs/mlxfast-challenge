@@ -189,7 +189,7 @@ func gemma4MTPShouldUseExactFour(
         && draftMargins[2] >= 6.0
 }
 
-public enum Gemma4MTPVerificationMode: String, Sendable {
+public enum MTPVerificationMode: String, Sendable {
     case exactPair = "exact-pair"
     case serial
 }
@@ -465,7 +465,7 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
 
     private let target: Gemma4RuntimeModel
     private let drafter: Gemma4AssistantDraftModel
-    public let verificationMode: Gemma4MTPVerificationMode
+    public let verificationMode: MTPVerificationMode
     // Internal (not public) so runtime seam tests can compare this cache's
     // physical bytes against an independent serial cache.
     private(set) var targetCache: [any KVCache] = []
@@ -485,7 +485,7 @@ public final class Gemma4TrainedMTPBlockSession: @unchecked Sendable {
     public init(
         target: Gemma4RuntimeModel,
         drafter: Gemma4AssistantDraftModel,
-        verificationMode: Gemma4MTPVerificationMode = .exactPair
+        verificationMode: MTPVerificationMode = .exactPair
     ) throws {
         guard verificationMode != .exactPair
                 || target.supportsExactMTPPair

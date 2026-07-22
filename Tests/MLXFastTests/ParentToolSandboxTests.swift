@@ -155,7 +155,7 @@ struct ParentToolSandboxTests {
     @Test
     func runtimeWorkerAllowlistDropsSSHAgentSocket() throws {
         let worker = try String(
-            contentsOfFile: "Sources/MLXFastHarness/GemmaRuntimeWorker.swift",
+            contentsOfFile: "Sources/MLXFastHarness/LagunaRuntimeWorker.swift",
             encoding: .utf8
         )
         let allowlistRange = try #require(

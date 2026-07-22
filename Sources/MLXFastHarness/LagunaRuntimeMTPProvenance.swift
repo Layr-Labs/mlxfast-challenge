@@ -335,7 +335,7 @@ private struct ExperimentalMTPAssistantGating: Decodable {
     }
 }
 
-extension GemmaRuntime {
+extension LagunaRuntime {
     static let experimentalMTPTrackID = "laguna-xs-2.1-mtp-v1"
     static let experimentalMTPDependencyRevision =
         "bc1c0ee67d15798343be17c9f8f61f7c0d977149"

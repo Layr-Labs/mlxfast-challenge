@@ -3,10 +3,10 @@ import MLXFastCore
 import MLXFastModel
 import Tokenizers
 
-// GemmaRuntime is split across GemmaRuntime*.swift for auditability.
+// LagunaRuntime is split across LagunaRuntime*.swift for auditability.
 // Generated split; behavior identical to the original single file.
 
-extension GemmaRuntime {
+extension LagunaRuntime {
     public static func generateGreedyTokens(
         _ options: GreedyGenerationOptions,
         progress: ((Int, Int) -> Void)? = nil

@@ -6,11 +6,11 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 
-/// Eagerly-prepared, RAM-resident weight cache for the Gemma 4 text tower.
+/// Eagerly-prepared, RAM-resident weight cache retained for the unranked
+/// experimental MTP commands.
 ///
 /// The whole 4-bit checkpoint (~17 GB) is loaded once at construction time
-/// (outside every scored window -- the runtime worker builds this before the
-/// benchmark protocol handshake), so every scored forward pays no dense
+/// before the worker protocol handshake, so each forward pays no dense
 /// loads or derived-view construction. There is no expert streaming or
 /// residency machinery: the entire model is dense and lives in unified
 /// memory for the whole process lifetime.
@@ -18,9 +18,9 @@ public final class Gemma4RuntimeWeightCache {
     public let loader: Gemma4WeightLoader
     public let config: Gemma4Config
 
-    /// The mlx-swift-lm Gemma 4 text tower this benchmark's reference runs. It is
-    /// loaded once here at construction (outside every scored window), so no
-    /// checkpoint I/O or quantized-linear construction lands on the hot path.
+    /// The mlx-swift-lm Gemma 4 text tower used by the legacy MTP path. It is
+    /// loaded once here at construction, so no checkpoint I/O or
+    /// quantized-linear construction lands on the request path.
     /// nil only if the load failed, in which case `loadError` carries the reason
     /// and the first `Gemma4Model.logits` rethrows it.
     public let libraryModel: Gemma4RuntimeModel?
@@ -35,18 +35,18 @@ public final class Gemma4RuntimeWeightCache {
     public init(loader: Gemma4WeightLoader, config: Gemma4Config) {
         self.loader = loader
         self.config = config
-        let startupMemoryPolicy: Gemma4StartupMemoryPolicy?
+        let startupMemoryPolicy: RuntimeStartupMemoryPolicy?
         if config.numHiddenLayers >= 16 {
-            // Keep the ranked 128 GiB machine's full optimized layout, but
+            // Keep the 128 GiB machine's full optimized layout, but
             // protect local Macs from retaining ~14.5 GiB of alternate weight
             // layouts on top of the ~16.9 GiB source model. The policy is
             // selected before model loading so file-global feature switches are
             // first observed after their low-memory defaults are installed;
             // the defaults never overwrite flags the user set explicitly.
-            let policy = Gemma4StartupMemoryPolicy.resolve(
+            let policy = RuntimeStartupMemoryPolicy.resolve(
                 physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
                 requestedProfile: ProcessInfo.processInfo.environment[
-                    Gemma4StartupMemoryPolicy.profileOverrideEnvironmentName
+                    RuntimeStartupMemoryPolicy.profileOverrideEnvironmentName
                 ]
             )
             policy.apply()
@@ -64,15 +64,14 @@ public final class Gemma4RuntimeWeightCache {
             libraryModel = nil
             loadError = error
         }
-        // Constructor-time warmup for the library model: the runtime worker builds this cache
-        // before the benchmark protocol handshake, so the Metal pipeline-state
+        // Constructor-time warmup for the library model: the runtime worker
+        // builds this cache before the protocol handshake, so Metal pipeline-state
         // creation and MLX kernel-cache population triggered by the first
-        // forward happen HERE, outside every scored window, instead of inside
-        // the first scored prefill.
+        // forward happen here instead of inside the first request.
         //
-        // Retain freed, shape-relevant warmup buffers for the scored worker
-        // request. Metal libraries and pipeline state are process-lifetime
-        // caches independent of this allocator pool.
+        // Retain freed, shape-relevant warmup buffers for the worker request.
+        // Metal libraries and pipeline state are process-lifetime caches
+        // independent of this allocator pool.
         if let model = libraryModel, config.numHiddenLayers >= 16 {
             Self.warmLibraryModel(model)
             if startupMemoryPolicy?.clearAllocatorCacheAfterWarmup == true {

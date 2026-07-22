@@ -22,11 +22,9 @@ binary did not otherwise change.
 ## Target definition
 
 `lowsim-prose-v1` is an organizer-authored prose target selected by
-measurement, not by content class. (It was authored and calibrated against
-the Gemma-era tokenizer; the Laguna XS 2.1 re-pin — new tokenizer, vocab
-100352 — requires re-tokenizing/re-validating or rotating this target on
-m5-bench before the serial timed window runs again.) The public contract is
-its shape and its
+measurement, not by content class. It was re-tokenized and re-validated on
+`m5-bench` for the Laguna XS 2.1 tokenizer (vocab 100352) as part of the
+completed model re-pin. The public contract is its shape and its
 gate: original text whose first 512 target-tokenizer tokens form the seed, and
 whose 129-token greedy continuation (the seed next-token plus the 128 checked
 decode tokens) passes the self-similarity metric below on the ranked M5

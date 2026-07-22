@@ -8,7 +8,7 @@ import Testing
 func experimentalMTPSerialFallbackChainsTokensAndOffsetsExactly() throws {
     var inputTokens: [Int] = []
     var offsets: [Int] = []
-    let tokens = try Gemma4TargetBlockGeneration.generateSerialBlock(
+    let tokens = try TargetBlockGeneration.generateSerialBlock(
         previousToken: 10,
         maxBlockSize: 4,
         positionOffset: 512
@@ -26,21 +26,21 @@ func experimentalMTPSerialFallbackChainsTokensAndOffsetsExactly() throws {
 @Test
 func experimentalMTPSerialFallbackRejectsInvalidBounds() {
     #expect(throws: MLXFastError.self) {
-        _ = try Gemma4TargetBlockGeneration.generateSerialBlock(
+        _ = try TargetBlockGeneration.generateSerialBlock(
             previousToken: 1,
             maxBlockSize: 0,
             positionOffset: 0
         ) { token, _ in token }
     }
     #expect(throws: MLXFastError.self) {
-        _ = try Gemma4TargetBlockGeneration.generateSerialBlock(
+        _ = try TargetBlockGeneration.generateSerialBlock(
             previousToken: 1,
             maxBlockSize: MLXFastConstants.experimentalMTPMaxBlockSize + 1,
             positionOffset: 0
         ) { token, _ in token }
     }
     #expect(throws: MLXFastError.self) {
-        _ = try Gemma4TargetBlockGeneration.generateSerialBlock(
+        _ = try TargetBlockGeneration.generateSerialBlock(
             previousToken: MLXFastConstants.vocabSize,
             maxBlockSize: 1,
             positionOffset: 0
@@ -50,11 +50,11 @@ func experimentalMTPSerialFallbackRejectsInvalidBounds() {
 
 @Test
 func shippedCheckpointReportsAssistantUnavailable() {
-    let availability = Gemma4MTPAssistantAvailability.shippedCheckpoint
+    let availability = MTPAssistantAvailability.shippedCheckpoint
     #expect(!availability.isAvailable)
     #expect(availability.reason.contains("unavailable/incompatible"))
     #expect(availability.reason.contains("base checkpoint"))
-    #expect(availability.reason.contains("IT models"))
+    #expect(availability.reason.contains("no drafter weights"))
     #expect(throws: MLXFastError.self) {
         try availability.requireAvailable()
     }
@@ -302,7 +302,7 @@ func experimentalMTPUsesTrustedConfigurableLengthAndBoundedBlocks() throws {
         MLXFastConstants.experimentalMTPMaxTotalTokens
             == MLXFastConstants.benchmarkDecodeSteps
     )
-    try GemmaRuntime.validateExperimentalMTPProbeOptions(
+    try LagunaRuntime.validateExperimentalMTPProbeOptions(
         ExperimentalMTPProbeOptions(
             weightsPath: "weights",
             goldenPath: "public.json",
@@ -311,7 +311,7 @@ func experimentalMTPUsesTrustedConfigurableLengthAndBoundedBlocks() throws {
         )
     )
     #expect(throws: MLXFastError.self) {
-        try GemmaRuntime.validateExperimentalMTPProbeOptions(
+        try LagunaRuntime.validateExperimentalMTPProbeOptions(
             ExperimentalMTPProbeOptions(
                 weightsPath: "weights",
                 goldenPath: "public.json",
@@ -320,7 +320,7 @@ func experimentalMTPUsesTrustedConfigurableLengthAndBoundedBlocks() throws {
         )
     }
     #expect(throws: MLXFastError.self) {
-        try GemmaRuntime.validateExperimentalMTPProbeOptions(
+        try LagunaRuntime.validateExperimentalMTPProbeOptions(
             ExperimentalMTPProbeOptions(
                 weightsPath: "weights",
                 goldenPath: "public.json",
@@ -598,7 +598,7 @@ func trainedMTPOptionsFailClosedWithoutAssistantRequirement() throws {
         requireTrainedAssistant: false
     )
     #expect(throws: MLXFastError.self) {
-        try GemmaRuntime.validateExperimentalTrainedMTPOptions(
+        try LagunaRuntime.validateExperimentalTrainedMTPOptions(
             missingRequirement
         )
     }
@@ -613,8 +613,8 @@ func trainedMTPOptionsFailClosedWithoutAssistantRequirement() throws {
         totalTokenCount: 257,
         requireTrainedAssistant: true
     )
-    try GemmaRuntime.validateExperimentalTrainedMTPOptions(valid)
-    try GemmaRuntime.validateExperimentalTrainedMTPOptions(
+    try LagunaRuntime.validateExperimentalTrainedMTPOptions(valid)
+    try LagunaRuntime.validateExperimentalTrainedMTPOptions(
         ExperimentalTrainedMTPOptions(
             sourceTargetPath: "source-target",
             targetWeightsPath: "mtp-weights",
@@ -631,7 +631,7 @@ func trainedMTPOptionsFailClosedWithoutAssistantRequirement() throws {
     // K=1 cannot draft, so the trained-assistant benchmark rejects it; the
     // serial K=1 control remains mtp-probe.
     #expect(throws: MLXFastError.self) {
-        try GemmaRuntime.validateExperimentalTrainedMTPOptions(
+        try LagunaRuntime.validateExperimentalTrainedMTPOptions(
             ExperimentalTrainedMTPOptions(
                 sourceTargetPath: "source-target",
                 targetWeightsPath: "mtp-weights",
@@ -646,7 +646,7 @@ func trainedMTPOptionsFailClosedWithoutAssistantRequirement() throws {
     }
 
     #expect(throws: MLXFastError.self) {
-        try GemmaRuntime.validateExperimentalTrainedMTPOptions(
+        try LagunaRuntime.validateExperimentalTrainedMTPOptions(
             ExperimentalTrainedMTPOptions(
                 sourceTargetPath: "source-target",
                 targetWeightsPath: "mtp-weights",
@@ -677,8 +677,8 @@ func trainedMTPTrackIsExplicitAndSerialBenchmarkRemainsUnchanged() throws {
     #expect(workerSource.contains("case \"runtime-worker\":"))
     #expect(workerSource.contains("case \"preflight\":"))
     #expect(workerSource.contains("case \"mtp-runtime-worker\":"))
-    #expect(workerSource.contains("GemmaRuntime.runPreflightWorker"))
-    #expect(trustedSource.contains("GemmaRuntime.runPreflightWithWorker"))
+    #expect(workerSource.contains("LagunaRuntime.runPreflightWorker"))
+    #expect(trustedSource.contains("LagunaRuntime.runPreflightWithWorker"))
     #expect(workerSource.contains("mlxfast-runtime-worker runtime-worker"))
     #expect(workerSource.contains("[\"help\", \"--help\", \"-h\"]"))
     #expect(trustedSource.contains("Bundle.main.executableURL"))
@@ -719,7 +719,7 @@ func trainedMTPUsesExplicitExactPairVerificationAndSerialControl() throws {
     )
     let worker = try String(
         contentsOfFile:
-            "Sources/MLXFastHarness/GemmaRuntimeMTPWorker.swift",
+            "Sources/MLXFastHarness/LagunaRuntimeMTPWorker.swift",
         encoding: .utf8
     )
     #expect(adapter.contains("fastMTPForward(tokens, cache: cache)"))
