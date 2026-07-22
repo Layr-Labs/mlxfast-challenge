@@ -158,16 +158,18 @@ The `officialBaseline*` constants in `Sources/MLXFastCore/Constants.swift` are
 a **cached calibration retained for local-mode estimates and the gates pass's
 skip-timed placeholder timing only** -- the ranked score denominator is the
 live paired baseline measured on the M5 box (next section), never these
-numbers. They were last calibrated 2026-07-12 as the mean of the on-box M5
-paired-baseline timings published by 12 consecutive successful ranked runs
-(29179374395 through 29197772284; decode CV 0.08%, prefill CV 0.17%),
-replacing the retired VM-era 2026-07-07 values (decode 0.1336139485703125 /
-prefill 0.010605031949609375) that inflated local estimates ~3.7x. They are
-kept so `--local-iterate` / `--local-submit` can print a directional speedup
+numbers. They were last calibrated 2026-07-22 for the Poolside Laguna XS 2.1
+re-pin as the mean of the on-box M5 paired-baseline timings published by the
+4 consecutive successful ranked Laguna runs (29891158354, 29898041981,
+29931435233, and 29934545157; decode CV 0.20%, prefill CV 0.71%), replacing
+the Gemma 4 31B 4-bit 2026-07-12 calibration (decode 0.04405625764973958 /
+prefill 0.0016216554767252605, runs 29179374395-29197772284) that predated
+the model re-pin and inflated local estimates ~4.5x. They are kept so
+`--local-iterate` / `--local-submit` can print a directional speedup
 without a second local build:
 
-- `officialBaselineDecodeSecondsPerToken = 0.04405625764973958`
-- `officialBaselinePrefillSecondsPerToken = 0.0016216554767252605`
+- `officialBaselineDecodeSecondsPerToken = 0.00938833593359375`
+- `officialBaselinePrefillSecondsPerToken = 0.00036280499267578125`
 
 If either number here disagrees with `Sources/MLXFastCore/Constants.swift`, the
 freeze test fails on purpose -- the doc and the code must move together.

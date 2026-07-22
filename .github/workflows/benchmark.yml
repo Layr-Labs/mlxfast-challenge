@@ -195,8 +195,9 @@ jobs:
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
       MLXFAST_GPQA_CASE_COUNT: "5"
       # 64-token GPQA behavior/semantic budget and min-pass 1 threshold:
-      # calibrated to the unmodified Gemma 4 31B 4-bit rebase baseline, which
-      # stably judges 2/5 on the M5-regenerated hidden prompts (five runs, see
+      # re-validated 2026-07-22 against the unmodified Laguna XS 2.1 4-bit
+      # baseline, which judges 1/5-2/5 on the regenerated hidden Laguna
+      # prompts (four ranked runs, see
       # MLXFastConstants.semanticGPQAMinPassCount). Keep in sync with
       # MLXFastConstants.{correctnessGPQAMaxNewTokens,semanticGPQAMaxNewTokens,
       # semanticGPQAMinPassCount}.

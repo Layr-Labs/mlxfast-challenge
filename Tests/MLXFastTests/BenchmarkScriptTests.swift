@@ -1294,9 +1294,9 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json"))
     #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna.json"))
     #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"5\""))
-    // 64-token budget and min-pass 1 threshold are calibrated to the
-    // unmodified Gemma 4 31B 4-bit rebase baseline, which stably judged 2/5
-    // across five official-runner runs on the M5-regenerated hidden prompts;
+    // 64-token budget and min-pass 1 threshold, re-validated against the
+    // unmodified Laguna XS 2.1 4-bit baseline (judged 1/5-2/5 across four
+    // ranked official-runner runs on the regenerated hidden Laguna prompts);
     // see MLXFastConstants.semanticGPQAMinPassCount.
     #expect(workflow.contains("MLXFAST_GPQA_MAX_NEW_TOKENS: \"64\""))
     #expect(workflow.contains("MLXFAST_GPQA_TTFT_CASE_COUNT: \"5\""))

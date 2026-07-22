@@ -39,14 +39,14 @@ public enum MLXFastConstants {
     // Swift/MLX. Semantic GPQA behavior captures a short continuation for the
     // private judge; exact token enforcement stays on the long copy gate and
     // non-semantic behavior fixtures.
-    // 64 (was 10, DeepSeek-era): historical Gemma-era calibration -- baseline
-    // Gemma 4 31B 4-bit greedy continuations of the raw (untemplated) hidden
-    // GPQA prompts rarely express the selected option within 10 tokens; a
-    // 2026-07-06 baseline capture at budgets 10/32/64 confirmed most
-    // candidates are cut off mid-sentence, and 64 (the
-    // correctnessMaxBehaviorSteps ceiling) gave the judge the most usable
-    // candidate text. TODO(operator): revisit against the Laguna XS 2.1
-    // hidden GPQA regeneration on m5-bench (go-live runbook step B).
+    // 64 (was 10, DeepSeek-era): originally a Gemma-era calibration (a
+    // 2026-07-06 budget capture at 10/32/64 showed shorter budgets cut most
+    // candidates off mid-sentence; 64, the correctnessMaxBehaviorSteps
+    // ceiling, gave the judge the most usable text). Retained unchanged for
+    // the Laguna XS 2.1 re-pin: the four ranked Laguna runs on m5-bench
+    // (29891158354, 29898041981, 29931435233, 29934545157) all passed the
+    // judge gate at this budget against the regenerated hidden Laguna GPQA
+    // reference, so 64 remains the working budget.
     public static let correctnessGPQAMaxNewTokens = 64
     // Semantic judging uses short hidden GPQA answers as a baseline-calibrated
     // gate for optimizations that preserve the exact prefix but damage answer
@@ -56,22 +56,20 @@ public enum MLXFastConstants {
     // correctnessGPQAMaxNewTokens (and must stay <= correctnessMaxBehaviorSteps).
     public static let semanticGPQACaseCount = 5
     public static let semanticGPQAMaxNewTokens = 64
-    // Baseline-calibrated threshold, recalibrated 2026-07-09 after the hidden
-    // GPQA reference object was regenerated on the M5 ranked runner from the
-    // mlx-swift-lm-rebase reference model (then Gemma 4 31B-IT). Five judged
-    // official-runner baseline observations of unmodified main (tip 3c94f4e)
-    // all scored 2/5 with identical per-case verdicts (cases 2 and 3 judged
-    // correct every time): runs 29040771374, 29048752714, 29051462434,
-    // 29052276465, and 29053091705. The threshold is min(observed) - 1 = 1:
-    // one judged case of margin below the stable 2/5 baseline floor absorbs
-    // single-case judge nondeterminism, while a submission that wrecks answer
-    // quality (0/5 judged) fails the gate instead of merely being recorded.
-    // If the hidden prompts or the reference model change, a fresh judged
-    // official-runner baseline must recalibrate this threshold.
-    // TODO(operator): the Laguna XS 2.1 re-pin changes the reference model
-    // and tokenizer, so the GPQA reference regeneration on m5-bench (go-live
-    // runbook step B) must re-run this judged-baseline calibration before
-    // trusting the threshold for ranked Laguna runs.
+    // Baseline-calibrated threshold, re-validated 2026-07-22 for the Laguna
+    // XS 2.1 re-pin against the regenerated hidden Laguna GPQA reference:
+    // the four ranked official-runner Laguna baseline observations judged
+    // 2/5, 2/5, 1/5, and 2/5 (runs 29891158354, 29898041981, 29931435233,
+    // and 29934545157; Opus 4.8 judge). min(observed) is 1, so 1 stays the
+    // conservative floor: an observed 1/5 sits exactly AT the threshold
+    // (raising it would flake honest runs on single-case judge
+    // nondeterminism), while a submission that wrecks answer quality (0/5
+    // judged) still fails the gate instead of merely being recorded. Keep in
+    // sync with the workflow env MLXFAST_SEMANTIC_GPQA_MIN_PASS. If the
+    // hidden prompts, the judge model, or the reference model change, a
+    // fresh judged official-runner baseline must recalibrate this threshold.
+    // (Historical: the 2026-07-09 Gemma 4 31B-IT calibration observed a
+    // stable 2/5 across five runs and set min(observed) - 1 = 1.)
     public static let semanticGPQAMinPassCount = 1
     public static let benchmarkPrefillPromptTokens = 512
     // Stable public identifier for the private timed-evaluation prompt. The
@@ -140,24 +138,22 @@ public enum MLXFastConstants {
     public static let prefillBandDownTolerance = 0.05
     public static let decodeBandUpTolerance = 0.02
     public static let decodeBandDownTolerance = 0.05
-    // CACHED serial baseline, still the GEMMA 4 31B 4-bit dense calibration.
-    // Calibration provenance: the live M5 paired baseline as of 2026-07-12 --
+    // CACHED serial baseline: the Poolside Laguna XS 2.1 4-bit calibration.
+    // Calibration provenance: the live M5 paired baseline as of 2026-07-22 --
     // the mean of the `baseline_decode_seconds_per_token` /
-    // `baseline_prefill_seconds_per_token` fields published by 12 consecutive
-    // successful ranked runs on the self-hosted M5 Max (m5-bench), runs
-    // 29179374395 through 29197772284 (each field is measure-job's on-box
-    // timing of the pinned reference tree in that run's session): decode
-    // clustered 0.04401-0.04411 (CV 0.08%), prefill 0.001618-0.001626 (CV
-    // 0.17%). Supersedes the retired tenki-macos-latest-xlarge VM-era values
-    // (prefill 0.010605031949609375 / decode 0.1336139485703125, 2026-07-07),
-    // which were ~6.5x / ~3.0x slower than the M5 and inflated local score
-    // estimates to ~3.7 for code that ranks ~1.0.
-    //
-    // TODO(operator): STALE FOR LAGUNA XS 2.1. These literals were measured
-    // against the Gemma reference tree; the Laguna re-baseline on m5-bench
-    // (go-live runbook steps B-C) must re-measure them (and update
-    // docs/benchmark-window-freeze.md, which quotes the exact literals)
-    // before local-mode score estimates mean anything for the new target.
+    // `baseline_prefill_seconds_per_token` fields published by the 4
+    // consecutive successful ranked Laguna runs on the self-hosted M5 Max
+    // (m5-bench): 29891158354, 29898041981, 29931435233, and 29934545157
+    // (each field is measure-job's on-box timing of the pinned Laguna
+    // reference tree in that run's session): decode clustered
+    // 0.0093606-0.0094083 (CV 0.20%), prefill 0.0003596-0.0003664 (CV
+    // 0.71%). The on-box /opt/bench-runner/state/baseline-calibration.json
+    // is runner-private, so the published per-run baseline fields are the
+    // audited public source. Supersedes the Gemma 4 31B 4-bit calibration of
+    // 2026-07-12 (prefill 0.0016216554767252605 / decode
+    // 0.04405625764973958, runs 29179374395-29197772284), which was ~4.5x /
+    // ~4.7x slower than the Laguna baseline and inflated local score
+    // estimates accordingly after the model re-pin.
     //
     // These constants are NOT the ranked scoring denominator. The ranked runner
     // is the single self-hosted M5 Max (m5-bench), where measure-job times the
@@ -168,8 +164,8 @@ public enum MLXFastConstants {
     // estimates (--local-iterate / --local-submit) and the gates-only pass's
     // placeholder timing fields, which the paired-timing overlay replaces. See
     // the paired-baseline section of docs/benchmark-window-freeze.md.
-    public static let officialBaselinePrefillSecondsPerToken = 0.0016216554767252605
-    public static let officialBaselineDecodeSecondsPerToken = 0.04405625764973958
+    public static let officialBaselinePrefillSecondsPerToken = 0.00036280499267578125
+    public static let officialBaselineDecodeSecondsPerToken = 0.00938833593359375
     public static let scorePrefillWeight = 0.25
     public static let scoreDecodeWeight = 0.75
     public static let scorePrefillSpeedupFloor = 0.95
