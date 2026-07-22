@@ -359,6 +359,36 @@ func officialRankedRunMeasuresPairedBaselineOnTheSameSilicon() throws {
 }
 
 @Test
+func pairedMeasurementPinsTelemetrySamplingInterval() throws {
+    let workflow = try packageFile(".github/workflows/benchmark.yml")
+    let dispatch = try slice(
+        workflow,
+        from: "  workflow_dispatch:",
+        to: "permissions:"
+    )
+    let steps = try #require(workflow.range(of: "\n    steps:"))
+    let jobHeader = String(workflow[..<steps.lowerBound])
+    let measureBody = try slice(
+        workflow,
+        from: "- name: Timed paired benchmark (measure-job)",
+        to: "- name: Overlay paired timing into final score"
+    )
+
+    // Laguna's ~1.4-second loaded window needs 100 ms samples. Pin the value
+    // directly on the trusted measure-job invocation: it must not come from a
+    // dispatch input, ambient job environment, or expression interpolation.
+    let telemetryAssignments = measureBody
+        .split(separator: "\n")
+        .map { String($0).trimmingCharacters(in: .whitespaces) }
+        .filter { $0.hasPrefix("TELEM_INTERVAL_MS=") }
+    #expect(telemetryAssignments == ["TELEM_INTERVAL_MS=100 \\"])
+    #expect(!dispatch.lowercased().contains("telem_interval_ms"))
+    #expect(!jobHeader.contains("\n      TELEM_INTERVAL_MS:"))
+    #expect(!measureBody.contains("TELEM_INTERVAL_MS=\"${"))
+    #expect(!measureBody.contains("TELEM_INTERVAL_MS=${{"))
+}
+
+@Test
 func decodeMeasurementInvokesNoPhaseVaryingEditableHook() throws {
     // The scored decode loop must invoke NO editable hook that is unique to it.
     // The former editable knob (Gemma4SubmissionControls.measuredDecodeDelay-

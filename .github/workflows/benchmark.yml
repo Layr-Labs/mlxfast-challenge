@@ -31,7 +31,7 @@ name: benchmark
 # whose thermal-stability contract is FIXED in that script (readonly, not
 # env-overridable): every timed phase -- baseline and candidate, plus any
 # oracle generation -- starts only once the GPU is below 40C (up to a 900s
-# cooldown wait), runs under 2 Hz macmon telemetry, and is REJECTED if any
+# cooldown wait), runs under 100 ms macmon telemetry, and is REJECTED if any
 # loaded sample shows GPU clocks below 1600 MHz (throttling), if telemetry is
 # missing, or if the sealed score shows token mismatches; one gated retry is
 # allowed. This replaces the old "separate cold machine for timing" guarantee:
@@ -1668,13 +1668,16 @@ jobs:
           # first loaded telemetry sample is a spin-up transient (~1590 MHz at
           # 93-94% util, coolest sample of the run) that false-trips the fixed
           # MIN_FREQ=1600 throttle-reject; 0.95 classifies only steady-state
-          # samples (0.96-0.98 util at 1607-1610 MHz) as loaded. The fixed
-          # thermal contract (40C gate, 900s ceiling, 1600 MHz floor) is
-          # readonly inside measure-job and remains fully enforced.
+          # samples (0.96-0.98 util at 1607-1610 MHz) as loaded.
+          # TELEM_INTERVAL_MS=100 gives Laguna's ~1.4s loaded window enough
+          # samples for the telemetry-validity gate. The fixed thermal contract
+          # (40C gate, 900s ceiling, 1600 MHz floor) is readonly inside
+          # measure-job and remains fully enforced.
           MEASURE_STATE_DIR="${MLXFAST_MEASURE_STATE_DIR}" \
           BASELINE_WS="${MLXFAST_BASELINE_WS}" \
           BASELINE_CALIBRATION="${MLXFAST_BASELINE_CALIBRATION}" \
           GPU_LOADED_UTIL=0.95 \
+          TELEM_INTERVAL_MS=100 \
             "${MLXFAST_MEASURE_JOB}" \
               --candidate "${MLXFAST_JOB_WS}" \
               --baseline "${MLXFAST_BASELINE_WS}" \
