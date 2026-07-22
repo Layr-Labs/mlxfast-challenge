@@ -2092,9 +2092,9 @@ func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
     #expect(cli.contains(
         "official benchmark runs require the editable-surface byte budget check"
     ))
-    #expect(EditableSurfaceByteBudget.defaultMaxTotalBytes == 2_500_000)
+    #expect(EditableSurfaceByteBudget.defaultMaxTotalBytes == 3_000_000)
     #expect(EditableSurfaceByteBudget.defaultMaxFileBytes == 524_288)
-    #expect(staticReview.contains("MAX_BYTES=\"${MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES:-2500000}\""))
+    #expect(staticReview.contains("MAX_BYTES=\"${MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES:-3000000}\""))
 
     // The current editable surface must actually FIT the launch budget with
     // the shipped defaults, or every official worker launch would fail.

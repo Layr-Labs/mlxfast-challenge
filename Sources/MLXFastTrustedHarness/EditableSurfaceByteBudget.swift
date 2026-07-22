@@ -12,9 +12,10 @@ import MLXFastCore
 /// with the script's `MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES` and
 /// `MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_FILE_BYTES`.
 public enum EditableSurfaceByteBudget {
-    /// The unmodified enlarged surface is ~1.51 MB; 2.5 MB leaves headroom
-    /// for merged frontier work while still bounding lookup-table smuggling.
-    public static let defaultMaxTotalBytes = 2_500_000
+    /// The unmodified full-stack surface is 2,590,558 bytes (~2.59 MB);
+    /// 3.0 MB leaves 409,442 bytes for merged frontier work while still
+    /// bounding lookup-table smuggling.
+    public static let defaultMaxTotalBytes = 3_000_000
     public static let defaultMaxFileBytes = 524_288
     public static let defaultContractRelativePath = "benchmark.json"
 }

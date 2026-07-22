@@ -86,7 +86,7 @@ official benchmark for ranking.
 ## What You May Optimize
 
 The submitted editable surface is defined by `editablePaths` in
-`benchmark.json` — that list (currently 75 entries) is the source of truth.
+`benchmark.json` — that list (currently 91 entries) is the source of truth.
 It covers four groups:
 
 ```text
@@ -97,9 +97,9 @@ Vendor/mlx-swift/ the MLX Metal kernels Laguna dispatches
 ```
 
 The vendored model surface is `Libraries/MLXLLM/Models/Laguna.swift` plus
-the `MLXLMCommon` files it uses directly (KV caches, RoPE utilities and
-application, compiled decode, evaluation plumbing; the exact file list is in
-`benchmark.json`).
+the `MLXLMCommon` files it uses directly (MoE/attention dispatch helpers,
+KV caches, RoPE utilities and application, compiled decode, evaluation
+plumbing; the exact file list is in `benchmark.json`).
 
 The vendored kernel surface is the kernel families the Laguna forward pass
 actually dispatches — SDPA (`scaled_dot_product_attention.metal`,
@@ -108,8 +108,8 @@ Laguna's head dim is 128, so the fused steel attention kernels are
 dispatchable at prefill), affine-quantized matmul (`quantized*` and
 `fp_quantized*` including the `_nax`
 variants), the MoE gather GEMM (`steel_gemm_gather*.cpp`), `steel/gemm/`,
-`gemv`, `rope`, `rms_norm`, `softmax`, `copy`,
-elementwise (`unary`/`binary`/`ternary`), `arg_reduce`, and gather indexing
+`gemv`, `rope`, `rms_norm`, `softmax`, `sort`, `reduce`, `copy`, elementwise
+(`unary`/`binary`/`ternary`), `arg_reduce`, and gather indexing
 — in both forms the build uses: the AOT `.metal`/`.h` sources under
 `Vendor/mlx-swift/.../backend/metal/kernels/` and their JIT twins under
 `Vendor/mlx-swift/Source/Cmlx/mlx-generated/*.cpp`.
@@ -117,7 +117,7 @@ elementwise (`unary`/`binary`/`ternary`), `arg_reduce`, and gather indexing
 Know how a kernel edit becomes the running kernel. The vendored MLX Swift
 package builds in JIT mode: families with an `mlx-generated/*.cpp` twin
 (quantized incl. fp_quantized, steel/gemm incl. the gather GEMM, steel/attn,
-gemv, softmax, copy, elementwise, gather) are
+gemv, softmax, sort, reduce, copy, elementwise, gather) are
 compiled at runtime from the C++ source strings embedded in those files, so
 for them the twin is the runtime-effective source — editing only the
 `.h`/`.metal` form does not change what runs; edit the pair together.

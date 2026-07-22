@@ -9,11 +9,11 @@ CONTRACT_PATH="${CONTRACT_PATH:-benchmark.json}"
 # performs bypass review. Both currently default to Opus 4.8, but each pin
 # is owned independently.
 MODEL="${MLXFAST_SUBMISSION_STATIC_REVIEW_MODEL:-claude-opus-4-8}"
-# Byte budget for the enlarged (vendored-kernel) editable surface. The whole
-# unmodified surface is ~1.51 MB (the pre-kernel 1.5 MB default no longer
-# even fits it), so MAX_BYTES bounds the total surface/review payload with
+# Byte budget for the full-stack (vendored-kernel) editable surface. The whole
+# unmodified surface is 2,590,558 bytes (~2.59 MB), so the 3.0 MB MAX_BYTES
+# bounds the total surface/review payload while leaving 409,442 bytes of
 # headroom for merged frontier work; MAX_FILE_BYTES bounds any single
-# editable file (the largest legitimate file today is ~106 KB, so 512 KiB
+# editable file (the largest legitimate file today is ~81 KB, so 512 KiB
 # leaves generous room while stopping a single lookup-table file);
 # MAX_GROWTH_BYTES bounds how many bytes a submission may ADD versus its
 # review base -- the total cap alone would let a small diff hide a large
@@ -22,7 +22,7 @@ MODEL="${MLXFAST_SUBMISSION_STATIC_REVIEW_MODEL:-claude-opus-4-8}"
 # defaults in sync with EditableSurfaceByteBudget in
 # Sources/MLXFastTrustedHarness, which re-enforces the total and per-file
 # caps at participant-worker launch.
-MAX_BYTES="${MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES:-2500000}"
+MAX_BYTES="${MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES:-3000000}"
 MAX_FILE_BYTES="${MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_FILE_BYTES:-524288}"
 MAX_GROWTH_BYTES="${MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_GROWTH_BYTES:-262144}"
 RESULTS_PATH="${MLXFAST_SUBMISSION_STATIC_REVIEW_RESULTS_PATH:-${MLXFAST_PRIVATE_DIR:-/tmp}/submission_static_review.json}"

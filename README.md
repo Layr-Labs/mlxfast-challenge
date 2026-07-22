@@ -141,19 +141,19 @@ correctness and benchmark checks.
 Unlike typical inference benchmarks, the entire model execution pipeline is
 in scope — including the vendored Laguna model code and the MLX Metal
 kernels it runs on. The authoritative list is `editablePaths` in
-`benchmark.json` (currently 75 entries), in four groups:
+`benchmark.json` (currently 91 entries), in four groups:
 
 | Path | What it controls |
 |---|---|
 | `Sources/MLXFastModel/` | Laguna XS 2.1 runtime: weight loading, attention, MoE MLP, KV caches, prefill/decode execution. **Primary target.** |
 | `Sources/MLXFastTransform/` | Offline reference-checkpoint transform into benchmark-ready `weights/`. |
-| `Vendor/mlx-swift-lm/Libraries/` (listed files) | The vendored Laguna model implementation (`MLXLLM/Models/Laguna.swift`) plus the `MLXLMCommon` plumbing it uses directly (KV caches, RoPE utilities/application, compiled decode, evaluation). |
-| `Vendor/mlx-swift/Source/Cmlx/` (listed files) | The MLX Metal kernels Laguna dispatches — SDPA (`steel/attn`, `sdpa_vector`), affine-quantized matmul (incl. `_nax` and the `fp_quantized` families), MoE gather GEMM (`steel_gemm_gather*`), `steel/gemm`, `gemv`, `rope`, `rms_norm`, `softmax`, `copy`, elementwise, `arg_reduce`, gather indexing — as AOT `.metal`/`.h` sources and their JIT `mlx-generated/*.cpp` twins. |
+| `Vendor/mlx-swift-lm/Libraries/` (listed files) | The vendored Laguna model implementation (`MLXLLM/Models/Laguna.swift`) plus the `MLXLMCommon` plumbing it uses directly (MoE/attention dispatch helpers, KV caches, RoPE utilities/application, compiled decode, evaluation). |
+| `Vendor/mlx-swift/Source/Cmlx/` (listed files) | The MLX Metal kernels Laguna dispatches — SDPA (`steel/attn`, `sdpa_vector`), affine-quantized matmul (incl. `_nax` and the `fp_quantized` families), MoE gather GEMM (`steel_gemm_gather*`), `steel/gemm`, `gemv`, `rope`, `rms_norm`, `softmax`, `sort`, `reduce`, `copy`, elementwise, `arg_reduce`, gather indexing — as AOT `.metal`/`.h` sources and their JIT `mlx-generated/*.cpp` twins. |
 
 Two build forms matter for kernel edits, because the vendored MLX package
 builds in JIT mode. Families with an `mlx-generated/*.cpp` twin (quantized
 incl. `fp_quantized`, steel/gemm incl. the gather GEMM, steel/attn, gemv,
-softmax, copy, elementwise, gather) are compiled at
+softmax, sort, reduce, copy, elementwise, gather) are compiled at
 runtime from the C++ source strings embedded in those files — the twin is
 the runtime-effective source, so edit it (and keep the readable
 `.metal`/`.h` pair in sync). RoPE, RMSNorm, the SDPA vector kernel, and

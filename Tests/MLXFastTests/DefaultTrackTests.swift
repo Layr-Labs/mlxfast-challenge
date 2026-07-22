@@ -118,6 +118,34 @@ struct DefaultTrackTests {
         )
         let editablePaths = try #require(track["editablePaths"] as? [String])
         #expect(!editablePaths.isEmpty)
+        #expect(editablePaths.count == 91)
+        #expect(Set(editablePaths).count == editablePaths.count, "editablePaths must be unique")
+
+        let requiredFullStackPaths = [
+            "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift",
+            "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/AttentionUtils.swift",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/sort.metal",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/sort.h",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/reduce.metal",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/reduce.h",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/reduce_utils.h",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/atomic.h",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/reduction/reduce_col.h",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/reduction/reduce_init.h",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/reduction/reduce_row.h",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/reduction/ops.h",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/reduction/reduce_all.h",
+            "Vendor/mlx-swift/Source/Cmlx/mlx-generated/sort.cpp",
+            "Vendor/mlx-swift/Source/Cmlx/mlx-generated/reduce.cpp",
+            "Vendor/mlx-swift/Source/Cmlx/mlx-generated/reduce_utils.cpp",
+        ]
+        for path in requiredFullStackPaths {
+            #expect(
+                editablePaths.contains(path),
+                "Laguna MoE/attention full-stack path \(path) must remain editable"
+            )
+        }
+
         let fm = FileManager.default
         for path in editablePaths {
             #expect(
