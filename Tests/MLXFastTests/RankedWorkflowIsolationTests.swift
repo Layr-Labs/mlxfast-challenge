@@ -9,7 +9,7 @@ import Testing
 @Suite
 struct RankedWorkflowIsolationTests {
     private func workflow() throws -> String {
-        try String(contentsOfFile: ".github/workflows/serial-benchmark.yml", encoding: .utf8)
+        try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
     }
 
     private func stepBody(_ workflow: String, from stepName: String, to nextStepName: String) throws -> String {
@@ -40,7 +40,7 @@ struct RankedWorkflowIsolationTests {
             "MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna.json"
         ))
         #expect(!jobHeader.contains(
-            "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_gc_runtimes_essay-laguna.txt"
+            "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt"
         ))
 
         let prepareStep = try stepBody(
@@ -60,7 +60,7 @@ struct RankedWorkflowIsolationTests {
             to: "- name: Wait for quiescence before timing"
         )
         #expect(prepareTimedPromptStep.contains(
-            "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_gc_runtimes_essay-laguna.txt"
+            "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt"
         ))
     }
 

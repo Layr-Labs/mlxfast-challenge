@@ -5,7 +5,8 @@
 > moved to a single self-hosted Apple M5 Max (`m5-bench`), where the timed
 > windows run last, pinned baseline then candidate back to back, each behind a
 > fixed 40C thermal gate with telemetry-validated acceptance (see
-> `.github/workflows/serial-benchmark.yml` and `benchmark-window-freeze.md`). The
+> `.github/workflows/benchmark.yml` — the serial ranked pipeline, formerly
+> named `serial-benchmark.yml` — and `benchmark-window-freeze.md`). The
 > analysis below is kept as the measurement record behind the per-axis
 > acceptance bands (`AcceptanceBand`, the `*BandTolerance` constants), which
 > remain in force; the runner-class specifics below no longer describe the

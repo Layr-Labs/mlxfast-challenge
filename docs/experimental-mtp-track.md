@@ -1,13 +1,29 @@
-# Poolside Laguna XS 2.1 MTP Track
+# Poolside Laguna XS 2.1 MTP Track (RETIRED)
 
-## Status and default routing
+> **RETIRED (2026-07-21).** The MTP track was dropped before going live for
+> Laguna. The serial track (`laguna-xs-2.1-serial-v1`) is now the default —
+> and only — ranked track: `benchmark.json` registers it and
+> `.github/workflows/benchmark.yml` is the serial ranked pipeline. The MTP
+> manifests (`benchmark.mtp.json` and the MTP-shaped `benchmark.json`), the
+> contract fixture (`fixtures/laguna_xs_2_1_mtp_track.json`), the MTP weight
+> manifests, and the local scripts (`setup-mtp.sh`, `benchmark-mtp.sh`) have
+> been deleted. The `mtp-*` CLI commands remain in the Swift tree as
+> unranked experimental code only. This document is preserved as a
+> historical design record: file, manifest, and workflow references below
+> describe the repository as it was when the track was live and are
+> deliberately not rewritten.
 
-This is the default official ranked track, with track ID
-`laguna-xs-2.1-mtp-v1`. Yukon reads `benchmark.json`, dispatches
-`.github/workflows/benchmark.yml`, and ingests `score.json`. Official scoring
-is decode-only paired speedup against the pinned serial K=1 target baseline.
-The former base-model serial challenge is archived as
-`benchmark.serial.json` and `.github/workflows/serial-benchmark.yml`.
+## Status and default routing (historical)
+
+This was the default official ranked track, with track ID
+`laguna-xs-2.1-mtp-v1`. Yukon read `benchmark.json`, dispatched
+`.github/workflows/benchmark.yml` (then the MTP pipeline), and ingested
+`score.json`. Official scoring
+was decode-only paired speedup against the pinned serial K=1 target baseline.
+The base-model serial challenge was archived at the time as
+`benchmark.serial.json` and `.github/workflows/serial-benchmark.yml`; it has
+since become the default again under the canonical names `benchmark.json`
+and `benchmark.yml`.
 
 The two experimental commands are:
 

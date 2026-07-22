@@ -1,47 +1,47 @@
-# mlxfast — Poolside Laguna XS 2.1 MTP Swift Challenge
+# mlxfast — Poolside Laguna XS 2.1 Serial Swift Challenge
 
-Optimize trained-assistant block decode for Poolside Laguna XS 2.1 (MoE text
-tower, 4-bit target) on Apple Silicon while preserving the target model's
-exact serial greedy output.
+Optimize serial (one token per decode request) inference for Poolside Laguna
+XS 2.1 (MoE text tower, 4-bit) on Apple Silicon while preserving the model's
+exact greedy output.
 
 ## Default ranked contract
 
-`benchmark.json` and `.github/workflows/benchmark.yml` define the default
-Yukon track, `laguna-xs-2.1-mtp-v1`. The organizer supplies a pinned Laguna
-target, Poolside's matched DFlash speculator (as the assistant), two hidden
-M5-generated goldens, and a pinned serial K=1 baseline.
+`benchmark.json` and `.github/workflows/benchmark.yml` define the default —
+and only — Yukon track, `laguna-xs-2.1-serial-v1`. The former MTP track is
+retired: there is no assistant, no block protocol, and no MTP manifest or
+workflow in this repository.
 
-The trusted parent drives:
+A ranked run on the self-hosted M5 box:
 
-1. `mtp_decode_begin` with the supplied seed.
-2. `mtp_decode_block` with only the last committed token and maximum block
-   size 4.
-3. Target verification of every proposed token before commitment.
-4. Exact comparison of every returned token with the hidden serial oracle.
+1. Verifies the pre-provisioned reference checkpoint against the pinned
+   manifest, builds the trusted CLI and the sandboxed participant worker,
+   and transforms the reference checkpoint into `weights/`.
+2. Runs the public drift tripwire, then the hidden 512-token-prompt
+   teacher-forced base case plus anchor/free-run/behavior/GPQA gates and the
+   semantic GPQA judge.
+3. Scrubs every hidden byte from the bench workspace, then runs the timed
+   paired measurement LAST behind the fixed 40C thermal gate: the pinned
+   baseline tree and the candidate are measured back to back on the same
+   silicon (`measure-job.sh`, telemetry-validated).
 
-A one-token divergence fails the run. The parent owns the timer and the
-logical token count; seed prefill is charged to decode. Ranked timing uses at
-least three accepted alternating serial/MTP pairs behind the 40C thermal gate:
+Timing measures a 512-token prompt prefill and a teacher-forced decode window
+(512-token decode seed, 128 decode steps; see
+`docs/benchmark-window-freeze.md` for the frozen knobs). The published score
+is the paired prefill+decode weighted speedup:
 
 ```text
-score = mean(serial_K1_seconds_per_token) / mean(MTP_seconds_per_token)
-floor = 1.0
+score = decode_speedup^0.75 * prefill_speedup^0.25
+decode_speedup_floor = 0.95
+prefill_speedup_floor = 0.95
 ```
 
-Run `MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh`, `./setup-mtp.sh`, then
-`./benchmark-mtp.sh --local-iterate` or `--local-submit`. Local runs generate
-a candidate-local serial oracle, so they check parity and speed direction but
-not official target fidelity. Only the hidden M5 goldens are authoritative.
-
-The serial non-speculative challenge remains available explicitly through
-`benchmark.serial.json`, `.github/workflows/serial-benchmark.yml`, and
-`./benchmark.sh`; it is no longer Yukon's default.
+Both floors are hard: a run below either floor, or with any token mismatch,
+publishes no score. Run `./setup.sh`, then `./benchmark.sh --local-iterate`
+or `--local-submit` locally; local modes write an estimated local
+`score.json` only — the official paired score comes exclusively from the
+ranked M5 run.
 
 ## Model Artifacts
-
-The default MTP target and assistant are provisioned by `setup-mtp.sh` and
-pinned by `fixtures/laguna_xs_2_1_mtp_track.json`. The base-checkpoint layout
-below documents the archived serial track.
 
 By default, `setup.sh` stores the frozen reference checkpoint in a shared
 Hugging Face-style cache under your home directory (so parallel clones reuse
@@ -63,7 +63,8 @@ mirror exists yet; one may be added later). It checks cached files
 against the pinned SHA256 manifest and redownloads only missing, truncated, or
 hash-mismatched files. (The checked-in Laguna weight manifests are entry-less
 placeholders until the operator regenerates them on m5-bench; setup fails
-closed on an entry-less manifest.) The safetensors payload is about 18.8 GB across 4
+closed on an entry-less manifest, so use `MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1`
+until then.) The safetensors payload is about 18.8 GB across 4
 shards; `setup.sh` requires 40 GiB free by default before starting. After a
 full verification, setup writes `.mlxfast-reference-cache.lock`; later setup
 runs use cheap size/mtime checks from that lock and skip the full checkpoint
@@ -156,10 +157,10 @@ benchmark checkout and re-enforces the editable surface server-side before
 running hidden validation. `--model` is required and is recorded for the
 leaderboard; pass `--note-file PATH` or `--claimed-score N` as needed.
 The benchmark contract also declares a local `preSubmitCommand`:
-`./benchmark-mtp.sh --local-submit`. `mlxfast submit` does not run it — the upload
+`./benchmark.sh --local-submit`. `mlxfast submit` does not run it — the upload
 goes directly to official validation, and no local run blocks it. Running that
-command yourself before submitting is the recommended local parity and timing
-check, without running the official hidden golden.
+command yourself before submitting is the recommended local correctness and
+timing check, without running the official hidden golden.
 
 `mlxfast-swift verify-transform` is an organizer/debug check for deterministic
 transform output. It re-runs the submitted transform and compares the generated
@@ -173,14 +174,6 @@ accepts `--max-bytes`.
 There is no Python harness path.
 
 ## Correctness Gates
-
-The default track replays a hidden 512-token MTP correctness golden, requires
-the trained assistant and exact-pair target verification, and checks every
-returned token against the parent-owned serial K=1 oracle. It also validates
-block size, accepted-prefix accounting, cache offsets, and rollback. Any
-failure makes the submission ineligible before timing.
-
-### Archived serial gate
 
 Correctness is a hard gate. Each base golden case contains exactly 512 prompt
 token IDs and at least 64 expected continuation token IDs. The harness checks
@@ -233,26 +226,12 @@ output path, and hidden-state tensors are easier to make ambiguous around
 normalization than token-level or logit-anchor checks.
 
 VLM/image and audio inputs remain out of scope. Only the Laguna text tower
-and organizer-provided DFlash MTP assistant execute.
+executes; the retired MTP track's DFlash assistant is no longer provisioned
+or run.
 
-### Default MTP decode rule
+### Serial non-speculative rule (default track)
 
-Each `mtp_decode_block` request supplies only the last committed token and a
-trusted maximum block length. The participant may draft and verify within that
-block using the pinned assistant and target, but may return only the
-target-confirmed prefix. Logical and physical cache positions advance exactly
-by the returned token count. The trusted parent independently checks every
-token against its serial oracle and rejects mismatches, extra rows, invalid
-rollback, or protocol drift.
-
-Prompt lookup, token-history drafting, a different assistant, hidden-prompt
-specialization, and precomputed future outputs remain forbidden. Kernel edits
-are allowed when they are input-general for Laguna and matched across AOT
-sources and JIT twins.
-
-### Archived serial non-speculative rule
-
-In `benchmark.serial.json`, each model
+In `benchmark.json`, each model
 invocation may compute logits and KV rows only for tokens supplied in that
 invocation, and must advance logical and physical KV position by exactly the
 supplied input length. A one-token decode request therefore advances exactly
@@ -276,26 +255,31 @@ every row corresponds to a token actually supplied in that same invocation,
 such as ordinary prefill; the prohibited case is using extra rows to compute
 or verify future tokens for a serial one-token request.
 
-Those restrictions apply only to the explicit serial workflow. They do not
-prohibit the organizer-defined block protocol in the default MTP track.
+Organizer-provided MTP or other speculative decoding would require a
+separately declared trusted block protocol, correctness contract, and score;
+no such track currently exists (the former MTP track is retired), so these
+restrictions apply to every ranked submission.
 
 ## Score
 
 ```text
-score = mean(serial_K1_seconds_per_token) / mean(MTP_seconds_per_token)
+score = decode_speedup^0.75 * prefill_speedup^0.25
 ```
 
-Higher is better. Both sides run on the same M5 in the same session, with
-alternating order and the same fixed thermal/telemetry acceptance. The hard
-component floor is:
+Higher is better. Each speedup is the pinned baseline's seconds/token divided
+by the candidate's, with both sides measured on the same M5 in the same
+session behind the same fixed thermal/telemetry acceptance (the paired
+baseline cancels host drift). The hard component floors are:
 
 ```text
-score >= 1.0
+decode_speedup >= 0.95
+prefill_speedup >= 0.95
 ```
 
-A run below the floor or with any token mismatch is ineligible.
-`score.json` also carries pair counts, parity, MTP acceptance diagnostics,
-seconds/token means, and transformed-weight identity.
+A run below either floor or with any token mismatch is ineligible. The score
+is null when any gate fails. `score.json` also carries prefill and decode
+seconds/token, speedups, floor verdicts, gate results, and
+transformed-weight identity.
 
 ## Useful Commands
 
@@ -303,10 +287,9 @@ seconds/token means, and transformed-weight identity.
 swift test
 MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test
 swift build -c release
-MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
-./setup-mtp.sh
-./benchmark-mtp.sh --local-iterate
-./benchmark-mtp.sh --local-submit
+./setup.sh
+./benchmark.sh --local-iterate
+./benchmark.sh --local-submit
 
 # Submitting is done with the Yukon CLI (mlxfast), not mlxfast-swift:
 mlxfast clone <benchmark-id-or-name>

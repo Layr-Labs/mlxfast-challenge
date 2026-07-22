@@ -580,63 +580,11 @@ func trainedMTPMemoryDiagnosticsRemainNonScoringProtocolFields() throws {
     #expect(decoded.serialVerificationRowCount == 1)
 }
 
-@Test
-func trainedMTPContractPinsMatchedITPairAndDependency() throws {
-    let data = try Data(
-        contentsOf: URL(
-            fileURLWithPath: "fixtures/laguna_xs_2_1_mtp_track.json"
-        )
-    )
-    let contract = try JSONDecoder().decode(
-        ExperimentalMTPTrackContract.self,
-        from: data
-    )
-    try GemmaRuntime.validateExperimentalMTPContract(contract)
-    #expect(contract.trackID == "laguna-xs-2.1-mtp-v1")
-    #expect(contract.target.upstreamModelID == "poolside/Laguna-XS-2.1")
-    #expect(
-        contract.target.runtimeModelID == "mlx-community/Laguna-XS-2.1-4bit"
-    )
-    #expect(
-        contract.assistant.modelID == "poolside/Laguna-XS-2.1-DFlash"
-    )
-    #expect(contract.assistant.expectedTotalBytes == 924_135_848)
-    #expect(contract.assistant.quantizationBits == 4)
-    #expect(contract.assistant.quantizationGroupSize == 64)
-    #expect(
-        contract.mlxSwiftLMRevision
-            == "bc1c0ee67d15798343be17c9f8f61f7c0d977149"
-    )
-    // Laguna re-pin: official scoring is OFF, fail-closed, until the hidden
-    // goldens, weight manifests, and paired reference baseline are
-    // regenerated on m5-bench (docs/mtp-track-golive-runbook.md). The
-    // ranked decode window (512) is owned by the workflow env; the
-    // contract's decode_tokens stays the 128-token compatibility default
-    // with a 1536 trusted-parent maximum (3x Laguna's 512-position sliding
-    // window, for the untimed wrap legs).
-    #expect(!contract.officialScoringEnabled)
-    #expect(contract.referenceBaseline.status == "pending_m5_rebaseline")
-    #expect(!contract.referenceBaseline.publicationAllowed)
-    #expect(contract.protocolContract.decodeTokens == 128)
-    #expect(contract.protocolContract.maximumDecodeTokens == 1_536)
-}
-
-@Test
-func trainedMTPContractRejectsAssistantReplacement() throws {
-    let path = "fixtures/laguna_xs_2_1_mtp_track.json"
-    let original = try String(contentsOfFile: path, encoding: .utf8)
-    let tampered = original.replacingOccurrences(
-        of: "poolside/Laguna-XS-2.1-DFlash",
-        with: "participant/arbitrary-assistant"
-    )
-    let contract = try JSONDecoder().decode(
-        ExperimentalMTPTrackContract.self,
-        from: Data(tampered.utf8)
-    )
-    #expect(throws: MLXFastError.self) {
-        try GemmaRuntime.validateExperimentalMTPContract(contract)
-    }
-}
+// The MTP ranked track is retired: its contract fixture
+// (fixtures/laguna_xs_2_1_mtp_track.json), weight manifests, manifests, and
+// local scripts are deleted, so the contract-pinning tests retired with
+// them. The MTP protocol/validator unit tests below remain because the
+// worker protocol code they cover still compiles into the runtime worker.
 
 @Test
 func trainedMTPOptionsFailClosedWithoutAssistantRequirement() throws {
@@ -810,137 +758,16 @@ func trainedMTPUsesExplicitExactPairVerificationAndSerialControl() throws {
     #expect(warmup.lowerBound < protocolHello.lowerBound)
 }
 
+// setup.sh must stay free of the retired MTP track's provisioning: no MTP
+// cache namespace and no assistant download path. (setup-mtp.sh itself is
+// retired and deleted; DefaultTrackTests pins its absence.)
 @Test
-func mtpProvisioningIsPinnedResumableAndSeparate() throws {
-    let script = try String(
-        contentsOfFile: "setup-mtp.sh",
-        encoding: .utf8
-    )
-    #expect(
-        script.contains(
-            "TARGET_REVISION=\"c42e0a8f8d504ceacde015a535dcb286d65c8799\""
-        )
-    )
-    #expect(
-        script.contains(
-            "ASSISTANT_REVISION=\"5c36361aab23c8ed3afbd079c10c426b677bc607\""
-        )
-    )
-    #expect(script.contains("--continue-at -"))
-    #expect(!script.contains("?download=true"))
-    #expect(script.contains("shasum -a 256"))
-    #expect(script.contains("must not be hardlinked"))
-    #expect(script.contains("must not be a symlink"))
-
+func setupStaysFreeOfRetiredMTPProvisioning() throws {
     let normalSetup = try String(
         contentsOfFile: "setup.sh",
         encoding: .utf8
     )
     #expect(!normalSetup.contains("laguna-xs-2.1-mtp-v1"))
     #expect(!normalSetup.contains("assistant"))
-}
-
-@Test
-func staticReviewHasDistinctSerialAndMTPPolicies() throws {
-    let script = try String(
-        contentsOfFile:
-            ".github/scripts/run-submission-static-review.sh",
-        encoding: .utf8
-    )
-    #expect(script.contains("MLXFAST_SUBMISSION_TRACK_ID"))
-    // TODO(operator): the review script's track-id allowlist still carries
-    // the retired gemma4-31b-it-mtp-v1 id; it rotates to
-    // laguna-xs-2.1-mtp-v1 with the .github workflow re-pin (a separate
-    // workstream from the Swift-side Laguna port). Update this expectation
-    // together with that script change.
-    #expect(script.contains("serial|gemma4-31b-it-mtp-v1"))
-    #expect(
-        script.contains(
-            "Permit organizer-assistant target-verified block speculation"
-        )
-    )
-    #expect(script.contains("participant-provided, replaced, tampered"))
-    #expect(script.contains("unverified draft output"))
-    #expect(script.contains("incorrect logical or physical KV rollback"))
-    #expect(script.contains("Controlling serial-track rule"))
-}
-
-@Test
-func trainedMTPArtifactValidationRuntimeGate() throws {
-    guard ProcessInfo.processInfo.environment[
-        "MLXFAST_RUN_MTP_RUNTIME_TESTS"
-    ] == "1" else {
-        return
-    }
-    let target = try #require(
-        ProcessInfo.processInfo.environment["MLXFAST_MTP_WEIGHTS_PATH"]
-    )
-    let sourceTarget = try #require(
-        ProcessInfo.processInfo.environment["MLXFAST_MTP_TARGET_DIR"]
-    )
-    let assistant = try #require(
-        ProcessInfo.processInfo.environment["MLXFAST_MTP_ASSISTANT_DIR"]
-    )
-    // NOTE: this runtime-gated leg can only pass once the operator has
-    // regenerated the Laguna weight manifests on m5-bench: the checked-in
-    // contract still carries REGENERATE_ON_M5 placeholder pins that make
-    // artifact validation fail closed by design.
-    let sourceReport = try GemmaRuntime.validateExperimentalMTPSourceTarget(
-        sourceTargetPath: sourceTarget,
-        contractPath: "fixtures/laguna_xs_2_1_mtp_track.json"
-    )
-    #expect(sourceReport.byteCount == 18_829_720_326)
-    let report = try GemmaRuntime.validateExperimentalMTPArtifacts(
-        targetWeightsPath: target,
-        assistantPath: assistant,
-        contractPath: "fixtures/laguna_xs_2_1_mtp_track.json"
-    )
-    #expect(report.trackID == "laguna-xs-2.1-mtp-v1")
-    #expect(report.assistantByteCount == 924_135_848)
-    #expect(report.targetByteCount <= 20 * (1 << 30))
-}
-
-@Test
-func trainedMTPPublicParityRuntimeGate() throws {
-    let environment = ProcessInfo.processInfo.environment
-    guard environment["MLXFAST_RUN_MTP_PARITY_TESTS"] == "1" else {
-        return
-    }
-    let sourceTarget = try #require(
-        environment["MLXFAST_MTP_TARGET_DIR"]
-    )
-    let weights = try #require(
-        environment["MLXFAST_MTP_WEIGHTS_PATH"]
-    )
-    let assistant = try #require(
-        environment["MLXFAST_MTP_ASSISTANT_DIR"]
-    )
-    let golden = try #require(
-        environment["MLXFAST_MTP_PARITY_GOLDEN_PATH"]
-    )
-    let executable = environment["MLXFAST_MTP_EXECUTABLE"]
-        ?? ".build-worker/release/mlxfast-runtime-worker"
-    let totalTokenCount = Int(
-        environment["MLXFAST_MTP_PARITY_TOKENS"] ?? "128"
-    ) ?? 128
-
-    let report = try GemmaRuntime.experimentalTrainedMTPBenchmark(
-        ExperimentalTrainedMTPOptions(
-            sourceTargetPath: sourceTarget,
-            targetWeightsPath: weights,
-            assistantPath: assistant,
-            contractPath: "fixtures/laguna_xs_2_1_mtp_track.json",
-            goldenPath: golden,
-            maxBlockSize: 4,
-            totalTokenCount: totalTokenCount,
-            requireTrainedAssistant: true
-        ),
-        worker: RuntimeWorkerOptions(
-            executablePath: executable,
-            helloTimeoutSeconds: 15 * 60,
-            requestTimeoutSeconds: 15 * 60
-        )
-    )
-    #expect(report.allTokensMatched)
-    #expect(report.decodeTokenCount == totalTokenCount)
+    #expect(!normalSetup.contains("setup-mtp.sh"))
 }

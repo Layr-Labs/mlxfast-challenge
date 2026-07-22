@@ -1,13 +1,12 @@
 # Gemma 4 MTP Track Threat Model
 
-> **Historical (Gemma-era) record.** This threat model was written for the
+> **Historical (Gemma-era) record — the MTP track is now retired
+> (2026-07-21).** This threat model was written for the
 > previous pin, `gemma4-31b-it-mtp-v1` (Gemma 4 31B-IT dense target with the
-> QAT trained assistant). The track is now `laguna-xs-2.1-mtp-v1`: Poolside
-> Laguna XS 2.1 (256-expert MoE, untied head, YaRN full-attention RoPE,
-> sliding window 512) with the 5-layer DFlash Eagle-style draft
-> (`poolside/Laguna-XS-2.1-DFlash`). The threat classes and controls below
-> carry over, but model-specific numbers, symbol names, and assistant
-> details are stale until this document is re-validated for Laguna.
+> QAT trained assistant), and was never re-validated for the short-lived
+> `laguna-xs-2.1-mtp-v1` re-pin, which was retired before going live. The
+> serial track is now the only ranked track. Kept for provenance; the threat
+> classes below would apply to any future speculative-decoding track.
 
 ## Executive summary
 

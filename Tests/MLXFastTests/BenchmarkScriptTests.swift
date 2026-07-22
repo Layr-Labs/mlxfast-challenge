@@ -158,15 +158,19 @@ func participantDocsExposeDefaultCLIInstallDirectory() throws {
 }
 
 @Test
-func participantDocsDescribeDefaultMTPScoreAndFloor() throws {
+func participantDocsDescribeDefaultSerialScoreAndFloors() throws {
     let readme = try String(contentsOfFile: "README.md", encoding: .utf8)
     let challenge = try String(contentsOfFile: "TASK.md", encoding: .utf8)
 
     for document in [readme, challenge] {
-        #expect(document.contains("serial_K1_seconds_per_token"))
-        #expect(document.contains("MTP_seconds_per_token"))
-        #expect(document.contains("1.0"))
+        // The default (and only) ranked track is the serial prefill+decode
+        // weighted paired speedup with the 0.95 floors.
+        #expect(document.contains("decode_speedup^0.75 * prefill_speedup^0.25"))
+        #expect(document.contains("0.95"))
         #expect(document.contains("512"))
+        // The retired MTP track's score description must be gone.
+        #expect(!document.contains("MTP_seconds_per_token"))
+        #expect(!document.contains("serial_K1_seconds_per_token"))
         #expect(!document.contains("3.177180971604"))
         #expect(!document.contains("0.149183255724"))
         #expect(!document.contains("256-step greedy decode latency"))
@@ -181,7 +185,7 @@ func participantDocsDescribeDefaultMTPScoreAndFloor() throws {
 @Test
 func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() throws {
     let workflow = try String(
-        contentsOfFile: ".github/workflows/serial-benchmark.yml",
+        contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
     let ci = try String(
@@ -439,7 +443,7 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
 @Test
 func benchmarkWorkflowProbesAndEnforcesRuntimeWorkerSandbox() throws {
     let workflow = try String(
-        contentsOfFile: ".github/workflows/serial-benchmark.yml",
+        contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
     let benchmark = try String(
@@ -523,11 +527,11 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
 @Test
 func benchmarkWorkflowRunsTrustedMainAndOverlaysOnlySubmittedEditablePaths() throws {
     let workflow = try String(
-        contentsOfFile: ".github/workflows/serial-benchmark.yml",
+        contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
     let guardScript = try String(
-        contentsOfFile: ".github/scripts/enforce-trusted-serial-benchmark-workflow.sh",
+        contentsOfFile: ".github/scripts/enforce-trusted-benchmark-workflow.sh",
         encoding: .utf8
     )
 
@@ -629,8 +633,7 @@ func trustedBenchmarkWorkflowGuardAllowsOnlyPermittedBranches() throws {
     }
 
     for (script, workflow) in [
-        (".github/scripts/enforce-trusted-benchmark-workflow.sh", "benchmark.yml"),
-        (".github/scripts/enforce-trusted-serial-benchmark-workflow.sh", "serial-benchmark.yml"),
+        (".github/scripts/enforce-trusted-benchmark-workflow.sh", "benchmark.yml")
     ] {
         for ref in [
             "refs/heads/main",
@@ -657,7 +660,7 @@ func trustedBenchmarkWorkflowGuardAllowsOnlyPermittedBranches() throws {
 @Test
 func benchmarkWorkspaceACLLocksTrustedSurfacesAgainstBench() throws {
     let workflow = try String(
-        contentsOfFile: ".github/workflows/serial-benchmark.yml",
+        contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
     let prepareRange = try #require(workflow.range(of: "- name: Prepare bench workspace"))
@@ -697,7 +700,7 @@ func benchmarkWorkspaceACLLocksTrustedSurfacesAgainstBench() throws {
 @Test
 func benchmarkPlacesHiddenGoldenInputsSymlinkSafely() throws {
     let workflow = try String(
-        contentsOfFile: ".github/workflows/serial-benchmark.yml",
+        contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
     let attachRange = try #require(workflow.range(of: "- name: Attach GPQA gates and verify augmented golden"))
@@ -727,7 +730,7 @@ func benchmarkPlacesHiddenGoldenInputsSymlinkSafely() throws {
 @Test
 func benchmarkPinsAndVerifiesTrustedHarnessAcrossScoredPhases() throws {
     let workflow = try String(
-        contentsOfFile: ".github/workflows/serial-benchmark.yml",
+        contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
     let pinScript = try String(
@@ -918,7 +921,7 @@ func benchmarkWorkflowsPinTrustedSourceScopeBeforeBuilding() throws {
     #expect(manifest.contains("verify-trusted-source-scope.sh"))
 
     for workflowPath in [
-        ".github/workflows/serial-benchmark.yml",
+        ".github/workflows/benchmark.yml",
         ".github/workflows/benchmark.yml",
     ] {
         let workflow = try String(contentsOfFile: workflowPath, encoding: .utf8)
@@ -1125,7 +1128,7 @@ func hashWeightsDirectoryRejectsHardlinks() throws {
 @Test
 func benchmarkWorkflowBindsPublishedArtifactsToDispatchedCommit() throws {
     let workflow = try String(
-        contentsOfFile: ".github/workflows/serial-benchmark.yml",
+        contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
     let overlay = try String(
@@ -1205,7 +1208,7 @@ func benchmarkWorkflowBindsPublishedArtifactsToDispatchedCommit() throws {
 @Test
 func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     let workflow = try String(
-        contentsOfFile: ".github/workflows/serial-benchmark.yml",
+        contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
     let validator = try String(
@@ -1244,7 +1247,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_TIMED_DECODE_TARGET_ID: \(MLXFastConstants.benchmarkEvaluationTargetID)"))
     #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_SHA256: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}"))
     #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_BYTES: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_BYTES }}"))
-    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_gc_runtimes_essay-laguna.txt"))
+    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt"))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json"))
     #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna.json"))
     #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"5\""))
@@ -1534,8 +1537,8 @@ func submissionStaticReviewPromptCoversMeasurementStructureExploitation() throws
         let publishedRule = try String(contentsOfFile: path, encoding: .utf8)
         let normalizedRule = publishedRule.lowercased()
         #expect(
-            normalizedRule.contains("archived serial non-speculative"),
-            "\(path) is missing the archived serial-track rule"
+            normalizedRule.contains("serial non-speculative"),
+            "\(path) is missing the serial-track rule"
         )
         #expect(normalizedRule.contains("prompt-lookup decoding"))
         #expect(normalizedRule.contains("same-target lookahead"))
@@ -1543,8 +1546,9 @@ func submissionStaticReviewPromptCoversMeasurementStructureExploitation() throws
         #expect(normalizedRule.contains("one position and leaves no pending future token"))
         #expect(normalizedRule.contains("default"))
         #expect(normalizedRule.contains("laguna xs 2.1"))
-        #expect(normalizedRule.contains("mtp_decode_block"))
-        #expect(normalizedRule.contains("last committed token"))
+        // The MTP track is retired: participant docs must no longer describe
+        // its block protocol as a live default.
+        #expect(!normalizedRule.contains("mtp_decode_block"))
     }
 }
 
@@ -2297,7 +2301,7 @@ func semanticGPQAGateParsesOpusVerdictShapesAndFailsUnparseableCaseClosed() thro
 @Test
 func rankedJobRunsPublicBehaviorGateBeforeHiddenGates() throws {
     let workflow = try String(
-        contentsOfFile: ".github/workflows/serial-benchmark.yml",
+        contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
 
@@ -2540,7 +2544,7 @@ func officialCorrectnessRunsEnforceWorkerSandboxThroughBenchExec() throws {
     #expect(cli.contains(".appendingPathComponent(\"mlxfast-runtime-worker\")"))
 
     let workflow = try String(
-        contentsOfFile: ".github/workflows/serial-benchmark.yml",
+        contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
     #expect(workflow.contains("MLXFAST_OFFICIAL_BENCHMARK_RUN: \"1\""))
@@ -2899,7 +2903,7 @@ func benchmarkCliSupportsSkippableBenchmarkCorrectness() throws {
 // unchanged.)
 @Test
 func benchmarkWorkflowValidatesCorrectnessReportGoldenHash() throws {
-    let workflow = try String(contentsOfFile: ".github/workflows/serial-benchmark.yml", encoding: .utf8)
+    let workflow = try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
     #expect(workflow.contains(".golden_hash == $golden_hash"))
 }
 
@@ -3088,7 +3092,7 @@ func compiledDecodeSkipsSynchronousHostOffsetValidation() throws {
 @Test
 func benchmarkLocalSubmitModeUsesLongLocalBenchmarkAndPrintsScore() throws {
     let contract = try String(
-        contentsOfFile: "benchmark.serial.json",
+        contentsOfFile: "benchmark.json",
         encoding: .utf8
     )
     let constants = try String(
@@ -4848,7 +4852,7 @@ func privateArtifactGuardRejectsRenamedGoldenAndPromptFiles() throws {
 @Test
 func singleMachineWorkflowGatesUploadsOnContentValidation() throws {
     let workflow = try String(
-        contentsOfFile: ".github/workflows/serial-benchmark.yml",
+        contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
 
@@ -4932,7 +4936,7 @@ func overlayPairedTimingValidatesInputsAppliesFloorsAndClearsPartialResult() thr
         encoding: .utf8
     )
     let workflow = try String(
-        contentsOfFile: ".github/workflows/serial-benchmark.yml",
+        contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
 
@@ -5140,7 +5144,7 @@ func overlayPairedTimingAcceptsTrustedCommitAndRejectsForgedOrMissingCommit() th
 @Test
 func cheapPreflightChecksRunBeforeExpensiveWork() throws {
     let workflow = try String(
-        contentsOfFile: ".github/workflows/serial-benchmark.yml",
+        contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
 
@@ -5178,7 +5182,7 @@ func cheapPreflightChecksRunBeforeExpensiveWork() throws {
 @Test
 func benchmarkWorkflowFailsClosedWhenRunnerPrivateArtifactCleanupFails() throws {
     let workflow = try String(
-        contentsOfFile: ".github/workflows/serial-benchmark.yml",
+        contentsOfFile: ".github/workflows/benchmark.yml",
         encoding: .utf8
     )
     let cleanupRange = try #require(workflow.range(of: "- name: Cleanup bench workspace"))
@@ -5206,7 +5210,7 @@ func benchmarkWorkflowFailsClosedWhenRunnerPrivateArtifactCleanupFails() throws 
 
 @Test
 func finalArtifactNamesStayRunIdOnlyAndAuditArtifactsEmbedRunAttempt() throws {
-    let workflow = try String(contentsOfFile: ".github/workflows/serial-benchmark.yml", encoding: .utf8)
+    let workflow = try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
 
     // The parallel benchmark-parallel-* intermediates (and their resolve/
     // download machinery) are gone with the fan-out; the name survives only
@@ -5236,7 +5240,7 @@ func benchmarkWorkflowUsesPerRunConcurrencyGroupWithoutCancellation() throws {
     // serialization is enforced by the self-hosted runner label queue, one job
     // per box), and cancel-in-progress stays false so no ranked run is ever
     // cancelled out from under a box mid-measurement.
-    let workflow = try String(contentsOfFile: ".github/workflows/serial-benchmark.yml", encoding: .utf8)
+    let workflow = try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
     #expect(workflow.contains("concurrency:\n  group: mlxfast-ranked-${{ github.run_id }}\n  cancel-in-progress: false"))
     #expect(!workflow.contains("group: mlxfast-ranked-benchmark"))
     #expect(!workflow.contains("group: benchmark-${{ github.ref }}"))

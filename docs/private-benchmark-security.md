@@ -7,17 +7,19 @@ single-machine pipeline: how private material is handled, what confines
 submitted code while it runs, which output channels are closed, and which
 gaps are known and stated rather than papered over.
 
-The MTP-default migration reused the same runner, sandbox, hidden-material,
-and artifact controls. Sections below that discuss GPQA or teacher-forced
-base-model gates describe the archived `serial-benchmark.yml` path; the live
-default substitutes the pinned MTP correctness and benchmark goldens.
+The serial track is the default — and only — ranked track: the former MTP
+track is retired, and the serial ranked pipeline now runs under the
+canonical workflow name `benchmark.yml` (it previously ran as
+`serial-benchmark.yml`). The GPQA and teacher-forced base-model gates below
+describe that live default path.
 
 ## Single-machine ranked topology
 
-Ranked runs execute through `.github/workflows/benchmark.yml` as one MTP
-track job on a single operator-supervised, self-hosted Apple M5 Max machine
-(runner label `m5-bench`). Build, IT-target transform, hidden MTP correctness,
-and alternating serial-K1/MTP paired timing all run in order on that box. The
+Ranked runs execute through `.github/workflows/benchmark.yml` as one
+serial-track job on a single operator-supervised, self-hosted Apple M5 Max
+machine (runner label `m5-bench`). Build, reference-checkpoint transform,
+hidden correctness/gates, and the paired baseline/candidate timing all run
+in order on that box. The
 previous multi-VM topology — parallel correctness slices, a separate
 paired-baseline timing VM, and a combine job — is retired; the guards it
 duplicated across privileged jobs now run once inside the single job, in
@@ -160,7 +162,7 @@ the private R2 bucket in trusted steps:
 `correctness_prompts/gpqa_reference_cases-laguna.json` (the hidden GPQA
 reference cases, merged into the golden as 5 behavior gates), followed after
 the correctness scrub by
-`correctness_prompts/timed_decode_gc_runtimes_essay-laguna.txt` (the
+`correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt` (the
 independent timed prefill/decode target).
 Correctness-only dispatches (`run_benchmark=false`) fetch no private
 material at all. The 2026-07 Poolside Laguna XS 2.1 re-pin rotated these
@@ -168,8 +170,7 @@ object keys from their former `-gemma` names: the correctness objects are
 regenerated from the Laguna reference — new tokenizer, vocab 100352 —
 through the same organizer-controlled offline process that
 `docs/gemma-migration-r2-checklist.md` records for the previous Gemma
-migration (that checklist is the template for this pass; see
-`docs/mtp-track-golive-runbook.md`).
+migration (that checklist is the template for this pass).
 
 Raw private bytes land only in a runner-only `0700` per-run directory; the
 raw golden and timed prompt are each verified against a SHA-256 and byte

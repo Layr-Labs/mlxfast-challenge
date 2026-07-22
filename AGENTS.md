@@ -10,19 +10,22 @@ Optimize Poolside Laguna XS 2.1 4-bit (text tower only) inference on Apple
 Silicon without
 changing the observable model behavior required by the correctness gates.
 
-The default official track is `laguna-xs-2.1-mtp-v1`. It rewards faster
-trained-assistant block decode against a paired serial K=1 target baseline:
+The default — and only — ranked track is `laguna-xs-2.1-serial-v1`, the
+serial (one token per decode request) track. It rewards faster prefill and
+decode against a paired on-box baseline measured in the same session:
 
 ```text
-score = mean(serial_K1_seconds_per_token) / mean(MTP_seconds_per_token)
+score = decode_speedup^0.75 * prefill_speedup^0.25
 ```
 
-Higher is better. Both sides are measured in alternating order on the same
-machine and session behind the same thermal gate. The floor is `1.0`, and
-every returned token must match the trusted serial oracle. The former
-prefill/decode weighted serial track remains available explicitly through
-`benchmark.serial.json` and `serial-benchmark.yml`; it is not the Yukon
-default.
+Higher is better. Each speedup is the pinned baseline's seconds/token divided
+by the candidate's for that phase, both measured on the same machine behind
+the same thermal gate. Both component floors are `0.95`, hard, and every
+checked token must match the golden. The former MTP speculative-decoding
+track is retired: `benchmark.json` registers the serial track,
+`.github/workflows/benchmark.yml` is the serial ranked pipeline, and no MTP
+manifest, contract fixture, or MTP-specific local script remains in the
+repository.
 
 ## Official Hardware
 
@@ -38,17 +41,16 @@ The box is operator-supervised: each ranked job runs on a fresh ephemeral
 runner registration, every invocation of submitted code (build, transform,
 correctness, benchmark) executes sandboxed, and the machine's protected
 surface is integrity-audited between jobs — drift quarantines the box instead
-of publishing a score. The default pipeline validates the pinned Laguna target
-and DFlash assistant, builds and transforms, replays the hidden MTP
-correctness golden,
-then runs at least three accepted alternating serial/MTP timing pairs. Every
-timed phase starts only once the GPU has cooled below a fixed 40C gate and
-rejects throttled or telemetry-invalid measurements. See
-`.github/workflows/benchmark.yml` for the exact step order.
+of publishing a score. The pipeline verifies the pre-provisioned reference
+checkpoint against the pinned manifest, builds and transforms, runs the
+public drift tripwire and the hidden correctness/gates pass, then runs the
+timed paired measurement LAST. Every timed phase starts only once the GPU has
+cooled below a fixed 40C gate and rejects throttled or telemetry-invalid
+measurements. See `.github/workflows/benchmark.yml` for the exact step order.
 
-Because the candidate and the pinned reference are measured back to back on
-the same silicon behind the same thermal gate, the paired speedup ratio
-cancels host drift; the score is that ratio, not a comparison against a
+Because the candidate and the pinned on-box baseline are measured back to
+back on the same silicon behind the same thermal gate, the paired speedup
+ratio cancels host drift; the score is that ratio, not a comparison against a
 stored constant. Laguna XS 2.1 4-bit is a fine-grained MoE model (256 routed
 experts plus one shared expert per sparse layer, 8 experts per token,
 per-head gating; layer 0 is a dense MLP): the text tower is about
@@ -63,9 +65,8 @@ full-attention layers), quantized matmul and MoE gather-GEMM dispatch,
 KV-cache handling, memory layout, and MLX
 scheduling — not disk I/O.
 
-Local MTP work needs enough unified memory for the ~18.8 GB target, assistant,
-KV state, and verification buffers; 64 GiB is the practical local minimum.
-The archived serial track can still run at roughly 36 GiB.
+Local work needs enough unified memory for the ~18.8 GB model plus KV state
+and buffers; roughly 36 GiB is the practical local minimum.
 Machines below 64 GiB automatically use a low-memory startup profile: retained
 co-tiled/combined weight layouts and compiled decode are disabled, the MLX
 allocator cache is capped at 6 GiB, and free warmup buffers are cleared before
@@ -89,10 +90,10 @@ The submitted editable surface is defined by `editablePaths` in
 It covers four groups:
 
 ```text
-Sources/MLXFastModel/     Laguna runtime glue, custom kernels, decode path
+Sources/MLXFastModel/ Laguna runtime glue, custom kernels, decode path
 Sources/MLXFastTransform/ offline weight transform
-Vendor/mlx-swift-lm/      the Laguna model files + MLXLMCommon plumbing
-Vendor/mlx-swift/         the MLX Metal kernels Laguna dispatches
+Vendor/mlx-swift-lm/ the Laguna model files + MLXLMCommon plumbing
+Vendor/mlx-swift/ the MLX Metal kernels Laguna dispatches
 ```
 
 The vendored model surface is `Libraries/MLXLLM/Models/Laguna.swift`,
@@ -127,7 +128,7 @@ vendored `.metal` sources by `tools/build-mlx-metallib.sh` (invoked by
 names are the M5-generation kernel variants; the ranked M5 box selects
 them, so tune the `_nax` twin as well as the plain one. Then rebuild
 (`swift build -c release`) and test with
-`./benchmark-mtp.sh --local-iterate`.
+`./benchmark.sh --local-iterate`.
 
 All participant model and kernel code — `MLXFastModel` plus the vendored
 forks — compiles into the sandboxed `mlxfast-runtime-worker` binary. The
@@ -137,10 +138,8 @@ hot-path code runs only inside the worker.
 
 Focus on:
 
-- Reducing scored MTP seconds per committed token.
-- Increasing safe draft acceptance and reducing target verification work
- without changing the serial K=1 accumulation order.
-- Optimizing the vendored Metal kernels on the decode and exact-pair paths.
+- Reducing scored prefill and decode seconds per token.
+- Optimizing the vendored Metal kernels on the prefill and decode paths.
 - Optimizing kernels and hot-path MLX operations used by attention (both the
  sliding-window and full-attention layer types), the MoE MLP (routing,
  expert gather GEMM, shared expert), KV-cache
@@ -151,21 +150,17 @@ Focus on:
  linear construction, fewer copies, lazier Data-to-Metal conversions).
 - Making the offline transform produce better runtime metadata or compact
  transformed artifacts.
-- Improving seed prefill and block decode inside the Swift/MLX model path.
+- Improving prefill and single-token decode inside the Swift/MLX model path.
 
 The target is Poolside Laguna XS 2.1, MoE, 4-bit (untied embeddings, vocab
 100352), text tower only (the empty `vision_config` is out of scope and never
-loaded). The frozen target checkpoint is about
-18.8 GB across 4 safetensors shards; `setup-mtp.sh` also provisions the
-matched DFlash speculator (the 924,135,848-byte BF16 upstream, converted to
-MLX affine 4-bit group-64 at setup) as the assistant and verifies both
-against pinned manifests. The
-transformed `mtp-weights/` tree holds only the text-tower tensors
+loaded). The frozen reference checkpoint is about
+18.8 GB across 4 safetensors shards, verified against the pinned manifest.
+The transformed `weights/` tree holds only the text-tower tensors
 (everything under the source checkpoint's `language_model.` prefix) plus a
 runtime-authored `config.json`; it is an overlay/runtime artifact, not a
-second full copy of the model. Aim to keep generated transformed weights under
-20 GB (the default cap is 25 GiB; the MTP contract caps transformed output at
-20 GiB).
+second full copy of the model. Aim to keep generated transformed weights
+under 20 GB (the default cap is 25 GiB).
 
 ## What Not To Change
 
@@ -180,7 +175,7 @@ They are trusted harness/operator code and are not packaged by submit:
 - Everything in `Vendor/` not listed in `editablePaths`: other model
  families, shared model-factory/tokenizer plumbing, and kernels Laguna
  does not dispatch
-- `.github/`, scripts, tests, docs, and all `benchmark*.json` manifests
+- `.github/`, scripts, tests, docs, and `benchmark.json`
 - `weights/`, reference checkpoints, scores, golden files, local caches
 
 Do not try to hardcode hidden prompts, hidden token IDs, GPQA answers, timing
@@ -195,29 +190,36 @@ use the Yukon CLI (`mlxfast`).
 
 ## Correctness Gates
 
-Correctness is a hard gate. Local MTP runs generate their oracle from the
-current candidate, so they prove block/serial parity only. They do not prove
-fidelity to the pinned Laguna target. The ranked M5 runner is the authority.
+Correctness is a hard gate. The ranked M5 runner is the authority.
 
 The official correctness stack includes:
 
-- Hidden 512-token MTP correctness replay.
-- A distinct hidden 512-token timed golden.
-- Trained-assistant requirement and exact-pair target verification.
-- Parent-owned serial oracle comparison for every returned token.
-- Cache offset, rollback, block-size, and acceptance-accounting invariants.
+- The public drift tripwire (one 64-step teacher-forced check against the
+ checked-in public fixture, run before any hidden material enters the
+ workspace).
+- The hidden full-length teacher-forced base case (512-token prompts) plus
+ hidden anchor, free-run, and GPQA behavior gates.
+- The GPQA TTFT guardrail and the semantic GPQA judge (Anthropic).
+- The timed phase's own token acceptance: the trusted measure wrapper
+ generates a per-binary oracle for the hidden timed prompt and rejects any
+ mismatched output.
+
+Note the public checked-in fixtures are M5-generated; a near-tie argmax can
+diverge on other Apple Silicon generations even for correct code.
 
 ## Timing And Score Measurement
 
-The official benchmark measures serial K=1 and candidate MTP decode
-seconds/token over alternating accepted pairs, then publishes the ratio of
-their means. The floor is `1.0`.
+The official benchmark measures prefill and decode seconds/token for the
+candidate and the pinned on-box baseline in the same session, then publishes
+the weighted paired speedup `decode_speedup^0.75 * prefill_speedup^0.25`.
+Both component floors are `0.95`, hard.
 
 The timed measurement runs last in the ranked job, after all correctness and
-gate work, behind a fixed 40C GPU thermal gate with telemetry-validated
-acceptance; the pinned reference is measured the same way on the same box in
-the same session. At least three pairs must pass parity, stall, thermal, and
-telemetry validation.
+gate work and after every hidden byte is scrubbed from the bench workspace,
+behind a fixed 40C GPU thermal gate with telemetry-validated acceptance
+(throttled samples reject the measurement, with one gated retry). The timed
+window is frozen: a 512-token prefill prompt and a teacher-forced decode pass
+(512-token seed, 128 decode steps) — see `docs/benchmark-window-freeze.md`.
 
 Diagnostic fields such as memory and read timings are recorded for audit and
 future guardrails, but are not the primary score unless the benchmark contract
@@ -225,10 +227,7 @@ changes. There is no expert/weight-streaming bandwidth to report — every
 routed expert is RAM-resident: `bandwidth_gb_per_token` is always `0` with
 `bandwidth_source=ram_resident_model`. Do not optimize for that diagnostic
 field as a standalone target; optimize changes that reduce the measured
-MTP decode time.
-
-The benchmark charges decode setup to the decode measurement so model code
-cannot hide future-token work in an unscored seed-prefill phase.
+prefill and decode times.
 
 ## Local Workflow
 
@@ -240,32 +239,30 @@ local run:
 git fetch origin main
 git switch main
 git pull --ff-only
-MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
-./setup-mtp.sh
-./benchmark-mtp.sh --local-iterate
-cp score.json score.mtp.baseline.json
+./setup.sh
+./benchmark.sh --local-iterate
+cp score.json score.baseline.json
 ```
 
 Create your working branch from that synced commit, or rebase/merge your
 existing branch onto `origin/main` before trusting local timings. Every
-`./benchmark-mtp.sh --local-iterate` result should be interpreted as performance on
-top of the latest synced base commit measured on the same local machine, with
-the same toolchain, model cache, power state, and thermal conditions. If the
-base commit changes, rerun the local baseline before deciding whether an
+`./benchmark.sh --local-iterate` result should be interpreted as performance
+on top of the latest synced base commit measured on the same local machine,
+with the same toolchain, model cache, power state, and thermal conditions. If
+the base commit changes, rerun the local baseline before deciding whether an
 optimization is faster.
 
 Start with:
 
 ```bash
-MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
-./setup-mtp.sh
+./setup.sh
 ```
 
 This checks the local Swift/Xcode toolchain, builds the Swift harness and MLX
-Metal library, then downloads and verifies the pinned Laguna XS 2.1 target
-and trained DFlash assistant. The MTP cache defaults under
-`~/.cache/mlxfast/laguna-xs-2.1-mtp-v1`; override it with
-`MLXFAST_MTP_CACHE_ROOT`.
+Metal library, then downloads and verifies the pinned Laguna XS 2.1 reference
+checkpoint (use `MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1` while the checked-in weight
+manifests are still entry-less placeholders, or when the checkpoint is
+provisioned externally).
 
 Common commands:
 
@@ -274,26 +271,25 @@ swift test
 MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test
 swift build -c release
 tools/build-mlx-metallib.sh
-./benchmark-mtp.sh --local-iterate
-./benchmark-mtp.sh --local-submit
+./benchmark.sh --local-iterate
+./benchmark.sh --local-submit
 ```
 
-`./benchmark-mtp.sh --local-iterate` is the fast local edit-loop signal.
+`./benchmark.sh --local-iterate` is the fast local edit-loop signal.
 Use it to compare the current working tree against the latest-tip baseline you
 recorded above, not against a result from an older branch.
-`./benchmark-mtp.sh --local-submit` is the recommended manual pre-submit check
+`./benchmark.sh --local-submit` is the recommended manual pre-submit check
 (`mlxfast submit` does not run it for you) and is intended to be longer and
-closer to the official path; like `--local-iterate` it publishes only the
-candidate-local paired score (never the official ranked score). It generates
-its own serial oracle, so the hidden M5 golden remains the fidelity authority.
-The former `benchmark.sh` commands belong to `benchmark.serial.json`.
+closer to the official path; like `--local-iterate` it publishes only a
+local estimated score (never the official ranked score). The hidden M5
+goldens remain the fidelity authority.
 
 ## Notes For Autonomous Agents
 
 Operational contract for coding agents iterating in this repo. These
 behaviors are expected, not bugs:
 
-- **Legacy serial cool-down gate.** `./benchmark.sh
+- **Cool-down gate.** `./benchmark.sh
  --local-iterate` and `--local-submit` wait for the GPU to cool below 40C
  before starting the timed run (read via `macmon`), printing a progress
  line roughly every 10 seconds while waiting. A benchmark invocation that
@@ -319,15 +315,14 @@ behaviors are expected, not bugs:
  RPM). Manual control uses the same helper:
  `tools/fan-control.sh boost|normal|status` (needs an `smc` CLI, e.g.
  from smcFanControl; fanless Macs are refused cleanly).
-- **Measurement discipline.** Trust MTP and serial numbers only from a cool,
+- **Measurement discipline.** Trust timing numbers only from a cool,
  quiescent machine. Back-to-back runs heat the GPU and throttle it; a
- 2-3 minute cool-down between local runs is normal. The legacy serial wrapper
- enforces this automatically; cool the machine before `benchmark-mtp.sh`.
- Do not fight the serial gate to iterate faster:
+ 2-3 minute cool-down between local runs is normal. The wrapper
+ enforces this automatically. Do not fight the gate to iterate faster:
  `MLXFAST_LOCAL_COOL_GATE=0` is for debugging only and produces
  hot-start timings that are not comparable to gated ones. The ranked
- score is a paired speedup versus the on-box pinned reference measured
- in the same session. Treat candidate-local MTP ratios as directional.
+ score is a paired speedup versus the on-box pinned baseline measured
+ in the same session. Treat local scores as directional.
 - **A local gate failure on non-M5 hardware may not be your bug.** The
  public goldens are M5-generated greedy continuations of the
  mlx-swift-lm reference; near-tie argmaxes can diverge on other Apple
@@ -340,9 +335,9 @@ behaviors are expected, not bugs:
  `Sources/MLXFastTransform/`, the vendored Laguna model and `MLXLMCommon`
  files, and the listed vendored kernel sources (both AOT `.metal`/`.h`
  and JIT `mlx-generated/*.cpp` forms); changes anywhere else will not
- upload even if they help locally. Official MTP ranking requires hidden
+ upload even if they help locally. Official ranking requires hidden
  organizer goldens and is not runnable locally — use
- `./benchmark-mtp.sh --local-iterate` for the edit loop and
+ `./benchmark.sh --local-iterate` for the edit loop and
  `--local-submit` as the recommended pre-submit check.
 - **One local run at a time; the memory guard is protecting your RAM.** The
  ~18.8 GB RAM-resident text tower means two simultaneous model residencies
@@ -358,11 +353,11 @@ behaviors are expected, not bugs:
  (wait for it). The guard warns and aborts -- it never kills anything
  itself. Aborted local runs now reap their own worker on INT/TERM/EXIT
  and the worker exits if its parent dies, so the guard should fire
- rarely. Know its scope: the lock lives in `benchmark.sh`, so
- `benchmark-mtp.sh` and direct
+ rarely. Know its scope: the lock lives in `benchmark.sh`, so direct
  `mlxfast-swift` model commands (`correctness`, `correctness-trace`,
- `generate-golden`, `generate-gpqa-answers`, `mtp-*`) take no lock and
- do not check for other runs -- run one model-holding command at a
+ `generate-golden`, `generate-gpqa-answers`, and the retired-track
+ `mtp-*` commands, which still load the model if invoked) take no lock
+ and do not check for other runs -- run one model-holding command at a
  time, never concurrently with a local benchmark or with each other.
  (`swift test` never loads the real model and is safe alongside.)
  `MLXFAST_LOCAL_RUN_GUARD=0` disables the guard for harness debugging
@@ -413,20 +408,17 @@ Submit packages only `editablePaths`. It rejects generated artifacts, symlinks,
 local scores, reference checkpoints, and source changes outside the editable
 surface. `mlxfast submit` uploads the editable-path archive directly for
 official validation; it does not run a local benchmark first, and no local run
-blocks the upload. Run `./benchmark-mtp.sh --local-submit` yourself before
+blocks the upload. Run `./benchmark.sh --local-submit` yourself before
 submitting — the official M5 run is the gate that ranks the submission.
 
 ## Practical Optimization Ideas
 
 Good submissions are likely to improve one or more of:
 
-- Trained-assistant drafting, target-confirmed-prefix handling, exact-pair
- verification, rollback, and shared K/V reuse inside the trained-MTP block
- session and behavior-exact pair kernels in `Sources/MLXFastModel/`.
-- Kernel-level optimization inside the vendored Metal sources, now that
- they are editable. Prioritize kernels reached by block decode, target
- exact-pair verification, and the assistant. For the JIT families, edit the
- `mlx-generated/*.cpp` twin — that string is what compiles at runtime.
+- Kernel-level optimization inside the vendored Metal sources. Prioritize
+ kernels reached by the timed prefill and decode phases. For the JIT
+ families, edit the `mlx-generated/*.cpp` twin — that string is what
+ compiles at runtime.
 - Attention kernel dispatch: sliding-window vs. full-attention masking, GQA
  head-group broadcasting (8 KV heads at head_dim 128), and the
  full-attention layers' YaRN partial-rotary (0.5) RoPE.
@@ -486,15 +478,14 @@ Run at least:
 
 ```bash
 swift test
-MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
-./setup-mtp.sh
-./benchmark-mtp.sh --local-submit
+./setup.sh
+./benchmark.sh --local-submit
 ```
 
-If local MTP parity fails, the official benchmark will not rank the
-submission. Local parity uses a candidate-generated oracle and is weaker than
-the hidden M5 golden; if performance improves but correctness is fragile,
-prefer a more conservative optimization.
+If local correctness fails, check the non-M5 near-tie caveat above before
+assuming a regression; if performance improves but correctness is fragile,
+prefer a more conservative optimization. The official benchmark will not rank
+a submission that fails the hidden gates.
 
 Do not add caches or memos keyed on a request's input tokens whose only
 possible hit is the benchmark harness repeating an identical computation — for
@@ -509,9 +500,10 @@ rely on. Input-independent caching (weights, dequantized tensors, RoPE/mask
 tables keyed on shapes and offsets) and within-request KV reuse remain fine.
 Submissions in this category fail the static review as bypass behavior.
 
-### Archived Serial Non-Speculative Track
+### Serial Non-Speculative Track Rules (default)
 
-In `benchmark.serial.json`, each model
+This is the default Laguna XS 2.1 serial track, `laguna-xs-2.1-serial-v1`,
+registered by `benchmark.json`. Each model
 invocation may compute logits and KV rows only for tokens supplied in that
 invocation, and must advance logical and physical KV position by exactly the
 supplied input length. A one-token decode request therefore advances exactly
@@ -531,34 +523,18 @@ Ordinary within-request KV reuse, current-token-only decode, and
 input-independent weight, dequantization, kernel, mask, or RoPE caches remain
 allowed. Multi-row kernels remain allowed when every row is backed by a token
 supplied in that same invocation, such as prefill. Organizer-provided MTP or
-other speculative decoding requires a separate explicit track with a trusted
-variable-length block protocol, correctness contract, and score; it is not an
-optimization within this serial track.
+other speculative decoding would require a separate explicit track with a
+trusted variable-length block protocol, correctness contract, and score; no
+such track currently exists.
 
-### Default Laguna XS 2.1 MTP Track
+### Retired MTP Track (historical)
 
-The Yukon-default ranked surface has track ID
-`laguna-xs-2.1-mtp-v1`; `docs/experimental-mtp-track.md` is its detailed
-contract. An organizer-pinned Laguna XS 2.1 target
-(`mlx-community/Laguna-XS-2.1-4bit`, MLX affine 4-bit group-64) is
-paired with Poolside's matched trained DFlash speculator
-(`poolside/Laguna-XS-2.1-DFlash`, a 5-layer Eagle-style draft over target
-layers [1,13,25,33,39] with block_size 16 and mask token 12, downloaded as
-the BF16 upstream and converted to MLX 4-bit at setup); a trusted parent
-drives a block protocol
-(`mtp_decode_begin`, then
-`mtp_decode_block` carrying only the last committed token and a max block
-size of 4), owns the timer and an independent serial-oracle check of every
-returned token, and divides its own wall time by its configured decode total
-(`--tokens`, default 128, trusted-parent max 1536; ranked timed decode stays
-fixed at 512). The participant surface is the drafting
-and verification strategy inside `Sources/MLXFastModel/` — the
-trained-MTP block decoder and the bit-exact exact-pair
-verification kernels, which verify two target rows
-per dispatch while preserving each row's serial K=1 accumulation order so
-accepted tokens are bit-identical to serial decode. Bit-exactness is a hard
-gate: one token diverging from the parent oracle fails the run, so the track
-cannot be won by degrading output. Scoring is decode-only
-paired speedup versus the trusted serial K=1 reference in the same session,
-with a floor of 1.0. The archived serial rules above still apply to explicit
-serial-track submissions only.
+An experimental trained-assistant MTP block-decode track
+(`laguna-xs-2.1-mtp-v1`, previously the Yukon default) existed until
+2026-07 and has been retired without going live for Laguna: its manifests
+(`benchmark.mtp.json`, the old MTP-shaped `benchmark.json`), workflow
+content, contract fixture, weight manifests, and local scripts
+(`benchmark-mtp.sh`, `setup-mtp.sh`) were removed when the serial pipeline
+became the canonical `benchmark.yml`. Historical design records remain under
+`docs/` (marked retired) for provenance only; the serial rules above govern
+every ranked submission.

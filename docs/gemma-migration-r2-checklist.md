@@ -2,10 +2,15 @@
 
 > **Historical record.** This checklist covers the DeepSeek-to-Gemma
 > migration and is complete. The 2026-07 re-pin to Poolside Laguna XS 2.1
-> (`laguna-xs-2.1-mtp-v1`, new tokenizer with vocab 100352) requires the
+> (new tokenizer with vocab 100352) requires the
 > same regeneration pass again — hidden goldens, GPQA references, public
-> fixtures, and pins — executed per
-> `docs/mtp-track-golive-runbook.md`; use this file as the template.
+> fixtures, and pins — for the serial track (`laguna-xs-2.1-serial-v1`);
+> use this file as the template. (The MTP track named in earlier revisions
+> of this note was retired 2026-07-21 without going live for Laguna.)
+> Workflow-name note: the serial ranked pipeline referenced below as
+> `serial-benchmark.yml` now runs under the canonical name `benchmark.yml`;
+> the step names and env pins are unchanged. Mentions below are kept as
+> written for provenance.
 
 The DeepSeek V4 Flash to Gemma 4 31B 4-bit migration changed the model,
 tokenizer, and layer count, so every private artifact that embeds prompt

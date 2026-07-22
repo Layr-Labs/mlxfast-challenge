@@ -4,8 +4,8 @@ This repository's own code is licensed per the top-level `LICENSE` file. The
 challenge additionally depends on third-party model artifacts and Swift
 packages credited below. Nothing in this file grants rights to the mlxfast
 harness itself, and no model weights are distributed inside this repository —
-the setup scripts (`setup.sh`, `setup-mtp.sh`) download the pinned artifacts
-from their upstream repositories and verify them against checked-in SHA256
+the setup script (`setup.sh`) downloads the pinned artifacts
+from their upstream repositories and verifies them against checked-in SHA256
 manifests.
 
 ## Poolside Laguna XS 2.1 models
@@ -19,9 +19,9 @@ Artifacts referenced (and hash-pinned) by this repository:
 
 | Artifact | Upstream | License |
 |---|---|---|
-| `poolside/Laguna-XS-2.1` @ `c405648833500615a2efde76886b8aed4fb9324e` (MTP-track upstream target, BF16) | Poolside | OpenMDW-1.1 |
-| `mlx-community/Laguna-XS-2.1-4bit` @ `c42e0a8f8d504ceacde015a535dcb286d65c8799` (MTP-track runtime target and serial-track reference checkpoint; MLX affine 4-bit, group size 64) | mlx-community conversion of the above | OpenMDW-1.1 |
-| `poolside/Laguna-XS-2.1-DFlash` @ `5c36361aab23c8ed3afbd079c10c426b677bc607` (MTP-track draft/assistant; BF16 upstream, converted to MLX 4-bit at setup) | Poolside | OpenMDW-1.1 |
+| `poolside/Laguna-XS-2.1` @ `c405648833500615a2efde76886b8aed4fb9324e` (upstream model, BF16) | Poolside | OpenMDW-1.1 |
+| `mlx-community/Laguna-XS-2.1-4bit` @ `c42e0a8f8d504ceacde015a535dcb286d65c8799` (serial-track reference checkpoint; MLX affine 4-bit, group size 64) | mlx-community conversion of the above | OpenMDW-1.1 |
+| `poolside/Laguna-XS-2.1-DFlash` @ `5c36361aab23c8ed3afbd079c10c426b677bc607` (the retired MTP track's draft/assistant; no longer downloaded or pinned by setup, credited here for the historical records under `docs/`) | Poolside | OpenMDW-1.1 |
 
 Attribution statement: "Laguna XS 2.1 and Laguna XS 2.1 DFlash © Poolside,
 licensed OpenMDW-1.1 (<https://huggingface.co/poolside/Laguna-XS-2.1>);

@@ -1,41 +1,27 @@
-# mlxfast — Poolside Laguna XS 2.1 MTP
+# mlxfast — Poolside Laguna XS 2.1
 
 A benchmark arena for compute-optimal LLM inference on Apple Silicon.
-Run Poolside Laguna XS 2.1 with Poolside's matched trained DFlash speculator,
-verify every returned token against the target model, and make block decode
-faster.
+Run Poolside Laguna XS 2.1 4-bit, keep its exact greedy output, and make
+prefill and serial decode faster.
 
 See [TASK.md](TASK.md) for the full problem statement, scoring formula, and
-approach space.
+approach space. (The former MTP speculative-decoding track is retired; the
+serial track described here is the default and only ranked track.)
 
 ## Quickstart
 
 ```bash
-# Build the Swift/Metal runtime without downloading the legacy base checkpoint.
-MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 ./setup.sh
+# Build the Swift/Metal runtime and download the reference checkpoint.
+./setup.sh
 
-# Download and verify the pinned Laguna target and trained DFlash assistant.
-./setup-mtp.sh
+# Fast local edit-loop signal (correctness smoke + local timing estimate).
+./benchmark.sh --local-iterate
 
-# Directional local MTP-vs-serial control (64 decoded tokens).
-./benchmark-mtp.sh --local-iterate
-
-# Longer local pre-submit signal (128 decoded tokens).
-./benchmark-mtp.sh --local-submit
+# Longer local pre-submit signal.
+./benchmark.sh --local-submit
 ```
 
-The local wrapper generates a temporary serial oracle from the current
-candidate, then requires the trained-assistant path to match it exactly. That
-is useful for parity and speed direction but is not an official correctness
-oracle. Ranked runs use organizer-pinned M5 goldens from the frozen Laguna
-target; one divergent token fails the run.
-
-### Legacy serial local setup
-
-The archived serial track (`benchmark.serial.json` and
-`serial-benchmark.yml`) still uses the following base checkpoint and local
-commands. Full model setup needs a moderate local SSD. The reference
-checkpoint is
+Full model setup needs a moderate local SSD. The reference checkpoint is
 `mlx-community/Laguna-XS-2.1-4bit`, with 4 safetensors shards totaling about
 18.8 GB. `setup.sh` downloads the checkpoint from the pinned Hugging Face
 revision by default (no organizer mirror exists yet for this checkpoint),
@@ -76,32 +62,34 @@ and `MLXFAST_REFERENCE_AUTH_HEADER` to pass an auth
 header to a private checkpoint endpoint. Run `./setup.sh --help`
 for the full local setup knobs.
 
-> **Correctness fixtures are M5-generated.** The archived serial track's
-> checked-in goldens can hit near-tie argmax differences on other Apple
-> Silicon generations; the ranked M5 result is authoritative.
+> **Correctness fixtures are M5-generated.** The checked-in goldens can hit
+> near-tie argmax differences on other Apple Silicon generations; the ranked
+> M5 result is authoritative.
 
-### Ranked MTP workflow
+### Ranked workflow
 
-Yukon dispatches `.github/workflows/benchmark.yml`, the default MTP workflow.
-It validates the pinned Laguna target and organizer-owned DFlash assistant,
-builds and transforms submitted code in the sandbox, and replays a hidden
-512-token correctness golden through trained-assistant block decode. The
-trusted parent accepts only a target-confirmed prefix and compares every
-returned token with its serial K=1 oracle.
+Yukon dispatches `.github/workflows/benchmark.yml`, the serial ranked
+pipeline. It verifies the pre-provisioned reference checkpoint against the
+pinned manifest, builds and transforms submitted code in the sandbox, runs
+the public drift tripwire, then the hidden teacher-forced base case plus the
+anchor/free-run/behavior/GPQA gates and the semantic GPQA judge.
 
-Timing runs last. At least three alternating candidate/reference pairs run
-behind the fixed 40C thermal gate. The published decode-only score is:
+Timing runs last, behind the fixed 40C thermal gate: the trusted on-box
+measure-job runs the pinned baseline tree and the candidate back to back on
+the same silicon over a hidden 512-token evaluation prompt, and the paired
+ratio cancels host drift. The published score is:
 
 ```text
-score = mean(serial_K1_seconds_per_token) / mean(MTP_seconds_per_token)
+score = decode_speedup^0.75 * prefill_speedup^0.25
 ```
 
-The hard floor is `1.0`; parity failure, invalid cache rollback, throttling,
-or invalid telemetry fails the run. `score.json` carries
-`track_id=laguna-xs-2.1-mtp-v1`. See
-[`docs/experimental-mtp-track.md`](docs/experimental-mtp-track.md) for the
-protocol and [`docs/private-benchmark-security.md`](docs/private-benchmark-security.md)
-for isolation details.
+Both speedup floors are `0.95`, hard; a token mismatch, throttled sample, or
+invalid telemetry fails the run. `score.json` publishes the paired speedups
+and floor verdicts. See
+[`docs/private-benchmark-security.md`](docs/private-benchmark-security.md)
+for isolation details and
+[`docs/benchmark-window-freeze.md`](docs/benchmark-window-freeze.md) for the
+frozen timed window.
 
 ## Why this challenge exists
 
@@ -111,10 +99,8 @@ gating); only the text tower (`language_model.` tensors) is in scope here. In
 MLX affine 4-bit the checkpoint is about 18.8 GB, small enough to load
 entirely into unified memory once at process startup on the official runner
 (a self-hosted Apple M5 Max with 128 GB of unified memory, runner label
-`m5-bench`). MTP keeps the target, assistant, target KV, shared K/V, and
-verification activations resident together; 64 GiB is the practical local
-minimum. There is
-no weight streaming: the target is RAM-resident before scored decode.
+`m5-bench`). There is no weight streaming: the model is RAM-resident before
+scored prefill or decode.
 
 The optimized runtime also has alternate combined/co-tiled weight layouts that
 are profitable on the 128 GB ranked machine but would duplicate roughly
@@ -141,7 +127,7 @@ quantized matmul
 dispatch, MoE expert gathering, KV-cache handling, attention masking, and MLX
 graph/scheduling
 overhead are all optimisation targets — and so are the vendored MLX Metal
-kernels themselves, which are now part of the editable surface (see "The
+kernels themselves, which are part of the editable surface (see "The
 modifiable surface" below). The generated `weights/` tree is
 expected to stay small: it is a runtime artifact overlay on top of the frozen
 reference checkpoint (a straight text-tensor subset plus a runtime-authored
@@ -159,8 +145,8 @@ kernels it runs on. The authoritative list is `editablePaths` in
 
 | Path | What it controls |
 |---|---|
-| `Sources/MLXFastModel/` | Laguna XS 2.1 target runtime, trained-assistant block session, exact-pair verification, MLX Swift array bridge, attention, and KV-cache logic. **Primary target.** |
-| `Sources/MLXFastTransform/` | Offline target transform into benchmark-ready `mtp-weights/`. |
+| `Sources/MLXFastModel/` | Laguna XS 2.1 runtime: weight loading, attention, MoE MLP, KV caches, prefill/decode execution. **Primary target.** |
+| `Sources/MLXFastTransform/` | Offline reference-checkpoint transform into benchmark-ready `weights/`. |
 | `Vendor/mlx-swift-lm/Libraries/` (listed files) | The vendored Laguna model implementation (`MLXLLM/Models/Laguna.swift`, `LagunaMTP.swift`, `LagunaMTPTarget.swift`) plus the `MLXLMCommon` plumbing it uses directly (KV caches, RoPE utilities/application, compiled decode, evaluation). |
 | `Vendor/mlx-swift/Source/Cmlx/` (listed files) | The MLX Metal kernels Laguna dispatches — SDPA (`steel/attn`, `sdpa_vector`), affine-quantized matmul (incl. `_nax` and the `fp_quantized` families), MoE gather GEMM (`steel_gemm_gather*`), `steel/gemm`, `gemv`, `rope`, `rms_norm`, `softmax`, `copy`, elementwise, `arg_reduce`, gather indexing — as AOT `.metal`/`.h` sources and their JIT `mlx-generated/*.cpp` twins. |
 
@@ -176,8 +162,8 @@ the runtime-effective source, so edit it (and keep the readable
 vendored `.metal` sources — rerun it after editing those. `_nax` names are
 the M5-generation kernel variants the ranked runner selects. After a kernel
 edit: `swift build -c release` (plus the metallib rebuild for AOT edits),
-then `./benchmark-mtp.sh --local-iterate`. Prioritize kernels reached by
-assistant drafting, target block verification, and exact-pair decode.
+then `./benchmark.sh --local-iterate`. Prioritize kernels reached by the
+timed prefill and decode phases.
 
 Participant model and kernel code — `MLXFastModel` plus the vendored forks
 — builds into the sandboxed `mlxfast-runtime-worker` binary. The trusted
@@ -233,54 +219,52 @@ surface server-side after upload. `--model` is required and is recorded for the
 leaderboard. `MLXFAST_API_URL` / `MLXFAST_API_TOKEN` (or the `YUKON_*`
 equivalents) configure the endpoint and token for scripted runs.
 `mlxfast submit` uploads directly: it does not run the contract
-`preSubmitCommand` (`./benchmark-mtp.sh --local-submit`), and no local run blocks
+`preSubmitCommand` (`./benchmark.sh --local-submit`), and no local run blocks
 the upload — the official M5 run is the gate. Run
-`./benchmark-mtp.sh --local-submit` yourself before submitting: it compares
-trained-assistant block decode with the candidate's serial K=1 control, writes
-`score.json`, and catches obvious parity or speed regressions before they
-spend official runner time.
+`./benchmark.sh --local-submit` yourself before submitting: it runs the
+public correctness fixture and a longer local timing pass, writes
+`score.json`, and catches obvious correctness or speed regressions before
+they spend official runner time.
 
 ## Local Commands
 
-Use these MTP modes for local development:
+Use these modes for local development:
 
 | Command | Purpose | What it checks | Output |
 |---|---|---|---|
-| `./benchmark-mtp.sh --local-iterate` | Fast directional edit loop. | Candidate-local serial oracle, 64 exact tokens, trained assistant, exact-pair verification. | `score.json` with local MTP speedup. |
-| `./benchmark-mtp.sh --local-submit` | Longer pre-submit signal. | Same checks over 128 exact tokens. | `score.json` with local MTP speedup. |
+| `./benchmark.sh --local-iterate` | Fast directional edit loop. | Public-fixture correctness (64 teacher-forced steps) plus a short local timing pass. | `score.json` with a local estimated score. |
+| `./benchmark.sh --local-submit` | Longer pre-submit signal. | Same correctness over a longer 1023-step decode timing pass. | `score.json` with a local estimated score. |
 
-Both modes transform the pinned Laguna target, generate a temporary oracle from
-the current candidate, run serial K=1 and trained-assistant exact-pair decode,
-and publish their ratio. The generated oracle deliberately cannot establish
-official target fidelity; only the hidden M5 golden can do that. The archived
-serial local modes remain available through `benchmark.serial.json` and
-`./benchmark.sh`.
+Both modes transform the reference checkpoint if needed, run the checked-in
+public correctness fixture, and time prefill and decode locally. Local scores
+are estimates for direction only; the official paired score exists only on
+the ranked M5 runner, measured against the pinned on-box baseline.
 
 ## Scoring
 
 ```text
-score = mean(serial_K1_seconds_per_token) / mean(MTP_seconds_per_token)
+score = decode_speedup^0.75 * prefill_speedup^0.25
 ```
 
-Higher is better. The denominator is the pinned serial K=1 target baseline
-measured on the same M5 in the same session, behind the same thermal gates.
-The score is a ratio of means over accepted alternating pairs; at least three
-pairs must survive parity, thermal, and telemetry checks. The component floor
-is `score >= 1.0`.
+Higher is better. Each speedup is the pinned baseline's seconds/token divided
+by the candidate's for that phase, measured on the same M5 in the same
+session behind the same fixed 40C thermal gate and telemetry acceptance. The
+timed window is frozen (512-token prefill prompt; 512-token decode seed with
+128 teacher-forced decode steps — see
+`docs/benchmark-window-freeze.md`), and the component floors are hard:
 
-The trusted parent owns the timer and divides wall time by its configured
-decode count. Seed prefill is charged to decode. Each block may return at most
-four tokens, and every token must match the parent-owned serial oracle before
-it is committed. The whole target is RAM-resident with no weight streaming.
-`bandwidth_gb_per_token=0`. RAM and phase-timing metrics are still reported
+```text
+decode_speedup >= 0.95
+prefill_speedup >= 0.95
+```
+
+Correctness is a hard gate: the full 64-step teacher-forced base case, the
+hidden anchor/free-run/behavior/GPQA gates, GPQA TTFT, the semantic GPQA
+judge, and the public drift tripwire must all pass, or the score is null.
+The whole model is RAM-resident with no weight streaming
+(`bandwidth_gb_per_token=0`). RAM and phase-timing metrics are still reported
 for operator review and future guardrails; they are not primary score factors.
-Correctness is a hard gate. See TASK.md for the full correctness specification.
-The ranked correctness replay runs before timing in a fresh worker. The
-benchmark golden is distinct from the correctness golden and is installed
-only by the trusted measurement wrapper. The score payload publishes aggregate
-pair counts, parity status, serial and MTP seconds/token means, speedup
-statistics, and the transformed-weights digest; prompts, token IDs, and
-per-case hidden outputs remain private.
+See TASK.md for the full correctness specification.
 
 ## Architecture
 
@@ -323,17 +307,16 @@ files; it does not require the baseline `weights/` layout. `verify-transform`
 uses the same default cap and can also be changed with
 `mlxfast-swift verify-transform --max-bytes N`.
 
-### Legacy serial fixtures
+### Correctness fixtures
 
-The archived serial track's public correctness prompt and golden live in
-`correctness_prompts/`.
+The public correctness prompt and golden live in `correctness_prompts/`.
 These fixtures are generated on the ranked M5 hardware against the 4-bit
 reference: the prompt text is tokenized with the target tokenizer
 (512 prompt tokens) and the expected tokens are greedy reference
 continuations captured with `mlxfast-swift generate-golden` (256 tokens for
 local-iterate, 1024 for local-submit). The checked-in fixtures are still the
 legacy Gemma-generated ones; they must be regenerated on m5-bench with the
-Laguna tokenizer (vocab 100352) and model before the serial track can gate
+Laguna tokenizer (vocab 100352) and model before they can gate
 Laguna code. Private prompt manifests and hidden
 benchmark golden files are not committed or generated by the benchmark
 workflow. In private benchmark CI, the normal path downloads the precomputed
@@ -343,7 +326,7 @@ regeneration), then downloads
 `correctness_prompts/gpqa_reference_cases-laguna.json` and merges it into the
 local golden as 5 hidden GPQA behavior checks. Generate
 final hidden benchmark goldens outside the public repository and upload the
-resulting file to the protected private R2 path. `serial-benchmark.yml` keeps
+resulting file to the protected private R2 path. `benchmark.yml` keeps
 raw hidden material in a runner-only private directory, not the repository
 workspace, scrubs every hidden byte out of the bench workspace before the
 timed measurement, and uploads only hash and byte-count sidecars. The
@@ -385,9 +368,9 @@ tokenizer whitespace variants.
 ## License and attribution
 
 This repository's harness code is licensed per [LICENSE](LICENSE). The
-Poolside Laguna models the harness downloads and benchmarks
-(Laguna XS 2.1 and the Laguna XS 2.1 DFlash speculator, © Poolside, plus the
-mlx-community 4-bit conversion) are licensed OpenMDW-1.1 with terms at
+Poolside Laguna model the harness downloads and benchmarks
+(Laguna XS 2.1, © Poolside, plus the
+mlx-community 4-bit conversion) is licensed OpenMDW-1.1 with terms at
 <https://huggingface.co/poolside/Laguna-XS-2.1>; no model weights are
 distributed in this repository. Full third-party attribution — models,
 linked Swift packages, and the Apache-2.0 text — is in
@@ -395,10 +378,11 @@ linked Swift packages, and the Apache-2.0 text — is in
 
 ## Requirements
 
-- Apple Silicon Mac, 64 GB+ unified memory recommended for MTP (enough to
-  hold the ~18.8 GB target plus assistant, KV cache, and buffers; the ranked
-  runner is a single self-hosted Apple M5 Max with 128 GB, so local timings —
-  and, on non-M5 machines, near-tie greedy tokens — are directional only)
+- Apple Silicon Mac with enough unified memory for the ~18.8 GB RAM-resident
+  model plus KV cache and buffers (roughly 36 GiB practical minimum; the
+  ranked runner is a single self-hosted Apple M5 Max with 128 GB, so local
+  timings — and, on non-M5 machines, near-tie greedy tokens — are
+  directional only)
 - macOS Sequoia or later
 - Swift 6 through Xcode or Xcode Command Line Tools
 - Xcode Metal Toolchain for `mlx.metallib`; `./setup.sh` tries
