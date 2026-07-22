@@ -804,7 +804,7 @@ struct BenchmarkSafetyTests {
     }
 
     @Test
-    func finalArtifactValidatorRejectsScoreIntegrityIdentityMismatches() throws {
+    func finalArtifactValidatorEnforcesTimingAndIntegrityContracts() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let score = root.appendingPathComponent("score.json")
@@ -817,10 +817,11 @@ struct BenchmarkSafetyTests {
 
         let metrics: [String: Any] = [
             "actual_token": NSNull(), "bandwidth_gb_per_token": 0,
-            "bandwidth_source": "ram_resident_model", "baseline_decode_seconds_per_token": 1,
-            "baseline_prefill_seconds_per_token": 1, "benchmark_wall_seconds": 3,
+            "bandwidth_source": "ram_resident_model",
+            "baseline_decode_seconds_per_token": 0.00936,
+            "baseline_prefill_seconds_per_token": 0.000361, "benchmark_wall_seconds": 3,
             "case_count": 1, "checked_steps": 64, "commit": commit,
-            "correctness_seconds": 1, "decode_seconds_per_token": 1,
+            "correctness_seconds": 1, "decode_seconds_per_token": 0.00936,
             "decode_speedup": 1,
             "decode_speedup_floor": NSDecimalNumber(string: "0.95"), "error": "",
             "expected_token": NSNull(), "expert_bytes_read": 0,
@@ -836,7 +837,7 @@ struct BenchmarkSafetyTests {
             "max_abs_diff": 0, "num_layers": 40, "partial_result": false,
             "passed_correctness": true, "peak_ram_gb": 1,
             "passed_decode_speedup_floor": true, "passed_prefill_speedup_floor": true,
-            "prefill_seconds_per_token": 1, "prefill_speedup": 1,
+            "prefill_seconds_per_token": 0.000361, "prefill_speedup": 1,
             "prefill_speedup_floor": NSDecimalNumber(string: "0.95"), "preflight_seconds": 1,
             "process_resident_memory_gb": 1, "runtime": "swift",
             "semantic_gpqa_case_count": 1, "semantic_gpqa_model": "fixture",
@@ -845,14 +846,6 @@ struct BenchmarkSafetyTests {
             "weights_byte_count": 1, "weights_file_count": 1,
             "weights_hash": weightsHash,
         ]
-        try JSONSerialization.data(withJSONObject: [
-            "metrics": metrics, "passed": true, "score": 1,
-        ]).write(to: score)
-        let scoreHash = SHA256.hash(data: try Data(contentsOf: score))
-            .map { String(format: "%02x", $0) }.joined()
-        try "\(scoreHash)  score.json\n".write(
-            to: URL(fileURLWithPath: score.path + ".sha256"), atomically: true, encoding: .utf8
-        )
         try "{}".write(to: golden, atomically: true, encoding: .utf8)
         try "\(goldenHash)  correctness_golden.json\n".write(
             to: URL(fileURLWithPath: golden.path + ".sha256"), atomically: true, encoding: .utf8
@@ -861,17 +854,155 @@ struct BenchmarkSafetyTests {
             to: URL(fileURLWithPath: golden.path + ".bytes"), atomically: true, encoding: .utf8
         )
 
-        let baseIntegrity: [String: Any] = [
-            "golden_path": "[private]", "golden_sha256": goldenHash,
-            "score_path": "score.json", "score_sha256": scoreHash,
-            "transform_source_sha256": String(repeating: "e", count: 64),
-            "weights_byte_count": 1, "weights_file_count": 1,
-            "weights_path": "weights", "weights_sha256": weightsHash,
-        ]
-        try JSONSerialization.data(withJSONObject: baseIntegrity).write(to: integrity)
+        func writeScoreArtifacts(
+            metrics inputMetrics: [String: Any],
+            scientificTiming: (field: String, literal: String)? = nil
+        ) throws -> [String: Any] {
+            var serializedMetrics = inputMetrics
+            let scientificMarker = "__MLXFAST_SCIENTIFIC_TIMING__"
+            if let scientificTiming {
+                serializedMetrics[scientificTiming.field] = scientificMarker
+            }
+
+            var scoreData = try JSONSerialization.data(withJSONObject: [
+                "metrics": serializedMetrics, "passed": true, "score": 1,
+            ])
+            if let scientificTiming {
+                let quotedMarker = "\"\(scientificMarker)\""
+                guard var scoreJSON = String(data: scoreData, encoding: .utf8),
+                      scoreJSON.contains(quotedMarker)
+                else {
+                    throw NSError(
+                        domain: "BenchmarkSafetyTests.scientificTiming",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "scientific timing marker missing"]
+                    )
+                }
+                scoreJSON = scoreJSON.replacingOccurrences(
+                    of: quotedMarker,
+                    with: scientificTiming.literal
+                )
+                scoreData = Data(scoreJSON.utf8)
+            }
+
+            try scoreData.write(to: score)
+            let scoreHash = SHA256.hash(data: scoreData)
+                .map { String(format: "%02x", $0) }.joined()
+            try "\(scoreHash)  score.json\n".write(
+                to: URL(fileURLWithPath: score.path + ".sha256"),
+                atomically: true,
+                encoding: .utf8
+            )
+            let generatedIntegrity: [String: Any] = [
+                "golden_path": "[private]", "golden_sha256": goldenHash,
+                "score_path": "score.json", "score_sha256": scoreHash,
+                "transform_source_sha256": String(repeating: "e", count: 64),
+                "weights_byte_count": 1, "weights_file_count": 1,
+                "weights_path": "weights", "weights_sha256": weightsHash,
+            ]
+            try JSONSerialization.data(withJSONObject: generatedIntegrity).write(to: integrity)
+            return generatedIntegrity
+        }
+
+        _ = try writeScoreArtifacts(metrics: metrics)
         let accepted = try runFinalArtifactValidator(root: root, golden: golden, commit: commit)
         #expect(accepted.status == 0, Comment(rawValue: accepted.stderr))
 
+        let validatorSource = try String(
+            contentsOfFile: ".github/scripts/validate-benchmark-artifacts.sh",
+            encoding: .utf8
+        )
+        #expect(validatorSource.contains(
+            "MAX_PLAUSIBLE_SPEEDUP=\"${MLXFAST_MAX_PLAUSIBLE_SPEEDUP:-5.0}\""
+        ))
+        #expect(validatorSource.contains(
+            "MIN_DECODE_SECONDS_PER_TOKEN=\"${MLXFAST_MIN_DECODE_SECONDS_PER_TOKEN:-0.001}\""
+        ))
+        #expect(validatorSource.contains(
+            "MIN_PREFILL_SECONDS_PER_TOKEN=\"${MLXFAST_MIN_PREFILL_SECONDS_PER_TOKEN:-0.00004}\""
+        ))
+        #expect(validatorSource.contains(
+            "mirror /opt/bench-runner/measure-job.sh exactly"
+        ))
+        // The measured Laguna baseline values remain comfortably above the
+        // recalibrated defaults, including when JSON spells a timing in
+        // scientific notation.
+        _ = try writeScoreArtifacts(
+            metrics: metrics,
+            scientificTiming: ("decode_seconds_per_token", "9.36e-3")
+        )
+        let scientificLegitimate = try runFinalArtifactValidator(
+            root: root,
+            golden: golden,
+            commit: commit
+        )
+        #expect(
+            scientificLegitimate.status == 0,
+            Comment(rawValue: scientificLegitimate.stderr)
+        )
+
+        // Both candidate and paired-baseline timings fail below either
+        // default floor.
+        let belowFloorCases: [(field: String, value: Double)] = [
+            ("decode_seconds_per_token", 0.000999),
+            ("baseline_decode_seconds_per_token", 0.000999),
+            ("prefill_seconds_per_token", 0.000039),
+            ("baseline_prefill_seconds_per_token", 0.000039),
+        ]
+        for testCase in belowFloorCases {
+            var tooFast = metrics
+            tooFast[testCase.field] = testCase.value
+            _ = try writeScoreArtifacts(metrics: tooFast)
+            let rejected = try runFinalArtifactValidator(
+                root: root,
+                golden: golden,
+                commit: commit
+            )
+            #expect(rejected.status != 0, "validator accepted \(testCase.field) below its floor")
+            #expect(rejected.stderr.contains("scored timing failed the plausibility ceiling"))
+        }
+
+        for testCase in [
+            (field: "decode_seconds_per_token", literal: "9e-4"),
+            (field: "prefill_seconds_per_token", literal: "3e-5"),
+        ] {
+            _ = try writeScoreArtifacts(
+                metrics: metrics,
+                scientificTiming: (testCase.field, testCase.literal)
+            )
+            let rejected = try runFinalArtifactValidator(
+                root: root,
+                golden: golden,
+                commit: commit
+            )
+            #expect(
+                rejected.status != 0,
+                "validator accepted scientific-notation \(testCase.field) below its floor"
+            )
+        }
+
+        // Overrides remain operator-tunable plain decimals only. Values that
+        // jq could otherwise parse (scientific notation or a negative number)
+        // must fail closed before comparison.
+        for invalidOverride in [
+            (name: "MLXFAST_MAX_PLAUSIBLE_SPEEDUP", value: "5e0"),
+            (name: "MLXFAST_MIN_DECODE_SECONDS_PER_TOKEN", value: "1e-3"),
+            (name: "MLXFAST_MIN_PREFILL_SECONDS_PER_TOKEN", value: "-0.00004"),
+        ] {
+            _ = try writeScoreArtifacts(metrics: metrics)
+            let rejected = try runFinalArtifactValidator(
+                root: root,
+                golden: golden,
+                commit: commit,
+                plausibilityBounds: [invalidOverride.name: invalidOverride.value]
+            )
+            #expect(rejected.status != 0)
+            #expect(rejected.stderr.contains(
+                "plausibility bound override must be a plain non-negative decimal"
+            ))
+        }
+
+        let baseIntegrity = try writeScoreArtifacts(metrics: metrics)
         let wrongLayerCount = try runFinalArtifactValidator(
             root: root,
             golden: golden,
@@ -1507,7 +1638,8 @@ private func runFinalArtifactValidator(
     root: URL,
     golden: URL,
     commit: String,
-    expectedNumLayers: String? = "40"
+    expectedNumLayers: String? = "40",
+    plausibilityBounds: [String: String] = [:]
 ) throws -> (status: Int32, stderr: String) {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -1530,6 +1662,14 @@ private func runFinalArtifactValidator(
         "MLXFAST_SEMANTIC_GPQA_REQUIRED": "1",
         "MLXFAST_EXPECTED_COMMIT": commit,
     ]) { _, new in new }
+    for name in [
+        "MLXFAST_MAX_PLAUSIBLE_SPEEDUP",
+        "MLXFAST_MIN_DECODE_SECONDS_PER_TOKEN",
+        "MLXFAST_MIN_PREFILL_SECONDS_PER_TOKEN",
+    ] {
+        environment.removeValue(forKey: name)
+    }
+    environment.merge(plausibilityBounds) { _, new in new }
     if let expectedNumLayers {
         environment["MLXFAST_EXPECTED_NUM_LAYERS"] = expectedNumLayers
     } else {

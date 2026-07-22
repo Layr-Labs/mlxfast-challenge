@@ -222,22 +222,23 @@ jq -e \
 # decode/prefill seconds-per-token originate in the bench-executed benchmark
 # process's own stdout, so an implausibly-fast fabricated result would
 # previously sail through this validator. The AUTHORITATIVE guard runs on the
-# ranked box itself (m5-machine-scripts, opt/bench-runner/measure-job.sh
+# ranked box itself (m5-machine-scripts, /opt/bench-runner/measure-job.sh
 # "SCORE PLAUSIBILITY GUARDS": an independent telemetry-window cross-check
 # plus the same numeric bounds, readonly there); this block is the
 # challenge-repo backstop over the final merged artifact so the two layers
 # enforce the same bounds independently. The telemetry cross-check cannot be
 # mirrored here (this validator sees no telemetry), only the numeric bounds.
 #
-# The bounds mirror the measure-job constants and are deliberately LOOSE so
-# an honest run can never trip them: honest paired speedups sit near 1.0-1.1,
-# and baseline decode/prefill are ~0.044 / ~0.0016 s per token (~9x / ~8x
-# above the minimums). They reject fabrication, not real optimizations.
+# The bounds mirror /opt/bench-runner/measure-job.sh exactly and are
+# deliberately LOOSE so an honest run can never trip them: honest paired
+# speedups sit near 1.0-1.1, and the measured Laguna baseline decode/prefill
+# are ~0.00936 / ~0.000361 s per token (~9.4x / ~9.0x above the minimums).
+# They reject fabrication, not real optimizations.
 # Env-overridable for operator tuning only (the workflow env is trusted);
-# the defaults FAIL CLOSED on the values mirrored from measure-job.
-MAX_PLAUSIBLE_SPEEDUP="${MLXFAST_MAX_PLAUSIBLE_SPEEDUP:-5.0}"                    # mirrors measure-job MAX_PLAUSIBLE_SPEEDUP
-MIN_DECODE_SECONDS_PER_TOKEN="${MLXFAST_MIN_DECODE_SECONDS_PER_TOKEN:-0.005}"    # mirrors measure-job MIN_DECODE_SPT
-MIN_PREFILL_SECONDS_PER_TOKEN="${MLXFAST_MIN_PREFILL_SECONDS_PER_TOKEN:-0.0002}" # mirrors measure-job MIN_PREFILL_SPT
+# the defaults FAIL CLOSED on the exact values mirrored from measure-job.
+MAX_PLAUSIBLE_SPEEDUP="${MLXFAST_MAX_PLAUSIBLE_SPEEDUP:-5.0}"
+MIN_DECODE_SECONDS_PER_TOKEN="${MLXFAST_MIN_DECODE_SECONDS_PER_TOKEN:-0.001}"
+MIN_PREFILL_SECONDS_PER_TOKEN="${MLXFAST_MIN_PREFILL_SECONDS_PER_TOKEN:-0.00004}"
 for bound in \
   "${MAX_PLAUSIBLE_SPEEDUP}" \
   "${MIN_DECODE_SECONDS_PER_TOKEN}" \
