@@ -1206,6 +1206,44 @@ func benchmarkWorkflowBindsPublishedArtifactsToDispatchedCommit() throws {
 }
 
 @Test
+func benchmarkWorkflowPinsTrustedLayerCountForFinalValidation() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+    let validator = try String(
+        contentsOfFile: ".github/scripts/validate-benchmark-artifacts.sh",
+        encoding: .utf8
+    )
+    let steps = try #require(workflow.range(of: "\n    steps:"))
+    let jobHeader = String(workflow[..<steps.lowerBound])
+    let dispatch = try #require(workflow.range(of: "  workflow_dispatch:"))
+    let permissions = try #require(
+        workflow.range(of: "\npermissions:", range: dispatch.upperBound..<workflow.endIndex)
+    )
+    let dispatchInputs = String(workflow[dispatch.lowerBound..<permissions.lowerBound])
+
+    // The model shape is a trusted, literal workflow contract. A dispatch or
+    // participant-controlled expression must never choose the accepted count.
+    let assignment = "MLXFAST_EXPECTED_NUM_LAYERS: \"\(MLXFastConstants.numHiddenLayers)\""
+    #expect(jobHeader.components(separatedBy: assignment).count - 1 == 1)
+    #expect(!dispatchInputs.contains("MLXFAST_EXPECTED_NUM_LAYERS"))
+    #expect(!jobHeader.contains("MLXFAST_EXPECTED_NUM_LAYERS: ${{"))
+
+    #expect(validator.contains(
+        "MLXFAST_EXPECTED_NUM_LAYERS:?MLXFAST_EXPECTED_NUM_LAYERS is required"
+    ))
+    #expect(validator.contains(
+        "MLXFAST_EXPECTED_NUM_LAYERS must be a positive integer"
+    ))
+    #expect(validator.contains(
+        "--argjson expected_num_layers \"${MLXFAST_EXPECTED_NUM_LAYERS}\""
+    ))
+    #expect(validator.contains(".metrics.num_layers == $expected_num_layers"))
+    #expect(!validator.contains(".metrics.num_layers == 60"))
+}
+
+@Test
 func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     let workflow = try String(
         contentsOfFile: ".github/workflows/benchmark.yml",

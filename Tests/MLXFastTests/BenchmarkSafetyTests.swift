@@ -833,7 +833,7 @@ struct BenchmarkSafetyTests {
             "gpqa_ttft_p50_seconds": 1, "gpqa_ttft_pass_count": 1,
             "gpqa_ttft_passed": true, "gpqa_ttft_seconds": 1,
             "gpqa_ttft_source": "hidden_gpqa_first_token", "harness_hash": harnessHash,
-            "max_abs_diff": 0, "num_layers": 60, "partial_result": false,
+            "max_abs_diff": 0, "num_layers": 40, "partial_result": false,
             "passed_correctness": true, "peak_ram_gb": 1,
             "passed_decode_speedup_floor": true, "passed_prefill_speedup_floor": true,
             "prefill_seconds_per_token": 1, "prefill_speedup": 1,
@@ -871,6 +871,34 @@ struct BenchmarkSafetyTests {
         try JSONSerialization.data(withJSONObject: baseIntegrity).write(to: integrity)
         let accepted = try runFinalArtifactValidator(root: root, golden: golden, commit: commit)
         #expect(accepted.status == 0, Comment(rawValue: accepted.stderr))
+
+        let wrongLayerCount = try runFinalArtifactValidator(
+            root: root,
+            golden: golden,
+            commit: commit,
+            expectedNumLayers: "60"
+        )
+        #expect(wrongLayerCount.status != 0)
+
+        let missingLayerCount = try runFinalArtifactValidator(
+            root: root,
+            golden: golden,
+            commit: commit,
+            expectedNumLayers: nil
+        )
+        #expect(missingLayerCount.status != 0)
+        #expect(missingLayerCount.stderr.contains("MLXFAST_EXPECTED_NUM_LAYERS is required"))
+
+        for invalidLayerCount in ["forty", "0"] {
+            let invalid = try runFinalArtifactValidator(
+                root: root,
+                golden: golden,
+                commit: commit,
+                expectedNumLayers: invalidLayerCount
+            )
+            #expect(invalid.status != 0)
+            #expect(invalid.stderr.contains("MLXFAST_EXPECTED_NUM_LAYERS must be a positive integer"))
+        }
 
         let mismatches: [(String, Any)] = [
             ("weights_sha256", String(repeating: "f", count: 64)),
@@ -1478,7 +1506,8 @@ private func runPairedTimingOverlay(
 private func runFinalArtifactValidator(
     root: URL,
     golden: URL,
-    commit: String
+    commit: String,
+    expectedNumLayers: String? = "40"
 ) throws -> (status: Int32, stderr: String) {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -1487,7 +1516,7 @@ private func runFinalArtifactValidator(
             .appendingPathComponent(".github/scripts/validate-benchmark-artifacts.sh").path,
     ]
     process.currentDirectoryURL = root
-    process.environment = ProcessInfo.processInfo.environment.merging([
+    var environment = ProcessInfo.processInfo.environment.merging([
         "MLXFAST_SCORE_PATH": "score.json",
         "MLXFAST_INTEGRITY_PATH": "benchmark-integrity.json",
         "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
@@ -1501,6 +1530,12 @@ private func runFinalArtifactValidator(
         "MLXFAST_SEMANTIC_GPQA_REQUIRED": "1",
         "MLXFAST_EXPECTED_COMMIT": commit,
     ]) { _, new in new }
+    if let expectedNumLayers {
+        environment["MLXFAST_EXPECTED_NUM_LAYERS"] = expectedNumLayers
+    } else {
+        environment.removeValue(forKey: "MLXFAST_EXPECTED_NUM_LAYERS")
+    }
+    process.environment = environment
     process.standardOutput = FileHandle.nullDevice
     let stderr = Pipe()
     process.standardError = stderr

@@ -165,6 +165,10 @@ jobs:
       MLXFAST_MEASURE_OUT: /tmp/mlxfast-measure-${{ github.run_id }}-${{ github.run_attempt }}
       # --- Benchmark contract (identical values to the previous pipeline).
       MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+      # Trusted final-artifact shape contract. Keep in sync with
+      # MLXFastConstants.numHiddenLayers; never source this from dispatch input
+      # or participant-controlled code.
+      MLXFAST_EXPECTED_NUM_LAYERS: "40"
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
       MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}
       # The timed target's bytes remain private in R2. Its digest and byte count

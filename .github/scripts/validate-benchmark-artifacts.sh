@@ -27,7 +27,12 @@ require_file "${GOLDEN_PATH}.bytes"
 : "${MLXFAST_GPQA_TTFT_CASE_COUNT:?MLXFAST_GPQA_TTFT_CASE_COUNT is required}"
 : "${MLXFAST_SEMANTIC_GPQA_CASE_COUNT:?MLXFAST_SEMANTIC_GPQA_CASE_COUNT is required}"
 : "${MLXFAST_SEMANTIC_GPQA_MIN_PASS:?MLXFAST_SEMANTIC_GPQA_MIN_PASS is required}"
+: "${MLXFAST_EXPECTED_NUM_LAYERS:?MLXFAST_EXPECTED_NUM_LAYERS is required}"
 : "${MLXFAST_EXPECTED_COMMIT:?MLXFAST_EXPECTED_COMMIT is required}"
+if [[ ! "${MLXFAST_EXPECTED_NUM_LAYERS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "::error::MLXFAST_EXPECTED_NUM_LAYERS must be a positive integer" >&2
+  exit 1
+fi
 if [[ ! "${MLXFAST_EXPECTED_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
   echo "::error::MLXFAST_EXPECTED_COMMIT must be a full lowercase commit SHA" >&2
   exit 1
@@ -69,6 +74,7 @@ jq -e \
   --argjson semantic_cases "${MLXFAST_SEMANTIC_GPQA_CASE_COUNT}" \
   --argjson semantic_min_pass "${MLXFAST_SEMANTIC_GPQA_MIN_PASS}" \
   --argjson semantic_required "${semantic_required}" \
+  --argjson expected_num_layers "${MLXFAST_EXPECTED_NUM_LAYERS}" \
   --arg expected_commit "${MLXFAST_EXPECTED_COMMIT}" \
   '
   def same_keys($expected):
@@ -161,7 +167,7 @@ jq -e \
   else true end)
   and (.metrics.semantic_gpqa_model | type == "string")
   and (.metrics.semantic_gpqa_model | length > 0)
-  and (.metrics.num_layers == 60)
+  and (.metrics.num_layers == $expected_num_layers)
   and (.metrics.golden_hash == $golden_hash)
   and (.metrics.first_failing_case == null)
   and (.metrics.first_failing_layer == null)
