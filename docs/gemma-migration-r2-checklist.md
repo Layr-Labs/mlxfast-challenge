@@ -4,7 +4,7 @@
 > migration and is complete. The 2026-07 re-pin to Poolside Laguna XS 2.1
 > (new tokenizer with vocab 100352) requires the
 > same regeneration pass again — hidden goldens, GPQA references, public
-> fixtures, and pins — for the serial track (`laguna-xs-2.1-serial-v1`);
+> fixtures, and pins — for the v2 serial track (`laguna-xs-2.1-serial-v2`);
 > use this file as the template. (The MTP track named in earlier revisions
 > of this note was retired 2026-07-21 without going live for Laguna.)
 > Workflow-name note: the serial ranked pipeline referenced below as
@@ -128,8 +128,10 @@ verify them) were regenerated.
 - The ranked score no longer prices against a repo-pinned baseline ref or
   the calibrated constants: the single-machine pipeline measures the
   **pinned reference baseline tree provisioned on the M5 box**
-  (`/opt/bench-runner/baseline/current`, sanity-banded against
-  `/opt/bench-runner/state/baseline-calibration.json`) in the same session
+  (`/opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current`,
+  sanity-banded against the versioned
+  `/opt/bench-runner/state/laguna-xs-2.1-serial-v2/baseline-calibration.json`)
+  in the same session
   as the candidate. Regenerating that tree or its calibration is an
   operator procedure (RUNBOOK) and a ranking-contract change.
 - The `officialBaselinePrefillSecondsPerToken` /

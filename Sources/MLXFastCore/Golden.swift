@@ -19,6 +19,16 @@ public struct GoldenCase: Codable, Equatable {
     }
 }
 
+public struct GoldenModelProvenance: Codable, Equatable {
+    public let repository: String
+    public let revision: String
+
+    public init(repository: String, revision: String) {
+        self.repository = repository
+        self.revision = revision
+    }
+}
+
 public struct GoldenAnchorCase: Codable, Equatable {
     public let name: String
     public let contextTokens: [Int]
@@ -218,12 +228,14 @@ public struct BenchmarkGolden: Codable, Equatable {
 
 public struct GoldenDocument: Codable, Equatable {
     public let version: Int?
+    public let modelProvenance: GoldenModelProvenance?
     public let cases: [GoldenCase]
     public let correctnessGates: GoldenCorrectnessGates?
     public let benchmark: BenchmarkGolden?
 
     enum CodingKeys: String, CodingKey {
         case version
+        case modelProvenance = "model_provenance"
         case cases
         case correctnessGates = "correctness_gates"
         case benchmark
@@ -231,11 +243,13 @@ public struct GoldenDocument: Codable, Equatable {
 
     public init(
         version: Int = 1,
+        modelProvenance: GoldenModelProvenance? = nil,
         cases: [GoldenCase],
         correctnessGates: GoldenCorrectnessGates? = nil,
         benchmark: BenchmarkGolden?
     ) {
         self.version = version
+        self.modelProvenance = modelProvenance
         self.cases = cases
         self.correctnessGates = correctnessGates
         self.benchmark = benchmark
@@ -317,6 +331,15 @@ public func loadGoldenFixture(
     let decoded = try JSONDecoder().decode(GoldenDocument.self, from: data)
     guard decoded.version == 1 else {
         throw MLXFastError.invalidInput("correctness golden file version must be 1")
+    }
+    if let provenance = decoded.modelProvenance {
+        guard provenance.repository == MLXFastConstants.referenceModelRepository,
+              provenance.revision == MLXFastConstants.referenceModelRevision
+        else {
+            throw MLXFastError.invalidInput(
+                "correctness golden model_provenance does not match the pinned reference model"
+            )
+        }
     }
     try validateGoldenCases(
         decoded.cases,
@@ -608,7 +631,13 @@ private func validateGoldenFixtureKeys(_ data: Data) throws {
     }
     try rejectUnknownKeys(
         Set(root.keys),
-        allowed: ["version", "cases", "correctness_gates", "benchmark"],
+        allowed: [
+            "version",
+            "model_provenance",
+            "cases",
+            "correctness_gates",
+            "benchmark",
+        ],
         field: "correctness golden file"
     )
     guard root["version"] != nil else {
@@ -617,11 +646,42 @@ private func validateGoldenFixtureKeys(_ data: Data) throws {
     guard let cases = root["cases"] as? [Any], !cases.isEmpty else {
         throw MLXFastError.invalidInput("correctness golden file must contain a non-empty cases array")
     }
+    if let provenance = root["model_provenance"] {
+        try validateGoldenModelProvenanceKeys(provenance)
+    }
     if let gates = root["correctness_gates"] {
         try validateGoldenCorrectnessGateKeys(gates)
     }
     if let benchmark = root["benchmark"] {
         try validateGoldenBenchmarkKeys(benchmark)
+    }
+}
+
+private func validateGoldenModelProvenanceKeys(_ provenance: Any) throws {
+    guard !(provenance is NSNull),
+          let object = provenance as? [String: Any]
+    else {
+        throw MLXFastError.invalidInput(
+            "model_provenance must be a JSON object"
+        )
+    }
+    try rejectUnknownKeys(
+        Set(object.keys),
+        allowed: ["repository", "revision"],
+        field: "model_provenance"
+    )
+    guard Set(object.keys) == ["repository", "revision"],
+          let repository = object["repository"] as? String,
+          !repository.isEmpty,
+          let revision = object["revision"] as? String,
+          revision.range(
+            of: "^[0-9a-f]{40}$",
+            options: .regularExpression
+          ) != nil
+    else {
+        throw MLXFastError.invalidInput(
+            "model_provenance requires repository and a 40-character lowercase revision"
+        )
     }
 }
 

@@ -40,10 +40,10 @@ func hiddenTimedPromptIsIndependentOfCorrectnessFixtures() throws {
         "MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"
     ))
     #expect(workflow.contains(
-        "MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json"
+        "MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/hidden-golden-${{ env.MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256 }}.json"
     ))
     #expect(workflow.contains(
-        "MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna.json"
+        "MLXFAST_GPQA_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/gpqa-reference-${{ env.MLXFAST_GPQA_REFERENCE_SHA256 }}.json"
     ))
 }
 
@@ -61,7 +61,7 @@ func hiddenTimedPromptIsPinnedAndScopedToTrustedSteps() throws {
     #expect(!jobHeader.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH:"))
     #expect(
         workflow.components(
-            separatedBy: "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt"
+            separatedBy: "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/timed-prompt-${{ env.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}.txt"
         ).count - 1 == 1
     )
     #expect(prepare.contains(".github/scripts/download-r2-object.sh"))
@@ -69,13 +69,13 @@ func hiddenTimedPromptIsPinnedAndScopedToTrustedSteps() throws {
     #expect(prepare.contains("shasum -a 256"))
     #expect(prepare.contains("wc -c"))
     #expect(jobHeader.contains(
-        "MLXFAST_TIMED_DECODE_PROMPT_SHA256: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}"
+        "MLXFAST_TIMED_DECODE_PROMPT_SHA256: __POOLSIDE_V2_TIMED_PROMPT_SHA256_PENDING__"
     ))
     #expect(jobHeader.contains(
-        "MLXFAST_TIMED_DECODE_PROMPT_BYTES: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_BYTES }}"
+        "MLXFAST_TIMED_DECODE_PROMPT_BYTES: \"0\""
     ))
     #expect(jobHeader.contains(
-        "MLXFAST_TIMED_DECODE_PROMPT_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/timed_decode_prompt.txt"
+        "MLXFAST_TIMED_DECODE_PROMPT_PATH: /tmp/mlxfast-private-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}/timed_decode_prompt.txt"
     ))
 }
 

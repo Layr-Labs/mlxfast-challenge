@@ -18,7 +18,7 @@ func lagunaCorrectnessSelectsGreedyTokenWhenRuntimeTestsAreEnabled() throws {
     ) == 0)
 }
 
-// The worker's orphan self-reaper is what frees the ~17 GB model residency
+// The worker's orphan self-reaper is what frees the ~21.6 GB model residency
 // when the harness parent dies while the worker is not blocked on protocol
 // stdin (most importantly during the minutes-long model load).
 @Test

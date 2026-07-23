@@ -123,10 +123,10 @@ compromised host must never silently publish a score.
 ## Required GitHub setup
 
 Store private prompt/golden download credentials only as secrets on the
-`benchmark-private-prompts` GitHub Environment. Do not store them as
+`benchmark-private-prompts-v2` GitHub Environment. Do not store them as
 repository-wide or organization-wide secrets.
 
-Configure the `benchmark-private-prompts` Environment with:
+Configure the `benchmark-private-prompts-v2` Environment with:
 
 - Deployment branches limited to the same namespaces the runtime guard
   (`enforce-trusted-benchmark-workflow.sh`) admits: `main`, `submissions/*`
@@ -144,7 +144,7 @@ Configure the `benchmark-private-prompts` Environment with:
   - `R2_BUCKET_ENDPOINT`
   - `R2_SECRET_ACCESS_KEY`
 
-The single ranked job declares `environment: benchmark-private-prompts`, so
+The single ranked job declares `environment: benchmark-private-prompts-v2`, so
 the deployment-branch policy and required reviewers gate every run that can
 read those secrets. The semantic GPQA judge additionally requires the
 `ORG_ANTHROPIC_API_KEY` secret. All of these are consumed only by trusted
@@ -156,14 +156,13 @@ sees them.
 ## Private golden and GPQA handling
 
 Full benchmark dispatches (`run_benchmark=true`) download three objects from
-the private R2 bucket in trusted steps:
-`correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json`
-(the hidden teacher-forced base case) and
-`correctness_prompts/gpqa_reference_cases-laguna.json` (the hidden GPQA
-reference cases, merged into the golden as 5 behavior gates), followed after
-the correctness scrub by
-`correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt` (the
-independent timed prefill/decode target).
+the private R2 bucket in trusted steps. All live under
+`correctness_prompts/laguna-xs-2.1-serial-v2/` and use immutable
+content-addressed names: `hidden-golden-<sha256>.json`,
+`gpqa-reference-<sha256>.json`, and `timed-prompt-<sha256>.txt`.
+The first is the hidden teacher-forced base case, the second is merged into
+the golden as 5 behavior gates, and the third is the independent timed
+prefill/decode target.
 Correctness-only dispatches (`run_benchmark=false`) fetch no private
 material at all. The 2026-07 Poolside Laguna XS 2.1 re-pin rotated these
 object keys from their former `-gemma` names: the correctness objects are
@@ -172,9 +171,10 @@ through the same organizer-controlled offline process that
 `docs/gemma-migration-r2-checklist.md` records for the previous Gemma
 migration (that checklist is the template for this pass).
 
-Raw private bytes land only in a runner-only `0700` per-run directory; the
-raw golden and timed prompt are each verified against a SHA-256 and byte
-count before use.
+Raw private bytes land only in a runner-only `0700` per-run directory; all
+three objects are independently verified against SHA-256 and byte-count pins
+before use. Placeholder pins deliberately fail closed until trusted operator
+generation completes.
 The GPQA augmentation step (`attach-gpqa-gates`) executes code from the
 submitted build (it loads the tokenizer), so it runs through the bench-exec
 bridge like every other untrusted invocation: the raw inputs are copied

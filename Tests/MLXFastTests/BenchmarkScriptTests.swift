@@ -11,13 +11,25 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
         encoding: .utf8
     )
 
-    // TODO(operator): once a Darkbloom R2 mirror is provisioned for the Laguna
-    // checkpoint, re-pin this to the mirror URL (the Gemma track used
-    // https://ds4.darkbloom.ai/<model>). Until then the pinned Hugging Face
-    // revision is the primary source.
-    #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/c42e0a8f8d504ceacde015a535dcb286d65c8799\""))
-    #expect(setup.contains("DEFAULT_REFERENCE_FALLBACK_BASE_URL=\"https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/main\""))
+    #expect(setup.contains("REFERENCE_MODEL_REPO=\"${MLXFAST_REFERENCE_MODEL_REPO:-poolside/Laguna-XS-2.1-NVFP4-mlx}\""))
+    #expect(setup.contains("REFERENCE_REVISION=\"${MLXFAST_REFERENCE_REVISION:-841778bda563a36104dd521e37d99218e46f4f25}\""))
+    #expect(setup.contains("DEFAULT_REFERENCE_BASE_URL=\"https://ds4.darkbloom.ai/laguna-xs-2.1-nvfp4-mlx\""))
+    #expect(setup.contains("DEFAULT_REFERENCE_FALLBACK_BASE_URL=\"https://huggingface.co/poolside/Laguna-XS-2.1-NVFP4-mlx/resolve/841778bda563a36104dd521e37d99218e46f4f25\""))
     #expect(setup.contains("REFERENCE_BASE_URL=\"${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}\""))
+    #expect(setup.contains("REFERENCE_MANIFEST_PATH=\"${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256}\""))
+    for metadata in [
+        ".gitattributes",
+        "LICENSE.md",
+        "README.md",
+        "chat_template.jinja",
+        "config.json",
+        "model.safetensors.index.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ] {
+        #expect(setup.contains("  \"\(metadata)\""))
+    }
+    #expect(!setup.contains("REFERENCE_OPTIONAL_METADATA_FILES"))
     // 3 parallel shard downloads by default; env-overridable.
     #expect(setup.contains("REFERENCE_DOWNLOAD_JOBS=\"${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-3}\""))
     #expect(setup.contains("DEFAULT_HF_HOME=\"${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}\""))
@@ -72,7 +84,7 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"))
     #expect(setup.contains("sudo xcodebuild -license accept"))
 
-    // The cold ~17 GiB parallel shard download prints an aggregate progress
+    // The cold ~20 GiB parallel shard download prints an aggregate progress
     // heartbeat instead of going silent for the whole transfer.
     #expect(setup.contains("start_reference_download_heartbeat \"${output_dir}\" \"${expected_total_bytes}\" \"$@\""))
     #expect(setup.contains("stop_reference_download_heartbeat"))
@@ -84,6 +96,109 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(main.contains("wait_for_mlx_metallib_build\ncheck_mlxfast_cli\nprint_setup_summary \"ready\""))
     #expect(setup.contains("is not on PATH, so"))
     #expect(setup.contains("external Yukon installer"))
+}
+
+@Test
+func poolsideNVFP4DistributionIdentityIsPinned() throws {
+    let repository = "poolside/Laguna-XS-2.1-NVFP4-mlx"
+    let revision = "841778bda563a36104dd521e37d99218e46f4f25"
+    #expect(MLXFastConstants.referenceModelRepository == repository)
+    #expect(MLXFastConstants.referenceModelRevision == revision)
+    #expect(MLXFastConstants.referenceModelName == "laguna-xs-2.1-nvfp4-mlx")
+    #expect(
+        MLXFastConstants.defaultReferencePath
+            == "reference_weights/laguna-xs-2.1-nvfp4-mlx"
+    )
+    #expect(
+        MLXFastConstants.defaultReferenceCachePath
+            == ".cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/\(revision)"
+    )
+    // The retired MTP prototype is a frozen historical affine-v1 contract.
+    // Repointing only its model ID while leaving its group-64 manifest,
+    // byte-count, and quantization fields intact would create incoherent
+    // provenance, so the serial-v2 distribution migration must not mutate it.
+    let retiredMTPRepository = "mlx-community/Laguna-XS-2.1-4bit"
+    let retiredMTPRevision = "c42e0a8f8d504ceacde015a535dcb286d65c8799"
+    #expect(LagunaRuntime.experimentalMTPTargetModelID == retiredMTPRepository)
+    #expect(LagunaRuntime.experimentalMTPTargetRevision == retiredMTPRevision)
+
+    let trustedProvenance = try String(
+        contentsOfFile:
+            "Sources/MLXFastTrustedHarness/LagunaRuntimeMTPProvenance.swift",
+        encoding: .utf8
+    )
+    #expect(
+        trustedProvenance.contains(
+            "experimentalMTPTargetModelID =\n        \"\(retiredMTPRepository)\""
+        )
+    )
+    #expect(
+        trustedProvenance.contains(
+            "experimentalMTPTargetRevision =\n        \"\(retiredMTPRevision)\""
+        )
+    )
+
+    let manifest = try String(
+        contentsOfFile: "fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256",
+        encoding: .utf8
+    )
+    #expect(manifest.contains("# SHA256 manifest for \(repository)."))
+    #expect(manifest.contains("# Revision: \(revision)"))
+
+    let expectedPaths: Set<String> = [
+        ".gitattributes",
+        "LICENSE.md",
+        "README.md",
+        "chat_template.jinja",
+        "config.json",
+        "model.safetensors.index.json",
+        "model-00001-of-00005.safetensors",
+        "model-00002-of-00005.safetensors",
+        "model-00003-of-00005.safetensors",
+        "model-00004-of-00005.safetensors",
+        "model-00005-of-00005.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ]
+    let records = manifest.split(separator: "\n").filter { !$0.hasPrefix("#") }
+    var paths = Set<String>()
+    var byteCount = 0
+    var shardHashes: [String: String] = [:]
+    for record in records {
+        let fields = record.split(separator: " ")
+        guard fields.count == 3, let size = Int(fields[1]) else {
+            Issue.record("malformed Poolside manifest record: \(record)")
+            continue
+        }
+        let hash = String(fields[0])
+        let path = String(fields[2])
+        #expect(hash.count == 64)
+        #expect(hash.allSatisfy { $0.isHexDigit })
+        #expect(size > 0)
+        #expect(paths.insert(path).inserted)
+        byteCount += size
+        if path.hasSuffix(".safetensors") {
+            shardHashes[path] = hash
+        }
+    }
+
+    #expect(records.count == 13)
+    #expect(paths == expectedPaths)
+    #expect(byteCount == 21_568_905_520)
+    #expect(
+        shardHashes == [
+            "model-00001-of-00005.safetensors":
+                "5072099885cf248ee097c3b2cf508846cf6245c713cb722d8e7a24f83407ee64",
+            "model-00002-of-00005.safetensors":
+                "52ddbf2d53c3587ec1d56a8c61a5ec7961df7dbef7d5db1347f9a60b4532a3d3",
+            "model-00003-of-00005.safetensors":
+                "4c1239b3a246f2f5fb7312d8cb3afac0a63a1d17c7eaec06738df0a3fc118cdb",
+            "model-00004-of-00005.safetensors":
+                "fdf825800be5ce39c414778d785ea8c3282d58b54550b5f8f99fc5a0177b928f",
+            "model-00005-of-00005.safetensors":
+                "b9a2482014602e31bbd167389340f1932caf1e0d979f87bf35d93bfc748e2ffe",
+        ]
+    )
 }
 
 @Test
@@ -248,8 +363,8 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     // The reference comes from the runner-owned cache, never a download. The
     // dependency-only SwiftPM cache is restored before the checkout is copied
     // into the bench workspace; ranked jobs never save submission build output.
-    #expect(workflow.contains("MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main"))
-    #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_4bit.sha256"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256"))
     #expect(workflow.contains("shasum -a 256 \"${path}\""))
     #expect(workflow.contains("reference checkpoint failed manifest verification"))
     #expect(!workflow.contains("./setup.sh"))
@@ -344,7 +459,7 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     // build output can never enter the trusted cache namespaces. The trusted
     // CLI root and the participant worker root are cached as two separate
     // entries.
-    #expect(workflow.contains("MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-current"))
+    #expect(workflow.contains("MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-laguna-xs-2.1-serial-v2"))
     #expect(!workflow.contains("MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-${{"))
     let resetBuildProductsStep = String(workflow[resetBuildProductsRange.lowerBound..<restoreBuildProductsRange.lowerBound])
     #expect(resetBuildProductsStep.contains("run: /bin/rm -rf .mlxfast-cache/trusted-build .mlxfast-cache/worker-build"))
@@ -500,6 +615,10 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
         contentsOfFile: ".github/workflows/reference-cache-probe.yml",
         encoding: .utf8
     )
+    let downloader = try String(
+        contentsOfFile: ".github/scripts/download-reference-cache-scope.sh",
+        encoding: .utf8
+    )
     #expect(workflow.contains("name: reference-cache-probe"))
     #expect(workflow.contains("workflow_dispatch:"))
     #expect(!workflow.contains("pull_request:"))
@@ -515,17 +634,21 @@ func referenceCacheProbeWorkflowIsManualAndExperimental() throws {
     // `environment:` approval gate, so a repo credential injected here (as a
     // prior version did with secrets.MLXFAST_REFERENCE_BASE_URL/
     // MLXFAST_REFERENCE_AUTH_HEADER) would be exfiltratable by any ref with a
-    // modified setup.sh. The public Hugging Face mirror needs no credential
-    // and every downloaded byte is verified against the pinned manifest.
+    // modified setup.sh. The public R2 mirror and immutable Hugging Face
+    // fallback need no credential, and every downloaded byte is manifest-pinned.
     #expect(!workflow.contains("environment:"))
     #expect(!workflow.contains("secrets."))
     #expect(!workflow.contains("secrets: inherit"))
     #expect(!workflow.contains("MLXFAST_REFERENCE_AUTH_HEADER"))
-    #expect(workflow.contains("MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || 'https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/main' }}"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || 'https://ds4.darkbloom.ai/laguna-xs-2.1-nvfp4-mlx' }}"))
     // The probe must target the LAGUNA reference checkpoint: the Gemma-era
     // manifest and cache directory were deleted with the migration, so stale
     // defaults would fail every dispatch at the manifest hash step.
-    #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_4bit.sha256"))
+    #expect(workflow.contains("MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256"))
+    #expect(workflow.contains("cache_key=\"laguna-xs-2.1-nvfp4-mlx-${CACHE_SCOPE}-"))
+    #expect(downloader.contains("DEFAULT_REFERENCE_BASE_URL=\"https://ds4.darkbloom.ai/laguna-xs-2.1-nvfp4-mlx\""))
+    #expect(downloader.contains("DEFAULT_REFERENCE_FALLBACK_BASE_URL=\"https://huggingface.co/poolside/Laguna-XS-2.1-NVFP4-mlx/resolve/841778bda563a36104dd521e37d99218e46f4f25\""))
+    #expect(downloader.contains("trying fallback source for ${relative_path}"))
     #expect(!workflow.contains("gemma-4-31b-4bit"))
 }
 
@@ -1272,32 +1395,43 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     )
 
     #expect(!workflow.contains("${{ runner.temp }}"))
-    #expect(workflow.contains("MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}"))
-    #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json"))
+    #expect(workflow.contains("environment: benchmark-private-prompts-v2"))
+    #expect(workflow.contains("MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}"))
+    #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json"))
+    #expect(workflow.contains("MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-laguna-xs-2.1-serial-v2"))
+    #expect(workflow.contains("MLXFAST_BASELINE_WS: /opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current"))
+    #expect(workflow.contains("MLXFAST_BASELINE_CALIBRATION: /opt/bench-runner/state/laguna-xs-2.1-serial-v2/baseline-calibration.json"))
+    #expect(workflow.contains("MLXFAST_MEASURE_STATE_DIR: /opt/bench-runner/state/laguna-xs-2.1-serial-v2"))
+    #expect(workflow.contains("MLXFAST_BASELINE_COMMIT: __FINAL_MERGED_POOLSIDE_V2_SHA_PENDING__"))
     // The raw GPQA reference is downloaded straight into the runner-private
     // dir; its accepted answers reach the bench workspace only inside the
     // augmented golden.
     #expect(workflow.contains("\"${MLXFAST_PRIVATE_DIR}/gpqa_reference.json\""))
     #expect(!workflow.contains("MLXFAST_GPQA_TTFT_RESULTS_PATH"))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH: ${{ env.MLXFAST_JOB_WS }}/private/semantic_gpqa_answers.json"))
-    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json"))
-    #expect(workflow.contains("MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}"))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json"))
+    #expect(workflow.contains("MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}"))
     #expect(workflow.contains("MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}"))
+    #expect(workflow.contains("MLXFAST_POOLSIDE_V2_CALIBRATION_READY: \"0\""))
+    #expect(
+        workflow.contains(
+            "Poolside v2 model-derived fixtures and final-SHA baseline are not calibrated"
+        )
+    )
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json"))
-    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 679ba44220d581316c752533472883f4905a1b6a30f5f657a25f1177ae6247c1"))
-    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"10519\""))
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: b9509697c08a2cf3c2943a85f0b76e39c485c441794690fa76835b40a58d7a63"))
+    #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"10686\""))
     #expect(workflow.contains("MLXFAST_TIMED_DECODE_TARGET_ID: \(MLXFastConstants.benchmarkEvaluationTargetID)"))
-    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_SHA256: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}"))
-    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_BYTES: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_BYTES }}"))
-    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt"))
-    #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json"))
-    #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna.json"))
+    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_SHA256: __POOLSIDE_V2_TIMED_PROMPT_SHA256_PENDING__"))
+    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_BYTES: \"0\""))
+    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/timed-prompt-${{ env.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}.txt"))
+    #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/hidden-golden-${{ env.MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256 }}.json"))
+    #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/gpqa-reference-${{ env.MLXFAST_GPQA_REFERENCE_SHA256 }}.json"))
     #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"5\""))
-    // 64-token budget and min-pass 1 threshold, re-validated against the
-    // unmodified Laguna XS 2.1 4-bit baseline (judged 1/5-2/5 across four
-    // ranked official-runner runs on the regenerated hidden Laguna prompts);
-    // see MLXFastConstants.semanticGPQAMinPassCount.
+    // Temporary affine-checkpoint values; Poolside NVFP4 M5 validation must
+    // replace or explicitly re-confirm them before merge. See
+    // MLXFastConstants.semanticGPQAMinPassCount.
     #expect(workflow.contains("MLXFAST_GPQA_MAX_NEW_TOKENS: \"64\""))
     #expect(workflow.contains("MLXFAST_GPQA_TTFT_CASE_COUNT: \"5\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_CASE_COUNT: \"5\""))
@@ -1312,14 +1446,16 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(!workflow.contains("mlxfast-gpqa-calibration-private.log"))
     #expect(!workflow.contains(".github/scripts/upload-r2-object.sh"))
     #expect(!workflow.contains("uploaded calibrated GPQA reference cases to private R2"))
-    // The RAW (pre-GPQA-augmentation) hidden golden pins -- the same object the
-    // prior shard goldens verified as MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_*.
-    // The augmented golden is pinned to a self-anchored hash exported into
-    // GITHUB_ENV right after attach-gpqa-gates, exactly as the old gates
-    // machine did.
-    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 96689a9ceaf7cc813174d0a6cb2ab650454d7d031f88514cbd222bcb17bb4d7e"))
-    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: \"35749\""))
+    // All three Poolside-private artifacts remain explicit fail-closed
+    // placeholders until trusted operator generation replaces all six pins.
+    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: __POOLSIDE_V2_HIDDEN_GOLDEN_SHA256_PENDING__"))
+    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: \"0\""))
+    #expect(workflow.contains("MLXFAST_GPQA_REFERENCE_SHA256: __POOLSIDE_V2_GPQA_REFERENCE_SHA256_PENDING__"))
+    #expect(workflow.contains("MLXFAST_GPQA_REFERENCE_BYTES: \"0\""))
     #expect(workflow.contains("raw hidden correctness golden pin mismatch"))
+    #expect(workflow.contains("private GPQA reference pin mismatch"))
+    #expect(workflow.contains("Poolside v2 private artifacts require three pinned SHA-256 values"))
+    #expect(workflow.contains("Poolside v2 private artifacts require three positive byte-count pins"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${actual_hash}"))
     #expect(workflow.contains("MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${actual_bytes}"))
     #expect(workflow.contains(".github/scripts/verify-correctness-golden.sh"))
@@ -1481,6 +1617,9 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(staticReview.contains("score.json or benchmark-integrity.json tampering"))
     #expect(staticReview.contains("request-shape, call-count, phase, process-lifetime, prompt-length, or cache-state special-casing"))
     #expect(staticReview.contains("only for timed benchmark workers"))
+    #expect(staticReview.contains("exact host-side C++ GEMM dispatch and JIT source-factory files"))
+    #expect(staticReview.contains("compiled template dtype/source selection"))
+    #expect(staticReview.contains("binds template dtypes to the actual input buffers"))
     #expect(staticReview.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES"))
     #expect(staticReview.contains("oversized source that could hide lookup tables"))
     #expect(staticReview.contains("find \"${editable_path}\" -type f -print0"))
@@ -2081,6 +2220,18 @@ func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
     #expect(staticReview.contains("Metal kernel tuning"))
     #expect(staticReview.contains("M5 (_nax) kernel variants"))
     #expect(staticReview.contains("matched edits applied consistently to a kernel AOT .metal/.h source and its JIT mlx-generated twin"))
+    #expect(staticReview.contains(
+        "host-side C++ GEMM dispatch or JIT source-factory edits"
+    ))
+    #expect(staticReview.contains(
+        "bind compiled template dtypes to the actual input buffers"
+    ))
+    #expect(staticReview.contains(
+        "canonical fp4.h and fp8.h datatype helpers"
+    ))
+    #expect(staticReview.contains(
+        "runtime JIT fp_quantized, fp_quantized_nax, and unary sources"
+    ))
 
     // Launch-time backstop in the trusted CLI: same knobs, same defaults,
     // official fail-closed, and the TODO marker resolved.
@@ -2107,8 +2258,53 @@ func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
         Issue.record("editable surface exceeds the shipped launch budget: \(verdict)")
         return
     }
-    #expect(totalBytes > 0)
-    #expect(fileCount > 0)
+    #expect(totalBytes == 2_802_363)
+    #expect(fileCount == 177)
+    #expect(staticReview.contains("unmodified surface is 2,802,363 bytes"))
+    #expect(staticReview.contains("leaving 197,637 bytes"))
+    for path in [
+        "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/matmul.cpp",
+        "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/jit_kernels.cpp",
+        "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels.h",
+        "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/fp4.h",
+        "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/fp8.h",
+    ] {
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        let bytes = try #require((attributes[.size] as? NSNumber)?.intValue)
+        #expect(bytes <= EditableSurfaceByteBudget.defaultMaxFileBytes)
+    }
+    let matmulAttributes = try FileManager.default.attributesOfItem(
+        atPath: "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/matmul.cpp"
+    )
+    #expect((matmulAttributes[.size] as? NSNumber)?.intValue == 86_040)
+
+    // Ranked builds consume the overlaid host dispatch source through the
+    // pinned local mlx-swift package. On Apple platforms the Cmlx target walks
+    // Source/Cmlx and does not exclude metal/matmul.cpp.
+    let rootPackage = try String(contentsOfFile: "Package.swift", encoding: .utf8)
+    let mlxPackage = try String(
+        contentsOfFile: "Vendor/mlx-swift/Package.swift",
+        encoding: .utf8
+    )
+    #expect(rootPackage.contains(#".package(path: "Vendor/mlx-swift")"#))
+    #expect(mlxPackage.contains(#"name: "Cmlx","#))
+    #expect(mlxPackage.contains(#"path: "Source/Cmlx","#))
+    let appleStart = try #require(
+        mlxPackage.range(of: "// Apple's platforms with Metal")
+    )
+    let appleEnd = try #require(
+        mlxPackage.range(
+            of: "#endif",
+            range: appleStart.upperBound..<mlxPackage.endIndex
+        )
+    )
+    let applePlatformConfiguration =
+        mlxPackage[appleStart.lowerBound..<appleEnd.lowerBound]
+    #expect(
+        !applePlatformConfiguration.contains(
+            #""mlx/mlx/backend/metal/matmul.cpp""#
+        )
+    )
 }
 
 @Test
@@ -2457,6 +2653,9 @@ func cliSupportsPublicBaseGoldenGeneration() throws {
     #expect(cli.contains("generate-golden requires --prompt-file PATH"))
     #expect(cli.contains("requiredSteps: steps,"))
     #expect(cli.contains("generate-golden --prompt-file PATH"))
+    #expect(cli.contains("modelProvenance: GoldenModelProvenance("))
+    #expect(cli.contains("repository: MLXFastConstants.referenceModelRepository"))
+    #expect(cli.contains("revision: MLXFastConstants.referenceModelRevision"))
 }
 
 @Test
@@ -2474,6 +2673,12 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(package.contains(".product(name: \"Tokenizers\", package: \"swift-transformers\")"))
     #expect(cli.contains("case \"attach-gpqa-gates\""))
     #expect(!cli.contains("case \"calibrate-gpqa-gates\""))
+    #expect(!cli.contains("case \"calibrate-private-golden\""))
+    #expect(!cli.contains("collectPrivateArtifactCalibration"))
+    #expect(!cli.contains("PrivateArtifactCalibrator"))
+    #expect(!cli.contains("PrivateArtifactWriter"))
+    #expect(!cli.contains("requirePrivateIsolation"))
+    #expect(!cli.contains("--gpqa-output"))
     #expect(cli.contains("case \"generate-gpqa-answers\""))
     #expect(!cli.contains("case \"measure-gpqa-ttft\""))
     #expect(cli.contains("AutoTokenizer.from(modelFolder: modelFolder, strict: false)"))
@@ -2537,6 +2742,22 @@ func cliSupportsHiddenGPQAGateAttachment() throws {
     #expect(workerBehavior.contains("let usesSemanticJudge = behaviorUsesSemanticJudge(testCase)"))
     #expect(workerBehavior.contains("if !usesSemanticJudge"))
     #expect(workerBehavior.contains("if usesSemanticJudge ||"))
+}
+
+@Test
+func unsafePrivateCalibrationToolingStaysExcluded() {
+    for path in [
+        "Sources/MLXFastCore/PrivateArtifactCalibration.swift",
+        "Sources/MLXFastTrustedHarness/LagunaRuntimePrivateCalibration.swift",
+        "Tests/Fixtures/PrivateArtifactCalibration/synthetic-private-golden-template.json",
+        "Tests/Fixtures/PrivateArtifactCalibration/synthetic-private-gpqa-template.json",
+        "Tests/MLXFastTests/PrivateArtifactCalibrationTests.swift",
+    ] {
+        #expect(
+            !FileManager.default.fileExists(atPath: path),
+            "unsafe participant-worker private calibration tooling must remain excluded: \(path)"
+        )
+    }
 }
 
 @Test
@@ -2733,6 +2954,8 @@ func overlayScriptRejectsDangerousArtifactsAfterCopy() throws {
     )
 
     #expect(overlay.contains("validate_overlay_tree \"${target_path}\""))
+    #expect(overlay.contains("submitted editable path is missing"))
+    #expect(overlay.contains("jq -r '.editablePaths[]'"))
     #expect(overlay.contains("overlaid editable paths must not contain symlinks"))
     #expect(overlay.contains("overlaid editable paths must contain only regular files and directories"))
     #expect(overlay.contains("-links +1"))
@@ -3863,10 +4086,10 @@ func benchmarkRestoresFansWhenAbortedAfterBoost() throws {
     #expect(helperInvocations.contains("normal"))
 }
 
-// The ~17 GB RAM-resident model means TWO simultaneous residencies (an
+// The ~21.6 GB RAM-resident model means TWO simultaneous residencies (an
 // overlapping second local run, or a new run started while an orphaned
 // model-holding worker from an aborted run lingers) can out-of-memory a
-// 36 GB machine. Local modes must therefore (1) serialize runs behind a
+// 40 GiB machine. Local modes must therefore (1) serialize runs behind a
 // per-user lock, (2) refuse to start while a model-holding process is
 // already alive -- warn-and-abort, never auto-kill -- and (3) reap the
 // spawned benchmark process tree on INT/TERM/EXIT so aborted runs cannot
@@ -4095,7 +4318,7 @@ func terminatedLocalRunReapsTheModelHoldingProcessTree() throws {
     )
 
     // The fake benchmark stands in for `mlxfast-swift benchmark`: it spawns a
-    // long-lived child (the stand-in for the ~17 GB runtime worker), records
+    // long-lived child (the stand-in for the ~21.6 GB runtime worker), records
     // both pids, then idles like a real run mid-measurement.
     let workerPidFile = root.appendingPathComponent("worker.pid")
     let marker = root.appendingPathComponent("benchmark-running.marker")
@@ -4764,12 +4987,12 @@ func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
     let refWeights = root.appendingPathComponent("reference_weights")
     try FileManager.default.createDirectory(at: refWeights, withIntermediateDirectories: true)
     try FileManager.default.createSymbolicLink(
-        atPath: refWeights.appendingPathComponent("laguna-xs-2.1-4bit").path,
+        atPath: refWeights.appendingPathComponent("laguna-xs-2.1-nvfp4-mlx").path,
         withDestinationPath: root.appendingPathComponent("does-not-exist").path
     )
 
     // A real cache directory holding the checkpoint.
-    let cache = root.appendingPathComponent("hfcache/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main")
+    let cache = root.appendingPathComponent("hfcache/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25")
     try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
     try "{}".write(to: cache.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
 
@@ -4846,7 +5069,7 @@ func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
     let recorded = (try? String(contentsOf: reflog, encoding: .utf8)) ?? ""
     // The transform was handed the real cache dir, not the broken symlink.
     #expect(recorded.contains(cache.path))
-    #expect(!recorded.contains("reference_weights/laguna-xs-2.1-4bit"))
+    #expect(!recorded.contains("reference_weights/laguna-xs-2.1-nvfp4-mlx"))
 }
 
 @Test
@@ -5209,7 +5432,7 @@ func cheapPreflightChecksRunBeforeExpensiveWork() throws {
     let timingGuardRange = try #require(hostPreflightStep.range(of: "if [[ \"${MLXFAST_RUN_BENCHMARK}\" == \"1\" ]]; then"))
     let measureCheckRange = try #require(hostPreflightStep.range(of: "measure-job missing"))
     let timingGuardEndRange = try #require(
-        hostPreflightStep.range(of: "          fi", range: timingGuardRange.lowerBound..<hostPreflightStep.endIndex)
+        hostPreflightStep.range(of: "test -f \"${MLXFAST_REFERENCE_DIR}/config.json\"")
     )
     #expect(timingGuardRange.lowerBound < measureCheckRange.lowerBound)
     #expect(measureCheckRange.lowerBound < timingGuardEndRange.lowerBound)

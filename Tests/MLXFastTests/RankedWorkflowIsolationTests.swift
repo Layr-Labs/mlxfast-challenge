@@ -34,13 +34,13 @@ struct RankedWorkflowIsolationTests {
         let stepsMarker = try #require(workflow.range(of: "\n    steps:"))
         let jobHeader = String(workflow[workflow.startIndex..<stepsMarker.lowerBound])
         #expect(!jobHeader.contains(
-            "MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json"
+            "MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/"
         ))
         #expect(!jobHeader.contains(
-            "MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna.json"
+            "MLXFAST_GPQA_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/"
         ))
         #expect(!jobHeader.contains(
-            "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt"
+            "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/"
         ))
 
         let prepareStep = try stepBody(
@@ -49,10 +49,10 @@ struct RankedWorkflowIsolationTests {
             to: "- name: Attach GPQA gates and verify augmented golden"
         )
         #expect(prepareStep.contains(
-            "MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json"
+            "MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/hidden-golden-${{ env.MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256 }}.json"
         ))
         #expect(prepareStep.contains(
-            "MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna.json"
+            "MLXFAST_GPQA_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/gpqa-reference-${{ env.MLXFAST_GPQA_REFERENCE_SHA256 }}.json"
         ))
         let prepareTimedPromptStep = try stepBody(
             workflow,
@@ -60,7 +60,7 @@ struct RankedWorkflowIsolationTests {
             to: "- name: Wait for quiescence before timing"
         )
         #expect(prepareTimedPromptStep.contains(
-            "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt"
+            "MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/timed-prompt-${{ env.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}.txt"
         ))
     }
 

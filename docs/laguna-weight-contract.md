@@ -1,183 +1,184 @@
-# Laguna Transformed-Weight Contract
+# Poolside Laguna NVFP4 Weight Contract
 
-Interface between the offline transform (`Sources/MLXFastTransform/`) and the
-Laguna runtime (`LagunaConfig` / `LagunaWeightLoader` /
-`LagunaRuntimeWeightCache` / `LagunaRuntimeModel` in
-`Sources/MLXFastModel/`). The
-transform must produce a weights directory that satisfies everything below;
-the runtime validates all of it (`LagunaWeightLoader.validateRequiredMetadata`
-plus the shard/tensor inventory checks in `loadRuntimeWeightValues`) before
-the first forward.
+This is the interface between the offline transform
+(`Sources/MLXFastTransform/`) and the serial runtime (`LagunaConfig`,
+`LagunaWeightLoader`, `LagunaRuntimeWeightCache`, and
+`LagunaRuntimeModel`).
 
-Source checkpoint: `mlx-community/Laguna-XS-2.1-4bit` (Poolside Laguna XS
-2.1, 256-expert MoE, MLX affine quantization). All shapes, dtypes, and
-per-tensor quantization below were verified against the pinned checkpoint's
-safetensors headers and `config.json`.
+Source identity:
 
-## Directory layout
+```text
+poolside/Laguna-XS-2.1-NVFP4-mlx
+revision 841778bda563a36104dd521e37d99218e46f4f25
+R2 https://ds4.darkbloom.ai/laguna-xs-2.1-nvfp4-mlx
+```
+
+The source is text-only. Its five shards contain 912 tensors and
+21,561,408,512 tensor-data bytes. The transform preserves the source
+`model.*` / `lm_head.*` names and the source config (minus an empty
+`vision_config` if present).
+
+The public artifact contract is checked in without model data:
+
+```text
+fixtures/poolside_laguna_xs_2_1_nvfp4_config.json
+fixtures/poolside_laguna_xs_2_1_nvfp4_tensor_inventory.json
+```
+
+The config fixture is the complete public `config.json`, normalized only for
+JSON formatting. The inventory fixture was extracted with HTTP range requests
+for the five safetensors headers plus the public index; no tensor payload was
+downloaded. It records every name, dtype, shape, and index shard assignment,
+the public config/index SHA256 values, each raw header SHA256, representative
+records, per-shard hashes, and a full canonical inventory SHA256
+`6da902713b7348d11f3b9664b2ad64703c2544eae6d028133f3d2c45be926848`.
+
+## Directory and inventory
 
 ```text
 weights/
-  config.json                      runtime config (schema parsed by LagunaConfig.load)
-  model.safetensors.index.json     standard HF index: {"weight_map": {tensor -> shard}}
-  model-XXXXX-of-YYYYY.safetensors one or more shards
+  config.json
+  model.safetensors.index.json
+  model-00001-of-00005.safetensors
+  ...
+  model-00005-of-00005.safetensors
 ```
 
-- Every shard referenced by the index must exist, every `*.safetensors` file
-  present must be referenced, and each shard must contain exactly the tensors
-  the index maps to it (validated both directions at load).
-- Tensor names must be unique across shards, and must remain unique after the
-  runtime strips the `language_model.` prefix.
+Every referenced shard must exist; every present safetensors shard must be
+referenced; and each shard must contain exactly the tensors assigned to it by
+the index. Tensor names must be unique. `rotary_emb.inv_freq` tables are
+excluded.
 
-## Naming scheme
-
-The transform keeps the source checkpoint's tensor names **unchanged**,
-including the `language_model.` text-tower prefix (`LagunaWeightNames`
-addresses tensors by these names). At load time the runtime renames
-`language_model.X` to `X` (`RuntimeWeightNameTracker`), which aligns the
-tensors with the module parameter paths of `LagunaRuntimeModel`
-(`model.layers.N...`, `lm_head.*`).
-
-Quantized tensors are affine-packed triplets: `<stem>.weight` (U32 packed
-codes), `<stem>.scales` (BF16), `<stem>.biases` (BF16). A stem is quantized
-exactly when its `.scales` companion exists; the runtime derives bits from
-the packed width, so the layout below is the source of truth.
+When a source shard contains only selected tensors—as every Poolside shard
+does—the transform may create an independent APFS copy-on-write clone. It must
+fall back to a regular copy across filesystems and must never publish a
+symlink.
 
 ## Quantization
 
-Global: affine, `group_size = 64`, `bits = 4` — declared in `config.json`
-under `quantization` (and mirrored in `quantization_config`) as
-`{"group_size": 64, "bits": 4, "mode": "affine"}`.
-
-Per-tensor overrides: the same `quantization` object additionally maps the 39
-router-gate stems to 8-bit:
+Both `quantization` and `quantization_config` are required, must match, and
+must contain exactly:
 
 ```json
-"language_model.model.layers.<N>.mlp.gate.proj": {"group_size": 64, "bits": 8}
+{"group_size": 16, "bits": 4, "mode": "nvfp4"}
 ```
 
-for every sparse layer `N` in 1...39. No other overrides exist.
+No per-tensor overrides are permitted.
 
-For a quantized stem with logical shape `[rows, in]` (or `[experts, rows,
-in]`), the stored shapes are:
+Only routed and shared expert projections are quantized. For logical shape
+`[rows, in]` or `[experts, rows, in]`:
 
 ```text
-<stem>.weight  U32  [..., rows, in * bits / 32]
-<stem>.scales  BF16 [..., rows, in / 64]
-<stem>.biases  BF16 [..., rows, in / 64]
+<stem>.weight  U32 [..., rows, in * 4 / 32]
+<stem>.scales  U8  [..., rows, in / 16]
 ```
 
-## Full tensor inventory (1634 tensors)
+The U8 values are NVFP4 E4M3 group scales. There is no `.biases` companion.
+The runtime promotes exactly every sparse layer's routed/shared expert
+projection to `QuantizedLinear` / `QuantizedSwitchLinear` during model
+construction and dispatches MLX with mode `.nvfp4`; metadata validation then
+requires the matching `.scales` tensor for each such module.
 
-Geometry constants (see `LagunaConstants`): hidden 2048, vocab 100352, 40
-layers, head_dim 128, 8 KV heads, per-layer query heads 48 (full-attention
-layers 0, 4, 8, ..., 36) / 64 (the 30 sliding layers), dense intermediate
-8192 (layer 0 only), 256 experts, moe intermediate 512, shared expert 512.
+## Tensor inventory
 
-### Top level (7 tensors)
+Geometry: hidden 2048, vocab 100352, 40 layers, head dimension 128, 8 KV
+heads, 48 query heads on full-attention layers (0, 4, ..., 36), 64 query
+heads on sliding layers, dense intermediate 8192 at layer 0, 256 experts,
+expert/shared intermediate 512.
 
-| Tensor | Quant | Logical shape | Stored weight/scales shapes |
-| --- | --- | --- | --- |
-| `language_model.model.embed_tokens.{weight,scales,biases}` | 4-bit g64 | [100352, 2048] | [100352, 256] / [100352, 32] |
-| `language_model.lm_head.{weight,scales,biases}` (UNTIED) | 4-bit g64 | [100352, 2048] | [100352, 256] / [100352, 32] |
-| `language_model.model.norm.weight` | BF16 | [2048] | — |
+Top level:
 
-### Per layer, all 40 layers (19 tensors each = 760)
+- `model.embed_tokens.weight`: BF16 `[100352, 2048]`
+- `model.norm.weight`: BF16 `[2048]`
+- `lm_head.weight`: BF16 `[100352, 2048]`, untied
 
-Prefix `language_model.model.layers.<N>.`; `H(N)` = 48 on full-attention
-layers, 64 on sliding layers.
+Every layer `model.layers.<N>`:
 
-| Tensor | Quant | Logical shape |
-| --- | --- | --- |
-| `input_layernorm.weight` | BF16 | [2048] |
-| `post_attention_layernorm.weight` | BF16 | [2048] |
-| `self_attn.q_proj.{weight,scales,biases}` | 4-bit g64 | [H(N)*128, 2048] |
-| `self_attn.k_proj.{weight,scales,biases}` | 4-bit g64 | [1024, 2048] |
-| `self_attn.v_proj.{weight,scales,biases}` | 4-bit g64 | [1024, 2048] |
-| `self_attn.o_proj.{weight,scales,biases}` | 4-bit g64 | [2048, H(N)*128] |
-| `self_attn.g_proj.{weight,scales,biases}` (per-head gate) | 4-bit g64 | [H(N), 2048] |
-| `self_attn.q_norm.weight` | BF16 | [128] |
-| `self_attn.k_norm.weight` | BF16 | [128] |
+- `input_layernorm.weight`, `post_attention_layernorm.weight`: BF16 `[2048]`
+- `self_attn.q_proj.weight`: BF16 `[H(N)*128, 2048]`
+- `self_attn.k_proj.weight`, `v_proj.weight`: BF16 `[1024, 2048]`
+- `self_attn.o_proj.weight`: BF16 `[2048, H(N)*128]`
+- `self_attn.g_proj.weight`: BF16 `[H(N), 2048]`
+- `self_attn.q_norm.weight`, `k_norm.weight`: BF16 `[128]`
 
-Examples of stored shapes: layer 0 `q_proj.weight` U32 [6144, 256], layer 1
-`q_proj.weight` U32 [8192, 256]; layer 0 `o_proj.weight` U32 [2048, 768],
-layer 1 `o_proj.weight` U32 [2048, 1024]; `g_proj.weight` U32 [48, 256] /
-[64, 256].
+Layer 0 dense MLP:
 
-### Layer 0 only — dense MLP (9 tensors)
+- `mlp.gate_proj.weight`, `up_proj.weight`: BF16 `[8192, 2048]`
+- `mlp.down_proj.weight`: BF16 `[2048, 8192]`
 
-| Tensor | Quant | Logical shape |
-| --- | --- | --- |
-| `mlp.gate_proj.{weight,scales,biases}` | 4-bit g64 | [8192, 2048] |
-| `mlp.up_proj.{weight,scales,biases}` | 4-bit g64 | [8192, 2048] |
-| `mlp.down_proj.{weight,scales,biases}` | 4-bit g64 | [2048, 8192] |
+Sparse layers 1–39:
 
-### Layers 1–39 — sparse MoE (22 tensors each = 858)
+- `mlp.gate.weight`: BF16 `[256, 2048]`
+- `mlp.gate.e_score_correction_bias`: F32 `[256]`
+- `mlp.switch_mlp.gate_proj` / `up_proj`: NVFP4 logical
+  `[256, 512, 2048]`; stored weight `[256, 512, 256]`, scales
+  `[256, 512, 128]`
+- `mlp.switch_mlp.down_proj`: NVFP4 logical `[256, 2048, 512]`; stored
+  weight `[256, 2048, 64]`, scales `[256, 2048, 32]`
+- `mlp.shared_expert.gate_proj` / `up_proj`: NVFP4 logical `[512, 2048]`;
+  stored weight `[512, 256]`, scales `[512, 128]`
+- `mlp.shared_expert.down_proj`: NVFP4 logical `[2048, 512]`; stored
+  weight `[2048, 64]`, scales `[2048, 32]`
 
-| Tensor | Quant | Logical shape | Stored weight shape |
-| --- | --- | --- | --- |
-| `mlp.gate.proj.{weight,scales,biases}` (router) | **8-bit** g64 | [256, 2048] | U32 [256, 512], scales [256, 32] |
-| `mlp.gate.e_score_correction_bias` | BF16 | [256] | — |
-| `mlp.switch_mlp.gate_proj.{weight,scales,biases}` | 4-bit g64 | [256, 512, 2048] | U32 [256, 512, 256], scales [256, 512, 32] |
-| `mlp.switch_mlp.up_proj.{weight,scales,biases}` | 4-bit g64 | [256, 512, 2048] | U32 [256, 512, 256] |
-| `mlp.switch_mlp.down_proj.{weight,scales,biases}` | 4-bit g64 | [256, 2048, 512] | U32 [256, 2048, 64], scales [256, 2048, 8] |
-| `mlp.shared_expert.gate_proj.{weight,scales,biases}` | 4-bit g64 | [512, 2048] | U32 [512, 256] |
-| `mlp.shared_expert.up_proj.{weight,scales,biases}` | 4-bit g64 | [512, 2048] | U32 [512, 256] |
-| `mlp.shared_expert.down_proj.{weight,scales,biases}` | 4-bit g64 | [2048, 512] | U32 [2048, 64] |
+Count check:
 
-The `switch_mlp` tensors are the SwitchGLU stacked-expert layout (leading
-axis = expert index) that `mlx_lm` writes and the vendored
-`SwitchGLU`/`QuantizedSwitchLinear` consume directly. The transform must NOT
-split them into per-expert tensors.
+- 405 BF16 tensors
+- 39 F32 tensors
+- 234 U32 tensors
+- 234 U8 tensors
+- total 912
 
-Count check: 7 + 40*19 + 9 + 39*22 = 1634.
+The `switch_mlp` tensors remain stacked by expert. They must not be split into
+per-expert tensors. Affine `.biases`, compressed-tensors `weight_packed`,
+`global_scale`, or KV-scale tensors, and any missing, extra, or renamed tensor
+are different schemas and fail the exact inventory check.
 
-## What must NOT be present
+## Config invariants
 
-- No tensors outside the `language_model.` prefix (the source checkpoint's
-  empty `vision_config` contributes none).
-- No `rotary_emb.inv_freq` tables (the runtime would drop them via
-  `sanitize`, but the inventory check runs first — leave them out).
-- No fused/derived layouts in v1: no `gate_up_proj` fusion, no transposed
-  experts, no extra metadata sidecars. Derived runtime layouts are a later
-  optimization wave and will extend this contract explicitly.
+The runtime validates the frozen architecture before materializing weights:
+model type `laguna`, vocab 100352, hidden 2048, dense intermediate 8192, 40
+layers, 8 KV heads, head dimension 128, sliding window 512, 256 experts,
+top-8 routing, expert/shared intermediate 512, untied head, per-head gating,
+all 40 `gating_types` entries set to `per_head`, and the every-fourth
+full-attention schedule. It also pins max position 262144, RMS epsilon 1e-6,
+zero attention dropout, normalized top-k probabilities, routed factor 2.5,
+`moe_apply_router_weight_on_input=false`, `router_aux_loss_coef=0`, and
+`use_cache=true`. The public artifact explicitly stores the two zero-valued
+fields but omits `qkv_bias` and `moe_router_logit_softcapping`; the exact
+fixture preserves absent, JSON null, and numeric zero as distinct states.
 
-## config.json requirements
+RoPE remains:
 
-`LagunaConfig.load` parses the flat source-config schema; the transform may
-copy the source `config.json` fields directly (defaults equal the pinned
-checkpoint's values, so trimmed configs also parse). Load-bearing fields:
+- sliding: default, theta 10000, full head rotation
+- full: YaRN, theta 500000, factor 32, original context 8192, beta 64/1,
+  attention factor 1.0, partial rotary factor 0.5
 
-- `model_type` ("laguna"), `vocab_size`, `hidden_size`, `intermediate_size`,
-  `num_hidden_layers`, `num_attention_heads`,
-  `num_attention_heads_per_layer` (40 entries: 48 full / 64 sliding),
-  `num_key_value_heads`, `head_dim`, `rms_norm_eps`,
-  `max_position_embeddings`, `attention_bias`, `attention_dropout`,
-  `sliding_window`, `tie_word_embeddings` (must be false), `gating`
-  ("per-head" — required by the frozen-invariant check).
-- `layer_types`: 40 entries of `full_attention` / `sliding_attention`
-  (full at 0, 4, 8, ..., 36).
-- `mlp_layer_types`: 40 entries of `dense` / `sparse` (dense only at 0). If
-  omitted, derived from `mlp_only_layers` (default `[0]`) and
-  `decoder_sparse_step` (default 1).
-- MoE: `num_experts` 256, `num_experts_per_tok` 8, `moe_intermediate_size`
-  512, `shared_expert_intermediate_size` 512, `moe_routed_scaling_factor`
-  2.5, `norm_topk_prob` true, `moe_router_logit_softcapping` 0.
-- `rope_parameters.sliding_attention`: `{rope_type: "default", rope_theta:
-  10000.0, partial_rotary_factor: 1.0}`.
-- `rope_parameters.full_attention`: `{rope_type: "yarn", rope_theta:
-  500000.0, factor: 32.0, original_max_position_embeddings: 8192,
-  beta_fast: 64.0, beta_slow: 1.0, partial_rotary_factor: 0.5}`. (The source
-  config's `attention_factor: 1.0` is ignored — the vendored Swift
-  `YarnRoPE` computes its attention scaling internally and is the pinned
-  correctness reference.)
-- `quantization` (or `quantization_config`): global
-  `{group_size: 64, bits: 4, mode: "affine"}` plus the 39 router-gate 8-bit
-  overrides listed above. The runtime validates every quantized tensor's
-  stored geometry against this spec, so the overrides must match the packed
-  shapes exactly.
+`attention_factor` is parsed and pinned as public artifact metadata, but it is
+not applied directly as the YaRN query/key multiplier. The vendored
+mlx-swift-lm `YarnRoPE` implementation is the runtime authority: with its
+default `mscale=1`, `mscale_all_dim=0`, and factor 32 it derives
+`1 + 0.1 * log(32) = 1.3465736...`. Replacing that derived multiplier with
+the literal public `attention_factor=1.0` changes runtime math and is forbidden.
 
-Frozen invariants enforced at parse time (`validateFrozenInvariants`): vocab
-100352, hidden 2048, intermediate 8192, 40 layers, 8 KV heads, head_dim 128,
-sliding window 512, 256 experts, top-8, moe/shared intermediate 512, untied
-head, per-head gating.
+Any affine checkpoint, group size other than 16, quantization override,
+quantized router, affine bias companion, non-U8 NVFP4 scale, or non-BF16
+dense projection fails closed before the first forward. The 48-layer,
+top-10 Laguna S geometry is likewise a different artifact and fails closed.
+
+## M5 upstream equivalence gate
+
+Before regenerating correctness artifacts, operators compare one 512-token
+prefill and eight serial teacher-forced decode steps against the vendored
+`MLXLLM.LagunaModel`, with both module trees sharing the same loaded tensor
+objects:
+
+```bash
+MLXFAST_RUN_LAGUNA_UPSTREAM_EQUIVALENCE=1 \
+MLXFAST_LAGUNA_EQUIVALENCE_WEIGHTS_PATH=weights \
+swift test --filter lagunaRuntimeMatchesVendoredUpstreamOnM5WhenEnabled
+```
+
+The test reports maximum/mean absolute logit error and both greedy tokens for
+every step. Its default tolerance is exact (`0`); an operator may set
+`MLXFAST_LAGUNA_EQUIVALENCE_MAX_ABS_ERROR` only to diagnose a mismatch, not to
+weaken the exact-token correctness gates.

@@ -12,8 +12,8 @@ import MLXFastCore
 /// with the script's `MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES` and
 /// `MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_FILE_BYTES`.
 public enum EditableSurfaceByteBudget {
-    /// The unmodified full-stack surface is 2,590,558 bytes (~2.59 MB);
-    /// 3.0 MB leaves 409,442 bytes for merged frontier work while still
+    /// The unmodified full-stack surface is 2,802,363 bytes (~2.80 MB);
+    /// 3.0 MB leaves 197,637 bytes for merged frontier work while still
     /// bounding lookup-table smuggling.
     public static let defaultMaxTotalBytes = 3_000_000
     public static let defaultMaxFileBytes = 524_288

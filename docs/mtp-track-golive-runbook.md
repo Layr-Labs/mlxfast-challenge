@@ -7,13 +7,16 @@
 > manifests, and local scripts this runbook references have been deleted
 > from the repository. Kept for provenance only — do not execute.
 
-> **Laguna XS 2.1 re-pin (2026-07): this runbook must be re-executed.**
-> The track has been re-pinned from Gemma 4 31B-IT to Poolside Laguna XS 2.1
+> **Historical Laguna XS 2.1 re-pin proposal (2026-07; never execute).**
+> The proposed track would have moved from Gemma 4 31B-IT to Laguna XS 2.1
 > (target `mlx-community/Laguna-XS-2.1-4bit`, upstream
 > `poolside/Laguna-XS-2.1`, assistant `poolside/Laguna-XS-2.1-DFlash`
 > downloaded as the BF16 upstream and converted to MLX 4-bit at setup) under
 > the new track ID `laguna-xs-2.1-mtp-v1`
-> (serial: `laguna-xs-2.1-serial-v1`). Everything M5-derived below is stale
+> (then-serial: `laguna-xs-2.1-serial-v1`). These identifiers intentionally
+> describe the retired affine proposal, not the current independently
+> versioned Poolside NVFP4 serial track (`laguna-xs-2.1-serial-v2`).
+> Everything M5-derived below is stale
 > for the new model and must be regenerated on `m5-bench` with the real
 > Laguna weights before the track can go live again:
 >

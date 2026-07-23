@@ -160,9 +160,9 @@ fi
 # else use reference_weights/ only when it actually holds a checkpoint, resolved to
 # its real target so the transform never opens a symlinked directory; else fall
 # back to the Hugging Face cache setup.sh downloads into.
-REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/Laguna-XS-2.1-4bit}"
-REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-main}"
-REFERENCE_DEFAULT_DIR="reference_weights/laguna-xs-2.1-4bit"
+REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-poolside/Laguna-XS-2.1-NVFP4-mlx}"
+REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-841778bda563a36104dd521e37d99218e46f4f25}"
+REFERENCE_DEFAULT_DIR="reference_weights/laguna-xs-2.1-nvfp4-mlx"
 REFERENCE_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}"
 REFERENCE_HF_HUB_CACHE="${MLXFAST_HF_HUB_CACHE:-${HF_HUB_CACHE:-${REFERENCE_HF_HOME}/hub}}"
 REFERENCE_CACHE_DIR="${MLXFAST_REFERENCE_CACHE_DIR:-${REFERENCE_HF_HUB_CACHE}/models--${REFERENCE_MODEL_REPO//\//--}/snapshots/${REFERENCE_REVISION//\//--}}"
@@ -413,7 +413,7 @@ FAN_BOOST_ABORT_HANDLED=0
 # PID of the in-flight `mlxfast-swift benchmark` child. Local modes launch it
 # as a monitored background child (see the invocation site) so the INT/TERM
 # abort handler and the EXIT cleanup can reap the model-holding process tree
-# instead of leaving a ~17 GB runtime worker behind on an aborted run.
+# instead of leaving a ~21.6 GB runtime worker behind on an aborted run.
 BENCHMARK_CHILD_PID=""
 
 fan_boost_recorded() {
@@ -471,7 +471,7 @@ EOF
 # INT/TERM handler for the run that owns the abort traps. Two duties:
 # 1) Reap the in-flight benchmark process tree. Local modes run the Swift
 #    benchmark as a monitored background child (see the invocation site), and
-#    that child's runtime worker holds the ~17 GB model. An aborted run that
+#    that child's runtime worker holds the ~21.6 GB model. An aborted run that
 #    leaves the worker behind makes the NEXT run load a second copy of the
 #    model and can out-of-memory the machine, so the tree is torn down here
 #    on every abort.
@@ -503,10 +503,11 @@ handle_benchmark_abort_signal() {
 }
 
 # --- Local run memory guard and worker teardown --------------------------------
-# The Laguna XS 2.1 text tower is ~19 GB and RAM-resident: it lives inside the
+# The Poolside Laguna XS 2.1 NVFP4 text tower is ~21.6 GB and RAM-resident: it lives inside the
 # sibling `mlxfast-runtime-worker runtime-worker` subprocess that the trusted
-# `mlxfast-swift benchmark` process spawns. ONE resident copy fits a 36 GB
-# machine; TWO do not. Two copies happen when local runs overlap, or when a
+# `mlxfast-swift benchmark` process spawns. ONE resident copy needs roughly a
+# 40 GiB machine once KV and workspace are included; TWO do not fit locally.
+# Two copies happen when local runs overlap, or when a
 # new run starts while an orphaned model-holding process from a previous
 # aborted run is still alive. Local modes therefore:
 #   1. take a per-user run lock so two local runs cannot overlap
@@ -519,7 +520,7 @@ handle_benchmark_abort_signal() {
 #   3. reap the spawned benchmark process tree (the Swift benchmark child
 #      and its runtime worker) on INT/TERM and on EXIT
 #      (terminate_benchmark_child_tree), so an interrupted edit-loop run
-#      cannot orphan a 17 GB process in the first place.
+#      cannot orphan a 21.6 GB process in the first place.
 # Local modes only: the ranked --official path is operator-supervised and is
 # not touched by any of this.
 #
@@ -538,7 +539,7 @@ LOCAL_RUN_LOCK_OWNED=""
 # workers launched by an older checkout), plus the trusted mlxfast-swift
 # subcommands that own an imminent worker. The trusted binary never holds
 # the model in-process, but a run in its pre-worker phase (validation,
-# weights digest) is about to spawn a ~17 GB worker and would otherwise be
+# weights digest) is about to spawn a ~21.6 GB worker and would otherwise be
 # invisible to this scan until that load has already started.
 readonly RESIDENT_MODEL_PROCESS_PATTERN='runtime-worker[[:space:]]+--weights|mlxfast-swift[[:space:]]+(benchmark|correctness|correctness-trace|generate-golden|generate-gpqa-answers|attach-free-run-gate|mtp-probe|mtp-benchmark)'
 
@@ -584,7 +585,7 @@ acquire_local_run_lock() {
     if [[ "${holder_pid}" =~ ^[0-9]+$ ]] && ps -p "${holder_pid}" >/dev/null 2>&1; then
       cat >&2 <<EOF
 benchmark.sh: ERROR: another local benchmark run (pid ${holder_pid}) already holds ${lock_path}.
-benchmark.sh: two overlapping local runs would hold two ~17 GB copies of the model, which can
+benchmark.sh: two overlapping local runs would hold two ~21.6 GB copies of the model, which can
 benchmark.sh: out-of-memory this machine (and they would share one GPU, invalidating both timings).
 benchmark.sh: wait for that run to finish and rerun. If pid ${holder_pid} is not a benchmark run,
 benchmark.sh: remove the stale lock with: rm -rf "${lock_path}"
@@ -646,7 +647,7 @@ abort_if_model_already_resident() {
     echo "benchmark.sh: ERROR: a model-holding mlxfast process is already running (pid ppid rss_kb command):"
     printf '%s\n' "${resident}" | sed 's/^/benchmark.sh:   /'
     cat <<EOF
-benchmark.sh: the Laguna model is ~19 GB RAM-resident per process; starting another local run
+benchmark.sh: the Poolside Laguna NVFP4 model is ~21.6 GB RAM-resident per process; starting another local run
 benchmark.sh: now would load a second copy and can out-of-memory this machine.
 benchmark.sh: - a ppid of 1 usually means an orphan left by a previous aborted run: verify with
 benchmark.sh:   'ps -p <pid> -o pid,ppid,rss,command' and stop it with 'kill <pid>'.
@@ -1431,6 +1432,7 @@ validate_staged_transform_contents() {
     rm -f "${shard_list}"
     return 1
   fi
+  # shellcheck disable=SC2094  # error cleanup intentionally unlinks the open list
   while IFS= read -r shard_name; do
     if [[ ! -f "${staged_weights}/${shard_name}" \
         || -L "${staged_weights}/${shard_name}" ]]; then
@@ -1706,7 +1708,7 @@ if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ]]; then
   # forced through the timed phases) or restores automatic control on
   # INT/TERM so an aborted run is not left pinned at 70%.
   setup_fan_boost_run_tracking
-  # Memory guard for the ~17 GB RAM-resident model (local modes only, before
+  # Memory guard for the ~21.6 GB RAM-resident model (local modes only, before
   # any transform/model work): serialize local runs behind a per-user lock,
   # then refuse to start while a model-holding process from a previous or
   # parallel run is still alive. See the guard section above for the policy.
@@ -1801,7 +1803,7 @@ if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ]]; then
   #    plain `kill` of an in-flight local run used to be silently ignored
   #    until the whole run finished on its own;
   # 2. on INT/TERM the abort handler must reap the model-holding process tree
-  #    (the Swift benchmark and its ~17 GB runtime worker) so an aborted
+  #    (the Swift benchmark and its ~21.6 GB runtime worker) so an aborted
   #    edit-loop run cannot orphan a resident model and out-of-memory the
   #    next run. The ranked --official invocation below keeps its original
   #    foreground semantics, unchanged.

@@ -3,7 +3,7 @@ name: benchmark
 # DEFAULT SERIAL RANKED PIPELINE (self-hosted Apple M5 Max, label m5-bench).
 #
 # This is the Yukon-default ranked entrypoint declared by benchmark.json
-# (track id laguna-xs-2.1-serial-v1). It runs the one-token serial contract:
+# (track id laguna-xs-2.1-serial-v2). It runs the one-token serial contract:
 # the MTP track is retired, and this serial pipeline is the only ranked
 # track.
 #
@@ -46,8 +46,8 @@ name: benchmark
 # harness spawns its per-phase runtime workers fresh inside that run, so no
 # model/cache state survives from the correctness pass into the timed pass.
 # The paired ratio (candidate vs the PINNED baseline tree at
-# /opt/bench-runner/baseline/current, sanity-banded against
-# /opt/bench-runner/state/baseline-calibration.json) cancels the remaining
+# /opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current, sanity-banded
+# against the matching versioned calibration) cancels the remaining
 # common-mode host drift exactly like the old separate-VM pairing did --
 # validated on this box at paired score 1.0507 with decode CV 0.13%.
 #
@@ -92,7 +92,9 @@ on:
       run_benchmark:
         description: "Run the private gates + timed benchmark after the public correctness gate. false = public-fixture correctness only."
         required: false
-        default: true
+        # Poolside v2 remains fail-closed until its M5-derived public/private
+        # fixtures, GPQA policy, and final-SHA baseline are calibrated.
+        default: false
         type: boolean
       verify_transform:
         description: "Run deterministic transform verification before timing."
@@ -103,9 +105,10 @@ on:
 permissions:
   contents: read
 
-# Ranked serving now spans two hardened, at-parity M5 boxes (both PF-locked-down,
-# same pinned baseline ref 4475b88, cross-box timing measured ~0.01% decode /
-# ~0.09% prefill apart). A per-run concurrency group lets dispatches run
+# Ranked serving spans two hardened M5 boxes. Poolside v2 parity and its pinned
+# baseline must be re-established from the FINAL migration SHA before ranked
+# dispatch is enabled; no Gemma/affine baseline claim applies to this track.
+# A per-run concurrency group lets dispatches run
 # concurrently -- one per box -- instead of serializing behind a single global
 # queue; actual concurrency is naturally bounded by the number of online
 # m5-bench runners (2). cancel-in-progress stays false so no ranked run is ever
@@ -122,7 +125,7 @@ jobs:
     # base case + gates (~45m) + cooldowns (up to 900s per timed phase) +
     # paired timing. Generous until recalibrated.
     timeout-minutes: 360
-    environment: benchmark-private-prompts
+    environment: benchmark-private-prompts-v2
     env:
       # --- Host contract: provisioned by the box operator, audited by the
       # janitor's signed manifest. The workflow only ever consumes these; it
@@ -132,15 +135,23 @@ jobs:
       MLXFAST_MEASURE_JOB: /opt/bench-runner/measure-job.sh
       MLXFAST_QUARANTINE_FLAG: /opt/bench/quarantine.flag
       MLXFAST_MACMON: /opt/bench-runner/bin/macmon
-      MLXFAST_BASELINE_WS: /opt/bench-runner/baseline/current
-      MLXFAST_BASELINE_CALIBRATION: /opt/bench-runner/state/baseline-calibration.json
-      MLXFAST_MEASURE_STATE_DIR: /opt/bench-runner/state
+      MLXFAST_BASELINE_WS: /opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current
+      MLXFAST_BASELINE_CALIBRATION: /opt/bench-runner/state/laguna-xs-2.1-serial-v2/baseline-calibration.json
+      MLXFAST_MEASURE_STATE_DIR: /opt/bench-runner/state/laguna-xs-2.1-serial-v2
+      # Filled only after the Poolside migration PR is merged and that exact
+      # immutable 40-character commit is installed as the v2 baseline on both
+      # boxes. The host preflight rejects this placeholder for ranked runs.
+      MLXFAST_BASELINE_COMMIT: __FINAL_MERGED_POOLSIDE_V2_SHA_PENDING__
+      # Deliberate migration interlock. Set to "1" only in the same final
+      # calibration change that replaces every legacy model-derived pin below
+      # and provisions the final-SHA v2 baseline on both M5 boxes.
+      MLXFAST_POOLSIDE_V2_CALIBRATION_READY: "0"
       # Reference checkpoint pre-provisioned in the runner-owned cache
       # (world-readable; verified against the pinned manifest below every
       # run). No download happens on this box, so the old
       # reference_download_jobs/reference_min_free_gib inputs are gone.
-      MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main
-      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_4bit.sha256
+      MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256
       # Bench workspace: the ONLY place submitted code executes and writes.
       # Must live under /Users/Shared/bench-jobs (bench-exec refuses anything
       # else). The path is STABLE across runs (not per-run) because llbuild's
@@ -150,19 +161,21 @@ jobs:
       # exactly one ranked job at a time (one ephemeral runner registration per
       # box) and "Prepare bench workspace" starts with rm -rf; per-run identity
       # lives in BENCH_JOB_ID and the per-run private/artifact dirs below.
-      MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-current
+      # This stable v2-specific workspace also namespaces measure-job's
+      # self-generated bench_oracle.mjob.json away from every v1 run.
+      MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-laguna-xs-2.1-serial-v2
       # --- Runner-only private material, same /tmp/mlxfast-private-* naming
       # convention as the VM pipeline. The directory is created 0700 runner,
       # so neither the bench parent nor the worker (both the bench uid) can
       # read it; the janitor's bench-uid purge never touches runner-owned
       # files.
-      MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}
-      MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json
-      MLXFAST_TIMED_DECODE_PROMPT_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/timed_decode_prompt.txt
-      MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json
-      MLXFAST_SUBMISSION_STATIC_REVIEW_RESULTS_PATH: /tmp/mlxfast-private-${{ github.run_id }}-${{ github.run_attempt }}/submission_static_review.json
-      MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
-      MLXFAST_MEASURE_OUT: /tmp/mlxfast-measure-${{ github.run_id }}-${{ github.run_attempt }}
+      MLXFAST_PRIVATE_DIR: /tmp/mlxfast-private-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}
+      MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-private-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json
+      MLXFAST_TIMED_DECODE_PROMPT_PATH: /tmp/mlxfast-private-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}/timed_decode_prompt.txt
+      MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json
+      MLXFAST_SUBMISSION_STATIC_REVIEW_RESULTS_PATH: /tmp/mlxfast-private-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}/submission_static_review.json
+      MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}
+      MLXFAST_MEASURE_OUT: /tmp/mlxfast-measure-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}
       # --- Benchmark contract (identical values to the previous pipeline).
       MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
       # Trusted final-artifact shape contract. Keep in sync with
@@ -171,14 +184,14 @@ jobs:
       MLXFAST_EXPECTED_NUM_LAYERS: "40"
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
       MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}
-      # The timed target's bytes remain private in R2. Its digest and byte count
-      # are non-secret Environment variables so the trusted workflow can pin
-      # the exact fixture while operators rotate it without publishing it.
+      # Private v2 artifacts remain fail-closed until trusted operator
+      # generation fills all six content pins below. Never inherit Environment
+      # variables from v1: each object key embeds its pinned SHA-256.
       # Keep the ID in sync with
       # MLXFastConstants.benchmarkEvaluationTargetID.
       MLXFAST_TIMED_DECODE_TARGET_ID: lowsim-prose-v1
-      MLXFAST_TIMED_DECODE_PROMPT_SHA256: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}
-      MLXFAST_TIMED_DECODE_PROMPT_BYTES: ${{ vars.MLXFAST_TIMED_DECODE_PROMPT_BYTES }}
+      MLXFAST_TIMED_DECODE_PROMPT_SHA256: __POOLSIDE_V2_TIMED_PROMPT_SHA256_PENDING__
+      MLXFAST_TIMED_DECODE_PROMPT_BYTES: "0"
       # The private R2 object KEYS (MLXFAST_CORRECTNESS_GOLDEN_R2_PATH /
       # MLXFAST_GPQA_R2_PATH / MLXFAST_TIMED_DECODE_PROMPT_R2_PATH) are
       # deliberately NOT set at job level: job env is ambient to every step,
@@ -186,19 +199,18 @@ jobs:
       # needlessly reach the untrusted bench environment. They are scoped to
       # their trusted download steps. (The operator denylist blocks them at the
       # bridge as defense in depth.)
-      # The RAW (pre-GPQA-augmentation) hidden golden's pins -- the same object
-      # the old slices verified. The augmented golden is verified against a
-      # self-anchored hash computed right after attach-gpqa-gates, exactly as
-      # the old gates machine did.
-      MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 96689a9ceaf7cc813174d0a6cb2ab650454d7d031f88514cbd222bcb17bb4d7e
-      MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "35749"
+      # Poolside v2 private pins. Placeholders intentionally fail the preflight;
+      # trusted generation must replace every value in one reviewed change.
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: __POOLSIDE_V2_HIDDEN_GOLDEN_SHA256_PENDING__
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "0"
+      MLXFAST_GPQA_REFERENCE_SHA256: __POOLSIDE_V2_GPQA_REFERENCE_SHA256_PENDING__
+      MLXFAST_GPQA_REFERENCE_BYTES: "0"
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
       MLXFAST_GPQA_CASE_COUNT: "5"
-      # 64-token GPQA behavior/semantic budget and min-pass 1 threshold:
-      # re-validated 2026-07-22 against the unmodified Laguna XS 2.1 4-bit
-      # baseline, which judges 1/5-2/5 on the regenerated hidden Laguna
-      # prompts (four ranked runs, see
-      # MLXFastConstants.semanticGPQAMinPassCount). Keep in sync with
+      # TEMPORARY legacy GPQA budget/min-pass calibration from the superseded
+      # mlx-community affine checkpoint. Re-evaluate both values from repeated
+      # Poolside NVFP4 M5 runs before this migration merges; do not weaken the
+      # semantic gate merely to make the new baseline pass. Keep in sync with
       # MLXFastConstants.{correctnessGPQAMaxNewTokens,semanticGPQAMaxNewTokens,
       # semanticGPQAMinPassCount}.
       MLXFAST_GPQA_MAX_NEW_TOKENS: "64"
@@ -208,15 +220,17 @@ jobs:
       MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
       # Opus 4.8 at max effort (adaptive thinking) replaced the Sonnet 4.5
       # judge after that model produced prose-wrapped/truncated verdicts
-      # (3 unparseable first attempts in run 29124417146). The Laguna
-      # threshold calibration above was judged by Opus 4.8 across four runs.
+      # (3 unparseable first attempts in run 29124417146). Poolside v2's
+      # pass threshold still requires its own repeated M5 calibration.
       MLXFAST_SEMANTIC_GPQA_MODEL: claude-opus-4-8
       MLXFAST_GPQA_TTFT_CASE_COUNT: "5"
-      # Public drift-tripwire fixture, pinned (enforced by BenchmarkScriptTests).
+      # Poolside v2 public drift-tripwire fixture generated by the challenge
+      # runtime on M5-B after exact 256/1024 parity with the independent
+      # vendored-Swift reference. It carries the pinned model provenance.
       MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt
       MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
-      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: 679ba44220d581316c752533472883f4905a1b6a30f5f657a25f1177ae6247c1
-      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: "10519"
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: b9509697c08a2cf3c2943a85f0b76e39c485c441794690fa76835b40a58d7a63
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: "10686"
       # Speedup floors; keep in sync with
       # MLXFastConstants.{scoreDecodeSpeedupFloor,scorePrefillSpeedupFloor}.
       # The old timing machine computed floor verdicts inside the harness from
@@ -255,11 +269,42 @@ jobs:
           fi
           test -e "${MLXFAST_BENCH_EXEC}" || { echo "::error::bench-exec bridge missing" >&2; exit 1; }
           test -e "${MLXFAST_JANITOR}" || { echo "::error::janitor missing" >&2; exit 1; }
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" && "${MLXFAST_POOLSIDE_V2_CALIBRATION_READY}" != "1" ]]; then
+            echo "::error::Poolside v2 model-derived fixtures and final-SHA baseline are not calibrated" >&2
+            exit 1
+          fi
           if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
+            for sha256 in \
+              "${MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256}" \
+              "${MLXFAST_GPQA_REFERENCE_SHA256}" \
+              "${MLXFAST_TIMED_DECODE_PROMPT_SHA256}"; do
+              if [[ ! "${sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+                echo "::error::Poolside v2 private artifacts require three pinned SHA-256 values" >&2
+                exit 1
+              fi
+            done
+            for bytes in \
+              "${MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES}" \
+              "${MLXFAST_GPQA_REFERENCE_BYTES}" \
+              "${MLXFAST_TIMED_DECODE_PROMPT_BYTES}"; do
+              if [[ ! "${bytes}" =~ ^[1-9][0-9]*$ ]]; then
+                echo "::error::Poolside v2 private artifacts require three positive byte-count pins" >&2
+                exit 1
+              fi
+            done
+            if [[ ! "${MLXFAST_BASELINE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Poolside v2 baseline requires the exact final merged 40-character commit" >&2
+              exit 1
+            fi
             test -x "${MLXFAST_MEASURE_JOB}" || { echo "::error::measure-job missing" >&2; exit 1; }
             test -x "${MLXFAST_MACMON}" || { echo "::error::macmon missing" >&2; exit 1; }
             test -d "${MLXFAST_BASELINE_WS}" || { echo "::error::pinned baseline workspace missing" >&2; exit 1; }
             test -s "${MLXFAST_BASELINE_CALIBRATION}" || { echo "::error::baseline calibration missing" >&2; exit 1; }
+            baseline_commit="$(git -C "${MLXFAST_BASELINE_WS}" rev-parse HEAD)"
+            if [[ "${baseline_commit}" != "${MLXFAST_BASELINE_COMMIT}" ]]; then
+              echo "::error::Poolside v2 baseline is ${baseline_commit}, expected ${MLXFAST_BASELINE_COMMIT}" >&2
+              exit 1
+            fi
           fi
           test -f "${MLXFAST_REFERENCE_DIR}/config.json" || { echo "::error::reference checkpoint cache missing" >&2; exit 1; }
 
@@ -388,14 +433,6 @@ jobs:
             echo "::error::semantic GPQA gate requires ORG_ANTHROPIC_API_KEY" >&2
             exit 1
           fi
-          if [[ ! "${MLXFAST_TIMED_DECODE_PROMPT_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "::error::timed decode prompt requires a pinned 64-character SHA-256 in the benchmark-private-prompts Environment" >&2
-            exit 1
-          fi
-          if [[ ! "${MLXFAST_TIMED_DECODE_PROMPT_BYTES}" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::timed decode prompt requires a positive byte-count pin in the benchmark-private-prompts Environment" >&2
-            exit 1
-          fi
 
       # setup.sh's download path is not used on this box; this replaces its
       # post-download verification. Full content hash of every checkpoint file
@@ -407,8 +444,22 @@ jobs:
           test -s "${MLXFAST_REFERENCE_MANIFEST_PATH}"
           failures=0
           checked=0
-          while read -r want_hash want_bytes rel_path; do
-            [[ -z "${want_hash}" || "${want_hash}" == \#* ]] && continue
+          checked_bytes=0
+          while IFS= read -r line || [[ -n "${line}" ]]; do
+            [[ -z "${line}" || "${line}" == \#* ]] && continue
+            read -r want_hash want_bytes rel_path extra <<< "${line}"
+            if [[ -n "${extra:-}" \
+                || ! "${want_hash:-}" =~ ^[0-9a-f]{64}$ \
+                || ! "${want_bytes:-}" =~ ^[0-9]+$ \
+                || -z "${rel_path:-}" \
+                || "${rel_path}" == /* \
+                || "${rel_path}" == *\\* \
+                || "/${rel_path}/" == *"/../"* \
+                || "/${rel_path}/" == *"/./"* ]]; then
+              echo "::error::malformed reference manifest entry" >&2
+              failures=$((failures + 1))
+              continue
+            fi
             path="${MLXFAST_REFERENCE_DIR}/${rel_path}"
             if [[ ! -f "${path}" ]]; then
               echo "::error::reference file missing: ${rel_path}" >&2
@@ -422,12 +473,15 @@ jobs:
               failures=$((failures + 1))
             fi
             checked=$((checked + 1))
+            checked_bytes=$((checked_bytes + want_bytes))
           done < "${MLXFAST_REFERENCE_MANIFEST_PATH}"
-          if [[ "${failures}" -ne 0 || "${checked}" -eq 0 ]]; then
-            echo "::error::reference checkpoint failed manifest verification (checked=${checked} failures=${failures})" >&2
+          if [[ "${failures}" -ne 0 \
+              || "${checked}" -ne 13 \
+              || "${checked_bytes}" -ne 21568905520 ]]; then
+            echo "::error::reference checkpoint failed manifest verification (checked=${checked} bytes=${checked_bytes} failures=${failures})" >&2
             exit 1
           fi
-          echo "benchmark: reference checkpoint verified against pinned manifest (${checked} files)"
+          echo "benchmark: reference checkpoint verified against pinned manifest (${checked} files, ${checked_bytes} bytes)"
 
       # Dependency checkouts for BOTH SwiftPM roots: the trusted CLI resolves
       # into .build and the participant worker into its own .build-worker
@@ -1212,9 +1266,10 @@ jobs:
           R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           # Private object keys scoped to this trusted download step only (not
-          # job-level), so untrusted bench phases never receive the object names.
-          MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/golden_prompt_benchmark_transcription_gate_english_512_256-laguna.json
-          MLXFAST_GPQA_R2_PATH: correctness_prompts/gpqa_reference_cases-laguna.json
+          # job-level), so untrusted bench phases never receive the object
+          # names. SHA-addressed names are immutable and cannot alias v1.
+          MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/hidden-golden-${{ env.MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256 }}.json
+          MLXFAST_GPQA_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/gpqa-reference-${{ env.MLXFAST_GPQA_REFERENCE_SHA256 }}.json
         run: |
           set -euo pipefail
           .github/scripts/download-r2-object.sh \
@@ -1229,7 +1284,13 @@ jobs:
           .github/scripts/download-r2-object.sh \
             "${MLXFAST_GPQA_R2_PATH}" \
             "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json"
-          echo "benchmark: raw hidden golden verified ${raw_hash} bytes=${raw_bytes}"
+          gpqa_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json" | awk '{print $1}')"
+          gpqa_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json" | tr -d ' ')"
+          if [[ "${gpqa_hash}" != "${MLXFAST_GPQA_REFERENCE_SHA256}" || "${gpqa_bytes}" != "${MLXFAST_GPQA_REFERENCE_BYTES}" ]]; then
+            echo "::error::private GPQA reference pin mismatch" >&2
+            exit 1
+          fi
+          echo "benchmark: raw hidden golden verified ${raw_hash} bytes=${raw_bytes}; GPQA reference verified ${gpqa_hash} bytes=${gpqa_bytes}"
 
       # PARITY CONTRACT: attach-gpqa-gates augments the raw golden with GPQA
       # behavior gates but MUST NOT mutate its .cases (the base teacher-forced
@@ -1596,7 +1657,7 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/timed_decode_lowsim_prose_v1-laguna.txt
+          MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/timed-prompt-${{ env.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}.txt
         run: |
           set -euo pipefail
           .github/scripts/download-r2-object.sh \

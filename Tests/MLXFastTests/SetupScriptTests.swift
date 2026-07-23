@@ -279,7 +279,7 @@ func setupAcceptsLegacyReferenceDirectoryAsItsOwnCompatibilityPath() throws {
         environment: [
             "REPO_ROOT": FileManager.default.currentDirectoryPath,
             "TEST_ROOT": root.path,
-            "MLXFAST_REFERENCE_DIR": "reference_weights/laguna-xs-2.1-4bit",
+            "MLXFAST_REFERENCE_DIR": "reference_weights/laguna-xs-2.1-nvfp4-mlx",
         ]
     )
 
@@ -822,6 +822,75 @@ func setupFallsBackWhenPrimaryReferenceDownloadFails() throws {
     #expect(requests.contains("https://primary.invalid/model.bin"))
     #expect(requests.contains("https://fallback.invalid/model.bin"))
     #expect(result.stdout.contains("trying fallback source"))
+}
+
+@Test
+func poolsideReferenceDownloadersUseSourceSpecificQueryHandling() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let fakeBin = root.appendingPathComponent("bin")
+    try FileManager.default.createDirectory(at: fakeBin, withIntermediateDirectories: true)
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("curl"),
+        contents: """
+        #!/usr/bin/env bash
+        set -euo pipefail
+        output=""
+        url=""
+        while [[ "$#" -gt 0 ]]; do
+          case "$1" in
+            --output) output="$2"; shift 2 ;;
+            http*) url="$1"; shift ;;
+            *) shift ;;
+          esac
+        done
+        printf '%s\n' "${url}" >> "${CURL_LOG}"
+        if [[ "${url}" == https://ds4.darkbloom.ai/* ]]; then
+          exit 28
+        fi
+        printf 'fallback fixture' > "${output}"
+        """
+    )
+
+    let curlLog = root.appendingPathComponent("curl.log")
+    let output = root.appendingPathComponent("setup/config.json")
+    let cache = root.appendingPathComponent("cache")
+    let manifest = root.appendingPathComponent("manifest.sha256")
+    let result = try runSetupBash(
+        """
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        download_reference_file "config.json" "${OUTPUT_PATH}"
+        [[ "$(cat "${OUTPUT_PATH}")" == "fallback fixture" ]]
+
+        fixture_hash="$(printf 'fallback fixture' | shasum -a 256 | awk '{print $1}')"
+        printf '%s 16 config.json\n' "${fixture_hash}" > "${REFERENCE_MANIFEST_PATH}"
+        "${REPO_ROOT}/.github/scripts/download-reference-cache-scope.sh" metadata
+        [[ "$(cat "${REFERENCE_DIR}/config.json")" == "fallback fixture" ]]
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "PATH": "\(fakeBin.path):/usr/bin:/bin:/usr/sbin:/sbin",
+            "CURL_LOG": curlLog.path,
+            "OUTPUT_PATH": output.path,
+            "MLXFAST_REFERENCE_DIR": cache.path,
+            "MLXFAST_REFERENCE_MANIFEST_PATH": manifest.path,
+            "MLXFAST_REFERENCE_HASH_VERIFY": "0",
+            "MLXFAST_REFERENCE_DOWNLOAD_PROGRESS_SECONDS": "1",
+            "MLXFAST_REFERENCE_DOWNLOAD_STALL_SECONDS": "1",
+            "MLXFAST_REFERENCE_DOWNLOAD_MIN_BYTES_PER_SECOND": "1",
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+    let requests = try String(contentsOf: curlLog, encoding: .utf8)
+        .split(separator: "\n")
+        .map(String.init)
+    let r2 = "https://ds4.darkbloom.ai/laguna-xs-2.1-nvfp4-mlx/config.json"
+    let hf =
+        "https://huggingface.co/poolside/Laguna-XS-2.1-NVFP4-mlx/resolve/"
+        + "841778bda563a36104dd521e37d99218e46f4f25/config.json?download=true"
+    #expect(requests == [r2, hf, r2, hf])
+    #expect(!requests.contains("\(r2)?download=true"))
 }
 
 @Test

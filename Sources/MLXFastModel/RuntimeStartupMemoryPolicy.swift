@@ -4,10 +4,10 @@ import MLX
 /// Selects a model-startup profile from the machine's physical-memory budget.
 ///
 /// Editable runtime paths may retain large alternate weight layouts in
-/// addition to the ~18.8 GiB Laguna checkpoint. The full profile is
+/// addition to the ~21.6 GB Poolside NVFP4 checkpoint. The full profile is
 /// appropriate for the 128 GiB ranked runner, but may leave too little
 /// headroom for macOS, warmup activations, KV state, and Metal buffers on the
-/// documented 36 GiB local minimum.
+/// documented 40 GiB local minimum.
 ///
 /// The low-memory feature defaults never clobber explicit settings: a flag
 /// the user already exported keeps its value (so, for example, verifying a

@@ -10,14 +10,10 @@ import MLXNN
 // `LagunaModelInner`), which is the behavior oracle for this port. It is a
 // reimplementation rather than a wrapper for two load-bearing reasons:
 //
-// 1. The pinned `mlx-community/Laguna-XS-2.1-4bit` checkpoint stores the MoE
-//    router as a quantized linear submodule (`mlp.gate.proj.{weight,scales,
-//    biases}`, 8-bit group-64) next to `mlp.gate.e_score_correction_bias`.
-//    The vendored `LagunaMoEGate` models the router as a raw
-//    `gate.weight` MLXArray (the original Poolside NVFP4 layout), so its
-//    parameter paths cannot absorb this checkpoint's router tensors.
-//    `LagunaRuntimeMoEGate` below restructures the router as a `proj`
-//    Linear child while keeping the routing math identical.
+// 1. The Poolside checkpoint stores the MoE router as a raw BF16
+//    `mlp.gate.weight` matrix next to the F32
+//    `mlp.gate.e_score_correction_bias`, while only expert projections are
+//    NVFP4. The runtime mirrors those parameter paths exactly.
 // 2. The vendored `LagunaModelInner`/`LagunaDecoderLayer` types are
 //    fileprivate and `LagunaConfiguration`'s stored properties are internal
 //    to MLXLLM, so the runtime layers (cache geometry, future fast-engine
@@ -44,9 +40,11 @@ func lagunaLastTokenHidden(_ hidden: MLXArray) -> MLXArray {
 
 /// Builds the `initializeRope` scaling dictionary for a per-type Laguna RoPE
 /// spec. For `default` RoPE only the type is consulted; for YaRN the factory
-/// reads factor / original context / betas (Laguna leaves mscale and
-/// mscale_all_dim at the shared defaults 1.0 / 0.0, which yields the vendored
-/// attention scaling of `0.1 * ln(32) + 1`).
+/// reads factor / original context / betas. The XS config also serializes
+/// `attention_factor: 1.0`, but both vendored MLX Laguna implementations
+/// intentionally ignore that Hugging Face field. Do not forward it here:
+/// leaving MLX's mscale/mscale_all_dim defaults at 1.0/0.0 yields the upstream
+/// attention scaling of `0.1 * ln(32) + 1` (~1.34657).
 func lagunaRopeScalingConfig(_ spec: LagunaRopeSpec) -> [String: StringOrNumber] {
     var scalingConfig: [String: StringOrNumber] = ["rope_type": .string(spec.type)]
     if spec.type == "yarn" {
@@ -91,8 +89,9 @@ final class LagunaRuntimeAttention: Module {
         self.nKVHeads = config.numKeyValueHeads
         self.headDim = config.headDim
         self.scale = pow(Float(headDim), -0.5)
-        self.gatingEnabled = config.gating.enabled
-        self.gatePerHead = config.gating.isPerHead
+        let layerGating = config.gatingMode(forLayer: layerIdx)
+        self.gatingEnabled = layerGating.enabled
+        self.gatePerHead = layerGating.isPerHead
 
         let layerType = config.layerType(forLayer: layerIdx)
         self.isSliding = layerType == .sliding
@@ -191,28 +190,25 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
 /// Sigmoid top-k router. The routing math mirrors the vendored
 /// `LagunaMoEGate` exactly (sigmoid scores, correction bias added only for
 /// expert CHOICE, mixture weights taken from the pre-bias scores, optional
-/// top-k renormalization). The structural difference from the vendored type
-/// is the projection: the pinned checkpoint ships the router as a quantized
-/// linear child (`gate.proj.{weight,scales,biases}`, 8-bit group-64), so the
-/// projection lives in a `proj` submodule instead of a raw `weight` array.
+/// top-k renormalization).
 final class LagunaRuntimeMoEGate: Module {
     let topK: Int
     let normTopkProb: Bool
     let routerLogitSoftcapping: Float
 
-    @ModuleInfo(key: "proj") var proj: Linear
+    @ParameterInfo(key: "weight") var weight: MLXArray
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
 
     init(_ config: LagunaConfig) {
         self.topK = config.numExpertsPerTok
         self.normTopkProb = config.normTopkProb
         self.routerLogitSoftcapping = Float(config.moeRouterLogitSoftcapping)
-        self._proj.wrappedValue = Linear(config.hiddenSize, config.numExperts, bias: false)
+        self._weight.wrappedValue = zeros([config.numExperts, config.hiddenSize])
         self._eScoreCorrectionBias.wrappedValue = zeros([config.numExperts])
     }
 
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        var logits = proj(x).asType(.float32)
+        var logits = x.matmul(weight.T).asType(.float32)
         if routerLogitSoftcapping > 0 {
             logits = tanh(logits / routerLogitSoftcapping) * routerLogitSoftcapping
         }
@@ -374,6 +370,23 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
             self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabSize, bias: false)
         }
         super.init()
+
+        // Match the vendored Poolside Laguna model exactly: only the routed
+        // experts and shared expert are NVFP4. Quantizing one sparse decoder
+        // layer at a time avoids asking Module.update to descend through the
+        // dense layer 0, which has no quantized child.
+        for layer in model.layers where layer.mlp is LagunaRuntimeSparseMoEBlock {
+            quantize(model: layer) { path, _ in
+                if path.contains("switch_mlp") || path.contains("shared_expert") {
+                    return (
+                        groupSize: config.quantization.groupSize,
+                        bits: config.quantization.bits,
+                        mode: .nvfp4
+                    )
+                }
+                return nil
+            }
+        }
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {

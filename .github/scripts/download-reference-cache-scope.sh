@@ -1,16 +1,25 @@
 #!/usr/bin/env bash
-# Download a small, manifest-verified subset of the Laguna XS 2.1 4-bit
+# Download a small, manifest-verified subset of the Poolside Laguna XS 2.1 NVFP4
 # reference checkpoint for cache experiments. The full checkpoint path
 # intentionally stays in setup.sh so full downloads keep the same
 # lock/verification behavior.
 set -euo pipefail
 
 SCOPE="${1:-}"
-REFERENCE_DIR="${MLXFAST_REFERENCE_DIR:-.cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main}"
-REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/main}"
+REFERENCE_DIR="${MLXFAST_REFERENCE_DIR:-.cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25}"
+DEFAULT_REFERENCE_BASE_URL="https://ds4.darkbloom.ai/laguna-xs-2.1-nvfp4-mlx"
+DEFAULT_REFERENCE_FALLBACK_BASE_URL="https://huggingface.co/poolside/Laguna-XS-2.1-NVFP4-mlx/resolve/841778bda563a36104dd521e37d99218e46f4f25"
+REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}"
+if [[ -n "${MLXFAST_REFERENCE_FALLBACK_BASE_URL+x}" ]]; then
+  REFERENCE_FALLBACK_BASE_URL="${MLXFAST_REFERENCE_FALLBACK_BASE_URL}"
+elif [[ "${REFERENCE_BASE_URL}" == "${DEFAULT_REFERENCE_BASE_URL}" ]]; then
+  REFERENCE_FALLBACK_BASE_URL="${DEFAULT_REFERENCE_FALLBACK_BASE_URL}"
+else
+  REFERENCE_FALLBACK_BASE_URL=""
+fi
 REFERENCE_AUTH_HEADER="${MLXFAST_REFERENCE_AUTH_HEADER:-}"
 REFERENCE_APPEND_DOWNLOAD_QUERY="${MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY:-auto}"
-REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_laguna_xs_2_1_4bit.sha256}"
+REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256}"
 
 usage() {
   cat >&2 <<EOF
@@ -124,58 +133,84 @@ file_is_current() {
 download_file() {
   local relative_path="$1"
   local output_path="${REFERENCE_DIR}/${relative_path}"
+  local base_url
   local url
-  local attempt=1
+  local attempt
+  local curl_status
+  local source_index=0
+  local source_count
+  local base_urls=("${REFERENCE_BASE_URL}")
 
   if file_is_current "${relative_path}" "${output_path}"; then
     echo "cache-probe: using cached ${relative_path}"
     return 0
   fi
 
-  url="$(download_url_for_file "${REFERENCE_BASE_URL%/}/${relative_path}")"
+  if [[ -n "${REFERENCE_FALLBACK_BASE_URL}" && "${REFERENCE_FALLBACK_BASE_URL}" != "${REFERENCE_BASE_URL}" ]]; then
+    base_urls+=("${REFERENCE_FALLBACK_BASE_URL}")
+  fi
+  source_count="${#base_urls[@]}"
   mkdir -p "$(dirname "${output_path}")"
 
-  while [[ "${attempt}" -le 2 ]]; do
-    if [[ "${attempt}" == "1" ]]; then
-      echo "cache-probe: downloading ${relative_path}"
-    else
-      echo "cache-probe: redownloading ${relative_path} after verification failed"
+  for base_url in "${base_urls[@]}"; do
+    source_index=$((source_index + 1))
+    url="$(download_url_for_file "${base_url%/}/${relative_path}")"
+    if [[ "${source_index}" -gt 1 ]]; then
+      echo "cache-probe: trying fallback source for ${relative_path}: ${base_url}"
+    fi
+
+    attempt=1
+    while [[ "${attempt}" -le 2 ]]; do
+      if [[ "${attempt}" == "1" ]]; then
+        echo "cache-probe: downloading ${relative_path}"
+      else
+        echo "cache-probe: redownloading ${relative_path} after verification failed"
+        rm -f "${output_path}"
+      fi
+
+      curl_status=0
+      if [[ "${source_index}" == "1" && -n "${REFERENCE_AUTH_HEADER}" ]]; then
+        curl \
+          --fail \
+          --location \
+          --retry 5 \
+          --retry-all-errors \
+          --retry-delay 2 \
+          --continue-at - \
+          --silent \
+          --show-error \
+          -H "${REFERENCE_AUTH_HEADER}" \
+          --output "${output_path}" \
+          "${url}" || curl_status=$?
+      else
+        curl \
+          --fail \
+          --location \
+          --retry 5 \
+          --retry-all-errors \
+          --retry-delay 2 \
+          --continue-at - \
+          --silent \
+          --show-error \
+          --output "${output_path}" \
+          "${url}" || curl_status=$?
+      fi
+
+      if [[ "${curl_status}" != "0" ]]; then
+        echo "cache-probe: source failed (status=${curl_status}, source=${base_url})" >&2
+        break
+      fi
+      if file_is_current "${relative_path}" "${output_path}"; then
+        echo "cache-probe: verified ${relative_path}"
+        return 0
+      fi
+
+      attempt=$((attempt + 1))
+    done
+
+    if [[ "${source_index}" -lt "${source_count}" && "${curl_status}" == "0" ]]; then
       rm -f "${output_path}"
     fi
-
-    if [[ -n "${REFERENCE_AUTH_HEADER}" ]]; then
-      curl \
-        --fail \
-        --location \
-        --retry 5 \
-        --retry-all-errors \
-        --retry-delay 2 \
-        --continue-at - \
-        --silent \
-        --show-error \
-        -H "${REFERENCE_AUTH_HEADER}" \
-        --output "${output_path}" \
-        "${url}"
-    else
-      curl \
-        --fail \
-        --location \
-        --retry 5 \
-        --retry-all-errors \
-        --retry-delay 2 \
-        --continue-at - \
-        --silent \
-        --show-error \
-        --output "${output_path}" \
-        "${url}"
-    fi
-
-    if file_is_current "${relative_path}" "${output_path}"; then
-      echo "cache-probe: verified ${relative_path}"
-      return 0
-    fi
-
-    attempt=$((attempt + 1))
   done
 
   echo "cache-probe: failed to download verified ${relative_path}" >&2

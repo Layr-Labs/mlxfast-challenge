@@ -658,6 +658,7 @@ private enum MLXFastCLI {
         )
         let merged = GoldenDocument(
             version: golden.version ?? 1,
+            modelProvenance: golden.modelProvenance,
             cases: golden.cases,
             correctnessGates: mergedGates,
             benchmark: golden.benchmark
@@ -819,6 +820,7 @@ private enum MLXFastCLI {
         )
         let merged = GoldenDocument(
             version: golden.version ?? 1,
+            modelProvenance: golden.modelProvenance,
             cases: golden.cases,
             correctnessGates: mergedGates,
             benchmark: golden.benchmark
@@ -920,6 +922,10 @@ private enum MLXFastCLI {
 
         let document = GoldenDocument(
             version: 1,
+            modelProvenance: GoldenModelProvenance(
+                repository: MLXFastConstants.referenceModelRepository,
+                revision: MLXFastConstants.referenceModelRevision
+            ),
             cases: [
                 GoldenCase(
                     name: caseName,
@@ -1868,7 +1874,7 @@ private enum MLXFastCLI {
               mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]
               mlxfast-swift checkpoint-shards --index PATH
 
-            Swift-only Poolside Laguna XS 2.1 4-bit harness entrypoint.
+            Swift-only Poolside Laguna XS 2.1 NVFP4 harness entrypoint.
             """
         )
     }

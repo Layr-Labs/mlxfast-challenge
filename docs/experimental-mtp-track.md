@@ -1,9 +1,11 @@
 # Poolside Laguna XS 2.1 MTP Track (RETIRED)
 
 > **RETIRED (2026-07-21).** The MTP track was dropped before going live for
-> Laguna. The serial track (`laguna-xs-2.1-serial-v1`) is now the default —
-> and only — ranked track: `benchmark.json` registers it and
-> `.github/workflows/benchmark.yml` is the serial ranked pipeline. The MTP
+> Laguna. This document intentionally records the then-current
+> `mlx-community` affine target and `laguna-xs-2.1-serial-v1` namespace. The
+> current and only ranked track is the independently versioned Poolside
+> NVFP4 contract, `laguna-xs-2.1-serial-v2`; `benchmark.json` and
+> `.github/workflows/benchmark.yml` are authoritative. The MTP
 > manifests (`benchmark.mtp.json` and the MTP-shaped `benchmark.json`), the
 > contract fixture (`fixtures/laguna_xs_2_1_mtp_track.json`), the MTP weight
 > manifests, and the local scripts (`setup-mtp.sh`, `benchmark-mtp.sh`) have

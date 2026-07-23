@@ -2,20 +2,16 @@
 # Bootstrap system tools and build the Swift-only Laguna harness.
 set -euo pipefail
 
-REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-mlx-community/Laguna-XS-2.1-4bit}"
-REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-main}"
+REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-poolside/Laguna-XS-2.1-NVFP4-mlx}"
+REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-841778bda563a36104dd521e37d99218e46f4f25}"
 REFERENCE_CACHE_REPO_DIR="models--${REFERENCE_MODEL_REPO//\//--}"
 REFERENCE_CACHE_REVISION_DIR="${REFERENCE_REVISION//\//--}"
-# No organizer-hosted mirror exists yet for this checkpoint; default to the
-# pinned Hugging Face revision as primary (the manifest pins every byte) with
-# the repo's main branch as fallback.
-# TODO(operator): add a Darkbloom R2 mirror and make it the primary once it is
-# provisioned, keeping this Hugging Face URL as the fallback.
-# download_url_for_file appends
-# "?download=true" automatically for huggingface.co URLs so that resolves to
-# the raw LFS/Xet bytes.
-DEFAULT_REFERENCE_BASE_URL="https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/c42e0a8f8d504ceacde015a535dcb286d65c8799"
-DEFAULT_REFERENCE_FALLBACK_BASE_URL="https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/main"
+# The organizer's public Darkbloom R2 mirror is primary. It serves the exact
+# Poolside NVFP4 revision pinned below; failed or stalled transfers fall back
+# to that same immutable Hugging Face revision. download_url_for_file appends
+# "?download=true" only for huggingface.co URLs.
+DEFAULT_REFERENCE_BASE_URL="https://ds4.darkbloom.ai/laguna-xs-2.1-nvfp4-mlx"
+DEFAULT_REFERENCE_FALLBACK_BASE_URL="https://huggingface.co/poolside/Laguna-XS-2.1-NVFP4-mlx/resolve/841778bda563a36104dd521e37d99218e46f4f25"
 REFERENCE_BASE_URL="${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}"
 if [[ -n "${MLXFAST_REFERENCE_FALLBACK_BASE_URL+x}" ]]; then
   REFERENCE_FALLBACK_BASE_URL="${MLXFAST_REFERENCE_FALLBACK_BASE_URL}"
@@ -26,7 +22,7 @@ else
 fi
 REFERENCE_AUTH_HEADER="${MLXFAST_REFERENCE_AUTH_HEADER:-}"
 REFERENCE_APPEND_DOWNLOAD_QUERY="${MLXFAST_REFERENCE_APPEND_DOWNLOAD_QUERY:-auto}"
-REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_laguna_xs_2_1_4bit.sha256}"
+REFERENCE_MANIFEST_PATH="${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256}"
 REFERENCE_HASH_VERIFY="${MLXFAST_REFERENCE_HASH_VERIFY:-1}"
 REFERENCE_POST_DOWNLOAD_FULL_VERIFY="${MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY:-1}"
 REFERENCE_MIN_FREE_GIB="${MLXFAST_REFERENCE_MIN_FREE_GIB:-40}"
@@ -55,7 +51,7 @@ SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
 # next to the worker binary, where Cmlx searches first.
 RUNTIME_WORKER_BIN="${MLXFAST_RUNTIME_WORKER_EXECUTABLE:-.build-worker/release/mlxfast-runtime-worker}"
 MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$(dirname "${RUNTIME_WORKER_BIN}")/mlx.metallib}"
-DEFAULT_REFERENCE_DIR="reference_weights/laguna-xs-2.1-4bit"
+DEFAULT_REFERENCE_DIR="reference_weights/laguna-xs-2.1-nvfp4-mlx"
 DEFAULT_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}"
 DEFAULT_HF_HUB_CACHE="${MLXFAST_HF_HUB_CACHE:-${HF_HUB_CACHE:-${DEFAULT_HF_HOME}/hub}}"
 REFERENCE_CACHE_DIR="${MLXFAST_REFERENCE_CACHE_DIR:-${DEFAULT_HF_HUB_CACHE}/${REFERENCE_CACHE_REPO_DIR}/snapshots/${REFERENCE_CACHE_REVISION_DIR}}"
@@ -101,14 +97,12 @@ REFERENCE_VERIFIED_EXPECTED_HASH=""
 REFERENCE_VERIFIED_EXPECTED_SIZE=""
 REFERENCE_VERIFIED_FILE_MANIFEST_HASH=""
 REFERENCE_REQUIRED_METADATA_FILES=(
-  "config.json"
-  "model.safetensors.index.json"
-)
-REFERENCE_OPTIONAL_METADATA_FILES=(
+  ".gitattributes"
+  "LICENSE.md"
   "README.md"
   "chat_template.jinja"
-  "generation_config.json"
-  "special_tokens_map.json"
+  "config.json"
+  "model.safetensors.index.json"
   "tokenizer.json"
   "tokenizer_config.json"
 )
@@ -118,7 +112,7 @@ print_help() {
 Usage: ./setup.sh
 
 Checks the local macOS/Apple Silicon toolchain, builds the Swift harness,
-builds mlx.metallib, and downloads the Laguna XS 2.1 4-bit reference
+builds mlx.metallib, and downloads the Poolside Laguna XS 2.1 NVFP4 reference
 checkpoint when it is not already present.
 
 Important environment variables:
@@ -1503,18 +1497,6 @@ download_reference_file() {
   return 1
 }
 
-download_optional_reference_file() {
-  local file="$1"
-  local output_path="$2"
-
-  if download_reference_file "${file}" "${output_path}"; then
-    return 0
-  fi
-
-  rm -f "${output_path}" "${output_path}.partial" "${output_path}.complete"
-  echo "setup.sh: optional metadata ${file} was not available; continuing"
-}
-
 reference_download_on_disk_bytes() {
   local output_dir="$1"
   shift
@@ -1540,7 +1522,7 @@ reference_download_on_disk_bytes() {
 }
 
 start_reference_download_heartbeat() {
-  # A cold checkpoint download is ~17 GiB and the parallel per-shard curls run
+  # A cold checkpoint download is ~20 GiB and the parallel per-shard curls run
   # silenced, which used to mean 10+ minutes with no output at all. This
   # heartbeat is the single progress reporter for the parallel shard phase:
   # every REFERENCE_DOWNLOAD_PROGRESS_SECONDS it sums the on-disk shard bytes
@@ -3043,13 +3025,14 @@ download_reference_weights_locked() {
   ensure_reference_space "${parent_dir}" || return 1
   mkdir -p "${reference_dir}" || return 1
 
-  echo "setup.sh: downloading ${REFERENCE_MODEL_REPO} from ${REFERENCE_BASE_URL}"
+  echo "setup.sh: downloading ${REFERENCE_MODEL_REPO}@${REFERENCE_REVISION}"
+  echo "setup.sh: primary reference source ${REFERENCE_BASE_URL}"
+  if [[ -n "${REFERENCE_FALLBACK_BASE_URL}" ]]; then
+    echo "setup.sh: fallback reference source ${REFERENCE_FALLBACK_BASE_URL}"
+  fi
   echo "setup.sh: reference cache path ${reference_dir}"
   for file in "${REFERENCE_REQUIRED_METADATA_FILES[@]}"; do
     download_reference_file "${file}" "${reference_dir}/${file}" || return 1
-  done
-  for file in "${REFERENCE_OPTIONAL_METADATA_FILES[@]}"; do
-    download_optional_reference_file "${file}" "${reference_dir}/${file}"
   done
 
   if [[ ! -f "${reference_dir}/config.json" ]]; then

@@ -4,18 +4,15 @@ import MLXFastCore
 import MLXLMCommon
 import MLXNN
 
-/// Tensor name helpers for the Laguna text tower. The transform keeps the
-/// source checkpoint's tensor names (including the `language_model.model.`
-/// prefix) unchanged when it copies text-tower tensors into the transformed
-/// weights tree, so the loader can address them directly without a rename
-/// pass. See `docs/laguna-weight-contract.md` for the full key scheme,
-/// shapes, and quantization layout the transform must produce.
+/// Tensor name helpers for the Poolside Laguna text tower. The source
+/// checkpoint is already text-only and uses the runtime-native `model.*` /
+/// `lm_head.*` names, which the transform preserves unchanged.
 public enum LagunaWeightNames {
-    private static let prefix = "language_model.model"
+    private static let prefix = "model"
 
     public static let embedTokens = "\(prefix).embed_tokens.weight"
     public static let finalNorm = "\(prefix).norm.weight"
-    public static let lmHead = "language_model.lm_head.weight"
+    public static let lmHead = "lm_head.weight"
 
     public static func layer(_ layerIndex: Int, _ suffix: String) -> String {
         "\(prefix).layers.\(layerIndex).\(suffix)"
@@ -48,22 +45,62 @@ public struct LagunaWeightLoader {
     }
 
     public func validateRequiredMetadata(config: LagunaConfig) throws {
-        try validateQuantizedTensorMetadata(
+        let tensorNames = denseStore.tensorNames
+        let forbiddenSuffixes = [
+            ".weight_packed",
+            ".input_global_scale",
+            ".weight_global_scale",
+            ".k_scale",
+            ".v_scale",
+            ".biases",
+        ]
+        if let forbiddenName = tensorNames.first(where: { name in
+            forbiddenSuffixes.contains(where: name.hasSuffix)
+        }) {
+            throw MLXFastError.invalidInput(
+                "Poolside Laguna MLX checkpoint must not contain compressed-tensors/global-scale, "
+                    + "FP8 KV-scale, or affine-bias tensor \(forbiddenName)"
+            )
+        }
+        guard tensorNames.count == LagunaConstants.tensorCount else {
+            throw MLXFastError.invalidInput(
+                "Poolside Laguna tensor inventory contains \(tensorNames.count) tensors; "
+                    + "expected exactly \(LagunaConstants.tensorCount)"
+            )
+        }
+        var dtypeCounts: [String: Int] = [:]
+        for name in tensorNames {
+            guard let record = denseStore.record(named: name) else {
+                throw MLXFastError.invalidInput("dense tensor not found: \(name)")
+            }
+            dtypeCounts[record.dtype, default: 0] += 1
+        }
+        let expectedDTypeCounts = [
+            "BF16": LagunaConstants.bfloat16TensorCount,
+            "F32": LagunaConstants.float32TensorCount,
+            "U32": LagunaConstants.packedUInt32TensorCount,
+            "U8": LagunaConstants.e4m3ScaleUInt8TensorCount,
+        ]
+        guard dtypeCounts == expectedDTypeCounts else {
+            throw MLXFastError.invalidInput(
+                "Poolside Laguna tensor dtype inventory \(dtypeCounts) does not match "
+                    + "expected \(expectedDTypeCounts)"
+            )
+        }
+
+        try validateBFloat16ProjectionMetadata(
             named: LagunaWeightNames.embedTokens,
-            expectedLeadingShape: [config.vocabSize],
-            expectedInputFeatures: config.hiddenSize,
-            quantization: config.quantization
+            expectedShape: [config.vocabSize, config.hiddenSize]
         )
         try validateDenseTensorMetadata(
             named: LagunaWeightNames.finalNorm,
-            expectedShape: [config.hiddenSize]
+            expectedShape: [config.hiddenSize],
+            expectedDType: "BF16"
         )
         if !config.tieWordEmbeddings {
-            try validateQuantizedTensorMetadata(
+            try validateBFloat16ProjectionMetadata(
                 named: LagunaWeightNames.lmHead,
-                expectedLeadingShape: [config.vocabSize],
-                expectedInputFeatures: config.hiddenSize,
-                quantization: config.quantization
+                expectedShape: [config.vocabSize, config.hiddenSize]
             )
         }
 
@@ -73,84 +110,79 @@ public struct LagunaWeightLoader {
             for suffix in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
                 try validateDenseTensorMetadata(
                     named: LagunaWeightNames.layer(layerIndex, suffix),
-                    expectedShape: [config.hiddenSize]
+                    expectedShape: [config.hiddenSize],
+                    expectedDType: "BF16"
                 )
             }
 
-            try validateQuantizedTensorMetadata(
+            try validateBFloat16ProjectionMetadata(
                 named: LagunaWeightNames.attention(layerIndex, "q_proj.weight"),
-                expectedLeadingShape: [layerHeads * config.headDim],
-                expectedInputFeatures: config.hiddenSize,
-                quantization: config.quantization
+                expectedShape: [layerHeads * config.headDim, config.hiddenSize]
             )
             for suffix in ["k_proj.weight", "v_proj.weight"] {
-                try validateQuantizedTensorMetadata(
+                try validateBFloat16ProjectionMetadata(
                     named: LagunaWeightNames.attention(layerIndex, suffix),
-                    expectedLeadingShape: [config.numKeyValueHeads * config.headDim],
-                    expectedInputFeatures: config.hiddenSize,
-                    quantization: config.quantization
+                    expectedShape: [
+                        config.numKeyValueHeads * config.headDim,
+                        config.hiddenSize,
+                    ]
                 )
             }
-            try validateQuantizedTensorMetadata(
+            try validateBFloat16ProjectionMetadata(
                 named: LagunaWeightNames.attention(layerIndex, "o_proj.weight"),
-                expectedLeadingShape: [config.hiddenSize],
-                expectedInputFeatures: layerHeads * config.headDim,
-                quantization: config.quantization
+                expectedShape: [config.hiddenSize, layerHeads * config.headDim]
             )
             if let gateDim = config.gateProjectionOutputDim(forLayer: layerIndex) {
-                try validateQuantizedTensorMetadata(
+                try validateBFloat16ProjectionMetadata(
                     named: LagunaWeightNames.attention(layerIndex, "g_proj.weight"),
-                    expectedLeadingShape: [gateDim],
-                    expectedInputFeatures: config.hiddenSize,
-                    quantization: config.quantization
+                    expectedShape: [gateDim, config.hiddenSize]
                 )
             }
             for suffix in ["q_norm.weight", "k_norm.weight"] {
                 try validateDenseTensorMetadata(
                     named: LagunaWeightNames.attention(layerIndex, suffix),
-                    expectedShape: [config.headDim]
+                    expectedShape: [config.headDim],
+                    expectedDType: "BF16"
                 )
             }
 
             if config.isSparse(layer: layerIndex) {
-                // Router: quantized linear child plus a raw correction bias.
-                // The pinned checkpoint stores the router at 8 bits via a
-                // per-tensor override in the config's quantization block.
-                try validateQuantizedTensorMetadata(
-                    named: LagunaWeightNames.mlp(layerIndex, "gate.proj.weight"),
-                    expectedLeadingShape: [config.numExperts],
-                    expectedInputFeatures: config.hiddenSize,
-                    quantization: config.quantization
+                // Poolside keeps routing in full precision; only expert
+                // projections carry NVFP4 companions.
+                try validateBFloat16ProjectionMetadata(
+                    named: LagunaWeightNames.mlp(layerIndex, "gate.weight"),
+                    expectedShape: [config.numExperts, config.hiddenSize]
                 )
                 try validateDenseTensorMetadata(
                     named: LagunaWeightNames.mlp(layerIndex, "gate.e_score_correction_bias"),
-                    expectedShape: [config.numExperts]
+                    expectedShape: [config.numExperts],
+                    expectedDType: "F32"
                 )
                 // Routed experts: SwitchGLU-stacked tensors with a leading
                 // experts axis.
                 for suffix in ["switch_mlp.gate_proj.weight", "switch_mlp.up_proj.weight"] {
-                    try validateQuantizedTensorMetadata(
+                    try validateNVFP4TensorMetadata(
                         named: LagunaWeightNames.mlp(layerIndex, suffix),
                         expectedLeadingShape: [config.numExperts, config.moeIntermediateSize],
                         expectedInputFeatures: config.hiddenSize,
                         quantization: config.quantization
                     )
                 }
-                try validateQuantizedTensorMetadata(
+                try validateNVFP4TensorMetadata(
                     named: LagunaWeightNames.mlp(layerIndex, "switch_mlp.down_proj.weight"),
                     expectedLeadingShape: [config.numExperts, config.hiddenSize],
                     expectedInputFeatures: config.moeIntermediateSize,
                     quantization: config.quantization
                 )
                 for suffix in ["shared_expert.gate_proj.weight", "shared_expert.up_proj.weight"] {
-                    try validateQuantizedTensorMetadata(
+                    try validateNVFP4TensorMetadata(
                         named: LagunaWeightNames.mlp(layerIndex, suffix),
                         expectedLeadingShape: [config.sharedExpertIntermediateSize],
                         expectedInputFeatures: config.hiddenSize,
                         quantization: config.quantization
                     )
                 }
-                try validateQuantizedTensorMetadata(
+                try validateNVFP4TensorMetadata(
                     named: LagunaWeightNames.mlp(layerIndex, "shared_expert.down_proj.weight"),
                     expectedLeadingShape: [config.hiddenSize],
                     expectedInputFeatures: config.sharedExpertIntermediateSize,
@@ -158,44 +190,77 @@ public struct LagunaWeightLoader {
                 )
             } else {
                 for suffix in ["gate_proj.weight", "up_proj.weight"] {
-                    try validateQuantizedTensorMetadata(
+                    try validateBFloat16ProjectionMetadata(
                         named: LagunaWeightNames.mlp(layerIndex, suffix),
-                        expectedLeadingShape: [config.intermediateSize],
-                        expectedInputFeatures: config.hiddenSize,
-                        quantization: config.quantization
+                        expectedShape: [config.intermediateSize, config.hiddenSize]
                     )
                 }
-                try validateQuantizedTensorMetadata(
+                try validateBFloat16ProjectionMetadata(
                     named: LagunaWeightNames.mlp(layerIndex, "down_proj.weight"),
-                    expectedLeadingShape: [config.hiddenSize],
-                    expectedInputFeatures: config.intermediateSize,
-                    quantization: config.quantization
+                    expectedShape: [config.hiddenSize, config.intermediateSize]
+                )
+            }
+        }
+
+        var expectedTensorCount = config.tieWordEmbeddings ? 2 : 3
+        for layerIndex in 0..<config.numHiddenLayers {
+            // Layer norms (2), q/k/v/o projections (4), q/k norms (2),
+            // and the Poolside per-head gate projection (1).
+            expectedTensorCount += 8
+            if config.gateProjectionOutputDim(forLayer: layerIndex) != nil {
+                expectedTensorCount += 1
+            }
+            // Sparse layers have two router tensors plus six NVFP4
+            // projections, each represented by weight + scales. Layer 0 is
+            // the sole dense three-projection MLP.
+            expectedTensorCount += config.isSparse(layer: layerIndex) ? 14 : 3
+        }
+        guard expectedTensorCount == LagunaConstants.tensorCount else {
+            throw MLXFastError.invalidInput(
+                "internal Poolside Laguna tensor contract computed \(expectedTensorCount) tensors; "
+                    + "expected \(LagunaConstants.tensorCount)"
+            )
+        }
+    }
+
+    /// Validates a plain tensor's exact dtype and shape without materializing it.
+    private func validateDenseTensorMetadata(
+        named name: String,
+        expectedShape: [Int],
+        expectedDType: String
+    ) throws {
+        guard let record = denseStore.record(named: name) else {
+            throw MLXFastError.invalidInput("dense tensor not found: \(name)")
+        }
+        guard record.dtype == expectedDType, record.shape == expectedShape else {
+            throw MLXFastError.invalidInput(
+                "tensor \(name) dtype/shape \(record.dtype) \(record.shape) does not match expected \(expectedDType) \(expectedShape)"
+            )
+        }
+    }
+
+    private func validateBFloat16ProjectionMetadata(
+        named name: String,
+        expectedShape: [Int]
+    ) throws {
+        try validateDenseTensorMetadata(
+            named: name,
+            expectedShape: expectedShape,
+            expectedDType: "BF16"
+        )
+        for suffix in ["scales", "biases"] {
+            let companionName = Self.companionName(for: name, suffix: suffix)
+            guard denseStore.record(named: companionName) == nil else {
+                throw MLXFastError.invalidInput(
+                    "BF16 Poolside projection \(name) must not contain \(companionName)"
                 )
             }
         }
     }
 
-    /// Validates a plain (non-quantized) dense tensor's shape without
-    /// materializing it.
-    private func validateDenseTensorMetadata(named name: String, expectedShape: [Int]) throws {
-        guard let record = denseStore.record(named: name) else {
-            throw MLXFastError.invalidInput("dense tensor not found: \(name)")
-        }
-        guard record.shape == expectedShape else {
-            throw MLXFastError.invalidInput(
-                "tensor \(name) shape \(record.shape) does not match expected shape \(expectedShape)"
-            )
-        }
-    }
-
-    /// Validates an affine-quantized tensor and its `.scales`/`.biases`
-    /// companions against the exact expected geometry. `expectedLeadingShape`
-    /// is `[rows]` for ordinary projections and `[experts, rows]` for the
-    /// SwitchGLU-stacked expert tensors; the trailing axis is the packed
-    /// (weight) or grouped (scales/biases) input dimension. Group size and
-    /// bit width come from the config's quantization spec, resolved through
-    /// its per-tensor overrides (the router gate is 8-bit).
-    private func validateQuantizedTensorMetadata(
+    /// Validates a Poolside NVFP4 expert tensor: packed U32 codes, one U8
+    /// E4M3 scale per 16 inputs, and no affine-bias companion.
+    private func validateNVFP4TensorMetadata(
         named name: String,
         expectedLeadingShape: [Int],
         expectedInputFeatures: Int,
@@ -203,13 +268,14 @@ public struct LagunaWeightLoader {
     ) throws {
         let (groupSize, bits) = quantization.expected(forTensorStem: Self.tensorStem(name))
         guard expectedInputFeatures > 0,
-              groupSize > 0,
-              bits > 0,
+              quantization.mode == LagunaConstants.quantizationMode,
+              groupSize == LagunaConstants.quantizationGroupSize,
+              bits == LagunaConstants.quantizationBits,
               (expectedInputFeatures * bits).isMultiple(of: 32),
               expectedInputFeatures.isMultiple(of: groupSize)
         else {
             throw MLXFastError.invalidInput(
-                "quantized tensor \(name) logical input \(expectedInputFeatures) is incompatible with group size \(groupSize) and bits \(bits)"
+                "NVFP4 tensor \(name) logical input \(expectedInputFeatures) is incompatible with 4-bit group size 16"
             )
         }
         guard let record = denseStore.record(named: name) else {
@@ -227,24 +293,23 @@ public struct LagunaWeightLoader {
             )
         }
 
+        let scalesName = Self.companionName(for: name, suffix: "scales")
+        guard let scales = denseStore.record(named: scalesName) else {
+            throw MLXFastError.invalidInput(
+                "NVFP4 tensor \(name) is missing U8 scales \(scalesName)"
+            )
+        }
         let expectedCompanionShape = expectedLeadingShape + [expectedInputFeatures / groupSize]
-        for suffix in ["scales", "biases"] {
-            let companionName = Self.companionName(for: name, suffix: suffix)
-            guard let companion = denseStore.record(named: companionName) else {
-                throw MLXFastError.invalidInput(
-                    "quantized tensor \(name) is missing companion \(companionName)"
-                )
-            }
-            guard companion.dtype == "BF16" else {
-                throw MLXFastError.invalidInput(
-                    "quantized tensor \(name) \(suffix) must use BF16, found \(companion.dtype)"
-                )
-            }
-            guard companion.shape == expectedCompanionShape else {
-                throw MLXFastError.invalidInput(
-                    "quantized tensor \(name) \(suffix) shape \(companion.shape) does not match expected shape \(expectedCompanionShape)"
-                )
-            }
+        guard scales.dtype == "U8", scales.shape == expectedCompanionShape else {
+            throw MLXFastError.invalidInput(
+                "NVFP4 tensor \(name) scales dtype/shape \(scales.dtype) \(scales.shape) does not match expected U8 \(expectedCompanionShape)"
+            )
+        }
+        let biasesName = Self.companionName(for: name, suffix: "biases")
+        guard denseStore.record(named: biasesName) == nil else {
+            throw MLXFastError.invalidInput(
+                "NVFP4 tensor \(name) must not contain affine biases \(biasesName)"
+            )
         }
     }
 
@@ -261,8 +326,8 @@ public struct LagunaWeightLoader {
 }
 
 /// Eagerly-prepared, RAM-resident weight cache for the Laguna text tower. The
-/// whole 4-bit checkpoint (~18.8 GB) is loaded once at construction time (outside
-/// every scored window -- the runtime worker builds this before the
+/// whole Poolside NVFP4 checkpoint (~21.6 GB) is loaded once at construction
+/// time (outside every scored window -- the runtime worker builds this before the
 /// benchmark protocol handshake), so every scored forward pays no dense
 /// loads or quantized-module construction. All expert tensors are
 /// RAM-resident SwitchGLU stacks; there is no expert streaming or residency
@@ -354,19 +419,13 @@ public final class LagunaRuntimeWeightCache {
 
     /// Construct and weight-load the Laguna runtime model from the
     /// transformed weights tree. Mirrors the library's `loadWeights`
-    /// pipeline (sanitize -> affine quantize -> update -> eval) while
+    /// pipeline (sanitize -> NVFP4 module wiring -> update -> eval) while
     /// streaming each tensor from its shard into MLX-owned storage and
-    /// stripping the checkpoint's `language_model.` text-tower prefix (the
-    /// transform preserves source names; the module tree's parameter paths
-    /// start at `model.` / `lm_head`).
+    /// preserving its runtime-native `model.*` / `lm_head.*` parameter paths.
     ///
-    /// Quantization geometry is derived per module from the loaded tensors
-    /// themselves: a module is promoted to its quantized twin exactly when a
-    /// matching `.scales` tensor exists, with the bit width recovered from
-    /// the packed U32 width (`packed * 32 / inputFeatures`). This yields
-    /// 4-bit group-64 everywhere except the sparse layers' 8-bit router
-    /// gates -- the same per-tensor layout `validateRequiredMetadata`
-    /// enforced against the config's quantization overrides just before.
+    /// `LagunaRuntimeModel` promotes exactly each sparse layer's routed/shared
+    /// expert projections to NVFP4 during construction. All attention,
+    /// embedding, dense-MLP, router, and vocabulary-head modules stay BF16.
     private static func loadLibraryModel(
         loader: LagunaWeightLoader,
         config: LagunaConfig
@@ -376,22 +435,8 @@ public final class LagunaRuntimeWeightCache {
 
         let loadedWeights = try loadRuntimeWeightArrays(denseStore: loader.denseStore)
         let sanitized = model.sanitize(weights: loadedWeights)
-        let groupSize = config.quantization.groupSize
-        quantize(model: model) {
-            (path: String, _: Module) -> (groupSize: Int, bits: Int, mode: QuantizationMode)? in
-            guard let scales = sanitized["\(path).scales"],
-                  let packedWeight = sanitized["\(path).weight"]
-            else {
-                return nil
-            }
-            let inputFeatures = scales.dim(-1) * groupSize
-            let bits = packedWeight.dim(-1) * 32 / inputFeatures
-            return (groupSize: groupSize, bits: bits, mode: .affine)
-        }
-        // The mlx-community Laguna checkpoint already stores scales/biases
-        // and norms in bf16 (only the packed codes are U32), so the
-        // library's fp16->bf16 conversion pass is a no-op here and is
-        // intentionally omitted.
+        // Poolside stores dense parameters in BF16 and NVFP4 scales in U8, so
+        // the library's fp16->bf16 conversion pass is a no-op and is omitted.
         try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
         eval(model)
         return model

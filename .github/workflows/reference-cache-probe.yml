@@ -17,13 +17,13 @@ on:
         default: "manual-v1"
         type: string
       reference_base_url:
-        description: "Optional HTTP base URL for reference checkpoint files. Defaults to the public Hugging Face mirror."
+        description: "Optional HTTP base URL for reference checkpoint files. Defaults to the public organizer R2 mirror."
         required: false
         type: string
       reference_download_jobs:
         description: "Parallel shard downloads for setup.sh when cache_scope=full."
         required: false
-        default: "8"
+        default: "3"
         type: string
       reference_min_free_gib:
         description: "Minimum free GiB required before full reference checkpoint download."
@@ -58,8 +58,8 @@ jobs:
     runs-on: blacksmith-12vcpu-macos-26
     timeout-minutes: 120
     env:
-      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main
-      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_4bit.sha256
+      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256
       # Secret-free by design -- this dispatch-time workflow runs setup.sh and
       # the download script FROM THE DISPATCHED REF with no approval
       # environment gate and no modifiable-surface guard, so it must never be
@@ -70,9 +70,9 @@ jobs:
       # since-retired parallel-correctness probe workflows. Removed: the probe
       # exists to test the cache backend, not the private mirror, and both setup.sh and
       # download-reference-cache-scope.sh verify every byte against the pinned
-      # manifest, so the public Hugging Face mirror (no auth header) is fully
-      # sufficient.
-      MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || 'https://huggingface.co/mlx-community/Laguna-XS-2.1-4bit/resolve/main' }}
+      # manifest, so the public organizer R2 mirror and immutable public
+      # Hugging Face fallback (neither needs an auth header) are sufficient.
+      MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || 'https://ds4.darkbloom.ai/laguna-xs-2.1-nvfp4-mlx' }}
       MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
       MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
       MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
@@ -100,7 +100,7 @@ jobs:
 
           manifest_hash="$(shasum -a 256 "${MLXFAST_REFERENCE_MANIFEST_PATH}" | awk '{print $1}')"
           safe_suffix="$(printf '%s' "${CACHE_KEY_SUFFIX}" | tr -c 'A-Za-z0-9_.-' '-')"
-          cache_key="laguna-xs-2.1-4bit-${CACHE_SCOPE}-${manifest_hash}-${safe_suffix}"
+          cache_key="laguna-xs-2.1-nvfp4-mlx-${CACHE_SCOPE}-${manifest_hash}-${safe_suffix}"
           echo "key=${cache_key}" >> "${GITHUB_OUTPUT}"
           echo "manifest_hash=${manifest_hash}" >> "${GITHUB_OUTPUT}"
 

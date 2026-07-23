@@ -35,13 +35,17 @@ struct DefaultTrackTests {
         ))
 
         // Serial ranked identity: the serial measure wrapper, stable bench
-        // workspace, pinned baseline tree, calibration, and the frozen
+        // v2 workspace, pinned baseline tree, calibration, and the frozen
         // prefill+decode floors.
         #expect(workflow.contains("MLXFAST_MEASURE_JOB: /opt/bench-runner/measure-job.sh"))
-        #expect(workflow.contains("MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-current"))
-        #expect(workflow.contains("MLXFAST_BASELINE_WS: /opt/bench-runner/baseline/current"))
         #expect(workflow.contains(
-            "MLXFAST_BASELINE_CALIBRATION: /opt/bench-runner/state/baseline-calibration.json"
+            "MLXFAST_JOB_WS: /Users/Shared/bench-jobs/ranked-laguna-xs-2.1-serial-v2"
+        ))
+        #expect(workflow.contains(
+            "MLXFAST_BASELINE_WS: /opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current"
+        ))
+        #expect(workflow.contains(
+            "MLXFAST_BASELINE_CALIBRATION: /opt/bench-runner/state/laguna-xs-2.1-serial-v2/baseline-calibration.json"
         ))
         #expect(workflow.contains("MLXFAST_DECODE_SPEEDUP_FLOOR: \"0.95\""))
         #expect(workflow.contains("MLXFAST_PREFILL_SPEEDUP_FLOOR: \"0.95\""))
@@ -66,8 +70,8 @@ struct DefaultTrackTests {
         let track = try #require(
             try JSONSerialization.jsonObject(with: registration) as? [String: Any]
         )
-        #expect(track["trackId"] as? String == "laguna-xs-2.1-serial-v1")
-        #expect(track["name"] as? String == "mlxfast-challenge-dev-serial")
+        #expect(track["trackId"] as? String == "laguna-xs-2.1-serial-v2")
+        #expect(track["name"] as? String == "mlxfast-challenge-dev-serial-v2")
         let runner = try #require(track["runner"] as? [String: Any])
         #expect(runner["provider"] as? String == "github-actions")
         #expect(runner["workflow"] as? String == "benchmark.yml")
@@ -89,7 +93,7 @@ struct DefaultTrackTests {
         #expect(scoring["decodeSpeedupFloor"] as? Double == 0.95)
         #expect(scoring["prefillSpeedupFloor"] as? Double == 0.95)
         let leaderboard = try #require(track["leaderboard"] as? [String: Any])
-        #expect(leaderboard["namespace"] as? String == "laguna-xs-2.1-serial-v1")
+        #expect(leaderboard["namespace"] as? String == "laguna-xs-2.1-serial-v2")
         // The serial track has no separate contract fixture; the manifest is
         // the single source of truth.
         #expect(track["contractPath"] == nil)
@@ -118,12 +122,17 @@ struct DefaultTrackTests {
         )
         let editablePaths = try #require(track["editablePaths"] as? [String])
         #expect(!editablePaths.isEmpty)
-        #expect(editablePaths.count == 91)
+        #expect(editablePaths.count == 97)
         #expect(Set(editablePaths).count == editablePaths.count, "editablePaths must be unique")
 
         let requiredFullStackPaths = [
             "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift",
             "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/AttentionUtils.swift",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/matmul.cpp",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/jit_kernels.cpp",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels.h",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/fp4.h",
+            "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/fp8.h",
             "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/sort.metal",
             "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/sort.h",
             "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/reduce.metal",
@@ -143,6 +152,28 @@ struct DefaultTrackTests {
             #expect(
                 editablePaths.contains(path),
                 "Laguna MoE/attention full-stack path \(path) must remain editable"
+            )
+        }
+        #expect(
+            !editablePaths.contains(
+                "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal"
+            ),
+            "host-side MLX edits must stay limited to exact reviewed files"
+        )
+        for trustedRoot in [
+            ".github",
+            "correctness_prompts",
+            "fixtures",
+            "Sources/MLXFastCLI",
+            "Sources/MLXFastCore",
+            "Sources/MLXFastHarness",
+            "Sources/MLXFastTrustedHarness",
+        ] {
+            #expect(
+                !editablePaths.contains {
+                    $0 == trustedRoot || $0.hasPrefix(trustedRoot + "/")
+                },
+                "distribution, golden, and trusted harness tooling must stay excluded: \(trustedRoot)"
             )
         }
 

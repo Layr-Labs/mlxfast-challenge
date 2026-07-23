@@ -158,15 +158,13 @@ The `officialBaseline*` constants in `Sources/MLXFastCore/Constants.swift` are
 a **cached calibration retained for local-mode estimates and the gates pass's
 skip-timed placeholder timing only** -- the ranked score denominator is the
 live paired baseline measured on the M5 box (next section), never these
-numbers. They were last calibrated 2026-07-22 for the Poolside Laguna XS 2.1
-re-pin as the mean of the on-box M5 paired-baseline timings published by the
-4 consecutive successful ranked Laguna runs (29891158354, 29898041981,
-29931435233, and 29934545157; decode CV 0.20%, prefill CV 0.71%), replacing
-the Gemma 4 31B 4-bit 2026-07-12 calibration (decode 0.04405625764973958 /
-prefill 0.0016216554767252605, runs 29179374395-29197772284) that predated
-the model re-pin and inflated local estimates ~4.5x. They are kept so
-`--local-iterate` / `--local-submit` can print a directional speedup
-without a second local build:
+numbers. The numeric values below are TEMPORARY leftovers from the superseded
+mlx-community affine Laguna checkpoint. They are not a Poolside v2
+calibration and must not ship as that track's local estimates. The workflow's
+`MLXFAST_POOLSIDE_V2_CALIBRATION_READY=0` interlock keeps private/ranked use
+disabled while the final migration SHA, versioned baseline, and repeated M5
+samples are unavailable. Replace both constants from those Poolside samples
+before enabling the interlock or merging:
 
 - `officialBaselineDecodeSecondsPerToken = 0.00938833593359375`
 - `officialBaselinePrefillSecondsPerToken = 0.00036280499267578125`
@@ -176,9 +174,11 @@ freeze test fails on purpose -- the doc and the code must move together.
 
 ### Paired baseline on the single M5 box
 
-The ranked runner is one self-hosted Apple M5 Max (label `m5-bench`). The
-paired baseline is a **pinned reference tree provisioned on that box**
-(`/opt/bench-runner/baseline/current`), and the timed measurement is owned by
+The ranked runners are self-hosted Apple M5 Max boxes (label `m5-bench`). The
+v2 paired baseline path is reserved at
+`/opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current`, but the baseline
+is not valid until it is built from the FINAL Poolside migration SHA and
+provisioned with its versioned calibration on both boxes. The timed measurement is owned by
 the on-box `measure-job` (trusted, runner-provisioned, fixed thermal
 contract). Per ranked run, after all correctness/gates work, a hidden-material
 scrub, and a quiescence wait, measure-job runs the pinned **baseline tree
@@ -192,7 +192,8 @@ common-mode host drift exactly like the old separate-VM pairing did
 (validated on this box at paired score 1.0507 with decode CV 0.13%).
 
 - The baseline sample is additionally sanity-checked against the box's
-  recorded calibration (`/opt/bench-runner/state/baseline-calibration.json`),
+  versioned calibration
+  (`/opt/bench-runner/state/laguna-xs-2.1-serial-v2/baseline-calibration.json`),
   so a broken baseline build or a sick host fails the run instead of
   repricing every speedup.
 - The baseline's own floor verdict is ignored; token mismatches or harness

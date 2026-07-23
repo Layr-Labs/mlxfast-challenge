@@ -1,13 +1,13 @@
 # mlxfast — Poolside Laguna XS 2.1 Serial Swift Challenge
 
 Optimize serial (one token per decode request) inference for Poolside Laguna
-XS 2.1 (MoE text tower, 4-bit) on Apple Silicon while preserving the model's
+XS 2.1 (MoE text tower, Poolside NVFP4) on Apple Silicon while preserving the model's
 exact greedy output.
 
 ## Default ranked contract
 
 `benchmark.json` and `.github/workflows/benchmark.yml` define the default —
-and only — Yukon track, `laguna-xs-2.1-serial-v1`. The former MTP track is
+and only — Yukon track, `laguna-xs-2.1-serial-v2`. The former MTP track is
 retired: there is no assistant, no block protocol, and no MTP manifest or
 workflow in this repository.
 
@@ -48,24 +48,23 @@ Hugging Face-style cache under your home directory (so parallel clones reuse
 one checkpoint):
 
 ```text
-~/.cache/huggingface/hub/models--mlx-community--Laguna-XS-2.1-4bit/snapshots/main/
+~/.cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25/
 ```
 
 It also creates this compatibility symlink unless the path already exists:
 
 ```text
-reference_weights/laguna-xs-2.1-4bit/
+reference_weights/laguna-xs-2.1-nvfp4-mlx/
 ```
 
-By default `setup.sh` downloads `mlx-community/Laguna-XS-2.1-4bit` from the
-pinned Hugging Face revision with resumable `curl` requests (no organizer
-mirror exists yet; one may be added later). It checks cached files
+By default `setup.sh` downloads
+`poolside/Laguna-XS-2.1-NVFP4-mlx@841778bda563a36104dd521e37d99218e46f4f25`
+from the public organizer R2 mirror, with the exact Hugging Face revision as
+fallback. It checks cached files
 against the pinned SHA256 manifest and redownloads only missing, truncated, or
-hash-mismatched files. (The checked-in Laguna weight manifests are entry-less
-placeholders until the operator regenerates them on m5-bench; setup fails
-closed on an entry-less manifest, so use `MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1`
-until then.) The safetensors payload is about 18.8 GB across 4
-shards; `setup.sh` requires 40 GiB free by default before starting. After a
+hash-mismatched files. The complete manifest covers 13 files totaling
+21,568,905,520 bytes, including 5 safetensors shards; `setup.sh` requires
+40 GiB free by default before starting. After a
 full verification, setup writes `.mlxfast-reference-cache.lock`; later setup
 runs use cheap size/mtime checks from that lock and skip the full checkpoint
 hash pass when the cache is unchanged. Set
@@ -84,9 +83,9 @@ weights/
   tokenizer_config.json
 ```
 
-The generated `weights/` tree is a compact runtime artifact set, not a second
-full copy of the checkpoint: it holds only the text-tower tensors (the
-`language_model.` prefix in the source checkpoint), plus a runtime-authored
+The generated `weights/` tree is a runtime artifact set, not a second physical
+copy on APFS: the source is already text-only (`model.*` / `lm_head.*`), so
+the transform may clone complete shards copy-on-write and writes a runtime-authored
 `config.json` (the Laguna geometry fields the runtime needs,
 plus the checkpoint's quantization metadata). There is no expert
 streaming manifest -- the whole model, including every routed expert, is
@@ -124,7 +123,7 @@ The active editable surface is Swift-only and is defined by `benchmark.json`:
 
 | Path | Scope |
 |---|---|
-| `Sources/MLXFastModel/` | Laguna XS 2.1 4-bit model implementation: attention (sliding-window + full, GQA, YaRN partial-rotary RoPE on full-attention layers), MoE MLP (256 routed experts + shared expert, per-head gating), RMSNorm, KV caches, weight loading, and prefill/decode execution. |
+| `Sources/MLXFastModel/` | Laguna XS 2.1 NVFP4 model implementation: attention (sliding-window + full, GQA, YaRN partial-rotary RoPE on full-attention layers), MoE MLP (256 routed experts + shared expert, per-head gating), RMSNorm, KV caches, weight loading, and prefill/decode execution. |
 | `Sources/MLXFastTransform/` | Offline safetensors transform (text-tensor selection, config/tokenizer emission). |
 
 `Sources/MLXFastCore/`, `Sources/MLXFastHarness/`,
@@ -165,7 +164,7 @@ transform output. It re-runs the submitted transform and compares the generated
 `weights/` tree against that fresh run. It is not a baseline-layout requirement.
 The normal preflight/benchmark path also rejects generated `weights/` above the
 default 25 GiB transformed-output cap before correctness or timing runs (the
-text tower is about 18.8 GB, comfortably under that cap).
+text tower is about 21.6 GB, under that cap).
 Override it with `MLXFAST_MAX_WEIGHTS_BYTES`; `verify-transform` additionally
 accepts `--max-bytes`.
 

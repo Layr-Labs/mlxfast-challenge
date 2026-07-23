@@ -194,6 +194,41 @@ func lagunaRuntimeCorrectnessReportsGoldenMetadataWhenWeightsAreMissing() throws
     #expect(report.firstFailingCase == nil)
 }
 
+@Test
+func lagunaRuntimeMatchesVendoredUpstreamOnM5WhenEnabled() throws {
+    let environment = ProcessInfo.processInfo.environment
+    guard environment["MLXFAST_RUN_LAGUNA_UPSTREAM_EQUIVALENCE"] == "1" else {
+        return
+    }
+    let weightsPath = try #require(
+        environment["MLXFAST_LAGUNA_EQUIVALENCE_WEIGHTS_PATH"]
+    )
+    let goldenPath =
+        environment["MLXFAST_LAGUNA_EQUIVALENCE_GOLDEN_PATH"]
+        ?? MLXFastConstants.defaultPublicCorrectnessGoldenPath
+    let sourceCase = try #require(
+        loadGoldenCases(
+            from: goldenPath,
+            requiredSteps: 8,
+            requiredPromptTokens: MLXFastConstants.correctnessPromptTokens
+        ).first
+    )
+    let tolerance = Float(
+        environment["MLXFAST_LAGUNA_EQUIVALENCE_MAX_ABS_ERROR"] ?? "0"
+    ) ?? 0
+
+    let report = try LagunaUpstreamEquivalence.compare(
+        weightsPath: weightsPath,
+        promptTokens: sourceCase.promptTokens,
+        decodeTokens: Array(sourceCase.expectedTokens.prefix(8))
+    )
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let encoded = try encoder.encode(report)
+    print(String(decoding: encoded, as: UTF8.self))
+    #expect(report.passes(maximumAbsoluteLogitError: tolerance))
+}
+
 private func temporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent(
         UUID().uuidString,

@@ -320,8 +320,12 @@ func officialRankedRunMeasuresPairedBaselineOnTheSameSilicon() throws {
     // against its recorded calibration -- both consumed from the host
     // contract, never installed or repointable by the workflow run itself.
     #expect(workflow.contains("MLXFAST_MEASURE_JOB: /opt/bench-runner/measure-job.sh"))
-    #expect(workflow.contains("MLXFAST_BASELINE_WS: /opt/bench-runner/baseline/current"))
-    #expect(workflow.contains("MLXFAST_BASELINE_CALIBRATION: /opt/bench-runner/state/baseline-calibration.json"))
+    #expect(workflow.contains(
+        "MLXFAST_BASELINE_WS: /opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current"
+    ))
+    #expect(workflow.contains(
+        "MLXFAST_BASELINE_CALIBRATION: /opt/bench-runner/state/laguna-xs-2.1-serial-v2/baseline-calibration.json"
+    ))
     let measureBody = String(workflow[measure.lowerBound..<overlayStep.lowerBound])
     #expect(measureBody.contains("--candidate \"${MLXFAST_JOB_WS}\""))
     #expect(measureBody.contains("--baseline \"${MLXFAST_BASELINE_WS}\""))

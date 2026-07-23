@@ -1235,7 +1235,7 @@ struct BenchmarkSafetyTests {
             ]
         )
 
-        #expect(result.status == 19)
+        #expect(result.status == 19, "stderr: \(result.stderr)")
         #expect(!FileManager.default.fileExists(atPath: invocation.path))
     }
 

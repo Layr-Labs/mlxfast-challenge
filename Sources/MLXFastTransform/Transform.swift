@@ -1,5 +1,8 @@
 import Foundation
 import MLXFastCore
+#if canImport(Darwin)
+import Darwin
+#endif
 
 public struct TransformOptions: Equatable {
     public let referencePath: String
@@ -46,30 +49,31 @@ enum TransformModelFamily: Equatable {
 }
 
 /// Offline transform for the pinned reference checkpoint: selects ONLY the
-/// text-tower tensors (the `language_model.` prefix in the source index),
-/// drops every vision/audio/multimodal-projector tensor, and rewrites the
+/// text-tower tensors (`model.*` / `lm_head.*` for Poolside Laguna;
+/// `language_model.*` for legacy Gemma), drops every vision/audio/
+/// multimodal-projector tensor, and rewrites the
 /// selected tensors into dense safetensors shard(s) plus a
 /// `model.safetensors.index.json` and a runtime-authored `config.json`.
 ///
 /// Two source checkpoint families are supported, detected from the source
 /// config.json:
 ///
-/// - Poolside Laguna XS 2.1 4-bit (flat config, `model_type` "laguna"): the
-///   ranked serial-track target. The source is already MLX affine-quantized,
+/// - Poolside Laguna XS 2.1 NVFP4 (flat config, `model_type` "laguna"): the
+///   ranked serial-track target. The source is already MLX NVFP4-quantized,
 ///   so the transform validates and passes through -- byte-for-byte, source
-///   tensor names unchanged -- the quantized triplet set described by
+///   tensor names unchanged -- the BF16/NVFP4 tensor set described by
 ///   `docs/laguna-weight-contract.md`: attention
 ///   q/k/v/o projections plus the per-head `g_proj` gates and q/k norms,
-///   the layer-0 dense MLP, the SwitchGLU-STACKED `mlp.switch_mlp.*` expert
-///   tensors (leading experts axis; never split per expert), the 8-bit
-///   `mlp.gate.proj` routers with their `mlp.gate.e_score_correction_bias`
-///   vectors, the shared experts, and the untied quantized `lm_head`. The
+///   the layer-0 dense MLP, the SwitchGLU-STACKED `mlp.switch_mlp.*` NVFP4
+///   expert tensors (leading experts axis; never split per expert), the raw
+///   BF16 `mlp.gate.weight` routers with their F32 correction vectors, the
+///   NVFP4 shared experts, and the untied BF16 `lm_head`. The
 ///   contract forbids derived metadata sidecars (the Gemma projection and
 ///   tied-head packed13 sidecars are never emitted for Laguna) and requires
 ///   `rotary_emb.inv_freq` tables to be left out. The runtime config.json is
 ///   the flat source config minus the empty `vision_config`, carrying the
-///   checkpoint's `quantization` block: global affine 4-bit group-64 plus
-///   the per-router-gate 8-bit overrides.
+///   checkpoint's matching NVFP4 4-bit group-16 `quantization` and
+///   `quantization_config` blocks.
 /// - Legacy Gemma 4 31B 4-bit (nested `text_config`): the archived dense
 ///   path, unchanged: flattened `text_config` runtime config plus the
 ///   projection/tied-head metadata sidecars.
@@ -204,12 +208,22 @@ public enum SwiftTransform {
             guard let header = validatedHeaders[shardName] else {
                 throw MLXFastError.invalidInput("missing validated header for checkpoint shard \(shardName)")
             }
-            copiedTensors += try Safetensors.copySubset(
-                from: source,
-                to: destination,
-                tensorNames: textKeysByShard[shardName, default: []].sorted(),
-                validatedHeader: header
-            )
+            let selectedNames = textKeysByShard[shardName, default: []].sorted()
+            if Set(selectedNames) == Set(header.tensors.keys) {
+                // Poolside's reference is already text-only. Preserve the
+                // byte-identical shard and use an APFS copy-on-write clone
+                // when source/output share a volume; fall back to a normal
+                // independent file copy elsewhere. Never publish a symlink.
+                try cloneOrCopyShard(from: source, to: destination)
+                copiedTensors += selectedNames.count
+            } else {
+                copiedTensors += try Safetensors.copySubset(
+                    from: source,
+                    to: destination,
+                    tensorNames: selectedNames,
+                    validatedHeader: header
+                )
+            }
             stagedHeaders[shardName] = try Safetensors.readHeader(destination)
         }
 
@@ -234,7 +248,7 @@ public enum SwiftTransform {
             )
         case .laguna:
             // docs/laguna-weight-contract.md forbids derived layouts and
-            // metadata sidecars in v1, and the Laguna runtime loads exactly the
+            // metadata sidecars in the Poolside v2 contract, and the runtime loads exactly the
             // indexed checkpoint tensors (its untied lm_head makes the
             // Gemma tied-head packed13 sidecar meaningless anyway). Emit
             // nothing beyond the pass-through tensor set.
@@ -467,20 +481,19 @@ public enum SwiftTransform {
         key.hasPrefix(textTowerPrefix)
     }
 
-    /// Laguna keeps the same `language_model.` text-tower prefix as the
-    /// Gemma 4 checkpoint, so prefix selection is shared. The Laguna weight
-    /// contract additionally requires precomputed `rotary_emb.inv_freq`
-    /// tables to be left out of the transformed tree: the runtime's shard/
-    /// tensor inventory check runs before its `sanitize` pass would drop
-    /// them.
+    /// Poolside Laguna is already text-only and uses runtime-native
+    /// `model.*` / `lm_head.*` names. Legacy Gemma retains the
+    /// `language_model.*` selection. Precomputed rotary tables are omitted.
     static func isSelectedTextTowerKey(_ key: String, family: TransformModelFamily) -> Bool {
-        guard isTextTowerKey(key) else {
-            return false
+        switch family {
+        case .gemma4:
+            return isTextTowerKey(key)
+        case .laguna:
+            guard key.hasPrefix("model.") || key.hasPrefix("lm_head.") else {
+                return false
+            }
+            return !key.contains("rotary_emb.inv_freq")
         }
-        if family == .laguna, key.contains("rotary_emb.inv_freq") {
-            return false
-        }
-        return true
     }
 
     private static func captureMetadataFiles(from source: URL) throws -> [String: Data] {
@@ -530,6 +543,35 @@ public enum SwiftTransform {
         }
     }
 
+    private static func cloneOrCopyShard(from source: URL, to destination: URL) throws {
+        #if canImport(Darwin)
+        let cloned = source.path.withCString { sourcePath in
+            destination.path.withCString { destinationPath in
+                clonefile(sourcePath, destinationPath, 0) == 0
+            }
+        }
+        if !cloned {
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.removeItem(at: destination)
+            }
+            try FileManager.default.copyItem(at: source, to: destination)
+        }
+        #else
+        if FileManager.default.fileExists(atPath: destination.path) {
+            try FileManager.default.removeItem(at: destination)
+        }
+        try FileManager.default.copyItem(at: source, to: destination)
+        #endif
+        let values = try destination.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        )
+        guard values.isRegularFile == true, values.isSymbolicLink != true else {
+            throw MLXFastError.invalidInput(
+                "transformed shard copy is not an independent regular file: \(destination.path)"
+            )
+        }
+    }
+
     private static func loadReferenceConfigRoot(_ sourceConfigPath: URL) throws -> [String: Any] {
         let data = try Data(contentsOf: sourceConfigPath)
         let object = try JSONSerialization.jsonObject(with: data)
@@ -572,12 +614,9 @@ public enum SwiftTransform {
     /// Laguna: the source config is already the flat schema
     /// `LagunaConfig.load` parses (per docs/laguna-weight-contract.md the
     /// transform may copy the source fields directly), so it is passed
-    /// through minus the empty multimodal `vision_config` stub. The
-    /// checkpoint's `quantization` block -- global affine 4-bit group-64
-    /// plus the per-tensor 8-bit router-gate overrides
-    /// (`language_model.model.layers.<N>.mlp.gate.proj`) -- is normalized
-    /// under the `quantization` key (filled from `quantization_config` when
-    /// only the mirror is present).
+    /// through minus the empty multimodal `vision_config` stub. Its matching
+    /// NVFP4 4-bit group-16 `quantization` and `quantization_config` blocks are
+    /// both required and preserved.
     static func makeRuntimeConfigData(
         sourceConfigRoot root: [String: Any],
         family: TransformModelFamily
@@ -589,14 +628,15 @@ public enum SwiftTransform {
                 throw MLXFastError.invalidInput("reference config.json is missing text_config")
             }
             runtimeConfig = textConfig
+            if let quantization = root["quantization"] {
+                runtimeConfig["quantization"] = quantization
+            } else if let quantizationConfig = root["quantization_config"] {
+                runtimeConfig["quantization"] = quantizationConfig
+            }
         case .laguna:
+            _ = try LagunaCheckpointValidation.quantizationSpec(fromConfigRoot: root)
             runtimeConfig = root
             runtimeConfig["vision_config"] = nil
-        }
-        if let quantization = root["quantization"] {
-            runtimeConfig["quantization"] = quantization
-        } else if let quantizationConfig = root["quantization_config"] {
-            runtimeConfig["quantization"] = quantizationConfig
         }
 
         return try JSONSerialization.data(

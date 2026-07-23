@@ -1,16 +1,16 @@
 # MLXFast Challenge Agent Guide
 
-This repository is the Swift-only Poolside Laguna XS 2.1 4-bit MoE inference
+This repository is the Swift-only Poolside Laguna XS 2.1 NVFP4 MoE inference
 optimization challenge.
 Use this file as the working contract for coding agents and participants.
 
 ## Goal
 
-Optimize Poolside Laguna XS 2.1 4-bit (text tower only) inference on Apple
+Optimize Poolside Laguna XS 2.1 NVFP4 (text tower only) inference on Apple
 Silicon without
 changing the observable model behavior required by the correctness gates.
 
-The default — and only — ranked track is `laguna-xs-2.1-serial-v1`, the
+The default — and only — ranked track is `laguna-xs-2.1-serial-v2`, the
 serial (one token per decode request) track. It rewards faster prefill and
 decode against a paired on-box baseline measured in the same session:
 
@@ -51,10 +51,10 @@ measurements. See `.github/workflows/benchmark.yml` for the exact step order.
 Because the candidate and the pinned on-box baseline are measured back to
 back on the same silicon behind the same thermal gate, the paired speedup
 ratio cancels host drift; the score is that ratio, not a comparison against a
-stored constant. Laguna XS 2.1 4-bit is a fine-grained MoE model (256 routed
+stored constant. Poolside Laguna XS 2.1 NVFP4 is a fine-grained MoE model (256 routed
 experts plus one shared expert per sparse layer, 8 experts per token,
 per-head gating; layer 0 is a dense MLP): the text tower is about
-18.8 GB in 4-bit, fully RAM-resident on the ranked box — the runtime loads
+21.6 GB in Poolside NVFP4, fully RAM-resident on the ranked box — the runtime loads
 every text-tower tensor, including all experts, once during untimed
 initialization and keeps it
 resident for the whole process lifetime. There is no weight streaming of any
@@ -65,8 +65,8 @@ full-attention layers), quantized matmul and MoE gather-GEMM dispatch,
 KV-cache handling, memory layout, and MLX
 scheduling — not disk I/O.
 
-Local work needs enough unified memory for the ~18.8 GB model plus KV state
-and buffers; roughly 36 GiB is the practical local minimum.
+Local work needs enough unified memory for the ~21.6 GB model plus KV state
+and buffers; roughly 40 GiB is the practical local minimum.
 Machines below 64 GiB automatically use a low-memory startup profile: retained
 co-tiled/combined weight layouts and compiled decode are disabled, the MLX
 allocator cache is capped at 6 GiB, and free warmup buffers are cleared before
@@ -86,7 +86,7 @@ official benchmark for ranking.
 ## What You May Optimize
 
 The submitted editable surface is defined by `editablePaths` in
-`benchmark.json` — that list (currently 91 entries) is the source of truth.
+`benchmark.json` — that list (currently 92 entries) is the source of truth.
 It covers four groups:
 
 ```text
@@ -105,8 +105,8 @@ The vendored kernel surface is the kernel families the Laguna forward pass
 actually dispatches — SDPA (`scaled_dot_product_attention.metal`,
 `sdpa_vector.h`, and `steel/attn/` with its `steel_attention*.cpp` twins:
 Laguna's head dim is 128, so the fused steel attention kernels are
-dispatchable at prefill), affine-quantized matmul (`quantized*` and
-`fp_quantized*` including the `_nax`
+dispatchable at prefill), quantized matmul (the NVFP4 `fp_quantized*` kernels
+and the shared `quantized*` infrastructure, including the `_nax`
 variants), the MoE gather GEMM (`steel_gemm_gather*.cpp`), `steel/gemm/`,
 `gemv`, `rope`, `rms_norm`, `softmax`, `sort`, `reduce`, `copy`, elementwise
 (`unary`/`binary`/`ternary`), `arg_reduce`, and gather indexing
@@ -152,15 +152,15 @@ Focus on:
  transformed artifacts.
 - Improving prefill and single-token decode inside the Swift/MLX model path.
 
-The target is Poolside Laguna XS 2.1, MoE, 4-bit (untied embeddings, vocab
+The target is Poolside Laguna XS 2.1, MoE, NVFP4 (untied embeddings, vocab
 100352), text tower only (the empty `vision_config` is out of scope and never
 loaded). The frozen reference checkpoint is about
-18.8 GB across 4 safetensors shards, verified against the pinned manifest.
-The transformed `weights/` tree holds only the text-tower tensors
-(everything under the source checkpoint's `language_model.` prefix) plus a
+21.6 GB across 5 safetensors shards, verified against the pinned manifest.
+The transformed `weights/` tree holds the source's text-only `model.*` /
+`lm_head.*` tensors plus a
 runtime-authored `config.json`; it is an overlay/runtime artifact, not a
-second full copy of the model. Aim to keep generated transformed weights
-under 20 GB (the default cap is 25 GiB).
+second physical copy of the model on APFS. Aim to keep generated transformed
+weights under 22 GB (the default cap is 25 GiB).
 
 ## What Not To Change
 
@@ -340,7 +340,7 @@ behaviors are expected, not bugs:
  `./benchmark.sh --local-iterate` for the edit loop and
  `--local-submit` as the recommended pre-submit check.
 - **One local run at a time; the memory guard is protecting your RAM.** The
- ~18.8 GB RAM-resident text tower means two simultaneous model residencies
+ ~21.6 GB RAM-resident text tower means two simultaneous model residencies
  (an overlapping second local run, or a new run started while an orphaned
  model-holding worker from an aborted run lingers) can out-of-memory a
  local machine. A single worker is separately protected by the automatic
@@ -422,9 +422,9 @@ Good submissions are likely to improve one or more of:
 - Attention kernel dispatch: sliding-window vs. full-attention masking, GQA
  head-group broadcasting (8 KV heads at head_dim 128), and the
  full-attention layers' YaRN partial-rotary (0.5) RoPE.
-- Quantized matmul and MoE dispatch for the affine 4-bit (group size 64)
+- NVFP4 matmul and MoE dispatch for the group-16 routed/shared expert
  projections: fewer dequantize/copy steps, better expert gather-GEMM
- batching across the routed experts, the 8-bit per-layer router gates, the
+ batching across routed experts, the BF16 per-layer router gates, the
  shared expert, and reuse of derived weight views.
 - KV cache handling: the sliding-window cache only ever needs the last 512
  positions; a tighter ring-buffer implementation can reduce both memory and
@@ -447,7 +447,7 @@ flip near-tie greedy argmaxes on the M5 and fail the exact-token gates.
 
 Do not assume the benchmark machine has the same memory budget as your local
 Mac. The ranked box is one Apple M5 Max with 128 GB of unified memory; the
-~18.8 GB text tower is comfortably RAM-resident there, but do not treat that
+~21.6 GB text tower is comfortably RAM-resident there, but do not treat that
 headroom as an invitation for memory-hungry strategies tuned on a different
 machine — KV cache, buffers, and caches still compete, and what is fast on
 your Apple Silicon generation can move differently on the M5. Although Laguna
@@ -502,7 +502,7 @@ Submissions in this category fail the static review as bypass behavior.
 
 ### Serial Non-Speculative Track Rules (default)
 
-This is the default Laguna XS 2.1 serial track, `laguna-xs-2.1-serial-v1`,
+This is the default Laguna XS 2.1 serial track, `laguna-xs-2.1-serial-v2`,
 registered by `benchmark.json`. Each model
 invocation may compute logits and KV rows only for tokens supplied in that
 invocation, and must advance logical and physical KV position by exactly the

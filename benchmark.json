@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "name": "mlxfast-challenge-dev-serial",
-  "trackId": "laguna-xs-2.1-serial-v1",
-  "description": "Optimize Poolside Laguna XS 2.1 4-bit MoE inference by transforming weights offline and reducing compute latency without failing the correctness gate.",
+  "name": "mlxfast-challenge-dev-serial-v2",
+  "trackId": "laguna-xs-2.1-serial-v2",
+  "description": "Optimize Poolside Laguna XS 2.1 NVFP4 MoE inference by transforming weights offline and reducing compute latency without failing the correctness gate.",
   "category": "swift",
   "direction": "+",
   "editablePaths": [
@@ -23,6 +23,9 @@
     "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/JSONDecodingTypes.swift",
     "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift",
     "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/AttentionUtils.swift",
+    "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/matmul.cpp",
+    "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/jit_kernels.cpp",
+    "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels.h",
     "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/scaled_dot_product_attention.metal",
     "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/sdpa_vector.h",
     "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/softmax.metal",
@@ -55,11 +58,14 @@
     "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/indexing/gather_axis.h",
     "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/steel/gemm",
     "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/steel/attn",
+    "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/quantized.cpp",
     "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/quantized.h",
     "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/quantized.metal",
     "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/quantized_nax.h",
     "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/quantized_nax.metal",
     "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/quantized_utils.h",
+    "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/fp4.h",
+    "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/fp8.h",
     "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/fp_quantized.h",
     "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/fp_quantized.metal",
     "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/fp_quantized_nax.h",
@@ -113,6 +119,6 @@
     "prefillSpeedupFloor": 0.95
   },
   "leaderboard": {
-    "namespace": "laguna-xs-2.1-serial-v1"
+    "namespace": "laguna-xs-2.1-serial-v2"
   }
 }
