@@ -184,8 +184,10 @@ if upload_with_aws_cli; then
 fi
 
 echo "upload-r2-object: using signed HTTPS upload"
+response_body_path="$(mktemp)"
+curl_rc=0
 curl \
-  --fail \
+  --fail-with-body \
   --silent \
   --show-error \
   --location \
@@ -197,6 +199,20 @@ curl \
   -H "x-amz-content-sha256: ${payload_hash}" \
   -H "x-amz-date: ${amz_date}" \
   --upload-file "${input_path}" \
-  "${url}"
+  --output "${response_body_path}" \
+  "${url}" || curl_rc=$?
+if [[ "${curl_rc}" -ne 0 ]]; then
+  # --fail-with-body keeps --fail's retry/exit semantics but preserves the
+  # response body. A failed transfer's body is an R2/S3 error document
+  # (Code/Message XML), never object content, so a bounded prefix leaks no
+  # hidden material and turns an opaque HTTP status into a diagnosable
+  # cause (SignatureDoesNotMatch vs InvalidAccessKeyId vs NoSuchBucket vs
+  # NoSuchKey).
+  error_body="$(LC_ALL=C tr -d '[:cntrl:]' < "${response_body_path}" 2>/dev/null | head -c 400 || true)"
+  rm -f "${response_body_path}"
+  echo "upload-r2-object: R2 request failed (curl exit ${curl_rc}); server error body: ${error_body:-<none captured>}" >&2
+  exit "${curl_rc}"
+fi
+rm -f "${response_body_path}"
 
 echo "upload-r2-object: wrote ${object_path}"
