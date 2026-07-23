@@ -7,9 +7,7 @@ exact greedy output.
 ## Default ranked contract
 
 `benchmark.json` and `.github/workflows/benchmark.yml` define the default —
-and only — Yukon track, `laguna-xs-2.1-serial-v2`. The former MTP track is
-retired: there is no assistant, no block protocol, and no MTP manifest or
-workflow in this repository.
+and only — Yukon track, `laguna-xs-2.1-serial-v2`.
 
 A ranked run on the self-hosted M5 box:
 
@@ -223,8 +221,7 @@ output path, and hidden-state tensors are easier to make ambiguous around
 normalization than token-level or logit-anchor checks.
 
 VLM/image and audio inputs remain out of scope. Only the Laguna text tower
-executes; the retired MTP track's DFlash assistant is no longer provisioned
-or run.
+executes.
 
 ### Serial non-speculative rule (default track)
 
@@ -254,7 +251,7 @@ or verify future tokens for a serial one-token request.
 
 Organizer-provided MTP or other speculative decoding would require a
 separately declared trusted block protocol, correctness contract, and score;
-no such track currently exists (the former MTP track is retired), so these
+no such track currently exists, so these
 restrictions apply to every ranked submission.
 
 ## Score

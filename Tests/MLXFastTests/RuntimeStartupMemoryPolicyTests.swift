@@ -13,17 +13,13 @@ func startupMemoryPolicyProtectsDocumented36GiBLocalMachine() {
     #expect(policy.maxMegabytesPerCommandBuffer == 128)
     #expect(policy.maxOperationsPerCommandBuffer == 64)
     #expect(policy.clearAllocatorCacheAfterWarmup)
-    // Exact-size pin plus the multi-GiB layout switches the profile exists
+    // Exact-size pin plus the compiled-decode switches the profile exists
     // to disable; every name's spelling is cross-checked against the model
     // sources in lowMemoryOverridesNameOnlyFlagsReadByModelSources, so the
     // dictionary is not duplicated here verbatim.
-    #expect(policy.environmentOverrides.count == 27)
+    #expect(policy.environmentOverrides.count == 2)
     #expect(policy.environmentOverrides.values.allSatisfy { $0 == "0" })
     for name in [
-        "DARKBLOOM_GATE_UP_COTILED_FIXED12",
-        "DARKBLOOM_DOWN_COTILED_FIXED12",
-        "MLXFAST_COMBINED_ATTENTION_PREFILL",
-        "DARKBLOOM_OUTPUT_COTILED",
         "MLX_COMPILED_DECODE",
         "DARKBLOOM_COMPILED_DECODE",
     ] {
@@ -34,16 +30,25 @@ func startupMemoryPolicyProtectsDocumented36GiBLocalMachine() {
 // Every override must name a flag some model source actually reads;
 // a typo or a rename that leaves the policy behind fails here. The policy
 // file itself is excluded so the dictionary cannot self-satisfy the check.
+// The scanned surface is the worker's model code: Sources/MLXFastModel plus
+// the vendored MLXLMCommon runtime plumbing the Laguna forward dispatches
+// (the compiled-decode flags are read there).
 @Test
 func lowMemoryOverridesNameOnlyFlagsReadByModelSources() throws {
-    let modelSourcesDirectory = "Sources/MLXFastModel"
-    let sourceFiles = try FileManager.default
-        .contentsOfDirectory(atPath: modelSourcesDirectory)
-        .filter { $0.hasSuffix(".swift") && $0 != "RuntimeStartupMemoryPolicy.swift" }
-    #expect(!sourceFiles.isEmpty)
-    let combinedSources = try sourceFiles
-        .map { try String(contentsOfFile: "\(modelSourcesDirectory)/\($0)", encoding: .utf8) }
-        .joined(separator: "\n")
+    let modelSourceDirectories = [
+        "Sources/MLXFastModel",
+        "Vendor/mlx-swift-lm/Libraries/MLXLMCommon",
+    ]
+    var combinedSources = ""
+    for directory in modelSourceDirectories {
+        let sourceFiles = try FileManager.default
+            .contentsOfDirectory(atPath: directory)
+            .filter { $0.hasSuffix(".swift") && $0 != "RuntimeStartupMemoryPolicy.swift" }
+        #expect(!sourceFiles.isEmpty)
+        combinedSources += try sourceFiles
+            .map { try String(contentsOfFile: "\(directory)/\($0)", encoding: .utf8) }
+            .joined(separator: "\n")
+    }
 
     let policy = RuntimeStartupMemoryPolicy.resolve(
         physicalMemoryBytes: UInt64(36) << 30
@@ -51,15 +56,15 @@ func lowMemoryOverridesNameOnlyFlagsReadByModelSources() throws {
     for name in policy.environmentOverrides.keys.sorted() {
         #expect(
             combinedSources.contains("\"\(name)\""),
-            "override \(name) is not read anywhere in \(modelSourcesDirectory)"
+            "override \(name) is not read anywhere in \(modelSourceDirectories)"
         )
     }
 }
 
 // The documented low-memory startup profile (<64 GiB machines: 6 GiB MLX
 // allocator cap, feature-disable env defaults, warmup-buffer clear before
-// the protocol hello) applies to the LAGUNA runtime worker, not only the
-// retained experimental MTP path. The Laguna weight cache must resolve the policy
+// the protocol hello) applies to the LAGUNA runtime worker. The Laguna
+// weight cache must resolve the policy
 // before its model load and honor clearAllocatorCacheAfterWarmup; the full
 // profile stays a no-op there (the ranked box keeps stock allocator
 // behavior, matching how the pinned baseline was measured).
@@ -155,7 +160,7 @@ func lowMemoryPlanPreservesUserSetFlagsAndReportsThem() throws {
     let policy = RuntimeStartupMemoryPolicy.resolve(
         physicalMemoryBytes: UInt64(36) << 30
     )
-    let userSet = "DARKBLOOM_GATE_UP_COTILED_FIXED12"
+    let userSet = "DARKBLOOM_COMPILED_DECODE"
     let plan = policy.environmentPlan { name in
         name == userSet ? "1" : nil
     }
@@ -190,7 +195,7 @@ func lowMemoryPlanAppliesAllDefaultsWhenNoneAreUserSet() throws {
 @Test
 func startupMemoryPolicyIsAppliedBeforeModelLoadAndCleansWarmupCache() throws {
     let source = try String(
-        contentsOfFile: "Sources/MLXFastModel/Gemma4RuntimeWeights.swift",
+        contentsOfFile: "Sources/MLXFastModel/LagunaRuntimeWeights.swift",
         encoding: .utf8
     )
     // Scope every assertion to the initializer body so this pins statement
@@ -225,7 +230,7 @@ func startupMemoryPolicyIsAppliedBeforeModelLoadAndCleansWarmupCache() throws {
 
 private func initializerBody(of source: String) throws -> String {
     let start = try #require(
-        source.range(of: "public init(loader: Gemma4WeightLoader, config: Gemma4Config)")
+        source.range(of: "public init(loader: LagunaWeightLoader, config: LagunaConfig)")
     )
     let end = try #require(
         source.range(

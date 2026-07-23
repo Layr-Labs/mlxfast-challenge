@@ -4,8 +4,7 @@ name: benchmark
 #
 # This is the Yukon-default ranked entrypoint declared by benchmark.json
 # (track id laguna-xs-2.1-serial-v2). It runs the one-token serial contract:
-# the MTP track is retired, and this serial pipeline is the only ranked
-# track.
+# this serial pipeline is the only ranked track.
 #
 # This replaces the previous multi-job fan-out with ONE serial job on ONE
 # self-hosted runner. On a dedicated box the serial order is what buys us a

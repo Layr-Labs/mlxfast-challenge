@@ -43,6 +43,13 @@ public struct TransformReport: Equatable {
 /// config.json. The transform supports the pinned Poolside Laguna XS 2.1
 /// MoE target (flat config with `model_type` "laguna", untied head) and the
 /// legacy Gemma 4 multimodal layout (nested `text_config`, tied head).
+///
+/// The legacy `.gemma4` family no longer has a runtime consumer (the Gemma 4
+/// runtime and its MTP track were removed); it is retained here deliberately
+/// as the only source-config family whose full transform pipeline (staging,
+/// atomic install, revalidation, verifier) can be exercised end to end with
+/// small synthetic fixtures -- the Laguna family requires the exact pinned
+/// 912-tensor inventory with real shapes.
 enum TransformModelFamily: Equatable {
     case gemma4
     case laguna
@@ -605,8 +612,9 @@ public enum SwiftTransform {
 
     /// Writes the runtime's `config.json`.
     ///
-    /// Gemma 4: the source checkpoint's `text_config` fields flattened to the
-    /// top level (the exact schema `Gemma4Config.load` reads), plus the
+    /// Gemma 4 (legacy): the source checkpoint's `text_config` fields
+    /// flattened to the top level (the schema the archived Gemma 4 runtime
+    /// read), plus the
     /// checkpoint-wide `quantization` block -- no vision or audio config, no
     /// architecture/tokenizer metadata duplicated from
     /// `tokenizer_config.json`.

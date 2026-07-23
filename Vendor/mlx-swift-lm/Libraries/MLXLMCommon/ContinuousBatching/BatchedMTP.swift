@@ -3,8 +3,8 @@
 // Engine-facing abstraction for batched Multi-Token Prediction (MTP)
 // speculative decoding. Declared in MLXLMCommon so the continuous-batching
 // engine (`GenerationBatch`) can drive MTP without importing MLXLLM (which
-// would create a layering cycle). The concrete Gemma 4 implementation lives
-// in MLXLLM (`Gemma4MTPEngineRuntime` / `Gemma4MTPBatchState`).
+// would create a layering cycle). Concrete implementations live in the
+// model layer (MLXLLM model families with MTP heads).
 
 import Foundation
 import MLX

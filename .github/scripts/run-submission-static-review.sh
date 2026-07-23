@@ -10,8 +10,8 @@ CONTRACT_PATH="${CONTRACT_PATH:-benchmark.json}"
 # is owned independently.
 MODEL="${MLXFAST_SUBMISSION_STATIC_REVIEW_MODEL:-claude-opus-4-8}"
 # Byte budget for the full-stack (vendored-kernel) editable surface. The whole
-# unmodified surface is 2,802,363 bytes (~2.80 MB), so the 3.0 MB MAX_BYTES
-# bounds the total surface/review payload while leaving 197,637 bytes of
+# unmodified surface is 2,139,781 bytes (~2.14 MB), so the 3.0 MB MAX_BYTES
+# bounds the total surface/review payload while leaving 860,219 bytes of
 # headroom for merged frontier work; MAX_FILE_BYTES bounds any single
 # editable file (the largest legitimate file today is ~86 KB, so 512 KiB
 # leaves generous room while stopping a single lookup-table file);

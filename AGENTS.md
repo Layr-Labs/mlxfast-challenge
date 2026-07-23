@@ -21,11 +21,8 @@ score = decode_speedup^0.75 * prefill_speedup^0.25
 Higher is better. Each speedup is the pinned baseline's seconds/token divided
 by the candidate's for that phase, both measured on the same machine behind
 the same thermal gate. Both component floors are `0.95`, hard, and every
-checked token must match the golden. The former MTP speculative-decoding
-track is retired: `benchmark.json` registers the serial track,
-`.github/workflows/benchmark.yml` is the serial ranked pipeline, and no MTP
-manifest, contract fixture, or MTP-specific local script remains in the
-repository.
+checked token must match the golden. `benchmark.json` registers the serial
+track and `.github/workflows/benchmark.yml` is the serial ranked pipeline.
 
 ## Official Hardware
 
@@ -67,15 +64,15 @@ scheduling — not disk I/O.
 
 Local work needs enough unified memory for the ~21.6 GB model plus KV state
 and buffers; roughly 40 GiB is the practical local minimum.
-Machines below 64 GiB automatically use a low-memory startup profile: retained
-co-tiled/combined weight layouts and compiled decode are disabled, the MLX
+Machines below 64 GiB automatically use a low-memory startup profile:
+compiled decode is disabled, the MLX
 allocator cache is capped at 6 GiB, and free warmup buffers are cleared before
 the worker protocol starts. The profile prints a one-line stderr notice when
 it engages and only fills in feature flags you have not set yourself —
 explicitly exported `DARKBLOOM_*`/`MLXFAST_*`/`MLX_*` values always win. Set
 `DARKBLOOM_STARTUP_MEMORY_PROFILE=full|low|auto` to override the automatic
-selection. Note the low profile does not exercise the alternate weight
-layouts locally, so verify layout-sensitive changes on a 64 GiB+ machine or
+selection. Note the low profile does not exercise compiled decode locally,
+so verify decode-path-sensitive changes on a 64 GiB+ machine or
 rely on the ranked run. The 128 GB ranked runner keeps the full profile.
 The ranked box has more headroom than that, but memory-hungry strategies
 tuned against a different machine still have to survive the paired
@@ -355,8 +352,7 @@ behaviors are expected, not bugs:
  and the worker exits if its parent dies, so the guard should fire
  rarely. Know its scope: the lock lives in `benchmark.sh`, so direct
  `mlxfast-swift` model commands (`correctness`, `correctness-trace`,
- `generate-golden`, `generate-gpqa-answers`, and the retired-track
- `mtp-*` commands, which still load the model if invoked) take no lock
+ `generate-golden`, and `generate-gpqa-answers`) take no lock
  and do not check for other runs -- run one model-holding command at a
  time, never concurrently with a local benchmark or with each other.
  (`swift test` never loads the real model and is safe alongside.)
@@ -526,15 +522,3 @@ supplied in that same invocation, such as prefill. Organizer-provided MTP or
 other speculative decoding would require a separate explicit track with a
 trusted variable-length block protocol, correctness contract, and score; no
 such track currently exists.
-
-### Retired MTP Track (historical)
-
-An experimental trained-assistant MTP block-decode track
-(`laguna-xs-2.1-mtp-v1`, previously the Yukon default) existed until
-2026-07 and has been retired without going live for Laguna: its manifests
-(`benchmark.mtp.json`, the old MTP-shaped `benchmark.json`), workflow
-content, contract fixture, weight manifests, and local scripts
-(`benchmark-mtp.sh`, `setup-mtp.sh`) were removed when the serial pipeline
-became the canonical `benchmark.yml`. Historical design records remain under
-`docs/` (marked retired) for provenance only; the serial rules above govern
-every ranked submission.

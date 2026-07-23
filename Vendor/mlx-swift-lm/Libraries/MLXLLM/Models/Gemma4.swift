@@ -67,8 +67,8 @@ public class Gemma4Model: Module, LLMModel, KVCacheDimensionProvider {
 
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Gemma4TextModel
 
-    /// Public accessor for the inner text model (needed by MTP speculative
-    /// decoding which calls `Gemma4TextModel.forwardForMTP` directly).
+    /// Public accessor for the inner text model (used by callers that need
+    /// `Gemma4TextModel` API directly, e.g. the CBv2 benchmark hooks).
     public var textModel: Gemma4TextModel { languageModel }
 
     public init(_ config: Gemma4Configuration) {

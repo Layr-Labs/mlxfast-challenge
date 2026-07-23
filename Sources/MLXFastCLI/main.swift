@@ -36,12 +36,6 @@ private enum MLXFastCLI {
             case "benchmark":
                 try runBenchmark(options)
                 return 0
-            case "mtp-probe":
-                try runExperimentalMTPProbe(options)
-                return 0
-            case "mtp-benchmark":
-                try runExperimentalTrainedMTPBenchmark(options)
-                return 0
             case "attach-gpqa-gates":
                 try runAttachGPQAGates(options)
                 return 0
@@ -382,167 +376,6 @@ private enum MLXFastCLI {
         try writeScorePayload(payload, to: scorePath)
         try emitScorePayloadToStdout(payload)
         fputs("wrote \(scorePath)\n", stderr)
-    }
-
-    private static func runExperimentalMTPProbe(_ options: ParsedOptions) throws {
-        try options.validate(
-            valueOptions: ["--weights", "--golden", "--block-size", "--tokens"]
-        )
-        let weightsPath = options.value(for: "--weights", default: "")
-        guard !weightsPath.isEmpty else {
-            throw MLXFastError.invalidInput("mtp-probe requires --weights PATH")
-        }
-        let goldenPath = options.value(for: "--golden", default: "")
-        guard !goldenPath.isEmpty else {
-            throw MLXFastError.invalidInput("mtp-probe requires --golden PATH")
-        }
-        let maxBlockSize = try parsePositiveInt(
-            options.value(
-                for: "--block-size",
-                default: "\(MLXFastConstants.experimentalMTPMaxBlockSize)"
-            ),
-            optionName: "--block-size"
-        )
-        let totalTokenCount = try parsePositiveInt(
-            options.value(
-                for: "--tokens",
-                default: "\(MLXFastConstants.experimentalMTPMaxTotalTokens)"
-            ),
-            optionName: "--tokens"
-        )
-        guard let worker = try runtimeWorkerOptions(
-            blockedGoldenPath: goldenPath
-        ) else {
-            throw MLXFastError.invalidInput(
-                "mtp-probe requires the runtime worker; MLXFAST_USE_RUNTIME_WORKER=0 is unsupported"
-            )
-        }
-        let report = try LagunaRuntime.experimentalMTPProbe(
-            ExperimentalMTPProbeOptions(
-                weightsPath: weightsPath,
-                goldenPath: goldenPath,
-                maxBlockSize: maxBlockSize,
-                totalTokenCount: totalTokenCount
-            ),
-            worker: worker
-        )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        let data = try encoder.encode(report)
-        FileHandle.standardOutput.write(data)
-        if data.last != 0x0a {
-            print("")
-        }
-    }
-
-    private static func runExperimentalTrainedMTPBenchmark(
-        _ options: ParsedOptions
-    ) throws {
-        try options.validate(
-            valueOptions: [
-                "--target-source",
-                "--weights",
-                "--assistant",
-                "--contract",
-                "--golden",
-                "--block-size",
-                "--tokens",
-                "--target-verification",
-            ],
-            flagOptions: ["--require-trained-assistant"]
-        )
-        let sourceTargetPath = options.value(
-            for: "--target-source",
-            default: ""
-        )
-        let weightsPath = options.value(for: "--weights", default: "")
-        let assistantPath = options.value(for: "--assistant", default: "")
-        let contractPath = options.value(for: "--contract", default: "")
-        let goldenPath = options.value(for: "--golden", default: "")
-        guard !sourceTargetPath.isEmpty else {
-            throw MLXFastError.invalidInput(
-                "mtp-benchmark requires --target-source PATH for the pinned 31B-IT source"
-            )
-        }
-        guard !weightsPath.isEmpty else {
-            throw MLXFastError.invalidInput(
-                "mtp-benchmark requires --weights PATH for the transformed 31B-IT target"
-            )
-        }
-        guard !assistantPath.isEmpty else {
-            throw MLXFastError.invalidInput(
-                "mtp-benchmark requires --assistant PATH"
-            )
-        }
-        guard !contractPath.isEmpty else {
-            throw MLXFastError.invalidInput(
-                "mtp-benchmark requires --contract PATH"
-            )
-        }
-        guard !goldenPath.isEmpty else {
-            throw MLXFastError.invalidInput(
-                "mtp-benchmark requires --golden PATH for the 31B-IT target"
-            )
-        }
-        let maxBlockSize = try parsePositiveInt(
-            options.value(
-                for: "--block-size",
-                default: "\(MLXFastConstants.experimentalMTPMaxBlockSize)"
-            ),
-            optionName: "--block-size"
-        )
-        let totalTokenCount = try parsePositiveInt(
-            options.value(
-                for: "--tokens",
-                default: "\(MLXFastConstants.experimentalMTPMaxTotalTokens)"
-            ),
-            optionName: "--tokens"
-        )
-        let verificationValue = options.value(
-            for: "--target-verification",
-            default: MTPVerificationMode.exactPair.rawValue
-        ).lowercased()
-        guard let verificationMode = MTPVerificationMode(
-            rawValue: verificationValue
-        ) else {
-            throw MLXFastError.invalidInput(
-                "--target-verification must be exact-pair or serial"
-            )
-        }
-        guard let worker = try runtimeWorkerOptions(
-            blockedGoldenPath: goldenPath
-        ) else {
-            throw MLXFastError.invalidInput(
-                "mtp-benchmark requires the sandboxed runtime worker"
-            )
-        }
-        let report = try LagunaRuntime.experimentalTrainedMTPBenchmark(
-            ExperimentalTrainedMTPOptions(
-                sourceTargetPath: sourceTargetPath,
-                targetWeightsPath: weightsPath,
-                assistantPath: assistantPath,
-                contractPath: contractPath,
-                goldenPath: goldenPath,
-                maxBlockSize: maxBlockSize,
-                totalTokenCount: totalTokenCount,
-                verificationMode: verificationMode,
-                requireTrainedAssistant: options.hasFlag(
-                    "--require-trained-assistant"
-                )
-            ),
-            worker: worker
-        )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [
-            .prettyPrinted,
-            .sortedKeys,
-            .withoutEscapingSlashes,
-        ]
-        let data = try encoder.encode(report)
-        FileHandle.standardOutput.write(data)
-        if data.last != 0x0a {
-            print("")
-        }
     }
 
     // Emits the in-memory payload, not a re-read of scorePath: the benchmark
@@ -1865,8 +1698,6 @@ private enum MLXFastCLI {
               mlxfast-swift correctness-trace [--weights PATH] [--golden PATH] [--case NAME] --step N [--top-k N]
               mlxfast-swift preflight [--weights PATH] [--golden PATH]
               mlxfast-swift benchmark [--local-submit|--local-iterate] [--weights PATH] [--golden PATH] [--score-path PATH]
-              mlxfast-swift mtp-probe --weights PATH --golden PATH [--block-size N] [--tokens N]
-              mlxfast-swift mtp-benchmark --target-source IT_SOURCE --weights IT_PATH --assistant PATH --contract PATH --golden IT_GOLDEN --require-trained-assistant [--block-size N] [--tokens N] [--target-verification exact-pair|serial]
               mlxfast-swift attach-gpqa-gates [--golden PATH] --gpqa PATH [--tokenizer PATH] [--output PATH] [--case-count N] [--max-new-tokens N]
               mlxfast-swift attach-free-run-gate [--golden PATH] [--weights PATH] [--output PATH] [--name NAME] [--steps N] [--allow-partial] [--case NAME | --prompt-file PATH [--tokenizer PATH]] [--exact-prefix N]
               mlxfast-swift generate-golden --prompt-file PATH [--weights PATH] [--tokenizer PATH] --output PATH --name NAME --steps N

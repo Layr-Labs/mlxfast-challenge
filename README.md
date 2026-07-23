@@ -5,8 +5,8 @@ Run Poolside Laguna XS 2.1 NVFP4, keep its exact greedy output, and make
 prefill and serial decode faster.
 
 See [TASK.md](TASK.md) for the full problem statement, scoring formula, and
-approach space. (The former MTP speculative-decoding track is retired; the
-serial track described here is the default and only ranked track.)
+approach space. (The serial track described here is the default and only
+ranked track.)
 
 The Poolside checkpoint is registered as the new contract
 `laguna-xs-2.1-serial-v2`. The earlier `laguna-xs-2.1-serial-v1` contract used

@@ -22,16 +22,15 @@ Artifacts referenced (and hash-pinned) by this repository:
 | `poolside/Laguna-XS-2.1` @ `c405648833500615a2efde76886b8aed4fb9324e` (upstream model, BF16) | Poolside | OpenMDW-1.1 |
 | `poolside/Laguna-XS-2.1-NVFP4-mlx` @ `841778bda563a36104dd521e37d99218e46f4f25` (current v2 serial-track reference checkpoint; Poolside NVFP4, group size 16) | Poolside | OpenMDW-1.1 |
 | `mlx-community/Laguna-XS-2.1-4bit` @ `c42e0a8f8d504ceacde015a535dcb286d65c8799` (historical `laguna-xs-2.1-serial-v1` reference; MLX affine 4-bit, group size 64) | mlx-community conversion of the above | OpenMDW-1.1 |
-| `poolside/Laguna-XS-2.1-DFlash` @ `5c36361aab23c8ed3afbd079c10c426b677bc607` (the retired MTP track's draft/assistant; no longer downloaded or pinned by setup, credited here for the historical records under `docs/`) | Poolside | OpenMDW-1.1 |
 
-Attribution statement: "Laguna XS 2.1, Laguna XS 2.1 NVFP4 MLX, and Laguna
-XS 2.1 DFlash © Poolside, licensed OpenMDW-1.1
+Attribution statement: "Laguna XS 2.1 and Laguna XS 2.1 NVFP4 MLX
+© Poolside, licensed OpenMDW-1.1
 (<https://huggingface.co/poolside/Laguna-XS-2.1>). Historical affine MLX
 target conversion by mlx-community."
 
 Compliance notes for anyone redistributing these models or derivative
-weights obtained through this harness (e.g. a transformed `weights/` or
-`mtp-weights/` tree):
+weights obtained through this harness (e.g. a transformed `weights/`
+tree):
 
 - Review and satisfy the OpenMDW-1.1 terms published on the model cards
   before redistribution. TODO(operator): confirm the SPDX identifier and a

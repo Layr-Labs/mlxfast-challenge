@@ -3,15 +3,15 @@ import MLX
 
 /// Selects a model-startup profile from the machine's physical-memory budget.
 ///
-/// Editable runtime paths may retain large alternate weight layouts in
+/// Editable runtime paths may retain compiled closures and buffers in
 /// addition to the ~21.6 GB Poolside NVFP4 checkpoint. The full profile is
 /// appropriate for the 128 GiB ranked runner, but may leave too little
 /// headroom for macOS, warmup activations, KV state, and Metal buffers on the
 /// documented 40 GiB local minimum.
 ///
 /// The low-memory feature defaults never clobber explicit settings: a flag
-/// the user already exported keeps its value (so, for example, verifying a
-/// co-tiled layout on a 48 GiB machine still works), and the automatic
+/// the user already exported keeps its value (so, for example, exercising
+/// compiled decode on a 48 GiB machine still works), and the automatic
 /// selection itself can be overridden with
 /// `DARKBLOOM_STARTUP_MEMORY_PROFILE=full|low|auto`. When the low-memory
 /// profile engages it announces itself on stderr, including any user-set
@@ -73,37 +73,14 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
                 maxOperationsPerCommandBuffer: 64,
                 clearAllocatorCacheAfterWarmup: true,
                 environmentOverrides: [
-                    // Avoid retaining compiled closures and the largest alternate
-                    // weight layouts in addition to the source model. The
-                    // VERIFY_* companions matter too: a verify flag alone
-                    // re-materializes the layout it compares against.
+                    // Avoid retaining compiled closures in addition to the
+                    // source model. Both flags gate the vendored compiled
+                    // decode path (MLXLMCommon CompiledDecode/MLXHardwareInfo)
+                    // that the Laguna runtime dispatches. The Gemma-era
+                    // alternate weight-layout flags were removed with the
+                    // Gemma 4 runtime.
                     "MLX_COMPILED_DECODE": "0",
-                    "MLX_COMPILED_MLP_TAIL": "0",
                     "DARKBLOOM_COMPILED_DECODE": "0",
-                    "MLXFAST_COMBINED_ATTENTION_PREFILL": "0",
-                    "MLXFAST_VERIFY_COMBINED_ATTENTION_PREFILL": "0",
-                    "MLXFAST_FUSED_QKV": "0",
-                    "MLXFAST_FUSED_FULL_QK": "0",
-                    "MLXFAST_FUSED_GATE_UP": "0",
-                    "MLXFAST_INDEXED_DOWN": "0",
-                    "MLXFAST_INDEXED_OUTPUT_FAST": "0",
-                    "DARKBLOOM_PACKED_GATE_UP_INDICES": "0",
-                    "DARKBLOOM_VERIFY_PACKED_GATE_UP_BITS": "0",
-                    "DARKBLOOM_GATE_UP_COTILED_FIXED12": "0",
-                    "DARKBLOOM_VERIFY_GATE_UP_COTILED_FIXED12_BITS": "0",
-                    "MLXFAST_PACKED_DOWN_INDICES": "0",
-                    "MLXFAST_VERIFY_PACKED_DOWN_BITS": "0",
-                    "DARKBLOOM_DOWN_COTILED_FIXED12": "0",
-                    "DARKBLOOM_VERIFY_DOWN_COTILED_FIXED12_BITS": "0",
-                    "MLXFAST_PACKED_OUTPUT_INDICES": "0",
-                    "MLXFAST_VERIFY_PACKED_OUTPUT_BITS": "0",
-                    "DARKBLOOM_OUTPUT_COTILED": "0",
-                    "DARKBLOOM_OUTPUT_COTILED_SLIDING": "0",
-                    "DARKBLOOM_OUTPUT_COTILED_FULL": "0",
-                    "DARKBLOOM_VERIFY_OUTPUT_COTILED_BITS": "0",
-                    "DARKBLOOM_VERIFY_OUTPUT_STOCK_BITS": "0",
-                    "DARKBLOOM_TIED_HEAD_QMV": "0",
-                    "DARKBLOOM_VERIFY_TIED_HEAD_BITS": "0",
                 ]
             )
         }

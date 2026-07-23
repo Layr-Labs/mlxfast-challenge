@@ -9,6 +9,27 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// MARK: - Shared Gemma 4 namespace
+
+/// Public namespace for Gemma 4 types that need cross-module visibility.
+public enum Gemma4 {
+
+    /// Position offset for RoPE, either a single scalar (standard decode)
+    /// or a per-row `MLXArray` (continuous-batching paths).
+    ///
+    /// `@unchecked Sendable` because `MLXArray` is not `Sendable`; callers must
+    /// treat these values as immutable snapshots (they are only ever read, never
+    /// mutated in place).
+    public enum PositionOffset: @unchecked Sendable {
+        case scalar(Int)
+        case batch(MLXArray)
+        /// Graph-tracked offset from `CompilableKVCache.offsetArray`.
+        /// Must stay as an `MLXArray` so `compile()` can trace through
+        /// the RoPE computation without forcing a host readback.
+        case graphArray(MLXArray)
+    }
+}
+
 // MARK: - vMLX decode hot-path helpers (ported from osaurus/main Gemma4Text)
 //
 // File-private, self-contained compiled fusions. They do NOT depend on the
@@ -776,9 +797,8 @@ private class Gemma4MLP: Module {
 
 /// Gemma 4 decoder layer. Combines `Gemma4Attention` with an MLP (or MoE)
 /// block, the per-layer-input (PLE) path, and residual / layer-scalar
-/// plumbing. Consumed by `Gemma4TextModelInner` and by the Gemma 4 MTP
-/// drafter's trunk in `Gemma4MTP`; not intended as a user-facing
-/// composable layer.
+/// plumbing. Consumed by `Gemma4TextModelInner`; not intended as a
+/// user-facing composable layer.
 public class Gemma4DecoderLayer: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
@@ -924,10 +944,8 @@ public class Gemma4DecoderLayer: Module {
 // MARK: - Text Model
 
 /// Inner Gemma 4 trunk: embeddings + per-layer-input (PLE) + 35 decoder
-/// layers + final norm. Public so the Gemma 4 MTP drafter in
-/// `Gemma4MTP` can build its own 4-layer kv-shared trunk; not
-/// intended as a user-facing model — use `Gemma4TextModel` for
-/// standalone inference.
+/// layers + final norm. Not intended as a user-facing model — use
+/// `Gemma4TextModel` for standalone inference.
 public class Gemma4TextModelInner: Module {
     let config: Gemma4TextConfiguration
     let embedScale: Float
@@ -947,7 +965,7 @@ public class Gemma4TextModelInner: Module {
     let firstKvSharedLayerIdx: Int
 
     /// Index of the last non-shared full-attention layer (-1 if none).
-    /// Used by the shared-KV capture hook for the MTP drafter.
+    /// Used by the shared-KV capture hook.
     let lastFullAttentionNonSharedIdx: Int
     let lastSlidingAttentionNonSharedIdx: Int
 
@@ -994,7 +1012,7 @@ public class Gemma4TextModelInner: Module {
         }
         self.previousKvs = kvMap
 
-        // Capture indices for MTP drafter: the last layer of each type that
+        // Capture indices: the last layer of each type that
         // still has its own K/V (not shared from an earlier layer).
         let firstShared = self.firstKvSharedLayerIdx
         var lastFull = -1
@@ -1022,11 +1040,10 @@ public class Gemma4TextModelInner: Module {
         ).postNorm
     }
 
-    /// Variant that ALSO returns the pre-norm last-layer hidden state.
-    /// The MTP drafter's `pre_projection` was trained against the pre-norm
-    /// hidden (HF captures `hidden_states` at the decoder-layer boundary,
+    /// Variant that ALSO returns the pre-norm last-layer hidden state
+    /// (HF captures `hidden_states` at the decoder-layer boundary,
     /// BEFORE `model.norm`); the LM head consumes the post-norm hidden.
-    /// The non-MTP path goes through `callAsFunction`.
+    /// The standard path goes through `callAsFunction`.
     public func callCapturingPreNorm(
         _ inputs: MLXArray,
         cache: [KVCache]? = nil,
@@ -1246,8 +1263,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     fileprivate let config: Gemma4TextConfiguration
     let model: Gemma4TextModelInner
 
-    /// Read-only accessor for the underlying text configuration. Needed by
-    /// `Gemma4AssistantDraftModel` for its bind-time compatibility checks.
+    /// Read-only accessor for the underlying text configuration.
     public var configuration: Gemma4TextConfiguration { config }
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
@@ -1299,23 +1315,6 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         // gate is off this is equivalent to `tanh(out / cap) * cap`.
         out = gemma4CompiledLogitSoftcap(out, MLXArray(config.finalLogitSoftcapping))
         return out
-    }
-
-    /// Compute the scaled input embedding for `tokens`, matching what the
-    /// inner trunk does in its first step (`embedTokens(inputs) * embedScale`).
-    /// Used by `Gemma4AssistantDraftModel` as the "target embedding" input
-    /// when building its drafter-step input `[target_embed(last_token), last_hidden]`.
-    public func embedTokensForDrafter(_ tokens: MLXArray) -> MLXArray {
-        model.embedTokens(tokens) * Float(config.hiddenSize).squareRoot()
-    }
-
-    /// Internal helper for Gemma4CaptureHookTests. Not part of the public API.
-    internal func _testCallInner(
-        _ inputs: MLXArray,
-        cache: [KVCache],
-        captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil
-    ) -> MLXArray {
-        model(inputs, cache: cache, captureHook: captureHook)
     }
 
     /// Parse the layer index out of a weight key like

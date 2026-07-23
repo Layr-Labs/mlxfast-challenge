@@ -7,8 +7,8 @@ single-machine pipeline: how private material is handled, what confines
 submitted code while it runs, which output channels are closed, and which
 gaps are known and stated rather than papered over.
 
-The serial track is the default — and only — ranked track: the former MTP
-track is retired, and the serial ranked pipeline now runs under the
+The serial track is the default — and only — ranked track; the serial
+ranked pipeline runs under the
 canonical workflow name `benchmark.yml` (it previously ran as
 `serial-benchmark.yml`). The GPQA and teacher-forced base-model gates below
 describe that live default path.

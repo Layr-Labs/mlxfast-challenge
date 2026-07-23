@@ -32,8 +32,7 @@ private enum ParticipantWorkerCLI {
             switch command {
             case "runtime-worker":
                 try options.requireOnly(
-                    values: ["--weights"],
-                    flags: []
+                    values: ["--weights"]
                 )
                 let weightsPath = options.value(
                     for: "--weights",
@@ -45,8 +44,7 @@ private enum ParticipantWorkerCLI {
 
             case "preflight":
                 try options.requireOnly(
-                    values: ["--weights"],
-                    flags: []
+                    values: ["--weights"]
                 )
                 let weightsPath = options.value(
                     for: "--weights",
@@ -56,48 +54,6 @@ private enum ParticipantWorkerCLI {
                 )
                 try LagunaRuntime.runPreflightWorker(
                     weightsPath: weightsPath
-                )
-
-            case "mtp-runtime-worker":
-                try options.requireOnly(
-                    values: [
-                        "--weights",
-                        "--assistant",
-                        "--contract",
-                        "--target-verification",
-                    ],
-                    flags: ["--require-trained-assistant"]
-                )
-                let weightsPath = options.value(for: "--weights")
-                let assistantPath = options.value(for: "--assistant")
-                let contractPath = options.value(for: "--contract")
-                guard !weightsPath.isEmpty,
-                      !assistantPath.isEmpty,
-                      !contractPath.isEmpty
-                else {
-                    throw MLXFastError.invalidInput(
-                        "mtp-runtime-worker requires weights, assistant, and contract paths"
-                    )
-                }
-                let verificationValue = options.value(
-                    for: "--target-verification",
-                    default: MTPVerificationMode.exactPair.rawValue
-                ).lowercased()
-                guard let verificationMode = MTPVerificationMode(
-                    rawValue: verificationValue
-                ) else {
-                    throw MLXFastError.invalidInput(
-                        "--target-verification must be exact-pair or serial"
-                    )
-                }
-                try LagunaRuntime.runExperimentalMTPWorker(
-                    targetWeightsPath: weightsPath,
-                    assistantPath: assistantPath,
-                    contractPath: contractPath,
-                    verificationMode: verificationMode,
-                    requireTrainedAssistant: options.hasFlag(
-                        "--require-trained-assistant"
-                    )
                 )
 
             default:
@@ -118,7 +74,6 @@ private enum ParticipantWorkerCLI {
             Usage:
               mlxfast-runtime-worker runtime-worker [--weights PATH]
               mlxfast-runtime-worker preflight [--weights PATH]
-              mlxfast-runtime-worker mtp-runtime-worker --weights PATH --assistant PATH --contract PATH [--target-verification exact-pair|serial] [--require-trained-assistant]
 
             Participant-side MLX runtime worker for mlxfast-swift.
             """
@@ -128,11 +83,9 @@ private enum ParticipantWorkerCLI {
 
 private struct WorkerOptions {
     private let values: [String: String]
-    private let flags: Set<String>
 
     init(_ arguments: [String]) throws {
         var values: [String: String] = [:]
-        var flags = Set<String>()
         var index = 0
         while index < arguments.count {
             let option = arguments[index]
@@ -140,15 +93,6 @@ private struct WorkerOptions {
                 throw MLXFastError.invalidInput(
                     "unexpected participant worker argument '\(option)'"
                 )
-            }
-            if option == "--require-trained-assistant" {
-                guard flags.insert(option).inserted else {
-                    throw MLXFastError.invalidInput(
-                        "duplicate participant worker option \(option)"
-                    )
-                }
-                index += 1
-                continue
             }
             guard values[option] == nil else {
                 throw MLXFastError.invalidInput(
@@ -164,21 +108,14 @@ private struct WorkerOptions {
             index += 2
         }
         self.values = values
-        self.flags = flags
     }
 
     func value(for option: String, default defaultValue: String = "") -> String {
         values[option] ?? defaultValue
     }
 
-    func hasFlag(_ option: String) -> Bool {
-        flags.contains(option)
-    }
-
-    func requireOnly(values allowedValues: Set<String>, flags allowedFlags: Set<String>) throws {
-        let unexpectedValues = Set(values.keys).subtracting(allowedValues)
-        let unexpectedFlags = flags.subtracting(allowedFlags)
-        if let unexpected = unexpectedValues.union(unexpectedFlags).sorted().first {
+    func requireOnly(values allowedValues: Set<String>) throws {
+        if let unexpected = Set(values.keys).subtracting(allowedValues).sorted().first {
             throw MLXFastError.invalidInput(
                 "unexpected participant worker option \(unexpected)"
             )

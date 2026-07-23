@@ -243,11 +243,6 @@ extension LagunaRuntime {
         weightCache: LagunaRuntimeWeightCache,
         state: inout RuntimeWorkerState
     ) throws -> RuntimeWorkerResponse {
-        if request.kind != "decode_block", request.maxBlockSize != nil {
-            throw MLXFastError.invalidInput(
-                "runtime worker max_block_size is valid only for decode_block"
-            )
-        }
         let carriesTraceDiagnostics =
             request.topK != nil || request.expectedToken != nil
         if carriesTraceDiagnostics {
@@ -451,75 +446,6 @@ extension LagunaRuntime {
                 nonce: sessionNonce,
                 ok: true,
                 token: token
-            )
-
-        case "decode_block":
-            let blockRequest = try validateExperimentalDecodeBlockRequest(
-                request,
-                decodedTokenCount: state.decodeStep
-            )
-            guard let cache = state.decodeCache else {
-                throw MLXFastError.invalidInput(
-                    "runtime worker decode_block before decode_begin"
-                )
-            }
-            let (positionOffset, positionOverflow) =
-                state.decodeSeedTokenCount.addingReportingOverflow(state.decodeStep)
-            guard !positionOverflow else {
-                throw MLXFastError.invalidInput(
-                    "runtime worker decode_block position offset overflows Int"
-                )
-            }
-
-            let tokens: [Int]
-            do {
-                // Serial target-only block fallback (one Laguna forward per
-                // returned token) through the shared pure block-generation
-                // helper.
-                let model = try weightCache.requireLibraryModel()
-                tokens = try TargetBlockGeneration.generateSerialBlock(
-                    previousToken: blockRequest.previousToken,
-                    maxBlockSize: blockRequest.maxBlockSize,
-                    positionOffset: positionOffset
-                ) { inputToken, stepOffset in
-                    let logits = try lagunaLogits(
-                        inputIDs: MLXArray([Int32(inputToken)], [1, 1]),
-                        model: model,
-                        cache: cache,
-                        positionOffset: stepOffset
-                    )
-                    return try LagunaCorrectness.greedyToken(from: logits)
-                }
-            } catch {
-                // A failed multi-forward request may have partially advanced
-                // device KV state. Poison this decode sequence so no later
-                // request can continue from an ambiguous cache position.
-                state.decodeCache = nil
-                throw error
-            }
-            guard !tokens.isEmpty, tokens.count <= blockRequest.maxBlockSize else {
-                state.decodeCache = nil
-                throw MLXFastError.invalidInput(
-                    "runtime worker decode_block generator returned an invalid block length"
-                )
-            }
-            let (nextDecodeStep, stepOverflow) =
-                state.decodeStep.addingReportingOverflow(tokens.count)
-            guard !stepOverflow,
-                  nextDecodeStep
-                      <= MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens
-            else {
-                state.decodeCache = nil
-                throw MLXFastError.invalidInput(
-                    "runtime worker decode_block exceeded the experimental token limit"
-                )
-            }
-            state.decodeStep = nextDecodeStep
-            return RuntimeWorkerResponse(
-                id: request.id,
-                nonce: sessionNonce,
-                ok: true,
-                tokens: tokens
             )
 
         case "phase_diagnostics":
@@ -851,7 +777,6 @@ struct RuntimeWorkerRequest: Codable {
     let token: Int?
     let seedTokens: [Int]?
     let steps: Int?
-    let maxBlockSize: Int?
     let topK: Int?
     let expectedToken: Int?
 
@@ -862,7 +787,6 @@ struct RuntimeWorkerRequest: Codable {
         token: Int? = nil,
         seedTokens: [Int]? = nil,
         steps: Int? = nil,
-        maxBlockSize: Int? = nil,
         topK: Int? = nil,
         expectedToken: Int? = nil
     ) {
@@ -872,7 +796,6 @@ struct RuntimeWorkerRequest: Codable {
         self.token = token
         self.seedTokens = seedTokens
         self.steps = steps
-        self.maxBlockSize = maxBlockSize
         self.topK = topK
         self.expectedToken = expectedToken
     }
@@ -907,10 +830,6 @@ struct RuntimeWorkerRequest: Codable {
             forKey: .seedTokens
         )
         steps = try container.decodeIfPresent(Int.self, forKey: .steps)
-        maxBlockSize = try container.decodeIfPresent(
-            Int.self,
-            forKey: .maxBlockSize
-        )
         topK = try container.decodeIfPresent(Int.self, forKey: .topK)
         expectedToken = try container.decodeIfPresent(
             Int.self,
@@ -926,7 +845,6 @@ struct RuntimeWorkerRequest: Codable {
         try container.encodeIfPresent(token, forKey: .token)
         try container.encodeIfPresent(seedTokens, forKey: .seedTokens)
         try container.encodeIfPresent(steps, forKey: .steps)
-        try container.encodeIfPresent(maxBlockSize, forKey: .maxBlockSize)
         try container.encodeIfPresent(topK, forKey: .topK)
         try container.encodeIfPresent(expectedToken, forKey: .expectedToken)
     }
@@ -938,7 +856,6 @@ struct RuntimeWorkerRequest: Codable {
         case token
         case seedTokens = "seed_tokens"
         case steps
-        case maxBlockSize = "max_block_size"
         case topK = "top_k"
         case expectedToken = "expected_token"
     }
@@ -957,73 +874,6 @@ private struct RuntimeWorkerWireCodingKey: CodingKey {
         self.stringValue = String(intValue)
         self.intValue = intValue
     }
-}
-
-struct ExperimentalDecodeBlockRequest: Equatable {
-    let previousToken: Int
-    let maxBlockSize: Int
-}
-
-func validateExperimentalDecodeBlockRequest(
-    _ request: RuntimeWorkerRequest,
-    decodedTokenCount: Int
-) throws -> ExperimentalDecodeBlockRequest {
-    guard request.kind == "decode_block" else {
-        throw MLXFastError.invalidInput(
-            "experimental block validation requires decode_block"
-        )
-    }
-    guard request.id > 0 else {
-        throw MLXFastError.invalidInput(
-            "runtime worker decode_block request id must be positive"
-        )
-    }
-    guard request.promptTokens == nil,
-          request.seedTokens == nil,
-          request.steps == nil,
-          request.topK == nil,
-          request.expectedToken == nil
-    else {
-        throw MLXFastError.invalidInput(
-            "runtime worker decode_block request contains fields for another request kind"
-        )
-    }
-    guard let previousToken = request.token,
-          previousToken >= 0,
-          previousToken < MLXFastConstants.vocabSize
-    else {
-        throw MLXFastError.invalidInput(
-            "runtime worker decode_block request has an invalid token"
-        )
-    }
-    guard let maxBlockSize = request.maxBlockSize,
-          maxBlockSize > 0,
-          maxBlockSize <= MLXFastConstants.experimentalMTPMaxBlockSize
-    else {
-        throw MLXFastError.invalidInput(
-            "runtime worker decode_block max_block_size must be in "
-                + "1...\(MLXFastConstants.experimentalMTPMaxBlockSize)"
-        )
-    }
-    guard decodedTokenCount >= 0 else {
-        throw MLXFastError.invalidInput(
-            "runtime worker decode_block state has a negative token count"
-        )
-    }
-    let (requestedTotal, overflow) =
-        decodedTokenCount.addingReportingOverflow(maxBlockSize)
-    guard !overflow,
-          requestedTotal
-              <= MLXFastConstants.experimentalMTPMaxConfiguredTotalTokens
-    else {
-        throw MLXFastError.invalidInput(
-            "runtime worker decode_block request exceeds the experimental token limit"
-        )
-    }
-    return ExperimentalDecodeBlockRequest(
-        previousToken: previousToken,
-        maxBlockSize: maxBlockSize
-    )
 }
 
 struct RuntimeWorkerState {
@@ -1632,43 +1482,6 @@ func stopRuntimeWorkerProcess(
     return !process.isRunning
 }
 
-enum RuntimeWorkerLaunch: Equatable {
-    case serial
-    case trainedMTP(
-        assistantPath: String,
-        contractPath: String,
-        verificationMode: MTPVerificationMode
-    )
-
-    func arguments(weightsPath: String) -> [String] {
-        switch self {
-        case .serial:
-            return [
-                "runtime-worker",
-                "--weights",
-                weightsPath,
-            ]
-        case .trainedMTP(
-            let assistantPath,
-            let contractPath,
-            let verificationMode
-        ):
-            return [
-                "mtp-runtime-worker",
-                "--weights",
-                weightsPath,
-                "--assistant",
-                assistantPath,
-                "--contract",
-                contractPath,
-                "--target-verification",
-                verificationMode.rawValue,
-                "--require-trained-assistant",
-            ]
-        }
-    }
-}
-
 extension LagunaRuntime {
     public static func runPreflightWithWorker(
         weightsPath: String,
@@ -1790,8 +1603,7 @@ final class RuntimeWorkerClient {
 
     init(
         options: RuntimeWorkerOptions,
-        weightsPath: String,
-        launch: RuntimeWorkerLaunch = .serial
+        weightsPath: String
     ) throws {
         guard options.helloTimeoutSeconds.isFinite,
               options.helloTimeoutSeconds > 0,
@@ -1808,7 +1620,11 @@ final class RuntimeWorkerClient {
         let stdin = Pipe()
         let stdout = Pipe()
         let stderr = Pipe()
-        let workerArguments = launch.arguments(weightsPath: weightsPath)
+        let workerArguments = [
+            "runtime-worker",
+            "--weights",
+            weightsPath,
+        ]
         if let sandboxProfilePath = options.sandboxProfilePath {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
             process.arguments = [
@@ -1937,41 +1753,6 @@ final class RuntimeWorkerClient {
         )
     }
 
-    func decodeBlock(
-        previousToken: Int,
-        maxBlockSize: Int
-    ) throws -> RuntimeWorkerResponse {
-        try send(
-            kind: "decode_block",
-            token: previousToken,
-            maxBlockSize: maxBlockSize
-        )
-    }
-
-    func beginTrainedMTPDecode(
-        seedTokens: [Int]
-    ) throws -> RuntimeWorkerResponse {
-        try send(
-            kind: "mtp_decode_begin",
-            seedTokens: seedTokens
-        )
-    }
-
-    func trainedMTPDecodeBlock(
-        previousToken: Int,
-        maxBlockSize: Int
-    ) throws -> RuntimeWorkerResponse {
-        try send(
-            kind: "mtp_decode_block",
-            token: previousToken,
-            maxBlockSize: maxBlockSize
-        )
-    }
-
-    func trainedMTPDiagnostics() throws -> RuntimeWorkerResponse {
-        try send(kind: "mtp_phase_diagnostics")
-    }
-
     func phaseDiagnostics() throws -> RuntimeWorkerResponse {
         try send(kind: "phase_diagnostics")
     }
@@ -1982,7 +1763,6 @@ final class RuntimeWorkerClient {
         token: Int? = nil,
         seedTokens: [Int]? = nil,
         steps: Int? = nil,
-        maxBlockSize: Int? = nil,
         topK: Int? = nil,
         expectedToken: Int? = nil
     ) throws -> RuntimeWorkerResponse {
@@ -1998,7 +1778,6 @@ final class RuntimeWorkerClient {
             token: token,
             seedTokens: seedTokens,
             steps: steps,
-            maxBlockSize: maxBlockSize,
             topK: topK,
             expectedToken: expectedToken
         )

@@ -541,7 +541,7 @@ LOCAL_RUN_LOCK_OWNED=""
 # the model in-process, but a run in its pre-worker phase (validation,
 # weights digest) is about to spawn a ~21.6 GB worker and would otherwise be
 # invisible to this scan until that load has already started.
-readonly RESIDENT_MODEL_PROCESS_PATTERN='runtime-worker[[:space:]]+--weights|mlxfast-swift[[:space:]]+(benchmark|correctness|correctness-trace|generate-golden|generate-gpqa-answers|attach-free-run-gate|mtp-probe|mtp-benchmark)'
+readonly RESIDENT_MODEL_PROCESS_PATTERN='runtime-worker[[:space:]]+--weights|mlxfast-swift[[:space:]]+(benchmark|correctness|correctness-trace|generate-golden|generate-gpqa-answers|attach-free-run-gate)'
 
 local_run_guard_enabled() {
   [[ "${MLXFAST_LOCAL_RUN_GUARD:-1}" != "0" ]] || return 1

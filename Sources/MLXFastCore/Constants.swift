@@ -82,20 +82,6 @@ public enum MLXFastConstants {
     // many checked token steps. Charging setup prevents submitted model code
     // from precomputing future decode tokens in an unscored seed-prefill phase.
     public static let benchmarkDecodeSteps = 128
-    // Retired MTP diagnostic-command limits. The unranked `mtp-*` commands
-    // remain protocol-explicit compatibility tools: they emit diagnostics only
-    // and do not contribute to score.json. Keep the total explicit (rather
-    // than deriving it) so changing either protocol requires a conscious review.
-    public static let experimentalMTPMaxBlockSize = 4
-    // Compatibility default for callers that do not select an explicit public
-    // oracle length.
-    public static let experimentalMTPMaxTotalTokens = 128
-    // Trusted-parent configured experimental runs may exercise longer tail
-    // boundaries when the selected oracle contains enough tokens. 1,536 was
-    // the retired laguna-xs-2.1-mtp-v1 contract's `maximum_decode_tokens`: it
-    // keeps the compatibility diagnostics able to wrap Laguna's 512-position
-    // sliding-window cache three times.
-    public static let experimentalMTPMaxConfiguredTotalTokens = 1_536
     // Local iterate charges the same 512-token seed prefill as the official
     // decode window, so it must use the same denominator to produce a
     // comparable decode seconds-per-token estimate.

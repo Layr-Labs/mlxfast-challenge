@@ -166,20 +166,11 @@ let package = Package(
             ],
             path: "Tests/MLXLMTests",
             exclude: [
-                "README.md",
-                // Stale VLM MTP spike: references Gemma4 (MLXVLM) MTP API
-                // removed by the vMLX decode port (#55). Broken at the
-                // engine-v2 branch base and blocks the whole test target;
-                // excluded until the VLM MTP spike is updated or deleted.
-                "Gemma4VLMMTPSpikeTests.swift",
+                "README.md"
             ],
             resources: [
                 .process("Resources/1080p_30.mov"),
                 .process("Resources/audio_only.mov"),
-                .process("Resources/Gemma4MTPPrompts.json"),
-                .process("Resources/gemma4-26B-A4B-assistant-config.json"),
-                .process("Resources/gemma4-E4B-assistant-config.json"),
-                .process("Resources/mtp-oracle/gemma4-e2b-block3-max64.json"),
             ]
         ),
         .testTarget(
@@ -233,13 +224,6 @@ let package = Package(
                 .product(name: "MLXRandom", package: "mlx-swift"),
             ],
             path: "benchmarks",
-            exclude: [
-                "mtp-2026-05-09-130614.md",
-                "mtp-2026-05-09-142113.md",
-                "mtp-2026-05-09-183133.md",
-                "mtp-2026-05-09-190948.md",
-                "mtp-2026-05-09-203007.md",
-            ],
             sources: ["CBv2Benchmark.swift"]
         ),
         // Real-weights validation driver for the CBv2 engine: correctness

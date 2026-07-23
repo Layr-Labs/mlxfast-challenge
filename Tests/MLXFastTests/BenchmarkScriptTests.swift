@@ -140,31 +140,6 @@ func poolsideNVFP4DistributionIdentityIsPinned() throws {
         MLXFastConstants.defaultReferenceCachePath
             == ".cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/\(revision)"
     )
-    // The retired MTP prototype is a frozen historical affine-v1 contract.
-    // Repointing only its model ID while leaving its group-64 manifest,
-    // byte-count, and quantization fields intact would create incoherent
-    // provenance, so the serial-v2 distribution migration must not mutate it.
-    let retiredMTPRepository = "mlx-community/Laguna-XS-2.1-4bit"
-    let retiredMTPRevision = "c42e0a8f8d504ceacde015a535dcb286d65c8799"
-    #expect(LagunaRuntime.experimentalMTPTargetModelID == retiredMTPRepository)
-    #expect(LagunaRuntime.experimentalMTPTargetRevision == retiredMTPRevision)
-
-    let trustedProvenance = try String(
-        contentsOfFile:
-            "Sources/MLXFastTrustedHarness/LagunaRuntimeMTPProvenance.swift",
-        encoding: .utf8
-    )
-    #expect(
-        trustedProvenance.contains(
-            "experimentalMTPTargetModelID =\n        \"\(retiredMTPRepository)\""
-        )
-    )
-    #expect(
-        trustedProvenance.contains(
-            "experimentalMTPTargetRevision =\n        \"\(retiredMTPRevision)\""
-        )
-    )
-
     let manifest = try String(
         contentsOfFile: "fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256",
         encoding: .utf8
@@ -2288,9 +2263,9 @@ func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
         return
     }
     #expect(totalBytes <= EditableSurfaceByteBudget.defaultMaxTotalBytes)
-    #expect(fileCount == 177)
-    #expect(staticReview.contains("unmodified surface is 2,802,363 bytes"))
-    #expect(staticReview.contains("leaving 197,637 bytes"))
+    #expect(fileCount == 141)
+    #expect(staticReview.contains("unmodified surface is 2,139,781 bytes"))
+    #expect(staticReview.contains("leaving 860,219 bytes"))
     for path in [
         "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/matmul.cpp",
         "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/jit_kernels.cpp",
@@ -3048,7 +3023,7 @@ func benchmarkTimingChargesDecodeSetupAndSeparatesWorkers() throws {
     #expect(workerRuntime.contains("let ttftSeconds = secondsSince(ttftStart)"))
     #expect(!workerRuntime.contains("ttftSeconds: beginResponse.seconds"))
     // benchmarkWithWorker's preflight must not call BenchmarkPreflight.check --
-    // that helper loads Gemma4Config/DenseTensorStore/Gemma4WeightLoader
+    // that helper loaded config/dense-store/weight-loader
     // (editable MLXFastModel code) in this trusted, unsandboxed parent process.
     // checkWorkerBenchmarkInputs is model-free: it only checks that required
     // artifact paths exist, and lets the sandboxed worker itself validate
@@ -3370,18 +3345,6 @@ func runtimeWorkerValidatesTransformedWeightsAtStartup() throws {
     #expect(!workerDecode.contains("submissionValidationDelayMilliseconds()"))
     #expect(!workerDecode.contains("decode validation delay enabled"))
     #expect(!workerDecode.contains("Gemma4SubmissionControls"))
-}
-
-@Test
-func compiledDecodeSkipsSynchronousHostOffsetValidation() throws {
-    let model = try String(
-        contentsOfFile: "Sources/MLXFastModel/Gemma4Model.swift",
-        encoding: .utf8
-    )
-    #expect(model.contains("let compiledDecodeStep = cache.compiledDecodeStep"))
-    #expect(model.contains("if compiledDecodeStep == nil {"))
-    #expect(model.contains("cacheOffsets: kvCaches.map(\\.offset)"))
-    #expect(model.contains("if let step = compiledDecodeStep {"))
 }
 
 @Test
