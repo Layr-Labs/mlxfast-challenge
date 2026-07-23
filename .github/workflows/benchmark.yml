@@ -92,9 +92,13 @@ on:
       run_benchmark:
         description: "Run the private gates + timed benchmark after the public correctness gate. false = public-fixture correctness only."
         required: false
-        # Poolside v2 remains fail-closed until its M5-derived public/private
-        # fixtures, GPQA policy, and final-SHA baseline are calibrated.
-        default: false
+        # Restored to true (the pre-migration default Yukon dispatches rely
+        # on) after the Poolside v2 fail-closed window closed: private pins
+        # (#756), the final-SHA baseline interlock release (#758), and a
+        # green end-to-end paired run on M5-A (run 30011903540, score
+        # 1.0042). Yukon's dispatcher sends no inputs, so this default is
+        # what selects the ranked path.
+        default: true
         type: boolean
       verify_transform:
         description: "Run deterministic transform verification before timing."
