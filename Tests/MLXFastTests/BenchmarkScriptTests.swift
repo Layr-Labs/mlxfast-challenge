@@ -2248,8 +2248,9 @@ func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
     #expect(EditableSurfaceByteBudget.defaultMaxFileBytes == 524_288)
     #expect(staticReview.contains("MAX_BYTES=\"${MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_BYTES:-3000000}\""))
 
-    // The current editable surface must actually FIT the launch budget with
-    // the shipped defaults, or every official worker launch would fail.
+    // The current checkout, including a participant submission, must fit the
+    // launch budget. Submission PRs legitimately change the editable byte
+    // count, so only the shipped baseline prose below is pinned exactly.
     let verdict = verifyEditableSurfaceByteBudget(
         contractPath: "benchmark.json",
         maxTotalBytes: EditableSurfaceByteBudget.defaultMaxTotalBytes,
@@ -2259,7 +2260,7 @@ func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
         Issue.record("editable surface exceeds the shipped launch budget: \(verdict)")
         return
     }
-    #expect(totalBytes == 2_802_363)
+    #expect(totalBytes <= EditableSurfaceByteBudget.defaultMaxTotalBytes)
     #expect(fileCount == 177)
     #expect(staticReview.contains("unmodified surface is 2,802,363 bytes"))
     #expect(staticReview.contains("leaving 197,637 bytes"))
