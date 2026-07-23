@@ -59,6 +59,13 @@ func lagunaRopeScalingConfig(_ spec: LagunaRopeSpec) -> [String: StringOrNumber]
 
 // MARK: - Attention
 
+private let lagunaCompiledSoftplusGate: @Sendable (MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray) -> MLXArray = { gate in
+        softplus(gate.asType(.float32)).asType(gate.dtype)
+    }
+    return MLXHardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
 /// Laguna attention: GQA with per-head QK-norm, per-layer-type RoPE (YaRN on
 /// full-attention layers over the first half of the head, plain RoPE on
 /// sliding layers over the whole head), and per-head softplus output gating.
@@ -153,7 +160,10 @@ final class LagunaRuntimeAttention: Module {
             // Per-head softplus gate computed in float32, then broadcast
             // across the head dimension (or applied elementwise for a
             // per-element gate).
-            let gate = softplus(gProj(x).asType(.float32)).asType(output.dtype)
+            let projectedGate = gProj(x)
+            let gate = gatePerHead && projectedGate.dtype == output.dtype
+                ? lagunaCompiledSoftplusGate(projectedGate)
+                : softplus(projectedGate.asType(.float32)).asType(output.dtype)
             if gatePerHead {
                 output =
                     (output.reshaped(B, L, nHeads, headDim) * gate[.ellipsis, .newAxis])
@@ -181,7 +191,7 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(silu(gateProj(x)) * upProj(x))
+        downProj(compiledSiluProduct(gateProj(x), upProj(x)))
     }
 }
 
