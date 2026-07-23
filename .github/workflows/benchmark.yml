@@ -138,14 +138,17 @@ jobs:
       MLXFAST_BASELINE_WS: /opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current
       MLXFAST_BASELINE_CALIBRATION: /opt/bench-runner/state/laguna-xs-2.1-serial-v2/baseline-calibration.json
       MLXFAST_MEASURE_STATE_DIR: /opt/bench-runner/state/laguna-xs-2.1-serial-v2
-      # Filled only after the Poolside migration PR is merged and that exact
-      # immutable 40-character commit is installed as the v2 baseline on both
-      # boxes. The host preflight rejects this placeholder for ranked runs.
-      MLXFAST_BASELINE_COMMIT: __FINAL_MERGED_POOLSIDE_V2_SHA_PENDING__
-      # Deliberate migration interlock. Set to "1" only in the same final
-      # calibration change that replaces every legacy model-derived pin below
-      # and provisions the final-SHA v2 baseline on both M5 boxes.
-      MLXFAST_POOLSIDE_V2_CALIBRATION_READY: "0"
+      # Final merged Poolside v2 SHA (PR #756 merge commit). This exact
+      # immutable commit is installed as the signed v2 baseline on M5-A
+      # (/Users/Shared/bench-jobs/baseline/laguna-xs-2.1-serial-v2/<sha>,
+      # activation 2026-07-23). M5-B is pending re-provisioning; until then
+      # ranked capacity is M5-A only.
+      MLXFAST_BASELINE_COMMIT: 15852ee52858def42ddd4f32bca7e59d275e020e
+      # Migration interlock released 2026-07-23: private artifact pins landed
+      # in #756 and the final-SHA v2 baseline + calibration are installed on
+      # M5-A. GPQA budget/min-pass values below carry over pending repeated
+      # Poolside M5 recalibration (tracked operator follow-up).
+      MLXFAST_POOLSIDE_V2_CALIBRATION_READY: "1"
       # Reference checkpoint pre-provisioned in the runner-owned cache
       # (world-readable; verified against the pinned manifest below every
       # run). No download happens on this box, so the old

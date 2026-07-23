@@ -1402,7 +1402,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_BASELINE_WS: /opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current"))
     #expect(workflow.contains("MLXFAST_BASELINE_CALIBRATION: /opt/bench-runner/state/laguna-xs-2.1-serial-v2/baseline-calibration.json"))
     #expect(workflow.contains("MLXFAST_MEASURE_STATE_DIR: /opt/bench-runner/state/laguna-xs-2.1-serial-v2"))
-    #expect(workflow.contains("MLXFAST_BASELINE_COMMIT: __FINAL_MERGED_POOLSIDE_V2_SHA_PENDING__"))
+    #expect(workflow.contains("MLXFAST_BASELINE_COMMIT: 15852ee52858def42ddd4f32bca7e59d275e020e"))
     // The raw GPQA reference is downloaded straight into the runner-private
     // dir; its accepted answers reach the bench workspace only inside the
     // augmented golden.
@@ -1412,7 +1412,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-private-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json"))
     #expect(workflow.contains("MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-laguna-xs-2.1-serial-v2-${{ github.run_id }}-${{ github.run_attempt }}"))
     #expect(workflow.contains("MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}"))
-    #expect(workflow.contains("MLXFAST_POOLSIDE_V2_CALIBRATION_READY: \"0\""))
+    #expect(workflow.contains("MLXFAST_POOLSIDE_V2_CALIBRATION_READY: \"1\""))
     #expect(
         workflow.contains(
             "Poolside v2 model-derived fixtures and final-SHA baseline are not calibrated"
