@@ -41,12 +41,12 @@ public enum MLXFastConstants {
     // Swift/MLX. Semantic GPQA behavior captures a short continuation for the
     // private judge; exact token enforcement stays on the long copy gate and
     // non-semantic behavior fixtures.
-    // 64 (was 10, DeepSeek-era): originally a Gemma-era calibration (a
-    // 2026-07-06 budget capture at 10/32/64 showed shorter budgets cut most
-    // candidates off mid-sentence; 64, the correctnessMaxBehaviorSteps
-    // ceiling, gave the judge the most usable text). TEMPORARY: the four
-    // cited Laguna runs used the superseded mlx-community affine checkpoint.
-    // Re-evaluate this budget from Poolside NVFP4 M5 runs before merge.
+    // 64 (was 10, DeepSeek-era): a 2026-07-06 budget capture at 10/32/64
+    // showed shorter budgets cut most candidates off mid-sentence; 64, the
+    // correctnessMaxBehaviorSteps ceiling, gave the judge the most usable
+    // text. Poolside NVFP4 activation runs 30011903540, 30015338806,
+    // 30022640438, and 30027994180 each judged the unmodified baseline 2/5 at
+    // this budget, re-confirming it across the migration.
     public static let correctnessGPQAMaxNewTokens = 64
     // Semantic judging uses short hidden GPQA answers as a baseline-calibrated
     // gate for optimizations that preserve the exact prefix but damage answer
@@ -56,17 +56,13 @@ public enum MLXFastConstants {
     // correctnessGPQAMaxNewTokens (and must stay <= correctnessMaxBehaviorSteps).
     public static let semanticGPQACaseCount = 5
     public static let semanticGPQAMaxNewTokens = 64
-    // TEMPORARY threshold from the superseded mlx-community affine
-    // checkpoint. Its four ranked official-runner observations judged
-    // 2/5, 2/5, 1/5, and 2/5 (runs 29891158354, 29898041981, 29931435233,
-    // and 29934545157; Opus 4.8 judge). min(observed) is 1, so 1 stays the
-    // conservative floor: an observed 1/5 sits exactly AT the threshold
-    // (raising it would flake honest runs on single-case judge
-    // nondeterminism), while a submission that wrecks answer quality (0/5
-    // judged) still fails the gate instead of merely being recorded. Keep in
-    // sync with the workflow env MLXFAST_SEMANTIC_GPQA_MIN_PASS. The reference
-    // model is changing here, so repeated Poolside NVFP4 judged M5 runs must
-    // recalibrate this threshold before merge.
+    // Poolside NVFP4 calibration: four ranked baseline-equivalent M5 runs
+    // (30011903540, 30015338806, 30022640438, and 30027994180; Opus 4.8
+    // judge) each scored 2/5. min(observed) - 1 therefore re-confirms 1 as the
+    // conservative floor: a one-case judge fluctuation still passes, while a
+    // submission that wrecks answer quality (0/5 judged) fails instead of
+    // merely being recorded. Keep in sync with the workflow env
+    // MLXFAST_SEMANTIC_GPQA_MIN_PASS.
     // (Historical: the 2026-07-09 Gemma 4 31B-IT calibration observed a
     // stable 2/5 across five runs and set min(observed) - 1 = 1.)
     public static let semanticGPQAMinPassCount = 1
@@ -86,20 +82,19 @@ public enum MLXFastConstants {
     // many checked token steps. Charging setup prevents submitted model code
     // from precomputing future decode tokens in an unscored seed-prefill phase.
     public static let benchmarkDecodeSteps = 128
-    // EXPERIMENTAL MTP track limits. This track is deliberately separate from
-    // the frozen one-token benchmark above: it emits diagnostics only and does
-    // not contribute to score.json. Keep the total explicit (rather than
-    // deriving it) so changing either protocol requires a conscious rebaseline.
+    // Retired MTP diagnostic-command limits. The unranked `mtp-*` commands
+    // remain protocol-explicit compatibility tools: they emit diagnostics only
+    // and do not contribute to score.json. Keep the total explicit (rather
+    // than deriving it) so changing either protocol requires a conscious review.
     public static let experimentalMTPMaxBlockSize = 4
     // Compatibility default for callers that do not select an explicit public
     // oracle length.
     public static let experimentalMTPMaxTotalTokens = 128
     // Trusted-parent configured experimental runs may exercise longer tail
-    // boundaries when the selected oracle contains enough tokens. 1,536 is
-    // the laguna-xs-2.1-mtp-v1 contract's `maximum_decode_tokens`: it keeps
-    // the untimed correctness legs able to wrap Laguna's 512-position
-    // sliding-window cache (3x the window) while ranked timed decode stays
-    // fixed at 512 by the workflow env.
+    // boundaries when the selected oracle contains enough tokens. 1,536 was
+    // the retired laguna-xs-2.1-mtp-v1 contract's `maximum_decode_tokens`: it
+    // keeps the compatibility diagnostics able to wrap Laguna's 512-position
+    // sliding-window cache three times.
     public static let experimentalMTPMaxConfiguredTotalTokens = 1_536
     // Local iterate charges the same 512-token seed prefill as the official
     // decode window, so it must use the same denominator to produce a
@@ -115,11 +110,11 @@ public enum MLXFastConstants {
     // when teacher-forced correctness agrees, which makes the timed oracle
     // fragile for reasons unrelated to kernel performance.
     public static let benchmarkDecodeSeedTokens = 512
-    // The timed benchmark runs FIRST, before correctness/GPQA, specifically so
-    // the measured model path is cold (the correctness gate must not be able to
-    // warm it). The official baselines below were measured the same way, so a
-    // warmup run here would both diverge from how the baseline was calibrated
-    // and add minutes to the job -- keep zero warmup and one measured run.
+    // Official paired timing runs LAST at workflow level, after correctness,
+    // GPQA, and the hidden-material scrub. The on-box wrapper launches the
+    // baseline and candidate in fresh worker processes, and each timed prefill
+    // starts without an in-process warmup. The calibration below used that
+    // same shape, so keep zero warmup and one measured run.
     public static let benchmarkPrefillWarmupRuns = 0
     public static let benchmarkPrefillTimedRuns = 1
     // Acceptance bands (see AcceptanceBand + docs/thermal-variance-investigation.md).
@@ -140,27 +135,17 @@ public enum MLXFastConstants {
     public static let prefillBandDownTolerance = 0.05
     public static let decodeBandUpTolerance = 0.02
     public static let decodeBandDownTolerance = 0.05
-    // TEMPORARY legacy calibration from the superseded mlx-community affine
-    // checkpoint. Replace both literals from Poolside NVFP4 M5 measurements
-    // before this migration merges.
-    // Legacy calibration provenance: the affine-v1 M5 paired baseline as of 2026-07-22 --
-    // the mean of the `baseline_decode_seconds_per_token` /
-    // `baseline_prefill_seconds_per_token` fields published by the 4
-    // consecutive successful ranked Laguna runs on the self-hosted M5 Max
-    // (m5-bench): 29891158354, 29898041981, 29931435233, and 29934545157
-    // (each field is measure-job's on-box timing of that superseded Laguna
-    // reference tree in the run's session): decode clustered
-    // 0.0093606-0.0094083 (CV 0.20%), prefill 0.0003596-0.0003664 (CV
-    // 0.71%). No Poolside v2 baseline/calibration exists yet; it must be built
-    // from the final migration SHA under the versioned on-box state directory.
-    // The legacy affine values superseded the Gemma 4 31B 4-bit calibration of
-    // 2026-07-12 (prefill 0.0016216554767252605 / decode
-    // 0.04405625764973958, runs 29179374395-29197772284), which was ~4.5x /
-    // ~4.7x slower than the Laguna baseline and inflated local score
-    // estimates accordingly after the model re-pin.
+    // Poolside v2 cached calibration as of 2026-07-23: the mean of the
+    // `baseline_decode_seconds_per_token` / `baseline_prefill_seconds_per_token`
+    // fields published by four consecutive successful ranked runs on the
+    // self-hosted M5 Max (m5-bench): 30011903540, 30015338806, 30022640438,
+    // and 30027994180. Each field is measure-job's same-session timing of the
+    // pinned Poolside baseline commit 15852ee52858def42ddd4f32bca7e59d275e020e.
+    // Decode ranged 0.01382311946875-0.0139106712265625 (CV 0.26%);
+    // prefill ranged 0.00036540633203125-0.000371515869140625 (CV 0.65%).
     //
     // These constants are NOT the ranked scoring denominator. The ranked runner
-    // uses self-hosted M5 Max boxes (m5-bench), where measure-job times the
+    // uses a self-hosted M5 Max (m5-bench), where measure-job times the
     // candidate and the PINNED on-box reference tree back to back in the same
     // session behind the same 40C thermal gate; the paired ratio against that
     // live same-session baseline is what overlay-paired-timing.sh folds into
@@ -168,16 +153,15 @@ public enum MLXFastConstants {
     // estimates (--local-iterate / --local-submit) and the gates-only pass's
     // placeholder timing fields, which the paired-timing overlay replaces. See
     // the paired-baseline section of docs/benchmark-window-freeze.md.
-    public static let officialBaselinePrefillSecondsPerToken = 0.00036280499267578125
-    public static let officialBaselineDecodeSecondsPerToken = 0.00938833593359375
+    public static let officialBaselinePrefillSecondsPerToken = 0.00036751938916015625
+    public static let officialBaselineDecodeSecondsPerToken = 0.01385621216015625
     public static let scorePrefillWeight = 0.25
     public static let scoreDecodeWeight = 0.75
     public static let scorePrefillSpeedupFloor = 0.95
     public static let scoreDecodeSpeedupFloor = 0.95
     // The Poolside Laguna XS 2.1 NVFP4 text tower is ~21.6 GB; 25 GiB keeps ample
     // headroom for shard alignment/padding without approving a second full
-    // copy of the model. (The MTP track contract enforces its own tighter
-    // 20 GiB `maximum_transformed_bytes` cap separately.)
+    // copy of the model.
     public static let defaultMaxTransformedWeightsBytes = 25 * 1024 * 1024 * 1024
     public static let defaultMaxSubmissionSourceBytes = 256 * 1024 * 1024
     // Diagnostic (non-ranking) real-valued score fields are published rounded to

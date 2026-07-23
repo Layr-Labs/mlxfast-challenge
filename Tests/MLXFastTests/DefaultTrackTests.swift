@@ -124,6 +124,13 @@ struct DefaultTrackTests {
         #expect(!editablePaths.isEmpty)
         #expect(editablePaths.count == 97)
         #expect(Set(editablePaths).count == editablePaths.count, "editablePaths must be unique")
+        for guidePath in ["README.md", "AGENTS.md", "CLAUDE.md"] {
+            let guide = try String(contentsOfFile: guidePath, encoding: .utf8)
+            #expect(
+                guide.contains("currently \(editablePaths.count) entries"),
+                "\(guidePath) must report benchmark.json's editablePaths count"
+            )
+        }
 
         let requiredFullStackPaths = [
             "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift",

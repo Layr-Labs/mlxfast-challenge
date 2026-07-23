@@ -99,6 +99,33 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
 }
 
 @Test
+func benchmarkWorkflowDispatchDefaultsToRankedPath() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+    let runStart = try #require(workflow.range(of: "      run_benchmark:"))
+    let verifyStart = try #require(
+        workflow.range(
+            of: "      verify_transform:",
+            range: runStart.upperBound..<workflow.endIndex
+        )
+    )
+    let permissionsStart = try #require(
+        workflow.range(
+            of: "\npermissions:",
+            range: verifyStart.upperBound..<workflow.endIndex
+        )
+    )
+    let runBenchmarkInput = workflow[runStart.lowerBound..<verifyStart.lowerBound]
+    let verifyTransformInput = workflow[verifyStart.lowerBound..<permissionsStart.lowerBound]
+
+    #expect(runBenchmarkInput.contains("        default: true"))
+    #expect(!runBenchmarkInput.contains("        default: false"))
+    #expect(verifyTransformInput.contains("        default: false"))
+}
+
+@Test
 func poolsideNVFP4DistributionIdentityIsPinned() throws {
     let repository = "poolside/Laguna-XS-2.1-NVFP4-mlx"
     let revision = "841778bda563a36104dd521e37d99218e46f4f25"
@@ -1431,9 +1458,9 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/hidden-correctness-golden-94239d59b435eb8f370c82bcf8c86822d1bbc1094e3650aeff3abc5558137023.json"))
     #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/gpqa-reference-cases-4a6d847c6535561e8d4094e2bb764be96c2cd8f4ca310614120058c3c6a7d26f.json"))
     #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"5\""))
-    // Temporary affine-checkpoint values; Poolside NVFP4 M5 validation must
-    // replace or explicitly re-confirm them before ranked activation. See
-    // MLXFastConstants.semanticGPQAMinPassCount.
+    // Four Poolside NVFP4 baseline-equivalent activation runs re-confirmed the
+    // 64-token budget and conservative 1/5 floor. See
+    // MLXFastConstants.semanticGPQAMinPassCount for provenance.
     #expect(workflow.contains("MLXFAST_GPQA_MAX_NEW_TOKENS: \"64\""))
     #expect(workflow.contains("MLXFAST_GPQA_TTFT_CASE_COUNT: \"5\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_CASE_COUNT: \"5\""))
@@ -2940,7 +2967,7 @@ func benchmarkScriptAvoidsNestedSandboxWithRuntimeWorker() throws {
         encoding: .utf8
     )
 
-    #expect(benchmark.contains("Blacksmith rejects nested sandbox-exec"))
+    #expect(benchmark.contains("supported macOS runners reject nested"))
     #expect(benchmark.contains("if [[ \"${USE_RUNTIME_WORKER}\" != \"1\" && \"${MLXFAST_IN_SANDBOX:-0}\" != \"1\" && \"${MLXFAST_NO_SANDBOX:-0}\" != \"1\" ]]; then"))
     #expect(benchmark.contains("run_offline_writable_command \"${TRANSFORM_STAGING_PARENT_OWNED}\""))
     #expect(benchmark.contains("--output \"${staged_weights}\""))
@@ -5505,11 +5532,9 @@ func finalArtifactNamesStayRunIdOnlyAndAuditArtifactsEmbedRunAttempt() throws {
 
 @Test
 func benchmarkWorkflowUsesPerRunConcurrencyGroupWithoutCancellation() throws {
-    // Ranked serving spans two at-parity m5-bench boxes: the concurrency group
-    // is per-run so a second online runner can claim queued work (per-box
-    // serialization is enforced by the self-hosted runner label queue, one job
-    // per box), and cancel-in-progress stays false so no ranked run is ever
-    // cancelled out from under a box mid-measurement.
+    // Ranked serving currently has one active m5-bench box. The per-run group
+    // avoids workflow-level serialization or cross-run cancellation, while the
+    // single self-hosted runner's label queue serializes jobs one at a time.
     let workflow = try String(contentsOfFile: ".github/workflows/benchmark.yml", encoding: .utf8)
     #expect(workflow.contains("concurrency:\n  group: mlxfast-ranked-${{ github.run_id }}\n  cancel-in-progress: false"))
     #expect(!workflow.contains("group: mlxfast-ranked-benchmark"))

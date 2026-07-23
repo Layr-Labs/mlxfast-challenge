@@ -86,7 +86,7 @@ official benchmark for ranking.
 ## What You May Optimize
 
 The submitted editable surface is defined by `editablePaths` in
-`benchmark.json` — that list (currently 92 entries) is the source of truth.
+`benchmark.json` — that list (currently 97 entries) is the source of truth.
 It covers four groups:
 
 ```text

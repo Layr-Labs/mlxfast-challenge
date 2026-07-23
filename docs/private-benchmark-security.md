@@ -29,9 +29,10 @@ The runner registration is ephemeral: a root supervisor on the box mints a
 single-use just-in-time (JIT) registration per job, authenticated through a
 GitHub App installation (no long-lived PAT). Each registration is consumed
 by exactly one job and a fresh one is minted for the next, so one job at a
-time is structural, a compromised job cannot accept a second job, and the
-workflow's concurrency group queues duplicate dispatches instead of
-cancelling an in-flight measurement.
+time is structural and a compromised job cannot accept a second job. The
+workflow uses non-cancelling per-run concurrency groups; the single active
+`m5-bench` runner's label queue serializes duplicate dispatches behind an
+in-flight measurement.
 
 The workflow is `workflow_dispatch`-only with no PR or push triggers (fork
 code must never reach a self-hosted runner), and it verifies at runtime
@@ -186,7 +187,11 @@ migration (that checklist is the template for this pass).
 Raw private bytes land only in a runner-only `0700` per-run directory; all
 three objects are independently verified against SHA-256 and byte-count pins
 before use. The final baseline-commit and calibration-ready interlocks remain
-separate and fail closed until protected M5 provisioning completes.
+separate fail-closed checks. Protected M5 provisioning completed on
+2026-07-23 for baseline commit
+`15852ee52858def42ddd4f32bca7e59d275e020e`, so the workflow now pins
+`MLXFAST_POOLSIDE_V2_CALIBRATION_READY=1`; a missing or mismatched on-box
+baseline/calibration still fails host preflight.
 The GPQA augmentation step (`attach-gpqa-gates`) executes code from the
 submitted build (it loads the tokenizer), so it runs through the bench-exec
 bridge like every other untrusted invocation: the raw inputs are copied

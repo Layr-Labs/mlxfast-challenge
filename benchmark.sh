@@ -1629,7 +1629,8 @@ fi
 
 # Preserve the legacy no-worker wrapper path under the whole-script sandbox
 # while it reaches the trusted CLI's fail-closed rejection. With the worker
-# enabled, do not sandbox the parent: Blacksmith rejects nested sandbox-exec.
+# enabled, do not sandbox the parent: supported macOS runners reject nested
+# sandbox-exec profiles.
 # Submitted transform runs through run-offline.sh below, and submitted model
 # execution runs in the participant worker sandbox.
 if [[ "${USE_RUNTIME_WORKER}" != "1" && "${MLXFAST_IN_SANDBOX:-0}" != "1" && "${MLXFAST_NO_SANDBOX:-0}" != "1" ]]; then

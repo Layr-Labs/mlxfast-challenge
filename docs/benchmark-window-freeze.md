@@ -158,38 +158,39 @@ The `officialBaseline*` constants in `Sources/MLXFastCore/Constants.swift` are
 a **cached calibration retained for local-mode estimates and the gates pass's
 skip-timed placeholder timing only** -- the ranked score denominator is the
 live paired baseline measured on the M5 box (next section), never these
-numbers. The numeric values below are TEMPORARY leftovers from the superseded
-mlx-community affine Laguna checkpoint. They are not a Poolside v2
-calibration and must not ship as that track's local estimates. The workflow's
-`MLXFAST_POOLSIDE_V2_CALIBRATION_READY=0` interlock keeps private/ranked use
-disabled while the final migration SHA, versioned baseline, and repeated M5
-samples are unavailable. Replace both constants from those Poolside samples
-before enabling the interlock or merging:
+numbers. The values below are the Poolside v2 calibration: the mean baseline
+fields from four consecutive successful ranked M5 runs (`30011903540`,
+`30015338806`, `30022640438`, and `30027994180`) against pinned baseline
+commit `15852ee52858def42ddd4f32bca7e59d275e020e`. Decode ranged
+`0.01382311946875`-`0.0139106712265625` (CV 0.26%); prefill ranged
+`0.00036540633203125`-`0.000371515869140625` (CV 0.65%). The workflow's
+`MLXFAST_POOLSIDE_V2_CALIBRATION_READY=1` interlock records that the final-SHA
+baseline and versioned on-box calibration are active:
 
-- `officialBaselineDecodeSecondsPerToken = 0.00938833593359375`
-- `officialBaselinePrefillSecondsPerToken = 0.00036280499267578125`
+- `officialBaselineDecodeSecondsPerToken = 0.01385621216015625`
+- `officialBaselinePrefillSecondsPerToken = 0.00036751938916015625`
 
 If either number here disagrees with `Sources/MLXFastCore/Constants.swift`, the
 freeze test fails on purpose -- the doc and the code must move together.
 
 ### Paired baseline on the single M5 box
 
-The ranked runners are self-hosted Apple M5 Max boxes (label `m5-bench`). The
-v2 paired baseline path is reserved at
-`/opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current`, but the baseline
-is not valid until it is built from the FINAL Poolside migration SHA and
-provisioned with its versioned calibration on both boxes. The timed measurement is owned by
-the on-box `measure-job` (trusted, runner-provisioned, fixed thermal
-contract). Per ranked run, after all correctness/gates work, a hidden-material
-scrub, and a quiescence wait, measure-job runs the pinned **baseline tree
-first, then the candidate workspace**, each as a full `./benchmark.sh
---official` in fresh worker processes, each starting only once the GPU is
-below the fixed 40C gate (up to a 900s cooldown), each under 2 Hz telemetry.
+The ranked runner is a self-hosted Apple M5 Max (label `m5-bench`); active
+ranked capacity is one box. The v2 paired baseline at
+`/opt/bench-runner/baseline/laguna-xs-2.1-serial-v2/current` is built from
+commit `15852ee52858def42ddd4f32bca7e59d275e020e` and provisioned with its
+versioned calibration. The timed measurement is owned by the on-box
+`measure-job` (trusted, runner-provisioned, fixed thermal contract). Per
+ranked run, after all correctness/gates work, a hidden-material scrub, and a
+quiescence wait, measure-job runs the pinned **baseline tree first, then the
+candidate workspace**, each as a full `./benchmark.sh --official` in fresh
+worker processes, each starting only once the GPU is below the fixed 40C gate
+(up to a 900s cooldown), each under 2 Hz telemetry.
 A measurement is rejected -- with one gated retry -- on GPU throttling under
 load, missing telemetry, or token mismatches. Because both sides run back to
 back on the same silicon behind the same gate, the paired ratio cancels
-common-mode host drift exactly like the old separate-VM pairing did
-(validated on this box at paired score 1.0507 with decode CV 0.13%).
+common-mode host drift. The four Poolside v2 activation runs above scored
+`0.9901`-`1.0042` for baseline-equivalent candidate trees.
 
 - The baseline sample is additionally sanity-checked against the box's
   versioned calibration

@@ -149,7 +149,7 @@ correctness and benchmark checks.
 Unlike typical inference benchmarks, the entire model execution pipeline is
 in scope — including the vendored Laguna model code and the MLX Metal
 kernels it runs on. The authoritative list is `editablePaths` in
-`benchmark.json` (currently 91 entries), in four groups:
+`benchmark.json` (currently 97 entries), in four groups:
 
 | Path | What it controls |
 |---|---|

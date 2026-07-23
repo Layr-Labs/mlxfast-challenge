@@ -6,11 +6,11 @@ import MLX
 import Testing
 
 // Guards the frozen timed-benchmark window (see docs/benchmark-window-freeze.md).
-// The official prefill/decode baselines are measured on the Blacksmith runner at
-// real cost, so any change to the charged work silently invalidates them. These
-// tests are deliberately annoying to change: editing a window constant or the
-// decode/prefill charged-forward structure fails CI until the baseline is
-// re-measured and the freeze doc is updated in the same change.
+// The official prefill/decode baselines are measured on the self-hosted M5 at
+// real cost, so any change to the charged work silently invalidates them.
+// These tests are deliberately annoying to change: editing a window constant
+// or the decode/prefill charged-forward structure fails CI until the baseline
+// is re-measured and the freeze doc is updated in the same change.
 
 private func packageFile(_ path: String) throws -> String {
     try String(contentsOfFile: path, encoding: .utf8)
@@ -93,6 +93,9 @@ func benchmarkWindowFreezeDocMatchesConstants() throws {
     let prefillBaseline = try swiftConstantLiteral(constants, name: "officialBaselinePrefillSecondsPerToken")
     #expect(doc.contains(decodeBaseline), "freeze doc must quote officialBaselineDecodeSecondsPerToken=\(decodeBaseline)")
     #expect(doc.contains(prefillBaseline), "freeze doc must quote officialBaselinePrefillSecondsPerToken=\(prefillBaseline)")
+    #expect(doc.contains("MLXFAST_POOLSIDE_V2_CALIBRATION_READY=1"))
+    #expect(!doc.contains("MLXFAST_POOLSIDE_V2_CALIBRATION_READY=0"))
+    #expect(doc.contains("15852ee52858def42ddd4f32bca7e59d275e020e"))
 }
 
 @Test
