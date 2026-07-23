@@ -439,6 +439,11 @@ public final class LagunaRuntimeWeightCache {
         // the library's fp16->bf16 conversion pass is a no-op and is omitted.
         try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
         eval(model)
+        // Build the retained fused weight layouts (fused QKV, fused
+        // shared-expert gate/up; see the DARKBLOOM_FUSED_* flags) from the
+        // now-materialized checkpoint arrays, before the constructor-time
+        // warmup so the fused kernels warm with their production shapes.
+        model.prepareFusedRuntimeWeights()
         return model
     }
 

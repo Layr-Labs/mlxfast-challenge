@@ -1172,6 +1172,52 @@ struct DefaultAccT<complex64_t> {
   using type = complex64_t;
 };
 
+// Contiguous TN-element loader for the GEMV inner loop. The primary template
+// preserves the original scalar loads. The kAligned=true specializations for
+// 2-byte float types issue one 8-byte vector load and unpack IN ORDER, so the
+// values consumed by the accumulation loop -- and therefore every rounding
+// step -- are bit-identical to the scalar path. The host dispatches the
+// aligned variant ("gemv_al") only after verifying that both device pointers
+// are 8-byte aligned and the matrix leading dimension is a multiple of 4.
+template <typename T, typename U, int TN, bool kAligned>
+struct GEMVLoader {
+  static METAL_FUNC void
+  load_unsafe(const device T* src, thread U dst[TN], const int src_offset) {
+    MLX_MTL_PRAGMA_UNROLL
+    for (int tn = 0; tn < TN; tn++) {
+      dst[tn] = static_cast<U>(src[src_offset + tn]);
+    }
+  }
+};
+
+template <typename U>
+struct GEMVLoader<bfloat16_t, U, 4, true> {
+  static METAL_FUNC void load_unsafe(
+      const device bfloat16_t* src,
+      thread U dst[4],
+      const int src_offset) {
+    vec<bfloat16_t, 4> vals =
+        *((const device vec<bfloat16_t, 4>*)(src + src_offset));
+    dst[0] = static_cast<U>(vals.x);
+    dst[1] = static_cast<U>(vals.y);
+    dst[2] = static_cast<U>(vals.z);
+    dst[3] = static_cast<U>(vals.w);
+  }
+};
+
+template <typename U>
+struct GEMVLoader<half, U, 4, true> {
+  static METAL_FUNC void
+  load_unsafe(const device half* src, thread U dst[4], const int src_offset) {
+    vec<half, 4> vals =
+        *((const device vec<half, 4>*)(src + src_offset));
+    dst[0] = static_cast<U>(vals.x);
+    dst[1] = static_cast<U>(vals.y);
+    dst[2] = static_cast<U>(vals.z);
+    dst[3] = static_cast<U>(vals.w);
+  }
+};
+
 template <
     typename T,
     const int BM, /* Threadgroup rows (in simdgroups) */
@@ -1181,6 +1227,7 @@ template <
     const int TM, /* Thread rows (in elements) */
     const int TN, /* Thread cols (in elements) */
     const bool kDoAxpby, /* Do out = alpha * out + beta * bias */
+    const bool kAligned = false, /* 8-byte-aligned vector loads */
     typename AccT = typename DefaultAccT<T>::type>
 struct GEMVKernel {
   using acc_type = AccT;
@@ -1223,10 +1270,7 @@ struct GEMVKernel {
   template <typename U = T>
   static METAL_FUNC void
   load_unsafe(const device T* src, thread U dst[TN], const int src_offset = 0) {
-    MLX_MTL_PRAGMA_UNROLL
-    for (int tn = 0; tn < TN; tn++) {
-      dst[tn] = static_cast<U>(src[src_offset + tn]);
-    }
+    GEMVLoader<T, U, TN, kAligned>::load_unsafe(src, dst, src_offset);
   }
 
   template <typename U = T>
@@ -1614,6 +1658,82 @@ template <
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   using gemv_kernel = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
+  threadgroup typename gemv_kernel::acc_type tgp_memory
+      [gemv_kernel::tgp_mem_size == 0 ? 1 : gemv_kernel::tgp_mem_size];
+
+  // Update batch offsets
+  if (kDoNCBatch) {
+    in_vec += elem_to_loc(tid.z, batch_shape, vector_batch_stride, batch_ndim);
+    mat += elem_to_loc(tid.z, batch_shape, matrix_batch_stride, batch_ndim);
+
+    if (kDoAxpby) {
+      bias += elem_to_loc(tid.z, batch_shape, bias_batch_stride, batch_ndim);
+    }
+
+  } else {
+    in_vec += tid.z * vector_batch_stride[0];
+    mat += tid.z * matrix_batch_stride[0];
+
+    if (kDoAxpby) {
+      bias += tid.z * bias_batch_stride[0];
+    }
+  }
+
+  out_vec += tid.z * out_vec_size;
+
+  gemv_kernel::run(
+      mat,
+      in_vec,
+      bias,
+      out_vec,
+      in_vec_size,
+      out_vec_size,
+      marix_ld,
+      alpha,
+      beta,
+      bias_stride,
+      gemv_kernel::tgp_mem_size == 0 ? nullptr : tgp_memory,
+      tid,
+      lid,
+      simd_gid,
+      simd_lid);
+}
+
+// `gemv` twin whose only difference is the kAligned=true GEMVKernel: the
+// host dispatches it only when the matrix/vector device pointers are 8-byte
+// aligned and the leading dimension is a multiple of 4, so the vectorized
+// loader is valid. Per-row arithmetic order is unchanged (bit-exact).
+template <
+    typename T,
+    const int BM, /* Threadgroup rows (in simdgroups) */
+    const int BN, /* Threadgroup cols (in simdgroups) */
+    const int SM, /* Simdgroup rows (in threads) */
+    const int SN, /* Simdgroup cols (in threads) */
+    const int TM, /* Thread rows (in elements) */
+    const int TN, /* Thread cols (in elements) */
+    const bool kDoNCBatch, /* Batch ndim > 1 */
+    const bool kDoAxpby> /* Do out = alpha * out + beta * bias */
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]] void gemv_al(
+    const device T* mat [[buffer(0)]],
+    const device T* in_vec [[buffer(1)]],
+    const device T* bias [[buffer(2)]],
+    device T* out_vec [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    const constant int& marix_ld [[buffer(6)]],
+    const constant float& alpha [[buffer(7)]],
+    const constant float& beta [[buffer(8)]],
+    const constant int& batch_ndim [[buffer(9)]],
+    const constant int* batch_shape [[buffer(10)]],
+    const constant int64_t* vector_batch_stride [[buffer(11)]],
+    const constant int64_t* matrix_batch_stride [[buffer(12)]],
+    const constant int64_t* bias_batch_stride [[buffer(13)]],
+    const constant int& bias_stride [[buffer(14)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  using gemv_kernel = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby, true>;
   threadgroup typename gemv_kernel::acc_type tgp_memory
       [gemv_kernel::tgp_mem_size == 0 ? 1 : gemv_kernel::tgp_mem_size];
 

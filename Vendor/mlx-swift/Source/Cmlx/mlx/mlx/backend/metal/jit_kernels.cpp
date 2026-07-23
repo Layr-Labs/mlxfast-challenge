@@ -713,11 +713,14 @@ MTL::ComputePipelineState* get_gemv_kernel(
     bool axpby) {
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
+    // The aligned non-transposed variant is a distinct kernel template
+    // ("gemv_al"); the host encodes it in the kernel name prefix.
+    bool aligned = kernel_name.compare(0, 8, "gemv_al_") == 0;
     std::ostringstream kernel_source;
     kernel_source << metal::gemv()
                   << get_template_definition(
                          lib_name,
-                         transpose_mat ? "gemv_t" : "gemv",
+                         transpose_mat ? "gemv_t" : (aligned ? "gemv_al" : "gemv"),
                          get_type_string(out.dtype()),
                          bm,
                          bn,

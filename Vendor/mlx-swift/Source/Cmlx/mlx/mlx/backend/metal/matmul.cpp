@@ -1128,7 +1128,20 @@ void gemv_axbpy(
     tm = out_vector_len < tm ? 1 : tm;
 
     n_out_per_tgp = bm * sm * tm;
-    kname << "gemv_" << type_to_name(out);
+
+    // 8-byte-aligned vector-load fast path for 2-byte float types: the
+    // aligned twin loads identical values in identical order (bit-exact) but
+    // issues one vec<T,4> load per TN=4 group instead of four scalar loads.
+    // Requires 8-byte-aligned matrix/vector base pointers, a leading
+    // dimension that keeps every row 8-byte aligned, and unit batching so the
+    // in-kernel batch stride advance cannot break alignment.
+    auto byte_offset = [](const array& arr) {
+      return static_cast<size_t>(arr.offset());
+    };
+    bool aligned = tn == 4 && out.itemsize() == 2 && (mat_ld % 4) == 0 &&
+        batch_size_out == 1 && (byte_offset(mat) % 8) == 0 &&
+        (byte_offset(vec) % 8) == 0;
+    kname << (aligned ? "gemv_al_" : "gemv_") << type_to_name(out);
   }
 
   const bool do_axpby = CHECK_AB && (alpha != 1.0f || beta != 0.0f);
@@ -1636,10 +1649,10 @@ void BlockMaskedMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         bm = out_vector_len >= 512 ? 4 : 2;
       }
 
-      // Specialized kernel for very small outputs
-      tm = out_vector_len < tm ? 1 : tm;
+    // Specialized kernel for very small outputs
+    tm = out_vector_len < tm ? 1 : tm;
 
-      n_out_per_tgp = bm * sm * tm;
+    n_out_per_tgp = bm * sm * tm;
       kname << "gemv";
     }
 

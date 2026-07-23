@@ -230,7 +230,44 @@ inline void load_vector_safe(const device T* x, thread U* x_thread, int N) {
 template <typename U, int values_per_thread, int bits>
 inline U qdot(const device uint8_t* w, const thread U* x_thread, U scale) {
   U accum = 0;
-  if constexpr (bits == 4) {
+  if constexpr (bits == 4 && values_per_thread == 16) {
+    // Specialized fp4 decode for the qmv_fast family (values_per_thread ==
+    // 16, e.g. nvfp4 gs=16 decode). Bit-exact vs the generic bits == 4 path
+    // below: each 4-bit code n decodes through the identical half bit
+    // pattern (magnitude (n & 7) << 9 with sign (n & 8) in the half sign
+    // bit), the same exact half -> float conversion, and the same exact
+    // 16384.0f renormalization, so every decoded value is bit-identical to
+    // Dequantize<4>{}(n) for all 16 code points (including -0.0f for
+    // n == 8). The product/accumulation expression tree (groups of 4, same
+    // operand order, same parenthesization, float math) and the final
+    // scale * accum are unchanged. The uint2 load is 8-byte aligned at
+    // every call site with values_per_thread == 16 (lane code offsets are
+    // multiples of 8 bytes and row strides are multiples of 256 bytes).
+    const device uint2* wq = (const device uint2*)w;
+    const uint2 codes = wq[0];
+#pragma unroll
+    for (int j = 0; j < 2; j++) {
+      const uint32_t c = (j == 0) ? codes.x : codes.y;
+      const uint32_t p0 = ((c & 0x00070007u) << 9) | ((c & 0x00080008u) << 12);
+      const uint32_t p1 = ((c & 0x00700070u) << 5) | ((c & 0x00800080u) << 8);
+      const uint32_t p2 = ((c & 0x07000700u) << 1) | ((c & 0x08000800u) << 4);
+      const uint32_t p3 = ((c & 0x70007000u) >> 3) | (c & 0x80008000u);
+      const float2 v04 = float2(as_type<half2>(p0)) * 16384.0f;
+      const float2 v15 = float2(as_type<half2>(p1)) * 16384.0f;
+      const float2 v26 = float2(as_type<half2>(p2)) * 16384.0f;
+      const float2 v37 = float2(as_type<half2>(p3)) * 16384.0f;
+      accum +=
+          (x_thread[8 * j] * v04.x +
+           x_thread[8 * j + 1] * v15.x +
+           x_thread[8 * j + 2] * v26.x +
+           x_thread[8 * j + 3] * v37.x);
+      accum +=
+          (x_thread[8 * j + 4] * v04.y +
+           x_thread[8 * j + 5] * v15.y +
+           x_thread[8 * j + 6] * v26.y +
+           x_thread[8 * j + 7] * v37.y);
+    }
+  } else if constexpr (bits == 4) {
     const device uint16_t* ws = (const device uint16_t*)w;
     for (int i = 0; i < (values_per_thread / 4); i++) {
       accum +=
@@ -508,7 +545,27 @@ METAL_FUNC void fp_qmv_fast_impl(
   y += tid.x * out_vec_size + out_row;
 
   for (int k = 0; k < in_vec_size; k += block_size) {
+#if defined(__METAL_VERSION__) && (__METAL_VERSION__ >= 310)
+    if constexpr (group_size == 16 && bits == 4) {
+      // Same x elements into the same x_thread slots with the same
+      // per-element T -> U conversion as load_vector, using wider aligned
+      // loads (lane x offsets are multiples of values_per_thread == 16
+      // elements and rows of the fast kernel are multiples of 512 elements).
+      const device vec<T, 4>* xv = (const device vec<T, 4>*)x;
+#pragma unroll
+      for (int i = 0; i < values_per_thread / 4; i++) {
+        const vec<T, 4> xi = xv[i];
+        x_thread[4 * i] = xi[0];
+        x_thread[4 * i + 1] = xi[1];
+        x_thread[4 * i + 2] = xi[2];
+        x_thread[4 * i + 3] = xi[3];
+      }
+    } else {
+      load_vector<T, U, values_per_thread>(x, x_thread);
+    }
+#else
     load_vector<T, U, values_per_thread>(x, x_thread);
+#endif
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
