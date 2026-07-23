@@ -61,12 +61,12 @@ value_fingerprint() {
 # pure ASCII, so byte-wise deletion cannot corrupt a legitimate value; a
 # poisoned-but-otherwise-correct secret is rescued instead of handing curl a
 # malformed URL (curl exit 3, "URL rejected").
-sanitize_url_value() {
+strip_invisible_bytes() {
   LC_ALL=C printf '%s' "$1" | LC_ALL=C tr -d '[:space:][:cntrl:]\302\240'
 }
 
 raw_bucket_endpoint="${R2_BUCKET_ENDPOINT}"
-endpoint="$(sanitize_url_value "${raw_bucket_endpoint}")"
+endpoint="$(strip_invisible_bytes "${raw_bucket_endpoint}")"
 if [[ "${endpoint}" != "${raw_bucket_endpoint}" ]]; then
   echo "download-r2-object: stripped invisible whitespace/control bytes from R2_BUCKET_ENDPOINT ($(value_fingerprint "${raw_bucket_endpoint}"))" >&2
 fi
@@ -74,6 +74,34 @@ endpoint="${endpoint%/}"
 endpoint_pattern='^https://[a-z0-9.-]+(/[A-Za-z0-9._-]+)*$'
 if [[ ! "${endpoint}" =~ ${endpoint_pattern} ]]; then
   echo "download-r2-object: R2_BUCKET_ENDPOINT is not a valid https R2 endpoint after sanitization ($(value_fingerprint "${raw_bucket_endpoint}")); expected https://<host>[/<bucket>[/<prefix>...]]; refusing to print the value" >&2
+  exit 1
+fi
+
+# The same paste class poisons the credentials: an invisible byte inside
+# R2_ACCESS_KEY_ID lands mid-string in the Authorization header (curl drops
+# the malformed header and the request arrives unsigned -> R2 answers 400
+# InvalidArgument: Authorization), and one inside R2_SECRET_ACCESS_KEY feeds
+# the HMAC a wrong key (403 SignatureDoesNotMatch). Neither byte class is
+# ever legitimate in an R2 credential, so strip and note it. The secret's
+# notice reports length only - never any byte of the secret.
+raw_access_key_id="${R2_ACCESS_KEY_ID}"
+R2_ACCESS_KEY_ID="$(strip_invisible_bytes "${raw_access_key_id}")"
+if [[ "${R2_ACCESS_KEY_ID}" != "${raw_access_key_id}" ]]; then
+  echo "download-r2-object: stripped invisible whitespace/control bytes from R2_ACCESS_KEY_ID ($(value_fingerprint "${raw_access_key_id}"))" >&2
+fi
+access_key_pattern='^[A-Za-z0-9]+$'
+if [[ ! "${R2_ACCESS_KEY_ID}" =~ ${access_key_pattern} ]]; then
+  echo "download-r2-object: R2_ACCESS_KEY_ID is not a plausible access key id after sanitization ($(value_fingerprint "${raw_access_key_id}")); refusing to print the value" >&2
+  exit 1
+fi
+
+raw_secret_access_key="${R2_SECRET_ACCESS_KEY}"
+R2_SECRET_ACCESS_KEY="$(strip_invisible_bytes "${raw_secret_access_key}")"
+if [[ "${R2_SECRET_ACCESS_KEY}" != "${raw_secret_access_key}" ]]; then
+  echo "download-r2-object: stripped invisible whitespace/control bytes from R2_SECRET_ACCESS_KEY (length=$(LC_ALL=C printf '%s' "${raw_secret_access_key}" | wc -c | tr -d '[:space:]'); byte values withheld)" >&2
+fi
+if [[ -z "${R2_SECRET_ACCESS_KEY}" ]]; then
+  echo "download-r2-object: R2_SECRET_ACCESS_KEY is empty after sanitization" >&2
   exit 1
 fi
 
