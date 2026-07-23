@@ -1002,9 +1002,21 @@ jobs:
           set -euo pipefail
           /bin/rm -rf .mlxfast-cache/worker-build
           /bin/mkdir -p .mlxfast-cache/worker-build
+          # The metallib CMake build tree (mlx-metal, plus the builder's
+          # mlx-metal.mlxfast-build.* lock artifacts) never rides the cache:
+          # a restored tree comes back owned by the runner uid, and the
+          # bench uid -- whose ACL grant deliberately withholds
+          # writesecurity -- cannot chmod runner-owned files, so cmake's
+          # configure_file dies with "Operation not permitted" the first
+          # time a kernel-touching submission (metallib cache miss) has to
+          # rebuild the metallib over it (run 30048514684). When the
+          # metallib cache hits, the tree is never consulted at all.
+          # tools/build-mlx-metallib.sh also regenerates any foreign-owned
+          # tree it finds, as defense in depth.
           /usr/bin/rsync -a \
             --exclude='ModuleCache' \
             --exclude='clang-module-cache' \
+            --exclude='/mlx-metal*' \
             "${MLXFAST_JOB_WS}/.build-worker/" .mlxfast-cache/worker-build/
           test -d .mlxfast-cache/worker-build/release
 

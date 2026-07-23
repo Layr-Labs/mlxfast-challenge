@@ -500,6 +500,13 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(stageWorkerBuildProductsStep.contains("/usr/bin/rsync -a \\"))
     #expect(stageWorkerBuildProductsStep.contains("--exclude='ModuleCache'"))
     #expect(stageWorkerBuildProductsStep.contains("--exclude='clang-module-cache'"))
+    // The metallib CMake build tree must never enter the worker cache: a
+    // restored tree comes back runner-owned, and the bench uid (no
+    // writesecurity in its ACL grant) cannot chmod runner-owned files, so
+    // cmake configure_file EPERMs on the next kernel-touching metallib
+    // rebuild (run 30048514684). The anchored pattern also keeps the
+    // builder's mlx-metal.mlxfast-build.* lock artifacts out of the cache.
+    #expect(stageWorkerBuildProductsStep.contains("--exclude='/mlx-metal*'"))
     #expect(stageWorkerBuildProductsStep.contains("\"${MLXFAST_JOB_WS}/.build-worker/\" .mlxfast-cache/worker-build/"))
     #expect(stageWorkerBuildProductsStep.contains("test -d .mlxfast-cache/worker-build/release"))
     let saveWorkerBuildProductsStep = String(workflow[saveWorkerBuildProductsRange.lowerBound..<transformRange.lowerBound])
@@ -2277,10 +2284,15 @@ func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
         let bytes = try #require((attributes[.size] as? NSNumber)?.intValue)
         #expect(bytes <= EditableSurfaceByteBudget.defaultMaxFileBytes)
     }
+    // Like the total above, matmul.cpp's exact size legitimately moves with
+    // promoted kernel submissions (62c6697 grew it past the old 86_040
+    // pin, breaking ci for every branch); only the per-file launch budget
+    // is asserted for it.
     let matmulAttributes = try FileManager.default.attributesOfItem(
         atPath: "Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/matmul.cpp"
     )
-    #expect((matmulAttributes[.size] as? NSNumber)?.intValue == 86_040)
+    let matmulBytes = try #require((matmulAttributes[.size] as? NSNumber)?.intValue)
+    #expect(matmulBytes <= EditableSurfaceByteBudget.defaultMaxFileBytes)
 
     // Ranked builds consume the overlaid host dispatch source through the
     // pinned local mlx-swift package. On Apple platforms the Cmlx target walks

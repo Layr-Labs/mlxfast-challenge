@@ -628,8 +628,26 @@ VENDORED_METAL_FINGERPRINT="$(compute_vendored_metal_fingerprint)"
 # Detect the mismatch while holding the build lock and regenerate the build
 # tree instead of failing the build; a matching cache is kept untouched so
 # incremental rebuilds stay cheap.
+#
+# A build tree OWNED BY ANOTHER USER is equally unusable, but fails later
+# instead of up front: cmake's configure_file always finishes by chmod()ing
+# its output file, and chmod by a non-owner fails with EPERM ("Operation
+# not permitted") even where writing the file's data is allowed. That is
+# exactly the ranked-runner shape -- the worker build-products cache
+# restores as the runner uid, the bench uid builds through an ACL grant
+# that deliberately withholds writesecurity, and the first kernel-touching
+# submission (metallib cache miss) then reconfigures the restored tree and
+# dies inside configure_file (run 30048514684). Regenerate any
+# foreign-owned tree: a fresh tree is owned by this uid and configures
+# cleanly. Both regeneration paths recreate the Metal compiler HOME, which
+# defaults to a subdirectory of the removed build tree.
 CMAKE_CACHE_FILE="${CMAKE_BUILD_DIR}/CMakeCache.txt"
-if [[ -f "${CMAKE_CACHE_FILE}" ]]; then
+if [[ ( -d "${CMAKE_BUILD_DIR}" && ! -O "${CMAKE_BUILD_DIR}" ) \
+    || ( -f "${CMAKE_CACHE_FILE}" && ! -O "${CMAKE_CACHE_FILE}" ) ]]; then
+  echo "build-mlx-metallib.sh: CMake build tree in ${CMAKE_BUILD_DIR} is owned by another user (e.g. restored build products); regenerating" >&2
+  rm -rf "${CMAKE_BUILD_DIR}"
+  mkdir -p "${METAL_COMPILER_HOME}"
+elif [[ -f "${CMAKE_CACHE_FILE}" ]]; then
   recorded_cache_dir="$(sed -n 's/^CMAKE_CACHEFILE_DIR:INTERNAL=//p' "${CMAKE_CACHE_FILE}" | head -n 1)"
   recorded_source_dir="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "${CMAKE_CACHE_FILE}" | head -n 1)"
   actual_cache_dir="$(cd "${CMAKE_BUILD_DIR}" && pwd -P)"
@@ -638,6 +656,7 @@ if [[ -f "${CMAKE_CACHE_FILE}" ]]; then
       || "${recorded_source_dir}" != "${MLX_SOURCE}" ]]; then
     echo "build-mlx-metallib.sh: stale CMake cache in ${CMAKE_BUILD_DIR} (recorded build dir '${recorded_cache_dir:-unknown}', source '${recorded_source_dir:-unknown}'); regenerating" >&2
     rm -rf "${CMAKE_BUILD_DIR}"
+    mkdir -p "${METAL_COMPILER_HOME}"
   fi
 fi
 

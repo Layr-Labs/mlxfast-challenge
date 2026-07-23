@@ -76,6 +76,27 @@ func metallibBuilderRegeneratesStaleCMakeCache() throws {
     #expect(metallibBuilder.contains("CMAKE_HOME_DIRECTORY:INTERNAL="))
     #expect(metallibBuilder.contains("|| \"${recorded_source_dir}\" != \"${MLX_SOURCE}\""))
     #expect(metallibBuilder.contains("rm -rf \"${CMAKE_BUILD_DIR}\""))
+
+    // A build tree owned by another uid is equally unusable, but fails
+    // LATER: cmake's configure_file always chmod()s its output, and chmod
+    // by a non-owner fails with EPERM even where writing file data is
+    // allowed. On the ranked box the worker build-products cache restores
+    // as the runner uid while the bench uid builds through an ACL grant
+    // that withholds writesecurity, so the first kernel-touching
+    // submission (metallib cache miss) died reconfiguring the restored
+    // tree with "Operation not permitted" (run 30048514684). The builder
+    // must regenerate a foreign-owned tree, and both regeneration paths
+    // must recreate the Metal compiler HOME they may have just deleted
+    // (its default lives inside the build tree).
+    #expect(metallibBuilder.contains("! -O \"${CMAKE_BUILD_DIR}\""))
+    #expect(metallibBuilder.contains("! -O \"${CMAKE_CACHE_FILE}\""))
+    #expect(metallibBuilder.contains("owned by another user"))
+    #expect(metallibBuilder.contains(
+        "rm -rf \"${CMAKE_BUILD_DIR}\"\n  mkdir -p \"${METAL_COMPILER_HOME}\""
+    ))
+    #expect(metallibBuilder.contains(
+        "rm -rf \"${CMAKE_BUILD_DIR}\"\n    mkdir -p \"${METAL_COMPILER_HOME}\""
+    ))
 }
 
 @Test
