@@ -3,7 +3,7 @@
 # workflow on an explicitly permitted branch namespace.
 set -euo pipefail
 
-readonly TRUSTED_REPOSITORY="Layr-Labs/mlxfast-challenge-dev"
+readonly TRUSTED_REPOSITORY="Layr-Labs/mlxfast-challenge"
 readonly WORKFLOW_PATH=".github/workflows/benchmark.yml"
 
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"

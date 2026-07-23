@@ -743,10 +743,10 @@ func trustedBenchmarkWorkflowGuardAllowsOnlyPermittedBranches() throws {
             fileURLWithPath: FileManager.default.currentDirectoryPath
         )
         process.environment = ProcessInfo.processInfo.environment.merging([
-            "GITHUB_REPOSITORY": "Layr-Labs/mlxfast-challenge-dev",
+            "GITHUB_REPOSITORY": "Layr-Labs/mlxfast-challenge",
             "GITHUB_REF": ref,
             "GITHUB_WORKFLOW_REF":
-                "Layr-Labs/mlxfast-challenge-dev/.github/workflows/\(workflow)@\(ref)",
+                "Layr-Labs/mlxfast-challenge/.github/workflows/\(workflow)@\(ref)",
             "GITHUB_EVENT_NAME": "workflow_dispatch",
         ]) { _, new in new }
         let stderr = Pipe()
