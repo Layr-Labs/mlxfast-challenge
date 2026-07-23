@@ -599,6 +599,26 @@ FMT_SOURCE="$(cd "${FMT_SOURCE}" && pwd -P)"
 # mid-build yields a sidecar that later verification correctly rejects.
 VENDORED_METAL_FINGERPRINT="$(compute_vendored_metal_fingerprint)"
 
+# A CMake cache generated for a different build or source directory (for
+# example a build tree restored into a relocated workspace, like the ranked
+# job workspace moving from ranked-current to a track-versioned path) makes
+# cmake configure hard-fail with "CMakeCache.txt directory ... is different".
+# Detect the mismatch while holding the build lock and regenerate the build
+# tree instead of failing the build; a matching cache is kept untouched so
+# incremental rebuilds stay cheap.
+CMAKE_CACHE_FILE="${CMAKE_BUILD_DIR}/CMakeCache.txt"
+if [[ -f "${CMAKE_CACHE_FILE}" ]]; then
+  recorded_cache_dir="$(sed -n 's/^CMAKE_CACHEFILE_DIR:INTERNAL=//p' "${CMAKE_CACHE_FILE}" | head -n 1)"
+  recorded_source_dir="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "${CMAKE_CACHE_FILE}" | head -n 1)"
+  actual_cache_dir="$(cd "${CMAKE_BUILD_DIR}" && pwd -P)"
+  if [[ -z "${recorded_cache_dir}" \
+      || "${recorded_cache_dir}" != "${actual_cache_dir}" \
+      || "${recorded_source_dir}" != "${MLX_SOURCE}" ]]; then
+    echo "build-mlx-metallib.sh: stale CMake cache in ${CMAKE_BUILD_DIR} (recorded build dir '${recorded_cache_dir:-unknown}', source '${recorded_source_dir:-unknown}'); regenerating" >&2
+    rm -rf "${CMAKE_BUILD_DIR}"
+  fi
+fi
+
 JOBS="${MLXFAST_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 
 HOME="${METAL_COMPILER_HOME}" "${CMAKE_BIN}" \

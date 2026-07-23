@@ -58,6 +58,27 @@ func setupScriptCoordinatesCacheAndMetallibState() throws {
 }
 
 @Test
+func metallibBuilderRegeneratesStaleCMakeCache() throws {
+    let metallibBuilder = try String(
+        contentsOfFile: "tools/build-mlx-metallib.sh",
+        encoding: .utf8
+    )
+
+    // A build tree restored into a relocated workspace (for example the
+    // ranked job workspace moving between absolute paths) carries a
+    // CMakeCache.txt whose recorded build/source directories no longer
+    // match; cmake configure hard-fails on that mismatch. The builder must
+    // detect it while holding the build lock and regenerate the build tree
+    // instead of failing, and must keep a matching cache untouched so
+    // incremental rebuilds stay cheap.
+    #expect(metallibBuilder.contains("CMAKE_CACHE_FILE=\"${CMAKE_BUILD_DIR}/CMakeCache.txt\""))
+    #expect(metallibBuilder.contains("CMAKE_CACHEFILE_DIR:INTERNAL="))
+    #expect(metallibBuilder.contains("CMAKE_HOME_DIRECTORY:INTERNAL="))
+    #expect(metallibBuilder.contains("|| \"${recorded_source_dir}\" != \"${MLX_SOURCE}\""))
+    #expect(metallibBuilder.contains("rm -rf \"${CMAKE_BUILD_DIR}\""))
+}
+
+@Test
 func setupStartsMetallibBuildOnlyOnceInSynchronousAndParallelModes() throws {
     let root = try setupTemporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
