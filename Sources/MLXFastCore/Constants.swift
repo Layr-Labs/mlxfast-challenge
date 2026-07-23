@@ -101,7 +101,10 @@ public enum MLXFastConstants {
     // sliding-window cache (3x the window) while ranked timed decode stays
     // fixed at 512 by the workflow env.
     public static let experimentalMTPMaxConfiguredTotalTokens = 1_536
-    public static let localIterateBenchmarkDecodeSteps = 16
+    // Local iterate charges the same 512-token seed prefill as the official
+    // decode window, so it must use the same denominator to produce a
+    // comparable decode seconds-per-token estimate.
+    public static let localIterateBenchmarkDecodeSteps = benchmarkDecodeSteps
     // Local submit uses a longer public fixture so the Yukon pre-submit hook
     // exercises one continuous decode trajectory for about ten minutes instead
     // of repeating the short local-iterate correctness window.

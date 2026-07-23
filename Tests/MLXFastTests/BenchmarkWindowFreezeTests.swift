@@ -52,6 +52,13 @@ func benchmarkWindowConstantsAreFrozen() {
     // Decode axis: 512-token seed prefill charged to decode, then 128 validated steps.
     #expect(MLXFastConstants.benchmarkDecodeSeedTokens == 512)
     #expect(MLXFastConstants.benchmarkDecodeSteps == 128)
+    // The local estimate is divided by its decode-step count after charging
+    // the same 512-token seed prefill. It must therefore use the official
+    // window's denominator to remain comparable with the cached baseline.
+    #expect(
+        MLXFastConstants.localIterateBenchmarkDecodeSteps
+            == MLXFastConstants.benchmarkDecodeSteps
+    )
     // Ranking contract: geometric weights and floors the baseline maps through.
     #expect(MLXFastConstants.scoreDecodeWeight == 0.75)
     #expect(MLXFastConstants.scorePrefillWeight == 0.25)

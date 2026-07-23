@@ -1369,11 +1369,16 @@ private func writeIndex(_ path: URL, tensors: [TensorFixture], shardName: String
 }
 
 @Test
-func localIterateDecodeProgressIntervalReportsEveryStepForShortRuns() {
-    // local-iterate: 16 decode steps get a running-number line on every token.
+func localDecodeProgressIntervalUsesExpectedCadence() {
+    // Tiny synthetic runs get a running-number line on every token.
     #expect(LagunaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 16, timingRepeats: 1) == 1)
     #expect(LagunaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 32, timingRepeats: 1) == 1)
-    // local-submit: 1023 steps keep the historical 8-step cadence.
+    // The 128-step local-iterate window and 1023-step local-submit window keep
+    // the historical 8-step cadence.
+    #expect(LagunaRuntime.localIterateDecodeProgressInterval(
+        totalDecodeSteps: MLXFastConstants.localIterateBenchmarkDecodeSteps,
+        timingRepeats: 1
+    ) == 8)
     #expect(LagunaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 1023, timingRepeats: 1) == 8)
     // Multi-repeat runs keep the sparser 64-step cadence.
     #expect(LagunaRuntime.localIterateDecodeProgressInterval(totalDecodeSteps: 512, timingRepeats: 4) == 64)

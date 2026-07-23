@@ -3441,7 +3441,9 @@ func benchmarkLocalIterateModeUsesPublicFixtureAndNonOfficialScore() throws {
     #expect(script.contains("if [[ \"${arg}\" == \"--local-iterate\" ]]; then"))
     #expect(script.contains("SCORE_PATH=\"score.local-iterate.json\""))
     #expect(script.contains("GOLDEN_PATH=\"correctness_prompts/public_longcopy_gate_english_512_256.json\""))
-    #expect(constants.contains("public static let localIterateBenchmarkDecodeSteps = 16"))
+    #expect(constants.contains(
+        "public static let localIterateBenchmarkDecodeSteps = benchmarkDecodeSteps"
+    ))
     #expect(cli.contains("flagOptions: [\"--local-submit\", \"--local-iterate\"]"))
     #expect(cli.contains("LagunaRuntime.localIterate("))
     #expect(cli.contains("MLXFastConstants.defaultLocalIterateScorePath"))
