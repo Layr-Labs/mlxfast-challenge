@@ -37,14 +37,45 @@ fi
 : "${R2_BUCKET_ENDPOINT:?R2_BUCKET_ENDPOINT is required}"
 : "${R2_SECRET_ACCESS_KEY:?R2_SECRET_ACCESS_KEY is required}"
 
-endpoint="${R2_BUCKET_ENDPOINT%/}"
-case "${endpoint}" in
-  https://*) ;;
-  *)
-    echo "download-r2-object: R2_BUCKET_ENDPOINT must be an https URL" >&2
-    exit 1
-    ;;
-esac
+# Describe a value without revealing it: byte length plus the hex of the
+# first and last byte. Enough to spot an invisible poison byte (0x0a
+# newline, 0x0d CR, 0xa0 from a pasted NBSP) in a secret from the run log.
+value_fingerprint() {
+  local value="$1"
+  local length
+  length="$(LC_ALL=C printf '%s' "${value}" | wc -c | tr -d '[:space:]')"
+  if [[ "${length}" == "0" ]]; then
+    printf 'length=0'
+    return 0
+  fi
+  local first_hex last_hex
+  first_hex="$(LC_ALL=C printf '%s' "${value}" | head -c 1 | xxd -p | tr -d '\n')"
+  last_hex="$(LC_ALL=C printf '%s' "${value}" | tail -c 1 | xxd -p | tr -d '\n')"
+  printf 'length=%s first=0x%s last=0x%s' "${length}" "${first_hex}" "${last_hex}"
+}
+
+# Remove bytes that can never appear in a valid https endpoint: every ASCII
+# whitespace/control byte (the trailing newline `echo | gh secret set`
+# injects, CRs from Windows clipboards, tabs) plus the UTF-8 non-breaking
+# space bytes (0xC2 0xA0) that rich-text editors paste. A valid endpoint is
+# pure ASCII, so byte-wise deletion cannot corrupt a legitimate value; a
+# poisoned-but-otherwise-correct secret is rescued instead of handing curl a
+# malformed URL (curl exit 3, "URL rejected").
+sanitize_url_value() {
+  LC_ALL=C printf '%s' "$1" | LC_ALL=C tr -d '[:space:][:cntrl:]\302\240'
+}
+
+raw_bucket_endpoint="${R2_BUCKET_ENDPOINT}"
+endpoint="$(sanitize_url_value "${raw_bucket_endpoint}")"
+if [[ "${endpoint}" != "${raw_bucket_endpoint}" ]]; then
+  echo "download-r2-object: stripped invisible whitespace/control bytes from R2_BUCKET_ENDPOINT ($(value_fingerprint "${raw_bucket_endpoint}"))" >&2
+fi
+endpoint="${endpoint%/}"
+endpoint_pattern='^https://[a-z0-9.-]+(/[A-Za-z0-9._-]+)*$'
+if [[ ! "${endpoint}" =~ ${endpoint_pattern} ]]; then
+  echo "download-r2-object: R2_BUCKET_ENDPOINT is not a valid https R2 endpoint after sanitization ($(value_fingerprint "${raw_bucket_endpoint}")); expected https://<host>[/<bucket>[/<prefix>...]]; refusing to print the value" >&2
+  exit 1
+fi
 
 endpoint_rest="${endpoint#https://}"
 host="${endpoint_rest%%/*}"
