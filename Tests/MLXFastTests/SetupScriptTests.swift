@@ -79,6 +79,188 @@ func metallibBuilderRegeneratesStaleCMakeCache() throws {
 }
 
 @Test
+func setupAndMetallibLocksPublishWithBSDAndGNUCoreutils() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let fakeBin = root.appendingPathComponent("bin")
+    try FileManager.default.createDirectory(at: fakeBin, withIntermediateDirectories: true)
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("ln"),
+        contents: """
+        #!/usr/bin/env bash
+        set -euo pipefail
+        printf '%s\n' "$*" >> "${MLXFAST_TEST_LN_LOG:?}"
+        mode="${MLXFAST_TEST_COREUTILS_MODE:?}"
+        if [[ "${mode}" == "gnu" && "${1:-}" == "-s" && "${2:-}" == "-h" ]]; then
+          if [[ "${MLXFAST_TEST_INJECT_COMPETING_LOCK:-0}" == "1" ]]; then
+            mkdir "${5:?}"
+          fi
+          exit 1
+        fi
+        if [[ "${1:-}" == "-s" && "${2:-}" == "-T" && "${3:-}" == "--" ]]; then
+          [[ "${mode}" == "gnu" ]]
+          [[ ! -e "${5:?}" && ! -L "${5}" ]]
+          exec /bin/ln -s -h -- "${4:?}" "${5}"
+        fi
+        exec /bin/ln "$@"
+        """
+    )
+
+    for mode in ["bsd", "gnu"] {
+        let modeRoot = root.appendingPathComponent(mode)
+        try FileManager.default.createDirectory(at: modeRoot, withIntermediateDirectories: true)
+        let linkLog = modeRoot.appendingPathComponent("ln.log")
+        let raceLog = modeRoot.appendingPathComponent("race-ln.log")
+        let result = try runSetupBash(
+            """
+            set -euo pipefail
+            eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+            acquire_reference_cache_mutation_lock
+            setup_generation="${REFERENCE_CACHE_MUTATION_LOCK_GENERATION_DIR}"
+            [[ -L "${REFERENCE_CACHE_MUTATION_LOCK_DIR}" ]]
+            [[ "$(readlink "${REFERENCE_CACHE_MUTATION_LOCK_DIR}")" == "${setup_generation}" ]]
+            release_reference_cache_mutation_lock
+            [[ ! -e "${REFERENCE_CACHE_MUTATION_LOCK_DIR}" \
+                && ! -L "${REFERENCE_CACHE_MUTATION_LOCK_DIR}" ]]
+            [[ ! -e "${setup_generation}" ]]
+
+            eval "$(sed \
+              -e 's|^ROOT_DIR=.*|ROOT_DIR="${REPO_ROOT}"|' \
+              -e '/^METAL_TOOLCHAIN_IDENTIFIER=/,$d' \
+              "${REPO_ROOT}/tools/build-mlx-metallib.sh")"
+            acquire_build_lock
+            build_generation="${BUILD_LOCK_GENERATION_DIR}"
+            [[ -L "${BUILD_LOCK_DIR}" ]]
+            [[ "$(readlink "${BUILD_LOCK_DIR}")" == "${build_generation}" ]]
+            release_build_lock
+            [[ ! -e "${BUILD_LOCK_DIR}" && ! -L "${BUILD_LOCK_DIR}" ]]
+            [[ ! -e "${build_generation}" ]]
+
+            if [[ "${MLXFAST_TEST_COREUTILS_MODE}" == "gnu" ]]; then
+              export MLXFAST_TEST_LN_LOG="${RACE_LOG}"
+              export MLXFAST_TEST_INJECT_COMPETING_LOCK=1
+              mkdir "${MODE_ROOT}/race-target"
+              publish_status=0
+              publish_lock_symlink \
+                "${MODE_ROOT}/race-target" "${MODE_ROOT}/race.lock" || publish_status=$?
+              [[ "${publish_status}" != "0" ]]
+              [[ -d "${MODE_ROOT}/race.lock" && ! -L "${MODE_ROOT}/race.lock" ]]
+            fi
+            """,
+            environment: [
+                "REPO_ROOT": FileManager.default.currentDirectoryPath,
+                "PATH": "\(fakeBin.path):/usr/bin:/bin",
+                "MODE_ROOT": modeRoot.path,
+                "RACE_LOG": raceLog.path,
+                "MLXFAST_TEST_LN_LOG": linkLog.path,
+                "MLXFAST_TEST_COREUTILS_MODE": mode,
+                "MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_DIR": modeRoot
+                    .appendingPathComponent("reference.lock").path,
+                "MLXFAST_REFERENCE_CACHE_MUTATION_LOCK_TIMEOUT_SECONDS": "0",
+                "MLXFAST_MLX_METAL_BUILD_DIR": modeRoot
+                    .appendingPathComponent("metal-build").path,
+                "MLXFAST_MLX_METAL_BUILD_LOCK_DIR": modeRoot
+                    .appendingPathComponent("metal-build.lock").path,
+                "MLXFAST_MLX_METAL_BUILD_LOCK_TIMEOUT_SECONDS": "0",
+                "MLXFAST_MLX_METALLIB": modeRoot.appendingPathComponent("mlx.metallib").path,
+                "MLXFAST_CLANG_MODULE_CACHE": modeRoot.appendingPathComponent("clang-cache").path,
+                "MLXFAST_METAL_COMPILER_HOME": modeRoot.appendingPathComponent("metal-home").path,
+            ]
+        )
+
+        #expect(
+            result.status == 0,
+            "mode=\(mode) stdout: \(result.stdout) stderr: \(result.stderr)"
+        )
+        let linkAttempts = try String(contentsOf: linkLog, encoding: .utf8)
+            .split(separator: "\n")
+        if mode == "bsd" {
+            #expect(linkAttempts.count == 2)
+            #expect(linkAttempts.allSatisfy { $0.contains("-s -h --") })
+        } else {
+            #expect(linkAttempts.count == 4)
+            #expect(linkAttempts.filter { $0.contains("-s -h --") }.count == 2)
+            #expect(linkAttempts.filter { $0.contains("-s -T --") }.count == 2)
+            let raceAttempts = try String(contentsOf: raceLog, encoding: .utf8)
+                .split(separator: "\n")
+            #expect(raceAttempts.count == 1)
+            #expect(raceAttempts.first?.contains("-s -h --") == true)
+        }
+    }
+}
+
+@Test
+func setupAndMetallibStatFallbackDiscardsFailedProbeOutput() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let fakeBin = root.appendingPathComponent("bin")
+    try FileManager.default.createDirectory(at: fakeBin, withIntermediateDirectories: true)
+    try writeSetupExecutable(
+        at: fakeBin.appendingPathComponent("stat"),
+        contents: """
+        #!/usr/bin/env bash
+        set -euo pipefail
+        if [[ "${1:-}" == "-f" ]]; then
+          printf 'failed-bsd-probe-output\n'
+          exit 1
+        fi
+        [[ "${1:-}" == "-c" && "$#" == "3" ]]
+        case "${2}" in
+          '%Y') printf '1700000000\n' ;;
+          '%d:%i') printf '11:22\n' ;;
+          '%d:%i:%s:%Y:%Z:0') printf '11:22:33:44:55:0\n' ;;
+          '%d:%i:%s:%Y:0') printf '11:22:33:44:0\n' ;;
+          '%u') /usr/bin/id -u ;;
+          *) exit 2 ;;
+        esac
+        """
+    )
+
+    let result = try runSetupBash(
+        """
+        set -euo pipefail
+        eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+        [[ "$(file_mtime_seconds "${TEST_ROOT}")" == "1700000000" ]]
+        [[ "$(file_metadata_signature "${TEST_ROOT}")" == "11:22:33:44:55:0" ]]
+        [[ "$(file_content_identity_signature "${TEST_ROOT}")" == "11:22:33:44:0" ]]
+        [[ "$(directory_identity "${TEST_ROOT}")" == "11:22" ]]
+
+        eval "$(sed \
+          -e 's|^ROOT_DIR=.*|ROOT_DIR="${REPO_ROOT}"|' \
+          -e '/^METAL_TOOLCHAIN_IDENTIFIER=/,$d' \
+          "${REPO_ROOT}/tools/build-mlx-metallib.sh")"
+        [[ "$(lock_mtime_seconds "${TEST_ROOT}")" == "1700000000" ]]
+        [[ "$(lock_directory_identity "${TEST_ROOT}")" == "11:22" ]]
+        """,
+        environment: [
+            "REPO_ROOT": FileManager.default.currentDirectoryPath,
+            "PATH": "\(fakeBin.path):/usr/bin:/bin",
+            "TEST_ROOT": root.path,
+            "MLXFAST_MLX_METAL_BUILD_DIR": root.appendingPathComponent("metal-build").path,
+            "MLXFAST_MLX_METAL_BUILD_LOCK_DIR": root
+                .appendingPathComponent("metal-build.lock").path,
+            "MLXFAST_MLX_METALLIB": root.appendingPathComponent("mlx.metallib").path,
+            "MLXFAST_CLANG_MODULE_CACHE": root.appendingPathComponent("clang-cache").path,
+            "MLXFAST_METAL_COMPILER_HOME": root.appendingPathComponent("metal-home").path,
+        ]
+    )
+
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+    let setup = try String(contentsOfFile: "setup.sh", encoding: .utf8)
+    let metallibBuilder = try String(
+        contentsOfFile: "tools/build-mlx-metallib.sh",
+        encoding: .utf8
+    )
+    let setupStatHelperCount = setup.components(separatedBy: "stat_value() {").count - 1
+    let builderStatHelperCount =
+        metallibBuilder.components(separatedBy: "stat_value() {").count - 1
+    #expect(setupStatHelperCount == 2)
+    #expect(builderStatHelperCount == 1)
+    #expect(!setup.contains("|| stat -c"))
+    #expect(!metallibBuilder.contains("|| stat -c"))
+}
+
+@Test
 func setupStartsMetallibBuildOnlyOnceInSynchronousAndParallelModes() throws {
     let root = try setupTemporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }

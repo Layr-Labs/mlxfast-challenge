@@ -898,21 +898,32 @@ reference_manifest_totals() {
   printf '%s %s\n' "${file_count}" "${byte_count}"
 }
 
+stat_value() {
+  local bsd_format="$1"
+  local gnu_format="$2"
+  local path="$3"
+  local value
+  # GNU stat can print data for the valid path before its BSD-style probe fails.
+  if value="$(stat -f "${bsd_format}" "${path}" 2>/dev/null)"; then
+    printf '%s\n' "${value}"
+    return 0
+  fi
+  stat -c "${gnu_format}" "${path}"
+}
+
 file_mtime_seconds() {
   local file_path="$1"
-  stat -f '%m' "${file_path}" 2>/dev/null || stat -c '%Y' "${file_path}"
+  stat_value '%m' '%Y' "${file_path}"
 }
 
 file_metadata_signature() {
   local file_path="$1"
-  stat -f '%d:%i:%z:%Fm:%Fc:%v' "${file_path}" 2>/dev/null \
-    || stat -c '%d:%i:%s:%Y:%Z:0' "${file_path}"
+  stat_value '%d:%i:%z:%Fm:%Fc:%v' '%d:%i:%s:%Y:%Z:0' "${file_path}"
 }
 
 file_content_identity_signature() {
   local file_path="$1"
-  stat -f '%d:%i:%z:%Fm:%v' "${file_path}" 2>/dev/null \
-    || stat -c '%d:%i:%s:%Y:0' "${file_path}"
+  stat_value '%d:%i:%z:%Fm:%v' '%d:%i:%s:%Y:0' "${file_path}"
 }
 
 discard_reference_verified_signatures() {
@@ -1029,8 +1040,7 @@ mark_reference_file_complete() {
 
 directory_identity() {
   local directory="$1"
-  stat -f '%d:%i' "${directory}" 2>/dev/null \
-    || stat -c '%d:%i' "${directory}"
+  stat_value '%d:%i' '%d:%i' "${directory}"
 }
 
 current_shell_pid() {
@@ -1691,14 +1701,25 @@ download_reference_shards() {
     source_count="${#base_urls[@]}"
     verified_content_identity=""
 
+    stat_value() {
+      local bsd_format="$1"
+      local gnu_format="$2"
+      local path="$3"
+      local value
+      # Discard output from a failed BSD-style probe before trying GNU stat.
+      if value="$(stat -f "${bsd_format}" "${path}" 2>/dev/null)"; then
+        printf "%s\n" "${value}"
+        return 0
+      fi
+      stat -c "${gnu_format}" "${path}"
+    }
+
     file_metadata_signature() {
-      stat -f "%d:%i:%z:%Fm:%Fc:%v" "$1" 2>/dev/null \
-        || stat -c "%d:%i:%s:%Y:%Z:0" "$1"
+      stat_value "%d:%i:%z:%Fm:%Fc:%v" "%d:%i:%s:%Y:%Z:0" "$1"
     }
 
     file_content_identity_signature() {
-      stat -f "%d:%i:%z:%Fm:%v" "$1" 2>/dev/null \
-        || stat -c "%d:%i:%s:%Y:0" "$1"
+      stat_value "%d:%i:%z:%Fm:%v" "%d:%i:%s:%Y:0" "$1"
     }
 
     mark_complete() {
@@ -2205,6 +2226,17 @@ setup_parallel_metallib_enabled() {
   esac
 }
 
+publish_lock_symlink() {
+  local target="$1"
+  local lock_path="$2"
+  # GNU ln rejects BSD -h; retry with -T only if no competing lock appeared.
+  if ln -s -h -- "${target}" "${lock_path}" 2>/dev/null; then
+    return 0
+  fi
+  [[ ! -e "${lock_path}" && ! -L "${lock_path}" ]] || return 1
+  ln -s -T -- "${target}" "${lock_path}" 2>/dev/null
+}
+
 reference_cache_lock_generation_path() {
   local lock_dir="${REFERENCE_CACHE_MUTATION_LOCK_DIR}"
   local raw_target
@@ -2224,8 +2256,7 @@ reference_cache_lock_generation_path() {
   expected_prefix="$(basename "${lock_dir}").generation."
   [[ "$(dirname "${canonical_candidate}")" == "${canonical_lock_parent}" ]] || return 1
   [[ "$(basename "${canonical_candidate}")" == "${expected_prefix}"* ]] || return 1
-  lock_uid="$(stat -f '%u' "${lock_dir}" 2>/dev/null || stat -c '%u' "${lock_dir}")" \
-    || return 1
+  lock_uid="$(stat_value '%u' '%u' "${lock_dir}")" || return 1
   [[ "${lock_uid}" == "$(id -u)" ]] || return 1
   if [[ -e "${canonical_candidate}" || -L "${canonical_candidate}" ]]; then
     [[ -d "${canonical_candidate}" && ! -L "${canonical_candidate}" \
@@ -2530,7 +2561,7 @@ acquire_reference_cache_mutation_lock() {
     # generation already contains a complete owner record. A stalled creator
     # therefore has no ownerless public directory that recovery can replace.
     if [[ ! -e "${lock_dir}" && ! -L "${lock_dir}" ]] \
-        && ln -s -h -- "${generation_dir}" "${lock_dir}" 2>/dev/null; then
+        && publish_lock_symlink "${generation_dir}" "${lock_dir}"; then
       if [[ -L "${lock_dir}" \
           && "$(readlink "${lock_dir}" 2>/dev/null || true)" == "${generation_dir}" ]]; then
         REFERENCE_CACHE_MUTATION_LOCK_TOKEN="${token}"

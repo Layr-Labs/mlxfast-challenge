@@ -123,15 +123,38 @@ find_cmake() {
   return 1
 }
 
+stat_value() {
+  local bsd_format="$1"
+  local gnu_format="$2"
+  local path="$3"
+  local value
+  # GNU stat can print data for the valid path before its BSD-style probe fails.
+  if value="$(stat -f "${bsd_format}" "${path}" 2>/dev/null)"; then
+    printf '%s\n' "${value}"
+    return 0
+  fi
+  stat -c "${gnu_format}" "${path}"
+}
+
+publish_lock_symlink() {
+  local target="$1"
+  local lock_path="$2"
+  # GNU ln rejects BSD -h; retry with -T only if no competing lock appeared.
+  if ln -s -h -- "${target}" "${lock_path}" 2>/dev/null; then
+    return 0
+  fi
+  [[ ! -e "${lock_path}" && ! -L "${lock_path}" ]] || return 1
+  ln -s -T -- "${target}" "${lock_path}" 2>/dev/null
+}
+
 lock_directory_identity() {
   local directory="$1"
-  stat -f '%d:%i' "${directory}" 2>/dev/null \
-    || stat -c '%d:%i' "${directory}"
+  stat_value '%d:%i' '%d:%i' "${directory}"
 }
 
 lock_mtime_seconds() {
   local path="$1"
-  stat -f '%m' "${path}" 2>/dev/null || stat -c '%Y' "${path}"
+  stat_value '%m' '%Y' "${path}"
 }
 
 build_lock_generation_path() {
@@ -152,8 +175,7 @@ build_lock_generation_path() {
   expected_prefix="$(basename "${BUILD_LOCK_DIR}").generation."
   [[ "$(dirname "${canonical_candidate}")" == "${canonical_lock_parent}" ]] || return 1
   [[ "$(basename "${canonical_candidate}")" == "${expected_prefix}"* ]] || return 1
-  lock_uid="$(stat -f '%u' "${BUILD_LOCK_DIR}" 2>/dev/null || stat -c '%u' "${BUILD_LOCK_DIR}")" \
-    || return 1
+  lock_uid="$(stat_value '%u' '%u' "${BUILD_LOCK_DIR}")" || return 1
   [[ "${lock_uid}" == "$(id -u)" ]] || return 1
   if [[ -e "${canonical_candidate}" || -L "${canonical_candidate}" ]]; then
     [[ -d "${canonical_candidate}" && ! -L "${canonical_candidate}" \
@@ -427,7 +449,7 @@ acquire_build_lock() {
     BUILD_LOCK_GENERATION_DIR="${generation_dir}"
 
     if [[ ! -e "${BUILD_LOCK_DIR}" && ! -L "${BUILD_LOCK_DIR}" ]] \
-        && ln -s -h -- "${generation_dir}" "${BUILD_LOCK_DIR}" 2>/dev/null; then
+        && publish_lock_symlink "${generation_dir}" "${BUILD_LOCK_DIR}"; then
       if [[ -L "${BUILD_LOCK_DIR}" \
           && "$(readlink "${BUILD_LOCK_DIR}" 2>/dev/null || true)" == "${generation_dir}" ]]; then
         BUILD_LOCK_TOKEN="${token}"
