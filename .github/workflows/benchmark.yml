@@ -184,14 +184,15 @@ jobs:
       MLXFAST_EXPECTED_NUM_LAYERS: "40"
       MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
       MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}
-      # Private v2 artifacts remain fail-closed until trusted operator
-      # generation fills all six content pins below. Never inherit Environment
-      # variables from v1: each object key embeds its pinned SHA-256.
+      # Private v2 artifacts are pinned in trusted source below. The v2
+      # Environment mirrors the timed prompt SHA/bytes for operator tooling,
+      # but mutable Environment variables are not a workflow trust source.
+      # Each object key embeds its independently verified SHA-256.
       # Keep the ID in sync with
       # MLXFastConstants.benchmarkEvaluationTargetID.
       MLXFAST_TIMED_DECODE_TARGET_ID: lowsim-prose-v1
-      MLXFAST_TIMED_DECODE_PROMPT_SHA256: __POOLSIDE_V2_TIMED_PROMPT_SHA256_PENDING__
-      MLXFAST_TIMED_DECODE_PROMPT_BYTES: "0"
+      MLXFAST_TIMED_DECODE_PROMPT_SHA256: 0b67162cbea948f380e693398b19ba797892b5100cd9e0e415a87e900ac79e03
+      MLXFAST_TIMED_DECODE_PROMPT_BYTES: "2750"
       # The private R2 object KEYS (MLXFAST_CORRECTNESS_GOLDEN_R2_PATH /
       # MLXFAST_GPQA_R2_PATH / MLXFAST_TIMED_DECODE_PROMPT_R2_PATH) are
       # deliberately NOT set at job level: job env is ambient to every step,
@@ -199,17 +200,16 @@ jobs:
       # needlessly reach the untrusted bench environment. They are scoped to
       # their trusted download steps. (The operator denylist blocks them at the
       # bridge as defense in depth.)
-      # Poolside v2 private pins. Placeholders intentionally fail the preflight;
-      # trusted generation must replace every value in one reviewed change.
-      MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: __POOLSIDE_V2_HIDDEN_GOLDEN_SHA256_PENDING__
-      MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "0"
-      MLXFAST_GPQA_REFERENCE_SHA256: __POOLSIDE_V2_GPQA_REFERENCE_SHA256_PENDING__
-      MLXFAST_GPQA_REFERENCE_BYTES: "0"
+      # Poolside v2 private pins, verified against the immutable R2 objects.
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 94239d59b435eb8f370c82bcf8c86822d1bbc1094e3650aeff3abc5558137023
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "35892"
+      MLXFAST_GPQA_REFERENCE_SHA256: 4a6d847c6535561e8d4094e2bb764be96c2cd8f4ca310614120058c3c6a7d26f
+      MLXFAST_GPQA_REFERENCE_BYTES: "9885"
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
       MLXFAST_GPQA_CASE_COUNT: "5"
       # TEMPORARY legacy GPQA budget/min-pass calibration from the superseded
       # mlx-community affine checkpoint. Re-evaluate both values from repeated
-      # Poolside NVFP4 M5 runs before this migration merges; do not weaken the
+      # Poolside NVFP4 M5 runs before ranked activation; do not weaken the
       # semantic gate merely to make the new baseline pass. Keep in sync with
       # MLXFastConstants.{correctnessGPQAMaxNewTokens,semanticGPQAMaxNewTokens,
       # semanticGPQAMinPassCount}.
@@ -1268,8 +1268,8 @@ jobs:
           # Private object keys scoped to this trusted download step only (not
           # job-level), so untrusted bench phases never receive the object
           # names. SHA-addressed names are immutable and cannot alias v1.
-          MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/hidden-golden-${{ env.MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256 }}.json
-          MLXFAST_GPQA_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/gpqa-reference-${{ env.MLXFAST_GPQA_REFERENCE_SHA256 }}.json
+          MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/hidden-correctness-golden-94239d59b435eb8f370c82bcf8c86822d1bbc1094e3650aeff3abc5558137023.json
+          MLXFAST_GPQA_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/gpqa-reference-cases-4a6d847c6535561e8d4094e2bb764be96c2cd8f4ca310614120058c3c6a7d26f.json
         run: |
           set -euo pipefail
           .github/scripts/download-r2-object.sh \
@@ -1657,7 +1657,7 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/timed-prompt-${{ env.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}.txt
+          MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/timed-decode-prompt-0b67162cbea948f380e693398b19ba797892b5100cd9e0e415a87e900ac79e03.txt
         run: |
           set -euo pipefail
           .github/scripts/download-r2-object.sh \

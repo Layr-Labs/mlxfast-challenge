@@ -143,6 +143,14 @@ Configure the `benchmark-private-prompts-v2` Environment with:
   - `R2_ACCESS_KEY_ID`
   - `R2_BUCKET_ENDPOINT`
   - `R2_SECRET_ACCESS_KEY`
+- Non-secret timed-prompt operator mirrors:
+  - `MLXFAST_TIMED_DECODE_PROMPT_SHA256` =
+    `0b67162cbea948f380e693398b19ba797892b5100cd9e0e415a87e900ac79e03`
+  - `MLXFAST_TIMED_DECODE_PROMPT_BYTES` = `2750`
+
+The workflow keeps the reviewed timed-prompt pins in trusted source rather
+than consuming these mutable variables. The Environment values are retained
+for operator tooling and must match the source pins.
 
 The single ranked job declares `environment: benchmark-private-prompts-v2`, so
 the deployment-branch policy and required reviewers gate every run that can
@@ -157,9 +165,13 @@ sees them.
 
 Full benchmark dispatches (`run_benchmark=true`) download three objects from
 the private R2 bucket in trusted steps. All live under
-`correctness_prompts/laguna-xs-2.1-serial-v2/` and use immutable
-content-addressed names: `hidden-golden-<sha256>.json`,
-`gpqa-reference-<sha256>.json`, and `timed-prompt-<sha256>.txt`.
+`correctness_prompts/laguna-xs-2.1-serial-v2/` and use these immutable,
+content-addressed names:
+
+- `hidden-correctness-golden-94239d59b435eb8f370c82bcf8c86822d1bbc1094e3650aeff3abc5558137023.json`
+- `gpqa-reference-cases-4a6d847c6535561e8d4094e2bb764be96c2cd8f4ca310614120058c3c6a7d26f.json`
+- `timed-decode-prompt-0b67162cbea948f380e693398b19ba797892b5100cd9e0e415a87e900ac79e03.txt`
+
 The first is the hidden teacher-forced base case, the second is merged into
 the golden as 5 behavior gates, and the third is the independent timed
 prefill/decode target.
@@ -173,8 +185,8 @@ migration (that checklist is the template for this pass).
 
 Raw private bytes land only in a runner-only `0700` per-run directory; all
 three objects are independently verified against SHA-256 and byte-count pins
-before use. Placeholder pins deliberately fail closed until trusted operator
-generation completes.
+before use. The final baseline-commit and calibration-ready interlocks remain
+separate and fail closed until protected M5 provisioning completes.
 The GPQA augmentation step (`attach-gpqa-gates`) executes code from the
 submitted build (it loads the tokenizer), so it runs through the bench-exec
 bridge like every other untrusted invocation: the raw inputs are copied

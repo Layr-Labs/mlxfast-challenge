@@ -1423,14 +1423,16 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: b9509697c08a2cf3c2943a85f0b76e39c485c441794690fa76835b40a58d7a63"))
     #expect(workflow.contains("MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: \"10686\""))
     #expect(workflow.contains("MLXFAST_TIMED_DECODE_TARGET_ID: \(MLXFastConstants.benchmarkEvaluationTargetID)"))
-    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_SHA256: __POOLSIDE_V2_TIMED_PROMPT_SHA256_PENDING__"))
-    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_BYTES: \"0\""))
-    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/timed-prompt-${{ env.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}.txt"))
-    #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/hidden-golden-${{ env.MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256 }}.json"))
-    #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/gpqa-reference-${{ env.MLXFAST_GPQA_REFERENCE_SHA256 }}.json"))
+    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_SHA256: 0b67162cbea948f380e693398b19ba797892b5100cd9e0e415a87e900ac79e03"))
+    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_BYTES: \"2750\""))
+    #expect(!workflow.contains("${{ vars.MLXFAST_TIMED_DECODE_PROMPT_SHA256 }}"))
+    #expect(!workflow.contains("${{ vars.MLXFAST_TIMED_DECODE_PROMPT_BYTES }}"))
+    #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/timed-decode-prompt-0b67162cbea948f380e693398b19ba797892b5100cd9e0e415a87e900ac79e03.txt"))
+    #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/hidden-correctness-golden-94239d59b435eb8f370c82bcf8c86822d1bbc1094e3650aeff3abc5558137023.json"))
+    #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/gpqa-reference-cases-4a6d847c6535561e8d4094e2bb764be96c2cd8f4ca310614120058c3c6a7d26f.json"))
     #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"5\""))
     // Temporary affine-checkpoint values; Poolside NVFP4 M5 validation must
-    // replace or explicitly re-confirm them before merge. See
+    // replace or explicitly re-confirm them before ranked activation. See
     // MLXFastConstants.semanticGPQAMinPassCount.
     #expect(workflow.contains("MLXFAST_GPQA_MAX_NEW_TOKENS: \"64\""))
     #expect(workflow.contains("MLXFAST_GPQA_TTFT_CASE_COUNT: \"5\""))
@@ -1446,12 +1448,11 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(!workflow.contains("mlxfast-gpqa-calibration-private.log"))
     #expect(!workflow.contains(".github/scripts/upload-r2-object.sh"))
     #expect(!workflow.contains("uploaded calibrated GPQA reference cases to private R2"))
-    // All three Poolside-private artifacts remain explicit fail-closed
-    // placeholders until trusted operator generation replaces all six pins.
-    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: __POOLSIDE_V2_HIDDEN_GOLDEN_SHA256_PENDING__"))
-    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: \"0\""))
-    #expect(workflow.contains("MLXFAST_GPQA_REFERENCE_SHA256: __POOLSIDE_V2_GPQA_REFERENCE_SHA256_PENDING__"))
-    #expect(workflow.contains("MLXFAST_GPQA_REFERENCE_BYTES: \"0\""))
+    // All three Poolside-private artifacts carry reviewed source pins.
+    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 94239d59b435eb8f370c82bcf8c86822d1bbc1094e3650aeff3abc5558137023"))
+    #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: \"35892\""))
+    #expect(workflow.contains("MLXFAST_GPQA_REFERENCE_SHA256: 4a6d847c6535561e8d4094e2bb764be96c2cd8f4ca310614120058c3c6a7d26f"))
+    #expect(workflow.contains("MLXFAST_GPQA_REFERENCE_BYTES: \"9885\""))
     #expect(workflow.contains("raw hidden correctness golden pin mismatch"))
     #expect(workflow.contains("private GPQA reference pin mismatch"))
     #expect(workflow.contains("Poolside v2 private artifacts require three pinned SHA-256 values"))
