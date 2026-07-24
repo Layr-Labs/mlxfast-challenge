@@ -73,7 +73,7 @@ func lagunaRopeScalingConfig(_ spec: LagunaRopeSpec) -> [String: StringOrNumber]
 /// paired local benchmark showed a mild prefill cost with no decode gain, so
 /// this ships opt-in.
 let lagunaFusedQKVEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] == "1"
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] != "0"
 
 /// `DARKBLOOM_FUSED_SHARED_GATE_UP` (default on; set "0" to disable): after
 /// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
