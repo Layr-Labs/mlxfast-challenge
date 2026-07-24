@@ -41,4 +41,11 @@ using namespace metal;
 instantiate_sdpa_vector_heads(float)
 instantiate_sdpa_vector_heads(bfloat16_t)
 instantiate_sdpa_vector_heads(float16_t)
+
+instantiate_kernel(
+    "sdpa_vector_pair_bfloat16_t_128_128",
+    sdpa_vector_pair,
+    bfloat16_t,
+    128,
+    128)
     // clang-format on
