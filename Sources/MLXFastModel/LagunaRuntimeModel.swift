@@ -515,11 +515,32 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
             let xGate = gateUp[.ellipsis, 0 ..< _fusedRoutedGateUpSplit]
             let xUp = gateUp[.ellipsis, _fusedRoutedGateUpSplit...]
             let activated = compiledSiluProduct(xGate, xUp)
-            y = MLX.squeezed(downProj(activated, inds, sortedIndices: false), axis: -2)
+            let expertOutputs = MLX.squeezed(
+                downProj(activated, inds, sortedIndices: false),
+                axis: -2
+            )
+            y = weightedExpertSum(
+                expertOutputs,
+                weights.asType(expertOutputs.dtype)
+            )
+        } else if inds.size >= 64 {
+            // The prefill gather-QMM path already sorts routed rows by expert.
+            // Preserve that layout through the down projection and combine
+            // inverse gather, router weighting, and top-k reduction directly,
+            // avoiding the full unsorted expert-output intermediate.
+            let (sorted, inverseOrder) = switchMLP.callSorted(x, inds)
+            y = fusedUnsortWeightedSum(
+                sorted: sorted,
+                inverseOrder: inverseOrder,
+                weights: weights.asType(sorted.dtype)
+            )
         } else {
-            y = switchMLP(x, inds)
+            let expertOutputs = switchMLP(x, inds)
+            y = weightedExpertSum(
+                expertOutputs,
+                weights.asType(expertOutputs.dtype)
+            )
         }
-        y = weightedExpertSum(y, weights.asType(y.dtype))
         if routedScalingFactor != 1 {
             y = y * routedScalingFactor
         }
