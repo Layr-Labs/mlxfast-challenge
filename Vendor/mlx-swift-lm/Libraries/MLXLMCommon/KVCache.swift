@@ -362,6 +362,43 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             } else {
                 self.keys == nil
             }
+
+        // Fast growth from a completely full allocation: put the supplied
+        // rows between the existing cache and the unused tail in the new
+        // allocation. The stock path concatenates an all-zero growth chunk
+        // and then slice-updates these same supplied rows into it. This form
+        // has the identical capacity and row layout without the redundant
+        // zero-fill/update region. Caches with any existing slack retain the
+        // generic path below because their insertion point is not the end of
+        // the physical allocation.
+        if reset, let currentKeys = self.keys, let currentValues = self.values,
+            currentKeys.dim(2) == previous, currentValues.dim(2) == previous
+        {
+            let supplied = keys.dim(2)
+            let growth = ((step + supplied - 1) / step) * step
+            let tail = growth - supplied
+
+            if tail > 0 {
+                let B = keys.dim(0)
+                let kvHeads = keys.dim(1)
+                let newK = MLXArray.zeros(
+                    [B, kvHeads, tail, keys.dim(3)], dtype: keys.dtype)
+                let newV = MLXArray.zeros(
+                    [B, kvHeads, tail, values.dim(3)], dtype: values.dtype)
+                self.keys = concatenated([currentKeys, keys, newK], axis: 2)
+                self.values = concatenated([currentValues, values, newV], axis: 2)
+            } else {
+                self.keys = concatenated([currentKeys, keys], axis: 2)
+                self.values = concatenated([currentValues, values], axis: 2)
+            }
+
+            self.offset += supplied
+            return (
+                self.keys![.ellipsis, ..<self.offset, 0...],
+                self.values![.ellipsis, ..<self.offset, 0...]
+            )
+        }
+
         if reset {
             let B = keys.dim(0)
             let kvHeads = keys.dim(1)
