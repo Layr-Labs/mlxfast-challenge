@@ -94,6 +94,92 @@ let lagunaFusedSharedGateUpEnabled =
 let lagunaFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_GATE_UP"] != "0"
 
+/// Decode post-attention residual + RMSNorm fusion. The kernel emits
+/// both the rounded BF16 residual (needed by the following skip connection)
+/// and the normalized row (consumed immediately by the MLP), eliminating a
+/// separate residual-add materialization/read. Prefill stays on the stock path
+/// to keep its dispatch and scheduling unchanged.
+let lagunaFusedResidualRMSNormEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_RESIDUAL_RMS"] != "0"
+
+private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
+    name: "laguna_residual_rms_bf16_2048_v1",
+    inputNames: ["residual", "branch", "weight"],
+    outputNames: ["summed", "normalized"],
+    source: """
+        constexpr uint axis_size = 2048;
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint lid = thread_position_in_threadgroup.x;
+        uint simd_lane = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint base = row * axis_size + lid * n_reads;
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        thread bfloat values[n_reads];
+        float acc = 0.0f;
+        for (uint i = 0; i < n_reads; ++i) {
+            bfloat value = bfloat(residual[base + i] + branch[base + i]);
+            values[i] = value;
+            summed[base + i] = value;
+            float fv = float(value);
+            acc += fv * fv;
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_lane] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_lane == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_lane]);
+            if (simd_lane == 0) {
+                local_inv_mean[0] =
+                    metal::precise::rsqrt(acc / 2048.0f + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < n_reads; ++i) {
+            normalized[base + i] =
+                weight[lid * n_reads + i] *
+                bfloat(float(values[i]) * local_inv_mean[0]);
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+func lagunaResidualRMSNorm(
+    residual: MLXArray, branch: MLXArray, weight: MLXArray
+) -> (MLXArray, MLXArray) {
+    precondition(residual.dtype == .bfloat16)
+    precondition(branch.dtype == .bfloat16)
+    precondition(weight.dtype == .bfloat16)
+    precondition(residual.shape == branch.shape)
+    precondition(residual.dim(-1) == LagunaConstants.hiddenSize)
+    precondition(weight.shape == [LagunaConstants.hiddenSize])
+
+    let rows = residual.size / LagunaConstants.hiddenSize
+    let outputs = lagunaResidualRMSNormKernel(
+        [residual, branch, weight],
+        grid: (rows * 512, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [residual.shape, residual.shape],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
 // MARK: - Attention
 
 /// Keep the stock shapeless unary gate for prefill. Ranked measurement showed
@@ -790,8 +876,21 @@ final class LagunaRuntimeDecoderLayer: Module {
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        let h = x + r
-        let r2 = mlp(postAttentionLayerNorm(h))
+        let h: MLXArray
+        let normalized: MLXArray
+        if lagunaFusedResidualRMSNormEnabled,
+            x.dtype == .bfloat16, r.dtype == .bfloat16,
+            postAttentionLayerNorm.weight.dtype == .bfloat16,
+            x.shape == r.shape, x.dim(-1) == LagunaConstants.hiddenSize,
+            x.size == LagunaConstants.hiddenSize
+        {
+            (h, normalized) = lagunaResidualRMSNorm(
+                residual: x, branch: r, weight: postAttentionLayerNorm.weight)
+        } else {
+            h = x + r
+            normalized = postAttentionLayerNorm(h)
+        }
+        let r2 = mlp(normalized)
         return h + r2
     }
 
