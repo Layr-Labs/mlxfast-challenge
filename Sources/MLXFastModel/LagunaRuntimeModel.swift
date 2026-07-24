@@ -71,9 +71,19 @@ func lagunaRopeScalingConfig(_ spec: LagunaRopeSpec) -> [String: StringOrNumber]
 /// load, retain one row-concatenated `[Wq; Wk; Wv]` BF16 weight per attention
 /// layer and serve Q/K/V from a single projection dispatch. Ablation on the
 /// paired local benchmark showed a mild prefill cost with no decode gain, so
-/// this ships opt-in.
+/// this shipped opt-in.
+///
+/// Re-measured on an M5 Max / 128 GB box under the FULL startup memory profile
+/// -- the ranked configuration -- that ablation does not hold. The original was
+/// taken on a 36 GiB M4 Max, which selects the low-memory profile and therefore
+/// runs with compiled decode DISABLED. Here the fusion is a clear PREFILL win
+/// and decode-neutral, which is exactly what the dispatch model predicts: Q, K
+/// and V all consume the same input and are mutually independent, so they
+/// already pipeline and fusing them removes no SERIAL launch latency at decode;
+/// at L=512 it replaces three `[512,2048] x [N,2048]` GEMMs with one N=10240
+/// GEMM whose larger output tile keeps the GPU better occupied.
 let lagunaFusedQKVEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] == "1"
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] != "0"
 
 /// `DARKBLOOM_FUSED_SHARED_GATE_UP` (default on; set "0" to disable): after
 /// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
@@ -93,6 +103,13 @@ let lagunaFusedSharedGateUpEnabled =
 /// separate banks.
 let lagunaFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_GATE_UP"] != "0"
+
+/// `DARKBLOOM_FUSED_MOE_TAIL` (default on; set "0" to disable): fold the sparse
+/// MoE expert combine, the routed scaling, the shared-expert add and the
+/// enclosing decoder layer's residual add into ONE compiled graph on the
+/// single-token decode path. See `LagunaRuntimeSparseMoEBlock.fusedTail`.
+let lagunaFusedMoETailEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_MOE_TAIL"] != "0"
 
 // MARK: - Attention
 
@@ -695,8 +712,37 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         return [fusedWeight, fusedScales]
     }
 
+    /// Compiled MoE tail: the expert combine, the routed scaling, the
+    /// shared-expert add and the enclosing decoder layer's residual add as ONE
+    /// graph. Eagerly these are four dependent elementwise dispatches on
+    /// `[1, 1, hidden]` per sparse layer -- ~156 serialized launches per decode
+    /// token whose launch latency dwarfs their arithmetic.
+    ///
+    /// The traced expression reproduces the eager sequence link for link,
+    /// `residual + ((combine * scale) + shared)`, so every intermediate keeps
+    /// its dtype and rounding point and no reduction is reassociated
+    /// (`sum(axis: -2)` is the same primitive `weightedExpertSum` uses, itself
+    /// already `compile(shapeless: true)` in stock `SwitchLayers.swift`). The
+    /// scale is a traced Swift constant rather than an MLXArray operand, so it
+    /// cannot promote BF16 to F32. Verified bit-exact against the eager
+    /// sequence on random BF16 inputs at Laguna's decode shapes: max|d| == 0.
+    let fusedTail: @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray
+
     init(_ config: LagunaConfig) {
         self.routedScalingFactor = Float(config.moeRoutedScalingFactor)
+        let scale = Float(config.moeRoutedScalingFactor)
+        let tailBody: @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray = {
+            outputs, weights, shared, residual in
+            var combined = (outputs * MLX.expandedDimensions(weights, axis: -1)).sum(axis: -2)
+            if scale != 1 {
+                combined = combined * scale
+            }
+            return residual + (combined + shared)
+        }
+        self.fusedTail =
+            MLXHardwareInfo.isCompiledDecodeSupported
+            ? compile(shapeless: true, tailBody)
+            : tailBody
         self._gate.wrappedValue = LagunaRuntimeMoEGate(config)
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
@@ -709,8 +755,10 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         )
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let (inds, weights) = gate(x)
+    /// Routed-expert outputs for the supplied tokens, before the weighted
+    /// combine. Extracted verbatim from `callAsFunction` so the residual-fused
+    /// decode entry point below shares exactly the same expert arithmetic.
+    private func routedExpertOutputs(_ x: MLXArray, inds: MLXArray) -> MLXArray {
         var y: MLXArray
         if let fusedWeight = _fusedRoutedGateUpWeight,
             let fusedScales = _fusedRoutedGateUpScales,
@@ -750,11 +798,28 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         } else {
             y = switchMLP(x, inds)
         }
+        return y
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let (inds, weights) = gate(x)
+        var y = routedExpertOutputs(x, inds: inds)
         y = weightedExpertSum(y, weights.asType(y.dtype))
         if routedScalingFactor != 1 {
             y = y * routedScalingFactor
         }
         return y + sharedExpert(x)
+    }
+
+    /// Decode entry point that also consumes the decoder layer's residual, so
+    /// the combine / scale / shared-add / residual-add chain becomes a single
+    /// compiled graph instead of four dependent dispatches. Identical
+    /// arithmetic and ordering to `callAsFunction(_:)` followed by the layer's
+    /// `h + r2`; see `fusedTail`.
+    func callAsFunction(_ x: MLXArray, residual: MLXArray) -> MLXArray {
+        let (inds, weights) = gate(x)
+        let y = routedExpertOutputs(x, inds: inds)
+        return fusedTail(y, weights.asType(y.dtype), sharedExpert(x), residual)
     }
 }
 
@@ -791,6 +856,14 @@ final class LagunaRuntimeDecoderLayer: Module {
     ) -> MLXArray {
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
         let h = x + r
+        // Single-token decode folds the sparse MoE tail and this residual add
+        // into one compiled graph. Multi-token prefill, the dense layer-0 MLP,
+        // and the final-layer prefill specialization below keep the stock form.
+        if lagunaFusedMoETailEnabled, x.dim(1) == 1,
+            let sparse = mlp as? LagunaRuntimeSparseMoEBlock
+        {
+            return sparse(postAttentionLayerNorm(h), residual: h)
+        }
         let r2 = mlp(postAttentionLayerNorm(h))
         return h + r2
     }
