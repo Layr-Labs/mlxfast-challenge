@@ -58,6 +58,12 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
     /// `makeMask` to build a causal mask over the full buffer.
     private lazy var maskRinds: MLXArray = MLXArray(Int32(0) ..< Int32(maxCacheSize))
 
+    /// Promotion-time proof that the physical ring is already full. Once true,
+    /// single-token decode keeps every slot valid forever: each update replaces
+    /// one old row with the supplied current row. When the requested attention
+    /// window equals the ring size, a mask is therefore exactly redundant.
+    private var canElideFullWindowDecodeMask = false
+
     // MARK: - Init
 
     /// Direct constructor matching the parent. Primarily for testing.
@@ -85,6 +91,7 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
         // access works because parent's state is `internal`.
         self.idx = rotating.idx
         self.offset = rotating.offset
+        self.canElideFullWindowDecodeMask = rotating.offset >= maxCacheSize
 
         // Pre-allocate or extend the unified buffer to full maxCacheSize.
         // This prevents the compile-breaking concat-growth path from ever
@@ -198,6 +205,10 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if n == 1, windowSize == maxCacheSize, canElideFullWindowDecodeMask {
+            return .none
+        }
+
         let linds: MLXArray
         if n == 1 {
             linds = offsetArray.reshaped(1, 1)

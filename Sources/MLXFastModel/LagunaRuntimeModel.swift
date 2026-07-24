@@ -94,26 +94,15 @@ let lagunaFusedRoutedGateUpEnabled =
 
 // MARK: - Attention
 
-/// Compile the per-head softplus gate and broadcast product as one operation.
-/// Shape-specialized compilation is intentional: the reshape dimensions are
-/// trace-time constants, so decode and prefill cache separate graphs during
-/// warmup. The explicit BF16 cast before multiplication preserves the stock
-/// rounding point exactly.
-private func makeLagunaAttentionGateProduct(
-    heads: Int, headDim: Int
-) -> @Sendable (MLXArray, MLXArray) -> MLXArray {
-    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
-        output, projectedGate in
-        let batch = output.dim(0)
-        let length = output.dim(1)
-        let gate = softplus(projectedGate.asType(.float32)).asType(output.dtype)
-        return (
-            output.reshaped(batch, length, heads, headDim)
-                * gate[.ellipsis, .newAxis]
-        ).reshaped(batch, length, heads * headDim)
+/// Keep the stock shapeless unary gate for prefill. Ranked measurement showed
+/// the larger gate/product graph regressing the complete prefill schedule even
+/// though its isolated steady-state subpath was slightly faster.
+private let lagunaCompiledSoftplusGate: @Sendable (MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray) -> MLXArray = { gate in
+        softplus(gate.asType(.float32)).asType(gate.dtype)
     }
-    return MLXHardwareInfo.isCompiledDecodeSupported ? compile(body) : body
-}
+    return MLXHardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
 
 /// Decode-only outer compilation of the same gate product with the following
 /// bias-free BF16 output projection. MLX keeps the matmul primitive intact but
@@ -137,18 +126,8 @@ private func makeLagunaAttentionGateProjection(
     return MLXHardwareInfo.isCompiledDecodeSupported ? compile(body) : body
 }
 
-private let lagunaFullAttentionGateProduct = makeLagunaAttentionGateProduct(
-    heads: LagunaConstants.fullAttentionHeads,
-    headDim: LagunaConstants.headDim
-)
-
 private let lagunaFullAttentionGateProjection = makeLagunaAttentionGateProjection(
     heads: LagunaConstants.fullAttentionHeads,
-    headDim: LagunaConstants.headDim
-)
-
-private let lagunaSlidingAttentionGateProduct = makeLagunaAttentionGateProduct(
-    heads: LagunaConstants.slidingAttentionHeads,
     headDim: LagunaConstants.headDim
 )
 
@@ -169,7 +148,6 @@ final class LagunaRuntimeAttention: Module {
     let gatingEnabled: Bool
     let gatePerHead: Bool
     let isSliding: Bool
-    let attentionGateProduct: @Sendable (MLXArray, MLXArray) -> MLXArray
     let attentionGateProjection: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray
 
     @ModuleInfo(key: "q_proj") var wq: Linear
@@ -232,10 +210,6 @@ final class LagunaRuntimeAttention: Module {
 
         let layerType = config.layerType(forLayer: layerIdx)
         self.isSliding = layerType == .sliding
-        self.attentionGateProduct =
-            layerType == .sliding
-            ? lagunaSlidingAttentionGateProduct
-            : lagunaFullAttentionGateProduct
         self.attentionGateProjection =
             layerType == .sliding
             ? lagunaSlidingAttentionGateProjection
@@ -317,21 +291,21 @@ final class LagunaRuntimeAttention: Module {
             // across the head dimension (or applied elementwise for a
             // per-element gate).
             let projectedGate = gProj(x)
-            if gatePerHead && projectedGate.dtype == output.dtype {
-                if L == 1, wo.bias == nil, MLXHardwareInfo.isCompiledDecodeSupported {
-                    return attentionGateProjection(output, projectedGate, wo.weight)
-                }
-                output = attentionGateProduct(output, projectedGate)
+            if gatePerHead && projectedGate.dtype == output.dtype,
+                L == 1, wo.bias == nil, MLXHardwareInfo.isCompiledDecodeSupported
+            {
+                return attentionGateProjection(output, projectedGate, wo.weight)
+            }
+            let gate =
+                gatePerHead && projectedGate.dtype == output.dtype
+                ? lagunaCompiledSoftplusGate(projectedGate)
+                : softplus(projectedGate.asType(.float32)).asType(output.dtype)
+            if gatePerHead {
+                output =
+                    (output.reshaped(B, L, nHeads, headDim) * gate[.ellipsis, .newAxis])
+                    .reshaped(B, L, -1)
             } else {
-                let gate = softplus(projectedGate.asType(.float32)).asType(output.dtype)
-                if gatePerHead {
-                    output =
-                        (output.reshaped(B, L, nHeads, headDim)
-                            * gate[.ellipsis, .newAxis])
-                        .reshaped(B, L, -1)
-                } else {
-                    output = output * gate
-                }
+                output = output * gate
             }
         }
 
