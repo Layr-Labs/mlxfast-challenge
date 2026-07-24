@@ -96,6 +96,12 @@ let lagunaFusedSharedSwiGLUQMVEnabled =
 let lagunaFusedRoutedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_SWIGLU_QMV"] != "0"
 
+/// Decode-only routed NVFP4 down-QMV plus BF16 router weighting, fixed-order
+/// expert reduction, and the Laguna 2.5 routed scale. The custom kernel emits
+/// one 2048-wide branch instead of materializing eight expert rows.
+let lagunaFusedRoutedDownReduceEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_DOWN_REDUCE"] != "0"
+
 /// `DARKBLOOM_FUSED_ROUTED_GATE_UP` (default on; set "0" to disable): after
 /// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
 /// sparse layer's routed experts and serve single-token decode's gate/up from
@@ -757,6 +763,146 @@ func lagunaRoutedSwiGLUQMV(
     )[0]
 }
 
+// Decode-only Laguna XS routed down projection. The stock graph materializes
+// eight 2048-wide BF16 expert outputs, casts eight FP32 router weights to
+// BF16, multiplies, reduces the expert axis, then applies the fixed BF16 2.5
+// routed scale. This kernel preserves each of those arithmetic boundaries but
+// keeps the eight expert rows in threadgroup memory and emits only the final
+// 2048-wide routed branch.
+private let lagunaRoutedDownReduceKernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_down_reduce_bf16_v1",
+    inputNames: [
+        "activated", "down_weight", "down_scales", "indices", "router_weights",
+    ],
+    outputNames: ["routed"],
+    source: """
+        constexpr uint input_width = 512;
+        constexpr uint output_width = 2048;
+        constexpr uint experts_per_token = 8;
+        constexpr uint outputs_per_simd = 4;
+        constexpr uint values_per_lane = 16;
+        constexpr uint packed_row_bytes = 256;
+        constexpr uint scale_row_bytes = 32;
+        constexpr uint packed_expert_bytes =
+            output_width * packed_row_bytes;
+        constexpr uint scale_expert_bytes =
+            output_width * scale_row_bytes;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint expert_slot = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint first_row = tile * outputs_per_simd;
+        uint expert = uint(indices[expert_slot]);
+
+        const device bfloat* expert_input =
+            activated + expert_slot * input_width;
+        const device uint8_t* expert_weight =
+            (const device uint8_t*)down_weight +
+            expert * packed_expert_bytes;
+        const device uint8_t* expert_scales =
+            down_scales + expert * scale_expert_bytes;
+
+        thread float input_values[values_per_lane];
+        const device vec<bfloat, 4>* input_vectors =
+            (const device vec<bfloat, 4>*)(
+                expert_input + lane * values_per_lane);
+        for (uint i = 0; i < values_per_lane / 4; ++i) {
+            const vec<bfloat, 4> values = input_vectors[i];
+            input_values[4 * i] = values[0];
+            input_values[4 * i + 1] = values[1];
+            input_values[4 * i + 2] = values[2];
+            input_values[4 * i + 3] = values[3];
+        }
+
+        thread float result[outputs_per_simd] = {
+            0.0f, 0.0f, 0.0f, 0.0f
+        };
+        for (uint row = 0; row < outputs_per_simd; ++row) {
+            uint output_row = first_row + row;
+            const device uint8_t* weight =
+                expert_weight + output_row * packed_row_bytes + lane * 8;
+            const device uint8_t* scale =
+                expert_scales + output_row * scale_row_bytes + lane;
+            result[row] = laguna_nvfp4_qdot_16(
+                weight,
+                input_values,
+                laguna_nvfp4_scale(scale[0]));
+            result[row] = simd_sum(result[row]);
+        }
+
+        threadgroup bfloat expert_outputs[
+            experts_per_token * outputs_per_simd
+        ];
+        if (lane == 0) {
+            for (uint row = 0; row < outputs_per_simd; ++row) {
+                expert_outputs[
+                    expert_slot * outputs_per_simd + row
+                ] = bfloat(result[row]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // `weightedExpertSum` first multiplies BF16 expert outputs by router
+        // weights cast from FP32 to BF16. Its small strided BF16 reduction
+        // initializes with zero, then visits expert slots 0 through 7 in
+        // order. The scalar 2.5 is constructed in the BF16 result dtype.
+        if (expert_slot == 0 && lane < outputs_per_simd) {
+            bfloat total = bfloat(0);
+            for (uint slot = 0; slot < experts_per_token; ++slot) {
+                bfloat route_weight = bfloat(router_weights[slot]);
+                bfloat product = bfloat(
+                    expert_outputs[slot * outputs_per_simd + lane] *
+                    route_weight);
+                total = bfloat(product + total);
+            }
+            routed[first_row + lane] = bfloat(total * bfloat(2.5f));
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
+func lagunaRoutedDownReduce(
+    _ activated: MLXArray,
+    downWeight: MLXArray,
+    downScales: MLXArray,
+    indices: MLXArray,
+    routerWeights: MLXArray
+) -> MLXArray {
+    precondition(activated.dtype == .bfloat16)
+    precondition(
+        activated.shape == [
+            1, 1, LagunaConstants.numExpertsPerTok, 1,
+            LagunaConstants.moeIntermediateSize,
+        ])
+    precondition(downWeight.dtype == .uint32)
+    precondition(
+        downWeight.shape == [
+            LagunaConstants.numExperts,
+            LagunaConstants.hiddenSize,
+            LagunaConstants.moeIntermediateSize / 8,
+        ])
+    precondition(downScales.dtype == .uint8)
+    precondition(
+        downScales.shape == [
+            LagunaConstants.numExperts,
+            LagunaConstants.hiddenSize,
+            LagunaConstants.moeIntermediateSize / 16,
+        ])
+    precondition(indices.dtype == .uint32)
+    precondition(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
+    precondition(routerWeights.dtype == .float32)
+    precondition(routerWeights.shape == [1, 1, LagunaConstants.numExpertsPerTok])
+
+    return lagunaRoutedDownReduceKernel(
+        [activated, downWeight, downScales, indices, routerWeights],
+        grid: ((LagunaConstants.hiddenSize / 4) * 256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 final class LagunaRuntimeMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
@@ -1045,6 +1191,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     var _fusedRoutedGateUpScales: MLXArray?
     var _fusedRoutedGateUpSplit: Int = 0
     var _routedDownProj: SwitchLinear?
+    var _routedDownWeight: MLXArray?
+    var _routedDownScales: MLXArray?
 
     /// Builds and retains the fused routed gate/up NVFP4 banks from the
     /// loaded stock `SwitchGLU` submodules (reached through the public
@@ -1060,30 +1208,43 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         let children = Dictionary(uniqueKeysWithValues: switchMLP.children().flattened())
         guard let gateModule = children["gate_proj"] as? QuantizedSwitchLinear,
             let upModule = children["up_proj"] as? QuantizedSwitchLinear,
-            let downModule = children["down_proj"] as? SwitchLinear,
+            let downModule = children["down_proj"] as? QuantizedSwitchLinear,
             type(of: gateModule) == QuantizedSwitchLinear.self,
             type(of: upModule) == QuantizedSwitchLinear.self,
+            type(of: downModule) == QuantizedSwitchLinear.self,
             gateModule.mode == .nvfp4, upModule.mode == .nvfp4,
+            downModule.mode == .nvfp4,
             gateModule.groupSize == 16, upModule.groupSize == 16,
-            gateModule.bits == 4, upModule.bits == 4
+            downModule.groupSize == 16,
+            gateModule.bits == 4, upModule.bits == 4, downModule.bits == 4
         else {
             return []
         }
         let gateParams = Dictionary(uniqueKeysWithValues: gateModule.parameters().flattened())
         let upParams = Dictionary(uniqueKeysWithValues: upModule.parameters().flattened())
+        let downParams = Dictionary(uniqueKeysWithValues: downModule.parameters().flattened())
         guard let gateWeight = gateParams["weight"], let gateScales = gateParams["scales"],
             let upWeight = upParams["weight"], let upScales = upParams["scales"],
+            let downWeight = downParams["weight"],
+            let downScales = downParams["scales"],
             gateParams["bias"] == nil, gateParams["biases"] == nil,
             upParams["bias"] == nil, upParams["biases"] == nil,
+            downParams["bias"] == nil, downParams["biases"] == nil,
             gateWeight.ndim == 3, upWeight.ndim == 3,
             gateScales.ndim == 3, upScales.ndim == 3,
+            downWeight.ndim == 3, downScales.ndim == 3,
             gateWeight.dtype == .uint32, upWeight.dtype == .uint32,
             gateScales.dtype == .uint8, upScales.dtype == .uint8,
+            downWeight.dtype == .uint32, downScales.dtype == .uint8,
             gateWeight.shape == upWeight.shape,
             gateScales.shape == upScales.shape,
             gateScales.dim(0) == gateWeight.dim(0),
             gateScales.dim(1) == gateWeight.dim(1),
-            gateWeight.dim(2) * 8 == gateScales.dim(2) * 16
+            gateWeight.dim(2) * 8 == gateScales.dim(2) * 16,
+            downWeight.dim(0) == gateWeight.dim(0),
+            downScales.dim(0) == downWeight.dim(0),
+            downScales.dim(1) == downWeight.dim(1),
+            downWeight.dim(2) * 8 == downScales.dim(2) * 16
         else {
             return []
         }
@@ -1093,6 +1254,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         _fusedRoutedGateUpScales = fusedScales
         _fusedRoutedGateUpSplit = gateWeight.dim(1)
         _routedDownProj = downModule
+        _routedDownWeight = downWeight
+        _routedDownScales = downScales
         return [fusedWeight, fusedScales]
     }
 
@@ -1113,6 +1276,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, weights) = gate(x)
         var y: MLXArray
+        var routedAlreadyReduced = false
         if let fusedWeight = _fusedRoutedGateUpWeight,
             let fusedScales = _fusedRoutedGateUpScales,
             let downProj = _routedDownProj,
@@ -1165,13 +1329,51 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 let xUp = gateUp[.ellipsis, _fusedRoutedGateUpSplit...]
                 activated = compiledSiluProduct(xGate, xUp)
             }
-            y = MLX.squeezed(downProj(activated, inds, sortedIndices: false), axis: -2)
+            if lagunaFusedRoutedDownReduceEnabled,
+                let downWeight = _routedDownWeight,
+                let downScales = _routedDownScales,
+                activated.dtype == .bfloat16,
+                activated.shape == [
+                    1, 1, LagunaConstants.numExpertsPerTok, 1,
+                    LagunaConstants.moeIntermediateSize,
+                ],
+                downWeight.dtype == .uint32,
+                downWeight.shape == [
+                    LagunaConstants.numExperts,
+                    LagunaConstants.hiddenSize,
+                    LagunaConstants.moeIntermediateSize / 8,
+                ],
+                downScales.dtype == .uint8,
+                downScales.shape == [
+                    LagunaConstants.numExperts,
+                    LagunaConstants.hiddenSize,
+                    LagunaConstants.moeIntermediateSize / 16,
+                ],
+                weights.dtype == .float32,
+                weights.shape == [1, 1, LagunaConstants.numExpertsPerTok],
+                routedScalingFactor == Float(LagunaConstants.moeRoutedScalingFactor)
+            {
+                y = lagunaRoutedDownReduce(
+                    activated,
+                    downWeight: downWeight,
+                    downScales: downScales,
+                    indices: inds,
+                    routerWeights: weights
+                )
+                routedAlreadyReduced = true
+            } else {
+                y = MLX.squeezed(
+                    downProj(activated, inds, sortedIndices: false),
+                    axis: -2)
+            }
         } else {
             y = switchMLP(x, inds)
         }
-        y = weightedExpertSum(y, weights.asType(y.dtype))
-        if routedScalingFactor != 1 {
-            y = y * routedScalingFactor
+        if !routedAlreadyReduced {
+            y = weightedExpertSum(y, weights.asType(y.dtype))
+            if routedScalingFactor != 1 {
+                y = y * routedScalingFactor
+            }
         }
         return y + sharedExpert(x)
     }
