@@ -74,12 +74,13 @@ func lagunaRopeScalingConfig(_ spec: LagunaRopeSpec) -> [String: StringOrNumber]
 let lagunaFusedQKVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] == "1"
 
-/// `DARKBLOOM_FUSED_SHARED_GATE_UP` (default OFF; set "1" to enable): after
+/// `DARKBLOOM_FUSED_SHARED_GATE_UP` (default on; set "0" to disable): after
 /// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
-/// shared expert and serve both projections from a single quantized matmul.
-/// Unproven in ablation, so this ships opt-in.
+/// shared expert and serve single-token decode from one quantized matmul.
+/// Multi-token prefill remains on the stock separate banks so the ranked
+/// prefill path and its smaller gather/GEMM shapes are unchanged.
 let lagunaFusedSharedGateUpEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_GATE_UP"] == "1"
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_GATE_UP"] != "0"
 
 /// `DARKBLOOM_FUSED_ROUTED_GATE_UP` (default on; set "0" to disable): after
 /// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
@@ -374,7 +375,9 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if let fusedWeight = _fusedGateUpWeight, let fusedScales = _fusedGateUpScales {
+        if x.dim(1) == 1,
+            let fusedWeight = _fusedGateUpWeight, let fusedScales = _fusedGateUpScales
+        {
             // One NVFP4 dispatch over the row-concatenated [gate; up] bank,
             // mirroring `QuantizedLinear.callAsFunction` exactly (transpose,
             // group 16, 4-bit, .nvfp4, no affine biases, no bias add; the
