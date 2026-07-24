@@ -90,11 +90,11 @@ let lagunaFusedSharedGateUpEnabled =
 let lagunaFusedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_SWIGLU_QMV"] != "0"
 
-/// Single-row sparse-layer megakernel: eight routed down QMVs plus one shared
-/// down QMV, ordered routed weighting/scale, shared add, and decoder residual
-/// add. Four output channels share one nine-SIMD synchronization domain.
-let lagunaFusedNineWayMoEFinalEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_NINE_WAY_MOE_FINAL"] != "0"
+/// Single-row sparse-layer megakernel: all eight SIMD groups compute one
+/// routed down QMV tile, while the first four also compute one shared-expert
+/// output. This retains the proven 256-thread occupancy geometry.
+let lagunaFusedEightSIMDMoEFinalEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_EIGHT_SIMD_MOE_FINAL"] != "0"
 
 /// Routed-expert counterpart to the shared QMV + SwiGLU fusion. Each decode
 /// request supplies exactly eight current-token expert indices; the kernel
@@ -909,8 +909,8 @@ func lagunaRoutedDownReduce(
     )[0]
 }
 
-private let lagunaNineWayMoEFinalKernel = MLXFast.metalKernel(
-    name: "laguna_nvfp4_nine_way_moe_final_bf16_v1",
+private let lagunaEightSIMDMoEFinalKernel = MLXFast.metalKernel(
+    name: "laguna_nvfp4_eight_simd_moe_final_bf16_v1",
     inputNames: [
         "routed_activated", "routed_down_weight", "routed_down_scales",
         "indices", "router_weights", "shared_activated",
@@ -921,7 +921,6 @@ private let lagunaNineWayMoEFinalKernel = MLXFast.metalKernel(
         constexpr uint input_width = 512;
         constexpr uint output_width = 2048;
         constexpr uint routed_experts = 8;
-        constexpr uint total_experts = 9;
         constexpr uint outputs_per_simd = 4;
         constexpr uint values_per_lane = 16;
         constexpr uint packed_row_bytes = 256;
@@ -935,23 +934,14 @@ private let lagunaNineWayMoEFinalKernel = MLXFast.metalKernel(
         uint expert_slot = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
         uint first_row = tile * outputs_per_simd;
-        bool is_routed = expert_slot < routed_experts;
-
         const device bfloat* expert_input =
-            is_routed
-            ? routed_activated + expert_slot * input_width
-            : shared_activated;
-
-        uint expert = is_routed ? uint(indices[expert_slot]) : 0;
+            routed_activated + expert_slot * input_width;
+        uint expert = uint(indices[expert_slot]);
         const device uint8_t* expert_weight =
-            is_routed
-            ? (const device uint8_t*)routed_down_weight +
-                expert * packed_expert_bytes
-            : (const device uint8_t*)shared_down_weight;
+            (const device uint8_t*)routed_down_weight +
+            expert * packed_expert_bytes;
         const device uint8_t* expert_scales =
-            is_routed
-            ? routed_down_scales + expert * scale_expert_bytes
-            : shared_down_scales;
+            routed_down_scales + expert * scale_expert_bytes;
 
         thread float input_values[values_per_lane];
         const device vec<bfloat, 4>* input_vectors =
@@ -981,14 +971,45 @@ private let lagunaNineWayMoEFinalKernel = MLXFast.metalKernel(
             result[row] = simd_sum(result[row]);
         }
 
-        threadgroup bfloat expert_outputs[
-            total_experts * outputs_per_simd
+        float shared_result = 0.0f;
+        if (expert_slot < outputs_per_simd) {
+            const device vec<bfloat, 4>* shared_input_vectors =
+                (const device vec<bfloat, 4>*)(
+                    shared_activated + lane * values_per_lane);
+            for (uint i = 0; i < values_per_lane / 4; ++i) {
+                const vec<bfloat, 4> values = shared_input_vectors[i];
+                input_values[4 * i] = values[0];
+                input_values[4 * i + 1] = values[1];
+                input_values[4 * i + 2] = values[2];
+                input_values[4 * i + 3] = values[3];
+            }
+
+            uint shared_row = first_row + expert_slot;
+            const device uint8_t* shared_weight =
+                (const device uint8_t*)shared_down_weight +
+                shared_row * packed_row_bytes + lane * 8;
+            const device uint8_t* shared_scale =
+                shared_down_scales +
+                shared_row * scale_row_bytes + lane;
+            shared_result = laguna_nvfp4_qdot_16(
+                shared_weight,
+                input_values,
+                laguna_nvfp4_scale(shared_scale[0]));
+            shared_result = simd_sum(shared_result);
+        }
+
+        threadgroup bfloat routed_outputs[
+            routed_experts * outputs_per_simd
         ];
+        threadgroup bfloat shared_outputs[outputs_per_simd];
         if (lane == 0) {
             for (uint row = 0; row < outputs_per_simd; ++row) {
-                expert_outputs[
+                routed_outputs[
                     expert_slot * outputs_per_simd + row
                 ] = bfloat(result[row]);
+            }
+            if (expert_slot < outputs_per_simd) {
+                shared_outputs[expert_slot] = bfloat(shared_result);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -998,13 +1019,12 @@ private let lagunaNineWayMoEFinalKernel = MLXFast.metalKernel(
             for (uint slot = 0; slot < routed_experts; ++slot) {
                 bfloat route_weight = bfloat(router_weights[slot]);
                 bfloat product = bfloat(
-                    expert_outputs[slot * outputs_per_simd + lane] *
+                    routed_outputs[slot * outputs_per_simd + lane] *
                     route_weight);
                 routed_total = bfloat(product + routed_total);
             }
             bfloat routed = bfloat(routed_total * bfloat(2.5f));
-            bfloat shared =
-                expert_outputs[routed_experts * outputs_per_simd + lane];
+            bfloat shared = shared_outputs[lane];
             bfloat sparse = bfloat(routed + shared);
             output[first_row + lane] =
                 bfloat(residual[first_row + lane] + sparse);
@@ -1014,7 +1034,7 @@ private let lagunaNineWayMoEFinalKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-func lagunaNineWayMoEFinal(
+func lagunaEightSIMDMoEFinal(
     routedActivated: MLXArray,
     routedDownWeight: MLXArray,
     routedDownScales: MLXArray,
@@ -1069,14 +1089,14 @@ func lagunaNineWayMoEFinal(
     precondition(residual.dtype == .bfloat16)
     precondition(residual.shape == [1, 1, LagunaConstants.hiddenSize])
 
-    return lagunaNineWayMoEFinalKernel(
+    return lagunaEightSIMDMoEFinalKernel(
         [
             routedActivated, routedDownWeight, routedDownScales,
             indices, routerWeights, sharedActivated,
             sharedDownWeight, sharedDownScales, residual,
         ],
-        grid: ((LagunaConstants.hiddenSize / 4) * 288, 1, 1),
-        threadGroup: (288, 1, 1),
+        grid: ((LagunaConstants.hiddenSize / 4) * 256, 1, 1),
+        threadGroup: (256, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
         outputDTypes: [.bfloat16]
     )[0]
@@ -1557,7 +1577,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 let xUp = gateUp[.ellipsis, _fusedRoutedGateUpSplit...]
                 activated = compiledSiluProduct(xGate, xUp)
             }
-            if lagunaFusedNineWayMoEFinalEnabled,
+            if lagunaFusedEightSIMDMoEFinalEnabled,
                 let residual,
                 let downWeight = _routedDownWeight,
                 let downScales = _routedDownScales,
@@ -1587,7 +1607,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 residual.shape == [1, 1, LagunaConstants.hiddenSize],
                 routedScalingFactor == Float(LagunaConstants.moeRoutedScalingFactor)
             {
-                return lagunaNineWayMoEFinal(
+                return lagunaEightSIMDMoEFinal(
                     routedActivated: activated,
                     routedDownWeight: downWeight,
                     routedDownScales: downScales,
