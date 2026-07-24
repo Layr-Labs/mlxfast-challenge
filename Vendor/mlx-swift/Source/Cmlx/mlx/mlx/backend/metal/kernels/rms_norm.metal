@@ -19,6 +19,7 @@ template <typename T, int N_READS = RMS_N_READS>
     constant uint& w_stride,
     uint gid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
+    uint lsize [[threads_per_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
   constexpr int SIMD_SIZE = 32;
@@ -43,37 +44,53 @@ template <typename T, int N_READS = RMS_N_READS>
     }
   }
   acc = simd_sum(acc);
-  //  Initialize shared memory
-  if (simd_group_id == 0) {
-    local_sums[simd_lane_id] = 0;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Write simd accumulations into shared memory
-  if (simd_lane_id == 0) {
-    local_sums[simd_group_id] = acc;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  // Accumulate over simd groups
-  if (simd_group_id == 0) {
-    acc = simd_sum(local_sums[simd_lane_id]);
-    if (simd_lane_id == 0) {
-      local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+  float inv_mean;
+  if (axis_size == SIMD_SIZE * N_READS && lsize == SIMD_SIZE) {
+    // A single SIMD already holds the complete row. Reproduce the generic
+    // path's second reduction over [row_sum, 0, ..., 0], then broadcast the
+    // lane-zero normalizer without publishing through threadgroup memory.
+    // Laguna's 128-wide Q/K norms take this path (N_READS=4).
+    acc = simd_sum(simd_lane_id == 0 ? acc : 0.0f);
+    inv_mean =
+        simd_lane_id == 0
+        ? metal::precise::rsqrt(acc / axis_size + eps)
+        : 0.0f;
+    inv_mean = simd_broadcast_first(inv_mean);
+  } else {
+    // Initialize shared memory.
+    if (simd_group_id == 0) {
+      local_sums[simd_lane_id] = 0;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Write simd accumulations into shared memory.
+    if (simd_lane_id == 0) {
+      local_sums[simd_group_id] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Accumulate over simd groups.
+    if (simd_group_id == 0) {
+      acc = simd_sum(local_sums[simd_lane_id]);
+      if (simd_lane_id == 0) {
+        local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    inv_mean = local_inv_mean[0];
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // Write the outputs
   out += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; i++) {
-      out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
+      out[i] = w[w_stride * i] * static_cast<T>(x[i] * inv_mean);
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
-        out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
+        out[i] = w[w_stride * i] * static_cast<T>(x[i] * inv_mean);
       }
     }
   }
