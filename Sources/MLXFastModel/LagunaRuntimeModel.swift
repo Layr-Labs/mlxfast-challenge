@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXFast
 import MLXLMCommon
 import MLXNN
 
@@ -459,6 +460,119 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
 
 // MARK: - MoE
 
+/// Decode-only router post-processing. The stock path materializes sigmoid
+/// scores, corrected choice scores, their negation, a full 256-entry argsort,
+/// and a gather before retaining just eight entries. This fixed-shape kernel
+/// computes the same FP32 sigmoid values and stable choice order, then emits
+/// only the selected indices and their *uncorrected* scores. Normalization
+/// deliberately remains on the stock MLX reduction below so its accumulation
+/// order and rounding are unchanged.
+private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_top8_v2",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: """
+        uint lane = thread_position_in_threadgroup.x;
+
+        threadgroup float scores[256];
+        threadgroup float choice_keys[256];
+        threadgroup uint expert_indices[256];
+
+        float x = float(logits[lane]);
+        float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+        float score = x < 0.0f ? y : 1.0f - y;
+        scores[lane] = score;
+        float corrected = score + float(correction_bias[lane]);
+        choice_keys[lane] = -corrected;
+        expert_indices[lane] = lane;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // A total order (choice key, then original expert index) makes this
+        // network match the stock stable merge sort even for exact ties,
+        // signed zero, and NaNs. The lower half of each final sequence keeps
+        // the better entries, so ranks 0..<8 are the desired top experts.
+        for (uint sequence = 2; sequence <= 256; sequence <<= 1) {
+            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+                uint partner = lane ^ stride;
+                if (partner > lane) {
+                    float a_key = choice_keys[lane];
+                    uint a_index = expert_indices[lane];
+                    float a_score = scores[lane];
+                    float b_key = choice_keys[partner];
+                    uint b_index = expert_indices[partner];
+                    float b_score = scores[partner];
+
+                    bool lower_wants_better = (lane & sequence) == 0;
+                    bool b_before_a = laguna_router_key_before(
+                        b_key, b_index, a_key, a_index);
+                    bool a_before_b = laguna_router_key_before(
+                        a_key, a_index, b_key, b_index);
+                    bool swap = lower_wants_better ? b_before_a : a_before_b;
+                    if (swap) {
+                        choice_keys[lane] = b_key;
+                        expert_indices[lane] = b_index;
+                        scores[lane] = b_score;
+                        choice_keys[partner] = a_key;
+                        expert_indices[partner] = a_index;
+                        scores[partner] = a_score;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+
+        if (lane < 8) {
+            router_indices[lane] = expert_indices[lane];
+            router_scores[lane] = scores[lane];
+        }
+        """,
+    header: """
+        METAL_FUNC bool laguna_router_key_before(
+            float a, uint a_index, float b, uint b_index) {
+            bool a_nan = metal::isnan(a);
+            bool b_nan = metal::isnan(b);
+            if (a_nan | b_nan) {
+                if (a_nan != b_nan) {
+                    return !a_nan;
+                }
+                return a_index < b_index;
+            }
+            if (a < b) {
+                return true;
+            }
+            if (b < a) {
+                return false;
+            }
+            return a_index < b_index;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private func lagunaDecodeRouterTop8(
+    logits: MLXArray, correctionBias: MLXArray
+) -> (MLXArray, MLXArray) {
+    precondition(logits.dtype == .float32)
+    precondition(correctionBias.dtype == .float32)
+    precondition(logits.size == 256)
+    precondition(correctionBias.size == 256)
+
+    let outputs = lagunaDecodeRouterTop8Kernel(
+        [logits, correctionBias],
+        grid: (256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1, 1, 8], [1, 1, 8]],
+        outputDTypes: [.uint32, .float32]
+    )
+    return (outputs[0], outputs[1])
+}
+
+/// Default-on after same-binary bitwise checks over smooth, tied, and extreme
+/// rows plus a 39-stage compiled latency probe. Set
+/// `DARKBLOOM_FUSED_ROUTER=0` for a stock-path ablation.
+private let lagunaDecodeRouterTop8Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTER"] != "0"
+
 /// Sigmoid top-k router. The routing math mirrors the vendored
 /// `LagunaMoEGate` exactly (sigmoid scores, correction bias added only for
 /// expert CHOICE, mixture weights taken from the pre-bias scores, optional
@@ -485,11 +599,24 @@ final class LagunaRuntimeMoEGate: Module {
             logits = tanh(logits / routerLogitSoftcapping) * routerLogitSoftcapping
         }
 
-        let scores = sigmoid(logits)
-        let scoresForChoice = scores + eScoreCorrectionBias.asType(scores.dtype)
-
-        let inds = argPartition(-scoresForChoice, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
-        var weights = takeAlong(scores, inds, axis: -1)
+        let inds: MLXArray
+        var weights: MLXArray
+        if lagunaDecodeRouterTop8Enabled,
+            logits.size == 256, topK == 8,
+            eScoreCorrectionBias.size == 256
+        {
+            (inds, weights) = lagunaDecodeRouterTop8(
+                logits: logits,
+                correctionBias: eScoreCorrectionBias.asType(.float32)
+            )
+        } else {
+            let scores = sigmoid(logits)
+            let scoresForChoice = scores + eScoreCorrectionBias.asType(scores.dtype)
+            inds =
+                argPartition(-scoresForChoice, kth: topK - 1, axis: -1)[
+                    .ellipsis, ..<topK]
+            weights = takeAlong(scores, inds, axis: -1)
+        }
         if normTopkProb {
             weights = weights / weights.sum(axis: -1, keepDims: true)
         }
