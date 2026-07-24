@@ -90,6 +90,12 @@ let lagunaFusedSharedGateUpEnabled =
 let lagunaFusedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_SWIGLU_QMV"] != "0"
 
+/// Single-row sparse-layer megakernel: eight routed down QMVs plus one shared
+/// down QMV, ordered routed weighting/scale, shared add, and decoder residual
+/// add. Four output channels share one nine-SIMD synchronization domain.
+let lagunaFusedNineWayMoEFinalEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_NINE_WAY_MOE_FINAL"] != "0"
+
 /// Routed-expert counterpart to the shared QMV + SwiGLU fusion. Each decode
 /// request supplies exactly eight current-token expert indices; the kernel
 /// reads those banks directly and emits `[1, 1, 8, 1, 512]`.
@@ -903,6 +909,179 @@ func lagunaRoutedDownReduce(
     )[0]
 }
 
+private let lagunaNineWayMoEFinalKernel = MLXFast.metalKernel(
+    name: "laguna_nvfp4_nine_way_moe_final_bf16_v1",
+    inputNames: [
+        "routed_activated", "routed_down_weight", "routed_down_scales",
+        "indices", "router_weights", "shared_activated",
+        "shared_down_weight", "shared_down_scales", "residual",
+    ],
+    outputNames: ["output"],
+    source: """
+        constexpr uint input_width = 512;
+        constexpr uint output_width = 2048;
+        constexpr uint routed_experts = 8;
+        constexpr uint total_experts = 9;
+        constexpr uint outputs_per_simd = 4;
+        constexpr uint values_per_lane = 16;
+        constexpr uint packed_row_bytes = 256;
+        constexpr uint scale_row_bytes = 32;
+        constexpr uint packed_expert_bytes =
+            output_width * packed_row_bytes;
+        constexpr uint scale_expert_bytes =
+            output_width * scale_row_bytes;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint expert_slot = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint first_row = tile * outputs_per_simd;
+        bool is_routed = expert_slot < routed_experts;
+
+        const device bfloat* expert_input =
+            is_routed
+            ? routed_activated + expert_slot * input_width
+            : shared_activated;
+
+        uint expert = is_routed ? uint(indices[expert_slot]) : 0;
+        const device uint8_t* expert_weight =
+            is_routed
+            ? (const device uint8_t*)routed_down_weight +
+                expert * packed_expert_bytes
+            : (const device uint8_t*)shared_down_weight;
+        const device uint8_t* expert_scales =
+            is_routed
+            ? routed_down_scales + expert * scale_expert_bytes
+            : shared_down_scales;
+
+        thread float input_values[values_per_lane];
+        const device vec<bfloat, 4>* input_vectors =
+            (const device vec<bfloat, 4>*)(
+                expert_input + lane * values_per_lane);
+        for (uint i = 0; i < values_per_lane / 4; ++i) {
+            const vec<bfloat, 4> values = input_vectors[i];
+            input_values[4 * i] = values[0];
+            input_values[4 * i + 1] = values[1];
+            input_values[4 * i + 2] = values[2];
+            input_values[4 * i + 3] = values[3];
+        }
+
+        thread float result[outputs_per_simd] = {
+            0.0f, 0.0f, 0.0f, 0.0f
+        };
+        for (uint row = 0; row < outputs_per_simd; ++row) {
+            uint output_row = first_row + row;
+            const device uint8_t* weight =
+                expert_weight + output_row * packed_row_bytes + lane * 8;
+            const device uint8_t* scale =
+                expert_scales + output_row * scale_row_bytes + lane;
+            result[row] = laguna_nvfp4_qdot_16(
+                weight,
+                input_values,
+                laguna_nvfp4_scale(scale[0]));
+            result[row] = simd_sum(result[row]);
+        }
+
+        threadgroup bfloat expert_outputs[
+            total_experts * outputs_per_simd
+        ];
+        if (lane == 0) {
+            for (uint row = 0; row < outputs_per_simd; ++row) {
+                expert_outputs[
+                    expert_slot * outputs_per_simd + row
+                ] = bfloat(result[row]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (expert_slot == 0 && lane < outputs_per_simd) {
+            bfloat routed_total = bfloat(0);
+            for (uint slot = 0; slot < routed_experts; ++slot) {
+                bfloat route_weight = bfloat(router_weights[slot]);
+                bfloat product = bfloat(
+                    expert_outputs[slot * outputs_per_simd + lane] *
+                    route_weight);
+                routed_total = bfloat(product + routed_total);
+            }
+            bfloat routed = bfloat(routed_total * bfloat(2.5f));
+            bfloat shared =
+                expert_outputs[routed_experts * outputs_per_simd + lane];
+            bfloat sparse = bfloat(routed + shared);
+            output[first_row + lane] =
+                bfloat(residual[first_row + lane] + sparse);
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
+func lagunaNineWayMoEFinal(
+    routedActivated: MLXArray,
+    routedDownWeight: MLXArray,
+    routedDownScales: MLXArray,
+    indices: MLXArray,
+    routerWeights: MLXArray,
+    sharedActivated: MLXArray,
+    sharedDownWeight: MLXArray,
+    sharedDownScales: MLXArray,
+    residual: MLXArray
+) -> MLXArray {
+    precondition(routedActivated.dtype == .bfloat16)
+    precondition(
+        routedActivated.shape == [
+            1, 1, LagunaConstants.numExpertsPerTok, 1,
+            LagunaConstants.moeIntermediateSize,
+        ])
+    precondition(routedDownWeight.dtype == .uint32)
+    precondition(
+        routedDownWeight.shape == [
+            LagunaConstants.numExperts,
+            LagunaConstants.hiddenSize,
+            LagunaConstants.moeIntermediateSize / 8,
+        ])
+    precondition(routedDownScales.dtype == .uint8)
+    precondition(
+        routedDownScales.shape == [
+            LagunaConstants.numExperts,
+            LagunaConstants.hiddenSize,
+            LagunaConstants.moeIntermediateSize / 16,
+        ])
+    precondition(indices.dtype == .uint32)
+    precondition(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
+    precondition(routerWeights.dtype == .float32)
+    precondition(routerWeights.shape == [1, 1, LagunaConstants.numExpertsPerTok])
+    precondition(sharedActivated.dtype == .bfloat16)
+    precondition(
+        sharedActivated.shape == [
+            1, 1, LagunaConstants.sharedExpertIntermediateSize,
+        ])
+    precondition(sharedDownWeight.dtype == .uint32)
+    precondition(
+        sharedDownWeight.shape == [
+            LagunaConstants.hiddenSize,
+            LagunaConstants.sharedExpertIntermediateSize / 8,
+        ])
+    precondition(sharedDownScales.dtype == .uint8)
+    precondition(
+        sharedDownScales.shape == [
+            LagunaConstants.hiddenSize,
+            LagunaConstants.sharedExpertIntermediateSize / 16,
+        ])
+    precondition(residual.dtype == .bfloat16)
+    precondition(residual.shape == [1, 1, LagunaConstants.hiddenSize])
+
+    return lagunaNineWayMoEFinalKernel(
+        [
+            routedActivated, routedDownWeight, routedDownScales,
+            indices, routerWeights, sharedActivated,
+            sharedDownWeight, sharedDownScales, residual,
+        ],
+        grid: ((LagunaConstants.hiddenSize / 4) * 288, 1, 1),
+        threadGroup: (288, 1, 1),
+        outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 final class LagunaRuntimeMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
@@ -918,6 +1097,8 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     var _fusedGateUpWeight: MLXArray?
     var _fusedGateUpScales: MLXArray?
     var _fusedGateUpSplit: Int = 0
+    var _sharedDownWeight: MLXArray?
+    var _sharedDownScales: MLXArray?
 
     init(dimensions: Int, hiddenDimensions: Int) {
         self._gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
@@ -935,21 +1116,35 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
         guard _fusedGateUpWeight == nil, _fusedGateUpScales == nil,
             let gate = gateProj as? QuantizedLinear,
             let up = upProj as? QuantizedLinear,
+            let down = downProj as? QuantizedLinear,
             type(of: gate) == QuantizedLinear.self,
             type(of: up) == QuantizedLinear.self,
-            gate.mode == .nvfp4, up.mode == .nvfp4,
-            gate.groupSize == 16, up.groupSize == 16,
-            gate.bits == 4, up.bits == 4,
-            gate.bias == nil, up.bias == nil,
-            gate.biases == nil, up.biases == nil,
+            type(of: down) == QuantizedLinear.self,
+            gate.mode == .nvfp4, up.mode == .nvfp4, down.mode == .nvfp4,
+            gate.groupSize == 16, up.groupSize == 16, down.groupSize == 16,
+            gate.bits == 4, up.bits == 4, down.bits == 4,
+            gate.bias == nil, up.bias == nil, down.bias == nil,
+            gate.biases == nil, up.biases == nil, down.biases == nil,
             gate.weight.ndim == 2, up.weight.ndim == 2,
+            down.weight.ndim == 2,
             gate.weight.dtype == .uint32, up.weight.dtype == .uint32,
+            down.weight.dtype == .uint32,
             gate.scales.ndim == 2, up.scales.ndim == 2,
+            down.scales.ndim == 2,
             gate.scales.dtype == .uint8, up.scales.dtype == .uint8,
+            down.scales.dtype == .uint8,
             gate.weight.shape == up.weight.shape,
             gate.scales.shape == up.scales.shape,
             gate.scales.dim(0) == gate.weight.dim(0),
-            gate.weight.dim(1) * 8 == gate.scales.dim(1) * 16
+            gate.weight.dim(1) * 8 == gate.scales.dim(1) * 16,
+            down.weight.shape == [
+                LagunaConstants.hiddenSize,
+                LagunaConstants.sharedExpertIntermediateSize / 8,
+            ],
+            down.scales.shape == [
+                LagunaConstants.hiddenSize,
+                LagunaConstants.sharedExpertIntermediateSize / 16,
+            ]
         else {
             return []
         }
@@ -958,27 +1153,58 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
         _fusedGateUpWeight = fusedWeight
         _fusedGateUpScales = fusedScales
         _fusedGateUpSplit = gate.weight.dim(0)
+        _sharedDownWeight = down.weight
+        _sharedDownScales = down.scales
         return [fusedWeight, fusedScales]
+    }
+
+    private func fusedSharedActivation(_ x: MLXArray) -> MLXArray? {
+        guard lagunaFusedSharedSwiGLUQMVEnabled,
+            let fusedWeight = _fusedGateUpWeight,
+            let fusedScales = _fusedGateUpScales,
+            x.dtype == .bfloat16,
+            x.shape == [1, 1, LagunaConstants.hiddenSize],
+            fusedWeight.dtype == .uint32,
+            fusedScales.dtype == .uint8,
+            _fusedGateUpSplit == LagunaConstants.sharedExpertIntermediateSize
+        else {
+            return nil
+        }
+        return lagunaSharedSwiGLUQMV(
+            x,
+            fusedWeight: fusedWeight,
+            fusedScales: fusedScales
+        )
+    }
+
+    func fusedDownInputs(
+        _ x: MLXArray
+    ) -> (activated: MLXArray, weight: MLXArray, scales: MLXArray)? {
+        guard let activated = fusedSharedActivation(x),
+            let downWeight = _sharedDownWeight,
+            let downScales = _sharedDownScales,
+            downWeight.dtype == .uint32,
+            downWeight.shape == [
+                LagunaConstants.hiddenSize,
+                LagunaConstants.sharedExpertIntermediateSize / 8,
+            ],
+            downScales.dtype == .uint8,
+            downScales.shape == [
+                LagunaConstants.hiddenSize,
+                LagunaConstants.sharedExpertIntermediateSize / 16,
+            ]
+        else {
+            return nil
+        }
+        return (activated, downWeight, downScales)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         if x.dim(1) == 1,
             let fusedWeight = _fusedGateUpWeight, let fusedScales = _fusedGateUpScales
         {
-            if lagunaFusedSharedSwiGLUQMVEnabled,
-                x.dtype == .bfloat16,
-                x.shape == [1, 1, LagunaConstants.hiddenSize],
-                fusedWeight.dtype == .uint32,
-                fusedScales.dtype == .uint8,
-                _fusedGateUpSplit == LagunaConstants.sharedExpertIntermediateSize
-            {
-                return downProj(
-                    lagunaSharedSwiGLUQMV(
-                        x,
-                        fusedWeight: fusedWeight,
-                        fusedScales: fusedScales
-                    )
-                )
+            if let activated = fusedSharedActivation(x) {
+                return downProj(activated)
             }
 
             // One NVFP4 dispatch over the row-concatenated [gate; up] bank,
@@ -1273,7 +1499,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         )
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
+    private func callAsFunction(
+        _ x: MLXArray, adding residual: MLXArray?
+    ) -> MLXArray {
         let (inds, weights) = gate(x)
         var y: MLXArray
         var routedAlreadyReduced = false
@@ -1329,6 +1557,48 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 let xUp = gateUp[.ellipsis, _fusedRoutedGateUpSplit...]
                 activated = compiledSiluProduct(xGate, xUp)
             }
+            if lagunaFusedNineWayMoEFinalEnabled,
+                let residual,
+                let downWeight = _routedDownWeight,
+                let downScales = _routedDownScales,
+                let shared = sharedExpert.fusedDownInputs(x),
+                activated.dtype == .bfloat16,
+                activated.shape == [
+                    1, 1, LagunaConstants.numExpertsPerTok, 1,
+                    LagunaConstants.moeIntermediateSize,
+                ],
+                downWeight.dtype == .uint32,
+                downWeight.shape == [
+                    LagunaConstants.numExperts,
+                    LagunaConstants.hiddenSize,
+                    LagunaConstants.moeIntermediateSize / 8,
+                ],
+                downScales.dtype == .uint8,
+                downScales.shape == [
+                    LagunaConstants.numExperts,
+                    LagunaConstants.hiddenSize,
+                    LagunaConstants.moeIntermediateSize / 16,
+                ],
+                inds.dtype == .uint32,
+                inds.shape == [1, 1, LagunaConstants.numExpertsPerTok],
+                weights.dtype == .float32,
+                weights.shape == [1, 1, LagunaConstants.numExpertsPerTok],
+                residual.dtype == .bfloat16,
+                residual.shape == [1, 1, LagunaConstants.hiddenSize],
+                routedScalingFactor == Float(LagunaConstants.moeRoutedScalingFactor)
+            {
+                return lagunaNineWayMoEFinal(
+                    routedActivated: activated,
+                    routedDownWeight: downWeight,
+                    routedDownScales: downScales,
+                    indices: inds,
+                    routerWeights: weights,
+                    sharedActivated: shared.activated,
+                    sharedDownWeight: shared.weight,
+                    sharedDownScales: shared.scales,
+                    residual: residual
+                )
+            }
             if lagunaFusedRoutedDownReduceEnabled,
                 let downWeight = _routedDownWeight,
                 let downScales = _routedDownScales,
@@ -1375,7 +1645,19 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 y = y * routedScalingFactor
             }
         }
-        return y + sharedExpert(x)
+        let sparse = y + sharedExpert(x)
+        if let residual {
+            return residual + sparse
+        }
+        return sparse
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        callAsFunction(x, adding: nil)
+    }
+
+    func callAddingResidual(_ x: MLXArray, residual: MLXArray) -> MLXArray {
+        callAsFunction(x, adding: residual)
     }
 }
 
@@ -1424,6 +1706,14 @@ final class LagunaRuntimeDecoderLayer: Module {
         } else {
             h = x + r
             normalized = postAttentionLayerNorm(h)
+        }
+        if let sparse = mlp as? LagunaRuntimeSparseMoEBlock,
+            normalized.dtype == .bfloat16,
+            normalized.shape == [1, 1, LagunaConstants.hiddenSize],
+            h.dtype == .bfloat16,
+            h.shape == [1, 1, LagunaConstants.hiddenSize]
+        {
+            return sparse.callAddingResidual(normalized, residual: h)
         }
         let r2 = mlp(normalized)
         return h + r2
