@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "name": "mlxfast-challenge-dev-serial-v2",
-  "trackId": "laguna-xs-2.1-serial-v2",
+  "name": "mlxfast-challenge",
+  "trackId": "laguna-xs-2.1",
   "description": "Optimize Poolside Laguna XS 2.1 NVFP4 MoE inference by transforming weights offline and reducing compute latency without failing the correctness gate.",
   "category": "swift",
   "direction": "+",
@@ -119,6 +119,6 @@
     "prefillSpeedupFloor": 0.95
   },
   "leaderboard": {
-    "namespace": "laguna-xs-2.1-serial-v2"
+    "namespace": "laguna-xs-2.1"
   }
 }
