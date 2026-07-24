@@ -20,12 +20,11 @@ import MLXNN
 //    and exact-verification waves) could not reach the internals through a
 //    plain wrapper.
 //
-// All math is expressed with standard MLX ops and the vendored shared
-// primitives (`attentionWithCacheUpdate`, `initializeRope`,
-// `applyRotaryPosition`, `SwitchGLU`, `weightedExpertSum`, `RMSNorm`,
-// `createAttentionMask`). No custom Metal kernels in this increment; the
-// fused fast-engine and exact-pair/exact-four style optimizations are a
-// later layer on top of this reference target.
+// Math is expressed with standard MLX ops and the vendored shared primitives
+// (`attentionWithCacheUpdate`, `initializeRope`, `applyRotaryPosition`,
+// `SwitchGLU`, `weightedExpertSum`, `RMSNorm`, `createAttentionMask`), except
+// for narrow fixed-geometry kernels whose stock operation boundaries have
+// been proven bit-exact before integration.
 
 func lagunaLastTokenRange(sequenceLength: Int) -> Range<Int>? {
     sequenceLength > 1 ? (sequenceLength - 1)..<sequenceLength : nil
@@ -94,26 +93,15 @@ let lagunaFusedRoutedGateUpEnabled =
 
 // MARK: - Attention
 
-/// Compile the per-head softplus gate and broadcast product as one operation.
-/// Shape-specialized compilation is intentional: the reshape dimensions are
-/// trace-time constants, so decode and prefill cache separate graphs during
-/// warmup. The explicit BF16 cast before multiplication preserves the stock
-/// rounding point exactly.
-private func makeLagunaAttentionGateProduct(
-    heads: Int, headDim: Int
-) -> @Sendable (MLXArray, MLXArray) -> MLXArray {
-    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
-        output, projectedGate in
-        let batch = output.dim(0)
-        let length = output.dim(1)
-        let gate = softplus(projectedGate.asType(.float32)).asType(output.dtype)
-        return (
-            output.reshaped(batch, length, heads, headDim)
-                * gate[.ellipsis, .newAxis]
-        ).reshaped(batch, length, heads * headDim)
+/// Keep the stock shapeless unary gate for prefill. Ranked measurement showed
+/// the larger gate/product graph regressing the complete prefill schedule even
+/// though its isolated steady-state subpath was slightly faster.
+private let lagunaCompiledSoftplusGate: @Sendable (MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray) -> MLXArray = { gate in
+        softplus(gate.asType(.float32)).asType(gate.dtype)
     }
-    return MLXHardwareInfo.isCompiledDecodeSupported ? compile(body) : body
-}
+    return MLXHardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
 
 /// Decode-only outer compilation of the same gate product with the following
 /// bias-free BF16 output projection. MLX keeps the matmul primitive intact but
@@ -137,18 +125,8 @@ private func makeLagunaAttentionGateProjection(
     return MLXHardwareInfo.isCompiledDecodeSupported ? compile(body) : body
 }
 
-private let lagunaFullAttentionGateProduct = makeLagunaAttentionGateProduct(
-    heads: LagunaConstants.fullAttentionHeads,
-    headDim: LagunaConstants.headDim
-)
-
 private let lagunaFullAttentionGateProjection = makeLagunaAttentionGateProjection(
     heads: LagunaConstants.fullAttentionHeads,
-    headDim: LagunaConstants.headDim
-)
-
-private let lagunaSlidingAttentionGateProduct = makeLagunaAttentionGateProduct(
-    heads: LagunaConstants.slidingAttentionHeads,
     headDim: LagunaConstants.headDim
 )
 
@@ -169,7 +147,6 @@ final class LagunaRuntimeAttention: Module {
     let gatingEnabled: Bool
     let gatePerHead: Bool
     let isSliding: Bool
-    let attentionGateProduct: @Sendable (MLXArray, MLXArray) -> MLXArray
     let attentionGateProjection: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray
 
     @ModuleInfo(key: "q_proj") var wq: Linear
@@ -232,10 +209,6 @@ final class LagunaRuntimeAttention: Module {
 
         let layerType = config.layerType(forLayer: layerIdx)
         self.isSliding = layerType == .sliding
-        self.attentionGateProduct =
-            layerType == .sliding
-            ? lagunaSlidingAttentionGateProduct
-            : lagunaFullAttentionGateProduct
         self.attentionGateProjection =
             layerType == .sliding
             ? lagunaSlidingAttentionGateProjection
@@ -317,21 +290,21 @@ final class LagunaRuntimeAttention: Module {
             // across the head dimension (or applied elementwise for a
             // per-element gate).
             let projectedGate = gProj(x)
-            if gatePerHead && projectedGate.dtype == output.dtype {
-                if L == 1, wo.bias == nil, MLXHardwareInfo.isCompiledDecodeSupported {
-                    return attentionGateProjection(output, projectedGate, wo.weight)
-                }
-                output = attentionGateProduct(output, projectedGate)
+            if gatePerHead && projectedGate.dtype == output.dtype,
+                L == 1, wo.bias == nil, MLXHardwareInfo.isCompiledDecodeSupported
+            {
+                return attentionGateProjection(output, projectedGate, wo.weight)
+            }
+            let gate =
+                gatePerHead && projectedGate.dtype == output.dtype
+                ? lagunaCompiledSoftplusGate(projectedGate)
+                : softplus(projectedGate.asType(.float32)).asType(output.dtype)
+            if gatePerHead {
+                output =
+                    (output.reshaped(B, L, nHeads, headDim) * gate[.ellipsis, .newAxis])
+                    .reshaped(B, L, -1)
             } else {
-                let gate = softplus(projectedGate.asType(.float32)).asType(output.dtype)
-                if gatePerHead {
-                    output =
-                        (output.reshaped(B, L, nHeads, headDim)
-                            * gate[.ellipsis, .newAxis])
-                        .reshaped(B, L, -1)
-                } else {
-                    output = output * gate
-                }
+                output = output * gate
             }
         }
 
@@ -427,6 +400,57 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
 
 // MARK: - MoE
 
+/// Laguna's pinned router emits eight choices from 256 FP32 scores. Consume
+/// the full contiguous arg-partition result so the sliced indices remain a
+/// zero-copy view for the expert path, while one dispatch replaces
+/// takeAlong + reduction + broadcast division.
+private let lagunaNormalizeSelectedRouterScoresKernel = MLX.MLXFast.metalKernel(
+    name: "laguna_normalize_selected_router_scores",
+    inputNames: ["scores", "partitioned_indices"],
+    outputNames: ["weights"],
+    source: """
+        uint row = thread_position_in_grid.x;
+        if (row >= uint(NROWS)) {
+            return;
+        }
+        uint score_base = row * uint(NEXPERTS);
+        uint index_base = row * uint(NEXPERTS);
+        float selected[8];
+        float total = 0.0f;
+        for (uint k = 0; k < 8; ++k) {
+            uint expert = uint(partitioned_indices[index_base + k]);
+            selected[k] = scores[score_base + expert];
+            total += selected[k];
+        }
+        uint output_base = row * 8;
+        for (uint k = 0; k < 8; ++k) {
+            weights[output_base + k] = selected[k] / total;
+        }
+        """
+)
+
+private func lagunaNormalizeSelectedRouterScores(
+    scores: MLXArray, partitionedIndices: MLXArray
+) -> MLXArray {
+    precondition(scores.dtype == .float32)
+    precondition(scores.dim(-1) == 256)
+    precondition(partitionedIndices.shape == scores.shape)
+    let rows = scores.size / 256
+    var outputShape = scores.shape
+    outputShape[outputShape.count - 1] = 8
+    return lagunaNormalizeSelectedRouterScoresKernel(
+        [scores, partitionedIndices],
+        template: [
+            ("NROWS", rows),
+            ("NEXPERTS", 256),
+        ],
+        grid: (rows, 1, 1),
+        threadGroup: (min(rows, 256), 1, 1),
+        outputShapes: [outputShape],
+        outputDTypes: [.float32]
+    )[0]
+}
+
 /// Sigmoid top-k router. The routing math mirrors the vendored
 /// `LagunaMoEGate` exactly (sigmoid scores, correction bias added only for
 /// expert CHOICE, mixture weights taken from the pre-bias scores, optional
@@ -456,7 +480,25 @@ final class LagunaRuntimeMoEGate: Module {
         let scores = sigmoid(logits)
         let scoresForChoice = scores + eScoreCorrectionBias.asType(scores.dtype)
 
-        let inds = argPartition(-scoresForChoice, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+        if normTopkProb, topK == 8, scores.dtype == .float32,
+            scores.shape == [1, 1, 256]
+        {
+            let partitioned = argPartition(-scoresForChoice, kth: topK - 1, axis: -1)
+            let inds = partitioned[.ellipsis, ..<topK]
+            let weights = lagunaNormalizeSelectedRouterScores(
+                scores: scores,
+                partitionedIndices: partitioned
+            )
+            return (inds, weights)
+        }
+
+        // Keep the fallback source-structurally identical to upstream. In
+        // particular, do not retain a full-width partition local through the
+        // multi-token graph: ranked measurement showed that its lifetime alone
+        // was enough to perturb the complete prefill schedule.
+        let inds = argPartition(
+            -scoresForChoice, kth: topK - 1, axis: -1
+        )[.ellipsis, ..<topK]
         var weights = takeAlong(scores, inds, axis: -1)
         if normTopkProb {
             weights = weights / weights.sum(axis: -1, keepDims: true)
@@ -601,6 +643,91 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
 
 // MARK: - Decoder Layer
 
+/// Decode-only fusion of the post-attention residual add and RMSNorm. Laguna's
+/// 2,048-wide BF16 row uses the same 512-thread, four-reads-per-thread
+/// reduction tree as MLX's `rms_single_row` kernel. The BF16 residual is
+/// materialized as a separate output because it is consumed again after the
+/// MLP; keeping it in registers for the normalization avoids rereading that
+/// row and removes one dispatch without changing the stock rounding points.
+private let lagunaResidualRMSNormKernel = MLX.MLXFast.metalKernel(
+    name: "laguna_residual_rms_norm_bf16_2048",
+    inputNames: ["x", "residual", "weight"],
+    outputNames: ["sum", "normalized"],
+    source: """
+        constexpr uint axis_size = 2048;
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint lid = thread_position_in_threadgroup.x;
+        uint simd_lane_id = thread_index_in_simdgroup;
+        uint simd_group_id = simdgroup_index_in_threadgroup;
+        uint base = row * axis_size + lid * n_reads;
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        bfloat row_sum[n_reads];
+        float acc = 0.0f;
+        for (uint i = 0; i < n_reads; ++i) {
+            row_sum[i] = x[base + i] + residual[base + i];
+            sum[base + i] = row_sum[i];
+            float value = row_sum[i];
+            acc += value * value;
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group_id == 0) {
+            local_sums[simd_lane_id] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_lane_id == 0) {
+            local_sums[simd_group_id] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group_id == 0) {
+            acc = simd_sum(local_sums[simd_lane_id]);
+            if (simd_lane_id == 0) {
+                local_inv_mean[0] =
+                    metal::precise::rsqrt(acc / float(axis_size) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < n_reads; ++i) {
+            normalized[base + i] =
+                weight[lid * n_reads + i]
+                * bfloat(float(row_sum[i]) * local_inv_mean[0]);
+        }
+        """
+)
+
+private func lagunaResidualRMSNorm(
+    _ x: MLXArray, residual: MLXArray, norm: RMSNorm
+) -> (sum: MLXArray, normalized: MLXArray)? {
+    guard x.shape == [1, 1, LagunaConstants.hiddenSize],
+        residual.shape == x.shape,
+        x.dtype == .bfloat16,
+        residual.dtype == .bfloat16,
+        norm.weight.shape == [LagunaConstants.hiddenSize],
+        norm.weight.dtype == .bfloat16,
+        norm.eps == Float(LagunaConstants.rmsNormEpsilon)
+    else {
+        return nil
+    }
+    let rows = x.size / LagunaConstants.hiddenSize
+    let outputs = lagunaResidualRMSNormKernel(
+        [x, residual, norm.weight],
+        grid: (rows * 512, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [x.shape, x.shape],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
 final class LagunaRuntimeDecoderLayer: Module {
     @ModuleInfo(key: "self_attn") var selfAttn: LagunaRuntimeAttention
     let mlp: UnaryLayer
@@ -631,8 +758,16 @@ final class LagunaRuntimeDecoderLayer: Module {
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        let h = x + r
-        let r2 = mlp(postAttentionLayerNorm(h))
+        let h: MLXArray
+        let normalized: MLXArray
+        if let fused = lagunaResidualRMSNorm(x, residual: r, norm: postAttentionLayerNorm) {
+            h = fused.sum
+            normalized = fused.normalized
+        } else {
+            h = x + r
+            normalized = postAttentionLayerNorm(h)
+        }
+        let r2 = mlp(normalized)
         return h + r2
     }
 }
