@@ -203,8 +203,22 @@ private class LagunaSparseMoeBlock: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, weights) = gate(x)
-        var y = switchMLP(x, inds)
-        y = weightedExpertSum(y, weights.asType(y.dtype))
+        var y: MLXArray
+        if inds.size >= 64 {
+            // Prefill already sorts routes by expert for gather-QMM. Keep the
+            // down-projection rows sorted and fuse the inverse gather, router
+            // weighting, and top-k reduction into one kernel instead of
+            // materializing a full unsorted expert-output tensor.
+            let (sorted, inverseOrder) = switchMLP.callSorted(x, inds)
+            y = fusedUnsortWeightedSum(
+                sorted: sorted,
+                inverseOrder: inverseOrder,
+                weights: weights.asType(sorted.dtype)
+            )
+        } else {
+            y = switchMLP(x, inds)
+            y = weightedExpertSum(y, weights.asType(y.dtype))
+        }
         if routedScalingFactor != 1 {
             y = y * routedScalingFactor
         }
