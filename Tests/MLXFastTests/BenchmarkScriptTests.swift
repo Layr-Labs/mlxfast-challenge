@@ -1651,7 +1651,9 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // (Gemma4SubmissionControls.swift's validation hook, comment mentions
     // benchmark timing) failed a submission that never touched it.
     #expect(staticReview.contains("review_base=\"${MLXFAST_SUBMISSION_REVIEW_BASE_SHA:-}\""))
-    #expect(staticReview.contains("git diff --name-only -z \"${review_base}\" \"${review_head}\" -- \"${editable_paths[@]}\""))
+    // The changed-path listing runs against the untrusted submission checkout,
+    // so it goes through the hardened wrapper.
+    #expect(staticReview.contains("\"${HARDENED_GIT}\" diff --name-only -z \"${review_base}\" \"${review_head}\" -- \"${editable_paths[@]}\""))
     #expect(staticReview.contains("changed_path_count=$((changed_path_count + 1))"))
     // A resolvable base is mandatory once provided (fail closed, never silently
     // fall back to whole-surface which would resurrect the false positive).
@@ -1665,8 +1667,9 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // review the whole surface.
     #expect(staticReview.contains("is set but empty"))
     // The allowlist comes from the BASE commit (like enforce-modifiable-
-    // surface.sh), and an empty allowlist is an error, not a clean pass.
-    #expect(staticReview.contains("git show \"${review_base}:${CONTRACT_PATH}\""))
+    // surface.sh), read through the hardened wrapper, and an empty allowlist
+    // is an error, not a clean pass.
+    #expect(staticReview.contains("\"${HARDENED_GIT}\" show \"${review_base}:${CONTRACT_PATH}\""))
     #expect(staticReview.contains("lists no editablePaths"))
     // A changed path that is missing or not a regular file in the work tree
     // (checkout divergence or a symlink) fails the review instead of silently
@@ -2221,8 +2224,10 @@ func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
     #expect(staticReview.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_FILE_BYTES must be a positive integer"))
     #expect(staticReview.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_GROWTH_BYTES must be a positive integer"))
     #expect(staticReview.contains("above the per-file static review limit"))
-    #expect(staticReview.contains("git cat-file -s \"${review_base}:${changed_path}\""))
-    #expect(staticReview.contains("git cat-file -s \"${review_head}:${changed_path}\""))
+    // Blob sizes are read through the hardened wrapper: the script's working
+    // directory is the untrusted submission checkout.
+    #expect(staticReview.contains("\"${HARDENED_GIT}\" cat-file -s \"${review_base}:${changed_path}\""))
+    #expect(staticReview.contains("\"${HARDENED_GIT}\" cat-file -s \"${review_head}:${changed_path}\""))
     #expect(staticReview.contains("surface_growth_bytes=$((head_surface_bytes - base_surface_bytes))"))
     #expect(staticReview.contains("above the growth limit"))
 
