@@ -74,6 +74,15 @@ func lagunaRopeScalingConfig(_ spec: LagunaRopeSpec) -> [String: StringOrNumber]
 let lagunaFusedQKVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] == "1"
 
+/// `DARKBLOOM_FUSED_KV` (default on; set "0" to disable): retain one
+/// row-concatenated `[Wk; Wv]` BF16 weight per attention layer and serve
+/// single-token decode K/V from one projection dispatch. Unlike the opt-in QKV
+/// fusion, this preserves the query projection's existing GEMM geometry.
+/// Multi-token prefill stays on the stock pair because changing the projection
+/// N geometry can change BF16 rounding there; M=1 decode is bit-exact.
+let lagunaFusedKVEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_KV"] != "0"
+
 /// `DARKBLOOM_FUSED_SHARED_GATE_UP` (default on; set "0" to disable): after
 /// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
 /// shared expert and serve single-token decode from one quantized matmul.
@@ -170,6 +179,10 @@ final class LagunaRuntimeAttention: Module {
     /// arrays for parameter integrity.
     var _fusedQKVWeight: MLXArray?
 
+    /// Retained fused `[Wk; Wv]` weight. This is used when broad QKV fusion is
+    /// disabled, preserving the query projection's stock dispatch geometry.
+    var _fusedKVWeight: MLXArray?
+
     /// Builds and retains the fused QKV weight from the loaded q/k/v
     /// projection weights. Called once after weights are installed and
     /// evaluated (before warmup); returns the new array so the caller can
@@ -196,6 +209,23 @@ final class LagunaRuntimeAttention: Module {
         }
         let fused = concatenated([wq.weight, wk.weight, wv.weight], axis: 0)
         _fusedQKVWeight = fused
+        return fused
+    }
+
+    func prepareFusedKVWeight() -> MLXArray? {
+        guard _fusedKVWeight == nil,
+            type(of: wk) == Linear.self,
+            type(of: wv) == Linear.self,
+            wk.bias == nil, wv.bias == nil,
+            wk.weight.ndim == 2, wv.weight.ndim == 2,
+            wk.weight.dtype == wv.weight.dtype,
+            wk.weight.shape == wv.weight.shape,
+            wk.weight.dim(0) == nKVHeads * headDim
+        else {
+            return nil
+        }
+        let fused = concatenated([wk.weight, wv.weight], axis: 0)
+        _fusedKVWeight = fused
         return fused
     }
 
@@ -263,6 +293,12 @@ final class LagunaRuntimeAttention: Module {
             queries = qkv[.ellipsis, 0 ..< queryDim]
             keys = qkv[.ellipsis, queryDim ..< (queryDim + kvDim)]
             values = qkv[.ellipsis, (queryDim + kvDim) ..< (queryDim + 2 * kvDim)]
+        } else if L == 1, let fusedKVWeight = _fusedKVWeight {
+            queries = wq(x)
+            let kv = matmul(x, fusedKVWeight.T)
+            let kvDim = nKVHeads * headDim
+            keys = kv[.ellipsis, 0 ..< kvDim]
+            values = kv[.ellipsis, kvDim ..< (2 * kvDim)]
         } else {
             queries = wq(x)
             keys = wk(x)
@@ -751,6 +787,8 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         var fusedArrays: [MLXArray] = []
         for layer in model.layers {
             if lagunaFusedQKVEnabled, let fused = layer.selfAttn.prepareFusedQKVWeight() {
+                fusedArrays.append(fused)
+            } else if lagunaFusedKVEnabled, let fused = layer.selfAttn.prepareFusedKVWeight() {
                 fusedArrays.append(fused)
             }
             if let sparse = layer.mlp as? LagunaRuntimeSparseMoEBlock {
