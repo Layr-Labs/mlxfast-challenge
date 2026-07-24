@@ -616,9 +616,9 @@ final class LagunaRuntimeDecoderLayer: Module {
 
 // MARK: - Model
 
-/// The Laguna text tower: unscaled embedding, 40 decoder layers, final
-/// RMSNorm.
-/// Returns post-norm hidden states for every input position.
+/// The Laguna text tower: unscaled embedding and 40 decoder layers. The final
+/// RMSNorm remains a child of this module for checkpoint compatibility, but
+/// the scored wrapper applies it after selecting the only consumed row.
 final class LagunaRuntimeModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     @ModuleInfo(key: "layers") var layers: [LagunaRuntimeDecoderLayer]
@@ -663,7 +663,7 @@ final class LagunaRuntimeModelInner: Module {
             h = layer(h, mask: mask, cache: cache?[i])
         }
 
-        return norm(h)
+        return h
     }
 }
 
@@ -711,9 +711,10 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let fullHidden = model(inputs, cache: cache)
         // Every consumer of multi-token logits reads only the LAST
-        // position's row; slicing before the head removes a
-        // [length-1, vocab]-sized slab of dead work from every prefill.
-        let hidden = lagunaLastTokenHidden(fullHidden)
+        // position's row. Slice before the row-independent final RMSNorm and
+        // vocabulary head so prefill neither normalizes nor projects the
+        // preceding rows. For single-token decode the slice is a no-op.
+        let hidden = model.norm(lagunaLastTokenHidden(fullHidden))
         if let lmHead {
             return lmHead(hidden)
         }

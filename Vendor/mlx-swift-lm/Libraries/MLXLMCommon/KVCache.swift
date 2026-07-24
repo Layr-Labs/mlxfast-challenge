@@ -340,6 +340,22 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let previous = self.offset
 
+        // When the first update already lands exactly on an allocation-step
+        // boundary, the stock zero allocation has no spare capacity: it
+        // creates arrays with the same sequence length as `keys`/`values`,
+        // then copies the entire inputs into them. Retain the incoming arrays
+        // directly in this no-slack case. Shapes, offsets, returned values,
+        // and the next growth boundary are identical; only the redundant
+        // zero-fill and full-prompt slice updates disappear.
+        if self.keys == nil, previous == 0, keys.dim(2) > 0,
+            keys.dim(2).isMultiple(of: step)
+        {
+            self.keys = keys
+            self.values = values
+            self.offset = keys.dim(2)
+            return (keys, values)
+        }
+
         let reset =
             if let currentKeys = self.keys, (previous + keys.dim(2)) > currentKeys.dim(2) {
                 true
