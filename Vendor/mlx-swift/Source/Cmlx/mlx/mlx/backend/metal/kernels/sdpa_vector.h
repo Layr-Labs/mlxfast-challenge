@@ -53,7 +53,9 @@ template <typename T, int D, int V = D>
   thread U k[qk_per_thread];
   thread U o[v_per_thread];
 
-  threadgroup U outputs[BN * BD];
+  using output_exchange_t =
+      metal::conditional_t<v_per_thread == 4, float2, U>;
+  threadgroup output_exchange_t outputs[BN * BD];
   threadgroup U max_scores[BN];
   threadgroup U sum_exp_scores[BN];
 
@@ -159,13 +161,34 @@ template <typename T, int D, int V = D>
   U factor = fast::exp(max_score - new_max);
   sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
 
-  // Now we need to aggregate all the outputs
-  for (int i = 0; i < v_per_thread; i++) {
-    outputs[simd_lid * BD + simd_gid] = o[i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
-    o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+  // Now we need to aggregate all the outputs. D=V=128 has four components
+  // per lane; exchange them in two float2 waves to reduce synchronization
+  // while keeping threadgroup-memory pressure modest.
+  if constexpr (v_per_thread == 4) {
+    for (int wave = 0; wave < 2; wave++) {
+      int component = 2 * wave;
+      outputs[simd_lid * BD + simd_gid] =
+          float2(o[component], o[component + 1]);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      float2 exchanged = outputs[simd_gid * BD + simd_lid];
+      for (int i = 0; i < 2; i++) {
+        o[component + i] = simd_sum(exchanged[i] * factor);
+        o[component + i] = sum_exp_score == 0
+            ? o[component + i]
+            : (o[component + i] / sum_exp_score);
+      }
+      if (wave == 0) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+    }
+  } else {
+    for (int i = 0; i < v_per_thread; i++) {
+      outputs[simd_lid * BD + simd_gid] = o[i];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+      o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
   }
 
   // And write the output
@@ -335,7 +358,9 @@ template <typename T, int D>
   typedef float U;
 
   thread U o[elem_per_thread] = {0};
-  threadgroup U outputs[BN * BD];
+  using output_exchange_t =
+      metal::conditional_t<elem_per_thread == 4, float2, U>;
+  threadgroup output_exchange_t outputs[BN * BD];
 
   // Adjust positions
   const int head_idx = tid.x;
@@ -376,13 +401,33 @@ template <typename T, int D>
     partials += BN * D;
   }
 
-  // Use shared memory to transpose and reduce the final block
-  for (int i = 0; i < elem_per_thread; i++) {
-    outputs[simd_lid * BD + simd_gid] = o[i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
-    o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+  // Use shared memory to transpose and reduce the final block. Pack the four
+  // D=128 components into two exchanges, preserving their scalar reductions.
+  if constexpr (elem_per_thread == 4) {
+    for (int wave = 0; wave < 2; wave++) {
+      int component = 2 * wave;
+      outputs[simd_lid * BD + simd_gid] =
+          float2(o[component], o[component + 1]);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      float2 exchanged = outputs[simd_gid * BD + simd_lid];
+      for (int i = 0; i < 2; i++) {
+        o[component + i] = simd_sum(exchanged[i]);
+        o[component + i] = sum_exp_score == 0
+            ? o[component + i]
+            : (o[component + i] / sum_exp_score);
+      }
+      if (wave == 0) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+    }
+  } else {
+    for (int i = 0; i < elem_per_thread; i++) {
+      outputs[simd_lid * BD + simd_gid] = o[i];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+      o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
   }
 
   // And write the output
