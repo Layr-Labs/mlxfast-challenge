@@ -94,91 +94,8 @@ let lagunaFusedSharedGateUpEnabled =
 let lagunaFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_GATE_UP"] != "0"
 
-/// Decode post-attention residual + RMSNorm fusion. The kernel emits
-/// both the rounded BF16 residual (needed by the following skip connection)
-/// and the normalized row (consumed immediately by the MLP), eliminating a
-/// separate residual-add materialization/read. Prefill stays on the stock path
-/// to keep its dispatch and scheduling unchanged.
-let lagunaFusedResidualRMSNormEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_RESIDUAL_RMS"] != "0"
-
-private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
-    name: "laguna_residual_rms_bf16_2048_v1",
-    inputNames: ["residual", "branch", "weight"],
-    outputNames: ["summed", "normalized"],
-    source: """
-        constexpr uint axis_size = 2048;
-        constexpr uint n_reads = 4;
-        constexpr uint simd_size = 32;
-
-        uint row = threadgroup_position_in_grid.x;
-        uint lid = thread_position_in_threadgroup.x;
-        uint simd_lane = thread_index_in_simdgroup;
-        uint simd_group = simdgroup_index_in_threadgroup;
-        uint base = row * axis_size + lid * n_reads;
-
-        threadgroup float local_inv_mean[1];
-        threadgroup float local_sums[simd_size];
-
-        thread bfloat values[n_reads];
-        float acc = 0.0f;
-        for (uint i = 0; i < n_reads; ++i) {
-            bfloat value = bfloat(residual[base + i] + branch[base + i]);
-            values[i] = value;
-            summed[base + i] = value;
-            float fv = float(value);
-            acc += fv * fv;
-        }
-
-        acc = simd_sum(acc);
-        if (simd_group == 0) {
-            local_sums[simd_lane] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (simd_lane == 0) {
-            local_sums[simd_group] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (simd_group == 0) {
-            acc = simd_sum(local_sums[simd_lane]);
-            if (simd_lane == 0) {
-                local_inv_mean[0] =
-                    metal::precise::rsqrt(acc / 2048.0f + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint i = 0; i < n_reads; ++i) {
-            normalized[base + i] =
-                weight[lid * n_reads + i] *
-                bfloat(float(values[i]) * local_inv_mean[0]);
-        }
-        """,
-    ensureRowContiguous: true
-)
-
-func lagunaResidualRMSNorm(
-    residual: MLXArray, branch: MLXArray, weight: MLXArray
-) -> (MLXArray, MLXArray) {
-    precondition(residual.dtype == .bfloat16)
-    precondition(branch.dtype == .bfloat16)
-    precondition(weight.dtype == .bfloat16)
-    precondition(residual.shape == branch.shape)
-    precondition(residual.dim(-1) == LagunaConstants.hiddenSize)
-    precondition(weight.shape == [LagunaConstants.hiddenSize])
-
-    let rows = residual.size / LagunaConstants.hiddenSize
-    let outputs = lagunaResidualRMSNormKernel(
-        [residual, branch, weight],
-        grid: (rows * 512, 1, 1),
-        threadGroup: (512, 1, 1),
-        outputShapes: [residual.shape, residual.shape],
-        outputDTypes: [.bfloat16, .bfloat16]
-    )
-    return (outputs[0], outputs[1])
-}
+let lagunaFusedAttentionGateGEMVEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ATTENTION_GATE_GEMV"] != "0"
 
 // MARK: - Attention
 
@@ -192,37 +109,88 @@ private let lagunaCompiledSoftplusGate: @Sendable (MLXArray) -> MLXArray = {
     return MLXHardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
-/// Decode-only outer compilation of the same gate product with the following
-/// bias-free BF16 output projection. MLX keeps the matmul primitive intact but
-/// schedules the elementwise producer and projection as one compiled graph,
-/// avoiding a separate frontend boundary and shortening the gated vector's
-/// lifetime. Prefill deliberately uses the smaller gate-only fusion.
-private func makeLagunaAttentionGateProjection(
-    heads: Int, headDim: Int
-) -> @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray {
-    let body: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
-        output, projectedGate, weight in
-        let batch = output.dim(0)
-        let length = output.dim(1)
-        let gate = softplus(projectedGate.asType(.float32)).asType(output.dtype)
-        let gated = (
-            output.reshaped(batch, length, heads, headDim)
-                * gate[.ellipsis, .newAxis]
-        ).reshaped(batch, length, heads * headDim)
-        return matmul(gated, weight.T)
-    }
-    return MLXHardwareInfo.isCompiledDecodeSupported ? compile(body) : body
+/// Decode-only BF16 output projection with the per-head BF16 gate multiplied
+/// at the vector-load boundary. This is the stock MLX GEMV reduction tree for
+/// Laguna's exact shapes (BM=4, BN=1, SM=1, SN=32, TM=4, TN=4): only the
+/// separately materialized gated vector is removed. Casting the product back
+/// to BF16 before FP32 accumulation preserves the stock elementwise boundary.
+private let lagunaGatedOutputProjectionKernel = MLXFast.metalKernel(
+    name: "laguna_gated_output_gemv_bf16_v1",
+    inputNames: ["attention", "gate", "weight"],
+    outputNames: ["projected"],
+    source: """
+        constexpr uint output_width = 2048;
+        constexpr uint head_dim = 128;
+        constexpr uint outputs_per_group = 16;
+        constexpr uint values_per_lane = 4;
+        constexpr uint input_block = 128;
+
+        uint group = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint output_base =
+            group * outputs_per_group + simd_group * values_per_lane;
+
+        thread float result[values_per_lane] = {0.0f};
+        uint input_base = lane * values_per_lane;
+
+        for (uint block = 0; block < uint(INPUT_WIDTH); block += input_block) {
+            thread float coefficients[values_per_lane];
+            for (uint j = 0; j < values_per_lane; ++j) {
+                uint column = block + input_base + j;
+                bfloat gated = bfloat(
+                    attention[column] * gate[column / head_dim]);
+                coefficients[j] = float(gated);
+            }
+
+            for (uint row = 0; row < values_per_lane; ++row) {
+                uint weight_base =
+                    (output_base + row) * uint(INPUT_WIDTH) + block + input_base;
+                for (uint j = 0; j < values_per_lane; ++j) {
+                    result[row] += weight[weight_base + j] * coefficients[j];
+                }
+            }
+        }
+
+        for (ushort offset = 16; offset >= 1; offset >>= 1) {
+            for (uint row = 0; row < values_per_lane; ++row) {
+                result[row] += simd_shuffle_down(result[row], offset);
+            }
+        }
+
+        if (lane == 0) {
+            for (uint row = 0; row < values_per_lane; ++row) {
+                projected[output_base + row] = bfloat(result[row]);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+func lagunaGatedOutputProjection(
+    attention: MLXArray, gate: MLXArray, weight: MLXArray
+) -> MLXArray {
+    precondition(attention.shape.count == 3)
+    precondition(attention.shape[0] == 1 && attention.shape[1] == 1)
+    precondition(attention.dtype == .bfloat16)
+    precondition(gate.shape == [1, 1, attention.dim(-1) / LagunaConstants.headDim])
+    precondition(gate.dtype == .bfloat16)
+    precondition(
+        attention.dim(-1) == LagunaConstants.fullAttentionHeads * LagunaConstants.headDim
+            || attention.dim(-1)
+                == LagunaConstants.slidingAttentionHeads * LagunaConstants.headDim)
+    precondition(weight.shape == [LagunaConstants.hiddenSize, attention.dim(-1)])
+    precondition(weight.dtype == .bfloat16)
+
+    return lagunaGatedOutputProjectionKernel(
+        [attention, gate, weight],
+        template: [("INPUT_WIDTH", attention.dim(-1))],
+        grid: (128 * 32, 1, 4),
+        threadGroup: (32, 1, 4),
+        outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
 }
-
-private let lagunaFullAttentionGateProjection = makeLagunaAttentionGateProjection(
-    heads: LagunaConstants.fullAttentionHeads,
-    headDim: LagunaConstants.headDim
-)
-
-private let lagunaSlidingAttentionGateProjection = makeLagunaAttentionGateProjection(
-    heads: LagunaConstants.slidingAttentionHeads,
-    headDim: LagunaConstants.headDim
-)
 
 /// Laguna attention: GQA with per-head QK-norm, per-layer-type RoPE (YaRN on
 /// full-attention layers over the first half of the head, plain RoPE on
@@ -236,7 +204,6 @@ final class LagunaRuntimeAttention: Module {
     let gatingEnabled: Bool
     let gatePerHead: Bool
     let isSliding: Bool
-    let attentionGateProjection: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray
 
     @ModuleInfo(key: "q_proj") var wq: Linear
     @ModuleInfo(key: "k_proj") var wk: Linear
@@ -298,10 +265,6 @@ final class LagunaRuntimeAttention: Module {
 
         let layerType = config.layerType(forLayer: layerIdx)
         self.isSliding = layerType == .sliding
-        self.attentionGateProjection =
-            layerType == .sliding
-            ? lagunaSlidingAttentionGateProjection
-            : lagunaFullAttentionGateProjection
 
         self._wq.wrappedValue = Linear(dim, nHeads * headDim, bias: config.qkvBias)
         self._wk.wrappedValue = Linear(dim, nKVHeads * headDim, bias: config.qkvBias)
@@ -379,10 +342,17 @@ final class LagunaRuntimeAttention: Module {
             // across the head dimension (or applied elementwise for a
             // per-element gate).
             let projectedGate = gProj(x)
-            if gatePerHead && projectedGate.dtype == output.dtype,
+            if lagunaFusedAttentionGateGEMVEnabled,
+                gatePerHead, projectedGate.dtype == .bfloat16,
+                output.dtype == .bfloat16,
+                output.shape == [1, 1, nHeads * headDim],
+                wo.weight.dtype == .bfloat16,
+                wo.weight.shape == [LagunaConstants.hiddenSize, nHeads * headDim],
                 L == 1, wo.bias == nil, MLXHardwareInfo.isCompiledDecodeSupported
             {
-                return attentionGateProjection(output, projectedGate, wo.weight)
+                let gate = lagunaCompiledSoftplusGate(projectedGate)
+                return lagunaGatedOutputProjection(
+                    attention: output, gate: gate, weight: wo.weight)
             }
             let gate =
                 gatePerHead && projectedGate.dtype == output.dtype
@@ -876,21 +846,8 @@ final class LagunaRuntimeDecoderLayer: Module {
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        let h: MLXArray
-        let normalized: MLXArray
-        if lagunaFusedResidualRMSNormEnabled,
-            x.dtype == .bfloat16, r.dtype == .bfloat16,
-            postAttentionLayerNorm.weight.dtype == .bfloat16,
-            x.shape == r.shape, x.dim(-1) == LagunaConstants.hiddenSize,
-            x.size == LagunaConstants.hiddenSize
-        {
-            (h, normalized) = lagunaResidualRMSNorm(
-                residual: x, branch: r, weight: postAttentionLayerNorm.weight)
-        } else {
-            h = x + r
-            normalized = postAttentionLayerNorm(h)
-        }
-        let r2 = mlp(normalized)
+        let h = x + r
+        let r2 = mlp(postAttentionLayerNorm(h))
         return h + r2
     }
 
