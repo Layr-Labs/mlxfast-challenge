@@ -4606,6 +4606,158 @@ func benchmarkScriptLocalSummarySkipsQuietlyWithoutTimingMetrics() throws {
 }
 
 @Test
+func benchmarkScriptWarnsWhenLowMemoryProfileSkippedRankedFeatures() throws {
+    // The runtime worker's low-memory startup profile silently defaults the
+    // compiled-decode flags OFF on <64 GiB machines, announced by one stderr
+    // notice at startup that is easy to miss. A submission validated only
+    // under that profile can crash on the ranked box inside the
+    // compiled-decode path it never executed, so local modes must repeat the
+    // parity gap prominently at the END of the run -- and must stay silent
+    // when the user explicitly exported the flags (their values always win),
+    // forced the full profile, or runs a full-profile machine.
+    let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    #expect(script.contains("report_low_memory_parity_warning() {"))
+    // The warning belongs to the FINAL local summary block, after the score
+    // summary, so it cannot scroll away with the startup output.
+    #expect(script.contains(
+        "  report_local_score_summary\n  report_low_memory_parity_warning"
+    ))
+
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let weights = root.appendingPathComponent("weights")
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try "{}".write(
+        to: weights.appendingPathComponent("config.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let score = root.appendingPathComponent("score.local-iterate.json")
+    let integrity = root.appendingPathComponent("benchmark-integrity.local-iterate.json")
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    cat <<'JSON'
+    {
+      "score": null,
+      "passed": true,
+      "metrics": {
+        "prefill_seconds_per_token": 0.1,
+        "decode_seconds_per_token": 2.0,
+        "prefill_speedup": 2.0,
+        "decode_speedup": 2.0,
+        "weights_hash": "fake-weights",
+        "weights_file_count": 1,
+        "weights_byte_count": 2
+      }
+    }
+    JSON
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeSwift.path
+    )
+
+    func runLocalIterate(
+        physicalMemoryGiB: UInt64,
+        extraEnvironment: [String: String] = [:]
+    ) throws -> String {
+        var environment = benchmarkTestEnvironment([
+            "MLXFAST_NO_SANDBOX": "1",
+            "MLXFAST_SKIP_TRANSFORM": "1",
+            "MLXFAST_SWIFT_BIN": fakeSwift.path,
+            "MLXFAST_WEIGHTS_PATH": weights.path,
+            "MLXFAST_SCORE_PATH": score.path,
+            "MLXFAST_INTEGRITY_PATH": integrity.path,
+            // Testing seam standing in for `sysctl -n hw.memsize`.
+            "MLXFAST_PHYSICAL_MEMORY_BYTES": String(physicalMemoryGiB << 30),
+        ])
+        // The machine running the tests may itself export the profile or the
+        // feature flags; every case controls them explicitly instead.
+        for flag in [
+            "MLX_COMPILED_DECODE",
+            "DARKBLOOM_COMPILED_DECODE",
+            "DARKBLOOM_STARTUP_MEMORY_PROFILE",
+        ] {
+            environment.removeValue(forKey: flag)
+        }
+        environment.merge(extraEnvironment) { _, new in new }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = ["benchmark.sh", "--local-iterate"]
+        process.currentDirectoryURL = URL(
+            fileURLWithPath: FileManager.default.currentDirectoryPath
+        )
+        process.environment = environment
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+        try process.run()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        #expect(process.terminationStatus == 0)
+        return String(data: stderrData, encoding: .utf8) ?? ""
+    }
+
+    // <64 GiB with nothing exported: the profile downgraded both
+    // compiled-decode flags, so the final summary names the skipped ranked
+    // path, every downgraded flag, and the opt-in.
+    let lowMemory = try runLocalIterate(physicalMemoryGiB: 36)
+    #expect(lowMemory.contains("RANKED-PARITY WARNING"))
+    #expect(lowMemory.contains(
+        "physical memory 36 GiB is below the 64 GiB full-profile minimum"
+    ))
+    #expect(lowMemory.contains("MLX_COMPILED_DECODE=0 DARKBLOOM_COMPILED_DECODE=0"))
+    #expect(lowMemory.contains("compile(shapeless:)"))
+    #expect(lowMemory.contains(
+        "export MLX_COMPILED_DECODE=1 DARKBLOOM_COMPILED_DECODE=1"
+    ))
+    #expect(lowMemory.contains("64 GiB+ machine"))
+    let summaryRange = try #require(lowMemory.range(of: "local-iterate summary"))
+    let warningRange = try #require(lowMemory.range(of: "RANKED-PARITY WARNING"))
+    #expect(summaryRange.lowerBound < warningRange.lowerBound)
+
+    // Explicitly exported flags are respected and never warned about: with
+    // one flag exported the warning enumerates only the other; with both
+    // exported it disappears entirely.
+    let partiallyOptedIn = try runLocalIterate(
+        physicalMemoryGiB: 36,
+        extraEnvironment: ["DARKBLOOM_COMPILED_DECODE": "1"]
+    )
+    #expect(partiallyOptedIn.contains("RANKED-PARITY WARNING"))
+    #expect(partiallyOptedIn.contains("by default: MLX_COMPILED_DECODE=0."))
+    #expect(!partiallyOptedIn.contains("DARKBLOOM_COMPILED_DECODE=0"))
+    let fullyOptedIn = try runLocalIterate(
+        physicalMemoryGiB: 36,
+        extraEnvironment: [
+            "MLX_COMPILED_DECODE": "1",
+            "DARKBLOOM_COMPILED_DECODE": "1",
+        ]
+    )
+    #expect(!fullyOptedIn.contains("RANKED-PARITY WARNING"))
+
+    // Full-profile machines and an explicit full-profile override apply no
+    // feature-disable defaults, so there is nothing to warn about; forcing
+    // the low profile on a big machine still warns because the parity gap is
+    // just as real there.
+    let fullMachine = try runLocalIterate(physicalMemoryGiB: 128)
+    #expect(!fullMachine.contains("RANKED-PARITY WARNING"))
+    let forcedFull = try runLocalIterate(
+        physicalMemoryGiB: 36,
+        extraEnvironment: ["DARKBLOOM_STARTUP_MEMORY_PROFILE": "full"]
+    )
+    #expect(!forcedFull.contains("RANKED-PARITY WARNING"))
+    let forcedLow = try runLocalIterate(
+        physicalMemoryGiB: 128,
+        extraEnvironment: ["DARKBLOOM_STARTUP_MEMORY_PROFILE": "low"]
+    )
+    #expect(forcedLow.contains("RANKED-PARITY WARNING"))
+    #expect(forcedLow.contains("DARKBLOOM_STARTUP_MEMORY_PROFILE=low"))
+}
+
+@Test
 func benchmarkScriptRejectsPathFlagsBeforeForwardingToSwiftBenchmark() throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
