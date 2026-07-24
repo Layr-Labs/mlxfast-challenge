@@ -17,10 +17,22 @@
 #   - already-coarsened wall seconds,
 #   - the first failing decode step floored to a coarse bucket of 32.
 # The raw error string is never printed, uploaded, or partially quoted.
+#
+# The public behavior gate runs BEFORE any score.json exists, so every
+# failure there used to collapse into the opaque "no_score" category --
+# indistinguishable from any other pre-benchmark failure, which invited
+# consumers to guess the failing gate from the surrounding (skipped) step
+# names instead. When no score-derived category is available, this script
+# now also consults the public gate report: its verdict booleans are
+# authored by the pin-verified trusted CLI and reference only the
+# checked-in public fixture, while its error string can embed sandboxed
+# worker stderr and is therefore only prefix-matched against fixed
+# harness-authored prefixes, never emitted.
 set -euo pipefail
 
-out="${1:?usage: redact-benchmark-failure.sh OUTPUT_PATH}"
+out="${1:?usage: redact-benchmark-failure.sh OUTPUT_PATH [SCORE_PATH] [PUBLIC_GATE_REPORT_PATH]}"
 score_path="${2:-score.json}"
+public_gate_report_path="${3:-public-gate-report.json}"
 
 category="no_score"
 step_bucket="null"
@@ -92,10 +104,37 @@ if [[ -s "${score_path}" ]]; then
   fi
 fi
 
+# Public gate verdict. `passed` is coerced to boolean-or-null exactly like
+# the score fields above so a non-scalar value can never ride --argjson into
+# the uploaded artifact. It is surfaced unconditionally: together with the
+# category it distinguishes "failed at the public gate" from "passed the
+# public gate, failed later" without consulting hidden material.
+public_gate_passed="null"
+if [[ -s "${public_gate_report_path}" ]] \
+  && jq -e 'type == "object"' "${public_gate_report_path}" >/dev/null 2>&1; then
+  public_gate_passed="$(jq 'if (.passed | type) == "boolean" then .passed else null end' "${public_gate_report_path}")"
+  if [[ "${category}" == "no_score" && "${public_gate_passed}" == "false" ]]; then
+    # The gate report's error string can carry sandboxed-worker stderr (an
+    # exfiltration channel), so like the score error above it is matched
+    # ONLY against fixed prefixes the trusted harness itself authors and is
+    # never emitted. Anything unrecognized collapses to an opaque
+    # public-gate category.
+    gate_error_text="$(jq -r 'if (.error | type) == "string" then .error else "" end' "${public_gate_report_path}")"
+    if [[ "${gate_error_text}" == "runtime worker closed stdout before returning a response"* ]]; then
+      category="public_gate_worker_crash"
+    elif [[ "${gate_error_text}" == "teacher-forced token mismatch"* ]]; then
+      category="public_gate_token_mismatch"
+    else
+      category="public_gate_failed"
+    fi
+  fi
+fi
+
 jq -n \
   --arg category "${category}" \
   --arg mode "${MLXFAST_BENCHMARK_MODE:-unknown}" \
   --argjson step_bucket "${step_bucket}" \
+  --argjson public_gate_passed "${public_gate_passed}" \
   --argjson passed "${passed}" \
   --argjson passed_correctness "${passed_correctness}" \
   --argjson passed_decode_speedup_floor "${passed_decode_floor}" \
@@ -107,6 +146,7 @@ jq -n \
     failure_category: $category,
     mode: $mode,
     first_failing_step_bucket: $step_bucket,
+    public_gate_passed: $public_gate_passed,
     passed: $passed,
     passed_correctness: $passed_correctness,
     passed_decode_speedup_floor: $passed_decode_speedup_floor,
