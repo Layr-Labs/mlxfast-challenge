@@ -188,28 +188,47 @@ fi
 
 echo "download-r2-object: using signed HTTPS download"
 curl_rc=0
-curl \
-  --fail-with-body \
-  --silent \
-  --show-error \
-  --location \
-  --retry 5 \
-  --retry-all-errors \
-  --retry-delay 2 \
-  -H "Authorization: ${authorization}" \
-  -H "x-amz-content-sha256: ${payload_hash}" \
-  -H "x-amz-date: ${amz_date}" \
-  --output "${tmp_path}" \
-  "${url}" || curl_rc=$?
+http_status="$(
+  curl \
+    --fail-with-body \
+    --silent \
+    --show-error \
+    --location \
+    --retry 5 \
+    --retry-all-errors \
+    --retry-delay 2 \
+    --write-out '%{http_code}' \
+    -H "Authorization: ${authorization}" \
+    -H "x-amz-content-sha256: ${payload_hash}" \
+    -H "x-amz-date: ${amz_date}" \
+    --output "${tmp_path}" \
+    "${url}"
+)" || curl_rc=$?
 if [[ "${curl_rc}" -ne 0 ]]; then
   # --fail-with-body keeps --fail's retry/exit semantics but preserves the
-  # response body. A failed transfer's body is an R2/S3 error document
-  # (Code/Message XML), never object content, so a bounded prefix leaks no
-  # hidden material and turns an opaque HTTP status into a diagnosable
-  # cause (SignatureDoesNotMatch vs InvalidAccessKeyId vs NoSuchBucket vs
-  # NoSuchKey).
-  error_body="$(LC_ALL=C tr -d '[:cntrl:]' < "${tmp_path}" 2>/dev/null | head -c 400 || true)"
-  echo "download-r2-object: R2 request failed (curl exit ${curl_rc}); server error body: ${error_body:-<none captured>}" >&2
+  # response body for diagnostics. The body is only PROVABLY an R2/S3 error
+  # document (Code/Message XML: SignatureDoesNotMatch vs InvalidAccessKeyId
+  # vs NoSuchBucket vs NoSuchKey) when the final attempt's HTTP status is
+  # >= 400 (curl exit 22 under --fail-with-body). Any other failure -- above
+  # all a 200 whose transfer died mid-body (curl exit 18/56 through every
+  # retry) -- leaves a prefix of the OBJECT ITSELF in the temp file, and this
+  # script downloads raw hidden material (correctness golden, GPQA
+  # reference) whose bytes must never reach the run log. For those failures
+  # report status, exit code, and byte count only.
+  http_status_pattern='^[0-9]{3}$'
+  if [[ ! "${http_status}" =~ ${http_status_pattern} ]]; then
+    http_status="none"
+  fi
+  received_bytes=0
+  if [[ -f "${tmp_path}" ]]; then
+    received_bytes="$(wc -c < "${tmp_path}" | tr -d '[:space:]')"
+  fi
+  if [[ "${http_status}" != "none" ]] && (( 10#${http_status} >= 400 )); then
+    error_body="$(LC_ALL=C tr -d '[:cntrl:]' < "${tmp_path}" 2>/dev/null | head -c 400 || true)"
+    echo "download-r2-object: R2 request failed (curl exit ${curl_rc}, HTTP ${http_status}); server error body: ${error_body:-<none captured>}" >&2
+  else
+    echo "download-r2-object: R2 transfer failed (curl exit ${curl_rc}, HTTP ${http_status}, ${received_bytes} body byte(s) discarded); body withheld -- only an HTTP >= 400 response is provably a server error document rather than truncated object content" >&2
+  fi
   exit "${curl_rc}"
 fi
 

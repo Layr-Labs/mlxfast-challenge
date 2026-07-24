@@ -2204,6 +2204,169 @@ func submissionStaticReviewCapsFileSizeAndSurfaceGrowth() throws {
     #expect(badKnob.output.contains("MLXFAST_SUBMISSION_STATIC_REVIEW_MAX_GROWTH_BYTES must be a positive integer"))
 }
 
+// Behavioral pin for download-r2-object.sh's failure path: the script fetches
+// RAW hidden material (correctness golden, GPQA reference), so its error
+// diagnostics may print the response body ONLY when the final HTTP status
+// proves the body is a server error document (>= 400; curl exit 22 under
+// --fail-with-body). The dangerous case is a 200 whose transfer died mid-body
+// (curl exit 18/56 through every retry): the temp file then holds a prefix of
+// the OBJECT ITSELF, and printing a "bounded error body" would put hidden
+// golden bytes into the (public) Actions log. Simulated with a curl shim that
+// reproduces curl's observable contract: body lands in --output, the
+// --write-out '%{http_code}' code is emitted once on stdout even after
+// exhausted retries, and the exit code reports the failure class.
+@Test
+func downloadR2ObjectWithholdsBodyUnlessServerErrorStatus() throws {
+    let fm = FileManager.default
+    let scriptPath = URL(fileURLWithPath: fm.currentDirectoryPath)
+        .appendingPathComponent(".github/scripts/download-r2-object.sh").path
+
+    let root = fm.temporaryDirectory
+        .appendingPathComponent("r2-download-\(UUID().uuidString)")
+    try fm.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: root) }
+
+    func run(
+        _ argv: [String], env extra: [String: String] = [:]
+    ) throws -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = argv
+        process.currentDirectoryURL = root
+        var env = ProcessInfo.processInfo.environment
+        let strayKeys = env.keys.filter {
+            $0.hasPrefix("MLXFAST_") || $0.hasPrefix("ANTHROPIC_") || $0.hasPrefix("R2_")
+        }
+        for key in strayKeys { env.removeValue(forKey: key) }
+        env.merge(extra) { _, override in override }
+        process.environment = env
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    guard try run(["sh", "-c", "command -v bash"]).status == 0 else { return }
+
+    // The shim stands in for curl: writes CURL_SHIM_BODY to the --output
+    // target, prints CURL_SHIM_HTTP_CODE (the --write-out result) to stdout,
+    // exits CURL_SHIM_EXIT.
+    let shimDir = root.appendingPathComponent("bin").path
+    try fm.createDirectory(atPath: shimDir, withIntermediateDirectories: true)
+    let shim = """
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=""
+    prev=""
+    for arg in "$@"; do
+      if [[ "${prev}" == "--output" ]]; then out="${arg}"; fi
+      prev="${arg}"
+    done
+    if [[ -n "${out}" && -n "${CURL_SHIM_BODY:-}" ]]; then
+      printf '%s' "${CURL_SHIM_BODY}" > "${out}"
+    fi
+    printf '%s' "${CURL_SHIM_HTTP_CODE:-}"
+    exit "${CURL_SHIM_EXIT:-0}"
+    """
+    try shim.write(toFile: shimDir + "/curl", atomically: true, encoding: .utf8)
+    try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shimDir + "/curl")
+    let inheritedPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"
+
+    // Endpoint WITHOUT a bucket path: base_path is empty, so the aws-cli
+    // branch is skipped deterministically even on machines with aws
+    // installed and every run reaches the curl path under test.
+    let baseEnv: [String: String] = [
+        "R2_ACCESS_KEY_ID": "AKIDTESTKEY",
+        "R2_SECRET_ACCESS_KEY": "testsecret",
+        "R2_BUCKET_ENDPOINT": "https://r2.example.test",
+        "PATH": shimDir + ":" + inheritedPath,
+    ]
+
+    // 200-then-truncated (curl exit 18 after all retries): the temp file is
+    // a prefix of the hidden object; NOT ONE BYTE of it may print.
+    let hiddenObjectPrefix = "HIDDEN-GOLDEN-OBJECT-BYTES-3c1a9f-DO-NOT-LOG"
+    let truncatedOut = root.appendingPathComponent("truncated/golden.json").path
+    let truncated = try run(
+        ["bash", scriptPath, "correctness_prompts/x.json", truncatedOut],
+        env: baseEnv.merging([
+            "CURL_SHIM_BODY": hiddenObjectPrefix,
+            "CURL_SHIM_HTTP_CODE": "200",
+            "CURL_SHIM_EXIT": "18",
+        ]) { _, new in new })
+    #expect(truncated.status == 18)
+    #expect(!truncated.output.contains("HIDDEN-GOLDEN"))
+    #expect(!truncated.output.contains(hiddenObjectPrefix))
+    #expect(truncated.output.contains("HTTP 200"))
+    #expect(truncated.output.contains("body withheld"))
+    #expect(truncated.output.contains("\(hiddenObjectPrefix.utf8.count) body byte(s) discarded"))
+    // The partial object is also gone from disk (trap cleanup), so a later
+    // step cannot leak what this one withheld.
+    #expect(!fm.fileExists(atPath: truncatedOut))
+    #expect(!fm.fileExists(atPath: truncatedOut + ".tmp"))
+
+    // Provable server error (HTTP 403, curl exit 22): the R2 error document
+    // still prints, keeping signature/credential failures diagnosable.
+    let deniedOut = root.appendingPathComponent("denied/golden.json").path
+    let denied = try run(
+        ["bash", scriptPath, "correctness_prompts/x.json", deniedOut],
+        env: baseEnv.merging([
+            "CURL_SHIM_BODY": "<Error><Code>SignatureDoesNotMatch</Code></Error>",
+            "CURL_SHIM_HTTP_CODE": "403",
+            "CURL_SHIM_EXIT": "22",
+        ]) { _, new in new })
+    #expect(denied.status == 22)
+    #expect(denied.output.contains("SignatureDoesNotMatch"))
+    #expect(denied.output.contains("HTTP 403"))
+
+    // Connection-level failure (curl exit 7): no response at all, code 000;
+    // nothing to print and nothing printed.
+    let refusedOut = root.appendingPathComponent("refused/golden.json").path
+    let refused = try run(
+        ["bash", scriptPath, "correctness_prompts/x.json", refusedOut],
+        env: baseEnv.merging([
+            "CURL_SHIM_HTTP_CODE": "000",
+            "CURL_SHIM_EXIT": "7",
+        ]) { _, new in new })
+    #expect(refused.status == 7)
+    #expect(refused.output.contains("body withheld"))
+    #expect(refused.output.contains("HTTP 000"))
+    #expect(refused.output.contains("0 body byte(s) discarded"))
+
+    // The success path is untouched by the gate.
+    let okOut = root.appendingPathComponent("ok/golden.json").path
+    let ok = try run(
+        ["bash", scriptPath, "correctness_prompts/x.json", okOut],
+        env: baseEnv.merging([
+            "CURL_SHIM_BODY": "{\"ok\":true}",
+            "CURL_SHIM_HTTP_CODE": "200",
+            "CURL_SHIM_EXIT": "0",
+        ]) { _, new in new })
+    #expect(ok.status == 0)
+    #expect(ok.output.contains("wrote \(okOut)"))
+    #expect(try String(contentsOfFile: okOut, encoding: .utf8) == "{\"ok\":true}")
+
+    // Both R2 scripts carry the same status-gated pattern (upload responses
+    // are server-authored, but symmetry keeps the next copy-paste between
+    // them from reintroducing the download-side leak), and the old comment's
+    // false premise -- that a failed transfer's body is never object
+    // content -- is gone from both.
+    for scriptFile in ["download-r2-object.sh", "upload-r2-object.sh"] {
+        let script = try String(
+            contentsOfFile: ".github/scripts/" + scriptFile,
+            encoding: .utf8
+        )
+        #expect(script.contains("--write-out '%{http_code}'"), "\(scriptFile)")
+        #expect(script.contains("(( 10#${http_status} >= 400 ))"), "\(scriptFile)")
+        #expect(
+            !script.contains("A failed transfer's body is an R2/S3 error document"),
+            "\(scriptFile)"
+        )
+    }
+}
+
 // The kernel-bypass policy for the enlarged (vendored-kernel) editable
 // surface reaches the judge, and the deterministic byte budgets are enforced
 // twice: in the review script and again at participant-worker launch in the
