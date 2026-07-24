@@ -312,6 +312,56 @@ final class LagunaRuntimeAttention: Module {
 
         return wo(output)
     }
+
+    /// Prefill-only final-layer attention when the caller consumes just the
+    /// last hidden row. K/V and the cache update still cover every supplied
+    /// token. Q projection, Q normalization, and Q RoPE retain their stock
+    /// full-row geometry before selecting the last query, while SDPA and the
+    /// output gate/projection run only for that query.
+    func callLastPrefillRow(_ x: MLXArray, cache: KVCache?) -> MLXArray {
+        let (B, L) = (x.dim(0), x.dim(1))
+        precondition(L > 1)
+
+        var queries = wq(x)
+        var keys = wk(x)
+        var values = wv(x)
+
+        queries = qNorm(queries.reshaped(B, L, nHeads, headDim)).transposed(0, 2, 1, 3)
+        keys = kNorm(keys.reshaped(B, L, nKVHeads, headDim)).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
+
+        queries = applyRotaryPosition(rope, to: queries, cache: cache)
+        keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        queries = queries[.ellipsis, (L - 1)..<L, 0...]
+
+        var output = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: cache,
+            scale: scale,
+            mask: .causal
+        )
+        .transposed(0, 2, 1, 3)
+        .reshaped(B, 1, -1)
+
+        if gatingEnabled, let gProj {
+            let projectedGate = gProj(lagunaLastTokenHidden(x))
+            let gate =
+                gatePerHead && projectedGate.dtype == output.dtype
+                ? lagunaCompiledSoftplusGate(projectedGate)
+                : softplus(projectedGate.asType(.float32)).asType(output.dtype)
+            if gatePerHead {
+                output =
+                    (output.reshaped(B, 1, nHeads, headDim) * gate[.ellipsis, .newAxis])
+                    .reshaped(B, 1, -1)
+            } else {
+                output = output * gate
+            }
+        }
+
+        return wo(output)
+    }
 }
 
 // MARK: - Dense MLP (also used as the shared expert)
@@ -612,6 +662,17 @@ final class LagunaRuntimeDecoderLayer: Module {
         let r2 = mlp(postAttentionLayerNorm(h))
         return h + r2
     }
+
+    /// Final-layer prefill specialization. Every supplied row still produces
+    /// and commits its K/V state, but only the last query/output row proceeds
+    /// through attention output projection and the terminal MLP.
+    func callLastPrefillRow(_ x: MLXArray, cache: KVCache?) -> MLXArray {
+        let normalized = inputLayerNorm(x)
+        let r = selfAttn.callLastPrefillRow(normalized, cache: cache)
+        let h = lagunaLastTokenHidden(x) + r
+        let r2 = mlp(postAttentionLayerNorm(h))
+        return h + r2
+    }
 }
 
 // MARK: - Model
@@ -660,7 +721,15 @@ final class LagunaRuntimeModelInner: Module {
 
         for (i, layer) in layers.enumerated() {
             let mask = layerTypes[i] == .full ? fullMask : slidingMask
-            h = layer(h, mask: mask, cache: cache?[i])
+            if i == layers.count - 1, h.dim(1) > 1 {
+                if case .causal = mask {
+                    h = layer.callLastPrefillRow(h, cache: cache?[i])
+                } else {
+                    h = layer(h, mask: mask, cache: cache?[i])
+                }
+            } else {
+                h = layer(h, mask: mask, cache: cache?[i])
+            }
         }
 
         return h
