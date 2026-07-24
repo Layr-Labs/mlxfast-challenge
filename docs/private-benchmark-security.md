@@ -287,12 +287,24 @@ checked-out branch directly.
 
 On `submissions/*` branches the workflow additionally:
 
-- runs the static cheat review over the editable files the submission
-  changed versus its merge-base with `main`
-  (`run-submission-static-review.sh`; unchanged editable files are
-  byte-identical to trusted `main` content and are not sent to the judge),
-- enforces the modifiable surface against `main`
-  (`enforce-modifiable-surface.sh`),
+- enforces the modifiable surface as a content rule against the current
+  trusted `main` tip (`enforce-modifiable-surface.sh` diffs the candidate
+  tree directly against `main`'s tree): every path where the candidate
+  differs from current trusted `main` must be inside `editablePaths`, and
+  each offending path is named on failure. The candidate commit is NOT
+  required to be an ancestor-descendant of the current tip — trusted `main`
+  moving within `editablePaths` after a candidate was created (a mid-flight
+  promotion) does not invalidate the queued candidate, matching Yukon's own
+  promotion-time rebase rule. Ancestry would constrain no executed byte
+  anyway: the bench workspace is always trusted `main` content plus the
+  validated editable-path overlay, and the workflow file is non-editable, so
+  the content rule already forces the dispatched `benchmark.yml` to match
+  current trusted `main` whenever a run proceeds,
+- runs the static cheat review over the editable files that differ versus
+  the current trusted `main` tip — the same base as the surface check, so
+  the reviewed diff is exactly the effective delta the overlay executes
+  (`run-submission-static-review.sh`; editable files byte-identical to
+  trusted `main` content are not sent to the judge),
 - suppresses submitted correctness/benchmark process logs, and
 - uploads artifacts only after validation succeeds.
 

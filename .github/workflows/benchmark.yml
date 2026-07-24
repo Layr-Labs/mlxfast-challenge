@@ -368,16 +368,36 @@ jobs:
             echo "::error::submitted checkout cannot resolve trusted main commit ${TRUSTED_MAIN_SHA}" >&2
             exit 1
           fi
-          base_sha="$("${hardened_git}" -C .mlxfast-submission-src merge-base "${TRUSTED_MAIN_SHA}" "${actual_sha}")"
-          if [[ "${base_sha}" != "${TRUSTED_MAIN_SHA}" ]]; then
-            echo "::error::submission must be based on current trusted main ${TRUSTED_MAIN_SHA}; merge-base is ${base_sha}" >&2
+          # CONTENT RULE, not an ancestry rule: diff the candidate TREE against
+          # the CURRENT trusted main tip and require every differing path to be
+          # inside editablePaths (enforce-modifiable-surface.sh compares the two
+          # trees directly, reads the allowlist from trusted main's
+          # benchmark.json, and names each offending path). This step used to
+          # additionally require the candidate to DESCEND from the current tip
+          # (a git ancestor equality on the two commits); that pin is
+          # deliberately gone. Ancestry constrained no executed byte: the bench
+          # workspace is built from the trusted 'main' checkout plus the
+          # validated editable-path overlay below (the candidate's full checkout
+          # is removed right after), verify-trusted-source-scope.sh re-verifies
+          # the trusted-build sources byte-for-byte against trusted git before
+          # anything compiles, and the workflow definition itself is
+          # non-editable, so this same tree rule already forces the candidate's
+          # .github -- including the dispatched benchmark.yml -- to be
+          # byte-identical to current trusted main whenever the run proceeds.
+          # All the descent pin did in practice was fail innocent queued
+          # candidates created before an editablePaths-only promotion moved
+          # main mid-flight; Yukon explicitly supports that movement (it
+          # rebases candidates at promotion when the intervening changes are
+          # editable-only), and this step now accepts exactly the same set.
+          base_sha="${TRUSTED_MAIN_SHA}"
+          if ! (
+            cd .mlxfast-submission-src \
+              && BASE_SHA="${base_sha}" HEAD_SHA="${actual_sha}" \
+                "${GITHUB_WORKSPACE}/.github/scripts/enforce-modifiable-surface.sh"
+          ); then
+            echo "::error::candidate ${actual_sha} differs from current trusted main ${TRUSTED_MAIN_SHA} outside editablePaths (offending paths above): either the submission modified non-editable files, or trusted main moved a non-editable file after the candidate was created -- re-sync with current main and resubmit" >&2
             exit 1
           fi
-          (
-            cd .mlxfast-submission-src
-            BASE_SHA="${base_sha}" HEAD_SHA="${actual_sha}" \
-              "${GITHUB_WORKSPACE}/.github/scripts/enforce-modifiable-surface.sh"
-          )
           # Keep the candidate commit object in the trusted repository for
           # provenance only. No candidate tree is checked out here.
           if ! "${hardened_git}" cat-file -e "${actual_sha}^{commit}"; then
