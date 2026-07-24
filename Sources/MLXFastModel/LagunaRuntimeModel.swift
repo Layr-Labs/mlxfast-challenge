@@ -20,12 +20,11 @@ import MLXNN
 //    and exact-verification waves) could not reach the internals through a
 //    plain wrapper.
 //
-// All math is expressed with standard MLX ops and the vendored shared
-// primitives (`attentionWithCacheUpdate`, `initializeRope`,
-// `applyRotaryPosition`, `SwitchGLU`, `weightedExpertSum`, `RMSNorm`,
-// `createAttentionMask`). No custom Metal kernels in this increment; the
-// fused fast-engine and exact-pair/exact-four style optimizations are a
-// later layer on top of this reference target.
+// Math is expressed with standard MLX ops and the vendored shared primitives
+// (`attentionWithCacheUpdate`, `initializeRope`, `applyRotaryPosition`,
+// `SwitchGLU`, `weightedExpertSum`, `RMSNorm`, `createAttentionMask`), except
+// for narrow fixed-geometry kernels whose stock operation boundaries have
+// been proven bit-exact before integration.
 
 func lagunaLastTokenRange(sequenceLength: Int) -> Range<Int>? {
     sequenceLength > 1 ? (sequenceLength - 1)..<sequenceLength : nil
@@ -427,6 +426,57 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
 
 // MARK: - MoE
 
+/// Laguna's pinned router emits eight choices from 256 FP32 scores. Consume
+/// the full contiguous arg-partition result so the sliced indices remain a
+/// zero-copy view for the expert path, while one dispatch replaces
+/// takeAlong + reduction + broadcast division.
+private let lagunaNormalizeSelectedRouterScoresKernel = MLX.MLXFast.metalKernel(
+    name: "laguna_normalize_selected_router_scores",
+    inputNames: ["scores", "partitioned_indices"],
+    outputNames: ["weights"],
+    source: """
+        uint row = thread_position_in_grid.x;
+        if (row >= uint(NROWS)) {
+            return;
+        }
+        uint score_base = row * uint(NEXPERTS);
+        uint index_base = row * uint(NEXPERTS);
+        float selected[8];
+        float total = 0.0f;
+        for (uint k = 0; k < 8; ++k) {
+            uint expert = uint(partitioned_indices[index_base + k]);
+            selected[k] = scores[score_base + expert];
+            total += selected[k];
+        }
+        uint output_base = row * 8;
+        for (uint k = 0; k < 8; ++k) {
+            weights[output_base + k] = selected[k] / total;
+        }
+        """
+)
+
+private func lagunaNormalizeSelectedRouterScores(
+    scores: MLXArray, partitionedIndices: MLXArray
+) -> MLXArray {
+    precondition(scores.dtype == .float32)
+    precondition(scores.dim(-1) == 256)
+    precondition(partitionedIndices.shape == scores.shape)
+    let rows = scores.size / 256
+    var outputShape = scores.shape
+    outputShape[outputShape.count - 1] = 8
+    return lagunaNormalizeSelectedRouterScoresKernel(
+        [scores, partitionedIndices],
+        template: [
+            ("NROWS", rows),
+            ("NEXPERTS", 256),
+        ],
+        grid: (rows, 1, 1),
+        threadGroup: (min(rows, 256), 1, 1),
+        outputShapes: [outputShape],
+        outputDTypes: [.float32]
+    )[0]
+}
+
 /// Sigmoid top-k router. The routing math mirrors the vendored
 /// `LagunaMoEGate` exactly (sigmoid scores, correction bias added only for
 /// expert CHOICE, mixture weights taken from the pre-bias scores, optional
@@ -456,10 +506,20 @@ final class LagunaRuntimeMoEGate: Module {
         let scores = sigmoid(logits)
         let scoresForChoice = scores + eScoreCorrectionBias.asType(scores.dtype)
 
-        let inds = argPartition(-scoresForChoice, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
-        var weights = takeAlong(scores, inds, axis: -1)
-        if normTopkProb {
-            weights = weights / weights.sum(axis: -1, keepDims: true)
+        let partitioned = argPartition(-scoresForChoice, kth: topK - 1, axis: -1)
+        let inds = partitioned[.ellipsis, ..<topK]
+        let weights: MLXArray
+        if normTopkProb, topK == 8, scores.dtype == .float32, scores.dim(-1) == 256 {
+            weights = lagunaNormalizeSelectedRouterScores(
+                scores: scores,
+                partitionedIndices: partitioned
+            )
+        } else {
+            let selected = takeAlong(scores, inds, axis: -1)
+            weights =
+                normTopkProb
+                ? selected / selected.sum(axis: -1, keepDims: true)
+                : selected
         }
         return (inds, weights)
     }
