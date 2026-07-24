@@ -102,6 +102,20 @@ the `MLXLMCommon` files it uses directly (MoE/attention dispatch helpers,
 KV caches, RoPE utilities and application, compiled decode, evaluation
 plumbing; the exact file list is in `benchmark.json`).
 
+Know which of those vendored files the scored path actually executes.
+`Laguna.swift` is a reference implementation, not the scored forward pass:
+the benchmark runs the runtime port in
+`Sources/MLXFastModel/LagunaRuntimeModel.swift`, and the vendored model is
+kept as the behavior oracle for the gated upstream-equivalence cross-check
+(`Sources/MLXFastModel/LagunaUpstreamEquivalence.swift`), so edits to
+`Laguna.swift` do not change scored timings unless your runtime calls into
+it. The vendored `MLXLMCommon` helpers ARE executed by the runtime —
+`SwitchLayers.swift` (MoE expert gather/dispatch), `AttentionUtils.swift`
+(attention-with-cache-update dispatch), `KVCache.swift` (standard and
+rotating caches), `RoPEUtils.swift` / `RoPEApplication.swift`, and
+`CompiledDecode.swift` with its compilable cache variants — as are the
+vendored `Vendor/mlx-swift` kernels described below.
+
 The vendored kernel surface is the kernel families the Laguna forward pass
 actually dispatches — SDPA (`scaled_dot_product_attention.metal`,
 `sdpa_vector.h`, and `steel/attn/` with its `steel_attention*.cpp` twins:
