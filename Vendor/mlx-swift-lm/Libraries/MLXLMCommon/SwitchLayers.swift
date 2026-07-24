@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXFast
 import MLXNN
 
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
@@ -95,7 +96,14 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
     let m = indices.dim(-1)
     let indices = indices.flattened()
     let order = argSort(indices)
-    let inverseOrder = argSort(order)
+    // `order` is a permutation, so invert it directly instead of sorting a
+    // second time.  This preserves exactly the same gather order while
+    // replacing an O(n log n) prefill sort with one indexed scatter.
+    let inverseOrder = putAlong(
+        zeros(like: order),
+        order,
+        values: MLXArray(Int32(0) ..< Int32(order.size))
+    )
 
     return (
         x.flattened(start: 0, end: -3)[order.floorDivide(m)],
@@ -110,6 +118,126 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
         x = unflatten(x, axis: 0, shape: shape)
     }
     return x
+}
+
+/// Fuses the sorted-to-original gather, router-weight multiply, and top-k
+/// reduction used after a sorted MoE projection. Keeping the expert output in
+/// sorted order avoids materializing the full `[tokens, topK, hidden]`
+/// unsorted tensor before reducing it.
+private let fusedUnsortWeightedSumKernel = MLXFast.metalKernel(
+    name: "mlx_lm_fused_unsort_weighted_sum",
+    inputNames: ["sorted", "inverse", "weights"],
+    outputNames: ["out"],
+    source: """
+        uint elem = thread_position_in_grid.x;
+        if (elem >= uint(NROWS * WIDTH)) {
+            return;
+        }
+        uint row = elem / uint(WIDTH);
+        uint column = elem - row * uint(WIDTH);
+        T total = T(0.0f);
+        for (uint k = 0; k < uint(TOPK); ++k) {
+            uint original = row * uint(TOPK) + k;
+            uint sorted_row = uint(inverse[original]);
+            // Keep the product and each addition rounded separately. This
+            // matches the BF16 multiply followed by MLX's ordered reduction;
+            // allowing contraction here changes near-tie model logits.
+            T product = T(sorted[sorted_row * uint(WIDTH) + column] * weights[original]);
+            total = T(product + total);
+        }
+        out[elem] = total;
+        """
+)
+
+/// Sorted MoE combine with the common post-reduction scale and residual add
+/// folded into the same dispatch. Product, accumulation, scaling, and residual
+/// addition are each explicitly rounded to `T` in the same order as the
+/// separate MLX expression.
+private let fusedUnsortWeightedSumAndAddKernel = MLXFast.metalKernel(
+    name: "mlx_lm_fused_unsort_weighted_sum_and_add",
+    inputNames: ["sorted", "inverse", "weights", "residual", "scale"],
+    outputNames: ["out"],
+    source: """
+        uint elem = thread_position_in_grid.x;
+        if (elem >= uint(NROWS * WIDTH)) {
+            return;
+        }
+        uint row = elem / uint(WIDTH);
+        uint column = elem - row * uint(WIDTH);
+        T total = T(0.0f);
+        for (uint k = 0; k < uint(TOPK); ++k) {
+            uint original = row * uint(TOPK) + k;
+            uint sorted_row = uint(inverse[original]);
+            T product = T(sorted[sorted_row * uint(WIDTH) + column] * weights[original]);
+            total = T(product + total);
+        }
+        T routed = T(total * T(scale));
+        out[elem] = T(routed + residual[elem]);
+        """
+)
+
+/// Combine sorted MoE expert rows directly into their original token rows.
+///
+/// `sorted` contains one row per routed token/expert pair in expert-sorted
+/// order, while `inverseOrder` maps original flattened route positions back to
+/// those rows. `weights` has shape `[..., tokens, topK]`.
+public func fusedUnsortWeightedSum(
+    sorted: MLXArray, inverseOrder: MLXArray, weights: MLXArray
+) -> MLXArray {
+    let topK = weights.dim(-1)
+    let width = sorted.dim(-1)
+    let rows = weights.size / topK
+    var outputShape = Array(weights.shape.dropLast())
+    outputShape.append(width)
+
+    return fusedUnsortWeightedSumKernel(
+        [sorted, inverseOrder, weights],
+        template: [
+            ("T", sorted.dtype),
+            ("TOPK", topK),
+            ("WIDTH", width),
+            ("NROWS", rows),
+        ],
+        grid: (rows * width, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [outputShape],
+        outputDTypes: [sorted.dtype]
+    )[0]
+}
+
+/// Combine sorted expert rows, scale the routed result, and add a residual in
+/// one dispatch. `residual` must have the token-row shape produced by removing
+/// the final top-k dimension from `weights` and appending `sorted.dim(-1)`.
+public func fusedUnsortWeightedSumAndAdd(
+    sorted: MLXArray,
+    inverseOrder: MLXArray,
+    weights: MLXArray,
+    scale: Float,
+    residual: MLXArray
+) -> MLXArray {
+    let topK = weights.dim(-1)
+    let width = sorted.dim(-1)
+    let rows = weights.size / topK
+    var outputShape = Array(weights.shape.dropLast())
+    outputShape.append(width)
+    precondition(
+        residual.shape == outputShape,
+        "fused MoE residual shape \(residual.shape) does not match \(outputShape)"
+    )
+
+    return fusedUnsortWeightedSumAndAddKernel(
+        [sorted, inverseOrder, weights, residual, scale],
+        template: [
+            ("T", sorted.dtype),
+            ("TOPK", topK),
+            ("WIDTH", width),
+            ("NROWS", rows),
+        ],
+        grid: (rows * width, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [outputShape],
+        outputDTypes: [sorted.dtype]
+    )[0]
 }
 
 // MARK: - SwitchGLU
@@ -226,12 +354,34 @@ public class SwitchGLU: Module {
             (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
         }
 
+        x = project(x, idx, sortedIndices: doSort)
+
+        if doSort {
+            x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)
+        }
+
+        return MLX.squeezed(x, axis: -2)
+    }
+
+    /// Run the expert projections in expert-sorted order and return the
+    /// permutation needed to address rows in original route order. This is the
+    /// prefill companion to ``fusedUnsortWeightedSum(sorted:inverseOrder:weights:)``.
+    public func callSorted(_ x: MLXArray, _ indices: MLXArray) -> (MLXArray, MLXArray) {
+        precondition(indices.size >= 64, "callSorted requires the sorted MoE path")
+        let expanded = MLX.expandedDimensions(x, axes: [-2, -3])
+        let (sortedX, sortedIndices, inverseOrder) = gatherSort(x: expanded, indices: indices)
+        return (project(sortedX, sortedIndices, sortedIndices: true), inverseOrder)
+    }
+
+    private func project(
+        _ x: MLXArray, _ idx: MLXArray, sortedIndices: Bool
+    ) -> MLXArray {
         let xGate: MLXArray
         let xUp: MLXArray
         if let gateUpProj {
             // Pre-fused gate_up_proj weight from checkpoint — one gathered
             // matmul via the polymorphic SwitchLinear call, then split.
-            let xGateUp = gateUpProj(x, idx, sortedIndices: doSort)
+            let xGateUp = gateUpProj(x, idx, sortedIndices: sortedIndices)
             xGate = xGateUp[.ellipsis, ..<hiddenDims]
             xUp = xGateUp[.ellipsis, hiddenDims...]
         } else {
@@ -239,8 +389,8 @@ public class SwitchGLU: Module {
             guard let gateProj, let upProj else {
                 fatalError("SwitchGLU requires either gate_up_proj or gate_proj/up_proj")
             }
-            xUp = upProj(x, idx, sortedIndices: doSort)
-            xGate = gateProj(x, idx, sortedIndices: doSort)
+            xUp = upProj(x, idx, sortedIndices: sortedIndices)
+            xGate = gateProj(x, idx, sortedIndices: sortedIndices)
         }
 
         let activated: MLXArray
@@ -254,13 +404,7 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
-        x = downProj(activated, idx, sortedIndices: doSort)
-
-        if doSort {
-            x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)
-        }
-
-        return MLX.squeezed(x, axis: -2)
+        return downProj(activated, idx, sortedIndices: sortedIndices)
     }
 }
 
