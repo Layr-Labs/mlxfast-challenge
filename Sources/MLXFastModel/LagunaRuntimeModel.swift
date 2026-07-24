@@ -82,6 +82,12 @@ let lagunaFusedQKVEnabled =
 let lagunaFusedSharedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_GATE_UP"] != "0"
 
+/// `DARKBLOOM_FUSED_DENSE_GATE_UP` (default on; set "0" to disable): retain
+/// one row-concatenated BF16 `[gate; up]` weight for the dense layer-0 MLP and
+/// use it only for single-token decode. Multi-token prefill remains stock.
+let lagunaFusedDenseGateUpEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_DENSE_GATE_UP"] != "0"
+
 /// `DARKBLOOM_FUSED_ROUTED_GATE_UP` (default on; set "0" to disable): after
 /// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
 /// sparse layer's routed experts and serve single-token decode's gate/up from
@@ -321,16 +327,15 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
 
-    /// Retained fused NVFP4 `[gate; up]` layout (gate output rows first),
-    /// built once after checkpoint load for the shared expert when
-    /// `DARKBLOOM_FUSED_SHARED_GATE_UP` is enabled. Plain stored properties
-    /// with a leading underscore so Module reflection never treats the
-    /// derived layout as checkpoint parameters; the quantized gate/up
-    /// modules keep the original arrays for parameter integrity. Never set
-    /// on the dense (BF16) layer-0 MLP.
+    /// Retained fused `[gate; up]` layouts (gate output rows first), built
+    /// once after checkpoint load. Plain stored properties with leading
+    /// underscores keep the derived arrays out of Module reflection and the
+    /// checkpoint parameter tree.
     var _fusedGateUpWeight: MLXArray?
     var _fusedGateUpScales: MLXArray?
     var _fusedGateUpSplit: Int = 0
+    var _fusedDenseGateUpWeight: MLXArray?
+    var _fusedDenseGateUpSplit: Int = 0
 
     init(dimensions: Int, hiddenDimensions: Int) {
         self._gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
@@ -374,7 +379,35 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
         return [fusedWeight, fusedScales]
     }
 
+    /// Builds the dense layer-0 BF16 `[gate; up]` projection. The exact type
+    /// checks exclude quantized shared experts; matching bias-free row-major
+    /// Linear weights make every output row independent of the shared
+    /// dispatch boundary.
+    func prepareFusedDenseGateUp() -> MLXArray? {
+        guard _fusedDenseGateUpWeight == nil,
+            type(of: gateProj) == Linear.self,
+            type(of: upProj) == Linear.self,
+            gateProj.bias == nil, upProj.bias == nil,
+            gateProj.weight.ndim == 2, upProj.weight.ndim == 2,
+            gateProj.weight.dtype == .bfloat16,
+            upProj.weight.dtype == gateProj.weight.dtype,
+            gateProj.weight.shape == upProj.weight.shape
+        else {
+            return nil
+        }
+        let fusedWeight = concatenated([gateProj.weight, upProj.weight], axis: 0)
+        _fusedDenseGateUpWeight = fusedWeight
+        _fusedDenseGateUpSplit = gateProj.weight.dim(0)
+        return fusedWeight
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if x.dim(1) == 1, let fusedWeight = _fusedDenseGateUpWeight {
+            let gateUp = matmul(x, fusedWeight.T)
+            let gate = gateUp[.ellipsis, 0 ..< _fusedDenseGateUpSplit]
+            let up = gateUp[.ellipsis, _fusedDenseGateUpSplit...]
+            return downProj(compiledSiluProduct(gate, up))
+        }
         if x.dim(1) == 1,
             let fusedWeight = _fusedGateUpWeight, let fusedScales = _fusedGateUpScales
         {
@@ -616,9 +649,9 @@ final class LagunaRuntimeDecoderLayer: Module {
 
 // MARK: - Model
 
-/// The Laguna text tower: unscaled embedding, 40 decoder layers, final
-/// RMSNorm.
-/// Returns post-norm hidden states for every input position.
+/// The Laguna text tower: unscaled embedding and 40 decoder layers. The final
+/// RMSNorm remains a child of this module for checkpoint compatibility, but
+/// the scored wrapper applies it after selecting the only consumed row.
 final class LagunaRuntimeModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     @ModuleInfo(key: "layers") var layers: [LagunaRuntimeDecoderLayer]
@@ -663,7 +696,7 @@ final class LagunaRuntimeModelInner: Module {
             h = layer(h, mask: mask, cache: cache?[i])
         }
 
-        return norm(h)
+        return h
     }
 }
 
@@ -711,9 +744,10 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let fullHidden = model(inputs, cache: cache)
         // Every consumer of multi-token logits reads only the LAST
-        // position's row; slicing before the head removes a
-        // [length-1, vocab]-sized slab of dead work from every prefill.
-        let hidden = lagunaLastTokenHidden(fullHidden)
+        // position's row. Slice before the row-independent final RMSNorm and
+        // vocabulary head so prefill neither normalizes nor projects the
+        // preceding rows. For single-token decode the slice is a no-op.
+        let hidden = model.norm(lagunaLastTokenHidden(fullHidden))
         if let lmHead {
             return lmHead(hidden)
         }
@@ -759,6 +793,11 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                 if lagunaFusedRoutedGateUpEnabled {
                     fusedArrays.append(contentsOf: sparse.prepareFusedRoutedGateUp())
                 }
+            } else if lagunaFusedDenseGateUpEnabled,
+                let dense = layer.mlp as? LagunaRuntimeMLP,
+                let fused = dense.prepareFusedDenseGateUp()
+            {
+                fusedArrays.append(fused)
             }
         }
         if !fusedArrays.isEmpty {
