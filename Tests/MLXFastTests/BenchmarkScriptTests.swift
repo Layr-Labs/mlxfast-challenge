@@ -500,6 +500,13 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(stageWorkerBuildProductsStep.contains("/usr/bin/rsync -a \\"))
     #expect(stageWorkerBuildProductsStep.contains("--exclude='ModuleCache'"))
     #expect(stageWorkerBuildProductsStep.contains("--exclude='clang-module-cache'"))
+    // The metallib CMake build tree must never enter the worker cache: a
+    // restored tree comes back runner-owned, and the bench uid (no
+    // writesecurity in its ACL grant) cannot chmod runner-owned files, so
+    // cmake configure_file EPERMs on the next kernel-touching metallib
+    // rebuild (run 30048514684). The anchored pattern also keeps the
+    // builder's mlx-metal.mlxfast-build.* lock artifacts out of the cache.
+    #expect(stageWorkerBuildProductsStep.contains("--exclude='/mlx-metal*'"))
     #expect(stageWorkerBuildProductsStep.contains("\"${MLXFAST_JOB_WS}/.build-worker/\" .mlxfast-cache/worker-build/"))
     #expect(stageWorkerBuildProductsStep.contains("test -d .mlxfast-cache/worker-build/release"))
     let saveWorkerBuildProductsStep = String(workflow[saveWorkerBuildProductsRange.lowerBound..<transformRange.lowerBound])
