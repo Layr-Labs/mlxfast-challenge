@@ -1237,19 +1237,19 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
 /// scores, corrected choice scores, their negation, a full 256-entry argsort,
 /// and a gather before retaining just eight entries. This fixed-shape kernel
 /// computes the same FP32 sigmoid values and stable choice order, then emits
-/// only the selected indices and their *uncorrected* scores. Normalization
-/// deliberately remains on the stock MLX reduction below so its accumulation
-/// order and rounding are unchanged.
+/// only the selected indices and normalized uncorrected weights. Its lane-zero
+/// sum follows MLX's length-eight `row_reduce_small` order exactly.
 private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_v2",
+    name: "laguna_decode_router_top8_normalized_v3",
     inputNames: ["logits", "correction_bias"],
-    outputNames: ["router_indices", "router_scores"],
+    outputNames: ["router_indices", "router_weights"],
     source: """
         uint lane = thread_position_in_threadgroup.x;
 
         threadgroup float scores[256];
         threadgroup float choice_keys[256];
         threadgroup uint expert_indices[256];
+        threadgroup float normalization_sum[1];
 
         float x = float(logits[lane]);
         float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
@@ -1294,9 +1294,18 @@ private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
             }
         }
 
+        if (lane == 0) {
+            float total = 0.0f;
+            for (uint slot = 0; slot < 8; ++slot) {
+                total = scores[slot] + total;
+            }
+            normalization_sum[0] = total;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         if (lane < 8) {
             router_indices[lane] = expert_indices[lane];
-            router_scores[lane] = scores[lane];
+            router_weights[lane] = scores[lane] / normalization_sum[0];
         }
         """,
     header: """
@@ -1322,7 +1331,7 @@ private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-private func lagunaDecodeRouterTop8(
+private func lagunaDecodeRouterTop8Normalized(
     logits: MLXArray, correctionBias: MLXArray
 ) -> (MLXArray, MLXArray) {
     precondition(logits.dtype == .float32)
@@ -1372,24 +1381,23 @@ final class LagunaRuntimeMoEGate: Module {
             logits = tanh(logits / routerLogitSoftcapping) * routerLogitSoftcapping
         }
 
-        let inds: MLXArray
-        var weights: MLXArray
         if lagunaDecodeRouterTop8Enabled,
+            normTopkProb,
             logits.size == 256, topK == 8,
             eScoreCorrectionBias.size == 256
         {
-            (inds, weights) = lagunaDecodeRouterTop8(
+            return lagunaDecodeRouterTop8Normalized(
                 logits: logits,
                 correctionBias: eScoreCorrectionBias.asType(.float32)
             )
-        } else {
-            let scores = sigmoid(logits)
-            let scoresForChoice = scores + eScoreCorrectionBias.asType(scores.dtype)
-            inds =
-                argPartition(-scoresForChoice, kth: topK - 1, axis: -1)[
-                    .ellipsis, ..<topK]
-            weights = takeAlong(scores, inds, axis: -1)
         }
+
+        let scores = sigmoid(logits)
+        let scoresForChoice = scores + eScoreCorrectionBias.asType(scores.dtype)
+        let inds =
+            argPartition(-scoresForChoice, kth: topK - 1, axis: -1)[
+                .ellipsis, ..<topK]
+        var weights = takeAlong(scores, inds, axis: -1)
         if normTopkProb {
             weights = weights / weights.sum(axis: -1, keepDims: true)
         }
