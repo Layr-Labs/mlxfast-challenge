@@ -1113,6 +1113,17 @@ void gemv_axbpy(
 
   } else {
     bm = out_vector_len >= 4096 ? 8 : 4;
+    // Laguna's BF16 decode attention output projections have 2,048 output
+    // rows and either 6,144 (full attention) or 8,192 (sliding attention)
+    // input columns.  Pack 16 independent output-row SIMD groups into each
+    // threadgroup for these exact shapes.  This leaves every output row's
+    // K-loop and shuffle reduction unchanged while quartering dispatch groups
+    // relative to the generic BM=4 schedule.
+    if (out.dtype() == bfloat16 &&
+        (in_vector_len == 8192 || in_vector_len == 6144) &&
+        out_vector_len == 2048 && batch_size_out == 1) {
+      bm = 16;
+    }
     sn = 32;
 
     if (K <= 64) {
