@@ -69,7 +69,11 @@ compiled decode is disabled, the MLX
 allocator cache is capped at 6 GiB, and free warmup buffers are cleared before
 the worker protocol starts. The profile prints a one-line stderr notice when
 it engages and only fills in feature flags you have not set yourself —
-explicitly exported `DARKBLOOM_*`/`MLXFAST_*`/`MLX_*` values always win. Set
+explicitly exported `DARKBLOOM_*`/`MLXFAST_*`/`MLX_*` values always win.
+Local `./benchmark.sh --local-iterate`/`--local-submit` runs whose profile
+downgraded ranked-path flags this way also end with a ranked-parity warning
+in the final summary listing exactly which flags were disabled and how to
+opt in. Set
 `DARKBLOOM_STARTUP_MEMORY_PROFILE=full|low|auto` to override the automatic
 selection. Note the low profile does not exercise compiled decode locally,
 so verify decode-path-sensitive changes on a 64 GiB+ machine or

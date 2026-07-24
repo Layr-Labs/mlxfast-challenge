@@ -61,6 +61,51 @@ func lowMemoryOverridesNameOnlyFlagsReadByModelSources() throws {
     }
 }
 
+// benchmark.sh's end-of-run ranked-parity warning re-derives this policy's
+// decision from the same inputs (physical memory, the profile override,
+// per-flag environment presence), so the flag list, full-profile threshold,
+// override name, and no-overwrite check it embeds must track this policy
+// exactly. A policy change that leaves the shell mirror behind fails here.
+@Test
+func benchmarkScriptParityWarningMirrorsLowMemoryPolicy() throws {
+    let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    let policy = RuntimeStartupMemoryPolicy.resolve(
+        physicalMemoryBytes: UInt64(36) << 30
+    )
+
+    // The shell flag array enumerates exactly the low-memory feature-disable
+    // overrides -- no missing flag, no stale extra.
+    let flagsLine = try #require(
+        script.split(separator: "\n").first {
+            $0.hasPrefix("readonly LOW_MEMORY_PROFILE_DISABLED_FLAGS=(")
+        }
+    )
+    let openParenthesis = try #require(flagsLine.firstIndex(of: "("))
+    let closeParenthesis = try #require(flagsLine.lastIndex(of: ")"))
+    let shellFlags = Set(
+        flagsLine[flagsLine.index(after: openParenthesis)..<closeParenthesis]
+            .split(separator: " ")
+            .map(String.init)
+    )
+    #expect(shellFlags == Set(policy.environmentOverrides.keys))
+    #expect(policy.environmentOverrides.values.allSatisfy { $0 == "0" })
+
+    // The shell threshold mirrors the policy's full-profile minimum, and the
+    // profile override is read under the policy's worker-reachable name.
+    let minimumGiB = RuntimeStartupMemoryPolicy.fullProfileMinimumPhysicalMemoryBytes >> 30
+    #expect(script.contains(
+        "readonly LOW_MEMORY_PROFILE_FULL_MIN_BYTES=$((\(minimumGiB) << 30))"
+    ))
+    #expect(script.contains(
+        "${\(RuntimeStartupMemoryPolicy.profileOverrideEnvironmentName):-}"
+    ))
+
+    // The shell mirrors the policy's no-overwrite semantics with a per-flag
+    // set/unset check (printenv treats set-but-empty as set, like getenv), so
+    // explicitly exported flags are never warned about.
+    #expect(script.contains("if ! printenv \"${flag}\" >/dev/null 2>&1; then"))
+}
+
 // The documented low-memory startup profile (<64 GiB machines: 6 GiB MLX
 // allocator cap, feature-disable env defaults, warmup-buffer clear before
 // the protocol hello) applies to the LAGUNA runtime worker. The Laguna

@@ -641,6 +641,137 @@ struct BenchmarkSafetyTests {
         )
     }
 
+    // A worker crash at the public behavior gate happens before any
+    // score.json exists. It must surface as an explicit public-gate
+    // category (not the opaque "no_score" that invites consumers to guess
+    // the failing gate from the surrounding skipped step names, e.g. the
+    // GPQA steps), and the worker-controlled stderr embedded in the gate
+    // report's error string must never reach the uploaded artifact.
+    @Test
+    func redactedBenchmarkFailureCategorizesPublicGateWorkerCrashWithoutQuotingWorkerStderr() throws {
+        let workspace = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        try #"""
+        {"actual_token":null,"case_count":1,"checked_steps":0,"error":"runtime worker closed stdout before returning a response: exit_status=5 stderr=WORKER-CONTROLLED-SENTINEL Fatal error: [reshape] Cannot reshape array","expected_token":null,"first_failing_case":null,"first_failing_step":null,"golden_hash":"b9509697","passed":false}
+        """#.write(
+            to: workspace.appendingPathComponent("public-gate-report.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let result = try runRedactBenchmarkFailureScript(
+            workspace: workspace,
+            environment: ["MLXFAST_BENCHMARK_MODE": "single-machine"]
+        )
+
+        #expect(result.status == 0)
+        #expect(result.artifact.contains("\"failure_category\": \"public_gate_worker_crash\""))
+        #expect(result.artifact.contains("\"public_gate_passed\": false"))
+        #expect(result.artifact.contains("\"mode\": \"single-machine\""))
+        #expect(!result.artifact.contains("WORKER-CONTROLLED-SENTINEL"))
+        #expect(!result.artifact.contains("reshape"))
+    }
+
+    @Test
+    func redactedBenchmarkFailureCategorizesPublicGateTokenMismatchWithoutTokenValues() throws {
+        let workspace = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        try #"""
+        {"passed":false,"error":"teacher-forced token mismatch","checked_steps":12,"first_failing_step":12,"expected_token":314159,"actual_token":271828}
+        """#.write(
+            to: workspace.appendingPathComponent("public-gate-report.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let result = try runRedactBenchmarkFailureScript(workspace: workspace)
+
+        #expect(result.status == 0)
+        #expect(result.artifact.contains("\"failure_category\": \"public_gate_token_mismatch\""))
+        #expect(result.artifact.contains("\"public_gate_passed\": false"))
+        #expect(!result.artifact.contains("314159"))
+        #expect(!result.artifact.contains("271828"))
+    }
+
+    @Test
+    func redactedBenchmarkFailureCollapsesUnknownPublicGateErrorToOpaqueCategory() throws {
+        let workspace = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        try #"""
+        {"passed":false,"error":"UNRECOGNIZED-SENTINEL hidden golden token 99999"}
+        """#.write(
+            to: workspace.appendingPathComponent("public-gate-report.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let result = try runRedactBenchmarkFailureScript(workspace: workspace)
+
+        #expect(result.status == 0)
+        #expect(result.artifact.contains("\"failure_category\": \"public_gate_failed\""))
+        #expect(!result.artifact.contains("UNRECOGNIZED-SENTINEL"))
+        #expect(!result.artifact.contains("99999"))
+    }
+
+    // Without a failing gate report the pre-change behavior is preserved:
+    // a passing report keeps "no_score" while recording the gate verdict, a
+    // non-boolean (attacker-shaped) verdict is coerced to null instead of
+    // riding --argjson into the artifact, and a missing report emits null.
+    @Test
+    func redactedBenchmarkFailureKeepsNoScoreUnlessPublicGateReportShowsFailure() throws {
+        let workspace = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let report = workspace.appendingPathComponent("public-gate-report.json")
+
+        try #"{"passed":true,"error":""}"#.write(to: report, atomically: true, encoding: .utf8)
+        let gatePassed = try runRedactBenchmarkFailureScript(workspace: workspace)
+        #expect(gatePassed.status == 0)
+        #expect(gatePassed.artifact.contains("\"failure_category\": \"no_score\""))
+        #expect(gatePassed.artifact.contains("\"public_gate_passed\": true"))
+
+        try #"{"passed":"EXFIL-STRING","error":"x"}"#.write(
+            to: report,
+            atomically: true,
+            encoding: .utf8
+        )
+        let coerced = try runRedactBenchmarkFailureScript(workspace: workspace)
+        #expect(coerced.status == 0)
+        #expect(coerced.artifact.contains("\"failure_category\": \"no_score\""))
+        #expect(coerced.artifact.contains("\"public_gate_passed\": null"))
+        #expect(!coerced.artifact.contains("EXFIL-STRING"))
+
+        try FileManager.default.removeItem(at: report)
+        let missing = try runRedactBenchmarkFailureScript(workspace: workspace)
+        #expect(missing.status == 0)
+        #expect(missing.artifact.contains("\"failure_category\": \"no_score\""))
+        #expect(missing.artifact.contains("\"public_gate_passed\": null"))
+    }
+
+    @Test
+    func redactedBenchmarkFailurePrefersScoreDerivedCategoryOverPublicGateReport() throws {
+        let workspace = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        try #"""
+        {"passed":false,"metrics":{"error":"performance floor failed: decode","passed_correctness":true,"passed_decode_speedup_floor":false,"passed_prefill_speedup_floor":true,"partial_result":false,"benchmark_wall_seconds":100.5,"timed_benchmark_seconds":60.1}}
+        """#.write(
+            to: workspace.appendingPathComponent("score.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"{"passed":true,"error":""}"#.write(
+            to: workspace.appendingPathComponent("public-gate-report.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let result = try runRedactBenchmarkFailureScript(workspace: workspace)
+
+        #expect(result.status == 0)
+        #expect(result.artifact.contains("\"failure_category\": \"floor_failed\""))
+        #expect(result.artifact.contains("\"public_gate_passed\": true"))
+        #expect(result.artifact.contains("\"passed_decode_speedup_floor\": false"))
+    }
+
     @Test
     func offlineRunnerRemovesProfilesAndPreservesCommandFailure() throws {
         let root = try makeTemporaryDirectory()
@@ -1692,6 +1823,40 @@ private func makeTemporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
+}
+
+/// Runs `.github/scripts/redact-benchmark-failure.sh` with the workflow's
+/// default relative paths resolved against `workspace`, mirroring the
+/// "Surface redacted benchmark failure" step, and returns the exit status
+/// plus the produced redacted artifact.
+private func runRedactBenchmarkFailureScript(
+    workspace: URL,
+    environment: [String: String] = [:]
+) throws -> (status: Int32, artifact: String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = [
+        URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".github/scripts/redact-benchmark-failure.sh").path,
+        "benchmark-failure.json",
+    ]
+    process.currentDirectoryURL = workspace
+    // Blank out GITHUB_STEP_SUMMARY so test runs inside CI do not append
+    // fixture artifacts to the real job summary.
+    process.environment = ProcessInfo.processInfo.environment
+        .merging(["GITHUB_STEP_SUMMARY": ""]) { _, new in new }
+        .merging(environment) { _, new in new }
+    let stdout = Pipe()
+    process.standardOutput = stdout
+    try process.run()
+    _ = stdout.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    let artifact =
+        (try? String(
+            contentsOf: workspace.appendingPathComponent("benchmark-failure.json"),
+            encoding: .utf8
+        )) ?? ""
+    return (process.terminationStatus, artifact)
 }
 
 private func makeExecutable(_ url: URL) throws {
