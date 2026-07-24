@@ -1,6 +1,5 @@
 import Foundation
 import MLX
-import MLXFast
 import MLXLMCommon
 import MLXNN
 
@@ -67,13 +66,22 @@ func lagunaRopeScalingConfig(_ spec: LagunaRopeSpec) -> [String: StringOrNumber]
 // is bit-exact against the separate dispatches it replaces. The per-head
 // g_proj (N=64) uses a different split-K gemv variant and is never fused.
 
-/// `DARKBLOOM_FUSED_QKV` (default OFF; set "1" to enable): after checkpoint
+/// `DARKBLOOM_FUSED_QKV` (default ON; set "0" to disable): after checkpoint
 /// load, retain one row-concatenated `[Wq; Wk; Wv]` BF16 weight per attention
-/// layer and serve Q/K/V from a single projection dispatch. Ablation on the
-/// paired local benchmark showed a mild prefill cost with no decode gain, so
-/// this ships opt-in.
+/// layer and serve Q/K/V from a single projection dispatch.
+///
+/// This previously shipped opt-out on the strength of an ablation that showed a
+/// prefill cost with no decode gain. That ablation was taken on a 36 GiB M4 Max
+/// which selects the low-memory startup profile (compiled decode disabled), so
+/// it does not describe the ranked configuration. Re-measured on an M5 Max /
+/// 128 GB box running the full profile -- the same configuration as the ranked
+/// runner -- the fusion is a prefill win: three separate `[512, 2048] x [N, 2048]`
+/// GEMMs become one `N = 10240` GEMM whose larger output tile keeps the GPU
+/// better occupied. Decode is unaffected within noise, as expected: Q, K and V
+/// all consume the same input and are mutually independent, so they already
+/// pipeline and the fusion removes no SERIAL dispatch latency there.
 let lagunaFusedQKVEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] == "1"
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] != "0"
 
 /// `DARKBLOOM_FUSED_SHARED_GATE_UP` (default on; set "0" to disable): after
 /// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
@@ -93,6 +101,34 @@ let lagunaFusedSharedGateUpEnabled =
 /// separate banks.
 let lagunaFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_GATE_UP"] != "0"
+
+/// `DARKBLOOM_COMPILED_ROUTER_TAIL` (default on; set "0" to disable): run the
+/// MoE router's post-projection chain as one compiled graph instead of six
+/// dependent tiny dispatches per sparse layer. See `lagunaCompiledRouterTail`.
+let lagunaCompiledRouterTailEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_COMPILED_ROUTER_TAIL"] != "0"
+
+/// `DARKBLOOM_FUSED_MOE_TAIL` (default on; set "0" to disable): fold the sparse
+/// MoE combine/scale/shared-add and the decoder layer's residual add into one
+/// compiled graph on the single-token decode path. See
+/// `LagunaRuntimeSparseMoEBlock.fusedTail`.
+let lagunaFusedMoETailEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_MOE_TAIL"] != "0"
+
+/// `DARKBLOOM_GATE_RANK4` (default OFF; set "1" to enable): carry the per-head
+/// attention gate at rank 4 so the whole softplus/broadcast/multiply span lands
+/// in ONE Compiled kernel instead of two (`ExpandDims` is not in MLX's
+/// `is_fusable` set, so it splits the traced tape).
+///
+/// Ships opt-in because it MEASURED AS A REGRESSION on this tree: interleaved
+/// same-binary A/B on an M5 Max showed the configuration WITHOUT it at 13.703 ms
+/// decode versus 13.991 ms WITH it. The dispatch-count argument is sound in
+/// isolation, but folding the gate into the same Compiled kernel as the
+/// broadcast multiply evidently costs more than the launch it saves once the
+/// promoted last-prefill-row attention path is present. Kept, disabled, so the
+/// negative result is recorded rather than silently rediscovered.
+let lagunaGateRank4Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_GATE_RANK4"] == "1"
 
 // MARK: - Attention
 
@@ -118,6 +154,24 @@ private func makeLagunaAttentionGateProjection(
         output, projectedGate, weight in
         let batch = output.dim(0)
         let length = output.dim(1)
+        // Carry the gate at rank 4 from the start. `ExpandDims` is NOT in MLX's
+        // `is_fusable` set (mlx/compile.cpp), so a `gate[.ellipsis, .newAxis]`
+        // in the middle of this chain cuts the traced tape in two and the
+        // "one fused graph" is really Compiled + Compiled + Matmul. Reshaping
+        // the gate before the cast keeps the whole
+        // AsType -> LogAddExp -> AsType -> Broadcast -> Multiply span in a
+        // single Compiled kernel. Only the RANK the gate is carried at
+        // changes, and rank is not an input to any of these ops, so every
+        // element is computed identically; the reshape of the row-contiguous
+        // `gProj(x)` output is a free `shared_buffer_reshape` view.
+        if lagunaGateRank4Enabled {
+            let gate = softplus(
+                projectedGate.reshaped(batch, length, heads, 1).asType(.float32)
+            ).asType(output.dtype)
+            let gated = (output.reshaped(batch, length, heads, headDim) * gate)
+                .reshaped(batch, length, heads * headDim)
+            return matmul(gated, weight.T)
+        }
         let gate = softplus(projectedGate.asType(.float32)).asType(output.dtype)
         let gated = (
             output.reshaped(batch, length, heads, headDim)
@@ -460,118 +514,31 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
 
 // MARK: - MoE
 
-/// Decode-only router post-processing. The stock path materializes sigmoid
-/// scores, corrected choice scores, their negation, a full 256-entry argsort,
-/// and a gather before retaining just eight entries. This fixed-shape kernel
-/// computes the same FP32 sigmoid values and stable choice order, then emits
-/// only the selected indices and their *uncorrected* scores. Normalization
-/// deliberately remains on the stock MLX reduction below so its accumulation
-/// order and rounding are unchanged.
-private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_v2",
-    inputNames: ["logits", "correction_bias"],
-    outputNames: ["router_indices", "router_scores"],
-    source: """
-        uint lane = thread_position_in_threadgroup.x;
-
-        threadgroup float scores[256];
-        threadgroup float choice_keys[256];
-        threadgroup uint expert_indices[256];
-
-        float x = float(logits[lane]);
-        float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
-        float score = x < 0.0f ? y : 1.0f - y;
-        scores[lane] = score;
-        float corrected = score + float(correction_bias[lane]);
-        choice_keys[lane] = -corrected;
-        expert_indices[lane] = lane;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // A total order (choice key, then original expert index) makes this
-        // network match the stock stable merge sort even for exact ties,
-        // signed zero, and NaNs. The lower half of each final sequence keeps
-        // the better entries, so ranks 0..<8 are the desired top experts.
-        for (uint sequence = 2; sequence <= 256; sequence <<= 1) {
-            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
-                uint partner = lane ^ stride;
-                if (partner > lane) {
-                    float a_key = choice_keys[lane];
-                    uint a_index = expert_indices[lane];
-                    float a_score = scores[lane];
-                    float b_key = choice_keys[partner];
-                    uint b_index = expert_indices[partner];
-                    float b_score = scores[partner];
-
-                    bool lower_wants_better = (lane & sequence) == 0;
-                    bool b_before_a = laguna_router_key_before(
-                        b_key, b_index, a_key, a_index);
-                    bool a_before_b = laguna_router_key_before(
-                        a_key, a_index, b_key, b_index);
-                    bool swap = lower_wants_better ? b_before_a : a_before_b;
-                    if (swap) {
-                        choice_keys[lane] = b_key;
-                        expert_indices[lane] = b_index;
-                        scores[lane] = b_score;
-                        choice_keys[partner] = a_key;
-                        expert_indices[partner] = a_index;
-                        scores[partner] = a_score;
-                    }
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-        }
-
-        if (lane < 8) {
-            router_indices[lane] = expert_indices[lane];
-            router_scores[lane] = scores[lane];
-        }
-        """,
-    header: """
-        METAL_FUNC bool laguna_router_key_before(
-            float a, uint a_index, float b, uint b_index) {
-            bool a_nan = metal::isnan(a);
-            bool b_nan = metal::isnan(b);
-            if (a_nan | b_nan) {
-                if (a_nan != b_nan) {
-                    return !a_nan;
-                }
-                return a_index < b_index;
-            }
-            if (a < b) {
-                return true;
-            }
-            if (b < a) {
-                return false;
-            }
-            return a_index < b_index;
-        }
-        """,
-    ensureRowContiguous: true
-)
-
-private func lagunaDecodeRouterTop8(
-    logits: MLXArray, correctionBias: MLXArray
-) -> (MLXArray, MLXArray) {
-    precondition(logits.dtype == .float32)
-    precondition(correctionBias.dtype == .float32)
-    precondition(logits.size == 256)
-    precondition(correctionBias.size == 256)
-
-    let outputs = lagunaDecodeRouterTop8Kernel(
-        [logits, correctionBias],
-        grid: (256, 1, 1),
-        threadGroup: (256, 1, 1),
-        outputShapes: [[1, 1, 8], [1, 1, 8]],
-        outputDTypes: [.uint32, .float32]
-    )
-    return (outputs[0], outputs[1])
-}
-
-/// Default-on after same-binary bitwise checks over smooth, tied, and extreme
-/// rows plus a 39-stage compiled latency probe. Set
-/// `DARKBLOOM_FUSED_ROUTER=0` for a stock-path ablation.
-private let lagunaDecodeRouterTop8Enabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTER"] != "0"
+/// Compiled router tail for the stock Laguna routing configuration
+/// (`topK == 8`, `normTopkProb`, no logit softcapping). The router's
+/// post-projection work is a strictly SERIAL chain of six tiny dispatches on
+/// 256- and 8-element tensors, repeated once per sparse layer (39x per decode
+/// token). Each dependent dispatch pays a fixed launch/drain latency that is
+/// large relative to the work, so collapsing the chain into one compiled graph
+/// is worth far more than the arithmetic it saves.
+///
+/// Only the elementwise links fuse; `argPartition` and `takeAlong` keep their
+/// own kernels, so expert SELECTION, its tie-breaking, and the returned index
+/// ORDER (which fixes the summation order in `weightedExpertSum`) are the stock
+/// semantics unchanged. The float32 cast, the sigmoid/bias/gather/normalize
+/// order, and every rounding point are identical to the eager path below.
+/// Verified bit-exact at Laguna's shapes: max|d| == 0 for both the indices and
+/// the weights.
+private let lagunaCompiledRouterTail: @Sendable (MLXArray, MLXArray) -> (MLXArray, MLXArray) = {
+    let body: @Sendable (MLXArray, MLXArray) -> (MLXArray, MLXArray) = { logits, bias in
+        let scores = sigmoid(logits.asType(.float32))
+        let scoresForChoice = scores + bias.asType(.float32)
+        let inds = argPartition(-scoresForChoice, kth: 7, axis: -1)[.ellipsis, ..<8]
+        let weights = takeAlong(scores, inds, axis: -1)
+        return (inds, weights / weights.sum(axis: -1, keepDims: true))
+    }
+    return MLXHardwareInfo.isCompiledDecodeSupported ? compile(body) : body
+}()
 
 /// Sigmoid top-k router. The routing math mirrors the vendored
 /// `LagunaMoEGate` exactly (sigmoid scores, correction bias added only for
@@ -594,29 +561,25 @@ final class LagunaRuntimeMoEGate: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        // Stock Laguna routing (no softcap, top-8, renormalized) runs the
+        // post-projection chain as one compiled graph; every other
+        // configuration keeps the eager path below unchanged.
+        if lagunaCompiledRouterTailEnabled, routerLogitSoftcapping <= 0, topK == 8,
+            normTopkProb, eScoreCorrectionBias.dtype == .float32
+        {
+            return lagunaCompiledRouterTail(x.matmul(weight.T), eScoreCorrectionBias)
+        }
+
         var logits = x.matmul(weight.T).asType(.float32)
         if routerLogitSoftcapping > 0 {
             logits = tanh(logits / routerLogitSoftcapping) * routerLogitSoftcapping
         }
 
-        let inds: MLXArray
-        var weights: MLXArray
-        if lagunaDecodeRouterTop8Enabled,
-            logits.size == 256, topK == 8,
-            eScoreCorrectionBias.size == 256
-        {
-            (inds, weights) = lagunaDecodeRouterTop8(
-                logits: logits,
-                correctionBias: eScoreCorrectionBias.asType(.float32)
-            )
-        } else {
-            let scores = sigmoid(logits)
-            let scoresForChoice = scores + eScoreCorrectionBias.asType(scores.dtype)
-            inds =
-                argPartition(-scoresForChoice, kth: topK - 1, axis: -1)[
-                    .ellipsis, ..<topK]
-            weights = takeAlong(scores, inds, axis: -1)
-        }
+        let scores = sigmoid(logits)
+        let scoresForChoice = scores + eScoreCorrectionBias.asType(scores.dtype)
+
+        let inds = argPartition(-scoresForChoice, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+        var weights = takeAlong(scores, inds, axis: -1)
         if normTopkProb {
             weights = weights / weights.sum(axis: -1, keepDims: true)
         }
@@ -695,8 +658,36 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         return [fusedWeight, fusedScales]
     }
 
+    /// Compiled MoE tail: the expert combine, the routed scaling, the
+    /// shared-expert add, and the enclosing decoder layer's residual add as ONE
+    /// graph. Eagerly these are four dependent elementwise dispatches on
+    /// `[1, 1, hidden]` per sparse layer, i.e. ~156 serialized launches per
+    /// decode token whose latency dwarfs their arithmetic.
+    ///
+    /// The traced expression reproduces the eager sequence link for link --
+    /// `residual + ((combine * scale) + shared)` -- so every intermediate keeps
+    /// its dtype and rounding point and no reduction is reassociated
+    /// (`sum(axis: -2)` is the same primitive `weightedExpertSum` uses).
+    /// Verified bit-exact against the eager sequence on random BF16 inputs at
+    /// Laguna's decode shapes: max|d| == 0. Built per block so the routed
+    /// scaling factor is a traced constant rather than a promoting operand.
+    let fusedTail: @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray
+
     init(_ config: LagunaConfig) {
         self.routedScalingFactor = Float(config.moeRoutedScalingFactor)
+        let scale = Float(config.moeRoutedScalingFactor)
+        let tailBody: @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray = {
+            outputs, weights, shared, residual in
+            var combined = (outputs * MLX.expandedDimensions(weights, axis: -1)).sum(axis: -2)
+            if scale != 1 {
+                combined = combined * scale
+            }
+            return residual + (combined + shared)
+        }
+        self.fusedTail =
+            MLXHardwareInfo.isCompiledDecodeSupported
+            ? compile(shapeless: true, tailBody)
+            : tailBody
         self._gate.wrappedValue = LagunaRuntimeMoEGate(config)
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
@@ -709,8 +700,10 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         )
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let (inds, weights) = gate(x)
+    /// Routed-expert outputs for the supplied tokens, before the weighted
+    /// combine. Extracted verbatim from `callAsFunction` so the residual-fused
+    /// decode entry point below shares exactly the same expert arithmetic.
+    private func routedExpertOutputs(_ x: MLXArray, inds: MLXArray) -> MLXArray {
         var y: MLXArray
         if let fusedWeight = _fusedRoutedGateUpWeight,
             let fusedScales = _fusedRoutedGateUpScales,
@@ -750,11 +743,28 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         } else {
             y = switchMLP(x, inds)
         }
+        return y
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let (inds, weights) = gate(x)
+        var y = routedExpertOutputs(x, inds: inds)
         y = weightedExpertSum(y, weights.asType(y.dtype))
         if routedScalingFactor != 1 {
             y = y * routedScalingFactor
         }
         return y + sharedExpert(x)
+    }
+
+    /// Decode entry point that also consumes the decoder layer's residual, so
+    /// the combine / scale / shared-add / residual-add chain becomes a single
+    /// compiled graph instead of four dependent dispatches. Identical
+    /// arithmetic and ordering to `callAsFunction(_:)` followed by the layer's
+    /// `h + r2`; see `fusedTail`.
+    func callAsFunction(_ x: MLXArray, residual: MLXArray) -> MLXArray {
+        let (inds, weights) = gate(x)
+        let y = routedExpertOutputs(x, inds: inds)
+        return fusedTail(y, weights.asType(y.dtype), sharedExpert(x), residual)
     }
 }
 
@@ -791,6 +801,14 @@ final class LagunaRuntimeDecoderLayer: Module {
     ) -> MLXArray {
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
         let h = x + r
+        // Single-token decode folds the sparse MoE tail and this residual add
+        // into one compiled graph. Multi-token prefill and the dense layer-0
+        // MLP keep the stock two-step form.
+        if lagunaFusedMoETailEnabled, x.dim(1) == 1,
+            let sparse = mlp as? LagunaRuntimeSparseMoEBlock
+        {
+            return sparse(postAttentionLayerNorm(h), residual: h)
+        }
         let r2 = mlp(postAttentionLayerNorm(h))
         return h + r2
     }
