@@ -249,27 +249,39 @@ public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     }
 
     public func callAsFunction(_ x: MLXArray, offset: Int = 0) -> MLXArray {
+        // "copy" of x as we are going to write through it and don't want to update
+        // through the reference
+        // https://github.com/ml-explore/mlx-swift/issues/364
+        var x = x
+        if _mscale != 1.0 {
+            x = x[0..., .ellipsis]
+            x[.ellipsis, 0 ..< dimensions] *= _mscale
+        }
+
         return MLXFast.RoPE(
             x,
             dimensions: dimensions,
             traditional: traditional,
             base: nil,
-            // A negative scale is an internal AOT-kernel sentinel: keep the
-            // angle scale at one and apply mscale to each rotary input with
-            // the same dtype round-trip as the former multiply/update pass.
-            scale: _mscale == 1.0 ? 1.0 : -_mscale,
+            scale: 1.0,
             offset: offset,
             freqs: self._freqs
         )
     }
 
     public func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        var x = x
+        if _mscale != 1.0 {
+            x = x[0..., .ellipsis]
+            x[.ellipsis, 0 ..< dimensions] *= _mscale
+        }
+
         return MLXFast.RoPE(
             x,
             dimensions: dimensions,
             traditional: traditional,
             base: nil,
-            scale: _mscale == 1.0 ? 1.0 : -_mscale,
+            scale: 1.0,
             offset: offset,
             freqs: self._freqs
         )

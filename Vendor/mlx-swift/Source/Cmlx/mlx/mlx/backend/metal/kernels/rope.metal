@@ -8,16 +8,7 @@ constant bool forward [[function_constant(1)]];
 constant bool traditional [[function_constant(2)]];
 constant bool hs_transpose [[function_constant(3)]];
 
-template <typename T, bool allow_mscale>
-inline float rope_input_with_mscale(T value, float scale) {
-  if (!allow_mscale || scale >= 0.0f) {
-    return static_cast<float>(value);
-  }
-  const T mscale = static_cast<T>(-scale);
-  return static_cast<float>(static_cast<T>(value * mscale));
-}
-
-template <typename T, bool allow_mscale>
+template <typename T>
 void rope_single_impl(
     const device T* in,
     device T* out,
@@ -27,8 +18,7 @@ void rope_single_impl(
     constant const int64_t& stride,
     uint2 pos,
     uint2 grid) {
-  float angle_scale = allow_mscale && scale < 0.0f ? 1.0f : scale;
-  float L = angle_scale * static_cast<float>(offset);
+  float L = scale * static_cast<float>(offset);
 
   // Compute costheta, sintheta
   float theta = L * inv_freq;
@@ -46,8 +36,8 @@ void rope_single_impl(
   }
 
   // Read and write the output
-  float x1 = rope_input_with_mscale<T, allow_mscale>(in[index_1], scale);
-  float x2 = rope_input_with_mscale<T, allow_mscale>(in[index_2], scale);
+  float x1 = static_cast<float>(in[index_1]);
+  float x2 = static_cast<float>(in[index_2]);
   float rx1;
   float rx2;
   if (forward) {
@@ -73,8 +63,7 @@ template <typename T>
     uint2 grid [[threads_per_grid]]) {
   float d = static_cast<float>(pos.x) / static_cast<float>(grid.x);
   float inv_freq = metal::exp2(-d * base);
-  rope_single_impl<T, false>(
-      in, out, offset, inv_freq, scale, stride, pos, grid);
+  rope_single_impl<T>(in, out, offset, inv_freq, scale, stride, pos, grid);
 }
 
 template <typename T>
@@ -89,11 +78,10 @@ template <typename T>
     uint2 pos [[thread_position_in_grid]],
     uint2 grid [[threads_per_grid]]) {
   float inv_freq = 1.0 / (freqs[freq_stride * pos.x]);
-  rope_single_impl<T, true>(
-      in, out, offset, inv_freq, scale, stride, pos, grid);
+  rope_single_impl<T>(in, out, offset, inv_freq, scale, stride, pos, grid);
 }
 
-template <typename T, typename IdxT, int N = 4, bool allow_mscale = false>
+template <typename T, typename IdxT, int N = 4>
 void rope_impl(
     const device T* in,
     device T* out,
@@ -110,8 +98,7 @@ void rope_impl(
   auto head_idx = static_cast<int>((pos.z * N) % n_head_up);
   auto batch_idx = (pos.z * N) / n_head_up;
   auto batch_offset = offset[batch_idx * offset_stride];
-  float angle_scale = allow_mscale && scale < 0.0f ? 1.0f : scale;
-  float L = angle_scale * static_cast<float>(pos.y + batch_offset);
+  float L = scale * static_cast<float>(pos.y + batch_offset);
   auto mat_idx = batch_idx * n_head + head_idx;
 
   // Compute costheta, sintheta
@@ -144,10 +131,8 @@ void rope_impl(
   }
   for (int i = 0; i < N && head_idx + i < n_head; ++i) {
     // Read and write the output
-    float x1 =
-        rope_input_with_mscale<T, allow_mscale>(in[in_index_1], scale);
-    float x2 =
-        rope_input_with_mscale<T, allow_mscale>(in[in_index_2], scale);
+    float x1 = static_cast<float>(in[in_index_1]);
+    float x2 = static_cast<float>(in[in_index_2]);
     float rx1;
     float rx2;
     if (forward) {
@@ -181,7 +166,7 @@ template <typename T, typename IdxT, int N = 4>
     uint3 grid [[threads_per_grid]]) {
   float d = static_cast<float>(pos.x) / static_cast<float>(grid.x);
   float inv_freq = metal::exp2(-d * base);
-  rope_impl<T, IdxT, N, false>(
+  rope_impl<T, IdxT, N>(
       in,
       out,
       offset,
@@ -210,7 +195,7 @@ template <typename T, typename IdxT, int N = 4>
     uint3 pos [[thread_position_in_grid]],
     uint3 grid [[threads_per_grid]]) {
   float inv_freq = 1.0 / (freqs[freq_stride * pos.x]);
-  rope_impl<T, IdxT, N, true>(
+  rope_impl<T, IdxT, N>(
       in,
       out,
       offset,
