@@ -86,10 +86,13 @@ struct RankedWorkflowIsolationTests {
         #expect(wrapper.contains("-c core.pager=cat"))
         #expect(wrapper.contains("-c protocol.ext.allow=never"))
 
-        // Submission-worktree calls go through the wrapper...
+        // Submission-worktree calls go through the wrapper... (the former
+        // merge-base ancestry probe is gone: the modifiable-surface check
+        // diffs the candidate tree against the current trusted main tip
+        // directly, so no ancestry plumbing runs against the untrusted
+        // worktree at all.)
         #expect(workflow.contains("\"${hardened_git}\" -C .mlxfast-submission-src rev-parse HEAD"))
         #expect(workflow.contains("\"${hardened_git}\" -C .mlxfast-submission-src cat-file -e"))
-        #expect(workflow.contains("\"${hardened_git}\" -C .mlxfast-submission-src merge-base"))
         #expect(workflow.contains("\"${hardened_git}\" fetch --no-tags .mlxfast-submission-src"))
         // ...as do the bench-workspace calls.
         #expect(workflow.contains(".github/scripts/hardened-git.sh -C \"${MLXFAST_JOB_WS}\" cat-file -e"))

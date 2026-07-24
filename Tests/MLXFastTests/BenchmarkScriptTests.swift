@@ -704,8 +704,19 @@ func benchmarkWorkflowRunsTrustedMainAndOverlaysOnlySubmittedEditablePaths() thr
     #expect(candidatePipeline.contains("ref: ${{ github.sha }}"))
     #expect(candidatePipeline.contains("path: .mlxfast-submission-src"))
     #expect(candidatePipeline.contains("BASE_SHA=\"${base_sha}\" HEAD_SHA=\"${actual_sha}\""))
-    #expect(candidatePipeline.contains("if [[ \"${base_sha}\" != \"${TRUSTED_MAIN_SHA}\" ]]; then"))
-    #expect(candidatePipeline.contains("submission must be based on current trusted main"))
+    // Content rule, not an ancestry rule: the modifiable-surface diff base IS
+    // the current trusted main tip, and no descent requirement on the
+    // candidate commit remains anywhere in the workflow. The bench workspace
+    // is trusted main + overlaid editablePaths regardless of candidate
+    // ancestry, so a queued candidate created before an editablePaths-only
+    // promotion moved main must still run; only content drift OUTSIDE
+    // editablePaths versus the current tip may fail it.
+    #expect(candidatePipeline.contains("base_sha=\"${TRUSTED_MAIN_SHA}\""))
+    #expect(!workflow.contains("merge-base"))
+    #expect(!workflow.contains("submission must be based on current trusted main"))
+    #expect(candidatePipeline.contains(
+        "differs from current trusted main ${TRUSTED_MAIN_SHA} outside editablePaths"))
+    #expect(candidatePipeline.contains("re-sync with current main and resubmit"))
     #expect(candidatePipeline.contains("\"${GITHUB_WORKSPACE}/.github/scripts/enforce-modifiable-surface.sh\""))
     #expect(candidatePipeline.contains("\"${GITHUB_WORKSPACE}/.github/scripts/run-submission-static-review.sh\""))
     #expect(candidatePipeline.contains("run: .github/scripts/overlay-editable-paths.sh"))
@@ -1663,12 +1674,13 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(staticReview.contains("missing or not a regular file"))
     #expect(staticReview.contains("not the checked-out HEAD"))
 
-    // The trusted workflow computes a merge-base inside the separately checked
-    // out candidate repository and passes it to the trusted review script, so
-    // review still runs in diff-only mode without executing candidate scripts.
-    // The merge-base against the untrusted submission worktree runs through the
-    // hardened git wrapper (neutralized .git/config, hooks, filters, fsmonitor).
-    #expect(workflow.contains("base_sha=\"$(\"${hardened_git}\" -C .mlxfast-submission-src merge-base \"${TRUSTED_MAIN_SHA}\" \"${actual_sha}\")\""))
+    // The trusted workflow passes the current trusted main tip as the review
+    // base (the same content-rule base the modifiable-surface check uses; no
+    // ancestry computation against the untrusted worktree remains), so review
+    // still runs in diff-only mode without executing candidate scripts, and
+    // the reviewed diff is exactly the effective delta the editable-path
+    // overlay will execute on top of trusted main.
+    #expect(workflow.contains("base_sha=\"${TRUSTED_MAIN_SHA}\""))
     #expect(workflow.contains("MLXFAST_SUBMISSION_REVIEW_BASE_SHA=\"${REVIEW_BASE_SHA}\""))
     #expect(!workflow.contains("MLXFAST_SUBMISSION_REVIEW_BASE_SHA=\"$(git merge-base"))
 }
