@@ -2,6 +2,17 @@
 # Ask Claude to review overlaid editable submission code for benchmark-bypass behavior.
 set -euo pipefail
 
+# benchmark.yml invokes this script with the UNTRUSTED submission checkout as
+# the working directory (diff-only mode reads commits and blobs from that
+# repository), where repo-local .git/config settings (core.fsmonitor,
+# core.hooksPath, core.pager, filters) are attacker-influenced on submission
+# branches. Per the doctrine in benchmark.yml's "Verify submitted commit and
+# modifiable surface" step, every git call here goes through hardened-git.sh
+# -- resolved next to THIS script, i.e. the trusted checkout's copy, never
+# one inside the submission worktree.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null && pwd -P)"
+HARDENED_GIT="${SCRIPT_DIR}/hardened-git.sh"
+
 CONTRACT_PATH="${CONTRACT_PATH:-benchmark.json}"
 # Deliberately NOT chained to MLXFAST_SEMANTIC_GPQA_MODEL: the gates job
 # exports that as job-level env, and retuning the per-case GPQA judge (or
@@ -158,27 +169,27 @@ fi
 
 editable_paths=()
 if [[ -n "${review_base}" ]]; then
-  if ! command -v git >/dev/null 2>&1 || ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  if ! command -v git >/dev/null 2>&1 || ! "${HARDENED_GIT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "::error::MLXFAST_SUBMISSION_REVIEW_BASE_SHA is set but this is not a git work tree" >&2
     exit 1
   fi
-  if ! review_base="$(git rev-parse --verify --quiet "${review_base}^{commit}")"; then
+  if ! review_base="$("${HARDENED_GIT}" rev-parse --verify --quiet "${review_base}^{commit}")"; then
     echo "::error::submission review base '${MLXFAST_SUBMISSION_REVIEW_BASE_SHA}' is not a resolvable commit" >&2
     exit 1
   fi
-  if ! review_head="$(git rev-parse --verify --quiet "${review_head}^{commit}")"; then
+  if ! review_head="$("${HARDENED_GIT}" rev-parse --verify --quiet "${review_head}^{commit}")"; then
     echo "::error::submission review head '${HEAD_SHA:-HEAD}' is not a resolvable commit" >&2
     exit 1
   fi
   # The diff selects paths from commits but collect_file reads the work tree;
   # those only agree when the work tree is the checkout of the review head.
-  if [[ "$(git rev-parse HEAD)" != "${review_head}" ]]; then
+  if [[ "$("${HARDENED_GIT}" rev-parse HEAD)" != "${review_head}" ]]; then
     echo "::error::review head ${review_head} is not the checked-out HEAD; work-tree content would not match the reviewed diff" >&2
     exit 1
   fi
   # Like enforce-modifiable-surface.sh, read the allowlist from the BASE commit
   # so nothing in the submitted work tree can steer which files the judge sees.
-  if ! contract_source="$(git show "${review_base}:${CONTRACT_PATH}")"; then
+  if ! contract_source="$("${HARDENED_GIT}" show "${review_base}:${CONTRACT_PATH}")"; then
     echo "::error::cannot read ${CONTRACT_PATH} from review base ${review_base}" >&2
     exit 1
   fi
@@ -209,9 +220,9 @@ if [[ -n "${review_base}" ]]; then
   # Capture both the complete changed-path set (including deletions) and the
   # changed files still present in the head. Use regular temporary files so a
   # git failure cannot disappear inside process-substitution status handling.
-  git diff --name-only -z "${review_base}" "${review_head}" -- "${editable_paths[@]}" \
+  "${HARDENED_GIT}" diff --name-only -z "${review_base}" "${review_head}" -- "${editable_paths[@]}" \
     > "${changed_paths_file}"
-  git diff --name-only -z --diff-filter=d "${review_base}" "${review_head}" -- "${editable_paths[@]}" \
+  "${HARDENED_GIT}" diff --name-only -z --diff-filter=d "${review_base}" "${review_head}" -- "${editable_paths[@]}" \
     > "${changed_present_paths_file}"
 
   while IFS= read -r -d '' file_path; do
@@ -227,7 +238,7 @@ if [[ -n "${review_base}" ]]; then
   # reviewed diff far past the size cap, so surface the real cause and the
   # remedy instead of only the lookup-table refusal.
   deleted_paths_file="${work_dir}/deleted-paths.z"
-  git diff --name-only -z --diff-filter=D "${review_base}" "${review_head}" -- "${editable_paths[@]}" \
+  "${HARDENED_GIT}" diff --name-only -z --diff-filter=D "${review_base}" "${review_head}" -- "${editable_paths[@]}" \
     > "${deleted_paths_file}"
   first_deleted_path=""
   while IFS= read -r -d '' file_path; do
@@ -256,11 +267,11 @@ if [[ -n "${review_base}" ]]; then
   base_surface_bytes=0
   head_surface_bytes=0
   while IFS= read -r -d '' changed_path; do
-    if git cat-file -e "${review_base}:${changed_path}" 2>/dev/null; then
-      base_surface_bytes=$((base_surface_bytes + $(git cat-file -s "${review_base}:${changed_path}")))
+    if "${HARDENED_GIT}" cat-file -e "${review_base}:${changed_path}" 2>/dev/null; then
+      base_surface_bytes=$((base_surface_bytes + $("${HARDENED_GIT}" cat-file -s "${review_base}:${changed_path}")))
     fi
-    if git cat-file -e "${review_head}:${changed_path}" 2>/dev/null; then
-      head_surface_bytes=$((head_surface_bytes + $(git cat-file -s "${review_head}:${changed_path}")))
+    if "${HARDENED_GIT}" cat-file -e "${review_head}:${changed_path}" 2>/dev/null; then
+      head_surface_bytes=$((head_surface_bytes + $("${HARDENED_GIT}" cat-file -s "${review_head}:${changed_path}")))
     fi
   done < "${changed_paths_file}"
   surface_growth_bytes=$((head_surface_bytes - base_surface_bytes))
@@ -284,7 +295,7 @@ if [[ -n "${review_base}" ]]; then
   # CHANGED. Without this, code inherited from trusted main inside a touched
   # file (e.g. a previously merged frontier optimization) is indistinguishable
   # from submission-authored code and can fail an innocent submission.
-  git diff "${review_base}" "${review_head}" -- "${editable_paths[@]}" > "${submission_diff_path}"
+  "${HARDENED_GIT}" diff "${review_base}" "${review_head}" -- "${editable_paths[@]}" > "${submission_diff_path}"
   diff_bytes="$(wc -c < "${submission_diff_path}" | tr -d ' ')"
   if ! [[ "${diff_bytes}" =~ ^[0-9]+$ ]]; then
     echo "::error::could not determine submission diff size" >&2

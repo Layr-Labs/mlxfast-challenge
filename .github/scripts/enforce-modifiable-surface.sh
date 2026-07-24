@@ -7,13 +7,24 @@ set -euo pipefail
 : "${BASE_SHA:?BASE_SHA is required}"
 : "${HEAD_SHA:?HEAD_SHA is required}"
 
+# benchmark.yml runs this script with the UNTRUSTED submission checkout as
+# the working directory, where repo-local .git/config settings
+# (core.fsmonitor, core.hooksPath, core.pager, filters) are
+# attacker-influenced on submission branches. Per the doctrine in
+# benchmark.yml's "Verify submitted commit and modifiable surface" step,
+# every git read here goes through hardened-git.sh -- resolved next to THIS
+# script, i.e. the trusted checkout's copy, never one inside the submission
+# worktree.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null && pwd -P)"
+HARDENED_GIT="${SCRIPT_DIR}/hardened-git.sh"
+
 if ! command -v jq >/dev/null 2>&1; then
   echo "::error::jq is required to read editablePaths from benchmark.json"
   exit 1
 fi
 
-allowed="$(git show "${BASE_SHA}:benchmark.json" | jq -r '.editablePaths[]')"
-changed="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
+allowed="$("${HARDENED_GIT}" show "${BASE_SHA}:benchmark.json" | jq -r '.editablePaths[]')"
+changed="$("${HARDENED_GIT}" diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
 
 bad=0
 while IFS= read -r f; do

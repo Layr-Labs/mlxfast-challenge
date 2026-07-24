@@ -102,6 +102,65 @@ struct RankedWorkflowIsolationTests {
         #expect(!workflow.contains("git -C .mlxfast-submission-src"))
         #expect(!workflow.contains("git -C \"${MLXFAST_JOB_WS}\""))
         #expect(!workflow.contains(" git fetch --no-tags .mlxfast-submission-src"))
+
+        // The doctrine also binds the scripts the workflow runs WITH the
+        // untrusted submission checkout as their working directory:
+        // enforce-modifiable-surface.sh and run-submission-static-review.sh
+        // read commits/blobs from that repository, so their git calls go
+        // through the wrapper too -- resolved next to the script itself (the
+        // trusted checkout's copy), never one inside the submission worktree.
+        let enforceSurface = try String(
+            contentsOfFile: ".github/scripts/enforce-modifiable-surface.sh",
+            encoding: .utf8
+        )
+        #expect(enforceSurface.contains(
+            "SCRIPT_DIR=\"$(cd -- \"$(dirname -- \"${BASH_SOURCE[0]}\")\" >/dev/null && pwd -P)\""
+        ))
+        #expect(enforceSurface.contains("HARDENED_GIT=\"${SCRIPT_DIR}/hardened-git.sh\""))
+        #expect(enforceSurface.contains(
+            "allowed=\"$(\"${HARDENED_GIT}\" show \"${BASE_SHA}:benchmark.json\" | jq -r '.editablePaths[]')\""
+        ))
+        #expect(enforceSurface.contains(
+            "changed=\"$(\"${HARDENED_GIT}\" diff --name-only \"${BASE_SHA}\" \"${HEAD_SHA}\")\""
+        ))
+
+        let staticReview = try String(
+            contentsOfFile: ".github/scripts/run-submission-static-review.sh",
+            encoding: .utf8
+        )
+        #expect(staticReview.contains("HARDENED_GIT=\"${SCRIPT_DIR}/hardened-git.sh\""))
+        // Every plumbing family the script uses is wrapper-routed.
+        #expect(staticReview.contains("\"${HARDENED_GIT}\" rev-parse --is-inside-work-tree"))
+        #expect(staticReview.contains("\"${HARDENED_GIT}\" rev-parse --verify --quiet"))
+        #expect(staticReview.contains("\"$(\"${HARDENED_GIT}\" rev-parse HEAD)\""))
+        #expect(staticReview.contains("\"${HARDENED_GIT}\" show \"${review_base}:${CONTRACT_PATH}\""))
+        #expect(staticReview.contains("\"${HARDENED_GIT}\" diff --name-only -z"))
+        #expect(staticReview.contains("\"${HARDENED_GIT}\" cat-file -e"))
+        #expect(staticReview.contains("\"${HARDENED_GIT}\" cat-file -s"))
+        #expect(staticReview.contains(
+            "\"${HARDENED_GIT}\" diff \"${review_base}\" \"${review_head}\" -- \"${editable_paths[@]}\""
+        ))
+
+        // No bare git invocation survives in either script: every non-comment
+        // line mentioning `git ` must be the binary-presence check or a
+        // diagnostic string (wrapper calls spell the uppercase HARDENED_GIT
+        // variable, so they never match `git ` at all).
+        let allowedBareGitFragments = [
+            "command -v git",
+            "did git merge-base fail",
+            "not a git work tree",
+        ]
+        for script in [enforceSurface, staticReview] {
+            for rawLine in script.components(separatedBy: "\n") {
+                let line = rawLine.trimmingCharacters(in: .whitespaces)
+                if line.hasPrefix("#") { continue }
+                guard line.contains("git ") else { continue }
+                #expect(
+                    allowedBareGitFragments.contains(where: { line.contains($0) }),
+                    "unhardened git call: \(line)"
+                )
+            }
+        }
     }
 
     // F1: the pre-hidden snapshot is taken before hidden material enters the
