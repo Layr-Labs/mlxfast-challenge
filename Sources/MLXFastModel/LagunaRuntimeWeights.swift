@@ -347,11 +347,12 @@ public final class LagunaRuntimeWeightCache {
         self.loader = loader
         self.config = config
         // Select the startup memory profile BEFORE the model load. Laguna
-        // retains no alternate weight layouts, so the full profile is
-        // deliberately a no-op here (the
-        // ranked 128 GiB box keeps stock allocator behavior); the documented
-        // low-memory profile for <64 GiB machines caps the MLX allocator
-        // cache at 6 GiB, shortens command buffers, installs the
+        // retains no alternate weight layouts. Both profiles install their
+        // allocator and command-buffer budgets before MLX creates the Metal
+        // device; the ranked full profile groups adjacent kernels whose
+        // individual expert banks exceed MLX's stock 50 MiB reference budget.
+        // The documented low-memory profile for <64 GiB machines caps the MLX
+        // allocator cache at 6 GiB, shortens command buffers, installs the
         // feature-disable env defaults (no-overwrite), and clears free
         // warmup buffers before the worker protocol hello. The layer-count
         // guard keeps tiny unit-test configurations on stock behavior.
@@ -363,8 +364,8 @@ public final class LagunaRuntimeWeightCache {
                     RuntimeStartupMemoryPolicy.profileOverrideEnvironmentName
                 ]
             )
+            policy.apply()
             if policy.isLowMemory {
-                policy.apply()
                 startupMemoryPolicy = policy
             } else {
                 startupMemoryPolicy = nil
