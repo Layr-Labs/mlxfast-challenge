@@ -507,7 +507,12 @@ METAL_FUNC void fp_qmv_quad_impl(
   }
 }
 
-template <typename T, int group_size, int bits>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int fixed_in_vec_size = 0,
+    int fixed_out_vec_size = 0>
 METAL_FUNC void fp_qmv_fast_impl(
     const device uint32_t* w,
     const device uint8_t* scales,
@@ -533,18 +538,24 @@ METAL_FUNC void fp_qmv_fast_impl(
   thread U x_thread[values_per_thread];
   thread U result[results_per_simdgroup] = {0};
 
+  const int kernel_in_vec_size =
+      fixed_in_vec_size > 0 ? fixed_in_vec_size : in_vec_size;
+  const int kernel_out_vec_size =
+      fixed_out_vec_size > 0 ? fixed_out_vec_size : out_vec_size;
+
   // Adjust positions
-  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
-  const int in_vec_size_g = in_vec_size / group_size;
+  const int in_vec_size_w =
+      kernel_in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = kernel_in_vec_size / group_size;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
   ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
   scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  x += tid.x * in_vec_size + simd_lid * values_per_thread;
-  y += tid.x * out_vec_size + out_row;
+  x += tid.x * kernel_in_vec_size + simd_lid * values_per_thread;
+  y += tid.x * kernel_out_vec_size + out_row;
 
-  for (int k = 0; k < in_vec_size; k += block_size) {
+  for (int k = 0; k < kernel_in_vec_size; k += block_size) {
 #if defined(__METAL_VERSION__) && (__METAL_VERSION__ >= 310)
     if constexpr (group_size == 16 && bits == 4) {
       // Same x elements into the same x_thread slots with the same
@@ -1251,6 +1262,31 @@ template <typename T, int group_size, int bits, bool batched>
         tid);
   }
   fp_qmv_fast_impl<T, group_size, bits>(
+      w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int fixed_in_vec_size,
+    int fixed_out_vec_size>
+[[kernel]] void fp_qmv_fast_static(
+    const device uint32_t* w,
+    const device uint8_t* scales,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  fp_qmv_fast_impl<
+      T,
+      group_size,
+      bits,
+      fixed_in_vec_size,
+      fixed_out_vec_size>(
       w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 

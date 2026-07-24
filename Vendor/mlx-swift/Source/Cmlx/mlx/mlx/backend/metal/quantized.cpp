@@ -257,25 +257,50 @@ void qmv(
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
   bool fast = N % bn == 0 && K % 512 == 0;
+  bool use_static_laguna_shape =
+      fast && B == 1 && M == 1 && mode == "nvfp4" &&
+      type_string == "bfloat16" && group_size == 16 && bits == 4 &&
+      !biases.has_value() &&
+      ((K == 2048 && N == 1024) || (K == 512 && N == 2048));
 
   concatenate(
       kname,
-      mode + (fast ? "_qmv_fast_" : "_qmv_"),
+      mode +
+          (use_static_laguna_shape
+               ? "_qmv_fast_static_"
+               : (fast ? "_qmv_fast_" : "_qmv_")),
       type_string,
       "_gs_",
       group_size,
       "_b_",
       bits,
+      use_static_laguna_shape
+          ? ("_k_" + std::to_string(K) + "_n_" + std::to_string(N))
+          : "",
       B > 1 ? "_batch_1" : "_batch_0");
-  auto kernel = get_quantized_kernel_wrapped(
-      d,
-      kname,
-      (fast ? "qmv_fast" : "qmv"),
-      mode,
-      type_string,
-      group_size,
-      bits,
-      B > 1);
+  MTL::ComputePipelineState* kernel;
+  if (use_static_laguna_shape) {
+    kernel = get_quantized_kernel_wrapped(
+        d,
+        kname,
+        "qmv_fast_static",
+        mode,
+        type_string,
+        group_size,
+        bits,
+        K,
+        N);
+  } else {
+    kernel = get_quantized_kernel_wrapped(
+        d,
+        kname,
+        (fast ? "qmv_fast" : "qmv"),
+        mode,
+        type_string,
+        group_size,
+        bits,
+        B > 1);
+  }
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
