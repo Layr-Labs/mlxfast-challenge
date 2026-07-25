@@ -1682,15 +1682,18 @@ fi
 # arg_reduce) an existence-only gate benchmarks the stale library, and in
 # local modes the trusted CLI's fingerprint verification deliberately
 # downgrades to a single mid-run stderr warning that is easy to scroll past.
-# Rebuild whenever the fingerprint sidecar is missing or anything under the
-# two fingerprinted vendored subtrees (the exact mlx.metallib.fingerprint
-# input set -- deliberately an over-approximation, matching the builder) is
-# newer than the published metallib. Official runs are untouched: the
-# trusted workflow owns that build, and the fingerprint check fails closed
-# there instead of warning.
+# Rebuild whenever anything under the two fingerprinted vendored subtrees
+# (the exact mlx.metallib.fingerprint input set -- deliberately an
+# over-approximation, matching the builder) is newer than the published
+# metallib. Official runs are untouched: the trusted workflow owns that
+# build, and the fingerprint check fails closed there instead of warning.
 metallib_rebuild_required() {
-  if [[ ! -s "${MLX_METALLIB}.fingerprint" ]]; then
-    return 0
+  # An explicit MLXFAST_MLX_METALLIB override means the caller owns that
+  # artifact's lifecycle (test fixtures, operator layouts): never rebuild
+  # over it. The trusted CLI's fingerprint verification still warns when an
+  # overridden metallib goes stale.
+  if [[ -n "${MLXFAST_MLX_METALLIB:-}" ]]; then
+    return 1
   fi
   local newer
   newer="$(find \

@@ -266,11 +266,13 @@ func benchmarkRebuildsTheMetallibWhenVendoredKernelSourcesAreNewer() throws {
     )
     let body = String(benchmark[gate.upperBound..<gateEnd.lowerBound])
 
-    // Rebuilds when the fingerprint sidecar is missing...
-    #expect(body.contains("${MLX_METALLIB}.fingerprint"))
-    // ...and when anything under the two fingerprinted vendored subtrees --
-    // the exact input set of mlx.metallib.fingerprint -- is newer than the
-    // published metallib.
+    // Never rebuilds over an explicit MLXFAST_MLX_METALLIB override -- the
+    // caller (test fixtures, operator layouts) owns that artifact's
+    // lifecycle, and the fixture-driven benchmark.sh tests rely on it.
+    #expect(body.contains("-n \"${MLXFAST_MLX_METALLIB:-}\""))
+    // Rebuilds when anything under the two fingerprinted vendored subtrees
+    // -- the exact input set of mlx.metallib.fingerprint -- is newer than
+    // the published metallib.
     #expect(body.contains("-newer \"${MLX_METALLIB}\""))
     #expect(body.contains("Vendor/mlx-swift/Source/Cmlx/mlx \\"))
     #expect(body.contains("Vendor/mlx-swift/Source/Cmlx/mlx-generated \\"))
