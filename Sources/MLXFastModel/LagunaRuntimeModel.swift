@@ -2571,7 +2571,9 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
 /// division -- MLX builds every runtime library, this kernel included, with
 /// fast math disabled, so `scores[lane] / total` is the same division the
 /// binary kernel would perform.
-private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
+private func lagunaDecodeRouterTop8KernelSource(
+    normalizing: Bool, hasCorrectionBias: Bool = true
+) -> String {
     let epilogue =
         normalizing
         ? """
@@ -2584,6 +2586,15 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
         : """
                 router_scores[lane] = scores[lane];
         """
+    let choiceKey =
+        hasCorrectionBias
+        ? """
+                float corrected = score + float(correction_bias[lane]);
+                choice_keys[lane] = -corrected;
+        """
+        : """
+                choice_keys[lane] = -score;
+        """
     return """
         uint lane = thread_position_in_threadgroup.x;
 
@@ -2595,8 +2606,7 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
         float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
         float score = x < 0.0f ? y : 1.0f - y;
         scores[lane] = score;
-        float corrected = score + float(correction_bias[lane]);
-        choice_keys[lane] = -corrected;
+        \(choiceKey)
         expert_indices[lane] = lane;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -2680,18 +2690,48 @@ private let lagunaDecodeRouterTop8NormalizingKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+private let lagunaDecodeRouterTop8ZeroBiasKernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_top8_zero_bias_v1",
+    inputNames: ["logits"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterTop8KernelSource(
+        normalizing: false, hasCorrectionBias: false),
+    header: lagunaDecodeRouterTop8Header,
+    ensureRowContiguous: true
+)
+
+private let lagunaDecodeRouterTop8ZeroBiasNormalizingKernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_top8_zero_bias_norm_v1",
+    inputNames: ["logits"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterTop8KernelSource(
+        normalizing: true, hasCorrectionBias: false),
+    header: lagunaDecodeRouterTop8Header,
+    ensureRowContiguous: true
+)
+
 private func lagunaDecodeRouterTop8(
-    logits: MLXArray, correctionBias: MLXArray, normalizing: Bool = false
+    logits: MLXArray, correctionBias: MLXArray?, normalizing: Bool = false
 ) -> (MLXArray, MLXArray) {
     precondition(logits.dtype == .bfloat16 || logits.dtype == .float32)
-    precondition(correctionBias.dtype == .float32)
     precondition(logits.size == 256)
-    precondition(correctionBias.size == 256)
+    if let correctionBias {
+        precondition(correctionBias.dtype == .float32)
+        precondition(correctionBias.size == 256)
+    }
 
-    let kernel =
-        normalizing ? lagunaDecodeRouterTop8NormalizingKernel : lagunaDecodeRouterTop8Kernel
+    let kernel: MLXFast.MLXFastKernel
+    if correctionBias == nil {
+        kernel =
+            normalizing
+            ? lagunaDecodeRouterTop8ZeroBiasNormalizingKernel
+            : lagunaDecodeRouterTop8ZeroBiasKernel
+    } else {
+        kernel =
+            normalizing ? lagunaDecodeRouterTop8NormalizingKernel : lagunaDecodeRouterTop8Kernel
+    }
     let outputs = kernel(
-        [logits, correctionBias],
+        correctionBias.map { [logits, $0] } ?? [logits],
         grid: (256, 1, 1),
         threadGroup: (256, 1, 1),
         outputShapes: [[1, 1, 8], [1, 1, 8]],
@@ -2719,6 +2759,13 @@ private let lagunaDecodeRouterCastSinkEnabled =
 private let lagunaDecodeRouterNormSinkEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTER_NORM"] != "0"
 
+/// The fixed checkpoint's correction tensors are currently all bitwise +0.
+/// Certify that fact from the loaded weights during untimed preparation and
+/// remove the dead add in prefill plus the dead input/load/add in decode.
+/// Any nonzero bit pattern, including -0 and NaN, keeps the stock path.
+private let lagunaZeroRouterCorrectionEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ZERO_ROUTER_CORRECTION"] != "0"
+
 /// Sigmoid top-k router. The routing math mirrors the vendored
 /// `LagunaMoEGate` exactly (sigmoid scores, correction bias added only for
 /// expert CHOICE, mixture weights taken from the pre-bias scores, optional
@@ -2730,6 +2777,7 @@ final class LagunaRuntimeMoEGate: Module {
 
     @ParameterInfo(key: "weight") var weight: MLXArray
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
+    private var correctionBiasIsPositiveZero = false
 
     init(_ config: LagunaConfig) {
         self.topK = config.numExpertsPerTok
@@ -2737,6 +2785,23 @@ final class LagunaRuntimeMoEGate: Module {
         self.routerLogitSoftcapping = Float(config.moeRouterLogitSoftcapping)
         self._weight.wrappedValue = zeros([config.numExperts, config.hiddenSize])
         self._eScoreCorrectionBias.wrappedValue = zeros([config.numExperts])
+    }
+
+    func prepareCorrectionBiasSpecialization() {
+        guard lagunaZeroRouterCorrectionEnabled,
+            eScoreCorrectionBias.dtype == .float32,
+            eScoreCorrectionBias.size == 256
+        else {
+            correctionBiasIsPositiveZero = false
+            return
+        }
+        correctionBiasIsPositiveZero =
+            eScoreCorrectionBias.asArray(Float.self).allSatisfy {
+                $0.bitPattern == 0
+            }
+        if correctionBiasIsPositiveZero {
+            lagunaTrace("zero router correction")
+        }
     }
 
     /// `logits` is this layer's router projection when an upstream kernel in
@@ -2757,7 +2822,8 @@ final class LagunaRuntimeMoEGate: Module {
             let sinkNormalization = normTopkProb && lagunaDecodeRouterNormSinkEnabled
             (inds, weights) = lagunaDecodeRouterTop8(
                 logits: projectedLogits,
-                correctionBias: eScoreCorrectionBias.asType(.float32),
+                correctionBias: correctionBiasIsPositiveZero
+                    ? nil : eScoreCorrectionBias.asType(.float32),
                 normalizing: sinkNormalization
             )
             if sinkNormalization {
@@ -2774,12 +2840,14 @@ final class LagunaRuntimeMoEGate: Module {
             {
                 (inds, weights) = lagunaDecodeRouterTop8(
                     logits: logits,
-                    correctionBias: eScoreCorrectionBias.asType(.float32)
+                    correctionBias: correctionBiasIsPositiveZero
+                        ? nil : eScoreCorrectionBias.asType(.float32)
                 )
             } else {
                 let scores = sigmoid(logits)
                 let scoresForChoice =
-                    scores + eScoreCorrectionBias.asType(scores.dtype)
+                    correctionBiasIsPositiveZero
+                    ? scores : scores + eScoreCorrectionBias.asType(scores.dtype)
                 inds =
                     argPartition(-scoresForChoice, kth: topK - 1, axis: -1)[
                         .ellipsis, ..<topK]
@@ -3392,6 +3460,7 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                 fusedArrays.append(fused)
             }
             if let sparse = layer.mlp as? LagunaRuntimeSparseMoEBlock {
+                sparse.gate.prepareCorrectionBiasSpecialization()
                 if lagunaFusedSharedGateUpEnabled {
                     fusedArrays.append(contentsOf: sparse.sharedExpert.prepareFusedSharedGateUp())
                 }
