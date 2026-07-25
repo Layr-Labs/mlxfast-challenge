@@ -1514,14 +1514,31 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
 /// scores, corrected choice scores, their negation, a full 256-entry argsort,
 /// and a gather before retaining just eight entries. This fixed-shape kernel
 /// computes the same FP32 sigmoid values and stable choice order, then emits
-/// only the selected indices and their *uncorrected* scores. Normalization
-/// deliberately remains on the stock MLX reduction below so its accumulation
-/// order and rounding are unchanged.
-private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_v2",
-    inputNames: ["logits", "correction_bias"],
-    outputNames: ["router_indices", "router_scores"],
-    source: """
+/// only the selected indices and their scores.
+///
+/// `normalizing` additionally folds in the top-k renormalization, which the
+/// stock path spends two more dependent dispatches on. That is reproducible
+/// exactly: `weights.sum(axis: -1)` over a row of eight FP32 values takes
+/// MLX's `row_reduce_small` path (`row_size <= 64` with a single non-row
+/// reduction), whose `thread_reduce` walks the row in index order from
+/// `Op::init == 0`, and the following divide is an elementwise FP32 IEEE
+/// division -- MLX builds every runtime library, this kernel included, with
+/// fast math disabled, so `scores[lane] / total` is the same division the
+/// binary kernel would perform.
+private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
+    let epilogue =
+        normalizing
+        ? """
+                float total = 0.0f;
+                for (uint i = 0; i < 8; ++i) {
+                    total = scores[i] + total;
+                }
+                router_scores[lane] = scores[lane] / total;
+        """
+        : """
+                router_scores[lane] = scores[lane];
+        """
+    return """
         uint lane = thread_position_in_threadgroup.x;
 
         threadgroup float scores[256];
@@ -1573,41 +1590,61 @@ private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
 
         if (lane < 8) {
             router_indices[lane] = expert_indices[lane];
-            router_scores[lane] = scores[lane];
+        \(epilogue)
         }
-        """,
-    header: """
-        METAL_FUNC bool laguna_router_key_before(
-            float a, uint a_index, float b, uint b_index) {
-            bool a_nan = metal::isnan(a);
-            bool b_nan = metal::isnan(b);
-            if (a_nan | b_nan) {
-                if (a_nan != b_nan) {
-                    return !a_nan;
-                }
-                return a_index < b_index;
-            }
-            if (a < b) {
-                return true;
-            }
-            if (b < a) {
-                return false;
+        """
+}
+
+private let lagunaDecodeRouterTop8Header = """
+    METAL_FUNC bool laguna_router_key_before(
+        float a, uint a_index, float b, uint b_index) {
+        bool a_nan = metal::isnan(a);
+        bool b_nan = metal::isnan(b);
+        if (a_nan | b_nan) {
+            if (a_nan != b_nan) {
+                return !a_nan;
             }
             return a_index < b_index;
         }
-        """,
+        if (a < b) {
+            return true;
+        }
+        if (b < a) {
+            return false;
+        }
+        return a_index < b_index;
+    }
+    """
+
+private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_top8_v2",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterTop8KernelSource(normalizing: false),
+    header: lagunaDecodeRouterTop8Header,
+    ensureRowContiguous: true
+)
+
+private let lagunaDecodeRouterTop8NormalizingKernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_top8_norm_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterTop8KernelSource(normalizing: true),
+    header: lagunaDecodeRouterTop8Header,
     ensureRowContiguous: true
 )
 
 private func lagunaDecodeRouterTop8(
-    logits: MLXArray, correctionBias: MLXArray
+    logits: MLXArray, correctionBias: MLXArray, normalizing: Bool = false
 ) -> (MLXArray, MLXArray) {
     precondition(logits.dtype == .bfloat16 || logits.dtype == .float32)
     precondition(correctionBias.dtype == .float32)
     precondition(logits.size == 256)
     precondition(correctionBias.size == 256)
 
-    let outputs = lagunaDecodeRouterTop8Kernel(
+    let kernel =
+        normalizing ? lagunaDecodeRouterTop8NormalizingKernel : lagunaDecodeRouterTop8Kernel
+    let outputs = kernel(
         [logits, correctionBias],
         grid: (256, 1, 1),
         threadGroup: (256, 1, 1),
@@ -1628,6 +1665,13 @@ private let lagunaDecodeRouterTop8Enabled =
 /// instruction, removing an otherwise standalone 256-element cast dispatch.
 private let lagunaDecodeRouterCastSinkEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTER_CAST"] != "0"
+
+/// Decode-only top-k renormalization sinking, the companion to the cast sink
+/// above: the eight selected scores are summed and divided inside the top-8
+/// kernel, removing the standalone eight-element reduce and the broadcast
+/// divide that followed it. Set `DARKBLOOM_FUSED_ROUTER_NORM=0` to ablate.
+private let lagunaDecodeRouterNormSinkEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTER_NORM"] != "0"
 
 /// Sigmoid top-k router. The routing math mirrors the vendored
 /// `LagunaMoEGate` exactly (sigmoid scores, correction bias added only for
@@ -1660,10 +1704,15 @@ final class LagunaRuntimeMoEGate: Module {
             projectedLogits.size == 256, topK == 8,
             eScoreCorrectionBias.size == 256
         {
+            let sinkNormalization = normTopkProb && lagunaDecodeRouterNormSinkEnabled
             (inds, weights) = lagunaDecodeRouterTop8(
                 logits: projectedLogits,
-                correctionBias: eScoreCorrectionBias.asType(.float32)
+                correctionBias: eScoreCorrectionBias.asType(.float32),
+                normalizing: sinkNormalization
             )
+            if sinkNormalization {
+                return (inds, weights)
+            }
         } else {
             var logits = projectedLogits.asType(.float32)
             if routerLogitSoftcapping > 0 {
