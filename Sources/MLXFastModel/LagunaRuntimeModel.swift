@@ -211,6 +211,17 @@ let lagunaFusedResidualRMSNormRouterEnabled =
 let lagunaFusedFullQKNormYaRNEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_QK_NORM_YARN"] != "0"
 
+/// Decode-only carrier for the two authoritative RoPE angle rows consumed by
+/// the fused Q/K kernels. At load time each attention family's own stock RoPE
+/// materializes an exact FP32 position atlas. A single custom kernel then
+/// replaces the token embedding gather and copies both selected atlas rows,
+/// removing the two per-token probe RoPE dispatches without changing their
+/// values. Set `DARKBLOOM_ROPE_ANGLE_ATLAS=0` to ablate.
+let lagunaRoPEAngleAtlasEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] != "0"
+
+private let lagunaRoPEAngleAtlasLength = 4096
+
 /// Post-attention residual add + RMSNorm with the MoE router's projection
 /// folded in.
 ///
@@ -3468,6 +3479,104 @@ final class LagunaRuntimeDecoderLayer: Module {
 
 // MARK: - Model
 
+/// Single-token embedding gather plus position-atlas row selection. The
+/// embedding row is copied as BF16 bits; the angle rows are copied as FP32
+/// bits. The stock embedding and the two stock probe RoPE calls produce the
+/// same three output buffers separately.
+private let lagunaDecodeEmbeddingRoPEAtlasKernel = MLXFast.metalKernel(
+    name: "laguna_decode_embedding_rope_atlas_bf16_2048_v1",
+    inputNames: [
+        "tokens", "embedding_weight", "full_atlas", "sliding_atlas",
+        "atlas_position",
+    ],
+    outputNames: ["hidden", "full_angles", "sliding_angles"],
+    source: """
+        constexpr uint hidden_size = 2048;
+        constexpr uint hidden_vectors = hidden_size / 4;
+        constexpr uint threads = 128;
+        constexpr uint full_width = 64;
+        constexpr uint sliding_width = 128;
+
+        uint lane = thread_position_in_grid.x;
+        uint token = uint(tokens[0]);
+        uint position = uint(atlas_position);
+
+        const device vec<bfloat, 4>* embedding_vectors =
+            (const device vec<bfloat, 4>*)(
+                embedding_weight + token * hidden_size);
+        device vec<bfloat, 4>* hidden_vectors_out =
+            (device vec<bfloat, 4>*)(hidden);
+        for (uint i = 0; i < hidden_vectors / threads; ++i) {
+            uint vector_index = lane + i * threads;
+            hidden_vectors_out[vector_index] = embedding_vectors[vector_index];
+        }
+
+        if (lane < full_width / 4) {
+            const device vec<float, 4>* atlas_vectors =
+                (const device vec<float, 4>*)(
+                    full_atlas + position * full_width);
+            ((device vec<float, 4>*)(full_angles))[lane] =
+                atlas_vectors[lane];
+        }
+        if (lane < sliding_width / 4) {
+            const device vec<float, 4>* atlas_vectors =
+                (const device vec<float, 4>*)(
+                    sliding_atlas + position * sliding_width);
+            ((device vec<float, 4>*)(sliding_angles))[lane] =
+                atlas_vectors[lane];
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private func lagunaDecodeEmbeddingRoPEAtlas(
+    tokens: MLXArray,
+    embeddingWeight: MLXArray,
+    fullAtlas: MLXArray,
+    slidingAtlas: MLXArray,
+    position: Int
+) -> (hidden: MLXArray, fullAngles: MLXArray, slidingAngles: MLXArray)? {
+    guard tokens.dtype == .int32,
+        tokens.shape == [1, 1],
+        embeddingWeight.dtype == .bfloat16,
+        embeddingWeight.shape == [
+            LagunaConstants.vocabSize, LagunaConstants.hiddenSize,
+        ],
+        fullAtlas.dtype == .float32,
+        fullAtlas.shape == [
+            1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim / 2,
+        ],
+        slidingAtlas.dtype == .float32,
+        slidingAtlas.shape == [
+            1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim,
+        ],
+        position >= 0, position < lagunaRoPEAngleAtlasLength
+    else {
+        return nil
+    }
+
+    let kernelInputs: [any ScalarOrArray] = [
+        tokens,
+        embeddingWeight,
+        fullAtlas,
+        slidingAtlas,
+        Int32(position),
+    ]
+    let outputs = lagunaDecodeEmbeddingRoPEAtlasKernel(
+        kernelInputs,
+        grid: (128, 1, 1),
+        threadGroup: (128, 1, 1),
+        outputShapes: [
+            [1, 1, LagunaConstants.hiddenSize],
+            [1, 1, 1, LagunaConstants.headDim / 2],
+            [1, 1, 1, LagunaConstants.headDim],
+        ],
+        outputDTypes: [.bfloat16, .float32, .float32]
+    )
+    lagunaTrace("decode embedding+rope atlas")
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 /// The Laguna text tower: unscaled embedding and 40 decoder layers. The final
 /// RMSNorm remains a child of this module for checkpoint compatibility, but
 /// the scored wrapper applies it after selecting the only consumed row.
@@ -3482,6 +3591,8 @@ final class LagunaRuntimeModelInner: Module {
     let slidingAttentionIdx: Int
     let _fullRoPEAngleSeed: MLXArray
     let _slidingRoPEAngleSeed: MLXArray
+    var _fullRoPEAngleAtlas: MLXArray?
+    var _slidingRoPEAngleAtlas: MLXArray?
 
     init(_ config: LagunaConfig) {
         precondition(config.vocabSize > 0)
@@ -3516,6 +3627,83 @@ final class LagunaRuntimeModelInner: Module {
         )
     }
 
+    /// Materialize exact position rows with the same stock RoPE instances the
+    /// two attention families use. Broadcasting the probe seeds along the
+    /// sequence dimension makes row `p` exactly the scalar-offset probe at
+    /// position `p`, including YaRN's authoritative FP32 rounding.
+    func prepareRoPEAngleAtlases() -> [MLXArray] {
+        guard lagunaRoPEAngleAtlasEnabled,
+            lagunaFusedFullQKNormYaRNEnabled,
+            lagunaFusedSlidingQKNormRoPEEnabled,
+            layerTypes.contains(.full),
+            layerTypes.contains(.sliding)
+        else {
+            return []
+        }
+        if let fullAtlas = _fullRoPEAngleAtlas,
+            let slidingAtlas = _slidingRoPEAngleAtlas
+        {
+            return [fullAtlas, slidingAtlas]
+        }
+
+        let fullSeed = broadcast(
+            _fullRoPEAngleSeed,
+            to: [
+                1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim / 2,
+            ])
+        let slidingSeed = broadcast(
+            _slidingRoPEAngleSeed,
+            to: [
+                1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim,
+            ])
+        let fullAtlas = layers[fullAttentionIdx].selfAttn.rope(fullSeed, offset: 0)
+        let slidingAtlas = layers[slidingAttentionIdx].selfAttn.rope(
+            slidingSeed, offset: 0)
+        _fullRoPEAngleAtlas = fullAtlas
+        _slidingRoPEAngleAtlas = slidingAtlas
+        return [fullAtlas, slidingAtlas]
+    }
+
+    /// Return a host position only for the exact direct-decode cache pair.
+    /// Exact runtime type checks deliberately exclude compilable subclasses,
+    /// whose compatibility `offset` getter may synchronize a graph value.
+    private func decodeRoPEAtlasPosition(
+        inputs: MLXArray, cache: [KVCache]?
+    ) -> Int? {
+        guard lagunaRoPEAngleAtlasEnabled,
+            lagunaFusedFullQKNormYaRNEnabled,
+            lagunaFusedSlidingQKNormRoPEEnabled,
+            inputs.dtype == .int32,
+            inputs.shape == [1, 1],
+            _fullRoPEAngleAtlas != nil,
+            _slidingRoPEAngleAtlas != nil,
+            let cache,
+            fullAttentionIdx < cache.count,
+            slidingAttentionIdx < cache.count
+        else {
+            return nil
+        }
+
+        let fullCache = cache[fullAttentionIdx]
+        let slidingCache = cache[slidingAttentionIdx]
+        guard type(of: fullCache) == KVCacheSimple.self,
+            type(of: slidingCache) == RotatingKVCache.self,
+            slidingCache.maxSize == slidingWindow
+        else {
+            return nil
+        }
+
+        let fullPosition = fullCache.offset
+        let slidingPosition = slidingCache.offset
+        guard fullPosition == slidingPosition,
+            fullPosition >= 0,
+            fullPosition < lagunaRoPEAngleAtlasLength
+        else {
+            return nil
+        }
+        return fullPosition
+    }
+
     /// Runs `attention`'s own RoPE layer over `seed` at the cache's current
     /// position, honoring a graph-valued offset when the cache carries one.
     private func ropeAngleTable(
@@ -3528,7 +3716,42 @@ final class LagunaRuntimeModelInner: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
-        var h = embedTokens(inputs)
+        var h: MLXArray
+        let fullRoPEAngles: MLXArray?
+        let slidingRoPEAngles: MLXArray?
+        if let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
+            let fullAtlas = _fullRoPEAngleAtlas,
+            let slidingAtlas = _slidingRoPEAngleAtlas,
+            let atlasOutputs = lagunaDecodeEmbeddingRoPEAtlas(
+                tokens: inputs,
+                embeddingWeight: embedTokens.weight,
+                fullAtlas: fullAtlas,
+                slidingAtlas: slidingAtlas,
+                position: position)
+        {
+            h = atlasOutputs.hidden
+            fullRoPEAngles = atlasOutputs.fullAngles
+            slidingRoPEAngles = atlasOutputs.slidingAngles
+        } else {
+            // Verbatim stock fallback for prefill, unsupported caches and
+            // positions outside the precomputed atlas.
+            h = embedTokens(inputs)
+            let isSingleTokenDecode = h.dim(0) == 1 && h.dim(1) == 1
+            fullRoPEAngles =
+                lagunaFusedFullQKNormYaRNEnabled && isSingleTokenDecode
+                ? ropeAngleTable(
+                    seed: _fullRoPEAngleSeed,
+                    attention: layers[fullAttentionIdx].selfAttn,
+                    cache: cache?[fullAttentionIdx])
+                : nil
+            slidingRoPEAngles =
+                lagunaFusedSlidingQKNormRoPEEnabled && isSingleTokenDecode
+                ? ropeAngleTable(
+                    seed: _slidingRoPEAngleSeed,
+                    attention: layers[slidingAttentionIdx].selfAttn,
+                    cache: cache?[slidingAttentionIdx])
+                : nil
+        }
 
         // One mask per attention family, derived from a representative
         // layer's cache offset: all full-attention caches advance in
@@ -3543,19 +3766,6 @@ final class LagunaRuntimeModelInner: Module {
         // table is produced by running the family's own RoPE layer over a
         // seed row, so the angles are the exact floats that layer's kernel
         // would have computed rather than a re-derivation.
-        let isSingleTokenDecode = h.dim(0) == 1 && h.dim(1) == 1
-        let fullRoPEAngles = lagunaFusedFullQKNormYaRNEnabled && isSingleTokenDecode
-            ? ropeAngleTable(
-                seed: _fullRoPEAngleSeed,
-                attention: layers[fullAttentionIdx].selfAttn,
-                cache: cache?[fullAttentionIdx])
-            : nil
-        let slidingRoPEAngles = lagunaFusedSlidingQKNormRoPEEnabled && isSingleTokenDecode
-            ? ropeAngleTable(
-                seed: _slidingRoPEAngleSeed,
-                attention: layers[slidingAttentionIdx].selfAttn,
-                cache: cache?[slidingAttentionIdx])
-            : nil
 
         for (i, layer) in layers.enumerated() {
             let isFull = layerTypes[i] == .full
@@ -3667,7 +3877,7 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     /// checkpoint parameters are never restructured; every fused layout is a
     /// derived side copy.
     func prepareFusedRuntimeWeights() {
-        var fusedArrays: [MLXArray] = []
+        var fusedArrays = model.prepareRoPEAngleAtlases()
         for layer in model.layers {
             if lagunaFusedQKVEnabled, let fused = layer.selfAttn.prepareFusedQKVWeight() {
                 fusedArrays.append(fused)
