@@ -301,9 +301,9 @@ transformed-weight identity.
 ## Useful Commands
 
 ```bash
-swift test
-MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test
-swift build -c release
+swift test --force-resolved-versions
+MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test --force-resolved-versions
+swift build -c release --force-resolved-versions
 ./setup.sh
 ./benchmark.sh --local-iterate
 ./benchmark.sh --local-submit
@@ -313,3 +313,9 @@ mlxfast clone <benchmark-id-or-name>
 mlxfast submit --model "<model name>" --note "..."
 mlxfast submissions
 ```
+
+Always pass `--force-resolved-versions` to direct `swift build` / `swift
+test` runs: the dependency graph is frozen, and a bare invocation can
+silently rewrite `Package.resolved`, after which `./setup.sh` and
+`./benchmark.sh` refuse to run until you restore it with
+`git checkout -- Package.resolved`.

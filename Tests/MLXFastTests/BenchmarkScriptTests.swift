@@ -586,7 +586,7 @@ func benchmarkWorkflowVerifiesReferenceThenBuildsAndTransformsInBenchSandbox() t
     #expect(ci.contains("\n                sh -n \"${script}\"\n"))
     #expect(ci.contains("swift build -c release --force-resolved-versions --product mlxfast-swift"))
     #expect(ci.contains("swift build -c release --force-resolved-versions --scratch-path .build-worker --product mlxfast-runtime-worker"))
-    #expect(ci.contains("swift test -c release"))
+    #expect(ci.contains("swift test -c release --force-resolved-versions"))
     #expect(ci.contains("test -x .build/release/mlxfast-swift"))
     #expect(ci.contains("test -x .build-worker/release/mlxfast-runtime-worker"))
     #expect(!ci.contains("swift test --filter"))

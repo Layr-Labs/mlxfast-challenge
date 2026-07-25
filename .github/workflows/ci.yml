@@ -96,7 +96,7 @@ jobs:
           # worker in its own .build-worker SwiftPM scratch root.
           swift build -c release --force-resolved-versions --product mlxfast-swift
           swift build -c release --force-resolved-versions --scratch-path .build-worker --product mlxfast-runtime-worker
-          swift test -c release
+          swift test -c release --force-resolved-versions
           test -x .build/release/mlxfast-swift
           test -x .build-worker/release/mlxfast-runtime-worker
 
