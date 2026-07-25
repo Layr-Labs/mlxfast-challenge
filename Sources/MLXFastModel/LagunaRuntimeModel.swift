@@ -139,6 +139,12 @@ let lagunaFusedResidualRMSNormEnabled =
 /// Full-attention counterpart: fuses per-head Q/K RMSNorm with partial YaRN
 /// RoPE. One stock FP32 probe row carries the authoritative rotary factors,
 /// while the custom kernel preserves the normalized BF16 boundary and tail.
+/// Sliding-layer per-head RMSNorm + plain RoPE fusion (see
+/// `lagunaSlidingQKNormRoPEKernel`). Set `DARKBLOOM_FUSED_SLIDING_QK_NORM_ROPE=0`
+/// to ablate.
+let lagunaFusedSlidingQKNormRoPEEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_QK_NORM_ROPE"] != "0"
+
 let lagunaFusedFullQKNormYaRNEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_QK_NORM_YARN"] != "0"
 
@@ -331,6 +337,132 @@ func lagunaFullQKNormYaRN(
     return (outputs[0], outputs[1])
 }
 
+/// Sliding-layer twin of the full-attention QK-norm+RoPE kernel above. The
+/// thirty sliding layers carry plain RoPE -- the whole 128-element head
+/// rotates, the angle scale is one, and there is no YaRN mscale -- so their
+/// per-head RMSNorm and rotation stayed on the stock four-dispatch path
+/// (`q_norm`, `k_norm`, RoPE(q), RoPE(k)) while the ten full-attention layers
+/// were fused. This kernel closes that gap: one dispatch per decode step per
+/// layer for all 72 heads, emitting the transposed `[1, heads, 1, 128]` layout
+/// attention consumes directly.
+///
+/// Exactness, link for link with the pair it replaces:
+///  * The RMSNorm half mirrors `rms_single_row` (rms_norm.metal) at
+///    axis_size 128 with N_READS 4 and a 32-thread group: lane `l` owns the
+///    contiguous block `[4l, 4l+4)`, accumulates `float(x)^2` in index order,
+///    `simd_sum`s, and applies `precise::rsqrt(acc / 128 + eps)`. The
+///    `bfloat(...)` inside `w[i] * bfloat(x[i] * inv_mean)` is load-bearing:
+///    it is the same rounding the separate kernel would have written out and
+///    the rotation would have read back.
+///  * The rotation mirrors `rope_single_impl<T, false>` for `dims == 128`:
+///    pair `p` couples elements `p` and `p + 64`, and `cos`/`sin` come from a
+///    table produced by that very kernel (see `_slidingRoPEAngleSeed`), so
+///    they are the same floats, not a re-derivation.
+private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
+    name: "laguna_sliding_qk_norm_rope_bf16_128_v1",
+    inputNames: ["raw_queries", "raw_keys", "query_weight", "key_weight", "angles"],
+    outputNames: ["queries", "keys"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint rotary_pairs = 64;
+        constexpr uint query_heads = 64;
+
+        uint head = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+
+        threadgroup float inverse_rms[1];
+
+        const device bfloat* input;
+        const device bfloat* weight;
+        if (head < query_heads) {
+            input = raw_queries + head * head_dim;
+            weight = query_weight;
+        } else {
+            input = raw_keys + (head - query_heads) * head_dim;
+            weight = key_weight;
+        }
+
+        uint base = lane * 4;
+        thread bfloat normalized[4];
+        float sum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float value = float(input[base + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        if (lane == 0) {
+            inverse_rms[0] =
+                metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < 4; ++i) {
+            normalized[i] =
+                weight[base + i] *
+                bfloat(float(input[base + i]) * inverse_rms[0]);
+        }
+
+        // Element `p + 64`, the partner of pair `p`, lives 16 lanes away.
+        thread float paired[4];
+        for (uint i = 0; i < 4; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
+        }
+
+        device bfloat* output =
+            head < query_heads
+            ? queries + head * head_dim
+            : keys + (head - query_heads) * head_dim;
+        // Every element rotates, so the lower sixteen lanes own all 64 pairs
+        // and write both halves of each.
+        if (lane < 16) {
+            for (uint i = 0; i < 4; ++i) {
+                uint pair = base + i;
+                float first = float(normalized[i]);
+                float second = paired[i];
+                float cosine = angles[pair];
+                float sine = angles[pair + rotary_pairs];
+                output[pair] = bfloat(first * cosine - second * sine);
+                output[pair + rotary_pairs] =
+                    bfloat(first * sine + second * cosine);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+func lagunaSlidingQKNormRoPE(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray
+) -> (MLXArray, MLXArray) {
+    let heads = LagunaConstants.slidingAttentionHeads
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    precondition(rawQueries.dtype == .bfloat16)
+    precondition(rawKeys.dtype == .bfloat16)
+    precondition(queryWeight.dtype == .bfloat16)
+    precondition(keyWeight.dtype == .bfloat16)
+    precondition(rawQueries.shape == [1, 1, heads * LagunaConstants.headDim])
+    precondition(rawKeys.shape == [1, 1, kvHeads * LagunaConstants.headDim])
+    precondition(queryWeight.shape == [LagunaConstants.headDim])
+    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(angles.dtype == .float32)
+    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim])
+
+    let outputs = lagunaSlidingQKNormRoPEKernel(
+        [rawQueries, rawKeys, queryWeight, keyWeight, angles],
+        grid: ((heads + kvHeads) * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [
+            [1, heads, 1, LagunaConstants.headDim],
+            [1, kvHeads, 1, LagunaConstants.headDim],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
 /// Keep the stock shapeless unary gate for prefill. Ranked measurement showed
 /// the larger gate/product graph regressing the complete prefill schedule even
 /// though its isolated steady-state subpath was slightly faster.
@@ -482,7 +614,7 @@ final class LagunaRuntimeAttention: Module {
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
-        fullRoPEAngles: MLXArray? = nil
+        qkRoPEAngles: MLXArray? = nil
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
 
@@ -508,26 +640,44 @@ final class LagunaRuntimeAttention: Module {
             values = wv(x)
         }
 
-        let useFusedFullQKNormYaRN =
-            lagunaFusedFullQKNormYaRNEnabled && !isSliding &&
+        let fusedQKNormShapesMatch =
             B == 1 && L == 1 &&
-            nHeads == LagunaConstants.fullAttentionHeads &&
             nKVHeads == LagunaConstants.numKeyValueHeads &&
             headDim == LagunaConstants.headDim &&
             queries.dtype == .bfloat16 && keys.dtype == .bfloat16 &&
             qNorm.weight.dtype == .bfloat16 && kNorm.weight.dtype == .bfloat16 &&
             queries.shape == [1, 1, nHeads * headDim] &&
-            keys.shape == [1, 1, nKVHeads * headDim] &&
-            fullRoPEAngles?.dtype == .float32 &&
-            fullRoPEAngles?.shape == [1, 1, 1, headDim / 2]
+            keys.shape == [1, 1, nKVHeads * headDim]
 
-        if useFusedFullQKNormYaRN, let fullRoPEAngles {
+        let useFusedFullQKNormYaRN =
+            lagunaFusedFullQKNormYaRNEnabled && !isSliding &&
+            fusedQKNormShapesMatch &&
+            nHeads == LagunaConstants.fullAttentionHeads &&
+            qkRoPEAngles?.dtype == .float32 &&
+            qkRoPEAngles?.shape == [1, 1, 1, headDim / 2]
+
+        let useFusedSlidingQKNormRoPE =
+            lagunaFusedSlidingQKNormRoPEEnabled && isSliding &&
+            fusedQKNormShapesMatch &&
+            nHeads == LagunaConstants.slidingAttentionHeads &&
+            qkRoPEAngles?.dtype == .float32 &&
+            qkRoPEAngles?.shape == [1, 1, 1, headDim]
+
+        if useFusedFullQKNormYaRN, let qkRoPEAngles {
             (queries, keys) = lagunaFullQKNormYaRN(
                 rawQueries: queries,
                 rawKeys: keys,
                 queryWeight: qNorm.weight,
                 keyWeight: kNorm.weight,
-                angles: fullRoPEAngles
+                angles: qkRoPEAngles
+            )
+        } else if useFusedSlidingQKNormRoPE, let qkRoPEAngles {
+            (queries, keys) = lagunaSlidingQKNormRoPE(
+                rawQueries: queries,
+                rawKeys: keys,
+                queryWeight: qNorm.weight,
+                keyWeight: kNorm.weight,
+                angles: qkRoPEAngles
             )
         } else {
             queries =
@@ -539,7 +689,7 @@ final class LagunaRuntimeAttention: Module {
         }
         values = values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
 
-        if !useFusedFullQKNormYaRN {
+        if !useFusedFullQKNormYaRN && !useFusedSlidingQKNormRoPE {
             queries = applyRotaryPosition(rope, to: queries, cache: cache)
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
@@ -2040,13 +2190,13 @@ final class LagunaRuntimeDecoderLayer: Module {
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
-        fullRoPEAngles: MLXArray? = nil
+        qkRoPEAngles: MLXArray? = nil
     ) -> MLXArray {
         let r = selfAttn(
             inputLayerNorm(x),
             mask: mask,
             cache: cache,
-            fullRoPEAngles: fullRoPEAngles
+            qkRoPEAngles: qkRoPEAngles
         )
         let h: MLXArray
         let normalized: MLXArray
@@ -2105,6 +2255,7 @@ final class LagunaRuntimeModelInner: Module {
     let fullAttentionIdx: Int
     let slidingAttentionIdx: Int
     let _fullRoPEAngleSeed: MLXArray
+    let _slidingRoPEAngleSeed: MLXArray
 
     init(_ config: LagunaConfig) {
         precondition(config.vocabSize > 0)
@@ -2127,6 +2278,27 @@ final class LagunaRuntimeModelInner: Module {
                 + Array(repeating: Float(0), count: LagunaConstants.headDim / 4),
             [1, 1, 1, LagunaConstants.headDim / 2]
         )
+        // Plain RoPE rotates the pair (p, p + 64) as
+        // `(x_p cos - x_{p+64} sin, x_p sin + x_{p+64} cos)`, so a row of ones
+        // followed by zeros comes back as exactly `[cos..., sin...]`. The
+        // full-attention seed above carries `1 / mscale` instead because YaRN
+        // scales its rotary inputs; sliding layers apply no mscale.
+        self._slidingRoPEAngleSeed = MLXArray(
+            Array(repeating: Float(1), count: LagunaConstants.headDim / 2)
+                + Array(repeating: Float(0), count: LagunaConstants.headDim / 2),
+            [1, 1, 1, LagunaConstants.headDim]
+        )
+    }
+
+    /// Runs `attention`'s own RoPE layer over `seed` at the cache's current
+    /// position, honoring a graph-valued offset when the cache carries one.
+    private func ropeAngleTable(
+        seed: MLXArray, attention: LagunaRuntimeAttention, cache: KVCache?
+    ) -> MLXArray {
+        if let graphOffset = graphOffsetArray(for: cache) {
+            return attention.rope(seed, offset: graphOffset)
+        }
+        return attention.rope(seed, offset: cache?.offset ?? 0)
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
@@ -2140,28 +2312,29 @@ final class LagunaRuntimeModelInner: Module {
         let slidingMask = createAttentionMask(
             h: h, cache: cache?[slidingAttentionIdx], windowSize: slidingWindow)
 
-        let fullRoPEAngles: MLXArray?
-        if lagunaFusedFullQKNormYaRNEnabled, h.dim(0) == 1, h.dim(1) == 1 {
-            let representativeCache = cache?[fullAttentionIdx]
-            if let graphOffset = graphOffsetArray(for: representativeCache) {
-                fullRoPEAngles =
-                    layers[fullAttentionIdx].selfAttn.rope(
-                        _fullRoPEAngleSeed,
-                        offset: graphOffset
-                    )
-            } else {
-                fullRoPEAngles =
-                    layers[fullAttentionIdx].selfAttn.rope(
-                        _fullRoPEAngleSeed,
-                        offset: representativeCache?.offset ?? 0
-                    )
-            }
-        } else {
-            fullRoPEAngles = nil
-        }
+        // One cos/sin table per attention family per decode step, shared by
+        // every layer of that family (their caches advance in lockstep). Each
+        // table is produced by running the family's own RoPE layer over a
+        // seed row, so the angles are the exact floats that layer's kernel
+        // would have computed rather than a re-derivation.
+        let isSingleTokenDecode = h.dim(0) == 1 && h.dim(1) == 1
+        let fullRoPEAngles = lagunaFusedFullQKNormYaRNEnabled && isSingleTokenDecode
+            ? ropeAngleTable(
+                seed: _fullRoPEAngleSeed,
+                attention: layers[fullAttentionIdx].selfAttn,
+                cache: cache?[fullAttentionIdx])
+            : nil
+        let slidingRoPEAngles = lagunaFusedSlidingQKNormRoPEEnabled && isSingleTokenDecode
+            ? ropeAngleTable(
+                seed: _slidingRoPEAngleSeed,
+                attention: layers[slidingAttentionIdx].selfAttn,
+                cache: cache?[slidingAttentionIdx])
+            : nil
 
         for (i, layer) in layers.enumerated() {
-            let mask = layerTypes[i] == .full ? fullMask : slidingMask
+            let isFull = layerTypes[i] == .full
+            let mask = isFull ? fullMask : slidingMask
+            let qkRoPEAngles = isFull ? fullRoPEAngles : slidingRoPEAngles
             if i == layers.count - 1, h.dim(1) > 1 {
                 if case .causal = mask {
                     h = layer.callLastPrefillRow(h, cache: cache?[i])
@@ -2170,7 +2343,7 @@ final class LagunaRuntimeModelInner: Module {
                         h,
                         mask: mask,
                         cache: cache?[i],
-                        fullRoPEAngles: fullRoPEAngles
+                        qkRoPEAngles: qkRoPEAngles
                     )
                 }
             } else {
@@ -2178,7 +2351,7 @@ final class LagunaRuntimeModelInner: Module {
                     h,
                     mask: mask,
                     cache: cache?[i],
-                    fullRoPEAngles: fullRoPEAngles
+                    qkRoPEAngles: qkRoPEAngles
                 )
             }
         }
