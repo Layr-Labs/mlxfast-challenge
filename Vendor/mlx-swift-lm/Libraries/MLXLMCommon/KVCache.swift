@@ -1841,6 +1841,214 @@ public func trimPromptCache(_ cache: [KVCache], numTokens: Int) -> Int {
     return cache.first?.trim(numTokens) ?? 0
 }
 
+// MARK: - Laguna fused K/V slab caches (Darkbloom)
+
+/// `DARKBLOOM_FUSED_KV_SLAB` (default on): single-token decode commits the
+/// step's K and V rows with ONE slice update over a shared `[2, H, S, D]`
+/// slab (plane 0 keys, plane 1 values) instead of the two separate updates.
+/// Storage layout only: attention consumes plane views holding exactly the
+/// bytes the separate buffers would hold, so every value is unchanged.
+public let lagunaFusedKVSlabCachesEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_KV_SLAB"] != "0"
+
+/// Rotating (sliding-window) cache whose decode-time storage is the fused
+/// K/V slab. Prefill runs the stock parent paths untouched; the first fused
+/// decode commit converts the populated buffers into one `[2, H, len, D]`
+/// slab (a single concat), after which each step is one slice update. The
+/// parent's `keys`/`values` are kept as plane views so every reader
+/// (`state`, `innerState`, masks, trims) sees the same data as stock.
+public final class LagunaSlabRotatingKVCache: RotatingKVCache, @unchecked Sendable {
+
+    /// `[2, H, len, D]` slab; nil until the first fused decode commit.
+    public private(set) var kvSlab: MLXArray?
+
+    private func refreshPlaneViews() {
+        keys = kvSlab![0 ..< 1]
+        values = kvSlab![1 ..< 2]
+    }
+
+    /// Mirror of the parent's private `trim(trimSize:_:)` (the leading `[2]`
+    /// plane axis rides along `.ellipsis`; keep/rotation columns unchanged).
+    private func slabTrim(trimSize: Int, _ array: MLXArray) -> MLXArray {
+        guard trimSize > 0 else { return array }
+        return concatenated(
+            [
+                array[.ellipsis, ..<keep, 0...],
+                array[.ellipsis, (trimSize + keep)..., 0...],
+            ],
+            axis: 2)
+    }
+
+    /// Stock `updateInPlace` bookkeeping (growth, trim, wrap, offsets, and
+    /// trimmed-view returns), with the slab as storage. `commit` performs
+    /// the row write(s) at the resolved index.
+    private func updateSlabInPlace(
+        tokens: Int, commit: (MLXArray, Int) -> MLXArray
+    ) -> (MLXArray, MLXArray) {
+        let prev = offset
+        var slab = kvSlab!
+
+        // May not have hit the max size yet: keep growing like stock.
+        if prev >= slab.dim(2), slab.dim(2) < maxCacheSize {
+            let newSize = Swift.min(step, maxCacheSize - prev)
+            let pad = MLXArray.zeros(
+                [2, slab.dim(1), newSize, slab.dim(3)], dtype: slab.dtype)
+            slab = concatenated([slab, pad], axis: 2)
+            idx = prev
+        }
+
+        let trimSize = slab.dim(2) - maxCacheSize
+        if trimSize > 0 {
+            slab = slabTrim(trimSize: trimSize, slab)
+            idx = maxCacheSize
+        }
+
+        if idx == maxCacheSize {
+            idx = keep
+        }
+
+        slab = commit(slab, idx)
+        kvSlab = slab
+        offset += tokens
+        idx += tokens
+        refreshPlaneViews()
+
+        if offset < maxCacheSize {
+            return (
+                keys![.ellipsis, ..<offset, 0...],
+                values![.ellipsis, ..<offset, 0...]
+            )
+        }
+        return (keys!, values!)
+    }
+
+    /// Fused one-dispatch decode commit of a `[2, H, n, D]` step.
+    public func updateKVSlab(_ kv: MLXArray) -> (MLXArray, MLXArray) {
+        if kvSlab == nil {
+            guard let k = keys, let v = values, k.dim(0) == 1,
+                k.dim(3) == v.dim(3)
+            else {
+                // No populated prefill state (never on the scored path):
+                // stock update on the split planes.
+                return update(keys: kv[0 ..< 1], values: kv[1 ..< 2])
+            }
+            kvSlab = concatenated([k, v], axis: 0)
+        }
+        let n = kv.dim(2)
+        return updateSlabInPlace(tokens: n) { slab, at in
+            var slab = slab
+            slab[.ellipsis, at ..< (at + n), 0...] = kv
+            return slab
+        }
+    }
+
+    /// Once the slab exists it is the storage of record: separate-K/V
+    /// callers decompose into two plane writes (the stock dispatch count).
+    public override func update(
+        keys newKeys: MLXArray, values newValues: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        guard kvSlab != nil else {
+            return super.update(keys: newKeys, values: newValues)
+        }
+        let n = newKeys.dim(2)
+        guard n == 1, newKeys.dim(3) == newValues.dim(3) else {
+            // Never reached on the scored path (multi-token forwards only
+            // hit fresh caches). De-convert: the plane views hold the same
+            // data, and stock concat paths handle them like any arrays.
+            kvSlab = nil
+            return super.update(keys: newKeys, values: newValues)
+        }
+        return updateSlabInPlace(tokens: n) { slab, at in
+            var slab = slab
+            slab[0 ..< 1, 0..., at ..< (at + n), 0...] = newKeys
+            slab[1 ..< 2, 0..., at ..< (at + n), 0...] = newValues
+            return slab
+        }
+    }
+}
+
+/// Standard (full-attention) cache twin of `LagunaSlabRotatingKVCache`:
+/// stock `KVCacheSimple` growth and trimmed-view returns, slab storage,
+/// one slice update per fused decode commit.
+public final class LagunaSlabKVCache: KVCacheSimple, @unchecked Sendable {
+
+    /// `[2, H, capacity, D]` slab; nil until the first fused decode commit.
+    public private(set) var kvSlab: MLXArray?
+
+    private func refreshPlaneViews() {
+        keys = kvSlab![0 ..< 1]
+        values = kvSlab![1 ..< 2]
+    }
+
+    /// Stock `KVCacheSimple.update` bookkeeping (step-chunk growth with the
+    /// partial-chunk trim, offset advance, trimmed-view returns), with the
+    /// slab as storage.
+    private func updateSlabAppend(
+        tokens: Int, commit: (MLXArray, Int) -> MLXArray
+    ) -> (MLXArray, MLXArray) {
+        let previous = offset
+        var slab = kvSlab!
+
+        if previous + tokens > slab.dim(2) {
+            let nSteps = (step + tokens - 1) / step
+            var current = slab
+            if previous % step != 0 {
+                current = current[.ellipsis, ..<previous, 0...]
+            }
+            let pad = MLXArray.zeros(
+                [2, slab.dim(1), nSteps * step, slab.dim(3)], dtype: slab.dtype)
+            slab = concatenated([current, pad], axis: 2)
+        }
+
+        slab = commit(slab, previous)
+        kvSlab = slab
+        offset = previous + tokens
+        refreshPlaneViews()
+
+        return (
+            keys![.ellipsis, ..<offset, 0...],
+            values![.ellipsis, ..<offset, 0...]
+        )
+    }
+
+    /// Fused one-dispatch decode commit of a `[2, H, n, D]` step.
+    public func updateKVSlab(_ kv: MLXArray) -> (MLXArray, MLXArray) {
+        if kvSlab == nil {
+            guard let k = keys, let v = values, k.dim(0) == 1,
+                k.dim(3) == v.dim(3)
+            else {
+                return update(keys: kv[0 ..< 1], values: kv[1 ..< 2])
+            }
+            kvSlab = concatenated([k, v], axis: 0)
+        }
+        let n = kv.dim(2)
+        return updateSlabAppend(tokens: n) { slab, at in
+            var slab = slab
+            slab[.ellipsis, at ..< (at + n), 0...] = kv
+            return slab
+        }
+    }
+
+    public override func update(
+        keys newKeys: MLXArray, values newValues: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        guard kvSlab != nil else {
+            return super.update(keys: newKeys, values: newValues)
+        }
+        let n = newKeys.dim(2)
+        guard n == 1, newKeys.dim(3) == newValues.dim(3) else {
+            kvSlab = nil
+            return super.update(keys: newKeys, values: newValues)
+        }
+        return updateSlabAppend(tokens: n) { slab, at in
+            var slab = slab
+            slab[0 ..< 1, 0..., at ..< (at + n), 0...] = newKeys
+            slab[1 ..< 2, 0..., at ..< (at + n), 0...] = newValues
+            return slab
+        }
+    }
+}
+
 // MARK: - Type Aliases
 
 /// Standard KV cache - alias to KVCacheSimple for compatibility
