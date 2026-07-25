@@ -163,6 +163,15 @@ constant bool align_K [[function_constant(202)]];
 // is byte-for-byte the upstream algorithm.
 constant bool gather_run_skip [[function_constant(203)]];
 
+// DARKBLOOM staging levers for fp_gather_qmm_rhs_nax. All default OFF: an
+// undefined bool function constant reads as false, exactly as the kernel
+// behaves today. Each is resolved once per process on the host side, so no
+// tunable magnitude ever enters the pipeline specialization key.
+constant bool stage_widest [[function_constant(204)]];
+constant bool stage_wideld [[function_constant(205)]];
+constant bool stage_runbar [[function_constant(206)]];
+constant bool stage_novol [[function_constant(207)]];
+
 using namespace metal;
 
 #define MLX_MTL_CONST static constant constexpr const
@@ -221,6 +230,17 @@ inline void dequantize(uint8_t w, U scale, threadgroup U* w_local) {
     w_local[0] = scale * Dequantize<8, U>{}(w);
   }
 }
+
+// 16B-aligned chunk used to give the Ws staging buffer a guaranteed 16B base
+// address. Metal gives no alignas on a threadgroup array of scalars, and MSL
+// has no pointer-to-integer cast for threadgroup addresses, so the alignment
+// has to come from the element type. Declaring Ws as an array of these and
+// reinterpreting to Wtype* changes nothing about the buffer's size, element
+// count, layout, or contents -- it only pins the base address.
+template <typename T>
+struct alignas(16) NAXWsChunk16 {
+  T v[16 / sizeof(T)];
+};
 
 template <
     typename T,
@@ -292,6 +312,149 @@ struct QuantizedBlockLoader {
         dequantize<T, bits>(
             src[k * bytes_per_pack], scale, dst + k * pack_factor);
         k++;
+      }
+    }
+  }
+
+  // DARKBLOOM_STAGE_WIDEST / DARKBLOOM_STAGE_WIDELD.
+  //
+  // BIT-EXACTNESS. This writes exactly the same values to exactly the same
+  // threadgroup addresses as load_unsafe(), decoded from exactly the same
+  // source bytes with exactly the same scale for every element. NO FLOAT
+  // ARITHMETIC IS TOUCHED AT ALL -- only the *width* of the device loads and
+  // the threadgroup stores changes. The per-element expression is character
+  // for character the one in dequantize<T, 4>:
+  //     scale * Dequantize<4, T>{}(byte)        (low nibble)
+  //     scale * Dequantize<4, T>{}(byte >> 4)   (high nibble)
+  // so this is a strictly stronger exactness class than a barrier removal:
+  // there is no reassociation, no accumulation-order change, and no rounding
+  // boundary anywhere in the diff.
+  //
+  // ALIGNMENT IS A CORRECTNESS PRECONDITION, NOT AN ASSUMPTION. A misaligned
+  // wide access is silent corruption, not a fault, so the preconditions are
+  // split between the two places that can actually see them:
+  //   * the HOST checks what only it knows -- the weight buffer's own byte
+  //     offset, the per-expert stride, and the tile column base (see
+  //     darkbloom_stage_wide_load_ok in quantized.cpp),
+  //   * this loader checks what only it knows -- each thread's own offset
+  //     within the tile, below, using integer arithmetic on the same
+  //     expressions the constructor used (no pointer-to-integer casts, which
+  //     MSL does not provide for threadgroup addresses).
+  // If any precondition fails the thread runs the untouched scalar path, so
+  // an unexpected shape degrades to today's code rather than corrupting.
+
+  // Elements per 16B threadgroup store, and how many such stores cover the
+  // 32 contiguous elements this thread owns.
+  MLX_MTL_CONST short kWideElems = 16 / sizeof(T);
+  MLX_MTL_CONST short kElemsPerThread = n_reads * pack_factor;
+  MLX_MTL_CONST short kWideChunks = kElemsPerThread / kWideElems;
+  MLX_MTL_CONST short kSrcBytesPerChunk = kWideElems / pack_factor;
+  // Total packed source bytes this thread reads per k-iteration.
+  MLX_MTL_CONST short kSrcBytes = n_reads * bytes_per_pack;
+
+  // Shape preconditions that depend only on the instantiation.
+  MLX_MTL_CONST bool kWidenShapeOk = (bits == 4) && (bytes_per_pack == 1) &&
+      (kWideChunks >= 1) && (kWideChunks * kWideElems == kElemsPerThread) &&
+      (kSrcBytesPerChunk * pack_factor == kWideElems) &&
+      // Every chunk must fall inside a single scale group, so that one scale
+      // covers it exactly as the scalar loop's `i` would.
+      ((n_reads_per_scale % kSrcBytesPerChunk) == 0) &&
+      (BCOLS_PACKED * BROWS >= tgp_size);
+  // A single 16B device load covers this thread's whole source run.
+  MLX_MTL_CONST bool kWideLoadShapeOk = kWidenShapeOk && (kSrcBytes == 16);
+
+  struct alignas(16) WideChunk {
+    T v[kWideElems];
+  };
+  // Sized by kSrcBytes rather than a literal 16 so the copy loop below stays
+  // in bounds for every instantiation, including the 8-bit ones where
+  // kSrcBytes is 32 and the wide-load path is statically disabled.
+  struct alignas(16) WideSrc {
+    uint8_t b[kSrcBytes];
+  };
+
+  // Byte offset of this thread's threadgroup destination, relative to the Ws
+  // base -- the same expression the constructor used for `dst`. Ws itself is
+  // 16B aligned by construction (see the NAXWsChunk16 backing store), so this
+  // offset alone decides whether a 16B store is legal.
+  short dst_byte_off() const {
+    return short((bi * dst_ld + bj * pack_factor) * sizeof(T));
+  }
+
+  // Byte offset of this thread's device source, relative to the per-expert
+  // tile base the constructor was handed. The host certifies that base.
+  int src_byte_off() const {
+    return bi * src_ld * bytes_per_pack / pack_factor + bj * bytes_per_pack;
+  }
+
+  // Exact thread-space twin of dequantize<T, bits> for bits == 4.
+  static void dequantize_pair(uint8_t w, T scale, thread T* out) {
+    out[0] = scale * Dequantize<4, T>{}(w);
+    out[1] = scale * Dequantize<4, T>{}(w >> 4);
+  }
+
+  template <bool wide_store, bool wide_load>
+  void load_unsafe_wide() const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    const bool store_ok =
+        wide_store && kWidenShapeOk && ((dst_byte_off() & 15) == 0);
+    const bool load_ok =
+        wide_load && kWideLoadShapeOk && ((src_byte_off() & 15) == 0);
+
+    // Nothing widened for this thread: run the untouched scalar path.
+    if (!store_ok && !load_ok) {
+      load_unsafe();
+      return;
+    }
+
+    uint8_t sb[kSrcBytes];
+    // if constexpr: on instantiations where a single 16B load cannot cover
+    // this thread's source run the wide-load branch is not just unreachable,
+    // it is not emitted at all.
+    bool took_wide_load = false;
+    if constexpr (kWideLoadShapeOk) {
+      if (load_ok) {
+        WideSrc packed = *((const device WideSrc*)src);
+        STEEL_PRAGMA_UNROLL
+        for (short b = 0; b < kSrcBytes; b++) {
+          sb[b] = packed.b[b];
+        }
+        took_wide_load = true;
+      }
+    }
+    if (!took_wide_load) {
+      STEEL_PRAGMA_UNROLL
+      for (short b = 0; b < kSrcBytes; b++) {
+        sb[b] = src[b * bytes_per_pack];
+      }
+    }
+
+    STEEL_PRAGMA_UNROLL
+    for (short c = 0; c < kWideChunks; c++) {
+      const short e0 = c * kWideElems;
+      const short k0 = c * kSrcBytesPerChunk;
+      // Same scale the scalar loop selects for every k in this chunk:
+      // i = k / n_reads_per_scale, constant across the chunk because
+      // kSrcBytesPerChunk divides n_reads_per_scale.
+      T scale =
+          dequantize_scale<T, group_size>(scales[k0 / n_reads_per_scale]);
+
+      WideChunk out;
+      STEEL_PRAGMA_UNROLL
+      for (short b = 0; b < kSrcBytesPerChunk; b++) {
+        dequantize_pair(sb[k0 + b], scale, &out.v[b * pack_factor]);
+      }
+
+      if (store_ok) {
+        *((threadgroup WideChunk*)(dst + e0)) = out;
+      } else {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < kWideElems; j++) {
+          dst[e0 + j] = out.v[j];
+        }
       }
     }
   }
@@ -980,7 +1143,16 @@ template <
       group_size,
       bits>;
 
-  threadgroup Wtype Ws[transpose ? BN * BK_padded : BK * BN_padded];
+  // 16B-aligned backing store for Ws: identical element count, identical
+  // contents, identical relative addresses. DARKBLOOM_STAGE_WIDEST needs Ws
+  // itself 16B-aligned so that every thread's dst = Ws + bi*BK_padded +
+  // bj*pack_factor is too (BK_padded*sizeof == 144 and bj*pack_factor*sizeof
+  // in {0, 64} are all multiples of 16).
+  constexpr int kWsElems = transpose ? BN * BK_padded : BK * BN_padded;
+  constexpr int kWsPerChunk = 16 / sizeof(Wtype);
+  threadgroup NAXWsChunk16<Wtype>
+      Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
+  threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
 
   // Compute the block
   const int K_w = K * bytes_per_pack / pack_factor;
@@ -1051,7 +1223,13 @@ template <
         break;
       }
     }
-    threadgroup_barrier(mem_flags::mem_none);
+    // DARKBLOOM_STAGE_RUNBAR: mem_none is an execution-only sync. Everything
+    // between it and the next mem_threadgroup barrier (Dtile.clear and the
+    // loader constructor) is register work, so that later barrier already
+    // orders every threadgroup access on both sides of this point.
+    if (!stage_runbar) {
+      threadgroup_barrier(mem_flags::mem_none);
+    }
 
     // --- DARKBLOOM_PREFILL_GATHER_RUNSKIP (function constant 203) ---
     // Rows this simdgroup owns are [tm, tm + sgp_sm) inside the tile; this run
@@ -1108,7 +1286,19 @@ template <
         for (int k = 0; k < K_it; k++) {
           threadgroup_barrier(mem_flags::mem_threadgroup);
           if constexpr (kAlignedN.value) {
-            loader_w.load_unsafe();
+            // Same bytes, same addresses, same nibble decode, same scale
+            // mapping -- only the access width changes. See load_unsafe_wide.
+            if (stage_widest) {
+              if (stage_wideld) {
+                loader_w.template load_unsafe_wide<true, true>();
+              } else {
+                loader_w.template load_unsafe_wide<true, false>();
+              }
+            } else if (stage_wideld) {
+              loader_w.template load_unsafe_wide<false, true>();
+            } else {
+              loader_w.load_unsafe();
+            }
           } else {
             loader_w.load_safe(
                 transpose ? short2(BK, tgp_bn) : short2(tgp_bn, BK));
@@ -1145,7 +1335,14 @@ template <
                   Btile,
                   metal::bool_constant<transpose>{});
 
-              (void)compiler_barrier;
+              // DARKBLOOM_STAGE_NOVOL: the volatile read forces a stack load
+              // and an optimization barrier on every inner step, which blocks
+              // software-pipelining the Atile load against the MMA. Dropping
+              // it touches no arithmetic and no memory the kernel reads or
+              // writes.
+              if (!stage_novol) {
+                (void)compiler_barrier;
+              }
             }
           }
 
@@ -1184,12 +1381,22 @@ template <
                   Btile,
                   metal::bool_constant<transpose>{});
 
-              (void)compiler_barrier;
+              if (!stage_novol) {
+                (void)compiler_barrier;
+              }
             }
           }
         }
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // DARKBLOOM_STAGE_RUNBAR: this barrier fences nothing. The only
+        // threadgroup array is Ws; the code between here and the next Ws
+        // access is Dtile.store*/store_slice, which reads registers and
+        // writes device memory. The write-after-read hazard against the next
+        // run's Ws stores is already covered by the mem_threadgroup barrier
+        // that immediately precedes those stores.
+        if (!stage_runbar) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
 
         // Store results to device memory. A skipped run stored nothing anyway
         // (m_lo_lim >= m_hi_lim makes every store_slice range empty), so this

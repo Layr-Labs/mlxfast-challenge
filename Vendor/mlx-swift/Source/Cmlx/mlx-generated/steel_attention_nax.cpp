@@ -6,6 +6,23 @@ const char* steel_attention_nax() {
 
 // Auto generated source for mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.h
 
+// DARKBLOOM_ATTN_QHOIST default. DEFAULT OFF: unless the host prepends a
+// `#define DARKBLOOM_ATTN_QHOIST 1` ahead of this string (see
+// get_steel_attention_nax_kernel in mlx/backend/metal/jit_kernels.cpp), the
+// kernel below is byte-for-byte the upstream algorithm.
+//
+// The flag is deliberately a preprocessor define baked into the JIT source
+// string, NOT a Metal function constant. A function constant participates in
+// the pipeline specialization key; flipping one mid-process forces a second
+// pipeline compile that can land inside a timed forward. That exact failure
+// produced a reproducible 15-24% regression for
+// DARKBLOOM_PREFILL_GATHER_RUNSKIP (see quantized.cpp). A define is resolved
+// once, when the library source string is assembled, so exactly one variant is
+// ever compiled per process.
+#ifndef DARKBLOOM_ATTN_QHOIST
+#define DARKBLOOM_ATTN_QHOIST 0
+#endif
+
 ///////////////////////////////////////////////////////////////////////////////
 // Contents from "mlx/backend/metal/kernels/steel/defines.h"
 ///////////////////////////////////////////////////////////////////////////////
@@ -1475,6 +1492,53 @@ template <
   const short lim_rows_q = params->qL_rem - tm;
   const short lim_rows_k = params->kL_rem;
 
+#if DARKBLOOM_ATTN_QHOIST
+  // DARKBLOOM_ATTN_QHOIST -- hoist the loop-invariant Q fragments.
+  //
+  // The kb loop advances K and V (`K += BK * K_strides[2]` at the bottom) but
+  // NEVER advances Q: the Q pointer is finalised above and is constant for the
+  // whole loop. The QK^T phase nevertheless re-executed `Qtile.load(...)` on
+  // every iteration, re-reading the identical TQ*TD fragments from device
+  // memory ~9 times per q-block at the frozen 512-token prefill window.
+  //
+  // Staging them once here is a PURE HOIST: the loads use the same pointer,
+  // the same offsets and the same bounds predicate as the in-loop version, and
+  // the mma consumes the identical fragment values in the identical order. No
+  // float arithmetic is touched, so no rounding boundary can move.
+  //
+  // Both loop nests are STEEL_PRAGMA_UNROLL, so every Qhoist index is a
+  // compile-time constant and the array stays in registers. If either unroll
+  // were ever dropped, Qhoist would spill to thread-local memory and this
+  // would become a pessimisation, not an optimisation.
+  //
+  // COST (BQ=64 BK=32 BD=128 WM=4 WN=1 => TQ=1 TD=8, T=bfloat16): TQ*TD = 8
+  // fragments x 8 elems x 2 B = 128 B/thread = 32 x 32-bit registers, live for
+  // the whole loop instead of one fragment (4 registers) live for part of it,
+  // so +28 registers/thread and +16 KB/threadgroup at 128 threads. See
+  // notes/21-attn-analysis.md for why that is expected to fit: this kernel
+  // allocates ZERO threadgroup memory, and on Apple family 9+ the on-chip pool
+  // is shared between registers and threadgroup memory.
+  typename NAXTile<T, 1, 1>::frag_type Qhoist[TQ * TD];
+
+  STEEL_PRAGMA_UNROLL
+  for (short iq = 0; iq < TQ; iq++) {
+    STEEL_PRAGMA_UNROLL
+    for (short id = 0; id < TD; id++) {
+      NAXTile<T, 1, 1> Qstage;
+      const int Q_load_off = iq * kU * int(params->Q_strides[2]) + id * kU;
+
+      if (!align_Q && is_last_q) {
+        Qstage.load_rows(
+            Q + Q_load_off, int(params->Q_strides[2]), lim_rows_q - iq * kU);
+      } else {
+        Qstage.load(Q + Q_load_off, int(params->Q_strides[2]));
+      }
+
+      Qhoist[iq * TD + id] = Qstage.frag_at(0, 0);
+    }
+  }
+#endif
+
   // Loop over KV seq length
   for (int kb = 0; kb < kb_lim; kb++) {
     const int is_last_k = (kb == (params->NK_aligned));
@@ -1494,9 +1558,26 @@ template <
           NAXTile<T, 1, 1> Qtile;
           NAXTile<T, 2, 1> Ktile;
 
+#if !DARKBLOOM_ATTN_QHOIST
           const int Q_load_off = iq * kU * int(params->Q_strides[2]) + id * kU;
+#endif
           const int K_load_off = ik * kU * int(params->K_strides[2]) + id * kU;
 
+#if DARKBLOOM_ATTN_QHOIST
+          // Q is loop-invariant: the kb loop advances K and V but never Q, so
+          // the load in the #else branch re-read the same addresses on every
+          // one of the ~9 K-block iterations. Consume the fragment staged
+          // before the loop instead.
+          //
+          // EXACTNESS: the staged load used the same base pointer, the same
+          // Q_load_off, the same stride and the same bounds predicate, so the
+          // bits in Qhoist are the bits this load would have returned. The mma
+          // below consumes them in the identical order. NO FLOAT ARITHMETIC IS
+          // TOUCHED AT ALL -- nothing is reassociated, no accumulation order
+          // changes, no rounding boundary moves. The only difference is WHEN
+          // the device read happened.
+          Qtile.frag_at(0, 0) = Qhoist[iq * TD + id];
+#else
           if (!align_Q && is_last_q) {
             Qtile.load_rows(
                 Q + Q_load_off,
@@ -1505,6 +1586,7 @@ template <
           } else {
             Qtile.load(Q + Q_load_off, int(params->Q_strides[2]));
           }
+#endif
 
           if (!align_K && is_last_k) {
             Ktile.load_rows(

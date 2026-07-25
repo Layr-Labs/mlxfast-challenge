@@ -1,8 +1,11 @@
 // Copyright © 2024 Apple Inc.
+#include <cstdio>
+
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/metal/jit/includes.h"
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/utils.h"
+#include "mlx/utils.h"
 
 using namespace fmt::literals;
 
@@ -1211,6 +1214,58 @@ MTL::ComputePipelineState* get_steel_attention_kernel(
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);
 }
 
+namespace {
+
+// DARKBLOOM_ATTN_QHOIST: hoist the loop-invariant Q fragments out of the
+// steel-attention K-block loop.
+//
+// The kb loop in attention_nax advances K and V but never Q, yet the QK^T
+// phase re-executed `Qtile.load(...)` on every iteration, re-reading the same
+// TQ*TD fragments from device memory. At the frozen 512-token prefill window
+// (BQ=64 BK=32 BD=128 WM=4 WN=1 => TQ=1 TD=8 TK=2, kb_lim averaging 9.00) that
+// is 8 of every 40 device fragment-loads per simdgroup per iteration, ~17.8%
+// of the loader traffic, and it drops the LSU:MMA issue ratio from 5.00 to
+// 4.11. See notes/21-attn-analysis.md.
+//
+// DEFAULT OFF, read as `== "1"`. This is an unmeasured arm: the hoist extends
+// 8 fragments' live range across the whole loop (+28 registers/thread), and if
+// that crosses an occupancy threshold it shows up as a regression, not a win.
+// It must not ship until a paired measurement says otherwise.
+//
+// WHY A #define AND NOT A FUNCTION CONSTANT. The natural home for a host-side
+// switch is scaled_dot_product_attention.cpp, but that file is not in
+// benchmark.json editablePaths, so it cannot carry one. jit_kernels.cpp is
+// editable and is where the JIT source string is assembled, which turns out to
+// be the better place anyway: a define is baked into the source text before
+// compilation and therefore CANNOT enter the Metal pipeline specialization
+// key. A function constant can, and flipping one mid-process forces a second
+// pipeline compile that can land inside a timed forward -- the exact trap that
+// produced a reproducible 15-24% regression for
+// DARKBLOOM_PREFILL_GATHER_RUNSKIP (see the note in quantized.cpp).
+//
+// Resolved once via a function-local static, so the value is constant for the
+// process. Device::get_library caches the built library in memory keyed on
+// lib_name with no on-disk persistence, so exactly one variant is ever
+// compiled and a fresh process picks up a changed environment cleanly.
+//
+// Returns a `const char*` rather than a std::string because concatenate()
+// takes its arguments by value; the empty string appends nothing.
+const char* darkbloom_attn_qhoist_define() {
+  static const bool enabled = [] {
+    const bool v = env::get_var("DARKBLOOM_ATTN_QHOIST", "") == "1";
+    // Same ground-truth discipline the STAGE arms needed: prove the arm is
+    // live before trusting its number. A #define that silently fails to reach
+    // the source string produces an arm that measures its own control.
+    if (env::get_var("DARKBLOOM_ATTN_TRACE", "") == "1") {
+      fprintf(stderr, "mlxfast: attn qhoist: enabled=%d\n", int(v));
+    }
+    return v;
+  }();
+  return enabled ? "\n#define DARKBLOOM_ATTN_QHOIST 1\n" : "";
+}
+
+} // namespace
+
 MTL::ComputePipelineState* get_steel_attention_nax_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -1229,6 +1284,7 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
     concatenate(
         kernel_source,
         metal::utils(),
+        darkbloom_attn_qhoist_define(),
         metal::steel_attention_nax(),
         get_template_definition(
             lib_name,

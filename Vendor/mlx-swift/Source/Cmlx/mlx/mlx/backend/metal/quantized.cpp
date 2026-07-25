@@ -1,6 +1,8 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
 
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
@@ -1193,6 +1195,110 @@ int darkbloom_gather_run_skip_pct() {
   return pct;
 }
 
+// DARKBLOOM_STAGE_*: attack the per-run staging cost in
+// fp_gather_qmm_rhs_nax. Independent, each default OFF, each "1" to enable.
+//
+// The duplication probe puts the routed gather-QMMs at ~54% of prefill, while
+// RUNSKIP removing ~40% of their MMA work moved prefill only 5.88%. The
+// reconciliation is that this kernel is not MMA bound: per thread per
+// k-iteration QuantizedBlockLoader issues 16 scalar 1B device weight loads, 2
+// scalar scale loads and 32 scalar 2B threadgroup stores -- 50 LSU ops
+// against ~40 for the whole Atile+Btile+MMA compute. RUNSKIP gates
+// per-simdgroup register work but the threadgroup-wide loader stays
+// unconditional, so loader cost scales with E[runs/tile]=4.92 while MMA cost
+// scales with E[runs intersecting a band]=2.93: after RUNSKIP the loader is
+// ~68% of the kernel's LSU traffic. These levers attack that.
+//
+//   DARKBLOOM_STAGE_WIDEST  fc 204  32x2B -> 4x16B threadgroup stores
+//   DARKBLOOM_STAGE_WIDELD  fc 205  16x1B -> 1x16B device weight load
+//   DARKBLOOM_STAGE_RUNBAR  fc 206  drop 2 provably dead per-run barriers
+//   DARKBLOOM_STAGE_NOVOL   fc 207  drop the vestigial volatile in the k-loop
+//
+// These compose with RUNSKIP above rather than competing with it: RUNSKIP
+// elides per-simdgroup MMA work, these cut the threadgroup-wide loader cost
+// that RUNSKIP deliberately leaves untouched to keep barriers uniform.
+//
+// Each is resolved ONCE per process, so it is fixed for the process lifetime
+// and exactly one pipeline variant is ever compiled. Never express a tunable
+// magnitude through a function constant: anything in the specialization key
+// that changes mid-process forces a JIT build that can land inside a timed
+// region (see notes/12, the 1:N dispatch-prefix regression).
+
+bool darkbloom_stage_flag(const char* name) {
+  auto v = env::get_var(name, "");
+  return v == "1";
+}
+
+bool darkbloom_stage_widest() {
+  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_WIDEST");
+  return v;
+}
+
+bool darkbloom_stage_wideld() {
+  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_WIDELD");
+  return v;
+}
+
+bool darkbloom_stage_runbar() {
+  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_RUNBAR");
+  return v;
+}
+
+bool darkbloom_stage_novol() {
+  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_NOVOL");
+  return v;
+}
+
+// Host half of the wide-access alignment contract. The kernel checks each
+// thread's own offset within a tile; only the host can see the three things
+// below, and a misaligned 16B load is silent corruption rather than a fault,
+// so every one of them is checked rather than assumed.
+//
+//   1. The weight array's own byte offset into its Metal buffer. MLX binds
+//      `a.offset() + offset`, so a sliced/offset weight array would shift
+//      every address the kernel derives.
+//   2. The per-expert stride. The kernel advances by `index * stride_w`
+//      bytes; for Laguna this is N*K/2 = 512*2048/2 = 524288 for gate/up and
+//      2048*512/2 = 524288 for down -- both multiples of 16, so every one of
+//      the 256 experts keeps a 16B-aligned base. This is an invariant of the
+//      shape, and it is verified here rather than trusted.
+//   3. The tile column base. The kernel adds `y_col * K/2` bytes with y_col a
+//      multiple of bn = 64, so the term is a multiple of 32*K -- but only if
+//      K itself is even, which is checked.
+//
+// The x/y row bases are irrelevant: this lever only widens weight staging.
+bool darkbloom_stage_wide_load_ok(
+    const array& w,
+    bool transpose,
+    int bits,
+    int N,
+    int K,
+    int bn) {
+  if (bits != 4) {
+    return false;
+  }
+  // Packed 4-bit: two weights per byte.
+  if ((K % 2) != 0 || (N % 2) != 0) {
+    return false;
+  }
+  // (1) buffer offset of the weight array itself.
+  if ((w.offset() % 16) != 0) {
+    return false;
+  }
+  // (2) per-expert stride, in bytes, exactly as the kernel computes it.
+  const int64_t stride_w =
+      transpose ? int64_t(N) * (K / 2) : int64_t(K) * (N / 2);
+  if ((stride_w % 16) != 0) {
+    return false;
+  }
+  // (3) tile column base, in bytes, for every tile the grid can produce.
+  const int64_t col_step = transpose ? int64_t(bn) * (K / 2) : int64_t(bn) / 2;
+  if ((col_step % 16) != 0) {
+    return false;
+  }
+  return true;
+}
+
 } // namespace
 
 void gather_qmm_rhs_nax(
@@ -1277,12 +1383,56 @@ void gather_qmm_rhs_nax(
   // JIT compile, which the partial dial then modulates via a runtime scalar.
   const bool run_skip = darkbloom_gather_run_skip_enabled();
   const int run_skip_pct = run_skip ? darkbloom_gather_run_skip_pct() : 100;
+  // DARKBLOOM_STAGE_*. Widening is additionally gated on the host-side
+  // alignment certification; WIDELD implies reading the packed weights
+  // through a 16B type, so it needs the device-side guarantee, while WIDEST
+  // only needs the threadgroup one (Ws is 16B aligned by construction in the
+  // kernel). Both are resolved once per process, so the specialization key is
+  // fixed for the process lifetime.
+  const bool wide_ok =
+      darkbloom_stage_wide_load_ok(w, transpose, bits, N, K, bn);
+  const bool stage_widest = darkbloom_stage_widest();
+  const bool stage_wideld = darkbloom_stage_wideld() && wide_ok;
+  const bool stage_runbar = darkbloom_stage_runbar();
+  const bool stage_novol = darkbloom_stage_novol();
+
+  // Ground truth for the A/B harness. `stage_wideld` is silently downgraded
+  // to false when the host alignment certification declines, and `wide_ok`
+  // depends on `w.offset()`, which is a runtime property no static reading of
+  // the source can settle. Without this, a rejected gate is indistinguishable
+  // from a lever that does nothing -- the exact confound that makes an
+  // A/B arm meaningless. One shot per process, default off, stderr only.
+  if (darkbloom_stage_flag("DARKBLOOM_STAGE_TRACE")) {
+    static std::once_flag once;
+    std::call_once(once, [&]() {
+      fprintf(
+          stderr,
+          "mlxfast: stage active: widest=%d wideld=%d(req=%d wide_ok=%d) "
+          "runbar=%d novol=%d w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d\n",
+          int(stage_widest),
+          int(stage_wideld),
+          int(darkbloom_stage_wideld()),
+          int(wide_ok),
+          int(stage_runbar),
+          int(stage_novol),
+          size_t(w.offset()),
+          int(transpose),
+          bits,
+          N,
+          K,
+          bn);
+    });
+  }
 
   metal::MTLFCList func_consts = {
       {&align_M, MTL::DataType::DataTypeBool, 200},
       {&align_N, MTL::DataType::DataTypeBool, 201},
       {&align_K, MTL::DataType::DataTypeBool, 202},
       {&run_skip, MTL::DataType::DataTypeBool, 203},
+      {&stage_widest, MTL::DataType::DataTypeBool, 204},
+      {&stage_wideld, MTL::DataType::DataTypeBool, 205},
+      {&stage_runbar, MTL::DataType::DataTypeBool, 206},
+      {&stage_novol, MTL::DataType::DataTypeBool, 207},
   };
 
   // And the kernel hash that includes the function constants
@@ -1298,7 +1448,12 @@ void gather_qmm_rhs_nax(
       "_align_K_",
       align_K ? 't' : 'n',
       "_rs_",
-      run_skip ? 't' : 'n');
+      run_skip ? 't' : 'n',
+      "_stg_",
+      stage_widest ? 'W' : 'n',
+      stage_wideld ? 'L' : 'n',
+      stage_runbar ? 'B' : 'n',
+      stage_novol ? 'V' : 'n');
 
   // Get and set the kernel
   auto& compute_encoder = metal::get_command_encoder(s);
