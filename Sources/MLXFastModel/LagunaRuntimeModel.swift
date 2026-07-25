@@ -2719,6 +2719,140 @@ private let lagunaDecodeRouterCastSinkEnabled =
 private let lagunaDecodeRouterNormSinkEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTER_NORM"] != "0"
 
+/// Prefill counterpart of the fused decode router: one dispatch per sparse
+/// layer replaces the stock multi-token routing chain (FP32 cast, sigmoid,
+/// correction-bias add, negate, `argPartition`'s full 256-wide merge argsort,
+/// the top-8 slice, `takeAlong`, and — when `norm_topk_prob` is set — the
+/// row sum and broadcast divide).
+///
+/// DEFAULT OFF: submission `fe01af9` shipped this together with the prefill
+/// MoE tail and ranked **-0.68%** against its own base (1.11254 vs 1.12019).
+/// The per-lane predecessor-count selection is ~10x the ALU of the batched
+/// merge sort it replaced, and at 512 rows the stock sort amortizes to a few
+/// microseconds per layer — there was nothing to save, only kernel shape to
+/// lose. Kept behind `DARKBLOOM_PREFILL_ROUTER_TOP8=1` because the
+/// bit-exactness argument (Metal `ArgPartition` IS the stable merge argsort)
+/// is verified and useful.
+private let lagunaPrefillRouterTop8Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ROUTER_TOP8"] == "1"
+
+/// Prefill MoE tail fusion: the weighted expert-output combine, the fixed
+/// 2.5 routed scale, the shared-expert add and the residual add collapse
+/// into one elementwise kernel, so the `[1, L, 8, 2048]` expert bank is read
+/// once instead of materializing three more `[1, L, 2048]`-sized
+/// intermediates. Set `DARKBLOOM_PREFILL_MOE_TAIL=0` to restore the stock
+/// ops.
+private let lagunaPrefillMoETailEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_MOE_TAIL"] != "0"
+
+/// Batched top-8 selection for multi-token (prefill) routing.
+///
+/// Exactness against the stock chain it replaces, per row:
+///  * The sigmoid is the same numerically-stable form the FP32 `sigmoid`
+///    kernel computes after the standalone cast (`float(bfloat)` widening is
+///    exact), already ranked-validated by the decode router kernel.
+///  * The selection reproduces `argPartition(-scoresForChoice, kth: 7)`
+///    exactly: on Metal `ArgPartition::eval_gpu` IS `gpu_merge_sort`
+///    (sort.cpp routes it to the same stable merge argsort as `argSort`), so
+///    the stock "partition" is a fully sorted row. `laguna_router_key_before`
+///    is a strict total order (choice key, then original expert index, with
+///    the sort's NaN placement), so counting predecessors gives every expert
+///    a unique rank equal to its stable-argsort position; ranks 0..<8 emit in
+///    rank order, which is byte-identical to the stock argsort slice.
+///  * Mixture weights are the pre-bias sigmoid scores of the selected
+///    experts, exactly `takeAlong(scores, inds)`.
+///  * The normalizing epilogue reproduces `weights.sum(axis: -1)` (an
+///    8-element `row_reduce_small` walked in index order from zero) and the
+///    IEEE FP32 broadcast divide — the same two dispatches the decode norm
+///    sink already replaces, one row at a time.
+private func lagunaPrefillRouterTop8KernelSource(normalizing: Bool) -> String {
+    let epilogue =
+        normalizing
+        ? """
+                float total = 0.0f;
+                for (uint i = 0; i < 8; ++i) {
+                    total = selected_scores[i] + total;
+                }
+                router_scores[row * 8 + lane] = selected_scores[lane] / total;
+        """
+        : """
+                router_scores[row * 8 + lane] = selected_scores[lane];
+        """
+    return """
+        uint lane = thread_position_in_threadgroup.x;
+        uint row = threadgroup_position_in_grid.y;
+
+        threadgroup float choice_keys[256];
+        threadgroup float selected_scores[8];
+
+        float x = float(logits[row * 256 + lane]);
+        float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+        float score = x < 0.0f ? y : 1.0f - y;
+        float corrected = score + float(correction_bias[lane]);
+        float my_key = -corrected;
+        choice_keys[lane] = my_key;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Stable-argsort rank by predecessor count under the strict total
+        // order (key, then original index). Ranks are a permutation of
+        // 0..255, so the eight winners land in distinct output slots in
+        // exactly the stock argsort-slice order.
+        uint rank = 0;
+        for (uint j = 0; j < 256; ++j) {
+            rank += laguna_router_key_before(
+                choice_keys[j], j, my_key, lane) ? 1 : 0;
+        }
+        if (rank < 8) {
+            router_indices[row * 8 + rank] = lane;
+            selected_scores[rank] = score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (lane < 8) {
+        \(epilogue)
+        }
+        """
+}
+
+private let lagunaPrefillRouterTop8Kernel = MLXFast.metalKernel(
+    name: "laguna_prefill_router_top8_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaPrefillRouterTop8KernelSource(normalizing: false),
+    header: lagunaDecodeRouterTop8Header,
+    ensureRowContiguous: true
+)
+
+private let lagunaPrefillRouterTop8NormalizingKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_router_top8_norm_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaPrefillRouterTop8KernelSource(normalizing: true),
+    header: lagunaDecodeRouterTop8Header,
+    ensureRowContiguous: true
+)
+
+private func lagunaPrefillRouterTop8(
+    logits: MLXArray, correctionBias: MLXArray, rows: Int, normalizing: Bool
+) -> (MLXArray, MLXArray) {
+    precondition(logits.dtype == .bfloat16 || logits.dtype == .float32)
+    precondition(correctionBias.dtype == .float32)
+    precondition(logits.size == rows * 256)
+    precondition(correctionBias.size == 256)
+
+    let kernel =
+        normalizing
+        ? lagunaPrefillRouterTop8NormalizingKernel : lagunaPrefillRouterTop8Kernel
+    let outputs = kernel(
+        [logits, correctionBias],
+        grid: (256, rows, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1, rows, 8], [1, rows, 8]],
+        outputDTypes: [.uint32, .float32]
+    )
+    return (outputs[0], outputs[1])
+}
+
 /// Sigmoid top-k router. The routing math mirrors the vendored
 /// `LagunaMoEGate` exactly (sigmoid scores, correction bias added only for
 /// expert CHOICE, mixture weights taken from the pre-bias scores, optional
@@ -2747,6 +2881,24 @@ final class LagunaRuntimeMoEGate: Module {
         let projectedLogits = logits ?? x.matmul(weight.T)
         let inds: MLXArray
         var weights: MLXArray
+        if lagunaPrefillRouterTop8Enabled,
+            routerLogitSoftcapping == 0,
+            topK == 8,
+            projectedLogits.dtype == .bfloat16,
+            projectedLogits.ndim == 3,
+            projectedLogits.dim(0) == 1,
+            projectedLogits.dim(1) > 1,
+            projectedLogits.dim(2) == 256,
+            eScoreCorrectionBias.size == 256
+        {
+            lagunaTrace("prefill router top8")
+            return lagunaPrefillRouterTop8(
+                logits: projectedLogits,
+                correctionBias: eScoreCorrectionBias.asType(.float32),
+                rows: projectedLogits.dim(1),
+                normalizing: normTopkProb
+            )
+        }
         if lagunaDecodeRouterTop8Enabled,
             lagunaDecodeRouterCastSinkEnabled,
             routerLogitSoftcapping == 0,
@@ -2791,6 +2943,91 @@ final class LagunaRuntimeMoEGate: Module {
         }
         return (inds, weights)
     }
+}
+
+/// Prefill MoE tail: weighted expert combine + routed scale + shared add +
+/// residual add in one elementwise dispatch.
+///
+/// Exactness, op for op against the stock chain (`weightedExpertSum`, the
+/// scalar multiply, and the two adds), whose arithmetic the promoted decode
+/// down-reduce kernel already reproduces bit-exactly one row at a time:
+///  * `weights.asType(y.dtype)` is the FP32→BF16 convert of each router
+///    weight, done here per weight before any product.
+///  * The multiply materializes `bfloat(y * w)` per element — the same
+///    single-rounding BF16 product the compiled elementwise kernel writes.
+///  * The `.sum(axis: -2)` over eight expert slots takes MLX's
+///    `col_reduce_small` path (reduction size 8, stride 2048): each slot is
+///    `op(value, init == 0)` and the combine walks slots in ascending order
+///    with a BF16 accumulator, i.e. `total = bfloat(product + total)` from
+///    zero in slot order. (`x + 0` is exact in BF16 except `-0`, which both
+///    forms canonicalize identically.)
+///  * The routed scale is `y * 2.5` with the scalar constructed in the BF16
+///    result dtype (2.5 is exactly representable), one rounding.
+///  * `r2 = scaled + shared` and `residual + r2` keep the stock operand
+///    order and one BF16 rounding each.
+private let lagunaPrefillMoETailKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_moe_tail_bf16_v1",
+    inputNames: ["expert_outputs", "router_weights", "shared_output", "residual"],
+    outputNames: ["output"],
+    source: """
+        constexpr uint hidden = 2048;
+        constexpr uint experts = 8;
+        constexpr uint n_cols = 4;
+
+        uint row = thread_position_in_grid.y;
+        uint col = thread_position_in_grid.x * n_cols;
+
+        const device bfloat* expert_row =
+            expert_outputs + (row * experts) * hidden + col;
+        const device float* weight_row = router_weights + row * experts;
+
+        bfloat expert_weights[experts];
+        for (uint e = 0; e < experts; ++e) {
+            expert_weights[e] = bfloat(weight_row[e]);
+        }
+
+        for (uint i = 0; i < n_cols; ++i) {
+            bfloat total = bfloat(0);
+            for (uint e = 0; e < experts; ++e) {
+                bfloat product =
+                    bfloat(expert_row[e * hidden + i] * expert_weights[e]);
+                total = bfloat(product + total);
+            }
+            bfloat scaled = bfloat(total * bfloat(2.5f));
+            bfloat r2 = bfloat(scaled + shared_output[row * hidden + col + i]);
+            output[row * hidden + col + i] =
+                bfloat(residual[row * hidden + col + i] + r2);
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private func lagunaPrefillMoETail(
+    expertOutputs: MLXArray,
+    routerWeights: MLXArray,
+    sharedOutput: MLXArray,
+    residual: MLXArray
+) -> MLXArray {
+    let rows = expertOutputs.dim(1)
+    precondition(expertOutputs.dtype == .bfloat16)
+    precondition(
+        expertOutputs.shape == [
+            1, rows, LagunaConstants.numExpertsPerTok, LagunaConstants.hiddenSize,
+        ])
+    precondition(routerWeights.dtype == .float32)
+    precondition(routerWeights.shape == [1, rows, LagunaConstants.numExpertsPerTok])
+    precondition(sharedOutput.dtype == .bfloat16)
+    precondition(sharedOutput.shape == [1, rows, LagunaConstants.hiddenSize])
+    precondition(residual.dtype == .bfloat16)
+    precondition(residual.shape == [1, rows, LagunaConstants.hiddenSize])
+
+    return lagunaPrefillMoETailKernel(
+        [expertOutputs, routerWeights, sharedOutput, residual],
+        grid: (LagunaConstants.hiddenSize / 4, rows, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1, rows, LagunaConstants.hiddenSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
 }
 
 final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
@@ -3062,6 +3299,39 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
             }
         } else {
             y = switchMLP(x, inds)
+            if lagunaPrefillMoETailEnabled,
+                let residual,
+                x.dim(1) > 1,
+                y.dtype == .bfloat16,
+                y.ndim == 4,
+                y.dim(0) == 1,
+                y.dim(1) == x.dim(1),
+                y.dim(2) == LagunaConstants.numExpertsPerTok,
+                y.dim(3) == LagunaConstants.hiddenSize,
+                weights.dtype == .float32,
+                weights.shape == [1, x.dim(1), LagunaConstants.numExpertsPerTok],
+                routedScalingFactor == Float(LagunaConstants.moeRoutedScalingFactor),
+                residual.dtype == .bfloat16,
+                residual.shape == [1, x.dim(1), LagunaConstants.hiddenSize]
+            {
+                let sharedOut = sharedExpert(x)
+                if sharedOut.dtype == .bfloat16, sharedOut.shape == residual.shape {
+                    lagunaTrace("prefill moe tail")
+                    return lagunaPrefillMoETail(
+                        expertOutputs: y,
+                        routerWeights: weights,
+                        sharedOutput: sharedOut,
+                        residual: residual
+                    )
+                }
+                // Unreachable with the stock shared expert; keep the stock
+                // arithmetic while reusing the already-built shared output.
+                var reduced = weightedExpertSum(y, weights.asType(y.dtype))
+                if routedScalingFactor != 1 {
+                    reduced = reduced * routedScalingFactor
+                }
+                return residual + (reduced + sharedOut)
+            }
         }
         if !routedAlreadyReduced {
             y = weightedExpertSum(y, weights.asType(y.dtype))
@@ -3165,6 +3435,17 @@ final class LagunaRuntimeDecoderLayer: Module {
             normalized.shape == [1, 1, LagunaConstants.hiddenSize],
             h.dtype == .bfloat16,
             h.shape == normalized.shape,
+            let sparse = mlp as? LagunaRuntimeSparseMoEBlock
+        {
+            return sparse(normalized, residual: h, routerLogits: routerLogits)
+        }
+        // Multi-token prefill: hand the residual to the sparse block so the
+        // prefill MoE tail kernel can fold the final residual add. When any
+        // guard inside declines, the block computes `residual + (y + shared)`
+        // itself — the identical stock ops this call site would otherwise
+        // issue.
+        if lagunaPrefillMoETailEnabled,
+            x.dim(1) > 1,
             let sparse = mlp as? LagunaRuntimeSparseMoEBlock
         {
             return sparse(normalized, residual: h, routerLogits: routerLogits)
