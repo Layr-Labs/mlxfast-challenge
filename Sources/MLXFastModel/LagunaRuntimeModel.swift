@@ -154,8 +154,42 @@ let lagunaFusedRoutedDownReduceEnabled =
 /// showed the fused bank helps decode (~+1.9%) but badly hurts the M=512
 /// sorted gather-GEMM prefill path, so prefill always dispatches the stock
 /// separate banks.
+///
+/// That prefill finding pre-dates RUNSKIP. See
+/// `DARKBLOOM_PREFILL_FUSED_GATE_UP` immediately below for the current,
+/// separately-flagged, post-RUNSKIP re-measurement of the same fusion idea
+/// applied to the sorted prefill path -- this flag and its history are left
+/// as-is (decode-only) rather than folded together, so each can be ablated
+/// independently.
 let lagunaFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_GATE_UP"] != "0"
+
+/// `DARKBLOOM_PREFILL_FUSED_GATE_UP` (default on; set "0" to disable):
+/// prefill/SORTED-regime counterpart to `DARKBLOOM_FUSED_ROUTED_GATE_UP`
+/// above. Serves the multi-token sorted gather-GEMM path (`indices.size >=
+/// 64` -- `SwitchGLU`'s own threshold for taking `gatherSort`, which every
+/// timed 512-token prefill request clears) from the same retained
+/// row-concatenated NVFP4 `[gate; up]` bank the decode path already keeps
+/// resident, instead of the stock two separate sorted gather-QMMs
+/// (`gate_proj` then `up_proj`). Mechanism: one N=1024 gather-GEMM has half
+/// the run-loop iterations and dispatch overhead of two N=512 ones, and,
+/// like the decode fusion above, each *gathered* output row's K-loop and
+/// scale application reads only its own weight/scale row independent of
+/// which bank that row lives in -- so the fused dispatch is bit-exact
+/// against the two separate ones it replaces.
+///
+/// The `DARKBLOOM_FUSED_ROUTED_GATE_UP` comment above records an earlier
+/// ablation that measured this same idea hurting the M=512 sorted prefill
+/// path; that measurement pre-dates RUNSKIP. A later measurement on a
+/// RUNSKIP-era tree (note ba4561c, never landed) found this specific
+/// prefill fusion a ~4% prefill win (373.5us -> 358.5us) instead. Shipped
+/// default ON, behind its own flag, so it can be ablated and re-measured on
+/// the ranked box independently of both the older decode-only flag and the
+/// stale prefill finding. See `lagunaFusedSortedRoutedGateUp` and its call
+/// site in `LagunaRuntimeSparseMoEBlock.forward` for the exact op-for-op
+/// mirror of `SwitchGLU.callAsFunction`'s sorted branch.
+let lagunaPrefillFusedRoutedGateUpEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_GATE_UP"] != "0"
 
 /// Decode post-attention residual + RMSNorm fusion. The kernel emits
 /// both the rounded BF16 residual (needed by the following skip connection)
@@ -232,6 +266,28 @@ let lagunaFusedFullQKNormYaRNEnabled =
 /// values. Set `DARKBLOOM_ROPE_ANGLE_ATLAS=0` to ablate.
 let lagunaRoPEAngleAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] != "0"
+
+/// `DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU` (default on; set "0" to disable):
+/// after checkpoint load, retain one row-concatenated BF16 `[gate; up]` bank
+/// for layer 0's dense (non-quantized) MLP and serve single-token decode's
+/// gate/up projections plus the SiLU-gated product from one dispatch (see
+/// `LagunaRuntimeMLP.fusedDenseDownResidual` and `lagunaDenseGateUpSwiGLU`).
+/// Layer 0 is the only layer whose MLP is plain BF16 `Linear` rather than
+/// NVFP4 `QuantizedLinear`, so every gate/up fusion flag above (all guarded
+/// on `QuantizedLinear`) always declines for it; this is its dedicated
+/// counterpart.
+let lagunaFusedDenseGateUpSwiGLUEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU"] != "0"
+
+/// `DARKBLOOM_FUSED_DENSE_DOWN_RESIDUAL` (default on; set "0" to disable):
+/// layer-0-only decode fusion of the dense MLP's down projection with the
+/// decoder layer's `h + r2` residual add (see `lagunaDenseDownResidual`).
+/// Every other down+residual fusion flag in this file requires
+/// `mlp as? LagunaRuntimeSparseMoEBlock`, which layer 0 never satisfies, so
+/// layer 0's residual add was the one MLP-side decode dispatch left with no
+/// fusion counterpart at all before this flag.
+let lagunaFusedDenseDownResidualEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_DENSE_DOWN_RESIDUAL"] != "0"
 
 private let lagunaRoPEAngleAtlasLength = 4096
 
@@ -2420,6 +2476,224 @@ func lagunaRoutedSharedDownResidual(
     )[0]
 }
 
+// MARK: - Layer-0 dense MLP fusion (BF16, no quantization)
+//
+// Layer 0's `gate_proj`/`up_proj`/`down_proj` are plain BF16 `Linear`, never
+// NVFP4 `QuantizedLinear` -- every fused-bank guard above this point casts to
+// `QuantizedLinear` and always declines for layer 0, so it fell all the way
+// through to four fully separate stock dispatches (gate GEMV, up GEMV,
+// `compiledSiluProduct`, down GEMV) plus the decoder layer's own separate
+// `h + r2` residual add. The two kernels below close that gap.
+//
+// `laguna_dense_gate_up_swiglu_bf16_v1` fuses the gate and up projections
+// plus the SiLU-gated product into one dispatch (3 dispatches -> 1).
+// Exactness: the row loop is the plain-BF16 "projections" tiling already
+// shipped and documented on `lagunaFusedQKVProjectionSource` above (SM 1,
+// SN 32, TM 4, TN 4, BN 1 -- see that kernel's doc comment) for this exact
+// out_vec/in_vec pair: 8192 output rows over a 2048-wide input is precisely
+// the sliding-attention Q projection's shape (`slidingAttentionHeads(64) *
+// headDim(128) == 8192`, dispatched at lines 932-983 above), so that same row
+// loop -- `block_width 128`, `blocks = in_vec_size / 128`, `rows_per_group
+// 64`, `rows_per_thread 4`, one `vec<bfloat, 4>` read per block, FP32
+// accumulation, the `simd_shuffle_down` ladder (16, 8, 4, 2, 1), one BF16
+// round -- is bit-exact here too. The loop is duplicated per output row (one
+// pass over `gate_weight` and one over the row-shifted `up_weight` half of
+// the same fused bank) so a single shared read of the input row produces both
+// the gate row and its matching up row, generalizing the two-lane-per-simdgroup
+// pairing already shipped in `lagunaSharedSwiGLUQMVKernel` above (lines
+// 1664-1688, `outputs_per_simd == 2`) to this file's standard
+// `rows_per_thread == 4`. The SiLU epilogue -- round each accumulator to
+// BF16 first (matching stock `gateProj`/`upProj`'s own output rounding), then
+// the numerically-stable sigmoid and the BF16 product -- is copied verbatim
+// from that same kernel's tail (lines 1691-1704), which is dtype-generic (not
+// NVFP4-specific) and already reproduces `compiledSiluProduct`'s exact BF16
+// rounding boundary.
+//
+// `laguna_dense_down_residual_bf16_v1` fuses the down projection with the
+// decoder layer's residual add (2 dispatches -> 1). Exactness: the row loop
+// is the plain-BF16 row loop already shipped on
+// `lagunaGatedOutputProjectionSource` above for the identical out_vec/in_vec
+// pair -- 2048 output rows over an 8192-wide input is exactly the
+// sliding-attention output projection's shape (in_vec = heads(64) *
+// headDim(128) == 8192, dispatched at lines 1064-1117 above) -- minus that
+// kernel's per-head gate multiply (layer 0's down projection has no gate to
+// fold in), so `block_width 128`, `blocks = in_vec_size / 128`, `rows_per_group
+// 16`, `rows_per_thread 4` reproduce the identical MLX gemv tiling for this
+// shape. The epilogue mirrors `lagunaSharedDownResidualKernel`'s tail
+// rounding order above (lines 1789-1797): round the GEMV accumulator to BF16
+// first, matching stock `downProj`'s own output rounding, then add the
+// residual and round once more -- reproducing stock `h + r2` bit-for-bit.
+private let lagunaDenseGateUpSwiGLUKernel = MLXFast.metalKernel(
+    name: "laguna_dense_gate_up_swiglu_bf16_v1",
+    inputNames: ["input", "fused_weight"],
+    outputNames: ["activated"],
+    source: """
+        constexpr uint in_vec_size = 2048;
+        constexpr uint output_width = 8192;
+        constexpr uint rows_per_thread = 4;
+        constexpr uint values_per_thread = 4;
+        constexpr uint block_width = 128;
+        constexpr uint blocks = in_vec_size / block_width;
+        constexpr uint rows_per_group = 64;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        uint row_base = tile * rows_per_group + simd_group * rows_per_thread;
+
+        thread float gate_result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread float up_result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread float coefficients[values_per_thread];
+
+        uint column = lane * values_per_thread;
+        for (uint block = 0; block < blocks; ++block) {
+            for (uint i = 0; i < values_per_thread; ++i) {
+                coefficients[i] = float(input[column + i]);
+            }
+            for (uint row = 0; row < rows_per_thread; ++row) {
+                const device vec<bfloat, 4>* gate_row_values =
+                    (const device vec<bfloat, 4>*)(
+                        fused_weight + (row_base + row) * in_vec_size + column);
+                const vec<bfloat, 4> gw = gate_row_values[0];
+                const device vec<bfloat, 4>* up_row_values =
+                    (const device vec<bfloat, 4>*)(
+                        fused_weight +
+                        (output_width + row_base + row) * in_vec_size + column);
+                const vec<bfloat, 4> uw = up_row_values[0];
+                for (uint i = 0; i < values_per_thread; ++i) {
+                    gate_result[row] += float(gw[i]) * coefficients[i];
+                    up_result[row] += float(uw[i]) * coefficients[i];
+                }
+            }
+            column += block_width;
+        }
+
+        for (uint row = 0; row < rows_per_thread; ++row) {
+            for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                gate_result[row] +=
+                    metal::simd_shuffle_down(gate_result[row], delta);
+                up_result[row] +=
+                    metal::simd_shuffle_down(up_result[row], delta);
+            }
+        }
+        if (lane == 0) {
+            for (uint row = 0; row < rows_per_thread; ++row) {
+                bfloat gate = bfloat(gate_result[row]);
+                bfloat up = bfloat(up_result[row]);
+                bfloat exp_abs = metal::exp(metal::abs(gate));
+                bfloat denominator = bfloat(1) + exp_abs;
+                bfloat y = bfloat(1) / denominator;
+                bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+                bfloat silu = bfloat(gate * sigmoid);
+                activated[row_base + row] = bfloat(silu * up);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// `fusedWeight` is `concatenated([gateProj.weight, upProj.weight], axis: 0)`
+/// -- gate rows first -- built once by `LagunaRuntimeMLP.prepareFusedDenseGateUp()`.
+func lagunaDenseGateUpSwiGLU(
+    _ input: MLXArray,
+    fusedWeight: MLXArray
+) -> MLXArray {
+    precondition(input.dtype == .bfloat16)
+    precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
+    precondition(fusedWeight.dtype == .bfloat16)
+    precondition(
+        fusedWeight.shape == [
+            2 * LagunaConstants.denseIntermediateSize, LagunaConstants.hiddenSize,
+        ])
+
+    return lagunaDenseGateUpSwiGLUKernel(
+        [input, fusedWeight],
+        grid: ((LagunaConstants.denseIntermediateSize / 64) * 512, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [[1, 1, LagunaConstants.denseIntermediateSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+private let lagunaDenseDownResidualKernel = MLXFast.metalKernel(
+    name: "laguna_dense_down_residual_bf16_v1",
+    inputNames: ["activated", "down_weight", "residual"],
+    outputNames: ["output"],
+    source: """
+        constexpr uint in_vec_size = 8192;
+        constexpr uint rows_per_thread = 4;
+        constexpr uint values_per_thread = 4;
+        constexpr uint block_width = 128;
+        constexpr uint blocks = in_vec_size / block_width;
+        constexpr uint rows_per_group = 16;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        uint row_base = tile * rows_per_group + simd_group * rows_per_thread;
+
+        thread float result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread float coefficients[values_per_thread];
+
+        uint column = lane * values_per_thread;
+        for (uint block = 0; block < blocks; ++block) {
+            for (uint i = 0; i < values_per_thread; ++i) {
+                coefficients[i] = float(activated[column + i]);
+            }
+            for (uint row = 0; row < rows_per_thread; ++row) {
+                const device vec<bfloat, 4>* row_values =
+                    (const device vec<bfloat, 4>*)(
+                        down_weight + (row_base + row) * in_vec_size + column);
+                const vec<bfloat, 4> w = row_values[0];
+                for (uint i = 0; i < values_per_thread; ++i) {
+                    result[row] += float(w[i]) * coefficients[i];
+                }
+            }
+            column += block_width;
+        }
+
+        for (uint row = 0; row < rows_per_thread; ++row) {
+            for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                result[row] += metal::simd_shuffle_down(result[row], delta);
+            }
+        }
+        if (lane == 0) {
+            for (uint row = 0; row < rows_per_thread; ++row) {
+                bfloat down = bfloat(result[row]);
+                output[row_base + row] =
+                    bfloat(residual[row_base + row] + down);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+func lagunaDenseDownResidual(
+    _ activated: MLXArray,
+    downWeight: MLXArray,
+    residual: MLXArray
+) -> MLXArray {
+    precondition(activated.dtype == .bfloat16)
+    precondition(activated.shape == [1, 1, LagunaConstants.denseIntermediateSize])
+    precondition(downWeight.dtype == .bfloat16)
+    precondition(
+        downWeight.shape == [
+            LagunaConstants.hiddenSize, LagunaConstants.denseIntermediateSize,
+        ])
+    precondition(residual.dtype == .bfloat16)
+    precondition(residual.shape == [1, 1, LagunaConstants.hiddenSize])
+
+    return lagunaDenseDownResidualKernel(
+        [activated, downWeight, residual],
+        grid: ((LagunaConstants.hiddenSize / 16) * 128, 1, 1),
+        threadGroup: (128, 1, 1),
+        outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 final class LagunaRuntimeMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
@@ -2435,6 +2709,16 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     var _fusedGateUpWeight: MLXArray?
     var _fusedGateUpScales: MLXArray?
     var _fusedGateUpSplit: Int = 0
+
+    /// Retained fused BF16 `[gate; up]` bank for the dense (non-quantized)
+    /// layer-0 MLP, built once after checkpoint load when
+    /// `DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU` is enabled. Mutually exclusive
+    /// with `_fusedGateUpWeight`/`_fusedGateUpScales` above: those guard on
+    /// `QuantizedLinear` (the NVFP4 shared-expert instance of this class),
+    /// this one guards on plain `Linear` (the dense layer-0 instance), and
+    /// `gateProj`/`upProj` are always both-or-neither quantized, so at most
+    /// one of the two banks is ever non-nil on a given instance.
+    var _fusedDenseGateUpWeight: MLXArray?
 
     init(dimensions: Int, hiddenDimensions: Int) {
         self._gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
@@ -2476,6 +2760,33 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
         _fusedGateUpScales = fusedScales
         _fusedGateUpSplit = gate.weight.dim(0)
         return [fusedWeight, fusedScales]
+    }
+
+    /// Builds and retains the fused BF16 gate/up bank from layer 0's dense
+    /// (non-quantized) `gate_proj`/`up_proj`. Called once after weights are
+    /// installed and evaluated (before warmup); returns the new array so the
+    /// caller can batch a single eval. Fuses only the exact stock dense
+    /// configuration: two bias-free plain `Linear` projections of identical
+    /// shape and dtype. Never fires on the NVFP4 shared-expert instance of
+    /// this class -- `type(of: gateProj) == Linear.self` is false there
+    /// because `QuantizedLinear` is a distinct type, not this base type.
+    func prepareFusedDenseGateUp() -> MLXArray? {
+        let hidden = LagunaConstants.hiddenSize
+        let intermediate = LagunaConstants.denseIntermediateSize
+        guard _fusedDenseGateUpWeight == nil,
+            type(of: gateProj) == Linear.self,
+            type(of: upProj) == Linear.self,
+            gateProj.bias == nil, upProj.bias == nil,
+            gateProj.weight.dtype == .bfloat16,
+            upProj.weight.dtype == .bfloat16,
+            gateProj.weight.shape == [intermediate, hidden],
+            upProj.weight.shape == [intermediate, hidden]
+        else {
+            return nil
+        }
+        let fusedWeight = concatenated([gateProj.weight, upProj.weight], axis: 0)
+        _fusedDenseGateUpWeight = fusedWeight
+        return fusedWeight
     }
 
     /// The shared expert's fused gate/up bank and its down bank, when every
@@ -2580,6 +2891,63 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             routed: routed,
             residual: residual
         )
+    }
+
+    /// Layer-0-only decode fusion: the dense gate/up GEMV + SiLU product and
+    /// the down GEMV + decoder-layer residual add, each independently
+    /// ablatable via its own `DARKBLOOM_FUSED_DENSE_*` flag. Every guard here
+    /// mirrors the stock configuration exactly (bias-free plain `Linear`,
+    /// BF16, the fixed layer-0 shapes), so when a flag is off, its retained
+    /// bank was never built, or a guard declines, that half falls back to the
+    /// exact stock op it replaces -- `compiledSiluProduct(gateProj(x),
+    /// upProj(x))` for the gate/up half, `residual + downProj(activated)` for
+    /// the down+residual half (the same elementwise BF16 add the decoder
+    /// layer's stock `h + r2` performs). Returns `nil` only when the outer
+    /// decode/layer-0/dense-BF16 guard itself declines, in which case the
+    /// caller falls back to the fully stock `let r2 = mlp(normalized); return
+    /// h + r2` path.
+    func fusedDenseDownResidual(
+        _ x: MLXArray, residual: MLXArray
+    ) -> MLXArray? {
+        let hidden = LagunaConstants.hiddenSize
+        let intermediate = LagunaConstants.denseIntermediateSize
+        guard x.dim(1) == 1,
+            x.dtype == .bfloat16,
+            x.shape == [1, 1, hidden],
+            residual.dtype == .bfloat16,
+            residual.shape == [1, 1, hidden],
+            type(of: gateProj) == Linear.self,
+            type(of: upProj) == Linear.self,
+            type(of: downProj) == Linear.self,
+            gateProj.bias == nil, upProj.bias == nil, downProj.bias == nil,
+            gateProj.weight.dtype == .bfloat16,
+            upProj.weight.dtype == .bfloat16,
+            downProj.weight.dtype == .bfloat16,
+            gateProj.weight.shape == [intermediate, hidden],
+            upProj.weight.shape == [intermediate, hidden],
+            downProj.weight.shape == [hidden, intermediate]
+        else {
+            return nil
+        }
+
+        let activated: MLXArray
+        if lagunaFusedDenseGateUpSwiGLUEnabled,
+            let fusedWeight = _fusedDenseGateUpWeight,
+            fusedWeight.dtype == .bfloat16,
+            fusedWeight.shape == [2 * intermediate, hidden]
+        {
+            lagunaTrace("dense gate/up GEMV + SwiGLU")
+            activated = lagunaDenseGateUpSwiGLU(x, fusedWeight: fusedWeight)
+        } else {
+            activated = compiledSiluProduct(gateProj(x), upProj(x))
+        }
+
+        if lagunaFusedDenseDownResidualEnabled {
+            lagunaTrace("dense down GEMV + residual")
+            return lagunaDenseDownResidual(
+                activated, downWeight: downProj.weight, residual: residual)
+        }
+        return residual + downProj(activated)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -3144,6 +3512,93 @@ private func lagunaPrefillMoETail(
     )[0]
 }
 
+/// Prefill (multi-token, SORTED-regime) counterpart to the decode-only fused
+/// gate/up dispatch in `LagunaRuntimeSparseMoEBlock.forward`. Mirrors
+/// `SwitchGLU.callAsFunction`
+/// (`Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift`) op for
+/// op on its `doSort == true` branch -- every line below is annotated with
+/// the stock line it replaces or reproduces exactly -- with ONE gather-QMM
+/// over the retained row-concatenated `[gate; up]` NVFP4 bank in place of
+/// `SwitchGLU`'s two separate `gate_proj`/`up_proj` `QuantizedSwitchLinear`
+/// calls. `down_proj` is still the exact stock module (`downProj`, obtained
+/// via `prepareFusedRoutedGateUp`'s reflection over `switchMLP.children()`),
+/// invoked exactly as `SwitchGLU` invokes it.
+///
+/// Bit-exactness: `gatherSort`/`scatterUnsort` and the down projection are
+/// untouched stock calls, called with the exact same arguments `SwitchGLU`
+/// uses. The only change is fusing the two gate/up
+/// `QuantizedSwitchLinear.callAsFunction` gather-QMMs (both bias-free,
+/// verified at `prepareFusedRoutedGateUp` build time) into one
+/// `MLX.gatherQuantizedMM` over `fusedWeight`/`fusedScales` -- gate rows then
+/// up rows, the same concatenation order the decode path already relies on.
+/// Each gathered output row's K-loop and scale application reads only its
+/// own weight/scale row and is independent of which bank that row lives in
+/// or which other rows share the dispatch, so slicing the fused output at
+/// `split` reproduces the two separate `gate_proj`/`up_proj` outputs
+/// exactly; `compiledSiluProduct` then runs on those two exact slices,
+/// identical to the stock `activationProduct(xGate, xUp)` call `SwitchGLU`
+/// makes for the default SiLU path this runtime uses.
+private func lagunaFusedSortedRoutedGateUp(
+    _ x: MLXArray,
+    indices: MLXArray,
+    fusedWeight: MLXArray,
+    fusedScales: MLXArray,
+    split: Int,
+    downProj: SwitchLinear
+) -> MLXArray {
+    // SwitchGLU: `var x = MLX.expandedDimensions(x, axes: [-2, -3])`
+    var sortedX = MLX.expandedDimensions(x, axes: [-2, -3])
+    // SwitchGLU: `let doSort = indices.size >= 64`. The call site already
+    // guards `indices.size >= 64` before calling in, so this is always true
+    // here; recomputed anyway so this function mirrors SwitchGLU verbatim
+    // and stays correct if that guard is ever loosened.
+    let doSort = indices.size >= 64
+    // SwitchGLU: `var idx = indices` / `var inverseOrder = MLXArray()`
+    var idx = indices
+    var inverseOrder = MLXArray()
+    // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
+    if doSort {
+        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+    }
+    // Fused counterpart of SwitchGLU's separate-bank branch:
+    //   xUp = upProj(x, idx, sortedIndices: doSort)
+    //   xGate = gateProj(x, idx, sortedIndices: doSort)
+    // Each of those is exactly `QuantizedSwitchLinear.callAsFunction` with
+    // `biases: nil` (both banks are bias-free per the `prepareFusedRoutedGateUp`
+    // guard): `MLX.gatherQuantizedMM(x, weight, scales: scales, biases: nil,
+    // rhsIndices: indices, transpose: true, groupSize: groupSize, bits: bits,
+    // mode: mode, sortedIndices: sortedIndices)`. Issuing that once over the
+    // row-concatenated `fusedWeight`/`fusedScales` bank instead of twice over
+    // the separate banks is the fusion; every other argument matches the
+    // stock call exactly (group 16, 4-bit, NVFP4, transpose, doSort).
+    let gateUp = MLX.gatherQuantizedMM(
+        sortedX,
+        fusedWeight,
+        scales: fusedScales,
+        biases: nil,
+        rhsIndices: idx,
+        transpose: true,
+        groupSize: 16,
+        bits: 4,
+        mode: .nvfp4,
+        sortedIndices: doSort
+    )
+    let xGate = gateUp[.ellipsis, ..<split]
+    let xUp = gateUp[.ellipsis, split...]
+    // SwitchGLU: `activated = activationProduct(xGate, xUp)` -- this
+    // runtime's SwitchGLU instances are always built via the default SiLU
+    // initializer, so `activationProduct` is always `compiledSiluProduct`.
+    let activated = compiledSiluProduct(xGate, xUp)
+    // SwitchGLU: `x = downProj(activated, idx, sortedIndices: doSort)`
+    var result = downProj(activated, idx, sortedIndices: doSort)
+    // SwitchGLU: `if doSort { x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape) }`
+    if doSort {
+        result = scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape)
+    }
+    // SwitchGLU: `return MLX.squeezed(x, axis: -2)`
+    return MLX.squeezed(result, axis: -2)
+}
+
 final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     let routedScalingFactor: Float
 
@@ -3415,7 +3870,41 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     axis: -2)
             }
         } else {
-            y = switchMLP(x, inds)
+            // PREFILL sorted-regime fused gate/up: same retained
+            // row-concatenated NVFP4 bank the decode branch above uses, but
+            // driven through `lagunaFusedSortedRoutedGateUp`, which mirrors
+            // `SwitchGLU.callAsFunction`'s `doSort == true` path op for op
+            // (see that function's doc comment for the line-by-line
+            // correspondence). Falls back to the fully stock `switchMLP(x,
+            // inds)` -- unchanged from before this fusion -- whenever the
+            // flag is off, the fused bank wasn't built, or the guarded
+            // shapes/dtypes/regime don't match; either way `y` ends up with
+            // the exact same shape/dtype `switchMLP` alone would have
+            // produced, so every consumer below (including the
+            // `lagunaPrefillMoETailEnabled` tail fusion) is unaffected by
+            // which branch ran.
+            if lagunaPrefillFusedRoutedGateUpEnabled,
+                let fusedWeight = _fusedRoutedGateUpWeight,
+                let fusedScales = _fusedRoutedGateUpScales,
+                let downProj = _routedDownProj,
+                x.dim(1) > 1,
+                inds.size >= 64,
+                fusedWeight.dtype == .uint32,
+                fusedScales.dtype == .uint8,
+                _fusedRoutedGateUpSplit == LagunaConstants.moeIntermediateSize
+            {
+                lagunaTrace("prefill fused routed gate/up")
+                y = lagunaFusedSortedRoutedGateUp(
+                    x,
+                    indices: inds,
+                    fusedWeight: fusedWeight,
+                    fusedScales: fusedScales,
+                    split: _fusedRoutedGateUpSplit,
+                    downProj: downProj
+                )
+            } else {
+                y = switchMLP(x, inds)
+            }
             if lagunaPrefillMoETailEnabled,
                 let residual,
                 x.dim(1) > 1,
@@ -3567,6 +4056,17 @@ final class LagunaRuntimeDecoderLayer: Module {
             let sparse = mlp as? LagunaRuntimeSparseMoEBlock
         {
             return sparse(normalized, residual: h, routerLogits: routerLogits)
+        }
+        // Layer-0-only decode fusion: the dense MLP has no
+        // `LagunaRuntimeSparseMoEBlock` branch above to catch it, so its
+        // residual add was the one MLP-side decode dispatch left completely
+        // unfused. `fusedDenseDownResidual` returns `nil` whenever it isn't
+        // layer 0's decode shape (or a guard inside it declines), in which
+        // case the stock path below runs unchanged.
+        if let dense = mlp as? LagunaRuntimeMLP,
+            let fused = dense.fusedDenseDownResidual(normalized, residual: h)
+        {
+            return fused
         }
         let r2 = mlp(normalized)
         return h + r2
@@ -3993,6 +4493,12 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                 }
                 if lagunaFusedRoutedGateUpEnabled {
                     fusedArrays.append(contentsOf: sparse.prepareFusedRoutedGateUp())
+                }
+            } else if let dense = layer.mlp as? LagunaRuntimeMLP {
+                if lagunaFusedDenseGateUpSwiGLUEnabled,
+                    let fused = dense.prepareFusedDenseGateUp()
+                {
+                    fusedArrays.append(fused)
                 }
             }
         }
