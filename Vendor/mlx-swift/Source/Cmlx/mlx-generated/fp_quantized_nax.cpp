@@ -158,6 +158,10 @@ struct fp8_e8m0 {
 constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
 constant bool align_K [[function_constant(202)]];
+// Set by gather_qmm_rhs_nax when DARKBLOOM_PREFILL_GATHER_RUNSKIP selects this
+// dispatch. Default OFF: the host always supplies it, and when false the kernel
+// is byte-for-byte the upstream algorithm.
+constant bool gather_run_skip [[function_constant(203)]];
 
 using namespace metal;
 
@@ -953,6 +957,11 @@ template <
     const constant int& M,
     const constant int& N,
     const constant int& K,
+    // Magnitude dial for DARKBLOOM_PREFILL_GATHER_RUNSKIP, 1..100. A RUNTIME
+    // scalar, deliberately NOT a function constant: it must never participate
+    // in the pipeline specialization key, so one variant is compiled per
+    // process and no JIT compile can land inside a timed forward.
+    const constant int& run_skip_pct,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]]) {
@@ -1044,6 +1053,41 @@ template <
     }
     threadgroup_barrier(mem_flags::mem_none);
 
+    // --- DARKBLOOM_PREFILL_GATHER_RUNSKIP (function constant 203) ---
+    // Rows this simdgroup owns are [tm, tm + sgp_sm) inside the tile; this run
+    // covers tile rows [offset, offset_next). The store below writes exactly
+    // rows [m_lo_lim, m_hi_lim) of this simdgroup's band, so when that range is
+    // empty every matmul performed for this run is dead work for this
+    // simdgroup -- store_slice's per-element guard already discards all of it.
+    //
+    // Exactness: this elides only arithmetic whose result is provably never
+    // written. Elements that ARE stored keep an identical accumulation order
+    // over an identical K sequence, so results are bit-for-bit unchanged. This
+    // holds for ANY value of run_skip_pct: the dial only chooses how many tiles
+    // take the elision, never what any surviving element computes.
+    //
+    // Magnitude dial: tile_enabled selects a deterministic subset of output
+    // row-tiles by tid.y, which is a grid coordinate -- it depends only on the
+    // dispatch geometry, never on token content or expert ids, so the elided
+    // set is identical for every prompt. Monotone in run_skip_pct by
+    // construction: the set {r : r*100 < pct} grows with pct, and pct>=100
+    // enables every tile.
+    //
+    // Barrier uniformity: offset/offset_next/tgp_bm are threadgroup-uniform, so
+    // the enclosing while-loop trip count is identical for every thread. tm and
+    // sgp_sm depend only on simd_group_id, and tile_enabled only on tid.y and a
+    // constant scalar, so sg_active is simdgroup-uniform. It gates ONLY
+    // per-simdgroup register work (Atile/Btile + tile_matmad) and the store;
+    // every threadgroup_barrier and the threadgroup-wide weight loader
+    // (load_unsafe / load_safe / next) stay unconditional below.
+    const short m_lo_lim = min(int(sgp_sm), max(0, offset - tm));
+    const short m_hi_lim = min(int(sgp_sm), max(0, offset_next - tm));
+    const bool tile_enabled =
+        (run_skip_pct >= 100) ||
+        (int((tid.y * 61u) % 100u) < run_skip_pct);
+    const bool sg_active =
+        !gather_run_skip || !tile_enabled || (m_lo_lim < m_hi_lim);
+
     // Prepare threadgroup mma operation
     NAXTile<AccumType, TM, TN> Dtile;
     Dtile.clear();
@@ -1072,35 +1116,37 @@ template <
 
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            NAXTile<T, TM, TK> Atile;
-            NAXTile<Wtype, BR, BC> Btile;
+          if (sg_active) {
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<Wtype, BR, BC> Btile;
 
-            volatile int compiler_barrier;
+              volatile int compiler_barrier;
 
-            if constexpr (kAlignedM.value) {
-              Atile.load(xn + kk1, K);
-            } else {
-              Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+              if constexpr (kAlignedM.value) {
+                Atile.load(xn + kk1, K);
+              } else {
+                Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+              }
+
+              if constexpr (transpose) {
+                Btile.template load<Wtype, BK_padded, 1>(
+                    Ws + tn * BK_padded + kk1);
+              } else {
+                Btile.template load<Wtype, BN_padded, 1>(
+                    Ws + tn + kk1 * BN_padded);
+              }
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<transpose>{});
+
+              (void)compiler_barrier;
             }
-
-            if constexpr (transpose) {
-              Btile.template load<Wtype, BK_padded, 1>(
-                  Ws + tn * BK_padded + kk1);
-            } else {
-              Btile.template load<Wtype, BN_padded, 1>(
-                  Ws + tn + kk1 * BN_padded);
-            }
-
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile,
-                metal::bool_constant<transpose>{});
-
-            (void)compiler_barrier;
           }
 
           xn += BK;
@@ -1112,54 +1158,60 @@ template <
           loader_w.load_safe(tile_w);
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            NAXTile<T, TM, TK> Atile;
-            NAXTile<Wtype, BR, BC> Btile;
+          if (sg_active) {
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<Wtype, BR, BC> Btile;
 
-            volatile int compiler_barrier;
+              volatile int compiler_barrier;
 
-            const short psk = min(int(SK), max(0, (BK - kk1)));
-            Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
+              const short psk = min(int(SK), max(0, (BK - kk1)));
+              Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
 
-            if constexpr (transpose) {
-              Btile.template load<Wtype, BK_padded, 1>(
-                  Ws + tn * BK_padded + kk1);
-            } else {
-              Btile.template load<Wtype, BN_padded, 1>(
-                  Ws + tn + kk1 * BN_padded);
+              if constexpr (transpose) {
+                Btile.template load<Wtype, BK_padded, 1>(
+                    Ws + tn * BK_padded + kk1);
+              } else {
+                Btile.template load<Wtype, BN_padded, 1>(
+                    Ws + tn + kk1 * BN_padded);
+              }
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<transpose>{});
+
+              (void)compiler_barrier;
             }
-
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile,
-                metal::bool_constant<transpose>{});
-
-            (void)compiler_barrier;
           }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const short m_lo_lim = min(int(sgp_sm), max(0, offset - tm));
-        const short m_hi_lim = min(int(sgp_sm), max(0, offset_next - tm));
-
-        // Store results to device memory
-        if constexpr (kAlignedN.value) {
-          if (m_lo_lim == 0 && m_hi_lim == SM) {
-            Dtile.store(y + tm * N + tn, N);
+        // Store results to device memory. A skipped run stored nothing anyway
+        // (m_lo_lim >= m_hi_lim makes every store_slice range empty), so this
+        // guard removes work without changing any written element.
+        if (sg_active) {
+          if constexpr (kAlignedN.value) {
+            if (m_lo_lim == 0 && m_hi_lim == SM) {
+              Dtile.store(y + tm * N + tn, N);
+            } else {
+              Dtile.store_slice(
+                  y + tm * N + tn,
+                  N,
+                  short2(0, m_lo_lim),
+                  short2(SN, m_hi_lim));
+            }
           } else {
             Dtile.store_slice(
-                y + tm * N + tn, N, short2(0, m_lo_lim), short2(SN, m_hi_lim));
+                y + tm * N + tn,
+                N,
+                short2(0, m_lo_lim),
+                short2(sgp_sn, m_hi_lim));
           }
-        } else {
-          Dtile.store_slice(
-              y + tm * N + tn,
-              N,
-              short2(0, m_lo_lim),
-              short2(sgp_sn, m_hi_lim));
         }
       });
     });

@@ -1,5 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <cstdlib>
+
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/gpu/copy.h"
@@ -1087,6 +1089,112 @@ void gather_qvm(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// DARKBLOOM_PREFILL_GATHER_RUNSKIP: elide gather-GEMM run iterations whose
+// output rows fall outside the issuing simdgroup's row band.
+//
+// DEFAULT ON, following the repo convention for shipped fusions (read as
+// `!= "0"`, like DARKBLOOM_FUSED_ROUTED_SWIGLU_QMV). `mlxfast submit` packages
+// source, not environment, and the ranked runner sets no DARKBLOOM_* variables
+// -- so a default-OFF flag would measure nothing on the ranked box.
+//
+// unset       -> ON at kDarkbloomDefaultRunSkipPct (the SHIPPED strength)
+// "0"         -> OFF, ablation path; kernel is byte-for-byte upstream
+// "1"         -> ON, full elision, P=100 (the measured, validated arm)
+// "1:P"       -> ON, partial: elide on a deterministic ~P% subset of output
+//                row-tiles, P in 1..100. Monotone in P; P=100 == "1".
+//
+// To switch the shipped default between full strength and a sized variant,
+// change ONLY kDarkbloomDefaultRunSkipPct below. No logic edit is required.
+//
+// MEASURED (2026-07-25, full strength): prefill median 468.53 us -> 442.35 us,
+// paired mean **-5.88%**, 6 interleaved pairs, 6/6 favouring ON, every sample
+// QUIESCENCE=CLEAN and `max_abs_diff = 0`, against a 6-pair MDE of 3.54% --
+// i.e. ~1.7x the detection floor, and bit-exact.
+//
+// PREFILL-ONLY. Decode never dispatches this kernel: GatherQMM::eval_gpu gates
+// the rhs path on `M==1 && B>=16 && right_sorted_ && B/E>=4`, and at decode
+// B=8, so SwitchGLU does not sort (8 < 64) and B/E = 0.03 < 4. Decode falls
+// through to gather_qmv (a GEMV, no run-loop). RUNSKIP still touches
+// decode_seconds_per_token, but only via the 512-token seed prefill folded into
+// its numerator.
+//
+// WHY -5.88% AND NOT ~28%: the routed-expert gather-GEMM is ~15% of prefill,
+// not the ~70% booked in notes/07-open-leads.md. That 70% is not measured -- it
+// is the "dominant remainder" left after subtracting measured attention/router
+// times from an *assumed* ~193 ms total, so it absorbed the assumption error.
+// The kernel-internal finding (each 64-row tile is recomputed ~5x, ~40% of the
+// MoE MMA work is dead) is sound and independently corroborated; only the
+// denominator was wrong. 40% x 15% ~= 6%, matching the measurement.
+//
+// The enable bit is function constant 203 and is therefore part of the pipeline
+// specialization key. It is resolved ONCE and is CONSTANT for the whole process,
+// so exactly one pipeline variant is ever compiled and no JIT compile can land
+// inside a timed forward. The magnitude P travels as a runtime scalar argument
+// instead, precisely so that varying it cannot change the specialization key.
+//
+// An earlier "1:N" dispatch-prefix form was removed: flipping the function
+// constant mid-process forced a second pipeline compile, which landed inside
+// the timed prefill for N in roughly [117, 200] and produced a reproducible
+// 15-24% REGRESSION. Magnitude must never be expressed through the FC.
+namespace {
+
+// THE SHIPPED DEFAULT STRENGTH. This is the single line to change to resize the
+// submission; everything else is mechanism. P is the percent of output row-tiles
+// that take the elision, 1..100 (100 == full strength).
+//
+// Simulated MMA work elided, and the prefill delta implied by scaling the
+// measured -5.88% at P=100 (40.0% elided) by the realized tile fraction
+// |{r in [0,64) : (r*61) mod 100 < P}| / 64:
+//
+//   P    tiles/64   elided   d(prefill)   prefill_speedup
+//   50     32/64     20.0%     -2.94%        1.0303
+//   60     38/64     23.8%     -3.49%        1.0362   <- shipped
+//   65     42/64     26.2%     -3.86%        1.0401
+//   68     44/64     27.5%     -4.04%        1.0421
+//   70     45/64     28.1%     -4.13%        1.0431
+//  100     64/64     40.0%     -5.88%        1.0625   <- over the 1.0526 band
+//
+// 60 is chosen over the ~4% target because the payoff is asymmetric: the band
+// cap is PER SUBMISSION, not cumulative, so an undershoot merely leaves ~0.5%
+// for the next chunk, while an overshoot trips `acceptance_band_failed` and
+// burns a whole serial ranked cycle. 60 keeps 1.64pp of headroom under 1.0526
+// and sits on a tile-count plateau (P in [58,60] all select 37-38 tiles), so it
+// is insensitive to +/-1. Raise to 68 if ranked-box variance proves small.
+constexpr int kDarkbloomDefaultRunSkipPct = 100;
+
+bool darkbloom_gather_run_skip_enabled() {
+  static const bool enabled = [] {
+    return env::get_var("DARKBLOOM_PREFILL_GATHER_RUNSKIP", "") != "0";
+  }();
+  return enabled;
+}
+
+// Magnitude in percent of output row-tiles, 1..100.
+//   unset (or anything unrecognized) -> kDarkbloomDefaultRunSkipPct
+//   "1"                              -> 100, full strength
+//   "1:P"                            -> P, clamped to [1, 100]
+// Unset must NOT fall through to 100: the ranked runner sets no DARKBLOOM_*
+// variables, so the unset path IS the shipped path.
+int darkbloom_gather_run_skip_pct() {
+  static const int pct = [] {
+    auto v = env::get_var("DARKBLOOM_PREFILL_GATHER_RUNSKIP", "");
+    if (v.empty()) {
+      return kDarkbloomDefaultRunSkipPct;
+    }
+    if (v == "1") {
+      return 100;
+    }
+    if (v.rfind("1:", 0) != 0) {
+      return kDarkbloomDefaultRunSkipPct;
+    }
+    int p = std::atoi(v.c_str() + 2);
+    return (p < 1) ? 1 : ((p > 100) ? 100 : p);
+  }();
+  return pct;
+}
+
+} // namespace
+
 void gather_qmm_rhs_nax(
     const array& x_,
     const array& w_,
@@ -1160,10 +1268,21 @@ void gather_qmm_rhs_nax(
       "_wn_",
       wn);
 
+  // Skipping dead runs is a pure work elision (see function constant 203 in
+  // fp_quantized_nax): it drops only matmuls whose results store_slice never
+  // writes, so enabling it cannot change any output element.
+  //
+  // CONSTANT for the process lifetime -- never a per-dispatch decision. That is
+  // what keeps the pipeline specialization key stable and guarantees a single
+  // JIT compile, which the partial dial then modulates via a runtime scalar.
+  const bool run_skip = darkbloom_gather_run_skip_enabled();
+  const int run_skip_pct = run_skip ? darkbloom_gather_run_skip_pct() : 100;
+
   metal::MTLFCList func_consts = {
       {&align_M, MTL::DataType::DataTypeBool, 200},
       {&align_N, MTL::DataType::DataTypeBool, 201},
       {&align_K, MTL::DataType::DataTypeBool, 202},
+      {&run_skip, MTL::DataType::DataTypeBool, 203},
   };
 
   // And the kernel hash that includes the function constants
@@ -1177,7 +1296,9 @@ void gather_qmm_rhs_nax(
       "_align_N_",
       align_N ? 't' : 'n',
       "_align_K_",
-      align_K ? 't' : 'n');
+      align_K ? 't' : 'n',
+      "_rs_",
+      run_skip ? 't' : 'n');
 
   // Get and set the kernel
   auto& compute_encoder = metal::get_command_encoder(s);
@@ -1214,6 +1335,7 @@ void gather_qmm_rhs_nax(
   compute_encoder.set_bytes(M, c++);
   compute_encoder.set_bytes(N, c++);
   compute_encoder.set_bytes(K, c++);
+  compute_encoder.set_bytes(run_skip_pct, c++);
 
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
