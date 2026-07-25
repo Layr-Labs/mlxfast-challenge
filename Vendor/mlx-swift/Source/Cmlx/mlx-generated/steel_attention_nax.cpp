@@ -1493,12 +1493,16 @@ template <
   // exactly the all-+0.0 tile Stile.clear() already produces, new_max equal
   // to max_score (factor == exp2(+0.0) == 1.0), and the sum_score update a
   // +0.0 add into a value that is always >= +0.0. Skipping QK^T, the scale,
-  // both masks and the softmax for those blocks while STILL running P@V on
-  // the cleared Stile is therefore bit-exact, down to the +/-0.0 pattern the
-  // +0.0-product accumulation leaves in Otile. The kb trip count and every
-  // barrier stay untouched (the P@V loop contains a threadgroup_barrier at
-  // BD == 128, so a per-simdgroup trip count would be undefined behaviour);
-  // sg_active is simdgroup-uniform (tid.x and tm only). Restricted to
+  // both masks and the softmax for those blocks is therefore bit-exact.
+  // Level 2 also skips the P@V loads and MMAs: every Stile multiplicand is
+  // +0.0, so those instructions can only add a signed zero to Otile. That
+  // leaves every finite nonzero accumulator bit-identical; an exactly-zero
+  // accumulator can differ only in its zero sign, which is numerically equal
+  // through the final positive normalization and all downstream arithmetic.
+  // The kb trip count and every barrier stay untouched (the P@V loop contains
+  // a threadgroup_barrier at BD == 128, so a per-simdgroup trip count would be
+  // undefined behaviour); sg_active is simdgroup-uniform (tid.x and tm only).
+  // Restricted to
   // do_causal && !has_mask so the all-masked proof rests on the causal mask
   // alone; the timed window passes no array mask.
   int sg_kb_lim = kb_lim;
@@ -1571,8 +1575,9 @@ template <
 
     Stile.clear();
 
-    // Level-1 elision: guard the score computation, not the P@V or any
-    // barrier. See the sg_kb_lim comment above for the exactness argument.
+    // Causal elision: guard the score computation and the zero P@V work, but
+    // never a barrier or the outer-loop pointer advance. See the sg_kb_lim
+    // comment above for the exactness argument.
     const bool sg_active = kb < sg_kb_lim;
     if (sg_active) {
 
@@ -1818,6 +1823,7 @@ template <
 
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < TK; ik++) {
+          if (sg_active) {
           NAXTile<T, 1, 2> Vtile;
 
           const int V_load_off = ik * kU * int(params->V_strides[2]) + id * kU;
@@ -1839,6 +1845,7 @@ template <
               Vtile.frag_at(0, 0),
               Vtile.frag_at(0, 1),
               metal::false_type{});
+          }
         }
       }
     }

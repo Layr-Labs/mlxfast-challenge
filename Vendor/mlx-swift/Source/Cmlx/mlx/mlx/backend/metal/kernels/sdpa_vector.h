@@ -162,6 +162,176 @@ template <
   threadgroup U max_scores[BN];
   threadgroup U sum_exp_scores[BN];
 
+  // Laguna decode fast path: two adjacent query heads share one KV head
+  // (GQA factor 8 on sliding layers, 6 on full-attention layers). Compute the
+  // pair in one 32-simdgroup threadgroup so each
+  // K/V element is loaded once, while keeping each head's score traversal,
+  // online-softmax recurrence, lane reduction, and output exchange identical
+  // to the stock single-head path below. Odd grid positions retire before any
+  // barrier; the even position writes both output heads.
+  //
+  // This is deliberately restricted to the frozen serial-decode geometry.
+  // Prefill, masks, sinks, other head dimensions, and other GQA factors take
+  // the untouched stock path.
+  if constexpr (D == 128 && V == 128) {
+    const bool laguna_gqa_pair =
+        (gqa_factor == 8 || gqa_factor == 6) && int(tpg.y) == 1 &&
+        !has_mask && !has_sinks;
+    if (laguna_gqa_pair) {
+      if ((tid.x & 1u) != 0u) {
+        return;
+      }
+
+      constexpr int pair_heads = 2;
+      const int q_head_base = int(tid.x);
+      const int kv_head_idx = q_head_base / gqa_factor;
+
+      const device T* pair_query_0 =
+          queries + q_head_base * D + simd_lid * qk_per_thread;
+      const device T* pair_query_1 =
+          queries + (q_head_base + 1) * D + simd_lid * qk_per_thread;
+      const device T* pair_keys =
+          keys + kv_head_idx * k_head_stride + simd_gid * k_seq_stride +
+          simd_lid * qk_per_thread;
+      const device T* pair_values =
+          values + kv_head_idx * v_head_stride + simd_gid * v_seq_stride +
+          simd_lid * v_per_thread;
+
+      thread U pair_q[pair_heads * qk_per_thread];
+      thread U pair_k[qk_per_thread];
+      thread U pair_o[pair_heads * v_per_thread];
+      thread U pair_max[pair_heads];
+      thread U pair_sum[pair_heads];
+
+      for (int j = 0; j < qk_per_thread; ++j) {
+        pair_q[j] = static_cast<U>(scale) * pair_query_0[j];
+        pair_q[qk_per_thread + j] =
+            static_cast<U>(scale) * pair_query_1[j];
+      }
+      for (int h = 0; h < pair_heads; ++h) {
+        for (int j = 0; j < v_per_thread; ++j) {
+          pair_o[h * v_per_thread + j] = 0;
+        }
+        pair_max[h] = Limits<U>::finite_min;
+        pair_sum[h] = 0;
+      }
+
+      for (int i = simd_gid; i < N; i += BN) {
+        for (int j = 0; j < qk_per_thread; ++j) {
+          pair_k[j] = pair_keys[j];
+        }
+        thread U pair_v[v_per_thread];
+        for (int j = 0; j < v_per_thread; ++j) {
+          pair_v[j] = pair_values[j];
+        }
+
+        thread U pair_score[pair_heads] = {0, 0};
+        for (int h = 0; h < pair_heads; ++h) {
+          for (int j = 0; j < qk_per_thread; ++j) {
+            pair_score[h] +=
+                pair_q[h * qk_per_thread + j] * pair_k[j];
+          }
+          pair_score[h] = simd_sum(pair_score[h]);
+
+          U new_max = max(pair_max[h], pair_score[h]);
+          U old_factor = fast::exp(pair_max[h] - new_max);
+          U exp_score = fast::exp(pair_score[h] - new_max);
+          pair_max[h] = new_max;
+          pair_sum[h] = pair_sum[h] * old_factor + exp_score;
+
+          for (int j = 0; j < v_per_thread; ++j) {
+            pair_o[h * v_per_thread + j] =
+                pair_o[h * v_per_thread + j] * old_factor +
+                exp_score * pair_v[j];
+          }
+        }
+
+        pair_keys += inner_k_stride;
+        pair_values += inner_v_stride;
+      }
+
+      for (int h = 0; h < pair_heads; ++h) {
+        // Head 1 reuses the exchange arrays only after every lane has
+        // finished reading head 0.
+        if (h != 0) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (v_planes > 1) {
+          if (simd_lid == 0) {
+            max_scores[simd_gid] = pair_max[h];
+            sum_exp_scores[simd_gid] = pair_sum[h];
+          }
+          for (int i = 0; i < v_planes; ++i) {
+            outputs[i * (BN * BD) + simd_lid * BD + simd_gid] =
+                pair_o[h * v_per_thread + i];
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          U head_max = max_scores[simd_lid];
+          U new_max = simd_max(head_max);
+          U factor = fast::exp(head_max - new_max);
+          U head_sum = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+          for (int i = 0; i < v_planes; ++i) {
+            U acc = simd_sum(
+                outputs[i * (BN * BD) + simd_gid * BD + simd_lid] * factor);
+            pair_o[h * v_per_thread + i] =
+                head_sum == 0 ? acc : (acc / head_sum);
+          }
+          for (int base = v_planes; base < v_per_thread;
+               base += v_planes) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = 0; i < v_planes && base + i < v_per_thread; ++i) {
+              outputs[i * (BN * BD) + simd_lid * BD + simd_gid] =
+                  pair_o[h * v_per_thread + base + i];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = 0; i < v_planes && base + i < v_per_thread; ++i) {
+              U acc = simd_sum(
+                  outputs[i * (BN * BD) + simd_gid * BD + simd_lid] * factor);
+              pair_o[h * v_per_thread + base + i] =
+                  head_sum == 0 ? acc : (acc / head_sum);
+            }
+          }
+        } else {
+          if (simd_lid == 0) {
+            max_scores[simd_gid] = pair_max[h];
+            sum_exp_scores[simd_gid] = pair_sum[h];
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          U head_max = max_scores[simd_lid];
+          U new_max = simd_max(head_max);
+          U factor = fast::exp(head_max - new_max);
+          U head_sum = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+          for (int i = 0; i < v_per_thread; ++i) {
+            outputs[simd_lid * BD + simd_gid] =
+                pair_o[h * v_per_thread + i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            U acc =
+                simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+            pair_o[h * v_per_thread + i] =
+                head_sum == 0 ? acc : (acc / head_sum);
+            if (i + 1 < v_per_thread) {
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+          }
+        }
+
+        if (simd_lid == 0) {
+          device T* pair_out =
+              out + (q_head_base + h) * V + simd_gid * v_per_thread;
+          for (int i = 0; i < v_per_thread; ++i) {
+            pair_out[i] =
+                static_cast<T>(pair_o[h * v_per_thread + i]);
+          }
+        }
+      }
+      return;
+    }
+  }
+
   // Adjust positions
   const int q_batch_head_idx = tid.x;
   const int q_seq_idx = tid.y;
