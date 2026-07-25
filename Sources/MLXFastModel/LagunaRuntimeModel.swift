@@ -142,6 +142,24 @@ let lagunaFusedResidualRMSNormEnabled =
 let lagunaFusedFullQKNormYaRNEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_QK_NORM_YARN"] != "0"
 
+/// Decode-only exact prefix-bounded counterpart to MLX's two-pass vector
+/// attention for Laguna's compiled 4096-row full-attention caches. It keeps
+/// the same 128 partial blocks and second-pass reduction, but the first pass
+/// stops at the dynamic post-update valid length instead of scanning masked
+/// capacity. Set to "0" for a stock-path ablation.
+let lagunaPrefixBoundedFullAttentionEnabled: Bool = {
+    let environment = ProcessInfo.processInfo.environment
+    guard environment["DARKBLOOM_PREFIX_BOUNDED_FULL_ATTENTION"] != "0" else {
+        return false
+    }
+    // The official M5 Max path selects 128 blocks. Respect an explicit MLX
+    // override instead of silently changing its requested reduction geometry.
+    if let requestedBlocks = environment["MLX_SDPA_BLOCKS"] {
+        return requestedBlocks == "128"
+    }
+    return true
+}()
+
 private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
     name: "laguna_residual_rms_bf16_2048_v1",
     inputNames: ["residual", "branch", "weight"],
@@ -329,6 +347,227 @@ func lagunaFullQKNormYaRN(
         outputDTypes: [.bfloat16, .bfloat16]
     )
     return (outputs[0], outputs[1])
+}
+
+/// First pass of the exact decode-only full-attention specialization below.
+///
+/// Whole-step compiled decode keeps a fixed 4096-row full-attention cache.
+/// At the scored 512...640 positions most rows are still invalid, but stock
+/// `sdpa_vector_2pass_1` walks all 32 physical rows assigned to each of its
+/// 128 blocks and consults a Boolean prefix mask for every one. This kernel
+/// keeps the stock block assignment and all active arithmetic, while bounding
+/// each block's loop by the post-update valid prefix length. Empty blocks still
+/// emit the same zero / finite-min partial state consumed by the unchanged
+/// second-pass reduction order.
+private let lagunaFullAttentionPrefixPass1Kernel = MLXFast.metalKernel(
+    name: "laguna_full_attention_prefix_2pass_1_bf16_128_v1",
+    inputNames: ["queries", "keys", "values", "valid_length"],
+    outputNames: ["partials", "sums", "maxs"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint kv_heads = 8;
+        constexpr uint query_heads_per_kv = 6;
+        constexpr uint blocks = 128;
+        constexpr uint cache_capacity = 4096;
+        constexpr float attention_scale = 0.0883883461356163f;
+        constexpr float finite_min =
+            -metal::numeric_limits<float>::max();
+
+        uint group = threadgroup_position_in_grid.x;
+        uint kv_head = group / blocks;
+        uint block = group - kv_head * blocks;
+        uint query_in_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint query_head = kv_head * query_heads_per_kv + query_in_group;
+
+        uint channel = lane * 4;
+        const device bfloat* query =
+            queries + query_head * head_dim + channel;
+        const device bfloat* key =
+            keys +
+            (kv_head * cache_capacity + block) * head_dim +
+            channel;
+        const device bfloat* value =
+            values +
+            (kv_head * cache_capacity + block) * head_dim +
+            channel;
+
+        thread float q[4];
+        thread float output[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint i = 0; i < 4; ++i) {
+            q[i] = attention_scale * float(query[i]);
+        }
+
+        float max_score = finite_min;
+        float sum_exp_score = 0.0f;
+        int prefix = min(max(int(valid_length[0]), 0), int(cache_capacity));
+
+        // Identical active-position assignment to stock:
+        // block, block + 128, ... . The only removed work is consulting a
+        // known-false prefix mask after the first invalid position.
+        for (int position = int(block); position < prefix; position += int(blocks)) {
+            float score = 0.0f;
+            for (uint i = 0; i < 4; ++i) {
+                score += q[i] * float(key[i]);
+            }
+            score = simd_sum(score);
+
+            float new_max = max(max_score, score);
+            float factor = metal::fast::exp(max_score - new_max);
+            float exp_score = metal::fast::exp(score - new_max);
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+
+            for (uint i = 0; i < 4; ++i) {
+                output[i] =
+                    output[i] * factor + exp_score * float(value[i]);
+            }
+
+            key += blocks * head_dim;
+            value += blocks * head_dim;
+        }
+
+        uint partial_base =
+            (query_head * blocks + block) * head_dim + channel;
+        for (uint i = 0; i < 4; ++i) {
+            partials[partial_base + i] = bfloat(output[i]);
+        }
+        if (lane == 0) {
+            uint scalar_index = query_head * blocks + block;
+            sums[scalar_index] = sum_exp_score;
+            maxs[scalar_index] = max_score;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Exact copy of the stock BF16 `sdpa_vector_2pass_2` arithmetic for
+/// D=128, blocks=128. Keeping this as a separate pass deliberately preserves
+/// the BF16 partial boundary and the block aggregation order.
+private let lagunaFullAttentionPrefixPass2Kernel = MLXFast.metalKernel(
+    name: "laguna_full_attention_prefix_2pass_2_bf16_128_v1",
+    inputNames: ["partials", "sums", "maxs"],
+    outputNames: ["attended"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint blocks = 128;
+        constexpr uint simd_groups = 32;
+        constexpr uint elements_per_thread = 4;
+        constexpr float finite_min =
+            -metal::numeric_limits<float>::max();
+
+        uint query_head = threadgroup_position_in_grid.x;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        const device bfloat* partial =
+            partials +
+            query_head * blocks * head_dim +
+            simd_group * head_dim +
+            lane * elements_per_thread;
+        const device float* head_sums = sums + query_head * blocks;
+        const device float* head_maxs = maxs + query_head * blocks;
+
+        thread float output[elements_per_thread] =
+            {0.0f, 0.0f, 0.0f, 0.0f};
+        threadgroup float transposed[simd_groups * simd_groups];
+
+        float sum_exp_score = 0.0f;
+        float max_score = finite_min;
+
+        for (uint batch = 0; batch < blocks / simd_groups; ++batch) {
+            max_score = max(
+                max_score,
+                head_maxs[lane + simd_groups * batch]
+            );
+        }
+        max_score = simd_max(max_score);
+
+        for (uint batch = 0; batch < blocks / simd_groups; ++batch) {
+            float factor = metal::fast::exp(
+                head_maxs[lane + simd_groups * batch] - max_score
+            );
+            sum_exp_score +=
+                factor * head_sums[lane + simd_groups * batch];
+        }
+        sum_exp_score = simd_sum(sum_exp_score);
+
+        for (uint batch = 0; batch < blocks / simd_groups; ++batch) {
+            float factor = metal::fast::exp(
+                head_maxs[simd_group + simd_groups * batch] - max_score
+            );
+            for (uint i = 0; i < elements_per_thread; ++i) {
+                output[i] += factor * float(partial[i]);
+            }
+            partial += simd_groups * head_dim;
+        }
+
+        for (uint i = 0; i < elements_per_thread; ++i) {
+            transposed[lane * simd_groups + simd_group] = output[i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            output[i] = simd_sum(
+                transposed[simd_group * simd_groups + lane]
+            );
+            output[i] =
+                sum_exp_score == 0.0f
+                ? output[i]
+                : output[i] / sum_exp_score;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0) {
+            uint output_base =
+                query_head * head_dim +
+                simd_group * elements_per_thread;
+            for (uint i = 0; i < elements_per_thread; ++i) {
+                attended[output_base + i] = bfloat(output[i]);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+func lagunaFullAttentionPrefixBounded(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray,
+    validLength: MLXArray
+) -> MLXArray {
+    precondition(queries.dtype == .bfloat16)
+    precondition(keys.dtype == .bfloat16)
+    precondition(values.dtype == .bfloat16)
+    precondition(validLength.dtype == .int32)
+    precondition(
+        queries.shape == [
+            1, LagunaConstants.fullAttentionHeads, 1, LagunaConstants.headDim,
+        ])
+    precondition(
+        keys.shape == [
+            1, LagunaConstants.numKeyValueHeads, 4096, LagunaConstants.headDim,
+        ])
+    precondition(values.shape == keys.shape)
+    precondition(validLength.size == 1)
+
+    let partialsShape = [
+        LagunaConstants.fullAttentionHeads, 128, LagunaConstants.headDim,
+    ]
+    let scalarsShape = [LagunaConstants.fullAttentionHeads, 128]
+    let firstPass = lagunaFullAttentionPrefixPass1Kernel(
+        [queries, keys, values, validLength],
+        grid: (LagunaConstants.numKeyValueHeads * 128 * 192, 1, 1),
+        threadGroup: (192, 1, 1),
+        outputShapes: [partialsShape, scalarsShape, scalarsShape],
+        outputDTypes: [.bfloat16, .float32, .float32]
+    )
+    return lagunaFullAttentionPrefixPass2Kernel(
+        firstPass,
+        grid: (LagunaConstants.fullAttentionHeads * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [[
+            1, LagunaConstants.fullAttentionHeads, 1, LagunaConstants.headDim,
+        ]],
+        outputDTypes: [.bfloat16]
+    )[0]
 }
 
 /// Keep the stock shapeless unary gate for prefill. Ranked measurement showed
@@ -544,16 +783,43 @@ final class LagunaRuntimeAttention: Module {
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
-        var output = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
-        )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
+        let attended: MLXArray
+        if lagunaPrefixBoundedFullAttentionEnabled,
+            !isSliding, B == 1, L == 1,
+            nHeads == LagunaConstants.fullAttentionHeads,
+            nKVHeads == LagunaConstants.numKeyValueHeads,
+            headDim == LagunaConstants.headDim,
+            queries.dtype == .bfloat16,
+            keys.dtype == .bfloat16,
+            values.dtype == .bfloat16,
+            let compiledCache = cache as? CompilableKVCache,
+            compiledCache.maxLength == 4096,
+            compiledCache.offsetArray.dtype == .int32
+        {
+            let (cachedKeys, cachedValues) = compiledCache.update(
+                keys: keys,
+                values: values
+            )
+            attended = lagunaFullAttentionPrefixBounded(
+                queries: queries,
+                keys: cachedKeys,
+                values: cachedValues,
+                validLength: compiledCache.offsetArray
+            )
+        } else {
+            attended = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
+        }
+        var output =
+            attended
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
 
         if gatingEnabled, let gProj {
             // Per-head softplus gate computed in float32, then broadcast
