@@ -8,8 +8,7 @@
 using namespace mlx::steel;
 
 // DARKBLOOM_ATTN_QHOIST default. DEFAULT OFF: unless the compiler is invoked
-// with -DDARKBLOOM_ATTN_QHOIST=1, the kernel below is byte-for-byte the
-// upstream algorithm.
+// with -DDARKBLOOM_ATTN_QHOIST=1, Q loads keep their upstream placement.
 //
 // NOTE ON WHICH TWIN RUNS. steel/attn is a JIT family: the runtime-effective
 // source is the string in Cmlx/mlx-generated/steel_attention_nax.cpp, and the
@@ -21,6 +20,12 @@ using namespace mlx::steel;
 // define to the metallib build flags by hand.
 #ifndef DARKBLOOM_ATTN_QHOIST
 #define DARKBLOOM_ATTN_QHOIST 0
+#endif
+
+// Default-on removal of the midpoint P@V pacing rendezvous. Defining this as
+// zero restores the stock barrier for same-source ablation.
+#ifndef DARKBLOOM_ATTN_NAX_PV_UNPACE
+#define DARKBLOOM_ATTN_NAX_PV_UNPACE 1
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -202,28 +207,6 @@ template <
     kb_min_causal = (q_min / BK);
   }
 
-  // Per-simdgroup causal K-block elision (level 1, always on). kb_lim above
-  // derives from the THREADGROUP's last row; this simdgroup owns only rows
-  // [tid.x * BQ + tm, tid.x * BQ + tm + kU * TQ). K blocks at or beyond
-  // sg_kb_lim lie entirely above its causal diagonal: the causal mask would
-  // set every element of its Stile rows to neg_inf, making the P tile
-  // exactly the all-+0.0 tile Stile.clear() already produces, new_max equal
-  // to max_score (factor == exp2(+0.0) == 1.0), and the sum_score update a
-  // +0.0 add into a value that is always >= +0.0. Skipping QK^T, the scale,
-  // both masks and the softmax for those blocks while STILL running P@V on
-  // the cleared Stile is therefore bit-exact, down to the +/-0.0 pattern the
-  // +0.0-product accumulation leaves in Otile. The kb trip count and every
-  // barrier stay untouched (the P@V loop contains a threadgroup_barrier at
-  // BD == 128, so a per-simdgroup trip count would be undefined behaviour);
-  // sg_active is simdgroup-uniform (tid.x and tm only). Restricted to
-  // do_causal && !has_mask so the all-masked proof rests on the causal mask
-  // alone; the timed window passes no array mask.
-  int sg_kb_lim = kb_lim;
-  if (do_causal && !has_mask) {
-    int sg_q_max = int(tid.x) * BQ + params->qL_off + int(tm) + kU * TQ;
-    sg_kb_lim = min(kb_lim, (sg_q_max + BK - 1) / BK);
-  }
-
   const bool is_last_bq = int(tid.x) == (params->NQ_aligned);
   // const bool is_last_tq = int(simd_group_id) >= (params->qL_rem / UQ);
   const bool is_last_q = is_last_bq;
@@ -287,11 +270,6 @@ template <
     stile_t Stile;
 
     Stile.clear();
-
-    // Level-1 elision: guard the score computation, not the P@V or any
-    // barrier. See the sg_kb_lim comment above for the exactness argument.
-    const bool sg_active = kb < sg_kb_lim;
-    if (sg_active) {
 
     STEEL_PRAGMA_UNROLL
     for (short iq = 0; iq < TQ; iq++) {
@@ -518,7 +496,6 @@ template <
 
     // Update O
     Otile.template row_bin_op<MulOp>(factor);
-    }
 
     simdgroup_barrier(mem_flags::mem_none);
 
@@ -529,7 +506,20 @@ template <
       for (short id = 0; id < TD; id += 2) {
         if constexpr (BD == 128) {
           if (id == 4) {
+#if DARKBLOOM_ATTN_NAX_PV_UNPACE
+            constexpr bool is_laguna_seed_template =
+                is_same_v<T, bfloat> && BQ == 64 && (BK == 32 || BK == 64) &&
+                WM == 4 && WN == 1;
+            const bool is_laguna_seed =
+                is_laguna_seed_template && align_Q && align_K && do_causal &&
+                params->qL == 512 && params->kL == 512 &&
+                (params->gqa_factor == 6 || params->gqa_factor == 8);
+            if (!is_laguna_seed) {
+              threadgroup_barrier(mem_flags::mem_none);
+            }
+#else
             threadgroup_barrier(mem_flags::mem_none);
+#endif
           }
         }
 
