@@ -8,8 +8,8 @@ const char* steel_attention_nax() {
 
 // DARKBLOOM_ATTN_QHOIST default. DEFAULT OFF: unless the host prepends a
 // `#define DARKBLOOM_ATTN_QHOIST 1` ahead of this string (see
-// get_steel_attention_nax_kernel in mlx/backend/metal/jit_kernels.cpp), the
-// kernel below is byte-for-byte the upstream algorithm.
+// get_steel_attention_nax_kernel in mlx/backend/metal/jit_kernels.cpp), Q
+// loads keep their upstream placement.
 //
 // The flag is deliberately a preprocessor define baked into the JIT source
 // string, NOT a Metal function constant. A function constant participates in
@@ -21,6 +21,12 @@ const char* steel_attention_nax() {
 // ever compiled per process.
 #ifndef DARKBLOOM_ATTN_QHOIST
 #define DARKBLOOM_ATTN_QHOIST 0
+#endif
+
+// Default-on removal of the midpoint P@V pacing rendezvous. Defining this as
+// zero restores the stock barrier for same-source ablation.
+#ifndef DARKBLOOM_ATTN_NAX_PV_UNPACE
+#define DARKBLOOM_ATTN_NAX_PV_UNPACE 1
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1812,7 +1818,20 @@ template <
       for (short id = 0; id < TD; id += 2) {
         if constexpr (BD == 128) {
           if (id == 4) {
+#if DARKBLOOM_ATTN_NAX_PV_UNPACE
+            constexpr bool is_laguna_seed_template =
+                is_same_v<T, bfloat> && BQ == 64 && (BK == 32 || BK == 64) &&
+                WM == 4 && WN == 1;
+            const bool is_laguna_seed =
+                is_laguna_seed_template && align_Q && align_K && do_causal &&
+                params->qL == 512 && params->kL == 512 &&
+                (params->gqa_factor == 6 || params->gqa_factor == 8);
+            if (!is_laguna_seed) {
+              threadgroup_barrier(mem_flags::mem_none);
+            }
+#else
             threadgroup_barrier(mem_flags::mem_none);
+#endif
           }
         }
 
