@@ -1255,12 +1255,13 @@ bool darkbloom_stage_novol() {
 // pipeline key. Resolved once per process, so exactly one variant is ever
 // compiled and a fresh process picks up a changed environment cleanly.
 //
-//   unset (SHIPPED) -> 4  (BM=64,  WM=4, WN=2)  SM=16, 256 thr/TG
+//   unset (SHIPPED) -> 6  (BM=64,  WM=8, WN=2)  SM=8, 512 thr/TG
 //   "0"             -> 0  (BM=64,  WM=2, WN=2)  SM=32  upstream tiling
 //   "1"             -> 1  (BM=128, WM=4)        SM=32  less expert re-staging
 //   "2"             -> 2  (BM=128, WM=2)        SM=64  measured regression
 //   "3"             -> 3  (BM=128, WM=8)        SM=16  both mechanisms
 //   "5"             -> 5  (BM=64,  WM=4, WN=1)  SM=16, 128 thr/TG
+//   "6"             -> 6  (BM=64,  WM=8, WN=2)  SM=8, 512 thr/TG
 //
 // WHY SM=16 IS THE WIN. DARKBLOOM_PREFILL_GATHER_RUNSKIP elides a run for a
 // simdgroup only when the intersection with its SM-row band is EMPTY. On
@@ -1329,7 +1330,7 @@ int darkbloom_stage_bm128_variant() {
   static const int v = [] {
     auto s = env::get_var("DARKBLOOM_STAGE_BM128", "");
     if (s.empty()) {
-      return 4;
+      return 6;
     }
     if (s == "1") {
       return 1;
@@ -1345,6 +1346,9 @@ int darkbloom_stage_bm128_variant() {
     }
     if (s == "5") {
       return 5;
+    }
+    if (s == "6") {
+      return 6;
     }
     return 0;
   }();
@@ -1452,8 +1456,9 @@ void gather_qmm_rhs_nax(
     case 1: bm = 128; wm = 4; break;         // SM=32, less re-staging
     case 2: bm = 128; wm = 2; break;         // SM=64, predicted regression
     case 3: bm = 128; wm = 8; break;         // SM=16, both mechanisms
-    case 4: bm = 64;  wm = 4; break;         // SM=16, 256 thr/TG, SHIPPED DEFAULT
+    case 4: bm = 64;  wm = 4; break;         // SM=16, 256 thr/TG
     case 5: bm = 64;  wm = 4; wn = 1; break; // SM=16, 128 thr/TG, TN 2 -> 4
+    case 6: bm = 64;  wm = 8; break;         // SM=8, 512 thr/TG
     default: break;                          // upstream: bm=64, wm=2, wn=2
   }
 
