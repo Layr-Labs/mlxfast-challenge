@@ -227,7 +227,7 @@ let lagunaFusedFullQKNormYaRNEnabled =
 /// one BF16 round. Sixteen simdgroups of four rows cover the 64 rows this
 /// threadgroup owns, and 256 divides evenly by 64. The norm half is untouched.
 private let lagunaResidualRMSNormRouterKernel = MLXFast.metalKernel(
-    name: "laguna_residual_rms_router_bf16_2048_v1",
+    name: "laguna_residual_rms_router_bf16_2048_v2",
     inputNames: ["residual", "branch", "weight", "router_weight"],
     outputNames: ["summed", "normalized", "router_logits"],
     source: """
@@ -261,18 +261,20 @@ private let lagunaResidualRMSNormRouterKernel = MLXFast.metalKernel(
         }
 
         acc = simd_sum(acc);
-        if (simd_group == 0) {
-            local_sums[simd_lane] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
         if (simd_lane == 0) {
             local_sums[simd_group] = acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (simd_group == 0) {
-            acc = simd_sum(local_sums[simd_lane]);
+            // The threadgroup is always dispatched at 512 threads (16
+            // simdgroups), so only local_sums[0..15] are ever written. An
+            // in-register 0.0f for lanes 16-31 reproduces the previously
+            // zero-filled slots exactly (adding +0.0f leaves every partial
+            // in simd_sum's reduction tree bit-identical for these
+            // non-negative sums of squares), removing the separate
+            // zero-init pass and its barrier without changing any value.
+            acc = simd_sum(simd_lane < 16 ? local_sums[simd_lane] : 0.0f);
             if (simd_lane == 0) {
                 local_inv_mean[0] =
                     metal::precise::rsqrt(acc / 2048.0f + 1.0e-6f);
@@ -332,7 +334,7 @@ private let lagunaResidualRMSNormRouterKernel = MLXFast.metalKernel(
 /// Residual add + RMSNorm for the layers whose MLP is not a sparse block
 /// (layer 0) and for any shape the router fusion above declines.
 private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
-    name: "laguna_residual_rms_bf16_2048_v1",
+    name: "laguna_residual_rms_bf16_2048_v2",
     inputNames: ["residual", "branch", "weight"],
     outputNames: ["summed", "normalized"],
     source: """
@@ -360,18 +362,20 @@ private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
         }
 
         acc = simd_sum(acc);
-        if (simd_group == 0) {
-            local_sums[simd_lane] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
         if (simd_lane == 0) {
             local_sums[simd_group] = acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (simd_group == 0) {
-            acc = simd_sum(local_sums[simd_lane]);
+            // The threadgroup is always dispatched at 512 threads (16
+            // simdgroups), so only local_sums[0..15] are ever written. An
+            // in-register 0.0f for lanes 16-31 reproduces the previously
+            // zero-filled slots exactly (adding +0.0f leaves every partial
+            // in simd_sum's reduction tree bit-identical for these
+            // non-negative sums of squares), removing the separate
+            // zero-init pass and its barrier without changing any value.
+            acc = simd_sum(simd_lane < 16 ? local_sums[simd_lane] : 0.0f);
             if (simd_lane == 0) {
                 local_inv_mean[0] =
                     metal::precise::rsqrt(acc / 2048.0f + 1.0e-6f);
@@ -737,16 +741,19 @@ private func lagunaFusedQKVProjectionSource(heads: Int) -> String {
             acc += raw[i] * raw[i];
         }
         acc = simd_sum(acc);
-        if (simd_group == 0) {
-            local_sums[lane] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) {
             local_sums[simd_group] = acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (simd_group == 0) {
-            acc = simd_sum(local_sums[lane]);
+            // The threadgroup is always dispatched at 512 threads (16
+            // simdgroups), so only local_sums[0..15] are ever written. An
+            // in-register 0.0f for lanes 16-31 reproduces the previously
+            // zero-filled slots exactly (adding +0.0f leaves every partial
+            // in simd_sum's reduction tree bit-identical for these
+            // non-negative sums of squares), removing the separate
+            // zero-init pass and its barrier without changing any value.
+            acc = simd_sum(lane < 16 ? local_sums[lane] : 0.0f);
             if (lane == 0) {
                 local_inv_mean[0] =
                     metal::precise::rsqrt(acc / float(in_vec_size) + norm_eps);
@@ -902,7 +909,7 @@ private let lagunaFusedQKVProjectionKernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_fused_norm_qkv_projection_bf16_h\(heads)_v1",
+            name: "laguna_fused_norm_qkv_projection_bf16_h\(heads)_v2",
             inputNames: [
                 "residual", "norm_weight", "query_weight", "key_weight",
                 "value_weight", "gate_weight",
@@ -3586,6 +3593,172 @@ final class LagunaRuntimeModelInner: Module {
     }
 }
 
+/// `DARKBLOOM_FUSED_FINAL_NORM_LMHEAD` (default on; set "0" to disable):
+/// fuses the final `model.norm` RMSNorm with the `lm_head` GEMV into one
+/// dispatch. `LagunaRuntimeModel.callAsFunction` always slices to the last
+/// token before either op runs (see the comment there), so `model.norm`'s
+/// input is already `[1,1,2048]` for both single-token decode and the one
+/// post-slice row of a multi-token prefill -- this fusion fires identically
+/// (and correctly) in both cases; the -1-dispatch win is decode-relative
+/// since a prefill only pays for this pair once per prefill call.
+let lagunaFusedFinalNormLMHeadEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FINAL_NORM_LMHEAD"] != "0"
+
+/// Final RMSNorm + `lm_head` GEMV fusion, folding the RMSNorm as a
+/// redundant-per-threadgroup prologue ahead of the vocabulary projection.
+///
+/// Exactness. The norm prologue is byte-for-byte the same one already
+/// shipped twice in this file (`lagunaResidualRMSNormRouterKernel`,
+/// `lagunaFusedQKVProjectionSource`): `rms_single_row` at `axis_size=2048`,
+/// `N_READS=4`, 512 threads (16 simdgroups) -- the exact shape MLX's own
+/// `normalization.cpp` thread-count derivation picks for this row, including
+/// the `lane < 16 ? local_sums[lane] : 0.0f` zero-init elision. `eps` is
+/// hardcoded to `1.0e-6f` because Laguna's config loader enforces
+/// `rms_norm_eps == LagunaConstants.rmsNormEpsilon (1e-6)` as a hard
+/// invariant, exactly as the other fused norm kernels already assume.
+///
+/// The GEMV half replicates MLX's own `gemv_axbpy` dispatch for
+/// `out_vec=100352, in_vec=2048`: neither the `K<=64` nor `K>=16*out_vec`
+/// override fires, so MLX picks `bm=8, bn=1, sm=1, sn=32, tm=4, tn=4` -- the
+/// same `sn`/`tn` as the router fusion's `out_vec=256` case and the
+/// gated-output-projection's `out_vec=2048`/`in_vec=8192` case, because
+/// `sn`/`tn` (and therefore the per-lane column stride, the 128-wide block
+/// loop, and the `simd_shuffle_down` reduction ladder) only change when one
+/// of those overrides fires. Only `bm` (native simdgroups per threadgroup)
+/// differs with `out_vec`, and a row's value does not depend on it:
+/// `needs_tgp_reduction = (BN>1)` is false for this shape, so each simdgroup
+/// independently completes its own rows' full K-reduction via
+/// `simd_shuffle_down` with no cross-simdgroup step -- this kernel's
+/// 16-simdgroup/64-rows-per-tile grid (driven by the norm prologue's
+/// 512-thread requirement) therefore produces bit-identical rows to MLX's
+/// native 8-simdgroup/32-rows-per-tile grid. `100352 / 64 = 1568` exactly,
+/// so there is no tail tile.
+private let lagunaFusedFinalNormLMHeadKernel = MLXFast.metalKernel(
+    name: "laguna_fused_final_norm_lm_head_bf16_2048x100352_v1",
+    inputNames: ["hidden", "norm_weight", "lm_head_weight"],
+    outputNames: ["logits"],
+    source: """
+        constexpr uint in_vec_size = 2048;
+        constexpr uint values_per_thread = 4;
+        constexpr uint block_width = 128;
+        constexpr uint blocks = in_vec_size / block_width;
+        constexpr uint rows_per_thread = 4;
+        constexpr uint rows_per_group = 64;
+        constexpr float norm_eps = 1.0e-6f;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint local_id = thread_position_in_threadgroup.x;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        // --- input RMSNorm, mirroring rms_single_row at 512 threads ---
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[32];
+        threadgroup bfloat normalized_row[in_vec_size];
+
+        uint norm_base = local_id * values_per_thread;
+        thread float raw[values_per_thread];
+        float acc = 0.0f;
+        for (uint i = 0; i < values_per_thread; ++i) {
+            raw[i] = float(hidden[norm_base + i]);
+            acc += raw[i] * raw[i];
+        }
+        acc = simd_sum(acc);
+        if (lane == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            // The threadgroup is always dispatched at 512 threads (16
+            // simdgroups), so only local_sums[0..15] are ever written. An
+            // in-register 0.0f for lanes 16-31 reproduces the previously
+            // zero-filled slots exactly (adding +0.0f leaves every partial
+            // in simd_sum's reduction tree bit-identical for these
+            // non-negative sums of squares).
+            acc = simd_sum(lane < 16 ? local_sums[lane] : 0.0f);
+            if (lane == 0) {
+                local_inv_mean[0] =
+                    metal::precise::rsqrt(acc / float(in_vec_size) + norm_eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < values_per_thread; ++i) {
+            normalized_row[norm_base + i] =
+                norm_weight[norm_base + i] *
+                bfloat(raw[i] * local_inv_mean[0]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- lm_head GEMV, replicating MLX's stock gemv tiling for
+        // out_vec=100352 / in_vec=2048 (bm8/bn1/sm1/sn32/tm4/tn4; see the
+        // kernel doc comment for the exactness argument) ---
+        uint row_base = tile * rows_per_group + simd_group * rows_per_thread;
+
+        thread float result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread float coefficients[values_per_thread];
+
+        uint column = lane * values_per_thread;
+        for (uint block = 0; block < blocks; ++block) {
+            for (uint i = 0; i < values_per_thread; ++i) {
+                coefficients[i] = float(normalized_row[column + i]);
+            }
+            for (uint row = 0; row < rows_per_thread; ++row) {
+                const device vec<bfloat, 4>* row_values =
+                    (const device vec<bfloat, 4>*)(
+                        lm_head_weight + (row_base + row) * in_vec_size +
+                            column);
+                const vec<bfloat, 4> w = row_values[0];
+                for (uint i = 0; i < values_per_thread; ++i) {
+                    result[row] += float(w[i]) * coefficients[i];
+                }
+            }
+            column += block_width;
+        }
+
+        for (uint row = 0; row < rows_per_thread; ++row) {
+            for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                result[row] += metal::simd_shuffle_down(result[row], delta);
+            }
+        }
+        if (lane == 0) {
+            for (uint row = 0; row < rows_per_thread; ++row) {
+                logits[row_base + row] = bfloat(result[row]);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Fuses `model.norm(hidden)` and `lmHead(...)` into one dispatch. Callers
+/// must verify shapes/dtypes/module-identity themselves (matching this
+/// file's convention: guards live at the call site, this function
+/// `precondition`s them). Always returns a `[1,1,vocabSize]` BF16 array.
+func lagunaFusedFinalNormLMHead(
+    hidden: MLXArray, normWeight: MLXArray, lmHeadWeight: MLXArray
+) -> MLXArray {
+    let hiddenSize = LagunaConstants.hiddenSize
+    let vocab = LagunaConstants.vocabSize
+    precondition(hidden.dtype == .bfloat16)
+    precondition(hidden.shape == [1, 1, hiddenSize])
+    precondition(normWeight.dtype == .bfloat16)
+    precondition(normWeight.shape == [hiddenSize])
+    precondition(lmHeadWeight.dtype == .bfloat16)
+    precondition(lmHeadWeight.shape == [vocab, hiddenSize])
+    precondition(vocab % 64 == 0)
+
+    let tiles = vocab / 64
+    lagunaTrace("final-norm+lm-head")
+    let outputs = lagunaFusedFinalNormLMHeadKernel(
+        [hidden, normWeight, lmHeadWeight],
+        grid: (tiles * 512, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [[1, 1, vocab]],
+        outputDTypes: [.bfloat16]
+    )
+    return outputs[0]
+}
+
 /// Scored Laguna runtime model: last-token vocabulary head over the
 /// reimplemented Laguna text tower.
 ///
@@ -3633,7 +3806,30 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         // position's row. Slice before the row-independent final RMSNorm and
         // vocabulary head so prefill neither normalizes nor projects the
         // preceding rows. For single-token decode the slice is a no-op.
-        let hidden = model.norm(lagunaLastTokenHidden(fullHidden))
+        let lastHidden = lagunaLastTokenHidden(fullHidden)
+
+        // One dispatch for the final RMSNorm + lm_head GEMV when the
+        // decode/prefill-tail preconditions hold (see
+        // `lagunaFusedFinalNormLMHead`'s doc comment for the exactness
+        // argument); otherwise normalize and project separately below.
+        if let lmHead, lagunaFusedFinalNormLMHeadEnabled,
+            lastHidden.dtype == .bfloat16,
+            lastHidden.shape == [1, 1, LagunaConstants.hiddenSize],
+            model.norm.weight.dtype == .bfloat16,
+            model.norm.weight.shape == [LagunaConstants.hiddenSize],
+            type(of: lmHead) == Linear.self,
+            lmHead.bias == nil,
+            lmHead.weight.dtype == .bfloat16,
+            lmHead.weight.shape == [LagunaConstants.vocabSize, LagunaConstants.hiddenSize]
+        {
+            return lagunaFusedFinalNormLMHead(
+                hidden: lastHidden,
+                normWeight: model.norm.weight,
+                lmHeadWeight: lmHead.weight
+            )
+        }
+
+        let hidden = model.norm(lastHidden)
         if let lmHead {
             return lmHead(hidden)
         }
