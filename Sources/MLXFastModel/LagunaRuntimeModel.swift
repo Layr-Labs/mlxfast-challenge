@@ -227,7 +227,7 @@ let lagunaFusedFullQKNormYaRNEnabled =
 /// one BF16 round. Sixteen simdgroups of four rows cover the 64 rows this
 /// threadgroup owns, and 256 divides evenly by 64. The norm half is untouched.
 private let lagunaResidualRMSNormRouterKernel = MLXFast.metalKernel(
-    name: "laguna_residual_rms_router_bf16_2048_v1",
+    name: "laguna_residual_rms_router_bf16_2048_v2",
     inputNames: ["residual", "branch", "weight", "router_weight"],
     outputNames: ["summed", "normalized", "router_logits"],
     source: """
@@ -261,18 +261,20 @@ private let lagunaResidualRMSNormRouterKernel = MLXFast.metalKernel(
         }
 
         acc = simd_sum(acc);
-        if (simd_group == 0) {
-            local_sums[simd_lane] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
         if (simd_lane == 0) {
             local_sums[simd_group] = acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (simd_group == 0) {
-            acc = simd_sum(local_sums[simd_lane]);
+            // The threadgroup is always dispatched at 512 threads (16
+            // simdgroups), so only local_sums[0..15] are ever written. An
+            // in-register 0.0f for lanes 16-31 reproduces the previously
+            // zero-filled slots exactly (adding +0.0f leaves every partial
+            // in simd_sum's reduction tree bit-identical for these
+            // non-negative sums of squares), removing the separate
+            // zero-init pass and its barrier without changing any value.
+            acc = simd_sum(simd_lane < 16 ? local_sums[simd_lane] : 0.0f);
             if (simd_lane == 0) {
                 local_inv_mean[0] =
                     metal::precise::rsqrt(acc / 2048.0f + 1.0e-6f);
@@ -332,7 +334,7 @@ private let lagunaResidualRMSNormRouterKernel = MLXFast.metalKernel(
 /// Residual add + RMSNorm for the layers whose MLP is not a sparse block
 /// (layer 0) and for any shape the router fusion above declines.
 private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
-    name: "laguna_residual_rms_bf16_2048_v1",
+    name: "laguna_residual_rms_bf16_2048_v2",
     inputNames: ["residual", "branch", "weight"],
     outputNames: ["summed", "normalized"],
     source: """
@@ -360,18 +362,20 @@ private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
         }
 
         acc = simd_sum(acc);
-        if (simd_group == 0) {
-            local_sums[simd_lane] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
         if (simd_lane == 0) {
             local_sums[simd_group] = acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (simd_group == 0) {
-            acc = simd_sum(local_sums[simd_lane]);
+            // The threadgroup is always dispatched at 512 threads (16
+            // simdgroups), so only local_sums[0..15] are ever written. An
+            // in-register 0.0f for lanes 16-31 reproduces the previously
+            // zero-filled slots exactly (adding +0.0f leaves every partial
+            // in simd_sum's reduction tree bit-identical for these
+            // non-negative sums of squares), removing the separate
+            // zero-init pass and its barrier without changing any value.
+            acc = simd_sum(simd_lane < 16 ? local_sums[simd_lane] : 0.0f);
             if (simd_lane == 0) {
                 local_inv_mean[0] =
                     metal::precise::rsqrt(acc / 2048.0f + 1.0e-6f);
@@ -737,16 +741,19 @@ private func lagunaFusedQKVProjectionSource(heads: Int) -> String {
             acc += raw[i] * raw[i];
         }
         acc = simd_sum(acc);
-        if (simd_group == 0) {
-            local_sums[lane] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) {
             local_sums[simd_group] = acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (simd_group == 0) {
-            acc = simd_sum(local_sums[lane]);
+            // The threadgroup is always dispatched at 512 threads (16
+            // simdgroups), so only local_sums[0..15] are ever written. An
+            // in-register 0.0f for lanes 16-31 reproduces the previously
+            // zero-filled slots exactly (adding +0.0f leaves every partial
+            // in simd_sum's reduction tree bit-identical for these
+            // non-negative sums of squares), removing the separate
+            // zero-init pass and its barrier without changing any value.
+            acc = simd_sum(lane < 16 ? local_sums[lane] : 0.0f);
             if (lane == 0) {
                 local_inv_mean[0] =
                     metal::precise::rsqrt(acc / float(in_vec_size) + norm_eps);
@@ -902,7 +909,7 @@ private let lagunaFusedQKVProjectionKernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_fused_norm_qkv_projection_bf16_h\(heads)_v1",
+            name: "laguna_fused_norm_qkv_projection_bf16_h\(heads)_v2",
             inputNames: [
                 "residual", "norm_weight", "query_weight", "key_weight",
                 "value_weight", "gate_weight",
@@ -2630,7 +2637,20 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
                         scores[partner] = a_score;
                     }
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+                // `partner = lane ^ stride` never leaves the calling
+                // simdgroup while `stride < 32` (only bits 0-4 flip), so
+                // those stages' compare-swaps touch only the calling
+                // simdgroup's own disjoint 32-slot range of choice_keys /
+                // expert_indices / scores; a simdgroup-scoped fence is
+                // sufficient there. Stages with stride >= 32 cross the
+                // 32-lane boundary and keep the full threadgroup barrier.
+                // The comparator, swap predicate, and total order are
+                // unchanged, so the selected ranks are identical.
+                if (stride < 32) {
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                } else {
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
             }
         }
 
@@ -2663,7 +2683,7 @@ private let lagunaDecodeRouterTop8Header = """
     """
 
 private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_v2",
+    name: "laguna_decode_router_top8_v3",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterTop8KernelSource(normalizing: false),
@@ -2672,7 +2692,7 @@ private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
 )
 
 private let lagunaDecodeRouterTop8NormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_norm_v1",
+    name: "laguna_decode_router_top8_norm_v2",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterTop8KernelSource(normalizing: true),
