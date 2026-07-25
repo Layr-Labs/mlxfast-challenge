@@ -40,9 +40,17 @@ A second, two-sided **acceptance band** also applies on the ranked path, and
 it is tighter than the floors in both directions:
 
 ```text
-decode_speedup  must land in [0.980, 1.053]
-prefill_speedup must land in [0.952, 1.053]
+decode_speedup  vs the pinned calibration reference: [0.980, 1.053]
+prefill_speedup vs the pinned calibration reference: [0.952, 1.053]
 ```
+
+The banded quantity is each timed run's measured seconds/token relative to
+the pinned calibration reference (the `officialBaseline*` constants in
+`Sources/MLXFastCore/Constants.swift`), not the same-session paired
+baseline that produces the published `decode_speedup`/`prefill_speedup` —
+the published paired ratio is checked only against the 0.95 floors and can
+land slightly outside the band window when the box's session baseline
+drifts from the pinned reference.
 
 The upper bound caps how much a single submission may gain (about 5%): a
 larger measured win is either a lucky reading or too big to trust in one
@@ -291,9 +299,10 @@ prefill_speedup >= 0.95
 
 A run below either floor or with any token mismatch is ineligible. The score
 is null when any gate fails. The two-sided acceptance band described above
-(`decode_speedup` in `[0.980, 1.053]`, `prefill_speedup` in `[0.952, 1.053]`)
-applies on top of the floors; local modes warn when their estimate exceeds
-it but never fail on it.
+(speedup vs the pinned calibration reference in `[0.980, 1.053]` for
+decode, `[0.952, 1.053]` for prefill) applies on top of the floors and is
+evaluated against that pinned reference, not the paired session baseline;
+local modes warn when their estimate exceeds it but never fail on it.
 `score.json` also carries prefill and decode
 seconds/token, speedups, floor verdicts, gate results, and
 transformed-weight identity.

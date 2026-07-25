@@ -22,10 +22,12 @@ Higher is better. Each speedup is the pinned baseline's seconds/token divided
 by the candidate's for that phase, both measured on the same machine behind
 the same thermal gate. Both component floors are `0.95`, hard, and every
 checked token must match the golden. A two-sided acceptance band applies on
-top of the floors and is tighter than them: `decode_speedup` must land in
-`[0.980, 1.053]` and `prefill_speedup` in `[0.952, 1.053]`, so a single
-submission's gain is capped at about 5% and larger wins must be chunked
-across submissions (see "Timing And Score Measurement" below).
+top of the floors and is tighter than them: measured against the pinned
+calibration reference, `decode_speedup` must land in `[0.980, 1.053]` and
+`prefill_speedup` in `[0.952, 1.053]`, so a single submission's gain is
+capped at about 5% and larger wins must be chunked across submissions (the
+published paired speedup is floors-only and can land slightly outside the
+window; see "Timing And Score Measurement" below).
 `benchmark.json` registers the serial
 track and `.github/workflows/benchmark.yml` is the serial ranked pipeline.
 
@@ -239,19 +241,27 @@ Both component floors are `0.95`, hard.
 
 A two-sided acceptance band applies on top of the floors
 (`MLXFastConstants.{prefill,decode}Band{Up,Down}Tolerance`): measured
-seconds/token must land within +5%/-5% of the paired baseline for prefill
-and +2%/-5% for decode, i.e. `decode_speedup` in `[0.980, 1.053]` and
-`prefill_speedup` in `[0.952, 1.053]`. The down side deliberately caps a
-single submission's gain at about 5% — larger wins are either lucky
-measurements or too big to trust in one shot and must be chunked across
-submissions; the cap is per submission, not cumulative. The band is frozen
+seconds/token must land within +5%/-5% of the pinned calibration reference
+for prefill and +2%/-5% for decode, i.e. speedup against that pinned
+reference in `[0.980, 1.053]` for decode and `[0.952, 1.053]` for prefill.
+The reference is the cached ranked-box calibration
+(`MLXFastConstants.officialBaseline{Prefill,Decode}SecondsPerToken`, or
+golden-supplied baseline fields carrying the same calibration), not the
+same-session paired baseline: `overlay-paired-timing.sh` applies only the
+0.95 floors to the published paired ratio, so the published
+`decode_speedup`/`prefill_speedup` can land slightly outside the band
+window when the session baseline drifts from the pinned calibration mean.
+The down side deliberately caps a single submission's gain at about 5% —
+larger wins are either lucky measurements or too big to trust in one shot
+and must be chunked across submissions; the cap is per submission, not
+cumulative. The band is frozen
 policy (`docs/benchmark-window-freeze.md`), it is NOT evaluated by
 `--local-iterate` / `--local-submit`, and a ranked run that trips it fails
 with failure category `acceptance_band_failed`. Local modes print a warning
-when their estimate is more than 5% faster than the pinned baseline (the
-"chunk it" direction only — the slow edge is already covered by the floors,
-and a two-sided local check would fire on every run on hardware slower than
-the ranked box), but they never fail on it.
+when their estimate is more than 5% faster than the pinned calibration
+reference (the "chunk it" direction only — the slow edge is already covered
+by the floors, and a two-sided local check would fire on every run on
+hardware slower than the ranked box), but they never fail on it.
 
 The timed measurement runs last in the ranked job, after all correctness and
 gate work and after every hidden byte is scrubbed from the bench workspace,

@@ -278,9 +278,18 @@ A two-sided acceptance band applies on top of the floors, and is tighter
 than them in both directions:
 
 ```text
-decode_speedup  must land in [0.980, 1.053]
-prefill_speedup must land in [0.952, 1.053]
+decode_speedup  vs the pinned calibration reference: [0.980, 1.053]
+prefill_speedup vs the pinned calibration reference: [0.952, 1.053]
 ```
+
+The band gates each timed run's measured seconds/token against the pinned
+calibration reference (the `officialBaseline*` constants in
+`Sources/MLXFastCore/Constants.swift` — the same reference local estimates
+use), not against the same-session paired baseline that produces the
+published `decode_speedup`/`prefill_speedup`. Only the 0.95 floors apply to
+the published paired ratio, so a published speedup slightly outside the
+band window is expected when the box's session baseline drifts from the
+pinned reference — it is not a band violation.
 
 The upper bound caps a single submission's gain at about 5% — a larger
 measured win is either a lucky reading or too big to trust in one shot, so
