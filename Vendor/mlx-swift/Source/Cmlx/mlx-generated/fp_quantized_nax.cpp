@@ -1105,47 +1105,172 @@ template <
 
     dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
       dispatch_bool(align_N || !is_unaligned_bn, [&](auto kAlignedN) {
+        // Fast-path eligibility: device-direct dequant-into-fragment is
+        // only derived/validated below for the transpose=true (nt), bits==4
+        // (NVFP4/MXFP4 2-values-per-byte packing) case. This is the only
+        // specialization Laguna's gather-GEMM dispatch requests
+        // (gather_qmm_rhs_nax always calls with transpose=true, and Laguna
+        // is NVFP4/bits=4). bits==8 (MXFP8) keeps the original Ws-staging
+        // path unchanged below.
+        constexpr bool kFastPathEligible = transpose && (bits == 4);
+        // Rollout gate: the acceptance band caps a single submission's
+        // prefill gain at ~5%, and this fast path addresses the largest
+        // prefill cost block, so it is intentionally chunked: this
+        // submission enables it only for the down-projection shape
+        // (K == 512); the gate/up shape (K == 2048) is the next chunk.
+        const bool kFastPathK = (K == 512);
         for (int k = 0; k < K_it; k++) {
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          if constexpr (kAlignedN.value) {
-            loader_w.load_unsafe();
-          } else {
-            loader_w.load_safe(
-                transpose ? short2(BK, tgp_bn) : short2(tgp_bn, BK));
-          }
+          if (kFastPathEligible && kAlignedM.value && kAlignedN.value &&
+              kFastPathK) {
+            // Device-direct fast path: skip the Ws threadgroup staging
+            // round trip (populate Ws -> mem_threadgroup barrier ->
+            // mem_threadgroup barrier -> Btile.load(Ws + ...)) for the
+            // aligned case, which is the only case Laguna's exactly
+            // 64-divisible M/N/K ever dispatches (align_M/align_N/align_K
+            // are all baked true as function constants for those shapes,
+            // so kAlignedM.value && kAlignedN.value is unconditionally the
+            // live branch on the M5). loader_w itself is left fully
+            // constructed and loader_w.next() below still runs (pure
+            // pointer arithmetic, no threadgroup writes) so its state stays
+            // correct for the dead-for-Laguna-but-must-stay-correct
+            // `!align_K` tail block after this loop, in case this same
+            // kernel template is ever dispatched with M/N aligned but K
+            // unaligned by some other caller. sg_active gating is
+            // preserved exactly as in the else branch below: a skipped run
+            // does no MMA work here either, so RUNSKIP semantics compose
+            // unchanged with this fast path.
+            if (sg_active) {
+              STEEL_PRAGMA_NO_UNROLL
+              for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+                NAXTile<T, TM, TK> Atile;
+                NAXTile<Wtype, BR, BC> Btile;
 
-          threadgroup_barrier(mem_flags::mem_threadgroup);
+                volatile int compiler_barrier;
 
-          if (sg_active) {
-            STEEL_PRAGMA_NO_UNROLL
-            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-              NAXTile<T, TM, TK> Atile;
-              NAXTile<Wtype, BR, BC> Btile;
-
-              volatile int compiler_barrier;
-
-              if constexpr (kAlignedM.value) {
                 Atile.load(xn + kk1, K);
-              } else {
-                Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+
+                // Reproduces, element for element and fragment-lane for
+                // fragment-lane, exactly what
+                //   Btile.template load<Wtype, BK_padded, 1>(
+                //       Ws + tn * BK_padded + kk1)
+                // would have read back out of a Ws populated by
+                // loader_w.load_unsafe() for this same (k, kk1, tn):
+                //  - same BaseNAXFrag::get_coord()-driven per-lane (row, col)
+                //    addressing NAXFrag::load uses against Ws (row = tn +
+                //    idx_row*kFragRows + i*kElemRowsJump + get_coord().y,
+                //    col = kk1 + idx_col*kFragCols + j + get_coord().x);
+                //  - the identical dequant formula `scale *
+                //    Dequantize<4, U>{}(nibble)` that dequantize<U,4>() above
+                //    uses (byte-for-byte the same expression, U = Wtype);
+                //  - the identical packed-byte/scale-group pointer arithmetic
+                //    QuantizedBlockLoader uses (row-stride K_w bytes/K_g
+                //    scale-groups per weight row, 2 values packed per byte),
+                //    generalized from that loader's fixed per-thread (bi, bj)
+                //    partition to the arbitrary (row, col) each fragment lane
+                //    needs, via the exact-division identity
+                //    (k*BK + C) / d == k*(BK/d) + C/d (valid because BK is an
+                //    exact multiple of d for d in {pack_factor, group_size}
+                //    on every Laguna shape).
+                {
+                  const device uint8_t* w_base =
+                      wl + index * stride_w + size_t(tn) * K_w;
+                  const device uint8_t* s_base =
+                      scales + index * stride_s + size_t(tn) * K_g;
+                  const short2 sc = BaseNAXFrag::get_coord();
+                  const short fn = sc.x;
+                  const short fm = sc.y;
+
+                  STEEL_PRAGMA_UNROLL
+                  for (short idx_row = 0; idx_row < BR; idx_row++) {
+                    STEEL_PRAGMA_UNROLL
+                    for (short i = 0; i < BaseNAXFrag::kElemRows; i++) {
+                      // Local weight row within this BN=64 tile; matches the
+                      // row BaseNAXFrag::load would compute against
+                      // Ws + tn * BK_padded + kk1.
+                      const short R = idx_row * BaseNAXFrag::kFragRows +
+                          i * BaseNAXFrag::kElemRowsJump + fm;
+                      const device uint8_t* w_row = w_base + size_t(R) * K_w;
+                      const device uint8_t* s_row = s_base + size_t(R) * K_g;
+
+                      STEEL_PRAGMA_UNROLL
+                      for (short idx_col = 0; idx_col < BC; idx_col++) {
+                        STEEL_PRAGMA_UNROLL
+                        for (short j = 0; j < BaseNAXFrag::kElemCols; j++) {
+                          // Local K-column within this BK=64 step; matches
+                          // the col BaseNAXFrag::load would compute.
+                          const short C = kk1 +
+                              idx_col * BaseNAXFrag::kFragCols + j + fn;
+                          const int packed_byte_offset =
+                              k * (BK / pack_factor) + (C / pack_factor);
+                          const int scale_group =
+                              k * (BK / group_size) + (C / group_size);
+                          const uint8_t raw_byte = w_row[packed_byte_offset];
+                          const uint8_t scale_byte = s_row[scale_group];
+                          const Wtype scale =
+                              dequantize_scale<Wtype, group_size>(scale_byte);
+                          const Wtype value = ((C % pack_factor) == 0)
+                              ? scale * Dequantize<4, Wtype>{}(raw_byte)
+                              : scale * Dequantize<4, Wtype>{}(raw_byte >> 4);
+                          Btile.frag_at(idx_row, idx_col)
+                              [i * BaseNAXFrag::kElemCols + j] = value;
+                        }
+                      }
+                    }
+                  }
+                }
+
+                tile_matmad_nax(
+                    Dtile,
+                    Atile,
+                    metal::bool_constant<false>{},
+                    Btile,
+                    metal::bool_constant<transpose>{});
+
+                (void)compiler_barrier;
               }
+            }
+          } else {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if constexpr (kAlignedN.value) {
+              loader_w.load_unsafe();
+            } else {
+              loader_w.load_safe(
+                  transpose ? short2(BK, tgp_bn) : short2(tgp_bn, BK));
+            }
 
-              if constexpr (transpose) {
-                Btile.template load<Wtype, BK_padded, 1>(
-                    Ws + tn * BK_padded + kk1);
-              } else {
-                Btile.template load<Wtype, BN_padded, 1>(
-                    Ws + tn + kk1 * BN_padded);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (sg_active) {
+              STEEL_PRAGMA_NO_UNROLL
+              for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+                NAXTile<T, TM, TK> Atile;
+                NAXTile<Wtype, BR, BC> Btile;
+
+                volatile int compiler_barrier;
+
+                if constexpr (kAlignedM.value) {
+                  Atile.load(xn + kk1, K);
+                } else {
+                  Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+                }
+
+                if constexpr (transpose) {
+                  Btile.template load<Wtype, BK_padded, 1>(
+                      Ws + tn * BK_padded + kk1);
+                } else {
+                  Btile.template load<Wtype, BN_padded, 1>(
+                      Ws + tn + kk1 * BN_padded);
+                }
+
+                tile_matmad_nax(
+                    Dtile,
+                    Atile,
+                    metal::bool_constant<false>{},
+                    Btile,
+                    metal::bool_constant<transpose>{});
+
+                (void)compiler_barrier;
               }
-
-              tile_matmad_nax(
-                  Dtile,
-                  Atile,
-                  metal::bool_constant<false>{},
-                  Btile,
-                  metal::bool_constant<transpose>{});
-
-              (void)compiler_barrier;
             }
           }
 
