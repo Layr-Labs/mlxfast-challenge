@@ -8,8 +8,11 @@ const char* steel_attention_nax() {
 
 // DARKBLOOM_ATTN_QHOIST default. DEFAULT OFF: unless the host prepends a
 // `#define DARKBLOOM_ATTN_QHOIST 1` ahead of this string (see
-// get_steel_attention_nax_kernel in mlx/backend/metal/jit_kernels.cpp), the
-// kernel below is byte-for-byte the upstream algorithm.
+// get_steel_attention_nax_kernel in mlx/backend/metal/jit_kernels.cpp), only
+// that optional Q-fragment hoisting path is gated. Independent always-on
+// Laguna optimizations (e.g., per-simdgroup causal K-block elision and
+// level-2 P@V elision) remain active below and are not present in upstream
+// mlx.
 //
 // The flag is deliberately a preprocessor define baked into the JIT source
 // string, NOT a Metal function constant. A function constant participates in
@@ -1499,9 +1502,8 @@ template <
   // leaves every finite nonzero accumulator bit-identical; an exactly-zero
   // accumulator can differ only in its zero sign, which is numerically equal
   // through the final positive normalization and all downstream arithmetic.
-  // The kb trip count and every barrier stay untouched (the P@V loop contains
-  // a threadgroup_barrier at BD == 128, so a per-simdgroup trip count would be
-  // undefined behaviour); sg_active is simdgroup-uniform (tid.x and tm only).
+  // The kb trip count and every remaining barrier stay on uniform paths;
+  // sg_active is simdgroup-uniform (tid.x and tm only).
   // Restricted to
   // do_causal && !has_mask so the all-masked proof rests on the causal mask
   // alone; the timed window passes no array mask.
@@ -1815,12 +1817,6 @@ template <
     for (short iq = 0; iq < TQ; iq++) {
       STEEL_PRAGMA_UNROLL
       for (short id = 0; id < TD; id += 2) {
-        if constexpr (BD == 128) {
-          if (id == 4) {
-            threadgroup_barrier(mem_flags::mem_none);
-          }
-        }
-
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < TK; ik++) {
           if (sg_active) {

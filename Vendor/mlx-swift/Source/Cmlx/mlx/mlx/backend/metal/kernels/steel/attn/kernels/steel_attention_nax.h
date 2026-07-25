@@ -8,8 +8,10 @@
 using namespace mlx::steel;
 
 // DARKBLOOM_ATTN_QHOIST default. DEFAULT OFF: unless the compiler is invoked
-// with -DDARKBLOOM_ATTN_QHOIST=1, the kernel below is byte-for-byte the
-// upstream algorithm.
+// with -DDARKBLOOM_ATTN_QHOIST=1, only that optional Q-fragment hoisting path
+// is gated. Independent always-on Laguna optimizations (e.g., per-simdgroup
+// causal K-block elision and level-2 P@V elision) remain active below and are
+// not present in upstream mlx.
 //
 // NOTE ON WHICH TWIN RUNS. steel/attn is a JIT family: the runtime-effective
 // source is the string in Cmlx/mlx-generated/steel_attention_nax.cpp, and the
@@ -216,9 +218,8 @@ template <
   // leaves every finite nonzero accumulator bit-identical; an exactly-zero
   // accumulator can differ only in its zero sign, which is numerically equal
   // through the final positive normalization and all downstream arithmetic.
-  // The kb trip count and every barrier stay untouched (the P@V loop contains
-  // a threadgroup_barrier at BD == 128, so a per-simdgroup trip count would be
-  // undefined behaviour); sg_active is simdgroup-uniform (tid.x and tm only).
+  // The kb trip count and every remaining barrier stay on uniform paths;
+  // sg_active is simdgroup-uniform (tid.x and tm only).
   // Restricted to
   // do_causal && !has_mask so the all-masked proof rests on the causal mask
   // alone; the timed window passes no array mask.
@@ -532,12 +533,6 @@ template <
     for (short iq = 0; iq < TQ; iq++) {
       STEEL_PRAGMA_UNROLL
       for (short id = 0; id < TD; id += 2) {
-        if constexpr (BD == 128) {
-          if (id == 4) {
-            threadgroup_barrier(mem_flags::mem_none);
-          }
-        }
-
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < TK; ik++) {
           if (sg_active) {
