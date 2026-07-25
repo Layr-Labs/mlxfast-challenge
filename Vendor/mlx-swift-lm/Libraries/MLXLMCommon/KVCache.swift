@@ -639,6 +639,56 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return result
     }
 
+    /// Decode-only fast path: adopt externally-computed FULL ring buffers
+    /// (`[B, nKVHeads, maxCacheSize, D]`, produced by a fused kernel that
+    /// already wrote the new row at `nextDecodeWriteIndex()` and copied
+    /// every other row unchanged from the current `keys`/`values`),
+    /// advancing `idx`/`offset` with exactly the rotate-then-advance
+    /// sequence `updateInPlace` applies for a one-token update, without
+    /// dispatching any write of its own. The caller must have verified the
+    /// ring is fully allocated and in the steady full-buffer return regime
+    /// before dispatching its kernel; the preconditions here are a
+    /// correctness backstop, not the primary guard.
+    public func adoptDecodeUpdate(keys newKeys: MLXArray, values newValues: MLXArray) {
+        precondition(
+            self.keys != nil && self.values != nil
+                && self.keys!.dim(2) == maxCacheSize,
+            "adoptDecodeUpdate requires an already-fully-allocated ring buffer"
+        )
+        precondition(
+            offset >= maxCacheSize - 1,
+            "adoptDecodeUpdate requires the ring to already be in steady state"
+        )
+        precondition(
+            newKeys.shape == self.keys!.shape && newValues.shape == self.values!.shape,
+            "adoptDecodeUpdate requires full-ring-shaped buffers"
+        )
+        if idx == maxCacheSize {
+            idx = keep
+        }
+        self.keys = newKeys
+        self.values = newValues
+        offset += 1
+        idx += 1
+    }
+
+    /// The ring slot the next single-token update will write -- exactly the
+    /// index `updateInPlace` would assign before advancing `idx`, for a
+    /// one-token update on a fully-grown ring. Read-only; callers compute
+    /// the new row at this slot in their fused kernel and pass the
+    /// resulting full buffers to `adoptDecodeUpdate`, which applies the
+    /// identical rotate-check again (idempotent -- cache state is untouched
+    /// between the two calls) before advancing.
+    public func nextDecodeWriteIndex() -> Int {
+        idx == maxCacheSize ? keep : idx
+    }
+
+    /// Read-only views of the ring buffers for the decode ring-emit fast
+    /// path's guard checks (the stored properties stay `internal` for the
+    /// same-module Compilable subclass's promotion machinery).
+    public var ringEmitKeys: MLXArray? { keys }
+    public var ringEmitValues: MLXArray? { values }
+
     public override var state: [MLXArray] {
         get {
             guard let keys = self.keys, let values = self.values else { return [] }

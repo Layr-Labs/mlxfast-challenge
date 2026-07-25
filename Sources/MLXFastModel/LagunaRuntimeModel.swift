@@ -199,6 +199,20 @@ let lagunaFusedQKVProjectionEnabled =
 let lagunaFusedSlidingQKNormRoPEEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_QK_NORM_ROPE"] != "0"
 
+/// Sliding-layer fusion that, in addition to the QK-norm+RoPE math the
+/// sibling kernel above performs, ALSO rewrites the full 512-row sliding
+/// KV ring in the same dispatch and feeds the result straight to
+/// `MLXFast.scaledDotProductAttention`, bypassing `attentionWithCacheUpdate`
+/// and its two per-layer slice-write dispatches (K, V) entirely for
+/// single-token decode. The ring materialization trades ~2 MB/layer of
+/// extra (bandwidth-idle) copy traffic for two fewer launch-latency-bound
+/// dispatches on the serial chain. See
+/// `laguna_sliding_qk_norm_rope_ring_emit_bf16_128_v1` and
+/// `RotatingKVCache.adoptDecodeUpdate`. Independent of
+/// `DARKBLOOM_FUSED_SLIDING_QK_NORM_ROPE` (own sibling kernel, own guards).
+let lagunaFusedKVRingEmitEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_KV_RING_EMIT"] != "0"
+
 /// Full-attention counterpart: fuses per-head Q/K RMSNorm with partial YaRN
 /// RoPE. One stock FP32 probe row carries the authoritative rotary factors,
 /// while the custom kernel preserves the normalized BF16 boundary and tail.
@@ -682,6 +696,202 @@ func lagunaSlidingQKNormRoPE(
         outputDTypes: [.bfloat16, .bfloat16]
     )
     return (outputs[0], outputs[1])
+}
+
+/// Sliding-layer sibling of `lagunaSlidingQKNormRoPEKernel` (above) that
+/// ALSO rewrites the full 512-row sliding KV ring in the same dispatch,
+/// eliminating the two `RotatingKVCache.updateInPlace` slice-write
+/// dispatches per layer per decode step. Decode-only (single-token), and
+/// only reachable once the ring is fully allocated and in its steady
+/// "full buffer" return regime -- see the guard set at the call site.
+///
+/// Q/K-compute threadgroups [0, 72) are byte-identical to the sibling
+/// kernel's body except that the 8 K-head threadgroups write their rotated
+/// row directly into `new_keys` at [0, head, write_idx, :] -- a destination
+/// disjoint from every other write in the dispatch (the K-copy threadgroups
+/// explicitly skip `row == write_idx`), so no cross-threadgroup visibility
+/// is ever relied upon and the kernel needs no barrier anywhere. V takes no
+/// norm or RoPE in this model, so its new row is a straight copy of
+/// `raw_values`, handled uniformly by the V-copy threadgroups
+/// (source-select on `row == write_idx`). Every ring row not written this
+/// step is a pure `vec<bfloat,4>` load/store from the previous ring --
+/// byte-identical to what the stock slice-assign leaves untouched in place.
+private let lagunaSlidingQKNormRoPERingEmitKernel = MLXFast.metalKernel(
+    name: "laguna_sliding_qk_norm_rope_ring_emit_bf16_128_v1",
+    inputNames: [
+        "raw_queries", "raw_keys", "raw_values",
+        "query_weight", "key_weight", "angles",
+        "old_keys", "old_values", "write_idx",
+    ],
+    outputNames: ["queries", "new_keys", "new_values"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint rotary_pairs = 64;
+        constexpr uint query_heads = 64;
+        constexpr uint kv_heads = 8;
+        constexpr uint ring_size = 512;
+        constexpr uint qk_threadgroups = query_heads + kv_heads;
+        constexpr uint k_copy_threadgroups = kv_heads * ring_size;
+
+        uint tg = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+        uint idx = write_idx[0];
+
+        if (tg < qk_threadgroups) {
+            uint head = tg;
+
+            const device bfloat* input;
+            const device bfloat* weight;
+            if (head < query_heads) {
+                input = raw_queries + head * head_dim;
+                weight = query_weight;
+            } else {
+                input = raw_keys + (head - query_heads) * head_dim;
+                weight = key_weight;
+            }
+
+            uint base = lane * 4;
+            thread bfloat normalized[4];
+            float sum = 0.0f;
+            for (uint i = 0; i < 4; ++i) {
+                float value = float(input[base + i]);
+                sum += value * value;
+            }
+            sum = simd_sum(sum);
+            float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+            for (uint i = 0; i < 4; ++i) {
+                normalized[i] =
+                    weight[base + i] *
+                    bfloat(float(input[base + i]) * inverse_rms);
+            }
+
+            thread float paired[4];
+            for (uint i = 0; i < 4; ++i) {
+                paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
+            }
+
+            device bfloat* output;
+            if (head < query_heads) {
+                output = queries + head * head_dim;
+            } else {
+                uint kv_head = head - query_heads;
+                output = new_keys + (kv_head * ring_size + idx) * head_dim;
+            }
+            if (lane < 16) {
+                for (uint i = 0; i < 4; ++i) {
+                    uint pair = base + i;
+                    float first = float(normalized[i]);
+                    float second = paired[i];
+                    float cosine = angles[pair];
+                    float sine = angles[pair + rotary_pairs];
+                    output[pair] = bfloat(first * cosine - second * sine);
+                    output[pair + rotary_pairs] =
+                        bfloat(first * sine + second * cosine);
+                }
+            }
+            return;
+        }
+
+        uint base = lane * 4;
+
+        if (tg < qk_threadgroups + k_copy_threadgroups) {
+            // K ring copy: one threadgroup per (head, row). The row equal
+            // to `idx` is owned exclusively by the K-head compute
+            // threadgroup above -- skip it here to keep every write in
+            // this dispatch disjoint.
+            uint slot = tg - qk_threadgroups;
+            uint head = slot / ring_size;
+            uint row = slot % ring_size;
+            if (row == idx) {
+                return;
+            }
+            const device vec<bfloat, 4>* src =
+                (const device vec<bfloat, 4>*)(
+                    old_keys + (head * ring_size + row) * head_dim + base);
+            device vec<bfloat, 4>* dst =
+                (device vec<bfloat, 4>*)(
+                    new_keys + (head * ring_size + row) * head_dim + base);
+            dst[0] = src[0];
+            return;
+        }
+
+        // V ring copy + insert: one threadgroup per (head, row). V gets no
+        // norm/RoPE, so the new row is a straight copy of raw_values.
+        uint slot = tg - qk_threadgroups - k_copy_threadgroups;
+        uint head = slot / ring_size;
+        uint row = slot % ring_size;
+        device vec<bfloat, 4>* dst =
+            (device vec<bfloat, 4>*)(
+                new_values + (head * ring_size + row) * head_dim + base);
+        if (row == idx) {
+            const device vec<bfloat, 4>* src =
+                (const device vec<bfloat, 4>*)(
+                    raw_values + head * head_dim + base);
+            dst[0] = src[0];
+        } else {
+            const device vec<bfloat, 4>* src =
+                (const device vec<bfloat, 4>*)(
+                    old_values + (head * ring_size + row) * head_dim + base);
+            dst[0] = src[0];
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+func lagunaSlidingQKNormRoPERingEmit(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    rawValues: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray,
+    oldKeys: MLXArray,
+    oldValues: MLXArray,
+    writeIndex: Int
+) -> (queries: MLXArray, newKeys: MLXArray, newValues: MLXArray) {
+    let heads = LagunaConstants.slidingAttentionHeads
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    let headDim = LagunaConstants.headDim
+    let ringSize = LagunaConstants.slidingWindow
+    precondition(rawQueries.dtype == .bfloat16)
+    precondition(rawKeys.dtype == .bfloat16)
+    precondition(rawValues.dtype == .bfloat16)
+    precondition(queryWeight.dtype == .bfloat16)
+    precondition(keyWeight.dtype == .bfloat16)
+    precondition(rawQueries.shape == [1, 1, heads * headDim])
+    precondition(rawKeys.shape == [1, 1, kvHeads * headDim])
+    precondition(rawValues.shape == [1, 1, kvHeads * headDim])
+    precondition(queryWeight.shape == [headDim])
+    precondition(keyWeight.shape == [headDim])
+    precondition(angles.dtype == .float32)
+    precondition(angles.shape == [1, 1, 1, headDim])
+    precondition(oldKeys.dtype == .bfloat16)
+    precondition(oldValues.dtype == .bfloat16)
+    precondition(oldKeys.shape == [1, kvHeads, ringSize, headDim])
+    precondition(oldValues.shape == oldKeys.shape)
+    precondition(writeIndex >= 0 && writeIndex < ringSize)
+
+    let qkThreadgroups = heads + kvHeads
+    let ringThreadgroups = kvHeads * ringSize
+    let totalThreadgroups = qkThreadgroups + 2 * ringThreadgroups
+
+    lagunaTrace("sliding qk norm+rope+kv ring emit")
+    let outputs = lagunaSlidingQKNormRoPERingEmitKernel(
+        [
+            rawQueries, rawKeys, rawValues, queryWeight, keyWeight, angles,
+            oldKeys, oldValues, MLXArray([UInt32(writeIndex)]),
+        ],
+        grid: (totalThreadgroups * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [
+            [1, heads, 1, headDim],
+            [1, kvHeads, ringSize, headDim],
+            [1, kvHeads, ringSize, headDim],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1], outputs[2])
 }
 
 /// Decode-only fusion of the three attention input projections into one
@@ -1346,67 +1556,131 @@ final class LagunaRuntimeAttention: Module {
             qkRoPEAngles?.dtype == .float32 &&
             qkRoPEAngles?.shape == [1, 1, 1, headDim / 2]
 
-        let useFusedSlidingQKNormRoPE =
-            lagunaFusedSlidingQKNormRoPEEnabled && isSliding &&
+        // Shared shape/dtype prerequisite for BOTH the QK-only sliding
+        // fusion and the ring-emit fusion below -- factored out so the two
+        // guards cannot silently drift apart.
+        let slidingFusedShapesHold =
+            isSliding &&
             fusedQKNormShapesMatch &&
             nHeads == LagunaConstants.slidingAttentionHeads &&
             qkRoPEAngles?.dtype == .float32 &&
             qkRoPEAngles?.shape == [1, 1, 1, headDim]
 
-        if useFusedFullQKNormYaRN, let qkRoPEAngles {
-            (queries, keys) = lagunaFullQKNormYaRN(
+        let useFusedSlidingQKNormRoPE =
+            lagunaFusedSlidingQKNormRoPEEnabled && slidingFusedShapesHold
+
+        // KV ring-emit fast path (see `lagunaSlidingQKNormRoPERingEmit` and
+        // `RotatingKVCache.adoptDecodeUpdate`): single-token decode on a
+        // fully-grown steady-state sliding ring only; any guard failure
+        // falls through to the existing code unchanged. `values` here is
+        // still the FLAT, pre-reshape projection output. The exact-type
+        // check deliberately refuses `CompilableRotatingKVCache` (its
+        // Int `idx`/`offset` go stale after promotion).
+        func lagunaMaskIsNone() -> Bool {
+            if case .none = mask { return true }
+            return false
+        }
+        var ringEmitCache: RotatingKVCache?
+        if lagunaFusedKVRingEmitEnabled, slidingFusedShapesHold,
+            values.dtype == .bfloat16,
+            values.shape == [1, 1, nKVHeads * headDim],
+            let concreteCache = cache,
+            type(of: concreteCache) == RotatingKVCache.self,
+            let rotating = concreteCache as? RotatingKVCache,
+            let oldKeys = rotating.ringEmitKeys,
+            let oldValues = rotating.ringEmitValues,
+            oldKeys.dtype == .bfloat16, oldValues.dtype == .bfloat16,
+            rotating.maxSize == LagunaConstants.slidingWindow,
+            oldKeys.shape == [1, nKVHeads, LagunaConstants.slidingWindow, headDim],
+            oldValues.shape == oldKeys.shape,
+            rotating.offset >= LagunaConstants.slidingWindow - 1,
+            lagunaMaskIsNone()
+        {
+            ringEmitCache = rotating
+        }
+
+        var output: MLXArray
+        if let rotating = ringEmitCache, let qkRoPEAngles {
+            let writeIndex = rotating.nextDecodeWriteIndex()
+            let ring = lagunaSlidingQKNormRoPERingEmit(
                 rawQueries: queries,
                 rawKeys: keys,
+                rawValues: values,
                 queryWeight: qNorm.weight,
                 keyWeight: kNorm.weight,
-                angles: qkRoPEAngles
+                angles: qkRoPEAngles,
+                oldKeys: rotating.ringEmitKeys!,
+                oldValues: rotating.ringEmitValues!,
+                writeIndex: writeIndex
             )
-        } else if useFusedSlidingQKNormRoPE, let qkRoPEAngles {
-            (queries, keys) = lagunaSlidingQKNormRoPE(
-                rawQueries: queries,
-                rawKeys: keys,
-                queryWeight: qNorm.weight,
-                keyWeight: kNorm.weight,
-                angles: qkRoPEAngles
+            rotating.adoptDecodeUpdate(keys: ring.newKeys, values: ring.newValues)
+            // SDPA returns `[B, H, 1, D]`; flattening the contiguous
+            // head-major payload directly matches the `[B, 1, H*D]` byte
+            // order (same singleton-axis reasoning as the stock path below).
+            output = MLXFast.scaledDotProductAttention(
+                queries: ring.queries,
+                keys: ring.newKeys,
+                values: ring.newValues,
+                scale: scale,
+                mask: mask
             )
+            .reshaped(B, L, -1)
         } else {
-            queries =
-                qNorm(queries.reshaped(B, L, nHeads, headDim))
-                .transposed(0, 2, 1, 3)
-            keys =
-                kNorm(keys.reshaped(B, L, nKVHeads, headDim))
-                .transposed(0, 2, 1, 3)
-        }
-        // With a singleton sequence axis, `[B, 1, H, D]` and
-        // `[B, H, 1, D]` have the same contiguous byte order. Reshape
-        // directly so decode does not carry a no-op transpose view through
-        // the lazy graph. Multi-token calls still require the real axis swap.
-        values =
-            L == 1
-            ? values.reshaped(B, nKVHeads, L, headDim)
-            : values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
+            if useFusedFullQKNormYaRN, let qkRoPEAngles {
+                (queries, keys) = lagunaFullQKNormYaRN(
+                    rawQueries: queries,
+                    rawKeys: keys,
+                    queryWeight: qNorm.weight,
+                    keyWeight: kNorm.weight,
+                    angles: qkRoPEAngles
+                )
+            } else if useFusedSlidingQKNormRoPE, let qkRoPEAngles {
+                (queries, keys) = lagunaSlidingQKNormRoPE(
+                    rawQueries: queries,
+                    rawKeys: keys,
+                    queryWeight: qNorm.weight,
+                    keyWeight: kNorm.weight,
+                    angles: qkRoPEAngles
+                )
+            } else {
+                queries =
+                    qNorm(queries.reshaped(B, L, nHeads, headDim))
+                    .transposed(0, 2, 1, 3)
+                keys =
+                    kNorm(keys.reshaped(B, L, nKVHeads, headDim))
+                    .transposed(0, 2, 1, 3)
+            }
+            // With a singleton sequence axis, `[B, 1, H, D]` and
+            // `[B, H, 1, D]` have the same contiguous byte order. Reshape
+            // directly so decode does not carry a no-op transpose view through
+            // the lazy graph. Multi-token calls still require the real axis swap.
+            values =
+                L == 1
+                ? values.reshaped(B, nKVHeads, L, headDim)
+                : values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
 
-        if !useFusedFullQKNormYaRN && !useFusedSlidingQKNormRoPE {
-            queries = applyRotaryPosition(rope, to: queries, cache: cache)
-            keys = applyRotaryPosition(rope, to: keys, cache: cache)
-        }
+            if !useFusedFullQKNormYaRN && !useFusedSlidingQKNormRoPE {
+                queries = applyRotaryPosition(rope, to: queries, cache: cache)
+                keys = applyRotaryPosition(rope, to: keys, cache: cache)
+            }
 
-        let attended = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
-        )
-        // SDPA returns `[B, H, L, D]`. When `L == 1`, flattening its
-        // contiguous head-major payload directly produces the exact
-        // `[B, 1, H*D]` byte order; the transpose only changes singleton-axis
-        // metadata. Preserve the real transpose for prefill.
-        var output =
-            L == 1
-            ? attended.reshaped(B, L, -1)
-            : attended.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            let attended = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
+            // SDPA returns `[B, H, L, D]`. When `L == 1`, flattening its
+            // contiguous head-major payload directly produces the exact
+            // `[B, 1, H*D]` byte order; the transpose only changes singleton-axis
+            // metadata. Preserve the real transpose for prefill.
+            output =
+                L == 1
+                ? attended.reshaped(B, L, -1)
+                : attended.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        }
 
         if gatingEnabled, let gProj {
             // Per-head softplus gate computed in float32, then broadcast
@@ -2619,25 +2893,27 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
         ? """
         float total = 0.0f;
         for (uint i = 0; i < 8; ++i) {
-            total = simd_shuffle(my_score, ushort(i)) + total;
+            total = simd_shuffle(my_final_score, ushort(i)) + total;
         }
         if (lane < 8) {
-            router_indices[lane] = my_index;
-            router_scores[lane] = my_score / total;
+            router_indices[lane] = my_final_index;
+            router_scores[lane] = my_final_score / total;
         }
         """
         : """
         if (lane < 8) {
-            router_indices[lane] = my_index;
-            router_scores[lane] = my_score;
+            router_indices[lane] = my_final_index;
+            router_scores[lane] = my_final_score;
         }
         """
     return """
         uint lane = thread_position_in_threadgroup.x;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint simd_lane = thread_index_in_simdgroup;
 
-        threadgroup float xchg_keys[256];
-        threadgroup uint xchg_indices[256];
-        threadgroup float xchg_scores[256];
+        threadgroup float stage_keys[64];
+        threadgroup uint stage_indices[64];
+        threadgroup float stage_scores[64];
 
         float x = float(logits[lane]);
         float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
@@ -2645,72 +2921,118 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
         float my_key = -(my_score + float(correction_bias[lane]));
         uint my_index = lane;
 
-        // A total order (choice key, then original expert index) makes this
-        // network match the stock stable merge sort even for exact ties,
-        // signed zero, and NaNs. The lower half of each final sequence keeps
-        // the better entries, so ranks 0..<8 are the desired top experts.
+        // Hierarchical top-8 selection under the same strict total order
+        // (choice key, then original expert index) the stock stable merge
+        // argsort realizes. A strict total order has a unique minimum over
+        // any candidate set regardless of the comparison tree, so repeated
+        // extract-min yields exactly the stock sort's ranks 0..<8 -- the
+        // only rows this kernel has ever emitted. Every global top-8 expert
+        // is necessarily within its own simdgroup's top 8, so per-simdgroup
+        // top-8 followed by a 64-candidate final selection is exact.
         //
-        // The network's schedule, comparator, and pair roles are unchanged
-        // from the threadgroup-memory version; only WHERE a pair exchanges
-        // its operands differs. For stride < 32, `partner = lane ^ stride`
-        // never leaves the calling simdgroup (only bits 0-4 flip), so those
-        // 30 stages exchange through registers with `simd_shuffle_xor` --
-        // the same value-passing idiom the promoted QK-norm kernels use --
-        // touching no memory and needing no barrier. Shuffles are
-        // bit-preserving, both partners compute the identical swap decision
-        // from identical operands (`lane & sequence` agrees across a pair
-        // because stride < sequence), and each keeps its side of the
-        // exchange, so every stage's resulting values are bit-identical to
-        // the memory version's. Only the six stages with stride >= 32 cross
-        // a simdgroup boundary and go through threadgroup memory with full
-        // barriers.
-        for (uint sequence = 2; sequence <= 256; sequence <<= 1) {
-            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
-                float other_key;
-                uint other_index;
-                float other_score;
-                if (stride < 32) {
-                    other_key = simd_shuffle_xor(my_key, ushort(stride));
-                    other_index = simd_shuffle_xor(my_index, ushort(stride));
-                    other_score = simd_shuffle_xor(my_score, ushort(stride));
-                } else {
-                    xchg_keys[lane] = my_key;
-                    xchg_indices[lane] = my_index;
-                    xchg_scores[lane] = my_score;
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                    uint partner = lane ^ stride;
-                    other_key = xchg_keys[partner];
-                    other_index = xchg_indices[partner];
-                    other_score = xchg_scores[partner];
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Round r of each phase finds the current minimum via a
+        // simd_shuffle_xor butterfly (bit-preserving; comparator unchanged),
+        // hands it to collector lane r, and masks the winner with a
+        // sentinel that the total order places strictly after every real
+        // candidate: a quiet-NaN key with expert index 0xFFFFFFFF (real NaN
+        // keys carry indices < 256 and win the NaN-vs-NaN index tie-break;
+        // non-NaN keys precede NaN keys outright).
+
+        // --- phase 1: per-simdgroup top 8 (registers only, no barriers) ---
+        float rank_key = 0.0f;
+        uint rank_index = 0u;
+        float rank_score = 0.0f;
+        for (uint round = 0; round < 8; ++round) {
+            float best_key = my_key;
+            uint best_index = my_index;
+            float best_score = my_score;
+            for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                float other_key = simd_shuffle_xor(best_key, delta);
+                uint other_index = simd_shuffle_xor(best_index, delta);
+                float other_score = simd_shuffle_xor(best_score, delta);
+                if (laguna_router_key_before(
+                        other_key, other_index, best_key, best_index)) {
+                    best_key = other_key;
+                    best_index = other_index;
+                    best_score = other_score;
                 }
+            }
+            if (simd_lane == round) {
+                rank_key = best_key;
+                rank_index = best_index;
+                rank_score = best_score;
+            }
+            if (my_index == best_index) {
+                my_key = as_type<float>(0x7FC00000u);
+                my_index = 0xFFFFFFFFu;
+            }
+        }
 
-                bool is_lower = (lane & stride) == 0;
-                float a_key = is_lower ? my_key : other_key;
-                uint a_index = is_lower ? my_index : other_index;
-                float a_score = is_lower ? my_score : other_score;
-                float b_key = is_lower ? other_key : my_key;
-                uint b_index = is_lower ? other_index : my_index;
-                float b_score = is_lower ? other_score : my_score;
+        // --- publish the 8 x 8 survivors, one barrier ---
+        if (simd_lane < 8) {
+            stage_keys[simd_group * 8 + simd_lane] = rank_key;
+            stage_indices[simd_group * 8 + simd_lane] = rank_index;
+            stage_scores[simd_group * 8 + simd_lane] = rank_score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                bool lower_wants_better = (lane & sequence) == 0;
-                bool b_before_a = laguna_router_key_before(
-                    b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
-                if (swap) {
-                    my_key = is_lower ? b_key : a_key;
-                    my_index = is_lower ? b_index : a_index;
-                    my_score = is_lower ? b_score : a_score;
+        // --- phase 2: simdgroup 0 selects the global top 8 from 64
+        // candidates (two per lane, registers only) ---
+        float cand_key_a = 0.0f;
+        uint cand_index_a = 0xFFFFFFFFu;
+        float cand_score_a = 0.0f;
+        float cand_key_b = 0.0f;
+        uint cand_index_b = 0xFFFFFFFFu;
+        float cand_score_b = 0.0f;
+        if (simd_group == 0) {
+            cand_key_a = stage_keys[simd_lane];
+            cand_index_a = stage_indices[simd_lane];
+            cand_score_a = stage_scores[simd_lane];
+            cand_key_b = stage_keys[32 + simd_lane];
+            cand_index_b = stage_indices[32 + simd_lane];
+            cand_score_b = stage_scores[32 + simd_lane];
+        }
+        uint final_expert = 0u;
+        float final_score = 0.0f;
+        if (simd_group == 0) {
+            for (uint round = 0; round < 8; ++round) {
+                bool b_first = laguna_router_key_before(
+                    cand_key_b, cand_index_b, cand_key_a, cand_index_a);
+                float best_key = b_first ? cand_key_b : cand_key_a;
+                uint best_index = b_first ? cand_index_b : cand_index_a;
+                float best_score = b_first ? cand_score_b : cand_score_a;
+                for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                    float other_key = simd_shuffle_xor(best_key, delta);
+                    uint other_index = simd_shuffle_xor(best_index, delta);
+                    float other_score = simd_shuffle_xor(best_score, delta);
+                    if (laguna_router_key_before(
+                            other_key, other_index, best_key, best_index)) {
+                        best_key = other_key;
+                        best_index = other_index;
+                        best_score = other_score;
+                    }
+                }
+                if (simd_lane == round) {
+                    final_expert = best_index;
+                    final_score = best_score;
+                }
+                if (cand_index_a == best_index) {
+                    cand_key_a = as_type<float>(0x7FC00000u);
+                    cand_index_a = 0xFFFFFFFFu;
+                }
+                if (cand_index_b == best_index) {
+                    cand_key_b = as_type<float>(0x7FC00000u);
+                    cand_index_b = 0xFFFFFFFFu;
                 }
             }
         }
 
         // Ranks 0..<8 live in lanes 0..<8 of simdgroup 0. The epilogue runs
-        // unguarded so every shuffle source lane is active; only lanes < 8
-        // write. The rank-order left fold reproduces the stock epilogue's
-        // `total = scores[i] + total` operand order exactly.
+        // across all lanes so every shuffle source lane is active; only
+        // lanes < 8 write. The rank-order left fold reproduces the stock
+        // epilogue's `total = scores[i] + total` operand order exactly.
+        float my_final_score = final_score;
+        uint my_final_index = final_expert;
         \(epilogue)
         """
 }
@@ -2737,7 +3059,7 @@ private let lagunaDecodeRouterTop8Header = """
     """
 
 private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_v3",
+    name: "laguna_decode_router_top8_v4",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterTop8KernelSource(normalizing: false),
@@ -2746,7 +3068,7 @@ private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
 )
 
 private let lagunaDecodeRouterTop8NormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_norm_v2",
+    name: "laguna_decode_router_top8_norm_v3",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterTop8KernelSource(normalizing: true),
