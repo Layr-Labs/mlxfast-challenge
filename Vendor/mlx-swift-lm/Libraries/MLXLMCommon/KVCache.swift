@@ -776,6 +776,740 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 }
 
+// MARK: - Head-packed KV caches
+
+// `HeadPackedKVCacheSimple` / `HeadPackedRotatingKVCache` are decode-path
+// variants of `KVCacheSimple` / `RotatingKVCache` that keep K and V of a layer
+// in ONE buffer of shape `[B, 2 * kvHeads, capacity, headDim]` — K occupies
+// heads `0 ..< kvHeads`, V occupies `kvHeads ..< 2 * kvHeads`. A single-token
+// decode step then writes both halves with ONE slice-update instead of two,
+// halving the cache-write dispatch and graph-op count per layer per token.
+//
+// EXACTNESS CONTRACT (why this is bit-identical to the stock classes):
+//
+//  * Nothing is recomputed. The packed buffer stores the very same BF16 bytes
+//    the stock buffers would store; packing is a pure relabeling of where a
+//    row lives, never an arithmetic change.
+//  * All bookkeeping (offset, idx, step growth, the `previous % step` trim,
+//    the rotating wrap `idx == maxCacheSize -> keep`, the return-slice rule)
+//    is ported line for line from the stock class, so capacities, zero-fill
+//    boundaries and returned sequence lengths match step for step.
+//  * The K/V views handed to SDPA carry the SAME stride structure the stock
+//    dense buffers do. `sdpa_vector` reads only `k.strides(1)` (head stride)
+//    and `k.strides(2)` (sequence stride); for a `[B, 2H, S, D]` buffer those
+//    are `S*D` and `D`, exactly as for a dense `[B, H, S, D]` buffer. The
+//    batch stride differs, but it is never consulted at B == 1, and
+//    `kv_copy_unless` in `scaled_dot_product_attention.cpp` returns "no copy"
+//    whenever `shape[0] == 1`, so the views are consumed in place.
+//  * `use_fallback` and the vector/2-pass kernel choice depend only on shapes
+//    and dtypes, never on strides, so the packed views take the same kernel.
+//  * Multi-token updates (prefill) never pack: they run the stock code path
+//    verbatim on separate `keys`/`values` arrays, including the retain-input
+//    no-copy fast paths, so prefill op count and memory are unchanged.
+
+/// Head-packed twin of ``KVCacheSimple``.
+///
+/// The cache starts in "separate mode" (stock `keys`/`values` arrays) and
+/// switches to "packed mode" the first time ``updatePacked(_:)`` is called.
+/// Once packed it stays packed until a multi-token update or a `state`
+/// assignment forces it back; single-token `update(keys:values:)` calls in
+/// packed mode write the two head ranges with two slice updates rather than
+/// re-splitting the buffer.
+public class HeadPackedKVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
+    /// Separate-mode storage, exactly as `KVCacheSimple` holds it.
+    internal var keys: MLXArray?
+    internal var values: MLXArray?
+    /// Packed-mode storage `[B, 2 * kvHeads, capacity, headDim]`.
+    internal var packed: MLXArray?
+    public var step = 256
+
+    public override init() {
+        super.init()
+    }
+
+    public override func innerState() -> [MLXArray] {
+        if let packed {
+            return [packed]
+        }
+        return [self.keys, self.values].compactMap { $0 }
+    }
+
+    // MARK: Packed decode path
+
+    /// Single-token packed update.
+    ///
+    /// - Parameter packedRow: `[B, 2 * kvHeads, 1, headDim]` with the K row in
+    ///   heads `0 ..< kvHeads` and the V row in `kvHeads ..< 2 * kvHeads`.
+    /// - Returns: `(keys, values)` head-range views suitable for SDPA.
+    ///
+    /// The growth arithmetic below is `KVCacheSimple.update`'s, with the two
+    /// `zeros` + two `concatenated` calls collapsed into one of each over the
+    /// packed buffer. Capacity after the call, and therefore every subsequent
+    /// growth boundary, is identical to the stock cache's.
+    public func updatePacked(_ packedRow: MLXArray) -> (MLXArray, MLXArray) {
+        precondition(packedRow.ndim == 4, "packed KV row must be [B, 2H, 1, D]")
+        precondition(packedRow.dim(2) == 1, "updatePacked is a single-token update")
+        precondition(
+            packedRow.dim(1) % 2 == 0, "packed KV row must carry an even head count")
+        let kvHeads = packedRow.dim(1) / 2
+        let previous = self.offset
+        let tokenCount = 1
+
+        migrateToPacked()
+
+        growPacked(
+            previous: previous, tokenCount: tokenCount, batch: packedRow.dim(0),
+            kvHeads: kvHeads, headDim: packedRow.dim(3), dtype: packedRow.dtype)
+
+        self.offset += tokenCount
+
+        // One slice update for K and V together. `.ellipsis` spans the batch
+        // and packed-head axes, exactly as the stock write spans batch and
+        // head.
+        packed![.ellipsis, previous ..< self.offset, 0...] = packedRow
+
+        return packedViews(length: self.offset, kvHeads: kvHeads)
+    }
+
+    /// Fold the separate-mode arrays into one packed buffer. `concatenated`
+    /// on the head axis produces precisely the `[K heads | V heads]` layout,
+    /// as one data copy of bytes that are already final.
+    private func migrateToPacked() {
+        guard packed == nil, let currentKeys = self.keys, let currentValues = self.values
+        else { return }
+        precondition(
+            currentKeys.dim(3) == currentValues.dim(3),
+            "head packing requires matching key/value head dims")
+        self.packed = concatenated([currentKeys, currentValues], axis: 1)
+        self.keys = nil
+        self.values = nil
+    }
+
+    /// `KVCacheSimple.update`'s reset/growth block, applied to the packed
+    /// buffer.
+    private func growPacked(
+        previous: Int, tokenCount: Int, batch: Int, kvHeads: Int, headDim: Int, dtype: DType
+    ) {
+        let reset =
+            if let currentPacked = packed, (previous + tokenCount) > currentPacked.dim(2) {
+                true
+            } else {
+                packed == nil
+            }
+        guard reset else { return }
+
+        let nSteps = (step + tokenCount - 1) / step
+        let fresh = MLXArray.zeros(
+            [batch, 2 * kvHeads, nSteps * step, headDim], dtype: dtype)
+        if var currentPacked = packed {
+            if previous % step != 0 {
+                currentPacked = currentPacked[.ellipsis, ..<previous, 0...]
+            }
+            self.packed = concatenated([currentPacked, fresh], axis: 2)
+        } else {
+            self.packed = fresh
+        }
+    }
+
+    /// `(keys, values)` head-range views over the first `length` positions.
+    private func packedViews(length: Int, kvHeads: Int) -> (MLXArray, MLXArray) {
+        let buffer = packed!
+        return (
+            buffer[0..., 0 ..< kvHeads, ..<length, 0...],
+            buffer[0..., kvHeads ..< (2 * kvHeads), ..<length, 0...]
+        )
+    }
+
+    /// Return to separate mode so an exotic multi-token update runs the stock
+    /// code path byte for byte. The two head ranges are views over the packed
+    /// buffer, so no value changes.
+    private func unpack() {
+        guard let currentPacked = packed else { return }
+        let kvHeads = currentPacked.dim(1) / 2
+        self.keys = currentPacked[0..., 0 ..< kvHeads, 0..., 0...]
+        self.values = currentPacked[0..., kvHeads ..< (2 * kvHeads), 0..., 0...]
+        self.packed = nil
+    }
+
+    // MARK: KVCache
+
+    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        if packed != nil {
+            if keys.dim(2) == 1 {
+                return updatePackedSplit(keys: keys, values: values)
+            }
+            // Prefill-shaped update on a packed cache: revert to separate mode
+            // and run the stock path unchanged.
+            unpack()
+        }
+        return updateSeparate(keys: keys, values: values)
+    }
+
+    /// Single-token update in packed mode when the caller could not supply a
+    /// pre-packed row (the fused kernel path declined). Identical bookkeeping,
+    /// two slice updates instead of one.
+    private func updatePackedSplit(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        let currentPacked = packed!
+        let kvHeads = currentPacked.dim(1) / 2
+        precondition(keys.dim(1) == kvHeads && values.dim(1) == kvHeads)
+        let previous = self.offset
+        let tokenCount = keys.dim(2)
+
+        growPacked(
+            previous: previous, tokenCount: tokenCount, batch: keys.dim(0),
+            kvHeads: kvHeads, headDim: keys.dim(3), dtype: keys.dtype)
+
+        self.offset += tokenCount
+
+        packed![0..., 0 ..< kvHeads, previous ..< self.offset, 0...] = keys
+        packed![0..., kvHeads ..< (2 * kvHeads), previous ..< self.offset, 0...] = values
+
+        return packedViews(length: self.offset, kvHeads: kvHeads)
+    }
+
+    /// `KVCacheSimple.update`, ported verbatim (including the retain-input
+    /// no-copy fast path) so separate mode is stock-identical.
+    private func updateSeparate(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        let previous = self.offset
+        let tokenCount = keys.dim(2)
+
+        if self.keys == nil, previous == 0, tokenCount > 0,
+            tokenCount.isMultiple(of: step)
+        {
+            self.keys = keys
+            self.values = values
+            self.offset = tokenCount
+            return (keys, values)
+        }
+
+        let reset =
+            if let currentKeys = self.keys, (previous + tokenCount) > currentKeys.dim(2) {
+                true
+            } else {
+                self.keys == nil
+            }
+        if reset {
+            let B = keys.dim(0)
+            let kvHeads = keys.dim(1)
+            let kHeadDim = keys.dim(3)
+            let vHeadDim = values.dim(3)
+
+            let nSteps = (step + tokenCount - 1) / step
+            let kShape = [B, kvHeads, nSteps * step, kHeadDim]
+            let vShape = [B, kvHeads, nSteps * step, vHeadDim]
+            let newK = MLXArray.zeros(kShape, dtype: keys.dtype)
+            let newV = MLXArray.zeros(vShape, dtype: values.dtype)
+
+            if var currentKeys = self.keys, var currentValues = self.values {
+                if previous % step != 0 {
+                    currentKeys = currentKeys[.ellipsis, ..<previous, 0...]
+                    currentValues = currentValues[.ellipsis, ..<previous, 0...]
+                }
+                self.keys = concatenated([currentKeys, newK], axis: 2)
+                self.values = concatenated([currentValues, newV], axis: 2)
+            } else {
+                self.keys = newK
+                self.values = newV
+            }
+        }
+
+        self.offset += tokenCount
+
+        self.keys?[.ellipsis, previous ..< self.offset, 0...] = keys
+        self.values?[.ellipsis, previous ..< self.offset, 0...] = values
+
+        let returnedKeys = self.keys![.ellipsis, ..<self.offset, 0...]
+        let returnedValues = self.values![.ellipsis, ..<self.offset, 0...]
+
+        return (returnedKeys, returnedValues)
+    }
+
+    /// Mirrors `KVCacheSimple.state`; in packed mode the K/V pair is
+    /// reconstructed with head-range slices (off the hot path).
+    public override var state: [MLXArray] {
+        get {
+            let currentKeys: MLXArray
+            let currentValues: MLXArray
+            if let packed {
+                let kvHeads = packed.dim(1) / 2
+                currentKeys = packed[0..., 0 ..< kvHeads, 0..., 0...]
+                currentValues = packed[0..., kvHeads ..< (2 * kvHeads), 0..., 0...]
+            } else if let keys = self.keys, let values = self.values {
+                currentKeys = keys
+                currentValues = values
+            } else {
+                return []
+            }
+            if offset == currentKeys.dim(2) {
+                return [currentKeys, currentValues]
+            } else {
+                return [
+                    currentKeys[.ellipsis, ..<offset, 0...],
+                    currentValues[.ellipsis, ..<offset, 0...],
+                ]
+            }
+        }
+        set {
+            guard newValue.count == 2 else {
+                fatalError(
+                    "HeadPackedKVCacheSimple state must have exactly 2 arrays (keys, values)")
+            }
+            self.packed = nil
+            self.keys = newValue[0]
+            self.values = newValue[1]
+            self.offset = self.keys!.dim(2)
+        }
+    }
+
+    public override var isTrimmable: Bool { true }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        let trimmed = min(offset, n)
+        offset -= trimmed
+        return trimmed
+    }
+
+    public override func copy() -> any KVCache {
+        let new = HeadPackedKVCacheSimple()
+        new.step = self.step
+        let s = self.state
+        if !s.isEmpty {
+            new.state = s.map { $0[.ellipsis] }
+        }
+        return new
+    }
+
+    public var debugDescription: String {
+        "\(String(describing: Self.self)) \(Unmanaged.passUnretained(self).toOpaque()), offset: \(offset), step: \(step), packed: \(packed?.shape.description ?? "-"), keys: \(keys?.shape.description ?? "-"), values: \(values?.shape.description ?? "-")"
+    }
+}
+
+/// Head-packed twin of ``RotatingKVCache``.
+///
+/// Ring semantics — growth by `min(step, maxCacheSize - prev)`, the
+/// `cacheLength > maxCacheSize` trim, the `idx == maxCacheSize -> keep` wrap,
+/// the `offset < maxCacheSize` return-slice rule, and `updateConcat`'s
+/// temporal reordering for multi-token updates — are ported from the stock
+/// class unchanged; only the storage layout differs.
+public class HeadPackedRotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
+    var keep: Int
+    var keys: MLXArray?
+    var values: MLXArray?
+    /// Packed-mode storage `[B, 2 * kvHeads, cacheLength, headDim]`.
+    var packed: MLXArray?
+    var maxCacheSize: Int
+    var step: Int
+    var idx: Int = 0
+
+    public override var maxSize: Int? { maxCacheSize }
+
+    public init(maxSize: Int, keep: Int = 0, step: Int = 256) {
+        self.maxCacheSize = maxSize
+        self.keep = keep
+        self.step = step
+        super.init()
+    }
+
+    public override func innerState() -> [MLXArray] {
+        if let packed {
+            return [packed]
+        }
+        return [self.keys, self.values].compactMap { $0 }
+    }
+
+    /// `RotatingKVCache.trim(trimSize:_:append:)`, ported verbatim. It only
+    /// touches the sequence axis (2), which both layouts share, so the same
+    /// helper serves separate and packed storage.
+    private func trim(trimSize: Int, _ array: MLXArray, append: MLXArray? = nil) -> MLXArray {
+        var toCat: [MLXArray] = []
+        if trimSize > 0 {
+            toCat = [
+                array[.ellipsis, ..<keep, 0...],
+                array[.ellipsis, (trimSize + keep)..., 0...],
+            ]
+        } else {
+            toCat = [array]
+        }
+        if let append {
+            toCat.append(append)
+        }
+        return concatenated(toCat, axis: 2)
+    }
+
+    private func temporalOrder(_ array: MLXArray) -> MLXArray {
+        // Rearrange the cache into temporal order, slicing off the end if unused
+        if idx == array.dim(2) {
+            return array
+        } else if idx < offset {
+            return concatenated(
+                [
+                    array[.ellipsis, ..<keep, 0...],
+                    array[.ellipsis, idx..., 0...],
+                    array[.ellipsis, keep ..< idx, 0...],
+                ], axis: 2)
+        } else {
+            return array[.ellipsis, ..<idx, 0...]
+        }
+    }
+
+    // MARK: Packed decode path
+
+    /// Single-token packed update; see ``HeadPackedKVCacheSimple/updatePacked(_:)``.
+    public func updatePacked(_ packedRow: MLXArray) -> (MLXArray, MLXArray) {
+        precondition(packedRow.ndim == 4, "packed KV row must be [B, 2H, 1, D]")
+        precondition(packedRow.dim(2) == 1, "updatePacked is a single-token update")
+        precondition(
+            packedRow.dim(1) % 2 == 0, "packed KV row must carry an even head count")
+        let kvHeads = packedRow.dim(1) / 2
+        let tokenCount = 1
+
+        migrateToPacked()
+
+        let idxBefore = advancePackedRing(
+            tokenCount: tokenCount, batch: packedRow.dim(0), kvHeads: kvHeads,
+            headDim: packedRow.dim(3), dtype: packedRow.dtype)
+
+        // One slice update for K and V together.
+        packed![.ellipsis, idxBefore ..< (idxBefore + tokenCount), 0...] = packedRow
+        offset += tokenCount
+        idx += tokenCount
+
+        return packedViews(kvHeads: kvHeads)
+    }
+
+    private func migrateToPacked() {
+        guard packed == nil, let currentKeys = self.keys, let currentValues = self.values
+        else { return }
+        precondition(
+            currentKeys.dim(3) == currentValues.dim(3),
+            "head packing requires matching key/value head dims")
+        self.packed = concatenated([currentKeys, currentValues], axis: 1)
+        self.keys = nil
+        self.values = nil
+    }
+
+    /// `RotatingKVCache.updateInPlace`'s grow / trim / wrap prologue applied to
+    /// the packed buffer. Returns the write index (`idx` before the advance).
+    private func advancePackedRing(
+        tokenCount: Int, batch: Int, kvHeads: Int, headDim: Int, dtype: DType
+    ) -> Int {
+        let prev = offset
+        var cacheLength = packed?.dim(2)
+
+        // May not have hit the max size yet, so potentially keep growing the cache
+        if cacheLength == nil
+            || (prev >= cacheLength! && cacheLength! < maxCacheSize)
+        {
+            let newSize = min(step, maxCacheSize - prev)
+            let fresh = MLXArray.zeros([batch, 2 * kvHeads, newSize, headDim], dtype: dtype)
+            if let currentPacked = packed {
+                self.packed = concatenated([currentPacked, fresh], axis: 2)
+            } else {
+                self.packed = fresh
+            }
+            cacheLength = packed!.dim(2)
+            idx = prev
+        }
+
+        // Trim if needed
+        let trimSize = cacheLength! - maxCacheSize
+        if trimSize > 0 {
+            self.packed = trim(trimSize: trimSize, packed!)
+            idx = maxCacheSize
+        }
+
+        // Rotate if we've hit the end
+        if idx == maxCacheSize {
+            idx = keep
+        }
+
+        return idx
+    }
+
+    /// The stock return rule: the live prefix while the ring is still filling,
+    /// the whole ring once it has wrapped.
+    private func packedViews(kvHeads: Int) -> (MLXArray, MLXArray) {
+        let buffer = packed!
+        if offset < maxCacheSize {
+            return (
+                buffer[0..., 0 ..< kvHeads, ..<offset, 0...],
+                buffer[0..., kvHeads ..< (2 * kvHeads), ..<offset, 0...]
+            )
+        }
+        return (
+            buffer[0..., 0 ..< kvHeads, 0..., 0...],
+            buffer[0..., kvHeads ..< (2 * kvHeads), 0..., 0...]
+        )
+    }
+
+    private func unpack() {
+        guard let currentPacked = packed else { return }
+        let kvHeads = currentPacked.dim(1) / 2
+        self.keys = currentPacked[0..., 0 ..< kvHeads, 0..., 0...]
+        self.values = currentPacked[0..., kvHeads ..< (2 * kvHeads), 0..., 0...]
+        self.packed = nil
+    }
+
+    // MARK: KVCache
+
+    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        let tokenCount = keys.dim(2)
+        if packed != nil {
+            if tokenCount == 1 {
+                return updateInPlacePacked(keys: keys, values: values, tokenCount: tokenCount)
+            }
+            unpack()
+        }
+        let result =
+            if tokenCount == 1 {
+                updateInPlace(keys: keys, values: values, tokenCount: tokenCount)
+            } else {
+                updateConcat(keys: keys, values: values)
+            }
+        return result
+    }
+
+    /// Single-token update in packed mode without a pre-packed row.
+    private func updateInPlacePacked(
+        keys: MLXArray, values: MLXArray, tokenCount: Int
+    ) -> (MLXArray, MLXArray) {
+        let kvHeads = packed!.dim(1) / 2
+        precondition(keys.dim(1) == kvHeads && values.dim(1) == kvHeads)
+
+        let idxBefore = advancePackedRing(
+            tokenCount: tokenCount, batch: keys.dim(0), kvHeads: kvHeads,
+            headDim: keys.dim(3), dtype: keys.dtype)
+
+        packed![0..., 0 ..< kvHeads, idxBefore ..< (idxBefore + tokenCount), 0...] = keys
+        packed![0..., kvHeads ..< (2 * kvHeads), idxBefore ..< (idxBefore + tokenCount), 0...] =
+            values
+        offset += tokenCount
+        idx += tokenCount
+
+        return packedViews(kvHeads: kvHeads)
+    }
+
+    /// `RotatingKVCache.updateConcat`, ported verbatim.
+    private func updateConcat(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        if self.keys == nil {
+            self.keys = keys
+            self.values = values
+        } else {
+            // Put the keys/values in temporal order to preserve context
+            self.keys = temporalOrder(self.keys!)
+            self.values = temporalOrder(self.values!)
+            idx = self.keys!.dim(2)
+
+            // Allow temporary cache growth during multi-token processing (e.g., prompt prefill).
+            // The largest size is maxCacheSize + S - 1 to ensure
+            // every token gets at least maxCacheSize context
+            let trimSize = idx - maxCacheSize + 1
+            self.keys = trim(trimSize: trimSize, self.keys!, append: keys)
+            self.values = trim(trimSize: trimSize, self.values!, append: values)
+        }
+
+        offset += keys.dim(2)
+        idx = self.keys!.dim(2)
+
+        return (self.keys!, self.values!)
+    }
+
+    /// `RotatingKVCache.updateInPlace`, ported verbatim.
+    private func updateInPlace(
+        keys: MLXArray, values: MLXArray, tokenCount: Int
+    ) -> (MLXArray, MLXArray) {
+        let prev = offset
+        var cacheLength = self.keys?.dim(2)
+
+        // May not have hit the max size yet, so potentially keep growing the cache
+        if cacheLength == nil
+            || (prev >= cacheLength! && cacheLength! < maxCacheSize)
+        {
+            let B = keys.dim(0)
+            let nKVHeads = keys.dim(1)
+            let kHeadDim = keys.dim(3)
+            let vHeadDim = values.dim(3)
+            let newSize = min(step, maxCacheSize - prev)
+
+            let kShape = [B, nKVHeads, newSize, kHeadDim]
+            let vShape = [B, nKVHeads, newSize, vHeadDim]
+            let newK = MLXArray.zeros(kShape, dtype: keys.dtype)
+            let newV = MLXArray.zeros(vShape, dtype: values.dtype)
+
+            if let currentKeys = self.keys, let currentValues = self.values {
+                self.keys = concatenated([currentKeys, newK], axis: 2)
+                self.values = concatenated([currentValues, newV], axis: 2)
+            } else {
+                self.keys = newK
+                self.values = newV
+            }
+            cacheLength = self.keys!.dim(2)
+            idx = prev
+        }
+
+        // Trim if needed
+        let trimSize = cacheLength! - maxCacheSize
+        if trimSize > 0 {
+            self.keys = trim(trimSize: trimSize, self.keys!)
+            self.values = trim(trimSize: trimSize, self.values!)
+            idx = maxCacheSize
+        }
+
+        // Rotate if we've hit the end
+        if idx == maxCacheSize {
+            idx = keep
+        }
+
+        // Assign
+        self.keys![.ellipsis, idx ..< (idx + tokenCount), 0...] = keys
+        self.values![.ellipsis, idx ..< (idx + tokenCount), 0...] = values
+        offset += tokenCount
+        idx += tokenCount
+
+        // Return the appropriate cache slice
+        if offset < maxCacheSize {
+            return (
+                self.keys![.ellipsis, ..<offset, 0...],
+                self.values![.ellipsis, ..<offset, 0...]
+            )
+        }
+        return (self.keys!, self.values!)
+    }
+
+    public override var state: [MLXArray] {
+        get {
+            let currentKeys: MLXArray
+            let currentValues: MLXArray
+            if let packed {
+                let kvHeads = packed.dim(1) / 2
+                currentKeys = packed[0..., 0 ..< kvHeads, 0..., 0...]
+                currentValues = packed[0..., kvHeads ..< (2 * kvHeads), 0..., 0...]
+            } else if let keys = self.keys, let values = self.values {
+                currentKeys = keys
+                currentValues = values
+            } else {
+                return []
+            }
+            if offset < currentKeys.dim(2) {
+                return [
+                    currentKeys[.ellipsis, ..<offset, 0...],
+                    currentValues[.ellipsis, ..<offset, 0...],
+                ]
+            } else {
+                return [currentKeys, currentValues]
+            }
+        }
+        set {
+            guard newValue.count == 2 else {
+                fatalError("HeadPackedRotatingKVCache state must have exactly 2 arrays")
+            }
+            self.packed = nil
+            self.keys = newValue[0]
+            self.values = newValue[1]
+            // Note: like RotatingKVCache, offset is managed through metaState.
+        }
+    }
+
+    public override var metaState: [String] {
+        get {
+            return [String(keep), String(maxCacheSize), String(step), String(offset), String(idx)]
+        }
+        set {
+            guard newValue.count == 5 else {
+                fatalError("HeadPackedRotatingKVCache metaState must have exactly 5 values")
+            }
+            guard let keepVal = Int(newValue[0]),
+                let stepVal = Int(newValue[2]),
+                let offsetVal = Int(newValue[3]),
+                let idxVal = Int(newValue[4])
+            else {
+                fatalError("Failed to convert metaState values to integers")
+            }
+            if newValue[1] == "None" {
+                fatalError(
+                    "HeadPackedRotatingKVCache requires a non-nil maxSize. Cannot load cache with maxSize=None."
+                )
+            }
+            guard let maxSizeVal = Int(newValue[1]) else {
+                fatalError("Failed to convert maxCacheSize '\(newValue[1])' to integer")
+            }
+            self.keep = keepVal
+            self.maxCacheSize = maxSizeVal
+            self.step = stepVal
+            self.offset = offsetVal
+            self.idx = idxVal
+        }
+    }
+
+    public override var isTrimmable: Bool {
+        return offset < maxCacheSize
+    }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        let trimmed = min(offset, n)
+        offset -= trimmed
+        idx -= trimmed
+        return trimmed
+    }
+
+    /// `RotatingKVCache.makeMask`, ported verbatim (it reads only `offset`,
+    /// `idx` and `maxCacheSize`, none of which the packing changes).
+    public override func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if n > 1 {
+            // Multi-token case
+            let actualWindowSize = windowSize ?? maxCacheSize
+            let cappedOffset = min(maxCacheSize - 1, offset)
+
+            // Decide if we need an array mask
+            if cappedOffset + n > actualWindowSize || returnArray {
+                return .array(
+                    createCausalMask(n: n, offset: cappedOffset, windowSize: actualWindowSize))
+            }
+            return .causal
+        } else {
+            // Single token case (n == 1)
+            guard let windowSize = windowSize else {
+                return .none
+            }
+
+            // May need a mask when window_size < max_size and cache has wrapped
+            if offset >= windowSize, maxCacheSize > windowSize {
+                var currentIdx = idx
+                if currentIdx >= maxCacheSize {
+                    currentIdx = 0
+                }
+
+                let maskSize = offset < maxCacheSize ? offset + 1 : maxCacheSize
+                let mask = MLXArray(0 ..< Int32(maskSize)) .>= Int32(maskSize - windowSize)
+
+                // Roll the mask to account for rotation
+                let rolledMask = roll(mask, shift: currentIdx + 1)
+
+                return .array(rolledMask)
+            }
+            return .none
+        }
+    }
+
+    public var debugDescription: String {
+        "\(String(describing: Self.self)) offset: \(offset), maxSize: \(maxCacheSize.description), keep: \(keep), idx: \(idx), packed: \(packed?.shape.description ?? "-")"
+    }
+
+    public override func copy() -> any KVCache {
+        let new = HeadPackedRotatingKVCache(maxSize: maxCacheSize, keep: keep, step: step)
+        let s = self.state
+        if !s.isEmpty {
+            new.state = s.map { $0[.ellipsis] }
+        }
+        new.metaState = self.metaState
+        return new
+    }
+}
+
 /// Pick the supported quantization group size ({32, 64, 128}) closest to the
 /// requested one whose value divides both head dims. Returns nil when no
 /// supported group size is compatible. Upstream 01b8624.
