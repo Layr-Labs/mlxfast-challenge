@@ -3634,12 +3634,17 @@ private let lagunaDecodeEmbeddingRoPEAtlasKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+private enum LagunaDecodeRoPEAtlasPosition {
+    case host(Int)
+    case graph(MLXArray, verifiedHostPosition: Int)
+}
+
 private func lagunaDecodeEmbeddingRoPEAtlas(
     tokens: MLXArray,
     embeddingWeight: MLXArray,
     fullAtlas: MLXArray,
     slidingAtlas: MLXArray,
-    position: Int
+    position: LagunaDecodeRoPEAtlasPosition
 ) -> (hidden: MLXArray, fullAngles: MLXArray, slidingAngles: MLXArray)? {
     guard tokens.dtype == .int32,
         tokens.shape == [1, 1],
@@ -3654,10 +3659,29 @@ private func lagunaDecodeEmbeddingRoPEAtlas(
         slidingAtlas.dtype == .float32,
         slidingAtlas.shape == [
             1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim,
-        ],
-        position >= 0, position < lagunaRoPEAngleAtlasLength
+        ]
     else {
         return nil
+    }
+
+    let atlasPosition: any ScalarOrArray
+    switch position {
+    case .host(let position):
+        guard position >= 0, position < lagunaRoPEAngleAtlasLength else {
+            return nil
+        }
+        atlasPosition = Int32(position)
+    case .graph(let positionArray, let verifiedHostPosition):
+        guard verifiedHostPosition >= 0,
+            verifiedHostPosition < lagunaRoPEAngleAtlasLength,
+            positionArray.dtype == .int32,
+            positionArray.shape == [1]
+        else {
+            return nil
+        }
+        // Preserve the existing kernel's scalar ABI. This zero-dimensional
+        // array remains graph-valued, unlike a host `.item()` conversion.
+        atlasPosition = positionArray[0]
     }
 
     let kernelInputs: [any ScalarOrArray] = [
@@ -3665,7 +3689,7 @@ private func lagunaDecodeEmbeddingRoPEAtlas(
         embeddingWeight,
         fullAtlas,
         slidingAtlas,
-        Int32(position),
+        atlasPosition,
     ]
     let outputs = lagunaDecodeEmbeddingRoPEAtlasKernel(
         kernelInputs,
@@ -3769,12 +3793,12 @@ final class LagunaRuntimeModelInner: Module {
         return [fullAtlas, slidingAtlas]
     }
 
-    /// Return a host position only for the exact direct-decode cache pair.
-    /// Exact runtime type checks deliberately exclude compilable subclasses,
-    /// whose compatibility `offset` getter may synchronize a graph value.
+    /// Select the existing exact atlas with the pre-update cache position.
+    /// Compiled mode keeps that position in the graph; ordinary deferred,
+    /// feature-disabled, and post-capacity fallback modes use host counters.
     private func decodeRoPEAtlasPosition(
         inputs: MLXArray, cache: [KVCache]?
-    ) -> Int? {
+    ) -> LagunaDecodeRoPEAtlasPosition? {
         guard lagunaRoPEAngleAtlasEnabled,
             lagunaFusedFullQKNormYaRNEnabled,
             lagunaFusedSlidingQKNormRoPEEnabled,
@@ -3791,22 +3815,57 @@ final class LagunaRuntimeModelInner: Module {
 
         let fullCache = cache[fullAttentionIdx]
         let slidingCache = cache[slidingAttentionIdx]
-        guard type(of: fullCache) == KVCacheSimple.self,
-            type(of: slidingCache) == RotatingKVCache.self,
-            slidingCache.maxSize == slidingWindow
-        else {
+
+        if let compiledFull = fullCache as? CompilableKVCache,
+            let compiledSliding = slidingCache as? CompilableRotatingKVCache,
+            compiledFull.isCompiledMode,
+            compiledSliding.isCompiledMode
+        {
+            let hostPosition = compiledFull.hostOffset
+            guard compiledFull.maxLength == lagunaDirectCompiledDecodeCapacity,
+                compiledSliding.maxSize == slidingWindow,
+                hostPosition == compiledSliding.hostOffset,
+                hostPosition >= 0,
+                hostPosition < lagunaRoPEAngleAtlasLength,
+                let graphPosition = graphOffsetArray(for: compiledFull)
+            else {
+                return nil
+            }
+            // `graphOffsetArray` snapshots with `+ 0`, so later cache.update
+            // mutations cannot move this lookup to the next position.
+            return .graph(graphPosition, verifiedHostPosition: hostPosition)
+        }
+
+        let fullPosition: Int
+        if type(of: fullCache) == KVCacheSimple.self {
+            fullPosition = fullCache.offset
+        } else if let deferredFull = fullCache as? CompilableKVCache,
+            !deferredFull.isCompiledMode
+        {
+            fullPosition = deferredFull.hostOffset
+        } else {
             return nil
         }
 
-        let fullPosition = fullCache.offset
-        let slidingPosition = slidingCache.offset
-        guard fullPosition == slidingPosition,
+        let slidingPosition: Int
+        if type(of: slidingCache) == RotatingKVCache.self {
+            slidingPosition = slidingCache.offset
+        } else if let deferredSliding = slidingCache as? CompilableRotatingKVCache,
+            !deferredSliding.isCompiledMode
+        {
+            slidingPosition = deferredSliding.hostOffset
+        } else {
+            return nil
+        }
+
+        guard slidingCache.maxSize == slidingWindow,
+            fullPosition == slidingPosition,
             fullPosition >= 0,
             fullPosition < lagunaRoPEAngleAtlasLength
         else {
             return nil
         }
-        return fullPosition
+        return .host(fullPosition)
     }
 
     /// Runs `attention`'s own RoPE layer over `seed` at the cache's current
@@ -3901,23 +3960,71 @@ final class LagunaRuntimeModelInner: Module {
     }
 }
 
+private let lagunaDirectCompiledDecodeCapacity = 768
+
+/// Process-lifetime direct whole-step compile gate. The dedicated ablation is
+/// default-on and composes with the existing global compiled-decode and
+/// hardware gates; all three are resolved once per process.
+private let lagunaDirectCompiledDecodeProcessEnabled: Bool = {
+    if let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DIRECT_COMPILED_DECODE"],
+        ["0", "false", "no", "off"].contains(raw.lowercased())
+    {
+        return false
+    }
+    return CompiledDecode.isEnabled && MLXHardwareInfo.isCompiledDecodeSupported
+}()
+
+private func lagunaSupportsDirectCompiledDecode(_ configuration: LagunaConfig) -> Bool {
+    guard configuration.modelType == LagunaConstants.modelType,
+        configuration.numHiddenLayers == LagunaConstants.numHiddenLayers,
+        configuration.numKeyValueHeads == LagunaConstants.numKeyValueHeads,
+        configuration.headDim == LagunaConstants.headDim,
+        configuration.slidingWindow == LagunaConstants.slidingWindow,
+        configuration.layerTypes.count == LagunaConstants.numHiddenLayers,
+        configuration.numAttentionHeadsPerLayer.count == LagunaConstants.numHiddenLayers
+    else {
+        return false
+    }
+
+    return configuration.layerTypes.indices.allSatisfy { layerIndex in
+        let isFull = layerIndex.isMultiple(of: 4)
+        let expectedType: LagunaLayerType = isFull ? .full : .sliding
+        let expectedHeads =
+            isFull
+            ? LagunaConstants.fullAttentionHeads
+            : LagunaConstants.slidingAttentionHeads
+        return configuration.layerTypes[layerIndex] == expectedType
+            && configuration.numAttentionHeadsPerLayer[layerIndex] == expectedHeads
+    }
+}
+
 /// Scored Laguna runtime model: last-token vocabulary head over the
 /// reimplemented Laguna text tower.
 ///
 /// `callAsFunction(_:cache:)` serves both prompt prefill
 /// (`[1, L]`) and single-token decode steps (`[1, 1]`) and returns
-/// `[1, 1, vocab]` last-token logits; `newCache(parameters:)` creates the
-/// per-layer cache stack (unbounded `StandardKVCache` for full-attention
-/// layers, `RotatingKVCache(512)` for sliding layers). Laguna applies NO
-/// final logit softcap and NO embedding scaling.
+/// `[1, 1, vocab]` last-token logits. On the exact production configuration,
+/// enabled caches retain eager semantics through prefill and then bind to one
+/// process-lifetime compiled executor; feature-off and unsupported configs
+/// retain the original stock cache classes. Laguna applies NO final logit
+/// softcap and NO embedding scaling.
 public final class LagunaRuntimeModel: Module, LanguageModel {
     @ModuleInfo(key: "model") var model: LagunaRuntimeModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
     public let configuration: LagunaConfig
+    private let directCompiledDecodeSupported: Bool
+    private lazy var directCompiledDecode = LagunaDirectCompiledDecodeExecutor(
+        model: self,
+        configuration: configuration,
+        fullCapacity: lagunaDirectCompiledDecodeCapacity
+    )
 
     public init(_ config: LagunaConfig) {
         self.configuration = config
+        self.directCompiledDecodeSupported =
+            lagunaDirectCompiledDecodeProcessEnabled
+            && lagunaSupportsDirectCompiledDecode(config)
         self._model.wrappedValue = LagunaRuntimeModelInner(config)
         if !config.tieWordEmbeddings {
             self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabSize, bias: false)
@@ -3943,6 +4050,21 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        if directCompiledDecodeSupported,
+            inputs.dtype == .int32,
+            inputs.shape == [1, 1],
+            let cache,
+            let logits = directCompiledDecode.call(tokens: inputs, requestCaches: cache)
+        {
+            return logits
+        }
+        return uncompiledForward(inputs, cache: cache)
+    }
+
+    /// Arithmetic authority used both by eager calls and by the compile
+    /// closure. Keeping the executor dispatch outside this method prevents
+    /// recursive compilation while retaining every existing kernel boundary.
+    fileprivate func uncompiledForward(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let fullHidden = model(inputs, cache: cache)
         // Every consumer of multi-token logits reads only the LAST
         // position's row. Slice before the row-independent final RMSNorm and
@@ -3964,12 +4086,29 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     }
 
     public func newCache(parameters _: GenerateParameters?) -> [KVCache] {
-        (0..<configuration.numHiddenLayers).map { layerIndex in
-            if configuration.layerTypes[layerIndex] == .full {
-                StandardKVCache()
-            } else {
-                RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
+        if directCompiledDecodeSupported {
+            return (0..<configuration.numHiddenLayers).map { layerIndex in
+                if configuration.layerTypes[layerIndex] == .full {
+                    return CompilableKVCache(
+                        maxLength: lagunaDirectCompiledDecodeCapacity,
+                        step: 256,
+                        deferredPromotion: true
+                    )
+                }
+                return CompilableRotatingKVCache(
+                    maxSize: configuration.slidingWindow,
+                    keep: 0,
+                    step: 256,
+                    deferredPromotion: true
+                )
             }
+        }
+
+        return (0..<configuration.numHiddenLayers).map { layerIndex in
+            if configuration.layerTypes[layerIndex] == .full {
+                return StandardKVCache()
+            }
+            return RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
         }
     }
 
@@ -4008,5 +4147,203 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         }
         // Drop precomputed rotary tables if a checkpoint ships them.
         return weights.filter { !$0.key.contains("rotary_emb.inv_freq") }
+    }
+}
+
+/// One process-lifetime graph, rebound under serialized ownership to each
+/// request's 40 cache objects. Constructor warmup supplies the production
+/// 512-token seed and first `[1, 1]` token, so this closure traces the fixed
+/// full and sliding family shapes before the worker protocol hello.
+private final class LagunaDirectCompiledDecodeExecutor: @unchecked Sendable {
+    private let templateCaches: [KVCache]
+    private let compiledForward: @Sendable ([MLXArray]) -> [MLXArray]
+    private let fullCapacity: Int
+    private let slidingCapacity: Int
+    private let lock = NSLock()
+
+    init(
+        model: LagunaRuntimeModel,
+        configuration: LagunaConfig,
+        fullCapacity: Int
+    ) {
+        self.fullCapacity = fullCapacity
+        self.slidingCapacity = configuration.slidingWindow
+
+        let templates: [KVCache] = (0..<configuration.numHiddenLayers).map { layerIndex in
+            if configuration.layerTypes[layerIndex] == .full {
+                return CompilableKVCache(maxLength: fullCapacity, step: 256)
+            }
+            return CompilableRotatingKVCache(
+                maxSize: configuration.slidingWindow,
+                keep: 0,
+                step: 256
+            )
+        }
+        self.templateCaches = templates
+
+        let capturedCaches = templates
+        self.compiledForward = compile(inputs: templates, outputs: templates) {
+            [unowned model] arguments in
+            // Never call the public dispatcher from inside its own graph.
+            [model.uncompiledForward(arguments[0], cache: capturedCaches)]
+        }
+    }
+
+    func call(tokens: MLXArray, requestCaches: [KVCache]) -> MLXArray? {
+        guard tokens.dtype == .int32, tokens.shape == [1, 1] else {
+            return nil
+        }
+
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard requestCaches.count == templateCaches.count else {
+            deactivate(requestCaches)
+            return nil
+        }
+
+        var sharedOffset: Int?
+        var fullCount = 0
+        var rotatingCount = 0
+
+        // Validate the complete request before changing any cache mode. This
+        // proves all 40 host counters carry one common pre-update position.
+        for index in requestCaches.indices {
+            let requestOffset: Int
+            if templateCaches[index] is CompilableKVCache,
+                let request = requestCaches[index] as? CompilableKVCache
+            {
+                guard request.maxLength == fullCapacity else {
+                    deactivate(requestCaches)
+                    return nil
+                }
+                requestOffset = request.hostOffset
+                fullCount += 1
+            } else if templateCaches[index] is CompilableRotatingKVCache,
+                let request = requestCaches[index] as? CompilableRotatingKVCache
+            {
+                guard request.maxSize == slidingCapacity else {
+                    deactivate(requestCaches)
+                    return nil
+                }
+                requestOffset = request.hostOffset
+                rotatingCount += 1
+            } else {
+                deactivate(requestCaches)
+                return nil
+            }
+
+            if let establishedOffset = sharedOffset {
+                guard establishedOffset == requestOffset else {
+                    deactivate(requestCaches)
+                    return nil
+                }
+            } else {
+                sharedOffset = requestOffset
+            }
+        }
+
+        guard fullCount == 10,
+            rotatingCount == 30,
+            let preUpdateOffset = sharedOffset,
+            preUpdateOffset >= slidingCapacity
+        else {
+            deactivate(requestCaches)
+            return nil
+        }
+
+        // Offset 767 is the final compiled pre-update position: it writes row
+        // 767 and advances to 768. The next supplied token deactivates first
+        // and is handled exactly once by the eager growth path.
+        guard preUpdateOffset < fullCapacity else {
+            deactivate(requestCaches)
+            return nil
+        }
+
+        // Promote in place, then pin the one production tensor signature.
+        // These scalar/dimension checks do not allocate per-layer state arrays.
+        for cache in requestCaches {
+            if let full = cache as? CompilableKVCache {
+                guard full.prepareForCompiledDecode(),
+                    full.compiledStorageMatches(
+                        batchSize: 1,
+                        heads: LagunaConstants.numKeyValueHeads,
+                        length: fullCapacity,
+                        headDimension: LagunaConstants.headDim,
+                        dtype: .bfloat16
+                    )
+                else {
+                    deactivate(requestCaches)
+                    return nil
+                }
+            } else if let rotating = cache as? CompilableRotatingKVCache {
+                guard rotating.prepareForCompiledDecode(),
+                    rotating.hostIndex >= 0,
+                    rotating.hostIndex < slidingCapacity,
+                    rotating.compiledStorageMatches(
+                        batchSize: 1,
+                        heads: LagunaConstants.numKeyValueHeads,
+                        length: slidingCapacity,
+                        headDimension: LagunaConstants.headDim,
+                        dtype: .bfloat16
+                    )
+                else {
+                    deactivate(requestCaches)
+                    return nil
+                }
+            } else {
+                deactivate(requestCaches)
+                return nil
+            }
+        }
+
+        // Every template reference is overwritten on every call. A successive
+        // request cannot observe the prior request's K/V, idx, or offset.
+        for index in requestCaches.indices {
+            if let template = templateCaches[index] as? CompilableKVCache,
+                let request = requestCaches[index] as? CompilableKVCache
+            {
+                guard template.bindCompiledStorage(from: request) else {
+                    deactivate(requestCaches)
+                    return nil
+                }
+            } else if let template =
+                templateCaches[index] as? CompilableRotatingKVCache,
+                let request = requestCaches[index] as? CompilableRotatingKVCache
+            {
+                guard template.bindCompiledStorage(from: request) else {
+                    deactivate(requestCaches)
+                    return nil
+                }
+            } else {
+                deactivate(requestCaches)
+                return nil
+            }
+        }
+
+        let outputs = compiledForward([tokens])
+        guard outputs.count == 1 else {
+            deactivate(requestCaches)
+            return nil
+        }
+
+        // Graph K/V and counters have advanced once. Only now advance the
+        // host mirrors once, preserving the trusted worker's serial validator.
+        for cache in requestCaches {
+            if let full = cache as? CompilableKVCache {
+                full.noteCompiledAdvance()
+            } else if let rotating = cache as? CompilableRotatingKVCache {
+                rotating.noteCompiledAdvance()
+            }
+        }
+        lagunaTrace("whole-step compiled decode")
+        return outputs[0]
+    }
+
+    private func deactivate(_ caches: [KVCache]) {
+        for cache in caches {
+            (cache as? CompilableKVCache)?.deactivateCompiledDecode()
+            (cache as? CompilableRotatingKVCache)?.deactivateCompiledDecode()
+        }
     }
 }

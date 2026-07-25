@@ -21,17 +21,20 @@ public protocol BatchPositionedKVCache: KVCache {
 ///
 /// `KVCache.offset` is an `Int` API for compatibility with upstream model
 /// ports. Compile-safe caches keep the offset as an `MLXArray` so the value
-/// can flow through `compile()` without an `.item()` readback. Model-side
-/// helpers that need positions outside `applyRotaryPosition` should call this
-/// before falling back to `cache.offset`.
+/// can flow through `compile()` without an `.item()` readback. Deferred caches
+/// expose that graph state only while compiled; ordinary and fallback modes
+/// deliberately return `nil` and use the host offset. Model-side helpers that
+/// need positions outside `applyRotaryPosition` should call this first.
 public func graphOffsetArray(for cache: KVCache?) -> MLXArray? {
     // Snapshot with `+ 0` so cache.update() advancing offsetArray
     // doesn't shift the caller's RoPE position. Without this, the query
     // gets a position one step ahead of the keys in compiled decode.
-    if let compilableRot = cache as? CompilableRotatingKVCache {
-        return compilableRot.offsetArray + 0
+    if let compilableRotating = cache as? CompilableRotatingKVCache,
+        compilableRotating.isCompiledMode
+    {
+        return compilableRotating.offsetArray + 0
     }
-    if let compilable = cache as? CompilableKVCache {
+    if let compilable = cache as? CompilableKVCache, compilable.isCompiledMode {
         return compilable.offsetArray + 0
     }
     if let batchCache = cache as? BatchPositionedKVCache {

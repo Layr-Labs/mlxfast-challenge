@@ -39,172 +39,271 @@ import MLXNN
 /// - `update(keys:values:)` writes new tokens at `idxArray` via
 ///   `dynamicSliceUpdate`, then advances `idxArray` with wrap semantics
 ///   entirely in MLXArray space.
-/// - `makeMask` always returns `.array(mask)` — the full-buffer return
-///   means attention must be told which positions are valid.
+/// - `makeMask` uses graph counters for partial rings; the production
+///   single-token/full-window graph proves all 512 rows valid and returns `.none`.
 public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendable {
 
-    /// Current write index within the ring buffer, as `MLXArray[1] int32`.
-    /// In the linear segment (before wrap), this equals `offsetArray`.
-    /// After wrap, this rotates through `[keep, maxCacheSize)`.
+    /// Graph-visible next-write slot, normalized into `[keep, maxCacheSize)`.
     public var idxArray: MLXArray
 
-    /// Total valid tokens seen, as `MLXArray[1] int32`. In the linear
-    /// segment, equals `idxArray` and is a tight upper bound on valid
-    /// positions. Post-wrap, `offsetArray >= maxCacheSize` and ALL
-    /// `maxCacheSize` positions in the buffer are valid (ring full).
+    /// Graph-visible total number of tokens committed to this cache.
     public var offsetArray: MLXArray
 
-    /// Pre-computed column indices `[0, 1, ..., maxCacheSize-1]` used by
-    /// `makeMask` to build a causal mask over the full buffer.
-    private lazy var maskRinds: MLXArray = MLXArray(Int32(0) ..< Int32(maxCacheSize))
+    private lazy var maskRinds = MLXArray(Int32(0) ..< Int32(maxCacheSize))
 
-    /// Promotion-time proof that the physical ring is already full. Once true,
-    /// single-token decode keeps every slot valid forever: each update replaces
-    /// one old row with the supplied current row. When the requested attention
-    /// window equals the ring size, a mask is therefore exactly redundant.
+    /// The full-window `.none` mask branch is legal only after promotion has
+    /// proved every physical ring slot valid.
     private var canElideFullWindowDecodeMask = false
+
+    /// Deferred Laguna caches use stock rotating semantics through prefill.
+    public private(set) var isCompiledMode: Bool
+
+    /// Laguna mirrors graph counters on the host after a successful call.
+    /// Generic compiled caches retain the historical graph-authoritative mode.
+    private var mirrorsCompiledStateOnHost = false
 
     // MARK: - Init
 
-    /// Direct constructor matching the parent. Primarily for testing.
+    /// Historical direct-compiled constructor used by generic CompiledDecode.
     public override init(maxSize: Int, keep: Int = 0, step: Int = 256) {
         self.idxArray = MLXArray([Int32(0)])
         self.offsetArray = MLXArray([Int32(0)])
+        self.isCompiledMode = true
         super.init(maxSize: maxSize, keep: keep, step: step)
     }
 
-    /// Promote an existing populated ``RotatingKVCache`` to a compile-
-    /// traceable variant. Copies the state references AND allocates the
-    /// unified buffer at full `maxCacheSize` size if the parent's buffer
-    /// is smaller (the parent grows lazily in `step`-sized chunks).
-    ///
-    /// - Parameter rotating: Source cache. Typically the result of a
-    ///   prefill that has populated keys/values.
+    /// Laguna constructor: ordinary cache first, in-place promotion later.
+    public convenience init(
+        maxSize: Int,
+        keep: Int = 0,
+        step: Int = 256,
+        deferredPromotion: Bool
+    ) {
+        self.init(maxSize: maxSize, keep: keep, step: step)
+        mirrorsCompiledStateOnHost = deferredPromotion
+        isCompiledMode = !deferredPromotion
+    }
+
+    /// Host counters never trigger graph readback.
+    public var hostOffset: Int { super.offset }
+    public var hostIndex: Int { idx }
+
+    /// Promote an already populated stock rotating cache.
     public convenience init(from rotating: RotatingKVCache) {
         self.init(
             maxSize: rotating.maxCacheSize,
             keep: rotating.keep,
             step: rotating.step
         )
-
-        // Copy state references from the source. Same-module subclass
-        // access works because parent's state is `internal`.
-        self.idx = rotating.idx
-        self.offset = rotating.offset
-        self.canElideFullWindowDecodeMask = rotating.offset >= maxCacheSize
-
-        // Pre-allocate or extend the unified buffer to full maxCacheSize.
-        // This prevents the compile-breaking concat-growth path from ever
-        // firing during decode.
-        if let srcK = rotating.keys, let srcV = rotating.values {
-            let B = srcK.dim(0)
-            let H = srcK.dim(1)
-            let kD = srcK.dim(3)
-            let vD = srcV.dim(3)
-            let curLen = srcK.dim(2)
-
-            if curLen < maxCacheSize {
-                // Need to grow — but this is a ONE-TIME growth during
-                // promotion, not inside a compile trace. Use concat to
-                // extend to full size.
-                let padLen = maxCacheSize - curLen
-                let padK = MLXArray.zeros([B, H, padLen, kD], dtype: srcK.dtype)
-                let padV = MLXArray.zeros([B, H, padLen, vD], dtype: srcV.dtype)
-                self.keys = concatenated([srcK, padK], axis: 2)
-                self.values = concatenated([srcV, padV], axis: 2)
-            } else {
-                self.keys = srcK
-                self.values = srcV
-            }
-        }
-        // else: keys/values remain nil; first `update` call allocates
-        // them at full size.
-
-        self.idxArray = MLXArray([Int32(self.idx)])
-        self.offsetArray = MLXArray([Int32(self.offset)])
+        isCompiledMode = false
+        idx = rotating.idx
+        offset = rotating.offset
+        keys = rotating.keys
+        values = rotating.values
+        _ = prepareForCompiledDecode()
     }
 
-    /// Static promote helper for symmetry with `CompilableKVCache.promote`.
-    public static func promote(from cache: RotatingKVCache, maxLength: Int) -> CompilableRotatingKVCache {
-        // maxLength is unused here because RotatingKVCache already has maxCacheSize,
-        // but the parameter keeps the API symmetric with CompilableKVCache.promote.
-        return CompilableRotatingKVCache(from: cache)
+    public static func promote(
+        from cache: RotatingKVCache, maxLength _: Int
+    ) -> CompilableRotatingKVCache {
+        CompilableRotatingKVCache(from: cache)
     }
 
-    // MARK: - Overridden update
-
-    /// Compile-traceable append. Writes new tokens at `idxArray` position
-    /// via `dynamicSliceUpdate`, advances counters with wrap semantics in
-    /// MLXArray ops.
+    /// Pad the ordinary ring to fixed capacity and expose graph counters.
     ///
-    /// Returns the FULL `[B, H, maxCacheSize, D]` buffer. `makeMask`
-    /// restricts attention to valid positions.
+    /// A stock cache exactly filled by the 512-token seed leaves `idx == 512`
+    /// and resets it to `keep` at the start of its next update. Promotion
+    /// performs that pending normalization once, before the compiled write.
+    @discardableResult
+    public func prepareForCompiledDecode() -> Bool {
+        if isCompiledMode {
+            return keys?.dim(2) == maxCacheSize
+                && values?.dim(2) == maxCacheSize
+        }
+        guard let currentKeys = keys,
+            let currentValues = values,
+            currentKeys.dim(2) >= min(super.offset, maxCacheSize),
+            currentValues.dim(2) >= min(super.offset, maxCacheSize),
+            currentKeys.dim(2) <= maxCacheSize,
+            currentValues.dim(2) <= maxCacheSize
+        else {
+            return false
+        }
+
+        let keyPadding = maxCacheSize - currentKeys.dim(2)
+        if keyPadding > 0 {
+            let zeros = MLXArray.zeros(
+                [
+                    currentKeys.dim(0), currentKeys.dim(1), keyPadding,
+                    currentKeys.dim(3),
+                ],
+                dtype: currentKeys.dtype
+            )
+            keys = concatenated([currentKeys, zeros], axis: 2)
+        }
+
+        let valuePadding = maxCacheSize - currentValues.dim(2)
+        if valuePadding > 0 {
+            let zeros = MLXArray.zeros(
+                [
+                    currentValues.dim(0), currentValues.dim(1), valuePadding,
+                    currentValues.dim(3),
+                ],
+                dtype: currentValues.dtype
+            )
+            values = concatenated([currentValues, zeros], axis: 2)
+        }
+
+        if idx == maxCacheSize {
+            idx = keep
+        }
+        guard idx >= keep, idx < maxCacheSize else {
+            return false
+        }
+
+        idxArray = MLXArray([Int32(idx)])
+        offsetArray = MLXArray([Int32(super.offset)])
+        canElideFullWindowDecodeMask = super.offset >= maxCacheSize
+        isCompiledMode = true
+        return true
+    }
+
+    /// Resume the parent's eager update/mask behavior on the same ring.
+    public func deactivateCompiledDecode() {
+        guard isCompiledMode else { return }
+        if !mirrorsCompiledStateOnHost {
+            idx = idxArray[0].item(Int.self)
+            super.offset = offsetArray[0].item(Int.self)
+        }
+        isCompiledMode = false
+    }
+
+    /// Replace every template state reference with one request's state.
+    public func bindCompiledStorage(from source: CompilableRotatingKVCache) -> Bool {
+        guard source.isCompiledMode,
+            source.maxCacheSize == maxCacheSize,
+            source.keep == keep,
+            source.step == step,
+            let sourceKeys = source.keys,
+            let sourceValues = source.values,
+            sourceKeys.dim(2) == maxCacheSize,
+            sourceValues.dim(2) == maxCacheSize
+        else {
+            return false
+        }
+
+        keys = sourceKeys
+        values = sourceValues
+        idxArray = source.idxArray
+        offsetArray = source.offsetArray
+        idx = source.hostIndex
+        super.offset = source.hostOffset
+        canElideFullWindowDecodeMask = source.canElideFullWindowDecodeMask
+        isCompiledMode = true
+        return true
+    }
+
+    /// Allocation-free signature check used by Laguna before binding a
+    /// request into its fixed production graph.
+    public func compiledStorageMatches(
+        batchSize: Int,
+        heads: Int,
+        length: Int,
+        headDimension: Int,
+        dtype: DType
+    ) -> Bool {
+        guard isCompiledMode, let keys, let values else { return false }
+        return keys.dtype == dtype
+            && keys.ndim == 4
+            && keys.dim(0) == batchSize
+            && keys.dim(1) == heads
+            && keys.dim(2) == length
+            && keys.dim(3) == headDimension
+            && values.dtype == dtype
+            && values.ndim == 4
+            && values.dim(0) == batchSize
+            && values.dim(1) == heads
+            && values.dim(2) == length
+            && values.dim(3) == headDimension
+            && idxArray.dtype == .int32
+            && idxArray.ndim == 1
+            && idxArray.dim(0) == 1
+            && offsetArray.dtype == .int32
+            && offsetArray.ndim == 1
+            && offsetArray.dim(0) == 1
+    }
+
+    /// Mirror the graph's one-token counter transition after a successful call.
+    public func noteCompiledAdvance(_ count: Int = 1) {
+        precondition(count >= 0)
+        super.offset += count
+        let advanced = idx + count
+        if advanced < maxCacheSize {
+            idx = advanced
+        } else {
+            idx = keep + (advanced - keep) % (maxCacheSize - keep)
+        }
+        canElideFullWindowDecodeMask = super.offset >= maxCacheSize
+    }
+
+    // MARK: - Update
+
     public override func update(
         keys newKeys: MLXArray, values newValues: MLXArray
     ) -> (MLXArray, MLXArray) {
-        let nTokens = newKeys.dim(2)
-
-        // Lazy-allocate the unified buffer if empty (first-call init).
-        if keys == nil {
-            let B = newKeys.dim(0)
-            let H = newKeys.dim(1)
-            let kD = newKeys.dim(3)
-            let vD = newValues.dim(3)
-            keys = MLXArray.zeros([B, H, maxCacheSize, kD], dtype: newKeys.dtype)
-            values = MLXArray.zeros([B, H, maxCacheSize, vD], dtype: newValues.dtype)
+        guard isCompiledMode else {
+            return super.update(keys: newKeys, values: newValues)
         }
 
-        // Write new tokens at idxArray position.
+        let nTokens = newKeys.dim(2)
+        if keys == nil {
+            keys = MLXArray.zeros(
+                [newKeys.dim(0), newKeys.dim(1), maxCacheSize, newKeys.dim(3)],
+                dtype: newKeys.dtype
+            )
+            values = MLXArray.zeros(
+                [newValues.dim(0), newValues.dim(1), maxCacheSize, newValues.dim(3)],
+                dtype: newValues.dtype
+            )
+        }
+
+        // Preserve physical ring order: write exactly the graph's next-write
+        // slot, then advance both K and V state through the same index.
         keys!._updateInternal(
             dynamicSliceUpdate(keys!, update: newKeys, start: idxArray, axes: [2]))
         values!._updateInternal(
             dynamicSliceUpdate(values!, update: newValues, start: idxArray, axes: [2]))
 
-        // Advance counters. Wrap arithmetic on idxArray:
-        //   newIdx = advance < maxCacheSize ? advance : keep + (advance - keep) % (maxCacheSize - keep)
-        // We use `where_` so both branches live in the MLXArray graph.
         let advance = MLXArray([Int32(nTokens)])
         let advancedIdx = idxArray + advance
-        let maxSz = MLXArray([Int32(maxCacheSize)])
-        let keepArr = MLXArray([Int32(keep)])
-        let cycleLen = maxSz - keepArr  // number of rotating slots
-
+        let maxSizeArray = MLXArray([Int32(maxCacheSize)])
+        let keepArray = MLXArray([Int32(keep)])
+        let cycleLength = maxSizeArray - keepArray
         let rotatedIdx: MLXArray
         if keep > 0 {
-            rotatedIdx = keepArr + ((advancedIdx - keepArr) % cycleLen)
+            rotatedIdx = keepArray + ((advancedIdx - keepArray) % cycleLength)
         } else {
-            rotatedIdx = advancedIdx % maxSz
+            rotatedIdx = advancedIdx % maxSizeArray
         }
-        // where_(cond, true_branch, false_branch)
-        let newIdx = MLX.`where`(advancedIdx .< maxSz, advancedIdx, rotatedIdx)
+        let nextIdx = MLX.`where`(
+            advancedIdx .< maxSizeArray, advancedIdx, rotatedIdx)
 
-        idxArray._updateInternal(newIdx)
+        idxArray._updateInternal(nextIdx)
         offsetArray._updateInternal(offsetArray + advance)
-
-        // DELIBERATELY no Swift-Int mirror updates here:
-        // `idx = Int(newIdx.item(Int32.self))` would force an `eval`
-        // call, which MLX compile rejects. Consumers that need the Int
-        // view should read the MLXArray counters and materialize
-        // OUTSIDE the compiled trace.
-
         return (keys!, values!)
     }
 
-    // MARK: - makeMask
+    // MARK: - Mask
 
-    /// Build an attention mask over the full `[B, H, maxCacheSize, D]`
-    /// buffer.
-    ///
-    /// Mask semantics:
-    ///  - **Linear phase** (offsetArray < maxCacheSize): valid positions
-    ///    are `[0, offsetArray)`. Causal mask is `linds >= rinds`.
-    ///  - **Post-wrap phase** (offsetArray >= maxCacheSize): all
-    ///    `maxCacheSize` positions are valid (the ring is full). The
-    ///    ring layout means positions are NOT in logical order — but for
-    ///    single-query decode with `n=1`, every position is attendable.
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        guard isCompiledMode else {
+            return super.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+        }
+
+        // The production graph is traced only after a full 512-row ring. A
+        // one-token query may attend every physical row, exactly like stock.
         if n == 1, windowSize == maxCacheSize, canElideFullWindowDecodeMask {
             return .none
         }
@@ -215,45 +314,87 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
         } else {
             linds = (MLXArray(Int32(0) ..< Int32(n)) + offsetArray).reshaped(n, 1)
         }
-
         let rinds = maskRinds.reshaped(1, maxCacheSize)
-        // Causal: attend to positions j <= query_position.
         let causal = linds .>= rinds
-
-        // Post-wrap: if offsetArray >= maxCacheSize, all positions are
-        // valid. For n=1 this is `linds >= maxCacheSize ? all-true : causal`.
-        let maxSzArr = MLXArray([Int32(maxCacheSize)]).reshaped(1, 1)
-        let allTrueMask = MLX.broadcast(
+        let maxSizeArray = MLXArray([Int32(maxCacheSize)]).reshaped(1, 1)
+        let allTrue = MLX.broadcast(
             MLXArray([true]).reshaped(1, 1),
             to: [linds.dim(0), rinds.dim(1)]
         )
-        var mask = MLX.`where`(linds .>= maxSzArr, allTrueMask, causal)
+        var mask = MLX.`where`(linds .>= maxSizeArray, allTrue, causal)
 
         if let windowSize {
-            // After ring wrap, the recent window may be split across buffer
-            // end and beginning. Compare in modular token-index space rather
-            // than physical ring-column space so both halves are included.
-            // tokenInds maps each physical position to its distance from the
-            // write cursor: idxArray → 0 (oldest/next-write), idxArray-1 →
-            // maxCacheSize-1 (most recent). Keep the RECENT end of the ring.
-            let tokenInds = (rinds - idxArray + MLXArray(Int32(maxCacheSize))) % Int32(maxCacheSize)
-            let windowFilter = tokenInds .>= Int32(maxCacheSize - windowSize)
-            mask = mask & windowFilter
+            let tokenIndices =
+                (rinds - idxArray + MLXArray(Int32(maxCacheSize))) % Int32(maxCacheSize)
+            mask = mask & (tokenIndices .>= Int32(maxCacheSize - windowSize))
         }
-
         return .array(mask)
     }
 
-    // MARK: - innerState
+    // MARK: - State
 
-    /// Return ONLY state that mutates during decode: the keys/values
-    /// buffers and the two MLXArray counters.
+    /// Stable compiled state order: `[K, V, idx, offset]`.
     public override func innerState() -> [MLXArray] {
-        var state = [MLXArray]()
-        if let k = keys { state.append(k) }
-        if let v = values { state.append(v) }
+        guard isCompiledMode else {
+            return super.innerState()
+        }
+        var state: [MLXArray] = []
+        if let keys {
+            state.append(keys)
+        }
+        if let values {
+            state.append(values)
+        }
         state.append(idxArray)
         state.append(offsetArray)
         return state
+    }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        guard isCompiledMode else {
+            return super.trim(n)
+        }
+        if !mirrorsCompiledStateOnHost {
+            idx = idxArray[0].item(Int.self)
+            super.offset = offsetArray[0].item(Int.self)
+        }
+        let trimmed = super.trim(n)
+        idxArray = MLXArray([Int32(idx)])
+        offsetArray = MLXArray([Int32(super.offset)])
+        canElideFullWindowDecodeMask = super.offset >= maxCacheSize
+        return trimmed
+    }
+
+    public override func copy() -> any KVCache {
+        let logicalIndex: Int
+        let logicalOffset: Int
+        if isCompiledMode && !mirrorsCompiledStateOnHost {
+            logicalIndex = idxArray[0].item(Int.self)
+            logicalOffset = offsetArray[0].item(Int.self)
+        } else {
+            logicalIndex = idx
+            logicalOffset = super.offset
+        }
+
+        let copy = CompilableRotatingKVCache(
+            maxSize: maxCacheSize,
+            keep: keep,
+            step: step,
+            deferredPromotion: mirrorsCompiledStateOnHost
+        )
+        if let keys {
+            copy.keys = keys[.ellipsis]
+        }
+        if let values {
+            copy.values = values[.ellipsis]
+        }
+        copy.idx = logicalIndex
+        copy.offset = logicalOffset
+        copy.idxArray = idxArray[0...]
+        copy.offsetArray = offsetArray[0...]
+        copy.canElideFullWindowDecodeMask = canElideFullWindowDecodeMask
+        copy.isCompiledMode = isCompiledMode
+        return copy
     }
 }

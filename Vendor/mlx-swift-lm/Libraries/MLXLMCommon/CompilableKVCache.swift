@@ -25,10 +25,10 @@
 //       CompilableKVCache(from: c, maxLength: 2048)
 //   }
 //
-// NOTE (Darkbloom): this type is presently UNWIRED — it ships as the verified
-// foundation for a future compiled-decode path. See `CompiledDecode.swift` for
-// the `compileDecodeForward` wrapper and the port plan for batched integration
-// into `GenerationBatch`.
+// `CompiledDecode` uses this type for generic single-stream generation.
+// Laguna additionally constructs it in deferred mode: seed prefill retains
+// ordinary `KVCacheSimple` behavior, then the same object is promoted and
+// rebound into a process-lifetime compiled decode executor.
 
 import Foundation
 import MLX
@@ -47,74 +47,205 @@ public class CompilableKVCache: BaseKVCache {
     public var keys: MLXArray?
     public var values: MLXArray?
 
-    /// Offset as MLXArray (1D [1] int32) — tracked by compile tracer.
-    /// Must be 1D (not scalar) for DynamicSlice start parameter compatibility.
+    /// Offset as MLXArray (1D [1] int32) — tracked by the compile tracer.
+    /// It remains separate from the host mirror used by Laguna's worker
+    /// protocol so compiled decode never needs a synchronous `.item()` call.
     public var offsetArray: MLXArray
 
-    /// Maximum sequence length the buffer can hold.
+    /// Maximum sequence length the fixed overflow-bin buffer can hold.
     public let maxLength: Int
 
-    /// Pre-allocation chunk size (same semantics as KVCacheSimple.step).
+    /// Ordinary-cache allocation step, matching `KVCacheSimple.step`.
     public var step: Int
 
-    /// Pre-computed column indices for mask creation [0, 1, ..., maxLength-1].
-    /// Avoids re-creating every step.
-    private lazy var maskRinds: MLXArray = MLXArray(Int32(0) ..< Int32(maxLength))
+    /// Fixed key-column indices used by the compiled overflow-bin mask.
+    private lazy var maskRinds = MLXArray(Int32(0) ..< Int32(maxLength))
 
-    public init(maxLength: Int = 4096, step: Int = 256) {
+    /// Deferred Laguna caches remain ordinary until the seed is complete.
+    /// Generic `CompiledDecode` caches retain their historical direct-compiled
+    /// behavior by leaving `deferredPromotion` at its default value.
+    public private(set) var isCompiledMode: Bool
+
+    /// When true, `BaseKVCache.offset` is the authoritative host mirror and is
+    /// advanced by the direct executor after each successful graph call.
+    private let mirrorsCompiledOffsetOnHost: Bool
+
+    public init(
+        maxLength: Int = 4096,
+        step: Int = 256,
+        deferredPromotion: Bool = false
+    ) {
+        precondition(maxLength > 0)
+        precondition(step > 0)
         self.maxLength = maxLength
         self.step = step
         self.offsetArray = MLXArray([Int32(0)])
+        self.isCompiledMode = !deferredPromotion
+        self.mirrorsCompiledOffsetOnHost = deferredPromotion
         super.init()
     }
 
-    /// Static promote helper for symmetry with `CompilableRotatingKVCache.promote`.
+    /// The host-only logical position. Unlike `offset`, this never reads back
+    /// `offsetArray`; the direct executor and atlas routing use it for guards.
+    public var hostOffset: Int { super.offset }
+
+    /// Static promotion helper used by the generic compiled-decode path.
     public static func promote(from cache: KVCacheSimple, maxLength: Int) -> CompilableKVCache {
-        return CompilableKVCache(from: cache, maxLength: maxLength)
+        CompilableKVCache(from: cache, maxLength: maxLength)
     }
 
-    /// Create from an existing KVCacheSimple (e.g., after prefill).
-    /// Copies the existing cache state into a fixed-size buffer.
+    /// Create a direct-compiled cache from an already populated ordinary cache.
     public convenience init(from cache: KVCache, maxLength: Int = 4096) {
         self.init(maxLength: maxLength)
-
         let existingState = cache.state
         if existingState.count >= 2 {
-            let existingKeys = existingState[0]  // [B, H, seqLen, D]
-            let existingValues = existingState[1]
-
-            let seqLen = existingKeys.dim(2)
-            let B = existingKeys.dim(0)
-            let H = existingKeys.dim(1)
-            let kD = existingKeys.dim(3)
-            let vD = existingValues.dim(3)
-
-            // Pre-allocate to maxLength
-            self.keys = MLXArray.zeros([B, H, maxLength, kD], dtype: existingKeys.dtype)
-            self.values = MLXArray.zeros([B, H, maxLength, vD], dtype: existingValues.dtype)
-
-            // Copy existing data at position 0
-            self.keys![.ellipsis, ..<seqLen, 0...] = existingKeys
-            self.values![.ellipsis, ..<seqLen, 0...] = existingValues
-
-            self.offsetArray = MLXArray([Int32(seqLen)])
+            state = [existingState[0], existingState[1]]
         }
+    }
+
+    /// Promote the ordinary dynamic buffer in place to a fixed overflow bin.
+    ///
+    /// This is deliberately outside the compiled closure. The request keeps
+    /// ownership of this cache object while the process-lifetime template is
+    /// rebound to these exact array objects before every graph invocation.
+    @discardableResult
+    public func prepareForCompiledDecode() -> Bool {
+        if isCompiledMode {
+            return hostOffset < maxLength
+                && keys?.dim(2) == maxLength
+                && values?.dim(2) == maxLength
+        }
+        guard hostOffset < maxLength,
+            let currentKeys = keys,
+            let currentValues = values,
+            currentKeys.dim(2) >= hostOffset,
+            currentValues.dim(2) >= hostOffset,
+            currentKeys.dim(2) <= maxLength,
+            currentValues.dim(2) <= maxLength
+        else {
+            return false
+        }
+
+        let keyPadding = maxLength - currentKeys.dim(2)
+        if keyPadding > 0 {
+            let zeros = MLXArray.zeros(
+                [
+                    currentKeys.dim(0), currentKeys.dim(1), keyPadding,
+                    currentKeys.dim(3),
+                ],
+                dtype: currentKeys.dtype
+            )
+            keys = concatenated([currentKeys, zeros], axis: 2)
+        }
+
+        let valuePadding = maxLength - currentValues.dim(2)
+        if valuePadding > 0 {
+            let zeros = MLXArray.zeros(
+                [
+                    currentValues.dim(0), currentValues.dim(1), valuePadding,
+                    currentValues.dim(3),
+                ],
+                dtype: currentValues.dtype
+            )
+            values = concatenated([currentValues, zeros], axis: 2)
+        }
+
+        offsetArray = MLXArray([Int32(hostOffset)])
+        isCompiledMode = true
+        return true
+    }
+
+    /// Resume ordinary `KVCacheSimple` semantics on the same physical buffer.
+    /// At offset 768 its next eager update performs the stock 256-row growth,
+    /// writes row 768 once, and returns the valid 769-row prefix.
+    public func deactivateCompiledDecode() {
+        guard isCompiledMode else { return }
+        if !mirrorsCompiledOffsetOnHost {
+            super.offset = offsetArray[0].item(Int.self)
+        }
+        isCompiledMode = false
+    }
+
+    /// Rebind a persistent graph template to request-owned state.
+    ///
+    /// `compile(inputs:outputs:)` asks `innerState()` on every invocation, so
+    /// replacing all three references here feeds the new request into the
+    /// already compiled graph without retracing or retaining prior counters.
+    public func bindCompiledStorage(from source: CompilableKVCache) -> Bool {
+        guard source.isCompiledMode,
+            source.maxLength == maxLength,
+            let sourceKeys = source.keys,
+            let sourceValues = source.values,
+            sourceKeys.dim(2) == maxLength,
+            sourceValues.dim(2) == maxLength
+        else {
+            return false
+        }
+
+        keys = sourceKeys
+        values = sourceValues
+        offsetArray = source.offsetArray
+        super.offset = source.hostOffset
+        isCompiledMode = true
+        return true
+    }
+
+    /// Allocation-free signature check used by Laguna before binding a
+    /// request into its fixed production graph.
+    public func compiledStorageMatches(
+        batchSize: Int,
+        heads: Int,
+        length: Int,
+        headDimension: Int,
+        dtype: DType
+    ) -> Bool {
+        guard isCompiledMode, let keys, let values else { return false }
+        return keys.dtype == dtype
+            && keys.ndim == 4
+            && keys.dim(0) == batchSize
+            && keys.dim(1) == heads
+            && keys.dim(2) == length
+            && keys.dim(3) == headDimension
+            && values.dtype == dtype
+            && values.ndim == 4
+            && values.dim(0) == batchSize
+            && values.dim(1) == heads
+            && values.dim(2) == length
+            && values.dim(3) == headDimension
+            && offsetArray.dtype == .int32
+            && offsetArray.ndim == 1
+            && offsetArray.dim(0) == 1
+    }
+
+    /// Advance only the host mirror after the graph has successfully advanced
+    /// `offsetArray` and written one supplied token's K/V rows.
+    public func noteCompiledAdvance(_ count: Int = 1) {
+        precondition(count >= 0)
+        super.offset += count
     }
 
     // MARK: - KVCache protocol
 
     public override var offset: Int {
         get {
-            // Materialize for compatibility with code that reads offset as Int.
-            // This triggers synchronous readback — avoid inside compiled paths.
-            offsetArray[0].item(Int.self)
+            if isCompiledMode && !mirrorsCompiledOffsetOnHost {
+                return offsetArray[0].item(Int.self)
+            }
+            return super.offset
         }
         set {
-            offsetArray = MLXArray([Int32(newValue)])
+            super.offset = newValue
+            if isCompiledMode {
+                offsetArray = MLXArray([Int32(newValue)])
+            }
         }
     }
 
+    /// Stable compiled state order: `[K, V, offset]`.
     public override func innerState() -> [MLXArray] {
+        guard isCompiledMode else {
+            return [keys, values].compactMap { $0 }
+        }
         if let keys, let values {
             return [keys, values, offsetArray]
         }
@@ -124,111 +255,168 @@ public class CompilableKVCache: BaseKVCache {
     public override func update(keys newKeys: MLXArray, values newValues: MLXArray)
         -> (MLXArray, MLXArray)
     {
-        let nTokens = newKeys.dim(2)
-
-        // Lazy initialization on first call
-        if self.keys == nil {
-            let B = newKeys.dim(0)
-            let H = newKeys.dim(1)
-            let kD = newKeys.dim(3)
-            let vD = newValues.dim(3)
-            self.keys = MLXArray.zeros([B, H, maxLength, kD], dtype: newKeys.dtype)
-            self.values = MLXArray.zeros([B, H, maxLength, vD], dtype: newValues.dtype)
+        guard isCompiledMode else {
+            return eagerUpdate(keys: newKeys, values: newValues)
         }
 
+        let nTokens = newKeys.dim(2)
+        if keys == nil {
+            keys = MLXArray.zeros(
+                [newKeys.dim(0), newKeys.dim(1), maxLength, newKeys.dim(3)],
+                dtype: newKeys.dtype
+            )
+            values = MLXArray.zeros(
+                [newValues.dim(0), newValues.dim(1), maxLength, newValues.dim(3)],
+                dtype: newValues.dtype
+            )
+        }
+
+        // `prev` is the pre-update graph position. Both writes use it, then
+        // the graph counter advances exactly once.
         let prev = offsetArray
         let newOffset = prev + MLXArray([Int32(nTokens)])
+        keys!._updateInternal(
+            dynamicSliceUpdate(keys!, update: newKeys, start: prev, axes: [2]))
+        values!._updateInternal(
+            dynamicSliceUpdate(values!, update: newValues, start: prev, axes: [2]))
+        offsetArray._updateInternal(newOffset)
 
-        // Must use _updateInternal to preserve object identity — compile() captures
-        // stateInputs at innerCall start and expects the same objects to be mutated.
-        self.keys!._updateInternal(
-            dynamicSliceUpdate(self.keys!, update: newKeys, start: prev, axes: [2]))
-        self.values!._updateInternal(
-            dynamicSliceUpdate(self.values!, update: newValues, start: prev, axes: [2]))
-
-        self.offsetArray._updateInternal(newOffset)
-
-        // OVERFLOW BIN: return the full static-size buffer.
-        // The attention mask from makeMask() handles which positions are valid.
-        // This keeps tensor shapes constant across all decode steps,
-        // enabling compile() to trace the entire forward pass.
-        return (self.keys!, self.values!)
+        // Overflow-bin attention always receives the fixed backing arrays.
+        return (keys!, values!)
     }
 
-    // MARK: - Mask (Overflow Bin)
+    /// Verbatim `KVCacheSimple.update` semantics for deferred prefill and
+    /// post-capacity fallback.
+    private func eagerUpdate(keys newKeys: MLXArray, values newValues: MLXArray)
+        -> (MLXArray, MLXArray)
+    {
+        let previous = super.offset
+        let tokenCount = newKeys.dim(2)
 
-    /// Generate attention mask for the full-buffer return.
-    ///
-    /// Since update() returns the entire maxLength buffer, we ALWAYS need an array
-    /// mask to prevent attention to unwritten positions. The mask is boolean:
-    /// True = attend, False = don't attend (gets -inf in attention scores).
-    ///
-    /// For decode (n=1): mask[0, j] = (j <= offset)
-    /// For prefill (n>1): mask[i, j] = (j <= offset + i)  (causal)
-    ///
-    /// Note: `offset` here is the PRE-update value. After update, positions
-    /// 0..<offset+n are valid, matching the mask exactly.
-    ///
-    /// Uses `offsetArray` (MLXArray) for all computation so compile() can trace
-    /// the mask through the computation graph.
+        if keys == nil, previous == 0, tokenCount > 0,
+            tokenCount.isMultiple(of: step)
+        {
+            keys = newKeys
+            values = newValues
+            super.offset = tokenCount
+            return (newKeys, newValues)
+        }
+
+        let reset =
+            if let currentKeys = keys, (previous + tokenCount) > currentKeys.dim(2) {
+                true
+            } else {
+                keys == nil
+            }
+        if reset {
+            let keyShape = [
+                newKeys.dim(0), newKeys.dim(1),
+                ((step + tokenCount - 1) / step) * step, newKeys.dim(3),
+            ]
+            let valueShape = [
+                newValues.dim(0), newValues.dim(1),
+                ((step + tokenCount - 1) / step) * step, newValues.dim(3),
+            ]
+            let newKeyStorage = MLXArray.zeros(keyShape, dtype: newKeys.dtype)
+            let newValueStorage = MLXArray.zeros(valueShape, dtype: newValues.dtype)
+
+            if var currentKeys = keys, var currentValues = values {
+                if previous % step != 0 {
+                    currentKeys = currentKeys[.ellipsis, ..<previous, 0...]
+                    currentValues = currentValues[.ellipsis, ..<previous, 0...]
+                }
+                keys = concatenated([currentKeys, newKeyStorage], axis: 2)
+                values = concatenated([currentValues, newValueStorage], axis: 2)
+            } else {
+                keys = newKeyStorage
+                values = newValueStorage
+            }
+        }
+
+        super.offset += tokenCount
+        keys?[.ellipsis, previous ..< super.offset, 0...] = newKeys
+        values?[.ellipsis, previous ..< super.offset, 0...] = newValues
+        return (
+            keys![.ellipsis, ..<super.offset, 0...],
+            values![.ellipsis, ..<super.offset, 0...]
+        )
+    }
+
+    /// In compiled mode a boolean prefix mask admits precisely columns
+    /// `0...preOffset`, including the row just written by the current token.
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
-        // Use offsetArray directly — compile-traceable, no .item() needed
-        let currentOffsetArr = offsetArray  // MLXArray [1] int32
+        guard isCompiledMode else {
+            return super.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+        }
 
-        // Query positions: [offset, offset+1, ..., offset+n-1]
         let linds: MLXArray
         if n == 1 {
-            linds = currentOffsetArr.reshaped(1, 1)
+            linds = offsetArray.reshaped(1, 1)
         } else {
-            linds = (MLXArray(Int32(0) ..< Int32(n)) + currentOffsetArr).reshaped(n, 1)
+            linds = (MLXArray(Int32(0) ..< Int32(n)) + offsetArray).reshaped(n, 1)
         }
-
-        // Key positions: [0, 1, ..., maxLength-1]
         let rinds = maskRinds.reshaped(1, maxLength)
-
-        // Causal + validity: attend to positions j where j <= query_position
         var mask = linds .>= rinds
-
-        // Apply sliding window if specified
         if let windowSize {
-            let windowStart = linds - Int32(windowSize - 1)
-            mask = mask & (rinds .>= windowStart)
+            mask = mask & (rinds .>= linds - Int32(windowSize - 1))
         }
-
         return .array(mask)
     }
 
-    // MARK: - State
-
     public override var state: [MLXArray] {
         get {
-            guard let keys, let values else { return [] }
-            let off: Int = offsetArray[0].item(Int.self)
-            if off == keys.dim(2) {
-                return [keys, values]
-            } else {
-                // Return only valid portion for serialization
+            guard isCompiledMode else {
+                guard let keys, let values else { return [] }
+                if super.offset == keys.dim(2) {
+                    return [keys, values]
+                }
                 return [
-                    keys[.ellipsis, ..<off, 0...],
-                    values[.ellipsis, ..<off, 0...],
+                    keys[.ellipsis, ..<super.offset, 0...],
+                    values[.ellipsis, ..<super.offset, 0...],
                 ]
             }
+
+            guard let keys, let values else { return [] }
+            let logicalOffset = offset
+            if logicalOffset == keys.dim(2) {
+                return [keys, values]
+            }
+            return [
+                keys[.ellipsis, ..<logicalOffset, 0...],
+                values[.ellipsis, ..<logicalOffset, 0...],
+            ]
         }
         set {
             guard newValue.count == 2 else { return }
-            let seqLen = newValue[0].dim(2)
-            let B = newValue[0].dim(0)
-            let H = newValue[0].dim(1)
-            let kD = newValue[0].dim(3)
-            let vD = newValue[1].dim(3)
+            let sequenceLength = newValue[0].dim(2)
 
-            self.keys = MLXArray.zeros([B, H, maxLength, kD], dtype: newValue[0].dtype)
-            self.values = MLXArray.zeros([B, H, maxLength, vD], dtype: newValue[1].dtype)
-            self.keys![.ellipsis, ..<seqLen, 0...] = newValue[0]
-            self.values![.ellipsis, ..<seqLen, 0...] = newValue[1]
-            self.offsetArray = MLXArray([Int32(seqLen)])
+            if isCompiledMode {
+                guard sequenceLength <= maxLength else { return }
+                keys = MLXArray.zeros(
+                    [
+                        newValue[0].dim(0), newValue[0].dim(1), maxLength,
+                        newValue[0].dim(3),
+                    ],
+                    dtype: newValue[0].dtype
+                )
+                values = MLXArray.zeros(
+                    [
+                        newValue[1].dim(0), newValue[1].dim(1), maxLength,
+                        newValue[1].dim(3),
+                    ],
+                    dtype: newValue[1].dtype
+                )
+                keys?[.ellipsis, ..<sequenceLength, 0...] = newValue[0]
+                values?[.ellipsis, ..<sequenceLength, 0...] = newValue[1]
+                super.offset = sequenceLength
+                offsetArray = MLXArray([Int32(sequenceLength)])
+            } else {
+                keys = newValue[0]
+                values = newValue[1]
+                super.offset = sequenceLength
+            }
         }
     }
 
@@ -236,25 +424,41 @@ public class CompilableKVCache: BaseKVCache {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        let current: Int = offsetArray[0].item(Int.self)
-        let trimmed = min(current, n)
-        offsetArray = MLXArray([Int32(current - trimmed)])
-        super.offset = current - trimmed
+        if isCompiledMode && !mirrorsCompiledOffsetOnHost {
+            super.offset = offsetArray[0].item(Int.self)
+        }
+        let trimmed = min(super.offset, n)
+        super.offset -= trimmed
+        if isCompiledMode {
+            offsetArray = MLXArray([Int32(super.offset)])
+        }
         return trimmed
     }
 
     public override func copy() -> any KVCache {
-        let c = CompilableKVCache(maxLength: maxLength, step: step)
-        c.keys = keys
-        c.values = values
-        c.offsetArray = offsetArray
-        return c
+        let logicalOffset = offset
+        let copy = CompilableKVCache(
+            maxLength: maxLength,
+            step: step,
+            deferredPromotion: mirrorsCompiledOffsetOnHost
+        )
+        if let keys {
+            copy.keys = keys[.ellipsis]
+        }
+        if let values {
+            copy.values = values[.ellipsis]
+        }
+        copy.isCompiledMode = isCompiledMode
+        copy.offsetArray = offsetArray[0...]
+        copy.offset = logicalOffset
+        if isCompiledMode {
+            copy.offsetArray = offsetArray[0...]
+        }
+        return copy
     }
-
-    // MARK: - Debug
 
     public var debugDescription: String {
         "CompilableKVCache(offset=\(offset), maxLength=\(maxLength), "
-            + "shape=\(keys?.shape.description ?? "nil"))"
+            + "compiled=\(isCompiledMode), shape=\(keys?.shape.description ?? "nil"))"
     }
 }
