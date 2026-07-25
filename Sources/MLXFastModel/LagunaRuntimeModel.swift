@@ -515,6 +515,139 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Slab twin of `lagunaFullQKNormYaRNKernel`: identical Q/K math and writes,
+/// plus a fused `kv` output `[2, 8, 1, 128]` — plane 0 receives the same K
+/// bits the `keys` output receives (mirror stores of the identical computed
+/// values), plane 1 receives the raw V row verbatim. The pair feeds the
+/// cache's one-dispatch `updateKVSlab`, replacing the two per-layer
+/// `dynamicSliceUpdate` commits.
+private let lagunaFullQKNormYaRNKVKernel = MLXFast.metalKernel(
+    name: "laguna_full_qk_norm_yarn_kv_bf16_128_v1",
+    inputNames: [
+        "raw_queries", "raw_keys", "raw_values", "query_weight", "key_weight",
+        "angles",
+    ],
+    outputNames: ["queries", "keys", "kv"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint rotary_dims = 64;
+        constexpr uint rotary_pairs = 32;
+        constexpr uint query_heads = 48;
+        constexpr uint kv_heads = 8;
+        constexpr float yarn_mscale = 1.3465735912322998f;
+
+        uint head = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+
+        const device bfloat* input;
+        const device bfloat* weight;
+        bool is_key_head = head >= query_heads;
+        uint kv_head = is_key_head ? head - query_heads : 0;
+        if (!is_key_head) {
+            input = raw_queries + head * head_dim;
+            weight = query_weight;
+        } else {
+            input = raw_keys + kv_head * head_dim;
+            weight = key_weight;
+        }
+
+        uint base = lane * 4;
+        thread bfloat normalized[4];
+        float sum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float value = float(input[base + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+        for (uint i = 0; i < 4; ++i) {
+            normalized[i] =
+                weight[base + i] *
+                bfloat(float(input[base + i]) * inverse_rms);
+        }
+
+        thread float paired[4];
+        for (uint i = 0; i < 4; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
+        }
+
+        device bfloat* output =
+            !is_key_head
+            ? queries + head * head_dim
+            : keys + kv_head * head_dim;
+        device bfloat* kv_key = kv + kv_head * head_dim;
+        if (lane < 8) {
+            bfloat rounded_mscale = bfloat(yarn_mscale);
+            for (uint i = 0; i < 4; ++i) {
+                uint pair = base + i;
+                float first =
+                    float(bfloat(normalized[i] * rounded_mscale));
+                float second =
+                    float(bfloat(bfloat(paired[i]) * rounded_mscale));
+                float cosine = angles[pair];
+                float sine = angles[pair + rotary_pairs];
+                bfloat rotated_first = bfloat(first * cosine - second * sine);
+                bfloat rotated_second = bfloat(first * sine + second * cosine);
+                output[pair] = rotated_first;
+                output[pair + rotary_pairs] = rotated_second;
+                if (is_key_head) {
+                    kv_key[pair] = rotated_first;
+                    kv_key[pair + rotary_pairs] = rotated_second;
+                }
+            }
+        } else if (lane >= 16) {
+            for (uint i = 0; i < 4; ++i) {
+                output[base + i] = normalized[i];
+                if (is_key_head) {
+                    kv_key[base + i] = normalized[i];
+                }
+            }
+        }
+        if (is_key_head) {
+            device bfloat* kv_value =
+                kv + kv_heads * head_dim + kv_head * head_dim;
+            const device bfloat* value_row = raw_values + kv_head * head_dim;
+            for (uint i = 0; i < 4; ++i) {
+                kv_value[base + i] = value_row[base + i];
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+func lagunaFullQKNormYaRNKV(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    rawValues: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray
+) -> (MLXArray, MLXArray, MLXArray) {
+    precondition(rawQueries.dtype == .bfloat16)
+    precondition(rawKeys.dtype == .bfloat16)
+    precondition(rawValues.dtype == .bfloat16)
+    precondition(rawQueries.shape == [1, 1, 48 * LagunaConstants.headDim])
+    precondition(rawKeys.shape == [1, 1, 8 * LagunaConstants.headDim])
+    precondition(rawValues.shape == [1, 1, 8 * LagunaConstants.headDim])
+    precondition(angles.dtype == .float32)
+    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim / 2])
+
+    lagunaTrace("full qk norm+yarn kv-slab")
+    let outputs = lagunaFullQKNormYaRNKVKernel(
+        [rawQueries, rawKeys, rawValues, queryWeight, keyWeight, angles],
+        grid: (56 * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [
+            [1, 48, 1, LagunaConstants.headDim],
+            [1, 8, 1, LagunaConstants.headDim],
+            [2, 8, 1, LagunaConstants.headDim],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 func lagunaFullQKNormYaRN(
     rawQueries: MLXArray,
     rawKeys: MLXArray,
@@ -638,6 +771,131 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         """,
     ensureRowContiguous: true
 )
+
+/// Slab twin of `lagunaSlidingQKNormRoPEKernel`: identical Q/K math and
+/// writes, plus the fused `kv` output `[2, 8, 1, 128]` (plane 0 = the same K
+/// bits, mirror stores of the identical computed values; plane 1 = the raw V
+/// row verbatim) for the cache's one-dispatch `updateKVSlab`.
+private let lagunaSlidingQKNormRoPEKVKernel = MLXFast.metalKernel(
+    name: "laguna_sliding_qk_norm_rope_kv_bf16_128_v1",
+    inputNames: [
+        "raw_queries", "raw_keys", "raw_values", "query_weight", "key_weight",
+        "angles",
+    ],
+    outputNames: ["queries", "keys", "kv"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint rotary_pairs = 64;
+        constexpr uint query_heads = 64;
+        constexpr uint kv_heads = 8;
+
+        uint head = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+
+        const device bfloat* input;
+        const device bfloat* weight;
+        bool is_key_head = head >= query_heads;
+        uint kv_head = is_key_head ? head - query_heads : 0;
+        if (!is_key_head) {
+            input = raw_queries + head * head_dim;
+            weight = query_weight;
+        } else {
+            input = raw_keys + kv_head * head_dim;
+            weight = key_weight;
+        }
+
+        uint base = lane * 4;
+        thread bfloat normalized[4];
+        float sum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float value = float(input[base + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+        for (uint i = 0; i < 4; ++i) {
+            normalized[i] =
+                weight[base + i] *
+                bfloat(float(input[base + i]) * inverse_rms);
+        }
+
+        // Element `p + 64`, the partner of pair `p`, lives 16 lanes away.
+        thread float paired[4];
+        for (uint i = 0; i < 4; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
+        }
+
+        device bfloat* output =
+            !is_key_head
+            ? queries + head * head_dim
+            : keys + kv_head * head_dim;
+        device bfloat* kv_key = kv + kv_head * head_dim;
+        // Every element rotates, so the lower sixteen lanes own all 64 pairs
+        // and write both halves of each.
+        if (lane < 16) {
+            for (uint i = 0; i < 4; ++i) {
+                uint pair = base + i;
+                float first = float(normalized[i]);
+                float second = paired[i];
+                float cosine = angles[pair];
+                float sine = angles[pair + rotary_pairs];
+                bfloat rotated_first = bfloat(first * cosine - second * sine);
+                bfloat rotated_second =
+                    bfloat(first * sine + second * cosine);
+                output[pair] = rotated_first;
+                output[pair + rotary_pairs] = rotated_second;
+                if (is_key_head) {
+                    kv_key[pair] = rotated_first;
+                    kv_key[pair + rotary_pairs] = rotated_second;
+                }
+            }
+        }
+        if (is_key_head) {
+            device bfloat* kv_value =
+                kv + kv_heads * head_dim + kv_head * head_dim;
+            const device bfloat* value_row = raw_values + kv_head * head_dim;
+            for (uint i = 0; i < 4; ++i) {
+                kv_value[base + i] = value_row[base + i];
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+func lagunaSlidingQKNormRoPEKV(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    rawValues: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray
+) -> (MLXArray, MLXArray, MLXArray) {
+    let heads = LagunaConstants.slidingAttentionHeads
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    precondition(rawQueries.dtype == .bfloat16)
+    precondition(rawKeys.dtype == .bfloat16)
+    precondition(rawValues.dtype == .bfloat16)
+    precondition(rawQueries.shape == [1, 1, heads * LagunaConstants.headDim])
+    precondition(rawKeys.shape == [1, 1, kvHeads * LagunaConstants.headDim])
+    precondition(rawValues.shape == [1, 1, kvHeads * LagunaConstants.headDim])
+    precondition(angles.dtype == .float32)
+    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim])
+
+    lagunaTrace("sliding qk norm+rope kv-slab")
+    let outputs = lagunaSlidingQKNormRoPEKVKernel(
+        [rawQueries, rawKeys, rawValues, queryWeight, keyWeight, angles],
+        grid: ((heads + kvHeads) * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [
+            [1, heads, 1, LagunaConstants.headDim],
+            [1, kvHeads, 1, LagunaConstants.headDim],
+            [2, kvHeads, 1, LagunaConstants.headDim],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
 
 func lagunaSlidingQKNormRoPE(
     rawQueries: MLXArray,
@@ -1333,22 +1591,64 @@ final class LagunaRuntimeAttention: Module {
             qkRoPEAngles?.dtype == .float32 &&
             qkRoPEAngles?.shape == [1, 1, 1, headDim]
 
+        // Fused K/V slab commit: when the cache was promoted in slab mode,
+        // the fused QK-norm kernels also emit the step's K and V rows as one
+        // [2, 8, 1, 128] array, and the cache commits both with ONE
+        // dynamicSliceUpdate instead of two. Storage layout only — the K
+        // bits are mirror stores of the identical computed values, V is a
+        // verbatim copy, and attention consumes contiguous plane views of
+        // the same bytes the separate buffers would hold.
+        let slabCapableCache: (any KVCache)? = {
+            guard lagunaFusedKVSlabCachesEnabled else { return nil }
+            if let c = cache as? LagunaSlabRotatingKVCache { return c }
+            if let c = cache as? LagunaSlabKVCache { return c }
+            return nil
+        }()
+        let useKVSlab =
+            slabCapableCache != nil &&
+            (useFusedFullQKNormYaRN || useFusedSlidingQKNormRoPE) &&
+            values.dtype == .bfloat16 &&
+            values.shape == [1, 1, nKVHeads * headDim]
+
+        var fusedKV: MLXArray? = nil
         if useFusedFullQKNormYaRN, let qkRoPEAngles {
-            (queries, keys) = lagunaFullQKNormYaRN(
-                rawQueries: queries,
-                rawKeys: keys,
-                queryWeight: qNorm.weight,
-                keyWeight: kNorm.weight,
-                angles: qkRoPEAngles
-            )
+            if useKVSlab {
+                (queries, keys, fusedKV) = lagunaFullQKNormYaRNKV(
+                    rawQueries: queries,
+                    rawKeys: keys,
+                    rawValues: values,
+                    queryWeight: qNorm.weight,
+                    keyWeight: kNorm.weight,
+                    angles: qkRoPEAngles
+                )
+            } else {
+                (queries, keys) = lagunaFullQKNormYaRN(
+                    rawQueries: queries,
+                    rawKeys: keys,
+                    queryWeight: qNorm.weight,
+                    keyWeight: kNorm.weight,
+                    angles: qkRoPEAngles
+                )
+            }
         } else if useFusedSlidingQKNormRoPE, let qkRoPEAngles {
-            (queries, keys) = lagunaSlidingQKNormRoPE(
-                rawQueries: queries,
-                rawKeys: keys,
-                queryWeight: qNorm.weight,
-                keyWeight: kNorm.weight,
-                angles: qkRoPEAngles
-            )
+            if useKVSlab {
+                (queries, keys, fusedKV) = lagunaSlidingQKNormRoPEKV(
+                    rawQueries: queries,
+                    rawKeys: keys,
+                    rawValues: values,
+                    queryWeight: qNorm.weight,
+                    keyWeight: kNorm.weight,
+                    angles: qkRoPEAngles
+                )
+            } else {
+                (queries, keys) = lagunaSlidingQKNormRoPE(
+                    rawQueries: queries,
+                    rawKeys: keys,
+                    queryWeight: qNorm.weight,
+                    keyWeight: kNorm.weight,
+                    angles: qkRoPEAngles
+                )
+            }
         } else {
             queries =
                 qNorm(queries.reshaped(B, L, nHeads, headDim))
@@ -1357,23 +1657,48 @@ final class LagunaRuntimeAttention: Module {
                 kNorm(keys.reshaped(B, L, nKVHeads, headDim))
                 .transposed(0, 2, 1, 3)
         }
-        values = values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
 
         if !useFusedFullQKNormYaRN && !useFusedSlidingQKNormRoPE {
+            values = values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
             queries = applyRotaryPosition(rope, to: queries, cache: cache)
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        } else if fusedKV == nil {
+            values = values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
         }
 
-        var output = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
-        )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
+        var output: MLXArray
+        if let fusedKV {
+            // Mirrors attentionWithCacheUpdate's plain branch with the
+            // one-dispatch slab commit in place of cache.update.
+            let (cachedKeys, cachedValues): (MLXArray, MLXArray)
+            if let c = slabCapableCache as? LagunaSlabRotatingKVCache {
+                (cachedKeys, cachedValues) = c.updateKVSlab(fusedKV)
+            } else if let c = slabCapableCache as? LagunaSlabKVCache {
+                (cachedKeys, cachedValues) = c.updateKVSlab(fusedKV)
+            } else {
+                fatalError("fusedKV without a slab-capable cache")
+            }
+            output = MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: cachedKeys,
+                values: cachedValues,
+                scale: scale,
+                mask: mask
+            )
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
+        } else {
+            output = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
+        }
 
         if gatingEnabled, let gProj {
             // Per-head softplus gate computed in float32, then broadcast
@@ -3651,9 +3976,14 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     public func newCache(parameters _: GenerateParameters?) -> [KVCache] {
         (0..<configuration.numHiddenLayers).map { layerIndex in
             if configuration.layerTypes[layerIndex] == .full {
-                StandardKVCache()
+                lagunaFusedKVSlabCachesEnabled
+                    ? LagunaSlabKVCache()
+                    : StandardKVCache()
             } else {
-                RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
+                lagunaFusedKVSlabCachesEnabled
+                    ? LagunaSlabRotatingKVCache(
+                        maxSize: configuration.slidingWindow, keep: 0)
+                    : RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
             }
         }
     }
