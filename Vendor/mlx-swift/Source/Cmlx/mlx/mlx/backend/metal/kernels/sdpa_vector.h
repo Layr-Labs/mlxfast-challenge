@@ -53,7 +53,14 @@ template <typename T, int D, int V = D>
   thread U k[qk_per_thread];
   thread U o[v_per_thread];
 
-  threadgroup U outputs[BN * BD];
+  // One BN*BD exchange plane per output element (capped at four planes,
+  // 16 KiB, so the D=256 instantiation stays under the 32 KiB threadgroup
+  // budget) so the output combination pays one barrier per chunk of planes
+  // instead of two per element. Every exchanged value, its transposed slot,
+  // and the simd_sum lane order are identical to the per-element exchange
+  // this replaces; only barrier scheduling changes.
+  constexpr int out_planes = (v_per_thread < 4) ? v_per_thread : 4;
+  threadgroup U outputs[out_planes * BN * BD];
   threadgroup U max_scores[BN];
   threadgroup U sum_exp_scores[BN];
 
@@ -159,13 +166,25 @@ template <typename T, int D, int V = D>
   U factor = fast::exp(max_score - new_max);
   sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
 
-  // Now we need to aggregate all the outputs
-  for (int i = 0; i < v_per_thread; i++) {
-    outputs[simd_lid * BD + simd_gid] = o[i];
+  // Now we need to aggregate all the outputs. A chunk of planes is written
+  // before one barrier; each plane's read pattern, `factor` scaling,
+  // simd_sum lane order, and division are unchanged from the per-element
+  // exchange. The trailing barrier only runs when a further chunk reuses
+  // the planes.
+  for (int base = 0; base < v_per_thread; base += out_planes) {
+    for (int i = 0; i < out_planes && base + i < v_per_thread; i++) {
+      outputs[i * BN * BD + simd_lid * BD + simd_gid] = o[base + i];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
-    o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = 0; i < out_planes && base + i < v_per_thread; i++) {
+      o[base + i] =
+          simd_sum(outputs[i * BN * BD + simd_gid * BD + simd_lid] * factor);
+      o[base + i] =
+          sum_exp_score == 0 ? o[base + i] : (o[base + i] / sum_exp_score);
+    }
+    if (base + out_planes < v_per_thread) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
   }
 
   // And write the output
