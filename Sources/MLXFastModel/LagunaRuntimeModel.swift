@@ -265,17 +265,20 @@ private func lagunaNormReductionTail(
 ) -> String {
     let inverseRMS =
         "metal::precise::rsqrt(acc / \(denominator) + \(epsilon))"
+    // Every consumer dispatches exactly 512 threads (16 simdgroups), so only
+    // local_sums[0..15] are ever written. Substituting an in-register 0.0f
+    // for lanes 16-31 reproduces the previously zero-filled slots exactly
+    // (adding +0.0f leaves every partial in simd_sum's reduction tree
+    // bit-identical for these non-negative sums of squares), removing the
+    // zero-init pass and one full 512-thread barrier per threadgroup without
+    // changing any value.
     let lines: [String] = [
-        "if (\(simdGroup) == 0) {",
-        "    local_sums[\(lane)] = 0.0f;",
-        "}",
-        "threadgroup_barrier(mem_flags::mem_threadgroup);",
         "if (\(lane) == 0) {",
         "    local_sums[\(simdGroup)] = acc;",
         "}",
         "threadgroup_barrier(mem_flags::mem_threadgroup);",
         "if (\(simdGroup) == 0) {",
-        "    acc = simd_sum(local_sums[\(lane)]);",
+        "    acc = simd_sum(\(lane) < 16 ? local_sums[\(lane)] : 0.0f);",
         "    if (\(lane) == 0) {",
         "        local_inv_mean[0] = \(inverseRMS);",
         "    }",
@@ -315,7 +318,7 @@ private let lagunaNormReductionTailQKV = lagunaNormReductionTail(
 /// one BF16 round. Sixteen simdgroups of four rows cover the 64 rows this
 /// threadgroup owns, and 256 divides evenly by 64. The norm half is untouched.
 private let lagunaResidualRMSNormRouterKernel = MLXFast.metalKernel(
-    name: "laguna_residual_rms_router_bf16_2048_v1",
+    name: "laguna_residual_rms_router_bf16_2048_v2",
     inputNames: ["residual", "branch", "weight", "router_weight"],
     outputNames: ["summed", "normalized", "router_logits"],
     source: """
@@ -403,7 +406,7 @@ private let lagunaResidualRMSNormRouterKernel = MLXFast.metalKernel(
 /// Residual add + RMSNorm for the layers whose MLP is not a sparse block
 /// (layer 0) and for any shape the router fusion above declines.
 private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
-    name: "laguna_residual_rms_bf16_2048_v1",
+    name: "laguna_residual_rms_bf16_2048_v2",
     inputNames: ["residual", "branch", "weight"],
     outputNames: ["summed", "normalized"],
     source: """
@@ -954,7 +957,7 @@ private let lagunaFusedQKVProjectionKernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_fused_norm_qkv_projection_bf16_h\(heads)_v3",
+            name: "laguna_fused_norm_qkv_projection_bf16_h\(heads)_v4",
             inputNames: [
                 "residual", "norm_weight", "query_weight", "key_weight",
                 "value_weight", "gate_weight",
