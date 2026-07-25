@@ -194,7 +194,7 @@ ranked run, after all correctness/gates work, a hidden-material scrub, and a
 quiescence wait, measure-job runs the pinned **baseline tree first, then the
 candidate workspace**, each as a full `./benchmark.sh --official` in fresh
 worker processes, each starting only once the GPU is below the fixed 40C gate
-(up to a 900s cooldown), each under 2 Hz telemetry.
+(up to a 900s cooldown), each under 100 ms macmon telemetry.
 A measurement is rejected -- with one gated retry -- on GPU throttling under
 load, missing telemetry, or token mismatches. Because both sides run back to
 back on the same silicon behind the same gate, the paired ratio cancels
