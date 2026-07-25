@@ -106,11 +106,49 @@ let lagunaFusedQKVEnabled =
 
 /// `DARKBLOOM_FUSED_SHARED_GATE_UP` (default on; set "0" to disable): after
 /// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
-/// shared expert and serve single-token decode from one quantized matmul.
-/// Multi-token prefill remains on the stock separate banks so the ranked
-/// prefill path and its smaller gather/GEMM shapes are unchanged.
+/// shared expert and serve decode from one quantized matmul. This flag owns
+/// building/retaining the bank; `DARKBLOOM_SHARED_ANY_L` below decides whether
+/// multi-token (prefill) forwards also consume it, so setting this to "0"
+/// disables both.
 let lagunaFusedSharedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_GATE_UP"] != "0"
+
+/// `DARKBLOOM_SHARED_ANY_L` (default on; set "0" to disable): serve the shared
+/// expert's MULTI-token (L > 1, i.e. prefill) gate/up from the same retained
+/// row-concatenated NVFP4 `[gate; up]` bank the decode path already keeps
+/// resident, instead of the stock two separate quantized matmuls (`gate_proj`
+/// then `up_proj`). One `(M=L, N=1024, K=2048)` dispatch replaces two
+/// `(M=L, N=512, K=2048)` ones -- half the kernel launches, half the split-K
+/// reduce dispatches, and one fewer full-width intermediate, for every prompt
+/// length.
+///
+/// EXACTNESS. `qmm_t_splitk` (and `qmm_t`/`qmm_t_nax` in the no-split regime)
+/// gives every output element its own K-loop over its own weight/scale rows;
+/// N only selects which grid columns exist. So concatenating the two banks
+/// along the output-row axis leaves each individual element's arithmetic --
+/// operand order, accumulation order, and every rounding boundary -- untouched,
+/// and slicing the [L, 1024] result back into `[..., 0..<512]` / `[...,
+/// 512..<1024]` reproduces the two separate results bit for bit. `gate` rows
+/// come first because `prepareFusedSharedGateUp` concatenates
+/// `[gate.weight, up.weight]` on axis 0.
+///
+/// The one thing that is NOT N-independent is MLX's split-K *dispatch choice*:
+/// `qmm_splitk` picks its split factor from the threadgroup count, which
+/// scales with N, and rounds each partial to BF16 before the sum-reduce
+/// combine -- so halving the number of dispatches would otherwise halve the
+/// split factor (at L=512, 2 -> 1, which additionally leaves the split-K
+/// kernel family for plain `qmm`/`qmm_nax`) and perturb the result. That is
+/// pinned in `Vendor/mlx-swift/.../backend/metal/quantized.cpp`, where
+/// `qmm_splitk` recomputes the split factor for this exact static shape key
+/// (nvfp4, group 16, 4-bit, N=1024, K=2048) as if it were still one of the two
+/// N=512 halves. The pin is L-generic and input-independent; see its comment
+/// block for the full argument.
+///
+/// Falls back to the stock `downProj(compiledSiluProduct(gateProj(x),
+/// upProj(x)))` byte for byte whenever this flag is off, the fused bank was
+/// never built, or any guard below declines.
+let lagunaSharedAnyLEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_ANY_L"] != "0"
 
 /// Decode-only shared-expert NVFP4 QMV + SwiGLU fusion. This consumes the
 /// retained row-concatenated `[gate; up]` bank and emits only the 512-wide
@@ -2992,6 +3030,74 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             let up = gateUp[.ellipsis, _fusedGateUpSplit...]
             return downProj(compiledSiluProduct(gate, up))
         }
+
+        // Multi-token (prefill) counterpart of the fused-bank branch above,
+        // behind `DARKBLOOM_SHARED_ANY_L`. One NVFP4 dispatch over the
+        // row-concatenated [gate; up] bank instead of two, mirroring
+        // `QuantizedLinear.callAsFunction` exactly (same `quantizedMM`
+        // primitive, transpose, group 16, 4-bit, .nvfp4, no affine biases and
+        // no bias add -- `prepareFusedSharedGateUp` pins every one of those
+        // literals, and the guards below re-assert them). The SiLU product and
+        // the down projection are the stock ops, unchanged and in the stock
+        // order, so the only thing that moves is how gate/up are computed.
+        //
+        // Bit-exactness: each quantized output row owns its K-loop and reads
+        // only its own weight/scale rows, so the split halves equal the two
+        // separate dispatches element for element -- provided the split-K
+        // dispatch choice matches too, which the shape-keyed parity pin in
+        // `qmm_splitk` (Vendor/mlx-swift/.../backend/metal/quantized.cpp)
+        // guarantees for this exact (nvfp4, gs 16, 4-bit, N=1024, K=2048)
+        // tuple at every L. See `lagunaSharedAnyLEnabled` for the full
+        // argument. `gate` is the low half because `prepareFusedSharedGateUp`
+        // concatenates `[gate.weight, up.weight]` on axis 0.
+        //
+        // The down projection is untouched: it keeps its own stock
+        // (M=L, N=2048, K=512) dispatch, which the pin's shape key excludes.
+        if lagunaSharedAnyLEnabled,
+            x.dim(1) > 1,
+            let fusedWeight = _fusedGateUpWeight,
+            let fusedScales = _fusedGateUpScales,
+            let gate = gateProj as? QuantizedLinear,
+            let up = upProj as? QuantizedLinear,
+            type(of: gate) == QuantizedLinear.self,
+            type(of: up) == QuantizedLinear.self,
+            gate.mode == .nvfp4, up.mode == .nvfp4,
+            gate.groupSize == 16, up.groupSize == 16,
+            gate.bits == 4, up.bits == 4,
+            gate.bias == nil, up.bias == nil,
+            gate.biases == nil, up.biases == nil,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == 1,
+            x.dim(2) == LagunaConstants.hiddenSize,
+            _fusedGateUpSplit == LagunaConstants.sharedExpertIntermediateSize,
+            fusedWeight.dtype == .uint32,
+            fusedWeight.shape == [
+                2 * LagunaConstants.sharedExpertIntermediateSize,
+                LagunaConstants.hiddenSize / 8,
+            ],
+            fusedScales.dtype == .uint8,
+            fusedScales.shape == [
+                2 * LagunaConstants.sharedExpertIntermediateSize,
+                LagunaConstants.hiddenSize / 16,
+            ]
+        {
+            lagunaTrace("shared any-L fused [gate; up] bank QMM")
+            let gateUp = MLX.quantizedMM(
+                x,
+                fusedWeight,
+                scales: fusedScales,
+                biases: nil,
+                transpose: true,
+                groupSize: 16,
+                bits: 4,
+                mode: .nvfp4
+            )
+            let xGate = gateUp[.ellipsis, 0 ..< _fusedGateUpSplit]
+            let xUp = gateUp[.ellipsis, _fusedGateUpSplit...]
+            return downProj(compiledSiluProduct(xGate, xUp))
+        }
+
         return downProj(compiledSiluProduct(gateProj(x), upProj(x)))
     }
 }

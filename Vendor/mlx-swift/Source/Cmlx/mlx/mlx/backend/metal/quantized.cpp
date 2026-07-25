@@ -777,20 +777,21 @@ void qmm(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-void qmm_splitk(
-    const array& x,
-    const array& w,
-    const array& scales,
-    const std::optional<array>& biases,
-    array& out,
-    int group_size,
-    int bits,
-    int M,
-    int N,
-    int K,
-    metal::Device& d,
-    const Stream& s,
-    const std::string& mode) {
+// The split-K chooser used by `qmm_splitk` below, factored out verbatim so it
+// can also be evaluated for a *hypothetical* N. `qmm_splitk` calls it with the
+// real (M, N, K, group_size); the Laguna shared-expert dispatch-parity pin
+// documented in `qmm_splitk` calls it a second time with the N the equivalent
+// unfused dispatch would have had. Keeping one implementation means the pinned
+// answer can never drift from the answer the default heuristic gives.
+//
+// The arithmetic is unchanged from the original inline body:
+//   bm = bn = 32
+//   n_tiles = ceil(N / bn), m_tiles = ceil(M / bm)
+//   split_k = max(1, 512 / (n_tiles * m_tiles))        // target ~512 tgs
+//   k_align = max(group_size, 32)
+//   split_k = min(split_k, K / k_align)
+//   while (split_k > 1 && K % (split_k * k_align) != 0) split_k--;
+inline int qmm_splitk_split_factor(int M, int N, int K, int group_size) {
   // Choose split_k to target ~512 threadgroups
   int bm = 32, bn = 32;
   int n_tiles = (N + bn - 1) / bn;
@@ -809,6 +810,77 @@ void qmm_splitk(
   while (split_k > 1 && (K % (split_k * k_align) != 0)) {
     split_k--;
   }
+  return split_k;
+}
+
+void qmm_splitk(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s,
+    const std::string& mode) {
+  // Grid tiling for the dispatch itself always uses the real N.
+  int bm = 32, bn = 32;
+  int n_tiles = (N + bn - 1) / bn;
+  int m_tiles = (M + bm - 1) / bm;
+  int split_k = qmm_splitk_split_factor(M, N, K, group_size);
+
+  // ---- Laguna shared-expert fused-bank dispatch-parity pin ----
+  //
+  // WHY: the split-K path rounds each partial product to the intermediate
+  // buffer's dtype (x.dtype(), BF16 for Laguna) BEFORE the axis-0 sum-reduce
+  // combines them, so the chosen split factor is numerically VISIBLE in the
+  // result. The factor above is derived from the threadgroup count, which
+  // scales with N -- so fusing two N=512 matmuls into one N=1024 matmul
+  // silently halves split_k, changes the BF16 partial boundaries, and (when
+  // the fused value lands at 1) drops out of the split-K family entirely into
+  // plain qmm()/qmm_nax(). Either change flips near-tie greedy argmaxes
+  // against the M5 goldens, which embed the TWO-DISPATCH baseline.
+  //
+  // The Laguna shared expert's prefill gate/up is exactly that case. Stock it
+  // issues two NVFP4 QMMs of (M=L, N=512, K=2048); the fused `[gate; up]` bank
+  // in `LagunaRuntimeMLP.callAsFunction` issues one (M=L, N=1024, K=2048). At
+  // L=512 the two halves get 512/(16*16) = 2, the fused call would get
+  // 512/(32*16) = 1 (i.e. no split-K at all).
+  //
+  // WHAT: for exactly that shape key, recompute the split factor as if the
+  // dispatch were still one of the two N=512 halves. `qmm_t_splitk` gives each
+  // output element its own K-loop and N only selects grid columns, so with the
+  // same split factor -- hence the same K-partition boundaries, the same BF16
+  // partial rounding, and the same reduce shape/order per output column -- the
+  // fused N=1024 dispatch is bit-exact, element for element, against the two
+  // separate N=512 dispatches it replaces.
+  //
+  // The key is L-GENERIC and INPUT-INDEPENDENT: it names only static shape
+  // constants of the Laguna shared expert (nvfp4, group 16, 4-bit, N=1024,
+  // K=2048), never M, never any tensor content. Every prompt length gets the
+  // same parity treatment. Nothing else in Laguna dispatches this tuple
+  // through QuantizedMatmul -- the unfused gate/up halves are N=512, the down
+  // projection is N=2048/K=512, and every routed expert goes through GatherQMM
+  // instead -- so no other matmul in the model can observe this branch.
+  //
+  // Applied as max(default, pinned) so it can only ever RAISE the split factor
+  // (more parallelism, never less). For this shape the pinned value is
+  // provably >= the default anyway -- both are floor(512 / (n_tiles*m_tiles))
+  // under the same clamp chain, and halving n_tiles cannot decrease a floored
+  // quotient -- but the max() makes that a property of the code, not a proof
+  // obligation on the reader.
+  if (mode == "nvfp4" && group_size == 16 && bits == 4 && N == 1024 &&
+      K == 2048) {
+    // N the equivalent unfused dispatch would have had: one [gate; up] half.
+    const int unfused_n = 1024 / 2;
+    split_k = std::max(
+        split_k, qmm_splitk_split_factor(M, unfused_n, K, group_size));
+  }
+
   if (split_k <= 1) {
     return qmm(
         x, w, scales, biases, out, true, group_size, bits, M, N, K, d, s, mode);
