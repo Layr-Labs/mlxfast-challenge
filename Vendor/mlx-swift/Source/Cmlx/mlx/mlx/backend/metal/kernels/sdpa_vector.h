@@ -159,13 +159,18 @@ template <typename T, int D, int V = D>
   U factor = fast::exp(max_score - new_max);
   sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
 
-  // Now we need to aggregate all the outputs
+  // Now we need to aggregate all the outputs. The trailing barrier only
+  // protects the exchange plane's reuse by the NEXT iteration, so the last
+  // iteration's trailing barrier guards nothing and is skipped; every
+  // exchanged value, slot, and reduction is unchanged.
   for (int i = 0; i < v_per_thread; i++) {
     outputs[simd_lid * BD + simd_gid] = o[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
     o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (i + 1 < v_per_thread) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
   }
 
   // And write the output
@@ -376,13 +381,19 @@ template <typename T, int D>
     partials += BN * D;
   }
 
-  // Use shared memory to transpose and reduce the final block
+  // Use shared memory to transpose and reduce the final block. As in
+  // sdpa_vector above, the trailing barrier only protects the exchange
+  // plane's reuse by the NEXT iteration, so the last iteration's trailing
+  // barrier guards nothing and is skipped; no value, order, or write set
+  // changes.
   for (int i = 0; i < elem_per_thread; i++) {
     outputs[simd_lid * BD + simd_gid] = o[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
     o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (i + 1 < elem_per_thread) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
   }
 
   // And write the output
