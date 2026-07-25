@@ -219,6 +219,12 @@ let lagunaFusedGatedOutputProjectionEnabled =
 let lagunaFusedQKVProjectionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV_PROJECTION"] != "0"
 
+/// Decode-only bulk prefetch of the following layer's K/V projection weights.
+/// The token it emits is a dependency input to that layer's fused QKV kernel;
+/// set `DARKBLOOM_KV_PREFETCH=0` to ablate.
+let lagunaKVPrefetchEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_KV_PREFETCH"] != "0"
+
 /// Sliding-layer per-head RMSNorm + plain RoPE fusion (see
 /// `lagunaSlidingQKNormRoPEKernel`).
 ///
@@ -783,6 +789,67 @@ func lagunaSlidingQKNormRoPE(
     return (outputs[0], outputs[1])
 }
 
+/// Reads the following layer's two 4 MiB BF16 K/V projection banks with a
+/// compact, fully coalesced grid. The output bits are deliberately irrelevant:
+/// passing the token as an input to the next fused-QKV dispatch creates the
+/// graph dependency that makes these reads finish before those weights are
+/// consumed. The current layer and this prefetch both depend on the same
+/// incoming hidden row, so MLX may overlap them without changing model data.
+private let lagunaKVPrefetchKernel = MLXFast.metalKernel(
+    name: "laguna_decode_kv_weight_prefetch_bf16_1024x2048_v1",
+    inputNames: ["dependency", "key_weight", "value_weight"],
+    outputNames: ["prefetch_token"],
+    source: """
+        constexpr uint projection_elements = 1024 * 2048;
+        constexpr uint grid_threads = 10240;
+
+        uint gid = thread_position_in_grid.x;
+        uint checksum = 0x9e3779b9u ^ gid;
+        const device ushort* key_bits =
+            (const device ushort*)(key_weight);
+        const device ushort* value_bits =
+            (const device ushort*)(value_weight);
+
+        for (uint i = gid; i < projection_elements; i += grid_threads) {
+            uint packed =
+                uint(key_bits[i]) | (uint(value_bits[i]) << 16);
+            checksum = (checksum << 5) | (checksum >> 27);
+            checksum ^= packed;
+        }
+        prefetch_token[gid] = checksum;
+        """,
+    ensureRowContiguous: true
+)
+
+private func lagunaPrefetchKVWeights(
+    dependency: MLXArray,
+    keyWeight: MLXArray,
+    valueWeight: MLXArray
+) -> MLXArray? {
+    guard lagunaKVPrefetchEnabled,
+        dependency.dtype == .bfloat16,
+        dependency.shape == [1, 1, LagunaConstants.hiddenSize],
+        keyWeight.dtype == .bfloat16,
+        valueWeight.dtype == .bfloat16,
+        keyWeight.shape == [
+            LagunaConstants.numKeyValueHeads * LagunaConstants.headDim,
+            LagunaConstants.hiddenSize,
+        ],
+        valueWeight.shape == keyWeight.shape
+    else {
+        return nil
+    }
+
+    let gridThreads = 10_240
+    return lagunaKVPrefetchKernel(
+        [dependency, keyWeight, valueWeight],
+        grid: (gridThreads, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[gridThreads]],
+        outputDTypes: [.uint32]
+    )[0]
+}
+
 /// Decode-only fusion of the three attention input projections into one
 /// dispatch. Q, K and V all read the same normalized row and are mutually
 /// independent, so MLX already issues them into one barrier group; what this
@@ -1013,7 +1080,7 @@ private let lagunaFusedQKVProjectionKernels: [Int: MLXFast.MLXFastKernel] = {
             name: "laguna_fused_norm_qkv_projection_bf16_h\(heads)_v3",
             inputNames: [
                 "residual", "norm_weight", "query_weight", "key_weight",
-                "value_weight", "gate_weight",
+                "value_weight", "gate_weight", "prefetch_token",
             ],
             outputNames: ["queries", "keys", "values", "gate_values"],
             source: lagunaFusedQKVProjectionSource(heads: heads),
@@ -1030,6 +1097,7 @@ func lagunaFusedNormQKVProjection(
     keyWeight: MLXArray,
     valueWeight: MLXArray,
     gateWeight: MLXArray,
+    prefetchToken: MLXArray,
     heads: Int
 ) -> (
     queries: MLXArray, keys: MLXArray, values: MLXArray, gateValues: MLXArray
@@ -1047,6 +1115,7 @@ func lagunaFusedNormQKVProjection(
     precondition(valueWeight.shape == [kvRows, hidden])
     precondition(gateWeight.dtype == .bfloat16)
     precondition(gateWeight.shape == [heads, hidden])
+    precondition(prefetchToken.dtype == .uint32)
 
     // Q/K/V tiles at 64 rows each, then 8 more tiles carrying the 64 gate
     // rows as two eight-simdgroup split-K groups apiece.
@@ -1054,7 +1123,10 @@ func lagunaFusedNormQKVProjection(
     let gateTiles = heads / 8
     lagunaTrace("norm+qkv+gate projection h\(heads)")
     let outputs = kernel(
-        [residual, normWeight, queryWeight, keyWeight, valueWeight, gateWeight],
+        [
+            residual, normWeight, queryWeight, keyWeight, valueWeight,
+            gateWeight, prefetchToken,
+        ],
         grid: ((projectionTiles + gateTiles) * 512, 1, 1),
         threadGroup: (512, 1, 1),
         outputShapes: [
@@ -1327,7 +1399,8 @@ final class LagunaRuntimeAttention: Module {
         inputNorm: RMSNorm,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
-        qkRoPEAngles: MLXArray? = nil
+        qkRoPEAngles: MLXArray? = nil,
+        prefetchToken: MLXArray? = nil
     ) -> MLXArray {
         let (B, L) = (input.dim(0), input.dim(1))
 
@@ -1366,6 +1439,7 @@ final class LagunaRuntimeAttention: Module {
                 keyWeight: wk.weight,
                 valueWeight: wv.weight,
                 gateWeight: gateProjection.weight,
+                prefetchToken: prefetchToken ?? MLXArray([UInt32(0)]),
                 heads: nHeads
             )
         }
@@ -3991,14 +4065,16 @@ final class LagunaRuntimeDecoderLayer: Module {
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
-        qkRoPEAngles: MLXArray? = nil
+        qkRoPEAngles: MLXArray? = nil,
+        prefetchToken: MLXArray? = nil
     ) -> MLXArray {
         let r = selfAttn(
             x,
             inputNorm: inputLayerNorm,
             mask: mask,
             cache: cache,
-            qkRoPEAngles: qkRoPEAngles
+            qkRoPEAngles: qkRoPEAngles,
+            prefetchToken: prefetchToken
         )
         let h: MLXArray
         let normalized: MLXArray
@@ -4372,7 +4448,23 @@ final class LagunaRuntimeModelInner: Module {
         // seed row, so the angles are the exact floats that layer's kernel
         // would have computed rather than a re-derivation.
 
+        let useKVPrefetch =
+            lagunaKVPrefetchEnabled && h.dim(0) == 1 && h.dim(1) == 1
+        var pendingKVPrefetch: MLXArray?
+
         for (i, layer) in layers.enumerated() {
+            let currentKVPrefetch = pendingKVPrefetch
+            if useKVPrefetch, i + 1 < layers.count {
+                let nextAttention = layers[i + 1].selfAttn
+                pendingKVPrefetch = lagunaPrefetchKVWeights(
+                    dependency: h,
+                    keyWeight: nextAttention.wk.weight,
+                    valueWeight: nextAttention.wv.weight
+                )
+            } else {
+                pendingKVPrefetch = nil
+            }
+
             let isFull = layerTypes[i] == .full
             let mask = isFull ? fullMask : slidingMask
             let qkRoPEAngles = isFull ? fullRoPEAngles : slidingRoPEAngles
@@ -4384,7 +4476,8 @@ final class LagunaRuntimeModelInner: Module {
                         h,
                         mask: mask,
                         cache: cache?[i],
-                        qkRoPEAngles: qkRoPEAngles
+                        qkRoPEAngles: qkRoPEAngles,
+                        prefetchToken: currentKVPrefetch
                     )
                 }
             } else {
@@ -4392,7 +4485,8 @@ final class LagunaRuntimeModelInner: Module {
                     h,
                     mask: mask,
                     cache: cache?[i],
-                    qkRoPEAngles: qkRoPEAngles
+                    qkRoPEAngles: qkRoPEAngles,
+                    prefetchToken: currentKVPrefetch
                 )
             }
         }

@@ -163,10 +163,10 @@ constant bool align_K [[function_constant(202)]];
 // is byte-for-byte the upstream algorithm.
 constant bool gather_run_skip [[function_constant(203)]];
 
-// DARKBLOOM staging levers for fp_gather_qmm_rhs_nax. All default OFF: an
-// undefined bool function constant reads as false, exactly as the kernel
-// behaves today. Each is resolved once per process on the host side, so no
-// tunable magnitude ever enters the pipeline specialization key.
+// DARKBLOOM staging levers for fp_gather_qmm_rhs_nax. The host always supplies
+// every function constant and ships all four ON. Each is fixed once per
+// process, so no tunable magnitude ever enters the pipeline specialization
+// key.
 constant bool stage_widest [[function_constant(204)]];
 constant bool stage_wideld [[function_constant(205)]];
 constant bool stage_runbar [[function_constant(206)]];

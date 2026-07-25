@@ -1196,7 +1196,8 @@ int darkbloom_gather_run_skip_pct() {
 }
 
 // DARKBLOOM_STAGE_*: attack the per-run staging cost in
-// fp_gather_qmm_rhs_nax. Independent, each default OFF, each "1" to enable.
+// fp_gather_qmm_rhs_nax. All four exact work-width/barrier levers ship ON;
+// set any one to "0" for its ablation.
 //
 // The duplication probe puts the routed gather-QMMs at ~54% of prefill, while
 // RUNSKIP removing ~40% of their MMA work moved prefill only 5.88%. The
@@ -1229,23 +1230,28 @@ bool darkbloom_stage_flag(const char* name) {
   return v == "1";
 }
 
+bool darkbloom_stage_enabled(const char* name) {
+  auto v = env::get_var(name, "");
+  return v != "0";
+}
+
 bool darkbloom_stage_widest() {
-  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_WIDEST");
+  static const bool v = darkbloom_stage_enabled("DARKBLOOM_STAGE_WIDEST");
   return v;
 }
 
 bool darkbloom_stage_wideld() {
-  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_WIDELD");
+  static const bool v = darkbloom_stage_enabled("DARKBLOOM_STAGE_WIDELD");
   return v;
 }
 
 bool darkbloom_stage_runbar() {
-  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_RUNBAR");
+  static const bool v = darkbloom_stage_enabled("DARKBLOOM_STAGE_RUNBAR");
   return v;
 }
 
 bool darkbloom_stage_novol() {
-  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_NOVOL");
+  static const bool v = darkbloom_stage_enabled("DARKBLOOM_STAGE_NOVOL");
   return v;
 }
 
