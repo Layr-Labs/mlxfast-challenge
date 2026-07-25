@@ -1675,6 +1675,42 @@ if [[ ! -s "${MLX_METALLIB}" ]]; then
   exit 1
 fi
 
+# Existence is not freshness for mlx.metallib either. The metallib is a
+# CMake/Metal artifact entirely outside SwiftPM's build graph, so the
+# automatic `swift build` below can never refresh it: after an edit to an
+# AOT-served kernel source (RoPE, RMSNorm, the SDPA vector kernel,
+# arg_reduce) an existence-only gate benchmarks the stale library, and in
+# local modes the trusted CLI's fingerprint verification deliberately
+# downgrades to a single mid-run stderr warning that is easy to scroll past.
+# Rebuild whenever anything under the two fingerprinted vendored subtrees
+# (the exact mlx.metallib.fingerprint input set -- deliberately an
+# over-approximation, matching the builder) is newer than the published
+# metallib. Official runs are untouched: the trusted workflow owns that
+# build, and the fingerprint check fails closed there instead of warning.
+metallib_rebuild_required() {
+  # An explicit MLXFAST_MLX_METALLIB override means the caller owns that
+  # artifact's lifecycle (test fixtures, operator layouts): never rebuild
+  # over it. The trusted CLI's fingerprint verification still warns when an
+  # overridden metallib goes stale.
+  if [[ -n "${MLXFAST_MLX_METALLIB:-}" ]]; then
+    return 1
+  fi
+  local newer
+  newer="$(find \
+    Vendor/mlx-swift/Source/Cmlx/mlx \
+    Vendor/mlx-swift/Source/Cmlx/mlx-generated \
+    -type f -newer "${MLX_METALLIB}" -print -quit 2>/dev/null || true)"
+  [[ -n "${newer}" ]]
+}
+
+if [[ "${OFFICIAL}" != "1" ]] && metallib_rebuild_required; then
+  echo "benchmark.sh: mlx.metallib is stale (vendored kernel sources changed after it was built); rebuilding with tools/build-mlx-metallib.sh"
+  if ! tools/build-mlx-metallib.sh; then
+    echo "benchmark.sh: mlx.metallib rebuild failed; fix the kernel edit (or rerun ./setup.sh) and retry" >&2
+    exit 1
+  fi
+fi
+
 # Existence is not freshness. The scored binary is
 # .build-worker/release/mlxfast-runtime-worker, and an existence-only gate
 # timed whatever setup.sh built before the participant's edit: a real decode

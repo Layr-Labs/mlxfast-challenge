@@ -250,6 +250,50 @@ func benchmarkRebuildsWhenParticipantSourcesAreNewerThanTheBuiltWorker() throws 
     #expect(body.contains("-ot"))
 }
 
+/// mlx.metallib is a CMake/Metal artifact outside SwiftPM's build graph, so
+/// the swift-build freshness gate can never refresh it; without its own gate
+/// an AOT kernel edit (RoPE, RMSNorm, SDPA vector, arg_reduce) is silently
+/// benchmarked against the stale library in local modes, where the trusted
+/// CLI's fingerprint verification only prints one stderr warning line.
+@Test
+func benchmarkRebuildsTheMetallibWhenVendoredKernelSourcesAreNewer() throws {
+    let benchmark = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    let gate = try #require(
+        benchmark.range(of: "metallib_rebuild_required() {")
+    )
+    let gateEnd = try #require(
+        benchmark.range(of: "\n}", range: gate.upperBound..<benchmark.endIndex)
+    )
+    let body = String(benchmark[gate.upperBound..<gateEnd.lowerBound])
+
+    // Never rebuilds over an explicit MLXFAST_MLX_METALLIB override -- the
+    // caller (test fixtures, operator layouts) owns that artifact's
+    // lifecycle, and the fixture-driven benchmark.sh tests rely on it.
+    #expect(body.contains("-n \"${MLXFAST_MLX_METALLIB:-}\""))
+    // Rebuilds when anything under the two fingerprinted vendored subtrees
+    // -- the exact input set of mlx.metallib.fingerprint -- is newer than
+    // the published metallib.
+    #expect(body.contains("-newer \"${MLX_METALLIB}\""))
+    #expect(body.contains("Vendor/mlx-swift/Source/Cmlx/mlx \\"))
+    #expect(body.contains("Vendor/mlx-swift/Source/Cmlx/mlx-generated \\"))
+
+    // The gate triggers the real builder (which republishes the fingerprint
+    // sidecar), fails the run when that rebuild fails, and never runs on the
+    // official path, where the fingerprint check fails closed instead.
+    let trigger = try #require(
+        benchmark.range(of: "&& metallib_rebuild_required; then")
+    )
+    let triggerLineStart = benchmark[..<trigger.lowerBound].lastIndex(of: "\n")
+        ?? benchmark.startIndex
+    let triggerBlockEnd = try #require(
+        benchmark.range(of: "\nfi\n", range: trigger.upperBound..<benchmark.endIndex)
+    )
+    let triggerBlock = String(benchmark[triggerLineStart..<triggerBlockEnd.upperBound])
+    #expect(triggerBlock.contains("[[ \"${OFFICIAL}\" != \"1\" ]]"))
+    #expect(triggerBlock.contains("tools/build-mlx-metallib.sh"))
+    #expect(triggerBlock.contains("exit 1"))
+}
+
 @Test
 func benchmarkRejectsPartialSetupBeforeInvokingExistingBinary() throws {
     let root = try temporaryDirectory()
