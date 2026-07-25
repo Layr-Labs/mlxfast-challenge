@@ -212,7 +212,7 @@ func benchmarkFailsFastWhenSetupArtifactsAreMissing() throws {
     let automaticBuild = try #require(
         benchmark.range(
             of:
-                "benchmark.sh: trusted CLI or participant runtime worker missing; building"
+                "benchmark.sh: trusted CLI or participant runtime worker missing or stale; building"
         )
     )
     #expect(prerequisite.lowerBound < automaticBuild.lowerBound)
@@ -220,6 +220,34 @@ func benchmarkFailsFastWhenSetupArtifactsAreMissing() throws {
     let guardBody = String(benchmark[prerequisite.lowerBound..<automaticBuild.lowerBound])
     #expect(guardBody.contains("MLXFAST_CLI_COMMAND"))
     #expect(guardBody.contains("exit 1"))
+}
+
+/// The scored binary is the .build-worker worker, and an existence-only build
+/// gate timed a worker built before the participant's edit -- a silently stale
+/// measurement with no warning anywhere in the output. The gate must also
+/// compare mtimes against the build inputs that produce that worker.
+@Test
+func benchmarkRebuildsWhenParticipantSourcesAreNewerThanTheBuiltWorker() throws {
+    let benchmark = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    let gate = try #require(
+        benchmark.range(of: "swift_build_required() {")
+    )
+    let gateEnd = try #require(
+        benchmark.range(of: "\n}", range: gate.upperBound..<benchmark.endIndex)
+    )
+    let body = String(benchmark[gate.upperBound..<gateEnd.lowerBound])
+
+    // Still builds when either product is absent.
+    #expect(body.contains("[[ ! -x \"${SWIFT_BIN}\" ]]"))
+    #expect(body.contains("! -x \"${RUNTIME_WORKER_BIN}\""))
+    // ...and when any build input is newer than the product we would run.
+    #expect(body.contains("-newer"))
+    #expect(body.contains("Sources"))
+    #expect(body.contains("Vendor"))
+    #expect(body.contains("Package.resolved"))
+    // The older of the two products is the comparison reference, so a stale
+    // worker is caught even when the trusted CLI was rebuilt more recently.
+    #expect(body.contains("-ot"))
 }
 
 @Test
@@ -3156,6 +3184,57 @@ func overlayScriptRejectsDangerousArtifactsAfterCopy() throws {
     #expect(overlay.contains("overlaid editable paths must contain only regular files and directories"))
     #expect(overlay.contains("-links +1"))
     #expect(overlay.contains("setuid or setgid"))
+}
+
+/// The overlay takes the submission's copy of EVERY editablePath, including
+/// files the participant never touched -- so an operator change to an editable
+/// file made after the candidate branched is silently replaced by pre-change
+/// content (and reverted on main at promotion). enforce-modifiable-surface.sh
+/// cannot see it: its content rule only covers NON-editable paths. Surface it.
+@Test
+func overlayScriptReportsEditableFilesTrustedMainChangedAfterTheSubmissionBranched() throws {
+    let overlay = try String(
+        contentsOfFile: ".github/scripts/overlay-editable-paths.sh",
+        encoding: .utf8
+    )
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/benchmark.yml",
+        encoding: .utf8
+    )
+
+    #expect(overlay.contains("report_stale_editable_overlays"))
+    #expect(overlay.contains("merge-base HEAD \"${TRUSTED_MAIN_SHA}\""))
+    // Only files the submission left untouched since the merge base count.
+    #expect(overlay.contains("diff --quiet \"${merge_base}\" HEAD -- \"${path}\""))
+    #expect(overlay.contains("path_is_editable"))
+    // Untrusted worktree: reuse the neutralized git wrapper when present.
+    #expect(overlay.contains("hardened-git.sh"))
+    // Report-only: rejecting here would fail a submission for something the
+    // participant did not do, so the check's own body emits warnings and never
+    // exits (validate_overlay_tree's ::error:: lines below are a different,
+    // deliberately fail-closed check).
+    let checkStart = try #require(
+        overlay.range(of: "report_stale_editable_overlays() {")
+    )
+    let checkEnd = try #require(
+        overlay.range(of: "\n}", range: checkStart.upperBound..<overlay.endIndex)
+    )
+    let checkBody = String(overlay[checkStart.upperBound..<checkEnd.lowerBound])
+    #expect(checkBody.contains("::warning file=${path}::"))
+    #expect(!checkBody.contains("::error"))
+    #expect(!checkBody.contains("exit 1"))
+    // The ranked pipeline has to pass the tip in for the check to run at all.
+    let overlayStep = try #require(
+        workflow.range(of: "- name: Overlay submitted editable paths")
+    )
+    let overlayRun = try #require(
+        workflow.range(
+            of: "run: .github/scripts/overlay-editable-paths.sh",
+            range: overlayStep.upperBound..<workflow.endIndex
+        )
+    )
+    let stepBody = String(workflow[overlayStep.upperBound..<overlayRun.lowerBound])
+    #expect(stepBody.contains("TRUSTED_MAIN_SHA:"))
 }
 
 @Test

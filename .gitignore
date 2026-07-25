@@ -24,6 +24,17 @@ m5_artifacts/
 # Benchmark contract outputs
 score.json
 score.json.tmp
+# Every local run also writes a checksum sidecar and an integrity record, and
+# --local-iterate writes its own score/integrity names (benchmark.sh:112,:190).
+# Leaving them untracked-but-not-ignored made the tree permanently dirty, so a
+# `git add -A` swept repo-root artifacts into a submission diff -- which
+# enforce-modifiable-surface.sh then rejects as outside editablePaths.
+score.json.sha256
+score.local-*.json
+score.local-*.json.sha256
+score*.baseline.json
+benchmark-integrity.json
+benchmark-integrity.local-*.json
 correctness_golden.json
 correctness_golden*.json
 local_correctness_golden.json

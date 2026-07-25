@@ -1886,6 +1886,55 @@ func localIterateScorePublishesCLIUsableEstimatedScore() throws {
     #expect(decoded.score == estimated)
 }
 
+/// The MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT override lets a local run publish its
+/// timing estimate after a teacher-forced mismatch (the documented non-M5
+/// near-tie divergence). The payload must stay CLI-consumable AND
+/// self-describing: passed/score keep the run usable, while
+/// passed_correctness, the diverging tokens, and metrics.error record exactly
+/// what was not verified. Silently reporting passed_correctness=true here
+/// would turn the escape hatch into a way to hide a real regression.
+@Test
+func localIterateScoreUnderGoldenDriftStaysUsableButRecordsTheDivergence() throws {
+    let payload = LagunaRuntime.localIterateScore(
+        peakRamGB: 24.5,
+        bandwidthGBPerToken: 0,
+        decodeSecondsPerToken: MLXFastConstants.officialBaselineDecodeSecondsPerToken,
+        prefillSecondsPerToken: MLXFastConstants.officialBaselinePrefillSecondsPerToken,
+        wallSeconds: 10,
+        validationSeconds: 1,
+        correctnessSeconds: 5,
+        timedSeconds: 5,
+        correctness: LagunaRuntime.localIterateCorrectnessReport(
+            passed: false,
+            checkedSteps: 7,
+            caseCount: 1,
+            firstFailingStep: 6,
+            expectedToken: 1234,
+            actualToken: 4321,
+            goldenHash: "hash",
+            expertStats: .zero,
+            error: "local-iterate teacher-forced token mismatch",
+            modeName: "local-iterate"
+        ),
+        expertStats: .zero,
+        bandwidthSource: "ram_resident_model",
+        weightsDigest: nil,
+        runtime: "swift-local-iterate"
+    )
+
+    // Usable: the Yukon CLI rejects score:null, so the estimate must survive.
+    let estimated = try #require(payload.score)
+    #expect(estimated.isFinite)
+    #expect(payload.passed)
+    // Honest: the divergence is recorded, not laundered.
+    #expect(payload.metrics.passedCorrectness == false)
+    #expect(payload.metrics.firstFailingStep == 6)
+    #expect(payload.metrics.expectedToken == 1234)
+    #expect(payload.metrics.actualToken == 4321)
+    #expect(payload.metrics.error.contains(LagunaRuntime.localGoldenDriftEnvironmentName))
+    #expect(payload.metrics.error.contains("NOT verified"))
+}
+
 @Test
 func localIterateScoreFailsForUnusableTimings() {
     // Zero/invalid timings make the estimate non-finite. The payload must be a

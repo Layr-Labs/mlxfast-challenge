@@ -772,6 +772,32 @@ struct BenchmarkSafetyTests {
         #expect(result.artifact.contains("\"passed_decode_speedup_floor\": false"))
     }
 
+    /// The acceptance band is evaluated before correctness runs, so the band
+    /// path writes passed_correctness=false with correctness never executed.
+    /// Reporting that to a participant as "correctness_failed" sent them
+    /// hunting a nonexistent numerics bug when the real (and actionable)
+    /// verdict was "your win is too large for one submission -- chunk it".
+    @Test
+    func redactedBenchmarkFailureReportsAcceptanceBandSeparatelyFromCorrectness() throws {
+        let workspace = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        try #"""
+        {"passed":false,"metrics":{"error":"acceptance band failed: decode 0.0111 below -5.0% of reference 0.0124 (< 0.0118): improvement too large for one submission (chunk it) or a suspiciously lucky reading","passed_correctness":false,"passed_decode_speedup_floor":true,"passed_prefill_speedup_floor":true,"partial_result":false,"benchmark_wall_seconds":100.5,"timed_benchmark_seconds":60.1}}
+        """#.write(
+            to: workspace.appendingPathComponent("score.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let result = try runRedactBenchmarkFailureScript(workspace: workspace)
+
+        #expect(result.status == 0)
+        #expect(result.artifact.contains("\"failure_category\": \"acceptance_band_failed\""))
+        #expect(!result.artifact.contains("correctness_failed"))
+        // The raw reason still never leaves the runner.
+        #expect(!result.artifact.contains("chunk it"))
+    }
+
     @Test
     func offlineRunnerRemovesProfilesAndPreservesCommandFailure() throws {
         let root = try makeTemporaryDirectory()

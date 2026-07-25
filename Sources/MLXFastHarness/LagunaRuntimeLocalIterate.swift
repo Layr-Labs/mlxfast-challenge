@@ -151,14 +151,21 @@ extension LagunaRuntime {
                     + "wall_seconds=\(formatSeconds(timingWallSeconds))"
             )
             emitLocalIterateSummary(modeName: modeName, timing: timing, progress: progress)
-            guard timing.correctness.passed else {
-                return failed(
-                    timing.correctness.error.isEmpty ? "\(modeName) correctness failed" : timing.correctness.error,
-                    passedCorrectness: false,
-                    decodeSecondsPerToken: timing.decode.secondsPerToken,
-                    prefillSecondsPerToken: timing.prefillSecondsPerToken,
-                    bandwidthGBPerToken: timing.decode.bandwidthGBPerToken,
-                    bandwidthSource: timing.decode.bandwidthSource
+            if !timing.correctness.passed {
+                guard localGoldenDriftAllowed() else {
+                    return failed(
+                        timing.correctness.error.isEmpty ? "\(modeName) correctness failed" : timing.correctness.error,
+                        passedCorrectness: false,
+                        decodeSecondsPerToken: timing.decode.secondsPerToken,
+                        prefillSecondsPerToken: timing.prefillSecondsPerToken,
+                        bandwidthGBPerToken: timing.decode.bandwidthGBPerToken,
+                        bandwidthSource: timing.decode.bandwidthSource
+                    )
+                }
+                emitLocalGoldenDriftOverrideNotice(
+                    modeName: modeName,
+                    correctness: timing.correctness,
+                    progress: progress
                 )
             }
 
@@ -391,6 +398,106 @@ extension LagunaRuntime {
         progress(
             "\(modeName) summary decode_bandwidth_gb_per_token=\(formatDouble(timing.decode.bandwidthGBPerToken)) "
                 + "peak_ram_gb=\(formatRatio(timing.peakRamGB))"
+        )
+        emitLocalAcceptanceBandNotice(
+            modeName: modeName,
+            decodeSecondsPerToken: timing.decode.secondsPerToken,
+            prefillSecondsPerToken: timing.prefillSecondsPerToken,
+            progress: progress
+        )
+    }
+
+    /// Opt-in escape hatch for the documented non-M5 golden divergence.
+    ///
+    /// The public fixtures are greedy continuations captured on the ranked M5
+    /// box, so a near-tie argmax diverges deterministically on other Apple
+    /// Silicon generations even for a correct build. Without this, one such
+    /// token in 128 ends the local edit loop: the payload carries
+    /// `score: null`, which the Yukon participant CLI rejects outright, so the
+    /// contestant gets no estimate and no baseline delta -- on a machine where
+    /// nothing is actually wrong. With it set, the run publishes its timing
+    /// estimate and stays honest about what was not verified
+    /// (`passed_correctness: false`, the diverging tokens, and an explanatory
+    /// `metrics.error`).
+    ///
+    /// Local-only by construction: this file is never on the ranked path,
+    /// which routes to LagunaRuntime.benchmark and evaluates the hidden
+    /// goldens. The M5 runner remains the fidelity authority.
+    static let localGoldenDriftEnvironmentName = "MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT"
+
+    static func localGoldenDriftAllowed() -> Bool {
+        ProcessInfo.processInfo.environment[localGoldenDriftEnvironmentName] == "1"
+    }
+
+    static func emitLocalGoldenDriftOverrideNotice(
+        modeName: String,
+        correctness: CorrectnessReport,
+        progress: (String) -> Void
+    ) {
+        let step = correctness.firstFailingStep.map(String.init) ?? "unknown"
+        let expected = correctness.expectedToken.map(String.init) ?? "unknown"
+        let actual = correctness.actualToken.map(String.init) ?? "unknown"
+        progress(
+            "\(modeName) WARNING golden drift ACCEPTED via \(localGoldenDriftEnvironmentName)=1: "
+                + "checked_step=\(step) expected_token=\(expected) actual_token=\(actual)"
+        )
+        progress(
+            "\(modeName) WARNING this run's tokens are NOT verified. The estimate below is usable "
+                + "for A/B timing on this machine ONLY if unmodified main diverges identically "
+                + "here -- confirm that first, or you are timing a genuinely broken build. The "
+                + "ranked M5 runner enforces exact tokens and is the fidelity authority."
+        )
+    }
+
+    /// The ranked path applies a two-sided acceptance band on top of the
+    /// speedup floors: a single submission's GAIN is capped at about 5%, and
+    /// larger wins must be chunked across submissions. Local modes publish an
+    /// unbounded estimate, so without this notice the edit loop silently
+    /// rewards exceeding a bound that then fails the ranked run with a category
+    /// the participant cannot act on.
+    ///
+    /// Only the too-fast edge is reported. The slow edge is already covered by
+    /// the published 0.95 floors, and the reference here is the pinned M5
+    /// baseline rather than a same-session paired measurement -- so on any
+    /// machine slower than the ranked box a two-sided check would fire on
+    /// literally every run and train participants to ignore it.
+    static func emitLocalAcceptanceBandNotice(
+        modeName: String,
+        decodeSecondsPerToken: Double,
+        prefillSecondsPerToken: Double,
+        progress: (String) -> Void
+    ) {
+        let decodeFastEdge = MLXFastConstants.officialBaselineDecodeSecondsPerToken
+            * (1.0 - MLXFastConstants.decodeBandDownTolerance)
+        let prefillFastEdge = MLXFastConstants.officialBaselinePrefillSecondsPerToken
+            * (1.0 - MLXFastConstants.prefillBandDownTolerance)
+        var axes: [String] = []
+        if decodeSecondsPerToken.isFinite, decodeSecondsPerToken > 0,
+           decodeSecondsPerToken < decodeFastEdge
+        {
+            axes.append("decode")
+        }
+        if prefillSecondsPerToken.isFinite, prefillSecondsPerToken > 0,
+           prefillSecondsPerToken < prefillFastEdge
+        {
+            axes.append("prefill")
+        }
+        guard !axes.isEmpty else {
+            return
+        }
+        progress(
+            "\(modeName) WARNING \(axes.joined(separator: "+")) is more than "
+                + "\(Int((MLXFastConstants.decodeBandDownTolerance * 100).rounded()))% faster than "
+                + "the pinned baseline, which is OUTSIDE the ranked acceptance band"
+        )
+        progress(
+            "\(modeName) WARNING the ranked run requires decode_speedup in [0.980, 1.053] and "
+                + "prefill_speedup in [0.952, 1.053] on top of the 0.95 floors, so a gain this "
+                + "large must be CHUNKED across submissions or the ranked run fails with "
+                + "failure_category=acceptance_band_failed. Local modes never enforce it, and this "
+                + "estimate uses the pinned baseline constants rather than the M5 paired baseline, "
+                + "so on a fast local box it can fire spuriously. See "
+                + "docs/benchmark-window-freeze.md."
         )
     }
 
@@ -967,7 +1074,10 @@ extension LagunaRuntime {
                 correctnessSeconds: correctnessSeconds,
                 timedBenchmarkSeconds: timedSeconds,
                 processResidentMemoryGB: currentResidentMemoryGB(),
-                passedCorrectness: true,
+                // Normally true (the caller returns early on a mismatch); false
+                // only under MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT, where the payload
+                // must stay self-describing about the tokens that diverged.
+                passedCorrectness: correctness.passed,
                 numLayers: MLXFastConstants.numHiddenLayers,
                 checkedSteps: correctness.checkedSteps,
                 caseCount: correctness.caseCount,
@@ -980,13 +1090,16 @@ extension LagunaRuntime {
                 expertHitRate: expertStats.hitRate,
                 firstFailingLayer: nil,
                 firstFailingCase: nil,
-                firstFailingStep: nil,
-                expectedToken: nil,
-                actualToken: nil,
+                firstFailingStep: correctness.firstFailingStep,
+                expectedToken: correctness.expectedToken,
+                actualToken: correctness.actualToken,
                 maxAbsDiff: 0,
                 goldenHash: correctness.goldenHash,
                 bandwidthSource: bandwidthSource,
-                error: "",
+                error: correctness.passed
+                    ? ""
+                    : "golden drift accepted by \(localGoldenDriftEnvironmentName)=1: "
+                        + "timings are usable, tokens are NOT verified",
                 commit: commitIdentifier(),
                 timestamp: ISO8601DateFormatter().string(from: Date()),
                 harnessHash: harnessHash(),

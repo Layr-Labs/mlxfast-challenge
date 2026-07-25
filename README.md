@@ -69,7 +69,11 @@ for the full local setup knobs.
 
 > **Correctness fixtures are M5-generated.** The checked-in goldens can hit
 > near-tie argmax differences on other Apple Silicon generations; the ranked
-> M5 result is authoritative.
+> M5 result is authoritative. If unmodified `main` diverges at the same token
+> position on your machine, rerun the local mode with
+> `MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT=1` to keep the timing estimate — the
+> score then records `passed_correctness: false` and the diverging tokens,
+> so the divergence is never hidden.
 
 ### Ranked workflow
 
@@ -169,9 +173,13 @@ the runtime-effective source, so edit it (and keep the readable
 `tools/build-mlx-metallib.sh` (run by `./setup.sh`) compiles from the
 vendored `.metal` sources — rerun it after editing those. `_nax` names are
 the M5-generation kernel variants the ranked runner selects. After a kernel
-edit: `swift build -c release` (plus the metallib rebuild for AOT edits),
-then `./benchmark.sh --local-iterate`. Prioritize kernels reached by the
-timed prefill and decode phases.
+edit: rerun the metallib build for AOT edits, then
+`./benchmark.sh --local-iterate`, which rebuilds both binaries for you
+whenever a build input is newer than them. A bare `swift build -c release`
+is not enough on its own — without `--scratch-path .build-worker` it writes
+`.build/release`, while the scored binary is
+`.build-worker/release/mlxfast-runtime-worker`. Prioritize kernels reached
+by the timed prefill and decode phases.
 
 Participant model and kernel code — `MLXFastModel` plus the vendored forks
 — builds into the sandboxed `mlxfast-runtime-worker` binary. The trusted
@@ -265,6 +273,22 @@ timed window is frozen (512-token prefill prompt; 512-token decode seed with
 decode_speedup >= 0.95
 prefill_speedup >= 0.95
 ```
+
+A two-sided acceptance band applies on top of the floors, and is tighter
+than them in both directions:
+
+```text
+decode_speedup  must land in [0.980, 1.053]
+prefill_speedup must land in [0.952, 1.053]
+```
+
+The upper bound caps a single submission's gain at about 5% — a larger
+measured win is either a lucky reading or too big to trust in one shot, so
+chunk it across submissions (the cap is per submission, not cumulative).
+Local modes never fail on the band: `--local-iterate` and `--local-submit`
+print a warning when their estimate exceeds it but still publish the
+estimate. A ranked run that trips it fails with failure category
+`acceptance_band_failed`; see `docs/benchmark-window-freeze.md`.
 
 Correctness is a hard gate: the full 64-step teacher-forced base case, the
 hidden anchor/free-run/behavior/GPQA gates, GPQA TTFT, the semantic GPQA
