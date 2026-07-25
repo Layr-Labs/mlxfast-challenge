@@ -235,6 +235,133 @@ let lagunaRoPEAngleAtlasEnabled =
 
 private let lagunaRoPEAngleAtlasLength = 4096
 
+/// Shuffle-lens ablations for the shared 512-thread RMSNorm prologue.
+///
+/// Three decode kernels open with the identical reduction: 512 threads / 16
+/// simdgroups square one 2048-wide row, `simd_sum` inside each simdgroup, the
+/// sixteen partials meet in `local_sums`, and one inverse RMS comes back out.
+/// Gathering those sixteen partials genuinely needs threadgroup memory --
+/// `simd_shuffle*` reaches only the 32 lanes of the calling simdgroup, so no
+/// shuffle crosses from simdgroup 5 to simdgroup 0 and that middle barrier
+/// stays. What these two flags remove are the two barriers that are *not* the
+/// gather.
+///
+/// `DARKBLOOM_SHUF_NORM_BCAST` (default ON; set "0" to ablate): `simd_sum`
+/// already returns the total to every lane, so every simdgroup can reduce the
+/// gathered slots and derive `precise::rsqrt` locally instead of having
+/// simdgroup 0 compute it, park it in `local_inv_mean[0]`, and publish it
+/// behind a third barrier. This is the promoted QK-norm barrier removal
+/// (`9e06de6`) applied one level up the same reduction.
+///
+/// Bit-exact by construction: every simdgroup feeds the identical 32 floats
+/// through the identical `simd_sum` tree and the identical
+/// `precise::rsqrt(acc / axis + eps)`, so each derives exactly the bits
+/// simdgroup 0 would have published. No float is reordered, no accumulation
+/// order moves, and the value the normalize loop multiplies by is unchanged.
+///
+/// DEFAULT ON, following the repo convention for shipped fusions (read as
+/// `!= "0"`, like `DARKBLOOM_PREFILL_GATHER_RUNSKIP`). `mlxfast submit`
+/// packages source, not environment, and the ranked runner sets no
+/// `DARKBLOOM_*` variables -- so a default-OFF flag would measure nothing on
+/// the ranked box. Set to `0` for the ablation arm.
+private let lagunaShufNormBroadcastEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SHUF_NORM_BCAST"] != "0"
+
+/// `DARKBLOOM_SHUF_NORM_INIT` (default ON; set "0" to ablate): only 16 of the
+/// 32 `local_sums` slots are ever written; the upper 16 exist solely so lanes
+/// 16-31 contribute a zero to the second `simd_sum`. Selecting the literal
+/// `0.0f` for those lanes supplies that same zero without the zeroing store,
+/// which also retires the barrier that separated the zeroing from the sixteen
+/// partial writes.
+///
+/// Bit-exact by construction: the 32-value vector entering `simd_sum` is
+/// unchanged element for element -- lanes 0-15 still read the same partials
+/// and lanes 16-31 still contribute `+0.0f`.
+///
+/// DEFAULT ON for the same reason as `SHUF_NORM_BCAST` above; set `0` to
+/// ablate.
+private let lagunaShufNormInitEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SHUF_NORM_INIT"] != "0"
+
+/// Distinguishes the emitted kernel variants so a JIT cache keyed by kernel
+/// name can never serve one flag combination's binary to another. Empty only
+/// when both flags are ablated to `0`; the shipped default emits the `bi`
+/// suffix.
+private let lagunaShufNormVariantSuffix =
+    (lagunaShufNormBroadcastEnabled ? "b" : "")
+    + (lagunaShufNormInitEnabled ? "i" : "")
+
+/// The broadcast slot disappears with the barrier that published it.
+private let lagunaNormInvMeanScratch =
+    lagunaShufNormBroadcastEnabled ? "" : "threadgroup float local_inv_mean[1];"
+
+/// Emits the cross-simdgroup half of that prologue, from the sixteen partial
+/// writes through to a `float laguna_inv_mean` the normalize loop consumes.
+/// With both flags off the emitted text is line for line what the three
+/// kernels shipped, plus a register alias for `local_inv_mean[0]`.
+private func lagunaNormReductionTail(
+    lane: String,
+    simdGroup: String,
+    simdGroups: Int,
+    denominator: String,
+    epsilon: String
+) -> String {
+    var lines: [String] = []
+    if !lagunaShufNormInitEnabled {
+        lines += [
+            "if (\(simdGroup) == 0) {",
+            "    local_sums[\(lane)] = 0.0f;",
+            "}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+    }
+    lines += [
+        "if (\(lane) == 0) {",
+        "    local_sums[\(simdGroup)] = acc;",
+        "}",
+        "threadgroup_barrier(mem_flags::mem_threadgroup);",
+    ]
+    // Lanes past the simdgroup count contribute the same `+0.0f` the zeroing
+    // store would have left behind, so the reduced vector is identical.
+    let gathered =
+        lagunaShufNormInitEnabled
+        ? "(\(lane) < \(simdGroups) ? local_sums[\(lane)] : 0.0f)"
+        : "local_sums[\(lane)]"
+    let inverseRMS =
+        "metal::precise::rsqrt(acc / \(denominator) + \(epsilon))"
+    if lagunaShufNormBroadcastEnabled {
+        lines += [
+            "acc = simd_sum(\(gathered));",
+            "float laguna_inv_mean = \(inverseRMS);",
+        ]
+    } else {
+        lines += [
+            "if (\(simdGroup) == 0) {",
+            "    acc = simd_sum(\(gathered));",
+            "    if (\(lane) == 0) {",
+            "        local_inv_mean[0] = \(inverseRMS);",
+            "    }",
+            "}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "float laguna_inv_mean = local_inv_mean[0];",
+        ]
+    }
+    // The first line inherits the enclosing literal's indentation, exactly as
+    // the `\(epilogue)` interpolation in the router kernel does.
+    return lines.joined(separator: "\n        ")
+}
+
+/// The 2048-row prologue shared by both residual+RMSNorm kernels.
+private let lagunaNormReductionTail2048 = lagunaNormReductionTail(
+    lane: "simd_lane", simdGroup: "simd_group", simdGroups: 16,
+    denominator: "2048.0f", epsilon: "1.0e-6f")
+
+/// The fused QKV kernel names the same two builtins `lane` and `simd_group`
+/// and spells its constants differently, but the reduction is the same shape.
+private let lagunaNormReductionTailQKV = lagunaNormReductionTail(
+    lane: "lane", simdGroup: "simd_group", simdGroups: 16,
+    denominator: "float(in_vec_size)", epsilon: "norm_eps")
+
 /// Post-attention residual add + RMSNorm with the MoE router's projection
 /// folded in.
 ///
@@ -251,7 +378,7 @@ private let lagunaRoPEAngleAtlasLength = 4096
 /// one BF16 round. Sixteen simdgroups of four rows cover the 64 rows this
 /// threadgroup owns, and 256 divides evenly by 64. The norm half is untouched.
 private let lagunaResidualRMSNormRouterKernel = MLXFast.metalKernel(
-    name: "laguna_residual_rms_router_bf16_2048_v1",
+    name: "laguna_residual_rms_router_bf16_2048_v1\(lagunaShufNormVariantSuffix)",
     inputNames: ["residual", "branch", "weight", "router_weight"],
     outputNames: ["summed", "normalized", "router_logits"],
     source: """
@@ -268,7 +395,7 @@ private let lagunaResidualRMSNormRouterKernel = MLXFast.metalKernel(
         uint simd_group = simdgroup_index_in_threadgroup;
         uint base = lid * n_reads;
 
-        threadgroup float local_inv_mean[1];
+        \(lagunaNormInvMeanScratch)
         threadgroup float local_sums[simd_size];
         threadgroup bfloat normalized_row[axis_size];
 
@@ -285,29 +412,12 @@ private let lagunaResidualRMSNormRouterKernel = MLXFast.metalKernel(
         }
 
         acc = simd_sum(acc);
-        if (simd_group == 0) {
-            local_sums[simd_lane] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (simd_lane == 0) {
-            local_sums[simd_group] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (simd_group == 0) {
-            acc = simd_sum(local_sums[simd_lane]);
-            if (simd_lane == 0) {
-                local_inv_mean[0] =
-                    metal::precise::rsqrt(acc / 2048.0f + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        \(lagunaNormReductionTail2048)
 
         for (uint i = 0; i < n_reads; ++i) {
             bfloat value =
                 weight[base + i] *
-                bfloat(float(values[i]) * local_inv_mean[0]);
+                bfloat(float(values[i]) * laguna_inv_mean);
             normalized_row[base + i] = value;
             if (tile == 0) {
                 normalized[base + i] = value;
@@ -356,7 +466,7 @@ private let lagunaResidualRMSNormRouterKernel = MLXFast.metalKernel(
 /// Residual add + RMSNorm for the layers whose MLP is not a sparse block
 /// (layer 0) and for any shape the router fusion above declines.
 private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
-    name: "laguna_residual_rms_bf16_2048_v1",
+    name: "laguna_residual_rms_bf16_2048_v1\(lagunaShufNormVariantSuffix)",
     inputNames: ["residual", "branch", "weight"],
     outputNames: ["summed", "normalized"],
     source: """
@@ -370,7 +480,7 @@ private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
         uint simd_group = simdgroup_index_in_threadgroup;
         uint base = row * axis_size + lid * n_reads;
 
-        threadgroup float local_inv_mean[1];
+        \(lagunaNormInvMeanScratch)
         threadgroup float local_sums[simd_size];
 
         thread bfloat values[n_reads];
@@ -384,29 +494,12 @@ private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
         }
 
         acc = simd_sum(acc);
-        if (simd_group == 0) {
-            local_sums[simd_lane] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (simd_lane == 0) {
-            local_sums[simd_group] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (simd_group == 0) {
-            acc = simd_sum(local_sums[simd_lane]);
-            if (simd_lane == 0) {
-                local_inv_mean[0] =
-                    metal::precise::rsqrt(acc / 2048.0f + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        \(lagunaNormReductionTail2048)
 
         for (uint i = 0; i < n_reads; ++i) {
             normalized[base + i] =
                 weight[lid * n_reads + i] *
-                bfloat(float(values[i]) * local_inv_mean[0]);
+                bfloat(float(values[i]) * laguna_inv_mean);
         }
         """,
     ensureRowContiguous: true
@@ -750,7 +843,7 @@ private func lagunaFusedQKVProjectionSource(heads: Int) -> String {
         uint lane = thread_index_in_simdgroup;
 
         // --- input RMSNorm, mirroring rms_single_row at 512 threads ---
-        threadgroup float local_inv_mean[1];
+        \(lagunaNormInvMeanScratch)
         threadgroup float local_sums[32];
         threadgroup bfloat normalized_row[in_vec_size];
 
@@ -762,27 +855,12 @@ private func lagunaFusedQKVProjectionSource(heads: Int) -> String {
             acc += raw[i] * raw[i];
         }
         acc = simd_sum(acc);
-        if (simd_group == 0) {
-            local_sums[lane] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane == 0) {
-            local_sums[simd_group] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (simd_group == 0) {
-            acc = simd_sum(local_sums[lane]);
-            if (lane == 0) {
-                local_inv_mean[0] =
-                    metal::precise::rsqrt(acc / float(in_vec_size) + norm_eps);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        \(lagunaNormReductionTailQKV)
 
         for (uint i = 0; i < values_per_thread; ++i) {
             bfloat value =
                 norm_weight[norm_base + i] *
-                bfloat(raw[i] * local_inv_mean[0]);
+                bfloat(raw[i] * laguna_inv_mean);
             normalized_row[norm_base + i] = value;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -924,7 +1002,7 @@ private let lagunaFusedQKVProjectionKernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_fused_norm_qkv_projection_bf16_h\(heads)_v2",
+            name: "laguna_fused_norm_qkv_projection_bf16_h\(heads)_v2\(lagunaShufNormVariantSuffix)",
             inputNames: [
                 "residual", "norm_weight", "query_weight", "key_weight",
                 "value_weight", "gate_weight",
