@@ -178,6 +178,16 @@ let lagunaFusedRoutedSharedSwiGLUQMVEnabled =
 let lagunaFusedGatedOutputProjectionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATED_OUTPUT"] != "0"
 
+/// Decode-only experiment that folds Laguna's already-activated BF16
+/// per-head gate into the one-pass vector-SDPA output store, then feeds the
+/// rounded gated row to an otherwise stock-order BF16 output GEMV. The path
+/// accepts only the exact direct caches and the one-query/no-array-mask
+/// geometry served by MLX's one-pass `sdpa_vector`; every guard is checked
+/// before the cache is advanced. Set `DARKBLOOM_GATED_VECTOR_SDPA=0` to
+/// restore the existing attention + fused-gated-output path.
+let lagunaGatedVectorSDPAEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_GATED_VECTOR_SDPA"] != "0"
+
 /// Issues Q, K and V as one dispatch over the three stock weights (see
 /// `lagunaFusedQKVProjectionSource`). Unlike `DARKBLOOM_FUSED_QKV` this keeps
 /// no concatenated bank, so prefill is untouched. Set
@@ -1315,6 +1325,406 @@ func lagunaGatedOutputProjection(
     )[0]
 }
 
+/// Laguna's one-query BF16 specialization of MLX's one-pass
+/// `sdpa_vector<T, 128, 128>`. The online-softmax arithmetic and reduction
+/// order below intentionally stay line-for-line with the stock Metal kernel.
+/// Only the final store changes: stock first rounds the FP32 attention
+/// accumulator to BF16; Laguna then multiplies that BF16 value by its
+/// already-activated BF16 per-head gate and rounds once more to BF16.
+///
+/// K/V use the post-update cache views' runtime strides. This is load-bearing
+/// for both the growing full cache and the rotating cache: forcing either view
+/// contiguous would add a copy to the scored decode path.
+private func lagunaGatedVectorSDPASource(heads: Int) -> String {
+    """
+        constexpr int D = 128;
+        constexpr int V = 128;
+        constexpr int BN = 32;
+        constexpr int BD = 32;
+        constexpr int qk_per_thread = D / BD;
+        constexpr int v_per_thread = V / BD;
+        constexpr int query_heads = \(heads);
+        constexpr int key_heads = \(LagunaConstants.numKeyValueHeads);
+        constexpr int gqa_factor = query_heads / key_heads;
+
+        typedef float U;
+
+        uint q_batch_head_idx = threadgroup_position_in_grid.x;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+        uint simd_lid = thread_index_in_simdgroup;
+        uint kv_head_idx = q_batch_head_idx / gqa_factor;
+
+        const long q_head_stride = queries_strides[1];
+        const long q_dim_stride = queries_strides[3];
+        const long k_head_stride = keys_strides[1];
+        const long k_seq_stride = keys_strides[2];
+        const long k_dim_stride = keys_strides[3];
+        const long v_head_stride = values_strides[1];
+        const long v_seq_stride = values_strides[2];
+        const long v_dim_stride = values_strides[3];
+        const long gate_head_stride = gate_values_strides[2];
+        int N = int(sequence_length);
+        int inner_k_stride = BN * int(k_seq_stride);
+        int inner_v_stride = BN * int(v_seq_stride);
+
+        thread U q[qk_per_thread];
+        thread U k[qk_per_thread];
+        thread U o[v_per_thread];
+
+        threadgroup U outputs[BN * BD];
+        threadgroup U max_scores[BN];
+        threadgroup U sum_exp_scores[BN];
+
+        queries +=
+            q_batch_head_idx * q_head_stride +
+            simd_lid * qk_per_thread * q_dim_stride;
+        keys +=
+            kv_head_idx * k_head_stride +
+            simd_gid * k_seq_stride +
+            simd_lid * qk_per_thread * k_dim_stride;
+        values +=
+            kv_head_idx * v_head_stride +
+            simd_gid * v_seq_stride +
+            simd_lid * v_per_thread * v_dim_stride;
+        gated += q_batch_head_idx * V + simd_gid * v_per_thread;
+
+        // Read the query and 0 the output accumulator.
+        for (int i = 0; i < qk_per_thread; i++) {
+            q[i] = static_cast<U>(attention_scale) *
+                queries[i * q_dim_stride];
+        }
+        for (int i = 0; i < v_per_thread; i++) {
+            o[i] = 0;
+        }
+
+        U max_score = Limits<U>::finite_min;
+        U sum_exp_score = 0;
+
+        // For each key.
+        for (int i = simd_gid; i < N; i += BN) {
+            // Read the key.
+            for (int j = 0; j < qk_per_thread; j++) {
+                k[j] = keys[j * k_dim_stride];
+            }
+
+            // Compute the i-th score.
+            U score = 0;
+            for (int j = 0; j < qk_per_thread; j++) {
+                score += q[j] * k[j];
+            }
+            score = simd_sum(score);
+
+            // Update the accumulators.
+            U new_max = max(max_score, score);
+            U factor = fast::exp(max_score - new_max);
+            U exp_score = fast::exp(score - new_max);
+
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+
+            // Update the output accumulator.
+            for (int j = 0; j < v_per_thread; j++) {
+                o[j] =
+                    o[j] * factor +
+                    exp_score * values[j * v_dim_stride];
+            }
+
+            // Move the pointers to the next kv.
+            keys += inner_k_stride;
+            values += inner_v_stride;
+        }
+
+        // Each thread has a partial part of the output so we need to combine
+        // them. First communicate the max and sum_exp.
+        if (simd_lid == 0) {
+            max_scores[simd_gid] = max_score;
+            sum_exp_scores[simd_gid] = sum_exp_score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        max_score = max_scores[simd_lid];
+        U new_max = simd_max(max_score);
+        U factor = fast::exp(max_score - new_max);
+        sum_exp_score =
+            simd_sum(sum_exp_scores[simd_lid] * factor);
+
+        // Aggregate all output lanes in the stock order.
+        for (int i = 0; i < v_per_thread; i++) {
+            outputs[simd_lid * BD + simd_gid] = o[i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            o[i] =
+                simd_sum(
+                    outputs[simd_gid * BD + simd_lid] * factor);
+            o[i] = sum_exp_score == 0
+                ? o[i]
+                : (o[i] / sum_exp_score);
+            // The next iteration overwrites `outputs`; only those iterations
+            // need the rendezvous. After the final component every lane has
+            // completed its read and there are no later threadgroup readers.
+            if (i + 1 < v_per_thread) {
+                threadgroup_barrier(
+                    mem_flags::mem_threadgroup);
+            }
+        }
+
+        // Preserve the two stock graph boundaries exactly:
+        //   FP32 SDPA accumulator -> BF16 attention -> BF16 gate product.
+        if (simd_lid == 0) {
+            const bfloat gate =
+                gate_values[q_batch_head_idx * gate_head_stride];
+            for (int i = 0; i < v_per_thread; i++) {
+                const bfloat attention = bfloat(o[i]);
+                gated[i] =
+                    bfloat(float(attention) * float(gate));
+            }
+        }
+        """
+}
+
+private let lagunaGatedVectorSDPAKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_gated_vector_sdpa_bf16_h\(heads)_d128_v1",
+            inputNames: [
+                "queries", "keys", "values", "gate_values",
+                "sequence_length", "attention_scale",
+            ],
+            outputNames: ["gated"],
+            source: lagunaGatedVectorSDPASource(heads: heads),
+            ensureRowContiguous: false
+        )
+    }
+    return kernels
+}()
+
+/// Stock-order BF16 GEMV for a row whose per-head gate was already applied by
+/// `lagunaGatedVectorSDPAKernels`. This is the existing fused gated-output
+/// projection with only the gate multiply removed; the column walk, FP32
+/// accumulation and simd reduction remain identical to MLX's decode GEMV.
+private func lagunaAlreadyGatedOutputProjectionSource(heads: Int) -> String {
+    """
+        constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
+        constexpr uint rows_per_thread = 4;
+        constexpr uint values_per_thread = 4;
+        constexpr uint block_width = 128;
+        constexpr uint blocks = in_vec_size / block_width;
+        constexpr uint rows_per_group = 16;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        uint out_row =
+            tile * rows_per_group + simd_group * rows_per_thread;
+        thread float result[rows_per_thread] =
+            {0.0f, 0.0f, 0.0f, 0.0f};
+        thread float coefficients[values_per_thread];
+
+        uint column = lane * values_per_thread;
+        for (uint block = 0; block < blocks; ++block) {
+            const device vec<bfloat, 4>* gated =
+                (const device vec<bfloat, 4>*)(
+                    attention_output + column);
+            const vec<bfloat, 4> values = gated[0];
+            for (uint i = 0; i < values_per_thread; ++i) {
+                coefficients[i] = float(values[i]);
+            }
+
+            for (uint row = 0; row < rows_per_thread; ++row) {
+                const device vec<bfloat, 4>* row_values =
+                    (const device vec<bfloat, 4>*)(
+                        weight +
+                        (out_row + row) * in_vec_size +
+                        column);
+                const vec<bfloat, 4> w = row_values[0];
+                for (uint i = 0; i < values_per_thread; ++i) {
+                    result[row] +=
+                        float(w[i]) * coefficients[i];
+                }
+            }
+
+            column += block_width;
+        }
+
+        for (uint row = 0; row < rows_per_thread; ++row) {
+            for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                result[row] +=
+                    metal::simd_shuffle_down(
+                        result[row], delta);
+            }
+        }
+        if (lane == 0) {
+            for (uint row = 0; row < rows_per_thread; ++row) {
+                projected[out_row + row] =
+                    bfloat(result[row]);
+            }
+        }
+        """
+}
+
+private let lagunaAlreadyGatedOutputProjectionKernels:
+    [Int: MLXFast.MLXFastKernel] =
+{
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_already_gated_output_projection_bf16_h\(heads)_v1",
+            inputNames: ["attention_output", "weight"],
+            outputNames: ["projected"],
+            source: lagunaAlreadyGatedOutputProjectionSource(
+                heads: heads),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+@inline(__always)
+private func lagunaGatedVectorSDPAMaskIsSupported(
+    _ mask: MLXFast.ScaledDotProductAttentionMaskMode
+) -> Bool {
+    switch mask {
+    case .none, .causal:
+        return true
+    case .array, .arrays:
+        return false
+    }
+}
+
+/// Prove the exact direct-cache geometry without advancing it. The returned
+/// length is the sequence axis the subsequent one-row update must expose.
+/// Reading shapes and offsets is metadata-only for these exact cache classes.
+private func lagunaGatedVectorSDPAExpectedLength(
+    cache: KVCache, isSliding: Bool
+) -> Int? {
+    guard cache.offset >= 0, cache.offset < Int.max else {
+        return nil
+    }
+    let state = cache.innerState()
+    guard state.count == 2 else { return nil }
+    let stateKeys = state[0]
+    let stateValues = state[1]
+    guard stateKeys.dtype == .bfloat16,
+        stateValues.dtype == .bfloat16,
+        stateKeys.ndim == 4,
+        stateValues.ndim == 4,
+        stateKeys.shape == stateValues.shape,
+        stateKeys.dim(0) == 1,
+        stateKeys.dim(1) == LagunaConstants.numKeyValueHeads,
+        stateKeys.dim(2) > 0,
+        stateKeys.dim(3) == LagunaConstants.headDim
+    else {
+        return nil
+    }
+
+    let expectedLength: Int
+    if isSliding {
+        guard type(of: cache) == RotatingKVCache.self,
+            cache.maxSize == 512,
+            stateKeys.dim(2) >= min(cache.offset, 512)
+        else {
+            return nil
+        }
+        expectedLength = min(cache.offset + 1, 512)
+    } else {
+        guard type(of: cache) == KVCacheSimple.self,
+            cache.maxSize == nil,
+            stateKeys.dim(2) >= cache.offset
+        else {
+            return nil
+        }
+        expectedLength = cache.offset + 1
+    }
+    guard expectedLength > 0, expectedLength < 1024 else {
+        return nil
+    }
+    return expectedLength
+}
+
+/// Complete decode experiment. Every eligibility check, including the
+/// downstream projection, runs before `cache.update`; once that single
+/// mutation occurs this function cannot fall back into a second update.
+private func lagunaGatedVectorSDPAOutputProjection(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray,
+    gateValues: MLXArray,
+    outputWeight: MLXArray,
+    cache: KVCache?,
+    scale: Float,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode,
+    heads: Int,
+    isSliding: Bool
+) -> MLXArray? {
+    let headDim = LagunaConstants.headDim
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    let expectedScale = pow(Float(headDim), -0.5)
+    guard lagunaGatedVectorSDPAEnabled,
+        let cache,
+        let attentionKernel = lagunaGatedVectorSDPAKernels[heads],
+        let projectionKernel =
+            lagunaAlreadyGatedOutputProjectionKernels[heads],
+        lagunaGatedVectorSDPAMaskIsSupported(mask),
+        scale.bitPattern == expectedScale.bitPattern,
+        heads == LagunaConstants.fullAttentionHeads
+            || heads == LagunaConstants.slidingAttentionHeads,
+        heads.isMultiple(of: kvHeads),
+        queries.dtype == .bfloat16,
+        keys.dtype == .bfloat16,
+        values.dtype == .bfloat16,
+        gateValues.dtype == .bfloat16,
+        outputWeight.dtype == .bfloat16,
+        queries.shape == [1, heads, 1, headDim],
+        keys.shape == [1, kvHeads, 1, headDim],
+        values.shape == [1, kvHeads, 1, headDim],
+        gateValues.shape == [1, 1, heads],
+        outputWeight.shape == [
+            LagunaConstants.hiddenSize, heads * headDim,
+        ],
+        let expectedLength =
+            lagunaGatedVectorSDPAExpectedLength(
+                cache: cache, isSliding: isSliding)
+    else {
+        return nil
+    }
+
+    // The complete fast path has been proven. Advance the cache exactly once;
+    // any contradiction after this point is an invariant failure, never a
+    // reason to call the stock update path again.
+    let (cachedKeys, cachedValues) =
+        cache.update(keys: keys, values: values)
+    precondition(
+        cachedKeys.dtype == .bfloat16
+            && cachedValues.dtype == .bfloat16
+            && cachedKeys.shape
+                == [1, kvHeads, expectedLength, headDim]
+            && cachedValues.shape
+                == [1, kvHeads, expectedLength, headDim],
+        "gated vector SDPA cache preflight disagreed with update"
+    )
+
+    lagunaTrace("gated vector sdpa h\(heads)")
+    let gatedAttention = attentionKernel(
+        [
+            queries, cachedKeys, cachedValues, gateValues,
+            Int32(expectedLength), scale,
+        ],
+        grid: (heads * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [[1, heads, 1, headDim]],
+        outputDTypes: [.bfloat16]
+    )[0]
+
+    lagunaTrace("already-gated output projection h\(heads)")
+    return projectionKernel(
+        [gatedAttention, outputWeight],
+        grid: ((LagunaConstants.hiddenSize / 16) * 128, 1, 1),
+        threadGroup: (128, 1, 1),
+        outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 /// Keep the stock shapeless unary gate for prefill. Ranked measurement showed
 /// the larger gate/product graph regressing the complete prefill schedule even
 /// though its isolated steady-state subpath was slightly faster.
@@ -1625,6 +2035,29 @@ final class LagunaRuntimeAttention: Module {
         {
             queries = applyRotaryPosition(rope, to: queries, cache: cache)
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        }
+
+        // The custom attention path is a complete transaction: its helper
+        // proves the exact direct-cache geometry and the downstream output
+        // projection before advancing the cache once. It is only eligible
+        // when the fused producer has already materialized the exact BF16
+        // softplus gate that the stock post-SDPA path would consume.
+        if gatingEnabled, gatePerHead,
+            type(of: wo) == Linear.self, wo.bias == nil,
+            let fusedNormQKV,
+            let projected = lagunaGatedVectorSDPAOutputProjection(
+                queries: queries,
+                keys: keys,
+                values: values,
+                gateValues: fusedNormQKV.gateValues,
+                outputWeight: wo.weight,
+                cache: cache,
+                scale: scale,
+                mask: mask,
+                heads: nHeads,
+                isSliding: isSliding)
+        {
+            return projected
         }
 
         let attended = attentionWithCacheUpdate(
