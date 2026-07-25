@@ -1255,12 +1255,12 @@ bool darkbloom_stage_novol() {
 // pipeline key. Resolved once per process, so exactly one variant is ever
 // compiled and a fresh process picks up a changed environment cleanly.
 //
-//   unset (SHIPPED) -> 5  (BM=64, WM=4, WN=1)  SM=16
-//   "0"             -> 0  (BM=64, WM=2, WN=2)  SM=32  upstream tiling
-//   "1"             -> 1  (BM=128, WM=4)       SM=32  less expert re-staging
-//   "2"             -> 2  (BM=128, WM=2)       SM=64  predicted regression
-//   "3"             -> 3  (BM=128, WM=8)       SM=16  both mechanisms
-//   "4"             -> 4  (BM=64,  WM=4)       SM=16  finer elision, 256 thr/TG
+//   unset (SHIPPED) -> 4  (BM=64,  WM=4, WN=2)  SM=16, 256 thr/TG
+//   "0"             -> 0  (BM=64,  WM=2, WN=2)  SM=32  upstream tiling
+//   "1"             -> 1  (BM=128, WM=4)        SM=32  less expert re-staging
+//   "2"             -> 2  (BM=128, WM=2)        SM=64  measured regression
+//   "3"             -> 3  (BM=128, WM=8)        SM=16  both mechanisms
+//   "5"             -> 5  (BM=64,  WM=4, WN=1)  SM=16, 128 thr/TG
 //
 // WHY SM=16 IS THE WIN. DARKBLOOM_PREFILL_GATHER_RUNSKIP elides a run for a
 // simdgroup only when the intersection with its SM-row band is EMPTY. On
@@ -1279,28 +1279,46 @@ bool darkbloom_stage_novol() {
 // Here the RUNSKIP predicate is untouched and stays simdgroup-uniform; only
 // the bands are narrower.
 //
-// WHY VARIANT 5 AND NOT 1/3/4. Variant 5 buys the row split from the COLUMN
-// axis (WN 2 -> 1) rather than from the thread count, so relative to upstream:
-// threads/TG stays 128, simdgroups stays 4, the grid stays 512 TGs, expert
-// re-staging stays at 315 stage-units, Dtile stays 32 floats and the loader's
-// n_reads stays 16. The ONLY thing that moves is the RUNSKIP band width,
-// 32 -> 16. Variants 1 and 2 move BM and both measured slower (variant 1:
-// -1.95% prefill, t=-5.30, 0/4 pairs); variant 4 confounds SM with a 2x
-// thread count.
+// EXACTNESS. BM, BN, BK, SK and WN are all untouched, so SN=32, TN=2 and TK=2
+// are exactly upstream and the per-row K partition is identical: every output
+// element is still accumulated over the same K_it x (BK/SK) sequence, in the
+// same order, inside one simdgroup's fragment accumulator. The ONLY thing that
+// changes is which rows a simdgroup owns -- `tm = SM * (simd_group_id / WN)`
+// with SM 32 -> 16 -- and how many row-fragments it holds (TM 2 -> 1). That is
+// the "regroup rows across simdgroups" class, arithmetic-neutral by
+// construction rather than by argument. This is a strictly weaker change than
+// variant 5, which also moved WN. max_abs_diff = 0 on every timed run and on
+// the full 1025-step gate.
 //
-// EXACTNESS. BN, BK and SK are untouched and WN only re-partitions columns
-// across simdgroups, so every output element is still accumulated over the
-// same K_it x (BK/SK) sequence, in the same order, inside one simdgroup's
-// fragment accumulator. Only the assignment of row/column blocks to
-// simdgroups changes. That is arithmetic-neutral by construction, not by
-// argument, and it measured max_abs_diff = 0 on all 12 paired runs.
+// WHY VARIANT 4 AND NOT 5. Both reach SM=16. They differ in where the extra
+// row-split is paid for, and measurement says that is worth an order of
+// magnitude:
 //
-// MEASURED (n=12 ABBA, one binary, quiescence-gated, prefill axis, "+" =
-// variant 5 faster): +2.13%, se 0.68%, t = +3.13, 10/12 pairs,
-// 95% CI [+0.63%, +3.64%]. Thirds +2.15% / +1.85% / +2.39% -- the
-// half-to-half reproducibility that two earlier candidate arms failed.
-// Steady-state decode step +0.03% (t = +0.23), i.e. flat, as expected for a
-// prefill-only gather-GEMM tiling change.
+//              WM  WN  SM  SN  TM  TN  Dtile   threads/TG   vs upstream
+//   variant 5   4   1  16  64   1   4  32 flt      128        +2.13%
+//   variant 4   4   2  16  32   1   2  16 flt      256       +15.40%
+//
+// Variant 5 buys the split from the column axis, so TN doubles 2 -> 4 and each
+// simdgroup reads twice as much Btile out of Ws. Variant 4 buys it from the
+// thread count: TN stays at the upstream 2, Dtile HALVES 32 -> 16 floats, and
+// threads/threadgroup double 128 -> 256. Total useful work is identical in both
+// -- each thread simply covers half the rows -- but variant 4 additionally
+// halves the accumulator register footprint and doubles the parallelism
+// available to hide staging latency, which is 39.5% of prefill. The elision
+// model priced only the MMA term (-5.0 pp) and therefore under-predicted this
+// by ~3x; the occupancy term was never in it.
+//
+// MEASURED (ABBA, one binary per series, quiescence-gated, prefill axis,
+// "+" = the named variant faster):
+//
+//   variant 4 vs 0 (upstream)   +15.40%   4/4 pairs
+//   variant 4 vs 5              +17.47%   4/4 pairs
+//   variant 5 vs 0              +2.13%   10/12 pairs, se 0.68%, t = +3.13
+//
+// The two variant-4 series have zero distributional overlap with their
+// controls (e.g. 342-371 us against 414-434 us) and are unanimous across 8
+// paired samples. Steady-state decode step is flat (-0.18%); the positive
+// composite decode reading is the 512-token seed prefill folding in.
 //
 // The unset path is the SHIPPED path: `mlxfast submit` packages source, not
 // environment, and the ranked runner sets no DARKBLOOM_* variables. So the
@@ -1311,7 +1329,7 @@ int darkbloom_stage_bm128_variant() {
   static const int v = [] {
     auto s = env::get_var("DARKBLOOM_STAGE_BM128", "");
     if (s.empty()) {
-      return 5;
+      return 4;
     }
     if (s == "1") {
       return 1;
@@ -1434,8 +1452,8 @@ void gather_qmm_rhs_nax(
     case 1: bm = 128; wm = 4; break;         // SM=32, less re-staging
     case 2: bm = 128; wm = 2; break;         // SM=64, predicted regression
     case 3: bm = 128; wm = 8; break;         // SM=16, both mechanisms
-    case 4: bm = 64;  wm = 4; break;         // SM=16, elision only, 256 thr/TG
-    case 5: bm = 64;  wm = 4; wn = 1; break; // SM=16, SHIPPED DEFAULT
+    case 4: bm = 64;  wm = 4; break;         // SM=16, 256 thr/TG, SHIPPED DEFAULT
+    case 5: bm = 64;  wm = 4; wn = 1; break; // SM=16, 128 thr/TG, TN 2 -> 4
     default: break;                          // upstream: bm=64, wm=2, wn=2
   }
 
