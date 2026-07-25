@@ -1165,7 +1165,11 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
         is_affine ? metal::quantized_nax() : metal::fp_quantized_nax(),
         get_template_definition(
             lib_name,
-            (is_affine ? "affine" : "fp") + std::string("_gather_qmm_rhs_nax"),
+            (is_affine ? "affine" : "fp") +
+                std::string(
+                    kernel_name.find("_expert_") != std::string::npos
+                        ? "_gather_qmm_rhs_expert_nax"
+                        : "_gather_qmm_rhs_nax"),
             get_type_string(x.dtype()),
             group_size,
             bits,

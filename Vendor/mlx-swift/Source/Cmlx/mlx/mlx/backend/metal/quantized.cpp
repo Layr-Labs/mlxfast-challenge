@@ -1249,6 +1249,12 @@ bool darkbloom_stage_novol() {
   return v;
 }
 
+bool darkbloom_expert_aligned_gather() {
+  static const bool v =
+      env::get_var("DARKBLOOM_EXPERT_ALIGNED_GATHER", "") != "0";
+  return v;
+}
+
 // DARKBLOOM_STAGE_BM128: select the gather-GEMM m-tiling. NOT a function
 // constant -- it changes the template instantiation, so it is already in
 // `kname` (`_bm_`/`_wm_`/`_wn_`) and therefore in the library name and the
@@ -1460,6 +1466,12 @@ void gather_qmm_rhs_nax(
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
+  const bool laguna_moe_shape =
+      (K == 2048 && N == 1024) || (K == 512 && N == 2048);
+  const bool expert_aligned =
+      darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
+      group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
+      align_N && align_K && bm == 64 && wm == 4 && wn == 2;
 
   // Make the kernel name
   std::string kname;
@@ -1468,7 +1480,10 @@ void gather_qmm_rhs_nax(
   concatenate(
       kname,
       mode +
-          (transpose ? "_gather_qmm_rhs_nax_nt_" : "_gather_qmm_rhs_nax_nn_"),
+          (expert_aligned
+               ? "_gather_qmm_rhs_expert_nax_nt_"
+               : (transpose ? "_gather_qmm_rhs_nax_nt_"
+                            : "_gather_qmm_rhs_nax_nn_")),
       type_string,
       "_gs_",
       group_size,
@@ -1519,7 +1534,7 @@ void gather_qmm_rhs_nax(
       fprintf(
           stderr,
           "mlxfast: stage active: widest=%d wideld=%d(req=%d wide_ok=%d) "
-          "runbar=%d novol=%d bm128=%d bm=%d wm=%d wn=%d "
+          "runbar=%d novol=%d expert=%d bm128=%d bm=%d wm=%d wn=%d "
           "w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d\n",
           int(stage_widest),
           int(stage_wideld),
@@ -1527,6 +1542,7 @@ void gather_qmm_rhs_nax(
           int(wide_ok),
           int(stage_runbar),
           int(stage_novol),
+          int(expert_aligned),
           bm128,
           bm,
           wm,
@@ -1540,16 +1556,19 @@ void gather_qmm_rhs_nax(
     });
   }
 
-  metal::MTLFCList func_consts = {
-      {&align_M, MTL::DataType::DataTypeBool, 200},
-      {&align_N, MTL::DataType::DataTypeBool, 201},
-      {&align_K, MTL::DataType::DataTypeBool, 202},
-      {&run_skip, MTL::DataType::DataTypeBool, 203},
-      {&stage_widest, MTL::DataType::DataTypeBool, 204},
-      {&stage_wideld, MTL::DataType::DataTypeBool, 205},
-      {&stage_runbar, MTL::DataType::DataTypeBool, 206},
-      {&stage_novol, MTL::DataType::DataTypeBool, 207},
-  };
+  metal::MTLFCList func_consts;
+  if (!expert_aligned) {
+    func_consts = {
+        {&align_M, MTL::DataType::DataTypeBool, 200},
+        {&align_N, MTL::DataType::DataTypeBool, 201},
+        {&align_K, MTL::DataType::DataTypeBool, 202},
+        {&run_skip, MTL::DataType::DataTypeBool, 203},
+        {&stage_widest, MTL::DataType::DataTypeBool, 204},
+        {&stage_wideld, MTL::DataType::DataTypeBool, 205},
+        {&stage_runbar, MTL::DataType::DataTypeBool, 206},
+        {&stage_novol, MTL::DataType::DataTypeBool, 207},
+    };
+  }
 
   // And the kernel hash that includes the function constants
   std::string hash_name;
@@ -1591,7 +1610,10 @@ void gather_qmm_rhs_nax(
   compute_encoder.set_compute_pipeline_state(kernel);
 
   MTL::Size group_dims(32, wn, wm);
-  MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, 1);
+  MTL::Size grid_dims(
+      (N + bn - 1) / bn,
+      expert_aligned ? 64 : (M + bm - 1) / bm,
+      1);
 
   int c = 0;
   compute_encoder.set_input_array(x, c++);

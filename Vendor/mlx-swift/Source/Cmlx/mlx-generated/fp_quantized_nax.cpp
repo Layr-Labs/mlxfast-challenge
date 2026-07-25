@@ -1425,6 +1425,193 @@ template <
   }
 }
 
+METAL_FUNC int laguna_sorted_lower_bound(
+    const device uint32_t* indices,
+    const int count,
+    const uint32_t value) {
+  int lo = 0;
+  int hi = count;
+  while (lo < hi) {
+    const int mid = lo + (hi - lo) / 2;
+    if (indices[mid] < value) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+// Laguna prefill sorts the M routed rows by expert before this QMM. The stock
+// kernel assigns fixed 64-row tiles, then walks every expert run intersecting
+// a tile; a run crossing a tile boundary stages the same expert weight tile
+// again. This variant assigns four expert ids to each of 64 threadgroups.
+// Each expert's contiguous interval is found by two lower bounds, chunked only
+// when it genuinely exceeds BM, and therefore stages once per expert/chunk.
+//
+// Per-output arithmetic is unchanged: the same NAX fragment coordinates,
+// K_it/BK/SK traversal, BF16 weight staging boundary and tile_matmad sequence
+// are used. Only the rows grouped into a threadgroup change.
+template <
+    typename T,
+    int group_size,
+    const int bits,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool transpose,
+    typename Wtype = bfloat>
+[[kernel]] void fp_gather_qmm_rhs_expert_nax(
+    const device T* x,
+    const device uint32_t* w,
+    const device uint8_t* scales,
+    const device uint32_t* indices,
+    device T* y,
+    const constant int& M,
+    const constant int& N,
+    const constant int& K,
+    const constant int& run_skip_pct,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]]) {
+  (void)run_skip_pct;
+  static_assert(transpose, "expert-aligned Laguna QMM requires NT weights");
+  static_assert(group_size == 16, "expert-aligned Laguna QMM requires gs16");
+  static_assert(bits == 4, "expert-aligned Laguna QMM requires NVFP4");
+
+  constexpr int pack_factor = get_pack_factor<8, bits>();
+  constexpr int bytes_per_pack = get_bytes_per_pack();
+  constexpr int BK_padded = BK + 16 / sizeof(Wtype);
+  constexpr int BN_padded = BN + 16 / sizeof(Wtype);
+  constexpr int expert_groups = 64;
+  constexpr int experts = 256;
+
+  using loader_w_t = QuantizedBlockLoader<
+      Wtype,
+      BN,
+      BK,
+      BK_padded,
+      true,
+      WM * WN * SIMD_SIZE,
+      group_size,
+      bits>;
+
+  constexpr int kWsElems = BN * BK_padded;
+  constexpr int kWsPerChunk = 16 / sizeof(Wtype);
+  threadgroup NAXWsChunk16<Wtype>
+      Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
+  threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
+  threadgroup int bounds[2];
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int K_it = K / BK;
+  const size_t stride_w = size_t(N) * K_w;
+  const size_t stride_s = size_t(N) * K_g;
+  const int y_col = tid.x * BN;
+
+  auto wl = (const device uint8_t*)w + size_t(y_col) * K_w;
+  const device uint8_t* scale_base =
+      scales + size_t(y_col) * K_g;
+
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+
+  const short tm = SM * (simd_group_id / WN);
+  const short tn = SN * (simd_group_id % WN);
+
+  for (int expert_slot = 0; expert_slot < experts / expert_groups;
+       ++expert_slot) {
+    const uint32_t expert =
+        static_cast<uint32_t>(tid.y + expert_slot * expert_groups);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+      bounds[0] = laguna_sorted_lower_bound(indices, M, expert);
+      bounds[1] = laguna_sorted_lower_bound(indices, M, expert + 1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int run_start = bounds[0];
+    const int run_end = bounds[1];
+    for (int chunk_start = run_start; chunk_start < run_end;
+         chunk_start += BM) {
+      const short chunk_rows =
+          short(min(BM, run_end - chunk_start));
+      const short sgp_sm =
+          min(int(SM), max(0, int(chunk_rows) - int(tm)));
+      const bool sg_active = sgp_sm > 0;
+
+      NAXTile<float, TM, TN> Dtile;
+      Dtile.clear();
+
+      const device T* xn =
+          x + size_t(chunk_start + tm) * K;
+      thread loader_w_t loader_w(
+          wl + size_t(expert) * stride_w,
+          scale_base + size_t(expert) * stride_s,
+          K,
+          Ws,
+          simd_group_id,
+          simd_lane_id);
+
+      for (int k = 0; k < K_it; ++k) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_w.load_unsafe();
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg_active) {
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<Wtype, TN, TK> Btile;
+            volatile int compiler_barrier;
+
+            if (sgp_sm == SM) {
+              Atile.load(xn + kk1, K);
+            } else {
+              Atile.load_safe(
+                  xn + kk1, K, short2(SK, sgp_sm));
+            }
+            Btile.template load<Wtype, BK_padded, 1>(
+                Ws + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<true>{});
+            (void)compiler_barrier;
+          }
+        }
+
+        xn += BK;
+        loader_w.next();
+      }
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sg_active) {
+        device T* yn =
+            y + size_t(chunk_start + tm) * N + y_col + tn;
+        if (sgp_sm == SM) {
+          Dtile.store(yn, N);
+        } else {
+          Dtile.store_slice(
+              yn, N, short2(0, 0), short2(SN, sgp_sm));
+        }
+      }
+    }
+  }
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 )preamble";
 }
