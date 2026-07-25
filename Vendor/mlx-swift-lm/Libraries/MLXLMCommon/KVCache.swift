@@ -339,6 +339,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let previous = self.offset
+        let tokenCount = keys.dim(2)
 
         // When the first update already lands exactly on an allocation-step
         // boundary, the stock zero allocation has no spare capacity: it
@@ -347,17 +348,17 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         // directly in this no-slack case. Shapes, offsets, returned values,
         // and the next growth boundary are identical; only the redundant
         // zero-fill and full-prompt slice updates disappear.
-        if self.keys == nil, previous == 0, keys.dim(2) > 0,
-            keys.dim(2).isMultiple(of: step)
+        if self.keys == nil, previous == 0, tokenCount > 0,
+            tokenCount.isMultiple(of: step)
         {
             self.keys = keys
             self.values = values
-            self.offset = keys.dim(2)
+            self.offset = tokenCount
             return (keys, values)
         }
 
         let reset =
-            if let currentKeys = self.keys, (previous + keys.dim(2)) > currentKeys.dim(2) {
+            if let currentKeys = self.keys, (previous + tokenCount) > currentKeys.dim(2) {
                 true
             } else {
                 self.keys == nil
@@ -368,7 +369,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             let kHeadDim = keys.dim(3)
             let vHeadDim = values.dim(3)
 
-            let nSteps = (step + keys.dim(2) - 1) / step
+            let nSteps = (step + tokenCount - 1) / step
             let kShape = [B, kvHeads, nSteps * step, kHeadDim]
             let vShape = [B, kvHeads, nSteps * step, vHeadDim]
             let newK = MLXArray.zeros(kShape, dtype: keys.dtype)
@@ -387,7 +388,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             }
         }
 
-        self.offset += keys.dim(2)
+        self.offset += tokenCount
 
         self.keys?[.ellipsis, previous ..< self.offset, 0...] = keys
         self.values?[.ellipsis, previous ..< self.offset, 0...] = values
@@ -566,18 +567,20 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return (self.keys!, self.values!)
     }
 
-    private func updateInPlace(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
-        let B = keys.dim(0)
-        let nKVHeads = keys.dim(1)
-        let S = keys.dim(2)
-        let kHeadDim = keys.dim(3)
-        let vHeadDim = values.dim(3)
+    private func updateInPlace(
+        keys: MLXArray, values: MLXArray, tokenCount: Int
+    ) -> (MLXArray, MLXArray) {
         let prev = offset
+        var cacheLength = self.keys?.dim(2)
 
         // May not have hit the max size yet, so potentially keep growing the cache
-        if self.keys == nil
-            || (prev >= self.keys!.dim(2) && self.keys!.dim(2) < maxCacheSize)
+        if cacheLength == nil
+            || (prev >= cacheLength! && cacheLength! < maxCacheSize)
         {
+            let B = keys.dim(0)
+            let nKVHeads = keys.dim(1)
+            let kHeadDim = keys.dim(3)
+            let vHeadDim = values.dim(3)
             let newSize = min(step, maxCacheSize - prev)
 
             let kShape = [B, nKVHeads, newSize, kHeadDim]
@@ -592,11 +595,12 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
                 self.keys = newK
                 self.values = newV
             }
+            cacheLength = self.keys!.dim(2)
             idx = prev
         }
 
         // Trim if needed
-        let trimSize = self.keys!.dim(2) - maxCacheSize
+        let trimSize = cacheLength! - maxCacheSize
         if trimSize > 0 {
             self.keys = trim(trimSize: trimSize, self.keys!)
             self.values = trim(trimSize: trimSize, self.values!)
@@ -609,10 +613,10 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         }
 
         // Assign
-        self.keys![.ellipsis, idx ..< (idx + S), 0...] = keys
-        self.values![.ellipsis, idx ..< (idx + S), 0...] = values
-        offset += S
-        idx += S
+        self.keys![.ellipsis, idx ..< (idx + tokenCount), 0...] = keys
+        self.values![.ellipsis, idx ..< (idx + tokenCount), 0...] = values
+        offset += tokenCount
+        idx += tokenCount
 
         // Return the appropriate cache slice
         if offset < maxCacheSize {
@@ -625,9 +629,10 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        let tokenCount = keys.dim(2)
         let result =
-            if keys.dim(2) == 1 {
-                updateInPlace(keys: keys, values: values)
+            if tokenCount == 1 {
+                updateInPlace(keys: keys, values: values, tokenCount: tokenCount)
             } else {
                 updateConcat(keys: keys, values: values)
             }

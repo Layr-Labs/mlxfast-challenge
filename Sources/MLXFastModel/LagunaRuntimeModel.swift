@@ -211,6 +211,17 @@ let lagunaFusedResidualRMSNormRouterEnabled =
 let lagunaFusedFullQKNormYaRNEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_QK_NORM_YARN"] != "0"
 
+/// Decode-only carrier for the two authoritative RoPE angle rows consumed by
+/// the fused Q/K kernels. At load time each attention family's own stock RoPE
+/// materializes an exact FP32 position atlas. A single custom kernel then
+/// replaces the token embedding gather and copies both selected atlas rows,
+/// removing the two per-token probe RoPE dispatches without changing their
+/// values. Set `DARKBLOOM_ROPE_ANGLE_ATLAS=0` to ablate.
+let lagunaRoPEAngleAtlasEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] != "0"
+
+private let lagunaRoPEAngleAtlasLength = 4096
+
 /// Post-attention residual add + RMSNorm with the MoE router's projection
 /// folded in.
 ///
@@ -695,8 +706,9 @@ func lagunaSlidingQKNormRoPE(
 /// from the raw residual row — 4 KB read and one 2048-element reduction
 /// against 32 MB of weight traffic — and keeps the normalized row in
 /// threadgroup memory for its own K loop, so the norm leaves the dependency
-/// chain entirely. `normalized` is still emitted (from tile 0) because the
-/// per-head gate projection reads it.
+/// chain entirely. The per-head gate projection is folded into this same
+/// kernel and also reads the threadgroup row, so no device-visible normalized
+/// output is needed.
 ///
 /// The norm reproduces `rms_single_row` at `axis_size == 2048`, `N_READS == 4`
 /// and a 512-thread group, which is exactly the shape MLX dispatches for this
@@ -759,9 +771,6 @@ private func lagunaFusedQKVProjectionSource(heads: Int) -> String {
                 norm_weight[norm_base + i] *
                 bfloat(raw[i] * local_inv_mean[0]);
             normalized_row[norm_base + i] = value;
-            if (tile == 0) {
-                normalized[norm_base + i] = value;
-            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -837,7 +846,22 @@ private func lagunaFusedQKVProjectionSource(heads: Int) -> String {
                             (gate_half * gate_simds + sgn) * rows_per_thread + r
                         ];
                     }
-                    gate_logits[gate_row + r] = bfloat(total);
+                    // Preserve the stock boundary: the projection first
+                    // rounds to BF16, then softplus widens that rounded logit
+                    // to FP32 and rounds the activated value back to BF16.
+                    bfloat rounded_logit = bfloat(total);
+                    float logit = float(rounded_logit);
+                    float gate;
+                    if (metal::isnan(logit)) {
+                        gate = NAN;
+                    } else {
+                        float maxval = metal::max(logit, 0.0f);
+                        float minval = metal::min(logit, 0.0f);
+                        gate = (metal::isinf(minval) || metal::isinf(maxval))
+                            ? maxval
+                            : maxval + log1p(metal::exp(minval - maxval));
+                    }
+                    gate_values[gate_row + r] = bfloat(gate);
                 }
             }
             return;
@@ -902,12 +926,12 @@ private let lagunaFusedQKVProjectionKernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_fused_norm_qkv_projection_bf16_h\(heads)_v1",
+            name: "laguna_fused_norm_qkv_projection_bf16_h\(heads)_v3",
             inputNames: [
                 "residual", "norm_weight", "query_weight", "key_weight",
                 "value_weight", "gate_weight",
             ],
-            outputNames: ["normalized", "queries", "keys", "values", "gate_logits"],
+            outputNames: ["queries", "keys", "values", "gate_values"],
             source: lagunaFusedQKVProjectionSource(heads: heads),
             ensureRowContiguous: true
         )
@@ -924,8 +948,7 @@ func lagunaFusedNormQKVProjection(
     gateWeight: MLXArray,
     heads: Int
 ) -> (
-    normalized: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray,
-    gateLogits: MLXArray
+    queries: MLXArray, keys: MLXArray, values: MLXArray, gateValues: MLXArray
 )? {
     guard let kernel = lagunaFusedQKVProjectionKernels[heads] else { return nil }
     let hidden = LagunaConstants.hiddenSize
@@ -951,12 +974,11 @@ func lagunaFusedNormQKVProjection(
         grid: ((projectionTiles + gateTiles) * 512, 1, 1),
         threadGroup: (512, 1, 1),
         outputShapes: [
-            [1, 1, hidden], [1, 1, queryRows], [1, 1, kvRows], [1, 1, kvRows],
-            [1, 1, heads],
+            [1, 1, queryRows], [1, 1, kvRows], [1, 1, kvRows], [1, 1, heads],
         ],
-        outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .bfloat16, .bfloat16]
+        outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .bfloat16]
     )
-    return (outputs[0], outputs[1], outputs[2], outputs[3], outputs[4])
+    return (outputs[0], outputs[1], outputs[2], outputs[3])
 }
 
 /// Decode-only fusion of the per-head attention gate with the output
@@ -966,17 +988,17 @@ func lagunaFusedNormQKVProjection(
 /// the 8192-wide gated row is never materialized and the layer spends one
 /// dispatch instead of two.
 ///
-/// Exactness. The gate reproduces `softplus(gate.asType(.float32))`, which is
-/// MLX's `logAddExp(x, 0)`: `max(x, 0) + log1p(exp(min(x, 0) - max(x, 0)))`,
-/// with the same NaN and infinity short-circuits, then the same
-/// `.asType(output.dtype)` rounding to BF16 and the same BF16 product with the
-/// attention output. The projection reproduces MLX's `gemv` for this shape
-/// exactly: out_vec 2048 and in_vec 8192 select BM 4, BN 1, SM 1, SN 32, TM 4,
-/// TN 4, so a thread owns four output rows, lane `l` covers input columns
-/// `4l + 128i`, products accumulate in `i` then `tn` order in FP32, and the
-/// simdgroup reduces with the same `simd_shuffle_down` ladder (16, 8, 4, 2, 1)
-/// before lane 0 rounds once to BF16. Because column `4l + 128i` always lies
-/// inside head `i`, the gate a thread needs at step `i` is simply `gates[i]`.
+/// Exactness. The fused QKV producer has already reproduced
+/// `softplus(gate.asType(.float32)).asType(.bfloat16)` after preserving the
+/// projection's intermediate BF16 rounding boundary. This consumer applies
+/// the same BF16 gate product as stock. The projection reproduces MLX's
+/// `gemv` for this shape exactly: out_vec 2048 and in_vec 8192 select BM 4,
+/// BN 1, SM 1, SN 32, TM 4, TN 4, so a thread owns four output rows, lane `l`
+/// covers input columns `4l + 128i`, products accumulate in `i` then `tn`
+/// order in FP32, and the simdgroup reduces with the same
+/// `simd_shuffle_down` ladder (16, 8, 4, 2, 1) before lane 0 rounds once to
+/// BF16. Because column `4l + 128i` always lies inside head `i`, the gate a
+/// thread needs at step `i` is simply `gate_values[i]`.
 private func lagunaGatedOutputProjectionSource(heads: Int) -> String {
     """
         constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
@@ -989,28 +1011,8 @@ private func lagunaGatedOutputProjectionSource(heads: Int) -> String {
         constexpr uint rows_per_group = 16;
 
         uint tile = threadgroup_position_in_grid.x;
-        uint local_id = thread_position_in_threadgroup.x;
         uint simd_group = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
-
-        // softplus(x) == logaddexp(x, 0), rounded to BF16 exactly where
-        // `.asType(output.dtype)` rounds it.
-        threadgroup bfloat gates[heads];
-        if (local_id < heads) {
-            float logit = float(gate_logits[local_id]);
-            float gate;
-            if (metal::isnan(logit)) {
-                gate = NAN;
-            } else {
-                float maxval = metal::max(logit, 0.0f);
-                float minval = metal::min(logit, 0.0f);
-                gate = (metal::isinf(minval) || metal::isinf(maxval))
-                    ? maxval
-                    : maxval + log1p(metal::exp(minval - maxval));
-            }
-            gates[local_id] = bfloat(gate);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         uint out_row = tile * rows_per_group + simd_group * rows_per_thread;
         thread float result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -1019,7 +1021,7 @@ private func lagunaGatedOutputProjectionSource(heads: Int) -> String {
         uint column = lane * values_per_thread;
         for (uint block = 0; block < blocks; ++block) {
             // Column `4 * lane + 128 * block` sits in head `block`.
-            float gate = float(gates[block]);
+            float gate = float(gate_values[block]);
             const device vec<bfloat, 4>* gated =
                 (const device vec<bfloat, 4>*)(attention_output + column);
             const vec<bfloat, 4> values = gated[0];
@@ -1057,8 +1059,8 @@ private let lagunaGatedOutputProjectionKernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_gated_output_projection_bf16_h\(heads)_v1",
-            inputNames: ["attention_output", "gate_logits", "weight"],
+            name: "laguna_gated_output_projection_bf16_h\(heads)_v2",
+            inputNames: ["attention_output", "gate_values", "weight"],
             outputNames: ["projected"],
             source: lagunaGatedOutputProjectionSource(heads: heads),
             ensureRowContiguous: true
@@ -1068,20 +1070,20 @@ private let lagunaGatedOutputProjectionKernels: [Int: MLXFast.MLXFastKernel] = {
 }()
 
 func lagunaGatedOutputProjection(
-    attentionOutput: MLXArray, gateLogits: MLXArray, weight: MLXArray, heads: Int
+    attentionOutput: MLXArray, gateValues: MLXArray, weight: MLXArray, heads: Int
 ) -> MLXArray? {
     guard let kernel = lagunaGatedOutputProjectionKernels[heads] else { return nil }
     let inVec = heads * LagunaConstants.headDim
     precondition(attentionOutput.dtype == .bfloat16)
     precondition(attentionOutput.shape == [1, 1, inVec])
-    precondition(gateLogits.dtype == .bfloat16)
-    precondition(gateLogits.shape == [1, 1, heads])
+    precondition(gateValues.dtype == .bfloat16)
+    precondition(gateValues.shape == [1, 1, heads])
     precondition(weight.dtype == .bfloat16)
     precondition(weight.shape == [LagunaConstants.hiddenSize, inVec])
 
     lagunaTrace("gated output projection h\(heads)")
     return kernel(
-        [attentionOutput, gateLogits, weight],
+        [attentionOutput, gateValues, weight],
         grid: ((LagunaConstants.hiddenSize / 16) * 128, 1, 1),
         threadGroup: (128, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
@@ -1250,10 +1252,11 @@ final class LagunaRuntimeAttention: Module {
         // fall through to the stock projections below.
         var fusedNormQKV:
             (
-                normalized: MLXArray, queries: MLXArray, keys: MLXArray,
-                values: MLXArray, gateLogits: MLXArray
+                queries: MLXArray, keys: MLXArray, values: MLXArray,
+                gateValues: MLXArray
             )?
-        if lagunaFusedQKVProjectionEnabled, B == 1, L == 1,
+        if lagunaFusedQKVProjectionEnabled, _fusedQKVWeight == nil,
+            B == 1, L == 1,
             headDim == LagunaConstants.headDim,
             nKVHeads == LagunaConstants.numKeyValueHeads,
             input.dtype == .bfloat16,
@@ -1282,19 +1285,28 @@ final class LagunaRuntimeAttention: Module {
                 heads: nHeads
             )
         }
-        let x = fusedNormQKV?.normalized ?? inputNorm(input)
+        // The fused result already contains every consumer of the normalized
+        // row. Materialize that row only for the stock projections or the
+        // retained row-concatenated QKV bank. Checking actual bank presence
+        // above (rather than its environment flag) preserves the custom
+        // fallback if fused-weight preparation declined.
+        let normalizedInput: MLXArray? =
+            fusedNormQKV == nil ? inputNorm(input) : nil
 
         var queries: MLXArray
         var keys: MLXArray
         var values: MLXArray
         if let fusedQKVWeight = _fusedQKVWeight {
+            guard let normalizedInput else {
+                preconditionFailure("retained fused QKV requires normalized input")
+            }
             // One dispatch over the row-concatenated [Wq; Wk; Wv] weight,
             // identical math to the three bias-free `Linear` calls
             // (`matmul(x, w.T)`). Each output row's K-loop is independent of
             // which rows share the dispatch, so every Q/K/V element is
             // bit-exact; the slices are views and the reshapes below may
             // copy, which does not change values.
-            let qkv = matmul(x, fusedQKVWeight.T)
+            let qkv = matmul(normalizedInput, fusedQKVWeight.T)
             let queryDim = nHeads * headDim
             let kvDim = nKVHeads * headDim
             queries = qkv[.ellipsis, 0 ..< queryDim]
@@ -1305,9 +1317,12 @@ final class LagunaRuntimeAttention: Module {
             keys = fused.keys
             values = fused.values
         } else {
-            queries = wq(x)
-            keys = wk(x)
-            values = wv(x)
+            guard let normalizedInput else {
+                preconditionFailure("stock QKV projections require normalized input")
+            }
+            queries = wq(normalizedInput)
+            keys = wk(normalizedInput)
+            values = wv(normalizedInput)
         }
 
         let fusedQKNormShapesMatch =
@@ -1357,14 +1372,21 @@ final class LagunaRuntimeAttention: Module {
                 kNorm(keys.reshaped(B, L, nKVHeads, headDim))
                 .transposed(0, 2, 1, 3)
         }
-        values = values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
+        // With a singleton sequence axis, `[B, 1, H, D]` and
+        // `[B, H, 1, D]` have the same contiguous byte order. Reshape
+        // directly so decode does not carry a no-op transpose view through
+        // the lazy graph. Multi-token calls still require the real axis swap.
+        values =
+            L == 1
+            ? values.reshaped(B, nKVHeads, L, headDim)
+            : values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
 
         if !useFusedFullQKNormYaRN && !useFusedSlidingQKNormRoPE {
             queries = applyRotaryPosition(rope, to: queries, cache: cache)
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
-        var output = attentionWithCacheUpdate(
+        let attended = attentionWithCacheUpdate(
             queries: queries,
             keys: keys,
             values: values,
@@ -1372,16 +1394,33 @@ final class LagunaRuntimeAttention: Module {
             scale: scale,
             mask: mask
         )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
+        // SDPA returns `[B, H, L, D]`. When `L == 1`, flattening its
+        // contiguous head-major payload directly produces the exact
+        // `[B, 1, H*D]` byte order; the transpose only changes singleton-axis
+        // metadata. Preserve the real transpose for prefill.
+        var output =
+            L == 1
+            ? attended.reshaped(B, L, -1)
+            : attended.transposed(0, 2, 1, 3).reshaped(B, L, -1)
 
         if gatingEnabled, let gProj {
             // Per-head softplus gate computed in float32, then broadcast
             // across the head dimension (or applied elementwise for a
             // per-element gate).
-            let projectedGate = fusedNormQKV?.gateLogits ?? gProj(x)
+            let projectedGate: MLXArray
+            let gateIsActivated: Bool
+            if let fusedNormQKV {
+                projectedGate = fusedNormQKV.gateValues
+                gateIsActivated = true
+            } else {
+                guard let normalizedInput else {
+                    preconditionFailure("attention gate requires normalized input")
+                }
+                projectedGate = gProj(normalizedInput)
+                gateIsActivated = false
+            }
             if lagunaFusedGatedOutputProjectionEnabled,
-                gatePerHead, L == 1, B == 1, wo.bias == nil,
+                gateIsActivated, gatePerHead, L == 1, B == 1, wo.bias == nil,
                 headDim == LagunaConstants.headDim,
                 output.dtype == .bfloat16, projectedGate.dtype == .bfloat16,
                 wo.weight.dtype == .bfloat16,
@@ -1390,20 +1429,23 @@ final class LagunaRuntimeAttention: Module {
                 wo.weight.shape == [LagunaConstants.hiddenSize, nHeads * headDim],
                 let projection = lagunaGatedOutputProjection(
                     attentionOutput: output,
-                    gateLogits: projectedGate,
+                    gateValues: projectedGate,
                     weight: wo.weight,
                     heads: nHeads
                 )
             {
                 return projection
             }
-            if gatePerHead && projectedGate.dtype == output.dtype,
+            if !gateIsActivated,
+                gatePerHead && projectedGate.dtype == output.dtype,
                 L == 1, wo.bias == nil, MLXHardwareInfo.isCompiledDecodeSupported
             {
                 return attentionGateProjection(output, projectedGate, wo.weight)
             }
             let gate =
-                gatePerHead && projectedGate.dtype == output.dtype
+                gateIsActivated
+                ? projectedGate
+                : gatePerHead && projectedGate.dtype == output.dtype
                 ? lagunaCompiledSoftplusGate(projectedGate)
                 : softplus(projectedGate.asType(.float32)).asType(output.dtype)
             if gatePerHead {
@@ -1444,7 +1486,7 @@ final class LagunaRuntimeAttention: Module {
         }
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
-        var output = attentionWithCacheUpdate(
+        let attended = attentionWithCacheUpdate(
             queries: queries,
             keys: keys,
             values: values,
@@ -1452,8 +1494,9 @@ final class LagunaRuntimeAttention: Module {
             scale: scale,
             mask: .causal
         )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, 1, -1)
+        // The last-row query length is exactly one, so the SDPA result's
+        // `[B, H, 1, D]` storage is already the desired flattened head order.
+        var output = attended.reshaped(B, 1, -1)
 
         if gatingEnabled, let gProj {
             let projectedGate = gProj(lastInput)
@@ -3468,6 +3511,102 @@ final class LagunaRuntimeDecoderLayer: Module {
 
 // MARK: - Model
 
+/// Single-token embedding gather plus position-atlas row selection. The
+/// embedding row is copied as BF16 bits; the angle rows are copied as FP32
+/// bits. The stock embedding and the two stock probe RoPE calls produce the
+/// same three output buffers separately.
+private let lagunaDecodeEmbeddingRoPEAtlasKernel = MLXFast.metalKernel(
+    name: "laguna_decode_embedding_rope_atlas_bf16_2048_v2",
+    inputNames: [
+        "tokens", "embedding_weight", "full_atlas", "sliding_atlas",
+        "atlas_position",
+    ],
+    outputNames: ["hidden", "full_angles", "sliding_angles"],
+    source: """
+        constexpr uint hidden_size = 2048;
+        constexpr uint hidden_vectors = hidden_size / 4;
+        constexpr uint full_width = 64;
+        constexpr uint sliding_width = 128;
+
+        uint lane = thread_position_in_grid.x;
+        uint token = uint(tokens[0]);
+        uint position = uint(atlas_position);
+
+        const device vec<bfloat, 4>* embedding_vectors =
+            (const device vec<bfloat, 4>*)(
+                embedding_weight + token * hidden_size);
+        device vec<bfloat, 4>* hidden_vectors_out =
+            (device vec<bfloat, 4>*)(hidden);
+        if (lane < hidden_vectors) {
+            hidden_vectors_out[lane] = embedding_vectors[lane];
+        }
+
+        if (lane < full_width / 4) {
+            const device vec<float, 4>* atlas_vectors =
+                (const device vec<float, 4>*)(
+                    full_atlas + position * full_width);
+            ((device vec<float, 4>*)(full_angles))[lane] =
+                atlas_vectors[lane];
+        }
+        if (lane < sliding_width / 4) {
+            const device vec<float, 4>* atlas_vectors =
+                (const device vec<float, 4>*)(
+                    sliding_atlas + position * sliding_width);
+            ((device vec<float, 4>*)(sliding_angles))[lane] =
+                atlas_vectors[lane];
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private func lagunaDecodeEmbeddingRoPEAtlas(
+    tokens: MLXArray,
+    embeddingWeight: MLXArray,
+    fullAtlas: MLXArray,
+    slidingAtlas: MLXArray,
+    position: Int
+) -> (hidden: MLXArray, fullAngles: MLXArray, slidingAngles: MLXArray)? {
+    guard tokens.dtype == .int32,
+        tokens.shape == [1, 1],
+        embeddingWeight.dtype == .bfloat16,
+        embeddingWeight.shape == [
+            LagunaConstants.vocabSize, LagunaConstants.hiddenSize,
+        ],
+        fullAtlas.dtype == .float32,
+        fullAtlas.shape == [
+            1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim / 2,
+        ],
+        slidingAtlas.dtype == .float32,
+        slidingAtlas.shape == [
+            1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim,
+        ],
+        position >= 0, position < lagunaRoPEAngleAtlasLength
+    else {
+        return nil
+    }
+
+    let kernelInputs: [any ScalarOrArray] = [
+        tokens,
+        embeddingWeight,
+        fullAtlas,
+        slidingAtlas,
+        Int32(position),
+    ]
+    let outputs = lagunaDecodeEmbeddingRoPEAtlasKernel(
+        kernelInputs,
+        grid: (512, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [
+            [1, 1, LagunaConstants.hiddenSize],
+            [1, 1, 1, LagunaConstants.headDim / 2],
+            [1, 1, 1, LagunaConstants.headDim],
+        ],
+        outputDTypes: [.bfloat16, .float32, .float32]
+    )
+    lagunaTrace("decode embedding+rope atlas")
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 /// The Laguna text tower: unscaled embedding and 40 decoder layers. The final
 /// RMSNorm remains a child of this module for checkpoint compatibility, but
 /// the scored wrapper applies it after selecting the only consumed row.
@@ -3482,6 +3621,8 @@ final class LagunaRuntimeModelInner: Module {
     let slidingAttentionIdx: Int
     let _fullRoPEAngleSeed: MLXArray
     let _slidingRoPEAngleSeed: MLXArray
+    var _fullRoPEAngleAtlas: MLXArray?
+    var _slidingRoPEAngleAtlas: MLXArray?
 
     init(_ config: LagunaConfig) {
         precondition(config.vocabSize > 0)
@@ -3516,6 +3657,83 @@ final class LagunaRuntimeModelInner: Module {
         )
     }
 
+    /// Materialize exact position rows with the same stock RoPE instances the
+    /// two attention families use. Broadcasting the probe seeds along the
+    /// sequence dimension makes row `p` exactly the scalar-offset probe at
+    /// position `p`, including YaRN's authoritative FP32 rounding.
+    func prepareRoPEAngleAtlases() -> [MLXArray] {
+        guard lagunaRoPEAngleAtlasEnabled,
+            lagunaFusedFullQKNormYaRNEnabled,
+            lagunaFusedSlidingQKNormRoPEEnabled,
+            layerTypes.contains(.full),
+            layerTypes.contains(.sliding)
+        else {
+            return []
+        }
+        if let fullAtlas = _fullRoPEAngleAtlas,
+            let slidingAtlas = _slidingRoPEAngleAtlas
+        {
+            return [fullAtlas, slidingAtlas]
+        }
+
+        let fullSeed = broadcast(
+            _fullRoPEAngleSeed,
+            to: [
+                1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim / 2,
+            ])
+        let slidingSeed = broadcast(
+            _slidingRoPEAngleSeed,
+            to: [
+                1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim,
+            ])
+        let fullAtlas = layers[fullAttentionIdx].selfAttn.rope(fullSeed, offset: 0)
+        let slidingAtlas = layers[slidingAttentionIdx].selfAttn.rope(
+            slidingSeed, offset: 0)
+        _fullRoPEAngleAtlas = fullAtlas
+        _slidingRoPEAngleAtlas = slidingAtlas
+        return [fullAtlas, slidingAtlas]
+    }
+
+    /// Return a host position only for the exact direct-decode cache pair.
+    /// Exact runtime type checks deliberately exclude compilable subclasses,
+    /// whose compatibility `offset` getter may synchronize a graph value.
+    private func decodeRoPEAtlasPosition(
+        inputs: MLXArray, cache: [KVCache]?
+    ) -> Int? {
+        guard lagunaRoPEAngleAtlasEnabled,
+            lagunaFusedFullQKNormYaRNEnabled,
+            lagunaFusedSlidingQKNormRoPEEnabled,
+            inputs.dtype == .int32,
+            inputs.shape == [1, 1],
+            _fullRoPEAngleAtlas != nil,
+            _slidingRoPEAngleAtlas != nil,
+            let cache,
+            fullAttentionIdx < cache.count,
+            slidingAttentionIdx < cache.count
+        else {
+            return nil
+        }
+
+        let fullCache = cache[fullAttentionIdx]
+        let slidingCache = cache[slidingAttentionIdx]
+        guard type(of: fullCache) == KVCacheSimple.self,
+            type(of: slidingCache) == RotatingKVCache.self,
+            slidingCache.maxSize == slidingWindow
+        else {
+            return nil
+        }
+
+        let fullPosition = fullCache.offset
+        let slidingPosition = slidingCache.offset
+        guard fullPosition == slidingPosition,
+            fullPosition >= 0,
+            fullPosition < lagunaRoPEAngleAtlasLength
+        else {
+            return nil
+        }
+        return fullPosition
+    }
+
     /// Runs `attention`'s own RoPE layer over `seed` at the cache's current
     /// position, honoring a graph-valued offset when the cache carries one.
     private func ropeAngleTable(
@@ -3528,7 +3746,42 @@ final class LagunaRuntimeModelInner: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
-        var h = embedTokens(inputs)
+        var h: MLXArray
+        let fullRoPEAngles: MLXArray?
+        let slidingRoPEAngles: MLXArray?
+        if let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
+            let fullAtlas = _fullRoPEAngleAtlas,
+            let slidingAtlas = _slidingRoPEAngleAtlas,
+            let atlasOutputs = lagunaDecodeEmbeddingRoPEAtlas(
+                tokens: inputs,
+                embeddingWeight: embedTokens.weight,
+                fullAtlas: fullAtlas,
+                slidingAtlas: slidingAtlas,
+                position: position)
+        {
+            h = atlasOutputs.hidden
+            fullRoPEAngles = atlasOutputs.fullAngles
+            slidingRoPEAngles = atlasOutputs.slidingAngles
+        } else {
+            // Verbatim stock fallback for prefill, unsupported caches and
+            // positions outside the precomputed atlas.
+            h = embedTokens(inputs)
+            let isSingleTokenDecode = h.dim(0) == 1 && h.dim(1) == 1
+            fullRoPEAngles =
+                lagunaFusedFullQKNormYaRNEnabled && isSingleTokenDecode
+                ? ropeAngleTable(
+                    seed: _fullRoPEAngleSeed,
+                    attention: layers[fullAttentionIdx].selfAttn,
+                    cache: cache?[fullAttentionIdx])
+                : nil
+            slidingRoPEAngles =
+                lagunaFusedSlidingQKNormRoPEEnabled && isSingleTokenDecode
+                ? ropeAngleTable(
+                    seed: _slidingRoPEAngleSeed,
+                    attention: layers[slidingAttentionIdx].selfAttn,
+                    cache: cache?[slidingAttentionIdx])
+                : nil
+        }
 
         // One mask per attention family, derived from a representative
         // layer's cache offset: all full-attention caches advance in
@@ -3543,19 +3796,6 @@ final class LagunaRuntimeModelInner: Module {
         // table is produced by running the family's own RoPE layer over a
         // seed row, so the angles are the exact floats that layer's kernel
         // would have computed rather than a re-derivation.
-        let isSingleTokenDecode = h.dim(0) == 1 && h.dim(1) == 1
-        let fullRoPEAngles = lagunaFusedFullQKNormYaRNEnabled && isSingleTokenDecode
-            ? ropeAngleTable(
-                seed: _fullRoPEAngleSeed,
-                attention: layers[fullAttentionIdx].selfAttn,
-                cache: cache?[fullAttentionIdx])
-            : nil
-        let slidingRoPEAngles = lagunaFusedSlidingQKNormRoPEEnabled && isSingleTokenDecode
-            ? ropeAngleTable(
-                seed: _slidingRoPEAngleSeed,
-                attention: layers[slidingAttentionIdx].selfAttn,
-                cache: cache?[slidingAttentionIdx])
-            : nil
 
         for (i, layer) in layers.enumerated() {
             let isFull = layerTypes[i] == .full
@@ -3667,7 +3907,7 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     /// checkpoint parameters are never restructured; every fused layout is a
     /// derived side copy.
     func prepareFusedRuntimeWeights() {
-        var fusedArrays: [MLXArray] = []
+        var fusedArrays = model.prepareRoPEAngleAtlases()
         for layer in model.layers {
             if lagunaFusedQKVEnabled, let fused = layer.selfAttn.prepareFusedQKVWeight() {
                 fusedArrays.append(fused)
