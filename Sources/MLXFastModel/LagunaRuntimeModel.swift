@@ -2575,69 +2575,150 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
     let epilogue =
         normalizing
         ? """
-                float total = 0.0f;
-                for (uint i = 0; i < 8; ++i) {
-                    total = scores[i] + total;
-                }
-                router_scores[lane] = scores[lane] / total;
+        float total = 0.0f;
+        for (uint i = 0; i < 8; ++i) {
+            total = simd_shuffle(my_final_score, ushort(i)) + total;
+        }
+        if (lane < 8) {
+            router_indices[lane] = my_final_index;
+            router_scores[lane] = my_final_score / total;
+        }
         """
         : """
-                router_scores[lane] = scores[lane];
+        if (lane < 8) {
+            router_indices[lane] = my_final_index;
+            router_scores[lane] = my_final_score;
+        }
         """
     return """
         uint lane = thread_position_in_threadgroup.x;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint simd_lane = thread_index_in_simdgroup;
 
-        threadgroup float scores[256];
-        threadgroup float choice_keys[256];
-        threadgroup uint expert_indices[256];
+        threadgroup float stage_keys[64];
+        threadgroup uint stage_indices[64];
+        threadgroup float stage_scores[64];
 
         float x = float(logits[lane]);
         float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
-        float score = x < 0.0f ? y : 1.0f - y;
-        scores[lane] = score;
-        float corrected = score + float(correction_bias[lane]);
-        choice_keys[lane] = -corrected;
-        expert_indices[lane] = lane;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float my_score = x < 0.0f ? y : 1.0f - y;
+        float my_key = -(my_score + float(correction_bias[lane]));
+        uint my_index = lane;
 
-        // A total order (choice key, then original expert index) makes this
-        // network match the stock stable merge sort even for exact ties,
-        // signed zero, and NaNs. The lower half of each final sequence keeps
-        // the better entries, so ranks 0..<8 are the desired top experts.
-        for (uint sequence = 2; sequence <= 256; sequence <<= 1) {
-            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
-                uint partner = lane ^ stride;
-                if (partner > lane) {
-                    float a_key = choice_keys[lane];
-                    uint a_index = expert_indices[lane];
-                    float a_score = scores[lane];
-                    float b_key = choice_keys[partner];
-                    uint b_index = expert_indices[partner];
-                    float b_score = scores[partner];
+        // Hierarchical top-8 selection under the same strict total order
+        // (choice key, then original expert index) the stock stable merge
+        // argsort realizes. A strict total order has a unique minimum over
+        // any candidate set regardless of the comparison tree, so repeated
+        // extract-min yields exactly the stock sort's ranks 0..<8 -- the
+        // only rows this kernel has ever emitted. Every global top-8 expert
+        // is necessarily within its own simdgroup's top 8, so per-simdgroup
+        // top-8 followed by a 64-candidate final selection is exact.
+        //
+        // Round r of each phase finds the current minimum via a
+        // simd_shuffle_xor butterfly (bit-preserving; comparator unchanged),
+        // hands it to collector lane r, and masks the winner with a
+        // sentinel that the total order places strictly after every real
+        // candidate: a NaN key with expert index 0xFFFFFFFF (real NaN keys
+        // carry indices < 256 and win the NaN-vs-NaN index tie-break;
+        // non-NaN keys precede NaN keys outright).
 
-                    bool lower_wants_better = (lane & sequence) == 0;
-                    bool b_before_a = laguna_router_key_before(
-                        b_key, b_index, a_key, a_index);
-                    bool a_before_b = laguna_router_key_before(
-                        a_key, a_index, b_key, b_index);
-                    bool swap = lower_wants_better ? b_before_a : a_before_b;
-                    if (swap) {
-                        choice_keys[lane] = b_key;
-                        expert_indices[lane] = b_index;
-                        scores[lane] = b_score;
-                        choice_keys[partner] = a_key;
-                        expert_indices[partner] = a_index;
-                        scores[partner] = a_score;
-                    }
+        // --- phase 1: per-simdgroup top 8 (registers only, no barriers) ---
+        float rank_key = 0.0f;
+        uint rank_index = 0u;
+        float rank_score = 0.0f;
+        for (uint round = 0; round < 8; ++round) {
+            float best_key = my_key;
+            uint best_index = my_index;
+            float best_score = my_score;
+            for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                float other_key = simd_shuffle_xor(best_key, delta);
+                uint other_index = simd_shuffle_xor(best_index, delta);
+                float other_score = simd_shuffle_xor(best_score, delta);
+                if (laguna_router_key_before(
+                        other_key, other_index, best_key, best_index)) {
+                    best_key = other_key;
+                    best_index = other_index;
+                    best_score = other_score;
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (simd_lane == round) {
+                rank_key = best_key;
+                rank_index = best_index;
+                rank_score = best_score;
+            }
+            if (my_index == best_index) {
+                my_key = as_type<float>(0x7FC00000u);
+                my_index = 0xFFFFFFFFu;
             }
         }
 
-        if (lane < 8) {
-            router_indices[lane] = expert_indices[lane];
-        \(epilogue)
+        // --- publish the 8 x 8 survivors, one barrier ---
+        if (simd_lane < 8) {
+            stage_keys[simd_group * 8 + simd_lane] = rank_key;
+            stage_indices[simd_group * 8 + simd_lane] = rank_index;
+            stage_scores[simd_group * 8 + simd_lane] = rank_score;
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- phase 2: simdgroup 0 selects the global top 8 from 64
+        // candidates (two per lane, registers only) ---
+        float cand_key_a = 0.0f;
+        uint cand_index_a = 0xFFFFFFFFu;
+        float cand_score_a = 0.0f;
+        float cand_key_b = 0.0f;
+        uint cand_index_b = 0xFFFFFFFFu;
+        float cand_score_b = 0.0f;
+        if (simd_group == 0) {
+            cand_key_a = stage_keys[simd_lane];
+            cand_index_a = stage_indices[simd_lane];
+            cand_score_a = stage_scores[simd_lane];
+            cand_key_b = stage_keys[32 + simd_lane];
+            cand_index_b = stage_indices[32 + simd_lane];
+            cand_score_b = stage_scores[32 + simd_lane];
+        }
+        uint final_expert = 0u;
+        float final_score = 0.0f;
+        if (simd_group == 0) {
+            for (uint round = 0; round < 8; ++round) {
+                bool b_first = laguna_router_key_before(
+                    cand_key_b, cand_index_b, cand_key_a, cand_index_a);
+                float best_key = b_first ? cand_key_b : cand_key_a;
+                uint best_index = b_first ? cand_index_b : cand_index_a;
+                float best_score = b_first ? cand_score_b : cand_score_a;
+                for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                    float other_key = simd_shuffle_xor(best_key, delta);
+                    uint other_index = simd_shuffle_xor(best_index, delta);
+                    float other_score = simd_shuffle_xor(best_score, delta);
+                    if (laguna_router_key_before(
+                            other_key, other_index, best_key, best_index)) {
+                        best_key = other_key;
+                        best_index = other_index;
+                        best_score = other_score;
+                    }
+                }
+                if (simd_lane == round) {
+                    final_expert = best_index;
+                    final_score = best_score;
+                }
+                if (cand_index_a == best_index) {
+                    cand_key_a = as_type<float>(0x7FC00000u);
+                    cand_index_a = 0xFFFFFFFFu;
+                }
+                if (cand_index_b == best_index) {
+                    cand_key_b = as_type<float>(0x7FC00000u);
+                    cand_index_b = 0xFFFFFFFFu;
+                }
+            }
+        }
+
+        // Ranks 0..<8 live in lanes 0..<8 of simdgroup 0. The epilogue runs
+        // across all of simdgroup 0 so every shuffle source lane is active;
+        // only lanes < 8 write. The rank-order left fold reproduces the
+        // stock epilogue's `total = scores[i] + total` operand order
+        // exactly.
+        float my_final_score = final_score;
+        uint my_final_index = final_expert;
+        \(epilogue)
         """
 }
 
@@ -2663,7 +2744,7 @@ private let lagunaDecodeRouterTop8Header = """
     """
 
 private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_v2",
+    name: "laguna_decode_router_top8_v4",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterTop8KernelSource(normalizing: false),
@@ -2672,7 +2753,7 @@ private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
 )
 
 private let lagunaDecodeRouterTop8NormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_norm_v1",
+    name: "laguna_decode_router_top8_norm_v3",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterTop8KernelSource(normalizing: true),
