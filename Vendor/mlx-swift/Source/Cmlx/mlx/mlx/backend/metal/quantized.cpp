@@ -1249,6 +1249,12 @@ bool darkbloom_stage_novol() {
   return v;
 }
 
+bool darkbloom_stage_direct() {
+  static const bool v =
+      env::get_var("DARKBLOOM_STAGE_DIRECT", "") != "0";
+  return v;
+}
+
 // DARKBLOOM_STAGE_BM128: select the gather-GEMM m-tiling. NOT a function
 // constant -- it changes the template instantiation, so it is already in
 // `kname` (`_bm_`/`_wm_`/`_wn_`) and therefore in the library name and the
@@ -1506,6 +1512,15 @@ void gather_qmm_rhs_nax(
   const bool stage_wideld = darkbloom_stage_wideld() && wide_ok;
   const bool stage_runbar = darkbloom_stage_runbar();
   const bool stage_novol = darkbloom_stage_novol();
+  // Direct fragment loading is specialized narrowly to Laguna's sorted,
+  // aligned NVFP4 gather-QMMs. Decode uses dedicated QMV kernels, while
+  // non-Laguna shapes retain the upstream threadgroup staging path.
+  const bool laguna_moe_shape =
+      (K == 2048 && N == 1024) || (K == 512 && N == 2048);
+  const bool stage_direct =
+      darkbloom_stage_direct() && mode != "affine" && transpose &&
+      group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
+      align_N && align_K;
 
   // Ground truth for the A/B harness. `stage_wideld` is silently downgraded
   // to false when the host alignment certification declines, and `wide_ok`
@@ -1519,7 +1534,7 @@ void gather_qmm_rhs_nax(
       fprintf(
           stderr,
           "mlxfast: stage active: widest=%d wideld=%d(req=%d wide_ok=%d) "
-          "runbar=%d novol=%d bm128=%d bm=%d wm=%d wn=%d "
+          "runbar=%d novol=%d direct=%d bm128=%d bm=%d wm=%d wn=%d "
           "w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d\n",
           int(stage_widest),
           int(stage_wideld),
@@ -1527,6 +1542,7 @@ void gather_qmm_rhs_nax(
           int(wide_ok),
           int(stage_runbar),
           int(stage_novol),
+          int(stage_direct),
           bm128,
           bm,
           wm,
@@ -1549,6 +1565,7 @@ void gather_qmm_rhs_nax(
       {&stage_wideld, MTL::DataType::DataTypeBool, 205},
       {&stage_runbar, MTL::DataType::DataTypeBool, 206},
       {&stage_novol, MTL::DataType::DataTypeBool, 207},
+      {&stage_direct, MTL::DataType::DataTypeBool, 208},
   };
 
   // And the kernel hash that includes the function constants
@@ -1569,7 +1586,8 @@ void gather_qmm_rhs_nax(
       stage_widest ? 'W' : 'n',
       stage_wideld ? 'L' : 'n',
       stage_runbar ? 'B' : 'n',
-      stage_novol ? 'V' : 'n');
+      stage_novol ? 'V' : 'n',
+      stage_direct ? 'D' : 'n');
 
   // Get and set the kernel
   auto& compute_encoder = metal::get_command_encoder(s);

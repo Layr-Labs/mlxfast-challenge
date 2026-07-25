@@ -171,6 +171,11 @@ constant bool stage_widest [[function_constant(204)]];
 constant bool stage_wideld [[function_constant(205)]];
 constant bool stage_runbar [[function_constant(206)]];
 constant bool stage_novol [[function_constant(207)]];
+// Laguna's sorted NVFP4 gather-QMM path can feed each NAX B fragment directly
+// from the packed expert bank. This removes the full-tile threadgroup
+// dequantize/store/barrier/load round trip; inactive RUNSKIP simdgroups also
+// avoid their B work entirely.
+constant bool stage_direct [[function_constant(208)]];
 
 using namespace metal;
 
@@ -489,6 +494,23 @@ struct QuantizedBlockLoader {
     }
   }
 
+  void load_compressed(
+      threadgroup uint8_t* packed_dst,
+      threadgroup uint8_t* scale_dst) const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < n_reads; ++i) {
+      packed_dst[bi * BCOLS_PACKED + bj + i] =
+          src[i * bytes_per_pack];
+    }
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < n_steps_per_read; ++i) {
+      scale_dst[bi * n_groups + group_id + i] = scales[i];
+    }
+  }
+
   void next() {
     src += tile_stride;
     if (reduction_dim == 1) {
@@ -498,6 +520,45 @@ struct QuantizedBlockLoader {
     }
   }
 };
+
+template <typename T, short BR, short BC>
+METAL_FUNC void load_nvfp4_rhs_direct(
+    thread mlx::steel::NAXTile<T, BR, BC>& tile,
+    const threadgroup uint8_t* packed,
+    const threadgroup uint8_t* scales,
+    const int packed_row_stride,
+    const int scale_row_stride,
+    const int row_base,
+    const int col_base) {
+  const short2 sc = mlx::steel::BaseNAXFrag::get_coord();
+  STEEL_PRAGMA_UNROLL
+  for (short frag_row = 0; frag_row < BR; ++frag_row) {
+    STEEL_PRAGMA_UNROLL
+    for (short frag_col = 0; frag_col < BC; ++frag_col) {
+      STEEL_PRAGMA_UNROLL
+      for (short elem_row = 0; elem_row < 2; ++elem_row) {
+        const int row =
+            row_base + frag_row * 16 + sc.y + elem_row * 8;
+        const int col = col_base + frag_col * 16 + sc.x;
+        const threadgroup uint8_t* src =
+            packed + row * packed_row_stride + col / 2;
+        const T scale = dequantize_scale<T, 16>(
+            scales[row * scale_row_stride + col / 16]);
+        const uint8_t w0 = src[0];
+        const uint8_t w1 = src[1];
+        thread auto& frag = tile.frag_at(frag_row, frag_col);
+        frag[elem_row * 4 + 0] =
+            scale * Dequantize<4, T>{}(w0);
+        frag[elem_row * 4 + 1] =
+            scale * Dequantize<4, T>{}(w0 >> 4);
+        frag[elem_row * 4 + 2] =
+            scale * Dequantize<4, T>{}(w1);
+        frag[elem_row * 4 + 3] =
+            scale * Dequantize<4, T>{}(w1 >> 4);
+      }
+    }
+  }
+}
 
 using namespace mlx::steel;
 
@@ -1153,6 +1214,8 @@ template <
   threadgroup NAXWsChunk16<Wtype>
       Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
   threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
+  threadgroup uint8_t* packed_ws = (threadgroup uint8_t*)Ws_storage;
+  threadgroup uint8_t* scale_ws = packed_ws + BN * BK / 2;
 
   // Compute the block
   const int K_w = K * bytes_per_pack / pack_factor;
@@ -1284,27 +1347,33 @@ template <
     dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
       dispatch_bool(align_N || !is_unaligned_bn, [&](auto kAlignedN) {
         for (int k = 0; k < K_it; k++) {
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          if constexpr (kAlignedN.value) {
-            // Same bytes, same addresses, same nibble decode, same scale
-            // mapping -- only the access width changes. See load_unsafe_wide.
-            if (stage_widest) {
-              if (stage_wideld) {
-                loader_w.template load_unsafe_wide<true, true>();
+          if (!stage_direct) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if constexpr (kAlignedN.value) {
+              // Same bytes, same addresses, same nibble decode, same scale
+              // mapping -- only the access width changes. See load_unsafe_wide.
+              if (stage_widest) {
+                if (stage_wideld) {
+                  loader_w.template load_unsafe_wide<true, true>();
+                } else {
+                  loader_w.template load_unsafe_wide<true, false>();
+                }
+              } else if (stage_wideld) {
+                loader_w.template load_unsafe_wide<false, true>();
               } else {
-                loader_w.template load_unsafe_wide<true, false>();
+                loader_w.load_unsafe();
               }
-            } else if (stage_wideld) {
-              loader_w.template load_unsafe_wide<false, true>();
             } else {
-              loader_w.load_unsafe();
+              loader_w.load_safe(
+                  transpose ? short2(BK, tgp_bn) : short2(tgp_bn, BK));
             }
-          } else {
-            loader_w.load_safe(
-                transpose ? short2(BK, tgp_bn) : short2(tgp_bn, BK));
-          }
 
-          threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          } else {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            loader_w.load_compressed(packed_ws, scale_ws);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
 
           if (sg_active) {
             STEEL_PRAGMA_NO_UNROLL
@@ -1320,7 +1389,21 @@ template <
                 Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
               }
 
-              if constexpr (transpose) {
+              if constexpr (transpose && group_size == 16 && bits == 4) {
+                if (stage_direct) {
+                  load_nvfp4_rhs_direct(
+                      Btile,
+                      packed_ws,
+                      scale_ws,
+                      BK / 2,
+                      BK / 16,
+                      tn,
+                      kk1);
+                } else {
+                  Btile.template load<Wtype, BK_padded, 1>(
+                      Ws + tn * BK_padded + kk1);
+                }
+              } else if constexpr (transpose) {
                 Btile.template load<Wtype, BK_padded, 1>(
                     Ws + tn * BK_padded + kk1);
               } else {
@@ -1394,7 +1477,7 @@ template <
         // writes device memory. The write-after-read hazard against the next
         // run's Ws stores is already covered by the mem_threadgroup barrier
         // that immediately precedes those stores.
-        if (!stage_runbar) {
+        if (!stage_runbar && !stage_direct) {
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
