@@ -175,7 +175,8 @@ objects:
 ```bash
 MLXFAST_RUN_LAGUNA_UPSTREAM_EQUIVALENCE=1 \
 MLXFAST_LAGUNA_EQUIVALENCE_WEIGHTS_PATH=weights \
-swift test --filter lagunaRuntimeMatchesVendoredUpstreamOnM5WhenEnabled
+swift test --force-resolved-versions \
+  --filter lagunaRuntimeMatchesVendoredUpstreamOnM5WhenEnabled
 ```
 
 The test reports maximum/mean absolute logit error and both greedy tokens for

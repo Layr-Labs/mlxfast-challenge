@@ -316,13 +316,20 @@ provisioned externally).
 Common commands:
 
 ```bash
-swift test
-MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test
-swift build -c release
+swift test --force-resolved-versions
+MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test --force-resolved-versions
+swift build -c release --force-resolved-versions
 tools/build-mlx-metallib.sh
 ./benchmark.sh --local-iterate
 ./benchmark.sh --local-submit
 ```
+
+Pass `--force-resolved-versions` on every direct `swift build` / `swift
+test`: the dependency graph is frozen, and a bare invocation can silently
+rewrite `Package.resolved` (SwiftPM re-resolves the ranged transitive pins
+on toolchain drift), after which `./setup.sh` and `./benchmark.sh` refuse
+to run until you restore it with `git checkout -- Package.resolved`. The
+flag makes SwiftPM fail closed instead.
 
 `./benchmark.sh --local-iterate` is the fast local edit-loop signal.
 Use it to compare the current working tree against the latest-tip baseline you
@@ -434,13 +441,18 @@ toolchain. Point your editor at the repository root so SourceKit-LSP can read
 Useful local tooling commands:
 
 ```bash
-swift package resolve
-swift build -c release
-swift test
+swift build -c release --force-resolved-versions
+swift test --force-resolved-versions
 sourcekit-lsp
 xcode-select -p
 xcrun --find sourcekit-lsp
 ```
+
+Avoid bare `swift package resolve` / `swift package update`: they can
+rewrite the frozen `Package.resolved` (there is no fail-closed flag for
+`resolve`), and `./setup.sh` plus the flagged builds already resolve
+fail-closed. If `Package.resolved` ever shows as modified, restore it with
+`git checkout -- Package.resolved`.
 
 For editor agents, prefer SourceKit-LSP symbol navigation and diagnostics over
 string-only edits when changing Swift model code. Use `swift test` for cheap
@@ -532,7 +544,7 @@ ranked run.
 Run at least:
 
 ```bash
-swift test
+swift test --force-resolved-versions
 ./setup.sh
 ./benchmark.sh --local-submit
 ```

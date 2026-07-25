@@ -2232,7 +2232,8 @@ func buildEntrypointsAssertFrozenDependencyGraph() throws {
 
     // Every ranked resolve/build passes --force-resolved-versions too.
     for workflowPath in [
-        ".github/workflows/benchmark.yml"
+        ".github/workflows/benchmark.yml",
+        ".github/workflows/ci.yml",
     ] {
         let workflow = try String(contentsOfFile: workflowPath, encoding: .utf8)
         #expect(
@@ -2243,6 +2244,41 @@ func buildEntrypointsAssertFrozenDependencyGraph() throws {
             !workflow.contains("swift build -c release --product"),
             "\(workflowPath) must build with --force-resolved-versions"
         )
+        #expect(
+            !workflow.contains("swift test -c release\n"),
+            "\(workflowPath) must test with --force-resolved-versions"
+        )
+    }
+}
+
+/// The contestant docs' own command blocks must not instruct a bare
+/// `swift build` / `swift test` / `swift package resolve`: a bare invocation
+/// can silently rewrite the frozen Package.resolved (SwiftPM re-resolves the
+/// ranged transitive pins on toolchain drift), after which setup.sh and
+/// benchmark.sh refuse to run via assert_frozen_dependency_graph — blaming
+/// the contestant for following the docs.
+@Test
+func contestantDocsCommandBlocksKeepTheDependencyGraphFrozen() throws {
+    for docPath in ["AGENTS.md", "TASK.md", "README.md"] {
+        let doc = try String(contentsOfFile: docPath, encoding: .utf8)
+        for bare in ["\nswift test\n", "\nswift build -c release\n", "\nswift package resolve\n"] {
+            #expect(
+                !doc.contains(bare),
+                "\(docPath) documents a bare\(bare)which can rewrite the frozen Package.resolved; add --force-resolved-versions"
+            )
+        }
+        // Also catches env-prefixed bare invocations like
+        // `MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test`.
+        #expect(
+            !doc.contains(" swift test\n"),
+            "\(docPath) documents a bare env-prefixed swift test; add --force-resolved-versions"
+        )
+    }
+    for docPath in ["AGENTS.md", "TASK.md"] {
+        let doc = try String(contentsOfFile: docPath, encoding: .utf8)
+        #expect(doc.contains("swift test --force-resolved-versions"))
+        #expect(doc.contains("swift build -c release --force-resolved-versions"))
+        #expect(doc.contains("git checkout -- Package.resolved"))
     }
 }
 
