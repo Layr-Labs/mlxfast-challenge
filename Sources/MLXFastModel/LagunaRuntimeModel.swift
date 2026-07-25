@@ -2038,14 +2038,14 @@ func lagunaRoutedSwiGLUQMV(
 
 /// The routed and shared gate/up QMVs read the same activation row, write
 /// different outputs, and share an identical tile shape: 128 tiles of four
-/// output rows, two rows per simdgroup, four 512-wide K blocks. They are also
+/// output rows and four 512-wide K blocks. They are also
 /// independent of each other, so MLX issues them into the same barrier group
 /// anyway. Merging them into one nine-slot dispatch (slots 0-7 routed, slot 8
 /// shared) removes one dispatch per sparse layer without touching either
 /// slot's arithmetic: a threadgroup does exactly the work it did before, over
 /// the same bank, in the same order.
 private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_v1",
+    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_v2",
     inputNames: [
         "input", "routed_weight", "routed_scales", "indices",
         "shared_weight", "shared_scales",
@@ -2073,7 +2073,10 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
         bool is_routed = expert_slot < routed_experts;
         uint simd_group = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
-        uint first_row = tile * 4 + simd_group * 2;
+        // Four simdgroups now own one row each instead of two simdgroups
+        // owning two rows each. Per-row K traversal is identical; this only
+        // halves accumulator registers and doubles latency-hiding lanes.
+        uint first_row = tile * 4 + simd_group;
 
         const device uint8_t* expert_weight;
         const device uint8_t* expert_scales;
@@ -2088,8 +2091,8 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             expert_scales = shared_scales;
         }
 
-        thread float gate_result[2] = {0.0f, 0.0f};
-        thread float up_result[2] = {0.0f, 0.0f};
+        thread float gate_result = 0.0f;
+        thread float up_result = 0.0f;
         thread float input_values[values_per_lane];
 
         for (uint block = 0; block < input_width; block += block_width) {
@@ -2104,52 +2107,48 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
                 input_values[4 * i + 3] = values[3];
             }
 
-            for (uint row = 0; row < 2; ++row) {
-                uint gate_row = first_row + row;
-                uint up_row = gate_row + output_width;
-                const device uint8_t* gate_weight =
-                    expert_weight + gate_row * packed_row_bytes +
-                    block / 2 + lane * 8;
-                const device uint8_t* up_weight =
-                    expert_weight + up_row * packed_row_bytes +
-                    block / 2 + lane * 8;
-                const device uint8_t* gate_scale =
-                    expert_scales + gate_row * scale_row_bytes +
-                    block / 16 + lane;
-                const device uint8_t* up_scale =
-                    expert_scales + up_row * scale_row_bytes +
-                    block / 16 + lane;
+            uint gate_row = first_row;
+            uint up_row = gate_row + output_width;
+            const device uint8_t* gate_weight =
+                expert_weight + gate_row * packed_row_bytes +
+                block / 2 + lane * 8;
+            const device uint8_t* up_weight =
+                expert_weight + up_row * packed_row_bytes +
+                block / 2 + lane * 8;
+            const device uint8_t* gate_scale =
+                expert_scales + gate_row * scale_row_bytes +
+                block / 16 + lane;
+            const device uint8_t* up_scale =
+                expert_scales + up_row * scale_row_bytes +
+                block / 16 + lane;
 
-                gate_result[row] += laguna_nvfp4_qdot_16(
-                    gate_weight,
-                    input_values,
-                    laguna_nvfp4_scale(gate_scale[0]));
-                up_result[row] += laguna_nvfp4_qdot_16(
-                    up_weight,
-                    input_values,
-                    laguna_nvfp4_scale(up_scale[0]));
-            }
+            gate_result += laguna_nvfp4_qdot_16(
+                gate_weight,
+                input_values,
+                laguna_nvfp4_scale(gate_scale[0]));
+            up_result += laguna_nvfp4_qdot_16(
+                up_weight,
+                input_values,
+                laguna_nvfp4_scale(up_scale[0]));
         }
 
-        for (uint row = 0; row < 2; ++row) {
-            gate_result[row] = simd_sum(gate_result[row]);
-            up_result[row] = simd_sum(up_result[row]);
-            if (lane == 0) {
-                bfloat gate = bfloat(gate_result[row]);
-                bfloat up = bfloat(up_result[row]);
-                bfloat exp_abs = metal::exp(metal::abs(gate));
-                bfloat denominator = bfloat(1) + exp_abs;
-                bfloat y = bfloat(1) / denominator;
-                bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
-                bfloat silu = bfloat(gate * sigmoid);
-                bfloat activation = bfloat(silu * up);
-                if (is_routed) {
-                    routed_activated[
-                        expert_slot * output_width + first_row + row
-                    ] = activation;
-                } else {
-                    shared_activated[first_row + row] = activation;
-                }
+        gate_result = simd_sum(gate_result);
+        up_result = simd_sum(up_result);
+        if (lane == 0) {
+            bfloat gate = bfloat(gate_result);
+            bfloat up = bfloat(up_result);
+            bfloat exp_abs = metal::exp(metal::abs(gate));
+            bfloat denominator = bfloat(1) + exp_abs;
+            bfloat y = bfloat(1) / denominator;
+            bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+            bfloat silu = bfloat(gate * sigmoid);
+            bfloat activation = bfloat(silu * up);
+            if (is_routed) {
+                routed_activated[
+                    expert_slot * output_width + first_row
+                ] = activation;
+            } else {
+                shared_activated[first_row] = activation;
             }
         }
         """,
@@ -2199,8 +2198,8 @@ func lagunaRoutedSharedSwiGLUQMV(
     lagunaTrace("routed+shared gate/up QMV")
     let outputs = lagunaRoutedSharedSwiGLUQMVKernel(
         [input, routedWeight, routedScales, indices, sharedWeight, sharedScales],
-        grid: ((LagunaConstants.numExpertsPerTok + 1) * 128 * 64, 1, 1),
-        threadGroup: (64, 1, 1),
+        grid: ((LagunaConstants.numExpertsPerTok + 1) * 128 * 128, 1, 1),
+        threadGroup: (128, 1, 1),
         outputShapes: [
             [
                 1, 1, LagunaConstants.numExpertsPerTok, 1,
@@ -2354,7 +2353,7 @@ func lagunaRoutedDownReduce(
 }
 
 private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_down_residual_bf16_v1",
+    name: "laguna_routed_shared_nvfp4_down_residual_bf16_v2",
     inputNames: [
         "routed_activated", "routed_down_weight", "routed_down_scales",
         "indices", "router_weights", "shared_activated",
@@ -2366,7 +2365,9 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
         constexpr uint output_width = 2048;
         constexpr uint routed_experts = 8;
         constexpr uint shared_slot = 8;
-        constexpr uint outputs_per_simd = 4;
+        constexpr uint outputs_per_simd = 2;
+        constexpr uint outputs_per_tile = 4;
+        constexpr uint simds_per_slot = 2;
         constexpr uint values_per_lane = 16;
         constexpr uint packed_row_bytes = 256;
         constexpr uint scale_row_bytes = 32;
@@ -2376,9 +2377,12 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
             output_width * scale_row_bytes;
 
         uint tile = threadgroup_position_in_grid.x;
-        uint slot = simdgroup_index_in_threadgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint slot = simd_group / simds_per_slot;
+        uint row_shard = simd_group % simds_per_slot;
         uint lane = thread_index_in_simdgroup;
-        uint first_row = tile * outputs_per_simd;
+        uint first_row =
+            tile * outputs_per_tile + row_shard * outputs_per_simd;
         bool is_shared = slot == shared_slot;
         uint expert = is_shared ? 0 : uint(indices[slot]);
 
@@ -2405,9 +2409,7 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
             input_values[4 * i + 3] = values[3];
         }
 
-        thread float result[outputs_per_simd] = {
-            0.0f, 0.0f, 0.0f, 0.0f
-        };
+        thread float result[outputs_per_simd] = {0.0f, 0.0f};
         for (uint row = 0; row < outputs_per_simd; ++row) {
             uint output_row = first_row + row;
             const device uint8_t* weight =
@@ -2422,17 +2424,20 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
         }
 
         threadgroup bfloat down_outputs[
-            (routed_experts + 1) * outputs_per_simd
+            (routed_experts + 1) * outputs_per_tile
         ];
         if (lane == 0) {
             for (uint row = 0; row < outputs_per_simd; ++row) {
-                down_outputs[slot * outputs_per_simd + row] =
+                down_outputs[
+                    slot * outputs_per_tile +
+                    row_shard * outputs_per_simd + row
+                ] =
                     bfloat(result[row]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (slot == 0 && lane < outputs_per_simd) {
+        if (simd_group == 0 && lane < outputs_per_tile) {
             bfloat routed_total = bfloat(0);
             for (uint routed_slot = 0;
                  routed_slot < routed_experts;
@@ -2441,17 +2446,18 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
                     bfloat(router_weights[routed_slot]);
                 bfloat product = bfloat(
                     down_outputs[
-                        routed_slot * outputs_per_simd + lane
+                        routed_slot * outputs_per_tile + lane
                     ] * route_weight);
                 routed_total = bfloat(product + routed_total);
             }
             bfloat routed = bfloat(
                 routed_total * bfloat(2.5f));
             bfloat shared =
-                down_outputs[shared_slot * outputs_per_simd + lane];
+                down_outputs[shared_slot * outputs_per_tile + lane];
             bfloat r2 = bfloat(routed + shared);
-            output[first_row + lane] =
-                bfloat(residual[first_row + lane] + r2);
+            uint output_row = tile * outputs_per_tile + lane;
+            output[output_row] =
+                bfloat(residual[output_row] + r2);
         }
         """,
     header: lagunaSharedSwiGLUQMVHeader,
@@ -2519,8 +2525,8 @@ func lagunaRoutedSharedDownResidual(
             indices, routerWeights, sharedActivated,
             sharedDownWeight, sharedDownScales, residual,
         ],
-        grid: ((LagunaConstants.hiddenSize / 4) * 288, 1, 1),
-        threadGroup: (288, 1, 1),
+        grid: ((LagunaConstants.hiddenSize / 4) * 576, 1, 1),
+        threadGroup: (576, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
         outputDTypes: [.bfloat16]
     )[0]
