@@ -1249,6 +1249,90 @@ bool darkbloom_stage_novol() {
   return v;
 }
 
+// DARKBLOOM_STAGE_BM128: select the gather-GEMM m-tiling. NOT a function
+// constant -- it changes the template instantiation, so it is already in
+// `kname` (`_bm_`/`_wm_`/`_wn_`) and therefore in the library name and the
+// pipeline key. Resolved once per process, so exactly one variant is ever
+// compiled and a fresh process picks up a changed environment cleanly.
+//
+//   unset (SHIPPED) -> 5  (BM=64, WM=4, WN=1)  SM=16
+//   "0"             -> 0  (BM=64, WM=2, WN=2)  SM=32  upstream tiling
+//   "1"             -> 1  (BM=128, WM=4)       SM=32  less expert re-staging
+//   "2"             -> 2  (BM=128, WM=2)       SM=64  predicted regression
+//   "3"             -> 3  (BM=128, WM=8)       SM=16  both mechanisms
+//   "4"             -> 4  (BM=64,  WM=4)       SM=16  finer elision, 256 thr/TG
+//
+// WHY SM=16 IS THE WIN. DARKBLOOM_PREFILL_GATHER_RUNSKIP elides a run for a
+// simdgroup only when the intersection with its SM-row band is EMPTY. On
+// PARTIAL overlap the simdgroup still computes all SM rows and store_slice
+// discards the rest. `tm = SM * (simd_group_id / WN)` gives bands of
+// SM = BM/WM rows, so halving SM narrows the band and converts partial
+// overlaps into full elisions. Simulated over uniform routing (the model
+// reproduces the measured 4.92 runs/tile and 40.5% elision):
+//
+//   SM=32 (upstream)  elision 40.5%  MMA 2.93x ideal  34% of rows useful
+//   SM=16             elision 60.7%  MMA 1.94x ideal  52% of rows useful
+//
+// This is the FRAGSKIP prize reached through TILING instead of predication:
+// FRAGSKIP was rejected because a 16-row predicate is thread-varying and
+// tile_matmad_nax is a simdgroup-collective op that cannot be lane-masked.
+// Here the RUNSKIP predicate is untouched and stays simdgroup-uniform; only
+// the bands are narrower.
+//
+// WHY VARIANT 5 AND NOT 1/3/4. Variant 5 buys the row split from the COLUMN
+// axis (WN 2 -> 1) rather than from the thread count, so relative to upstream:
+// threads/TG stays 128, simdgroups stays 4, the grid stays 512 TGs, expert
+// re-staging stays at 315 stage-units, Dtile stays 32 floats and the loader's
+// n_reads stays 16. The ONLY thing that moves is the RUNSKIP band width,
+// 32 -> 16. Variants 1 and 2 move BM and both measured slower (variant 1:
+// -1.95% prefill, t=-5.30, 0/4 pairs); variant 4 confounds SM with a 2x
+// thread count.
+//
+// EXACTNESS. BN, BK and SK are untouched and WN only re-partitions columns
+// across simdgroups, so every output element is still accumulated over the
+// same K_it x (BK/SK) sequence, in the same order, inside one simdgroup's
+// fragment accumulator. Only the assignment of row/column blocks to
+// simdgroups changes. That is arithmetic-neutral by construction, not by
+// argument, and it measured max_abs_diff = 0 on all 12 paired runs.
+//
+// MEASURED (n=12 ABBA, one binary, quiescence-gated, prefill axis, "+" =
+// variant 5 faster): +2.13%, se 0.68%, t = +3.13, 10/12 pairs,
+// 95% CI [+0.63%, +3.64%]. Thirds +2.15% / +1.85% / +2.39% -- the
+// half-to-half reproducibility that two earlier candidate arms failed.
+// Steady-state decode step +0.03% (t = +0.23), i.e. flat, as expected for a
+// prefill-only gather-GEMM tiling change.
+//
+// The unset path is the SHIPPED path: `mlxfast submit` packages source, not
+// environment, and the ranked runner sets no DARKBLOOM_* variables. So the
+// empty string selects the winning variant here, exactly as
+// kDarkbloomDefaultRunSkipPct does above. Explicit "0" keeps the upstream
+// tiling reachable as an A/B control arm.
+int darkbloom_stage_bm128_variant() {
+  static const int v = [] {
+    auto s = env::get_var("DARKBLOOM_STAGE_BM128", "");
+    if (s.empty()) {
+      return 5;
+    }
+    if (s == "1") {
+      return 1;
+    }
+    if (s == "2") {
+      return 2;
+    }
+    if (s == "3") {
+      return 3;
+    }
+    if (s == "4") {
+      return 4;
+    }
+    if (s == "5") {
+      return 5;
+    }
+    return 0;
+  }();
+  return v;
+}
+
 // Host half of the wide-access alignment contract. The kernel checks each
 // thread's own offset within a tile; only the host can see the three things
 // below, and a misaligned 16B load is silent corruption rather than a fault,
@@ -1345,6 +1429,15 @@ void gather_qmm_rhs_nax(
   // TODO: Tune the block sizes
   int bm = 64, bn = 64, bk = 64;
   int wm = 2, wn = 2;
+  const int bm128 = darkbloom_stage_bm128_variant();
+  switch (bm128) {
+    case 1: bm = 128; wm = 4; break;         // SM=32, less re-staging
+    case 2: bm = 128; wm = 2; break;         // SM=64, predicted regression
+    case 3: bm = 128; wm = 8; break;         // SM=16, both mechanisms
+    case 4: bm = 64;  wm = 4; break;         // SM=16, elision only, 256 thr/TG
+    case 5: bm = 64;  wm = 4; wn = 1; break; // SM=16, SHIPPED DEFAULT
+    default: break;                          // upstream: bm=64, wm=2, wn=2
+  }
 
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
@@ -1408,13 +1501,18 @@ void gather_qmm_rhs_nax(
       fprintf(
           stderr,
           "mlxfast: stage active: widest=%d wideld=%d(req=%d wide_ok=%d) "
-          "runbar=%d novol=%d w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d\n",
+          "runbar=%d novol=%d bm128=%d bm=%d wm=%d wn=%d "
+          "w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d\n",
           int(stage_widest),
           int(stage_wideld),
           int(darkbloom_stage_wideld()),
           int(wide_ok),
           int(stage_runbar),
           int(stage_novol),
+          bm128,
+          bm,
+          wm,
+          wn,
           size_t(w.offset()),
           int(transpose),
           bits,
