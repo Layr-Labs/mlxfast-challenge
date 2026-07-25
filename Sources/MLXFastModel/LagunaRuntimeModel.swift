@@ -191,6 +191,15 @@ let lagunaFusedRoutedGateUpEnabled =
 let lagunaPrefillFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_GATE_UP"] != "0"
 
+/// The expert-aligned gather-QMM consumes a 32-row gate/up-interleaved bank
+/// and writes the packed 512-wide SwiGLU result into the first half of its
+/// oversized MLX output allocation. The same environment switch controls the
+/// backend dispatch and this view interpretation, keeping its ablation path
+/// coherent.
+let lagunaExpertAlignedGatherEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_EXPERT_ALIGNED_GATHER"] != "0"
+
 /// Decode post-attention residual + RMSNorm fusion. The kernel emits
 /// both the rounded BF16 residual (needed by the following skip connection)
 /// and the normalized row (consumed immediately by the MLP), eliminating a
@@ -1900,7 +1909,7 @@ func lagunaSharedDownResidual(
 }
 
 private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_bf16_v1",
+    name: "laguna_routed_nvfp4_swiglu_qmv_bf16_v2",
     inputNames: ["input", "fused_weight", "fused_scales", "indices"],
     outputNames: ["activated"],
     source: """
@@ -1952,8 +1961,10 @@ private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
             }
 
             for (uint row = 0; row < 2; ++row) {
-                uint gate_row = first_row + row;
-                uint up_row = gate_row + output_width;
+                uint logical_row = first_row + row;
+                uint pair_tile = logical_row / 32;
+                uint gate_row = pair_tile * 64 + logical_row % 32;
+                uint up_row = gate_row + 32;
                 const device uint8_t* gate_weight =
                     expert_weight + gate_row * packed_row_bytes +
                     block / 2 + lane * 8;
@@ -2045,7 +2056,7 @@ func lagunaRoutedSwiGLUQMV(
 /// slot's arithmetic: a threadgroup does exactly the work it did before, over
 /// the same bank, in the same order.
 private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_v1",
+    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_v2",
     inputNames: [
         "input", "routed_weight", "routed_scales", "indices",
         "shared_weight", "shared_scales",
@@ -2105,8 +2116,17 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             }
 
             for (uint row = 0; row < 2; ++row) {
-                uint gate_row = first_row + row;
-                uint up_row = gate_row + output_width;
+                uint logical_row = first_row + row;
+                uint gate_row;
+                uint up_row;
+                if (is_routed) {
+                    uint pair_tile = logical_row / 32;
+                    gate_row = pair_tile * 64 + logical_row % 32;
+                    up_row = gate_row + 32;
+                } else {
+                    gate_row = logical_row;
+                    up_row = gate_row + output_width;
+                }
                 const device uint8_t* gate_weight =
                     expert_weight + gate_row * packed_row_bytes +
                     block / 2 + lane * 8;
@@ -3562,32 +3582,37 @@ private func lagunaPrefillMoETail(
     )[0]
 }
 
+/// Reconstructs the stock SwiGLU result from the retained bank's physical
+/// `[gate32, up32]` tile order. This is the correctness-preserving fallback
+/// when the expert-aligned backend is disabled.
+private func lagunaInterleavedSwiGLU(
+    _ gateUp: MLXArray,
+    split: Int
+) -> MLXArray {
+    precondition(split % 32 == 0)
+    precondition(gateUp.dim(-1) == 2 * split)
+
+    var tiledShape = gateUp.shape
+    tiledShape.removeLast()
+    tiledShape.append(split / 32)
+    tiledShape.append(64)
+    let tiled = gateUp.reshaped(tiledShape)
+
+    var halfShape = gateUp.shape
+    halfShape[halfShape.count - 1] = split
+    let gate = tiled[.ellipsis, 0 ..< 32].reshaped(halfShape)
+    let up = tiled[.ellipsis, 32 ..< 64].reshaped(halfShape)
+    return compiledSiluProduct(gate, up)
+}
+
 /// Prefill (multi-token, SORTED-regime) counterpart to the decode-only fused
-/// gate/up dispatch in `LagunaRuntimeSparseMoEBlock.forward`. Mirrors
-/// `SwitchGLU.callAsFunction`
-/// (`Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift`) op for
-/// op on its `doSort == true` branch -- every line below is annotated with
-/// the stock line it replaces or reproduces exactly -- with ONE gather-QMM
-/// over the retained row-concatenated `[gate; up]` NVFP4 bank in place of
-/// `SwitchGLU`'s two separate `gate_proj`/`up_proj` `QuantizedSwitchLinear`
-/// calls. `down_proj` is still the exact stock module (`downProj`, obtained
-/// via `prepareFusedRoutedGateUp`'s reflection over `switchMLP.children()`),
-/// invoked exactly as `SwitchGLU` invokes it.
-///
-/// Bit-exactness: `gatherSort`/`scatterUnsort` and the down projection are
-/// untouched stock calls, called with the exact same arguments `SwitchGLU`
-/// uses. The only change is fusing the two gate/up
-/// `QuantizedSwitchLinear.callAsFunction` gather-QMMs (both bias-free,
-/// verified at `prepareFusedRoutedGateUp` build time) into one
-/// `MLX.gatherQuantizedMM` over `fusedWeight`/`fusedScales` -- gate rows then
-/// up rows, the same concatenation order the decode path already relies on.
-/// Each gathered output row's K-loop and scale application reads only its
-/// own weight/scale row and is independent of which bank that row lives in
-/// or which other rows share the dispatch, so slicing the fused output at
-/// `split` reproduces the two separate `gate_proj`/`up_proj` outputs
-/// exactly; `compiledSiluProduct` then runs on those two exact slices,
-/// identical to the stock `activationProduct(xGate, xUp)` call `SwitchGLU`
-/// makes for the default SiLU path this runtime uses.
+/// gate/up dispatch in `LagunaRuntimeSparseMoEBlock.forward`. One gather-QMM
+/// consumes the retained `[gate32, up32]`-interleaved NVFP4 bank in place of
+/// `SwitchGLU`'s separate `gate_proj` and `up_proj` calls. On the ranked
+/// expert-aligned path the backend also applies the same rounded-BF16 SiLU
+/// product and packs the 512-wide activation into the first half of the
+/// nominal 1024-wide output allocation, avoiding that intermediate's device
+/// round trip. `down_proj`, sorting, and unsorting remain the stock calls.
 private func lagunaFusedSortedRoutedGateUp(
     _ x: MLXArray,
     indices: MLXArray,
@@ -3618,7 +3643,7 @@ private func lagunaFusedSortedRoutedGateUp(
     // guard): `MLX.gatherQuantizedMM(x, weight, scales: scales, biases: nil,
     // rhsIndices: indices, transpose: true, groupSize: groupSize, bits: bits,
     // mode: mode, sortedIndices: sortedIndices)`. Issuing that once over the
-    // row-concatenated `fusedWeight`/`fusedScales` bank instead of twice over
+    // tile-interleaved `fusedWeight`/`fusedScales` bank instead of twice over
     // the separate banks is the fusion; every other argument matches the
     // stock call exactly (group 16, 4-bit, NVFP4, transpose, doSort).
     let gateUp = MLX.gatherQuantizedMM(
@@ -3633,12 +3658,18 @@ private func lagunaFusedSortedRoutedGateUp(
         mode: .nvfp4,
         sortedIndices: doSort
     )
-    let xGate = gateUp[.ellipsis, ..<split]
-    let xUp = gateUp[.ellipsis, split...]
-    // SwitchGLU: `activated = activationProduct(xGate, xUp)` -- this
-    // runtime's SwitchGLU instances are always built via the default SiLU
-    // initializer, so `activationProduct` is always `compiledSiluProduct`.
-    let activated = compiledSiluProduct(xGate, xUp)
+    let activated: MLXArray
+    if lagunaExpertAlignedGatherEnabled {
+        // The expert kernel writes rows with a physical stride of `split`
+        // into the allocation's contiguous prefix. Slice that prefix before
+        // restoring the logical shape expected by down_proj.
+        var activatedShape = gateUp.shape
+        activatedShape[activatedShape.count - 1] = split
+        activated = gateUp.reshaped([-1])[0 ..< gateUp.size / 2]
+            .reshaped(activatedShape)
+    } else {
+        activated = lagunaInterleavedSwiGLU(gateUp, split: split)
+    }
     // SwitchGLU: `x = downProj(activated, idx, sortedIndices: doSort)`
     var result = downProj(activated, idx, sortedIndices: doSort)
     // SwitchGLU: `if doSort { x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape) }`
@@ -3656,15 +3687,14 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ModuleInfo(key: "shared_expert") var sharedExpert: LagunaRuntimeMLP
 
-    /// Retained fused NVFP4 `[gate; up]` routed-expert banks (per-expert
-    /// output rows concatenated, gate rows first), built once after
+    /// Retained fused NVFP4 `[gate32, up32]` routed-expert banks (per-expert
+    /// output rows interleaved in matched 32-row tiles), built once after
     /// checkpoint load when `DARKBLOOM_FUSED_ROUTED_GATE_UP` is enabled, plus
     /// a reference to the stock `switch_mlp.down_proj` module for the fused
     /// decode path. Plain stored properties with a leading underscore so
     /// Module reflection never treats the derived layout as checkpoint
     /// parameters or a second child module; `switchMLP` keeps the original
-    /// separate banks (they still serve every multi-token forward and
-    /// parameter integrity).
+    /// separate banks for checkpoint parameter integrity.
     var _fusedRoutedGateUpWeight: MLXArray?
     var _fusedRoutedGateUpScales: MLXArray?
     var _fusedRoutedGateUpSplit: Int = 0
@@ -3726,11 +3756,32 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         else {
             return []
         }
-        let fusedWeight = concatenated([gateWeight, upWeight], axis: 1)
-        let fusedScales = concatenated([gateScales, upScales], axis: 1)
+        // Interleave one 32-row gate tile with its matching 32-row up tile.
+        // The expert-aligned prefill kernel's two WN simdgroups then own a
+        // matched pair inside one 64-column threadgroup and can exchange the
+        // rounded BF16 results through its existing weight scratch.
+        let experts = gateWeight.dim(0)
+        let split = gateWeight.dim(1)
+        let pairRows = 32
+        let weightDepth = gateWeight.dim(2)
+        let scaleDepth = gateScales.dim(2)
+        let gateWeightTiles = gateWeight.reshaped(
+            [experts, split / pairRows, pairRows, weightDepth])
+        let upWeightTiles = upWeight.reshaped(
+            [experts, split / pairRows, pairRows, weightDepth])
+        let gateScaleTiles = gateScales.reshaped(
+            [experts, split / pairRows, pairRows, scaleDepth])
+        let upScaleTiles = upScales.reshaped(
+            [experts, split / pairRows, pairRows, scaleDepth])
+        let fusedWeight = concatenated(
+            [gateWeightTiles, upWeightTiles], axis: 2
+        ).reshaped([experts, 2 * split, weightDepth])
+        let fusedScales = concatenated(
+            [gateScaleTiles, upScaleTiles], axis: 2
+        ).reshaped([experts, 2 * split, scaleDepth])
         _fusedRoutedGateUpWeight = fusedWeight
         _fusedRoutedGateUpScales = fusedScales
-        _fusedRoutedGateUpSplit = gateWeight.dim(1)
+        _fusedRoutedGateUpSplit = split
         _routedDownProj = downModule
         _routedDownWeight = downWeight
         _routedDownScales = downScales
@@ -3836,9 +3887,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     mode: .nvfp4,
                     sortedIndices: false
                 )
-                let xGate = gateUp[.ellipsis, 0 ..< _fusedRoutedGateUpSplit]
-                let xUp = gateUp[.ellipsis, _fusedRoutedGateUpSplit...]
-                activated = compiledSiluProduct(xGate, xUp)
+                activated = lagunaInterleavedSwiGLU(
+                    gateUp, split: _fusedRoutedGateUpSplit)
             }
             if lagunaFusedRoutedSharedDownResidualEnabled,
                 let residual,

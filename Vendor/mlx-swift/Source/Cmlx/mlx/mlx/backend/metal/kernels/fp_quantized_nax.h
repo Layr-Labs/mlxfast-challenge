@@ -1355,6 +1355,8 @@ template <
   threadgroup NAXWsChunk16<Wtype>
       Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
   threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
+  threadgroup bfloat* gate_up_stage =
+      (threadgroup bfloat*)Ws_storage;
   threadgroup int bounds[2];
 
   const int K_w = K * bytes_per_pack / pack_factor;
@@ -1449,7 +1451,37 @@ template <
       }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (sg_active) {
+      const bool fuse_swiglu = N == 1024 && K == 2048;
+      if (fuse_swiglu) {
+        if (sg_active) {
+          Dtile.template store<bfloat, BN, 1>(
+              gate_up_stage + tm * BN + tn);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_active && (simd_group_id % WN) == 0) {
+          constexpr int activated_cols = BN / 2;
+          for (int linear = simd_lane_id;
+               linear < int(sgp_sm) * activated_cols;
+               linear += SIMD_SIZE) {
+            const int row = linear / activated_cols;
+            const int col = linear % activated_cols;
+            const bfloat gate =
+                gate_up_stage[(tm + row) * BN + col];
+            const bfloat up =
+                gate_up_stage[(tm + row) * BN + activated_cols + col];
+            const bfloat exp_abs = metal::exp(metal::abs(gate));
+            const bfloat denominator = bfloat(1) + exp_abs;
+            const bfloat z = bfloat(1) / denominator;
+            const bfloat sigmoid =
+                gate < bfloat(0) ? z : bfloat(1) - z;
+            const bfloat silu = bfloat(gate * sigmoid);
+            y[size_t(chunk_start + tm + row) * (N / 2) +
+              size_t(tid.x) * activated_cols + col] =
+                bfloat(silu * up);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      } else if (sg_active) {
         device T* yn =
             y + size_t(chunk_start + tm) * N + y_col + tn;
         if (sgp_sm == SM) {
