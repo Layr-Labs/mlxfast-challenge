@@ -246,8 +246,8 @@ runner-owned measurement wrapper whose thermal-stability contract is fixed
 in the script itself — readonly, not environment-overridable: every timed
 phase (pinned baseline and candidate, plus any oracle generation) starts
 only once the GPU has cooled below 40C (waiting up to 900 seconds), runs
-under 2 Hz GPU telemetry, and is rejected if any loaded sample shows GPU
-clocks below 1600 MHz (throttling), if telemetry is missing, or if the
+under 100 ms macmon GPU telemetry, and is rejected if any loaded sample
+shows GPU clocks below 1600 MHz (throttling), if telemetry is missing, or if the
 sealed score shows token mismatches; one gated retry is allowed.
 
 The measurement is paired: the pinned reference baseline tree provisioned

@@ -133,12 +133,20 @@ same test:
 
 Acceptance bands (see `AcceptanceBand`,
 `docs/thermal-variance-investigation.md`): prefill and decode are single noisy
-measurements, each gated against the same-session paired baseline `B` measured
-on the same silicon (which cancels host-speed differences). After the speedup
+measurements, each gated against the pinned calibration reference `R` — the
+golden's `baseline_*_seconds_per_token` fields when present, else
+`MLXFastConstants.officialBaseline{Prefill,Decode}SecondsPerToken`; in both
+cases the cached ranked-box calibration of the pinned baseline (next
+section), NOT the live same-session paired baseline. The same-session
+baseline feeds only the published paired ratio, to which
+`overlay-paired-timing.sh` applies the 0.95 floors — so the published paired
+speedup can land slightly outside the band window when the session baseline
+drifts from `R` (the drift itself is bounded by measure-job's baseline
+calibration-band check). After the speedup
 floors, each axis's measured value must land within
-`[B * (1 - downTolerance), B * (1 + upTolerance)]`: it fails if the value
-exceeds `B * (1 + upTolerance)` (a real slowdown / regression) or drops below
-`B * (1 - downTolerance)` (an improvement too large to trust in one
+`[R * (1 - downTolerance), R * (1 + upTolerance)]`: it fails if the value
+exceeds `R * (1 + upTolerance)` (a real slowdown / regression) or drops below
+`R * (1 - downTolerance)` (an improvement too large to trust in one
 submission, or a suspiciously lucky-fast reading).
 
 - **Prefill: +/-5% symmetric.** Prefill is not a real optimization axis here, so
@@ -149,16 +157,17 @@ submission, or a suspiciously lucky-fast reading).
   must be **chunked** across submissions so each step stays inside the band and is
   independently verifiable. The cap is per-submission, not cumulative.
 
-`B`'s robustness and the per-axis tolerances are ranking-contract decisions, so
-they are operator-owned and pinned here.
+`R`'s calibration and the per-axis tolerances are ranking-contract decisions,
+so they are operator-owned and pinned here.
 
 ## Cached local-mode constants
 
 The `officialBaseline*` constants in `Sources/MLXFastCore/Constants.swift` are
-a **cached calibration retained for local-mode estimates and the gates pass's
-skip-timed placeholder timing only** -- the ranked score denominator is the
-live paired baseline measured on the M5 box (next section), never these
-numbers. The values below are the Poolside v2 calibration: the mean baseline
+a **cached calibration retained for the acceptance-band reference `R`,
+local-mode estimates, and the gates pass's skip-timed placeholder timing** --
+the ranked score denominator is the live paired baseline measured on the M5
+box (next section), never these numbers. The values below are the Poolside
+v2 calibration: the mean baseline
 fields from four consecutive successful ranked M5 runs (`30011903540`,
 `30015338806`, `30022640438`, and `30027994180`) against pinned baseline
 commit `15852ee52858def42ddd4f32bca7e59d275e020e`. Decode ranged
@@ -185,7 +194,7 @@ ranked run, after all correctness/gates work, a hidden-material scrub, and a
 quiescence wait, measure-job runs the pinned **baseline tree first, then the
 candidate workspace**, each as a full `./benchmark.sh --official` in fresh
 worker processes, each starting only once the GPU is below the fixed 40C gate
-(up to a 900s cooldown), each under 2 Hz telemetry.
+(up to a 900s cooldown), each under 100 ms macmon telemetry.
 A measurement is rejected -- with one gated retry -- on GPU throttling under
 load, missing telemetry, or token mismatches. Because both sides run back to
 back on the same silicon behind the same gate, the paired ratio cancels
