@@ -197,7 +197,7 @@ let lagunaFusedQKVProjectionEnabled =
 /// deleted because the negative result is the useful part, and a wider variant
 /// (several heads per threadgroup) might still pay.
 let lagunaFusedSlidingQKNormRoPEEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_QK_NORM_ROPE"] == "1"
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_QK_NORM_ROPE"] != "0"
 
 /// Full-attention counterpart: fuses per-head Q/K RMSNorm with partial YaRN
 /// RoPE. One stock FP32 probe row carries the authoritative rotary factors,
@@ -452,7 +452,6 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
         uint head = threadgroup_position_in_grid.x;
         uint lane = thread_index_in_simdgroup;
 
-        threadgroup float inverse_rms[1];
 
         const device bfloat* input;
         const device bfloat* weight;
@@ -471,17 +470,17 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
             float value = float(input[base + i]);
             sum += value * value;
         }
+        // `simd_sum` already returns the total to every lane, so each lane
+        // derives the same `precise::rsqrt` locally. That removes the
+        // threadgroup slot and the barrier this one-simdgroup-per-head kernel
+        // would otherwise pay for on every head.
         sum = simd_sum(sum);
-        if (lane == 0) {
-            inverse_rms[0] =
-                metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
-                bfloat(float(input[base + i]) * inverse_rms[0]);
+                bfloat(float(input[base + i]) * inverse_rms);
         }
 
         thread float paired[4];
@@ -534,6 +533,7 @@ func lagunaFullQKNormYaRN(
     precondition(angles.dtype == .float32)
     precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim / 2])
 
+    lagunaTrace("full qk norm+yarn")
     let outputs = lagunaFullQKNormYaRNKernel(
         [rawQueries, rawKeys, queryWeight, keyWeight, angles],
         grid: (56 * 32, 1, 1),
@@ -580,7 +580,6 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         uint head = threadgroup_position_in_grid.x;
         uint lane = thread_index_in_simdgroup;
 
-        threadgroup float inverse_rms[1];
 
         const device bfloat* input;
         const device bfloat* weight;
@@ -599,17 +598,17 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
             float value = float(input[base + i]);
             sum += value * value;
         }
+        // `simd_sum` already returns the total to every lane, so each lane
+        // derives the same `precise::rsqrt` locally. That removes the
+        // threadgroup slot and the barrier this one-simdgroup-per-head kernel
+        // would otherwise pay for on every head.
         sum = simd_sum(sum);
-        if (lane == 0) {
-            inverse_rms[0] =
-                metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
-                bfloat(float(input[base + i]) * inverse_rms[0]);
+                bfloat(float(input[base + i]) * inverse_rms);
         }
 
         // Element `p + 64`, the partner of pair `p`, lives 16 lanes away.
@@ -660,6 +659,7 @@ func lagunaSlidingQKNormRoPE(
     precondition(angles.dtype == .float32)
     precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim])
 
+    lagunaTrace("sliding qk norm+rope")
     let outputs = lagunaSlidingQKNormRoPEKernel(
         [rawQueries, rawKeys, queryWeight, keyWeight, angles],
         grid: ((heads + kvHeads) * 32, 1, 1),
