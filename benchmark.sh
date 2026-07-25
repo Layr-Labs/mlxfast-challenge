@@ -1675,9 +1675,31 @@ if [[ ! -s "${MLX_METALLIB}" ]]; then
   exit 1
 fi
 
+# Existence is not freshness. The scored binary is
+# .build-worker/release/mlxfast-runtime-worker, and an existence-only gate
+# timed whatever setup.sh built before the participant's edit: a real decode
+# win read as noise, and a correctness-breaking change passed the local public
+# gate because it never executed. (`swift build -c release` on its own does
+# NOT fix that -- with no --scratch-path it writes .build/release, and the CLI
+# deliberately prefers the .build-worker twin.) So also rebuild whenever any
+# build input is newer than the product we are about to run. `-print -quit`
+# early-exits on the first newer file; the nothing-changed walk over
+# Sources+Vendor measures ~35ms, against a build SwiftPM makes a near no-op.
 swift_build_required() {
-  [[ ! -x "${SWIFT_BIN}" ]] \
-    || [[ "${USE_RUNTIME_WORKER}" == "1" && ! -x "${RUNTIME_WORKER_BIN}" ]]
+  if [[ ! -x "${SWIFT_BIN}" ]]; then
+    return 0
+  fi
+  if [[ "${USE_RUNTIME_WORKER}" == "1" && ! -x "${RUNTIME_WORKER_BIN}" ]]; then
+    return 0
+  fi
+  local reference="${SWIFT_BIN}"
+  if [[ "${USE_RUNTIME_WORKER}" == "1" && "${RUNTIME_WORKER_BIN}" -ot "${reference}" ]]; then
+    reference="${RUNTIME_WORKER_BIN}"
+  fi
+  local newer
+  newer="$(find Package.swift Package.resolved Sources Vendor \
+    -newer "${reference}" -print -quit 2>/dev/null || true)"
+  [[ -n "${newer}" ]]
 }
 
 # The dependency graph is frozen by challenge policy: before either build
@@ -1703,7 +1725,7 @@ assert_frozen_dependency_graph() {
 }
 
 if [[ "${MLXFAST_IN_SANDBOX:-0}" != "1" ]] && swift_build_required; then
-  echo "benchmark.sh: trusted CLI or participant runtime worker missing; building"
+  echo "benchmark.sh: trusted CLI or participant runtime worker missing or stale; building"
   assert_frozen_dependency_graph
   # Independent SwiftPM build/cache roots: the trusted CLI builds in .build
   # and the participant worker (which compiles the vendored MLX forks) in
@@ -1995,6 +2017,7 @@ if ! jq -e '.passed == true' "${SCORE_PATH}" >/dev/null; then
   if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ]] \
       && jq -e '(.metrics.error // "") | test("token mismatch")' "${SCORE_PATH}" >/dev/null 2>&1; then
     echo "benchmark.sh: note: the public goldens are M5-generated, so on non-M5 Apple Silicon a deterministic near-tie token mismatch is expected for a correct build (see \"Correctness fixtures are M5-generated\" in README.md); the ranked M5 runner is the source of truth" >&2
+    echo "benchmark.sh: note: if unmodified main diverges at the same token position on this machine, rerun with MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT=1 to keep the timing estimate (tokens stay unverified and the score records that)" >&2
   fi
   exit 1
 fi

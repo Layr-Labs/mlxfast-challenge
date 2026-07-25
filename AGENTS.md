@@ -21,7 +21,12 @@ score = decode_speedup^0.75 * prefill_speedup^0.25
 Higher is better. Each speedup is the pinned baseline's seconds/token divided
 by the candidate's for that phase, both measured on the same machine behind
 the same thermal gate. Both component floors are `0.95`, hard, and every
-checked token must match the golden. `benchmark.json` registers the serial
+checked token must match the golden. A two-sided acceptance band applies on
+top of the floors and is tighter than them: `decode_speedup` must land in
+`[0.980, 1.053]` and `prefill_speedup` in `[0.952, 1.053]`, so a single
+submission's gain is capped at about 5% and larger wins must be chunked
+across submissions (see "Timing And Score Measurement" below).
+`benchmark.json` registers the serial
 track and `.github/workflows/benchmark.yml` is the serial ranked pipeline.
 
 ## Official Hardware
@@ -141,9 +146,12 @@ Families without a twin (RoPE, RMSNorm, the SDPA vector kernel,
 vendored `.metal` sources by `tools/build-mlx-metallib.sh` (invoked by
 `./setup.sh`; rerun either after editing an AOT `.metal`/`.h` file). `_nax`
 names are the M5-generation kernel variants; the ranked M5 box selects
-them, so tune the `_nax` twin as well as the plain one. Then rebuild
-(`swift build -c release`) and test with
-`./benchmark.sh --local-iterate`.
+them, so tune the `_nax` twin as well as the plain one. Then test with
+`./benchmark.sh --local-iterate`, which rebuilds both binaries for you
+whenever a build input is newer than them. A bare `swift build -c release`
+is **not** enough on its own: without `--scratch-path .build-worker` it
+writes `.build/release`, while the scored binary is
+`.build-worker/release/mlxfast-runtime-worker`.
 
 All participant model and kernel code — `MLXFastModel` plus the vendored
 forks — compiles into the sandboxed `mlxfast-runtime-worker` binary. The
@@ -228,6 +236,22 @@ The official benchmark measures prefill and decode seconds/token for the
 candidate and the pinned on-box baseline in the same session, then publishes
 the weighted paired speedup `decode_speedup^0.75 * prefill_speedup^0.25`.
 Both component floors are `0.95`, hard.
+
+A two-sided acceptance band applies on top of the floors
+(`MLXFastConstants.{prefill,decode}Band{Up,Down}Tolerance`): measured
+seconds/token must land within +5%/-5% of the paired baseline for prefill
+and +2%/-5% for decode, i.e. `decode_speedup` in `[0.980, 1.053]` and
+`prefill_speedup` in `[0.952, 1.053]`. The down side deliberately caps a
+single submission's gain at about 5% — larger wins are either lucky
+measurements or too big to trust in one shot and must be chunked across
+submissions; the cap is per submission, not cumulative. The band is frozen
+policy (`docs/benchmark-window-freeze.md`), it is NOT evaluated by
+`--local-iterate` / `--local-submit`, and a ranked run that trips it fails
+with failure category `acceptance_band_failed`. Local modes print a warning
+when their estimate is more than 5% faster than the pinned baseline (the
+"chunk it" direction only — the slow edge is already covered by the floors,
+and a two-sided local check would fire on every run on hardware slower than
+the ranked box), but they never fail on it.
 
 The timed measurement runs last in the ranked job, after all correctness and
 gate work and after every hidden byte is scrubbed from the bench workspace,
@@ -344,7 +368,14 @@ behaviors are expected, not bugs:
  Silicon generations even for correct code. Before treating a local
  public-gate failure as a regression, check whether unmodified `main`
  fails at the same token position on your machine; the ranked M5 runner
- is the source of truth.
+ is the source of truth. If it does, rerun with
+ `MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT=1` so the local mode still publishes
+ its timing estimate instead of a `score: null` the Yukon CLI rejects.
+ The override is local-only and does not hide the divergence: the score
+ keeps `passed_correctness: false`, records the diverging tokens, and
+ explains itself in `metrics.error`. Never use it to paper over a real
+ regression -- if unmodified `main` passes on your machine, the mismatch
+ is yours.
 - **Know the runnable surface.** Only the `benchmark.json` `editablePaths`
  entries ship in a submission: `Sources/MLXFastModel/`,
  `Sources/MLXFastTransform/`, the vendored Laguna model and `MLXLMCommon`

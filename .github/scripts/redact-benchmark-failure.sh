@@ -76,6 +76,14 @@ if [[ -s "${score_path}" ]]; then
     # deliberately collapsed to an opaque category.
     if [[ "${error_text}" == "performance floor failed"* ]]; then
       category="floor_failed"
+    # The acceptance band is evaluated BEFORE correctness runs, so the band
+    # path leaves passed_correctness false (correctnessReport is still nil)
+    # and would otherwise fall through to "correctness_failed" below -- the
+    # single most misleading verdict we can hand a participant whose tokens
+    # were never checked. Match the harness's own prefix
+    # (TimedRunScoreEvaluation.firstFailureReason) ahead of that fallback.
+    elif [[ "${error_text}" == "acceptance band failed"* ]]; then
+      category="acceptance_band_failed"
     elif [[ "${error_text}" == "benchmark prefill token mismatch"* ]]; then
       category="prefill_token_mismatch"
     elif [[ "${error_text}" == "benchmark decode seed token mismatch"* ]]; then

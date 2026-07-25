@@ -34,7 +34,26 @@ prefill_speedup_floor = 0.95
 ```
 
 Both floors are hard: a run below either floor, or with any token mismatch,
-publishes no score. Run `./setup.sh`, then `./benchmark.sh --local-iterate`
+publishes no score.
+
+A second, two-sided **acceptance band** also applies on the ranked path, and
+it is tighter than the floors in both directions:
+
+```text
+decode_speedup  must land in [0.980, 1.053]
+prefill_speedup must land in [0.952, 1.053]
+```
+
+The upper bound caps how much a single submission may gain (about 5%): a
+larger measured win is either a lucky reading or too big to trust in one
+shot, so **chunk it across submissions** — the cap is per submission, not
+cumulative. The lower decode bound is deliberately tighter than the 0.95
+decode floor. Local modes never fail on the band: `--local-iterate` /
+`--local-submit` print a warning when their estimate exceeds it but still
+publish the estimate; see `docs/benchmark-window-freeze.md`. A ranked run
+that trips the band fails with failure category `acceptance_band_failed`.
+
+Run `./setup.sh`, then `./benchmark.sh --local-iterate`
 or `--local-submit` locally; local modes write an estimated local
 `score.json` only — the official paired score comes exclusively from the
 ranked M5 run.
@@ -271,7 +290,11 @@ prefill_speedup >= 0.95
 ```
 
 A run below either floor or with any token mismatch is ineligible. The score
-is null when any gate fails. `score.json` also carries prefill and decode
+is null when any gate fails. The two-sided acceptance band described above
+(`decode_speedup` in `[0.980, 1.053]`, `prefill_speedup` in `[0.952, 1.053]`)
+applies on top of the floors; local modes warn when their estimate exceeds
+it but never fail on it.
+`score.json` also carries prefill and decode
 seconds/token, speedups, floor verdicts, gate results, and
 transformed-weight identity.
 

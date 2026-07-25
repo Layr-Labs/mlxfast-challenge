@@ -425,6 +425,10 @@ jobs:
         if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
         env:
           SUBMISSION_WORKTREE: .mlxfast-submission-src
+          # Report-only: names the editable files trusted main changed after
+          # this candidate branched that the candidate never touched, which the
+          # overlay is therefore about to replace with pre-branch content.
+          TRUSTED_MAIN_SHA: ${{ steps.candidate_context.outputs.trusted_main_sha }}
         run: .github/scripts/overlay-editable-paths.sh
 
       # The bench workspace must contain the trusted tree plus overlaid editable
