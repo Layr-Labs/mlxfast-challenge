@@ -828,51 +828,9 @@ private func lagunaFusedQKVProjectionSource(heads: Int) -> String {
         constexpr uint block_width = 128;
         constexpr uint blocks = in_vec_size / block_width;
         constexpr uint rows_per_group = 64;
-        constexpr uint query_tiles = query_rows / rows_per_group;
-        constexpr uint kv_tiles = kv_rows / rows_per_group;
-        constexpr uint gate_tiles = \(heads / 8);
-        constexpr uint query_tiles_per_round = query_tiles / kv_tiles;
         constexpr float norm_eps = 1.0e-6f;
 
-        // The projection used to launch every Q tile, then every K tile,
-        // then every V tile. Decode on the ranked M5 is latency-bound rather
-        // than bandwidth-bound, so that order presents only one independent
-        // weight bank to each scheduling wave. Preserve sequential row order
-        // within every bank, but issue one K, one V, and (while available)
-        // one gate tile before each proportional run of Q tiles.
-        //
-        // This is a pure bijection over the existing threadgroups. `tile`
-        // below is the old logical tile number, so row ownership, K-loop
-        // order, reductions, writes, and total work are unchanged.
-        uint scheduled_tile = threadgroup_position_in_grid.x;
-        uint round;
-        uint position;
-        constexpr uint gated_round_width = query_tiles_per_round + 3;
-        constexpr uint plain_round_width = query_tiles_per_round + 2;
-        constexpr uint gated_span = gate_tiles * gated_round_width;
-        bool round_has_gate = scheduled_tile < gated_span;
-        if (round_has_gate) {
-            round = scheduled_tile / gated_round_width;
-            position = scheduled_tile % gated_round_width;
-        } else {
-            uint tail = scheduled_tile - gated_span;
-            round = gate_tiles + tail / plain_round_width;
-            position = tail % plain_round_width;
-        }
-
-        uint tile;
-        if (position == 0) {
-            tile = query_tiles + round;
-        } else if (position == 1) {
-            tile = query_tiles + kv_tiles + round;
-        } else if (round_has_gate && position == 2) {
-            tile = query_tiles + 2 * kv_tiles + round;
-        } else {
-            uint projection_prefix = round_has_gate ? 3u : 2u;
-            uint query_position = position - projection_prefix;
-            tile = round * query_tiles_per_round + query_position;
-        }
-
+        uint tile = threadgroup_position_in_grid.x;
         uint local_id = thread_position_in_threadgroup.x;
         uint simd_group = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
@@ -913,7 +871,8 @@ private func lagunaFusedQKVProjectionSource(heads: Int) -> String {
         constexpr uint gate_simds = 8;
         constexpr uint gate_block_width = 1024;
         constexpr uint gate_blocks = in_vec_size / gate_block_width;
-        constexpr uint qkv_tiles = query_tiles + 2 * kv_tiles;
+        constexpr uint qkv_tiles =
+            (query_rows + 2 * kv_rows) / rows_per_group;
 
         // Flat, because Metal will not take a multidimensional threadgroup
         // array here: [gate_half][split][row] laid out row-major by hand.
@@ -1914,16 +1873,10 @@ private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
         constexpr uint block_width = 512;
         constexpr uint values_per_lane = 16;
         constexpr uint tiles_per_expert = 128;
-        constexpr uint routed_experts = 8;
 
-        // Tile-major order keeps one threadgroup per expert exactly as before,
-        // but places the eight independent weight banks next to one another in
-        // the dispatch stream. This exposes expert-bank memory latency across
-        // a scheduling wave instead of issuing all 128 tiles of one expert
-        // before touching the next bank.
         uint group = threadgroup_position_in_grid.x;
-        uint expert_slot = group % routed_experts;
-        uint tile = group / routed_experts;
+        uint expert_slot = group / tiles_per_expert;
+        uint tile = group % tiles_per_expert;
         uint expert = uint(indices[expert_slot]);
         uint simd_group = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
@@ -2064,12 +2017,9 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
         constexpr uint tiles_per_expert = 128;
         constexpr uint routed_experts = 8;
 
-        // Preserve each expert tile's arithmetic and output address while
-        // exposing all eight routed banks plus the shared bank in each
-        // scheduling wave.
         uint group = threadgroup_position_in_grid.x;
-        uint expert_slot = group % (routed_experts + 1);
-        uint tile = group / (routed_experts + 1);
+        uint expert_slot = group / tiles_per_expert;
+        uint tile = group % tiles_per_expert;
         bool is_routed = expert_slot < routed_experts;
         uint simd_group = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
