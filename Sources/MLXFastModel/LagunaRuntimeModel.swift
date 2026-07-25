@@ -154,8 +154,42 @@ let lagunaFusedRoutedDownReduceEnabled =
 /// showed the fused bank helps decode (~+1.9%) but badly hurts the M=512
 /// sorted gather-GEMM prefill path, so prefill always dispatches the stock
 /// separate banks.
+///
+/// That prefill finding pre-dates RUNSKIP. See
+/// `DARKBLOOM_PREFILL_FUSED_GATE_UP` immediately below for the current,
+/// separately-flagged, post-RUNSKIP re-measurement of the same fusion idea
+/// applied to the sorted prefill path -- this flag and its history are left
+/// as-is (decode-only) rather than folded together, so each can be ablated
+/// independently.
 let lagunaFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_GATE_UP"] != "0"
+
+/// `DARKBLOOM_PREFILL_FUSED_GATE_UP` (default on; set "0" to disable):
+/// prefill/SORTED-regime counterpart to `DARKBLOOM_FUSED_ROUTED_GATE_UP`
+/// above. Serves the multi-token sorted gather-GEMM path (`indices.size >=
+/// 64` -- `SwitchGLU`'s own threshold for taking `gatherSort`, which every
+/// timed 512-token prefill request clears) from the same retained
+/// row-concatenated NVFP4 `[gate; up]` bank the decode path already keeps
+/// resident, instead of the stock two separate sorted gather-QMMs
+/// (`gate_proj` then `up_proj`). Mechanism: one N=1024 gather-GEMM has half
+/// the run-loop iterations and dispatch overhead of two N=512 ones, and,
+/// like the decode fusion above, each *gathered* output row's K-loop and
+/// scale application reads only its own weight/scale row independent of
+/// which bank that row lives in -- so the fused dispatch is bit-exact
+/// against the two separate ones it replaces.
+///
+/// The `DARKBLOOM_FUSED_ROUTED_GATE_UP` comment above records an earlier
+/// ablation that measured this same idea hurting the M=512 sorted prefill
+/// path; that measurement pre-dates RUNSKIP. A later measurement on a
+/// RUNSKIP-era tree (note ba4561c, never landed) found this specific
+/// prefill fusion a ~4% prefill win (373.5us -> 358.5us) instead. Shipped
+/// default ON, behind its own flag, so it can be ablated and re-measured on
+/// the ranked box independently of both the older decode-only flag and the
+/// stale prefill finding. See `lagunaFusedSortedRoutedGateUp` and its call
+/// site in `LagunaRuntimeSparseMoEBlock.forward` for the exact op-for-op
+/// mirror of `SwitchGLU.callAsFunction`'s sorted branch.
+let lagunaPrefillFusedRoutedGateUpEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_GATE_UP"] != "0"
 
 /// Decode post-attention residual + RMSNorm fusion. The kernel emits
 /// both the rounded BF16 residual (needed by the following skip connection)
@@ -3144,6 +3178,93 @@ private func lagunaPrefillMoETail(
     )[0]
 }
 
+/// Prefill (multi-token, SORTED-regime) counterpart to the decode-only fused
+/// gate/up dispatch in `LagunaRuntimeSparseMoEBlock.forward`. Mirrors
+/// `SwitchGLU.callAsFunction`
+/// (`Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift`) op for
+/// op on its `doSort == true` branch -- every line below is annotated with
+/// the stock line it replaces or reproduces exactly -- with ONE gather-QMM
+/// over the retained row-concatenated `[gate; up]` NVFP4 bank in place of
+/// `SwitchGLU`'s two separate `gate_proj`/`up_proj` `QuantizedSwitchLinear`
+/// calls. `down_proj` is still the exact stock module (`downProj`, obtained
+/// via `prepareFusedRoutedGateUp`'s reflection over `switchMLP.children()`),
+/// invoked exactly as `SwitchGLU` invokes it.
+///
+/// Bit-exactness: `gatherSort`/`scatterUnsort` and the down projection are
+/// untouched stock calls, called with the exact same arguments `SwitchGLU`
+/// uses. The only change is fusing the two gate/up
+/// `QuantizedSwitchLinear.callAsFunction` gather-QMMs (both bias-free,
+/// verified at `prepareFusedRoutedGateUp` build time) into one
+/// `MLX.gatherQuantizedMM` over `fusedWeight`/`fusedScales` -- gate rows then
+/// up rows, the same concatenation order the decode path already relies on.
+/// Each gathered output row's K-loop and scale application reads only its
+/// own weight/scale row and is independent of which bank that row lives in
+/// or which other rows share the dispatch, so slicing the fused output at
+/// `split` reproduces the two separate `gate_proj`/`up_proj` outputs
+/// exactly; `compiledSiluProduct` then runs on those two exact slices,
+/// identical to the stock `activationProduct(xGate, xUp)` call `SwitchGLU`
+/// makes for the default SiLU path this runtime uses.
+private func lagunaFusedSortedRoutedGateUp(
+    _ x: MLXArray,
+    indices: MLXArray,
+    fusedWeight: MLXArray,
+    fusedScales: MLXArray,
+    split: Int,
+    downProj: SwitchLinear
+) -> MLXArray {
+    // SwitchGLU: `var x = MLX.expandedDimensions(x, axes: [-2, -3])`
+    var sortedX = MLX.expandedDimensions(x, axes: [-2, -3])
+    // SwitchGLU: `let doSort = indices.size >= 64`. The call site already
+    // guards `indices.size >= 64` before calling in, so this is always true
+    // here; recomputed anyway so this function mirrors SwitchGLU verbatim
+    // and stays correct if that guard is ever loosened.
+    let doSort = indices.size >= 64
+    // SwitchGLU: `var idx = indices` / `var inverseOrder = MLXArray()`
+    var idx = indices
+    var inverseOrder = MLXArray()
+    // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
+    if doSort {
+        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+    }
+    // Fused counterpart of SwitchGLU's separate-bank branch:
+    //   xUp = upProj(x, idx, sortedIndices: doSort)
+    //   xGate = gateProj(x, idx, sortedIndices: doSort)
+    // Each of those is exactly `QuantizedSwitchLinear.callAsFunction` with
+    // `biases: nil` (both banks are bias-free per the `prepareFusedRoutedGateUp`
+    // guard): `MLX.gatherQuantizedMM(x, weight, scales: scales, biases: nil,
+    // rhsIndices: indices, transpose: true, groupSize: groupSize, bits: bits,
+    // mode: mode, sortedIndices: sortedIndices)`. Issuing that once over the
+    // row-concatenated `fusedWeight`/`fusedScales` bank instead of twice over
+    // the separate banks is the fusion; every other argument matches the
+    // stock call exactly (group 16, 4-bit, NVFP4, transpose, doSort).
+    let gateUp = MLX.gatherQuantizedMM(
+        sortedX,
+        fusedWeight,
+        scales: fusedScales,
+        biases: nil,
+        rhsIndices: idx,
+        transpose: true,
+        groupSize: 16,
+        bits: 4,
+        mode: .nvfp4,
+        sortedIndices: doSort
+    )
+    let xGate = gateUp[.ellipsis, ..<split]
+    let xUp = gateUp[.ellipsis, split...]
+    // SwitchGLU: `activated = activationProduct(xGate, xUp)` -- this
+    // runtime's SwitchGLU instances are always built via the default SiLU
+    // initializer, so `activationProduct` is always `compiledSiluProduct`.
+    let activated = compiledSiluProduct(xGate, xUp)
+    // SwitchGLU: `x = downProj(activated, idx, sortedIndices: doSort)`
+    var result = downProj(activated, idx, sortedIndices: doSort)
+    // SwitchGLU: `if doSort { x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape) }`
+    if doSort {
+        result = scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape)
+    }
+    // SwitchGLU: `return MLX.squeezed(x, axis: -2)`
+    return MLX.squeezed(result, axis: -2)
+}
+
 final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     let routedScalingFactor: Float
 
@@ -3415,7 +3536,41 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     axis: -2)
             }
         } else {
-            y = switchMLP(x, inds)
+            // PREFILL sorted-regime fused gate/up: same retained
+            // row-concatenated NVFP4 bank the decode branch above uses, but
+            // driven through `lagunaFusedSortedRoutedGateUp`, which mirrors
+            // `SwitchGLU.callAsFunction`'s `doSort == true` path op for op
+            // (see that function's doc comment for the line-by-line
+            // correspondence). Falls back to the fully stock `switchMLP(x,
+            // inds)` -- unchanged from before this fusion -- whenever the
+            // flag is off, the fused bank wasn't built, or the guarded
+            // shapes/dtypes/regime don't match; either way `y` ends up with
+            // the exact same shape/dtype `switchMLP` alone would have
+            // produced, so every consumer below (including the
+            // `lagunaPrefillMoETailEnabled` tail fusion) is unaffected by
+            // which branch ran.
+            if lagunaPrefillFusedRoutedGateUpEnabled,
+                let fusedWeight = _fusedRoutedGateUpWeight,
+                let fusedScales = _fusedRoutedGateUpScales,
+                let downProj = _routedDownProj,
+                x.dim(1) > 1,
+                inds.size >= 64,
+                fusedWeight.dtype == .uint32,
+                fusedScales.dtype == .uint8,
+                _fusedRoutedGateUpSplit == LagunaConstants.moeIntermediateSize
+            {
+                lagunaTrace("prefill fused routed gate/up")
+                y = lagunaFusedSortedRoutedGateUp(
+                    x,
+                    indices: inds,
+                    fusedWeight: fusedWeight,
+                    fusedScales: fusedScales,
+                    split: _fusedRoutedGateUpSplit,
+                    downProj: downProj
+                )
+            } else {
+                y = switchMLP(x, inds)
+            }
             if lagunaPrefillMoETailEnabled,
                 let residual,
                 x.dim(1) > 1,
