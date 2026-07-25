@@ -211,6 +211,12 @@ let lagunaFusedResidualRMSNormRouterEnabled =
 let lagunaFusedFullQKNormYaRNEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_QK_NORM_YARN"] != "0"
 
+/// Stores K and V in one leading-axis allocation. Decode's fused QK
+/// norm/RoPE kernels emit that layout directly, so both cache rows advance
+/// through one `slice_update` instead of two.
+let lagunaPairedKVCacheEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PAIRED_KV_CACHE"] != "0"
+
 /// Post-attention residual add + RMSNorm with the MoE router's projection
 /// folded in.
 ///
@@ -436,12 +442,260 @@ func lagunaResidualRMSNorm(
     return (outputs[0], outputs[1])
 }
 
+private protocol LagunaPackedKVCache: KVCache {
+    func updatePacked(_ keyValues: MLXArray) -> (MLXArray, MLXArray)
+}
+
+/// Laguna-only cache with `[K; V]` on a leading axis. The fixed checkpoint
+/// uses equal key/value head dimensions, so both banks have identical shapes.
+/// Multi-row prefill pays one stack copy and then retains that allocation;
+/// single-token decode receives the packed row directly from the fused QK
+/// norm/RoPE kernel and performs one in-place slice update.
+private final class LagunaRuntimePackedKVCache: LagunaPackedKVCache {
+    private var storage: MLXArray?
+    private let sizeLimit: Int?
+    private let allocationStep = 256
+    private var ringIndex = 0
+
+    var offset = 0
+    var maxSize: Int? { sizeLimit }
+
+    init(maxSize: Int? = nil) {
+        self.sizeLimit = maxSize
+    }
+
+    func innerState() -> [MLXArray] {
+        storage.map { [$0] } ?? []
+    }
+
+    private func visibleViews(_ packed: MLXArray, length: Int) -> (
+        MLXArray, MLXArray
+    ) {
+        let visible =
+            length == packed.dim(3)
+            ? packed : packed[.ellipsis, ..<length, 0...]
+        return (visible[0], visible[1])
+    }
+
+    func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        precondition(keys.dtype == values.dtype)
+        precondition(keys.shape == values.shape)
+        return updatePacked(stacked([keys, values], axis: 0))
+    }
+
+    func updatePacked(_ keyValues: MLXArray) -> (MLXArray, MLXArray) {
+        precondition(keyValues.ndim == 5)
+        precondition(keyValues.dim(0) == 2)
+        let sequenceLength = keyValues.dim(3)
+
+        if let sizeLimit {
+            // Retain multi-row prefill directly, like RotatingKVCache's
+            // concat path. If a caller supplies prefill in chunks, first put
+            // a wrapped cache back into temporal order and preserve the same
+            // temporary maxSize + sequenceLength - 1 growth used upstream.
+            if sequenceLength > 1 {
+                if let current = storage {
+                    let ordered: MLXArray
+                    if ringIndex == current.dim(3) {
+                        ordered = current
+                    } else if ringIndex < offset {
+                        ordered = concatenated(
+                            [
+                                current[.ellipsis, ringIndex..., 0...],
+                                current[.ellipsis, ..<ringIndex, 0...],
+                            ],
+                            axis: 3)
+                    } else {
+                        ordered = current[.ellipsis, ..<ringIndex, 0...]
+                    }
+                    let trimSize = ordered.dim(3) - sizeLimit + 1
+                    let retained =
+                        trimSize > 0
+                        ? ordered[.ellipsis, trimSize..., 0...] : ordered
+                    storage = concatenated([retained, keyValues], axis: 3)
+                } else {
+                    storage = keyValues
+                }
+                offset += sequenceLength
+                ringIndex = storage!.dim(3)
+                return visibleViews(storage!, length: storage!.dim(3))
+            }
+
+            if storage == nil {
+                let capacity = min(allocationStep, sizeLimit)
+                storage = MLXArray.zeros(
+                    [
+                        2, keyValues.dim(1), keyValues.dim(2), capacity,
+                        keyValues.dim(4),
+                    ],
+                    dtype: keyValues.dtype)
+                storage![.ellipsis, ..<sequenceLength, 0...] = keyValues
+                offset = sequenceLength
+                ringIndex = sequenceLength
+                return visibleViews(storage!, length: sequenceLength)
+            }
+
+            precondition(sequenceLength == 1)
+            if storage!.dim(3) > sizeLimit {
+                let trimStart = storage!.dim(3) - sizeLimit
+                storage = storage![.ellipsis, trimStart..., 0...]
+                ringIndex = 0
+            } else if offset >= storage!.dim(3) && storage!.dim(3) < sizeLimit {
+                let extraLength = min(allocationStep, sizeLimit - storage!.dim(3))
+                let extra = MLXArray.zeros(
+                    [
+                        2, keyValues.dim(1), keyValues.dim(2), extraLength,
+                        keyValues.dim(4),
+                    ],
+                    dtype: keyValues.dtype)
+                storage = concatenated([storage!, extra], axis: 3)
+                ringIndex = offset
+            }
+            if ringIndex >= sizeLimit {
+                ringIndex = 0
+            }
+            storage![.ellipsis, ringIndex ..< (ringIndex + 1), 0...] = keyValues
+            offset += 1
+            ringIndex += 1
+            return visibleViews(storage!, length: min(offset, sizeLimit))
+        }
+
+        let previous = offset
+        if storage == nil, sequenceLength > 0,
+            sequenceLength.isMultiple(of: allocationStep)
+        {
+            storage = keyValues
+            offset = sequenceLength
+            ringIndex = sequenceLength
+            return visibleViews(keyValues, length: sequenceLength)
+        }
+
+        if storage == nil || previous + sequenceLength > storage!.dim(3) {
+            let batch = keyValues.dim(1)
+            let heads = keyValues.dim(2)
+            let dimension = keyValues.dim(4)
+            let steps =
+                (allocationStep + sequenceLength - 1) / allocationStep
+            let extra = MLXArray.zeros(
+                [2, batch, heads, steps * allocationStep, dimension],
+                dtype: keyValues.dtype)
+            if var current = storage {
+                if previous % allocationStep != 0 {
+                    current = current[.ellipsis, ..<previous, 0...]
+                }
+                storage = concatenated([current, extra], axis: 3)
+            } else {
+                storage = extra
+            }
+        }
+
+        offset += sequenceLength
+        storage![.ellipsis, previous ..< offset, 0...] = keyValues
+        return visibleViews(storage!, length: offset)
+    }
+
+    var state: [MLXArray] {
+        get {
+            guard let storage else { return [] }
+            let (keys, values) = visibleViews(
+                storage, length: min(offset, storage.dim(3)))
+            return [keys, values]
+        }
+        set {
+            precondition(newValue.count == 2)
+            precondition(newValue[0].shape == newValue[1].shape)
+            storage = stacked(newValue, axis: 0)
+            offset = newValue[0].dim(2)
+            ringIndex = offset
+        }
+    }
+
+    var metaState: [String] {
+        get {
+            [
+                sizeLimit.map { String($0) } ?? "None",
+                String(offset),
+                String(ringIndex),
+            ]
+        }
+        set {
+            precondition(newValue.count == 3)
+            offset = Int(newValue[1])!
+            ringIndex = Int(newValue[2])!
+        }
+    }
+
+    var isTrimmable: Bool {
+        sizeLimit == nil || offset < sizeLimit!
+    }
+
+    @discardableResult
+    func trim(_ n: Int) -> Int {
+        let trimmed = min(offset, n)
+        offset -= trimmed
+        ringIndex = max(0, ringIndex - trimmed)
+        return trimmed
+    }
+
+    func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if let sizeLimit {
+            if n > 1 {
+                let actualWindowSize = windowSize ?? sizeLimit
+                let cappedOffset = min(sizeLimit - 1, offset)
+                if returnArray || cappedOffset + n > actualWindowSize {
+                    return .array(
+                        createCausalMask(
+                            n: n,
+                            offset: cappedOffset,
+                            windowSize: actualWindowSize))
+                }
+                return .causal
+            }
+            if let windowSize, offset >= windowSize,
+                sizeLimit > windowSize
+            {
+                var currentIndex = ringIndex
+                if currentIndex >= sizeLimit {
+                    currentIndex = 0
+                }
+                let maskSize = offset < sizeLimit ? offset + 1 : sizeLimit
+                let mask =
+                    MLXArray(0 ..< Int32(maskSize))
+                    .>= Int32(maskSize - windowSize)
+                return .array(roll(mask, shift: currentIndex + 1))
+            }
+            return .none
+        }
+        if n == 1 {
+            return .none
+        }
+        if returnArray || (windowSize != nil && n > windowSize!) {
+            return .array(
+                createCausalMask(n: n, offset: offset, windowSize: windowSize))
+        }
+        return .causal
+    }
+
+    func copy() -> any KVCache {
+        let result = LagunaRuntimePackedKVCache(maxSize: sizeLimit)
+        result.storage = storage.map { $0[.ellipsis] }
+        result.offset = offset
+        result.ringIndex = ringIndex
+        return result
+    }
+}
+
 // MARK: - Attention
 
 private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
-    name: "laguna_full_qk_norm_yarn_bf16_128_v4",
-    inputNames: ["raw_queries", "raw_keys", "query_weight", "key_weight", "angles"],
-    outputNames: ["queries", "keys"],
+    name: "laguna_full_qk_norm_yarn_bf16_128_v5",
+    inputNames: [
+        "raw_queries", "raw_keys", "raw_values",
+        "query_weight", "key_weight", "angles",
+    ],
+    outputNames: ["queries", "key_values"],
     source: """
         constexpr uint head_dim = 128;
         constexpr uint rotary_dims = 64;
@@ -491,7 +745,7 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
         device bfloat* output =
             head < query_heads
             ? queries + head * head_dim
-            : keys + (head - query_heads) * head_dim;
+            : key_values + (head - query_heads) * head_dim;
         if (lane < 8) {
             bfloat rounded_mscale = bfloat(yarn_mscale);
             for (uint i = 0; i < 4; ++i) {
@@ -511,6 +765,17 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
                 output[base + i] = normalized[i];
             }
         }
+
+        // The K heads also copy their corresponding V row into the second
+        // bank. This is otherwise a separate producer followed by a second
+        // cache slice_update; the paired cache consumes both banks together.
+        if (head >= query_heads) {
+            uint key_head = head - query_heads;
+            for (uint i = 0; i < 4; ++i) {
+                key_values[8 * head_dim + key_head * head_dim + base + i] =
+                    raw_values[key_head * head_dim + base + i];
+            }
+        }
         """,
     ensureRowContiguous: true
 )
@@ -518,16 +783,19 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
 func lagunaFullQKNormYaRN(
     rawQueries: MLXArray,
     rawKeys: MLXArray,
+    rawValues: MLXArray,
     queryWeight: MLXArray,
     keyWeight: MLXArray,
     angles: MLXArray
-) -> (MLXArray, MLXArray) {
+) -> (queries: MLXArray, keyValues: MLXArray) {
     precondition(rawQueries.dtype == .bfloat16)
     precondition(rawKeys.dtype == .bfloat16)
+    precondition(rawValues.dtype == .bfloat16)
     precondition(queryWeight.dtype == .bfloat16)
     precondition(keyWeight.dtype == .bfloat16)
     precondition(rawQueries.shape == [1, 1, 48 * LagunaConstants.headDim])
     precondition(rawKeys.shape == [1, 1, 8 * LagunaConstants.headDim])
+    precondition(rawValues.shape == [1, 1, 8 * LagunaConstants.headDim])
     precondition(queryWeight.shape == [LagunaConstants.headDim])
     precondition(keyWeight.shape == [LagunaConstants.headDim])
     precondition(angles.dtype == .float32)
@@ -535,12 +803,12 @@ func lagunaFullQKNormYaRN(
 
     lagunaTrace("full qk norm+yarn")
     let outputs = lagunaFullQKNormYaRNKernel(
-        [rawQueries, rawKeys, queryWeight, keyWeight, angles],
+        [rawQueries, rawKeys, rawValues, queryWeight, keyWeight, angles],
         grid: (56 * 32, 1, 1),
         threadGroup: (32, 1, 1),
         outputShapes: [
             [1, 48, 1, LagunaConstants.headDim],
-            [1, 8, 1, LagunaConstants.headDim],
+            [2, 1, 8, 1, LagunaConstants.headDim],
         ],
         outputDTypes: [.bfloat16, .bfloat16]
     )
@@ -569,9 +837,12 @@ func lagunaFullQKNormYaRN(
 ///    table produced by that very kernel (see `_slidingRoPEAngleSeed`), so
 ///    they are the same floats, not a re-derivation.
 private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
-    name: "laguna_sliding_qk_norm_rope_bf16_128_v1",
-    inputNames: ["raw_queries", "raw_keys", "query_weight", "key_weight", "angles"],
-    outputNames: ["queries", "keys"],
+    name: "laguna_sliding_qk_norm_rope_bf16_128_v2",
+    inputNames: [
+        "raw_queries", "raw_keys", "raw_values",
+        "query_weight", "key_weight", "angles",
+    ],
+    outputNames: ["queries", "key_values"],
     source: """
         constexpr uint head_dim = 128;
         constexpr uint rotary_pairs = 64;
@@ -620,7 +891,7 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         device bfloat* output =
             head < query_heads
             ? queries + head * head_dim
-            : keys + (head - query_heads) * head_dim;
+            : key_values + (head - query_heads) * head_dim;
         // Every element rotates, so the lower sixteen lanes own all 64 pairs
         // and write both halves of each.
         if (lane < 16) {
@@ -635,6 +906,14 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
                     bfloat(first * sine + second * cosine);
             }
         }
+
+        if (head >= query_heads) {
+            uint key_head = head - query_heads;
+            for (uint i = 0; i < 4; ++i) {
+                key_values[8 * head_dim + key_head * head_dim + base + i] =
+                    raw_values[key_head * head_dim + base + i];
+            }
+        }
         """,
     ensureRowContiguous: true
 )
@@ -642,18 +921,21 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
 func lagunaSlidingQKNormRoPE(
     rawQueries: MLXArray,
     rawKeys: MLXArray,
+    rawValues: MLXArray,
     queryWeight: MLXArray,
     keyWeight: MLXArray,
     angles: MLXArray
-) -> (MLXArray, MLXArray) {
+) -> (queries: MLXArray, keyValues: MLXArray) {
     let heads = LagunaConstants.slidingAttentionHeads
     let kvHeads = LagunaConstants.numKeyValueHeads
     precondition(rawQueries.dtype == .bfloat16)
     precondition(rawKeys.dtype == .bfloat16)
+    precondition(rawValues.dtype == .bfloat16)
     precondition(queryWeight.dtype == .bfloat16)
     precondition(keyWeight.dtype == .bfloat16)
     precondition(rawQueries.shape == [1, 1, heads * LagunaConstants.headDim])
     precondition(rawKeys.shape == [1, 1, kvHeads * LagunaConstants.headDim])
+    precondition(rawValues.shape == [1, 1, kvHeads * LagunaConstants.headDim])
     precondition(queryWeight.shape == [LagunaConstants.headDim])
     precondition(keyWeight.shape == [LagunaConstants.headDim])
     precondition(angles.dtype == .float32)
@@ -661,12 +943,12 @@ func lagunaSlidingQKNormRoPE(
 
     lagunaTrace("sliding qk norm+rope")
     let outputs = lagunaSlidingQKNormRoPEKernel(
-        [rawQueries, rawKeys, queryWeight, keyWeight, angles],
+        [rawQueries, rawKeys, rawValues, queryWeight, keyWeight, angles],
         grid: ((heads + kvHeads) * 32, 1, 1),
         threadGroup: (32, 1, 1),
         outputShapes: [
             [1, heads, 1, LagunaConstants.headDim],
-            [1, kvHeads, 1, LagunaConstants.headDim],
+            [2, 1, kvHeads, 1, LagunaConstants.headDim],
         ],
         outputDTypes: [.bfloat16, .bfloat16]
     )
@@ -1315,9 +1597,11 @@ final class LagunaRuntimeAttention: Module {
             nKVHeads == LagunaConstants.numKeyValueHeads &&
             headDim == LagunaConstants.headDim &&
             queries.dtype == .bfloat16 && keys.dtype == .bfloat16 &&
+            values.dtype == .bfloat16 &&
             qNorm.weight.dtype == .bfloat16 && kNorm.weight.dtype == .bfloat16 &&
             queries.shape == [1, 1, nHeads * headDim] &&
-            keys.shape == [1, 1, nKVHeads * headDim]
+            keys.shape == [1, 1, nKVHeads * headDim] &&
+            values.shape == [1, 1, nKVHeads * headDim]
 
         let useFusedFullQKNormYaRN =
             lagunaFusedFullQKNormYaRNEnabled && !isSliding &&
@@ -1333,22 +1617,33 @@ final class LagunaRuntimeAttention: Module {
             qkRoPEAngles?.dtype == .float32 &&
             qkRoPEAngles?.shape == [1, 1, 1, headDim]
 
+        var packedKeyValues: MLXArray?
         if useFusedFullQKNormYaRN, let qkRoPEAngles {
-            (queries, keys) = lagunaFullQKNormYaRN(
+            let fused = lagunaFullQKNormYaRN(
                 rawQueries: queries,
                 rawKeys: keys,
+                rawValues: values,
                 queryWeight: qNorm.weight,
                 keyWeight: kNorm.weight,
                 angles: qkRoPEAngles
             )
+            queries = fused.queries
+            packedKeyValues = fused.keyValues
+            keys = fused.keyValues[0]
+            values = fused.keyValues[1]
         } else if useFusedSlidingQKNormRoPE, let qkRoPEAngles {
-            (queries, keys) = lagunaSlidingQKNormRoPE(
+            let fused = lagunaSlidingQKNormRoPE(
                 rawQueries: queries,
                 rawKeys: keys,
+                rawValues: values,
                 queryWeight: qNorm.weight,
                 keyWeight: kNorm.weight,
                 angles: qkRoPEAngles
             )
+            queries = fused.queries
+            packedKeyValues = fused.keyValues
+            keys = fused.keyValues[0]
+            values = fused.keyValues[1]
         } else {
             queries =
                 qNorm(queries.reshaped(B, L, nHeads, headDim))
@@ -1357,21 +1652,41 @@ final class LagunaRuntimeAttention: Module {
                 kNorm(keys.reshaped(B, L, nKVHeads, headDim))
                 .transposed(0, 2, 1, 3)
         }
-        values = values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
+        if packedKeyValues == nil {
+            values =
+                values.reshaped(B, L, nKVHeads, headDim)
+                .transposed(0, 2, 1, 3)
+        }
 
         if !useFusedFullQKNormYaRN && !useFusedSlidingQKNormRoPE {
             queries = applyRotaryPosition(rope, to: queries, cache: cache)
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
-        var output = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
-        )
+        let attended: MLXArray
+        if let packedKeyValues,
+            let packedCache = cache as? LagunaPackedKVCache
+        {
+            let (cachedKeys, cachedValues) =
+                packedCache.updatePacked(packedKeyValues)
+            attended = MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: cachedKeys,
+                values: cachedValues,
+                scale: scale,
+                mask: mask
+            )
+        } else {
+            attended = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
+        }
+        var output = attended
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
@@ -3649,6 +3964,14 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     }
 
     public func newCache(parameters _: GenerateParameters?) -> [KVCache] {
+        if lagunaPairedKVCacheEnabled {
+            return (0..<configuration.numHiddenLayers).map { layerIndex in
+                let maxSize =
+                    configuration.layerTypes[layerIndex] == .full
+                    ? nil : configuration.slidingWindow
+                return LagunaRuntimePackedKVCache(maxSize: maxSize) as KVCache
+            }
+        }
         (0..<configuration.numHiddenLayers).map { layerIndex in
             if configuration.layerTypes[layerIndex] == .full {
                 StandardKVCache()
