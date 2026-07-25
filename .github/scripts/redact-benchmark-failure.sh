@@ -100,6 +100,18 @@ if [[ -s "${score_path}" ]]; then
     # streaming path to meter. Its threat (hiding timed work outside the
     # measured window) is covered by the single-seed timed decode protocol
     # and the submission static review.
+    #
+    # Semantic GPQA gate outcomes. Both prefixes are authored by the trusted
+    # gate script (run-semantic-gpqa-gate.sh). The infra category means the
+    # judge API itself was unreachable (curl transport errors / HTTP 429 /
+    # 5xx through the bounded retry budget -- run 30169401200's 529 burst):
+    # no verdict exists, the submission was NOT rejected, and the run is
+    # re-dispatchable. It must never be conflated with semantic_gpqa_failed,
+    # which is a real judged rejection below min_pass.
+    elif [[ "${error_text}" == "semantic GPQA gate infra failure"* ]]; then
+      category="semantic_gpqa_infra_failed"
+    elif [[ "${error_text}" == "semantic GPQA gate failed"* ]]; then
+      category="semantic_gpqa_failed"
     elif [[ "${passed_correctness}" == "false" ]]; then
       category="correctness_failed"
     elif [[ -n "${error_text}" ]]; then
