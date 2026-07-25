@@ -1,5 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
+import Cmlx
 import Foundation
 import MLX
 import MLXNN
@@ -17,6 +18,16 @@ public protocol BatchPositionedKVCache: KVCache {
 
 // MARK: - graphOffsetArray Helper
 
+/// Retain the current graph context without adding an MLX primitive. This is
+/// the cross-module equivalent of MLXArray's internal `copyContext()`: later
+/// `_updateInternal` calls replace the source wrapper's context while this
+/// wrapper continues to reference the pre-update tracer.
+private func graphContextSnapshot(_ array: MLXArray) -> MLXArray {
+    var snapshot = mlx_array_new()
+    mlx_array_set(&snapshot, array.ctx)
+    return MLXArray(snapshot)
+}
+
 /// Returns a graph-visible cache offset when the cache exposes one.
 ///
 /// `KVCache.offset` is an `Int` API for compatibility with upstream model
@@ -25,17 +36,19 @@ public protocol BatchPositionedKVCache: KVCache {
 /// helpers that need positions outside `applyRotaryPosition` should call this
 /// before falling back to `cache.offset`.
 public func graphOffsetArray(for cache: KVCache?) -> MLXArray? {
-    // Snapshot with `+ 0` so cache.update() advancing offsetArray
-    // doesn't shift the caller's RoPE position. Without this, the query
-    // gets a position one step ahead of the keys in compiled decode.
+    // Snapshot the context so cache.update() advancing offsetArray doesn't
+    // shift the caller's RoPE position. A direct alias would put the query
+    // one step ahead of the keys in compiled decode. The former `+ 0`
+    // snapshot preserved this ordering but also created an elementwise GPU
+    // primitive on every call.
     if let compilableRot = cache as? CompilableRotatingKVCache {
-        return compilableRot.offsetArray + 0
+        return graphContextSnapshot(compilableRot.offsetArray)
     }
     if let compilable = cache as? CompilableKVCache {
-        return compilable.offsetArray + 0
+        return graphContextSnapshot(compilable.offsetArray)
     }
     if let batchCache = cache as? BatchPositionedKVCache {
-        return batchCache.batchOffset + 0
+        return graphContextSnapshot(batchCache.batchOffset)
     }
     return nil
 }
