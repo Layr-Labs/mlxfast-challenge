@@ -154,8 +154,42 @@ let lagunaFusedRoutedDownReduceEnabled =
 /// showed the fused bank helps decode (~+1.9%) but badly hurts the M=512
 /// sorted gather-GEMM prefill path, so prefill always dispatches the stock
 /// separate banks.
+///
+/// That prefill finding pre-dates RUNSKIP. See
+/// `DARKBLOOM_PREFILL_FUSED_GATE_UP` immediately below for the current,
+/// separately-flagged, post-RUNSKIP re-measurement of the same fusion idea
+/// applied to the sorted prefill path -- this flag and its history are left
+/// as-is (decode-only) rather than folded together, so each can be ablated
+/// independently.
 let lagunaFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_GATE_UP"] != "0"
+
+/// `DARKBLOOM_PREFILL_FUSED_GATE_UP` (default on; set "0" to disable):
+/// prefill/SORTED-regime counterpart to `DARKBLOOM_FUSED_ROUTED_GATE_UP`
+/// above. Serves the multi-token sorted gather-GEMM path (`indices.size >=
+/// 64` -- `SwitchGLU`'s own threshold for taking `gatherSort`, which every
+/// timed 512-token prefill request clears) from the same retained
+/// row-concatenated NVFP4 `[gate; up]` bank the decode path already keeps
+/// resident, instead of the stock two separate sorted gather-QMMs
+/// (`gate_proj` then `up_proj`). Mechanism: one N=1024 gather-GEMM has half
+/// the run-loop iterations and dispatch overhead of two N=512 ones, and,
+/// like the decode fusion above, each *gathered* output row's K-loop and
+/// scale application reads only its own weight/scale row independent of
+/// which bank that row lives in -- so the fused dispatch is bit-exact
+/// against the two separate ones it replaces.
+///
+/// The `DARKBLOOM_FUSED_ROUTED_GATE_UP` comment above records an earlier
+/// ablation that measured this same idea hurting the M=512 sorted prefill
+/// path; that measurement pre-dates RUNSKIP. A later measurement on a
+/// RUNSKIP-era tree (note ba4561c, never landed) found this specific
+/// prefill fusion a ~4% prefill win (373.5us -> 358.5us) instead. Shipped
+/// default ON, behind its own flag, so it can be ablated and re-measured on
+/// the ranked box independently of both the older decode-only flag and the
+/// stale prefill finding. See `lagunaFusedSortedRoutedGateUp` and its call
+/// site in `LagunaRuntimeSparseMoEBlock.forward` for the exact op-for-op
+/// mirror of `SwitchGLU.callAsFunction`'s sorted branch.
+let lagunaPrefillFusedRoutedGateUpEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_GATE_UP"] != "0"
 
 /// Decode post-attention residual + RMSNorm fusion. The kernel emits
 /// both the rounded BF16 residual (needed by the following skip connection)
@@ -232,6 +266,14 @@ let lagunaFusedFullQKNormYaRNEnabled =
 /// values. Set `DARKBLOOM_ROPE_ANGLE_ATLAS=0` to ablate.
 let lagunaRoPEAngleAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] != "0"
+
+/// Multi-token counterpart to the decode angle carrier. Stock Q/K RMSNorm
+/// remains untouched; only RoPE application is replaced. The applicator reads
+/// exact cos/sin rows produced by each attention family's own stock RoPE,
+/// combines Q and K in one large prefill dispatch, and writes attention's
+/// head-major layout directly. Set `DARKBLOOM_PREFILL_ROPE_ATLAS=0` to ablate.
+let lagunaPrefillRoPEAtlasEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ROPE_ATLAS"] != "0"
 
 private let lagunaRoPEAngleAtlasLength = 4096
 
@@ -724,6 +766,222 @@ func lagunaSlidingQKNormRoPE(
         ],
         outputDTypes: [.bfloat16, .bfloat16]
     )
+    return (outputs[0], outputs[1])
+}
+
+/// RoPE-only prefill applicator. Q/K normalization intentionally stays in
+/// MLX's stock RMSNorm kernels; this kernel consumes their rounded BF16
+/// token-major outputs and writes the head-major layout attention expects.
+///
+/// `work_row` flattens `(Q token, Q four-head group)` followed by
+/// `(K token, K four-head group)`, matching stock `rope_impl`'s N=4 work
+/// partition. The final-layer specialization therefore uses only sixteen
+/// Q work rows for its one query while retaining 512 * 2 K work rows.
+private func lagunaPrefillRoPEAtlasSource(
+    queryHeads: Int, rotaryDims: Int, yarn: Bool
+) -> String {
+    let rotaryPairs = rotaryDims / 2
+    let readFirst =
+        yarn
+        ? "float(bfloat(input[input_base + pair] * rounded_mscale))"
+        : "float(input[input_base + pair])"
+    let readSecond =
+        yarn
+        ? "float(bfloat(input[input_base + pair + rotary_pairs] * rounded_mscale))"
+        : "float(input[input_base + pair + rotary_pairs])"
+    let mscaleDeclaration =
+        yarn
+        ? "const bfloat rounded_mscale = bfloat(1.3465735912322998f);"
+        : ""
+    let tail =
+        rotaryDims < LagunaConstants.headDim
+        ? """
+            else {
+                // Full attention rotates the first 64 dimensions and copies
+                // the 64-element tail exactly as stock partial RoPE does.
+                uint tail_index =
+                    rotary_dims + (pair - rotary_pairs) * 2;
+                output[output_base + tail_index] =
+                    input[input_base + tail_index];
+                output[output_base + tail_index + 1] =
+                    input[input_base + tail_index + 1];
+            }
+            """
+        : ""
+
+    return """
+        constexpr uint head_dim = \(LagunaConstants.headDim);
+        constexpr uint query_heads = \(queryHeads);
+        constexpr uint key_heads = \(LagunaConstants.numKeyValueHeads);
+        constexpr uint heads_per_work_row = 4;
+        constexpr uint query_head_groups =
+            (query_heads + heads_per_work_row - 1) / heads_per_work_row;
+        constexpr uint key_head_groups =
+            (key_heads + heads_per_work_row - 1) / heads_per_work_row;
+        constexpr uint rotary_dims = \(rotaryDims);
+        constexpr uint rotary_pairs = \(rotaryPairs);
+        \(mscaleDeclaration)
+
+        uint pair = thread_position_in_grid.x;
+        uint work_row = thread_position_in_grid.y;
+        uint q_length = uint(query_length);
+        uint k_length = uint(key_length);
+        uint q_work_rows = q_length * query_head_groups;
+
+        const device bfloat* input;
+        device bfloat* output;
+        uint token;
+        uint first_head;
+        uint head_count;
+        uint sequence_length;
+        uint angle_position;
+
+        if (work_row < q_work_rows) {
+            token = work_row / query_head_groups;
+            first_head =
+                (work_row - token * query_head_groups) * heads_per_work_row;
+            head_count = query_heads;
+            sequence_length = q_length;
+            angle_position = uint(query_angle_start) + token;
+            input = normalized_queries;
+            output = queries;
+        } else {
+            uint key_work_row = work_row - q_work_rows;
+            token = key_work_row / key_head_groups;
+            first_head =
+                (key_work_row - token * key_head_groups) * heads_per_work_row;
+            head_count = key_heads;
+            sequence_length = k_length;
+            angle_position = token;
+            input = normalized_keys;
+            output = keys;
+        }
+
+        const device float* angle_row = angles + angle_position * rotary_dims;
+        for (uint i = 0; i < heads_per_work_row; ++i) {
+            uint head = first_head + i;
+            if (head >= head_count) {
+                break;
+            }
+
+            // RMSNorm outputs [1, sequence, heads, 128]. Attention consumes
+            // [1, heads, sequence, 128].
+            uint input_base =
+                (token * head_count + head) * head_dim;
+            uint output_base =
+                (head * sequence_length + token) * head_dim;
+
+            if (pair < rotary_pairs) {
+                float first = \(readFirst);
+                float second = \(readSecond);
+                float cosine = angle_row[pair];
+                float sine = angle_row[pair + rotary_pairs];
+                output[output_base + pair] =
+                    bfloat(first * cosine - second * sine);
+                output[output_base + pair + rotary_pairs] =
+                    bfloat(first * sine + second * cosine);
+            }
+            \(tail)
+        }
+        """
+}
+
+private let lagunaFullPrefillRoPEAtlasKernel = MLXFast.metalKernel(
+    name: "laguna_full_prefill_rope_atlas_bf16_v1",
+    inputNames: [
+        "normalized_queries", "normalized_keys", "angles",
+        "query_angle_start", "query_length", "key_length",
+    ],
+    outputNames: ["queries", "keys"],
+    source: lagunaPrefillRoPEAtlasSource(
+        queryHeads: LagunaConstants.fullAttentionHeads,
+        rotaryDims: LagunaConstants.headDim / 2,
+        yarn: true
+    ),
+    ensureRowContiguous: true
+)
+
+private let lagunaSlidingPrefillRoPEAtlasKernel = MLXFast.metalKernel(
+    name: "laguna_sliding_prefill_rope_atlas_bf16_v1",
+    inputNames: [
+        "normalized_queries", "normalized_keys", "angles",
+        "query_angle_start", "query_length", "key_length",
+    ],
+    outputNames: ["queries", "keys"],
+    source: lagunaPrefillRoPEAtlasSource(
+        queryHeads: LagunaConstants.slidingAttentionHeads,
+        rotaryDims: LagunaConstants.headDim,
+        yarn: false
+    ),
+    ensureRowContiguous: true
+)
+
+private func lagunaPrefillRoPEAtlas(
+    normalizedQueries: MLXArray,
+    normalizedKeys: MLXArray,
+    angles: MLXArray,
+    queryAngleStart: Int,
+    isSliding: Bool
+) -> (queries: MLXArray, keys: MLXArray)? {
+    let queryHeads =
+        isSliding
+        ? LagunaConstants.slidingAttentionHeads
+        : LagunaConstants.fullAttentionHeads
+    let rotaryDims =
+        isSliding ? LagunaConstants.headDim : LagunaConstants.headDim / 2
+    guard lagunaPrefillRoPEAtlasEnabled,
+        normalizedQueries.dtype == .bfloat16,
+        normalizedKeys.dtype == .bfloat16,
+        angles.dtype == .float32,
+        normalizedQueries.ndim == 4,
+        normalizedKeys.ndim == 4,
+        normalizedQueries.dim(0) == 1,
+        normalizedKeys.dim(0) == 1,
+        normalizedQueries.dim(2) == queryHeads,
+        normalizedKeys.dim(2) == LagunaConstants.numKeyValueHeads,
+        normalizedQueries.dim(3) == LagunaConstants.headDim,
+        normalizedKeys.dim(3) == LagunaConstants.headDim,
+        normalizedQueries.dim(1) >= 1,
+        normalizedKeys.dim(1) > 1,
+        angles.shape == [1, 1, normalizedKeys.dim(1), rotaryDims],
+        queryAngleStart >= 0,
+        queryAngleStart + normalizedQueries.dim(1) <= normalizedKeys.dim(1)
+    else {
+        return nil
+    }
+
+    let queryLength = normalizedQueries.dim(1)
+    let keyLength = normalizedKeys.dim(1)
+    let queryHeadGroups = (queryHeads + 3) / 4
+    let keyHeadGroups = (LagunaConstants.numKeyValueHeads + 3) / 4
+    let workRows =
+        queryLength * queryHeadGroups + keyLength * keyHeadGroups
+    let kernel =
+        isSliding
+        ? lagunaSlidingPrefillRoPEAtlasKernel
+        : lagunaFullPrefillRoPEAtlasKernel
+    let inputs: [any ScalarOrArray] = [
+        normalizedQueries,
+        normalizedKeys,
+        angles,
+        Int32(queryAngleStart),
+        Int32(queryLength),
+        Int32(keyLength),
+    ]
+    let outputs = kernel(
+        inputs,
+        grid: (LagunaConstants.headDim / 2, workRows, 1),
+        threadGroup: (32, 8, 1),
+        outputShapes: [
+            [1, queryHeads, queryLength, LagunaConstants.headDim],
+            [
+                1, LagunaConstants.numKeyValueHeads, keyLength,
+                LagunaConstants.headDim,
+            ],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    lagunaTrace("prefill qk rope atlas")
     return (outputs[0], outputs[1])
 }
 
@@ -1271,7 +1529,8 @@ final class LagunaRuntimeAttention: Module {
         inputNorm: RMSNorm,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
-        qkRoPEAngles: MLXArray? = nil
+        qkRoPEAngles: MLXArray? = nil,
+        prefillRoPEAngles: MLXArray? = nil
     ) -> MLXArray {
         let (B, L) = (input.dim(0), input.dim(1))
 
@@ -1376,6 +1635,7 @@ final class LagunaRuntimeAttention: Module {
             qkRoPEAngles?.dtype == .float32 &&
             qkRoPEAngles?.shape == [1, 1, 1, headDim]
 
+        var usedPrefillRoPEAtlas = false
         if useFusedFullQKNormYaRN, let qkRoPEAngles {
             (queries, keys) = lagunaFullQKNormYaRN(
                 rawQueries: queries,
@@ -1393,12 +1653,25 @@ final class LagunaRuntimeAttention: Module {
                 angles: qkRoPEAngles
             )
         } else {
-            queries =
-                qNorm(queries.reshaped(B, L, nHeads, headDim))
-                .transposed(0, 2, 1, 3)
-            keys =
-                kNorm(keys.reshaped(B, L, nKVHeads, headDim))
-                .transposed(0, 2, 1, 3)
+            let normalizedQueries = qNorm(
+                queries.reshaped(B, L, nHeads, headDim))
+            let normalizedKeys = kNorm(
+                keys.reshaped(B, L, nKVHeads, headDim))
+            if L > 1, let prefillRoPEAngles,
+                let rotated = lagunaPrefillRoPEAtlas(
+                    normalizedQueries: normalizedQueries,
+                    normalizedKeys: normalizedKeys,
+                    angles: prefillRoPEAngles,
+                    queryAngleStart: 0,
+                    isSliding: isSliding)
+            {
+                queries = rotated.queries
+                keys = rotated.keys
+                usedPrefillRoPEAtlas = true
+            } else {
+                queries = normalizedQueries.transposed(0, 2, 1, 3)
+                keys = normalizedKeys.transposed(0, 2, 1, 3)
+            }
         }
         // With a singleton sequence axis, `[B, 1, H, D]` and
         // `[B, H, 1, D]` have the same contiguous byte order. Reshape
@@ -1409,7 +1682,9 @@ final class LagunaRuntimeAttention: Module {
             ? values.reshaped(B, nKVHeads, L, headDim)
             : values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
 
-        if !useFusedFullQKNormYaRN && !useFusedSlidingQKNormRoPE {
+        if !useFusedFullQKNormYaRN && !useFusedSlidingQKNormRoPE
+            && !usedPrefillRoPEAtlas
+        {
             queries = applyRotaryPosition(rope, to: queries, cache: cache)
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
@@ -1494,7 +1769,11 @@ final class LagunaRuntimeAttention: Module {
     /// gate/projection run only for the last query; its RoPE offset is advanced
     /// by the discarded query-row count so it remains at the supplied
     /// sequence's final absolute position.
-    func callLastPrefillRow(_ x: MLXArray, cache: KVCache?) -> MLXArray {
+    func callLastPrefillRow(
+        _ x: MLXArray,
+        cache: KVCache?,
+        prefillRoPEAngles: MLXArray? = nil
+    ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
         precondition(L > 1)
 
@@ -1503,16 +1782,32 @@ final class LagunaRuntimeAttention: Module {
         var keys = wk(x)
         var values = wv(x)
 
-        queries = qNorm(queries.reshaped(B, 1, nHeads, headDim)).transposed(0, 2, 1, 3)
-        keys = kNorm(keys.reshaped(B, L, nKVHeads, headDim)).transposed(0, 2, 1, 3)
+        let normalizedQueries = qNorm(
+            queries.reshaped(B, 1, nHeads, headDim))
+        let normalizedKeys = kNorm(
+            keys.reshaped(B, L, nKVHeads, headDim))
         values = values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
 
-        if let offsetArray = graphOffsetArray(for: cache) {
-            queries = rope(queries, offset: offsetArray + Int32(L - 1))
+        if let prefillRoPEAngles,
+            let rotated = lagunaPrefillRoPEAtlas(
+                normalizedQueries: normalizedQueries,
+                normalizedKeys: normalizedKeys,
+                angles: prefillRoPEAngles,
+                queryAngleStart: L - 1,
+                isSliding: isSliding)
+        {
+            queries = rotated.queries
+            keys = rotated.keys
         } else {
-            queries = rope(queries, offset: (cache?.offset ?? 0) + L - 1)
+            queries = normalizedQueries.transposed(0, 2, 1, 3)
+            keys = normalizedKeys.transposed(0, 2, 1, 3)
+            if let offsetArray = graphOffsetArray(for: cache) {
+                queries = rope(queries, offset: offsetArray + Int32(L - 1))
+            } else {
+                queries = rope(queries, offset: (cache?.offset ?? 0) + L - 1)
+            }
+            keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
         let attended = attentionWithCacheUpdate(
             queries: queries,
@@ -3144,6 +3439,93 @@ private func lagunaPrefillMoETail(
     )[0]
 }
 
+/// Prefill (multi-token, SORTED-regime) counterpart to the decode-only fused
+/// gate/up dispatch in `LagunaRuntimeSparseMoEBlock.forward`. Mirrors
+/// `SwitchGLU.callAsFunction`
+/// (`Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift`) op for
+/// op on its `doSort == true` branch -- every line below is annotated with
+/// the stock line it replaces or reproduces exactly -- with ONE gather-QMM
+/// over the retained row-concatenated `[gate; up]` NVFP4 bank in place of
+/// `SwitchGLU`'s two separate `gate_proj`/`up_proj` `QuantizedSwitchLinear`
+/// calls. `down_proj` is still the exact stock module (`downProj`, obtained
+/// via `prepareFusedRoutedGateUp`'s reflection over `switchMLP.children()`),
+/// invoked exactly as `SwitchGLU` invokes it.
+///
+/// Bit-exactness: `gatherSort`/`scatterUnsort` and the down projection are
+/// untouched stock calls, called with the exact same arguments `SwitchGLU`
+/// uses. The only change is fusing the two gate/up
+/// `QuantizedSwitchLinear.callAsFunction` gather-QMMs (both bias-free,
+/// verified at `prepareFusedRoutedGateUp` build time) into one
+/// `MLX.gatherQuantizedMM` over `fusedWeight`/`fusedScales` -- gate rows then
+/// up rows, the same concatenation order the decode path already relies on.
+/// Each gathered output row's K-loop and scale application reads only its
+/// own weight/scale row and is independent of which bank that row lives in
+/// or which other rows share the dispatch, so slicing the fused output at
+/// `split` reproduces the two separate `gate_proj`/`up_proj` outputs
+/// exactly; `compiledSiluProduct` then runs on those two exact slices,
+/// identical to the stock `activationProduct(xGate, xUp)` call `SwitchGLU`
+/// makes for the default SiLU path this runtime uses.
+private func lagunaFusedSortedRoutedGateUp(
+    _ x: MLXArray,
+    indices: MLXArray,
+    fusedWeight: MLXArray,
+    fusedScales: MLXArray,
+    split: Int,
+    downProj: SwitchLinear
+) -> MLXArray {
+    // SwitchGLU: `var x = MLX.expandedDimensions(x, axes: [-2, -3])`
+    var sortedX = MLX.expandedDimensions(x, axes: [-2, -3])
+    // SwitchGLU: `let doSort = indices.size >= 64`. The call site already
+    // guards `indices.size >= 64` before calling in, so this is always true
+    // here; recomputed anyway so this function mirrors SwitchGLU verbatim
+    // and stays correct if that guard is ever loosened.
+    let doSort = indices.size >= 64
+    // SwitchGLU: `var idx = indices` / `var inverseOrder = MLXArray()`
+    var idx = indices
+    var inverseOrder = MLXArray()
+    // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
+    if doSort {
+        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+    }
+    // Fused counterpart of SwitchGLU's separate-bank branch:
+    //   xUp = upProj(x, idx, sortedIndices: doSort)
+    //   xGate = gateProj(x, idx, sortedIndices: doSort)
+    // Each of those is exactly `QuantizedSwitchLinear.callAsFunction` with
+    // `biases: nil` (both banks are bias-free per the `prepareFusedRoutedGateUp`
+    // guard): `MLX.gatherQuantizedMM(x, weight, scales: scales, biases: nil,
+    // rhsIndices: indices, transpose: true, groupSize: groupSize, bits: bits,
+    // mode: mode, sortedIndices: sortedIndices)`. Issuing that once over the
+    // row-concatenated `fusedWeight`/`fusedScales` bank instead of twice over
+    // the separate banks is the fusion; every other argument matches the
+    // stock call exactly (group 16, 4-bit, NVFP4, transpose, doSort).
+    let gateUp = MLX.gatherQuantizedMM(
+        sortedX,
+        fusedWeight,
+        scales: fusedScales,
+        biases: nil,
+        rhsIndices: idx,
+        transpose: true,
+        groupSize: 16,
+        bits: 4,
+        mode: .nvfp4,
+        sortedIndices: doSort
+    )
+    let xGate = gateUp[.ellipsis, ..<split]
+    let xUp = gateUp[.ellipsis, split...]
+    // SwitchGLU: `activated = activationProduct(xGate, xUp)` -- this
+    // runtime's SwitchGLU instances are always built via the default SiLU
+    // initializer, so `activationProduct` is always `compiledSiluProduct`.
+    let activated = compiledSiluProduct(xGate, xUp)
+    // SwitchGLU: `x = downProj(activated, idx, sortedIndices: doSort)`
+    var result = downProj(activated, idx, sortedIndices: doSort)
+    // SwitchGLU: `if doSort { x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape) }`
+    if doSort {
+        result = scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape)
+    }
+    // SwitchGLU: `return MLX.squeezed(x, axis: -2)`
+    return MLX.squeezed(result, axis: -2)
+}
+
 final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     let routedScalingFactor: Float
 
@@ -3415,7 +3797,41 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     axis: -2)
             }
         } else {
-            y = switchMLP(x, inds)
+            // PREFILL sorted-regime fused gate/up: same retained
+            // row-concatenated NVFP4 bank the decode branch above uses, but
+            // driven through `lagunaFusedSortedRoutedGateUp`, which mirrors
+            // `SwitchGLU.callAsFunction`'s `doSort == true` path op for op
+            // (see that function's doc comment for the line-by-line
+            // correspondence). Falls back to the fully stock `switchMLP(x,
+            // inds)` -- unchanged from before this fusion -- whenever the
+            // flag is off, the fused bank wasn't built, or the guarded
+            // shapes/dtypes/regime don't match; either way `y` ends up with
+            // the exact same shape/dtype `switchMLP` alone would have
+            // produced, so every consumer below (including the
+            // `lagunaPrefillMoETailEnabled` tail fusion) is unaffected by
+            // which branch ran.
+            if lagunaPrefillFusedRoutedGateUpEnabled,
+                let fusedWeight = _fusedRoutedGateUpWeight,
+                let fusedScales = _fusedRoutedGateUpScales,
+                let downProj = _routedDownProj,
+                x.dim(1) > 1,
+                inds.size >= 64,
+                fusedWeight.dtype == .uint32,
+                fusedScales.dtype == .uint8,
+                _fusedRoutedGateUpSplit == LagunaConstants.moeIntermediateSize
+            {
+                lagunaTrace("prefill fused routed gate/up")
+                y = lagunaFusedSortedRoutedGateUp(
+                    x,
+                    indices: inds,
+                    fusedWeight: fusedWeight,
+                    fusedScales: fusedScales,
+                    split: _fusedRoutedGateUpSplit,
+                    downProj: downProj
+                )
+            } else {
+                y = switchMLP(x, inds)
+            }
             if lagunaPrefillMoETailEnabled,
                 let residual,
                 x.dim(1) > 1,
@@ -3502,14 +3918,16 @@ final class LagunaRuntimeDecoderLayer: Module {
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
-        qkRoPEAngles: MLXArray? = nil
+        qkRoPEAngles: MLXArray? = nil,
+        prefillRoPEAngles: MLXArray? = nil
     ) -> MLXArray {
         let r = selfAttn(
             x,
             inputNorm: inputLayerNorm,
             mask: mask,
             cache: cache,
-            qkRoPEAngles: qkRoPEAngles
+            qkRoPEAngles: qkRoPEAngles,
+            prefillRoPEAngles: prefillRoPEAngles
         )
         let h: MLXArray
         let normalized: MLXArray
@@ -3575,9 +3993,16 @@ final class LagunaRuntimeDecoderLayer: Module {
     /// Final-layer prefill specialization. Every supplied row still produces
     /// and commits its K/V state, but only the last query/output row proceeds
     /// through attention output projection and the terminal MLP.
-    func callLastPrefillRow(_ x: MLXArray, cache: KVCache?) -> MLXArray {
+    func callLastPrefillRow(
+        _ x: MLXArray,
+        cache: KVCache?,
+        prefillRoPEAngles: MLXArray? = nil
+    ) -> MLXArray {
         let normalized = inputLayerNorm(x)
-        let r = selfAttn.callLastPrefillRow(normalized, cache: cache)
+        let r = selfAttn.callLastPrefillRow(
+            normalized,
+            cache: cache,
+            prefillRoPEAngles: prefillRoPEAngles)
         let h = lagunaLastTokenHidden(x) + r
         let r2 = mlp(postAttentionLayerNorm(h))
         return h + r2
@@ -3738,8 +4163,11 @@ final class LagunaRuntimeModelInner: Module {
     /// position `p`, including YaRN's authoritative FP32 rounding.
     func prepareRoPEAngleAtlases() -> [MLXArray] {
         guard lagunaRoPEAngleAtlasEnabled,
-            lagunaFusedFullQKNormYaRNEnabled,
-            lagunaFusedSlidingQKNormRoPEEnabled,
+            lagunaPrefillRoPEAtlasEnabled
+                || (
+                    lagunaFusedFullQKNormYaRNEnabled
+                        && lagunaFusedSlidingQKNormRoPEEnabled
+                ),
             layerTypes.contains(.full),
             layerTypes.contains(.sliding)
         else {
@@ -3767,6 +4195,63 @@ final class LagunaRuntimeModelInner: Module {
         _fullRoPEAngleAtlas = fullAtlas
         _slidingRoPEAngleAtlas = slidingAtlas
         return [fullAtlas, slidingAtlas]
+    }
+
+    /// Return one absolute atlas range only for a real multi-token prefill
+    /// whose caches are either absent (position zero) or the exact direct
+    /// cache stack used by this model. Compilable/graph-offset subclasses are
+    /// excluded so reading `offset` cannot synchronize a graph value. Checking
+    /// every layer also prevents a representative cache from silently
+    /// supplying an angle range to a desynchronized layer.
+    private func prefillRoPEAtlasRange(
+        inputs: MLXArray, cache: [KVCache]?
+    ) -> Range<Int>? {
+        guard lagunaRoPEAngleAtlasEnabled,
+            lagunaPrefillRoPEAtlasEnabled,
+            inputs.dtype == .int32,
+            inputs.ndim == 2,
+            inputs.dim(0) == 1,
+            inputs.dim(1) > 1,
+            _fullRoPEAngleAtlas != nil,
+            _slidingRoPEAngleAtlas != nil
+        else {
+            return nil
+        }
+
+        let length = inputs.dim(1)
+        if cache == nil {
+            guard length <= lagunaRoPEAngleAtlasLength else { return nil }
+            return 0 ..< length
+        }
+        guard let cache, cache.count == layers.count else { return nil }
+
+        var start: Int?
+        for (index, layerCache) in cache.enumerated() {
+            switch layerTypes[index] {
+            case .full:
+                guard type(of: layerCache) == KVCacheSimple.self else {
+                    return nil
+                }
+            case .sliding:
+                guard type(of: layerCache) == RotatingKVCache.self,
+                    layerCache.maxSize == slidingWindow
+                else {
+                    return nil
+                }
+            }
+            if let start {
+                guard layerCache.offset == start else { return nil }
+            } else {
+                start = layerCache.offset
+            }
+        }
+
+        guard let start, start >= 0,
+            start + length <= lagunaRoPEAngleAtlasLength
+        else {
+            return nil
+        }
+        return start ..< (start + length)
     }
 
     /// Return a host position only for the exact direct-decode cache pair.
@@ -3858,6 +4343,23 @@ final class LagunaRuntimeModelInner: Module {
                 : nil
         }
 
+        let prefillRoPEAtlasRange = prefillRoPEAtlasRange(
+            inputs: inputs, cache: cache)
+        let fullPrefillRoPEAngles: MLXArray?
+        let slidingPrefillRoPEAngles: MLXArray?
+        if let prefillRoPEAtlasRange,
+            let fullAtlas = _fullRoPEAngleAtlas,
+            let slidingAtlas = _slidingRoPEAngleAtlas
+        {
+            fullPrefillRoPEAngles =
+                fullAtlas[0..., 0..., prefillRoPEAtlasRange, 0...]
+            slidingPrefillRoPEAngles =
+                slidingAtlas[0..., 0..., prefillRoPEAtlasRange, 0...]
+        } else {
+            fullPrefillRoPEAngles = nil
+            slidingPrefillRoPEAngles = nil
+        }
+
         // One mask per attention family, derived from a representative
         // layer's cache offset: all full-attention caches advance in
         // lockstep, as do all sliding caches (vendored `LagunaModelInner`
@@ -3876,15 +4378,21 @@ final class LagunaRuntimeModelInner: Module {
             let isFull = layerTypes[i] == .full
             let mask = isFull ? fullMask : slidingMask
             let qkRoPEAngles = isFull ? fullRoPEAngles : slidingRoPEAngles
+            let prefillRoPEAngles =
+                isFull ? fullPrefillRoPEAngles : slidingPrefillRoPEAngles
             if i == layers.count - 1, h.dim(1) > 1 {
                 if case .causal = mask {
-                    h = layer.callLastPrefillRow(h, cache: cache?[i])
+                    h = layer.callLastPrefillRow(
+                        h,
+                        cache: cache?[i],
+                        prefillRoPEAngles: prefillRoPEAngles)
                 } else {
                     h = layer(
                         h,
                         mask: mask,
                         cache: cache?[i],
-                        qkRoPEAngles: qkRoPEAngles
+                        qkRoPEAngles: qkRoPEAngles,
+                        prefillRoPEAngles: prefillRoPEAngles
                     )
                 }
             } else {
@@ -3892,7 +4400,8 @@ final class LagunaRuntimeModelInner: Module {
                     h,
                     mask: mask,
                     cache: cache?[i],
-                    qkRoPEAngles: qkRoPEAngles
+                    qkRoPEAngles: qkRoPEAngles,
+                    prefillRoPEAngles: prefillRoPEAngles
                 )
             }
         }
