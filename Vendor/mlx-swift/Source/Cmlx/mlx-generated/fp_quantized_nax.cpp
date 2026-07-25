@@ -197,13 +197,37 @@ struct Quantize {
   }
 };
 
+// E2M1 code -> value table, indexed by the full 4-bit code (bit 3 = sign).
+// Bit-exact against the arithmetic decode by exhaustion: the 16 possible
+// codes map to {+-0, +-0.5, +-1, +-1.5, +-2, +-3, +-4, +-6}, every one of
+// which is exactly representable in float, half and bfloat, so the
+// float-to-U convert below cannot round.
+constant float fp4_e2m1_lut[16] = {
+    0.0f,
+    0.5f,
+    1.0f,
+    1.5f,
+    2.0f,
+    3.0f,
+    4.0f,
+    6.0f,
+    -0.0f,
+    -0.5f,
+    -1.0f,
+    -1.5f,
+    -2.0f,
+    -3.0f,
+    -4.0f,
+    -6.0f,
+};
+
 template <int bits, typename U = float>
 struct Dequantize {
   U operator()(uint8_t x) {
     if constexpr (bits == 8) {
       return U(*(thread fp8_e4m3*)(&x));
     } else {
-      return U(*(thread fp4_e2m1*)(&x));
+      return U(fp4_e2m1_lut[x & 0xF]);
     }
   }
 };

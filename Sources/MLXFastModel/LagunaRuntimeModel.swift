@@ -199,6 +199,22 @@ let lagunaFusedQKVProjectionEnabled =
 let lagunaFusedSlidingQKNormRoPEEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_QK_NORM_ROPE"] != "0"
 
+/// Prefill shared-expert gate/up merge: the existing fused-bank
+/// `quantizedMM` branch extended from decode-only to any sequence length
+/// (same row-concatenation exactness argument). Acceptance-band chunk 1.
+/// Set `DARKBLOOM_PREFILL_SHARED_GATE_UP=0` to restore the stock pair.
+let lagunaPrefillSharedGateUpEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_SHARED_GATE_UP"] != "0"
+
+/// Prefill routed gate/up merge: one sorted gather-QMM over the retained
+/// row-concatenated `[gate; up]` bank instead of two. Measured ~-4% prefill
+/// alone. DEFAULT OFF pending its own acceptance-band chunk (the paired
+/// band caps a submission's prefill gain at ~5%, so the measured -18%
+/// prefill stack ships in slices); set
+/// `DARKBLOOM_PREFILL_FUSED_GATE_UP=1` to enable.
+let lagunaPrefillFusedGateUpEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_GATE_UP"] == "1"
+
 /// Full-attention counterpart: fuses per-head Q/K RMSNorm with partial YaRN
 /// RoPE. One stock FP32 probe row carries the authoritative rotary factors,
 /// while the custom kernel preserves the normalized BF16 boundary and tail.
@@ -2553,9 +2569,19 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if x.dim(1) == 1,
+        // The fused [gate; up] bank serves every sequence length: each
+        // quantized output row is computed independently, so one dispatch
+        // over the row-concatenated bank is bit-exact against the separate
+        // gate/up dispatches at prefill exactly as at decode. Prefill entry
+        // is gated by `DARKBLOOM_PREFILL_SHARED_GATE_UP` (acceptance-band
+        // chunk 1); the custom SwiGLU QMV kernel below keeps its own
+        // single-token shape guard either way.
+        if x.dim(1) == 1 || lagunaPrefillSharedGateUpEnabled,
             let fusedWeight = _fusedGateUpWeight, let fusedScales = _fusedGateUpScales
         {
+            if x.dim(1) > 1 {
+                lagunaTrace("prefill fused shared gate/up QMM")
+            }
             if lagunaFusedSharedSwiGLUQMVEnabled,
                 x.dtype == .bfloat16,
                 x.shape == [1, 1, LagunaConstants.hiddenSize],
@@ -3372,7 +3398,51 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     axis: -2)
             }
         } else {
-            y = switchMLP(x, inds)
+            if lagunaPrefillFusedGateUpEnabled,
+                x.dim(1) > 1,
+                inds.size >= 64,
+                let fusedWeight = _fusedRoutedGateUpWeight,
+                let fusedScales = _fusedRoutedGateUpScales,
+                let downProj = _routedDownProj,
+                _fusedRoutedGateUpSplit == LagunaConstants.moeIntermediateSize,
+                x.dtype == .bfloat16,
+                fusedWeight.dtype == .uint32,
+                fusedScales.dtype == .uint8
+            {
+                // Prefill: one sorted gather-QMM over the retained
+                // row-concatenated [gate; up] bank instead of two over the
+                // separate banks. Replicates SwitchGLU's sorted path op for
+                // op (same expand, gatherSort, gather call shape, SwiGLU
+                // product, down projection, and scatterUnsort); only the row
+                // grouping of the gate/up dispatch changes, and each
+                // gathered output row keeps its own K loop, so every value
+                // is bit-exact against the separate banks.
+                lagunaTrace("prefill fused gate/up gather QMM")
+                let expanded = MLX.expandedDimensions(x, axes: [-2, -3])
+                let (sortedX, sortedIdx, inverseOrder) = gatherSort(
+                    x: expanded, indices: inds)
+                let gateUp = MLX.gatherQuantizedMM(
+                    sortedX,
+                    fusedWeight,
+                    scales: fusedScales,
+                    biases: nil,
+                    rhsIndices: sortedIdx,
+                    transpose: true,
+                    groupSize: 16,
+                    bits: 4,
+                    mode: .nvfp4,
+                    sortedIndices: true
+                )
+                let xGate = gateUp[.ellipsis, 0 ..< _fusedRoutedGateUpSplit]
+                let xUp = gateUp[.ellipsis, _fusedRoutedGateUpSplit...]
+                let activated = compiledSiluProduct(xGate, xUp)
+                var routed = downProj(activated, sortedIdx, sortedIndices: true)
+                routed = scatterUnsort(
+                    x: routed, invOrder: inverseOrder, shape: inds.shape)
+                y = MLX.squeezed(routed, axis: -2)
+            } else {
+                y = switchMLP(x, inds)
+            }
             if lagunaPrefillMoETailEnabled,
                 let residual,
                 x.dim(1) > 1,
