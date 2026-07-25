@@ -2575,69 +2575,101 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
     let epilogue =
         normalizing
         ? """
-                float total = 0.0f;
-                for (uint i = 0; i < 8; ++i) {
-                    total = scores[i] + total;
-                }
-                router_scores[lane] = scores[lane] / total;
+        float total = 0.0f;
+        for (uint i = 0; i < 8; ++i) {
+            total = simd_shuffle(my_score, ushort(i)) + total;
+        }
+        if (lane < 8) {
+            router_indices[lane] = my_index;
+            router_scores[lane] = my_score / total;
+        }
         """
         : """
-                router_scores[lane] = scores[lane];
+        if (lane < 8) {
+            router_indices[lane] = my_index;
+            router_scores[lane] = my_score;
+        }
         """
     return """
         uint lane = thread_position_in_threadgroup.x;
 
-        threadgroup float scores[256];
-        threadgroup float choice_keys[256];
-        threadgroup uint expert_indices[256];
+        threadgroup float xchg_keys[256];
+        threadgroup uint xchg_indices[256];
+        threadgroup float xchg_scores[256];
 
         float x = float(logits[lane]);
         float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
-        float score = x < 0.0f ? y : 1.0f - y;
-        scores[lane] = score;
-        float corrected = score + float(correction_bias[lane]);
-        choice_keys[lane] = -corrected;
-        expert_indices[lane] = lane;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float my_score = x < 0.0f ? y : 1.0f - y;
+        float my_key = -(my_score + float(correction_bias[lane]));
+        uint my_index = lane;
 
         // A total order (choice key, then original expert index) makes this
         // network match the stock stable merge sort even for exact ties,
         // signed zero, and NaNs. The lower half of each final sequence keeps
         // the better entries, so ranks 0..<8 are the desired top experts.
+        //
+        // The network's schedule, comparator, and pair roles are unchanged
+        // from the threadgroup-memory version; only WHERE a pair exchanges
+        // its operands differs. For stride < 32, `partner = lane ^ stride`
+        // never leaves the calling simdgroup (only bits 0-4 flip), so those
+        // 30 stages exchange through registers with `simd_shuffle_xor` --
+        // the same value-passing idiom the promoted QK-norm kernels use --
+        // touching no memory and needing no barrier. Shuffles are
+        // bit-preserving, both partners compute the identical swap decision
+        // from identical operands (`lane & sequence` agrees across a pair
+        // because stride < sequence), and each keeps its side of the
+        // exchange, so every stage's resulting values are bit-identical to
+        // the memory version's. Only the six stages with stride >= 32 cross
+        // a simdgroup boundary and go through threadgroup memory with full
+        // barriers.
         for (uint sequence = 2; sequence <= 256; sequence <<= 1) {
             for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
-                uint partner = lane ^ stride;
-                if (partner > lane) {
-                    float a_key = choice_keys[lane];
-                    uint a_index = expert_indices[lane];
-                    float a_score = scores[lane];
-                    float b_key = choice_keys[partner];
-                    uint b_index = expert_indices[partner];
-                    float b_score = scores[partner];
-
-                    bool lower_wants_better = (lane & sequence) == 0;
-                    bool b_before_a = laguna_router_key_before(
-                        b_key, b_index, a_key, a_index);
-                    bool a_before_b = laguna_router_key_before(
-                        a_key, a_index, b_key, b_index);
-                    bool swap = lower_wants_better ? b_before_a : a_before_b;
-                    if (swap) {
-                        choice_keys[lane] = b_key;
-                        expert_indices[lane] = b_index;
-                        scores[lane] = b_score;
-                        choice_keys[partner] = a_key;
-                        expert_indices[partner] = a_index;
-                        scores[partner] = a_score;
-                    }
+                float other_key;
+                uint other_index;
+                float other_score;
+                if (stride < 32) {
+                    other_key = simd_shuffle_xor(my_key, ushort(stride));
+                    other_index = simd_shuffle_xor(my_index, ushort(stride));
+                    other_score = simd_shuffle_xor(my_score, ushort(stride));
+                } else {
+                    xchg_keys[lane] = my_key;
+                    xchg_indices[lane] = my_index;
+                    xchg_scores[lane] = my_score;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    uint partner = lane ^ stride;
+                    other_key = xchg_keys[partner];
+                    other_index = xchg_indices[partner];
+                    other_score = xchg_scores[partner];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                bool is_lower = (lane & stride) == 0;
+                float a_key = is_lower ? my_key : other_key;
+                uint a_index = is_lower ? my_index : other_index;
+                float a_score = is_lower ? my_score : other_score;
+                float b_key = is_lower ? other_key : my_key;
+                uint b_index = is_lower ? other_index : my_index;
+                float b_score = is_lower ? other_score : my_score;
+
+                bool lower_wants_better = (lane & sequence) == 0;
+                bool b_before_a = laguna_router_key_before(
+                    b_key, b_index, a_key, a_index);
+                bool a_before_b = laguna_router_key_before(
+                    a_key, a_index, b_key, b_index);
+                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                if (swap) {
+                    my_key = is_lower ? b_key : a_key;
+                    my_index = is_lower ? b_index : a_index;
+                    my_score = is_lower ? b_score : a_score;
+                }
             }
         }
 
-        if (lane < 8) {
-            router_indices[lane] = expert_indices[lane];
+        // Ranks 0..<8 live in lanes 0..<8 of simdgroup 0. The epilogue runs
+        // unguarded so every shuffle source lane is active; only lanes < 8
+        // write. The rank-order left fold reproduces the stock epilogue's
+        // `total = scores[i] + total` operand order exactly.
         \(epilogue)
-        }
         """
 }
 
@@ -2663,7 +2695,7 @@ private let lagunaDecodeRouterTop8Header = """
     """
 
 private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_v2",
+    name: "laguna_decode_router_top8_v3",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterTop8KernelSource(normalizing: false),
@@ -2672,7 +2704,7 @@ private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
 )
 
 private let lagunaDecodeRouterTop8NormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_norm_v1",
+    name: "laguna_decode_router_top8_norm_v2",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterTop8KernelSource(normalizing: true),
