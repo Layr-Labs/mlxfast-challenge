@@ -1264,6 +1264,76 @@ const char* darkbloom_attn_qhoist_define() {
   return enabled ? "\n#define DARKBLOOM_ATTN_QHOIST 1\n" : "";
 }
 
+// DARKBLOOM_ATTN_SGCAUSAL: per-simdgroup causal K-block limit in attention_nax.
+//
+// kb_lim is derived from the THREADGROUP's row span, but each simdgroup owns
+// only kU*TQ of those BQ rows. Simdgroups holding the earlier rows therefore
+// run K blocks entirely above their own causal diagonal, where every Stile
+// element is masked to neg_inf and the block is the identity. At the frozen
+// prefill window that is 16 of 288 simdgroup x K-block units -- 5.56% of the
+// executed block work. The trip count and every barrier stay exactly where
+// they are (a per-simdgroup trip count would make the in-loop
+// threadgroup_barrier be reached a different number of times per simdgroup,
+// which is UB); only the work is predicated.
+//
+// Levels: 1 = skip QK^T, scale, masking and softmax but still run P@V on the
+// cleared +0.0 Stile, which is bit-for-bit the P upstream would have fed it.
+// 2 = also skip P@V; see the -0.0 note in the kernel.
+//
+// THE EMPTY STRING SELECTS LEVEL 1, AND THAT IS DELIBERATE. `mlxfast submit`
+// packages source, not environment, and the ranked runner sets no DARKBLOOM_*
+// variables -- so the UNSET PATH IS THE SHIPPED PATH. A winning flag left at
+// `raw == "1"` ships as a literal no-op, which this project has done twice.
+// Explicit "0" keeps upstream reachable as the A/B control arm, and level 2
+// stays opt-in behind its -0.0 asterisk.
+int darkbloom_attn_sgcausal_level() {
+  static const int level = [] {
+    const auto raw = env::get_var("DARKBLOOM_ATTN_SGCAUSAL", "");
+    const int v = (raw == "0") ? 0 : ((raw == "2") ? 2 : 1);
+    if (env::get_var("DARKBLOOM_ATTN_TRACE", "") == "1") {
+      fprintf(stderr, "mlxfast: attn sgcausal: level=%d\n", v);
+    }
+    return v;
+  }();
+  return level;
+}
+
+const char* darkbloom_attn_sgcausal_define() {
+  switch (darkbloom_attn_sgcausal_level()) {
+    case 1:
+      return "\n#define DARKBLOOM_ATTN_SGCAUSAL 1\n";
+    case 2:
+      return "\n#define DARKBLOOM_ATTN_SGCAUSAL 2\n";
+    default:
+      return "";
+  }
+}
+
+// Arm state, folded into the kernel/library name.
+//
+// `d.get_library()` keys its cache on the library name and
+// `get_steel_attention_nax_kernel` passed the bare `kernel_name`, which encodes
+// tile shape and dtype but NOT which DARKBLOOM define was prepended. Two arms
+// therefore shared one cache entry, so whichever ran first could have its
+// binary served to the other -- an arm silently measuring its control. Folding
+// the state into the name gives each arm its own entry. Empty when every arm is
+// off, so the default path keeps the exact upstream name.
+const char* darkbloom_attn_variant_suffix() {
+  static const std::string suffix = [] {
+    std::string s;
+    if (darkbloom_attn_qhoist_define()[0] != '\0') {
+      s += "_qhoist";
+    }
+    const int sg = darkbloom_attn_sgcausal_level();
+    if (sg != 0) {
+      s += "_sgcausal";
+      s += char('0' + sg);
+    }
+    return s;
+  }();
+  return suffix.c_str();
+}
+
 } // namespace
 
 MTL::ComputePipelineState* get_steel_attention_nax_kernel(
@@ -1278,13 +1348,16 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
     int wm,
     int wn,
     const array& m) {
-  const auto& lib_name = kernel_name;
+  // Arm-qualified so a cached library can never be served to the wrong arm.
+  // Identical to `kernel_name` when no arm is enabled.
+  const std::string lib_name = kernel_name + darkbloom_attn_variant_suffix();
   auto lib = d.get_library(lib_name, [&]() {
     std::string kernel_source;
     concatenate(
         kernel_source,
         metal::utils(),
         darkbloom_attn_qhoist_define(),
+        darkbloom_attn_sgcausal_define(),
         metal::steel_attention_nax(),
         get_template_definition(
             lib_name,
@@ -1298,7 +1371,7 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
             get_type_string(m.dtype())));
     return kernel_source;
   });
-  return d.get_kernel(kernel_name, lib, hash_name, func_consts);
+  return d.get_kernel(lib_name, lib, hash_name, func_consts);
 }
 
 } // namespace mlx::core

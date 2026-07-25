@@ -23,6 +23,43 @@ const char* steel_attention_nax() {
 #define DARKBLOOM_ATTN_QHOIST 0
 #endif
 
+// DARKBLOOM_ATTN_SGCAUSAL: per-simdgroup causal K-block limit. DEFAULT 0 = OFF,
+// in which case `sg_active` folds to a compile-time `true` and the kernel is
+// the upstream algorithm. THIS STRING IS THE RUNTIME-EFFECTIVE TWIN: the host
+// prepends `#define DARKBLOOM_ATTN_SGCAUSAL <n>` ahead of it (see
+// get_steel_attention_nax_kernel in mlx/backend/metal/jit_kernels.cpp).
+//
+// WHAT IT REMOVES. `kb_lim` is derived from the THREADGROUP's row span
+// (`q_max = (tid.x + 1) * BQ`), but each of the WM*WN simdgroups owns only
+// kU*TQ of those BQ rows, at offset `tm`. Simdgroups holding the earlier rows
+// therefore run K blocks that are ENTIRELY above their own causal diagonal --
+// every element of their Stile is masked to neg_inf, so the block contributes
+// exp2(neg_inf - max) = +0.0 to every accumulator. At the frozen prefill
+// window (qL = kL = 512, BQ = 64, BK = 32, 4 warps) that is 16 of 288
+// simdgroup x K-block units, i.e. 5.56% of the executed block work, and it
+// lifts the share of the available causal saving that is actually captured
+// from 87.7% to 93.9%.
+//
+// The threadgroup-uniform `kb_lim` cannot simply be tightened per simdgroup:
+// the P@V loop contains a threadgroup_barrier, so a per-simdgroup TRIP COUNT
+// would make different simdgroups reach it a different number of times, which
+// is undefined behaviour. This arm keeps the trip count and every barrier
+// exactly where they are and predicates only the WORK, so all WM*WN*32 threads
+// still reach every barrier the same number of times.
+//
+// LEVELS.
+//   1  Skip the QK^T MMAs, the scale, the masking and the softmax. The P@V MMA
+//      still runs, on the cleared (+0.0) Stile -- which is bit-for-bit the P
+//      upstream would have fed it, because exp2 of a large negative argument
+//      underflows to +0.0, never -0.0. AIRTIGHT: identical operands, identical
+//      accumulator, identical order.
+//   2  Also skip the P@V MMA. Saves the other half, but see the -0.0 note at
+//      the guard below: dropping `Otile + (0.0 @ V)` can leave a -0.0 in an
+//      Otile lane where upstream would have normalised it to +0.0.
+#ifndef DARKBLOOM_ATTN_SGCAUSAL
+#define DARKBLOOM_ATTN_SGCAUSAL 0
+#endif
+
 ///////////////////////////////////////////////////////////////////////////////
 // Contents from "mlx/backend/metal/kernels/steel/defines.h"
 ///////////////////////////////////////////////////////////////////////////////
@@ -1485,6 +1522,25 @@ template <
     kb_min_causal = (q_min / BK);
   }
 
+#if DARKBLOOM_ATTN_SGCAUSAL
+  // Last K block this SIMDGROUP's rows can reach, as opposed to the whole
+  // threadgroup's. sg_row_max is the simdgroup's highest query row; a block is
+  // wholly above the diagonal once BK*kb exceeds it, i.e. from block
+  // (sg_row_max + BK) / BK onwards.
+  int sg_kb_lim = kb_lim;
+  if (do_causal) {
+    // `tid.x` is uint, so the unqualified expression promotes to uint and
+    // `max(0, <uint>)` is ambiguous against Metal's int/uint overloads. Cast
+    // the whole expression to int explicitly. (a34e83f was authored and
+    // reasoned about WITHOUT COMPILING -- its own message says so -- and this
+    // is the one place that bit.)
+    const int sg_row_max = max(
+        0,
+        int(tid.x) * BQ + params->qL_off + int(tm) + (kU * TQ) - 1);
+    sg_kb_lim = min(kb_lim, (sg_row_max + BK) / BK);
+  }
+#endif
+
   const bool is_last_bq = int(tid.x) == (params->NQ_aligned);
   // const bool is_last_tq = int(simd_group_id) >= (params->qL_rem / UQ);
   const bool is_last_q = is_last_bq;
@@ -1543,11 +1599,41 @@ template <
   for (int kb = 0; kb < kb_lim; kb++) {
     const int is_last_k = (kb == (params->NK_aligned));
 
+    // Compile-time `true` unless DARKBLOOM_ATTN_SGCAUSAL is on. Depends only on
+    // tm (uniform within a simdgroup) and threadgroup-uniform values, so the
+    // guards below never diverge inside a simdgroup, and no barrier sits inside
+    // one.
+#if DARKBLOOM_ATTN_SGCAUSAL
+    const bool sg_active = kb < sg_kb_lim;
+#else
+    const bool sg_active = true;
+#endif
+#if DARKBLOOM_ATTN_SGCAUSAL >= 2
+    // Level 2 also drops `Otile += (+0.0) @ V`. That accumulate is the identity
+    // on every finite Otile EXCEPT an exact -0.0 lane, which upstream promotes
+    // to +0.0 whenever any V element in the block's column is non-negative.
+    // Reaching it needs an Otile lane to be exactly -0.0, which in turn needs
+    // every attended V element in that channel so far to have been -0.0. Even
+    // then no comparison can see it: IEEE 754 has -0.0 == +0.0, argmax ties on
+    // equality, and |(-0.0) - (+0.0)| = 0 so max_abs_diff is unmoved.
+    const bool pv_active = sg_active;
+#else
+    const bool pv_active = true;
+#endif
+
     // Do S = Q @ K.T
     using stile_t = NAXTile<AccumType, TQ, TK>;
     stile_t Stile;
 
     Stile.clear();
+
+    // Everything from here to the Otile rescale is the identity for a block
+    // that lies wholly above this simdgroup's causal diagonal: row_reduce<Max>
+    // over neg_inf leaves max_score, factor becomes exp2(0) = 1 exactly,
+    // sum_score * 1 + 0 is sum_score (it is never -0.0, being a sum of exp2
+    // results), and Otile * 1 is bitwise Otile. Stile stays cleared to +0.0,
+    // which is exactly the P that the skipped softmax would have produced.
+    if (sg_active) {
 
     STEEL_PRAGMA_UNROLL
     for (short iq = 0; iq < TQ; iq++) {
@@ -1774,6 +1860,7 @@ template <
 
     // Update O
     Otile.template row_bin_op<MulOp>(factor);
+    } // sg_active
 
     simdgroup_barrier(mem_flags::mem_none);
 
@@ -1788,6 +1875,7 @@ template <
           }
         }
 
+        if (pv_active) {
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < TK; ik++) {
           NAXTile<T, 1, 2> Vtile;
@@ -1812,6 +1900,7 @@ template <
               Vtile.frag_at(0, 1),
               metal::false_type{});
         }
+        } // pv_active
       }
     }
 
