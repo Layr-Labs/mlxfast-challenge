@@ -2004,13 +2004,59 @@ final class LagunaRuntimeAttention: Module {
 
 // MARK: - Dense MLP (also used as the shared expert)
 
-private let lagunaSharedSwiGLUQMVHeader = """
+/// `DARKBLOOM_NVFP4_SCALE_FOLD` (default on; set "0" to restore the pre-fold
+/// arithmetic): hoists the `2^14` out of `laguna_nvfp4_qdot_16`'s sixteen
+/// per-call multiplies and folds it into the one multiply
+/// `laguna_nvfp4_scale` already performs. **−16 scalar multiplies per
+/// `qdot_16` call, −16.5% of the dequantize ALU, ~−1104 M float multiplies per
+/// token across L8 + L9, and nothing added** (`notes/57` §10).
+///
+/// Bit-exact. `16384 == 2^14`, and scaling a binary float by an exact power of
+/// two touches only the exponent field, so every product, partial sum and
+/// rounding decision in the accumulator chain is exactly `2^-14 ×` its old
+/// value — same bits, different exponent — and the `2^14` reappears once in
+/// the scale before the single final rounding.
+///
+/// **The dtype move is range-checked, not assumed** (`notes/58` §1a). The
+/// multiply moves from half to float because `4194304` overflows half, and a
+/// power-of-two argument does NOT by itself survive a dtype change — so all
+/// 256 E4M3 scale bytes were enumerated through both paths, in half and in
+/// float, with an explicit `isfinite` check on the old path. **Zero
+/// divergence, and no overflow is reachable:** the shuffle
+/// `(bits & 127) << 7` maps E4M3 into half format, and since E4M3's exponent
+/// bias is 7 against half's 15 it already yields the scale divided by 256 —
+/// which is exactly what the old `*= 256.0` corrected. The half-domain
+/// intermediate therefore peaks at **1.875**, and the scale at **480**,
+/// against half's finite max of 65504. **136x headroom.**
+///
+/// The compiler cannot do this fold itself: `device.cpp:631` sets
+/// `setFastMathEnabled(false)`, so reassociating `Σ(a·h·2^14)` into
+/// `2^14·Σ(a·h)` is forbidden and all sixteen multiplies really are emitted.
+/// `device.cpp` is outside `editablePaths`, so it is done by hand.
+///
+/// Safe under the `notes/00` kernel-selection rule: this is a pure arithmetic
+/// identity **inside our own Metal source**. No shape, dtype, tile count or
+/// reduction order that MLX can observe changes, so it cannot alter which
+/// kernel MLX selects.
+let lagunaNvfp4ScaleFoldEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_FOLD"] != "0"
+
+private let lagunaSharedSwiGLUQMVHeader: String = {
+    // The two halves of one power-of-two regrouping. They MUST move together:
+    // the scale absorbs `2^14` exactly when the weights stop applying it.
+    // `4194304.0f == 256 · 16384 == 2^22`.
+    let scaleTail =
+        lagunaNvfp4ScaleFoldEnabled
+        ? "        return float(signed_value) * 4194304.0f;"
+        : "        return float(signed_value);"
+    let scale256 = lagunaNvfp4ScaleFoldEnabled ? "" : "        converted *= 256.0;\n"
+    let weightScale = lagunaNvfp4ScaleFoldEnabled ? "" : " * 16384.0f"
+    return """
     static inline float laguna_nvfp4_scale(uint8_t bits) {
         ushort raw = ushort(bits & 127) << 7;
         half converted = as_type<half>(raw);
-        converted *= 256.0;
-        half signed_value = (bits & 128) ? -converted : converted;
-        return float(signed_value);
+    \(scale256)    half signed_value = (bits & 128) ? -converted : converted;
+    \(scaleTail)
     }
 
     static inline float laguna_nvfp4_qdot_16(
@@ -2031,10 +2077,10 @@ private let lagunaSharedSwiGLUQMVHeader = """
                 ((c & 0x07000700u) << 1) | ((c & 0x08000800u) << 4);
             const uint p3 =
                 ((c & 0x70007000u) >> 3) | (c & 0x80008000u);
-            const float2 v04 = float2(as_type<half2>(p0)) * 16384.0f;
-            const float2 v15 = float2(as_type<half2>(p1)) * 16384.0f;
-            const float2 v26 = float2(as_type<half2>(p2)) * 16384.0f;
-            const float2 v37 = float2(as_type<half2>(p3)) * 16384.0f;
+            const float2 v04 = float2(as_type<half2>(p0))\(weightScale);
+            const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
+            const float2 v26 = float2(as_type<half2>(p2))\(weightScale);
+            const float2 v37 = float2(as_type<half2>(p3))\(weightScale);
             accum +=
                 (input[8 * j] * v04.x +
                  input[8 * j + 1] * v15.x +
@@ -2049,6 +2095,7 @@ private let lagunaSharedSwiGLUQMVHeader = """
         return scale * accum;
     }
     """
+}()
 
 private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
     name: "laguna_shared_nvfp4_swiglu_qmv_bf16_v1",
@@ -3640,21 +3687,13 @@ private let lagunaPrefillRouterTop8Enabled =
 private let lagunaPrefillMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_MOE_TAIL"] != "0"
 
-/// Keep the routed down projection in expert-sorted order
+/// Default-off probe: keep the routed down projection in expert-sorted order
 /// and let the fused MoE tail gather each original `(token, slot)` row through
 /// `gatherSort`'s already-computed inverse permutation. This removes
 /// `scatterUnsort`'s full expert-bank copy without changing the eight-slot
 /// weighted reduction order.
 private let lagunaPrefillSortedMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_SORTED_MOE_TAIL"] != "0"
-
-/// `gatherSort`'s second `argSort` does not sort arbitrary
-/// data. Its input is the first sort's `uint32` permutation, so its result can
-/// be produced in one linear scatter (`inverse[order[i]] = i`) instead of a
-/// second stable merge sort. The first sort, and therefore all expert tie
-/// ordering, remains unchanged.
-private let lagunaLinearInversePermutationEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_LINEAR_INVERSE_PERMUTATION"] != "0"
 
 /// Batched top-8 selection for multi-token (prefill) routing.
 ///
@@ -4239,87 +4278,6 @@ private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// Finish `gatherSort`'s three coordinate transforms in one linear dispatch:
-/// gather the expert IDs into stable sorted order, derive each routed token
-/// row, and invert the permutation. Every inverse destination is written
-/// exactly once because `order` comes directly from MLX `argSort`.
-private let lagunaRouteCoordinatesKernel = MLXFast.metalKernel(
-    name: "laguna_route_coordinates_u32_v1",
-    inputNames: ["order", "indices"],
-    outputNames: ["sorted_indices", "token_rows", "inverse_order"],
-    source: """
-        uint i = thread_position_in_grid.x;
-        uint source = order[i];
-        uint routes_per_token =
-            uint(indices_shape[indices_ndim - 1]);
-        sorted_indices[i] = indices[source];
-        token_rows[i] = source / routes_per_token;
-        inverse_order[source] = i;
-        """,
-    ensureRowContiguous: true
-)
-
-/// Internal for focused runtime tests. `order` must be a one-dimensional
-/// permutation of the flattened `indices` coordinates.
-func lagunaRouteCoordinates(
-    order: MLXArray,
-    indices: MLXArray
-) -> (sortedIndices: MLXArray, tokenRows: MLXArray, inverseOrder: MLXArray) {
-    precondition(order.dtype == .uint32)
-    precondition(order.ndim == 1)
-    precondition(order.size > 0)
-    // MLXFast's launch configuration stores each grid dimension as Int32.
-    precondition(UInt64(order.size) <= UInt64(Int32.max))
-    precondition(indices.dtype == .uint32)
-    precondition(indices.ndim > 0)
-    precondition(indices.size == order.size)
-    precondition(indices.dim(-1) > 0)
-
-    let outputs = lagunaRouteCoordinatesKernel(
-        [order, indices],
-        grid: (order.size, 1, 1),
-        threadGroup: (min(order.size, 256), 1, 1),
-        outputShapes: [order.shape, order.shape, order.shape],
-        outputDTypes: [.uint32, .uint32, .uint32]
-    )
-    return (outputs[0], outputs[1], outputs[2])
-}
-
-/// `gatherSort` with an optional O(n) inverse-permutation construction.
-/// The fallback is the upstream implementation verbatim. The optimized path
-/// preserves its first stable `argSort`, flattened indexing and `uint32`
-/// inverse dtype; it changes only how the inverse of the known permutation is
-/// computed.
-private func lagunaGatherSort(
-    x: MLXArray,
-    indices: MLXArray
-) -> (MLXArray, MLXArray, MLXArray) {
-    guard lagunaLinearInversePermutationEnabled else {
-        return gatherSort(x: x, indices: indices)
-    }
-
-    let m = indices.dim(-1)
-    let flattenedIndices = indices.flattened()
-    let order = argSort(flattenedIndices)
-    guard order.dtype == .uint32, order.ndim == 1, order.size > 0,
-        UInt64(order.size) <= UInt64(Int32.max)
-    else {
-        return (
-            x.flattened(start: 0, end: -3)[order.floorDivide(m)],
-            flattenedIndices[order],
-            argSort(order)
-        )
-    }
-
-    let coordinates = lagunaRouteCoordinates(order: order, indices: indices)
-
-    return (
-        x.flattened(start: 0, end: -3)[coordinates.tokenRows],
-        coordinates.sortedIndices,
-        coordinates.inverseOrder
-    )
-}
-
 private func lagunaPrefillMoETail(
     expertOutputs: MLXArray,
     routerWeights: MLXArray,
@@ -4433,7 +4391,7 @@ private func lagunaFusedSortedRoutedGateUp(
     var inverseOrder = MLXArray()
     // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
     if doSort {
-        (sortedX, idx, inverseOrder) = lagunaGatherSort(x: sortedX, indices: indices)
+        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
     }
     // Fused counterpart of SwitchGLU's separate-bank branch:
     //   xUp = upProj(x, idx, sortedIndices: doSort)
