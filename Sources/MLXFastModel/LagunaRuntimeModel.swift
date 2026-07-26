@@ -112,6 +112,26 @@ let lagunaFusedQKVEnabled =
 let lagunaFusedSharedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_GATE_UP"] != "0"
 
+/// `DARKBLOOM_PREFILL_FUSED_SHARED_GATE_UP` (default OFF; set "1" to
+/// enable): serve multi-row shared-expert gate/up from the retained
+/// row-concatenated NVFP4 bank. The Metal dispatch mirrors the split-K chosen
+/// for each original 512-row logical half, preserving its partitioning and
+/// BF16 rounding boundaries instead of letting the wider bank cross into a
+/// numerically different non-split/NAX kernel.
+let lagunaPrefillFusedSharedGateUpEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_FUSED_SHARED_GATE_UP"] == "1"
+
+/// `DARKBLOOM_PREFILL_FUSED_SHARED_SWIGLU_REDUCE` (default on; set "0" to
+/// disable): for 32...512-row shared-expert prefill, reduce the stock BF16
+/// split-K gate/up partials and apply SwiGLU in one Metal epilogue. It writes
+/// the 512-wide activation contiguously into the prefix of the ordinary
+/// 1024-wide allocation, avoiding two strided half views and their separate
+/// compiled elementwise materialization while preserving reduction order.
+let lagunaPrefillFusedSharedSwiGLUReduceEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_FUSED_SHARED_SWIGLU_REDUCE"] != "0"
+
 /// Decode-only shared-expert NVFP4 QMV + SwiGLU fusion. This consumes the
 /// retained row-concatenated `[gate; up]` bank and emits only the 512-wide
 /// BF16 activation, preserving the two independent QMV casts and every BF16
@@ -3102,6 +3122,60 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             let gate = gateUp[.ellipsis, 0 ..< _fusedGateUpSplit]
             let up = gateUp[.ellipsis, _fusedGateUpSplit...]
             return downProj(compiledSiluProduct(gate, up))
+        }
+
+        if lagunaPrefillFusedSharedGateUpEnabled
+            || lagunaPrefillFusedSharedSwiGLUReduceEnabled,
+            let fusedWeight = _fusedGateUpWeight,
+            let fusedScales = _fusedGateUpScales,
+            x.ndim >= 2,
+            x.dtype == .bfloat16,
+            x.dim(-1) == LagunaConstants.hiddenSize,
+            x.size / LagunaConstants.hiddenSize > 1,
+            fusedWeight.dtype == .uint32,
+            fusedWeight.shape == [
+                2 * LagunaConstants.sharedExpertIntermediateSize,
+                LagunaConstants.hiddenSize / 8,
+            ],
+            fusedScales.dtype == .uint8,
+            fusedScales.shape == [
+                2 * LagunaConstants.sharedExpertIntermediateSize,
+                LagunaConstants.hiddenSize / 16,
+            ],
+            _fusedGateUpSplit == LagunaConstants.sharedExpertIntermediateSize
+        {
+            // `quantized.cpp` recognizes this exact retained-bank geometry
+            // under the same opt-in flag and chooses split-K from the logical
+            // 512-row half. Thus every gate/up output row uses the stock
+            // kernel, K partitions, BF16 partial stores, and reduction order.
+            // These slices are views; the elementwise SwiGLU preserves all
+            // stock BF16 projection and activation boundaries.
+            lagunaTrace("prefill shared fused [gate; up] bank QMM")
+            let gateUp = MLX.quantizedMM(
+                x,
+                fusedWeight,
+                scales: fusedScales,
+                biases: nil,
+                transpose: true,
+                groupSize: LagunaConstants.quantizationGroupSize,
+                bits: LagunaConstants.quantizationBits,
+                mode: .nvfp4
+            )
+            let rowCount = x.size / LagunaConstants.hiddenSize
+            if lagunaPrefillFusedSharedSwiGLUReduceEnabled,
+                rowCount >= 32, rowCount <= 512
+            {
+                var activatedShape = gateUp.shape
+                activatedShape[activatedShape.count - 1] = _fusedGateUpSplit
+                let activated =
+                    gateUp.reshaped([-1])[0 ..< gateUp.size / 2]
+                    .reshaped(activatedShape)
+                return downProj(activated)
+            } else {
+                let gate = gateUp[.ellipsis, 0 ..< _fusedGateUpSplit]
+                let up = gateUp[.ellipsis, _fusedGateUpSplit...]
+                return downProj(compiledSiluProduct(gate, up))
+            }
         }
         return downProj(compiledSiluProduct(gateProj(x), upProj(x)))
     }

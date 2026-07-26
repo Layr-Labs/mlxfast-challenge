@@ -1632,6 +1632,136 @@ template <
       simd_lid);
 }
 
+// Reduce the two logical halves of Laguna's retained shared-expert [gate; up]
+// bank and apply SwiGLU directly into a contiguous half-width prefix of y.
+//
+// split_k < 32 mirrors col_reduce_small exactly: each threadgroup-y lane
+// accumulates partitions y, y + lsize.y, ... in bfloat, then lane zero folds
+// the lane partials in increasing-y order. split_k == 32 mirrors the
+// BM=BN=32 col_reduce_looped kernel, including its bfloat simd_sum tree.
+// Keeping those reduction shapes is necessary for exact greedy-token parity.
+template <typename T, const int group_size, const int bits>
+[[kernel]] void fp_qmm_splitk_swiglu_reduce(
+    const device T* partials [[buffer(0)]],
+    device T* y [[buffer(1)]],
+    const constant int& M [[buffer(2)]],
+    const constant int& N [[buffer(3)]],
+    const constant int& split_k [[buffer(4)]],
+    const constant int& partition_stride [[buffer(5)]],
+    uint3 gid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint3 lsize [[threads_per_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(group_size == 16 && bits == 4);
+  constexpr int n_reads = 4;
+  const int half_N = N / 2;
+  threadgroup T shared_gate[32 * 8 * n_reads];
+  threadgroup T shared_up[32 * 8 * n_reads];
+
+  if (split_k == 32) {
+    constexpr int BN = 32;
+    constexpr int n_simdgroups = 8;
+    constexpr int n_read_blocks = BN / n_reads;
+    constexpr int n_outputs = BN / n_simdgroups;
+    const int flat_lid = simd_gid * 32 + simd_lid;
+    const int input_column =
+        BN * int(gid.x) + (flat_lid % n_read_blocks) * n_reads;
+    const int partition = flat_lid / n_read_blocks;
+    const int row = int(gid.y);
+
+    T gate_totals[n_reads];
+    T up_totals[n_reads];
+    for (int i = 0; i < n_reads; ++i) {
+      const int offset =
+          partition * partition_stride + row * N + input_column + i;
+      gate_totals[i] = partials[offset];
+      up_totals[i] = partials[offset + half_N];
+      shared_gate[partition * BN + input_column % BN + i] = gate_totals[i];
+      shared_up[partition * BN + input_column % BN + i] = up_totals[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int output_column = BN * int(gid.x) + simd_gid * n_outputs;
+    for (int i = 0; i < n_outputs; ++i) {
+      gate_totals[i] =
+          simd_sum(shared_gate[simd_lid * BN + simd_gid * n_outputs + i]);
+      up_totals[i] =
+          simd_sum(shared_up[simd_lid * BN + simd_gid * n_outputs + i]);
+    }
+    if (simd_lid == 0 && row < M) {
+      for (int i = 0; i < n_outputs && output_column + i < half_N; ++i) {
+        T gate = gate_totals[i];
+        T up = up_totals[i];
+        T exp_abs = metal::exp(metal::abs(gate));
+        T denominator = T(1) + exp_abs;
+        T sigmoid_part = T(1) / denominator;
+        T sigmoid = gate < T(0) ? sigmoid_part : T(1) - sigmoid_part;
+        T silu = T(gate * sigmoid);
+        y[row * half_N + output_column + i] = T(silu * up);
+      }
+    }
+    return;
+  }
+
+  const int column = int(gid.x) * int(lsize.x) * n_reads +
+      int(lid.x) * n_reads;
+  const int row = int(gid.y);
+  if (column >= half_N || row >= M) {
+    return;
+  }
+
+  T gate_totals[n_reads];
+  T up_totals[n_reads];
+  for (int i = 0; i < n_reads; ++i) {
+    gate_totals[i] = T(0);
+    up_totals[i] = T(0);
+  }
+  for (int partition = int(lid.y); partition < split_k;
+       partition += int(lsize.y)) {
+    const int offset =
+        partition * partition_stride + row * N + column;
+    for (int i = 0; i < n_reads; ++i) {
+      gate_totals[i] = partials[offset + i] + gate_totals[i];
+      up_totals[i] = partials[offset + half_N + i] + up_totals[i];
+    }
+  }
+
+  const int shared_offset =
+      int(lid.y) * int(lsize.x) * n_reads + int(lid.x) * n_reads;
+  for (int i = 0; i < n_reads; ++i) {
+    shared_gate[shared_offset + i] = gate_totals[i];
+    shared_up[shared_offset + i] = up_totals[i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (lid.y == 0) {
+    for (int i = 0; i < n_reads; ++i) {
+      gate_totals[i] = shared_gate[int(lid.x) * n_reads + i];
+      up_totals[i] = shared_up[int(lid.x) * n_reads + i];
+    }
+    for (int j = 1; j < int(lsize.y); ++j) {
+      const int lane_offset =
+          j * int(lsize.x) * n_reads + int(lid.x) * n_reads;
+      for (int i = 0; i < n_reads; ++i) {
+        gate_totals[i] = shared_gate[lane_offset + i] + gate_totals[i];
+        up_totals[i] = shared_up[lane_offset + i] + up_totals[i];
+      }
+    }
+
+    for (int i = 0; i < n_reads && column + i < half_N; ++i) {
+      T gate = gate_totals[i];
+      T up = up_totals[i];
+      T exp_abs = metal::exp(metal::abs(gate));
+      T denominator = T(1) + exp_abs;
+      T sigmoid_part = T(1) / denominator;
+      T sigmoid = gate < T(0) ? sigmoid_part : T(1) - sigmoid_part;
+      T silu = T(gate * sigmoid);
+      y[row * half_N + column + i] = T(silu * up);
+    }
+  }
+}
+
 template <
     typename T,
     const int group_size,

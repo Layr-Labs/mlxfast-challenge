@@ -791,11 +791,34 @@ void qmm_splitk(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  // Choose split_k to target ~512 threadgroups
+  // Choose split_k to target ~512 threadgroups.
+  //
+  // Laguna's opt-in shared-expert prefill path concatenates two independent
+  // 512-row NVFP4 projections into one 1024-row bank. Selecting split-K from
+  // the physical width would halve split_k (and at M=512 switch from the
+  // stock split-K kernel to a non-split NAX kernel), changing the BF16
+  // partial-rounding boundary. For this exact retained-bank geometry, choose
+  // from one logical half instead. This preserves the stock split_k for both
+  // halves at every supported M; the fused dispatch only combines their
+  // launches and reduction.
   int bm = 32, bn = 32;
+  static const bool fused_shared_prefill_enabled = [] {
+    return env::get_var("DARKBLOOM_PREFILL_FUSED_SHARED_GATE_UP", "") == "1";
+  }();
+  static const bool fused_shared_prefill_swiglu_reduce_enabled = [] {
+    return env::get_var(
+               "DARKBLOOM_PREFILL_FUSED_SHARED_SWIGLU_REDUCE", "1") != "0";
+  }();
+  bool preserve_fused_shared_half_split =
+      (fused_shared_prefill_enabled ||
+       fused_shared_prefill_swiglu_reduce_enabled) &&
+      mode == "nvfp4" && group_size == 16 && bits == 4 && K == 2048 &&
+      N == 1024;
+  int logical_N = preserve_fused_shared_half_split ? N / 2 : N;
+  int logical_n_tiles = (logical_N + bn - 1) / bn;
   int n_tiles = (N + bn - 1) / bn;
   int m_tiles = (M + bm - 1) / bm;
-  int current_tgs = n_tiles * m_tiles;
+  int current_tgs = logical_n_tiles * m_tiles;
   int split_k = std::max(1, 512 / current_tgs);
 
   // Each K partition must be a whole number of BK-wide (32) K-tiles as well as
@@ -866,6 +889,54 @@ void qmm_splitk(
   compute_encoder.set_bytes(split_k_partition_stride, c++);
 
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+
+  // The opt-in fused epilogue writes the contiguous 512-wide SwiGLU result
+  // into the first half of the ordinary 1024-wide output allocation. Swift
+  // consumes exactly that flattened prefix. Restrict this to reducer shapes
+  // mirrored byte-for-byte by fp_qmm_splitk_swiglu_reduce; all other shapes
+  // retain the ordinary exact split-K reduction and sliced SwiGLU fallback.
+  bool use_fused_swiglu_reduce =
+      preserve_fused_shared_half_split &&
+      fused_shared_prefill_swiglu_reduce_enabled && M >= 32 && M <= 512 &&
+      split_k <= 32;
+  if (use_fused_swiglu_reduce) {
+    std::string reduce_kname;
+    concatenate(
+        reduce_kname,
+        mode,
+        "_qmm_splitk_swiglu_reduce_",
+        type_string,
+        "_gs_",
+        group_size,
+        "_b_",
+        bits);
+    auto reduce_kernel = get_quantized_kernel_wrapped(
+        d,
+        reduce_kname,
+        "qmm_splitk_swiglu_reduce",
+        mode,
+        type_string,
+        group_size,
+        bits);
+    compute_encoder.set_compute_pipeline_state(reduce_kernel);
+    compute_encoder.set_input_array(intermediate, 0);
+    compute_encoder.set_output_array(out, 1);
+    compute_encoder.set_bytes(M, 2);
+    compute_encoder.set_bytes(N, 3);
+    compute_encoder.set_bytes(split_k, 4);
+    compute_encoder.set_bytes(split_k_partition_stride, 5);
+
+    if (split_k == 32) {
+      compute_encoder.dispatch_threadgroups(
+          MTL::Size((N / 2 + 31) / 32, M, 1), MTL::Size(256, 1, 1));
+    } else {
+      int threadgroup_y = std::min(8, split_k);
+      compute_encoder.dispatch_threadgroups(
+          MTL::Size((N / 2 + 127) / 128, M, 1),
+          MTL::Size(32, threadgroup_y, 1));
+    }
+    return;
+  }
 
   // Sum across split_k dimension (axis 0)
   ReductionPlan plan(
