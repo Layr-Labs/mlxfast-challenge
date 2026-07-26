@@ -330,8 +330,9 @@ private let lagunaNormInvMeanScratch = "threadgroup float local_inv_mean[1];"
 
 /// Emits the cross-simdgroup half of that prologue, from the sixteen partial
 /// writes through to a `float laguna_inv_mean` the normalize loop consumes.
-/// The emitted text is line for line what the three kernels shipped, plus a
-/// register alias for `local_inv_mean[0]`.
+/// Lanes 16...31 contribute register +0.0 to the second-level reduction.
+/// This is bit-identical to zeroing `local_sums[16...31]` first, while removing
+/// that initialization and its otherwise mandatory threadgroup barrier.
 private func lagunaNormReductionTail(
     lane: String,
     simdGroup: String,
@@ -341,16 +342,13 @@ private func lagunaNormReductionTail(
     let inverseRMS =
         "metal::precise::rsqrt(acc / \(denominator) + \(epsilon))"
     let lines: [String] = [
-        "if (\(simdGroup) == 0) {",
-        "    local_sums[\(lane)] = 0.0f;",
-        "}",
-        "threadgroup_barrier(mem_flags::mem_threadgroup);",
         "if (\(lane) == 0) {",
         "    local_sums[\(simdGroup)] = acc;",
         "}",
         "threadgroup_barrier(mem_flags::mem_threadgroup);",
         "if (\(simdGroup) == 0) {",
-        "    acc = simd_sum(local_sums[\(lane)]);",
+        "    float partial = \(lane) < 16 ? local_sums[\(lane)] : 0.0f;",
+        "    acc = simd_sum(partial);",
         "    if (\(lane) == 0) {",
         "        local_inv_mean[0] = \(inverseRMS);",
         "    }",
