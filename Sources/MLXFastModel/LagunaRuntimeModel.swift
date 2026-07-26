@@ -308,23 +308,32 @@ let lagunaFusedDenseGateUpSwiGLUEnabled =
 let lagunaFusedDenseDownResidualEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_DENSE_DOWN_RESIDUAL"] != "0"
 
-/// `DARKBLOOM_DECODE_ASYNC_STAGE` (default `20,33`): process-once stage selector
-/// for decode-step async scheduling. The promoted layer-33 rung remains the
-/// second boundary; layer 20 starts the same current-token graph earlier so
-/// Metal can overlap the middle decode layers with Swift graph construction.
-/// Active only for exact `[1, 1]` inputs. `33` isolates the promoted control;
-/// `off`/`0` disables all boundaries. No operation, cache row, or token is
-/// added, and prefill/multi-token paths are never asyncEval'd.
+/// `DARKBLOOM_DECODE_ASYNC_STAGE` (default `33`): process-once stage selector
+/// for decode-step async scheduling. Active only when the invocation input
+/// shape is exactly `[1, 1]`; prefill and multi-token shapes are never
+/// asyncEval'd. Layer 33 is the measured first rung: Metal begins the existing
+/// graph while Swift constructs layers 34-39, final RMSNorm, and the head.
+/// `off`/`0` disables it; `30`, `36`, `39`, `norm`, and `logits` remain
+/// process-once ablation points. No operation, cache row, or token is added.
 private enum LagunaDecodeAsyncStage {
     case off
     case layer(Int)
-    case layers(Int, Int)
+    case ladder(Int)
     case norm
     case logits
 }
 
+/// `ladderN` extends the promoted single-rung schedule (b3889ed8, layer 33)
+/// to a streaming ladder: `asyncEval` fires after every `N`th layer of a
+/// `[1, 1]` decode step, so Metal continuously executes completed graph
+/// segments while Swift constructs the next ones — the single rung leaves
+/// the first 34 layers' construction unoverlapped; the ladder overlaps all
+/// but the first `N`. Same mechanism, same exactness ground: `asyncEval`
+/// adds no operation, cache row, dtype boundary, or token; it only enqueues
+/// already-constructed work earlier. Each extra fire costs one scheduler
+/// round trip, so the stride is chosen by measurement, not maximal overlap.
 private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
-    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?.lowercased() ?? "20,33"
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?.lowercased() ?? "ladder8"
     switch raw {
     case "off", "0", "":
         return .off
@@ -332,10 +341,13 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
         return .norm
     case "logits":
         return .logits
-    case "20,33":
-        return .layers(20, 33)
     default:
-        if let index = Int(raw), [20, 30, 33, 36, 39].contains(index) {
+        if raw.hasPrefix("ladder"), let stride = Int(raw.dropFirst("ladder".count)),
+            (1...40).contains(stride)
+        {
+            return .ladder(stride)
+        }
+        if let index = Int(raw), [30, 33, 36, 39].contains(index) {
             return .layer(index)
         }
         return .off
@@ -4533,8 +4545,8 @@ final class LagunaRuntimeModelInner: Module {
                     if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
                         asyncEval(h)
                     }
-                    if case .layers(let first, let second) = lagunaDecodeAsyncStage,
-                        (first == i || second == i), inputs.shape == [1, 1]
+                    if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
+                        inputs.shape == [1, 1]
                     {
                         asyncEval(h)
                     }
@@ -4549,8 +4561,8 @@ final class LagunaRuntimeModelInner: Module {
                 if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
                     asyncEval(h)
                 }
-                if case .layers(let first, let second) = lagunaDecodeAsyncStage,
-                    (first == i || second == i), inputs.shape == [1, 1]
+                if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
+                    inputs.shape == [1, 1]
                 {
                     asyncEval(h)
                 }
