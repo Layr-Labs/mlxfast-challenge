@@ -319,6 +319,21 @@ let lagunaFusedFullQKNormYaRNEnabled =
 let lagunaRoPEAngleAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] == "1"
 
+/// Enabled by default (set `DARKBLOOM_COMPILED_OFFSET_SDPA=0` to disable):
+/// for Laguna's exact
+/// single-token, full-attention, compilable-cache shape, replace the overflow
+/// bin's `[1, N]` boolean validity mask with the graph-valued pre-update cache
+/// offset consumed directly by a two-pass vector-SDPA twin below.
+///
+/// The stock vector primitive cannot accept that scalar: its host encoder is
+/// outside the submission surface and qL == 1 disables its symbolic causal
+/// mode. The model-specific twin preserves the M5 `blocks == 128` partition
+/// and every FP32 operation/rounding boundary while removing the mask compare
+/// dispatch and all repeated boolean-mask reads. Every other cache, shape,
+/// architecture partition and mask retains the stock path.
+let lagunaCompiledOffsetSDPAEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_COMPILED_OFFSET_SDPA"] != "0"
+
 /// `DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU` (default on; set "0" to disable):
 /// after checkpoint load, retain one row-concatenated BF16 `[gate; up]` bank
 /// for layer 0's dense (non-quantized) MLP and serve single-token decode's
@@ -813,6 +828,228 @@ func lagunaResidualRMSNorm(
 }
 
 // MARK: - Attention
+
+/// Pass one of MLX's M5 `sdpa_vector_2pass` specialization with the sole
+/// semantic substitution `bmask[i]` -> `i <= validThrough[0]`, expressed as
+/// the loop's upper bound so invalid overflow-bin rows are not scanned at all.
+///
+/// Laguna's compiled full-attention cache returns a fixed overflow-bin view
+/// but has a graph-valued pre-update offset. Its stock mask is exactly
+/// `rinds <= offset`, so this substitution changes neither the key set nor any
+/// QK/softmax/V arithmetic. The 128-way split, per-lane K loop, `simd_sum`,
+/// `fast::exp`, BF16 partial write and final merge below mirror
+/// `sdpa_vector_2pass_{1,2}<bfloat16_t, 128, 128>` operation for operation.
+///
+/// `ensureRowContiguous` is deliberately false: the 1025-token fast view is a
+/// strided prefix of a longer backing allocation. The stock kernel consumes
+/// those head/sequence strides directly, and copying the view would erase the
+/// traffic win. Mentioning `keys_strides`/`values_strides` asks MLX's custom
+/// kernel ABI to bind the corresponding metadata constants.
+private let lagunaCompiledOffsetSDPAPartKernel = MLXFast.metalKernel(
+    name: "laguna_compiled_offset_sdpa_part_bf16_d128_b128_v1",
+    inputNames: ["queries", "keys", "values", "valid_through", "attention_scale"],
+    outputNames: ["partials", "sums", "maxs"],
+    source: """
+        constexpr int head_dim = 128;
+        constexpr int blocks = 128;
+        constexpr int elements_per_lane = 4;
+
+        const int kv_head = int(threadgroup_position_in_grid.x);
+        const int block = int(threadgroup_position_in_grid.z);
+        const int gqa = int(threads_per_threadgroup.y);
+        const int query_head =
+            gqa * kv_head + int(thread_position_in_threadgroup.y);
+        const int lane = int(thread_index_in_simdgroup);
+
+        const device bfloat* query =
+            queries + query_head * head_dim + lane * elements_per_lane;
+        const device bfloat* key =
+            keys + kv_head * keys_strides[1]
+            + block * keys_strides[2] + lane * elements_per_lane;
+        const device bfloat* value =
+            values + kv_head * values_strides[1]
+            + block * values_strides[2] + lane * elements_per_lane;
+        device bfloat* partial =
+            partials + (query_head * blocks + block) * head_dim
+            + lane * elements_per_lane;
+        device float* sum_out = sums + query_head * blocks + block;
+        device float* max_out = maxs + query_head * blocks + block;
+
+        thread float q[elements_per_lane];
+        thread float output[elements_per_lane] = {0.0f};
+        for (int element = 0; element < elements_per_lane; ++element) {
+            q[element] = attention_scale * float(query[element]);
+        }
+
+        float max_score = Limits<float>::finite_min;
+        float sum_exp_score = 0.0f;
+        const int valid_length =
+            min(CACHE_LENGTH, int(valid_through[0]) + 1);
+
+        for (int position = block; position < valid_length; position += blocks) {
+            float score = 0.0f;
+            for (int element = 0; element < elements_per_lane; ++element) {
+                score += q[element] * float(key[element]);
+            }
+            score = simd_sum(score);
+
+            float new_max = max(max_score, score);
+            float factor = fast::exp(max_score - new_max);
+            float exp_score = fast::exp(score - new_max);
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+
+            for (int element = 0; element < elements_per_lane; ++element) {
+                output[element] =
+                    output[element] * factor
+                    + exp_score * float(value[element]);
+            }
+            key += blocks * keys_strides[2];
+            value += blocks * values_strides[2];
+        }
+
+        if (lane == 0) {
+            sum_out[0] = sum_exp_score;
+            max_out[0] = max_score;
+        }
+        for (int element = 0; element < elements_per_lane; ++element) {
+            partial[element] = bfloat(output[element]);
+        }
+        """,
+    ensureRowContiguous: false
+)
+
+/// Final merge pass corresponding exactly to MLX's currently shipped
+/// `DARKBLOOM_AOT_SDPA_2PASS_PLANES == 1` specialization. The single
+/// 1024-float exchange plane and its barrier/reduction order are intentionally
+/// retained; this candidate isolates mask removal rather than mixing in a
+/// second-pass scheduling change.
+private let lagunaCompiledOffsetSDPAMergeKernel = MLXFast.metalKernel(
+    name: "laguna_compiled_offset_sdpa_merge_bf16_d128_b128_v1",
+    inputNames: ["partials", "sums", "maxs"],
+    outputNames: ["attended"],
+    source: """
+        constexpr int head_dim = 128;
+        constexpr int blocks = 128;
+        constexpr int simd_width = 32;
+        constexpr int elements_per_lane = 4;
+
+        const int head = int(threadgroup_position_in_grid.x);
+        const int simd = int(simdgroup_index_in_threadgroup);
+        const int lane = int(thread_index_in_simdgroup);
+
+        const device bfloat* partial =
+            partials + head * blocks * head_dim
+            + simd * head_dim + lane * elements_per_lane;
+        const device float* sum_in = sums + head * blocks;
+        const device float* max_in = maxs + head * blocks;
+        device bfloat* output =
+            attended + head * head_dim + simd * elements_per_lane;
+
+        thread float accumulated[elements_per_lane] = {0.0f};
+        threadgroup float exchange[simd_width * simd_width];
+
+        float sum_exp_score = 0.0f;
+        float max_score = Limits<float>::finite_min;
+        for (int block = 0; block < blocks / simd_width; ++block) {
+            max_score = max(max_score, max_in[lane + simd_width * block]);
+        }
+        max_score = simd_max(max_score);
+
+        for (int block = 0; block < blocks / simd_width; ++block) {
+            float factor =
+                fast::exp(max_in[lane + simd_width * block] - max_score);
+            sum_exp_score += factor * sum_in[lane + simd_width * block];
+        }
+        sum_exp_score = simd_sum(sum_exp_score);
+
+        for (int block = 0; block < blocks / simd_width; ++block) {
+            float factor = fast::exp(max_in[simd] - max_score);
+            for (int element = 0; element < elements_per_lane; ++element) {
+                accumulated[element] += factor * float(partial[element]);
+            }
+            max_in += simd_width;
+            sum_in += simd_width;
+            partial += simd_width * head_dim;
+        }
+
+        for (int element = 0; element < elements_per_lane; ++element) {
+            exchange[lane * simd_width + simd] = accumulated[element];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            accumulated[element] =
+                simd_sum(exchange[simd * simd_width + lane]);
+            accumulated[element] =
+                sum_exp_score == 0.0f
+                ? accumulated[element]
+                : accumulated[element] / sum_exp_score;
+            if (element + 1 < elements_per_lane) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+
+        if (lane == 0) {
+            for (int element = 0; element < elements_per_lane; ++element) {
+                output[element] = bfloat(accumulated[element]);
+            }
+        }
+        """,
+    ensureRowContiguous: false
+)
+
+/// Host-side mirror of the stock dispatcher's 128-block eligibility for the
+/// fixed Laguna shape. Architecture categories `s` and `d` both choose 128
+/// blocks for 1025...8192 keys at GQA 6. Respect an explicit MLX override so
+/// enabling this candidate never silently changes that diagnostic contract.
+private let lagunaCompiledOffsetSDPAUses128Blocks: Bool = {
+    if let raw = ProcessInfo.processInfo.environment["MLX_SDPA_BLOCKS"],
+        let override = Int(raw), override > 0
+    {
+        return override == 128
+    }
+    guard let category = GPU.deviceInfo().architecture.lowercased().last else {
+        return false
+    }
+    return category == "s" || category == "d"
+}()
+
+private func lagunaCompiledOffsetSDPA(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray,
+    validThrough: MLXArray,
+    scale: Float
+) -> MLXArray {
+    let cacheLength = keys.dim(2)
+    precondition(queries.dtype == .bfloat16)
+    precondition(keys.dtype == .bfloat16 && values.dtype == .bfloat16)
+    precondition(validThrough.dtype == .int32 && validThrough.shape == [1])
+    precondition(queries.shape == [1, 48, 1, LagunaConstants.headDim])
+    precondition(keys.shape == [1, 8, cacheLength, LagunaConstants.headDim])
+    precondition(values.shape == keys.shape)
+    precondition(cacheLength > 1024 && cacheLength <= 8192)
+
+    let passOne = lagunaCompiledOffsetSDPAPartKernel(
+        [queries, keys, values, validThrough, scale],
+        template: [("CACHE_LENGTH", cacheLength)],
+        grid: (8 * 32, 6, 128),
+        threadGroup: (32, 6, 1),
+        outputShapes: [
+            [1, 48, 1, 128, LagunaConstants.headDim],
+            [1, 48, 1, 128],
+            [1, 48, 1, 128],
+        ],
+        outputDTypes: [.bfloat16, .float32, .float32]
+    )
+    let passTwo = lagunaCompiledOffsetSDPAMergeKernel(
+        passOne,
+        grid: (48 * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [[1, 48, 1, LagunaConstants.headDim]],
+        outputDTypes: [.bfloat16]
+    )
+    lagunaTrace("compiled offset sdpa")
+    return passTwo[0]
+}
 
 private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
     name: "laguna_full_qk_norm_yarn_bf16_128_v4",
@@ -1728,7 +1965,8 @@ final class LagunaRuntimeAttention: Module {
         inputNorm: RMSNorm,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
-        qkRoPEAngles: MLXArray? = nil
+        qkRoPEAngles: MLXArray? = nil,
+        fullDecodeValidThrough: MLXArray? = nil
     ) -> MLXArray {
         let (B, L) = (input.dim(0), input.dim(1))
 
@@ -1871,14 +2109,51 @@ final class LagunaRuntimeAttention: Module {
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
-        let attended = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
-        )
+        let attended: MLXArray
+        if lagunaCompiledOffsetSDPAEnabled,
+            lagunaCompiledOffsetSDPAUses128Blocks,
+            !isSliding,
+            B == 1, L == 1,
+            nHeads == LagunaConstants.fullAttentionHeads,
+            nKVHeads == LagunaConstants.numKeyValueHeads,
+            headDim == LagunaConstants.headDim,
+            queries.dtype == .bfloat16,
+            keys.dtype == .bfloat16,
+            values.dtype == .bfloat16,
+            queries.shape == [1, 48, 1, LagunaConstants.headDim],
+            keys.shape == [1, 8, 1, LagunaConstants.headDim],
+            values.shape == keys.shape,
+            case .array = mask,
+            let validThrough = fullDecodeValidThrough,
+            let compiledCache = cache as? CompilableKVCache,
+            type(of: compiledCache) == CompilableKVCache.self,
+            compiledCache.attentionLength > 1024,
+            compiledCache.attentionLength <= 8192
+        {
+            // Snapshot validity comes from the representative full cache
+            // before any layer update. All ten full caches advance in
+            // lockstep; this layer still performs its own normal cache write,
+            // then attends the returned fixed view with that old inclusive
+            // endpoint exactly as the discarded boolean mask did.
+            let (cachedKeys, cachedValues) = compiledCache.update(
+                keys: keys, values: values)
+            attended = lagunaCompiledOffsetSDPA(
+                queries: queries,
+                keys: cachedKeys,
+                values: cachedValues,
+                validThrough: validThrough,
+                scale: scale
+            )
+        } else {
+            attended = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
+        }
         // SDPA returns `[B, H, L, D]`. When `L == 1`, flattening its
         // contiguous head-major payload directly produces the exact
         // `[B, 1, H*D]` byte order; the transpose only changes singleton-axis
@@ -4948,14 +5223,16 @@ final class LagunaRuntimeDecoderLayer: Module {
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
-        qkRoPEAngles: MLXArray? = nil
+        qkRoPEAngles: MLXArray? = nil,
+        fullDecodeValidThrough: MLXArray? = nil
     ) -> MLXArray {
         let r = selfAttn(
             x,
             inputNorm: inputLayerNorm,
             mask: mask,
             cache: cache,
-            qkRoPEAngles: qkRoPEAngles
+            qkRoPEAngles: qkRoPEAngles,
+            fullDecodeValidThrough: fullDecodeValidThrough
         )
         let h: MLXArray
         let normalized: MLXArray
@@ -5296,8 +5573,14 @@ final class LagunaRuntimeModelInner: Module {
     /// Runs `attention`'s own RoPE layer over `seed` at the cache's current
     /// position, honoring a graph-valued offset when the cache carries one.
     private func ropeAngleTable(
-        seed: MLXArray, attention: LagunaRuntimeAttention, cache: KVCache?
+        seed: MLXArray,
+        attention: LagunaRuntimeAttention,
+        cache: KVCache?,
+        graphOffsetOverride: MLXArray? = nil
     ) -> MLXArray {
+        if let graphOffsetOverride {
+            return attention.rope(seed, offset: graphOffsetOverride)
+        }
         if let graphOffset = graphOffsetArray(for: cache) {
             return attention.rope(seed, offset: graphOffset)
         }
@@ -5305,6 +5588,26 @@ final class LagunaRuntimeModelInner: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        // The full-family RoPE probe already needs a stable pre-update graph
+        // offset. Reuse that exact scalar as the validity endpoint for the
+        // optional offset-SDPA path, so removing the O(N) mask compare does not
+        // add a replacement scalar-copy dispatch. Exact type and width checks
+        // keep every generic/custom cache and every non-decode call unchanged.
+        let fullDecodeValidThrough: MLXArray? = {
+            guard lagunaCompiledOffsetSDPAEnabled,
+                lagunaCompiledOffsetSDPAUses128Blocks,
+                lagunaFusedFullQKNormYaRNEnabled,
+                inputs.shape == [1, 1],
+                let fullCache = cache?[fullAttentionIdx] as? CompilableKVCache,
+                type(of: fullCache) == CompilableKVCache.self,
+                fullCache.attentionLength > 1024,
+                fullCache.attentionLength <= 8192
+            else {
+                return nil
+            }
+            return graphOffsetArray(for: fullCache)
+        }()
+
         var h: MLXArray
         let fullRoPEAngles: MLXArray?
         let slidingRoPEAngles: MLXArray?
@@ -5331,7 +5634,8 @@ final class LagunaRuntimeModelInner: Module {
                 ? ropeAngleTable(
                     seed: _fullRoPEAngleSeed,
                     attention: layers[fullAttentionIdx].selfAttn,
-                    cache: cache?[fullAttentionIdx])
+                    cache: cache?[fullAttentionIdx],
+                    graphOffsetOverride: fullDecodeValidThrough)
                 : nil
             slidingRoPEAngles =
                 lagunaFusedSlidingQKNormRoPEEnabled && isSingleTokenDecode
@@ -5360,6 +5664,7 @@ final class LagunaRuntimeModelInner: Module {
             let isFull = layerTypes[i] == .full
             let mask = isFull ? fullMask : slidingMask
             let qkRoPEAngles = isFull ? fullRoPEAngles : slidingRoPEAngles
+            let validThrough = isFull ? fullDecodeValidThrough : nil
             if i == layers.count - 1, h.dim(1) > 1 {
                 if case .causal = mask {
                     h = layer.callLastPrefillRow(h, cache: cache?[i])
@@ -5368,7 +5673,8 @@ final class LagunaRuntimeModelInner: Module {
                         h,
                         mask: mask,
                         cache: cache?[i],
-                        qkRoPEAngles: qkRoPEAngles
+                        qkRoPEAngles: qkRoPEAngles,
+                        fullDecodeValidThrough: validThrough
                     )
                     if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
                         asyncEval(h)
@@ -5384,7 +5690,8 @@ final class LagunaRuntimeModelInner: Module {
                     h,
                     mask: mask,
                     cache: cache?[i],
-                    qkRoPEAngles: qkRoPEAngles
+                    qkRoPEAngles: qkRoPEAngles,
+                    fullDecodeValidThrough: validThrough
                 )
                 if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
                     asyncEval(h)
