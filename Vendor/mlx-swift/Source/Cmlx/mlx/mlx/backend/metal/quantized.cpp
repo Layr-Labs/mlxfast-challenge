@@ -1255,6 +1255,12 @@ bool darkbloom_expert_aligned_gather() {
   return v;
 }
 
+bool darkbloom_expert_compressed_gather() {
+  static const bool v =
+      env::get_var("DARKBLOOM_EXPERT_COMPRESSED_GATHER", "") != "0";
+  return v;
+}
+
 // DARKBLOOM_STAGE_BM128: select the gather-GEMM m-tiling. NOT a function
 // constant -- it changes the template instantiation, so it is already in
 // `kname` (`_bm_`/`_wm_`/`_wn_`) and therefore in the library name and the
@@ -1463,15 +1469,33 @@ void gather_qmm_rhs_nax(
     default: break;                          // upstream: bm=64, wm=2, wn=2
   }
 
+  const bool laguna_moe_shape =
+      (K == 2048 && N == 1024) || (K == 512 && N == 2048);
+  const bool expert_compressed =
+      darkbloom_expert_aligned_gather() &&
+      darkbloom_expert_compressed_gather() && mode != "affine" &&
+      transpose && group_size == 16 && bits == 4 && laguna_moe_shape &&
+      M >= 64;
+  if (expert_compressed) {
+    bm = 32;
+    bn = 128;
+    bk = 64;
+    wm = 2;
+    wn = 4;
+  }
+
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
-  const bool laguna_moe_shape =
-      (K == 2048 && N == 1024) || (K == 512 && N == 2048);
+  const bool expert_geometry =
+      (expert_compressed &&
+       bm == 32 && bn == 128 && bk == 64 && wm == 2 && wn == 4) ||
+      (!expert_compressed &&
+       bm == 64 && bn == 64 && bk == 64 && wm == 4 && wn == 2);
   const bool expert_aligned =
       darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
       group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
-      align_N && align_K && bm == 64 && wm == 4 && wn == 2;
+      align_N && align_K && expert_geometry;
 
   // Make the kernel name
   std::string kname;
@@ -1534,7 +1558,8 @@ void gather_qmm_rhs_nax(
       fprintf(
           stderr,
           "mlxfast: stage active: widest=%d wideld=%d(req=%d wide_ok=%d) "
-          "runbar=%d novol=%d expert=%d bm128=%d bm=%d wm=%d wn=%d "
+          "runbar=%d novol=%d expert=%d compressed=%d "
+          "bm128=%d bm=%d bn=%d wm=%d wn=%d "
           "w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d\n",
           int(stage_widest),
           int(stage_wideld),
@@ -1543,8 +1568,10 @@ void gather_qmm_rhs_nax(
           int(stage_runbar),
           int(stage_novol),
           int(expert_aligned),
+          int(expert_compressed),
           bm128,
           bm,
+          bn,
           wm,
           wn,
           size_t(w.offset()),

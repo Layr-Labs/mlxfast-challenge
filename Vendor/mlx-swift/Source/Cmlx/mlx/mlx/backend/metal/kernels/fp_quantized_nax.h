@@ -340,6 +340,28 @@ struct QuantizedBlockLoader {
     }
   }
 
+  // Stage the native NVFP4 representation without expanding it to BF16.
+  // The expert-aligned kernel dequantizes each NAX fragment directly from
+  // this compact tile, cutting threadgroup storage and preserving the exact
+  // scalar dequantization expression used by load_unsafe().
+  void load_compressed(
+      threadgroup uint8_t* packed_dst,
+      threadgroup uint8_t* scale_dst) const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < n_reads; ++i) {
+      packed_dst[bi * BCOLS_PACKED + bj + i] =
+          src[i * bytes_per_pack];
+    }
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < n_steps_per_read; ++i) {
+      scale_dst[bi * n_groups + group_id + i] = scales[i];
+    }
+  }
+
   void next() {
     src += tile_stride;
     if (reduction_dim == 1) {
@@ -349,6 +371,43 @@ struct QuantizedBlockLoader {
     }
   }
 };
+
+template <typename T, short BR, short BC>
+METAL_FUNC void load_nvfp4_rhs_direct(
+    thread mlx::steel::NAXTile<T, BR, BC>& tile,
+    const threadgroup uint8_t* packed,
+    const threadgroup uint8_t* scales,
+    const int packed_row_stride,
+    const int scale_row_stride,
+    const int row_base,
+    const int col_base) {
+  const short2 sc = mlx::steel::BaseNAXFrag::get_coord();
+  STEEL_PRAGMA_UNROLL
+  for (short frag_row = 0; frag_row < BR; ++frag_row) {
+    STEEL_PRAGMA_UNROLL
+    for (short frag_col = 0; frag_col < BC; ++frag_col) {
+      STEEL_PRAGMA_UNROLL
+      for (short elem_row = 0; elem_row < 2; ++elem_row) {
+        const int row =
+            row_base + frag_row * 16 + sc.y + elem_row * 8;
+        const int col = col_base + frag_col * 16 + sc.x;
+        const threadgroup uint8_t* src =
+            packed + row * packed_row_stride + col / 2;
+        const T scale = dequantize_scale<T, 16>(
+            scales[row * scale_row_stride + col / 16]);
+        const uint8_t w0 = src[0];
+        const uint8_t w1 = src[1];
+        thread auto& frag = tile.frag_at(frag_row, frag_col);
+        frag[elem_row * 4 + 0] = scale * Dequantize<4, T>{}(w0);
+        frag[elem_row * 4 + 1] =
+            scale * Dequantize<4, T>{}(w0 >> 4);
+        frag[elem_row * 4 + 2] = scale * Dequantize<4, T>{}(w1);
+        frag[elem_row * 4 + 3] =
+            scale * Dequantize<4, T>{}(w1 >> 4);
+      }
+    }
+  }
+}
 
 using namespace mlx::steel;
 
@@ -1350,11 +1409,28 @@ template <
       group_size,
       bits>;
 
-  constexpr int kWsElems = BN * BK_padded;
-  constexpr int kWsPerChunk = 16 / sizeof(Wtype);
-  threadgroup NAXWsChunk16<Wtype>
-      Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
+  // The shipped geometry keeps the established BF16 staging path.  The
+  // compressed geometry instead stores one native NVFP4 tile (packed bytes
+  // plus E8M0 scales) in the same 8 KiB scratch later reused by SwiGLU.
+  constexpr bool compressed_path =
+      BM == 32 && BN == 128 && BK == 64 && WM == 2 && WN == 4;
+  constexpr int kFullStageBytes = BN * BK_padded * sizeof(Wtype);
+  constexpr int kGateStageBytes = BM * BN * sizeof(bfloat);
+  constexpr int kScratchBytes =
+      compressed_path ? kGateStageBytes : kFullStageBytes;
+  constexpr int kScratchChunks =
+      (kScratchBytes + sizeof(NAXWsChunk16<uint8_t>) - 1) /
+      sizeof(NAXWsChunk16<uint8_t>);
+  static_assert(
+      !compressed_path ||
+          kGateStageBytes >= BN * BK / 2 + BN * BK / group_size,
+      "compressed NVFP4 tile must fit in expert scratch");
+  threadgroup NAXWsChunk16<uint8_t> Ws_storage[kScratchChunks];
   threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
+  threadgroup uint8_t* packed_ws =
+      (threadgroup uint8_t*)Ws_storage;
+  threadgroup uint8_t* scale_ws =
+      packed_ws + BN * BK / 2;
   threadgroup bfloat* gate_up_stage =
       (threadgroup bfloat*)Ws_storage;
   threadgroup int bounds[2];
@@ -1417,7 +1493,11 @@ template <
 
       for (int k = 0; k < K_it; ++k) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_w.load_unsafe();
+        if constexpr (compressed_path) {
+          loader_w.load_compressed(packed_ws, scale_ws);
+        } else {
+          loader_w.load_unsafe();
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg_active) {
@@ -1433,8 +1513,19 @@ template <
               Atile.load_safe(
                   xn + kk1, K, short2(SK, sgp_sm));
             }
-            Btile.template load<Wtype, BK_padded, 1>(
-                Ws + tn * BK_padded + kk1);
+            if constexpr (compressed_path) {
+              load_nvfp4_rhs_direct(
+                  Btile,
+                  packed_ws,
+                  scale_ws,
+                  BK / 2,
+                  BK / group_size,
+                  tn,
+                  kk1);
+            } else {
+              Btile.template load<Wtype, BK_padded, 1>(
+                  Ws + tn * BK_padded + kk1);
+            }
 
             tile_matmad_nax(
                 Dtile,
@@ -1458,17 +1549,22 @@ template <
               gate_up_stage + tm * BN + tn);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg_active && (simd_group_id % WN) == 0) {
-          constexpr int activated_cols = BN / 2;
+        const short n_sg = simd_group_id % WN;
+        if (sg_active && (n_sg % 2) == 0) {
+          constexpr int activated_cols = SN;
+          constexpr int pair_stride = 2 * SN;
+          const int pair = n_sg / 2;
           for (int linear = simd_lane_id;
                linear < int(sgp_sm) * activated_cols;
                linear += SIMD_SIZE) {
             const int row = linear / activated_cols;
             const int col = linear % activated_cols;
             const bfloat gate =
-                gate_up_stage[(tm + row) * BN + col];
+                gate_up_stage[
+                    (tm + row) * BN + pair * pair_stride + col];
             const bfloat up =
-                gate_up_stage[(tm + row) * BN + activated_cols + col];
+                gate_up_stage[
+                    (tm + row) * BN + pair * pair_stride + SN + col];
             const bfloat exp_abs = metal::exp(metal::abs(gate));
             const bfloat denominator = bfloat(1) + exp_abs;
             const bfloat z = bfloat(1) / denominator;
@@ -1476,7 +1572,8 @@ template <
                 gate < bfloat(0) ? z : bfloat(1) - z;
             const bfloat silu = bfloat(gate * sigmoid);
             y[size_t(chunk_start + tm + row) * (N / 2) +
-              size_t(tid.x) * activated_cols + col] =
+              size_t(tid.x) * (BN / 2) +
+              size_t(pair) * activated_cols + col] =
                 bfloat(silu * up);
           }
         }
