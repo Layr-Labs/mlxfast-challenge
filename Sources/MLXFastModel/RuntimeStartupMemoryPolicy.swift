@@ -3,19 +3,27 @@ import MLX
 
 /// Selects a model-startup profile from the machine's physical-memory budget.
 ///
-/// Editable runtime paths may retain compiled closures and buffers in
-/// addition to the ~21.6 GB Poolside NVFP4 checkpoint. The full profile is
-/// appropriate for the 128 GiB ranked runner, but may leave too little
-/// headroom for macOS, warmup activations, KV state, and Metal buffers on the
-/// documented 40 GiB local minimum.
+/// The profile is pure memory management: it never changes which code path
+/// executes or what the model produces. Machines below the 64 GiB
+/// full-profile minimum get a 6 GiB MLX allocator-cache cap, shorter
+/// command buffers, and a free-warmup-buffer clear before the worker
+/// protocol hello -- headroom insurance that lets the ~21.6 GB Poolside
+/// NVFP4 checkpoint run down to the documented 40 GiB local minimum.
+/// Compiled decode and every other ranked code path stay enabled on every
+/// machine, matching the ranked 128 GiB box.
 ///
-/// The low-memory feature defaults never clobber explicit settings: a flag
-/// the user already exported keeps its value (so, for example, exercising
-/// compiled decode on a 48 GiB machine still works), and the automatic
-/// selection itself can be overridden with
-/// `DARKBLOOM_STARTUP_MEMORY_PROFILE=full|low|auto`. When the low-memory
-/// profile engages it announces itself on stderr, including any user-set
-/// flags it preserved.
+/// `environmentOverrides` is deliberately empty in both profiles: a
+/// memory-gated feature-disable default makes small machines silently skip
+/// code paths the ranked box runs (the pre-2026-07 profile defaulted
+/// compiled decode off below 64 GiB this way, so local runs never executed
+/// the `compile(shapeless:)` decode closures the ranked M5 exercises). The
+/// no-overwrite plan machinery remains so any future override has to
+/// reintroduce it consciously, under test. The automatic selection can be
+/// overridden with `DARKBLOOM_STARTUP_MEMORY_PROFILE=full|low|auto`. When
+/// the low-memory profile engages it announces itself on stderr; a machine
+/// too small for the model plus the decode working set fails loudly with an
+/// out-of-memory error instead of silently diverging from the ranked
+/// behavior.
 public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
     public static let fullProfileMinimumPhysicalMemoryBytes = UInt64(64) << 30
 
@@ -72,16 +80,19 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
                 maxMegabytesPerCommandBuffer: 128,
                 maxOperationsPerCommandBuffer: 64,
                 clearAllocatorCacheAfterWarmup: true,
-                environmentOverrides: [
-                    // Avoid retaining compiled closures in addition to the
-                    // source model. Both flags gate the vendored compiled
-                    // decode path (MLXLMCommon CompiledDecode/MLXHardwareInfo)
-                    // that the Laguna runtime dispatches. The Gemma-era
-                    // alternate weight-layout flags were removed with the
-                    // Gemma 4 runtime.
-                    "MLX_COMPILED_DECODE": "0",
-                    "DARKBLOOM_COMPILED_DECODE": "0",
-                ]
+                // No feature-disable defaults. Compiled decode
+                // (MLX_COMPILED_DECODE / DARKBLOOM_COMPILED_DECODE, both
+                // default-on in the vendored CompiledDecode/MLXHardwareInfo)
+                // was the only profile-touched setting that changed which
+                // code path executes; defaulting it off here made <64 GiB
+                // machines silently skip the compile(shapeless:) decode
+                // closures the ranked box runs. It captures the decode graph
+                // -- not a second model residency -- and the allocator cap
+                // above bounds its transient footprint, so it stays enabled
+                // for ranked parity. The cap, the command-buffer budgets,
+                // and the warmup clear are pure memory management with no
+                // effect on kernel selection or token output.
+                environmentOverrides: [:]
             )
         }
 
@@ -127,9 +138,17 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
         if isLowMemory {
             noticeLines.append(
                 "mlxfast: low-memory startup profile active (\(selectionReason)): "
-                    + "applying \(defaultsToApply.count) feature-disable defaults and a "
-                    + "\(cacheLimitBytes >> 30) GiB MLX allocator-cache cap; set "
+                    + "capping the MLX allocator cache at \(cacheLimitBytes >> 30) GiB and "
+                    + "clearing free warmup buffers; compiled decode and every other "
+                    + "ranked code path stay enabled; set "
                     + "\(Self.profileOverrideEnvironmentName)=full to opt out"
+            )
+            noticeLines.append(
+                "mlxfast: a machine too small for the model plus the decode working "
+                    + "set fails with an out-of-memory error instead of silently "
+                    + "skipping ranked code paths; verify on a "
+                    + "\(Self.fullProfileMinimumPhysicalMemoryBytes >> 30) GiB+ machine "
+                    + "or rely on the ranked run"
             )
             if !preservedUserValues.isEmpty {
                 let preserved = preservedUserValues.keys.sorted()

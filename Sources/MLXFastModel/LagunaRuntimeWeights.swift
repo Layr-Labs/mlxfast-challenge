@@ -351,9 +351,10 @@ public final class LagunaRuntimeWeightCache {
         // deliberately a no-op here (the
         // ranked 128 GiB box keeps stock allocator behavior); the documented
         // low-memory profile for <64 GiB machines caps the MLX allocator
-        // cache at 6 GiB, shortens command buffers, installs the
-        // feature-disable env defaults (no-overwrite), and clears free
-        // warmup buffers before the worker protocol hello. The layer-count
+        // cache at 6 GiB, shortens command buffers, and clears free
+        // warmup buffers before the worker protocol hello -- pure memory
+        // management: compiled decode and every other ranked code path stay
+        // enabled, matching the ranked box. The layer-count
         // guard keeps tiny unit-test configurations on stock behavior.
         let startupMemoryPolicy: RuntimeStartupMemoryPolicy?
         if config.numHiddenLayers >= 16 {

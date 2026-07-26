@@ -349,96 +349,6 @@ report_local_score_summary() {
   } >&2
 }
 
-# --- Low-memory startup-profile ranked-parity warning (local modes) -----------
-# On machines below 64 GiB the runtime worker's startup memory policy
-# (Sources/MLXFastModel/RuntimeStartupMemoryPolicy.swift) silently defaults
-# ranked-path feature flags OFF -- today the compiled-decode pair below --
-# unless the user exported them explicitly. The worker announces that once on
-# stderr at startup, which is easy to miss; a submission can then pass every
-# local run yet crash on the ranked box inside a code path (for example the
-# compile(shapeless:) compiled-decode closures) that the local machine never
-# executed. Local modes therefore repeat the parity gap prominently in the
-# END-OF-RUN summary. The constants and the decision below mirror
-# RuntimeStartupMemoryPolicy exactly (same inputs: physical memory, the
-# DARKBLOOM_STARTUP_MEMORY_PROFILE override, per-flag environment presence;
-# the trusted harness forwards MLX_*/DARKBLOOM_* to the worker unchanged), and
-# the mirror is pinned by benchmarkScriptParityWarningMirrorsLowMemoryPolicy
-# in Tests/MLXFastTests/RuntimeStartupMemoryPolicyTests.swift. Diagnostic
-# only: any failure here must never fail the benchmark run.
-#
-# Knobs (local debugging/testing only):
-#   MLXFAST_PHYSICAL_MEMORY_BYTES=...  testing seam: stands in for
-#                                      `sysctl -n hw.memsize`
-readonly LOW_MEMORY_PROFILE_FULL_MIN_BYTES=$((64 << 30))
-readonly LOW_MEMORY_PROFILE_DISABLED_FLAGS=(MLX_COMPILED_DECODE DARKBLOOM_COMPILED_DECODE)
-
-physical_memory_bytes() {
-  if [[ -n "${MLXFAST_PHYSICAL_MEMORY_BYTES:-}" ]]; then
-    printf '%s\n' "${MLXFAST_PHYSICAL_MEMORY_BYTES}"
-    return 0
-  fi
-  sysctl -n hw.memsize 2>/dev/null || true
-}
-
-report_low_memory_parity_warning() {
-  if [[ "${LOCAL_ITERATE}" != "1" && "${LOCAL_SUBMIT}" != "1" ]]; then
-    return 0
-  fi
-  local requested reason
-  requested="$(printf '%s' "${DARKBLOOM_STARTUP_MEMORY_PROFILE:-}" | tr '[:upper:]' '[:lower:]')"
-  case "${requested}" in
-    full)
-      # Explicit full-profile opt-out: the worker applied no feature-disable
-      # defaults, so there is no parity gap to report.
-      return 0
-      ;;
-    low)
-      reason="DARKBLOOM_STARTUP_MEMORY_PROFILE=low"
-      ;;
-    *)
-      # "", auto, or anything else resolves by physical memory (an invalid
-      # override would have aborted the worker long before this summary).
-      local memory_bytes
-      memory_bytes="$(physical_memory_bytes)"
-      if [[ ! "${memory_bytes}" =~ ^[0-9]+$ ]] \
-          || [[ "${memory_bytes}" -ge "${LOW_MEMORY_PROFILE_FULL_MIN_BYTES}" ]]; then
-        return 0
-      fi
-      reason="physical memory $((memory_bytes >> 30)) GiB is below the $((LOW_MEMORY_PROFILE_FULL_MIN_BYTES >> 30)) GiB full-profile minimum"
-      ;;
-  esac
-
-  # The profile never overwrites flags the user exported (set-but-empty
-  # counts as set, matching the worker's getenv check), so only the flags it
-  # actually defaulted OFF are reported.
-  local downgraded=() flag
-  for flag in "${LOW_MEMORY_PROFILE_DISABLED_FLAGS[@]}"; do
-    if ! printenv "${flag}" >/dev/null 2>&1; then
-      downgraded+=("${flag}")
-    fi
-  done
-  if [[ "${#downgraded[@]}" -eq 0 ]]; then
-    return 0
-  fi
-  local disabled_list enable_exports
-  disabled_list="$(printf '%s=0 ' "${downgraded[@]}")"
-  disabled_list="${disabled_list% }"
-  enable_exports="$(printf '%s=1 ' "${downgraded[@]}")"
-  enable_exports="${enable_exports% }"
-  cat >&2 <<EOF
-benchmark.sh: RANKED-PARITY WARNING: this run did NOT exercise the ranked compiled-decode path.
-benchmark.sh: the low-memory startup profile engaged (${reason})
-benchmark.sh: and disabled compiled decode by default: ${disabled_list}.
-benchmark.sh: the ranked 128 GB M5 runner keeps the full profile, so the official benchmark WILL
-benchmark.sh: run the compiled-decode code paths (e.g. compile(shapeless:) decode closures) that
-benchmark.sh: this machine never executed -- a change can pass locally and still fail there.
-benchmark.sh: to exercise them locally, rerun with: export ${enable_exports}
-benchmark.sh: (explicitly exported flags always win over the profile; needs memory headroom),
-benchmark.sh: or verify on a 64 GiB+ machine. The ranked run remains the authority.
-EOF
-  return 0
-}
-
 find_macmon() {
   # Prefer an explicit override, then PATH, then the usual install locations
   # (Homebrew, and the ~/bin drop used on the ranked boxes).
@@ -1999,7 +1909,6 @@ fi
 if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ]]; then
   cat "${SCORE_PATH}"
   report_local_score_summary
-  report_low_memory_parity_warning
 fi
 
 score_hash="$(shasum -a 256 "${SCORE_PATH}" | awk '{print $1}')"

@@ -13,97 +13,43 @@ func startupMemoryPolicyProtectsDocumented36GiBLocalMachine() {
     #expect(policy.maxMegabytesPerCommandBuffer == 128)
     #expect(policy.maxOperationsPerCommandBuffer == 64)
     #expect(policy.clearAllocatorCacheAfterWarmup)
-    // Exact-size pin plus the compiled-decode switches the profile exists
-    // to disable; every name's spelling is cross-checked against the model
-    // sources in lowMemoryOverridesNameOnlyFlagsReadByModelSources, so the
-    // dictionary is not duplicated here verbatim.
-    #expect(policy.environmentOverrides.count == 2)
-    #expect(policy.environmentOverrides.values.allSatisfy { $0 == "0" })
-    for name in [
-        "MLX_COMPILED_DECODE",
-        "DARKBLOOM_COMPILED_DECODE",
-    ] {
-        #expect(policy.environmentOverrides[name] == "0", "missing \(name)")
-    }
+    // Consistency contract: the low-memory profile is pure memory
+    // management and must not default any feature flag off. A memory-gated
+    // feature-disable default makes small machines silently skip code paths
+    // the ranked box runs (the old profile defaulted the compiled-decode
+    // flags off below 64 GiB exactly this way, so <64 GiB machines never
+    // executed the compile(shapeless:) decode closures the ranked M5
+    // exercises). If this expectation fails, a feature divergence has been
+    // reintroduced; read the policy's doc comment before shipping it.
+    #expect(policy.environmentOverrides.isEmpty)
 }
 
-// Every override must name a flag some model source actually reads;
-// a typo or a rename that leaves the policy behind fails here. The policy
-// file itself is excluded so the dictionary cannot self-satisfy the check.
-// The scanned surface is the worker's model code: Sources/MLXFastModel plus
-// the vendored MLXLMCommon runtime plumbing the Laguna forward dispatches
-// (the compiled-decode flags are read there).
+// The low-memory profile no longer disables the compiled-decode flags, so
+// both must be unread by the policy and remain default-on where the model
+// code consults them (MLXLMCommon CompiledDecode/MLXHardwareInfo). This
+// pins the flag spellings so a vendored rename cannot silently orphan the
+// documented opt-out names.
 @Test
-func lowMemoryOverridesNameOnlyFlagsReadByModelSources() throws {
-    let modelSourceDirectories = [
-        "Sources/MLXFastModel",
-        "Vendor/mlx-swift-lm/Libraries/MLXLMCommon",
-    ]
-    var combinedSources = ""
-    for directory in modelSourceDirectories {
-        let sourceFiles = try FileManager.default
-            .contentsOfDirectory(atPath: directory)
-            .filter { $0.hasSuffix(".swift") && $0 != "RuntimeStartupMemoryPolicy.swift" }
-        #expect(!sourceFiles.isEmpty)
-        combinedSources += try sourceFiles
-            .map { try String(contentsOfFile: "\(directory)/\($0)", encoding: .utf8) }
-            .joined(separator: "\n")
-    }
-
-    let policy = RuntimeStartupMemoryPolicy.resolve(
-        physicalMemoryBytes: UInt64(36) << 30
-    )
-    for name in policy.environmentOverrides.keys.sorted() {
+func compiledDecodeFlagsStayReadableByModelSources() throws {
+    let vendoredRuntimeDirectory = "Vendor/mlx-swift-lm/Libraries/MLXLMCommon"
+    let sourceFiles = try FileManager.default
+        .contentsOfDirectory(atPath: vendoredRuntimeDirectory)
+        .filter { $0.hasSuffix(".swift") }
+    #expect(!sourceFiles.isEmpty)
+    let combinedSources = try sourceFiles
+        .map {
+            try String(
+                contentsOfFile: "\(vendoredRuntimeDirectory)/\($0)",
+                encoding: .utf8
+            )
+        }
+        .joined(separator: "\n")
+    for name in ["MLX_COMPILED_DECODE", "DARKBLOOM_COMPILED_DECODE"] {
         #expect(
             combinedSources.contains("\"\(name)\""),
-            "override \(name) is not read anywhere in \(modelSourceDirectories)"
+            "\(name) is not read anywhere in \(vendoredRuntimeDirectory)"
         )
     }
-}
-
-// benchmark.sh's end-of-run ranked-parity warning re-derives this policy's
-// decision from the same inputs (physical memory, the profile override,
-// per-flag environment presence), so the flag list, full-profile threshold,
-// override name, and no-overwrite check it embeds must track this policy
-// exactly. A policy change that leaves the shell mirror behind fails here.
-@Test
-func benchmarkScriptParityWarningMirrorsLowMemoryPolicy() throws {
-    let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
-    let policy = RuntimeStartupMemoryPolicy.resolve(
-        physicalMemoryBytes: UInt64(36) << 30
-    )
-
-    // The shell flag array enumerates exactly the low-memory feature-disable
-    // overrides -- no missing flag, no stale extra.
-    let flagsLine = try #require(
-        script.split(separator: "\n").first {
-            $0.hasPrefix("readonly LOW_MEMORY_PROFILE_DISABLED_FLAGS=(")
-        }
-    )
-    let openParenthesis = try #require(flagsLine.firstIndex(of: "("))
-    let closeParenthesis = try #require(flagsLine.lastIndex(of: ")"))
-    let shellFlags = Set(
-        flagsLine[flagsLine.index(after: openParenthesis)..<closeParenthesis]
-            .split(separator: " ")
-            .map(String.init)
-    )
-    #expect(shellFlags == Set(policy.environmentOverrides.keys))
-    #expect(policy.environmentOverrides.values.allSatisfy { $0 == "0" })
-
-    // The shell threshold mirrors the policy's full-profile minimum, and the
-    // profile override is read under the policy's worker-reachable name.
-    let minimumGiB = RuntimeStartupMemoryPolicy.fullProfileMinimumPhysicalMemoryBytes >> 30
-    #expect(script.contains(
-        "readonly LOW_MEMORY_PROFILE_FULL_MIN_BYTES=$((\(minimumGiB) << 30))"
-    ))
-    #expect(script.contains(
-        "${\(RuntimeStartupMemoryPolicy.profileOverrideEnvironmentName):-}"
-    ))
-
-    // The shell mirrors the policy's no-overwrite semantics with a per-flag
-    // set/unset check (printenv treats set-but-empty as set, like getenv), so
-    // explicitly exported flags are never warned about.
-    #expect(script.contains("if ! printenv \"${flag}\" >/dev/null 2>&1; then"))
 }
 
 // The documented low-memory startup profile (<64 GiB machines: 6 GiB MLX
@@ -200,41 +146,37 @@ func startupMemoryPolicyHonorsExplicitProfileRequest() {
     )
 }
 
+// The low-memory plan writes no environment defaults -- compiled decode and
+// every other ranked code path stay enabled -- and its stderr notice states
+// exactly what it does (cap + warmup clear), that ranked code paths stay
+// enabled, and that a genuinely-too-small machine fails loudly with an
+// out-of-memory error instead of silently skipping ranked code paths (the
+// silent divergence the old feature-disable defaults caused).
 @Test
-func lowMemoryPlanPreservesUserSetFlagsAndReportsThem() throws {
+func lowMemoryPlanWritesNoFeatureDefaultsAndAnnouncesRankedParity() throws {
     let policy = RuntimeStartupMemoryPolicy.resolve(
         physicalMemoryBytes: UInt64(36) << 30
     )
-    let userSet = "DARKBLOOM_COMPILED_DECODE"
+    // Even with the historical compiled-decode flag names exported, the plan
+    // neither writes nor tracks them: the profile no longer touches feature
+    // flags at all.
     let plan = policy.environmentPlan { name in
-        name == userSet ? "1" : nil
+        ["MLX_COMPILED_DECODE", "DARKBLOOM_COMPILED_DECODE"].contains(name)
+            ? "1" : nil
     }
 
-    // The explicitly-set flag is preserved, every unset flag gets its
-    // low-memory default, and nothing else is touched.
-    #expect(plan.preservedUserValues == [userSet: "1"])
-    #expect(plan.defaultsToApply[userSet] == nil)
-    #expect(plan.defaultsToApply.count == policy.environmentOverrides.count - 1)
-    #expect(plan.defaultsToApply["MLX_COMPILED_DECODE"] == "0")
-
-    // The notice names the active profile, the opt-out, and the preserved flag.
+    #expect(plan.defaultsToApply.isEmpty)
+    #expect(plan.preservedUserValues.isEmpty)
     try #require(plan.noticeLines.count == 2)
     #expect(plan.noticeLines[0].contains("low-memory startup profile active"))
+    #expect(plan.noticeLines[0].contains("capping the MLX allocator cache at 6 GiB"))
+    #expect(plan.noticeLines[0].contains(
+        "compiled decode and every other ranked code path stay enabled"
+    ))
     #expect(plan.noticeLines[0].contains("DARKBLOOM_STARTUP_MEMORY_PROFILE=full"))
-    #expect(plan.noticeLines[1].contains("\(userSet)=1"))
-}
-
-@Test
-func lowMemoryPlanAppliesAllDefaultsWhenNoneAreUserSet() throws {
-    let policy = RuntimeStartupMemoryPolicy.resolve(
-        physicalMemoryBytes: UInt64(36) << 30
-    )
-    let plan = policy.environmentPlan { _ in nil }
-
-    #expect(plan.defaultsToApply == policy.environmentOverrides)
-    #expect(plan.preservedUserValues.isEmpty)
-    try #require(plan.noticeLines.count == 1)
-    #expect(plan.noticeLines[0].contains("low-memory startup profile active"))
+    #expect(plan.noticeLines[1].contains("out-of-memory"))
+    #expect(plan.noticeLines[1].contains("64 GiB+ machine"))
+    #expect(plan.noticeLines[1].contains("rely on the ranked run"))
 }
 
 @Test
