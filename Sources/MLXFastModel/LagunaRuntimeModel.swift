@@ -333,7 +333,7 @@ private enum LagunaDecodeAsyncStage {
 /// already-constructed work earlier. Each extra fire costs one scheduler
 /// round trip, so the stride is chosen by measurement, not maximal overlap.
 private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
-    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?.lowercased() ?? "ladder8"
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?.lowercased() ?? "ladder6"
     switch raw {
     case "off", "0", "":
         return .off
@@ -352,6 +352,21 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
         }
         return .off
     }
+}()
+
+/// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `8`; `0`/`off` disables):
+/// prefill-side twin of the decode ladder above. Multi-token forwards build
+/// a ~400-op graph with the GPU idle until the final eval; firing `asyncEval`
+/// after every Nth layer streams completed segments exactly as the promoted
+/// decode ladder does. Same exactness ground: no operation, order, cache
+/// write, or token changes — only when already-constructed work is enqueued.
+/// This pays into both score components: the prefill phase itself and the
+/// 512-token seed prefill charged to the decode window.
+private let lagunaPrefillAsyncLadderStride: Int = {
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ASYNC_LADDER"]?.lowercased() ?? "8"
+    if raw == "off" || raw == "0" || raw.isEmpty { return 0 }
+    guard let n = Int(raw), (1...40).contains(n) else { return 0 }
+    return n
 }()
 
 private let lagunaRoPEAngleAtlasLength = 4096
@@ -4563,6 +4578,11 @@ final class LagunaRuntimeModelInner: Module {
                 }
                 if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
                     inputs.shape == [1, 1]
+                {
+                    asyncEval(h)
+                }
+                if lagunaPrefillAsyncLadderStride > 0, h.dim(1) > 1,
+                    (i + 1) % lagunaPrefillAsyncLadderStride == 0
                 {
                     asyncEval(h)
                 }
