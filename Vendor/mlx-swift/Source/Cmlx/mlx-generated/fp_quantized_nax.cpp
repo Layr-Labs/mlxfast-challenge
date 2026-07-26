@@ -1488,6 +1488,7 @@ template <
   constexpr int BN_padded = BN + 16 / sizeof(Wtype);
   constexpr int expert_groups = 64;
   constexpr int experts = 256;
+  static_assert(experts % expert_groups == 0);
 
   using loader_w_t = QuantizedBlockLoader<
       Wtype,
@@ -1531,8 +1532,11 @@ template <
 
   for (int expert_slot = 0; expert_slot < experts / expert_groups;
        ++expert_slot) {
+    // Keep each threadgroup's row intervals and expert weight regions
+    // contiguous across slots while preserving the exact expert bijection.
     const uint32_t expert =
-        static_cast<uint32_t>(tid.y + expert_slot * expert_groups);
+        static_cast<uint32_t>(
+            tid.y * (experts / expert_groups) + expert_slot);
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0) {
