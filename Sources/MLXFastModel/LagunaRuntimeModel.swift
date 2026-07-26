@@ -203,10 +203,43 @@ let lagunaExpertAlignedGatherEnabled =
 /// Decode post-attention residual + RMSNorm fusion. The kernel emits
 /// both the rounded BF16 residual (needed by the following skip connection)
 /// and the normalized row (consumed immediately by the MLP), eliminating a
-/// separate residual-add materialization/read. Prefill stays on the stock path
-/// to keep its dispatch and scheduling unchanged.
+/// separate residual-add materialization/read. Restricted to the single-row
+/// (`x.size == hiddenSize`) decode shape at its call site; see
+/// `lagunaPrefillFusedResidualRMSNormEnabled` immediately below for the
+/// multi-token counterpart, gated independently.
 let lagunaFusedResidualRMSNormEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_RESIDUAL_RMS"] != "0"
+
+/// `DARKBLOOM_PREFILL_FUSED_RESIDUAL_RMS` (default on; set "0" to ablate):
+/// prefill (multi-token) counterpart of `lagunaFusedResidualRMSNormEnabled`
+/// above, gated independently per this file's convention of separate
+/// per-regime flags (see the router fusion split, `DARKBLOOM_FUSED_ROUTER`
+/// vs. `DARKBLOOM_PREFILL_ROUTER_TOURNAMENT`). Reuses the IDENTICAL
+/// `lagunaResidualRMSNorm` kernel the decode branch already calls -- no new
+/// Metal source -- because that kernel's Swift wrapper and Metal body are
+/// already fully row-count-general: `rows` is derived from
+/// `residual.size / hiddenSize` (not hardcoded), the dispatch grid is
+/// `rows` independent threadgroups, and the kernel body's own row index
+/// (`threadgroup_position_in_grid.x`) plus all of its scratch
+/// (`local_sums`, the running mean-square accumulator) are per-threadgroup
+/// -- one row's computation never reads another row's data. Only the
+/// call-site guard restricted it to decode; this flag lifts that
+/// restriction for `x.dim(1) > 1` specifically, leaving the decode branch
+/// above completely untouched (mutually exclusive guards: decode requires
+/// `x.size == hiddenSize`, i.e. exactly one row; this branch requires
+/// `x.dim(1) > 1`).
+///
+/// Exactness: with this flag off, EVERY prefill forward already falls
+/// through this same call site's stock `else` arm (`h = x + r`; `normalized
+/// = postAttentionLayerNorm(h)`) unconditionally, since the decode branch's
+/// `x.size == hiddenSize` guard is always false for `L > 1` -- confirmed by
+/// reading the guard, not assumed. That is the exact two-op sequence the
+/// kernel already reproduces bit-for-bit for decode's `L == 1` case, and
+/// RMSNorm has no cross-token interaction in either the stock ops or the
+/// kernel, so the per-row equivalence already proven for one row holds row
+/// by row for any `L`.
+let lagunaPrefillFusedResidualRMSNormEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_RESIDUAL_RMS"] != "0"
 
 /// Issues the routed and shared gate/up NVFP4 QMVs as one nine-slot dispatch
 /// (see `lagunaRoutedSharedSwiGLUQMVKernel`). Set
@@ -3715,6 +3748,260 @@ private func lagunaPrefillRouterTop8(
     return (outputs[0], outputs[1])
 }
 
+/// `DARKBLOOM_PREFILL_ROUTER_TOURNAMENT` (default on; set "0" to ablate):
+/// credited re-land of saucegod's `aeabc27` two-stage tournament, the
+/// mechanism this replaces `lagunaPrefillRouterTop8` above's O(256) per-lane
+/// predecessor count with (that one stays in the tree, default off, as its
+/// own independent ablation point -- `DARKBLOOM_PREFILL_ROUTER_TOP8=1`).
+///
+/// Same comparator, same total order, same normalization idiom as the
+/// promoted decode router (`laguna_router_key_before`,
+/// `lagunaDecodeRouterTop8Header` above) -- reused verbatim, not
+/// reimplemented -- but a genuinely cheaper selection network instead of a
+/// full 256-element sort or an O(256^2) predecessor count:
+///
+/// Phase 1 -- eight independent 32-lane bitonic sorts, one per simdgroup.
+/// This is exactly the promoted decode kernel's own low-stride bitonic
+/// network code (`sequence` from 2 to 32, `stride` from `sequence>>1` down
+/// to 1, `simd_shuffle_xor`-only exchanges, identical comparator calls),
+/// simply not continued past `sequence == 32`: since `stride <
+/// sequence <= 32` throughout, no exchange's `lane ^ stride` ever crosses a
+/// 32-lane simdgroup boundary (XORing bits 0-4 cannot flip bit 5), so this
+/// is EXACTLY 8 independent, fully-correct bitonic sorts of each
+/// simdgroup's own 32-lane block, needing no threadgroup memory. Each
+/// block IS fully sorted by the total order after this phase, but NOT all
+/// eight ascending: standard Batcher-network direction alternates by block
+/// parity at an intermediate stage like this one (needed if the network
+/// continued merging into larger blocks, which this one does not) --
+/// even-indexed blocks land ascending (rank 0 at `within_block == 0`),
+/// odd-indexed blocks land descending (rank 0 at `within_block == 31`).
+/// The extraction step below reads each block's true rank-0..7 from
+/// whichever end it actually sorted to.
+///
+/// Exactness of the local-top-8-is-sufficient claim: if an expert `e` is in
+/// the row's GLOBAL top-8, it cannot rank below 7 within its own 32-lane
+/// block -- if it did, that one block alone would already contain 8
+/// experts strictly better than `e` (its within-block betters, all real,
+/// all in the same 256-row), giving `e` a global rank of at least 9,
+/// contradicting global top-8 membership. So the 8 blocks' local top-8
+/// sets (64 candidates total) provably contain the row's true top-8 as a
+/// SET, for any partition into blocks -- this holds regardless of block
+/// size or which 32 experts land in which block.
+///
+/// Phase 2 -- repack the 64 candidates into one contiguous threadgroup
+/// array (unavoidably a real cross-simdgroup data movement, one barrier)
+/// then bitonic-sort THAT 64-element union using the same comparator
+/// (`sequence` 2 to 64). All 256 threads participate uniformly (Metal
+/// requires uniform control flow to reach a `threadgroup_barrier`); lanes
+/// 64-255 operate on a harmless wrapped duplicate of the same 64
+/// candidates (`lane & 63`) and are never read. Because a strict total
+/// order applied consistently preserves relative order within any subset,
+/// the sorted union's first 8 entries are the row's true top-8 IN THE SAME
+/// ORDER the full 256-element stable argsort would have produced them --
+/// same proof structure the promoted decode kernel and the existing
+/// (default-off) `lagunaPrefillRouterTop8` predecessor-count kernel both
+/// already rely on for their own exactness arguments.
+///
+/// The normalizing epilogue reuses the decode kernel's own trick verbatim:
+/// after phase 2, ranks 0..<8 are physical lanes 0..<8, all within
+/// simdgroup 0, so `simd_shuffle(my_score2, i)` gathers all eight winning
+/// scores through registers (no threadgroup memory) and folds them in
+/// ascending-lane order -- bit-identical to stock `weights.sum(axis: -1)`'s
+/// left fold and the IEEE FP32 divide that follows it.
+private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> String {
+    let epilogue =
+        normalizing
+        ? """
+        float total = 0.0f;
+        for (uint i = 0; i < 8; ++i) {
+            total = simd_shuffle(my_score2, ushort(i)) + total;
+        }
+        if (lane < 8) {
+            router_indices[row * 8 + lane] = my_index2;
+            router_scores[row * 8 + lane] = my_score2 / total;
+        }
+        """
+        : """
+        if (lane < 8) {
+            router_indices[row * 8 + lane] = my_index2;
+            router_scores[row * 8 + lane] = my_score2;
+        }
+        """
+    return """
+        uint lane = thread_position_in_threadgroup.x;
+        uint row = threadgroup_position_in_grid.y;
+
+        threadgroup float xchg_keys[256];
+        threadgroup uint xchg_indices[256];
+        threadgroup float xchg_scores[256];
+        threadgroup float candidate_keys[64];
+        threadgroup uint candidate_indices[64];
+        threadgroup float candidate_scores[64];
+
+        float x = float(logits[row * 256 + lane]);
+        float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+        float my_score = x < 0.0f ? y : 1.0f - y;
+        float my_key = -(my_score + float(correction_bias[lane]));
+        uint my_index = lane;
+
+        // Phase 1: eight independent 32-lane bitonic sorts (one per
+        // simdgroup), entirely via simd_shuffle_xor. Identical stage
+        // structure and comparator calls to the promoted decode router's
+        // low-stride stages; just not continued past sequence == 32.
+        for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
+            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+                float other_key = simd_shuffle_xor(my_key, ushort(stride));
+                uint other_index = simd_shuffle_xor(my_index, ushort(stride));
+                float other_score = simd_shuffle_xor(my_score, ushort(stride));
+
+                bool is_lower = (lane & stride) == 0;
+                float a_key = is_lower ? my_key : other_key;
+                uint a_index = is_lower ? my_index : other_index;
+                float a_score = is_lower ? my_score : other_score;
+                float b_key = is_lower ? other_key : my_key;
+                uint b_index = is_lower ? other_index : my_index;
+                float b_score = is_lower ? other_score : my_score;
+
+                bool lower_wants_better = (lane & sequence) == 0;
+                bool b_before_a = laguna_router_key_before(
+                    b_key, b_index, a_key, a_index);
+                bool a_before_b = laguna_router_key_before(
+                    a_key, a_index, b_key, b_index);
+                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                if (swap) {
+                    my_key = is_lower ? b_key : a_key;
+                    my_index = is_lower ? b_index : a_index;
+                    my_score = is_lower ? b_score : a_score;
+                }
+            }
+        }
+
+        // Each simdgroup's 32 lanes are now fully sorted by (key, index) --
+        // but NOT all eight blocks ascending: this is stage `sequence ==
+        // 32` of the standard Batcher network, whose direction test
+        // `(lane & sequence) == 0` reads bit 5 of `lane` at that stage,
+        // which is exactly the block-parity bit. Even-indexed blocks
+        // (0, 2, 4, 6) sort ascending (within_block 0 = best); odd-indexed
+        // blocks (1, 3, 5, 7) sort DESCENDING (within_block 31 = best) --
+        // required so a continued network could merge each adjacent
+        // ascending/descending pair into a bitonic sequence at sequence ==
+        // 64, even though this network stops here instead of continuing.
+        // Extract each block's true local top-8 in rank order (0 = best)
+        // from whichever end that block actually sorted its best element
+        // to; the local-top-8-contains-global-top-8 proof above depends
+        // only on each block being internally sorted by the total order,
+        // not on a particular direction.
+        uint block = lane >> 5;
+        uint within_block = lane & 31;
+        bool block_ascending = (block & 1) == 0;
+        uint rank_in_block = block_ascending ? within_block : (31 - within_block);
+        bool is_local_top8 = block_ascending ? (within_block < 8) : (within_block >= 24);
+        if (is_local_top8) {
+            candidate_keys[block * 8 + rank_in_block] = my_key;
+            candidate_indices[block * 8 + rank_in_block] = my_index;
+            candidate_scores[block * 8 + rank_in_block] = my_score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Phase 2: bitonic-sort the 64-candidate union. Every thread
+        // participates uniformly -- lanes 64-255 load a harmless wrapped
+        // duplicate of the real 64 candidates (`lane & 63`) so every
+        // thread in the threadgroup reaches the stride >= 32 barrier
+        // below identically; only lanes < 8 are ever read.
+        float my_key2 = candidate_keys[lane & 63];
+        uint my_index2 = candidate_indices[lane & 63];
+        float my_score2 = candidate_scores[lane & 63];
+        for (uint sequence = 2; sequence <= 64; sequence <<= 1) {
+            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+                float other_key;
+                uint other_index;
+                float other_score;
+                if (stride < 32) {
+                    other_key = simd_shuffle_xor(my_key2, ushort(stride));
+                    other_index = simd_shuffle_xor(my_index2, ushort(stride));
+                    other_score = simd_shuffle_xor(my_score2, ushort(stride));
+                } else {
+                    xchg_keys[lane] = my_key2;
+                    xchg_indices[lane] = my_index2;
+                    xchg_scores[lane] = my_score2;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    uint partner = lane ^ stride;
+                    other_key = xchg_keys[partner];
+                    other_index = xchg_indices[partner];
+                    other_score = xchg_scores[partner];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+
+                bool is_lower = (lane & stride) == 0;
+                float a_key = is_lower ? my_key2 : other_key;
+                uint a_index = is_lower ? my_index2 : other_index;
+                float a_score = is_lower ? my_score2 : other_score;
+                float b_key = is_lower ? other_key : my_key2;
+                uint b_index = is_lower ? other_index : my_index2;
+                float b_score = is_lower ? other_score : my_score2;
+
+                bool lower_wants_better = (lane & sequence) == 0;
+                bool b_before_a = laguna_router_key_before(
+                    b_key, b_index, a_key, a_index);
+                bool a_before_b = laguna_router_key_before(
+                    a_key, a_index, b_key, b_index);
+                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                if (swap) {
+                    my_key2 = is_lower ? b_key : a_key;
+                    my_index2 = is_lower ? b_index : a_index;
+                    my_score2 = is_lower ? b_score : a_score;
+                }
+            }
+        }
+
+        // Ranks 0..<8 of the 64-candidate merge are the row's global
+        // top-8, in exactly the stock argsort-slice order.
+        \(epilogue)
+        """
+}
+
+private let lagunaPrefillRouterTournamentKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_router_tournament_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaPrefillRouterTournamentKernelSource(normalizing: false),
+    header: lagunaDecodeRouterTop8Header,
+    ensureRowContiguous: true
+)
+
+private let lagunaPrefillRouterTournamentNormalizingKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_router_tournament_norm_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaPrefillRouterTournamentKernelSource(normalizing: true),
+    header: lagunaDecodeRouterTop8Header,
+    ensureRowContiguous: true
+)
+
+private func lagunaPrefillRouterTournament(
+    logits: MLXArray, correctionBias: MLXArray, rows: Int, normalizing: Bool
+) -> (MLXArray, MLXArray) {
+    precondition(logits.dtype == .bfloat16 || logits.dtype == .float32)
+    precondition(correctionBias.dtype == .float32)
+    precondition(logits.size == rows * 256)
+    precondition(correctionBias.size == 256)
+
+    let kernel =
+        normalizing
+        ? lagunaPrefillRouterTournamentNormalizingKernel : lagunaPrefillRouterTournamentKernel
+    let outputs = kernel(
+        [logits, correctionBias],
+        grid: (256, rows, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1, rows, 8], [1, rows, 8]],
+        outputDTypes: [.uint32, .float32]
+    )
+    return (outputs[0], outputs[1])
+}
+
+private let lagunaPrefillRouterTournamentEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ROUTER_TOURNAMENT"] != "0"
+
 /// Sigmoid top-k router. The routing math mirrors the vendored
 /// `LagunaMoEGate` exactly (sigmoid scores, correction bias added only for
 /// expert CHOICE, mixture weights taken from the pre-bias scores, optional
@@ -3743,6 +4030,24 @@ final class LagunaRuntimeMoEGate: Module {
         let projectedLogits = logits ?? x.matmul(weight.T)
         let inds: MLXArray
         var weights: MLXArray
+        if lagunaPrefillRouterTournamentEnabled,
+            routerLogitSoftcapping == 0,
+            topK == 8,
+            projectedLogits.dtype == .bfloat16,
+            projectedLogits.ndim == 3,
+            projectedLogits.dim(0) == 1,
+            projectedLogits.dim(1) > 1,
+            projectedLogits.dim(2) == 256,
+            eScoreCorrectionBias.size == 256
+        {
+            lagunaTrace("prefill router tournament")
+            return lagunaPrefillRouterTournament(
+                logits: projectedLogits,
+                correctionBias: eScoreCorrectionBias.asType(.float32),
+                rows: projectedLogits.dim(1),
+                normalizing: normTopkProb
+            )
+        }
         if lagunaPrefillRouterTop8Enabled,
             routerLogitSoftcapping == 0,
             topK == 8,
@@ -4446,6 +4751,33 @@ final class LagunaRuntimeDecoderLayer: Module {
             x.size == LagunaConstants.hiddenSize
         {
             lagunaTrace("residual+rmsnorm")
+            (h, normalized) = lagunaResidualRMSNorm(
+                residual: x, branch: r, weight: postAttentionLayerNorm.weight)
+        } else if lagunaPrefillFusedResidualRMSNormEnabled,
+            x.dtype == .bfloat16, r.dtype == .bfloat16,
+            postAttentionLayerNorm.weight.dtype == .bfloat16,
+            x.shape == r.shape, x.ndim == 3, x.dim(0) == 1,
+            x.dim(-1) == LagunaConstants.hiddenSize,
+            x.dim(1) > 1
+        {
+            // Prefill (multi-token) counterpart of the fused decode branch
+            // just above: same kernel (`lagunaResidualRMSNorm`), which is
+            // already fully row-count-general (its Swift wrapper derives
+            // `rows` from `residual.size / hiddenSize` and its grid is
+            // `rows` independent threadgroups; the Metal body indexes
+            // everything from `threadgroup_position_in_grid.x` and
+            // per-threadgroup scratch, with no cross-row state of any
+            // kind) -- only the call-site guard above was decode-only
+            // (`x.size == hiddenSize` forces a single row). The stock ops
+            // it replaces are identical for prefill: with this branch off,
+            // `x.dim(1) > 1` always falls through to the same `h = x + r`
+            // / `normalized = postAttentionLayerNorm(h)` pair the decode
+            // branch already replaces at L == 1, applied row-independently
+            // by both the stock ops and the kernel alike (RMSNorm has no
+            // cross-token interaction in either form). See
+            // `lagunaPrefillFusedResidualRMSNormEnabled`'s doc comment for
+            // the full exactness argument.
+            lagunaTrace("prefill residual+rmsnorm")
             (h, normalized) = lagunaResidualRMSNorm(
                 residual: x, branch: r, weight: postAttentionLayerNorm.weight)
         } else {
