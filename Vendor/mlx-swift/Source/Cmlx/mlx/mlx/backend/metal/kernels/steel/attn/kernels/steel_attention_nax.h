@@ -282,12 +282,96 @@ template <
   }
 #endif
 
+  // DARKBLOOM K-TILE THREADGROUP STAGING (always on).
+  //
+  // Upstream, every one of the WM*WN simdgroups loaded the SAME K block
+  // fragments straight from device memory inside the QK^T nest, so the
+  // threadgroup paid for the identical block WM*WN times (4x at the ranked
+  // shape). Stage the block ONCE per threadgroup here and let all simdgroups
+  // read their fragments out of threadgroup memory instead. V is deliberately
+  // left on the device path.
+  //
+  // EXACTNESS: this is a bitwise relocation of the same T values, nothing
+  // else. The staging copy is storage-type to storage-type (no
+  // bfloat -> float -> bfloat round trip), the fragment fetch below goes
+  // through the same BaseNAXFrag::load / BaseNAXFrag::load_rows entry points
+  // with the same per-lane coordinates, the same per-fragment row offsets and
+  // the same row bound, and the fragment orientation, the transpose flags and
+  // the mma call sequence are untouched. NO FLOAT ARITHMETIC IS TOUCHED AT
+  // ALL -- nothing is reassociated, no accumulation order changes, no rounding
+  // boundary moves. Only WHERE the fragment bits are fetched from changes.
+  //
+  // LAYOUT: BK rows of BD elements at a padded row stride of BD + 8 elements.
+  // At the ranked shape (BK=32, BD=128, T=bfloat16) that is 32 x 136 elements
+  // = 8704 B, of which 8192 B are written; the 8 pad elements per row are
+  // never written and never read. The pad keeps every row 16 B aligned
+  // (136 * 2 B = 272 B = 17 * 16 B) while avoiding the pathological
+  // power-of-two 256 B stride. This kernel allocated ZERO threadgroup memory
+  // before, so 8704 B is the whole threadgroup-memory budget it now takes.
+  constexpr int kKStageLD = BD + 8;
+  constexpr int kKStageThreads = WM * WN * 32;
+  constexpr int kKStageElemsPerThread = (BK * BD) / kKStageThreads;
+  constexpr int kKStageThreadsPerRow = BD / kKStageElemsPerThread;
+  static_assert(
+      kKStageElemsPerThread * kKStageThreads == BK * BD &&
+          kKStageThreadsPerRow * kKStageElemsPerThread == BD,
+      "K staging must tile the block exactly");
+
+  threadgroup T Kstage[BK * kKStageLD];
+
+  // Flat thread index in the threadgroup. The launch is (32, WM, WN), so
+  // simd_group_id * 32 + simd_lane_id enumerates all kKStageThreads lanes
+  // exactly once. At the ranked shape that is 128 threads, four per row:
+  // row = tid_in_tg >> 2, col0 = (tid_in_tg & 3) * 32.
+  const int tid_in_tg = int(simd_group_id) * 32 + int(simd_lane_id);
+  const short kstage_row = short(tid_in_tg / kKStageThreadsPerRow);
+  const short kstage_col =
+      short((tid_in_tg % kKStageThreadsPerRow) * kKStageElemsPerThread);
+
   // Loop over KV seq length
   for (int kb = 0; kb < kb_lim; kb++) {
     const int is_last_k = (kb == (params->NK_aligned));
 
+    // Stage this K block. K still points at the current block here -- the
+    // advance happens at the bottom of the loop.
+    //
+    // UNIFORMITY: kb_lim depends only on tid.x and params, so the trip count
+    // is threadgroup-uniform and every thread reaches the staging and both
+    // barriers on every iteration. They therefore sit OUTSIDE the
+    // per-simdgroup `sg_active` causal elision below, which continues to
+    // guard fragment CONSUMPTION only. No barrier sits inside a
+    // simdgroup-varying conditional.
+    //
+    // TAIL: on the ragged last block the rows at or past lim_rows_k do not
+    // exist in device memory, so they are staged as T(0) rather than read --
+    // no out-of-range device read is ever issued. Columns are always full
+    // (BD is the head dim). The bounded fragment fetch below keeps the same
+    // lim_rows_k bound, so those staged zeros are never actually read back,
+    // matching upstream where load_rows zero-fills without touching memory.
+    {
+      threadgroup T* kstage_dst = Kstage + kstage_row * kKStageLD + kstage_col;
+
+      if ((!align_K && is_last_k) && kstage_row >= lim_rows_k) {
+        STEEL_PRAGMA_UNROLL
+        for (short e = 0; e < kKStageElemsPerThread; e++) {
+          kstage_dst[e] = T(0);
+        }
+      } else {
+        const device T* kstage_src =
+            K + kstage_row * int(params->K_strides[2]) + kstage_col;
+
+        STEEL_PRAGMA_UNROLL
+        for (short e = 0; e < kKStageElemsPerThread; e++) {
+          kstage_dst[e] = kstage_src[e];
+        }
+      }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     // Do S = Q @ K.T
     using stile_t = NAXTile<AccumType, TQ, TK>;
+    using ktile_t = NAXTile<T, 2, 1>;
     stile_t Stile;
 
     Stile.clear();
@@ -305,12 +389,12 @@ template <
         STEEL_PRAGMA_UNROLL
         for (short id = 0; id < TD; id++) {
           NAXTile<T, 1, 1> Qtile;
-          NAXTile<T, 2, 1> Ktile;
+          ktile_t Ktile;
 
 #if !DARKBLOOM_ATTN_QHOIST
           const int Q_load_off = iq * kU * int(params->Q_strides[2]) + id * kU;
 #endif
-          const int K_load_off = ik * kU * int(params->K_strides[2]) + id * kU;
+          const int K_stage_off = ik * kU * kKStageLD + id * kU;
 
 #if DARKBLOOM_ATTN_QHOIST
           // Q is loop-invariant: the kb loop advances K and V but never Q, so
@@ -337,13 +421,49 @@ template <
           }
 #endif
 
+          // Consume the block staged above instead of re-reading it from
+          // device memory. Same fragment entry points, same per-fragment row
+          // offsets (0 and kU) and -- for the ragged tail -- the same
+          // `lim_rows_k - ik * kU` bound as the device path; only the source
+          // pointer and the row stride change. Keeping the bound on top of
+          // the zero-staging is belt and braces: the staged zero rows are
+          // never read, exactly as upstream never read them.
+          const threadgroup T* Kstage_src = Kstage + K_stage_off;
+
           if (!align_K && is_last_k) {
-            Ktile.load_rows(
-                K + K_load_off,
-                int(params->K_strides[2]),
-                lim_rows_k - ik * kU);
+            const short k_lim_rows = lim_rows_k - ik * kU;
+
+            ktile_t::NAXFrag_t::load_rows(
+                Ktile.frag_at(0, 0),
+                Kstage_src,
+                kKStageLD,
+                Int<1>{},
+                k_lim_rows,
+                Int<0>{},
+                Int<0>{});
+            ktile_t::NAXFrag_t::load_rows(
+                Ktile.frag_at(1, 0),
+                Kstage_src,
+                kKStageLD,
+                Int<1>{},
+                k_lim_rows,
+                Int<kU>{},
+                Int<0>{});
           } else {
-            Ktile.load(K + K_load_off, int(params->K_strides[2]));
+            ktile_t::NAXFrag_t::load(
+                Ktile.frag_at(0, 0),
+                Kstage_src,
+                kKStageLD,
+                Int<1>{},
+                Int<0>{},
+                Int<0>{});
+            ktile_t::NAXFrag_t::load(
+                Ktile.frag_at(1, 0),
+                Kstage_src,
+                kKStageLD,
+                Int<1>{},
+                Int<kU>{},
+                Int<0>{});
           }
 
           stile_t::NAXFrag_t::mma(
@@ -570,6 +690,12 @@ template <
     // Prepare for next iteration
     K += BK * int(params->K_strides[2]);
     V += BK * int(params->V_strides[2]);
+
+    // The whole block has now been consumed: the P@V nest above reads V from
+    // device memory and never touches Kstage. Fence before the next
+    // iteration's staging overwrites the tile. Unconditional and uniform --
+    // it sits at the loop bottom, outside every sg_active guard.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
   // Normalize output
