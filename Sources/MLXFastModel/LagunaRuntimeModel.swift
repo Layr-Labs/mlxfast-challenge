@@ -2004,13 +2004,59 @@ final class LagunaRuntimeAttention: Module {
 
 // MARK: - Dense MLP (also used as the shared expert)
 
-private let lagunaSharedSwiGLUQMVHeader = """
+/// `DARKBLOOM_NVFP4_SCALE_FOLD` (default on; set "0" to restore the pre-fold
+/// arithmetic): hoists the `2^14` out of `laguna_nvfp4_qdot_16`'s sixteen
+/// per-call multiplies and folds it into the one multiply
+/// `laguna_nvfp4_scale` already performs. **−16 scalar multiplies per
+/// `qdot_16` call, −16.5% of the dequantize ALU, ~−1104 M float multiplies per
+/// token across L8 + L9, and nothing added** (`notes/57` §10).
+///
+/// Bit-exact. `16384 == 2^14`, and scaling a binary float by an exact power of
+/// two touches only the exponent field, so every product, partial sum and
+/// rounding decision in the accumulator chain is exactly `2^-14 ×` its old
+/// value — same bits, different exponent — and the `2^14` reappears once in
+/// the scale before the single final rounding.
+///
+/// **The dtype move is range-checked, not assumed** (`notes/58` §1a). The
+/// multiply moves from half to float because `4194304` overflows half, and a
+/// power-of-two argument does NOT by itself survive a dtype change — so all
+/// 256 E4M3 scale bytes were enumerated through both paths, in half and in
+/// float, with an explicit `isfinite` check on the old path. **Zero
+/// divergence, and no overflow is reachable:** the shuffle
+/// `(bits & 127) << 7` maps E4M3 into half format, and since E4M3's exponent
+/// bias is 7 against half's 15 it already yields the scale divided by 256 —
+/// which is exactly what the old `*= 256.0` corrected. The half-domain
+/// intermediate therefore peaks at **1.875**, and the scale at **480**,
+/// against half's finite max of 65504. **136x headroom.**
+///
+/// The compiler cannot do this fold itself: `device.cpp:631` sets
+/// `setFastMathEnabled(false)`, so reassociating `Σ(a·h·2^14)` into
+/// `2^14·Σ(a·h)` is forbidden and all sixteen multiplies really are emitted.
+/// `device.cpp` is outside `editablePaths`, so it is done by hand.
+///
+/// Safe under the `notes/00` kernel-selection rule: this is a pure arithmetic
+/// identity **inside our own Metal source**. No shape, dtype, tile count or
+/// reduction order that MLX can observe changes, so it cannot alter which
+/// kernel MLX selects.
+let lagunaNvfp4ScaleFoldEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_FOLD"] != "0"
+
+private let lagunaSharedSwiGLUQMVHeader: String = {
+    // The two halves of one power-of-two regrouping. They MUST move together:
+    // the scale absorbs `2^14` exactly when the weights stop applying it.
+    // `4194304.0f == 256 · 16384 == 2^22`.
+    let scaleTail =
+        lagunaNvfp4ScaleFoldEnabled
+        ? "        return float(signed_value) * 4194304.0f;"
+        : "        return float(signed_value);"
+    let scale256 = lagunaNvfp4ScaleFoldEnabled ? "" : "        converted *= 256.0;\n"
+    let weightScale = lagunaNvfp4ScaleFoldEnabled ? "" : " * 16384.0f"
+    return """
     static inline float laguna_nvfp4_scale(uint8_t bits) {
         ushort raw = ushort(bits & 127) << 7;
         half converted = as_type<half>(raw);
-        converted *= 256.0;
-        half signed_value = (bits & 128) ? -converted : converted;
-        return float(signed_value);
+    \(scale256)    half signed_value = (bits & 128) ? -converted : converted;
+    \(scaleTail)
     }
 
     static inline float laguna_nvfp4_qdot_16(
@@ -2031,10 +2077,10 @@ private let lagunaSharedSwiGLUQMVHeader = """
                 ((c & 0x07000700u) << 1) | ((c & 0x08000800u) << 4);
             const uint p3 =
                 ((c & 0x70007000u) >> 3) | (c & 0x80008000u);
-            const float2 v04 = float2(as_type<half2>(p0)) * 16384.0f;
-            const float2 v15 = float2(as_type<half2>(p1)) * 16384.0f;
-            const float2 v26 = float2(as_type<half2>(p2)) * 16384.0f;
-            const float2 v37 = float2(as_type<half2>(p3)) * 16384.0f;
+            const float2 v04 = float2(as_type<half2>(p0))\(weightScale);
+            const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
+            const float2 v26 = float2(as_type<half2>(p2))\(weightScale);
+            const float2 v37 = float2(as_type<half2>(p3))\(weightScale);
             accum +=
                 (input[8 * j] * v04.x +
                  input[8 * j + 1] * v15.x +
@@ -2049,6 +2095,7 @@ private let lagunaSharedSwiGLUQMVHeader = """
         return scale * accum;
     }
     """
+}()
 
 private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
     name: "laguna_shared_nvfp4_swiglu_qmv_bf16_v1",
