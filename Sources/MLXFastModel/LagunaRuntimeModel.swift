@@ -200,6 +200,68 @@ let lagunaExpertAlignedGatherEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_EXPERT_ALIGNED_GATHER"] != "0"
 
+/// `DARKBLOOM_DIRECT_LOADS_LAYER_PCT` (integer 0-100, default **20**):
+/// partial-strength dial for `DARKBLOOM_DIRECT_GATHER_LOADS`
+/// (`lagunaDirectGatherLoadsEnabled`, `SwitchLayers.swift`).
+///
+/// Full-strength direct loads (every eligible sparse layer's gate/up leg
+/// reading raw x instead of a physically pre-gathered copy) re-reads the
+/// gate/up A-tile from device once per N-tile (`BN=64` over `N=1024` -> 16
+/// re-reads per layer), cutting roughly O(10 GB) of DRAM traffic across a
+/// full prefill pass -- plausibly enough, on its own, to overshoot the
+/// paired prefill acceptance band (`docs/benchmark-window-freeze.md`) and
+/// FAIL a ranked run rather than merely REJECT it. This dial exists to
+/// chunk that gain across submissions -- the identical pattern, and
+/// identical honest intent, as the RUNSKIP percentage dial
+/// (`DARKBLOOM_PREFILL_GATHER_RUNSKIP=1:N`, `darkbloom_gather_run_skip_pct`
+/// in `quantized.cpp`): both turn an all-or-nothing kernel-level lever into
+/// a deterministic fraction of the work, sized to land inside the band
+/// instead of past it, so the remainder can ship in a later submission.
+///
+/// Deliberately Swift-side only: see `lagunaDirectLoadsLayerSelected`
+/// immediately below for why the C++ side needs no counterpart.
+private let lagunaDirectLoadsLayerPct: Int = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DIRECT_LOADS_LAYER_PCT"],
+        let parsed = Int(raw)
+    else {
+        return 20
+    }
+    return min(100, max(0, parsed))
+}()
+
+/// Deterministic, evenly-spread selection over the 0-based ordinal `i` among
+/// Laguna's 39 sparse MoE layers (NOT the overall 0-based decoder-layer
+/// index, which also counts the one dense layer 0 -- see
+/// `lagunaFusedSortedRoutedGateUp`'s caller for how the ordinal is derived).
+/// Standard Bresenham/DDA "spread pct% of a stream evenly" predicate:
+///
+///     selected(i) == ((i + 1) * pct) / 100 > (i * pct) / 100   (integer division)
+///
+/// `pct == 100` selects every ordinal, `pct == 0` selects none. This
+/// telescopes over `i = 0..<n`: the count of `true`s among the first `n`
+/// ordinals is exactly `(n * pct) / 100` (the sum collapses to
+/// `f(n) - f(0)` where `f(i) = (i * pct) / 100`), so the selected fraction
+/// is correct for ANY sparse-layer count without this function needing to
+/// know the total up front -- it only ever looks at `i` and `pct`.
+///
+/// This is Swift-side ONLY. `direct_gather_loads_capable` in
+/// `GatherQMM::eval_gpu` (`quantized.cpp`) is not, and does not need to be,
+/// aware layers are being selectively excluded: a dial-excluded layer's
+/// gate/up call simply never supplies `lhsIndices` (see
+/// `lagunaFusedSortedRoutedGateUp`), so from the C++ side it is
+/// indistinguishable from "loads was never eligible for this dispatch" --
+/// the exact same code path either way. The encoded-indices decision (`bit
+/// 2` in the trailing scalar, `indices_may_be_encoded` in
+/// `gather_qmm_rhs_nax`) stays correct across a partial dial for a
+/// different, load-bearing reason: it is driven by `lagunaDirectGatherLoadEligible`
+/// (the GLOBAL, layer-agnostic eligibility check), not by this per-layer
+/// selection, so it does not vary with which layers the dial excludes -- see
+/// the "four combinations" doc comment on `lagunaFusedSortedRoutedGateUp`
+/// for the exact per-layer dataflow this preserves.
+private func lagunaDirectLoadsLayerSelected(ordinal i: Int, pct: Int) -> Bool {
+    ((i + 1) * pct) / 100 > (i * pct) / 100
+}
+
 /// Decode post-attention residual + RMSNorm fusion. The kernel emits
 /// both the rounded BF16 residual (needed by the following skip connection)
 /// and the normalized row (consumed immediately by the MLP), eliminating a
@@ -3629,10 +3691,12 @@ private func lagunaFusedSortedRoutedGateUp(
     fusedWeight: MLXArray,
     fusedScales: MLXArray,
     split: Int,
-    downProj: SwitchLinear
+    downProj: SwitchLinear,
+    sparseLayerOrdinal: Int
 ) -> MLXArray {
     // SwitchGLU: `var x = MLX.expandedDimensions(x, axes: [-2, -3])`
-    var sortedX = MLX.expandedDimensions(x, axes: [-2, -3])
+    let expandedX = MLX.expandedDimensions(x, axes: [-2, -3])
+    var sortedX = expandedX
     // SwitchGLU: `let doSort = indices.size >= 64`. The call site already
     // guards `indices.size >= 64` before calling in, so this is always true
     // here; recomputed anyway so this function mirrors SwitchGLU verbatim
@@ -3641,9 +3705,129 @@ private func lagunaFusedSortedRoutedGateUp(
     // SwitchGLU: `var idx = indices` / `var inverseOrder = MLXArray()`
     var idx = indices
     var inverseOrder = MLXArray()
+    // Direct-final-row-store (output side, down leg) and direct-gather-loads
+    // (input side, gate/up leg) fast paths -- see the "Direct final-row
+    // stores" section in SwitchLayers.swift above `gatherSort`,
+    // `lagunaDirectFinalRowStoreEligible`, and `lagunaDirectGatherLoadEligible`.
+    // Unlike `SwitchGLU`'s stock `gate_proj`/`up_proj` (separate banks,
+    // N == moeIntermediateSize each, never expert-aligned), THIS fused
+    // bank's gate/up gather-QMM is itself N == 2 * split == 1024,
+    // K == hiddenSize == 2048 -- `laguna_moe_shape`'s first leg -- so it
+    // lands on the same expert-aligned kernel as down_proj whenever
+    // down_proj is eligible (both shapes are pinned by the same fixed
+    // Laguna config constants, and this function only runs when
+    // `_fusedRoutedGateUpSplit == LagunaConstants.moeIntermediateSize` is
+    // already verified by the call site). So, unlike `SwitchGLU`, a single
+    // encoded `idx` is safe to reuse for BOTH the gate/up dispatch below
+    // and the down dispatch whenever EITHER fast path is active: both
+    // decode the expert id out of it the same way in the kernel, and each
+    // leg additionally decodes only the bit it owns (down's slot for its
+    // store epilogue, gate/up's token index for its load).
+    //
+    // The two mechanisms are independent (`DARKBLOOM_DIRECT_GATHER_LOADS`
+    // and `DARKBLOOM_DIRECT_FINAL_ROW_STORES` each default on, either can
+    // be "0" alone) but share the SAME encoded `idx`, so this function
+    // covers all four combinations explicitly rather than composing two
+    // independent branches. `loadsEligible` is the GLOBAL/shape check
+    // (`lagunaDirectGatherLoadEligible`, layer-agnostic); `loadsSelected`
+    // additionally requires `DARKBLOOM_DIRECT_LOADS_LAYER_PCT`'s per-layer
+    // dial (`lagunaDirectLoadsLayerSelected`) to pick this layer. This
+    // split matters: the ENCODING decision below uses `loadsEligible`
+    // (unselected), so a dial-excluded-but-otherwise-eligible layer still
+    // encodes `idx` exactly like a selected one -- required for
+    // correctness, not just cheap insurance, because `quantized.cpp`'s
+    // `indices_may_be_encoded` (bit 2 of the trailing scalar) is derived
+    // from the GLOBAL `darkbloom_direct_gather_loads_enabled()` flag alone,
+    // with no way to know which layers the Swift-side dial excluded; if
+    // this function stopped encoding for a dial-excluded layer while that
+    // global flag stayed on, the down leg's run-boundary search would
+    // wrongly decode plain expert ids (or the gate/up leg's, if stores
+    // alone drove encoding) on THIS layer while it correctly decodes on
+    // every other -- silent, per-layer corruption. Only the ADDRESSING
+    // decision (raw x + `lhsIndices` vs. physical gather) uses
+    // `loadsSelected`.
+    //   loads on,  stores on:  gate/up reads raw x directly (no gather) IF
+    //                          `loadsSelected`, else physically gathers
+    //                          (using the same encoded `idx` either way);
+    //                          down stores directly (no scatterUnsort).
+    //   loads on,  stores off: gate/up as above; down still writes
+    //                          contiguous SORTED output, so `inverseOrder`
+    //                          (the second argSort direct stores would
+    //                          otherwise remove) is computed here
+    //                          specifically to undo that.
+    //   loads off, stores on:  gate/up always physically gathers (this is
+    //                          the shipped behavior before the loads
+    //                          patch); down stores directly.
+    //   loads off, stores off: full stock `gatherSort` path, unchanged.
+    var directStored = false
+    var gateUpLHSIndices: MLXArray?
     // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
     if doSort {
-        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        let totalSlots = indices.size
+        let storesEligible: Bool
+        if let downQuantized = downProj as? QuantizedSwitchLinear {
+            storesEligible = lagunaDirectFinalRowStoreEligible(down: downQuantized, m: totalSlots)
+        } else {
+            storesEligible = false
+        }
+        let loadsEligible = lagunaDirectGatherLoadEligible(
+            m: totalSlots, k: LagunaConstants.hiddenSize, n: 2 * split)
+        // Layer-gated: this is the ONLY place `sparseLayerOrdinal` and the
+        // `DARKBLOOM_DIRECT_LOADS_LAYER_PCT` dial matter. Never used for
+        // the encoding decision just below -- see the comment above.
+        let loadsSelected =
+            loadsEligible
+            && lagunaDirectLoadsLayerSelected(
+                ordinal: sparseLayerOrdinal, pct: lagunaDirectLoadsLayerPct)
+
+        if storesEligible || loadsEligible {
+            // Inlined `gatherSortKeyed` (rather than calling it) because
+            // this function additionally needs `order` itself: the loads
+            // path skips gathering x with it, and the stores-off/loads-on
+            // combination above needs it to build `inverseOrder`, neither
+            // of which `gatherSortKeyed`'s two-value return exposes.
+            let flatIndices = indices.flattened().asType(.uint32)
+            let slot = MLXArray.arange(flatIndices.size, dtype: .uint32)
+            let key = (flatIndices << 20) | slot
+            let order = argSort(key)
+            idx = key[order]
+
+            if loadsSelected {
+                // Skip the physical gather entirely: `sortedX` stays the
+                // small, raw, un-sorted (numTokens, 1, hiddenDims) array,
+                // and the gate/up leg's kernel derives each row's real
+                // source token from the same encoded `idx` its weight/run
+                // search already reads. `gateUpLHSIndices` exists only to
+                // steer the FROZEN `gather_qmm` shape inference
+                // (`ops.cpp`: `out_shape = lhs_indices.shape() + [x.shape(-2),
+                // w_outer_dims]`) into allocating the full sorted-row output
+                // from that small x; its VALUES are never read on the
+                // dispatch path this takes (`gather_qmm_rhs_nax` in
+                // `quantized.cpp` derives everything from `idx`/`rhs_indices`
+                // instead), so reusing `idx` -- already built, already the
+                // right shape and dtype -- avoids allocating a second
+                // throwaway array.
+                sortedX = expandedX.flattened(start: 0, end: -3)
+                gateUpLHSIndices = idx
+            } else {
+                let expertsPerTok = indices.dim(-1)
+                sortedX = expandedX.flattened(start: 0, end: -3)[order.floorDivide(expertsPerTok)]
+            }
+
+            if storesEligible {
+                directStored = true
+            } else {
+                // Stores are off (loads-only combination): down_proj still
+                // writes contiguous sorted-order output, so it still needs
+                // undoing. `order` was already computed above for the
+                // encoded-key sort; this is the same second `argSort`
+                // `gatherSort` always pays, just deferred until we know
+                // stores are off.
+                inverseOrder = argSort(order)
+            }
+        } else {
+            (sortedX, idx, inverseOrder) = gatherSort(x: expandedX, indices: indices)
+        }
     }
     // Fused counterpart of SwitchGLU's separate-bank branch:
     //   xUp = upProj(x, idx, sortedIndices: doSort)
@@ -3656,11 +3840,13 @@ private func lagunaFusedSortedRoutedGateUp(
     // tile-interleaved `fusedWeight`/`fusedScales` bank instead of twice over
     // the separate banks is the fusion; every other argument matches the
     // stock call exactly (group 16, 4-bit, NVFP4, transpose, doSort).
+    // `lhsIndices` is nil except on the direct-gather-loads path above.
     let gateUp = MLX.gatherQuantizedMM(
         sortedX,
         fusedWeight,
         scales: fusedScales,
         biases: nil,
+        lhsIndices: gateUpLHSIndices,
         rhsIndices: idx,
         transpose: true,
         groupSize: 16,
@@ -3684,7 +3870,11 @@ private func lagunaFusedSortedRoutedGateUp(
     var result = downProj(activated, idx, sortedIndices: doSort)
     // SwitchGLU: `if doSort { x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape) }`
     if doSort {
-        result = scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape)
+        if directStored {
+            result = unflattenDirectStored(x: result, shape: indices.shape)
+        } else {
+            result = scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape)
+        }
     }
     // SwitchGLU: `return MLX.squeezed(x, axis: -2)`
     return MLX.squeezed(result, axis: -2)
@@ -3692,6 +3882,14 @@ private func lagunaFusedSortedRoutedGateUp(
 
 final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     let routedScalingFactor: Float
+    /// 0-based ordinal among Laguna's sparse MoE layers only (NOT the
+    /// overall decoder-layer index, which also counts dense layer 0) --
+    /// threaded through from `LagunaRuntimeModel.init`'s layer loop purely
+    /// to drive `DARKBLOOM_DIRECT_LOADS_LAYER_PCT`'s per-layer dial in
+    /// `lagunaFusedSortedRoutedGateUp`. See
+    /// `lagunaDirectLoadsLayerSelected`'s doc comment for why this ordinal
+    /// (not the raw decoder-layer index) is what the dial spreads over.
+    let sparseLayerOrdinal: Int
 
     @ModuleInfo(key: "gate") var gate: LagunaRuntimeMoEGate
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
@@ -3798,8 +3996,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         return [fusedWeight, fusedScales]
     }
 
-    init(_ config: LagunaConfig) {
+    init(_ config: LagunaConfig, sparseLayerOrdinal: Int) {
         self.routedScalingFactor = Float(config.moeRoutedScalingFactor)
+        self.sparseLayerOrdinal = sparseLayerOrdinal
         self._gate.wrappedValue = LagunaRuntimeMoEGate(config)
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
@@ -4010,7 +4209,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     fusedWeight: fusedWeight,
                     fusedScales: fusedScales,
                     split: _fusedRoutedGateUpSplit,
-                    downProj: downProj
+                    downProj: downProj,
+                    sparseLayerOrdinal: sparseLayerOrdinal
                 )
             } else {
                 y = switchMLP(x, inds)
@@ -4079,11 +4279,16 @@ final class LagunaRuntimeDecoderLayer: Module {
 
     let attentionType: LagunaLayerType
 
-    init(_ config: LagunaConfig, layerIdx: Int) {
+    /// `sparseLayerOrdinal`: 0-based ordinal among sparse MoE layers only,
+    /// computed by the caller (`LagunaRuntimeModel.init`'s layer loop) --
+    /// meaningful only when `config.isSparse(layer: layerIdx)`; pass -1 for
+    /// a dense layer, where it is never read. See
+    /// `LagunaRuntimeSparseMoEBlock.sparseLayerOrdinal`'s doc comment.
+    init(_ config: LagunaConfig, layerIdx: Int, sparseLayerOrdinal: Int) {
         self._selfAttn.wrappedValue = LagunaRuntimeAttention(config, layerIdx: layerIdx)
 
         if config.isSparse(layer: layerIdx) {
-            self.mlp = LagunaRuntimeSparseMoEBlock(config)
+            self.mlp = LagunaRuntimeSparseMoEBlock(config, sparseLayerOrdinal: sparseLayerOrdinal)
         } else {
             self.mlp = LagunaRuntimeMLP(
                 dimensions: config.hiddenSize, hiddenDimensions: config.intermediateSize)
@@ -4315,9 +4520,30 @@ final class LagunaRuntimeModelInner: Module {
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabSize, dimensions: config.hiddenSize)
 
-        self._layers.wrappedValue = (0..<config.numHiddenLayers).map {
-            LagunaRuntimeDecoderLayer(config, layerIdx: $0)
+        // `sparseLayerOrdinal` is a 0-based running count over sparse
+        // layers only (skips dense layer 0), threaded down to
+        // `LagunaRuntimeSparseMoEBlock` purely for the
+        // `DARKBLOOM_DIRECT_LOADS_LAYER_PCT` per-layer dial -- see
+        // `lagunaDirectLoadsLayerSelected`'s doc comment. Built with an
+        // explicit loop (rather than `.map` over a captured counter) so the
+        // ordering dependency is visible at the call site.
+        var lagunaLayers: [LagunaRuntimeDecoderLayer] = []
+        lagunaLayers.reserveCapacity(config.numHiddenLayers)
+        var nextSparseLayerOrdinal = 0
+        for layerIdx in 0 ..< config.numHiddenLayers {
+            let isSparseLayer = config.isSparse(layer: layerIdx)
+            lagunaLayers.append(
+                LagunaRuntimeDecoderLayer(
+                    config,
+                    layerIdx: layerIdx,
+                    sparseLayerOrdinal: isSparseLayer ? nextSparseLayerOrdinal : -1
+                )
+            )
+            if isSparseLayer {
+                nextSparseLayerOrdinal += 1
+            }
         }
+        self._layers.wrappedValue = lagunaLayers
         self._norm.wrappedValue = RMSNorm(
             dimensions: config.hiddenSize, eps: Float(config.rmsNormEps))
 
