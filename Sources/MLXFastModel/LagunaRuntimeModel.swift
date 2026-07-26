@@ -119,6 +119,34 @@ let lagunaFusedSharedGateUpEnabled =
 let lagunaFusedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_SWIGLU_QMV"] != "0"
 
+/// `DARKBLOOM_PREFILL_FUSED_SHARED_GATE_UP` (default on; set "0" to restore the
+/// two-dispatch prefill path): lets multi-token forwards reach the retained
+/// row-concatenated `[gate; up]` NVFP4 bank that decode already uses.
+///
+/// The bank is built once and, before this flag, was reachable only under
+/// `x.dim(1) == 1` — so every prefill did two `quantizedMM`s over
+/// `[1024, 2048]` where one over `[2048, 2048]` would do, re-reading `x` twice.
+/// Lifting it saves a dispatch on all 40 sparse layers plus the
+/// `sharedExpert(x)` call inside the prefill MoE tail, and it pays into both
+/// score components: the prefill phase and the 512-token seed prefill charged
+/// to the decode window.
+///
+/// Bit-exact, and by an argument already written in this file for the decode
+/// case: each quantized output row is computed independently, so splitting the
+/// concatenated result reproduces the separate gate/up dispatches exactly. That
+/// argument never mentions row count. Unlike the competitor's kernel lift this
+/// is a stock `MLX.quantizedMM`, so row-generality needs no Metal proof.
+///
+/// The build-time hazard was the two output slices becoming strided views
+/// (`[1, L, 1024]`, row stride 2048) instead of the contiguous `[1, 1, 1024]`
+/// decode gets. **Checked at source, not assumed: `compiled.cpp` contains no
+/// `copy_gpu` on any path** — `Compiled::eval_gpu` collapses what dims it can
+/// and otherwise routes to a `_strided_` kernel variant, so
+/// `compiledSiluProduct` reads the slices in place and materialises nothing.
+/// `downProj` then receives that op's freshly allocated contiguous output.
+let lagunaPrefillFusedSharedGateUpEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_SHARED_GATE_UP"] != "0"
+
 /// Decode-only shared-expert down QMV plus both sparse-block residual adds.
 /// The kernel preserves the stock BF16 down-projection result, the inner
 /// `routed + shared` rounding, and the outer `h + r2` rounding while avoiding
@@ -2004,14 +2032,69 @@ final class LagunaRuntimeAttention: Module {
 
 // MARK: - Dense MLP (also used as the shared expert)
 
-private let lagunaSharedSwiGLUQMVHeader = """
-    static inline float laguna_nvfp4_scale(uint8_t bits) {
-        ushort raw = ushort(bits & 127) << 7;
-        half converted = as_type<half>(raw);
-        converted *= 256.0;
-        half signed_value = (bits & 128) ? -converted : converted;
-        return float(signed_value);
-    }
+/// `DARKBLOOM_NVFP4_SCALE_FOLD` (default on; set "0" to restore the pre-fold
+/// arithmetic): hoists the `2^14` out of `laguna_nvfp4_qdot_16`'s sixteen
+/// per-call multiplies and folds it into the one multiply `laguna_nvfp4_scale`
+/// already performs. **−16 scalar multiplies per `qdot_16` call, −16.5% of the
+/// dequantize ALU, ~−1104 M float multiplies per token across L8 + L9, and
+/// nothing added.**
+///
+/// Bit-exact, and not merely by argument. `16384 == 2^14`, and scaling a binary
+/// float by an exact power of two touches only the exponent field, so every
+/// product, every partial sum and every rounding decision in the accumulator
+/// chain is exactly `2^-14 ×` its old value — same bits, different exponent —
+/// and the `2^14` reappears once in the scale before the single final rounding.
+/// `notes/57` §10b enumerated it rather than trusting that: all 256 scale bytes
+/// × 4 weight patterns × 6 activation vectors × both FMA-contracted and
+/// non-contracted accumulation = **12,288 cases, 0 mismatches**. The only
+/// theoretical risk is a product reaching denormal in the new form but not the
+/// old; first divergence is at `|activation| = 2^-137` against a real range of
+/// `2^-10 … 2^+7`, a margin of 127 binades.
+///
+/// The compiler cannot do this itself: `device.cpp:631` sets
+/// `setFastMathEnabled(false)`, so reassociating `Σ(a·h·2^14)` into
+/// `2^14·Σ(a·h)` is forbidden and all sixteen multiplies really are emitted.
+/// (`device.cpp` is outside `editablePaths`, so the fold is done by hand.)
+///
+/// The flag exists to make this an A/B on ONE binary rather than a contrast
+/// across two — worth having, because between-binary drift on this box
+/// measured 0.93% (`notes/52` §5a) against a lever budgeted at 0.20–0.44%.
+/// MLX's JIT library cache is in-memory and source-keyed
+/// (`custom_kernel.cpp:58-71`) with no on-disk archive, and each process
+/// resolves this flag exactly once, so one kernel name only ever sees one
+/// source and no name bump is required.
+let lagunaNvfp4ScaleFoldEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_FOLD"] != "0"
+
+private let lagunaSharedSwiGLUQMVHeader: String = {
+    // The two halves of one power-of-two regrouping. They MUST move together:
+    // the scale absorbs `2^14` exactly when the weights stop applying it.
+    let scaleFunction =
+        lagunaNvfp4ScaleFoldEnabled
+        ? """
+            static inline float laguna_nvfp4_scale(uint8_t bits) {
+                ushort raw = ushort(bits & 127) << 7;
+                half converted = as_type<half>(raw);
+                half signed_value = (bits & 128) ? -converted : converted;
+                return float(signed_value) * 4194304.0f;
+            }
+        """
+        : """
+            static inline float laguna_nvfp4_scale(uint8_t bits) {
+                ushort raw = ushort(bits & 127) << 7;
+                half converted = as_type<half>(raw);
+                converted *= 256.0;
+                half signed_value = (bits & 128) ? -converted : converted;
+                return float(signed_value);
+            }
+        """
+    // `4194304.0f == 256 · 16384 == 2^22`. The `256` moves out of half and into
+    // float because 4194304 overflows half's 65504 max; that move is itself
+    // exact for all 256 input bytes, since the half value is at most 1.875 and
+    // half denormals scale into normal range losslessly under a power of two.
+    let weightScale = lagunaNvfp4ScaleFoldEnabled ? "" : " * 16384.0f"
+    return """
+    \(scaleFunction)
 
     static inline float laguna_nvfp4_qdot_16(
         const device uint8_t* weight,
@@ -2031,10 +2114,10 @@ private let lagunaSharedSwiGLUQMVHeader = """
                 ((c & 0x07000700u) << 1) | ((c & 0x08000800u) << 4);
             const uint p3 =
                 ((c & 0x70007000u) >> 3) | (c & 0x80008000u);
-            const float2 v04 = float2(as_type<half2>(p0)) * 16384.0f;
-            const float2 v15 = float2(as_type<half2>(p1)) * 16384.0f;
-            const float2 v26 = float2(as_type<half2>(p2)) * 16384.0f;
-            const float2 v37 = float2(as_type<half2>(p3)) * 16384.0f;
+            const float2 v04 = float2(as_type<half2>(p0))\(weightScale);
+            const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
+            const float2 v26 = float2(as_type<half2>(p2))\(weightScale);
+            const float2 v37 = float2(as_type<half2>(p3))\(weightScale);
             accum +=
                 (input[8 * j] * v04.x +
                  input[8 * j + 1] * v15.x +
@@ -2049,6 +2132,7 @@ private let lagunaSharedSwiGLUQMVHeader = """
         return scale * accum;
     }
     """
+}()
 
 private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
     name: "laguna_shared_nvfp4_swiglu_qmv_bf16_v1",
@@ -3372,8 +3456,11 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if x.dim(1) == 1,
-            let fusedWeight = _fusedGateUpWeight, let fusedScales = _fusedGateUpScales
+        // The custom QMV kernel below stays decode-only — its own
+        // `x.shape == [1, 1, hidden]` guard pins that — but the stock fused
+        // bank underneath it is row-general, so prefill may reach it too.
+        if let fusedWeight = _fusedGateUpWeight, let fusedScales = _fusedGateUpScales,
+            x.dim(1) == 1 || lagunaPrefillFusedSharedGateUpEnabled
         {
             if lagunaFusedSharedSwiGLUQMVEnabled,
                 x.dtype == .bfloat16,
@@ -3397,7 +3484,9 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             // group 16, 4-bit, .nvfp4, no affine biases, no bias add; the
             // guards in `prepareFusedSharedGateUp` pin those literals). Each
             // quantized output row is computed independently, so the split
-            // halves are bit-exact vs. the separate gate/up dispatches.
+            // halves are bit-exact vs. the separate gate/up dispatches — an
+            // argument that holds for any row count, which is what makes the
+            // prefill lift free.
             lagunaTrace("shared fused [gate; up] bank QMM")
             let gateUp = MLX.quantizedMM(
                 x,
