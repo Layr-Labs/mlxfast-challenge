@@ -3687,13 +3687,21 @@ private let lagunaPrefillRouterTop8Enabled =
 private let lagunaPrefillMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_MOE_TAIL"] != "0"
 
-/// Default-off probe: keep the routed down projection in expert-sorted order
+/// Keep the routed down projection in expert-sorted order
 /// and let the fused MoE tail gather each original `(token, slot)` row through
 /// `gatherSort`'s already-computed inverse permutation. This removes
 /// `scatterUnsort`'s full expert-bank copy without changing the eight-slot
 /// weighted reduction order.
 private let lagunaPrefillSortedMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_SORTED_MOE_TAIL"] != "0"
+
+/// `gatherSort`'s second `argSort` does not sort arbitrary
+/// data. Its input is the first sort's `uint32` permutation, so its result can
+/// be produced in one linear scatter (`inverse[order[i]] = i`) instead of a
+/// second stable merge sort. The first sort, and therefore all expert tie
+/// ordering, remains unchanged.
+private let lagunaLinearInversePermutationEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LINEAR_INVERSE_PERMUTATION"] != "0"
 
 /// Batched top-8 selection for multi-token (prefill) routing.
 ///
@@ -4278,6 +4286,87 @@ private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Finish `gatherSort`'s three coordinate transforms in one linear dispatch:
+/// gather the expert IDs into stable sorted order, derive each routed token
+/// row, and invert the permutation. Every inverse destination is written
+/// exactly once because `order` comes directly from MLX `argSort`.
+private let lagunaRouteCoordinatesKernel = MLXFast.metalKernel(
+    name: "laguna_route_coordinates_u32_v1",
+    inputNames: ["order", "indices"],
+    outputNames: ["sorted_indices", "token_rows", "inverse_order"],
+    source: """
+        uint i = thread_position_in_grid.x;
+        uint source = order[i];
+        uint routes_per_token =
+            uint(indices_shape[indices_ndim - 1]);
+        sorted_indices[i] = indices[source];
+        token_rows[i] = source / routes_per_token;
+        inverse_order[source] = i;
+        """,
+    ensureRowContiguous: true
+)
+
+/// Internal for focused runtime tests. `order` must be a one-dimensional
+/// permutation of the flattened `indices` coordinates.
+func lagunaRouteCoordinates(
+    order: MLXArray,
+    indices: MLXArray
+) -> (sortedIndices: MLXArray, tokenRows: MLXArray, inverseOrder: MLXArray) {
+    precondition(order.dtype == .uint32)
+    precondition(order.ndim == 1)
+    precondition(order.size > 0)
+    // MLXFast's launch configuration stores each grid dimension as Int32.
+    precondition(UInt64(order.size) <= UInt64(Int32.max))
+    precondition(indices.dtype == .uint32)
+    precondition(indices.ndim > 0)
+    precondition(indices.size == order.size)
+    precondition(indices.dim(-1) > 0)
+
+    let outputs = lagunaRouteCoordinatesKernel(
+        [order, indices],
+        grid: (order.size, 1, 1),
+        threadGroup: (min(order.size, 256), 1, 1),
+        outputShapes: [order.shape, order.shape, order.shape],
+        outputDTypes: [.uint32, .uint32, .uint32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
+/// `gatherSort` with an optional O(n) inverse-permutation construction.
+/// The fallback is the upstream implementation verbatim. The optimized path
+/// preserves its first stable `argSort`, flattened indexing and `uint32`
+/// inverse dtype; it changes only how the inverse of the known permutation is
+/// computed.
+private func lagunaGatherSort(
+    x: MLXArray,
+    indices: MLXArray
+) -> (MLXArray, MLXArray, MLXArray) {
+    guard lagunaLinearInversePermutationEnabled else {
+        return gatherSort(x: x, indices: indices)
+    }
+
+    let m = indices.dim(-1)
+    let flattenedIndices = indices.flattened()
+    let order = argSort(flattenedIndices)
+    guard order.dtype == .uint32, order.ndim == 1, order.size > 0,
+        UInt64(order.size) <= UInt64(Int32.max)
+    else {
+        return (
+            x.flattened(start: 0, end: -3)[order.floorDivide(m)],
+            flattenedIndices[order],
+            argSort(order)
+        )
+    }
+
+    let coordinates = lagunaRouteCoordinates(order: order, indices: indices)
+
+    return (
+        x.flattened(start: 0, end: -3)[coordinates.tokenRows],
+        coordinates.sortedIndices,
+        coordinates.inverseOrder
+    )
+}
+
 private func lagunaPrefillMoETail(
     expertOutputs: MLXArray,
     routerWeights: MLXArray,
@@ -4391,7 +4480,7 @@ private func lagunaFusedSortedRoutedGateUp(
     var inverseOrder = MLXArray()
     // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
     if doSort {
-        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        (sortedX, idx, inverseOrder) = lagunaGatherSort(x: sortedX, indices: indices)
     }
     // Fused counterpart of SwitchGLU's separate-bank branch:
     //   xUp = upProj(x, idx, sortedIndices: doSort)
