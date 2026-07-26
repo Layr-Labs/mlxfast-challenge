@@ -144,18 +144,27 @@ template <
   constexpr short kU = 16;
 
   constexpr int kNWarps = WM * WN;
+  // Laguna's BQ64/BD128 prefill kernel carries four one-chain simdgroups.
+  // Pair the rows onto two active simdgroups instead: each owns two
+  // independent 16-row chains and can reuse every K/V fragment between them
+  // in registers. The two inactive simdgroups remain in the threadgroup only
+  // because the trusted host dispatch geometry is outside the editable
+  // surface; they participate in uniform barriers but issue no hot-path work.
+  constexpr int kActiveWarps =
+      (BQ == 64 && BD == 128 && WM == 4 && WN == 1) ? 2 : kNWarps;
   static_assert(
-      BQ >= (kNWarps * kU) && BQ % (kNWarps * kU) == 0,
+      BQ >= (kActiveWarps * kU) && BQ % (kActiveWarps * kU) == 0,
       "Each simdgroup must host atleast 1 simdgroup matrix along Q sequence.");
 
   // Q seq frags per warp
-  constexpr int TQ = BQ / (kNWarps * kU);
+  constexpr int TQ = BQ / (kActiveWarps * kU);
   // HeadDim frags (all warps load the same frags)
   constexpr int TD = BD / kU;
   // KV seq frags per warp
   constexpr short TK = BK / kU;
 
-  static_assert(TQ == 1, "Check TQ");
+  static_assert(TQ == 1 || TQ == 2, "Check TQ");
+  const bool active_warp = simd_group_id < kActiveWarps;
   using otile_t = NAXTile<AccumType, TQ, TD>;
   otile_t Otile;
 
@@ -263,21 +272,26 @@ template <
   // is shared between registers and threadgroup memory.
   typename NAXTile<T, 1, 1>::frag_type Qhoist[TQ * TD];
 
-  STEEL_PRAGMA_UNROLL
-  for (short iq = 0; iq < TQ; iq++) {
+  if (active_warp) {
     STEEL_PRAGMA_UNROLL
-    for (short id = 0; id < TD; id++) {
-      NAXTile<T, 1, 1> Qstage;
-      const int Q_load_off = iq * kU * int(params->Q_strides[2]) + id * kU;
+    for (short iq = 0; iq < TQ; iq++) {
+      STEEL_PRAGMA_UNROLL
+      for (short id = 0; id < TD; id++) {
+        NAXTile<T, 1, 1> Qstage;
+        const int Q_load_off =
+            iq * kU * int(params->Q_strides[2]) + id * kU;
 
-      if (!align_Q && is_last_q) {
-        Qstage.load_rows(
-            Q + Q_load_off, int(params->Q_strides[2]), lim_rows_q - iq * kU);
-      } else {
-        Qstage.load(Q + Q_load_off, int(params->Q_strides[2]));
+        if (!align_Q && is_last_q) {
+          Qstage.load_rows(
+              Q + Q_load_off,
+              int(params->Q_strides[2]),
+              lim_rows_q - iq * kU);
+        } else {
+          Qstage.load(Q + Q_load_off, int(params->Q_strides[2]));
+        }
+
+        Qhoist[iq * TD + id] = Qstage.frag_at(0, 0);
       }
-
-      Qhoist[iq * TD + id] = Qstage.frag_at(0, 0);
     }
   }
 #endif
@@ -295,38 +309,38 @@ template <
     // Causal elision: guard the score computation and the zero P@V work, but
     // never a barrier or the outer-loop pointer advance. See the sg_kb_lim
     // comment above for the exactness argument.
-    const bool sg_active = kb < sg_kb_lim;
+    const bool sg_active = active_warp && kb < sg_kb_lim;
     if (sg_active) {
 
     STEEL_PRAGMA_UNROLL
-    for (short iq = 0; iq < TQ; iq++) {
+    for (short ik = 0; ik < TK; ik += 2) {
       STEEL_PRAGMA_UNROLL
-      for (short ik = 0; ik < TK; ik += 2) {
-        STEEL_PRAGMA_UNROLL
-        for (short id = 0; id < TD; id++) {
-          NAXTile<T, 1, 1> Qtile;
-          NAXTile<T, 2, 1> Ktile;
+      for (short id = 0; id < TD; id++) {
+        NAXTile<T, 2, 1> Ktile;
+        const int K_load_off =
+            ik * kU * int(params->K_strides[2]) + id * kU;
 
-#if !DARKBLOOM_ATTN_QHOIST
-          const int Q_load_off = iq * kU * int(params->Q_strides[2]) + id * kU;
-#endif
-          const int K_load_off = ik * kU * int(params->K_strides[2]) + id * kU;
+        if (!align_K && is_last_k) {
+          Ktile.load_rows(
+              K + K_load_off,
+              int(params->K_strides[2]),
+              lim_rows_k - ik * kU);
+        } else {
+          Ktile.load(K + K_load_off, int(params->K_strides[2]));
+        }
+
+        // Issue the independent Q chains back-to-back against one shared K
+        // fragment. Each score accumulator still sees id=0...TD-1 in the
+        // stock order, so no floating-point operation is reassociated.
+        STEEL_PRAGMA_UNROLL
+        for (short iq = 0; iq < TQ; iq++) {
+          NAXTile<T, 1, 1> Qtile;
 
 #if DARKBLOOM_ATTN_QHOIST
-          // Q is loop-invariant: the kb loop advances K and V but never Q, so
-          // the load in the #else branch re-read the same addresses on every
-          // one of the ~9 K-block iterations. Consume the fragment staged
-          // before the loop instead.
-          //
-          // EXACTNESS: the staged load used the same base pointer, the same
-          // Q_load_off, the same stride and the same bounds predicate, so the
-          // bits in Qhoist are the bits this load would have returned. The mma
-          // below consumes them in the identical order. NO FLOAT ARITHMETIC IS
-          // TOUCHED AT ALL -- nothing is reassociated, no accumulation order
-          // changes, no rounding boundary moves. The only difference is WHEN
-          // the device read happened.
           Qtile.frag_at(0, 0) = Qhoist[iq * TD + id];
 #else
+          const int Q_load_off =
+              iq * kU * int(params->Q_strides[2]) + id * kU;
           if (!align_Q && is_last_q) {
             Qtile.load_rows(
                 Q + Q_load_off,
@@ -336,15 +350,6 @@ template <
             Qtile.load(Q + Q_load_off, int(params->Q_strides[2]));
           }
 #endif
-
-          if (!align_K && is_last_k) {
-            Ktile.load_rows(
-                K + K_load_off,
-                int(params->K_strides[2]),
-                lim_rows_k - ik * kU);
-          } else {
-            Ktile.load(K + K_load_off, int(params->K_strides[2]));
-          }
 
           stile_t::NAXFrag_t::mma(
               Stile.frag_at(iq, ik),
@@ -529,21 +534,19 @@ template <
 
     // Do O = P @ V
     STEEL_PRAGMA_UNROLL
-    for (short iq = 0; iq < TQ; iq++) {
-      STEEL_PRAGMA_UNROLL
-      for (short id = 0; id < TD; id += 2) {
-        if constexpr (BD == 128) {
-          if (id == 4) {
-            threadgroup_barrier(mem_flags::mem_none);
-          }
+    for (short id = 0; id < TD; id += 2) {
+      if constexpr (BD == 128) {
+        if (id == 4) {
+          threadgroup_barrier(mem_flags::mem_none);
         }
+      }
 
-        STEEL_PRAGMA_UNROLL
-        for (short ik = 0; ik < TK; ik++) {
-          if (sg_active) {
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        if (sg_active) {
           NAXTile<T, 1, 2> Vtile;
-
-          const int V_load_off = ik * kU * int(params->V_strides[2]) + id * kU;
+          const int V_load_off =
+              ik * kU * int(params->V_strides[2]) + id * kU;
 
           if (!align_K && is_last_k) {
             Vtile.load_rows(
@@ -554,14 +557,18 @@ template <
             Vtile.load(V + V_load_off, int(params->V_strides[2]));
           }
 
-          otile_t::NAXFrag_t::mma(
-              Otile.frag_at(iq, id),
-              Otile.frag_at(iq, id + 1),
-              Stile.frag_at(iq, ik),
-              metal::false_type{},
-              Vtile.frag_at(0, 0),
-              Vtile.frag_at(0, 1),
-              metal::false_type{});
+          // Reuse the V fragment across both chains. For each output
+          // accumulator, ik still advances in the exact stock order.
+          STEEL_PRAGMA_UNROLL
+          for (short iq = 0; iq < TQ; iq++) {
+            otile_t::NAXFrag_t::mma(
+                Otile.frag_at(iq, id),
+                Otile.frag_at(iq, id + 1),
+                Stile.frag_at(iq, ik),
+                metal::false_type{},
+                Vtile.frag_at(0, 0),
+                Vtile.frag_at(0, 1),
+                metal::false_type{});
           }
         }
       }
@@ -575,6 +582,10 @@ template <
   // Normalize output
 
   threadgroup_barrier(mem_flags::mem_none);
+
+  if (!active_warp) {
+    return;
+  }
 
   metal::vec<AccumType, kRowsPT> rcp;
   STEEL_PRAGMA_UNROLL
