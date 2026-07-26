@@ -2063,10 +2063,12 @@ func lagunaRoutedSwiGLUQMV(
 /// independent of each other, so MLX issues them into the same barrier group
 /// anyway. Merging them into one nine-slot dispatch (slots 0-7 routed, slot 8
 /// shared) removes one dispatch per sparse layer without touching either
-/// slot's arithmetic: a threadgroup does exactly the work it did before, over
-/// the same bank, in the same order.
+/// slot's arithmetic. One SIMD group owns all four output rows in a tile so
+/// the 2048-element activation is loaded once per tile instead of once by
+/// each of two SIMD groups; every individual row retains the same four-block
+/// accumulation and reduction order.
 private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_v2",
+    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_v3",
     inputNames: [
         "input", "routed_weight", "routed_scales", "indices",
         "shared_weight", "shared_scales",
@@ -2084,6 +2086,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
         constexpr uint values_per_lane = 16;
         constexpr uint tiles_per_expert = 128;
         constexpr uint routed_experts = 8;
+        constexpr uint outputs_per_simd = 4;
 
         // Preserve each expert tile's arithmetic and output address while
         // exposing all eight routed banks plus the shared bank in each
@@ -2092,9 +2095,8 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
         uint expert_slot = group % (routed_experts + 1);
         uint tile = group / (routed_experts + 1);
         bool is_routed = expert_slot < routed_experts;
-        uint simd_group = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
-        uint first_row = tile * 4 + simd_group * 2;
+        uint first_row = tile * outputs_per_simd;
 
         const device uint8_t* expert_weight;
         const device uint8_t* expert_scales;
@@ -2109,8 +2111,12 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             expert_scales = shared_scales;
         }
 
-        thread float gate_result[2] = {0.0f, 0.0f};
-        thread float up_result[2] = {0.0f, 0.0f};
+        thread float gate_result[outputs_per_simd] = {
+            0.0f, 0.0f, 0.0f, 0.0f
+        };
+        thread float up_result[outputs_per_simd] = {
+            0.0f, 0.0f, 0.0f, 0.0f
+        };
         thread float input_values[values_per_lane];
 
         for (uint block = 0; block < input_width; block += block_width) {
@@ -2125,7 +2131,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
                 input_values[4 * i + 3] = values[3];
             }
 
-            for (uint row = 0; row < 2; ++row) {
+            for (uint row = 0; row < outputs_per_simd; ++row) {
                 uint logical_row = first_row + row;
                 uint gate_row;
                 uint up_row;
@@ -2161,7 +2167,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             }
         }
 
-        for (uint row = 0; row < 2; ++row) {
+        for (uint row = 0; row < outputs_per_simd; ++row) {
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
             if (lane == 0) {
@@ -2229,8 +2235,8 @@ func lagunaRoutedSharedSwiGLUQMV(
     lagunaTrace("routed+shared gate/up QMV")
     let outputs = lagunaRoutedSharedSwiGLUQMVKernel(
         [input, routedWeight, routedScales, indices, sharedWeight, sharedScales],
-        grid: ((LagunaConstants.numExpertsPerTok + 1) * 128 * 64, 1, 1),
-        threadGroup: (64, 1, 1),
+        grid: ((LagunaConstants.numExpertsPerTok + 1) * 128 * 32, 1, 1),
+        threadGroup: (32, 1, 1),
         outputShapes: [
             [
                 1, 1, LagunaConstants.numExpertsPerTok, 1,
