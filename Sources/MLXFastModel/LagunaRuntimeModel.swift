@@ -308,22 +308,23 @@ let lagunaFusedDenseGateUpSwiGLUEnabled =
 let lagunaFusedDenseDownResidualEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_DENSE_DOWN_RESIDUAL"] != "0"
 
-/// `DARKBLOOM_DECODE_ASYNC_STAGE` (default `33`): process-once stage selector
-/// for decode-step async scheduling. Active only when the invocation input
-/// shape is exactly `[1, 1]`; prefill and multi-token shapes are never
-/// asyncEval'd. Layer 33 is the measured first rung: Metal begins the existing
-/// graph while Swift constructs layers 34-39, final RMSNorm, and the head.
-/// `off`/`0` disables it; `30`, `36`, `39`, `norm`, and `logits` remain
-/// process-once ablation points. No operation, cache row, or token is added.
+/// `DARKBLOOM_DECODE_ASYNC_STAGE` (default `20,33`): process-once stage selector
+/// for decode-step async scheduling. The promoted layer-33 rung remains the
+/// second boundary; layer 20 starts the same current-token graph earlier so
+/// Metal can overlap the middle decode layers with Swift graph construction.
+/// Active only for exact `[1, 1]` inputs. `33` isolates the promoted control;
+/// `off`/`0` disables all boundaries. No operation, cache row, or token is
+/// added, and prefill/multi-token paths are never asyncEval'd.
 private enum LagunaDecodeAsyncStage {
     case off
     case layer(Int)
+    case layers(Int, Int)
     case norm
     case logits
 }
 
 private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
-    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?.lowercased() ?? "33"
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?.lowercased() ?? "20,33"
     switch raw {
     case "off", "0", "":
         return .off
@@ -331,8 +332,10 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
         return .norm
     case "logits":
         return .logits
+    case "20,33":
+        return .layers(20, 33)
     default:
-        if let index = Int(raw), [30, 33, 36, 39].contains(index) {
+        if let index = Int(raw), [20, 30, 33, 36, 39].contains(index) {
             return .layer(index)
         }
         return .off
@@ -4530,6 +4533,11 @@ final class LagunaRuntimeModelInner: Module {
                     if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
                         asyncEval(h)
                     }
+                    if case .layers(let first, let second) = lagunaDecodeAsyncStage,
+                        (first == i || second == i), inputs.shape == [1, 1]
+                    {
+                        asyncEval(h)
+                    }
                 }
             } else {
                 h = layer(
@@ -4539,6 +4547,11 @@ final class LagunaRuntimeModelInner: Module {
                     qkRoPEAngles: qkRoPEAngles
                 )
                 if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
+                    asyncEval(h)
+                }
+                if case .layers(let first, let second) = lagunaDecodeAsyncStage,
+                    (first == i || second == i), inputs.shape == [1, 1]
+                {
                     asyncEval(h)
                 }
             }
