@@ -3273,22 +3273,20 @@ private let lagunaDecodeRouterCastSinkEnabled =
 private let lagunaDecodeRouterNormSinkEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTER_NORM"] != "0"
 
-/// Prefill counterpart of the fused decode router: one dispatch per sparse
-/// layer replaces the stock multi-token routing chain (FP32 cast, sigmoid,
-/// correction-bias add, negate, `argPartition`'s full 256-wide merge argsort,
-/// the top-8 slice, `takeAlong`, and — when `norm_topk_prob` is set — the
-/// row sum and broadcast divide).
+/// Experimental prefill counterpart of the fused decode router. Each SIMD
+/// group first retains its local top eight, then the first two SIMD groups
+/// sort the resulting 64-candidate union. The global top eight must occur in
+/// that union, so this replaces the stock cast/sigmoid/argsort/gather/reduce
+/// chain without the rejected predecessor-count kernel's O(256^2) work.
 ///
-/// DEFAULT OFF: submission `fe01af9` shipped this together with the prefill
-/// MoE tail and ranked **-0.68%** against its own base (1.11254 vs 1.12019).
-/// The per-lane predecessor-count selection is ~10x the ALU of the batched
-/// merge sort it replaced, and at 512 rows the stock sort amortizes to a few
-/// microseconds per layer — there was nothing to save, only kernel shape to
-/// lose. Kept behind `DARKBLOOM_PREFILL_ROUTER_TOP8=1` because the
-/// bit-exactness argument (Metal `ArgPartition` IS the stable merge argsort)
-/// is verified and useful.
-private let lagunaPrefillRouterTop8Enabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ROUTER_TOP8"] == "1"
+/// Default ON after byte-exact GPU A/B checks over smooth, all-tie and
+/// saturated rows at arbitrary lengths, plus two 24-pair alternating M=512
+/// probes: 429.8 -> 274.5 us and 439.0 -> 289.3 us for the complete router
+/// postprocess (1.566x and 1.517x). Set
+/// `DARKBLOOM_PREFILL_ROUTER_TOURNAMENT=0` to ablate.
+private let lagunaPrefillRouterTournamentEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_ROUTER_TOURNAMENT"] != "0"
 
 /// Prefill MoE tail fusion: the weighted expert-output combine, the fixed
 /// 2.5 routed scale, the shared-expert add and the residual add collapse
@@ -3299,7 +3297,7 @@ private let lagunaPrefillRouterTop8Enabled =
 private let lagunaPrefillMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_MOE_TAIL"] != "0"
 
-/// Batched top-8 selection for multi-token (prefill) routing.
+/// Hierarchical batched top-8 selection for multi-token (prefill) routing.
 ///
 /// Exactness against the stock chain it replaces, per row:
 ///  * The sigmoid is the same numerically-stable form the FP32 `sigmoid`
@@ -3309,95 +3307,186 @@ private let lagunaPrefillMoETailEnabled =
 ///    exactly: on Metal `ArgPartition::eval_gpu` IS `gpu_merge_sort`
 ///    (sort.cpp routes it to the same stable merge argsort as `argSort`), so
 ///    the stock "partition" is a fully sorted row. `laguna_router_key_before`
-///    is a strict total order (choice key, then original expert index, with
-///    the sort's NaN placement), so counting predecessors gives every expert
-///    a unique rank equal to its stable-argsort position; ranks 0..<8 emit in
-///    rank order, which is byte-identical to the stock argsort slice.
+///    supplies that identical strict total order (choice key, then original
+///    expert index, including NaN placement).
+///  * The global top eight are contained in the union of each disjoint
+///    32-expert block's local top eight. Sorting those 64 candidates therefore
+///    emits the same first eight entries, in the same order, as sorting all
+///    256 experts.
 ///  * Mixture weights are the pre-bias sigmoid scores of the selected
 ///    experts, exactly `takeAlong(scores, inds)`.
 ///  * The normalizing epilogue reproduces `weights.sum(axis: -1)` (an
 ///    8-element `row_reduce_small` walked in index order from zero) and the
 ///    IEEE FP32 broadcast divide — the same two dispatches the decode norm
 ///    sink already replaces, one row at a time.
-private func lagunaPrefillRouterTop8KernelSource(normalizing: Bool) -> String {
-    let epilogue =
-        normalizing
-        ? """
-                float total = 0.0f;
-                for (uint i = 0; i < 8; ++i) {
-                    total = selected_scores[i] + total;
-                }
-                router_scores[row * 8 + lane] = selected_scores[lane] / total;
-        """
-        : """
-                router_scores[row * 8 + lane] = selected_scores[lane];
-        """
-    return """
+private let lagunaPrefillRouterTournamentKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_router_top8_tournament_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: """
         uint lane = thread_position_in_threadgroup.x;
+        uint simd_lane = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
         uint row = threadgroup_position_in_grid.y;
 
-        threadgroup float choice_keys[256];
-        threadgroup float selected_scores[8];
+        threadgroup float candidate_keys[64];
+        threadgroup uint candidate_indices[64];
+        threadgroup float candidate_scores[64];
 
         float x = float(logits[row * 256 + lane]);
         float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
-        float score = x < 0.0f ? y : 1.0f - y;
-        float corrected = score + float(correction_bias[lane]);
-        float my_key = -corrected;
-        choice_keys[lane] = my_key;
+        float my_score = x < 0.0f ? y : 1.0f - y;
+        float my_key = -(my_score + float(correction_bias[lane]));
+        uint my_index = lane;
+
+        // Stage 1: eight independent stable 32-way sorts. All exchanges stay
+        // within one SIMD group, so every stage is a register shuffle.
+        for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
+            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+                float other_key =
+                    simd_shuffle_xor(my_key, ushort(stride));
+                uint other_index =
+                    simd_shuffle_xor(my_index, ushort(stride));
+                float other_score =
+                    simd_shuffle_xor(my_score, ushort(stride));
+
+                bool is_lower = (simd_lane & stride) == 0;
+                float a_key = is_lower ? my_key : other_key;
+                uint a_index = is_lower ? my_index : other_index;
+                float a_score = is_lower ? my_score : other_score;
+                float b_key = is_lower ? other_key : my_key;
+                uint b_index = is_lower ? other_index : my_index;
+                float b_score = is_lower ? other_score : my_score;
+
+                bool lower_wants_better = (simd_lane & sequence) == 0;
+                bool b_before_a = laguna_router_key_before(
+                    b_key, b_index, a_key, a_index);
+                bool a_before_b = laguna_router_key_before(
+                    a_key, a_index, b_key, b_index);
+                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                if (swap) {
+                    my_key = is_lower ? b_key : a_key;
+                    my_index = is_lower ? b_index : a_index;
+                    my_score = is_lower ? b_score : a_score;
+                }
+            }
+        }
+
+        if (simd_lane < 8) {
+            uint candidate = simd_group * 8 + simd_lane;
+            candidate_keys[candidate] = my_key;
+            candidate_indices[candidate] = my_index;
+            candidate_scores[candidate] = my_score;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Stable-argsort rank by predecessor count under the strict total
-        // order (key, then original index). Ranks are a permutation of
-        // 0..255, so the eight winners land in distinct output slots in
-        // exactly the stock argsort-slice order.
-        uint rank = 0;
-        for (uint j = 0; j < 256; ++j) {
-            rank += laguna_router_key_before(
-                choice_keys[j], j, my_key, lane) ? 1 : 0;
+        // Stage 2: sort the 64 local winners. The first two complete SIMD
+        // groups own all candidates. Twenty stages remain register shuffles;
+        // only stride 32 crosses the group boundary and uses threadgroup
+        // memory. Every thread executes both barriers in that stage.
+        if (lane < 64) {
+            my_key = candidate_keys[lane];
+            my_index = candidate_indices[lane];
+            my_score = candidate_scores[lane];
         }
-        if (rank < 8) {
-            router_indices[row * 8 + rank] = lane;
-            selected_scores[rank] = score;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (lane < 8) {
-        \(epilogue)
-        }
-        """
-}
+        for (uint sequence = 2; sequence <= 64; sequence <<= 1) {
+            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+                if (stride < 32) {
+                    if (lane < 64) {
+                        float other_key =
+                            simd_shuffle_xor(my_key, ushort(stride));
+                        uint other_index =
+                            simd_shuffle_xor(my_index, ushort(stride));
+                        float other_score =
+                            simd_shuffle_xor(my_score, ushort(stride));
 
-private let lagunaPrefillRouterTop8Kernel = MLXFast.metalKernel(
-    name: "laguna_prefill_router_top8_v1",
-    inputNames: ["logits", "correction_bias"],
-    outputNames: ["router_indices", "router_scores"],
-    source: lagunaPrefillRouterTop8KernelSource(normalizing: false),
+                        bool is_lower = (lane & stride) == 0;
+                        float a_key = is_lower ? my_key : other_key;
+                        uint a_index = is_lower ? my_index : other_index;
+                        float a_score = is_lower ? my_score : other_score;
+                        float b_key = is_lower ? other_key : my_key;
+                        uint b_index = is_lower ? other_index : my_index;
+                        float b_score = is_lower ? other_score : my_score;
+
+                        bool lower_wants_better = (lane & sequence) == 0;
+                        bool b_before_a = laguna_router_key_before(
+                            b_key, b_index, a_key, a_index);
+                        bool a_before_b = laguna_router_key_before(
+                            a_key, a_index, b_key, b_index);
+                        bool swap =
+                            lower_wants_better ? b_before_a : a_before_b;
+                        if (swap) {
+                            my_key = is_lower ? b_key : a_key;
+                            my_index = is_lower ? b_index : a_index;
+                            my_score = is_lower ? b_score : a_score;
+                        }
+                    }
+                } else {
+                    if (lane < 64) {
+                        candidate_keys[lane] = my_key;
+                        candidate_indices[lane] = my_index;
+                        candidate_scores[lane] = my_score;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (lane < 64) {
+                        uint partner = lane ^ stride;
+                        float other_key = candidate_keys[partner];
+                        uint other_index = candidate_indices[partner];
+                        float other_score = candidate_scores[partner];
+
+                        bool is_lower = (lane & stride) == 0;
+                        float a_key = is_lower ? my_key : other_key;
+                        uint a_index = is_lower ? my_index : other_index;
+                        float a_score = is_lower ? my_score : other_score;
+                        float b_key = is_lower ? other_key : my_key;
+                        uint b_index = is_lower ? other_index : my_index;
+                        float b_score = is_lower ? other_score : my_score;
+
+                        bool lower_wants_better = (lane & sequence) == 0;
+                        bool b_before_a = laguna_router_key_before(
+                            b_key, b_index, a_key, a_index);
+                        bool a_before_b = laguna_router_key_before(
+                            a_key, a_index, b_key, b_index);
+                        bool swap =
+                            lower_wants_better ? b_before_a : a_before_b;
+                        if (swap) {
+                            my_key = is_lower ? b_key : a_key;
+                            my_index = is_lower ? b_index : a_index;
+                            my_score = is_lower ? b_score : a_score;
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+            }
+        }
+
+        // All 32 lanes of SIMD group zero execute each shuffle. The ordered
+        // left fold is byte-identical to MLX's eight-element row reduction.
+        if (lane < 32) {
+            float total = 0.0f;
+            for (uint i = 0; i < 8; ++i) {
+                total = simd_shuffle(my_score, ushort(i)) + total;
+            }
+            if (lane < 8) {
+                router_indices[row * 8 + lane] = my_index;
+                router_scores[row * 8 + lane] = my_score / total;
+            }
+        }
+        """,
     header: lagunaDecodeRouterTop8Header,
     ensureRowContiguous: true
 )
 
-private let lagunaPrefillRouterTop8NormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_router_top8_norm_v1",
-    inputNames: ["logits", "correction_bias"],
-    outputNames: ["router_indices", "router_scores"],
-    source: lagunaPrefillRouterTop8KernelSource(normalizing: true),
-    header: lagunaDecodeRouterTop8Header,
-    ensureRowContiguous: true
-)
-
-private func lagunaPrefillRouterTop8(
-    logits: MLXArray, correctionBias: MLXArray, rows: Int, normalizing: Bool
+private func lagunaPrefillRouterTournament(
+    logits: MLXArray, correctionBias: MLXArray, rows: Int
 ) -> (MLXArray, MLXArray) {
     precondition(logits.dtype == .bfloat16 || logits.dtype == .float32)
     precondition(correctionBias.dtype == .float32)
     precondition(logits.size == rows * 256)
     precondition(correctionBias.size == 256)
 
-    let kernel =
-        normalizing
-        ? lagunaPrefillRouterTop8NormalizingKernel : lagunaPrefillRouterTop8Kernel
-    let outputs = kernel(
+    let outputs = lagunaPrefillRouterTournamentKernel(
         [logits, correctionBias],
         grid: (256, rows, 1),
         threadGroup: (256, 1, 1),
@@ -3435,8 +3524,9 @@ final class LagunaRuntimeMoEGate: Module {
         let projectedLogits = logits ?? x.matmul(weight.T)
         let inds: MLXArray
         var weights: MLXArray
-        if lagunaPrefillRouterTop8Enabled,
+        if lagunaPrefillRouterTournamentEnabled,
             routerLogitSoftcapping == 0,
+            normTopkProb,
             topK == 8,
             projectedLogits.dtype == .bfloat16,
             projectedLogits.ndim == 3,
@@ -3445,12 +3535,11 @@ final class LagunaRuntimeMoEGate: Module {
             projectedLogits.dim(2) == 256,
             eScoreCorrectionBias.size == 256
         {
-            lagunaTrace("prefill router top8")
-            return lagunaPrefillRouterTop8(
+            lagunaTrace("prefill router top8 tournament")
+            return lagunaPrefillRouterTournament(
                 logits: projectedLogits,
                 correctionBias: eScoreCorrectionBias.asType(.float32),
-                rows: projectedLogits.dim(1),
-                normalizing: normTopkProb
+                rows: projectedLogits.dim(1)
             )
         }
         if lagunaDecodeRouterTop8Enabled,
