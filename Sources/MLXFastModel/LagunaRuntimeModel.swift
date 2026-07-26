@@ -354,6 +354,72 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     }
 }()
 
+/// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `8`; integer stride, "0" or any
+/// invalid value disables -- stock single-eval-at-the-end behavior fully
+/// intact): the prefill-forward analog of `lagunaDecodeAsyncStage`'s
+/// `.ladder` case, left untouched by both `DARKBLOOM_DECODE_ASYNC_STAGE`
+/// rungs (b3889ed8's single layer-33 boundary, then the streaming ladder
+/// that generalized it) -- both restricted themselves to exact `[1, 1]`
+/// decode steps and explicitly left prefill's graph-construction-before-
+/// first-eval shape untouched.
+///
+/// The scored prefill forward (512 tokens) -- and the whole-prompt "seed"
+/// forward `decode_begin` also issues, charged to the decode metric per
+/// `LagunaRuntimeWorker.swift`'s comment on why -- builds its full lazy
+/// graph (every sparse layer's router, sorts, gather-QMMs, SwiGLU, down
+/// projection and finalization -- roughly 15-25 ops each, ~800+ ops across
+/// all 40 layers, plus attention and the head) entirely as Swift-side graph
+/// construction before the harness's single `eval(logits)` call at the end
+/// forces any of it onto the GPU (confirmed: no `eval`/`asyncEval` exists
+/// anywhere on the multi-token path before this flag). `asyncEval` on the
+/// running hidden state after every `N`th layer lets Metal start executing
+/// completed layer segments while Swift is still constructing the rest of
+/// the graph -- same mechanism as the decode ladder (`asyncEval` schedules
+/// already-built work early; it adds no operation, no cache row, no token,
+/// no dtype/shape change -- see `lagunaDecodeAsyncStage`'s doc comment,
+/// which makes the identical claim), applied to the complementary request
+/// shape. Independent of `DARKBLOOM_DECODE_ASYNC_STAGE`: the two compose
+/// freely (both default on) because they are mutually exclusive by
+/// construction -- `inputs.shape == [1, 1]` selects the decode ladder,
+/// `inputs.shape != [1, 1]` selects this one, and a single forward is
+/// always exactly one or the other.
+private let lagunaPrefillAsyncLadderStride: Int? = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ASYNC_LADDER"] else {
+        return 8
+    }
+    if raw == "0" {
+        return nil
+    }
+    guard let stride = Int(raw), (1...40).contains(stride) else {
+        return nil
+    }
+    return stride
+}()
+
+/// `DARKBLOOM_PREFILL_ASYNC_LADDER_START` (default `12`): the ladder's first
+/// fire is the first stride multiple STRICTLY past this layer index -- the
+/// band-chunking dial for this lever. The GPU starts executing at the first
+/// `asyncEval`, so the overlapped fraction of graph construction is roughly
+/// `(40 - firstFire) / 40`; the default (first fire after layer 16 at
+/// stride 8) deliberately claims only ~60% of the available overlap so a
+/// single submission's prefill gain stays comfortably inside the +5%
+/// acceptance band (`docs/benchmark-window-freeze.md`), with the remainder
+/// available to later submissions as the calibration re-pins -- the same
+/// chunking pattern the RUNSKIP partial dial and the direct-loads layer
+/// dial established. `0` (the default) claims the full ladder: the 60%
+/// probe (submission 26029899, START=12) scored a -0.42% dead heat with
+/// zero gate or band issues, empirically retiring the band concern the
+/// dial was built for -- construction overlap at this scale is nowhere
+/// near the +5% prefill window.
+private let lagunaPrefillAsyncLadderStart: Int = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ASYNC_LADDER_START"],
+        let start = Int(raw), (0...40).contains(start)
+    else {
+        return 0
+    }
+    return start
+}()
+
 private let lagunaRoPEAngleAtlasLength = 4096
 
 /// The shared 512-thread RMSNorm prologue emitted by three decode kernels.
@@ -4535,6 +4601,12 @@ final class LagunaRuntimeModelInner: Module {
             if i == layers.count - 1, h.dim(1) > 1 {
                 if case .causal = mask {
                     h = layer.callLastPrefillRow(h, cache: cache?[i])
+                    if let n = lagunaPrefillAsyncLadderStride, (i + 1) % n == 0,
+                        (i + 1) > lagunaPrefillAsyncLadderStart,
+                        inputs.shape != [1, 1]
+                    {
+                        asyncEval(h)
+                    }
                 } else {
                     h = layer(
                         h,
@@ -4547,6 +4619,12 @@ final class LagunaRuntimeModelInner: Module {
                     }
                     if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
                         inputs.shape == [1, 1]
+                    {
+                        asyncEval(h)
+                    }
+                    if let n = lagunaPrefillAsyncLadderStride, (i + 1) % n == 0,
+                        (i + 1) > lagunaPrefillAsyncLadderStart,
+                        inputs.shape != [1, 1]
                     {
                         asyncEval(h)
                     }
@@ -4563,6 +4641,12 @@ final class LagunaRuntimeModelInner: Module {
                 }
                 if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
                     inputs.shape == [1, 1]
+                {
+                    asyncEval(h)
+                }
+                if let n = lagunaPrefillAsyncLadderStride, (i + 1) % n == 0,
+                    (i + 1) > lagunaPrefillAsyncLadderStart,
+                    inputs.shape != [1, 1]
                 {
                     asyncEval(h)
                 }
@@ -4622,6 +4706,15 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         // preceding rows. For single-token decode the slice is a no-op.
         let hidden = model.norm(lagunaLastTokenHidden(fullHidden))
         if case .norm = lagunaDecodeAsyncStage, inputs.shape == [1, 1] {
+            asyncEval(hidden)
+        }
+        // Prefill ladder's final rung: everything through the last-row
+        // slice and final RMSNorm is already-constructed work; enqueue it
+        // so Metal executes the tail of the layer stack while Swift builds
+        // the vocabulary-head projection (the widest single op in the
+        // graph). Same scheduling-only exactness ground as every other
+        // fire; multi-token forwards only, mirroring the ladder's gate.
+        if lagunaPrefillAsyncLadderStride != nil, inputs.shape != [1, 1] {
             asyncEval(hidden)
         }
 
