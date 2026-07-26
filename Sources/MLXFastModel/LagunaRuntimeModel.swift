@@ -308,50 +308,93 @@ let lagunaFusedDenseGateUpSwiGLUEnabled =
 let lagunaFusedDenseDownResidualEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_DENSE_DOWN_RESIDUAL"] != "0"
 
-/// `DARKBLOOM_DECODE_ASYNC_STAGE` (default `33`): process-once stage selector
-/// for decode-step async scheduling. Active only when the invocation input
-/// shape is exactly `[1, 1]`; prefill and multi-token shapes are never
-/// asyncEval'd. Layer 33 is the measured first rung: Metal begins the existing
-/// graph while Swift constructs layers 34-39, final RMSNorm, and the head.
-/// `off`/`0` disables it; `30`, `36`, `39`, `norm`, and `logits` remain
-/// process-once ablation points. No operation, cache row, or token is added.
-private enum LagunaDecodeAsyncStage {
-    case off
-    case layer(Int)
-    case ladder(Int)
-    case norm
-    case logits
-}
+/// Throttle setting for the decode graph/GPU overlap below: how many of the
+/// leading layer boundaries commit the graph built so far. **This constant, not
+/// the environment, is what ships** — `mlxfast submit` uploads an archive of the
+/// tree and the ranked runner sets no `DARKBLOOM_*` variables, so the UNSET path
+/// IS the shipped path. Same discipline as `kDarkbloomDefaultRunSkipPct`: sizing
+/// lives in source, the env var exists only to disable or resize for a local A/B.
+///
+/// **CURRENT VALUE IS 2 — LIVE — BECAUSE THIS ARM IS THE NAMED LEVER OF THIS
+/// CYCLE, AND IT IS MEASURED.** House invariant: at most one NEW, UNMEASURED
+/// lever may be default-ON at a time, and it must be the one named in the
+/// cycle's submission note. We ship one lever per submission for clean
+/// attribution, so an unmeasured arm left live here would ride along inside
+/// somebody else's submission, contaminate its attribution, and turn a good
+/// result into a rejection misattributed to them. This one is not unmeasured:
+/// `notes/49` records n=12 at this exact setting on the unset path.
+///
+/// The NEW/UNMEASURED qualifier matters: the already-promoted default-ON flags
+/// in the editable surface stay default-ON permanently — they are the baseline,
+/// not a hazard. The pre-ship check is a read of every hunk of
+/// `git diff origin/main -- Sources Vendor`, never an absolute grep and never a
+/// `!= "0"` grep (a `?? ""` default-ON lever does not match one).
+///
+/// LIFECYCLE — do not skip a step:
+///   1. Develop and measure at 0 (inert). Sweep with explicit `=1` / `=2` / `=6`
+///      against a `=0` control. The tree stays shippable for whichever cycle is
+///      actually in flight. DONE — `notes/49` §2.
+///   2. When this arm IS the cycle's lever and the sweep came back positive and
+///      with agreeing halves: set this to the measured chunk size and run the
+///      `notes/44` §9d gate, including the confirmation ABBA of UNSET vs `=0`.
+///      DONE — `notes/49` §3-§6. **This is where the tree stands right now.**
+///   3. Set it back to 0 immediately after that submission uploads, so the next
+///      cycle starts from a tree with zero live unmeasured levers. PENDING.
+///
+/// Never set this to 5+ in one step: full strength is modelled at
+/// decode_speedup 1.091 against a 1.0526 acceptance-band cap
+/// (`Sources/MLXFastCore/AcceptanceBand.swift:49-65`,
+/// `Sources/MLXFastCore/Constants.swift:115-123`) and would fail the ranked run
+/// outright. Raise one chunk at a time.
+let kLagunaDefaultAsyncEvalLayers = 2
 
-/// `ladderN` extends the promoted single-rung schedule (b3889ed8, layer 33)
-/// to a streaming ladder: `asyncEval` fires after every `N`th layer of a
-/// `[1, 1]` decode step, so Metal continuously executes completed graph
-/// segments while Swift constructs the next ones — the single rung leaves
-/// the first 34 layers' construction unoverlapped; the ladder overlaps all
-/// but the first `N`. Same mechanism, same exactness ground: `asyncEval`
-/// adds no operation, cache row, dtype boundary, or token; it only enqueues
-/// already-constructed work earlier. Each extra fire costs one scheduler
-/// round trip, so the stride is chosen by measurement, not maximal overlap.
-private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
-    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?.lowercased() ?? "ladder8"
-    switch raw {
-    case "off", "0", "":
-        return .off
-    case "norm":
-        return .norm
-    case "logits":
-        return .logits
-    default:
-        if raw.hasPrefix("ladder"), let stride = Int(raw.dropFirst("ladder".count)),
-            (1...40).contains(stride)
-        {
-            return .ladder(stride)
-        }
-        if let index = Int(raw), [30, 33, 36, 39].contains(index) {
-            return .layer(index)
-        }
-        return .off
+/// `DARKBLOOM_ASYNC_EVAL_LAYERS` — decode-only graph/GPU overlap, THROTTLED.
+/// The value is a COUNT: how many of the leading layer boundaries commit the
+/// graph built so far, i.e. `n` means `asyncEval` after layers `0 ..< n`.
+/// Clamped by the loop to `layers.count - 1`.
+///
+/// **UNSET (the shipped path) = `kLagunaDefaultAsyncEvalLayers`. `"0"` disables
+/// it for a local A/B.** Any other non-negative integer overrides the count for
+/// a dose-response sweep. An unparseable or negative value falls back to the
+/// shipped constant rather than to zero — unset and garbage must never silently
+/// ship a no-op.
+///
+/// This changes only WHEN buffers are committed. It fuses nothing, reorders
+/// nothing, and touches no accumulation order — `asyncEval` and `eval` run the
+/// identical `eval_impl` tape and differ solely in the trailing `.wait()`
+/// (`Vendor/mlx-swift/Source/Cmlx/mlx/mlx/transforms.cpp:322-351`), so the arm
+/// is bit-exact by construction and a `passed_correctness` failure here is a
+/// wiring defect, not a tradeoff.
+///
+/// WHY A COUNT AND NOT A BOOL. `lagunaLogits` returns a lazy graph, so every
+/// decode step opens with ~1.043 ms of pure CPU construction during which the
+/// GPU executes nothing (`notes/35` §1 and `notes/33` §4d — two independent
+/// instruments, 1.043 and 1.095 ms). The GPU needs 0.223 ms per layer against
+/// the builder's 0.026 ms, so each boundary should let the GPU retire one more
+/// layer inside that window: the modelled effect is LINEAR in `n` and saturates
+/// at `n = 1.043/0.223 = 4.68`. A bool would only offer "off" or "band failure".
+///
+/// DEDICATED FLAG BY DESIGN: it shares no kill switch with any shipped fusion.
+///
+/// NOT A PHASE ORACLE: the guard at the call site is a pure shape test that the
+/// teacher-forced correctness path exercises identically, so it does not signal
+/// "I am being scored now".
+///
+/// LIVENESS: the resolution is announced once per process through the existing
+/// `DARKBLOOM_TRACE_FUSION=1` channel, and the call site announces itself with
+/// a static literal. Both are no-ops when that trace flag is unset, and neither
+/// reads `DARKBLOOM_ASYNC_EVAL_LAYERS` a second time — so a trace-only run has
+/// this variable UNSET and therefore reports the genuine shipped resolution.
+let lagunaAsyncEvalLayers: Int = {
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_ASYNC_EVAL_LAYERS"]
+    let resolved: Int
+    if let raw, !raw.isEmpty, let count = Int(raw), count >= 0 {
+        resolved = count
+    } else {
+        resolved = kLagunaDefaultAsyncEvalLayers
     }
+    lagunaTrace("async_eval_layers=\(resolved) env=\(raw ?? "<unset>")")
+    return resolved
 }()
 
 private let lagunaRoPEAngleAtlasLength = 4096
@@ -4528,6 +4571,20 @@ final class LagunaRuntimeModelInner: Module {
         // seed row, so the angles are the exact floats that layer's kernel
         // would have computed rather than a re-derivation.
 
+        // Decode-only graph/GPU overlap. `DARKBLOOM_ASYNC_EVAL_LAYERS` is
+        // UNSET on the shipped path and resolves to
+        // `kLagunaDefaultAsyncEvalLayers`; "0" disables it for a local A/B.
+        // Committing the layers built so far lets the GPU start on them while
+        // this loop keeps building. `h` is a complete cut of the graph up to
+        // its layer, because every cache `update` returns the post-write
+        // buffer (or a slice of it) that attention then consumes, so forcing
+        // `h` forces both KV writes of every layer at or below it — passing
+        // the cache as well would add a live reference that costs the ring its
+        // buffer donation. Prefill is excluded by shape: extra commits there
+        // delay the GPU behind a much longer encode.
+        let asyncEvalLayers =
+            (h.ndim == 3 && h.dim(0) == 1 && h.dim(1) == 1) ? lagunaAsyncEvalLayers : 0
+
         for (i, layer) in layers.enumerated() {
             let isFull = layerTypes[i] == .full
             let mask = isFull ? fullMask : slidingMask
@@ -4542,14 +4599,6 @@ final class LagunaRuntimeModelInner: Module {
                         cache: cache?[i],
                         qkRoPEAngles: qkRoPEAngles
                     )
-                    if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
-                        asyncEval(h)
-                    }
-                    if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                        inputs.shape == [1, 1]
-                    {
-                        asyncEval(h)
-                    }
                 }
             } else {
                 h = layer(
@@ -4558,14 +4607,13 @@ final class LagunaRuntimeModelInner: Module {
                     cache: cache?[i],
                     qkRoPEAngles: qkRoPEAngles
                 )
-                if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
-                    asyncEval(h)
-                }
-                if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                    inputs.shape == [1, 1]
-                {
-                    asyncEval(h)
-                }
+            }
+            // Never after the last layer: the terminal `.item()` commits that
+            // tail anyway, so a boundary there is a free extra command buffer.
+            // This also clamps the flag to `layers.count - 1`.
+            if i < asyncEvalLayers, i < layers.count - 1 {
+                lagunaTrace("async_eval_boundary")
+                asyncEval([h])
             }
         }
 
@@ -4621,20 +4669,10 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         // vocabulary head so prefill neither normalizes nor projects the
         // preceding rows. For single-token decode the slice is a no-op.
         let hidden = model.norm(lagunaLastTokenHidden(fullHidden))
-        if case .norm = lagunaDecodeAsyncStage, inputs.shape == [1, 1] {
-            asyncEval(hidden)
-        }
-
-        let result: MLXArray
         if let lmHead {
-            result = lmHead(hidden)
-        } else {
-            result = model.embedTokens.asLinear(hidden)
+            return lmHead(hidden)
         }
-        if case .logits = lagunaDecodeAsyncStage, inputs.shape == [1, 1] {
-            asyncEval(result)
-        }
-        return result
+        return model.embedTokens.asLinear(hidden)
     }
 
     public func prepare(
