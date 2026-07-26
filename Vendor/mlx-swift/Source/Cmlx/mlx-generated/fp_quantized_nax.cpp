@@ -1429,11 +1429,12 @@ METAL_FUNC int laguna_sorted_lower_bound(
     const device uint32_t* indices,
     const int count,
     const uint32_t value) {
+  constexpr uint32_t row_bits = 20;
   int lo = 0;
   int hi = count;
   while (lo < hi) {
     const int mid = lo + (hi - lo) / 2;
-    if (indices[mid] < value) {
+    if ((indices[mid] >> row_bits) < value) {
       lo = mid + 1;
     } else {
       hi = mid;
@@ -1627,6 +1628,29 @@ template <
             y[size_t(chunk_start + tm + row) * (N / 2) +
               size_t(tid.x) * activated_cols + col] =
                 bfloat(silu * up);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      } else if (N == 2048 && K == 512) {
+        // The low 20 bits carry each sorted row's original flattened slot.
+        // Round through the same BF16 Dtile store boundary, then scatter
+        // directly to final order and avoid a full 4096x2048 copy.
+        if (sg_active) {
+          Dtile.template store<bfloat, BN, 1>(
+              gate_up_stage + tm * BN + tn);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_active) {
+          constexpr uint32_t row_mask = (1u << 20) - 1;
+          for (int linear = simd_lane_id;
+               linear < int(sgp_sm) * SN;
+               linear += SIMD_SIZE) {
+            const int row = linear / SN;
+            const int col = linear % SN;
+            const uint32_t output_row =
+                indices[chunk_start + tm + row] & row_mask;
+            y[size_t(output_row) * N + y_col + tn + col] =
+                gate_up_stage[(tm + row) * BN + tn + col];
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

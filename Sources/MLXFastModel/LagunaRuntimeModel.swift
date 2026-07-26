@@ -3612,7 +3612,9 @@ private func lagunaInterleavedSwiGLU(
 /// expert-aligned path the backend also applies the same rounded-BF16 SiLU
 /// product and packs the 512-wide activation into the first half of the
 /// nominal 1024-wide output allocation, avoiding that intermediate's device
-/// round trip. `down_proj`, sorting, and unsorting remain the stock calls.
+/// round trip. The sorted expert id also carries its original flattened row
+/// in the low 20 bits; the down expert kernel writes directly to that row,
+/// removing the inverse argsort and full-width scatter.
 private func lagunaFusedSortedRoutedGateUp(
     _ x: MLXArray,
     indices: MLXArray,
@@ -3628,11 +3630,23 @@ private func lagunaFusedSortedRoutedGateUp(
     // here; recomputed anyway so this function mirrors SwitchGLU verbatim
     // and stays correct if that guard is ever loosened.
     let doSort = indices.size >= 64
+    let directUnsort = doSort && lagunaExpertAlignedGatherEnabled
     // SwitchGLU: `var idx = indices` / `var inverseOrder = MLXArray()`
     var idx = indices
     var inverseOrder = MLXArray()
-    // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
-    if doSort {
+    if directUnsort {
+        // This is the same first argsort and input gather as gatherSort. Keep
+        // the original flattened slot in the low 20 bits so the down kernel
+        // can scatter as it stores; expert remains the high-order sort key.
+        precondition(indices.size <= 1 << 20)
+        let routingWidth = indices.dim(-1)
+        let flatIndices = indices.flattened().asType(.uint32)
+        let order = argSort(flatIndices).asType(.uint32)
+        sortedX = sortedX.flattened(start: 0, end: -3)[
+            order.floorDivide(routingWidth)]
+        idx = flatIndices[order] * UInt32(1 << 20) + order
+    } else if doSort {
+        // Stock fallback, including the inverse permutation consumed below.
         (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
     }
     // Fused counterpart of SwitchGLU's separate-bank branch:
@@ -3672,8 +3686,13 @@ private func lagunaFusedSortedRoutedGateUp(
     }
     // SwitchGLU: `x = downProj(activated, idx, sortedIndices: doSort)`
     var result = downProj(activated, idx, sortedIndices: doSort)
-    // SwitchGLU: `if doSort { x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape) }`
-    if doSort {
+    if directUnsort {
+        // The down kernel already stored rows in flattened original order.
+        // Restore only the logical routing dimensions; reshape is a view.
+        result = result.reshaped(
+            indices.shape + Array(result.shape.dropFirst()))
+    } else if doSort {
+        // SwitchGLU stock fallback.
         result = scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape)
     }
     // SwitchGLU: `return MLX.squeezed(x, axis: -2)`
