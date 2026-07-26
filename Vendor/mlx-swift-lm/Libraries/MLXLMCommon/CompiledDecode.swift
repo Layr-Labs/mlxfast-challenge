@@ -30,8 +30,56 @@ import MLX
 import os
 
 private let compiledDecodeLog = Logger(subsystem: "darkbloom", category: "CompiledDecode")
+private let tieredCompiledAttentionEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_COMPILED_TIERED_ATTENTION"] != "0"
 
 public enum CompiledDecode {
+
+    /// Host-side selector between two compiled graphs over shared cache state.
+    ///
+    /// The fast graph attends to a short fixed prefix while the slow graph
+    /// exposes the whole backing buffer. Both cache arrays contain wrappers
+    /// around the same `MLXArray` objects, so switching graphs requires no KV
+    /// copy and no GPU offset readback.
+    private final class TieredForward: @unchecked Sendable {
+        let fastAttentionLength: Int
+        var logicalOffset: Int
+        let fastForward: @Sendable ([MLXArray]) -> [MLXArray]
+        let fullForward: @Sendable ([MLXArray]) -> [MLXArray]
+        let lock = NSLock()
+
+        init(
+            model: any LanguageModel,
+            fastCache: [KVCache],
+            fullCache: [KVCache],
+            fastAttentionLength: Int,
+            logicalOffset: Int
+        ) {
+            self.fastAttentionLength = fastAttentionLength
+            self.logicalOffset = logicalOffset
+            self.fastForward = CompiledDecode.compileForward(
+                model: model, cacheRef: fastCache)
+            self.fullForward = CompiledDecode.compileForward(
+                model: model, cacheRef: fullCache)
+        }
+
+        func callAsFunction(_ args: [MLXArray]) -> [MLXArray] {
+            lock.withLock {
+                let tokenCount = args.first?.dim(1) ?? 0
+                guard tokenCount > 0 else {
+                    return logicalOffset < fastAttentionLength
+                        ? fastForward(args) : fullForward(args)
+                }
+
+                let (needed, overflow) = logicalOffset.addingReportingOverflow(tokenCount)
+                precondition(
+                    !overflow && needed <= Int(Int32.max),
+                    "Compiled decode cache offset exceeds its Int32 graph representation")
+                logicalOffset = needed
+                return needed <= fastAttentionLength ? fastForward(args) : fullForward(args)
+            }
+        }
+    }
 
     /// Compiled decode is ON by default. Set `DARKBLOOM_COMPILED_DECODE=0`
     /// to disable. Guards in GenerationBatch ensure it only activates for
@@ -140,6 +188,19 @@ public enum CompiledDecode {
         // Materialize all pending cache operations before conversion.
         eval(cache)
 
+        let currentOffset = cache.map(\.offset).max() ?? 0
+        let growthStep =
+            cache.compactMap { ($0 as? KVCacheSimple)?.step }.max() ?? 256
+        guard currentOffset >= 0,
+            let fastAttentionLength = initialAttentionLength(
+                currentOffset: currentOffset,
+                growthStep: growthStep,
+                callerUpperBound: maxCacheLength)
+        else {
+            compiledDecodeLog.info("Compiled decode skipped: invalid cache capacity")
+            return nil
+        }
+
         // Per-layer promotion: each layer type gets its compilable equivalent.
         var simpleCount = 0
         var rotatingCount = 0
@@ -151,7 +212,8 @@ public enum CompiledDecode {
                 rotatingCount += 1
             } else if let simple = cache[i] as? KVCacheSimple {
                 // KVCacheSimple → CompilableKVCache
-                cache[i] = CompilableKVCache.promote(from: simple, maxLength: maxCacheLength)
+                cache[i] = CompilableKVCache.promote(
+                    from: simple, maxLength: maxCacheLength)
                 simpleCount += 1
             }
         }
@@ -161,9 +223,64 @@ public enum CompiledDecode {
 
         let layerCount = cache.count
         compiledDecodeLog.info(
-            "Compiled decode enabled: \(layerCount) layers (\(simpleCount) simple + \(rotatingCount) rotating), maxLength=\(maxCacheLength)")
+            "Compiled decode enabled: \(layerCount) layers (\(simpleCount) simple + \(rotatingCount) rotating), fastAttentionLength=\(fastAttentionLength), backingLength=\(maxCacheLength)")
 
-        return compileForward(model: model, cacheRef: cache)
+        guard tieredCompiledAttentionEnabled,
+            simpleCount > 0,
+            fastAttentionLength < maxCacheLength
+        else {
+            return compileForward(model: model, cacheRef: cache)
+        }
+        let fastCache: [KVCache] = cache.map {
+            if let full = $0 as? CompilableKVCache {
+                return full.sharingStorage(attentionLength: fastAttentionLength)
+            }
+            return $0
+        }
+        let owner = TieredForward(
+            model: model,
+            fastCache: fastCache,
+            fullCache: cache,
+            fastAttentionLength: fastAttentionLength,
+            logicalOffset: currentOffset)
+        return { owner($0) }
+    }
+
+    /// Choose a short attention view with one ordinary cache allocation
+    /// tranche beyond the live sequence.
+    ///
+    /// Lengths above 1024 stay on MLX's two-pass vector SDPA on large M-series
+    /// devices. Rounding the first such length to Laguna's normal 256-row
+    /// cache tranche gives 1280: materially shorter than 4096 while preserving
+    /// the full buffer's block partition for Laguna's six-way GQA on every
+    /// MLX architecture category (`s`: 128 blocks, `d`: 128, other: 64).
+    /// This is a kernel boundary, not a benchmark prompt/token constant.
+    static func initialAttentionLength(
+        currentOffset: Int,
+        growthStep: Int,
+        callerUpperBound: Int
+    ) -> Int? {
+        guard currentOffset >= 0, growthStep > 0, callerUpperBound >= currentOffset,
+            currentOffset <= Int(Int32.max)
+        else { return nil }
+        let (withHeadroom, overflow) = currentOffset.addingReportingOverflow(growthStep)
+        guard !overflow else { return nil }
+        let rounded = roundedCapacity(
+            atLeast: max(withHeadroom, 1025),
+            step: growthStep)
+        return min(callerUpperBound, rounded)
+    }
+
+    private static func roundedCapacity(atLeast needed: Int, step: Int) -> Int {
+        precondition(needed >= 0 && step > 0)
+        let quotient = needed / step
+        let remainder = needed % step
+        let roundedQuotient = quotient + (remainder == 0 ? 0 : 1)
+        let (capacity, overflow) = roundedQuotient.multipliedReportingOverflow(by: step)
+        precondition(
+            !overflow && capacity <= Int(Int32.max),
+            "Compiled decode cache capacity exceeds its Int32 graph representation")
+        return capacity
     }
 
     /// Set up compiled decode for batched caches (B >= 1).
