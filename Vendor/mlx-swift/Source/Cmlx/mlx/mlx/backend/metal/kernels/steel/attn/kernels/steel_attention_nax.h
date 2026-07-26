@@ -104,6 +104,13 @@ struct DivOp {
   }
 };
 
+// Exact unsigned division by three without a hardware divide.
+// 0xAAAAAAAB == ceil(2^33 / 3), so the high half of value * magic,
+// followed by one more right shift, is floor(value / 3) for every uint.
+METAL_FUNC uint darkbloom_divide_u32_by_3(uint value) {
+  return metal::mulhi(value, 0xAAAAAAABu) >> 1;
+}
+
 // clang-format off
 template <
     typename T,
@@ -139,21 +146,48 @@ template <
   // is a bijection onto the same logical coordinate set. Each threadgroup
   // therefore retains its exact Q/K/V inputs, floating-point operation order,
   // and disjoint output rows; only GPU presentation order changes.
+  const uint h = uint(params->H);
 #if DARKBLOOM_ATTN_QBLOCK_MAJOR
-  const ulong physical_linear =
-      ulong(tid.y) * ulong(params->NQ) + ulong(tid.x);
-  const ulong physical_qblock = physical_linear / ulong(params->H);
-  const ulong logical_head =
-      physical_linear - physical_qblock * ulong(params->H);
+  const uint nq = uint(params->NQ);
+  ulong physical_qblock;
+  ulong logical_head;
+
+  // Serial decode has one query block, so the remap is the identity for every
+  // head count. Laguna's validated layer schedule uses 48 or 64 query heads.
+  // For those architectures, recover quotient/remainder with literal constant
+  // divisors for every NQ whose flattened index fits in uint. The bounds are
+  // floor(2^32 / H), because the largest flattened index is H * NQ - 1.
+  // Retain the original wide generic mapping for all other valid shapes.
+  if (nq == 1u) {
+    physical_qblock = 0ul;
+    logical_head = ulong(tid.y);
+  } else if (h == 64u && nq <= 0x04000000u) {
+    const uint physical_linear = tid.y * nq + tid.x;
+    physical_qblock = ulong(physical_linear / 64u);
+    logical_head = ulong(physical_linear % 64u);
+  } else if (h == 48u && nq <= 0x05555555u) {
+    const uint physical_linear = tid.y * nq + tid.x;
+    const uint qblock_u =
+        darkbloom_divide_u32_by_3(physical_linear >> 4);
+    physical_qblock = ulong(qblock_u);
+    logical_head = ulong(physical_linear - qblock_u * 48u);
+  } else {
+    const ulong physical_linear =
+        ulong(tid.y) * ulong(params->NQ) + ulong(tid.x);
+    physical_qblock = physical_linear / ulong(params->H);
+    logical_head =
+        physical_linear - physical_qblock * ulong(params->H);
+  }
 #if DARKBLOOM_ATTN_QBLOCK_ZIGZAG
   // Present causal work high, low, second-high, second-low, ... while keeping
   // every query block's heads contiguous. Even ranks map injectively onto the
   // upper half in descending order; odd ranks map onto the lower half in
   // ascending order, so their disjoint union is exactly [0, NQ).
+  const ulong half_rank = physical_qblock >> 1;
   const ulong logical_qblock =
       (physical_qblock & 1ul) == 0
-      ? ulong(params->NQ) - 1 - physical_qblock / 2
-      : physical_qblock / 2;
+      ? ulong(params->NQ) - 1ul - half_rank
+      : half_rank;
 #else
   const ulong logical_qblock = physical_qblock;
 #endif
@@ -166,7 +200,17 @@ template <
       tidl.y * params->Q_strides[1] + // Head
       tidl.x * BQ * params->Q_strides[2]; // Sequence
 
-  ulong kv_head_idx = int(tidl.y) / params->gqa_factor;
+  const uint logical_head_u = uint(tidl.y);
+  const uint gqa_factor = uint(params->gqa_factor);
+  ulong kv_head_idx;
+  if (h == 64u && gqa_factor == 8u) {
+    kv_head_idx = ulong(logical_head_u / 8u);
+  } else if (h == 48u && gqa_factor == 6u) {
+    kv_head_idx =
+        ulong(darkbloom_divide_u32_by_3(logical_head_u >> 1));
+  } else {
+    kv_head_idx = ulong(int(tidl.y) / params->gqa_factor);
+  }
   K += tidl.z * params->K_strides[0] + // Batch
       kv_head_idx * params->K_strides[1]; // Head
 
