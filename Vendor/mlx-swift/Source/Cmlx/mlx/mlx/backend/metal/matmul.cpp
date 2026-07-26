@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <numeric>
 #include <sstream>
 
@@ -234,6 +235,22 @@ void steel_matmul_regular_axpby_nax(
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
 
+  // Laguna's retained prefill Q/K bank appends one 128-row metadata tile to
+  // the ordinary BF16 projection weights.  Select the fused post-GEMM
+  // epilogue only for its two exact, private shapes.  The GPU validates a
+  // versioned magic in that tile before changing ordinary matmul semantics,
+  // so an unrelated array with the same dimensions still falls back to the
+  // stock store path.  Keeping this as a function constant lets Metal remove
+  // the 16 KiB threadgroup staging tile from every other NAX pipeline.
+  const bool laguna_qk_prefill =
+      !CHECK_AB && a.dtype() == bfloat16 && out.dtype() == bfloat16 &&
+      !transpose_a && transpose_b && batch_size_out == 1 && M == 512 &&
+      K == 2048 && (N == 7296 || N == 9344) && bm == 64 && bn == 128 &&
+      bk == 256 && wm == 2 && wn == 4 && a.ndim() == 4 &&
+      a.shape(0) == 1 && a.shape(1) == 1 && b.ndim() == 4 &&
+      b.shape(0) == 1 && b.shape(1) == 1 && b.shape(-2) == K &&
+      b.shape(-1) == N;
+
   metal::MTLFCList func_consts = {
       {&has_batch, MTL::DataType::DataTypeBool, 10},
       {&use_out_source, MTL::DataType::DataTypeBool, 100},
@@ -241,6 +258,7 @@ void steel_matmul_regular_axpby_nax(
       {&align_M, MTL::DataType::DataTypeBool, 200},
       {&align_N, MTL::DataType::DataTypeBool, 201},
       {&align_K, MTL::DataType::DataTypeBool, 202},
+      {&laguna_qk_prefill, MTL::DataType::DataTypeBool, 203},
   };
 
   // clang-format off
@@ -249,7 +267,8 @@ void steel_matmul_regular_axpby_nax(
         << "_do_axpby_" << (do_axpby ? 't' : 'n')
         << "_align_M_" << (align_M ? 't' : 'n')
         << "_align_N_" << (align_N ? 't' : 'n')
-        << "_align_K_" << (align_K ? 't' : 'n'); // clang-format on
+        << "_align_K_" << (align_K ? 't' : 'n')
+        << "_laguna_qk_prefill_" << (laguna_qk_prefill ? 't' : 'n'); // clang-format on
 
   std::string hash_name = kname.str();
 
@@ -270,6 +289,13 @@ void steel_matmul_regular_axpby_nax(
       /* int wn = */ wn);
 
   compute_encoder.set_compute_pipeline_state(kernel);
+  // FC203 removes the threadgroup argument entirely from ordinary pipelines,
+  // so only the private specialization needs a dynamic-memory binding.  This
+  // keeps every generic NAX dispatch off the extra encoder API path.
+  if (laguna_qk_prefill) {
+    compute_encoder.set_threadgroup_memory_length(
+        size_t(bm) * bn * sizeof(uint16_t), 0);
+  }
 
   // Use problem size to determine threadblock swizzle
   int tn = (N + bn - 1) / bn;

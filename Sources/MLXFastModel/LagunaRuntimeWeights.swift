@@ -434,7 +434,39 @@ public final class LagunaRuntimeWeightCache {
         try loader.validateRequiredMetadata(config: config)
         let model = LagunaRuntimeModel(config)
 
-        let loadedWeights = try loadRuntimeWeightArrays(denseStore: loader.denseStore)
+        // When FC203 is explicitly enabled on its exact NAX target, form its
+        // retained Q/K+metadata banks directly from checkpoint bytes. The
+        // ordinary loader then skips only those physical Q/K tensors and we
+        // install zero-copy bank slices under their original parameter names.
+        // This preserves the 912-name validation/update contract while never
+        // creating redundant standalone Q/K Metal allocations.
+        let directQKBanks = try prepareDirectPrefillQKBanks(
+            model: model,
+            denseStore: loader.denseStore
+        )
+        let excludedQKNames = Set(
+            directQKBanks.flatMap { [$0.queryName, $0.keyName] })
+        var loadedWeights = try loadRuntimeWeightArrays(
+            denseStore: loader.denseStore,
+            excludingOriginalNames: excludedQKNames
+        )
+        for direct in directQKBanks {
+            guard loadedWeights[direct.queryName] == nil,
+                loadedWeights[direct.keyName] == nil
+            else {
+                throw MLXFastError.invalidInput(
+                    "direct prefill Q/K aliases collide with loaded parameters in layer \(direct.layerIndex)"
+                )
+            }
+            loadedWeights[direct.queryName] = direct.query
+            loadedWeights[direct.keyName] = direct.key
+        }
+        guard loadedWeights.count == loader.denseStore.tensorNames.count else {
+            throw MLXFastError.invalidInput(
+                "direct prefill Q/K loading produced \(loadedWeights.count) runtime parameters; "
+                    + "expected \(loader.denseStore.tensorNames.count)"
+            )
+        }
         let sanitized = model.sanitize(weights: loadedWeights)
         // Poolside stores dense parameters in BF16 and NVFP4 scales in U8, so
         // the library's fp16->bf16 conversion pass is a no-op and is omitted.
@@ -446,6 +478,233 @@ public final class LagunaRuntimeWeightCache {
         // warmup so the fused kernels warm with their production shapes.
         model.prepareFusedRuntimeWeights()
         return model
+    }
+
+    private struct DirectPrefillQKBank {
+        let layerIndex: Int
+        let queryName: String
+        let keyName: String
+        let query: MLXArray
+        let key: MLXArray
+    }
+
+    /// Materialize at most one host bank and one final MLX bank at a time.
+    /// The returned aliases retain their backing through the attention's
+    /// `_prefillQKMetadataWeight`, so releasing each host `Data` before the
+    /// next layer cannot invalidate either parameter view.
+    private static func prepareDirectPrefillQKBanks(
+        model: LagunaRuntimeModel,
+        denseStore: DenseTensorStore
+    ) throws -> [DirectPrefillQKBank] {
+        guard lagunaPrefillFusedQKProjectionNAXAvailable,
+            !lagunaFusedQKVEnabled,
+            model.model.layers.count == model.configuration.numHiddenLayers
+        else {
+            return []
+        }
+
+        let atlases = model.model.prepareRoPEAngleAtlases()
+        guard !atlases.isEmpty,
+            let fullAtlas = model.model._fullRoPEAngleAtlas,
+            let slidingAtlas = model.model._slidingRoPEAngleAtlas
+        else {
+            return []
+        }
+        eval(atlases)
+
+        let length = LagunaPrefillQKProjectionBankABI.sequenceLength
+        let fullAngles = fullAtlas[0..., 0..., 0 ..< length, 0...].contiguous()
+        let slidingAngles = slidingAtlas[0..., 0..., 0 ..< length, 0...].contiguous()
+        eval(fullAngles, slidingAngles)
+
+        var result: [DirectPrefillQKBank] = []
+        result.reserveCapacity(model.model.layers.count)
+        for (layerIndex, layer) in model.model.layers.enumerated() {
+            // The final multi-token layer uses the dedicated last-row path;
+            // decode has L=1. Its FC203 bank can never be consumed.
+            guard layerIndex != model.model.layers.count - 1 else { continue }
+            let attention = layer.selfAttn
+            let familyEnabled = attention.isSliding
+                ? lagunaPrefillFusedSlidingQKProjectionEnabled
+                : lagunaPrefillFusedFullQKProjectionEnabled
+            guard familyEnabled else { continue }
+
+            let angles = attention.isSliding ? slidingAngles : fullAngles
+            let queryName = LagunaWeightNames.attention(
+                layerIndex, "q_proj.weight")
+            let keyName = LagunaWeightNames.attention(
+                layerIndex, "k_proj.weight")
+            let bank = try makeDirectPrefillQKBank(
+                denseStore: denseStore,
+                layerIndex: layerIndex,
+                isSliding: attention.isSliding,
+                angleTable: angles
+            )
+            guard let aliases = attention.retainLoadedPrefillQKMetadataWeight(bank)
+            else {
+                throw MLXFastError.invalidInput(
+                    "direct prefill Q/K bank failed runtime eligibility for layer \(layerIndex)"
+                )
+            }
+            result.append(
+                DirectPrefillQKBank(
+                    layerIndex: layerIndex,
+                    queryName: queryName,
+                    keyName: keyName,
+                    query: aliases.query,
+                    key: aliases.key
+                ))
+        }
+        return result
+    }
+
+    /// Build the exact FC203 bank byte-for-byte. Safetensors BF16 payloads
+    /// are already little-endian UInt16 bit patterns; the Float32 atlas is
+    /// copied in its evaluated native little-endian representation. Metadata
+    /// gaps remain deterministically zero.
+    private static func makeDirectPrefillQKBank(
+        denseStore: DenseTensorStore,
+        layerIndex: Int,
+        isSliding: Bool,
+        angleTable: MLXArray
+    ) throws -> MLXArray {
+        let hidden = LagunaConstants.hiddenSize
+        let headDim = LagunaConstants.headDim
+        let queryRows = LagunaPrefillQKProjectionBankABI.queryHeads(
+            isSliding: isSliding) * headDim
+        let keyRows = LagunaConstants.numKeyValueHeads * headDim
+        let semanticRows = LagunaPrefillQKProjectionBankABI.semanticRows(
+            isSliding: isSliding)
+        let bankRows = LagunaPrefillQKProjectionBankABI.bankRows(
+            isSliding: isSliding)
+        let queryName = LagunaWeightNames.attention(layerIndex, "q_proj.weight")
+        let keyName = LagunaWeightNames.attention(layerIndex, "k_proj.weight")
+        let queryNormName = LagunaWeightNames.attention(
+            layerIndex, "q_norm.weight")
+        let keyNormName = LagunaWeightNames.attention(
+            layerIndex, "k_norm.weight")
+
+        let bytesPerBF16 = 2
+        var bankBytes = Data(count: bankRows * hidden * bytesPerBF16)
+        try copyDirectBankTensor(
+            named: queryName,
+            expectedShape: [queryRows, hidden],
+            from: denseStore,
+            into: &bankBytes,
+            atByteOffset: 0
+        )
+        try copyDirectBankTensor(
+            named: keyName,
+            expectedShape: [keyRows, hidden],
+            from: denseStore,
+            into: &bankBytes,
+            atByteOffset: queryRows * hidden * bytesPerBF16
+        )
+
+        let metadataByteOffset = semanticRows * hidden * bytesPerBF16
+        try copyDirectBankTensor(
+            named: queryNormName,
+            expectedShape: [headDim],
+            from: denseStore,
+            into: &bankBytes,
+            atByteOffset: metadataByteOffset
+        )
+        try copyDirectBankTensor(
+            named: keyNormName,
+            expectedShape: [headDim],
+            from: denseStore,
+            into: &bankBytes,
+            atByteOffset: metadataByteOffset + headDim * bytesPerBF16
+        )
+
+        let magicByteOffset = metadataByteOffset
+            + LagunaPrefillQKProjectionBankABI.magicOffset * bytesPerBF16
+        for (wordIndex, word) in LagunaPrefillQKProjectionBankABI
+            .magicWords(isSliding: isSliding).enumerated()
+        {
+            var littleEndianWord = word.littleEndian
+            withUnsafeBytes(of: &littleEndianWord) { source in
+                bankBytes.withUnsafeMutableBytes {
+                    (destination: UnsafeMutableRawBufferPointer) in
+                    destination.baseAddress!
+                        .advanced(by: magicByteOffset + wordIndex * bytesPerBF16)
+                        .copyMemory(from: source.baseAddress!, byteCount: bytesPerBF16)
+                }
+            }
+        }
+
+        let angleWidth = LagunaPrefillQKProjectionBankABI.angleWidth(
+            isSliding: isSliding)
+        guard angleTable.dtype == .float32,
+            angleTable.shape == [
+                1, 1, LagunaPrefillQKProjectionBankABI.sequenceLength, angleWidth,
+            ]
+        else {
+            throw MLXFastError.invalidInput(
+                "direct prefill Q/K angle table has dtype/shape \(angleTable.dtype) \(angleTable.shape)"
+            )
+        }
+        let angleData = angleTable.asData(access: .noCopy)
+        let expectedAngleBytes = angleTable.size * MemoryLayout<Float>.size
+        guard angleData.strides.suffix(2) == [angleWidth, 1],
+            angleData.data.count == expectedAngleBytes
+        else {
+            throw MLXFastError.invalidInput(
+                "direct prefill Q/K angle table is not contiguous"
+            )
+        }
+        let angleByteOffset = metadataByteOffset
+            + LagunaPrefillQKProjectionBankABI.angleOffset * bytesPerBF16
+        guard angleByteOffset + expectedAngleBytes <= bankBytes.count else {
+            throw MLXFastError.invalidInput(
+                "direct prefill Q/K angle table exceeds metadata bank"
+            )
+        }
+        angleData.data.withUnsafeBytes { source in
+            bankBytes.withUnsafeMutableBytes {
+                (destination: UnsafeMutableRawBufferPointer) in
+                destination.baseAddress!.advanced(by: angleByteOffset)
+                    .copyMemory(from: source.baseAddress!, byteCount: expectedAngleBytes)
+            }
+        }
+
+        let bankBits = MLXArray(
+            bankBytes,
+            [bankRows, hidden],
+            dtype: .uint16
+        )
+        return bankBits.view(dtype: .bfloat16).reshaped(
+            1, 1, bankRows, hidden)
+    }
+
+    private static func copyDirectBankTensor(
+        named name: String,
+        expectedShape: [Int],
+        from denseStore: DenseTensorStore,
+        into destination: inout Data,
+        atByteOffset byteOffset: Int
+    ) throws {
+        let tensor = try denseStore.materializedTensor(named: name)
+        guard tensor.dtype == .bf16, tensor.shape == expectedShape else {
+            throw MLXFastError.invalidInput(
+                "direct prefill Q/K tensor \(name) dtype/shape "
+                    + "\(tensor.dtype.rawValue) \(tensor.shape) does not match BF16 \(expectedShape)"
+            )
+        }
+        guard byteOffset >= 0,
+            byteOffset + tensor.bytes.count <= destination.count
+        else {
+            throw MLXFastError.invalidInput(
+                "direct prefill Q/K tensor \(name) exceeds retained bank"
+            )
+        }
+        tensor.bytes.withUnsafeBytes { source in
+            destination.withUnsafeMutableBytes {
+                (target: UnsafeMutableRawBufferPointer) in
+                target.baseAddress!.advanced(by: byteOffset)
+                    .copyMemory(from: source.baseAddress!, byteCount: tensor.bytes.count)
+            }
+        }
     }
 
     public func requireLibraryModel() throws -> LagunaRuntimeModel {

@@ -9,10 +9,14 @@ import MLXFastCore
 // model-specific loaders can come and go without touching this file.
 
 func loadRuntimeWeightArrays(
-    denseStore: DenseTensorStore
+    denseStore: DenseTensorStore,
+    excludingOriginalNames: Set<String> = []
 ) throws -> [String: MLXArray] {
     let bridge = MLXArrayTensorBridge()
-    return try loadRuntimeWeightValues(denseStore: denseStore) { tensor in
+    return try loadRuntimeWeightValues(
+        denseStore: denseStore,
+        excludingOriginalNames: excludingOriginalNames
+    ) { tensor in
         try bridge.makeArray(from: tensor)
     }
 }
@@ -24,8 +28,18 @@ func loadRuntimeWeightArrays(
 /// bytes into MLX-owned storage.
 func loadRuntimeWeightValues<Value>(
     denseStore: DenseTensorStore,
+    excludingOriginalNames: Set<String> = [],
     makeValue: (MaterializedTensor) throws -> Value
 ) throws -> [String: Value] {
+    let indexedNames = Set(denseStore.tensorNames)
+    let unknownExclusions = excludingOriginalNames.subtracting(indexedNames).sorted()
+    guard unknownExclusions.isEmpty else {
+        throw MLXFastError.invalidInput(
+            "runtime weight exclusions contain unindexed tensors: "
+                + unknownExclusions.joined(separator: ", ")
+        )
+    }
+
     let directory = URL(fileURLWithPath: denseStore.weightsPath)
     let entries = try FileManager.default.contentsOfDirectory(
         at: directory, includingPropertiesForKeys: nil
@@ -39,12 +53,17 @@ func loadRuntimeWeightValues<Value>(
     )
 
     var loadedWeights: [String: Value] = [:]
-    loadedWeights.reserveCapacity(denseStore.tensorNames.count)
-    var expectedLoadedNames: Set<String> = []
+    loadedWeights.reserveCapacity(indexedNames.count - excludingOriginalNames.count)
+    var expectedPhysicalNames: Set<String> = []
+    var expectedMaterializedNames: Set<String> = []
+    var materializedNames: Set<String> = []
     var nameTracker = RuntimeWeightNameTracker()
     for shardName in shardNames {
         let expectedNames = denseStore.tensorNames(inShard: shardName)
-        expectedLoadedNames.formUnion(expectedNames)
+        expectedPhysicalNames.formUnion(expectedNames)
+        expectedMaterializedNames.formUnion(
+            expectedNames.subtracting(excludingOriginalNames)
+        )
         let shard = directory.appendingPathComponent(shardName)
         let discoveredNames = Set(try Safetensors.readHeader(shard).tensors.keys)
         try validateRuntimeTensorInventory(
@@ -52,16 +71,56 @@ func loadRuntimeWeightValues<Value>(
             expectedNames: expectedNames,
             discoveredNames: discoveredNames
         )
-        try denseStore.forEachMaterializedTensor(inShard: shardName) { record, tensor in
-            let renamed = try nameTracker.register(
-                originalName: record.name,
+
+        // Register every physical name before applying the materialization
+        // filter. Excluded tensors therefore still participate in duplicate
+        // and post-prefix collision checks, and validateComplete continues to
+        // cover the full on-disk inventory rather than only returned values.
+        var runtimeNamesByOriginal: [String: String] = [:]
+        runtimeNamesByOriginal.reserveCapacity(expectedNames.count)
+        for originalName in expectedNames.sorted() {
+            runtimeNamesByOriginal[originalName] = try nameTracker.register(
+                originalName: originalName,
                 shardName: shardName,
                 expectedNames: expectedNames
             )
+        }
+
+        try denseStore.forEachMaterializedTensor(
+            inShard: shardName,
+            excludingNames: excludingOriginalNames
+        ) { record, tensor in
+            guard materializedNames.insert(record.name).inserted else {
+                throw MLXFastError.invalidInput(
+                    "duplicate materialized safetensors tensor \(record.name)"
+                )
+            }
+            guard let renamed = runtimeNamesByOriginal[record.name] else {
+                throw MLXFastError.invalidInput(
+                    "safetensors tensor \(record.name) was not registered in \(shardName)"
+                )
+            }
             loadedWeights[renamed] = try makeValue(tensor)
         }
     }
-    try nameTracker.validateComplete(expectedNames: expectedLoadedNames)
+    try nameTracker.validateComplete(expectedNames: expectedPhysicalNames)
+
+    let missingMaterialized = expectedMaterializedNames
+        .subtracting(materializedNames).sorted()
+    guard missingMaterialized.isEmpty else {
+        throw MLXFastError.invalidInput(
+            "indexed safetensors tensors were not materialized: "
+                + missingMaterialized.joined(separator: ", ")
+        )
+    }
+    let unexpectedMaterialized = materializedNames
+        .subtracting(expectedMaterializedNames).sorted()
+    guard unexpectedMaterialized.isEmpty else {
+        throw MLXFastError.invalidInput(
+            "excluded or unindexed safetensors tensors were materialized: "
+                + unexpectedMaterialized.joined(separator: ", ")
+        )
+    }
     return loadedWeights
 }
 

@@ -35,9 +35,12 @@ public final class DenseTensorStore {
     /// Visits a shard in file order while keeping each tensor's source `Data`
     /// inside its own autorelease pool. Callers that copy the tensor into its
     /// final runtime representation during `body` never retain source bytes
-    /// beyond one tensor.
+    /// beyond one tensor. `excludingNames` suppresses the source read itself;
+    /// callers remain responsible for validating those names against the
+    /// complete indexed inventory before using this lower-level hook.
     func forEachMaterializedTensor(
         inShard shard: String,
+        excludingNames: Set<String> = [],
         _ body: (DenseTensorRecord, MaterializedTensor) throws -> Void
     ) throws {
         let records = recordsByName.values
@@ -54,11 +57,18 @@ public final class DenseTensorStore {
             )
         }
 
+        let materializedRecords = records.filter {
+            !excludingNames.contains($0.name)
+        }
+        guard !materializedRecords.isEmpty else {
+            return
+        }
+
         let handle = try uncachedReadHandle(forShard: shard)
         defer {
             try? handle.close()
         }
-        for record in records {
+        for record in materializedRecords {
             try autoreleasepool {
                 let tensor = try materializeTensor(
                     name: record.name,
