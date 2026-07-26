@@ -106,11 +106,23 @@ let lagunaFusedQKVEnabled =
 
 /// `DARKBLOOM_FUSED_SHARED_GATE_UP` (default on; set "0" to disable): after
 /// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
-/// shared expert and serve single-token decode from one quantized matmul.
-/// Multi-token prefill remains on the stock separate banks so the ranked
-/// prefill path and its smaller gather/GEMM shapes are unchanged.
+/// shared expert. Decode consumes that bank from one quantized matmul; the
+/// independently ablatable prefill consumer is controlled immediately below.
 let lagunaFusedSharedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_GATE_UP"] != "0"
+
+/// `DARKBLOOM_PREFILL_FUSED_SHARED_GATE_UP` (default on; set "0" to
+/// disable): multi-token counterpart to the shared-expert decode fusion.
+/// The fused bank is already retained for decode, so this adds no weight
+/// layout or startup allocation. One N=1024 NVFP4 QMM replaces the separate
+/// N=512 gate/up QMMs, reading the common `[B, L, 2048]` activation once and
+/// eliminating one launch. Output rows remain `[gate; up]`; every row keeps
+/// the stock K-loop, scale application, BF16 result boundary, and subsequent
+/// `compiledSiluProduct` arithmetic. The disabled path is the stock pair of
+/// `QuantizedLinear` calls.
+let lagunaPrefillFusedSharedGateUpEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_FUSED_SHARED_GATE_UP"] != "0"
 
 /// Decode-only shared-expert NVFP4 QMV + SwiGLU fusion. This consumes the
 /// retained row-concatenated `[gate; up]` bank and emits only the 512-wide
@@ -3372,7 +3384,7 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if x.dim(1) == 1,
+        if (x.dim(1) == 1 || lagunaPrefillFusedSharedGateUpEnabled),
             let fusedWeight = _fusedGateUpWeight, let fusedScales = _fusedGateUpScales
         {
             if lagunaFusedSharedSwiGLUQMVEnabled,
@@ -3398,7 +3410,10 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             // guards in `prepareFusedSharedGateUp` pin those literals). Each
             // quantized output row is computed independently, so the split
             // halves are bit-exact vs. the separate gate/up dispatches.
-            lagunaTrace("shared fused [gate; up] bank QMM")
+            lagunaTrace(
+                x.dim(1) == 1
+                    ? "shared fused [gate; up] bank QMM"
+                    : "prefill shared fused [gate; up] bank QMM")
             let gateUp = MLX.quantizedMM(
                 x,
                 fusedWeight,
