@@ -502,11 +502,22 @@ void qmm_nax(
   std::string kname;
   kname.reserve(64);
   bool aligned = N % 64 == 0;
+  bool aligned_M = M % 64 == 0;
   bool batched = B > 1;
   std::string type_string = get_type_string(x.dtype());
+  static const bool static_laguna_shapes =
+      env::get_var("DARKBLOOM_STATIC_NVFP4_SHAPES", "") != "0";
+  const bool use_static_laguna_shape =
+      static_laguna_shapes && transpose && aligned && !batched &&
+      mode == "nvfp4" && type_string == "bfloat16_t" &&
+      group_size == 16 && bits == 4 && !biases.has_value() &&
+      ((K == 2048 && N == 1024) || (K == 512 && N == 2048));
   concatenate(
       kname,
-      mode + (transpose ? "_qmm_t_nax_" : "_qmm_n_nax_"),
+      mode +
+          (use_static_laguna_shape
+               ? "_qmm_t_nax_static_"
+               : (transpose ? "_qmm_t_nax_" : "_qmm_n_nax_")),
       type_string,
       "_gs_",
       group_size,
@@ -522,11 +533,32 @@ void qmm_nax(
       wm,
       "_wn",
       wn,
+      use_static_laguna_shape
+          ? ("_k" + std::to_string(K) + "_n" + std::to_string(N) +
+             "_alM_" + (aligned_M ? "true" : "false"))
+          : "",
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
       batched ? "_batch_1" : "_batch_0");
   std::string template_def;
   MTL::ComputePipelineState* kernel;
-  if (transpose) {
+  if (use_static_laguna_shape) {
+    kernel = get_qmm_nax_kernel_wrapped(
+        d,
+        kname,
+        "qmm_t_nax_static",
+        mode,
+        type_string,
+        group_size,
+        bits,
+        K,
+        N,
+        aligned_M,
+        bm,
+        bk,
+        bn,
+        wm,
+        wn);
+  } else if (transpose) {
     kernel = get_qmm_nax_kernel_wrapped(
         d,
         kname,
@@ -1472,18 +1504,25 @@ void gather_qmm_rhs_nax(
       darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
       group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
       align_N && align_K && bm == 64 && wm == 4 && wn == 2;
+  std::string type_string = get_type_string(x.dtype());
+  static const bool static_laguna_shapes =
+      env::get_var("DARKBLOOM_STATIC_NVFP4_SHAPES", "") != "0";
+  const bool static_expert_shape =
+      expert_aligned && static_laguna_shapes && mode == "nvfp4" &&
+      type_string == "bfloat16_t" && !biases_.has_value();
 
   // Make the kernel name
   std::string kname;
   kname.reserve(64);
-  std::string type_string = get_type_string(x.dtype());
   concatenate(
       kname,
       mode +
-          (expert_aligned
-               ? "_gather_qmm_rhs_expert_nax_nt_"
+          (static_expert_shape
+               ? "_gather_qmm_rhs_expert_static_nax_nt_"
+               : (expert_aligned
+                      ? "_gather_qmm_rhs_expert_nax_nt_"
                : (transpose ? "_gather_qmm_rhs_nax_nt_"
-                            : "_gather_qmm_rhs_nax_nn_")),
+                            : "_gather_qmm_rhs_nax_nn_"))),
       type_string,
       "_gs_",
       group_size,
@@ -1498,7 +1537,10 @@ void gather_qmm_rhs_nax(
       "_wm_",
       wm,
       "_wn_",
-      wn);
+      wn,
+      static_expert_shape
+          ? ("_k_" + std::to_string(K) + "_n_" + std::to_string(N))
+          : "");
 
   // Skipping dead runs is a pure work elision (see function constant 203 in
   // fp_quantized_nax): it drops only matmuls whose results store_slice never
@@ -1592,21 +1634,40 @@ void gather_qmm_rhs_nax(
 
   // Get and set the kernel
   auto& compute_encoder = metal::get_command_encoder(s);
-  auto kernel = get_gather_qmm_nax_kernel(
-      d,
-      kname,
-      hash_name,
-      func_consts,
-      x,
-      group_size,
-      bits,
-      mode,
-      bm,
-      bn,
-      bk,
-      wm,
-      wn,
-      transpose);
+  MTL::ComputePipelineState* kernel;
+  if (static_expert_shape) {
+    auto template_def = get_template_definition(
+        kname,
+        "fp_gather_qmm_rhs_expert_nax",
+        get_type_string(x.dtype()),
+        group_size,
+        bits,
+        bm,
+        bn,
+        bk,
+        wm,
+        wn,
+        transpose,
+        K,
+        N);
+    kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
+  } else {
+    kernel = get_gather_qmm_nax_kernel(
+        d,
+        kname,
+        hash_name,
+        func_consts,
+        x,
+        group_size,
+        bits,
+        mode,
+        bm,
+        bn,
+        bk,
+        wm,
+        wn,
+        transpose);
+  }
   compute_encoder.set_compute_pipeline_state(kernel);
 
   MTL::Size group_dims(32, wn, wm);
