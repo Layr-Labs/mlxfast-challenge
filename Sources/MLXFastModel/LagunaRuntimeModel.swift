@@ -200,6 +200,14 @@ let lagunaExpertAlignedGatherEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_EXPERT_ALIGNED_GATHER"] != "0"
 
+/// Prefill specialization: replace `gatherSort`'s two generic
+/// 4,096-element merge argsorts with a deterministic two-kernel stable count
+/// sort specialized to Laguna's fixed 256-expert, eight-routes-per-token
+/// geometry. Set `DARKBLOOM_PREFILL_STABLE_COUNT_SORT=0` to ablate.
+private let lagunaPrefillStableCountSortEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_STABLE_COUNT_SORT"] != "0"
+
 /// Decode post-attention residual + RMSNorm fusion. The kernel emits
 /// both the rounded BF16 residual (needed by the following skip connection)
 /// and the normalized row (consumed immediately by the MLP), eliminating a
@@ -3615,6 +3623,142 @@ private func lagunaInterleavedSwiGLU(
     return compiledSiluProduct(gate, up)
 }
 
+/// Stable-sort 4,096 flattened route coordinates in 32 independent chunks.
+/// Each route computes its exact stable rank inside a 128-row chunk, while
+/// the same threadgroup records the 257-entry expert-offset table consumed by
+/// the global merge below. There are no atomics or order-dependent writes.
+private let lagunaRouteChunkSortKernel = MLXFast.metalKernel(
+    name: "laguna_route_chunk_stable_sort_u32_v1",
+    inputNames: ["indices"],
+    outputNames: ["local_order", "chunk_offsets"],
+    source: """
+        constexpr uint chunk_size = 128;
+        constexpr uint expert_count = 256;
+
+        uint lane = thread_position_in_threadgroup.x;
+        uint chunk = threadgroup_position_in_grid.x;
+        uint source = chunk * chunk_size + lane;
+
+        threadgroup ushort route_ids[chunk_size];
+        threadgroup ushort counts[expert_count];
+
+        route_ids[lane] = ushort(indices[source]);
+        counts[lane] = 0;
+        counts[lane + chunk_size] = 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        ushort my_expert = route_ids[lane];
+        uint stable_rank = 0;
+        for (uint j = 0; j < chunk_size; ++j) {
+            ushort other = route_ids[j];
+            stable_rank +=
+                (other < my_expert || (other == my_expert && j < lane)) ? 1 : 0;
+        }
+
+        for (uint partition = 0; partition < 2; ++partition) {
+            uint expert = lane + partition * chunk_size;
+            ushort count = 0;
+            for (uint j = 0; j < chunk_size; ++j) {
+                count += route_ids[j] == ushort(expert) ? ushort(1) : ushort(0);
+            }
+            counts[expert] = count;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        local_order[chunk * chunk_size + stable_rank] = source;
+        if (lane == 0) {
+            uint prefix = 0;
+            uint offset_base = chunk * (expert_count + 1);
+            for (uint expert = 0; expert < expert_count; ++expert) {
+                chunk_offsets[offset_base + expert] = prefix;
+                prefix += uint(counts[expert]);
+            }
+            chunk_offsets[offset_base + expert_count] = prefix;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Merge the 32 chunk-local stable runs in chunk order. One thread owns one
+/// expert, so its destination interval is disjoint. The three outputs exactly
+/// match `indices[argSort(indices)]`, `argSort(indices).floorDivide(8)`, and
+/// `argSort(argSort(indices))`.
+private let lagunaRouteChunkMergeKernel = MLXFast.metalKernel(
+    name: "laguna_route_chunk_stable_merge_u32_v1",
+    inputNames: ["local_order", "chunk_offsets"],
+    outputNames: ["sorted_indices", "token_rows", "inverse_order"],
+    source: """
+        constexpr uint chunk_count = 32;
+        constexpr uint chunk_size = 128;
+        constexpr uint expert_count = 256;
+        constexpr uint routes_per_token = 8;
+
+        uint expert = thread_position_in_threadgroup.x;
+        threadgroup uint totals[expert_count];
+
+        uint total = 0;
+        for (uint chunk = 0; chunk < chunk_count; ++chunk) {
+            uint offset_base = chunk * (expert_count + 1);
+            total +=
+                chunk_offsets[offset_base + expert + 1] -
+                chunk_offsets[offset_base + expert];
+        }
+        totals[expert] = total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint destination = 0;
+        for (uint prior = 0; prior < expert; ++prior) {
+            destination += totals[prior];
+        }
+
+        for (uint chunk = 0; chunk < chunk_count; ++chunk) {
+            uint offset_base = chunk * (expert_count + 1);
+            uint begin = chunk_offsets[offset_base + expert];
+            uint end = chunk_offsets[offset_base + expert + 1];
+            for (uint local = begin; local < end; ++local) {
+                uint source =
+                    local_order[chunk * chunk_size + local];
+                sorted_indices[destination] = expert;
+                token_rows[destination] = source / routes_per_token;
+                inverse_order[source] = destination;
+                ++destination;
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private func lagunaStableRouteSort(
+    x: MLXArray, indices: MLXArray
+) -> (MLXArray, MLXArray, MLXArray) {
+    precondition(indices.dtype == .uint32)
+    precondition(indices.size == 4096)
+    precondition(indices.dim(-1) == LagunaConstants.numExpertsPerTok)
+
+    let chunked = lagunaRouteChunkSortKernel(
+        [indices.flattened()],
+        grid: (4096, 1, 1),
+        threadGroup: (128, 1, 1),
+        outputShapes: [[4096], [32 * 257]],
+        outputDTypes: [.uint32, .uint32]
+    )
+    let merged = lagunaRouteChunkMergeKernel(
+        chunked,
+        grid: (256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[4096], [4096], [4096]],
+        outputDTypes: [.uint32, .uint32, .uint32]
+    )
+    let sortedIndices = merged[0]
+    let tokenRows = merged[1]
+    let inverseOrder = merged[2]
+    return (
+        x.flattened(start: 0, end: -3)[tokenRows],
+        sortedIndices,
+        inverseOrder
+    )
+}
+
 /// Prefill (multi-token, SORTED-regime) counterpart to the decode-only fused
 /// gate/up dispatch in `LagunaRuntimeSparseMoEBlock.forward`. One gather-QMM
 /// consumes the retained `[gate32, up32]`-interleaved NVFP4 bank in place of
@@ -3643,7 +3787,16 @@ private func lagunaFusedSortedRoutedGateUp(
     var inverseOrder = MLXArray()
     // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
     if doSort {
-        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        if lagunaPrefillStableCountSortEnabled,
+            indices.dtype == .uint32,
+            indices.size == 4096,
+            indices.dim(-1) == LagunaConstants.numExpertsPerTok
+        {
+            (sortedX, idx, inverseOrder) = lagunaStableRouteSort(
+                x: sortedX, indices: indices)
+        } else {
+            (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        }
     }
     // Fused counterpart of SwitchGLU's separate-bank branch:
     //   xUp = upProj(x, idx, sortedIndices: doSort)
