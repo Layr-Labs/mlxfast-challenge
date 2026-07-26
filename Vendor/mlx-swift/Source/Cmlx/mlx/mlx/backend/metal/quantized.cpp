@@ -1255,6 +1255,58 @@ bool darkbloom_expert_aligned_gather() {
   return v;
 }
 
+// DARKBLOOM_DIRECT_FINAL_ROW_STORES (default on; "0" reverts to the stock
+// Swift-side gatherSort/scatterUnsort round trip -- see the "Direct
+// final-row stores" section in
+// Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift).
+//
+// The expert-aligned kernel (`fp_gather_qmm_rhs_expert_nax`) already visits
+// every sorted row exactly once. Its down-projection dispatch
+// (`K == 512 && N == 2048`, the second leg of `laguna_moe_shape` below)
+// normally stores each row to a contiguous SORTED position, which the
+// Swift caller then has to undo with a second `argSort` (`inverseOrder`)
+// and a full `[M, hiddenDims]` gather (`scatterUnsort`). When this is on,
+// the caller instead encodes the original flattened routing slot into the
+// low 20 bits of each row's sort key (expert id in the high bits) and the
+// kernel decodes that to store each row directly at its final slot,
+// eliminating both.
+//
+// This flag alone only says whether the OPTIMIZATION IS PERMITTED; whether
+// it fires for a specific dispatch is `expert_aligned` (computed per-call
+// below from M/N/K/mode/align/tiling, identically for gate/up and down).
+// It is safe to gate purely on `expert_aligned` -- with no per-call opt-in
+// threaded through the frozen `gatherQuantizedMM` primitive -- only because
+// EVERY editable-surface Swift caller that can reach this shape encodes its
+// indices and skips the unsort in lockstep (see the safety-contract comment
+// in SwitchLayers.swift). Resolved once per process, like every other
+// DARKBLOOM_* dispatch flag in this file.
+bool darkbloom_direct_final_row_stores_enabled() {
+  static const bool v =
+      env::get_var("DARKBLOOM_DIRECT_FINAL_ROW_STORES", "") != "0";
+  return v;
+}
+
+// DARKBLOOM_DIRECT_GATHER_LOADS (default on; "0" reverts to the stock
+// Swift-side physical gather that materializes sortedX -- see
+// `lagunaFusedSortedRoutedGateUp` in LagunaRuntimeModel.swift).
+//
+// Symmetric, input-side counterpart to darkbloom_direct_final_row_stores_enabled
+// above: instead of storing each row to a permuted OUTPUT address, this lets
+// the gate/up leg (K == 2048, N == 1024, the first leg of laguna_moe_shape)
+// load each row from a permuted SOURCE address -- raw, un-gathered x (512
+// rows) instead of a physically pre-gathered 4096-row copy. Independent of
+// DARKBLOOM_DIRECT_FINAL_ROW_STORES: each is honored only on its own leg
+// (K==2048&&N==1024 for loads, K==512&&N==2048 for stores) of the shared
+// expert-aligned pipeline, so either can be 0 while the other is 1 with no
+// interaction (see the trailing_scalar_arg bit split in gather_qmm_rhs_nax
+// and the exhaustive combination table in
+// Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift).
+bool darkbloom_direct_gather_loads_enabled() {
+  static const bool v =
+      env::get_var("DARKBLOOM_DIRECT_GATHER_LOADS", "") != "0";
+  return v;
+}
+
 // DARKBLOOM_STAGE_BM128: select the gather-GEMM m-tiling. NOT a function
 // constant -- it changes the template instantiation, so it is already in
 // `kname` (`_bm_`/`_wm_`/`_wn_`) and therefore in the library name and the
@@ -1415,6 +1467,7 @@ void gather_qmm_rhs_nax(
     const array& scales_,
     const std::optional<array>& biases_,
     const array& indices_,
+    const std::optional<array>& lhs_indices_,
     array& out,
     bool transpose,
     int group_size,
@@ -1445,11 +1498,6 @@ void gather_qmm_rhs_nax(
     return ensure_row_contiguous(new_x, d, s);
   };
 
-  // Normalize the input arrays
-  array x = broadcast_with_indices(x_);
-  array w = ensure_row_contiguous(w_, d, s);
-  array scales = ensure_row_contiguous(scales_, d, s);
-
   // TODO: Tune the block sizes
   int bm = 64, bn = 64, bk = 64;
   int wm = 2, wn = 2;
@@ -1468,10 +1516,84 @@ void gather_qmm_rhs_nax(
   const bool align_K = (K % bk) == 0;
   const bool laguna_moe_shape =
       (K == 2048 && N == 1024) || (K == 512 && N == 2048);
+  // Computed here, BEFORE x is normalized, specifically so the
+  // DARKBLOOM_DIRECT_GATHER_LOADS x-normalization decision right below can
+  // depend on it -- see the comment there. None of align_M/align_N/align_K/
+  // laguna_moe_shape/expert_aligned read x, only the scalar M/N/K/mode/
+  // transpose/group_size/bits parameters and the bm/wm/wn tiling choice
+  // above, so hoisting this block ahead of "Normalize the input arrays"
+  // changes nothing about what it computes.
   const bool expert_aligned =
       darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
       group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
       align_N && align_K && bm == 64 && wm == 4 && wn == 2;
+
+  // DARKBLOOM_DIRECT_GATHER_LOADS: `lhs_indices_` is only ever non-nullopt
+  // when the caller (GatherQMM::eval_gpu below) has already certified this
+  // exact call as the Laguna gate/up leg raw-x case -- see
+  // `direct_gather_loads_capable` there. `x_` in that case is the SMALL raw
+  // (numTokens, 1, hiddenDims) array, not a physically pre-sorted copy;
+  // `broadcast_with_indices` was written for the "lhs_indices omitted"
+  // contract (either x already has one row per rhs index, or x needs a
+  // true broadcast-repeat) and does not know how to gather -- calling it
+  // here would either throw (512 does not broadcast to 4096) or, worse,
+  // silently materialize exactly the 4096-row copy this lever exists to
+  // avoid. So this path never calls it: x is left as its own small,
+  // already-contiguous self, and `fp_gather_qmm_rhs_expert_nax` derives
+  // each row's real source row from the SAME encoded `indices` entry its
+  // run-boundary search already reads (see kDirectLoadTokenShift in
+  // fp_quantized_nax.cpp).
+  //
+  // Gated on `expert_aligned` (not just `lhs_indices_.has_value()`): the
+  // Swift-side eligibility mirror (`lagunaDirectGatherLoadEligible`,
+  // SwitchLayers.swift) is supposed to guarantee expert_aligned will hold
+  // whenever it supplies lhs_indices, but that guarantee lives in a
+  // DIFFERENT file the compiler cannot check for us. If the two ever drift
+  // -- lhs_indices supplied, but expert_aligned false here, e.g. from a
+  // future `DARKBLOOM_STAGE_BM128` conditions change on one side only --
+  // falling through to `broadcast_with_indices` with the small raw x would
+  // either throw (safe: 512 does not broadcast to 4096) or, if it ever did
+  // "succeed" some other way, hand the small buffer to a kernel expecting
+  // the full sorted-row count and read out of bounds. Failing loudly here
+  // instead is strictly safer than either.
+  const bool direct_gather_loads_requested = lhs_indices_.has_value();
+  if (direct_gather_loads_requested && !expert_aligned) {
+    throw std::runtime_error(
+        "[gather_qmm_rhs_nax] direct-gather-loads lhs_indices were supplied "
+        "but this call does not qualify for the expert-aligned kernel -- "
+        "the Swift-side eligibility mirror should have prevented this.");
+  }
+  const bool direct_gather_loads_capable_here =
+      direct_gather_loads_requested && expert_aligned;
+
+  // Normalize the input arrays
+  array x = direct_gather_loads_capable_here
+      ? ensure_row_contiguous(x_, d, s)
+      : broadcast_with_indices(x_);
+  array w = ensure_row_contiguous(w_, d, s);
+  array scales = ensure_row_contiguous(scales_, d, s);
+
+  // See darkbloom_direct_final_row_stores_enabled() above: permitted only
+  // on top of the expert-aligned kernel, and correct only because every
+  // Swift caller that can reach expert_aligned encodes its indices and
+  // skips scatterUnsort whenever this is true (SwitchLayers.swift's
+  // safety-contract comment). Applies uniformly to BOTH legs of
+  // laguna_moe_shape sharing this pipeline (gate/up at K=2048,N=1024 and
+  // down at K=512,N=2048): the kernel decodes the expert id out of every
+  // index it reads whenever this is set, and additionally decodes the
+  // original slot for its own store epilogue only on the K=512,N=2048 leg
+  // (see fp_gather_qmm_rhs_expert_nax in fp_quantized_nax.cpp).
+  const bool direct_final_store =
+      expert_aligned && darkbloom_direct_final_row_stores_enabled();
+
+  // Symmetric input-side counterpart, gate/up leg only (K==2048&&N==1024,
+  // the first leg of laguna_moe_shape). Reuses the same
+  // `direct_gather_loads_capable_here` the x-normalization step above
+  // already certified (expert_aligned AND lhs_indices supplied), so this
+  // is consistent with which x was actually bound to the kernel by
+  // construction, not a second independent check that could disagree.
+  const bool direct_gather_loads = direct_gather_loads_capable_here &&
+      darkbloom_direct_gather_loads_enabled() && K == 2048 && N == 1024;
 
   // Make the kernel name
   std::string kname;
@@ -1628,7 +1750,25 @@ void gather_qmm_rhs_nax(
   compute_encoder.set_bytes(M, c++);
   compute_encoder.set_bytes(N, c++);
   compute_encoder.set_bytes(K, c++);
-  compute_encoder.set_bytes(run_skip_pct, c++);
+  // fp_gather_qmm_rhs_expert_nax ignores run_skip_pct (RUNSKIP only exists
+  // in the generic, non-expert-aligned kernel below) and instead reads this
+  // same trailing scalar argument as two independent bits: a genuine
+  // per-dispatch runtime value, not a function constant, which is what lets
+  // it differ safely across dispatches sharing one compiled pipeline (see
+  // the comment on `direct_final_store` above -- the expert-aligned gate/up
+  // and down calls for one MoE layer share a single kname/pipeline, so a
+  // function constant could not distinguish "on" from "off" between them
+  // even if it needed to; here it never needs to, since both bits are each
+  // constant for the lifetime of the process and each leg's kernel code
+  // only ever consults the bit that applies to its own K/N):
+  //   bit 0 (1): direct_final_store_enabled -- honored only on the down
+  //              leg (K==512, N==2048).
+  //   bit 1 (2): direct_gather_loads_enabled -- honored only on the
+  //              gate/up leg (K==2048, N==1024).
+  const int trailing_scalar_arg = expert_aligned
+      ? ((direct_final_store ? 1 : 0) | (direct_gather_loads ? 2 : 0))
+      : run_skip_pct;
+  compute_encoder.set_bytes(trailing_scalar_arg, c++);
 
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
@@ -1648,7 +1788,8 @@ void gather_qmm_rhs(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string mode) {
+    const std::string mode,
+    const std::optional<array>& lhs_indices_ = std::nullopt) {
   if (metal::is_nax_available() && transpose &&
       (env::enable_tf32() || x_.dtype() != float32)) {
     return gather_qmm_rhs_nax(
@@ -1657,6 +1798,7 @@ void gather_qmm_rhs(
         /* const array& scales_ = */ scales_,
         /* const std::optional<array>& biases_ = */ biases_,
         /* const array& indices_ = */ indices_,
+        /* const std::optional<array>& lhs_indices_ = */ lhs_indices_,
         /* array& out = */ out,
         /* bool transpose = */ transpose,
         /* int group_size = */ group_size,
@@ -1667,6 +1809,24 @@ void gather_qmm_rhs(
         /* metal::Device& d = */ d,
         /* const Stream& s = */ s,
         /* const std::string mode = */ mode);
+  }
+
+  // Reaching here with lhs_indices_ set means direct_gather_loads_capable
+  // was true in GatherQMM::eval_gpu (below) while metal::is_nax_available()
+  // -- checked identically on the Swift side by `lagunaIsNAXAvailable`,
+  // SwitchLayers.swift -- is false. That combination should be structurally
+  // unreachable (the Swift eligibility mirror gates on the identical
+  // predicate before ever building an explicit lhs_indices array), so
+  // getting here anyway means the two sides have drifted. Fail loudly
+  // instead of silently falling through to a kernel family
+  // (`_gather_qmm_rhs_nt_`/`_gather_qmm_rhs_nn_` below) that has no gather
+  // decode at all and would read every encoded `(expertId << 20) | slot`
+  // index as a raw, wildly out-of-range expert id.
+  if (lhs_indices_) {
+    throw std::runtime_error(
+        "[gather_qmm_rhs] direct-gather-loads indices were supplied but "
+        "the NAX gather-QMM kernel is not available on this device -- the "
+        "Swift-side eligibility gate should have prevented this call.");
   }
 
   // Start by normalizing the indices
@@ -1898,11 +2058,37 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
 
+  // DARKBLOOM_DIRECT_GATHER_LOADS: `right_sorted_` (computed by the frozen
+  // `mlx::core::gather_qmm` in ops.cpp, NOT editable, as
+  // `sorted_indices && !lhs_indices_`) can only ever be true when the
+  // caller omitted lhs_indices -- there is no way to ask upstream for
+  // "sorted AND an explicit lhs gather" in one flag. Laguna's fused
+  // gate/up leg (K==2048, N==1024) wants exactly that: an explicit
+  // lhs_indices array (see `lagunaDirectGatherLoadEligible`,
+  // SwitchLayers.swift) purely to steer the FROZEN shape inference in
+  // ops.cpp (`out_shape = lhs_indices.shape() + [x.shape(-2), w_outer_dims]`)
+  // into allocating the full (sortedRows, 1, N) output from a SMALL raw x,
+  // while `right_sorted_` -- and therefore the stock branch below --
+  // necessarily reads false. `direct_gather_loads_capable` is this file's
+  // own, editable, alternative route: everything `right_sorted_==true`
+  // would otherwise certify (shape family, quantization mode/params,
+  // `transpose_`), replicated for the explicit-lhs_indices case. Nothing
+  // here is a substitute for the NAX-availability / stage-tiling / shape
+  // gating `expert_aligned` still performs one level down in
+  // `gather_qmm_rhs_nax` -- this only decides whether it is SAFE to hand
+  // lhs_indices through instead of erroring or silently materializing a
+  // broadcast copy.
+  const bool direct_gather_loads_capable = right_sorted_ == false &&
+      darkbloom_direct_gather_loads_enabled() && transpose_ &&
+      mode != "affine" && group_size_ == 16 && bits_ == 4 && K == 2048 &&
+      N == 1024;
+
   // We are walking x in order and w is also in order so we can batch up the
   // matmuls and reuse reading x and w.
   //
   // TODO: Tune 16 and 4 here a bit better.
-  if (M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4) {
+  if (M == 1 && B >= 16 && B / E >= 4 &&
+      (right_sorted_ == true || direct_gather_loads_capable)) {
     gather_qmm_rhs(
         x,
         w,
@@ -1913,12 +2099,23 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         transpose_,
         group_size_,
         bits_,
-        x.size() / K,
+        // `B` (== rhs_indices.size() == lhs_indices.size() after the
+        // broadcast in ops.cpp) is the number of SORTED rows the kernel
+        // must walk -- not `x.size() / K`, x's own physical row count.
+        // These coincide when lhs_indices was omitted (x is already
+        // gathered 1:1 with rhs_indices, the only case this used to run),
+        // but diverge exactly for the direct-gather-loads case (x is the
+        // small raw array; B is still the full sorted-row count). Passing
+        // x.size()/K there would truncate laguna_sorted_lower_bound's
+        // search window and silently drop most experts' runs.
+        B,
         N,
         K,
         d,
         s,
-        mode);
+        mode,
+        direct_gather_loads_capable ? std::make_optional(lhs_indices)
+                                     : std::nullopt);
     return;
   }
 

@@ -3632,7 +3632,8 @@ private func lagunaFusedSortedRoutedGateUp(
     downProj: SwitchLinear
 ) -> MLXArray {
     // SwitchGLU: `var x = MLX.expandedDimensions(x, axes: [-2, -3])`
-    var sortedX = MLX.expandedDimensions(x, axes: [-2, -3])
+    let expandedX = MLX.expandedDimensions(x, axes: [-2, -3])
+    var sortedX = expandedX
     // SwitchGLU: `let doSort = indices.size >= 64`. The call site already
     // guards `indices.size >= 64` before calling in, so this is always true
     // here; recomputed anyway so this function mirrors SwitchGLU verbatim
@@ -3641,9 +3642,103 @@ private func lagunaFusedSortedRoutedGateUp(
     // SwitchGLU: `var idx = indices` / `var inverseOrder = MLXArray()`
     var idx = indices
     var inverseOrder = MLXArray()
+    // Direct-final-row-store (output side, down leg) and direct-gather-loads
+    // (input side, gate/up leg) fast paths -- see the "Direct final-row
+    // stores" section in SwitchLayers.swift above `gatherSort`,
+    // `lagunaDirectFinalRowStoreEligible`, and `lagunaDirectGatherLoadEligible`.
+    // Unlike `SwitchGLU`'s stock `gate_proj`/`up_proj` (separate banks,
+    // N == moeIntermediateSize each, never expert-aligned), THIS fused
+    // bank's gate/up gather-QMM is itself N == 2 * split == 1024,
+    // K == hiddenSize == 2048 -- `laguna_moe_shape`'s first leg -- so it
+    // lands on the same expert-aligned kernel as down_proj whenever
+    // down_proj is eligible (both shapes are pinned by the same fixed
+    // Laguna config constants, and this function only runs when
+    // `_fusedRoutedGateUpSplit == LagunaConstants.moeIntermediateSize` is
+    // already verified by the call site). So, unlike `SwitchGLU`, a single
+    // encoded `idx` is safe to reuse for BOTH the gate/up dispatch below
+    // and the down dispatch whenever EITHER fast path is active: both
+    // decode the expert id out of it the same way in the kernel, and each
+    // leg additionally decodes only the bit it owns (down's slot for its
+    // store epilogue, gate/up's token index for its load).
+    //
+    // The two mechanisms are independent (`DARKBLOOM_DIRECT_GATHER_LOADS`
+    // and `DARKBLOOM_DIRECT_FINAL_ROW_STORES` each default on, either can
+    // be "0" alone) but share the SAME encoded `idx`, so this function
+    // covers all four combinations explicitly rather than composing two
+    // independent branches:
+    //   loads on,  stores on:  gate/up reads raw x directly (no gather);
+    //                          down stores directly (no scatterUnsort).
+    //   loads on,  stores off: gate/up reads raw x directly; down still
+    //                          writes contiguous SORTED output, so
+    //                          `inverseOrder` (the second argSort direct
+    //                          stores would otherwise remove) is computed
+    //                          here specifically to undo that.
+    //   loads off, stores on:  gate/up still needs the physical gather
+    //                          (this is the shipped behavior before this
+    //                          patch); down stores directly.
+    //   loads off, stores off: full stock `gatherSort` path, unchanged.
+    var directStored = false
+    var gateUpLHSIndices: MLXArray?
     // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
     if doSort {
-        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        let totalSlots = indices.size
+        let storesEligible: Bool
+        if let downQuantized = downProj as? QuantizedSwitchLinear {
+            storesEligible = lagunaDirectFinalRowStoreEligible(down: downQuantized, m: totalSlots)
+        } else {
+            storesEligible = false
+        }
+        let loadsEligible = lagunaDirectGatherLoadEligible(
+            m: totalSlots, k: LagunaConstants.hiddenSize, n: 2 * split)
+
+        if storesEligible || loadsEligible {
+            // Inlined `gatherSortKeyed` (rather than calling it) because
+            // this function additionally needs `order` itself: the loads
+            // path skips gathering x with it, and the stores-off/loads-on
+            // combination above needs it to build `inverseOrder`, neither
+            // of which `gatherSortKeyed`'s two-value return exposes.
+            let flatIndices = indices.flattened().asType(.uint32)
+            let slot = MLXArray.arange(flatIndices.size, dtype: .uint32)
+            let key = (flatIndices << 20) | slot
+            let order = argSort(key)
+            idx = key[order]
+
+            if loadsEligible {
+                // Skip the physical gather entirely: `sortedX` stays the
+                // small, raw, un-sorted (numTokens, 1, hiddenDims) array,
+                // and the gate/up leg's kernel derives each row's real
+                // source token from the same encoded `idx` its weight/run
+                // search already reads. `gateUpLHSIndices` exists only to
+                // steer the FROZEN `gather_qmm` shape inference
+                // (`ops.cpp`: `out_shape = lhs_indices.shape() + [x.shape(-2),
+                // w_outer_dims]`) into allocating the full sorted-row output
+                // from that small x; its VALUES are never read on the
+                // dispatch path this takes (`gather_qmm_rhs_nax` in
+                // `quantized.cpp` derives everything from `idx`/`rhs_indices`
+                // instead), so reusing `idx` -- already built, already the
+                // right shape and dtype -- avoids allocating a second
+                // throwaway array.
+                sortedX = expandedX.flattened(start: 0, end: -3)
+                gateUpLHSIndices = idx
+            } else {
+                let expertsPerTok = indices.dim(-1)
+                sortedX = expandedX.flattened(start: 0, end: -3)[order.floorDivide(expertsPerTok)]
+            }
+
+            if storesEligible {
+                directStored = true
+            } else {
+                // Stores are off (loads-only combination): down_proj still
+                // writes contiguous sorted-order output, so it still needs
+                // undoing. `order` was already computed above for the
+                // encoded-key sort; this is the same second `argSort`
+                // `gatherSort` always pays, just deferred until we know
+                // stores are off.
+                inverseOrder = argSort(order)
+            }
+        } else {
+            (sortedX, idx, inverseOrder) = gatherSort(x: expandedX, indices: indices)
+        }
     }
     // Fused counterpart of SwitchGLU's separate-bank branch:
     //   xUp = upProj(x, idx, sortedIndices: doSort)
@@ -3656,11 +3751,13 @@ private func lagunaFusedSortedRoutedGateUp(
     // tile-interleaved `fusedWeight`/`fusedScales` bank instead of twice over
     // the separate banks is the fusion; every other argument matches the
     // stock call exactly (group 16, 4-bit, NVFP4, transpose, doSort).
+    // `lhsIndices` is nil except on the direct-gather-loads path above.
     let gateUp = MLX.gatherQuantizedMM(
         sortedX,
         fusedWeight,
         scales: fusedScales,
         biases: nil,
+        lhsIndices: gateUpLHSIndices,
         rhsIndices: idx,
         transpose: true,
         groupSize: 16,
@@ -3684,7 +3781,11 @@ private func lagunaFusedSortedRoutedGateUp(
     var result = downProj(activated, idx, sortedIndices: doSort)
     // SwitchGLU: `if doSort { x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape) }`
     if doSort {
-        result = scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape)
+        if directStored {
+            result = unflattenDirectStored(x: result, shape: indices.shape)
+        } else {
+            result = scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape)
+        }
     }
     // SwitchGLU: `return MLX.squeezed(x, axis: -2)`
     return MLX.squeezed(result, axis: -2)

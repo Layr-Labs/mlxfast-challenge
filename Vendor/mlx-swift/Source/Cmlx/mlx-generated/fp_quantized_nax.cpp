@@ -1425,15 +1425,46 @@ template <
   }
 }
 
+// DARKBLOOM_DIRECT_FINAL_ROW_STORES: the number of low bits of an encoded
+// sort key reserved for the original flattened routing slot (expert id in
+// the remaining high bits). Matches the Swift-side encoding in
+// `gatherSortKeyed` (Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift):
+// `key = (uint32(expertId) << kDirectStoreSlotBits) | uint32(originalSlot)`.
+// 20 bits covers up to 2^20 - 1 routing slots (numTokens * numExpertsPerTok),
+// far beyond the frozen 512-token * 8-expert = 4096-slot prefill window.
+MLX_MTL_CONST uint32_t kDirectStoreSlotBits = 20u;
+MLX_MTL_CONST uint32_t kDirectStoreSlotMask =
+    (1u << kDirectStoreSlotBits) - 1u;
+
+// DARKBLOOM_DIRECT_GATHER_LOADS: a routing slot is `token * numExpertsPerTok
+// + expertSlotWithinToken`; numExpertsPerTok is fixed at 8 for Laguna
+// (`quantized.cpp`'s `direct_gather_loads_capable` requires the caller to
+// have checked this), so the token a slot belongs to is the slot right-
+// shifted by log2(8) == 3. Symmetric to kDirectStoreSlotBits/Mask above: the
+// down leg's store epilogue uses the whole decoded slot as its destination
+// row, the gate/up leg's load epilogue further divides it by 8 to recover
+// the source row in raw (un-gathered) x.
+MLX_MTL_CONST uint32_t kDirectLoadTokenShift = 3u;
+
+// `decode_expert_id`: when true, `indices` holds encoded
+// `(expertId << kDirectStoreSlotBits) | originalSlot` keys instead of plain
+// expert ids (see DARKBLOOM_DIRECT_FINAL_ROW_STORES above); every read of an
+// index for run-boundary comparison must go through this same decode. Since
+// the encoded key's low bits (the slot) monotonically increase within a
+// fixed expert id, decoding preserves the binary search's monotonicity
+// invariant exactly as if `indices` held plain ids.
 METAL_FUNC int laguna_sorted_lower_bound(
     const device uint32_t* indices,
     const int count,
-    const uint32_t value) {
+    const uint32_t value,
+    const bool decode_expert_id) {
   int lo = 0;
   int hi = count;
   while (lo < hi) {
     const int mid = lo + (hi - lo) / 2;
-    if (indices[mid] < value) {
+    const uint32_t key =
+        decode_expert_id ? (indices[mid] >> kDirectStoreSlotBits) : indices[mid];
+    if (key < value) {
       lo = mid + 1;
     } else {
       hi = mid;
@@ -1477,7 +1508,29 @@ template <
     uint lid [[thread_index_in_threadgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]]) {
-  (void)run_skip_pct;
+  // This kernel ignores RUNSKIP (fp_gather_qmm_rhs_nax's dead-run elision --
+  // it does not apply here since every tile this kernel visits is a real
+  // expert run by construction). DARKBLOOM_DIRECT_FINAL_ROW_STORES and
+  // DARKBLOOM_DIRECT_GATHER_LOADS instead repurpose this same trailing
+  // scalar argument as two independent bits (quantized.cpp's
+  // `trailing_scalar_arg`):
+  //   bit 0: the caller wants the down-projection leg (K==512, N==2048) to
+  //          store each row directly to its decoded slot instead of a
+  //          contiguous sorted position.
+  //   bit 1: the caller wants the gate/up leg (K==2048, N==1024) to load
+  //          each row directly from its decoded source token in raw x
+  //          instead of a physically pre-gathered copy.
+  // EITHER bit being set means `indices` holds encoded
+  // `(expertId << kDirectStoreSlotBits) | originalSlot` keys rather than
+  // plain expert ids -- both legs share one `indices` array per MoE layer
+  // (see LagunaRuntimeModel.swift's `lagunaFusedSortedRoutedGateUp`), so
+  // the run-boundary search below must decode whenever EITHER fast path is
+  // active, not only when its own leg's bit is set. See
+  // darkbloom_direct_final_row_stores_enabled() /
+  // darkbloom_direct_gather_loads_enabled() in quantized.cpp.
+  const bool direct_final_store_enabled = (run_skip_pct & 1) != 0;
+  const bool direct_gather_loads_enabled = (run_skip_pct & 2) != 0;
+  const bool indices_are_encoded = run_skip_pct != 0;
   static_assert(transpose, "expert-aligned Laguna QMM requires NT weights");
   static_assert(group_size == 16, "expert-aligned Laguna QMM requires gs16");
   static_assert(bits == 4, "expert-aligned Laguna QMM requires NVFP4");
@@ -1536,8 +1589,10 @@ template <
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0) {
-      bounds[0] = laguna_sorted_lower_bound(indices, M, expert);
-      bounds[1] = laguna_sorted_lower_bound(indices, M, expert + 1);
+      bounds[0] = laguna_sorted_lower_bound(
+          indices, M, expert, indices_are_encoded);
+      bounds[1] = laguna_sorted_lower_bound(
+          indices, M, expert + 1, indices_are_encoded);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1553,6 +1608,47 @@ template <
 
       NAXTile<float, TM, TN> Dtile;
       Dtile.clear();
+
+      // DARKBLOOM_DIRECT_GATHER_LOADS (gate/up leg only, K==2048&&N==1024):
+      // symmetric input-side counterpart to the down leg's row-scatter
+      // store below. Instead of reading this chunk's A-tile from a
+      // physically pre-sorted copy of x, decode each of this lane's TWO
+      // owned tile-rows' ORIGINAL TOKEN from the same encoded `indices`
+      // entry the weight-run search above already reads (token = slot >>
+      // kDirectLoadTokenShift, since numExpertsPerTok == 8 routing slots
+      // share one token) and read directly from the small, un-gathered raw
+      // `x` (numTokens rows here vs. up to BM sorted rows per chunk -- up
+      // to 8x reuse of the same SLC-resident token row across the 8
+      // routing slots that share it). Precomputed ONCE per chunk, exactly
+      // like the store side's row decode: the row set a lane owns
+      // (`tile_row`/`sgp_sm`) is fixed for the whole chunk, so the
+      // pointer/validity pair is invariant across every K_it/kk1 step
+      // below, even though the ACTUAL token each points at varies row by
+      // row (unlike the stock contiguous `xn`, which advances by a fixed
+      // `K` stride per row because every row in a physically pre-sorted
+      // chunk really is contiguous).
+      const bool direct_load_leg = direct_gather_loads_enabled && N == 1024 && K == 2048;
+      using AFrag = typename decltype(Dtile)::NAXFrag_t; // same BaseNAXFrag geometry as the store side
+      const short2 a_sc = AFrag::get_coord();
+      const device T* gather_row_ptr[AFrag::kElemRows];
+      bool gather_row_valid[AFrag::kElemRows];
+      if (direct_load_leg) {
+        static_assert(
+            TM == 1,
+            "direct gather loads assume the shipped BM64/WM4/WN2 tiling "
+            "(SM == 16, one 16-row fragment per simdgroup)");
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < AFrag::kElemRows; ++i) {
+          const short tile_row = a_sc.y + i * AFrag::kElemRowsJump;
+          gather_row_valid[i] = tile_row < sgp_sm;
+          const int phys_row = chunk_start + int(tm) + int(tile_row);
+          const int token_idx = gather_row_valid[i]
+              ? int((indices[phys_row] & kDirectStoreSlotMask) >>
+                    kDirectLoadTokenShift)
+              : 0;
+          gather_row_ptr[i] = x + size_t(token_idx) * K;
+        }
+      }
 
       const device T* xn =
           x + size_t(chunk_start + tm) * K;
@@ -1576,7 +1672,33 @@ template <
             NAXTile<Wtype, TN, TK> Btile;
             volatile int compiler_barrier;
 
-            if (sgp_sm == SM) {
+            if (direct_load_leg) {
+              // Per-lane manual fill, mirroring BaseNAXFrag::load's own
+              // (row, col) decomposition exactly (same `a_sc.y`/`a_sc.x`
+              // this lane would use for the contiguous load, same
+              // `kElemRowsJump` row spacing, same TK column fragments in
+              // the same order) -- the only thing that changes is which
+              // ROW each lane's two owned rows reads from: a decoded
+              // per-row token pointer instead of one shared base pointer
+              // plus a uniform row stride. A masked-out row (tail chunk,
+              // `sgp_sm < SM`) reads zero, matching `Atile.load_safe`'s own
+              // zero-fill for the identical case.
+              STEEL_PRAGMA_UNROLL
+              for (short i = 0; i < AFrag::kElemRows; ++i) {
+                const device T* row_src = gather_row_ptr[i] + kk1 + a_sc.x;
+                STEEL_PRAGMA_UNROLL
+                for (short idx_col = 0; idx_col < TK; ++idx_col) {
+                  STEEL_PRAGMA_UNROLL
+                  for (short j = 0; j < AFrag::kElemCols; ++j) {
+                    Atile.frag_at(0, idx_col)[i * AFrag::kElemCols + j] =
+                        gather_row_valid[i]
+                            ? static_cast<T>(
+                                  row_src[idx_col * AFrag::kFragCols + j])
+                            : T(0);
+                  }
+                }
+              }
+            } else if (sgp_sm == SM) {
               Atile.load(xn + kk1, K);
             } else {
               Atile.load_safe(
@@ -1631,13 +1753,72 @@ template <
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
       } else if (sg_active) {
-        device T* yn =
-            y + size_t(chunk_start + tm) * N + y_col + tn;
-        if (sgp_sm == SM) {
-          Dtile.store(yn, N);
+        // DARKBLOOM_DIRECT_FINAL_ROW_STORES down-projection leg (K == 512,
+        // N == 2048, the shape `fuse_swiglu` above excludes). Instead of
+        // storing this simdgroup's SM rows to the contiguous SORTED
+        // position `chunk_start + tm` (which the Swift caller would then
+        // have to undo with a second argSort + a full [M, hiddenDims]
+        // gather -- scatterUnsort), decode each row's ORIGINAL flattened
+        // routing slot from the low kDirectStoreSlotBits of its own
+        // `indices` entry and store straight there. `direct_final_store_enabled`
+        // is a genuine per-dispatch runtime value (not a function constant,
+        // per the comment on the kernel's `run_skip_pct` parameter above),
+        // so it is safe for it to be true here yet false for a different
+        // shape sharing this same compiled pipeline (it never is in
+        // practice -- see quantized.cpp -- but the mechanism does not rely
+        // on that).
+        //
+        // Exactness: this only changes the DEVICE ADDRESS a row is written
+        // to, via the exact per-lane (row, col) decomposition
+        // BaseNAXFrag::store already uses (get_coord() gives the same
+        // `sc.y`/`sc.x` this lane would use for the contiguous store; the
+        // row jump `kElemRowsJump` and the two TN column fragments are
+        // walked in the same order). The accumulated value, its rounding to
+        // T, and which (row, col) each lane owns are byte-for-byte
+        // identical to the `Dtile.store`/`store_slice` calls below; indices
+        // is a bijection between sorted rows [0, M) and the tokens' 4096
+        // original routing slots (each token/expert pair sorted exactly
+        // once), so every output row is still written exactly once, just at
+        // a permuted address.
+        const bool direct_store_this_call =
+            direct_final_store_enabled && N == 2048 && K == 512;
+        if (direct_store_this_call) {
+          using Frag = typename decltype(Dtile)::NAXFrag_t;
+          static_assert(
+              TM == 1,
+              "direct final-row store assumes the shipped BM64/WM4/WN2 "
+              "tiling (SM == 16, one 16-row fragment per simdgroup)");
+          const short2 sc = Frag::get_coord();
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < Frag::kElemRows; ++i) {
+            const short tile_row = sc.y + i * Frag::kElemRowsJump;
+            if (tile_row >= sgp_sm) {
+              continue;
+            }
+            const int phys_row = chunk_start + int(tm) + int(tile_row);
+            const uint32_t encoded = indices[phys_row];
+            const int dest_row = int(encoded & kDirectStoreSlotMask);
+            device T* row_base =
+                y + size_t(dest_row) * N + y_col + tn + sc.x;
+            STEEL_PRAGMA_UNROLL
+            for (short fcol = 0; fcol < TN; ++fcol) {
+              const thread auto& frag = Dtile.frag_at(0, fcol);
+              STEEL_PRAGMA_UNROLL
+              for (short j = 0; j < Frag::kElemCols; ++j) {
+                row_base[fcol * Frag::kFragCols + j] =
+                    static_cast<T>(frag[i * Frag::kElemCols + j]);
+              }
+            }
+          }
         } else {
-          Dtile.store_slice(
-              yn, N, short2(0, 0), short2(SN, sgp_sm));
+          device T* yn =
+              y + size_t(chunk_start + tm) * N + y_col + tn;
+          if (sgp_sm == SM) {
+            Dtile.store(yn, N);
+          } else {
+            Dtile.store_slice(
+                yn, N, short2(0, 0), short2(SN, sgp_sm));
+          }
         }
       }
     }
