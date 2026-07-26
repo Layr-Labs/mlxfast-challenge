@@ -3640,6 +3640,14 @@ private let lagunaPrefillRouterTop8Enabled =
 private let lagunaPrefillMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_MOE_TAIL"] != "0"
 
+/// Default-off probe: keep the routed down projection in expert-sorted order
+/// and let the fused MoE tail gather each original `(token, slot)` row through
+/// `gatherSort`'s already-computed inverse permutation. This removes
+/// `scatterUnsort`'s full expert-bank copy without changing the eight-slot
+/// weighted reduction order.
+private let lagunaPrefillSortedMoETailEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_SORTED_MOE_TAIL"] != "0"
+
 /// Batched top-8 selection for multi-token (prefill) routing.
 ///
 /// Exactness against the stock chain it replaces, per row:
@@ -4177,6 +4185,52 @@ private let lagunaPrefillMoETailKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Sorted-input twin of `lagunaPrefillMoETailKernel`. `inverse_order[p]` is
+/// the row in the expert-sorted down-projection output that
+/// `scatterUnsort(...)[p]` would copy to original flattened slot `p`.
+/// Reading that row directly preserves the stock slot-0-through-slot-7 BF16
+/// multiply/add sequence while deleting the intervening 16 MiB copy at the
+/// ranked 512-token window.
+private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_sorted_moe_tail_bf16_v1",
+    inputNames: [
+        "sorted_expert_outputs", "inverse_order", "router_weights",
+        "shared_output", "residual",
+    ],
+    outputNames: ["output"],
+    source: """
+        constexpr uint hidden = 2048;
+        constexpr uint experts = 8;
+        constexpr uint n_cols = 4;
+
+        uint row = thread_position_in_grid.y;
+        uint col = thread_position_in_grid.x * n_cols;
+        const device float* weight_row = router_weights + row * experts;
+
+        bfloat expert_weights[experts];
+        uint sorted_rows[experts];
+        for (uint e = 0; e < experts; ++e) {
+            expert_weights[e] = bfloat(weight_row[e]);
+            sorted_rows[e] = inverse_order[row * experts + e];
+        }
+
+        for (uint i = 0; i < n_cols; ++i) {
+            bfloat total = bfloat(0);
+            for (uint e = 0; e < experts; ++e) {
+                bfloat product = bfloat(
+                    sorted_expert_outputs[sorted_rows[e] * hidden + col + i] *
+                    expert_weights[e]);
+                total = bfloat(product + total);
+            }
+            bfloat scaled = bfloat(total * bfloat(2.5f));
+            bfloat r2 = bfloat(scaled + shared_output[row * hidden + col + i]);
+            output[row * hidden + col + i] =
+                bfloat(residual[row * hidden + col + i] + r2);
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 private func lagunaPrefillMoETail(
     expertOutputs: MLXArray,
     routerWeights: MLXArray,
@@ -4198,6 +4252,39 @@ private func lagunaPrefillMoETail(
 
     return lagunaPrefillMoETailKernel(
         [expertOutputs, routerWeights, sharedOutput, residual],
+        grid: (LagunaConstants.hiddenSize / 4, rows, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1, rows, LagunaConstants.hiddenSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+private func lagunaPrefillSortedMoETail(
+    sortedExpertOutputs: MLXArray,
+    inverseOrder: MLXArray,
+    routerWeights: MLXArray,
+    sharedOutput: MLXArray,
+    residual: MLXArray
+) -> MLXArray {
+    let rows = routerWeights.dim(1)
+    precondition(sortedExpertOutputs.dtype == .bfloat16)
+    precondition(
+        sortedExpertOutputs.size
+            == rows * LagunaConstants.numExpertsPerTok * LagunaConstants.hiddenSize)
+    precondition(inverseOrder.dtype == .uint32)
+    precondition(inverseOrder.size == rows * LagunaConstants.numExpertsPerTok)
+    precondition(routerWeights.dtype == .float32)
+    precondition(routerWeights.shape == [1, rows, LagunaConstants.numExpertsPerTok])
+    precondition(sharedOutput.dtype == .bfloat16)
+    precondition(sharedOutput.shape == [1, rows, LagunaConstants.hiddenSize])
+    precondition(residual.dtype == .bfloat16)
+    precondition(residual.shape == [1, rows, LagunaConstants.hiddenSize])
+
+    return lagunaPrefillSortedMoETailKernel(
+        [
+            sortedExpertOutputs, inverseOrder, routerWeights, sharedOutput,
+            residual,
+        ],
         grid: (LagunaConstants.hiddenSize / 4, rows, 1),
         threadGroup: (256, 1, 1),
         outputShapes: [[1, rows, LagunaConstants.hiddenSize]],
@@ -4242,8 +4329,9 @@ private func lagunaFusedSortedRoutedGateUp(
     fusedWeight: MLXArray,
     fusedScales: MLXArray,
     split: Int,
-    downProj: SwitchLinear
-) -> MLXArray {
+    downProj: SwitchLinear,
+    deferUnsort: Bool
+) -> (output: MLXArray, inverseOrder: MLXArray?) {
     // SwitchGLU: `var x = MLX.expandedDimensions(x, axes: [-2, -3])`
     var sortedX = MLX.expandedDimensions(x, axes: [-2, -3])
     // SwitchGLU: `let doSort = indices.size >= 64`. The call site already
@@ -4296,11 +4384,14 @@ private func lagunaFusedSortedRoutedGateUp(
     // SwitchGLU: `x = downProj(activated, idx, sortedIndices: doSort)`
     var result = downProj(activated, idx, sortedIndices: doSort)
     // SwitchGLU: `if doSort { x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape) }`
-    if doSort {
+    if doSort && !deferUnsort {
         result = scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape)
     }
+    if doSort && deferUnsort {
+        return (result, inverseOrder)
+    }
     // SwitchGLU: `return MLX.squeezed(x, axis: -2)`
-    return MLX.squeezed(result, axis: -2)
+    return (MLX.squeezed(result, axis: -2), nil)
 }
 
 final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
@@ -4441,6 +4532,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         let (inds, weights) = gate(x, logits: routerLogits)
         var y: MLXArray
         var routedAlreadyReduced = false
+        var sortedTailInverseOrder: MLXArray?
         if let fusedWeight = _fusedRoutedGateUpWeight,
             let fusedScales = _fusedRoutedGateUpScales,
             let downProj = _routedDownProj,
@@ -4617,16 +4709,69 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 _fusedRoutedGateUpSplit == LagunaConstants.moeIntermediateSize
             {
                 lagunaTrace("prefill fused routed gate/up")
-                y = lagunaFusedSortedRoutedGateUp(
+                let routed = lagunaFusedSortedRoutedGateUp(
                     x,
                     indices: inds,
                     fusedWeight: fusedWeight,
                     fusedScales: fusedScales,
                     split: _fusedRoutedGateUpSplit,
-                    downProj: downProj
+                    downProj: downProj,
+                    deferUnsort:
+                        lagunaPrefillSortedMoETailEnabled
+                        && lagunaPrefillMoETailEnabled
+                        && residual != nil
                 )
+                y = routed.output
+                sortedTailInverseOrder = routed.inverseOrder
             } else {
                 y = switchMLP(x, inds)
+            }
+            if let inverseOrder = sortedTailInverseOrder,
+                lagunaPrefillMoETailEnabled,
+                let residual,
+                x.dim(1) > 1,
+                y.dtype == .bfloat16,
+                y.size
+                    == x.dim(1) * LagunaConstants.numExpertsPerTok
+                        * LagunaConstants.hiddenSize,
+                inverseOrder.dtype == .uint32,
+                inverseOrder.size == x.dim(1) * LagunaConstants.numExpertsPerTok,
+                weights.dtype == .float32,
+                weights.shape == [1, x.dim(1), LagunaConstants.numExpertsPerTok],
+                routedScalingFactor == Float(LagunaConstants.moeRoutedScalingFactor),
+                residual.dtype == .bfloat16,
+                residual.shape == [1, x.dim(1), LagunaConstants.hiddenSize]
+            {
+                let sharedOut = sharedExpert(x)
+                if sharedOut.dtype == .bfloat16, sharedOut.shape == residual.shape {
+                    lagunaTrace("prefill sorted moe tail")
+                    return lagunaPrefillSortedMoETail(
+                        sortedExpertOutputs: y,
+                        inverseOrder: inverseOrder,
+                        routerWeights: weights,
+                        sharedOutput: sharedOut,
+                        residual: residual
+                    )
+                }
+                // Preserve the stock fallback for an unexpected shared-expert
+                // shape while reusing the already-built shared output.
+                y = MLX.squeezed(
+                    scatterUnsort(x: y, invOrder: inverseOrder, shape: inds.shape),
+                    axis: -2)
+                var reduced = weightedExpertSum(y, weights.asType(y.dtype))
+                if routedScalingFactor != 1 {
+                    reduced = reduced * routedScalingFactor
+                }
+                return residual + (reduced + sharedOut)
+            }
+            if let inverseOrder = sortedTailInverseOrder {
+                // A generic guard declined after down_proj was deliberately
+                // left sorted. Restore the exact SwitchGLU representation
+                // before entering any stock consumer.
+                y = MLX.squeezed(
+                    scatterUnsort(x: y, invOrder: inverseOrder, shape: inds.shape),
+                    axis: -2)
+                sortedTailInverseOrder = nil
             }
             if lagunaPrefillMoETailEnabled,
                 let residual,
