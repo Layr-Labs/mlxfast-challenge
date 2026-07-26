@@ -1525,6 +1525,7 @@ template <
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
   constexpr short TK = SK / 16;
+  static_assert(SN == 32, "expert-aligned SwiGLU requires 32-column fragments");
 
   const short tm = SM * (simd_group_id / WN);
   const short tn = SN * (simd_group_id % WN);
@@ -1607,17 +1608,21 @@ template <
               gate_up_stage + tm * BN + tn);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg_active && (simd_group_id % WN) == 0) {
-          constexpr int activated_cols = BN / 2;
+        const short n_sg = simd_group_id % WN;
+        if (sg_active && (n_sg % 2) == 0) {
+          constexpr int activated_cols = SN;
+          const int pair = n_sg / 2;
           for (int linear = simd_lane_id;
                linear < int(sgp_sm) * activated_cols;
                linear += SIMD_SIZE) {
             const int row = linear / activated_cols;
             const int col = linear % activated_cols;
             const bfloat gate =
-                gate_up_stage[(tm + row) * BN + col];
+                gate_up_stage[
+                    (tm + row) * BN + pair * 2 * SN + col];
             const bfloat up =
-                gate_up_stage[(tm + row) * BN + activated_cols + col];
+                gate_up_stage[
+                    (tm + row) * BN + pair * 2 * SN + SN + col];
             const bfloat exp_abs = metal::exp(metal::abs(gate));
             const bfloat denominator = bfloat(1) + exp_abs;
             const bfloat z = bfloat(1) / denominator;
@@ -1625,7 +1630,8 @@ template <
                 gate < bfloat(0) ? z : bfloat(1) - z;
             const bfloat silu = bfloat(gate * sigmoid);
             y[size_t(chunk_start + tm + row) * (N / 2) +
-              size_t(tid.x) * activated_cols + col] =
+              size_t(tid.x) * (BN / 2) +
+              size_t(pair) * activated_cols + col] =
                 bfloat(silu * up);
           }
         }

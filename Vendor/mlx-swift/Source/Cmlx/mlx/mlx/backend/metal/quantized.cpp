@@ -1255,6 +1255,17 @@ bool darkbloom_expert_aligned_gather() {
   return v;
 }
 
+// Widen the expert-aligned tile without changing its per-simdgroup NAX
+// fragment: BM16/BN256/BK32/WM1/WN8 keeps SM16/SN32/SK32 and the same K
+// accumulation order, but an average 16-row Laguna expert run now gives all
+// eight simdgroups useful output columns. Four old BN64 threadgroups become
+// one BN256 threadgroup with a 20 KiB weight stage.
+bool darkbloom_expert_wide_gather() {
+  static const bool v =
+      env::get_var("DARKBLOOM_EXPERT_WIDE_GATHER", "") != "0";
+  return v;
+}
+
 // DARKBLOOM_STAGE_BM128: select the gather-GEMM m-tiling. NOT a function
 // constant -- it changes the template instantiation, so it is already in
 // `kname` (`_bm_`/`_wm_`/`_wn_`) and therefore in the library name and the
@@ -1463,15 +1474,32 @@ void gather_qmm_rhs_nax(
     default: break;                          // upstream: bm=64, wm=2, wn=2
   }
 
+  const bool laguna_moe_shape =
+      (K == 2048 && N == 1024) || (K == 512 && N == 2048);
+  const bool expert_wide =
+      darkbloom_expert_aligned_gather() &&
+      darkbloom_expert_wide_gather() && mode != "affine" && transpose &&
+      group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64;
+  if (expert_wide) {
+    bm = 16;
+    bn = 256;
+    bk = 32;
+    wm = 1;
+    wn = 8;
+  }
+
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
-  const bool laguna_moe_shape =
-      (K == 2048 && N == 1024) || (K == 512 && N == 2048);
+  const bool expert_geometry =
+      (expert_wide && bm == 16 && bn == 256 && bk == 32 &&
+       wm == 1 && wn == 8) ||
+      (!expert_wide && bm == 64 && bn == 64 && bk == 64 &&
+       wm == 4 && wn == 2);
   const bool expert_aligned =
       darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
       group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
-      align_N && align_K && bm == 64 && wm == 4 && wn == 2;
+      align_N && align_K && expert_geometry;
 
   // Make the kernel name
   std::string kname;
@@ -1534,8 +1562,9 @@ void gather_qmm_rhs_nax(
       fprintf(
           stderr,
           "mlxfast: stage active: widest=%d wideld=%d(req=%d wide_ok=%d) "
-          "runbar=%d novol=%d expert=%d bm128=%d bm=%d wm=%d wn=%d "
-          "w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d\n",
+          "runbar=%d novol=%d expert=%d wide=%d bm128=%d "
+          "bm=%d bn=%d bk=%d wm=%d wn=%d "
+          "w.offset=%zu transpose=%d bits=%d N=%d K=%d\n",
           int(stage_widest),
           int(stage_wideld),
           int(darkbloom_stage_wideld()),
@@ -1543,16 +1572,18 @@ void gather_qmm_rhs_nax(
           int(stage_runbar),
           int(stage_novol),
           int(expert_aligned),
+          int(expert_wide),
           bm128,
           bm,
+          bn,
+          bk,
           wm,
           wn,
           size_t(w.offset()),
           int(transpose),
           bits,
           N,
-          K,
-          bn);
+          K);
     });
   }
 
