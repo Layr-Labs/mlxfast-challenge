@@ -115,16 +115,19 @@ entirely into unified memory once at process startup on the official runner
 `m5-bench`). There is no weight streaming: the model is RAM-resident before
 scored prefill or decode.
 
-The optimized runtime also has alternate combined/co-tiled weight layouts that
-are profitable on the 128 GB ranked machine but would duplicate roughly
-14.5 GiB of active model data on a 40 GiB Mac. At process startup, machines
-with less than 64 GiB therefore select a low-memory profile automatically:
-large persistent co-tiles and compiled decode are disabled, the MLX allocator
-cache is capped at 6 GiB, and free warmup buffers are released before the
-worker begins serving requests. The profile announces itself on stderr, never
-overrides feature flags you exported explicitly, and can be forced either way
-with `DARKBLOOM_STARTUP_MEMORY_PROFILE=full|low|auto`. This changes local speed
-only; the 128 GB ranked runner keeps the full optimized profile.
+At process startup, machines with less than 64 GiB select a low-memory
+profile automatically. The profile is pure memory management: the MLX
+allocator cache is capped at 6 GiB, command buffers are shortened, and free
+warmup buffers are released before the worker begins serving requests. It
+does not disable any code-path or output-affecting feature — the
+compiled-decode fusions run everywhere, so a local run exercises the same
+code path as the ranked box all the way down to the ~40 GiB practical local
+minimum. A machine too small for the model plus the decode working set
+fails loudly with an out-of-memory error rather than silently diverging
+from ranked behavior. The profile announces itself on stderr and can be
+forced either way with `DARKBLOOM_STARTUP_MEMORY_PROFILE=full|low|auto`.
+This changes local speed only; the 128 GB ranked runner keeps the full
+profile.
 
 That does not mean there is nothing left to optimize. Attention alternates
 three sliding-window layers (512-token window, 64 heads) with one

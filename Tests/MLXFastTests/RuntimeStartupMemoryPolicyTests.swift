@@ -53,8 +53,9 @@ func compiledDecodeFlagsStayReadableByModelSources() throws {
 }
 
 // The documented low-memory startup profile (<64 GiB machines: 6 GiB MLX
-// allocator cap, feature-disable env defaults, warmup-buffer clear before
-// the protocol hello) applies to the LAGUNA runtime worker. The Laguna
+// allocator cap, shortened command buffers, warmup-buffer clear before the
+// protocol hello; no env feature defaults) applies to the LAGUNA runtime
+// worker. The Laguna
 // weight cache must resolve the policy
 // before its model load and honor clearAllocatorCacheAfterWarmup; the full
 // profile stays a no-op there (the ranked box keeps stock allocator
