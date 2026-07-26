@@ -1674,6 +1674,30 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // A hung connection must fail the attempt (and trip the retry loop), not
     // stall the serial ranked job.
     #expect(semanticGate.contains("--max-time 900"))
+    #expect(semanticGate.contains("--connect-timeout 15"))
+    // Transport hardening (run 30169401200's 529 burst): the HTTP status is
+    // read from --write-out and classified explicitly -- never inferred from
+    // a curl abort via --fail-with-body under `set -e` -- and an unreachable
+    // judge terminates as a labeled, re-dispatchable infra failure, never as
+    // a semantic rejection. Retryable = transport errors, 429, and 5xx;
+    // Retry-After is honored with a bounded, capped backoff.
+    // Pin the curl argument form (trailing continuation); the script's own
+    // comments legitimately name the removed flag when explaining why.
+    #expect(!semanticGate.contains("--fail-with-body \\"))
+    #expect(!semanticGate.contains("--retry-all-errors \\"))
+    #expect(semanticGate.contains("--write-out '%{http_code}'"))
+    #expect(semanticGate.contains("TRANSPORT_MAX_ATTEMPTS=\"${MLXFAST_SEMANTIC_GPQA_TRANSPORT_MAX_ATTEMPTS:-5}\""))
+    #expect(semanticGate.contains("\"${http_status}\" == \"429\" || \"${http_status}\" =~ ^5[0-9][0-9]$"))
+    #expect(semanticGate.contains("retry_after_seconds"))
+    #expect(semanticGate.contains(".metrics.error = \"semantic GPQA gate infra failure: judge API unavailable\""))
+    let redactor = try String(
+        contentsOfFile: ".github/scripts/redact-benchmark-failure.sh",
+        encoding: .utf8
+    )
+    #expect(redactor.contains("\"semantic GPQA gate infra failure\"* ]]"))
+    #expect(redactor.contains("category=\"semantic_gpqa_infra_failed\""))
+    #expect(redactor.contains("\"semantic GPQA gate failed\"* ]]"))
+    #expect(redactor.contains("category=\"semantic_gpqa_failed\""))
     #expect(semanticGate.contains("MIN_PASS=\"${MLXFAST_SEMANTIC_GPQA_MIN_PASS:-1}\""))
     #expect(semanticGate.contains("REQUIRED=\"${MLXFAST_SEMANTIC_GPQA_REQUIRED:-1}\""))
     #expect(semanticGate.contains("MLXFAST_SEMANTIC_GPQA_REQUIRED"))
@@ -2726,6 +2750,9 @@ func semanticGPQAGateParsesOpusVerdictShapesAndFailsUnparseableCaseClosed() thro
           echo attempt >> "${SHIM_DIR}/garbage-attempts"
         fi
         cp "${SHIM_DIR}/response-${name}.json" "${out}"
+        # The script reads the HTTP status from --write-out on stdout and
+        # only hands a 200 body to the parse logic.
+        printf '200'
         exit 0
       fi
     done
@@ -2795,6 +2822,258 @@ func semanticGPQAGateParsesOpusVerdictShapesAndFailsUnparseableCaseClosed() thro
     #expect(score.contains("\"semantic_gpqa_model\": \"claude-opus-4-8\""))
     let results = try String(contentsOfFile: resultsPath, encoding: .utf8)
     #expect(results.contains("\"error\": \"invalid_judge_response\""))
+}
+
+// Behavioral pin for run-semantic-gpqa-gate.sh's judge-API transport
+// hardening. Run 30169401200 (submission e2b91595) had passed the public
+// gate and the full hidden correctness gates, and had already met min_pass
+// (case 1 judged passed=true), when Anthropic returned a burst of HTTP 529s:
+// curl exited 22 under `set -e`, the script died mid-judging, and an
+// external outage surfaced as a submission failure. Pins, via a curl shim:
+// (1) transport-class failures (curl exit codes, HTTP 429/5xx including
+// 529) are retried with bounded backoff and Retry-After honored, then
+// judging continues normally; (2) a real judged {"passed":false} below
+// min_pass still fails the gate exactly as before -- transport handling
+// must not mask a semantic rejection; (3) a persistent outage terminates as
+// a labeled infra failure that redact-benchmark-failure.sh maps to
+// semantic_gpqa_infra_failed with the submission's earned gate flags intact
+// -- never as a semantic fail; (4) a deterministic 4xx is not retried; and
+// (5) transport logging carries only fixed strings, attempt counts, and
+// status codes -- never prompt, answer, or judge-response content.
+@Test
+func semanticGPQAGateRetriesTransportFailuresAndFailsInfraNotSemantic() throws {
+    let fm = FileManager.default
+    let gateScript = URL(fileURLWithPath: fm.currentDirectoryPath)
+        .appendingPathComponent(".github/scripts/run-semantic-gpqa-gate.sh").path
+    let redactScript = URL(fileURLWithPath: fm.currentDirectoryPath)
+        .appendingPathComponent(".github/scripts/redact-benchmark-failure.sh").path
+
+    let root = fm.temporaryDirectory
+        .appendingPathComponent("semantic-gate-transport-\(UUID().uuidString)")
+    try fm.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: root) }
+
+    func run(_ argv: [String], env extra: [String: String]) throws -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = argv
+        process.currentDirectoryURL = root
+        var env = ProcessInfo.processInfo.environment
+        let strayKeys = env.keys.filter {
+            $0.hasPrefix("MLXFAST_") || $0.hasPrefix("ANTHROPIC_")
+        }
+        for key in strayKeys { env.removeValue(forKey: key) }
+        env.merge(extra) { _, override in override }
+        process.environment = env
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    for tool in ["jq", "bash"] {
+        guard try run(["sh", "-c", "command -v \(tool)"], env: [:]).status == 0 else { return }
+    }
+
+    // Curl shim: emits a canned HTTP status (via the script's --write-out
+    // contract) and body per case marker, counting attempts per case so the
+    // retry budget is observable. Exit 7 simulates a connection-level curl
+    // failure; 529 responses carry an optional Retry-After header through
+    // the script's --dump-header path.
+    let shimDir = root.appendingPathComponent("bin").path
+    try fm.createDirectory(atPath: shimDir, withIntermediateDirectories: true)
+    let shim = """
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=""
+    data=""
+    headers="/dev/null"
+    prev=""
+    for arg in "$@"; do
+      case "${prev}" in
+        --output) out="${arg}" ;;
+        --data) data="${arg}" ;;
+        --dump-header) headers="${arg}" ;;
+      esac
+      prev="${arg}"
+    done
+    req="${data#@}"
+    pass_body='{"content":[{"type":"thinking","thinking":"t"},{"type":"text","text":"{\\"passed\\":true}"}],"stop_reason":"end_turn"}'
+    fail_body='{"content":[{"type":"text","text":"{\\"passed\\":false}"}],"stop_reason":"end_turn"}'
+    mode=""
+    for name in transport-then-ok overloaded-then-ok always-529 real-fail bad-request plain-ok; do
+      if grep -q "marker-case-${name}" "${req}"; then mode="${name}"; break; fi
+    done
+    if [[ -z "${mode}" ]]; then
+      echo "curl shim: unmatched request" >&2
+      exit 1
+    fi
+    count_file="${SHIM_COUNTS}/attempts-${mode}"
+    count=$(( $(cat "${count_file}" 2>/dev/null || echo 0) + 1 ))
+    printf '%s' "${count}" > "${count_file}"
+    case "${mode}" in
+      transport-then-ok)
+        if [[ "${count}" -eq 1 ]]; then exit 7; fi
+        printf '%s' "${pass_body}" > "${out}"
+        printf '200' ;;
+      overloaded-then-ok)
+        if [[ "${count}" -eq 1 ]]; then
+          printf 'HTTP/1.1 529 Overloaded\\r\\nRetry-After: 1\\r\\n\\r\\n' > "${headers}"
+          printf '{"type":"error","error":{"type":"overloaded_error"}}' > "${out}"
+          printf '529'
+        else
+          printf '%s' "${pass_body}" > "${out}"
+          printf '200'
+        fi ;;
+      always-529)
+        printf 'HTTP/1.1 529 Overloaded\\r\\n\\r\\n' > "${headers}"
+        printf '{"type":"error","error":{"type":"overloaded_error"}}' > "${out}"
+        printf '529' ;;
+      real-fail)
+        printf '%s' "${fail_body}" > "${out}"
+        printf '200' ;;
+      bad-request)
+        printf '{"type":"error","error":{"type":"invalid_request_error"}}' > "${out}"
+        printf '400' ;;
+      plain-ok)
+        printf '%s' "${pass_body}" > "${out}"
+        printf '200' ;;
+    esac
+    """
+    try shim.write(toFile: shimDir + "/curl", atomically: true, encoding: .utf8)
+    try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shimDir + "/curl")
+    let inheritedPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"
+
+    func answerCase(_ id: String) -> String {
+        #"{"id":"\#(id)","prompt":"marker-case-\#(id) question","answer_key":"C","reference_answer":"option C","candidate_answer":"C"}"#
+    }
+
+    struct GateRun {
+        let status: Int32
+        let output: String
+        let score: String
+        let redacted: String
+    }
+
+    func attempts(_ scenario: String, _ mode: String) throws -> String {
+        try String(
+            contentsOfFile: root.appendingPathComponent(scenario)
+                .appendingPathComponent("counts/attempts-\(mode)").path,
+            encoding: .utf8)
+    }
+
+    func runGate(name: String, cases: [String], minPass: Int) throws -> GateRun {
+        let dir = root.appendingPathComponent(name)
+        let counts = dir.appendingPathComponent("counts").path
+        try fm.createDirectory(atPath: counts, withIntermediateDirectories: true)
+        let answersPath = dir.appendingPathComponent("answers.json").path
+        let answers = #"{"version":1,"cases":["# +
+            cases.map(answerCase).joined(separator: ",") + "]}"
+        try answers.write(toFile: answersPath, atomically: true, encoding: .utf8)
+        let scorePath = dir.appendingPathComponent("score.json").path
+        // The score the correctness+gates phase leaves behind: every earned
+        // gate flag true, timing not yet run.
+        try #"{"passed":true,"score":null,"metrics":{"error":"","passed_correctness":true,"partial_result":true,"benchmark_wall_seconds":30}}"#
+            .write(toFile: scorePath, atomically: true, encoding: .utf8)
+        let gate = try run(
+            ["bash", gateScript],
+            env: [
+                "PATH": shimDir + ":" + inheritedPath,
+                "SHIM_COUNTS": counts,
+                "ANTHROPIC_API_KEY": "test-key-never-sent",
+                "MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH": answersPath,
+                "MLXFAST_SCORE_PATH": scorePath,
+                "MLXFAST_INTEGRITY_PATH": dir.appendingPathComponent("absent-integrity.json").path,
+                "MLXFAST_SEMANTIC_GPQA_RESULTS_PATH": dir.appendingPathComponent("results.json").path,
+                "MLXFAST_PRIVATE_DIR": dir.appendingPathComponent("private").path,
+                "MLXFAST_SEMANTIC_GPQA_MIN_PASS": String(minPass),
+                "MLXFAST_SEMANTIC_GPQA_REQUIRED": "1",
+                "MLXFAST_SEMANTIC_GPQA_TRANSPORT_MAX_ATTEMPTS": "4",
+                "MLXFAST_SEMANTIC_GPQA_TRANSPORT_BACKOFF_BASE_SECONDS": "0",
+            ])
+        // The redacted failure artifact is the operator-facing verdict for a
+        // failed run; derive it from the score the gate left behind exactly
+        // as the workflow's failure path does.
+        let failurePath = dir.appendingPathComponent("benchmark-failure.json").path
+        let redact = try run(
+            ["bash", redactScript, failurePath, scorePath],
+            env: ["MLXFAST_BENCHMARK_MODE": "single-machine"])
+        #expect(redact.status == 0, redact.output.isEmpty ? "no output" : "\(redact.output)")
+        return GateRun(
+            status: gate.status,
+            output: gate.output,
+            score: try String(contentsOfFile: scorePath, encoding: .utf8),
+            redacted: try String(contentsOfFile: failurePath, encoding: .utf8))
+    }
+
+    // (1) Recovery: a connection-level curl failure and a 529 with
+    // Retry-After are retried (Retry-After: 1 wins over the 0s test
+    // backoff) and both cases still judge to completion.
+    let recovery = try runGate(
+        name: "recovery", cases: ["transport-then-ok", "overloaded-then-ok"], minPass: 2)
+    #expect(recovery.status == 0, recovery.output.isEmpty ? "no output" : "\(recovery.output)")
+    #expect(recovery.output.contains(
+        "case 1/2 judge call attempt 1/4 failed (curl transport error exit=7); retrying in 0s"))
+    #expect(recovery.output.contains(
+        "case 2/2 judge call attempt 1/4 failed (retryable HTTP status 529); retrying in 1s"))
+    #expect(recovery.output.contains("case 1/2 passed=true"))
+    #expect(recovery.output.contains("case 2/2 passed=true"))
+    #expect(recovery.output.contains("semantic-gpqa: passed 2/2"))
+    #expect(recovery.score.contains("\"semantic_gpqa_passed\": true"))
+    #expect(try attempts("recovery", "transport-then-ok") == "2")
+    #expect(try attempts("recovery", "overloaded-then-ok") == "2")
+
+    // (2) A real judged rejection below min_pass fails the gate exactly as
+    // before, on the first response, and is categorized as the judged
+    // semantic failure it is -- transport handling must not mask it.
+    let rejected = try runGate(name: "rejected", cases: ["real-fail"], minPass: 1)
+    #expect(rejected.status != 0)
+    #expect(rejected.output.contains("case 1/1 passed=false"))
+    #expect(rejected.output.contains("semantic GPQA gate failed pass_count=0/1"))
+    #expect(!rejected.output.contains("infra"))
+    #expect(try attempts("rejected", "real-fail") == "1")
+    #expect(rejected.score.contains("\"semantic_gpqa_passed\": false"))
+    #expect(rejected.score.contains("\"passed\": false"))
+    #expect(rejected.score.contains("semantic GPQA gate failed"))
+    #expect(rejected.redacted.contains("\"failure_category\": \"semantic_gpqa_failed\""))
+
+    // (3) Persistent outage in the exact run-30169401200 shape: min_pass
+    // already met by case 1 when case 2's retry budget exhausts. The gate
+    // fails as labeled, re-dispatchable infra with every earned gate flag
+    // intact -- never as a semantic rejection of the submission.
+    let outage = try runGate(name: "outage", cases: ["plain-ok", "always-529"], minPass: 1)
+    #expect(outage.status != 0)
+    #expect(outage.output.contains("case 1/2 passed=true"))
+    #expect(outage.output.contains(
+        "case 2/2 judge call attempt 4/4 failed (retryable HTTP status 529); retry budget exhausted"))
+    #expect(outage.output.contains("semantic GPQA gate infra failure"))
+    #expect(outage.output.contains("re-dispatch the run"))
+    #expect(try attempts("outage", "always-529") == "4")
+    #expect(outage.score.contains("\"passed\": true"))
+    #expect(outage.score.contains("\"passed_correctness\": true"))
+    #expect(outage.score.contains("semantic GPQA gate infra failure: judge API unavailable"))
+    #expect(!outage.score.contains("semantic_gpqa_passed"))
+    #expect(outage.redacted.contains("\"failure_category\": \"semantic_gpqa_infra_failed\""))
+    #expect(outage.redacted.contains("\"passed_correctness\": true"))
+    // Transport/infra logging never carries prompt, answer, or
+    // judge-response content -- only fixed strings, attempt counts, and
+    // status codes.
+    #expect(!outage.output.contains("marker-case"))
+    #expect(!outage.output.contains("option C"))
+    #expect(!outage.output.contains("overloaded_error"))
+
+    // (4) A deterministic request rejection (400) is not retried -- and is
+    // still labeled infra, because no judge verdict exists.
+    let badRequest = try runGate(name: "bad-request", cases: ["bad-request"], minPass: 1)
+    #expect(badRequest.status != 0)
+    #expect(badRequest.output.contains(
+        "case 1/1 judge call attempt 1/4 non-retryable HTTP status 400"))
+    #expect(badRequest.output.contains("semantic GPQA gate infra failure"))
+    #expect(try attempts("bad-request", "bad-request") == "1")
+    #expect(badRequest.redacted.contains("\"failure_category\": \"semantic_gpqa_infra_failed\""))
 }
 
 // Ranked validation otherwise exercises only the hidden goldens, so numerics
