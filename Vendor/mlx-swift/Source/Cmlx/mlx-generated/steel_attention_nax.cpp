@@ -23,6 +23,14 @@ const char* steel_attention_nax() {
 #define DARKBLOOM_ATTN_QHOIST 0
 #endif
 
+// Use each simdgroup's first logical query row to identify K blocks where
+// the causal mask is an identity operation. This is finer than the
+// threadgroup-wide lower bound while preserving the boundary block that can
+// cross the simdgroup's diagonal.
+#ifndef DARKBLOOM_ATTN_SG_CAUSAL_LOWER
+#define DARKBLOOM_ATTN_SG_CAUSAL_LOWER 1
+#endif
+
 // DARKBLOOM_ATTN_QBLOCK_MAJOR default. DEFAULT ON for the standalone ranked
 // candidate: remap the stock physical grid into query-block-major logical
 // order. The mapping is a pure permutation of threadgroups; it does not alter
@@ -1529,6 +1537,21 @@ template <
     q_min = max(0, q_min);
     kb_min_causal = (q_min / BK);
   }
+
+#if DARKBLOOM_ATTN_SG_CAUSAL_LOWER
+  // This simdgroup owns logical query rows beginning at
+  // tidl.x * BQ + qL_off + tm. Every K block strictly below the block
+  // containing that first row ends before it, so causal masking cannot
+  // change any score there. Keep the containing block masked because it can
+  // cross this simdgroup's diagonal. tidl.x is required here: under the
+  // qblock-major zigzag, physical tid.x is only a scheduling coordinate.
+  if (do_causal) {
+    int sg_q_min =
+        int(tidl.x) * BQ + params->qL_off + int(tm);
+    sg_q_min = max(0, sg_q_min);
+    kb_min_causal = sg_q_min / BK;
+  }
+#endif
 
   // Per-simdgroup causal K-block elision (level 1, always on). kb_lim above
   // derives from the THREADGROUP's last row; this simdgroup owns only rows
