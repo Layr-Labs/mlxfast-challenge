@@ -51,18 +51,35 @@ public class CompilableKVCache: BaseKVCache {
     /// Must be 1D (not scalar) for DynamicSlice start parameter compatibility.
     public var offsetArray: MLXArray
 
-    /// Maximum sequence length the buffer can hold.
+    /// Maximum sequence length the backing buffer can hold.
     public let maxLength: Int
+
+    /// Fixed key length returned to attention by this cache view.
+    ///
+    /// This may be shorter than `maxLength` for a compiled fast view. Both
+    /// views still update the same full backing arrays; only the returned
+    /// attention slice and mask width differ.
+    public let attentionLength: Int
 
     /// Pre-allocation chunk size (same semantics as KVCacheSimple.step).
     public var step: Int
 
     /// Pre-computed column indices for mask creation [0, 1, ..., maxLength-1].
     /// Avoids re-creating every step.
-    private lazy var maskRinds: MLXArray = MLXArray(Int32(0) ..< Int32(maxLength))
+    private lazy var maskRinds: MLXArray =
+        MLXArray(Int32(0) ..< Int32(attentionLength))
 
-    public init(maxLength: Int = 4096, step: Int = 256) {
+    public init(
+        maxLength: Int = 4096,
+        step: Int = 256,
+        attentionLength: Int? = nil
+    ) {
+        let attentionLength = attentionLength ?? maxLength
+        precondition(
+            attentionLength > 0 && attentionLength <= maxLength,
+            "CompilableKVCache attention length must fit its backing buffer")
         self.maxLength = maxLength
+        self.attentionLength = attentionLength
         self.step = step
         self.offsetArray = MLXArray([Int32(0)])
         super.init()
@@ -152,7 +169,33 @@ public class CompilableKVCache: BaseKVCache {
         // The attention mask from makeMask() handles which positions are valid.
         // This keeps tensor shapes constant across all decode steps,
         // enabling compile() to trace the entire forward pass.
-        return (self.keys!, self.values!)
+        if attentionLength == maxLength {
+            return (self.keys!, self.values!)
+        }
+        return (
+            self.keys![.ellipsis, ..<attentionLength, 0...],
+            self.values![.ellipsis, ..<attentionLength, 0...]
+        )
+    }
+
+    /// Make another fixed-shape attention view over the exact same mutable
+    /// backing arrays and graph offset.
+    ///
+    /// `MLXArray` has reference semantics and compiled state is advanced with
+    /// `_updateInternal`, so sharing these object identities lets either
+    /// compiled graph advance state that the other graph sees without a copy.
+    public func sharingStorage(attentionLength: Int) -> CompilableKVCache {
+        precondition(
+            keys != nil && values != nil,
+            "CompilableKVCache storage must be allocated before making a view")
+        let view = CompilableKVCache(
+            maxLength: maxLength,
+            step: step,
+            attentionLength: attentionLength)
+        view.keys = keys
+        view.values = values
+        view.offsetArray = offsetArray
+        return view
     }
 
     // MARK: - Mask (Overflow Bin)
@@ -186,7 +229,7 @@ public class CompilableKVCache: BaseKVCache {
         }
 
         // Key positions: [0, 1, ..., maxLength-1]
-        let rinds = maskRinds.reshaped(1, maxLength)
+        let rinds = maskRinds.reshaped(1, attentionLength)
 
         // Causal + validity: attend to positions j where j <= query_position
         var mask = linds .>= rinds
@@ -244,7 +287,8 @@ public class CompilableKVCache: BaseKVCache {
     }
 
     public override func copy() -> any KVCache {
-        let c = CompilableKVCache(maxLength: maxLength, step: step)
+        let c = CompilableKVCache(
+            maxLength: maxLength, step: step, attentionLength: attentionLength)
         c.keys = keys
         c.values = values
         c.offsetArray = offsetArray
@@ -255,6 +299,7 @@ public class CompilableKVCache: BaseKVCache {
 
     public var debugDescription: String {
         "CompilableKVCache(offset=\(offset), maxLength=\(maxLength), "
+            + "attentionLength=\(attentionLength), "
             + "shape=\(keys?.shape.description ?? "nil"))"
     }
 }
