@@ -308,37 +308,6 @@ let lagunaFusedDenseGateUpSwiGLUEnabled =
 let lagunaFusedDenseDownResidualEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_DENSE_DOWN_RESIDUAL"] != "0"
 
-/// `DARKBLOOM_DECODE_ASYNC_STAGE` (default `33`): process-once stage selector
-/// for decode-step async scheduling. Active only when the invocation input
-/// shape is exactly `[1, 1]`; prefill and multi-token shapes are never
-/// asyncEval'd. Layer 33 is the measured first rung: Metal begins the existing
-/// graph while Swift constructs layers 34-39, final RMSNorm, and the head.
-/// `off`/`0` disables it; `30`, `36`, `39`, `norm`, and `logits` remain
-/// process-once ablation points. No operation, cache row, or token is added.
-private enum LagunaDecodeAsyncStage {
-    case off
-    case layer(Int)
-    case norm
-    case logits
-}
-
-private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
-    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?.lowercased() ?? "33"
-    switch raw {
-    case "off", "0", "":
-        return .off
-    case "norm":
-        return .norm
-    case "logits":
-        return .logits
-    default:
-        if let index = Int(raw), [30, 33, 36, 39].contains(index) {
-            return .layer(index)
-        }
-        return .off
-    }
-}()
-
 private let lagunaRoPEAngleAtlasLength = 4096
 
 /// The shared 512-thread RMSNorm prologue emitted by three decode kernels.
@@ -3145,10 +3114,16 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
         """
     return """
         uint lane = thread_position_in_threadgroup.x;
+        uint simd_lane = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
 
-        threadgroup float xchg_keys[256];
-        threadgroup uint xchg_indices[256];
-        threadgroup float xchg_scores[256];
+        // The global top eight must be present in the union of each
+        // 32-expert SIMD group's local top eight. Retain those 64 candidates,
+        // then sort only that exact superset. These arrays also serve the
+        // single cross-SIMD exchange in the final 64-entry network.
+        threadgroup float xchg_keys[64];
+        threadgroup uint xchg_indices[64];
+        threadgroup float xchg_scores[64];
 
         float x = float(logits[lane]);
         float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
@@ -3156,47 +3131,19 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
         float my_key = -(my_score + float(correction_bias[lane]));
         uint my_index = lane;
 
-        // A total order (choice key, then original expert index) makes this
-        // network match the stock stable merge sort even for exact ties,
-        // signed zero, and NaNs. The lower half of each final sequence keeps
-        // the better entries, so ranks 0..<8 are the desired top experts.
-        //
-        // The network's schedule, comparator, and pair roles are unchanged
-        // from the threadgroup-memory version; only WHERE a pair exchanges
-        // its operands differs. For stride < 32, `partner = lane ^ stride`
-        // never leaves the calling simdgroup (only bits 0-4 flip), so those
-        // 30 stages exchange through registers with `simd_shuffle_xor` --
-        // the same value-passing idiom the promoted QK-norm kernels use --
-        // touching no memory and needing no barrier. Shuffles are
-        // bit-preserving, both partners compute the identical swap decision
-        // from identical operands (`lane & sequence` agrees across a pair
-        // because stride < sequence), and each keeps its side of the
-        // exchange, so every stage's resulting values are bit-identical to
-        // the memory version's. Only the six stages with stride >= 32 cross
-        // a simdgroup boundary and go through threadgroup memory with full
-        // barriers.
-        for (uint sequence = 2; sequence <= 256; sequence <<= 1) {
+        // First, sort each 32-entry SIMD group independently under the same
+        // strict total order as the stock stable argsort. Every exchange is
+        // register-only and bit-preserving.
+        for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
             for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
-                float other_key;
-                uint other_index;
-                float other_score;
-                if (stride < 32) {
-                    other_key = simd_shuffle_xor(my_key, ushort(stride));
-                    other_index = simd_shuffle_xor(my_index, ushort(stride));
-                    other_score = simd_shuffle_xor(my_score, ushort(stride));
-                } else {
-                    xchg_keys[lane] = my_key;
-                    xchg_indices[lane] = my_index;
-                    xchg_scores[lane] = my_score;
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                    uint partner = lane ^ stride;
-                    other_key = xchg_keys[partner];
-                    other_index = xchg_indices[partner];
-                    other_score = xchg_scores[partner];
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                }
+                float other_key =
+                    simd_shuffle_xor(my_key, ushort(stride));
+                uint other_index =
+                    simd_shuffle_xor(my_index, ushort(stride));
+                float other_score =
+                    simd_shuffle_xor(my_score, ushort(stride));
 
-                bool is_lower = (lane & stride) == 0;
+                bool is_lower = (simd_lane & stride) == 0;
                 float a_key = is_lower ? my_key : other_key;
                 uint a_index = is_lower ? my_index : other_index;
                 float a_score = is_lower ? my_score : other_score;
@@ -3204,13 +3151,143 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
                 uint b_index = is_lower ? other_index : my_index;
                 float b_score = is_lower ? other_score : my_score;
 
-                bool lower_wants_better = (lane & sequence) == 0;
+                bool lower_wants_better =
+                    (simd_lane & sequence) == 0;
                 bool b_before_a = laguna_router_key_before(
                     b_key, b_index, a_key, a_index);
                 bool a_before_b = laguna_router_key_before(
                     a_key, a_index, b_key, b_index);
                 bool swap = lower_wants_better ? b_before_a : a_before_b;
                 if (swap) {
+                    my_key = is_lower ? b_key : a_key;
+                    my_index = is_lower ? b_index : a_index;
+                    my_score = is_lower ? b_score : a_score;
+                }
+            }
+        }
+
+        if (simd_lane < 8) {
+            uint candidate = simd_group * 8 + simd_lane;
+            xchg_keys[candidate] = my_key;
+            xchg_indices[candidate] = my_index;
+            xchg_scores[candidate] = my_score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // The first two SIMD groups merge the eight already-sorted lists of
+        // eight candidates. Pairwise bitonic merges produce four sorted
+        // 16-entry lists, then two sorted 32-entry lists. Exploiting that
+        // existing order saves six comparator stages versus sorting 64
+        // arbitrary entries.
+        if (lane < 64) {
+            uint block16 = lane & ~15u;
+            uint local16 = lane & 15u;
+            uint source =
+                local16 < 8 ? lane : block16 + 23 - local16;
+            my_key = xchg_keys[source];
+            my_index = xchg_indices[source];
+            my_score = xchg_scores[source];
+
+            for (uint stride = 8; stride > 0; stride >>= 1) {
+                float other_key =
+                    simd_shuffle_xor(my_key, ushort(stride));
+                uint other_index =
+                    simd_shuffle_xor(my_index, ushort(stride));
+                float other_score =
+                    simd_shuffle_xor(my_score, ushort(stride));
+                bool is_lower = (simd_lane & stride) == 0;
+                float a_key = is_lower ? my_key : other_key;
+                uint a_index = is_lower ? my_index : other_index;
+                float a_score = is_lower ? my_score : other_score;
+                float b_key = is_lower ? other_key : my_key;
+                uint b_index = is_lower ? other_index : my_index;
+                float b_score = is_lower ? other_score : my_score;
+                bool swap = laguna_router_key_before(
+                    b_key, b_index, a_key, a_index);
+                if (swap) {
+                    my_key = is_lower ? b_key : a_key;
+                    my_index = is_lower ? b_index : a_index;
+                    my_score = is_lower ? b_score : a_score;
+                }
+            }
+
+            // Reverse the second sorted 16-entry list inside each SIMD group
+            // to form a 32-entry bitonic sequence.
+            uint reverse_source =
+                simd_lane < 16 ? simd_lane : 47 - simd_lane;
+            my_key = simd_shuffle(my_key, ushort(reverse_source));
+            my_index = simd_shuffle(my_index, ushort(reverse_source));
+            my_score = simd_shuffle(my_score, ushort(reverse_source));
+
+            for (uint stride = 16; stride > 0; stride >>= 1) {
+                float other_key =
+                    simd_shuffle_xor(my_key, ushort(stride));
+                uint other_index =
+                    simd_shuffle_xor(my_index, ushort(stride));
+                float other_score =
+                    simd_shuffle_xor(my_score, ushort(stride));
+                bool is_lower = (simd_lane & stride) == 0;
+                float a_key = is_lower ? my_key : other_key;
+                uint a_index = is_lower ? my_index : other_index;
+                float a_score = is_lower ? my_score : other_score;
+                float b_key = is_lower ? other_key : my_key;
+                uint b_index = is_lower ? other_index : my_index;
+                float b_score = is_lower ? other_score : my_score;
+                bool swap = laguna_router_key_before(
+                    b_key, b_index, a_key, a_index);
+                if (swap) {
+                    my_key = is_lower ? b_key : a_key;
+                    my_index = is_lower ? b_index : a_index;
+                    my_score = is_lower ? b_score : a_score;
+                }
+            }
+
+            xchg_keys[lane] = my_key;
+            xchg_indices[lane] = my_index;
+            xchg_scores[lane] = my_score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Merge the two sorted 32-entry lists. The first stride crosses SIMD
+        // groups and reads its pair directly from threadgroup memory; all
+        // remaining strides are register shuffles.
+        if (lane < 64) {
+            uint pair = lane & 31u;
+            float a_key = xchg_keys[pair];
+            uint a_index = xchg_indices[pair];
+            float a_score = xchg_scores[pair];
+            float b_key = xchg_keys[63 - pair];
+            uint b_index = xchg_indices[63 - pair];
+            float b_score = xchg_scores[63 - pair];
+            bool swap = laguna_router_key_before(
+                b_key, b_index, a_key, a_index);
+            if (lane < 32) {
+                my_key = swap ? b_key : a_key;
+                my_index = swap ? b_index : a_index;
+                my_score = swap ? b_score : a_score;
+            } else {
+                my_key = swap ? a_key : b_key;
+                my_index = swap ? a_index : b_index;
+                my_score = swap ? a_score : b_score;
+            }
+
+            for (uint stride = 16; stride > 0; stride >>= 1) {
+                float other_key =
+                    simd_shuffle_xor(my_key, ushort(stride));
+                uint other_index =
+                    simd_shuffle_xor(my_index, ushort(stride));
+                float other_score =
+                    simd_shuffle_xor(my_score, ushort(stride));
+                bool is_lower = (lane & stride) == 0;
+                float a_key = is_lower ? my_key : other_key;
+                uint a_index = is_lower ? my_index : other_index;
+                float a_score = is_lower ? my_score : other_score;
+                float b_key = is_lower ? other_key : my_key;
+                uint b_index = is_lower ? other_index : my_index;
+                float b_score = is_lower ? other_score : my_score;
+                bool local_swap = laguna_router_key_before(
+                    b_key, b_index, a_key, a_index);
+                if (local_swap) {
                     my_key = is_lower ? b_key : a_key;
                     my_index = is_lower ? b_index : a_index;
                     my_score = is_lower ? b_score : a_score;
@@ -3248,7 +3325,7 @@ private let lagunaDecodeRouterTop8Header = """
     """
 
 private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_v3",
+    name: "laguna_decode_router_top8_v5",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterTop8KernelSource(normalizing: false),
@@ -3257,7 +3334,7 @@ private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
 )
 
 private let lagunaDecodeRouterTop8NormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_norm_v2",
+    name: "laguna_decode_router_top8_norm_v4",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterTop8KernelSource(normalizing: true),
@@ -4527,9 +4604,6 @@ final class LagunaRuntimeModelInner: Module {
                         cache: cache?[i],
                         qkRoPEAngles: qkRoPEAngles
                     )
-                    if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
-                        asyncEval(h)
-                    }
                 }
             } else {
                 h = layer(
@@ -4538,9 +4612,6 @@ final class LagunaRuntimeModelInner: Module {
                     cache: cache?[i],
                     qkRoPEAngles: qkRoPEAngles
                 )
-                if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
-                    asyncEval(h)
-                }
             }
         }
 
@@ -4596,20 +4667,10 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         // vocabulary head so prefill neither normalizes nor projects the
         // preceding rows. For single-token decode the slice is a no-op.
         let hidden = model.norm(lagunaLastTokenHidden(fullHidden))
-        if case .norm = lagunaDecodeAsyncStage, inputs.shape == [1, 1] {
-            asyncEval(hidden)
-        }
-
-        let result: MLXArray
         if let lmHead {
-            result = lmHead(hidden)
-        } else {
-            result = model.embedTokens.asLinear(hidden)
+            return lmHead(hidden)
         }
-        if case .logits = lagunaDecodeAsyncStage, inputs.shape == [1, 1] {
-            asyncEval(result)
-        }
-        return result
+        return model.embedTokens.asLinear(hidden)
     }
 
     public func prepare(
