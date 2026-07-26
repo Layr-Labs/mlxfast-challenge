@@ -308,6 +308,37 @@ let lagunaFusedDenseGateUpSwiGLUEnabled =
 let lagunaFusedDenseDownResidualEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_DENSE_DOWN_RESIDUAL"] != "0"
 
+/// `DARKBLOOM_DECODE_ASYNC_STAGE` (default `33`): process-once stage selector
+/// for decode-step async scheduling. Active only when the invocation input
+/// shape is exactly `[1, 1]`; prefill and multi-token shapes are never
+/// asyncEval'd. Layer 33 is the measured first rung: Metal begins the existing
+/// graph while Swift constructs layers 34-39, final RMSNorm, and the head.
+/// `off`/`0` disables it; `30`, `36`, `39`, `norm`, and `logits` remain
+/// process-once ablation points. No operation, cache row, or token is added.
+private enum LagunaDecodeAsyncStage {
+    case off
+    case layer(Int)
+    case norm
+    case logits
+}
+
+private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?.lowercased() ?? "33"
+    switch raw {
+    case "off", "0", "":
+        return .off
+    case "norm":
+        return .norm
+    case "logits":
+        return .logits
+    default:
+        if let index = Int(raw), [30, 33, 36, 39].contains(index) {
+            return .layer(index)
+        }
+        return .off
+    }
+}()
+
 private let lagunaRoPEAngleAtlasLength = 4096
 
 /// The shared 512-thread RMSNorm prologue emitted by three decode kernels.
@@ -4496,6 +4527,9 @@ final class LagunaRuntimeModelInner: Module {
                         cache: cache?[i],
                         qkRoPEAngles: qkRoPEAngles
                     )
+                    if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
+                        asyncEval(h)
+                    }
                 }
             } else {
                 h = layer(
@@ -4504,6 +4538,9 @@ final class LagunaRuntimeModelInner: Module {
                     cache: cache?[i],
                     qkRoPEAngles: qkRoPEAngles
                 )
+                if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
+                    asyncEval(h)
+                }
             }
         }
 
@@ -4559,10 +4596,20 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         // vocabulary head so prefill neither normalizes nor projects the
         // preceding rows. For single-token decode the slice is a no-op.
         let hidden = model.norm(lagunaLastTokenHidden(fullHidden))
-        if let lmHead {
-            return lmHead(hidden)
+        if case .norm = lagunaDecodeAsyncStage, inputs.shape == [1, 1] {
+            asyncEval(hidden)
         }
-        return model.embedTokens.asLinear(hidden)
+
+        let result: MLXArray
+        if let lmHead {
+            result = lmHead(hidden)
+        } else {
+            result = model.embedTokens.asLinear(hidden)
+        }
+        if case .logits = lagunaDecodeAsyncStage, inputs.shape == [1, 1] {
+            asyncEval(result)
+        }
+        return result
     }
 
     public func prepare(
