@@ -35,32 +35,33 @@ public enum MLXFastConstants {
     public static let correctnessMaxAnchorContextTokens = 1_024
     public static let correctnessMaxFreeRunSteps = 256
     public static let correctnessMaxBehaviorPromptTokens = 2_048
-    public static let correctnessMaxBehaviorSteps = 64
+    public static let correctnessMaxBehaviorSteps = 128
     public static let correctnessGPQACaseCount = 9
     // Cross-machine greedy decode can drift on hidden GPQA even with pinned
     // Swift/MLX. Semantic GPQA behavior captures a short continuation for the
     // private judge; exact token enforcement stays on the long copy gate and
     // non-semantic behavior fixtures.
-    // 64 (was 10, DeepSeek-era): a 2026-07-06 budget capture at 10/32/64
-    // showed shorter budgets cut most candidates off mid-sentence; 64, the
-    // correctnessMaxBehaviorSteps ceiling, gave the judge the most usable
-    // text. Poolside NVFP4 activation runs 30011903540, 30015338806,
-    // 30022640438, and 30027994180 each judged the unmodified baseline 2/5 at
-    // this budget, re-confirming it across the migration.
-    public static let correctnessGPQAMaxNewTokens = 64
+    // 128 (was 64; before that 10, DeepSeek-era): the 10->64 history and its
+    // calibration runs predate the GPQA prompt-encoding (BOS) fix and
+    // measured degenerate no-BOS completions, so they no longer bind. With
+    // BOS the reference answers letter-first and then explains; 128 lets the
+    // explanation finish for the judge instead of cutting mid-sentence.
+    // Generation happens in the untimed gates phase (never the frozen timed
+    // window), so the cost is ~10-15s of job wall-clock, not score.
+    public static let correctnessGPQAMaxNewTokens = 128
     // Semantic judging uses short hidden GPQA answers as a baseline-calibrated
     // gate for optimizations that preserve the exact prefix but damage answer
     // sense. 9 (was 5): raised to the full fixture together with the GPQA
     // prompt-encoding (BOS) fix -- selection takes the first N budget-valid
     // cases in file order, and the old window of 5 contained only two of the
     // five cases the correctly-prompted reference answers right. Per-case
-    // cost is one 64-token generation plus one judge call; the 4 extra cases
-    // add roughly a minute to the job.
+    // cost is one short untimed generation plus one judge call; the 4 extra
+    // cases add roughly a minute to the job.
     // The captured answer is a prefix of the behavior-gate generation, so
     // semanticGPQAMaxNewTokens is only effective up to
     // correctnessGPQAMaxNewTokens (and must stay <= correctnessMaxBehaviorSteps).
     public static let semanticGPQACaseCount = 9
-    public static let semanticGPQAMaxNewTokens = 64
+    public static let semanticGPQAMaxNewTokens = 128
     // The floor of 1 predates the GPQA prompt-encoding (BOS) fix. The
     // pre-fix calibration runs (30011903540, 30015338806, 30022640438,
     // 30027994180; 2/5 and later 1/5 judged) measured a reference that never

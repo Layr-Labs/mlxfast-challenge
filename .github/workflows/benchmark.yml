@@ -233,9 +233,9 @@ jobs:
       # Keep in sync with MLXFastConstants.{correctnessGPQACaseCount,
       # correctnessGPQAMaxNewTokens,semanticGPQACaseCount,
       # semanticGPQAMaxNewTokens,semanticGPQAMinPassCount}.
-      MLXFAST_GPQA_MAX_NEW_TOKENS: "64"
+      MLXFAST_GPQA_MAX_NEW_TOKENS: "128"
       MLXFAST_SEMANTIC_GPQA_CASE_COUNT: "9"
-      MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: "64"
+      MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: "128"
       MLXFAST_SEMANTIC_GPQA_MIN_PASS: "1"
       MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
       # Opus 5 at max effort (adaptive thinking) replaced the Sonnet 4.5

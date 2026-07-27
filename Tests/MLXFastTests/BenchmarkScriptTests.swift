@@ -1526,10 +1526,10 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // 64-token budget retained across the GPQA BOS-encoding fix; the floor of
     // 1 is deliberately loose post-fix. See
     // MLXFastConstants.semanticGPQAMinPassCount for provenance.
-    #expect(workflow.contains("MLXFAST_GPQA_MAX_NEW_TOKENS: \"64\""))
+    #expect(workflow.contains("MLXFAST_GPQA_MAX_NEW_TOKENS: \"128\""))
     #expect(workflow.contains("MLXFAST_GPQA_TTFT_CASE_COUNT: \"9\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_CASE_COUNT: \"9\""))
-    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: \"64\""))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: \"128\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MIN_PASS: \"1\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_REQUIRED: \"1\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MODEL: claude-opus-4-8"))
