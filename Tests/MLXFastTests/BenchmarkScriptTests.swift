@@ -1532,7 +1532,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: \"64\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MIN_PASS: \"1\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_REQUIRED: \"1\""))
-    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MODEL: claude-opus-4-8"))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MODEL: claude-opus-5"))
     #expect(!workflow.contains("claude-sonnet"))
     #expect(!workflow.contains("calibrate_gpqa_reference"))
     #expect(!workflow.contains("MLXFAST_CALIBRATE_GPQA_REFERENCE"))
@@ -1663,7 +1663,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // be truncated the way the Sonnet-era 256 cap truncated it. Opus 4.8
     // rejects non-default sampling params and assistant prefill with a 400,
     // so the request must carry neither.
-    #expect(semanticGate.contains("MODEL=\"${MLXFAST_SEMANTIC_GPQA_MODEL:-claude-opus-4-8}\""))
+    #expect(semanticGate.contains("MODEL=\"${MLXFAST_SEMANTIC_GPQA_MODEL:-claude-opus-5}\""))
     #expect(semanticGate.contains("max_tokens: 32000,"))
     #expect(semanticGate.contains("thinking: { type: \"adaptive\" },"))
     #expect(semanticGate.contains("output_config: { effort: \"max\" },"))
@@ -1715,7 +1715,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     // The bypass review runs on the strongest model at max reasoning effort,
     // and must keep its own pin rather than inherit whatever judge the gates
     // job exports as MLXFAST_SEMANTIC_GPQA_MODEL job-level env.
-    #expect(staticReview.contains("MODEL=\"${MLXFAST_SUBMISSION_STATIC_REVIEW_MODEL:-claude-opus-4-8}\""))
+    #expect(staticReview.contains("MODEL=\"${MLXFAST_SUBMISSION_STATIC_REVIEW_MODEL:-claude-opus-5}\""))
     #expect(!staticReview.contains(":-${MLXFAST_SEMANTIC_GPQA_MODEL"))
     #expect(staticReview.contains("thinking: { type: \"adaptive\" },"))
     #expect(staticReview.contains("output_config: { effort: \"max\" },"))
@@ -2782,7 +2782,7 @@ func semanticGPQAGateParsesOpusVerdictShapesAndFailsUnparseableCaseClosed() thro
 
     // Every parseable verdict shape lands, prose-wrapped false stays false,
     // and only the garbage case fails -- after burning all three attempts.
-    #expect(gate.output.contains("judging 5 hidden cases with claude-opus-4-8"))
+    #expect(gate.output.contains("judging 5 hidden cases with claude-opus-5"))
     #expect(gate.output.contains("case 1/5 passed=true"))
     #expect(gate.output.contains("case 2/5 passed=true"))
     #expect(gate.output.contains("case 3/5 passed=false"))
@@ -2800,7 +2800,7 @@ func semanticGPQAGateParsesOpusVerdictShapesAndFailsUnparseableCaseClosed() thro
     let requestData = try Data(contentsOf: URL(fileURLWithPath: shimDir + "/last-request.json"))
     let request = try #require(
         try JSONSerialization.jsonObject(with: requestData) as? [String: Any])
-    #expect(request["model"] as? String == "claude-opus-4-8")
+    #expect(request["model"] as? String == "claude-opus-5")
     #expect(request["max_tokens"] as? Int == 32000)
     #expect((request["thinking"] as? [String: Any])?["type"] as? String == "adaptive")
     #expect((request["output_config"] as? [String: Any])?["effort"] as? String == "max")
@@ -2819,7 +2819,7 @@ func semanticGPQAGateParsesOpusVerdictShapesAndFailsUnparseableCaseClosed() thro
     #expect(score.contains("\"semantic_gpqa_passed\": true"))
     #expect(score.contains("\"semantic_gpqa_pass_count\": 3"))
     #expect(score.contains("\"semantic_gpqa_case_count\": 5"))
-    #expect(score.contains("\"semantic_gpqa_model\": \"claude-opus-4-8\""))
+    #expect(score.contains("\"semantic_gpqa_model\": \"claude-opus-5\""))
     let results = try String(contentsOfFile: resultsPath, encoding: .utf8)
     #expect(results.contains("\"error\": \"invalid_judge_response\""))
 }
