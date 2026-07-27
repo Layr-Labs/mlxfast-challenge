@@ -443,6 +443,14 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     }
 }()
 
+/// Optional front-rung scheduling probe. Layer 0's completed attention graph
+/// is enqueued while Swift constructs its dense MLP and layer 1, closing the
+/// idle window before the promoted top-level boundary after layer 1. Decode
+/// only; scheduling changes no operation, value, cache row, or token. Default
+/// ON for the ranked front-rung timing ablation.
+private let lagunaLayer0AttentionAsyncEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LAYER0_ATTENTION_ASYNC"] != "0"
+
 /// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `8`; `0`/`off` disables):
 /// prefill-side twin of the decode ladder above. Multi-token forwards build
 /// a ~400-op graph with the GPU idle until the final eval; firing `asyncEval`
@@ -4883,8 +4891,10 @@ final class LagunaRuntimeDecoderLayer: Module {
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
     let attentionType: LagunaLayerType
+    let layerIdx: Int
 
     init(_ config: LagunaConfig, layerIdx: Int) {
+        self.layerIdx = layerIdx
         self._selfAttn.wrappedValue = LagunaRuntimeAttention(config, layerIdx: layerIdx)
 
         if config.isSparse(layer: layerIdx) {
@@ -4915,6 +4925,11 @@ final class LagunaRuntimeDecoderLayer: Module {
             cache: cache,
             qkRoPEAngles: qkRoPEAngles
         )
+        if lagunaLayer0AttentionAsyncEnabled, layerIdx == 0,
+            x.shape == [1, 1, LagunaConstants.hiddenSize]
+        {
+            asyncEval(r)
+        }
         let h: MLXArray
         let normalized: MLXArray
         var routerLogits: MLXArray?
