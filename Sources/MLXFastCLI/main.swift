@@ -977,7 +977,7 @@ private enum MLXFastCLI {
             guard answers.count < caseCount else {
                 break
             }
-            let promptTokens = tokenizer.encode(text: testCase.prompt, addSpecialTokens: false)
+            let promptTokens = tokenizer.encode(text: testCase.prompt, addSpecialTokens: true)
             guard !promptTokens.isEmpty else {
                 throw MLXFastError.invalidInput("\(testCase.identifier).prompt tokenized to zero tokens")
             }
@@ -1097,7 +1097,7 @@ private enum MLXFastCLI {
         tokenizer: any Tokenizer,
         maxNewTokens: Int
     ) throws -> GoldenBehaviorCase? {
-        let promptTokens = tokenizer.encode(text: testCase.prompt, addSpecialTokens: false)
+        let promptTokens = tokenizer.encode(text: testCase.prompt, addSpecialTokens: true)
         guard !promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("\(testCase.identifier).prompt tokenized to zero tokens")
         }

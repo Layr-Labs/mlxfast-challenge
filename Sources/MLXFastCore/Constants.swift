@@ -36,7 +36,7 @@ public enum MLXFastConstants {
     public static let correctnessMaxFreeRunSteps = 256
     public static let correctnessMaxBehaviorPromptTokens = 2_048
     public static let correctnessMaxBehaviorSteps = 64
-    public static let correctnessGPQACaseCount = 5
+    public static let correctnessGPQACaseCount = 9
     // Cross-machine greedy decode can drift on hidden GPQA even with pinned
     // Swift/MLX. Semantic GPQA behavior captures a short continuation for the
     // private judge; exact token enforcement stays on the long copy gate and
@@ -54,7 +54,7 @@ public enum MLXFastConstants {
     // The captured answer is a prefix of the behavior-gate generation, so
     // semanticGPQAMaxNewTokens is only effective up to
     // correctnessGPQAMaxNewTokens (and must stay <= correctnessMaxBehaviorSteps).
-    public static let semanticGPQACaseCount = 5
+    public static let semanticGPQACaseCount = 9
     public static let semanticGPQAMaxNewTokens = 64
     // Poolside NVFP4 calibration: four ranked baseline-equivalent M5 runs
     // (30011903540, 30015338806, 30022640438, and 30027994180; Opus 4.8
