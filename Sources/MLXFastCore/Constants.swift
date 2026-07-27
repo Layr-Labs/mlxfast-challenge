@@ -50,19 +50,27 @@ public enum MLXFastConstants {
     public static let correctnessGPQAMaxNewTokens = 64
     // Semantic judging uses short hidden GPQA answers as a baseline-calibrated
     // gate for optimizations that preserve the exact prefix but damage answer
-    // sense. Five cases keeps the full GitHub job near the 30-minute budget.
+    // sense. 9 (was 5): raised to the full fixture together with the GPQA
+    // prompt-encoding (BOS) fix -- selection takes the first N budget-valid
+    // cases in file order, and the old window of 5 contained only two of the
+    // five cases the correctly-prompted reference answers right. Per-case
+    // cost is one 64-token generation plus one judge call; the 4 extra cases
+    // add roughly a minute to the job.
     // The captured answer is a prefix of the behavior-gate generation, so
     // semanticGPQAMaxNewTokens is only effective up to
     // correctnessGPQAMaxNewTokens (and must stay <= correctnessMaxBehaviorSteps).
     public static let semanticGPQACaseCount = 9
     public static let semanticGPQAMaxNewTokens = 64
-    // Poolside NVFP4 calibration: four ranked baseline-equivalent M5 runs
-    // (30011903540, 30015338806, 30022640438, and 30027994180; Opus 4.8
-    // judge) each scored 2/5. min(observed) - 1 therefore re-confirms 1 as the
-    // conservative floor: a one-case judge fluctuation still passes, while a
-    // submission that wrecks answer quality (0/5 judged) fails instead of
-    // merely being recorded. Keep in sync with the workflow env
-    // MLXFAST_SEMANTIC_GPQA_MIN_PASS.
+    // The floor of 1 predates the GPQA prompt-encoding (BOS) fix. The
+    // pre-fix calibration runs (30011903540, 30015338806, 30022640438,
+    // 30027994180; 2/5 and later 1/5 judged) measured a reference that never
+    // actually answered -- prompts were encoded without BOS, so those pass
+    // counts reflect judge behavior on degenerate completions, not model
+    // capability, and cannot justify any particular floor. Post-fix the
+    // correctly-prompted reference answers 5/9 by letter match, so 1 is now
+    // a deliberately loose floor with real margin; retighten only after
+    // ranked runs establish the post-fix judged distribution. Keep in sync
+    // with the workflow env MLXFAST_SEMANTIC_GPQA_MIN_PASS.
     // (Historical: the 2026-07-09 Gemma 4 31B-IT calibration observed a
     // stable 2/5 across five runs and set min(observed) - 1 = 1.)
     public static let semanticGPQAMinPassCount = 1
