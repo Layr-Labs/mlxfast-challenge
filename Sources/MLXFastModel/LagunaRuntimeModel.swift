@@ -319,6 +319,14 @@ let lagunaFusedFullQKNormYaRNEnabled =
 let lagunaRoPEAngleAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] == "1"
 
+/// Decode-only zero-copy atlas-row experiment. The stock embedding gather is
+/// retained, while the two authoritative FP32 RoPE rows are contiguous views
+/// into the materialized atlases. This removes the two probe-RoPE dispatches
+/// without adding the slower embedding+row-copy carrier above.
+/// Default ON for the ranked zero-copy atlas-row timing ablation.
+let lagunaRoPEAngleAtlasSliceEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS_SLICE"] != "0"
+
 /// `DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU` (default on; set "0" to disable):
 /// after checkpoint load, retain one row-concatenated BF16 `[gate; up]` bank
 /// for layer 0's dense (non-quantized) MLP and serve single-token decode's
@@ -5179,7 +5187,7 @@ final class LagunaRuntimeModelInner: Module {
     /// sequence dimension makes row `p` exactly the scalar-offset probe at
     /// position `p`, including YaRN's authoritative FP32 rounding.
     func prepareRoPEAngleAtlases() -> [MLXArray] {
-        guard lagunaRoPEAngleAtlasEnabled,
+        guard lagunaRoPEAngleAtlasEnabled || lagunaRoPEAngleAtlasSliceEnabled,
             lagunaFusedFullQKNormYaRNEnabled,
             lagunaFusedSlidingQKNormRoPEEnabled,
             layerTypes.contains(.full),
@@ -5217,7 +5225,7 @@ final class LagunaRuntimeModelInner: Module {
     private func decodeRoPEAtlasPosition(
         inputs: MLXArray, cache: [KVCache]?
     ) -> Int? {
-        guard lagunaRoPEAngleAtlasEnabled,
+        guard lagunaRoPEAngleAtlasEnabled || lagunaRoPEAngleAtlasSliceEnabled,
             lagunaFusedFullQKNormYaRNEnabled,
             lagunaFusedSlidingQKNormRoPEEnabled,
             inputs.dtype == .int32,
@@ -5266,7 +5274,17 @@ final class LagunaRuntimeModelInner: Module {
         var h: MLXArray
         let fullRoPEAngles: MLXArray?
         let slidingRoPEAngles: MLXArray?
-        if let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
+        if lagunaRoPEAngleAtlasSliceEnabled,
+            let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
+            let fullAtlas = _fullRoPEAngleAtlas,
+            let slidingAtlas = _slidingRoPEAngleAtlas
+        {
+            h = embedTokens(inputs)
+            fullRoPEAngles = fullAtlas[
+                0..., 0..., position..<(position + 1), 0...]
+            slidingRoPEAngles = slidingAtlas[
+                0..., 0..., position..<(position + 1), 0...]
+        } else if let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
             let fullAtlas = _fullRoPEAngleAtlas,
             let slidingAtlas = _slidingRoPEAngleAtlas,
             let atlasOutputs = lagunaDecodeEmbeddingRoPEAtlas(
