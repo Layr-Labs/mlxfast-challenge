@@ -1,10 +1,10 @@
-// Yukon Pi/OMP trace transport — yukon-pi-family-trace-extension-v1.
+// Hilbert Pi/OMP trace transport — hilbert-pi-family-trace-extension-v1.
 //
 // Pi and OMP sessions are native append-only JSONL files. This extension forwards low-frequency
-// lifecycle metadata; Yukon owns transcript reading, redaction, checkpoints, retry, and upload.
+// lifecycle metadata; Hilbert owns transcript reading, redaction, checkpoints, retry, and upload.
 import { spawn } from "node:child_process";
 
-const WRAPPER = ".yukon/hooks/yukon-trace.sh";
+const WRAPPER = ".hilbert/hooks/hilbert-trace.sh";
 
 type PiContext = {
   cwd: string;
@@ -26,7 +26,7 @@ type PiExtension = {
   ): void;
 };
 
-export default function YukonTrace(pi: PiExtension): void {
+export default function HilbertTrace(pi: PiExtension): void {
   const agent = pi.pi === undefined ? "pi" : "omp";
   const rootSessionId = agent === "pi" ? "YUKON_PI_SESSION_ID" : "YUKON_OMP_SESSION_ID";
   let parentSessionId: string | undefined;

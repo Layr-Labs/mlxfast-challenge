@@ -5,11 +5,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude session"
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.hilbert/hooks/hilbert-trace.sh\" claude session"
           },
           {
             "type": "command",
-            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude capture"
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.hilbert/hooks/hilbert-trace.sh\" claude capture"
           }
         ]
       }
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude session"
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.hilbert/hooks/hilbert-trace.sh\" claude session"
           }
         ]
       }
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude capture"
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.hilbert/hooks/hilbert-trace.sh\" claude capture"
           }
         ]
       }
@@ -39,7 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude capture"
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.hilbert/hooks/hilbert-trace.sh\" claude capture"
           }
         ]
       }
@@ -49,7 +49,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude capture"
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.hilbert/hooks/hilbert-trace.sh\" claude capture"
           }
         ]
       }
@@ -59,7 +59,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude capture"
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.hilbert/hooks/hilbert-trace.sh\" claude capture"
           }
         ]
       }
@@ -69,7 +69,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$CLAUDE_PROJECT_DIR/.yukon/hooks/yukon-trace.sh\" claude capture"
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.hilbert/hooks/hilbert-trace.sh\" claude capture"
           }
         ]
       }
