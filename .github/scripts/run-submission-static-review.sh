@@ -17,9 +17,9 @@ CONTRACT_PATH="${CONTRACT_PATH:-benchmark.json}"
 # Deliberately NOT chained to MLXFAST_SEMANTIC_GPQA_MODEL: the gates job
 # exports that as job-level env, and retuning the per-case GPQA judge (or
 # pointing it at a cheaper model) must never silently change which model
-# performs bypass review. Both currently default to Opus 4.8, but each pin
+# performs bypass review. Both currently default to Opus 5, but each pin
 # is owned independently.
-MODEL="${MLXFAST_SUBMISSION_STATIC_REVIEW_MODEL:-claude-opus-4-8}"
+MODEL="${MLXFAST_SUBMISSION_STATIC_REVIEW_MODEL:-claude-opus-5}"
 # Byte budget for the full-stack (vendored-kernel) editable surface. The whole
 # unmodified surface is 2,139,781 bytes (~2.14 MB), so the 3.0 MB MAX_BYTES
 # bounds the total surface/review payload while leaving 860,219 bytes of
@@ -330,6 +330,7 @@ system_prompt='You are a strict benchmark-integrity reviewer for an MLX/Swift mo
 system_prompt="${system_prompt} The editable surface also includes the exact host-side C++ GEMM dispatch and JIT source-factory files matmul.cpp, jit_kernels.cpp, and kernels.h. Treat edits that hide behavior through compiled template dtype/source selection, library cache keys, function constants, buffer bindings, or dispatch conditions as kernel-dispatch edits. Do not fail input-general host dispatch fixes or tuning that binds template dtypes to the actual input buffers."
 system_prompt="${system_prompt} The canonical fp4.h and fp8.h datatype helpers are editable because their definitions are compiled into AOT kernels and embedded in the runtime JIT fp_quantized, fp_quantized_nax, and unary sources. Review helper edits together with every represented AOT/JIT dependency; fail inconsistent copies or benchmark-specific datatype behavior, but allow prompt-general numerical corrections."
 system_prompt="${system_prompt} Controlling serial-track rule: ${serial_decode_rule} Fail prompt-lookup decoding, including n-gram, suffix, or token-history drafting; same-target lookahead or any other selection or evaluation of an unsupplied future token; two-, three-, or more-row target-model paths used to verify drafts from a one-token request; cross-request future-token, future-logit, or future-KV buffering, including deferred KV rows and commit, rollback, recommit, or discard markers; and pre-hello or initialization warmup of an excluded speculative pipeline. Fail these mechanisms even when they are generic, bit-exact, or production-useful. Organizer MTP belongs only in a separate explicit track. Do not fail current-token-only execution, ordinary within-request KV caches, input-independent caches, or multi-row kernels when every row corresponds to a token supplied in the same invocation, such as prefill."
+system_prompt="${system_prompt} Self-drafting is speculative decoding even when the submission ships no separate drafter model and adds no weights. Also fail: early-exit, reduced-depth, partial-layer, or intermediate-hidden-state paths used to propose tokens beyond the current position, including applying lm_head or any other projection to a hidden state taken from an earlier layer for that purpose; auxiliary or additional prediction heads, Medusa-style or otherwise, whether shipped in the submission, derived at load time from existing weights, or synthesized by the offline transform; transform-side generation of draft, speculator, or auxiliary-predictor parameters; and shadow, side, parallel, or staging buffers that carry hidden states, logits, or KV rows for positions beyond the current one across decode requests, under any name. Apply this general principle to variants not named above: within one decode invocation every computed logits row and every written KV row must correspond to a token the harness supplied in that same invocation, and no compute performed while serving one decode step may be reused to answer a later decode step. Amortizing decode work across steps is excluded regardless of the mechanism, including implementations that rely on the timed decode pass being teacher-forced so that the next supplied token is predictable from the model's own greedy output. Treat evidence of these mechanisms as high or critical severity."
 
 jq -s \
   --arg model "${MODEL}" \
@@ -343,10 +344,10 @@ jq -s \
   --rawfile submission_diff "${submission_diff_path}" \
   '{
     model: $model,
-    # max_tokens covers thinking plus the response text on Opus 4.8, and max
+    # max_tokens covers thinking plus the response text on Opus 5, and max
     # effort thinks extensively, so the budget is far above the 4096 that the
     # verdict JSON alone needs. stop_reason is still checked after the call to
-    # fail loudly on any remaining truncation. Opus 4.8 rejects non-default
+    # fail loudly on any remaining truncation. Opus 5 rejects non-default
     # temperature/top_p/top_k with a 400, so no temperature is set; adaptive
     # thinking is the only thinking mode it supports (manual budget_tokens is
     # also a 400).
@@ -386,7 +387,10 @@ jq -s \
                   "same-target lookahead or any other selection or evaluation by submitted code of a future token not supplied in the current serial request",
                   "multi-row speculative target execution, including two-, three-, or more-row target-model paths used to verify a draft initiated by a one-token decode request",
                   "cross-request future-token, future-logit, or future-KV buffering, including deferred KV rows and commit, rollback, recommit, or discard markers for speculative rows",
-                  "pre-hello or initialization warmup of a prompt-lookup, draft-verification, or other excluded speculative pipeline"
+                  "pre-hello or initialization warmup of a prompt-lookup, draft-verification, or other excluded speculative pipeline",
+                  "self-drafting with no separate drafter model: early-exit, reduced-depth, partial-layer, or intermediate-hidden-state paths that propose tokens beyond the current position, including applying lm_head to a hidden state taken from an earlier layer",
+                  "auxiliary or additional prediction heads (Medusa-style) shipped, derived at load time from existing weights, or synthesized by the offline transform, and transform-side generation of draft or speculator parameters",
+                  "shadow, side, parallel, or staging buffers carrying hidden states, logits, or KV rows for positions beyond the current one across decode requests, or any other amortization of decode work across steps"
                 ]),
                 allow: ([
                   "legitimate MLX kernel/model optimizations (quantized matmul dispatch, attention restructuring, KV-cache handling, weight layout/materialization, scheduling)",

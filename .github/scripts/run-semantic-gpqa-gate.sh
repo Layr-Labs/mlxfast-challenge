@@ -6,10 +6,10 @@ ANSWERS_PATH="${MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH:?MLXFAST_SEMANTIC_GPQA_OUTPUT_
 SCORE_PATH="${MLXFAST_SCORE_PATH:-score.json}"
 INTEGRITY_PATH="${MLXFAST_INTEGRITY_PATH:-benchmark-integrity.json}"
 RESULTS_PATH="${MLXFAST_SEMANTIC_GPQA_RESULTS_PATH:-${MLXFAST_PRIVATE_DIR:-/tmp}/semantic_gpqa_results.json}"
-MODEL="${MLXFAST_SEMANTIC_GPQA_MODEL:-claude-opus-4-8}"
+MODEL="${MLXFAST_SEMANTIC_GPQA_MODEL:-claude-opus-5}"
 # Default mirrors MLXFastConstants.semanticGPQAMinPassCount. Four 2026-07-22
 # official-runner Laguna baseline observations judged 2/5, 2/5, 1/5, and 2/5
-# with Opus 4.8, so the observed minimum remains the conservative floor of 1.
+# with Opus 5, so the observed minimum remains the conservative floor of 1.
 MIN_PASS="${MLXFAST_SEMANTIC_GPQA_MIN_PASS:-1}"
 REQUIRED="${MLXFAST_SEMANTIC_GPQA_REQUIRED:-1}"
 
@@ -231,11 +231,11 @@ for index in $(seq 0 $((case_count - 1))); do
     --argjson index "${index}" \
     '.cases[$index] as $case | {
       model: $model,
-      # max_tokens caps thinking plus the reply text on Opus 4.8. 32,000 gives
+      # max_tokens caps thinking plus the reply text on Opus 5. 32,000 gives
       # substantial headroom over the Sonnet-era 256 cap that produced
       # unparseable truncated verdicts in run 29124417146, but remains a hard
       # cap; an exhausted response is retried and then fails that case if no
-      # verdict can be extracted. Opus 4.8 rejects non-default
+      # verdict can be extracted. Opus 5 rejects non-default
       # temperature/top_p/top_k with a 400, so no sampling params are set;
       # adaptive thinking is its only thinking mode (a manual thinking budget
       # is also a 400), and effort max gives unconstrained reasoning depth.
@@ -261,7 +261,7 @@ for index in $(seq 0 $((case_count - 1))); do
       ]
     }' "${ANSWERS_PATH}" > "${request_path}"
 
-  # Opus 4.8 does not support assistant prefill (400), so the Sonnet-era
+  # Opus 5 does not support assistant prefill (400), so the Sonnet-era
   # prefilled-retry trick is gone. Adaptive thinking varies between attempts,
   # so re-sending the identical request is a real retry (unlike the old
   # temperature-0 setup where a byte-identical retry reproduced the same
