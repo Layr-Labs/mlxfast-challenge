@@ -6,7 +6,7 @@ ANSWERS_PATH="${MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH:?MLXFAST_SEMANTIC_GPQA_OUTPUT_
 SCORE_PATH="${MLXFAST_SCORE_PATH:-score.json}"
 INTEGRITY_PATH="${MLXFAST_INTEGRITY_PATH:-benchmark-integrity.json}"
 RESULTS_PATH="${MLXFAST_SEMANTIC_GPQA_RESULTS_PATH:-${MLXFAST_PRIVATE_DIR:-/tmp}/semantic_gpqa_results.json}"
-MODEL="${MLXFAST_SEMANTIC_GPQA_MODEL:-claude-opus-5}"
+MODEL="${MLXFAST_SEMANTIC_GPQA_MODEL:-claude-opus-4-8}"
 # Default mirrors MLXFastConstants.semanticGPQAMinPassCount. Four 2026-07-22
 # official-runner Laguna baseline observations judged 2/5, 2/5, 1/5, and 2/5
 # with Opus 5, so the observed minimum remains the conservative floor of 1.
