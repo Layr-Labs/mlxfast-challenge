@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# yukon-trace-config-v15
+# hilbert-trace-config-v15
 # Thin transport only: the CLI owns identity, checkpoints, source handling, retry, and upload.
 agent="${1:-unknown}"
 kind="${2:-capture}"

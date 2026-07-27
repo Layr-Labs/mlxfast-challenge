@@ -1,12 +1,12 @@
-// Yukon OpenCode trace transport — yukon-opencode-trace-plugin-v6.
+// Hilbert OpenCode trace transport — hilbert-opencode-trace-plugin-v6.
 //
 // Keep this repository-owned boundary stable across CLI upgrades. Every native event except noisy
 // token deltas is forwarded; old and new CLIs independently choose the events they understand.
 import { spawn } from "node:child_process";
 
-const WRAPPER = ".yukon/hooks/yukon-trace.sh";
+const WRAPPER = ".hilbert/hooks/hilbert-trace.sh";
 
-export const YukonTrace = async ({ worktree }: { worktree?: string }) => ({
+export const HilbertTrace = async ({ worktree }: { worktree?: string }) => ({
   event: ({ event }: { event: unknown }) => {
     try {
       if ((event as { type?: unknown } | null)?.type === "message.part.delta") return;
