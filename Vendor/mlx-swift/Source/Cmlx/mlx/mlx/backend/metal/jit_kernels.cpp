@@ -1231,10 +1231,16 @@ namespace {
 // of the loader traffic, and it drops the LSU:MMA issue ratio from 5.00 to
 // 4.11. See notes/21-attn-analysis.md.
 //
-// DEFAULT OFF, read as `== "1"`. This is an unmeasured arm: the hoist extends
-// 8 fragments' live range across the whole loop (+28 registers/thread), and if
-// that crosses an occupancy threshold it shows up as a regression, not a win.
-// It must not ship until a paired measurement says otherwise.
+// DEFAULT ON, read as `!= "0"` (explicit 0 ablates). Measured, not assumed:
+// paired n=6 on the shipped config read +0.66% prefill, a right-sign null with
+// no register-spill/occupancy signature (notes/20-session4-results.md:379,
+// notes/26-session5-results.md:351). The hoist extends 8 fragments' live range
+// across the whole loop (+28 registers/thread); the paired read says that does
+// not cross an occupancy threshold. Pure work removal -- 9.83M redundant 8B
+// device fragment-loads per 512-token forward -- with zero arithmetic change,
+// so exactness and the floors are not at risk. The default-ON flip was decided
+// at bef2350 ("rides with next ship", notes/26:429, notes/30:875) but never
+// submitted; notes/29:71-73 records main still carrying the OFF default.
 //
 // WHY A #define AND NOT A FUNCTION CONSTANT. The natural home for a host-side
 // switch is scaled_dot_product_attention.cpp, but that file is not in
@@ -1256,7 +1262,7 @@ namespace {
 // takes its arguments by value; the empty string appends nothing.
 const char* darkbloom_attn_qhoist_define() {
   static const bool enabled = [] {
-    const bool v = env::get_var("DARKBLOOM_ATTN_QHOIST", "") == "1";
+    const bool v = env::get_var("DARKBLOOM_ATTN_QHOIST", "1") != "0";
     // Same ground-truth discipline the STAGE arms needed: prove the arm is
     // live before trusting its number. A #define that silently fails to reach
     // the source string produces an arm that measures its own control.
