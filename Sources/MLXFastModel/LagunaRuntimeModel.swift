@@ -300,6 +300,14 @@ let lagunaFusedResidualRMSNormRouterEnabled =
 let lagunaFusedFullQKNormYaRNEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_QK_NORM_YARN"] != "0"
 
+/// Coalesces the fused decode Q/K norm+RoPE kernel's two short-lived BF16
+/// outputs into one allocation, then exposes row-contiguous shared-buffer
+/// views for attention. The arithmetic, thread geometry, and legacy kernels
+/// are unchanged. Default ON for the ranked M5 ablation; set
+/// `DARKBLOOM_FUSED_QK_OUTPUT_SLAB=0` to disable.
+let lagunaFusedQKOutputSlabEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QK_OUTPUT_SLAB"] != "0"
+
 /// Decode-only carrier for the two authoritative RoPE angle rows consumed by
 /// the fused Q/K kernels. At load time each attention family's own stock RoPE
 /// materializes an exact FP32 position atlas. A single custom kernel then
@@ -891,12 +899,85 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Single-allocation twin of ``lagunaFullQKNormYaRNKernel``. Head-major Q
+/// rows occupy `[0, 48)` and K rows `[48, 56)`, so splitting axis 1 at 48
+/// produces the exact legacy shapes without a GPU copy.
+private let lagunaFullQKNormYaRNSlabKernel = MLXFast.metalKernel(
+    name: "laguna_full_qk_norm_yarn_slab_bf16_128_v1",
+    inputNames: ["raw_queries", "raw_keys", "query_weight", "key_weight", "angles"],
+    outputNames: ["payload"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint rotary_dims = 64;
+        constexpr uint rotary_pairs = 32;
+        constexpr uint query_heads = 48;
+        constexpr float yarn_mscale = 1.3465735912322998f;
+
+        uint head = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+
+        const device bfloat* input;
+        const device bfloat* weight;
+        if (head < query_heads) {
+            input = raw_queries + head * head_dim;
+            weight = query_weight;
+        } else {
+            input = raw_keys + (head - query_heads) * head_dim;
+            weight = key_weight;
+        }
+
+        uint base = lane * 4;
+        thread bfloat normalized[4];
+        float sum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float value = float(input[base + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+        for (uint i = 0; i < 4; ++i) {
+            normalized[i] =
+                weight[base + i] *
+                bfloat(float(input[base + i]) * inverse_rms);
+        }
+
+        thread float paired[4];
+        for (uint i = 0; i < 4; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
+        }
+
+        device bfloat* output = payload + head * head_dim;
+        if (lane < 8) {
+            bfloat rounded_mscale = bfloat(yarn_mscale);
+            for (uint i = 0; i < 4; ++i) {
+                uint pair = base + i;
+                float first =
+                    float(bfloat(normalized[i] * rounded_mscale));
+                float second =
+                    float(bfloat(bfloat(paired[i]) * rounded_mscale));
+                float cosine = angles[pair];
+                float sine = angles[pair + rotary_pairs];
+                output[pair] = bfloat(first * cosine - second * sine);
+                output[pair + rotary_pairs] =
+                    bfloat(first * sine + second * cosine);
+            }
+        } else if (lane >= 16) {
+            for (uint i = 0; i < 4; ++i) {
+                output[base + i] = normalized[i];
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 func lagunaFullQKNormYaRN(
     rawQueries: MLXArray,
     rawKeys: MLXArray,
     queryWeight: MLXArray,
     keyWeight: MLXArray,
-    angles: MLXArray
+    angles: MLXArray,
+    useOutputSlab: Bool = lagunaFusedQKOutputSlabEnabled
 ) -> (MLXArray, MLXArray) {
     precondition(rawQueries.dtype == .bfloat16)
     precondition(rawKeys.dtype == .bfloat16)
@@ -910,6 +991,18 @@ func lagunaFullQKNormYaRN(
     precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim / 2])
 
     lagunaTrace("full qk norm+yarn")
+    if useOutputSlab {
+        let payload = lagunaFullQKNormYaRNSlabKernel(
+            [rawQueries, rawKeys, queryWeight, keyWeight, angles],
+            grid: (56 * 32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[1, 56, 1, LagunaConstants.headDim]],
+            outputDTypes: [.bfloat16]
+        )[0]
+        let segments = payload.split(indices: [48], axis: 1)
+        precondition(segments.count == 2)
+        return (segments[0], segments[1])
+    }
     let outputs = lagunaFullQKNormYaRNKernel(
         [rawQueries, rawKeys, queryWeight, keyWeight, angles],
         grid: (56 * 32, 1, 1),
@@ -1015,12 +1108,75 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Single-allocation twin of ``lagunaSlidingQKNormRoPEKernel``. Q occupies
+/// heads `[0, 64)` and K `[64, 72)` in one head-major payload.
+private let lagunaSlidingQKNormRoPESlabKernel = MLXFast.metalKernel(
+    name: "laguna_sliding_qk_norm_rope_slab_bf16_128_v1",
+    inputNames: ["raw_queries", "raw_keys", "query_weight", "key_weight", "angles"],
+    outputNames: ["payload"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint rotary_pairs = 64;
+        constexpr uint query_heads = 64;
+
+        uint head = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+
+        const device bfloat* input;
+        const device bfloat* weight;
+        if (head < query_heads) {
+            input = raw_queries + head * head_dim;
+            weight = query_weight;
+        } else {
+            input = raw_keys + (head - query_heads) * head_dim;
+            weight = key_weight;
+        }
+
+        uint base = lane * 4;
+        thread bfloat normalized[4];
+        float sum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float value = float(input[base + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+        for (uint i = 0; i < 4; ++i) {
+            normalized[i] =
+                weight[base + i] *
+                bfloat(float(input[base + i]) * inverse_rms);
+        }
+
+        thread float paired[4];
+        for (uint i = 0; i < 4; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
+        }
+
+        device bfloat* output = payload + head * head_dim;
+        if (lane < 16) {
+            for (uint i = 0; i < 4; ++i) {
+                uint pair = base + i;
+                float first = float(normalized[i]);
+                float second = paired[i];
+                float cosine = angles[pair];
+                float sine = angles[pair + rotary_pairs];
+                output[pair] = bfloat(first * cosine - second * sine);
+                output[pair + rotary_pairs] =
+                    bfloat(first * sine + second * cosine);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 func lagunaSlidingQKNormRoPE(
     rawQueries: MLXArray,
     rawKeys: MLXArray,
     queryWeight: MLXArray,
     keyWeight: MLXArray,
-    angles: MLXArray
+    angles: MLXArray,
+    useOutputSlab: Bool = lagunaFusedQKOutputSlabEnabled
 ) -> (MLXArray, MLXArray) {
     let heads = LagunaConstants.slidingAttentionHeads
     let kvHeads = LagunaConstants.numKeyValueHeads
@@ -1036,6 +1192,20 @@ func lagunaSlidingQKNormRoPE(
     precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim])
 
     lagunaTrace("sliding qk norm+rope")
+    if useOutputSlab {
+        let payload = lagunaSlidingQKNormRoPESlabKernel(
+            [rawQueries, rawKeys, queryWeight, keyWeight, angles],
+            grid: ((heads + kvHeads) * 32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [
+                [1, heads + kvHeads, 1, LagunaConstants.headDim]
+            ],
+            outputDTypes: [.bfloat16]
+        )[0]
+        let segments = payload.split(indices: [heads], axis: 1)
+        precondition(segments.count == 2)
+        return (segments[0], segments[1])
+    }
     let outputs = lagunaSlidingQKNormRoPEKernel(
         [rawQueries, rawKeys, queryWeight, keyWeight, angles],
         grid: ((heads + kvHeads) * 32, 1, 1),
