@@ -6,13 +6,16 @@
 
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
+#include "mlx/backend/common/slicing.h"
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/metal/binary.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/reduce.h"
 #include "mlx/backend/metal/unary.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/fast_primitives.h"
+#include "mlx/ops.h"
 #include "mlx/primitives.h"
 #include "mlx/utils.h"
 
@@ -900,6 +903,41 @@ void qmm_splitk(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 
   // Sum across split_k dimension (axis 0)
+  //
+  // DARKBLOOM_QMM_SPLITK_ADD_COMBINE (default ON, "0" ablates): combine the
+  // two partials through the vectorized binary-add kernel instead of the
+  // strided col_reduce. The col_reduce walks a 512 KB reduction stride with
+  // 32-thread threadgroups, which the stderr gpuprobe measured at ~0.42 ms
+  // median per call -- 2 calls per sparse layer (the shared expert's gate
+  // and up projections at M=512, N=512, K=2048 take split_k=2 here), ~36 ms
+  // of the 512-token prefill (notes/69). The binary add is arithmetically
+  // IDENTICAL: the col_reduce's init-0 accumulator yields 0+p0 = p0 exactly
+  // and then rounds p0+p1 once with a BF16 accumulator in ascending slot
+  // order; the binary add rounds the same BF16 p0+p1 once. Same operands,
+  // same order, same single rounding -- but each thread reads linearly from
+  // two contiguous halves at full DRAM bandwidth (~3-5 us).
+  static const bool splitk_add_combine =
+      env::get_var("DARKBLOOM_QMM_SPLITK_ADD_COMBINE", "1") != "0";
+  if (split_k == 2 && splitk_add_combine) {
+    // Evaluated shared-buffer aliases of the two partials, shaped exactly
+    // like out. Two backend-API traps avoided here, both observed live:
+    // (1) the frontend slice/reshape ops are lazy primitives -- inputs to a
+    //     direct GPU dispatch must already own data;
+    // (2) binary_op_gpu (non-inplace) treats its output as fresh: it donates
+    //     or reallocates the output buffer (backend/common/binary.h:71-76),
+    //     so an aliased view passed as output gets REPLACED and the write
+    //     lands elsewhere. binary_op_gpu_inplace writes into the existing
+    //     buffer instead.
+    array h0(out.shape(), out.dtype(), nullptr, {});
+    h0.copy_shared_buffer(
+        intermediate, out.strides(), intermediate.flags(), out.size(), 0);
+    array h1(out.shape(), out.dtype(), nullptr, {});
+    h1.copy_shared_buffer(
+        intermediate, out.strides(), intermediate.flags(), out.size(),
+        int64_t(M) * N);
+    binary_op_gpu_inplace({h0, h1}, out, "Add", s);
+    return;
+  }
   ReductionPlan plan(
       ReductionOpType::ContiguousStridedReduce,
       {intermediate.shape(0)},
