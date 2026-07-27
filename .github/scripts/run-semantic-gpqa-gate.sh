@@ -8,8 +8,11 @@ INTEGRITY_PATH="${MLXFAST_INTEGRITY_PATH:-benchmark-integrity.json}"
 RESULTS_PATH="${MLXFAST_SEMANTIC_GPQA_RESULTS_PATH:-${MLXFAST_PRIVATE_DIR:-/tmp}/semantic_gpqa_results.json}"
 MODEL="${MLXFAST_SEMANTIC_GPQA_MODEL:-claude-opus-4-8}"
 # Default mirrors MLXFastConstants.semanticGPQAMinPassCount. Four 2026-07-22
-# official-runner Laguna baseline observations judged 2/5, 2/5, 1/5, and 2/5
-# with Opus 5, so the observed minimum remains the conservative floor of 1.
+# The historical 1/5-2/5 observations behind this floor predate the GPQA
+# prompt-encoding (BOS) fix and measured a reference that never answered;
+# post-fix the reference answers 5/9 by letter match, so 1 is a deliberately
+# loose floor. Retighten only from post-fix ranked-run distributions. See
+# MLXFastConstants.semanticGPQAMinPassCount.
 MIN_PASS="${MLXFAST_SEMANTIC_GPQA_MIN_PASS:-1}"
 REQUIRED="${MLXFAST_SEMANTIC_GPQA_REQUIRED:-1}"
 

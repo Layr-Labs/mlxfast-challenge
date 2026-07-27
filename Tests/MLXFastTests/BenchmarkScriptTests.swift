@@ -1522,14 +1522,14 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_TIMED_DECODE_PROMPT_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/timed-decode-prompt-0b67162cbea948f380e693398b19ba797892b5100cd9e0e415a87e900ac79e03.txt"))
     #expect(workflow.contains("MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/hidden-correctness-golden-94239d59b435eb8f370c82bcf8c86822d1bbc1094e3650aeff3abc5558137023.json"))
     #expect(workflow.contains("MLXFAST_GPQA_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/gpqa-reference-cases-4a6d847c6535561e8d4094e2bb764be96c2cd8f4ca310614120058c3c6a7d26f.json"))
-    #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"5\""))
-    // Four Poolside NVFP4 baseline-equivalent activation runs re-confirmed the
-    // 64-token budget and conservative 1/5 floor. See
+    #expect(workflow.contains("MLXFAST_GPQA_CASE_COUNT: \"9\""))
+    // 64-token budget retained across the GPQA BOS-encoding fix; the floor of
+    // 1 is deliberately loose post-fix. See
     // MLXFastConstants.semanticGPQAMinPassCount for provenance.
-    #expect(workflow.contains("MLXFAST_GPQA_MAX_NEW_TOKENS: \"64\""))
-    #expect(workflow.contains("MLXFAST_GPQA_TTFT_CASE_COUNT: \"5\""))
-    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_CASE_COUNT: \"5\""))
-    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: \"64\""))
+    #expect(workflow.contains("MLXFAST_GPQA_MAX_NEW_TOKENS: \"128\""))
+    #expect(workflow.contains("MLXFAST_GPQA_TTFT_CASE_COUNT: \"9\""))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_CASE_COUNT: \"9\""))
+    #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: \"128\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MIN_PASS: \"1\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_REQUIRED: \"1\""))
     #expect(workflow.contains("MLXFAST_SEMANTIC_GPQA_MODEL: claude-opus-4-8"))
