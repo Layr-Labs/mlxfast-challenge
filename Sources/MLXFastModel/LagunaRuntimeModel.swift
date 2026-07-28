@@ -2583,7 +2583,7 @@ func lagunaSharedSwiGLUQMV(
 }
 
 private let lagunaSharedDownResidualKernel = MLXFast.metalKernel(
-    name: "laguna_shared_nvfp4_down_residual_bf16_v1",
+    name: "laguna_shared_nvfp4_down_residual_bf16_v2",
     inputNames: [
         "activated", "down_weight", "down_scales", "routed", "residual",
     ],
@@ -2618,6 +2618,7 @@ private let lagunaSharedDownResidualKernel = MLXFast.metalKernel(
         thread float result[outputs_per_simd] = {
             0.0f, 0.0f, 0.0f, 0.0f
         };
+        #pragma clang loop unroll(full)
         for (uint row = 0; row < outputs_per_simd; ++row) {
             uint output_row = first_row + row;
             const device uint8_t* weight =
@@ -2633,6 +2634,7 @@ private let lagunaSharedDownResidualKernel = MLXFast.metalKernel(
         }
 
         if (lane == 0) {
+            #pragma clang loop unroll(full)
             for (uint row = 0; row < outputs_per_simd; ++row) {
                 uint output_row = first_row + row;
                 bfloat shared = bfloat(result[row]);
@@ -3014,7 +3016,7 @@ func lagunaRoutedSharedSwiGLUQMV(
 // keeps the eight expert rows in threadgroup memory and emits only the final
 // 2048-wide routed branch.
 private let lagunaRoutedDownReduceKernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_down_reduce_bf16_v1",
+    name: "laguna_routed_nvfp4_down_reduce_bf16_v2",
     inputNames: [
         "activated", "down_weight", "down_scales", "indices", "router_weights",
     ],
@@ -3061,6 +3063,7 @@ private let lagunaRoutedDownReduceKernel = MLXFast.metalKernel(
         thread float result[outputs_per_simd] = {
             0.0f, 0.0f, 0.0f, 0.0f
         };
+        #pragma clang loop unroll(full)
         for (uint row = 0; row < outputs_per_simd; ++row) {
             uint output_row = first_row + row;
             const device uint8_t* weight =
@@ -3078,6 +3081,7 @@ private let lagunaRoutedDownReduceKernel = MLXFast.metalKernel(
             experts_per_token * outputs_per_simd
         ];
         if (lane == 0) {
+            #pragma clang loop unroll(full)
             for (uint row = 0; row < outputs_per_simd; ++row) {
                 expert_outputs[
                     expert_slot * outputs_per_simd + row
@@ -3368,7 +3372,7 @@ func lagunaRoutedSharedDownResidual(
 // first, matching stock `downProj`'s own output rounding, then add the
 // residual and round once more -- reproducing stock `h + r2` bit-for-bit.
 private let lagunaDenseGateUpSwiGLUKernel = MLXFast.metalKernel(
-    name: "laguna_dense_gate_up_swiglu_bf16_v1",
+    name: "laguna_dense_gate_up_swiglu_bf16_v2",
     inputNames: ["input", "fused_weight"],
     outputNames: ["activated"],
     source: """
@@ -3392,9 +3396,11 @@ private let lagunaDenseGateUpSwiGLUKernel = MLXFast.metalKernel(
 
         uint column = lane * values_per_thread;
         for (uint block = 0; block < blocks; ++block) {
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < values_per_thread; ++i) {
                 coefficients[i] = float(input[column + i]);
             }
+            #pragma clang loop unroll(full)
             for (uint row = 0; row < rows_per_thread; ++row) {
                 const device vec<bfloat, 4>* gate_row_values =
                     (const device vec<bfloat, 4>*)(
@@ -3405,6 +3411,7 @@ private let lagunaDenseGateUpSwiGLUKernel = MLXFast.metalKernel(
                         fused_weight +
                         (output_width + row_base + row) * in_vec_size + column);
                 const vec<bfloat, 4> uw = up_row_values[0];
+                #pragma clang loop unroll(full)
                 for (uint i = 0; i < values_per_thread; ++i) {
                     gate_result[row] += float(gw[i]) * coefficients[i];
                     up_result[row] += float(uw[i]) * coefficients[i];
@@ -3413,6 +3420,7 @@ private let lagunaDenseGateUpSwiGLUKernel = MLXFast.metalKernel(
             column += block_width;
         }
 
+        #pragma clang loop unroll(full)
         for (uint row = 0; row < rows_per_thread; ++row) {
             for (ushort delta = 16; delta >= 1; delta >>= 1) {
                 gate_result[row] +=
@@ -3422,6 +3430,7 @@ private let lagunaDenseGateUpSwiGLUKernel = MLXFast.metalKernel(
             }
         }
         if (lane == 0) {
+            #pragma clang loop unroll(full)
             for (uint row = 0; row < rows_per_thread; ++row) {
                 bfloat gate = bfloat(gate_result[row]);
                 bfloat up = bfloat(up_result[row]);
@@ -3461,7 +3470,7 @@ func lagunaDenseGateUpSwiGLU(
 }
 
 private let lagunaDenseDownResidualKernel = MLXFast.metalKernel(
-    name: "laguna_dense_down_residual_bf16_v1",
+    name: "laguna_dense_down_residual_bf16_v2",
     inputNames: ["activated", "down_weight", "residual"],
     outputNames: ["output"],
     source: """
@@ -3483,14 +3492,17 @@ private let lagunaDenseDownResidualKernel = MLXFast.metalKernel(
 
         uint column = lane * values_per_thread;
         for (uint block = 0; block < blocks; ++block) {
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < values_per_thread; ++i) {
                 coefficients[i] = float(activated[column + i]);
             }
+            #pragma clang loop unroll(full)
             for (uint row = 0; row < rows_per_thread; ++row) {
                 const device vec<bfloat, 4>* row_values =
                     (const device vec<bfloat, 4>*)(
                         down_weight + (row_base + row) * in_vec_size + column);
                 const vec<bfloat, 4> w = row_values[0];
+                #pragma clang loop unroll(full)
                 for (uint i = 0; i < values_per_thread; ++i) {
                     result[row] += float(w[i]) * coefficients[i];
                 }
@@ -3498,12 +3510,14 @@ private let lagunaDenseDownResidualKernel = MLXFast.metalKernel(
             column += block_width;
         }
 
+        #pragma clang loop unroll(full)
         for (uint row = 0; row < rows_per_thread; ++row) {
             for (ushort delta = 16; delta >= 1; delta >>= 1) {
                 result[row] += metal::simd_shuffle_down(result[row], delta);
             }
         }
         if (lane == 0) {
+            #pragma clang loop unroll(full)
             for (uint row = 0; row < rows_per_thread; ++row) {
                 bfloat down = bfloat(result[row]);
                 output[row_base + row] =
