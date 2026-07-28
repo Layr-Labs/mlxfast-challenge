@@ -176,8 +176,18 @@ func lowMemoryPlanWritesNoFeatureDefaultsAndAnnouncesRankedParity() throws {
     ))
     #expect(plan.noticeLines[0].contains("DARKBLOOM_STARTUP_MEMORY_PROFILE=full"))
     #expect(plan.noticeLines[1].contains("out-of-memory"))
-    #expect(plan.noticeLines[1].contains("machine with more unified memory"))
     #expect(plan.noticeLines[1].contains("rely on the ranked run"))
+    // Deliberately NOT asserting the machine-size phrasing in this line.
+    // RuntimeStartupMemoryPolicy.swift is an editable path, so a submission
+    // ships its own copy of this notice string. Pinning cosmetic guidance
+    // wording here fails every submission whose snapshot predates a wording
+    // change in trusted main, for no contract reason -- observed 2026-07-28,
+    // when rewording "64 GiB+ machine" to "machine with more unified memory"
+    // reddened in-flight submissions cb418c4c and others. The assertions that
+    // remain (out-of-memory guidance, ranked-run fallback) are stable across
+    // both wordings, and the noticeLines[0] assertions above are kept because
+    // they encode the actual contract (no feature-disable defaults; compiled
+    // decode stays enabled), not phrasing.
 }
 
 @Test
