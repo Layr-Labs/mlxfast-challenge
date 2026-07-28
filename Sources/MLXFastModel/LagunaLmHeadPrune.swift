@@ -113,17 +113,18 @@ private let lagunaLmHeadPruneHeader = """
 /// Fused MXFP8 coarse GEMV + certified bound + BF16 pre-fill.
 /// One simdgroup per row; lane covers 64 consecutive elements (2 groups).
 ///
-/// v2 (H3 audit, R1): same grid, same lane->element mapping, same FP
+/// v3 (H3 audit, R1): same grid, same lane->element mapping, same FP
 /// accumulation text and j-order -- only the per-element decode plumbing is
 /// vectorized. Word-parallel e4m3 decode (laguna_e4m3_decode4, bit-identical
 /// construction), vectorized hs8 (max-form, identical floats), x loaded as
-/// ushort4 and converted bf16->f32 by the exact bits<<16 construction, and
-/// both loops fully unrolled with static trip counts so the packed words and
-/// vector components resolve to static indices. Coarse, delta, and coarse_bf
-/// outputs are bit-identical to v1 for every input, so the notes/68
-/// certificate is untouched.
+/// ushort4 and converted bf16->f32 by the exact bits<<16 construction. v3
+/// additionally scalarizes the outer fixed-two scale-group loop; all three
+/// loops now have explicit static trip counts, so group, packed-word, and
+/// component indices resolve statically. Coarse, delta, and coarse_bf outputs
+/// are bit-identical to v1 for every input, so the notes/68 certificate is
+/// untouched.
 private let lagunaLmHeadCoarseKernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_mxfp8_coarse_v2",
+    name: "laguna_lmhead_mxfp8_coarse_v3",
     inputNames: ["x", "codes", "scales"],
     outputNames: ["coarse", "delta", "coarse_bf"],
     source: """
@@ -139,6 +140,7 @@ private let lagunaLmHeadCoarseKernel = MLXFast.metalKernel(
         float c_acc = 0.0f;
         float d_acc = 0.0f;
         float m_acc = 0.0f;
+        #pragma clang loop unroll(full)
         for (uint gg = 0; gg < 2; ++gg) {
             uint g = 2 * lane + gg;
             float sd = laguna_e8m0_decode(srow[g]);
