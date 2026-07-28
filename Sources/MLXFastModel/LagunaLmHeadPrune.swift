@@ -50,12 +50,18 @@ private let lagunaLmHeadPruneVocab = 100_352
 private let lagunaLmHeadPruneHidden = 2048
 
 /// Master switch for the certified two-pass decode lm_head (notes/68).
-/// DEFAULT ON: unset, or any value other than "0", enables the certified
-/// two-pass decode head and builds the MXFP8 coarse copy at init time.
-/// Set `DARKBLOOM_LM_HEAD_PRUNE=0` to disable and restore the byte-identical
-/// stock full lm_head pass.
+/// Operator override 2026-07-28: default flipped to OFF on the reference
+/// branch. This module arrived via submission e36827ee default-ON; leaving a
+/// single submission's optimization as the shipped default at the reference
+/// HEAD would silently apply it to anyone building from main and could leak
+/// into a future baseline re-pin, so on main it is opt-in only. The
+/// as-submitted design and certification below are unchanged; enable it with
+/// `DARKBLOOM_LM_HEAD_PRUNE=1`. Any other value (including unset) keeps the
+/// byte-identical stock full lm_head pass. (The algorithm comments below were
+/// authored against the original default-ON contract; the switch here is the
+/// authority.)
 let lagunaLmHeadPruneEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_LM_HEAD_PRUNE"] != "0"
+    ProcessInfo.processInfo.environment["DARKBLOOM_LM_HEAD_PRUNE"] == "1"
 
 /// Kernel header: bit-exact MXFP8 element decoders + the certified
 /// half-cell-width table, all inlinable and libm-free.
