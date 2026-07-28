@@ -94,6 +94,21 @@ using namespace metal;
 #define DARKBLOOM_AOT_SDPA_2PASS_PLANES 1
 #endif
 
+// Laguna decode uses eight query heads per KV head. The stock vector kernel
+// launches one 1024-thread group per query head, so each resident K/V row is
+// read eight times. Pair adjacent query heads inside one threadgroup: they
+// retain independent online-softmax state and the exact stock 32-simdgroup
+// reduction tree, but share each K/V load. The host grid is unchanged; its
+// upper half returns uniformly before touching memory.
+//
+// Two heads are deliberately conservative. Their four two-plane exchange
+// banks consume the same 16 KiB as the promoted one-head/four-plane kernel,
+// while query/output register state only doubles. This path is restricted to
+// the scored D=V=128, GQA=8, one-query, unmasked, sink-free vector shape.
+#ifndef DARKBLOOM_GQA_PAIR_HEADS
+#define DARKBLOOM_GQA_PAIR_HEADS 2
+#endif
+
 constant bool has_mask [[function_constant(20)]];
 constant bool query_transposed [[function_constant(21)]];
 constant bool do_causal [[function_constant(22)]];
@@ -148,19 +163,184 @@ template <
 
   typedef float U;
 
-  thread U q[qk_per_thread];
-  thread U k[qk_per_thread];
-  thread U o[v_per_thread];
-
   // Clamp: more planes than elements would allocate threadgroup memory nobody
   // writes. The clamp is also the compile-safety net for D = V = 256, where
   // v_per_thread = 8 and eight 4 KiB planes (32768 B, plus max_scores and
   // sum_exp_scores) would exceed the 32 KiB per-threadgroup limit - a hard
   // metallib compile error, not a slow kernel. PLANES never exceeds 4.
   constexpr int v_planes = PLANES < v_per_thread ? PLANES : v_per_thread;
-  threadgroup U outputs[v_planes * BN * BD];
-  threadgroup U max_scores[BN];
-  threadgroup U sum_exp_scores[BN];
+  constexpr int exchange_planes =
+      (D == 128 && V == 128 && DARKBLOOM_GQA_PAIR_HEADS == 2)
+      ? 4
+      : v_planes;
+  threadgroup U outputs[exchange_planes * BN * BD];
+  threadgroup U max_scores[DARKBLOOM_GQA_PAIR_HEADS * BN];
+  threadgroup U sum_exp_scores[DARKBLOOM_GQA_PAIR_HEADS * BN];
+
+  // DARKBLOOM_GQA_PAIR_HEADS: preserve each head's exact key order and
+  // reduction tree while sharing the K/V device reads across adjacent heads.
+  const bool use_gqa_pair =
+      D == 128 && V == 128 && DARKBLOOM_GQA_PAIR_HEADS == 2 &&
+      gqa_factor == 8 && tpg.y == 1 && (tpg.x % 2) == 0 &&
+      !has_mask && !do_causal && !has_sinks;
+  if (use_gqa_pair) {
+    const int pair_idx = tid.x;
+    const int q_head0 = 2 * pair_idx;
+    if (q_head0 >= int(tpg.x)) {
+      return;
+    }
+    const int q_head1 = q_head0 + 1;
+    const int kv_head_idx = q_head0 / gqa_factor;
+
+    const device T* pair_query0 =
+        queries + q_head0 * D + simd_lid * qk_per_thread;
+    const device T* pair_query1 =
+        queries + q_head1 * D + simd_lid * qk_per_thread;
+    const device T* pair_keys =
+        keys + kv_head_idx * k_head_stride + simd_gid * k_seq_stride +
+        simd_lid * qk_per_thread;
+    const device T* pair_values =
+        values + kv_head_idx * v_head_stride + simd_gid * v_seq_stride +
+        simd_lid * v_per_thread;
+    device T* pair_out0 =
+        out + q_head0 * V + simd_gid * v_per_thread;
+    device T* pair_out1 =
+        out + q_head1 * V + simd_gid * v_per_thread;
+
+    thread U pair_q0[qk_per_thread];
+    thread U pair_q1[qk_per_thread];
+    thread U pair_k[qk_per_thread];
+    thread U pair_o0[v_per_thread];
+    thread U pair_o1[v_per_thread];
+
+    for (int j = 0; j < qk_per_thread; ++j) {
+      pair_q0[j] = static_cast<U>(scale) * pair_query0[j];
+      pair_q1[j] = static_cast<U>(scale) * pair_query1[j];
+    }
+    for (int j = 0; j < v_per_thread; ++j) {
+      pair_o0[j] = 0;
+      pair_o1[j] = 0;
+    }
+
+    U pair_max0 = Limits<U>::finite_min;
+    U pair_max1 = Limits<U>::finite_min;
+    U pair_sum0 = 0;
+    U pair_sum1 = 0;
+
+    for (int i = simd_gid; i < N; i += BN) {
+      for (int j = 0; j < qk_per_thread; ++j) {
+        pair_k[j] = pair_keys[j];
+      }
+
+      U pair_score0 = 0;
+      U pair_score1 = 0;
+      for (int j = 0; j < qk_per_thread; ++j) {
+        pair_score0 += pair_q0[j] * pair_k[j];
+        pair_score1 += pair_q1[j] * pair_k[j];
+      }
+      pair_score0 = simd_sum(pair_score0);
+      pair_score1 = simd_sum(pair_score1);
+
+      U pair_new_max0 = max(pair_max0, pair_score0);
+      U pair_new_max1 = max(pair_max1, pair_score1);
+      U pair_factor0 = fast::exp(pair_max0 - pair_new_max0);
+      U pair_factor1 = fast::exp(pair_max1 - pair_new_max1);
+      U pair_exp0 = fast::exp(pair_score0 - pair_new_max0);
+      U pair_exp1 = fast::exp(pair_score1 - pair_new_max1);
+
+      pair_max0 = pair_new_max0;
+      pair_max1 = pair_new_max1;
+      pair_sum0 = pair_sum0 * pair_factor0 + pair_exp0;
+      pair_sum1 = pair_sum1 * pair_factor1 + pair_exp1;
+
+      for (int j = 0; j < v_per_thread; ++j) {
+        const T pair_value = pair_values[j];
+        pair_o0[j] = pair_o0[j] * pair_factor0 + pair_exp0 * pair_value;
+        pair_o1[j] = pair_o1[j] * pair_factor1 + pair_exp1 * pair_value;
+      }
+
+      pair_keys += inner_k_stride;
+      pair_values += inner_v_stride;
+    }
+
+    // Each head keeps the promoted two-plane combine shape. The additive
+    // head-bank offset changes no producer/consumer pairing or simd_sum tree.
+    constexpr int pair_planes = 2;
+    constexpr int pair_plane_size = BN * BD;
+    if (simd_lid == 0) {
+      max_scores[simd_gid] = pair_max0;
+      max_scores[BN + simd_gid] = pair_max1;
+      sum_exp_scores[simd_gid] = pair_sum0;
+      sum_exp_scores[BN + simd_gid] = pair_sum1;
+    }
+    for (int i = 0; i < pair_planes; ++i) {
+      outputs[i * pair_plane_size + simd_lid * BD + simd_gid] = pair_o0[i];
+      outputs[
+          (pair_planes + i) * pair_plane_size + simd_lid * BD + simd_gid] =
+          pair_o1[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    pair_max0 = max_scores[simd_lid];
+    pair_max1 = max_scores[BN + simd_lid];
+    U pair_global_max0 = simd_max(pair_max0);
+    U pair_global_max1 = simd_max(pair_max1);
+    U pair_global_factor0 = fast::exp(pair_max0 - pair_global_max0);
+    U pair_global_factor1 = fast::exp(pair_max1 - pair_global_max1);
+    pair_sum0 =
+        simd_sum(sum_exp_scores[simd_lid] * pair_global_factor0);
+    pair_sum1 =
+        simd_sum(sum_exp_scores[BN + simd_lid] * pair_global_factor1);
+
+    for (int i = 0; i < pair_planes; ++i) {
+      U acc0 = simd_sum(
+          outputs[i * pair_plane_size + simd_gid * BD + simd_lid] *
+          pair_global_factor0);
+      U acc1 = simd_sum(
+          outputs[
+              (pair_planes + i) * pair_plane_size +
+              simd_gid * BD + simd_lid] *
+          pair_global_factor1);
+      pair_o0[i] = pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
+      pair_o1[i] = pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = 0; i < pair_planes; ++i) {
+      outputs[i * pair_plane_size + simd_lid * BD + simd_gid] =
+          pair_o0[pair_planes + i];
+      outputs[
+          (pair_planes + i) * pair_plane_size + simd_lid * BD + simd_gid] =
+          pair_o1[pair_planes + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = 0; i < pair_planes; ++i) {
+      U acc0 = simd_sum(
+          outputs[i * pair_plane_size + simd_gid * BD + simd_lid] *
+          pair_global_factor0);
+      U acc1 = simd_sum(
+          outputs[
+              (pair_planes + i) * pair_plane_size +
+              simd_gid * BD + simd_lid] *
+          pair_global_factor1);
+      pair_o0[pair_planes + i] =
+          pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
+      pair_o1[pair_planes + i] =
+          pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
+    }
+
+    if (simd_lid == 0) {
+      for (int i = 0; i < v_per_thread; ++i) {
+        pair_out0[i] = static_cast<T>(pair_o0[i]);
+        pair_out1[i] = static_cast<T>(pair_o1[i]);
+      }
+    }
+    return;
+  }
+
+  thread U q[qk_per_thread];
+  thread U k[qk_per_thread];
+  thread U o[v_per_thread];
 
   // Adjust positions
   const int q_batch_head_idx = tid.x;
