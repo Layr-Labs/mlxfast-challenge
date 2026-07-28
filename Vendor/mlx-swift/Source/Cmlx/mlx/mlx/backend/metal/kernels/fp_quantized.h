@@ -338,12 +338,7 @@ METAL_FUNC void fp_qmv_quad_impl(
   for (int row = 0; row < results_per_quadgroup; row++) {
     auto wl = (const device uint8_t*)(w + row * in_vec_size_w * quads_per_simd);
     const device uint8_t* sl = scales + row * in_vec_size_g * quads_per_simd;
-    // unroll_count(4) instead of full unroll lets the compiler interleave the
-    // next weight/scale step load with the running qdot accumulation
-    // (steps_per_thread is 16 for the Laguna NVFP4 matvec, K=2048 group=16).
-    // Bit-exact: the k iterations accumulate into result[row] in sequential
-    // order; unroll_count only changes instruction scheduling.
-#pragma clang loop unroll_count(4)
+#pragma unroll
     for (int k = 0; k < steps_per_thread; ++k) {
       U s = dequantize_scale<U, group_size>(sl[0]);
       if (row * quads_per_simd + out_row < out_vec_size) {
