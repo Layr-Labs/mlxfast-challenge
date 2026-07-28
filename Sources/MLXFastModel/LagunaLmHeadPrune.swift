@@ -82,117 +82,22 @@ private let lagunaLmHeadPruneHeader = """
     // saturated top code 0x7E whose cell is open: the e8m0 scale may round
     // down by up to a factor 2^0.5, so ratio <= 448*2^0.5 and the bound is
     // 448*(2^0.5-1) = 185.6, rounded up to 186.
-    //
-    // Max-form: the denormal branch 2^-10 equals 2^(1-11), so both non-top
-    // cases collapse to 2^(max(e,1)-11) -- identical float for all 256 codes
-    // to the original three-branch form (e==0 -> 2^-10; e>0 -> 2^(e-11)).
     static inline float laguna_hs8(uint8_t b) {
         uint mag = uint(b) & 127u;
+        if (mag == 126u) {
+            return 186.0f;
+        }
         uint e = mag >> 3;
-        float h = as_type<float>((metal::max(e, 1u) + 116u) << 23);  // 2^(max(e,1)-11)
-        return (mag == 126u) ? 186.0f : h;
-    }
-
-    // Bit-parallel e4m3 decode of one packed word (4 codes) into 4 floats.
-    // Per byte b the half bit pattern is sign<<15 | (b&127)<<7, i.e. exactly
-    // fp8.h's (b&127)<<7 construction with the sign applied as the half sign
-    // bit instead of a post-float negate. IEEE multiply is sign-magnitude
-    // symmetric, so (sign-packed half)*256h == sign*((b&127)-half * 256h)
-    // bit-for-bit for every code, including -0 (code 0x80). The four decoded
-    // floats are byte-order b0,b1,b2,b3 in out.x,out.y,out.z,out.w.
-    static inline float4 laguna_e4m3_decode4(uint w) {
-        uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
-        uint hs = w >> 8;
-        uint hi = ((hs & 0x007F007Fu) << 7) | ((hs & 0x00800080u) << 8);
-        half2 h02 = as_type<half2>(lo) * half2((half)256.0f);
-        half2 h13 = as_type<half2>(hi) * half2((half)256.0f);
-        return float4(float(h02.x), float(h13.x), float(h02.y), float(h13.y));
+        if (e == 0u) {
+            return 0x1p-10f;
+        }
+        return as_type<float>((e + 116u) << 23);  // 2^(e-11), exact
     }
     """
 
 /// Fused MXFP8 coarse GEMV + certified bound + BF16 pre-fill.
 /// One simdgroup per row; lane covers 64 consecutive elements (2 groups).
-///
-/// v2 (H3 audit, R1): same grid, same lane->element mapping, same FP
-/// accumulation text and j-order -- only the per-element decode plumbing is
-/// vectorized. Word-parallel e4m3 decode (laguna_e4m3_decode4, bit-identical
-/// construction), vectorized hs8 (max-form, identical floats), x loaded as
-/// ushort4 and converted bf16->f32 by the exact bits<<16 construction, and
-/// both loops fully unrolled with static trip counts so the packed words and
-/// vector components resolve to static indices. Coarse, delta, and coarse_bf
-/// outputs are bit-identical to v1 for every input, so the notes/68
-/// certificate is untouched.
 private let lagunaLmHeadCoarseKernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_mxfp8_coarse_v2",
-    inputNames: ["x", "codes", "scales"],
-    outputNames: ["coarse", "delta", "coarse_bf"],
-    source: """
-        constexpr float GAMMA = 0x1p-15f;
-
-        uint row = threadgroup_position_in_grid.x * 8 +
-            simdgroup_index_in_threadgroup;
-        uint lane = thread_index_in_simdgroup;
-
-        const device uint8_t* crow = codes + size_t(row) * 2048;
-        const device uint8_t* srow = scales + size_t(row) * 64;
-
-        float c_acc = 0.0f;
-        float d_acc = 0.0f;
-        float m_acc = 0.0f;
-        for (uint gg = 0; gg < 2; ++gg) {
-            uint g = 2 * lane + gg;
-            float sd = laguna_e8m0_decode(srow[g]);
-            const device uint4* cptr = (const device uint4*)(crow + g * 32);
-            uint4 packed0 = cptr[0];
-            uint4 packed1 = cptr[1];
-            float cg = 0.0f;
-            float dg = 0.0f;
-            float mg = 0.0f;
-            const device ushort4* xrow = (const device ushort4*)(x + g * 32);
-            #pragma clang loop unroll(full)
-            for (uint w = 0; w < 8; ++w) {
-                uint word = (w < 4u) ? packed0[w & 3u] : packed1[w & 3u];
-                float4 cv4 = laguna_e4m3_decode4(word);
-                // bf16 -> f32 is exactly bits<<16 for every value class.
-                float4 xv4 = as_type<float4>(uint4(xrow[w]) << 16);
-                float4 ax4 = metal::abs(xv4);
-                uint4 b4 = (uint4(word) >> uint4(0u, 8u, 16u, 24u)) & 255u;
-                uint4 mag4 = b4 & 127u;
-                uint4 e4 = mag4 >> 3;
-                float4 hsf = as_type<float4>((metal::max(e4, uint4(1u)) + 116u) << 23);
-                float4 hs4 = metal::select(hsf, float4(186.0f), mag4 == 126u);
-                float4 acv4 = metal::abs(cv4);
-                #pragma clang loop unroll(full)
-                for (uint k = 0; k < 4; ++k) {
-                    float cv = cv4[k];
-                    float xv = xv4[k];
-                    float ax = ax4[k];
-                    cg += xv * cv;
-                    dg += ax * hs4[k];
-                    mg += ax * acv4[k];
-                }
-            }
-            c_acc += sd * cg;
-            d_acc += sd * dg;
-            m_acc += sd * mg;
-        }
-        c_acc = simd_sum(c_acc);
-        d_acc = simd_sum(d_acc);
-        m_acc = simd_sum(m_acc);
-        if (lane == 0) {
-            coarse[row] = c_acc;
-            delta[row] = d_acc * (1.0f + GAMMA) + (2.0f * GAMMA) * m_acc;
-            coarse_bf[row] = bfloat(c_acc);
-        }
-        """,
-    header: lagunaLmHeadPruneHeader,
-    ensureRowContiguous: true
-)
-/// v1 coarse kernel, kept verbatim for same-binary A/B (the paired
-/// measurement protocol requires both arms in one binary). Selected by
-/// `DARKBLOOM_LMHEAD_COARSE=v1`; the shipped default is v2 above. The two
-/// kernels are bit-identical in all three outputs for every input.
-private let lagunaLmHeadCoarseKernelV1 = MLXFast.metalKernel(
     name: "laguna_lmhead_mxfp8_coarse_v1",
     inputNames: ["x", "codes", "scales"],
     outputNames: ["coarse", "delta", "coarse_bf"],
@@ -244,10 +149,6 @@ private let lagunaLmHeadCoarseKernelV1 = MLXFast.metalKernel(
     header: lagunaLmHeadPruneHeader,
     ensureRowContiguous: true
 )
-
-/// Same-binary A/B selector for the coarse kernel (v2 default).
-private let lagunaLmHeadCoarseUseV1 =
-    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COARSE"] == "v1"
 
 /// GPU candidate marking: one byte per vocabulary row, set when the row's
 /// certified upper bound reaches the threshold. A dense mask rather than a
@@ -404,9 +305,7 @@ final class LagunaLmHeadPruner {
         let vocab = lagunaLmHeadPruneVocab
         let x = hidden.reshaped([lagunaLmHeadPruneHidden])
 
-        let coarseKernel =
-            lagunaLmHeadCoarseUseV1 ? lagunaLmHeadCoarseKernelV1 : lagunaLmHeadCoarseKernel
-        let coarseOut = coarseKernel(
+        let coarseOut = lagunaLmHeadCoarseKernel(
             [x, codes, scales],
             grid: (vocab / 8 * 256, 1, 1),
             threadGroup: (256, 1, 1),
@@ -417,13 +316,7 @@ final class LagunaLmHeadPruner {
         let delta = coarseOut[1]
         let coarseBF = coarseOut[2]
 
-        // Threshold on GPU: L = max(coarse - delta); thr = L - |L|/64, in ONE
-        // dispatch. The MLX expression form of this (`coarse - delta`, then
-        // `.max()` -- itself a two-pass all_reduce at this size -- then
-        // `.abs()`, a scalar multiply and a scalar subtract) costs six
-        // dispatches, five of which move almost no data. `max` is associative
-        // in IEEE 754, so the fused tree is bitwise identical regardless of
-        // shape; see the kernel's doc comment.
+        // Threshold on GPU: L = max(coarse - delta); thr = L - |L|/64.
         let lower = coarse - delta
         let l = lower.max()
         let thr = (l - l.abs() * Float(1.0 / 64.0)).reshaped([1])
