@@ -310,6 +310,82 @@ struct QuantizedBlockLoader {
     }
   }
 
+  // Expert-aligned Laguna staging for the shipped 256-thread tile. Each
+  // thread owns eight contiguous packed bytes, so adjacent SIMD lanes pair
+  // without changing loader ownership: the even lane issues one aligned
+  // uint4 load, its four words are shuffled to the odd lane, and each lane
+  // decodes its original eight-byte half into its original destination.
+  //
+  // The host certifies the weight buffer offset, expert stride, and tile
+  // column offset. Here, a simd-uniform vote additionally certifies every
+  // pair-relative source offset, every per-thread destination, and the
+  // 32-byte K-step before any wide access. If any check fails, every lane in
+  // that simdgroup takes the untouched scalar loader.
+  MLX_MTL_CONST bool kExpertPairWideShapeOk =
+      kWidenShapeOk && (kSrcBytes == 8) && (kWideChunks == 2) &&
+      (BCOLS_PACKED == 4 * n_reads) && ((SIMD_SIZE % 4) == 0);
+
+  void load_unsafe_expert_wide() const {
+    if constexpr (!kExpertPairWideShapeOk) {
+      load_unsafe();
+      return;
+    } else {
+      const int source_off = src_byte_off();
+      const short pair_half = short(source_off & 15);
+      const int pair_source_off = source_off - pair_half;
+      const bool local_alignment_ok =
+          (pair_half == 0 || pair_half == 8) &&
+          ((pair_source_off & 15) == 0) &&
+          ((tile_stride & 15) == 0) &&
+          ((dst_byte_off() & 15) == 0);
+
+      // Keep the collective uniform even if an unforeseen instantiation
+      // reaches this method: no lane may shuffle while a peer falls back.
+      if (!simd_all(local_alignment_ok)) {
+        load_unsafe();
+        return;
+      }
+
+      const device uint8_t* pair_src = src - pair_half;
+      uint4 packed_words = uint4(0u);
+      if (pair_half == 0) {
+        packed_words = *((const device uint4*)pair_src);
+      }
+
+      const ushort pair_leader =
+          ushort(thread_idx & (SIMD_SIZE - 2));
+      packed_words.x = simd_shuffle(packed_words.x, pair_leader);
+      packed_words.y = simd_shuffle(packed_words.y, pair_leader);
+      packed_words.z = simd_shuffle(packed_words.z, pair_leader);
+      packed_words.w = simd_shuffle(packed_words.w, pair_leader);
+
+      const thread uint8_t* pair_bytes =
+          (const thread uint8_t*)(&packed_words);
+      uint8_t sb[kSrcBytes];
+      STEEL_PRAGMA_UNROLL
+      for (short b = 0; b < kSrcBytes; ++b) {
+        sb[b] = pair_bytes[pair_half + b];
+      }
+
+      STEEL_PRAGMA_UNROLL
+      for (short c = 0; c < kWideChunks; ++c) {
+        const short e0 = c * kWideElems;
+        const short k0 = c * kSrcBytesPerChunk;
+        T scale =
+            dequantize_scale<T, group_size>(
+                scales[k0 / n_reads_per_scale]);
+
+        WideChunk out;
+        STEEL_PRAGMA_UNROLL
+        for (short b = 0; b < kSrcBytesPerChunk; ++b) {
+          dequantize_pair(
+              sb[k0 + b], scale, &out.v[b * pack_factor]);
+        }
+        *((threadgroup WideChunk*)(dst + e0)) = out;
+      }
+    }
+  }
+
   void load_safe(short2 src_tile_dim) const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
       return;
@@ -1394,6 +1470,7 @@ template <
     bool transpose,
     const int fixed_K = 0,
     const int fixed_N = 0,
+    const bool wide_stage = false,
     typename Wtype = bfloat>
 [[kernel]] void fp_gather_qmm_rhs_expert_nax(
     const device T* x,
@@ -1504,7 +1581,11 @@ template <
 
       for (int k = 0; k < K_it; ++k) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_w.load_unsafe();
+        if constexpr (wide_stage) {
+          loader_w.load_unsafe_expert_wide();
+        } else {
+          loader_w.load_unsafe();
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg_active) {

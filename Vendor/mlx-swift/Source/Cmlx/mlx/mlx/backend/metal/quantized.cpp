@@ -1287,6 +1287,17 @@ bool darkbloom_expert_aligned_gather() {
   return v;
 }
 
+// Wide packed-weight staging for the static expert-aligned Laguna prefill
+// kernel. Default ON; "0" selects the original scalar loader. The host and
+// kernel independently certify every address needed by the 16-byte accesses,
+// and the selected value is embedded in both the template instantiation and
+// kernel name so the two pipeline variants can never alias in the JIT cache.
+bool darkbloom_expert_wide_stage_enabled() {
+  static const bool v =
+      env::get_var("DARKBLOOM_EXPERT_WIDE_STAGE", "") != "0";
+  return v;
+}
+
 // DARKBLOOM_STAGE_BM128: select the gather-GEMM m-tiling. NOT a function
 // constant -- it changes the template instantiation, so it is already in
 // `kname` (`_bm_`/`_wm_`/`_wn_`) and therefore in the library name and the
@@ -1398,10 +1409,10 @@ int darkbloom_stage_bm128_variant() {
 //      `a.offset() + offset`, so a sliced/offset weight array would shift
 //      every address the kernel derives.
 //   2. The per-expert stride. The kernel advances by `index * stride_w`
-//      bytes; for Laguna this is N*K/2 = 512*2048/2 = 524288 for gate/up and
-//      2048*512/2 = 524288 for down -- both multiples of 16, so every one of
-//      the 256 experts keeps a 16B-aligned base. This is an invariant of the
-//      shape, and it is verified here rather than trusted.
+//      bytes; for Laguna this is N*K/2 = 1024*2048/2 = 1048576 for the fused
+//      gate/up bank and 2048*512/2 = 524288 for down -- both multiples of 16,
+//      so every one of the 256 experts keeps a 16B-aligned base. This is an
+//      invariant of the shape, and it is verified here rather than trusted.
 //   3. The tile column base. The kernel adds `y_col * K/2` bytes with y_col a
 //      multiple of bn = 64, so the term is a multiple of 32*K -- but only if
 //      K itself is even, which is checked.
@@ -1510,6 +1521,10 @@ void gather_qmm_rhs_nax(
   const bool static_expert_shape =
       expert_aligned && static_laguna_shapes && mode == "nvfp4" &&
       type_string == "bfloat16_t" && !biases_.has_value();
+  const bool wide_ok =
+      darkbloom_stage_wide_load_ok(w, transpose, bits, N, K, bn);
+  const bool expert_wide_stage =
+      static_expert_shape && darkbloom_expert_wide_stage_enabled() && wide_ok;
 
   // Make the kernel name
   std::string kname;
@@ -1539,7 +1554,8 @@ void gather_qmm_rhs_nax(
       "_wn_",
       wn,
       static_expert_shape
-          ? ("_k_" + std::to_string(K) + "_n_" + std::to_string(N))
+          ? ("_k_" + std::to_string(K) + "_n_" + std::to_string(N) +
+             (expert_wide_stage ? "_ew_1" : "_ew_0"))
           : "");
 
   // Skipping dead runs is a pure work elision (see function constant 203 in
@@ -1557,8 +1573,6 @@ void gather_qmm_rhs_nax(
   // only needs the threadgroup one (Ws is 16B aligned by construction in the
   // kernel). Both are resolved once per process, so the specialization key is
   // fixed for the process lifetime.
-  const bool wide_ok =
-      darkbloom_stage_wide_load_ok(w, transpose, bits, N, K, bn);
   const bool stage_widest = darkbloom_stage_widest();
   const bool stage_wideld = darkbloom_stage_wideld() && wide_ok;
   const bool stage_runbar = darkbloom_stage_runbar();
@@ -1576,7 +1590,8 @@ void gather_qmm_rhs_nax(
       fprintf(
           stderr,
           "mlxfast: stage active: widest=%d wideld=%d(req=%d wide_ok=%d) "
-          "runbar=%d novol=%d expert=%d bm128=%d bm=%d wm=%d wn=%d "
+          "runbar=%d novol=%d expert=%d expert_wide=%d "
+          "bm128=%d bm=%d wm=%d wn=%d "
           "w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d\n",
           int(stage_widest),
           int(stage_wideld),
@@ -1585,6 +1600,7 @@ void gather_qmm_rhs_nax(
           int(stage_runbar),
           int(stage_novol),
           int(expert_aligned),
+          int(expert_wide_stage),
           bm128,
           bm,
           wm,
@@ -1649,7 +1665,8 @@ void gather_qmm_rhs_nax(
         wn,
         transpose,
         K,
-        N);
+        N,
+        expert_wide_stage);
     kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
   } else {
     kernel = get_gather_qmm_nax_kernel(
