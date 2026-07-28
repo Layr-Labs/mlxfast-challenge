@@ -464,27 +464,29 @@ public final class LagunaRuntimeWeightCache {
     /// to the live footprint, applied through the public async ticket path
     /// (`WiredMemoryTicket.start` -> `mlx_set_wired_limit`), bridged
     /// synchronously because this runs before the worker protocol hello.
-    /// SHIPPED DOSE (submission chunk 2): capacity = 0.01 x live bytes
-    /// + 16 MiB ~= 350 MiB. Chunk 1 shipped 42 MiB (fraction 0.001 +
-    /// 8 MiB), measured -4.2% prefill loaded-local, and ranked at +1.24%
-    /// score (promoted 1.38531) -- implying ~+3.4-4.6% ranked prefill,
-    /// i.e. the loaded-local dose curve transfers ~1:1 to the ranked box.
-    /// The measured curve (cool-gated Latin squares, medians, correctness
-    /// green on every sample), all vs an unwired control:
-    ///   42 MiB -> -4.2% prefill  | 134 MiB -> -6.7% | 350 MiB -> -8.2%
-    ///   0.02x -> -9.8% | 0.20x -> -17.2% | 0.35x -> -20.8% | 1.0x -> -28.3%
-    /// (decode composite follows the seed-prefill share: -0.4% at 42 MiB up
-    /// to -4.2% at full wire; steady decode step is null throughout.)
-    /// The ranked acceptance band caps a single submission's per-axis gain
-    /// at ~5%, so each chunk moves one band-sized step along the curve:
-    /// 350 MiB is +~4.15% prefill over the promoted 42 MiB configuration.
+    /// SHIPPED DOSE (full wire, operator-directed): capacity = 1.0 x live
+    /// bytes + 64 MiB ~= 31.4 GiB -- the entire live footprint (weights +
+    /// fused banks + lm_head coarse copy) wired in one resize commit, the
+    /// full mechanism from notes/47 §4-§7 with the zero-headroom fit-test
+    /// discipline. Measured loaded-local (cool-gated Latin squares, all vs
+    /// unwired control, correctness green every sample):
+    ///   42 MiB -> -4.2% prefill | 350 MiB -> -8.2% | 0.10x -> -11.2%
+    ///   0.20x -> -17.2% | 0.35x -> -20.8% | 1.0x -> -28.3% prefill,
+    ///   -4.2% decode composite (seed-prefill share; steady step null).
+    /// Chunk 1 (42 MiB) ranked +1.24% score (promoted 1.38531), validating
+    /// the ~1:1 loaded-local -> ranked transfer. This configuration ships
+    /// the WHOLE curve in one submission per operator instruction; the
+    /// documented acceptance band (prefill speedup vs calibration in
+    /// [0.952, 1.053]) is expected to reject gains this large in one step
+    /// -- if the ranked run fails with acceptance_band_failed, revert to
+    /// band-sized dose increments (the curve above is the roadmap).
     ///
     /// Engagement guards: `DARKBLOOM_WIRED_ZH=0` kills it; machines under
     /// 96 GiB physical memory keep stock behavior (the ranked box is an
     /// M5 Max 128 GB; smaller local boxes must not wire a ~31 GB live set
     /// against a much smaller working-set cap).
-    private static let wiredZHDefaultFraction = 0.01
-    private static let wiredZHDefaultSlackMB = 16
+    private static let wiredZHDefaultFraction = 1.0
+    private static let wiredZHDefaultSlackMB = 64
 
     private static func wireResidentWeightsIfEnabled() {
         let env = ProcessInfo.processInfo.environment
