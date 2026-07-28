@@ -368,6 +368,20 @@ let lagunaRouterRowsPerGroup: Int = {
     return value
 }()
 
+/// `DARKBLOOM_DECODE_QKV_ASYNC` (default ON; set "0" to ablate): intra-layer
+/// "front porch" asyncEval that fires immediately after the Q/K/V (+gate)
+/// projection materializes, before Q/K norm, RoPE, cache update, SDPA, and
+/// output projection are constructed. This is a DIFFERENT schedule point
+/// than the layer-boundary ladder (`DARKBLOOM_DECODE_ASYNC_STAGE`, which is
+/// already near its measured ceiling per notes/52): it overlaps the
+/// projection kernels' GPU execution with the Swift construction of the
+/// remainder of this attention layer. Decode-only (`inputs.shape == [1,1]`),
+/// prefill untouched. Bit-exact: asyncEval adds no operation, cache row,
+/// dtype boundary, or token -- it only enqueues already-constructed work
+/// earlier. Set `DARKBLOOM_DECODE_QKV_ASYNC=0` to measure; ships ON.
+let lagunaDecodeQKVAsyncEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_QKV_ASYNC"] != "0"
+
 /// `DARKBLOOM_DECODE_ASYNC_STAGE` (default `at:1,7,15,23,31,39`): process-once
 /// boundary schedule for decode-step async scheduling. Active only when the
 /// invocation input shape is exactly `[1, 1]`; prefill and multi-token shapes
@@ -1808,6 +1822,16 @@ final class LagunaRuntimeAttention: Module {
             queries = wq(normalizedInput)
             keys = wk(normalizedInput)
             values = wv(normalizedInput)
+        }
+
+        // Intra-layer "front porch" (DARKBLOOM_DECODE_QKV_ASYNC): start the
+        // projection kernels' GPU execution before Swift constructs this
+        // layer's Q/K-norm, RoPE, cache update, SDPA, and output projection.
+        // Decode-only; bit-exact (asyncEval enqueues only, adds no work).
+        if lagunaDecodeQKVAsyncEnabled, B == 1, L == 1 {
+            asyncEval(queries)
+            asyncEval(keys)
+            asyncEval(values)
         }
 
         let fusedQKNormShapesMatch =
