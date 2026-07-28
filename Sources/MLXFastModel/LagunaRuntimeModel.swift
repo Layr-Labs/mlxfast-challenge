@@ -2474,7 +2474,7 @@ private let lagunaSharedSwiGLUQMVHeader: String = {
 }()
 
 private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_shared_nvfp4_swiglu_qmv_bf16_v1",
+    name: "laguna_shared_nvfp4_swiglu_qmv_bf16_v2",
     inputNames: ["input", "fused_weight", "fused_scales"],
     outputNames: ["activated"],
     source: """
@@ -2507,6 +2507,7 @@ private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
                 input_values[4 * i + 3] = values[3];
             }
 
+            #pragma clang loop unroll(full)
             for (uint row = 0; row < 2; ++row) {
                 uint gate_row = first_row + row;
                 uint up_row = gate_row + output_width;
@@ -2534,6 +2535,7 @@ private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             }
         }
 
+        #pragma clang loop unroll(full)
         for (uint row = 0; row < 2; ++row) {
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
@@ -2734,6 +2736,7 @@ private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
                 input_values[4 * i + 3] = values[3];
             }
 
+            #pragma clang loop unroll(full)
             for (uint row = 0; row < 2; ++row) {
                 uint logical_row = first_row + row;
                 uint pair_tile = logical_row / 32;
@@ -2763,6 +2766,7 @@ private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
             }
         }
 
+        #pragma clang loop unroll(full)
         for (uint row = 0; row < 2; ++row) {
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
@@ -2889,6 +2893,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
                 input_values[4 * i + 3] = values[3];
             }
 
+            #pragma clang loop unroll(full)
             for (uint row = 0; row < 2; ++row) {
                 uint logical_row = first_row + row;
                 uint gate_row;
@@ -2925,6 +2930,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             }
         }
 
+        #pragma clang loop unroll(full)
         for (uint row = 0; row < 2; ++row) {
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
