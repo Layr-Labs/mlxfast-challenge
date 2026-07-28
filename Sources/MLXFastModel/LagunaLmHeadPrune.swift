@@ -22,15 +22,15 @@ import MLXFast
 //      roundings/element-path << gamma = 2^-15 relative; notes/68 section 6).
 //      The e4m3/e8m0 decoders below are bit-exact replicas of the vendored
 //      fp8.h / fp_quantized.h semantics (no libm: exponent-bit construction).
-//   2. FUSED SELECTION + EXACT (`lagunaLmHeadExactKernel`): each simdgroup
-//      reads the four coarse bounds for the fixed output block it already
-//      owns and evaluates c_i + delta_i >= max_j(c_j - delta_j) - beta,
+//   2. SELECTION (`lagunaLmHeadSelectKernel`): a dense one-byte-per-row mask
+//      marking rows with c_i + delta_i >= max_j(c_j - delta_j) - beta,
 //      beta = |L| / 64 (>= 2 BF16 ulps at the logit scale, so a
 //      non-candidate's BF16(coarse) is PROVABLY strictly below the winner's
-//      BF16 value). This removes the standalone selection dispatch and its
-//      one-byte-per-row transient mask. The simdgroup runs a full BF16 GEMV
-//      over its block only when one of the four rows qualifies, writing
-//      coarse values otherwise.
+//      BF16 value). No host readback and no atomics: the exact pass keys on
+//      "is row r a candidate?", so a mask is both cheaper and race-free.
+//   3. EXACT pass (`lagunaLmHeadExactKernel`): each simdgroup owns a FIXED
+//      block of four output rows and runs a full BF16 GEMV over that block
+//      only when one of its rows is marked, writing coarse values otherwise.
 //      The per-row arithmetic is a TEXTUAL replica of the stock
 //      `gemv_al_bfloat16` (bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0; see gemv.h
 //      GEMVKernel::run with kAligned=true) -- same lane partition, same
@@ -50,12 +50,10 @@ private let lagunaLmHeadPruneVocab = 100_352
 private let lagunaLmHeadPruneHidden = 2048
 
 /// Master switch for the certified two-pass decode lm_head (notes/68).
-/// DEFAULT ON for this candidate: unset, or any value other than "0", enables
-/// the certified two-pass head. The reference branch keeps the already-
-/// promoted implementation opt-in so it cannot leak into a future baseline
-/// re-pin; a ranked candidate must deliberately turn it back on. Set
-/// `DARKBLOOM_LM_HEAD_PRUNE=0` to restore the byte-identical stock full
-/// lm_head pass for an ablation.
+/// DEFAULT ON: unset, or any value other than "0", enables the certified
+/// two-pass decode head and builds the MXFP8 coarse copy at init time.
+/// Set `DARKBLOOM_LM_HEAD_PRUNE=0` to disable and restore the byte-identical
+/// stock full lm_head pass.
 let lagunaLmHeadPruneEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_LM_HEAD_PRUNE"] != "0"
 
@@ -152,14 +150,29 @@ private let lagunaLmHeadCoarseKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// Fused selection + exact pass. Each simdgroup owns a FIXED block of four
-/// output rows -- the same static row-to-simdgroup mapping the stock kernel
-/// uses. Lane zero evaluates those rows' certified upper bounds, broadcasts a
-/// four-bit candidate mask within the simdgroup, and runs the full-precision
-/// GEMV only when at least one row qualifies. This removes a standalone
-/// 100352-thread selection dispatch, its 100352-byte result, and the exact
-/// pass's mask reads. Because the block is fixed, `assembled[r]` is written
-/// by exactly ONE lane on exactly one path, so the output is fully covered
+/// GPU candidate marking: one byte per vocabulary row, set when the row's
+/// certified upper bound reaches the threshold. A dense mask rather than a
+/// compacted index list, because the exact pass below owns a FIXED output
+/// block per simdgroup and therefore needs "is row r a candidate?" keyed by
+/// r, not "what is the r-th candidate?". No atomics, no compaction, and the
+/// output is a pure function of its inputs.
+private let lagunaLmHeadSelectKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_select_v2",
+    inputNames: ["coarse", "delta", "thr"],
+    outputNames: ["is_cand"],
+    source: """
+        uint i = thread_position_in_grid.x;
+        is_cand[i] = (coarse[i] + delta[i] >= thr[0]) ? uint8_t(1) : uint8_t(0);
+        """,
+    ensureRowContiguous: true
+)
+
+/// Exact pass. Each simdgroup owns a FIXED block of four output rows -- the
+/// same static row-to-simdgroup mapping the stock kernel uses -- and runs the
+/// full-precision GEMV for that block only when at least one of its four rows
+/// is a candidate; otherwise it writes those rows' coarse values. Because the
+/// block is fixed, `assembled[r]` is written by exactly ONE lane (lane 0 of
+/// the owning simdgroup) on exactly one path, so the output is fully covered
 /// with no race and no uninitialized slot.
 ///
 /// Per-row arithmetic is a textual replica of the stock `gemv_al_bfloat16`
@@ -175,8 +188,8 @@ private let lagunaLmHeadCoarseKernel = MLXFast.metalKernel(
 /// digits, all but a handful of the 3136 threadgroups take the coarse branch
 /// and never touch `lm_head`.
 private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_select_exact_block_v3",
-    inputNames: ["coarse_bf", "lm_head", "x", "coarse", "delta", "thr"],
+    name: "laguna_lmhead_exact_block_v2",
+    inputNames: ["coarse_bf", "lm_head", "x", "is_cand"],
     outputNames: ["assembled"],
     source: """
         constexpr uint VOCAB = 100352;
@@ -190,21 +203,15 @@ private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
         // grid tiles it exactly; the bounds test is belt-and-braces.
         uint base = tgid * 32 + sgid * 4;
 
-        // Only lane zero loads the four bound pairs. Broadcast the resulting
-        // bits within this simdgroup; no threadgroup barrier is required.
-        uint candidate_bits = 0u;
-        if (lane == 0) {
-            #pragma unroll
-            for (uint tm = 0; tm < 4; ++tm) {
-                uint r = base + tm;
-                if (r < VOCAB && coarse[r] + delta[r] >= thr[0]) {
-                    candidate_bits |= 1u << tm;
-                }
-            }
+        // Simdgroup-uniform: every lane reads the same four mask bytes.
+        bool any_candidate = false;
+        #pragma unroll
+        for (uint tm = 0; tm < 4; ++tm) {
+            uint r = base + tm;
+            any_candidate = any_candidate || (r < VOCAB && is_cand[r] != 0);
         }
-        candidate_bits = simd_broadcast(candidate_bits, 0);
 
-        if (candidate_bits == 0u) {
+        if (!any_candidate) {
             if (lane < 4 && base + lane < VOCAB) {
                 assembled[base + lane] = coarse_bf[base + lane];
             }
@@ -252,7 +259,7 @@ private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
             for (uint tm = 0; tm < 4; ++tm) {
                 uint r = base + tm;
                 if (r < VOCAB) {
-                    assembled[r] = ((candidate_bits & (1u << tm)) != 0u)
+                    assembled[r] = (is_cand[r] != 0)
                         ? bfloat(result[tm])
                         : coarse_bf[r];
                 }
@@ -309,15 +316,29 @@ final class LagunaLmHeadPruner {
         let delta = coarseOut[1]
         let coarseBF = coarseOut[2]
 
-        // Threshold on GPU: L = max(coarse - delta); thr = L - |L|/64.
+        // Threshold on GPU: L = max(coarse - delta); thr = L - |L|/64, in ONE
+        // dispatch. The MLX expression form of this (`coarse - delta`, then
+        // `.max()` -- itself a two-pass all_reduce at this size -- then
+        // `.abs()`, a scalar multiply and a scalar subtract) costs six
+        // dispatches, five of which move almost no data. `max` is associative
+        // in IEEE 754, so the fused tree is bitwise identical regardless of
+        // shape; see the kernel's doc comment.
         let lower = coarse - delta
         let l = lower.max()
         let thr = (l - l.abs() * Float(1.0 / 64.0)).reshaped([1])
 
+        let isCandidate = lagunaLmHeadSelectKernel(
+            [coarse, delta, thr],
+            grid: (vocab, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[vocab]],
+            outputDTypes: [.uint8]
+        )[0]
+
         // One threadgroup per 32 output rows, covering the vocabulary exactly
         // once (100352 == 3136 * 32). Every slot has exactly one owning lane.
         let assembled = lagunaLmHeadExactKernel(
-            [coarseBF, lmHeadWeight, x, coarse, delta, thr],
+            [coarseBF, lmHeadWeight, x, isCandidate],
             grid: (vocab / 32 * 256, 1, 1),
             threadGroup: (256, 1, 1),
             outputShapes: [[vocab]],
