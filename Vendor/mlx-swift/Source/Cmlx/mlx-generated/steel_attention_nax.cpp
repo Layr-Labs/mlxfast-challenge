@@ -1870,7 +1870,12 @@ template <
           }
         }
 
-        STEEL_PRAGMA_UNROLL
+        // PV (O = P @ V) K-tile loop: same unroll_count(4) rationale as the
+        // QK loop above -- lets the compiler interleave the next V-tile load
+        // with the running mma chain instead of fully unrolling. Bit-exact:
+        // the ik iterations accumulate into Otile.frag_at(iq,id) in the same
+        // sequential order; unroll_count only changes instruction scheduling.
+#pragma clang loop unroll_count(4)
         for (short ik = 0; ik < TK; ik++) {
           if (sg_active) {
           NAXTile<T, 1, 2> Vtile;
