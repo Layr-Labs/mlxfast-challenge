@@ -667,6 +667,7 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
 
         thread bfloat values[n_reads];
         float acc = 0.0f;
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < n_reads; ++i) {
             bfloat value = bfloat(residual[base + i] + branch[base + i]);
             values[i] = value;
@@ -680,6 +681,7 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
         acc = simd_sum(acc);
         \(lagunaNormReductionTail2048)
 
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < n_reads; ++i) {
             bfloat value =
                 weight[base + i] *
@@ -723,7 +725,7 @@ private let lagunaResidualRMSNormRouterKernels: [Int: MLXFast.MLXFastKernel] =
             (
                 rowsPerGroup,
                 MLXFast.metalKernel(
-                    name: "laguna_residual_rms_router_bf16_2048_rpg\(rowsPerGroup)_v2",
+                    name: "laguna_residual_rms_router_bf16_2048_rpg\(rowsPerGroup)_v3",
                     inputNames: ["residual", "branch", "weight", "router_weight"],
                     outputNames: ["summed", "normalized", "router_logits"],
                     source: lagunaResidualRMSNormRouterSource(rowsPerGroup: rowsPerGroup),
@@ -735,7 +737,7 @@ private let lagunaResidualRMSNormRouterKernels: [Int: MLXFast.MLXFastKernel] =
 /// Residual add + RMSNorm for the layers whose MLP is not a sparse block
 /// (layer 0) and for any shape the router fusion above declines.
 private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
-    name: "laguna_residual_rms_bf16_2048_v1",
+    name: "laguna_residual_rms_bf16_2048_v2",
     inputNames: ["residual", "branch", "weight"],
     outputNames: ["summed", "normalized"],
     source: """
@@ -754,6 +756,7 @@ private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
 
         thread bfloat values[n_reads];
         float acc = 0.0f;
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < n_reads; ++i) {
             bfloat value = bfloat(residual[base + i] + branch[base + i]);
             values[i] = value;
@@ -765,6 +768,7 @@ private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
         acc = simd_sum(acc);
         \(lagunaNormReductionTail2048)
 
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < n_reads; ++i) {
             normalized[base + i] =
                 weight[lid * n_reads + i] *
