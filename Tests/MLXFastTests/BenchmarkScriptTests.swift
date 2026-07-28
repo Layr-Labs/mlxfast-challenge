@@ -4677,7 +4677,7 @@ func benchmarkRestoresFansWhenAbortedAfterBoost() throws {
 // The ~21.6 GB RAM-resident model means TWO simultaneous residencies (an
 // overlapping second local run, or a new run started while an orphaned
 // model-holding worker from an aborted run lingers) can out-of-memory a
-// 40 GiB machine. Local modes must therefore (1) serialize runs behind a
+// 36 GiB machine. Local modes must therefore (1) serialize runs behind a
 // per-user lock, (2) refuse to start while a model-holding process is
 // already alive -- warn-and-abort, never auto-kill -- and (3) reap the
 // spawned benchmark process tree on INT/TERM/EXIT so aborted runs cannot

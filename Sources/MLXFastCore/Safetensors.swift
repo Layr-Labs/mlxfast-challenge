@@ -320,7 +320,7 @@ public enum Safetensors {
             try? input.close()
         }
         // Copied bytes are short-lived. Keeping a second copy of the ~21.6 GB
-        // source in the unified buffer cache can exhaust 40 GiB machines, so
+        // source in the unified buffer cache can exhaust 36 GiB machines, so
         // match the digest path's uncached read treatment (see #636).
         _ = Darwin.fcntl(input.fileDescriptor, F_NOCACHE, 1)
         _ = Darwin.fcntl(input.fileDescriptor, F_RDAHEAD, 0)

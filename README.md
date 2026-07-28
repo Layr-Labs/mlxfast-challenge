@@ -121,7 +121,7 @@ allocator cache is capped at 6 GiB, command buffers are shortened, and free
 warmup buffers are released before the worker begins serving requests. It
 does not disable any code-path or output-affecting feature — the
 compiled-decode fusions run everywhere, so a local run exercises the same
-code path as the ranked box all the way down to the ~40 GiB practical local
+code path as the ranked box all the way down to the ~36 GiB practical local
 minimum. A machine too small for the model plus the decode working set
 fails loudly with an out-of-memory error rather than silently diverging
 from ranked behavior. The profile announces itself on stderr and can be
@@ -421,7 +421,7 @@ linked Swift packages, and the Apache-2.0 text — is in
 ## Requirements
 
 - Apple Silicon Mac with enough unified memory for the ~21.6 GB RAM-resident
-  model plus KV cache and buffers (roughly 40 GiB practical minimum; the
+  model plus KV cache and buffers (roughly 36 GiB practical minimum; the
   ranked runner is a single self-hosted Apple M5 Max with 128 GB, so local
   timings — and, on non-M5 machines, near-tie greedy tokens — are
   directional only)

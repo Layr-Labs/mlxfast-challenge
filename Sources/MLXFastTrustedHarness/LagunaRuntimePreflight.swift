@@ -242,7 +242,7 @@ extension LagunaRuntime {
             try? handle.close()
         }
         // Digest bytes are short-lived. Keeping a second copy in the unified
-        // buffer cache while the model is about to load can exhaust 40 GiB
+        // buffer cache while the model is about to load can exhaust 36 GiB
         // machines, so match the runtime weight loader's uncached read path.
         _ = Darwin.fcntl(handle.fileDescriptor, F_NOCACHE, 1)
         _ = Darwin.fcntl(handle.fileDescriptor, F_RDAHEAD, 0)
