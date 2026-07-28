@@ -249,23 +249,6 @@ private let lagunaLmHeadCoarseKernelV1 = MLXFast.metalKernel(
 private let lagunaLmHeadCoarseUseV1 =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COARSE"] == "v1"
 
-/// GPU candidate marking: one byte per vocabulary row, set when the row's
-/// certified upper bound reaches the threshold. A dense mask rather than a
-/// compacted index list, because the exact pass below owns a FIXED output
-/// block per simdgroup and therefore needs "is row r a candidate?" keyed by
-/// r, not "what is the r-th candidate?". No atomics, no compaction, and the
-/// output is a pure function of its inputs.
-private let lagunaLmHeadSelectKernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_select_v2",
-    inputNames: ["coarse", "delta", "thr"],
-    outputNames: ["is_cand"],
-    source: """
-        uint i = thread_position_in_grid.x;
-        is_cand[i] = (coarse[i] + delta[i] >= thr[0]) ? uint8_t(1) : uint8_t(0);
-        """,
-    ensureRowContiguous: true
-)
-
 /// Exact pass. Each simdgroup owns a FIXED block of four output rows -- the
 /// same static row-to-simdgroup mapping the stock kernel uses -- and runs the
 /// full-precision GEMV for that block only when at least one of its four rows
@@ -286,9 +269,16 @@ private let lagunaLmHeadSelectKernel = MLXFast.metalKernel(
 /// The skipped work is the byte saving: with |C| in the single-to-low-double
 /// digits, all but a handful of the 3136 threadgroups take the coarse branch
 /// and never touch `lm_head`.
+///
+/// v3 evaluates the unchanged certificate predicate directly from `coarse`,
+/// `delta`, and `threshold`. The old standalone selection dispatch read those
+/// same two float rows and materialized a 100352-byte mask that this kernel
+/// immediately consumed. Folding the predicate into its only consumer removes
+/// that dispatch plus the mask write/read while preserving the expression,
+/// fixed row ownership, exact GEMV path, and every output value.
 private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_exact_block_v2",
-    inputNames: ["coarse_bf", "lm_head", "x", "is_cand"],
+    name: "laguna_lmhead_exact_block_v3",
+    inputNames: ["coarse", "delta", "coarse_bf", "lm_head", "x", "thr"],
     outputNames: ["assembled"],
     source: """
         constexpr uint VOCAB = 100352;
@@ -302,12 +292,15 @@ private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
         // grid tiles it exactly; the bounds test is belt-and-braces.
         uint base = tgid * 32 + sgid * 4;
 
-        // Simdgroup-uniform: every lane reads the same four mask bytes.
+        // Simdgroup-uniform: every lane evaluates the same four certified
+        // upper-bound predicates. This is the exact expression formerly used
+        // by laguna_lmhead_select_v2 to populate is_cand.
         bool any_candidate = false;
         #pragma unroll
         for (uint tm = 0; tm < 4; ++tm) {
             uint r = base + tm;
-            any_candidate = any_candidate || (r < VOCAB && is_cand[r] != 0);
+            any_candidate = any_candidate ||
+                (r < VOCAB && coarse[r] + delta[r] >= thr[0]);
         }
 
         if (!any_candidate) {
@@ -358,7 +351,7 @@ private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
             for (uint tm = 0; tm < 4; ++tm) {
                 uint r = base + tm;
                 if (r < VOCAB) {
-                    assembled[r] = (is_cand[r] != 0)
+                    assembled[r] = (coarse[r] + delta[r] >= thr[0])
                         ? bfloat(result[tm])
                         : coarse_bf[r];
                 }
@@ -428,18 +421,10 @@ final class LagunaLmHeadPruner {
         let l = lower.max()
         let thr = (l - l.abs() * Float(1.0 / 64.0)).reshaped([1])
 
-        let isCandidate = lagunaLmHeadSelectKernel(
-            [coarse, delta, thr],
-            grid: (vocab, 1, 1),
-            threadGroup: (256, 1, 1),
-            outputShapes: [[vocab]],
-            outputDTypes: [.uint8]
-        )[0]
-
         // One threadgroup per 32 output rows, covering the vocabulary exactly
         // once (100352 == 3136 * 32). Every slot has exactly one owning lane.
         let assembled = lagunaLmHeadExactKernel(
-            [coarseBF, lmHeadWeight, x, isCandidate],
+            [coarse, delta, coarseBF, lmHeadWeight, x, thr],
             grid: (vocab / 32 * 256, 1, 1),
             threadGroup: (256, 1, 1),
             outputShapes: [[vocab]],
