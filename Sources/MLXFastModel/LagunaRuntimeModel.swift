@@ -2040,6 +2040,7 @@ final class LagunaRuntimeAttention: Module {
 /// kernel MLX selects.
 let lagunaNvfp4ScaleFoldEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_FOLD"] != "0"
+
 private let lagunaSharedSwiGLUQMVHeader: String = {
     // The two halves of one power-of-two regrouping. They MUST move together:
     // the scale absorbs `2^14` exactly when the weights stop applying it.
