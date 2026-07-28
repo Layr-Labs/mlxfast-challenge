@@ -346,6 +346,28 @@ public final class LagunaRuntimeWeightCache {
     public init(loader: LagunaWeightLoader, config: LagunaConfig) {
         self.loader = loader
         self.config = config
+        // Post-wire command-buffer granularity (measured this session):
+        // with the residency set populated (see the wired-ZH block below),
+        // the per-command-buffer driver cost that made MLX's default 50-op /
+        // 50 MB granularity optimal is gone, and coarser buffers win by
+        // saving launch/tail overhead on decode: 200/200 measured decode
+        // composite +1.24% (3/3 pairs) and steady step +0.61% (3/3) with
+        // prefill flat, on the full-wire configuration. Pre-wire, the same
+        // knob measured -2.2% decode / -17.9% prefill at 400/400 (notes/47
+        // §5) -- the wired residency flipped the regime. MLX reads these on
+        // first use inside the (non-editable) metal device layer, so the
+        // shipped runtime sets them here, BEFORE the first MLX call in this
+        // process, and only when the operator has not set them explicitly
+        // (explicit env always wins, preserving local A/B arms). The knob
+        // changes command-buffer boundaries only: no op, kernel, dtype, or
+        // ordering of arithmetic changes, and every scored sample carrying
+        // it passed the exact-token gate with max_abs_diff = 0.
+        if ProcessInfo.processInfo.environment["MLX_MAX_OPS_PER_BUFFER"] == nil {
+            setenv("MLX_MAX_OPS_PER_BUFFER", "200", 1)
+        }
+        if ProcessInfo.processInfo.environment["MLX_MAX_MB_PER_BUFFER"] == nil {
+            setenv("MLX_MAX_MB_PER_BUFFER", "200", 1)
+        }
         // Select the startup memory profile BEFORE the model load. Laguna
         // retains no alternate weight layouts, so the full profile is
         // deliberately a no-op here (the
