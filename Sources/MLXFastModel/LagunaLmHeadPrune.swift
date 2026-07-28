@@ -249,6 +249,64 @@ private let lagunaLmHeadCoarseKernelV1 = MLXFast.metalKernel(
 private let lagunaLmHeadCoarseUseV1 =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COARSE"] == "v1"
 
+/// `DARKBLOOM_LMHEAD_TAIL` (default on; set "0" for the pre-fusion tail):
+/// collapses the pruner's post-coarse tail from six dispatches to two. The
+/// stock tail was `coarse - delta` (one V-wide elementwise), `.max()` (a
+/// two-pass all_reduce at V=100352), `.abs()`/multiply/subtract scalar ops,
+/// then the select kernel writing a V-byte mask the exact pass re-reads.
+/// The fused form runs ONE single-threadgroup reduction kernel producing
+/// `thr` directly, and the exact pass recomputes each row's candidacy
+/// inline from `coarse`/`delta`/`thr` (the identical fp32 add + compare the
+/// select kernel evaluated, on identical inputs, so the branch decisions
+/// are bit-identical). Exactness of the threshold: IEEE max is associative
+/// and commutative over these finite values (`coarse`/`delta` are finite
+/// fp32 sums; no NaN reaches this point on the guarded path), so any
+/// reduction shape yields the same maximum; the per-element subtract and
+/// the final `L - |L| * (1/64)` are textually the same fp32 expressions the
+/// stock ops evaluated.
+let lagunaLmHeadFusedTailEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_TAIL"] != "0"
+
+/// Fused threshold: `thr = L - |L|/64` with `L = max_i(coarse_i - delta_i)`
+/// in one dispatch. A single 1024-thread threadgroup strides the vocabulary
+/// (100352 = 1024 * 98, an exact tiling), keeps a per-thread running max,
+/// then reduces simd -> threadgroup -> simd. Seeding with -INFINITY is
+/// exact: `max(-inf, x) == x` for every finite x.
+private let lagunaLmHeadThresholdKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_threshold_v1",
+    inputNames: ["coarse", "delta"],
+    outputNames: ["thr"],
+    source: """
+        constexpr uint VOCAB = 100352;
+        constexpr uint THREADS = 1024;
+
+        uint lid = thread_position_in_threadgroup.x;
+        uint lane = thread_index_in_simdgroup;
+        uint sg = simdgroup_index_in_threadgroup;
+
+        threadgroup float partials[THREADS / 32];
+
+        float best = -INFINITY;
+        for (uint i = lid; i < VOCAB; i += THREADS) {
+            best = metal::max(best, coarse[i] - delta[i]);
+        }
+        best = metal::simd_max(best);
+        if (lane == 0) {
+            partials[sg] = best;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            float v = partials[lane];
+            v = metal::simd_max(v);
+            if (lane == 0) {
+                float L = v;
+                thr[0] = L - metal::abs(L) * (1.0f / 64.0f);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 /// GPU candidate marking: one byte per vocabulary row, set when the row's
 /// certified upper bound reaches the threshold. A dense mask rather than a
 /// compacted index list, because the exact pass below owns a FIXED output
@@ -286,6 +344,95 @@ private let lagunaLmHeadSelectKernel = MLXFast.metalKernel(
 /// The skipped work is the byte saving: with |C| in the single-to-low-double
 /// digits, all but a handful of the 3136 threadgroups take the coarse branch
 /// and never touch `lm_head`.
+///
+/// v3 (fused tail): identical GEMV replica and row ownership, but candidacy
+/// is recomputed inline from `coarse`/`delta`/`thr` instead of read from the
+/// select kernel's mask — the same `coarse[r] + delta[r] >= thr` fp32 add and
+/// compare on the same inputs, so every branch decision matches the masked
+/// version bit-for-bit while the V-byte mask write/read and its dispatch
+/// disappear.
+private let lagunaLmHeadExactKernelV3 = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_block_v3",
+    inputNames: ["coarse_bf", "lm_head", "x", "coarse", "delta", "thr"],
+    outputNames: ["assembled"],
+    source: """
+        constexpr uint VOCAB = 100352;
+        constexpr uint K = 2048;
+
+        uint tgid = threadgroup_position_in_grid.x;
+        uint sgid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        uint base = tgid * 32 + sgid * 4;
+        float t = thr[0];
+
+        // Simdgroup-uniform: every lane evaluates the same four rows.
+        bool any_candidate = false;
+        #pragma unroll
+        for (uint tm = 0; tm < 4; ++tm) {
+            uint r = base + tm;
+            any_candidate = any_candidate ||
+                (r < VOCAB && (coarse[r] + delta[r] >= t));
+        }
+
+        if (!any_candidate) {
+            if (lane < 4 && base + lane < VOCAB) {
+                assembled[base + lane] = coarse_bf[base + lane];
+            }
+            return;
+        }
+
+        // --- stock gemv_al replica begin (gemv.h:151-289) ---
+        thread float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread bfloat inter[4];
+        thread float v_coeff[4];
+        uint bn = lane * 4;
+        for (uint i = 0; i < 16; ++i) {
+            vec<bfloat, 4> xv =
+                *((const device vec<bfloat, 4>*)(x + bn));
+            v_coeff[0] = float(xv.x);
+            v_coeff[1] = float(xv.y);
+            v_coeff[2] = float(xv.z);
+            v_coeff[3] = float(xv.w);
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                const device bfloat* mrow = lm_head + size_t(base + tm) * K;
+                vec<bfloat, 4> mv =
+                    *((const device vec<bfloat, 4>*)(mrow + bn));
+                inter[0] = mv.x;
+                inter[1] = mv.y;
+                inter[2] = mv.z;
+                inter[3] = mv.w;
+                result[tm] += inter[0] * v_coeff[0];
+                result[tm] += inter[1] * v_coeff[1];
+                result[tm] += inter[2] * v_coeff[2];
+                result[tm] += inter[3] * v_coeff[3];
+            }
+            bn += 128;
+        }
+        #pragma unroll
+        for (uint tm = 0; tm < 4; ++tm) {
+            #pragma unroll
+            for (ushort sn = 16; sn >= 1; sn >>= 1) {
+                result[tm] += simd_shuffle_down(result[tm], sn);
+            }
+        }
+        // --- stock gemv_al replica end ---
+        if (lane == 0) {
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                uint r = base + tm;
+                if (r < VOCAB) {
+                    assembled[r] = ((coarse[r] + delta[r] >= t)
+                        ? bfloat(result[tm])
+                        : coarse_bf[r]);
+                }
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
     name: "laguna_lmhead_exact_block_v2",
     inputNames: ["coarse_bf", "lm_head", "x", "is_cand"],
@@ -417,34 +564,59 @@ final class LagunaLmHeadPruner {
         let delta = coarseOut[1]
         let coarseBF = coarseOut[2]
 
-        // Threshold on GPU: L = max(coarse - delta); thr = L - |L|/64, in ONE
-        // dispatch. The MLX expression form of this (`coarse - delta`, then
-        // `.max()` -- itself a two-pass all_reduce at this size -- then
-        // `.abs()`, a scalar multiply and a scalar subtract) costs six
-        // dispatches, five of which move almost no data. `max` is associative
-        // in IEEE 754, so the fused tree is bitwise identical regardless of
-        // shape; see the kernel's doc comment.
-        let lower = coarse - delta
-        let l = lower.max()
-        let thr = (l - l.abs() * Float(1.0 / 64.0)).reshaped([1])
+        // Fused tail (DARKBLOOM_LMHEAD_TAIL, default on): one reduction
+        // dispatch computes `thr = L - |L|/64` with `L = max(coarse - delta)`
+        // directly, and the exact pass recomputes candidacy inline — two
+        // dispatches for the whole post-coarse tail. See
+        // `lagunaLmHeadFusedTailEnabled` for the exactness argument. The
+        // stock arm below is the pre-fusion chain, kept verbatim for
+        // same-binary A/B: `coarse - delta` (V-wide elementwise), `.max()`
+        // (a two-pass all_reduce at this size), `.abs()`/multiply/subtract,
+        // the V-byte select mask, then the mask-consuming exact pass —
+        // six dispatches, five of which move almost no data. `max` is
+        // associative in IEEE 754, so both shapes yield the same maximum.
+        let assembled: MLXArray
+        if lagunaLmHeadFusedTailEnabled {
+            let thr = lagunaLmHeadThresholdKernel(
+                [coarse, delta],
+                grid: (1024, 1, 1),
+                threadGroup: (1024, 1, 1),
+                outputShapes: [[1]],
+                outputDTypes: [.float32]
+            )[0]
+            // One threadgroup per 32 output rows, covering the vocabulary
+            // exactly once (100352 == 3136 * 32).
+            assembled = lagunaLmHeadExactKernelV3(
+                [coarseBF, lmHeadWeight, x, coarse, delta, thr],
+                grid: (vocab / 32 * 256, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[vocab]],
+                outputDTypes: [.bfloat16]
+            )[0]
+        } else {
+            let lower = coarse - delta
+            let l = lower.max()
+            let thr = (l - l.abs() * Float(1.0 / 64.0)).reshaped([1])
 
-        let isCandidate = lagunaLmHeadSelectKernel(
-            [coarse, delta, thr],
-            grid: (vocab, 1, 1),
-            threadGroup: (256, 1, 1),
-            outputShapes: [[vocab]],
-            outputDTypes: [.uint8]
-        )[0]
+            let isCandidate = lagunaLmHeadSelectKernel(
+                [coarse, delta, thr],
+                grid: (vocab, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[vocab]],
+                outputDTypes: [.uint8]
+            )[0]
 
-        // One threadgroup per 32 output rows, covering the vocabulary exactly
-        // once (100352 == 3136 * 32). Every slot has exactly one owning lane.
-        let assembled = lagunaLmHeadExactKernel(
-            [coarseBF, lmHeadWeight, x, isCandidate],
-            grid: (vocab / 32 * 256, 1, 1),
-            threadGroup: (256, 1, 1),
-            outputShapes: [[vocab]],
-            outputDTypes: [.bfloat16]
-        )[0]
+            // One threadgroup per 32 output rows, covering the vocabulary
+            // exactly once (100352 == 3136 * 32). Every slot has exactly one
+            // owning lane.
+            assembled = lagunaLmHeadExactKernel(
+                [coarseBF, lmHeadWeight, x, isCandidate],
+                grid: (vocab / 32 * 256, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[vocab]],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
         return assembled.reshaped([1, 1, vocab])
     }
 }
