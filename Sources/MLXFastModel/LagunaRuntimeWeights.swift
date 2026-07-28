@@ -347,9 +347,8 @@ public final class LagunaRuntimeWeightCache {
         self.loader = loader
         self.config = config
         // Select the startup memory profile BEFORE the model load. Laguna
-        // retains no alternate weight layouts, so the full profile is
-        // deliberately a no-op here (the
-        // ranked 128 GiB box keeps stock allocator behavior); the documented
+        // retains no alternate weight layouts. The full profile only installs
+        // the post-wire command-buffer budget below; the documented
         // low-memory profile for <64 GiB machines caps the MLX allocator
         // cache at 6 GiB, shortens command buffers, and clears free
         // warmup buffers before the worker protocol hello -- pure memory
@@ -368,6 +367,22 @@ public final class LagunaRuntimeWeightCache {
                 policy.apply()
                 startupMemoryPolicy = policy
             } else {
+                // The full 128 GiB ranked profile wires the complete live
+                // model into Metal's residency set after load. Once those
+                // allocations are permanently resident, MLX's stock 50 MiB
+                // referenced-byte commit threshold splits every sparse layer
+                // across several command buffers even though the layer's
+                // weights no longer create residency pressure. A 512 MiB
+                // budget fits one complete decode layer (attention plus the
+                // routed/shared gate-up and down banks are ~507 MiB for the
+                // larger sliding-attention shape) while retaining MLX's
+                // stock M5 Max 50-operation cap. Explicit MLX_ values win,
+                // and the DARKBLOOM kill switch supports same-binary A/B.
+                let env = ProcessInfo.processInfo.environment
+                if env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" {
+                    setenv("MLX_MAX_MB_PER_BUFFER", "512", 0)
+                    setenv("MLX_MAX_OPS_PER_BUFFER", "50", 0)
+                }
                 startupMemoryPolicy = nil
             }
         } else {
