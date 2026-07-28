@@ -832,7 +832,7 @@ func lagunaResidualRMSNorm(
 // MARK: - Attention
 
 private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
-    name: "laguna_full_qk_norm_yarn_bf16_128_v4",
+    name: "laguna_full_qk_norm_yarn_bf16_128_v5",
     inputNames: ["raw_queries", "raw_keys", "query_weight", "key_weight", "angles"],
     outputNames: ["queries", "keys"],
     source: """
@@ -859,6 +859,7 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
         uint base = lane * 4;
         thread bfloat normalized[4];
         float sum = 0.0f;
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             float value = float(input[base + i]);
             sum += value * value;
@@ -870,6 +871,7 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
@@ -877,6 +879,7 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
         }
 
         thread float paired[4];
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
         }
@@ -887,6 +890,7 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
             : keys + (head - query_heads) * head_dim;
         if (lane < 8) {
             bfloat rounded_mscale = bfloat(yarn_mscale);
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
                 float first =
@@ -900,6 +904,7 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
                     bfloat(first * sine + second * cosine);
             }
         } else if (lane >= 16) {
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 output[base + i] = normalized[i];
             }
@@ -962,7 +967,7 @@ func lagunaFullQKNormYaRN(
 ///    table produced by that very kernel (see `_slidingRoPEAngleSeed`), so
 ///    they are the same floats, not a re-derivation.
 private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
-    name: "laguna_sliding_qk_norm_rope_bf16_128_v1",
+    name: "laguna_sliding_qk_norm_rope_bf16_128_v2",
     inputNames: ["raw_queries", "raw_keys", "query_weight", "key_weight", "angles"],
     outputNames: ["queries", "keys"],
     source: """
@@ -987,6 +992,7 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         uint base = lane * 4;
         thread bfloat normalized[4];
         float sum = 0.0f;
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             float value = float(input[base + i]);
             sum += value * value;
@@ -998,6 +1004,7 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
@@ -1006,6 +1013,7 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
 
         // Element `p + 64`, the partner of pair `p`, lives 16 lanes away.
         thread float paired[4];
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
         }
@@ -1017,6 +1025,7 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         // Every element rotates, so the lower sixteen lanes own all 64 pairs
         // and write both halves of each.
         if (lane < 16) {
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
                 float first = float(normalized[i]);
