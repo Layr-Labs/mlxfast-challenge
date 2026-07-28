@@ -1257,8 +1257,8 @@ int darkbloom_gather_run_skip_pct() {
 // region (see notes/12, the 1:N dispatch-prefix regression).
 
 bool darkbloom_stage_flag(const char* name) {
-  auto v = env::get_var(name, "");
-  return v == "1";
+  auto v = env::get_var(name, "1");
+  return v != "0";
 }
 
 bool darkbloom_stage_widest() {

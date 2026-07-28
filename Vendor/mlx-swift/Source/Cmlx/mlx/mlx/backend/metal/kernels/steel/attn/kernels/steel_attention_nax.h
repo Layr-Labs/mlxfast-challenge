@@ -7,20 +7,10 @@
 
 using namespace mlx::steel;
 
-// DARKBLOOM_ATTN_QHOIST default. DEFAULT OFF: unless the compiler is invoked
-// with -DDARKBLOOM_ATTN_QHOIST=1, the kernel below is byte-for-byte the
-// upstream algorithm.
-//
-// NOTE ON WHICH TWIN RUNS. steel/attn is a JIT family: the runtime-effective
-// source is the string in Cmlx/mlx-generated/steel_attention_nax.cpp, and the
-// DARKBLOOM_ATTN_QHOIST env var is read there, by
-// get_steel_attention_nax_kernel in mlx/backend/metal/jit_kernels.cpp, which
-// prepends the define to that string. This AOT header is kept in sync so the
-// two twins do not diverge, but nothing wires the env var to
-// tools/build-mlx-metallib.sh -- the AOT copy is reachable only by adding the
-// define to the metallib build flags by hand.
+// DARKBLOOM_ATTN_QHOIST default. DEFAULT ON for the standalone ranked
+// candidate. Compile with -DDARKBLOOM_ATTN_QHOIST=0 for an emergency opt-out.
 #ifndef DARKBLOOM_ATTN_QHOIST
-#define DARKBLOOM_ATTN_QHOIST 0
+#define DARKBLOOM_ATTN_QHOIST 1
 #endif
 
 // DARKBLOOM_ATTN_QBLOCK_MAJOR default. DEFAULT ON for the standalone ranked

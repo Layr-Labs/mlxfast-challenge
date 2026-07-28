@@ -380,7 +380,7 @@ let lagunaRouterRowsPerGroup: Int = {
         let raw = ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_ROWS_PER_GROUP"],
         let value = Int(raw), [8, 16, 32, 64].contains(value)
     else {
-        return 8
+        return 16
     }
     return value
 }()
@@ -426,7 +426,7 @@ private enum LagunaDecodeAsyncStage {
 private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     let raw =
         ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?
-        .lowercased() ?? "at:1,7,15,23,31,39"
+        .lowercased() ?? "ladder2"
     switch raw {
     case "off", "0", "":
         return .off
@@ -469,7 +469,7 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
 /// This pays into both score components: the prefill phase itself and the
 /// 512-token seed prefill charged to the decode window.
 private let lagunaPrefillAsyncLadderStride: Int = {
-    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ASYNC_LADDER"]?.lowercased() ?? "8"
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ASYNC_LADDER"]?.lowercased() ?? "2"
     if raw == "off" || raw == "0" || raw.isEmpty { return 0 }
     guard let n = Int(raw), (1...40).contains(n) else { return 0 }
     return n
@@ -1820,7 +1820,7 @@ let lagunaGatedOutputUnroll: Int = {
     guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_L5_UNROLL"],
         let value = Int(raw), [1, 2, 4, 8].contains(value)
     else {
-        return 2
+        return 4
     }
     return value
 }()
