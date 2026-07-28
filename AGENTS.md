@@ -70,19 +70,19 @@ KV-cache handling, memory layout, and MLX
 scheduling — not disk I/O.
 
 Local work needs enough unified memory for the ~21.6 GB model plus KV state
-and buffers; roughly 40 GiB is the practical local minimum.
+and buffers; roughly 36 GiB is the practical local minimum.
 Machines below 64 GiB automatically use a low-memory startup profile: the
 MLX allocator cache is capped at 6 GiB, command buffers are shortened, and
 free warmup buffers are cleared before the worker protocol starts. The
 profile is pure memory management — compiled decode and every other ranked
 code path stay enabled, so local runs execute the same code paths as the
-ranked box all the way down to the documented 40 GiB local minimum. It
+ranked box all the way down to the documented 36 GiB local minimum. It
 prints a stderr notice when it engages; set
 `DARKBLOOM_STARTUP_MEMORY_PROFILE=full|low|auto` to override the automatic
 selection. A machine too small for the model plus the decode working set
 fails loudly with an out-of-memory error rather than silently skipping
-ranked code paths — if that happens, use a 64 GiB+ machine or rely on the
-ranked run. The 128 GB ranked runner keeps the full profile.
+ranked code paths — if that happens, use a machine with more unified
+memory or rely on the ranked run. The 128 GB ranked runner keeps the full profile.
 The ranked box has more headroom than that, but memory-hungry strategies
 tuned against a different machine still have to survive the paired
 measurement on the M5, and a kernel or layout strategy that helps on one

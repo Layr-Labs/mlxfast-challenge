@@ -176,7 +176,7 @@ func lowMemoryPlanWritesNoFeatureDefaultsAndAnnouncesRankedParity() throws {
     ))
     #expect(plan.noticeLines[0].contains("DARKBLOOM_STARTUP_MEMORY_PROFILE=full"))
     #expect(plan.noticeLines[1].contains("out-of-memory"))
-    #expect(plan.noticeLines[1].contains("64 GiB+ machine"))
+    #expect(plan.noticeLines[1].contains("machine with more unified memory"))
     #expect(plan.noticeLines[1].contains("rely on the ranked run"))
 }
 

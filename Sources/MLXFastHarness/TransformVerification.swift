@@ -254,7 +254,7 @@ public enum TransformVerifier {
         }
         // Compared bytes are short-lived. Verification streams both ~18 GB
         // trees; keeping either in the unified buffer cache can exhaust
-        // 40 GiB machines, so match the digest path's uncached read
+        // 36 GiB machines, so match the digest path's uncached read
         // treatment (see #636).
         _ = Darwin.fcntl(expectedHandle.fileDescriptor, F_NOCACHE, 1)
         _ = Darwin.fcntl(expectedHandle.fileDescriptor, F_RDAHEAD, 0)

@@ -8,7 +8,7 @@ import MLX
 /// full-profile minimum get a 6 GiB MLX allocator-cache cap, shorter
 /// command buffers, and a free-warmup-buffer clear before the worker
 /// protocol hello -- headroom insurance that lets the ~21.6 GB Poolside
-/// NVFP4 checkpoint run down to the documented 40 GiB local minimum.
+/// NVFP4 checkpoint run down to the documented 36 GiB local minimum.
 /// Compiled decode and every other ranked code path stay enabled on every
 /// machine, matching the ranked 128 GiB box.
 ///
@@ -146,9 +146,8 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
             noticeLines.append(
                 "mlxfast: a machine too small for the model plus the decode working "
                     + "set fails with an out-of-memory error instead of silently "
-                    + "skipping ranked code paths; verify on a "
-                    + "\(Self.fullProfileMinimumPhysicalMemoryBytes >> 30) GiB+ machine "
-                    + "or rely on the ranked run"
+                    + "skipping ranked code paths; verify on a machine with more "
+                    + "unified memory or rely on the ranked run"
             )
             if !preservedUserValues.isEmpty {
                 let preserved = preservedUserValues.keys.sorted()
