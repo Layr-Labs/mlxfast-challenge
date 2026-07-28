@@ -487,7 +487,7 @@ METAL_FUNC void fp_qmv_quad_impl(
   for (int row = 0; row < results_per_quadgroup; row++) {
     auto wl = (const device uint8_t*)(w + row * in_vec_size_w * quads_per_simd);
     const device uint8_t* sl = scales + row * in_vec_size_g * quads_per_simd;
-#pragma clang loop unroll_count(4)
+#pragma unroll
     for (int k = 0; k < steps_per_thread; ++k) {
       U s = dequantize_scale<U, group_size>(sl[0]);
       if (row * quads_per_simd + out_row < out_vec_size) {
