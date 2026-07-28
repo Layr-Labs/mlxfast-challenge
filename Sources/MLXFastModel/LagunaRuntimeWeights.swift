@@ -372,16 +372,27 @@ public final class LagunaRuntimeWeightCache {
                 // allocations are permanently resident, MLX's stock 50 MiB
                 // referenced-byte commit threshold splits every sparse layer
                 // across several command buffers even though the layer's
-                // weights no longer create residency pressure. A 512 MiB
-                // budget fits one complete decode layer (attention plus the
-                // routed/shared gate-up and down banks are ~507 MiB for the
-                // larger sliding-attention shape) while retaining MLX's
-                // stock M5 Max 50-operation cap. Explicit MLX_ values win,
-                // and the DARKBLOOM kill switch supports same-binary A/B.
+                // weights no longer create residency pressure. The prior
+                // 512 MiB / 50-op budget fit exactly one complete decode
+                // layer (attention plus the routed/shared gate-up and down
+                // banks are ~507 MiB for the larger sliding-attention shape,
+                // and one layer is ~50 ops), coalescing one layer per command
+                // buffer. This raises both caps together to fit TWO decode
+                // layers per command buffer (1024 MiB / 100 ops), halving the
+                // per-step command-buffer dispatch count along the same
+                // mechanism. The two caps scale together so neither is the
+                // binding split threshold: a 2-layer segment needs ~1014 MiB
+                // and ~100 ops, so 512/50 would still split it on both axes.
+                // Bit-exact: pure command-buffer packing, no kernel, op,
+                // dtype, order, or token behavior changes. Explicit MLX_
+                // values win, and the DARKBLOOM kill switch supports
+                // same-binary A/B; setenv overwrite=0 means a shell-exported
+                // MLX_MAX_MB_PER_BUFFER / MLX_MAX_OPS_PER_BUFFER wins for
+                // local 1-layer-vs-2-layer A/B without a rebuild.
                 let env = ProcessInfo.processInfo.environment
                 if env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" {
-                    setenv("MLX_MAX_MB_PER_BUFFER", "512", 0)
-                    setenv("MLX_MAX_OPS_PER_BUFFER", "50", 0)
+                    setenv("MLX_MAX_MB_PER_BUFFER", "1024", 0)
+                    setenv("MLX_MAX_OPS_PER_BUFFER", "100", 0)
                 }
                 startupMemoryPolicy = nil
             }
