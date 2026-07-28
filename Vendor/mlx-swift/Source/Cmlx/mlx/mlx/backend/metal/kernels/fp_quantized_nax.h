@@ -367,10 +367,10 @@ template <
     const int fixed_N = 0,
     const bool aligned_M = false>
 METAL_FUNC void fp_qmm_t_impl(
-    const device uint32_t* w,
-    const device uint8_t* scales,
-    const device T* x,
-    device T* y,
+    const device uint32_t* __restrict__ w,
+    const device uint8_t* __restrict__ scales,
+    const device T* __restrict__ x,
+    device T* __restrict__ y,
     threadgroup Wtype* Ws,
     const constant int& K,
     const constant int& N,
@@ -520,10 +520,10 @@ template <
     const int WN = 2,
     typename Wtype = bfloat>
 METAL_FUNC void fp_qmm_n_impl(
-    const device uint32_t* w,
-    const device uint8_t* scales,
-    const device T* x,
-    device T* y,
+    const device uint32_t* __restrict__ w,
+    const device uint8_t* __restrict__ scales,
+    const device T* __restrict__ x,
+    device T* __restrict__ y,
     threadgroup T* Ws,
     const constant int& K,
     const constant int& N,

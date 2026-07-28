@@ -447,10 +447,10 @@ struct QuantizedBlockLoader {
 
 template <typename T, int group_size, int bits, int D>
 METAL_FUNC void fp_qmv_quad_impl(
-    const device uint32_t* w,
-    const device uint8_t* scales,
-    const device T* x,
-    device T* y,
+    const device uint32_t* __restrict__ w,
+    const device uint8_t* __restrict__ scales,
+    const device T* __restrict__ x,
+    device T* __restrict__ y,
     constant int& in_vec_size,
     const constant int& out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
@@ -509,10 +509,10 @@ METAL_FUNC void fp_qmv_quad_impl(
 
 template <typename T, int group_size, int bits>
 METAL_FUNC void fp_qmv_fast_impl(
-    const device uint32_t* w,
-    const device uint8_t* scales,
-    const device T* x,
-    device T* y,
+    const device uint32_t* __restrict__ w,
+    const device uint8_t* __restrict__ scales,
+    const device T* __restrict__ x,
+    device T* __restrict__ y,
     const constant int& in_vec_size,
     const constant int& out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
@@ -590,10 +590,10 @@ METAL_FUNC void fp_qmv_fast_impl(
 
 template <typename T, int group_size, int bits>
 METAL_FUNC void fp_qmv_impl(
-    const device uint32_t* w,
-    const device uint8_t* scales,
-    const device T* x,
-    device T* y,
+    const device uint32_t* __restrict__ w,
+    const device uint8_t* __restrict__ scales,
+    const device T* __restrict__ x,
+    device T* __restrict__ y,
     const constant int& in_vec_size,
     const constant int& out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
@@ -733,10 +733,10 @@ METAL_FUNC void fp_qmv_impl(
 
 template <typename T, const int group_size, int bits>
 METAL_FUNC void fp_qvm_impl(
-    const device uint32_t* w,
-    const device uint8_t* scales,
-    const device T* x,
-    device T* y,
+    const device uint32_t* __restrict__ w,
+    const device uint8_t* __restrict__ scales,
+    const device T* __restrict__ x,
+    device T* __restrict__ y,
     const int in_vec_size,
     const int out_vec_size,
     const int in_vec_stride,
@@ -840,10 +840,10 @@ template <
     const int BK = 32,
     const int BN = 32>
 METAL_FUNC void fp_qmm_t_impl(
-    const device uint32_t* w,
-    const device uint8_t* scales,
-    const device T* x,
-    device T* y,
+    const device uint32_t* __restrict__ w,
+    const device uint8_t* __restrict__ scales,
+    const device T* __restrict__ x,
+    device T* __restrict__ y,
     threadgroup T* Xs,
     threadgroup T* Ws,
     const constant int& K,
@@ -965,10 +965,10 @@ template <
     const int BK = 32,
     const int BN = 32>
 METAL_FUNC void fp_qmm_n_impl(
-    const device uint32_t* w,
-    const device uint8_t* scales,
-    const device T* x,
-    device T* y,
+    const device uint32_t* __restrict__ w,
+    const device uint8_t* __restrict__ scales,
+    const device T* __restrict__ x,
+    device T* __restrict__ y,
     threadgroup T* Xs,
     threadgroup T* Ws,
     const constant int& K,
