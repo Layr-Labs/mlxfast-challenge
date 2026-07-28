@@ -1631,7 +1631,10 @@ template <
     for (short iq = 0; iq < TQ; iq++) {
       STEEL_PRAGMA_UNROLL
       for (short ik = 0; ik < TK; ik += 2) {
-        STEEL_PRAGMA_UNROLL
+        // Upstream ml-explore/mlx 3541c66b (PR #3843): unroll-by-4 lets the
+        // compiler interleave K-tile loads with the running mma chain;
+        // bitwise-identical outputs, +12% at head_dim 128 on M5 Max.
+#pragma clang loop unroll_count(4)
         for (short id = 0; id < TD; id++) {
           NAXTile<T, 1, 1> Qtile;
           NAXTile<T, 2, 1> Ktile;
