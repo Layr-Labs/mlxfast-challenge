@@ -1400,8 +1400,118 @@ private func lagunaPrefillFullQKNormYaRN(
 /// `precise::rsqrt(acc / 2048 + eps)` is broadcast. The BF16 rounding stays
 /// inside `w[i] * bfloat(x[i] * inv)`, which is the value the separate kernel
 /// would have written and these projections would have read back.
-private func lagunaFusedQKVProjectionSource(heads: Int) -> String {
-    """
+/// `DARKBLOOM_L1_UNROLL` (default `2`; `1` restores the pre-unroll loop
+/// verbatim, `4`/`8` deepen it): block-loop unroll depth for the fused
+/// norm+QKV+gate projection's Q/K/V K-loop.
+///
+/// Why this kernel, and why now. L1 is the largest BF16 device read on the
+/// decode path that still has no load-level parallelism at all: per sliding
+/// layer it streams `wq` [8192, 2048] plus `wk`/`wv` [1024, 2048] -- about
+/// 42 MB of BF16 weights per decode token per layer -- through a K-loop that
+/// issues exactly `rows_per_thread == 4` vec4 device loads (32 B per thread)
+/// and then immediately consumes them. Its sibling L5 (the gated output
+/// projection) has the identical `(block, row, i)` GEMV shape, and depth-2
+/// then depth-8 load unrolls on L5 both promoted on the ranked box
+/// (`notes/54` §11 for the depth-2 rationale, submission `2d2661a` for the
+/// depth-8 selection). L1 never received that treatment, so the same
+/// outstanding-load ceiling that bound L5 still binds here -- with roughly
+/// five times L5's byte volume behind it.
+///
+/// Depth 2 hoists two blocks' weight vec4s, taking a thread from 32 B to
+/// 64 B in flight and a 512-thread threadgroup from 16 KB to 32 KB, at a
+/// cost of eight extra `vec<bfloat, 4>` registers. `blocks == 16` for both
+/// head counts (in_vec_size 2048 / block_width 128), and 1, 2, 4 and 8 all
+/// divide 16, so no depth needs a tail loop and depth `1` emits the
+/// pre-patch loop text verbatim -- a true ablation control rather than an
+/// approximation of one.
+///
+/// **LOADS ONLY, DEVICE LOADS ONLY.** `result[row]` stays one accumulator per
+/// row, stepped in strict `(block, row, i)` source order: block `b`'s four
+/// products for row 0, then rows 1, 2, 3, then block `b+1`'s, into the same
+/// register. Per-unroll partial sums combined at the end would regroup that
+/// FP32 chain into a tree, forfeiting bit-exactness while passing every local
+/// check (the same trap `lagunaGatedOutputProjectionSource` and the router
+/// kernel already document). Only the DEVICE weight loads are hoisted; the
+/// `coefficients[]` reads stay inline because they come from the
+/// `normalized_row` THREADGROUP array, which has no device latency to hide
+/// and would only cost registers (the router kernel's "read inline rather
+/// than staged" finding).
+let lagunaFusedQKVUnroll: Int = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_L1_UNROLL"],
+        let value = Int(raw), [1, 2, 4, 8].contains(value)
+    else {
+        return 2
+    }
+    return value
+}()
+
+private func lagunaFusedQKVProjectionSource(heads: Int, unroll: Int) -> String {
+    let projectionBody: String
+    if unroll == 1 {
+        projectionBody = """
+                uint column = lane * values_per_thread;
+                for (uint block = 0; block < blocks; ++block) {
+                    for (uint i = 0; i < values_per_thread; ++i) {
+                        coefficients[i] = float(normalized_row[column + i]);
+                    }
+
+                    for (uint row = 0; row < rows_per_thread; ++row) {
+                        const device vec<bfloat, 4>* row_values =
+                            (const device vec<bfloat, 4>*)(
+                                weight + (row_base + row) * in_vec_size + column);
+                        const vec<bfloat, 4> w = row_values[0];
+                        for (uint i = 0; i < values_per_thread; ++i) {
+                            result[row] += float(w[i]) * coefficients[i];
+                        }
+                    }
+
+                    column += block_width;
+                }
+        """
+    } else {
+        projectionBody = """
+                uint column = lane * values_per_thread;
+                for (uint block = 0; block < blocks; block += unroll) {
+                    // Hoisted DEVICE loads only: `unroll` blocks' weight
+                    // vec4s for all four owned rows, issued before any
+                    // product, so the next block's fetch overlaps this
+                    // block's arithmetic.
+                    vec<bfloat, 4> weight_values[unroll][rows_per_thread];
+                    for (uint u = 0; u < unroll; ++u) {
+                        uint column_u = column + u * block_width;
+                        for (uint row = 0; row < rows_per_thread; ++row) {
+                            const device vec<bfloat, 4>* row_values =
+                                (const device vec<bfloat, 4>*)(
+                                    weight + (row_base + row) * in_vec_size +
+                                        column_u);
+                            weight_values[u][row] = row_values[0];
+                        }
+                    }
+
+                    // Same `(block, row, i)` accumulation order as depth 1:
+                    // ascending `u` is ascending block, and within a block
+                    // rows 0..3 each take their four products in index order.
+                    for (uint u = 0; u < unroll; ++u) {
+                        uint column_u = column + u * block_width;
+                        for (uint i = 0; i < values_per_thread; ++i) {
+                            coefficients[i] =
+                                float(normalized_row[column_u + i]);
+                        }
+                        for (uint row = 0; row < rows_per_thread; ++row) {
+                            for (uint i = 0; i < values_per_thread; ++i) {
+                                result[row] +=
+                                    float(weight_values[u][row][i]) *
+                                        coefficients[i];
+                            }
+                        }
+                    }
+
+                    column += unroll * block_width;
+                }
+        """
+    }
+    return """
+        constexpr uint unroll = \(unroll);
         constexpr uint in_vec_size = \(LagunaConstants.hiddenSize);
         constexpr uint query_rows = \(heads * LagunaConstants.headDim);
         constexpr uint kv_rows =
@@ -1598,24 +1708,7 @@ private func lagunaFusedQKVProjectionSource(heads: Int) -> String {
         thread float result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
         thread float coefficients[values_per_thread];
 
-        uint column = lane * values_per_thread;
-        for (uint block = 0; block < blocks; ++block) {
-            for (uint i = 0; i < values_per_thread; ++i) {
-                coefficients[i] = float(normalized_row[column + i]);
-            }
-
-            for (uint row = 0; row < rows_per_thread; ++row) {
-                const device vec<bfloat, 4>* row_values =
-                    (const device vec<bfloat, 4>*)(
-                        weight + (row_base + row) * in_vec_size + column);
-                const vec<bfloat, 4> w = row_values[0];
-                for (uint i = 0; i < values_per_thread; ++i) {
-                    result[row] += float(w[i]) * coefficients[i];
-                }
-            }
-
-            column += block_width;
-        }
+        \(projectionBody)
 
         for (uint row = 0; row < rows_per_thread; ++row) {
             for (ushort delta = 16; delta >= 1; delta >>= 1) {
@@ -1630,19 +1723,28 @@ private func lagunaFusedQKVProjectionSource(heads: Int) -> String {
         """
 }
 
-private let lagunaFusedQKVProjectionKernels: [Int: MLXFast.MLXFastKernel] = {
-    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+/// Every head count x every unroll depth, built eagerly so one binary serves
+/// every arm of an ablation (`notes/00`'s one-binary rule) and so MLX's
+/// name-keyed JIT library cache never sees two sources under one name.
+private let lagunaFusedQKVProjectionKernels:
+    [Int: [Int: MLXFast.MLXFastKernel]] = {
+    var kernels: [Int: [Int: MLXFast.MLXFastKernel]] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
-        kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_fused_norm_qkv_projection_bf16_h\(heads)_v3",
-            inputNames: [
-                "residual", "norm_weight", "query_weight", "key_weight",
-                "value_weight", "gate_weight",
-            ],
-            outputNames: ["queries", "keys", "values", "gate_values"],
-            source: lagunaFusedQKVProjectionSource(heads: heads),
-            ensureRowContiguous: true
-        )
+        var byDepth: [Int: MLXFast.MLXFastKernel] = [:]
+        for depth in [1, 2, 4, 8] {
+            byDepth[depth] = MLXFast.metalKernel(
+                name: "laguna_fused_norm_qkv_projection_bf16_h\(heads)_u\(depth)_v4",
+                inputNames: [
+                    "residual", "norm_weight", "query_weight", "key_weight",
+                    "value_weight", "gate_weight",
+                ],
+                outputNames: ["queries", "keys", "values", "gate_values"],
+                source: lagunaFusedQKVProjectionSource(
+                    heads: heads, unroll: depth),
+                ensureRowContiguous: true
+            )
+        }
+        kernels[heads] = byDepth
     }
     return kernels
 }()
@@ -1658,7 +1760,8 @@ func lagunaFusedNormQKVProjection(
 ) -> (
     queries: MLXArray, keys: MLXArray, values: MLXArray, gateValues: MLXArray
 )? {
-    guard let kernel = lagunaFusedQKVProjectionKernels[heads] else { return nil }
+    guard let kernel = lagunaFusedQKVProjectionKernels[heads]?[lagunaFusedQKVUnroll]
+    else { return nil }
     let hidden = LagunaConstants.hiddenSize
     let queryRows = heads * LagunaConstants.headDim
     let kvRows = LagunaConstants.numKeyValueHeads * LagunaConstants.headDim
