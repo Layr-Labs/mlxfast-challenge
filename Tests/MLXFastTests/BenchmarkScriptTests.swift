@@ -2546,7 +2546,7 @@ func staticReviewKernelPolicyAndLaunchBudgetCoverEnlargedSurface() throws {
         return
     }
     #expect(totalBytes <= EditableSurfaceByteBudget.defaultMaxTotalBytes)
-    #expect(fileCount == 141)
+    #expect(fileCount == 142)
     #expect(staticReview.contains("unmodified surface is 2,139,781 bytes"))
     #expect(staticReview.contains("leaving 860,219 bytes"))
     for path in [
