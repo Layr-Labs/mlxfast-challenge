@@ -2443,6 +2443,7 @@ private let lagunaSharedSwiGLUQMVHeader: String = {
         float accum = 0.0f;
         const device uint2* packed = (const device uint2*)weight;
         const uint2 codes = packed[0];
+        #pragma clang loop unroll(full)
         for (uint j = 0; j < 2; ++j) {
             const uint c = (j == 0) ? codes.x : codes.y;
             const uint p0 =
