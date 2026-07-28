@@ -5384,6 +5384,12 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
 
     public let configuration: LagunaConfig
 
+    /// Certified two-pass lm_head elision for single-token decode
+    /// (notes/68). Non-nil only when `lagunaLmHeadPruneEnabled` (default ON;
+    /// set `DARKBLOOM_LM_HEAD_PRUNE=0` to disable) and the coarse copy built
+    /// cleanly; the stock full pass is used otherwise.
+    private var lmHeadPruner: LagunaLmHeadPruner?
+
     public init(_ config: LagunaConfig) {
         self.configuration = config
         self._model.wrappedValue = LagunaRuntimeModelInner(config)
@@ -5423,7 +5429,13 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
 
         let result: MLXArray
         if let lmHead {
-            result = lmHead(hidden)
+            if inputs.shape == [1, 1], let pruner = lmHeadPruner {
+                // Certified two-pass decode head (notes/68): full BF16 logits
+                // row, bit-identical to stock in every argmax-reachable slot.
+                result = pruner.logits(hidden: hidden, lmHeadWeight: lmHead.weight)
+            } else {
+                result = lmHead(hidden)
+            }
         } else {
             result = model.embedTokens.asLinear(hidden)
         }
@@ -5482,6 +5494,19 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         }
         if !fusedArrays.isEmpty {
             eval(fusedArrays)
+        }
+        // Certified two-pass lm_head coarse copy (notes/68), gated by
+        // `lagunaLmHeadPruneEnabled` (DARKBLOOM_LM_HEAD_PRUNE, default ON;
+        // set "0" to disable). Built after the fused layouts so it reads
+        // materialized BF16 weights; quantized() runs one untimed dispatch
+        // over 205M elements (~ms).
+        if lagunaLmHeadPruneEnabled, let lmHead {
+            lmHeadPruner = LagunaLmHeadPruner(lmHeadWeight: lmHead.weight)
+            if let pruner = lmHeadPruner {
+                eval(pruner.codes, pruner.scales)
+                FileHandle.standardError.write(
+                    Data("mlxfast: lm_head prune active (mxfp8 coarse copy resident)\n".utf8))
+            }
         }
     }
 
