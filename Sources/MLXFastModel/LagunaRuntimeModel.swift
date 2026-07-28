@@ -1092,7 +1092,7 @@ func lagunaSlidingQKNormRoPE(
 ///    re-derivation. The decode twin (`laguna_sliding_qk_norm_rope_bf16_128_v1`)
 ///    consumes the same table with the same expression.
 private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_v2",
+    name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_v1",
     inputNames: [
         "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
         "offsets",
@@ -1127,7 +1127,6 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         uint base = lane * 4;
         thread bfloat normalized[4];
         float sum = 0.0f;
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             float value = float(input[base + i]);
             sum += value * value;
@@ -1139,7 +1138,6 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
@@ -1147,11 +1145,7 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         }
 
         // Element `p + 64`, the partner of pair `p`, lives 16 lanes away.
-        // Every fixed-four loop in this prefill-only kernel is explicitly
-        // scalarized. This removes loop-control ALU while preserving the
-        // exact source order of the dependent RMS sum and rotary arithmetic.
         thread float paired[4];
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
         }
@@ -1161,7 +1155,6 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         // Every element rotates, so the lower sixteen lanes own all 64
         // pairs and write both halves of each.
         if (lane < 16) {
-            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
                 float first = float(normalized[i]);
@@ -1192,7 +1185,7 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
 /// and the tail elements 64…127 written verbatim, matching the values the
 /// stock pre-RoPE copy leaves behind.
 private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_full_qk_norm_yarn_bf16_128_v2",
+    name: "laguna_prefill_full_qk_norm_yarn_bf16_128_v1",
     inputNames: [
         "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
         "offsets",
@@ -1228,7 +1221,6 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
         uint base = lane * 4;
         thread bfloat normalized[4];
         float sum = 0.0f;
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             float value = float(input[base + i]);
             sum += value * value;
@@ -1236,7 +1228,6 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
@@ -1244,10 +1235,8 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
         }
 
         // Element `p + 32`, the rotary partner of pair `p` inside the
-        // 64-wide YaRN half, lives 8 lanes away. As in the sliding twin,
-        // scalarize the fixed-four plumbing without changing arithmetic.
+        // 64-wide YaRN half, lives 8 lanes away.
         thread float paired[4];
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
         }
@@ -1256,7 +1245,6 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
             angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
         if (lane < 8) {
             bfloat rounded_mscale = bfloat(yarn_mscale);
-            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
                 float first =
@@ -1270,7 +1258,6 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
                     bfloat(first * sine + second * cosine);
             }
         } else if (lane >= 16) {
-            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 output[base + i] = normalized[i];
             }
