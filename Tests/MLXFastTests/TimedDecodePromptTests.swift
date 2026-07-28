@@ -43,7 +43,7 @@ func hiddenTimedPromptIsIndependentOfCorrectnessFixtures() throws {
         "MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/hidden-correctness-golden-94239d59b435eb8f370c82bcf8c86822d1bbc1094e3650aeff3abc5558137023.json"
     ))
     #expect(workflow.contains(
-        "MLXFAST_GPQA_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/gpqa-reference-cases-4a6d847c6535561e8d4094e2bb764be96c2cd8f4ca310614120058c3c6a7d26f.json"
+        "MLXFAST_GPQA_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/gpqa-reference-cases-6e149e58908d086091ed7e7980e9f8beca7deb4d04063035d68d23e70ee1726f.json"
     ))
 }
 

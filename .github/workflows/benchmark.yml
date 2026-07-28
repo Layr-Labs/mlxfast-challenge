@@ -207,8 +207,8 @@ jobs:
       # Poolside v2 private pins, verified against the immutable R2 objects.
       MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 94239d59b435eb8f370c82bcf8c86822d1bbc1094e3650aeff3abc5558137023
       MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "35892"
-      MLXFAST_GPQA_REFERENCE_SHA256: 4a6d847c6535561e8d4094e2bb764be96c2cd8f4ca310614120058c3c6a7d26f
-      MLXFAST_GPQA_REFERENCE_BYTES: "9885"
+      MLXFAST_GPQA_REFERENCE_SHA256: 6e149e58908d086091ed7e7980e9f8beca7deb4d04063035d68d23e70ee1726f
+      MLXFAST_GPQA_REFERENCE_BYTES: "13534"
       MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
       MLXFAST_GPQA_CASE_COUNT: "9"
       # Case count raised 5 -> 9 (all fixture cases) together with the
@@ -236,7 +236,7 @@ jobs:
       MLXFAST_GPQA_MAX_NEW_TOKENS: "128"
       MLXFAST_SEMANTIC_GPQA_CASE_COUNT: "9"
       MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: "128"
-      MLXFAST_SEMANTIC_GPQA_MIN_PASS: "1"
+      MLXFAST_SEMANTIC_GPQA_MIN_PASS: "7"
       MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
       # Opus 5 at max effort (adaptive thinking) replaced the Sonnet 4.5
       # judge after that model produced prose-wrapped/truncated verdicts
@@ -1328,7 +1328,7 @@ jobs:
           # job-level), so untrusted bench phases never receive the object
           # names. SHA-addressed names are immutable and cannot alias v1.
           MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/hidden-correctness-golden-94239d59b435eb8f370c82bcf8c86822d1bbc1094e3650aeff3abc5558137023.json
-          MLXFAST_GPQA_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/gpqa-reference-cases-4a6d847c6535561e8d4094e2bb764be96c2cd8f4ca310614120058c3c6a7d26f.json
+          MLXFAST_GPQA_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/gpqa-reference-cases-6e149e58908d086091ed7e7980e9f8beca7deb4d04063035d68d23e70ee1726f.json
         run: |
           set -euo pipefail
           .github/scripts/download-r2-object.sh \
