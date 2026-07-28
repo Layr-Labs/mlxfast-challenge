@@ -1544,7 +1544,7 @@ func benchmarkWorkflowUsesDispatchParseablePrivatePaths() throws {
     #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 94239d59b435eb8f370c82bcf8c86822d1bbc1094e3650aeff3abc5558137023"))
     #expect(workflow.contains("MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: \"35892\""))
     #expect(workflow.contains("MLXFAST_GPQA_REFERENCE_SHA256: 6e149e58908d086091ed7e7980e9f8beca7deb4d04063035d68d23e70ee1726f"))
-    #expect(workflow.contains("MLXFAST_GPQA_REFERENCE_BYTES: \"9885\""))
+    #expect(workflow.contains("MLXFAST_GPQA_REFERENCE_BYTES: \"13534\""))
     #expect(workflow.contains("raw hidden correctness golden pin mismatch"))
     #expect(workflow.contains("private GPQA reference pin mismatch"))
     #expect(workflow.contains("Poolside v2 private artifacts require three pinned SHA-256 values"))
