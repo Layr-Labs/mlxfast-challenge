@@ -1124,8 +1124,13 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
     std::string kernel_source;
+    const bool expert_bounds_precompute =
+        env::get_var("DARKBLOOM_EXPERT_BOUNDS_PRECOMPUTE", "") != "0";
     concatenate(
         kernel_source,
+        expert_bounds_precompute
+            ? "\n#define DARKBLOOM_EXPERT_BOUNDS_PRECOMPUTE 1\n"
+            : "",
         metal::utils(),
         metal::gemm_nax(),
         metal::quantized_utils(),

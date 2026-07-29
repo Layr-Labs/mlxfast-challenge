@@ -172,6 +172,10 @@ constant bool stage_wideld [[function_constant(205)]];
 constant bool stage_runbar [[function_constant(206)]];
 constant bool stage_novol [[function_constant(207)]];
 
+#ifndef DARKBLOOM_EXPERT_BOUNDS_PRECOMPUTE
+#define DARKBLOOM_EXPERT_BOUNDS_PRECOMPUTE 1
+#endif
+
 using namespace metal;
 
 #define MLX_MTL_CONST static constant constexpr const
@@ -1525,8 +1529,11 @@ METAL_FUNC int laguna_sorted_lower_bound(
 // kernel assigns fixed 64-row tiles, then walks every expert run intersecting
 // a tile; a run crossing a tile boundary stages the same expert weight tile
 // again. This variant assigns four expert ids to each of 64 threadgroups.
-// Each expert's contiguous interval is found by two lower bounds, chunked only
-// when it genuinely exceeds BM, and therefore stages once per expert/chunk.
+// Each threadgroup finds its five contiguous expert boundaries once, then
+// reuses adjacent pairs for all four experts. This removes three duplicate
+// lower bounds and seven bounds-only barriers without touching QMM arithmetic.
+// Runs are chunked only when they genuinely exceed BM, and therefore stage
+// once per expert/chunk.
 //
 // Per-output arithmetic is unchanged: the same NAX fragment coordinates,
 // K_it/BK/SK traversal, BF16 weight staging boundary and tile_matmad sequence
@@ -1590,7 +1597,11 @@ template <
   threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
   threadgroup bfloat* gate_up_stage =
       (threadgroup bfloat*)Ws_storage;
+#if DARKBLOOM_EXPERT_BOUNDS_PRECOMPUTE
+  threadgroup int bounds[experts / expert_groups + 1];
+#else
   threadgroup int bounds[2];
+#endif
 
   const int K_w = kernel_K * bytes_per_pack / pack_factor;
   const int K_g = kernel_K / group_size;
@@ -1613,6 +1624,20 @@ template <
   const short tm = SM * (simd_group_id / WN);
   const short tn = SN * (simd_group_id % WN);
 
+#if DARKBLOOM_EXPERT_BOUNDS_PRECOMPUTE
+  if (lid == 0) {
+    for (int boundary = 0;
+         boundary <= experts / expert_groups; ++boundary) {
+      const uint32_t expert_boundary =
+          static_cast<uint32_t>(
+              tid.y * (experts / expert_groups) + boundary);
+      bounds[boundary] =
+          laguna_sorted_lower_bound(indices, M, expert_boundary);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif
+
   for (int expert_slot = 0; expert_slot < experts / expert_groups;
        ++expert_slot) {
     // Keep each threadgroup's row intervals and expert weight regions
@@ -1621,15 +1646,19 @@ template <
         static_cast<uint32_t>(
             tid.y * (experts / expert_groups) + expert_slot);
 
+#if DARKBLOOM_EXPERT_BOUNDS_PRECOMPUTE
+    const int run_start = bounds[expert_slot];
+    const int run_end = bounds[expert_slot + 1];
+#else
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0) {
       bounds[0] = laguna_sorted_lower_bound(indices, M, expert);
       bounds[1] = laguna_sorted_lower_bound(indices, M, expert + 1);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
     const int run_start = bounds[0];
     const int run_end = bounds[1];
+#endif
     for (int chunk_start = run_start; chunk_start < run_end;
          chunk_start += BM) {
       const short chunk_rows =
