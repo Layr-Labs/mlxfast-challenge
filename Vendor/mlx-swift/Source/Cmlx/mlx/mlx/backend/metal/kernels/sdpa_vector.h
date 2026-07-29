@@ -112,6 +112,116 @@ using namespace metal;
 #define DARKBLOOM_GQA_PAIR_HEADS 2
 #endif
 
+// ---------------------------------------------------------------------------
+// DARKBLOOM_ALPHASKIP: exact online-softmax rescale elision, keyed on the
+// bit-exact alpha == 1 case. Default ON; `0` restores the stock statement
+// textually (the `#else` arm below IS the upstream line), so an OFF build is
+// a byte-identical control. There is no function-constant or environment
+// switch: this header is AOT-only and the dispatcher that would have to
+// select a second kernel name lives in non-editable host code, so the two
+// arms are selected by building two metallibs.
+//
+// HOW OFTEN alpha == 1 (measured, not assumed). Instrumented decode run on
+// this tree (device counters in the rescale site, sampled over 4 of the 32
+// simdgroups, `--local-iterate`, 128 decode steps):
+//
+//   layer family        steady sites     factor == +1.0f      fraction
+//   full  (48 q heads)     3 264 288          2 663 629        81.60%
+//   sliding (64 q heads)  11 531 520          9 990 456        86.64%
+//   combined              14 795 808         12 654 085        85.52%
+//
+// The first key each simdgroup visits is never an alpha == 1 site (max_score
+// starts at Limits<U>::finite_min, so factor is +0.0 there): 0 / 960 960.
+// The dispatched kernel is this one-pass `sdpa_vector`, on the GQA-pair path,
+// for BOTH families -- the host routes to `sdpa_vector_2pass` only at
+// kL >= 1024 and the frozen window peaks at 640, and the generic (non-pair)
+// path of this kernel logged zero decode sites.
+//
+// WHAT IS *NOT* ELIDED, AND WHY. The obvious elision -- skipping the
+// `sum * factor` and `o[j] * factor` multiplies -- is both INEXACT and
+// WORTHLESS here, and the reason is codegen, not arithmetic. This toolchain
+// contracts
+//     o[j] = o[j] * factor + exp_score * value
+// into `fma(o[j], factor, fmul(exp_score, value))`: it fuses the FACTOR
+// multiply and rounds `exp_score * value` separately. Measured over 4 194 304
+// randomized (o, factor, exp, value) quadruples, `fma(o, factor, e * v)`
+// reproduces the stock spelling on all of them while `fma(e, v, o * factor)`
+// differs on 742 292. Two consequences:
+//   * The "pure-FMA accumulate" `fma(exp_score, value, o[j])` is NOT bitwise
+//     equal to the stock expression at factor == 1.0f -- it rounds the
+//     product once where stock rounds it twice -- and differed on
+//     372 418 / 4 194 304 factor == 1 quadruples. It would move tokens.
+//   * The factor multiply costs nothing to begin with: it is absorbed into an
+//     FMA the accumulate needs anyway, so `o[j] + P` and
+//     `fma(o[j], factor, P)` are both one instruction. Same for
+//     `sum_exp_score * factor + exp_score`. There is no work there to remove.
+//
+// WHAT *IS* ELIDED. The only work the alpha == 1 case actually contains is
+// the evaluation of `factor` itself. When the running max does not advance,
+// `max_score - new_max` is bit-exactly +0.0f (x - x, finite x, round-to-
+// nearest), and `fast::exp(+0.0f)` is bit-exactly 1.0f on this toolchain
+// (verified against every finite float32 exponent class, and against the
+// literal). The branch therefore substitutes the constant the call provably
+// returns and leaves every downstream expression CHARACTER-IDENTICAL:
+// `factor` is still a runtime value the compiler cannot fold, so
+// `sum_exp_score * factor + exp_score` and `o[j] * factor + exp_score * v`
+// emit the same instructions on the same bits as stock. Exactness reduces to
+// one checkable fact -- fast::exp(+0.0f) == 1.0f -- instead of to a claim
+// about rounding, and no accumulator, reduction, or rounding boundary moves.
+//
+// PREDICATE. It is the bit pattern of the delta, not `score <= max_score`.
+// That routes every non-finite case through the unchanged stock call: if
+// max_score or new_max is +/-inf the delta is NaN, whose bits are not +0.0,
+// so `fast::exp` runs exactly as before. It is simdgroup-uniform -- `score`
+// is the broadcast result of `simd_sum` and `max_score` is updated
+// identically in all 32 lanes -- so the whole simdgroup takes one arm and the
+// branch costs no divergence. Masked and sink handling is untouched: the
+// sink seed only changes the initial `max_score`, and the mask decides
+// whether the site executes at all, both upstream of this substitution.
+//
+// `sdpa_vector_2pass_1` carries the same rescale but is deliberately NOT
+// changed: it is off the scored path (see the 2PASS_PLANES note above) and
+// the instrumented run logged zero 2-pass launches.
+//
+// MEASURED OUTCOME: NEUTRAL. Do not re-run this experiment expecting a win.
+// Validation: 347 280 000 rescale sites / 79 872 000 bf16 output elements
+// compared bitwise between an ALPHASKIP=1 and an ALPHASKIP=0 metallib on
+// identical random Q/K/V across four decode shapes (denormals, +/-0, +/-inf,
+// NaN, and planted duplicate K rows to force exact score ties) -- 0
+// mismatches; and the `--local-iterate` drift signature was unchanged in
+// every run (checked_step=0 expected_token=5991 actual_token=8550, golden
+// b9509697c08a), so the elision does not move tokens. But the timing is a
+// null: position-balanced 8-run A/B (OFF,ON,ON,OFF then ON,OFF,OFF,ON,
+// metallib copy-swap, one worker binary), steady decode s/token
+//     ON  10.6930 10.5872 10.5863 10.5455 ms   mean 10.6030
+//     OFF 10.6618 10.5626 10.5584 10.6211 ms   mean 10.6010
+// = -0.02% for ON, i.e. dead even against a ~0.3% adjacent-pair noise floor.
+// One `fast::exp` per elided (key, head) is simply not what this loop is
+// bound by. It is left ON because it is exact and free, not because it pays.
+#ifndef DARKBLOOM_ALPHASKIP
+#define DARKBLOOM_ALPHASKIP 1
+#endif
+
+// Bit-exact +1.0f test on the online-softmax rescale delta. `d` is
+// `max_score - new_max`; the stock value of the rescale factor is
+// `fast::exp(d)`.
+#if DARKBLOOM_ALPHASKIP
+#define DARKBLOOM_RESCALE_FACTOR(dst, delta_expr)   \
+  do {                                              \
+    const U db_delta_ = (delta_expr);               \
+    if (as_type<uint>(db_delta_) == 0u) {           \
+      dst = U(1.0f);                                \
+    } else {                                        \
+      dst = fast::exp(db_delta_);                   \
+    }                                               \
+  } while (false)
+#else
+#define DARKBLOOM_RESCALE_FACTOR(dst, delta_expr) \
+  do {                                            \
+    dst = fast::exp(delta_expr);                  \
+  } while (false)
+#endif
+
 constant bool has_mask [[function_constant(20)]];
 constant bool query_transposed [[function_constant(21)]];
 constant bool do_causal [[function_constant(22)]];
@@ -247,8 +357,10 @@ template <
 
       U pair_new_max0 = max(pair_max0, pair_score0);
       U pair_new_max1 = max(pair_max1, pair_score1);
-      U pair_factor0 = fast::exp(pair_max0 - pair_new_max0);
-      U pair_factor1 = fast::exp(pair_max1 - pair_new_max1);
+      U pair_factor0;
+      U pair_factor1;
+      DARKBLOOM_RESCALE_FACTOR(pair_factor0, pair_max0 - pair_new_max0);
+      DARKBLOOM_RESCALE_FACTOR(pair_factor1, pair_max1 - pair_new_max1);
       U pair_exp0 = fast::exp(pair_score0 - pair_new_max0);
       U pair_exp1 = fast::exp(pair_score1 - pair_new_max1);
 
@@ -412,7 +524,8 @@ template <
 
       // Update the accumulators
       U new_max = max(max_score, score);
-      U factor = fast::exp(max_score - new_max);
+      U factor;
+      DARKBLOOM_RESCALE_FACTOR(factor, max_score - new_max);
       U exp_score = fast::exp(score - new_max);
 
       max_score = new_max;
