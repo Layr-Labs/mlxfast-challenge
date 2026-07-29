@@ -807,6 +807,204 @@ func lagunaResidualRMSNormRouter(
     )
     return (outputs[0], outputs[1], outputs[2])
 }
+/// `DARKBLOOM_ROUTER_FOLD` (default ON; "0" restores the two-kernel path): fold
+/// the decode router top-8 selection into the rpg8 residual+RMS+router
+/// kernel via a last-threadgroup election, deleting the separate 39x
+/// `laguna_decode_router_top8_norm_v2` dispatch per step (~2-2.5 us launch
+/// each; the selection arithmetic migrates, it does not vanish).
+///
+/// Mechanism: all 32 rpg8 tiles write their router logits to device exactly
+/// as today, then increment a per-layer persistent device counter behind a
+/// device-scope release fence. The LAST tile to arrive (prev == 31) resets
+/// the counter, acquire-fences, re-reads the full 256-entry BF16 logits row
+/// from device -- the IDENTICAL input the standalone kernel reads -- and
+/// runs the standalone kernel's bitonic + normalizing epilogue verbatim on
+/// its lower 256 lanes. Bit-exact by construction: same input values, same
+/// comparator network, same rank-order fold and division; the only deleted
+/// work is one kernel launch per layer. The election pattern (const-cast
+/// atomic counter input, self-reset, seq_cst device fences) is the same one
+/// the split-KV spike proved bit-exact on this box.
+///
+/// Barrier-uniformity note: the non-elected 31 tiles return BEFORE the
+/// epilogue's threadgroup barriers (uniform per threadgroup, legal); inside
+/// the elected 512-thread tile every barrier is executed by all threads,
+/// with the 256-lane participation guards wrapped around memory accesses
+/// only, never around a barrier.
+let lagunaRouterFoldEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_FOLD"] != "0"
+
+private final class LagunaRouterFoldCounter {
+    let value: MLXArray
+
+    init() {
+        value = MLXArray.zeros([8], dtype: .uint32)
+        eval(value)
+    }
+}
+
+private let lagunaResidualRMSNormRouterTop8Kernel: MLXFast.MLXFastKernel = {
+    let epilogue = """
+
+        // ---- fused decode top-8 (last-threadgroup election) ----
+        threadgroup_barrier(mem_flags::mem_device);
+        threadgroup uint laguna_fold_elected;
+        if (lid == 0) {
+            atomic_thread_fence(
+                mem_flags::mem_device, memory_order_seq_cst,
+                thread_scope_device);
+            device atomic_uint* laguna_fold_ctr =
+                (device atomic_uint*)fold_counter;
+            uint prev = atomic_fetch_add_explicit(
+                laguna_fold_ctr, 1u, memory_order_relaxed);
+            constexpr uint total_tiles = 256 / rows_per_group;
+            if (prev == total_tiles - 1u) {
+                atomic_store_explicit(
+                    laguna_fold_ctr, 0u, memory_order_relaxed);
+                laguna_fold_elected = 1u;
+            } else {
+                laguna_fold_elected = 0u;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (laguna_fold_elected == 0u) {
+            return;
+        }
+        atomic_thread_fence(
+            mem_flags::mem_device, memory_order_seq_cst,
+            thread_scope_device);
+
+        uint lane = lid;
+        bool router_active = lane < 256;
+        threadgroup float xchg_keys[256];
+        threadgroup uint xchg_indices[256];
+        threadgroup float xchg_scores[256];
+
+        float my_score = 0.0f;
+        float my_key = INFINITY;
+        uint my_index = lane;
+        if (router_active) {
+            float x = float(router_logits[lane]);
+            float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+            my_score = x < 0.0f ? y : 1.0f - y;
+            my_key = -(my_score + float(correction_bias[lane]));
+        }
+
+        for (uint sequence = 2; sequence <= 256; sequence <<= 1) {
+            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+                float other_key = 0.0f;
+                uint other_index = 0u;
+                float other_score = 0.0f;
+                if (stride < 32) {
+                    other_key = simd_shuffle_xor(my_key, ushort(stride));
+                    other_index = simd_shuffle_xor(my_index, ushort(stride));
+                    other_score = simd_shuffle_xor(my_score, ushort(stride));
+                } else {
+                    if (router_active) {
+                        xchg_keys[lane] = my_key;
+                        xchg_indices[lane] = my_index;
+                        xchg_scores[lane] = my_score;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (router_active) {
+                        uint partner = lane ^ stride;
+                        other_key = xchg_keys[partner];
+                        other_index = xchg_indices[partner];
+                        other_score = xchg_scores[partner];
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+
+                if (router_active) {
+                    bool is_lower = (lane & stride) == 0;
+                    float a_key = is_lower ? my_key : other_key;
+                    uint a_index = is_lower ? my_index : other_index;
+                    float a_score = is_lower ? my_score : other_score;
+                    float b_key = is_lower ? other_key : my_key;
+                    uint b_index = is_lower ? other_index : my_index;
+                    float b_score = is_lower ? other_score : my_score;
+
+                    bool lower_wants_better = (lane & sequence) == 0;
+                    bool b_before_a = laguna_router_key_before(
+                        b_key, b_index, a_key, a_index);
+                    bool a_before_b = laguna_router_key_before(
+                        a_key, a_index, b_key, b_index);
+                    bool swap = lower_wants_better ? b_before_a : a_before_b;
+                    if (swap) {
+                        my_key = is_lower ? b_key : a_key;
+                        my_index = is_lower ? b_index : a_index;
+                        my_score = is_lower ? b_score : a_score;
+                    }
+                }
+            }
+        }
+
+        float total = 0.0f;
+        for (uint i = 0; i < 8; ++i) {
+            total = simd_shuffle(my_score, ushort(i)) + total;
+        }
+        if (lane < 8) {
+            router_indices[lane] = my_index;
+            router_scores[lane] = my_score / total;
+        }
+        """
+    return MLXFast.metalKernel(
+        name: "laguna_residual_rms_router_top8_rpg8_v1",
+        inputNames: [
+            "residual", "branch", "weight", "router_weight",
+            "correction_bias", "fold_counter",
+        ],
+        outputNames: [
+            "summed", "normalized", "router_logits",
+            "router_indices", "router_scores",
+        ],
+        source: lagunaResidualRMSNormRouterSource(rowsPerGroup: 8) + epilogue,
+        header: lagunaDecodeRouterTop8Header,
+        ensureRowContiguous: true
+    )
+}()
+
+/// Fused L6+L7: residual add + RMSNorm + router GEMV + top-8 selection with
+/// normalization, one dispatch. Engages only under the exact cast-sink +
+/// norm-sink decode configuration (the caller checks the gate flags); the
+/// scores it returns are FINAL (normalized), matching the standalone
+/// normalizing kernel's contract.
+func lagunaResidualRMSNormRouterTop8(
+    residual: MLXArray, branch: MLXArray, weight: MLXArray,
+    routerWeight: MLXArray, correctionBias: MLXArray, foldCounter: MLXArray
+) -> (
+    summed: MLXArray, normalized: MLXArray, routerLogits: MLXArray,
+    indices: MLXArray, scores: MLXArray
+) {
+    let hidden = LagunaConstants.hiddenSize
+    let experts = LagunaConstants.numExperts
+    precondition(residual.dtype == .bfloat16)
+    precondition(branch.dtype == .bfloat16)
+    precondition(weight.dtype == .bfloat16)
+    precondition(routerWeight.dtype == .bfloat16)
+    precondition(correctionBias.dtype == .float32)
+    precondition(foldCounter.dtype == .uint32)
+    precondition(residual.shape == [1, 1, hidden])
+    precondition(branch.shape == [1, 1, hidden])
+    precondition(correctionBias.size == experts)
+    precondition(foldCounter.size >= 1)
+
+    lagunaTrace("residual+rmsnorm+router+top8")
+    let tiles = experts / 8
+    let outputs = lagunaResidualRMSNormRouterTop8Kernel(
+        [
+            residual, branch, weight, routerWeight, correctionBias,
+            foldCounter,
+        ],
+        grid: (tiles * 512, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [
+            [1, 1, hidden], [1, 1, hidden], [1, 1, experts],
+            [1, 1, 8], [1, 1, 8],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .uint32, .float32]
+    )
+    return (outputs[0], outputs[1], outputs[2], outputs[3], outputs[4])
+}
 
 func lagunaResidualRMSNorm(
     residual: MLXArray, branch: MLXArray, weight: MLXArray
@@ -4917,19 +5115,28 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        forward(x, residual: nil, routerLogits: nil)
+        forward(x, residual: nil, routerLogits: nil, routerSelection: nil)
     }
 
     func callAsFunction(
-        _ x: MLXArray, residual: MLXArray, routerLogits: MLXArray? = nil
+        _ x: MLXArray, residual: MLXArray, routerLogits: MLXArray? = nil,
+        routerSelection: (MLXArray, MLXArray)? = nil
     ) -> MLXArray {
-        forward(x, residual: residual, routerLogits: routerLogits)
+        forward(
+            x, residual: residual, routerLogits: routerLogits,
+            routerSelection: routerSelection)
     }
 
     private func forward(
-        _ x: MLXArray, residual: MLXArray?, routerLogits: MLXArray?
+        _ x: MLXArray, residual: MLXArray?, routerLogits: MLXArray?,
+        routerSelection: (MLXArray, MLXArray)?
     ) -> MLXArray {
-        let (inds, weights) = gate(x, logits: routerLogits)
+        // `routerSelection` is FINAL (indices, normalized scores) from the
+        // fused L6+top8 kernel; it is produced only under the exact
+        // cast-sink + norm-sink configuration whose standalone path also
+        // returns directly (see LagunaRuntimeMoEGate.callAsFunction), so no
+        // further normalization applies here.
+        let (inds, weights) = routerSelection ?? gate(x, logits: routerLogits)
         var y: MLXArray
         var routedAlreadyReduced = false
         var sortedTailInverseOrder: MLXArray?
@@ -5236,6 +5443,7 @@ final class LagunaRuntimeDecoderLayer: Module {
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
     let attentionType: LagunaLayerType
+    private let routerFoldCounter = LagunaRouterFoldCounter()
 
     init(_ config: LagunaConfig, layerIdx: Int) {
         self._selfAttn.wrappedValue = LagunaRuntimeAttention(config, layerIdx: layerIdx)
@@ -5273,6 +5481,7 @@ final class LagunaRuntimeDecoderLayer: Module {
         let h: MLXArray
         let normalized: MLXArray
         var routerLogits: MLXArray?
+        var routerSelection: (MLXArray, MLXArray)?
         if lagunaFusedResidualRMSNormRouterEnabled,
             x.dtype == .bfloat16, r.dtype == .bfloat16,
             postAttentionLayerNorm.weight.dtype == .bfloat16,
@@ -5283,14 +5492,44 @@ final class LagunaRuntimeDecoderLayer: Module {
                 LagunaConstants.numExperts, LagunaConstants.hiddenSize,
             ]
         {
-            let fused = lagunaResidualRMSNormRouter(
-                residual: x,
-                branch: r,
-                weight: postAttentionLayerNorm.weight,
-                routerWeight: sparse.gate.weight)
-            h = fused.summed
-            normalized = fused.normalized
-            routerLogits = fused.routerLogits
+            // Router fold (DARKBLOOM_ROUTER_FOLD=1): one dispatch produces
+            // the residual sum, the normalized row, the router logits, AND
+            // the final top-8 selection via the last-threadgroup election
+            // epilogue. The guard set below replicates the gate's cast-sink
+            // + norm-sink branch EXACTLY, because the fused epilogue bakes
+            // that branch's normalizing semantics; any mismatch falls back
+            // to the stock two-kernel path.
+            if lagunaRouterFoldEnabled,
+                lagunaRouterRowsPerGroup == 8,
+                lagunaDecodeRouterTop8Enabled,
+                lagunaDecodeRouterCastSinkEnabled,
+                lagunaDecodeRouterNormSinkEnabled,
+                sparse.gate.normTopkProb,
+                sparse.gate.routerLogitSoftcapping == 0,
+                sparse.gate.topK == 8,
+                sparse.gate.eScoreCorrectionBias.size == LagunaConstants.numExperts
+            {
+                let fused = lagunaResidualRMSNormRouterTop8(
+                    residual: x,
+                    branch: r,
+                    weight: postAttentionLayerNorm.weight,
+                    routerWeight: sparse.gate.weight,
+                    correctionBias: sparse.gate.eScoreCorrectionBias.asType(.float32),
+                    foldCounter: routerFoldCounter.value)
+                h = fused.summed
+                normalized = fused.normalized
+                routerLogits = fused.routerLogits
+                routerSelection = (fused.indices, fused.scores)
+            } else {
+                let fused = lagunaResidualRMSNormRouter(
+                    residual: x,
+                    branch: r,
+                    weight: postAttentionLayerNorm.weight,
+                    routerWeight: sparse.gate.weight)
+                h = fused.summed
+                normalized = fused.normalized
+                routerLogits = fused.routerLogits
+            }
         } else if lagunaFusedResidualRMSNormEnabled,
             x.dtype == .bfloat16, r.dtype == .bfloat16,
             postAttentionLayerNorm.weight.dtype == .bfloat16,
@@ -5341,7 +5580,9 @@ final class LagunaRuntimeDecoderLayer: Module {
             h.shape == normalized.shape,
             let sparse = mlp as? LagunaRuntimeSparseMoEBlock
         {
-            return sparse(normalized, residual: h, routerLogits: routerLogits)
+            return sparse(
+                normalized, residual: h, routerLogits: routerLogits,
+                routerSelection: routerSelection)
         }
         // Multi-token prefill: hand the residual to the sparse block so the
         // prefill MoE tail kernel can fold the final residual add. When any
