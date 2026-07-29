@@ -91,11 +91,47 @@ private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     return body
 }()
 
+/// `DARKBLOOM_INVERSE_SCATTER` (default on; "0" restores the stock double
+/// argsort): compute the routing permutation's inverse with one stock
+/// scatter (`putAlong`) over a cached index ramp instead of a second full
+/// `argSort`. `order` is a bijection on `0..<N`, so
+/// `inverse[order[i]] = i` writes every slot exactly once and the result is
+/// byte-identical UInt32s to `argSort(order)` (no ties exist, so stability
+/// is irrelevant; no float expression is touched). The ramp is
+/// input-independent (a constant per flattened length) and cached, which
+/// also removes the per-layer `arange` dispatch MLX's sort would re-issue.
+/// Unlike the previously rejected custom-kernel inverse, this stays on
+/// stock MLX primitives inside the same concurrent encoder — no
+/// custom-kernel dependency boundary.
+private let inverseScatterEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_INVERSE_SCATTER"] != "0"
+
+private final class IndexRampCache: @unchecked Sendable {
+    static let shared = IndexRampCache()
+    private var ramps: [Int: MLXArray] = [:]
+    private let lock = NSLock()
+    func ramp(_ n: Int) -> MLXArray {
+        lock.lock()
+        defer { lock.unlock() }
+        if let r = ramps[n] { return r }
+        let r = MLXArray(Int32(0) ..< Int32(n)).asType(.uint32)
+        ramps[n] = r
+        return r
+    }
+}
+
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
     let order = argSort(indices)
-    let inverseOrder = argSort(order)
+    let inverseOrder: MLXArray
+    if inverseScatterEnabled {
+        inverseOrder = putAlong(
+            order, order, values: IndexRampCache.shared.ramp(order.dim(0)),
+            axis: 0)
+    } else {
+        inverseOrder = argSort(order)
+    }
 
     return (
         x.flattened(start: 0, end: -3)[order.floorDivide(m)],
