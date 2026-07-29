@@ -104,6 +104,13 @@ func lagunaTrace(_ site: String) {
 let lagunaFusedQKVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] == "1"
 
+/// `DARKBLOOM_PREFILL_FUSED_KV` (default on; set "0" to disable): retain a
+/// row-concatenated `[Wk; Wv]` bank and remove one equal-shape Steel GEMM per
+/// attention layer during multi-token prefill. Decode keeps the custom fused
+/// norm+QKV kernel.
+let lagunaPrefillFusedKVEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_KV"] != "0"
+
 /// `DARKBLOOM_FUSED_SHARED_GATE_UP` (default on; set "0" to disable): after
 /// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
 /// shared expert and serve single-token decode from one quantized matmul.
@@ -1945,6 +1952,23 @@ final class LagunaRuntimeAttention: Module {
     /// checkpoint parameter; the q/k/v `Linear` modules keep the original
     /// arrays for parameter integrity.
     var _fusedQKVWeight: MLXArray?
+    /// Retained prefill-only `[Wk; Wv]` bank. Kept outside Module reflection
+    /// so checkpoint parameters remain the original K/V arrays.
+    var _fusedKVWeight: MLXArray?
+
+    func prepareFusedKVWeight() -> MLXArray? {
+        guard _fusedKVWeight == nil,
+            type(of: wk) == Linear.self, type(of: wv) == Linear.self,
+            wk.bias == nil, wv.bias == nil,
+            wk.weight.ndim == 2, wv.weight.ndim == 2,
+            wk.weight.dtype == wv.weight.dtype,
+            wk.weight.shape == wv.weight.shape,
+            wk.weight.dim(0) == nKVHeads * headDim
+        else { return nil }
+        let fused = concatenated([wk.weight, wv.weight], axis: 0)
+        _fusedKVWeight = fused
+        return fused
+    }
 
     /// Builds and retains the fused QKV weight from the loaded q/k/v
     /// projection weights. Called once after weights are installed and
@@ -2102,8 +2126,15 @@ final class LagunaRuntimeAttention: Module {
                 preconditionFailure("stock QKV projections require normalized input")
             }
             queries = wq(normalizedInput)
-            keys = wk(normalizedInput)
-            values = wv(normalizedInput)
+            if L > 1, let fusedKVWeight = _fusedKVWeight {
+                let kv = matmul(normalizedInput, fusedKVWeight.T)
+                let kvDim = nKVHeads * headDim
+                keys = kv[.ellipsis, 0 ..< kvDim]
+                values = kv[.ellipsis, kvDim ..< (2 * kvDim)]
+            } else {
+                keys = wk(normalizedInput)
+                values = wv(normalizedInput)
+            }
         }
 
         let fusedQKNormShapesMatch =
@@ -5861,6 +5892,10 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         var fusedArrays = model.prepareRoPEAngleAtlases()
         for layer in model.layers {
             if lagunaFusedQKVEnabled, let fused = layer.selfAttn.prepareFusedQKVWeight() {
+                fusedArrays.append(fused)
+            } else if lagunaPrefillFusedKVEnabled,
+                let fused = layer.selfAttn.prepareFusedKVWeight()
+            {
                 fusedArrays.append(fused)
             }
             if let sparse = layer.mlp as? LagunaRuntimeSparseMoEBlock {
