@@ -1469,6 +1469,27 @@ private let lagunaNativeAffineNVFP4From: Int? = {
     return min(max(value, 0), LagunaConstants.numHiddenLayers)
 }()
 
+/// Separate NVFP4 depth for the o_proj side layout
+/// (`DARKBLOOM_NATIVE_AFFINE_OPROJ_NVFP4_FROM`, default 30; Q/K/V keep the
+/// shared default above). This bounded two-layer chunk was sized by
+/// measurement, not by family intuition: on a 512-token probe prompt the
+/// previously landed layers->=32 chunk displaces its predecessor's argmax
+/// token by ~0.75 logits (rank 1 -> 7), o_proj-only >=30 lands just inside
+/// that (~0.6, rank 1 -> 2), while >=28 doubles it (~1.8, rank 1 -> 9) and
+/// >=24 pushes the token out of the top five entirely — the perturbation
+/// grows steeply with remaining depth, so the window advances two layers at
+/// a time, not eight. `DARKBLOOM_NATIVE_AFFINE_NVFP4=0` still disables both
+/// families; `..._OPROJ_NVFP4_FROM=32` reproduces the previous submission
+/// exactly.
+private let lagunaNativeAffineOProjNVFP4From: Int? = {
+    guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_NVFP4"] != "0"
+    else { return nil }
+    let raw =
+        ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OPROJ_NVFP4_FROM"] ?? "30"
+    guard let value = Int(raw), value < LagunaConstants.numHiddenLayers else { return nil }
+    return min(max(value, 0), LagunaConstants.numHiddenLayers)
+}()
+
 /// Measurement-only wire-format probe. `DARKBLOOM_NATIVE_AFFINE_PROBE_FORMAT`
 /// (`nvfp4` / `mxfp8` / `mxfp4`; unset = shipped INT8) rounds the BF16 source
 /// weight through the named format before the shipped group-32 affine INT8 side
@@ -1517,7 +1538,8 @@ private func lagunaNativeAffineProbeRoundTrip(_ weight: MLXArray, layer: Int?) -
 }
 
 func lagunaNativeAffineWeight(
-    _ weight: MLXArray, layer: Int? = nil
+    _ weight: MLXArray, layer: Int? = nil,
+    nvfp4From: Int? = lagunaNativeAffineNVFP4From
 ) -> LagunaNativeAffineWeight? {
     guard weight.dtype == .bfloat16, weight.ndim == 2,
         weight.dim(1).isMultiple(of: 32)
@@ -1525,7 +1547,7 @@ func lagunaNativeAffineWeight(
         return nil
     }
     let source = lagunaNativeAffineProbeRoundTrip(weight, layer: layer)
-    if let from = lagunaNativeAffineNVFP4From,
+    if let from = nvfp4From,
         (layer ?? 0) >= from,
         weight.dim(1).isMultiple(of: 16)
     {
@@ -2452,7 +2474,9 @@ final class LagunaRuntimeAttention: Module {
             type(of: wo) == Linear.self,
             wo.bias == nil,
             wo.weight.shape == [LagunaConstants.hiddenSize, nHeads * headDim],
-            let quantizedWO = lagunaNativeAffineWeight(wo.weight, layer: layerIdx)
+            let quantizedWO = lagunaNativeAffineWeight(
+                wo.weight, layer: layerIdx,
+                nvfp4From: lagunaNativeAffineOProjNVFP4From)
         else {
             return []
         }
