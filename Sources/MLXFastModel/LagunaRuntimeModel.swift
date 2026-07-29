@@ -6798,8 +6798,21 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
             lmHeadPruner = LagunaLmHeadPruner(lmHeadWeight: lmHead.weight)
             if let pruner = lmHeadPruner {
                 eval(pruner.codes, pruner.scales)
+                // Tighter, smaller int-b gs128 coarse screen (notes/69 int6,
+                // notes/70 int5). Built after the MXFP8 copy so a failed
+                // certificate check leaves the shipped MXFP8 screen fully
+                // armed; int5 additionally falls back to int6.
+                if lagunaLmHeadInt5Enabled {
+                    pruner.intB = buildLagunaLmHeadIntBPlanes(
+                        lmHeadWeight: lmHead.weight, bits: 5)
+                }
+                if pruner.intB == nil, lagunaLmHeadInt6Enabled {
+                    pruner.intB = buildLagunaLmHeadIntBPlanes(
+                        lmHeadWeight: lmHead.weight, bits: 6)
+                }
+                let screen = pruner.intB.map { "int\($0.bits) gs128" } ?? "mxfp8 gs32"
                 FileHandle.standardError.write(
-                    Data("mlxfast: lm_head prune active (mxfp8 coarse copy resident)\n".utf8))
+                    Data("mlxfast: lm_head prune active (\(screen) coarse copy resident)\n".utf8))
             }
         }
     }
