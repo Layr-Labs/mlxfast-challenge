@@ -357,6 +357,45 @@ private func lagunaUseNativeAffineOProj(layer: Int) -> Bool {
         onlyLayer: lagunaNativeAffineOProjOnlyLayer)
 }
 
+/// The same accepted group-32 affine INT8 layout applied to the attention
+/// per-head gate (`g_proj`). AGENTS.md's quantization envelope names the
+/// attention Q/K/V, output, AND per-head gate projections as the weights that
+/// may be re-represented this way — and only those; the MoE router gate is a
+/// distinct parameter and stays NVFP4 as shipped.
+///
+/// `g_proj` is small per layer (`[heads, 2048]` BF16) but it is dispatched as
+/// its own `gemv_al` on every decode token of every layer — 40 dispatches and
+/// ~290 µs/step in the in-situ capture — so halving its weight traffic is the
+/// last untaken piece of the accepted envelope.
+///
+/// **MEASURED NEGATIVE, so this ships DEFAULT OFF** (`== "1"` to enable).
+/// Isolated on the post-envelope frontier: gate ON 6.404 ms steady step vs
+/// OFF 6.260 ms over 2+2 same-session runs — **-2.3%**. The envelope permits
+/// it, but `g_proj` is only `[heads, 2048]`, so the byte saving is negligible
+/// while the `quantizedMM` dispatch is slower than the `gemv_al` MLX picks
+/// for this shape. Consistent with three separate failed attempts to beat
+/// that same projection with a hand-written BF16 kernel. Kept, wired, and
+/// documented so the next solver can re-measure rather than re-derive.
+private let lagunaNativeAffineGProjLayerCount: Int = {
+    guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_GPROJ"] == "1"
+    else { return 0 }
+    let requested = Int(
+        ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_GPROJ_LAYERS"]
+            ?? "40") ?? 40
+    return min(max(requested, 0), LagunaConstants.numHiddenLayers)
+}()
+let lagunaNativeAffineGProjEnabled = lagunaNativeAffineGProjLayerCount > 0
+
+private let lagunaNativeAffineGProjOnlyLayer = lagunaNativeAffineOnlyLayer(
+    "DARKBLOOM_NATIVE_AFFINE_GPROJ_ONLY_LAYER")
+
+private func lagunaUseNativeAffineGProj(layer: Int) -> Bool {
+    lagunaNativeAffineCovers(
+        layer: layer,
+        count: lagunaNativeAffineGProjLayerCount,
+        onlyLayer: lagunaNativeAffineGProjOnlyLayer)
+}
+
 /// Sliding-layer per-head RMSNorm + plain RoPE fusion (see
 /// `lagunaSlidingQKNormRoPEKernel`).
 ///
@@ -2460,6 +2499,30 @@ final class LagunaRuntimeAttention: Module {
         return quantizedWO.arrays
     }
 
+    /// Derived native group-32 affine layout for the attention per-head gate
+    /// (`g_proj`), used only by the serial decode call. AGENTS.md's accepted
+    /// quantization envelope names Q/K/V, the output projection, AND the
+    /// per-head gate as the attention weights that may be re-represented as
+    /// group-32 affine INT8 derived at init from the loaded weights; the MoE
+    /// router gate is a distinct parameter and stays as shipped. The BF16
+    /// `gProj.weight` remains authoritative for prefill, the last-row prefill
+    /// path, and every decode fallback.
+    var _nativeAffineGProj: LagunaNativeAffineWeight?
+
+    func prepareNativeAffineGProjWeight() -> [MLXArray] {
+        guard _nativeAffineGProj == nil,
+            let gate = gProj,
+            type(of: gate) == Linear.self,
+            gate.bias == nil,
+            gate.weight.shape == [nHeads, LagunaConstants.hiddenSize],
+            let quantizedGate = lagunaNativeAffineWeight(gate.weight, layer: layerIdx)
+        else {
+            return []
+        }
+        _nativeAffineGProj = quantizedGate
+        return quantizedGate.arrays
+    }
+
     func prepareNativeAffineQKVWeight() -> [MLXArray] {
         guard _nativeAffineQKV == nil,
             let q = lagunaNativeAffineWeight(wq.weight, layer: layerIdx),
@@ -2618,7 +2681,25 @@ final class LagunaRuntimeAttention: Module {
                 )
                 let queryDim = nHeads * headDim
                 let kvDim = nKVHeads * headDim
-                let gateLogits = gateProjection(normalized)
+                // Per-head gate over the group-32 affine INT8 side layout
+                // when the envelope layout is present (AGENTS.md admits
+                // `g_proj` alongside Q/K/V and o_proj); the BF16 projection
+                // runs unchanged whenever it is absent.
+                let gateLogits: MLXArray
+                if let affineGate = _nativeAffineGProj {
+                    gateLogits = quantizedMM(
+                        normalized,
+                        affineGate.packedCodes,
+                        scales: affineGate.scales,
+                        biases: affineGate.biases,
+                        transpose: true,
+                        groupSize: affineGate.groupSize,
+                        bits: affineGate.bits,
+                        mode: affineGate.mode
+                    )
+                } else {
+                    gateLogits = gateProjection(normalized)
+                }
                 let activatedGate =
                     softplus(gateLogits.asType(.float32)).asType(.bfloat16)
                 fusedNormQKV = (
@@ -6767,6 +6848,10 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
             if lagunaUseNativeAffineOProj(layer: layer.selfAttn.layerIdx) {
                 fusedArrays.append(
                     contentsOf: layer.selfAttn.prepareNativeAffineOProjWeight())
+            }
+            if lagunaUseNativeAffineGProj(layer: layer.selfAttn.layerIdx) {
+                fusedArrays.append(
+                    contentsOf: layer.selfAttn.prepareNativeAffineGProjWeight())
             }
             if lagunaFusedQKVEnabled, let fused = layer.selfAttn.prepareFusedQKVWeight() {
                 fusedArrays.append(fused)
