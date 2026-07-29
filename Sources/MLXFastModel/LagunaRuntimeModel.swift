@@ -1378,7 +1378,7 @@ private func lagunaPrefillFullQKNormYaRN(
 /// `precise::rsqrt(acc / 2048 + eps)` is broadcast. The BF16 rounding stays
 /// inside `w[i] * bfloat(x[i] * inv)`, which is the value the separate kernel
 /// would have written and these projections would have read back.
-private func lagunaFusedQKVProjectionSource(heads: Int) -> String {
+private func lagunaFusedQKVProjectionSource(heads: Int, unroll: Int) -> String {
     """
         constexpr uint in_vec_size = \(LagunaConstants.hiddenSize);
         constexpr uint query_rows = \(heads * LagunaConstants.headDim);
@@ -1576,23 +1576,36 @@ private func lagunaFusedQKVProjectionSource(heads: Int) -> String {
         thread float result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
         thread float coefficients[values_per_thread];
 
+        constexpr uint unroll = \(unroll);
         uint column = lane * values_per_thread;
-        for (uint block = 0; block < blocks; ++block) {
-            for (uint i = 0; i < values_per_thread; ++i) {
-                coefficients[i] = float(normalized_row[column + i]);
-            }
-
-            for (uint row = 0; row < rows_per_thread; ++row) {
-                const device vec<bfloat, 4>* row_values =
-                    (const device vec<bfloat, 4>*)(
-                        weight + (row_base + row) * in_vec_size + column);
-                const vec<bfloat, 4> w = row_values[0];
+        for (uint block = 0; block < blocks; block += unroll) {
+            // LOADS ONLY: hoist `unroll` consecutive blocks' coefficient and
+            // weight loads, then run the SAME strict (block, i) FMA order
+            // into the same single accumulator per row. No partial sums.
+            thread float coeff_u[unroll][values_per_thread];
+            thread vec<bfloat, 4> w_u[unroll][rows_per_thread];
+            for (uint u = 0; u < unroll; ++u) {
+                uint column_u = column + u * block_width;
                 for (uint i = 0; i < values_per_thread; ++i) {
-                    result[row] += float(w[i]) * coefficients[i];
+                    coeff_u[u][i] = float(normalized_row[column_u + i]);
+                }
+                for (uint row = 0; row < rows_per_thread; ++row) {
+                    const device vec<bfloat, 4>* row_values =
+                        (const device vec<bfloat, 4>*)(
+                            weight + (row_base + row) * in_vec_size + column_u);
+                    w_u[u][row] = row_values[0];
+                }
+            }
+            for (uint u = 0; u < unroll; ++u) {
+                for (uint row = 0; row < rows_per_thread; ++row) {
+                    const vec<bfloat, 4> w = w_u[u][row];
+                    for (uint i = 0; i < values_per_thread; ++i) {
+                        result[row] += float(w[i]) * coeff_u[u][i];
+                    }
                 }
             }
 
-            column += block_width;
+            column += unroll * block_width;
         }
 
         for (uint row = 0; row < rows_per_thread; ++row) {
@@ -1612,13 +1625,14 @@ private let lagunaFusedQKVProjectionKernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_fused_norm_qkv_projection_bf16_h\(heads)_v3",
+            name: "laguna_fused_norm_qkv_projection_bf16_h\(heads)_v3_u\(lagunaFusedQKVUnroll)",
             inputNames: [
                 "residual", "norm_weight", "query_weight", "key_weight",
                 "value_weight", "gate_weight",
             ],
             outputNames: ["queries", "keys", "values", "gate_values"],
-            source: lagunaFusedQKVProjectionSource(heads: heads),
+            source: lagunaFusedQKVProjectionSource(
+                heads: heads, unroll: lagunaFusedQKVUnroll),
             ensureRowContiguous: true
         )
     }
@@ -1816,6 +1830,33 @@ private func lagunaGatedOutputProjectionSource(heads: Int, unroll: Int) -> Strin
 /// thread — rather than bandwidth or occupancy — is what limits this whole
 /// kernel family. A monotone rise toward 596 GB/s would mean the 462.9 µs /
 /// 4.52% ceiling that L1+L5 have been sized against is itself too low.
+/// `DARKBLOOM_QKV_UNROLL` (default `2`; `1` restores the pre-unroll loop
+/// verbatim, `4`/`8` deepen it): block-loop unroll depth for the fused
+/// norm+QKV+gate projection — the same LOADS-ONLY hoist already promoted on
+/// the gated output projection (`DARKBLOOM_L5_UNROLL`), applied to the
+/// larger of the two attention GEMVs. `blocks` is `in_vec_size /
+/// block_width` = 2048/128 = 16, and 16 is divisible by 1, 2, 4 and 8, so no
+/// depth needs a tail loop and depth `1` emits the pre-patch loop exactly —
+/// a true ablation control.
+///
+/// **LOADS ONLY.** `result[row]` remains ONE accumulator per row stepped in
+/// strict `(block, i)` order: block b's four products, then block b+1's,
+/// into the same register. The unroll hoists the weight/coefficient LOADS of
+/// `unroll` consecutive blocks ahead of the FMA chain; it does not give each
+/// unrolled step its own partial sum. Per-step partials summed at the end
+/// would regroup the sequential FP32 chain into a tree — bit-exactness lost,
+/// every local check still green, the hidden exact-token gate failed. This
+/// is the identical discipline (and identical wording) the promoted L5
+/// unroll documents.
+let lagunaFusedQKVUnroll: Int = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_QKV_UNROLL"],
+        let value = Int(raw), [1, 2, 4, 8].contains(value)
+    else {
+        return 2
+    }
+    return value
+}()
+
 let lagunaGatedOutputUnroll: Int = {
     guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_L5_UNROLL"],
         let value = Int(raw), [1, 2, 4, 8].contains(value)
