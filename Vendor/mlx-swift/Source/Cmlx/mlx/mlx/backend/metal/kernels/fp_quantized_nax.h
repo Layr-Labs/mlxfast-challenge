@@ -391,6 +391,31 @@ struct QuantizedBlockLoader {
       return;
     }
 
+    // Store-only widening keeps the baseline packed_uchar4 device reads.
+    if constexpr (
+        wide_store && !wide_load && fp4nv_fast && (sizeof(T) == 2) &&
+        ((kSrcBytesPerChunk % 4) == 0)) {
+      STEEL_PRAGMA_UNROLL
+      for (short c = 0; c < kWideChunks; c++) {
+        const short e0 = c * kWideElems;
+        const short k0 = c * kSrcBytesPerChunk;
+        WideChunk out;
+        const float scale =
+            fp4nv_scale_x16384(scales[k0 / n_reads_per_scale]);
+        STEEL_PRAGMA_UNROLL
+        for (short b = 0; b < kSrcBytesPerChunk / 4; b++) {
+          fp4nv_decode8<T>(
+              fp4nv_pack4(src + k0 + b * 4), scale, &out.v[b * 8]);
+        }
+        const uint2 out_lo =
+            as_type<uint2>(vec<T, 4>(out.v[0], out.v[1], out.v[2], out.v[3]));
+        const uint2 out_hi =
+            as_type<uint2>(vec<T, 4>(out.v[4], out.v[5], out.v[6], out.v[7]));
+        *((threadgroup uint4*)(dst + e0)) = uint4(out_lo, out_hi);
+      }
+      return;
+    }
+
     uint8_t sb[kSrcBytes];
     // if constexpr: on instantiations where a single 16B load cannot cover
     // this thread's source run the wide-load branch is not just unreachable,
@@ -1643,7 +1668,7 @@ template <
 
       for (int k = 0; k < K_it; ++k) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_w.load_unsafe();
+        loader_w.template load_unsafe_wide<true, false>();
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg_active) {
