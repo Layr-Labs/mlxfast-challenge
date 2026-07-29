@@ -253,6 +253,8 @@ let lagunaFusedRoutedSharedSwiGLUQMVEnabled =
 /// family. Set `DARKBLOOM_FUSED_GATED_OUTPUT=0` to ablate.
 let lagunaFusedGatedOutputProjectionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATED_OUTPUT"] != "0"
+let lagunaPackedOutputProjectionEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_OUTPUT_PROJECTION"] != "0"
 
 /// Issues Q, K and V as one dispatch over the three stock weights (see
 /// `lagunaFusedQKVProjectionSource`). Unlike `DARKBLOOM_FUSED_QKV` this keeps
@@ -1909,6 +1911,233 @@ func lagunaFusedNormQKVProjection(
     return (outputs[0], outputs[1], outputs[2], outputs[3])
 }
 
+/// Lossless 14-bit storage for the BF16 output-projection weights used only
+/// by serial decode. The checkpoint's attention weights use exponent fields
+/// 87...128; base 65 therefore leaves every exponent in one six-bit delta.
+/// `low` stores sign + seven fraction bits and `exponent` packs four deltas
+/// into three bytes. The original BF16 matrix remains resident for prefill.
+struct LagunaPackedBF16OutputWeight {
+    let low: MLXArray
+    let exponent: MLXArray
+}
+
+private let lagunaPackBF16OutputKernel = MLXFast.metalKernel(
+    name: "laguna_pack_bf16_output_q6_v1",
+    inputNames: ["weight"],
+    outputNames: ["low", "exponent", "valid"],
+    source: """
+        uint group = thread_position_in_grid.x;
+        uint index = group * 4u;
+        vec<bfloat, 4> values =
+            *((const device vec<bfloat, 4>*)(weight + index));
+        ushort4 bits = as_type<ushort4>(values);
+        uint packed = 0u;
+        bool group_valid = true;
+        for (uint i = 0; i < 4u; ++i) {
+            uint e = uint((bits[i] >> 7u) & 0xffu);
+            group_valid = group_valid && e >= 65u && e <= 128u;
+            low[index + i] = uint8_t(
+                (bits[i] & 0x7fu) | ((bits[i] >> 8u) & 0x80u));
+            packed |= (e - 65u) << (6u * i);
+        }
+        uint out = group * 3u;
+        exponent[out] = uint8_t(packed);
+        exponent[out + 1u] = uint8_t(packed >> 8u);
+        exponent[out + 2u] = uint8_t(packed >> 16u);
+        valid[group] = uint8_t(group_valid);
+        // Every production matrix contains a multiple of 1024 groups. The
+        // extra byte makes the final alignment-1 packed_uchar4 read legal;
+        // its high byte is masked away by the six-bit extraction below.
+        if (group == 0u) {
+            exponent[threadgroups_per_grid.x * threads_per_threadgroup.x * 3u] = 0u;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private let lagunaUnpackBF16OutputKernel = MLXFast.metalKernel(
+    name: "laguna_unpack_bf16_output_q6_v1",
+    inputNames: ["low", "exponent"],
+    outputNames: ["weight"],
+    source: """
+        uint group = thread_position_in_grid.x;
+        uint index = group * 4u;
+        uchar4 lo = uchar4(*(const device packed_uchar4*)(low + index));
+        uint packed = as_type<uint>(uchar4(
+            *(const device packed_uchar4*)(exponent + group * 3u)));
+        ushort4 delta = ushort4(
+            packed & 0x3fu,
+            (packed >> 6u) & 0x3fu,
+            (packed >> 12u) & 0x3fu,
+            (packed >> 18u) & 0x3fu);
+        ushort4 lo16 = ushort4(lo);
+        ushort4 bits =
+            (lo16 & ushort(0x7f)) |
+            ((delta + ushort(65)) << ushort(7)) |
+            ((lo16 & ushort(0x80)) << ushort(8));
+        *((device vec<bfloat, 4>*)(weight + index)) =
+            as_type<vec<bfloat, 4>>(bits);
+        """,
+    ensureRowContiguous: true
+)
+
+func lagunaPackBF16OutputWeight(_ weight: MLXArray) -> LagunaPackedBF16OutputWeight {
+    precondition(weight.dtype == .bfloat16)
+    precondition(weight.ndim == 2 && weight.dim(0) == LagunaConstants.hiddenSize)
+    precondition(weight.dim(1) % 4 == 0 && weight.size % 1024 == 0)
+    let groups = weight.size / 4
+    let output = lagunaPackBF16OutputKernel(
+        [weight],
+        grid: (groups, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[weight.size], [groups * 3 + 1], [groups]],
+        outputDTypes: [.uint8, .uint8, .uint8]
+    )
+    let packed = LagunaPackedBF16OutputWeight(low: output[0], exponent: output[1])
+
+    // Validate the exact runtime-loaded tensor rather than relying on an
+    // offline scan. The full round trip is untimed initialization work and
+    // proves every reconstructed BF16 bit before the packed path is enabled.
+    let reconstructed = lagunaUnpackBF16OutputKernel(
+        [packed.low, packed.exponent],
+        grid: (groups, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [weight.shape],
+        outputDTypes: [.bfloat16]
+    )[0]
+    let inRange = output[2].all()
+    let exact = equal(
+        reconstructed.view(dtype: .uint16),
+        weight.view(dtype: .uint16)
+    ).all()
+    eval(packed.low, packed.exponent, inRange, exact)
+    precondition(inRange.item(Bool.self), "attention output weight exponent outside 65...128")
+    precondition(exact.item(Bool.self), "lossless attention output weight packing mismatch")
+    return packed
+}
+
+private func lagunaPackedOutputProjectionSource(heads: Int) -> String {
+    """
+        constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
+        constexpr uint heads = \(heads);
+        constexpr uint rows_per_thread = 4;
+        constexpr uint values_per_thread = 4;
+        constexpr uint block_width = 128;
+        constexpr uint blocks = in_vec_size / block_width;
+        constexpr uint rows_per_group = 16;
+        constexpr uint unroll = 2;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint out_row = tile * rows_per_group + simd_group * rows_per_thread;
+        thread float result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread float coefficients[values_per_thread];
+
+        uint column = lane * values_per_thread;
+        for (uint block = 0; block < blocks; block += unroll) {
+            vec<bfloat, 4> gated_values[unroll];
+            vec<bfloat, 4> weight_values[unroll][rows_per_thread];
+            for (uint u = 0; u < unroll; ++u) {
+                uint column_u = column + u * block_width;
+                const device vec<bfloat, 4>* gated =
+                    (const device vec<bfloat, 4>*)(attention_output + column_u);
+                gated_values[u] = gated[0];
+                for (uint row = 0; row < rows_per_thread; ++row) {
+                    size_t index =
+                        size_t(out_row + row) * in_vec_size + column_u;
+                    uchar4 lo = uchar4(
+                        *(const device packed_uchar4*)(weight_low + index));
+                    size_t packed_index = (index >> 2) * 3;
+                    uint packed = as_type<uint>(uchar4(
+                        *(const device packed_uchar4*)(
+                            weight_exponent + packed_index)));
+                    ushort4 delta = ushort4(
+                        packed & 0x3fu,
+                        (packed >> 6u) & 0x3fu,
+                        (packed >> 12u) & 0x3fu,
+                        (packed >> 18u) & 0x3fu);
+                    ushort4 lo16 = ushort4(lo);
+                    ushort4 bits =
+                        (lo16 & ushort(0x7f)) |
+                        ((delta + ushort(65)) << ushort(7)) |
+                        ((lo16 & ushort(0x80)) << ushort(8));
+                    weight_values[u][row] =
+                        as_type<vec<bfloat, 4>>(bits);
+                }
+            }
+
+            for (uint u = 0; u < unroll; ++u) {
+                float gate = float(gate_values[block + u]);
+                for (uint i = 0; i < values_per_thread; ++i) {
+                    coefficients[i] =
+                        float(bfloat(float(gated_values[u][i]) * gate));
+                }
+                for (uint row = 0; row < rows_per_thread; ++row) {
+                    for (uint i = 0; i < values_per_thread; ++i) {
+                        result[row] +=
+                            float(weight_values[u][row][i]) * coefficients[i];
+                    }
+                }
+            }
+            column += unroll * block_width;
+        }
+
+        for (uint row = 0; row < rows_per_thread; ++row) {
+            for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                result[row] += metal::simd_shuffle_down(result[row], delta);
+            }
+        }
+        if (lane == 0) {
+            for (uint row = 0; row < rows_per_thread; ++row) {
+                projected[out_row + row] = bfloat(result[row]);
+            }
+        }
+        """
+}
+
+private let lagunaPackedOutputProjectionKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_packed_gated_output_bf16_h\(heads)_u2_v1",
+            inputNames: [
+                "attention_output", "gate_values", "weight_low", "weight_exponent",
+            ],
+            outputNames: ["projected"],
+            source: lagunaPackedOutputProjectionSource(heads: heads),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+func lagunaPackedGatedOutputProjection(
+    attentionOutput: MLXArray,
+    gateValues: MLXArray,
+    weight: LagunaPackedBF16OutputWeight,
+    heads: Int
+) -> MLXArray? {
+    guard let kernel = lagunaPackedOutputProjectionKernels[heads] else { return nil }
+    let inVec = heads * LagunaConstants.headDim
+    precondition(attentionOutput.dtype == .bfloat16)
+    precondition(attentionOutput.shape == [1, 1, inVec])
+    precondition(gateValues.dtype == .bfloat16)
+    precondition(gateValues.shape == [1, 1, heads])
+    precondition(weight.low.dtype == .uint8 && weight.low.size == LagunaConstants.hiddenSize * inVec)
+    precondition(weight.exponent.dtype == .uint8)
+    precondition(weight.exponent.size == weight.low.size / 4 * 3 + 1)
+
+    lagunaTrace("packed gated output projection h\(heads)")
+    return kernel(
+        [attentionOutput, gateValues, weight.low, weight.exponent],
+        grid: ((LagunaConstants.hiddenSize / 16) * 128, 1, 1),
+        threadGroup: (128, 1, 1),
+        outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 /// Decode-only fusion of the per-head attention gate with the output
 /// projection. The stock decode path is two dispatches: one compiled
 /// elementwise kernel that softplus-gates the attention output, and one GEMV
@@ -2273,6 +2502,7 @@ final class LagunaRuntimeAttention: Module {
     /// checkpoint parameter; the q/k/v `Linear` modules keep the original
     /// arrays for parameter integrity.
     var _fusedQKVWeight: MLXArray?
+    var _packedOutputWeight: LagunaPackedBF16OutputWeight?
 
     /// Derived native group-32 affine layout for one serial decode token's
     /// Q/K/V batch. The original BF16 parameters remain authoritative and
@@ -2331,6 +2561,21 @@ final class LagunaRuntimeAttention: Module {
         let fused = concatenated([wq.weight, wk.weight, wv.weight], axis: 0)
         _fusedQKVWeight = fused
         return fused
+    }
+
+    func preparePackedOutputWeight() -> LagunaPackedBF16OutputWeight? {
+        guard _packedOutputWeight == nil,
+            nHeads == LagunaConstants.slidingAttentionHeads,
+            type(of: wo) == Linear.self,
+            wo.bias == nil,
+            wo.weight.dtype == .bfloat16,
+            wo.weight.shape == [LagunaConstants.hiddenSize, nHeads * headDim]
+        else {
+            return nil
+        }
+        let packed = lagunaPackBF16OutputWeight(wo.weight)
+        _packedOutputWeight = packed
+        return packed
     }
 
     init(_ config: LagunaConfig, layerIdx: Int) {
@@ -2654,13 +2899,22 @@ final class LagunaRuntimeAttention: Module {
                 projectedGate.shape == [1, 1, nHeads],
                 wo.weight.shape == [LagunaConstants.hiddenSize, nHeads * headDim]
             {
-                let projection = lagunaGatedOutputProjection(
+                if lagunaPackedOutputProjectionEnabled,
+                    let packedWeight = _packedOutputWeight,
+                    let projection = lagunaPackedGatedOutputProjection(
+                        attentionOutput: output,
+                        gateValues: projectedGate,
+                        weight: packedWeight,
+                        heads: nHeads)
+                {
+                    return projection
+                }
+                if let projection = lagunaGatedOutputProjection(
                     attentionOutput: output,
                     gateValues: projectedGate,
                     weight: wo.weight,
-                    heads: nHeads
-                )
-                if let projection {
+                    heads: nHeads)
+                {
                     return projection
                 }
             }
@@ -6527,6 +6781,12 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
             if lagunaUseNativeAffineQKV(layer: layer.selfAttn.layerIdx) {
                 fusedArrays.append(
                     contentsOf: layer.selfAttn.prepareNativeAffineQKVWeight())
+            }
+            if lagunaPackedOutputProjectionEnabled,
+                let packed = layer.selfAttn.preparePackedOutputWeight()
+            {
+                fusedArrays.append(packed.low)
+                fusedArrays.append(packed.exponent)
             }
             if lagunaFusedQKVEnabled, let fused = layer.selfAttn.prepareFusedQKVWeight() {
                 fusedArrays.append(fused)
