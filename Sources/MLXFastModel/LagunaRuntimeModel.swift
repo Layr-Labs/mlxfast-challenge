@@ -309,6 +309,17 @@ private func lagunaUseNativeAffineOProj(layer: Int) -> Bool {
     layer < lagunaNativeAffineOProjLayerCount
 }
 
+/// Folds the already-activated per-head attention gate into the native
+/// group-32 affine INT8 output projection. This removes the standalone BF16
+/// broadcast multiply and its gated activation intermediate while retaining
+/// the same single BF16 rounding boundary before the affine contraction.
+///
+/// Set `DARKBLOOM_FUSED_NATIVE_AFFINE_GATED_OPROJ=0` to restore the separate
+/// donated multiply followed by MLX's `affine_qmv_fast` kernel.
+let lagunaFusedNativeAffineGatedOProjEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_FUSED_NATIVE_AFFINE_GATED_OPROJ"] != "0"
+
 /// Sliding-layer per-head RMSNorm + plain RoPE fusion (see
 /// `lagunaSlidingQKNormRoPEKernel`).
 ///
@@ -2226,6 +2237,157 @@ func lagunaGatedOutputProjection(
     )[0]
 }
 
+/// Native group-32 affine INT8 counterpart of
+/// `lagunaGatedOutputProjection`. The tiling and arithmetic mirror MLX's
+/// `affine_qmv_fast<bfloat, 32, 8>` specialization exactly:
+///
+/// - one 64-thread group owns eight output rows (two SIMD groups x four rows);
+/// - every lane loads eight consecutive activations per 256-column block;
+/// - each lane forms `sum` and the eight-term integer dot in ascending index
+///   order, then applies `scale * accum + sum * bias`;
+/// - each row keeps one FP32 accumulator across blocks and finishes with the
+///   built-in `simd_sum` before a single BF16 output round.
+///
+/// The only added operation is the gate at the vector load. It deliberately
+/// spells `float(bfloat(float(x) * float(gate)))`, preserving the exact
+/// activation-side BF16 boundary of the separate MLX multiply that this
+/// kernel replaces.
+private func lagunaNativeAffineGatedOutputProjectionSource(heads: Int) -> String {
+    """
+        constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
+        constexpr uint out_vec_size = \(LagunaConstants.hiddenSize);
+        constexpr uint head_dim = \(LagunaConstants.headDim);
+        constexpr uint values_per_thread = 8;
+        constexpr uint block_size = values_per_thread * 32;
+        constexpr uint results_per_simdgroup = 4;
+        constexpr uint owned_simdgroups = 2;
+        constexpr uint rows_per_threadgroup =
+            results_per_simdgroup * owned_simdgroups;
+        constexpr uint groups_per_row = in_vec_size / 32;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint out_row =
+            tile * rows_per_threadgroup
+            + simd_group * results_per_simdgroup;
+
+        const device uint8_t* weight_bytes =
+            (const device uint8_t*)packed_codes
+            + size_t(out_row) * in_vec_size
+            + lane * values_per_thread;
+        const device bfloat* scale_values =
+            scales
+            + size_t(out_row) * groups_per_row
+            + lane / 4;
+        const device bfloat* bias_values =
+            biases
+            + size_t(out_row) * groups_per_row
+            + lane / 4;
+
+        thread float input_values[values_per_thread];
+        thread float result[results_per_simdgroup] = {
+            0.0f, 0.0f, 0.0f, 0.0f
+        };
+
+        uint column = lane * values_per_thread;
+        for (uint block = 0; block < in_vec_size; block += block_size) {
+            float gate = float(gate_values[column / head_dim]);
+            float sum = 0.0f;
+            for (uint i = 0; i < values_per_thread; ++i) {
+                float value = float(
+                    bfloat(float(attention_output[column + i]) * gate));
+                sum += value;
+                input_values[i] = value;
+            }
+
+            for (uint row = 0; row < results_per_simdgroup; ++row) {
+                const device uint8_t* row_weights =
+                    weight_bytes + size_t(row) * in_vec_size;
+                float scale =
+                    float(scale_values[size_t(row) * groups_per_row]);
+                float bias =
+                    float(bias_values[size_t(row) * groups_per_row]);
+                float accum = 0.0f;
+                for (uint i = 0; i < values_per_thread; ++i) {
+                    accum += input_values[i] * row_weights[i];
+                }
+                result[row] += scale * accum + sum * bias;
+            }
+
+            weight_bytes += block_size;
+            scale_values += block_size / 32;
+            bias_values += block_size / 32;
+            column += block_size;
+        }
+
+        for (uint row = 0; row < results_per_simdgroup; ++row) {
+            result[row] = simd_sum(result[row]);
+            if (lane == 0) {
+                projected[out_row + row] = bfloat(result[row]);
+            }
+        }
+        """
+}
+
+private let lagunaNativeAffineGatedOutputProjectionKernels:
+    [Int: MLXFast.MLXFastKernel] = Dictionary(
+        uniqueKeysWithValues: [
+            LagunaConstants.slidingAttentionHeads,
+            LagunaConstants.fullAttentionHeads,
+        ].map { heads in
+            (
+                heads,
+                MLXFast.metalKernel(
+                    name: "laguna_native_affine_gated_oproj_bf16_h\(heads)_v1",
+                    inputNames: [
+                        "attention_output", "gate_values", "packed_codes",
+                        "scales", "biases",
+                    ],
+                    outputNames: ["projected"],
+                    source: lagunaNativeAffineGatedOutputProjectionSource(heads: heads),
+                    ensureRowContiguous: true
+                )
+            )
+        })
+
+func lagunaNativeAffineGatedOutputProjection(
+    attentionOutput: MLXArray,
+    gateValues: MLXArray,
+    weight: LagunaNativeAffineWeight,
+    heads: Int
+) -> MLXArray? {
+    guard lagunaFusedNativeAffineGatedOProjEnabled,
+        let kernel = lagunaNativeAffineGatedOutputProjectionKernels[heads]
+    else { return nil }
+
+    let hidden = LagunaConstants.hiddenSize
+    let inVec = heads * LagunaConstants.headDim
+    precondition(attentionOutput.dtype == .bfloat16)
+    precondition(attentionOutput.shape == [1, 1, inVec])
+    precondition(gateValues.dtype == .bfloat16)
+    precondition(gateValues.shape == [1, 1, heads])
+    precondition(weight.originalShape == [hidden, inVec])
+    precondition(weight.packedCodes.dtype == .uint32)
+    precondition(weight.packedCodes.shape == [hidden, inVec / 4])
+    precondition(weight.scales.dtype == .bfloat16)
+    precondition(weight.scales.shape == [hidden, inVec / 32])
+    precondition(weight.biases.dtype == .bfloat16)
+    precondition(weight.biases.shape == weight.scales.shape)
+
+    lagunaTrace("fused native affine gated output projection h\(heads)")
+    return kernel(
+        [
+            attentionOutput, gateValues, weight.packedCodes,
+            weight.scales, weight.biases,
+        ],
+        grid: ((hidden / 8) * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, hidden]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 /// Keep the stock shapeless unary gate for prefill. Ranked measurement showed
 /// the larger gate/product graph regressing the complete prefill schedule even
 /// though its isolated steady-state subpath was slightly faster.
@@ -2693,12 +2855,11 @@ final class LagunaRuntimeAttention: Module {
                 gateIsActivated = false
             }
             // Native group-32 affine INT8 output projection for the serial
-            // decode token. The stock fused kernel folds the gate into the
-            // GEMV's own vector loads; this path cannot, because MLX's
-            // `quantizedMM` owns the contraction. It therefore reproduces that
-            // kernel's element-wise ordering explicitly: the per-head gate
-            // multiplies the attention output *first*, through the same single
-            // BF16 rounding boundary the kernel spells as
+            // decode token. Its fused affine kernel folds the gate into the
+            // GEMV's own vector loads while preserving the element-wise
+            // ordering explicitly: the per-head gate multiplies the attention
+            // output *first*, through the same single BF16 rounding boundary
+            // the stock fused BF16 projection spells as
             // `float(bfloat(float(values[i]) * gate))` (an MLX BF16 binary
             // product rounds once, identically), and only then does the
             // contraction run. Gate-then-project is what every stock decode
@@ -2708,11 +2869,9 @@ final class LagunaRuntimeAttention: Module {
             // element before the K loop — so the only perturbation this branch
             // introduces is the weight quantization itself.
             //
-            // The broadcast multiply stays an MLX binary op deliberately: its
-            // input is row-contiguous and refcount-1, so MLX donates the
-            // attention output buffer and runs the product in place, whereas a
-            // custom kernel would have to allocate and first-touch a fresh
-            // 8192-wide output.
+            // The ablation fallback keeps the old donated MLX binary product
+            // before `quantizedMM`, so this change is isolated to one removed
+            // dispatch/intermediate rather than a different quantization path.
             if lagunaUseNativeAffineOProj(layer: layerIdx),
                 let affineWO = _nativeAffineOProj,
                 gatePerHead, B == 1, L == 1, wo.bias == nil,
@@ -2725,6 +2884,14 @@ final class LagunaRuntimeAttention: Module {
                     gateIsActivated
                     ? projectedGate
                     : lagunaCompiledSoftplusGate(projectedGate)
+                if let fused = lagunaNativeAffineGatedOutputProjection(
+                    attentionOutput: output,
+                    gateValues: gate,
+                    weight: affineWO,
+                    heads: nHeads
+                ) {
+                    return fused
+                }
                 let gated =
                     (output.reshaped(B, L, nHeads, headDim)
                         * gate[.ellipsis, .newAxis])
