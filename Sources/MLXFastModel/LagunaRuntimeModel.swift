@@ -2799,14 +2799,47 @@ final class LagunaRuntimeAttention: Module {
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
-        let attended = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
-        )
+        let attended: MLXArray
+        if !isSliding,
+            B == 1,
+            L == 1,
+            let cache,
+            cache is KVCacheSimple || cache is CompilableKVCache
+        {
+            // CMOA owns the update on its full-attention decode path so the
+            // custom kernel can consume the resulting full KV view and the
+            // post-update valid length. If its geometry/length guards decline,
+            // use stock dense SDPA over the already-updated cache rather than
+            // updating twice.
+            let (cachedKeys, cachedValues) = cache.update(
+                keys: keys, values: values)
+            let validLength =
+                (cache as? CompilableKVCache)?.offsetArray
+                ?? MLXArray([Int32(cachedKeys.dim(2))])
+            attended =
+                lagunaCertifiedMiddleOutDecodeAttention(
+                    queries: queries,
+                    keys: cachedKeys,
+                    values: cachedValues,
+                    validLength: validLength
+                )
+                ?? MLXFast.scaledDotProductAttention(
+                    queries: queries,
+                    keys: cachedKeys,
+                    values: cachedValues,
+                    scale: scale,
+                    mask: mask
+                )
+        } else {
+            attended = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
+        }
         // SDPA returns `[B, H, L, D]`. When `L == 1`, flattening its
         // contiguous head-major payload directly produces the exact
         // `[B, 1, H*D]` byte order; the transpose only changes singleton-axis
