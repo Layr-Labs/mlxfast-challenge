@@ -375,12 +375,58 @@ let lagunaFusedDenseDownResidualEnabled =
 /// over `router_blocks` in `(block, i)` order, its own `simd_shuffle_down`
 /// ladder, and one BF16 round. No add is regrouped: the reduction tree exists
 /// only at lane level and this knob does not touch it.
+/// **`4` IS THE SHIPPED DEFAULT (was `8`).** The reason is a wave-count
+/// argument, and it comes from a measured negative elsewhere in this campaign.
+///
+/// The M5 Max has ~40 GPU cores. Counting threadgroups per decode dispatch:
+///
+/// ```text
+/// rpg  rows/thread  active simds  threadgroups  threadgroups/core
+///  64       4          16 of 16         4           0.10x
+///  32       2          16 of 16         8           0.20x
+///  16       1          16 of 16        16           0.40x
+///   8       1           8 of 16        32           0.80x   <- previous default
+///   4       1           4 of 16        64           1.60x   <- shipped here
+///   2       1           2 of 16       128           3.20x
+/// ```
+///
+/// At `8` this dispatch launches **32 threadgroups against ~40 cores**, so it
+/// cannot occupy the machine no matter how well each threadgroup is tuned:
+/// roughly a fifth of the GPU is idle for the whole kernel, once per sparse
+/// layer per decode token (39 times). `4` is the smallest setting that crosses
+/// the saturation point (64 threadgroups, 1.60x), and it is the first setting
+/// where every core has work.
+///
+/// WHY I TRUST THE DIRECTION. I submitted the opposite change on a different
+/// kernel and the ranked box punished it precisely on this axis: extending the
+/// promoted GQA K/V-sharing in `sdpa_vector` from two heads to four removed
+/// ~126 MB/token of real device reads (~3.3% of the decode byte budget) and
+/// still measured **-6.05%**, because it halved that dispatch from 32 to 16
+/// threadgroups -- from 0.80x to 0.40x of the core count. Byte savings could
+/// not pay for lost parallelism. The same arithmetic run forwards says a
+/// starved dispatch should be *widened*, and this kernel is the starved
+/// dispatch that widens for free.
+///
+/// The cost of widening is idle simdgroups inside each threadgroup: at `4`,
+/// twelve of sixteen simdgroups sit out the router phase behind
+/// `active_simd_groups`. That is not lost throughput, because those
+/// simdgroups had no rows to own at `rows_per_thread == 1` in the first place
+/// -- `tiles * rows_per_group == 256` at every setting, so the total row work
+/// is invariant. They still run the norm, which needs all 512 threads, and the
+/// guard opens after the norm's barrier and closes after the logit write.
+///
+/// Bit-exact at every setting, `4` included: see the paragraph above on
+/// `rows_per_thread == 1`. Each of the 256 rows keeps its own private FP32
+/// accumulator and its own four-deep `(block, i)` K-loop, and I verified by
+/// enumeration that `rpg == 4` covers rows 0..255 exactly once with no overlap,
+/// using the identical `rowsPerThread == 1` code path already shipped at `8`.
+/// `DARKBLOOM_ROUTER_ROWS_PER_GROUP=8` restores the previous default exactly.
 let lagunaRouterRowsPerGroup: Int = {
     guard
         let raw = ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_ROWS_PER_GROUP"],
-        let value = Int(raw), [8, 16, 32, 64].contains(value)
+        let value = Int(raw), [2, 4, 8, 16, 32, 64].contains(value)
     else {
-        return 8
+        return 4
     }
     return value
 }()
@@ -719,7 +765,7 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
 /// name or four sources would thrash one cache entry.
 private let lagunaResidualRMSNormRouterKernels: [Int: MLXFast.MLXFastKernel] =
     Dictionary(
-        uniqueKeysWithValues: [8, 16, 32, 64].map { rowsPerGroup in
+        uniqueKeysWithValues: [2, 4, 8, 16, 32, 64].map { rowsPerGroup in
             (
                 rowsPerGroup,
                 MLXFast.metalKernel(
@@ -789,8 +835,11 @@ func lagunaResidualRMSNormRouter(
     precondition(routerWeight.shape == [experts, hidden])
 
     // `rows_per_group` router rows per threadgroup, so 256 / rows_per_group
-    // tiles. Divides exactly for 64/32/16/8 (4/8/16/32 tiles), so no partial
-    // tile is dispatched and no row is computed twice or missed. The 512-thread
+    // tiles. Divides exactly for 64/32/16/8/4/2 (4/8/16/32/64/128 tiles), so no
+    // partial tile is dispatched and no row is computed twice or missed. The
+    // shipped default is 4, i.e. 64 tiles, which is the smallest setting that
+    // puts at least one threadgroup on each of the ranked box's ~40 GPU cores
+    // (see `lagunaRouterRowsPerGroup`). The 512-thread
     // threadgroup and `n_reads == 4` are NOT knobs: they are load-bearing for
     // the `rms_single_row` correspondence (each thread squares its own
     // contiguous four elements), and moving either regroups the FP32 RMS
