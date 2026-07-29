@@ -121,23 +121,16 @@ private let lagunaLmHeadPruneHeader = """
 /// Fused MXFP8 coarse GEMV + certified bound + BF16 pre-fill.
 /// One simdgroup per row; lane covers 64 consecutive elements (2 groups).
 ///
-/// v2 (H3 audit, R1): same grid, same lane->element mapping, same FP
-/// accumulation text and j-order -- only the per-element decode plumbing is
-/// vectorized. Word-parallel e4m3 decode (laguna_e4m3_decode4, bit-identical
-/// construction), vectorized hs8 (max-form, identical floats), x loaded as
-/// ushort4 and converted bf16->f32 by the exact bits<<16 construction, and
-/// both loops fully unrolled with static trip counts so the packed words and
-/// vector components resolve to static indices. Coarse, delta, and coarse_bf
-/// outputs are bit-identical to v1 for every input, so the notes/68
-/// certificate is untouched.
-private let lagunaLmHeadCoarseKernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_mxfp8_coarse_v2",
-    inputNames: ["x", "codes", "scales"],
-    outputNames: ["coarse", "delta", "coarse_bf"],
-    source: """
+/// v4 preserves the v2 arithmetic and row ownership while packing 28
+/// independent SIMD rows into each 896-thread threadgroup. The vocabulary
+/// size is exactly divisible by 28, so this removes threadgroups without a
+/// tail branch. The lane mapping, FP accumulation text, reduction order,
+/// vectorized decode, and every output bit remain unchanged.
+private func lagunaLmHeadCoarseKernelSource(rowsPerThreadgroup: Int) -> String {
+    """
         constexpr float GAMMA = 0x1p-15f;
 
-        uint row = threadgroup_position_in_grid.x * 8 +
+        uint row = threadgroup_position_in_grid.x * \(rowsPerThreadgroup) +
             simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
 
@@ -192,13 +185,29 @@ private let lagunaLmHeadCoarseKernel = MLXFast.metalKernel(
             delta[row] = d_acc * (1.0f + GAMMA) + (2.0f * GAMMA) * m_acc;
             coarse_bf[row] = bfloat(c_acc);
         }
-        """,
+        """
+}
+
+private let lagunaLmHeadCoarseKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_mxfp8_coarse_pack28_v4",
+    inputNames: ["x", "codes", "scales"],
+    outputNames: ["coarse", "delta", "coarse_bf"],
+    source: lagunaLmHeadCoarseKernelSource(rowsPerThreadgroup: 28),
+    header: lagunaLmHeadPruneHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaLmHeadCoarseKernelPack16 = MLXFast.metalKernel(
+    name: "laguna_lmhead_mxfp8_coarse_pack16_v3",
+    inputNames: ["x", "codes", "scales"],
+    outputNames: ["coarse", "delta", "coarse_bf"],
+    source: lagunaLmHeadCoarseKernelSource(rowsPerThreadgroup: 16),
     header: lagunaLmHeadPruneHeader,
     ensureRowContiguous: true
 )
 /// v1 coarse kernel, kept verbatim for same-binary A/B (the paired
 /// measurement protocol requires both arms in one binary). Selected by
-/// `DARKBLOOM_LMHEAD_COARSE=v1`; the shipped default is v2 above. The two
+/// `DARKBLOOM_LMHEAD_COARSE=v1`; the shipped default is pack28 above. The two
 /// kernels are bit-identical in all three outputs for every input.
 private let lagunaLmHeadCoarseKernelV1 = MLXFast.metalKernel(
     name: "laguna_lmhead_mxfp8_coarse_v1",
@@ -256,6 +265,9 @@ private let lagunaLmHeadCoarseKernelV1 = MLXFast.metalKernel(
 /// Same-binary A/B selector for the coarse kernel (v2 default).
 private let lagunaLmHeadCoarseUseV1 =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COARSE"] == "v1"
+
+private let lagunaLmHeadCoarseUsePack16 =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COARSE"] == "pack16"
 
 /// `lower.max()` uses MLX's two-pass `all_reduce_max` for this 100352-element
 /// row. The first pass partitions it into 128 contiguous 784-element rows,
@@ -365,6 +377,130 @@ private let lagunaLmHeadLowerMaxThresholdKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Default-off fusion probe for one complete 784-row lower-max partition.
+/// Twenty-eight SIMD groups preserve the accepted coarse row arithmetic while
+/// each group processes twenty-eight rows in ascending batches. The input row
+/// is staged once, and lane zero stores each row's separately rounded lower
+/// bound in threadgroup memory. The final 224-thread reduction is the exact
+/// stage-one tree above, so the only numerical change under test is none: the
+/// compiler emits the same FP32 delta fmuladd followed by the same fsub/fadd.
+private let lagunaLmHeadCoarseLowerFusedKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_mxfp8_coarse_lower_fused_v1",
+    inputNames: ["x", "codes", "scales"],
+    outputNames: ["upper", "coarse_bf", "partial_max"],
+    source: """
+        constexpr float GAMMA = 0x1p-15f;
+        constexpr uint PARTITION_ROWS = 784;
+        constexpr uint SIMD_GROUPS = 28;
+        constexpr uint ROWS_PER_SIMD = PARTITION_ROWS / SIMD_GROUPS;
+        constexpr uint THREADS = SIMD_GROUPS * 32;
+        constexpr uint REDUCE_THREADS = 224;
+        constexpr uint REDUCE_SIMD_GROUPS = 7;
+
+        uint partition = threadgroup_position_in_grid.x;
+        uint lid = thread_position_in_threadgroup.x;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        threadgroup bfloat staged_x[2048];
+        threadgroup float lower_values[PARTITION_ROWS];
+        threadgroup float shared_vals[32];
+
+        for (uint i = lid; i < 2048; i += THREADS) {
+            staged_x[i] = x[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(disable)
+        for (uint batch = 0; batch < ROWS_PER_SIMD; ++batch) {
+            uint local_row = batch * SIMD_GROUPS + simd_group;
+            uint row = partition * PARTITION_ROWS + local_row;
+            const device uint8_t* crow = codes + size_t(row) * 2048;
+            const device uint8_t* srow = scales + size_t(row) * 64;
+
+            float c_acc = 0.0f;
+            float d_acc = 0.0f;
+            float m_acc = 0.0f;
+            for (uint gg = 0; gg < 2; ++gg) {
+                uint g = 2 * lane + gg;
+                float sd = laguna_e8m0_decode(srow[g]);
+                const device uint4* cptr =
+                    (const device uint4*)(crow + g * 32);
+                uint4 packed0 = cptr[0];
+                uint4 packed1 = cptr[1];
+                float cg = 0.0f;
+                float dg = 0.0f;
+                float mg = 0.0f;
+                const threadgroup ushort4* xrow =
+                    (const threadgroup ushort4*)(staged_x + g * 32);
+                #pragma clang loop unroll(full)
+                for (uint w = 0; w < 8; ++w) {
+                    uint word = (w < 4u) ? packed0[w & 3u] : packed1[w & 3u];
+                    float4 cv4 = laguna_e4m3_decode4(word);
+                    float4 xv4 = as_type<float4>(uint4(xrow[w]) << 16);
+                    float4 ax4 = metal::abs(xv4);
+                    uint4 b4 =
+                        (uint4(word) >> uint4(0u, 8u, 16u, 24u)) & 255u;
+                    uint4 mag4 = b4 & 127u;
+                    uint4 e4 = mag4 >> 3;
+                    float4 hsf = as_type<float4>(
+                        (metal::max(e4, uint4(1u)) + 116u) << 23);
+                    float4 hs4 = metal::select(
+                        hsf, float4(186.0f), mag4 == 126u);
+                    float4 acv4 = metal::abs(cv4);
+                    #pragma clang loop unroll(full)
+                    for (uint k = 0; k < 4; ++k) {
+                        float cv = cv4[k];
+                        float xv = xv4[k];
+                        float ax = ax4[k];
+                        cg += xv * cv;
+                        dg += ax * hs4[k];
+                        mg += ax * acv4[k];
+                    }
+                }
+                c_acc += sd * cg;
+                d_acc += sd * dg;
+                m_acc += sd * mg;
+            }
+            c_acc = simd_sum(c_acc);
+            d_acc = simd_sum(d_acc);
+            m_acc = simd_sum(m_acc);
+            if (lane == 0) {
+                float rounded_delta =
+                    d_acc * (1.0f + GAMMA) + (2.0f * GAMMA) * m_acc;
+                lower_values[local_row] = c_acc - rounded_delta;
+                upper[row] = c_acc + rounded_delta;
+                coarse_bf[row] = bfloat(c_acc);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total = -metal::numeric_limits<float>::infinity();
+        if (lid < REDUCE_THREADS - 28) {
+            uint base = lid * 4;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+                total = laguna_lmhead_max_pair(lower_values[base + i], total);
+            }
+        }
+        total = laguna_lmhead_simd_max(total);
+        if (lane == 0) {
+            shared_vals[simd_group] = total;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        total = lid < REDUCE_SIMD_GROUPS
+            ? shared_vals[lid]
+            : -metal::numeric_limits<float>::infinity();
+        total = laguna_lmhead_simd_max(total);
+        if (lid == 0) {
+            partial_max[partition] = total;
+        }
+        """,
+    header: lagunaLmHeadPruneHeader + lagunaLmHeadLowerMaxHeader,
+    ensureRowContiguous: true
+)
+
 /// GPU candidate marking: one byte per vocabulary row, set when the row's
 /// certified upper bound reaches the threshold. A dense mask rather than a
 /// compacted index list, because the exact pass below owns a FIXED output
@@ -400,13 +536,11 @@ private let lagunaLmHeadSelectKernel = MLXFast.metalKernel(
 /// GEMV's by construction (R1).
 ///
 /// The skipped work is the byte saving: with |C| in the single-to-low-double
-/// digits, all but a handful of the 3136 threadgroups take the coarse branch
-/// and never touch `lm_head`.
-private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_exact_block_v2",
-    inputNames: ["coarse_bf", "lm_head", "x", "is_cand"],
-    outputNames: ["assembled"],
-    source: """
+/// digits, all but a handful of threadgroups take the coarse branch and never
+/// touch `lm_head`. The default packs thirty-two fixed four-row SIMD blocks
+/// into each 1,024-thread threadgroup, quartering the original launch count.
+private func lagunaLmHeadExactKernelSource(rowsPerThreadgroup: Int) -> String {
+    """
         constexpr uint VOCAB = 100352;
         constexpr uint K = 2048;
 
@@ -414,9 +548,7 @@ private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
         uint sgid = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
 
-        // This simdgroup's fixed four output rows. VOCAB is 3136 * 32, so the
-        // grid tiles it exactly; the bounds test is belt-and-braces.
-        uint base = tgid * 32 + sgid * 4;
+        uint base = tgid * \(rowsPerThreadgroup) + sgid * 4;
 
         // Simdgroup-uniform: every lane reads the same four mask bytes.
         bool any_candidate = false;
@@ -480,9 +612,232 @@ private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
                 }
             }
         }
+        """
+}
+
+private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_block_pack32_v4",
+    inputNames: ["coarse_bf", "lm_head", "x", "is_cand"],
+    outputNames: ["assembled"],
+    source: lagunaLmHeadExactKernelSource(rowsPerThreadgroup: 128),
+    ensureRowContiguous: true
+)
+
+private func lagunaLmHeadExactMaskBroadcastSource() -> String {
+    let source = lagunaLmHeadExactKernelSource(rowsPerThreadgroup: 128)
+    let candidate = source.replacingOccurrences(
+        of: "// Simdgroup-uniform: every lane reads the same four mask bytes.\n"
+            + "bool any_candidate = false;\n#pragma unroll\n"
+            + "for (uint tm = 0; tm < 4; ++tm) {\n"
+            + "    uint r = base + tm;\n"
+            + "    any_candidate = any_candidate || (r < VOCAB && is_cand[r] != 0);\n}",
+        with: "// base is four-byte aligned and every fixed block is in bounds.\n"
+            + "uint any_candidate = 0;\nif (lane == 0) {\n"
+            + "    any_candidate = *((const device uint*)(is_cand + base));\n}\n"
+            + "any_candidate = simd_broadcast(any_candidate, 0);")
+    precondition(candidate != source)
+    return candidate
+}
+
+private let lagunaLmHeadExactMaskBroadcastKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_block_mask_broadcast_v5",
+    inputNames: ["coarse_bf", "lm_head", "x", "is_cand"],
+    outputNames: ["assembled"],
+    source: lagunaLmHeadExactMaskBroadcastSource(),
+    ensureRowContiguous: true
+)
+
+private let lagunaLmHeadPackedSelectKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_select_packed_v3",
+    inputNames: ["coarse", "delta", "thr"],
+    outputNames: ["packed_cand"],
+    source: """
+        uint i = thread_position_in_grid.x;
+        uint base = i * 4;
+        float4 c = *((const device float4*)(coarse + base));
+        float4 d = *((const device float4*)(delta + base));
+        bool4 selected = c + d >= float4(thr[0]);
+        packed_cand[i] = uint(selected.x)
+            | (uint(selected.y) << 8)
+            | (uint(selected.z) << 16)
+            | (uint(selected.w) << 24);
         """,
     ensureRowContiguous: true
 )
+
+private func lagunaLmHeadExactPackedMaskRepeatedLoadsSource() -> String {
+    let source = lagunaLmHeadExactMaskBroadcastSource()
+    let loadReplaced = source.replacingOccurrences(
+        of: "any_candidate = *((const device uint*)(is_cand + base));",
+        with: "any_candidate = is_cand[base >> 2];")
+    precondition(loadReplaced != source)
+    let candidate = loadReplaced.replacingOccurrences(
+        of: "assembled[r] = (is_cand[r] != 0)\n"
+            + "                ? bfloat(result[tm])\n"
+            + "                : coarse_bf[r];",
+        with: "assembled[r] = ((is_cand[base >> 2] >> (tm * 8)) & 255u) != 0\n"
+            + "                ? bfloat(result[tm])\n"
+            + "                : coarse_bf[r];")
+    precondition(candidate != loadReplaced)
+    return candidate
+}
+
+private let lagunaLmHeadExactPackedMaskRepeatedLoadsKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_block_packed_mask_v6",
+    inputNames: ["coarse_bf", "lm_head", "x", "is_cand"],
+    outputNames: ["assembled"],
+    source: lagunaLmHeadExactPackedMaskRepeatedLoadsSource(),
+    ensureRowContiguous: true
+)
+
+private func lagunaLmHeadExactPackedMaskSource() -> String {
+    let source = lagunaLmHeadExactPackedMaskRepeatedLoadsSource()
+    let candidate = source.replacingOccurrences(
+        of: "((is_cand[base >> 2] >> (tm * 8)) & 255u)",
+        with: "((any_candidate >> (tm * 8)) & 255u)")
+    precondition(candidate != source)
+    return candidate
+}
+
+private let lagunaLmHeadExactPackedMaskWithBoundsKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_block_packed_mask_v7",
+    inputNames: ["coarse_bf", "lm_head", "x", "is_cand"],
+    outputNames: ["assembled"],
+    source: lagunaLmHeadExactPackedMaskSource(),
+    ensureRowContiguous: true
+)
+
+private func lagunaLmHeadExactPackedMaskNoBoundsSource() -> String {
+    let source = lagunaLmHeadExactPackedMaskSource()
+    let fastPath = source.replacingOccurrences(
+        of: "if (lane < 4 && base + lane < VOCAB)",
+        with: "if (lane < 4)")
+    precondition(fastPath != source)
+    let candidate = fastPath.replacingOccurrences(
+        of: "if (r < VOCAB) {",
+        with: "if (true) {")
+    precondition(candidate != fastPath)
+    return candidate
+}
+
+private let lagunaLmHeadExactPackedMaskScalarCopyKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_block_packed_mask_v8",
+    inputNames: ["coarse_bf", "lm_head", "x", "is_cand"],
+    outputNames: ["assembled"],
+    source: lagunaLmHeadExactPackedMaskNoBoundsSource(),
+    ensureRowContiguous: true
+)
+
+private func lagunaLmHeadExactPackedMaskVectorCopySource() -> String {
+    let source = lagunaLmHeadExactPackedMaskNoBoundsSource()
+    let candidate = source.replacingOccurrences(
+        of: "if (lane < 4) {\n"
+            + "        assembled[base + lane] = coarse_bf[base + lane];\n"
+            + "    }",
+        with: "if (lane == 0) {\n"
+            + "        *((device vec<bfloat, 4>*)(assembled + base)) =\n"
+            + "            *((const device vec<bfloat, 4>*)(coarse_bf + base));\n"
+            + "    }")
+    precondition(candidate != source)
+    return candidate
+}
+
+private let lagunaLmHeadExactPackedMaskKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_block_packed_mask_v9",
+    inputNames: ["coarse_bf", "lm_head", "x", "is_cand"],
+    outputNames: ["assembled"],
+    source: lagunaLmHeadExactPackedMaskVectorCopySource(),
+    ensureRowContiguous: true
+)
+
+private func lagunaLmHeadExactFusedSelectSource() -> String {
+    let source = lagunaLmHeadExactPackedMaskVectorCopySource()
+    let candidate = source.replacingOccurrences(
+        of: "any_candidate = is_cand[base >> 2];",
+        with: "float4 c = *((const device float4*)(coarse + base));\n"
+            + "    float4 d = *((const device float4*)(delta + base));\n"
+            + "    bool4 selected = c + d >= float4(thr[0]);\n"
+            + "    any_candidate = uint(selected.x)\n"
+            + "        | (uint(selected.y) << 8)\n"
+            + "        | (uint(selected.z) << 16)\n"
+            + "        | (uint(selected.w) << 24);")
+    precondition(candidate != source)
+    return candidate
+}
+
+private let lagunaLmHeadExactFusedSelectKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_block_fused_select_v1",
+    inputNames: ["coarse_bf", "lm_head", "x", "coarse", "delta", "thr"],
+    outputNames: ["assembled"],
+    source: lagunaLmHeadExactFusedSelectSource(),
+    ensureRowContiguous: true
+)
+
+private func lagunaLmHeadExactUpperBoundSource() -> String {
+    let source = lagunaLmHeadExactPackedMaskVectorCopySource()
+    let candidate = source.replacingOccurrences(
+        of: "any_candidate = is_cand[base >> 2];",
+        with: "float4 u = *((const device float4*)(upper + base));\n"
+            + "    bool4 selected = u >= float4(thr[0]);\n"
+            + "    any_candidate = uint(selected.x)\n"
+            + "        | (uint(selected.y) << 8)\n"
+            + "        | (uint(selected.z) << 16)\n"
+            + "        | (uint(selected.w) << 24);")
+    precondition(candidate != source)
+    return candidate
+}
+
+private let lagunaLmHeadExactUpperBoundKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_block_upper_bound_v1",
+    inputNames: ["coarse_bf", "lm_head", "x", "upper", "thr"],
+    outputNames: ["assembled"],
+    source: lagunaLmHeadExactUpperBoundSource(),
+    ensureRowContiguous: true
+)
+
+private let lagunaLmHeadExactKernelPack16 = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_block_pack16_v3",
+    inputNames: ["coarse_bf", "lm_head", "x", "is_cand"],
+    outputNames: ["assembled"],
+    source: lagunaLmHeadExactKernelSource(rowsPerThreadgroup: 64),
+    ensureRowContiguous: true
+)
+
+private let lagunaLmHeadExactKernelPack8 = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_block_v2",
+    inputNames: ["coarse_bf", "lm_head", "x", "is_cand"],
+    outputNames: ["assembled"],
+    source: lagunaLmHeadExactKernelSource(rowsPerThreadgroup: 32),
+    ensureRowContiguous: true
+)
+
+private let lagunaLmHeadExactUsePack8 =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_EXACT_PACK"] == "8"
+
+private let lagunaLmHeadExactUsePack16 =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_EXACT_PACK"] == "16"
+
+private let lagunaLmHeadExactUseRepeatedMaskLoads =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LMHEAD_EXACT_MASK_BROADCAST"] == "0"
+
+private let lagunaLmHeadPackedMaskEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_PACKED_MASK"] != "0"
+
+private let lagunaLmHeadPackedMaskReuseEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_PACKED_MASK_REUSE"] != "0"
+
+private let lagunaLmHeadPackedMaskNoBoundsEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_PACKED_MASK_NO_BOUNDS"] != "0"
+
+private let lagunaLmHeadPackedMaskVectorCopyEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_PACKED_MASK_VECTOR_COPY"] != "0"
+
+private let lagunaLmHeadExactFusedSelectEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_FUSED_SELECT"] != "0"
+
+private let lagunaLmHeadCoarseLowerFusedEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COARSE_LOWER_FUSED"] != "0"
 
 /// Retained init-time MXFP8 coarse copy of lm_head plus the pruned final-row
 /// forward. Built once (untimed init) by
@@ -520,29 +875,63 @@ final class LagunaLmHeadPruner {
         let vocab = lagunaLmHeadPruneVocab
         let x = hidden.reshaped([lagunaLmHeadPruneHidden])
 
-        let coarseKernel =
-            lagunaLmHeadCoarseUseV1 ? lagunaLmHeadCoarseKernelV1 : lagunaLmHeadCoarseKernel
-        let coarseOut = coarseKernel(
-            [x, codes, scales],
-            grid: (vocab / 8 * 256, 1, 1),
-            threadGroup: (256, 1, 1),
-            outputShapes: [[vocab], [vocab], [vocab]],
-            outputDTypes: [.float32, .float32, .bfloat16]
-        )
-        let coarse = coarseOut[0]
-        let delta = coarseOut[1]
-        let coarseBF = coarseOut[2]
+        let useCoarseV1 = lagunaLmHeadCoarseUseV1
+        let useCoarsePack16 = lagunaLmHeadCoarseUsePack16
+        let useCoarseLowerFused = lagunaLmHeadCoarseLowerFusedEnabled
+            && !useCoarseV1 && !useCoarsePack16
+            && !lagunaLmHeadExactUsePack8 && !lagunaLmHeadExactUsePack16
+            && !lagunaLmHeadExactUseRepeatedMaskLoads
+            && lagunaLmHeadPackedMaskEnabled
+            && lagunaLmHeadPackedMaskReuseEnabled
+            && lagunaLmHeadPackedMaskNoBoundsEnabled
+            && lagunaLmHeadPackedMaskVectorCopyEnabled
+        let coarse: MLXArray?
+        let delta: MLXArray?
+        let upper: MLXArray?
+        let coarseBF: MLXArray
+        let lowerMaxPartials: MLXArray
+        if useCoarseLowerFused {
+            let outputs = lagunaLmHeadCoarseLowerFusedKernel(
+                [x, codes, scales],
+                grid: (128 * 896, 1, 1),
+                threadGroup: (896, 1, 1),
+                outputShapes: [[vocab], [vocab], [128]],
+                outputDTypes: [.float32, .bfloat16, .float32]
+            )
+            upper = outputs[0]
+            coarseBF = outputs[1]
+            lowerMaxPartials = outputs[2]
+            coarse = nil
+            delta = nil
+        } else {
+            let coarseKernel = useCoarseV1 ? lagunaLmHeadCoarseKernelV1
+                : (useCoarsePack16
+                    ? lagunaLmHeadCoarseKernelPack16 : lagunaLmHeadCoarseKernel)
+            let coarseRowsPerThreadgroup = useCoarseV1
+                ? 8 : (useCoarsePack16 ? 16 : 28)
+            let coarseThreadsPerThreadgroup = coarseRowsPerThreadgroup * 32
+            let outputs = coarseKernel(
+                [x, codes, scales],
+                grid: (
+                    vocab / coarseRowsPerThreadgroup * coarseThreadsPerThreadgroup,
+                    1, 1),
+                threadGroup: (coarseThreadsPerThreadgroup, 1, 1),
+                outputShapes: [[vocab], [vocab], [vocab]],
+                outputDTypes: [.float32, .float32, .bfloat16]
+            )
+            coarse = outputs[0]
+            delta = outputs[1]
+            coarseBF = outputs[2]
+            lowerMaxPartials = lagunaLmHeadLowerMaxStage1Kernel(
+                [coarse!, delta!],
+                grid: (224, 128, 1),
+                threadGroup: (224, 1, 1),
+                outputShapes: [[128]],
+                outputDTypes: [.float32]
+            )[0]
+            upper = nil
+        }
 
-        // Threshold on GPU: L = max(coarse - delta); thr = L - |L|/64.
-        // The custom pair fuses the six-dispatch MLX expression into two
-        // dispatches while reproducing MLX's exact two-pass reduction layout.
-        let lowerMaxPartials = lagunaLmHeadLowerMaxStage1Kernel(
-            [coarse, delta],
-            grid: (224, 128, 1),
-            threadGroup: (224, 1, 1),
-            outputShapes: [[128]],
-            outputDTypes: [.float32]
-        )[0]
         let thr = lagunaLmHeadLowerMaxThresholdKernel(
             [lowerMaxPartials],
             grid: (32, 1, 1),
@@ -551,20 +940,67 @@ final class LagunaLmHeadPruner {
             outputDTypes: [.float32]
         )[0]
 
-        let isCandidate = lagunaLmHeadSelectKernel(
-            [coarse, delta, thr],
-            grid: (vocab, 1, 1),
-            threadGroup: (256, 1, 1),
-            outputShapes: [[vocab]],
-            outputDTypes: [.uint8]
-        )[0]
+        let useExactPack8 = lagunaLmHeadExactUsePack8
+        let useExactPack16 = lagunaLmHeadExactUsePack16
+        let usePackedMask = lagunaLmHeadPackedMaskEnabled
+            && !useExactPack8 && !useExactPack16
+            && !lagunaLmHeadExactUseRepeatedMaskLoads
+        let useFusedSelect = usePackedMask
+            && lagunaLmHeadPackedMaskReuseEnabled
+            && lagunaLmHeadPackedMaskNoBoundsEnabled
+            && lagunaLmHeadPackedMaskVectorCopyEnabled
+            && lagunaLmHeadExactFusedSelectEnabled
+        let isCandidate: MLXArray?
+        if useCoarseLowerFused || useFusedSelect {
+            isCandidate = nil
+        } else if usePackedMask {
+            isCandidate = lagunaLmHeadPackedSelectKernel(
+                [coarse!, delta!, thr],
+                grid: (vocab / 4, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[vocab / 4]],
+                outputDTypes: [.uint32]
+            )[0]
+        } else {
+            isCandidate = lagunaLmHeadSelectKernel(
+                [coarse!, delta!, thr],
+                grid: (vocab, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[vocab]],
+                outputDTypes: [.uint8]
+            )[0]
+        }
 
-        // One threadgroup per 32 output rows, covering the vocabulary exactly
-        // once (100352 == 3136 * 32). Every slot has exactly one owning lane.
-        let assembled = lagunaLmHeadExactKernel(
-            [coarseBF, lmHeadWeight, x, isCandidate],
-            grid: (vocab / 32 * 256, 1, 1),
-            threadGroup: (256, 1, 1),
+        let exactKernel = useCoarseLowerFused
+            ? lagunaLmHeadExactUpperBoundKernel
+            : useFusedSelect ? lagunaLmHeadExactFusedSelectKernel
+            : usePackedMask
+            ? (lagunaLmHeadPackedMaskReuseEnabled
+                ? (lagunaLmHeadPackedMaskNoBoundsEnabled
+                    ? (lagunaLmHeadPackedMaskVectorCopyEnabled
+                        ? lagunaLmHeadExactPackedMaskKernel
+                        : lagunaLmHeadExactPackedMaskScalarCopyKernel)
+                    : lagunaLmHeadExactPackedMaskWithBoundsKernel)
+                : lagunaLmHeadExactPackedMaskRepeatedLoadsKernel)
+            : (useExactPack8 ? lagunaLmHeadExactKernelPack8
+                : (useExactPack16 ? lagunaLmHeadExactKernelPack16
+                    : (lagunaLmHeadExactUseRepeatedMaskLoads
+                        ? lagunaLmHeadExactKernel
+                        : lagunaLmHeadExactMaskBroadcastKernel)))
+        let exactSIMDGroupsPerThreadgroup = useExactPack8 ? 8 : (useExactPack16 ? 16 : 32)
+        let exactThreadsPerThreadgroup = exactSIMDGroupsPerThreadgroup * 32
+        let exactRowsPerThreadgroup = exactSIMDGroupsPerThreadgroup * 4
+        let exactInputs = useCoarseLowerFused
+            ? [coarseBF, lmHeadWeight, x, upper!, thr]
+            : useFusedSelect
+                ? [coarseBF, lmHeadWeight, x, coarse!, delta!, thr]
+                : [coarseBF, lmHeadWeight, x, isCandidate!]
+        let assembled = exactKernel(
+            exactInputs,
+            grid: (
+                vocab / exactRowsPerThreadgroup * exactThreadsPerThreadgroup,
+                1, 1),
+            threadGroup: (exactThreadsPerThreadgroup, 1, 1),
             outputShapes: [[vocab]],
             outputDTypes: [.bfloat16]
         )[0]
