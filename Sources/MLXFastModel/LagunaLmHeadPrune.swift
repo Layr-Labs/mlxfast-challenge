@@ -121,23 +121,24 @@ private let lagunaLmHeadPruneHeader = """
 /// Fused MXFP8 coarse GEMV + certified bound + BF16 pre-fill.
 /// One simdgroup per row; lane covers 64 consecutive elements (2 groups).
 ///
-/// v2 (H3 audit, R1): same grid, same lane->element mapping, same FP
-/// accumulation text and j-order -- only the per-element decode plumbing is
-/// vectorized. Word-parallel e4m3 decode (laguna_e4m3_decode4, bit-identical
-/// construction), vectorized hs8 (max-form, identical floats), x loaded as
-/// ushort4 and converted bf16->f32 by the exact bits<<16 construction, and
-/// both loops fully unrolled with static trip counts so the packed words and
-/// vector components resolve to static indices. Coarse, delta, and coarse_bf
-/// outputs are bit-identical to v1 for every input, so the notes/68
-/// certificate is untouched.
+/// v3 (H3 audit, R1): the v2 arithmetic is unchanged, but each 512-thread
+/// threadgroup launches 16 independent SIMD rows instead of eight rows in a
+/// 256-thread threadgroup. Each row still owns exactly one SIMD group with the
+/// same lane->element mapping, FP accumulation text, and reduction order.
+/// Word-parallel e4m3 decode (laguna_e4m3_decode4, bit-identical construction),
+/// vectorized hs8 (max-form, identical floats), x loaded as ushort4 and
+/// converted bf16->f32 by the exact bits<<16 construction, and both loops fully
+/// unrolled with static trip counts are otherwise identical to v2. Coarse,
+/// delta, and coarse_bf outputs are bit-identical to v1 for every input, so the
+/// notes/68 certificate is untouched.
 private let lagunaLmHeadCoarseKernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_mxfp8_coarse_v2",
+    name: "laguna_lmhead_mxfp8_coarse_pack16_v3",
     inputNames: ["x", "codes", "scales"],
     outputNames: ["coarse", "delta", "coarse_bf"],
     source: """
         constexpr float GAMMA = 0x1p-15f;
 
-        uint row = threadgroup_position_in_grid.x * 8 +
+        uint row = threadgroup_position_in_grid.x * 16 +
             simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
 
@@ -198,8 +199,9 @@ private let lagunaLmHeadCoarseKernel = MLXFast.metalKernel(
 )
 /// v1 coarse kernel, kept verbatim for same-binary A/B (the paired
 /// measurement protocol requires both arms in one binary). Selected by
-/// `DARKBLOOM_LMHEAD_COARSE=v1`; the shipped default is v2 above. The two
-/// kernels are bit-identical in all three outputs for every input.
+/// `DARKBLOOM_LMHEAD_COARSE=v1`; v1 retains its stock eight-row launch while
+/// the shipped default is the 16-row v3 above. The two kernels are
+/// bit-identical in all three outputs for every input.
 private let lagunaLmHeadCoarseKernelV1 = MLXFast.metalKernel(
     name: "laguna_lmhead_mxfp8_coarse_v1",
     inputNames: ["x", "codes", "scales"],
@@ -520,12 +522,14 @@ final class LagunaLmHeadPruner {
         let vocab = lagunaLmHeadPruneVocab
         let x = hidden.reshaped([lagunaLmHeadPruneHidden])
 
-        let coarseKernel =
-            lagunaLmHeadCoarseUseV1 ? lagunaLmHeadCoarseKernelV1 : lagunaLmHeadCoarseKernel
+        let useCoarseV1 = lagunaLmHeadCoarseUseV1
+        let coarseKernel = useCoarseV1 ? lagunaLmHeadCoarseKernelV1 : lagunaLmHeadCoarseKernel
+        let coarseRowsPerThreadgroup = useCoarseV1 ? 8 : 16
+        let coarseThreadsPerThreadgroup = coarseRowsPerThreadgroup * 32
         let coarseOut = coarseKernel(
             [x, codes, scales],
-            grid: (vocab / 8 * 256, 1, 1),
-            threadGroup: (256, 1, 1),
+            grid: (vocab / coarseRowsPerThreadgroup * coarseThreadsPerThreadgroup, 1, 1),
+            threadGroup: (coarseThreadsPerThreadgroup, 1, 1),
             outputShapes: [[vocab], [vocab], [vocab]],
             outputDTypes: [.float32, .float32, .bfloat16]
         )
