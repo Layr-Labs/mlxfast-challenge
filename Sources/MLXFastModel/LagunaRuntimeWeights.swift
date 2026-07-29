@@ -347,8 +347,9 @@ public final class LagunaRuntimeWeightCache {
         self.loader = loader
         self.config = config
         // Select the startup memory profile BEFORE the model load. Laguna
-        // retains no alternate weight layouts. The full profile only installs
-        // the post-wire command-buffer budget below; the documented
+        // retains no alternate weight layouts, so the full profile is
+        // deliberately a no-op here (the
+        // ranked 128 GiB box keeps stock allocator behavior); the documented
         // low-memory profile for <64 GiB machines caps the MLX allocator
         // cache at 6 GiB, shortens command buffers, and clears free
         // warmup buffers before the worker protocol hello -- pure memory
@@ -367,22 +368,6 @@ public final class LagunaRuntimeWeightCache {
                 policy.apply()
                 startupMemoryPolicy = policy
             } else {
-                // The full 128 GiB ranked profile wires the complete live
-                // model into Metal's residency set after load. Once those
-                // allocations are permanently resident, MLX's stock 50 MiB
-                // referenced-byte commit threshold splits every sparse layer
-                // across several command buffers even though the layer's
-                // weights no longer create residency pressure. A 512 MiB
-                // budget fits one complete decode layer (attention plus the
-                // routed/shared gate-up and down banks are ~507 MiB for the
-                // larger sliding-attention shape) while retaining MLX's
-                // stock M5 Max 50-operation cap. Explicit MLX_ values win,
-                // and the DARKBLOOM kill switch supports same-binary A/B.
-                let env = ProcessInfo.processInfo.environment
-                if env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" {
-                    setenv("MLX_MAX_MB_PER_BUFFER", "512", 0)
-                    setenv("MLX_MAX_OPS_PER_BUFFER", "50", 0)
-                }
                 startupMemoryPolicy = nil
             }
         } else {
@@ -441,7 +426,7 @@ public final class LagunaRuntimeWeightCache {
         // dtype, order, or token behavior changes (register- and
         // shape-neutral by construction).
         //
-        // Ships DEFAULT-ON at a dosed 42 MiB capacity (the ranked runner
+        // Ships DEFAULT-ON at a dosed ~1.35 GiB capacity (the ranked runner
         // sets no environment variables): `DARKBLOOM_WIRED_ZH=0` is the
         // kill switch, `DARKBLOOM_WIRED_ZH_FRACTION` /
         // `DARKBLOOM_WIRED_ZH_SLACK_MB` override the dose for local A/B
@@ -479,29 +464,33 @@ public final class LagunaRuntimeWeightCache {
     /// to the live footprint, applied through the public async ticket path
     /// (`WiredMemoryTicket.start` -> `mlx_set_wired_limit`), bridged
     /// synchronously because this runs before the worker protocol hello.
-    /// SHIPPED DOSE (full wire, operator-directed): capacity = 1.0 x live
-    /// bytes + 64 MiB ~= 31.4 GiB -- the entire live footprint (weights +
-    /// fused banks + lm_head coarse copy) wired in one resize commit, the
-    /// full mechanism from notes/47 §4-§7 with the zero-headroom fit-test
-    /// discipline. Measured loaded-local (cool-gated Latin squares, all vs
-    /// unwired control, correctness green every sample):
-    ///   42 MiB -> -4.2% prefill | 350 MiB -> -8.2% | 0.10x -> -11.2%
-    ///   0.20x -> -17.2% | 0.35x -> -20.8% | 1.0x -> -28.3% prefill,
-    ///   -4.2% decode composite (seed-prefill share; steady step null).
-    /// Chunk 1 (42 MiB) ranked +1.24% score (promoted 1.38531), validating
-    /// the ~1:1 loaded-local -> ranked transfer. This configuration ships
-    /// the WHOLE curve in one submission per operator instruction; the
-    /// documented acceptance band (prefill speedup vs calibration in
-    /// [0.952, 1.053]) is expected to reject gains this large in one step
-    /// -- if the ranked run fails with acceptance_band_failed, revert to
-    /// band-sized dose increments (the curve above is the roadmap).
+    /// SHIPPED DOSE (submission chunk 3): capacity = 0.04 x live bytes
+    /// + 16 MiB ~= 1.35 GiB. Chunk 1 shipped 42 MiB (fraction 0.001 +
+    /// 8 MiB), measured -4.2% prefill loaded-local, and ranked at +1.24%
+    /// score (promoted 1.38531) -- implying ~+3.4-4.6% ranked prefill,
+    /// i.e. the loaded-local dose curve transfers ~1:1 to the ranked box.
+    /// Chunk 2 shipped 0.01x + 16 MiB ~= 350 MiB (+~4.15% prefill over
+    /// chunk 1, accepted). The measured curve (cool-gated Latin squares,
+    /// medians, correctness green on every sample), all vs an unwired
+    /// control:
+    ///   42 MiB -> -4.2% prefill  | 134 MiB -> -6.7% | 350 MiB -> -8.2%
+    ///   0.02x -> -9.8% | 0.20x -> -17.2% | 0.35x -> -20.8% | 1.0x -> -28.3%
+    /// (decode composite follows the seed-prefill share: -0.4% at 42 MiB up
+    /// to -4.2% at full wire; steady decode step is null throughout.)
+    /// The ranked acceptance band caps a single submission's per-axis gain
+    /// at ~5%, so each chunk moves one band-sized step along the curve.
+    /// Chunk 3 log-interpolates the 0.02x (-9.8%) and 0.20x (-17.2%)
+    /// points to fraction 0.04 ~= -12.2% prefill vs unwired, i.e. +~4.3%
+    /// prefill over the promoted chunk-2 configuration -- one band step,
+    /// with ~1pp margin under the +5.3% band edge for the box's ~0.65%
+    /// prefill CV.
     ///
     /// Engagement guards: `DARKBLOOM_WIRED_ZH=0` kills it; machines under
     /// 96 GiB physical memory keep stock behavior (the ranked box is an
     /// M5 Max 128 GB; smaller local boxes must not wire a ~31 GB live set
     /// against a much smaller working-set cap).
-    private static let wiredZHDefaultFraction = 1.0
-    private static let wiredZHDefaultSlackMB = 64
+    private static let wiredZHDefaultFraction = 0.04
+    private static let wiredZHDefaultSlackMB = 16
 
     private static func wireResidentWeightsIfEnabled() {
         let env = ProcessInfo.processInfo.environment

@@ -29,24 +29,15 @@ template <typename T, int N_READS = RMS_N_READS>
   float acc = 0;
   x += gid * size_t(axis_size) + lid * N_READS;
   w += w_stride * lid * N_READS;
-  // Upstream ml-explore/mlx PR #3754: cache the row values read during the
-  // accumulation pass so the output pass does not re-read the same device
-  // bytes. Pure load elimination: the cached float is the exact bf16->float
-  // promotion the output expression performs anyway (T * float promotes T
-  // first), device memory is immutable during the dispatch, and every
-  // arithmetic op, its order, and all barriers are unchanged -- bit-exact.
-  float xcache[N_READS];
   if (lid * N_READS + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; i++) {
       float xi = x[i];
-      xcache[i] = xi;
       acc += xi * xi;
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
         float xi = x[i];
-        xcache[i] = xi;
         acc += xi * xi;
       }
     }
@@ -77,12 +68,12 @@ template <typename T, int N_READS = RMS_N_READS>
   out += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; i++) {
-      out[i] = w[w_stride * i] * static_cast<T>(xcache[i] * local_inv_mean[0]);
+      out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
-        out[i] = w[w_stride * i] * static_cast<T>(xcache[i] * local_inv_mean[0]);
+        out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
       }
     }
   }
