@@ -277,6 +277,30 @@ private let lagunaNativeAffineQKVLayerCount: Int = {
 }()
 let lagunaNativeAffineQKVEnabled = lagunaNativeAffineQKVLayerCount > 0
 
+/// Latest affine-QKV layers whose per-head attention gate is appended to the
+/// existing native group-32 affine Q/K/V side layout. This removes the
+/// separate gate-projection GEMV without adding another quantized dispatch.
+/// Selecting backward from the affine/NVFP4 boundary gives the quantization
+/// perturbation the fewest downstream layers to amplify through while keeping
+/// the same periodic mix of full/sliding attention shapes. The gate is never
+/// appended to an NVFP4 Q/K/V tail layout: the accepted gate envelope is
+/// group-32 affine INT8 only. `0` disables; the default eight-layer dose
+/// selects layers 24...31.
+private let lagunaNativeAffineGProjLayerCount: Int = {
+    guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_GPROJ"] != "0"
+    else { return 0 }
+    let requested = Int(
+        ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_GPROJ_LAYERS"]
+            ?? "8") ?? 8
+    return min(max(requested, 0), 32)
+}()
+
+private func lagunaUseNativeAffineGProj(layer: Int) -> Bool {
+    let affineEnd = lagunaNativeAffineNVFP4From ?? LagunaConstants.numHiddenLayers
+    let affineStart = max(0, affineEnd - lagunaNativeAffineGProjLayerCount)
+    return layer >= affineStart && layer < affineEnd
+}
+
 /// Depth-selection mode for both native affine INT8 attention layouts.
 ///
 /// **Default (unset or anything but `1`) is the shipped PREFIX predicate**
@@ -2389,6 +2413,16 @@ private let lagunaNativeAffineGatedOutputQMVEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_NATIVE_AFFINE_GATED_OUTPUT_QMV"] != "0"
 
+/// Affine Q/K/V/gate producer counterpart: when `g_proj` rows have been
+/// appended to the native group-32 QKV bank, reproduce MLX `qmv_fast` and
+/// apply the exact BF16 softplus epilogue to only those aligned tail rows.
+/// This removes the last tiny gate-activation dispatch before the promoted
+/// gated output QMV. Set `DARKBLOOM_NATIVE_AFFINE_GATED_QKV=0` to retain the
+/// packed projection but ablate the fused epilogue in the same binary.
+private let lagunaNativeAffineGatedQKVEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NATIVE_AFFINE_GATED_QKV"] != "0"
+
 /// NVFP4 group-16 counterpart for the eight native side layouts in the tail.
 /// It consumes the same tiny activated-gate vector and preserves MLX's
 /// `fp_qmv_fast` row ownership, K loop, scale grouping, and reduction.
@@ -2614,6 +2648,214 @@ func lagunaNativeAffineGateProjectionSoftplus(
         grid: ((heads / 4) * 256, 1, 1),
         threadGroup: (256, 1, 1),
         outputShapes: [[1, 1, heads]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+/// Softplus-only consumer for gate logits already produced by the native
+/// affine QKV batch. This preserves the frontier kernel's exact float32
+/// LogAddExp arithmetic and BF16 boundary, but avoids reading the standalone
+/// BF16 gate weight after the packed projection has already supplied logits.
+private let lagunaNativeAffineGateSoftplusKernels:
+    [Int: MLXFast.MLXFastKernel] = {
+    Dictionary(
+        uniqueKeysWithValues: [
+            LagunaConstants.fullAttentionHeads,
+            LagunaConstants.slidingAttentionHeads,
+        ].map { heads in
+            (
+                heads,
+                MLXFast.metalKernel(
+                    name: "laguna_native_affine_gate_softplus_bf16_h\(heads)_v1",
+                    inputNames: ["gate_logits"],
+                    outputNames: ["gate_values"],
+                    source: """
+                        uint head = thread_position_in_grid.x;
+                        float x = float(gate_logits[head]);
+                        float softplus;
+                        if (metal::isnan(x)) {
+                            softplus =
+                                metal::numeric_limits<float>::quiet_NaN();
+                        } else {
+                            constexpr float inf =
+                                metal::numeric_limits<float>::infinity();
+                            float maxval = metal::max(x, 0.0f);
+                            float minval = metal::min(x, 0.0f);
+                            softplus =
+                                (minval == -inf || maxval == inf)
+                                ? maxval
+                                : maxval
+                                    + log1p(metal::exp(minval - maxval));
+                        }
+                        gate_values[head] = bfloat(softplus);
+                        """,
+                    ensureRowContiguous: true
+                )
+            )
+        }
+    )
+}()
+
+func lagunaNativeAffineGateSoftplus(
+    gateLogits: MLXArray,
+    heads: Int
+) -> MLXArray {
+    guard let kernel = lagunaNativeAffineGateSoftplusKernels[heads] else {
+        preconditionFailure("unsupported Laguna attention head count \(heads)")
+    }
+    precondition(gateLogits.dtype == .bfloat16)
+    precondition(gateLogits.shape == [1, 1, heads])
+
+    lagunaTrace("native affine packed gate softplus h\(heads)")
+    return kernel(
+        [gateLogits],
+        grid: (heads, 1, 1),
+        threadGroup: (heads, 1, 1),
+        outputShapes: [[1, 1, heads]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+private func lagunaNativeAffineGatedQKVSource(heads: Int) -> String {
+    let queryRows = heads * LagunaConstants.headDim
+    let qkvRows = queryRows + 2 * LagunaConstants.numKeyValueHeads
+        * LagunaConstants.headDim
+    let outputRows = qkvRows + heads
+    return """
+        constexpr uint group_size = 32;
+        constexpr uint input_width = 2048;
+        constexpr uint qkv_rows = \(qkvRows);
+        constexpr uint output_rows = \(outputRows);
+        constexpr uint values_per_lane = 8;
+        constexpr uint block_size = 256;
+        constexpr uint results_per_simdgroup = 4;
+        constexpr uint simdgroups_per_group = 2;
+        constexpr uint groups_per_row = input_width / group_size;
+
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint output_row =
+            threadgroup_position_in_grid.y
+                * (simdgroups_per_group * results_per_simdgroup)
+            + simd_group * results_per_simdgroup;
+
+        const device uint8_t* weight_bytes =
+            (const device uint8_t*)packed_codes;
+        thread float result[results_per_simdgroup] = {
+            0.0f, 0.0f, 0.0f, 0.0f
+        };
+        thread float coefficients[values_per_lane];
+
+        for (uint block = 0; block < input_width; block += block_size) {
+            uint column = block + lane * values_per_lane;
+            float coefficient_sum = 0.0f;
+            for (uint i = 0; i < values_per_lane; ++i) {
+                coefficients[i] = float(input[column + i]);
+                coefficient_sum += coefficients[i];
+            }
+
+            for (uint row = 0; row < results_per_simdgroup; ++row) {
+                uint logical_row = output_row + row;
+                const device uint8_t* codes =
+                    weight_bytes + logical_row * input_width + column;
+                uint affine_index =
+                    logical_row * groups_per_row + column / group_size;
+                float scale = float(scales[affine_index]);
+                float bias = float(biases[affine_index]);
+                float quantized_dot = 0.0f;
+                for (uint i = 0; i < values_per_lane; ++i) {
+                    quantized_dot += coefficients[i] * codes[i];
+                }
+                result[row] +=
+                    scale * quantized_dot + coefficient_sum * bias;
+            }
+        }
+
+        for (uint row = 0; row < results_per_simdgroup; ++row) {
+            result[row] = simd_sum(result[row]);
+            if (lane == 0) {
+                bfloat rounded = bfloat(result[row]);
+                if (output_row + row < qkv_rows) {
+                    output[output_row + row] = rounded;
+                } else {
+                    float x = float(rounded);
+                    float softplus;
+                    if (metal::isnan(x)) {
+                        softplus =
+                            metal::numeric_limits<float>::quiet_NaN();
+                    } else {
+                        constexpr float inf =
+                            metal::numeric_limits<float>::infinity();
+                        float maxval = metal::max(x, 0.0f);
+                        float minval = metal::min(x, 0.0f);
+                        softplus =
+                            (minval == -inf || maxval == inf)
+                            ? maxval
+                            : maxval
+                                + log1p(metal::exp(minval - maxval));
+                    }
+                    output[output_row + row] = bfloat(softplus);
+                }
+            }
+        }
+        """
+}
+
+private let lagunaNativeAffineGatedQKVKernels:
+    [Int: MLXFast.MLXFastKernel] = {
+    Dictionary(
+        uniqueKeysWithValues: [
+            LagunaConstants.fullAttentionHeads,
+            LagunaConstants.slidingAttentionHeads,
+        ].map { heads in
+            (
+                heads,
+                MLXFast.metalKernel(
+                    name: "laguna_native_affine_gated_qkv_bf16_h\(heads)_v1",
+                    inputNames: ["input", "packed_codes", "scales", "biases"],
+                    outputNames: ["output"],
+                    source: lagunaNativeAffineGatedQKVSource(heads: heads),
+                    ensureRowContiguous: true
+                )
+            )
+        }
+    )
+}()
+
+func lagunaNativeAffineGatedQKV(
+    input: MLXArray,
+    packedCodes: MLXArray,
+    scales: MLXArray,
+    biases: MLXArray,
+    heads: Int
+) -> MLXArray {
+    guard let kernel = lagunaNativeAffineGatedQKVKernels[heads] else {
+        preconditionFailure("unsupported Laguna attention head count \(heads)")
+    }
+    let queryRows = heads * LagunaConstants.headDim
+    let qkvRows = queryRows + 2 * LagunaConstants.numKeyValueHeads
+        * LagunaConstants.headDim
+    let outputRows = qkvRows + heads
+    precondition(input.dtype == .bfloat16)
+    precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
+    precondition(packedCodes.dtype == .uint32)
+    precondition(
+        packedCodes.shape == [
+            outputRows,
+            LagunaConstants.hiddenSize / MemoryLayout<UInt32>.size,
+        ])
+    precondition(scales.dtype == .bfloat16)
+    precondition(
+        scales.shape == [outputRows, LagunaConstants.hiddenSize / 32])
+    precondition(biases.dtype == .bfloat16)
+    precondition(biases.shape == scales.shape)
+
+    lagunaTrace("native affine QKV+activated gate h\(heads)")
+    return kernel(
+        [input, packedCodes, scales, biases],
+        grid: (64, outputRows / 8, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, outputRows]],
         outputDTypes: [.bfloat16]
     )[0]
 }
@@ -2975,6 +3217,7 @@ final class LagunaRuntimeAttention: Module {
     /// Q/K/V batch. The original BF16 parameters remain authoritative and
     /// continue to serve prefill.
     var _nativeAffineQKV: LagunaNativeAffineWeight?
+    var _nativeAffineQKVIncludesGate = false
 
     /// Derived native group-32 affine layout for the attention output
     /// projection, used only by the serial decode call. `wo.weight` remains the
@@ -3003,19 +3246,39 @@ final class LagunaRuntimeAttention: Module {
         else {
             return []
         }
+
+        var components = [q, k, v]
+        if lagunaUseNativeAffineGProj(layer: layerIdx),
+            q.groupSize == 32, q.bits == 8, q.mode == .affine,
+            let gateProjection = gProj,
+            gateProjection.bias == nil,
+            type(of: gateProjection) == Linear.self,
+            gateProjection.weight.dtype == .bfloat16,
+            gateProjection.weight.shape == [nHeads, LagunaConstants.hiddenSize],
+            let gate = lagunaNativeAffineWeight(
+                gateProjection.weight, layer: layerIdx),
+            gate.groupSize == q.groupSize,
+            gate.bits == q.bits,
+            gate.mode == q.mode
+        {
+            components.append(gate)
+            _nativeAffineQKVIncludesGate = true
+        }
+
         let packedCodes = concatenated(
-            [q.packedCodes, k.packedCodes, v.packedCodes], axis: 0)
-        let scales = concatenated([q.scales, k.scales, v.scales], axis: 0)
+            components.map(\.packedCodes), axis: 0)
+        let scales = concatenated(components.map(\.scales), axis: 0)
         var biases: MLXArray?
-        if let qb = q.biases, let kb = k.biases, let vb = v.biases {
-            biases = concatenated([qb, kb, vb], axis: 0)
+        let componentBiases = components.compactMap(\.biases)
+        if componentBiases.count == components.count {
+            biases = concatenated(componentBiases, axis: 0)
         }
         let fused = LagunaNativeAffineWeight(
             packedCodes: packedCodes,
             scales: scales,
             biases: biases,
             originalShape: [
-                wq.weight.dim(0) + wk.weight.dim(0) + wv.weight.dim(0),
+                components.reduce(0) { $0 + $1.originalShape[0] },
                 wq.weight.dim(1),
             ],
             groupSize: q.groupSize,
@@ -3141,18 +3404,41 @@ final class LagunaRuntimeAttention: Module {
                 let fusedAffine = _nativeAffineQKV
             {
                 let normalized = inputNorm(input)
-                let qkv = quantizedMM(
-                    normalized,
-                    fusedAffine.packedCodes,
-                    scales: fusedAffine.scales,
-                    biases: fusedAffine.biases,
-                    transpose: true,
-                    groupSize: fusedAffine.groupSize,
-                    bits: fusedAffine.bits,
-                    mode: fusedAffine.mode
-                )
+                let fusedGateActivation =
+                    lagunaNativeAffineGatedQKVEnabled
+                    && _nativeAffineQKVIncludesGate
+                    && fusedAffine.mode == .affine
+                    && fusedAffine.groupSize == 32
+                    && fusedAffine.bits == 8
+                    && fusedAffine.biases != nil
+                let projections: MLXArray
+                if fusedGateActivation, let biases = fusedAffine.biases {
+                    projections = lagunaNativeAffineGatedQKV(
+                        input: normalized,
+                        packedCodes: fusedAffine.packedCodes,
+                        scales: fusedAffine.scales,
+                        biases: biases,
+                        heads: nHeads
+                    )
+                } else {
+                    projections = quantizedMM(
+                        normalized,
+                        fusedAffine.packedCodes,
+                        scales: fusedAffine.scales,
+                        biases: fusedAffine.biases,
+                        transpose: true,
+                        groupSize: fusedAffine.groupSize,
+                        bits: fusedAffine.bits,
+                        mode: fusedAffine.mode
+                    )
+                }
                 let queryDim = nHeads * headDim
                 let kvDim = nKVHeads * headDim
+                let qkvEnd = queryDim + 2 * kvDim
+                let packedGateLogits: MLXArray? =
+                    _nativeAffineQKVIncludesGate
+                    ? projections[.ellipsis, qkvEnd ..< (qkvEnd + nHeads)]
+                    : nil
                 let fuseActivatedGateIntoAffineOProj =
                     lagunaNativeAffineGatedOutputQMVEnabled
                     && lagunaUseNativeAffineOProj(layer: layerIdx)
@@ -3173,24 +3459,38 @@ final class LagunaRuntimeAttention: Module {
                 let gateValues: MLXArray
                 let gateIsActivated: Bool
                 if fuseActivatedGateIntoOProj {
-                    gateValues = lagunaNativeAffineGateProjectionSoftplus(
-                        normalizedInput: normalized,
-                        gateWeight: gateProjection.weight,
-                        heads: nHeads
-                    )
+                    if fusedGateActivation, let packedGateLogits {
+                        gateValues = packedGateLogits
+                    } else if let packedGateLogits {
+                        gateValues = lagunaNativeAffineGateSoftplus(
+                            gateLogits: packedGateLogits,
+                            heads: nHeads
+                        )
+                    } else {
+                        gateValues = lagunaNativeAffineGateProjectionSoftplus(
+                            normalizedInput: normalized,
+                            gateWeight: gateProjection.weight,
+                            heads: nHeads
+                        )
+                    }
                     gateIsActivated = true
                 } else {
-                    let gateLogits = gateProjection(normalized)
-                    gateValues =
-                        lagunaNativeAffineGateProductEnabled
-                        ? gateLogits
-                        : softplus(gateLogits.asType(.float32)).asType(.bfloat16)
-                    gateIsActivated = !lagunaNativeAffineGateProductEnabled
+                    if fusedGateActivation, let packedGateLogits {
+                        gateValues = packedGateLogits
+                        gateIsActivated = true
+                    } else {
+                        let gateLogits = packedGateLogits ?? gateProjection(normalized)
+                        gateValues =
+                            lagunaNativeAffineGateProductEnabled
+                            ? gateLogits
+                            : softplus(gateLogits.asType(.float32)).asType(.bfloat16)
+                        gateIsActivated = !lagunaNativeAffineGateProductEnabled
+                    }
                 }
                 fusedNormQKV = (
-                    qkv[.ellipsis, 0 ..< queryDim],
-                    qkv[.ellipsis, queryDim ..< (queryDim + kvDim)],
-                    qkv[.ellipsis, (queryDim + kvDim) ..< (queryDim + 2 * kvDim)],
+                    projections[.ellipsis, 0 ..< queryDim],
+                    projections[.ellipsis, queryDim ..< (queryDim + kvDim)],
+                    projections[.ellipsis, (queryDim + kvDim) ..< qkvEnd],
                     gateValues,
                     gateIsActivated: gateIsActivated
                 )
