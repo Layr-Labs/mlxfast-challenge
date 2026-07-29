@@ -1687,6 +1687,11 @@ template <
     const constant int& N,
     const constant int& K,
     const constant int& run_skip_pct,
+    // Magnitude dial for DARKBLOOM_EXPERT_STAGE_WIDEST, 1..100. A RUNTIME
+    // scalar, never a function constant: this kernel is built with no
+    // MTLFCList at all, and a magnitude in the specialization key can force a
+    // JIT build inside a timed forward.
+    const constant int& stage_widest_pct,
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -1746,6 +1751,20 @@ template <
   const short tm = SM * (simd_group_id / WN);
   const short tn = SN * (simd_group_id % WN);
 
+  // DARKBLOOM_EXPERT_STAGE_WIDEST strength dial. tid.y is the expert-group
+  // coordinate over exactly [0, 64), the same 64-point domain RUNSKIP's table
+  // uses, so the realized fraction |{r in [0,64) : (r*61) mod 100 < P}| / 64
+  // is identical for both Laguna MoE shapes. Dispatch geometry only -- never
+  // token content -- and threadgroup-uniform. Full derivation of the
+  // alignment and bit-exactness arguments, and the P table, are in
+  // mlx/backend/metal/kernels/fp_quantized_nax.h at this same point.
+#ifdef DARKBLOOM_EXPERT_STAGE_WIDEST
+  const bool widest_tile = (stage_widest_pct >= 100) ||
+      (int((tid.y * 61u) % 100u) < stage_widest_pct);
+#else
+  (void)stage_widest_pct;
+#endif
+
   for (int expert_slot = 0; expert_slot < experts / expert_groups;
        ++expert_slot) {
     // Keep each threadgroup's row intervals and expert weight regions
@@ -1786,7 +1805,18 @@ template <
 
       for (int k = 0; k < K_it; ++k) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+#ifdef DARKBLOOM_EXPERT_STAGE_WIDEST
+        // Same bytes, same addresses, same nibble decode, same scale mapping
+        // -- only the width of the threadgroup stores changes. See
+        // load_unsafe_wide.
+        if (widest_tile) {
+          loader_w.template load_unsafe_wide<true, false>();
+        } else {
+          loader_w.load_unsafe();
+        }
+#else
         loader_w.load_unsafe();
+#endif
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg_active) {
