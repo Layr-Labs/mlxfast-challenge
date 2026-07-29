@@ -454,6 +454,25 @@ let lagunaFusedDenseGateUpSwiGLUEnabled =
 let lagunaFusedDenseDownResidualEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_DENSE_DOWN_RESIDUAL"] != "0"
 
+/// `DARKBLOOM_ROUTER_BF16_EXP12` (default on; set `0` to restore raw BF16):
+/// decode-only, bit-exact side storage for each sparse layer's
+/// `[256, 2048]` BF16 router matrix.
+///
+/// A BF16 word consists of one sign bit, eight exponent bits, and seven
+/// fraction bits. The sign and fraction fit in one byte. Router exponents
+/// 111...125 use codes 0...14; code 15 escapes to the authoritative raw BF16
+/// word at the same logical index. Two exponent codes share one byte, so the
+/// common path reads six bytes for the four weights consumed by one router
+/// lane instead of eight. Reconstructing the original UInt16 word happens
+/// before the unchanged BF16-to-FP32 multiply, accumulator, shuffle reduction,
+/// and output rounding.
+///
+/// The escape makes the representation exact for every BF16 bit pattern, not
+/// only the pinned checkpoint. Original router weights remain resident for
+/// prefill, stock fallbacks, and uncommon exponent values.
+let lagunaRouterBF16Exp12Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_BF16_EXP12"] != "0"
+
 /// `DARKBLOOM_ROUTER_ROWS_PER_GROUP` (default `8`; set `64` to restore the
 /// pre-widening shape, `32`/`16` for intermediate points): router output rows
 /// owned by one threadgroup in `laguna_residual_rms_router_bf16_2048`.
@@ -685,7 +704,106 @@ private let lagunaNormReductionTailQKV = lagunaNormReductionTail(
 /// is no tail. The `normalized_row` coefficients are read inline rather than
 /// staged: at one row per thread both cost `n_reads` threadgroup reads per
 /// block, so staging would buy nothing and cost 16 registers per unroll step.
-private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
+struct LagunaRouterBF16Exp12Storage {
+    let signMantissa: MLXArray
+    let exponentCodes: MLXArray
+
+    var arrays: [MLXArray] { [signMantissa, exponentCodes] }
+}
+
+private let lagunaRouterBF16Exp12PackKernel = MLXFast.metalKernel(
+    name: "laguna_router_bf16_exp12_pack_v1",
+    inputNames: ["raw_weight"],
+    outputNames: ["sign_mantissa", "exponent_codes"],
+    source: """
+        uint group = thread_position_in_grid.x;
+        uint value_index = 4 * group;
+        vec<ushort, 4> words =
+            *((const device vec<ushort, 4>*)(raw_weight + value_index));
+
+        ushort packed_codes = 0;
+        for (uint i = 0; i < 4; ++i) {
+            ushort word = words[i];
+            sign_mantissa[value_index + i] =
+                uint8_t(((word >> 8) & 0x80u) | (word & 0x7fu));
+            ushort exponent = (word >> 7) & 0xffu;
+            ushort code =
+                exponent >= 111u && exponent <= 125u
+                    ? exponent - 111u
+                    : 15u;
+            packed_codes |= code << (4 * i);
+        }
+        *((device ushort*)(exponent_codes + value_index / 2)) =
+            packed_codes;
+        """,
+    ensureRowContiguous: true
+)
+
+/// Builds an exact decode sidecar from a materialized BF16 router matrix.
+/// Packing runs during untimed runtime preparation. The last dimension must
+/// be divisible by four so every hot-path `vec<bfloat, 4>` load maps to one
+/// aligned four-byte sign/fraction load and one aligned two-byte exponent-code
+/// load. Code 15 deliberately leaves all exceptional words in the raw matrix.
+func lagunaRouterBF16Exp12Sidecar(
+    _ rawWeight: MLXArray
+) -> LagunaRouterBF16Exp12Storage? {
+    guard lagunaRouterBF16Exp12Enabled,
+        rawWeight.dtype == .bfloat16,
+        rawWeight.ndim == 2,
+        rawWeight.dim(-1).isMultiple(of: 4)
+    else {
+        return nil
+    }
+    var exponentShape = rawWeight.shape
+    exponentShape[exponentShape.count - 1] /= 2
+    let outputs = lagunaRouterBF16Exp12PackKernel(
+        [rawWeight],
+        grid: (rawWeight.size / 4, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [rawWeight.shape, exponentShape],
+        outputDTypes: [.uint8, .uint8]
+    )
+    return LagunaRouterBF16Exp12Storage(
+        signMantissa: outputs[0],
+        exponentCodes: outputs[1]
+    )
+}
+
+private let lagunaRouterBF16Exp12MetalHeader = """
+    static inline vec<bfloat, 4> laguna_router_bf16_exp12_load4(
+        const device bfloat* raw_weight,
+        const device uint8_t* sign_mantissa,
+        const device uint8_t* exponent_codes,
+        size_t value_index)
+    {
+        uint packed_sign_mantissa =
+            *((const device uint*)(sign_mantissa + value_index));
+        ushort packed_exponents =
+            *((const device ushort*)(exponent_codes + value_index / 2));
+        vec<bfloat, 4> result;
+        for (uint i = 0; i < 4; ++i) {
+            ushort sf =
+                ushort((packed_sign_mantissa >> (8 * i)) & 0xffu);
+            ushort code =
+                ushort((packed_exponents >> (4 * i)) & 0x0fu);
+            ushort bits;
+            if (code == 15u) {
+                bits = ((const device ushort*)raw_weight)[value_index + i];
+            } else {
+                bits =
+                    ushort((sf & 0x80u) << 8)
+                    | ushort((111u + code) << 7)
+                    | ushort(sf & 0x7fu);
+            }
+            result[i] = as_type<bfloat>(bits);
+        }
+        return result;
+    }
+    """
+
+private func lagunaResidualRMSNormRouterSource(
+    rowsPerGroup: Int, exp12: Bool
+) -> String {
     let simdGroups = 512 / 32
     let rowsPerThread = rowsPerGroup >= simdGroups ? rowsPerGroup / simdGroups : 1
     let activeSimdGroups = rowsPerGroup / rowsPerThread
@@ -695,7 +813,32 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
     let guardClose = activeSimdGroups < simdGroups ? "        }\n" : ""
 
     let accumulate: String
-    if rowsPerThread == 1 {
+    if rowsPerThread == 1 && exp12 {
+        accumulate = """
+                    uint column = simd_lane * n_reads;
+                    for (uint block = 0; block < router_blocks; block += 4) {
+                        vec<bfloat, 4> rw[4];
+                        for (uint u = 0; u < 4; ++u) {
+                            size_t value_index =
+                                size_t(router_row) * axis_size +
+                                column + u * block_width;
+                            rw[u] = laguna_router_bf16_exp12_load4(
+                                router_weight,
+                                router_sign_mantissa,
+                                router_exponent_codes,
+                                value_index);
+                        }
+                        for (uint u = 0; u < 4; ++u) {
+                            uint column_u = column + u * block_width;
+                            for (uint i = 0; i < n_reads; ++i) {
+                                router_result[0] += float(rw[u][i]) *
+                                    float(normalized_row[column_u + i]);
+                            }
+                        }
+                        column += 4 * block_width;
+                    }
+            """
+    } else if rowsPerThread == 1 {
         accumulate = """
                     uint column = simd_lane * n_reads;
                     for (uint block = 0; block < router_blocks; block += 4) {
@@ -715,6 +858,31 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
                             }
                         }
                         column += 4 * block_width;
+                    }
+            """
+    } else if exp12 {
+        accumulate = """
+                    thread float router_input[n_reads];
+
+                    uint column = simd_lane * n_reads;
+                    for (uint block = 0; block < router_blocks; ++block) {
+                        for (uint i = 0; i < n_reads; ++i) {
+                            router_input[i] = float(normalized_row[column + i]);
+                        }
+                        for (uint r = 0; r < rows_per_thread; ++r) {
+                            size_t value_index =
+                                size_t(router_row + r) * axis_size + column;
+                            const vec<bfloat, 4> rw =
+                                laguna_router_bf16_exp12_load4(
+                                    router_weight,
+                                    router_sign_mantissa,
+                                    router_exponent_codes,
+                                    value_index);
+                            for (uint i = 0; i < n_reads; ++i) {
+                                router_result[r] += float(rw[i]) * router_input[i];
+                            }
+                        }
+                        column += block_width;
                     }
             """
     } else {
@@ -822,7 +990,33 @@ private let lagunaResidualRMSNormRouterKernels: [Int: MLXFast.MLXFastKernel] =
                     name: "laguna_residual_rms_router_bf16_2048_rpg\(rowsPerGroup)_v2",
                     inputNames: ["residual", "branch", "weight", "router_weight"],
                     outputNames: ["summed", "normalized", "router_logits"],
-                    source: lagunaResidualRMSNormRouterSource(rowsPerGroup: rowsPerGroup),
+                    source: lagunaResidualRMSNormRouterSource(
+                        rowsPerGroup: rowsPerGroup, exp12: false),
+                    ensureRowContiguous: true
+                )
+            )
+        })
+
+/// Sidecar twins keep the stock kernels byte-for-byte available for ablation
+/// and for any layer whose untimed preparation declined. Kernel names include
+/// both the row-ownership shape and the representation so MLX's name-keyed JIT
+/// cache cannot alias either source.
+private let lagunaResidualRMSNormRouterExp12Kernels: [Int: MLXFast.MLXFastKernel] =
+    Dictionary(
+        uniqueKeysWithValues: [8, 16, 32, 64].map { rowsPerGroup in
+            (
+                rowsPerGroup,
+                MLXFast.metalKernel(
+                    name:
+                        "laguna_residual_rms_router_bf16_exp12_2048_rpg\(rowsPerGroup)_v1",
+                    inputNames: [
+                        "residual", "branch", "weight", "router_weight",
+                        "router_sign_mantissa", "router_exponent_codes",
+                    ],
+                    outputNames: ["summed", "normalized", "router_logits"],
+                    source: lagunaResidualRMSNormRouterSource(
+                        rowsPerGroup: rowsPerGroup, exp12: true),
+                    header: lagunaRouterBF16Exp12MetalHeader,
                     ensureRowContiguous: true
                 )
             )
@@ -871,7 +1065,11 @@ private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
 )
 
 func lagunaResidualRMSNormRouter(
-    residual: MLXArray, branch: MLXArray, weight: MLXArray, routerWeight: MLXArray
+    residual: MLXArray,
+    branch: MLXArray,
+    weight: MLXArray,
+    routerWeight: MLXArray,
+    routerExp12: LagunaRouterBF16Exp12Storage? = nil
 ) -> (summed: MLXArray, normalized: MLXArray, routerLogits: MLXArray) {
     let hidden = LagunaConstants.hiddenSize
     let experts = LagunaConstants.numExperts
@@ -893,14 +1091,33 @@ func lagunaResidualRMSNormRouter(
     // summation and forfeits bit-exactness.
     let rowsPerGroup = lagunaRouterRowsPerGroup
     let tiles = experts / rowsPerGroup
-    lagunaTrace("residual+rmsnorm+router")
-    let outputs = lagunaResidualRMSNormRouterKernels[rowsPerGroup]!(
-        [residual, branch, weight, routerWeight],
-        grid: (tiles * 512, 1, 1),
-        threadGroup: (512, 1, 1),
-        outputShapes: [[1, 1, hidden], [1, 1, hidden], [1, 1, experts]],
-        outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
-    )
+    let outputs: [MLXArray]
+    if let routerExp12 {
+        precondition(routerExp12.signMantissa.dtype == .uint8)
+        precondition(routerExp12.signMantissa.shape == [experts, hidden])
+        precondition(routerExp12.exponentCodes.dtype == .uint8)
+        precondition(routerExp12.exponentCodes.shape == [experts, hidden / 2])
+        lagunaTrace("residual+rmsnorm+router exp12")
+        outputs = lagunaResidualRMSNormRouterExp12Kernels[rowsPerGroup]!(
+            [
+                residual, branch, weight, routerWeight,
+                routerExp12.signMantissa, routerExp12.exponentCodes,
+            ],
+            grid: (tiles * 512, 1, 1),
+            threadGroup: (512, 1, 1),
+            outputShapes: [[1, 1, hidden], [1, 1, hidden], [1, 1, experts]],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
+        )
+    } else {
+        lagunaTrace("residual+rmsnorm+router")
+        outputs = lagunaResidualRMSNormRouterKernels[rowsPerGroup]!(
+            [residual, branch, weight, routerWeight],
+            grid: (tiles * 512, 1, 1),
+            threadGroup: (512, 1, 1),
+            outputShapes: [[1, 1, hidden], [1, 1, hidden], [1, 1, experts]],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
+        )
+    }
     return (outputs[0], outputs[1], outputs[2])
 }
 
@@ -5715,6 +5932,39 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     var _routedDownProj: SwitchLinear?
     var _routedDownWeight: MLXArray?
     var _routedDownScales: MLXArray?
+    var _routerBF16Exp12SignMantissa: MLXArray?
+    var _routerBF16Exp12ExponentCodes: MLXArray?
+
+    var routerBF16Exp12Storage: LagunaRouterBF16Exp12Storage? {
+        guard let signMantissa = _routerBF16Exp12SignMantissa,
+            let exponentCodes = _routerBF16Exp12ExponentCodes
+        else {
+            return nil
+        }
+        return LagunaRouterBF16Exp12Storage(
+            signMantissa: signMantissa,
+            exponentCodes: exponentCodes
+        )
+    }
+
+    /// Creates the router's lossless 12-bit decode side layout once after the
+    /// checkpoint parameters are installed. The stock BF16 gate remains the
+    /// module parameter and serves all prefill and fallback paths.
+    func prepareRouterBF16Exp12() -> [MLXArray] {
+        guard _routerBF16Exp12SignMantissa == nil,
+            _routerBF16Exp12ExponentCodes == nil,
+            gate.weight.dtype == .bfloat16,
+            gate.weight.shape == [
+                LagunaConstants.numExperts, LagunaConstants.hiddenSize,
+            ],
+            let storage = lagunaRouterBF16Exp12Sidecar(gate.weight)
+        else {
+            return []
+        }
+        _routerBF16Exp12SignMantissa = storage.signMantissa
+        _routerBF16Exp12ExponentCodes = storage.exponentCodes
+        return storage.arrays
+    }
 
     /// Builds and retains the fused routed gate/up NVFP4 banks from the
     /// loaded stock `SwitchGLU` submodules (reached through the public
@@ -6187,7 +6437,8 @@ final class LagunaRuntimeDecoderLayer: Module {
                 residual: x,
                 branch: r,
                 weight: postAttentionLayerNorm.weight,
-                routerWeight: sparse.gate.weight)
+                routerWeight: sparse.gate.weight,
+                routerExp12: sparse.routerBF16Exp12Storage)
             h = fused.summed
             normalized = fused.normalized
             routerLogits = fused.routerLogits
@@ -6772,6 +7023,7 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                 fusedArrays.append(fused)
             }
             if let sparse = layer.mlp as? LagunaRuntimeSparseMoEBlock {
+                fusedArrays.append(contentsOf: sparse.prepareRouterBF16Exp12())
                 if lagunaFusedSharedGateUpEnabled {
                     fusedArrays.append(contentsOf: sparse.sharedExpert.prepareFusedSharedGateUp())
                 }
