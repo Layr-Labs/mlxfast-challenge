@@ -281,6 +281,19 @@ private func lagunaUseNativeAffineQKV(layer: Int) -> Bool {
     layer < lagunaNativeAffineQKVLayerCount
 }
 
+/// Experimental group-32 affine INT8 side layout for `wo`. Only decode
+/// uses it; prefill stays BF16. Default: all 40 layers.
+private let lagunaNativeAffineOutputLayerCount: Int = {
+    let requested = Int(
+        ProcessInfo.processInfo.environment["DARBKBLOOM_NATIVE_AFFINE_OUTPUT_LAYERS"]
+            ?? "40") ?? 40
+    return min(max(requested, 0), LagunaConstants.numHiddenLayers)
+}()
+
+private func lagunaUseNativeAffineOutput(layer: Int) -> Bool {
+    layer < lagunaNativeAffineOutputLayerCount
+}
+
 /// Sliding-layer per-head RMSNorm + plain RoPE fusion (see
 /// `lagunaSlidingQKNormRoPEKernel`).
 ///
@@ -2300,8 +2313,24 @@ final class LagunaRuntimeAttention: Module {
                 wq.weight.dim(1),
             ]
         )
-        _nativeAffineQKV = fused
+    _nativeAffineQKV = fused
         return fused.arrays
+    }
+
+    /// Experimental group-32 affine side layout for `wo`. The source BF16
+    /// weight remains authoritative for prefill and the default decode path.
+    var _nativeAffineOutput: LagunaNativeAffineWeight?
+
+    func prepareNativeAffineOutputWeight() -> [MLXArray] {
+        guard _nativeAffineOutput == nil,
+            type(of: wo) == Linear.self,
+            wo.bias == nil,
+            let affine = lagunaNativeAffineWeight(wo.weight)
+        else {
+            return []
+        }
+        _nativeAffineOutput = affine
+        return affine.arrays
     }
 
     /// Builds and retains the fused QKV weight from the loaded q/k/v
@@ -2644,6 +2673,31 @@ final class LagunaRuntimeAttention: Module {
                 }
                 projectedGate = gProj(normalizedInput)
                 gateIsActivated = false
+            }
+            if lagunaUseNativeAffineOutput(layer: layerIdx),
+                gateIsActivated, gatePerHead, L == 1, B == 1, wo.bias == nil,
+                headDim == LagunaConstants.headDim,
+                output.dtype == .bfloat16, projectedGate.dtype == .bfloat16,
+                output.shape == [1, 1, nHeads * headDim],
+                projectedGate.shape == [1, 1, nHeads],
+                let affineOutput = _nativeAffineOutput,
+                affineOutput.originalShape
+                    == [LagunaConstants.hiddenSize, nHeads * headDim]
+            {
+                let gated = (
+                    output.reshaped(B, L, nHeads, headDim)
+                        * projectedGate[.ellipsis, .newAxis]
+                ).reshaped(B, L, nHeads * headDim)
+                return quantizedMM(
+                    gated,
+                    affineOutput.packedCodes,
+                    scales: affineOutput.scales,
+                    biases: affineOutput.biases,
+                    transpose: true,
+                    groupSize: 32,
+                    bits: 8,
+                    mode: .affine
+                )
             }
             if lagunaFusedGatedOutputProjectionEnabled,
                 gateIsActivated, gatePerHead, L == 1, B == 1, wo.bias == nil,
@@ -6527,6 +6581,10 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
             if lagunaUseNativeAffineQKV(layer: layer.selfAttn.layerIdx) {
                 fusedArrays.append(
                     contentsOf: layer.selfAttn.prepareNativeAffineQKVWeight())
+            }
+            if lagunaUseNativeAffineOutput(layer: layer.selfAttn.layerIdx) {
+                fusedArrays.append(
+                    contentsOf: layer.selfAttn.prepareNativeAffineOutputWeight())
             }
             if lagunaFusedQKVEnabled, let fused = layer.selfAttn.prepareFusedQKVWeight() {
                 fusedArrays.append(fused)
