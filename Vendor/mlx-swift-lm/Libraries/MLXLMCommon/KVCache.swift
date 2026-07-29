@@ -776,6 +776,358 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 }
 
+// MARK: - Band-fused KV caches (single decode write)
+
+/// Caches whose K and V rows live in ONE buffer `[B, 2*kvHeads, S, D]`
+/// (K = heads `0..<kvHeads`, V = heads `kvHeads..<2*kvHeads`), so a decode
+/// step's cache update is a SINGLE slice-update dispatch over a stacked
+/// `[B, 2*kvHeads, 1, D]` row instead of two `[B, kvHeads, 1, D]` writes.
+/// The returned key/value arrays are zero-copy band views of the fused
+/// buffer; `MLXFast.scaledDotProductAttention`'s vector path consumes
+/// arbitrary-stride K/V at B == 1 (only the head-dim stride must be 1), so
+/// no contiguity copy is ever triggered downstream.
+public protocol BandFusedKVCache: KVCache {
+    /// Update with a pre-stacked `[B, 2*kvHeads, tokens, D]` row (K band
+    /// first, V band second) and return `(keys, values)` band views exactly
+    /// as `update(keys:values:)` would have.
+    func updateStacked(_ stacked: MLXArray) -> (MLXArray, MLXArray)
+}
+
+/// Band-fused twin of `KVCacheSimple`. All sequence-axis geometry
+/// (allocation stepping, growth, slicing) is ported verbatim; banding only
+/// changes which axis-1 rows a write or view touches, which that geometry
+/// never inspects. The stock class's "no-slack first update" shortcut
+/// (retaining the incoming arrays) cannot apply to a banded buffer; the
+/// general zero-alloc + slice-write path runs instead, with identical
+/// observable values.
+public class FusedKVCacheSimple: BaseKVCache, BandFusedKVCache {
+    var kv: MLXArray?
+    public var step = 256
+
+    public override init() {
+        super.init()
+    }
+
+    public override func innerState() -> [MLXArray] {
+        [self.kv].compactMap { $0 }
+    }
+
+    private func bands(upTo: Int) -> (MLXArray, MLXArray) {
+        let kv = self.kv!
+        let kvHeads = kv.dim(1) / 2
+        return (
+            kv[0..., ..<kvHeads, ..<upTo, 0...],
+            kv[0..., kvHeads..., ..<upTo, 0...]
+        )
+    }
+
+    /// Shared growth geometry: ensure capacity for `tokenCount` more rows.
+    /// Mirrors `KVCacheSimple.update`'s reset arithmetic on the fused buffer.
+    private func ensureCapacity(
+        tokenCount: Int, batch: Int, fusedHeads: Int, headDim: Int, dtype: DType
+    ) {
+        let previous = self.offset
+        let reset =
+            if let kv = self.kv, (previous + tokenCount) > kv.dim(2) {
+                true
+            } else {
+                self.kv == nil
+            }
+        guard reset else { return }
+        let nSteps = (step + tokenCount - 1) / step
+        let grown = MLXArray.zeros(
+            [batch, fusedHeads, nSteps * step, headDim], dtype: dtype)
+        if var current = self.kv {
+            if previous % step != 0 {
+                current = current[.ellipsis, ..<previous, 0...]
+            }
+            self.kv = concatenated([current, grown], axis: 2)
+        } else {
+            self.kv = grown
+        }
+    }
+
+    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        let previous = self.offset
+        let tokenCount = keys.dim(2)
+        let kvHeads = keys.dim(1)
+        ensureCapacity(
+            tokenCount: tokenCount, batch: keys.dim(0), fusedHeads: 2 * kvHeads,
+            headDim: keys.dim(3), dtype: keys.dtype)
+        self.offset += tokenCount
+        self.kv?[0..., ..<kvHeads, previous ..< self.offset, 0...] = keys
+        self.kv?[0..., kvHeads..., previous ..< self.offset, 0...] = values
+        return bands(upTo: self.offset)
+    }
+
+    public func updateStacked(_ stacked: MLXArray) -> (MLXArray, MLXArray) {
+        let previous = self.offset
+        let tokenCount = stacked.dim(2)
+        ensureCapacity(
+            tokenCount: tokenCount, batch: stacked.dim(0), fusedHeads: stacked.dim(1),
+            headDim: stacked.dim(3), dtype: stacked.dtype)
+        self.offset += tokenCount
+        self.kv?[.ellipsis, previous ..< self.offset, 0...] = stacked
+        return bands(upTo: self.offset)
+    }
+
+    public override var state: [MLXArray] {
+        get {
+            guard self.kv != nil else { return [] }
+            let (k, v) = bands(upTo: self.offset)
+            return [k, v]
+        }
+        set {
+            guard newValue.count == 2 else {
+                fatalError("FusedKVCacheSimple state must have exactly 2 arrays (keys, values)")
+            }
+            self.kv = concatenated([newValue[0], newValue[1]], axis: 1)
+            self.offset = self.kv!.dim(2)
+        }
+    }
+
+    public override func copy() -> any KVCache {
+        let new = FusedKVCacheSimple()
+        new.step = self.step
+        new.offset = self.offset
+        new.kv = self.kv.map { $0[.ellipsis] }
+        return new
+    }
+}
+
+/// Band-fused twin of `RotatingKVCache` (sliding-window ring). Every
+/// sequence-axis operation — temporal reordering, trim, growth stepping,
+/// ring-index wrap — is the stock arithmetic applied to the fused buffer;
+/// the incoming K/V are stacked along the head axis (multi-token calls pay
+/// one concat, prefill-only) or arrive pre-stacked from the fused QK-norm
+/// kernel (decode, the single-write fast path).
+public class FusedRotatingKVCache: BaseKVCache, BandFusedKVCache, CustomDebugStringConvertible {
+    var keep: Int
+    var kv: MLXArray?
+    var maxCacheSize: Int
+    var step: Int
+    var idx: Int = 0
+
+    public override var maxSize: Int? { maxCacheSize }
+
+    public init(maxSize: Int, keep: Int = 0, step: Int = 256) {
+        self.maxCacheSize = maxSize
+        self.keep = keep
+        self.step = step
+        super.init()
+    }
+
+    public override func innerState() -> [MLXArray] {
+        [self.kv].compactMap { $0 }
+    }
+
+    private func bands(upTo: Int?) -> (MLXArray, MLXArray) {
+        let kv = self.kv!
+        let kvHeads = kv.dim(1) / 2
+        if let upTo, upTo < kv.dim(2) {
+            return (
+                kv[0..., ..<kvHeads, ..<upTo, 0...],
+                kv[0..., kvHeads..., ..<upTo, 0...]
+            )
+        }
+        return (kv[0..., ..<kvHeads, 0..., 0...], kv[0..., kvHeads..., 0..., 0...])
+    }
+
+    private func trim(trimSize: Int, _ array: MLXArray, append: MLXArray? = nil) -> MLXArray {
+        var toCat: [MLXArray] = []
+        if trimSize > 0 {
+            toCat = [
+                array[.ellipsis, ..<keep, 0...],
+                array[.ellipsis, (trimSize + keep)..., 0...],
+            ]
+        } else {
+            toCat = [array]
+        }
+        if let append {
+            toCat.append(append)
+        }
+        return concatenated(toCat, axis: 2)
+    }
+
+    private func temporalOrder(_ array: MLXArray) -> MLXArray {
+        if idx == array.dim(2) {
+            return array
+        } else if idx < offset {
+            return concatenated(
+                [
+                    array[.ellipsis, ..<keep, 0...],
+                    array[.ellipsis, idx..., 0...],
+                    array[.ellipsis, keep ..< idx, 0...],
+                ], axis: 2)
+        } else {
+            return array[.ellipsis, ..<idx, 0...]
+        }
+    }
+
+    private func updateConcat(stacked: MLXArray) -> (MLXArray, MLXArray) {
+        if self.kv == nil {
+            self.kv = stacked
+        } else {
+            self.kv = temporalOrder(self.kv!)
+            idx = self.kv!.dim(2)
+            let trimSize = idx - maxCacheSize + 1
+            self.kv = trim(trimSize: trimSize, self.kv!, append: stacked)
+        }
+        offset += stacked.dim(2)
+        idx = self.kv!.dim(2)
+        return bands(upTo: nil)
+    }
+
+    private func updateInPlace(stacked: MLXArray, tokenCount: Int) -> (MLXArray, MLXArray) {
+        let prev = offset
+        var cacheLength = self.kv?.dim(2)
+
+        if cacheLength == nil
+            || (prev >= cacheLength! && cacheLength! < maxCacheSize)
+        {
+            let newSize = min(step, maxCacheSize - prev)
+            let grown = MLXArray.zeros(
+                [stacked.dim(0), stacked.dim(1), newSize, stacked.dim(3)],
+                dtype: stacked.dtype)
+            if let current = self.kv {
+                self.kv = concatenated([current, grown], axis: 2)
+            } else {
+                self.kv = grown
+            }
+            cacheLength = self.kv!.dim(2)
+            idx = prev
+        }
+
+        let trimSize = cacheLength! - maxCacheSize
+        if trimSize > 0 {
+            self.kv = trim(trimSize: trimSize, self.kv!)
+            idx = maxCacheSize
+        }
+
+        if idx == maxCacheSize {
+            idx = keep
+        }
+
+        self.kv![.ellipsis, idx ..< (idx + tokenCount), 0...] = stacked
+        offset += tokenCount
+        idx += tokenCount
+
+        if offset < maxCacheSize {
+            return bands(upTo: offset)
+        }
+        return bands(upTo: nil)
+    }
+
+    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        let stacked = concatenated([keys, values], axis: 1)
+        let tokenCount = keys.dim(2)
+        if tokenCount == 1 {
+            return updateInPlace(stacked: stacked, tokenCount: tokenCount)
+        }
+        return updateConcat(stacked: stacked)
+    }
+
+    public func updateStacked(_ stacked: MLXArray) -> (MLXArray, MLXArray) {
+        let tokenCount = stacked.dim(2)
+        if tokenCount == 1 {
+            return updateInPlace(stacked: stacked, tokenCount: tokenCount)
+        }
+        return updateConcat(stacked: stacked)
+    }
+
+    public override var state: [MLXArray] {
+        get {
+            guard self.kv != nil else { return [] }
+            let (k, v) = bands(upTo: min(offset, self.kv!.dim(2)))
+            return [k, v]
+        }
+        set {
+            guard newValue.count == 2 else {
+                fatalError("FusedRotatingKVCache state must have exactly 2 arrays")
+            }
+            self.kv = concatenated([newValue[0], newValue[1]], axis: 1)
+        }
+    }
+
+    public override var metaState: [String] {
+        get {
+            [String(keep), String(maxCacheSize), String(step), String(offset), String(idx)]
+        }
+        set {
+            guard newValue.count == 5 else {
+                fatalError("FusedRotatingKVCache metaState must have exactly 5 values")
+            }
+            guard let keepVal = Int(newValue[0]),
+                let maxSizeVal = Int(newValue[1]),
+                let stepVal = Int(newValue[2]),
+                let offsetVal = Int(newValue[3]),
+                let idxVal = Int(newValue[4])
+            else {
+                fatalError("Failed to convert metaState values to integers")
+            }
+            self.keep = keepVal
+            self.maxCacheSize = maxSizeVal
+            self.step = stepVal
+            self.offset = offsetVal
+            self.idx = idxVal
+        }
+    }
+
+    public override var isTrimmable: Bool {
+        offset < maxCacheSize
+    }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        let trimmed = min(offset, n)
+        offset -= trimmed
+        idx -= trimmed
+        return trimmed
+    }
+
+    /// Verbatim port of `RotatingKVCache.makeMask` — reads only
+    /// offset/idx/maxCacheSize, which this class maintains identically.
+    public override func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if n > 1 {
+            let actualWindowSize = windowSize ?? maxCacheSize
+            let cappedOffset = min(maxCacheSize - 1, offset)
+            if cappedOffset + n > actualWindowSize || returnArray {
+                return .array(
+                    createCausalMask(n: n, offset: cappedOffset, windowSize: actualWindowSize))
+            }
+            return .causal
+        } else {
+            guard let windowSize = windowSize else {
+                return .none
+            }
+            if offset >= windowSize, maxCacheSize > windowSize {
+                var currentIdx = idx
+                if currentIdx >= maxCacheSize {
+                    currentIdx = 0
+                }
+                let maskSize = offset < maxCacheSize ? offset + 1 : maxCacheSize
+                let mask = MLXArray(0 ..< Int32(maskSize)) .>= Int32(maskSize - windowSize)
+                let rolledMask = roll(mask, shift: currentIdx + 1)
+                return .array(rolledMask)
+            }
+            return .none
+        }
+    }
+
+    public var debugDescription: String {
+        "\(String(describing: Self.self)) offset: \(offset), maxSize: \(maxCacheSize.description), keep: \(keep), idx: \(idx)"
+    }
+
+    public override func copy() -> any KVCache {
+        let new = FusedRotatingKVCache(maxSize: maxCacheSize, keep: keep, step: step)
+        new.kv = self.kv.map { $0[.ellipsis] }
+        new.metaState = self.metaState
+        return new
+    }
+}
+
 /// Pick the supported quantization group size ({32, 64, 128}) closest to the
 /// requested one whose value divides both head dims. Returns nil when no
 /// supported group size is compatible. Upstream 01b8624.
