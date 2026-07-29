@@ -1456,15 +1456,38 @@ struct LagunaNativeAffineWeight {
 }
 
 /// REAL (not simulated) NVFP4 side layout for layers `>= N`
-/// (`DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM`, default 32 — the tail window whose
-/// per-layer amplification is ~15x below the early layers), using the same
+/// (`DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM`, default 30 — the tail window whose
+/// per-layer amplification is ~15x below the early layers; the two-layer
+/// advance from 32 was sized by the same logit-displacement measurement as
+/// the o_proj window below), using the same
 /// group-16 4-bit NVFP4 the routed experts already ship. Set
 /// `DARKBLOOM_NATIVE_AFFINE_NVFP4=0` to keep every native affine layout
 /// group-32 affine INT8 exactly as previously shipped.
 private let lagunaNativeAffineNVFP4From: Int? = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_NVFP4"] != "0"
     else { return nil }
-    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM"] ?? "32"
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM"] ?? "30"
+    guard let value = Int(raw), value < LagunaConstants.numHiddenLayers else { return nil }
+    return min(max(value, 0), LagunaConstants.numHiddenLayers)
+}()
+
+/// Separate NVFP4 depth for the o_proj side layout
+/// (`DARKBLOOM_NATIVE_AFFINE_OPROJ_NVFP4_FROM`, default 30; Q/K/V keep the
+/// shared default above). This bounded two-layer chunk was sized by
+/// measurement, not by family intuition: on a 512-token probe prompt the
+/// previously landed layers->=32 chunk displaces its predecessor's argmax
+/// token by ~0.75 logits (rank 1 -> 7), o_proj-only >=30 lands just inside
+/// that (~0.6, rank 1 -> 2), while >=28 doubles it (~1.8, rank 1 -> 9) and
+/// >=24 pushes the token out of the top five entirely — the perturbation
+/// grows steeply with remaining depth, so the window advances two layers at
+/// a time, not eight. `DARKBLOOM_NATIVE_AFFINE_NVFP4=0` still disables both
+/// families; `..._OPROJ_NVFP4_FROM=32` reproduces the previous submission
+/// exactly.
+private let lagunaNativeAffineOProjNVFP4From: Int? = {
+    guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_NVFP4"] != "0"
+    else { return nil }
+    let raw =
+        ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OPROJ_NVFP4_FROM"] ?? "30"
     guard let value = Int(raw), value < LagunaConstants.numHiddenLayers else { return nil }
     return min(max(value, 0), LagunaConstants.numHiddenLayers)
 }()
@@ -1517,7 +1540,8 @@ private func lagunaNativeAffineProbeRoundTrip(_ weight: MLXArray, layer: Int?) -
 }
 
 func lagunaNativeAffineWeight(
-    _ weight: MLXArray, layer: Int? = nil
+    _ weight: MLXArray, layer: Int? = nil,
+    nvfp4From: Int? = lagunaNativeAffineNVFP4From
 ) -> LagunaNativeAffineWeight? {
     guard weight.dtype == .bfloat16, weight.ndim == 2,
         weight.dim(1).isMultiple(of: 32)
@@ -1525,7 +1549,7 @@ func lagunaNativeAffineWeight(
         return nil
     }
     let source = lagunaNativeAffineProbeRoundTrip(weight, layer: layer)
-    if let from = lagunaNativeAffineNVFP4From,
+    if let from = nvfp4From,
         (layer ?? 0) >= from,
         weight.dim(1).isMultiple(of: 16)
     {
@@ -2452,7 +2476,9 @@ final class LagunaRuntimeAttention: Module {
             type(of: wo) == Linear.self,
             wo.bias == nil,
             wo.weight.shape == [LagunaConstants.hiddenSize, nHeads * headDim],
-            let quantizedWO = lagunaNativeAffineWeight(wo.weight, layer: layerIdx)
+            let quantizedWO = lagunaNativeAffineWeight(
+                wo.weight, layer: layerIdx,
+                nvfp4From: lagunaNativeAffineOProjNVFP4From)
         else {
             return []
         }
@@ -4024,8 +4050,15 @@ func lagunaRoutedDownReduce(
     )[0]
 }
 
+/// One output row per SIMD retains the exact row-local NVFP4 dot products and
+/// nine-slot BF16 reduction while exposing four times as many independent
+/// weight streams as the original four-accumulator form. The
+/// four-outputs-per-simd `v1` form was isolated by two controlled ranked
+/// submissions (identical numerics, kernel-only difference) as the cause of
+/// the 2026-07-29 ranked failure streak; this `r1_v3` form is the
+/// ranked-proven-safe variant.
 private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_down_residual_bf16_v1",
+    name: "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v3",
     inputNames: [
         "routed_activated", "routed_down_weight", "routed_down_scales",
         "indices", "router_weights", "shared_activated",
@@ -4037,7 +4070,7 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
         constexpr uint output_width = 2048;
         constexpr uint routed_experts = 8;
         constexpr uint shared_slot = 8;
-        constexpr uint outputs_per_simd = 4;
+        constexpr uint outputs_per_simd = 1;
         constexpr uint values_per_lane = 16;
         constexpr uint packed_row_bytes = 256;
         constexpr uint scale_row_bytes = 32;
@@ -4076,9 +4109,7 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
             input_values[4 * i + 3] = values[3];
         }
 
-        thread float result[outputs_per_simd] = {
-            0.0f, 0.0f, 0.0f, 0.0f
-        };
+        thread float result[outputs_per_simd] = {0.0f};
         for (uint row = 0; row < outputs_per_simd; ++row) {
             uint output_row = first_row + row;
             const device uint8_t* weight =
@@ -4190,7 +4221,7 @@ func lagunaRoutedSharedDownResidual(
             indices, routerWeights, sharedActivated,
             sharedDownWeight, sharedDownScales, residual,
         ],
-        grid: ((LagunaConstants.hiddenSize / 4) * 288, 1, 1),
+        grid: (LagunaConstants.hiddenSize * 288, 1, 1),
         threadGroup: (288, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
         outputDTypes: [.bfloat16]
