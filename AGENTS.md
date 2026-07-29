@@ -584,6 +584,20 @@ markers for those rows. Generic, bit-exact, or production-useful
 implementations are still excluded under this track. Pre-hello or
 initialization warmup of an excluded speculative pipeline is also excluded.
 
+The reference model's NVFP4 quantization scheme is frozen: group size 16,
+4 bits, mode `nvfp4`. Submitted runtime code and the offline transform may
+relayout, co-tile, or repack the weights for faster dispatch only while
+preserving those exact NVFP4 group-16 4-bit values. Re-quantizing any model
+weight — attention Q/K/V or output projection, MoE routed or shared expert,
+router gate, embedding, `lm_head`, or any other parameter — to a different
+scheme (a different mode such as affine/INT8 or MXFP8, a different bit width,
+or a group size other than 16), whether at load time or in the transform, is
+out of scope for this track even when the re-quantized path passes the
+correctness gates: it substitutes a different numerical representation of the
+model rather than optimizing the shipped one. Re-deriving the identical NVFP4
+group-16 4-bit scheme, pure memory relayout/co-tiling that preserves the NVFP4
+values, and input-independent dequantized caches remain allowed.
+
 Ordinary within-request KV reuse, current-token-only decode, and
 input-independent weight, dequantization, kernel, mask, or RoPE caches remain
 allowed. Multi-row kernels remain allowed when every row is backed by a token
