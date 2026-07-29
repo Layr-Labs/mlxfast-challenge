@@ -112,6 +112,53 @@ using namespace metal;
 #define DARKBLOOM_GQA_PAIR_HEADS 2
 #endif
 
+// ---------------------------------------------------------------------------
+// DARKBLOOM: QUAD-head K/V sharing for the gqa_factor == 8 sliding layers.
+//
+// The promoted pair kernel above shares one K/V load across TWO adjacent
+// query heads and its own comment calls two heads "deliberately
+// conservative". This extends the identical mechanism to FOUR heads on the
+// only family where four is legal.
+//
+// WHY FOUR IS LEGAL HERE AND ONLY HERE. A head group may share a K/V load
+// only if every head in it maps to the same KV head, i.e. only if the group
+// width divides gqa_factor. Laguna's sliding layers have 64 query heads over
+// 8 KV heads (gqa_factor 8) and 8 % 4 == 0, so groups (0..3), (4..7), ...
+// never straddle a KV-head boundary. The full-attention layers have
+// gqa_factor 6 and 6 % 4 == 2, so quads there WOULD straddle (heads 4..7 span
+// kv0 and kv1). Those layers therefore keep the promoted pair path verbatim,
+// selected by the runtime `gqa_factor` value, not by a compile-time guess.
+//
+// BYTES. Per sliding layer a KV head's K+V window is 2 * 512 * 128 * 2 B =
+// 262 KB. At one head per threadgroup each KV head's rows are re-read 8
+// times (16.78 MB/layer); the promoted pair halves that to 4 (8.39 MB); quads
+// halve it again to 2 (4.19 MB). Across the 30 sliding layers that is
+// 252 MB -> 126 MB per decode token, i.e. ~126 MB removed, about 3.3% of the
+// ~3775 MB total decode byte budget. Decode is at the memory wall on this
+// box, so this is the same lever the pair kernel was promoted for, applied
+// once more.
+//
+// THREADGROUP MEMORY. Each head keeps its own two exchange planes, so the
+// quad path needs 4 heads * 2 planes... which would be 8 * 4 KiB = 32 KiB and
+// would NOT fit alongside max/sum. Instead the quad path uses ONE plane per
+// head (4 * 4 KiB = 16 KiB) and runs the combine as v_per_thread groups of
+// one, i.e. the upstream single-plane recycling shape applied per head. Total
+// threadgroup use is 16384 + 2 * (4 * 32 * 4) = 17408 B, comfortably inside
+// the 32 KiB limit and no larger than the promoted pair kernel's 16 KiB of
+// planes.
+//
+// EXACTNESS. Every head keeps its own private query registers, its own
+// online-softmax running max/sum, its own output accumulators, its own
+// `simd_sum` score reduction and its own final 32-simdgroup combine tree.
+// Sharing affects only WHERE the K and V values come from (one device read
+// feeding four heads instead of four reads of the same resident bytes) --
+// bit-identical values, since all four heads read the same addresses in the
+// same `i` order as before. No score, factor, accumulation order or rounding
+// boundary moves.
+#ifndef DARKBLOOM_GQA_QUAD_HEADS
+#define DARKBLOOM_GQA_QUAD_HEADS 4
+#endif
+
 constant bool has_mask [[function_constant(20)]];
 constant bool query_transposed [[function_constant(21)]];
 constant bool do_causal [[function_constant(22)]];
@@ -176,9 +223,145 @@ template <
       (D == 128 && V == 128 && DARKBLOOM_GQA_PAIR_HEADS == 2)
       ? 4
       : v_planes;
-  threadgroup U outputs[exchange_planes * BN * BD];
-  threadgroup U max_scores[DARKBLOOM_GQA_PAIR_HEADS * BN];
-  threadgroup U sum_exp_scores[DARKBLOOM_GQA_PAIR_HEADS * BN];
+  // The quad path needs one plane per head (4) and one max/sum bank per head;
+  // both are <= what the pair path already reserves, so taking the max of the
+  // two shapes keeps a single allocation that serves whichever path runs.
+  constexpr int quad_heads = DARKBLOOM_GQA_QUAD_HEADS;
+  constexpr int all_planes =
+      exchange_planes > quad_heads ? exchange_planes : quad_heads;
+  constexpr int score_banks = DARKBLOOM_GQA_PAIR_HEADS > quad_heads
+      ? DARKBLOOM_GQA_PAIR_HEADS
+      : quad_heads;
+  threadgroup U outputs[all_planes * BN * BD];
+  threadgroup U max_scores[score_banks * BN];
+  threadgroup U sum_exp_scores[score_banks * BN];
+
+  // DARKBLOOM quad-head K/V sharing: gqa_factor == 8 only (8 % 4 == 0), so a
+  // group of four adjacent query heads always maps to one KV head. See the
+  // header block for the byte accounting and the exactness argument.
+  const bool use_gqa_quad = D == 128 && V == 128 && quad_heads == 4 &&
+      gqa_factor == 8 && tpg.y == 1 && (tpg.x % 4) == 0 && !has_mask &&
+      !do_causal && !has_sinks;
+  if (use_gqa_quad) {
+    const int group_idx = tid.x;
+    const int q_head_base = quad_heads * group_idx;
+    // Upper 3/4 of the unchanged host grid exits uniformly before any model
+    // data is touched, exactly as the promoted pair path's upper half does.
+    if (q_head_base >= int(tpg.x)) {
+      return;
+    }
+    const int kv_head_idx = q_head_base / gqa_factor;
+
+    const device T* quad_keys = keys + kv_head_idx * k_head_stride +
+        simd_gid * k_seq_stride + simd_lid * qk_per_thread;
+    const device T* quad_values = values + kv_head_idx * v_head_stride +
+        simd_gid * v_seq_stride + simd_lid * v_per_thread;
+
+    thread U quad_q[quad_heads][qk_per_thread];
+    thread U quad_k[qk_per_thread];
+    thread U quad_o[quad_heads][v_per_thread];
+    thread U quad_max[quad_heads];
+    thread U quad_sum[quad_heads];
+
+    for (int h = 0; h < quad_heads; ++h) {
+      const device T* head_query =
+          queries + (q_head_base + h) * D + simd_lid * qk_per_thread;
+      for (int j = 0; j < qk_per_thread; ++j) {
+        quad_q[h][j] = static_cast<U>(scale) * head_query[j];
+      }
+      for (int j = 0; j < v_per_thread; ++j) {
+        quad_o[h][j] = 0;
+      }
+      quad_max[h] = Limits<U>::finite_min;
+      quad_sum[h] = 0;
+    }
+
+    // One shared K/V read per step feeds all four heads. Each head's score,
+    // running max, rescale factor and accumulator update are textually the
+    // stock per-head sequence, in the same `i` order.
+    for (int i = simd_gid; i < N; i += BN) {
+      for (int j = 0; j < qk_per_thread; ++j) {
+        quad_k[j] = quad_keys[j];
+      }
+
+      U quad_factor[quad_heads];
+      U quad_exp[quad_heads];
+      for (int h = 0; h < quad_heads; ++h) {
+        U score = 0;
+        for (int j = 0; j < qk_per_thread; ++j) {
+          score += quad_q[h][j] * quad_k[j];
+        }
+        score = simd_sum(score);
+
+        U new_max = max(quad_max[h], score);
+        quad_factor[h] = fast::exp(quad_max[h] - new_max);
+        quad_exp[h] = fast::exp(score - new_max);
+        quad_max[h] = new_max;
+        quad_sum[h] = quad_sum[h] * quad_factor[h] + quad_exp[h];
+      }
+
+      for (int j = 0; j < v_per_thread; ++j) {
+        const T shared_value = quad_values[j];
+        for (int h = 0; h < quad_heads; ++h) {
+          quad_o[h][j] =
+              quad_o[h][j] * quad_factor[h] + quad_exp[h] * shared_value;
+        }
+      }
+
+      quad_keys += inner_k_stride;
+      quad_values += inner_v_stride;
+    }
+
+    // Per-head combine. Each head owns bank `h` of max/sum and plane `h` of
+    // the exchange buffer, so the producer/consumer pairing, the lane
+    // ordering and every simd_sum tree are the stock ones with an additive
+    // per-head base address.
+    if (simd_lid == 0) {
+      for (int h = 0; h < quad_heads; ++h) {
+        max_scores[h * BN + simd_gid] = quad_max[h];
+        sum_exp_scores[h * BN + simd_gid] = quad_sum[h];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    U quad_global_factor[quad_heads];
+    for (int h = 0; h < quad_heads; ++h) {
+      U head_max = max_scores[h * BN + simd_lid];
+      U global_max = simd_max(head_max);
+      quad_global_factor[h] = fast::exp(head_max - global_max);
+      quad_sum[h] =
+          simd_sum(sum_exp_scores[h * BN + simd_lid] * quad_global_factor[h]);
+    }
+
+    // One plane per head, recycled across the v_per_thread elements: the
+    // upstream single-plane exchange shape, run per head. The barriers guard
+    // only that recycling.
+    constexpr int quad_plane_size = BN * BD;
+    for (int e = 0; e < v_per_thread; ++e) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int h = 0; h < quad_heads; ++h) {
+        outputs[h * quad_plane_size + simd_lid * BD + simd_gid] = quad_o[h][e];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int h = 0; h < quad_heads; ++h) {
+        U acc = simd_sum(
+            outputs[h * quad_plane_size + simd_gid * BD + simd_lid] *
+            quad_global_factor[h]);
+        quad_o[h][e] = quad_sum[h] == 0 ? acc : (acc / quad_sum[h]);
+      }
+    }
+
+    if (simd_lid == 0) {
+      for (int h = 0; h < quad_heads; ++h) {
+        device T* head_out = out + (q_head_base + h) * V +
+            simd_gid * v_per_thread;
+        for (int e = 0; e < v_per_thread; ++e) {
+          head_out[e] = static_cast<T>(quad_o[h][e]);
+        }
+      }
+    }
+    return;
+  }
 
   // DARKBLOOM_GQA_PAIR_HEADS: preserve each head's exact key order and
   // reduction tree while sharing the K/V device reads across adjacent heads.
