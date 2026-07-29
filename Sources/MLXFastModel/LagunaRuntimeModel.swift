@@ -282,6 +282,28 @@ private func lagunaUseNativeAffineQKV(layer: Int) -> Bool {
     layer < lagunaNativeAffineQKVLayerCount
 }
 
+/// Sibling rollout for the attention OUTPUT projection: the same group-32
+/// affine INT8 side layout applied to `o_proj` (16.8 MB BF16 per sliding
+/// layer, 12.6 MB per full-attention layer — ~630 MB per decode step across
+/// the tower). The gate product keeps the stock BF16 broadcast boundary
+/// (identical to the pre-L5 two-dispatch path); only the GEMV's weight
+/// traffic changes. Chunk 1: the first 12 layers, sized to the same
+/// acceptance-band arithmetic as the QKV rollout (12 measured locally at
+/// +3.0-3.5%; 8 ships to stay under the rolling-calibration worst case).
+private let lagunaNativeAffineOProjLayerCount: Int = {
+    guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OPROJ"] != "0"
+    else { return 0 }
+    let requested = Int(
+        ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OPROJ_LAYERS"]
+            ?? "8") ?? 8
+    return min(max(requested, 0), LagunaConstants.numHiddenLayers)
+}()
+let lagunaNativeAffineOProjEnabled = lagunaNativeAffineOProjLayerCount > 0
+
+private func lagunaUseNativeAffineOProj(layer: Int) -> Bool {
+    layer < lagunaNativeAffineOProjLayerCount
+}
+
 /// Sliding-layer per-head RMSNorm + plain RoPE fusion (see
 /// `lagunaSlidingQKNormRoPEKernel`).
 ///
@@ -2305,6 +2327,22 @@ final class LagunaRuntimeAttention: Module {
         return fused.arrays
     }
 
+    /// Derived native group-32 affine layout for the output projection.
+    /// Same contract as `_nativeAffineQKV`: the BF16 parameter stays
+    /// authoritative (prefill and every non-selected layer keep it).
+    var _nativeAffineOProj: LagunaNativeAffineWeight?
+
+    func prepareNativeAffineOProjWeight() -> [MLXArray] {
+        guard _nativeAffineOProj == nil,
+            wo.bias == nil, type(of: wo) == Linear.self,
+            let projection = lagunaNativeAffineWeight(wo.weight)
+        else {
+            return []
+        }
+        _nativeAffineOProj = projection
+        return projection.arrays
+    }
+
     /// Builds and retains the fused QKV weight from the loaded q/k/v
     /// projection weights. Called once after weights are installed and
     /// evaluated (before warmup); returns the new array so the caller can
@@ -2645,6 +2683,34 @@ final class LagunaRuntimeAttention: Module {
                 }
                 projectedGate = gProj(normalizedInput)
                 gateIsActivated = false
+            }
+            // Native-affine o_proj rollout (chunked like the QKV sibling):
+            // the gate product keeps the stock BF16 broadcast expression
+            // below verbatim, then the projection GEMV runs over the
+            // group-32 affine INT8 side layout instead of the BF16 weight.
+            // Any guard mismatch falls through to the fused/stock paths.
+            if lagunaUseNativeAffineOProj(layer: layerIdx),
+                let affine = _nativeAffineOProj,
+                gateIsActivated, gatePerHead, L == 1, B == 1, wo.bias == nil,
+                headDim == LagunaConstants.headDim,
+                output.dtype == .bfloat16, projectedGate.dtype == .bfloat16,
+                output.shape == [1, 1, nHeads * headDim],
+                projectedGate.shape == [1, 1, nHeads]
+            {
+                let gated =
+                    (output.reshaped(B, L, nHeads, headDim)
+                        * projectedGate[.ellipsis, .newAxis])
+                    .reshaped(B, L, -1)
+                return quantizedMM(
+                    gated,
+                    affine.packedCodes,
+                    scales: affine.scales,
+                    biases: affine.biases,
+                    transpose: true,
+                    groupSize: 32,
+                    bits: 8,
+                    mode: .affine
+                )
             }
             if lagunaFusedGatedOutputProjectionEnabled,
                 gateIsActivated, gatePerHead, L == 1, B == 1, wo.bias == nil,
@@ -6528,6 +6594,10 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
             if lagunaUseNativeAffineQKV(layer: layer.selfAttn.layerIdx) {
                 fusedArrays.append(
                     contentsOf: layer.selfAttn.prepareNativeAffineQKVWeight())
+            }
+            if lagunaUseNativeAffineOProj(layer: layer.selfAttn.layerIdx) {
+                fusedArrays.append(
+                    contentsOf: layer.selfAttn.prepareNativeAffineOProjWeight())
             }
             if lagunaFusedQKVEnabled, let fused = layer.selfAttn.prepareFusedQKVWeight() {
                 fusedArrays.append(fused)
