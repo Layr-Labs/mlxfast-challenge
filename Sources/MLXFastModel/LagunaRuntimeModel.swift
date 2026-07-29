@@ -277,6 +277,29 @@ private let lagunaNativeAffineQKVLayerCount: Int = {
 }()
 let lagunaNativeAffineQKVEnabled = lagunaNativeAffineQKVLayerCount > 0
 
+/// Latest affine-QKV layers whose per-head attention gate is appended to the
+/// existing native group-32 affine Q/K/V side layout. This removes the separate
+/// split-K BF16 `g_proj` GEMV without adding a dispatch. Selecting backward from
+/// the affine/NVFP4 boundary gives the quantization perturbation the fewest
+/// downstream layers to amplify through while keeping the exact same periodic
+/// mix of full/sliding attention shapes. The gate is never appended to an
+/// NVFP4 Q/K/V tail layout: the accepted gate envelope is group-32 affine INT8
+/// only. `0` disables; the default eight-layer dose selects layers 24...31.
+private let lagunaNativeAffineGProjLayerCount: Int = {
+    guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_GPROJ"] != "0"
+    else { return 0 }
+    let requested = Int(
+        ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_GPROJ_LAYERS"]
+            ?? "8") ?? 8
+    return min(max(requested, 0), 32)
+}()
+
+private func lagunaUseNativeAffineGProj(layer: Int) -> Bool {
+    let affineEnd = lagunaNativeAffineNVFP4From ?? LagunaConstants.numHiddenLayers
+    let affineStart = max(0, affineEnd - lagunaNativeAffineGProjLayerCount)
+    return layer >= affineStart && layer < affineEnd
+}
+
 /// Depth-selection mode for both native affine INT8 attention layouts.
 ///
 /// **Default (unset or anything but `1`) is the shipped PREFIX predicate**
@@ -2440,6 +2463,7 @@ final class LagunaRuntimeAttention: Module {
     /// Q/K/V batch. The original BF16 parameters remain authoritative and
     /// continue to serve prefill.
     var _nativeAffineQKV: LagunaNativeAffineWeight?
+    var _nativeAffineQKVIncludesGate = false
 
     /// Derived native group-32 affine layout for the attention output
     /// projection, used only by the serial decode call. `wo.weight` remains the
@@ -2468,19 +2492,39 @@ final class LagunaRuntimeAttention: Module {
         else {
             return []
         }
+
+        var components = [q, k, v]
+        if lagunaUseNativeAffineGProj(layer: layerIdx),
+            q.groupSize == 32, q.bits == 8, q.mode == .affine,
+            let gateProjection = gProj,
+            gateProjection.bias == nil,
+            type(of: gateProjection) == Linear.self,
+            gateProjection.weight.dtype == .bfloat16,
+            gateProjection.weight.shape == [nHeads, LagunaConstants.hiddenSize],
+            let gate = lagunaNativeAffineWeight(
+                gateProjection.weight, layer: layerIdx),
+            gate.groupSize == q.groupSize,
+            gate.bits == q.bits,
+            gate.mode == q.mode
+        {
+            components.append(gate)
+            _nativeAffineQKVIncludesGate = true
+        }
+
         let packedCodes = concatenated(
-            [q.packedCodes, k.packedCodes, v.packedCodes], axis: 0)
-        let scales = concatenated([q.scales, k.scales, v.scales], axis: 0)
+            components.map(\.packedCodes), axis: 0)
+        let scales = concatenated(components.map(\.scales), axis: 0)
         var biases: MLXArray?
-        if let qb = q.biases, let kb = k.biases, let vb = v.biases {
-            biases = concatenated([qb, kb, vb], axis: 0)
+        let componentBiases = components.compactMap(\.biases)
+        if componentBiases.count == components.count {
+            biases = concatenated(componentBiases, axis: 0)
         }
         let fused = LagunaNativeAffineWeight(
             packedCodes: packedCodes,
             scales: scales,
             biases: biases,
             originalShape: [
-                wq.weight.dim(0) + wk.weight.dim(0) + wv.weight.dim(0),
+                components.reduce(0) { $0 + $1.originalShape[0] },
                 wq.weight.dim(1),
             ],
             groupSize: q.groupSize,
@@ -2606,7 +2650,7 @@ final class LagunaRuntimeAttention: Module {
                 let fusedAffine = _nativeAffineQKV
             {
                 let normalized = inputNorm(input)
-                let qkv = quantizedMM(
+                let projections = quantizedMM(
                     normalized,
                     fusedAffine.packedCodes,
                     scales: fusedAffine.scales,
@@ -2618,13 +2662,17 @@ final class LagunaRuntimeAttention: Module {
                 )
                 let queryDim = nHeads * headDim
                 let kvDim = nKVHeads * headDim
-                let gateLogits = gateProjection(normalized)
+                let qkvEnd = queryDim + 2 * kvDim
+                let gateLogits =
+                    _nativeAffineQKVIncludesGate
+                    ? projections[.ellipsis, qkvEnd ..< (qkvEnd + nHeads)]
+                    : gateProjection(normalized)
                 let activatedGate =
                     softplus(gateLogits.asType(.float32)).asType(.bfloat16)
                 fusedNormQKV = (
-                    qkv[.ellipsis, 0 ..< queryDim],
-                    qkv[.ellipsis, queryDim ..< (queryDim + kvDim)],
-                    qkv[.ellipsis, (queryDim + kvDim) ..< (queryDim + 2 * kvDim)],
+                    projections[.ellipsis, 0 ..< queryDim],
+                    projections[.ellipsis, queryDim ..< (queryDim + kvDim)],
+                    projections[.ellipsis, (queryDim + kvDim) ..< qkvEnd],
                     activatedGate
                 )
             } else {
