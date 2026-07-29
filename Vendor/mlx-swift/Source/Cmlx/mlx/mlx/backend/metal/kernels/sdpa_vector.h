@@ -112,6 +112,14 @@ using namespace metal;
 #define DARKBLOOM_GQA_PAIR_HEADS 2
 #endif
 
+// Whether the pairing above also applies to the gqa_factor == 6
+// full-attention family. Default 0 = full-attention keeps the stock
+// one-head-per-threadgroup path; see the occupancy table at the
+// `use_gqa_pair` selector below for the reasoning.
+#ifndef DARKBLOOM_GQA_PAIR_FULL_ATTENTION
+#define DARKBLOOM_GQA_PAIR_FULL_ATTENTION 0
+#endif
+
 // ---------------------------------------------------------------------------
 // DARKBLOOM_ALPHASKIP: exact online-softmax rescale elision, keyed on the
 // bit-exact alpha == 1 case. Default ON; `0` restores the stock statement
@@ -292,9 +300,59 @@ template <
 
   // DARKBLOOM_GQA_PAIR_HEADS: preserve each head's exact key order and
   // reduction tree while sharing the K/V device reads across adjacent heads.
+  //
+  // DARKBLOOM_GQA_PAIR_FULL_ATTENTION (default 0 = pairing DISABLED for the
+  // gqa_factor == 6 full-attention family; set 1 to restore pairing there).
+  //
+  // WHY THE TWO FAMILIES ARE SPLIT. Pairing trades threadgroup count for K/V
+  // reads, and on this box that trade changes sign around one threadgroup per
+  // GPU core (~40 cores on the ranked M5 Max):
+  //
+  // ```
+  // family                 width  threadgroups  per core
+  // sliding   (30 layers)    1         64         1.60x
+  // sliding   (30 layers)    2         32         0.80x
+  // full-attn (10 layers)    1         48         1.20x
+  // full-attn (10 layers)    2         24         0.60x   <- worst in the model
+  // ```
+  //
+  // The full-attention family has only 48 query heads, so pairing takes it to
+  // **24 threadgroups against ~40 cores** -- the most starved dispatch in the
+  // decode step, and strictly more starved than the sliding family that
+  // motivated the pairing win. Reverting pairing for `gqa_factor == 6` alone
+  // restores 48 threadgroups (1.20x) on those ten layers.
+  //
+  // WHAT IT COSTS. Un-sharing the full-attention K/V doubles those layers'
+  // K/V re-reads: 10 layers x (K+V) x 8 KV heads x <=640 positions x 128 dims
+  // x 2 B = about 26 MB per decode token, against a ~3775 MB total decode byte
+  // budget (~0.7%). That is a small, quantified byte cost to double occupancy
+  // on a dispatch sitting at 0.60x.
+  //
+  // WHY I BELIEVE THE SIGN. I submitted the opposite experiment and the ranked
+  // box priced it precisely: extending pairing from 2 to 4 heads on the
+  // sliding family removed ~126 MB/token (~3.3% of the budget), was bit-exact,
+  // and still measured **-6.05%** -- because it took that dispatch from 32 to
+  // 16 threadgroups (0.80x -> 0.40x). Byte savings do not pay for lost
+  // parallelism below saturation. Run that finding backwards on the family
+  // that is furthest below saturation and you get this change.
+  //
+  // The sliding family keeps pairing untouched: at 0.80x it is closer to
+  // saturation and its byte saving is ~5x larger (its K/V window is re-read by
+  // 8 query heads per KV head rather than 6), so the same trade does not
+  // obviously invert there. One variable, one family.
+  //
+  // EXACTNESS. Both arms already exist in this file and both are already
+  // gated: `use_gqa_pair` false simply falls through to the stock single-head
+  // path below, which is the code every full-attention decode layer ran before
+  // pairing was introduced. No kernel body, arithmetic, accumulation order,
+  // rounding boundary, grid, dtype or KV behavior is modified by this change --
+  // only which of two existing, independently validated paths a
+  // `gqa_factor == 6` dispatch selects.
+  const bool gqa_pair_factor_ok = (gqa_factor == 8) ||
+      (DARKBLOOM_GQA_PAIR_FULL_ATTENTION && gqa_factor == 6);
   const bool use_gqa_pair =
       D == 128 && V == 128 && DARKBLOOM_GQA_PAIR_HEADS == 2 &&
-      (gqa_factor == 8 || gqa_factor == 6) &&
+      gqa_pair_factor_ok &&
       tpg.y == 1 && (tpg.x % 2) == 0 &&
       !has_mask && !do_causal && !has_sinks;
   if (use_gqa_pair) {
