@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXFast
 import MLXNN
 
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
@@ -91,15 +92,88 @@ private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     return body
 }()
 
-public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+/// Frozen Laguna prefill specialization for 512 tokens × top-8 routes over
+/// exactly 256 experts. The stock forward `argSort(indices)` is a multi-pass
+/// merge sort at 4096 elements. A fixed-domain counting sort emits the same
+/// expert-grouped rows and sorted expert IDs in one dispatch. Route order
+/// within an expert is intentionally unspecified: gathered rows are computed
+/// independently, and the stock inverse `argSort(order)` below restores every
+/// route to its original slot before any consumer observes it.
+private let lagunaPrefillExpertCountingSortKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_expert_counting_sort_u32_4096x256_v1",
+    inputNames: ["indices"],
+    outputNames: ["order", "sorted_indices"],
+    source: """
+        constexpr uint route_count = 4096;
+        constexpr uint expert_count = 256;
+
+        uint expert = thread_position_in_threadgroup.x;
+        threadgroup atomic_uint counts[expert_count];
+        threadgroup atomic_uint cursors[expert_count];
+
+        atomic_store_explicit(&counts[expert], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint route = expert; route < route_count; route += expert_count) {
+            uint routed_expert = uint(indices[route]);
+            atomic_fetch_add_explicit(
+                &counts[routed_expert], 1u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint write = 0;
+        for (uint prior = 0; prior < expert; ++prior) {
+            write += atomic_load_explicit(
+                &counts[prior], memory_order_relaxed);
+        }
+        atomic_store_explicit(&cursors[expert], write, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint route = expert; route < route_count; route += expert_count) {
+            uint routed_expert = uint(indices[route]);
+            uint slot = atomic_fetch_add_explicit(
+                &cursors[routed_expert], 1u, memory_order_relaxed);
+            order[slot] = route;
+            sorted_indices[slot] = routed_expert;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private func lagunaPrefillExpertCountingSort(
+    _ indices: MLXArray, expertCount: Int?
+) -> (order: MLXArray, sortedIndices: MLXArray)? {
+    guard expertCount == 256,
+        indices.dtype == .uint32,
+        indices.shape == [1, 512, 8]
+    else {
+        return nil
+    }
+
+    let outputs = lagunaPrefillExpertCountingSortKernel(
+        [indices.flattened()],
+        grid: (256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[4096], [4096]],
+        outputDTypes: [.uint32, .uint32]
+    )
+    return (outputs[0], outputs[1])
+}
+
+public func gatherSort(
+    x: MLXArray, indices: MLXArray, expertCount: Int? = nil
+) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
+    let specialized = lagunaPrefillExpertCountingSort(
+        indices, expertCount: expertCount)
     let indices = indices.flattened()
-    let order = argSort(indices)
+    let order = specialized?.order ?? argSort(indices)
+    let sortedIndices = specialized?.sortedIndices ?? indices[order]
     let inverseOrder = argSort(order)
 
     return (
         x.flattened(start: 0, end: -3)[order.floorDivide(m)],
-        indices[order],
+        sortedIndices,
         inverseOrder
     )
 }
@@ -223,7 +297,8 @@ public class SwitchGLU: Module {
         var inverseOrder = MLXArray()
 
         if doSort {
-            (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
+            (x, idx, inverseOrder) = gatherSort(
+                x: x, indices: indices, expertCount: numExperts)
         }
 
         let xGate: MLXArray
