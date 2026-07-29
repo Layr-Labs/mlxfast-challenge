@@ -1124,8 +1124,16 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
     std::string kernel_source;
+    // Ranked M5 transfer: contiguous expert-bound reuse reduced Laguna's
+    // candidate prefill from 0.000261590 to 0.000258972 seconds/token while
+    // retaining exact 1,344-step correctness (submission ab65cc0).
+    const bool expert_bounds_precompute =
+        env::get_var("DARKBLOOM_EXPERT_BOUNDS_PRECOMPUTE", "") != "0";
     concatenate(
         kernel_source,
+        expert_bounds_precompute
+            ? "\n#define DARKBLOOM_EXPERT_BOUNDS_PRECOMPUTE 1\n"
+            : "",
         metal::utils(),
         metal::gemm_nax(),
         metal::quantized_utils(),
