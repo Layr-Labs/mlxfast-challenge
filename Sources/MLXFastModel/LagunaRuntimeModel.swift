@@ -104,6 +104,13 @@ func lagunaTrace(_ site: String) {
 let lagunaFusedQKVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] == "1"
 
+/// `DARKBLOOM_PREFILL_FUSED_KV` (default on; set "0" to disable): retain one
+/// row-concatenated `[Wk; Wv]` BF16 weight per attention layer and use it only
+/// for multi-token prefill. Q remains a separate projection so it keeps the
+/// larger output geometry selected by the stock Steel GEMM dispatch.
+let lagunaPrefillFusedKVEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_KV"] != "0"
+
 /// `DARKBLOOM_FUSED_SHARED_GATE_UP` (default on; set "0" to disable): after
 /// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
 /// shared expert and serve single-token decode from one quantized matmul.
@@ -1946,6 +1953,10 @@ final class LagunaRuntimeAttention: Module {
     /// arrays for parameter integrity.
     var _fusedQKVWeight: MLXArray?
 
+    /// Retained `[Wk; Wv]` projection bank for the multi-token prefill path.
+    /// Decode deliberately keeps the existing single-row fused custom kernel.
+    var _fusedKVWeight: MLXArray?
+
     /// Builds and retains the fused QKV weight from the loaded q/k/v
     /// projection weights. Called once after weights are installed and
     /// evaluated (before warmup); returns the new array so the caller can
@@ -1972,6 +1983,26 @@ final class LagunaRuntimeAttention: Module {
         }
         let fused = concatenated([wq.weight, wk.weight, wv.weight], axis: 0)
         _fusedQKVWeight = fused
+        return fused
+    }
+
+    /// Builds the smaller K/V-only bank used by prefill. Matching complete
+    /// shapes (not merely input widths) keeps both halves on the same Steel
+    /// GEMM geometry while preserving every original output row.
+    func prepareFusedKVWeight() -> MLXArray? {
+        guard _fusedKVWeight == nil,
+            type(of: wk) == Linear.self,
+            type(of: wv) == Linear.self,
+            wk.bias == nil, wv.bias == nil,
+            wk.weight.ndim == 2, wv.weight.ndim == 2,
+            wk.weight.dtype == wv.weight.dtype,
+            wk.weight.shape == wv.weight.shape,
+            wk.weight.dim(0) == nKVHeads * headDim
+        else {
+            return nil
+        }
+        let fused = concatenated([wk.weight, wv.weight], axis: 0)
+        _fusedKVWeight = fused
         return fused
     }
 
@@ -2068,9 +2099,9 @@ final class LagunaRuntimeAttention: Module {
         }
         // The fused result already contains every consumer of the normalized
         // row. Materialize that row only for the stock projections or the
-        // retained row-concatenated QKV bank. Checking actual bank presence
-        // above (rather than its environment flag) preserves the custom
-        // fallback if fused-weight preparation declined.
+        // retained row-concatenated QKV/KV banks. Checking actual bank
+        // presence above (rather than its environment flag) preserves the
+        // custom fallback if fused-weight preparation declined.
         let normalizedInput: MLXArray? =
             fusedNormQKV == nil ? inputNorm(input) : nil
 
@@ -2097,6 +2128,15 @@ final class LagunaRuntimeAttention: Module {
             queries = fused.queries
             keys = fused.keys
             values = fused.values
+        } else if let fusedKVWeight = _fusedKVWeight, L > 1 {
+            guard let normalizedInput else {
+                preconditionFailure("retained fused KV requires normalized input")
+            }
+            queries = wq(normalizedInput)
+            let kv = matmul(normalizedInput, fusedKVWeight.T)
+            let kvDim = nKVHeads * headDim
+            keys = kv[.ellipsis, 0 ..< kvDim]
+            values = kv[.ellipsis, kvDim ..< (2 * kvDim)]
         } else {
             guard let normalizedInput else {
                 preconditionFailure("stock QKV projections require normalized input")
@@ -3124,8 +3164,11 @@ func lagunaRoutedDownReduce(
     )[0]
 }
 
+/// One output row per SIMD retains the exact row-local NVFP4 dot products and
+/// nine-slot BF16 reduction while exposing four times as many independent
+/// weight streams as the original four-accumulator form.
 private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_down_residual_bf16_v1",
+    name: "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v3",
     inputNames: [
         "routed_activated", "routed_down_weight", "routed_down_scales",
         "indices", "router_weights", "shared_activated",
@@ -3137,7 +3180,7 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
         constexpr uint output_width = 2048;
         constexpr uint routed_experts = 8;
         constexpr uint shared_slot = 8;
-        constexpr uint outputs_per_simd = 4;
+        constexpr uint outputs_per_simd = 1;
         constexpr uint values_per_lane = 16;
         constexpr uint packed_row_bytes = 256;
         constexpr uint scale_row_bytes = 32;
@@ -3176,9 +3219,7 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
             input_values[4 * i + 3] = values[3];
         }
 
-        thread float result[outputs_per_simd] = {
-            0.0f, 0.0f, 0.0f, 0.0f
-        };
+        thread float result[outputs_per_simd] = {0.0f};
         for (uint row = 0; row < outputs_per_simd; ++row) {
             uint output_row = first_row + row;
             const device uint8_t* weight =
@@ -3290,7 +3331,7 @@ func lagunaRoutedSharedDownResidual(
             indices, routerWeights, sharedActivated,
             sharedDownWeight, sharedDownScales, residual,
         ],
-        grid: ((LagunaConstants.hiddenSize / 4) * 288, 1, 1),
+        grid: (LagunaConstants.hiddenSize * 288, 1, 1),
         threadGroup: (288, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
         outputDTypes: [.bfloat16]
@@ -5849,18 +5890,22 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         }
     }
 
-    /// Builds the retained fused runtime weight layouts (fused QKV, fused
-    /// shared-expert gate/up, fused routed gate/up decode banks) once the
-    /// checkpoint parameters are installed and evaluated. Called by the
-    /// weight cache after `update` + `eval`, before constructor-time warmup,
-    /// so the concatenations read materialized weights and the fused arrays
-    /// are resident before the first forward. The module tree and its
-    /// checkpoint parameters are never restructured; every fused layout is a
-    /// derived side copy.
+    /// Builds the retained fused runtime weight layouts (fused QKV or
+    /// prefill-only KV, fused shared-expert gate/up, fused routed gate/up
+    /// decode banks) once the checkpoint parameters are installed and
+    /// evaluated. Called by the weight cache after `update` + `eval`, before
+    /// constructor-time warmup, so the concatenations read materialized
+    /// weights and the fused arrays are resident before the first forward.
+    /// The module tree and its checkpoint parameters are never restructured;
+    /// every fused layout is a derived side copy.
     func prepareFusedRuntimeWeights() {
         var fusedArrays = model.prepareRoPEAngleAtlases()
         for layer in model.layers {
             if lagunaFusedQKVEnabled, let fused = layer.selfAttn.prepareFusedQKVWeight() {
+                fusedArrays.append(fused)
+            } else if lagunaPrefillFusedKVEnabled,
+                let fused = layer.selfAttn.prepareFusedKVWeight()
+            {
                 fusedArrays.append(fused)
             }
             if let sparse = layer.mlp as? LagunaRuntimeSparseMoEBlock {
