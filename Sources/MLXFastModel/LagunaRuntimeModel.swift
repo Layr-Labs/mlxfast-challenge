@@ -1456,15 +1456,15 @@ struct LagunaNativeAffineWeight {
 }
 
 /// REAL (not simulated) NVFP4 side layout for layers `>= N`
-/// (`DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM`, default 32 — the tail window whose
-/// per-layer amplification is ~15x below the early layers), using the same
-/// group-16 4-bit NVFP4 the routed experts already ship. Set
+/// (`DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM`, default 27). The first ranked chunk
+/// proved layers 32–39; this band-safe continuation adds layers 27–31 using
+/// the same group-16 4-bit NVFP4 the routed experts already ship. Set
 /// `DARKBLOOM_NATIVE_AFFINE_NVFP4=0` to keep every native affine layout
 /// group-32 affine INT8 exactly as previously shipped.
 private let lagunaNativeAffineNVFP4From: Int? = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_NVFP4"] != "0"
     else { return nil }
-    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM"] ?? "32"
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM"] ?? "27"
     guard let value = Int(raw), value < LagunaConstants.numHiddenLayers else { return nil }
     return min(max(value, 0), LagunaConstants.numHiddenLayers)
 }()
