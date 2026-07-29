@@ -266,6 +266,29 @@ private let lagunaLmHeadSelectKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// TensorFold selection twin for the persistent exact pass. In addition to the
+/// row mask, one lane per 32-row logical block publishes whether that block has
+/// any candidate. The resident exact grid can then reject an empty block with
+/// one coherent byte read instead of having all eight simdgroups reload and
+/// reduce four mask bytes each.
+private let lagunaLmHeadSelectActiveBlocksKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_select_active_blocks_v1",
+    inputNames: ["coarse", "delta", "thr"],
+    outputNames: ["is_cand", "active_block"],
+    source: """
+        uint i = thread_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+        bool candidate = coarse[i] + delta[i] >= thr[0];
+        is_cand[i] = candidate ? uint8_t(1) : uint8_t(0);
+        bool block_active = simd_any(candidate);
+        if (lane == 0) {
+            active_block[i / 32] = block_active
+                ? uint8_t(1) : uint8_t(0);
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 /// Exact pass. Each simdgroup owns a FIXED block of four output rows -- the
 /// same static row-to-simdgroup mapping the stock kernel uses -- and runs the
 /// full-precision GEMV for that block only when at least one of its four rows
@@ -368,6 +391,120 @@ private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// TensorFold persistent exact pass. Sixty-four physical
+/// threadgroups cover the same 3,136 fixed vocabulary blocks by a static
+/// stride. Every logical block still has one owner, every candidate row keeps
+/// the exact stock GEMV K-loop and reduction tree, and every non-candidate row
+/// receives its coarse BF16 value. The only changed dimension is scheduling:
+/// mostly-empty logical blocks are batched inside a resident threadgroup
+/// instead of each consuming a separate physical launch slot.
+private let lagunaLmHeadExactPersistentKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_block_persistent64_v1",
+    inputNames: ["coarse_bf", "lm_head", "x", "is_cand", "active_block"],
+    outputNames: ["assembled"],
+    source: """
+        constexpr uint VOCAB = 100352;
+        constexpr uint K = 2048;
+        constexpr uint LOGICAL_BLOCKS = VOCAB / 32;
+
+        uint physical_group = threadgroup_position_in_grid.x;
+        uint physical_groups = threadgroups_per_grid.x;
+        uint sgid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        for (uint logical_group = physical_group;
+             logical_group < LOGICAL_BLOCKS;
+             logical_group += physical_groups) {
+            uint base = logical_group * 32 + sgid * 4;
+
+            if (active_block[logical_group] == 0) {
+                if (lane < 4) {
+                    assembled[base + lane] = coarse_bf[base + lane];
+                }
+                continue;
+            }
+
+            bool any_candidate = false;
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                uint r = base + tm;
+                any_candidate =
+                    any_candidate || (r < VOCAB && is_cand[r] != 0);
+            }
+
+            if (!any_candidate) {
+                if (lane < 4 && base + lane < VOCAB) {
+                    assembled[base + lane] = coarse_bf[base + lane];
+                }
+                continue;
+            }
+
+            thread float result[4] = {
+                0.0f, 0.0f, 0.0f, 0.0f
+            };
+            thread bfloat inter[4];
+            thread float v_coeff[4];
+            uint bn = lane * 4;
+            for (uint i = 0; i < 16; ++i) {
+                vec<bfloat, 4> xv =
+                    *((const device vec<bfloat, 4>*)(x + bn));
+                v_coeff[0] = float(xv.x);
+                v_coeff[1] = float(xv.y);
+                v_coeff[2] = float(xv.z);
+                v_coeff[3] = float(xv.w);
+                #pragma unroll
+                for (uint tm = 0; tm < 4; ++tm) {
+                    const device bfloat* mrow =
+                        lm_head + size_t(base + tm) * K;
+                    vec<bfloat, 4> mv =
+                        *((const device vec<bfloat, 4>*)(mrow + bn));
+                    inter[0] = mv.x;
+                    inter[1] = mv.y;
+                    inter[2] = mv.z;
+                    inter[3] = mv.w;
+                    result[tm] += inter[0] * v_coeff[0];
+                    result[tm] += inter[1] * v_coeff[1];
+                    result[tm] += inter[2] * v_coeff[2];
+                    result[tm] += inter[3] * v_coeff[3];
+                }
+                bn += 128;
+            }
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                #pragma unroll
+                for (ushort sn = 16; sn >= 1; sn >>= 1) {
+                    result[tm] += simd_shuffle_down(result[tm], sn);
+                }
+            }
+            if (lane == 0) {
+                #pragma unroll
+                for (uint tm = 0; tm < 4; ++tm) {
+                    uint r = base + tm;
+                    if (r < VOCAB) {
+                        assembled[r] = (is_cand[r] != 0)
+                            ? bfloat(result[tm])
+                            : coarse_bf[r];
+                    }
+                }
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private let lagunaLmHeadExactPersistentGroups: Int = {
+    let raw =
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_LMHEAD_EXACT_PERSISTENT"] ?? "64"
+    guard
+        let groups = Int(raw),
+        groups >= 16, groups <= 256, groups.isMultiple(of: 8)
+    else {
+        return 0
+    }
+    return groups
+}()
+
 /// Retained init-time MXFP8 coarse copy of lm_head plus the pruned decode
 /// forward. Built once (untimed init) by
 /// `LagunaRuntimeModel.prepareFusedRuntimeWeights` when
@@ -428,19 +565,43 @@ final class LagunaLmHeadPruner {
         let l = lower.max()
         let thr = (l - l.abs() * Float(1.0 / 64.0)).reshaped([1])
 
-        let isCandidate = lagunaLmHeadSelectKernel(
-            [coarse, delta, thr],
-            grid: (vocab, 1, 1),
-            threadGroup: (256, 1, 1),
-            outputShapes: [[vocab]],
-            outputDTypes: [.uint8]
-        )[0]
+        let isCandidate: MLXArray
+        let activeBlocks: MLXArray?
+        if lagunaLmHeadExactPersistentGroups > 0 {
+            let selection = lagunaLmHeadSelectActiveBlocksKernel(
+                [coarse, delta, thr],
+                grid: (vocab, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[vocab], [vocab / 32]],
+                outputDTypes: [.uint8, .uint8]
+            )
+            isCandidate = selection[0]
+            activeBlocks = selection[1]
+        } else {
+            isCandidate = lagunaLmHeadSelectKernel(
+                [coarse, delta, thr],
+                grid: (vocab, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[vocab]],
+                outputDTypes: [.uint8]
+            )[0]
+            activeBlocks = nil
+        }
 
         // One threadgroup per 32 output rows, covering the vocabulary exactly
         // once (100352 == 3136 * 32). Every slot has exactly one owning lane.
-        let assembled = lagunaLmHeadExactKernel(
-            [coarseBF, lmHeadWeight, x, isCandidate],
-            grid: (vocab / 32 * 256, 1, 1),
+        let exactKernel =
+            lagunaLmHeadExactPersistentGroups > 0
+            ? lagunaLmHeadExactPersistentKernel : lagunaLmHeadExactKernel
+        let exactPhysicalGroups =
+            lagunaLmHeadExactPersistentGroups > 0
+            ? lagunaLmHeadExactPersistentGroups : vocab / 32
+        let exactInputs =
+            activeBlocks.map { [coarseBF, lmHeadWeight, x, isCandidate, $0] }
+            ?? [coarseBF, lmHeadWeight, x, isCandidate]
+        let assembled = exactKernel(
+            exactInputs,
+            grid: (exactPhysicalGroups * 256, 1, 1),
             threadGroup: (256, 1, 1),
             outputShapes: [[vocab]],
             outputDTypes: [.bfloat16]

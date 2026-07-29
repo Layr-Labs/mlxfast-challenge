@@ -326,6 +326,20 @@ private func lagunaUseNativeAffineQKV(layer: Int) -> Bool {
         onlyLayer: lagunaNativeAffineQKVOnlyLayer)
 }
 
+/// TensorFold layout ablation for the decode-only QKV bank. Group 64 halves
+/// affine scale/bias metadata relative to group 32 while retaining the same
+/// 8-bit code payload. Group 64 is the checked default; `=32` restores the
+/// previously promoted layout inside the same binary.
+private let lagunaNativeAffineQKVGroupSize: Int = {
+    switch ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NATIVE_AFFINE_QKV_GROUP_SIZE"]
+    {
+    case "32": 32
+    case "128": 128
+    default: 64
+    }
+}()
+
 /// The same native group-32 affine INT8 side layout applied to the attention
 /// output projection. `o_proj` is the single largest BF16 decode weight read
 /// left in the attention block — 30 sliding layers at `[2048, 8192]` plus 10
@@ -355,6 +369,32 @@ private func lagunaUseNativeAffineOProj(layer: Int) -> Bool {
         layer: layer,
         count: lagunaNativeAffineOProjLayerCount,
         onlyLayer: lagunaNativeAffineOProjOnlyLayer)
+}
+
+/// Independent TensorFold metadata-layout ablation for the decode-only
+/// attention output bank. This is deliberately separate from QKV so the two
+/// large bandwidth surfaces can be measured and promoted independently.
+private let lagunaNativeAffineOProjRequestedGroupSize: Int = {
+    switch ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NATIVE_AFFINE_OPROJ_GROUP_SIZE"]
+    {
+    case "32": 32
+    case "128": 128
+    default: 64
+    }
+}()
+
+private let lagunaNativeAffineOProjWideGroupLayerCount: Int = {
+    let requested = Int(
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_NATIVE_AFFINE_OPROJ_WIDE_GROUP_LAYERS"] ?? "32") ?? 32
+    return min(max(requested, 0), LagunaConstants.numHiddenLayers)
+}()
+
+@inline(__always)
+private func lagunaNativeAffineOProjGroupSize(layer: Int) -> Int {
+    layer < lagunaNativeAffineOProjWideGroupLayerCount
+        ? lagunaNativeAffineOProjRequestedGroupSize : 32
 }
 
 /// Sliding-layer per-head RMSNorm + plain RoPE fusion (see
@@ -1517,10 +1557,12 @@ private func lagunaNativeAffineProbeRoundTrip(_ weight: MLXArray, layer: Int?) -
 }
 
 func lagunaNativeAffineWeight(
-    _ weight: MLXArray, layer: Int? = nil
+    _ weight: MLXArray,
+    layer: Int? = nil,
+    groupSize: Int = 32
 ) -> LagunaNativeAffineWeight? {
     guard weight.dtype == .bfloat16, weight.ndim == 2,
-        weight.dim(1).isMultiple(of: 32)
+        weight.dim(1).isMultiple(of: groupSize)
     else {
         return nil
     }
@@ -1542,13 +1584,16 @@ func lagunaNativeAffineWeight(
         )
     }
     let (packedCodes, scales, biases) = quantized(
-        source, groupSize: 32, bits: 8, mode: .affine)
+        source, groupSize: groupSize, bits: 8, mode: .affine)
     guard biases != nil else { return nil }
     return LagunaNativeAffineWeight(
         packedCodes: packedCodes,
         scales: scales,
         biases: biases,
-        originalShape: weight.shape
+        originalShape: weight.shape,
+        groupSize: groupSize,
+        bits: 8,
+        mode: .affine
     )
 }
 
@@ -2452,7 +2497,10 @@ final class LagunaRuntimeAttention: Module {
             type(of: wo) == Linear.self,
             wo.bias == nil,
             wo.weight.shape == [LagunaConstants.hiddenSize, nHeads * headDim],
-            let quantizedWO = lagunaNativeAffineWeight(wo.weight, layer: layerIdx)
+            let quantizedWO = lagunaNativeAffineWeight(
+                wo.weight,
+                layer: layerIdx,
+                groupSize: lagunaNativeAffineOProjGroupSize(layer: layerIdx))
         else {
             return []
         }
@@ -2462,9 +2510,15 @@ final class LagunaRuntimeAttention: Module {
 
     func prepareNativeAffineQKVWeight() -> [MLXArray] {
         guard _nativeAffineQKV == nil,
-            let q = lagunaNativeAffineWeight(wq.weight, layer: layerIdx),
-            let k = lagunaNativeAffineWeight(wk.weight, layer: layerIdx),
-            let v = lagunaNativeAffineWeight(wv.weight, layer: layerIdx)
+            let q = lagunaNativeAffineWeight(
+                wq.weight, layer: layerIdx,
+                groupSize: lagunaNativeAffineQKVGroupSize),
+            let k = lagunaNativeAffineWeight(
+                wk.weight, layer: layerIdx,
+                groupSize: lagunaNativeAffineQKVGroupSize),
+            let v = lagunaNativeAffineWeight(
+                wv.weight, layer: layerIdx,
+                groupSize: lagunaNativeAffineQKVGroupSize)
         else {
             return []
         }
