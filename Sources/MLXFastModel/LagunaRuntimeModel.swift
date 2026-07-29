@@ -265,8 +265,7 @@ let lagunaFusedQKVProjectionEnabled =
 /// A native group-32 affine INT8 side layout packs Q/K/V into one batched
 /// quantized matmul, cutting their weight traffic without speculating future
 /// tokens or changing the KV dependency. Prefill stays on the original BF16
-/// projections. Two ranked chunks proved 28 layers; this final bounded chunk
-/// widens the same layout to all 40 layers.
+/// projections. All 40 layers form the final acceptance-band-safe QKV chunk.
 private let lagunaNativeAffineQKVLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_QKV"] != "0"
     else { return 0 }
@@ -281,32 +280,62 @@ private func lagunaUseNativeAffineQKV(layer: Int) -> Bool {
     layer < lagunaNativeAffineQKVLayerCount
 }
 
-/// The same native group-32 affine INT8 side layout applied to the attention
-/// output projection. `o_proj` is the single largest BF16 decode weight read
-/// left in the attention block — 30 sliding layers at `[2048, 8192]` plus 10
-/// full-attention layers at `[2048, 6144]` is ~1.2 GB of the decode token's
-/// weight traffic — and unlike Q/K/V it is read *after* SDPA, so quantizing it
-/// changes nothing about the KV dependency or the cache contents.
-///
-/// Decode only: prefill and every non-`[1, 1, ·]` call keep the BF16 parameter,
-/// which stays authoritative and resident. The first 16 layers are the
-/// acceptance-band-safe first chunk; later submissions can widen the same
-/// layout the way `DARKBLOOM_NATIVE_AFFINE_QKV_LAYERS` was widened.
-///
-/// Set `DARKBLOOM_NATIVE_AFFINE_OPROJ=0` (or `..._LAYERS=0`) to fall back to
-/// the exact stock gated projection inside the same binary.
-private let lagunaNativeAffineOProjLayerCount: Int = {
-    guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OPROJ"] != "0"
-    else { return 0 }
+/// Experimental TensorFold-style compression of the attention output
+/// projection. This remains opt-in while it is measured against the existing
+/// single-dispatch BF16 gate + output kernel. Only the current serial decode
+/// token uses the side layout; prefill and the checkpoint parameters stay
+/// unchanged.
+private let lagunaNativeAffineOutputLayerCount: Int = {
     let requested = Int(
-        ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OPROJ_LAYERS"]
-            ?? "16") ?? 16
+        ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OUTPUT_LAYERS"]
+            ?? "40") ?? 40
     return min(max(requested, 0), LagunaConstants.numHiddenLayers)
 }()
-let lagunaNativeAffineOProjEnabled = lagunaNativeAffineOProjLayerCount > 0
 
-private func lagunaUseNativeAffineOProj(layer: Int) -> Bool {
-    layer < lagunaNativeAffineOProjLayerCount
+private let lagunaNativeAffineOutputFamily =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OUTPUT_FAMILY"]
+        ?? "full"
+
+/// Experimental output-weight precision. Eight-bit remains the submitted and
+/// promotion-tested default; four-bit reuses the same current-token path to
+/// test whether another halving of `wo` traffic preserves the token sequence.
+private let lagunaNativeAffineOutputDefaultBits: Int = {
+    let requested = Int(
+        ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OUTPUT_BITS"]
+            ?? "8") ?? 8
+    return requested == 4 ? 4 : 8
+}()
+
+/// Prefix selector for acceptance-band-safe staging of the four-bit output
+/// layout. With `DARKBLOOM_NATIVE_AFFINE_OUTPUT_BITS=4`, the default remains
+/// all 40 layers; setting this count converts only the selected prefix while
+/// every remaining enabled output layer keeps its native affine eight-bit
+/// representation.
+private let lagunaNativeAffineOutput4BitLayerCount: Int = {
+    guard lagunaNativeAffineOutputDefaultBits == 4 else { return 0 }
+    let requested = Int(
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_NATIVE_AFFINE_OUTPUT_4BIT_LAYERS"
+        ] ?? "\(LagunaConstants.numHiddenLayers)") ?? LagunaConstants.numHiddenLayers
+    return min(max(requested, 0), LagunaConstants.numHiddenLayers)
+}()
+
+private func lagunaNativeAffineOutputBits(layer: Int) -> Int {
+    layer < lagunaNativeAffineOutput4BitLayerCount ? 4 : 8
+}
+
+private func lagunaUseNativeAffineOutput(layer: Int, isSliding: Bool) -> Bool {
+    switch lagunaNativeAffineOutputFamily {
+    case "full":
+        return layer < lagunaNativeAffineOutputLayerCount && !isSliding
+    case "sliding":
+        return layer < lagunaNativeAffineOutputLayerCount && isSliding
+    case "full+sliding-prefix":
+        return !isSliding
+            || (layer < lagunaNativeAffineOutputLayerCount && isSliding)
+    default:
+        return layer < lagunaNativeAffineOutputLayerCount
+    }
 }
 
 /// Sliding-layer per-head RMSNorm + plain RoPE fusion (see
@@ -1401,14 +1430,16 @@ struct LagunaNativeAffineWeight {
     var arrays: [MLXArray] { [packedCodes, scales, biases] }
 }
 
-func lagunaNativeAffineWeight(_ weight: MLXArray) -> LagunaNativeAffineWeight? {
+func lagunaNativeAffineWeight(
+    _ weight: MLXArray, bits: Int = 8
+) -> LagunaNativeAffineWeight? {
     guard weight.dtype == .bfloat16, weight.ndim == 2,
-        weight.dim(1).isMultiple(of: 32)
+        weight.dim(1).isMultiple(of: 32), bits == 4 || bits == 8
     else {
         return nil
     }
     let (packedCodes, scales, biases) = quantized(
-        weight, groupSize: 32, bits: 8, mode: .affine)
+        weight, groupSize: 32, bits: bits, mode: .affine)
     guard let biases else { return nil }
     return LagunaNativeAffineWeight(
         packedCodes: packedCodes,
@@ -2307,24 +2338,9 @@ final class LagunaRuntimeAttention: Module {
     /// continue to serve prefill.
     var _nativeAffineQKV: LagunaNativeAffineWeight?
 
-    /// Derived native group-32 affine layout for the attention output
-    /// projection, used only by the serial decode call. `wo.weight` remains the
-    /// authoritative parameter and continues to serve prefill, the last-row
-    /// prefill path, and every decode fallback.
-    var _nativeAffineOProj: LagunaNativeAffineWeight?
-
-    func prepareNativeAffineOProjWeight() -> [MLXArray] {
-        guard _nativeAffineOProj == nil,
-            type(of: wo) == Linear.self,
-            wo.bias == nil,
-            wo.weight.shape == [LagunaConstants.hiddenSize, nHeads * headDim],
-            let quantizedWO = lagunaNativeAffineWeight(wo.weight)
-        else {
-            return []
-        }
-        _nativeAffineOProj = quantizedWO
-        return quantizedWO.arrays
-    }
+    /// Experimental group-32 affine side layout for `wo`. The source BF16
+    /// weight remains authoritative for prefill and the default decode path.
+    var _nativeAffineOutput: LagunaNativeAffineWeight?
 
     func prepareNativeAffineQKVWeight() -> [MLXArray] {
         guard _nativeAffineQKV == nil,
@@ -2349,6 +2365,19 @@ final class LagunaRuntimeAttention: Module {
         )
         _nativeAffineQKV = fused
         return fused.arrays
+    }
+
+    func prepareNativeAffineOutputWeight() -> [MLXArray] {
+        guard _nativeAffineOutput == nil,
+            type(of: wo) == Linear.self,
+            wo.bias == nil,
+            let affine = lagunaNativeAffineWeight(
+                wo.weight, bits: lagunaNativeAffineOutputBits(layer: layerIdx))
+        else {
+            return []
+        }
+        _nativeAffineOutput = affine
+        return affine.arrays
     }
 
     /// Builds and retains the fused QKV weight from the loaded q/k/v
@@ -2692,52 +2721,28 @@ final class LagunaRuntimeAttention: Module {
                 projectedGate = gProj(normalizedInput)
                 gateIsActivated = false
             }
-            // Native group-32 affine INT8 output projection for the serial
-            // decode token. The stock fused kernel folds the gate into the
-            // GEMV's own vector loads; this path cannot, because MLX's
-            // `quantizedMM` owns the contraction. It therefore reproduces that
-            // kernel's element-wise ordering explicitly: the per-head gate
-            // multiplies the attention output *first*, through the same single
-            // BF16 rounding boundary the kernel spells as
-            // `float(bfloat(float(values[i]) * gate))` (an MLX BF16 binary
-            // product rounds once, identically), and only then does the
-            // contraction run. Gate-then-project is what every stock decode
-            // form computes — the fused kernel, the compiled
-            // `attentionGateProjection`, and the plain
-            // `(output * gate); wo(output)` tail all apply the gate per input
-            // element before the K loop — so the only perturbation this branch
-            // introduces is the weight quantization itself.
-            //
-            // The broadcast multiply stays an MLX binary op deliberately: its
-            // input is row-contiguous and refcount-1, so MLX donates the
-            // attention output buffer and runs the product in place, whereas a
-            // custom kernel would have to allocate and first-touch a fresh
-            // 8192-wide output.
-            if lagunaUseNativeAffineOProj(layer: layerIdx),
-                let affineWO = _nativeAffineOProj,
-                gatePerHead, B == 1, L == 1, wo.bias == nil,
+            if lagunaUseNativeAffineOutput(layer: layerIdx, isSliding: isSliding),
+                gateIsActivated, gatePerHead, L == 1, B == 1, wo.bias == nil,
                 headDim == LagunaConstants.headDim,
                 output.dtype == .bfloat16, projectedGate.dtype == .bfloat16,
                 output.shape == [1, 1, nHeads * headDim],
-                projectedGate.shape == [1, 1, nHeads]
+                projectedGate.shape == [1, 1, nHeads],
+                let affineOutput = _nativeAffineOutput,
+                affineOutput.originalShape
+                    == [LagunaConstants.hiddenSize, nHeads * headDim]
             {
-                let gate =
-                    gateIsActivated
-                    ? projectedGate
-                    : lagunaCompiledSoftplusGate(projectedGate)
-                let gated =
-                    (output.reshaped(B, L, nHeads, headDim)
-                        * gate[.ellipsis, .newAxis])
-                    .reshaped(B, L, -1)
-                lagunaTrace("native affine gated output projection h\(nHeads)")
+                let gated = (
+                    output.reshaped(B, L, nHeads, headDim)
+                        * projectedGate[.ellipsis, .newAxis]
+                ).reshaped(B, L, nHeads * headDim)
                 return quantizedMM(
                     gated,
-                    affineWO.packedCodes,
-                    scales: affineWO.scales,
-                    biases: affineWO.biases,
+                    affineOutput.packedCodes,
+                    scales: affineOutput.scales,
+                    biases: affineOutput.biases,
                     transpose: true,
                     groupSize: 32,
-                    bits: 8,
+                    bits: lagunaNativeAffineOutputBits(layer: layerIdx),
                     mode: .affine
                 )
             }
@@ -6624,9 +6629,11 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                 fusedArrays.append(
                     contentsOf: layer.selfAttn.prepareNativeAffineQKVWeight())
             }
-            if lagunaUseNativeAffineOProj(layer: layer.selfAttn.layerIdx) {
+            if lagunaUseNativeAffineOutput(
+                layer: layer.selfAttn.layerIdx, isSliding: layer.selfAttn.isSliding)
+            {
                 fusedArrays.append(
-                    contentsOf: layer.selfAttn.prepareNativeAffineOProjWeight())
+                    contentsOf: layer.selfAttn.prepareNativeAffineOutputWeight())
             }
             if lagunaFusedQKVEnabled, let fused = layer.selfAttn.prepareFusedQKVWeight() {
                 fusedArrays.append(fused)
