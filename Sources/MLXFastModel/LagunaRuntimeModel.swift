@@ -380,7 +380,7 @@ let lagunaRouterRowsPerGroup: Int = {
         let raw = ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_ROWS_PER_GROUP"],
         let value = Int(raw), [8, 16, 32, 64].contains(value)
     else {
-        return 8
+        return 16
     }
     return value
 }()
