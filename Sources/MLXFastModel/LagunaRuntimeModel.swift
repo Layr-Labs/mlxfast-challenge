@@ -3813,6 +3813,52 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             let up = gateUp[.ellipsis, _fusedGateUpSplit...]
             return downProj(compiledSiluProduct(gate, up))
         }
+        // Prefill (L > 1): use compile(shapeless:) to fuse the stock gate+up
+        // SiLI forward. This preserves NAX kernel selection (the fused-bank
+        // quantizedMM does NOT trigger NAX for GEMM shapes). Bit-exact: the
+        // compiled graph traces the same quantizedMM operations with separate
+        // weights, fused with compiledSiluProduct.
+        if x.dim(1) > 1,
+            x.dtype == .bfloat16,
+            x.ndim == 3, x.dim(0) == 1,
+            x.dim(2) == LagunaConstants.hiddenSize,
+            let gateProjQ = gateProj as? QuantizedLinear,
+            let upProjQ = upProj as? QuantizedLinear,
+            type(of: gateProjQ) == QuantizedLinear.self,
+            type(of: upProjQ) == QuantizedLinear.self,
+            gateProjQ.mode == .nvfp4, upProjQ.mode == .nvfp4,
+            gateProjQ.groupSize == 16, upProjQ.groupSize == 16,
+            gateProjQ.bits == 4, upProjQ.bits == 4,
+            gateProjQ.bias == nil, upProjQ.bias == nil,
+            gateProjQ.biases == nil, upProjQ.biases == nil
+        {
+            let gWeight = gateProjQ.weight
+            let gScales = gateProjQ.scales
+            let uWeight = upProjQ.weight
+            let uScales = upProjQ.scales
+            let siLU = compiledSiluProduct
+            let body: @Sendable (
+                MLXArray, MLXArray, MLXArray, MLXArray, MLXArray
+            ) -> MLXArray = { input, gW, gS, uW, uS in
+                let gate = MLX.quantizedMM(
+                    input, gW, scales: gS, biases: nil,
+                    transpose: true, groupSize: 16, bits: 4, mode: .nvfp4)
+                let up = MLX.quantizedMM(
+                    input, uW, scales: uS, biases: nil,
+                    transpose: true, groupSize: 16, bits: 4, mode: .nvfp4)
+                return siLU(gate, up)
+            }
+            let compiled: (
+                MLXArray, MLXArray, MLXArray, MLXArray, MLXArray
+            ) -> MLXArray
+            if MLXHardwareInfo.isCompiledDecodeSupported {
+                compiled = compile(shapeless: true, body)
+            } else {
+                compiled = body
+            }
+            let activated = compiled(x, gWeight, gScales, uWeight, uScales)
+            return downProj(activated)
+        }
         return downProj(compiledSiluProduct(gateProj(x), upProj(x)))
     }
 }
