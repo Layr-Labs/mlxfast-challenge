@@ -5484,6 +5484,223 @@ private let lagunaDecodeRouterTop8NormalizingKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Hierarchical exact decode selection. Eight simdgroups first sort their
+/// 32-entry blocks and retain eight entries each. After one threadgroup
+/// barrier, simdgroup zero holds two of those 64 survivors per lane and emits
+/// the global top eight through eight select-best-and-invalidate reductions.
+///
+/// Bit-exact source anchors below refer to the selector at tip `1c3a483`:
+/// score/key construction is copied from `LagunaRuntimeModel.swift:5372-5376`,
+/// the local compare-exchange from lines 5418-5436, the normalization fold
+/// from lines 5350-5357, and the comparator from lines 5449-5466.
+private func lagunaDecodeRouterTop8HierarchicalKernelSource(normalizing: Bool) -> String {
+    let epilogue =
+        normalizing
+        ? """
+        float total = 0.0f;
+        for (uint i = 0; i < 8; ++i) {
+            total = simd_shuffle(my_score, ushort(i)) + total;
+        }
+        if (lane < 8) {
+            router_indices[lane] = my_index;
+            router_scores[lane] = my_score / total;
+        }
+        """
+        : """
+        if (lane < 8) {
+            router_indices[lane] = my_index;
+            router_scores[lane] = my_score;
+        }
+        """
+    return """
+        uint lane = thread_position_in_threadgroup.x;
+
+        threadgroup float candidate_keys[64];
+        threadgroup uint candidate_indices[64];
+        threadgroup float candidate_scores[64];
+
+        float x = float(logits[lane]);
+        float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+        float my_score = x < 0.0f ? y : 1.0f - y;
+        float my_key = -(my_score + float(correction_bias[lane]));
+        uint my_index = lane;
+
+        // Phase 1: the current selector's first 15 stages, stopping at
+        // sequence == 32. The register exchanges are its lines 5403-5405,
+        // and the pair roles/comparator block is copied textually from lines
+        // 5418-5436 of LagunaRuntimeModel.swift at tip 1c3a483.
+        for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
+            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+                float other_key = simd_shuffle_xor(my_key, ushort(stride));
+                uint other_index = simd_shuffle_xor(my_index, ushort(stride));
+                float other_score = simd_shuffle_xor(my_score, ushort(stride));
+
+                bool is_lower = (lane & stride) == 0;
+                float a_key = is_lower ? my_key : other_key;
+                uint a_index = is_lower ? my_index : other_index;
+                float a_score = is_lower ? my_score : other_score;
+                float b_key = is_lower ? other_key : my_key;
+                uint b_index = is_lower ? other_index : my_index;
+                float b_score = is_lower ? other_score : my_score;
+
+                bool lower_wants_better = (lane & sequence) == 0;
+                bool b_before_a = laguna_router_key_before(
+                    b_key, b_index, a_key, a_index);
+                bool a_before_b = laguna_router_key_before(
+                    a_key, a_index, b_key, b_index);
+                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                if (swap) {
+                    my_key = is_lower ? b_key : a_key;
+                    my_index = is_lower ? b_index : a_index;
+                    my_score = is_lower ? b_score : a_score;
+                }
+            }
+        }
+
+        // The sequence-32 direction alternates by simdgroup. Extract each
+        // block's true ranks 0..<8 from its better end and pack the 64
+        // survivors in local rank order. Every global top-eight entry must be
+        // in its block's local top eight: otherwise that block alone contains
+        // eight entries ordered before it.
+        uint block = lane >> 5;
+        uint within_block = lane & 31;
+        bool block_ascending = (block & 1) == 0;
+        uint rank_in_block =
+            block_ascending ? within_block : (31 - within_block);
+        bool is_local_top8 =
+            block_ascending ? (within_block < 8) : (within_block >= 24);
+        if (is_local_top8) {
+            candidate_keys[block * 8 + rank_in_block] = my_key;
+            candidate_indices[block * 8 + rank_in_block] = my_index;
+            candidate_scores[block * 8 + rank_in_block] = my_score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Phase 2: one simdgroup owns two survivors per lane. Each iteration
+        // selects the unique best valid tuple under the exact current total
+        // comparator, emits it in rank order, then invalidates it by its
+        // unique original expert index. No sentinel key is used, so finite,
+        // signed-zero, infinity, and NaN ordering all remain comparator-owned.
+        if (lane < 32) {
+            float candidate0_key = candidate_keys[lane];
+            uint candidate0_index = candidate_indices[lane];
+            float candidate0_score = candidate_scores[lane];
+            uint candidate0_valid = 1;
+
+            float candidate1_key = candidate_keys[lane + 32];
+            uint candidate1_index = candidate_indices[lane + 32];
+            float candidate1_score = candidate_scores[lane + 32];
+            uint candidate1_valid = 1;
+
+            for (uint rank = 0; rank < 8; ++rank) {
+                float best_key = candidate0_key;
+                uint best_index = candidate0_index;
+                float best_score = candidate0_score;
+                uint best_valid = candidate0_valid;
+
+                if (candidate1_valid != 0) {
+                    bool candidate1_before =
+                        best_valid == 0 || laguna_router_key_before(
+                            candidate1_key, candidate1_index,
+                            best_key, best_index);
+                    if (candidate1_before) {
+                        best_key = candidate1_key;
+                        best_index = candidate1_index;
+                        best_score = candidate1_score;
+                        best_valid = 1;
+                    }
+                }
+
+                for (ushort offset = 16; offset >= 1; offset >>= 1) {
+                    float other_key = simd_shuffle_down(best_key, offset);
+                    uint other_index = simd_shuffle_down(best_index, offset);
+                    float other_score = simd_shuffle_down(best_score, offset);
+                    uint other_valid = simd_shuffle_down(best_valid, offset);
+                    if (lane + uint(offset) < 32 && other_valid != 0) {
+                        bool other_before =
+                            best_valid == 0 || laguna_router_key_before(
+                                other_key, other_index, best_key, best_index);
+                        if (other_before) {
+                            best_key = other_key;
+                            best_index = other_index;
+                            best_score = other_score;
+                            best_valid = 1;
+                        }
+                    }
+                }
+
+                uint winner_index = simd_shuffle(best_index, ushort(0));
+                float winner_score = simd_shuffle(best_score, ushort(0));
+                if (lane == rank) {
+                    my_index = winner_index;
+                    my_score = winner_score;
+                }
+                if (candidate0_valid != 0 &&
+                    candidate0_index == winner_index) {
+                    candidate0_valid = 0;
+                }
+                if (candidate1_valid != 0 &&
+                    candidate1_index == winner_index) {
+                    candidate1_valid = 0;
+                }
+            }
+
+            // Textual copy of the incumbent rank-order output/normalization
+            // fold at LagunaRuntimeModel.swift:5350-5363, tip 1c3a483.
+        \(epilogue)
+        }
+        """
+}
+
+/// Textual copy of `lagunaDecodeRouterTop8Header` at
+/// `LagunaRuntimeModel.swift:5449-5466`, tip `1c3a483`. Keeping this private
+/// header self-contained makes the hierarchical comparator semantics auditable
+/// against the kill-switch kernel byte-for-byte.
+private let lagunaDecodeRouterTop8HierarchicalHeader = """
+    METAL_FUNC bool laguna_router_key_before(
+        float a, uint a_index, float b, uint b_index) {
+        bool a_nan = metal::isnan(a);
+        bool b_nan = metal::isnan(b);
+        if (a_nan | b_nan) {
+            if (a_nan != b_nan) {
+                return !a_nan;
+            }
+            return a_index < b_index;
+        }
+        if (a < b) {
+            return true;
+        }
+        if (b < a) {
+            return false;
+        }
+        return a_index < b_index;
+    }
+    """
+
+private let lagunaDecodeRouterTop8HierarchicalKernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_top8_hier_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterTop8HierarchicalKernelSource(normalizing: false),
+    header: lagunaDecodeRouterTop8HierarchicalHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaDecodeRouterTop8HierarchicalNormalizingKernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_top8_hier_norm_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterTop8HierarchicalKernelSource(normalizing: true),
+    header: lagunaDecodeRouterTop8HierarchicalHeader,
+    ensureRowContiguous: true
+)
+
+/// DEFAULT ON. Set `DARKBLOOM_ROUTER_TOP8_HIER=0` to restore the incumbent
+/// 256-lane, 36-stage bitonic selector (including its twelve threadgroup
+/// barriers) inside the same binary.
+private let lagunaDecodeRouterTop8HierarchicalEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_TOP8_HIER"] != "0"
+
 private func lagunaDecodeRouterTop8(
     logits: MLXArray, correctionBias: MLXArray, normalizing: Bool = false
 ) -> (MLXArray, MLXArray) {
@@ -5493,7 +5710,11 @@ private func lagunaDecodeRouterTop8(
     precondition(correctionBias.size == 256)
 
     let kernel =
-        normalizing ? lagunaDecodeRouterTop8NormalizingKernel : lagunaDecodeRouterTop8Kernel
+        lagunaDecodeRouterTop8HierarchicalEnabled
+        ? (normalizing
+            ? lagunaDecodeRouterTop8HierarchicalNormalizingKernel
+            : lagunaDecodeRouterTop8HierarchicalKernel)
+        : (normalizing ? lagunaDecodeRouterTop8NormalizingKernel : lagunaDecodeRouterTop8Kernel)
     let outputs = kernel(
         [logits, correctionBias],
         grid: (256, 1, 1),

@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXFast
 import MLXNN
 
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
@@ -91,11 +92,42 @@ private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     return body
 }()
 
+/// Linear inverse-permutation scatter for the sorted MoE route table.
+/// `argSort` returns `order` as a uint32 permutation, so
+/// `inverse[order[i]] = i` has exactly one writer per output and produces the
+/// same integer bits as `argSort(order)` without another comparison sort.
+/// DEFAULT ON; set `DARKBLOOM_INVERSE_SCATTER=0` to restore the original
+/// second `argSort` path inside the same binary.
+private let inversePermutationScatterEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_INVERSE_SCATTER"] != "0"
+
+private let inversePermutationScatterKernel = MLXFast.metalKernel(
+    name: "mlx_lm_inverse_permutation_scatter_u32_v1",
+    inputNames: ["order"],
+    outputNames: ["inverse"],
+    source: """
+        uint i = thread_position_in_grid.x;
+        inverse[order[i]] = i;
+        """,
+    ensureRowContiguous: false
+)
+
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
     let order = argSort(indices)
-    let inverseOrder = argSort(order)
+    let inverseOrder: MLXArray
+    if inversePermutationScatterEnabled && order.size > 0 {
+        inverseOrder = inversePermutationScatterKernel(
+            [order],
+            grid: (order.size, 1, 1),
+            threadGroup: (min(order.size, 256), 1, 1),
+            outputShapes: [[order.size]],
+            outputDTypes: [.uint32]
+        )[0]
+    } else {
+        inverseOrder = argSort(order)
+    }
 
     return (
         x.flattened(start: 0, end: -3)[order.floorDivide(m)],
