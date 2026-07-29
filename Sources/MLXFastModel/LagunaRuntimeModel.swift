@@ -1451,6 +1451,7 @@ struct LagunaNativeAffineWeight {
     var groupSize: Int = 32
     var bits: Int = 8
     var mode: QuantizationMode = .affine
+    var includesGate: Bool = false
 
     var arrays: [MLXArray] { [packedCodes, scales] + (biases.map { [$0] } ?? []) }
 }
@@ -2468,24 +2469,47 @@ final class LagunaRuntimeAttention: Module {
         else {
             return []
         }
-        let packedCodes = concatenated(
-            [q.packedCodes, k.packedCodes, v.packedCodes], axis: 0)
-        let scales = concatenated([q.scales, k.scales, v.scales], axis: 0)
+        // Fold the per-head attention gate (g_proj) into the INT8 bank so
+        // one quantizedMM produces [q | k | v | gate], eliminating the
+        // separate BF16 GEMV. Gate rows are independently quantized (groups
+        // never span rows), so the q/k/v slices are bit-identical to the
+        // promoted bank. The only numerical change is gate logits' precision.
+        // Set DARKBLOOM_NATIVE_AFFINE_GATE=0 to ablate.
+        let foldGate =
+            ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_GATE"]
+            != "0"
+        let gateAffine: LagunaNativeAffineWeight? =
+            (foldGate && gatingEnabled)
+            ? (gProj.flatMap { lagunaNativeAffineWeight($0.weight, layer: layerIdx) })
+            : nil
+        let includesGate = gateAffine != nil
+        let allCodes = includesGate
+            ? [q.packedCodes, k.packedCodes, v.packedCodes, gateAffine!.packedCodes]
+            : [q.packedCodes, k.packedCodes, v.packedCodes]
+        let allScales = includesGate
+            ? [q.scales, k.scales, v.scales, gateAffine!.scales]
+            : [q.scales, k.scales, v.scales]
+        let packedCodes = concatenated(allCodes, axis: 0)
+        let scales = concatenated(allScales, axis: 0)
         var biases: MLXArray?
         if let qb = q.biases, let kb = k.biases, let vb = v.biases {
-            biases = concatenated([qb, kb, vb], axis: 0)
+            if let gb = gateAffine?.biases {
+                biases = concatenated([qb, kb, vb, gb], axis: 0)
+            } else {
+                biases = concatenated([qb, kb, vb], axis: 0)
+            }
         }
+        let totalRows = wq.weight.dim(0) + wk.weight.dim(0) + wv.weight.dim(0)
+            + (includesGate ? (gProj?.weight.dim(0) ?? 0) : 0)
         let fused = LagunaNativeAffineWeight(
             packedCodes: packedCodes,
             scales: scales,
             biases: biases,
-            originalShape: [
-                wq.weight.dim(0) + wk.weight.dim(0) + wv.weight.dim(0),
-                wq.weight.dim(1),
-            ],
+            originalShape: [totalRows, wq.weight.dim(1)],
             groupSize: q.groupSize,
             bits: q.bits,
-            mode: q.mode
+            mode: q.mode,
+            includesGate: includesGate
         )
         _nativeAffineQKV = fused
         return fused.arrays
@@ -2618,9 +2642,17 @@ final class LagunaRuntimeAttention: Module {
                 )
                 let queryDim = nHeads * headDim
                 let kvDim = nKVHeads * headDim
-                let gateLogits = gateProjection(normalized)
-                let activatedGate =
-                    softplus(gateLogits.asType(.float32)).asType(.bfloat16)
+                let activatedGate: MLXArray
+                if fusedAffine.includesGate {
+                    let gateDim = nHeads
+                    let gateLogits = qkv[.ellipsis, (queryDim + 2 * kvDim) ..< (queryDim + 2 * kvDim + gateDim)]
+                    activatedGate =
+                        softplus(gateLogits.asType(.float32)).asType(.bfloat16)
+                } else {
+                    let gateLogits = gateProjection(normalized)
+                    activatedGate =
+                        softplus(gateLogits.asType(.float32)).asType(.bfloat16)
+                }
                 fusedNormQKV = (
                     qkv[.ellipsis, 0 ..< queryDim],
                     qkv[.ellipsis, queryDim ..< (queryDim + kvDim)],
