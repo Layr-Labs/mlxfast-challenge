@@ -289,9 +289,10 @@ private func lagunaUseNativeAffineQKV(layer: Int) -> Bool {
 /// changes nothing about the KV dependency or the cache contents.
 ///
 /// Decode only: prefill and every non-`[1, 1, ·]` call keep the BF16 parameter,
-/// which stays authoritative and resident. The first 16 layers are the
-/// acceptance-band-safe first chunk; later submissions can widen the same
-/// layout the way `DARKBLOOM_NATIVE_AFFINE_QKV_LAYERS` was widened.
+/// which stays authoritative and resident. Ranked chunks proved the layout at
+/// 16, 24, and 32 layers; this final bounded chunk widens the same layout to
+/// all 40 layers, mirroring the completed
+/// `DARKBLOOM_NATIVE_AFFINE_QKV_LAYERS` rollout.
 ///
 /// Set `DARKBLOOM_NATIVE_AFFINE_OPROJ=0` (or `..._LAYERS=0`) to fall back to
 /// the exact stock gated projection inside the same binary.
@@ -300,7 +301,7 @@ private let lagunaNativeAffineOProjLayerCount: Int = {
     else { return 0 }
     let requested = Int(
         ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OPROJ_LAYERS"]
-            ?? "32") ?? 32
+            ?? "40") ?? 40
     return min(max(requested, 0), LagunaConstants.numHiddenLayers)
 }()
 let lagunaNativeAffineOProjEnabled = lagunaNativeAffineOProjLayerCount > 0
