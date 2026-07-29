@@ -1881,6 +1881,159 @@ private let lagunaCompiledSoftplusGate: @Sendable (MLXArray) -> MLXArray = {
     return MLXHardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
+/// `DARKBLOOM_PREFILL_GATE_EPILOGUE` (default OFF — measured −0.7 to −1.1%
+/// prefill; set "1" to enable for A/B only; the doc below records why the
+/// stock path wins — the donation wall. Originally: default on; "0" restores the stock
+/// ops): replaces prefill's per-head gate broadcast multiply -- which MLX
+/// serves with the *General* (strided) binary kernel at one element per
+/// thread because the `[B, L, H, 1]` gate is broadcast across the 128-wide
+/// head axis -- with one layout-native, 16 B/thread vectorized kernel.
+///
+/// `v2` additionally folds the compiled softplus dispatch in, so the pair
+/// becomes a single dispatch; `v1` keeps the compiled softplus exactly as it
+/// is and fuses only the multiply. Which one is used is decided by
+/// `lagunaPrefillGateEpilogueFoldSoftplus` below.
+///
+/// **MEASURED REGRESSION -- do not enable without re-measuring.** Bitwise
+/// exact (58.7 M values, both variants) and it does delete one dispatch per
+/// attention layer, but on an M3 Ultra it *costs* prefill time: pooled-seed
+/// paired A/B, 6 ABBA pairs each, `v2` -1.098% +- 0.361% (1/6 wins) and
+/// `v1` -0.709% +- 0.027% (0/6 wins). Both variants lose, so the loss is not
+/// the softplus fold.
+///
+/// The cause is structural, not a tuning problem. The stock broadcast
+/// multiply is `BinaryOpType::General`, and MLX's
+/// `set_binary_op_output_data` (`backend/common/binary.h`) *donates* input
+/// `a` whenever it is donatable, row-contiguous and the same size as the
+/// output -- all true for the freshly materialized `[B, L, H, D]` attention
+/// output, which is a refcount-1 temporary. The stock multiply is therefore
+/// an **in-place** update of that 8 MiB buffer. `fast::metal_kernel` has no
+/// donation path at all: `CustomKernel::eval_gpu` unconditionally does
+/// `out.set_data(allocator::malloc(out.nbytes()))`, so this kernel must
+/// write a fresh, cold 8 MiB buffer per attention layer (~312 MiB of extra
+/// first-touch write traffic per 512-token prefill) plus the allocator
+/// churn. No amount of kernel-side tuning recovers that; the fusion can only
+/// win if the multiply stays an MLX binary op.
+private let lagunaPrefillGateEpilogueEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_GATE_EPILOGUE"] == "1"
+
+/// `DARKBLOOM_PREFILL_GATE_EPILOGUE_SOFTPLUS` (default on; set "0" for the
+/// multiply-only `v1` variant): folds `softplus` into the epilogue kernel.
+///
+/// The fold is bitwise, replicating MLX's compiled graph op for op. The
+/// compiled body is `softplus(gate.asType(.float32)).asType(gate.dtype)`, and
+/// `softplus(x)` is `logAddExp(x, 0)`; MLX's `LogAddExp` functor (identically
+/// spelled in `mlx-generated/binary_ops.cpp` and
+/// `backend/metal/kernels/binary_ops.h`) is
+///
+///     if (isnan(x) || isnan(y)) return NaN;
+///     maxval = max(x, y); minval = min(x, y);
+///     return (minval == -inf || maxval == inf)
+///         ? maxval : (maxval + log1p(exp(minval - maxval)));
+///
+/// instantiated at `T == float`. The kernel below is that expression with
+/// `y == 0.0f`, written with the same `metal::` calls in the same
+/// association, so every rounding decision is made in the same order. MLX
+/// compiles *every* JIT library -- compiled elementwise graphs and custom
+/// kernels alike -- through `Device::build_library_`, which pins
+/// `setFastMathEnabled(false)`, so `metal::exp` and `log1p` are the same
+/// precise implementations on both sides rather than a fast-math variant on
+/// one. The `bfloat -> float` widening is exact and the single `bfloat(...)`
+/// narrowing at the end is the one rounding `asType(gate.dtype)` performs.
+private let lagunaPrefillGateEpilogueFoldSoftplus =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_GATE_EPILOGUE_SOFTPLUS"] != "0"
+
+/// Shared body for both epilogue variants. Head dim is 128 and each thread
+/// owns eight contiguous BF16 lanes (16 B), so a thread's lanes never
+/// straddle two heads and one gate value serves all eight. The product is the
+/// `bfloat(a * b)` single-rounding idiom the shipped MoE tail kernel already
+/// uses in place of MLX's elementwise multiply.
+private func lagunaPrefillGateEpilogueSource(foldSoftplus: Bool) -> String {
+    let gateExpression =
+        foldSoftplus
+        ? """
+        float gx = float(gate[base >> 7]);
+        float gr;
+        if (metal::isnan(gx)) {
+            gr = metal::numeric_limits<float>::quiet_NaN();
+        } else {
+            constexpr float inf = metal::numeric_limits<float>::infinity();
+            float maxval = metal::max(gx, 0.0f);
+            float minval = metal::min(gx, 0.0f);
+            gr = (minval == -inf || maxval == inf)
+                ? maxval
+                : (maxval + log1p(metal::exp(minval - maxval)));
+        }
+        bfloat g = bfloat(gr);
+        """
+        : """
+        bfloat g = gate[base >> 7];
+        """
+    return """
+        uint base = thread_position_in_grid.x * 8u;
+        \(gateExpression)
+
+        const device vec<bfloat, 4>* src =
+            (const device vec<bfloat, 4>*)(attn_out + base);
+        device vec<bfloat, 4>* dst = (device vec<bfloat, 4>*)(output + base);
+        vec<bfloat, 4> a0 = src[0];
+        vec<bfloat, 4> a1 = src[1];
+        vec<bfloat, 4> r0;
+        vec<bfloat, 4> r1;
+        for (uint i = 0; i < 4u; ++i) {
+            r0[i] = bfloat(a0[i] * g);
+            r1[i] = bfloat(a1[i] * g);
+        }
+        dst[0] = r0;
+        dst[1] = r1;
+        """
+}
+
+private let lagunaPrefillGateEpilogueKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_gate_epilogue_bf16_v1",
+    inputNames: ["attn_out", "gate"],
+    outputNames: ["output"],
+    source: lagunaPrefillGateEpilogueSource(foldSoftplus: false),
+    ensureRowContiguous: true
+)
+
+private let lagunaPrefillGateEpilogueSoftplusKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_gate_epilogue_softplus_bf16_v2",
+    inputNames: ["attn_out", "gate"],
+    outputNames: ["output"],
+    source: lagunaPrefillGateEpilogueSource(foldSoftplus: true),
+    ensureRowContiguous: true
+)
+
+/// `attentionOutput` is `[rows, heads * 128]` BF16 in SDPA's native head-major
+/// order; `gate` is `[rows, heads]` BF16, already softplus-activated when
+/// `foldSoftplus` is false and raw `g_proj` output when it is true.
+private func lagunaPrefillGateEpilogue(
+    attentionOutput: MLXArray,
+    gate: MLXArray,
+    rows: Int,
+    heads: Int,
+    foldSoftplus: Bool
+) -> MLXArray {
+    let width = heads * LagunaConstants.headDim
+    precondition(attentionOutput.dtype == .bfloat16)
+    precondition(gate.dtype == .bfloat16)
+    precondition(attentionOutput.size == rows * width)
+    precondition(gate.size == rows * heads)
+
+    let kernel =
+        foldSoftplus
+        ? lagunaPrefillGateEpilogueSoftplusKernel : lagunaPrefillGateEpilogueKernel
+    return kernel(
+        [attentionOutput, gate],
+        grid: (rows * width / 8, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [attentionOutput.shape],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 /// Decode-only outer compilation of the same gate product with the following
 /// bias-free BF16 output projection. MLX keeps the matmul primitive intact but
 /// schedules the elementwise producer and projection as one compiled graph,
@@ -2281,6 +2434,42 @@ final class LagunaRuntimeAttention: Module {
                 L == 1, wo.bias == nil, MLXHardwareInfo.isCompiledDecodeSupported
             {
                 return attentionGateProjection(output, projectedGate, wo.weight)
+            }
+            // Prefill gate epilogue. The `v2` arm additionally consumes the
+            // RAW `g_proj` output and applies softplus inside the same
+            // kernel, deleting the compiled softplus dispatch; it is only
+            // reachable where the stock code would have taken the compiled
+            // `softplus(f32).asType(bf16)` path, whose arithmetic it
+            // replicates op for op. The `v1` arm takes whatever gate the
+            // stock chain produced and fuses only the multiply.
+            let foldSoftplus =
+                lagunaPrefillGateEpilogueFoldSoftplus && !gateIsActivated
+                && projectedGate.dtype == output.dtype
+            if lagunaPrefillGateEpilogueEnabled,
+                gatePerHead,
+                L > 1,
+                headDim == LagunaConstants.headDim,
+                output.dtype == .bfloat16,
+                projectedGate.dtype == .bfloat16,
+                output.size == B * L * nHeads * headDim,
+                projectedGate.size == B * L * nHeads
+            {
+                let epilogueGate =
+                    foldSoftplus ? projectedGate
+                    : (gateIsActivated
+                        ? projectedGate : lagunaCompiledSoftplusGate(projectedGate))
+                lagunaTrace(
+                    foldSoftplus
+                        ? "prefill gate epilogue (softplus folded)"
+                        : "prefill gate epilogue")
+                output = lagunaPrefillGateEpilogue(
+                    attentionOutput: output,
+                    gate: epilogueGate,
+                    rows: B * L,
+                    heads: nHeads,
+                    foldSoftplus: foldSoftplus
+                )
+                return wo(output)
             }
             let gate =
                 gateIsActivated
@@ -4715,6 +4904,204 @@ private func lagunaInterleavedSwiGLU(
     return compiledSiluProduct(gate, up)
 }
 
+/// `DARKBLOOM_PREFILL_EXPERT_SORT` (default on; set "0" to restore the stock
+/// `gatherSort` chain verbatim): collapses the ten dispatches `gatherSort`
+/// spends deriving the expert-sort permutation into one threadgroup-local
+/// counting sort.
+///
+/// The stock chain per sparse layer is `argSort(indices)` (a four-dispatch
+/// block merge-sort chain including a three-thread partition kernel),
+/// `argSort(order)` (four more), `order.floorDivide(8)`, and the
+/// `indices[order]` gather -- ten dispatches whose combined useful work is a
+/// 4096-element permutation. Only the `x[...]` row gather that follows is
+/// real work, and it is left exactly as it was.
+///
+/// **Integer-identical, not merely equivalent.** `argSort` is a stable sort,
+/// so `order` is fully determined: slot `r` holds position `p` iff `r` equals
+/// the number of positions carrying a strictly smaller expert plus the number
+/// of *earlier* positions carrying the same expert. The kernel materializes
+/// that closed form directly -- a per-(sub-block, expert) histogram, an
+/// exclusive scan over the 256 experts, then an in-position-order walk -- so
+/// its `token_of_slot` / `sorted_expert` / `inverse_order` are the same
+/// integers the stock chain produces for every input, including adversarial
+/// all-one-expert and heavy-tie routings. Integer identity of the permutation
+/// makes every downstream consumer (the row gather, the gather-QMM's
+/// `rhsIndices`, `down_proj`, and the sorted MoE tail's inverse lookup)
+/// bitwise unchanged.
+private let lagunaPrefillExpertSortEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_EXPERT_SORT"] != "0"
+
+/// One threadgroup of 512 threads (16 simdgroups) over a 16 x 256 `atomic_uint`
+/// threadgroup histogram (16 KiB) plus a 256-entry scan buffer (1 KiB).
+///
+/// Each simdgroup owns one contiguous *ordering chunk* of positions and walks
+/// it 32 lanes at a time, so the serial depth is `ceil(n / 512)` rounds (eight
+/// at the 512-token prefill width) rather than one iteration per position.
+/// Within a round the 32 lanes are ranked against each other entirely in
+/// registers: eight `simd_ballot` rounds over the expert's eight bits build a
+/// per-lane mask of the lanes carrying the *same* expert (the standard
+/// `match_any` emulation), so a lane's rank inside its group is
+/// `popcount(mask & lower_lanes)` and each distinct expert in the round costs
+/// its chunk exactly one atomic add, performed by the group's lowest lane and
+/// broadcast back with `simd_shuffle`.
+///
+///  * **P1** zeroes the histogram.
+///  * **P2** counts, one atomic add per (round, distinct expert).
+///  * **P3** reduces the 16 chunk rows to per-expert totals, runs an 8-step
+///    Hillis-Steele inclusive scan over the 256 totals (exclusive = inclusive
+///    - own), then rewrites each `hist[g][e]` in place with
+///    `ebase[e] + sum_{g' < g} hist[g'][e]` -- the first slot chunk `g` may
+///    claim for expert `e`.
+///  * **P4** places, taking `base = hist[g][e] += group_count` per round.
+///
+/// Stability, and therefore integer identity with `argSort`: inside a round
+/// lanes are ranked by lane index, which is position order; rounds advance the
+/// chunk's counter in position order; and the chunk bases are laid out in
+/// chunk (hence position) order. Lanes past `n` are excluded from every match
+/// mask by the validity ballot and write nothing.
+///
+/// `n` is read from `indices_shape` so one compiled kernel serves every prompt
+/// length. `p >> 3` and the 256-wide histogram are the
+/// `numExpertsPerTok == 8` / `numExperts == 256` literals the call-site guard
+/// pins.
+private let lagunaPrefillExpertSortHeader = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    /// Mask of the lanes in this simdgroup whose `expert` equals mine and
+    /// which are carrying a real position. Eight ballots over the expert's
+    /// eight bits; lanes not in `valid` are removed by the ninth.
+    inline uint laguna_expert_match_mask(uint expert, bool valid) {
+        uint m = ~0u;
+        for (uint b = 0; b < 8u; ++b) {
+            bool bit = ((expert >> b) & 1u) != 0u;
+            uint ballot = uint((simd_vote::vote_t)simd_ballot(bit));
+            m &= bit ? ballot : ~ballot;
+        }
+        return m & uint((simd_vote::vote_t)simd_ballot(valid));
+    }
+    """
+
+private let lagunaPrefillExpertSortKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_expert_sort_v1",
+    inputNames: ["indices"],
+    outputNames: ["token_of_slot", "sorted_expert", "inverse_order"],
+    source: """
+        constexpr uint kExperts = 256;
+        constexpr uint kGroups = 16;
+        constexpr uint kThreads = 512;
+
+        threadgroup atomic_uint hist[4096];
+        threadgroup uint totals[256];
+
+        uint tid = thread_position_in_threadgroup.x;
+        uint lane = tid & 31u;
+        uint grp = tid >> 5;
+        uint n = uint(
+            indices_shape[0] * indices_shape[1] * indices_shape[2]);
+        uint chunk = (n + kGroups - 1u) / kGroups;
+        uint start = grp * chunk;
+        uint end = min(n, start + chunk);
+
+        // P1: zero the histogram.
+        for (uint i = tid; i < kGroups * kExperts; i += kThreads) {
+            atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // P2: count. Order-free, so only the chunk assignment matters.
+        for (uint p0 = start; p0 < end; p0 += 32u) {
+            uint p = p0 + lane;
+            bool valid = p < end;
+            uint e = valid ? (indices[p] & (kExperts - 1u)) : 0u;
+            uint m = laguna_expert_match_mask(e, valid);
+            if (valid && lane == uint(ctz(m))) {
+                atomic_fetch_add_explicit(
+                    &hist[grp * kExperts + e], uint(popcount(m)),
+                    memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // P3a: per-expert totals across chunks.
+        uint total = 0u;
+        if (tid < kExperts) {
+            for (uint g = 0; g < kGroups; ++g) {
+                total += atomic_load_explicit(
+                    &hist[g * kExperts + tid], memory_order_relaxed);
+            }
+            totals[tid] = total;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // P3b: inclusive Hillis-Steele scan over the 256 expert totals.
+        for (uint off = 1u; off < kExperts; off <<= 1) {
+            uint add = (tid < kExperts && tid >= off) ? totals[tid - off] : 0u;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid < kExperts) {
+                totals[tid] = totals[tid] + add;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // P3c: rewrite each count with its chunk's first slot for this
+        // expert. `totals[tid] - total` is the exclusive expert prefix.
+        if (tid < kExperts) {
+            uint running = totals[tid] - total;
+            for (uint g = 0; g < kGroups; ++g) {
+                uint c = atomic_load_explicit(
+                    &hist[g * kExperts + tid], memory_order_relaxed);
+                atomic_store_explicit(
+                    &hist[g * kExperts + tid], running, memory_order_relaxed);
+                running += c;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // P4: stable placement, in position order within each chunk.
+        for (uint p0 = start; p0 < end; p0 += 32u) {
+            uint p = p0 + lane;
+            bool valid = p < end;
+            uint raw = valid ? indices[p] : 0u;
+            uint e = raw & (kExperts - 1u);
+            uint m = laguna_expert_match_mask(e, valid);
+            uint leader = m != 0u ? uint(ctz(m)) : 0u;
+            uint base = 0u;
+            if (valid && lane == leader) {
+                base = atomic_fetch_add_explicit(
+                    &hist[grp * kExperts + e], uint(popcount(m)),
+                    memory_order_relaxed);
+            }
+            base = simd_shuffle(base, ushort(leader));
+            if (valid) {
+                uint r = base + uint(popcount(m & ((1u << lane) - 1u)));
+                token_of_slot[r] = p >> 3;
+                sorted_expert[r] = raw;
+                inverse_order[p] = r;
+            }
+        }
+        """,
+    header: lagunaPrefillExpertSortHeader,
+    ensureRowContiguous: true
+)
+
+private func lagunaPrefillExpertSort(
+    indices: MLXArray
+) -> (tokenOfSlot: MLXArray, sortedExpert: MLXArray, inverseOrder: MLXArray) {
+    precondition(indices.dtype == .uint32)
+    let n = indices.size
+    precondition(n % LagunaConstants.numExpertsPerTok == 0)
+
+    let outputs = lagunaPrefillExpertSortKernel(
+        [indices],
+        grid: (512, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [[n], [n], [n]],
+        outputDTypes: [.uint32, .uint32, .uint32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 /// Prefill (multi-token, SORTED-regime) counterpart to the decode-only fused
 /// gate/up dispatch in `LagunaRuntimeSparseMoEBlock.forward`. One gather-QMM
 /// consumes the retained `[gate32, up32]`-interleaved NVFP4 bank in place of
@@ -4744,7 +5131,28 @@ private func lagunaFusedSortedRoutedGateUp(
     var inverseOrder = MLXArray()
     // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
     if doSort {
-        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        // `gatherSort` inlined with its ten permutation dispatches replaced
+        // by one counting-sort kernel. The row gather is the same
+        // `flattened(start: 0, end: -3)[...]` call with the same uint32
+        // index array (`order / 8`), so it stays one unchanged dispatch.
+        if lagunaPrefillExpertSortEnabled,
+            indices.dtype == .uint32,
+            indices.ndim == 3,
+            indices.dim(0) == 1,
+            indices.dim(1) > 1,
+            indices.dim(2) == LagunaConstants.numExpertsPerTok,
+            LagunaConstants.numExpertsPerTok == 8,
+            fusedWeight.dim(0) == 256,
+            indices.size <= 1 << 24
+        {
+            lagunaTrace("prefill expert sort")
+            let sorted = lagunaPrefillExpertSort(indices: indices)
+            sortedX = sortedX.flattened(start: 0, end: -3)[sorted.tokenOfSlot]
+            idx = sorted.sortedExpert
+            inverseOrder = sorted.inverseOrder
+        } else {
+            (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        }
     }
     // Fused counterpart of SwitchGLU's separate-bank branch:
     //   xUp = upProj(x, idx, sortedIndices: doSort)
