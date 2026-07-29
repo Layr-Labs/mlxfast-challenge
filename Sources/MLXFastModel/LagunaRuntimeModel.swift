@@ -248,6 +248,14 @@ let lagunaFusedRoutedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV"] != "0"
 
+/// Scheduling A/B for the merged routed/shared gate/up kernel. The R4 twin is
+/// the candidate default; set the selector to `2` for the proven
+/// two-row-per-SIMD control. R4 preserves each row's arithmetic; its only risk
+/// is performance from higher register pressure/occupancy tradeoffs.
+let lagunaRoutedSharedSwiGLUQMVRows4Enabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTED_SHARED_SWIGLU_ROWS"] != "2"
+
 /// Folds the per-head softplus gate into the output projection's GEMV (see
 /// `lagunaGatedOutputProjectionSource`), with one kernel variant per attention
 /// family. Set `DARKBLOOM_FUSED_GATED_OUTPUT=0` to ablate.
@@ -3560,6 +3568,132 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Four-output-rows-per-SIMD scheduling twin of the live two-row control.
+/// Every row retains the control's K-block loop, qdot calls, simd_sum order,
+/// BF16 casts, stable sigmoid/SwiGLU sequence, and routed/shared output map.
+/// Only row ownership changes, so correctness is intended to be exact while
+/// performance may regress from the doubled accumulator/register footprint.
+private let lagunaRoutedSharedSwiGLUQMVRows4Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_shared_nvfp4_swiglu_qmv_rows4_bf16_v1",
+    inputNames: [
+        "input", "routed_weight", "routed_scales", "indices",
+        "shared_weight", "shared_scales",
+    ],
+    outputNames: ["routed_activated", "shared_activated"],
+    source: """
+        constexpr uint input_width = 2048;
+        constexpr uint output_width = 512;
+        constexpr uint fused_width = 1024;
+        constexpr uint packed_row_bytes = 1024;
+        constexpr uint scale_row_bytes = 128;
+        constexpr uint packed_expert_bytes = fused_width * packed_row_bytes;
+        constexpr uint scale_expert_bytes = fused_width * scale_row_bytes;
+        constexpr uint block_width = 512;
+        constexpr uint values_per_lane = 16;
+        constexpr uint tiles_per_expert = 64;
+        constexpr uint routed_experts = 8;
+
+        // Preserve each expert row's arithmetic and output address while
+        // assigning four contiguous output rows to each SIMD group.
+        uint group = threadgroup_position_in_grid.x;
+        uint expert_slot = group % (routed_experts + 1);
+        uint tile = group / (routed_experts + 1);
+        bool is_routed = expert_slot < routed_experts;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint first_row = tile * 8 + simd_group * 4;
+
+        const device uint8_t* expert_weight;
+        const device uint8_t* expert_scales;
+        if (is_routed) {
+            uint expert = uint(indices[expert_slot]);
+            expert_weight =
+                (const device uint8_t*)routed_weight +
+                expert * packed_expert_bytes;
+            expert_scales = routed_scales + expert * scale_expert_bytes;
+        } else {
+            expert_weight = (const device uint8_t*)shared_weight;
+            expert_scales = shared_scales;
+        }
+
+        thread float gate_result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread float up_result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread float input_values[values_per_lane];
+
+        for (uint block = 0; block < input_width; block += block_width) {
+            const device vec<bfloat, 4>* input_vectors =
+                (const device vec<bfloat, 4>*)(
+                    input + block + lane * values_per_lane);
+            for (uint i = 0; i < values_per_lane / 4; ++i) {
+                const vec<bfloat, 4> values = input_vectors[i];
+                input_values[4 * i] = values[0];
+                input_values[4 * i + 1] = values[1];
+                input_values[4 * i + 2] = values[2];
+                input_values[4 * i + 3] = values[3];
+            }
+
+            for (uint row = 0; row < 4; ++row) {
+                uint logical_row = first_row + row;
+                uint gate_row;
+                uint up_row;
+                if (is_routed) {
+                    uint pair_tile = logical_row / 32;
+                    gate_row = pair_tile * 64 + logical_row % 32;
+                    up_row = gate_row + 32;
+                } else {
+                    gate_row = logical_row;
+                    up_row = gate_row + output_width;
+                }
+                const device uint8_t* gate_weight =
+                    expert_weight + gate_row * packed_row_bytes +
+                    block / 2 + lane * 8;
+                const device uint8_t* up_weight =
+                    expert_weight + up_row * packed_row_bytes +
+                    block / 2 + lane * 8;
+                const device uint8_t* gate_scale =
+                    expert_scales + gate_row * scale_row_bytes +
+                    block / 16 + lane;
+                const device uint8_t* up_scale =
+                    expert_scales + up_row * scale_row_bytes +
+                    block / 16 + lane;
+
+                gate_result[row] += laguna_nvfp4_qdot_16(
+                    gate_weight,
+                    input_values,
+                    laguna_nvfp4_scale(gate_scale[0]));
+                up_result[row] += laguna_nvfp4_qdot_16(
+                    up_weight,
+                    input_values,
+                    laguna_nvfp4_scale(up_scale[0]));
+            }
+        }
+
+        for (uint row = 0; row < 4; ++row) {
+            gate_result[row] = simd_sum(gate_result[row]);
+            up_result[row] = simd_sum(up_result[row]);
+            if (lane == 0) {
+                bfloat gate = bfloat(gate_result[row]);
+                bfloat up = bfloat(up_result[row]);
+                bfloat exp_abs = metal::exp(metal::abs(gate));
+                bfloat denominator = bfloat(1) + exp_abs;
+                bfloat y = bfloat(1) / denominator;
+                bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+                bfloat silu = bfloat(gate * sigmoid);
+                bfloat activation = bfloat(silu * up);
+                if (is_routed) {
+                    routed_activated[
+                        expert_slot * output_width + first_row + row
+                    ] = activation;
+                } else {
+                    shared_activated[first_row + row] = activation;
+                }
+            }
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
 /// Two-block software pipeline for the accepted 64-thread/two-SIMD geometry.
 /// Both blocks' activation, code, and scale loads are issued before either
 /// block is consumed, then the two contributions enter the original
@@ -3868,9 +4002,21 @@ func lagunaRoutedSharedSwiGLUQMV(
         ])
 
     lagunaTrace("routed+shared gate/up QMV")
-    let outputs = lagunaRoutedSharedSwiGLUQMVKernel(
+    let kernel =
+        lagunaRoutedSharedSwiGLUQMVRows4Enabled
+        ? lagunaRoutedSharedSwiGLUQMVRows4Kernel
+        : lagunaRoutedSharedSwiGLUQMVKernel
+    // R4 covers eight rows per 64-thread group, so 64 tiles per each of the
+    // nine slots dispatch exactly 576 threadgroups. The default R2 control
+    // retains its original 128 tiles per slot.
+    let tilesPerSlot = lagunaRoutedSharedSwiGLUQMVRows4Enabled ? 64 : 128
+    let outputs = kernel(
         [input, routedWeight, routedScales, indices, sharedWeight, sharedScales],
-        grid: ((LagunaConstants.numExpertsPerTok + 1) * 128 * 64, 1, 1),
+        grid: (
+            (LagunaConstants.numExpertsPerTok + 1) * tilesPerSlot * 64,
+            1,
+            1
+        ),
         threadGroup: (64, 1, 1),
         outputShapes: [
             [
@@ -6715,9 +6861,13 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
 
         let result: MLXArray
         if let lmHead {
-            if inputs.shape == [1, 1], let pruner = lmHeadPruner {
-                // Certified two-pass decode head (notes/68): full BF16 logits
-                // row, bit-identical to stock in every argmax-reachable slot.
+            if let pruner = lmHeadPruner,
+                inputs.shape == [1, 1] || lagunaLmHeadPrunePrefillEnabled
+            {
+                // Certified two-pass final-row head (notes/68): full BF16
+                // logits, bit-identical to stock in every argmax-reachable
+                // slot. When enabled, prefill has already sliced to the last
+                // hidden row; decode always retains this pruner.
                 result = pruner.logits(hidden: hidden, lmHeadWeight: lmHead.weight)
             } else {
                 result = lmHead(hidden)
