@@ -1386,7 +1386,7 @@ template <
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
           if (sg_active) {
-            STEEL_PRAGMA_NO_UNROLL
+            STEEL_PRAGMA_UNROLL
             for (int kk1 = 0; kk1 < BK; kk1 += SK) {
               NAXTile<T, TM, TK> Atile;
               NAXTile<Wtype, BR, BC> Btile;
@@ -1435,7 +1435,7 @@ template <
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
           if (sg_active) {
-            STEEL_PRAGMA_NO_UNROLL
+            STEEL_PRAGMA_UNROLL
             for (int kk1 = 0; kk1 < BK; kk1 += SK) {
               NAXTile<T, TM, TK> Atile;
               NAXTile<Wtype, BR, BC> Btile;
@@ -1657,11 +1657,10 @@ template <
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg_active) {
-          STEEL_PRAGMA_NO_UNROLL
+          STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             NAXTile<T, TM, TK> Atile;
             NAXTile<Wtype, TN, TK> Btile;
-            volatile int compiler_barrier;
 
             if (sgp_sm == SM) {
               Atile.load(xn + kk1, kernel_K);
@@ -1678,7 +1677,7 @@ template <
                 metal::bool_constant<false>{},
                 Btile,
                 metal::bool_constant<true>{});
-            (void)compiler_barrier;
+
           }
         }
 

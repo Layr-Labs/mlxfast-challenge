@@ -1237,7 +1237,12 @@ template <
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
           if (sg_active) {
-            STEEL_PRAGMA_NO_UNROLL
+            // PRAGMA-VARIANT 01: SK-step staging+MMA loop, 2 iterations
+            // (BK=64/SK=32). Full unroll lets the second step's 6 fragment
+            // loads issue during the first step's MMA chain. Scheduling
+            // only: tile_matmad_nax order and Dtile accumulation sequence
+            // are unchanged. Volatile stays, gated by stage_novol (fc 207).
+            STEEL_PRAGMA_UNROLL
             for (int kk1 = 0; kk1 < BK; kk1 += SK) {
               NAXTile<T, TM, TK> Atile;
               NAXTile<Wtype, BR, BC> Btile;
@@ -1286,7 +1291,8 @@ template <
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
           if (sg_active) {
-            STEEL_PRAGMA_NO_UNROLL
+            // PRAGMA-VARIANT 01: same unroll for the K-remainder loop.
+            STEEL_PRAGMA_UNROLL
             for (int kk1 = 0; kk1 < BK; kk1 += SK) {
               NAXTile<T, TM, TK> Atile;
               NAXTile<Wtype, BR, BC> Btile;
@@ -1508,11 +1514,18 @@ template <
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg_active) {
-          STEEL_PRAGMA_NO_UNROLL
+          // PRAGMA-VARIANT 01: SK-step staging+MMA loop, 2 iterations
+          // (BK=64/SK=32): Atile TMxTK=1x2 device frags + Btile TNxTK=2x2
+          // threadgroup frags per step, serially-dependent Dtile MMA chain.
+          // Full unroll + volatile removal let the second step's 6 fragment
+          // loads hoist ahead of the first step's MMAs. This kernel is built
+          // WITHOUT function constants (static expert shape path), so the
+          // stage_novol lever never reaches it -- the volatile must go here.
+          // Scheduling only: no arithmetic, order, or rounding change.
+          STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             NAXTile<T, TM, TK> Atile;
             NAXTile<Wtype, TN, TK> Btile;
-            volatile int compiler_barrier;
 
             if (sgp_sm == SM) {
               Atile.load(xn + kk1, kernel_K);
@@ -1529,7 +1542,7 @@ template <
                 metal::bool_constant<false>{},
                 Btile,
                 metal::bool_constant<true>{});
-            (void)compiler_barrier;
+
           }
         }
 
