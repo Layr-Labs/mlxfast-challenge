@@ -277,8 +277,53 @@ private let lagunaNativeAffineQKVLayerCount: Int = {
 }()
 let lagunaNativeAffineQKVEnabled = lagunaNativeAffineQKVLayerCount > 0
 
+/// Depth-selection mode for both native affine INT8 attention layouts.
+///
+/// **Default (unset or anything but `1`) is the shipped PREFIX predicate**
+/// `layer < count`, so the shipped semantics are byte-for-byte what the ranked
+/// chunks proved. `DARKBLOOM_NATIVE_AFFINE_SUFFIX=1` selects the LAST `count`
+/// layers (`layer >= numHiddenLayers - count`) instead. It exists to measure
+/// whether the quantization perturbation the argmax gate sees depends on the
+/// DEPTH of the quantized site (an early layer's error has 39 more layers of
+/// amplification runway than a late one's) at matched weight-traffic coverage.
+private let lagunaNativeAffineSuffixSelection =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_SUFFIX"] == "1"
+
+/// Restricts a native affine layout to exactly one layer index, for
+/// amplification-vs-depth probes. Unset (or out of range) keeps the normal
+/// prefix/suffix coverage. The layer count must still be non-zero, so the
+/// layout is prepared and dispatched exactly as it would be in a ranked run.
+private func lagunaNativeAffineOnlyLayer(_ key: String) -> Int? {
+    guard let raw = ProcessInfo.processInfo.environment[key],
+        let value = Int(raw),
+        value >= 0,
+        value < LagunaConstants.numHiddenLayers
+    else {
+        return nil
+    }
+    return value
+}
+
+private let lagunaNativeAffineQKVOnlyLayer = lagunaNativeAffineOnlyLayer(
+    "DARKBLOOM_NATIVE_AFFINE_QKV_ONLY_LAYER")
+
+private let lagunaNativeAffineOProjOnlyLayer = lagunaNativeAffineOnlyLayer(
+    "DARKBLOOM_NATIVE_AFFINE_OPROJ_ONLY_LAYER")
+
+private func lagunaNativeAffineCovers(layer: Int, count: Int, onlyLayer: Int?) -> Bool {
+    guard count > 0 else { return false }
+    if let onlyLayer { return layer == onlyLayer }
+    if lagunaNativeAffineSuffixSelection {
+        return layer >= LagunaConstants.numHiddenLayers - count
+    }
+    return layer < count
+}
+
 private func lagunaUseNativeAffineQKV(layer: Int) -> Bool {
-    layer < lagunaNativeAffineQKVLayerCount
+    lagunaNativeAffineCovers(
+        layer: layer,
+        count: lagunaNativeAffineQKVLayerCount,
+        onlyLayer: lagunaNativeAffineQKVOnlyLayer)
 }
 
 /// The same native group-32 affine INT8 side layout applied to the attention
@@ -306,7 +351,10 @@ private let lagunaNativeAffineOProjLayerCount: Int = {
 let lagunaNativeAffineOProjEnabled = lagunaNativeAffineOProjLayerCount > 0
 
 private func lagunaUseNativeAffineOProj(layer: Int) -> Bool {
-    layer < lagunaNativeAffineOProjLayerCount
+    lagunaNativeAffineCovers(
+        layer: layer,
+        count: lagunaNativeAffineOProjLayerCount,
+        onlyLayer: lagunaNativeAffineOProjOnlyLayer)
 }
 
 /// Sliding-layer per-head RMSNorm + plain RoPE fusion (see
@@ -1395,21 +1443,107 @@ private func lagunaPrefillFullQKNormYaRN(
 struct LagunaNativeAffineWeight {
     let packedCodes: MLXArray
     let scales: MLXArray
-    let biases: MLXArray
+    let biases: MLXArray?
     let originalShape: [Int]
+    /// Wire format of this side layout. The shipped layout is group-32 affine
+    /// INT8; the NVFP4 probe below can build group-16 4-bit NVFP4 instead, and
+    /// the decode dispatch reads these three fields so one call site serves both.
+    var groupSize: Int = 32
+    var bits: Int = 8
+    var mode: QuantizationMode = .affine
 
-    var arrays: [MLXArray] { [packedCodes, scales, biases] }
+    var arrays: [MLXArray] { [packedCodes, scales] + (biases.map { [$0] } ?? []) }
 }
 
-func lagunaNativeAffineWeight(_ weight: MLXArray) -> LagunaNativeAffineWeight? {
+/// REAL (not simulated) NVFP4 side layout for layers `>= N`
+/// (`DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM`, default 32 — the tail window whose
+/// per-layer amplification is ~15x below the early layers), using the same
+/// group-16 4-bit NVFP4 the routed experts already ship. Set
+/// `DARKBLOOM_NATIVE_AFFINE_NVFP4=0` to keep every native affine layout
+/// group-32 affine INT8 exactly as previously shipped.
+private let lagunaNativeAffineNVFP4From: Int? = {
+    guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_NVFP4"] != "0"
+    else { return nil }
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM"] ?? "32"
+    guard let value = Int(raw), value < LagunaConstants.numHiddenLayers else { return nil }
+    return min(max(value, 0), LagunaConstants.numHiddenLayers)
+}()
+
+/// Measurement-only wire-format probe. `DARKBLOOM_NATIVE_AFFINE_PROBE_FORMAT`
+/// (`nvfp4` / `mxfp8` / `mxfp4`; unset = shipped INT8) rounds the BF16 source
+/// weight through the named format before the shipped group-32 affine INT8 side
+/// layout is built from it, so the decode path carries that format's NUMERIC
+/// error while its dispatch shape, kernels and timing stay exactly the shipped
+/// ones. It prices a format step's argmax cost without building its layout;
+/// the extra INT8 re-quantization adds error in quadrature and is ~0.1% of an
+/// NVFP4-class perturbation. Unset by default — no shipped behavior changes.
+private let lagunaNativeAffineProbeFormat: (mode: QuantizationMode, groupSize: Int, bits: Int)? = {
+    switch ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_PROBE_FORMAT"] {
+    case "nvfp4": return (.nvfp4, 16, 4)
+    case "mxfp8": return (.mxfp8, 32, 8)
+    case "mxfp4": return (.mxfp4, 32, 4)
+    default: return nil
+    }
+}()
+
+/// Restricts the probe format to layers `>= N` (`DARKBLOOM_NATIVE_AFFINE_PROBE_
+/// FORMAT_FROM`), so a late-layer format step can be priced INCREMENTALLY on top
+/// of the shipped INT8 stack instead of replacing it everywhere. Default 0 = the
+/// probe format applies wherever a native affine layout is built.
+private let lagunaNativeAffineProbeFormatFrom: Int = {
+    guard
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_NATIVE_AFFINE_PROBE_FORMAT_FROM"],
+        let value = Int(raw)
+    else {
+        return 0
+    }
+    return min(max(value, 0), LagunaConstants.numHiddenLayers)
+}()
+
+private func lagunaNativeAffineProbeRoundTrip(_ weight: MLXArray, layer: Int?) -> MLXArray {
+    guard let probe = lagunaNativeAffineProbeFormat,
+        weight.dim(1).isMultiple(of: probe.groupSize),
+        layer.map({ $0 >= lagunaNativeAffineProbeFormatFrom }) ?? true
+    else {
+        return weight
+    }
+    let (codes, scales, biases) = quantized(
+        weight, groupSize: probe.groupSize, bits: probe.bits, mode: probe.mode)
+    return dequantized(
+        codes, scales: scales, biases: biases,
+        groupSize: probe.groupSize, bits: probe.bits, mode: probe.mode,
+        dtype: .bfloat16)
+}
+
+func lagunaNativeAffineWeight(
+    _ weight: MLXArray, layer: Int? = nil
+) -> LagunaNativeAffineWeight? {
     guard weight.dtype == .bfloat16, weight.ndim == 2,
         weight.dim(1).isMultiple(of: 32)
     else {
         return nil
     }
+    let source = lagunaNativeAffineProbeRoundTrip(weight, layer: layer)
+    if let from = lagunaNativeAffineNVFP4From,
+        (layer ?? 0) >= from,
+        weight.dim(1).isMultiple(of: 16)
+    {
+        let (codes, scales, biases) = quantized(
+            source, groupSize: 16, bits: 4, mode: .nvfp4)
+        return LagunaNativeAffineWeight(
+            packedCodes: codes,
+            scales: scales,
+            biases: biases,
+            originalShape: weight.shape,
+            groupSize: 16,
+            bits: 4,
+            mode: .nvfp4
+        )
+    }
     let (packedCodes, scales, biases) = quantized(
-        weight, groupSize: 32, bits: 8, mode: .affine)
-    guard let biases else { return nil }
+        source, groupSize: 32, bits: 8, mode: .affine)
+    guard biases != nil else { return nil }
     return LagunaNativeAffineWeight(
         packedCodes: packedCodes,
         scales: scales,
@@ -2318,7 +2452,7 @@ final class LagunaRuntimeAttention: Module {
             type(of: wo) == Linear.self,
             wo.bias == nil,
             wo.weight.shape == [LagunaConstants.hiddenSize, nHeads * headDim],
-            let quantizedWO = lagunaNativeAffineWeight(wo.weight)
+            let quantizedWO = lagunaNativeAffineWeight(wo.weight, layer: layerIdx)
         else {
             return []
         }
@@ -2328,16 +2462,19 @@ final class LagunaRuntimeAttention: Module {
 
     func prepareNativeAffineQKVWeight() -> [MLXArray] {
         guard _nativeAffineQKV == nil,
-            let q = lagunaNativeAffineWeight(wq.weight),
-            let k = lagunaNativeAffineWeight(wk.weight),
-            let v = lagunaNativeAffineWeight(wv.weight)
+            let q = lagunaNativeAffineWeight(wq.weight, layer: layerIdx),
+            let k = lagunaNativeAffineWeight(wk.weight, layer: layerIdx),
+            let v = lagunaNativeAffineWeight(wv.weight, layer: layerIdx)
         else {
             return []
         }
         let packedCodes = concatenated(
             [q.packedCodes, k.packedCodes, v.packedCodes], axis: 0)
         let scales = concatenated([q.scales, k.scales, v.scales], axis: 0)
-        let biases = concatenated([q.biases, k.biases, v.biases], axis: 0)
+        var biases: MLXArray?
+        if let qb = q.biases, let kb = k.biases, let vb = v.biases {
+            biases = concatenated([qb, kb, vb], axis: 0)
+        }
         let fused = LagunaNativeAffineWeight(
             packedCodes: packedCodes,
             scales: scales,
@@ -2345,7 +2482,10 @@ final class LagunaRuntimeAttention: Module {
             originalShape: [
                 wq.weight.dim(0) + wk.weight.dim(0) + wv.weight.dim(0),
                 wq.weight.dim(1),
-            ]
+            ],
+            groupSize: q.groupSize,
+            bits: q.bits,
+            mode: q.mode
         )
         _nativeAffineQKV = fused
         return fused.arrays
@@ -2472,9 +2612,9 @@ final class LagunaRuntimeAttention: Module {
                     scales: fusedAffine.scales,
                     biases: fusedAffine.biases,
                     transpose: true,
-                    groupSize: 32,
-                    bits: 8,
-                    mode: .affine
+                    groupSize: fusedAffine.groupSize,
+                    bits: fusedAffine.bits,
+                    mode: fusedAffine.mode
                 )
                 let queryDim = nHeads * headDim
                 let kvDim = nKVHeads * headDim
@@ -2736,9 +2876,9 @@ final class LagunaRuntimeAttention: Module {
                     scales: affineWO.scales,
                     biases: affineWO.biases,
                     transpose: true,
-                    groupSize: 32,
-                    bits: 8,
-                    mode: .affine
+                    groupSize: affineWO.groupSize,
+                    bits: affineWO.bits,
+                    mode: affineWO.mode
                 )
             }
             if lagunaFusedGatedOutputProjectionEnabled,
