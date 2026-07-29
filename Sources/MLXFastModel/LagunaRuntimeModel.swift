@@ -1667,6 +1667,127 @@ func lagunaFusedNormQKVProjection(
     return (outputs[0], outputs[1], outputs[2], outputs[3])
 }
 
+/// Prefill (multi-token) twin of `lagunaSharedSwiGLUQMVKernel`. Uses a 1D
+/// grid with the same threadgroup count as decode (128) and an inner loop
+/// over token positions, avoiding the 65k-threadgroup 2D grid that regressed
+/// on M5. Each threadgroup processes the same 4 output rows across all L
+/// positions sequentially — the per-position arithmetic is a verbatim copy
+/// of the decode kernel, just with `tok_pos` offset on every base pointer.
+/// Bit-exact: the `laguna_nvfp4_qdot_16` dequant and BF16 SiLU epilogue are
+/// identical, and each token's row is independent.
+private let lagunaSharedSwiGLUQMVPreomKernel = MLXFast.metalKernel(
+    name: "laguna_shared_nvfp4_swiglu_qmv_bf16_prefill_v1",
+    inputNames: ["input", "fused_weight", "fused_scales", "seq_len"],
+    outputNames: ["activated"],
+    source: """
+        constexpr uint input_width = 2048;
+        constexpr uint output_width = 512;
+        constexpr uint fused_width = 1024;
+        constexpr uint packed_row_bytes = 1024;
+        constexpr uint scale_row_bytes = 128;
+        constexpr uint block_width = 512;
+        constexpr uint values_per_lane = 16;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint first_row = tile * 4 + simd_group * 2;
+        uint sl = uint(seq_len);
+
+        for (uint tok_pos = 0; tok_pos < sl; ++tok_pos) {
+            thread float gate_result[2] = {0.0f, 0.0f};
+            thread float up_result[2] = {0.0f, 0.0f};
+            thread float input_values[values_per_lane];
+
+            for (uint block = 0; block < input_width; block += block_width) {
+                const device vec<bfloat, 4>* input_vectors =
+                    (const device vec<bfloat, 4>*)(
+                        input + tok_pos * input_width + block + lane * values_per_lane);
+                for (uint i = 0; i < values_per_lane / 4; ++i) {
+                    const vec<bfloat, 4> values = input_vectors[i];
+                    input_values[4 * i] = values[0];
+                    input_values[4 * i + 1] = values[1];
+                    input_values[4 * i + 2] = values[2];
+                    input_values[4 * i + 3] = values[3];
+                }
+
+                for (uint row = 0; row < 2; ++row) {
+                    uint gate_row = first_row + row;
+                    uint up_row = gate_row + output_width;
+                    const device uint8_t* gate_weight =
+                        (const device uint8_t*)fused_weight +
+                        gate_row * packed_row_bytes + block / 2 + lane * 8;
+                    const device uint8_t* up_weight =
+                        (const device uint8_t*)fused_weight +
+                        up_row * packed_row_bytes + block / 2 + lane * 8;
+                    const device uint8_t* gate_scale =
+                        fused_scales + gate_row * scale_row_bytes +
+                        block / 16 + lane;
+                    const device uint8_t* up_scale =
+                        fused_scales + up_row * scale_row_bytes +
+                        block / 16 + lane;
+
+                    gate_result[row] += laguna_nvfp4_qdot_16(
+                        gate_weight,
+                        input_values,
+                        laguna_nvfp4_scale(gate_scale[0]));
+                    up_result[row] += laguna_nvfp4_qdot_16(
+                        up_weight,
+                        input_values,
+                        laguna_nvfp4_scale(up_scale[0]));
+                }
+            }
+
+            for (uint row = 0; row < 2; ++row) {
+                gate_result[row] = simd_sum(gate_result[row]);
+                up_result[row] = simd_sum(up_result[row]);
+                if (lane == 0) {
+                    bfloat gate = bfloat(gate_result[row]);
+                    bfloat up = bfloat(up_result[row]);
+                    bfloat exp_abs = metal::exp(metal::abs(gate));
+                    bfloat denominator = bfloat(1) + exp_abs;
+                    bfloat y = bfloat(1) / denominator;
+                    bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+                    bfloat silu = bfloat(gate * sigmoid);
+                    activated[tok_pos * output_width + first_row + row] = bfloat(silu * up);
+                }
+            }
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
+func lagunaSharedSwiGLUQMVPreom(
+    _ input: MLXArray,
+    fusedWeight: MLXArray,
+    fusedScales: MLXArray,
+    seqLen: Int
+) -> MLXArray {
+    precondition(input.dtype == .bfloat16)
+    precondition(input.shape == [1, seqLen, LagunaConstants.hiddenSize])
+    precondition(fusedWeight.dtype == .uint32)
+    precondition(
+        fusedWeight.shape == [
+            2 * LagunaConstants.sharedExpertIntermediateSize,
+            LagunaConstants.hiddenSize / 8,
+        ])
+    precondition(fusedScales.dtype == .uint8)
+    precondition(
+        fusedScales.shape == [
+            2 * LagunaConstants.sharedExpertIntermediateSize,
+            LagunaConstants.hiddenSize / 16,
+        ])
+
+    return lagunaSharedSwiGLUQMVPreomKernel(
+        [input, fusedWeight, fusedScales, Int32(seqLen)],
+        grid: (128 * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, seqLen, LagunaConstants.sharedExpertIntermediateSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 /// Decode-only fusion of the per-head attention gate with the output
 /// projection. The stock decode path is two dispatches: one compiled
 /// elementwise kernel that softplus-gates the attention output, and one GEMV
@@ -3772,6 +3893,7 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let seqLen = x.dim(1)
         if x.dim(1) == 1,
             let fusedWeight = _fusedGateUpWeight, let fusedScales = _fusedGateUpScales
         {
@@ -3812,6 +3934,31 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             let gate = gateUp[.ellipsis, 0 ..< _fusedGateUpSplit]
             let up = gateUp[.ellipsis, _fusedGateUpSplit...]
             return downProj(compiledSiluProduct(gate, up))
+        }
+        // Multi-token prefill: use the 1D-grid inner-loop prefill kernel
+        // (same threadgroup count as decode, avoiding 65k-threadgroup 2D
+        // grids). Saves 2 dispatches per sparse layer vs the stock path
+        // (gate/up+SiLU fused into 1 dispatch + downProj).
+        if seqLen > 1,
+            lagunaFusedSharedSwiGLUQMVEnabled,
+            x.dtype == .bfloat16,
+            x.ndim == 3, x.dim(0) == 1,
+            x.dim(2) == LagunaConstants.hiddenSize,
+            let pfFusedWeight = _fusedGateUpWeight,
+            let pfFusedScales = _fusedGateUpScales,
+            pfFusedWeight.dtype == .uint32,
+            pfFusedScales.dtype == .uint8,
+            _fusedGateUpSplit == LagunaConstants.sharedExpertIntermediateSize
+        {
+            lagunaTrace("prefill shared gate/up QMV + SwiGLU")
+            return downProj(
+                lagunaSharedSwiGLUQMVPreom(
+                    x,
+                    fusedWeight: pfFusedWeight,
+                    fusedScales: pfFusedScales,
+                    seqLen: seqLen
+                )
+            )
         }
         return downProj(compiledSiluProduct(gateProj(x), upProj(x)))
     }
