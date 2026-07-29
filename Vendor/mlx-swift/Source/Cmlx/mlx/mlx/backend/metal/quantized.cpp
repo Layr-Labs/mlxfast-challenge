@@ -1277,7 +1277,8 @@ bool darkbloom_stage_runbar() {
 }
 
 bool darkbloom_stage_novol() {
-  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_NOVOL");
+  static const bool v =
+      env::get_var("DARKBLOOM_STAGE_NOVOL", "") != "0";
   return v;
 }
 
