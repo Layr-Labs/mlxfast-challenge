@@ -300,7 +300,7 @@ private let lagunaNativeAffineOProjLayerCount: Int = {
     else { return 0 }
     let requested = Int(
         ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OPROJ_LAYERS"]
-            ?? "16") ?? 16
+            ?? "40") ?? 40
     return min(max(requested, 0), LagunaConstants.numHiddenLayers)
 }()
 let lagunaNativeAffineOProjEnabled = lagunaNativeAffineOProjLayerCount > 0
