@@ -6810,6 +6810,20 @@ final class LagunaRuntimeModelInner: Module {
 /// per-layer cache stack (unbounded `StandardKVCache` for full-attention
 /// layers, `RotatingKVCache(512)` for sliding layers). Laguna applies NO
 /// final logit softcap and NO embedding scaling.
+///
+/// Use a 640-row allocation quantum for the standard full-attention cache.
+/// The frozen 512-token seed then has room for the complete 128-token ranked
+/// decode window, avoiding a full-history growth on its first decode request.
+/// `DARKBLOOM_FULL_KV_CACHE_STEP=256` restores the preceding behavior for a
+/// same-binary control.
+private let lagunaFullKVCacheStep: Int = {
+    let raw =
+        ProcessInfo.processInfo.environment["DARKBLOOM_FULL_KV_CACHE_STEP"]
+        ?? "640"
+    guard let value = Int(raw), value > 0 else { return 640 }
+    return value
+}()
+
 public final class LagunaRuntimeModel: Module, LanguageModel {
     @ModuleInfo(key: "model") var model: LagunaRuntimeModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
@@ -6892,9 +6906,12 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     public func newCache(parameters _: GenerateParameters?) -> [KVCache] {
         (0..<configuration.numHiddenLayers).map { layerIndex in
             if configuration.layerTypes[layerIndex] == .full {
-                StandardKVCache()
+                let cache = StandardKVCache()
+                cache.step = lagunaFullKVCacheStep
+                return cache
             } else {
-                RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
+                return RotatingKVCache(
+                    maxSize: configuration.slidingWindow, keep: 0)
             }
         }
     }
