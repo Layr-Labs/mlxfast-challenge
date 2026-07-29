@@ -799,6 +799,383 @@ private func resolvedKVQuantizationGroupSize(
     }
 }
 
+/// Quantized rotating KV cache for sliding-window attention.
+///
+/// Mirrors `RotatingKVCache`'s ring-buffer mechanics (temporal ordering, trim,
+/// in-place single-token update, `keep`-prefix preservation) but stores the K/V
+/// as quantized tuples `(wq, scales, biases)` and returns those tuples for
+/// `quantizedScaledDotProductAttention`, so the SDPA reads INT8 K/V directly
+/// (halving the decode K/V read bandwidth vs the BF16 `RotatingKVCache`).
+///
+/// The quantization is applied per-token at append time (each new K/V row is
+/// quantized against its own per-group scale), exactly as `QuantizedKVCache`
+/// does for the non-rotating full-attention cache. The ring rotation itself
+/// operates on the already-quantized tuples, so no re-quantization happens on
+/// rotation — the quantization perturbation is incurred once per token at
+/// append, identical to `QuantizedKVCache`.
+public class QuantizedRotatingKVCache: BaseKVCache, QuantizedKVCacheProtocol {
+    var keep: Int
+    var keys: (MLXArray, MLXArray, MLXArray?)?
+    var values: (MLXArray, MLXArray, MLXArray?)?
+    var maxCacheSize: Int
+    var step: Int
+    var idx: Int = 0
+    public private(set) var groupSize: Int
+    public private(set) var bits: Int
+    public let mode: QuantizationMode
+
+    public override var maxSize: Int? { maxCacheSize }
+
+    public init(
+        maxSize: Int, keep: Int = 0, step: Int = 256,
+        groupSize: Int = 64, bits: Int = 8, mode: QuantizationMode = .affine
+    ) {
+        self.maxCacheSize = maxSize
+        self.keep = keep
+        self.step = step
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+        super.init()
+    }
+
+    public override func innerState() -> [MLXArray] {
+        var arrays: [MLXArray] = []
+        if let keys = keys {
+            arrays.append(contentsOf: [keys.0, keys.1, keys.2].compactMap { $0 })
+        }
+        if let values = values {
+            arrays.append(contentsOf: [values.0, values.1, values.2].compactMap { $0 })
+        }
+        return arrays
+    }
+
+    private func treeMap<T>(
+        _ transform: (MLXArray) -> T, _ tuple: (MLXArray, MLXArray, MLXArray?)
+    ) -> (T, T, T?) {
+        if let biases = tuple.2 {
+            return (transform(tuple.0), transform(tuple.1), transform(biases))
+        }
+        return (transform(tuple.0), transform(tuple.1), nil)
+    }
+
+    private func treeMapPair<T>(
+        _ transform: (MLXArray) -> T, _ tuple1: (MLXArray, MLXArray, MLXArray?),
+        _ tuple2: (MLXArray, MLXArray, MLXArray?)
+    ) -> ((T, T, T?), (T, T, T?)) {
+        (treeMap(transform, tuple1), treeMap(transform, tuple2))
+    }
+
+    /// Quantize a single `[B, nKVHeads, L, headDim]` BF16 slab into the cache's
+    /// `(wq, scales, biases)` wire format. Per-group quantization along the last
+    /// dim, identical to `QuantizedKVCache`'s append path.
+    private func quantizeSlab(_ array: MLXArray) -> (MLXArray, MLXArray, MLXArray?) {
+        let (wq, scales, biases) = quantized(
+            array, groupSize: groupSize, bits: bits, mode: mode)
+        return (wq, scales, biases)
+    }
+
+    private func initQuant(
+        B: Int, nKVHeads: Int, newSize: Int, headDim: Int, dtype: DType
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        let temp = MLXArray.zeros([B, nKVHeads, newSize, headDim], dtype: dtype)
+        return quantizeSlab(temp)
+    }
+
+    private func trimTuple(
+        trimSize: Int, _ tuple: (MLXArray, MLXArray, MLXArray?),
+        append: (MLXArray, MLXArray, MLXArray?)? = nil
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        var toCat: [(MLXArray, MLXArray, MLXArray?)] = []
+        if trimSize > 0 {
+            toCat = [
+                treeMap({ $0[.ellipsis, ..<keep, 0...] }, tuple),
+                treeMap({ $0[.ellipsis, (trimSize + keep)..., 0...] }, tuple),
+            ]
+        } else {
+            toCat = [tuple]
+        }
+        if let append {
+            toCat.append(append)
+        }
+        // Concatenate each component along the sequence axis (axis 2).
+        let wqs = toCat.map { $0.0 }
+        let scales = toCat.map { $0.1 }
+        let biases = toCat.compactMap { $0.2 }
+        let newWq = concatenated(wqs, axis: 2)
+        let newScales = concatenated(scales, axis: 2)
+        let newBiases: MLXArray? =
+            biases.isEmpty || toCat.contains(where: { $0.2 == nil }) ? nil
+            : concatenated(biases, axis: 2)
+        return (newWq, newScales, newBiases)
+    }
+
+    /// Functional splice: return a new tuple equal to `tuple` with the sequence
+    /// slice `[at, end)` replaced by `slab`. Builds the result by concatenating
+    /// the `[..<at)` prefix, the slab, and the `[end...)` suffix along axis 2 —
+    /// no in-place mutation, so the lazy graph survives a mid-graph eval (which
+    /// in-place subscript-assign does not). When `at == 0` the prefix is empty;
+    /// when `end >= seqLen` the suffix is empty.
+    private func scatterTuple(
+        _ tuple: (MLXArray, MLXArray, MLXArray?),
+        _ slab: (MLXArray, MLXArray, MLXArray?),
+        at: Int, end: Int
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        let seqLen = tuple.0.dim(2)
+        var parts: [(MLXArray, MLXArray, MLXArray?)] = []
+        // Skip empty slices (e.g. `..<0` prefix or `end...` suffix when the
+        // splice covers an end); a 0-width concat component is not a no-op in
+        // MLX and can break downstream eval.
+        if at > 0 {
+            parts.append(treeMap({ $0[.ellipsis, ..<at, 0...] }, tuple))
+        }
+        parts.append(slab)
+        if end < seqLen {
+            parts.append(treeMap({ $0[.ellipsis, end..., 0...] }, tuple))
+        }
+        let wqs = parts.map { $0.0 }
+        let scales = parts.map { $0.1 }
+        let biases = parts.compactMap { $0.2 }
+        let newWq = concatenated(wqs, axis: 2)
+        let newScales = concatenated(scales, axis: 2)
+        let newBiases: MLXArray? =
+            biases.isEmpty || parts.contains(where: { $0.2 == nil }) ? nil
+            : concatenated(biases, axis: 2)
+        return (newWq, newScales, newBiases)
+    }
+
+    private func temporalOrderTuple(
+        _ tuple: (MLXArray, MLXArray, MLXArray?)
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        // Mirror `RotatingKVCache.temporalOrder` over the quantized tuple's
+        // sequence axis (axis 2). `idx` is the write cursor; `offset` is the
+        // logical token count. The components share the same sequence layout,
+        // so the same slice indices apply to wq/scales/biases.
+        let seqLen = tuple.0.dim(2)
+        if idx == seqLen {
+            return tuple
+        } else if idx < offset {
+            // 3-part temporal order: keep-prefix, then [idx, seqLen), then
+            // [keep, idx). Concatenate each component along axis 2.
+            let parts: [(MLXArray, MLXArray, MLXArray?)] = [
+                treeMap({ $0[.ellipsis, ..<keep, 0...] }, tuple),
+                treeMap({ $0[.ellipsis, idx..., 0...] }, tuple),
+                treeMap({ $0[.ellipsis, keep ..< idx, 0...] }, tuple),
+            ]
+            let wqs = parts.map { $0.0 }
+            let scales = parts.map { $0.1 }
+            let biases = parts.compactMap { $0.2 }
+            let newWq = concatenated(wqs, axis: 2)
+            let newScales = concatenated(scales, axis: 2)
+            let newBiases: MLXArray? =
+                biases.isEmpty || parts.contains(where: { $0.2 == nil }) ? nil
+                : concatenated(biases, axis: 2)
+            return (newWq, newScales, newBiases)
+        } else {
+            return treeMap({ $0[.ellipsis, ..<idx, 0...] }, tuple)
+        }
+    }
+
+    private func updateConcat(
+        keys newKeys: MLXArray, values newValues: MLXArray
+    ) -> ((MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?)) {
+        let qKeys = quantizeSlab(newKeys)
+        let qValues = quantizeSlab(newValues)
+        if self.keys == nil {
+            self.keys = qKeys
+            self.values = qValues
+        } else {
+            // Put the cache in temporal order, then trim+append exactly as the
+            // BF16 `RotatingKVCache` does.
+            self.keys = temporalOrderTuple(self.keys!)
+            self.values = temporalOrderTuple(self.values!)
+            idx = self.keys!.0.dim(2)
+            let trimSize = idx - maxCacheSize + 1
+            self.keys = trimTuple(trimSize: trimSize, self.keys!, append: qKeys)
+            self.values = trimTuple(trimSize: trimSize, self.values!, append: qValues)
+        }
+        offset += newKeys.dim(2)
+        idx = self.keys!.0.dim(2)
+        return (self.keys!, self.values!)
+    }
+
+    private func updateInPlace(
+        keys newKeys: MLXArray, values newValues: MLXArray, tokenCount: Int
+    ) -> ((MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?)) {
+        let prev = offset
+        var cacheLength = self.keys?.0.dim(2)
+
+        // Grow the quantized slab in `step`-sized chunks, mirroring the BF16
+        // path, until we hit `maxCacheSize`.
+        if cacheLength == nil
+            || (prev >= cacheLength! && cacheLength! < maxCacheSize)
+        {
+            let B = newKeys.dim(0)
+            let nKVHeads = newKeys.dim(1)
+            let kHeadDim = newKeys.dim(3)
+            let vHeadDim = newValues.dim(3)
+            let newSize = min(step, maxCacheSize - prev)
+            let newK = initQuant(
+                B: B, nKVHeads: nKVHeads, newSize: newSize,
+                headDim: kHeadDim, dtype: newKeys.dtype)
+            let newV = initQuant(
+                B: B, nKVHeads: nKVHeads, newSize: newSize,
+                headDim: vHeadDim, dtype: newValues.dtype)
+            if let currentKeys = self.keys, let currentValues = self.values {
+                self.keys = (
+                    concatenated([currentKeys.0, newK.0], axis: 2),
+                    concatenated([currentKeys.1, newK.1], axis: 2),
+                    currentKeys.2 == nil || newK.2 == nil ? nil
+                    : concatenated([currentKeys.2!, newK.2!], axis: 2))
+                self.values = (
+                    concatenated([currentValues.0, newV.0], axis: 2),
+                    concatenated([currentValues.1, newV.1], axis: 2),
+                    currentValues.2 == nil || newV.2 == nil ? nil
+                    : concatenated([currentValues.2!, newV.2!], axis: 2))
+            } else {
+                self.keys = newK
+                self.values = newV
+            }
+            cacheLength = self.keys!.0.dim(2)
+            idx = prev
+        }
+
+        // Trim if we've exceeded the max size.
+        let trimSize = cacheLength! - maxCacheSize
+        if trimSize > 0 {
+            self.keys = trimTuple(trimSize: trimSize, self.keys!)
+            self.values = trimTuple(trimSize: trimSize, self.values!)
+            idx = maxCacheSize
+        }
+
+        // Rotate if we've hit the end.
+        if idx == maxCacheSize {
+            idx = keep
+        }
+
+        // Quantize the new slab and splice it into the ring slot FUNCTIONALLY
+        // (no in-place subscript-assign): build a new tuple by concatenating
+        // the before-slot, the new slab, and the after-slot along the sequence
+        // axis. In-place subscript-assign on a lazy tuple element does not
+        // survive a mid-graph eval (the lm_head pruner forces one), so this
+        // functional splice keeps the graph eval-safe while producing the same
+        // ring contents.
+        let qKeys = quantizeSlab(newKeys)
+        let qValues = quantizeSlab(newValues)
+        let end = idx + tokenCount
+        self.keys = scatterTuple(self.keys!, qKeys, at: idx, end: end)
+        self.values = scatterTuple(self.values!, qValues, at: idx, end: end)
+        offset += tokenCount
+        idx = end
+
+        // Return the temporally-appropriate slice (mirror the BF16 path's
+        // return). When still filling, return `..<offset`; once rotating,
+        // return the whole ring (the SDPA + mask handle the wrap semantics).
+        if offset < maxCacheSize {
+            return (
+                treeMap({ $0[.ellipsis, ..<offset, 0...] }, self.keys!),
+                treeMap({ $0[.ellipsis, ..<offset, 0...] }, self.values!)
+            )
+        }
+        return (self.keys!, self.values!)
+    }
+
+    public func updateQuantized(keys: MLXArray, values: MLXArray) -> (
+        (MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?)
+    ) {
+        let tokenCount = keys.dim(2)
+        let result =
+            if tokenCount == 1 {
+                updateInPlace(keys: keys, values: values, tokenCount: tokenCount)
+            } else {
+                updateConcat(keys: keys, values: values)
+            }
+        return result
+    }
+
+    public func getQuantizedState() -> (
+        (MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?)
+    )? {
+        guard let keys = keys, let values = values else { return nil }
+        return (
+            treeMap({ $0[.ellipsis, ..<offset, 0...] }, keys),
+            treeMap({ $0[.ellipsis, ..<offset, 0...] }, values)
+        )
+    }
+
+    // `update` is required by the KVCache protocol but not used on the quantized
+    // path; `attentionWithCacheUpdate` routes through `updateQuantized` instead.
+    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        fatalError(
+            "`update` was called on `QuantizedRotatingKVCache`. Use `updateQuantized` instead.")
+    }
+
+    public override var state: [MLXArray] {
+        get {
+            guard let keys = keys, let values = values else { return [] }
+            var arrays: [MLXArray] = []
+            if offset < keys.0.dim(2) {
+                arrays.append(contentsOf: [
+                    keys.0[.ellipsis, ..<offset, 0...], keys.1[.ellipsis, ..<offset, 0...],
+                ].compactMap { $0 })
+                if let kb = keys.2 { arrays.append(kb[.ellipsis, ..<offset, 0...]) }
+                arrays.append(contentsOf: [
+                    values.0[.ellipsis, ..<offset, 0...], values.1[.ellipsis, ..<offset, 0...],
+                ].compactMap { $0 })
+                if let vb = values.2 { arrays.append(vb[.ellipsis, ..<offset, 0...]) }
+            } else {
+                arrays.append(contentsOf: [keys.0, keys.1, keys.2].compactMap { $0 })
+                arrays.append(contentsOf: [values.0, values.1, values.2].compactMap { $0 })
+            }
+            return arrays
+        }
+        set {
+            // State restore is best-effort; the ranked path does not serialize
+            // the rotating quantized cache (it rebuilds from the checkpoint).
+            fatalError("QuantizedRotatingKVCache.state set is not supported")
+        }
+    }
+
+    public override var isTrimmable: Bool { offset < maxCacheSize }
+
+    /// Optimized mask creation for rotating cache with offset capping.
+    /// Identical to `RotatingKVCache.makeMask` — the mask semantics depend only
+    /// on the ring geometry (offset, idx, maxCacheSize, keep), not on whether
+    /// the stored K/V are BF16 or quantized.
+    public override func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if n > 1 {
+            let actualWindowSize = windowSize ?? maxCacheSize
+            let cappedOffset = min(maxCacheSize - 1, offset)
+            if cappedOffset + n > actualWindowSize || returnArray {
+                return .array(
+                    createCausalMask(n: n, offset: cappedOffset, windowSize: actualWindowSize))
+            }
+            return .causal
+        } else {
+            guard let windowSize = windowSize else { return .none }
+            if offset >= windowSize, maxCacheSize > windowSize {
+                var currentIdx = idx
+                if currentIdx >= maxCacheSize { currentIdx = 0 }
+                let maskSize = offset < maxCacheSize ? offset + 1 : maxCacheSize
+                let mask = MLXArray(0 ..< Int32(maskSize)) .>= Int32(maskSize - windowSize)
+                let rolledMask = roll(mask, shift: currentIdx + 1)
+                return .array(rolledMask)
+            }
+            return .none
+        }
+    }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        let trimmed = min(offset, n)
+        offset -= trimmed
+        idx -= trimmed
+        return trimmed
+    }
+}
+
 /// Quantized KV cache for memory efficiency using MLX quantization
 public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
     private var keys: (MLXArray, MLXArray, MLXArray?)?

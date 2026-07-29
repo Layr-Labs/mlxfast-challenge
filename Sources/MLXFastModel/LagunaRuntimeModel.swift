@@ -248,14 +248,6 @@ let lagunaFusedRoutedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV"] != "0"
 
-/// Scheduling A/B for the merged routed/shared gate/up kernel. The R4 twin is
-/// the candidate default; set the selector to `2` for the proven
-/// two-row-per-SIMD control. R4 preserves each row's arithmetic; its only risk
-/// is performance from higher register pressure/occupancy tradeoffs.
-let lagunaRoutedSharedSwiGLUQMVRows4Enabled =
-    ProcessInfo.processInfo.environment[
-        "DARKBLOOM_ROUTED_SHARED_SWIGLU_ROWS"] != "2"
-
 /// Folds the per-head softplus gate into the output projection's GEMV (see
 /// `lagunaGatedOutputProjectionSource`), with one kernel variant per attention
 /// family. Set `DARKBLOOM_FUSED_GATED_OUTPUT=0` to ablate.
@@ -363,6 +355,82 @@ private func lagunaUseNativeAffineOProj(layer: Int) -> Bool {
         layer: layer,
         count: lagunaNativeAffineOProjLayerCount,
         onlyLayer: lagunaNativeAffineOProjOnlyLayer)
+}
+
+/// KV-cache INT8 perturbation probe (KIVI-class, anupsv's depth-decay
+/// methodology). The KV cache is the largest remaining BF16 decode read on
+/// the frontier (experts are NVFP4, attention QKV/o_proj are affine-INT8; KV
+/// is still BF16). This PROBE measures the argmax cost of per-token INT8
+/// KV quantization WITHOUT the bandwidth saving: it round-trips the new K/V
+/// row through INT8 (quantize→dequantize) right before the cache append, so
+/// the cache stores perturbed BF16 and every subsequent SDPA read sees the
+/// INT8 perturbation. Per-token (each row scaled by its own absmax) is an
+/// UPPER BOUND on KIVI's per-channel-K / per-token-V scheme, so a sub-noise
+/// probe means the real scheme is safer.
+///
+/// RESULT-CHANGING. Gated per-layer tail (the deepest layers first, where
+/// anupsv's per-layer amplification study shows argmax perturbation decays
+/// ~exponentially with depth). `DARKBLOOM_KV_INT8_PROBE=1` + `_LAYERS=N`
+/// (default 0 = OFF = exact shipped baseline). The probe stores BF16 (no
+/// bandwidth win); a positive result justifies the real quantized-rotating-
+/// cache implementation that reuses MLX's `quantizedScaledDotProductAttention`.
+private let lagunaKVInt8ProbeLayerCount: Int = {
+    guard ProcessInfo.processInfo.environment["DARKBLOOM_KV_INT8_PROBE"] == "1"
+    else { return 0 }
+    let requested = Int(
+        ProcessInfo.processInfo.environment["DARKBLOOM_KV_INT8_PROBE_LAYERS"]
+            ?? "1") ?? 1
+    return min(max(requested, 0), LagunaConstants.numHiddenLayers)
+}()
+
+private func lagunaKVInt8ProbeActive(layer: Int) -> Bool {
+    guard lagunaKVInt8ProbeLayerCount > 0 else { return false }
+    return layer >= LagunaConstants.numHiddenLayers - lagunaKVInt8ProbeLayerCount
+}
+
+/// Per-token INT8 quantize→dequantize round-trip (upper-bound KIVI probe).
+/// `x` is `[B, nKVHeads, L, headDim]` BF16; returns BF16 with each
+/// `[B, nKVHeads, L, :]` slice rounded through symmetric INT8 by its own
+/// per-row absmax. Bit-exact to a per-token INT8 KV quant with zero point 0.
+private func lagunaKVInt8RoundTrip(_ x: MLXArray) -> MLXArray {
+    // per-row absmax over headDim: [B, nKVHeads, L, 1]
+    let absmax = max(abs(x), axis: -1, keepDims: true)
+    let scale = absmax / 127.0  // float32 broadcast
+    // quantize→dequantize, staying in float then rounding back to BF16 at the
+    // same boundary a real INT8 KV path would (the dequantized value's BF16
+    // store). Guard scale==0 (all-zero row) to avoid div-by-zero.
+    let safeScale = maximum(scale, MLXArray(1e-30, dtype: .float32))
+    let quantized = round(x.asType(.float32) / safeScale)
+    let dequant = quantized * safeScale
+    return dequant.asType(.bfloat16)
+}
+
+/// Real KV-cache INT8 quantization (the bandwidth win). Uses the new
+/// `QuantizedRotatingKVCache` for the sliding layers in the tail-N range, so
+/// the SDPA reads INT8 K/V directly via `quantizedScaledDotProductAttention`
+/// (halving the decode K/V read bandwidth). Independent of the
+/// `DARKBLOOM_KV_INT8_PROBE` measurement probe: this is the production path.
+///
+/// RESULT-CHANGING (per-token INT8 KV quantization). The probe established the
+/// gate-safe frontier at tail-16 (bit-identical to baseline over 64 free-run
+/// steps); this real path uses MLX's group quantization, which is at least as
+/// accurate as the probe's per-token absmax round-trip. Gated per-layer tail
+/// (deepest layers first). `DARKBLOOM_KV_INT8=1` + `_LAYERS=N` (default 0 =
+/// OFF = exact shipped `RotatingKVCache` baseline). Applies to sliding layers
+/// only; full-attention layers keep `StandardKVCache` (their quantization is a
+/// separate, smaller follow-up).
+private let lagunaKVInt8LayerCount: Int = {
+    guard ProcessInfo.processInfo.environment["DARKBLOOM_KV_INT8"] == "1"
+    else { return 0 }
+    let requested = Int(
+        ProcessInfo.processInfo.environment["DARKBLOOM_KV_INT8_LAYERS"]
+            ?? "1") ?? 1
+    return min(max(requested, 0), LagunaConstants.numHiddenLayers)
+}()
+
+private func lagunaKVInt8Active(layer: Int) -> Bool {
+    guard lagunaKVInt8LayerCount > 0 else { return false }
+    return layer >= LagunaConstants.numHiddenLayers - lagunaKVInt8LayerCount
 }
 
 /// Sliding-layer per-head RMSNorm + plain RoPE fusion (see
@@ -2807,6 +2875,19 @@ final class LagunaRuntimeAttention: Module {
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
+        // KV INT8 perturbation probe (KIVI-class, upper bound). Round-trips the
+        // K/V row through per-token INT8 before the cache append; the cache then
+        // holds the perturbed BF16 and every later SDPA read sees the INT8
+        // perturbation. Decode-only guard matches the rest of this block. Skip
+        // when the real `DARKBLOOM_KV_INT8` cache is active for this layer —
+        // that path quantizes inside the cache and would double-quantize here.
+        if L == 1, lagunaKVInt8ProbeActive(layer: layerIdx),
+            !lagunaKVInt8Active(layer: layerIdx)
+        {
+            keys = lagunaKVInt8RoundTrip(keys)
+            values = lagunaKVInt8RoundTrip(values)
+        }
+
         let attended = attentionWithCacheUpdate(
             queries: queries,
             keys: keys,
@@ -3568,132 +3649,6 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// Four-output-rows-per-SIMD scheduling twin of the live two-row control.
-/// Every row retains the control's K-block loop, qdot calls, simd_sum order,
-/// BF16 casts, stable sigmoid/SwiGLU sequence, and routed/shared output map.
-/// Only row ownership changes, so correctness is intended to be exact while
-/// performance may regress from the doubled accumulator/register footprint.
-private let lagunaRoutedSharedSwiGLUQMVRows4Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_swiglu_qmv_rows4_bf16_v1",
-    inputNames: [
-        "input", "routed_weight", "routed_scales", "indices",
-        "shared_weight", "shared_scales",
-    ],
-    outputNames: ["routed_activated", "shared_activated"],
-    source: """
-        constexpr uint input_width = 2048;
-        constexpr uint output_width = 512;
-        constexpr uint fused_width = 1024;
-        constexpr uint packed_row_bytes = 1024;
-        constexpr uint scale_row_bytes = 128;
-        constexpr uint packed_expert_bytes = fused_width * packed_row_bytes;
-        constexpr uint scale_expert_bytes = fused_width * scale_row_bytes;
-        constexpr uint block_width = 512;
-        constexpr uint values_per_lane = 16;
-        constexpr uint tiles_per_expert = 64;
-        constexpr uint routed_experts = 8;
-
-        // Preserve each expert row's arithmetic and output address while
-        // assigning four contiguous output rows to each SIMD group.
-        uint group = threadgroup_position_in_grid.x;
-        uint expert_slot = group % (routed_experts + 1);
-        uint tile = group / (routed_experts + 1);
-        bool is_routed = expert_slot < routed_experts;
-        uint simd_group = simdgroup_index_in_threadgroup;
-        uint lane = thread_index_in_simdgroup;
-        uint first_row = tile * 8 + simd_group * 4;
-
-        const device uint8_t* expert_weight;
-        const device uint8_t* expert_scales;
-        if (is_routed) {
-            uint expert = uint(indices[expert_slot]);
-            expert_weight =
-                (const device uint8_t*)routed_weight +
-                expert * packed_expert_bytes;
-            expert_scales = routed_scales + expert * scale_expert_bytes;
-        } else {
-            expert_weight = (const device uint8_t*)shared_weight;
-            expert_scales = shared_scales;
-        }
-
-        thread float gate_result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        thread float up_result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        thread float input_values[values_per_lane];
-
-        for (uint block = 0; block < input_width; block += block_width) {
-            const device vec<bfloat, 4>* input_vectors =
-                (const device vec<bfloat, 4>*)(
-                    input + block + lane * values_per_lane);
-            for (uint i = 0; i < values_per_lane / 4; ++i) {
-                const vec<bfloat, 4> values = input_vectors[i];
-                input_values[4 * i] = values[0];
-                input_values[4 * i + 1] = values[1];
-                input_values[4 * i + 2] = values[2];
-                input_values[4 * i + 3] = values[3];
-            }
-
-            for (uint row = 0; row < 4; ++row) {
-                uint logical_row = first_row + row;
-                uint gate_row;
-                uint up_row;
-                if (is_routed) {
-                    uint pair_tile = logical_row / 32;
-                    gate_row = pair_tile * 64 + logical_row % 32;
-                    up_row = gate_row + 32;
-                } else {
-                    gate_row = logical_row;
-                    up_row = gate_row + output_width;
-                }
-                const device uint8_t* gate_weight =
-                    expert_weight + gate_row * packed_row_bytes +
-                    block / 2 + lane * 8;
-                const device uint8_t* up_weight =
-                    expert_weight + up_row * packed_row_bytes +
-                    block / 2 + lane * 8;
-                const device uint8_t* gate_scale =
-                    expert_scales + gate_row * scale_row_bytes +
-                    block / 16 + lane;
-                const device uint8_t* up_scale =
-                    expert_scales + up_row * scale_row_bytes +
-                    block / 16 + lane;
-
-                gate_result[row] += laguna_nvfp4_qdot_16(
-                    gate_weight,
-                    input_values,
-                    laguna_nvfp4_scale(gate_scale[0]));
-                up_result[row] += laguna_nvfp4_qdot_16(
-                    up_weight,
-                    input_values,
-                    laguna_nvfp4_scale(up_scale[0]));
-            }
-        }
-
-        for (uint row = 0; row < 4; ++row) {
-            gate_result[row] = simd_sum(gate_result[row]);
-            up_result[row] = simd_sum(up_result[row]);
-            if (lane == 0) {
-                bfloat gate = bfloat(gate_result[row]);
-                bfloat up = bfloat(up_result[row]);
-                bfloat exp_abs = metal::exp(metal::abs(gate));
-                bfloat denominator = bfloat(1) + exp_abs;
-                bfloat y = bfloat(1) / denominator;
-                bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
-                bfloat silu = bfloat(gate * sigmoid);
-                bfloat activation = bfloat(silu * up);
-                if (is_routed) {
-                    routed_activated[
-                        expert_slot * output_width + first_row + row
-                    ] = activation;
-                } else {
-                    shared_activated[first_row + row] = activation;
-                }
-            }
-        }
-        """,
-    header: lagunaSharedSwiGLUQMVHeader,
-    ensureRowContiguous: true
-)
-
 /// Two-block software pipeline for the accepted 64-thread/two-SIMD geometry.
 /// Both blocks' activation, code, and scale loads are issued before either
 /// block is consumed, then the two contributions enter the original
@@ -4002,21 +3957,9 @@ func lagunaRoutedSharedSwiGLUQMV(
         ])
 
     lagunaTrace("routed+shared gate/up QMV")
-    let kernel =
-        lagunaRoutedSharedSwiGLUQMVRows4Enabled
-        ? lagunaRoutedSharedSwiGLUQMVRows4Kernel
-        : lagunaRoutedSharedSwiGLUQMVKernel
-    // R4 covers eight rows per 64-thread group, so 64 tiles per each of the
-    // nine slots dispatch exactly 576 threadgroups. The default R2 control
-    // retains its original 128 tiles per slot.
-    let tilesPerSlot = lagunaRoutedSharedSwiGLUQMVRows4Enabled ? 64 : 128
-    let outputs = kernel(
+    let outputs = lagunaRoutedSharedSwiGLUQMVKernel(
         [input, routedWeight, routedScales, indices, sharedWeight, sharedScales],
-        grid: (
-            (LagunaConstants.numExpertsPerTok + 1) * tilesPerSlot * 64,
-            1,
-            1
-        ),
+        grid: ((LagunaConstants.numExpertsPerTok + 1) * 128 * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [
             [
@@ -6860,14 +6803,19 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         }
 
         let result: MLXArray
-        if let lmHead {
-            if let pruner = lmHeadPruner,
-                inputs.shape == [1, 1] || lagunaLmHeadPrunePrefillEnabled
+if let lmHead {
+            // The certified lm_head pruner dispatches a custom Metal kernel on
+            // `hidden`, forcing a mid-graph eval that no QuantizedKVCacheProtocol
+            // cache (upstream QuantizedKVCache included) survives —
+            // `hidden.eval()` crashes. The stock lazy `lmHead` (a QuantizedLinear
+            // matmul) keeps the graph lazy until the final token read and is
+            // eval-safe. Fall back to it when KV INT8 is active. The pruner's
+            // decode speedup is the cost; the KV INT8 bandwidth win must overcome
+            // it (it does at a wide-enough tail — see
+            // docs/quantized-rotating-cache-result).
+            if inputs.shape == [1, 1], let pruner = lmHeadPruner,
+                lagunaKVInt8LayerCount == 0
             {
-                // Certified two-pass final-row head (notes/68): full BF16
-                // logits, bit-identical to stock in every argmax-reachable
-                // slot. When enabled, prefill has already sliced to the last
-                // hidden row; decode always retains this pruner.
                 result = pruner.logits(hidden: hidden, lmHeadWeight: lmHead.weight)
             } else {
                 result = lmHead(hidden)
@@ -6893,6 +6841,14 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         (0..<configuration.numHiddenLayers).map { layerIndex in
             if configuration.layerTypes[layerIndex] == .full {
                 StandardKVCache()
+            } else if lagunaKVInt8Active(layer: layerIndex) {
+                // Real KV INT8: quantized rotating cache for the sliding tail
+                // layers. head_dim 128 is divisible by group 64, so the
+                // resolved group size is 64 (affine INT8, the shipped quant
+                // mode for the affine attention side layouts).
+                QuantizedRotatingKVCache(
+                    maxSize: configuration.slidingWindow, keep: 0,
+                    groupSize: 64, bits: 8, mode: .affine)
             } else {
                 RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
             }
