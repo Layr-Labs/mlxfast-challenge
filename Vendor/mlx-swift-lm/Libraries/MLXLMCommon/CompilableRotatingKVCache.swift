@@ -120,7 +120,11 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
         // else: keys/values remain nil; first `update` call allocates
         // them at full size.
 
-        self.idxArray = MLXArray([Int32(self.idx)])
+        // A prompt that exactly fills the ring leaves the stock cache's write
+        // cursor at `maxCacheSize`; the next single-token write must wrap to
+        // `keep` before indexing the fixed buffer.
+        let normalizedIdx = self.idx == maxCacheSize ? keep : self.idx
+        self.idxArray = MLXArray([Int32(normalizedIdx)])
         self.offsetArray = MLXArray([Int32(self.offset)])
     }
 
@@ -129,6 +133,53 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
         // maxLength is unused here because RotatingKVCache already has maxCacheSize,
         // but the parameter keeps the API symmetric with CompilableKVCache.promote.
         return CompilableRotatingKVCache(from: cache)
+    }
+
+    /// Rebase a previously compiled ring from a fresh stock prompt cache while
+    /// retaining the array identities captured by `compile`. The stock ring's
+    /// physical order is copied verbatim; only an end cursor equal to capacity
+    /// is normalized to the next legal write position.
+    public func rebase(from rotating: RotatingKVCache) -> Bool {
+        guard rotating.maxCacheSize == maxCacheSize,
+            rotating.keep == keep,
+            let sourceKeys = rotating.keys,
+            let sourceValues = rotating.values,
+            sourceKeys.dim(2) <= maxCacheSize,
+            sourceValues.dim(2) == sourceKeys.dim(2)
+        else { return false }
+
+        if let keys, let values {
+            guard keys.dim(0) == sourceKeys.dim(0),
+                keys.dim(1) == sourceKeys.dim(1),
+                keys.dim(3) == sourceKeys.dim(3),
+                values.dim(0) == sourceValues.dim(0),
+                values.dim(1) == sourceValues.dim(1),
+                values.dim(3) == sourceValues.dim(3)
+            else { return false }
+            let zero = MLXArray([Int32(0)])
+            keys._updateInternal(
+                dynamicSliceUpdate(keys, update: sourceKeys, start: zero, axes: [2]))
+            values._updateInternal(
+                dynamicSliceUpdate(values, update: sourceValues, start: zero, axes: [2]))
+        } else {
+            let batch = sourceKeys.dim(0)
+            let heads = sourceKeys.dim(1)
+            self.keys = MLXArray.zeros(
+                [batch, heads, maxCacheSize, sourceKeys.dim(3)], dtype: sourceKeys.dtype)
+            self.values = MLXArray.zeros(
+                [batch, heads, maxCacheSize, sourceValues.dim(3)], dtype: sourceValues.dtype)
+            let zero = MLXArray([Int32(0)])
+            self.keys!._updateInternal(
+                dynamicSliceUpdate(self.keys!, update: sourceKeys, start: zero, axes: [2]))
+            self.values!._updateInternal(
+                dynamicSliceUpdate(self.values!, update: sourceValues, start: zero, axes: [2]))
+        }
+
+        let normalizedIdx = rotating.idx == maxCacheSize ? keep : rotating.idx
+        idxArray._updateInternal(MLXArray([Int32(normalizedIdx)]))
+        offsetArray._updateInternal(MLXArray([Int32(rotating.offset)]))
+        canElideFullWindowDecodeMask = rotating.offset >= maxCacheSize
+        return true
     }
 
     // MARK: - Overridden update

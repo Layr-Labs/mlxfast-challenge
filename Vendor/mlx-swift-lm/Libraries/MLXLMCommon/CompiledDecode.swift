@@ -362,3 +362,93 @@ public enum CompiledDecode {
         return compileForward(model: model, cacheRef: cacheRef)
     }
 }
+
+/// Stable cache facade for a serial compiled-decode session. Prompt ingestion
+/// delegates to the ordinary cache; after promotion the facade exposes the
+/// fixed-shape compiled state while retaining a host-owned logical offset for
+/// protocol validation without graph-counter readback.
+public final class CompiledDecodeCacheProxy: BaseKVCache, @unchecked Sendable {
+    public let stockCache: KVCache
+    private var compiledCache: KVCache?
+    private var compiledLogicalOffset: Int?
+
+    public init(stockCache: KVCache) {
+        self.stockCache = stockCache
+        super.init()
+    }
+
+    public var isCompiledActive: Bool { compiledCache != nil }
+    public var activeCache: KVCache { compiledCache ?? stockCache }
+
+    public func activate(compiledCache: KVCache, logicalOffset: Int) {
+        precondition(logicalOffset >= 0)
+        self.compiledCache = compiledCache
+        self.compiledLogicalOffset = logicalOffset
+    }
+
+    public func advanceCompiled(by tokenCount: Int) {
+        precondition(tokenCount >= 0)
+        guard let current = compiledLogicalOffset else { return }
+        let (next, overflow) = current.addingReportingOverflow(tokenCount)
+        precondition(!overflow)
+        compiledLogicalOffset = next
+    }
+
+    public override var offset: Int {
+        get { compiledLogicalOffset ?? stockCache.offset }
+        set {
+            if compiledCache != nil {
+                compiledLogicalOffset = newValue
+            } else if let base = stockCache as? BaseKVCache {
+                base.offset = newValue
+            }
+        }
+    }
+
+    public override var maxSize: Int? { activeCache.maxSize }
+
+    public override func innerState() -> [MLXArray] {
+        (activeCache as? BaseKVCache)?.innerState() ?? activeCache.state
+    }
+
+    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        activeCache.update(keys: keys, values: values)
+    }
+
+    public override var state: [MLXArray] {
+        get { activeCache.state }
+        set {
+            guard let target = activeCache as? BaseKVCache else { return }
+            target.state = newValue
+        }
+    }
+
+    public override var metaState: [String] {
+        get { activeCache.metaState }
+        set {
+            guard let target = activeCache as? BaseKVCache else { return }
+            target.metaState = newValue
+        }
+    }
+
+    public override var isTrimmable: Bool { activeCache.isTrimmable }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        let trimmed = activeCache.trim(n)
+        if let current = compiledLogicalOffset {
+            compiledLogicalOffset = current - trimmed
+        }
+        return trimmed
+    }
+
+    public override func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        activeCache.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+    }
+
+    public override func copy() -> any KVCache {
+        activeCache.copy()
+    }
+}

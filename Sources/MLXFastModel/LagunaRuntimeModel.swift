@@ -556,6 +556,36 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     }
 }()
 
+/// Number of late sliding-attention layers served by constructor-warmed,
+/// three-layer compiled blocks. Full-attention layers remain on their stock
+/// dynamically sized cache path, preserving the exact 513... sequence-length
+/// reduction shape. The three-layer granularity follows Laguna's fixed
+/// one-full/three-sliding schedule and makes the optimization doseable across
+/// the ranked acceptance band. `0` disables; valid values are multiples of
+/// three through the last 27 sliding layers. The first block stays dynamic so
+/// the promoted early enqueue after layer 1 remains intact.
+private let lagunaCompiledSlidingLayerCount: Int = {
+    let raw =
+        ProcessInfo.processInfo.environment["DARKBLOOM_COMPILED_SLIDING_LAYERS"]
+        ?? "6"
+    guard let count = Int(raw), (0...27).contains(count), count.isMultiple(of: 3)
+    else { return 6 }
+    return count
+}()
+
+private func lagunaShouldAsyncEval(afterLayer layerIndex: Int) -> Bool {
+    switch lagunaDecodeAsyncStage {
+    case .off, .norm, .logits:
+        return false
+    case .layer(let index):
+        return index == layerIndex
+    case .ladder(let stride):
+        return (layerIndex + 1).isMultiple(of: stride)
+    case .explicit(let mask):
+        return (mask >> UInt64(layerIndex)) & 1 == 1
+    }
+}
+
 /// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `8`; `0`/`off` disables):
 /// prefill-side twin of the decode ladder above. Multi-token forwards build
 /// a ~400-op graph with the GPU idle until the final eval; firing `asyncEval`
@@ -6520,7 +6550,11 @@ final class LagunaRuntimeModelInner: Module {
         return attention.rope(seed, offset: cache?.offset ?? 0)
     }
 
-    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+    fileprivate func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]? = nil,
+        compiledSlidingBlocks: [Int: LagunaCompiledSlidingBlock] = [:]
+    ) -> MLXArray {
         var h: MLXArray
         var fullRoPEAngles: MLXArray?
         var slidingRoPEAngles: MLXArray?
@@ -6598,7 +6632,22 @@ final class LagunaRuntimeModelInner: Module {
         // seed row, so the angles are the exact floats that layer's kernel
         // would have computed rather than a re-derivation.
 
+        var compiledThrough = -1
         for (i, layer) in layers.enumerated() {
+            if i <= compiledThrough { continue }
+
+            if inputs.shape == [1, 1],
+                let block = compiledSlidingBlocks[i],
+                let slidingRoPEAngles
+            {
+                h = block(h, qkRoPEAngles: slidingRoPEAngles)
+                compiledThrough = block.endLayerIndex
+                if lagunaShouldAsyncEval(afterLayer: block.endLayerIndex) {
+                    asyncEval(h)
+                }
+                continue
+            }
+
             let isFull = layerTypes[i] == .full
             let mask = isFull ? fullMask : slidingMask
             let qkRoPEAngles = isFull ? fullRoPEAngles : slidingRoPEAngles
@@ -6613,12 +6662,7 @@ final class LagunaRuntimeModelInner: Module {
                         qkRoPEAngles: qkRoPEAngles,
                         qkRoPEOffsets: qkRoPEOffsets
                     )
-                    if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
-                        asyncEval(h)
-                    }
-                    if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                        inputs.shape == [1, 1]
-                    {
+                    if inputs.shape == [1, 1], lagunaShouldAsyncEval(afterLayer: i) {
                         asyncEval(h)
                     }
                 }
@@ -6630,17 +6674,7 @@ final class LagunaRuntimeModelInner: Module {
                     qkRoPEAngles: qkRoPEAngles,
                     qkRoPEOffsets: qkRoPEOffsets
                 )
-                if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
-                    asyncEval(h)
-                }
-                if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                    inputs.shape == [1, 1]
-                {
-                    asyncEval(h)
-                }
-                if case .explicit(let mask) = lagunaDecodeAsyncStage,
-                    (mask >> UInt64(i)) & 1 == 1, inputs.shape == [1, 1]
-                {
+                if inputs.shape == [1, 1], lagunaShouldAsyncEval(afterLayer: i) {
                     asyncEval(h)
                 }
                 if lagunaPrefillAsyncLadderStride > 0, h.dim(1) > 1,
@@ -6652,6 +6686,76 @@ final class LagunaRuntimeModelInner: Module {
         }
 
         return h
+    }
+}
+
+/// Three consecutive sliding-attention decoder layers captured as one MLX
+/// compiled function. The hidden row and the stock-produced sliding RoPE row
+/// remain explicit inputs; only the fixed 512-row rotating-cache state is
+/// captured and updated in place.
+fileprivate final class LagunaCompiledSlidingBlock {
+    let startLayerIndex: Int
+    let endLayerIndex: Int
+    let caches: [CompilableRotatingKVCache]
+    private let forward: @Sendable ([MLXArray]) -> [MLXArray]
+
+    init?(
+        model: LagunaRuntimeModelInner,
+        layerIndices: [Int],
+        stockCaches: [RotatingKVCache],
+        slidingWindow: Int
+    ) {
+        guard layerIndices.count == 3,
+            stockCaches.count == layerIndices.count,
+            zip(layerIndices, layerIndices.dropFirst()).allSatisfy({ pair in
+                pair.1 == pair.0 + 1
+            }),
+            layerIndices.allSatisfy({ model.layerTypes[$0] == .sliding }),
+            stockCaches.allSatisfy({
+                $0.maxSize == slidingWindow && $0.offset >= slidingWindow
+            })
+        else { return nil }
+
+        let promoted = stockCaches.map {
+            CompilableRotatingKVCache(from: $0)
+        }
+        eval(promoted)
+
+        let layers = layerIndices.map { model.layers[$0] }
+        let capturedCaches: [KVCache] = promoted
+        self.startLayerIndex = layerIndices[0]
+        self.endLayerIndex = layerIndices[2]
+        self.caches = promoted
+        self.forward = compile(inputs: capturedCaches, outputs: capturedCaches) { args in
+            precondition(args.count == 2)
+            var hidden = args[0]
+            let qkRoPEAngles = args[1]
+            let mask = createAttentionMask(
+                h: hidden,
+                cache: capturedCaches[0],
+                windowSize: slidingWindow)
+            for (layer, cache) in zip(layers, capturedCaches) {
+                hidden = layer(
+                    hidden,
+                    mask: mask,
+                    cache: cache,
+                    qkRoPEAngles: qkRoPEAngles,
+                    qkRoPEOffsets: nil)
+            }
+            return [hidden]
+        }
+    }
+
+    func callAsFunction(_ hidden: MLXArray, qkRoPEAngles: MLXArray) -> MLXArray {
+        forward([hidden, qkRoPEAngles])[0]
+    }
+
+    func rebase(from stockCaches: [RotatingKVCache]) -> Bool {
+        guard stockCaches.count == caches.count else { return false }
+        for (compiled, stock) in zip(caches, stockCaches) {
+            guard compiled.rebase(from: stock) else { return false }
+        }
+        return true
     }
 }
 
@@ -6676,6 +6780,11 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     /// cleanly; the stock full pass is used otherwise.
     private var lmHeadPruner: LagunaLmHeadPruner?
 
+    /// Late three-layer sliding blocks selected for the compiled ladder, and
+    /// the constructor-warmed handles retained across serial sequences.
+    private var compiledSlidingBlockLayerIndices: [[Int]] = []
+    private var compiledSlidingBlocks: [Int: LagunaCompiledSlidingBlock] = [:]
+
     public init(_ config: LagunaConfig) {
         self.configuration = config
         self._model.wrappedValue = LagunaRuntimeModelInner(config)
@@ -6683,6 +6792,29 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
             self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabSize, bias: false)
         }
         super.init()
+
+        if lagunaCompiledSlidingLayerCount > 0,
+            CompiledDecode.isEnabled,
+            MLXHardwareInfo.isCompiledDecodeSupported,
+            lagunaFusedSlidingQKNormRoPEEnabled
+        {
+            var candidates: [[Int]] = []
+            for fullIndex in config.layerTypes.indices
+            where config.layerTypes[fullIndex] == .full {
+                let sliding = Array((fullIndex + 1)...(fullIndex + 3))
+                if sliding.allSatisfy({
+                    config.layerTypes.indices.contains($0)
+                        && config.layerTypes[$0] == .sliding
+                }) {
+                    candidates.append(sliding)
+                }
+            }
+            // Preserve the promoted layer-1 enqueue by leaving the first
+            // full+sliding quartet dynamic.
+            let blockCount = lagunaCompiledSlidingLayerCount / 3
+            compiledSlidingBlockLayerIndices = Array(
+                candidates.dropFirst().suffix(blockCount))
+        }
 
         // Match the vendored Poolside Laguna model exactly: only the routed
         // experts and shared expert are NVFP4. Quantizing one sparse decoder
@@ -6702,8 +6834,13 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         }
     }
 
-    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        let fullHidden = model(inputs, cache: cache)
+    private func forward(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        compiledBlocks: [Int: LagunaCompiledSlidingBlock]
+    ) -> MLXArray {
+        let fullHidden = model(
+            inputs, cache: cache, compiledSlidingBlocks: compiledBlocks)
         // Every consumer of multi-token logits reads only the LAST
         // position's row. Slice before the row-independent final RMSNorm and
         // vocabulary head so prefill neither normalizes nor projects the
@@ -6731,6 +6868,100 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         return result
     }
 
+    private func prepareCompiledSlidingBlocks(
+        cache: [KVCache],
+        proxies: [CompiledDecodeCacheProxy]
+    ) {
+        guard !compiledSlidingBlockLayerIndices.isEmpty,
+            proxies.count == compiledSlidingBlockLayerIndices.count * 3,
+            proxies.allSatisfy({ !$0.isCompiledActive }),
+            let logicalOffset = cache.first?.offset,
+            cache.allSatisfy({ $0.offset == logicalOffset }),
+            logicalOffset >= configuration.slidingWindow
+        else { return }
+
+        if compiledSlidingBlocks.count == compiledSlidingBlockLayerIndices.count {
+            for layerIndices in compiledSlidingBlockLayerIndices {
+                guard let block = compiledSlidingBlocks[layerIndices[0]] else { return }
+                let stock = layerIndices.compactMap {
+                    (cache[$0] as? CompiledDecodeCacheProxy)?.stockCache
+                        as? RotatingKVCache
+                }
+                guard stock.count == layerIndices.count,
+                    block.rebase(from: stock)
+                else { return }
+            }
+        } else {
+            // Constructor warmup reaches this path once. Materialize the
+            // prompt cache before promoting fixed rings, then retain the
+            // compiled handles for every later request in the worker.
+            eval(cache)
+            var built: [Int: LagunaCompiledSlidingBlock] = [:]
+            for layerIndices in compiledSlidingBlockLayerIndices {
+                let stock = layerIndices.compactMap {
+                    (cache[$0] as? CompiledDecodeCacheProxy)?.stockCache
+                        as? RotatingKVCache
+                }
+                guard stock.count == layerIndices.count,
+                    let block = LagunaCompiledSlidingBlock(
+                        model: model,
+                        layerIndices: layerIndices,
+                        stockCaches: stock,
+                        slidingWindow: configuration.slidingWindow)
+                else { return }
+                built[layerIndices[0]] = block
+            }
+            guard built.count == compiledSlidingBlockLayerIndices.count else { return }
+            compiledSlidingBlocks = built
+        }
+
+        for layerIndices in compiledSlidingBlockLayerIndices {
+            guard let block = compiledSlidingBlocks[layerIndices[0]] else { return }
+            for (layerIndex, compiledCache) in zip(layerIndices, block.caches) {
+                guard let proxy = cache[layerIndex] as? CompiledDecodeCacheProxy
+                else { return }
+                proxy.activate(
+                    compiledCache: compiledCache, logicalOffset: logicalOffset)
+            }
+        }
+    }
+
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        guard let cache,
+            !compiledSlidingBlockLayerIndices.isEmpty,
+            cache.count == configuration.numHiddenLayers
+        else {
+            return forward(inputs, cache: cache, compiledBlocks: [:])
+        }
+
+        let proxies = compiledSlidingBlockLayerIndices.flatMap { layerIndices in
+            layerIndices.compactMap {
+                cache[$0] as? CompiledDecodeCacheProxy
+            }
+        }
+        guard proxies.count == compiledSlidingBlockLayerIndices.count * 3 else {
+            return forward(inputs, cache: cache, compiledBlocks: [:])
+        }
+
+        let activeCaches: [KVCache] = cache.map {
+            ($0 as? CompiledDecodeCacheProxy)?.activeCache ?? $0
+        }
+        let compiledReady = proxies.allSatisfy(\.isCompiledActive)
+            && compiledSlidingBlocks.count == compiledSlidingBlockLayerIndices.count
+        let useBlocks = compiledReady && inputs.shape == [1, 1]
+        let logits = forward(
+            inputs,
+            cache: activeCaches,
+            compiledBlocks: useBlocks ? compiledSlidingBlocks : [:])
+
+        if compiledReady {
+            for proxy in proxies { proxy.advanceCompiled(by: inputs.dim(1)) }
+        } else {
+            prepareCompiledSlidingBlocks(cache: cache, proxies: proxies)
+        }
+        return logits
+    }
+
     public func prepare(
         _ input: LMInput,
         cache _: [KVCache],
@@ -6740,11 +6971,16 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     }
 
     public func newCache(parameters _: GenerateParameters?) -> [KVCache] {
-        (0..<configuration.numHiddenLayers).map { layerIndex in
+        let selected = Set(compiledSlidingBlockLayerIndices.flatMap { $0 })
+        return (0..<configuration.numHiddenLayers).map { layerIndex in
             if configuration.layerTypes[layerIndex] == .full {
-                StandardKVCache()
+                return StandardKVCache() as KVCache
             } else {
-                RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
+                let stock = RotatingKVCache(
+                    maxSize: configuration.slidingWindow, keep: 0)
+                return selected.contains(layerIndex)
+                    ? CompiledDecodeCacheProxy(stockCache: stock) as KVCache
+                    : stock as KVCache
             }
         }
     }
