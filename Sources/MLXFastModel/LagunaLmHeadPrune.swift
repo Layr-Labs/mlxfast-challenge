@@ -45,6 +45,18 @@ import MLXFast
 //      token is the stock token.
 // The threshold beta widens the candidate set slightly vs the raw lower bound
 // L; it is the BF16-cast safety margin from the assembly proof.
+//
+// notes/69 REPLACES STAGE 1 ONLY. The scanned coarse copy is now a
+// directed-rounding affine INT6 quantization at group size 128 (1600 B/row,
+// 160.6 MB/token) instead of MXFP8 gs32 (2112 B/row, 211.9 MB/token) --
+// 24% fewer bytes at the DRAM wall AND a strictly tighter certified bound, so
+// the candidate set shrinks too (|S| median 15 -> 1 on 512 real decode steps).
+// Stages 2 and 3 and the entire correctness argument above are untouched: the
+// int6 kernel emits the same three outputs with the same certified meaning.
+// See the block above `lagunaLmHeadInt6CoarseKernel` for the format, the
+// certificate, and why 4-bit does NOT work here. The MXFP8 copy stays
+// resident (+160.6 MB total) so `DARKBLOOM_LMHEAD_INT6=0` selects the previous
+// screen in the SAME binary, which the paired measurement protocol requires.
 
 private let lagunaLmHeadPruneVocab = 100_352
 private let lagunaLmHeadPruneHidden = 2048
@@ -368,6 +380,272 @@ private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+// ---------------------------------------------------------------------------
+// INT6 coarse screen (notes/69). Same three-stage structure as the MXFP8 screen
+// above -- coarse+certified-bound scan, dense candidate mask, blocked exact
+// GEMV -- but the scanned copy is a directed-rounding affine int6 quantization
+// at group size 128 instead of MXFP8 gs32. 1600 B/row instead of 2112 B/row
+// (160.6 MB instead of 211.9 MB per decode token), and a TIGHTER certified
+// bound, so the candidate set shrinks as well.
+//
+// WHY int6 AND NOT int4/mxfp4. The screen's headroom is thin: over 512 real
+// captured decode activations the vocabulary bulk sits at coarse+delta ~ 11.6
+// against a threshold of ~ 14.3, i.e. ~2.5 logits of slack. Scaling the MXFP8
+// bound by a multiplier m and recounting the survivors gives
+//     m       1.00  1.10  1.25  1.50   1.75    2.00    2.50
+//     median   15    30    103  1703  17092   58789   99308   (of 100352)
+// so any bound looser than ~1.25x collapses the screen. Every 4-bit format
+// certifies at 2.0x (affine gs32) to 3.1x (mxfp4 gs32) and blows the screen
+// wide open; int6 gs128 certifies at 0.60x -- TIGHTER than MXFP8 -- while
+// reading 24% fewer bytes. That is the whole idea.
+//
+// FORMAT. For each group g of 128 consecutive elements of row i:
+//     bias_g = largest bf16 <= min_j W_ij          (rounded DOWN)
+//     s_g    = smallest bf16 >= (max_j W_ij - bias_g) / 63   (rounded UP)
+//     q_ij   = round_to_nearest((W_ij - bias_g) / s_g)
+//     what_ij = q_ij * s_g + bias_g
+// The directed rounding is what makes the certificate clean:
+//   (a) W_ij - bias_g >= min_j W_ij - bias_g >= 0, so q_ij >= 0;
+//   (b) W_ij - bias_g <= max_j W_ij - bias_g <= 63 * s_g, so q_ij <= 63.
+// The code therefore NEVER clamps, and
+//       |W_ij - what_ij| = s_g * |(W_ij - bias_g)/s_g - q_ij| <= s_g / 2
+// EXACTLY -- with no widening term for the storage format, because s_g and
+// bias_g are themselves bf16 values used verbatim by both the packer and the
+// kernel, not roundings of some other target. Round-to-nearest-away and
+// round-to-nearest-even both satisfy |ratio - q| <= 1/2, so the bound does not
+// depend on which one `round` picks.
+// The build-time division (W - bias)/s is evaluated in f32, so the ratio the
+// rounding sees can differ from the real ratio by <= 63 * 2^-24 ulp; that is
+// 7.5e-6 relative to s/2, an order of magnitude inside the (1 + GAMMA) factor
+// applied below. `buildLagunaLmHeadInt6Planes` additionally VERIFIES
+// q in [0, 63] and |W - what| <= s/2 over every one of the 205.5M elements and
+// refuses the format (falling back to the MXFP8 screen) if either fails, so
+// the certificate does not rest on the float analysis alone.
+//
+// BOUND. Writing d_i = sum_g (s_g/2) * sum_{j in g} |x_j| and
+// M_i = sum_g (64 s_g + |bias_g|) * sum_{j in g} |x_j|:
+//   * d_i >= sum_j |x_j| * |W_ij - what_ij|, the quantization term;
+//   * M_i >= sum_j |x_j| * |what_ij| since |what_ij| = |q s_g + bias_g|
+//     <= 63 s_g + |bias_g| < 64 s_g + |bias_g|, AND M_i also dominates the sum
+//     of the ABSOLUTE VALUES OF THE TERMS this kernel actually accumulates
+//     (s_g * x_j q_ij and bias_g * x_j separately), which is what the float
+//     rounding analysis needs -- the split into a q-part and a bias-part can
+//     cancel, so bounding sum|x_j what_ij| alone would NOT be enough here.
+//   * 64 * s_g is exact in f32 (a power-of-two scaling), so that coefficient
+//     carries no rounding of its own.
+// Every value on both the coarse path and the exact path is accumulated in f32
+// through a chain of depth <= ~75 (64 sequential adds per lane, a 5-deep simd
+// tree, then a handful of combines), so each kernel's rounding is bounded by
+// 75 * 2^-24 = 4.5e-6 relative -- comfortably inside GAMMA = 2^-15 = 3.05e-5,
+// the same margin notes/68 establishes for the MXFP8 screen (depth <= 96).
+// delta_i = d_i*(1+GAMMA) + 2*GAMMA*M_i therefore covers the quantization
+// error AND both kernels' float rounding, exactly as in the MXFP8 screen, and
+// the downstream select/exact stages are used UNCHANGED.
+//
+// LAYOUT. Split-plane, so every load is uint4-aligned and every field extract
+// is a static shift-and-mask (no 6-bit field ever straddles a word):
+//     planeA  1024 B/row : high 4 bits of q, two elements per byte
+//     planeB   512 B/row : low  2 bits of q, four elements per byte
+//     meta       64 B/row: per group, (bf16 s_g, bf16 bias_g)
+// A lane owns 64 consecutive elements = exactly HALF a group, so it needs
+// exactly one (s, bias) pair and reads 2 uint4 of planeA + 1 uint4 of planeB.
+
+/// Master switch for the int6 coarse screen. DEFAULT ON; set
+/// `DARKBLOOM_LMHEAD_INT6=0` to fall back to the MXFP8 screen in the same
+/// binary (the paired measurement protocol needs both arms in one build).
+/// Ignored entirely when `DARKBLOOM_LM_HEAD_PRUNE=0` disables the screen.
+let lagunaLmHeadInt6Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_INT6"] != "0"
+
+/// Debug-only per-token cross-check against the stock full BF16 lm_head.
+/// OFF unless `DARKBLOOM_LMHEAD_VERIFY=1`; adds a full 411 MB GEMV and two
+/// host readbacks per decode step, so it is for local verification only.
+let lagunaLmHeadVerifyEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_VERIFY"] == "1"
+
+/// Fused int6 coarse GEMV + certified bound + BF16 pre-fill. Structurally the
+/// twin of `laguna_lmhead_mxfp8_coarse_v2`: one simdgroup per row, lane L owns
+/// elements [64L, 64L+64), three simd_sum reductions, identical output
+/// semantics (`coarse` f32, `delta` f32, `coarse_bf` bf16).
+///
+/// The per-lane work is a single FMA chain over the elements plus two
+/// x-only sums:
+///     S1 = sum x_j q_j   S2 = sum x_j   S3 = sum |x_j|
+///     coarse += s*S1 + bias*S2      (linearity of what = q*s + bias)
+///     d      += (s/2)*S3
+///     M      += (64 s + |bias|)*S3
+/// S2 and S3 are row-independent, but recomputing them per row costs two adds
+/// per element and no extra loads, and keeps the kernel a pure function of its
+/// inputs with the same one-row-per-simdgroup mapping as the MXFP8 arm.
+private let lagunaLmHeadInt6CoarseKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_int6_coarse_v1",
+    inputNames: ["x", "planeA", "planeB", "meta"],
+    outputNames: ["coarse", "delta", "coarse_bf"],
+    source: """
+        constexpr float GAMMA = 0x1p-15f;
+
+        uint row = threadgroup_position_in_grid.x * 8 +
+            simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        const device uint4* pa =
+            (const device uint4*)(planeA + size_t(row) * 1024 + lane * 32);
+        const device uint4* pb =
+            (const device uint4*)(planeB + size_t(row) * 512 + lane * 16);
+        const device ushort4* xr = (const device ushort4*)(x + lane * 64);
+        // meta is [vocab, 16, 2] ushort: group g occupies one uint32, low half
+        // the bf16 scale bits, high half the bf16 bias bits. Lane L covers the
+        // second half of group L/2.
+        uint mt = ((const device uint*)(meta + size_t(row) * 32))[lane >> 1];
+        float sc = as_type<float>((mt & 0xFFFFu) << 16);
+        float bi = as_type<float>((mt >> 16) << 16);
+
+        uint4 a0 = pa[0];
+        uint4 a1 = pa[1];
+        uint4 b0 = pb[0];
+
+        float s1 = 0.0f;
+        float s2 = 0.0f;
+        float s3 = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint w = 0; w < 8; ++w) {
+            // planeA word w holds elements 8w..8w+7 as nibbles at bit 4i.
+            uint aw = (w < 4u) ? a0[w & 3u] : a1[w & 3u];
+            // planeB word w/2 holds elements 16(w/2)..+15 as 2-bit fields;
+            // this word's elements start at bit 16*(w&1).
+            uint bw = b0[w >> 1];
+            uint bsh = (w & 1u) ? 16u : 0u;
+            #pragma clang loop unroll(full)
+            for (uint h = 0; h < 2; ++h) {
+                uint4 hi4 =
+                    (uint4(aw) >> (uint4(0u, 4u, 8u, 12u) + 16u * h)) & 15u;
+                uint4 lo2 =
+                    (uint4(bw) >> (uint4(0u, 2u, 4u, 6u) + 8u * h + bsh)) & 3u;
+                float4 qf = float4((hi4 << 2) | lo2);
+                // bf16 -> f32 is exactly bits<<16 for every value class.
+                float4 xv = as_type<float4>(uint4(xr[w * 2 + h]) << 16);
+                float4 ax = metal::abs(xv);
+                #pragma clang loop unroll(full)
+                for (uint k = 0; k < 4; ++k) {
+                    s1 += xv[k] * qf[k];
+                    s2 += xv[k];
+                    s3 += ax[k];
+                }
+            }
+        }
+        float c_acc = simd_sum(sc * s1 + bi * s2);
+        float d_acc = simd_sum((sc * 0.5f) * s3);
+        float m_acc = simd_sum((64.0f * sc + metal::abs(bi)) * s3);
+        if (lane == 0) {
+            coarse[row] = c_acc;
+            delta[row] = d_acc * (1.0f + GAMMA) + (2.0f * GAMMA) * m_acc;
+            coarse_bf[row] = bfloat(c_acc);
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Largest bf16 value <= `v` (v arbitrary sign), as float32. Bit truncation
+/// rounds toward ZERO, which is toward +inf for negatives, so a negative that
+/// truncated upward is stepped one bf16 ulp further from zero.
+private func lagunaBF16RoundedDown(_ v: MLXArray) -> MLXArray {
+    let truncBits = v.view(dtype: .uint32) & UInt32(0xFFFF_0000)
+    let trunc = truncBits.view(dtype: .float32)
+    let stepped = (truncBits + UInt32(0x0001_0000)).view(dtype: .float32)
+    return which(trunc .> v, stepped, trunc)
+}
+
+/// Smallest bf16 value >= `v`, for v >= 0. Truncation never overshoots a
+/// non-negative value, so one ulp up is enough whenever it undershoots.
+private func lagunaBF16RoundedUp(_ v: MLXArray) -> MLXArray {
+    let truncBits = v.view(dtype: .uint32) & UInt32(0xFFFF_0000)
+    let trunc = truncBits.view(dtype: .float32)
+    let stepped = (truncBits + UInt32(0x0001_0000)).view(dtype: .float32)
+    return which(trunc .< v, stepped, trunc)
+}
+
+/// The three resident int6 planes plus the build-time certificate check.
+struct LagunaLmHeadInt6Planes {
+    let planeA: MLXArray  // [vocab, 1024] uint8, high 4 bits, 2 elements/byte
+    let planeB: MLXArray  // [vocab,  512] uint8, low 2 bits, 4 elements/byte
+    let meta: MLXArray    // [vocab, 32] uint16, per gs128 (bf16 s, bf16 bias)
+}
+
+/// Builds the int6 planes from the materialized BF16 lm_head, verifying the
+/// certificate on the real weight before returning. Returns nil (-> MXFP8
+/// fallback) if any element would clamp or exceed the half-cell, or if the
+/// shape is not the expected [100352, 2048].
+///
+/// Runs in row chunks so the f32 working set stays ~100 MB rather than
+/// materializing an 822 MB f32 view of the whole head at once.
+func buildLagunaLmHeadInt6Planes(lmHeadWeight w: MLXArray) -> LagunaLmHeadInt6Planes? {
+    let vocab = lagunaLmHeadPruneVocab
+    let hidden = lagunaLmHeadPruneHidden
+    let groups = hidden / 128
+    guard w.shape == [vocab, hidden], w.dtype == .bfloat16 else { return nil }
+
+    var planeAChunks: [MLXArray] = []
+    var planeBChunks: [MLXArray] = []
+    var metaChunks: [MLXArray] = []
+    let chunk = 6272  // 16 chunks; 100352 == 16 * 6272
+
+    var rowStart = 0
+    while rowStart < vocab {
+        let rows = Swift.min(chunk, vocab - rowStart)
+        let wc = w[rowStart ..< (rowStart + rows)].asType(.float32)
+        let g = wc.reshaped([rows, groups, 128])
+        let lo = MLX.min(g, axis: 2)
+        let hi = MLX.max(g, axis: 2)
+        let bias = lagunaBF16RoundedDown(lo)
+        // Guard the all-equal group: hi - bias is then 0 (lm_head is bf16, so
+        // lo is already a bf16 value and bias == lo), which would divide by
+        // zero. Any strictly positive scale reconstructs the group exactly,
+        // because every element equals bias and therefore codes to q = 0.
+        let rawScale = lagunaBF16RoundedUp((hi - bias) / Float(63.0))
+        let scale = which(rawScale .> Float(0), rawScale, MLXArray(Float.leastNormalMagnitude))
+        let q = round((g - bias.reshaped([rows, groups, 1]))
+            / scale.reshaped([rows, groups, 1]))
+
+        // Certificate check on the REAL weight, before anything is retained.
+        let what = q * scale.reshaped([rows, groups, 1]) + bias.reshaped([rows, groups, 1])
+        let err = abs(g - what)
+        let cell = (scale * Float(0.5)).reshaped([rows, groups, 1])
+        let ok = MLX.min(q).item(Float.self) >= 0
+            && MLX.max(q).item(Float.self) <= 63
+            && MLX.max(err - cell).item(Float.self) <= 0
+        guard ok else {
+            FileHandle.standardError.write(Data(
+                "mlxfast: lm_head int6: certificate check failed at row \(rowStart); using mxfp8\n".utf8))
+            return nil
+        }
+
+        let qi = q.asType(.uint8).reshaped([rows, hidden])
+        let hi4 = (qi >> UInt8(2)) & UInt8(0x0F)
+        let lo2 = qi & UInt8(0x03)
+        let hiPair = hi4.reshaped([rows, hidden / 2, 2])
+        planeAChunks.append(hiPair[0..., 0..., 0] | (hiPair[0..., 0..., 1] << UInt8(4)))
+        let loQuad = lo2.reshaped([rows, hidden / 4, 4])
+        planeBChunks.append(
+            loQuad[0..., 0..., 0]
+                | (loQuad[0..., 0..., 1] << UInt8(2))
+                | (loQuad[0..., 0..., 2] << UInt8(4))
+                | (loQuad[0..., 0..., 3] << UInt8(6)))
+        let sBits = (scale.view(dtype: .uint32) >> UInt32(16)).asType(.uint16)
+        let bBits = (bias.view(dtype: .uint32) >> UInt32(16)).asType(.uint16)
+        metaChunks.append(
+            stacked([sBits, bBits], axis: 2).reshaped([rows, groups * 2]))
+        eval(planeAChunks.last!, planeBChunks.last!, metaChunks.last!)
+        rowStart += rows
+    }
+
+    let planes = LagunaLmHeadInt6Planes(
+        planeA: concatenated(planeAChunks, axis: 0),
+        planeB: concatenated(planeBChunks, axis: 0),
+        meta: concatenated(metaChunks, axis: 0))
+    eval(planes.planeA, planes.planeB, planes.meta)
+    return planes
+}
+
 /// Retained init-time MXFP8 coarse copy of lm_head plus the pruned decode
 /// forward. Built once (untimed init) by
 /// `LagunaRuntimeModel.prepareFusedRuntimeWeights` when
@@ -376,6 +654,11 @@ private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
 final class LagunaLmHeadPruner {
     let codes: MLXArray   // [100352, 2048] uint8 e4m3 elements
     let scales: MLXArray  // [100352, 64] uint8 e8m0 group scales
+    /// Non-nil when the int6 gs128 screen is enabled AND its build-time
+    /// certificate check passed on the real weight. When set it REPLACES the
+    /// MXFP8 coarse scan (160.6 MB/token instead of 211.9 MB/token); the MXFP8
+    /// copy stays resident so `DARKBLOOM_LMHEAD_INT6=0` is a same-binary A/B.
+    var int6: LagunaLmHeadInt6Planes?
 
     init?(lmHeadWeight: MLXArray) {
         guard lmHeadWeight.shape == [lagunaLmHeadPruneVocab, lagunaLmHeadPruneHidden],
@@ -404,15 +687,29 @@ final class LagunaLmHeadPruner {
         let vocab = lagunaLmHeadPruneVocab
         let x = hidden.reshaped([lagunaLmHeadPruneHidden])
 
-        let coarseKernel =
-            lagunaLmHeadCoarseUseV1 ? lagunaLmHeadCoarseKernelV1 : lagunaLmHeadCoarseKernel
-        let coarseOut = coarseKernel(
-            [x, codes, scales],
-            grid: (vocab / 8 * 256, 1, 1),
-            threadGroup: (256, 1, 1),
-            outputShapes: [[vocab], [vocab], [vocab]],
-            outputDTypes: [.float32, .float32, .bfloat16]
-        )
+        // Coarse scan: int6 gs128 when it built and certified, else MXFP8.
+        // Both produce the same three outputs with the same certified
+        // semantics, so everything downstream is shared verbatim.
+        let coarseOut: [MLXArray]
+        if let int6 {
+            coarseOut = lagunaLmHeadInt6CoarseKernel(
+                [x, int6.planeA, int6.planeB, int6.meta],
+                grid: (vocab / 8 * 256, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[vocab], [vocab], [vocab]],
+                outputDTypes: [.float32, .float32, .bfloat16]
+            )
+        } else {
+            let coarseKernel =
+                lagunaLmHeadCoarseUseV1 ? lagunaLmHeadCoarseKernelV1 : lagunaLmHeadCoarseKernel
+            coarseOut = coarseKernel(
+                [x, codes, scales],
+                grid: (vocab / 8 * 256, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[vocab], [vocab], [vocab]],
+                outputDTypes: [.float32, .float32, .bfloat16]
+            )
+        }
         let coarse = coarseOut[0]
         let delta = coarseOut[1]
         let coarseBF = coarseOut[2]
@@ -445,6 +742,33 @@ final class LagunaLmHeadPruner {
             outputShapes: [[vocab]],
             outputDTypes: [.bfloat16]
         )[0]
+        if lagunaLmHeadVerifyEnabled {
+            verifyAgainstStock(assembled: assembled, x: x, lmHeadWeight: lmHeadWeight,
+                               coarse: coarse, delta: delta)
+        }
         return assembled.reshaped([1, 1, vocab])
+    }
+
+    /// Debug-only (`DARKBLOOM_LMHEAD_VERIFY=1`): re-run the stock full BF16
+    /// GEMV for this token and assert that the screened row argmaxes to the
+    /// same vocabulary slot and that the certified bound really contains the
+    /// stock logit for every row. Reports to stderr and never mutates the
+    /// returned logits, so a verified run and a scored run execute the same
+    /// screen; it is not on the timed path.
+    private func verifyAgainstStock(
+        assembled: MLXArray, x: MLXArray, lmHeadWeight: MLXArray,
+        coarse: MLXArray, delta: MLXArray
+    ) {
+        let stock = matmul(lmHeadWeight, x.reshaped([lagunaLmHeadPruneHidden, 1]))
+            .reshaped([lagunaLmHeadPruneVocab])
+        let stockF = stock.asType(.float32)
+        let ours = argMax(assembled).item(Int.self)
+        let theirs = argMax(stock).item(Int.self)
+        let escapes = (abs(stockF - coarse) .> delta).sum().item(Int.self)
+        let candidates = ((coarse + delta) .>= (coarse - delta).max()).sum().item(Int.self)
+        let tag = (ours == theirs && escapes == 0) ? "ok" : "MISMATCH"
+        FileHandle.standardError.write(Data(
+            ("mlxfast: lmhead verify \(tag) screen_argmax=\(ours) stock_argmax=\(theirs) "
+                + "bound_escapes=\(escapes) candidates=\(candidates)\n").utf8))
     }
 }
