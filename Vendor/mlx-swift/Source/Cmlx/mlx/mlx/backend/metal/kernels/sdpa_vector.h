@@ -87,11 +87,14 @@ using namespace metal;
 #endif
 
 // Same encoding for `sdpa_vector_2pass_2`. Compile-time only, with no named
-// variants: that kernel is off the scored decode path (the host routes to
-// 2-pass only at KV length >= 1024 and the frozen timed window peaks at
-// 512 + 128 = 640), so it does not earn a slot in the measurement protocol.
+// variants. Compiled decode deliberately presents the ten full-attention
+// Laguna layers with a 1025-token view so they retain the stock two-pass
+// reduction partition while the timed logical prefix grows from 512 to 640.
+// Four planes therefore matter on the scored path: for D = 128 they exchange
+// all four per-lane output elements in one publish/read phase instead of
+// recycling one 4 KiB plane seven times.
 #ifndef DARKBLOOM_AOT_SDPA_2PASS_PLANES
-#define DARKBLOOM_AOT_SDPA_2PASS_PLANES 1
+#define DARKBLOOM_AOT_SDPA_2PASS_PLANES 4
 #endif
 
 // Laguna decode uses eight query heads per KV head on sliding layers and six
@@ -694,7 +697,10 @@ template <typename T, int D, int PLANES = DARKBLOOM_AOT_SDPA_2PASS_PLANES>
 
   thread U o[elem_per_thread] = {0};
   constexpr int o_planes = PLANES < elem_per_thread ? PLANES : elem_per_thread;
+  constexpr int factor_cache_blocks = 128;
   threadgroup U outputs[o_planes * BN * BD];
+  threadgroup U factors[factor_cache_blocks];
+  threadgroup U normalizer[2];
 
   // Adjust positions
   const int head_idx = tid.x;
@@ -705,26 +711,53 @@ template <typename T, int D, int PLANES = DARKBLOOM_AOT_SDPA_2PASS_PLANES>
   maxs += q_offset * blocks;
   out += q_offset * D + simd_gid * elem_per_thread;
 
-  // Set defaults
+  // Every SIMDgroup used to recompute the same global softmax normalizer.
+  // The inputs and lane mapping below have no simd_gid dependence, so all 32
+  // groups execute the same source expression with the same lane reduction
+  // topology. Execute that tree once in group zero, publish its two floats,
+  // and reuse them without changing the tree itself.
+  //
+  // For the 32/64/128-block shapes used at Laguna's 1025-token boundary, the
+  // same exp(maxs[b] - max_score) factors are also needed by the partial-output
+  // merge. Group zero already evaluates all of them with one lane per block;
+  // retain those exact float results in threadgroup memory instead of issuing
+  // the same elementwise exp in every output SIMDgroup. Larger generic shapes
+  // keep the stock per-group expression rather than imposing a larger cache.
+  const bool cache_factors = blocks <= factor_cache_blocks;
   U sum_exp_score = 0.0;
   U max_score = Limits<U>::finite_min;
+  if (simd_gid == 0) {
+    for (int b = 0; b < blocks / BN; ++b) {
+      max_score = max(max_score, maxs[simd_lid + BN * b]);
+    }
+    max_score = simd_max(max_score);
 
-  // Reduce the max
-  for (int b = 0; b < blocks / BN; ++b) {
-    max_score = max(max_score, maxs[simd_lid + BN * b]);
+    for (int b = 0; b < blocks / BN; ++b) {
+      const int block = simd_lid + BN * b;
+      U factor = fast::exp(maxs[block] - max_score);
+      if (cache_factors) {
+        factors[block] = factor;
+      }
+      sum_exp_score += factor * sums[block];
+    }
+    sum_exp_score = simd_sum(sum_exp_score);
+
+    if (simd_lid == 0) {
+      normalizer[0] = max_score;
+      normalizer[1] = sum_exp_score;
+    }
   }
-  max_score = simd_max(max_score);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  max_score = normalizer[0];
+  sum_exp_score = normalizer[1];
 
-  // Reduce the d
+  // Reduce the partial outputs in the unchanged block order. At the scored
+  // block counts this consumes the exact factors produced above; the fallback
+  // is the original expression for any larger dispatcher-selected shape.
   for (int b = 0; b < blocks / BN; ++b) {
-    U factor = fast::exp(maxs[simd_lid + BN * b] - max_score);
-    sum_exp_score += factor * sums[simd_lid + BN * b];
-  }
-  sum_exp_score = simd_sum(sum_exp_score);
-
-  // Reduce the sum exp and partials
-  for (int b = 0; b < blocks / BN; ++b) {
-    U factor = fast::exp(maxs[simd_gid] - max_score);
+    U factor = cache_factors
+        ? factors[simd_gid + BN * b]
+        : fast::exp(maxs[simd_gid] - max_score);
 
     // Update the output accumulator
     for (int i = 0; i < elem_per_thread; i++) {
