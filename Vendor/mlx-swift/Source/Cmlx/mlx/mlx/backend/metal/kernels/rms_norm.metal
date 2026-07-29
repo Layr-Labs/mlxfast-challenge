@@ -26,19 +26,22 @@ template <typename T, int N_READS = RMS_N_READS>
   threadgroup float local_inv_mean[1];
   threadgroup float local_sums[SIMD_SIZE];
 
+  // Cache x in registers to avoid redundant global read during output write
+  // (upstream a1316145, bit-exact: same values, just register-cached)
   float acc = 0;
+  float thread_x[N_READS];
   x += gid * size_t(axis_size) + lid * N_READS;
   w += w_stride * lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; i++) {
-      float xi = x[i];
-      acc += xi * xi;
+      thread_x[i] = x[i];
+      acc += thread_x[i] * thread_x[i];
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
-        float xi = x[i];
-        acc += xi * xi;
+        thread_x[i] = x[i];
+        acc += thread_x[i] * thread_x[i];
       }
     }
   }
@@ -64,16 +67,16 @@ template <typename T, int N_READS = RMS_N_READS>
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Write the outputs
+  // Write the outputs using cached x values
   out += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; i++) {
-      out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
+      out[i] = w[w_stride * i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
-        out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
+        out[i] = w[w_stride * i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
       }
     }
   }

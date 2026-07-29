@@ -109,7 +109,7 @@ using namespace metal;
 // sink-free vector shape. Both factors are even, so no adjacent pair crosses
 // a KV-head ownership boundary.
 #ifndef DARKBLOOM_GQA_PAIR_HEADS
-#define DARKBLOOM_GQA_PAIR_HEADS 2
+#define DARKBLOOM_GQA_PAIR_HEADS 4
 #endif
 
 constant bool has_mask [[function_constant(20)]];
@@ -182,9 +182,13 @@ template <
 
   // DARKBLOOM_GQA_PAIR_HEADS: preserve each head's exact key order and
   // reduction tree while sharing the K/V device reads across adjacent heads.
+  // When GQA_PAIR_HEADS==4, GQA8 uses the quad path and GQA6 uses the pair
+  // path (6 is not divisible by 4 but is divisible by 2).
   const bool use_gqa_pair =
-      D == 128 && V == 128 && DARKBLOOM_GQA_PAIR_HEADS == 2 &&
-      (gqa_factor == 8 || gqa_factor == 6) &&
+      D == 128 && V == 128 &&
+      ((DARKBLOOM_GQA_PAIR_HEADS == 2 && (gqa_factor == 8 || gqa_factor == 6))
+       ||
+       (DARKBLOOM_GQA_PAIR_HEADS == 4 && gqa_factor == 6)) &&
       tpg.y == 1 && (tpg.x % 2) == 0 &&
       !has_mask && !do_causal && !has_sinks;
   if (use_gqa_pair) {
@@ -337,6 +341,176 @@ template <
       for (int i = 0; i < v_per_thread; ++i) {
         pair_out0[i] = static_cast<T>(pair_o0[i]);
         pair_out1[i] = static_cast<T>(pair_o1[i]);
+      }
+    }
+    return;
+  }
+
+  // DARKBLOOM_GQA_PAIR_HEADS == 4: share K/V reads across 4 adjacent query
+  // heads. Each head keeps independent query registers, online-softmax state,
+  // output accumulators, and the stock 32-simdgroup reduction tree, while
+  // all 4 share each key and value load. Only dispatched for GQA factor 8
+  // (sliding layers); GQA factor 6 (full-attention) is not divisible by 4
+  // and stays on the 2-head path.
+  const bool use_gqa_quad =
+      D == 128 && V == 128 && DARKBLOOM_GQA_PAIR_HEADS == 4 &&
+      gqa_factor == 8 &&
+      tpg.y == 1 && (tpg.x % 4) == 0 &&
+      !has_mask && !do_causal && !has_sinks;
+  if (use_gqa_quad) {
+    const int quad_idx = tid.x;
+    const int q_head0 = 4 * quad_idx;
+    if (q_head0 >= int(tpg.x)) {
+      return;
+    }
+    const int kv_head_idx = q_head0 / gqa_factor;
+
+    const device T* quad_keys =
+        keys + kv_head_idx * k_head_stride + simd_gid * k_seq_stride +
+        simd_lid * qk_per_thread;
+    const device T* quad_values =
+        values + kv_head_idx * v_head_stride + simd_gid * v_seq_stride +
+        simd_lid * v_per_thread;
+
+    thread U quad_q[DARKBLOOM_GQA_PAIR_HEADS][qk_per_thread];
+    thread U quad_k[qk_per_thread];
+    thread U quad_o[DARKBLOOM_GQA_PAIR_HEADS][v_per_thread];
+    U quad_max[DARKBLOOM_GQA_PAIR_HEADS];
+    U quad_sum[DARKBLOOM_GQA_PAIR_HEADS];
+
+    // Read the 4 queries and zero the output accumulators
+    for (int h = 0; h < DARKBLOOM_GQA_PAIR_HEADS; ++h) {
+      const device T* qh =
+          queries + (q_head0 + h) * D + simd_lid * qk_per_thread;
+      for (int j = 0; j < qk_per_thread; ++j) {
+        quad_q[h][j] = static_cast<U>(scale) * qh[j];
+      }
+      for (int j = 0; j < v_per_thread; ++j) {
+        quad_o[h][j] = 0;
+      }
+      quad_max[h] = Limits<U>::finite_min;
+      quad_sum[h] = 0;
+    }
+
+    // For each key/value
+    for (int i = simd_gid; i < N; i += BN) {
+      // Read the key ONCE for all 4 heads
+      for (int j = 0; j < qk_per_thread; ++j) {
+        quad_k[j] = quad_keys[j];
+      }
+
+      U quad_score[DARKBLOOM_GQA_PAIR_HEADS];
+      for (int h = 0; h < DARKBLOOM_GQA_PAIR_HEADS; ++h) {
+        quad_score[h] = 0;
+        for (int j = 0; j < qk_per_thread; ++j) {
+          quad_score[h] += quad_q[h][j] * quad_k[j];
+        }
+        quad_score[h] = simd_sum(quad_score[h]);
+      }
+
+      U quad_exp[DARKBLOOM_GQA_PAIR_HEADS];
+      U quad_factor[DARKBLOOM_GQA_PAIR_HEADS];
+      for (int h = 0; h < DARKBLOOM_GQA_PAIR_HEADS; ++h) {
+        U quad_new_max = max(quad_max[h], quad_score[h]);
+        quad_factor[h] = fast::exp(quad_max[h] - quad_new_max);
+        quad_exp[h] = fast::exp(quad_score[h] - quad_new_max);
+        quad_max[h] = quad_new_max;
+        quad_sum[h] = quad_sum[h] * quad_factor[h] + quad_exp[h];
+      }
+
+      // Read value ONCE, update all 4 head accumulators
+      for (int j = 0; j < v_per_thread; ++j) {
+        const T quad_value = quad_values[j];
+        for (int h = 0; h < DARKBLOOM_GQA_PAIR_HEADS; ++h) {
+          quad_o[h][j] =
+              quad_o[h][j] * quad_factor[h] + quad_exp[h] * quad_value;
+        }
+      }
+
+      quad_keys += inner_k_stride;
+      quad_values += inner_v_stride;
+    }
+
+    // Combine: process 2 heads at a time through the 4-plane exchange buffer
+    // to stay within the 32 KiB threadgroup memory limit.
+    constexpr int quad_planes = 2;
+    constexpr int quad_plane_size = BN * BD;
+    U quad_global_factor[DARKBLOOM_GQA_PAIR_HEADS];
+    U quad_global_sum[DARKBLOOM_GQA_PAIR_HEADS];
+
+    // Compute global max/sum for all heads using max_scores/sum_exp_scores
+    if (simd_lid == 0) {
+      for (int h = 0; h < DARKBLOOM_GQA_PAIR_HEADS; ++h) {
+        max_scores[h * BN + simd_gid] = quad_max[h];
+        sum_exp_scores[h * BN + simd_gid] = quad_sum[h];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int h = 0; h < DARKBLOOM_GQA_PAIR_HEADS; ++h) {
+      U hm = max_scores[h * BN + simd_lid];
+      U gm = simd_max(hm);
+      quad_global_factor[h] = fast::exp(hm - gm);
+      quad_global_sum[h] =
+          simd_sum(sum_exp_scores[h * BN + simd_lid] * quad_global_factor[h]);
+    }
+
+    // Process heads 2 at a time through the exchange buffer (4 planes)
+    for (int hb = 0; hb < DARKBLOOM_GQA_PAIR_HEADS; hb += 2) {
+      // Stage 1: scatter head hb and hb+1 into the exchange buffer
+      for (int i = 0; i < quad_planes; ++i) {
+        outputs[i * quad_plane_size + simd_lid * BD + simd_gid] = quad_o[hb][i];
+        outputs[(quad_planes + i) * quad_plane_size + simd_lid * BD + simd_gid] =
+            quad_o[hb + 1][i];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      // Reduce pass 1
+      for (int i = 0; i < quad_planes; ++i) {
+        U acc0 = simd_sum(
+            outputs[i * quad_plane_size + simd_gid * BD + simd_lid] *
+            quad_global_factor[hb]);
+        U acc1 = simd_sum(
+            outputs[(quad_planes + i) * quad_plane_size + simd_gid * BD + simd_lid] *
+            quad_global_factor[hb + 1]);
+        quad_o[hb][i] =
+            quad_global_sum[hb] == 0 ? acc0 : (acc0 / quad_global_sum[hb]);
+        quad_o[hb + 1][i] =
+            quad_global_sum[hb + 1] == 0 ? acc1 : (acc1 / quad_global_sum[hb + 1]);
+      }
+
+      // Stage 2: scatter the upper halves
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int i = 0; i < quad_planes; ++i) {
+        outputs[i * quad_plane_size + simd_lid * BD + simd_gid] =
+            quad_o[hb][quad_planes + i];
+        outputs[(quad_planes + i) * quad_plane_size + simd_lid * BD + simd_gid] =
+            quad_o[hb + 1][quad_planes + i];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      // Reduce pass 2
+      for (int i = 0; i < quad_planes; ++i) {
+        U acc0 = simd_sum(
+            outputs[i * quad_plane_size + simd_gid * BD + simd_lid] *
+            quad_global_factor[hb]);
+        U acc1 = simd_sum(
+            outputs[(quad_planes + i) * quad_plane_size + simd_gid * BD + simd_lid] *
+            quad_global_factor[hb + 1]);
+        quad_o[hb][quad_planes + i] =
+            quad_global_sum[hb] == 0 ? acc0 : (acc0 / quad_global_sum[hb]);
+        quad_o[hb + 1][quad_planes + i] =
+            quad_global_sum[hb + 1] == 0 ? acc1 : (acc1 / quad_global_sum[hb + 1]);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (simd_lid == 0) {
+      for (int h = 0; h < DARKBLOOM_GQA_PAIR_HEADS; ++h) {
+        device T* qout =
+            out + (q_head0 + h) * V + simd_gid * v_per_thread;
+        for (int i = 0; i < v_per_thread; ++i) {
+          qout[i] = static_cast<T>(quad_o[h][i]);
+        }
       }
     }
     return;
