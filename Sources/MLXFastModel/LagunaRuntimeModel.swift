@@ -378,9 +378,9 @@ let lagunaFusedDenseDownResidualEnabled =
 let lagunaRouterRowsPerGroup: Int = {
     guard
         let raw = ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_ROWS_PER_GROUP"],
-        let value = Int(raw), [8, 16, 32, 64].contains(value)
+        let value = Int(raw), [4, 8, 16, 32, 64].contains(value)
     else {
-        return 8
+        return 4
     }
     return value
 }()
@@ -719,7 +719,7 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
 /// name or four sources would thrash one cache entry.
 private let lagunaResidualRMSNormRouterKernels: [Int: MLXFast.MLXFastKernel] =
     Dictionary(
-        uniqueKeysWithValues: [8, 16, 32, 64].map { rowsPerGroup in
+        uniqueKeysWithValues: [4, 8, 16, 32, 64].map { rowsPerGroup in
             (
                 rowsPerGroup,
                 MLXFast.metalKernel(
