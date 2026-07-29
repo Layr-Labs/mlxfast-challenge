@@ -1287,6 +1287,71 @@ bool darkbloom_expert_aligned_gather() {
   return v;
 }
 
+// DARKBLOOM_EXPERT_STAGE_WIDEST -- host half. The ENABLE bit lives in
+// jit_kernels.cpp as a preprocessor define (this kernel is built with no
+// MTLFCList, so a function constant is unavailable); this function owns only
+// the MAGNITUDE P, which travels to the kernel as a runtime scalar argument
+// exactly like run_skip_pct. Keeping P out of the source text and out of the
+// specialization key is what guarantees one JIT compile per process no matter
+// how the submission is resized.
+//
+// THE SHIPPED DEFAULT STRENGTH. This is the single line to change to resize
+// the submission; everything else is mechanism. P is the percent of expert
+// groups (tid.y in [0, 64)) whose threadgroups take the widened store path.
+//
+// Staging latency is 39.5% of prefill -- the same term the variant-4 tiling
+// above credits for +15.40%. The full-strength prefill delta for this arm is
+// modeled at -9% (conservative) to -16% (aggressive); both blow through the
+// +5.26% per-submission acceptance band, so the win has to be chunked.
+// d(P) = d(100) * tiles(P)/64 with tiles(P) = |{r in [0,64) : (r*61)%100<P}|:
+//
+//   P    tiles/64   frac     d@-9%   spd     d@-16%   spd      verdict
+//   20    12/64    18.75%   -1.69%  1.0172   -3.00%  1.0309   undershoot
+//   25    16/64    25.00%   -2.25%  1.0230   -4.00%  1.0417   safe, small
+//   29    19/64    29.69%   -2.67%  1.0275   -4.75%  1.0499   plateau
+//   30    19/64    29.69%   -2.67%  1.0275   -4.75%  1.0499   <- SHIPPED
+//   31    20/64    31.25%   -2.81%  1.0289   -5.00%  1.0526   AT the cap
+//   35    22/64    34.38%   -3.09%  1.0319   -5.50%  1.0582   OVER the cap
+//   40    25/64    39.06%   -3.52%  1.0364   -6.25%  1.0667   OVER the cap
+//  100    64/64   100.00%   -9.00%  1.0989  -16.00%  1.1905   OVER the cap
+//
+// 30 is shipped. Mid model (-12.5%) puts it at 1.0385, inside the +3.5-4.0%
+// design target; the AGGRESSIVE model puts it at 1.0499, still 0.27pp under
+// the 1.0526 cap. The asymmetry is the one the RUNSKIP note argues: an
+// undershoot leaves headroom for the next chunk, an overshoot trips
+// `acceptance_band_failed` and burns a whole serial ranked cycle. P in
+// [29, 30] selects the same 19 tiles so the choice is insensitive to -1; +1
+// lands exactly ON the cap. Raise toward 40 only once a ranked run has priced
+// d(100).
+constexpr int kDarkbloomExpertWidestPct = 30;
+
+// Magnitude in percent of expert groups, 1..100. Parsed identically to
+// darkbloom_gather_run_skip_pct and identically to the enable-bit parse in
+// jit_kernels.cpp, from the same variable, and resolved once per process, so
+// the two halves cannot disagree.
+//   unset (or anything unrecognized) -> kDarkbloomExpertWidestPct
+//   "0"                              -> arm disabled in jit_kernels.cpp; the
+//                                       value here is then never read
+//   "1"                              -> 100, full strength
+//   "1:P"                            -> P, clamped to [1, 100]
+int darkbloom_expert_stage_widest_pct() {
+  static const int pct = [] {
+    auto v = env::get_var("DARKBLOOM_EXPERT_STAGE_WIDEST", "");
+    if (v.empty()) {
+      return kDarkbloomExpertWidestPct;
+    }
+    if (v == "1") {
+      return 100;
+    }
+    if (v.rfind("1:", 0) != 0) {
+      return kDarkbloomExpertWidestPct;
+    }
+    int p = std::atoi(v.c_str() + 2);
+    return (p < 1) ? 1 : ((p > 100) ? 100 : p);
+  }();
+  return pct;
+}
+
 // DARKBLOOM_STAGE_BM128: select the gather-GEMM m-tiling. NOT a function
 // constant -- it changes the template instantiation, so it is already in
 // `kname` (`_bm_`/`_wm_`/`_wn_`) and therefore in the library name and the
@@ -1563,6 +1628,9 @@ void gather_qmm_rhs_nax(
   const bool stage_wideld = darkbloom_stage_wideld() && wide_ok;
   const bool stage_runbar = darkbloom_stage_runbar();
   const bool stage_novol = darkbloom_stage_novol();
+  // Magnitude only. The enable bit for this arm is the preprocessor define in
+  // get_qmm_nax_kernel; see darkbloom_expert_stage_widest_pct above.
+  const int stage_widest_pct = darkbloom_expert_stage_widest_pct();
 
   // Ground truth for the A/B harness. `stage_wideld` is silently downgraded
   // to false when the host alignment certification declines, and `wide_ok`
@@ -1577,7 +1645,8 @@ void gather_qmm_rhs_nax(
           stderr,
           "mlxfast: stage active: widest=%d wideld=%d(req=%d wide_ok=%d) "
           "runbar=%d novol=%d expert=%d bm128=%d bm=%d wm=%d wn=%d "
-          "w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d\n",
+          "w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d "
+          "expert_widest=%s(P=%d static_expert=%d)\n",
           int(stage_widest),
           int(stage_wideld),
           int(darkbloom_stage_wideld()),
@@ -1594,7 +1663,15 @@ void gather_qmm_rhs_nax(
           bits,
           N,
           K,
-          bn);
+          bn,
+          // The define itself is emitted in jit_kernels.cpp and traces
+          // separately under the same DARKBLOOM_STAGE_TRACE=1; this side
+          // reports the env as this TU parsed it, so a disagreement between
+          // the two halves is visible rather than silent.
+          (env::get_var("DARKBLOOM_EXPERT_STAGE_WIDEST", "") == "0") ? "off"
+                                                                    : "on",
+          stage_widest_pct,
+          int(static_expert_shape));
     });
   }
 
@@ -1690,6 +1767,22 @@ void gather_qmm_rhs_nax(
   compute_encoder.set_bytes(N, c++);
   compute_encoder.set_bytes(K, c++);
   compute_encoder.set_bytes(run_skip_pct, c++);
+  // DARKBLOOM_EXPERT_STAGE_WIDEST magnitude. Only fp_gather_qmm_rhs_expert_nax
+  // declares this argument, so it is bound exactly on the paths that select
+  // that kernel -- BOTH of them. `static_expert_shape` reaches it through
+  // get_qmm_nax_kernel, but plain `expert_aligned` reaches the same kernel
+  // through get_gather_qmm_nax_kernel, whose name-based dispatch picks
+  // "_gather_qmm_rhs_expert_nax" for any kname containing "_expert_". The
+  // guard is therefore `expert_aligned`, not `static_expert_shape`: binding
+  // only the narrower case would leave the wider one with a declared but
+  // unbound buffer argument. The arm's ENABLE bit is the preprocessor define,
+  // injected only into the get_qmm_nax_kernel library, so on the
+  // non-static-shape path the value is bound and deliberately ignored -- the
+  // kernel still declares (and (void)s) the slot, so argument indices never
+  // shift either way.
+  if (expert_aligned) {
+    compute_encoder.set_bytes(stage_widest_pct, c++);
+  }
 
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }

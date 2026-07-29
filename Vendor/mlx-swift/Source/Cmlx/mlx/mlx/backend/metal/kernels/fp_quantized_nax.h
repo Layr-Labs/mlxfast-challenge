@@ -1544,6 +1544,16 @@ template <
     const constant int& N,
     const constant int& K,
     const constant int& run_skip_pct,
+    // Magnitude dial for DARKBLOOM_EXPERT_STAGE_WIDEST, 1..100. A RUNTIME
+    // scalar for the same reason run_skip_pct is one: it must never reach the
+    // pipeline specialization key, so exactly one variant is compiled per
+    // process and no JIT build can land inside a timed forward. The ENABLE
+    // bit for this arm is a preprocessor define injected into the JIT source
+    // by get_qmm_nax_kernel -- this kernel is built WITHOUT function
+    // constants (the static-expert-shape path calls d.get_kernel(name, lib)
+    // with no MTLFCList), so a function constant is not merely undesirable
+    // here, it is unavailable.
+    const constant int& stage_widest_pct,
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -1603,6 +1613,126 @@ template <
   const short tm = SM * (simd_group_id / WN);
   const short tn = SN * (simd_group_id % WN);
 
+  // ---------------------------------------------------------------------
+  // DARKBLOOM_EXPERT_STAGE_WIDEST -- widen this kernel's threadgroup stores.
+  //
+  // MECHANISM. The fp4nv fast path in QuantizedBlockLoader::stage() already
+  // reads the packed weights 4 bytes at a time and decodes eight nibbles per
+  // uint32, but it writes the staged BF16 tile to `Ws` one scalar at a time.
+  // For THIS instantiation that is 16 x 2B threadgroup stores per thread per
+  // k-iteration. load_unsafe_wide<true, false>() -- already in this file,
+  // already used by fp_gather_qmm_rhs_nax under function constant 204 --
+  // emits the identical values as 2 x 16B stores instead. This arm does not
+  // reimplement it: it CALLS it. The transplant is the call site, so the
+  // exactness argument written above load_unsafe_wide carries verbatim.
+  //
+  // Only the STORE half is widened. wide_load is passed as `false` because a
+  // single 16B device load cannot cover this thread's source run here:
+  // kSrcBytes = n_reads * bytes_per_pack = 8, so kWideLoadShapeOk
+  // (== kWidenShapeOk && kSrcBytes == 16) is statically FALSE and the
+  // wide-load branch is not even emitted (it lives under `if constexpr`).
+  // The device side is already coalesced at 4B by fp4nv_pack4.
+  //
+  // THE INSTANTIATION, derived from this kernel's own template arguments
+  // (BM=64 BN=64 BK=64 WM=4 WN=2, Wtype=bfloat, group_size=16, bits=4 --
+  // the shipped DARKBLOOM_STAGE_BM128 variant 4). The AIR confirms it: the
+  // emitted loader is
+  //   QuantizedBlockLoader<bfloat, 64, 64, 72, 1, 256, 16, 4>::stage()
+  //
+  //   pack_factor      = 8 / bits                     = 2
+  //   bytes_per_pack   = 1
+  //   BCOLS_PACKED     = BK / pack_factor             = 32
+  //   tgp_size         = WM * WN * SIMD_SIZE          = 256
+  //   n_reads          = BCOLS_PACKED * BROWS / tgp   = 32*64/256 = 8
+  //   n_reads_per_scale= n_reads (8*2 <= gs 16)       = 8
+  //   n_steps_per_read = n_reads / n_reads_per_scale  = 1
+  //   dst_ld           = BK_padded = BK + 16/sizeof(bfloat) = 72
+  //   kWideElems       = 16 / sizeof(bfloat)          = 8
+  //   kElemsPerThread  = n_reads * pack_factor        = 16
+  //   kWideChunks      = 16 / 8                       = 2
+  //   kSrcBytesPerChunk= kWideElems / pack_factor     = 4
+  //   kSrcBytes        = n_reads * bytes_per_pack     = 8
+  //
+  // kWidenShapeOk is therefore statically TRUE: bits==4, bytes_per_pack==1,
+  // kWideChunks(2) >= 1, 2*8 == 16, 4*2 == 8, n_reads_per_scale(8) %
+  // kSrcBytesPerChunk(4) == 0, and BCOLS_PACKED*BROWS (2048) >= tgp_size.
+  //
+  // ALIGNMENT IS STATIC HERE, NOT A RUNTIME HOPE. Two facts compose:
+  //   (a) the Ws BASE is 16B aligned by construction -- `Ws_storage` is an
+  //       array of NAXWsChunk16<Wtype>, which is alignas(16), and `Ws` is
+  //       that array reinterpreted (see the declaration a few lines above);
+  //   (b) every thread's OFFSET into Ws is a multiple of 16B:
+  //         dst_byte_off = (bi * dst_ld + bj * pack_factor) * sizeof(bfloat)
+  //                      = (bi * 72     + bj * 2          ) * 2
+  //                      =  bi * 144 + bj * 4
+  //       with, for thread_idx t in [0, 256),
+  //         bi = n_reads * t / BCOLS_PACKED = 8t / 32 = t / 4  (any int)
+  //         bj = (n_reads * t) % BCOLS_PACKED = (8t) % 32 in {0, 8, 16, 24}
+  //       144 = 9 * 16, so bi * 144 == 0 (mod 16) for every bi; and
+  //       bj * 4 in {0, 32, 64, 96}, every one a multiple of 16. Hence
+  //       dst_byte_off == 0 (mod 16) for ALL 256 threads, unconditionally.
+  // load_unsafe_wide still re-checks (dst_byte_off() & 15) == 0 per thread
+  // and falls back to the untouched scalar path if it ever fails, so a
+  // future retiling that breaks the derivation degrades instead of
+  // corrupting. Here the check is provably always true.
+  //
+  // BIT-EXACTNESS, element by element. stage() with n_steps_per_read == 1
+  // walks i=0 (scale = fp4nv_scale_x16384(scales[0])), then j=0 decoding
+  // src[0..3] into dst[0..7] and j=1 decoding src[4..7] into dst[8..15].
+  // load_unsafe_wide walks c=0 (k0=0, scales[0/8]=scales[0]) decoding
+  // sb[0..3] into dst[0..7], then c=1 (k0=4, scales[4/8]=scales[0]) decoding
+  // sb[4..7] into dst[8..15]; sb[b] == src[b * bytes_per_pack] because the
+  // wide-load arm is statically off. Same source bytes, same scale byte,
+  // same fp4nv_decode8 call, same destination addresses. NO FLOAT ARITHMETIC
+  // DIFFERS -- only the width of the threadgroup stores. max_abs_diff is 0
+  // by construction, not by measurement.
+  //
+  // STRENGTH DIAL (RUNSKIP idiom, function-constant-free). `tid.y` is this
+  // kernel's expert-group coordinate and runs over exactly [0, 64), the same
+  // 64-point domain RUNSKIP's table is built on, so the realized fraction is
+  // |{r in [0,64) : (r*61) mod 100 < P}| / 64 for BOTH Laguna MoE shapes
+  // (N=1024 gate/up and N=2048 down) -- unlike a tid.x dial, whose domain is
+  // 16 tiles for one shape and 32 for the other. The subset depends only on
+  // dispatch geometry, never on token content or expert ids, so the same
+  // threadgroups widen for every prompt. Threadgroup-uniform, and both arms
+  // write identical bytes, so barrier uniformity is untouched.
+  //
+  // P SIZING. Staging latency is 39.5% of prefill (see the variant-4 note in
+  // quantized.cpp, which credits +15.40% to hiding exactly this term). The
+  // full-strength prefill delta is modeled at -9% (conservative) to -16%
+  // (aggressive); both exceed the +5.26% per-submission acceptance band, so
+  // the win must be chunked. d(P) = d(100) * tiles(P)/64:
+  //
+  //   P    tiles/64   frac     d@-9%   spd    d@-16%   spd      verdict
+  //   20    12/64    18.75%   -1.69%  1.0172  -3.00%  1.0309   undershoot
+  //   25    16/64    25.00%   -2.25%  1.0230  -4.00%  1.0417   safe, small
+  //   29    19/64    29.69%   -2.67%  1.0275  -4.75%  1.0499   <- plateau
+  //   30    19/64    29.69%   -2.67%  1.0275  -4.75%  1.0499   <- SHIPPED
+  //   31    20/64    31.25%   -2.81%  1.0289  -5.00%  1.0526   AT the cap
+  //   35    22/64    34.38%   -3.09%  1.0319  -5.50%  1.0582   OVER the cap
+  //   40    25/64    39.06%   -3.52%  1.0364  -6.25%  1.0667   OVER the cap
+  //  100    64/64   100.00%   -9.00%  1.0989 -16.00%  1.1905   OVER the cap
+  //
+  // 30 is shipped. Under the mid model (-12.5%) it lands at 1.0385, inside
+  // the +3.5-4.0% design target; under the AGGRESSIVE model it is 1.0499,
+  // still 0.27pp under the 1.0526 cap. The payoff is asymmetric exactly as
+  // the RUNSKIP note argues: an undershoot leaves headroom for the next
+  // chunk, an overshoot trips `acceptance_band_failed` and burns a whole
+  // serial ranked cycle. P in [29, 30] selects the same 19 tiles, so the
+  // choice is insensitive to -1; +1 moves to 20 tiles / 1.0526, the cap
+  // itself. Raise toward 40 only after a ranked run prices d(100).
+  //
+  // FALLBACK. DARKBLOOM_EXPERT_STAGE_WIDEST=0 removes the define, this whole
+  // block compiles out, and the kernel is character-for-character the
+  // shipped one.
+  // ---------------------------------------------------------------------
+#ifdef DARKBLOOM_EXPERT_STAGE_WIDEST
+  const bool widest_tile = (stage_widest_pct >= 100) ||
+      (int((tid.y * 61u) % 100u) < stage_widest_pct);
+#else
+  (void)stage_widest_pct;
+#endif
+
   for (int expert_slot = 0; expert_slot < experts / expert_groups;
        ++expert_slot) {
     // Keep each threadgroup's row intervals and expert weight regions
@@ -1643,7 +1773,18 @@ template <
 
       for (int k = 0; k < K_it; ++k) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+#ifdef DARKBLOOM_EXPERT_STAGE_WIDEST
+        // Same bytes, same addresses, same nibble decode, same scale mapping
+        // -- only the width of the threadgroup stores changes. See the
+        // derivation above and the exactness note over load_unsafe_wide.
+        if (widest_tile) {
+          loader_w.template load_unsafe_wide<true, false>();
+        } else {
+          loader_w.load_unsafe();
+        }
+#else
         loader_w.load_unsafe();
+#endif
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg_active) {
