@@ -3772,10 +3772,9 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if x.dim(1) == 1,
-            let fusedWeight = _fusedGateUpWeight, let fusedScales = _fusedGateUpScales
+        if let fusedWeight = _fusedGateUpWeight, let fusedScales = _fusedGateUpScales
         {
-            if lagunaFusedSharedSwiGLUQMVEnabled,
+            if lagunaFusedSharedSwiGLUQMVEnabled && x.dim(1) == 1,
                 x.dtype == .bfloat16,
                 x.shape == [1, 1, LagunaConstants.hiddenSize],
                 fusedWeight.dtype == .uint32,
