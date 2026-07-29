@@ -1256,7 +1256,10 @@ namespace {
 // takes its arguments by value; the empty string appends nothing.
 const char* darkbloom_attn_qhoist_define() {
   static const bool enabled = [] {
-    const bool v = env::get_var("DARKBLOOM_ATTN_QHOIST", "") == "1";
+    // Default ON: the QHOIST arm is _nax-only, so it is unmeasurable on
+    // non-M5 local hardware; the ranked box is the measurement. Set
+    // DARKBLOOM_ATTN_QHOIST=0 to restore the hoist-free loop.
+    const bool v = env::get_var("DARKBLOOM_ATTN_QHOIST", "1") == "1";
     // Same ground-truth discipline the STAGE arms needed: prove the arm is
     // live before trusting its number. A #define that silently fails to reach
     // the source string produces an arm that measures its own control.
