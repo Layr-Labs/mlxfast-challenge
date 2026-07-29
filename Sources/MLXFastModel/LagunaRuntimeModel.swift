@@ -261,6 +261,21 @@ let lagunaFusedGatedOutputProjectionEnabled =
 let lagunaFusedQKVProjectionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV_PROJECTION"] != "0"
 
+/// Folds the per-head Q/K RMSNorm + RoPE stage into the fused norm+QKV
+/// projection dispatch (see `lagunaFusedQKVQKNormRoPESource`), so a decode
+/// layer's whole pre-attention chain is ONE kernel instead of two. The
+/// projection tiles widen from 64 rows / 512 threads to 128 rows / 1024
+/// threads so every Q/K tile owns a complete head; lane 0 of each simdgroup
+/// stages its four raw BF16 outputs in threadgroup memory, and after one
+/// barrier simdgroup 0 replays the standalone QK-norm+RoPE kernel's
+/// arithmetic verbatim on that staged head. Per-row GEMV order, the input
+/// norm reduction, the per-head RMS sum, the shuffle pairing, and every BF16
+/// rounding boundary are unchanged, so the emitted tensors are bit-identical
+/// to the two-dispatch chain. Set `DARKBLOOM_FUSED_QKV_QK_NORM_ROPE=0` to
+/// ablate back to the two-kernel path.
+let lagunaFusedQKVQKNormRoPEEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV_QK_NORM_ROPE"] != "0"
+
 /// Sliding-layer per-head RMSNorm + plain RoPE fusion (see
 /// `lagunaSlidingQKNormRoPEKernel`).
 ///
@@ -1667,6 +1682,422 @@ func lagunaFusedNormQKVProjection(
     return (outputs[0], outputs[1], outputs[2], outputs[3])
 }
 
+/// One-dispatch decode pre-attention chain: input RMSNorm + Q/K/V/gate
+/// projections + per-head Q/K RMSNorm + RoPE (plain for sliding layers, YaRN
+/// partial-rotary for full-attention layers).
+///
+/// Exactness contract, stage by stage:
+///  * The input norm is the verbatim prologue of the v3 projection kernel.
+///    The group widens to 1024 threads, but only threads 0..511 square and
+///    normalize (same elements, same order); simdgroups 16..31 contribute
+///    exactly the `+0.0f` their `local_sums` slots already held in the v3
+///    kernel, and the ascending 32-slot `simd_sum` in simdgroup 0 therefore
+///    reduces the identical multiset in the identical slot order.
+///  * Every projection row keeps the v3 per-simdgroup GEMV: lane `l` owns
+///    columns `4l + 128b`, accumulates in strict `(block, i)` order into one
+///    FP32 register per row, reduces with the same `simd_shuffle_down`
+///    ladder, and rounds once to BF16. Widening a tile from 16 to 32
+///    simdgroups only changes WHICH THREADGROUP OWNS WHICH ROW, never a
+///    row's own arithmetic.
+///  * Q/K tiles stage those rounded BF16 rows in threadgroup memory instead
+///    of device memory. The standalone QK-norm+RoPE kernel read
+///    `float(input[...])` back from a device row the projection had written
+///    with the same rounding; `float(raw_head[...])` observes bit-identical
+///    values.
+///  * The per-head tail is the standalone kernel's source with only the
+///    input pointer renamed: same per-lane square order, same `simd_sum`,
+///    same `precise::rsqrt`, same load-bearing `bfloat(...)` rounding inside
+///    the weight multiply, same `simd_shuffle` pairing (`lane ^ 16` sliding,
+///    `lane ^ 8` YaRN), same writer-lane partition, same mscale rounding
+///    boundaries on the YaRN path.
+///  * V tiles and gate tiles are unchanged v3 code; gate tiles keep their
+///    two eight-simdgroup split-K groups and simdgroups 16..31 ride through
+///    the gate barrier without touching memory.
+private func lagunaFusedQKVQKNormRoPESource(heads: Int) -> String {
+    let isSliding = heads == LagunaConstants.slidingAttentionHeads
+    let ropeTail: String
+    if isSliding {
+        ropeTail = """
+                constexpr uint rotary_pairs = 64;
+                thread float qk_paired[4];
+                for (uint i = 0; i < 4; ++i) {
+                    qk_paired[i] = simd_shuffle(float(qk_normalized[i]), lane ^ 16);
+                }
+                if (lane < 16) {
+                    for (uint i = 0; i < 4; ++i) {
+                        uint pair = qk_base + i;
+                        float first = float(qk_normalized[i]);
+                        float second = qk_paired[i];
+                        float cosine = angles[pair];
+                        float sine = angles[pair + rotary_pairs];
+                        out_ptr[pair] = bfloat(first * cosine - second * sine);
+                        out_ptr[pair + rotary_pairs] =
+                            bfloat(first * sine + second * cosine);
+                    }
+                }
+        """
+    } else {
+        ropeTail = """
+                constexpr uint rotary_pairs = 32;
+                constexpr float yarn_mscale = 1.3465735912322998f;
+                thread float qk_paired[4];
+                for (uint i = 0; i < 4; ++i) {
+                    qk_paired[i] = simd_shuffle(float(qk_normalized[i]), lane ^ 8);
+                }
+                if (lane < 8) {
+                    bfloat rounded_mscale = bfloat(yarn_mscale);
+                    for (uint i = 0; i < 4; ++i) {
+                        uint pair = qk_base + i;
+                        float first =
+                            float(bfloat(qk_normalized[i] * rounded_mscale));
+                        float second =
+                            float(bfloat(bfloat(qk_paired[i]) * rounded_mscale));
+                        float cosine = angles[pair];
+                        float sine = angles[pair + rotary_pairs];
+                        out_ptr[pair] = bfloat(first * cosine - second * sine);
+                        out_ptr[pair + rotary_pairs] =
+                            bfloat(first * sine + second * cosine);
+                    }
+                } else if (lane >= 16) {
+                    for (uint i = 0; i < 4; ++i) {
+                        out_ptr[qk_base + i] = qk_normalized[i];
+                    }
+                }
+        """
+    }
+    return """
+        constexpr uint in_vec_size = \(LagunaConstants.hiddenSize);
+        constexpr uint head_dim = \(LagunaConstants.headDim);
+        constexpr uint query_rows = \(heads * LagunaConstants.headDim);
+        constexpr uint kv_rows =
+            \(LagunaConstants.numKeyValueHeads * LagunaConstants.headDim);
+        constexpr uint rows_per_thread = 4;
+        constexpr uint values_per_thread = 4;
+        constexpr uint block_width = 128;
+        constexpr uint blocks = in_vec_size / block_width;
+        constexpr uint rows_per_group = 128;
+        constexpr uint query_tiles = query_rows / rows_per_group;
+        constexpr uint kv_tiles = kv_rows / rows_per_group;
+        constexpr uint gate_tiles = \(heads / 8);
+        constexpr uint query_tiles_per_round = query_tiles / kv_tiles;
+        constexpr float norm_eps = 1.0e-6f;
+
+        // Same K/V/gate-before-Q interleaving bijection as the v3 kernel,
+        // over the widened 128-row tiles.
+        uint scheduled_tile = threadgroup_position_in_grid.x;
+        uint round;
+        uint position;
+        constexpr uint gated_round_width = query_tiles_per_round + 3;
+        constexpr uint plain_round_width = query_tiles_per_round + 2;
+        constexpr uint gated_span = gate_tiles * gated_round_width;
+        bool round_has_gate = scheduled_tile < gated_span;
+        if (round_has_gate) {
+            round = scheduled_tile / gated_round_width;
+            position = scheduled_tile % gated_round_width;
+        } else {
+            uint tail = scheduled_tile - gated_span;
+            round = gate_tiles + tail / plain_round_width;
+            position = tail % plain_round_width;
+        }
+
+        uint tile;
+        if (position == 0) {
+            tile = query_tiles + round;
+        } else if (position == 1) {
+            tile = query_tiles + kv_tiles + round;
+        } else if (round_has_gate && position == 2) {
+            tile = query_tiles + 2 * kv_tiles + round;
+        } else {
+            uint projection_prefix = round_has_gate ? 3u : 2u;
+            uint query_position = position - projection_prefix;
+            tile = round * query_tiles_per_round + query_position;
+        }
+
+        uint local_id = thread_position_in_threadgroup.x;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        // --- input RMSNorm, verbatim v3 prologue on threads 0..511 ---
+        \(lagunaNormInvMeanScratch)
+        threadgroup float local_sums[32];
+        threadgroup bfloat normalized_row[in_vec_size];
+        threadgroup bfloat raw_head[rows_per_group];
+
+        uint norm_base = local_id * values_per_thread;
+        thread float raw[values_per_thread];
+        float acc = 0.0f;
+        if (local_id < in_vec_size / values_per_thread) {
+            for (uint i = 0; i < values_per_thread; ++i) {
+                raw[i] = float(residual[norm_base + i]);
+                acc += raw[i] * raw[i];
+            }
+        }
+        acc = simd_sum(acc);
+        \(lagunaNormReductionTailQKV)
+
+        if (local_id < in_vec_size / values_per_thread) {
+            for (uint i = 0; i < values_per_thread; ++i) {
+                bfloat value =
+                    norm_weight[norm_base + i] *
+                    bfloat(raw[i] * laguna_inv_mean);
+                normalized_row[norm_base + i] = value;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- per-head gate projection, v3 code on simdgroups 0..15 ---
+        constexpr uint gate_simds = 8;
+        constexpr uint gate_block_width = 1024;
+        constexpr uint gate_blocks = in_vec_size / gate_block_width;
+        constexpr uint qkv_tiles = query_tiles + 2 * kv_tiles;
+
+        threadgroup float gate_partials[2 * gate_simds * rows_per_thread];
+
+        if (tile >= qkv_tiles) {
+            bool gate_active = simd_group < 2 * gate_simds;
+            uint gate_half = simd_group / gate_simds;
+            uint split = simd_group % gate_simds;
+            uint gate_row =
+                ((tile - qkv_tiles) * 2 + gate_half) * rows_per_thread;
+
+            thread float gate_result[rows_per_thread] = {
+                0.0f, 0.0f, 0.0f, 0.0f
+            };
+            if (gate_active) {
+                thread float gate_input[values_per_thread];
+
+                uint gate_column =
+                    (split * 32 + lane) * values_per_thread;
+                for (uint block = 0; block < gate_blocks; ++block) {
+                    for (uint i = 0; i < values_per_thread; ++i) {
+                        gate_input[i] = float(normalized_row[gate_column + i]);
+                    }
+                    for (uint r = 0; r < rows_per_thread; ++r) {
+                        const device vec<bfloat, 4>* row_values =
+                            (const device vec<bfloat, 4>*)(
+                                gate_weight + (gate_row + r) * in_vec_size +
+                                    gate_column);
+                        const vec<bfloat, 4> gw = row_values[0];
+                        for (uint i = 0; i < values_per_thread; ++i) {
+                            gate_result[r] += float(gw[i]) * gate_input[i];
+                        }
+                    }
+                    gate_column += gate_block_width;
+                }
+
+                for (uint r = 0; r < rows_per_thread; ++r) {
+                    for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                        gate_result[r] +=
+                            metal::simd_shuffle_down(gate_result[r], delta);
+                    }
+                }
+                if (lane == 0) {
+                    for (uint r = 0; r < rows_per_thread; ++r) {
+                        gate_partials[
+                            (gate_half * gate_simds + split) * rows_per_thread + r
+                        ] = gate_result[r];
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (gate_active && split == 0 && lane == 0) {
+                for (uint r = 0; r < rows_per_thread; ++r) {
+                    float total = gate_result[r];
+                    for (uint sgn = 1; sgn < gate_simds; ++sgn) {
+                        total += gate_partials[
+                            (gate_half * gate_simds + sgn) * rows_per_thread + r
+                        ];
+                    }
+                    bfloat rounded_logit = bfloat(total);
+                    float logit = float(rounded_logit);
+                    float gate;
+                    if (metal::isnan(logit)) {
+                        gate = NAN;
+                    } else {
+                        float maxval = metal::max(logit, 0.0f);
+                        float minval = metal::min(logit, 0.0f);
+                        gate = (metal::isinf(minval) || metal::isinf(maxval))
+                            ? maxval
+                            : maxval + log1p(metal::exp(minval - maxval));
+                    }
+                    gate_values[gate_row + r] = bfloat(gate);
+                }
+            }
+            return;
+        }
+
+        // --- projections, verbatim v3 per-simdgroup GEMV ---
+        uint global_row = tile * rows_per_group + simd_group * rows_per_thread;
+
+        bool is_query_tile = tile < query_tiles;
+        bool is_key_tile = !is_query_tile && tile < query_tiles + kv_tiles;
+
+        const device bfloat* weight;
+        uint row_base;
+        if (is_query_tile) {
+            weight = query_weight;
+            row_base = global_row;
+        } else if (is_key_tile) {
+            weight = key_weight;
+            row_base = global_row - query_rows;
+        } else {
+            weight = value_weight;
+            row_base = global_row - query_rows - kv_rows;
+        }
+
+        thread float result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread float coefficients[values_per_thread];
+
+        uint column = lane * values_per_thread;
+        for (uint block = 0; block < blocks; ++block) {
+            for (uint i = 0; i < values_per_thread; ++i) {
+                coefficients[i] = float(normalized_row[column + i]);
+            }
+
+            for (uint row = 0; row < rows_per_thread; ++row) {
+                const device vec<bfloat, 4>* row_values =
+                    (const device vec<bfloat, 4>*)(
+                        weight + (row_base + row) * in_vec_size + column);
+                const vec<bfloat, 4> w = row_values[0];
+                for (uint i = 0; i < values_per_thread; ++i) {
+                    result[row] += float(w[i]) * coefficients[i];
+                }
+            }
+
+            column += block_width;
+        }
+
+        for (uint row = 0; row < rows_per_thread; ++row) {
+            for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                result[row] += metal::simd_shuffle_down(result[row], delta);
+            }
+        }
+
+        if (is_query_tile || is_key_tile) {
+            // Stage the rounded BF16 head, then replay the standalone
+            // QK-norm+RoPE kernel on simdgroup 0.
+            if (lane == 0) {
+                for (uint row = 0; row < rows_per_thread; ++row) {
+                    raw_head[simd_group * rows_per_thread + row] =
+                        bfloat(result[row]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group == 0) {
+                const device bfloat* qk_weight;
+                device bfloat* out_ptr;
+                if (is_query_tile) {
+                    qk_weight = qk_query_norm_weight;
+                    out_ptr = queries + tile * head_dim;
+                } else {
+                    qk_weight = qk_key_norm_weight;
+                    out_ptr = keys + (tile - query_tiles) * head_dim;
+                }
+
+                uint qk_base = lane * 4;
+                thread bfloat qk_normalized[4];
+                float qk_sum = 0.0f;
+                for (uint i = 0; i < 4; ++i) {
+                    float value = float(raw_head[qk_base + i]);
+                    qk_sum += value * value;
+                }
+                qk_sum = simd_sum(qk_sum);
+                float inverse_rms =
+                    metal::precise::rsqrt(qk_sum / 128.0f + 1.0e-6f);
+
+                for (uint i = 0; i < 4; ++i) {
+                    qk_normalized[i] =
+                        qk_weight[qk_base + i] *
+                        bfloat(float(raw_head[qk_base + i]) * inverse_rms);
+                }
+
+        \(ropeTail)
+            }
+        } else {
+            if (lane == 0) {
+                for (uint row = 0; row < rows_per_thread; ++row) {
+                    values[row_base + row] = bfloat(result[row]);
+                }
+            }
+        }
+        """
+}
+
+private let lagunaFusedQKVQKNormRoPEKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_fused_norm_qkv_qk_norm_rope_bf16_h\(heads)_v1",
+            inputNames: [
+                "residual", "norm_weight", "query_weight", "key_weight",
+                "value_weight", "gate_weight", "qk_query_norm_weight",
+                "qk_key_norm_weight", "angles",
+            ],
+            outputNames: ["queries", "keys", "values", "gate_values"],
+            source: lagunaFusedQKVQKNormRoPESource(heads: heads),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+func lagunaFusedNormQKVQKNormRoPE(
+    residual: MLXArray,
+    normWeight: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    valueWeight: MLXArray,
+    gateWeight: MLXArray,
+    qkQueryNormWeight: MLXArray,
+    qkKeyNormWeight: MLXArray,
+    angles: MLXArray,
+    heads: Int
+) -> (
+    queries: MLXArray, keys: MLXArray, values: MLXArray, gateValues: MLXArray
+)? {
+    guard let kernel = lagunaFusedQKVQKNormRoPEKernels[heads] else { return nil }
+    let hidden = LagunaConstants.hiddenSize
+    let headDim = LagunaConstants.headDim
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    let queryRows = heads * headDim
+    let kvRows = kvHeads * headDim
+    let isSliding = heads == LagunaConstants.slidingAttentionHeads
+    precondition(residual.dtype == .bfloat16)
+    precondition(residual.shape == [1, 1, hidden])
+    precondition(normWeight.dtype == .bfloat16)
+    precondition(normWeight.shape == [hidden])
+    precondition(queryWeight.shape == [queryRows, hidden])
+    precondition(keyWeight.shape == [kvRows, hidden])
+    precondition(valueWeight.shape == [kvRows, hidden])
+    precondition(gateWeight.dtype == .bfloat16)
+    precondition(gateWeight.shape == [heads, hidden])
+    precondition(qkQueryNormWeight.dtype == .bfloat16)
+    precondition(qkQueryNormWeight.shape == [headDim])
+    precondition(qkKeyNormWeight.dtype == .bfloat16)
+    precondition(qkKeyNormWeight.shape == [headDim])
+    precondition(angles.dtype == .float32)
+    precondition(angles.shape == [1, 1, 1, isSliding ? headDim : headDim / 2])
+
+    // 128-row Q/K/V tiles (one complete head each) plus the v3 gate tiles.
+    let projectionTiles = (queryRows + 2 * kvRows) / 128
+    let gateTiles = heads / 8
+    lagunaTrace("norm+qkv+gate+qknorm+rope projection h\(heads)")
+    let outputs = kernel(
+        [
+            residual, normWeight, queryWeight, keyWeight, valueWeight,
+            gateWeight, qkQueryNormWeight, qkKeyNormWeight, angles,
+        ],
+        grid: ((projectionTiles + gateTiles) * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [
+            [1, heads, 1, headDim], [1, kvHeads, 1, headDim],
+            [1, 1, kvRows], [1, 1, heads],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1], outputs[2], outputs[3])
+}
+
 /// Decode-only fusion of the per-head attention gate with the output
 /// projection. The stock decode path is two dispatches: one compiled
 /// elementwise kernel that softplus-gates the attention output, and one GEMV
@@ -2036,6 +2467,7 @@ final class LagunaRuntimeAttention: Module {
                 queries: MLXArray, keys: MLXArray, values: MLXArray,
                 gateValues: MLXArray
             )?
+        var fusedQKNormRoPEDone = false
         if lagunaFusedQKVProjectionEnabled, _fusedQKVWeight == nil,
             B == 1, L == 1,
             headDim == LagunaConstants.headDim,
@@ -2056,15 +2488,49 @@ final class LagunaRuntimeAttention: Module {
             gateProjection.weight.dtype == .bfloat16,
             gateProjection.weight.shape == [nHeads, LagunaConstants.hiddenSize]
         {
-            fusedNormQKV = lagunaFusedNormQKVProjection(
-                residual: input,
-                normWeight: inputNorm.weight,
-                queryWeight: wq.weight,
-                keyWeight: wk.weight,
-                valueWeight: wv.weight,
-                gateWeight: gateProjection.weight,
-                heads: nHeads
-            )
+            // Widened all-in-one variant: also folds the per-head Q/K
+            // RMSNorm + RoPE stage in when its inputs are the shapes the
+            // standalone kernels accept. Falls back to the v3 projection
+            // (with the standalone norm+rope dispatch after it) otherwise.
+            if lagunaFusedQKVQKNormRoPEEnabled,
+                isSliding
+                    ? lagunaFusedSlidingQKNormRoPEEnabled
+                        && nHeads == LagunaConstants.slidingAttentionHeads
+                    : lagunaFusedFullQKNormYaRNEnabled
+                        && nHeads == LagunaConstants.fullAttentionHeads,
+                qNorm.weight.dtype == .bfloat16,
+                qNorm.weight.shape == [LagunaConstants.headDim],
+                kNorm.weight.dtype == .bfloat16,
+                kNorm.weight.shape == [LagunaConstants.headDim],
+                let angles = qkRoPEAngles,
+                angles.dtype == .float32,
+                angles.shape == [1, 1, 1, isSliding ? headDim : headDim / 2],
+                let allInOne = lagunaFusedNormQKVQKNormRoPE(
+                    residual: input,
+                    normWeight: inputNorm.weight,
+                    queryWeight: wq.weight,
+                    keyWeight: wk.weight,
+                    valueWeight: wv.weight,
+                    gateWeight: gateProjection.weight,
+                    qkQueryNormWeight: qNorm.weight,
+                    qkKeyNormWeight: kNorm.weight,
+                    angles: angles,
+                    heads: nHeads
+                )
+            {
+                fusedNormQKV = allInOne
+                fusedQKNormRoPEDone = true
+            } else {
+                fusedNormQKV = lagunaFusedNormQKVProjection(
+                    residual: input,
+                    normWeight: inputNorm.weight,
+                    queryWeight: wq.weight,
+                    keyWeight: wk.weight,
+                    valueWeight: wv.weight,
+                    gateWeight: gateProjection.weight,
+                    heads: nHeads
+                )
+            }
         }
         // The fused result already contains every consumer of the normalized
         // row. Materialize that row only for the stock projections or the
@@ -2106,6 +2572,10 @@ final class LagunaRuntimeAttention: Module {
             values = wv(normalizedInput)
         }
 
+        // When the all-in-one kernel ran, queries/keys are already
+        // [1, H, 1, D], so none of the shape guards below can match; the
+        // `fusedQKNormRoPEDone` branch MUST stay first in the chain that
+        // follows or the per-head norm+RoPE would be applied twice.
         let fusedQKNormShapesMatch =
             B == 1 && L == 1 &&
             nKVHeads == LagunaConstants.numKeyValueHeads &&
@@ -2160,7 +2630,11 @@ final class LagunaRuntimeAttention: Module {
             qkRoPEAngles?.shape == [1, 1, lagunaRoPEAngleAtlasLength, headDim / 2]
 
         var qkNormRoPEFused = false
-        if useFusedFullQKNormYaRN, let qkRoPEAngles {
+        if fusedQKNormRoPEDone {
+            // queries/keys already left the all-in-one kernel normalized,
+            // rotated, and in the [B, H, 1, D] layout attention consumes.
+            qkNormRoPEFused = true
+        } else if useFusedFullQKNormYaRN, let qkRoPEAngles {
             (queries, keys) = lagunaFullQKNormYaRN(
                 rawQueries: queries,
                 rawKeys: keys,
