@@ -2446,6 +2446,7 @@ final class LagunaRuntimeAttention: Module {
     /// authoritative parameter and continues to serve prefill, the last-row
     /// prefill path, and every decode fallback.
     var _nativeAffineOProj: LagunaNativeAffineWeight?
+    var _nativeAffineQKVHasGate: Bool = false
 
     func prepareNativeAffineOProjWeight() -> [MLXArray] {
         guard _nativeAffineOProj == nil,
@@ -2468,19 +2469,44 @@ final class LagunaRuntimeAttention: Module {
         else {
             return []
         }
-        let packedCodes = concatenated(
-            [q.packedCodes, k.packedCodes, v.packedCodes], axis: 0)
-        let scales = concatenated([q.scales, k.scales, v.scales], axis: 0)
-        var biases: MLXArray?
+        var packedList = [q.packedCodes, k.packedCodes, v.packedCodes]
+        var scaleList = [q.scales, k.scales, v.scales]
+        var biasList: [MLXArray]?
         if let qb = q.biases, let kb = k.biases, let vb = v.biases {
-            biases = concatenated([qb, kb, vb], axis: 0)
+            biasList = [qb, kb, vb]
+        }
+        var totalRows = wq.weight.dim(0) + wk.weight.dim(0) + wv.weight.dim(0)
+        var hasGate = false
+
+        if ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_GATE"] != "0",
+            gatingEnabled, gatePerHead,
+            let gateProj = gProj, gateProj.bias == nil,
+            type(of: gateProj) == Linear.self,
+            gateProj.weight.shape == [nHeads, LagunaConstants.hiddenSize],
+            let g = lagunaNativeAffineWeight(gateProj.weight, layer: layerIdx),
+            g.groupSize == q.groupSize, g.bits == q.bits, g.mode == q.mode
+        {
+            packedList.append(g.packedCodes)
+            scaleList.append(g.scales)
+            if let gb = g.biases, biasList != nil {
+                biasList?.append(gb)
+            }
+            totalRows += nHeads
+            hasGate = true
+        }
+
+        let packedCodes = concatenated(packedList, axis: 0)
+        let scales = concatenated(scaleList, axis: 0)
+        var biases: MLXArray?
+        if let bList = biasList {
+            biases = concatenated(bList, axis: 0)
         }
         let fused = LagunaNativeAffineWeight(
             packedCodes: packedCodes,
             scales: scales,
             biases: biases,
             originalShape: [
-                wq.weight.dim(0) + wk.weight.dim(0) + wv.weight.dim(0),
+                totalRows,
                 wq.weight.dim(1),
             ],
             groupSize: q.groupSize,
@@ -2488,6 +2514,7 @@ final class LagunaRuntimeAttention: Module {
             mode: q.mode
         )
         _nativeAffineQKV = fused
+        _nativeAffineQKVHasGate = hasGate
         return fused.arrays
     }
 
@@ -2618,7 +2645,12 @@ final class LagunaRuntimeAttention: Module {
                 )
                 let queryDim = nHeads * headDim
                 let kvDim = nKVHeads * headDim
-                let gateLogits = gateProjection(normalized)
+                let gateLogits: MLXArray
+                if _nativeAffineQKVHasGate {
+                    gateLogits = qkv[.ellipsis, (queryDim + 2 * kvDim) ..< (queryDim + 2 * kvDim + nHeads)]
+                } else {
+                    gateLogits = gateProjection(normalized)
+                }
                 let activatedGate =
                     softplus(gateLogits.asType(.float32)).asType(.bfloat16)
                 fusedNormQKV = (
