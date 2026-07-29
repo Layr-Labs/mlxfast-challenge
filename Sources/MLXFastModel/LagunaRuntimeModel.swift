@@ -289,9 +289,11 @@ private func lagunaUseNativeAffineQKV(layer: Int) -> Bool {
 /// changes nothing about the KV dependency or the cache contents.
 ///
 /// Decode only: prefill and every non-`[1, 1, ·]` call keep the BF16 parameter,
-/// which stays authoritative and resident. The first 16 layers are the
-/// acceptance-band-safe first chunk; later submissions can widen the same
-/// layout the way `DARKBLOOM_NATIVE_AFFINE_QKV_LAYERS` was widened.
+/// which stays authoritative and resident. Rolled out in acceptance-band-safe
+/// chunks like `DARKBLOOM_NATIVE_AFFINE_QKV_LAYERS`: first 16 layers, then 32;
+/// this chunk completes the layout across all 40 layers (the remaining 8
+/// o_proj weights, ~118 MB/token of BF16 reads converted to the same packed
+/// affine form already serving layers 0–31).
 ///
 /// Set `DARKBLOOM_NATIVE_AFFINE_OPROJ=0` (or `..._LAYERS=0`) to fall back to
 /// the exact stock gated projection inside the same binary.
