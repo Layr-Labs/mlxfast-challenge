@@ -288,6 +288,16 @@ let lagunaFusedQKVProjectionEnabled =
 let lagunaFusedSlidingQKNormRoPEEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_QK_NORM_ROPE"] != "0"
 
+/// `DARKBLOOM_FUSED_KV` (default ON; "0" restores split K/V caches): band-fused
+/// KV caches — K and V share one `[1, 16, S, 128]` buffer per layer and the
+/// decode-step cache update is a single stacked slice-write (one `gg2_copy`
+/// dispatch instead of two, 40 launches deleted per step). The stacked
+/// QK-norm+RoPE kernel twins produce byte-identical Q/K and a verbatim V
+/// copy; sdpa consumes zero-copy band views (its vector path takes explicit
+/// head/seq strides and requires only unit head-dim stride at B == 1).
+let lagunaFusedKVEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_KV"] != "0"
+
 /// Multi-token (prefill) twin of the two decode QK-norm+RoPE fusions above
 /// (see `lagunaPrefillSlidingQKNormRoPEKernel` /
 /// `lagunaPrefillFullQKNormYaRNKernel`). One dispatch per layer replaces the
@@ -940,6 +950,128 @@ func lagunaFullQKNormYaRN(
     return (outputs[0], outputs[1])
 }
 
+/// Stacked-output twin of `lagunaFullQKNormYaRNKernel` for the band-fused
+/// KV cache (`DARKBLOOM_FUSED_KV`): identical Q/K math, plus eight extra
+/// threadgroups that copy the value head rows verbatim into the V band, so
+/// the kernel emits the `[1, 16, 1, 128]` stacked row the cache writes with
+/// ONE slice-update instead of two. Q and K bytes are produced by the exact
+/// v4 instruction mix; V is a pure bit copy.
+private let lagunaFullQKNormYaRNStackedKernel = MLXFast.metalKernel(
+    name: "laguna_full_qk_norm_yarn_stacked_bf16_128_v1",
+    inputNames: ["raw_queries", "raw_keys", "raw_values", "query_weight", "key_weight", "angles"],
+    outputNames: ["queries", "keys_values"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint rotary_pairs = 32;
+        constexpr uint query_heads = 48;
+        constexpr uint kv_heads = 8;
+        constexpr float yarn_mscale = 1.3465735912322998f;
+
+        uint head = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+        uint base = lane * 4;
+
+        if (head >= query_heads + kv_heads) {
+            // V band: verbatim copy into keys_values heads 8..15.
+            const device bfloat* v_in =
+                raw_values + (head - query_heads - kv_heads) * head_dim;
+            device bfloat* v_out = keys_values + (head - query_heads) * head_dim;
+            for (uint i = 0; i < 4; ++i) {
+                v_out[base + i] = v_in[base + i];
+            }
+            return;
+        }
+
+        const device bfloat* input;
+        const device bfloat* weight;
+        if (head < query_heads) {
+            input = raw_queries + head * head_dim;
+            weight = query_weight;
+        } else {
+            input = raw_keys + (head - query_heads) * head_dim;
+            weight = key_weight;
+        }
+
+        thread bfloat normalized[4];
+        float sum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float value = float(input[base + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+        for (uint i = 0; i < 4; ++i) {
+            normalized[i] =
+                weight[base + i] *
+                bfloat(float(input[base + i]) * inverse_rms);
+        }
+
+        thread float paired[4];
+        for (uint i = 0; i < 4; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
+        }
+
+        device bfloat* output =
+            head < query_heads
+            ? queries + head * head_dim
+            : keys_values + (head - query_heads) * head_dim;
+        if (lane < 8) {
+            bfloat rounded_mscale = bfloat(yarn_mscale);
+            for (uint i = 0; i < 4; ++i) {
+                uint pair = base + i;
+                float first =
+                    float(bfloat(normalized[i] * rounded_mscale));
+                float second =
+                    float(bfloat(bfloat(paired[i]) * rounded_mscale));
+                float cosine = angles[pair];
+                float sine = angles[pair + rotary_pairs];
+                output[pair] = bfloat(first * cosine - second * sine);
+                output[pair + rotary_pairs] =
+                    bfloat(first * sine + second * cosine);
+            }
+        } else if (lane >= 16) {
+            for (uint i = 0; i < 4; ++i) {
+                output[base + i] = normalized[i];
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+func lagunaFullQKNormYaRNStacked(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    rawValues: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray
+) -> (MLXArray, MLXArray) {
+    precondition(rawQueries.dtype == .bfloat16)
+    precondition(rawKeys.dtype == .bfloat16)
+    precondition(rawValues.dtype == .bfloat16)
+    precondition(rawQueries.shape == [1, 1, 48 * LagunaConstants.headDim])
+    precondition(rawKeys.shape == [1, 1, 8 * LagunaConstants.headDim])
+    precondition(rawValues.shape == [1, 1, 8 * LagunaConstants.headDim])
+    precondition(queryWeight.shape == [LagunaConstants.headDim])
+    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(angles.dtype == .float32)
+    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim / 2])
+
+    lagunaTrace("full qk norm+yarn (stacked kv)")
+    let outputs = lagunaFullQKNormYaRNStackedKernel(
+        [rawQueries, rawKeys, rawValues, queryWeight, keyWeight, angles],
+        grid: (64 * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [
+            [1, 48, 1, LagunaConstants.headDim],
+            [1, 16, 1, LagunaConstants.headDim],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
 /// Sliding-layer twin of the full-attention QK-norm+RoPE kernel above. The
 /// thirty sliding layers carry plain RoPE -- the whole 128-element head
 /// rotates, the angle scale is one, and there is no YaRN mscale -- so their
@@ -1060,6 +1192,118 @@ func lagunaSlidingQKNormRoPE(
         outputShapes: [
             [1, heads, 1, LagunaConstants.headDim],
             [1, kvHeads, 1, LagunaConstants.headDim],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
+/// Stacked-output twin of `lagunaSlidingQKNormRoPEKernel` for the band-fused
+/// KV cache: identical Q/K math plus a verbatim V-band copy, emitting the
+/// `[1, 16, 1, 128]` row the fused ring writes with one slice-update.
+private let lagunaSlidingQKNormRoPEStackedKernel = MLXFast.metalKernel(
+    name: "laguna_sliding_qk_norm_rope_stacked_bf16_128_v1",
+    inputNames: ["raw_queries", "raw_keys", "raw_values", "query_weight", "key_weight", "angles"],
+    outputNames: ["queries", "keys_values"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint rotary_pairs = 64;
+        constexpr uint query_heads = 64;
+        constexpr uint kv_heads = 8;
+
+        uint head = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+        uint base = lane * 4;
+
+        if (head >= query_heads + kv_heads) {
+            const device bfloat* v_in =
+                raw_values + (head - query_heads - kv_heads) * head_dim;
+            device bfloat* v_out = keys_values + (head - query_heads) * head_dim;
+            for (uint i = 0; i < 4; ++i) {
+                v_out[base + i] = v_in[base + i];
+            }
+            return;
+        }
+
+        const device bfloat* input;
+        const device bfloat* weight;
+        if (head < query_heads) {
+            input = raw_queries + head * head_dim;
+            weight = query_weight;
+        } else {
+            input = raw_keys + (head - query_heads) * head_dim;
+            weight = key_weight;
+        }
+
+        thread bfloat normalized[4];
+        float sum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float value = float(input[base + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+        for (uint i = 0; i < 4; ++i) {
+            normalized[i] =
+                weight[base + i] *
+                bfloat(float(input[base + i]) * inverse_rms);
+        }
+
+        thread float paired[4];
+        for (uint i = 0; i < 4; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
+        }
+
+        device bfloat* output =
+            head < query_heads
+            ? queries + head * head_dim
+            : keys_values + (head - query_heads) * head_dim;
+        if (lane < 16) {
+            for (uint i = 0; i < 4; ++i) {
+                uint pair = base + i;
+                float first = float(normalized[i]);
+                float second = paired[i];
+                float cosine = angles[pair];
+                float sine = angles[pair + rotary_pairs];
+                output[pair] = bfloat(first * cosine - second * sine);
+                output[pair + rotary_pairs] =
+                    bfloat(first * sine + second * cosine);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+func lagunaSlidingQKNormRoPEStacked(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    rawValues: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray
+) -> (MLXArray, MLXArray) {
+    let heads = LagunaConstants.slidingAttentionHeads
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    precondition(rawQueries.dtype == .bfloat16)
+    precondition(rawKeys.dtype == .bfloat16)
+    precondition(rawValues.dtype == .bfloat16)
+    precondition(rawQueries.shape == [1, 1, heads * LagunaConstants.headDim])
+    precondition(rawKeys.shape == [1, 1, kvHeads * LagunaConstants.headDim])
+    precondition(rawValues.shape == [1, 1, kvHeads * LagunaConstants.headDim])
+    precondition(queryWeight.shape == [LagunaConstants.headDim])
+    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(angles.dtype == .float32)
+    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim])
+
+    lagunaTrace("sliding qk norm+rope (stacked kv)")
+    let outputs = lagunaSlidingQKNormRoPEStackedKernel(
+        [rawQueries, rawKeys, rawValues, queryWeight, keyWeight, angles],
+        grid: ((heads + 2 * kvHeads) * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [
+            [1, heads, 1, LagunaConstants.headDim],
+            [1, 2 * kvHeads, 1, LagunaConstants.headDim],
         ],
         outputDTypes: [.bfloat16, .bfloat16]
     )
@@ -2159,8 +2403,47 @@ final class LagunaRuntimeAttention: Module {
             nHeads == LagunaConstants.fullAttentionHeads &&
             qkRoPEAngles?.shape == [1, 1, lagunaRoPEAngleAtlasLength, headDim / 2]
 
+        // Band-fused KV decode path (`DARKBLOOM_FUSED_KV`): the stacked
+        // kernel twin emits `[1, 16, 1, 128]` (K band roped, V band verbatim)
+        // and the fused cache commits it with ONE slice-update dispatch,
+        // deleting the second per-layer cache write. Values are consumed
+        // pre-reshape (`[1, 1, 1024]` row-contiguous). Any guard mismatch
+        // falls through to the stock two-write chain below.
+        var stackedKV: MLXArray?
         var qkNormRoPEFused = false
-        if useFusedFullQKNormYaRN, let qkRoPEAngles {
+        if useFusedFullQKNormYaRN, let qkRoPEAngles,
+            lagunaFusedKVEnabled, cache is BandFusedKVCache,
+            values.dtype == .bfloat16,
+            values.shape == [1, 1, nKVHeads * headDim]
+        {
+            let (q, kv) = lagunaFullQKNormYaRNStacked(
+                rawQueries: queries,
+                rawKeys: keys,
+                rawValues: values,
+                queryWeight: qNorm.weight,
+                keyWeight: kNorm.weight,
+                angles: qkRoPEAngles
+            )
+            queries = q
+            stackedKV = kv
+            qkNormRoPEFused = true
+        } else if useFusedSlidingQKNormRoPE, let qkRoPEAngles,
+            lagunaFusedKVEnabled, cache is BandFusedKVCache,
+            values.dtype == .bfloat16,
+            values.shape == [1, 1, nKVHeads * headDim]
+        {
+            let (q, kv) = lagunaSlidingQKNormRoPEStacked(
+                rawQueries: queries,
+                rawKeys: keys,
+                rawValues: values,
+                queryWeight: qNorm.weight,
+                keyWeight: kNorm.weight,
+                angles: qkRoPEAngles
+            )
+            queries = q
+            stackedKV = kv
+            qkNormRoPEFused = true
+        } else if useFusedFullQKNormYaRN, let qkRoPEAngles {
             (queries, keys) = lagunaFullQKNormYaRN(
                 rawQueries: queries,
                 rawKeys: keys,
@@ -2216,24 +2499,38 @@ final class LagunaRuntimeAttention: Module {
         // `[B, H, 1, D]` have the same contiguous byte order. Reshape
         // directly so decode does not carry a no-op transpose view through
         // the lazy graph. Multi-token calls still require the real axis swap.
-        values =
-            L == 1
-            ? values.reshaped(B, nKVHeads, L, headDim)
-            : values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
+        if stackedKV == nil {
+            values =
+                L == 1
+                ? values.reshaped(B, nKVHeads, L, headDim)
+                : values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
+        }
 
         if !qkNormRoPEFused {
             queries = applyRotaryPosition(rope, to: queries, cache: cache)
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
-        let attended = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
-        )
+        let attended: MLXArray
+        if let stackedKV, let fusedCache = cache as? BandFusedKVCache {
+            let (cachedKeys, cachedValues) = fusedCache.updateStacked(stackedKV)
+            attended = MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: cachedKeys,
+                values: cachedValues,
+                scale: scale,
+                mask: mask
+            )
+        } else {
+            attended = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
+        }
         // SDPA returns `[B, H, L, D]`. When `L == 1`, flattening its
         // contiguous head-major payload directly produces the exact
         // `[B, 1, H*D]` byte order; the transpose only changes singleton-axis
@@ -5843,9 +6140,11 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     public func newCache(parameters _: GenerateParameters?) -> [KVCache] {
         (0..<configuration.numHiddenLayers).map { layerIndex in
             if configuration.layerTypes[layerIndex] == .full {
-                StandardKVCache()
+                lagunaFusedKVEnabled ? FusedKVCacheSimple() : StandardKVCache()
             } else {
-                RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
+                lagunaFusedKVEnabled
+                    ? FusedRotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
+                    : RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
             }
         }
     }
