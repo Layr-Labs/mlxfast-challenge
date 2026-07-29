@@ -45,6 +45,19 @@ import MLXFast
 //      token is the stock token.
 // The threshold beta widens the candidate set slightly vs the raw lower bound
 // L; it is the BF16-cast safety margin from the assembly proof.
+//
+// SINCE `DARKBLOOM_NATIVE_AFFINE_LMHEAD` (default ON) the EXACT pass is served
+// by `lagunaLmHeadExactAffineKernel`, which is the same kernel over a group-32
+// affine INT8 side copy instead of the BF16 parameter, so a surviving row's
+// value is no longer bit-identical to the stock GEMV's -- it carries the same
+// quantization perturbation the promoted attention layouts carry, measured
+// ~36x smaller (see that flag's doc comment). Steps 1 and 2 above -- the coarse
+// GEMV, the certified bound, the threshold and the candidate mask -- are
+// untouched, so the certificate's actual guarantee is intact: the true argmax
+// row is always a candidate, and every non-candidate stays at least |L|/64
+// below it, which is an order of magnitude more than the finalist
+// perturbation. Set the flag to "0" for the bit-identical BF16 finalist pass in
+// the same binary.
 
 private let lagunaLmHeadPruneVocab = 100_352
 private let lagunaLmHeadPruneHidden = 2048
@@ -56,6 +69,44 @@ private let lagunaLmHeadPruneHidden = 2048
 /// stock full lm_head pass.
 let lagunaLmHeadPruneEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_LM_HEAD_PRUNE"] != "0"
+
+/// Decode-side group-32 affine INT8 side copy of `lm_head`, read by the
+/// FINALIST (exact) pass only. DEFAULT ON; `DARKBLOOM_NATIVE_AFFINE_LMHEAD=0`
+/// restores the byte-identical BF16 finalist pass inside the same binary.
+///
+/// The scan is untouched: the coarse GEMV, its certified bound, the threshold
+/// and the candidate mask are bit-for-bit the shipped ones, so the true argmax
+/// row still provably reaches the finalist pass (the certificate only needs
+/// `c_i + delta_i >= L - |L|/64` to be evaluated on the same numbers, and it
+/// is). What changes is only the VALUE a surviving row is scored with: instead
+/// of the stock BF16 GEMV it gets the same GEMV over the INT8 side copy. The
+/// resulting perturbation can therefore only reorder near-ties among
+/// survivors, and it is the same perturbation class the promoted attention
+/// layouts already ship, ~36x smaller. Measured on the public 512-token
+/// fixture, 129 teacher-forced positions, this flag against itself: top-1/top-2
+/// DIFFERENTIAL rms 0.040 logits (max 0.125 = one BF16 ulp) against a
+/// copy-regime p5 top-2 gap of 1.400 and a median of 6.125; 0/129 flips, and
+/// the OFF arm's token stays strict top-1 at 129/129 positions. The attention
+/// INT8 stack spends 1.47 at the same measure -- a logit perturbation applied
+/// at the head has no downstream layers to amplify it.
+///
+/// A non-candidate row can never overtake the winner either: it keeps its
+/// coarse BF16 value, which the certificate places at least `|L|/64` (~0.3-0.5
+/// logits here) below the true maximum, an order of magnitude above the
+/// finalist perturbation.
+///
+/// Decode only: prefill and the `DARKBLOOM_LM_HEAD_PRUNE=0` fallback keep the
+/// authoritative BF16 `lm_head` parameter.
+let lagunaLmHeadFinalistAffineEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_LMHEAD"] != "0"
+
+/// Measurement-only survivor census. `DARKBLOOM_LMHEAD_PRUNE_STATS=1` makes
+/// every pruned decode step evaluate and print the candidate-row count and the
+/// number of four-row simdgroup blocks the finalist pass actually reads, which
+/// is what turns into finalist weight traffic. Off by default (it forces a
+/// host sync per token and adds two reductions).
+private let lagunaLmHeadPruneStats =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_PRUNE_STATS"] == "1"
 
 /// Kernel header: bit-exact MXFP8 element decoders + the certified
 /// half-cell-width table, all inlinable and libm-free.
@@ -368,6 +419,101 @@ private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Finalist pass over the group-32 affine INT8 side copy (see
+/// `lagunaLmHeadFinalistAffineEnabled`). Structurally identical to
+/// `lagunaLmHeadExactKernel` -- same grid, same fixed four-row block per
+/// simdgroup, same candidate test, same coarse fallback, same lane partition
+/// (lane `l` covers columns `4l + 128i`), same sequential FP32 accumulation
+/// order and the same `simd_shuffle_down` ladder -- so the only difference is
+/// where a surviving row's weights come from.
+///
+/// The lane partition and the group size line up exactly: lane `l`'s four
+/// columns `4l..4l+3` never straddle a 32-element group, so each `(lane, i)`
+/// step reads one packed word (four codes) and that word's single
+/// `(scale, bias)` pair. Dequantization is MLX's affine form
+/// `w = scale * code + bias` (quantized.cpp `affine_dequantize`, bits == 8:
+/// one byte per value, little-endian within the packed word), evaluated in
+/// FP32 so the surviving row's arithmetic keeps the stock accumulation
+/// structure and only the weight values change.
+///
+/// Traffic per scored row: 2048 code bytes + 64 x (2 + 2) scale/bias bytes =
+/// 2304 B against the BF16 pass's 4096 B (9 bits/value vs 16, -43.75%).
+private let lagunaLmHeadExactAffineKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_block_affine_v1",
+    inputNames: ["coarse_bf", "codes", "scales", "biases", "x", "is_cand"],
+    outputNames: ["assembled"],
+    source: """
+        constexpr uint VOCAB = 100352;
+        constexpr uint WORDS = 512;   // 2048 codes / 4 per packed word
+        constexpr uint GROUPS = 64;   // 2048 codes / 32 per group
+
+        uint tgid = threadgroup_position_in_grid.x;
+        uint sgid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        uint base = tgid * 32 + sgid * 4;
+
+        bool any_candidate = false;
+        #pragma unroll
+        for (uint tm = 0; tm < 4; ++tm) {
+            uint r = base + tm;
+            any_candidate = any_candidate || (r < VOCAB && is_cand[r] != 0);
+        }
+
+        if (!any_candidate) {
+            if (lane < 4 && base + lane < VOCAB) {
+                assembled[base + lane] = coarse_bf[base + lane];
+            }
+            return;
+        }
+
+        thread float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread float v_coeff[4];
+        uint bn = lane * 4;
+        for (uint i = 0; i < 16; ++i) {
+            vec<bfloat, 4> xv =
+                *((const device vec<bfloat, 4>*)(x + bn));
+            v_coeff[0] = float(xv.x);
+            v_coeff[1] = float(xv.y);
+            v_coeff[2] = float(xv.z);
+            v_coeff[3] = float(xv.w);
+            uint widx = bn >> 2;
+            uint g = bn >> 5;
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                size_t r = size_t(base + tm);
+                uint packed = codes[r * WORDS + widx];
+                float sc = float(scales[r * GROUPS + g]);
+                float bi = float(biases[r * GROUPS + g]);
+                result[tm] += (sc * float(packed & 255u) + bi) * v_coeff[0];
+                result[tm] += (sc * float((packed >> 8) & 255u) + bi) * v_coeff[1];
+                result[tm] += (sc * float((packed >> 16) & 255u) + bi) * v_coeff[2];
+                result[tm] += (sc * float((packed >> 24) & 255u) + bi) * v_coeff[3];
+            }
+            bn += 128;
+        }
+        #pragma unroll
+        for (uint tm = 0; tm < 4; ++tm) {
+            #pragma unroll
+            for (ushort sn = 16; sn >= 1; sn >>= 1) {
+                result[tm] += simd_shuffle_down(result[tm], sn);
+            }
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                uint r = base + tm;
+                if (r < VOCAB) {
+                    assembled[r] = (is_cand[r] != 0)
+                        ? bfloat(result[tm])
+                        : coarse_bf[r];
+                }
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 /// Retained init-time MXFP8 coarse copy of lm_head plus the pruned decode
 /// forward. Built once (untimed init) by
 /// `LagunaRuntimeModel.prepareFusedRuntimeWeights` when
@@ -376,6 +522,19 @@ private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
 final class LagunaLmHeadPruner {
     let codes: MLXArray   // [100352, 2048] uint8 e4m3 elements
     let scales: MLXArray  // [100352, 64] uint8 e8m0 group scales
+
+    /// Group-32 affine INT8 side copy read by the FINALIST pass only, when
+    /// `DARKBLOOM_NATIVE_AFFINE_LMHEAD` is on. `nil` keeps the exact BF16
+    /// finalist pass. Codes are uint32 [100352, 512] (four 8-bit codes per
+    /// word); scales/biases are BF16 [100352, 64].
+    let affineCodes: MLXArray?
+    let affineScales: MLXArray?
+    let affineBiases: MLXArray?
+
+    /// Arrays that must be materialized before the first scored forward.
+    var residentArrays: [MLXArray] {
+        [codes, scales] + [affineCodes, affineScales, affineBiases].compactMap { $0 }
+    }
 
     init?(lmHeadWeight: MLXArray) {
         guard lmHeadWeight.shape == [lagunaLmHeadPruneVocab, lagunaLmHeadPruneHidden],
@@ -394,6 +553,39 @@ final class LagunaLmHeadPruner {
             lmHeadWeight, groupSize: 32, bits: 8, mode: .mxfp8)
         self.codes = wq.view(dtype: .uint8)
         self.scales = scales
+
+        // FINALIST-pass side copy. Same group-32 affine INT8 the promoted
+        // attention layouts use (`w = scale * code + bias`, one byte per
+        // value), built from the same materialized BF16 parameter. The scan
+        // above is not re-derived from it in any way.
+        if lagunaLmHeadFinalistAffineEnabled {
+            let (aq, ascales, abiases) = quantized(
+                lmHeadWeight, groupSize: 32, bits: 8, mode: .affine)
+            if let abiases,
+                aq.dtype == .uint32,
+                aq.shape == [lagunaLmHeadPruneVocab, lagunaLmHeadPruneHidden / 4],
+                ascales.dtype == .bfloat16,
+                abiases.dtype == .bfloat16,
+                ascales.shape == [lagunaLmHeadPruneVocab, lagunaLmHeadPruneHidden / 32],
+                abiases.shape == ascales.shape
+            {
+                self.affineCodes = aq
+                self.affineScales = ascales
+                self.affineBiases = abiases
+            } else {
+                FileHandle.standardError.write(
+                    Data(
+                        "mlxfast: lm_head finalist affine: unexpected layout; BF16 finalist\n"
+                            .utf8))
+                self.affineCodes = nil
+                self.affineScales = nil
+                self.affineBiases = nil
+            }
+        } else {
+            self.affineCodes = nil
+            self.affineScales = nil
+            self.affineBiases = nil
+        }
     }
 
     /// Pruned decode lm_head: full [vocab] BF16 logits row, bit-identical to
@@ -436,15 +628,54 @@ final class LagunaLmHeadPruner {
             outputDTypes: [.uint8]
         )[0]
 
+        if lagunaLmHeadPruneStats {
+            reportSurvivors(isCandidate)
+        }
+
         // One threadgroup per 32 output rows, covering the vocabulary exactly
         // once (100352 == 3136 * 32). Every slot has exactly one owning lane.
-        let assembled = lagunaLmHeadExactKernel(
-            [coarseBF, lmHeadWeight, x, isCandidate],
-            grid: (vocab / 32 * 256, 1, 1),
-            threadGroup: (256, 1, 1),
-            outputShapes: [[vocab]],
-            outputDTypes: [.bfloat16]
-        )[0]
+        let assembled: MLXArray
+        if let affineCodes, let affineScales, let affineBiases {
+            assembled = lagunaLmHeadExactAffineKernel(
+                [coarseBF, affineCodes, affineScales, affineBiases, x, isCandidate],
+                grid: (vocab / 32 * 256, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[vocab]],
+                outputDTypes: [.bfloat16]
+            )[0]
+        } else {
+            assembled = lagunaLmHeadExactKernel(
+                [coarseBF, lmHeadWeight, x, isCandidate],
+                grid: (vocab / 32 * 256, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[vocab]],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
         return assembled.reshaped([1, 1, vocab])
+    }
+
+    /// Measurement-only: how many rows survived the scan, and how many of the
+    /// finalist pass's four-row blocks that lights up (the block count is the
+    /// one that turns into weight traffic -- a block is read in full as soon as
+    /// any one of its four rows is a candidate).
+    private func reportSurvivors(_ isCandidate: MLXArray) {
+        let vocab = lagunaLmHeadPruneVocab
+        let rows = isCandidate.asType(.int32).sum()
+        let blocks = isCandidate.reshaped([vocab / 4, 4]).max(axis: 1)
+            .asType(.int32).sum()
+        eval(rows, blocks)
+        let rowCount = rows.item(Int.self)
+        let blockCount = blocks.item(Int.self)
+        let bytesBF16 = blockCount * 4 * lagunaLmHeadPruneHidden * 2
+        let bytesINT8 = blockCount * 4 * (lagunaLmHeadPruneHidden + 64 * 4)
+        FileHandle.standardError.write(
+            Data(
+                """
+                mlxfast: lm_head survivors rows=\(rowCount) blocks=\(blockCount) \
+                rows_read=\(blockCount * 4) bf16_bytes=\(bytesBF16) \
+                int8_bytes=\(bytesINT8)
+
+                """.utf8))
     }
 }
