@@ -260,6 +260,8 @@ let lagunaFusedGatedOutputProjectionEnabled =
 /// `DARKBLOOM_FUSED_QKV_PROJECTION=0` to ablate.
 let lagunaFusedQKVProjectionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV_PROJECTION"] != "0"
+let lagunaPackedQKVProjectionEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_QKV_PROJECTION"] != "0"
 
 /// Sliding-layer per-head RMSNorm + plain RoPE fusion (see
 /// `lagunaSlidingQKNormRoPEKernel`).
@@ -1378,8 +1380,82 @@ private func lagunaPrefillFullQKNormYaRN(
 /// `precise::rsqrt(acc / 2048 + eps)` is broadcast. The BF16 rounding stays
 /// inside `w[i] * bfloat(x[i] * inv)`, which is the value the separate kernel
 /// would have written and these projections would have read back.
-private func lagunaFusedQKVProjectionSource(heads: Int) -> String {
-    """
+private func lagunaFusedQKVProjectionSource(heads: Int, packed: Bool = false) -> String {
+    let weightSelection: String
+    let weightLoad: String
+    if packed {
+        weightSelection = """
+        const device uint8_t* weight_low;
+        const device uint8_t* weight_exponent;
+        device bfloat* out;
+        uint row_base;
+        if (global_row < query_rows) {
+            weight_low = query_weight_low;
+            weight_exponent = query_weight_exponent;
+            out = queries;
+            row_base = global_row;
+        } else if (global_row < query_rows + kv_rows) {
+            weight_low = key_weight_low;
+            weight_exponent = key_weight_exponent;
+            out = keys;
+            row_base = global_row - query_rows;
+        } else {
+            weight_low = value_weight_low;
+            weight_exponent = value_weight_exponent;
+            out = values;
+            row_base = global_row - query_rows - kv_rows;
+        }
+        """
+        weightLoad = """
+                size_t index =
+                    size_t(row_base + row) * in_vec_size + column;
+                uchar4 lo = uchar4(
+                    *(const device packed_uchar4*)(weight_low + index));
+                size_t packed_index = (index >> 2) * 3;
+                uint packed_bits = as_type<uint>(uchar4(
+                    *(const device packed_uchar4*)(
+                        weight_exponent + packed_index)));
+                ushort4 delta = ushort4(
+                    packed_bits & 0x3fu,
+                    (packed_bits >> 6u) & 0x3fu,
+                    (packed_bits >> 12u) & 0x3fu,
+                    (packed_bits >> 18u) & 0x3fu);
+                ushort4 lo16 = ushort4(lo);
+                ushort4 bits =
+                    (lo16 & ushort(0x7f)) |
+                    ((delta + ushort(65)) << ushort(7)) |
+                    ((lo16 & ushort(0x80)) << ushort(8));
+                const vec<bfloat, 4> w =
+                    as_type<vec<bfloat, 4>>(bits);
+        """
+    } else {
+        weightSelection = """
+        const device bfloat* weight;
+        device bfloat* out;
+        uint row_base;
+        if (global_row < query_rows) {
+            weight = query_weight;
+            out = queries;
+            row_base = global_row;
+        } else if (global_row < query_rows + kv_rows) {
+            weight = key_weight;
+            out = keys;
+            row_base = global_row - query_rows;
+        } else {
+            weight = value_weight;
+            out = values;
+            row_base = global_row - query_rows - kv_rows;
+        }
+        """
+        weightLoad = """
+                const device vec<bfloat, 4>* row_values =
+                    (const device vec<bfloat, 4>*)(
+                        weight + (row_base + row) * in_vec_size + column);
+                const vec<bfloat, 4> w = row_values[0];
+        """
+    }
+
+    return """
         constexpr uint in_vec_size = \(LagunaConstants.hiddenSize);
         constexpr uint query_rows = \(heads * LagunaConstants.headDim);
         constexpr uint kv_rows =
@@ -1556,22 +1632,7 @@ private func lagunaFusedQKVProjectionSource(heads: Int) -> String {
         // --- projections ---
         uint global_row = tile * rows_per_group + simd_group * rows_per_thread;
 
-        const device bfloat* weight;
-        device bfloat* out;
-        uint row_base;
-        if (global_row < query_rows) {
-            weight = query_weight;
-            out = queries;
-            row_base = global_row;
-        } else if (global_row < query_rows + kv_rows) {
-            weight = key_weight;
-            out = keys;
-            row_base = global_row - query_rows;
-        } else {
-            weight = value_weight;
-            out = values;
-            row_base = global_row - query_rows - kv_rows;
-        }
+        \(weightSelection)
 
         thread float result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
         thread float coefficients[values_per_thread];
@@ -1583,10 +1644,7 @@ private func lagunaFusedQKVProjectionSource(heads: Int) -> String {
             }
 
             for (uint row = 0; row < rows_per_thread; ++row) {
-                const device vec<bfloat, 4>* row_values =
-                    (const device vec<bfloat, 4>*)(
-                        weight + (row_base + row) * in_vec_size + column);
-                const vec<bfloat, 4> w = row_values[0];
+                \(weightLoad)
                 for (uint i = 0; i < values_per_thread; ++i) {
                     result[row] += float(w[i]) * coefficients[i];
                 }
@@ -1657,6 +1715,163 @@ func lagunaFusedNormQKVProjection(
     lagunaTrace("norm+qkv+gate projection h\(heads)")
     let outputs = kernel(
         [residual, normWeight, queryWeight, keyWeight, valueWeight, gateWeight],
+        grid: ((projectionTiles + gateTiles) * 512, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [
+            [1, 1, queryRows], [1, 1, kvRows], [1, 1, kvRows], [1, 1, heads],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1], outputs[2], outputs[3])
+}
+
+struct LagunaPackedBF16Weight {
+    let low: MLXArray
+    let exponent: MLXArray
+}
+
+struct LagunaPackedBF16QKVWeights {
+    let query: LagunaPackedBF16Weight
+    let key: LagunaPackedBF16Weight
+    let value: LagunaPackedBF16Weight
+}
+
+private let lagunaPackBF16WeightKernel = MLXFast.metalKernel(
+    name: "laguna_pack_bf16_q6_v1",
+    inputNames: ["weight"],
+    outputNames: ["low", "exponent", "valid"],
+    source: """
+        uint group = thread_position_in_grid.x;
+        uint index = group * 4u;
+        vec<bfloat, 4> values =
+            *((const device vec<bfloat, 4>*)(weight + index));
+        ushort4 bits = as_type<ushort4>(values);
+        uint packed = 0u;
+        bool group_valid = true;
+        for (uint i = 0; i < 4u; ++i) {
+            uint e = uint((bits[i] >> 7u) & 0xffu);
+            group_valid = group_valid && e >= 65u && e <= 128u;
+            low[index + i] = uint8_t(
+                (bits[i] & 0x7fu) | ((bits[i] >> 8u) & 0x80u));
+            packed |= (e - 65u) << (6u * i);
+        }
+        uint out = group * 3u;
+        exponent[out] = uint8_t(packed);
+        exponent[out + 1u] = uint8_t(packed >> 8u);
+        exponent[out + 2u] = uint8_t(packed >> 16u);
+        valid[group] = uint8_t(group_valid);
+        if (group == 0u) {
+            exponent[threadgroups_per_grid.x * threads_per_threadgroup.x * 3u] = 0u;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private let lagunaUnpackBF16WeightKernel = MLXFast.metalKernel(
+    name: "laguna_unpack_bf16_q6_v1",
+    inputNames: ["low", "exponent"],
+    outputNames: ["weight"],
+    source: """
+        uint group = thread_position_in_grid.x;
+        uint index = group * 4u;
+        uchar4 lo = uchar4(*(const device packed_uchar4*)(low + index));
+        uint packed = as_type<uint>(uchar4(
+            *(const device packed_uchar4*)(exponent + group * 3u)));
+        ushort4 delta = ushort4(
+            packed & 0x3fu,
+            (packed >> 6u) & 0x3fu,
+            (packed >> 12u) & 0x3fu,
+            (packed >> 18u) & 0x3fu);
+        ushort4 lo16 = ushort4(lo);
+        ushort4 bits =
+            (lo16 & ushort(0x7f)) |
+            ((delta + ushort(65)) << ushort(7)) |
+            ((lo16 & ushort(0x80)) << ushort(8));
+        *((device vec<bfloat, 4>*)(weight + index)) =
+            as_type<vec<bfloat, 4>>(bits);
+        """,
+    ensureRowContiguous: true
+)
+
+func lagunaPackBF16Weight(_ weight: MLXArray) -> LagunaPackedBF16Weight? {
+    precondition(weight.dtype == .bfloat16)
+    precondition(weight.ndim == 2 && weight.dim(1) == LagunaConstants.hiddenSize)
+    precondition(weight.size % 1024 == 0)
+    let groups = weight.size / 4
+    let output = lagunaPackBF16WeightKernel(
+        [weight],
+        grid: (groups, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[weight.size], [groups * 3 + 1], [groups]],
+        outputDTypes: [.uint8, .uint8, .uint8]
+    )
+    let packed = LagunaPackedBF16Weight(low: output[0], exponent: output[1])
+    let reconstructed = lagunaUnpackBF16WeightKernel(
+        [packed.low, packed.exponent],
+        grid: (groups, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [weight.shape],
+        outputDTypes: [.bfloat16]
+    )[0]
+    let inRange = output[2].all()
+    let exact = equal(
+        reconstructed.view(dtype: .uint16),
+        weight.view(dtype: .uint16)
+    ).all()
+    eval(packed.low, packed.exponent, inRange, exact)
+    guard inRange.item(Bool.self), exact.item(Bool.self) else { return nil }
+    return packed
+}
+
+private let lagunaPackedFusedQKVProjectionKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_fused_norm_qkv_projection_q6_h\(heads)_v1",
+            inputNames: [
+                "residual", "norm_weight",
+                "query_weight_low", "query_weight_exponent",
+                "key_weight_low", "key_weight_exponent",
+                "value_weight_low", "value_weight_exponent", "gate_weight",
+            ],
+            outputNames: ["queries", "keys", "values", "gate_values"],
+            source: lagunaFusedQKVProjectionSource(heads: heads, packed: true),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+func lagunaPackedFusedNormQKVProjection(
+    residual: MLXArray,
+    normWeight: MLXArray,
+    weights: LagunaPackedBF16QKVWeights,
+    gateWeight: MLXArray,
+    heads: Int
+) -> (
+    queries: MLXArray, keys: MLXArray, values: MLXArray, gateValues: MLXArray
+)? {
+    guard let kernel = lagunaPackedFusedQKVProjectionKernels[heads] else { return nil }
+    let hidden = LagunaConstants.hiddenSize
+    let queryRows = heads * LagunaConstants.headDim
+    let kvRows = LagunaConstants.numKeyValueHeads * LagunaConstants.headDim
+    precondition(residual.dtype == .bfloat16 && residual.shape == [1, 1, hidden])
+    precondition(normWeight.dtype == .bfloat16 && normWeight.shape == [hidden])
+    precondition(weights.query.low.size == queryRows * hidden)
+    precondition(weights.key.low.size == kvRows * hidden)
+    precondition(weights.value.low.size == kvRows * hidden)
+    precondition(gateWeight.dtype == .bfloat16 && gateWeight.shape == [heads, hidden])
+
+    let projectionTiles = (queryRows + 2 * kvRows) / 64
+    let gateTiles = heads / 8
+    lagunaTrace("packed norm+qkv+gate projection h\(heads)")
+    let outputs = kernel(
+        [
+            residual, normWeight,
+            weights.query.low, weights.query.exponent,
+            weights.key.low, weights.key.exponent,
+            weights.value.low, weights.value.exponent, gateWeight,
+        ],
         grid: ((projectionTiles + gateTiles) * 512, 1, 1),
         threadGroup: (512, 1, 1),
         outputShapes: [
@@ -1945,6 +2160,7 @@ final class LagunaRuntimeAttention: Module {
     /// checkpoint parameter; the q/k/v `Linear` modules keep the original
     /// arrays for parameter integrity.
     var _fusedQKVWeight: MLXArray?
+    var _packedQKVWeights: LagunaPackedBF16QKVWeights?
 
     /// Builds and retains the fused QKV weight from the loaded q/k/v
     /// projection weights. Called once after weights are installed and
@@ -1973,6 +2189,35 @@ final class LagunaRuntimeAttention: Module {
         let fused = concatenated([wq.weight, wk.weight, wv.weight], axis: 0)
         _fusedQKVWeight = fused
         return fused
+    }
+
+    func preparePackedQKVWeights() -> LagunaPackedBF16QKVWeights? {
+        guard _packedQKVWeights == nil,
+            isSliding,
+            nHeads == LagunaConstants.slidingAttentionHeads,
+            nKVHeads == LagunaConstants.numKeyValueHeads,
+            type(of: wq) == Linear.self,
+            type(of: wk) == Linear.self,
+            type(of: wv) == Linear.self,
+            wq.bias == nil, wk.bias == nil, wv.bias == nil,
+            wq.weight.dtype == .bfloat16,
+            wk.weight.dtype == .bfloat16,
+            wv.weight.dtype == .bfloat16,
+            wq.weight.shape == [nHeads * headDim, LagunaConstants.hiddenSize],
+            wk.weight.shape == [nKVHeads * headDim, LagunaConstants.hiddenSize],
+            wv.weight.shape == [nKVHeads * headDim, LagunaConstants.hiddenSize]
+        else {
+            return nil
+        }
+        guard let query = lagunaPackBF16Weight(wq.weight),
+            let key = lagunaPackBF16Weight(wk.weight),
+            let value = lagunaPackBF16Weight(wv.weight)
+        else {
+            return nil
+        }
+        let packed = LagunaPackedBF16QKVWeights(query: query, key: key, value: value)
+        _packedQKVWeights = packed
+        return packed
     }
 
     init(_ config: LagunaConfig, layerIdx: Int) {
@@ -2056,15 +2301,25 @@ final class LagunaRuntimeAttention: Module {
             gateProjection.weight.dtype == .bfloat16,
             gateProjection.weight.shape == [nHeads, LagunaConstants.hiddenSize]
         {
-            fusedNormQKV = lagunaFusedNormQKVProjection(
-                residual: input,
-                normWeight: inputNorm.weight,
-                queryWeight: wq.weight,
-                keyWeight: wk.weight,
-                valueWeight: wv.weight,
-                gateWeight: gateProjection.weight,
-                heads: nHeads
-            )
+            if let packed = _packedQKVWeights {
+                fusedNormQKV = lagunaPackedFusedNormQKVProjection(
+                    residual: input,
+                    normWeight: inputNorm.weight,
+                    weights: packed,
+                    gateWeight: gateProjection.weight,
+                    heads: nHeads
+                )
+            } else {
+                fusedNormQKV = lagunaFusedNormQKVProjection(
+                    residual: input,
+                    normWeight: inputNorm.weight,
+                    queryWeight: wq.weight,
+                    keyWeight: wk.weight,
+                    valueWeight: wv.weight,
+                    gateWeight: gateProjection.weight,
+                    heads: nHeads
+                )
+            }
         }
         // The fused result already contains every consumer of the normalized
         // row. Materialize that row only for the stock projections or the
@@ -3124,8 +3379,11 @@ func lagunaRoutedDownReduce(
     )[0]
 }
 
+/// One output row per SIMD retains the exact row-local NVFP4 dot products and
+/// nine-slot BF16 reduction while exposing four times as many independent
+/// weight streams as the original four-accumulator form.
 private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_down_residual_bf16_v1",
+    name: "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v3",
     inputNames: [
         "routed_activated", "routed_down_weight", "routed_down_scales",
         "indices", "router_weights", "shared_activated",
@@ -3137,7 +3395,7 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
         constexpr uint output_width = 2048;
         constexpr uint routed_experts = 8;
         constexpr uint shared_slot = 8;
-        constexpr uint outputs_per_simd = 4;
+        constexpr uint outputs_per_simd = 1;
         constexpr uint values_per_lane = 16;
         constexpr uint packed_row_bytes = 256;
         constexpr uint scale_row_bytes = 32;
@@ -3176,9 +3434,7 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
             input_values[4 * i + 3] = values[3];
         }
 
-        thread float result[outputs_per_simd] = {
-            0.0f, 0.0f, 0.0f, 0.0f
-        };
+        thread float result[outputs_per_simd] = {0.0f};
         for (uint row = 0; row < outputs_per_simd; ++row) {
             uint output_row = first_row + row;
             const device uint8_t* weight =
@@ -3290,7 +3546,7 @@ func lagunaRoutedSharedDownResidual(
             indices, routerWeights, sharedActivated,
             sharedDownWeight, sharedDownScales, residual,
         ],
-        grid: ((LagunaConstants.hiddenSize / 4) * 288, 1, 1),
+        grid: (LagunaConstants.hiddenSize * 288, 1, 1),
         threadGroup: (288, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
         outputDTypes: [.bfloat16]
@@ -4048,6 +4304,14 @@ private let lagunaPrefillMoETailEnabled =
 private let lagunaPrefillSortedMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_SORTED_MOE_TAIL"] != "0"
 
+/// Switchable replacement for `gatherSort`'s generic routed-input and
+/// permutation staging. Source rows and indices are copied byte-for-byte for
+/// every sorted Laguna prefill length, and the inverse permutation is built
+/// directly from the sort order.
+private let lagunaPrefillSortedRowCopyEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_SORTED_ROW_COPY"] != "0"
+
 /// Batched top-8 selection for multi-token (prefill) routing.
 ///
 /// Exactness against the stock chain it replaces, per row:
@@ -4715,6 +4979,67 @@ private func lagunaInterleavedSwiGLU(
     return compiledSiluProduct(gate, up)
 }
 
+/// `gatherSort` expands each token row once per selected expert after sorting
+/// the flattened expert indices. This kernel emits the same contiguous
+/// `[tokenCount * 8, 1, 2048]` BF16 payload for any sorted Laguna prefill,
+/// with one 16-byte copy per lane.
+private let lagunaPrefillSortedRowCopyKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_sorted_route_bf16_top8_v3",
+    inputNames: ["source", "flat_indices", "order"],
+    outputNames: ["sorted", "sorted_indices", "inverse_order"],
+    source: """
+        constexpr uint hidden_vectors = 2048 / 8;
+        constexpr uint experts_per_token = 8;
+
+        uint vector_index = thread_position_in_grid.x;
+        uint sorted_row = thread_position_in_grid.y;
+        uint original_row = order[sorted_row];
+        uint source_row = original_row / experts_per_token;
+        const device uint4* source_vectors =
+            (const device uint4*)(source);
+        device uint4* sorted_vectors = (device uint4*)(sorted);
+        sorted_vectors[sorted_row * hidden_vectors + vector_index] =
+            source_vectors[source_row * hidden_vectors + vector_index];
+
+        if (vector_index == 0) {
+            sorted_indices[sorted_row] = flat_indices[original_row];
+            inverse_order[original_row] = sorted_row;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private func lagunaPrefillSortedRoute(
+    source: MLXArray,
+    flatIndices: MLXArray,
+    order: MLXArray
+) -> (MLXArray, MLXArray, MLXArray) {
+    precondition(source.dtype == .bfloat16)
+    precondition(source.dim(-1) == LagunaConstants.hiddenSize)
+    precondition(source.size.isMultiple(of: LagunaConstants.hiddenSize))
+    precondition(flatIndices.dtype == .uint32)
+    precondition(
+        flatIndices.size
+            == (source.size / LagunaConstants.hiddenSize)
+                * LagunaConstants.numExpertsPerTok)
+    precondition(order.dtype == .uint32)
+    precondition(order.size == flatIndices.size)
+
+    let sortedRows = flatIndices.size
+    let outputs = lagunaPrefillSortedRowCopyKernel(
+        [source, flatIndices, order],
+        grid: (LagunaConstants.hiddenSize / 8, sortedRows, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [
+            [sortedRows, 1, LagunaConstants.hiddenSize],
+            [sortedRows],
+            [sortedRows],
+        ],
+        outputDTypes: [.bfloat16, .uint32, .uint32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 /// Prefill (multi-token, SORTED-regime) counterpart to the decode-only fused
 /// gate/up dispatch in `LagunaRuntimeSparseMoEBlock.forward`. One gather-QMM
 /// consumes the retained `[gate32, up32]`-interleaved NVFP4 bank in place of
@@ -4744,7 +5069,25 @@ private func lagunaFusedSortedRoutedGateUp(
     var inverseOrder = MLXArray()
     // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
     if doSort {
-        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        if lagunaPrefillSortedRowCopyEnabled,
+            sortedX.dtype == .bfloat16,
+            sortedX.dim(-1) == LagunaConstants.hiddenSize,
+            sortedX.size.isMultiple(of: LagunaConstants.hiddenSize),
+            indices.dtype == .uint32,
+            indices.size
+                == (sortedX.size / LagunaConstants.hiddenSize)
+                    * LagunaConstants.numExpertsPerTok
+        {
+            let flatIndices = indices.flattened()
+            let order = argSort(flatIndices)
+            (sortedX, idx, inverseOrder) = lagunaPrefillSortedRoute(
+                source: sortedX,
+                flatIndices: flatIndices,
+                order: order
+            )
+        } else {
+            (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        }
     }
     // Fused counterpart of SwitchGLU's separate-bank branch:
     //   xUp = upProj(x, idx, sortedIndices: doSort)
@@ -5103,7 +5446,10 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 let fusedScales = _fusedRoutedGateUpScales,
                 let downProj = _routedDownProj,
                 x.dim(1) > 1,
-                inds.size >= 64,
+                // The retained fused bank has a fixed 1024-column physical
+                // layout. Smaller sorted batches use the exact separate-bank
+                // implementation, which has no minimum batch geometry.
+                inds.size >= 2 * LagunaConstants.moeIntermediateSize,
                 fusedWeight.dtype == .uint32,
                 fusedScales.dtype == .uint8,
                 _fusedRoutedGateUpSplit == LagunaConstants.moeIntermediateSize
@@ -5860,6 +6206,16 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     func prepareFusedRuntimeWeights() {
         var fusedArrays = model.prepareRoPEAngleAtlases()
         for layer in model.layers {
+            if lagunaPackedQKVProjectionEnabled,
+                let packed = layer.selfAttn.preparePackedQKVWeights()
+            {
+                fusedArrays.append(packed.query.low)
+                fusedArrays.append(packed.query.exponent)
+                fusedArrays.append(packed.key.low)
+                fusedArrays.append(packed.key.exponent)
+                fusedArrays.append(packed.value.low)
+                fusedArrays.append(packed.value.exponent)
+            }
             if lagunaFusedQKVEnabled, let fused = layer.selfAttn.prepareFusedQKVWeight() {
                 fusedArrays.append(fused)
             }
