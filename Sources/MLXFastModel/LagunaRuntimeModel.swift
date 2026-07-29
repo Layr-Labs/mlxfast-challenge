@@ -314,6 +314,12 @@ private let lagunaPrefillQKNormRoPEEnabled =
 let lagunaFusedResidualRMSNormRouterEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_RESIDUAL_RMS_ROUTER"] != "0"
 
+/// Reuses the accepted single-row post-attention fusions after the final
+/// prefill layer has reduced its live output to one row. The stock tail remains
+/// available for isolated ablation and for every unsupported shape/config.
+let lagunaFinalPrefillFusedTailEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FINAL_PREFILL_FUSED_TAIL"] != "0"
+
 let lagunaFusedFullQKNormYaRNEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_QK_NORM_YARN"] != "0"
 
@@ -5375,7 +5381,38 @@ final class LagunaRuntimeDecoderLayer: Module {
     func callLastPrefillRow(_ x: MLXArray, cache: KVCache?) -> MLXArray {
         let normalized = inputLayerNorm(x)
         let r = selfAttn.callLastPrefillRow(normalized, cache: cache)
-        let h = lagunaLastTokenHidden(x) + r
+        let residual = lagunaLastTokenHidden(x)
+        if lagunaFinalPrefillFusedTailEnabled,
+            lagunaFusedResidualRMSNormRouterEnabled,
+            (
+                lagunaFusedSharedDownResidualEnabled
+                    || lagunaFusedRoutedSharedDownResidualEnabled
+            ),
+            residual.dtype == .bfloat16, r.dtype == .bfloat16,
+            postAttentionLayerNorm.weight.dtype == .bfloat16,
+            residual.shape == [1, 1, LagunaConstants.hiddenSize],
+            residual.shape == r.shape,
+            let sparse = mlp as? LagunaRuntimeSparseMoEBlock,
+            sparse.gate.weight.dtype == .bfloat16,
+            sparse.gate.weight.shape == [
+                LagunaConstants.numExperts, LagunaConstants.hiddenSize,
+            ]
+        {
+            // The final prefill specialization has already reduced the live
+            // post-attention state to one row. Reuse the same current-row
+            // residual/RMSNorm/router and sparse-tail fusions as decode;
+            // attention and its all-token K/V update still run exactly once.
+            let fused = lagunaResidualRMSNormRouter(
+                residual: residual,
+                branch: r,
+                weight: postAttentionLayerNorm.weight,
+                routerWeight: sparse.gate.weight)
+            return sparse(
+                fused.normalized,
+                residual: fused.summed,
+                routerLogits: fused.routerLogits)
+        }
+        let h = residual + r
         let r2 = mlp(postAttentionLayerNorm(h))
         return h + r2
     }
