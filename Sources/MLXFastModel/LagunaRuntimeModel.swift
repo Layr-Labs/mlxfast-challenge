@@ -277,6 +277,25 @@ private let lagunaNativeAffineQKVLayerCount: Int = {
 }()
 let lagunaNativeAffineQKVEnabled = lagunaNativeAffineQKVLayerCount > 0
 
+/// Fold the per-head gate projection into the promoted INT8 QKV bank.
+/// The promoted `DARKBLOOM_NATIVE_AFFINE_QKV` path batches Q, K and V into
+/// one group-32 affine INT8 quantizedMM — but then still dispatches
+/// `g_proj` as a separate BF16 GEMV over the SAME normalized row, plus its
+/// own softplus. The gate rows are just `nHeads` more output rows of the
+/// identical GEMV shape, so they belong in the batch: appending them
+/// removes one dispatch per gated layer from a latency-bound decode step
+/// and retires the `gemv_al` family from steady decode entirely.
+///
+/// Accuracy-budget note, same currency as the promoted bank: the gate
+/// logits pass through softplus into a smooth per-head multiplier, so
+/// group-32 INT8 error here perturbs attention output multiplicatively by
+/// ~1e-3 — it cannot flip an expert route and is far from the argmax
+/// surface. This spends the budget where it is cheapest.
+/// `DARKBLOOM_NATIVE_AFFINE_GATE=0` rebuilds the bank without the gate rows
+/// and restores the separate BF16 GEMV byte-for-byte.
+let lagunaNativeAffineGateEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_GATE"] != "0"
+
 private func lagunaUseNativeAffineQKV(layer: Int) -> Bool {
     layer < lagunaNativeAffineQKVLayerCount
 }
@@ -2306,6 +2325,7 @@ final class LagunaRuntimeAttention: Module {
     /// Q/K/V batch. The original BF16 parameters remain authoritative and
     /// continue to serve prefill.
     var _nativeAffineQKV: LagunaNativeAffineWeight?
+    var _nativeAffineQKVHasGate = false
 
     /// Derived native group-32 affine layout for the attention output
     /// projection, used only by the serial decode call. `wo.weight` remains the
@@ -2334,20 +2354,34 @@ final class LagunaRuntimeAttention: Module {
         else {
             return []
         }
-        let packedCodes = concatenated(
-            [q.packedCodes, k.packedCodes, v.packedCodes], axis: 0)
-        let scales = concatenated([q.scales, k.scales, v.scales], axis: 0)
-        let biases = concatenated([q.biases, k.biases, v.biases], axis: 0)
+        // Gate fold (see `lagunaNativeAffineGateEnabled`): the per-head gate
+        // rows ride the same batched quantizedMM. Row-block concatenation of
+        // independently quantized weights is exact — groups never span rows.
+        var parts: [LagunaNativeAffineWeight] = [q, k, v]
+        var gateRows = 0
+        if lagunaNativeAffineGateEnabled, gatingEnabled, gatePerHead,
+            let gate = gProj, gate.bias == nil,
+            gate.weight.dim(0) == nHeads,
+            let g = lagunaNativeAffineWeight(gate.weight)
+        {
+            parts.append(g)
+            gateRows = nHeads
+        }
+        let packedCodes = concatenated(parts.map(\.packedCodes), axis: 0)
+        let scales = concatenated(parts.map(\.scales), axis: 0)
+        let biases = concatenated(parts.map(\.biases), axis: 0)
         let fused = LagunaNativeAffineWeight(
             packedCodes: packedCodes,
             scales: scales,
             biases: biases,
             originalShape: [
-                wq.weight.dim(0) + wk.weight.dim(0) + wv.weight.dim(0),
+                wq.weight.dim(0) + wk.weight.dim(0) + wv.weight.dim(0)
+                    + gateRows,
                 wq.weight.dim(1),
             ]
         )
         _nativeAffineQKV = fused
+        _nativeAffineQKVHasGate = gateRows > 0
         return fused.arrays
     }
 
@@ -2478,7 +2512,13 @@ final class LagunaRuntimeAttention: Module {
                 )
                 let queryDim = nHeads * headDim
                 let kvDim = nKVHeads * headDim
-                let gateLogits = gateProjection(normalized)
+                // Gate rides the batch when the bank carries it (see
+                // `lagunaNativeAffineGateEnabled`); otherwise the promoted
+                // separate-GEMV path is byte-identical.
+                let gateLogits =
+                    _nativeAffineQKVHasGate
+                    ? qkv[.ellipsis, (queryDim + 2 * kvDim)...]
+                    : gateProjection(normalized)
                 let activatedGate =
                     softplus(gateLogits.asType(.float32)).asType(.bfloat16)
                 fusedNormQKV = (
