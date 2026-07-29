@@ -254,6 +254,27 @@ let lagunaFusedRoutedSharedSwiGLUQMVEnabled =
 let lagunaFusedGatedOutputProjectionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATED_OUTPUT"] != "0"
 
+/// Exact BF16 row-tier sidecars for attention Q/K/V rows not already served
+/// by the promoted native-affine rollout. The original BF16 weights remain
+/// resident for prefill and raw-row fallback.
+let lagunaLosslessAttentionQKVCodecEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LOSSLESS_ATTENTION_QKV"] != "0"
+
+/// Independent lossless sidecars for all 40 output projections: 30 sliding
+/// 8192-wide matrices and 10 full-attention 6144-wide matrices.
+let lagunaLosslessAttentionOCodecEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LOSSLESS_ATTENTION_O"] != "0"
+
+let lagunaLosslessAttentionOCodecUnroll: Int = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LOSSLESS_ATTENTION_O_UNROLL"],
+        let value = Int(raw), [1, 2, 4, 8].contains(value)
+    else { return 2 }
+    return value
+}()
+
 /// Issues Q, K and V as one dispatch over the three stock weights (see
 /// `lagunaFusedQKVProjectionSource`). Unlike `DARKBLOOM_FUSED_QKV` this keeps
 /// no concatenated bank, so prefill is untouched. Set
@@ -1425,10 +1446,30 @@ func lagunaNativeAffineWeight(_ weight: MLXArray) -> LagunaNativeAffineWeight? {
 /// inside `w[i] * bfloat(x[i] * inv)`, which is the value the separate kernel
 /// would have written and these projections would have read back.
 private func lagunaFusedQKVProjectionSource(
-    heads: Int, compact: Bool = false, mxfp8: Bool = false
+    heads: Int, compact: Bool = false, mxfp8: Bool = false,
+    lossless: Bool = false
 ) -> String {
     let projectionPointerSetup =
-        compact
+        lossless
+        ? """
+        const device bfloat* weight;
+        device bfloat* out;
+        uint row_base;
+        if (global_row < query_rows) {
+            weight = query_weight;
+            out = queries;
+            row_base = global_row;
+        } else if (global_row < query_rows + kv_rows) {
+            weight = key_weight;
+            out = keys;
+            row_base = global_row - query_rows;
+        } else {
+            weight = value_weight;
+            out = values;
+            row_base = global_row - query_rows - kv_rows;
+        }
+        """
+        : compact
         ? """
         const device bfloat* weight;
         const device uint8_t* weight_low;
@@ -1552,7 +1593,48 @@ private func lagunaFusedQKVProjectionSource(
         """
 
     let projectionLoop =
-        compact
+        lossless
+        ? """
+        thread float result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread float coefficients[values_per_thread];
+        thread uchar codec_tiers[rows_per_thread];
+        thread uint2 codec_extra_offsets[rows_per_thread];
+        for (uint row = 0; row < rows_per_thread; ++row) {
+            uint codec_row = global_row + row;
+            codec_tiers[row] = row_tiers[codec_row];
+            codec_extra_offsets[row] = *((const device uint2*) (
+                row_extra_offsets + codec_row * 2));
+        }
+
+        uint column = lane * values_per_thread;
+        for (uint block = 0; block < blocks; ++block) {
+            for (uint i = 0; i < values_per_thread; ++i) {
+                coefficients[i] = float(normalized_row[column + i]);
+            }
+
+            for (uint row = 0; row < rows_per_thread; ++row) {
+                vec<bfloat, 4> w;
+                uchar tier = codec_tiers[row];
+                if (tier == 0) {
+                    w = *((const device vec<bfloat, 4>*) (
+                        weight + (row_base + row) * in_vec_size + column));
+                } else {
+                    vec<ushort, 4> bits = laguna_bf16_row_codec_bits4(
+                        packed_weight, global_row + row, column, tier,
+                        codec_extra_offsets[row]);
+                    for (uint i = 0; i < values_per_thread; ++i) {
+                        w[i] = as_type<bfloat>(bits[i]);
+                    }
+                }
+                for (uint i = 0; i < values_per_thread; ++i) {
+                    result[row] += float(w[i]) * coefficients[i];
+                }
+            }
+
+            column += block_width;
+        }
+        """
+        : compact
         ? """
         thread float result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
         thread float coefficients[values_per_thread];
@@ -1867,6 +1949,25 @@ private let lagunaFusedQKVProjectionKernels: [Int: MLXFast.MLXFastKernel] = {
     return kernels
 }()
 
+private let lagunaLosslessFusedQKVProjectionKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_lossless_fused_norm_qkv_projection_bf16_h\(heads)_v2",
+            inputNames: [
+                "residual", "norm_weight", "query_weight", "key_weight",
+                "value_weight", "packed_weight", "row_tiers",
+                "row_extra_offsets", "gate_weight",
+            ],
+            outputNames: ["queries", "keys", "values", "gate_values"],
+            source: lagunaFusedQKVProjectionSource(heads: heads, lossless: true),
+            header: lagunaBF16RowCodecMetalHeader(layout: lagunaQKVCodecLayout),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
 func lagunaFusedNormQKVProjection(
     residual: MLXArray,
     normWeight: MLXArray,
@@ -1899,6 +2000,57 @@ func lagunaFusedNormQKVProjection(
     lagunaTrace("norm+qkv+gate projection h\(heads)")
     let outputs = kernel(
         [residual, normWeight, queryWeight, keyWeight, valueWeight, gateWeight],
+        grid: ((projectionTiles + gateTiles) * 512, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [
+            [1, 1, queryRows], [1, 1, kvRows], [1, 1, kvRows], [1, 1, heads],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1], outputs[2], outputs[3])
+}
+
+func lagunaLosslessFusedNormQKVProjection(
+    residual: MLXArray,
+    normWeight: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    valueWeight: MLXArray,
+    codec: LagunaBF16RowCodecStorage,
+    gateWeight: MLXArray,
+    heads: Int
+) -> (
+    queries: MLXArray, keys: MLXArray, values: MLXArray, gateValues: MLXArray
+)? {
+    guard let kernel = lagunaLosslessFusedQKVProjectionKernels[heads] else { return nil }
+    let hidden = LagunaConstants.hiddenSize
+    let queryRows = heads * LagunaConstants.headDim
+    let kvRows = LagunaConstants.numKeyValueHeads * LagunaConstants.headDim
+    let codecRows = queryRows + 2 * kvRows
+    precondition(residual.dtype == .bfloat16)
+    precondition(residual.shape == [1, 1, hidden])
+    precondition(normWeight.dtype == .bfloat16)
+    precondition(normWeight.shape == [hidden])
+    precondition(queryWeight.dtype == .bfloat16)
+    precondition(queryWeight.shape == [queryRows, hidden])
+    precondition(keyWeight.dtype == .bfloat16)
+    precondition(keyWeight.shape == [kvRows, hidden])
+    precondition(valueWeight.dtype == .bfloat16)
+    precondition(valueWeight.shape == [kvRows, hidden])
+    precondition(codec.layout == lagunaQKVCodecLayout)
+    precondition(codec.rows == codecRows)
+    precondition(codec.extraOffsets.shape == [codecRows, 2])
+    precondition(gateWeight.dtype == .bfloat16)
+    precondition(gateWeight.shape == [heads, hidden])
+
+    let projectionTiles = codecRows / 64
+    let gateTiles = heads / 8
+    lagunaTrace("lossless norm+qkv+gate projection h\(heads)")
+    let outputs = kernel(
+        [
+            residual, normWeight, queryWeight, keyWeight, valueWeight,
+            codec.payload, codec.tiers, codec.extraOffsets, gateWeight,
+        ],
         grid: ((projectionTiles + gateTiles) * 512, 1, 1),
         threadGroup: (512, 1, 1),
         outputShapes: [
@@ -2279,6 +2431,11 @@ final class LagunaRuntimeAttention: Module {
     /// continue to serve prefill.
     var _nativeAffineQKV: LagunaNativeAffineWeight?
 
+    /// Exact decode sidecars for the BF16 Q/K/V fallback layers and every O
+    /// projection. These are derived runtime state, never checkpoint keys.
+    var _losslessQKVCodec: LagunaBF16RowCodecStorage?
+    var _losslessOCodec: LagunaBF16RowCodecStorage?
+
     func prepareNativeAffineQKVWeight() -> [MLXArray] {
         guard _nativeAffineQKV == nil,
             let q = lagunaNativeAffineWeight(wq.weight),
@@ -2331,6 +2488,44 @@ final class LagunaRuntimeAttention: Module {
         let fused = concatenated([wq.weight, wk.weight, wv.weight], axis: 0)
         _fusedQKVWeight = fused
         return fused
+    }
+
+    func prepareLosslessQKVCodec() -> [MLXArray] {
+        guard lagunaLosslessAttentionQKVCodecEnabled,
+            !lagunaUseNativeAffineQKV(layer: layerIdx),
+            _losslessQKVCodec == nil,
+            type(of: wq) == Linear.self,
+            type(of: wk) == Linear.self,
+            type(of: wv) == Linear.self,
+            wq.bias == nil, wk.bias == nil, wv.bias == nil,
+            wq.weight.dtype == .bfloat16,
+            wk.weight.dtype == .bfloat16,
+            wv.weight.dtype == .bfloat16,
+            wq.weight.shape == [nHeads * headDim, LagunaConstants.hiddenSize],
+            wk.weight.shape == [nKVHeads * headDim, LagunaConstants.hiddenSize],
+            wv.weight.shape == [nKVHeads * headDim, LagunaConstants.hiddenSize]
+        else { return [] }
+
+        let combined = concatenated([wq.weight, wk.weight, wv.weight], axis: 0)
+        eval(combined)
+        guard let codec = LagunaBF16RowCodec.makeStorage(weight: combined) else {
+            return []
+        }
+        _losslessQKVCodec = codec
+        return [codec.payload, codec.tiers, codec.extraOffsets]
+    }
+
+    func prepareLosslessOCodec() -> [MLXArray] {
+        guard lagunaLosslessAttentionOCodecEnabled,
+            _losslessOCodec == nil,
+            type(of: wo) == Linear.self,
+            wo.bias == nil,
+            wo.weight.dtype == .bfloat16,
+            wo.weight.shape == [LagunaConstants.hiddenSize, nHeads * headDim],
+            let codec = LagunaBF16RowCodec.makeStorage(weight: wo.weight)
+        else { return [] }
+        _losslessOCodec = codec
+        return [codec.payload, codec.tiers, codec.extraOffsets]
     }
 
     init(_ config: LagunaConfig, layerIdx: Int) {
@@ -2439,6 +2634,17 @@ final class LagunaRuntimeAttention: Module {
                     qkv[.ellipsis, queryDim ..< (queryDim + kvDim)],
                     qkv[.ellipsis, (queryDim + kvDim) ..< (queryDim + 2 * kvDim)],
                     activatedGate
+                )
+            } else if let codec = _losslessQKVCodec {
+                fusedNormQKV = lagunaLosslessFusedNormQKVProjection(
+                    residual: input,
+                    normWeight: inputNorm.weight,
+                    queryWeight: wq.weight,
+                    keyWeight: wk.weight,
+                    valueWeight: wv.weight,
+                    codec: codec,
+                    gateWeight: gateProjection.weight,
+                    heads: nHeads
                 )
             } else {
                 fusedNormQKV = lagunaFusedNormQKVProjection(
@@ -2654,6 +2860,17 @@ final class LagunaRuntimeAttention: Module {
                 projectedGate.shape == [1, 1, nHeads],
                 wo.weight.shape == [LagunaConstants.hiddenSize, nHeads * headDim]
             {
+                if let codec = _losslessOCodec,
+                    let projection = lagunaLosslessOProjection(
+                        attentionOutput: output,
+                        gateValues: projectedGate,
+                        rawWeight: wo.weight,
+                        codec: codec,
+                        heads: nHeads,
+                        unroll: lagunaLosslessAttentionOCodecUnroll)
+                {
+                    return projection
+                }
                 let projection = lagunaGatedOutputProjection(
                     attentionOutput: output,
                     gateValues: projectedGate,
@@ -6528,6 +6745,8 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                 fusedArrays.append(
                     contentsOf: layer.selfAttn.prepareNativeAffineQKVWeight())
             }
+            fusedArrays.append(contentsOf: layer.selfAttn.prepareLosslessQKVCodec())
+            fusedArrays.append(contentsOf: layer.selfAttn.prepareLosslessOCodec())
             if lagunaFusedQKVEnabled, let fused = layer.selfAttn.prepareFusedQKVWeight() {
                 fusedArrays.append(fused)
             }
