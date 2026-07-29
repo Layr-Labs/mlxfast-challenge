@@ -2,13 +2,13 @@ import Foundation
 import MLX
 import MLXFast
 
-// Certified two-pass lm_head elision for the final-token projection (notes/68).
+// Certified two-pass lm_head elision for the decode path (notes/68).
 //
-// Stock lm_head reads the full BF16 [100352, 2048] weight (411 MB) for the
-// final hidden row at the DRAM wall. This module, gated by
+// Stock decode lm_head reads the full BF16 [100352, 2048] weight (411 MB) per
+// token at the DRAM wall. This module, gated by
 // DARKBLOOM_LM_HEAD_PRUNE (DEFAULT ON; set "0" to disable; unset = shipped
 // path), replaces it for
-// both prefill's already-sliced last hidden row and single-token decode with:
+// single-token decode steps with:
 //
 //   1. COARSE pass (`lagunaLmHeadCoarseKernel`): one fused GEMV over an
 //      init-time MXFP8 copy of lm_head (gs32 e8m0+e4m3, 211.9 MB) built with
@@ -49,21 +49,13 @@ import MLXFast
 private let lagunaLmHeadPruneVocab = 100_352
 private let lagunaLmHeadPruneHidden = 2048
 
-/// Master switch for the certified two-pass final-row lm_head (notes/68).
+/// Master switch for the certified two-pass decode lm_head (notes/68).
 /// DEFAULT ON: unset, or any value other than "0", enables the certified
-/// two-pass head and builds the MXFP8 coarse copy at init time.
+/// two-pass decode head and builds the MXFP8 coarse copy at init time.
 /// Set `DARKBLOOM_LM_HEAD_PRUNE=0` to disable and restore the byte-identical
 /// stock full lm_head pass.
 let lagunaLmHeadPruneEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_LM_HEAD_PRUNE"] != "0"
-
-/// Same-binary A/B switch for applying the certified pruner to prefill's
-/// already-sliced final hidden row. DEFAULT ON; set
-/// `DARKBLOOM_LM_HEAD_PRUNE_PREFILL=0` to restore the stock prefill head
-/// without disabling the existing decode pruner.
-let lagunaLmHeadPrunePrefillEnabled =
-    ProcessInfo.processInfo.environment[
-        "DARKBLOOM_LM_HEAD_PRUNE_PREFILL"] != "0"
 
 /// Kernel header: bit-exact MXFP8 element decoders + the certified
 /// half-cell-width table, all inlinable and libm-free.
@@ -257,114 +249,6 @@ private let lagunaLmHeadCoarseKernelV1 = MLXFast.metalKernel(
 private let lagunaLmHeadCoarseUseV1 =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COARSE"] == "v1"
 
-/// `lower.max()` uses MLX's two-pass `all_reduce_max` for this 100352-element
-/// row. The first pass partitions it into 128 contiguous 784-element rows,
-/// with 224 threads reading four values each (196 active threads), and the
-/// second pass reduces those 128 partials with one 32-lane simdgroup.
-///
-/// These two custom kernels reproduce that exact geometry while fusing the
-/// elementwise `coarse - delta` into pass one and the scalar threshold
-/// arithmetic into pass two. For finite inputs, max only selects an existing
-/// float, so matching the stock partitions plus `simd_max` gives the same
-/// `L` bit pattern. The helper also preserves MLX's NaN propagation and its
-/// pairwise `a > b ? a : b` behavior for completeness.
-private let lagunaLmHeadLowerMaxHeader = """
-    static inline float laguna_lmhead_max_pair(float a, float b) {
-        if (metal::isnan(a) || metal::isnan(b)) {
-            return NAN;
-        }
-        return a > b ? a : b;
-    }
-
-    static inline float laguna_lmhead_simd_max(float value) {
-        if (simd_any(value != value)) {
-            return NAN;
-        }
-        return simd_max(value);
-    }
-    """
-
-/// Pass one of the fused lower-bound reduction. Its launch shape and read
-/// order are the stock MLX `all_reduce_max` first pass for exactly 100352
-/// float32 values: grid (224, 128), threadgroup (224, 1), four consecutive
-/// values per active thread, then the stock simdgroup/shared-memory tree.
-private let lagunaLmHeadLowerMaxStage1Kernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_lower_max_stage1_v1",
-    inputNames: ["coarse", "delta"],
-    outputNames: ["partial_max"],
-    source: """
-        constexpr uint ROW_SIZE = 784;
-        constexpr uint READS = 4;
-        constexpr uint ACTIVE_THREADS = ROW_SIZE / READS;
-        constexpr uint SIMD_GROUPS = 7;
-
-        uint row = threadgroup_position_in_grid.y;
-        uint lid = thread_position_in_threadgroup.x;
-        uint simd_lane = thread_index_in_simdgroup;
-        uint simd_group = simdgroup_index_in_threadgroup;
-        threadgroup float shared_vals[32];
-
-        float total = -metal::numeric_limits<float>::infinity();
-        if (lid < ACTIVE_THREADS) {
-            uint base = row * ROW_SIZE + lid * READS;
-            #pragma clang loop unroll(full)
-            for (uint i = 0; i < READS; ++i) {
-                float lower = coarse[base + i] - delta[base + i];
-                total = laguna_lmhead_max_pair(lower, total);
-            }
-        }
-
-        total = laguna_lmhead_simd_max(total);
-        if (simd_lane == 0) {
-            shared_vals[simd_group] = total;
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        total = lid < SIMD_GROUPS
-            ? shared_vals[lid]
-            : -metal::numeric_limits<float>::infinity();
-        total = laguna_lmhead_simd_max(total);
-        if (lid == 0) {
-            partial_max[row] = total;
-        }
-        """,
-    header: lagunaLmHeadLowerMaxHeader,
-    ensureRowContiguous: true
-)
-
-/// Pass two reduces the 128 partials with the same four-values-per-lane
-/// order as MLX, then computes `L - abs(L) * 2^-6`. The temporary
-/// threadgroup store plus barrier preserves the separate float32 rounding of
-/// MLX's multiply before the final subtraction (and prevents contraction).
-private let lagunaLmHeadLowerMaxThresholdKernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_lower_max_threshold_v1",
-    inputNames: ["partial_max"],
-    outputNames: ["threshold"],
-    source: """
-        constexpr uint READS = 4;
-        uint lid = thread_position_in_threadgroup.x;
-        threadgroup float rounded_beta[1];
-
-        float total = -metal::numeric_limits<float>::infinity();
-        uint base = lid * READS;
-        #pragma clang loop unroll(full)
-        for (uint i = 0; i < READS; ++i) {
-            total = laguna_lmhead_max_pair(partial_max[base + i], total);
-        }
-        total = laguna_lmhead_simd_max(total);
-
-        if (lid == 0) {
-            rounded_beta[0] = metal::abs(total) * 0x1p-6f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lid == 0) {
-            threshold[0] = total - rounded_beta[0];
-        }
-        """,
-    header: lagunaLmHeadLowerMaxHeader,
-    ensureRowContiguous: true
-)
-
 /// GPU candidate marking: one byte per vocabulary row, set when the row's
 /// certified upper bound reaches the threshold. A dense mask rather than a
 /// compacted index list, because the exact pass below owns a FIXED output
@@ -484,7 +368,7 @@ private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// Retained init-time MXFP8 coarse copy of lm_head plus the pruned final-row
+/// Retained init-time MXFP8 coarse copy of lm_head plus the pruned decode
 /// forward. Built once (untimed init) by
 /// `LagunaRuntimeModel.prepareFusedRuntimeWeights` when
 /// `lagunaLmHeadPruneEnabled` (DARKBLOOM_LM_HEAD_PRUNE, default ON; set "0"
@@ -512,7 +396,7 @@ final class LagunaLmHeadPruner {
         self.scales = scales
     }
 
-    /// Pruned final-row lm_head: full [vocab] BF16 logits row, bit-identical to
+    /// Pruned decode lm_head: full [vocab] BF16 logits row, bit-identical to
     /// the stock pass in every candidate slot and certified-below elsewhere,
     /// so the downstream argmax emits the stock token.
     func logits(hidden: MLXArray, lmHeadWeight: MLXArray) -> MLXArray {
@@ -533,23 +417,16 @@ final class LagunaLmHeadPruner {
         let delta = coarseOut[1]
         let coarseBF = coarseOut[2]
 
-        // Threshold on GPU: L = max(coarse - delta); thr = L - |L|/64.
-        // The custom pair fuses the six-dispatch MLX expression into two
-        // dispatches while reproducing MLX's exact two-pass reduction layout.
-        let lowerMaxPartials = lagunaLmHeadLowerMaxStage1Kernel(
-            [coarse, delta],
-            grid: (224, 128, 1),
-            threadGroup: (224, 1, 1),
-            outputShapes: [[128]],
-            outputDTypes: [.float32]
-        )[0]
-        let thr = lagunaLmHeadLowerMaxThresholdKernel(
-            [lowerMaxPartials],
-            grid: (32, 1, 1),
-            threadGroup: (32, 1, 1),
-            outputShapes: [[1]],
-            outputDTypes: [.float32]
-        )[0]
+        // Threshold on GPU: L = max(coarse - delta); thr = L - |L|/64, in ONE
+        // dispatch. The MLX expression form of this (`coarse - delta`, then
+        // `.max()` -- itself a two-pass all_reduce at this size -- then
+        // `.abs()`, a scalar multiply and a scalar subtract) costs six
+        // dispatches, five of which move almost no data. `max` is associative
+        // in IEEE 754, so the fused tree is bitwise identical regardless of
+        // shape; see the kernel's doc comment.
+        let lower = coarse - delta
+        let l = lower.max()
+        let thr = (l - l.abs() * Float(1.0 / 64.0)).reshaped([1])
 
         let isCandidate = lagunaLmHeadSelectKernel(
             [coarse, delta, thr],
