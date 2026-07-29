@@ -8,6 +8,10 @@
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/device.h"
+// For the inline static-expert pipeline build below (the stage function
+// constants must bind on that path too, and get_qmm_nax_kernel's signature
+// cannot change without touching the non-editable nojit twin).
+#include "mlx/backend/metal/jit/includes.h"
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/reduce.h"
 #include "mlx/backend/metal/unary.h"
@@ -1262,7 +1266,14 @@ bool darkbloom_stage_flag(const char* name) {
 }
 
 bool darkbloom_stage_widest() {
-  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_WIDEST");
+  // DEFAULT ON. When these levers were authored the Laguna MoE shapes still
+  // dispatched fp_gather_qmm_rhs_nax; the expert-aligned kernels then took
+  // over that path, where the stage constants were never wired, so WIDEST
+  // shipped OFF and unmeasured. It is now wired into
+  // fp_gather_qmm_rhs_expert_nax (see the k-loop there) and defaults ON;
+  // "0" is the kill switch for same-binary A/B.
+  static const bool v =
+      env::get_var("DARKBLOOM_STAGE_WIDEST", "") != "0";
   return v;
 }
 
@@ -1569,12 +1580,25 @@ void gather_qmm_rhs_nax(
   // depends on `w.offset()`, which is a runtime property no static reading of
   // the source can settle. Without this, a rejected gate is indistinguishable
   // from a lever that does nothing -- the exact confound that makes an
-  // A/B arm meaningless. One shot per process, default off, stderr only.
-  if (darkbloom_stage_flag("DARKBLOOM_STAGE_TRACE")) {
+  // A/B arm meaningless. One shot per process, default off.
+  //
+  // "1" prints to worker stderr (visible only where the harness forwards
+  // it); any other non-empty value is a file path to append to, for the
+  // phases whose worker stderr the trusted CLI drains silently. Debug-only
+  // observability; never enabled on a measured run.
+  const std::string stage_trace_target =
+      env::get_var("DARKBLOOM_STAGE_TRACE", "");
+  if (!stage_trace_target.empty() && stage_trace_target != "0") {
     static std::once_flag once;
     std::call_once(once, [&]() {
+      FILE* trace_out = stage_trace_target == "1"
+          ? stderr
+          : fopen(stage_trace_target.c_str(), "a");
+      if (trace_out == nullptr) {
+        trace_out = stderr;
+      }
       fprintf(
-          stderr,
+          trace_out,
           "mlxfast: stage active: widest=%d wideld=%d(req=%d wide_ok=%d) "
           "runbar=%d novol=%d expert=%d bm128=%d bm=%d wm=%d wn=%d "
           "w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d\n",
@@ -1595,6 +1619,9 @@ void gather_qmm_rhs_nax(
           N,
           K,
           bn);
+      if (trace_out != stderr) {
+        fclose(trace_out);
+      }
     });
   }
 
@@ -1609,6 +1636,15 @@ void gather_qmm_rhs_nax(
         {&stage_wideld, MTL::DataType::DataTypeBool, 205},
         {&stage_runbar, MTL::DataType::DataTypeBool, 206},
         {&stage_novol, MTL::DataType::DataTypeBool, 207},
+    };
+  } else {
+    // The expert kernel's k-loop now references fc 204/205 (see
+    // fp_gather_qmm_rhs_expert_nax); a referenced-but-unbound function
+    // constant fails pipeline creation, so bind exactly the two it uses.
+    // 200-203/206/207 are not referenced by the expert kernels.
+    func_consts = {
+        {&stage_widest, MTL::DataType::DataTypeBool, 204},
+        {&stage_wideld, MTL::DataType::DataTypeBool, 205},
     };
   }
 
@@ -1650,7 +1686,28 @@ void gather_qmm_rhs_nax(
         transpose,
         K,
         N);
-    kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
+    // Inline twin of get_qmm_nax_kernel that additionally binds the stage
+    // function constants: the static expert kernel now references fc
+    // 204/205, and a referenced-but-unbound constant fails pipeline
+    // creation. The library body is byte-identical to get_qmm_nax_kernel's
+    // (utils + gemm_nax + quantized_utils + fp_quantized_nax + the same
+    // template_def); hash_name already encodes the stage flags (_stg_), so
+    // one process still compiles exactly one specialization.
+    {
+      const auto& lib_name = kname;
+      auto lib = d.get_library(lib_name, [&]() {
+        std::string kernel_source;
+        concatenate(
+            kernel_source,
+            metal::utils(),
+            metal::gemm_nax(),
+            metal::quantized_utils(),
+            metal::fp_quantized_nax(),
+            template_def);
+        return kernel_source;
+      });
+      kernel = d.get_kernel(kname, lib, hash_name, func_consts);
+    }
   } else {
     kernel = get_gather_qmm_nax_kernel(
         d,

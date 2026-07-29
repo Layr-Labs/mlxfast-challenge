@@ -1653,7 +1653,32 @@ template <
 
       for (int k = 0; k < K_it; ++k) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_w.load_unsafe();
+        // DARKBLOOM_STAGE_WIDEST / DARKBLOOM_STAGE_WIDELD on the expert
+        // path: same element->address mapping and the same per-element
+        // decode expressions as load_unsafe() -- only the access width
+        // changes (see the exactness note above load_unsafe_wide). These
+        // levers were previously wired only into fp_gather_qmm_rhs_nax,
+        // which the Laguna MoE shapes stopped dispatching once the
+        // expert-aligned kernels took over; the host now binds fc 204/205
+        // for expert pipelines as well. At Laguna tiles (BK=64, gs16,
+        // bf16 Ws, 256 threads) every thread's Ws byte offset is
+        // 144*bi + 4*bj with bj in {0,8,16,24} -- always 16B-aligned -- so
+        // WIDEST turns 16 scalar 2B threadgroup stores into 2 16B stores
+        // per thread per k-iteration. WIDELD stays statically disabled
+        // here (each thread's source run is n_reads = 8 bytes and
+        // load_unsafe_wide only widens exact 16B runs), so its branch
+        // folds away at pipeline specialization.
+        if (stage_widest) {
+          if (stage_wideld) {
+            loader_w.template load_unsafe_wide<true, true>();
+          } else {
+            loader_w.template load_unsafe_wide<true, false>();
+          }
+        } else if (stage_wideld) {
+          loader_w.template load_unsafe_wide<false, true>();
+        } else {
+          loader_w.load_unsafe();
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg_active) {
