@@ -1894,7 +1894,19 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (M >= vector_limit) {
     // Use split-K qmm for small M with transposed weights (non-batched only)
     int B = out.size() / M / N;
-    if (transpose_ && B == 1) {
+    // DARKBLOOM_QMM_NO_SPLITK (default ON; "0" restores split-K): the
+    // split-K route costs a bf16 intermediate
+    // plus a col_reduce accumulate, an arange and a copy per call -- 228
+    // dispatches per 512-token prefill for the shared-expert gate/up shape
+    // alone. The plain qmm path computes the same product in one dispatch
+    // with a single FP32 accumulator chain per output element. Selection
+    // only; no weight is re-quantized and the NVFP4 group-16 4-bit values
+    // are untouched. NOT bit-exact against split-K (a K-split sums two
+    // partials that the single chain accumulates in one order), so it is
+    // gated and measured, never assumed.
+    static const bool no_splitk =
+        env::get_var("DARKBLOOM_QMM_NO_SPLITK", "") != "0";
+    if (transpose_ && B == 1 && !no_splitk) {
       qmm_splitk(
           x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
       return;
