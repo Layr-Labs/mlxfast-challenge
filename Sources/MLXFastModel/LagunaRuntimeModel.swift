@@ -265,14 +265,14 @@ let lagunaFusedQKVProjectionEnabled =
 /// A native group-32 affine INT8 side layout packs Q/K/V into one batched
 /// quantized matmul, cutting their weight traffic without speculating future
 /// tokens or changing the KV dependency. Prefill stays on the original BF16
-/// projections. The first ranked chunk proved 16 layers; this second bounded
-/// chunk widens the same layout to 28 layers while retaining acceptance margin.
+/// projections. Earlier ranked chunks proved the first 28 layers; this bounded
+/// chunk widens the same layout to 32 layers while retaining acceptance margin.
 private let lagunaNativeAffineQKVLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_QKV"] != "0"
     else { return 0 }
     let requested = Int(
         ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_QKV_LAYERS"]
-            ?? "28") ?? 28
+            ?? "32") ?? 32
     return min(max(requested, 0), LagunaConstants.numHiddenLayers)
 }()
 let lagunaNativeAffineQKVEnabled = lagunaNativeAffineQKVLayerCount > 0
