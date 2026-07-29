@@ -267,8 +267,19 @@ template <
   // Restricted to
   // do_causal && !has_mask so the all-masked proof rests on the causal mask
   // alone; the timed window passes no array mask.
+  //
+  // The lower bound is tightened to this simdgroup's first query row as well.
+  // For kb < floor(max(0, sg_q_min + 1) / BK), every column in the K block is
+  // at most the first query row and therefore at most every row owned by this
+  // simdgroup. The causal select would keep every existing Stile element
+  // unchanged. Skipping only that predicate/select loop changes no value or
+  // arithmetic order.
+  int sg_kb_min_causal = kb_min_causal;
   int sg_kb_lim = kb_lim;
   if (do_causal && !has_mask) {
+    int sg_q_min =
+        int(tidl.x) * BQ + params->qL_off + int(tm);
+    sg_kb_min_causal = max(0, sg_q_min + 1) / BK;
     int sg_q_max =
         int(tidl.x) * BQ + params->qL_off + int(tm) + kU * TQ;
     sg_kb_lim = min(kb_lim, (sg_q_max + BK - 1) / BK);
@@ -440,7 +451,7 @@ template <
     }
 
     // Mask out if causal
-    if (do_causal && kb >= kb_min_causal) {
+    if (do_causal && kb >= sg_kb_min_causal) {
       constexpr auto neg_inf = Limits<AccumType>::finite_min;
 
       const int base_row = int(tidl.x) * BQ + params->qL_off + tm;
