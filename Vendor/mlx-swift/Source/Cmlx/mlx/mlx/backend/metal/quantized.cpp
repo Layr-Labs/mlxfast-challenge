@@ -1258,6 +1258,13 @@ int darkbloom_gather_run_skip_pct() {
 
 bool darkbloom_stage_flag(const char* name) {
   auto v = env::get_var(name, "");
+  // DARKBLOOM_STAGE_RUNBAR ships ON: drops 2 provably dead per-run barriers
+  // in the gather-GEMM threadgroup loader. Bit-exact (no inter-threadgroup
+  // dependency crosses them) and measured -0.75% decode locally (the seed
+  // prefill benefits). An explicit "0" restores the dead barriers for A/B.
+  if (v.empty() && std::string(name) == "DARKBLOOM_STAGE_RUNBAR") {
+    return true;
+  }
   return v == "1";
 }
 
