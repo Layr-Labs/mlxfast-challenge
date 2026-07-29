@@ -587,16 +587,20 @@ initialization warmup of an excluded speculative pipeline is also excluded.
 The model quantization is frozen to an accepted envelope, and every
 submission may use all of it. The envelope is exactly two things: (1) the
 reference NVFP4 weights as shipped — group size 16, 4 bits, mode `nvfp4`; and
-(2) one established re-quantization, in which the attention Q/K/V and output
-projection weights may be re-represented as group-32 affine INT8 derived at
+(2) one established re-quantization, in which the attention Q/K/V, output, and
+per-head gate (`g_proj`) projection weights may be re-represented as group-32
+affine INT8 derived at
 init from the loaded NVFP4 weights. That attention re-quant is accepted and
-available to all submissions. Nothing beyond this envelope is permitted: do
-not re-quantize any other weight (the MoE routed or shared experts, router
+available to all submissions. Note the attention per-head gate `g_proj` is a
+distinct parameter from the MoE router gate: `g_proj` is an attention
+projection and is inside the envelope, whereas the MoE router gate is not and
+stays as shipped. Nothing beyond this envelope is permitted: do
+not re-quantize any other weight (the MoE routed or shared experts, MoE router
 gate, embeddings, `lm_head`, and every other parameter must remain NVFP4
 group-16 4-bit); do not use any bit width other than 4 or 8, any group size
 other than 16 or 32, or any mode other than `nvfp4` or affine; and do not make
-the attention re-quant lossier than group-32 affine INT8 (a larger group or
-fewer bits). This holds even when a further re-quantization passes the
+the attention re-quant (including `g_proj`) lossier than group-32 affine INT8
+(a larger group or fewer bits). This holds even when a further re-quantization passes the
 correctness gates, because going beyond the envelope substitutes a
 further-degraded numerical representation of the model rather than optimizing
 the accepted one. Pure memory relayout or co-tiling that preserves quantized
