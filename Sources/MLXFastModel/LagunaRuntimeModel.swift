@@ -1140,7 +1140,7 @@ func lagunaSlidingQKNormRoPE(
 ///    re-derivation. The decode twin (`laguna_sliding_qk_norm_rope_bf16_128_v1`)
 ///    consumes the same table with the same expression.
 private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_v1",
+    name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_v2",
     inputNames: [
         "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
         "offsets",
@@ -1175,6 +1175,7 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         uint base = lane * 4;
         thread bfloat normalized[4];
         float sum = 0.0f;
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             float value = float(input[base + i]);
             sum += value * value;
@@ -1186,6 +1187,7 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
@@ -1194,6 +1196,7 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
 
         // Element `p + 64`, the partner of pair `p`, lives 16 lanes away.
         thread float paired[4];
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
         }
@@ -1203,6 +1206,7 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         // Every element rotates, so the lower sixteen lanes own all 64
         // pairs and write both halves of each.
         if (lane < 16) {
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
                 float first = float(normalized[i]);
@@ -1233,7 +1237,7 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
 /// and the tail elements 64…127 written verbatim, matching the values the
 /// stock pre-RoPE copy leaves behind.
 private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_full_qk_norm_yarn_bf16_128_v1",
+    name: "laguna_prefill_full_qk_norm_yarn_bf16_128_v2",
     inputNames: [
         "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
         "offsets",
@@ -1269,6 +1273,7 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
         uint base = lane * 4;
         thread bfloat normalized[4];
         float sum = 0.0f;
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             float value = float(input[base + i]);
             sum += value * value;
@@ -1276,6 +1281,7 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
@@ -1285,6 +1291,7 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
         // Element `p + 32`, the rotary partner of pair `p` inside the
         // 64-wide YaRN half, lives 8 lanes away.
         thread float paired[4];
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
         }
@@ -1293,6 +1300,7 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
             angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
         if (lane < 8) {
             bfloat rounded_mscale = bfloat(yarn_mscale);
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
                 float first =
@@ -1306,6 +1314,7 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
                     bfloat(first * sine + second * cosine);
             }
         } else if (lane >= 16) {
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 output[base + i] = normalized[i];
             }
@@ -3291,15 +3300,14 @@ func lagunaRoutedSwiGLUQMV(
 }
 
 /// The routed and shared gate/up QMVs read the same activation row, write
-/// different outputs, and share an identical tile shape: 128 tiles of four
-/// output rows, two rows per simdgroup, four 512-wide K blocks. They are also
-/// independent of each other, so MLX issues them into the same barrier group
-/// anyway. Merging them into one nine-slot dispatch (slots 0-7 routed, slot 8
-/// shared) removes one dispatch per sparse layer without touching either
-/// slot's arithmetic: a threadgroup does exactly the work it did before, over
-/// the same bank, in the same order.
+/// different outputs, and share an identical one-row-per-SIMD tile: 256 tiles
+/// of two output rows and four 512-wide K blocks. Splitting the old two-row
+/// accumulator doubles independent threadgroups while preserving every
+/// output row's K-loop, scale application, casts, and SwiGLU arithmetic.
+/// Merging routed slots 0-7 with shared slot 8 still removes one dispatch per
+/// sparse layer without changing any slot's arithmetic.
 private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_v2",
+    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_r1_v3",
     inputNames: [
         "input", "routed_weight", "routed_scales", "indices",
         "shared_weight", "shared_scales",
@@ -3315,7 +3323,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
         constexpr uint scale_expert_bytes = fused_width * scale_row_bytes;
         constexpr uint block_width = 512;
         constexpr uint values_per_lane = 16;
-        constexpr uint tiles_per_expert = 128;
+        constexpr uint tiles_per_expert = 256;
         constexpr uint routed_experts = 8;
 
         // Preserve each expert tile's arithmetic and output address while
@@ -3327,7 +3335,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
         bool is_routed = expert_slot < routed_experts;
         uint simd_group = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
-        uint first_row = tile * 4 + simd_group * 2;
+        uint first_row = tile * 2 + simd_group;
 
         const device uint8_t* expert_weight;
         const device uint8_t* expert_scales;
@@ -3342,8 +3350,8 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             expert_scales = shared_scales;
         }
 
-        thread float gate_result[2] = {0.0f, 0.0f};
-        thread float up_result[2] = {0.0f, 0.0f};
+        thread float gate_result[1] = {0.0f};
+        thread float up_result[1] = {0.0f};
         thread float input_values[values_per_lane];
 
         for (uint block = 0; block < input_width; block += block_width) {
@@ -3358,7 +3366,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
                 input_values[4 * i + 3] = values[3];
             }
 
-            for (uint row = 0; row < 2; ++row) {
+            for (uint row = 0; row < 1; ++row) {
                 uint logical_row = first_row + row;
                 uint gate_row;
                 uint up_row;
@@ -3394,7 +3402,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             }
         }
 
-        for (uint row = 0; row < 2; ++row) {
+        for (uint row = 0; row < 1; ++row) {
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
             if (lane == 0) {
@@ -3730,7 +3738,7 @@ func lagunaRoutedSharedSwiGLUQMV(
     lagunaTrace("routed+shared gate/up QMV")
     let outputs = lagunaRoutedSharedSwiGLUQMVKernel(
         [input, routedWeight, routedScales, indices, sharedWeight, sharedScales],
-        grid: ((LagunaConstants.numExpertsPerTok + 1) * 128 * 64, 1, 1),
+        grid: ((LagunaConstants.numExpertsPerTok + 1) * 256 * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [
             [
@@ -4719,19 +4727,19 @@ private let lagunaDecodeRouterTop8Header = """
     """
 
 private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_v3",
+    name: "laguna_decode_router_top8_v4",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
-    source: lagunaDecodeRouterTop8KernelSource(normalizing: false),
+    source: lagunaPrefillRouterTournamentKernelSource(normalizing: false),
     header: lagunaDecodeRouterTop8Header,
     ensureRowContiguous: true
 )
 
 private let lagunaDecodeRouterTop8NormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_norm_v2",
+    name: "laguna_decode_router_top8_norm_v3",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
-    source: lagunaDecodeRouterTop8KernelSource(normalizing: true),
+    source: lagunaPrefillRouterTournamentKernelSource(normalizing: true),
     header: lagunaDecodeRouterTop8Header,
     ensureRowContiguous: true
 )
