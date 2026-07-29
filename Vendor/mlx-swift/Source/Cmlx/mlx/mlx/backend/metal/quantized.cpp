@@ -1262,13 +1262,11 @@ bool darkbloom_stage_flag(const char* name) {
 }
 
 bool darkbloom_stage_widest() {
-  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_WIDEST");
-  return v;
+  return true;
 }
 
 bool darkbloom_stage_wideld() {
-  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_WIDELD");
-  return v;
+  return true;
 }
 
 bool darkbloom_stage_runbar() {
@@ -1609,6 +1607,18 @@ void gather_qmm_rhs_nax(
         {&stage_wideld, MTL::DataType::DataTypeBool, 205},
         {&stage_runbar, MTL::DataType::DataTypeBool, 206},
         {&stage_novol, MTL::DataType::DataTypeBool, 207},
+    };
+  } else {
+    // Expert-aligned dispatches skip align_* / run_skip but still
+    // benefit from the load/store widening levers (WIDEST/WIDELD).
+    // These are byte-for-byte identical: same addresses, same nibble
+    // decode, same scale mapping — only access width changes.
+    // NOVOL and RUNBAR are deliberately left off: NOVOL was rejected
+    // on M5 (-2.29%) and RUNBAR only targets the non-expert path's
+    // barrier layout.
+    func_consts = {
+        {&stage_widest, MTL::DataType::DataTypeBool, 204},
+        {&stage_wideld, MTL::DataType::DataTypeBool, 205},
     };
   }
 
