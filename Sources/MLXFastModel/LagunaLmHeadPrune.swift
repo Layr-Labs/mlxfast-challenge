@@ -123,7 +123,7 @@ private let lagunaLmHeadPruneHeader = """
 /// outputs are bit-identical to v1 for every input, so the notes/68
 /// certificate is untouched.
 private let lagunaLmHeadCoarseKernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_mxfp8_coarse_v2",
+    name: "laguna_lmhead_mxfp8_coarse_v3",
     inputNames: ["x", "codes", "scales"],
     outputNames: ["coarse", "delta", "coarse_bf"],
     source: """
@@ -139,6 +139,7 @@ private let lagunaLmHeadCoarseKernel = MLXFast.metalKernel(
         float c_acc = 0.0f;
         float d_acc = 0.0f;
         float m_acc = 0.0f;
+        #pragma clang loop unroll(full)
         for (uint gg = 0; gg < 2; ++gg) {
             uint g = 2 * lane + gg;
             float sd = laguna_e8m0_decode(srow[g]);
