@@ -1241,13 +1241,12 @@ template <
             // (BK=64/SK=32). Full unroll lets the second step's 6 fragment
             // loads issue during the first step's MMA chain. Scheduling
             // only: tile_matmad_nax order and Dtile accumulation sequence
-            // are unchanged. Volatile stays, gated by stage_novol (fc 207).
+            // are unchanged. Volatile removed (mirrors the audited expert
+            // staging path; register budget audited there).
             STEEL_PRAGMA_UNROLL
             for (int kk1 = 0; kk1 < BK; kk1 += SK) {
               NAXTile<T, TM, TK> Atile;
               NAXTile<Wtype, BR, BC> Btile;
-
-              volatile int compiler_barrier;
 
               if constexpr (kAlignedM.value) {
                 Atile.load(xn + kk1, K);
@@ -1270,14 +1269,11 @@ template <
                   Btile,
                   metal::bool_constant<transpose>{});
 
-              // DARKBLOOM_STAGE_NOVOL: the volatile read forces a stack load
-              // and an optimization barrier on every inner step, which blocks
-              // software-pipelining the Atile load against the MMA. Dropping
-              // it touches no arithmetic and no memory the kernel reads or
-              // writes.
-              if (!stage_novol) {
-                (void)compiler_barrier;
-              }
+              // Volatile barrier removed (mirrors the audited expert staging
+              // path): the next step's fragment loads may now hoist ahead of
+              // this step's MMA. Scheduling only: no arithmetic, order,
+              // rounding, or memory change; register budget audited via the
+              // equivalent expert staging path (ranked +0.83%).
             }
           }
 
@@ -1297,8 +1293,6 @@ template <
               NAXTile<T, TM, TK> Atile;
               NAXTile<Wtype, BR, BC> Btile;
 
-              volatile int compiler_barrier;
-
               const short psk = min(int(SK), max(0, (BK - kk1)));
               Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
 
@@ -1316,10 +1310,6 @@ template <
                   metal::bool_constant<false>{},
                   Btile,
                   metal::bool_constant<transpose>{});
-
-              if (!stage_novol) {
-                (void)compiler_barrier;
-              }
             }
           }
         }
