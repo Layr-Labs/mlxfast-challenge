@@ -254,6 +254,34 @@ let lagunaFusedRoutedSharedSwiGLUQMVEnabled =
 let lagunaFusedGatedOutputProjectionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATED_OUTPUT"] != "0"
 
+/// Exact BF16 exponent-delta sidecars for the first N sliding-layer output
+/// projections. Ten layers are the first ranked rollout chunk. The original
+/// BF16 `o_proj` remains resident for prefill and raw-row fallback.
+let lagunaLosslessSlidingOCodecLayerCount: Int = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LOSSLESS_SLIDING_O_LAYERS"],
+        let count = Int(raw)
+    else { return 10 }
+    return min(max(count, 0), 30)
+}()
+
+/// Independent unroll control for the decode-time codec kernel. All variants
+/// are compiled into one binary so synthetic A/B can choose a geometry without
+/// changing codec bytes or arithmetic.
+let lagunaLosslessSlidingOCodecUnroll: Int = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LOSSLESS_SLIDING_O_UNROLL"],
+        let value = Int(raw), [1, 2, 4, 8].contains(value)
+    else { return 2 }
+    return value
+}()
+
+private let lagunaLosslessSlidingOCodecLayerIndices: Set<Int> = Set(
+    (0..<LagunaConstants.numHiddenLayers)
+        .filter { !$0.isMultiple(of: 4) }
+        .prefix(lagunaLosslessSlidingOCodecLayerCount)
+)
+
 /// Issues Q, K and V as one dispatch over the three stock weights (see
 /// `lagunaFusedQKVProjectionSource`). Unlike `DARKBLOOM_FUSED_QKV` this keeps
 /// no concatenated bank, so prefill is untouched. Set
@@ -1918,6 +1946,7 @@ private let lagunaSlidingAttentionGateProjection = makeLagunaAttentionGateProjec
 /// sliding layers over the whole head), and per-head softplus output gating.
 /// Mirrors the vendored `LagunaAttention` forward exactly.
 final class LagunaRuntimeAttention: Module {
+    let layerIndex: Int
     let nHeads: Int
     let nKVHeads: Int
     let headDim: Int
@@ -1945,6 +1974,12 @@ final class LagunaRuntimeAttention: Module {
     /// checkpoint parameter; the q/k/v `Linear` modules keep the original
     /// arrays for parameter integrity.
     var _fusedQKVWeight: MLXArray?
+
+    /// Decode-only exact sidecar for selected sliding `o_proj` matrices. This
+    /// is a plain derived property rather than a module parameter, so checkpoint
+    /// loading and the prefill projection continue to see the original BF16
+    /// `wo.weight` unchanged.
+    var _losslessOCodec: LagunaBF16RowCodecStorage?
 
     /// Builds and retains the fused QKV weight from the loaded q/k/v
     /// projection weights. Called once after weights are installed and
@@ -1975,8 +2010,26 @@ final class LagunaRuntimeAttention: Module {
         return fused
     }
 
+    func prepareLosslessOCodec() -> [MLXArray] {
+        guard _losslessOCodec == nil,
+            isSliding,
+            lagunaLosslessSlidingOCodecLayerIndices.contains(layerIndex),
+            type(of: wo) == Linear.self,
+            wo.bias == nil,
+            wo.weight.dtype == .bfloat16,
+            wo.weight.shape == [
+                LagunaConstants.hiddenSize,
+                LagunaConstants.slidingAttentionHeads * LagunaConstants.headDim,
+            ],
+            let codec = LagunaBF16RowCodec.makeStorage(weight: wo.weight)
+        else { return [] }
+        _losslessOCodec = codec
+        return [codec.payload, codec.tiers, codec.extraOffsets]
+    }
+
     init(_ config: LagunaConfig, layerIdx: Int) {
         let dim = config.hiddenSize
+        self.layerIndex = layerIdx
         self.nHeads = config.heads(forLayer: layerIdx)
         self.nKVHeads = config.numKeyValueHeads
         self.headDim = config.headDim
@@ -2266,15 +2319,27 @@ final class LagunaRuntimeAttention: Module {
                 wo.weight.dtype == .bfloat16,
                 output.shape == [1, 1, nHeads * headDim],
                 projectedGate.shape == [1, 1, nHeads],
-                wo.weight.shape == [LagunaConstants.hiddenSize, nHeads * headDim],
-                let projection = lagunaGatedOutputProjection(
+                wo.weight.shape == [LagunaConstants.hiddenSize, nHeads * headDim]
+            {
+                if let codec = _losslessOCodec,
+                    let projection = lagunaLosslessSlidingOProjection(
+                        attentionOutput: output,
+                        gateValues: projectedGate,
+                        rawWeight: wo.weight,
+                        codec: codec,
+                        unroll: lagunaLosslessSlidingOCodecUnroll)
+                {
+                    return projection
+                }
+                if let projection = lagunaGatedOutputProjection(
                     attentionOutput: output,
                     gateValues: projectedGate,
                     weight: wo.weight,
                     heads: nHeads
                 )
-            {
-                return projection
+                {
+                    return projection
+                }
             }
             if !gateIsActivated,
                 gatePerHead && projectedGate.dtype == output.dtype,
@@ -5860,6 +5925,7 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     func prepareFusedRuntimeWeights() {
         var fusedArrays = model.prepareRoPEAngleAtlases()
         for layer in model.layers {
+            fusedArrays.append(contentsOf: layer.selfAttn.prepareLosslessOCodec())
             if lagunaFusedQKVEnabled, let fused = layer.selfAttn.prepareFusedQKVWeight() {
                 fusedArrays.append(fused)
             }
