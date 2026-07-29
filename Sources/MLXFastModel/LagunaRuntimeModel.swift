@@ -1577,22 +1577,39 @@ private func lagunaFusedQKVProjectionSource(heads: Int) -> String {
         thread float coefficients[values_per_thread];
 
         uint column = lane * values_per_thread;
-        for (uint block = 0; block < blocks; ++block) {
-            for (uint i = 0; i < values_per_thread; ++i) {
-                coefficients[i] = float(normalized_row[column + i]);
-            }
-
-            for (uint row = 0; row < rows_per_thread; ++row) {
-                const device vec<bfloat, 4>* row_values =
-                    (const device vec<bfloat, 4>*)(
-                        weight + (row_base + row) * in_vec_size + column);
-                const vec<bfloat, 4> w = row_values[0];
-                for (uint i = 0; i < values_per_thread; ++i) {
-                    result[row] += float(w[i]) * coefficients[i];
+        constexpr uint projection_unroll = 2;
+        for (uint block = 0; block < blocks; block += projection_unroll) {
+            vec<bfloat, 4> coefficient_values[projection_unroll];
+            vec<bfloat, 4> weight_values[projection_unroll][rows_per_thread];
+            for (uint u = 0; u < projection_unroll; ++u) {
+                uint column_u = column + u * block_width;
+                const threadgroup vec<bfloat, 4>* normalized_values =
+                    (const threadgroup vec<bfloat, 4>*)(
+                        normalized_row + column_u);
+                coefficient_values[u] = normalized_values[0];
+                for (uint row = 0; row < rows_per_thread; ++row) {
+                    const device vec<bfloat, 4>* row_values =
+                        (const device vec<bfloat, 4>*)(
+                            weight + (row_base + row) * in_vec_size + column_u);
+                    weight_values[u][row] = row_values[0];
                 }
             }
 
-            column += block_width;
+            // Hoist loads only. The single accumulator for each row still
+            // advances in strict (block, i) order.
+            for (uint u = 0; u < projection_unroll; ++u) {
+                for (uint i = 0; i < values_per_thread; ++i) {
+                    coefficients[i] = float(coefficient_values[u][i]);
+                }
+                for (uint row = 0; row < rows_per_thread; ++row) {
+                    const vec<bfloat, 4> w = weight_values[u][row];
+                    for (uint i = 0; i < values_per_thread; ++i) {
+                        result[row] += float(w[i]) * coefficients[i];
+                    }
+                }
+            }
+
+            column += projection_unroll * block_width;
         }
 
         for (uint row = 0; row < rows_per_thread; ++row) {
@@ -1612,7 +1629,7 @@ private let lagunaFusedQKVProjectionKernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_fused_norm_qkv_projection_bf16_h\(heads)_v3",
+            name: "laguna_fused_norm_qkv_projection_bf16_h\(heads)_u2_v4",
             inputNames: [
                 "residual", "norm_weight", "query_weight", "key_weight",
                 "value_weight", "gate_weight",
