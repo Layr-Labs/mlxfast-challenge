@@ -182,6 +182,106 @@ inline void dequantize(uint8_t w, U scale, threadgroup U* w_local) {
   }
 }
 
+///////////////////////////////////////////////////////////////////////////////
+// NVFP4 block-loader staging fast path.
+//
+// Two bit-exact rewrites of the fp4 staging chain QuantizedBlockLoader runs
+// (the qmm / gather-qmm prefill kernels). Both rest on one observation about
+// `fp4_e2m1::operator float16_t()`:
+//
+//     half converted = as_type<half>(ushort((bits & 7) << 9));
+//     converted *= 16384.0;                        // 2^14
+//     return bits & 8 ? -converted : converted;
+//
+// The 3-bit magnitude field is *bit-embedded* into a half -- fp4's 2-bit
+// exponent lands in the low two bits of half's 5-bit exponent field and fp4's
+// single mantissa bit lands in half mantissa bit 9 -- so the reinterpreted
+// half is already the right number up to a fixed power of two: exactly
+// {0, .5, 1, 1.5, 2, 3, 4, 6} * 2^-14. The `* 16384.0` is a pure
+// renormalization, never a rounding step. (0.5 * 2^-14 == 2^-15 is a half
+// subnormal, and its bit pattern is precisely the one we started from, so
+// nothing rounds there either.)
+//
+// CHANGE 1 -- hoist the 2^14 out of the per-value converts into the one
+// per-group scale. The loader stores `scale * value`, so with
+//     s = the e4m3 group scale (at most 4 significant bits, |s| in
+//         [2^-9, 448] or NaN)
+//     m = an fp4 magnitude in {0, .5, 1, 1.5, 2, 3, 4, 6}
+// today's chain rounds `s * (m * 2^-14 * 2^14)` once and the folded chain
+// rounds `(s * 2^14) * (m * 2^-14)` once. Every factor is exact in binary FP:
+//   * s * 2^14 only shifts an exponent -- no rounding -- and can neither
+//     overflow (448 * 2^14 = 7340032, far inside float) nor underflow
+//     (2^-9 * 2^14 = 2^5),
+//   * m * 2^-14 is exactly representable in half, bfloat and float,
+//   * so both orderings are the SAME real number rounded once to the same
+//     destination type: identical bits.
+// The per-value multiply count drops from `n_reads * pack_factor` to one.
+// This is the loader-side sibling of the 2^22 fold `laguna_nvfp4_scale`
+// already carries in the decode custom kernels.
+//
+// Restricted to group_size == 16, the e4m3 (NVFP4) scale. mxfp4's e8m0 scales
+// (group_size 32) reach 2^127, where s * 2^14 would overflow to inf, so those
+// instantiations keep the original chain byte for byte.
+//
+// CHANGE 2 -- spread eight nibbles per uint32 instead of two per byte. The
+// byte-at-a-time chain costs AND + SHL + half multiply + AND + compare +
+// select per nibble plus a SHR per byte (~104 scalar ops per thread per
+// k-iteration at 16 values). The uint-at-a-time spread is four masked-
+// shift-OR groups, 19 integer ops per uint32, each producing a half2 whose
+// two lanes are two nibbles with the sign folded into the same OR. Ported
+// from `laguna_nvfp4_qdot_16` in the decode custom kernels. The half bit
+// patterns it builds are exactly the ones fp4_e2m1 builds one lane at a time,
+// so the staged values are unchanged.
+//
+// Verified by exhaustive GPU enumeration against the byte-at-a-time chain for
+// bfloat16_t, float16_t and float: all 256 scale bytes x all 256 packed
+// bytes, and all 256 scale bytes x all 65536 four-nibble codes -- 0 bit
+// mismatches out of 404,226,048 staged values.
+///////////////////////////////////////////////////////////////////////////////
+
+// Per-group NVFP4 scale with fp4's 2^14 renormalization folded in (Change 1).
+static inline float fp4nv_scale_x16384(uint8_t s) {
+  return float(*(thread fp8_e4m3*)(&s)) * 16384.0f;
+}
+
+// Four packed bytes -> one uint32 in little-endian nibble order. Read through
+// packed_uchar4, whose alignment is 1, so widening the access adds no address
+// precondition the byte-at-a-time loop did not already satisfy.
+static inline uint32_t fp4nv_pack4(const device uint8_t* p) {
+  return as_type<uint32_t>(uchar4(*(const device packed_uchar4*)p));
+}
+static inline uint32_t fp4nv_pack4(const thread uint8_t* p) {
+  return as_type<uint32_t>(uchar4(p[0], p[1], p[2], p[3]));
+}
+
+// Decode the eight fp4 nibbles packed in `c` and apply the folded scale
+// (Change 2). `out[k]` is nibble k -- byte k/2's low half for even k, high
+// half for odd k -- which is exactly the order `dequantize<U, 4>` produces
+// when walking those four bytes.
+template <typename T>
+static inline void fp4nv_decode8(uint32_t c, float scale, thread T* out) {
+  const float2 v0 = float2(as_type<half2>(
+                        ((c & 0x00070007u) << 9) | ((c & 0x00080008u) << 12))) *
+      scale;
+  const float2 v1 = float2(as_type<half2>(
+                        ((c & 0x00700070u) << 5) | ((c & 0x00800080u) << 8))) *
+      scale;
+  const float2 v2 = float2(as_type<half2>(
+                        ((c & 0x07000700u) << 1) | ((c & 0x08000800u) << 4))) *
+      scale;
+  const float2 v3 =
+      float2(as_type<half2>(((c & 0x70007000u) >> 3) | (c & 0x80008000u))) *
+      scale;
+  out[0] = T(v0.x);
+  out[1] = T(v1.x);
+  out[2] = T(v2.x);
+  out[3] = T(v3.x);
+  out[4] = T(v0.y);
+  out[5] = T(v1.y);
+  out[6] = T(v2.y);
+  out[7] = T(v3.y);
+}
+
 template <
     typename T,
     short BROWS,
@@ -240,16 +340,41 @@ struct QuantizedBlockLoader {
             scales_ + bi * src_ld / group_size +
             (bj * pack_factor) / group_size) {}
 
+  // The NVFP4 staging fast path applies when the packing is one byte per two
+  // values, the scale is e4m3, and this thread's run of source bytes splits
+  // evenly into uint32s. Every fp4 instantiation in this file qualifies
+  // (n_reads is 4 for qmm_t/qmm_n and 8 for gather_qmm_rhs); anything else --
+  // mxfp8 (bits 8), mxfp4 (e8m0 scales) -- keeps the original scalar chain.
+  MLX_MTL_CONST bool fp4nv_fast = (bits == 4) && (group_size == 16) &&
+      (bytes_per_pack == 1) && (n_reads >= 4) && ((n_reads % 4) == 0);
+
+  // Stage this thread's n_reads packed bytes into `dst`. Identical values at
+  // identical addresses on both paths; see the note above dequantize().
+  void stage() const {
+    if constexpr (fp4nv_fast) {
+      const float scale = fp4nv_scale_x16384(*scales);
+      for (int i = 0; i < n_reads / 4; i++) {
+        T vals[8];
+        fp4nv_decode8<T>(fp4nv_pack4(src + i * 4), scale, vals);
+        for (int j = 0; j < 8; j++) {
+          dst[i * 8 + j] = vals[j];
+        }
+      }
+    } else {
+      T scale = dequantize_scale<T, group_size>(*scales);
+      for (int i = 0; i < n_reads; i++) {
+        dequantize<T, bits>(
+            src[i * bytes_per_pack], scale, dst + i * pack_factor);
+      }
+    }
+  }
+
   void load_unsafe() const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
       return;
     }
 
-    T scale = dequantize_scale<T, group_size>(*scales);
-    for (int i = 0; i < n_reads; i++) {
-      dequantize<T, bits>(
-          src[i * bytes_per_pack], scale, dst + i * pack_factor);
-    }
+    stage();
   }
 
   void load_safe(short2 src_tile_dim) const {
@@ -271,11 +396,7 @@ struct QuantizedBlockLoader {
       return;
     }
 
-    T scale = dequantize_scale<T, group_size>(*scales);
-    for (int i = 0; i < n_reads; i++) {
-      dequantize<T, bits>(
-          src[i * bytes_per_pack], scale, dst + i * pack_factor);
-    }
+    stage();
   }
 
   void next() {
