@@ -6797,7 +6797,7 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         if lagunaLmHeadPruneEnabled, let lmHead {
             lmHeadPruner = LagunaLmHeadPruner(lmHeadWeight: lmHead.weight)
             if let pruner = lmHeadPruner {
-                eval(pruner.codes, pruner.scales)
+                eval(pruner.evalArrays)
                 FileHandle.standardError.write(
                     Data("mlxfast: lm_head prune active (mxfp8 coarse copy resident)\n".utf8))
             }

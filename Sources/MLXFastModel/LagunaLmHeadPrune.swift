@@ -245,9 +245,83 @@ private let lagunaLmHeadCoarseKernelV1 = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// Same-binary A/B selector for the coarse kernel (v2 default).
-private let lagunaLmHeadCoarseUseV1 =
-    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COARSE"] == "v1"
+/// Same-binary A/B selector for the coarse arm. Default is the affine
+/// INT4 group-64 copy with measured per-group error bounds (`i4g64`, below);
+/// `DARKBLOOM_LMHEAD_COARSE=v2` (or `mxfp8`) restores the MXFP8 coarse copy,
+/// `=v1` its scalar-decode variant, both byte-for-byte as shipped.
+private enum LagunaLmHeadCoarseArm { case i4g64, mxfp8V2, mxfp8V1 }
+private let lagunaLmHeadCoarseArm: LagunaLmHeadCoarseArm = {
+    switch ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COARSE"]?.lowercased() {
+    case "v1": return .mxfp8V1
+    case "v2", "mxfp8": return .mxfp8V2
+    default: return .i4g64
+    }
+}()
+
+/// Affine INT4 group-64 coarse GEMV with a MEASURED certified bound.
+///
+/// Replaces the 211.9 MB MXFP8 coarse read with 122.0 MB (100.4 MB packed
+/// 4-bit codes + 2×6.4 MB bf16 scales/biases + 6.4 MB bf16 bounds + fp32
+/// paths unchanged). The certificate structure is exactly notes/68's:
+/// delta_i = d_i·(1+γ) + 2γ·m_i, with the quantization half of d_i now
+/// d_i = Σ_g E_g · Σ_{j∈g} |x_j|, where E_g is a per-group bound on
+/// |w_ij − ŵ_ij| MEASURED FROM THE STORED ARTIFACTS at init (see the pruner
+/// below). Measured rather than derived, deliberately: the textbook affine
+/// bound |s|/2 is UNSOUND against the vendored encoder (zero-snap, top-edge
+/// clip after the snap, bf16 storage rounding of scale/bias — violated on
+/// 89.4% of real lm_head groups, up to 3.0×), and a measured E holds for
+/// whatever codes/scales/biases exist regardless of which backend encoded
+/// them. The kernel's fma decode (ŵ = fma(s, q, b), one rounding) plus the
+/// 64-term sequential accumulation stays within the ≤96-roundings depth the
+/// γ = 2⁻¹⁵ term already covers (notes/68 section 6).
+///
+/// Geometry: one simdgroup per row (8 rows per 256-thread group, same grid
+/// as the MXFP8 kernels); lane g owns group g exactly (32 lanes × 64
+/// elements = 2048), reading 8 packed uint32 words (MLX 4-bit packing is
+/// LSB-first: element k of a word at bits 4k, ascending j-order preserved).
+private let lagunaLmHeadCoarseKernelI4G64 = MLXFast.metalKernel(
+    name: "laguna_lmhead_i4g64_coarse_v1",
+    inputNames: ["x", "codes4", "scales4", "biases4", "ebounds4"],
+    outputNames: ["coarse", "delta", "coarse_bf"],
+    source: """
+        constexpr float GAMMA = 0x1p-15f;
+
+        uint row = threadgroup_position_in_grid.x * 8 +
+            simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        const device uint* crow = codes4 + size_t(row) * 256;
+        float s = float(scales4[size_t(row) * 32 + lane]);
+        float b = float(biases4[size_t(row) * 32 + lane]);
+        float e = float(ebounds4[size_t(row) * 32 + lane]);
+
+        float c_acc = 0.0f;
+        float m_acc = 0.0f;
+        float sx_acc = 0.0f;
+        for (uint w = 0; w < 8; ++w) {
+            uint word = crow[lane * 8 + w];
+            for (uint k = 0; k < 8; ++k) {
+                float qf = float((word >> (4u * k)) & 0xFu);
+                float av = fma(s, qf, b);
+                float xv = float(x[lane * 64 + w * 8 + k]);
+                c_acc = fma(xv, av, c_acc);
+                m_acc = fma(fabs(xv), fabs(av), m_acc);
+                sx_acc += fabs(xv);
+            }
+        }
+        float d_acc = e * sx_acc;
+        c_acc = simd_sum(c_acc);
+        d_acc = simd_sum(d_acc);
+        m_acc = simd_sum(m_acc);
+        if (lane == 0) {
+            coarse[row] = c_acc;
+            delta[row] = d_acc * (1.0f + GAMMA) + (2.0f * GAMMA) * m_acc;
+            coarse_bf[row] = bfloat(c_acc);
+        }
+        """,
+    header: lagunaLmHeadPruneHeader,
+    ensureRowContiguous: true
+)
 
 /// GPU candidate marking: one byte per vocabulary row, set when the row's
 /// certified upper bound reaches the threshold. A dense mask rather than a
@@ -374,8 +448,20 @@ private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
 /// `lagunaLmHeadPruneEnabled` (DARKBLOOM_LM_HEAD_PRUNE, default ON; set "0"
 /// to disable); ~212 MB additional resident memory.
 final class LagunaLmHeadPruner {
-    let codes: MLXArray   // [100352, 2048] uint8 e4m3 elements
-    let scales: MLXArray  // [100352, 64] uint8 e8m0 group scales
+    // MXFP8 arms (env-selected fallback; byte-identical to the shipped copy).
+    let codes: MLXArray?   // [100352, 2048] uint8 e4m3 elements
+    let scales: MLXArray?  // [100352, 64] uint8 e8m0 group scales
+    // Affine INT4 group-64 arm (default): packed codes + bf16 scales/biases
+    // + measured per-group certified error bounds (see the i4g64 kernel doc).
+    let codes4: MLXArray?    // [100352, 256] uint32 (8 nibbles per word)
+    let scales4: MLXArray?   // [100352, 32] bf16
+    let biases4: MLXArray?   // [100352, 32] bf16
+    let ebounds4: MLXArray?  // [100352, 32] bf16, round-up inflated
+
+    /// Every retained derived array for the caller's batched eval.
+    var evalArrays: [MLXArray] {
+        [codes, scales, codes4, scales4, biases4, ebounds4].compactMap { $0 }
+    }
 
     init?(lmHeadWeight: MLXArray) {
         guard lmHeadWeight.shape == [lagunaLmHeadPruneVocab, lagunaLmHeadPruneHidden],
@@ -384,6 +470,54 @@ final class LagunaLmHeadPruner {
             FileHandle.standardError.write(
                 Data("mlxfast: lm_head prune: unrecognized lm_head shape/dtype; disabled\n".utf8))
             return nil
+        }
+        if lagunaLmHeadCoarseArm == .i4g64 {
+            // Affine INT4 g64 copy plus the measured bound. E_g is computed
+            // from the STORED artifacts (bf16 scales/biases, packed codes),
+            // never from re-quantization assumptions, so it upper-bounds
+            // |w - ŵ| for whatever the encoder produced. Inflation makes the
+            // chain safe end to end: the f32 max picks up the exact per-
+            // element |w - fma-decode(ŵ)| grid values computed in f32
+            // (dequantized() dtype .float32), ×(1+2⁻²³) for the subtraction
+            // rounding, +2⁻²⁴·max|ŵ| for the decode fma rounding, ×(1+2⁻⁷)
+            // so the final round-to-nearest bf16 cast cannot round below the
+            // true bound. Chunked so init peak memory stays a few hundred MB.
+            let (wq, s4, b4Opt) = quantized(
+                lmHeadWeight, groupSize: 64, bits: 4, mode: .affine)
+            guard let b4 = b4Opt else {
+                FileHandle.standardError.write(
+                    Data("mlxfast: lm_head prune: affine biases missing; disabled\n".utf8))
+                return nil
+            }
+            let vocab = lagunaLmHeadPruneVocab
+            var boundChunks: [MLXArray] = []
+            let chunk = vocab / 4
+            for start in stride(from: 0, to: vocab, by: chunk) {
+                let end = min(start + chunk, vocab)
+                let wSlice = lmHeadWeight[start ..< end].asType(.float32)
+                let wdSlice = dequantized(
+                    wq[start ..< end],
+                    scales: s4[start ..< end], biases: b4[start ..< end],
+                    groupSize: 64, bits: 4, mode: .affine, dtype: .float32)
+                let rows = end - start
+                let err = abs(wSlice - wdSlice)
+                    .reshaped([rows, 32, 64]).max(axis: 2)
+                let mabs = abs(wdSlice)
+                    .reshaped([rows, 32, 64]).max(axis: 2)
+                let inflated =
+                    (err * Float(1.0 + 0x1p-23) + mabs * Float(0x1p-24))
+                    * Float(1.0 + 0x1p-7)
+                let bounds = inflated.asType(.bfloat16)
+                eval(bounds)
+                boundChunks.append(bounds)
+            }
+            self.codes4 = wq
+            self.scales4 = s4
+            self.biases4 = b4
+            self.ebounds4 = concatenated(boundChunks, axis: 0)
+            self.codes = nil
+            self.scales = nil
+            return
         }
         // The repo's own quantizer (ops.cpp fp_quantize gs32/bits8 ->
         // fp_quantized.h fp_quantize kernel): e8m0 group scale = 2^round(log2(
@@ -394,6 +528,10 @@ final class LagunaLmHeadPruner {
             lmHeadWeight, groupSize: 32, bits: 8, mode: .mxfp8)
         self.codes = wq.view(dtype: .uint8)
         self.scales = scales
+        self.codes4 = nil
+        self.scales4 = nil
+        self.biases4 = nil
+        self.ebounds4 = nil
     }
 
     /// Pruned decode lm_head: full [vocab] BF16 logits row, bit-identical to
@@ -404,15 +542,32 @@ final class LagunaLmHeadPruner {
         let vocab = lagunaLmHeadPruneVocab
         let x = hidden.reshaped([lagunaLmHeadPruneHidden])
 
-        let coarseKernel =
-            lagunaLmHeadCoarseUseV1 ? lagunaLmHeadCoarseKernelV1 : lagunaLmHeadCoarseKernel
-        let coarseOut = coarseKernel(
-            [x, codes, scales],
-            grid: (vocab / 8 * 256, 1, 1),
-            threadGroup: (256, 1, 1),
-            outputShapes: [[vocab], [vocab], [vocab]],
-            outputDTypes: [.float32, .float32, .bfloat16]
-        )
+        let coarseOut: [MLXArray]
+        if lagunaLmHeadCoarseArm == .i4g64,
+            let codes4, let scales4, let biases4, let ebounds4
+        {
+            coarseOut = lagunaLmHeadCoarseKernelI4G64(
+                [x, codes4, scales4, biases4, ebounds4],
+                grid: (vocab / 8 * 256, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[vocab], [vocab], [vocab]],
+                outputDTypes: [.float32, .float32, .bfloat16]
+            )
+        } else {
+            guard let codes, let scales else {
+                preconditionFailure("lm_head pruner arm/storage mismatch")
+            }
+            let coarseKernel =
+                lagunaLmHeadCoarseArm == .mxfp8V1
+                ? lagunaLmHeadCoarseKernelV1 : lagunaLmHeadCoarseKernel
+            coarseOut = coarseKernel(
+                [x, codes, scales],
+                grid: (vocab / 8 * 256, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[vocab], [vocab], [vocab]],
+                outputDTypes: [.float32, .float32, .bfloat16]
+            )
+        }
         let coarse = coarseOut[0]
         let delta = coarseOut[1]
         let coarseBF = coarseOut[2]
