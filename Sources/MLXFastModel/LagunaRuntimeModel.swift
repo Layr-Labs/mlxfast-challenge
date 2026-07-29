@@ -3124,8 +3124,11 @@ func lagunaRoutedDownReduce(
     )[0]
 }
 
+/// One output row per SIMD retains the exact row-local NVFP4 dot products and
+/// nine-slot BF16 reduction while exposing four times as many independent
+/// weight streams as the original four-accumulator form.
 private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_down_residual_bf16_v1",
+    name: "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v3",
     inputNames: [
         "routed_activated", "routed_down_weight", "routed_down_scales",
         "indices", "router_weights", "shared_activated",
@@ -3137,7 +3140,7 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
         constexpr uint output_width = 2048;
         constexpr uint routed_experts = 8;
         constexpr uint shared_slot = 8;
-        constexpr uint outputs_per_simd = 4;
+        constexpr uint outputs_per_simd = 1;
         constexpr uint values_per_lane = 16;
         constexpr uint packed_row_bytes = 256;
         constexpr uint scale_row_bytes = 32;
@@ -3176,9 +3179,7 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
             input_values[4 * i + 3] = values[3];
         }
 
-        thread float result[outputs_per_simd] = {
-            0.0f, 0.0f, 0.0f, 0.0f
-        };
+        thread float result[outputs_per_simd] = {0.0f};
         for (uint row = 0; row < outputs_per_simd; ++row) {
             uint output_row = first_row + row;
             const device uint8_t* weight =
@@ -3290,7 +3291,7 @@ func lagunaRoutedSharedDownResidual(
             indices, routerWeights, sharedActivated,
             sharedDownWeight, sharedDownScales, residual,
         ],
-        grid: ((LagunaConstants.hiddenSize / 4) * 288, 1, 1),
+        grid: (LagunaConstants.hiddenSize * 288, 1, 1),
         threadGroup: (288, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
         outputDTypes: [.bfloat16]
@@ -4048,6 +4049,13 @@ private let lagunaPrefillMoETailEnabled =
 private let lagunaPrefillSortedMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_SORTED_MOE_TAIL"] != "0"
 
+/// Switchable ranked-shape replacement for `gatherSort`'s generic routed-input
+/// and permutation staging. Source rows and indices are copied byte-for-byte;
+/// the fixed 512-token / top-8 dispatch also builds the inverse permutation.
+private let lagunaPrefillSortedRowCopyEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_SORTED_ROW_COPY"] != "0"
+
 /// Batched top-8 selection for multi-token (prefill) routing.
 ///
 /// Exactness against the stock chain it replaces, per row:
@@ -4715,6 +4723,77 @@ private func lagunaInterleavedSwiGLU(
     return compiledSiluProduct(gate, up)
 }
 
+/// `gatherSort` expands each token row once per selected expert after sorting
+/// the flattened expert indices. At the ranked shape that is a 16 MiB generic
+/// gather per sparse layer. This kernel emits the identical contiguous
+/// `[4096, 1, 2048]` BF16 payload with one 16-byte copy per lane.
+private let lagunaPrefillSortedRowCopyKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_sorted_row_copy_bf16_512x8_v1",
+    inputNames: ["source", "order"],
+    outputNames: ["sorted"],
+    source: """
+        constexpr uint hidden_vectors = 2048 / 8;
+        constexpr uint experts_per_token = 8;
+
+        uint vector_index = thread_position_in_grid.x;
+        uint sorted_row = thread_position_in_grid.y;
+        uint original_row = order[sorted_row];
+        uint source_row = original_row / experts_per_token;
+        const device uint4* source_vectors =
+            (const device uint4*)(source);
+        device uint4* sorted_vectors = (device uint4*)(sorted);
+        sorted_vectors[sorted_row * hidden_vectors + vector_index] =
+            source_vectors[source_row * hidden_vectors + vector_index];
+        """,
+    ensureRowContiguous: true
+)
+
+/// `order` is a permutation, so its inverse needs one scatter rather than a
+/// second comparison sort. This small dispatch also folds in
+/// `flatIndices[order]` while keeping random stores out of the row-copy groups.
+private let lagunaPrefillSortedMetadataKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_sorted_metadata_u32_4096_v1",
+    inputNames: ["flat_indices", "order"],
+    outputNames: ["sorted_indices", "inverse_order"],
+    source: """
+        uint sorted_row = thread_position_in_grid.x;
+        uint original_row = order[sorted_row];
+        sorted_indices[sorted_row] = flat_indices[original_row];
+        inverse_order[original_row] = sorted_row;
+        """,
+    ensureRowContiguous: true
+)
+
+private func lagunaPrefillSortedRoute(
+    source: MLXArray,
+    flatIndices: MLXArray,
+    order: MLXArray
+) -> (MLXArray, MLXArray, MLXArray) {
+    precondition(source.dtype == .bfloat16)
+    precondition(source.size == 512 * LagunaConstants.hiddenSize)
+    precondition(flatIndices.dtype == .uint32)
+    precondition(flatIndices.size == 512 * LagunaConstants.numExpertsPerTok)
+    precondition(order.dtype == .uint32)
+    precondition(order.size == 512 * LagunaConstants.numExpertsPerTok)
+
+    let sortedRows = 512 * LagunaConstants.numExpertsPerTok
+    let sorted = lagunaPrefillSortedRowCopyKernel(
+        [source, order],
+        grid: (LagunaConstants.hiddenSize / 8, sortedRows, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[sortedRows, 1, LagunaConstants.hiddenSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
+    let metadata = lagunaPrefillSortedMetadataKernel(
+        [flatIndices, order],
+        grid: (sortedRows, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[sortedRows], [sortedRows]],
+        outputDTypes: [.uint32, .uint32]
+    )
+    return (sorted, metadata[0], metadata[1])
+}
+
 /// Prefill (multi-token, SORTED-regime) counterpart to the decode-only fused
 /// gate/up dispatch in `LagunaRuntimeSparseMoEBlock.forward`. One gather-QMM
 /// consumes the retained `[gate32, up32]`-interleaved NVFP4 bank in place of
@@ -4744,7 +4823,22 @@ private func lagunaFusedSortedRoutedGateUp(
     var inverseOrder = MLXArray()
     // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
     if doSort {
-        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        if lagunaPrefillSortedRowCopyEnabled,
+            sortedX.dtype == .bfloat16,
+            sortedX.size == 512 * LagunaConstants.hiddenSize,
+            indices.dtype == .uint32,
+            indices.size == 512 * LagunaConstants.numExpertsPerTok
+        {
+            let flatIndices = indices.flattened()
+            let order = argSort(flatIndices)
+            (sortedX, idx, inverseOrder) = lagunaPrefillSortedRoute(
+                source: sortedX,
+                flatIndices: flatIndices,
+                order: order
+            )
+        } else {
+            (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        }
     }
     // Fused counterpart of SwitchGLU's separate-bank branch:
     //   xUp = upProj(x, idx, sortedIndices: doSort)
@@ -5103,7 +5197,31 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 let fusedScales = _fusedRoutedGateUpScales,
                 let downProj = _routedDownProj,
                 x.dim(1) > 1,
-                inds.size >= 64,
+                // CORRECTNESS GUARD (was `inds.size >= 64`). 64 is
+                // `SwitchGLU`'s gatherSort threshold — the condition for the
+                // SORTED REGIME — but it is not the condition under which
+                // this N=1024 fused bank produces correct results. Measured
+                // on an M5 Max against the same-binary unfused arm
+                // (`DARKBLOOM_PREFILL_FUSED_GATE_UP=0`), greedy free-run,
+                // pristine main @5531848: every gathered-row count below
+                // 1024 diverges from the unfused path at the FIRST emitted
+                // token, and every count at or above 1024 matches it
+                // exactly. The boundary is sharp and sits exactly at the
+                // fused bank's output width, 2 * moeIntermediateSize = 1024
+                // (rows = L * numExpertsPerTok):
+                //
+                //   L    rows   verdict          L    rows   verdict
+                //     8     64  diverges         127  1016  diverges
+                //    64    512  diverges         128  1024  matches
+                //   127   1016  diverges         256  2048  matches
+                //
+                // The ranked window never sees the broken regime: a
+                // 512-token prefill gathers 4096 rows, so this guard costs
+                // the scored path exactly nothing while removing a silent
+                // wrong-output regime for every prompt under 128 tokens
+                // (i.e. ordinary chat/agent turns, which is how this was
+                // found — see the submission note).
+                inds.size >= 2 * LagunaConstants.moeIntermediateSize,
                 fusedWeight.dtype == .uint32,
                 fusedScales.dtype == .uint8,
                 _fusedRoutedGateUpSplit == LagunaConstants.moeIntermediateSize
