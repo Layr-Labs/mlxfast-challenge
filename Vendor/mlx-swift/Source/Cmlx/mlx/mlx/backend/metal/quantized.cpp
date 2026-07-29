@@ -507,11 +507,25 @@ void qmm_nax(
   std::string type_string = get_type_string(x.dtype());
   static const bool static_laguna_shapes =
       env::get_var("DARKBLOOM_STATIC_NVFP4_SHAPES", "") != "0";
-  const bool use_static_laguna_shape =
+  // Extend static shape specialization to the INT8 affine path used by
+  // the promoted QKV and o_proj attention quantization. The affine shapes
+  // are stable across decode steps (same K, N every token), so specializing
+  // the kernel name avoids JIT recompilation and enables compile-time
+  // constant folding in the NAX pipeline.
+  static const bool static_affine_shapes =
+      env::get_var("DARKBLOOM_STATIC_AFFINE_SHAPES", "") != "0";
+  const bool use_static_nvfp4_shape =
       static_laguna_shapes && transpose && aligned && !batched &&
       mode == "nvfp4" && type_string == "bfloat16_t" &&
       group_size == 16 && bits == 4 && !biases.has_value() &&
       ((K == 2048 && N == 1024) || (K == 512 && N == 2048));
+  const bool use_static_affine_shape =
+      static_affine_shapes && transpose && aligned && !batched &&
+      mode == "affine" && type_string == "bfloat16_t" &&
+      group_size == 32 && bits == 8 && biases.has_value() &&
+      K == 2048; // Laguna hidden size; N varies by layer type
+  const bool use_static_laguna_shape =
+      use_static_nvfp4_shape || use_static_affine_shape;
   concatenate(
       kname,
       mode +
