@@ -1116,6 +1116,59 @@ MTL::ComputePipelineState* get_steel_gemm_segmented_nax_kernel(
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);
 }
 
+namespace {
+
+// DARKBLOOM_EXPERT_STAGE_WIDEST: widen the threadgroup stores in the shipped
+// Laguna prefill MoE kernel fp_gather_qmm_rhs_expert_nax.
+//
+// WHY A #define AND NOT A FUNCTION CONSTANT. This is not a preference here,
+// it is the only option. The static-expert-shape path in quantized.cpp builds
+// its pipeline through get_qmm_nax_kernel, which ends in
+// `d.get_kernel(kernel_name, lib)` -- no MTLFCList is threaded through at
+// all, so the fc 204-207 STAGE levers that fp_gather_qmm_rhs_nax uses simply
+// cannot reach this kernel. A define is also the safer form: it is baked into
+// the source text before compilation and therefore CANNOT enter the Metal
+// pipeline specialization key, unlike a function constant, whose mid-process
+// flip forced a second pipeline compile inside the timed prefill and produced
+// the reproducible 15-24% regression documented for the RUNSKIP "1:N"
+// dispatch-prefix form (see quantized.cpp).
+//
+// The define carries only the ENABLE BIT. The magnitude P travels separately
+// as a runtime scalar kernel argument (stage_widest_pct, set in
+// quantized.cpp), exactly as run_skip_pct does, so resizing the submission
+// cannot change either the source text or the specialization key.
+//
+// Env (parsed identically in quantized.cpp, which owns P):
+//   unset  -> ON at the shipped default P  <- THE SHIPPED PATH; the ranked
+//             runner sets no DARKBLOOM_* variables
+//   "0"    -> OFF; the kernel compiles character-for-character as shipped
+//   "1"    -> ON at full strength (P = 100)
+//   "1:P"  -> ON at P, clamped to [1, 100]
+//
+// Resolved once via a function-local static, so the value is constant for the
+// process. Device::get_library caches the built library in memory keyed on
+// lib_name with no on-disk persistence, so exactly one variant is ever
+// compiled and a fresh process picks up a changed environment cleanly.
+const char* darkbloom_expert_stage_widest_define() {
+  static const bool enabled = [] {
+    const bool v =
+        env::get_var("DARKBLOOM_EXPERT_STAGE_WIDEST", "") != "0";
+    // Same ground-truth discipline the other STAGE arms needed: prove the arm
+    // is live before trusting its number. A #define that silently fails to
+    // reach the source string produces an arm that measures its own control.
+    if (env::get_var("DARKBLOOM_STAGE_TRACE", "") == "1") {
+      fprintf(
+          stderr,
+          "mlxfast: expert stage widest define: enabled=%d\n",
+          int(v));
+    }
+    return v;
+  }();
+  return enabled ? "\n#define DARKBLOOM_EXPERT_STAGE_WIDEST 1\n" : "";
+}
+
+} // namespace
+
 MTL::ComputePipelineState* get_qmm_nax_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -1127,6 +1180,13 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
     concatenate(
         kernel_source,
         metal::utils(),
+        // Injected only for the library that actually instantiates the expert
+        // kernel, so the qmm/qmv libraries this helper also builds keep a
+        // byte-identical source string.
+        (template_def.find("fp_gather_qmm_rhs_expert_nax") !=
+         std::string::npos)
+            ? darkbloom_expert_stage_widest_define()
+            : "",
         metal::gemm_nax(),
         metal::quantized_utils(),
         (mode == "affine") ? metal::quantized_nax() : metal::fp_quantized_nax(),

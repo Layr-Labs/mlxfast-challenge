@@ -55,7 +55,7 @@ private let lagunaLmHeadPruneHidden = 2048
 /// Set `DARKBLOOM_LM_HEAD_PRUNE=0` to disable and restore the byte-identical
 /// stock full lm_head pass.
 let lagunaLmHeadPruneEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_LM_HEAD_PRUNE"] != "0"
+    ProcessInfo.processInfo.environment["DARKBLOOM_LM_HEAD_PRUNE"] == "1"
 
 /// Kernel header: bit-exact MXFP8 element decoders + the certified
 /// half-cell-width table, all inlinable and libm-free.
