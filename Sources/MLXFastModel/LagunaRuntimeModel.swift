@@ -1464,7 +1464,7 @@ struct LagunaNativeAffineWeight {
 private let lagunaNativeAffineNVFP4From: Int? = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_NVFP4"] != "0"
     else { return nil }
-    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM"] ?? "32"
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM"] ?? "28"
     guard let value = Int(raw), value < LagunaConstants.numHiddenLayers else { return nil }
     return min(max(value, 0), LagunaConstants.numHiddenLayers)
 }()
@@ -6797,9 +6797,10 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         if lagunaLmHeadPruneEnabled, let lmHead {
             lmHeadPruner = LagunaLmHeadPruner(lmHeadWeight: lmHead.weight)
             if let pruner = lmHeadPruner {
-                eval(pruner.codes, pruner.scales)
+                eval(pruner.residentArrays)
                 FileHandle.standardError.write(
-                    Data("mlxfast: lm_head prune active (mxfp8 coarse copy resident)\n".utf8))
+                    Data(
+                        ("mlxfast: lm_head prune active (\(pruner.armDescription))\n").utf8))
             }
         }
     }
