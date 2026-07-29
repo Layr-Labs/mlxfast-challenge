@@ -277,6 +277,14 @@ private let lagunaNativeAffineQKVLayerCount: Int = {
 }()
 let lagunaNativeAffineQKVEnabled = lagunaNativeAffineQKVLayerCount > 0
 
+/// `DARKBLOOM_NATIVE_AFFINE_GATE` (default on; set "0" to disable): append
+/// the per-head attention gate rows to the retained affine Q/K/V bank. The
+/// gate reads the same normalized current-token row, so the widened native
+/// quantized matmul removes the separate BF16 gate GEMV without crossing the
+/// serial request boundary. Prefill remains on the original BF16 projections.
+let lagunaNativeAffineGateEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_GATE"] != "0"
+
 private func lagunaUseNativeAffineQKV(layer: Int) -> Bool {
     layer < lagunaNativeAffineQKVLayerCount
 }
@@ -2306,6 +2314,7 @@ final class LagunaRuntimeAttention: Module {
     /// Q/K/V batch. The original BF16 parameters remain authoritative and
     /// continue to serve prefill.
     var _nativeAffineQKV: LagunaNativeAffineWeight?
+    var _nativeAffineQKVHasGate = false
 
     /// Derived native group-32 affine layout for the attention output
     /// projection, used only by the serial decode call. `wo.weight` remains the
@@ -2334,20 +2343,36 @@ final class LagunaRuntimeAttention: Module {
         else {
             return []
         }
+        let gate: LagunaNativeAffineWeight? = {
+            guard lagunaNativeAffineGateEnabled,
+                gatingEnabled,
+                gatePerHead,
+                let gateProjection = gProj,
+                gateProjection.bias == nil,
+                type(of: gateProjection) == Linear.self,
+                gateProjection.weight.dtype == .bfloat16,
+                gateProjection.weight.shape == [nHeads, LagunaConstants.hiddenSize]
+            else {
+                return nil
+            }
+            return lagunaNativeAffineWeight(gateProjection.weight)
+        }()
+        let weights = [q, k, v] + (gate.map { [$0] } ?? [])
         let packedCodes = concatenated(
-            [q.packedCodes, k.packedCodes, v.packedCodes], axis: 0)
-        let scales = concatenated([q.scales, k.scales, v.scales], axis: 0)
-        let biases = concatenated([q.biases, k.biases, v.biases], axis: 0)
+            weights.map(\.packedCodes), axis: 0)
+        let scales = concatenated(weights.map(\.scales), axis: 0)
+        let biases = concatenated(weights.map(\.biases), axis: 0)
         let fused = LagunaNativeAffineWeight(
             packedCodes: packedCodes,
             scales: scales,
             biases: biases,
             originalShape: [
-                wq.weight.dim(0) + wk.weight.dim(0) + wv.weight.dim(0),
+                weights.map { $0.originalShape[0] }.reduce(0, +),
                 wq.weight.dim(1),
             ]
         )
         _nativeAffineQKV = fused
+        _nativeAffineQKVHasGate = gate != nil
         return fused.arrays
     }
 
@@ -2478,7 +2503,9 @@ final class LagunaRuntimeAttention: Module {
                 )
                 let queryDim = nHeads * headDim
                 let kvDim = nKVHeads * headDim
-                let gateLogits = gateProjection(normalized)
+                let gateLogits = _nativeAffineQKVHasGate
+                    ? qkv[.ellipsis, (queryDim + 2 * kvDim)...]
+                    : gateProjection(normalized)
                 let activatedGate =
                     softplus(gateLogits.asType(.float32)).asType(.bfloat16)
                 fusedNormQKV = (
@@ -3291,15 +3318,14 @@ func lagunaRoutedSwiGLUQMV(
 }
 
 /// The routed and shared gate/up QMVs read the same activation row, write
-/// different outputs, and share an identical tile shape: 128 tiles of four
-/// output rows, two rows per simdgroup, four 512-wide K blocks. They are also
-/// independent of each other, so MLX issues them into the same barrier group
-/// anyway. Merging them into one nine-slot dispatch (slots 0-7 routed, slot 8
-/// shared) removes one dispatch per sparse layer without touching either
-/// slot's arithmetic: a threadgroup does exactly the work it did before, over
-/// the same bank, in the same order.
+/// different outputs, and share an identical one-row-per-SIMD tile: 256 tiles
+/// of two output rows and four 512-wide K blocks. Splitting the old two-row
+/// accumulator doubles independent threadgroups while preserving every
+/// output row's K-loop, scale application, casts, and SwiGLU arithmetic.
+/// Merging routed slots 0-7 with shared slot 8 still removes one dispatch per
+/// sparse layer without changing any slot's arithmetic.
 private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_v2",
+    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_r1_v3",
     inputNames: [
         "input", "routed_weight", "routed_scales", "indices",
         "shared_weight", "shared_scales",
@@ -3315,7 +3341,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
         constexpr uint scale_expert_bytes = fused_width * scale_row_bytes;
         constexpr uint block_width = 512;
         constexpr uint values_per_lane = 16;
-        constexpr uint tiles_per_expert = 128;
+        constexpr uint tiles_per_expert = 256;
         constexpr uint routed_experts = 8;
 
         // Preserve each expert tile's arithmetic and output address while
@@ -3327,7 +3353,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
         bool is_routed = expert_slot < routed_experts;
         uint simd_group = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
-        uint first_row = tile * 4 + simd_group * 2;
+        uint first_row = tile * 2 + simd_group;
 
         const device uint8_t* expert_weight;
         const device uint8_t* expert_scales;
@@ -3342,8 +3368,8 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             expert_scales = shared_scales;
         }
 
-        thread float gate_result[2] = {0.0f, 0.0f};
-        thread float up_result[2] = {0.0f, 0.0f};
+        thread float gate_result[1] = {0.0f};
+        thread float up_result[1] = {0.0f};
         thread float input_values[values_per_lane];
 
         for (uint block = 0; block < input_width; block += block_width) {
@@ -3358,7 +3384,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
                 input_values[4 * i + 3] = values[3];
             }
 
-            for (uint row = 0; row < 2; ++row) {
+            for (uint row = 0; row < 1; ++row) {
                 uint logical_row = first_row + row;
                 uint gate_row;
                 uint up_row;
@@ -3394,7 +3420,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             }
         }
 
-        for (uint row = 0; row < 2; ++row) {
+        for (uint row = 0; row < 1; ++row) {
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
             if (lane == 0) {
@@ -3730,7 +3756,7 @@ func lagunaRoutedSharedSwiGLUQMV(
     lagunaTrace("routed+shared gate/up QMV")
     let outputs = lagunaRoutedSharedSwiGLUQMVKernel(
         [input, routedWeight, routedScales, indices, sharedWeight, sharedScales],
-        grid: ((LagunaConstants.numExpertsPerTok + 1) * 128 * 64, 1, 1),
+        grid: ((LagunaConstants.numExpertsPerTok + 1) * 256 * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [
             [
@@ -3884,8 +3910,11 @@ func lagunaRoutedDownReduce(
     )[0]
 }
 
+/// One output row per SIMD retains the exact row-local NVFP4 dot products and
+/// nine-slot BF16 reduction while exposing four times as many independent
+/// weight streams as the original four-accumulator form.
 private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_down_residual_bf16_v1",
+    name: "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v3",
     inputNames: [
         "routed_activated", "routed_down_weight", "routed_down_scales",
         "indices", "router_weights", "shared_activated",
@@ -3897,7 +3926,7 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
         constexpr uint output_width = 2048;
         constexpr uint routed_experts = 8;
         constexpr uint shared_slot = 8;
-        constexpr uint outputs_per_simd = 4;
+        constexpr uint outputs_per_simd = 1;
         constexpr uint values_per_lane = 16;
         constexpr uint packed_row_bytes = 256;
         constexpr uint scale_row_bytes = 32;
@@ -3936,9 +3965,7 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
             input_values[4 * i + 3] = values[3];
         }
 
-        thread float result[outputs_per_simd] = {
-            0.0f, 0.0f, 0.0f, 0.0f
-        };
+        thread float result[outputs_per_simd] = {0.0f};
         for (uint row = 0; row < outputs_per_simd; ++row) {
             uint output_row = first_row + row;
             const device uint8_t* weight =
@@ -4050,7 +4077,7 @@ func lagunaRoutedSharedDownResidual(
             indices, routerWeights, sharedActivated,
             sharedDownWeight, sharedDownScales, residual,
         ],
-        grid: ((LagunaConstants.hiddenSize / 4) * 288, 1, 1),
+        grid: (LagunaConstants.hiddenSize * 288, 1, 1),
         threadGroup: (288, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
         outputDTypes: [.bfloat16]
