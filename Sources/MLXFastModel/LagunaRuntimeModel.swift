@@ -5104,7 +5104,31 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 let fusedScales = _fusedRoutedGateUpScales,
                 let downProj = _routedDownProj,
                 x.dim(1) > 1,
-                inds.size >= 64,
+                // CORRECTNESS GUARD (was `inds.size >= 64`). 64 is
+                // `SwitchGLU`'s gatherSort threshold — the condition for the
+                // SORTED REGIME — but it is not the condition under which
+                // this N=1024 fused bank produces correct results. Measured
+                // on an M5 Max against the same-binary unfused arm
+                // (`DARKBLOOM_PREFILL_FUSED_GATE_UP=0`), greedy free-run,
+                // pristine main @5531848: every gathered-row count below
+                // 1024 diverges from the unfused path at the FIRST emitted
+                // token, and every count at or above 1024 matches it
+                // exactly. The boundary is sharp and sits exactly at the
+                // fused bank's output width, 2 * moeIntermediateSize = 1024
+                // (rows = L * numExpertsPerTok):
+                //
+                //   L    rows   verdict          L    rows   verdict
+                //     8     64  diverges         127  1016  diverges
+                //    64    512  diverges         128  1024  matches
+                //   127   1016  diverges         256  2048  matches
+                //
+                // The ranked window never sees the broken regime: a
+                // 512-token prefill gathers 4096 rows, so this guard costs
+                // the scored path exactly nothing while removing a silent
+                // wrong-output regime for every prompt under 128 tokens
+                // (i.e. ordinary chat/agent turns, which is how this was
+                // found — see the submission note).
+                inds.size >= 2 * LagunaConstants.moeIntermediateSize,
                 fusedWeight.dtype == .uint32,
                 fusedScales.dtype == .uint8,
                 _fusedRoutedGateUpSplit == LagunaConstants.moeIntermediateSize
