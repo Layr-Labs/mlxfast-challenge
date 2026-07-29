@@ -375,13 +375,13 @@ public final class LagunaRuntimeWeightCache {
                 // weights no longer create residency pressure. A 512 MiB
                 // budget fits one complete decode layer (attention plus the
                 // routed/shared gate-up and down banks are ~507 MiB for the
-                // larger sliding-attention shape) while retaining MLX's
-                // stock M5 Max 50-operation cap. Explicit MLX_ values win,
-                // and the DARKBLOOM kill switch supports same-binary A/B.
+                // 200 MB / 200-op command buffers: the post-anupsv-loader regime
+                // re-test winner (6 Latin pairs: decode 5/6, prefill 4/6). Explicit
+                // MLX_ values win; DARKBLOOM kill switch supports same-binary A/B.
                 let env = ProcessInfo.processInfo.environment
                 if env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" {
-                    setenv("MLX_MAX_MB_PER_BUFFER", "512", 0)
-                    setenv("MLX_MAX_OPS_PER_BUFFER", "50", 0)
+                    setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
+                    setenv("MLX_MAX_OPS_PER_BUFFER", "200", 0)
                 }
                 startupMemoryPolicy = nil
             }
