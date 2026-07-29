@@ -1494,16 +1494,26 @@ void gather_qmm_rhs_nax(
     case 5: bm = 64;  wm = 4; wn = 1; break; // SM=16, 128 thr/TG, TN 2 -> 4
     default: break;                          // upstream: bm=64, wm=2, wn=2
   }
+  // Laguna's routed down prefill has about 16 sorted rows per expert. Keep
+  // the shipped SM=16/SN=32 per-SIMD tile, but exchange row and column
+  // groups so four SIMD groups cover one common run instead of two. The
+  // wider N tile also halves threadgroups for the exact K=512, N=2048 bank.
+  if (K == 512 && N == 2048 && bm128 == 4) {
+    bm = 32; bn = 128; wm = 2; wn = 4;
+  }
 
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
   const bool laguna_moe_shape =
       (K == 2048 && N == 1024) || (K == 512 && N == 2048);
+  const bool laguna_expert_tile =
+      (bm == 64 && bn == 64 && wm == 4 && wn == 2) ||
+      (bm == 32 && bn == 128 && wm == 2 && wn == 4);
   const bool expert_aligned =
       darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
       group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
-      align_N && align_K && bm == 64 && wm == 4 && wn == 2;
+      align_N && align_K && laguna_expert_tile;
   std::string type_string = get_type_string(x.dtype());
   static const bool static_laguna_shapes =
       env::get_var("DARKBLOOM_STATIC_NVFP4_SHAPES", "") != "0";
