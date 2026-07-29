@@ -265,13 +265,13 @@ let lagunaFusedQKVProjectionEnabled =
 /// A native group-32 affine INT8 side layout packs Q/K/V into one batched
 /// quantized matmul, cutting their weight traffic without speculating future
 /// tokens or changing the KV dependency. Prefill stays on the original BF16
-/// projections. The first 28 layers form the second acceptance-band-safe chunk.
+/// projections. All 40 layers form the final acceptance-band-safe QKV chunk.
 private let lagunaNativeAffineQKVLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_QKV"] != "0"
     else { return 0 }
     let requested = Int(
         ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_QKV_LAYERS"]
-            ?? "28") ?? 28
+            ?? "40") ?? 40
     return min(max(requested, 0), LagunaConstants.numHiddenLayers)
 }()
 let lagunaNativeAffineQKVEnabled = lagunaNativeAffineQKVLayerCount > 0
@@ -292,8 +292,50 @@ private let lagunaNativeAffineOutputLayerCount: Int = {
     return min(max(requested, 0), LagunaConstants.numHiddenLayers)
 }()
 
-private func lagunaUseNativeAffineOutput(layer: Int) -> Bool {
-    layer < lagunaNativeAffineOutputLayerCount
+private let lagunaNativeAffineOutputFamily =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OUTPUT_FAMILY"]
+        ?? "all"
+
+/// Experimental output-weight precision. Eight-bit remains the submitted and
+/// promotion-tested default; four-bit reuses the same current-token path to
+/// test whether another halving of `wo` traffic preserves the token sequence.
+private let lagunaNativeAffineOutputDefaultBits: Int = {
+    let requested = Int(
+        ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OUTPUT_BITS"]
+            ?? "8") ?? 8
+    return requested == 4 ? 4 : 8
+}()
+
+/// Prefix selector for acceptance-band-safe staging of the four-bit output
+/// layout. With `DARKBLOOM_NATIVE_AFFINE_OUTPUT_BITS=4`, the default remains
+/// all 40 layers; setting this count converts only the selected prefix while
+/// every remaining enabled output layer keeps its native affine eight-bit
+/// representation.
+private let lagunaNativeAffineOutput4BitLayerCount: Int = {
+    guard lagunaNativeAffineOutputDefaultBits == 4 else { return 0 }
+    let requested = Int(
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_NATIVE_AFFINE_OUTPUT_4BIT_LAYERS"
+        ] ?? "\(LagunaConstants.numHiddenLayers)") ?? LagunaConstants.numHiddenLayers
+    return min(max(requested, 0), LagunaConstants.numHiddenLayers)
+}()
+
+private func lagunaNativeAffineOutputBits(layer: Int) -> Int {
+    layer < lagunaNativeAffineOutput4BitLayerCount ? 4 : 8
+}
+
+private func lagunaUseNativeAffineOutput(layer: Int, isSliding: Bool) -> Bool {
+    switch lagunaNativeAffineOutputFamily {
+    case "full":
+        return layer < lagunaNativeAffineOutputLayerCount && !isSliding
+    case "sliding":
+        return layer < lagunaNativeAffineOutputLayerCount && isSliding
+    case "full+sliding-prefix":
+        return !isSliding
+            || (layer < lagunaNativeAffineOutputLayerCount && isSliding)
+    default:
+        return layer < lagunaNativeAffineOutputLayerCount
+    }
 }
 
 /// Sliding-layer per-head RMSNorm + plain RoPE fusion (see
@@ -1388,14 +1430,16 @@ struct LagunaNativeAffineWeight {
     var arrays: [MLXArray] { [packedCodes, scales, biases] }
 }
 
-func lagunaNativeAffineWeight(_ weight: MLXArray) -> LagunaNativeAffineWeight? {
+func lagunaNativeAffineWeight(
+    _ weight: MLXArray, bits: Int = 8
+) -> LagunaNativeAffineWeight? {
     guard weight.dtype == .bfloat16, weight.ndim == 2,
-        weight.dim(1).isMultiple(of: 32)
+        weight.dim(1).isMultiple(of: 32), bits == 4 || bits == 8
     else {
         return nil
     }
     let (packedCodes, scales, biases) = quantized(
-        weight, groupSize: 32, bits: 8, mode: .affine)
+        weight, groupSize: 32, bits: bits, mode: .affine)
     guard let biases else { return nil }
     return LagunaNativeAffineWeight(
         packedCodes: packedCodes,
@@ -2327,7 +2371,8 @@ final class LagunaRuntimeAttention: Module {
         guard _nativeAffineOutput == nil,
             type(of: wo) == Linear.self,
             wo.bias == nil,
-            let affine = lagunaNativeAffineWeight(wo.weight)
+            let affine = lagunaNativeAffineWeight(
+                wo.weight, bits: lagunaNativeAffineOutputBits(layer: layerIdx))
         else {
             return []
         }
@@ -2676,7 +2721,7 @@ final class LagunaRuntimeAttention: Module {
                 projectedGate = gProj(normalizedInput)
                 gateIsActivated = false
             }
-            if lagunaUseNativeAffineOutput(layer: layerIdx),
+            if lagunaUseNativeAffineOutput(layer: layerIdx, isSliding: isSliding),
                 gateIsActivated, gatePerHead, L == 1, B == 1, wo.bias == nil,
                 headDim == LagunaConstants.headDim,
                 output.dtype == .bfloat16, projectedGate.dtype == .bfloat16,
@@ -2697,7 +2742,7 @@ final class LagunaRuntimeAttention: Module {
                     biases: affineOutput.biases,
                     transpose: true,
                     groupSize: 32,
-                    bits: 8,
+                    bits: lagunaNativeAffineOutputBits(layer: layerIdx),
                     mode: .affine
                 )
             }
@@ -6584,7 +6629,9 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                 fusedArrays.append(
                     contentsOf: layer.selfAttn.prepareNativeAffineQKVWeight())
             }
-            if lagunaUseNativeAffineOutput(layer: layer.selfAttn.layerIdx) {
+            if lagunaUseNativeAffineOutput(
+                layer: layer.selfAttn.layerIdx, isSliding: layer.selfAttn.isSliding)
+            {
                 fusedArrays.append(
                     contentsOf: layer.selfAttn.prepareNativeAffineOutputWeight())
             }
