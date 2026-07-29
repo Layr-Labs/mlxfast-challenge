@@ -4411,6 +4411,15 @@ private func lagunaPrefillRouterTournament(
 private let lagunaPrefillRouterTournamentEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ROUTER_TOURNAMENT"] != "0"
 
+/// `DARKBLOOM_ROUTER_BIAS_HOIST` (default on; set "0" to ablate): retain one
+/// FP32 view of each sparse layer's `e_score_correction_bias` at init instead
+/// of re-deriving it inside every routing call. See
+/// `LagunaRuntimeMoEGate._correctionBiasFP32` for the mechanism and the
+/// exactness argument. With the flag off, every routing call takes the
+/// verbatim per-call `asType(.float32)` it took before.
+let lagunaRouterCorrectionBiasHoistEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_BIAS_HOIST"] != "0"
+
 /// Sigmoid top-k router. The routing math mirrors the vendored
 /// `LagunaMoEGate` exactly (sigmoid scores, correction bias added only for
 /// expert CHOICE, mixture weights taken from the pre-bias scores, optional
@@ -4423,12 +4432,68 @@ final class LagunaRuntimeMoEGate: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
 
+    /// Retained FP32 view of `e_score_correction_bias`, built once during
+    /// untimed init-time weight preparation (see
+    /// `LagunaRuntimeSparseMoEBlock.prepareRouterCorrectionBias`).
+    ///
+    /// WHY THIS EXISTS. Every routing call below passes
+    /// `eScoreCorrectionBias.asType(.float32)` to its top-8 kernel. That is a
+    /// **cast of a checkpoint constant**: the array is a 256-element router
+    /// parameter that never changes after load, and `asType` is a real MLX op
+    /// that enqueues an `astype` dispatch each time it is evaluated. With 39
+    /// sparse layers, single-token decode therefore pays 39 identical
+    /// 256-element casts per token whose result is a pure function of a frozen
+    /// weight -- work that recurs in production single-pass inference and is
+    /// removable there too, so this is ordinary input-independent weight
+    /// preparation, exactly the category AGENTS.md keeps allowed.
+    ///
+    /// EXACTNESS. `asType` is deterministic and elementwise, so hoisting it
+    /// cannot change a value: the FP32 array produced once at init is
+    /// bit-identical to the one produced per call from the same source bytes.
+    /// `MLXArray.asType` additionally short-circuits (`guard type !=
+    /// self.dtype else { return self }`), so when the checkpoint already
+    /// stores this tensor as F32 -- which the Laguna reference does, per
+    /// `LagunaCheckpointValidation`'s "F32, one entry per expert" requirement
+    /// -- the hoisted value is literally the same array object the per-call
+    /// cast returned, and this change removes a pure no-op call rather than a
+    /// dispatch. Either way no value moves.
+    ///
+    /// The fallback keeps the per-call cast, so a checkpoint or module state
+    /// that never reaches the preparation hook behaves exactly as before.
+    /// Plain stored property, matching the already-ranked retained-layout
+    /// pattern used by `LagunaRuntimeSparseMoEBlock._fusedRoutedGateUpWeight`
+    /// and friends: a derived side copy that never enters `children()` or the
+    /// checkpoint parameter tree, so `Module.update` cannot disturb it and the
+    /// module structure is unchanged.
+    var _correctionBiasFP32: MLXArray?
+
+    /// FP32 correction bias for the routing kernels: the retained cast when
+    /// preparation ran, otherwise the verbatim per-call cast.
+    var correctionBiasFP32: MLXArray {
+        _correctionBiasFP32 ?? eScoreCorrectionBias.asType(.float32)
+    }
+
     init(_ config: LagunaConfig) {
         self.topK = config.numExpertsPerTok
         self.normTopkProb = config.normTopkProb
         self.routerLogitSoftcapping = Float(config.moeRouterLogitSoftcapping)
         self._weight.wrappedValue = zeros([config.numExperts, config.hiddenSize])
         self._eScoreCorrectionBias.wrappedValue = zeros([config.numExperts])
+    }
+
+    /// Build the retained FP32 correction bias. Called once from the runtime
+    /// model's untimed fused-weight preparation, after checkpoint parameters
+    /// are installed and evaluated. Returns the array so the caller can
+    /// include it in its single `eval`.
+    func prepareCorrectionBiasFP32() -> MLXArray? {
+        guard _correctionBiasFP32 == nil,
+            eScoreCorrectionBias.size == LagunaConstants.numExperts
+        else {
+            return nil
+        }
+        let prepared = eScoreCorrectionBias.asType(.float32)
+        _correctionBiasFP32 = prepared
+        return prepared
     }
 
     /// `logits` is this layer's router projection when an upstream kernel in
@@ -4452,7 +4517,7 @@ final class LagunaRuntimeMoEGate: Module {
             lagunaTrace("prefill router tournament")
             return lagunaPrefillRouterTournament(
                 logits: projectedLogits,
-                correctionBias: eScoreCorrectionBias.asType(.float32),
+                correctionBias: correctionBiasFP32,
                 rows: projectedLogits.dim(1),
                 normalizing: normTopkProb
             )
@@ -4470,7 +4535,7 @@ final class LagunaRuntimeMoEGate: Module {
             lagunaTrace("prefill router top8")
             return lagunaPrefillRouterTop8(
                 logits: projectedLogits,
-                correctionBias: eScoreCorrectionBias.asType(.float32),
+                correctionBias: correctionBiasFP32,
                 rows: projectedLogits.dim(1),
                 normalizing: normTopkProb
             )
@@ -4491,7 +4556,7 @@ final class LagunaRuntimeMoEGate: Module {
                     : "decode router top8 (cast sink)")
             (inds, weights) = lagunaDecodeRouterTop8(
                 logits: projectedLogits,
-                correctionBias: eScoreCorrectionBias.asType(.float32),
+                correctionBias: correctionBiasFP32,
                 normalizing: sinkNormalization
             )
             if sinkNormalization {
@@ -4510,7 +4575,7 @@ final class LagunaRuntimeMoEGate: Module {
                 lagunaTrace("decode router top8 (fp32 logits)")
                 (inds, weights) = lagunaDecodeRouterTop8(
                     logits: logits,
-                    correctionBias: eScoreCorrectionBias.asType(.float32)
+                    correctionBias: correctionBiasFP32
                 )
             } else {
                 let scores = sigmoid(logits)
@@ -5870,6 +5935,15 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                 }
                 if lagunaFusedRoutedGateUpEnabled {
                     fusedArrays.append(contentsOf: sparse.prepareFusedRoutedGateUp())
+                }
+                // Input-independent router constant: hoist the FP32 view of
+                // `e_score_correction_bias` out of the per-token routing call
+                // (see `LagunaRuntimeMoEGate._correctionBiasFP32`). Guarded by
+                // its own flag so the per-call cast can be restored for A/B.
+                if lagunaRouterCorrectionBiasHoistEnabled,
+                    let prepared = sparse.gate.prepareCorrectionBiasFP32()
+                {
+                    fusedArrays.append(prepared)
                 }
             } else if let dense = layer.mlp as? LagunaRuntimeMLP {
                 if lagunaFusedDenseGateUpSwiGLUEnabled,
