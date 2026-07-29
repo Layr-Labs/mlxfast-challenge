@@ -1552,6 +1552,9 @@ template <
   static_assert(transpose, "expert-aligned Laguna QMM requires NT weights");
   static_assert(group_size == 16, "expert-aligned Laguna QMM requires gs16");
   static_assert(bits == 4, "expert-aligned Laguna QMM requires NVFP4");
+  static_assert(
+      BK == 64 || BK == 128,
+      "expert-aligned Laguna QMM supports the control and M5 staging tiles");
 
   constexpr int pack_factor = get_pack_factor<8, bits>();
   constexpr int bytes_per_pack = get_bytes_per_pack();
@@ -1647,11 +1650,13 @@ template <
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg_active) {
-          // PRAGMA-VARIANT 01: SK-step staging+MMA loop, 2 iterations
-          // (BK=64/SK=32): Atile TMxTK=1x2 device frags + Btile TNxTK=2x2
-          // threadgroup frags per step, serially-dependent Dtile MMA chain.
-          // Full unroll + volatile removal let the second step's 6 fragment
-          // loads hoist ahead of the first step's MMAs. This kernel is built
+          // PRAGMA-VARIANT 01: SK-step staging+MMA loop, BK/SK iterations.
+          // Atile TMxTK=1x2 device frags + Btile TNxTK=2x2 threadgroup frags
+          // per step feed one serially-dependent Dtile MMA chain. Full
+          // unrolling exposes every staged step while preserving that chain.
+          // The Laguna host defaults BK to 128 on M5 (64 is the exact
+          // fallback), so widening only changes staging/barrier frequency.
+          // This kernel is built
           // WITHOUT function constants (static expert shape path), so the
           // stage_novol lever never reaches it -- the volatile must go here.
           // Scheduling only: no arithmetic, order, or rounding change.

@@ -1695,6 +1695,9 @@ template <
   static_assert(transpose, "expert-aligned Laguna QMM requires NT weights");
   static_assert(group_size == 16, "expert-aligned Laguna QMM requires gs16");
   static_assert(bits == 4, "expert-aligned Laguna QMM requires NVFP4");
+  static_assert(
+      BK == 64 || BK == 128,
+      "expert-aligned Laguna QMM supports the control and M5 staging tiles");
 
   constexpr int pack_factor = get_pack_factor<8, bits>();
   constexpr int bytes_per_pack = get_bytes_per_pack();

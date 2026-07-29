@@ -1287,6 +1287,25 @@ bool darkbloom_expert_aligned_gather() {
   return v;
 }
 
+// Laguna's static expert-aligned MPP kernel keeps each 32-wide MMA step and
+// its accumulation order fixed, but can stage several such steps between
+// threadgroup barriers. Apple's M5 MPP guide recommends BK=128 as the starting
+// point for this exact tradeoff. Both Laguna expert shapes (K=2048 gate/up and
+// K=512 down) divide 128, so the wider tile removes half of the staging
+// barriers without introducing an edge path or changing the SK=32 MMA chain.
+//
+// This is a template parameter, not a function constant. The selected value is
+// already embedded in `kname` as `_bk_...`, and it is resolved once per process
+// so no pipeline compilation can appear inside a timed region. Set
+// DARKBLOOM_EXPERT_BK=64 for the exact prior tile.
+int darkbloom_expert_bk() {
+  static const int v = [] {
+    auto raw = env::get_var("DARKBLOOM_EXPERT_BK", "");
+    return raw == "64" ? 64 : 128;
+  }();
+  return v;
+}
+
 // DARKBLOOM_STAGE_BM128: select the gather-GEMM m-tiling. NOT a function
 // constant -- it changes the template instantiation, so it is already in
 // `kname` (`_bm_`/`_wm_`/`_wn_`) and therefore in the library name and the
@@ -1495,15 +1514,20 @@ void gather_qmm_rhs_nax(
     default: break;                          // upstream: bm=64, wm=2, wn=2
   }
 
+  const bool laguna_moe_shape =
+      (K == 2048 && N == 1024) || (K == 512 && N == 2048);
+  const bool expert_shape_eligible =
+      darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
+      group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
+      bm == 64 && wm == 4 && wn == 2;
+  if (expert_shape_eligible) {
+    bk = darkbloom_expert_bk();
+  }
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
-  const bool laguna_moe_shape =
-      (K == 2048 && N == 1024) || (K == 512 && N == 2048);
   const bool expert_aligned =
-      darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
-      group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
-      align_N && align_K && bm == 64 && wm == 4 && wn == 2;
+      expert_shape_eligible && align_N && align_K;
   std::string type_string = get_type_string(x.dtype());
   static const bool static_laguna_shapes =
       env::get_var("DARKBLOOM_STATIC_NVFP4_SHAPES", "") != "0";
@@ -1576,7 +1600,7 @@ void gather_qmm_rhs_nax(
       fprintf(
           stderr,
           "mlxfast: stage active: widest=%d wideld=%d(req=%d wide_ok=%d) "
-          "runbar=%d novol=%d expert=%d bm128=%d bm=%d wm=%d wn=%d "
+          "runbar=%d novol=%d expert=%d bm128=%d bm=%d bk=%d wm=%d wn=%d "
           "w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d\n",
           int(stage_widest),
           int(stage_wideld),
@@ -1587,6 +1611,7 @@ void gather_qmm_rhs_nax(
           int(expert_aligned),
           bm128,
           bm,
+          bk,
           wm,
           wn,
           size_t(w.offset()),
