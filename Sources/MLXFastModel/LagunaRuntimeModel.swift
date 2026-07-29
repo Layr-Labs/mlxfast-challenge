@@ -89,6 +89,100 @@ func lagunaTrace(_ site: String) {
 
 // MARK: - Runtime fusion feature flags
 
+let lagunaDownOutputsPerSIMDOptions = [2, 4, 8]
+let lagunaGateUpRowsPerSIMDOptions = [1, 2, 4]
+
+let lagunaDefaultDownOutputsPerSIMD = 4
+let lagunaDefaultGateUpRowsPerSIMD = 1
+
+struct LagunaDecodeMoETilingGeometry: Equatable {
+    let gridWidth: Int
+    let threadGroupWidth: Int
+    let threadgroupCount: Int
+}
+
+func lagunaDecodeMoETilingValue(
+    environment: [String: String],
+    key: String,
+    allowed: [Int],
+    fallback: Int
+) -> Int {
+    guard
+        let rawValue = environment[key],
+        let value = Int(rawValue),
+        allowed.contains(value)
+    else {
+        return fallback
+    }
+    return value
+}
+
+func lagunaReplacingExactly(
+    _ source: String,
+    target: String,
+    replacement: String,
+    expectedCount: Int
+) -> String {
+    precondition(!target.isEmpty)
+    precondition(expectedCount >= 0)
+
+    var occurrenceCount = 0
+    var searchStart = source.startIndex
+    while
+        let range = source.range(
+            of: target,
+            range: searchStart..<source.endIndex
+        )
+    {
+        occurrenceCount += 1
+        searchStart = range.upperBound
+    }
+    precondition(occurrenceCount == expectedCount)
+    return source.replacingOccurrences(of: target, with: replacement)
+}
+
+let lagunaDownOutputsPerSIMD = lagunaDecodeMoETilingValue(
+    environment: ProcessInfo.processInfo.environment,
+    key: "DARKBLOOM_DOWN_OUTPUTS_PER_SIMD",
+    allowed: lagunaDownOutputsPerSIMDOptions,
+    fallback: lagunaDefaultDownOutputsPerSIMD
+)
+
+let lagunaGateUpRowsPerSIMD = lagunaDecodeMoETilingValue(
+    environment: ProcessInfo.processInfo.environment,
+    key: "DARKBLOOM_GATE_UP_ROWS_PER_SIMD",
+    allowed: lagunaGateUpRowsPerSIMDOptions,
+    fallback: lagunaDefaultGateUpRowsPerSIMD
+)
+
+func lagunaDownTilingGeometry(outputsPerSIMD: Int) -> LagunaDecodeMoETilingGeometry {
+    precondition(lagunaDownOutputsPerSIMDOptions.contains(outputsPerSIMD))
+
+    let threadGroupWidth = 288
+    let threadgroupCount = LagunaConstants.hiddenSize / outputsPerSIMD
+    return LagunaDecodeMoETilingGeometry(
+        gridWidth: threadgroupCount * threadGroupWidth,
+        threadGroupWidth: threadGroupWidth,
+        threadgroupCount: threadgroupCount
+    )
+}
+
+func lagunaGateUpTilingGeometry(rowsPerSIMD: Int) -> LagunaDecodeMoETilingGeometry {
+    precondition(lagunaGateUpRowsPerSIMDOptions.contains(rowsPerSIMD))
+
+    let threadGroupWidth = 64
+    let expertSlots = LagunaConstants.numExpertsPerTok + 1
+    let simdgroupsPerThreadgroup = threadGroupWidth / 32
+    let threadgroupCount =
+        expertSlots * LagunaConstants.moeIntermediateSize
+        / (simdgroupsPerThreadgroup * rowsPerSIMD)
+    return LagunaDecodeMoETilingGeometry(
+        gridWidth: threadgroupCount * threadGroupWidth,
+        threadGroupWidth: threadGroupWidth,
+        threadgroupCount: threadgroupCount
+    )
+}
+
 // Each fusion below concatenates the OUTPUT ROWS of same-dtype projections
 // that consume the same input. Per-row gemv/qmv/gather-qmv arithmetic is
 // independent of which rows share a dispatch (every output row keeps its own
@@ -2800,21 +2894,16 @@ func lagunaRoutedSwiGLUQMV(
 }
 
 /// The routed and shared gate/up QMVs read the same activation row, write
-/// different outputs, and share an identical tile shape: 128 tiles of four
-/// output rows, two rows per simdgroup, four 512-wide K blocks. They are also
-/// independent of each other, so MLX issues them into the same barrier group
-/// anyway. Merging them into one nine-slot dispatch (slots 0-7 routed, slot 8
-/// shared) removes one dispatch per sparse layer without touching either
-/// slot's arithmetic: a threadgroup does exactly the work it did before, over
-/// the same bank, in the same order.
-private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_v2",
-    inputNames: [
-        "input", "routed_weight", "routed_scales", "indices",
-        "shared_weight", "shared_scales",
-    ],
-    outputNames: ["routed_activated", "shared_activated"],
-    source: """
+/// different outputs, and share a parameterized tile shape. The r2 control
+/// uses 128 tiles of four output rows, two rows per simdgroup; r1 and r4 use
+/// 256 two-row tiles and 64 eight-row tiles respectively. Every variant
+/// traverses four 512-wide K blocks. The QMVs are also independent of each
+/// other, so MLX issues them into the same barrier group anyway. Merging them
+/// into one nine-slot dispatch (slots 0-7 routed, slot 8 shared) removes one
+/// dispatch per sparse layer without touching either slot's arithmetic: a
+/// threadgroup does exactly the work it did before, over the same bank, in the
+/// same order.
+let lagunaRoutedSharedSwiGLUQMVControlSource = """
         constexpr uint input_width = 2048;
         constexpr uint output_width = 512;
         constexpr uint fused_width = 1024;
@@ -2924,10 +3013,91 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
                 }
             }
         }
-        """,
-    header: lagunaSharedSwiGLUQMVHeader,
-    ensureRowContiguous: true
-)
+        """
+
+func lagunaRoutedSharedSwiGLUQMVKernelName(
+    _ rowsPerSIMD: Int
+) -> String {
+    precondition(lagunaGateUpRowsPerSIMDOptions.contains(rowsPerSIMD))
+    return "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_r\(rowsPerSIMD)_v2"
+}
+
+func lagunaRoutedSharedSwiGLUQMVSource(
+    rowsPerSIMD: Int
+) -> String {
+    precondition(lagunaGateUpRowsPerSIMDOptions.contains(rowsPerSIMD))
+    if rowsPerSIMD == 2 {
+        return lagunaRoutedSharedSwiGLUQMVControlSource
+    }
+
+    let tilesPerExpert =
+        LagunaConstants.moeIntermediateSize / (2 * rowsPerSIMD)
+    let firstRow =
+        "uint first_row = tile * \(2 * rowsPerSIMD) "
+        + "+ simd_group * \(rowsPerSIMD);"
+    let zeroInitializer = Array(
+        repeating: "0.0f",
+        count: rowsPerSIMD
+    ).joined(separator: ", ")
+    let gateInitializer =
+        "thread float gate_result[\(rowsPerSIMD)] = {\(zeroInitializer)};"
+    let upInitializer =
+        "thread float up_result[\(rowsPerSIMD)] = {\(zeroInitializer)};"
+    let rowLoop =
+        "for (uint row = 0; row < \(rowsPerSIMD); ++row) {"
+
+    var selected = lagunaReplacingExactly(
+        lagunaRoutedSharedSwiGLUQMVControlSource,
+        target: "constexpr uint tiles_per_expert = 128;",
+        replacement:
+            "constexpr uint tiles_per_expert = \(tilesPerExpert);",
+        expectedCount: 1
+    )
+    selected = lagunaReplacingExactly(
+        selected,
+        target: "uint first_row = tile * 4 + simd_group * 2;",
+        replacement: firstRow,
+        expectedCount: 1
+    )
+    selected = lagunaReplacingExactly(
+        selected,
+        target: "thread float gate_result[2] = {0.0f, 0.0f};",
+        replacement: gateInitializer,
+        expectedCount: 1
+    )
+    selected = lagunaReplacingExactly(
+        selected,
+        target: "thread float up_result[2] = {0.0f, 0.0f};",
+        replacement: upInitializer,
+        expectedCount: 1
+    )
+    return lagunaReplacingExactly(
+        selected,
+        target: "for (uint row = 0; row < 2; ++row) {",
+        replacement: rowLoop,
+        expectedCount: 2
+    )
+}
+
+private let lagunaRoutedSharedSwiGLUQMVKernels:
+    [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for rowsPerSIMD in lagunaGateUpRowsPerSIMDOptions {
+        kernels[rowsPerSIMD] = MLXFast.metalKernel(
+            name: lagunaRoutedSharedSwiGLUQMVKernelName(rowsPerSIMD),
+            inputNames: [
+                "input", "routed_weight", "routed_scales", "indices",
+                "shared_weight", "shared_scales",
+            ],
+            outputNames: ["routed_activated", "shared_activated"],
+            source: lagunaRoutedSharedSwiGLUQMVSource(
+                rowsPerSIMD: rowsPerSIMD),
+            header: lagunaSharedSwiGLUQMVHeader,
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
 
 func lagunaRoutedSharedSwiGLUQMV(
     _ input: MLXArray,
@@ -2935,7 +3105,8 @@ func lagunaRoutedSharedSwiGLUQMV(
     routedScales: MLXArray,
     indices: MLXArray,
     sharedWeight: MLXArray,
-    sharedScales: MLXArray
+    sharedScales: MLXArray,
+    rowsPerSIMD: Int = lagunaGateUpRowsPerSIMD
 ) -> (routed: MLXArray, shared: MLXArray) {
     precondition(input.dtype == .bfloat16)
     precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
@@ -2969,10 +3140,15 @@ func lagunaRoutedSharedSwiGLUQMV(
         ])
 
     lagunaTrace("routed+shared gate/up QMV")
-    let outputs = lagunaRoutedSharedSwiGLUQMVKernel(
+    guard let kernel = lagunaRoutedSharedSwiGLUQMVKernels[rowsPerSIMD]
+    else {
+        preconditionFailure("unsupported routed/shared gate/up tiling")
+    }
+    let geometry = lagunaGateUpTilingGeometry(rowsPerSIMD: rowsPerSIMD)
+    let outputs = kernel(
         [input, routedWeight, routedScales, indices, sharedWeight, sharedScales],
-        grid: ((LagunaConstants.numExpertsPerTok + 1) * 128 * 64, 1, 1),
-        threadGroup: (64, 1, 1),
+        grid: (geometry.gridWidth, 1, 1),
+        threadGroup: (geometry.threadGroupWidth, 1, 1),
         outputShapes: [
             [
                 1, 1, LagunaConstants.numExpertsPerTok, 1,
@@ -3125,15 +3301,7 @@ func lagunaRoutedDownReduce(
     )[0]
 }
 
-private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_down_residual_bf16_v1",
-    inputNames: [
-        "routed_activated", "routed_down_weight", "routed_down_scales",
-        "indices", "router_weights", "shared_activated",
-        "shared_down_weight", "shared_down_scales", "residual",
-    ],
-    outputNames: ["output"],
-    source: """
+let lagunaRoutedSharedDownResidualControlSource = """
         constexpr uint input_width = 512;
         constexpr uint output_width = 2048;
         constexpr uint routed_experts = 8;
@@ -3225,10 +3393,78 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
             output[first_row + lane] =
                 bfloat(residual[first_row + lane] + r2);
         }
-        """,
-    header: lagunaSharedSwiGLUQMVHeader,
-    ensureRowContiguous: true
-)
+        """
+
+func lagunaRoutedSharedDownResidualKernelName(
+    _ outputsPerSIMD: Int
+) -> String {
+    precondition(lagunaDownOutputsPerSIMDOptions.contains(outputsPerSIMD))
+    return "laguna_routed_shared_nvfp4_down_residual_bf16_o\(outputsPerSIMD)_v1"
+}
+
+func lagunaRoutedSharedDownResidualSource(
+    outputsPerSIMD: Int
+) -> String {
+    precondition(lagunaDownOutputsPerSIMDOptions.contains(outputsPerSIMD))
+    if outputsPerSIMD == 4 {
+        return lagunaRoutedSharedDownResidualControlSource
+    }
+
+    let controlInitializer =
+        "thread float result[outputs_per_simd] = {\n"
+        + "    0.0f, 0.0f, 0.0f, 0.0f\n"
+        + "};"
+    let selectedInitializer: String
+    switch outputsPerSIMD {
+    case 2:
+        selectedInitializer =
+            "thread float result[outputs_per_simd] = {\n"
+            + "    0.0f, 0.0f\n"
+            + "};"
+    case 8:
+        selectedInitializer =
+            "thread float result[outputs_per_simd] = {\n"
+            + "    0.0f, 0.0f, 0.0f, 0.0f,\n"
+            + "    0.0f, 0.0f, 0.0f, 0.0f\n"
+            + "};"
+    default:
+        preconditionFailure("unsupported routed/shared down tiling")
+    }
+
+    let selectedConstant = lagunaReplacingExactly(
+        lagunaRoutedSharedDownResidualControlSource,
+        target: "constexpr uint outputs_per_simd = 4;",
+        replacement: "constexpr uint outputs_per_simd = \(outputsPerSIMD);",
+        expectedCount: 1
+    )
+    return lagunaReplacingExactly(
+        selectedConstant,
+        target: controlInitializer,
+        replacement: selectedInitializer,
+        expectedCount: 1
+    )
+}
+
+private let lagunaRoutedSharedDownResidualKernels:
+    [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for outputsPerSIMD in lagunaDownOutputsPerSIMDOptions {
+        kernels[outputsPerSIMD] = MLXFast.metalKernel(
+            name: lagunaRoutedSharedDownResidualKernelName(outputsPerSIMD),
+            inputNames: [
+                "routed_activated", "routed_down_weight", "routed_down_scales",
+                "indices", "router_weights", "shared_activated",
+                "shared_down_weight", "shared_down_scales", "residual",
+            ],
+            outputNames: ["output"],
+            source: lagunaRoutedSharedDownResidualSource(
+                outputsPerSIMD: outputsPerSIMD),
+            header: lagunaSharedSwiGLUQMVHeader,
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
 
 func lagunaRoutedSharedDownResidual(
     routedActivated: MLXArray,
@@ -3239,7 +3475,8 @@ func lagunaRoutedSharedDownResidual(
     sharedActivated: MLXArray,
     sharedDownWeight: MLXArray,
     sharedDownScales: MLXArray,
-    residual: MLXArray
+    residual: MLXArray,
+    outputsPerSIMD: Int = lagunaDownOutputsPerSIMD
 ) -> MLXArray {
     precondition(routedActivated.dtype == .bfloat16)
     precondition(
@@ -3285,14 +3522,19 @@ func lagunaRoutedSharedDownResidual(
     precondition(residual.dtype == .bfloat16)
     precondition(residual.shape == [1, 1, LagunaConstants.hiddenSize])
 
-    return lagunaRoutedSharedDownResidualKernel(
+    guard let kernel = lagunaRoutedSharedDownResidualKernels[outputsPerSIMD]
+    else {
+        preconditionFailure("unsupported routed/shared down tiling")
+    }
+    let geometry = lagunaDownTilingGeometry(outputsPerSIMD: outputsPerSIMD)
+    return kernel(
         [
             routedActivated, routedDownWeight, routedDownScales,
             indices, routerWeights, sharedActivated,
             sharedDownWeight, sharedDownScales, residual,
         ],
-        grid: ((LagunaConstants.hiddenSize / 4) * 288, 1, 1),
-        threadGroup: (288, 1, 1),
+        grid: (geometry.gridWidth, 1, 1),
+        threadGroup: (geometry.threadGroupWidth, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
         outputDTypes: [.bfloat16]
     )[0]
