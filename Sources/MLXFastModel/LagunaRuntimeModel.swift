@@ -3126,7 +3126,7 @@ func lagunaRoutedDownReduce(
 }
 
 private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_down_residual_bf16_v1",
+    name: "laguna_routed_shared_nvfp4_down_residual_bf16_v2",
     inputNames: [
         "routed_activated", "routed_down_weight", "routed_down_scales",
         "indices", "router_weights", "shared_activated",
@@ -3138,7 +3138,7 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
         constexpr uint output_width = 2048;
         constexpr uint routed_experts = 8;
         constexpr uint shared_slot = 8;
-        constexpr uint outputs_per_simd = 4;
+        constexpr uint outputs_per_simd = 8;
         constexpr uint values_per_lane = 16;
         constexpr uint packed_row_bytes = 256;
         constexpr uint scale_row_bytes = 32;
@@ -3177,29 +3177,23 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
             input_values[4 * i + 3] = values[3];
         }
 
-        thread float result[outputs_per_simd] = {
-            0.0f, 0.0f, 0.0f, 0.0f
-        };
+        threadgroup bfloat down_outputs[
+            (routed_experts + 1) * outputs_per_simd
+        ];
         for (uint row = 0; row < outputs_per_simd; ++row) {
             uint output_row = first_row + row;
             const device uint8_t* weight =
                 expert_weight + output_row * packed_row_bytes + lane * 8;
             const device uint8_t* scale =
                 expert_scales + output_row * scale_row_bytes + lane;
-            result[row] = laguna_nvfp4_qdot_16(
+            float result = laguna_nvfp4_qdot_16(
                 weight,
                 input_values,
                 laguna_nvfp4_scale(scale[0]));
-            result[row] = simd_sum(result[row]);
-        }
-
-        threadgroup bfloat down_outputs[
-            (routed_experts + 1) * outputs_per_simd
-        ];
-        if (lane == 0) {
-            for (uint row = 0; row < outputs_per_simd; ++row) {
+            result = simd_sum(result);
+            if (lane == 0) {
                 down_outputs[slot * outputs_per_simd + row] =
-                    bfloat(result[row]);
+                    bfloat(result);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3291,7 +3285,7 @@ func lagunaRoutedSharedDownResidual(
             indices, routerWeights, sharedActivated,
             sharedDownWeight, sharedDownScales, residual,
         ],
-        grid: ((LagunaConstants.hiddenSize / 4) * 288, 1, 1),
+        grid: ((LagunaConstants.hiddenSize / 8) * 288, 1, 1),
         threadGroup: (288, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
         outputDTypes: [.bfloat16]
