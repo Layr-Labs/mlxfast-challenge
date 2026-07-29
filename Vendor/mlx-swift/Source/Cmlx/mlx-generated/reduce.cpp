@@ -123,6 +123,63 @@ template <typename T, typename U, typename Op, typename IdxT, int NDIMS>
   in += in_idx + column;
 
   IdxT total_rows = IdxT(non_col_reductions) * IdxT(reduction_size);
+  // Two-row fast path (e.g. the split-K=2 quantized-matmul accumulation):
+  // one thread performs exactly the two per-row accumulations and the
+  // combine that the stock path spreads over lsize.y == 2 threads plus a
+  // threadgroup-memory round trip and barrier. The operation sequence is
+  // identical link for link -- op(row0, init), op(row1, init),
+  // op(t1, t0) -- so every result is bit-identical (signed zeros
+  // included); only the barrier and shared staging disappear. Every other
+  // geometry falls through to the stock path unchanged.
+  if (total_rows == 2 && lsize.y == 2 && non_col_reductions == 1) {
+    if (lid.y != 0) {
+      return;
+    }
+    loop.next(0, reduce_shape, reduce_strides);
+    row = in + loop.location();
+    U row0[n_reads];
+    if (safe) {
+      for (int i = 0; i < n_reads; i++) {
+        row0[i] = op(static_cast<U>(row[i]), Op::init);
+      }
+    } else {
+      U vals[n_reads];
+      for (int i = 0; i < n_reads; i++) {
+        vals[i] =
+            (column + i < reduction_stride) ? static_cast<U>(row[i]) : op.init;
+      }
+      for (int i = 0; i < n_reads; i++) {
+        row0[i] = op(vals[i], Op::init);
+      }
+    }
+    loop.next(1, reduce_shape, reduce_strides);
+    row = in + loop.location();
+    if (safe) {
+      for (int i = 0; i < n_reads; i++) {
+        totals[i] = op(op(static_cast<U>(row[i]), Op::init), row0[i]);
+      }
+    } else {
+      U vals[n_reads];
+      for (int i = 0; i < n_reads; i++) {
+        vals[i] =
+            (column + i < reduction_stride) ? static_cast<U>(row[i]) : op.init;
+      }
+      for (int i = 0; i < n_reads; i++) {
+        totals[i] = op(op(vals[i], Op::init), row0[i]);
+      }
+    }
+    out += out_idx * IdxT(reduction_stride) + column;
+    if (safe) {
+      for (int i = 0; i < n_reads; i++) {
+        out[i] = totals[i];
+      }
+    } else {
+      for (int i = 0; column + i < reduction_stride; i++) {
+        out[i] = totals[i];
+      }
+    }
+    return;
+  }
   loop.next(lid.y, reduce_shape, reduce_strides);
   for (IdxT r = lid.y; r < total_rows; r += lsize.y) {
     row = in + loop.location();
