@@ -248,13 +248,13 @@ let lagunaFusedRoutedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV"] != "0"
 
-/// Scheduling A/B for the merged routed/shared gate/up kernel. The R4 twin is
-/// the candidate default; set the selector to `2` for the proven
-/// two-row-per-SIMD control. R4 preserves each row's arithmetic; its only risk
-/// is performance from higher register pressure/occupancy tradeoffs.
+/// Scheduling A/B for the merged routed/shared gate/up kernel. The r1
+/// one-row-per-SIMD geometry is the candidate default; set the selector to
+/// `4` to restore the R4 control. Both variants preserve each row's
+/// arithmetic; R4's only risk is higher register pressure/occupancy tradeoffs.
 let lagunaRoutedSharedSwiGLUQMVRows4Enabled =
     ProcessInfo.processInfo.environment[
-        "DARKBLOOM_ROUTED_SHARED_SWIGLU_ROWS"] != "2"
+        "DARKBLOOM_ROUTED_SHARED_SWIGLU_ROWS"] == "4"
 
 /// Folds the per-head softplus gate into the output projection's GEMV (see
 /// `lagunaGatedOutputProjectionSource`), with one kernel variant per attention
@@ -3694,7 +3694,7 @@ func lagunaRoutedSwiGLUQMV(
 /// slot's arithmetic: a threadgroup does exactly the work it did before, over
 /// the same bank, in the same order.
 private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_v2",
+    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_r1_v3",
     inputNames: [
         "input", "routed_weight", "routed_scales", "indices",
         "shared_weight", "shared_scales",
@@ -3710,7 +3710,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
         constexpr uint scale_expert_bytes = fused_width * scale_row_bytes;
         constexpr uint block_width = 512;
         constexpr uint values_per_lane = 16;
-        constexpr uint tiles_per_expert = 128;
+        constexpr uint tiles_per_expert = 256;
         constexpr uint routed_experts = 8;
 
         // Preserve each expert tile's arithmetic and output address while
@@ -3722,7 +3722,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
         bool is_routed = expert_slot < routed_experts;
         uint simd_group = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
-        uint first_row = tile * 4 + simd_group * 2;
+        uint first_row = tile * 2 + simd_group;
 
         const device uint8_t* expert_weight;
         const device uint8_t* expert_scales;
@@ -3737,8 +3737,8 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             expert_scales = shared_scales;
         }
 
-        thread float gate_result[2] = {0.0f, 0.0f};
-        thread float up_result[2] = {0.0f, 0.0f};
+        thread float gate_result[1] = {0.0f};
+        thread float up_result[1] = {0.0f};
         thread float input_values[values_per_lane];
 
         for (uint block = 0; block < input_width; block += block_width) {
@@ -3753,7 +3753,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
                 input_values[4 * i + 3] = values[3];
             }
 
-            for (uint row = 0; row < 2; ++row) {
+            for (uint row = 0; row < 1; ++row) {
                 uint logical_row = first_row + row;
                 uint gate_row;
                 uint up_row;
@@ -3789,7 +3789,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             }
         }
 
-        for (uint row = 0; row < 2; ++row) {
+        for (uint row = 0; row < 1; ++row) {
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
             if (lane == 0) {
@@ -4254,9 +4254,9 @@ func lagunaRoutedSharedSwiGLUQMV(
         ? lagunaRoutedSharedSwiGLUQMVRows4Kernel
         : lagunaRoutedSharedSwiGLUQMVKernel
     // R4 covers eight rows per 64-thread group, so 64 tiles per each of the
-    // nine slots dispatch exactly 576 threadgroups. The default R2 control
-    // retains its original 128 tiles per slot.
-    let tilesPerSlot = lagunaRoutedSharedSwiGLUQMVRows4Enabled ? 64 : 128
+    // nine slots dispatch exactly 576 threadgroups. The r1 two-row candidate
+    // covers two rows per group, so it uses 256 tiles per slot.
+    let tilesPerSlot = lagunaRoutedSharedSwiGLUQMVRows4Enabled ? 64 : 256
     let outputs = kernel(
         [input, routedWeight, routedScales, indices, sharedWeight, sharedScales],
         grid: (
