@@ -20,7 +20,7 @@ using namespace mlx::steel;
 // tools/build-mlx-metallib.sh -- the AOT copy is reachable only by adding the
 // define to the metallib build flags by hand.
 #ifndef DARKBLOOM_ATTN_QHOIST
-#define DARKBLOOM_ATTN_QHOIST 0
+#define DARKBLOOM_ATTN_QHOIST 1
 #endif
 
 // DARKBLOOM_ATTN_QBLOCK_MAJOR default. DEFAULT ON for the standalone ranked

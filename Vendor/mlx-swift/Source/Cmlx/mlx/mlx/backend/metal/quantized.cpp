@@ -1287,32 +1287,6 @@ bool darkbloom_expert_aligned_gather() {
   return v;
 }
 
-// DARKBLOOM_EXPERT_GATHER_GROUPS (default 128; "64" restores the promoted
-// four-experts-per-threadgroup schedule and "256" selects one expert per
-// threadgroup, both kept as A/B controls): how many threadgroups the
-// expert-aligned gather QMM spreads the 256 experts over. More threadgroups
-// means the hardware scheduler overlaps per-expert staging drains and MMA
-// phases instead of serializing expert slots inside one threadgroup. Only
-// the threadgroup-to-expert assignment changes: every output element is
-// computed by the same tile walk with the same accumulation order, and the
-// value is baked into the kernel name and template, so each setting compiles
-// exactly one pipeline for the process lifetime. Measured on M5 Max against
-// the promoted 64 schedule, 128 captures roughly two-thirds of the 256
-// schedule's prefill gain while keeping the measured speedup comfortably
-// mid-band; 256 measures closer to the acceptance ceiling in the single-shot
-// harness regime and is staged as its own follow-up chunk.
-int darkbloom_expert_gather_groups() {
-  static const int v = [] {
-    auto s = env::get_var("DARKBLOOM_EXPERT_GATHER_GROUPS", "");
-    if (s.empty()) {
-      return 128;
-    }
-    int n = std::atoi(s.c_str());
-    return (n > 0 && (256 % n) == 0) ? n : 128;
-  }();
-  return v;
-}
-
 // DARKBLOOM_STAGE_BM128: select the gather-GEMM m-tiling. NOT a function
 // constant -- it changes the template instantiation, so it is already in
 // `kname` (`_bm_`/`_wm_`/`_wn_`) and therefore in the library name and the
@@ -1536,11 +1510,6 @@ void gather_qmm_rhs_nax(
   const bool static_expert_shape =
       expert_aligned && static_laguna_shapes && mode == "nvfp4" &&
       type_string == "bfloat16_t" && !biases_.has_value();
-  // How many threadgroups the expert path spreads the 256 experts over; the
-  // value is baked into the kernel name and template (see
-  // darkbloom_expert_gather_groups), so each setting compiles exactly one
-  // pipeline for the process lifetime.
-  const int egroups = darkbloom_expert_gather_groups();
 
   // Make the kernel name
   std::string kname;
@@ -1571,8 +1540,7 @@ void gather_qmm_rhs_nax(
       wn,
       static_expert_shape
           ? ("_k_" + std::to_string(K) + "_n_" + std::to_string(N))
-          : "",
-      expert_aligned ? ("_eg_" + std::to_string(egroups)) : "");
+          : "");
 
   // Skipping dead runs is a pure work elision (see function constant 203 in
   // fp_quantized_nax): it drops only matmuls whose results store_slice never
@@ -1664,13 +1632,10 @@ void gather_qmm_rhs_nax(
       stage_runbar ? 'B' : 'n',
       stage_novol ? 'V' : 'n');
 
-  // Get and set the kernel. Every expert-aligned instantiation (static and
-  // runtime-shaped alike) is built from a template definition here, because
-  // the expert kernel's expert-group count is a template parameter; the
-  // shared gather builder keeps its stock signature for the non-expert path.
+  // Get and set the kernel
   auto& compute_encoder = metal::get_command_encoder(s);
   MTL::ComputePipelineState* kernel;
-  if (expert_aligned) {
+  if (static_expert_shape) {
     auto template_def = get_template_definition(
         kname,
         "fp_gather_qmm_rhs_expert_nax",
@@ -1683,10 +1648,8 @@ void gather_qmm_rhs_nax(
         wm,
         wn,
         transpose,
-        static_expert_shape ? K : 0,
-        static_expert_shape ? N : 0,
-        "bfloat",
-        egroups);
+        K,
+        N);
     kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
   } else {
     kernel = get_gather_qmm_nax_kernel(
@@ -1710,7 +1673,7 @@ void gather_qmm_rhs_nax(
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims(
       (N + bn - 1) / bn,
-      expert_aligned ? egroups : (M + bm - 1) / bm,
+      expert_aligned ? 64 : (M + bm - 1) / bm,
       1);
 
   int c = 0;
