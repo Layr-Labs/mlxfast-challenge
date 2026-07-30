@@ -446,6 +446,77 @@ struct QuantizedBlockLoader {
     stage();
   }
 
+  // Split-phase staging for software-pipelined (double-buffered) kernels.
+  // load_raw moves the packed source bytes and scale bytes into registers;
+  // dequant_store decodes them into a caller-chosen threadgroup destination
+  // later. Same addresses, same bytes, same nibble decode, same scale mapping
+  // as stage() -- only the *timing* of the two phases changes, so the staged
+  // values are bit-for-bit identical. The point: the device loads of tile k+1
+  // can be issued before the MMA of tile k, letting the memory system work
+  // while the simdgroups compute.
+  struct RawStage {
+    uint8_t b[n_reads * bytes_per_pack];
+    uint8_t s[n_steps_per_read > 0 ? n_steps_per_read : 1];
+  };
+
+  void load_raw(thread RawStage& raw) const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    if constexpr (fp4nv_fast && ((n_reads * bytes_per_pack) % 4) == 0) {
+      // Same bytes as the byte loop below, four at a time through
+      // packed_uchar4 (alignment 1), little-endian nibble order preserved.
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < n_reads * bytes_per_pack / 4; i++) {
+        const uint32_t p = fp4nv_pack4(src + i * 4);
+        raw.b[i * 4 + 0] = uint8_t(p & 0xffu);
+        raw.b[i * 4 + 1] = uint8_t((p >> 8) & 0xffu);
+        raw.b[i * 4 + 2] = uint8_t((p >> 16) & 0xffu);
+        raw.b[i * 4 + 3] = uint8_t(p >> 24);
+      }
+    } else {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < n_reads; i++) {
+        raw.b[i] = src[i * bytes_per_pack];
+      }
+    }
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < n_steps_per_read; i++) {
+      raw.s[i] = scales[i];
+    }
+  }
+
+  void dequant_store(const thread RawStage& raw, threadgroup T* dst_base) const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    threadgroup T* dstp = dst_base + bi * dst_ld + bj * pack_factor;
+    if constexpr (fp4nv_fast) {
+      int k = 0;
+      for (int i = 0; i < n_steps_per_read; i++) {
+        const float scale = fp4nv_scale_x16384(raw.s[i]);
+        for (int j = 0; j < n_reads_per_scale / 4; j++) {
+          T vals[8];
+          fp4nv_decode8<T>(fp4nv_pack4(raw.b + k), scale, vals);
+          for (int e = 0; e < 8; e++) {
+            dstp[k * pack_factor + e] = vals[e];
+          }
+          k += 4;
+        }
+      }
+    } else {
+      int k = 0;
+      for (int i = 0; i < n_steps_per_read; i++) {
+        T scale = dequantize_scale<T, group_size>(raw.s[i]);
+        for (int j = 0; j < n_reads_per_scale; j++) {
+          dequantize<T, bits>(
+              raw.b[k * bytes_per_pack], scale, dstp + k * pack_factor);
+          k++;
+        }
+      }
+    }
+  }
+
   // DARKBLOOM_STAGE_WIDEST / DARKBLOOM_STAGE_WIDELD.
   //
   // BIT-EXACTNESS. This writes exactly the same values to exactly the same
@@ -1722,9 +1793,13 @@ template <
 
   constexpr int kWsElems = BN * BK_padded;
   constexpr int kWsPerChunk = 16 / sizeof(Wtype);
-  threadgroup NAXWsChunk16<Wtype>
-      Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
+  constexpr int kWsChunks = (kWsElems + kWsPerChunk - 1) / kWsPerChunk;
+  // Two staging buffers so the dequantized tile k+1 can be written while the
+  // MMA of tile k reads tile k. 2 * 64 * 72 * 2B = 18KB, inside the 32KB
+  // threadgroup budget.
+  threadgroup NAXWsChunk16<Wtype> Ws_storage[2 * kWsChunks];
   threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
+  threadgroup Wtype* Ws_second = Ws + kWsElems;
   threadgroup bfloat* gate_up_stage =
       (threadgroup bfloat*)Ws_storage;
   threadgroup int bounds[2];
@@ -1788,10 +1863,28 @@ template <
           simd_group_id,
           simd_lane_id);
 
-      for (int k = 0; k < K_it; ++k) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_w.load_unsafe();
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Software-pipelined staging: the packed bytes of tile k+1 are read
+      // into registers BEFORE the tile-k MMA, and dequantized into the other
+      // staging buffer AFTER it, so the device-load latency rides on the MMA
+      // instead of serializing with it. Values, addresses, decode, MMA
+      // fragment coordinates and K traversal order are all unchanged -- the
+      // same bytes arrive in the same threadgroup slots in the same order;
+      // only when each phase executes differs. One barrier per tile still
+      // orders every threadgroup access on both sides.
+      typename loader_w_t::RawStage raw_even;
+      typename loader_w_t::RawStage raw_odd;
+      loader_w.load_raw(raw_even);
+      loader_w.dequant_store(raw_even, Ws);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      for (int k = 0; k < K_it; k += 2) {
+        // Even tile k lives in Ws; stage tile k+1 into Ws_second around the
+        // tile-k MMA.
+        const bool have_odd = (k + 1) < K_it;
+        if (have_odd) {
+          loader_w.next();
+          loader_w.load_raw(raw_odd);
+        }
 
         if (sg_active) {
           STEEL_PRAGMA_UNROLL
@@ -1818,8 +1911,56 @@ template <
           }
         }
 
+        if (have_odd) {
+          loader_w.dequant_store(raw_odd, Ws_second);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (!have_odd) {
+          break;
+        }
         xn += BK;
-        loader_w.next();
+
+        // Odd tile k+1 lives in Ws_second; stage tile k+2 back into Ws
+        // around the tile-(k+1) MMA. Every threadgroup read of Ws from the
+        // tile-k MMA is ordered before this write by the barrier above.
+        const bool have_next = (k + 2) < K_it;
+        if (have_next) {
+          loader_w.next();
+          loader_w.load_raw(raw_even);
+        }
+
+        if (sg_active) {
+          STEEL_PRAGMA_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<Wtype, TN, TK> Btile;
+
+            if (sgp_sm == SM) {
+              Atile.load(xn + kk1, kernel_K);
+            } else {
+              Atile.load_safe(
+                  xn + kk1, kernel_K, short2(SK, sgp_sm));
+            }
+            Btile.template load<Wtype, BK_padded, 1>(
+                Ws_second + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<true>{});
+
+          }
+        }
+
+        if (have_next) {
+          loader_w.dequant_store(raw_even, Ws);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        xn += BK;
       }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
