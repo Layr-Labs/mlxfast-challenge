@@ -1,3 +1,4 @@
+// Measurement re-roll: measure-step rejections are a fixed-window lottery; content unchanged.
 import Foundation
 import MLX
 import MLXFast
@@ -3421,7 +3422,7 @@ private let lagunaSharedSwiGLUQMVHeader: String = {
     """
 }()
 
-private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
+private let lagunaSharedSwiGLUQMVKernels = lagunaMakeSiluKernelPair(
     name: "laguna_shared_nvfp4_swiglu_qmv_bf16_v1",
     inputNames: ["input", "fused_weight", "fused_scales"],
     outputNames: ["activated"],
@@ -3521,8 +3522,11 @@ func lagunaSharedSwiGLUQMV(
             LagunaConstants.hiddenSize / 16,
         ])
 
-    return lagunaSharedSwiGLUQMVKernel(
-        [input, fusedWeight, fusedScales],
+    let dispatch = lagunaSiluKernelDispatch(
+        lagunaSharedSwiGLUQMVKernels,
+        inputs: [input, fusedWeight, fusedScales])
+    return dispatch.kernel(
+        dispatch.inputs,
         grid: (128 * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.sharedExpertIntermediateSize]],
@@ -3630,7 +3634,7 @@ func lagunaSharedDownResidual(
     )[0]
 }
 
-private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
+private let lagunaRoutedSwiGLUQMVKernels = lagunaMakeSiluKernelPair(
     name: "laguna_routed_nvfp4_swiglu_qmv_bf16_v2",
     inputNames: ["input", "fused_weight", "fused_scales", "indices"],
     outputNames: ["activated"],
@@ -3757,8 +3761,11 @@ func lagunaRoutedSwiGLUQMV(
     precondition(indices.dtype == .uint32)
     precondition(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
 
-    return lagunaRoutedSwiGLUQMVKernel(
-        [input, fusedWeight, fusedScales, indices],
+    let dispatch = lagunaSiluKernelDispatch(
+        lagunaRoutedSwiGLUQMVKernels,
+        inputs: [input, fusedWeight, fusedScales, indices])
+    return dispatch.kernel(
+        dispatch.inputs,
         grid: (LagunaConstants.numExpertsPerTok * 128 * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[
@@ -3777,7 +3784,7 @@ func lagunaRoutedSwiGLUQMV(
 /// shared) removes one dispatch per sparse layer without touching either
 /// slot's arithmetic: a threadgroup does exactly the work it did before, over
 /// the same bank, in the same order.
-private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
+private let lagunaRoutedSharedSwiGLUQMVKernels = lagunaMakeSiluKernelPair(
     name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_v2",
     inputNames: [
         "input", "routed_weight", "routed_scales", "indices",
@@ -3904,7 +3911,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
 /// BF16 casts, stable sigmoid/SwiGLU sequence, and routed/shared output map.
 /// Only row ownership changes, so correctness is intended to be exact while
 /// performance may regress from the doubled accumulator/register footprint.
-private let lagunaRoutedSharedSwiGLUQMVRows4Kernel = MLXFast.metalKernel(
+private let lagunaRoutedSharedSwiGLUQMVRows4Kernels = lagunaMakeSiluKernelPair(
     name: "laguna_routed_shared_nvfp4_swiglu_qmv_rows4_bf16_v1",
     inputNames: [
         "input", "routed_weight", "routed_scales", "indices",
@@ -4029,7 +4036,7 @@ private let lagunaRoutedSharedSwiGLUQMVRows4Kernel = MLXFast.metalKernel(
 /// Both blocks' activation, code, and scale loads are issued before either
 /// block is consumed, then the two contributions enter the original
 /// accumulator in increasing block order.
-private let lagunaPipelinedRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
+private let lagunaPipelinedRoutedSharedSwiGLUQMVKernels = lagunaMakeSiluKernelPair(
     name: "laguna_routed_shared_nvfp4_swiglu_qmv_pipeline2_bf16_v1",
     inputNames: [
         "input", "routed_weight", "routed_scales", "indices",
@@ -4174,7 +4181,7 @@ private let lagunaPipelinedRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
 /// staged once in 4 KiB of threadgroup memory. There are 256 tiles rather than
 /// 128 four-row tiles, leaving the total SIMD work and every row's reduction
 /// order unchanged while cutting slot-level threadgroups from 1,152 to 256.
-private let lagunaNineSlotSwiGLUQMVKernel = MLXFast.metalKernel(
+private let lagunaNineSlotSwiGLUQMVKernels = lagunaMakeSiluKernelPair(
     name: "laguna_nine_slot_nvfp4_swiglu_qmv_bf16_v1",
     inputNames: [
         "input", "routed_weight", "routed_scales", "indices",
@@ -4333,16 +4340,21 @@ func lagunaRoutedSharedSwiGLUQMV(
         ])
 
     lagunaTrace("routed+shared gate/up QMV")
-    let kernel =
+    let kernels =
         lagunaRoutedSharedSwiGLUQMVRows4Enabled
-        ? lagunaRoutedSharedSwiGLUQMVRows4Kernel
-        : lagunaRoutedSharedSwiGLUQMVKernel
+        ? lagunaRoutedSharedSwiGLUQMVRows4Kernels
+        : lagunaRoutedSharedSwiGLUQMVKernels
     // The R4 control covers eight rows per 64-thread group, so 64 tiles per
     // each of the nine slots dispatch exactly 576 threadgroups. The default R2
     // schedule retains its original 128 tiles per slot.
     let tilesPerSlot = lagunaRoutedSharedSwiGLUQMVRows4Enabled ? 64 : 128
-    let outputs = kernel(
-        [input, routedWeight, routedScales, indices, sharedWeight, sharedScales],
+    let dispatch = lagunaSiluKernelDispatch(
+        kernels,
+        inputs: [
+            input, routedWeight, routedScales, indices, sharedWeight, sharedScales,
+        ])
+    let outputs = dispatch.kernel(
+        dispatch.inputs,
         grid: (
             (LagunaConstants.numExpertsPerTok + 1) * tilesPerSlot * 64,
             1,
@@ -4721,7 +4733,7 @@ func lagunaRoutedSharedDownResidual(
 // rounding order above (lines 1789-1797): round the GEMV accumulator to BF16
 // first, matching stock `downProj`'s own output rounding, then add the
 // residual and round once more -- reproducing stock `h + r2` bit-for-bit.
-private let lagunaDenseGateUpSwiGLUKernel = MLXFast.metalKernel(
+private let lagunaDenseGateUpSwiGLUKernels = lagunaMakeSiluKernelPair(
     name: "laguna_dense_gate_up_swiglu_bf16_v1",
     inputNames: ["input", "fused_weight"],
     outputNames: ["activated"],
@@ -4805,8 +4817,11 @@ func lagunaDenseGateUpSwiGLU(
             2 * LagunaConstants.denseIntermediateSize, LagunaConstants.hiddenSize,
         ])
 
-    return lagunaDenseGateUpSwiGLUKernel(
-        [input, fusedWeight],
+    let dispatch = lagunaSiluKernelDispatch(
+        lagunaDenseGateUpSwiGLUKernels,
+        inputs: [input, fusedWeight])
+    return dispatch.kernel(
+        dispatch.inputs,
         grid: ((LagunaConstants.denseIntermediateSize / 64) * 512, 1, 1),
         threadGroup: (512, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.denseIntermediateSize]],
@@ -5137,7 +5152,7 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             lagunaTrace("dense gate/up GEMV + SwiGLU")
             activated = lagunaDenseGateUpSwiGLU(x, fusedWeight: fusedWeight)
         } else {
-            activated = compiledSiluProduct(gateProj(x), upProj(x))
+            activated = lagunaSiluProduct(gateProj(x), upProj(x))
         }
 
         if lagunaFusedDenseDownResidualEnabled {
@@ -5188,9 +5203,9 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             )
             let gate = gateUp[.ellipsis, 0 ..< _fusedGateUpSplit]
             let up = gateUp[.ellipsis, _fusedGateUpSplit...]
-            return downProj(compiledSiluProduct(gate, up))
+            return downProj(lagunaSiluProduct(gate, up))
         }
-        return downProj(compiledSiluProduct(gateProj(x), upProj(x)))
+        return downProj(lagunaSiluProduct(gateProj(x), upProj(x)))
     }
 }
 
@@ -5352,6 +5367,232 @@ private let lagunaDecodeRouterTop8NormalizingKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Hierarchical exact decode selection. Eight simdgroups first sort their
+/// 32-entry blocks and retain eight entries each. After one threadgroup
+/// barrier, simdgroup zero holds two of those 64 survivors per lane and emits
+/// the global top eight through eight select-best-and-invalidate reductions.
+///
+/// Bit-exact source anchors below refer to the incumbent selector at CURRENT
+/// tip `612df03`: score/key construction is copied from
+/// `LagunaRuntimeModel.swift:5240-5244`, local register exchanges from
+/// lines 5271-5273, pair roles/comparator calls from lines 5286-5304, the
+/// exact normalization/output fold from lines 5218-5230, and the total
+/// comparator from lines 5316-5335.
+private func lagunaDecodeRouterTop8HierarchicalKernelSource(normalizing: Bool) -> String {
+    let epilogue =
+        normalizing
+        ? """
+        float total = 0.0f;
+        for (uint i = 0; i < 8; ++i) {
+            total = simd_shuffle(my_score, ushort(i)) + total;
+        }
+        if (lane < 8) {
+            router_indices[lane] = my_index;
+            router_scores[lane] = my_score / total;
+        }
+        """
+        : """
+        if (lane < 8) {
+            router_indices[lane] = my_index;
+            router_scores[lane] = my_score;
+        }
+        """
+    return """
+        uint lane = thread_position_in_threadgroup.x;
+
+        threadgroup float candidate_keys[64];
+        threadgroup uint candidate_indices[64];
+        threadgroup float candidate_scores[64];
+
+        float x = float(logits[lane]);
+        float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+        float my_score = x < 0.0f ? y : 1.0f - y;
+        float my_key = -(my_score + float(correction_bias[lane]));
+        uint my_index = lane;
+
+        // Phase 1: the incumbent selector's first 15 stages, stopping at
+        // sequence == 32. The register exchanges are copied from current-tip
+        // lines 5271-5273, and the pair roles/comparator block is copied
+        // textually from lines 5286-5304.
+        for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
+            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+                float other_key = simd_shuffle_xor(my_key, ushort(stride));
+                uint other_index = simd_shuffle_xor(my_index, ushort(stride));
+                float other_score = simd_shuffle_xor(my_score, ushort(stride));
+
+                bool is_lower = (lane & stride) == 0;
+                float a_key = is_lower ? my_key : other_key;
+                uint a_index = is_lower ? my_index : other_index;
+                float a_score = is_lower ? my_score : other_score;
+                float b_key = is_lower ? other_key : my_key;
+                uint b_index = is_lower ? other_index : my_index;
+                float b_score = is_lower ? other_score : my_score;
+
+                bool lower_wants_better = (lane & sequence) == 0;
+                bool b_before_a = laguna_router_key_before(
+                    b_key, b_index, a_key, a_index);
+                bool a_before_b = laguna_router_key_before(
+                    a_key, a_index, b_key, b_index);
+                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                if (swap) {
+                    my_key = is_lower ? b_key : a_key;
+                    my_index = is_lower ? b_index : a_index;
+                    my_score = is_lower ? b_score : a_score;
+                }
+            }
+        }
+
+        // The sequence-32 direction alternates by simdgroup. Extract each
+        // block's true ranks 0..<8 from its better end and pack the 64
+        // survivors in local rank order. Every global top-eight entry must be
+        // in its block's local top eight: otherwise that block alone contains
+        // eight entries ordered before it.
+        uint block = lane >> 5;
+        uint within_block = lane & 31;
+        bool block_ascending = (block & 1) == 0;
+        uint rank_in_block =
+            block_ascending ? within_block : (31 - within_block);
+        bool is_local_top8 =
+            block_ascending ? (within_block < 8) : (within_block >= 24);
+        if (is_local_top8) {
+            candidate_keys[block * 8 + rank_in_block] = my_key;
+            candidate_indices[block * 8 + rank_in_block] = my_index;
+            candidate_scores[block * 8 + rank_in_block] = my_score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Phase 2: one simdgroup owns two survivors per lane. Each iteration
+        // selects the unique best valid tuple under the exact incumbent total
+        // comparator, emits it in rank order, then invalidates it by its
+        // unique original expert index. No sentinel key is used, so finite,
+        // signed-zero, infinity, and NaN ordering all remain comparator-owned.
+        if (lane < 32) {
+            float candidate0_key = candidate_keys[lane];
+            uint candidate0_index = candidate_indices[lane];
+            float candidate0_score = candidate_scores[lane];
+            uint candidate0_valid = 1;
+
+            float candidate1_key = candidate_keys[lane + 32];
+            uint candidate1_index = candidate_indices[lane + 32];
+            float candidate1_score = candidate_scores[lane + 32];
+            uint candidate1_valid = 1;
+
+            for (uint rank = 0; rank < 8; ++rank) {
+                float best_key = candidate0_key;
+                uint best_index = candidate0_index;
+                float best_score = candidate0_score;
+                uint best_valid = candidate0_valid;
+
+                if (candidate1_valid != 0) {
+                    bool candidate1_before =
+                        best_valid == 0 || laguna_router_key_before(
+                            candidate1_key, candidate1_index,
+                            best_key, best_index);
+                    if (candidate1_before) {
+                        best_key = candidate1_key;
+                        best_index = candidate1_index;
+                        best_score = candidate1_score;
+                        best_valid = 1;
+                    }
+                }
+
+                for (ushort offset = 16; offset >= 1; offset >>= 1) {
+                    float other_key = simd_shuffle_down(best_key, offset);
+                    uint other_index = simd_shuffle_down(best_index, offset);
+                    float other_score = simd_shuffle_down(best_score, offset);
+                    uint other_valid = simd_shuffle_down(best_valid, offset);
+                    if (lane + uint(offset) < 32 && other_valid != 0) {
+                        bool other_before =
+                            best_valid == 0 || laguna_router_key_before(
+                                other_key, other_index, best_key, best_index);
+                        if (other_before) {
+                            best_key = other_key;
+                            best_index = other_index;
+                            best_score = other_score;
+                            best_valid = 1;
+                        }
+                    }
+                }
+
+                uint winner_index = simd_shuffle(best_index, ushort(0));
+                float winner_score = simd_shuffle(best_score, ushort(0));
+                if (lane == rank) {
+                    my_index = winner_index;
+                    my_score = winner_score;
+                }
+                if (candidate0_valid != 0 &&
+                    candidate0_index == winner_index) {
+                    candidate0_valid = 0;
+                }
+                if (candidate1_valid != 0 &&
+                    candidate1_index == winner_index) {
+                    candidate1_valid = 0;
+                }
+            }
+
+            // Textual copy of the incumbent rank-order output/normalization
+            // fold at tip 612df03, LagunaRuntimeModel.swift:5218-5230.
+        \(epilogue)
+        }
+        """
+}
+
+/// Textual copy of `lagunaDecodeRouterTop8Header` at CURRENT tip `612df03`,
+/// `LagunaRuntimeModel.swift:5316-5335`. Keeping this private header
+/// self-contained makes the hierarchical comparator auditable byte-for-byte:
+/// finite values precede NaNs; ties (including +0/-0 and two NaNs) resolve to
+/// the lower original expert index.
+private let lagunaDecodeRouterTop8HierarchicalHeader = """
+    METAL_FUNC bool laguna_router_key_before(
+        float a, uint a_index, float b, uint b_index) {
+        bool a_nan = metal::isnan(a);
+        bool b_nan = metal::isnan(b);
+        if (a_nan | b_nan) {
+            if (a_nan != b_nan) {
+                return !a_nan;
+            }
+            return a_index < b_index;
+        }
+        if (a < b) {
+            return true;
+        }
+        if (b < a) {
+            return false;
+        }
+        return a_index < b_index;
+    }
+    """
+
+private let lagunaDecodeRouterTop8HierarchicalKernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_top8_hier_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterTop8HierarchicalKernelSource(normalizing: false),
+    header: lagunaDecodeRouterTop8HierarchicalHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaDecodeRouterTop8HierarchicalNormalizingKernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_top8_hier_norm_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterTop8HierarchicalKernelSource(normalizing: true),
+    header: lagunaDecodeRouterTop8HierarchicalHeader,
+    ensureRowContiguous: true
+)
+
+/// DEFAULT ON. Set `DARKBLOOM_ROUTER_TOP8_HIER=0` to restore the incumbent
+/// 256-lane bitonic selector inside the same binary.
+///
+/// Forensic purpose: submission fc593a30 passed every ranked correctness and
+/// behavior gate, then failed only the measure step at a fixed ~180 seconds.
+/// Four unrelated kernel-adding packages shared that signature. This re-port
+/// is therefore both a projected +0.2–0.55% decode candidate and a
+/// discriminating probe for that failure class. The explicit untimed warmup
+/// below removes first-use Metal JIT compilation from the timed window.
+private let lagunaDecodeRouterTop8HierarchicalEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_TOP8_HIER"] == "1"
+
 private func lagunaDecodeRouterTop8(
     logits: MLXArray, correctionBias: MLXArray, normalizing: Bool = false
 ) -> (MLXArray, MLXArray) {
@@ -5361,7 +5602,11 @@ private func lagunaDecodeRouterTop8(
     precondition(correctionBias.size == 256)
 
     let kernel =
-        normalizing ? lagunaDecodeRouterTop8NormalizingKernel : lagunaDecodeRouterTop8Kernel
+        lagunaDecodeRouterTop8HierarchicalEnabled
+        ? (normalizing
+            ? lagunaDecodeRouterTop8HierarchicalNormalizingKernel
+            : lagunaDecodeRouterTop8HierarchicalKernel)
+        : (normalizing ? lagunaDecodeRouterTop8NormalizingKernel : lagunaDecodeRouterTop8Kernel)
     let outputs = kernel(
         [logits, correctionBias],
         grid: (256, 1, 1),
@@ -5370,6 +5615,36 @@ private func lagunaDecodeRouterTop8(
         outputDTypes: [.uint32, .float32]
     )
     return (outputs[0], outputs[1])
+}
+
+/// Untimed constructor warmup for every hierarchical kernel specialization
+/// reachable through the current router flags. `metalKernel` specializes its
+/// generated function signature by input dtype, while normalized and
+/// unnormalized variants have distinct source/name pairs, so both BF16/FP32
+/// logits and both epilogues are dispatched once. This is unconditional when
+/// `DARKBLOOM_ROUTER_TOP8_HIER` is enabled, even if another router kill switch
+/// makes a variant unreachable in that run, ensuring no hierarchical Metal
+/// JIT compilation can first occur in a scored window.
+private func lagunaWarmupDecodeRouterTop8Hierarchical() {
+    guard lagunaDecodeRouterTop8HierarchicalEnabled else { return }
+
+    let correctionBias = MLXArray.zeros([256], dtype: .float32)
+    let bf16Logits = MLXArray.zeros([1, 1, 256], dtype: .bfloat16)
+    let fp32Logits = MLXArray.zeros([1, 1, 256], dtype: .float32)
+    let bf16Plain = lagunaDecodeRouterTop8(
+        logits: bf16Logits, correctionBias: correctionBias)
+    let bf16Normalized = lagunaDecodeRouterTop8(
+        logits: bf16Logits, correctionBias: correctionBias, normalizing: true)
+    let fp32Plain = lagunaDecodeRouterTop8(
+        logits: fp32Logits, correctionBias: correctionBias)
+    let fp32Normalized = lagunaDecodeRouterTop8(
+        logits: fp32Logits, correctionBias: correctionBias, normalizing: true)
+    eval([
+        bf16Plain.0, bf16Plain.1,
+        bf16Normalized.0, bf16Normalized.1,
+        fp32Plain.0, fp32Plain.1,
+        fp32Normalized.0, fp32Normalized.1,
+    ])
 }
 
 /// Default-on after same-binary bitwise checks over smooth, tied, and extreme
@@ -6089,7 +6364,7 @@ private func lagunaInterleavedSwiGLU(
     halfShape[halfShape.count - 1] = split
     let gate = tiled[.ellipsis, 0 ..< 32].reshaped(halfShape)
     let up = tiled[.ellipsis, 32 ..< 64].reshaped(halfShape)
-    return compiledSiluProduct(gate, up)
+    return lagunaSiluProduct(gate, up)
 }
 
 /// Prefill (multi-token, SORTED-regime) counterpart to the decode-only fused
@@ -7272,6 +7547,19 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         if !fusedArrays.isEmpty {
             eval(fusedArrays)
         }
+        // Build, exhaustively certify, and warm every BF16 SiLU table
+        // specialization during the existing untimed weight-warmup phase.
+        // This call is feature-unconditional: individual MLP fusion flags do
+        // not decide which table-consuming Metal pipelines are compiled.
+        prepareLagunaSiluTable()
+
+        // This method runs during weight initialization immediately before
+        // the existing constructor-time model warmup. Dispatch every
+        // hierarchical router specialization here on synthetic rows so its
+        // Metal JIT work is unconditionally outside the worker protocol and
+        // every scored window when the feature is enabled.
+        lagunaWarmupDecodeRouterTop8Hierarchical()
+
         // Certified two-pass lm_head coarse copy (notes/68), gated by
         // `lagunaLmHeadPruneEnabled` (DARKBLOOM_LM_HEAD_PRUNE, default ON;
         // set "0" to disable). Built after the fused layouts so it reads
@@ -7295,4 +7583,353 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         // Drop precomputed rotary tables if a checkpoint ships them.
         return weights.filter { !$0.key.contains("rotary_emb.inv_freq") }
     }
+}
+
+// MARK: - Self-certified BF16 SiLU table
+//
+// Folded into this file to keep the editable-surface file inventory pinned.
+// This port is Swift plus MLXFast kernel strings only: no vendored/C++ layer
+// reads DARKBLOOM_SILU_TABLE or DARKBLOOM_SILU_TABLE_CERTIFIED.
+
+/// Process-wide, input-independent BF16 SiLU metadata. The table is enabled
+/// only after an exhaustive on-device raw-bit certificate succeeds.
+private enum LagunaSiluTableState {
+    nonisolated(unsafe) static var attempted = false
+    nonisolated(unsafe) static var table: MLXArray?
+    nonisolated(unsafe) static var preparationSeconds: Double = 0
+}
+
+/// Default ON. Set `DARKBLOOM_SILU_TABLE=0` to retain every stock SiLU path.
+private let lagunaSiluTableEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SILU_TABLE"] != "0"
+
+private let lagunaSiluReferenceKernel = MLXFast.metalKernel(
+    name: "laguna_silu_bf16_reference_all_patterns_v1",
+    inputNames: ["input"],
+    outputNames: ["output"],
+    source: """
+        uint index = thread_position_in_grid.x;
+        bfloat gate = input[index];
+        bfloat exp_abs = metal::exp(metal::abs(gate));
+        bfloat denominator = bfloat(1) + exp_abs;
+        bfloat y = bfloat(1) / denominator;
+        bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+        output[index] = bfloat(gate * sigmoid);
+        """,
+    ensureRowContiguous: true
+)
+
+private let lagunaSiluLookupCertificateKernel = MLXFast.metalKernel(
+    name: "laguna_silu_bf16_lookup_certificate_v1",
+    inputNames: ["input", "table"],
+    outputNames: ["output"],
+    source: """
+        uint index = thread_position_in_grid.x;
+        ushort table_index = as_type<ushort>(input[index]);
+        output[index] = table[table_index];
+        """,
+    ensureRowContiguous: true
+)
+
+private let lagunaSiluRawBitCertificateKernel = MLXFast.metalKernel(
+    name: "laguna_silu_bf16_raw_bit_certificate_v1",
+    inputNames: ["stock", "reference", "lookup"],
+    outputNames: ["matches"],
+    source: """
+        uint index = thread_position_in_grid.x;
+        ushort stock_bits = as_type<ushort>(stock[index]);
+        matches[index] =
+            stock_bits == as_type<ushort>(reference[index]) &&
+            stock_bits == as_type<ushort>(lookup[index]);
+        """,
+    ensureRowContiguous: true
+)
+
+private let lagunaSiluProductKernel = MLXFast.metalKernel(
+    name: "laguna_silu_bf16_table_product_v1",
+    inputNames: ["gate", "up", "silu_table"],
+    outputNames: ["output"],
+    source: """
+        uint index = thread_position_in_grid.x;
+        bfloat silu =
+            silu_table[as_type<ushort>(gate[index])];
+        output[index] = bfloat(silu * up[index]);
+        """,
+    ensureRowContiguous: true
+)
+
+/// The exact textual block retained in all seven current fused MLP kernels.
+/// Table variants are derived from the full stock source by replacing exactly
+/// one copy of this block; the stock kernel object and source remain unchanged.
+private let lagunaStockSiluMetalBlock = """
+        bfloat exp_abs = metal::exp(metal::abs(gate));
+        bfloat denominator = bfloat(1) + exp_abs;
+        bfloat y = bfloat(1) / denominator;
+        bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+        bfloat silu = bfloat(gate * sigmoid);
+"""
+
+private let lagunaTableSiluMetalBlock = """
+        bfloat silu =
+            silu_table[as_type<ushort>(gate)];
+"""
+
+struct LagunaSiluKernelPair {
+    let stock: MLXFast.MLXFastKernel
+    let table: MLXFast.MLXFastKernel
+}
+
+func lagunaMakeSiluKernelPair(
+    name: String,
+    inputNames: [String],
+    outputNames: [String],
+    source: String,
+    header: String = "",
+    ensureRowContiguous: Bool = true
+) -> LagunaSiluKernelPair {
+    let sourceParts = source.components(separatedBy: lagunaStockSiluMetalBlock)
+    precondition(
+        sourceParts.count == 2,
+        "Laguna SiLU table kernel expected exactly one retained textual block")
+    let tableSource = sourceParts.joined(separator: lagunaTableSiluMetalBlock)
+
+    return LagunaSiluKernelPair(
+        stock: MLXFast.metalKernel(
+            name: name,
+            inputNames: inputNames,
+            outputNames: outputNames,
+            source: source,
+            header: header,
+            ensureRowContiguous: ensureRowContiguous
+        ),
+        table: MLXFast.metalKernel(
+            name: "\(name)_silu_table_v1",
+            inputNames: inputNames + ["silu_table"],
+            outputNames: outputNames,
+            source: tableSource,
+            header: header,
+            ensureRowContiguous: ensureRowContiguous
+        )
+    )
+}
+
+func lagunaSiluKernelDispatch(
+    _ pair: LagunaSiluKernelPair,
+    inputs: [MLXArray]
+) -> (kernel: MLXFast.MLXFastKernel, inputs: [MLXArray]) {
+    if let table = LagunaSiluTableState.table {
+        return (pair.table, inputs + [table])
+    }
+    return (pair.stock, inputs)
+}
+
+func lagunaSiluProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
+    guard let table = LagunaSiluTableState.table,
+        gate.dtype == .bfloat16,
+        up.dtype == .bfloat16,
+        gate.shape == up.shape
+    else {
+        return MLXLMCommon.compiledSiluProduct(gate, up)
+    }
+
+    return lagunaSiluProductKernel(
+        [gate, up, table],
+        grid: (gate.size, 1, 1),
+        threadGroup: (min(gate.size, 256), 1, 1),
+        outputShapes: [gate.shape],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+func lagunaCertifiedSiluTable() -> MLXArray? {
+    LagunaSiluTableState.table
+}
+
+func lagunaSiluTablePreparationSeconds() -> Double {
+    LagunaSiluTableState.preparationSeconds
+}
+
+/// Untimed synthetic dispatch inventory for every table-consuming pipeline:
+///
+/// - generic SiLU-product at decode and multirow-prefill shapes;
+/// - shared and routed decode QMV;
+/// - routed+shared R2, R4, pipeline-2, and nine-slot decode schedules;
+/// - the layer-0 dense gate/up decode fusion.
+///
+/// The three certification kernels are dispatched by
+/// `prepareLagunaSiluTable` immediately before this function. This inventory
+/// intentionally ignores the individual fusion flags: whenever
+/// `DARKBLOOM_SILU_TABLE` is enabled, every added table pipeline is compiled
+/// before the constructor-time model warmup and worker protocol.
+private func lagunaWarmupSiluTableKernels(table: MLXArray) {
+    let hidden = LagunaConstants.hiddenSize
+    let intermediate = LagunaConstants.moeIntermediateSize
+    let sharedIntermediate = LagunaConstants.sharedExpertIntermediateSize
+    let expertsPerToken = LagunaConstants.numExpertsPerTok
+
+    let decodeGate = MLXArray.zeros([1, 1, sharedIntermediate], dtype: .bfloat16)
+    let decodeUp = MLXArray.zeros([1, 1, sharedIntermediate], dtype: .bfloat16)
+    let prefillGate = MLXArray.zeros([1, 2, sharedIntermediate], dtype: .bfloat16)
+    let prefillUp = MLXArray.zeros([1, 2, sharedIntermediate], dtype: .bfloat16)
+    let decodeProduct = lagunaSiluProductKernel(
+        [decodeGate, decodeUp, table],
+        grid: (decodeGate.size, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [decodeGate.shape],
+        outputDTypes: [.bfloat16]
+    )[0]
+    let prefillProduct = lagunaSiluProductKernel(
+        [prefillGate, prefillUp, table],
+        grid: (prefillGate.size, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [prefillGate.shape],
+        outputDTypes: [.bfloat16]
+    )[0]
+
+    let input = MLXArray.zeros([1, 1, hidden], dtype: .bfloat16)
+    // One synthetic expert is sufficient because every routed index is zero.
+    // The full 1024 rows also cover the shared kernel's gate/up row split.
+    let fusedWeight = MLXArray.zeros(
+        [2 * intermediate, hidden / 8], dtype: .uint32)
+    let fusedScales = MLXArray.zeros(
+        [2 * intermediate, hidden / 16], dtype: .uint8)
+    let indices = MLXArray.zeros(
+        [1, 1, expertsPerToken], dtype: .uint32)
+    let routedShape = [
+        1, 1, expertsPerToken, 1, intermediate,
+    ]
+    let sharedShape = [1, 1, sharedIntermediate]
+
+    let shared = lagunaSharedSwiGLUQMVKernels.table(
+        [input, fusedWeight, fusedScales, table],
+        grid: (64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [sharedShape],
+        outputDTypes: [.bfloat16]
+    )[0]
+    let routed = lagunaRoutedSwiGLUQMVKernels.table(
+        [input, fusedWeight, fusedScales, indices, table],
+        grid: (64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [routedShape],
+        outputDTypes: [.bfloat16]
+    )[0]
+
+    let mergedInputs = [
+        input, fusedWeight, fusedScales, indices,
+        fusedWeight, fusedScales, table,
+    ]
+    let mergedOutputShapes = [routedShape, sharedShape]
+    let routedShared = lagunaRoutedSharedSwiGLUQMVKernels.table(
+        mergedInputs,
+        grid: (expertsPerToken * 64 + 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: mergedOutputShapes,
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    let routedSharedRows4 = lagunaRoutedSharedSwiGLUQMVRows4Kernels.table(
+        mergedInputs,
+        grid: (expertsPerToken * 64 + 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: mergedOutputShapes,
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    let routedSharedPipeline2 = lagunaPipelinedRoutedSharedSwiGLUQMVKernels.table(
+        mergedInputs,
+        grid: (expertsPerToken * 64 + 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: mergedOutputShapes,
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    let routedSharedNineSlot = lagunaNineSlotSwiGLUQMVKernels.table(
+        mergedInputs,
+        grid: ((expertsPerToken + 1) * 32, 1, 1),
+        threadGroup: ((expertsPerToken + 1) * 32, 1, 1),
+        outputShapes: mergedOutputShapes,
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+
+    // One 32-thread SIMD group touches gate rows 0..<4 and up rows
+    // 8192..<8196, so this is the smallest safe synthetic dense bank.
+    let denseWeight = MLXArray.zeros(
+        [LagunaConstants.denseIntermediateSize + 4, hidden],
+        dtype: .bfloat16)
+    let dense = lagunaDenseGateUpSwiGLUKernels.table(
+        [input, denseWeight, table],
+        grid: (32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [[1, 1, LagunaConstants.denseIntermediateSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
+
+    eval(
+        [decodeProduct, prefillProduct, shared, routed]
+            + routedShared + routedSharedRows4
+            + routedSharedPipeline2 + routedSharedNineSlot
+            + [dense])
+}
+
+/// Build and certify all 65,536 BF16 inputs during untimed weight
+/// initialization. The stock MLX SiLU result is the table. A retained textual
+/// kernel and the exact integer-indexed lookup are both compared with it as
+/// raw ushort bits on device, covering NaNs, infinities, subnormals, and
+/// signed zero. Any mismatch leaves the process on the untouched stock paths.
+func prepareLagunaSiluTable() {
+    guard !LagunaSiluTableState.attempted else { return }
+    LagunaSiluTableState.attempted = true
+    guard lagunaSiluTableEnabled else {
+        setenv("DARKBLOOM_SILU_TABLE_CERTIFIED", "0", 1)
+        return
+    }
+
+    let start = Date.timeIntervalSinceReferenceDate
+    let rawCodes = MLXArray((0 ..< 65_536).map { UInt16($0) })
+    let inputs = rawCodes.view(dtype: .bfloat16)
+    let stock = MLXNN.silu(inputs)
+    let reference = lagunaSiluReferenceKernel(
+        [inputs],
+        grid: (65_536, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[65_536]],
+        outputDTypes: [.bfloat16]
+    )[0]
+    let lookup = lagunaSiluLookupCertificateKernel(
+        [inputs, stock],
+        grid: (65_536, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[65_536]],
+        outputDTypes: [.bfloat16]
+    )[0]
+    let matches = lagunaSiluRawBitCertificateKernel(
+        [stock, reference, lookup],
+        grid: (65_536, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[65_536]],
+        outputDTypes: [.bool]
+    )[0]
+    let bitCertified = matches.all().item(Bool.self)
+    eval(stock)
+
+    // Unconditional for an enabled feature, even if certification fails:
+    // outputs are discarded and an uncertified table is never published to
+    // scored dispatch. This guarantees first-use JIT cannot move into timing.
+    lagunaWarmupSiluTableKernels(table: stock)
+
+    if bitCertified {
+        LagunaSiluTableState.table = stock
+        setenv("DARKBLOOM_SILU_TABLE_CERTIFIED", "1", 1)
+    } else {
+        LagunaSiluTableState.table = nil
+        setenv("DARKBLOOM_SILU_TABLE_CERTIFIED", "0", 1)
+    }
+
+    let elapsed = Date.timeIntervalSinceReferenceDate - start
+    LagunaSiluTableState.preparationSeconds = elapsed
+    let status =
+        bitCertified ? "active" : "certificate mismatch; stock fallback"
+    let line = String(
+        format:
+            "mlxfast: BF16 SiLU table %@; patterns=65536 bytes=131072 init_seconds=%.6f\n",
+        status, elapsed)
+    FileHandle.standardError.write(Data(line.utf8))
 }
