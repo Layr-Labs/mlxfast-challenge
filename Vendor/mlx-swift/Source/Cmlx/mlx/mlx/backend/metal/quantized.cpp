@@ -1287,9 +1287,9 @@ bool darkbloom_expert_aligned_gather() {
   return v;
 }
 
-// DARKBLOOM_EXPERT_GATHER_GROUPS (default 128; "64" restores the promoted
-// four-experts-per-threadgroup schedule and "256" selects one expert per
-// threadgroup, both kept as A/B controls): how many threadgroups the
+// DARKBLOOM_EXPERT_GATHER_GROUPS (default 256; "128" restores the previously
+// promoted two-experts-per-threadgroup schedule and "64" the four-per-group
+// schedule before it, both kept as A/B controls): how many threadgroups the
 // expert-aligned gather QMM spreads the 256 experts over. More threadgroups
 // means the hardware scheduler overlaps per-expert staging drains and MMA
 // phases instead of serializing expert slots inside one threadgroup. Only
@@ -1297,18 +1297,18 @@ bool darkbloom_expert_aligned_gather() {
 // computed by the same tile walk with the same accumulation order, and the
 // value is baked into the kernel name and template, so each setting compiles
 // exactly one pipeline for the process lifetime. Measured on M5 Max against
-// the promoted 64 schedule, 128 captures roughly two-thirds of the 256
-// schedule's prefill gain while keeping the measured speedup comfortably
-// mid-band; 256 measures closer to the acceptance ceiling in the single-shot
-// harness regime and is staged as its own follow-up chunk.
+// the promoted 64 schedule, 128 captured roughly two-thirds of the 256
+// schedule's prefill gain and promoted mid-band; this default completes the
+// staged widening to one expert per threadgroup, whose remaining step over
+// the now-promoted 128 schedule sits well inside the band.
 int darkbloom_expert_gather_groups() {
   static const int v = [] {
     auto s = env::get_var("DARKBLOOM_EXPERT_GATHER_GROUPS", "");
     if (s.empty()) {
-      return 128;
+      return 256;
     }
     int n = std::atoi(s.c_str());
-    return (n > 0 && (256 % n) == 0) ? n : 128;
+    return (n > 0 && (256 % n) == 0) ? n : 256;
   }();
   return v;
 }
