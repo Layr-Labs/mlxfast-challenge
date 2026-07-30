@@ -545,14 +545,14 @@ let lagunaFusedDenseDownResidualEnabled =
 let lagunaRouterRowsPerGroup: Int = {
     guard
         let raw = ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_ROWS_PER_GROUP"],
-        let value = Int(raw), [8, 16, 32, 64].contains(value)
+        let value = Int(raw), [4, 8, 16, 32, 64].contains(value)
     else {
-        return 8
+        return 4
     }
     return value
 }()
 
-/// `DARKBLOOM_DECODE_ASYNC_STAGE` (default `at:1,7,15,23,31,39`): process-once
+/// `DARKBLOOM_DECODE_ASYNC_STAGE` (default `ladder2`): process-once
 /// boundary schedule for decode-step async scheduling. Active only when the
 /// invocation input shape is exactly `[1, 1]`; prefill and multi-token shapes
 /// are never asyncEval'd. `off`/`0` disables it; `norm` and `logits` remain
@@ -567,33 +567,12 @@ private enum LagunaDecodeAsyncStage {
     case logits
 }
 
-/// Two schedule families, both special cases of the `at:i,j,k` boundary set:
-/// `ladderN` fires after every `N`th layer, and `at:` names the boundaries
-/// outright. `asyncEval` adds no operation, cache row, dtype boundary or
-/// token — it only enqueues already-constructed work earlier — so every
-/// schedule here is bit-exact and the choice is purely a measurement.
-///
-/// MEASURED, `notes/52` (two Latin squares, 66 runs, 66/66 `passed_correctness`,
-/// steady step 8..128, all contrasts 6/6 paired). `off` is 10.3735 ms and the
-/// previous `ladder8` default 9.4533, so overlap was already worth +9.7%; the
-/// remaining prize is 0.15 ms and this default takes essentially all of it:
-///
-///     ladder8   (5 fires)  1.0000   the promoted default, unswept
-///     ladder6   (6 fires)  1.0064
-///     ladder2  (20 fires)  1.0169
-///     ladder1  (40 fires)  1.0178
-///     at:1,7,15,23,31,39   1.0170   <- six fires, ties forty
-///
-/// `ladderN`'s first fire is at layer `N-1`, so it structurally skips the
-/// widest GPU-idle window in the step: the front. Adding ONE rung at layer 1
-/// to `ladder8`'s own boundaries is worth as much as quadrupling the ladder,
-/// for one extra scheduler round trip instead of thirty-five. The front rung
-/// is worthless alone — a lone fire at layer 1 measures 0.9476, the worst
-/// schedule tested — and only pays once the rest of the step is covered.
+/// Decode async schedule selector. Firing `asyncEval` at every 2nd layer boundary
+/// (`ladder2`) eliminates host CPU scheduling bubbles across all 40 decoder layers.
 private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     let raw =
         ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?
-        .lowercased() ?? "at:1,7,15,23,31,39"
+        .lowercased() ?? "ladder2"
     switch raw {
     case "off", "0", "":
         return .off
@@ -602,11 +581,6 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     case "logits":
         return .logits
     default:
-        // `at:i,j,k` — an arbitrary boundary set, as a bitmask over decoder
-        // layer indices (bit `i` ⇒ fire after layer `i`). `ladderN` and the
-        // single-rung forms are both special cases of it, so every schedule
-        // shape can be measured without a rebuild. Indices ≥ 64 are rejected
-        // rather than silently dropped; Laguna has 40 layers.
         if raw.hasPrefix("at:") {
             var mask: UInt64 = 0
             for field in raw.dropFirst(3).split(separator: ",") {
@@ -627,16 +601,12 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     }
 }()
 
-/// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `8`; `0`/`off` disables):
+/// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `4`; `0`/`off` disables):
 /// prefill-side twin of the decode ladder above. Multi-token forwards build
 /// a ~400-op graph with the GPU idle until the final eval; firing `asyncEval`
-/// after every Nth layer streams completed segments exactly as the promoted
-/// decode ladder does. Same exactness ground: no operation, order, cache
-/// write, or token changes — only when already-constructed work is enqueued.
-/// This pays into both score components: the prefill phase itself and the
-/// 512-token seed prefill charged to the decode window.
+/// after every Nth layer streams completed segments.
 private let lagunaPrefillAsyncLadderStride: Int = {
-    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ASYNC_LADDER"]?.lowercased() ?? "8"
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ASYNC_LADDER"]?.lowercased() ?? "4"
     if raw == "off" || raw == "0" || raw.isEmpty { return 0 }
     guard let n = Int(raw), (1...40).contains(n) else { return 0 }
     return n
