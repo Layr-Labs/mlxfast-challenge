@@ -1676,7 +1676,8 @@ template <
     bool transpose,
     const int fixed_K = 0,
     const int fixed_N = 0,
-    typename Wtype = bfloat>
+    typename Wtype = bfloat,
+    int tg_expert_groups = 64>
 [[kernel]] void fp_gather_qmm_rhs_expert_nax(
     const device T* x,
     const device uint32_t* w,
@@ -1700,7 +1701,10 @@ template <
   constexpr int bytes_per_pack = get_bytes_per_pack();
   constexpr int BK_padded = BK + 16 / sizeof(Wtype);
   constexpr int BN_padded = BN + 16 / sizeof(Wtype);
-  constexpr int expert_groups = 64;
+  // expert_groups comes from the template (grid y); the host certifies
+  // experts % expert_groups == 0 and sizes the grid to match, so each
+  // threadgroup owns exactly experts / expert_groups expert slots.
+  constexpr int expert_groups = tg_expert_groups;
   constexpr int experts = 256;
   const int kernel_K = fixed_K > 0 ? fixed_K : K;
   const int kernel_N = fixed_N > 0 ? fixed_N : N;
