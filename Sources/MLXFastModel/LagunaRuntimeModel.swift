@@ -5799,6 +5799,39 @@ final class LagunaRuntimeMoEGate: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
 
+    /// Cached FP32 view of the correction bias. The bias is an
+    /// input-independent constant, but the router runs
+    /// `eScoreCorrectionBias.asType(.float32)` on every sparse layer of every
+    /// decode token (39 recasts/token). Caching the recast turns that into a
+    /// single `astype`; the value is bit-identical to the inline recast since
+    /// `asType` of a fixed constant is deterministic.
+    ///
+    /// Lifecycle: the bias is materialized once by `update(parameters:)` at
+    /// model load and never reassigned on the inference path, so a cache
+    /// built after load stays valid for the process lifetime. The cache is
+    /// invalidated by `resetCorrectionBiasFP32Cache()` (called from the
+    /// eager `prepareFusedRuntimeWeights` load pass), and any lazy first call
+    /// recomputes it if `prepare` was skipped. To keep the guarantee explicit
+    /// rather than relying on array-handle identity, invalidation is driven by
+    /// that reset, not by comparing the backing `mlx_array`.
+    private var _correctionBiasFP32: MLXArray?
+
+    /// Drops the cached FP32 bias so the next `correctionBiasFP32()` rebuilds
+    /// it from the current parameter. Call after any `update(parameters:)`
+    /// that could change the bias.
+    func resetCorrectionBiasFP32Cache() {
+        _correctionBiasFP32 = nil
+    }
+
+    func correctionBiasFP32() -> MLXArray {
+        if let cached = _correctionBiasFP32 {
+            return cached
+        }
+        let recast = eScoreCorrectionBias.asType(.float32)
+        _correctionBiasFP32 = recast
+        return recast
+    }
+
     init(_ config: LagunaConfig) {
         self.topK = config.numExpertsPerTok
         self.normTopkProb = config.normTopkProb
@@ -5828,7 +5861,7 @@ final class LagunaRuntimeMoEGate: Module {
             lagunaTrace("prefill router tournament")
             return lagunaPrefillRouterTournament(
                 logits: projectedLogits,
-                correctionBias: eScoreCorrectionBias.asType(.float32),
+                correctionBias: correctionBiasFP32(),
                 rows: projectedLogits.dim(1),
                 normalizing: normTopkProb
             )
@@ -5846,7 +5879,7 @@ final class LagunaRuntimeMoEGate: Module {
             lagunaTrace("prefill router top8")
             return lagunaPrefillRouterTop8(
                 logits: projectedLogits,
-                correctionBias: eScoreCorrectionBias.asType(.float32),
+                correctionBias: correctionBiasFP32(),
                 rows: projectedLogits.dim(1),
                 normalizing: normTopkProb
             )
@@ -5867,7 +5900,7 @@ final class LagunaRuntimeMoEGate: Module {
                     : "decode router top8 (cast sink)")
             (inds, weights) = lagunaDecodeRouterTop8(
                 logits: projectedLogits,
-                correctionBias: eScoreCorrectionBias.asType(.float32),
+                correctionBias: correctionBiasFP32(),
                 normalizing: sinkNormalization
             )
             if sinkNormalization {
@@ -5886,7 +5919,7 @@ final class LagunaRuntimeMoEGate: Module {
                 lagunaTrace("decode router top8 (fp32 logits)")
                 (inds, weights) = lagunaDecodeRouterTop8(
                     logits: logits,
-                    correctionBias: eScoreCorrectionBias.asType(.float32)
+                    correctionBias: correctionBiasFP32()
                 )
             } else {
                 let scores = sigmoid(logits)
@@ -7261,6 +7294,12 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                 if lagunaFusedRoutedGateUpEnabled {
                     fusedArrays.append(contentsOf: sparse.prepareFusedRoutedGateUp())
                 }
+                // Prime the router's FP32 correction-bias cache from the
+                // now-loaded parameter so the 39-per-decode-token recasts
+                // become a single materialized constant. Reset first so a
+                // reload rebuilds it from the current bias.
+                sparse.gate.resetCorrectionBiasFP32Cache()
+                fusedArrays.append(sparse.gate.correctionBiasFP32())
             } else if let dense = layer.mlp as? LagunaRuntimeMLP {
                 if lagunaFusedDenseGateUpSwiGLUEnabled,
                     let fused = dense.prepareFusedDenseGateUp()
