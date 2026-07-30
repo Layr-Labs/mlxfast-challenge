@@ -776,6 +776,132 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 }
 
+/// Sliding-window cache whose serial-decode steps store K and V through ONE
+/// slice-update dispatch instead of two. The packed buffer is
+/// `[1, kvHeads, maxCacheSize, 2, headDim]` — K and V adjacent per ring slot —
+/// so a single-token write is one contiguous `[.., idx ..< idx+1, .., ..]`
+/// assignment of a `[1, H, 1, 2, D]` pair, and attention reads K/V back as
+/// squeezed views (`[.., 0, ..]` / `[.., 1, ..]`) whose seq stride is `2*D`.
+/// `sdpa_vector` takes explicit `k_seq_stride`/`v_seq_stride`, so the strided
+/// views dispatch the same fused kernel over the same values in the same
+/// per-row order — bit-identical attention, one fewer dispatch per sliding
+/// layer per decoded token.
+///
+/// Everything outside the single-token fast path delegates to the stock
+/// `RotatingKVCache` machinery: prefill (multi-token) updates run the exact
+/// inherited `updateConcat`, and any consumer that needs the classic split
+/// arrays (`state`, `trim`, a multi-token update arriving after packing, or
+/// the generic `update` fallback) first materializes the packed buffer back
+/// into `keys`/`values` via two slice copies and then behaves exactly like
+/// the parent class. The pack step itself happens once, on the first
+/// single-token update after prefill.
+public class LagunaPackedRotatingKVCache: RotatingKVCache {
+    /// `[1, kvHeads, maxCacheSize, 2, headDim]`; nil until the first decode
+    /// step packs the prefill state (or from the start for an empty prompt).
+    var packed: MLXArray?
+
+    public override func innerState() -> [MLXArray] {
+        ([self.keys, self.values, self.packed].compactMap { $0 })
+    }
+
+    /// Single-token fast path. `kv` is `[1, H, 1, 2, D]` (K at pair index 0,
+    /// V at pair index 1). Returns `(keys, values)` views shaped
+    /// `[1, H, len, D]`, or nil when the ring state cannot be packed (caller
+    /// must fall back to the stock two-write `update`).
+    public func updatePacked(_ kv: MLXArray) -> (MLXArray, MLXArray)? {
+        guard kv.ndim == 5, kv.dim(0) == 1, kv.dim(2) == 1, kv.dim(3) == 2
+        else { return nil }
+        if packed == nil {
+            guard migrateToPacked(like: kv) else { return nil }
+        }
+        // Mirrors `updateInPlace` bookkeeping for tokenCount == 1 with the
+        // buffer pre-allocated at full ring capacity (no growth, no trim).
+        if idx == maxCacheSize {
+            idx = keep
+        }
+        packed![.ellipsis, idx ..< (idx + 1), 0..., 0...] = kv
+        offset += 1
+        idx += 1
+        let length = min(offset, maxCacheSize)
+        return (
+            packed![0..., 0..., ..<length, 0, 0...],
+            packed![0..., 0..., ..<length, 1, 0...]
+        )
+    }
+
+    private func migrateToPacked(like kv: MLXArray) -> Bool {
+        let kvHeads = kv.dim(1)
+        let headDim = kv.dim(4)
+        if let keys = self.keys, let values = self.values {
+            // Ring layout must fit the pre-allocated capacity and the write
+            // cursor must be where the inherited prefill left it; anything
+            // else (over-length prompt staging) keeps the stock path.
+            let length = keys.dim(2)
+            guard length <= maxCacheSize, idx == length,
+                keys.dim(0) == 1, keys.dim(1) == kvHeads,
+                keys.dim(3) == headDim, values.dim(3) == headDim,
+                keys.dtype == kv.dtype, values.dtype == kv.dtype
+            else { return false }
+            let buffer = MLXArray.zeros(
+                [1, kvHeads, maxCacheSize, 2, headDim], dtype: kv.dtype)
+            buffer[0..., 0..., ..<length, 0, 0...] = keys
+            buffer[0..., 0..., ..<length, 1, 0...] = values
+            packed = buffer
+            self.keys = nil
+            self.values = nil
+        } else {
+            packed = MLXArray.zeros(
+                [1, kvHeads, maxCacheSize, 2, headDim], dtype: kv.dtype)
+        }
+        return true
+    }
+
+    /// Splits the packed buffer back into the parent's `keys`/`values` so
+    /// every inherited slow-path behavior stays exact.
+    func materializeUnpacked() {
+        guard let packed else { return }
+        let length = min(offset, maxCacheSize)
+        self.keys = packed[0..., 0..., ..<length, 0, 0...]
+        self.values = packed[0..., 0..., ..<length, 1, 0...]
+        self.packed = nil
+        // The parent treats `keys.dim(2)` as the ring allocation; after
+        // unpacking a full ring the cursor semantics are unchanged (idx
+        // still points at the next slot).
+    }
+
+    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        if packed != nil {
+            materializeUnpacked()
+        }
+        return super.update(keys: keys, values: values)
+    }
+
+    public override var state: [MLXArray] {
+        get {
+            if packed != nil {
+                materializeUnpacked()
+            }
+            return super.state
+        }
+        set {
+            packed = nil
+            super.state = newValue
+        }
+    }
+
+    public override var isTrimmable: Bool {
+        super.isTrimmable
+    }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        if packed != nil, n > 0 {
+            materializeUnpacked()
+        }
+        return super.trim(n)
+    }
+}
+
 /// Pick the supported quantization group size ({32, 64, 128}) closest to the
 /// requested one whose value divides both head dims. Returns nil when no
 /// supported group size is compatible. Upstream 01b8624.

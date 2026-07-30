@@ -258,6 +258,14 @@ let lagunaRoutedSharedSwiGLUQMVRows4Enabled =
 
 /// Folds the per-head softplus gate into the output projection's GEMV (see
 /// `lagunaGatedOutputProjectionSource`), with one kernel variant per attention
+/// Packed single-write KV cache for sliding layers: the sliding norm+RoPE
+/// kernel emits an interleaved [K|V] pair per step and
+/// `LagunaPackedRotatingKVCache` stores it with ONE slice-update dispatch
+/// instead of two. Set `DARKBLOOM_PACKED_KV=0` to restore the stock
+/// `RotatingKVCache` and its two-write update exactly.
+let lagunaPackedKVEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_KV"] != "0"
+
 /// family. Set `DARKBLOOM_FUSED_GATED_OUTPUT=0` to ablate.
 let lagunaFusedGatedOutputProjectionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATED_OUTPUT"] != "0"
@@ -1238,6 +1246,128 @@ func lagunaSlidingQKNormRoPE(
         outputShapes: [
             [1, heads, 1, LagunaConstants.headDim],
             [1, kvHeads, 1, LagunaConstants.headDim],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
+/// `lagunaSlidingQKNormRoPEKernel` with a packed-KV emitter: the same Q/K
+/// norm+RoPE text (head slots 0..<56 are UNCHANGED — same expressions, same
+/// per-head simdgroup, same rounding), plus 8 extra head slots that copy the
+/// raw V row through untouched. K and V land interleaved per head in one
+/// `[1, kvHeads, 1, 2, headDim]` output, which is exactly the pair
+/// `LagunaPackedRotatingKVCache.updatePacked` stores with a single
+/// slice-update dispatch. V is a bit-exact copy; K/Q are bit-exact by shared
+/// kernel text; only the destination layout differs.
+private let lagunaSlidingQKNormRoPEKVKernel = MLXFast.metalKernel(
+    name: "laguna_sliding_qk_norm_rope_kv_bf16_128_v1",
+    inputNames: [
+        "raw_queries", "raw_keys", "raw_values", "query_weight", "key_weight",
+        "angles",
+    ],
+    outputNames: ["queries", "kv"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint rotary_pairs = 64;
+        constexpr uint query_heads = 64;
+        constexpr uint norm_heads = 72;
+
+        uint head = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+        uint base = lane * 4;
+
+        // Pass-through V slots: one simdgroup per KV head copies its 128
+        // values into the pair-index-1 half of the packed row.
+        if (head >= norm_heads) {
+            uint kv_head = head - norm_heads;
+            const device bfloat* source = raw_values + kv_head * head_dim;
+            device bfloat* destination = kv + kv_head * 2 * head_dim + head_dim;
+            for (uint i = 0; i < 4; ++i) {
+                destination[base + i] = source[base + i];
+            }
+            return;
+        }
+
+        const device bfloat* input;
+        const device bfloat* weight;
+        if (head < query_heads) {
+            input = raw_queries + head * head_dim;
+            weight = query_weight;
+        } else {
+            input = raw_keys + (head - query_heads) * head_dim;
+            weight = key_weight;
+        }
+
+        thread bfloat normalized[4];
+        float sum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float value = float(input[base + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+        for (uint i = 0; i < 4; ++i) {
+            normalized[i] =
+                weight[base + i] *
+                bfloat(float(input[base + i]) * inverse_rms);
+        }
+
+        thread float paired[4];
+        for (uint i = 0; i < 4; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
+        }
+
+        device bfloat* output =
+            head < query_heads
+            ? queries + head * head_dim
+            : kv + (head - query_heads) * 2 * head_dim;
+        if (lane < 16) {
+            for (uint i = 0; i < 4; ++i) {
+                uint pair = base + i;
+                float first = float(normalized[i]);
+                float second = paired[i];
+                float cosine = angles[pair];
+                float sine = angles[pair + rotary_pairs];
+                output[pair] = bfloat(first * cosine - second * sine);
+                output[pair + rotary_pairs] =
+                    bfloat(first * sine + second * cosine);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+func lagunaSlidingQKNormRoPEKV(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    rawValues: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray
+) -> (MLXArray, MLXArray) {
+    let heads = LagunaConstants.slidingAttentionHeads
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    precondition(rawQueries.dtype == .bfloat16)
+    precondition(rawKeys.dtype == .bfloat16)
+    precondition(rawValues.dtype == .bfloat16)
+    precondition(rawQueries.shape == [1, 1, heads * LagunaConstants.headDim])
+    precondition(rawKeys.shape == [1, 1, kvHeads * LagunaConstants.headDim])
+    precondition(rawValues.shape == [1, 1, kvHeads * LagunaConstants.headDim])
+    precondition(queryWeight.shape == [LagunaConstants.headDim])
+    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(angles.dtype == .float32)
+    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim])
+
+    lagunaTrace("sliding qk norm+rope packed kv")
+    let outputs = lagunaSlidingQKNormRoPEKVKernel(
+        [rawQueries, rawKeys, rawValues, queryWeight, keyWeight, angles],
+        grid: ((heads + 2 * kvHeads) * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [
+            [1, heads, 1, LagunaConstants.headDim],
+            [1, kvHeads, 1, 2, LagunaConstants.headDim],
         ],
         outputDTypes: [.bfloat16, .bfloat16]
     )
@@ -2528,6 +2658,323 @@ func lagunaGateProductSoftplus(
     )[0]
 }
 
+/// Decode-only producer/consumer fusion for the native group-32 affine INT8
+/// `o_proj`: the promoted `laguna_native_affine_gated_output_qmv` contraction
+/// (its K loop, affine-group boundaries, per-row ownership, and SIMD
+/// reduction order are unchanged), re-landed on the folded-gate-bank frontier
+/// by moving the softplus INSIDE the kernel. The gate arrives as the RAW BF16
+/// logit sliced from the fused QKV bank; each lane reproduces
+/// `lagunaGateProductSoftplusSource`'s exact FP32 op stream (same
+/// NaN/inf guards, same `log1p`, same BF16 rounding boundaries) before
+/// forming the BF16-rounded per-head product in registers. This replaces the
+/// two-dispatch chain (softplus+product kernel, then the o_proj `quantizedMM`)
+/// and its materialized 6144/8192-element BF16 intermediate with one dispatch
+/// and a 48/64-element logit read. Every output element is bit-identical to
+/// that chain. Set `DARKBLOOM_NATIVE_AFFINE_GATED_OUTPUT_QMV=0` to restore it.
+private let lagunaNativeAffineGatedOutputQMVEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NATIVE_AFFINE_GATED_OUTPUT_QMV"] != "0"
+
+/// NVFP4 group-16 counterpart for the tail-window side layouts. Same in-kernel
+/// softplus, same promoted `laguna_native_nvfp4_gated_output_qmv` contraction
+/// (MLX's `fp_qmv_fast` row ownership, K loop, scale grouping, and reduction
+/// preserved via the shared `laguna_nvfp4_qdot_16`/`laguna_nvfp4_scale`
+/// helpers). Set `DARKBLOOM_NATIVE_NVFP4_GATED_OUTPUT_QMV=0` to restore the
+/// two-dispatch chain.
+private let lagunaNativeNVFP4GatedOutputQMVEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NATIVE_NVFP4_GATED_OUTPUT_QMV"] != "0"
+
+/// The softplus text is `lagunaGateProductSoftplusSource`'s, verbatim: the
+/// FP32 result depends only on the head's logit, so recomputing it per lane
+/// per block yields bit-identical `gate_bf` everywhere it is consumed.
+private let lagunaInKernelSoftplusGateSource = """
+    float logit = float(gate_logits[head]);
+    float gate;
+    if (metal::isnan(logit)) {
+        gate = NAN;
+    } else {
+        float maxval = metal::max(logit, 0.0f);
+        float minval = metal::min(logit, 0.0f);
+        gate = (metal::isinf(minval) || metal::isinf(maxval))
+            ? maxval
+            : maxval + log1p(metal::exp(minval - maxval));
+    }
+    bfloat gate_bf = bfloat(gate);
+    """
+
+private func lagunaNativeAffineGatedOutputQMVSource(heads: Int) -> String {
+    """
+    constexpr uint group_size = 32;
+    constexpr uint head_dim = 128;
+    constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
+    constexpr uint values_per_lane = 8;
+    constexpr uint block_size = 256;
+    constexpr uint results_per_simdgroup = 4;
+    constexpr uint simdgroups_per_group = 2;
+    constexpr uint groups_per_row = in_vec_size / group_size;
+
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint out_row =
+        threadgroup_position_in_grid.y *
+            (simdgroups_per_group * results_per_simdgroup) +
+        simd_group * results_per_simdgroup;
+
+    const device uint8_t* weight_bytes =
+        (const device uint8_t*)packed_codes;
+    thread float result[results_per_simdgroup] = {
+        0.0f, 0.0f, 0.0f, 0.0f
+    };
+    thread float coefficients[values_per_lane];
+
+    for (uint block = 0; block < in_vec_size; block += block_size) {
+        uint column = block + lane * values_per_lane;
+        uint head = column / head_dim;
+    \(lagunaInKernelSoftplusGateSource)
+        float coefficient_sum = 0.0f;
+        for (uint i = 0; i < values_per_lane; ++i) {
+            bfloat rounded = bfloat(
+                float(attention_output[column + i]) *
+                float(gate_bf));
+            coefficients[i] = float(rounded);
+            coefficient_sum += coefficients[i];
+        }
+
+        for (uint row = 0; row < results_per_simdgroup; ++row) {
+            uint logical_row = out_row + row;
+            const device uint8_t* codes =
+                weight_bytes + logical_row * in_vec_size + column;
+            uint affine_index =
+                logical_row * groups_per_row + column / group_size;
+            float scale = float(scales[affine_index]);
+            float bias = float(biases[affine_index]);
+            float quantized_dot = 0.0f;
+            for (uint i = 0; i < values_per_lane; ++i) {
+                quantized_dot += coefficients[i] * codes[i];
+            }
+            result[row] +=
+                scale * quantized_dot + coefficient_sum * bias;
+        }
+    }
+
+    for (uint row = 0; row < results_per_simdgroup; ++row) {
+        result[row] = simd_sum(result[row]);
+        if (lane == 0) {
+            output[out_row + row] = bfloat(result[row]);
+        }
+    }
+    """
+}
+
+private let lagunaNativeAffineGatedOutputQMVKernels:
+    [Int: MLXFast.MLXFastKernel] = {
+    Dictionary(
+        uniqueKeysWithValues: [
+            LagunaConstants.fullAttentionHeads,
+            LagunaConstants.slidingAttentionHeads,
+        ].map { heads in
+            (
+                heads,
+                MLXFast.metalKernel(
+                    name: "laguna_native_affine_gated_output_qmv_bf16_h\(heads)_v4",
+                    inputNames: [
+                        "attention_output", "gate_logits", "packed_codes",
+                        "scales", "biases",
+                    ],
+                    outputNames: ["output"],
+                    source: lagunaNativeAffineGatedOutputQMVSource(heads: heads),
+                    ensureRowContiguous: true
+                )
+            )
+        }
+    )
+}()
+
+func lagunaNativeAffineGatedOutputQMV(
+    attentionOutput: MLXArray,
+    gateLogits: MLXArray,
+    packedCodes: MLXArray,
+    scales: MLXArray,
+    biases: MLXArray,
+    heads: Int
+) -> MLXArray {
+    guard let kernel = lagunaNativeAffineGatedOutputQMVKernels[heads] else {
+        preconditionFailure("unsupported Laguna attention head count \(heads)")
+    }
+    let width = heads * LagunaConstants.headDim
+    precondition(attentionOutput.dtype == .bfloat16)
+    precondition(attentionOutput.shape == [1, 1, width])
+    precondition(gateLogits.dtype == .bfloat16)
+    precondition(gateLogits.shape == [1, 1, heads])
+    precondition(packedCodes.dtype == .uint32)
+    precondition(
+        packedCodes.shape == [
+            LagunaConstants.hiddenSize, width / MemoryLayout<UInt32>.size,
+        ])
+    precondition(scales.dtype == .bfloat16)
+    precondition(
+        scales.shape == [LagunaConstants.hiddenSize, width / 32])
+    precondition(biases.dtype == .bfloat16)
+    precondition(biases.shape == scales.shape)
+
+    lagunaTrace("native affine gate+output qmv h\(heads)")
+    return kernel(
+        [attentionOutput, gateLogits, packedCodes, scales, biases],
+        grid: (
+            64,
+            LagunaConstants.hiddenSize / 8,
+            1
+        ),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+private let lagunaNativeNVFP4GatedOutputQMVKernels:
+    [Int: MLXFast.MLXFastKernel] = {
+    Dictionary(
+        uniqueKeysWithValues: [
+            LagunaConstants.fullAttentionHeads,
+            LagunaConstants.slidingAttentionHeads,
+        ].map { heads in
+            (
+                heads,
+                MLXFast.metalKernel(
+                    name: "laguna_native_nvfp4_gated_output_qmv_bf16_h\(heads)_v2",
+                    inputNames: [
+                        "attention_output", "gate_logits", "packed_codes",
+                        "scales",
+                    ],
+                    outputNames: ["output"],
+                    source: """
+                        constexpr uint head_dim = 128;
+                        constexpr uint in_vec_size =
+                            \(heads * LagunaConstants.headDim);
+                        constexpr uint values_per_lane = 16;
+                        constexpr uint block_size = 512;
+                        constexpr uint results_per_simdgroup = 4;
+                        constexpr uint simdgroups_per_group = 2;
+                        constexpr uint packed_row_bytes = in_vec_size / 2;
+                        constexpr uint scale_row_bytes = in_vec_size / 16;
+
+                        uint simd_group =
+                            simdgroup_index_in_threadgroup;
+                        uint lane = thread_index_in_simdgroup;
+                        uint out_row =
+                            threadgroup_position_in_grid.y *
+                                (simdgroups_per_group *
+                                    results_per_simdgroup) +
+                            simd_group * results_per_simdgroup;
+
+                        const device uint8_t* weight_bytes =
+                            (const device uint8_t*)packed_codes;
+                        thread float result[results_per_simdgroup] = {
+                            0.0f, 0.0f, 0.0f, 0.0f
+                        };
+                        thread float coefficients[values_per_lane];
+
+                        for (uint block = 0; block < in_vec_size;
+                             block += block_size) {
+                            uint column =
+                                block + lane * values_per_lane;
+                            uint head = column / head_dim;
+                        \(lagunaInKernelSoftplusGateSource)
+                            const device vec<bfloat, 4>* input_vectors =
+                                (const device vec<bfloat, 4>*)(
+                                    attention_output + column);
+                            for (uint i = 0;
+                                 i < values_per_lane / 4; ++i) {
+                                const vec<bfloat, 4> values =
+                                    input_vectors[i];
+                                coefficients[4 * i] = float(bfloat(
+                                    float(values[0]) *
+                                    float(gate_bf)));
+                                coefficients[4 * i + 1] = float(bfloat(
+                                    float(values[1]) *
+                                    float(gate_bf)));
+                                coefficients[4 * i + 2] = float(bfloat(
+                                    float(values[2]) *
+                                    float(gate_bf)));
+                                coefficients[4 * i + 3] = float(bfloat(
+                                    float(values[3]) *
+                                    float(gate_bf)));
+                            }
+
+                            for (uint row = 0;
+                                 row < results_per_simdgroup; ++row) {
+                                uint logical_row = out_row + row;
+                                const device uint8_t* codes =
+                                    weight_bytes
+                                    + logical_row * packed_row_bytes
+                                    + column / 2;
+                                const device uint8_t* scale =
+                                    scales
+                                    + logical_row * scale_row_bytes
+                                    + column / 16;
+                                result[row] += laguna_nvfp4_qdot_16(
+                                    codes,
+                                    coefficients,
+                                    laguna_nvfp4_scale(scale[0]));
+                            }
+                        }
+
+                        for (uint row = 0;
+                             row < results_per_simdgroup; ++row) {
+                            result[row] = simd_sum(result[row]);
+                            if (lane == 0) {
+                                output[out_row + row] =
+                                    bfloat(result[row]);
+                            }
+                        }
+                        """,
+                    header: lagunaSharedSwiGLUQMVHeader,
+                    ensureRowContiguous: true
+                )
+            )
+        }
+    )
+}()
+
+func lagunaNativeNVFP4GatedOutputQMV(
+    attentionOutput: MLXArray,
+    gateLogits: MLXArray,
+    packedCodes: MLXArray,
+    scales: MLXArray,
+    heads: Int
+) -> MLXArray {
+    guard let kernel = lagunaNativeNVFP4GatedOutputQMVKernels[heads] else {
+        preconditionFailure("unsupported Laguna attention head count \(heads)")
+    }
+    let width = heads * LagunaConstants.headDim
+    precondition(attentionOutput.dtype == .bfloat16)
+    precondition(attentionOutput.shape == [1, 1, width])
+    precondition(gateLogits.dtype == .bfloat16)
+    precondition(gateLogits.shape == [1, 1, heads])
+    precondition(packedCodes.dtype == .uint32)
+    precondition(
+        packedCodes.shape == [
+            LagunaConstants.hiddenSize, width / 8,
+        ])
+    precondition(scales.dtype == .uint8)
+    precondition(
+        scales.shape == [LagunaConstants.hiddenSize, width / 16])
+
+    lagunaTrace("native NVFP4 gate+output qmv h\(heads)")
+    return kernel(
+        [attentionOutput, gateLogits, packedCodes, scales],
+        grid: (
+            64,
+            LagunaConstants.hiddenSize / 8,
+            1
+        ),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 /// Keep the stock shapeless unary gate for prefill. Ranked measurement showed
 /// the larger gate/product graph regressing the complete prefill schedule even
 /// though its isolated steady-state subpath was slightly faster.
@@ -3027,7 +3474,52 @@ final class LagunaRuntimeAttention: Module {
             qkRoPEAngles?.shape == [1, 1, lagunaRoPEAngleAtlasLength, headDim / 2]
 
         var qkNormRoPEFused = false
-        if useFusedFullQKNormYaRN, let qkRoPEAngles {
+        // Packed single-write KV path: the sliding norm+RoPE kernel emits the
+        // interleaved [K|V] pair, the packed rotating cache stores it with one
+        // slice-update, and SDPA consumes strided views of the same buffer.
+        // Attention output is bit-identical (same values, same fused
+        // sdpa_vector kernel — it takes explicit seq strides); only the
+        // dispatch count changes. Any decline falls through to the stock
+        // fused path below.
+        var packedAttended: MLXArray?
+        if useFusedSlidingQKNormRoPE, lagunaPackedKVEnabled,
+            let qkRoPEAngles,
+            let packedCache = cache as? LagunaPackedRotatingKVCache,
+            values.dtype == .bfloat16,
+            values.shape == [1, 1, nKVHeads * headDim]
+        {
+            let (ropedQueries, kvPair) = lagunaSlidingQKNormRoPEKV(
+                rawQueries: queries,
+                rawKeys: keys,
+                rawValues: values,
+                queryWeight: qNorm.weight,
+                keyWeight: kNorm.weight,
+                angles: qkRoPEAngles
+            )
+            queries = ropedQueries
+            if let (cachedKeys, cachedValues) = packedCache.updatePacked(kvPair) {
+                lagunaTrace("packed kv single-write update")
+                packedAttended = MLXFast.scaledDotProductAttention(
+                    queries: queries,
+                    keys: cachedKeys,
+                    values: cachedValues,
+                    scale: scale,
+                    mask: mask
+                )
+            } else {
+                // Ring state not packable: unpack the pair views and let the
+                // stock cache update run its exact two-write path.
+                keys = kvPair[0..., 0..., 0..., 0, 0...]
+                values = kvPair[0..., 0..., 0..., 1, 0...].reshaped(
+                    B, L, nKVHeads * headDim)
+            }
+            qkNormRoPEFused = true
+        }
+        if packedAttended == nil, qkNormRoPEFused {
+            // fall through with queries/keys already roped
+        } else if packedAttended != nil {
+            // attention already computed
+        } else if useFusedFullQKNormYaRN, let qkRoPEAngles {
             (queries, keys) = lagunaFullQKNormYaRN(
                 rawQueries: queries,
                 rawKeys: keys,
@@ -3093,14 +3585,16 @@ final class LagunaRuntimeAttention: Module {
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
-        let attended = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
-        )
+        let attended =
+            packedAttended
+            ?? attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
         // SDPA returns `[B, H, L, D]`. When `L == 1`, flattening its
         // contiguous head-major payload directly produces the exact
         // `[B, 1, H*D]` byte order; the transpose only changes singleton-axis
@@ -3155,6 +3649,46 @@ final class LagunaRuntimeAttention: Module {
                 output.shape == [1, 1, nHeads * headDim],
                 projectedGate.shape == [1, 1, nHeads]
             {
+                // Raw logits + the re-landed gated-output QMV: one dispatch
+                // reproduces the softplus chain, the broadcast product, AND
+                // the side-layout contraction bit-exactly, with no
+                // materialized gated row. Falls through to the two-dispatch
+                // chain below whenever the layout or activation state does
+                // not match.
+                if !gateIsActivated {
+                    if lagunaNativeAffineGatedOutputQMVEnabled,
+                        affineWO.mode == .affine,
+                        affineWO.groupSize == 32, affineWO.bits == 8,
+                        let affineBiases = affineWO.biases,
+                        affineWO.packedCodes.dtype == .uint32,
+                        affineWO.scales.dtype == .bfloat16,
+                        affineBiases.dtype == .bfloat16
+                    {
+                        return lagunaNativeAffineGatedOutputQMV(
+                            attentionOutput: output,
+                            gateLogits: projectedGate,
+                            packedCodes: affineWO.packedCodes,
+                            scales: affineWO.scales,
+                            biases: affineBiases,
+                            heads: nHeads
+                        )
+                    }
+                    if lagunaNativeNVFP4GatedOutputQMVEnabled,
+                        affineWO.mode == .nvfp4,
+                        affineWO.groupSize == 16, affineWO.bits == 4,
+                        affineWO.biases == nil,
+                        affineWO.packedCodes.dtype == .uint32,
+                        affineWO.scales.dtype == .uint8
+                    {
+                        return lagunaNativeNVFP4GatedOutputQMV(
+                            attentionOutput: output,
+                            gateLogits: projectedGate,
+                            packedCodes: affineWO.packedCodes,
+                            scales: affineWO.scales,
+                            heads: nHeads
+                        )
+                    }
+                }
                 // Raw logits + fused kernel: one dispatch reproduces the
                 // softplus chain AND the broadcast product bit-exactly (see
                 // `lagunaGateProductSoftplusSource`). Falls back to the stock
@@ -6969,7 +7503,8 @@ final class LagunaRuntimeModelInner: Module {
         let fullCache = cache[fullAttentionIdx]
         let slidingCache = cache[slidingAttentionIdx]
         guard type(of: fullCache) == KVCacheSimple.self,
-            type(of: slidingCache) == RotatingKVCache.self,
+            type(of: slidingCache) == RotatingKVCache.self
+                || type(of: slidingCache) == LagunaPackedRotatingKVCache.self,
             slidingCache.maxSize == slidingWindow
         else {
             return nil
@@ -7224,6 +7759,9 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         (0..<configuration.numHiddenLayers).map { layerIndex in
             if configuration.layerTypes[layerIndex] == .full {
                 StandardKVCache()
+            } else if lagunaPackedKVEnabled {
+                LagunaPackedRotatingKVCache(
+                    maxSize: configuration.slidingWindow, keep: 0)
             } else {
                 RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
             }
