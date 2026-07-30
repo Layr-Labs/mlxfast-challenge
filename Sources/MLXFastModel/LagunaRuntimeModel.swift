@@ -269,6 +269,15 @@ let lagunaFusedGatedOutputProjectionEnabled =
 let lagunaFusedQKVProjectionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV_PROJECTION"] != "0"
 
+/// Packs each group-32 affine BF16 `(scale, bias)` pair into one aligned
+/// `uint32` metadata word after the accepted INT8 side layout is built.
+/// The two BF16 bit patterns are unchanged; only their derived storage layout
+/// and the attention QMV load stream differ. Set
+/// `DARKBLOOM_PACKED_AFFINE_META=0` to retain the separate scale/bias arrays
+/// and the incumbent QKV / gated-output QMV dispatches.
+let lagunaPackedAffineMetadataEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_AFFINE_META"] == "1"
+
 /// TensorFold-derived within-token batching for the serial decode stream.
 /// A native group-32 affine INT8 side layout packs Q/K/V into one batched
 /// quantized matmul, cutting their weight traffic without speculating future
@@ -419,11 +428,13 @@ private func lagunaNativeAffineGProjWeight(_ weight: MLXArray) -> LagunaNativeAf
     }
     let (packedCodes, scales, biases) = quantized(
         weight, groupSize: 32, bits: 8, mode: .affine)
-    guard biases != nil else { return nil }
+    guard let biases else { return nil }
     return LagunaNativeAffineWeight(
         packedCodes: packedCodes,
         scales: scales,
         biases: biases,
+        packedMetadata: lagunaPackedAffineMetadata(
+            scales: scales, biases: biases),
         originalShape: weight.shape
     )
 }
@@ -1515,6 +1526,7 @@ struct LagunaNativeAffineWeight {
     let packedCodes: MLXArray
     let scales: MLXArray
     let biases: MLXArray?
+    let packedMetadata: MLXArray?
     let originalShape: [Int]
     /// Wire format of this side layout. The shipped layout is group-32 affine
     /// INT8; the NVFP4 probe below can build group-16 4-bit NVFP4 instead, and
@@ -1523,7 +1535,50 @@ struct LagunaNativeAffineWeight {
     var bits: Int = 8
     var mode: QuantizationMode = .affine
 
-    var arrays: [MLXArray] { [packedCodes, scales] + (biases.map { [$0] } ?? []) }
+    init(
+        packedCodes: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        packedMetadata: MLXArray? = nil,
+        originalShape: [Int],
+        groupSize: Int = 32,
+        bits: Int = 8,
+        mode: QuantizationMode = .affine
+    ) {
+        self.packedCodes = packedCodes
+        self.scales = scales
+        self.biases = biases
+        self.packedMetadata = packedMetadata
+        self.originalShape = originalShape
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+    }
+
+    var arrays: [MLXArray] {
+        [packedCodes, scales]
+            + (biases.map { [$0] } ?? [])
+            + (packedMetadata.map { [$0] } ?? [])
+    }
+}
+
+/// Interleave the existing BF16 scale and bias buffers as
+/// `[scale0, bias0, scale1, bias1, ...]`, then view each adjacent pair as one
+/// `uint32`. `stacked` is evaluated during runtime-weight preparation; no
+/// repacking occurs on the scored path.
+private func lagunaPackedAffineMetadata(
+    scales: MLXArray, biases: MLXArray
+) -> MLXArray? {
+    guard lagunaPackedAffineMetadataEnabled,
+        scales.dtype == .bfloat16,
+        biases.dtype == .bfloat16,
+        scales.shape == biases.shape
+    else {
+        return nil
+    }
+    return stacked([scales, biases], axis: -1)
+        .view(dtype: .uint32)
+        .reshaped(scales.shape)
 }
 
 /// REAL (not simulated) NVFP4 side layout for layers `>= N`
@@ -1606,6 +1661,7 @@ func lagunaNativeAffineWeight(
             packedCodes: codes,
             scales: scales,
             biases: biases,
+            packedMetadata: nil,
             originalShape: weight.shape,
             groupSize: 16,
             bits: 4,
@@ -1614,13 +1670,220 @@ func lagunaNativeAffineWeight(
     }
     let (packedCodes, scales, biases) = quantized(
         source, groupSize: 32, bits: 8, mode: .affine)
-    guard biases != nil else { return nil }
+    guard let biases else { return nil }
     return LagunaNativeAffineWeight(
         packedCodes: packedCodes,
         scales: scales,
         biases: biases,
+        packedMetadata: lagunaPackedAffineMetadata(
+            scales: scales, biases: biases),
         originalShape: weight.shape
     )
+}
+
+private struct LagunaPackedAffineQMVShape: Hashable {
+    let inputWidth: Int
+    let outputRows: Int
+}
+
+/// The 8-bit branches of MLX's current `load_vector` and `qdot` helpers,
+/// copied without changing their loop or arithmetic order. Keeping these
+/// helpers separate lets the kernel body below remain a textual copy of
+/// `qmv_fast_impl`; the metadata address stream is its only structural delta.
+private let lagunaPackedAffineQMVHeader = """
+    template <typename T, typename U, int values_per_thread>
+    inline U laguna_packed_affine_load_vector(
+        const device T* x,
+        thread U* x_thread) {
+      U sum = 0;
+      for (int i = 0; i < values_per_thread; i++) {
+        sum += x[i];
+        x_thread[i] = x[i];
+      }
+      return sum;
+    }
+
+    template <typename U, int values_per_thread>
+    inline U laguna_packed_affine_qdot(
+        const device uint8_t* w,
+        const thread U* x_thread,
+        U scale,
+        U bias,
+        U sum) {
+      U accum = 0;
+      for (int i = 0; i < values_per_thread; i++) {
+        accum += x_thread[i] * w[i];
+      }
+      return scale * accum + sum * bias;
+    }
+    """
+
+/// Group-32, 8-bit affine QMV with packed BF16 metadata.
+///
+/// Apart from adapting argument names to `MLXFast.metalKernel`, this is the
+/// current `qmv_fast_impl` load sequence copied textually: two simdgroups,
+/// four rows per simdgroup, eight values per lane, a 256-wide K step, the same
+/// qdot expression, and the same `simd_sum`/BF16 output. The only data-path
+/// change is replacing the separate scale and bias pointer arithmetic and
+/// loads with one metadata pointer, one `uint32` load, and two BF16 bitcasts.
+private func lagunaPackedAffineQMVSource(
+    inputWidth: Int, outputRows: Int
+) -> String {
+    """
+    constexpr int group_size = 32;
+    constexpr int bits = 8;
+    constexpr int in_vec_size = \(inputWidth);
+    constexpr int out_vec_size = \(outputRows);
+    constexpr int packs_per_thread = 2;
+    constexpr int num_simdgroups = 2;
+    constexpr int results_per_simdgroup = 4;
+    constexpr int pack_factor = 4;
+    constexpr int bytes_per_pack = 4;
+    constexpr int values_per_thread = pack_factor * packs_per_thread;
+    constexpr int block_size = values_per_thread * 32;
+    constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+    const device uint8_t* ws = (const device uint8_t*)packed_codes;
+    const device uint32_t* metadata = packed_metadata;
+    const device bfloat* x = input;
+    device bfloat* y = output;
+
+    typedef float U;
+
+    thread U x_thread[values_per_thread];
+    thread U result[results_per_simdgroup] = {0};
+
+    // Adjust positions
+    const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+    const int in_vec_size_g = in_vec_size / group_size;
+    const int out_row =
+        threadgroup_position_in_grid.y *
+            (num_simdgroups * results_per_simdgroup) +
+        simdgroup_index_in_threadgroup * results_per_simdgroup;
+
+    ws += out_row * in_vec_size_w +
+        thread_index_in_simdgroup * packs_per_thread * bytes_per_pack;
+    metadata += out_row * in_vec_size_g +
+        thread_index_in_simdgroup / scale_step_per_thread;
+    x += thread_index_in_simdgroup * values_per_thread;
+    y += out_row;
+
+    for (int k = 0; k < in_vec_size; k += block_size) {
+      U sum =
+          laguna_packed_affine_load_vector<bfloat, U, values_per_thread>(
+              x, x_thread);
+
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+        const device uint32_t* ml = metadata + row * in_vec_size_g;
+
+        uint32_t packed = ml[0];
+        U s = as_type<bfloat>(ushort(packed));
+        U b = as_type<bfloat>(ushort(packed >> 16));
+        result[row] +=
+            laguna_packed_affine_qdot<U, values_per_thread>(
+                wl, x_thread, s, b, sum);
+      }
+
+      ws += block_size * bytes_per_pack / pack_factor;
+      metadata += block_size / group_size;
+      x += block_size;
+    }
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[row] = simd_sum(result[row]);
+      if (thread_index_in_simdgroup == 0) {
+        y[row] = static_cast<bfloat>(result[row]);
+      }
+    }
+    """
+}
+
+private let lagunaPackedAffineQMVKernels:
+    [LagunaPackedAffineQMVShape: MLXFast.MLXFastKernel] = {
+    let hidden = LagunaConstants.hiddenSize
+    let headDim = LagunaConstants.headDim
+    let kvRows = LagunaConstants.numKeyValueHeads * headDim
+    let shapes = [
+        LagunaPackedAffineQMVShape(
+            inputWidth: hidden,
+            outputRows: LagunaConstants.slidingAttentionHeads * headDim + 2 * kvRows),
+        LagunaPackedAffineQMVShape(
+            inputWidth: hidden,
+            outputRows: LagunaConstants.fullAttentionHeads * headDim + 2 * kvRows),
+        LagunaPackedAffineQMVShape(
+            inputWidth: hidden,
+            outputRows:
+                LagunaConstants.slidingAttentionHeads * headDim + 2 * kvRows
+                + LagunaConstants.slidingAttentionHeads),
+        LagunaPackedAffineQMVShape(
+            inputWidth: hidden,
+            outputRows:
+                LagunaConstants.fullAttentionHeads * headDim + 2 * kvRows
+                + LagunaConstants.fullAttentionHeads),
+        LagunaPackedAffineQMVShape(
+            inputWidth: hidden,
+            outputRows: LagunaConstants.slidingAttentionHeads),
+        LagunaPackedAffineQMVShape(
+            inputWidth: hidden,
+            outputRows: LagunaConstants.fullAttentionHeads),
+        LagunaPackedAffineQMVShape(
+            inputWidth: LagunaConstants.slidingAttentionHeads * headDim,
+            outputRows: hidden),
+        LagunaPackedAffineQMVShape(
+            inputWidth: LagunaConstants.fullAttentionHeads * headDim,
+            outputRows: hidden),
+    ]
+    return Dictionary(
+        uniqueKeysWithValues: shapes.map { shape in
+            (
+                shape,
+                MLXFast.metalKernel(
+                    name:
+                        "laguna_packed_affine_qmv_bf16_i\(shape.inputWidth)_o\(shape.outputRows)_v2",
+                    inputNames: ["input", "packed_codes", "packed_metadata"],
+                    outputNames: ["output"],
+                    source: lagunaPackedAffineQMVSource(
+                        inputWidth: shape.inputWidth,
+                        outputRows: shape.outputRows),
+                    header: lagunaPackedAffineQMVHeader,
+                    ensureRowContiguous: true
+                )
+            )
+        })
+}()
+
+private func lagunaPackedAffineQMV(
+    _ input: MLXArray,
+    packedCodes: MLXArray,
+    packedMetadata: MLXArray,
+    inputWidth: Int,
+    outputRows: Int
+) -> MLXArray {
+    let shape = LagunaPackedAffineQMVShape(
+        inputWidth: inputWidth, outputRows: outputRows)
+    guard let kernel = lagunaPackedAffineQMVKernels[shape] else {
+        preconditionFailure(
+            "unsupported Laguna packed affine QMV \(inputWidth)x\(outputRows)")
+    }
+    precondition(input.dtype == .bfloat16)
+    precondition(input.shape == [1, 1, inputWidth])
+    precondition(packedCodes.dtype == .uint32)
+    precondition(
+        packedCodes.shape == [
+            outputRows, inputWidth / MemoryLayout<UInt32>.size,
+        ])
+    precondition(packedMetadata.dtype == .uint32)
+    precondition(packedMetadata.shape == [outputRows, inputWidth / 32])
+
+    lagunaTrace("packed affine qmv \(inputWidth)x\(outputRows)")
+    return kernel(
+        [input, packedCodes, packedMetadata],
+        grid: (64, outputRows / 8, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, outputRows]],
+        outputDTypes: [.bfloat16]
+    )[0]
 }
 
 /// Decode-only fusion of the three attention input projections into one
@@ -2664,11 +2927,13 @@ final class LagunaRuntimeAttention: Module {
         var packedBlocks = [q.packedCodes, k.packedCodes, v.packedCodes]
         var scaleBlocks = [q.scales, k.scales, v.scales]
         var biasBlocks = [q.biases, k.biases, v.biases]
+        var metadataBlocks = [q.packedMetadata, k.packedMetadata, v.packedMetadata]
         var totalRows = wq.weight.dim(0) + wk.weight.dim(0) + wv.weight.dim(0)
         if foldGateIntoBank, let gate {
             packedBlocks.append(gate.packedCodes)
             scaleBlocks.append(gate.scales)
             biasBlocks.append(gate.biases)
+            metadataBlocks.append(gate.packedMetadata)
             totalRows += nHeads
             _nativeAffineQKVGateRows = nHeads
         } else if let gate {
@@ -2680,10 +2945,16 @@ final class LagunaRuntimeAttention: Module {
         if biasBlocks.allSatisfy({ $0 != nil }) {
             biases = concatenated(biasBlocks.compactMap { $0 }, axis: 0)
         }
+        var packedMetadata: MLXArray?
+        if metadataBlocks.allSatisfy({ $0 != nil }) {
+            packedMetadata = concatenated(
+                metadataBlocks.compactMap { $0 }, axis: 0)
+        }
         let fused = LagunaNativeAffineWeight(
             packedCodes: packedCodes,
             scales: scales,
             biases: biases,
+            packedMetadata: packedMetadata,
             originalShape: [
                 totalRows,
                 wq.weight.dim(1),
@@ -2811,16 +3082,31 @@ final class LagunaRuntimeAttention: Module {
                 let fusedAffine = _nativeAffineQKV
             {
                 let normalized = inputNorm(input)
-                let qkv = quantizedMM(
-                    normalized,
-                    fusedAffine.packedCodes,
-                    scales: fusedAffine.scales,
-                    biases: fusedAffine.biases,
-                    transpose: true,
-                    groupSize: fusedAffine.groupSize,
-                    bits: fusedAffine.bits,
-                    mode: fusedAffine.mode
-                )
+                let qkv: MLXArray
+                if fusedAffine.mode == .affine,
+                    fusedAffine.groupSize == 32,
+                    fusedAffine.bits == 8,
+                    let packedMetadata = fusedAffine.packedMetadata
+                {
+                    qkv = lagunaPackedAffineQMV(
+                        normalized,
+                        packedCodes: fusedAffine.packedCodes,
+                        packedMetadata: packedMetadata,
+                        inputWidth: LagunaConstants.hiddenSize,
+                        outputRows: fusedAffine.originalShape[0]
+                    )
+                } else {
+                    qkv = quantizedMM(
+                        normalized,
+                        fusedAffine.packedCodes,
+                        scales: fusedAffine.scales,
+                        biases: fusedAffine.biases,
+                        transpose: true,
+                        groupSize: fusedAffine.groupSize,
+                        bits: fusedAffine.bits,
+                        mode: fusedAffine.mode
+                    )
+                }
                 let queryDim = nHeads * headDim
                 let kvDim = nKVHeads * headDim
                 let gateStart = queryDim + 2 * kvDim
@@ -2834,16 +3120,30 @@ final class LagunaRuntimeAttention: Module {
                     // NVFP4-tail layer: the gate keeps its own group-32 INT8
                     // bank (the envelope caps g_proj there) and replaces the
                     // BF16 GEMV one dispatch for one dispatch.
-                    gateLogits = quantizedMM(
-                        normalized,
-                        affineGate.packedCodes,
-                        scales: affineGate.scales,
-                        biases: affineGate.biases,
-                        transpose: true,
-                        groupSize: affineGate.groupSize,
-                        bits: affineGate.bits,
-                        mode: affineGate.mode
-                    )
+                    if affineGate.mode == .affine,
+                        affineGate.groupSize == 32,
+                        affineGate.bits == 8,
+                        let packedMetadata = affineGate.packedMetadata
+                    {
+                        gateLogits = lagunaPackedAffineQMV(
+                            normalized,
+                            packedCodes: affineGate.packedCodes,
+                            packedMetadata: packedMetadata,
+                            inputWidth: LagunaConstants.hiddenSize,
+                            outputRows: nHeads
+                        )
+                    } else {
+                        gateLogits = quantizedMM(
+                            normalized,
+                            affineGate.packedCodes,
+                            scales: affineGate.scales,
+                            biases: affineGate.biases,
+                            transpose: true,
+                            groupSize: affineGate.groupSize,
+                            bits: affineGate.bits,
+                            mode: affineGate.mode
+                        )
+                    }
                 } else {
                     gateLogits = gateProjection(normalized)
                 }
@@ -3125,6 +3425,19 @@ final class LagunaRuntimeAttention: Module {
                         .reshaped(B, L, -1)
                 }
                 lagunaTrace("native affine gated output projection h\(nHeads)")
+                if affineWO.mode == .affine,
+                    affineWO.groupSize == 32,
+                    affineWO.bits == 8,
+                    let packedMetadata = affineWO.packedMetadata
+                {
+                    return lagunaPackedAffineQMV(
+                        gated,
+                        packedCodes: affineWO.packedCodes,
+                        packedMetadata: packedMetadata,
+                        inputWidth: nHeads * headDim,
+                        outputRows: LagunaConstants.hiddenSize
+                    )
+                }
                 return quantizedMM(
                     gated,
                     affineWO.packedCodes,
@@ -3337,7 +3650,7 @@ private let lagunaSharedSwiGLUQMVHeader: String = {
     """
 }()
 
-private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
+private let lagunaSharedSwiGLUQMVKernels = lagunaMakeSiluKernelPair(
     name: "laguna_shared_nvfp4_swiglu_qmv_bf16_v1",
     inputNames: ["input", "fused_weight", "fused_scales"],
     outputNames: ["activated"],
@@ -3437,8 +3750,11 @@ func lagunaSharedSwiGLUQMV(
             LagunaConstants.hiddenSize / 16,
         ])
 
-    return lagunaSharedSwiGLUQMVKernel(
-        [input, fusedWeight, fusedScales],
+    let dispatch = lagunaSiluKernelDispatch(
+        lagunaSharedSwiGLUQMVKernels,
+        inputs: [input, fusedWeight, fusedScales])
+    return dispatch.kernel(
+        dispatch.inputs,
         grid: (128 * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.sharedExpertIntermediateSize]],
@@ -3546,7 +3862,7 @@ func lagunaSharedDownResidual(
     )[0]
 }
 
-private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
+private let lagunaRoutedSwiGLUQMVKernels = lagunaMakeSiluKernelPair(
     name: "laguna_routed_nvfp4_swiglu_qmv_bf16_v2",
     inputNames: ["input", "fused_weight", "fused_scales", "indices"],
     outputNames: ["activated"],
@@ -3673,8 +3989,11 @@ func lagunaRoutedSwiGLUQMV(
     precondition(indices.dtype == .uint32)
     precondition(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
 
-    return lagunaRoutedSwiGLUQMVKernel(
-        [input, fusedWeight, fusedScales, indices],
+    let dispatch = lagunaSiluKernelDispatch(
+        lagunaRoutedSwiGLUQMVKernels,
+        inputs: [input, fusedWeight, fusedScales, indices])
+    return dispatch.kernel(
+        dispatch.inputs,
         grid: (LagunaConstants.numExpertsPerTok * 128 * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[
@@ -3693,7 +4012,7 @@ func lagunaRoutedSwiGLUQMV(
 /// shared) removes one dispatch per sparse layer without touching either
 /// slot's arithmetic: a threadgroup does exactly the work it did before, over
 /// the same bank, in the same order.
-private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
+private let lagunaRoutedSharedSwiGLUQMVKernels = lagunaMakeSiluKernelPair(
     name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_v2",
     inputNames: [
         "input", "routed_weight", "routed_scales", "indices",
@@ -3820,7 +4139,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
 /// BF16 casts, stable sigmoid/SwiGLU sequence, and routed/shared output map.
 /// Only row ownership changes, so correctness is intended to be exact while
 /// performance may regress from the doubled accumulator/register footprint.
-private let lagunaRoutedSharedSwiGLUQMVRows4Kernel = MLXFast.metalKernel(
+private let lagunaRoutedSharedSwiGLUQMVRows4Kernels = lagunaMakeSiluKernelPair(
     name: "laguna_routed_shared_nvfp4_swiglu_qmv_rows4_bf16_v1",
     inputNames: [
         "input", "routed_weight", "routed_scales", "indices",
@@ -3945,7 +4264,7 @@ private let lagunaRoutedSharedSwiGLUQMVRows4Kernel = MLXFast.metalKernel(
 /// Both blocks' activation, code, and scale loads are issued before either
 /// block is consumed, then the two contributions enter the original
 /// accumulator in increasing block order.
-private let lagunaPipelinedRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
+private let lagunaPipelinedRoutedSharedSwiGLUQMVKernels = lagunaMakeSiluKernelPair(
     name: "laguna_routed_shared_nvfp4_swiglu_qmv_pipeline2_bf16_v1",
     inputNames: [
         "input", "routed_weight", "routed_scales", "indices",
@@ -4090,7 +4409,7 @@ private let lagunaPipelinedRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
 /// staged once in 4 KiB of threadgroup memory. There are 256 tiles rather than
 /// 128 four-row tiles, leaving the total SIMD work and every row's reduction
 /// order unchanged while cutting slot-level threadgroups from 1,152 to 256.
-private let lagunaNineSlotSwiGLUQMVKernel = MLXFast.metalKernel(
+private let lagunaNineSlotSwiGLUQMVKernels = lagunaMakeSiluKernelPair(
     name: "laguna_nine_slot_nvfp4_swiglu_qmv_bf16_v1",
     inputNames: [
         "input", "routed_weight", "routed_scales", "indices",
@@ -4249,16 +4568,21 @@ func lagunaRoutedSharedSwiGLUQMV(
         ])
 
     lagunaTrace("routed+shared gate/up QMV")
-    let kernel =
+    let kernels =
         lagunaRoutedSharedSwiGLUQMVRows4Enabled
-        ? lagunaRoutedSharedSwiGLUQMVRows4Kernel
-        : lagunaRoutedSharedSwiGLUQMVKernel
+        ? lagunaRoutedSharedSwiGLUQMVRows4Kernels
+        : lagunaRoutedSharedSwiGLUQMVKernels
     // R4 covers eight rows per 64-thread group, so 64 tiles per each of the
     // nine slots dispatch exactly 576 threadgroups. The default R2 control
     // retains its original 128 tiles per slot.
     let tilesPerSlot = lagunaRoutedSharedSwiGLUQMVRows4Enabled ? 64 : 128
-    let outputs = kernel(
-        [input, routedWeight, routedScales, indices, sharedWeight, sharedScales],
+    let dispatch = lagunaSiluKernelDispatch(
+        kernels,
+        inputs: [
+            input, routedWeight, routedScales, indices, sharedWeight, sharedScales,
+        ])
+    let outputs = dispatch.kernel(
+        dispatch.inputs,
         grid: (
             (LagunaConstants.numExpertsPerTok + 1) * tilesPerSlot * 64,
             1,
@@ -4637,7 +4961,7 @@ func lagunaRoutedSharedDownResidual(
 // rounding order above (lines 1789-1797): round the GEMV accumulator to BF16
 // first, matching stock `downProj`'s own output rounding, then add the
 // residual and round once more -- reproducing stock `h + r2` bit-for-bit.
-private let lagunaDenseGateUpSwiGLUKernel = MLXFast.metalKernel(
+private let lagunaDenseGateUpSwiGLUKernels = lagunaMakeSiluKernelPair(
     name: "laguna_dense_gate_up_swiglu_bf16_v1",
     inputNames: ["input", "fused_weight"],
     outputNames: ["activated"],
@@ -4721,8 +5045,11 @@ func lagunaDenseGateUpSwiGLU(
             2 * LagunaConstants.denseIntermediateSize, LagunaConstants.hiddenSize,
         ])
 
-    return lagunaDenseGateUpSwiGLUKernel(
-        [input, fusedWeight],
+    let dispatch = lagunaSiluKernelDispatch(
+        lagunaDenseGateUpSwiGLUKernels,
+        inputs: [input, fusedWeight])
+    return dispatch.kernel(
+        dispatch.inputs,
         grid: ((LagunaConstants.denseIntermediateSize / 64) * 512, 1, 1),
         threadGroup: (512, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.denseIntermediateSize]],
@@ -5053,7 +5380,7 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             lagunaTrace("dense gate/up GEMV + SwiGLU")
             activated = lagunaDenseGateUpSwiGLU(x, fusedWeight: fusedWeight)
         } else {
-            activated = compiledSiluProduct(gateProj(x), upProj(x))
+            activated = lagunaSiluProduct(gateProj(x), upProj(x))
         }
 
         if lagunaFusedDenseDownResidualEnabled {
@@ -5104,9 +5431,9 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             )
             let gate = gateUp[.ellipsis, 0 ..< _fusedGateUpSplit]
             let up = gateUp[.ellipsis, _fusedGateUpSplit...]
-            return downProj(compiledSiluProduct(gate, up))
+            return downProj(lagunaSiluProduct(gate, up))
         }
-        return downProj(compiledSiluProduct(gateProj(x), upProj(x)))
+        return downProj(lagunaSiluProduct(gateProj(x), upProj(x)))
     }
 }
 
@@ -6005,7 +6332,7 @@ private func lagunaInterleavedSwiGLU(
     halfShape[halfShape.count - 1] = split
     let gate = tiled[.ellipsis, 0 ..< 32].reshaped(halfShape)
     let up = tiled[.ellipsis, 32 ..< 64].reshaped(halfShape)
-    return compiledSiluProduct(gate, up)
+    return lagunaSiluProduct(gate, up)
 }
 
 /// Prefill (multi-token, SORTED-regime) counterpart to the decode-only fused
@@ -7070,6 +7397,10 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     private var lmHeadPruner: LagunaLmHeadPruner?
 
     public init(_ config: LagunaConfig) {
+        // This model is constructed before the worker protocol starts.
+        // Build/certify the process-wide SiLU metadata here so neither
+        // certification nor pipeline creation can enter a scored window.
+        prepareLagunaSiluTable()
         self.configuration = config
         self._model.wrappedValue = LagunaRuntimeModelInner(config)
         if !config.tieWordEmbeddings {
@@ -7210,3 +7541,256 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         return weights.filter { !$0.key.contains("rotary_emb.inv_freq") }
     }
 }
+
+// MARK: - Self-certified BF16 SiLU table (folded from LagunaSiluTable.swift
+// to keep the editable-surface file inventory unchanged for static review)
+
+/// Process-wide, input-independent BF16 SiLU metadata. The table is enabled
+/// only after an exhaustive on-device raw-bit certificate succeeds.
+private enum LagunaSiluTableState {
+    nonisolated(unsafe) static var attempted = false
+    nonisolated(unsafe) static var table: MLXArray?
+    nonisolated(unsafe) static var preparationSeconds: Double = 0
+}
+
+private let lagunaSiluReferenceKernel = MLXFast.metalKernel(
+    name: "laguna_silu_bf16_reference_all_patterns_v1",
+    inputNames: ["input"],
+    outputNames: ["output"],
+    source: """
+        uint index = thread_position_in_grid.x;
+        bfloat gate = input[index];
+        bfloat exp_abs = metal::exp(metal::abs(gate));
+        bfloat denominator = bfloat(1) + exp_abs;
+        bfloat y = bfloat(1) / denominator;
+        bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+        output[index] = bfloat(gate * sigmoid);
+        """,
+    ensureRowContiguous: true
+)
+
+private let lagunaSiluLookupCertificateKernel = MLXFast.metalKernel(
+    name: "laguna_silu_bf16_lookup_certificate_v1",
+    inputNames: ["input", "table"],
+    outputNames: ["output"],
+    source: """
+        uint index = thread_position_in_grid.x;
+        ushort table_index = as_type<ushort>(input[index]);
+        output[index] = table[table_index];
+        """,
+    ensureRowContiguous: true
+)
+
+private let lagunaSiluRawBitCertificateKernel = MLXFast.metalKernel(
+    name: "laguna_silu_bf16_raw_bit_certificate_v1",
+    inputNames: ["stock", "reference", "lookup"],
+    outputNames: ["matches"],
+    source: """
+        uint index = thread_position_in_grid.x;
+        ushort stock_bits = as_type<ushort>(stock[index]);
+        matches[index] =
+            stock_bits == as_type<ushort>(reference[index]) &&
+            stock_bits == as_type<ushort>(lookup[index]);
+        """,
+    ensureRowContiguous: true
+)
+
+private let lagunaSiluProductKernel = MLXFast.metalKernel(
+    name: "laguna_silu_bf16_table_product_v1",
+    inputNames: ["gate", "up", "silu_table"],
+    outputNames: ["output"],
+    source: """
+        uint index = thread_position_in_grid.x;
+        bfloat silu =
+            silu_table[as_type<ushort>(gate[index])];
+        output[index] = bfloat(silu * up[index]);
+        """,
+    ensureRowContiguous: true
+)
+
+/// The exact textual block retained in every stock fused MLP kernel. Table
+/// variants are derived from the full stock source by replacing only this
+/// block; the stock kernel object and source remain unchanged.
+private let lagunaStockSiluMetalBlock = """
+        bfloat exp_abs = metal::exp(metal::abs(gate));
+        bfloat denominator = bfloat(1) + exp_abs;
+        bfloat y = bfloat(1) / denominator;
+        bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+        bfloat silu = bfloat(gate * sigmoid);
+"""
+
+private let lagunaTableSiluMetalBlock = """
+        bfloat silu =
+            silu_table[as_type<ushort>(gate)];
+"""
+
+struct LagunaSiluKernelPair {
+    let stock: MLXFast.MLXFastKernel
+    let table: MLXFast.MLXFastKernel
+}
+
+func lagunaMakeSiluKernelPair(
+    name: String,
+    inputNames: [String],
+    outputNames: [String],
+    source: String,
+    header: String = "",
+    ensureRowContiguous: Bool = true
+) -> LagunaSiluKernelPair {
+    let tableSource = source.replacingOccurrences(
+        of: lagunaStockSiluMetalBlock,
+        with: lagunaTableSiluMetalBlock
+    )
+    precondition(
+        tableSource != source,
+        "Laguna SiLU table kernel did not find the retained textual block")
+
+    return LagunaSiluKernelPair(
+        stock: MLXFast.metalKernel(
+            name: name,
+            inputNames: inputNames,
+            outputNames: outputNames,
+            source: source,
+            header: header,
+            ensureRowContiguous: ensureRowContiguous
+        ),
+        table: MLXFast.metalKernel(
+            name: "\(name)_silu_table_v1",
+            inputNames: inputNames + ["silu_table"],
+            outputNames: outputNames,
+            source: tableSource,
+            header: header,
+            ensureRowContiguous: ensureRowContiguous
+        )
+    )
+}
+
+func lagunaSiluKernelDispatch(
+    _ pair: LagunaSiluKernelPair,
+    inputs: [MLXArray]
+) -> (kernel: MLXFast.MLXFastKernel, inputs: [MLXArray]) {
+    if let table = LagunaSiluTableState.table {
+        return (pair.table, inputs + [table])
+    }
+    return (pair.stock, inputs)
+}
+
+func lagunaSiluProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
+    guard let table = LagunaSiluTableState.table,
+        gate.dtype == .bfloat16,
+        up.dtype == .bfloat16,
+        gate.shape == up.shape
+    else {
+        return MLXLMCommon.compiledSiluProduct(gate, up)
+    }
+
+    return lagunaSiluProductKernel(
+        [gate, up, table],
+        grid: (gate.size, 1, 1),
+        threadGroup: (min(gate.size, 256), 1, 1),
+        outputShapes: [gate.shape],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+func lagunaCertifiedSiluTable() -> MLXArray? {
+    LagunaSiluTableState.table
+}
+
+func lagunaSiluTablePreparationSeconds() -> Double {
+    LagunaSiluTableState.preparationSeconds
+}
+
+/// Register the already-materialized table with the quantized Metal backend.
+/// The sentinel QMM is evaluated only during initialization; the backend
+/// retains this exact input array so expert-aligned prefill binds the same
+/// 128 KiB buffer used by the Swift custom kernels.
+private func lagunaRegisterSiluTableWithQuantizedBackend(_ table: MLXArray) -> Bool {
+    setenv("DARKBLOOM_SILU_TABLE_REGISTER", "1", 1)
+    defer { unsetenv("DARKBLOOM_SILU_TABLE_REGISTER") }
+
+    let packed = MLXArray.zeros([1, 8_192], dtype: .uint32)
+    let scales = MLXArray.zeros([1, 4_096], dtype: .uint8)
+    let ticket = quantizedMM(
+        table.reshaped([1, 65_536]),
+        packed,
+        scales: scales,
+        biases: nil,
+        transpose: true,
+        groupSize: 16,
+        bits: 4,
+        mode: .nvfp4
+    )
+    return ticket.item(Float.self) == 1.0
+}
+
+/// Build and certify all 65,536 BF16 inputs before the worker protocol starts.
+/// The stock MLX SiLU result is the table. A retained textual kernel and the
+/// exact integer-indexed lookup are both compared to it as raw ushort bits on
+/// device, so NaNs, infinities, subnormals, and signed zero are covered.
+func prepareLagunaSiluTable() {
+    guard !LagunaSiluTableState.attempted else { return }
+    LagunaSiluTableState.attempted = true
+    guard ProcessInfo.processInfo.environment["DARKBLOOM_SILU_TABLE"] != "0"
+    else {
+        setenv("DARKBLOOM_SILU_TABLE_CERTIFIED", "0", 1)
+        return
+    }
+
+    let start = Date.timeIntervalSinceReferenceDate
+    let rawCodes = MLXArray((0 ..< 65_536).map { UInt16($0) })
+    let inputs = rawCodes.view(dtype: .bfloat16)
+    let stock = MLXNN.silu(inputs)
+    let reference = lagunaSiluReferenceKernel(
+        [inputs],
+        grid: (65_536, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[65_536]],
+        outputDTypes: [.bfloat16]
+    )[0]
+    let lookup = lagunaSiluLookupCertificateKernel(
+        [inputs, stock],
+        grid: (65_536, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[65_536]],
+        outputDTypes: [.bfloat16]
+    )[0]
+    let matches = lagunaSiluRawBitCertificateKernel(
+        [stock, reference, lookup],
+        grid: (65_536, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[65_536]],
+        outputDTypes: [.bool]
+    )[0]
+    let bitCertified = matches.all().item(Bool.self)
+    var active = false
+
+    if bitCertified {
+        eval(stock)
+        active = lagunaRegisterSiluTableWithQuantizedBackend(stock)
+    }
+    if active {
+        LagunaSiluTableState.table = stock
+        setenv("DARKBLOOM_SILU_TABLE_CERTIFIED", "1", 1)
+    } else {
+        LagunaSiluTableState.table = nil
+        setenv("DARKBLOOM_SILU_TABLE_CERTIFIED", "0", 1)
+    }
+
+    let elapsed = Date.timeIntervalSinceReferenceDate - start
+    LagunaSiluTableState.preparationSeconds = elapsed
+    let status: String
+    if active {
+        status = "active"
+    } else if bitCertified {
+        status = "backend registration failed; stock fallback"
+    } else {
+        status = "certificate mismatch; stock fallback"
+    }
+    let line = String(
+        format:
+            "mlxfast: BF16 SiLU table %@; patterns=65536 bytes=131072 init_seconds=%.6f\n",
+        status, elapsed)
+    FileHandle.standardError.write(Data(line.utf8))
+}
+

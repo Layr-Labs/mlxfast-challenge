@@ -20,6 +20,31 @@ namespace mlx::core {
 
 namespace {
 
+// The BF16 SiLU table is built and exhaustively certified by the Laguna
+// runtime before warmup. A shape-unique, init-only sentinel QMM registers
+// that exact materialized MLX array here so the expert-aligned gather kernel
+// can bind the same 128 KiB buffer as the Swift custom kernels.
+std::optional<array>& darkbloom_silu_table_storage() {
+  static std::optional<array> table;
+  return table;
+}
+
+bool darkbloom_silu_table_registration_requested() {
+  return env::get_var("DARKBLOOM_SILU_TABLE_REGISTER", "") == "1";
+}
+
+const array* darkbloom_certified_silu_table() {
+  if (env::get_var("DARKBLOOM_SILU_TABLE_CERTIFIED", "") != "1") {
+    return nullptr;
+  }
+  auto& table = darkbloom_silu_table_storage();
+  if (!table.has_value() || table->dtype() != bfloat16 ||
+      table->size() != 65536 || !table->flags().row_contiguous) {
+    return nullptr;
+  }
+  return &*table;
+}
+
 template <typename... Args>
 auto get_quantized_kernel_wrapped(
     metal::Device& d,
@@ -1510,6 +1535,10 @@ void gather_qmm_rhs_nax(
   const bool static_expert_shape =
       expert_aligned && static_laguna_shapes && mode == "nvfp4" &&
       type_string == "bfloat16_t" && !biases_.has_value();
+  const array* silu_table = darkbloom_certified_silu_table();
+  const bool use_silu_table =
+      static_expert_shape && K == 2048 && N == 1024 &&
+      silu_table != nullptr;
 
   // Make the kernel name
   std::string kname;
@@ -1539,7 +1568,8 @@ void gather_qmm_rhs_nax(
       "_wn_",
       wn,
       static_expert_shape
-          ? ("_k_" + std::to_string(K) + "_n_" + std::to_string(N))
+          ? ("_k_" + std::to_string(K) + "_n_" + std::to_string(N) +
+             (use_silu_table ? "_silu_table" : ""))
           : "");
 
   // Skipping dead runs is a pure work elision (see function constant 203 in
@@ -1638,7 +1668,9 @@ void gather_qmm_rhs_nax(
   if (static_expert_shape) {
     auto template_def = get_template_definition(
         kname,
-        "fp_gather_qmm_rhs_expert_nax",
+        use_silu_table
+            ? "fp_gather_qmm_rhs_expert_silu_table_nax"
+            : "fp_gather_qmm_rhs_expert_nax",
         get_type_string(x.dtype()),
         group_size,
         bits,
@@ -1683,6 +1715,9 @@ void gather_qmm_rhs_nax(
   if (biases_) {
     array biases = ensure_row_contiguous(*biases_, d, s);
     compute_encoder.set_input_array(biases, c++);
+  }
+  if (use_silu_table) {
+    compute_encoder.set_input_array(*silu_table, c++);
   }
   compute_encoder.set_input_array(indices, c++);
   compute_encoder.set_output_array(out, c++);
@@ -1880,6 +1915,25 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   std::optional<array> biases = std::nullopt;
   if (inputs.size() == 4) {
     biases = ensure_row_contiguous_matrix(inputs[3], d, s);
+  }
+
+  // Init-only registration transport for the already-certified SiLU table.
+  // The signature is deliberately impossible for Laguna model weights:
+  // BF16 [1,65536] x NVFP4 [1,65536] -> [1,1], with the environment marker
+  // present only around this eagerly-evaluated call. No quantized arithmetic
+  // is performed; the exact input allocation is retained process-wide.
+  if (darkbloom_silu_table_registration_requested() &&
+      transpose_ && group_size_ == 16 && bits_ == 4 &&
+      quantization_mode_to_string(mode_) == "nvfp4" &&
+      !biases.has_value() && x.dtype() == bfloat16 &&
+      x.ndim() == 2 && x.shape(0) == 1 && x.shape(1) == 65536 &&
+      w.dtype() == uint32 && w.shape() == Shape({1, 8192}) &&
+      scales.dtype() == uint8 && scales.shape() == Shape({1, 4096}) &&
+      out.size() == 1) {
+    darkbloom_silu_table_storage() = x;
+    array registration_ok(1.0f);
+    fill_gpu(registration_ok, out, s);
+    return;
   }
 
   // Extract the matmul shapes
