@@ -6865,6 +6865,10 @@ final class LagunaRuntimeModelInner: Module {
     @ModuleInfo(key: "norm") var norm: RMSNorm
 
     let layerTypes: [LagunaLayerType]
+    /// Process-constant hot-loop plan: avoids repeatedly decoding layer type
+    /// and the async-stage enum for every layer of every serial token.
+    let layerIsFull: [Bool]
+    let decodeAsyncFireMask: UInt64
     let slidingWindow: Int
     let fullAttentionIdx: Int
     let slidingAttentionIdx: Int
@@ -6886,6 +6890,25 @@ final class LagunaRuntimeModelInner: Module {
             dimensions: config.hiddenSize, eps: Float(config.rmsNormEps))
 
         self.layerTypes = config.layerTypes
+        self.layerIsFull = config.layerTypes.map { $0 == .full }
+        switch lagunaDecodeAsyncStage {
+        case .layer(let index):
+            self.decodeAsyncFireMask = index >= 0 && index < 64 ? UInt64(1) << UInt64(index) : 0
+        case .ladder(let stride):
+            var mask: UInt64 = 0
+            if stride > 0 {
+                var index = stride - 1
+                while index < min(config.numHiddenLayers, 64) {
+                    mask |= UInt64(1) << UInt64(index)
+                    index += stride
+                }
+            }
+            self.decodeAsyncFireMask = mask
+        case .explicit(let mask):
+            self.decodeAsyncFireMask = mask
+        case .off, .norm, .logits:
+            self.decodeAsyncFireMask = 0
+        }
         self.slidingWindow = config.slidingWindow
         self.fullAttentionIdx = config.layerTypes.firstIndex(of: .full) ?? 0
         self.slidingAttentionIdx = config.layerTypes.firstIndex(of: .sliding) ?? 0
@@ -7064,10 +7087,16 @@ final class LagunaRuntimeModelInner: Module {
         // One mask per attention family, derived from a representative
         // layer's cache offset: all full-attention caches advance in
         // lockstep, as do all sliding caches (vendored `LagunaModelInner`
-        // convention).
-        let fullMask = createAttentionMask(h: h, cache: cache?[fullAttentionIdx])
-        let slidingMask = createAttentionMask(
-            h: h, cache: cache?[slidingAttentionIdx], windowSize: slidingWindow)
+        // convention). A serial one-token request is unconditionally `.none`;
+        // bypass the two cache-mask helper calls in that dominant path.
+        let isSingleTokenDecode = inputs.shape == [1, 1]
+        let fullMask: MLXFast.ScaledDotProductAttentionMaskMode =
+            isSingleTokenDecode
+            ? .none : createAttentionMask(h: h, cache: cache?[fullAttentionIdx])
+        let slidingMask: MLXFast.ScaledDotProductAttentionMaskMode =
+            isSingleTokenDecode
+            ? .none : createAttentionMask(
+                h: h, cache: cache?[slidingAttentionIdx], windowSize: slidingWindow)
 
         // One cos/sin table per attention family per decode step, shared by
         // every layer of that family (their caches advance in lockstep). Each
@@ -7076,7 +7105,7 @@ final class LagunaRuntimeModelInner: Module {
         // would have computed rather than a re-derivation.
 
         for (i, layer) in layers.enumerated() {
-            let isFull = layerTypes[i] == .full
+            let isFull = layerIsFull[i]
             let mask = isFull ? fullMask : slidingMask
             let qkRoPEAngles = isFull ? fullRoPEAngles : slidingRoPEAngles
             if i == layers.count - 1, h.dim(1) > 1 {
@@ -7090,11 +7119,8 @@ final class LagunaRuntimeModelInner: Module {
                         qkRoPEAngles: qkRoPEAngles,
                         qkRoPEOffsets: qkRoPEOffsets
                     )
-                    if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
-                        asyncEval(h)
-                    }
-                    if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                        inputs.shape == [1, 1]
+                    if isSingleTokenDecode,
+                        (decodeAsyncFireMask >> UInt64(i)) & 1 == 1
                     {
                         asyncEval(h)
                     }
@@ -7107,16 +7133,8 @@ final class LagunaRuntimeModelInner: Module {
                     qkRoPEAngles: qkRoPEAngles,
                     qkRoPEOffsets: qkRoPEOffsets
                 )
-                if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
-                    asyncEval(h)
-                }
-                if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                    inputs.shape == [1, 1]
-                {
-                    asyncEval(h)
-                }
-                if case .explicit(let mask) = lagunaDecodeAsyncStage,
-                    (mask >> UInt64(i)) & 1 == 1, inputs.shape == [1, 1]
+                if isSingleTokenDecode,
+                    (decodeAsyncFireMask >> UInt64(i)) & 1 == 1
                 {
                     asyncEval(h)
                 }
