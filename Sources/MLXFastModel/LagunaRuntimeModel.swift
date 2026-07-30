@@ -5391,6 +5391,16 @@ private let lagunaDecodeRouterCastSinkEnabled =
 private let lagunaDecodeRouterNormSinkEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTER_NORM"] != "0"
 
+/// Retained FP32 copy of each router's `e_score_correction_bias`, built once
+/// after checkpoint load so the router fast paths stop re-issuing the same
+/// 256-element cast on every invocation (one per sparse layer per token on
+/// decode, and one per sparse layer per prefill forward). The retained array
+/// is produced by the identical `asType(.float32)` op evaluated once, so
+/// every consumer sees bit-identical values. Set
+/// `DARKBLOOM_ROUTER_BIAS_CACHE=0` for a stock per-call-cast ablation.
+private let lagunaRouterBiasCacheEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_BIAS_CACHE"] != "0"
+
 /// Prefill counterpart of the fused decode router: one dispatch per sparse
 /// layer replaces the stock multi-token routing chain (FP32 cast, sigmoid,
 /// correction-bias add, negate, `argPartition`'s full 256-wide merge argsort,
@@ -5799,12 +5809,36 @@ final class LagunaRuntimeMoEGate: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
 
+    /// Retained FP32 copy of `e_score_correction_bias` (see
+    /// `lagunaRouterBiasCacheEnabled`). Plain stored property with a leading
+    /// underscore so Module reflection never treats it as a checkpoint
+    /// parameter.
+    var _correctionBiasF32: MLXArray?
+
     init(_ config: LagunaConfig) {
         self.topK = config.numExpertsPerTok
         self.normTopkProb = config.normTopkProb
         self.routerLogitSoftcapping = Float(config.moeRouterLogitSoftcapping)
         self._weight.wrappedValue = zeros([config.numExperts, config.hiddenSize])
         self._eScoreCorrectionBias.wrappedValue = zeros([config.numExperts])
+    }
+
+    /// Builds and retains the FP32 correction-bias copy from the loaded
+    /// checkpoint parameter. Called once after weights are installed
+    /// (before warmup); returns the new array so the caller can batch a
+    /// single eval alongside the other derived layouts.
+    func prepareCorrectionBiasF32() -> [MLXArray] {
+        guard lagunaRouterBiasCacheEnabled, _correctionBiasF32 == nil else { return [] }
+        let cast = eScoreCorrectionBias.asType(.float32)
+        _correctionBiasF32 = cast
+        return [cast]
+    }
+
+    /// The retained FP32 correction bias, or the stock per-call cast when
+    /// the cache is disabled or not yet prepared. Identical values either
+    /// way.
+    private var correctionBiasF32: MLXArray {
+        _correctionBiasF32 ?? eScoreCorrectionBias.asType(.float32)
     }
 
     /// `logits` is this layer's router projection when an upstream kernel in
@@ -5828,7 +5862,7 @@ final class LagunaRuntimeMoEGate: Module {
             lagunaTrace("prefill router tournament")
             return lagunaPrefillRouterTournament(
                 logits: projectedLogits,
-                correctionBias: eScoreCorrectionBias.asType(.float32),
+                correctionBias: correctionBiasF32,
                 rows: projectedLogits.dim(1),
                 normalizing: normTopkProb
             )
@@ -5846,7 +5880,7 @@ final class LagunaRuntimeMoEGate: Module {
             lagunaTrace("prefill router top8")
             return lagunaPrefillRouterTop8(
                 logits: projectedLogits,
-                correctionBias: eScoreCorrectionBias.asType(.float32),
+                correctionBias: correctionBiasF32,
                 rows: projectedLogits.dim(1),
                 normalizing: normTopkProb
             )
@@ -5867,7 +5901,7 @@ final class LagunaRuntimeMoEGate: Module {
                     : "decode router top8 (cast sink)")
             (inds, weights) = lagunaDecodeRouterTop8(
                 logits: projectedLogits,
-                correctionBias: eScoreCorrectionBias.asType(.float32),
+                correctionBias: correctionBiasF32,
                 normalizing: sinkNormalization
             )
             if sinkNormalization {
@@ -5886,7 +5920,7 @@ final class LagunaRuntimeMoEGate: Module {
                 lagunaTrace("decode router top8 (fp32 logits)")
                 (inds, weights) = lagunaDecodeRouterTop8(
                     logits: logits,
-                    correctionBias: eScoreCorrectionBias.asType(.float32)
+                    correctionBias: correctionBiasF32
                 )
             } else {
                 let scores = sigmoid(logits)
@@ -7255,6 +7289,7 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
             fusedArrays.append(
                 contentsOf: layer.selfAttn.prepareLastPrefillProjectionWeights())
             if let sparse = layer.mlp as? LagunaRuntimeSparseMoEBlock {
+                fusedArrays.append(contentsOf: sparse.gate.prepareCorrectionBiasF32())
                 if lagunaFusedSharedGateUpEnabled {
                     fusedArrays.append(contentsOf: sparse.sharedExpert.prepareFusedSharedGateUp())
                 }
