@@ -41,8 +41,9 @@ import MLXFast
 //      which the certificate shows is strictly below the winner; the harness
 //      argmaxes the returned row (LagunaCorrectness.swift:108), so the emitted
 //      token is the stock token.
-// The threshold beta widens the candidate set slightly vs the raw lower bound
-// L; it is the BF16-cast safety margin from the assembly proof.
+// The default threshold is BF16(L)'s exact lower rounding boundary, constructed
+// from integer bits; `DARKBLOOM_LMHEAD_EXACT_BETA=0` retains the older
+// two-ulp beta for same-binary ablation.
 //
 // `DARKBLOOM_LMHEAD_INLINE_MASK=0` restores the new tip's three-output coarse
 // kernels, fused two-pass lower-bound reduction, dense uint8 selector mask,
@@ -76,6 +77,24 @@ let lagunaLmHeadPrunePrefillEnabled =
 /// dispatch and stored `coarse_bf` output.
 private let lagunaLmHeadInlineMaskEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_INLINE_MASK"] != "0"
+
+/// Exact candidate threshold for the final BF16 logits. DEFAULT ON; set
+/// `DARKBLOOM_LMHEAD_EXACT_BETA=0` to restore the retained `L - |L|/64`
+/// threshold kernel byte-for-byte.
+private let lagunaLmHeadExactBetaEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_EXACT_BETA"] != "0"
+
+/// Candidate membership is computed by lane 0 and broadcast as a four-bit
+/// integer mask. DEFAULT ON; set `DARKBLOOM_LMHEAD_LANE_UNIFORM=0` to restore
+/// the retained every-lane candidate expressions.
+private let lagunaLmHeadLaneUniformEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_LANE_UNIFORM"] != "0"
+
+/// Within an active four-row exact block, issue the copied stock GEMV body
+/// only for candidate rows. DEFAULT ON; set `DARKBLOOM_LMHEAD_ROW_SKIP=0` to
+/// restore computation of all four rows.
+private let lagunaLmHeadRowSkipEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_ROW_SKIP"] != "0"
 
 /// Kernel header: bit-exact MXFP8 element decoders + the certified
 /// half-cell-width table, all inlinable and libm-free.
@@ -501,6 +520,81 @@ private let lagunaLmHeadLowerMaxThresholdKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Integer construction of the exact lower rounding boundary for BF16(L).
+/// The FP32-to-BF16 RNE step and the midpoint's FP32 bits are derived without
+/// floating-point arithmetic. Candidate comparison remains `upper >= T`, so
+/// an exact midpoint is retained regardless of the BF16 tie-even parity.
+///
+/// Exceptional handling is conservative: NaN returns the same NaN threshold
+/// as the incumbent path (all ordered comparisons are false); negative
+/// infinity returns -infinity (all non-NaN rows remain candidates); positive
+/// infinity uses the finite BF16 overflow midpoint 0x7f7f8000.
+private let lagunaLmHeadExactBetaHeader = lagunaLmHeadLowerMaxHeader + """
+
+    static inline float laguna_lmhead_bf16_lower_boundary(float value) {
+        uint raw = as_type<uint>(value);
+        uint magnitude = raw & 0x7fffffffu;
+
+        // Preserve NaN as NaN without a floating-point operation.
+        if (magnitude > 0x7f800000u) {
+            return as_type<float>(raw);
+        }
+
+        // Round the finite/infinite FP32 bit pattern to BF16, ties-to-even.
+        uint upper = raw >> 16;
+        uint remainder = raw & 0xffffu;
+        uint increment =
+            (remainder > 0x8000u ||
+             (remainder == 0x8000u && (upper & 1u) != 0u))
+            ? 1u : 0u;
+        uint bf = upper + increment;
+
+        // -infinity has no lower finite neighbor. Keeping -infinity is the
+        // conservative threshold and matches the retained beta path.
+        if (bf == 0xff80u) {
+            return as_type<float>(0xff800000u);
+        }
+
+        // The predecessor of either signed zero is -min-subnormal BF16, whose
+        // midpoint with zero is exactly FP32 -2^-134 (0x80008000).
+        if ((bf & 0x7fffu) == 0u) {
+            return as_type<float>(0x80008000u);
+        }
+
+        // Adjacent BF16 values differ by 0x10000 in their exact FP32
+        // encodings. The midpoint below a positive value (including +inf) is
+        // -0x8000 bits; below a negative finite value it is +0x8000 bits.
+        uint fp = bf << 16;
+        uint midpoint =
+            (bf & 0x8000u) != 0u ? fp + 0x8000u : fp - 0x8000u;
+        return as_type<float>(midpoint);
+    }
+    """
+
+private let lagunaLmHeadLowerMaxExactThresholdKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_lower_max_exact_bf16_threshold_v1",
+    inputNames: ["partial_max"],
+    outputNames: ["threshold"],
+    source: """
+        constexpr uint READS = 4;
+        uint lid = thread_position_in_threadgroup.x;
+
+        float total = -metal::numeric_limits<float>::infinity();
+        uint base = lid * READS;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < READS; ++i) {
+            total = laguna_lmhead_max_pair(partial_max[base + i], total);
+        }
+        total = laguna_lmhead_simd_max(total);
+
+        if (lid == 0) {
+            threshold[0] = laguna_lmhead_bf16_lower_boundary(total);
+        }
+        """,
+    header: lagunaLmHeadExactBetaHeader,
+    ensureRowContiguous: true
+)
+
 /// GPU candidate marking: one byte per vocabulary row, set when the row's
 /// certified upper bound reaches the threshold. A dense mask rather than a
 /// compacted index list, because the exact pass below owns a FIXED output
@@ -627,8 +721,8 @@ private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
 /// payloads and signed zero reach the same cast; candidate NaNs compare false
 /// on both paths. The stock GEMV block below is otherwise a textual copy of
 /// `lagunaLmHeadExactKernel`. Set `DARKBLOOM_LMHEAD_INLINE_MASK=0` to restore
-/// that kernel plus its selector and `coarse_bf` input. The new tip's fused
-/// lower-bound reduction is shared unchanged by both paths.
+/// that kernel plus its selector and `coarse_bf` input. Both paths consume the
+/// same selected lower-bound threshold.
 private let lagunaLmHeadInlineExactKernel = MLXFast.metalKernel(
     name: "laguna_lmhead_exact_inline_mask_block_v1",
     inputNames: ["coarse", "delta", "thr", "lm_head", "x"],
@@ -713,6 +807,205 @@ private let lagunaLmHeadInlineExactKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Builds the independently switchable lane-uniform and per-row-skip exact
+/// variants. The candidate expression is copied from the retained selector,
+/// and every floating-point line between the stock-replica markers is copied
+/// textually from `lagunaLmHeadInlineExactKernel`. The only inserted control
+/// is a simdgroup-uniform integer-mask guard around a row's existing loads,
+/// accumulations, shuffle tree, and BF16 cast.
+private func makeLagunaLmHeadSpecializedExactKernel(
+    name: String,
+    inlineCandidate: Bool,
+    laneUniform: Bool,
+    rowSkip: Bool
+) -> MLXFast.MLXFastKernel {
+    let candidateExpression =
+        inlineCandidate
+        ? "(r < VOCAB && coarse[r] + delta[r] >= thr[0])"
+        : "(r < VOCAB && is_cand[r] != 0)"
+    let skippedExpression =
+        inlineCandidate ? "bfloat(coarse[r])" : "coarse_bf[r]"
+    let inputNames =
+        inlineCandidate
+        ? ["coarse", "delta", "thr", "lm_head", "x"]
+        : ["coarse_bf", "lm_head", "x", "is_cand"]
+
+    return MLXFast.metalKernel(
+        name: name,
+        inputNames: inputNames,
+        outputNames: ["assembled"],
+        source: """
+            constexpr uint VOCAB = 100352;
+            constexpr uint K = 2048;
+            constexpr bool LANE_UNIFORM = \(laneUniform ? "true" : "false");
+            constexpr bool ROW_SKIP = \(rowSkip ? "true" : "false");
+
+            uint tgid = threadgroup_position_in_grid.x;
+            uint sgid = simdgroup_index_in_threadgroup;
+            uint lane = thread_index_in_simdgroup;
+
+            // This simdgroup's fixed four output rows.
+            uint base = tgid * 32 + sgid * 4;
+
+            // With LANE_UNIFORM, lane 0 alone executes the retained predicate
+            // and broadcasts only its integer result. Otherwise every lane
+            // computes the same mask, preserving an independent #5 ablation.
+            uint candidate_mask = 0u;
+            if (!LANE_UNIFORM || lane == 0u) {
+                #pragma unroll
+                for (uint tm = 0; tm < 4; ++tm) {
+                    uint r = base + tm;
+                    if \(candidateExpression) {
+                        candidate_mask |= 1u << tm;
+                    }
+                }
+            }
+            if (LANE_UNIFORM) {
+                candidate_mask = simd_shuffle(candidate_mask, ushort(0));
+            }
+
+            if (candidate_mask == 0u) {
+                if (lane < 4 && base + lane < VOCAB) {
+                    uint r = base + lane;
+                    assembled[r] = \(skippedExpression);
+                }
+                return;
+            }
+
+            // --- stock gemv_al replica begin (gemv.h:151-289) ---
+            thread float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            thread bfloat inter[4];
+            thread float v_coeff[4];
+            uint bn = lane * 4;
+            for (uint i = 0; i < 16; ++i) {
+                vec<bfloat, 4> xv =
+                    *((const device vec<bfloat, 4>*)(x + bn));
+                v_coeff[0] = float(xv.x);
+                v_coeff[1] = float(xv.y);
+                v_coeff[2] = float(xv.z);
+                v_coeff[3] = float(xv.w);
+                #pragma unroll
+                for (uint tm = 0; tm < 4; ++tm) {
+                    if (!ROW_SKIP || (candidate_mask & (1u << tm)) != 0u) {
+                        const device bfloat* mrow =
+                            lm_head + size_t(base + tm) * K;
+                        vec<bfloat, 4> mv =
+                            *((const device vec<bfloat, 4>*)(mrow + bn));
+                        inter[0] = mv.x;
+                        inter[1] = mv.y;
+                        inter[2] = mv.z;
+                        inter[3] = mv.w;
+                        result[tm] += inter[0] * v_coeff[0];
+                        result[tm] += inter[1] * v_coeff[1];
+                        result[tm] += inter[2] * v_coeff[2];
+                        result[tm] += inter[3] * v_coeff[3];
+                    }
+                }
+                bn += 128;
+            }
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                if (!ROW_SKIP || (candidate_mask & (1u << tm)) != 0u) {
+                    #pragma unroll
+                    for (ushort sn = 16; sn >= 1; sn >>= 1) {
+                        result[tm] += simd_shuffle_down(result[tm], sn);
+                    }
+                }
+            }
+            // --- stock gemv_al replica end ---
+            if (lane == 0) {
+                #pragma unroll
+                for (uint tm = 0; tm < 4; ++tm) {
+                    uint r = base + tm;
+                    if (r < VOCAB) {
+                        assembled[r] =
+                            (candidate_mask & (1u << tm)) != 0u
+                            ? bfloat(result[tm])
+                            : \(skippedExpression);
+                    }
+                }
+            }
+            """,
+        ensureRowContiguous: true
+    )
+}
+
+private let lagunaLmHeadInlineLaneUniformKernel =
+    makeLagunaLmHeadSpecializedExactKernel(
+        name: "laguna_lmhead_exact_inline_lane_uniform_v1",
+        inlineCandidate: true,
+        laneUniform: true,
+        rowSkip: false
+    )
+
+private let lagunaLmHeadInlineRowSkipKernel =
+    makeLagunaLmHeadSpecializedExactKernel(
+        name: "laguna_lmhead_exact_inline_row_skip_v1",
+        inlineCandidate: true,
+        laneUniform: false,
+        rowSkip: true
+    )
+
+private let lagunaLmHeadInlineLaneUniformRowSkipKernel =
+    makeLagunaLmHeadSpecializedExactKernel(
+        name: "laguna_lmhead_exact_inline_lane_uniform_row_skip_v1",
+        inlineCandidate: true,
+        laneUniform: true,
+        rowSkip: true
+    )
+
+private let lagunaLmHeadMaskLaneUniformKernel =
+    makeLagunaLmHeadSpecializedExactKernel(
+        name: "laguna_lmhead_exact_mask_lane_uniform_v1",
+        inlineCandidate: false,
+        laneUniform: true,
+        rowSkip: false
+    )
+
+private let lagunaLmHeadMaskRowSkipKernel =
+    makeLagunaLmHeadSpecializedExactKernel(
+        name: "laguna_lmhead_exact_mask_row_skip_v1",
+        inlineCandidate: false,
+        laneUniform: false,
+        rowSkip: true
+    )
+
+private let lagunaLmHeadMaskLaneUniformRowSkipKernel =
+    makeLagunaLmHeadSpecializedExactKernel(
+        name: "laguna_lmhead_exact_mask_lane_uniform_row_skip_v1",
+        inlineCandidate: false,
+        laneUniform: true,
+        rowSkip: true
+    )
+
+private func lagunaLmHeadSelectedExactKernel(
+    inlineCandidate: Bool
+) -> MLXFast.MLXFastKernel {
+    if inlineCandidate {
+        if lagunaLmHeadLaneUniformEnabled && lagunaLmHeadRowSkipEnabled {
+            return lagunaLmHeadInlineLaneUniformRowSkipKernel
+        }
+        if lagunaLmHeadLaneUniformEnabled {
+            return lagunaLmHeadInlineLaneUniformKernel
+        }
+        if lagunaLmHeadRowSkipEnabled {
+            return lagunaLmHeadInlineRowSkipKernel
+        }
+        return lagunaLmHeadInlineExactKernel
+    }
+
+    if lagunaLmHeadLaneUniformEnabled && lagunaLmHeadRowSkipEnabled {
+        return lagunaLmHeadMaskLaneUniformRowSkipKernel
+    }
+    if lagunaLmHeadLaneUniformEnabled {
+        return lagunaLmHeadMaskLaneUniformKernel
+    }
+    if lagunaLmHeadRowSkipEnabled {
+        return lagunaLmHeadMaskRowSkipKernel
+    }
+    return lagunaLmHeadExactKernel
+}
+
 /// Retained init-time MXFP8 coarse copy of lm_head plus the pruned final-row
 /// forward. Built once (untimed init) by
 /// `LagunaRuntimeModel.prepareFusedRuntimeWeights` when
@@ -778,9 +1071,10 @@ final class LagunaLmHeadPruner {
         let coarse = coarseOut[0]
         let delta = coarseOut[1]
 
-        // Threshold on GPU: L = max(coarse - delta); thr = L - |L|/64.
-        // The custom pair fuses the six-dispatch MLX expression into two
-        // dispatches while reproducing MLX's exact two-pass reduction layout.
+        // Threshold on GPU: L = max(coarse - delta). The exact-beta default
+        // constructs BF16(L)'s lower midpoint with integer bit manipulation;
+        // its kill switch retains the previous `L - |L|/64` second pass.
+        // Both variants share the identical fused first-pass reduction.
         let lowerMaxPartials = lagunaLmHeadLowerMaxStage1Kernel(
             [coarse, delta],
             grid: (224, 128, 1),
@@ -788,7 +1082,11 @@ final class LagunaLmHeadPruner {
             outputShapes: [[128]],
             outputDTypes: [.float32]
         )[0]
-        let thr = lagunaLmHeadLowerMaxThresholdKernel(
+        let thresholdKernel =
+            lagunaLmHeadExactBetaEnabled
+            ? lagunaLmHeadLowerMaxExactThresholdKernel
+            : lagunaLmHeadLowerMaxThresholdKernel
+        let thr = thresholdKernel(
             [lowerMaxPartials],
             grid: (32, 1, 1),
             threadGroup: (32, 1, 1),
@@ -800,7 +1098,8 @@ final class LagunaLmHeadPruner {
         // once (100352 == 3136 * 32). Every slot has exactly one owning lane.
         let assembled: MLXArray
         if lagunaLmHeadInlineMaskEnabled {
-            assembled = lagunaLmHeadInlineExactKernel(
+            let exactKernel = lagunaLmHeadSelectedExactKernel(inlineCandidate: true)
+            assembled = exactKernel(
                 [coarse, delta, thr, lmHeadWeight, x],
                 grid: (vocab / 32 * 256, 1, 1),
                 threadGroup: (256, 1, 1),
@@ -818,7 +1117,8 @@ final class LagunaLmHeadPruner {
                 outputShapes: [[vocab]],
                 outputDTypes: [.uint8]
             )[0]
-            assembled = lagunaLmHeadExactKernel(
+            let exactKernel = lagunaLmHeadSelectedExactKernel(inlineCandidate: false)
+            assembled = exactKernel(
                 [coarseBF, lmHeadWeight, x, isCandidate],
                 grid: (vocab / 32 * 256, 1, 1),
                 threadGroup: (256, 1, 1),
