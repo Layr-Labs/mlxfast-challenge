@@ -112,6 +112,11 @@ using namespace metal;
 #define DARKBLOOM_GQA_PAIR_HEADS 2
 #endif
 
+// Keys processed per main-loop trip in the GQA-pair branch (1 = stock).
+#ifndef DARKBLOOM_SDPA_KBATCH
+#define DARKBLOOM_SDPA_KBATCH 4
+#endif
+
 // ---------------------------------------------------------------------------
 // DARKBLOOM_ALPHASKIP: exact online-softmax rescale elision, keyed on the
 // bit-exact alpha == 1 case. Default ON; `0` restores the stock statement
@@ -341,7 +346,76 @@ template <
     U pair_sum0 = 0;
     U pair_sum1 = 0;
 
-    for (int i = simd_gid; i < N; i += BN) {
+    // DARKBLOOM_SDPA_KBATCH: process KB keys per main-loop trip. Loads and
+    // lane-local dot FMAs for the KB keys are issued up front (memory-level
+    // parallelism), the KB independent simd_sum reductions run back to back,
+    // and the online-softmax chain then consumes the scores strictly in the
+    // original key order. Every per-key floating-point operation -- the
+    // j-ordered dot chain, the simd_sum tree, max/rescale/exp/accumulate --
+    // is textually identical to the stock body below (which remains as the
+    // tail loop), and the build is -fno-fast-math, so the compiler cannot
+    // reassociate: only instruction scheduling changes, no rounding boundary
+    // moves. KB=1 disables the main loop entirely (the tail IS the stock
+    // loop, byte for byte).
+    int i = simd_gid;
+#if DARKBLOOM_SDPA_KBATCH > 1
+    {
+      constexpr int KB = DARKBLOOM_SDPA_KBATCH;
+      for (; i + (KB - 1) * BN < N; i += KB * BN) {
+        U batch_k[KB][qk_per_thread];
+        U batch_s0[KB];
+        U batch_s1[KB];
+        for (int b = 0; b < KB; ++b) {
+          const device T* kp = pair_keys + b * inner_k_stride;
+          for (int j = 0; j < qk_per_thread; ++j) {
+            batch_k[b][j] = kp[j];
+          }
+        }
+        for (int b = 0; b < KB; ++b) {
+          U pair_score0 = 0;
+          U pair_score1 = 0;
+          for (int j = 0; j < qk_per_thread; ++j) {
+            pair_score0 += pair_q0[j] * batch_k[b][j];
+            pair_score1 += pair_q1[j] * batch_k[b][j];
+          }
+          batch_s0[b] = pair_score0;
+          batch_s1[b] = pair_score1;
+        }
+        for (int b = 0; b < KB; ++b) {
+          batch_s0[b] = simd_sum(batch_s0[b]);
+          batch_s1[b] = simd_sum(batch_s1[b]);
+        }
+        for (int b = 0; b < KB; ++b) {
+          U pair_score0 = batch_s0[b];
+          U pair_score1 = batch_s1[b];
+
+          U pair_new_max0 = max(pair_max0, pair_score0);
+          U pair_new_max1 = max(pair_max1, pair_score1);
+          U pair_factor0;
+          U pair_factor1;
+          DARKBLOOM_RESCALE_FACTOR(pair_factor0, pair_max0 - pair_new_max0);
+          DARKBLOOM_RESCALE_FACTOR(pair_factor1, pair_max1 - pair_new_max1);
+          U pair_exp0 = fast::exp(pair_score0 - pair_new_max0);
+          U pair_exp1 = fast::exp(pair_score1 - pair_new_max1);
+
+          pair_max0 = pair_new_max0;
+          pair_max1 = pair_new_max1;
+          pair_sum0 = pair_sum0 * pair_factor0 + pair_exp0;
+          pair_sum1 = pair_sum1 * pair_factor1 + pair_exp1;
+
+          const device T* vp = pair_values + b * inner_v_stride;
+          for (int j = 0; j < v_per_thread; ++j) {
+            const T pair_value = vp[j];
+            pair_o0[j] = pair_o0[j] * pair_factor0 + pair_exp0 * pair_value;
+            pair_o1[j] = pair_o1[j] * pair_factor1 + pair_exp1 * pair_value;
+          }
+        }
+        pair_keys += KB * inner_k_stride;
+        pair_values += KB * inner_v_stride;
+      }
+    }
+#endif
+    for (; i < N; i += BN) {
       for (int j = 0; j < qk_per_thread; ++j) {
         pair_k[j] = pair_keys[j];
       }
