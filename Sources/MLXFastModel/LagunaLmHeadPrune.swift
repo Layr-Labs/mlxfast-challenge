@@ -143,13 +143,13 @@ private let lagunaLmHeadPruneHeader = """
 /// outputs are bit-identical to v1 for every input, so the notes/68
 /// certificate is untouched.
 private let lagunaLmHeadCoarseKernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_mxfp8_coarse_pack16_v3",
+    name: "laguna_lmhead_mxfp8_coarse_v2",
     inputNames: ["x", "codes", "scales"],
     outputNames: ["coarse", "delta", "coarse_bf"],
     source: """
         constexpr float GAMMA = 0x1p-15f;
 
-        uint row = threadgroup_position_in_grid.x * 16 +
+        uint row = threadgroup_position_in_grid.x * 8 +
             simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
 
@@ -272,13 +272,13 @@ private let lagunaLmHeadCoarseKernelV1 = MLXFast.metalKernel(
 /// which is byte-identical for finite values, NaNs, and signed zero. Setting
 /// `DARKBLOOM_LMHEAD_INLINE_MASK=0` selects the original three-output kernels.
 private let lagunaLmHeadInlineCoarseKernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_mxfp8_inline_coarse_pack16_v3",
+    name: "laguna_lmhead_mxfp8_inline_coarse_v2",
     inputNames: ["x", "codes", "scales"],
     outputNames: ["coarse", "delta"],
     source: """
         constexpr float GAMMA = 0x1p-15f;
 
-        uint row = threadgroup_position_in_grid.x * 16 +
+        uint row = threadgroup_position_in_grid.x * 8 +
             simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
 
@@ -748,23 +748,16 @@ final class LagunaLmHeadPruner {
         precondition(hidden.dtype == .bfloat16 && hidden.size == lagunaLmHeadPruneHidden)
         let vocab = lagunaLmHeadPruneVocab
         let x = hidden.reshaped([lagunaLmHeadPruneHidden])
-        let useCoarseV1 = lagunaLmHeadCoarseUseV1
-        let coarseRowsPerThreadgroup = useCoarseV1 ? 8 : 16
-        let coarseThreadsPerThreadgroup = coarseRowsPerThreadgroup * 32
 
         let coarseOut: [MLXArray]
         if lagunaLmHeadInlineMaskEnabled {
             let coarseKernel =
-                useCoarseV1
+                lagunaLmHeadCoarseUseV1
                 ? lagunaLmHeadInlineCoarseKernelV1 : lagunaLmHeadInlineCoarseKernel
             coarseOut = coarseKernel(
                 [x, codes, scales],
-                grid: (
-                    vocab / coarseRowsPerThreadgroup * coarseThreadsPerThreadgroup,
-                    1,
-                    1
-                ),
-                threadGroup: (coarseThreadsPerThreadgroup, 1, 1),
+                grid: (vocab / 8 * 256, 1, 1),
+                threadGroup: (256, 1, 1),
                 outputShapes: [[vocab], [vocab]],
                 outputDTypes: [.float32, .float32]
             )
@@ -773,15 +766,11 @@ final class LagunaLmHeadPruner {
             // coarse kernels still materialize `coarse_bf` for the retained
             // selector/exact path.
             let coarseKernel =
-                useCoarseV1 ? lagunaLmHeadCoarseKernelV1 : lagunaLmHeadCoarseKernel
+                lagunaLmHeadCoarseUseV1 ? lagunaLmHeadCoarseKernelV1 : lagunaLmHeadCoarseKernel
             coarseOut = coarseKernel(
                 [x, codes, scales],
-                grid: (
-                    vocab / coarseRowsPerThreadgroup * coarseThreadsPerThreadgroup,
-                    1,
-                    1
-                ),
-                threadGroup: (coarseThreadsPerThreadgroup, 1, 1),
+                grid: (vocab / 8 * 256, 1, 1),
+                threadGroup: (256, 1, 1),
                 outputShapes: [[vocab], [vocab], [vocab]],
                 outputDTypes: [.float32, .float32, .bfloat16]
             )
