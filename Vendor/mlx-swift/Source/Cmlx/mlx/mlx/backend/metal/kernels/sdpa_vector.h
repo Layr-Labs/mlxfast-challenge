@@ -327,9 +327,22 @@ template <
     thread U pair_o0[v_per_thread];
     thread U pair_o1[v_per_thread];
 
-    for (int j = 0; j < qk_per_thread; ++j) {
-      pair_q0[j] = static_cast<U>(scale) * pair_query0[j];
-      pair_q1[j] = static_cast<U>(scale) * pair_query1[j];
+    if (qk_per_thread == 4) {
+      vec<T, 4> q0_vec = *(const device vec<T, 4>*)pair_query0;
+      vec<T, 4> q1_vec = *(const device vec<T, 4>*)pair_query1;
+      pair_q0[0] = static_cast<U>(scale) * static_cast<U>(q0_vec[0]);
+      pair_q0[1] = static_cast<U>(scale) * static_cast<U>(q0_vec[1]);
+      pair_q0[2] = static_cast<U>(scale) * static_cast<U>(q0_vec[2]);
+      pair_q0[3] = static_cast<U>(scale) * static_cast<U>(q0_vec[3]);
+      pair_q1[0] = static_cast<U>(scale) * static_cast<U>(q1_vec[0]);
+      pair_q1[1] = static_cast<U>(scale) * static_cast<U>(q1_vec[1]);
+      pair_q1[2] = static_cast<U>(scale) * static_cast<U>(q1_vec[2]);
+      pair_q1[3] = static_cast<U>(scale) * static_cast<U>(q1_vec[3]);
+    } else {
+      for (int j = 0; j < qk_per_thread; ++j) {
+        pair_q0[j] = static_cast<U>(scale) * pair_query0[j];
+        pair_q1[j] = static_cast<U>(scale) * pair_query1[j];
+      }
     }
     for (int j = 0; j < v_per_thread; ++j) {
       pair_o0[j] = 0;
@@ -342,8 +355,16 @@ template <
     U pair_sum1 = 0;
 
     for (int i = simd_gid; i < N; i += BN) {
-      for (int j = 0; j < qk_per_thread; ++j) {
-        pair_k[j] = pair_keys[j];
+      if (qk_per_thread == 4) {
+        vec<T, 4> k_vec = *(const device vec<T, 4>*)pair_keys;
+        pair_k[0] = static_cast<U>(k_vec[0]);
+        pair_k[1] = static_cast<U>(k_vec[1]);
+        pair_k[2] = static_cast<U>(k_vec[2]);
+        pair_k[3] = static_cast<U>(k_vec[3]);
+      } else {
+        for (int j = 0; j < qk_per_thread; ++j) {
+          pair_k[j] = pair_keys[j];
+        }
       }
 
       U pair_score0 = 0;
@@ -369,10 +390,22 @@ template <
       pair_sum0 = pair_sum0 * pair_factor0 + pair_exp0;
       pair_sum1 = pair_sum1 * pair_factor1 + pair_exp1;
 
-      for (int j = 0; j < v_per_thread; ++j) {
-        const T pair_value = pair_values[j];
-        pair_o0[j] = pair_o0[j] * pair_factor0 + pair_exp0 * pair_value;
-        pair_o1[j] = pair_o1[j] * pair_factor1 + pair_exp1 * pair_value;
+      if (v_per_thread == 4) {
+        vec<T, 4> v_vec = *(const device vec<T, 4>*)pair_values;
+        pair_o0[0] = pair_o0[0] * pair_factor0 + pair_exp0 * static_cast<U>(v_vec[0]);
+        pair_o0[1] = pair_o0[1] * pair_factor0 + pair_exp0 * static_cast<U>(v_vec[1]);
+        pair_o0[2] = pair_o0[2] * pair_factor0 + pair_exp0 * static_cast<U>(v_vec[2]);
+        pair_o0[3] = pair_o0[3] * pair_factor0 + pair_exp0 * static_cast<U>(v_vec[3]);
+        pair_o1[0] = pair_o1[0] * pair_factor1 + pair_exp1 * static_cast<U>(v_vec[0]);
+        pair_o1[1] = pair_o1[1] * pair_factor1 + pair_exp1 * static_cast<U>(v_vec[1]);
+        pair_o1[2] = pair_o1[2] * pair_factor1 + pair_exp1 * static_cast<U>(v_vec[2]);
+        pair_o1[3] = pair_o1[3] * pair_factor1 + pair_exp1 * static_cast<U>(v_vec[3]);
+      } else {
+        for (int j = 0; j < v_per_thread; ++j) {
+          const T pair_value = pair_values[j];
+          pair_o0[j] = pair_o0[j] * pair_factor0 + pair_exp0 * pair_value;
+          pair_o1[j] = pair_o1[j] * pair_factor1 + pair_exp1 * pair_value;
+        }
       }
 
       pair_keys += inner_k_stride;
@@ -446,9 +479,16 @@ template <
     }
 
     if (simd_lid == 0) {
-      for (int i = 0; i < v_per_thread; ++i) {
-        pair_out0[i] = static_cast<T>(pair_o0[i]);
-        pair_out1[i] = static_cast<T>(pair_o1[i]);
+      if (v_per_thread == 4) {
+        vec<T, 4> out0_vec = {static_cast<T>(pair_o0[0]), static_cast<T>(pair_o0[1]), static_cast<T>(pair_o0[2]), static_cast<T>(pair_o0[3])};
+        vec<T, 4> out1_vec = {static_cast<T>(pair_o1[0]), static_cast<T>(pair_o1[1]), static_cast<T>(pair_o1[2]), static_cast<T>(pair_o1[3])};
+        *(device vec<T, 4>*)pair_out0 = out0_vec;
+        *(device vec<T, 4>*)pair_out1 = out1_vec;
+      } else {
+        for (int i = 0; i < v_per_thread; ++i) {
+          pair_out0[i] = static_cast<T>(pair_o0[i]);
+          pair_out1[i] = static_cast<T>(pair_o1[i]);
+        }
       }
     }
     return;
@@ -482,8 +522,16 @@ template <
   out += o_offset * V + simd_gid * v_per_thread;
 
   // Read the query and 0 the output accumulator
-  for (int i = 0; i < qk_per_thread; i++) {
-    q[i] = static_cast<U>(scale) * queries[i];
+  if (qk_per_thread == 4) {
+    vec<T, 4> q_vec = *(const device vec<T, 4>*)queries;
+    q[0] = static_cast<U>(scale) * static_cast<U>(q_vec[0]);
+    q[1] = static_cast<U>(scale) * static_cast<U>(q_vec[1]);
+    q[2] = static_cast<U>(scale) * static_cast<U>(q_vec[2]);
+    q[3] = static_cast<U>(scale) * static_cast<U>(q_vec[3]);
+  } else {
+    for (int i = 0; i < qk_per_thread; i++) {
+      q[i] = static_cast<U>(scale) * queries[i];
+    }
   }
   for (int i = 0; i < v_per_thread; i++) {
     o[i] = 0;
@@ -508,8 +556,16 @@ template <
     }
     if (use_key) {
       // Read the key
-      for (int j = 0; j < qk_per_thread; j++) {
-        k[j] = keys[j];
+      if (qk_per_thread == 4) {
+        vec<T, 4> k_vec = *(const device vec<T, 4>*)keys;
+        k[0] = static_cast<U>(k_vec[0]);
+        k[1] = static_cast<U>(k_vec[1]);
+        k[2] = static_cast<U>(k_vec[2]);
+        k[3] = static_cast<U>(k_vec[3]);
+      } else {
+        for (int j = 0; j < qk_per_thread; j++) {
+          k[j] = keys[j];
+        }
       }
 
       // Compute the i-th score
@@ -532,8 +588,16 @@ template <
       sum_exp_score = sum_exp_score * factor + exp_score;
 
       // Update the output accumulator
-      for (int j = 0; j < v_per_thread; j++) {
-        o[j] = o[j] * factor + exp_score * values[j];
+      if (v_per_thread == 4) {
+        vec<T, 4> v_vec = *(const device vec<T, 4>*)values;
+        o[0] = o[0] * factor + exp_score * static_cast<U>(v_vec[0]);
+        o[1] = o[1] * factor + exp_score * static_cast<U>(v_vec[1]);
+        o[2] = o[2] * factor + exp_score * static_cast<U>(v_vec[2]);
+        o[3] = o[3] * factor + exp_score * static_cast<U>(v_vec[3]);
+      } else {
+        for (int j = 0; j < v_per_thread; j++) {
+          o[j] = o[j] * factor + exp_score * values[j];
+        }
       }
     }
 
@@ -641,8 +705,13 @@ template <
 
   // And write the output
   if (simd_lid == 0) {
-    for (int i = 0; i < v_per_thread; i++) {
-      out[i] = static_cast<T>(o[i]);
+    if (v_per_thread == 4) {
+      vec<T, 4> out_vec = {static_cast<T>(o[0]), static_cast<T>(o[1]), static_cast<T>(o[2]), static_cast<T>(o[3])};
+      *(device vec<T, 4>*)out = out_vec;
+    } else {
+      for (int i = 0; i < v_per_thread; i++) {
+        out[i] = static_cast<T>(o[i]);
+      }
     }
   }
 }
