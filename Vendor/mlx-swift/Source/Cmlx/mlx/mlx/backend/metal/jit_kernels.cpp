@@ -1162,23 +1162,46 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
     bool is_affine = mode == "affine";
     concatenate(
         kernel_source,
-        is_affine ? metal::quantized_nax() : metal::fp_quantized_nax(),
-        get_template_definition(
-            lib_name,
-            (is_affine ? "affine" : "fp") +
-                std::string(
-                    kernel_name.find("_expert_") != std::string::npos
-                        ? "_gather_qmm_rhs_expert_nax"
-                        : "_gather_qmm_rhs_nax"),
-            get_type_string(x.dtype()),
-            group_size,
-            bits,
-            bm,
-            bn,
-            bk,
-            wm,
-            wn,
-            transpose));
+        is_affine ? metal::quantized_nax() : metal::fp_quantized_nax());
+    const bool expert =
+        kernel_name.find("_expert_") != std::string::npos;
+    if (expert && kernel_name.find("_lhs_") != std::string::npos) {
+      concatenate(
+          kernel_source,
+          get_template_definition(
+              lib_name,
+              "fp_gather_qmm_rhs_expert_nax",
+              get_type_string(x.dtype()),
+              group_size,
+              bits,
+              bm,
+              bn,
+              bk,
+              wm,
+              wn,
+              transpose,
+              0,
+              0,
+              true));
+    } else {
+      concatenate(
+          kernel_source,
+          get_template_definition(
+              lib_name,
+              (is_affine ? "affine" : "fp") +
+                  std::string(
+                      expert ? "_gather_qmm_rhs_expert_nax"
+                             : "_gather_qmm_rhs_nax"),
+              get_type_string(x.dtype()),
+              group_size,
+              bits,
+              bm,
+              bn,
+              bk,
+              wm,
+              wn,
+              transpose));
+    }
     return kernel_source;
   });
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);

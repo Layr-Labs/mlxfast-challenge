@@ -1287,6 +1287,15 @@ bool darkbloom_expert_aligned_gather() {
   return v;
 }
 
+// Default OFF. The Swift call site supplies an explicit LHS route-to-token
+// map only when this probe is enabled; the backend repeats the guard so an
+// unrelated both-index gather cannot enter the Laguna expert specialization.
+bool darkbloom_zerocopy_lhs() {
+  static const bool v =
+      env::get_var("DARKBLOOM_ZEROCOPY_LHS", "1") != "0";
+  return v;
+}
+
 // DARKBLOOM_STAGE_BM128: select the gather-GEMM m-tiling. NOT a function
 // constant -- it changes the template instantiation, so it is already in
 // `kname` (`_bm_`/`_wm_`/`_wn_`) and therefore in the library name and the
@@ -1446,6 +1455,7 @@ void gather_qmm_rhs_nax(
     const array& w_,
     const array& scales_,
     const std::optional<array>& biases_,
+    const array* lhs_indices_,
     const array& indices_,
     array& out,
     bool transpose,
@@ -1478,7 +1488,12 @@ void gather_qmm_rhs_nax(
   };
 
   // Normalize the input arrays
-  array x = broadcast_with_indices(x_);
+  const bool zero_copy_lhs =
+      lhs_indices_ != nullptr && darkbloom_zerocopy_lhs();
+  array x = zero_copy_lhs ? ensure_row_contiguous(x_, d, s)
+                          : broadcast_with_indices(x_);
+  array lhs_indices =
+      zero_copy_lhs ? ensure_row_contiguous(*lhs_indices_, d, s) : indices;
   array w = ensure_row_contiguous(w_, d, s);
   array scales = ensure_row_contiguous(scales_, d, s);
 
@@ -1504,6 +1519,25 @@ void gather_qmm_rhs_nax(
       darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
       group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
       align_N && align_K && bm == 64 && wm == 4 && wn == 2;
+  if (zero_copy_lhs && !expert_aligned) {
+    return gather_qmm(
+        x_,
+        w_,
+        scales_,
+        biases_,
+        *lhs_indices_,
+        indices_,
+        out,
+        transpose,
+        group_size,
+        bits,
+        x_.shape(-2),
+        N,
+        K,
+        d,
+        s,
+        mode);
+  }
   std::string type_string = get_type_string(x.dtype());
   static const bool static_laguna_shapes =
       env::get_var("DARKBLOOM_STATIC_NVFP4_SHAPES", "") != "0";
@@ -1518,9 +1552,13 @@ void gather_qmm_rhs_nax(
       kname,
       mode +
           (static_expert_shape
-               ? "_gather_qmm_rhs_expert_static_nax_nt_"
+               ? (zero_copy_lhs
+                      ? "_gather_qmm_rhs_expert_lhs_static_nax_nt_"
+                      : "_gather_qmm_rhs_expert_static_nax_nt_")
                : (expert_aligned
-                      ? "_gather_qmm_rhs_expert_nax_nt_"
+                      ? (zero_copy_lhs
+                             ? "_gather_qmm_rhs_expert_lhs_nax_nt_"
+                             : "_gather_qmm_rhs_expert_nax_nt_")
                : (transpose ? "_gather_qmm_rhs_nax_nt_"
                             : "_gather_qmm_rhs_nax_nn_"))),
       type_string,
@@ -1636,20 +1674,39 @@ void gather_qmm_rhs_nax(
   auto& compute_encoder = metal::get_command_encoder(s);
   MTL::ComputePipelineState* kernel;
   if (static_expert_shape) {
-    auto template_def = get_template_definition(
-        kname,
-        "fp_gather_qmm_rhs_expert_nax",
-        get_type_string(x.dtype()),
-        group_size,
-        bits,
-        bm,
-        bn,
-        bk,
-        wm,
-        wn,
-        transpose,
-        K,
-        N);
+    std::string template_def;
+    if (zero_copy_lhs) {
+      template_def = get_template_definition(
+          kname,
+          "fp_gather_qmm_rhs_expert_nax",
+          get_type_string(x.dtype()),
+          group_size,
+          bits,
+          bm,
+          bn,
+          bk,
+          wm,
+          wn,
+          transpose,
+          K,
+          N,
+          true);
+    } else {
+      template_def = get_template_definition(
+          kname,
+          "fp_gather_qmm_rhs_expert_nax",
+          get_type_string(x.dtype()),
+          group_size,
+          bits,
+          bm,
+          bn,
+          bk,
+          wm,
+          wn,
+          transpose,
+          K,
+          N);
+    }
     kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
   } else {
     kernel = get_gather_qmm_nax_kernel(
@@ -1685,6 +1742,12 @@ void gather_qmm_rhs_nax(
     compute_encoder.set_input_array(biases, c++);
   }
   compute_encoder.set_input_array(indices, c++);
+  if (expert_aligned) {
+    // The expert kernel has a stable ABI in both arms. Its default-off arm
+    // receives `indices` as an unused placeholder; the opt-in arm receives
+    // the independently normalized per-route LHS map.
+    compute_encoder.set_input_array(lhs_indices, c++);
+  }
   compute_encoder.set_output_array(out, c++);
   compute_encoder.set_bytes(M, c++);
   compute_encoder.set_bytes(N, c++);
@@ -1699,6 +1762,7 @@ void gather_qmm_rhs(
     const array& w_,
     const array& scales_,
     const std::optional<array>& biases_,
+    const array* lhs_indices_,
     const array& indices_,
     array& out,
     bool transpose,
@@ -1717,6 +1781,7 @@ void gather_qmm_rhs(
         /* const array& w_ = */ w_,
         /* const array& scales_ = */ scales_,
         /* const std::optional<array>& biases_ = */ biases_,
+        /* const array* lhs_indices_ = */ lhs_indices_,
         /* const array& indices_ = */ indices_,
         /* array& out = */ out,
         /* bool transpose = */ transpose,
@@ -1728,6 +1793,26 @@ void gather_qmm_rhs(
         /* metal::Device& d = */ d,
         /* const Stream& s = */ s,
         /* const std::string mode = */ mode);
+  }
+
+  if (lhs_indices_ != nullptr) {
+    return gather_qmm(
+        x_,
+        w_,
+        scales_,
+        biases_,
+        *lhs_indices_,
+        indices_,
+        out,
+        transpose,
+        group_size,
+        bits,
+        x_.shape(-2),
+        N,
+        K,
+        d,
+        s,
+        mode);
   }
 
   // Start by normalizing the indices
@@ -1959,6 +2044,36 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
 
+  // Opt-in Laguna zero-copy path. Both sorted-index flags are false when the
+  // public API receives explicit indices on both sides, so identify only the
+  // exact fused routed-prefill shape and require both feature guards. The
+  // generic both-index dispatch remains the fallback for every other shape.
+  const bool zero_copy_lhs =
+      darkbloom_zerocopy_lhs() && darkbloom_expert_aligned_gather() &&
+      M == 1 && B >= 64 && E == 256 && K == 2048 && N == 1024 &&
+      lhs_indices.size() == B && rhs_indices.size() == B &&
+      (x.size() / K) * 8 == B;
+  if (zero_copy_lhs) {
+    gather_qmm_rhs(
+        x,
+        w,
+        scales,
+        biases,
+        &lhs_indices,
+        rhs_indices,
+        out,
+        transpose_,
+        group_size_,
+        bits_,
+        B,
+        N,
+        K,
+        d,
+        s,
+        mode);
+    return;
+  }
+
   // We are walking x in order and w is also in order so we can batch up the
   // matmuls and reuse reading x and w.
   //
@@ -1969,6 +2084,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         w,
         scales,
         biases,
+        nullptr,
         rhs_indices,
         out,
         transpose_,
