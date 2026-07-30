@@ -294,8 +294,20 @@ inline U qdot(
   }
 
   else if (bits == 8) {
+    // One 8-byte load instead of eight byte loads; identical products in
+    // identical order (byte i of the lane's pack is extracted in lane order).
+    const uint2 packed = *(const device uint2*)w;
+    const thread U wv[8] = {
+        U(packed.x & 0xffu),
+        U((packed.x >> 8) & 0xffu),
+        U((packed.x >> 16) & 0xffu),
+        U((packed.x >> 24) & 0xffu),
+        U(packed.y & 0xffu),
+        U((packed.y >> 8) & 0xffu),
+        U((packed.y >> 16) & 0xffu),
+        U((packed.y >> 24) & 0xffu)};
     for (int i = 0; i < values_per_thread; i++) {
-      accum += x_thread[i] * w[i];
+      accum += x_thread[i] * wv[i];
     }
   }
 
