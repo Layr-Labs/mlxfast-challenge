@@ -2517,6 +2517,377 @@ func lagunaGateProductSoftplus(
     )[0]
 }
 
+/// Replaces the hidden-width gate-product intermediate on the native
+/// group-32 affine output path. The QKV bank already produces the 48/64 raw
+/// BF16 gate logits; a tiny kernel activates those logits once, then the
+/// output QMV forms each BF16-rounded attention/gate product in registers.
+/// Set `DARKBLOOM_NATIVE_AFFINE_GATED_OUTPUT_QMV=0` to ablate.
+private let lagunaNativeAffineRawGateOutputQMVEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NATIVE_AFFINE_GATED_OUTPUT_QMV"] != "0"
+
+/// Group-16 NVFP4 counterpart for the tail side layouts.
+/// Set `DARKBLOOM_NATIVE_NVFP4_GATED_OUTPUT_QMV=0` to ablate.
+private let lagunaNativeNVFP4RawGateOutputQMVEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NATIVE_NVFP4_GATED_OUTPUT_QMV"] != "0"
+
+private let lagunaNativeGateSoftplusKernels: [Int: MLXFast.MLXFastKernel] = {
+    Dictionary(
+        uniqueKeysWithValues: [
+            LagunaConstants.fullAttentionHeads,
+            LagunaConstants.slidingAttentionHeads,
+        ].map { heads in
+            (
+                heads,
+                MLXFast.metalKernel(
+                    name: "laguna_native_gate_softplus_bf16_h\(heads)_v1",
+                    inputNames: ["gate_logits"],
+                    outputNames: ["gate_values"],
+                    source: """
+                        uint gid = thread_position_in_grid.x;
+                        float logit = float(gate_logits[gid]);
+                        float gate;
+                        if (metal::isnan(logit)) {
+                            gate = NAN;
+                        } else {
+                            float maxval = metal::max(logit, 0.0f);
+                            float minval = metal::min(logit, 0.0f);
+                            gate = (metal::isinf(minval) || metal::isinf(maxval))
+                                ? maxval
+                                : maxval + log1p(metal::exp(minval - maxval));
+                        }
+                        gate_values[gid] = bfloat(gate);
+                        """,
+                    ensureRowContiguous: true
+                )
+            )
+        }
+    )
+}()
+
+func lagunaNativeGateSoftplus(
+    gateLogits: MLXArray, heads: Int
+) -> MLXArray {
+    guard let kernel = lagunaNativeGateSoftplusKernels[heads] else {
+        preconditionFailure("unsupported Laguna attention head count \(heads)")
+    }
+    precondition(gateLogits.dtype == .bfloat16)
+    precondition(gateLogits.shape == [1, 1, heads])
+
+    lagunaTrace("native gate softplus h\(heads)")
+    return kernel(
+        [gateLogits],
+        grid: (heads, 1, 1),
+        threadGroup: (heads, 1, 1),
+        outputShapes: [[1, 1, heads]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+private func lagunaNativeAffineGatedOutputQMVSource(heads: Int) -> String {
+    """
+    constexpr uint group_size = 32;
+    constexpr uint head_dim = 128;
+    constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
+    constexpr uint out_vec_size = 2048;
+    constexpr uint values_per_lane = 8;
+    constexpr uint block_size = 256;
+    constexpr uint results_per_simdgroup = 4;
+    constexpr uint simdgroups_per_group = 2;
+    constexpr uint groups_per_row = in_vec_size / group_size;
+
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint out_row =
+        threadgroup_position_in_grid.y *
+            (simdgroups_per_group * results_per_simdgroup) +
+        simd_group * results_per_simdgroup;
+
+    const device uint8_t* weight_bytes =
+        (const device uint8_t*)packed_codes;
+    thread float result[results_per_simdgroup] = {
+        0.0f, 0.0f, 0.0f, 0.0f
+    };
+    thread float coefficients[values_per_lane];
+
+    for (uint block = 0; block < in_vec_size; block += block_size) {
+        uint column = block + lane * values_per_lane;
+        uint head = column / head_dim;
+        bfloat rounded_gate = gate_values[head];
+
+        float coefficient_sum = 0.0f;
+        for (uint i = 0; i < values_per_lane; ++i) {
+            bfloat rounded = bfloat(
+                float(attention_output[column + i]) *
+                float(rounded_gate));
+            coefficients[i] = float(rounded);
+            coefficient_sum += coefficients[i];
+        }
+
+        for (uint row = 0; row < results_per_simdgroup; ++row) {
+            uint logical_row = out_row + row;
+            const device uint8_t* codes =
+                weight_bytes + logical_row * in_vec_size + column;
+            uint affine_index =
+                logical_row * groups_per_row + column / group_size;
+            float scale = float(scales[affine_index]);
+            float bias = float(biases[affine_index]);
+            float quantized_dot = 0.0f;
+            for (uint i = 0; i < values_per_lane; ++i) {
+                quantized_dot += coefficients[i] * codes[i];
+            }
+            result[row] +=
+                scale * quantized_dot + coefficient_sum * bias;
+        }
+    }
+
+    for (uint row = 0; row < results_per_simdgroup; ++row) {
+        result[row] = simd_sum(result[row]);
+        if (lane == 0) {
+            output[out_row + row] = bfloat(result[row]);
+        }
+    }
+    """
+}
+
+private let lagunaNativeAffineGatedOutputQMVKernels:
+    [Int: MLXFast.MLXFastKernel] = {
+    Dictionary(
+        uniqueKeysWithValues: [
+            LagunaConstants.fullAttentionHeads,
+            LagunaConstants.slidingAttentionHeads,
+        ].map { heads in
+            (
+                heads,
+                MLXFast.metalKernel(
+                    name: "laguna_native_affine_gated_output_qmv_bf16_h\(heads)_v4",
+                    inputNames: [
+                        "attention_output", "gate_values", "packed_codes",
+                        "scales", "biases",
+                    ],
+                    outputNames: ["output"],
+                    source: lagunaNativeAffineGatedOutputQMVSource(heads: heads),
+                    ensureRowContiguous: true
+                )
+            )
+        }
+    )
+}()
+
+func lagunaNativeAffineGatedOutputQMV(
+    attentionOutput: MLXArray,
+    gateValues: MLXArray,
+    packedCodes: MLXArray,
+    scales: MLXArray,
+    biases: MLXArray,
+    heads: Int
+) -> MLXArray {
+    guard let kernel = lagunaNativeAffineGatedOutputQMVKernels[heads] else {
+        preconditionFailure("unsupported Laguna attention head count \(heads)")
+    }
+    let width = heads * LagunaConstants.headDim
+    precondition(attentionOutput.dtype == .bfloat16)
+    precondition(attentionOutput.shape == [1, 1, width])
+    precondition(gateValues.dtype == .bfloat16)
+    precondition(gateValues.shape == [1, 1, heads])
+    precondition(packedCodes.dtype == .uint32)
+    precondition(
+        packedCodes.shape == [
+            LagunaConstants.hiddenSize, width / MemoryLayout<UInt32>.size,
+        ])
+    precondition(scales.dtype == .bfloat16)
+    precondition(
+        scales.shape == [LagunaConstants.hiddenSize, width / 32])
+    precondition(biases.dtype == .bfloat16)
+    precondition(biases.shape == scales.shape)
+
+    lagunaTrace("native affine gate+output qmv h\(heads)")
+    return kernel(
+        [attentionOutput, gateValues, packedCodes, scales, biases],
+        grid: (64, LagunaConstants.hiddenSize / 8, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+func lagunaNativeAffineRawGateOutputQMV(
+    attentionOutput: MLXArray,
+    gateLogits: MLXArray,
+    packedCodes: MLXArray,
+    scales: MLXArray,
+    biases: MLXArray,
+    heads: Int
+) -> MLXArray {
+    lagunaNativeAffineGatedOutputQMV(
+        attentionOutput: attentionOutput,
+        gateValues: lagunaNativeGateSoftplus(
+            gateLogits: gateLogits, heads: heads),
+        packedCodes: packedCodes,
+        scales: scales,
+        biases: biases,
+        heads: heads
+    )
+}
+
+private let lagunaNativeNVFP4GatedOutputQMVKernels:
+    [Int: MLXFast.MLXFastKernel] = {
+    Dictionary(
+        uniqueKeysWithValues: [
+            LagunaConstants.fullAttentionHeads,
+            LagunaConstants.slidingAttentionHeads,
+        ].map { heads in
+            (
+                heads,
+                MLXFast.metalKernel(
+                    name: "laguna_native_nvfp4_gated_output_qmv_bf16_h\(heads)_v2",
+                    inputNames: [
+                        "attention_output", "gate_values", "packed_codes",
+                        "scales",
+                    ],
+                    outputNames: ["output"],
+                    source: """
+                        constexpr uint head_dim = 128;
+                        constexpr uint in_vec_size =
+                            \(heads * LagunaConstants.headDim);
+                        constexpr uint values_per_lane = 16;
+                        constexpr uint block_size = 512;
+                        constexpr uint results_per_simdgroup = 4;
+                        constexpr uint simdgroups_per_group = 2;
+                        constexpr uint packed_row_bytes = in_vec_size / 2;
+                        constexpr uint scale_row_bytes = in_vec_size / 16;
+
+                        uint simd_group =
+                            simdgroup_index_in_threadgroup;
+                        uint lane = thread_index_in_simdgroup;
+                        uint out_row =
+                            threadgroup_position_in_grid.y *
+                                (simdgroups_per_group *
+                                    results_per_simdgroup) +
+                            simd_group * results_per_simdgroup;
+
+                        const device uint8_t* weight_bytes =
+                            (const device uint8_t*)packed_codes;
+                        thread float result[results_per_simdgroup] = {
+                            0.0f, 0.0f, 0.0f, 0.0f
+                        };
+                        thread float coefficients[values_per_lane];
+
+                        for (uint block = 0; block < in_vec_size;
+                             block += block_size) {
+                            uint column =
+                                block + lane * values_per_lane;
+                            uint head = column / head_dim;
+                            bfloat rounded_gate = gate_values[head];
+
+                            const device vec<bfloat, 4>* input_vectors =
+                                (const device vec<bfloat, 4>*)(
+                                    attention_output + column);
+                            for (uint i = 0;
+                                 i < values_per_lane / 4; ++i) {
+                                const vec<bfloat, 4> values =
+                                    input_vectors[i];
+                                coefficients[4 * i] = float(bfloat(
+                                    float(values[0]) *
+                                    float(rounded_gate)));
+                                coefficients[4 * i + 1] = float(bfloat(
+                                    float(values[1]) *
+                                    float(rounded_gate)));
+                                coefficients[4 * i + 2] = float(bfloat(
+                                    float(values[2]) *
+                                    float(rounded_gate)));
+                                coefficients[4 * i + 3] = float(bfloat(
+                                    float(values[3]) *
+                                    float(rounded_gate)));
+                            }
+
+                            for (uint row = 0;
+                                 row < results_per_simdgroup; ++row) {
+                                uint logical_row = out_row + row;
+                                const device uint8_t* codes =
+                                    weight_bytes
+                                    + logical_row * packed_row_bytes
+                                    + column / 2;
+                                const device uint8_t* scale =
+                                    scales
+                                    + logical_row * scale_row_bytes
+                                    + column / 16;
+                                result[row] += laguna_nvfp4_qdot_16(
+                                    codes,
+                                    coefficients,
+                                    laguna_nvfp4_scale(scale[0]));
+                            }
+                        }
+
+                        for (uint row = 0;
+                             row < results_per_simdgroup; ++row) {
+                            result[row] = simd_sum(result[row]);
+                            if (lane == 0) {
+                                output[out_row + row] =
+                                    bfloat(result[row]);
+                            }
+                        }
+                        """,
+                    header: lagunaSharedSwiGLUQMVHeader,
+                    ensureRowContiguous: true
+                )
+            )
+        }
+    )
+}()
+
+func lagunaNativeNVFP4GatedOutputQMV(
+    attentionOutput: MLXArray,
+    gateValues: MLXArray,
+    packedCodes: MLXArray,
+    scales: MLXArray,
+    heads: Int
+) -> MLXArray {
+    guard let kernel = lagunaNativeNVFP4GatedOutputQMVKernels[heads] else {
+        preconditionFailure("unsupported Laguna attention head count \(heads)")
+    }
+    let width = heads * LagunaConstants.headDim
+    precondition(attentionOutput.dtype == .bfloat16)
+    precondition(attentionOutput.shape == [1, 1, width])
+    precondition(gateValues.dtype == .bfloat16)
+    precondition(gateValues.shape == [1, 1, heads])
+    precondition(packedCodes.dtype == .uint32)
+    precondition(
+        packedCodes.shape == [
+            LagunaConstants.hiddenSize, width / 8,
+        ])
+    precondition(scales.dtype == .uint8)
+    precondition(
+        scales.shape == [LagunaConstants.hiddenSize, width / 16])
+
+    lagunaTrace("native NVFP4 gate+output qmv h\(heads)")
+    return kernel(
+        [attentionOutput, gateValues, packedCodes, scales],
+        grid: (64, LagunaConstants.hiddenSize / 8, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+func lagunaNativeNVFP4RawGateOutputQMV(
+    attentionOutput: MLXArray,
+    gateLogits: MLXArray,
+    packedCodes: MLXArray,
+    scales: MLXArray,
+    heads: Int
+) -> MLXArray {
+    lagunaNativeNVFP4GatedOutputQMV(
+        attentionOutput: attentionOutput,
+        gateValues: lagunaNativeGateSoftplus(
+            gateLogits: gateLogits, heads: heads),
+        packedCodes: packedCodes,
+        scales: scales,
+        heads: heads
+    )
+}
+
 /// Keep the stock shapeless unary gate for prefill. Ranked measurement showed
 /// the larger gate/product graph regressing the complete prefill schedule even
 /// though its isolated steady-state subpath was slightly faster.
@@ -3102,6 +3473,52 @@ final class LagunaRuntimeAttention: Module {
                 output.shape == [1, 1, nHeads * headDim],
                 projectedGate.shape == [1, 1, nHeads]
             {
+                if lagunaNativeAffineRawGateOutputQMVEnabled,
+                    affineWO.mode == .affine,
+                    affineWO.groupSize == 32,
+                    affineWO.bits == 8,
+                    let biases = affineWO.biases
+                {
+                    return gateIsActivated
+                        ? lagunaNativeAffineGatedOutputQMV(
+                            attentionOutput: output,
+                            gateValues: projectedGate,
+                            packedCodes: affineWO.packedCodes,
+                            scales: affineWO.scales,
+                            biases: biases,
+                            heads: nHeads
+                        )
+                        : lagunaNativeAffineRawGateOutputQMV(
+                            attentionOutput: output,
+                            gateLogits: projectedGate,
+                            packedCodes: affineWO.packedCodes,
+                            scales: affineWO.scales,
+                            biases: biases,
+                            heads: nHeads
+                        )
+                }
+                if lagunaNativeNVFP4RawGateOutputQMVEnabled,
+                    affineWO.mode == .nvfp4,
+                    affineWO.groupSize == 16,
+                    affineWO.bits == 4,
+                    affineWO.biases == nil
+                {
+                    return gateIsActivated
+                        ? lagunaNativeNVFP4GatedOutputQMV(
+                            attentionOutput: output,
+                            gateValues: projectedGate,
+                            packedCodes: affineWO.packedCodes,
+                            scales: affineWO.scales,
+                            heads: nHeads
+                        )
+                        : lagunaNativeNVFP4RawGateOutputQMV(
+                            attentionOutput: output,
+                            gateLogits: projectedGate,
+                            packedCodes: affineWO.packedCodes,
+                            scales: affineWO.scales,
+                            heads: nHeads
+                        )
+                }
                 // Raw logits + fused kernel: one dispatch reproduces the
                 // softplus chain AND the broadcast product bit-exactly (see
                 // `lagunaGateProductSoftplusSource`). Falls back to the stock
