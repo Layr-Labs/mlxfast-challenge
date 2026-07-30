@@ -776,6 +776,510 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 }
 
+// MARK: - Combined-KV caches (Laguna decode)
+
+/// A cache whose K and V rows live in ONE array of shape `[2, B, H, S, D]`, so
+/// a decode step can write both halves with a SINGLE `slice_update` dispatch
+/// instead of the two the stock caches issue.
+///
+/// The Laguna decode path produces its normalized+roped K row and its raw V row
+/// from one fused Metal kernel, which emits them already stacked as
+/// `[2, 1, H, 1, D]`. `updateCombined` consumes that array directly; the
+/// `KVCache.update(keys:values:)` conformance stays available (and
+/// dispatch-count-neutral) for prefill and for every guard-miss fallback.
+public protocol LagunaCombinedKVCache: KVCache {
+    /// Append `kv` (`[2, B, H, T, D]`) and return the `(keys, values)` views the
+    /// attention call consumes.
+    func updateCombined(kv: MLXArray) -> (MLXArray, MLXArray)
+}
+
+/// Recover the K and V halves of a `[2, B, H, S, D]` combined buffer as
+/// ZERO-COPY views with exactly the shape and strides the stock separate
+/// `[B, H, S, D]` cache arrays carry.
+///
+/// The range-slice-then-squeeze form is load bearing. `combined[0]` (an integer
+/// index) lowers to `take`/Gather and materializes a FULL COPY of the half on
+/// every layer of every decode step; `combined[0 ..< 1]` lowers to `mlx_slice`,
+/// which for a leading-axis unit slice of a contiguous array is a shared-buffer
+/// view, and `squeezed(axis: 0)` is a reshape of a contiguous array, likewise a
+/// shared-buffer view. Both halves therefore come out row-contiguous with the
+/// stock strides, so SDPA's shape/stride kernel-selection predicates pick the
+/// same kernel with the same accumulation order.
+@inline(__always)
+private func lagunaCombinedKVParts(_ combined: MLXArray) -> (MLXArray, MLXArray) {
+    (
+        combined[0 ..< 1].squeezed(axis: 0),
+        combined[1 ..< 2].squeezed(axis: 0)
+    )
+}
+
+/// Combined-storage twin of ``KVCacheSimple`` for Laguna's full-attention
+/// layers.
+///
+/// Every growth boundary, returned slice, mask and trim decision is copied from
+/// `KVCacheSimple` verbatim; the ONLY change is that keys and values share one
+/// `[2, B, H, S, D]` buffer whose sequence axis is 3 instead of 2. Two separate
+/// classes (rather than a mutation of the stock ones) keep every other vendored
+/// model, test and serialization path on the untouched implementations.
+public final class LagunaFusedKVCache: BaseKVCache, LagunaCombinedKVCache,
+    CustomDebugStringConvertible
+{
+    /// `[2, B, H, S, D]` — index 0 is K, index 1 is V.
+    internal var kv: MLXArray?
+    public var step = 256
+
+    public override init() {
+        super.init()
+    }
+
+    public override func innerState() -> [MLXArray] {
+        [self.kv].compactMap { $0 }
+    }
+
+    /// Allocation and growth, lifted verbatim from `KVCacheSimple.update`
+    /// (only the sequence axis moves from 2 to 3 and one combined allocation
+    /// replaces the separate K/V pair).
+    private func growIfNeeded(
+        previous: Int, tokenCount: Int, batch: Int, heads: Int, headDim: Int, dtype: DType
+    ) {
+        let reset =
+            if let current = self.kv, (previous + tokenCount) > current.dim(3) {
+                true
+            } else {
+                self.kv == nil
+            }
+        guard reset else { return }
+
+        let nSteps = (step + tokenCount - 1) / step
+        let newKV = MLXArray.zeros([2, batch, heads, nSteps * step, headDim], dtype: dtype)
+
+        if var current = self.kv {
+            if previous % step != 0 {
+                current = current[.ellipsis, ..<previous, 0...]
+            }
+            self.kv = concatenated([current, newKV], axis: 3)
+        } else {
+            self.kv = newKV
+        }
+    }
+
+    private func currentParts() -> (MLXArray, MLXArray) {
+        let (keys, values) = lagunaCombinedKVParts(self.kv!)
+        return (
+            keys[.ellipsis, ..<self.offset, 0...],
+            values[.ellipsis, ..<self.offset, 0...]
+        )
+    }
+
+    /// Single-`slice_update` append of a pre-stacked `[2, B, H, T, D]` block.
+    public func updateCombined(kv incoming: MLXArray) -> (MLXArray, MLXArray) {
+        precondition(incoming.ndim == 5, "combined KV must be [2, B, H, T, D]")
+        precondition(incoming.dim(0) == 2, "combined KV must lead with the K/V axis")
+        let previous = self.offset
+        let tokenCount = incoming.dim(3)
+
+        // `KVCacheSimple`'s no-slack prefill fast path: when the first update
+        // already lands exactly on an allocation-step boundary the stock zero
+        // allocation has no spare capacity, so retain the incoming block
+        // directly. Shapes, offsets, returned values and the next growth
+        // boundary are identical.
+        if self.kv == nil, previous == 0, tokenCount > 0, tokenCount.isMultiple(of: step) {
+            self.kv = incoming
+            self.offset = tokenCount
+            return lagunaCombinedKVParts(incoming)
+        }
+
+        growIfNeeded(
+            previous: previous,
+            tokenCount: tokenCount,
+            batch: incoming.dim(1),
+            heads: incoming.dim(2),
+            headDim: incoming.dim(4),
+            dtype: incoming.dtype
+        )
+
+        self.offset += tokenCount
+        self.kv![.ellipsis, previous ..< self.offset, 0...] = incoming
+        return currentParts()
+    }
+
+    /// `KVCache` conformance for prefill and every guard-miss fallback. Two
+    /// slice updates into the combined buffer: exactly the stock dispatch
+    /// count, just into one allocation.
+    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        precondition(
+            keys.dim(3) == values.dim(3),
+            "combined KV storage requires matching key/value head dims")
+        let previous = self.offset
+        let tokenCount = keys.dim(2)
+
+        if self.kv == nil, previous == 0, tokenCount > 0, tokenCount.isMultiple(of: step) {
+            let combined = stacked([keys, values], axis: 0)
+            self.kv = combined
+            self.offset = tokenCount
+            return lagunaCombinedKVParts(combined)
+        }
+
+        growIfNeeded(
+            previous: previous,
+            tokenCount: tokenCount,
+            batch: keys.dim(0),
+            heads: keys.dim(1),
+            headDim: keys.dim(3),
+            dtype: keys.dtype
+        )
+
+        self.offset += tokenCount
+        self.kv![0 ..< 1, .ellipsis, previous ..< self.offset, 0...] = keys
+        self.kv![1 ..< 2, .ellipsis, previous ..< self.offset, 0...] = values
+        return currentParts()
+    }
+
+    public override var state: [MLXArray] {
+        get {
+            guard let kv = self.kv else { return [] }
+            let (keys, values) = lagunaCombinedKVParts(kv)
+            if offset == kv.dim(3) {
+                return [keys, values]
+            } else {
+                return [
+                    keys[.ellipsis, ..<offset, 0...],
+                    values[.ellipsis, ..<offset, 0...],
+                ]
+            }
+        }
+        set {
+            guard newValue.count == 2 else {
+                fatalError("LagunaFusedKVCache state must have exactly 2 arrays (keys, values)")
+            }
+            self.kv = stacked([newValue[0], newValue[1]], axis: 0)
+            self.offset = self.kv!.dim(3)
+        }
+    }
+
+    public override var isTrimmable: Bool { true }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        let trimmed = min(offset, n)
+        offset -= trimmed
+        return trimmed
+    }
+
+    public override func copy() -> any KVCache {
+        let new = LagunaFusedKVCache()
+        new.step = self.step
+        let s = self.state
+        if !s.isEmpty {
+            new.state = s.map { $0[.ellipsis] }
+        }
+        return new
+    }
+
+    public var debugDescription: String {
+        "\(String(describing: Self.self)) \(Unmanaged.passUnretained(self).toOpaque()), offset: \(offset), step: \(step), kv: \(kv?.shape.description ?? "-")"
+    }
+}
+
+/// Combined-storage twin of ``RotatingKVCache`` for Laguna's sliding-window
+/// layers.
+///
+/// `keep`, `idx`, `temporalOrder`, the trim/rotate schedule, `makeMask` and the
+/// `metaState` encoding are copied verbatim from `RotatingKVCache`; only the
+/// storage collapses into one `[2, B, H, S, D]` buffer with sequence axis 3.
+public final class LagunaFusedRotatingKVCache: BaseKVCache, LagunaCombinedKVCache,
+    CustomDebugStringConvertible
+{
+    var keep: Int
+    /// `[2, B, H, S, D]` — index 0 is K, index 1 is V.
+    internal var kv: MLXArray?
+    var maxCacheSize: Int
+    var step: Int
+    var idx: Int = 0
+
+    public override var maxSize: Int? { maxCacheSize }
+
+    public init(maxSize: Int, keep: Int = 0, step: Int = 256) {
+        self.maxCacheSize = maxSize
+        self.keep = keep
+        self.step = step
+        super.init()
+    }
+
+    public override func innerState() -> [MLXArray] {
+        [self.kv].compactMap { $0 }
+    }
+
+    private func trim(trimSize: Int, _ array: MLXArray, append: MLXArray? = nil) -> MLXArray {
+        var toCat: [MLXArray] = []
+        if trimSize > 0 {
+            toCat = [
+                array[.ellipsis, ..<keep, 0...],
+                array[.ellipsis, (trimSize + keep)..., 0...],
+            ]
+        } else {
+            toCat = [array]
+        }
+        if let append {
+            toCat.append(append)
+        }
+        return concatenated(toCat, axis: 3)
+    }
+
+    private func temporalOrder(_ array: MLXArray) -> MLXArray {
+        // Rearrange the cache into temporal order, slicing off the end if unused
+        if idx == array.dim(3) {
+            return array
+        } else if idx < offset {
+            return concatenated(
+                [
+                    array[.ellipsis, ..<keep, 0...],
+                    array[.ellipsis, idx..., 0...],
+                    array[.ellipsis, keep ..< idx, 0...],
+                ], axis: 3)
+        } else {
+            return array[.ellipsis, ..<idx, 0...]
+        }
+    }
+
+    private func updateConcat(_ incoming: MLXArray) -> (MLXArray, MLXArray) {
+        if self.kv == nil {
+            self.kv = incoming
+        } else {
+            // Put the keys/values in temporal order to preserve context
+            self.kv = temporalOrder(self.kv!)
+            idx = self.kv!.dim(3)
+
+            // Allow temporary cache growth during multi-token processing (e.g.
+            // prompt prefill). The largest size is maxCacheSize + S - 1 to
+            // ensure every token gets at least maxCacheSize context.
+            let trimSize = idx - maxCacheSize + 1
+            self.kv = trim(trimSize: trimSize, self.kv!, append: incoming)
+        }
+
+        offset += incoming.dim(3)
+        idx = self.kv!.dim(3)
+
+        return lagunaCombinedKVParts(self.kv!)
+    }
+
+    /// Allocation, trim and rotation, lifted verbatim from
+    /// `RotatingKVCache.updateInPlace` up to (not including) the assignment.
+    /// Leaves `idx` pointing at the row the caller must write.
+    private func prepareInPlace(batch: Int, heads: Int, headDim: Int, dtype: DType) {
+        let prev = offset
+        var cacheLength = self.kv?.dim(3)
+
+        // May not have hit the max size yet, so potentially keep growing the cache
+        if cacheLength == nil || (prev >= cacheLength! && cacheLength! < maxCacheSize) {
+            let newSize = min(step, maxCacheSize - prev)
+            let newKV = MLXArray.zeros([2, batch, heads, newSize, headDim], dtype: dtype)
+
+            if let current = self.kv {
+                self.kv = concatenated([current, newKV], axis: 3)
+            } else {
+                self.kv = newKV
+            }
+            cacheLength = self.kv!.dim(3)
+            idx = prev
+        }
+
+        // Trim if needed
+        let trimSize = cacheLength! - maxCacheSize
+        if trimSize > 0 {
+            self.kv = trim(trimSize: trimSize, self.kv!)
+            idx = maxCacheSize
+        }
+
+        // Rotate if we've hit the end
+        if idx == maxCacheSize {
+            idx = keep
+        }
+    }
+
+    private func inPlaceResult() -> (MLXArray, MLXArray) {
+        let (keys, values) = lagunaCombinedKVParts(self.kv!)
+        // Return the appropriate cache slice
+        if offset < maxCacheSize {
+            return (
+                keys[.ellipsis, ..<offset, 0...],
+                values[.ellipsis, ..<offset, 0...]
+            )
+        }
+        return (keys, values)
+    }
+
+    /// Single-`slice_update` append of a pre-stacked `[2, B, H, T, D]` block.
+    public func updateCombined(kv incoming: MLXArray) -> (MLXArray, MLXArray) {
+        precondition(incoming.ndim == 5, "combined KV must be [2, B, H, T, D]")
+        precondition(incoming.dim(0) == 2, "combined KV must lead with the K/V axis")
+        let tokenCount = incoming.dim(3)
+        guard tokenCount == 1 else {
+            return updateConcat(incoming)
+        }
+
+        prepareInPlace(
+            batch: incoming.dim(1),
+            heads: incoming.dim(2),
+            headDim: incoming.dim(4),
+            dtype: incoming.dtype
+        )
+
+        self.kv![.ellipsis, idx ..< (idx + tokenCount), 0...] = incoming
+        offset += tokenCount
+        idx += tokenCount
+
+        return inPlaceResult()
+    }
+
+    /// `KVCache` conformance for prefill and every guard-miss fallback. Two
+    /// slice updates into the combined buffer: exactly the stock dispatch
+    /// count, just into one allocation.
+    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        precondition(
+            keys.dim(3) == values.dim(3),
+            "combined KV storage requires matching key/value head dims")
+        let tokenCount = keys.dim(2)
+        guard tokenCount == 1 else {
+            return updateConcat(stacked([keys, values], axis: 0))
+        }
+
+        prepareInPlace(
+            batch: keys.dim(0),
+            heads: keys.dim(1),
+            headDim: keys.dim(3),
+            dtype: keys.dtype
+        )
+
+        self.kv![0 ..< 1, .ellipsis, idx ..< (idx + tokenCount), 0...] = keys
+        self.kv![1 ..< 2, .ellipsis, idx ..< (idx + tokenCount), 0...] = values
+        offset += tokenCount
+        idx += tokenCount
+
+        return inPlaceResult()
+    }
+
+    public override var state: [MLXArray] {
+        get {
+            guard let kv = self.kv else { return [] }
+            let (keys, values) = lagunaCombinedKVParts(kv)
+            if offset < kv.dim(3) {
+                return [
+                    keys[.ellipsis, ..<offset, 0...],
+                    values[.ellipsis, ..<offset, 0...],
+                ]
+            } else {
+                return [keys, values]
+            }
+        }
+        set {
+            guard newValue.count == 2 else {
+                fatalError("LagunaFusedRotatingKVCache state must have exactly 2 arrays")
+            }
+            // Note: like RotatingKVCache this does NOT set offset from the
+            // state; the offset is managed through metaState.
+            self.kv = stacked([newValue[0], newValue[1]], axis: 0)
+        }
+    }
+
+    public override var metaState: [String] {
+        get {
+            return [String(keep), String(maxCacheSize), String(step), String(offset), String(idx)]
+        }
+        set {
+            guard newValue.count == 5 else {
+                fatalError("LagunaFusedRotatingKVCache metaState must have exactly 5 values")
+            }
+            guard let keepVal = Int(newValue[0]),
+                let stepVal = Int(newValue[2]),
+                let offsetVal = Int(newValue[3]),
+                let idxVal = Int(newValue[4])
+            else {
+                fatalError("Failed to convert metaState values to integers")
+            }
+            if newValue[1] == "None" {
+                fatalError(
+                    "LagunaFusedRotatingKVCache requires a non-nil maxSize. Cannot load cache with maxSize=None."
+                )
+            }
+            guard let maxSizeVal = Int(newValue[1]) else {
+                fatalError("Failed to convert maxCacheSize '\(newValue[1])' to integer")
+            }
+            self.keep = keepVal
+            self.maxCacheSize = maxSizeVal
+            self.step = stepVal
+            self.offset = offsetVal
+            self.idx = idxVal
+        }
+    }
+
+    public override var isTrimmable: Bool {
+        return offset < maxCacheSize
+    }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        let trimmed = min(offset, n)
+        offset -= trimmed
+        idx -= trimmed
+        return trimmed
+    }
+
+    /// Optimized mask creation for rotating cache with offset capping
+    public override func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if n > 1 {
+            // Multi-token case
+            let actualWindowSize = windowSize ?? maxCacheSize
+            let cappedOffset = min(maxCacheSize - 1, offset)
+
+            // Decide if we need an array mask
+            if cappedOffset + n > actualWindowSize || returnArray {
+                return .array(
+                    createCausalMask(n: n, offset: cappedOffset, windowSize: actualWindowSize))
+            }
+            return .causal
+        } else {
+            // Single token case (n == 1)
+            guard let windowSize = windowSize else {
+                return .none
+            }
+
+            // May need a mask when window_size < max_size and cache has wrapped
+            if offset >= windowSize, maxCacheSize > windowSize {
+                var currentIdx = idx
+                if currentIdx >= maxCacheSize {
+                    currentIdx = 0
+                }
+
+                let maskSize = offset < maxCacheSize ? offset + 1 : maxCacheSize
+                let mask = MLXArray(0 ..< Int32(maskSize)) .>= Int32(maskSize - windowSize)
+
+                // Roll the mask to account for rotation
+                let rolledMask = roll(mask, shift: currentIdx + 1)
+
+                return .array(rolledMask)
+            }
+            return .none
+        }
+    }
+
+    public override func copy() -> any KVCache {
+        let new = LagunaFusedRotatingKVCache(maxSize: maxCacheSize, keep: keep, step: step)
+        let s = self.state
+        if !s.isEmpty {
+            new.state = s.map { $0[.ellipsis] }
+        }
+        new.metaState = self.metaState
+        return new
+    }
+
+    public var debugDescription: String {
+        "\(String(describing: Self.self)) offset: \(offset), maxSize: \(maxCacheSize.description), keep: \(keep), idx: \(idx)"
+    }
+}
+
 /// Pick the supported quantization group size ({32, 64, 128}) closest to the
 /// requested one whose value divides both head dims. Returns nil when no
 /// supported group size is compatible. Upstream 01b8624.
