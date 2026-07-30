@@ -1527,15 +1527,21 @@ struct LagunaNativeAffineWeight {
 }
 
 /// REAL (not simulated) NVFP4 side layout for layers `>= N`
-/// (`DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM`, default 32 — the tail window whose
-/// per-layer amplification is ~15x below the early layers), using the same
-/// group-16 4-bit NVFP4 the routed experts already ship. Set
-/// `DARKBLOOM_NATIVE_AFFINE_NVFP4=0` to keep every native affine layout
-/// group-32 affine INT8 exactly as previously shipped.
+/// (`DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM`, default 28 — widened from 32 in a
+/// band-safe chunk so layers 28..31 join the NVFP4 tail; deeper early-layer
+/// amplification is still avoided). Uses the same group-16 4-bit NVFP4 the
+/// routed experts already ship. Set `DARKBLOOM_NATIVE_AFFINE_NVFP4=0` to keep
+/// every native affine layout group-32 affine INT8, or
+/// `DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM=32` for the prior prefix.
 private let lagunaNativeAffineNVFP4From: Int? = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_NVFP4"] != "0"
     else { return nil }
-    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM"] ?? "32"
+    // Default 28: widened from the original 32-layer INT8 prefix in a
+    // band-safe chunk (layers 28..31 join the NVFP4 tail). M3 Ultra warmed
+    // ABBA vs 32: ~3% decode s/token reduction with flat prefill; 24 is a
+    // larger ~4.5-5% step reserved for a follow-up. Set
+    // `DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM=32` to restore the prior prefix.
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_NVFP4_FROM"] ?? "28"
     guard let value = Int(raw), value < LagunaConstants.numHiddenLayers else { return nil }
     return min(max(value, 0), LagunaConstants.numHiddenLayers)
 }()
