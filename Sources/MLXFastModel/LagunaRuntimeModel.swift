@@ -439,6 +439,82 @@ private func lagunaNativeAffineGProjWeight(_ weight: MLXArray) -> LagunaNativeAf
     )
 }
 
+/// KV-cache INT8 perturbation probe (KIVI-class, anupsv's depth-decay
+/// methodology). The KV cache is the largest remaining BF16 decode read on
+/// the frontier (experts are NVFP4, attention QKV/o_proj are affine-INT8; KV
+/// is still BF16). This PROBE measures the argmax cost of per-token INT8
+/// KV quantization WITHOUT the bandwidth saving: it round-trips the new K/V
+/// row through INT8 (quantize→dequantize) right before the cache append, so
+/// the cache stores perturbed BF16 and every subsequent SDPA read sees the
+/// INT8 perturbation. Per-token (each row scaled by its own absmax) is an
+/// UPPER BOUND on KIVI's per-channel-K / per-token-V scheme, so a sub-noise
+/// probe means the real scheme is safer.
+///
+/// RESULT-CHANGING. Gated per-layer tail (the deepest layers first, where
+/// anupsv's per-layer amplification study shows argmax perturbation decays
+/// ~exponentially with depth). `DARKBLOOM_KV_INT8_PROBE=1` + `_LAYERS=N`
+/// (default 0 = OFF = exact shipped baseline). The probe stores BF16 (no
+/// bandwidth win); a positive result justifies the real quantized-rotating-
+/// cache implementation that reuses MLX's `quantizedScaledDotProductAttention`.
+private let lagunaKVInt8ProbeLayerCount: Int = {
+    guard ProcessInfo.processInfo.environment["DARKBLOOM_KV_INT8_PROBE"] == "1"
+    else { return 0 }
+    let requested = Int(
+        ProcessInfo.processInfo.environment["DARKBLOOM_KV_INT8_PROBE_LAYERS"]
+            ?? "1") ?? 1
+    return min(max(requested, 0), LagunaConstants.numHiddenLayers)
+}()
+
+private func lagunaKVInt8ProbeActive(layer: Int) -> Bool {
+    guard lagunaKVInt8ProbeLayerCount > 0 else { return false }
+    return layer >= LagunaConstants.numHiddenLayers - lagunaKVInt8ProbeLayerCount
+}
+
+/// Per-token INT8 quantize→dequantize round-trip (upper-bound KIVI probe).
+/// `x` is `[B, nKVHeads, L, headDim]` BF16; returns BF16 with each
+/// `[B, nKVHeads, L, :]` slice rounded through symmetric INT8 by its own
+/// per-row absmax. Bit-exact to a per-token INT8 KV quant with zero point 0.
+private func lagunaKVInt8RoundTrip(_ x: MLXArray) -> MLXArray {
+    // per-row absmax over headDim: [B, nKVHeads, L, 1]
+    let absmax = max(abs(x), axis: -1, keepDims: true)
+    let scale = absmax / 127.0  // float32 broadcast
+    // quantize→dequantize, staying in float then rounding back to BF16 at the
+    // same boundary a real INT8 KV path would (the dequantized value's BF16
+    // store). Guard scale==0 (all-zero row) to avoid div-by-zero.
+    let safeScale = maximum(scale, MLXArray(1e-30, dtype: .float32))
+    let quantized = round(x.asType(.float32) / safeScale)
+    let dequant = quantized * safeScale
+    return dequant.asType(.bfloat16)
+}
+
+/// Real KV-cache INT8 quantization (the bandwidth win). Uses the new
+/// `QuantizedRotatingKVCache` for the sliding layers in the tail-N range, so
+/// the SDPA reads INT8 K/V directly via `quantizedScaledDotProductAttention`
+/// (halving the decode K/V read bandwidth). Independent of the
+/// `DARKBLOOM_KV_INT8_PROBE` measurement probe: this is the production path.
+///
+/// RESULT-CHANGING (per-token INT8 KV quantization). The probe established the
+/// gate-safe frontier at tail-16 (bit-identical to baseline over 64 free-run
+/// steps); this real path uses MLX's group quantization, which is at least as
+/// accurate as the probe's per-token absmax round-trip. Gated per-layer tail
+/// (deepest layers first). `DARKBLOOM_KV_INT8=1` + `_LAYERS=N` (default 0 =
+/// OFF = exact shipped `RotatingKVCache` baseline). Applies to sliding layers
+/// only; full-attention layers keep `StandardKVCache` (their quantization is a
+/// separate, smaller follow-up).
+private let lagunaKVInt8LayerCount: Int = {
+    guard ProcessInfo.processInfo.environment["DARKBLOOM_KV_INT8"] == "1"
+    else { return 0 }
+    let requested = Int(
+        ProcessInfo.processInfo.environment["DARKBLOOM_KV_INT8_LAYERS"]
+            ?? "1") ?? 1
+    return min(max(requested, 0), LagunaConstants.numHiddenLayers)
+}()
+
+private func lagunaKVInt8Active(layer: Int) -> Bool {
+    guard lagunaKVInt8LayerCount > 0 else { return false }
+    return layer >= LagunaConstants.numHiddenLayers - lagunaKVInt8LayerCount
+}
+
 /// Sliding-layer per-head RMSNorm + plain RoPE fusion (see
 /// `lagunaSlidingQKNormRoPEKernel`).
 ///
@@ -3361,6 +3437,19 @@ final class LagunaRuntimeAttention: Module {
         if !qkNormRoPEFused {
             queries = applyRotaryPosition(rope, to: queries, cache: cache)
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        }
+
+        // KV INT8 perturbation probe (KIVI-class, upper bound). Round-trips the
+        // K/V row through per-token INT8 before the cache append; the cache then
+        // holds the perturbed BF16 and every later SDPA read sees the INT8
+        // perturbation. Decode-only guard matches the rest of this block. Skip
+        // when the real `DARKBLOOM_KV_INT8` cache is active for this layer —
+        // that path quantizes inside the cache and would double-quantize here.
+        if L == 1, lagunaKVInt8ProbeActive(layer: layerIdx),
+            !lagunaKVInt8Active(layer: layerIdx)
+        {
+            keys = lagunaKVInt8RoundTrip(keys)
+            values = lagunaKVInt8RoundTrip(values)
         }
 
         let attended = attentionWithCacheUpdate(
@@ -7521,13 +7610,24 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
 
         let result: MLXArray
         if let lmHead {
+            // The certified lm_head pruner dispatches a custom Metal kernel on
+            // `hidden`, forcing a mid-graph eval that no QuantizedKVCacheProtocol
+            // cache (upstream QuantizedKVCache included) survives —
+            // `hidden.eval()` crashes. The stock lazy `lmHead` (a QuantizedLinear
+            // matmul) keeps the graph lazy until the final token read and is
+            // eval-safe. Fall back to it when KV INT8 is active. The pruner's
+            // decode speedup is the cost; the KV INT8 bandwidth win must overcome
+            // it (it does at a wide-enough tail — see
+            // docs/quantized-rotating-cache-result). When enabled, prefill has
+            // already sliced to the last hidden row; decode always retains the
+            // pruner.
             if let pruner = lmHeadPruner,
+                lagunaKVInt8LayerCount == 0,
                 inputs.shape == [1, 1] || lagunaLmHeadPrunePrefillEnabled
             {
                 // Certified two-pass final-row head (notes/68): full BF16
                 // logits, bit-identical to stock in every argmax-reachable
-                // slot. When enabled, prefill has already sliced to the last
-                // hidden row; decode always retains this pruner.
+                // slot.
                 result = pruner.logits(hidden: hidden, lmHeadWeight: lmHead.weight)
             } else {
                 result = lmHead(hidden)
@@ -7553,6 +7653,14 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         (0..<configuration.numHiddenLayers).map { layerIndex in
             if configuration.layerTypes[layerIndex] == .full {
                 StandardKVCache()
+            } else if lagunaKVInt8Active(layer: layerIndex) {
+                // Real KV INT8: quantized rotating cache for the sliding tail
+                // layers. head_dim 128 is divisible by group 64, so the
+                // resolved group size is 64 (affine INT8, the shipped quant
+                // mode for the affine attention side layouts).
+                QuantizedRotatingKVCache(
+                    maxSize: configuration.slidingWindow, keep: 0,
+                    groupSize: 64, bits: 8, mode: .affine)
             } else {
                 RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
             }
