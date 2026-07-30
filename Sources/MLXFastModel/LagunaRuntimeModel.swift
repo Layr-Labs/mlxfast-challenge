@@ -489,7 +489,7 @@ let lagunaRouterRowsPerGroup: Int = {
     return value
 }()
 
-/// `DARKBLOOM_DECODE_ASYNC_STAGE` (default `at:1,7,15,23,31,39`): process-once
+/// `DARKBLOOM_DECODE_ASYNC_STAGE` (default `ladder1`): process-once
 /// boundary schedule for decode-step async scheduling. Active only when the
 /// invocation input shape is exactly `[1, 1]`; prefill and multi-token shapes
 /// are never asyncEval'd. `off`/`0` disables it; `norm` and `logits` remain
@@ -518,8 +518,8 @@ private enum LagunaDecodeAsyncStage {
 ///     ladder8   (5 fires)  1.0000   the promoted default, unswept
 ///     ladder6   (6 fires)  1.0064
 ///     ladder2  (20 fires)  1.0169
-///     ladder1  (40 fires)  1.0178
-///     at:1,7,15,23,31,39   1.0170   <- six fires, ties forty
+///     ladder1  (40 fires)  1.0178   <- candidate default
+///     at:1,7,15,23,31,39   1.0170   previous six-fire default
 ///
 /// `ladderN`'s first fire is at layer `N-1`, so it structurally skips the
 /// widest GPU-idle window in the step: the front. Adding ONE rung at layer 1
@@ -530,7 +530,7 @@ private enum LagunaDecodeAsyncStage {
 private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     let raw =
         ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?
-        .lowercased() ?? "at:1,7,15,23,31,39"
+        .lowercased() ?? "ladder1"
     switch raw {
     case "off", "0", "":
         return .off
