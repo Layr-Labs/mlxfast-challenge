@@ -328,6 +328,9 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var keys: MLXArray?
     internal var values: MLXArray?
     public var step = 256
+    /// Opt-in graph-construction specialization for callers that know cache
+    /// growth appends immutable token rows. Generic caches leave this false.
+    public var directAppendGrowth = false
 
     public override init() {
         super.init()
@@ -370,6 +373,44 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             let vHeadDim = values.dim(3)
 
             let nSteps = (step + tokenCount - 1) / step
+
+            // Direct-growth mode preserves the already-written prefix, places
+            // the incoming rows immediately after it, and zero-fills only the
+            // remaining slack. This deletes the separate slice assignments
+            // that the generic grow-then-update sequence issues. It is gated
+            // to BF16 and to an existing cache; initialization and every
+            // generic KVCacheSimple retain the stock path below.
+            if directAppendGrowth,
+                keys.dtype == .bfloat16, values.dtype == .bfloat16,
+                let currentKeys = self.keys, let currentValues = self.values
+            {
+                let prefixKeys =
+                    currentKeys.dim(2) == previous
+                    ? currentKeys : currentKeys[.ellipsis, ..<previous, 0...]
+                let prefixValues =
+                    currentValues.dim(2) == previous
+                    ? currentValues : currentValues[.ellipsis, ..<previous, 0...]
+                let slack = nSteps * step - tokenCount
+                if slack > 0 {
+                    let kSlack = MLXArray.zeros(
+                        [B, kvHeads, slack, kHeadDim], dtype: keys.dtype)
+                    let vSlack = MLXArray.zeros(
+                        [B, kvHeads, slack, vHeadDim], dtype: values.dtype)
+                    self.keys = concatenated([prefixKeys, keys, kSlack], axis: 2)
+                    self.values = concatenated(
+                        [prefixValues, values, vSlack], axis: 2)
+                } else {
+                    self.keys = concatenated([prefixKeys, keys], axis: 2)
+                    self.values = concatenated([prefixValues, values], axis: 2)
+                }
+
+                self.offset = previous + tokenCount
+                return (
+                    self.keys![.ellipsis, ..<self.offset, 0...],
+                    self.values![.ellipsis, ..<self.offset, 0...]
+                )
+            }
+
             let kShape = [B, kvHeads, nSteps * step, kHeadDim]
             let vShape = [B, kvHeads, nSteps * step, vHeadDim]
             let newK = MLXArray.zeros(kShape, dtype: keys.dtype)
@@ -475,6 +516,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     public override func copy() -> any KVCache {
         let new = KVCacheSimple()
         new.step = self.step
+        new.directAppendGrowth = self.directAppendGrowth
         let s = self.state
         if !s.isEmpty {
             new.state = s.map { $0[.ellipsis] }
