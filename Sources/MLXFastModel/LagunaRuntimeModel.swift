@@ -7075,11 +7075,20 @@ final class LagunaRuntimeModelInner: Module {
         // seed row, so the angles are the exact floats that layer's kernel
         // would have computed rather than a re-derivation.
 
+        // The invocation shape is fixed for the whole layer walk. Cache the
+        // two ranked modes once rather than rebuilding/comparing the shape or
+        // querying each lazy layer result's sequence dimension at every
+        // boundary. This is host-only control-flow specialization: layer
+        // calls, masks, async-eval fire points, and tensor arithmetic are
+        // unchanged.
+        let isDecodeShape = inputs.shape == [1, 1]
+        let isPrefillShape = !isDecodeShape && h.dim(1) > 1
+
         for (i, layer) in layers.enumerated() {
             let isFull = layerTypes[i] == .full
             let mask = isFull ? fullMask : slidingMask
             let qkRoPEAngles = isFull ? fullRoPEAngles : slidingRoPEAngles
-            if i == layers.count - 1, h.dim(1) > 1 {
+            if i == layers.count - 1, isPrefillShape {
                 if case .causal = mask {
                     h = layer.callLastPrefillRow(h, cache: cache?[i])
                 } else {
@@ -7090,11 +7099,11 @@ final class LagunaRuntimeModelInner: Module {
                         qkRoPEAngles: qkRoPEAngles,
                         qkRoPEOffsets: qkRoPEOffsets
                     )
-                    if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
+                    if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, isDecodeShape {
                         asyncEval(h)
                     }
                     if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                        inputs.shape == [1, 1]
+                        isDecodeShape
                     {
                         asyncEval(h)
                     }
@@ -7107,20 +7116,20 @@ final class LagunaRuntimeModelInner: Module {
                     qkRoPEAngles: qkRoPEAngles,
                     qkRoPEOffsets: qkRoPEOffsets
                 )
-                if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
+                if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, isDecodeShape {
                     asyncEval(h)
                 }
                 if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                    inputs.shape == [1, 1]
+                    isDecodeShape
                 {
                     asyncEval(h)
                 }
                 if case .explicit(let mask) = lagunaDecodeAsyncStage,
-                    (mask >> UInt64(i)) & 1 == 1, inputs.shape == [1, 1]
+                    (mask >> UInt64(i)) & 1 == 1, isDecodeShape
                 {
                     asyncEval(h)
                 }
-                if lagunaPrefillAsyncLadderStride > 0, h.dim(1) > 1,
+                if lagunaPrefillAsyncLadderStride > 0, isPrefillShape,
                     (i + 1) % lagunaPrefillAsyncLadderStride == 0
                 {
                     asyncEval(h)
