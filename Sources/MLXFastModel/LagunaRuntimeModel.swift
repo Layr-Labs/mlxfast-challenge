@@ -252,6 +252,13 @@ let lagunaFusedRoutedSharedSwiGLUQMVEnabled =
 /// schedule is the default; only an explicit selector value of `4` opts into
 /// the R4 control. R4 preserves each row's arithmetic; its only risk is
 /// performance from higher register pressure/occupancy tradeoffs.
+/// `DARKBLOOM_R1_TG_WIDTH` (default 64; "128" regroups the same
+/// one-row-per-SIMD r1 arithmetic into four-SIMD threadgroups — row
+/// coverage, K-loops, and per-row reductions identical; only threadgroup
+/// membership changes).
+let lagunaR1TGWidth128 =
+    ProcessInfo.processInfo.environment["DARKBLOOM_R1_TG_WIDTH"] == "128"
+
 let lagunaRoutedSharedSwiGLUQMVRows4Enabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_ROUTED_SHARED_SWIGLU_ROWS"] == "4"
@@ -3778,7 +3785,7 @@ func lagunaRoutedSwiGLUQMV(
 /// slot's arithmetic: a threadgroup does exactly the work it did before, over
 /// the same bank, in the same order.
 private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_v2",
+    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_r1_v3",
     inputNames: [
         "input", "routed_weight", "routed_scales", "indices",
         "shared_weight", "shared_scales",
@@ -3794,7 +3801,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
         constexpr uint scale_expert_bytes = fused_width * scale_row_bytes;
         constexpr uint block_width = 512;
         constexpr uint values_per_lane = 16;
-        constexpr uint tiles_per_expert = 128;
+        constexpr uint tiles_per_expert = 256;
         constexpr uint routed_experts = 8;
 
         // Preserve each expert tile's arithmetic and output address while
@@ -3806,7 +3813,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
         bool is_routed = expert_slot < routed_experts;
         uint simd_group = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
-        uint first_row = tile * 4 + simd_group * 2;
+        uint first_row = tile * 2 + simd_group;
 
         const device uint8_t* expert_weight;
         const device uint8_t* expert_scales;
@@ -3821,8 +3828,8 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             expert_scales = shared_scales;
         }
 
-        thread float gate_result[2] = {0.0f, 0.0f};
-        thread float up_result[2] = {0.0f, 0.0f};
+        thread float gate_result[1] = {0.0f};
+        thread float up_result[1] = {0.0f};
         thread float input_values[values_per_lane];
 
         for (uint block = 0; block < input_width; block += block_width) {
@@ -3837,7 +3844,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
                 input_values[4 * i + 3] = values[3];
             }
 
-            for (uint row = 0; row < 2; ++row) {
+            for (uint row = 0; row < 1; ++row) {
                 uint logical_row = first_row + row;
                 uint gate_row;
                 uint up_row;
@@ -3873,7 +3880,129 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             }
         }
 
-        for (uint row = 0; row < 2; ++row) {
+        for (uint row = 0; row < 1; ++row) {
+            gate_result[row] = simd_sum(gate_result[row]);
+            up_result[row] = simd_sum(up_result[row]);
+            if (lane == 0) {
+                bfloat gate = bfloat(gate_result[row]);
+                bfloat up = bfloat(up_result[row]);
+                bfloat exp_abs = metal::exp(metal::abs(gate));
+                bfloat denominator = bfloat(1) + exp_abs;
+                bfloat y = bfloat(1) / denominator;
+                bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+                bfloat silu = bfloat(gate * sigmoid);
+                bfloat activation = bfloat(silu * up);
+                if (is_routed) {
+                    routed_activated[
+                        expert_slot * output_width + first_row + row
+                    ] = activation;
+                } else {
+                    shared_activated[first_row + row] = activation;
+                }
+            }
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaRoutedSharedSwiGLUQMVKernelW128 = MLXFast.metalKernel(
+    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_r1w128_v4",
+    inputNames: [
+        "input", "routed_weight", "routed_scales", "indices",
+        "shared_weight", "shared_scales",
+    ],
+    outputNames: ["routed_activated", "shared_activated"],
+    source: """
+        constexpr uint input_width = 2048;
+        constexpr uint output_width = 512;
+        constexpr uint fused_width = 1024;
+        constexpr uint packed_row_bytes = 1024;
+        constexpr uint scale_row_bytes = 128;
+        constexpr uint packed_expert_bytes = fused_width * packed_row_bytes;
+        constexpr uint scale_expert_bytes = fused_width * scale_row_bytes;
+        constexpr uint block_width = 512;
+        constexpr uint values_per_lane = 16;
+        constexpr uint tiles_per_expert = 128;
+        constexpr uint routed_experts = 8;
+
+        // Preserve each expert tile's arithmetic and output address while
+        // exposing all eight routed banks plus the shared bank in each
+        // scheduling wave.
+        uint group = threadgroup_position_in_grid.x;
+        uint expert_slot = group % (routed_experts + 1);
+        uint tile = group / (routed_experts + 1);
+        bool is_routed = expert_slot < routed_experts;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint first_row = tile * 4 + simd_group;
+
+        const device uint8_t* expert_weight;
+        const device uint8_t* expert_scales;
+        if (is_routed) {
+            uint expert = uint(indices[expert_slot]);
+            expert_weight =
+                (const device uint8_t*)routed_weight +
+                expert * packed_expert_bytes;
+            expert_scales = routed_scales + expert * scale_expert_bytes;
+        } else {
+            expert_weight = (const device uint8_t*)shared_weight;
+            expert_scales = shared_scales;
+        }
+
+        thread float gate_result[1] = {0.0f};
+        thread float up_result[1] = {0.0f};
+        thread float input_values[values_per_lane];
+
+        for (uint block = 0; block < input_width; block += block_width) {
+            const device vec<bfloat, 4>* input_vectors =
+                (const device vec<bfloat, 4>*)(
+                    input + block + lane * values_per_lane);
+            for (uint i = 0; i < values_per_lane / 4; ++i) {
+                const vec<bfloat, 4> values = input_vectors[i];
+                input_values[4 * i] = values[0];
+                input_values[4 * i + 1] = values[1];
+                input_values[4 * i + 2] = values[2];
+                input_values[4 * i + 3] = values[3];
+            }
+
+            for (uint row = 0; row < 1; ++row) {
+                uint logical_row = first_row + row;
+                uint gate_row;
+                uint up_row;
+                if (is_routed) {
+                    uint pair_tile = logical_row / 32;
+                    gate_row = pair_tile * 64 + logical_row % 32;
+                    up_row = gate_row + 32;
+                } else {
+                    gate_row = logical_row;
+                    up_row = gate_row + output_width;
+                }
+                const device uint8_t* gate_weight =
+                    expert_weight + gate_row * packed_row_bytes +
+                    block / 2 + lane * 8;
+                const device uint8_t* up_weight =
+                    expert_weight + up_row * packed_row_bytes +
+                    block / 2 + lane * 8;
+                const device uint8_t* gate_scale =
+                    expert_scales + gate_row * scale_row_bytes +
+                    block / 16 + lane;
+                const device uint8_t* up_scale =
+                    expert_scales + up_row * scale_row_bytes +
+                    block / 16 + lane;
+
+                gate_result[row] += laguna_nvfp4_qdot_16(
+                    gate_weight,
+                    input_values,
+                    laguna_nvfp4_scale(gate_scale[0]));
+                up_result[row] += laguna_nvfp4_qdot_16(
+                    up_weight,
+                    input_values,
+                    laguna_nvfp4_scale(up_scale[0]));
+            }
+        }
+
+        for (uint row = 0; row < 1; ++row) {
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
             if (lane == 0) {
@@ -4336,19 +4465,27 @@ func lagunaRoutedSharedSwiGLUQMV(
     let kernel =
         lagunaRoutedSharedSwiGLUQMVRows4Enabled
         ? lagunaRoutedSharedSwiGLUQMVRows4Kernel
-        : lagunaRoutedSharedSwiGLUQMVKernel
+        : (lagunaR1TGWidth128
+            ? lagunaRoutedSharedSwiGLUQMVKernelW128
+            : lagunaRoutedSharedSwiGLUQMVKernel)
     // The R4 control covers eight rows per 64-thread group, so 64 tiles per
     // each of the nine slots dispatch exactly 576 threadgroups. The default R2
     // schedule retains its original 128 tiles per slot.
-    let tilesPerSlot = lagunaRoutedSharedSwiGLUQMVRows4Enabled ? 64 : 128
+    let tilesPerSlot =
+        lagunaRoutedSharedSwiGLUQMVRows4Enabled
+        ? 64 : (lagunaR1TGWidth128 ? 128 : 256)
+    let qmvThreadsPerGroup =
+        (lagunaR1TGWidth128 && !lagunaRoutedSharedSwiGLUQMVRows4Enabled)
+        ? 128 : 64
     let outputs = kernel(
         [input, routedWeight, routedScales, indices, sharedWeight, sharedScales],
         grid: (
-            (LagunaConstants.numExpertsPerTok + 1) * tilesPerSlot * 64,
+            (LagunaConstants.numExpertsPerTok + 1) * tilesPerSlot
+                * qmvThreadsPerGroup,
             1,
             1
         ),
-        threadGroup: (64, 1, 1),
+        threadGroup: (qmvThreadsPerGroup, 1, 1),
         outputShapes: [
             [
                 1, 1, LagunaConstants.numExpertsPerTok, 1,
@@ -7284,6 +7421,24 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                 FileHandle.standardError.write(
                     Data("mlxfast: lm_head prune active (mxfp8 coarse copy resident)\n".utf8))
             }
+        }
+
+        // Deterministic init settle (`DARKBLOOM_INIT_SETTLE_MS`, default 0 =
+        // disabled): after every untimed warmup dispatch above has been
+        // issued, synchronize the GPU stream so no warmup work is still
+        // draining when the worker protocol starts, then idle briefly so the
+        // process hands over from a settled state rather than mid-burst.
+        // This runs entirely BEFORE the worker protocol hello; it adds
+        // nothing to, and removes nothing from, any measured phase.
+        let settleMs =
+            Int(ProcessInfo.processInfo.environment[
+                "DARKBLOOM_INIT_SETTLE_MS"] ?? "300") ?? 300
+        if settleMs > 0 {
+            Stream.defaultStream(Device.gpu)
+            eval([MLXArray]())
+            usleep(useconds_t(min(settleMs, 2_000) * 1_000))
+            FileHandle.standardError.write(
+                Data("mlxfast: init settle \(settleMs)ms before protocol start\n".utf8))
         }
     }
 
