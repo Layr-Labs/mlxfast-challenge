@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <mutex>
 #include <numeric>
+#include <set>
 #include <sstream>
 
 #include "mlx/backend/common/broadcasting.h"
@@ -21,6 +23,136 @@
 namespace mlx::core {
 
 namespace {
+
+// DARKBLOOM_GEMM_SWIZZLE -- size the steel threadblock swizzle from the actual
+// M-tile count instead of a constant.
+//
+// The swizzle is a pure remap of which threadgroup owns which output tile:
+// `tid_y = (tid.y << s) + (tid.x & ((1 << s) - 1))`, `tid_x = tid.x >> s`
+// (steel/gemm/gemm.h:154, steel_gemm_fused_nax.h:98, steel_gemm_splitk_nax.h:44),
+// and the host compensates with `tn *= 1 << s; tm = ceil(tm / (1 << s))`. A
+// tile's K loop, its accumulation order and its output address are untouched,
+// so this is BIT-EXACT BY CONSTRUCTION for every shape -- only the schedule
+// moves.
+//
+// WHAT IT BUYS. Threadgroups are dispatched x-fastest, so at swizzle `s` a run
+// of `2^s` consecutive threadgroups covers `2^s` different M-tiles against the
+// SAME N-tile of B before advancing to the next N-tile. The B operand -- the
+// weight matrix, which is the large one for every prefill projection -- is
+// therefore streamed `ceil(tm / 2^s)` times rather than `tm` times.
+//
+// At the frozen 512-token prefill window the stock values leave real traffic on
+// the table:
+//
+//   site                       stock s      tm   passes over B
+//   NAX regular (bm 64)        2 on s/c/d    8   2
+//   NAX split-K (bm 64)        1             8   4
+//   NAX split-K (bm 128)       1             4   2
+//   classic regular            0 (hard-      8   8
+//                              zeroed; the
+//                              heuristic is
+//                              commented out)
+//
+// `min(3, ceil(log2(tm)))` drives every one of those to a single pass, which is
+// the minimum possible, and degrades to the stock value whenever tm is small
+// (tm <= 1 -> 0, tm <= 2 -> 1, tm <= 4 -> 2). The cap at 3 keeps the swizzled
+// grid's x extent bounded; the kernels' own
+// `if (tiles_n <= tid_x || tiles_m <= tid_y) return;` guard makes an
+// over-subscribed grid safe when tm is not a power of two.
+//
+// Honest caveat: on a device whose last-level cache already holds the B panel
+// across the second pass, the redundant streaming never reaches DRAM and this
+// buys nothing. That is precisely what the ranked run measures.
+//
+// `DARKBLOOM_GEMM_SWIZZLE=0` restores the stock per-site constants exactly.
+inline bool darkbloom_gemm_swizzle_enabled() {
+  static const bool enabled = env::get_var("DARKBLOOM_GEMM_SWIZZLE", "1") != "0";
+  return enabled;
+}
+
+// ceil(log2(tm)), capped, or the caller's stock value when disabled.
+inline int darkbloom_swizzle_log(int tm, int stock) {
+  if (!darkbloom_gemm_swizzle_enabled()) {
+    return stock;
+  }
+  int s = 0;
+  while ((1 << s) < tm && s < 3) {
+    s++;
+  }
+  return s;
+}
+
+// DARKBLOOM_GEMM_SPLITK_MIN_N -- keep skinny-N GEMMs off the split-K path.
+//
+// NOT BIT-EXACT. Split-K partitions the K loop across `tid_z` partitions, sums
+// the partial products in a separate accumulation dispatch, and therefore
+// REASSOCIATES the K reduction relative to the single sequential K loop of the
+// regular path. The non-split form is strictly the more accurate of the two,
+// but "more accurate" is not "identical": every affected GEMM's outputs can
+// move by an ulp, and on this benchmark a moved ulp can flip a near-tie greedy
+// argmax and fail the exact-token gates. Treat any nonzero threshold as a
+// numerics change requiring its own token-identity evidence, never as a free
+// scheduling win.
+//
+// The motivation is scheduling, not arithmetic. At the frozen prefill window
+// `g_proj` (N = 48/64) trips split-K, which costs an extra accumulation
+// dispatch AND a full concurrent-encoder drain -- the accumulation kernel reads
+// `C_split` right after the partial kernel writes it, so the encoder inserts a
+// memory barrier that serialises the sibling q/k/v dispatches that would
+// otherwise overlap. For a GEMM whose N is 48 there is no split-K parallelism
+// benefit worth that.
+//
+// The router gate (N = 256) also trips split-K but has no siblings to
+// serialise, so split-K may genuinely be the right choice there; a threshold of
+// 64 excludes `g_proj` and leaves the router alone.
+//
+// DEFAULT 0 = INERT. The shipped default changes nothing, so the payload this
+// lands in stays bit-exact. Set `DARKBLOOM_GEMM_SPLITK_MIN_N=64` to A/B it.
+inline int darkbloom_gemm_splitk_min_n() {
+  static const int threshold = [] {
+    auto raw = env::get_var("DARKBLOOM_GEMM_SPLITK_MIN_N", "0");
+    int v = 0;
+    try {
+      v = std::stoi(raw);
+    } catch (...) {
+      v = 0;
+    }
+    return v < 0 ? 0 : v;
+  }();
+  return threshold;
+}
+
+// DARKBLOOM_GEMM_TRACE=1 -- one stderr line per distinct GEMM routing, so the
+// dispatch map can be read off a real forward instead of inferred from the
+// predicates. Measurement only; prints nothing unless asked.
+inline void darkbloom_gemm_trace(
+    const char* kernel,
+    int M,
+    int N,
+    int K,
+    int bm,
+    int bn,
+    int bk,
+    int swizzle_log,
+    long threadgroups) {
+  static const bool enabled = env::get_var("DARKBLOOM_GEMM_TRACE", "") == "1";
+  if (!enabled) {
+    return;
+  }
+  static std::mutex mtx;
+  static std::set<std::string> seen;
+  std::string key;
+  key.reserve(96);
+  key = std::string(kernel) + " M=" + std::to_string(M) + " N=" +
+      std::to_string(N) + " K=" + std::to_string(K) + " bm=" +
+      std::to_string(bm) + " bn=" + std::to_string(bn) + " bk=" +
+      std::to_string(bk) + " swizzle_log=" + std::to_string(swizzle_log) +
+      " tgs=" + std::to_string(threadgroups);
+  std::lock_guard<std::mutex> lock(mtx);
+  if (seen.insert(key).second) {
+    fprintf(stderr, "mlxfast: gemm %s\n", key.c_str());
+  }
+}
 
 std::tuple<bool, int64_t, array> check_transpose(
     std::vector<array>& copies,
@@ -276,10 +408,14 @@ void steel_matmul_regular_axpby_nax(
   int tm = (M + bm - 1) / bm;
 
   // TODO: Explore device-based tuning for swizzle
-  int swizzle_log = tm <= 3 ? 0 : 1;
+  int stock_swizzle_log = tm <= 3 ? 0 : 1;
   if (devc == 's' || devc == 'c' || devc == 'd') {
-    swizzle_log = 2;
+    stock_swizzle_log = 2;
   }
+  // Size the swizzle from tm so B is streamed once (see
+  // darkbloom_swizzle_log): at the 512-token prefill window tm is 8 here and
+  // the stock 2 leaves a second full pass over the weight matrix.
+  int swizzle_log = darkbloom_swizzle_log(tm, stock_swizzle_log);
 
   // Prepare steel matmul params
   GEMMParams params{/* const int M = */ M,
@@ -304,6 +440,9 @@ void steel_matmul_regular_axpby_nax(
 
   MTL::Size group_dims = MTL::Size(32, wn, wm);
   MTL::Size grid_dims = MTL::Size(tn, tm, batch_size_out);
+  darkbloom_gemm_trace(
+      "steel_gemm_fused_nax", M, N, K, bm, bn, bk, swizzle_log,
+      long(tn) * tm * batch_size_out);
 
   // Launch kernel
   compute_encoder.set_input_array(a, 0);
@@ -435,7 +574,12 @@ void steel_matmul_regular_axpby(
   int tm = (M + bm - 1) / bm;
 
   // TODO: Explore device-based tuning for swizzle
-  int swizzle_log = 0; // tm >= 6 ? 3 : (tm <= 3 ? 0 : 2);
+  // Stock value is a hard zero -- the original heuristic
+  // (`tm >= 6 ? 3 : (tm <= 3 ? 0 : 2)`) is commented out just below -- so at
+  // the 512-token prefill window (tm == 8) this path streamed B eight times.
+  // See darkbloom_swizzle_log.
+  int swizzle_log =
+      darkbloom_swizzle_log(tm, 0); // stock: tm >= 6 ? 3 : (tm <= 3 ? 0 : 2);
 
   // Prepare steel matmul params
   GEMMParams params{/* const int M = */ M,
@@ -460,6 +604,9 @@ void steel_matmul_regular_axpby(
 
   MTL::Size group_dims = MTL::Size(32, wn, wm);
   MTL::Size grid_dims = MTL::Size(tn, tm, batch_size_out);
+  darkbloom_gemm_trace(
+      "steel_gemm_fused", M, N, K, bm, bn, bk, swizzle_log,
+      long(tn) * tm * batch_size_out);
 
   // Launch kernel
   compute_encoder.set_input_array(a, 0);
@@ -596,6 +743,13 @@ void steel_gemm_splitk_axpby(
 
   MTL::Size group_dims = MTL::Size(32, wn, wm);
   MTL::Size grid_dims = MTL::Size(tn, tm, split_k_partitions);
+  // Trace only. This path's grid is 3D with tid.z carrying the K partition, so
+  // a swizzle here needs the tn_swizzled/tm_swizzled flattening the NAX
+  // split-K path already has; left alone to keep the change on the three sites
+  // the analysis identified.
+  darkbloom_gemm_trace(
+      "steel_gemm_splitk", M, N, K, bm, bn, bk, 0,
+      long(tn) * tm * split_k_partitions);
 
   compute_encoder.set_input_array(a, 0);
   compute_encoder.set_input_array(b, 1);
@@ -751,12 +905,19 @@ void steel_gemm_splitk_axpby_nax(
   int tn = (N + bn - 1) / bn;
   int tm = (M + bm - 1) / bm;
 
-  int swizzle_log = tm <= 3 ? 0 : 1;
+  // Size the swizzle from tm so each partition streams its B panel once
+  // instead of ceil(tm / 2^stock) times (see darkbloom_swizzle_log). At the
+  // 512-token prefill window tm is 4 (o_proj, bm 128) or 8 (g_proj / router,
+  // bm 64) here, against a stock swizzle of 1.
+  int swizzle_log = darkbloom_swizzle_log(tm, tm <= 3 ? 0 : 1);
 
   // Compute swizzled tile counts
   int tile = 1 << swizzle_log;
   int tm_swizzled = (tm + tile - 1) / tile;
   int tn_swizzled = tn * tile;
+  darkbloom_gemm_trace(
+      "steel_gemm_splitk_nax", M, N, K, bm, bn, bk, swizzle_log,
+      long(tn_swizzled) * tm_swizzled * split_k_partitions);
 
   GEMMSpiltKParams params{
       /* const int M = */ M,
@@ -918,10 +1079,17 @@ void steel_matmul_axpby(
   char devc = d.get_architecture().back();
   int min_tmn_threshold = (devc == 's' || devc == 'd') ? 2048 : 1024;
 
+  // Skinny-N GEMMs (attention `g_proj`, N = 48/64) gain nothing from split-K's
+  // parallelism and pay an accumulation dispatch plus a concurrent-encoder
+  // drain for it. DEFAULT 0 = inert; NOT bit-exact when enabled, because the
+  // regular path's K reduction is not a reassociation of split-K's. See
+  // darkbloom_gemm_splitk_min_n.
+  const bool darkbloom_skip_splitk = N <= darkbloom_gemm_splitk_min_n();
+
   // Case 1: Small M×N with large K, use SIMD split-K
   // Max and Ultra dispatch larger sizes to splitk
-  if (!use_nax && batch_size_out == 1 && (_tm * _tn) <= min_tmn_threshold &&
-      _tk >= 8 && K >= std::max(M, N)) {
+  if (!use_nax && !darkbloom_skip_splitk && batch_size_out == 1 &&
+      (_tm * _tn) <= min_tmn_threshold && _tk >= 8 && K >= std::max(M, N)) {
     return steel_gemm_splitk_axpby<CHECK_AB>(
         /* const Stream& s = */ s,
         /* metal::Device& d = */ d,
@@ -943,7 +1111,7 @@ void steel_matmul_axpby(
   }
 
   // Case 2: Large K with sufficient M, N, and NAX is available, use NAX split-K
-  if (use_nax && batch_size_out == 1 &&
+  if (use_nax && !darkbloom_skip_splitk && batch_size_out == 1 &&
       (K >= 3 * std::max(M, N) ||
        (std::max(M, N) <= 1024 && K > 2 * std::max(M, N)))) {
     return steel_gemm_splitk_axpby_nax<CHECK_AB>(
