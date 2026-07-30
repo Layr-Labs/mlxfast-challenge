@@ -2366,7 +2366,7 @@ private func lagunaGatedOutputProjectionSource(
         """
 }
 
-/// `DARKBLOOM_L5_UNROLL` (default `2`; `1` restores the pre-unroll loop
+/// `DARKBLOOM_L5_UNROLL` (default `4`; `1` restores the pre-unroll loop
 /// verbatim, `4`/`8` deepen it): block-loop unroll depth for the gated output
 /// projection. Every depth divides both block counts — 64 heads and 48 — so no
 /// tail loop is ever needed, and depth `1` emits the pre-patch loop, which
@@ -2381,7 +2381,7 @@ let lagunaGatedOutputUnroll: Int = {
     guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_L5_UNROLL"],
         let value = Int(raw), [1, 2, 4, 8].contains(value)
     else {
-        return 2
+        return 4
     }
     return value
 }()
