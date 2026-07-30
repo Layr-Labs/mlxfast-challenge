@@ -1271,8 +1271,13 @@ bool darkbloom_stage_wideld() {
   return v;
 }
 
+// SHIPPED DEFAULT ON: two mem_threadgroup barriers that fence nothing (Ws
+// write-after-read already covered by the barrier preceding next stores).
+// Set DARKBLOOM_STAGE_RUNBAR=0 to ablate. Ranked runner sets no env.
 bool darkbloom_stage_runbar() {
-  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_RUNBAR");
+  static const bool v = [] {
+    return env::get_var("DARKBLOOM_STAGE_RUNBAR", "") != "0";
+  }();
   return v;
 }
 
