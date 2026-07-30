@@ -281,8 +281,43 @@ inline U qdot(
   }
 
   else if (bits == 8) {
+    // Aligned-pack fast path for the affine 8-bit qdot (bit-exact, proof
+    // below). The generic chain it replaces reads the lane's eight weight
+    // codes one byte at a time:
+    //
+    //     for (int i = 0; i < values_per_thread; i++)
+    //       accum += x_thread[i] * w[i];
+    //
+    // For bits == 8 every caller's lane owns one CONTIGUOUS eight-byte
+    // pack: `packs_per_thread * bytes_per_pack == 8`, so the lane's codes
+    // sit at `ws = w_base + out_row * in_vec_size_w + k + simd_lid * 8`
+    // with `in_vec_size_w` a multiple of the pack size (2048 here) and the
+    // per-block stride (256) likewise, so the `uint2` load is 8-byte
+    // aligned at every instantiation and every iteration. Both 32-bit
+    // lanes are little-endian on every supported platform, so
+    //
+    //     wv[i] = (packed.{x,y} >> (8 * (i & 3))) & 0xff   (i = 0..7)
+    //
+    // is EXACTLY the integer the generic chain promotes from `w[i]`:
+    // same values, same order. The conversion `uint8_t -> float` is exact
+    // for every byte value, the products `x_thread[i] * wv[i]` are the
+    // same operands in the same order, the accumulation order is
+    // unchanged, and `scale * accum + sum * bias` is unchanged, so every
+    // output element is bit-identical to the byte-load chain. This is a
+    // pure load-scheduling relayout: no arithmetic, quantization, or
+    // dispatch change.
+    const uint2 packed = *(const device uint2*)w;
+    const thread U wv[8] = {
+        U(packed.x & 0xffu),
+        U((packed.x >> 8) & 0xffu),
+        U((packed.x >> 16) & 0xffu),
+        U((packed.x >> 24) & 0xffu),
+        U(packed.y & 0xffu),
+        U((packed.y >> 8) & 0xffu),
+        U((packed.y >> 16) & 0xffu),
+        U((packed.y >> 24) & 0xffu)};
     for (int i = 0; i < values_per_thread; i++) {
-      accum += x_thread[i] * w[i];
+      accum += x_thread[i] * wv[i];
     }
   }
 
