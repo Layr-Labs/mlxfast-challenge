@@ -248,13 +248,13 @@ let lagunaFusedRoutedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV"] != "0"
 
-/// Scheduling A/B for the merged routed/shared gate/up kernel. The R4 twin is
-/// the candidate default; set the selector to `2` for the proven
-/// two-row-per-SIMD control. R4 preserves each row's arithmetic; its only risk
-/// is performance from higher register pressure/occupancy tradeoffs.
+/// Scheduling A/B for the merged routed/shared gate/up kernel. The proven R2
+/// schedule is the default; set the selector to `4` for the R4 control. R4
+/// preserves each row's arithmetic; its only risk is performance from higher
+/// register pressure/occupancy tradeoffs.
 let lagunaRoutedSharedSwiGLUQMVRows4Enabled =
     ProcessInfo.processInfo.environment[
-        "DARKBLOOM_ROUTED_SHARED_SWIGLU_ROWS"] != "2"
+        "DARKBLOOM_ROUTED_SHARED_SWIGLU_ROWS"] == "4"
 
 /// Folds the per-head softplus gate into the output projection's GEMV (see
 /// `lagunaGatedOutputProjectionSource`), with one kernel variant per attention
@@ -4253,9 +4253,9 @@ func lagunaRoutedSharedSwiGLUQMV(
         lagunaRoutedSharedSwiGLUQMVRows4Enabled
         ? lagunaRoutedSharedSwiGLUQMVRows4Kernel
         : lagunaRoutedSharedSwiGLUQMVKernel
-    // R4 covers eight rows per 64-thread group, so 64 tiles per each of the
-    // nine slots dispatch exactly 576 threadgroups. The default R2 control
-    // retains its original 128 tiles per slot.
+    // The R4 control covers eight rows per 64-thread group, so 64 tiles per
+    // each of the nine slots dispatch exactly 576 threadgroups. The default R2
+    // schedule retains its original 128 tiles per slot.
     let tilesPerSlot = lagunaRoutedSharedSwiGLUQMVRows4Enabled ? 64 : 128
     let outputs = kernel(
         [input, routedWeight, routedScales, indices, sharedWeight, sharedScales],
