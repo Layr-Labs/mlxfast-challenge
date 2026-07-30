@@ -22,6 +22,26 @@ namespace mlx::core {
 
 namespace {
 
+
+// DARKBLOOM_GEMM_SWIZZLE: size steel threadblock swizzle from actual M-tile
+// count. Pure remap of which threadgroup owns which output tile — K loop,
+// accumulation order, and store addresses unchanged (bit-exact by construction).
+// Default ON; set DARKBLOOM_GEMM_SWIZZLE=0 to restore stock constants.
+inline bool darkbloom_gemm_swizzle_enabled() {
+  static const bool enabled = env::get_var("DARKBLOOM_GEMM_SWIZZLE", "") != "0";
+  return enabled;
+}
+inline int darkbloom_swizzle_log(int tm, int stock) {
+  if (!darkbloom_gemm_swizzle_enabled()) {
+    return stock;
+  }
+  int s = 0;
+  while ((1 << s) < tm && s < 3) {
+    s++;
+  }
+  return s;
+}
+
 std::tuple<bool, int64_t, array> check_transpose(
     std::vector<array>& copies,
     const Stream& s,
@@ -276,10 +296,11 @@ void steel_matmul_regular_axpby_nax(
   int tm = (M + bm - 1) / bm;
 
   // TODO: Explore device-based tuning for swizzle
-  int swizzle_log = tm <= 3 ? 0 : 1;
+  int stock_swizzle_log = tm <= 3 ? 0 : 1;
   if (devc == 's' || devc == 'c' || devc == 'd') {
-    swizzle_log = 2;
+    stock_swizzle_log = 2;
   }
+  int swizzle_log = darkbloom_swizzle_log(tm, stock_swizzle_log);
 
   // Prepare steel matmul params
   GEMMParams params{/* const int M = */ M,
@@ -435,7 +456,8 @@ void steel_matmul_regular_axpby(
   int tm = (M + bm - 1) / bm;
 
   // TODO: Explore device-based tuning for swizzle
-  int swizzle_log = 0; // tm >= 6 ? 3 : (tm <= 3 ? 0 : 2);
+  int swizzle_log =
+      darkbloom_swizzle_log(tm, 0); // stock: tm >= 6 ? 3 : (tm <= 3 ? 0 : 2);
 
   // Prepare steel matmul params
   GEMMParams params{/* const int M = */ M,
@@ -751,7 +773,7 @@ void steel_gemm_splitk_axpby_nax(
   int tn = (N + bn - 1) / bn;
   int tm = (M + bm - 1) / bm;
 
-  int swizzle_log = tm <= 3 ? 0 : 1;
+  int swizzle_log = darkbloom_swizzle_log(tm, tm <= 3 ? 0 : 1);
 
   // Compute swizzled tile counts
   int tile = 1 << swizzle_log;
@@ -1807,7 +1829,8 @@ void BlockMaskedMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int tm = (M + bm - 1) / bm;
 
   // TODO: Explore device-based tuning for swizzle
-  int swizzle_log = 0; // tm >= 6 ? 3 : (tm <= 3 ? 0 : 2);
+  int swizzle_log =
+      darkbloom_swizzle_log(tm, 0); // stock: tm >= 6 ? 3 : (tm <= 3 ? 0 : 2);
 
   // Prepare steel matmul params
   GEMMParams params{/* const int M = */ M,
