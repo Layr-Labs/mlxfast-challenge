@@ -1244,6 +1244,289 @@ func lagunaSlidingQKNormRoPE(
     return (outputs[0], outputs[1])
 }
 
+// MARK: - Decode QK-norm/RoPE with the KV-cache write folded in
+
+/// `DARKBLOOM_FUSED_KV_WRITE` (default ON; set "0" to ablate): let the
+/// decode QK-norm+RoPE kernel land the new token's K and V rows in the KV
+/// cache itself, removing the two `slice_update` dispatches MLX would
+/// otherwise issue per layer per token (80 of the ~497 decode dispatches).
+///
+/// This is a dispatch-count change only. The K row is the value the fused
+/// kernel already computed, written to the address `slice_update` would have
+/// written it to; the V row is a byte copy of the projection's V slice. No
+/// arithmetic, rounding, accumulation order or launch geometry changes.
+///
+/// Ordering. MLX encodes with `MTLDispatchTypeConcurrent` and inserts a
+/// global `memoryBarrier(BarrierScopeBuffers)` before any dispatch that
+/// *reads* a buffer an earlier dispatch in the same encoder *wrote*
+/// (`CommandEncoder::set_input_array` / `maybeInsertBarrier`,
+/// backend/metal/device.cpp). MLX sees the cache arrays only as inputs here,
+/// so the barrier that orders the write against the SDPA that reads it comes
+/// from `queries`: SDPA consumes this kernel's `queries` output, which is in
+/// the encoder's previous-output set, and the barrier it triggers is buffer
+/// *scope*, not per-resource. The guard below therefore also requires the
+/// exact decode shape SDPA's `kv_copy_unless` accepts without a staging copy
+/// (`strides.back() == 1` and `B == 1`), so no un-barriered op can read the
+/// cache between the write and the SDPA that consumes `queries`.
+let lagunaFusedKVWriteEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_KV_WRITE"] != "0"
+
+/// 0-d `int32` cache-row constants, so a decode step's forty fused KV writes
+/// cost forty array lookups instead of forty scalar-array constructions.
+/// Grown on demand and never shrunk; MLX arrays are immutable, so one
+/// constant per row index serves every layer and every step.
+private final class LagunaKVRowConstants: @unchecked Sendable {
+    static let shared = LagunaKVRowConstants()
+    private var constants: [MLXArray] = []
+    private let lock = NSLock()
+
+    func constant(_ row: Int) -> MLXArray {
+        lock.lock()
+        defer { lock.unlock() }
+        if row < constants.count { return constants[row] }
+        let target = max(row + 1, 1024)
+        var grown: [MLXArray] = []
+        grown.reserveCapacity(target - constants.count)
+        for value in constants.count ..< target {
+            grown.append(MLXArray(Int32(value)))
+        }
+        eval(grown)
+        constants.append(contentsOf: grown)
+        return constants[row]
+    }
+}
+
+/// Body shared by the two KV-writing decode kernels. `queryHeads` and the
+/// rotation block are the only differences from their non-writing twins, and
+/// both are spliced in verbatim from those kernels — the RMSNorm reduction,
+/// the `simd_shuffle` partner fetch, the BF16 boundaries and the write order
+/// are character-for-character identical, so the K row this lands in the
+/// cache is the same bit pattern the `slice_update` pair would have landed.
+private func lagunaDecodeQKNormKVWriteSource(
+    queryHeads: Int,
+    rotation: String
+) -> String {
+    """
+    constexpr uint head_dim = 128;
+    constexpr uint query_heads = \(queryHeads);
+
+    uint head = threadgroup_position_in_grid.x;
+    uint lane = thread_index_in_simdgroup;
+
+    const device bfloat* input;
+    const device bfloat* weight;
+    uint kv_head = head - query_heads;
+    if (head < query_heads) {
+        input = raw_queries + head * head_dim;
+        weight = query_weight;
+    } else {
+        input = raw_keys + kv_head * head_dim;
+        weight = key_weight;
+    }
+
+    uint base = lane * 4;
+    thread bfloat normalized[4];
+    float sum = 0.0f;
+    for (uint i = 0; i < 4; ++i) {
+        float value = float(input[base + i]);
+        sum += value * value;
+    }
+    sum = simd_sum(sum);
+    float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+    for (uint i = 0; i < 4; ++i) {
+        normalized[i] =
+            weight[base + i] *
+            bfloat(float(input[base + i]) * inverse_rms);
+    }
+
+    // The K row goes straight to the ring slot `slice_update` would have
+    // filled: MLX binds `cache_keys` at the cache array's own data offset,
+    // and `cache_keys_strides[1]` is its kv-head stride in elements.
+    device bfloat* output;
+    if (head < query_heads) {
+        output = queries + head * head_dim;
+    } else {
+        output =
+            (device bfloat*)cache_keys
+            + long(cache_keys_strides[1]) * long(kv_head)
+            + long(kv_row) * long(head_dim);
+    }
+
+    \(rotation)
+
+    // V is untouched by QK-norm and RoPE, so its cache row is a byte copy of
+    // the projection's V slice; the eight kv-head threadgroups own it, four
+    // elements per lane, exactly covering the 128-wide row.
+    if (head >= query_heads) {
+        device bfloat* value_row =
+            (device bfloat*)cache_values
+            + long(cache_values_strides[1]) * long(kv_head)
+            + long(kv_row) * long(head_dim);
+        const device bfloat* value_source = raw_values + kv_head * head_dim;
+        for (uint i = 0; i < 4; ++i) {
+            value_row[base + i] = value_source[base + i];
+        }
+    }
+    """
+}
+
+private let lagunaSlidingQKNormRoPEKVWriteKernel = MLXFast.metalKernel(
+    name: "laguna_sliding_qk_norm_rope_kvwrite_bf16_128_v1",
+    inputNames: [
+        "raw_queries", "raw_keys", "raw_values", "query_weight", "key_weight",
+        "angles", "cache_keys", "cache_values", "kv_row",
+    ],
+    outputNames: ["queries"],
+    source: lagunaDecodeQKNormKVWriteSource(
+        queryHeads: LagunaConstants.slidingAttentionHeads,
+        rotation: """
+            constexpr uint rotary_pairs = 64;
+            thread float paired[4];
+            for (uint i = 0; i < 4; ++i) {
+                paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
+            }
+            if (lane < 16) {
+                for (uint i = 0; i < 4; ++i) {
+                    uint pair = base + i;
+                    float first = float(normalized[i]);
+                    float second = paired[i];
+                    float cosine = angles[pair];
+                    float sine = angles[pair + rotary_pairs];
+                    output[pair] = bfloat(first * cosine - second * sine);
+                    output[pair + rotary_pairs] =
+                        bfloat(first * sine + second * cosine);
+                }
+            }
+            """
+    ),
+    // Every input here is already dense at its own data offset, and the two
+    // cache arrays MUST NOT be staged through a contiguous copy: the copy is
+    // what the kernel would then write into.
+    ensureRowContiguous: false
+)
+
+private let lagunaFullQKNormYaRNKVWriteKernel = MLXFast.metalKernel(
+    name: "laguna_full_qk_norm_yarn_kvwrite_bf16_128_v1",
+    inputNames: [
+        "raw_queries", "raw_keys", "raw_values", "query_weight", "key_weight",
+        "angles", "cache_keys", "cache_values", "kv_row",
+    ],
+    outputNames: ["queries"],
+    source: lagunaDecodeQKNormKVWriteSource(
+        queryHeads: LagunaConstants.fullAttentionHeads,
+        rotation: """
+            constexpr uint rotary_pairs = 32;
+            constexpr float yarn_mscale = 1.3465735912322998f;
+            thread float paired[4];
+            for (uint i = 0; i < 4; ++i) {
+                paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
+            }
+            if (lane < 8) {
+                bfloat rounded_mscale = bfloat(yarn_mscale);
+                for (uint i = 0; i < 4; ++i) {
+                    uint pair = base + i;
+                    float first =
+                        float(bfloat(normalized[i] * rounded_mscale));
+                    float second =
+                        float(bfloat(bfloat(paired[i]) * rounded_mscale));
+                    float cosine = angles[pair];
+                    float sine = angles[pair + rotary_pairs];
+                    output[pair] = bfloat(first * cosine - second * sine);
+                    output[pair + rotary_pairs] =
+                        bfloat(first * sine + second * cosine);
+                }
+            } else if (lane >= 16) {
+                for (uint i = 0; i < 4; ++i) {
+                    output[base + i] = normalized[i];
+                }
+            }
+            """
+    ),
+    ensureRowContiguous: false
+)
+
+/// Shape/layout contract every fused in-place KV write must satisfy.
+/// Anything outside it keeps the stock kernel plus `cache.update`.
+func lagunaFusedKVWriteAccepts(
+    target: FusedKVWriteTarget,
+    kvHeads: Int,
+    headDim: Int,
+    rawValues: MLXArray
+) -> Bool {
+    let keyShape = target.keys.shape
+    let valueShape = target.values.shape
+    guard keyShape.count == 4, valueShape.count == 4 else { return false }
+    guard keyShape[0] == 1, keyShape[1] == kvHeads, keyShape[3] == headDim else { return false }
+    guard valueShape[0] == 1, valueShape[1] == kvHeads, valueShape[3] == headDim else {
+        return false
+    }
+    guard target.keys.dtype == .bfloat16, target.values.dtype == .bfloat16 else { return false }
+    guard target.row >= 0, target.row < keyShape[2], target.row < valueShape[2] else {
+        return false
+    }
+    // The cache slices SDPA is handed must reach `sdpa_vector` without a
+    // staging copy (see the ordering note on `lagunaFusedKVWriteEnabled`);
+    // `kv_copy_unless` accepts `strides.back() == 1 && shape[0] == 1`, which
+    // a row-major-dense `[1, kvHeads, T, headDim]` store always satisfies.
+    guard target.keys.strides.last == 1, target.values.strides.last == 1 else { return false }
+    guard rawValues.dtype == .bfloat16, rawValues.size == kvHeads * headDim else { return false }
+    return true
+}
+
+/// Sliding-layer decode QK-norm + RoPE that also lands the K and V cache
+/// rows. Returns only the rotated queries; K and V now live in the cache.
+func lagunaSlidingQKNormRoPEKVWrite(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    rawValues: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray,
+    target: FusedKVWriteTarget
+) -> MLXArray {
+    let heads = LagunaConstants.slidingAttentionHeads
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    lagunaTrace("sliding qk norm+rope+kv write")
+    let outputs = lagunaSlidingQKNormRoPEKVWriteKernel(
+        [
+            rawQueries, rawKeys, rawValues, queryWeight, keyWeight, angles,
+            target.keys, target.values, LagunaKVRowConstants.shared.constant(target.row),
+        ],
+        grid: ((heads + kvHeads) * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
+        outputDTypes: [.bfloat16]
+    )
+    return outputs[0]
+}
+
+/// Full-attention twin of `lagunaSlidingQKNormRoPEKVWrite`.
+func lagunaFullQKNormYaRNKVWrite(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    rawValues: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray,
+    target: FusedKVWriteTarget
+) -> MLXArray {
+    let heads = LagunaConstants.fullAttentionHeads
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    lagunaTrace("full qk norm+yarn+kv write")
+    let outputs = lagunaFullQKNormYaRNKVWriteKernel(
+        [
+            rawQueries, rawKeys, rawValues, queryWeight, keyWeight, angles,
+            target.keys, target.values, LagunaKVRowConstants.shared.constant(target.row),
+        ],
+        grid: ((heads + kvHeads) * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
+        outputDTypes: [.bfloat16]
+    )
+    return outputs[0]
+}
+
 /// Multi-token sliding-layer Q/K RMSNorm + plain RoPE fusion. One dispatch
 /// replaces the stock four (`rms_single_row` q, `rms_single_row` k,
 /// `rope_bfloat16` q, `rope_bfloat16` k) for a whole prefill layer and
@@ -3026,8 +3309,48 @@ final class LagunaRuntimeAttention: Module {
             nHeads == LagunaConstants.fullAttentionHeads &&
             qkRoPEAngles?.shape == [1, 1, lagunaRoPEAngleAtlasLength, headDim / 2]
 
-        var qkNormRoPEFused = false
-        if useFusedFullQKNormYaRN, let qkRoPEAngles {
+        // Decode KV-cache write folded into the QK-norm/RoPE dispatch. The
+        // kernel lands the K row it already computed, plus a byte copy of the
+        // V row, at the addresses the cache's two `slice_update` dispatches
+        // would have written; the cache then advances its host-side `offset`
+        // (and ring cursor) exactly as `update` would, so the trusted
+        // worker's per-step offset audit is unaffected. Any shape, layout or
+        // cache state outside the accepted contract falls through to the
+        // stock kernel + `attentionWithCacheUpdate` below.
+        var fusedKVCacheState: (keys: MLXArray, values: MLXArray)?
+        if lagunaFusedKVWriteEnabled,
+            useFusedFullQKNormYaRN || useFusedSlidingQKNormRoPE,
+            let qkRoPEAngles,
+            let ringCache = cache as? BaseKVCache,
+            values.dtype == .bfloat16,
+            values.shape == [1, 1, nKVHeads * headDim],
+            let target = ringCache.fusedDecodeWriteTarget(),
+            lagunaFusedKVWriteAccepts(
+                target: target, kvHeads: nKVHeads, headDim: headDim, rawValues: values)
+        {
+            let rotated =
+                useFusedFullQKNormYaRN
+                ? lagunaFullQKNormYaRNKVWrite(
+                    rawQueries: queries, rawKeys: keys, rawValues: values,
+                    queryWeight: qNorm.weight, keyWeight: kNorm.weight,
+                    angles: qkRoPEAngles, target: target)
+                : lagunaSlidingQKNormRoPEKVWrite(
+                    rawQueries: queries, rawKeys: keys, rawValues: values,
+                    queryWeight: qNorm.weight, keyWeight: kNorm.weight,
+                    angles: qkRoPEAngles, target: target)
+            guard let committed = ringCache.commitFusedDecodeWrite(target) else {
+                preconditionFailure(
+                    "fused KV write target was invalidated before its commit")
+            }
+            queries = rotated
+            fusedKVCacheState = (keys: committed.0, values: committed.1)
+        }
+
+        var qkNormRoPEFused = fusedKVCacheState != nil
+        if fusedKVCacheState != nil {
+            // K and V are already in the cache; nothing left to normalize,
+            // rotate or reshape on this path.
+        } else if useFusedFullQKNormYaRN, let qkRoPEAngles {
             (queries, keys) = lagunaFullQKNormYaRN(
                 rawQueries: queries,
                 rawKeys: keys,
@@ -3083,24 +3406,40 @@ final class LagunaRuntimeAttention: Module {
         // `[B, H, 1, D]` have the same contiguous byte order. Reshape
         // directly so decode does not carry a no-op transpose view through
         // the lazy graph. Multi-token calls still require the real axis swap.
-        values =
-            L == 1
-            ? values.reshaped(B, nKVHeads, L, headDim)
-            : values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
+        if fusedKVCacheState == nil {
+            values =
+                L == 1
+                ? values.reshaped(B, nKVHeads, L, headDim)
+                : values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
+        }
 
         if !qkNormRoPEFused {
             queries = applyRotaryPosition(rope, to: queries, cache: cache)
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
-        let attended = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
-        )
+        let attended: MLXArray
+        if let fusedKVCacheState {
+            // The cache update already happened inside the QK-norm dispatch;
+            // `commitFusedDecodeWrite` returned the very slices
+            // `cache.update` would have returned for this token.
+            attended = MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: fusedKVCacheState.keys,
+                values: fusedKVCacheState.values,
+                scale: scale,
+                mask: mask
+            )
+        } else {
+            attended = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
+        }
         // SDPA returns `[B, H, L, D]`. When `L == 1`, flattening its
         // contiguous head-major payload directly produces the exact
         // `[B, 1, H*D]` byte order; the transpose only changes singleton-axis
@@ -3358,6 +3697,57 @@ final class LagunaRuntimeAttention: Module {
 /// kernel MLX selects.
 let lagunaNvfp4ScaleFoldEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_FOLD"] != "0"
+
+/// `DARKBLOOM_NVFP4_NIBBLE_SPLIT` (default `1` = split; set `0` for the stock
+/// shuffle, `2` for the 2-constant control arm): a strictly shorter
+/// instruction sequence that produces the SAME eight `half` bit patterns per
+/// code word. Values, dtypes, FP32 accumulation and its order, and the single
+/// final BF16 round are untouched -- only the integer sequence that builds the
+/// half bit patterns changes.
+///
+///   0  stock. Each of the four `half2` words takes its own magnitude
+///      shift+mask, its own sign shift+mask and an OR: 5 int ops (4 for `p3`,
+///      whose sign is already in place) = **19 per code word, 38 per 16-value
+///      group**, spread over **eight distinct 32-bit mask constants**.
+///
+///   1  split. Separate the even and odd nibbles once, and in the same step
+///      slide each nibble's sign three places so magnitude and sign sit at a
+///      FIXED offset from one another. After that one shift+mask yields a
+///      whole `half2`:
+///
+///          xe = c & 0x0F0F0F0F   even nibbles: mag 4j..4j+2, sign 4j+3
+///          ge = xe | (xe << 3)   sign copied to 4j+6 -- those bits are zero
+///                                in `xe`, so the OR cannot collide
+///          yo = c & 0xF0F0F0F0   odd nibbles
+///          go = yo | (yo >> 3)   mag copied down to 4j-3..4j-1, sign kept
+///          p0 = (ge << 9) & M    p2 = (ge << 1) & M
+///          p1 = (go << 8) & M    p3 =  go       & M     M = 0x8E008E00
+///
+///      **13 int ops per code word, 26 per group (-12), and three mask
+///      constants instead of eight (-5 live constant registers).**
+///
+///   2  the op-count control. Identical 19-op structure to stock -- shift
+///      first, then mask -- but only TWO distinct mask constants. It isolates
+///      "fewer live constants" from "fewer instructions": if `2` alone moves
+///      the needle the win is register pressure, if only `1` moves it the win
+///      is the instruction count.
+///
+/// Bit-exactness is by construction, not tolerance. Every form here is an OR
+/// of masked shifts, so each output bit is an OR of a fixed subset of input
+/// bits and the 33 single-bit basis words pin the function completely. All 33
+/// basis words plus 300 000 random words agree bit-for-bit with stock, and
+/// decoding every (nibble position, code) pair through both yields the
+/// identical float -- the NVFP4 alphabet {0, .5, 1, 1.5, 2, 3, 4, 6} x 2^-14.
+///
+/// Composes with `DARKBLOOM_NVFP4_SCALE_FOLD`: that flag scales the decoded
+/// weights, this one only changes how their bits are assembled.
+let lagunaNvfp4NibbleSplit: Int = {
+    guard
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_NIBBLE_SPLIT"],
+        let value = Int(raw), (0 ... 2).contains(value)
+    else { return 1 }
+    return value
+}()
 private let lagunaSharedSwiGLUQMVHeader: String = {
     // The two halves of one power-of-two regrouping. They MUST move together:
     // the scale absorbs `2^14` exactly when the weights stop applying it.
@@ -3368,6 +3758,42 @@ private let lagunaSharedSwiGLUQMVHeader: String = {
         : "        return float(signed_value);"
     let scale256 = lagunaNvfp4ScaleFoldEnabled ? "" : "        converted *= 256.0;\n"
     let weightScale = lagunaNvfp4ScaleFoldEnabled ? "" : " * 16384.0f"
+    let extract: String
+    switch lagunaNvfp4NibbleSplit {
+    case 1:
+        extract = """
+                    const uint xe = c & 0x0F0F0F0Fu;
+                    const uint ge = xe | (xe << 3);
+                    const uint yo = c & 0xF0F0F0F0u;
+                    const uint go = yo | (yo >> 3);
+                    const uint p0 = (ge << 9) & 0x8E008E00u;
+                    const uint p1 = (go << 8) & 0x8E008E00u;
+                    const uint p2 = (ge << 1) & 0x8E008E00u;
+                    const uint p3 = go & 0x8E008E00u;
+            """
+    case 2:
+        extract = """
+                    const uint p0 =
+                        ((c << 9) & 0x0E000E00u) | ((c << 12) & 0x80008000u);
+                    const uint p1 =
+                        ((c << 5) & 0x0E000E00u) | ((c << 8) & 0x80008000u);
+                    const uint p2 =
+                        ((c << 1) & 0x0E000E00u) | ((c << 4) & 0x80008000u);
+                    const uint p3 =
+                        ((c >> 3) & 0x0E000E00u) | (c & 0x80008000u);
+            """
+    default:
+        extract = """
+                    const uint p0 =
+                        ((c & 0x00070007u) << 9) | ((c & 0x00080008u) << 12);
+                    const uint p1 =
+                        ((c & 0x00700070u) << 5) | ((c & 0x00800080u) << 8);
+                    const uint p2 =
+                        ((c & 0x07000700u) << 1) | ((c & 0x08000800u) << 4);
+                    const uint p3 =
+                        ((c & 0x70007000u) >> 3) | (c & 0x80008000u);
+            """
+    }
     return """
     static inline float laguna_nvfp4_scale(uint8_t bits) {
         ushort raw = ushort(bits & 127) << 7;
@@ -3384,14 +3810,7 @@ private let lagunaSharedSwiGLUQMVHeader: String = {
         float accum = 0.0f;
         for (uint j = 0; j < 2; ++j) {
             const uint c = (j == 0) ? codes.x : codes.y;
-            const uint p0 =
-                ((c & 0x00070007u) << 9) | ((c & 0x00080008u) << 12);
-            const uint p1 =
-                ((c & 0x00700070u) << 5) | ((c & 0x00800080u) << 8);
-            const uint p2 =
-                ((c & 0x07000700u) << 1) | ((c & 0x08000800u) << 4);
-            const uint p3 =
-                ((c & 0x70007000u) >> 3) | (c & 0x80008000u);
+    \(extract)
             const float2 v04 = float2(as_type<half2>(p0))\(weightScale);
             const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
             const float2 v26 = float2(as_type<half2>(p2))\(weightScale);
