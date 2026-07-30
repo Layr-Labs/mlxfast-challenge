@@ -248,13 +248,13 @@ let lagunaFusedRoutedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV"] != "0"
 
-/// Scheduling A/B for the merged routed/shared gate/up kernel. The proven R2
-/// schedule is the default; only an explicit selector value of `4` opts into
-/// the R4 control. R4 preserves each row's arithmetic; its only risk is
-/// performance from higher register pressure/occupancy tradeoffs.
+/// Scheduling A/B for the merged routed/shared gate/up kernel. The R4 twin is
+/// the candidate default; set the selector to `2` for the proven
+/// two-row-per-SIMD control. R4 preserves each row's arithmetic; its only risk
+/// is performance from higher register pressure/occupancy tradeoffs.
 let lagunaRoutedSharedSwiGLUQMVRows4Enabled =
     ProcessInfo.processInfo.environment[
-        "DARKBLOOM_ROUTED_SHARED_SWIGLU_ROWS"] == "4"
+        "DARKBLOOM_ROUTED_SHARED_SWIGLU_ROWS"] != "2"
 
 /// Folds the per-head softplus gate into the output projection's GEMV (see
 /// `lagunaGatedOutputProjectionSource`), with one kernel variant per attention
@@ -471,17 +471,6 @@ let lagunaFusedSlidingQKNormRoPEEnabled =
 /// the verbatim stock path.
 private let lagunaPrefillQKNormRoPEEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_QK_NORM_ROPE"] != "0"
-
-/// Terminal-prefill projection banking. The last decoder layer consumes Q and
-/// the per-head gate for only the final supplied row, while K/V must still be
-/// produced for every row so the cache advances normally. Retained `[Q; G]`
-/// and `[K; V]` BF16 banks therefore turn four independent projections into
-/// two without changing any output row's contraction or rounding. Set
-/// `DARKBLOOM_LAST_PREFILL_PROJECTION_BANKS=0` to restore the four stock
-/// `Linear` calls and skip allocating the two derived banks.
-private let lagunaLastPrefillProjectionBanksEnabled =
-    ProcessInfo.processInfo.environment[
-        "DARKBLOOM_LAST_PREFILL_PROJECTION_BANKS"] != "0"
 
 /// Full-attention counterpart: fuses per-head Q/K RMSNorm with partial YaRN
 /// RoPE. One stock FP32 probe row carries the authoritative rotary factors,
@@ -2604,13 +2593,6 @@ final class LagunaRuntimeAttention: Module {
     /// arrays for parameter integrity.
     var _fusedQKVWeight: MLXArray?
 
-    /// Terminal-prefill-only BF16 side banks. Q and the per-head gate share
-    /// the singleton final normalized row; K and V share every normalized
-    /// supplied row. The authoritative modules remain intact for checkpoint
-    /// loading and every fallback path.
-    var _lastPrefillQGateWeight: MLXArray?
-    var _lastPrefillKVWeight: MLXArray?
-
     /// Derived native group-32 affine layout for one serial decode token's
     /// Q/K/V batch. The original BF16 parameters remain authoritative and
     /// continue to serve prefill.
@@ -2741,41 +2723,6 @@ final class LagunaRuntimeAttention: Module {
         let fused = concatenated([wq.weight, wk.weight, wv.weight], axis: 0)
         _fusedQKVWeight = fused
         return fused
-    }
-
-    /// Build the two terminal-prefill projection banks once after checkpoint
-    /// load. Only the final sliding layer can dispatch them. Concatenating
-    /// output rows is exact for bias-free `Linear`: each row retains the same
-    /// K loop, BF16 inputs and BF16 weight bytes, independent of which other
-    /// output rows share the matmul dispatch.
-    func prepareLastPrefillProjectionWeights() -> [MLXArray] {
-        guard lagunaLastPrefillProjectionBanksEnabled,
-            _lastPrefillQGateWeight == nil,
-            _lastPrefillKVWeight == nil,
-            layerIdx == LagunaConstants.numHiddenLayers - 1,
-            isSliding, gatingEnabled, gatePerHead,
-            let gProj,
-            type(of: wq) == Linear.self,
-            type(of: wk) == Linear.self,
-            type(of: wv) == Linear.self,
-            type(of: gProj) == Linear.self,
-            wq.bias == nil, wk.bias == nil, wv.bias == nil, gProj.bias == nil,
-            wq.weight.dtype == .bfloat16,
-            wk.weight.dtype == .bfloat16,
-            wv.weight.dtype == .bfloat16,
-            gProj.weight.dtype == .bfloat16,
-            wq.weight.shape == [nHeads * headDim, LagunaConstants.hiddenSize],
-            wk.weight.shape == [nKVHeads * headDim, LagunaConstants.hiddenSize],
-            wv.weight.shape == [nKVHeads * headDim, LagunaConstants.hiddenSize],
-            gProj.weight.shape == [nHeads, LagunaConstants.hiddenSize]
-        else {
-            return []
-        }
-        let qGate = concatenated([wq.weight, gProj.weight], axis: 0)
-        let kv = concatenated([wk.weight, wv.weight], axis: 0)
-        _lastPrefillQGateWeight = qGate
-        _lastPrefillKVWeight = kv
-        return [qGate, kv]
     }
 
     init(_ config: LagunaConfig, layerIdx: Int) {
@@ -3243,40 +3190,9 @@ final class LagunaRuntimeAttention: Module {
         precondition(L > 1)
 
         let lastInput = lagunaLastTokenHidden(x)
-        var queries: MLXArray
-        var keys: MLXArray
-        var values: MLXArray
-        let bankedGate: MLXArray?
-        if lagunaLastPrefillProjectionBanksEnabled,
-            let qGateWeight = _lastPrefillQGateWeight,
-            let kvWeight = _lastPrefillKVWeight,
-            B == 1,
-            isSliding, gatingEnabled, gatePerHead,
-            lastInput.dtype == .bfloat16,
-            x.dtype == .bfloat16,
-            lastInput.shape == [1, 1, LagunaConstants.hiddenSize],
-            x.shape == [1, L, LagunaConstants.hiddenSize],
-            qGateWeight.dtype == .bfloat16,
-            kvWeight.dtype == .bfloat16,
-            qGateWeight.shape == [nHeads * headDim + nHeads, LagunaConstants.hiddenSize],
-            kvWeight.shape == [2 * nKVHeads * headDim, LagunaConstants.hiddenSize]
-        {
-            let qGate = matmul(lastInput, qGateWeight.T)
-            let queryDim = nHeads * headDim
-            queries = qGate[.ellipsis, 0 ..< queryDim]
-            bankedGate = qGate[.ellipsis, queryDim ..< (queryDim + nHeads)]
-
-            let kv = matmul(x, kvWeight.T)
-            let kvDim = nKVHeads * headDim
-            keys = kv[.ellipsis, 0 ..< kvDim]
-            values = kv[.ellipsis, kvDim ..< (2 * kvDim)]
-            lagunaTrace("last prefill Q+gate / K+V projection banks")
-        } else {
-            queries = wq(lastInput)
-            keys = wk(x)
-            values = wv(x)
-            bankedGate = nil
-        }
+        var queries = wq(lastInput)
+        var keys = wk(x)
+        var values = wv(x)
 
         queries = qNorm(queries.reshaped(B, 1, nHeads, headDim)).transposed(0, 2, 1, 3)
         keys = kNorm(keys.reshaped(B, L, nKVHeads, headDim)).transposed(0, 2, 1, 3)
@@ -3302,7 +3218,7 @@ final class LagunaRuntimeAttention: Module {
         var output = attended.reshaped(B, 1, -1)
 
         if gatingEnabled, let gProj {
-            let projectedGate = bankedGate ?? gProj(lastInput)
+            let projectedGate = gProj(lastInput)
             let gate =
                 gatePerHead && projectedGate.dtype == output.dtype
                 ? lagunaCompiledSoftplusGate(projectedGate)
@@ -4337,9 +4253,9 @@ func lagunaRoutedSharedSwiGLUQMV(
         lagunaRoutedSharedSwiGLUQMVRows4Enabled
         ? lagunaRoutedSharedSwiGLUQMVRows4Kernel
         : lagunaRoutedSharedSwiGLUQMVKernel
-    // The R4 control covers eight rows per 64-thread group, so 64 tiles per
-    // each of the nine slots dispatch exactly 576 threadgroups. The default R2
-    // schedule retains its original 128 tiles per slot.
+    // R4 covers eight rows per 64-thread group, so 64 tiles per each of the
+    // nine slots dispatch exactly 576 threadgroups. The default R2 control
+    // retains its original 128 tiles per slot.
     let tilesPerSlot = lagunaRoutedSharedSwiGLUQMVRows4Enabled ? 64 : 128
     let outputs = kernel(
         [input, routedWeight, routedScales, indices, sharedWeight, sharedScales],
@@ -7252,8 +7168,6 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
             if lagunaFusedQKVEnabled, let fused = layer.selfAttn.prepareFusedQKVWeight() {
                 fusedArrays.append(fused)
             }
-            fusedArrays.append(
-                contentsOf: layer.selfAttn.prepareLastPrefillProjectionWeights())
             if let sparse = layer.mlp as? LagunaRuntimeSparseMoEBlock {
                 if lagunaFusedSharedGateUpEnabled {
                     fusedArrays.append(contentsOf: sparse.sharedExpert.prepareFusedSharedGateUp())
