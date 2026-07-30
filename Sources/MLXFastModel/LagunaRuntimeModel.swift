@@ -1,3 +1,5 @@
+// Diagnostic re-run of the promoted 9d312950 package: this comment is the
+// only source change, so the compiled binary and all behavior are identical.
 import Foundation
 import MLX
 import MLXFast
