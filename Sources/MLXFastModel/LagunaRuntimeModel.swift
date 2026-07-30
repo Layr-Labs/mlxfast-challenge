@@ -269,6 +269,41 @@ let lagunaFusedGatedOutputProjectionEnabled =
 let lagunaFusedQKVProjectionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV_PROJECTION"] != "0"
 
+/// Folds the layer's input RMSNorm into the native-affine attention bank's own
+/// quantized GEMV (see `lagunaFusedAffineNormQMVSource`).
+///
+/// After the `g_proj` INT8 fold (submission `21805f6c`) and its deferred
+/// softplus, the whole decode attention front end on an INT8-bank layer is
+/// exactly TWO dispatches: MLX's `rms_single_row`, then one
+/// `affine_qmv_fast` over the four-slot `[Wq; Wk; Wv; Wg]` bank. Everything
+/// else in that block is a view or has moved downstream into
+/// `lagunaGateProductSoftplus`. This removes the first of those two: each
+/// threadgroup recomputes the 2048-wide norm from the raw residual row — 4 KB
+/// of cached read and one 2048-element reduction against ~147 KB of weight
+/// traffic per threadgroup — and keeps the normalized row in threadgroup
+/// memory for its own K loop, so the norm leaves the dependency chain
+/// entirely and the layer spends one dispatch where it spent two. This is
+/// precisely the follow-up `21805f6c`'s note named as its own next step.
+///
+/// Chunked on the established prefix pattern.
+/// `DARKBLOOM_FUSED_NORM_AFFINE_QMV_LAYERS=0` (or
+/// `DARKBLOOM_FUSED_NORM_AFFINE_QMV=0`) restores the exact two-dispatch path
+/// inside the same binary. Default 32 = the whole eligible pool: layers 32-39
+/// carry the NVFP4 group-16 bank, which this kernel declines on wire format,
+/// so a larger count would silently do nothing for them.
+private let lagunaFusedNormAffineQMVLayerCount: Int = {
+    guard ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_NORM_AFFINE_QMV"] != "0"
+    else { return 0 }
+    let requested = Int(
+        ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_NORM_AFFINE_QMV_LAYERS"]
+            ?? "32") ?? 32
+    return min(max(requested, 0), LagunaConstants.numHiddenLayers)
+}()
+
+private func lagunaUseFusedNormAffineQMV(layer: Int) -> Bool {
+    layer < lagunaFusedNormAffineQMVLayerCount
+}
+
 /// TensorFold-derived within-token batching for the serial decode stream.
 /// A native group-32 affine INT8 side layout packs Q/K/V into one batched
 /// quantized matmul, cutting their weight traffic without speculating future
@@ -472,6 +507,10 @@ let lagunaFusedSlidingQKNormRoPEEnabled =
 private let lagunaPrefillQKNormRoPEEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_QK_NORM_ROPE"] != "0"
 
+/// Telemetry re-roll nonce r4: unchanged candidate, official retry per the
+/// established unchanged-resubmission practice (cf. e8e195b5's promoted nonce).
+/// Prior attempt 212e97cf died on n=4 telemetry then the 25.7s-window
+/// plausibility artifact; both RESULT lines showed a promoting score.
 /// Terminal-prefill projection banking. The last decoder layer consumes Q and
 /// the per-head gate for only the final supplied row, while K/V must still be
 /// produced for every row so the cache advances normally. Retained `[Q; G]`
@@ -2154,6 +2193,292 @@ func lagunaFusedNormQKVProjection(
     return (outputs[0], outputs[1], outputs[2], outputs[3], true)
 }
 
+/// The two MLX quantized-GEMV primitives this file replicates textually, at
+/// the single instantiation the decode attention bank selects:
+/// `load_vector<bfloat16_t, float, 8, 8>` and `qdot<float, 8, 8>` from
+/// `mlx/backend/metal/kernels/quantized.h` (runtime-effective twin:
+/// `mlx-generated/quantized.cpp`).
+///
+/// They are copied statement for statement, not re-derived. `bits == 8` takes
+/// the last branch of each template, which is the plain in-order loop over
+/// `values_per_thread`; every other branch is bit-packing bookkeeping for
+/// sub-byte formats and cannot be reached here. The accumulator type `U` is
+/// `float` because `qmv_fast_impl` hardcodes `typedef float U`. The only
+/// deviation is the address space of `x`: MLX reads the normalized row back
+/// from device memory, this kernel reads the same bits from the threadgroup
+/// copy it just produced. `sum += x[i]` and `x_thread[i] = x[i]` are a BF16 ->
+/// float promotion in both cases, and the promotion is exact and address-space
+/// independent, so every downstream value is unchanged.
+///
+/// `scale * accum + sum * bias` is kept as one returned expression inside a
+/// function, exactly as `qdot` spells it, so the compiler makes the same
+/// contraction decision it makes for MLX's own kernel. `device.cpp:631` sets
+/// `setFastMathEnabled(false)` for both the JIT quantized kernels and these
+/// custom kernels, so neither side may reassociate the loops.
+private let lagunaFusedAffineQMVHeader = """
+    static inline float laguna_affine_load_vector_8(
+        const threadgroup bfloat* x,
+        thread float* x_thread) {
+      float sum = 0;
+      for (int i = 0; i < 8; i++) {
+        sum += x[i];
+        x_thread[i] = x[i];
+      }
+      return sum;
+    }
+
+    static inline float laguna_affine_qdot_8(
+        const device uint8_t* w,
+        const thread float* x_thread,
+        float scale,
+        float bias,
+        float sum) {
+      float accum = 0;
+      for (int i = 0; i < 8; i++) {
+        accum += x_thread[i] * w[i];
+      }
+      return scale * accum + sum * bias;
+    }
+    """
+
+/// Decode-only fusion of the layer's input RMSNorm into the native-affine
+/// attention bank's own quantized GEMV: one dispatch that produces exactly the
+/// bytes `quantizedMM(inputNorm(input), bank...)` produces.
+///
+/// The kernel is deliberately shaped as a drop-in for that pair. It emits one
+/// `[1, 1, bankRows]` BF16 row, so every consumer downstream — the Q/K/V
+/// slices, the gate-logit tail slice, the deferred-softplus decision — is the
+/// unchanged stock code operating on an identical buffer.
+///
+/// ## Which MLX kernel is being replicated, and why that one
+///
+/// `QuantizedMatmul::eval_gpu` (`backend/metal/quantized.cpp`) sees `M == 1`,
+/// `transpose_ == true`, so it takes `dispatch_qmv`. `K == 2048` is neither
+/// 128 nor 64, so `qmv_quad` is skipped and `qmv` runs. There `bn == 8`,
+/// `bk == 32`, and `fast = (N % 8 == 0 && K % 512 == 0)`. Every bank shape
+/// this kernel serves satisfies both: with the `g_proj` rows folded in the
+/// bank is `[10304, 2048]` on sliding layers and `[8240, 2048]` on
+/// full-attention layers (10304 = 8 * 1288, 8240 = 8 * 1030), and without
+/// them `[10240, 2048]` / `[8192, 2048]`. So the selected kernel is
+/// `affine_qmv_fast_bfloat16_gs_32_b_8_batch_0` in all four cases.
+/// `is_nax_available()` is not consulted anywhere on the qmv path — only
+/// `qmm`/`gather_qmm` route to NAX — so the ranked M5 box and every local
+/// Apple Silicon generation run the same `qmv_fast_impl`, and this replica is
+/// correct on both.
+///
+/// ## The contraction, element by element
+///
+/// `qmv_fast_impl` at `group_size == 32, bits == 8` instantiates
+/// `packs_per_thread == 2`, `pack_factor == 4`, `bytes_per_pack == 4`, hence
+/// `values_per_thread == 8` and `block_size == 256`;
+/// `scale_step_per_thread == 32 / 8 == 4`. Row addressing is
+/// `in_vec_size_w == 2048` bytes and `in_vec_size_g == 64` groups per row,
+/// `num_simdgroups == 2`, `results_per_simdgroup == 4`.
+///
+/// So for output row `r` the arithmetic is fully determined by `r` alone:
+/// lane `l` owns columns `8l + 256k` for `k in 0..<8`; it forms
+/// `sum = Σ_i x[8l + 256k + i]` and `x_thread[i]` in ascending `i`, reads the
+/// row's `scales[64r + 8k + l/4]` and `biases[...]`, accumulates
+/// `Σ_i x_thread[i] * uint8(codes[2048r + 8l + 256k + i])` in ascending `i`,
+/// and adds `scale * accum + sum * bias` into a per-row FP32 register in
+/// ascending `k`. The 32 lane partials then meet in `simd_sum` and lane 0
+/// rounds once to BF16.
+///
+/// Nothing in that description mentions the threadgroup: `out_row` is the only
+/// coupling between a row and its dispatch, and `tid.y * 8 + simd_gid * 4`
+/// versus this kernel's `tile * 64 + simd_group * 4` are two enumerations of
+/// the same set of `(row, lane)` assignments. Regrouping rows across
+/// threadgroups is therefore a bijection, exactly as it is for the BF16
+/// `lagunaFusedQKVProjectionSource` (SM 1, SN 32 there), and `simd_sum` is the
+/// same intrinsic on both sides so its implementation-defined reduction order
+/// cancels.
+///
+/// This argument is indifferent to what a row MEANS, which is why the
+/// four-slot bank needs no special handling: the folded `g_proj` rows are
+/// group-32 affine INT8 rows of the same bank, so they are contracted by the
+/// same row-local loop and land in the same tail slice the stock path reads.
+/// `bankRows` is not required to be a multiple of the 64 rows a threadgroup
+/// owns — `[8240, 2048]` is not — so the last tile's surplus simdgroups exit
+/// on `out_row >= bank_rows`. Every bank shape is a multiple of the 4 rows a
+/// SIMDGROUP owns, so a simdgroup is never half in range, and the guard sits
+/// after the norm's barriers so no thread skips a rendezvous.
+///
+/// ## Quantization envelope
+///
+/// Nothing is requantized here. `packedCodes`, `scales` and `biases` are the
+/// same arrays `prepareNativeAffineQKVWeight` built and the same ones the
+/// stock branch hands to `quantizedMM`; this is relayout-free consumption plus
+/// scheduling, inside the accepted envelope by construction.
+///
+/// ## RMSNorm
+///
+/// The prologue is the certified text from `lagunaFusedQKVProjectionSource`,
+/// unchanged, and reproduces `rms_single_row` at `axis_size == 2048`,
+/// `N_READS == 4` and a 512-thread group, which is exactly the shape MLX
+/// dispatches for this row: thread `lid` squares its own contiguous four
+/// elements in index order, `simd_sum` inside each of the sixteen simdgroups,
+/// lane 0 of each writes into `local_sums`, simdgroup 0 `simd_sum`s those, and
+/// `precise::rsqrt(acc / 2048 + eps)` is broadcast. The BF16 rounding stays
+/// inside `w[i] * bfloat(x[i] * inv)`, which is the value the separate kernel
+/// would have written and this GEMV would have read back. `rms_norm_eps` is
+/// checked to be exactly `1e-6` by the config invariant, which is why the
+/// kernel may spell it as a literal.
+private func lagunaFusedAffineNormQMVSource(bankRows: Int) -> String {
+    """
+    constexpr uint in_vec_size = \(LagunaConstants.hiddenSize);
+    constexpr uint bank_rows = \(bankRows);
+    constexpr uint rows_per_thread = 4;
+    constexpr uint values_per_thread = 4;
+    constexpr uint rows_per_group = 64;
+    constexpr float norm_eps = 1.0e-6f;
+
+    // qmv_fast_impl instantiation constants for group_size 32 / bits 8.
+    constexpr uint qmv_values_per_thread = 8;
+    constexpr uint qmv_block_size = 256;
+    constexpr uint row_code_bytes = in_vec_size;
+    constexpr uint row_scale_count = in_vec_size / 32;
+
+    uint tile = threadgroup_position_in_grid.x;
+    uint local_id = thread_position_in_threadgroup.x;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+
+    // --- input RMSNorm, mirroring rms_single_row at 512 threads ---
+    \(lagunaNormInvMeanScratch)
+    threadgroup float local_sums[32];
+    threadgroup bfloat normalized_row[in_vec_size];
+
+    uint norm_base = local_id * values_per_thread;
+    thread float raw[values_per_thread];
+    float acc = 0.0f;
+    for (uint i = 0; i < values_per_thread; ++i) {
+        raw[i] = float(residual[norm_base + i]);
+        acc += raw[i] * raw[i];
+    }
+    acc = simd_sum(acc);
+    \(lagunaNormReductionTailQKV)
+
+    for (uint i = 0; i < values_per_thread; ++i) {
+        bfloat value =
+            norm_weight[norm_base + i] *
+            bfloat(raw[i] * laguna_inv_mean);
+        normalized_row[norm_base + i] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- the bank's rows, replicating affine_qmv_fast ---
+    uint out_row = tile * rows_per_group + simd_group * rows_per_thread;
+    if (out_row >= bank_rows) {
+        return;
+    }
+
+    const device uint8_t* ws = (const device uint8_t*)qkv_codes;
+    ws += out_row * row_code_bytes + lane * qmv_values_per_thread;
+    const device bfloat* row_scales =
+        qkv_scales + out_row * row_scale_count + lane / 4;
+    const device bfloat* row_biases =
+        qkv_biases + out_row * row_scale_count + lane / 4;
+    const threadgroup bfloat* x = normalized_row + lane * qmv_values_per_thread;
+
+    thread float x_thread[qmv_values_per_thread];
+    thread float result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint k = 0; k < in_vec_size; k += qmv_block_size) {
+        float sum = laguna_affine_load_vector_8(x, x_thread);
+
+        for (uint row = 0; row < rows_per_thread; ++row) {
+            const device uint8_t* wl = ws + row * row_code_bytes;
+            float s = row_scales[row * row_scale_count];
+            float b = row_biases[row * row_scale_count];
+            result[row] += laguna_affine_qdot_8(wl, x_thread, s, b, sum);
+        }
+
+        ws += qmv_block_size;
+        row_scales += qmv_block_size / 32;
+        row_biases += qmv_block_size / 32;
+        x += qmv_block_size;
+    }
+
+    for (uint row = 0; row < rows_per_thread; ++row) {
+        result[row] = simd_sum(result[row]);
+        if (lane == 0) {
+            qkv[out_row + row] = bfloat(result[row]);
+        }
+    }
+    """
+}
+
+/// The four bank widths the decode path can present: sliding/full attention,
+/// each with and without the folded `g_proj` rows. Precomputed rather than
+/// memoized so the table stays an immutable `let` like every other kernel
+/// table in this file.
+private let lagunaFusedAffineNormQMVBankRows: [Int] = {
+    let kv = 2 * LagunaConstants.numKeyValueHeads * LagunaConstants.headDim
+    var widths: Set<Int> = []
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        let base = heads * LagunaConstants.headDim + kv
+        widths.insert(base)
+        widths.insert(base + heads)
+    }
+    return widths.sorted()
+}()
+
+private let lagunaFusedAffineNormQMVKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for bankRows in lagunaFusedAffineNormQMVBankRows {
+        kernels[bankRows] = MLXFast.metalKernel(
+            name: "laguna_fused_norm_affine_qmv_bf16_n\(bankRows)_v1",
+            inputNames: [
+                "residual", "norm_weight", "qkv_codes", "qkv_scales", "qkv_biases",
+            ],
+            outputNames: ["qkv"],
+            source: lagunaFusedAffineNormQMVSource(bankRows: bankRows),
+            header: lagunaFusedAffineQMVHeader,
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+/// One-dispatch `inputNorm(input)` + group-32 affine INT8 bank GEMV. Returns
+/// `nil` — leaving the caller on the stock two-dispatch pair — for any shape,
+/// dtype or wire format this kernel was not certified against.
+func lagunaFusedNormAffineQMV(
+    residual: MLXArray,
+    normWeight: MLXArray,
+    bank: LagunaNativeAffineWeight
+) -> MLXArray? {
+    let hidden = LagunaConstants.hiddenSize
+    guard bank.mode == .affine, bank.bits == 8, bank.groupSize == 32,
+        let biases = bank.biases,
+        bank.originalShape.count == 2, bank.originalShape[1] == hidden
+    else {
+        return nil
+    }
+    let bankRows = bank.originalShape[0]
+    guard let kernel = lagunaFusedAffineNormQMVKernels[bankRows],
+        bankRows.isMultiple(of: 4),
+        residual.dtype == .bfloat16, residual.shape == [1, 1, hidden],
+        normWeight.dtype == .bfloat16, normWeight.shape == [hidden],
+        bank.packedCodes.dtype == .uint32,
+        bank.packedCodes.shape == [bankRows, hidden / 4],
+        bank.scales.dtype == .bfloat16, bank.scales.shape == [bankRows, hidden / 32],
+        biases.dtype == .bfloat16, biases.shape == [bankRows, hidden / 32]
+    else {
+        return nil
+    }
+
+    let tiles = (bankRows + 63) / 64
+    lagunaTrace("norm+affine bank qmv n\(bankRows)")
+    return kernel(
+        [residual, normWeight, bank.packedCodes, bank.scales, biases],
+        grid: (tiles * 512, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [[1, 1, bankRows]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 /// Decode-only fusion of the per-head attention gate with the output
 /// projection. The stock decode path is two dispatches: one compiled
 /// elementwise kernel that softplus-gates the attention output, and one GEMV
@@ -2863,17 +3188,49 @@ final class LagunaRuntimeAttention: Module {
             if lagunaUseNativeAffineQKV(layer: layerIdx),
                 let fusedAffine = _nativeAffineQKV
             {
-                let normalized = inputNorm(input)
-                let qkv = quantizedMM(
-                    normalized,
-                    fusedAffine.packedCodes,
-                    scales: fusedAffine.scales,
-                    biases: fusedAffine.biases,
-                    transpose: true,
-                    groupSize: fusedAffine.groupSize,
-                    bits: fusedAffine.bits,
-                    mode: fusedAffine.mode
-                )
+                // One dispatch for the input RMSNorm and the whole bank GEMV
+                // where this chunk covers the layer and the bank is group-32
+                // affine INT8; otherwise the stock pair. `fusedNorm` is
+                // byte-identical to `quantizedMM(inputNorm(input), ...)`, so
+                // everything below is the unchanged stock code either way —
+                // including the gate-tail slice and the deferred softplus.
+                //
+                // Requiring the gate rows to ride the bank is what makes the
+                // normalized row dead after this dispatch: it is the one
+                // configuration in which nothing outside the bank GEMV reads
+                // it. With `DARKBLOOM_NATIVE_AFFINE_GPROJ=0`, or on an
+                // NVFP4-tail layer, the gate still needs a device-visible
+                // normalized row, so the fusion declines and the stock pair
+                // runs unchanged rather than paying a dispatch to materialize
+                // what it just discarded.
+                let fusedNorm =
+                    lagunaUseFusedNormAffineQMV(layer: layerIdx)
+                        && _nativeAffineQKVGateRows == nHeads
+                    ? lagunaFusedNormAffineQMV(
+                        residual: input,
+                        normWeight: inputNorm.weight,
+                        bank: fusedAffine)
+                    : nil
+                let normalized: MLXArray? =
+                    fusedNorm == nil ? inputNorm(input) : nil
+                let qkv: MLXArray
+                if let fusedNorm {
+                    qkv = fusedNorm
+                } else {
+                    guard let normalized else {
+                        preconditionFailure("native affine QKV requires normalized input")
+                    }
+                    qkv = quantizedMM(
+                        normalized,
+                        fusedAffine.packedCodes,
+                        scales: fusedAffine.scales,
+                        biases: fusedAffine.biases,
+                        transpose: true,
+                        groupSize: fusedAffine.groupSize,
+                        bits: fusedAffine.bits,
+                        mode: fusedAffine.mode
+                    )
+                }
                 let queryDim = nHeads * headDim
                 let kvDim = nKVHeads * headDim
                 let gateStart = queryDim + 2 * kvDim
@@ -2887,6 +3244,9 @@ final class LagunaRuntimeAttention: Module {
                     // NVFP4-tail layer: the gate keeps its own group-32 INT8
                     // bank (the envelope caps g_proj there) and replaces the
                     // BF16 GEMV one dispatch for one dispatch.
+                    guard let normalized else {
+                        preconditionFailure("standalone affine gate requires normalized input")
+                    }
                     gateLogits = quantizedMM(
                         normalized,
                         affineGate.packedCodes,
@@ -2898,6 +3258,9 @@ final class LagunaRuntimeAttention: Module {
                         mode: affineGate.mode
                     )
                 } else {
+                    guard let normalized else {
+                        preconditionFailure("stock gate projection requires normalized input")
+                    }
                     gateLogits = gateProjection(normalized)
                 }
                 // When the fused gate-product kernel will consume the gate at
@@ -6873,6 +7236,18 @@ final class LagunaRuntimeModelInner: Module {
     var _fullRoPEAngleAtlas: MLXArray?
     var _slidingRoPEAngleAtlas: MLXArray?
 
+    /// Process-constant per-layer "is full-attention" flags. Built once at
+    /// init so the hot decode/prefill loop does not re-branch on
+    /// `layerTypes[i] == .full` for every token. Pure control-flow
+    /// specialization: same ops, same order, same values.
+    /// Kill with `DARKBLOOM_LAYER_PLAN=0`.
+    private let layerIsFull: [Bool]
+    /// Process-constant decode async-eval fire mask (bit i ⇒ fire after layer
+    /// i). Computed once from the same `lagunaDecodeAsyncStage` schedule the
+    /// loop already consults, so the hot path becomes a bitmask test instead
+    /// of a multi-way enum switch per layer. Bit-exact: same fire set.
+    private let decodeAsyncFireMask: UInt64
+
     init(_ config: LagunaConfig) {
         precondition(config.vocabSize > 0)
 
@@ -6889,6 +7264,31 @@ final class LagunaRuntimeModelInner: Module {
         self.slidingWindow = config.slidingWindow
         self.fullAttentionIdx = config.layerTypes.firstIndex(of: .full) ?? 0
         self.slidingAttentionIdx = config.layerTypes.firstIndex(of: .sliding) ?? 0
+        let planEnabled =
+            ProcessInfo.processInfo.environment["DARKBLOOM_LAYER_PLAN"] != "0"
+        if planEnabled {
+            self.layerIsFull = config.layerTypes.map { $0 == .full }
+            var mask: UInt64 = 0
+            switch lagunaDecodeAsyncStage {
+            case .off, .norm, .logits:
+                break
+            case .layer(let idx):
+                if (0..<64).contains(idx) { mask = 1 << UInt64(idx) }
+            case .ladder(let n):
+                var i = n - 1
+                while i < config.numHiddenLayers {
+                    mask |= 1 << UInt64(i)
+                    i += n
+                }
+            case .explicit(let m):
+                mask = m
+            }
+            self.decodeAsyncFireMask = mask
+        } else {
+            // Kill-switch: empty plan forces the legacy per-layer branch.
+            self.layerIsFull = []
+            self.decodeAsyncFireMask = 0
+        }
         self._fullRoPEAngleSeed = MLXArray(
             Array(repeating: Float(0.7426255941390991), count: LagunaConstants.headDim / 4)
                 + Array(repeating: Float(0), count: LagunaConstants.headDim / 4),
@@ -7075,8 +7475,10 @@ final class LagunaRuntimeModelInner: Module {
         // seed row, so the angles are the exact floats that layer's kernel
         // would have computed rather than a re-derivation.
 
+        let useLayerPlan = !layerIsFull.isEmpty
+        let isDecodeShape = inputs.shape == [1, 1]
         for (i, layer) in layers.enumerated() {
-            let isFull = layerTypes[i] == .full
+            let isFull = useLayerPlan ? layerIsFull[i] : (layerTypes[i] == .full)
             let mask = isFull ? fullMask : slidingMask
             let qkRoPEAngles = isFull ? fullRoPEAngles : slidingRoPEAngles
             if i == layers.count - 1, h.dim(1) > 1 {
@@ -7090,13 +7492,19 @@ final class LagunaRuntimeModelInner: Module {
                         qkRoPEAngles: qkRoPEAngles,
                         qkRoPEOffsets: qkRoPEOffsets
                     )
-                    if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
-                        asyncEval(h)
-                    }
-                    if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                        inputs.shape == [1, 1]
-                    {
-                        asyncEval(h)
+                    if isDecodeShape {
+                        if useLayerPlan {
+                            if (decodeAsyncFireMask >> UInt64(i)) & 1 == 1 {
+                                asyncEval(h)
+                            }
+                        } else {
+                            if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i {
+                                asyncEval(h)
+                            }
+                            if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0 {
+                                asyncEval(h)
+                            }
+                        }
                     }
                 }
             } else {
@@ -7107,18 +7515,24 @@ final class LagunaRuntimeModelInner: Module {
                     qkRoPEAngles: qkRoPEAngles,
                     qkRoPEOffsets: qkRoPEOffsets
                 )
-                if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
-                    asyncEval(h)
-                }
-                if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                    inputs.shape == [1, 1]
-                {
-                    asyncEval(h)
-                }
-                if case .explicit(let mask) = lagunaDecodeAsyncStage,
-                    (mask >> UInt64(i)) & 1 == 1, inputs.shape == [1, 1]
-                {
-                    asyncEval(h)
+                if isDecodeShape {
+                    if useLayerPlan {
+                        if (decodeAsyncFireMask >> UInt64(i)) & 1 == 1 {
+                            asyncEval(h)
+                        }
+                    } else {
+                        if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i {
+                            asyncEval(h)
+                        }
+                        if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0 {
+                            asyncEval(h)
+                        }
+                        if case .explicit(let m) = lagunaDecodeAsyncStage,
+                            (m >> UInt64(i)) & 1 == 1
+                        {
+                            asyncEval(h)
+                        }
+                    }
                 }
                 if lagunaPrefillAsyncLadderStride > 0, h.dim(1) > 1,
                     (i + 1) % lagunaPrefillAsyncLadderStride == 0
