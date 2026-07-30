@@ -627,7 +627,7 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     }
 }()
 
-/// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `8`; `0`/`off` disables):
+/// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `1`; `0`/`off` disables):
 /// prefill-side twin of the decode ladder above. Multi-token forwards build
 /// a ~400-op graph with the GPU idle until the final eval; firing `asyncEval`
 /// after every Nth layer streams completed segments exactly as the promoted
@@ -635,8 +635,24 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
 /// write, or token changes — only when already-constructed work is enqueued.
 /// This pays into both score components: the prefill phase itself and the
 /// 512-token seed prefill charged to the decode window.
+///
+/// MEASURED stride sweep on M5 Max @ 961e46c (worker-protocol driver, 10
+/// timed prefills per run after a warm round, medians of 512-token wall
+/// time; every value is the median of 2-5 independent runs, all pairs
+/// ordered identically):
+///
+///     off        ~107.4 ms    GPU starves while the CPU builds 40 layers
+///     8 (old)    ~103.9 ms    the promoted default
+///     4          ~103.2 ms
+///     2          ~103.1 ms
+///     1 (new)    ~101.9 ms    <- every-layer fire, ~2.0% prefill
+///
+/// Per-layer `asyncEval` lets the GPU start each layer's kernels while the
+/// CPU is still constructing the next layer's graph; wider strides leave
+/// multi-layer build windows with no GPU work queued. Decode is untouched
+/// (the guard is `h.dim(1) > 1`), and the decode seed prefill gains ~0.4%.
 private let lagunaPrefillAsyncLadderStride: Int = {
-    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ASYNC_LADDER"]?.lowercased() ?? "8"
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ASYNC_LADDER"]?.lowercased() ?? "1"
     if raw == "off" || raw == "0" || raw.isEmpty { return 0 }
     guard let n = Int(raw), (1...40).contains(n) else { return 0 }
     return n
