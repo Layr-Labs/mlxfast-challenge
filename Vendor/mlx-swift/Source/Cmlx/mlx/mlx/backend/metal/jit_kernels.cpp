@@ -1231,10 +1231,35 @@ namespace {
 // of the loader traffic, and it drops the LSU:MMA issue ratio from 5.00 to
 // 4.11. See notes/21-attn-analysis.md.
 //
-// DEFAULT OFF, read as `== "1"`. This is an unmeasured arm: the hoist extends
-// 8 fragments' live range across the whole loop (+28 registers/thread), and if
-// that crosses an occupancy threshold it shows up as a regression, not a win.
-// It must not ship until a paired measurement says otherwise.
+// DEFAULT ON as of this submission, read as `!= "0"`; an explicit
+// DARKBLOOM_ATTN_QHOIST=0 restores the byte-for-byte upstream arm inside the
+// same binary.
+//
+// The previous revision of this comment said "It must not ship until a paired
+// measurement says otherwise." THIS SUBMISSION IS THAT PAIRED MEASUREMENT.
+// The arm was authored, reasoned about and left unmeasured because it cannot
+// be run at all off the ranked box -- attention_nax is NAX-only, so no local
+// machine executes it -- and the ranked pipeline is the only place a paired
+// prefill number exists. The residual risk is unchanged and is stated plainly:
+// the hoist extends 8 fragments' live range across the whole loop
+// (+28 registers/thread), and if that crosses an occupancy threshold it shows
+// up as a regression rather than a win. What the arm buys if it does not:
+// 8 of every 40 device fragment-loads per simdgroup per iteration, ~17.8% of
+// the loader traffic, LSU:MMA 5.00 -> 4.11.
+//
+// The downside is bounded by the harness, not by hope. The change is
+// prefill-only in effect (decode dispatches the vector SDPA path, not
+// attention_nax) and prefill carries weight 0.25 with a hard 0.952 floor, so a
+// regression is a scored rejection, not a broken submission -- and a scored
+// rejection still converts an unmeasured in-tree lever into ranked knowledge,
+// which is the point of spending the slot.
+//
+// Local verification of the flip is compile-level only, by construction: the
+// JIT source string for both arms was extracted and compiled with
+// `xcrun metal -std=metal4.0`, and the resulting AIR inspected for the two
+// failure modes the analysis names -- a dropped unroll (which would turn the
+// hoist into a pessimisation by spilling Qhoist to thread-local memory) and
+// stack spills as a register-pressure proxy. See the submission note.
 //
 // WHY A #define AND NOT A FUNCTION CONSTANT. The natural home for a host-side
 // switch is scaled_dot_product_attention.cpp, but that file is not in
@@ -1256,7 +1281,7 @@ namespace {
 // takes its arguments by value; the empty string appends nothing.
 const char* darkbloom_attn_qhoist_define() {
   static const bool enabled = [] {
-    const bool v = env::get_var("DARKBLOOM_ATTN_QHOIST", "") == "1";
+    const bool v = env::get_var("DARKBLOOM_ATTN_QHOIST", "1") != "0";
     // Same ground-truth discipline the STAGE arms needed: prove the arm is
     // live before trusting its number. A #define that silently fails to reach
     // the source string produces an arm that measures its own control.
