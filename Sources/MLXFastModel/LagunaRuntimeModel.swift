@@ -3358,6 +3358,57 @@ final class LagunaRuntimeAttention: Module {
 /// kernel MLX selects.
 let lagunaNvfp4ScaleFoldEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_FOLD"] != "0"
+
+/// `DARKBLOOM_NVFP4_NIBBLE_SPLIT` (default `1` = split; set `0` for the stock
+/// shuffle, `2` for the 2-constant control arm): a strictly shorter
+/// instruction sequence that produces the SAME eight `half` bit patterns per
+/// code word. Values, dtypes, FP32 accumulation and its order, and the single
+/// final BF16 round are untouched -- only the integer sequence that builds the
+/// half bit patterns changes.
+///
+///   0  stock. Each of the four `half2` words takes its own magnitude
+///      shift+mask, its own sign shift+mask and an OR: 5 int ops (4 for `p3`,
+///      whose sign is already in place) = **19 per code word, 38 per 16-value
+///      group**, spread over **eight distinct 32-bit mask constants**.
+///
+///   1  split. Separate the even and odd nibbles once, and in the same step
+///      slide each nibble's sign three places so magnitude and sign sit at a
+///      FIXED offset from one another. After that one shift+mask yields a
+///      whole `half2`:
+///
+///          xe = c & 0x0F0F0F0F   even nibbles: mag 4j..4j+2, sign 4j+3
+///          ge = xe | (xe << 3)   sign copied to 4j+6 -- those bits are zero
+///                                in `xe`, so the OR cannot collide
+///          yo = c & 0xF0F0F0F0   odd nibbles
+///          go = yo | (yo >> 3)   mag copied down to 4j-3..4j-1, sign kept
+///          p0 = (ge << 9) & M    p2 = (ge << 1) & M
+///          p1 = (go << 8) & M    p3 =  go       & M     M = 0x8E008E00
+///
+///      **13 int ops per code word, 26 per group (-12), and three mask
+///      constants instead of eight (-5 live constant registers).**
+///
+///   2  the op-count control. Identical 19-op structure to stock -- shift
+///      first, then mask -- but only TWO distinct mask constants. It isolates
+///      "fewer live constants" from "fewer instructions": if `2` alone moves
+///      the needle the win is register pressure, if only `1` moves it the win
+///      is the instruction count.
+///
+/// Bit-exactness is by construction, not tolerance. Every form here is an OR
+/// of masked shifts, so each output bit is an OR of a fixed subset of input
+/// bits and the 33 single-bit basis words pin the function completely. All 33
+/// basis words plus 300 000 random words agree bit-for-bit with stock, and
+/// decoding every (nibble position, code) pair through both yields the
+/// identical float -- the NVFP4 alphabet {0, .5, 1, 1.5, 2, 3, 4, 6} x 2^-14.
+///
+/// Composes with `DARKBLOOM_NVFP4_SCALE_FOLD`: that flag scales the decoded
+/// weights, this one only changes how their bits are assembled.
+let lagunaNvfp4NibbleSplit: Int = {
+    guard
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_NIBBLE_SPLIT"],
+        let value = Int(raw), (0 ... 2).contains(value)
+    else { return 1 }
+    return value
+}()
 private let lagunaSharedSwiGLUQMVHeader: String = {
     // The two halves of one power-of-two regrouping. They MUST move together:
     // the scale absorbs `2^14` exactly when the weights stop applying it.
@@ -3368,6 +3419,42 @@ private let lagunaSharedSwiGLUQMVHeader: String = {
         : "        return float(signed_value);"
     let scale256 = lagunaNvfp4ScaleFoldEnabled ? "" : "        converted *= 256.0;\n"
     let weightScale = lagunaNvfp4ScaleFoldEnabled ? "" : " * 16384.0f"
+    let extract: String
+    switch lagunaNvfp4NibbleSplit {
+    case 1:
+        extract = """
+                    const uint xe = c & 0x0F0F0F0Fu;
+                    const uint ge = xe | (xe << 3);
+                    const uint yo = c & 0xF0F0F0F0u;
+                    const uint go = yo | (yo >> 3);
+                    const uint p0 = (ge << 9) & 0x8E008E00u;
+                    const uint p1 = (go << 8) & 0x8E008E00u;
+                    const uint p2 = (ge << 1) & 0x8E008E00u;
+                    const uint p3 = go & 0x8E008E00u;
+            """
+    case 2:
+        extract = """
+                    const uint p0 =
+                        ((c << 9) & 0x0E000E00u) | ((c << 12) & 0x80008000u);
+                    const uint p1 =
+                        ((c << 5) & 0x0E000E00u) | ((c << 8) & 0x80008000u);
+                    const uint p2 =
+                        ((c << 1) & 0x0E000E00u) | ((c << 4) & 0x80008000u);
+                    const uint p3 =
+                        ((c >> 3) & 0x0E000E00u) | (c & 0x80008000u);
+            """
+    default:
+        extract = """
+                    const uint p0 =
+                        ((c & 0x00070007u) << 9) | ((c & 0x00080008u) << 12);
+                    const uint p1 =
+                        ((c & 0x00700070u) << 5) | ((c & 0x00800080u) << 8);
+                    const uint p2 =
+                        ((c & 0x07000700u) << 1) | ((c & 0x08000800u) << 4);
+                    const uint p3 =
+                        ((c & 0x70007000u) >> 3) | (c & 0x80008000u);
+            """
+    }
     return """
     static inline float laguna_nvfp4_scale(uint8_t bits) {
         ushort raw = ushort(bits & 127) << 7;
@@ -3384,14 +3471,7 @@ private let lagunaSharedSwiGLUQMVHeader: String = {
         float accum = 0.0f;
         for (uint j = 0; j < 2; ++j) {
             const uint c = (j == 0) ? codes.x : codes.y;
-            const uint p0 =
-                ((c & 0x00070007u) << 9) | ((c & 0x00080008u) << 12);
-            const uint p1 =
-                ((c & 0x00700070u) << 5) | ((c & 0x00800080u) << 8);
-            const uint p2 =
-                ((c & 0x07000700u) << 1) | ((c & 0x08000800u) << 4);
-            const uint p3 =
-                ((c & 0x70007000u) >> 3) | (c & 0x80008000u);
+    \(extract)
             const float2 v04 = float2(as_type<half2>(p0))\(weightScale);
             const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
             const float2 v26 = float2(as_type<half2>(p2))\(weightScale);
