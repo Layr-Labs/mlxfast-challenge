@@ -503,6 +503,20 @@ let lagunaFusedFullQKNormYaRNEnabled =
 let lagunaRoPEAngleAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] == "1"
 
+/// Zero-dispatch counterpart for the per-step angle probes: when the
+/// load-time angle atlases exist and the cache position is host-known and
+/// inside the atlas, the angle row is an atlas SLICE (a view, no kernel)
+/// instead of running the family's RoPE over the probe seed. Row `position`
+/// of the atlas is byte-identical to the scalar-offset probe at that
+/// position (`prepareRoPEAngleAtlases` builds it with the same RoPE
+/// instances), so every consumer sees the same floats. This is not the
+/// embedding-fusion atlas path measured at −0.23% — that replaced the
+/// probes with a fused KERNEL whose fixed cost exceeded them; a view has
+/// no kernel cost. DEFAULT ON; set `DARKBLOOM_ROPE_ANGLE_SLICE=0` to
+/// restore the per-step probe dispatches.
+let lagunaRoPEAngleSliceEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_SLICE"] != "0"
+
 /// `DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU` (default on; set "0" to disable):
 /// after checkpoint load, retain one row-concatenated BF16 `[gate; up]` bank
 /// for layer 0's dense (non-quantized) MLP and serve single-token decode's
@@ -6904,13 +6918,31 @@ final class LagunaRuntimeModelInner: Module {
 
     /// Runs `attention`'s own RoPE layer over `seed` at the cache's current
     /// position, honoring a graph-valued offset when the cache carries one.
+    /// When the family's load-time atlas covers the position, serves the row
+    /// as a zero-dispatch slice view instead (see `lagunaRoPEAngleSliceEnabled`).
     private func ropeAngleTable(
-        seed: MLXArray, attention: LagunaRuntimeAttention, cache: KVCache?
+        seed: MLXArray, attention: LagunaRuntimeAttention, cache: KVCache?,
+        atlas: MLXArray? = nil
     ) -> MLXArray {
         if let graphOffset = graphOffsetArray(for: cache) {
             return attention.rope(seed, offset: graphOffset)
         }
-        return attention.rope(seed, offset: cache?.offset ?? 0)
+        let position = cache?.offset ?? 0
+        if lagunaRoPEAngleSliceEnabled, let atlas,
+            position >= 0, position < lagunaRoPEAngleAtlasLength,
+            atlas.ndim == 4,
+            atlas.dim(0) == 1, atlas.dim(1) == 1,
+            atlas.dim(2) == lagunaRoPEAngleAtlasLength
+        {
+            // Explicit 4-axis slice (not `.ellipsis`) so the result is always
+            // rank-4 `[1, 1, 1, D]` matching `attention.rope(seed, offset: p)`.
+            // A prior submission using `.ellipsis` failed the timed measure
+            // job with no score — shape ambiguity on the view is the leading
+            // hypothesis. Values are the same floats either way when the
+            // rank is correct (atlas row p == rope(seed, offset: p)).
+            return atlas[0 ..< 1, 0 ..< 1, position ..< (position + 1), 0...]
+        }
+        return attention.rope(seed, offset: position)
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
@@ -6941,14 +6973,16 @@ final class LagunaRuntimeModelInner: Module {
                 ? ropeAngleTable(
                     seed: _fullRoPEAngleSeed,
                     attention: layers[fullAttentionIdx].selfAttn,
-                    cache: cache?[fullAttentionIdx])
+                    cache: cache?[fullAttentionIdx],
+                    atlas: _fullRoPEAngleAtlas)
                 : nil
             slidingRoPEAngles =
                 lagunaFusedSlidingQKNormRoPEEnabled && isSingleTokenDecode
                 ? ropeAngleTable(
                     seed: _slidingRoPEAngleSeed,
                     attention: layers[slidingAttentionIdx].selfAttn,
-                    cache: cache?[slidingAttentionIdx])
+                    cache: cache?[slidingAttentionIdx],
+                    atlas: _slidingRoPEAngleAtlas)
                 : nil
             // Prefill: hand every layer the family's load-time angle atlas
             // plus the cache offset the stock `applyRotaryPosition` would
