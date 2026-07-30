@@ -112,6 +112,20 @@ using namespace metal;
 #define DARKBLOOM_GQA_PAIR_HEADS 2
 #endif
 
+// The scored pair-2 D=V=128 BF16 path assigns four contiguous K and V
+// elements to each lane. A contiguous-last-axis view can still carry an
+// arbitrary element-aligned base offset, so a vec<bfloat, 4>* dereference is
+// not valid here: it would assume 8-byte alignment the dispatcher does not
+// guarantee. Fetch the eight bytes through packed_ushort4 instead. Its
+// alignment is that of ushort (2 bytes), exactly the guarantee of a BF16
+// pointer, and the scalar as_type below restores each original BF16 bit
+// pattern. Components are then consumed in their original order. Conversion,
+// multiply, accumulation, online softmax, and reduction order stay identical.
+// AOT-only: rebuild mlx.metallib after changing the switch.
+#ifndef DARKBLOOM_GQA_PAIR_VECTOR_LOADS
+#define DARKBLOOM_GQA_PAIR_VECTOR_LOADS 1
+#endif
+
 // ---------------------------------------------------------------------------
 // DARKBLOOM_ALPHASKIP: exact online-softmax rescale elision, keyed on the
 // bit-exact alpha == 1 case. Default ON; `0` restores the stock statement
@@ -342,9 +356,23 @@ template <
     U pair_sum1 = 0;
 
     for (int i = simd_gid; i < N; i += BN) {
+#if DARKBLOOM_GQA_PAIR_VECTOR_LOADS
+      if constexpr (metal::is_same_v<T, bfloat16_t>) {
+        const ushort4 pair_k_bits =
+            ushort4(*((const device packed_ushort4*)(pair_keys)));
+        for (int j = 0; j < qk_per_thread; ++j) {
+          pair_k[j] = as_type<bfloat16_t>(pair_k_bits[j]);
+        }
+      } else {
+        for (int j = 0; j < qk_per_thread; ++j) {
+          pair_k[j] = pair_keys[j];
+        }
+      }
+#else
       for (int j = 0; j < qk_per_thread; ++j) {
         pair_k[j] = pair_keys[j];
       }
+#endif
 
       U pair_score0 = 0;
       U pair_score1 = 0;
@@ -369,11 +397,34 @@ template <
       pair_sum0 = pair_sum0 * pair_factor0 + pair_exp0;
       pair_sum1 = pair_sum1 * pair_factor1 + pair_exp1;
 
+#if DARKBLOOM_GQA_PAIR_VECTOR_LOADS
+      if constexpr (metal::is_same_v<T, bfloat16_t>) {
+        const ushort4 pair_value_bits =
+            ushort4(*((const device packed_ushort4*)(pair_values)));
+        for (int j = 0; j < v_per_thread; ++j) {
+          const T pair_value =
+              as_type<bfloat16_t>(pair_value_bits[j]);
+          pair_o0[j] =
+              pair_o0[j] * pair_factor0 + pair_exp0 * pair_value;
+          pair_o1[j] =
+              pair_o1[j] * pair_factor1 + pair_exp1 * pair_value;
+        }
+      } else {
+        for (int j = 0; j < v_per_thread; ++j) {
+          const T pair_value = pair_values[j];
+          pair_o0[j] =
+              pair_o0[j] * pair_factor0 + pair_exp0 * pair_value;
+          pair_o1[j] =
+              pair_o1[j] * pair_factor1 + pair_exp1 * pair_value;
+        }
+      }
+#else
       for (int j = 0; j < v_per_thread; ++j) {
         const T pair_value = pair_values[j];
         pair_o0[j] = pair_o0[j] * pair_factor0 + pair_exp0 * pair_value;
         pair_o1[j] = pair_o1[j] * pair_factor1 + pair_exp1 * pair_value;
       }
+#endif
 
       pair_keys += inner_k_stride;
       pair_values += inner_v_stride;
