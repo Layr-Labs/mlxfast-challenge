@@ -2432,6 +2432,145 @@ func lagunaGatedOutputProjection(
     )[0]
 }
 
+/// Measurement-only serial-decode twin of native affine `quantizedMM` that
+/// forms the BF16-rounded per-head gate product in registers. It retains the
+/// native group-32 INT8 contraction order but avoids materializing and then
+/// rereading the 6K/8K-element gated attention row. Set
+/// `DARKBLOOM_AFFINE_GATED_OUTPUT_QMV=0` to ablate it.
+private let lagunaAffineGatedOutputQMVEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_AFFINE_GATED_OUTPUT_QMV"] != "0"
+
+private func lagunaAffineGatedOutputQMVSource(heads: Int) -> String {
+    """
+    constexpr uint group_size = 32;
+    constexpr uint head_dim = 128;
+    constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
+    constexpr uint values_per_lane = 8;
+    constexpr uint block_size = 256;
+    constexpr uint results_per_simdgroup = 2;
+    constexpr uint simdgroups_per_group = 2;
+    constexpr uint groups_per_row = in_vec_size / group_size;
+
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint out_row =
+        threadgroup_position_in_grid.y *
+            (simdgroups_per_group * results_per_simdgroup) +
+        simd_group * results_per_simdgroup;
+
+    const device uint8_t* weight_bytes =
+        (const device uint8_t*)packed_codes;
+    thread float result[results_per_simdgroup] = {0.0f, 0.0f};
+    thread float coefficients[values_per_lane];
+
+    for (uint block = 0; block < in_vec_size; block += block_size) {
+        uint column = block + lane * values_per_lane;
+        uint head = column / head_dim;
+        bfloat rounded_gate = gate_values[head];
+
+        float coefficient_sum = 0.0f;
+        for (uint i = 0; i < values_per_lane; ++i) {
+            bfloat rounded = bfloat(
+                float(attention_output[column + i]) *
+                float(rounded_gate));
+            coefficients[i] = float(rounded);
+            coefficient_sum += coefficients[i];
+        }
+
+        for (uint row = 0; row < results_per_simdgroup; ++row) {
+            uint logical_row = out_row + row;
+            const device uint8_t* codes =
+                weight_bytes + logical_row * in_vec_size + column;
+            uint affine_index =
+                logical_row * groups_per_row + column / group_size;
+            float scale = float(scales[affine_index]);
+            float bias = float(biases[affine_index]);
+            float quantized_dot = 0.0f;
+            for (uint i = 0; i < values_per_lane; ++i) {
+                quantized_dot += coefficients[i] * codes[i];
+            }
+            result[row] +=
+                scale * quantized_dot + coefficient_sum * bias;
+        }
+    }
+
+    for (uint row = 0; row < results_per_simdgroup; ++row) {
+        result[row] = simd_sum(result[row]);
+        if (lane == 0) {
+            output[out_row + row] = bfloat(result[row]);
+        }
+    }
+    """
+}
+
+private let lagunaAffineGatedOutputQMVKernels: [Int: MLXFast.MLXFastKernel] = {
+    Dictionary(
+        uniqueKeysWithValues: [
+            LagunaConstants.fullAttentionHeads,
+            LagunaConstants.slidingAttentionHeads,
+        ].map { heads in
+            (
+                heads,
+                MLXFast.metalKernel(
+                    name: "laguna_affine_gated_output_qmv_bf16_h\(heads)_r2_v1",
+                    inputNames: [
+                        "attention_output", "gate_values", "packed_codes",
+                        "scales", "biases",
+                    ],
+                    outputNames: ["output"],
+                    source: lagunaAffineGatedOutputQMVSource(heads: heads),
+                    ensureRowContiguous: true
+                )
+            )
+        }
+    )
+}()
+
+private func lagunaAffineGatedOutputQMV(
+    attentionOutput: MLXArray,
+    gateValues: MLXArray,
+    affine: LagunaNativeAffineWeight,
+    heads: Int
+) -> MLXArray {
+    guard let kernel = lagunaAffineGatedOutputQMVKernels[heads],
+        let biases = affine.biases
+    else {
+        preconditionFailure("unsupported affine gated output QMV")
+    }
+    let width = heads * LagunaConstants.headDim
+    precondition(attentionOutput.dtype == .bfloat16)
+    precondition(attentionOutput.shape == [1, 1, width])
+    precondition(gateValues.dtype == .bfloat16)
+    precondition(gateValues.shape == [1, 1, heads])
+    precondition(affine.mode == .affine)
+    precondition(affine.groupSize == 32)
+    precondition(affine.bits == 8)
+    precondition(affine.originalShape == [LagunaConstants.hiddenSize, width])
+    precondition(affine.packedCodes.dtype == .uint32)
+    precondition(
+        affine.packedCodes.shape == [
+            LagunaConstants.hiddenSize,
+            width / MemoryLayout<UInt32>.size,
+        ])
+    precondition(affine.scales.dtype == .bfloat16)
+    precondition(affine.scales.shape == [LagunaConstants.hiddenSize, width / 32])
+    precondition(biases.dtype == .bfloat16)
+    precondition(biases.shape == affine.scales.shape)
+
+    lagunaTrace("affine gate+output qmv h\(heads)")
+    return kernel(
+        [
+            attentionOutput, gateValues, affine.packedCodes,
+            affine.scales, biases,
+        ],
+        grid: (64, LagunaConstants.hiddenSize / 4, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 /// Decode-only producer/consumer fusion for the per-head output gate. The
 /// stock chain between the gate projection and the output projection is four
 /// dispatches — BF16→FP32 cast, `LogAddExp(x, 0)`, FP32→BF16 cast, and the
@@ -3102,6 +3241,23 @@ final class LagunaRuntimeAttention: Module {
                 output.shape == [1, 1, nHeads * headDim],
                 projectedGate.shape == [1, 1, nHeads]
             {
+                if lagunaAffineGatedOutputQMVEnabled,
+                    affineWO.mode == .affine,
+                    affineWO.groupSize == 32,
+                    affineWO.bits == 8,
+                    affineWO.biases != nil
+                {
+                    let activatedGate =
+                        gateIsActivated
+                        ? projectedGate
+                        : lagunaCompiledSoftplusGate(projectedGate)
+                    return lagunaAffineGatedOutputQMV(
+                        attentionOutput: output,
+                        gateValues: activatedGate,
+                        affine: affineWO,
+                        heads: nHeads
+                    )
+                }
                 // Raw logits + fused kernel: one dispatch reproduces the
                 // softplus chain AND the broadcast product bit-exactly (see
                 // `lagunaGateProductSoftplusSource`). Falls back to the stock
