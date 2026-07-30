@@ -213,6 +213,36 @@ void steel_matmul_regular_axpby_nax(
     wm = 2;
   }
 
+  // Laguna weight-geometry tile selection. The K/N constants below are the
+  // model's PROJECTION WEIGHT dimensions (hidden 2048; 64 or 48 attention heads
+  // x head_dim 128 => 8192 / 6144; 8 KV heads x 128 => 1024; per-head gate
+  // width 64 / 48), not properties of any request. Selection is therefore
+  // independent of prompt content and of sequence length: M is used only as a
+  // lower threshold, never matched, so every multi-token forward of any length
+  // takes the same tiles and single-token decode (M=1) never reaches here at
+  // all (it dispatches to gemv).
+  //
+  // Bit-exact: bm/bn/wm/wn only reassign which threadgroup and simdgroup own
+  // which OUTPUT tile. Every output element keeps its own full K-loop in the
+  // same order, and bk (the K-blocking factor, which would change summation
+  // order) is deliberately left untouched.
+  static const bool use_tile_tuning =
+      env::get_var("DARKBLOOM_GEMM_TILE_TUNING", "1") != "0";
+  if (use_tile_tuning && M >= 64 && a.dtype() == bfloat16 &&
+      out.dtype() == bfloat16) {
+    if (K == 2048 && (N == 8192 || N == 6144)) {
+      bm = 128;
+      bn = 64;
+      wm = 4;
+      wn = 2;
+    } else if (K == 2048 && N == 1024) {
+      bm = 64;
+      bn = 64;
+      wm = 2;
+      wn = 2;
+    }
+  }
+
   // Prepare kernel name
   std::ostringstream kname;
 
@@ -690,6 +720,36 @@ void steel_gemm_splitk_axpby_nax(
     split_k_partition_size = 1024;
   } else if (K <= 4096) {
     split_k_partition_size = 2048;
+  }
+
+  // Laguna weight-geometry tile selection. The K/N constants below are the
+  // model's PROJECTION WEIGHT dimensions (hidden 2048; 64 or 48 attention heads
+  // x head_dim 128 => 8192 / 6144; 8 KV heads x 128 => 1024; per-head gate
+  // width 64 / 48), not properties of any request. Selection is therefore
+  // independent of prompt content and of sequence length: M is used only as a
+  // lower threshold, never matched, so every multi-token forward of any length
+  // takes the same tiles and single-token decode (M=1) never reaches here at
+  // all (it dispatches to gemv).
+  //
+  // Bit-exact: bm/bn/wm/wn only reassign which threadgroup and simdgroup own
+  // which OUTPUT tile. Every output element keeps its own full K-loop in the
+  // same order, and bk (the K-blocking factor, which would change summation
+  // order) is deliberately left untouched.
+  static const bool use_tile_tuning =
+      env::get_var("DARKBLOOM_GEMM_TILE_TUNING", "1") != "0";
+  if (use_tile_tuning && M >= 64 && a.dtype() == bfloat16 &&
+      out.dtype() == bfloat16) {
+    if (K == 2048 && (N == 64 || N == 48)) {
+      bm = 32;
+      bn = 16;
+      wm = 2;
+      wn = 1;
+    } else if (N == 2048 && (K == 8192 || K == 6144)) {
+      bm = 128;
+      bn = 64;
+      wm = 4;
+      wn = 2;
+    }
   }
 
   // Determine how many partitions to split K into
