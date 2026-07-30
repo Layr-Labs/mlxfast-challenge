@@ -1867,6 +1867,208 @@ template <
   }
 }
 
+// Certified-table specialization of the expert-aligned Laguna kernel above.
+// The contraction, staging, fragment ownership, loop order, stores, and final
+// BF16 product are a textual copy. Only the computation through `silu` is
+// replaced by an integer-indexed load from the process-wide certified table.
+template <
+    typename T,
+    int group_size,
+    const int bits,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool transpose,
+    const int fixed_K = 0,
+    const int fixed_N = 0,
+    typename Wtype = bfloat>
+[[kernel]] void fp_gather_qmm_rhs_expert_silu_table_nax(
+    const device T* x,
+    const device uint32_t* w,
+    const device uint8_t* scales,
+    const device bfloat* silu_table,
+    const device uint32_t* indices,
+    device T* y,
+    const constant int& M,
+    const constant int& N,
+    const constant int& K,
+    const constant int& run_skip_pct,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]]) {
+  (void)run_skip_pct;
+  static_assert(transpose, "expert-aligned Laguna QMM requires NT weights");
+  static_assert(group_size == 16, "expert-aligned Laguna QMM requires gs16");
+  static_assert(bits == 4, "expert-aligned Laguna QMM requires NVFP4");
+
+  constexpr int pack_factor = get_pack_factor<8, bits>();
+  constexpr int bytes_per_pack = get_bytes_per_pack();
+  constexpr int BK_padded = BK + 16 / sizeof(Wtype);
+  constexpr int BN_padded = BN + 16 / sizeof(Wtype);
+  constexpr int expert_groups = 64;
+  constexpr int experts = 256;
+  const int kernel_K = fixed_K > 0 ? fixed_K : K;
+  const int kernel_N = fixed_N > 0 ? fixed_N : N;
+  static_assert(experts % expert_groups == 0);
+
+  using loader_w_t = QuantizedBlockLoader<
+      Wtype,
+      BN,
+      BK,
+      BK_padded,
+      true,
+      WM * WN * SIMD_SIZE,
+      group_size,
+      bits>;
+
+  constexpr int kWsElems = BN * BK_padded;
+  constexpr int kWsPerChunk = 16 / sizeof(Wtype);
+  threadgroup NAXWsChunk16<Wtype>
+      Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
+  threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
+  threadgroup bfloat* gate_up_stage =
+      (threadgroup bfloat*)Ws_storage;
+  threadgroup int bounds[2];
+
+  const int K_w = kernel_K * bytes_per_pack / pack_factor;
+  const int K_g = kernel_K / group_size;
+  const int K_it = kernel_K / BK;
+  const size_t stride_w = size_t(kernel_N) * K_w;
+  const size_t stride_s = size_t(kernel_N) * K_g;
+  const int y_col = tid.x * BN;
+
+  auto wl = (const device uint8_t*)w + size_t(y_col) * K_w;
+  const device uint8_t* scale_base =
+      scales + size_t(y_col) * K_g;
+
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+
+  const short tm = SM * (simd_group_id / WN);
+  const short tn = SN * (simd_group_id % WN);
+
+  for (int expert_slot = 0; expert_slot < experts / expert_groups;
+       ++expert_slot) {
+    const uint32_t expert =
+        static_cast<uint32_t>(
+            tid.y * (experts / expert_groups) + expert_slot);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+      bounds[0] = laguna_sorted_lower_bound(indices, M, expert);
+      bounds[1] = laguna_sorted_lower_bound(indices, M, expert + 1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int run_start = bounds[0];
+    const int run_end = bounds[1];
+    for (int chunk_start = run_start; chunk_start < run_end;
+         chunk_start += BM) {
+      const short chunk_rows =
+          short(min(BM, run_end - chunk_start));
+      const short sgp_sm =
+          min(int(SM), max(0, int(chunk_rows) - int(tm)));
+      const bool sg_active = sgp_sm > 0;
+
+      NAXTile<float, TM, TN> Dtile;
+      Dtile.clear();
+
+      const device T* xn =
+          x + size_t(chunk_start + tm) * kernel_K;
+      thread loader_w_t loader_w(
+          wl + size_t(expert) * stride_w,
+          scale_base + size_t(expert) * stride_s,
+          kernel_K,
+          Ws,
+          simd_group_id,
+          simd_lane_id);
+
+      for (int k = 0; k < K_it; ++k) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_w.load_unsafe();
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg_active) {
+          STEEL_PRAGMA_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<Wtype, TN, TK> Btile;
+
+            if (sgp_sm == SM) {
+              Atile.load(xn + kk1, kernel_K);
+            } else {
+              Atile.load_safe(
+                  xn + kk1, kernel_K, short2(SK, sgp_sm));
+            }
+            Btile.template load<Wtype, BK_padded, 1>(
+                Ws + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<true>{});
+
+          }
+        }
+
+        xn += BK;
+        loader_w.next();
+      }
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const bool fuse_swiglu =
+          kernel_N == 1024 && kernel_K == 2048;
+      if (fuse_swiglu) {
+        if (sg_active) {
+          Dtile.template store<bfloat, BN, 1>(
+              gate_up_stage + tm * BN + tn);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_active && (simd_group_id % WN) == 0) {
+          constexpr int activated_cols = BN / 2;
+          for (int linear = simd_lane_id;
+               linear < int(sgp_sm) * activated_cols;
+               linear += SIMD_SIZE) {
+            const int row = linear / activated_cols;
+            const int col = linear % activated_cols;
+            const bfloat gate =
+                gate_up_stage[(tm + row) * BN + col];
+            const bfloat up =
+                gate_up_stage[(tm + row) * BN + activated_cols + col];
+            const bfloat silu =
+                silu_table[as_type<ushort>(gate)];
+            y[size_t(chunk_start + tm + row) * (kernel_N / 2) +
+              size_t(tid.x) * activated_cols + col] =
+                bfloat(silu * up);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      } else if (sg_active) {
+        device T* yn =
+            y + size_t(chunk_start + tm) * kernel_N + y_col + tn;
+        if (sgp_sm == SM) {
+          Dtile.store(yn, kernel_N);
+        } else {
+          Dtile.store_slice(
+              yn,
+              kernel_N,
+              short2(0, 0),
+              short2(SN, sgp_sm));
+        }
+      }
+    }
+  }
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 )preamble";
 }
