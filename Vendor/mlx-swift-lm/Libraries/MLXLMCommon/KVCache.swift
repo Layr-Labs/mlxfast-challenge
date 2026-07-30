@@ -1846,6 +1846,142 @@ public func trimPromptCache(_ cache: [KVCache], numTokens: Int) -> Int {
     return cache.first?.trim(numTokens) ?? 0
 }
 
+// MARK: - Direct in-cache decode writes
+
+/// Row-contiguity check matching MLX's flags: a buffer the direct-write
+/// kernel can store into in place. The zero-copy prefill install can retain
+/// a TRANSPOSED values view ([1, L, H, D] -> [1, H, L, D]); passed as a
+/// custom-kernel input with ensureRowContiguous it would be copied per
+/// dispatch and the kernel's store would land in the copy, never in the
+/// cache — so the direct-write path replaces such views with contiguous
+/// (value-identical) copies once, below.
+private func cacheDirectWriteIsRowContiguous(_ array: MLXArray) -> Bool {
+    let shape = array.shape
+    let strides = array.strides
+    var expected = 1
+    for i in stride(from: shape.count - 1, through: 0, by: -1) {
+        if shape[i] > 1 {
+            if strides[i] != expected { return false }
+            expected *= shape[i]
+        }
+    }
+    return true
+}
+
+/// Accessors for the Laguna runtime's decode fast path, where the fused
+/// QK-norm+RoPE kernels write the new K/V rows directly into the cache
+/// buffers instead of producing fresh rows for `update` to slice-assign.
+/// These members expose only what that path needs: the buffer pair, the
+/// write position for the current step (nil when the stock `update` must
+/// run — unallocated buffers, growth boundaries, or any non-steady ring
+/// state), and a commit that advances the bookkeeping and returns exactly
+/// the views `update` would have returned. Values written through the
+/// buffers are byte-identical to the slice-assigns they replace, so every
+/// reader (`state`, `innerState`, masks, later `update` calls) observes the
+/// same contents as on the stock path.
+extension KVCacheSimple {
+    /// Write position for a one-token direct write, or nil when the stock
+    /// `update` path must run (buffers not yet allocated, or the incoming
+    /// token would grow the buffer).
+    public var directWritePosition: Int? {
+        guard let keys, let _ = values, offset + 1 <= keys.dim(2) else { return nil }
+        return offset
+    }
+
+    /// The backing buffers, when allocated. Callers must treat them as
+    /// read-write shared state: the direct-write kernel stores into them in
+    /// place, exactly where `update`'s slice-assign would.
+    public var directWriteBuffers: (keys: MLXArray, values: MLXArray)? {
+        guard let keys, let values else { return nil }
+        return (keys, values)
+    }
+
+    /// The backing buffers made safe for in-place kernel stores: any
+    /// non-row-contiguous retained view (see the contiguity note above) is
+    /// replaced by a value-identical contiguous copy first. The replacement
+    /// is a one-time cost; later steps see a contiguous buffer.
+    public var directWriteBuffersNormalized: (keys: MLXArray, values: MLXArray)? {
+        guard let keys, let values else { return nil }
+        var k = keys
+        var v = values
+        if !cacheDirectWriteIsRowContiguous(k) {
+            k = k.contiguous()
+            self.keys = k
+        }
+        if !cacheDirectWriteIsRowContiguous(v) {
+            v = v.contiguous()
+            self.values = v
+        }
+        return (k, v)
+    }
+
+    /// Advances the cache past rows the caller wrote directly and returns
+    /// the same views `update` returns after its slice-assign.
+    public func commitDirectWrite(tokenCount: Int) -> (MLXArray, MLXArray) {
+        offset += tokenCount
+        return (
+            keys![.ellipsis, ..<offset, 0...],
+            values![.ellipsis, ..<offset, 0...]
+        )
+    }
+}
+
+extension RotatingKVCache {
+    /// Ring position for a one-token direct write, or nil unless the cache is
+    /// in the exact steady state `updateInPlace` handles (full ring, `keep ==
+    /// 0`, one-token steps, ring index consistent with the logical offset).
+    public var directWritePosition: Int? {
+        guard keep == 0, let keys, let _ = values,
+            keys.dim(2) == maxCacheSize, offset >= maxCacheSize
+        else { return nil }
+        var writeIdx = idx
+        if writeIdx == maxCacheSize {
+            writeIdx = keep
+        }
+        guard writeIdx == offset % maxCacheSize else { return nil }
+        return writeIdx
+    }
+
+    /// The backing ring buffers, when allocated.
+    public var directWriteBuffers: (keys: MLXArray, values: MLXArray)? {
+        guard let keys, let values else { return nil }
+        return (keys, values)
+    }
+
+    /// The ring buffers made safe for in-place kernel stores (see the
+    /// contiguity note on `KVCacheSimple.directWriteBuffersNormalized`).
+    public var directWriteBuffersNormalized: (keys: MLXArray, values: MLXArray)? {
+        guard let keys, let values else { return nil }
+        var k = keys
+        var v = values
+        if !cacheDirectWriteIsRowContiguous(k) {
+            k = k.contiguous()
+            self.keys = k
+        }
+        if !cacheDirectWriteIsRowContiguous(v) {
+            v = v.contiguous()
+            self.values = v
+        }
+        return (k, v)
+    }
+
+    /// Advances the ring past rows the caller wrote directly and returns the
+    /// same full-buffer pair `updateInPlace` returns in steady state. The
+    /// ring index is rotated to `keep` when it sits at `maxCacheSize` BEFORE
+    /// advancing, exactly as `updateInPlace` does — skipping that rotation
+    /// corrupts the ring (an out-of-range idx pushes later steps onto the
+    /// stock path with a poisoned write position).
+    public func commitDirectWrite(tokenCount: Int) -> (MLXArray, MLXArray) {
+        var writeIdx = idx
+        if writeIdx == maxCacheSize {
+            writeIdx = keep
+        }
+        idx = writeIdx + tokenCount
+        offset += tokenCount
+        return (keys!, values!)
+    }
+}
+
 // MARK: - Type Aliases
 
 /// Standard KV cache - alias to KVCacheSimple for compatibility

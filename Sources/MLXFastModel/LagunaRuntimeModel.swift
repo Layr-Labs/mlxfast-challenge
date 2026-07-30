@@ -1233,6 +1233,311 @@ func lagunaSlidingQKNormRoPE(
     return (outputs[0], outputs[1])
 }
 
+/// Direct in-cache K/V write variants of the two decode QK-norm+RoPE
+/// kernels above. On the stock path each decode layer spends two extra copy
+/// dispatches slice-assigning the fresh K/V rows into the cache buffers (80
+/// copies per token across 40 layers). These variants take the cache buffers
+/// as additional INPUTS (the custom-kernel API only fresh-allocates outputs)
+/// and store the same bytes in place through a `const_cast` — the K row is
+/// the identical norm+RoPE output the stock kernel emits, the V row is the
+/// identical raw copy the slice-assign performs — so the cache contents,
+/// the views SDPA reads, and every downstream value are byte-identical to
+/// the stock path. `kv_offsets` is a shared per-step int32 vector:
+/// `[fullPos, fullCap, slidingPos, slidingCap]`; the full-attention kernel
+/// reads elements 0/1, the sliding kernel reads 2/3. Only the `queries`
+/// output is still produced normally.
+///
+/// Ordering: the kernel's untracked cache store is safe because its tracked
+/// `queries` output feeds the very SDPA that reads the cache, forcing a
+/// barrier between this dispatch and that one, and the unbroken residual
+/// chain forces program order across layers and steps.
+private let lagunaFullQKNormYaRNKVWriteKernel = MLXFast.metalKernel(
+    name: "laguna_full_qk_norm_yarn_kvwrite_bf16_128_v1",
+    inputNames: [
+        "raw_queries", "raw_keys", "raw_values", "query_weight", "key_weight",
+        "angles", "cache_keys", "cache_values", "kv_offsets",
+    ],
+    outputNames: ["queries"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint rotary_dims = 64;
+        constexpr uint rotary_pairs = 32;
+        constexpr uint query_heads = 48;
+        constexpr float yarn_mscale = 1.3465735912322998f;
+
+        uint head = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+
+
+        const device bfloat* input;
+        const device bfloat* weight;
+        if (head < query_heads) {
+            input = raw_queries + head * head_dim;
+            weight = query_weight;
+        } else {
+            input = raw_keys + (head - query_heads) * head_dim;
+            weight = key_weight;
+        }
+
+        uint base = lane * 4;
+        thread bfloat normalized[4];
+        float sum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float value = float(input[base + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+        for (uint i = 0; i < 4; ++i) {
+            normalized[i] =
+                weight[base + i] *
+                bfloat(float(input[base + i]) * inverse_rms);
+        }
+
+        thread float paired[4];
+        for (uint i = 0; i < 4; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
+        }
+
+        uint kv_head = head - query_heads;
+        uint write_pos = uint(kv_offsets[0]);
+        uint cache_cap = uint(kv_offsets[1]);
+        size_t cache_row =
+            size_t(kv_head) * (size_t(cache_cap) * head_dim)
+            + size_t(write_pos) * head_dim;
+
+        device bfloat* output =
+            head < query_heads
+            ? queries + head * head_dim
+            : const_cast<device bfloat*>(cache_keys) + cache_row;
+        if (lane < 8) {
+            bfloat rounded_mscale = bfloat(yarn_mscale);
+            for (uint i = 0; i < 4; ++i) {
+                uint pair = base + i;
+                float first =
+                    float(bfloat(normalized[i] * rounded_mscale));
+                float second =
+                    float(bfloat(bfloat(paired[i]) * rounded_mscale));
+                float cosine = angles[pair];
+                float sine = angles[pair + rotary_pairs];
+                output[pair] = bfloat(first * cosine - second * sine);
+                output[pair + rotary_pairs] =
+                    bfloat(first * sine + second * cosine);
+            }
+        } else if (lane >= 16) {
+            for (uint i = 0; i < 4; ++i) {
+                output[base + i] = normalized[i];
+            }
+        }
+        if (head >= query_heads) {
+            // The raw V row the stock slice-assign would copy: all 32 lanes,
+            // four contiguous elements apiece, destination cache row only.
+            const device bfloat* raw_v = raw_values + kv_head * head_dim;
+            device bfloat* cache_v =
+                const_cast<device bfloat*>(cache_values) + cache_row;
+            for (uint i = 0; i < 4; ++i) {
+                cache_v[base + i] = raw_v[base + i];
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private let lagunaSlidingQKNormRoPEKVWriteKernel = MLXFast.metalKernel(
+    name: "laguna_sliding_qk_norm_rope_kvwrite_bf16_128_v1",
+    inputNames: [
+        "raw_queries", "raw_keys", "raw_values", "query_weight", "key_weight",
+        "angles", "cache_keys", "cache_values", "kv_offsets",
+    ],
+    outputNames: ["queries"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint rotary_pairs = 64;
+        constexpr uint query_heads = 64;
+
+        uint head = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+
+
+        const device bfloat* input;
+        const device bfloat* weight;
+        if (head < query_heads) {
+            input = raw_queries + head * head_dim;
+            weight = query_weight;
+        } else {
+            input = raw_keys + (head - query_heads) * head_dim;
+            weight = key_weight;
+        }
+
+        uint base = lane * 4;
+        thread bfloat normalized[4];
+        float sum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float value = float(input[base + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+        for (uint i = 0; i < 4; ++i) {
+            normalized[i] =
+                weight[base + i] *
+                bfloat(float(input[base + i]) * inverse_rms);
+        }
+
+        // Element `p + 64`, the partner of pair `p`, lives 16 lanes away.
+        thread float paired[4];
+        for (uint i = 0; i < 4; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
+        }
+
+        uint kv_head = head - query_heads;
+        uint write_pos = uint(kv_offsets[2]);
+        uint cache_cap = uint(kv_offsets[3]);
+        size_t cache_row =
+            size_t(kv_head) * (size_t(cache_cap) * head_dim)
+            + size_t(write_pos) * head_dim;
+
+        device bfloat* output =
+            head < query_heads
+            ? queries + head * head_dim
+            : const_cast<device bfloat*>(cache_keys) + cache_row;
+        // Every element rotates, so the lower sixteen lanes own all 64 pairs
+        // and write both halves of each.
+        if (lane < 16) {
+            for (uint i = 0; i < 4; ++i) {
+                uint pair = base + i;
+                float first = float(normalized[i]);
+                float second = paired[i];
+                float cosine = angles[pair];
+                float sine = angles[pair + rotary_pairs];
+                output[pair] = bfloat(first * cosine - second * sine);
+                output[pair + rotary_pairs] =
+                    bfloat(first * sine + second * cosine);
+            }
+        }
+        if (head >= query_heads) {
+            const device bfloat* raw_v = raw_values + kv_head * head_dim;
+            device bfloat* cache_v =
+                const_cast<device bfloat*>(cache_values) + cache_row;
+            for (uint i = 0; i < 4; ++i) {
+                cache_v[base + i] = raw_v[base + i];
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Decode-only direct in-cache K/V write path (see the KVWrite kernel
+/// variants above). DEFAULT ON; set `DARKBLOOM_KV_DIRECT_WRITE=0` to restore
+/// the stock `cache.update` slice-assigns inside the same binary. The
+/// per-family `..._FULL=0` / `..._SLIDING=0` knobs are ablation seams.
+let lagunaKVDirectWriteEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_KV_DIRECT_WRITE"] != "0"
+let lagunaKVDirectWriteFullEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_KV_DIRECT_WRITE_FULL"] != "0"
+let lagunaKVDirectWriteSlidingEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_KV_DIRECT_WRITE_SLIDING"] != "0"
+
+/// Full-attention KVWrite wrapper: returns only the normed+rotated queries;
+/// the kernel has already stored the K/V rows into the cache buffers.
+func lagunaFullQKNormYaRNKVWrite(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    rawValues: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray,
+    cacheKeys: MLXArray,
+    cacheValues: MLXArray,
+    kvOffsets: MLXArray
+) -> MLXArray {
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    precondition(rawQueries.dtype == .bfloat16)
+    precondition(rawKeys.dtype == .bfloat16)
+    precondition(rawValues.dtype == .bfloat16)
+    precondition(queryWeight.dtype == .bfloat16)
+    precondition(keyWeight.dtype == .bfloat16)
+    precondition(cacheKeys.dtype == .bfloat16)
+    precondition(cacheValues.dtype == .bfloat16)
+    precondition(rawQueries.shape == [1, 1, 48 * LagunaConstants.headDim])
+    precondition(rawKeys.shape == [1, 1, kvHeads * LagunaConstants.headDim])
+    precondition(rawValues.shape == [1, 1, kvHeads * LagunaConstants.headDim])
+    precondition(queryWeight.shape == [LagunaConstants.headDim])
+    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(angles.dtype == .float32)
+    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim / 2])
+    precondition(kvOffsets.dtype == .int32 && kvOffsets.size == 4)
+    precondition(cacheKeys.ndim == 4 && cacheKeys.dim(0) == 1)
+    precondition(cacheKeys.dim(1) == kvHeads)
+    precondition(cacheKeys.dim(3) == LagunaConstants.headDim)
+    precondition(cacheValues.shape == cacheKeys.shape)
+
+    lagunaTrace("full qk norm+yarn kvwrite")
+    return lagunaFullQKNormYaRNKVWriteKernel(
+        [
+            rawQueries, rawKeys, rawValues, queryWeight, keyWeight,
+            angles, cacheKeys, cacheValues, kvOffsets,
+        ],
+        grid: (56 * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [
+            [1, 48, 1, LagunaConstants.headDim]
+        ],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+/// Sliding-layer twin of `lagunaFullQKNormYaRNKVWrite`.
+func lagunaSlidingQKNormRoPEKVWrite(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    rawValues: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray,
+    cacheKeys: MLXArray,
+    cacheValues: MLXArray,
+    kvOffsets: MLXArray
+) -> MLXArray {
+    let heads = LagunaConstants.slidingAttentionHeads
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    precondition(rawQueries.dtype == .bfloat16)
+    precondition(rawKeys.dtype == .bfloat16)
+    precondition(rawValues.dtype == .bfloat16)
+    precondition(queryWeight.dtype == .bfloat16)
+    precondition(keyWeight.dtype == .bfloat16)
+    precondition(cacheKeys.dtype == .bfloat16)
+    precondition(cacheValues.dtype == .bfloat16)
+    precondition(rawQueries.shape == [1, 1, heads * LagunaConstants.headDim])
+    precondition(rawKeys.shape == [1, 1, kvHeads * LagunaConstants.headDim])
+    precondition(rawValues.shape == [1, 1, kvHeads * LagunaConstants.headDim])
+    precondition(queryWeight.shape == [LagunaConstants.headDim])
+    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(angles.dtype == .float32)
+    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim])
+    precondition(kvOffsets.dtype == .int32 && kvOffsets.size == 4)
+    precondition(cacheKeys.ndim == 4 && cacheKeys.dim(0) == 1)
+    precondition(cacheKeys.dim(1) == kvHeads)
+    precondition(cacheKeys.dim(3) == LagunaConstants.headDim)
+    precondition(cacheValues.shape == cacheKeys.shape)
+
+    lagunaTrace("sliding qk norm+rope kvwrite")
+    return lagunaSlidingQKNormRoPEKVWriteKernel(
+        [
+            rawQueries, rawKeys, rawValues, queryWeight, keyWeight,
+            angles, cacheKeys, cacheValues, kvOffsets,
+        ],
+        grid: ((heads + kvHeads) * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [
+            [1, heads, 1, LagunaConstants.headDim]
+        ],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 /// Multi-token sliding-layer Q/K RMSNorm + plain RoPE fusion. One dispatch
 /// replaces the stock four (`rms_single_row` q, `rms_single_row` k,
 /// `rope_bfloat16` q, `rope_bfloat16` k) for a whole prefill layer and
@@ -2775,7 +3080,8 @@ final class LagunaRuntimeAttention: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
         qkRoPEAngles: MLXArray? = nil,
-        qkRoPEOffsets: MLXArray? = nil
+        qkRoPEOffsets: MLXArray? = nil,
+        kvWriteOffsets: MLXArray? = nil
     ) -> MLXArray {
         let (B, L) = (input.dim(0), input.dim(1))
 
@@ -2974,23 +3280,85 @@ final class LagunaRuntimeAttention: Module {
             qkRoPEAngles?.shape == [1, 1, lagunaRoPEAngleAtlasLength, headDim / 2]
 
         var qkNormRoPEFused = false
+        // When the KVWrite kernels run, they store the new K/V rows into the
+        // cache buffers themselves; these are the exact views the stock
+        // `cache.update` would have returned, and the SDPA below reads them
+        // instead of calling `attentionWithCacheUpdate`.
+        var kvDirectViews: (keys: MLXArray, values: MLXArray)?
         if useFusedFullQKNormYaRN, let qkRoPEAngles {
-            (queries, keys) = lagunaFullQKNormYaRN(
-                rawQueries: queries,
-                rawKeys: keys,
-                queryWeight: qNorm.weight,
-                keyWeight: kNorm.weight,
-                angles: qkRoPEAngles
-            )
+            if lagunaKVDirectWriteEnabled, lagunaKVDirectWriteFullEnabled,
+                let kvWriteOffsets,
+                let simpleCache = cache as? KVCacheSimple,
+                simpleCache.directWritePosition != nil,
+                let buffers = simpleCache.directWriteBuffersNormalized,
+                buffers.keys.dtype == .bfloat16, buffers.values.dtype == .bfloat16,
+                buffers.keys.ndim == 4, buffers.keys.dim(0) == 1,
+                buffers.keys.dim(1) == nKVHeads,
+                buffers.keys.dim(3) == headDim,
+                buffers.values.shape == buffers.keys.shape,
+                graphOffsetArray(for: cache) == nil
+            {
+                // The kernel writes into this layer's own cache buffers; the
+                // per-step offsets were built from the representative cache
+                // of the same lockstep family (the same invariant the masks
+                // and angle tables already rely on), and this layer's
+                // `directWritePosition` guard re-verified the steady state.
+                queries = lagunaFullQKNormYaRNKVWrite(
+                    rawQueries: queries,
+                    rawKeys: keys,
+                    rawValues: values,
+                    queryWeight: qNorm.weight,
+                    keyWeight: kNorm.weight,
+                    angles: qkRoPEAngles,
+                    cacheKeys: buffers.keys,
+                    cacheValues: buffers.values,
+                    kvOffsets: kvWriteOffsets
+                )
+                kvDirectViews = simpleCache.commitDirectWrite(tokenCount: 1)
+            } else {
+                (queries, keys) = lagunaFullQKNormYaRN(
+                    rawQueries: queries,
+                    rawKeys: keys,
+                    queryWeight: qNorm.weight,
+                    keyWeight: kNorm.weight,
+                    angles: qkRoPEAngles
+                )
+            }
             qkNormRoPEFused = true
         } else if useFusedSlidingQKNormRoPE, let qkRoPEAngles {
-            (queries, keys) = lagunaSlidingQKNormRoPE(
-                rawQueries: queries,
-                rawKeys: keys,
-                queryWeight: qNorm.weight,
-                keyWeight: kNorm.weight,
-                angles: qkRoPEAngles
-            )
+            if lagunaKVDirectWriteEnabled, lagunaKVDirectWriteSlidingEnabled,
+                let kvWriteOffsets,
+                let rotatingCache = cache as? RotatingKVCache,
+                rotatingCache.directWritePosition != nil,
+                let buffers = rotatingCache.directWriteBuffersNormalized,
+                buffers.keys.dtype == .bfloat16, buffers.values.dtype == .bfloat16,
+                buffers.keys.ndim == 4, buffers.keys.dim(0) == 1,
+                buffers.keys.dim(1) == nKVHeads,
+                buffers.keys.dim(3) == headDim,
+                buffers.values.shape == buffers.keys.shape,
+                graphOffsetArray(for: cache) == nil
+            {
+                queries = lagunaSlidingQKNormRoPEKVWrite(
+                    rawQueries: queries,
+                    rawKeys: keys,
+                    rawValues: values,
+                    queryWeight: qNorm.weight,
+                    keyWeight: kNorm.weight,
+                    angles: qkRoPEAngles,
+                    cacheKeys: buffers.keys,
+                    cacheValues: buffers.values,
+                    kvOffsets: kvWriteOffsets
+                )
+                kvDirectViews = rotatingCache.commitDirectWrite(tokenCount: 1)
+            } else {
+                (queries, keys) = lagunaSlidingQKNormRoPE(
+                    rawQueries: queries,
+                    rawKeys: keys,
+                    queryWeight: qNorm.weight,
+                    keyWeight: kNorm.weight,
+                    angles: qkRoPEAngles
+                )
+            }
             qkNormRoPEFused = true
         } else if usePrefillFusedSlidingQKNormRoPE,
             let angles = qkRoPEAngles, let offsets = qkRoPEOffsets
@@ -3040,14 +3408,28 @@ final class LagunaRuntimeAttention: Module {
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
-        let attended = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
-        )
+        let attended: MLXArray
+        if let kvDirectViews {
+            // The KVWrite kernel already stored this step's K/V rows and the
+            // cache returned the same views `update` would have; attend
+            // directly with the same mask the stock call would have passed.
+            attended = MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: kvDirectViews.keys,
+                values: kvDirectViews.values,
+                scale: scale,
+                mask: mask
+            )
+        } else {
+            attended = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
+        }
         // SDPA returns `[B, H, L, D]`. When `L == 1`, flattening its
         // contiguous head-major payload directly produces the exact
         // `[B, 1, H*D]` byte order; the transpose only changes singleton-axis
@@ -6553,7 +6935,8 @@ final class LagunaRuntimeDecoderLayer: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
         qkRoPEAngles: MLXArray? = nil,
-        qkRoPEOffsets: MLXArray? = nil
+        qkRoPEOffsets: MLXArray? = nil,
+        kvWriteOffsets: MLXArray? = nil
     ) -> MLXArray {
         let r = selfAttn(
             x,
@@ -6561,7 +6944,8 @@ final class LagunaRuntimeDecoderLayer: Module {
             mask: mask,
             cache: cache,
             qkRoPEAngles: qkRoPEAngles,
-            qkRoPEOffsets: qkRoPEOffsets
+            qkRoPEOffsets: qkRoPEOffsets,
+            kvWriteOffsets: kvWriteOffsets
         )
         let h: MLXArray
         let normalized: MLXArray
@@ -6985,6 +7369,52 @@ final class LagunaRuntimeModelInner: Module {
         let slidingMask = createAttentionMask(
             h: h, cache: cache?[slidingAttentionIdx], windowSize: slidingWindow)
 
+        // One shared write-offset vector per decode step for the direct
+        // in-cache K/V write path: [fullPos, fullCap, slidingPos,
+        // slidingCap]. Built from each family's representative cache — the
+        // same lockstep invariant the masks and angle tables rely on — and
+        // every layer re-verifies its own cache's steady state before using
+        // it. One 16-byte host-to-device array replaces up to 80 slice-assign
+        // copy dispatches per token. Any non-steady state (first decode step
+        // after prefill, growth boundaries, compiled-decode graph caches)
+        // leaves this nil and every layer takes the stock `cache.update`.
+        var kvWriteOffsets: MLXArray?
+        if lagunaKVDirectWriteEnabled, inputs.shape == [1, 1],
+            let caches = cache,
+            fullAttentionIdx < caches.count, slidingAttentionIdx < caches.count
+        {
+            var fullPos = 0, fullCap = 0, slidingPos = 0, slidingCap = 0
+            var usable = false
+            if lagunaKVDirectWriteFullEnabled,
+                let fullCache = caches[fullAttentionIdx] as? KVCacheSimple,
+                let pos = fullCache.directWritePosition,
+                let buffers = fullCache.directWriteBuffers
+            {
+                fullPos = pos
+                fullCap = buffers.keys.dim(2)
+                usable = true
+            }
+            if lagunaKVDirectWriteSlidingEnabled,
+                let slidingCache = caches[slidingAttentionIdx] as? RotatingKVCache,
+                let pos = slidingCache.directWritePosition,
+                let buffers = slidingCache.directWriteBuffers
+            {
+                slidingPos = pos
+                slidingCap = buffers.keys.dim(2)
+                usable = true
+            }
+            // A family whose entries stay zero is simply not dispatched on
+            // the direct path; its layers take the stock `cache.update`
+            // (first decode step after prefill, growth boundaries,
+            // compiled-decode graph caches).
+            if usable {
+                kvWriteOffsets = MLXArray([
+                    Int32(fullPos), Int32(fullCap),
+                    Int32(slidingPos), Int32(slidingCap),
+                ])
+            }
+        }
+
         // One cos/sin table per attention family per decode step, shared by
         // every layer of that family (their caches advance in lockstep). Each
         // table is produced by running the family's own RoPE layer over a
@@ -7021,7 +7451,8 @@ final class LagunaRuntimeModelInner: Module {
                     mask: mask,
                     cache: cache?[i],
                     qkRoPEAngles: qkRoPEAngles,
-                    qkRoPEOffsets: qkRoPEOffsets
+                    qkRoPEOffsets: qkRoPEOffsets,
+                    kvWriteOffsets: kvWriteOffsets
                 )
                 if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
                     asyncEval(h)
