@@ -1677,12 +1677,14 @@ template <
     const int fixed_K = 0,
     const int fixed_N = 0,
     typename Wtype = bfloat,
-    int tg_expert_groups = 64>
+    int tg_expert_groups = 64,
+    const bool gather_lhs = false>
 [[kernel]] void fp_gather_qmm_rhs_expert_nax(
     const device T* x,
     const device uint32_t* w,
     const device uint8_t* scales,
     const device uint32_t* indices,
+    const device uint32_t* lhs_indices,
     device T* y,
     const constant int& M,
     const constant int& N,
@@ -1796,14 +1798,74 @@ template <
         if (sg_active) {
           STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            // Zero-copy A-loader index algebra (before the implementation):
+            //
+            //   local_m =
+            //       frag_m * 16 + lane_m + elem_m * 8
+            //   route = chunk_start + tm + local_m
+            //   source_m = lhs_indices[route]
+            //   local_k =
+            //       frag_k * 16 + lane_k + elem_k
+            //   source_k = k * BK + kk1 + local_k
+            //   A(local_m, local_k) =
+            //       x[source_m * kernel_K + source_k]
+            //
+            // `route` varies for every logical M row in the 16-row A tile.
+            // Resolving lhs_indices once for the tile would therefore
+            // broadcast one token into unrelated routed rows (the old bug).
             NAXTile<T, TM, TK> Atile;
             NAXTile<Wtype, TN, TK> Btile;
 
-            if (sgp_sm == SM) {
-              Atile.load(xn + kk1, kernel_K);
+            if constexpr (gather_lhs) {
+              using AFrag =
+                  typename NAXTile<T, TM, TK>::NAXFrag_t;
+              const short2 lane_coord = AFrag::get_coord();
+              STEEL_PRAGMA_UNROLL
+              for (short frag_m = 0; frag_m < TM; ++frag_m) {
+                STEEL_PRAGMA_UNROLL
+                for (short elem_m = 0;
+                     elem_m < AFrag::kElemRows;
+                     ++elem_m) {
+                  const short local_m =
+                      frag_m * AFrag::kFragRows + lane_coord.y +
+                      elem_m * AFrag::kElemRowsJump;
+                  const bool row_valid = local_m < sgp_sm;
+                  size_t source_base = 0;
+                  if (row_valid) {
+                    const int route =
+                        chunk_start + int(tm) + int(local_m);
+                    source_base =
+                        size_t(lhs_indices[route]) * size_t(kernel_K);
+                  }
+                  STEEL_PRAGMA_UNROLL
+                  for (short frag_k = 0; frag_k < TK; ++frag_k) {
+                    thread auto& a_frag =
+                        Atile.frag_at(frag_m, frag_k);
+                    const short local_k =
+                        frag_k * AFrag::kFragCols + lane_coord.x;
+                    STEEL_PRAGMA_UNROLL
+                    for (short elem_k = 0;
+                         elem_k < AFrag::kElemCols;
+                         ++elem_k) {
+                      const short fragment_element =
+                          elem_m * AFrag::kElemCols + elem_k;
+                      a_frag[fragment_element] =
+                          row_valid
+                          ? x[source_base +
+                              size_t(k) * size_t(BK) +
+                              size_t(kk1 + local_k + elem_k)]
+                          : T(0);
+                    }
+                  }
+                }
+              }
             } else {
-              Atile.load_safe(
-                  xn + kk1, kernel_K, short2(SK, sgp_sm));
+              if (sgp_sm == SM) {
+                Atile.load(xn + kk1, kernel_K);
+              } else {
+                Atile.load_safe(
+                    xn + kk1, kernel_K, short2(SK, sgp_sm));
+              }
             }
             Btile.template load<Wtype, BK_padded, 1>(
                 Ws + tn * BK_padded + kk1);

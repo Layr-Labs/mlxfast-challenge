@@ -211,6 +211,26 @@ let lagunaExpertAlignedGatherEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_EXPERT_ALIGNED_GATHER"] != "0"
 
+/// `DARKBLOOM_ZEROCOPY_LHS` (default ON; set "0" to disable): keep the
+/// normalized prefill rows in their original `[tokens, 1, 2048]` storage and
+/// pass `gatherSort`'s `order / 8` route-to-token map as `lhsIndices`. The
+/// expert-aligned NAX kernel resolves that map independently for every
+/// logical M row loaded into its A fragment. No per-tile source-row
+/// substitution is valid because one A tile contains 16 independently
+/// routed rows.
+let lagunaZeroCopySortedLHSEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ZEROCOPY_LHS"] != "0"
+
+/// `DARKBLOOM_ZEROCOPY_LHS_LAYERS=<n>` (default 13): apply zero-copy LHS
+/// indexing to the first `n` sparse layers only. Later sparse layers retain
+/// the stock physical gather, so this chunks the full mechanism without any
+/// sequence-length or prompt-shape predicate. Negative values clamp to zero;
+/// an invalid or absent value selects the one-third default.
+private let lagunaZeroCopySortedLHSSparseLayerCount: Int = {
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_ZEROCOPY_LHS_LAYERS"]
+    return max(0, raw.flatMap(Int.init) ?? 13)
+}()
+
 /// Decode post-attention residual + RMSNorm fusion. The kernel emits
 /// both the rounded BF16 residual (needed by the following skip connection)
 /// and the normalized row (consumed immediately by the MLP), eliminating a
@@ -6418,7 +6438,8 @@ private func lagunaFusedSortedRoutedGateUp(
     fusedScales: MLXArray,
     split: Int,
     downProj: SwitchLinear,
-    deferUnsort: Bool
+    deferUnsort: Bool,
+    sparseLayerOrdinal: Int
 ) -> (output: MLXArray, inverseOrder: MLXArray?) {
     // SwitchGLU: `var x = MLX.expandedDimensions(x, axes: [-2, -3])`
     var sortedX = MLX.expandedDimensions(x, axes: [-2, -3])
@@ -6430,9 +6451,27 @@ private func lagunaFusedSortedRoutedGateUp(
     // SwitchGLU: `var idx = indices` / `var inverseOrder = MLXArray()`
     var idx = indices
     var inverseOrder = MLXArray()
+    var lhsIndices: MLXArray?
     // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
     if doSort {
-        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        if lagunaZeroCopySortedLHSEnabled
+            && sparseLayerOrdinal < lagunaZeroCopySortedLHSSparseLayerCount
+        {
+            let routeWidth = indices.dim(-1)
+            let plan = gatherSortIndices(indices: indices)
+            // Index algebra:
+            //   order[r]       = original flattened route for sorted route r
+            //   original token = order[r] / routesPerToken
+            //   lhsIndices[r]  = order[r] / routeWidth
+            // The matrix batch kept below is `[token, 1, K]`, so that quotient
+            // is exactly the LHS matrix index consumed by gatherQuantizedMM.
+            lhsIndices = plan.order.floorDivide(routeWidth)
+            idx = plan.sortedIndices
+            inverseOrder = plan.inverseOrder
+            sortedX = sortedX.flattened(start: 0, end: -3)
+        } else {
+            (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        }
     }
     // Fused counterpart of SwitchGLU's separate-bank branch:
     //   xUp = upProj(x, idx, sortedIndices: doSort)
@@ -6450,6 +6489,7 @@ private func lagunaFusedSortedRoutedGateUp(
         fusedWeight,
         scales: fusedScales,
         biases: nil,
+        lhsIndices: lhsIndices,
         rhsIndices: idx,
         transpose: true,
         groupSize: 16,
@@ -6484,6 +6524,10 @@ private func lagunaFusedSortedRoutedGateUp(
 
 final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     let routedScalingFactor: Float
+    /// Zero-based ordinal among sparse decoder layers, independent of dense
+    /// layer placement. Drives DARKBLOOM_ZEROCOPY_LHS_LAYERS at the exact
+    /// gatherSort/gather-QMM boundary.
+    let sparseLayerOrdinal: Int
 
     @ModuleInfo(key: "gate") var gate: LagunaRuntimeMoEGate
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
@@ -6590,8 +6634,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         return [fusedWeight, fusedScales]
     }
 
-    init(_ config: LagunaConfig) {
+    init(_ config: LagunaConfig, sparseLayerOrdinal: Int) {
         self.routedScalingFactor = Float(config.moeRoutedScalingFactor)
+        self.sparseLayerOrdinal = sparseLayerOrdinal
         self._gate.wrappedValue = LagunaRuntimeMoEGate(config)
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
@@ -6807,7 +6852,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     deferUnsort:
                         lagunaPrefillSortedMoETailEnabled
                         && lagunaPrefillMoETailEnabled
-                        && residual != nil
+                        && residual != nil,
+                    sparseLayerOrdinal: sparseLayerOrdinal
                 )
                 y = routed.output
                 sortedTailInverseOrder = routed.inverseOrder
@@ -6929,7 +6975,13 @@ final class LagunaRuntimeDecoderLayer: Module {
         self._selfAttn.wrappedValue = LagunaRuntimeAttention(config, layerIdx: layerIdx)
 
         if config.isSparse(layer: layerIdx) {
-            self.mlp = LagunaRuntimeSparseMoEBlock(config)
+            let sparseLayerOrdinal = (0..<layerIdx).reduce(into: 0) { count, index in
+                if config.isSparse(layer: index) {
+                    count += 1
+                }
+            }
+            self.mlp = LagunaRuntimeSparseMoEBlock(
+                config, sparseLayerOrdinal: sparseLayerOrdinal)
         } else {
             self.mlp = LagunaRuntimeMLP(
                 dimensions: config.hiddenSize, hiddenDimensions: config.intermediateSize)

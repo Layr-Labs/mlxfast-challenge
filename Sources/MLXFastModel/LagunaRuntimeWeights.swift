@@ -471,6 +471,10 @@ public final class LagunaRuntimeWeightCache {
             Array(repeating: bosToken, count: 512),
             [1, 512]
         )
+        // This unconditional synthetic prefill also explicitly warms the
+        // DARKBLOOM_ZEROCOPY_LHS expert gather specialization (when enabled):
+        // 512 tokens produce the sorted 4096-route gate/up dispatch, and eval
+        // forces its Metal JIT pipeline to compile before the worker hello.
         eval(model(prefillTokens, cache: warmupCache))
         let decodeToken = MLXArray([bosToken], [1, 1])
         eval(model(decodeToken, cache: warmupCache))

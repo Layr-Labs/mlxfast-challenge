@@ -112,6 +112,32 @@ private let inversePermutationScatterKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+/// Produces `gatherSort`'s index plan without gathering `x`.
+///
+/// This is useful when a gather-aware matrix kernel can consume `order`
+/// directly and therefore does not need `gatherSort`'s expanded LHS copy.
+/// The sort and inverse-permutation operations intentionally match
+/// `gatherSort` below.
+public func gatherSortIndices(
+    indices: MLXArray
+) -> (order: MLXArray, sortedIndices: MLXArray, inverseOrder: MLXArray) {
+    let indices = indices.flattened()
+    let order = argSort(indices)
+    let inverseOrder: MLXArray
+    if inversePermutationScatterEnabled && order.size > 0 {
+        inverseOrder = inversePermutationScatterKernel(
+            [order],
+            grid: (order.size, 1, 1),
+            threadGroup: (min(order.size, 256), 1, 1),
+            outputShapes: [[order.size]],
+            outputDTypes: [.uint32]
+        )[0]
+    } else {
+        inverseOrder = argSort(order)
+    }
+    return (order, indices[order], inverseOrder)
+}
+
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
