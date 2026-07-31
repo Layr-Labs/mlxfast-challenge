@@ -1550,8 +1550,23 @@ template <
   // Restricted to
   // do_causal && !has_mask so the all-masked proof rests on the causal mask
   // alone; the timed window passes no array mask.
+  //
+  // Per-simdgroup causal mask start (level 1b, always on with the lim above):
+  // kb_min_causal is computed from the THREADGROUP's first row. This
+  // simdgroup's first row is tidl.x * BQ + tm, so every K block with
+  // kb < sg_kb_min_causal lies entirely BELOW this simdgroup's diagonal:
+  // the causal mask is a pure no-op there (every (row,col) satisfies
+  // col <= row). Raising the mask-loop entry from the threadgroup-wide
+  // kb_min_causal to sg_kb_min_causal therefore skips only sites whose
+  // stored scores are already unmasked -- bit-exact by construction.
+  // (The upper elision via sg_kb_lim / sg_active already covers blocks
+  // fully ABOVE the diagonal; this only tightens the mask start.)
+  int sg_kb_min_causal = kb_min_causal;
   int sg_kb_lim = kb_lim;
   if (do_causal && !has_mask) {
+    int sg_q_min =
+        int(tidl.x) * BQ + params->qL_off + int(tm);
+    sg_kb_min_causal = max(0, sg_q_min + 1) / BK;
     int sg_q_max =
         int(tidl.x) * BQ + params->qL_off + int(tm) + kU * TQ;
     sg_kb_lim = min(kb_lim, (sg_q_max + BK - 1) / BK);
@@ -1720,8 +1735,10 @@ template <
       }
     }
 
-    // Mask out if causal
-    if (do_causal && kb >= kb_min_causal) {
+    // Mask out if causal. Use the per-simdgroup start (sg_kb_min_causal)
+    // so blocks fully below this simdgroup's diagonal skip the mask loop
+    // without changing any stored score (see level 1b above).
+    if (do_causal && kb >= sg_kb_min_causal) {
       constexpr auto neg_inf = Limits<AccumType>::finite_min;
 
       const int base_row = int(tidl.x) * BQ + params->qL_off + tm;
