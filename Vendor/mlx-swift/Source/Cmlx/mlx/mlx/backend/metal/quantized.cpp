@@ -491,8 +491,31 @@ void qmm_nax(
     const std::string& mode) {
   int B = out.size() / M / N;
 
-  int wm = 2;
-  int wn = 2;
+  // DARKBLOOM_SHARED_QMM_WM: tile geometry for the shared-expert / dense-style
+  // NVFP4 qmm_t_nax_static path (K==2048,N==1024 gate/up and K==512,N==2048
+  // down). This is the same "regroup rows across simdgroups" change class as
+  // the gather path's measured winner BM128 variant 4: it only changes
+  //   SM = BM / WM   (line `constexpr short SM = BM / WM` in fp_qmm_t_impl)
+  //   tm = SM * (simd_gid / WN)
+  // i.e. which output rows each simdgroup owns. The K accumulation
+  //   for (int k = 0; k < kernel_K; k += BK)
+  // still runs inside one simdgroup's own fragment accumulator (Dtile) in the
+  // same ascending-K order, so every output element is summed over the
+  // identical K sequence in the identical order -- arithmetic-neutral by
+  // construction, max_abs_diff = 0, identical to the proven gather analogue.
+  //   unset (SHIPPED) -> wm=4, wn=2  (SM=16, 256 thr/TG; matches gather v4)
+  //   "0"             -> wm=2, wn=2  (SM=32, 128 thr/TG; pre-change control)
+  int shared_wm = [] {
+    auto s = env::get_var("DARKBLOOM_SHARED_QMM_WM", "");
+    if (s == "0") {
+      return 2;
+    }
+    return 4;
+  }();
+  int shared_wn = 2;
+
+  int wm = shared_wm;
+  int wn = shared_wn;
   int bm = 64;
   int bn = 64;
   int bk = 64;
