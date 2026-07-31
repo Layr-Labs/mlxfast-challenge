@@ -77,6 +77,15 @@ let lagunaLmHeadPrunePrefillEnabled =
 private let lagunaLmHeadInlineMaskEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_INLINE_MASK"] != "0"
 
+/// Candidate-only exact pass. DEFAULT ON: it keeps the shipped 256-thread,
+/// eight-SIMD threadgroup and fixed four-row ownership, but skips each
+/// non-candidate row's weight loads, FP32 additions, and reduction. Set
+/// `DARKBLOOM_LMHEAD_EXACT_4OWNER_XREUSE=0` to restore the shipped inline exact
+/// v1 kernel inside the same binary.
+private let lagunaLmHeadExactXReuseEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LMHEAD_EXACT_4OWNER_XREUSE"] != "0"
+
 /// Kernel header: bit-exact MXFP8 element decoders + the certified
 /// half-cell-width table, all inlinable and libm-free.
 private let lagunaLmHeadPruneHeader = """
@@ -713,6 +722,91 @@ private let lagunaLmHeadInlineExactKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Candidate-only exact variant that keeps the shipped i-outer loop and
+/// result[4] register layout. Each row predicate is broadcast before the K
+/// loop, so all guards are SIMD-uniform. Active rows retain the stock lane/K
+/// mapping, four ordered FP32 additions, reduction tree, and BF16 cast;
+/// inactive rows perform no lm_head load or reduction and receive coarse BF16.
+private let lagunaLmHeadInlineExactXReuseKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_inline_mask_four_owner_xreuse_v1",
+    inputNames: ["coarse", "delta", "thr", "lm_head", "x"],
+    outputNames: ["assembled"],
+    source: """
+        constexpr uint VOCAB = 100352;
+        constexpr uint K = 2048;
+
+        uint tgid = threadgroup_position_in_grid.x;
+        uint sgid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint base = tgid * 32 + sgid * 4;
+
+        bool lane_candidate = false;
+        if (lane < 4) {
+            uint row = base + lane;
+            lane_candidate =
+                row < VOCAB && coarse[row] + delta[row] >= thr[0];
+        }
+        uint lane_candidate_u = lane_candidate ? 1u : 0u;
+        bool active[4];
+        #pragma clang loop unroll(full)
+        for (ushort tm = 0; tm < 4; ++tm) {
+            active[tm] = simd_shuffle(lane_candidate_u, tm) != 0u;
+        }
+
+        // Keep the shipped i-outer/result[4] structure so x is loaded once
+        // per K step. Each active[tm] is SIMD-uniform, hence every collective
+        // below is reached by either all lanes or no lanes.
+        thread float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread bfloat inter[4];
+        thread float v_coeff[4];
+        uint bn = lane * 4;
+        for (uint i = 0; i < 16; ++i) {
+            vec<bfloat, 4> xv =
+                *((const device vec<bfloat, 4>*)(x + bn));
+            v_coeff[0] = float(xv.x);
+            v_coeff[1] = float(xv.y);
+            v_coeff[2] = float(xv.z);
+            v_coeff[3] = float(xv.w);
+            #pragma clang loop unroll(full)
+            for (uint tm = 0; tm < 4; ++tm) {
+                if (active[tm]) {
+                    const device bfloat* mrow =
+                        lm_head + size_t(base + tm) * K;
+                    vec<bfloat, 4> mv =
+                        *((const device vec<bfloat, 4>*)(mrow + bn));
+                    inter[0] = mv.x;
+                    inter[1] = mv.y;
+                    inter[2] = mv.z;
+                    inter[3] = mv.w;
+                    result[tm] += inter[0] * v_coeff[0];
+                    result[tm] += inter[1] * v_coeff[1];
+                    result[tm] += inter[2] * v_coeff[2];
+                    result[tm] += inter[3] * v_coeff[3];
+                }
+            }
+            bn += 128;
+        }
+        #pragma clang loop unroll(full)
+        for (uint tm = 0; tm < 4; ++tm) {
+            if (active[tm]) {
+                #pragma unroll
+                for (ushort sn = 16; sn >= 1; sn >>= 1) {
+                    result[tm] += simd_shuffle_down(result[tm], sn);
+                }
+            }
+        }
+        if (lane == 0) {
+            #pragma clang loop unroll(full)
+            for (uint tm = 0; tm < 4; ++tm) {
+                uint row = base + tm;
+                assembled[row] = active[tm]
+                    ? bfloat(result[tm]) : bfloat(coarse[row]);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 /// Retained init-time MXFP8 coarse copy of lm_head plus the pruned final-row
 /// forward. Built once (untimed init) by
 /// `LagunaRuntimeModel.prepareFusedRuntimeWeights` when
@@ -811,7 +905,10 @@ final class LagunaLmHeadPruner {
         // once (100352 == 3136 * 32). Every slot has exactly one owning lane.
         let assembled: MLXArray
         if lagunaLmHeadInlineMaskEnabled {
-            assembled = lagunaLmHeadInlineExactKernel(
+            let exactKernel = lagunaLmHeadExactXReuseEnabled
+                ? lagunaLmHeadInlineExactXReuseKernel
+                : lagunaLmHeadInlineExactKernel
+            assembled = exactKernel(
                 [coarse, delta, thr, lmHeadWeight, x],
                 grid: (vocab / 32 * 256, 1, 1),
                 threadGroup: (256, 1, 1),
