@@ -508,22 +508,24 @@ let lagunaFusedFullQKNormYaRNEnabled =
 
 /// Decode-only carrier for the two authoritative RoPE angle rows consumed by
 /// the fused Q/K kernels. At load time each attention family's own stock RoPE
-/// materializes an exact FP32 position atlas. A single custom kernel then
-/// replaces the token embedding gather and copies both selected atlas rows,
-/// removing the two per-token probe RoPE dispatches without changing their
-/// values.
+/// materializes an exact FP32 position atlas. The direct-atlas candidate reads
+/// the selected rows in the Q/K kernels, replacing the two per-token probe
+/// RoPE dispatches and the legacy row-copy carrier without changing values.
+/// The legacy carrier remains available for isolated diagnostics.
 ///
-/// Default OFF since the decode fusion-stack audit: with every other lever
-/// at default, the atlas measures −0.23% steady decode (se 0.03%, 0/2 ABBA
-/// pairs favoring ON, quiescent-machine rig) — the fused kernel's fixed cost
-/// now exceeds the two tiny probe dispatches it removes, the same
-/// promoted-era-value rot its prefill sibling showed (ranked −0.79%
-/// re-land). The OFF path is the verbatim stock fallback below
-/// (`embedTokens` gather + `ropeAngleTable` probes), exercised with zero
-/// token mismatches in every audit arm. Set `DARKBLOOM_ROPE_ANGLE_ATLAS=1`
-/// to re-enable.
+/// Default ON for the direct-atlas candidate. Set
+/// `DARKBLOOM_ROPE_ANGLE_ATLAS=0` to restore the stock embedding gather and
+/// per-step RoPE probe path; the legacy carrier remains available with
+/// `DARKBLOOM_DIRECT_ROPE_ANGLE_ATLAS=0` for isolated diagnostics.
 let lagunaRoPEAngleAtlasEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] == "1"
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] != "0"
+
+/// Decode-only direct atlas consumer. The existing atlas carrier remains the
+/// explicit legacy path; this flag makes Q/K kernels read the selected row
+/// from the resident atlas directly, avoiding per-token row-copy outputs.
+private let lagunaDirectRoPEAngleAtlasEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_DIRECT_ROPE_ANGLE_ATLAS"] != "0"
 
 /// `DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU` (default on; set "0" to disable):
 /// after checkpoint load, retain one row-concatenated BF16 `[gate; up]` bank
@@ -1097,6 +1099,122 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Decode atlas twin of `lagunaFullQKNormYaRNKernel`. It reads the selected
+/// authoritative angle row in place instead of receiving a copied row output
+/// from the embedding/atlas carrier kernel.
+private let lagunaFullQKNormYaRNAtlasKernel = MLXFast.metalKernel(
+    name: "laguna_full_qk_norm_yarn_bf16_128_atlas_v1",
+    inputNames: [
+        "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
+        "offsets",
+    ],
+    outputNames: ["queries", "keys"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint rotary_pairs = 32;
+        constexpr uint query_heads = 48;
+        constexpr float yarn_mscale = 1.3465735912322998f;
+
+        uint head = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+        uint position = uint(offsets[0]);
+
+        const device bfloat* input;
+        const device bfloat* weight;
+        if (head < query_heads) {
+            input = raw_queries + head * head_dim;
+            weight = query_weight;
+        } else {
+            input = raw_keys + (head - query_heads) * head_dim;
+            weight = key_weight;
+        }
+
+        uint base = lane * 4;
+        thread bfloat normalized[4];
+        float sum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float value = float(input[base + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+        for (uint i = 0; i < 4; ++i) {
+            normalized[i] =
+                weight[base + i] *
+                bfloat(float(input[base + i]) * inverse_rms);
+        }
+
+        thread float paired[4];
+        for (uint i = 0; i < 4; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
+        }
+
+        device bfloat* output =
+            head < query_heads
+            ? queries + head * head_dim
+            : keys + (head - query_heads) * head_dim;
+        const device float* angle_row =
+            angles + position * (2 * rotary_pairs);
+        if (lane < 8) {
+            bfloat rounded_mscale = bfloat(yarn_mscale);
+            for (uint i = 0; i < 4; ++i) {
+                uint pair = base + i;
+                float first =
+                    float(bfloat(normalized[i] * rounded_mscale));
+                float second =
+                    float(bfloat(bfloat(paired[i]) * rounded_mscale));
+                float cosine = angle_row[pair];
+                float sine = angle_row[pair + rotary_pairs];
+                output[pair] = bfloat(first * cosine - second * sine);
+                output[pair + rotary_pairs] =
+                    bfloat(first * sine + second * cosine);
+            }
+        } else if (lane >= 16) {
+            for (uint i = 0; i < 4; ++i) {
+                output[base + i] = normalized[i];
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private func lagunaFullQKNormYaRNAtlas(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray,
+    offsets: MLXArray
+) -> (MLXArray, MLXArray) {
+    precondition(rawQueries.dtype == .bfloat16)
+    precondition(rawKeys.dtype == .bfloat16)
+    precondition(queryWeight.dtype == .bfloat16)
+    precondition(keyWeight.dtype == .bfloat16)
+    precondition(rawQueries.shape == [1, 1, 48 * LagunaConstants.headDim])
+    precondition(rawKeys.shape == [1, 1, 8 * LagunaConstants.headDim])
+    precondition(queryWeight.shape == [LagunaConstants.headDim])
+    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(angles.dtype == .float32)
+    precondition(angles.shape == [
+        1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim / 2,
+    ])
+    precondition(offsets.dtype == .int32 && offsets.size == 1)
+
+    lagunaTrace("full qk norm+yarn direct atlas")
+    let outputs = lagunaFullQKNormYaRNAtlasKernel(
+        [rawQueries, rawKeys, queryWeight, keyWeight, angles, offsets],
+        grid: (56 * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [
+            [1, 48, 1, LagunaConstants.headDim],
+            [1, 8, 1, LagunaConstants.headDim],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
 func lagunaFullQKNormYaRN(
     rawQueries: MLXArray,
     rawKeys: MLXArray,
@@ -1244,6 +1362,115 @@ func lagunaSlidingQKNormRoPE(
     lagunaTrace("sliding qk norm+rope")
     let outputs = lagunaSlidingQKNormRoPEKernel(
         [rawQueries, rawKeys, queryWeight, keyWeight, angles],
+        grid: ((heads + kvHeads) * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [
+            [1, heads, 1, LagunaConstants.headDim],
+            [1, kvHeads, 1, LagunaConstants.headDim],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
+/// Decode atlas twin of `lagunaSlidingQKNormRoPEKernel`; it reads the
+/// selected full atlas row directly and avoids the carrier's copied output.
+private let lagunaSlidingQKNormRoPEAtlasKernel = MLXFast.metalKernel(
+    name: "laguna_sliding_qk_norm_rope_bf16_128_atlas_v1",
+    inputNames: [
+        "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
+        "offsets",
+    ],
+    outputNames: ["queries", "keys"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint rotary_pairs = 64;
+        constexpr uint query_heads = 64;
+
+        uint head = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+        uint position = uint(offsets[0]);
+
+        const device bfloat* input;
+        const device bfloat* weight;
+        if (head < query_heads) {
+            input = raw_queries + head * head_dim;
+            weight = query_weight;
+        } else {
+            input = raw_keys + (head - query_heads) * head_dim;
+            weight = key_weight;
+        }
+
+        uint base = lane * 4;
+        thread bfloat normalized[4];
+        float sum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float value = float(input[base + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+        for (uint i = 0; i < 4; ++i) {
+            normalized[i] =
+                weight[base + i] *
+                bfloat(float(input[base + i]) * inverse_rms);
+        }
+
+        thread float paired[4];
+        for (uint i = 0; i < 4; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
+        }
+
+        device bfloat* output =
+            head < query_heads
+            ? queries + head * head_dim
+            : keys + (head - query_heads) * head_dim;
+        const device float* angle_row =
+            angles + position * (2 * rotary_pairs);
+        if (lane < 16) {
+            for (uint i = 0; i < 4; ++i) {
+                uint pair = base + i;
+                float first = float(normalized[i]);
+                float second = paired[i];
+                float cosine = angle_row[pair];
+                float sine = angle_row[pair + rotary_pairs];
+                output[pair] = bfloat(first * cosine - second * sine);
+                output[pair + rotary_pairs] =
+                    bfloat(first * sine + second * cosine);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private func lagunaSlidingQKNormRoPEAtlas(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray,
+    offsets: MLXArray
+) -> (MLXArray, MLXArray) {
+    let heads = LagunaConstants.slidingAttentionHeads
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    precondition(rawQueries.dtype == .bfloat16)
+    precondition(rawKeys.dtype == .bfloat16)
+    precondition(queryWeight.dtype == .bfloat16)
+    precondition(keyWeight.dtype == .bfloat16)
+    precondition(rawQueries.shape == [1, 1, heads * LagunaConstants.headDim])
+    precondition(rawKeys.shape == [1, 1, kvHeads * LagunaConstants.headDim])
+    precondition(queryWeight.shape == [LagunaConstants.headDim])
+    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(angles.dtype == .float32)
+    precondition(angles.shape == [
+        1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim,
+    ])
+    precondition(offsets.dtype == .int32 && offsets.size == 1)
+
+    lagunaTrace("sliding qk norm+rope direct atlas")
+    let outputs = lagunaSlidingQKNormRoPEAtlasKernel(
+        [rawQueries, rawKeys, queryWeight, keyWeight, angles, offsets],
         grid: ((heads + kvHeads) * 32, 1, 1),
         threadGroup: (32, 1, 1),
         outputShapes: [
@@ -3266,6 +3493,23 @@ final class LagunaRuntimeAttention: Module {
             qkRoPEAngles?.dtype == .float32 &&
             qkRoPEAngles?.shape == [1, 1, 1, headDim]
 
+        let useDirectFullQKNormYaRNAtlas =
+            lagunaDirectRoPEAngleAtlasEnabled && !isSliding &&
+            fusedQKNormShapesMatch &&
+            nHeads == LagunaConstants.fullAttentionHeads &&
+            qkRoPEAngles?.dtype == .float32 &&
+            qkRoPEAngles?.shape == [
+                1, 1, lagunaRoPEAngleAtlasLength, headDim / 2,
+            ] && qkRoPEOffsets?.dtype == .int32 && qkRoPEOffsets?.size == 1
+
+        let useDirectSlidingQKNormRoPEAtlas =
+            lagunaDirectRoPEAngleAtlasEnabled && isSliding &&
+            fusedQKNormShapesMatch &&
+            nHeads == LagunaConstants.slidingAttentionHeads &&
+            qkRoPEAngles?.dtype == .float32 &&
+            qkRoPEAngles?.shape == [1, 1, lagunaRoPEAngleAtlasLength, headDim] &&
+            qkRoPEOffsets?.dtype == .int32 && qkRoPEOffsets?.size == 1
+
         // Multi-token twins of the decode fusions. The angle input is the
         // full load-time atlas (one cos/sin row per absolute position) and
         // `qkRoPEOffsets` carries the cache offset the stock
@@ -3297,7 +3541,31 @@ final class LagunaRuntimeAttention: Module {
             qkRoPEAngles?.shape == [1, 1, lagunaRoPEAngleAtlasLength, headDim / 2]
 
         var qkNormRoPEFused = false
-        if useFusedFullQKNormYaRN, let qkRoPEAngles {
+        if useDirectFullQKNormYaRNAtlas,
+            let angles = qkRoPEAngles, let offsets = qkRoPEOffsets
+        {
+            (queries, keys) = lagunaFullQKNormYaRNAtlas(
+                rawQueries: queries,
+                rawKeys: keys,
+                queryWeight: qNorm.weight,
+                keyWeight: kNorm.weight,
+                angles: angles,
+                offsets: offsets
+            )
+            qkNormRoPEFused = true
+        } else if useDirectSlidingQKNormRoPEAtlas,
+            let angles = qkRoPEAngles, let offsets = qkRoPEOffsets
+        {
+            (queries, keys) = lagunaSlidingQKNormRoPEAtlas(
+                rawQueries: queries,
+                rawKeys: keys,
+                queryWeight: qNorm.weight,
+                keyWeight: kNorm.weight,
+                angles: angles,
+                offsets: offsets
+            )
+            qkNormRoPEFused = true
+        } else if useFusedFullQKNormYaRN, let qkRoPEAngles {
             (queries, keys) = lagunaFullQKNormYaRN(
                 rawQueries: queries,
                 rawKeys: keys,
@@ -7316,7 +7584,26 @@ final class LagunaRuntimeModelInner: Module {
         var slidingRoPEAngles: MLXArray?
         var qkRoPEOffsets: MLXArray?
         var layer0PrecomputedNorm: MLXArray?
-        if let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
+        if lagunaDirectRoPEAngleAtlasEnabled,
+            let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
+            let fullAtlas = _fullRoPEAngleAtlas,
+            let slidingAtlas = _slidingRoPEAngleAtlas
+        {
+            if inputs.shape == [1, 1], lagunaFusedEmbedNormEnabled,
+                let fused = lagunaEmbedNorm(
+                    tokens: inputs,
+                    embedWeight: embedTokens.weight,
+                    normWeight: layers[0].inputLayerNorm.weight)
+            {
+                h = fused.hidden
+                layer0PrecomputedNorm = fused.normalized
+            } else {
+                h = embedTokens(inputs)
+            }
+            fullRoPEAngles = fullAtlas
+            slidingRoPEAngles = slidingAtlas
+            qkRoPEOffsets = MLXArray([Int32(position)])
+        } else if let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
             let fullAtlas = _fullRoPEAngleAtlas,
             let slidingAtlas = _slidingRoPEAngleAtlas,
             let atlasOutputs = lagunaDecodeEmbeddingRoPEAtlas(
