@@ -82,108 +82,6 @@ inline void dequantize(uint8_t w, U scale, threadgroup U* w_local) {
   }
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// NVFP4 block-loader staging fast path.
-//
-// Two bit-exact rewrites of the fp4 staging chain QuantizedBlockLoader runs
-// (the qmm / gather-qmm prefill kernels). Both rest on one observation about
-// `fp4_e2m1::operator float16_t()`:
-//
-//     half converted = as_type<half>(ushort((bits & 7) << 9));
-//     converted *= 16384.0;                        // 2^14
-//     return bits & 8 ? -converted : converted;
-//
-// The 3-bit magnitude field is *bit-embedded* into a half -- fp4's 2-bit
-// exponent lands in the low two bits of half's 5-bit exponent field and fp4's
-// single mantissa bit lands in half mantissa bit 9 -- so the reinterpreted
-// half is already the right number up to a fixed power of two: exactly
-// {0, .5, 1, 1.5, 2, 3, 4, 6} * 2^-14. The `* 16384.0` is a pure
-// renormalization, never a rounding step. (0.5 * 2^-14 == 2^-15 is a half
-// subnormal, and its bit pattern is precisely the one we started from, so
-// nothing rounds there either.)
-//
-// CHANGE 1 -- hoist the 2^14 out of the per-value converts into the one
-// per-group scale. The loader stores `scale * value`, so with
-//     s = the e4m3 group scale (at most 4 significant bits, |s| in
-//         [2^-9, 448] or NaN)
-//     m = an fp4 magnitude in {0, .5, 1, 1.5, 2, 3, 4, 6}
-// today's chain rounds `s * (m * 2^-14 * 2^14)` once and the folded chain
-// rounds `(s * 2^14) * (m * 2^-14)` once. Every factor is exact in binary FP:
-//   * s * 2^14 only shifts an exponent -- no rounding -- and can neither
-//     overflow (448 * 2^14 = 7340032, far inside float) nor underflow
-//     (2^-9 * 2^14 = 2^5),
-//   * m * 2^-14 is exactly representable in half, bfloat and float,
-//   * so both orderings are the SAME real number rounded once to the same
-//     destination type: identical bits.
-// The per-value multiply count drops from `n_reads * pack_factor` to one.
-// This is the loader-side sibling of the 2^22 fold `laguna_nvfp4_scale`
-// already carries in the decode custom kernels.
-//
-// Restricted to group_size == 16, the e4m3 (NVFP4) scale. mxfp4's e8m0 scales
-// (group_size 32) reach 2^127, where s * 2^14 would overflow to inf, so those
-// instantiations keep the original chain byte for byte.
-//
-// CHANGE 2 -- spread eight nibbles per uint32 instead of two per byte. The
-// byte-at-a-time chain costs AND + SHL + half multiply + AND + compare +
-// select per nibble plus a SHR per byte (~104 scalar ops per thread per
-// k-iteration at 16 values). The uint-at-a-time spread is four masked-
-// shift-OR groups, 19 integer ops per uint32, each producing a half2 whose
-// two lanes are two nibbles with the sign folded into the same OR. Ported
-// from `laguna_nvfp4_qdot_16` in the decode custom kernels. The half bit
-// patterns it builds are exactly the ones fp4_e2m1 builds one lane at a time,
-// so the staged values are unchanged.
-//
-// Verified by exhaustive GPU enumeration against the byte-at-a-time chain for
-// bfloat16_t, float16_t and float: all 256 scale bytes x all 256 packed
-// bytes, and all 256 scale bytes x all 65536 four-nibble codes -- 0 bit
-// mismatches out of 404,226,048 staged values.
-///////////////////////////////////////////////////////////////////////////////
-
-// Per-group NVFP4 scale with fp4's 2^14 renormalization folded in (Change 1).
-static inline float fp4nv_scale_x16384(uint8_t s) {
-  return float(*(thread fp8_e4m3*)(&s)) * 16384.0f;
-}
-
-// Four packed bytes -> one uint32 in little-endian nibble order. Read through
-// packed_uchar4, whose alignment is 1, so widening the access adds no address
-// precondition the byte-at-a-time loop did not already satisfy.
-static inline uint32_t fp4nv_pack4(const device uint8_t* p) {
-  return as_type<uint32_t>(uchar4(*(const device packed_uchar4*)p));
-}
-static inline uint32_t fp4nv_pack4(const thread uint8_t* p) {
-  return as_type<uint32_t>(uchar4(p[0], p[1], p[2], p[3]));
-}
-
-// Decode the eight fp4 nibbles packed in `c` and apply the folded scale
-// (Change 2). `out[k]` is nibble k -- byte k/2's low half for even k, high
-// half for odd k -- which is exactly the order `dequantize<U, 4>` produces
-// when walking those four bytes.
-template <typename T>
-static inline void fp4nv_decode8(uint32_t c, float scale, thread T* out) {
-  // Split-nibble decode: identical half bit patterns to stock with fewer
-  // integer ops and fewer live constant registers. See fp_quantized.cpp
-  // qdot() for the bit-exactness argument.
-  const uint32_t xe = c & 0x0F0F0F0Fu;
-  const uint32_t ge = xe | (xe << 3);
-  const uint32_t yo = c & 0xF0F0F0F0u;
-  const uint32_t go = yo | (yo >> 3);
-  const float2 v0 =
-      float2(as_type<half2>((ge << 9) & 0x8E008E00u)) * scale;
-  const float2 v1 =
-      float2(as_type<half2>((go << 8) & 0x8E008E00u)) * scale;
-  const float2 v2 =
-      float2(as_type<half2>((ge << 1) & 0x8E008E00u)) * scale;
-  const float2 v3 = float2(as_type<half2>(go & 0x8E008E00u)) * scale;
-  out[0] = T(v0.x);
-  out[1] = T(v1.x);
-  out[2] = T(v2.x);
-  out[3] = T(v3.x);
-  out[4] = T(v0.y);
-  out[5] = T(v1.y);
-  out[6] = T(v2.y);
-  out[7] = T(v3.y);
-}
-
 // 16B-aligned chunk used to give the Ws staging buffer a guaranteed 16B base
 // address. Metal gives no alignas on a threadgroup array of scalars, and MSL
 // has no pointer-to-integer cast for threadgroup addresses, so the alignment
@@ -253,50 +151,20 @@ struct QuantizedBlockLoader {
             bj * bytes_per_pack),
         scales(scales_ + bi * src_ld / group_size + group_id) {}
 
-  // The NVFP4 staging fast path applies when the packing is one byte per two
-  // values, the scale is e4m3, and the byte run governed by ONE scale splits
-  // evenly into uint32s (so a uint32 never straddles a scale boundary). Every
-  // fp4 instantiation here qualifies: n_reads = 16 with n_reads_per_scale = 8.
-  // mxfp8 (bits 8) and mxfp4 (e8m0 scales) keep the original scalar chain.
-  MLX_MTL_CONST bool fp4nv_fast = (bits == 4) && (group_size == 16) &&
-      (bytes_per_pack == 1) && (n_reads_per_scale >= 4) &&
-      ((n_reads_per_scale % 4) == 0);
-
-  // Stage this thread's n_reads packed bytes into `dst`. Identical values at
-  // identical addresses on both paths; see the note above dequantize().
-  void stage() const {
-    if constexpr (fp4nv_fast) {
-      int k = 0;
-      for (int i = 0; i < n_steps_per_read; i++) {
-        const float scale = fp4nv_scale_x16384(scales[i]);
-        for (int j = 0; j < n_reads_per_scale / 4; j++) {
-          T vals[8];
-          fp4nv_decode8<T>(fp4nv_pack4(src + k), scale, vals);
-          for (int e = 0; e < 8; e++) {
-            dst[k * pack_factor + e] = vals[e];
-          }
-          k += 4;
-        }
-      }
-    } else {
-      int k = 0;
-      for (int i = 0; i < n_steps_per_read; i++) {
-        T scale = dequantize_scale<T, group_size>(scales[i]);
-        for (int j = 0; j < n_reads_per_scale; j++) {
-          dequantize<T, bits>(
-              src[k * bytes_per_pack], scale, dst + k * pack_factor);
-          k++;
-        }
-      }
-    }
-  }
-
   void load_unsafe() const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
       return;
     }
 
-    stage();
+    int k = 0;
+    for (int i = 0; i < n_steps_per_read; i++) {
+      T scale = dequantize_scale<T, group_size>(scales[i]);
+      for (int j = 0; j < n_reads_per_scale; j++) {
+        dequantize<T, bits>(
+            src[k * bytes_per_pack], scale, dst + k * pack_factor);
+        k++;
+      }
+    }
   }
 
   // DARKBLOOM_STAGE_WIDEST / DARKBLOOM_STAGE_WIDELD.
@@ -422,24 +290,13 @@ struct QuantizedBlockLoader {
       // Same scale the scalar loop selects for every k in this chunk:
       // i = k / n_reads_per_scale, constant across the chunk because
       // kSrcBytesPerChunk divides n_reads_per_scale.
+      T scale =
+          dequantize_scale<T, group_size>(scales[k0 / n_reads_per_scale]);
+
       WideChunk out;
-      // The NVFP4 spread needs 4 source bytes per call, so it is used only
-      // when a 16B chunk covers a whole multiple of them (kSrcBytesPerChunk
-      // is 4 for bfloat/half staging, 2 for float). Same values either way.
-      if constexpr (fp4nv_fast && (kSrcBytesPerChunk % 4) == 0) {
-        const float scale =
-            fp4nv_scale_x16384(scales[k0 / n_reads_per_scale]);
-        STEEL_PRAGMA_UNROLL
-        for (short b = 0; b < kSrcBytesPerChunk / 4; b++) {
-          fp4nv_decode8<T>(fp4nv_pack4(sb + k0 + b * 4), scale, &out.v[b * 8]);
-        }
-      } else {
-        T scale =
-            dequantize_scale<T, group_size>(scales[k0 / n_reads_per_scale]);
-        STEEL_PRAGMA_UNROLL
-        for (short b = 0; b < kSrcBytesPerChunk; b++) {
-          dequantize_pair(sb[k0 + b], scale, &out.v[b * pack_factor]);
-        }
+      STEEL_PRAGMA_UNROLL
+      for (short b = 0; b < kSrcBytesPerChunk; b++) {
+        dequantize_pair(sb[k0 + b], scale, &out.v[b * pack_factor]);
       }
 
       if (store_ok) {
@@ -472,7 +329,15 @@ struct QuantizedBlockLoader {
       return;
     }
 
-    stage();
+    int k = 0;
+    for (int i = 0; i < n_steps_per_read; i++) {
+      T scale = dequantize_scale<T, group_size>(scales[i]);
+      for (int j = 0; j < n_reads_per_scale; j++) {
+        dequantize<T, bits>(
+            src[k * bytes_per_pack], scale, dst + k * pack_factor);
+        k++;
+      }
+    }
   }
 
   void next() {
@@ -497,10 +362,7 @@ template <
     const int BN = 64,
     const int WM = 2,
     const int WN = 2,
-    typename Wtype = bfloat,
-    const int fixed_K = 0,
-    const int fixed_N = 0,
-    const bool aligned_M = false>
+    typename Wtype = bfloat>
 METAL_FUNC void fp_qmm_t_impl(
     const device uint32_t* w,
     const device uint8_t* scales,
@@ -521,8 +383,6 @@ METAL_FUNC void fp_qmm_t_impl(
 
   constexpr int pack_factor = get_pack_factor<8, bits>();
   constexpr int bytes_per_pack = get_bytes_per_pack();
-  const int kernel_K = fixed_K > 0 ? fixed_K : K;
-  const int kernel_N = fixed_N > 0 ? fixed_N : N;
 
   constexpr int BK_padded = (BK + 16 / sizeof(Wtype));
 
@@ -538,20 +398,20 @@ METAL_FUNC void fp_qmm_t_impl(
       bits>;
 
   // Set the block
-  const int K_w = kernel_K * bytes_per_pack / pack_factor;
-  const int K_g = kernel_K / group_size;
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
 
   auto wl = (const device uint8_t*)w;
 
-  x += y_row * static_cast<int64_t>(kernel_K);
+  x += y_row * static_cast<int64_t>(K);
   wl += y_col * K_w;
   scales += y_col * K_g;
-  y += y_row * static_cast<int64_t>(kernel_N) + y_col;
+  y += y_row * static_cast<int64_t>(N) + y_col;
 
   // Make the weight loader
-  loader_w_t loader_w(wl, scales, kernel_K, Ws, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, K, Ws, simd_gid, simd_lid);
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
@@ -567,15 +427,12 @@ METAL_FUNC void fp_qmm_t_impl(
   constexpr bool transpose_a = false;
   constexpr bool transpose_b = true;
 
-  const short sgp_sm =
-      aligned_M ? SM : min(int(SM), M - (y_row + tm));
-  const bool is_unaligned_sm = aligned_M ? false : (sgp_sm != SM);
+  const short sgp_sm = min(int(SM), M - (y_row + tm));
+  const bool is_unaligned_sm = (sgp_sm != SM);
 
-  const short sgp_sn =
-      aligned_N ? SN : min(int(SN), kernel_N - (y_col + tn));
+  const short sgp_sn = aligned_N ? SN : min(int(SN), N - (y_col + tn));
 
-  const short tgp_bn =
-      aligned_N ? BN : min(BN, int(kernel_N - y_col));
+  const short tgp_bn = aligned_N ? BN : min(BN, int(N - (y_col)));
   const bool is_unaligned_bn = aligned_N ? false : (tgp_bn != BN);
 
   using AccumType = float;
@@ -583,11 +440,11 @@ METAL_FUNC void fp_qmm_t_impl(
   NAXTile<AccumType, TM, TN> Dtile;
   Dtile.clear();
 
-  x += tm * kernel_K;
+  x += tm * K;
 
-  dispatch_bool(aligned_M || !is_unaligned_sm, [&](auto kAlignedM) {
+  dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      for (int k = 0; k < kernel_K; k += BK) {
+      for (int k = 0; k < K; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
@@ -605,10 +462,9 @@ METAL_FUNC void fp_qmm_t_impl(
           volatile int compiler_barrier;
 
           if constexpr (kAlignedM.value) {
-            Atile.load(x + kk1, kernel_K);
+            Atile.load(x + kk1, K);
           } else {
-            Atile.load_safe(
-                x + kk1, kernel_K, short2(SK, sgp_sm));
+            Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
           }
 
           Btile.template load<Wtype, BK_padded, 1>(Ws + tn * BK_padded + kk1);
@@ -631,14 +487,11 @@ METAL_FUNC void fp_qmm_t_impl(
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
       if constexpr (kAlignedM.value && kAlignedN.value) {
-        Dtile.store(y + tm * kernel_N + tn, kernel_N);
+        Dtile.store(y + tm * N + tn, N);
       } else if (kAlignedM.value && sgp_sn == SN) {
-        Dtile.store(y + tm * kernel_N + tn, kernel_N);
+        Dtile.store(y + tm * N + tn, N);
       } else {
-        Dtile.store_safe(
-            y + tm * kernel_N + tn,
-            kernel_N,
-            short2(sgp_sn, sgp_sm));
+        Dtile.store_safe(y + tm * N + tn, N, short2(sgp_sn, sgp_sm));
       }
     });
   });
@@ -903,73 +756,6 @@ template <
         tid);
   }
   fp_qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN, Wtype>(
-      w, scales, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
-}
-
-// Laguna's shared-expert NVFP4 projections have two fixed matrix shapes.
-// Baking K/N and the M-alignment class into the JIT specialization removes
-// constant-buffer divisions, dynamic row strides, and the dead tail path
-// without changing any load, dequantization, MMA, or accumulation order.
-template <
-    typename T,
-    const int group_size,
-    const int bits,
-    const int fixed_K,
-    const int fixed_N,
-    const bool aligned_M,
-    const int BM = 64,
-    const int BK = 64,
-    const int BN = 64,
-    const int WM = 2,
-    const int WN = 2,
-    typename Wtype = bfloat>
-[[kernel]] void fp_qmm_t_nax_static(
-    const device uint32_t* w,
-    const device uint8_t* scales,
-    const device T* x,
-    device T* y,
-    const constant int& K,
-    const constant int& N,
-    const constant int& M,
-    const constant int& x_batch_ndims,
-    const constant int* x_shape,
-    const constant int64_t* x_strides,
-    const constant int& w_batch_ndims,
-    const constant int* w_shape,
-    const constant int64_t* w_strides,
-    const constant int64_t* s_strides,
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint lid [[thread_index_in_threadgroup]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  (void)K;
-  (void)N;
-  (void)x_batch_ndims;
-  (void)x_shape;
-  (void)x_strides;
-  (void)w_batch_ndims;
-  (void)w_shape;
-  (void)w_strides;
-  (void)s_strides;
-  static_assert(fixed_K > 0 && fixed_N > 0);
-
-  constexpr int BK_padded = BK + 16 / sizeof(Wtype);
-  threadgroup Wtype Ws[BN * BK_padded];
-
-  fp_qmm_t_impl<
-      T,
-      group_size,
-      bits,
-      true,
-      BM,
-      BK,
-      BN,
-      WM,
-      WN,
-      Wtype,
-      fixed_K,
-      fixed_N,
-      aligned_M>(
       w, scales, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
@@ -1372,12 +1158,7 @@ template <
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
           if (sg_active) {
-            // PRAGMA-VARIANT 01: SK-step staging+MMA loop, 2 iterations
-            // (BK=64/SK=32). Full unroll lets the second step's 6 fragment
-            // loads issue during the first step's MMA chain. Scheduling
-            // only: tile_matmad_nax order and Dtile accumulation sequence
-            // are unchanged. Volatile stays, gated by stage_novol (fc 207).
-            STEEL_PRAGMA_UNROLL
+            STEEL_PRAGMA_NO_UNROLL
             for (int kk1 = 0; kk1 < BK; kk1 += SK) {
               NAXTile<T, TM, TK> Atile;
               NAXTile<Wtype, BR, BC> Btile;
@@ -1426,8 +1207,7 @@ template <
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
           if (sg_active) {
-            // PRAGMA-VARIANT 01: same unroll for the K-remainder loop.
-            STEEL_PRAGMA_UNROLL
+            STEEL_PRAGMA_NO_UNROLL
             for (int kk1 = 0; kk1 < BK; kk1 += SK) {
               NAXTile<T, TM, TK> Atile;
               NAXTile<Wtype, BR, BC> Btile;
@@ -1493,247 +1273,5 @@ template <
         }
       });
     });
-  }
-}
-
-METAL_FUNC int laguna_sorted_lower_bound(
-    const device uint32_t* indices,
-    const int count,
-    const uint32_t value) {
-  int lo = 0;
-  int hi = count;
-  while (lo < hi) {
-    const int mid = lo + (hi - lo) / 2;
-    if (indices[mid] < value) {
-      lo = mid + 1;
-    } else {
-      hi = mid;
-    }
-  }
-  return lo;
-}
-
-// Laguna prefill sorts the M routed rows by expert before this QMM. The stock
-// kernel assigns fixed 64-row tiles, then walks every expert run intersecting
-// a tile; a run crossing a tile boundary stages the same expert weight tile
-// again. This variant assigns four expert ids to each of 64 threadgroups.
-// Each expert's contiguous interval is found by two lower bounds, chunked only
-// when it genuinely exceeds BM, and therefore stages once per expert/chunk.
-//
-// Per-output arithmetic is unchanged: the same NAX fragment coordinates,
-// K_it/BK/SK traversal, BF16 weight staging boundary and tile_matmad sequence
-// are used. Only the rows grouped into a threadgroup change.
-template <
-    typename T,
-    int group_size,
-    const int bits,
-    int BM,
-    int BN,
-    int BK,
-    int WM,
-    int WN,
-    bool transpose,
-    const int fixed_K = 0,
-    const int fixed_N = 0,
-    typename Wtype = bfloat,
-    int tg_expert_groups = 64>
-[[kernel]] void fp_gather_qmm_rhs_expert_nax(
-    const device T* x,
-    const device uint32_t* w,
-    const device uint8_t* scales,
-    const device uint32_t* indices,
-    device T* y,
-    const constant int& M,
-    const constant int& N,
-    const constant int& K,
-    const constant int& run_skip_pct,
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint lid [[thread_index_in_threadgroup]],
-    uint simd_group_id [[simdgroup_index_in_threadgroup]],
-    uint simd_lane_id [[thread_index_in_simdgroup]]) {
-  (void)run_skip_pct;
-  static_assert(transpose, "expert-aligned Laguna QMM requires NT weights");
-  static_assert(group_size == 16, "expert-aligned Laguna QMM requires gs16");
-  static_assert(bits == 4, "expert-aligned Laguna QMM requires NVFP4");
-
-  constexpr int pack_factor = get_pack_factor<8, bits>();
-  constexpr int bytes_per_pack = get_bytes_per_pack();
-  constexpr int BK_padded = BK + 16 / sizeof(Wtype);
-  constexpr int BN_padded = BN + 16 / sizeof(Wtype);
-  // expert_groups comes from the template (grid y); the host certifies
-  // experts % expert_groups == 0 and sizes the grid to match, so each
-  // threadgroup owns exactly experts / expert_groups expert slots.
-  constexpr int expert_groups = tg_expert_groups;
-  constexpr int experts = 256;
-  const int kernel_K = fixed_K > 0 ? fixed_K : K;
-  const int kernel_N = fixed_N > 0 ? fixed_N : N;
-  static_assert(experts % expert_groups == 0);
-
-  using loader_w_t = QuantizedBlockLoader<
-      Wtype,
-      BN,
-      BK,
-      BK_padded,
-      true,
-      WM * WN * SIMD_SIZE,
-      group_size,
-      bits>;
-
-  constexpr int kWsElems = BN * BK_padded;
-  constexpr int kWsPerChunk = 16 / sizeof(Wtype);
-  threadgroup NAXWsChunk16<Wtype>
-      Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
-  threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
-  threadgroup bfloat* gate_up_stage =
-      (threadgroup bfloat*)Ws_storage;
-  threadgroup int bounds[2];
-
-  const int K_w = kernel_K * bytes_per_pack / pack_factor;
-  const int K_g = kernel_K / group_size;
-  const int K_it = kernel_K / BK;
-  const size_t stride_w = size_t(kernel_N) * K_w;
-  const size_t stride_s = size_t(kernel_N) * K_g;
-  const int y_col = tid.x * BN;
-
-  auto wl = (const device uint8_t*)w + size_t(y_col) * K_w;
-  const device uint8_t* scale_base =
-      scales + size_t(y_col) * K_g;
-
-  constexpr short SM = BM / WM;
-  constexpr short SN = BN / WN;
-  constexpr short SK = 32;
-  constexpr short TM = SM / 16;
-  constexpr short TN = SN / 16;
-  constexpr short TK = SK / 16;
-
-  const short tm = SM * (simd_group_id / WN);
-  const short tn = SN * (simd_group_id % WN);
-
-  for (int expert_slot = 0; expert_slot < experts / expert_groups;
-       ++expert_slot) {
-    // Keep each threadgroup's row intervals and expert weight regions
-    // contiguous across slots while preserving the exact expert bijection.
-    const uint32_t expert =
-        static_cast<uint32_t>(
-            tid.y * (experts / expert_groups) + expert_slot);
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid == 0) {
-      bounds[0] = laguna_sorted_lower_bound(indices, M, expert);
-      bounds[1] = laguna_sorted_lower_bound(indices, M, expert + 1);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const int run_start = bounds[0];
-    const int run_end = bounds[1];
-    for (int chunk_start = run_start; chunk_start < run_end;
-         chunk_start += BM) {
-      const short chunk_rows =
-          short(min(BM, run_end - chunk_start));
-      const short sgp_sm =
-          min(int(SM), max(0, int(chunk_rows) - int(tm)));
-      const bool sg_active = sgp_sm > 0;
-
-      NAXTile<float, TM, TN> Dtile;
-      Dtile.clear();
-
-      const device T* xn =
-          x + size_t(chunk_start + tm) * kernel_K;
-      thread loader_w_t loader_w(
-          wl + size_t(expert) * stride_w,
-          scale_base + size_t(expert) * stride_s,
-          kernel_K,
-          Ws,
-          simd_group_id,
-          simd_lane_id);
-
-      for (int k = 0; k < K_it; ++k) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_w.load_unsafe();
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (sg_active) {
-          // PRAGMA-VARIANT 01: SK-step staging+MMA loop, 2 iterations
-          // (BK=64/SK=32): Atile TMxTK=1x2 device frags + Btile TNxTK=2x2
-          // threadgroup frags per step, serially-dependent Dtile MMA chain.
-          // Full unroll + volatile removal let the second step's 6 fragment
-          // loads hoist ahead of the first step's MMAs. This kernel is built
-          // WITHOUT function constants (static expert shape path), so the
-          // stage_novol lever never reaches it -- the volatile must go here.
-          // Scheduling only: no arithmetic, order, or rounding change.
-          STEEL_PRAGMA_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            NAXTile<T, TM, TK> Atile;
-            NAXTile<Wtype, TN, TK> Btile;
-
-            if (sgp_sm == SM) {
-              Atile.load(xn + kk1, kernel_K);
-            } else {
-              Atile.load_safe(
-                  xn + kk1, kernel_K, short2(SK, sgp_sm));
-            }
-            Btile.template load<Wtype, BK_padded, 1>(
-                Ws + tn * BK_padded + kk1);
-
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile,
-                metal::bool_constant<true>{});
-
-          }
-        }
-
-        xn += BK;
-        loader_w.next();
-      }
-
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      const bool fuse_swiglu =
-          kernel_N == 1024 && kernel_K == 2048;
-      if (fuse_swiglu) {
-        if (sg_active) {
-          Dtile.template store<bfloat, BN, 1>(
-              gate_up_stage + tm * BN + tn);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg_active && (simd_group_id % WN) == 0) {
-          constexpr int activated_cols = BN / 2;
-          for (int linear = simd_lane_id;
-               linear < int(sgp_sm) * activated_cols;
-               linear += SIMD_SIZE) {
-            const int row = linear / activated_cols;
-            const int col = linear % activated_cols;
-            const bfloat gate =
-                gate_up_stage[(tm + row) * BN + col];
-            const bfloat up =
-                gate_up_stage[(tm + row) * BN + activated_cols + col];
-            const bfloat exp_abs = metal::exp(metal::abs(gate));
-            const bfloat denominator = bfloat(1) + exp_abs;
-            const bfloat z = bfloat(1) / denominator;
-            const bfloat sigmoid =
-                gate < bfloat(0) ? z : bfloat(1) - z;
-            const bfloat silu = bfloat(gate * sigmoid);
-            y[size_t(chunk_start + tm + row) * (kernel_N / 2) +
-              size_t(tid.x) * activated_cols + col] =
-                bfloat(silu * up);
-          }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-      } else if (sg_active) {
-        device T* yn =
-            y + size_t(chunk_start + tm) * kernel_N + y_col + tn;
-        if (sgp_sm == SM) {
-          Dtile.store(yn, kernel_N);
-        } else {
-          Dtile.store_slice(
-              yn,
-              kernel_N,
-              short2(0, 0),
-              short2(SN, sgp_sm));
-        }
-      }
-    }
   }
 }

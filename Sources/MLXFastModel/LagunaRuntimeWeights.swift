@@ -347,13 +347,13 @@ public final class LagunaRuntimeWeightCache {
         self.loader = loader
         self.config = config
         // Select the startup memory profile BEFORE the model load. Laguna
-        // retains no alternate weight layouts. The full profile only installs
-        // the post-wire command-buffer budget below; the documented
+        // retains no alternate weight layouts, so the full profile is
+        // deliberately a no-op here (the
+        // ranked 128 GiB box keeps stock allocator behavior); the documented
         // low-memory profile for <64 GiB machines caps the MLX allocator
-        // cache at 6 GiB, shortens command buffers, and clears free
-        // warmup buffers before the worker protocol hello -- pure memory
-        // management: compiled decode and every other ranked code path stay
-        // enabled, matching the ranked box. The layer-count
+        // cache at 6 GiB, shortens command buffers, installs the
+        // feature-disable env defaults (no-overwrite), and clears free
+        // warmup buffers before the worker protocol hello. The layer-count
         // guard keeps tiny unit-test configurations on stock behavior.
         let startupMemoryPolicy: RuntimeStartupMemoryPolicy?
         if config.numHiddenLayers >= 16 {
@@ -367,22 +367,6 @@ public final class LagunaRuntimeWeightCache {
                 policy.apply()
                 startupMemoryPolicy = policy
             } else {
-                // The full 128 GiB ranked profile wires the complete live
-                // model into Metal's residency set after load. Once those
-                // allocations are permanently resident, MLX's stock 50 MiB
-                // referenced-byte commit threshold splits every sparse layer
-                // across several command buffers even though the layer's
-                // weights no longer create residency pressure. A 512 MiB
-                // budget fits one complete decode layer (attention plus the
-                // routed/shared gate-up and down banks are ~507 MiB for the
-                // 200 MB / 200-op command buffers: the post-anupsv-loader regime
-                // re-test winner (6 Latin pairs: decode 5/6, prefill 4/6). Explicit
-                // MLX_ values win; DARKBLOOM kill switch supports same-binary A/B.
-                let env = ProcessInfo.processInfo.environment
-                if env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" {
-                    setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
-                    setenv("MLX_MAX_OPS_PER_BUFFER", "200", 0)
-                }
                 startupMemoryPolicy = nil
             }
         } else {
@@ -414,49 +398,6 @@ public final class LagunaRuntimeWeightCache {
                 Memory.clearCache()
             }
         }
-        // Zero-headroom wired residency (notes/47 §4e follow-up, session
-        // H6): the vendored MLX Device attaches a `MTLResidencySet` to every
-        // command queue, but `ResidencySet::capacity_` defaults to 0, so the
-        // set stays empty and the driver re-establishes residency for the
-        // whole ~21.6 GB RAM-resident text tower on every command buffer
-        // (notes/47 §4d-4e: driver-busy tracks the prefill span, 9-15 ms
-        // kernelStart gaps). notes/47 §6-§7 measured the naive fix -- a
-        // 32 GiB wired limit -- removing that driver work (167.1 -> 9.9 ms)
-        // but regressing under the scored seatbelt, because ~10 GiB of spare
-        // capacity made `ResidencySet::insert`/`erase` issue a Metal
-        // `commit()` for every scored-window allocation and eviction
-        // (resident.cpp:28-50).
-        //
-        // This variant closes that hole with capacity discipline instead of
-        // new API: wire ONCE at construction time (outside every scored
-        // window) with capacity = live-bytes-now + a small page-rounding
-        // slack, so `ResidencySet::resize` migrates the weights in a single
-        // commit (resident.cpp:52-90) and every later transient allocation
-        // FAILS the fit test (`allocatedSize() + buf > capacity_`) and takes
-        // the commit-free `unwired_set_` branch. Live weight buffers never
-        // enter the buffer cache, so the trusted per-phase
-        // `Memory.clearCache()` reset cannot unwire them; cached transients
-        // allocated after this point are never wired, so their eviction
-        // never commits either. Pure driver-side residency: no kernel, op,
-        // dtype, order, or token behavior changes (register- and
-        // shape-neutral by construction).
-        //
-        // Ships DEFAULT-ON at a dosed 42 MiB capacity (the ranked runner
-        // sets no environment variables): `DARKBLOOM_WIRED_ZH=0` is the
-        // kill switch, `DARKBLOOM_WIRED_ZH_FRACTION` /
-        // `DARKBLOOM_WIRED_ZH_SLACK_MB` override the dose for local A/B
-        // (fraction of live bytes + flat slack; the slack also covers the
-        // MTLBuffer allocatedSize page-rounding inflation over
-        // `Memory.activeMemory` at full wire). A >=96 GiB physical-memory
-        // guard keeps sub-128GB machines on stock behavior. Target machine
-        // (local and ranked) is an M5 Max with 128 GB unified memory:
-        // recommendedMaxWorkingSetSize ~= 115 GB, so even a full ~31 GB
-        // wire is far from the OS cap that `metal::set_wired_limit`
-        // fail-closes on (allocator.cpp:305-312). See the dose table on
-        // `wireResidentWeightsIfEnabled`.
-        if libraryModel != nil, config.numHiddenLayers >= 16 {
-            Self.wireResidentWeightsIfEnabled()
-        }
     }
 
     /// One prefill-shaped forward (512 tokens) and one single-token decode
@@ -473,118 +414,7 @@ public final class LagunaRuntimeWeightCache {
         )
         eval(model(prefillTokens, cache: warmupCache))
         let decodeToken = MLXArray([bosToken], [1, 1])
-        let warmDecodeLogits = model(decodeToken, cache: warmupCache)
-        eval(warmDecodeLogits)
-        // Warm the greedy-token pipeline too. Every scored worker request ends
-        // in `LagunaCorrectness.greedyToken` (reshape -> last row -> argMax),
-        // and the forwards above never run an argmax, so its first use
-        // otherwise creates the `argmax_bfloat16` compute pipeline state
-        // INSIDE the measured window: a timestamped PSO-miss log showed the
-        // compile firing ~0.23 s into the scored prefill request and again in
-        // the decode seed, matching a recurring ~17 ms MTLCompilerService
-        // interval inside both timed phases in Metal System Trace. Replicating
-        // the same ops here moves that one-time compile to untimed init.
-        // Input-independent kernel-cache warmup only (TASK.md explicitly
-        // allows caches for kernels); constant BOS input, output discarded.
-        // `DARKBLOOM_WARM_GREEDY_ARGMAX=0` restores the stock warmup.
-        if ProcessInfo.processInfo.environment["DARKBLOOM_WARM_GREEDY_ARGMAX"] != "0",
-            let vocabSize = warmDecodeLogits.shape.last, vocabSize > 0
-        {
-            let rows = warmDecodeLogits.reshaped([-1, vocabSize])
-            eval(rows[-1].argMax())
-        }
-    }
-    /// See the construction-time comment: one `set_wired_limit` call sized
-    /// to the live footprint, applied through the public async ticket path
-    /// (`WiredMemoryTicket.start` -> `mlx_set_wired_limit`), bridged
-    /// synchronously because this runs before the worker protocol hello.
-    /// SHIPPED DOSE (full wire, operator-directed): capacity = 1.0 x live
-    /// bytes + 64 MiB ~= 31.4 GiB -- the entire live footprint (weights +
-    /// fused banks + lm_head coarse copy) wired in one resize commit, the
-    /// full mechanism from notes/47 §4-§7 with the zero-headroom fit-test
-    /// discipline. Measured loaded-local (cool-gated Latin squares, all vs
-    /// unwired control, correctness green every sample):
-    ///   42 MiB -> -4.2% prefill | 350 MiB -> -8.2% | 0.10x -> -11.2%
-    ///   0.20x -> -17.2% | 0.35x -> -20.8% | 1.0x -> -28.3% prefill,
-    ///   -4.2% decode composite (seed-prefill share; steady step null).
-    /// Chunk 1 (42 MiB) ranked +1.24% score (promoted 1.38531), validating
-    /// the ~1:1 loaded-local -> ranked transfer. This configuration ships
-    /// the WHOLE curve in one submission per operator instruction; the
-    /// documented acceptance band (prefill speedup vs calibration in
-    /// [0.952, 1.053]) is expected to reject gains this large in one step
-    /// -- if the ranked run fails with acceptance_band_failed, revert to
-    /// band-sized dose increments (the curve above is the roadmap).
-    ///
-    /// Engagement guards: `DARKBLOOM_WIRED_ZH=0` kills it; machines under
-    /// 96 GiB physical memory keep stock behavior (the ranked box is an
-    /// M5 Max 128 GB; smaller local boxes must not wire a ~31 GB live set
-    /// against a much smaller working-set cap).
-    private static let wiredZHDefaultFraction = 1.0
-    private static let wiredZHDefaultSlackMB = 64
-
-    private static func wireResidentWeightsIfEnabled() {
-        let env = ProcessInfo.processInfo.environment
-        guard env["DARKBLOOM_WIRED_ZH"] != "0" else { return }
-        guard ProcessInfo.processInfo.physicalMemory >= (96 << 30) else { return }
-
-        // Evict cached warmup transients FIRST so only live buffers
-        // (weights + persistent runtime tensors) are tracked when the
-        // resize walk runs, and the computed capacity leaves no headroom
-        // for scored-window scratch to fit into.
-        Memory.clearCache()
-
-        let active = Memory.activeMemory
-        guard active > 0 else { return }
-
-        let fraction =
-            env["DARKBLOOM_WIRED_ZH_FRACTION"].flatMap(Double.init)
-            ?? wiredZHDefaultFraction
-        let slackMB =
-            env["DARKBLOOM_WIRED_ZH_SLACK_MB"].flatMap(Int.init)
-            ?? wiredZHDefaultSlackMB
-        var target = Int(Double(active) * min(max(fraction, 0.0), 1.0))
-        target += max(0, slackMB) << 20
-
-        // metal::set_wired_limit THROWS (uncaught in the Swift backend) on
-        // limits above recommendedMaxWorkingSetSize; clamp with margin.
-        if let maxRec = GPU.maxRecommendedWorkingSetBytes() {
-            target = min(target, maxRec - (256 << 20))
-        }
-        guard target > 0 else { return }
-
-        let ticket = WiredMemoryTicket(
-            size: target,
-            policy: MLXLMCommon.WiredSumPolicy(cap: target),
-            manager: .shared,
-            kind: .active
-        )
-        let appliedBox = LagunaWiredLimitBox()
-        let semaphore = DispatchSemaphore(value: 0)
-        Task.detached(priority: .userInitiated) {
-            let applied = await ticket.start()
-            appliedBox.value = applied
-            semaphore.signal()
-        }
-        // Bounded wait: a manager stall must not hang worker construction.
-        let outcome = semaphore.wait(timeout: .now() + .seconds(30))
-        Self.wiredTicketRetainer = ticket
-        let applied = outcome == .success ? appliedBox.value : -1
-        let maxRec = GPU.maxRecommendedWorkingSetBytes() ?? -1
-        var line = "mlxfast: wired-zh request=\(target) applied=\(applied)"
-        line += " active=\(active)"
-        line += " slack_mb=\(max(0, slackMB))"
-        line += " fraction=\(fraction)"
-        line += " maxrec=\(maxRec)\n"
-        FileHandle.standardError.write(Data(line.utf8))
-    }
-
-    /// Never ended: ending would restore the 0 baseline and unwire the
-    /// weights (resident.cpp resize-shrink evicts every allocation).
-    nonisolated(unsafe) private static var wiredTicketRetainer: WiredMemoryTicket?
-    /// Crossing the applied wired limit back from the async ticket task to
-    /// the synchronous constructor; the semaphore orders the accesses.
-    private final class LagunaWiredLimitBox: @unchecked Sendable {
-        var value: Int = 0
+        eval(model(decodeToken, cache: warmupCache))
     }
 
     /// Construct and weight-load the Laguna runtime model from the

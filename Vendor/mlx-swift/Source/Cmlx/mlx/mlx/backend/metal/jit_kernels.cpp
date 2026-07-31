@@ -1165,11 +1165,7 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
         is_affine ? metal::quantized_nax() : metal::fp_quantized_nax(),
         get_template_definition(
             lib_name,
-            (is_affine ? "affine" : "fp") +
-                std::string(
-                    kernel_name.find("_expert_") != std::string::npos
-                        ? "_gather_qmm_rhs_expert_nax"
-                        : "_gather_qmm_rhs_nax"),
+            (is_affine ? "affine" : "fp") + std::string("_gather_qmm_rhs_nax"),
             get_type_string(x.dtype()),
             group_size,
             bits,
@@ -1268,45 +1264,6 @@ const char* darkbloom_attn_qhoist_define() {
   return enabled ? "\n#define DARKBLOOM_ATTN_QHOIST 1\n" : "";
 }
 
-// DARKBLOOM_ATTN_QBLOCK_MAJOR: present the existing (query-block, query-head)
-// workgroups to the GPU in query-block-major order. The Metal dispatch remains
-// the stock (NQ, H, B) grid; the kernel applies a bijection from its physical
-// x-fast linear index to the original logical coordinates. No threadgroup's
-// arithmetic or output ownership changes.
-//
-// This standalone candidate is default ON. As with QHOIST, bake the choice
-// into the one JIT source compiled by a process rather than introducing a
-// pipeline function constant and a second timed compilation. An explicit
-// DARKBLOOM_ATTN_QBLOCK_MAJOR=0 prepends the only override.
-const char* darkbloom_attn_qblock_major_define() {
-  static const bool enabled = [] {
-    const bool v =
-        env::get_var("DARKBLOOM_ATTN_QBLOCK_MAJOR", "1") != "0";
-    if (env::get_var("DARKBLOOM_ATTN_TRACE", "") == "1") {
-      fprintf(
-          stderr, "mlxfast: attn qblock-major: enabled=%d\n", int(v));
-    }
-    return v;
-  }();
-  return enabled ? "" : "\n#define DARKBLOOM_ATTN_QBLOCK_MAJOR 0\n";
-}
-
-// DARKBLOOM_ATTN_QBLOCK_ZIGZAG: keep the qblock-major head locality above,
-// but alternate high- and low-work causal query blocks. Default ON for this
-// standalone alternative; an explicit 0 recovers ascending qblock-major.
-const char* darkbloom_attn_qblock_zigzag_define() {
-  static const bool enabled = [] {
-    const bool v =
-        env::get_var("DARKBLOOM_ATTN_QBLOCK_ZIGZAG", "1") != "0";
-    if (env::get_var("DARKBLOOM_ATTN_TRACE", "") == "1") {
-      fprintf(
-          stderr, "mlxfast: attn qblock-zigzag: enabled=%d\n", int(v));
-    }
-    return v;
-  }();
-  return enabled ? "" : "\n#define DARKBLOOM_ATTN_QBLOCK_ZIGZAG 0\n";
-}
-
 } // namespace
 
 MTL::ComputePipelineState* get_steel_attention_nax_kernel(
@@ -1328,8 +1285,6 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
         kernel_source,
         metal::utils(),
         darkbloom_attn_qhoist_define(),
-        darkbloom_attn_qblock_major_define(),
-        darkbloom_attn_qblock_zigzag_define(),
         metal::steel_attention_nax(),
         get_template_definition(
             lib_name,

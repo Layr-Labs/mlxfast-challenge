@@ -502,22 +502,11 @@ void qmm_nax(
   std::string kname;
   kname.reserve(64);
   bool aligned = N % 64 == 0;
-  bool aligned_M = M % 64 == 0;
   bool batched = B > 1;
   std::string type_string = get_type_string(x.dtype());
-  static const bool static_laguna_shapes =
-      env::get_var("DARKBLOOM_STATIC_NVFP4_SHAPES", "") != "0";
-  const bool use_static_laguna_shape =
-      static_laguna_shapes && transpose && aligned && !batched &&
-      mode == "nvfp4" && type_string == "bfloat16_t" &&
-      group_size == 16 && bits == 4 && !biases.has_value() &&
-      ((K == 2048 && N == 1024) || (K == 512 && N == 2048));
   concatenate(
       kname,
-      mode +
-          (use_static_laguna_shape
-               ? "_qmm_t_nax_static_"
-               : (transpose ? "_qmm_t_nax_" : "_qmm_n_nax_")),
+      mode + (transpose ? "_qmm_t_nax_" : "_qmm_n_nax_"),
       type_string,
       "_gs_",
       group_size,
@@ -533,32 +522,11 @@ void qmm_nax(
       wm,
       "_wn",
       wn,
-      use_static_laguna_shape
-          ? ("_k" + std::to_string(K) + "_n" + std::to_string(N) +
-             "_alM_" + (aligned_M ? "true" : "false"))
-          : "",
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
       batched ? "_batch_1" : "_batch_0");
   std::string template_def;
   MTL::ComputePipelineState* kernel;
-  if (use_static_laguna_shape) {
-    kernel = get_qmm_nax_kernel_wrapped(
-        d,
-        kname,
-        "qmm_t_nax_static",
-        mode,
-        type_string,
-        group_size,
-        bits,
-        K,
-        N,
-        aligned_M,
-        bm,
-        bk,
-        bn,
-        wm,
-        wn);
-  } else if (transpose) {
+  if (transpose) {
     kernel = get_qmm_nax_kernel_wrapped(
         d,
         kname,
@@ -1281,38 +1249,6 @@ bool darkbloom_stage_novol() {
   return v;
 }
 
-bool darkbloom_expert_aligned_gather() {
-  static const bool v =
-      env::get_var("DARKBLOOM_EXPERT_ALIGNED_GATHER", "") != "0";
-  return v;
-}
-
-// DARKBLOOM_EXPERT_GATHER_GROUPS (default 128; "64" restores the promoted
-// four-experts-per-threadgroup schedule and "256" selects one expert per
-// threadgroup, both kept as A/B controls): how many threadgroups the
-// expert-aligned gather QMM spreads the 256 experts over. More threadgroups
-// means the hardware scheduler overlaps per-expert staging drains and MMA
-// phases instead of serializing expert slots inside one threadgroup. Only
-// the threadgroup-to-expert assignment changes: every output element is
-// computed by the same tile walk with the same accumulation order, and the
-// value is baked into the kernel name and template, so each setting compiles
-// exactly one pipeline for the process lifetime. Measured on M5 Max against
-// the promoted 64 schedule, 128 captures roughly two-thirds of the 256
-// schedule's prefill gain while keeping the measured speedup comfortably
-// mid-band; 256 measures closer to the acceptance ceiling in the single-shot
-// harness regime and is staged as its own follow-up chunk.
-int darkbloom_expert_gather_groups() {
-  static const int v = [] {
-    auto s = env::get_var("DARKBLOOM_EXPERT_GATHER_GROUPS", "");
-    if (s.empty()) {
-      return 256;
-    }
-    int n = std::atoi(s.c_str());
-    return (n > 0 && (256 % n) == 0) ? n : 256;
-  }();
-  return v;
-}
-
 // DARKBLOOM_STAGE_BM128: select the gather-GEMM m-tiling. NOT a function
 // constant -- it changes the template instantiation, so it is already in
 // `kname` (`_bm_`/`_wm_`/`_wn_`) and therefore in the library name and the
@@ -1524,36 +1460,15 @@ void gather_qmm_rhs_nax(
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
-  const bool laguna_moe_shape =
-      (K == 2048 && N == 1024) || (K == 512 && N == 2048);
-  const bool expert_aligned =
-      darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
-      group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
-      align_N && align_K && bm == 64 && wm == 4 && wn == 2;
-  std::string type_string = get_type_string(x.dtype());
-  static const bool static_laguna_shapes =
-      env::get_var("DARKBLOOM_STATIC_NVFP4_SHAPES", "") != "0";
-  const bool static_expert_shape =
-      expert_aligned && static_laguna_shapes && mode == "nvfp4" &&
-      type_string == "bfloat16_t" && !biases_.has_value();
-  // How many threadgroups the expert path spreads the 256 experts over; the
-  // value is baked into the kernel name and template (see
-  // darkbloom_expert_gather_groups), so each setting compiles exactly one
-  // pipeline for the process lifetime.
-  const int egroups = darkbloom_expert_gather_groups();
 
   // Make the kernel name
   std::string kname;
   kname.reserve(64);
+  std::string type_string = get_type_string(x.dtype());
   concatenate(
       kname,
       mode +
-          (static_expert_shape
-               ? "_gather_qmm_rhs_expert_static_nax_nt_"
-               : (expert_aligned
-                      ? "_gather_qmm_rhs_expert_nax_nt_"
-               : (transpose ? "_gather_qmm_rhs_nax_nt_"
-                            : "_gather_qmm_rhs_nax_nn_"))),
+          (transpose ? "_gather_qmm_rhs_nax_nt_" : "_gather_qmm_rhs_nax_nn_"),
       type_string,
       "_gs_",
       group_size,
@@ -1568,11 +1483,7 @@ void gather_qmm_rhs_nax(
       "_wm_",
       wm,
       "_wn_",
-      wn,
-      static_expert_shape
-          ? ("_k_" + std::to_string(K) + "_n_" + std::to_string(N))
-          : "",
-      expert_aligned ? ("_eg_" + std::to_string(egroups)) : "");
+      wn);
 
   // Skipping dead runs is a pure work elision (see function constant 203 in
   // fp_quantized_nax): it drops only matmuls whose results store_slice never
@@ -1608,7 +1519,7 @@ void gather_qmm_rhs_nax(
       fprintf(
           stderr,
           "mlxfast: stage active: widest=%d wideld=%d(req=%d wide_ok=%d) "
-          "runbar=%d novol=%d expert=%d bm128=%d bm=%d wm=%d wn=%d "
+          "runbar=%d novol=%d bm128=%d bm=%d wm=%d wn=%d "
           "w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d\n",
           int(stage_widest),
           int(stage_wideld),
@@ -1616,7 +1527,6 @@ void gather_qmm_rhs_nax(
           int(wide_ok),
           int(stage_runbar),
           int(stage_novol),
-          int(expert_aligned),
           bm128,
           bm,
           wm,
@@ -1630,19 +1540,16 @@ void gather_qmm_rhs_nax(
     });
   }
 
-  metal::MTLFCList func_consts;
-  if (!expert_aligned) {
-    func_consts = {
-        {&align_M, MTL::DataType::DataTypeBool, 200},
-        {&align_N, MTL::DataType::DataTypeBool, 201},
-        {&align_K, MTL::DataType::DataTypeBool, 202},
-        {&run_skip, MTL::DataType::DataTypeBool, 203},
-        {&stage_widest, MTL::DataType::DataTypeBool, 204},
-        {&stage_wideld, MTL::DataType::DataTypeBool, 205},
-        {&stage_runbar, MTL::DataType::DataTypeBool, 206},
-        {&stage_novol, MTL::DataType::DataTypeBool, 207},
-    };
-  }
+  metal::MTLFCList func_consts = {
+      {&align_M, MTL::DataType::DataTypeBool, 200},
+      {&align_N, MTL::DataType::DataTypeBool, 201},
+      {&align_K, MTL::DataType::DataTypeBool, 202},
+      {&run_skip, MTL::DataType::DataTypeBool, 203},
+      {&stage_widest, MTL::DataType::DataTypeBool, 204},
+      {&stage_wideld, MTL::DataType::DataTypeBool, 205},
+      {&stage_runbar, MTL::DataType::DataTypeBool, 206},
+      {&stage_novol, MTL::DataType::DataTypeBool, 207},
+  };
 
   // And the kernel hash that includes the function constants
   std::string hash_name;
@@ -1664,54 +1571,27 @@ void gather_qmm_rhs_nax(
       stage_runbar ? 'B' : 'n',
       stage_novol ? 'V' : 'n');
 
-  // Get and set the kernel. Every expert-aligned instantiation (static and
-  // runtime-shaped alike) is built from a template definition here, because
-  // the expert kernel's expert-group count is a template parameter; the
-  // shared gather builder keeps its stock signature for the non-expert path.
+  // Get and set the kernel
   auto& compute_encoder = metal::get_command_encoder(s);
-  MTL::ComputePipelineState* kernel;
-  if (expert_aligned) {
-    auto template_def = get_template_definition(
-        kname,
-        "fp_gather_qmm_rhs_expert_nax",
-        get_type_string(x.dtype()),
-        group_size,
-        bits,
-        bm,
-        bn,
-        bk,
-        wm,
-        wn,
-        transpose,
-        static_expert_shape ? K : 0,
-        static_expert_shape ? N : 0,
-        "bfloat",
-        egroups);
-    kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
-  } else {
-    kernel = get_gather_qmm_nax_kernel(
-        d,
-        kname,
-        hash_name,
-        func_consts,
-        x,
-        group_size,
-        bits,
-        mode,
-        bm,
-        bn,
-        bk,
-        wm,
-        wn,
-        transpose);
-  }
+  auto kernel = get_gather_qmm_nax_kernel(
+      d,
+      kname,
+      hash_name,
+      func_consts,
+      x,
+      group_size,
+      bits,
+      mode,
+      bm,
+      bn,
+      bk,
+      wm,
+      wn,
+      transpose);
   compute_encoder.set_compute_pipeline_state(kernel);
 
   MTL::Size group_dims(32, wn, wm);
-  MTL::Size grid_dims(
-      (N + bn - 1) / bn,
-      expert_aligned ? egroups : (M + bm - 1) / bm,
-      1);
+  MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, 1);
 
   int c = 0;
   compute_encoder.set_input_array(x, c++);

@@ -23,24 +23,6 @@ const char* steel_attention_nax() {
 #define DARKBLOOM_ATTN_QHOIST 0
 #endif
 
-// DARKBLOOM_ATTN_QBLOCK_MAJOR default. DEFAULT ON for the standalone ranked
-// candidate: remap the stock physical grid into query-block-major logical
-// order. The mapping is a pure permutation of threadgroups; it does not alter
-// any threadgroup's arithmetic or output. The JIT host may prepend an explicit
-// `#define DARKBLOOM_ATTN_QBLOCK_MAJOR 0` as an emergency opt-out.
-#ifndef DARKBLOOM_ATTN_QBLOCK_MAJOR
-#define DARKBLOOM_ATTN_QBLOCK_MAJOR 1
-#endif
-
-// DARKBLOOM_ATTN_QBLOCK_ZIGZAG default. DEFAULT ON for the balanced
-// qblock-major candidate: retain head-minor locality inside each query block,
-// but present query blocks in high/low order rather than monotonically
-// increasing causal work. The JIT host may prepend an explicit
-// `#define DARKBLOOM_ATTN_QBLOCK_ZIGZAG 0` to recover ascending qblock-major.
-#ifndef DARKBLOOM_ATTN_QBLOCK_ZIGZAG
-#define DARKBLOOM_ATTN_QBLOCK_ZIGZAG 1
-#endif
-
 ///////////////////////////////////////////////////////////////////////////////
 // Contents from "mlx/backend/metal/kernels/steel/defines.h"
 ///////////////////////////////////////////////////////////////////////////////
@@ -1415,41 +1397,14 @@ template <
   (void)lid;
   (void)simd_lane_id;
 
-  // Move to the logical query block and head. The host dispatches the stock
-  // (NQ, H, B) grid. In the optional qblock-major arm, reinterpret its x-fast
-  // physical linear index as (query block major, query head minor). Since
-  // physical_linear ranges over exactly [0, NQ * H), quotient/remainder by H
-  // is a bijection onto the same logical coordinate set. Each threadgroup
-  // therefore retains its exact Q/K/V inputs, floating-point operation order,
-  // and disjoint output rows; only GPU presentation order changes.
-#if DARKBLOOM_ATTN_QBLOCK_MAJOR
-  const ulong physical_linear =
-      ulong(tid.y) * ulong(params->NQ) + ulong(tid.x);
-  const ulong physical_qblock = physical_linear / ulong(params->H);
-  const ulong logical_head =
-      physical_linear - physical_qblock * ulong(params->H);
-#if DARKBLOOM_ATTN_QBLOCK_ZIGZAG
-  // Present causal work high, low, second-high, second-low, ... while keeping
-  // every query block's heads contiguous. Even ranks map injectively onto the
-  // upper half in descending order; odd ranks map onto the lower half in
-  // ascending order, so their disjoint union is exactly [0, NQ).
-  const ulong logical_qblock =
-      (physical_qblock & 1ul) == 0
-      ? ulong(params->NQ) - 1 - physical_qblock / 2
-      : physical_qblock / 2;
-#else
-  const ulong logical_qblock = physical_qblock;
-#endif
-  ulong3 tidl{logical_qblock, logical_head, tid.z};
-#else
+  // Move to correct block
   ulong3 tidl{tid.x, tid.y, tid.z};
-#endif
 
   Q += tidl.z * params->Q_strides[0] + // Batch
       tidl.y * params->Q_strides[1] + // Head
       tidl.x * BQ * params->Q_strides[2]; // Sequence
 
-  ulong kv_head_idx = int(tidl.y) / params->gqa_factor;
+  ulong kv_head_idx = int(tid.y) / params->gqa_factor;
   K += tidl.z * params->K_strides[0] + // Batch
       kv_head_idx * params->K_strides[1]; // Head
 
@@ -1521,43 +1476,38 @@ template <
   int kb_min_causal = params->NK;
 
   if (do_causal) {
-    int q_max = (int(tidl.x) + 1) * BQ + params->qL_off;
+    int q_max = (tid.x + 1) * BQ + params->qL_off;
     kb_lim = (q_max + BK - 1) / BK;
     kb_lim = min(params->NK, kb_lim);
 
-    int q_min = int(tidl.x) * BQ + params->qL_off;
+    int q_min = tid.x * BQ + params->qL_off;
     q_min = max(0, q_min);
     kb_min_causal = (q_min / BK);
   }
 
   // Per-simdgroup causal K-block elision (level 1, always on). kb_lim above
   // derives from the THREADGROUP's last row; this simdgroup owns only rows
-  // [tidl.x * BQ + tm, tidl.x * BQ + tm + kU * TQ). K blocks at or beyond
+  // [tid.x * BQ + tm, tid.x * BQ + tm + kU * TQ). K blocks at or beyond
   // sg_kb_lim lie entirely above its causal diagonal: the causal mask would
   // set every element of its Stile rows to neg_inf, making the P tile
   // exactly the all-+0.0 tile Stile.clear() already produces, new_max equal
   // to max_score (factor == exp2(+0.0) == 1.0), and the sum_score update a
   // +0.0 add into a value that is always >= +0.0. Skipping QK^T, the scale,
-  // both masks and the softmax for those blocks is therefore bit-exact.
-  // Level 2 also skips the P@V loads and MMAs: every Stile multiplicand is
-  // +0.0, so those instructions can only add a signed zero to Otile. That
-  // leaves every finite nonzero accumulator bit-identical; an exactly-zero
-  // accumulator can differ only in its zero sign, which is numerically equal
-  // through the final positive normalization and all downstream arithmetic.
-  // The kb trip count and every barrier stay untouched (the P@V loop contains
-  // a threadgroup_barrier at BD == 128, so a per-simdgroup trip count would be
-  // undefined behaviour); sg_active is simdgroup-uniform (tidl.x and tm only).
-  // Restricted to
+  // both masks and the softmax for those blocks while STILL running P@V on
+  // the cleared Stile is therefore bit-exact, down to the +/-0.0 pattern the
+  // +0.0-product accumulation leaves in Otile. The kb trip count and every
+  // barrier stay untouched (the P@V loop contains a threadgroup_barrier at
+  // BD == 128, so a per-simdgroup trip count would be undefined behaviour);
+  // sg_active is simdgroup-uniform (tid.x and tm only). Restricted to
   // do_causal && !has_mask so the all-masked proof rests on the causal mask
   // alone; the timed window passes no array mask.
   int sg_kb_lim = kb_lim;
   if (do_causal && !has_mask) {
-    int sg_q_max =
-        int(tidl.x) * BQ + params->qL_off + int(tm) + kU * TQ;
+    int sg_q_max = int(tid.x) * BQ + params->qL_off + int(tm) + kU * TQ;
     sg_kb_lim = min(kb_lim, (sg_q_max + BK - 1) / BK);
   }
 
-  const bool is_last_bq = int(tidl.x) == (params->NQ_aligned);
+  const bool is_last_bq = int(tid.x) == (params->NQ_aligned);
   // const bool is_last_tq = int(simd_group_id) >= (params->qL_rem / UQ);
   const bool is_last_q = is_last_bq;
 
@@ -1621,9 +1571,8 @@ template <
 
     Stile.clear();
 
-    // Causal elision: guard the score computation and the zero P@V work, but
-    // never a barrier or the outer-loop pointer advance. See the sg_kb_lim
-    // comment above for the exactness argument.
+    // Level-1 elision: guard the score computation, not the P@V or any
+    // barrier. See the sg_kb_lim comment above for the exactness argument.
     const bool sg_active = kb < sg_kb_lim;
     if (sg_active) {
 
@@ -1631,10 +1580,7 @@ template <
     for (short iq = 0; iq < TQ; iq++) {
       STEEL_PRAGMA_UNROLL
       for (short ik = 0; ik < TK; ik += 2) {
-        // Upstream ml-explore/mlx 3541c66b (PR #3843): unroll-by-4 lets the
-        // compiler interleave K-tile loads with the running mma chain;
-        // bitwise-identical outputs, +12% at head_dim 128 on M5 Max.
-#pragma clang loop unroll_count(4)
+        STEEL_PRAGMA_UNROLL
         for (short id = 0; id < TD; id++) {
           NAXTile<T, 1, 1> Qtile;
           NAXTile<T, 2, 1> Ktile;
@@ -1724,7 +1670,7 @@ template <
     if (do_causal && kb >= kb_min_causal) {
       constexpr auto neg_inf = Limits<AccumType>::finite_min;
 
-      const int base_row = int(tidl.x) * BQ + params->qL_off + tm;
+      const int base_row = tid.x * BQ + params->qL_off + tm;
       const int base_col = kb * BK;
 
       STEEL_PRAGMA_UNROLL
@@ -1752,7 +1698,7 @@ template <
     if (has_mask) {
       constexpr auto neg_inf = Limits<AccumType>::finite_min;
 
-      const int base_row = int(tidl.x) * BQ + tm;
+      const int base_row = tid.x * BQ + tm;
       const int base_col = kb * BK;
 
       constexpr bool is_bool = is_same_v<MaskType, bool>;
@@ -1872,7 +1818,6 @@ template <
 
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < TK; ik++) {
-          if (sg_active) {
           NAXTile<T, 1, 2> Vtile;
 
           const int V_load_off = ik * kU * int(params->V_strides[2]) + id * kU;
@@ -1894,7 +1839,6 @@ template <
               Vtile.frag_at(0, 0),
               Vtile.frag_at(0, 1),
               metal::false_type{});
-          }
         }
       }
     }
