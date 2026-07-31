@@ -1281,6 +1281,29 @@ bool darkbloom_stage_novol() {
   return v;
 }
 
+// DARKBLOOM_EXPERT_STAGE_WIDE (DEFAULT ON; set "0" to restore the shipped
+// scalar staging exactly): the WIDEST/WIDELD staging widths, ported to the
+// expert-aligned gather kernels -- the kernels the Laguna prefill MoE
+// actually dispatches. The original STAGE_WIDEST / STAGE_WIDELD levers bind
+// fc 204/205 only on the generic !expert_aligned path (see the func_consts
+// construction in gather_qmm_rhs_nax), so on the shipped Laguna shapes they
+// never reach the running kernel: the expert kernels called plain
+// load_unsafe() unconditionally and their pipelines were created with an
+// empty function-constant list. This flag binds the same two constants on
+// the expert pipelines instead: the store widening unconditionally (Ws is
+// 16B aligned by construction in the kernel), the device-load widening
+// additionally gated on the same darkbloom_stage_wide_load_ok host
+// certification. The arm is folded into the kernel name, so each setting
+// owns a distinct library and pipeline for the process lifetime, and an OFF
+// ("0") process keeps today's kernel name, empty constant list, and (by
+// function-constant folding of the kernel-side aliases) a bit-identical
+// pipeline.
+bool darkbloom_expert_stage_wide() {
+  static const bool v =
+      env::get_var("DARKBLOOM_EXPERT_STAGE_WIDE", "") != "0";
+  return v;
+}
+
 bool darkbloom_expert_aligned_gather() {
   static const bool v =
       env::get_var("DARKBLOOM_EXPERT_ALIGNED_GATHER", "") != "0";
@@ -1596,6 +1619,21 @@ void gather_qmm_rhs_nax(
   const bool stage_runbar = darkbloom_stage_runbar();
   const bool stage_novol = darkbloom_stage_novol();
 
+  // DARKBLOOM_EXPERT_STAGE_WIDE: the expert-kernel port of WIDEST/WIDELD.
+  // Kept OUT of `func_consts` below (that list is generic-path-only) and
+  // bound through a separate list at the expert call site. The arm is folded
+  // into `kname` so each setting owns a distinct library and pipeline for the
+  // process lifetime; an OFF process keeps today's kernel name exactly. The
+  // store widening needs no host certification (Ws is 16B aligned by
+  // construction in the kernel); the device-load widening reuses the same
+  // `wide_ok` certification as the generic lever.
+  const bool expert_wide_req = darkbloom_expert_stage_wide();
+  const bool expert_stage_widest = expert_aligned && expert_wide_req;
+  const bool expert_stage_wideld = expert_stage_widest && wide_ok;
+  if (expert_stage_widest) {
+    kname += expert_stage_wideld ? "_xw_WL" : "_xw_Wn";
+  }
+
   // Ground truth for the A/B harness. `stage_wideld` is silently downgraded
   // to false when the host alignment certification declines, and `wide_ok`
   // depends on `w.offset()`, which is a runtime property no static reading of
@@ -1609,7 +1647,8 @@ void gather_qmm_rhs_nax(
           stderr,
           "mlxfast: stage active: widest=%d wideld=%d(req=%d wide_ok=%d) "
           "runbar=%d novol=%d expert=%d bm128=%d bm=%d wm=%d wn=%d "
-          "w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d\n",
+          "w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d "
+          "xw_widest=%d xw_wideld=%d(req=%d)\n",
           int(stage_widest),
           int(stage_wideld),
           int(darkbloom_stage_wideld()),
@@ -1626,7 +1665,10 @@ void gather_qmm_rhs_nax(
           bits,
           N,
           K,
-          bn);
+          bn,
+          int(expert_stage_widest),
+          int(expert_stage_wideld),
+          int(expert_wide_req));
     });
   }
 
@@ -1687,7 +1729,19 @@ void gather_qmm_rhs_nax(
         static_expert_shape ? N : 0,
         "bfloat",
         egroups);
-    kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
+    // DARKBLOOM_EXPERT_STAGE_WIDE: bind fc 204/205 on the expert pipeline.
+    // With the flag off the list is empty and get_qmm_nax_kernel takes its
+    // historical two-argument d.get_kernel path -- byte-identical to today.
+    // `kname` already carries the arm suffix, so it doubles as the hash.
+    metal::MTLFCList expert_func_consts;
+    if (expert_stage_widest) {
+      expert_func_consts = {
+          {&expert_stage_widest, MTL::DataType::DataTypeBool, 204},
+          {&expert_stage_wideld, MTL::DataType::DataTypeBool, 205},
+      };
+    }
+    kernel = get_qmm_nax_kernel(
+        d, kname, template_def, mode, kname, expert_func_consts);
   } else {
     kernel = get_gather_qmm_nax_kernel(
         d,

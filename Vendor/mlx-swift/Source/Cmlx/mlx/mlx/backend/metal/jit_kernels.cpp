@@ -1120,7 +1120,9 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
     metal::Device& d,
     const std::string& kernel_name,
     const std::string& template_def,
-    const std::string& mode) {
+    const std::string& mode,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts) {
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
     std::string kernel_source;
@@ -1133,7 +1135,19 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
         template_def);
     return kernel_source;
   });
-  return d.get_kernel(kernel_name, lib);
+  // DARKBLOOM_EXPERT_STAGE_WIDE: an empty constant list takes the historical
+  // two-argument path, so every pre-existing caller (and the expert path with
+  // the flag off) creates today's pipeline byte for byte. Only the
+  // expert-stage-wide arm passes constants, under a kernel name that already
+  // encodes them.
+  if (func_consts.empty()) {
+    return d.get_kernel(kernel_name, lib);
+  }
+  return d.get_kernel(
+      kernel_name,
+      lib,
+      hash_name.empty() ? kernel_name : hash_name,
+      func_consts);
 }
 
 MTL::ComputePipelineState* get_gather_qmm_nax_kernel(

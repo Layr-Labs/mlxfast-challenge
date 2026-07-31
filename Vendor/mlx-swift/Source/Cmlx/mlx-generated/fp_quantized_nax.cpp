@@ -172,6 +172,23 @@ constant bool stage_wideld [[function_constant(205)]];
 constant bool stage_runbar [[function_constant(206)]];
 constant bool stage_novol [[function_constant(207)]];
 
+// DARKBLOOM_EXPERT_STAGE_WIDE (host: darkbloom_expert_stage_wide): unbound-safe
+// aliases of fc 204/205 for the expert-aligned kernels. Expert pipelines have
+// always been created with an EMPTY function-constant list, so they must stay
+// valid -- and byte-identical -- when fc 204/205 are unbound. The ternary on
+// is_function_constant_defined is the MSL-documented pattern for exactly this:
+// with the constant undefined the false arm is chosen at pipeline creation and
+// the wide branches at the expert load site fold away, leaving the plain
+// load_unsafe() path; when the host binds them (under
+// DARKBLOOM_EXPERT_STAGE_WIDE, DEFAULT ON, "0" to disable -- always on a
+// distinct kernel name) the wide selection compiles in. The generic
+// fp_gather_qmm_rhs_nax keeps reading fc 204/205 directly -- its host path
+// always binds them.
+constant bool expert_stage_widest =
+    is_function_constant_defined(stage_widest) ? stage_widest : false;
+constant bool expert_stage_wideld =
+    is_function_constant_defined(stage_wideld) ? stage_wideld : false;
+
 using namespace metal;
 
 #define MLX_MTL_CONST static constant constexpr const
@@ -309,20 +326,18 @@ static inline uint32_t fp4nv_pack4(const thread uint8_t* p) {
 // when walking those four bytes.
 template <typename T>
 static inline void fp4nv_decode8(uint32_t c, float scale, thread T* out) {
-  // Split-nibble decode: identical half bit patterns to stock with fewer
-  // integer ops and fewer live constant registers. See fp_quantized.cpp
-  // qdot() for the bit-exactness argument.
-  const uint32_t xe = c & 0x0F0F0F0Fu;
-  const uint32_t ge = xe | (xe << 3);
-  const uint32_t yo = c & 0xF0F0F0F0u;
-  const uint32_t go = yo | (yo >> 3);
-  const float2 v0 =
-      float2(as_type<half2>((ge << 9) & 0x8E008E00u)) * scale;
-  const float2 v1 =
-      float2(as_type<half2>((go << 8) & 0x8E008E00u)) * scale;
-  const float2 v2 =
-      float2(as_type<half2>((ge << 1) & 0x8E008E00u)) * scale;
-  const float2 v3 = float2(as_type<half2>(go & 0x8E008E00u)) * scale;
+  const float2 v0 = float2(as_type<half2>(
+                        ((c & 0x00070007u) << 9) | ((c & 0x00080008u) << 12))) *
+      scale;
+  const float2 v1 = float2(as_type<half2>(
+                        ((c & 0x00700070u) << 5) | ((c & 0x00800080u) << 8))) *
+      scale;
+  const float2 v2 = float2(as_type<half2>(
+                        ((c & 0x07000700u) << 1) | ((c & 0x08000800u) << 4))) *
+      scale;
+  const float2 v3 =
+      float2(as_type<half2>(((c & 0x70007000u) >> 3) | (c & 0x80008000u))) *
+      scale;
   out[0] = T(v0.x);
   out[1] = T(v1.x);
   out[2] = T(v2.x);
@@ -1792,7 +1807,25 @@ template <
 
       for (int k = 0; k < K_it; ++k) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_w.load_unsafe();
+        // DARKBLOOM_EXPERT_STAGE_WIDE: the same fc-204/205 selection the
+        // generic kernel makes, through the unbound-safe aliases above.
+        // Exactness is load_unsafe_wide's own contract: same bytes, same
+        // addresses, same nibble decode, same scale mapping -- only the
+        // access width changes -- and each thread self-degrades to the
+        // scalar path when its own offsets decline. With the constants
+        // unbound (the shipped default) every branch folds to the plain
+        // load_unsafe() below and the pipeline is bit-identical to today's.
+        if (expert_stage_widest) {
+          if (expert_stage_wideld) {
+            loader_w.template load_unsafe_wide<true, true>();
+          } else {
+            loader_w.template load_unsafe_wide<true, false>();
+          }
+        } else if (expert_stage_wideld) {
+          loader_w.template load_unsafe_wide<false, true>();
+        } else {
+          loader_w.load_unsafe();
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg_active) {
