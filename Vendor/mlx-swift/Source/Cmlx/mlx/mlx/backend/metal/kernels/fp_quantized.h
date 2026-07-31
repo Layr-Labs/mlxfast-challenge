@@ -287,14 +287,8 @@ static inline void fp4nv_decode8(uint32_t c, float scale, thread T* out) {
   const float2 v2 =
       float2(as_type<half2>((ge << 1) & 0x8E008E00u)) * scale;
   const float2 v3 = float2(as_type<half2>(go & 0x8E008E00u)) * scale;
-  out[0] = T(v0.x);
-  out[1] = T(v1.x);
-  out[2] = T(v2.x);
-  out[3] = T(v3.x);
-  out[4] = T(v0.y);
-  out[5] = T(v1.y);
-  out[6] = T(v2.y);
-  out[7] = T(v3.y);
+  *((thread vec<T, 4>*)out) = vec<T, 4>(T(v0.x), T(v1.x), T(v2.x), T(v3.x));
+  *((thread vec<T, 4>*)(out + 4)) = vec<T, 4>(T(v0.y), T(v1.y), T(v2.y), T(v3.y));
 }
 
 template <
@@ -371,9 +365,8 @@ struct QuantizedBlockLoader {
       for (int i = 0; i < n_reads / 4; i++) {
         T vals[8];
         fp4nv_decode8<T>(fp4nv_pack4(src + i * 4), scale, vals);
-        for (int j = 0; j < 8; j++) {
-          dst[i * 8 + j] = vals[j];
-        }
+        *((threadgroup vec<T, 4>*)(dst + i * 8)) = *((thread vec<T, 4>*)vals);
+        *((threadgroup vec<T, 4>*)(dst + i * 8 + 4)) = *((thread vec<T, 4>*)(vals + 4));
       }
     } else {
       T scale = dequantize_scale<T, group_size>(*scales);
