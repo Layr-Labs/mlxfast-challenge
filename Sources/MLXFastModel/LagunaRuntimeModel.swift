@@ -87,6 +87,128 @@ func lagunaTrace(_ site: String) {
     lagunaTracedFusions.note(site)
 }
 
+// MARK: - In-window decode-scratch pre-warm
+
+/// `DARKBLOOM_DECODE_SCRATCH_PREWARM` (default ON; set "0" to disable): once
+/// per process, at the end of the first multi-token forward AFTER weight-cache
+/// construction, allocate-and-release a fixed ladder of decode-transient-sized
+/// scratch buffers so they sit in the MLX buffer cache when the first
+/// single-token decode step allocates.
+///
+/// Why: the trusted worker clears the allocator cache at every phase start,
+/// then the charged 512-token seed forward refills it with prefill-sized
+/// transients only. The vendored buffer cache reuses a cached buffer only when
+/// `size <= cached < min(2*size, size + 2*page)`, so decode step 1 reuses
+/// nothing and pays fresh `newBuffer` + first-touch for essentially every
+/// transient in the step. This pre-warm runs INSIDE the charged window (the
+/// seed forward), allocates ~8 MB of standalone zero arrays that no model op
+/// ever reads, asyncEvals them after the layer ladder has submitted, and drops
+/// every reference -- the freed buffers are the most-recently-used cache
+/// entries when step 1 allocates. Zero model operations, dtypes, orders, or
+/// shapes change; every byte is allocated after the trusted phase-start reset
+/// and charged like all other work, and the buffers complete and recycle
+/// strictly inside the same request, so the trusted `cacheMemory == 0`
+/// postcondition at the next phase boundary is untouched.
+///
+/// The one-shot latch is armed as the LAST step of weight-cache init (after
+/// warmup and wiring), so the untimed init-time warmup forwards can never
+/// consume it; one boolean is all that crosses the trusted reset. The firing
+/// guard (armed + `dim(1) > 1` + flag) is phase- and machine-independent: the
+/// behavior is identical in every worker (correctness, prefill, decode) --
+/// first multi-token forward per process -- so it cannot function as a phase
+/// oracle.
+let lagunaDecodeScratchPrewarmEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_SCRATCH_PREWARM"] != "0"
+
+/// `DARKBLOOM_DECODE_SCRATCH_PREWARM_MB`: optional total-budget scaler for
+/// A/B forensics. Unset keeps the default ladder table; a positive integer
+/// scales every rung count so the requested total is approximately `MB << 20`
+/// bytes; `0` (or negative) empties the ladder without disturbing the
+/// main flag's arming semantics.
+let lagunaDecodeScratchPrewarmBudgetMB =
+    ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_SCRATCH_PREWARM_MB"]
+    .flatMap(Int.init)
+
+/// The pre-warm size ladder, derived from the vendored allocator's reuse
+/// window (buffer_cache.h `reuse_from_cache`: accept cached in
+/// `[R, min(2R, R + 2*page))`; allocator.cpp page-rounds requests above one
+/// 16 KiB page to 16 KiB multiples):
+///
+/// - Sub-page classes keep exact byte sizes and accept cached entries in
+///   `[R, 2R)`, so a geometric ladder with ratio < 2 covers every request
+///   size: {1 K, 2 K, 3.5 K, 6 K, 10 K, 16 K}. The dominant per-layer 4 KiB
+///   class ([1,1,2048] BF16 residual/norm/down rows) lands in the 6 K rung's
+///   window.
+/// - Requests above 16 KiB are page-rounded, then accept exactly rung `R` or
+///   `R + 16 KiB`, so every 16 KiB multiple from 16 K to 256 K blankets the
+///   per-layer QKV fused outputs (~20.7 K -> 32 K), attention outputs (16 K),
+///   INT8-path and pruner intermediates, and the [1,1,100352] BF16 logits
+///   row (200704 B -> 208 K).
+///
+/// Counts are deliberately generous -- a miss costs nothing, and an unused
+/// cached buffer costs bytes only (~8 MB requested total). KV growth chunks
+/// are excluded on purpose (that class was priced dead by the ranked
+/// KV-preallocation experiment).
+func lagunaDecodeScratchPrewarmLadder() -> [(bytes: Int, count: Int)] {
+    let base: [(bytes: Int, count: Int)] = [
+        // Sub-page geometric rungs (exact byte sizes, [R, 2R) windows).
+        (1 << 10, 24),
+        (2 << 10, 24),
+        (3_584, 48),
+        (6 << 10, 24),
+        (10 << 10, 16),
+        // 16 KiB serves both the top sub-page window and the first page
+        // multiple; the spec table lists it in both groups (16 + 16).
+        (16 << 10, 32),
+        // Page-multiple rungs (page-rounded requests hit R or R + 16 KiB).
+        (32 << 10, 12),
+        (48 << 10, 8),
+        (64 << 10, 8),
+        (80 << 10, 6),
+        (96 << 10, 6),
+        (112 << 10, 4),
+        (128 << 10, 4),
+        (144 << 10, 2),
+        (160 << 10, 2),
+        (176 << 10, 2),
+        (192 << 10, 2),
+        (208 << 10, 2),
+        (224 << 10, 2),
+        (240 << 10, 2),
+        (256 << 10, 2),
+    ]
+    guard let budgetMB = lagunaDecodeScratchPrewarmBudgetMB else { return base }
+    guard budgetMB > 0 else { return [] }
+    let baseBytes = base.reduce(0) { $0 + $1.bytes * $1.count }
+    let factor = Double(budgetMB << 20) / Double(baseBytes)
+    return base.map { rung in
+        (rung.bytes, max(1, Int((Double(rung.count) * factor).rounded())))
+    }
+}
+
+/// Builds the ladder as standalone `UInt8` zero arrays, submits them with one
+/// `asyncEval`, and drops every reference. The arrays are pure allocator
+/// scratch: no model op ever reads them, and their buffers recycle into the
+/// MLX cache as the most-recently-used entries once the submission completes
+/// inside the same request. Returns the array count and requested bytes for
+/// the trace line.
+@discardableResult
+func lagunaRunDecodeScratchPrewarm() -> (arrays: Int, bytes: Int) {
+    let ladder = lagunaDecodeScratchPrewarmLadder()
+    guard !ladder.isEmpty else { return (0, 0) }
+    var scratch: [MLXArray] = []
+    scratch.reserveCapacity(ladder.reduce(0) { $0 + $1.count })
+    var totalBytes = 0
+    for rung in ladder {
+        for _ in 0..<rung.count {
+            scratch.append(MLXArray.zeros([rung.bytes], type: UInt8.self))
+        }
+        totalBytes += rung.bytes * rung.count
+    }
+    asyncEval(scratch)
+    return (scratch.count, totalBytes)
+}
+
 // MARK: - Runtime fusion feature flags
 
 // Each fusion below concatenates the OUTPUT ROWS of same-dtype projections
@@ -8089,6 +8211,25 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     /// cleanly; the stock full pass is used otherwise.
     private var lmHeadPruner: LagunaLmHeadPruner?
 
+    /// One-shot latch for the in-window decode-scratch pre-warm (see the
+    /// `DARKBLOOM_DECODE_SCRATCH_PREWARM` comment). Armed by the weight cache
+    /// as the LAST step of its init -- after the untimed warmup forwards, so
+    /// they can never consume it -- and disarmed before the pre-warm runs on
+    /// the first multi-token forward that follows. One plain boolean is all
+    /// that crosses the trusted per-phase allocator reset.
+    private var decodeScratchPrewarmArmed = false
+
+    /// Test-observable fire count for the pre-warm latch (exactly 0 or 1 for
+    /// the process lifetime; the latch disarms before firing).
+    private(set) var decodeScratchPrewarmFiredCount = 0
+
+    /// Arms the decode-scratch pre-warm latch. No-op when
+    /// `DARKBLOOM_DECODE_SCRATCH_PREWARM=0`.
+    func armDecodeScratchPrewarm() {
+        guard lagunaDecodeScratchPrewarmEnabled else { return }
+        decodeScratchPrewarmArmed = true
+    }
+
     public init(_ config: LagunaConfig) {
         self.configuration = config
         self._model.wrappedValue = LagunaRuntimeModelInner(config)
@@ -8144,6 +8285,21 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         }
         if case .logits = lagunaDecodeAsyncStage, inputs.shape == [1, 1] {
             asyncEval(result)
+        }
+        // In-window decode-scratch pre-warm: once per process, on the first
+        // multi-token forward after init. Enqueued here -- AFTER the layer
+        // ladder has submitted all layers, BEFORE the caller's `eval(logits)`
+        // enqueues the norm/lm_head tail -- so GPU FIFO order is seed layers
+        // -> pre-warm -> seed tail: the scratch buffers complete and recycle
+        // into the cache strictly inside the same request, and, freed last,
+        // they are the most-recently-used entries when decode step 1
+        // allocates. Disarm first: the latch can fire at most once.
+        if decodeScratchPrewarmArmed, lagunaDecodeScratchPrewarmEnabled, inputs.dim(1) > 1 {
+            decodeScratchPrewarmArmed = false
+            let fired = lagunaRunDecodeScratchPrewarm()
+            decodeScratchPrewarmFiredCount += 1
+            lagunaTrace(
+                "decode scratch prewarm fired n=\(fired.arrays) bytes=\(fired.bytes)")
         }
         return result
     }

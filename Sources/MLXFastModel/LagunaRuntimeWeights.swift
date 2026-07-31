@@ -457,6 +457,17 @@ public final class LagunaRuntimeWeightCache {
         if libraryModel != nil, config.numHiddenLayers >= 16 {
             Self.wireResidentWeightsIfEnabled()
         }
+        // Arm the in-window decode-scratch pre-warm LAST, after the warmup
+        // forwards and the wiring above, so the untimed init-time 512-token
+        // warmup can never consume the one-shot latch. Only this boolean
+        // crosses the trusted per-phase allocator reset; the pre-warm itself
+        // allocates inside the charged window of the first multi-token
+        // forward (see `DARKBLOOM_DECODE_SCRATCH_PREWARM` in
+        // LagunaRuntimeModel.swift). The layer-count guard keeps tiny
+        // unit-test configurations on stock behavior.
+        if let model = libraryModel, config.numHiddenLayers >= 16 {
+            model.armDecodeScratchPrewarm()
+        }
     }
 
     /// One prefill-shaped forward (512 tokens) and one single-token decode
