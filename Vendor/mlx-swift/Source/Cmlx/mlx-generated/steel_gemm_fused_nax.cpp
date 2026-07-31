@@ -193,7 +193,7 @@ template <
   dispatch_bool(align_K, [&](auto kAlignedK) {
     dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
       dispatch_bool(align_N || !is_unaligned_sn, [&](auto kAlignedN) {
-        Dtile = gemm_loop<
+        Dtile = gemm_loop_two_step<
             T,
             SM,
             SN,
