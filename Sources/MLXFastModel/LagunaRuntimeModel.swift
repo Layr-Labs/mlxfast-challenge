@@ -877,8 +877,14 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
         threadgroup float local_sums[simd_size];
         threadgroup bfloat normalized_row[axis_size];
 
+        // Every fixed-count loop below is explicitly scalarized, mirroring
+        // the unroll treatment the prefill QK-norm kernels carry. This
+        // removes loop-control ALU and keeps the small thread arrays in
+        // registers while preserving the exact source order of the dependent
+        // RMS sum, normalization, and reduction arithmetic.
         thread bfloat values[n_reads];
         float acc = 0.0f;
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < n_reads; ++i) {
             bfloat value = bfloat(residual[base + i] + branch[base + i]);
             values[i] = value;
@@ -892,6 +898,7 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
         acc = simd_sum(acc);
         \(lagunaNormReductionTail2048)
 
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < n_reads; ++i) {
             bfloat value =
                 weight[base + i] *
@@ -909,13 +916,16 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
         thread float router_result[rows_per_thread] = {\(zeros)};
         \(accumulate)
 
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < rows_per_thread; ++r) {
+            #pragma clang loop unroll(full)
             for (ushort delta = 16; delta >= 1; delta >>= 1) {
                 router_result[r] +=
                     metal::simd_shuffle_down(router_result[r], delta);
             }
         }
         if (simd_lane == 0) {
+            #pragma clang loop unroll(full)
             for (uint r = 0; r < rows_per_thread; ++r) {
                 router_logits[router_row + r] = bfloat(router_result[r]);
             }
@@ -935,7 +945,7 @@ private let lagunaResidualRMSNormRouterKernels: [Int: MLXFast.MLXFastKernel] =
             (
                 rowsPerGroup,
                 MLXFast.metalKernel(
-                    name: "laguna_residual_rms_router_bf16_2048_rpg\(rowsPerGroup)_v2",
+                    name: "laguna_residual_rms_router_bf16_2048_rpg\(rowsPerGroup)_v3",
                     inputNames: ["residual", "branch", "weight", "router_weight"],
                     outputNames: ["summed", "normalized", "router_logits"],
                     source: lagunaResidualRMSNormRouterSource(rowsPerGroup: rowsPerGroup),
@@ -947,7 +957,7 @@ private let lagunaResidualRMSNormRouterKernels: [Int: MLXFast.MLXFastKernel] =
 /// Residual add + RMSNorm for the layers whose MLP is not a sparse block
 /// (layer 0) and for any shape the router fusion above declines.
 private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
-    name: "laguna_residual_rms_bf16_2048_v1",
+    name: "laguna_residual_rms_bf16_2048_v2",
     inputNames: ["residual", "branch", "weight"],
     outputNames: ["summed", "normalized"],
     source: """
@@ -964,8 +974,13 @@ private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
         \(lagunaNormInvMeanScratch)
         threadgroup float local_sums[simd_size];
 
+        // Both fixed-four loops are explicitly scalarized, mirroring the
+        // unroll treatment the prefill QK-norm kernels carry. This removes
+        // loop-control ALU and keeps `values` in registers while preserving
+        // the exact source order of the dependent RMS sum and normalization.
         thread bfloat values[n_reads];
         float acc = 0.0f;
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < n_reads; ++i) {
             bfloat value = bfloat(residual[base + i] + branch[base + i]);
             values[i] = value;
@@ -977,6 +992,7 @@ private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
         acc = simd_sum(acc);
         \(lagunaNormReductionTail2048)
 
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < n_reads; ++i) {
             normalized[base + i] =
                 weight[lid * n_reads + i] *
@@ -1044,7 +1060,7 @@ func lagunaResidualRMSNorm(
 // MARK: - Attention
 
 private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
-    name: "laguna_full_qk_norm_yarn_bf16_128_v4",
+    name: "laguna_full_qk_norm_yarn_bf16_128_v5",
     inputNames: ["raw_queries", "raw_keys", "query_weight", "key_weight", "angles"],
     outputNames: ["queries", "keys"],
     source: """
@@ -1071,6 +1087,7 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
         uint base = lane * 4;
         thread bfloat normalized[4];
         float sum = 0.0f;
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             float value = float(input[base + i]);
             sum += value * value;
@@ -1082,13 +1099,20 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
                 bfloat(float(input[base + i]) * inverse_rms);
         }
 
+        // Every fixed-four loop in this decode kernel is explicitly
+        // scalarized, mirroring the prefill twins. This removes loop-control
+        // ALU and keeps the four-element thread arrays in registers while
+        // preserving the exact source order of the dependent RMS sum and
+        // rotary arithmetic.
         thread float paired[4];
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
         }
@@ -1099,6 +1123,7 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
             : keys + (head - query_heads) * head_dim;
         if (lane < 8) {
             bfloat rounded_mscale = bfloat(yarn_mscale);
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
                 float first =
@@ -1112,6 +1137,7 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
                     bfloat(first * sine + second * cosine);
             }
         } else if (lane >= 16) {
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 output[base + i] = normalized[i];
             }
@@ -1174,7 +1200,7 @@ func lagunaFullQKNormYaRN(
 ///    table produced by that very kernel (see `_slidingRoPEAngleSeed`), so
 ///    they are the same floats, not a re-derivation.
 private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
-    name: "laguna_sliding_qk_norm_rope_bf16_128_v1",
+    name: "laguna_sliding_qk_norm_rope_bf16_128_v2",
     inputNames: ["raw_queries", "raw_keys", "query_weight", "key_weight", "angles"],
     outputNames: ["queries", "keys"],
     source: """
@@ -1199,6 +1225,7 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         uint base = lane * 4;
         thread bfloat normalized[4];
         float sum = 0.0f;
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             float value = float(input[base + i]);
             sum += value * value;
@@ -1210,6 +1237,7 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
@@ -1217,7 +1245,13 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         }
 
         // Element `p + 64`, the partner of pair `p`, lives 16 lanes away.
+        // Every fixed-four loop in this decode kernel is explicitly
+        // scalarized, mirroring the prefill twins. This removes loop-control
+        // ALU and keeps the four-element thread arrays in registers while
+        // preserving the exact source order of the dependent RMS sum and
+        // rotary arithmetic.
         thread float paired[4];
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
         }
@@ -1229,6 +1263,7 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         // Every element rotates, so the lower sixteen lanes own all 64 pairs
         // and write both halves of each.
         if (lane < 16) {
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
                 float first = float(normalized[i]);
@@ -7476,7 +7511,7 @@ final class LagunaRuntimeMoEGate: Module {
 ///  * `r2 = scaled + shared` and `residual + r2` keep the stock operand
 ///    order and one BF16 rounding each.
 private let lagunaPrefillMoETailKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_moe_tail_bf16_v1",
+    name: "laguna_prefill_moe_tail_bf16_v2",
     inputNames: ["expert_outputs", "router_weights", "shared_output", "residual"],
     outputNames: ["output"],
     source: """
@@ -7491,13 +7526,20 @@ private let lagunaPrefillMoETailKernel = MLXFast.metalKernel(
             expert_outputs + (row * experts) * hidden + col;
         const device float* weight_row = router_weights + row * experts;
 
+        // Every fixed-count loop is explicitly scalarized, mirroring the
+        // unroll treatment the prefill QK-norm kernels carry. This keeps
+        // `expert_weights` in registers and removes loop-control ALU while
+        // preserving the exact slot-order BF16 reduction chain.
         bfloat expert_weights[experts];
+        #pragma clang loop unroll(full)
         for (uint e = 0; e < experts; ++e) {
             expert_weights[e] = bfloat(weight_row[e]);
         }
 
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < n_cols; ++i) {
             bfloat total = bfloat(0);
+            #pragma clang loop unroll(full)
             for (uint e = 0; e < experts; ++e) {
                 bfloat product =
                     bfloat(expert_row[e * hidden + i] * expert_weights[e]);
@@ -7519,7 +7561,7 @@ private let lagunaPrefillMoETailKernel = MLXFast.metalKernel(
 /// multiply/add sequence while deleting the intervening 16 MiB copy at the
 /// ranked 512-token window.
 private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_sorted_moe_tail_bf16_v1",
+    name: "laguna_prefill_sorted_moe_tail_bf16_v2",
     inputNames: [
         "sorted_expert_outputs", "inverse_order", "router_weights",
         "shared_output", "residual",
@@ -7534,15 +7576,23 @@ private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
         uint col = thread_position_in_grid.x * n_cols;
         const device float* weight_row = router_weights + row * experts;
 
+        // Every fixed-count loop is explicitly scalarized, mirroring the
+        // unroll treatment the prefill QK-norm kernels carry. This keeps
+        // `expert_weights` and `sorted_rows` in registers and removes
+        // loop-control ALU while preserving the exact slot-order BF16
+        // reduction chain.
         bfloat expert_weights[experts];
         uint sorted_rows[experts];
+        #pragma clang loop unroll(full)
         for (uint e = 0; e < experts; ++e) {
             expert_weights[e] = bfloat(weight_row[e]);
             sorted_rows[e] = inverse_order[row * experts + e];
         }
 
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < n_cols; ++i) {
             bfloat total = bfloat(0);
+            #pragma clang loop unroll(full)
             for (uint e = 0; e < experts; ++e) {
                 bfloat product = bfloat(
                     sorted_expert_outputs[sorted_rows[e] * hidden + col + i] *
