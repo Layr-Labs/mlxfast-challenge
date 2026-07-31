@@ -229,89 +229,45 @@ inline void load_vector_safe(const device T* x, thread U* x_thread, int N) {
 
 template <typename U, int values_per_thread, int bits>
 inline U qdot(const device uint8_t* w, const thread U* x_thread, U scale) {
+  U accum = 0;
   if constexpr (bits == 4 && values_per_thread == 16) {
     // Specialized fp4 decode for the qmv_fast family (values_per_thread ==
-    // 16, e.g. nvfp4 gs=16 decode). Each 4-bit code n decodes through the
-    // same half bit pattern (magnitude (n & 7) << 9 with sign (n & 8) in
-    // the half sign bit) and the same exact half -> float conversion as the
-    // generic bits == 4 path below. Two further bit-exact ALU eliminations
-    // are applied on top of the split-nibble decode:
-    //
-    // (a) 2^14 renormalization fold. The old form multiplied each of the
-    //     eight decoded float2s by 16384.0f (16 multiplies per group). A
-    //     power-of-two scaling is exact at every step, so moving the 2^14
-    //     onto the one scale multiply -- (scale * 16384.0f) * accum --
-    //     leaves every partial sum exactly 2^-14 times its old value and
-    //     the single final rounding lands on the identical result. The
-    //     scale is e4m3 (|s| <= 448), so scale * 16384.0f <= 7.3e6 cannot
-    //     overflow FP32.
-    //
-    // (b) Dead +0.0f accumulator-seed elision. The old form seeded
-    //     `U accum = 0;` and paid one fadd per group computing fl(+0.0f +
-    //     t). +0.0f + t == t bitwise except t == -0.0f; that case leaves a
-    //     sign-of-zero difference only, and every caller accumulates the
-    //     return into a +0.0f-seeded result cell, which absorbs it
-    //     (+0.0f + -0.0f == +0.0f). Seeding the accumulator with the first
-    //     four-term product group directly is therefore bit-exact. The two
-    //     packed-word bodies are emitted textually, which is what the
-    //     compiler was already unrolling.
+    // 16, e.g. nvfp4 gs=16 decode). Bit-exact vs the generic bits == 4 path
+    // below: each 4-bit code n decodes through the identical half bit
+    // pattern (magnitude (n & 7) << 9 with sign (n & 8) in the half sign
+    // bit), the same exact half -> float conversion, and the same exact
+    // 16384.0f renormalization, so every decoded value is bit-identical to
+    // Dequantize<4>{}(n) for all 16 code points (including -0.0f for
+    // n == 8). The product/accumulation expression tree (groups of 4, same
+    // operand order, same parenthesization, float math) and the final
+    // scale * accum are unchanged. The uint2 load is 8-byte aligned at
+    // every call site with values_per_thread == 16 (lane code offsets are
+    // multiples of 8 bytes and row strides are multiples of 256 bytes).
     const device uint2* wq = (const device uint2*)w;
     const uint2 codes = wq[0];
-    U accum;
-    {
-      const uint32_t c = codes.x;
-      const uint32_t xe = c & 0x0F0F0F0Fu;
-      const uint32_t ge = xe | (xe << 3);
-      const uint32_t yo = c & 0xF0F0F0F0u;
-      const uint32_t go = yo | (yo >> 3);
-      const uint32_t p0 = (ge << 9) & 0x8E008E00u;
-      const uint32_t p1 = (go << 8) & 0x8E008E00u;
-      const uint32_t p2 = (ge << 1) & 0x8E008E00u;
-      const uint32_t p3 = go & 0x8E008E00u;
-      const float2 v04 = float2(as_type<half2>(p0));
-      const float2 v15 = float2(as_type<half2>(p1));
-      const float2 v26 = float2(as_type<half2>(p2));
-      const float2 v37 = float2(as_type<half2>(p3));
-      accum =
-          (x_thread[0] * v04.x +
-           x_thread[1] * v15.x +
-           x_thread[2] * v26.x +
-           x_thread[3] * v37.x);
+#pragma unroll
+    for (int j = 0; j < 2; j++) {
+      const uint32_t c = (j == 0) ? codes.x : codes.y;
+      const uint32_t p0 = ((c & 0x00070007u) << 9) | ((c & 0x00080008u) << 12);
+      const uint32_t p1 = ((c & 0x00700070u) << 5) | ((c & 0x00800080u) << 8);
+      const uint32_t p2 = ((c & 0x07000700u) << 1) | ((c & 0x08000800u) << 4);
+      const uint32_t p3 = ((c & 0x70007000u) >> 3) | (c & 0x80008000u);
+      const float2 v04 = float2(as_type<half2>(p0)) * 16384.0f;
+      const float2 v15 = float2(as_type<half2>(p1)) * 16384.0f;
+      const float2 v26 = float2(as_type<half2>(p2)) * 16384.0f;
+      const float2 v37 = float2(as_type<half2>(p3)) * 16384.0f;
       accum +=
-          (x_thread[4] * v04.y +
-           x_thread[5] * v15.y +
-           x_thread[6] * v26.y +
-           x_thread[7] * v37.y);
+          (x_thread[8 * j] * v04.x +
+           x_thread[8 * j + 1] * v15.x +
+           x_thread[8 * j + 2] * v26.x +
+           x_thread[8 * j + 3] * v37.x);
+      accum +=
+          (x_thread[8 * j + 4] * v04.y +
+           x_thread[8 * j + 5] * v15.y +
+           x_thread[8 * j + 6] * v26.y +
+           x_thread[8 * j + 7] * v37.y);
     }
-    {
-      const uint32_t c = codes.y;
-      const uint32_t xe = c & 0x0F0F0F0Fu;
-      const uint32_t ge = xe | (xe << 3);
-      const uint32_t yo = c & 0xF0F0F0F0u;
-      const uint32_t go = yo | (yo >> 3);
-      const uint32_t p0 = (ge << 9) & 0x8E008E00u;
-      const uint32_t p1 = (go << 8) & 0x8E008E00u;
-      const uint32_t p2 = (ge << 1) & 0x8E008E00u;
-      const uint32_t p3 = go & 0x8E008E00u;
-      const float2 v04 = float2(as_type<half2>(p0));
-      const float2 v15 = float2(as_type<half2>(p1));
-      const float2 v26 = float2(as_type<half2>(p2));
-      const float2 v37 = float2(as_type<half2>(p3));
-      accum +=
-          (x_thread[8] * v04.x +
-           x_thread[9] * v15.x +
-           x_thread[10] * v26.x +
-           x_thread[11] * v37.x);
-      accum +=
-          (x_thread[12] * v04.y +
-           x_thread[13] * v15.y +
-           x_thread[14] * v26.y +
-           x_thread[15] * v37.y);
-    }
-    return (scale * 16384.0f) * accum;
-  }
-  U accum = 0;
-  if constexpr (bits == 4) {
+  } else if constexpr (bits == 4) {
     const device uint16_t* ws = (const device uint16_t*)w;
     for (int i = 0; i < (values_per_thread / 4); i++) {
       accum +=
@@ -453,20 +409,18 @@ static inline uint32_t fp4nv_pack4(const thread uint8_t* p) {
 // when walking those four bytes.
 template <typename T>
 static inline void fp4nv_decode8(uint32_t c, float scale, thread T* out) {
-  // Split-nibble decode: identical half bit patterns to stock with fewer
-  // integer ops and fewer live constant registers. See qdot() for the
-  // bit-exactness argument.
-  const uint32_t xe = c & 0x0F0F0F0Fu;
-  const uint32_t ge = xe | (xe << 3);
-  const uint32_t yo = c & 0xF0F0F0F0u;
-  const uint32_t go = yo | (yo >> 3);
-  const float2 v0 =
-      float2(as_type<half2>((ge << 9) & 0x8E008E00u)) * scale;
-  const float2 v1 =
-      float2(as_type<half2>((go << 8) & 0x8E008E00u)) * scale;
-  const float2 v2 =
-      float2(as_type<half2>((ge << 1) & 0x8E008E00u)) * scale;
-  const float2 v3 = float2(as_type<half2>(go & 0x8E008E00u)) * scale;
+  const float2 v0 = float2(as_type<half2>(
+                        ((c & 0x00070007u) << 9) | ((c & 0x00080008u) << 12))) *
+      scale;
+  const float2 v1 = float2(as_type<half2>(
+                        ((c & 0x00700070u) << 5) | ((c & 0x00800080u) << 8))) *
+      scale;
+  const float2 v2 = float2(as_type<half2>(
+                        ((c & 0x07000700u) << 1) | ((c & 0x08000800u) << 4))) *
+      scale;
+  const float2 v3 =
+      float2(as_type<half2>(((c & 0x70007000u) >> 3) | (c & 0x80008000u))) *
+      scale;
   out[0] = T(v0.x);
   out[1] = T(v1.x);
   out[2] = T(v2.x);
