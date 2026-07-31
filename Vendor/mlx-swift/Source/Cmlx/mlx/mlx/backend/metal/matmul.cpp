@@ -22,6 +22,56 @@ namespace mlx::core {
 
 namespace {
 
+// DARKBLOOM_GEMM_SWIZZLE -- size the steel threadblock swizzle from the actual
+// M-tile count instead of a per-site constant.
+//
+// The swizzle is a pure remap of which threadgroup owns which output tile:
+// `tid_y = (tid.y << s) + (tid.x & ((1 << s) - 1))`, `tid_x = tid.x >> s`
+// (steel_gemm_fused_nax.h, steel_gemm_splitk_nax.h), and the host compensates
+// with `tn *= 1 << s; tm = ceil(tm / (1 << s))`. A tile's K loop, its
+// accumulation order and its output address are untouched, and the mapping is
+// bijective over valid tiles, so this is BIT-EXACT BY CONSTRUCTION.
+//
+// WHAT IT DOES AND DOES NOT DO. It does NOT reduce the number of B-tile loads:
+// every valid output tile still runs its own B loader. What changes is the
+// ORDER: threadgroups dispatch x-fastest, so at swizzle `s` a run of `2^s`
+// consecutive threadgroups works on `2^s` different M-tiles against the SAME
+// N-tile of B. Concurrently-resident threadgroups therefore share B-panel
+// lines, which can raise cache hit rate on the large operand -- prefill weight
+// matrices are big (`o_proj` is [2048, 8192] BF16 = 33.5 MB per layer), so
+// whether that reuse materialises depends on the M5's cache behaviour, not on
+// anything this code can guarantee. That is precisely what the ranked run
+// measures; this is a scheduling experiment, not an arithmetic saving.
+//
+// At the frozen 512-token prefill window the scored NAX sites run tm = 8
+// (regular; router and g_proj on split-K) and tm = 4 (attention and dense down
+// projections on split-K), against stock swizzles of 2 and 1 respectively.
+// `min(3, ceil(log2(tm)))` raises those to 3 and 2-3.
+//
+// The rule is NOT a superset of the stock constants: for small tm it can select
+// a different value in either direction (NAX regular stock is 2 while the rule
+// gives 0 at tm 1 and 1 at tm 2; NAX split-K stock is 0 below tm 4 while the
+// rule gives 1-2). Every such case is still bit-exact -- only the schedule
+// moves -- and single-token decode is untouched because M = 1 gives tm = 1.
+//
+// `DARKBLOOM_GEMM_SWIZZLE=0` restores the stock per-site constants exactly.
+inline bool darkbloom_gemm_swizzle_enabled() {
+  static const bool enabled = env::get_var("DARKBLOOM_GEMM_SWIZZLE", "1") != "0";
+  return enabled;
+}
+
+// ceil(log2(tm)), capped at 3, or the caller's stock value when disabled.
+inline int darkbloom_swizzle_log(int tm, int stock) {
+  if (!darkbloom_gemm_swizzle_enabled()) {
+    return stock;
+  }
+  int s = 0;
+  while ((1 << s) < tm && s < 3) {
+    s++;
+  }
+  return s;
+}
+
 std::tuple<bool, int64_t, array> check_transpose(
     std::vector<array>& copies,
     const Stream& s,
@@ -276,10 +326,13 @@ void steel_matmul_regular_axpby_nax(
   int tm = (M + bm - 1) / bm;
 
   // TODO: Explore device-based tuning for swizzle
-  int swizzle_log = tm <= 3 ? 0 : 1;
+  int stock_swizzle_log = tm <= 3 ? 0 : 1;
   if (devc == 's' || devc == 'c' || devc == 'd') {
-    swizzle_log = 2;
+    stock_swizzle_log = 2;
   }
+  // Group more M tiles per N coordinate for B-panel cache reuse (see
+  // darkbloom_swizzle_log); at the 512-token prefill window tm is 8 here.
+  int swizzle_log = darkbloom_swizzle_log(tm, stock_swizzle_log);
 
   // Prepare steel matmul params
   GEMMParams params{/* const int M = */ M,
@@ -751,7 +804,9 @@ void steel_gemm_splitk_axpby_nax(
   int tn = (N + bn - 1) / bn;
   int tm = (M + bm - 1) / bm;
 
-  int swizzle_log = tm <= 3 ? 0 : 1;
+  // Same B-panel reuse grouping per K partition (see darkbloom_swizzle_log);
+  // at the frozen window tm is 8 (router, g_proj) or 4 (o_proj, down).
+  int swizzle_log = darkbloom_swizzle_log(tm, tm <= 3 ? 0 : 1);
 
   // Compute swizzled tile counts
   int tile = 1 << swizzle_log;
