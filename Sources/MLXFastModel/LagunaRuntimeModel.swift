@@ -96,13 +96,12 @@ func lagunaTrace(_ site: String) {
 // is bit-exact against the separate dispatches it replaces. The per-head
 // g_proj (N=64) uses a different split-K gemv variant and is never fused.
 
-/// `DARKBLOOM_FUSED_QKV` (default OFF; set "1" to enable): after checkpoint
+/// `DARKBLOOM_FUSED_QKV` (default on; set "0" to disable): after checkpoint
 /// load, retain one row-concatenated `[Wq; Wk; Wv]` BF16 weight per attention
-/// layer and serve Q/K/V from a single projection dispatch. Ablation on the
-/// paired local benchmark showed a mild prefill cost with no decode gain, so
-/// this ships opt-in.
+/// layer and serve multi-token Q/K/V from a single projection dispatch.
+/// Single-token decode keeps the faster fused norm+QKV path.
 let lagunaFusedQKVEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] == "1"
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] != "0"
 
 /// `DARKBLOOM_FUSED_SHARED_GATE_UP` (default on; set "0" to disable): after
 /// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
@@ -1928,8 +1927,8 @@ func lagunaNativeAffineWeight(
 /// independent, so MLX already issues them into one barrier group; what this
 /// removes is two dispatches per layer, and it does so without the
 /// row-concatenated `[Wq; Wk; Wv]` bank behind `DARKBLOOM_FUSED_QKV` — the
-/// kernel reads the three stock weights in place, so prefill's GEMM shapes,
-/// scheduling and resident memory are all untouched.
+/// kernel reads the three stock weights in place, independently of whether
+/// the retained bank serves the multi-token path.
 ///
 /// Exactness: MLX's gemv gives every output row its own K loop and its own
 /// simdgroup reduction, and the tiling it picks for all three shapes shares
@@ -3608,8 +3607,7 @@ final class LagunaRuntimeAttention: Module {
                 queries: MLXArray, keys: MLXArray, values: MLXArray,
                 gateValues: MLXArray, gateActivated: Bool
             )?
-        if lagunaFusedQKVProjectionEnabled, _fusedQKVWeight == nil,
-            B == 1, L == 1,
+        if lagunaFusedQKVProjectionEnabled, B == 1, L == 1,
             headDim == LagunaConstants.headDim,
             nKVHeads == LagunaConstants.numKeyValueHeads,
             input.dtype == .bfloat16,
@@ -3738,7 +3736,7 @@ final class LagunaRuntimeAttention: Module {
         var queries: MLXArray
         var keys: MLXArray
         var values: MLXArray
-        if let fusedQKVWeight = _fusedQKVWeight {
+        if L > 1, let fusedQKVWeight = _fusedQKVWeight {
             guard let normalizedInput else {
                 preconditionFailure("retained fused QKV requires normalized input")
             }
