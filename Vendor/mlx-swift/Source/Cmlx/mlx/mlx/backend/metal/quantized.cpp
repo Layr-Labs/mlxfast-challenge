@@ -1521,6 +1521,30 @@ void gather_qmm_rhs_nax(
     default: break;                          // upstream: bm=64, wm=2, wn=2
   }
 
+  // DARKBLOOM_GATHER_BN128 (default ON; "0" restores bn = 64): widen the
+  // output-column tile for Laguna's routed DOWN projection only.
+  //
+  // Each threadgroup owns one output-column tile and walks every row of its
+  // expert group, so the activation panel A is re-read once per column tile:
+  // at N = 2048 with bn = 64 that is 32 passes over A per layer, while W is
+  // read exactly once. Doubling bn halves those A re-reads. The gate/up shape
+  // (K 2048, N 1024) is deliberately NOT widened: its `fuse_swiglu` epilogue
+  // assumes `activated_cols = BN / 2` and would need the fused bank
+  // re-interleaved, which is a separate change.
+  //
+  // Scope guards: `align_N` still holds (2048 % 128 == 0) and the expert
+  // kernel's threadgroup staging buffer is `BN * BK_padded` = 128 * 72
+  // elements = 18.4 KiB, inside the 32 KiB limit. Bit-exact: bn only selects
+  // WHICH output columns a threadgroup owns; every element still accumulates
+  // over the same K sequence in the same order in one simdgroup accumulator.
+  // Resolved once per process (the codebase convention: never re-read the
+  // environment on a dispatch path).
+  static const bool darkbloom_gather_bn128 =
+      env::get_var("DARKBLOOM_GATHER_BN128", "1") != "0";
+  if (darkbloom_gather_bn128 && K == 512 && N == 2048) {
+    bn = 128;
+  }
+
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
