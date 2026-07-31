@@ -96,13 +96,12 @@ func lagunaTrace(_ site: String) {
 // is bit-exact against the separate dispatches it replaces. The per-head
 // g_proj (N=64) uses a different split-K gemv variant and is never fused.
 
-/// `DARKBLOOM_FUSED_QKV` (default OFF; set "1" to enable): after checkpoint
+/// `DARKBLOOM_FUSED_QKV` (default on; set "0" to disable): after checkpoint
 /// load, retain one row-concatenated `[Wq; Wk; Wv]` BF16 weight per attention
-/// layer and serve Q/K/V from a single projection dispatch. Ablation on the
-/// paired local benchmark showed a mild prefill cost with no decode gain, so
-/// this ships opt-in.
+/// layer and serve multi-token Q/K/V from a single projection dispatch.
+/// Single-token decode keeps the faster fused norm+QKV path.
 let lagunaFusedQKVEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] == "1"
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] != "0"
 
 /// `DARKBLOOM_FUSED_SHARED_GATE_UP` (default on; set "0" to disable): after
 /// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
@@ -118,6 +117,17 @@ let lagunaFusedSharedGateUpEnabled =
 /// boundary in the compiled SiLU product.
 let lagunaFusedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_SWIGLU_QMV"] != "0"
+
+/// Prefill counterpart of the decode fused shared-expert `[gate; up]` bank:
+/// one QMM over the row-concatenated bank instead of separate gate/up QMMs
+/// for L > 1. DEFAULT OFF: at L = 512 the plain QMM dispatches a steel GEMM
+/// whose tiling/split-K differs between N = 2048 (fused) and 2 × N = 1024
+/// (separate), changing accumulation order — the trace A/B showed step-0
+/// logits shift, so this is a real perturbation, not a relayout. Enable for
+/// measurement only with `DARKBLOOM_FUSED_SHARED_GATE_UP_PREFILL=1`.
+let lagunaFusedSharedGateUpPrefillEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_FUSED_SHARED_GATE_UP_PREFILL"] == "1"
 
 /// Decode-only shared-expert down QMV plus both sparse-block residual adds.
 /// The kernel preserves the stock BF16 down-projection result, the inner
@@ -1639,8 +1649,8 @@ func lagunaNativeAffineWeight(
 /// independent, so MLX already issues them into one barrier group; what this
 /// removes is two dispatches per layer, and it does so without the
 /// row-concatenated `[Wq; Wk; Wv]` bank behind `DARKBLOOM_FUSED_QKV` — the
-/// kernel reads the three stock weights in place, so prefill's GEMM shapes,
-/// scheduling and resident memory are all untouched.
+/// kernel reads the three stock weights in place, independently of whether
+/// the retained bank serves the multi-token path.
 ///
 /// Exactness: MLX's gemv gives every output row its own K loop and its own
 /// simdgroup reduction, and the tiling it picks for all three shapes shares
@@ -2121,7 +2131,8 @@ func lagunaFusedNormQKVProjection(
     heads: Int
 ) -> (
     queries: MLXArray, keys: MLXArray, values: MLXArray, gateValues: MLXArray,
-    gateActivated: Bool
+    gateActivated: Bool,
+    gateQMV: (row: MLXArray, bank: LagunaNativeAffineWeight)?
 )? {
     guard let kernel = lagunaFusedQKVProjectionKernels[heads] else { return nil }
     let hidden = LagunaConstants.hiddenSize
@@ -2151,7 +2162,7 @@ func lagunaFusedNormQKVProjection(
         ],
         outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .bfloat16]
     )
-    return (outputs[0], outputs[1], outputs[2], outputs[3], true)
+    return (outputs[0], outputs[1], outputs[2], outputs[3], true, nil)
 }
 
 /// Decode-only fusion of the per-head attention gate with the output
@@ -2528,6 +2539,250 @@ func lagunaGateProductSoftplus(
     )[0]
 }
 
+/// NVFP4-tail counterpart of the gate-product kernel for layers whose gate
+/// bank cannot ride the fused QKV dispatch. The stock chain there is three
+/// dispatches — `rms_single_row` (already issued for the QKV qmv), a separate
+/// group-32 INT8 gate `qmv_fast`, and the softplus+product kernel above.
+/// This kernel absorbs the middle one: phase 1 replicates
+/// `qmv_fast_impl<bfloat16_t, 32, 8>` for the 48/64 gate rows out of the
+/// stock normalized row (line-for-line the vendored arithmetic, including the
+/// per-256-block `sum`, `result += s * accum + sum * b` order, `l / 4` scale
+/// groups, `simd_sum` reduction, and the single BF16 rounding of each logit
+/// the stock qmv would have written); phase 2 is the same softplus+product
+/// the one-kernel gate product performs, reading the logits from threadgroup
+/// memory. Every output element is bit-identical to the three-dispatch
+/// chain. Every threadgroup redundantly computes the tiny gate bank (≤ 64
+/// rows × 2 KB) — the same redundant-read pattern the router kernel uses —
+/// against 6-8 K element products.
+private func lagunaGateQMVProductSoftplusSource(heads: Int) -> String {
+    """
+    constexpr int gate_rows = \(heads);
+    constexpr int head_dim = \(LagunaConstants.headDim);
+    constexpr int in_vec = gate_rows * head_dim;
+    constexpr int in_vec_size_w = 2048;
+    constexpr int in_vec_size_g = 64;
+
+    uint lid = thread_position_in_threadgroup.x;
+    uint simd_lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+
+    threadgroup bfloat gate_logits[gate_rows];
+
+    // ---- phase 1: exact qmv_fast_impl<bfloat16_t, 32, 8> for the gate ----
+    // 16 simdgroups = 8 tiles of 2; tile u owns rows u*8 + sub*4.
+    int unit = simd_group / 2;
+    int sub = simd_group % 2;
+    int out_row = unit * 8 + sub * 4;
+    if (out_row < gate_rows) {
+        const device uint8_t* ws = (const device uint8_t*)gate_codes;
+        ws += out_row * in_vec_size_w + simd_lane * 8;
+        const device bfloat* sc = gate_scales + out_row * in_vec_size_g
+            + simd_lane / 4;
+        const device bfloat* bi = gate_biases + out_row * in_vec_size_g
+            + simd_lane / 4;
+        uint xoff = simd_lane * 8;
+
+        thread float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint k = 0; k < 2048; k += 256) {
+            thread float x_thread[8];
+            float sum = 0.0f;
+            for (uint i = 0; i < 8; ++i) {
+                float xv = float(normalized[k + xoff + i]);
+                sum += xv;
+                x_thread[i] = xv;
+            }
+            for (int row = 0; row < 4; ++row) {
+                int clamped = metal::min(out_row + row, gate_rows - 1);
+                const device uint8_t* wl =
+                    (const device uint8_t*)gate_codes
+                    + clamped * in_vec_size_w + (k + simd_lane * 8);
+                float s = float(gate_scales[clamped * in_vec_size_g
+                    + (k / 256) * 8 + simd_lane / 4]);
+                float b = float(gate_biases[clamped * in_vec_size_g
+                    + (k / 256) * 8 + simd_lane / 4]);
+                float accum = 0.0f;
+                for (uint i = 0; i < 8; ++i) {
+                    accum += x_thread[i] * float(wl[i]);
+                }
+                result[row] += s * accum + sum * b;
+            }
+        }
+        for (int row = 0; row < 4; ++row) {
+            result[row] = simd_sum(result[row]);
+            if (simd_lane == 0 && out_row + row < gate_rows) {
+                gate_logits[out_row + row] = bfloat(result[row]);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- phase 2: the exact softplus + broadcast product ----
+    // One thread per output element across in_vec/512 threadgroups; each
+    // group recomputed the tiny gate bank in phase 1 (the router kernel's
+    // redundant-read pattern) rather than serializing the whole product on
+    // a single threadgroup.
+    uint elem = threadgroup_position_in_grid.x * 512 + lid;
+    if (elem < uint(in_vec)) {
+        int head = elem / head_dim;
+        float logit = float(gate_logits[head]);
+        float gate;
+        if (metal::isnan(logit)) {
+            gate = NAN;
+        } else {
+            float maxval = metal::max(logit, 0.0f);
+            float minval = metal::min(logit, 0.0f);
+            gate = (metal::isinf(minval) || metal::isinf(maxval))
+                ? maxval
+                : maxval + log1p(metal::exp(minval - maxval));
+        }
+        bfloat gate_bf = bfloat(gate);
+        gated[elem] = bfloat(float(attention_output[elem]) * float(gate_bf));
+    }
+    """
+}
+
+private let lagunaGateQMVProductSoftplusKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_gate_qmv_product_softplus_bf16_h\(heads)_v2",
+            inputNames: [
+                "attention_output", "normalized", "gate_codes", "gate_scales",
+                "gate_biases",
+            ],
+            outputNames: ["gated"],
+            source: lagunaGateQMVProductSoftplusSource(heads: heads),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+/// Set `DARKBLOOM_FUSED_GATE_QMV=0` to ablate (separate gate qmv + gate
+/// product) inside the same binary.
+private let lagunaFusedGateQMVEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATE_QMV"] != "0"
+
+/// NVFP4-tail fused gate: qmv + softplus + product in one dispatch, or nil
+/// when the preconditions do not hold. Bit-identical to the three-dispatch
+/// chain; see the kernel commentary above.
+func lagunaGateQMVProductSoftplus(
+    attentionOutput: MLXArray, normalized: MLXArray,
+    bank: LagunaNativeAffineWeight, heads: Int
+) -> MLXArray? {
+    guard lagunaFusedGateQMVEnabled,
+        bank.mode == .affine, bank.bits == 8, bank.groupSize == 32,
+        let biases = bank.biases,
+        bank.originalShape == [heads, LagunaConstants.hiddenSize],
+        let kernel = lagunaGateQMVProductSoftplusKernels[heads]
+    else { return nil }
+    let inVec = heads * LagunaConstants.headDim
+    let hidden = LagunaConstants.hiddenSize
+    precondition(attentionOutput.dtype == .bfloat16)
+    precondition(attentionOutput.shape == [1, 1, inVec])
+    precondition(normalized.dtype == .bfloat16)
+    precondition(normalized.shape == [1, 1, hidden])
+    precondition(bank.packedCodes.dtype == .uint32)
+    precondition(bank.packedCodes.shape == [heads, hidden / 4])
+    precondition(bank.scales.dtype == .bfloat16)
+    precondition(bank.scales.shape == [heads, hidden / 32])
+    precondition(biases.dtype == .bfloat16)
+    precondition(biases.shape == [heads, hidden / 32])
+
+    lagunaTrace("gate qmv+product softplus h\(heads)")
+    return kernel(
+        [attentionOutput, normalized, bank.packedCodes, bank.scales, biases],
+        grid: (inVec, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [[1, 1, inVec]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+/// Decode-only fusion of the embedding gather and layer 0's input RMSNorm.
+/// The stock chain is two dispatches — `embedTokens(inputs)` gathering the
+/// token's 2048-row, then `rms_single_row` normalizing it — and layer 0 is
+/// the only layer whose attention input IS the embedding. One 512-thread
+/// group does both: each thread copies its contiguous four table elements
+/// (the exact bytes the gather writes) and squares them in index order, the
+/// proven `lagunaNormReductionTail2048` ladder produces
+/// `precise::rsqrt(acc / 2048 + 1e-6)`, and the normalized row is written
+/// with the same `w[i] * bfloat(float(x[i]) * inv)` rounding the stock norm
+/// writes. Both outputs are bit-identical to the stock chain; the raw row
+/// still feeds layer 0's residual path.
+private let lagunaEmbedNormKernel = MLXFast.metalKernel(
+    name: "laguna_embed_norm_bf16_2048_v1",
+    inputNames: ["token_ids", "embed_weight", "norm_weight"],
+    outputNames: ["hidden", "normalized"],
+    source: """
+        constexpr uint axis_size = 2048;
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+
+        uint lid = thread_position_in_threadgroup.x;
+        uint simd_lane = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint base = lid * n_reads;
+
+        uint token = uint(token_ids[0]);
+        const device bfloat* table_row =
+            embed_weight + size_t(token) * axis_size;
+
+        \(lagunaNormInvMeanScratch)
+        threadgroup float local_sums[simd_size];
+
+        thread bfloat values[n_reads];
+        float acc = 0.0f;
+        for (uint i = 0; i < n_reads; ++i) {
+            bfloat value = table_row[base + i];
+            values[i] = value;
+            hidden[base + i] = value;
+            float fv = float(value);
+            acc += fv * fv;
+        }
+
+        acc = simd_sum(acc);
+        \(lagunaNormReductionTail2048)
+
+        for (uint i = 0; i < n_reads; ++i) {
+            normalized[base + i] =
+                norm_weight[base + i] *
+                bfloat(float(values[i]) * laguna_inv_mean);
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Set `DARKBLOOM_FUSED_EMBED_NORM=0` to ablate (stock gather + stock norm).
+private let lagunaFusedEmbedNormEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_EMBED_NORM"] != "0"
+
+/// Returns (embedded row, normalized row) for a single decode token, or nil
+/// when the preconditions do not hold. Bit-identical to
+/// `embedTokens` + `RMSNorm`; see the kernel commentary above.
+func lagunaEmbedNorm(
+    tokens: MLXArray, embedWeight: MLXArray, normWeight: MLXArray
+) -> (hidden: MLXArray, normalized: MLXArray)? {
+    let hidden = LagunaConstants.hiddenSize
+    guard lagunaFusedEmbedNormEnabled else { return nil }
+    precondition(tokens.dtype == .int32)
+    precondition(tokens.shape == [1, 1])
+    precondition(embedWeight.dtype == .bfloat16)
+    precondition(embedWeight.ndim == 2 && embedWeight.dim(1) == hidden)
+    precondition(normWeight.dtype == .bfloat16)
+    precondition(normWeight.shape == [hidden])
+
+    lagunaTrace("embed+norm")
+    let outputs = lagunaEmbedNormKernel(
+        [tokens, embedWeight, normWeight],
+        grid: (512, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [[1, 1, hidden], [1, 1, hidden]],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
 /// Keep the stock shapeless unary gate for prefill. Ranked measurement showed
 /// the larger gate/product graph regressing the complete prefill schedule even
 /// though its isolated steady-state subpath was slightly faster.
@@ -2828,7 +3083,8 @@ final class LagunaRuntimeAttention: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
         qkRoPEAngles: MLXArray? = nil,
-        qkRoPEOffsets: MLXArray? = nil
+        qkRoPEOffsets: MLXArray? = nil,
+        precomputedNorm: MLXArray? = nil
     ) -> MLXArray {
         let (B, L) = (input.dim(0), input.dim(1))
 
@@ -2838,10 +3094,10 @@ final class LagunaRuntimeAttention: Module {
         var fusedNormQKV:
             (
                 queries: MLXArray, keys: MLXArray, values: MLXArray,
-                gateValues: MLXArray, gateActivated: Bool
+                gateValues: MLXArray, gateActivated: Bool,
+                gateQMV: (row: MLXArray, bank: LagunaNativeAffineWeight)?
             )?
-        if lagunaFusedQKVProjectionEnabled, _fusedQKVWeight == nil,
-            B == 1, L == 1,
+        if lagunaFusedQKVProjectionEnabled, B == 1, L == 1,
             headDim == LagunaConstants.headDim,
             nKVHeads == LagunaConstants.numKeyValueHeads,
             input.dtype == .bfloat16,
@@ -2863,7 +3119,10 @@ final class LagunaRuntimeAttention: Module {
             if lagunaUseNativeAffineQKV(layer: layerIdx),
                 let fusedAffine = _nativeAffineQKV
             {
-                let normalized = inputNorm(input)
+                // Layer 0's fused embed+norm kernel hands over the exact
+                // row the standalone norm would have written; every other
+                // layer normalizes here as before.
+                let normalized = precomputedNorm ?? inputNorm(input)
                 let qkv = quantizedMM(
                     normalized,
                     fusedAffine.packedCodes,
@@ -2877,6 +3136,17 @@ final class LagunaRuntimeAttention: Module {
                 let queryDim = nHeads * headDim
                 let kvDim = nKVHeads * headDim
                 let gateStart = queryDim + 2 * kvDim
+                // When the fused gate-product kernel will consume the gate at
+                // the output projection, hand it the RAW BF16 logits (or the
+                // raw source row, for the tail-fused variant) and skip the
+                // eager softplus chain entirely; the kernels reproduce those
+                // exact rounding boundaries inside their single dispatch.
+                let deferGateActivation =
+                    lagunaFusedGateProductEnabled
+                    && lagunaUseNativeAffineOProj(layer: layerIdx)
+                    && _nativeAffineOProj != nil
+                    && wo.bias == nil
+                var gateQMV: (row: MLXArray, bank: LagunaNativeAffineWeight)?
                 let gateLogits: MLXArray
                 if _nativeAffineQKVGateRows == nHeads {
                     // The gate rows rode the fused bank's single dispatch;
@@ -2885,31 +3155,28 @@ final class LagunaRuntimeAttention: Module {
                     gateLogits = qkv[.ellipsis, gateStart ..< (gateStart + nHeads)]
                 } else if let affineGate = _nativeAffineGProj {
                     // NVFP4-tail layer: the gate keeps its own group-32 INT8
-                    // bank (the envelope caps g_proj there) and replaces the
-                    // BF16 GEMV one dispatch for one dispatch.
-                    gateLogits = quantizedMM(
-                        normalized,
-                        affineGate.packedCodes,
-                        scales: affineGate.scales,
-                        biases: affineGate.biases,
-                        transpose: true,
-                        groupSize: affineGate.groupSize,
-                        bits: affineGate.bits,
-                        mode: affineGate.mode
-                    )
+                    // bank (the envelope caps g_proj there). When the fused
+                    // gate-QMV+product kernel runs at the output projection,
+                    // the bank and the stock normalized row travel as the
+                    // gate source instead of materializing logits here.
+                    if deferGateActivation, lagunaFusedGateQMVEnabled {
+                        gateQMV = (normalized, affineGate)
+                        gateLogits = normalized
+                    } else {
+                        gateLogits = quantizedMM(
+                            normalized,
+                            affineGate.packedCodes,
+                            scales: affineGate.scales,
+                            biases: affineGate.biases,
+                            transpose: true,
+                            groupSize: affineGate.groupSize,
+                            bits: affineGate.bits,
+                            mode: affineGate.mode
+                        )
+                    }
                 } else {
                     gateLogits = gateProjection(normalized)
                 }
-                // When the fused gate-product kernel will consume the gate at
-                // the output projection, hand it the RAW BF16 logits and skip
-                // the eager softplus chain entirely; the kernel reproduces
-                // those exact rounding boundaries inside its single dispatch.
-                // Otherwise keep the stock eager activation.
-                let deferGateActivation =
-                    lagunaFusedGateProductEnabled
-                    && lagunaUseNativeAffineOProj(layer: layerIdx)
-                    && _nativeAffineOProj != nil
-                    && wo.bias == nil
                 let gateValues =
                     deferGateActivation
                     ? gateLogits
@@ -2919,7 +3186,8 @@ final class LagunaRuntimeAttention: Module {
                     qkv[.ellipsis, queryDim ..< (queryDim + kvDim)],
                     qkv[.ellipsis, (queryDim + kvDim) ..< gateStart],
                     gateValues,
-                    !deferGateActivation
+                    !deferGateActivation,
+                    gateQMV
                 )
             } else {
                 fusedNormQKV = lagunaFusedNormQKVProjection(
@@ -2944,7 +3212,7 @@ final class LagunaRuntimeAttention: Module {
         var queries: MLXArray
         var keys: MLXArray
         var values: MLXArray
-        if let fusedQKVWeight = _fusedQKVWeight {
+        if L > 1, let fusedQKVWeight = _fusedQKVWeight {
             guard let normalizedInput else {
                 preconditionFailure("retained fused QKV requires normalized input")
             }
@@ -3116,15 +3384,18 @@ final class LagunaRuntimeAttention: Module {
             // per-element gate).
             let projectedGate: MLXArray
             let gateIsActivated: Bool
+            let gateQMV: (row: MLXArray, bank: LagunaNativeAffineWeight)?
             if let fusedNormQKV {
                 projectedGate = fusedNormQKV.gateValues
                 gateIsActivated = fusedNormQKV.gateActivated
+                gateQMV = fusedNormQKV.gateQMV
             } else {
                 guard let normalizedInput else {
                     preconditionFailure("attention gate requires normalized input")
                 }
                 projectedGate = gProj(normalizedInput)
                 gateIsActivated = false
+                gateQMV = nil
             }
             // Native group-32 affine INT8 output projection for the serial
             // decode token. The stock fused kernel folds the gate into the
@@ -3153,15 +3424,26 @@ final class LagunaRuntimeAttention: Module {
                 headDim == LagunaConstants.headDim,
                 output.dtype == .bfloat16, projectedGate.dtype == .bfloat16,
                 output.shape == [1, 1, nHeads * headDim],
-                projectedGate.shape == [1, 1, nHeads]
+                gateQMV != nil
+                    ? gateQMV!.row.shape == [1, 1, LagunaConstants.hiddenSize]
+                    : projectedGate.shape == [1, 1, nHeads]
             {
                 // Raw logits + fused kernel: one dispatch reproduces the
                 // softplus chain AND the broadcast product bit-exactly (see
-                // `lagunaGateProductSoftplusSource`). Falls back to the stock
-                // compiled-softplus + donated in-place multiply whenever the
-                // gate is already activated or the kernel declines.
+                // `lagunaGateProductSoftplusSource`). The tail-fused variant
+                // also absorbs the separate gate qmv (see
+                // `lagunaGateQMVProductSoftplusSource`). Falls back to the
+                // stock compiled-softplus + donated in-place multiply
+                // whenever the gate is already activated or the kernel
+                // declines.
                 let gated: MLXArray
-                if !gateIsActivated,
+                if !gateIsActivated, let gateQMV,
+                    let fusedGated = lagunaGateQMVProductSoftplus(
+                        attentionOutput: output, normalized: gateQMV.row,
+                        bank: gateQMV.bank, heads: nHeads)
+                {
+                    gated = fusedGated
+                } else if !gateIsActivated,
                     let fusedGated = lagunaGateProductSoftplus(
                         attentionOutput: output, gateLogits: projectedGate,
                         heads: nHeads)
@@ -5190,6 +5472,33 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             let up = gateUp[.ellipsis, _fusedGateUpSplit...]
             return downProj(compiledSiluProduct(gate, up))
         }
+        // Prefill (L > 1): the same retained `[gate; up]` bank in one QMM
+        // instead of separate gate/up QMMs. Each token's output rows are
+        // computed independently of which other rows share the dispatch.
+        if lagunaFusedSharedGateUpPrefillEnabled,
+            let fusedWeight = _fusedGateUpWeight,
+            let fusedScales = _fusedGateUpScales,
+            x.dtype == .bfloat16, x.ndim == 3,
+            x.dim(2) == LagunaConstants.hiddenSize,
+            fusedWeight.dtype == .uint32,
+            fusedScales.dtype == .uint8,
+            _fusedGateUpSplit == LagunaConstants.sharedExpertIntermediateSize
+        {
+            lagunaTrace("shared fused [gate; up] bank QMM (prefill)")
+            let gateUp = MLX.quantizedMM(
+                x,
+                fusedWeight,
+                scales: fusedScales,
+                biases: nil,
+                transpose: true,
+                groupSize: 16,
+                bits: 4,
+                mode: .nvfp4
+            )
+            let gate = gateUp[.ellipsis, 0 ..< _fusedGateUpSplit]
+            let up = gateUp[.ellipsis, _fusedGateUpSplit...]
+            return downProj(compiledSiluProduct(gate, up))
+        }
         return downProj(compiledSiluProduct(gateProj(x), upProj(x)))
     }
 }
@@ -6637,7 +6946,8 @@ final class LagunaRuntimeDecoderLayer: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
         qkRoPEAngles: MLXArray? = nil,
-        qkRoPEOffsets: MLXArray? = nil
+        qkRoPEOffsets: MLXArray? = nil,
+        precomputedNorm: MLXArray? = nil
     ) -> MLXArray {
         let r = selfAttn(
             x,
@@ -6645,7 +6955,8 @@ final class LagunaRuntimeDecoderLayer: Module {
             mask: mask,
             cache: cache,
             qkRoPEAngles: qkRoPEAngles,
-            qkRoPEOffsets: qkRoPEOffsets
+            qkRoPEOffsets: qkRoPEOffsets,
+            precomputedNorm: precomputedNorm
         )
         let h: MLXArray
         let normalized: MLXArray
@@ -7002,6 +7313,7 @@ final class LagunaRuntimeModelInner: Module {
         var fullRoPEAngles: MLXArray?
         var slidingRoPEAngles: MLXArray?
         var qkRoPEOffsets: MLXArray?
+        var layer0PrecomputedNorm: MLXArray?
         if let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
             let fullAtlas = _fullRoPEAngleAtlas,
             let slidingAtlas = _slidingRoPEAngleAtlas,
@@ -7018,7 +7330,21 @@ final class LagunaRuntimeModelInner: Module {
         } else {
             // Verbatim stock fallback for prefill, unsupported caches and
             // positions outside the precomputed atlas.
-            h = embedTokens(inputs)
+            if inputs.shape == [1, 1], lagunaFusedEmbedNormEnabled,
+                let fused = lagunaEmbedNorm(
+                    tokens: inputs,
+                    embedWeight: embedTokens.weight,
+                    normWeight: layers[0].inputLayerNorm.weight)
+            {
+                // One dispatch for the gather AND layer 0's input norm (see
+                // `lagunaEmbedNormKernel`); both outputs are bit-identical
+                // to the stock pair. The raw row still feeds layer 0's
+                // residual path.
+                h = fused.hidden
+                layer0PrecomputedNorm = fused.normalized
+            } else {
+                h = embedTokens(inputs)
+            }
             let isSingleTokenDecode = h.dim(0) == 1 && h.dim(1) == 1
             fullRoPEAngles =
                 lagunaFusedFullQKNormYaRNEnabled && isSingleTokenDecode
@@ -7105,7 +7431,8 @@ final class LagunaRuntimeModelInner: Module {
                     mask: mask,
                     cache: cache?[i],
                     qkRoPEAngles: qkRoPEAngles,
-                    qkRoPEOffsets: qkRoPEOffsets
+                    qkRoPEOffsets: qkRoPEOffsets,
+                    precomputedNorm: i == 0 ? layer0PrecomputedNorm : nil
                 )
                 if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
                     asyncEval(h)
