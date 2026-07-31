@@ -402,8 +402,26 @@ inline void dequantize(uint8_t w, U scale, threadgroup U* w_local) {
 ///////////////////////////////////////////////////////////////////////////////
 
 // Per-group NVFP4 scale with fp4's 2^14 renormalization folded in (Change 1).
+constant float fp4nv_linear_scale_x16384[16] = {
+    0.0f,   32.0f,  64.0f,  96.0f,  128.0f, 160.0f, 192.0f, 224.0f,
+    256.0f, 288.0f, 320.0f, 352.0f, 384.0f, 416.0f, 448.0f, 480.0f};
+
 static inline float fp4nv_scale_x16384(uint8_t s) {
-  return float(*(thread fp8_e4m3*)(&s)) * 16384.0f;
+  // E4M3 encodings 0x00...0x0f are one linear run after the 2^14 fold:
+  // subnormals 0...7 map to 0, 32, ..., 224 and exponent-one values 8...15
+  // continue at 256, 288, ..., 480. Laguna's fixed checkpoint places
+  // 99.9667% of its group scales in this range. The fallback remains exact
+  // for every other positive or negative E4M3 byte.
+  if (s < 16u) {
+    return fp4nv_linear_scale_x16384[s];
+  }
+  // Carry the e4m3 sign bit into half's sign position while clearing the
+  // now-overflowed exponent bit. This is the same half bit pattern as the
+  // fp8_e4m3 conversion for every byte, without its select-and-negate chain.
+  ushort raw = ushort((uint(s) + uint(s & 128u)) << 7);
+  half converted = as_type<half>(raw);
+  converted *= 256.0h;
+  return float(converted) * 16384.0f;
 }
 
 // Four packed bytes -> one uint32 in little-endian nibble order. Read through
