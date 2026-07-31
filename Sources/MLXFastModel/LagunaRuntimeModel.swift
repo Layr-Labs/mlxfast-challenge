@@ -5787,6 +5787,26 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
             router_scores[lane] = my_score;
         }
         """
+    let compareExchange = """
+                // Give both lanes of a pair the same `(lower, upper)`
+                // argument orientation, keeping every comparator branch
+                // SIMD-coherent. The comparator is a strict total order and
+                // paired expert indices are distinct, so `a_before_b` is
+                // exactly `!b_before_a`; the sequence direction selects the
+                // needed orientation without a second comparator call.
+                float a_key = is_lower ? my_key : other_key;
+                uint a_index = is_lower ? my_index : other_index;
+                float b_key = is_lower ? other_key : my_key;
+                uint b_index = is_lower ? other_index : my_index;
+                bool b_before_a = laguna_router_key_before(
+                    b_key, b_index, a_key, a_index);
+                bool swap = b_before_a == lower_wants_better;
+                if (swap) {
+                    my_key = other_key;
+                    my_index = other_index;
+                    my_score = other_score;
+                }
+        """
     return """
         uint lane = thread_position_in_threadgroup.x;
 
@@ -5841,24 +5861,8 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
                 }
 
                 bool is_lower = (lane & stride) == 0;
-                float a_key = is_lower ? my_key : other_key;
-                uint a_index = is_lower ? my_index : other_index;
-                float a_score = is_lower ? my_score : other_score;
-                float b_key = is_lower ? other_key : my_key;
-                uint b_index = is_lower ? other_index : my_index;
-                float b_score = is_lower ? other_score : my_score;
-
                 bool lower_wants_better = (lane & sequence) == 0;
-                bool b_before_a = laguna_router_key_before(
-                    b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
-                if (swap) {
-                    my_key = is_lower ? b_key : a_key;
-                    my_index = is_lower ? b_index : a_index;
-                    my_score = is_lower ? b_score : a_score;
-                }
+        \(compareExchange)
             }
         }
 
@@ -5892,7 +5896,7 @@ private let lagunaDecodeRouterTop8Header = """
     """
 
 private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_v3",
+    name: "laguna_decode_router_top8_v4",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterTop8KernelSource(normalizing: false),
@@ -5901,7 +5905,7 @@ private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
 )
 
 private let lagunaDecodeRouterTop8NormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_norm_v2",
+    name: "laguna_decode_router_top8_norm_v3",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterTop8KernelSource(normalizing: true),
@@ -5974,11 +5978,10 @@ private let lagunaPrefillRouterTop8Enabled =
 private let lagunaPrefillMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_MOE_TAIL"] != "0"
 
-/// Default-off probe: keep the routed down projection in expert-sorted order
-/// and let the fused MoE tail gather each original `(token, slot)` row through
-/// `gatherSort`'s already-computed inverse permutation. This removes
-/// `scatterUnsort`'s full expert-bank copy without changing the eight-slot
-/// weighted reduction order.
+/// Keep the routed down projection in expert-sorted order and let the fused
+/// MoE tail gather each original `(token, slot)` row through `gatherSort`'s
+/// already-computed inverse permutation. This removes `scatterUnsort`'s full
+/// expert-bank copy without changing the eight-slot weighted reduction order.
 private let lagunaPrefillSortedMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_SORTED_MOE_TAIL"] != "0"
 
@@ -6199,21 +6202,17 @@ private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> Str
                 bool is_lower = (lane & stride) == 0;
                 float a_key = is_lower ? my_key : other_key;
                 uint a_index = is_lower ? my_index : other_index;
-                float a_score = is_lower ? my_score : other_score;
                 float b_key = is_lower ? other_key : my_key;
                 uint b_index = is_lower ? other_index : my_index;
-                float b_score = is_lower ? other_score : my_score;
 
                 bool lower_wants_better = (lane & sequence) == 0;
                 bool b_before_a = laguna_router_key_before(
                     b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                bool swap = b_before_a == lower_wants_better;
                 if (swap) {
-                    my_key = is_lower ? b_key : a_key;
-                    my_index = is_lower ? b_index : a_index;
-                    my_score = is_lower ? b_score : a_score;
+                    my_key = other_key;
+                    my_index = other_index;
+                    my_score = other_score;
                 }
             }
         }
@@ -6277,21 +6276,17 @@ private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> Str
                 bool is_lower = (lane & stride) == 0;
                 float a_key = is_lower ? my_key2 : other_key;
                 uint a_index = is_lower ? my_index2 : other_index;
-                float a_score = is_lower ? my_score2 : other_score;
                 float b_key = is_lower ? other_key : my_key2;
                 uint b_index = is_lower ? other_index : my_index2;
-                float b_score = is_lower ? other_score : my_score2;
 
                 bool lower_wants_better = (lane & sequence) == 0;
                 bool b_before_a = laguna_router_key_before(
                     b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                bool swap = b_before_a == lower_wants_better;
                 if (swap) {
-                    my_key2 = is_lower ? b_key : a_key;
-                    my_index2 = is_lower ? b_index : a_index;
-                    my_score2 = is_lower ? b_score : a_score;
+                    my_key2 = other_key;
+                    my_index2 = other_index;
+                    my_score2 = other_score;
                 }
             }
         }
@@ -6303,7 +6298,7 @@ private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> Str
 }
 
 private let lagunaPrefillRouterTournamentKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_router_tournament_v1",
+    name: "laguna_prefill_router_tournament_v2",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaPrefillRouterTournamentKernelSource(normalizing: false),
@@ -6312,7 +6307,7 @@ private let lagunaPrefillRouterTournamentKernel = MLXFast.metalKernel(
 )
 
 private let lagunaPrefillRouterTournamentNormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_router_tournament_norm_v1",
+    name: "laguna_prefill_router_tournament_norm_v2",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaPrefillRouterTournamentKernelSource(normalizing: true),
@@ -6524,9 +6519,11 @@ private let lagunaPrefillMoETailKernel = MLXFast.metalKernel(
 /// `scatterUnsort(...)[p]` would copy to original flattened slot `p`.
 /// Reading that row directly preserves the stock slot-0-through-slot-7 BF16
 /// multiply/add sequence while deleting the intervening 16 MiB copy at the
-/// ranked 512-token window.
+/// ranked 512-token window. Four adjacent columns travel as one `bfloat4`;
+/// Metal arithmetic is componentwise, and each component retains its own
+/// ordered expert-0-through-expert-7 BF16 product/add chain.
 private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_sorted_moe_tail_bf16_v1",
+    name: "laguna_prefill_sorted_moe_tail_bf16_v2",
     inputNames: [
         "sorted_expert_outputs", "inverse_order", "router_weights",
         "shared_output", "residual",
@@ -6541,26 +6538,29 @@ private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
         uint col = thread_position_in_grid.x * n_cols;
         const device float* weight_row = router_weights + row * experts;
 
-        bfloat expert_weights[experts];
-        uint sorted_rows[experts];
+        bfloat4 total = bfloat4(bfloat(0));
         for (uint e = 0; e < experts; ++e) {
-            expert_weights[e] = bfloat(weight_row[e]);
-            sorted_rows[e] = inverse_order[row * experts + e];
+            bfloat expert_weight = bfloat(weight_row[e]);
+            uint sorted_row = inverse_order[row * experts + e];
+            bfloat4 expert_values =
+                *reinterpret_cast<const device bfloat4*>(
+                    sorted_expert_outputs + sorted_row * hidden + col);
+            bfloat4 product = bfloat4(
+                expert_values * bfloat4(expert_weight));
+            total = bfloat4(product + total);
         }
-
-        for (uint i = 0; i < n_cols; ++i) {
-            bfloat total = bfloat(0);
-            for (uint e = 0; e < experts; ++e) {
-                bfloat product = bfloat(
-                    sorted_expert_outputs[sorted_rows[e] * hidden + col + i] *
-                    expert_weights[e]);
-                total = bfloat(product + total);
-            }
-            bfloat scaled = bfloat(total * bfloat(2.5f));
-            bfloat r2 = bfloat(scaled + shared_output[row * hidden + col + i]);
-            output[row * hidden + col + i] =
-                bfloat(residual[row * hidden + col + i] + r2);
-        }
+        bfloat4 scaled = bfloat4(
+            total * bfloat4(bfloat(2.5f)));
+        bfloat4 shared_values =
+            *reinterpret_cast<const device bfloat4*>(
+                shared_output + row * hidden + col);
+        bfloat4 r2 = bfloat4(scaled + shared_values);
+        bfloat4 residual_values =
+            *reinterpret_cast<const device bfloat4*>(
+                residual + row * hidden + col);
+        *reinterpret_cast<device bfloat4*>(
+            output + row * hidden + col) =
+            bfloat4(residual_values + r2);
         """,
     ensureRowContiguous: true
 )
