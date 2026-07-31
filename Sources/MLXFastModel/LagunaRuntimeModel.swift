@@ -5849,11 +5849,28 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
                 float b_score = is_lower ? other_score : my_score;
 
                 bool lower_wants_better = (lane & sequence) == 0;
+                // One comparator call, not two. `laguna_router_key_before` is a
+                // strict total order and the two operands always carry distinct
+                // indices: `my_index` starts as `lane` and the network only ever
+                // permutes the (key, index, score) triples, so the indices stay
+                // a permutation of 0..255 and no comparison can tie in both key
+                // AND index. Under that invariant `a_before_b == !b_before_a`
+                // identically, so the selection collapses to an equality test
+                // against `lower_wants_better`.
+                //
+                // The invariant is load-bearing: if both key and index tied,
+                // both calls would return false and the identity would break.
+                // That case cannot arise here, but any future change that lets
+                // two lanes carry the same index must revisit this.
+                //
+                // Drops a call whose body is 2 isnan plus branches from every
+                // stage of every router network. No float is computed here, so
+                // there is no accumulation order to perturb, and the boolean
+                // result is unchanged -- the selected experts, their scores and
+                // their rank order are bit-identical.
                 bool b_before_a = laguna_router_key_before(
                     b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                bool swap = (b_before_a == lower_wants_better);
                 if (swap) {
                     my_key = is_lower ? b_key : a_key;
                     my_index = is_lower ? b_index : a_index;
@@ -6205,11 +6222,28 @@ private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> Str
                 float b_score = is_lower ? other_score : my_score;
 
                 bool lower_wants_better = (lane & sequence) == 0;
+                // One comparator call, not two. `laguna_router_key_before` is a
+                // strict total order and the two operands always carry distinct
+                // indices: `my_index` starts as `lane` and the network only ever
+                // permutes the (key, index, score) triples, so the indices stay
+                // a permutation of 0..255 and no comparison can tie in both key
+                // AND index. Under that invariant `a_before_b == !b_before_a`
+                // identically, so the selection collapses to an equality test
+                // against `lower_wants_better`.
+                //
+                // The invariant is load-bearing: if both key and index tied,
+                // both calls would return false and the identity would break.
+                // That case cannot arise here, but any future change that lets
+                // two lanes carry the same index must revisit this.
+                //
+                // Drops a call whose body is 2 isnan plus branches from every
+                // stage of every router network. No float is computed here, so
+                // there is no accumulation order to perturb, and the boolean
+                // result is unchanged -- the selected experts, their scores and
+                // their rank order are bit-identical.
                 bool b_before_a = laguna_router_key_before(
                     b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                bool swap = (b_before_a == lower_wants_better);
                 if (swap) {
                     my_key = is_lower ? b_key : a_key;
                     my_index = is_lower ? b_index : a_index;
@@ -6283,11 +6317,28 @@ private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> Str
                 float b_score = is_lower ? other_score : my_score2;
 
                 bool lower_wants_better = (lane & sequence) == 0;
+                // One comparator call, not two. `laguna_router_key_before` is a
+                // strict total order and the two operands always carry distinct
+                // indices: `my_index` starts as `lane` and the network only ever
+                // permutes the (key, index, score) triples, so the indices stay
+                // a permutation of 0..255 and no comparison can tie in both key
+                // AND index. Under that invariant `a_before_b == !b_before_a`
+                // identically, so the selection collapses to an equality test
+                // against `lower_wants_better`.
+                //
+                // The invariant is load-bearing: if both key and index tied,
+                // both calls would return false and the identity would break.
+                // That case cannot arise here, but any future change that lets
+                // two lanes carry the same index must revisit this.
+                //
+                // Drops a call whose body is 2 isnan plus branches from every
+                // stage of every router network. No float is computed here, so
+                // there is no accumulation order to perturb, and the boolean
+                // result is unchanged -- the selected experts, their scores and
+                // their rank order are bit-identical.
                 bool b_before_a = laguna_router_key_before(
                     b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                bool swap = (b_before_a == lower_wants_better);
                 if (swap) {
                     my_key2 = is_lower ? b_key : a_key;
                     my_index2 = is_lower ? b_index : a_index;
