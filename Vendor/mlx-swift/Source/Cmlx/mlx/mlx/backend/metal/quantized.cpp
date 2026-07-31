@@ -1305,10 +1305,10 @@ int darkbloom_expert_gather_groups() {
   static const int v = [] {
     auto s = env::get_var("DARKBLOOM_EXPERT_GATHER_GROUPS", "");
     if (s.empty()) {
-      return 256;
+      return 128;
     }
     int n = std::atoi(s.c_str());
-    return (n > 0 && (256 % n) == 0) ? n : 256;
+    return (n > 0 && (256 % n) == 0) ? n : 128;
   }();
   return v;
 }

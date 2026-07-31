@@ -20,7 +20,7 @@ const char* steel_attention_nax() {
 // once, when the library source string is assembled, so exactly one variant is
 // ever compiled per process.
 #ifndef DARKBLOOM_ATTN_QHOIST
-#define DARKBLOOM_ATTN_QHOIST 0
+#define DARKBLOOM_ATTN_QHOIST 1
 #endif
 
 // DARKBLOOM_ATTN_QBLOCK_MAJOR default. DEFAULT ON for the standalone ranked

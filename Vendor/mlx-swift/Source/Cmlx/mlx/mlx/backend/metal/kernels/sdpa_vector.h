@@ -292,8 +292,8 @@ template <
 
   // DARKBLOOM_GQA_PAIR_HEADS: preserve each head's exact key order and
   // reduction tree while sharing the K/V device reads across adjacent heads.
-  if constexpr (D == 128 && V == 128 && DARKBLOOM_GQA_PAIR_HEADS == 2) {
   const bool use_gqa_pair =
+      D == 128 && V == 128 && DARKBLOOM_GQA_PAIR_HEADS == 2 &&
       (gqa_factor == 8 || gqa_factor == 6) &&
       tpg.y == 1 && (tpg.x % 2) == 0 &&
       !has_mask && !do_causal && !has_sinks;
@@ -341,46 +341,17 @@ template <
     U pair_sum0 = 0;
     U pair_sum1 = 0;
 
-    // Two-deep software pipeline, loads hoisted: both positions' K and V
-    // rows are read at the top of the trip, then the two positions are
-    // accumulated strictly in order (i before i+BN). Per-position FP
-    // sequence is character-identical to stock; only load placement moved,
-    // and loads have no side effects (no device stores occur in the loop).
-    int i = simd_gid;
-    for (; i + BN < N; i += 2 * BN) {
-      const device T* pipe_keys_b = pair_keys + inner_k_stride;
-      const device T* pipe_values_b = pair_values + inner_v_stride;
-      U pipe_ka[4];
-      U pipe_kb[4];
-      pipe_ka[0] = pair_keys[0];
-      pipe_ka[1] = pair_keys[1];
-      pipe_ka[2] = pair_keys[2];
-      pipe_ka[3] = pair_keys[3];
-      pipe_kb[0] = pipe_keys_b[0];
-      pipe_kb[1] = pipe_keys_b[1];
-      pipe_kb[2] = pipe_keys_b[2];
-      pipe_kb[3] = pipe_keys_b[3];
-      const T pipe_va0 = pair_values[0];
-      const T pipe_va1 = pair_values[1];
-      const T pipe_va2 = pair_values[2];
-      const T pipe_va3 = pair_values[3];
-      const T pipe_vb0 = pipe_values_b[0];
-      const T pipe_vb1 = pipe_values_b[1];
-      const T pipe_vb2 = pipe_values_b[2];
-      const T pipe_vb3 = pipe_values_b[3];
-      // Manual full unroll of the qk_per_thread == 4 element loop. Same
-      // loads, same fmuladd chain order per score: identical FP sequence.
+    for (int i = simd_gid; i < N; i += BN) {
+      for (int j = 0; j < qk_per_thread; ++j) {
+        pair_k[j] = pair_keys[j];
+      }
 
       U pair_score0 = 0;
       U pair_score1 = 0;
-      pair_score0 += pair_q0[0] * pipe_ka[0];
-      pair_score1 += pair_q1[0] * pipe_ka[0];
-      pair_score0 += pair_q0[1] * pipe_ka[1];
-      pair_score1 += pair_q1[1] * pipe_ka[1];
-      pair_score0 += pair_q0[2] * pipe_ka[2];
-      pair_score1 += pair_q1[2] * pipe_ka[2];
-      pair_score0 += pair_q0[3] * pipe_ka[3];
-      pair_score1 += pair_q1[3] * pipe_ka[3];
+      for (int j = 0; j < qk_per_thread; ++j) {
+        pair_score0 += pair_q0[j] * pair_k[j];
+        pair_score1 += pair_q1[j] * pair_k[j];
+      }
       pair_score0 = simd_sum(pair_score0);
       pair_score1 = simd_sum(pair_score1);
 
@@ -398,105 +369,14 @@ template <
       pair_sum0 = pair_sum0 * pair_factor0 + pair_exp0;
       pair_sum1 = pair_sum1 * pair_factor1 + pair_exp1;
 
-      pair_o0[0] = pair_o0[0] * pair_factor0 + pair_exp0 * pipe_va0;
-      pair_o1[0] = pair_o1[0] * pair_factor1 + pair_exp1 * pipe_va0;
-      pair_o0[1] = pair_o0[1] * pair_factor0 + pair_exp0 * pipe_va1;
-      pair_o1[1] = pair_o1[1] * pair_factor1 + pair_exp1 * pipe_va1;
-      pair_o0[2] = pair_o0[2] * pair_factor0 + pair_exp0 * pipe_va2;
-      pair_o1[2] = pair_o1[2] * pair_factor1 + pair_exp1 * pipe_va2;
-      pair_o0[3] = pair_o0[3] * pair_factor0 + pair_exp0 * pipe_va3;
-      pair_o1[3] = pair_o1[3] * pair_factor1 + pair_exp1 * pipe_va3;
+      for (int j = 0; j < v_per_thread; ++j) {
+        const T pair_value = pair_values[j];
+        pair_o0[j] = pair_o0[j] * pair_factor0 + pair_exp0 * pair_value;
+        pair_o1[j] = pair_o1[j] * pair_factor1 + pair_exp1 * pair_value;
+      }
 
-      // Manual full unroll of the qk_per_thread == 4 element loop. Same
-      // loads, same fmuladd chain order per score: identical FP sequence.
-
-      U pipeb_score0 = 0;
-      U pipeb_score1 = 0;
-      pipeb_score0 += pair_q0[0] * pipe_kb[0];
-      pipeb_score1 += pair_q1[0] * pipe_kb[0];
-      pipeb_score0 += pair_q0[1] * pipe_kb[1];
-      pipeb_score1 += pair_q1[1] * pipe_kb[1];
-      pipeb_score0 += pair_q0[2] * pipe_kb[2];
-      pipeb_score1 += pair_q1[2] * pipe_kb[2];
-      pipeb_score0 += pair_q0[3] * pipe_kb[3];
-      pipeb_score1 += pair_q1[3] * pipe_kb[3];
-      pipeb_score0 = simd_sum(pipeb_score0);
-      pipeb_score1 = simd_sum(pipeb_score1);
-
-      U pipeb_new_max0 = max(pair_max0, pipeb_score0);
-      U pipeb_new_max1 = max(pair_max1, pipeb_score1);
-      U pipeb_factor0;
-      U pipeb_factor1;
-      DARKBLOOM_RESCALE_FACTOR(pipeb_factor0, pair_max0 - pipeb_new_max0);
-      DARKBLOOM_RESCALE_FACTOR(pipeb_factor1, pair_max1 - pipeb_new_max1);
-      U pipeb_exp0 = fast::exp(pipeb_score0 - pipeb_new_max0);
-      U pipeb_exp1 = fast::exp(pipeb_score1 - pipeb_new_max1);
-
-      pair_max0 = pipeb_new_max0;
-      pair_max1 = pipeb_new_max1;
-      pair_sum0 = pair_sum0 * pipeb_factor0 + pipeb_exp0;
-      pair_sum1 = pair_sum1 * pipeb_factor1 + pipeb_exp1;
-
-      pair_o0[0] = pair_o0[0] * pipeb_factor0 + pipeb_exp0 * pipe_vb0;
-      pair_o1[0] = pair_o1[0] * pipeb_factor1 + pipeb_exp1 * pipe_vb0;
-      pair_o0[1] = pair_o0[1] * pipeb_factor0 + pipeb_exp0 * pipe_vb1;
-      pair_o1[1] = pair_o1[1] * pipeb_factor1 + pipeb_exp1 * pipe_vb1;
-      pair_o0[2] = pair_o0[2] * pipeb_factor0 + pipeb_exp0 * pipe_vb2;
-      pair_o1[2] = pair_o1[2] * pipeb_factor1 + pipeb_exp1 * pipe_vb2;
-      pair_o0[3] = pair_o0[3] * pipeb_factor0 + pipeb_exp0 * pipe_vb3;
-      pair_o1[3] = pair_o1[3] * pipeb_factor1 + pipeb_exp1 * pipe_vb3;
-
-      pair_keys += 2 * inner_k_stride;
-      pair_values += 2 * inner_v_stride;
-    }
-    if (i < N) {
-      pair_k[0] = pair_keys[0];
-      pair_k[1] = pair_keys[1];
-      pair_k[2] = pair_keys[2];
-      pair_k[3] = pair_keys[3];
-      const T pipe_va0 = pair_values[0];
-      const T pipe_va1 = pair_values[1];
-      const T pipe_va2 = pair_values[2];
-      const T pipe_va3 = pair_values[3];
-      // Manual full unroll of the qk_per_thread == 4 element loop. Same
-      // loads, same fmuladd chain order per score: identical FP sequence.
-
-      U pair_score0 = 0;
-      U pair_score1 = 0;
-      pair_score0 += pair_q0[0] * pair_k[0];
-      pair_score1 += pair_q1[0] * pair_k[0];
-      pair_score0 += pair_q0[1] * pair_k[1];
-      pair_score1 += pair_q1[1] * pair_k[1];
-      pair_score0 += pair_q0[2] * pair_k[2];
-      pair_score1 += pair_q1[2] * pair_k[2];
-      pair_score0 += pair_q0[3] * pair_k[3];
-      pair_score1 += pair_q1[3] * pair_k[3];
-      pair_score0 = simd_sum(pair_score0);
-      pair_score1 = simd_sum(pair_score1);
-
-      U pair_new_max0 = max(pair_max0, pair_score0);
-      U pair_new_max1 = max(pair_max1, pair_score1);
-      U pair_factor0;
-      U pair_factor1;
-      DARKBLOOM_RESCALE_FACTOR(pair_factor0, pair_max0 - pair_new_max0);
-      DARKBLOOM_RESCALE_FACTOR(pair_factor1, pair_max1 - pair_new_max1);
-      U pair_exp0 = fast::exp(pair_score0 - pair_new_max0);
-      U pair_exp1 = fast::exp(pair_score1 - pair_new_max1);
-
-      pair_max0 = pair_new_max0;
-      pair_max1 = pair_new_max1;
-      pair_sum0 = pair_sum0 * pair_factor0 + pair_exp0;
-      pair_sum1 = pair_sum1 * pair_factor1 + pair_exp1;
-
-      pair_o0[0] = pair_o0[0] * pair_factor0 + pair_exp0 * pipe_va0;
-      pair_o1[0] = pair_o1[0] * pair_factor1 + pair_exp1 * pipe_va0;
-      pair_o0[1] = pair_o0[1] * pair_factor0 + pair_exp0 * pipe_va1;
-      pair_o1[1] = pair_o1[1] * pair_factor1 + pair_exp1 * pipe_va1;
-      pair_o0[2] = pair_o0[2] * pair_factor0 + pair_exp0 * pipe_va2;
-      pair_o1[2] = pair_o1[2] * pair_factor1 + pair_exp1 * pipe_va2;
-      pair_o0[3] = pair_o0[3] * pair_factor0 + pair_exp0 * pipe_va3;
-      pair_o1[3] = pair_o1[3] * pair_factor1 + pair_exp1 * pipe_va3;
-
+      pair_keys += inner_k_stride;
+      pair_values += inner_v_stride;
     }
 
     // Each head keeps the promoted two-plane combine shape. The additive
@@ -572,7 +452,6 @@ template <
       }
     }
     return;
-  }
   }
 
   thread U q[qk_per_thread];
