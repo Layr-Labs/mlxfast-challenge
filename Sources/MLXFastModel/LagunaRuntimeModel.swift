@@ -243,10 +243,24 @@ let lagunaPrefillFusedResidualRMSNormEnabled =
 
 /// Issues the routed and shared gate/up NVFP4 QMVs as one nine-slot dispatch
 /// (see `lagunaRoutedSharedSwiGLUQMVKernel`). Set
-/// `DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV=0` to ablate.
+/// `DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV=1` to restore the merge.
+///
+/// DEFAULT OFF: the merge is a dependency-chain pessimisation on the decode
+/// step. The routed half consumes `inds`, so the merged dispatch cannot be
+/// enqueued until the top-8 kernel retires -- but the shared half consumes
+/// only `x`, which is ready the moment `residual+rmsnorm+router` lands.
+/// Merging therefore parks the shared expert's gate/up work behind a dispatch
+/// it has no data dependency on. Splitting spends one extra dispatch per
+/// sparse layer to expose that work for overlap, and measured **+0.98% on the
+/// ranked M5** (submission 796ebd80, 1.88971780141921 -> 1.89954042203194).
+///
+/// Splitting is arithmetically inert: each half keeps its own kernel, its own
+/// row mapping, and its own accumulation order -- the merged form was built
+/// from these two kernels, so splitting returns each row to the same code path
+/// with the same operand order and the same reduction tree.
 let lagunaFusedRoutedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment[
-        "DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV"] != "0"
+        "DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV"] == "1"
 
 /// Scheduling A/B for the merged routed/shared gate/up kernel. The proven R2
 /// schedule is the default; only an explicit selector value of `4` opts into
@@ -5218,6 +5232,21 @@ func lagunaRoutedSharedDownResidual(
     precondition(residual.dtype == .bfloat16)
     precondition(residual.shape == [1, 1, LagunaConstants.hiddenSize])
 
+    // INPUT ORDER IS LOAD-BEARING — do not reorder for tidiness.
+    //
+    // MLX builds its tape breadth-first from the synchronizer and executes it
+    // in reverse, emitting a buffer-scope barrier only when a dispatch reads a
+    // previous dispatch's output. `routedActivated` arriving BEFORE
+    // `sharedActivated` is what makes the BFS push the routed gate/up QMV ahead
+    // of the shared one, which lands the shared QMV in the same barrier group as
+    // the router top-8 kernel and lets the two run concurrently. The shared half
+    // depends only on the normalized row, not on `inds`, so it has no reason to
+    // wait for the top-8 — that overlap is the whole point of issuing the two
+    // gate/up QMVs separately (see `DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV`).
+    //
+    // Putting `sharedActivated` first re-orders execution to G, T, R, S, D; the
+    // shared QMV then falls into the routed QMV's barrier group and the overlap
+    // silently disappears. No arithmetic changes, no test fails, no warning.
     return lagunaRoutedSharedDownResidualKernel(
         [
             routedActivated, routedDownWeight, routedDownScales,
@@ -5849,11 +5878,20 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
                 float b_score = is_lower ? other_score : my_score;
 
                 bool lower_wants_better = (lane & sequence) == 0;
+                // `laguna_router_key_before` is a strict total order and the
+                // two operands always carry distinct indices -- `my_index`
+                // starts as `lane` and the network only ever permutes the
+                // (key, index, score) triples, so the indices stay a
+                // permutation of 0..255 and no comparison ever sees a tie in
+                // both key AND index. Under those conditions
+                // `a_before_b == !b_before_a` identically, which collapses to
+                // an equality test against `lower_wants_better` and drops the
+                // second comparator call (2 isnan plus branches) from every
+                // stage. Boolean result is unchanged; no float is computed
+                // here, so there is no accumulation order to perturb.
                 bool b_before_a = laguna_router_key_before(
                     b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                bool swap = (b_before_a == lower_wants_better);
                 if (swap) {
                     my_key = is_lower ? b_key : a_key;
                     my_index = is_lower ? b_index : a_index;
@@ -6205,11 +6243,20 @@ private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> Str
                 float b_score = is_lower ? other_score : my_score;
 
                 bool lower_wants_better = (lane & sequence) == 0;
+                // `laguna_router_key_before` is a strict total order and the
+                // two operands always carry distinct indices -- `my_index`
+                // starts as `lane` and the network only ever permutes the
+                // (key, index, score) triples, so the indices stay a
+                // permutation of 0..255 and no comparison ever sees a tie in
+                // both key AND index. Under those conditions
+                // `a_before_b == !b_before_a` identically, which collapses to
+                // an equality test against `lower_wants_better` and drops the
+                // second comparator call (2 isnan plus branches) from every
+                // stage. Boolean result is unchanged; no float is computed
+                // here, so there is no accumulation order to perturb.
                 bool b_before_a = laguna_router_key_before(
                     b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                bool swap = (b_before_a == lower_wants_better);
                 if (swap) {
                     my_key = is_lower ? b_key : a_key;
                     my_index = is_lower ? b_index : a_index;
@@ -6283,11 +6330,20 @@ private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> Str
                 float b_score = is_lower ? other_score : my_score2;
 
                 bool lower_wants_better = (lane & sequence) == 0;
+                // `laguna_router_key_before` is a strict total order and the
+                // two operands always carry distinct indices -- `my_index`
+                // starts as `lane` and the network only ever permutes the
+                // (key, index, score) triples, so the indices stay a
+                // permutation of 0..255 and no comparison ever sees a tie in
+                // both key AND index. Under those conditions
+                // `a_before_b == !b_before_a` identically, which collapses to
+                // an equality test against `lower_wants_better` and drops the
+                // second comparator call (2 isnan plus branches) from every
+                // stage. Boolean result is unchanged; no float is computed
+                // here, so there is no accumulation order to perturb.
                 bool b_before_a = laguna_router_key_before(
                     b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                bool swap = (b_before_a == lower_wants_better);
                 if (swap) {
                     my_key2 = is_lower ? b_key : a_key;
                     my_index2 = is_lower ? b_index : a_index;
@@ -6344,6 +6400,26 @@ private func lagunaPrefillRouterTournament(
 private let lagunaPrefillRouterTournamentEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ROUTER_TOURNAMENT"] != "0"
 
+/// Route the single-token decode row through the same tournament network the
+/// prefill path already uses. Set `DARKBLOOM_DECODE_ROUTER_TOURNAMENT=0` to
+/// fall back to `lagunaDecodeRouterTop8`.
+///
+/// Both kernels run the identical 36-stage bitonic schedule over the identical
+/// total order, so the selected experts and their scores are bit-identical.
+/// They differ only in WHERE each stage exchanges operands: the decode kernel
+/// spreads 256 elements over 8 simdgroups, so its six stride >= 32 stages must
+/// round-trip through 3 KiB of threadgroup memory behind 12 barriers, while the
+/// tournament keeps phase 1 entirely in-simdgroup (`simd_shuffle_xor`, no
+/// barrier) and crosses a boundary only in phase 2 -- 3 barriers and one
+/// threadgroup exchange in total.
+///
+/// The normalizing epilogue matches on both arms: decode gates it on
+/// `normTopkProb && DARKBLOOM_FUSED_ROUTER_NORM` (the latter default ON) and
+/// the tournament on `normTopkProb`; when it is off, both leave the weights
+/// unnormalized for the shared `if normTopkProb` tail.
+private let lagunaDecodeRouterTournamentEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ROUTER_TOURNAMENT"] != "0"
+
 /// Sigmoid top-k router. The routing math mirrors the vendored
 /// `LagunaMoEGate` exactly (sigmoid scores, correction bias added only for
 /// expert CHOICE, mixture weights taken from the pre-bias scores, optional
@@ -6372,17 +6448,27 @@ final class LagunaRuntimeMoEGate: Module {
         let projectedLogits = logits ?? x.matmul(weight.T)
         let inds: MLXArray
         var weights: MLXArray
-        if lagunaPrefillRouterTournamentEnabled,
+        // The tournament network is row-general, so the only thing that kept it
+        // off the decode row was this call site. Decode keeps its own flag so
+        // the two phases stay independently ablatable.
+        let tournamentRows = projectedLogits.ndim == 3 ? projectedLogits.dim(1) : 0
+        let tournamentEligible =
+            tournamentRows > 1
+            ? lagunaPrefillRouterTournamentEnabled
+            : (tournamentRows == 1 && lagunaDecodeRouterTournamentEnabled)
+        if tournamentEligible,
             routerLogitSoftcapping == 0,
             topK == 8,
             projectedLogits.dtype == .bfloat16,
             projectedLogits.ndim == 3,
             projectedLogits.dim(0) == 1,
-            projectedLogits.dim(1) > 1,
             projectedLogits.dim(2) == 256,
             eScoreCorrectionBias.size == 256
         {
-            lagunaTrace("prefill router tournament")
+            lagunaTrace(
+                tournamentRows > 1
+                    ? "prefill router tournament"
+                    : "decode router tournament")
             return lagunaPrefillRouterTournament(
                 logits: projectedLogits,
                 correctionBias: eScoreCorrectionBias.asType(.float32),
