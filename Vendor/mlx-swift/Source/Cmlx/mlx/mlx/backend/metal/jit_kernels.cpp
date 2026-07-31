@@ -1307,6 +1307,26 @@ const char* darkbloom_attn_qblock_zigzag_define() {
   return enabled ? "" : "\n#define DARKBLOOM_ATTN_QBLOCK_ZIGZAG 0\n";
 }
 
+// DARKBLOOM_ATTN_QBLOCK_DESCEND: present the qblock-major batches heaviest
+// first (LPT) instead of the zigzag high/low interleave. Default ON; it
+// supersedes the zigzag arm, and an explicit
+// DARKBLOOM_ATTN_QBLOCK_DESCEND=0 restores the shipped zigzag order.
+// See the long note above the define in steel_attention_nax.h / .cpp for the
+// scheduling argument, the harness numbers and the exactness proof. Same
+// #define-not-function-constant discipline as the arms above.
+const char* darkbloom_attn_qblock_descend_define() {
+  static const bool enabled = [] {
+    const bool v =
+        env::get_var("DARKBLOOM_ATTN_QBLOCK_DESCEND", "1") != "0";
+    if (env::get_var("DARKBLOOM_ATTN_TRACE", "") == "1") {
+      fprintf(
+          stderr, "mlxfast: attn qblock-descend: enabled=%d\n", int(v));
+    }
+    return v;
+  }();
+  return enabled ? "" : "\n#define DARKBLOOM_ATTN_QBLOCK_DESCEND 0\n";
+}
+
 } // namespace
 
 MTL::ComputePipelineState* get_steel_attention_nax_kernel(
@@ -1330,6 +1350,7 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
         darkbloom_attn_qhoist_define(),
         darkbloom_attn_qblock_major_define(),
         darkbloom_attn_qblock_zigzag_define(),
+        darkbloom_attn_qblock_descend_define(),
         metal::steel_attention_nax(),
         get_template_definition(
             lib_name,
