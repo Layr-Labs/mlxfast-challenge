@@ -372,15 +372,33 @@ public final class LagunaRuntimeWeightCache {
                 // allocations are permanently resident, MLX's stock 50 MiB
                 // referenced-byte commit threshold splits every sparse layer
                 // across several command buffers even though the layer's
-                // weights no longer create residency pressure. A 512 MiB
-                // budget fits one complete decode layer (attention plus the
-                // routed/shared gate-up and down banks are ~507 MiB for the
-                // 200 MB / 200-op command buffers: the post-anupsv-loader regime
-                // re-test winner (6 Latin pairs: decode 5/6, prefill 4/6). Explicit
-                // MLX_ values win; DARKBLOOM kill switch supports same-binary A/B.
+                // weights no longer create residency pressure. 200 MB / 200-op
+                // was the post-anupsv-loader regime re-test winner (6 Latin
+                // pairs: decode 5/6, prefill 4/6); three structural shifts have
+                // landed since (attention INT8 requant, stride-1 prefill
+                // ladder, argmax pre-warm), and a Metal System Trace on the
+                // ranked frontier now measures decode steady state at ~44
+                // command buffers per step with ~0.5 ms/step of inter-CB idle
+                // (~7% of a step). The split arithmetic: `needs_commit` charges
+                // each op's UNIQUE referenced input buffers at full
+                // `data_size()` (elements, not bytes), so a decode layer's
+                // gather-QMM charges the whole 256-expert bank (~186
+                // counter-MB/layer: ~165 from NVFP4 expert banks as packed
+                // uint32 + ~21 from INT8 attention, which counts 4x heavier per
+                // byte than packed codes) even though only 8 experts are read.
+                // At 200 that fires roughly once per layer (~37 MB-splits + 6
+                // decode-ladder boundaries ~= the measured ~44), while the
+                // 200-op cap never binds (~11 dispatches/CB). Decode is one
+                // serial dependency chain, so every CB boundary is a full
+                // pipeline drain (~11 us each); 300 cuts the boundary count to
+                // ~1 per 1.6 layers (~31 CBs/step) and the at:1,7,15,23,31,39
+                // ladder still guarantees early GPU kickoff, which removes the
+                // large-CB submission-latency penalty the older 200>300 U-curve
+                // point was measured under. Explicit MLX_ values win; DARKBLOOM
+                // kill switch supports same-binary A/B.
                 let env = ProcessInfo.processInfo.environment
                 if env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" {
-                    setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
+                    setenv("MLX_MAX_MB_PER_BUFFER", "300", 0)
                     setenv("MLX_MAX_OPS_PER_BUFFER", "200", 0)
                 }
                 startupMemoryPolicy = nil
