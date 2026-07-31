@@ -2528,6 +2528,175 @@ func lagunaGateProductSoftplus(
     )[0]
 }
 
+// MARK: - Fused input RMSNorm + affine-INT8 QKV projection (decode)
+
+/// Decode-only fusion of the pre-attention input RMSNorm and the group-32
+/// affine-INT8 QKV(+folded gate) projection, for the native-affine attention
+/// layers whose gate rides the QKV bank (the INT8 layers; the NVFP4-tail
+/// layers keep a separate gate bank and are excluded). The stock chain is two
+/// dispatches — `rms_single_row` at axis_size 2048 producing the BF16
+/// normalized row, then the stock `quantizedMM` (a `qmv_fast<bfloat16_t,32,8>`
+/// GEMV, M == 1) over the packed `[Q; K; V; gate]` bank. This kernel issues
+/// one:
+///  * phase 1 replicates the RMSNorm exactly — the same rms_single_row
+///    reproduction `lagunaFusedNormQKVProjection` uses: FP32 sum-of-squares,
+///    `precise::rsqrt(acc / 2048 + 1e-6)`, and the single BF16 rounding of
+///    `norm_weight * bfloat(raw * inv_mean)` — writing the BF16 normalized row
+///    into threadgroup memory. It is recomputed per threadgroup (the router /
+///    gate kernels' redundant-read pattern); the 4 KB row stays L2-resident.
+///  * phase 2 replicates `qmv_fast_impl<bfloat16_t, 32, 8>` for this
+///    threadgroup's 64-row block, line-for-line the vendored arithmetic (the
+///    per-256-block `sum`, `result += s * accum + sum * b`, `l / 4` scale
+///    groups, `simd_sum` reduction, and the single BF16 rounding of each
+///    logit). Every output row's K loop is independent of which rows share the
+///    dispatch, so every Q/K/V/gate element is bit-identical to the
+///    two-dispatch chain.
+private func lagunaFusedNormAffineQKVSource(heads: Int) -> String {
+    let totalRows =
+        heads * LagunaConstants.headDim
+        + 2 * LagunaConstants.numKeyValueHeads * LagunaConstants.headDim
+        + heads
+    return """
+    constexpr int total_rows = \(totalRows);
+    constexpr uint in_vec_size = \(LagunaConstants.hiddenSize);
+    constexpr float norm_eps = 1.0e-6f;
+    constexpr uint values_per_thread = in_vec_size / 512;
+    constexpr uint in_vec_size_w = \(LagunaConstants.hiddenSize);
+    constexpr uint in_vec_size_g = \(LagunaConstants.hiddenSize / 32);
+
+    uint local_id = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+
+    \(lagunaNormInvMeanScratch)
+    threadgroup float local_sums[32];
+    threadgroup bfloat normalized_row[in_vec_size];
+
+    // ---- phase 1: input RMSNorm, mirroring rms_single_row at 512 threads ----
+    uint norm_base = local_id * values_per_thread;
+    thread float raw[values_per_thread];
+    float acc = 0.0f;
+    for (uint i = 0; i < values_per_thread; ++i) {
+        raw[i] = float(residual[norm_base + i]);
+        acc += raw[i] * raw[i];
+    }
+    acc = simd_sum(acc);
+    \(lagunaNormReductionTailQKV)
+    for (uint i = 0; i < values_per_thread; ++i) {
+        normalized_row[norm_base + i] =
+            norm_weight[norm_base + i] * bfloat(raw[i] * laguna_inv_mean);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- phase 2: qmv_fast_impl<bfloat16_t, 32, 8> over a 64-row block ----
+    uint row_base = threadgroup_position_in_grid.x * 64;
+    int unit = simd_group / 2;
+    int sub = simd_group % 2;
+    int out_row = int(row_base) + unit * 8 + sub * 4;
+    uint xoff = lane * 8;
+
+    thread float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint k = 0; k < in_vec_size; k += 256) {
+        thread float x_thread[8];
+        float sum = 0.0f;
+        for (uint i = 0; i < 8; ++i) {
+            float xv = float(normalized_row[k + xoff + i]);
+            sum += xv;
+            x_thread[i] = xv;
+        }
+        for (int row = 0; row < 4; ++row) {
+            int r = out_row + row;
+            if (r >= total_rows) { continue; }
+            const device uint8_t* wl =
+                (const device uint8_t*)qkv_codes
+                + r * in_vec_size_w + (k + lane * 8);
+            float s = float(
+                qkv_scales[r * in_vec_size_g + (k / 256) * 8 + lane / 4]);
+            float b = float(
+                qkv_biases[r * in_vec_size_g + (k / 256) * 8 + lane / 4]);
+            float accum = 0.0f;
+            for (uint i = 0; i < 8; ++i) {
+                accum += x_thread[i] * float(wl[i]);
+            }
+            result[row] += s * accum + sum * b;
+        }
+    }
+    for (int row = 0; row < 4; ++row) {
+        result[row] = simd_sum(result[row]);
+        int r = out_row + row;
+        if (lane == 0 && r < total_rows) {
+            qkv[r] = bfloat(result[row]);
+        }
+    }
+    """
+}
+
+private let lagunaFusedNormAffineQKVKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_fused_norm_affine_qkv_bf16_h\(heads)_v1",
+            inputNames: [
+                "residual", "norm_weight", "qkv_codes", "qkv_scales",
+                "qkv_biases",
+            ],
+            outputNames: ["qkv"],
+            source: lagunaFusedNormAffineQKVSource(heads: heads),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+/// Set `DARKBLOOM_FUSED_NORM_QKV_AFFINE=0` to ablate (separate input RMSNorm +
+/// stock `quantizedMM` QKV) inside the same binary.
+private let lagunaFusedNormQKVAffineEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_NORM_QKV_AFFINE"] != "0"
+
+/// Fused input RMSNorm + affine-INT8 QKV(+folded gate) projection, or nil when
+/// the preconditions do not hold. Bit-identical to `inputNorm(input)` followed
+/// by the stock `quantizedMM` over the folded bank; see the kernel commentary.
+/// The bank must be the folded `[Q; K; V; gate]` group-32 INT8 bank (its row
+/// count is `heads * head_dim + 2 * kv * head_dim + heads`, matching the
+/// kernel's compiled `total_rows`), so callers restrict this to the INT8
+/// layers where `_nativeAffineQKVGateRows == nHeads`.
+func lagunaFusedNormAffineQKV(
+    residual: MLXArray, normWeight: MLXArray,
+    bank: LagunaNativeAffineWeight, heads: Int
+) -> MLXArray? {
+    guard lagunaFusedNormQKVAffineEnabled,
+        bank.mode == .affine, bank.bits == 8, bank.groupSize == 32,
+        let biases = bank.biases,
+        let kernel = lagunaFusedNormAffineQKVKernels[heads]
+    else { return nil }
+    let hidden = LagunaConstants.hiddenSize
+    let totalRows =
+        heads * LagunaConstants.headDim
+        + 2 * LagunaConstants.numKeyValueHeads * LagunaConstants.headDim
+        + heads
+    guard bank.originalShape == [totalRows, hidden] else { return nil }
+    precondition(residual.dtype == .bfloat16)
+    precondition(residual.shape == [1, 1, hidden])
+    precondition(normWeight.dtype == .bfloat16)
+    precondition(normWeight.shape == [hidden])
+    precondition(bank.packedCodes.dtype == .uint32)
+    precondition(bank.packedCodes.shape == [totalRows, hidden / 4])
+    precondition(bank.scales.dtype == .bfloat16)
+    precondition(bank.scales.shape == [totalRows, hidden / 32])
+    precondition(biases.dtype == .bfloat16)
+    precondition(biases.shape == [totalRows, hidden / 32])
+
+    let threadgroups = (totalRows + 63) / 64
+    lagunaTrace("fused norm+affine qkv h\(heads) rows\(totalRows)")
+    return kernel(
+        [residual, normWeight, bank.packedCodes, bank.scales, biases],
+        grid: (threadgroups * 512, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [[1, 1, totalRows]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 /// Keep the stock shapeless unary gate for prefill. Ranked measurement showed
 /// the larger gate/product graph regressing the complete prefill schedule even
 /// though its isolated steady-state subpath was slightly faster.
@@ -2863,17 +3032,34 @@ final class LagunaRuntimeAttention: Module {
             if lagunaUseNativeAffineQKV(layer: layerIdx),
                 let fusedAffine = _nativeAffineQKV
             {
-                let normalized = inputNorm(input)
-                let qkv = quantizedMM(
-                    normalized,
-                    fusedAffine.packedCodes,
-                    scales: fusedAffine.scales,
-                    biases: fusedAffine.biases,
-                    transpose: true,
-                    groupSize: fusedAffine.groupSize,
-                    bits: fusedAffine.bits,
-                    mode: fusedAffine.mode
-                )
+                // When the gate rides the bank (INT8 layers), fold the input
+                // RMSNorm into the QKV qmv as one dispatch. Bit-identical to
+                // the two-dispatch chain; `normalized` then has no other
+                // consumer on this path (the gate is sliced from `qkv` below).
+                let fusedNormAffineQKV: MLXArray? =
+                    _nativeAffineQKVGateRows == nHeads
+                    ? lagunaFusedNormAffineQKV(
+                        residual: input, normWeight: inputNorm.weight,
+                        bank: fusedAffine, heads: nHeads)
+                    : nil
+                let normalized: MLXArray
+                let qkv: MLXArray
+                if let fusedNormAffineQKV {
+                    qkv = fusedNormAffineQKV
+                    normalized = input
+                } else {
+                    normalized = inputNorm(input)
+                    qkv = quantizedMM(
+                        normalized,
+                        fusedAffine.packedCodes,
+                        scales: fusedAffine.scales,
+                        biases: fusedAffine.biases,
+                        transpose: true,
+                        groupSize: fusedAffine.groupSize,
+                        bits: fusedAffine.bits,
+                        mode: fusedAffine.mode
+                    )
+                }
                 let queryDim = nHeads * headDim
                 let kvDim = nKVHeads * headDim
                 let gateStart = queryDim + 2 * kvDim
