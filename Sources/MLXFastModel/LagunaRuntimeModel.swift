@@ -3513,6 +3513,125 @@ func lagunaTailNormQKVGate(
     return (outputs[0], outputs[1])
 }
 
+/// Prefill (multi-token) counterpart of `lagunaGateProductSoftplusSource`
+/// that also absorbs the transpose copy. The stock prefill tail between SDPA
+/// and the output projection is three dispatches per layer:
+///
+///  1. `attended.transposed(0, 2, 1, 3).reshaped(B, L, -1)` — a general copy
+///     turning the head-major SDPA output `[B, H, L, D]` token-major;
+///  2. `lagunaCompiledSoftplusGate(projectedGate)` — the compiled FP32
+///     softplus + BF16 rounding over the `[B, L, H]` gate logits;
+///  3. `(output.reshaped(B, L, H, D) * gate[.ellipsis, .newAxis])` — the
+///     broadcast product.
+///
+/// This kernel performs all three in ONE dispatch: it reads the SDPA output
+/// in its head-major layout directly (no transpose copy), recomputes the
+/// softplus gate per (token, head), and writes the gated output token-major
+/// as `[B, L, H*D]`.
+///
+/// EXACTNESS. Every output element is independent of every other — pure
+/// elementwise data movement, no reductions — so grid geometry is free. The
+/// value written is
+/// `bfloat(float(attended[b, h, l, d]) * float(gate_bf))` with
+/// `gate_bf = bfloat(softplus_f32(float(logit)))`:
+///
+///  * the softplus replica is the same FP32 `LogAddExp` form with the same
+///    NaN/inf guards and the same BF16 rounding point
+///    `lagunaGateProductSoftplusSource` uses, whose commentary documents that
+///    this form reproduces `softplus(x.asType(.float32)).asType(.bfloat16)`
+///    bit-for-bit — the exact expression `lagunaCompiledSoftplusGate` runs;
+///  * the product rounds once to BF16 exactly where MLX's BF16 binary
+///    multiply rounds `float(bfloat(float(x) * gate))`;
+///  * the address mapping writes element `attended[b, h, l, d]` to
+///    `gated[b, l, h * D + d]`, byte-for-byte the layout the transpose +
+///    reshape copy produces.
+///
+/// One thread per output element; `threadgroups_per_grid.y` is L, so no
+/// shape constant is baked and any L dispatches the same compiled kernel. A
+/// vectorized four-per-thread form would be equally exact (each element's
+/// value still depends only on itself, so the layout arithmetic is identical
+/// either way), but the per-token row already spans 6144/8192 threads, so
+/// there is no occupancy reason to pay the extra index arithmetic.
+private func lagunaPrefillGateEpilogueSource(heads: Int) -> String {
+    """
+    constexpr uint head_dim = \(LagunaConstants.headDim);
+    constexpr uint gate_heads = \(heads);
+
+    uint e = thread_position_in_grid.x;
+    uint l = threadgroup_position_in_grid.y;
+    uint b = threadgroup_position_in_grid.z;
+    uint length = threadgroups_per_grid.y;
+
+    uint head = e / head_dim;
+    uint d = e - head * head_dim;
+    uint source_index = ((b * gate_heads + head) * length + l) * head_dim + d;
+    uint gate_index = (b * length + l) * gate_heads + head;
+
+    float logit = float(gate_logits[gate_index]);
+    float gate;
+    if (metal::isnan(logit)) {
+        gate = NAN;
+    } else {
+        float maxval = metal::max(logit, 0.0f);
+        float minval = metal::min(logit, 0.0f);
+        gate = (metal::isinf(minval) || metal::isinf(maxval))
+            ? maxval
+            : maxval + log1p(metal::exp(minval - maxval));
+    }
+    bfloat gate_bf = bfloat(gate);
+    gated[(b * length + l) * (gate_heads * head_dim) + e] =
+        bfloat(float(attended[source_index]) * float(gate_bf));
+    """
+}
+
+private let lagunaPrefillGateEpilogueKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_prefill_gate_epilogue_bf16_h\(heads)_v1",
+            inputNames: ["attended", "gate_logits"],
+            outputNames: ["gated"],
+            source: lagunaPrefillGateEpilogueSource(heads: heads),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+/// Set `DARKBLOOM_PREFILL_GATE_EPILOGUE=0` to ablate and restore the stock
+/// three-dispatch prefill tail (transpose copy + compiled softplus +
+/// broadcast multiply).
+private let lagunaPrefillGateEpilogueEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_GATE_EPILOGUE"] != "0"
+
+/// Returns the gated, token-major attention output `[B, L, heads*headDim]`
+/// for a multi-token prefill, or nil when the preconditions do not hold
+/// (caller falls back to the stock chain). The result is bit-identical to
+/// `transpose + softplus + broadcast-multiply` as the stock chain computes
+/// it; see the kernel commentary above.
+func lagunaPrefillGateEpilogue(
+    attended: MLXArray, gateLogits: MLXArray, heads: Int
+) -> MLXArray? {
+    guard lagunaPrefillGateEpilogueEnabled,
+        let kernel = lagunaPrefillGateEpilogueKernels[heads]
+    else { return nil }
+    let headDim = LagunaConstants.headDim
+    let (B, L) = (attended.dim(0), attended.dim(2))
+    precondition(attended.dtype == .bfloat16)
+    precondition(attended.shape == [B, heads, L, headDim])
+    precondition(gateLogits.dtype == .bfloat16)
+    precondition(gateLogits.shape == [B, L, heads])
+
+    lagunaTrace("prefill gate epilogue")
+    return kernel(
+        [attended, gateLogits],
+        grid: (heads * headDim, L, B),
+        threadGroup: (128, 1, 1),
+        outputShapes: [[B, L, heads * headDim]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 // MARK: - Norm-folded native-affine QKV projection (one dispatch)
 
 /// Folds the layer's input RMSNorm into the native group-32 affine INT8
@@ -4400,11 +4519,15 @@ final class LagunaRuntimeAttention: Module {
         // SDPA returns `[B, H, L, D]`. When `L == 1`, flattening its
         // contiguous head-major payload directly produces the exact
         // `[B, 1, H*D]` byte order; the transpose only changes singleton-axis
-        // metadata. Preserve the real transpose for prefill.
-        var output =
+        // metadata. Preserve the real transpose for prefill. Formed lazily:
+        // the prefill gate-epilogue fold below reads `attended` head-major
+        // and never builds this copy.
+        let tokenMajorOutput = {
             L == 1
-            ? attended.reshaped(B, L, -1)
-            : attended.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+                ? attended.reshaped(B, L, -1)
+                : attended.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        }
+        var output: MLXArray
 
         if gatingEnabled, let gProj {
             // Per-head softplus gate computed in float32, then broadcast
@@ -4422,6 +4545,24 @@ final class LagunaRuntimeAttention: Module {
                 projectedGate = gProj(normalizedInput)
                 gateIsActivated = false
             }
+            // Prefill gate-epilogue fold: ONE dispatch replaces the
+            // transpose copy, the compiled-softplus gate, and the broadcast
+            // multiply (see `lagunaPrefillGateEpilogueSource`). Only the
+            // exact form that kernel replicates is eligible — raw per-head
+            // BF16 logits over the BF16 head-major SDPA output on a
+            // multi-token call; decode (L == 1) and every other shape keep
+            // the stock chain below. `wo` is applied unchanged afterwards.
+            if L > 1, !gateIsActivated, gatePerHead,
+                headDim == LagunaConstants.headDim,
+                attended.dtype == .bfloat16, projectedGate.dtype == .bfloat16,
+                attended.shape == [B, nHeads, L, headDim],
+                projectedGate.shape == [B, L, nHeads],
+                let gated = lagunaPrefillGateEpilogue(
+                    attended: attended, gateLogits: projectedGate, heads: nHeads)
+            {
+                return wo(gated)
+            }
+            output = tokenMajorOutput()
             // Native group-32 affine INT8 output projection for the serial
             // decode token. The stock fused kernel folds the gate into the
             // GEMV's own vector loads; this path cannot, because MLX's
@@ -4556,6 +4697,8 @@ final class LagunaRuntimeAttention: Module {
             } else {
                 output = output * gate
             }
+        } else {
+            output = tokenMajorOutput()
         }
 
         return wo(output)
