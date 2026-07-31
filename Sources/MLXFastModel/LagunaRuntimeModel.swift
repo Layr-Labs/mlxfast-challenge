@@ -5800,6 +5800,12 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
         float my_key = -(my_score + float(correction_bias[lane]));
         uint my_index = lane;
 
+        // Seed the score table once, keyed by the ORIGINAL expert index. The
+        // network below permutes indices but never writes here again, so this
+        // remains a valid lookup for the whole sort -- and it is strictly
+        // fewer threadgroup stores than the 6 the score exchange performed.
+        xchg_scores[lane] = my_score;
+
         // A total order (choice key, then original expert index) makes this
         // network match the stock stable merge sort even for exact ties,
         // signed zero, and NaNs. The lower half of each final sequence keeps
@@ -5823,44 +5829,67 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
             for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
                 float other_key;
                 uint other_index;
-                float other_score;
                 if (stride < 32) {
                     other_key = simd_shuffle_xor(my_key, ushort(stride));
                     other_index = simd_shuffle_xor(my_index, ushort(stride));
-                    other_score = simd_shuffle_xor(my_score, ushort(stride));
                 } else {
                     xchg_keys[lane] = my_key;
                     xchg_indices[lane] = my_index;
-                    xchg_scores[lane] = my_score;
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                     uint partner = lane ^ stride;
                     other_key = xchg_keys[partner];
                     other_index = xchg_indices[partner];
-                    other_score = xchg_scores[partner];
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
 
                 bool is_lower = (lane & stride) == 0;
                 float a_key = is_lower ? my_key : other_key;
                 uint a_index = is_lower ? my_index : other_index;
-                float a_score = is_lower ? my_score : other_score;
                 float b_key = is_lower ? other_key : my_key;
                 uint b_index = is_lower ? other_index : my_index;
-                float b_score = is_lower ? other_score : my_score;
 
                 bool lower_wants_better = (lane & sequence) == 0;
+                // One comparator call, not two. `laguna_router_key_before` is a
+                // strict total order and the two operands always carry distinct
+                // indices: `my_index` starts as `lane` and the network only ever
+                // permutes the (key, index, score) triples, so the indices stay
+                // a permutation of 0..255 and no comparison can tie in both key
+                // AND index. Under that invariant `a_before_b == !b_before_a`
+                // identically, so the selection collapses to an equality test
+                // against `lower_wants_better`.
+                //
+                // The invariant is load-bearing: if both key and index tied,
+                // both calls would return false and the identity would break.
+                // That case cannot arise here, but any future change that lets
+                // two lanes carry the same index must revisit this.
+                //
+                // Drops a call whose body is 2 isnan plus branches from every
+                // stage of every router network. No float is computed here, so
+                // there is no accumulation order to perturb, and the boolean
+                // result is unchanged -- the selected experts, their scores and
+                // their rank order are bit-identical.
                 bool b_before_a = laguna_router_key_before(
                     b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                bool swap = (b_before_a == lower_wants_better);
                 if (swap) {
                     my_key = is_lower ? b_key : a_key;
                     my_index = is_lower ? b_index : a_index;
-                    my_score = is_lower ? b_score : a_score;
                 }
             }
         }
+
+        // Recover the score from the index instead of carrying it through the
+        // network. `my_score` was seeded as score_of(lane) with
+        // `my_index == lane`, and every stage moves key and index together
+        // under one predicate, so `my_score == score_of(my_index)` held at
+        // every stage and still holds here. The comparator never reads score
+        // (it takes key and index only), so carrying it was pure freight:
+        // 30 shuffles, 6 threadgroup round-trips and 108 selects per lane, to
+        // arrive at a value one lookup reproduces with the identical bit
+        // pattern. No float is recomputed -- `xchg_scores` still holds exactly
+        // what the seed wrote, because the network no longer clobbers it.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        my_score = xchg_scores[my_index];
 
         // Ranks 0..<8 live in lanes 0..<8 of simdgroup 0. The epilogue runs
         // unguarded so every shuffle source lane is active; only lanes < 8
@@ -6205,11 +6234,28 @@ private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> Str
                 float b_score = is_lower ? other_score : my_score;
 
                 bool lower_wants_better = (lane & sequence) == 0;
+                // One comparator call, not two. `laguna_router_key_before` is a
+                // strict total order and the two operands always carry distinct
+                // indices: `my_index` starts as `lane` and the network only ever
+                // permutes the (key, index, score) triples, so the indices stay
+                // a permutation of 0..255 and no comparison can tie in both key
+                // AND index. Under that invariant `a_before_b == !b_before_a`
+                // identically, so the selection collapses to an equality test
+                // against `lower_wants_better`.
+                //
+                // The invariant is load-bearing: if both key and index tied,
+                // both calls would return false and the identity would break.
+                // That case cannot arise here, but any future change that lets
+                // two lanes carry the same index must revisit this.
+                //
+                // Drops a call whose body is 2 isnan plus branches from every
+                // stage of every router network. No float is computed here, so
+                // there is no accumulation order to perturb, and the boolean
+                // result is unchanged -- the selected experts, their scores and
+                // their rank order are bit-identical.
                 bool b_before_a = laguna_router_key_before(
                     b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                bool swap = (b_before_a == lower_wants_better);
                 if (swap) {
                     my_key = is_lower ? b_key : a_key;
                     my_index = is_lower ? b_index : a_index;
@@ -6283,11 +6329,28 @@ private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> Str
                 float b_score = is_lower ? other_score : my_score2;
 
                 bool lower_wants_better = (lane & sequence) == 0;
+                // One comparator call, not two. `laguna_router_key_before` is a
+                // strict total order and the two operands always carry distinct
+                // indices: `my_index` starts as `lane` and the network only ever
+                // permutes the (key, index, score) triples, so the indices stay
+                // a permutation of 0..255 and no comparison can tie in both key
+                // AND index. Under that invariant `a_before_b == !b_before_a`
+                // identically, so the selection collapses to an equality test
+                // against `lower_wants_better`.
+                //
+                // The invariant is load-bearing: if both key and index tied,
+                // both calls would return false and the identity would break.
+                // That case cannot arise here, but any future change that lets
+                // two lanes carry the same index must revisit this.
+                //
+                // Drops a call whose body is 2 isnan plus branches from every
+                // stage of every router network. No float is computed here, so
+                // there is no accumulation order to perturb, and the boolean
+                // result is unchanged -- the selected experts, their scores and
+                // their rank order are bit-identical.
                 bool b_before_a = laguna_router_key_before(
                     b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                bool swap = (b_before_a == lower_wants_better);
                 if (swap) {
                     my_key2 = is_lower ? b_key : a_key;
                     my_index2 = is_lower ? b_index : a_index;
