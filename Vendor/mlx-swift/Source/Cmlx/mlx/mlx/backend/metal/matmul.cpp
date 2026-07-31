@@ -22,6 +22,66 @@ namespace mlx::core {
 
 namespace {
 
+// DARKBLOOM_GEMM_SWIZZLE -- size the steel threadblock swizzle from the actual
+// M-tile count instead of a constant.
+//
+// The swizzle is a pure remap of which threadgroup owns which output tile:
+// `tid_y = (tid.y << s) + (tid.x & ((1 << s) - 1))`, `tid_x = tid.x >> s`
+// (steel/gemm/gemm.h, steel_gemm_fused_nax.h, steel_gemm_splitk_nax.h), and the
+// host compensates with `tn *= 1 << s; tm = ceil(tm / (1 << s))`. A tile's K
+// loop, its accumulation order and its output address are untouched, so this is
+// BIT-EXACT BY CONSTRUCTION for every shape -- only the schedule moves. It is
+// the same class of change as an expert-threadgroup repartition, not a numeric
+// reassociation.
+//
+// WHAT IT BUYS. Threadgroups are dispatched x-fastest, so at swizzle `s` a run
+// of `2^s` consecutive threadgroups covers `2^s` different M-tiles against the
+// SAME N-tile of B before advancing to the next N-tile. The B operand -- the
+// weight matrix, the large one for every prefill projection -- is therefore
+// streamed `ceil(tm / 2^s)` times rather than `tm` times.
+//
+// At the frozen 512-token prefill window the stock values leave real traffic on
+// the table:
+//
+//   site                       stock s      tm   passes over B
+//   NAX regular (bm 64)        2 on s/c/d    8   2
+//   NAX split-K (bm 64)        1             8   4
+//   NAX split-K (bm 128)       1             4   2
+//   classic regular            0 (hard-      8   8
+//                              zeroed; the
+//                              heuristic is
+//                              commented out)
+//
+// `min(3, ceil(log2(tm)))` drives every one of those to a single pass, which is
+// the minimum possible, and degrades to the stock value whenever tm is small
+// (tm <= 1 -> 0, tm <= 2 -> 1, tm <= 4 -> 2). The cap at 3 keeps the swizzled
+// grid's x extent bounded; the kernels' own
+// `if (tiles_n <= tid_x || tiles_m <= tid_y) return;` guard makes an
+// over-subscribed grid safe when tm is not a power of two.
+//
+// Honest caveat: on a device whose last-level cache already holds the B panel
+// across the second pass, the redundant streaming never reaches DRAM and this
+// buys nothing. That is precisely what the ranked run measures.
+//
+// `DARKBLOOM_GEMM_SWIZZLE=0` restores the stock per-site constants exactly, so
+// an OFF build is a same-binary control.
+inline bool darkbloom_gemm_swizzle_enabled() {
+  static const bool enabled = env::get_var("DARKBLOOM_GEMM_SWIZZLE", "1") != "0";
+  return enabled;
+}
+
+// ceil(log2(tm)), capped at 3, or the caller's stock value when disabled.
+inline int darkbloom_swizzle_log(int tm, int stock) {
+  if (!darkbloom_gemm_swizzle_enabled()) {
+    return stock;
+  }
+  int s = 0;
+  while ((1 << s) < tm && s < 3) {
+    s++;
+  }
+  return s;
+}
+
 std::tuple<bool, int64_t, array> check_transpose(
     std::vector<array>& copies,
     const Stream& s,
@@ -276,10 +336,14 @@ void steel_matmul_regular_axpby_nax(
   int tm = (M + bm - 1) / bm;
 
   // TODO: Explore device-based tuning for swizzle
-  int swizzle_log = tm <= 3 ? 0 : 1;
+  int stock_swizzle_log = tm <= 3 ? 0 : 1;
   if (devc == 's' || devc == 'c' || devc == 'd') {
-    swizzle_log = 2;
+    stock_swizzle_log = 2;
   }
+  // Size the swizzle from tm so B is streamed once (see
+  // darkbloom_swizzle_log): at the 512-token prefill window tm is 8 here and
+  // the stock 2 leaves a second full pass over the weight matrix.
+  int swizzle_log = darkbloom_swizzle_log(tm, stock_swizzle_log);
 
   // Prepare steel matmul params
   GEMMParams params{/* const int M = */ M,
@@ -435,7 +499,12 @@ void steel_matmul_regular_axpby(
   int tm = (M + bm - 1) / bm;
 
   // TODO: Explore device-based tuning for swizzle
-  int swizzle_log = 0; // tm >= 6 ? 3 : (tm <= 3 ? 0 : 2);
+  // Stock value is a hard zero -- the original heuristic
+  // (`tm >= 6 ? 3 : (tm <= 3 ? 0 : 2)`) is commented out right here -- so at
+  // the 512-token prefill window (tm == 8) this path streamed B eight times.
+  // See darkbloom_swizzle_log.
+  int swizzle_log =
+      darkbloom_swizzle_log(tm, 0); // stock: tm >= 6 ? 3 : (tm <= 3 ? 0 : 2);
 
   // Prepare steel matmul params
   GEMMParams params{/* const int M = */ M,
@@ -751,7 +820,11 @@ void steel_gemm_splitk_axpby_nax(
   int tn = (N + bn - 1) / bn;
   int tm = (M + bm - 1) / bm;
 
-  int swizzle_log = tm <= 3 ? 0 : 1;
+  // Size the swizzle from tm so each partition streams its B panel once
+  // instead of ceil(tm / 2^stock) times (see darkbloom_swizzle_log). At the
+  // 512-token prefill window tm is 4 (o_proj, bm 128) or 8 (g_proj / router,
+  // bm 64) here, against a stock swizzle of 1.
+  int swizzle_log = darkbloom_swizzle_log(tm, tm <= 3 ? 0 : 1);
 
   // Compute swizzled tile counts
   int tile = 1 << swizzle_log;

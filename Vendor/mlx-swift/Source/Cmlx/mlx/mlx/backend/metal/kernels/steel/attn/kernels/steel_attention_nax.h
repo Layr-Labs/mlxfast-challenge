@@ -41,6 +41,44 @@ using namespace mlx::steel;
 #define DARKBLOOM_ATTN_QBLOCK_ZIGZAG 1
 #endif
 
+// DARKBLOOM_ATTN_QBLOCK_DESCEND default. DEFAULT ON, and it SUPERSEDES the
+// zigzag arm above (which stays reachable with
+// -DDARKBLOOM_ATTN_QBLOCK_DESCEND=0).
+//
+// WHAT IT CHANGES. Causal work per query block is strictly increasing:
+// threadgroup tidl.x runs kb_lim = ceil(((tidl.x + 1) * BQ + qL_off) / BK)
+// K-blocks, so at the frozen 512-token window (BQ=64, BK=32, NQ=8) the eight
+// query-block classes cost 2, 4, 6, ..., 16 blocks -- an 8:1 spread. The
+// qblock-major arm already fixed the DISPATCH SHAPE (equal-weight batches of H
+// threadgroups); this define fixes the ORDER those batches are presented in,
+// from "lightest first" to "heaviest first".
+//
+// WHY DESCENDING AND NOT ZIGZAG. Threadgroup dispatch onto a fixed pool of
+// cores is list scheduling on identical machines, and the textbook result
+// there is LPT (longest processing time first): sorting jobs descending
+// bounds the makespan at (4/3 - 1/(3m)) of optimal, while any order that
+// leaves long jobs for the end pays their full duration as tail. Zigzag
+// interleaves high and low, so half the long blocks are still issued late.
+// Measured on the standalone harness at production geometry (H=40, D=128,
+// GQA 5, bf16, causal, 39 dispatches/pass, 11 passes, min of pass): at NQ=8 --
+// the ranked NAX grid shape -- ascending 6.082 ms, zigzag 5.597 ms (+8.7%),
+// descending 5.334 ms (+14.0%), i.e. descending is 4.9% faster than the
+// shipped zigzag. At NQ=16 the same ordering ranks hold with a smaller spread
+// (ascending 19.367, zigzag 18.847, descending 18.279 ms). The advantage grows
+// as threadgroups-per-core falls, and the ranked grid (320 threadgroups) is
+// the sparser of the two.
+//
+// EXACTNESS. Identical argument to the qblock-major/zigzag arms: NQ - 1 - r is
+// an involution on [0, NQ), so the map from physical linear index to logical
+// (query block, head) stays a bijection onto the same coordinate set. Every
+// threadgroup keeps its exact Q/K/V inputs, its floating-point operation
+// order, and its disjoint output rows; only GPU presentation order changes.
+// Verified bit-identical against the unpermuted kernel over the full
+// [1, 40, 512, 128] output on the standalone harness.
+#ifndef DARKBLOOM_ATTN_QBLOCK_DESCEND
+#define DARKBLOOM_ATTN_QBLOCK_DESCEND 1
+#endif
+
 ///////////////////////////////////////////////////////////////////////////////
 // GEMM kernels
 ///////////////////////////////////////////////////////////////////////////////
@@ -145,7 +183,11 @@ template <
   const ulong physical_qblock = physical_linear / ulong(params->H);
   const ulong logical_head =
       physical_linear - physical_qblock * ulong(params->H);
-#if DARKBLOOM_ATTN_QBLOCK_ZIGZAG
+#if DARKBLOOM_ATTN_QBLOCK_DESCEND
+  // LPT: present the heaviest causal query block first. `NQ - 1 - r` is an
+  // involution on [0, NQ), so this stays a bijection onto the same coordinates.
+  const ulong logical_qblock = ulong(params->NQ) - 1 - physical_qblock;
+#elif DARKBLOOM_ATTN_QBLOCK_ZIGZAG
   // Present causal work high, low, second-high, second-low, ... while keeping
   // every query block's heads contiguous. Even ranks map injectively onto the
   // upper half in descending order; odd ranks map onto the lower half in
