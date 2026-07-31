@@ -667,6 +667,30 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     }
 }()
 
+/// Process-constant layer-boundary representation of the decode schedule.
+/// This collapses the `.layer`, `.ladder`, and `.explicit` families to the
+/// same mask once at startup, rather than pattern-matching the enum and doing
+/// modulo work at every layer of every serial token. `.norm` and `.logits`
+/// remain separate post-stack scheduling points.
+private let lagunaDecodeAsyncBoundaryMask: UInt64 = {
+    switch lagunaDecodeAsyncStage {
+    case .layer(let index):
+        return 1 << UInt64(index)
+    case .ladder(let stride):
+        var mask: UInt64 = 0
+        var index = stride - 1
+        while index < LagunaConstants.numHiddenLayers {
+            mask |= 1 << UInt64(index)
+            index += stride
+        }
+        return mask
+    case .explicit(let mask):
+        return mask
+    default:
+        return 0
+    }
+}()
+
 /// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `1`; `0`/`off` disables;
 /// `8` restores the prior default): a ranked measurement on the
 /// 1.87782 base scored stride 1 at 1.88526 (+0.40% vs that base, rejected
@@ -8011,6 +8035,16 @@ final class LagunaRuntimeModelInner: Module {
         // seed row, so the angles are the exact floats that layer's kernel
         // would have computed rather than a re-derivation.
 
+        // Shape classification is invariant across the layer stack. Keep it
+        // out of the serial hot loop: querying `inputs.shape` and comparing a
+        // freshly bridged Swift array at every async boundary adds host-side
+        // graph-construction work but cannot affect MLX scheduling or math.
+        let inputShape = inputs.shape
+        let isSerialDecode = inputShape == [1, 1]
+        let isMultiTokenPrefill = inputShape.count == 2 && inputShape[1] > 1
+        let decodeAsyncBoundaryMask =
+            isSerialDecode ? lagunaDecodeAsyncBoundaryMask : 0
+
         for (i, layer) in layers.enumerated() {
             let isFull = layerTypes[i] == .full
             let mask = isFull ? fullMask : slidingMask
@@ -8026,12 +8060,7 @@ final class LagunaRuntimeModelInner: Module {
                         qkRoPEAngles: qkRoPEAngles,
                         qkRoPEOffsets: qkRoPEOffsets
                     )
-                    if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
-                        asyncEval(h)
-                    }
-                    if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                        inputs.shape == [1, 1]
-                    {
+                    if (decodeAsyncBoundaryMask >> UInt64(i)) & 1 == 1 {
                         asyncEval(h)
                     }
                 }
@@ -8043,20 +8072,10 @@ final class LagunaRuntimeModelInner: Module {
                     qkRoPEAngles: qkRoPEAngles,
                     qkRoPEOffsets: qkRoPEOffsets
                 )
-                if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
+                if (decodeAsyncBoundaryMask >> UInt64(i)) & 1 == 1 {
                     asyncEval(h)
                 }
-                if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                    inputs.shape == [1, 1]
-                {
-                    asyncEval(h)
-                }
-                if case .explicit(let mask) = lagunaDecodeAsyncStage,
-                    (mask >> UInt64(i)) & 1 == 1, inputs.shape == [1, 1]
-                {
-                    asyncEval(h)
-                }
-                if lagunaPrefillAsyncLadderStride > 0, h.dim(1) > 1,
+                if lagunaPrefillAsyncLadderStride > 0, isMultiTokenPrefill,
                     (i + 1) % lagunaPrefillAsyncLadderStride == 0
                 {
                     asyncEval(h)
@@ -8116,20 +8135,21 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let isSerialDecode = inputs.shape == [1, 1]
         let fullHidden = model(inputs, cache: cache)
         // Every consumer of multi-token logits reads only the LAST
         // position's row. Slice before the row-independent final RMSNorm and
         // vocabulary head so prefill neither normalizes nor projects the
         // preceding rows. For single-token decode the slice is a no-op.
         let hidden = model.norm(lagunaLastTokenHidden(fullHidden))
-        if case .norm = lagunaDecodeAsyncStage, inputs.shape == [1, 1] {
+        if case .norm = lagunaDecodeAsyncStage, isSerialDecode {
             asyncEval(hidden)
         }
 
         let result: MLXArray
         if let lmHead {
             if let pruner = lmHeadPruner,
-                inputs.shape == [1, 1] || lagunaLmHeadPrunePrefillEnabled
+                isSerialDecode || lagunaLmHeadPrunePrefillEnabled
             {
                 // Certified two-pass final-row head (notes/68): full BF16
                 // logits, bit-identical to stock in every argmax-reachable
@@ -8142,7 +8162,7 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         } else {
             result = model.embedTokens.asLinear(hidden)
         }
-        if case .logits = lagunaDecodeAsyncStage, inputs.shape == [1, 1] {
+        if case .logits = lagunaDecodeAsyncStage, isSerialDecode {
             asyncEval(result)
         }
         return result
