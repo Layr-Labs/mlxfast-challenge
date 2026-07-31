@@ -243,26 +243,10 @@ let lagunaPrefillFusedResidualRMSNormEnabled =
 
 /// Issues the routed and shared gate/up NVFP4 QMVs as one nine-slot dispatch
 /// (see `lagunaRoutedSharedSwiGLUQMVKernel`). Set
-/// `DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV=1` to restore the merge.
-///
-/// DEFAULT OFF: the merge is a dependency-chain pessimisation on the decode
-/// step. The routed half consumes `inds`, so the merged dispatch cannot be
-/// enqueued until the top-8 kernel retires -- but the shared half consumes
-/// only `x`, which is ready the moment `residual+rmsnorm+router` lands.
-/// Merging therefore parks the shared expert's gate/up work behind a
-/// dispatch it has no data dependency on. Splitting spends one extra
-/// dispatch per sparse layer to expose that work for overlap.
-///
-/// The merge was chosen against an earlier tree, before the native-affine
-/// rollout reshaped the surrounding anatomy, so its A/B is stale rather than
-/// wrong. Splitting is arithmetically inert: each half keeps its own kernel,
-/// its own row mapping, and its own accumulation order -- the routed rows go
-/// through `lagunaRoutedSwiGLUQMV` and the shared rows through
-/// `lagunaSharedSwiGLUQMV`, both of which are the same kernels the merged
-/// form was built from.
+/// `DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV=0` to ablate.
 let lagunaFusedRoutedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment[
-        "DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV"] == "1"
+        "DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV"] != "0"
 
 /// Scheduling A/B for the merged routed/shared gate/up kernel. The proven R2
 /// schedule is the default; only an explicit selector value of `4` opts into
@@ -667,12 +651,7 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     }
 }()
 
-/// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `1`; `0`/`off` disables;
-/// `8` restores the prior default): a ranked measurement on the
-/// 1.87782 base scored stride 1 at 1.88526 (+0.40% vs that base, rejected
-/// only because a larger win promoted mid-queue), and the decode-side
-/// ladder sweep showed denser firing pays until graph-build cost
-/// dominates. Stride 1 fires `asyncEval` after every layer:
+/// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `1`; `0`/`off` disables):
 /// prefill-side twin of the decode ladder above. Multi-token forwards build
 /// a ~400-op graph with the GPU idle until the final eval; firing `asyncEval`
 /// after every Nth layer streams completed segments exactly as the promoted
@@ -1304,7 +1283,7 @@ func lagunaSlidingQKNormRoPE(
 ///    re-derivation. The decode twin (`laguna_sliding_qk_norm_rope_bf16_128_v1`)
 ///    consumes the same table with the same expression.
 private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_v1",
+    name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_v2",
     inputNames: [
         "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
         "offsets",
@@ -1339,6 +1318,7 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         uint base = lane * 4;
         thread bfloat normalized[4];
         float sum = 0.0f;
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             float value = float(input[base + i]);
             sum += value * value;
@@ -1350,6 +1330,7 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
@@ -1357,7 +1338,11 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         }
 
         // Element `p + 64`, the partner of pair `p`, lives 16 lanes away.
+        // Every fixed-four loop in this prefill-only kernel is explicitly
+        // scalarized. This removes loop-control ALU while preserving the
+        // exact source order of the dependent RMS sum and rotary arithmetic.
         thread float paired[4];
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
         }
@@ -1367,6 +1352,7 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         // Every element rotates, so the lower sixteen lanes own all 64
         // pairs and write both halves of each.
         if (lane < 16) {
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
                 float first = float(normalized[i]);
@@ -1392,7 +1378,7 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
 /// (`lagunaSlidingQKNormRoPEKernel`, one SIMD/head, the project's largest
 /// single win); the prefill `*4` was an unaudited divergence from it.
 private let lagunaPrefillSlidingQKNormRoPEH1Kernel = MLXFast.metalKernel(
-    name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_h1_v1",
+    name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_h1_v2",
     inputNames: [
         "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
         "offsets",
@@ -1426,6 +1412,7 @@ private let lagunaPrefillSlidingQKNormRoPEH1Kernel = MLXFast.metalKernel(
         uint base = lane * 4;
         thread bfloat normalized[4];
         float sum = 0.0f;
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             float value = float(input[base + i]);
             sum += value * value;
@@ -1433,13 +1420,18 @@ private let lagunaPrefillSlidingQKNormRoPEH1Kernel = MLXFast.metalKernel(
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
                 bfloat(float(input[base + i]) * inverse_rms);
         }
 
+        // Every fixed-four loop in this prefill-only kernel is explicitly
+        // scalarized. This removes loop-control ALU while preserving the
+        // exact source order of the dependent RMS sum and rotary arithmetic.
         thread float paired[4];
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
         }
@@ -1447,6 +1439,7 @@ private let lagunaPrefillSlidingQKNormRoPEH1Kernel = MLXFast.metalKernel(
         const device float* angle_row =
             angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
         if (lane < 16) {
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
                 float first = float(normalized[i]);
@@ -1477,7 +1470,7 @@ private let lagunaPrefillSlidingQKNormRoPEH1Kernel = MLXFast.metalKernel(
 /// and the tail elements 64…127 written verbatim, matching the values the
 /// stock pre-RoPE copy leaves behind.
 private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_full_qk_norm_yarn_bf16_128_v1",
+    name: "laguna_prefill_full_qk_norm_yarn_bf16_128_v2",
     inputNames: [
         "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
         "offsets",
@@ -1513,6 +1506,7 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
         uint base = lane * 4;
         thread bfloat normalized[4];
         float sum = 0.0f;
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             float value = float(input[base + i]);
             sum += value * value;
@@ -1520,6 +1514,7 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
@@ -1527,8 +1522,10 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
         }
 
         // Element `p + 32`, the rotary partner of pair `p` inside the
-        // 64-wide YaRN half, lives 8 lanes away.
+        // 64-wide YaRN half, lives 8 lanes away. As in the sliding twin,
+        // scalarize the fixed-four plumbing without changing arithmetic.
         thread float paired[4];
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
         }
@@ -1537,6 +1534,7 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
             angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
         if (lane < 8) {
             bfloat rounded_mscale = bfloat(yarn_mscale);
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
                 float first =
@@ -1550,6 +1548,7 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
                     bfloat(first * sine + second * cosine);
             }
         } else if (lane >= 16) {
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 output[base + i] = normalized[i];
             }
@@ -1565,7 +1564,7 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
 /// per threadgroup instead of four changes only launch count/occupancy, not any
 /// head's output value. Matches the proven decode shape.
 private let lagunaPrefillFullQKNormYaRNH1Kernel = MLXFast.metalKernel(
-    name: "laguna_prefill_full_qk_norm_yarn_bf16_128_h1_v1",
+    name: "laguna_prefill_full_qk_norm_yarn_bf16_128_h1_v2",
     inputNames: [
         "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
         "offsets",
@@ -1600,6 +1599,7 @@ private let lagunaPrefillFullQKNormYaRNH1Kernel = MLXFast.metalKernel(
         uint base = lane * 4;
         thread bfloat normalized[4];
         float sum = 0.0f;
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             float value = float(input[base + i]);
             sum += value * value;
@@ -1607,13 +1607,17 @@ private let lagunaPrefillFullQKNormYaRNH1Kernel = MLXFast.metalKernel(
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
                 bfloat(float(input[base + i]) * inverse_rms);
         }
 
+        // As in the sliding twin, scalarize the fixed-four plumbing without
+        // changing arithmetic.
         thread float paired[4];
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
         }
@@ -1622,6 +1626,7 @@ private let lagunaPrefillFullQKNormYaRNH1Kernel = MLXFast.metalKernel(
             angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
         if (lane < 8) {
             bfloat rounded_mscale = bfloat(yarn_mscale);
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
                 float first =
@@ -1635,6 +1640,7 @@ private let lagunaPrefillFullQKNormYaRNH1Kernel = MLXFast.metalKernel(
                     bfloat(first * sine + second * cosine);
             }
         } else if (lane >= 16) {
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 output[base + i] = normalized[i];
             }
@@ -4097,6 +4103,18 @@ let lagunaNvfp4NibbleSplit: Int = {
     else { return 1 }
     return value
 }()
+
+/// Folds the e4m3 group-scale's sign bit into the half bit pattern instead of
+/// negating after conversion. For `bits = 128 + m` the carry `bits + (bits &
+/// 128)` yields `256 + m`, and `(256 + m) << 7 == 0x8000 | (m << 7)` because
+/// `m <= 127` keeps `m << 7 <= 16256 < 0x8000`; IEEE half is sign-magnitude,
+/// so that pattern IS the negation, including `-0.0h`. For `bits < 128` the
+/// add is the identity. Drops `laguna_nvfp4_scale` from seven AIR ops to five
+/// in the innermost K loop of every routed/shared decode QMV.
+/// `DARKBLOOM_NVFP4_SCALE_CARRY=0` restores the negate-after-convert form.
+let lagunaNvfp4ScaleCarry: Bool =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_CARRY"] != "0"
+
 private let lagunaSharedSwiGLUQMVHeader: String = {
     // The two halves of one power-of-two regrouping. They MUST move together:
     // the scale absorbs `2^14` exactly when the weights stop applying it.
@@ -4143,11 +4161,22 @@ private let lagunaSharedSwiGLUQMVHeader: String = {
                         ((c & 0x70007000u) >> 3) | (c & 0x80008000u);
             """
     }
+    // The carry form only composes with the folded tail, which is where the
+    // sign lands before any further scaling; keep the negate form otherwise.
+    let scaleCarryActive = lagunaNvfp4ScaleCarry && lagunaNvfp4ScaleFoldEnabled
+    let scaleRawExpression =
+        scaleCarryActive
+        ? "ushort((uint(bits) + (bits & 128u)) << 7)"
+        : "ushort(bits & 127) << 7"
+    let scaleSignExpression =
+        scaleCarryActive
+        ? "converted"
+        : "(bits & 128) ? -converted : converted"
     return """
     static inline float laguna_nvfp4_scale(uint8_t bits) {
-        ushort raw = ushort(bits & 127) << 7;
+        ushort raw = \(scaleRawExpression);
         half converted = as_type<half>(raw);
-    \(scale256)    half signed_value = (bits & 128) ? -converted : converted;
+    \(scale256)    half signed_value = \(scaleSignExpression);
     \(scaleTail)
     }
 
