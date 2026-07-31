@@ -59,7 +59,7 @@ func lagunaRopeScalingConfig(_ spec: LagunaRopeSpec) -> [String: StringOrNumber]
 }
 
 /// `DARKBLOOM_TRACE_FUSION=1` prints one stderr line the first time each fused
-/// decode path is taken. Every fusion here is guarded on dtype, rank, exact
+/// runtime path is taken. Every fusion here is guarded on dtype, rank, exact
 /// shape and module identity and falls back silently when a guard declines, so
 /// a change that quietly stops firing looks exactly like a change that does
 /// nothing. This makes "did it actually run" observable without a debugger.
@@ -288,9 +288,10 @@ let lagunaFusedQKVProjectionEnabled =
 /// TensorFold-derived within-token batching for the serial decode stream.
 /// A native group-32 affine INT8 side layout packs Q/K/V into one batched
 /// quantized matmul, cutting their weight traffic without speculating future
-/// tokens or changing the KV dependency. Prefill stays on the original BF16
-/// projections. Two ranked chunks proved 28 layers; this final bounded chunk
-/// widens the same layout to all 40 layers.
+/// tokens or changing the KV dependency. Multi-token calls keep the original
+/// BF16 projections unless the independent prefill flag below selects the
+/// layer. Two ranked chunks proved 28 layers; this final bounded chunk widens
+/// the same layout to all 40 layers.
 private let lagunaNativeAffineQKVLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_QKV"] != "0"
     else { return 0 }
@@ -348,6 +349,33 @@ private func lagunaUseNativeAffineQKV(layer: Int) -> Bool {
         layer: layer,
         count: lagunaNativeAffineQKVLayerCount,
         onlyLayer: lagunaNativeAffineQKVOnlyLayer)
+}
+
+/// Reuses the already-resident group-32 affine INT8 Q/K/V side bank for
+/// multi-token prefill. This is deliberately independent of the proved decode
+/// rollout: unset selects the first 16 layers, `0` restores the prior BF16
+/// prefill projections, and the layer-count / single-layer selectors support
+/// bounded rollout and forensics. The shared suffix selector continues to
+/// provide the house depth-probe behavior.
+private let lagunaNativeAffinePrefillQKVLayerCount: Int = {
+    guard
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_NATIVE_AFFINE_PREFILL_QKV"] != "0"
+    else { return 0 }
+    let requested = Int(
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_NATIVE_AFFINE_PREFILL_QKV_LAYERS"] ?? "16") ?? 16
+    return min(max(requested, 0), LagunaConstants.numHiddenLayers)
+}()
+
+private let lagunaNativeAffinePrefillQKVOnlyLayer = lagunaNativeAffineOnlyLayer(
+    "DARKBLOOM_NATIVE_AFFINE_PREFILL_QKV_ONLY_LAYER")
+
+private func lagunaUseNativeAffinePrefillQKV(layer: Int) -> Bool {
+    lagunaNativeAffineCovers(
+        layer: layer,
+        count: lagunaNativeAffinePrefillQKVLayerCount,
+        onlyLayer: lagunaNativeAffinePrefillQKVOnlyLayer)
 }
 
 /// The same native group-32 affine INT8 side layout applied to the attention
@@ -1746,6 +1774,16 @@ struct LagunaNativeAffineWeight {
     var mode: QuantizationMode = .affine
 
     var arrays: [MLXArray] { [packedCodes, scales] + (biases.map { [$0] } ?? []) }
+}
+
+/// Row boundaries inside the retained `[Q; K; V; optional gate]` native
+/// affine bank. Prepared once with the bank so prefill never reconstructs the
+/// offsets from hot-path tensor dimensions, and consumed only through range
+/// slices (views, unlike integer subscripting's materializing Gather).
+struct LagunaNativeAffineQKVRowRanges {
+    let query: Range<Int>
+    let key: Range<Int>
+    let value: Range<Int>
 }
 
 /// REAL (not simulated) NVFP4 side layout for layers `>= N`
@@ -3254,10 +3292,16 @@ final class LagunaRuntimeAttention: Module {
     var _lastPrefillQGateWeight: MLXArray?
     var _lastPrefillKVWeight: MLXArray?
 
-    /// Derived native group-32 affine layout for one serial decode token's
-    /// Q/K/V batch. The original BF16 parameters remain authoritative and
-    /// continue to serve prefill.
+    /// Derived native attention Q/K/V layout. Serial decode consumes the full
+    /// row-concatenated bank; selected multi-token prefill layers consume the
+    /// three contiguous row views. The original BF16 parameters remain
+    /// authoritative and serve every fallback.
     var _nativeAffineQKV: LagunaNativeAffineWeight?
+
+    /// Load-time row boundaries for the Q/K/V views of `_nativeAffineQKV`.
+    /// Gate rows, when present, follow `value` and are intentionally excluded
+    /// because prefill keeps `g_proj` on the stock BF16 contraction.
+    var _nativeAffineQKVRowRanges: LagunaNativeAffineQKVRowRanges?
 
     /// Derived native group-32 affine layout for the attention output
     /// projection, used only by the serial decode call. `wo.weight` remains the
@@ -3297,10 +3341,16 @@ final class LagunaRuntimeAttention: Module {
         guard _nativeAffineQKV == nil,
             let q = lagunaNativeAffineWeight(wq.weight, layer: layerIdx),
             let k = lagunaNativeAffineWeight(wk.weight, layer: layerIdx),
-            let v = lagunaNativeAffineWeight(wv.weight, layer: layerIdx)
+            let v = lagunaNativeAffineWeight(wv.weight, layer: layerIdx),
+            q.originalShape == wq.weight.shape,
+            k.originalShape == wk.weight.shape,
+            v.originalShape == wv.weight.shape
         else {
             return []
         }
+        let queryEnd = q.originalShape[0]
+        let keyEnd = queryEnd + k.originalShape[0]
+        let valueEnd = keyEnd + v.originalShape[0]
         // The per-head gate joins the same side layout where the envelope
         // allows it. It is always group-32 affine INT8 (never the NVFP4 tail
         // window), so it can concatenate into the QKV bank only when that
@@ -3354,6 +3404,10 @@ final class LagunaRuntimeAttention: Module {
             mode: q.mode
         )
         _nativeAffineQKV = fused
+        _nativeAffineQKVRowRanges = LagunaNativeAffineQKVRowRanges(
+            query: 0 ..< queryEnd,
+            key: queryEnd ..< keyEnd,
+            value: keyEnd ..< valueEnd)
         return fused.arrays + (_nativeAffineGProj?.arrays ?? [])
     }
 
@@ -3633,6 +3687,55 @@ final class LagunaRuntimeAttention: Module {
             queries = fused.queries
             keys = fused.keys
             values = fused.values
+        } else if lagunaUseNativeAffinePrefillQKV(layer: layerIdx),
+            B == 1, L > 1,
+            let normalizedInput,
+            let affineQKV = _nativeAffineQKV,
+            let rows = _nativeAffineQKVRowRanges,
+            affineQKV.mode == .affine,
+            affineQKV.bits == 8,
+            affineQKV.groupSize == 32,
+            let affineBiases = affineQKV.biases,
+            normalizedInput.dtype == .bfloat16,
+            normalizedInput.shape == [1, L, LagunaConstants.hiddenSize],
+            rows.query.count == nHeads * headDim,
+            rows.key.count == nKVHeads * headDim,
+            rows.value.count == nKVHeads * headDim,
+            rows.value.upperBound <= affineQKV.originalShape[0]
+        {
+            // Q/K/V retain their established group-32 affine INT8 values and
+            // each contraction keeps the stock M=L row geometry. Only the
+            // contiguous outer weight-row range differs between calls. The
+            // M=512 ranked shape routes each of these through qmm with
+            // split_k=1; g_proj deliberately remains on its BF16 path below.
+            queries = quantizedMM(
+                normalizedInput,
+                affineQKV.packedCodes[rows.query, .ellipsis],
+                scales: affineQKV.scales[rows.query, .ellipsis],
+                biases: affineBiases[rows.query, .ellipsis],
+                transpose: true,
+                groupSize: affineQKV.groupSize,
+                bits: affineQKV.bits,
+                mode: affineQKV.mode)
+            keys = quantizedMM(
+                normalizedInput,
+                affineQKV.packedCodes[rows.key, .ellipsis],
+                scales: affineQKV.scales[rows.key, .ellipsis],
+                biases: affineBiases[rows.key, .ellipsis],
+                transpose: true,
+                groupSize: affineQKV.groupSize,
+                bits: affineQKV.bits,
+                mode: affineQKV.mode)
+            values = quantizedMM(
+                normalizedInput,
+                affineQKV.packedCodes[rows.value, .ellipsis],
+                scales: affineQKV.scales[rows.value, .ellipsis],
+                biases: affineBiases[rows.value, .ellipsis],
+                transpose: true,
+                groupSize: affineQKV.groupSize,
+                bits: affineQKV.bits,
+                mode: affineQKV.mode)
+            lagunaTrace("native affine prefill qkv layer \(layerIdx)")
         } else {
             guard let normalizedInput else {
                 preconditionFailure("stock QKV projections require normalized input")
@@ -8009,7 +8112,9 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     func prepareFusedRuntimeWeights() {
         var fusedArrays = model.prepareRoPEAngleAtlases()
         for layer in model.layers {
-            if lagunaUseNativeAffineQKV(layer: layer.selfAttn.layerIdx) {
+            if lagunaUseNativeAffineQKV(layer: layer.selfAttn.layerIdx)
+                || lagunaUseNativeAffinePrefillQKV(layer: layer.selfAttn.layerIdx)
+            {
                 fusedArrays.append(
                     contentsOf: layer.selfAttn.prepareNativeAffineQKVWeight())
             }
