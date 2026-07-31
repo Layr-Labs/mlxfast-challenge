@@ -47,6 +47,51 @@ import MLXFast
 // `DARKBLOOM_LMHEAD_INLINE_MASK=0` restores the new tip's three-output coarse
 // kernels, fused two-pass lower-bound reduction, dense uint8 selector mask,
 // and coarse_bf-fed exact kernel inside the same binary.
+//
+// COARSE WIDTH (this submission): `DARKBLOOM_LMHEAD_COARSE_BITS` selects the
+// coarse copy's format. Default `6` builds a 6-bit affine copy (group size
+// 64: plane-packed codes [V,1024]+[V,512] u8, bf16 scale/bias/bound tables
+// [V,32] each; 169.7 MB total) instead of MXFP8 (211.9 MB), saving 42.2 MB
+// of coarse reads per decode token. Set `8` to restore the MXFP8 arm (same
+// binary; init builds only the selected copy).
+//
+// Why 6-bit affine and not a 4-bit format: the certified window is an L1
+// bound (it must hold for EVERY hidden row, so it cannot exploit sign
+// cancellation), which makes candidate count exquisitely sensitive to the
+// per-element bound. Local sweeps on synthetic full-vocab weights measured
+// MXFP4's ~4x-wider bound admitting the ENTIRE vocabulary as candidates
+// (100352/100352 rows on every trial -- the coarse pass would prune
+// nothing), while 6-bit affine at group 64 has a ~0.75x SMALLER per-element
+// bound than MXFP8, measured 409-3411 candidates vs MXFP8's 1252-7997 on
+// the same trials. The 6-bit arm therefore shrinks both the coarse bytes
+// AND the candidate set; there is no candidate-inflation regression risk.
+//
+// The 6-bit certificate is simpler and stronger than the MXFP8 one because
+// the quantizer is ours (init-time MLX ops, no vendored-kernel semantics to
+// replicate) and the per-group bound is MEASURED, not derived:
+//   quantize: per 64-element group, s = bf16((max-min)/63), b = bf16(min),
+//   q = clip(round((w - b)/s), 0, 63) with all arithmetic in f32.
+//   decode (both init and kernel): what = s*q + b in f32. The kernel may
+//   contract that multiply-add to an FMA; the resulting <= 2^-24 relative
+//   discrepancy per element against the init-side two-rounding value is
+//   absorbed by the 2*GAMMA*m term (2^-24 << 2^-14), the same slack that
+//   covers the accumulation rounding.
+//   bound: E_g = bf16-ceil((1 + 2^-7) * max_{j in g} |w_j - what_j|),
+//   computed at init from the actual weights, so it certifies every element
+//   of the group by construction -- including the bf16 storage slop of s
+//   and b, the zero-range-group corner (all-equal groups decode to bf16(b)
+//   and E_g records exactly that residual), and any quantizer rounding.
+//   The (1 + 2^-7) pad keeps the table certified through its own bf16
+//   round-to-nearest storage (relative error <= 2^-8).
+//   d_i = sum_g E_g * sum_{j in g} |x_j|, and delta keeps the shipped form
+//   d*(1+GAMMA) + 2*GAMMA*m with GAMMA = 2^-15; the kernel accumulates one
+//   64-element group per lane sequentially then one simd_sum, keeping the
+//   per-element rounding depth inside the notes/68 budget. Downstream
+//   (threshold, BF16 margin, exact pass) is untouched: it only needs
+//   |t_i - c_i| <= delta_i. Every candidate row still gets the
+//   bit-identical stock BF16 GEMV value, so the emitted token is the stock
+//   token; the only thing a mis-sized (yet valid) bound could change is
+//   speed, never output.
 
 private let lagunaLmHeadPruneVocab = 100_352
 private let lagunaLmHeadPruneHidden = 2048
@@ -390,8 +435,123 @@ private let lagunaLmHeadInlineCoarseKernelV1 = MLXFast.metalKernel(
 )
 
 /// Same-binary A/B selector for the coarse kernel (v2 default).
+/// 8-bit arm only: the MXFP4 arm has a single kernel version.
 private let lagunaLmHeadCoarseUseV1 =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COARSE"] == "v1"
+
+/// Coarse-copy format. Default 6 (6-bit affine, group 64; 169.7 MB resident
+/// coarse copy); set `DARKBLOOM_LMHEAD_COARSE_BITS=8` to restore the MXFP8
+/// arm (211.9 MB). Any other value selects the default. Init builds only
+/// the selected copy, so the arms never double residency.
+private let lagunaLmHeadCoarseBits: Int =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COARSE_BITS"] == "8"
+    ? 8 : 6
+
+/// Shared body of the two 6-bit affine coarse kernels (they differ only in
+/// the trailing `coarse_bf` store, spliced in below), guaranteeing the
+/// kill-switch pair stays textually identical. Geometry matches the MXFP8
+/// pack16 kernels: 16 rows per threadgroup, one simdgroup per row; each lane
+/// owns ONE 64-element group (32 lanes x 64 = the 2048-wide row).
+///
+/// Code layout (authored by the pruner's init, see
+/// `LagunaLmHeadPruner.buildAffine6`): the 6-bit code q splits into a
+/// high-nibble plane (q >> 2, two elements per byte -- element 2b in byte
+/// b's low nibble) and a crumb plane (q & 3, four elements per byte --
+/// element 4b+i at bits 2i). A group is therefore 32 plane-A bytes (two
+/// uint4 loads) plus 16 plane-B bytes (one uint4 load), all 16-byte
+/// aligned. Decode is what = s*q + b in f32; the certificate's measured
+/// per-group bound E covers every element (module header above).
+private func lagunaLmHeadAffine6CoarseSource(emitCoarseBF: Bool) -> String {
+    let coarseBFStore =
+        emitCoarseBF
+        ? "\n            coarse_bf[row] = bfloat(c_acc);"
+        : ""
+    return """
+        constexpr float GAMMA = 0x1p-15f;
+
+        uint row = threadgroup_position_in_grid.x * 16 +
+            simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        // One 64-element group per lane.
+        const device uint8_t* pa = plane_a + size_t(row) * 1024 + lane * 32;
+        const device uint8_t* pb = plane_b + size_t(row) * 512 + lane * 16;
+        uint table = row * 32 + lane;
+        // bf16 -> f32 is exactly bits<<16 for every value class.
+        float s = as_type<float>(uint(scales[table]) << 16);
+        float b = as_type<float>(uint(biases[table]) << 16);
+        float e = as_type<float>(uint(bounds[table]) << 16);
+
+        uint4 packedA0 = ((const device uint4*)pa)[0];
+        uint4 packedA1 = ((const device uint4*)pa)[1];
+        uint4 packedB = ((const device uint4*)pb)[0];
+        const device ushort4* xrow =
+            (const device ushort4*)(x + lane * 64);
+
+        float cg = 0.0f;
+        float ag = 0.0f;
+        float mg = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint u = 0; u < 4; ++u) {
+            // 16 elements per iteration: plane-A words 2u,2u+1 pair with
+            // plane-B word u.
+            uint a0 = (u < 2u) ? packedA0[2 * u] : packedA1[2 * (u & 1u)];
+            uint a1 = (u < 2u) ? packedA0[2 * u + 1]
+                               : packedA1[2 * (u & 1u) + 1];
+            uint bw = packedB[u];
+            float4 xv0 = as_type<float4>(uint4(xrow[4 * u]) << 16);
+            float4 xv1 = as_type<float4>(uint4(xrow[4 * u + 1]) << 16);
+            float4 xv2 = as_type<float4>(uint4(xrow[4 * u + 2]) << 16);
+            float4 xv3 = as_type<float4>(uint4(xrow[4 * u + 3]) << 16);
+            #pragma clang loop unroll(full)
+            for (uint k = 0; k < 16; ++k) {
+                uint aw = (k < 8u) ? a0 : a1;
+                uint nib = (aw >> (8u * ((k & 7u) >> 1) + 4u * (k & 1u)))
+                    & 0xFu;
+                uint crumb = (bw >> (8u * (k >> 2) + 2u * (k & 3u))) & 0x3u;
+                float q = float((nib << 2) | crumb);
+                float wv = s * q + b;
+                float xv = (k < 4u) ? xv0[k & 3u]
+                    : (k < 8u) ? xv1[k & 3u]
+                    : (k < 12u) ? xv2[k & 3u]
+                    : xv3[k & 3u];
+                cg += xv * wv;
+                ag += metal::abs(xv);
+                mg += metal::abs(xv) * metal::abs(wv);
+            }
+        }
+        float c_acc = simd_sum(cg);
+        float d_acc = simd_sum(e * ag);
+        float m_acc = simd_sum(mg);
+        if (lane == 0) {
+            coarse[row] = c_acc;
+            delta[row] = d_acc * (1.0f + GAMMA) + (2.0f * GAMMA) * m_acc;\(coarseBFStore)
+        }
+        """
+}
+
+/// 6-bit affine coarse kernel, inline-mask (two-output) form -- the default
+/// path.
+private let lagunaLmHeadAffine6InlineCoarseKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_a6g64_inline_coarse_pack16_v1",
+    inputNames: ["x", "plane_a", "plane_b", "scales", "biases", "bounds"],
+    outputNames: ["coarse", "delta"],
+    source: lagunaLmHeadAffine6CoarseSource(emitCoarseBF: false),
+    header: lagunaLmHeadPruneHeader,
+    ensureRowContiguous: true
+)
+
+/// 6-bit affine coarse kernel, three-output form for the
+/// `DARKBLOOM_LMHEAD_INLINE_MASK=0` kill-switch (selector + coarse_bf-fed
+/// exact kernel). Textually the inline kernel plus the coarse_bf store.
+private let lagunaLmHeadAffine6CoarseKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_a6g64_coarse_pack16_v1",
+    inputNames: ["x", "plane_a", "plane_b", "scales", "biases", "bounds"],
+    outputNames: ["coarse", "delta", "coarse_bf"],
+    source: lagunaLmHeadAffine6CoarseSource(emitCoarseBF: true),
+    header: lagunaLmHeadPruneHeader,
+    ensureRowContiguous: true
+)
 
 /// `lower.max()` uses MLX's two-pass `all_reduce_max` for this 100352-element
 /// row. The first pass partitions it into 128 contiguous 784-element rows,
@@ -713,14 +873,23 @@ private let lagunaLmHeadInlineExactKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// Retained init-time MXFP8 coarse copy of lm_head plus the pruned final-row
+/// Retained init-time coarse copy of lm_head plus the pruned final-row
 /// forward. Built once (untimed init) by
 /// `LagunaRuntimeModel.prepareFusedRuntimeWeights` when
 /// `lagunaLmHeadPruneEnabled` (DARKBLOOM_LM_HEAD_PRUNE, default ON; set "0"
-/// to disable); ~212 MB additional resident memory.
+/// to disable). Resident cost: ~170 MB for the default 6-bit affine arm,
+/// ~212 MB for the DARKBLOOM_LMHEAD_COARSE_BITS=8 MXFP8 arm.
 final class LagunaLmHeadPruner {
-    let codes: MLXArray   // [100352, 2048] uint8 e4m3 elements
-    let scales: MLXArray  // [100352, 64] uint8 e8m0 group scales
+    /// 8-bit arm: [100352, 2048] uint8 e4m3 elements ([0]) + [100352, 64]
+    /// uint8 e8m0 group scales ([1]).
+    /// 6-bit arm (default): plane-A [100352, 1024] u8 ([0]), plane-B
+    /// [100352, 512] u8 ([1]), and bf16 [100352, 32] scale/bias/measured
+    /// bound tables ([2]/[3]/[4]).
+    let coarseArrays: [MLXArray]
+    /// Selected coarse format (6 default, 8 via
+    /// `DARKBLOOM_LMHEAD_COARSE_BITS=8`), frozen at init so the built copy
+    /// and the dispatched kernel can never disagree.
+    let coarseBits: Int
 
     init?(lmHeadWeight: MLXArray) {
         guard lmHeadWeight.shape == [lagunaLmHeadPruneVocab, lagunaLmHeadPruneHidden],
@@ -730,15 +899,61 @@ final class LagunaLmHeadPruner {
                 Data("mlxfast: lm_head prune: unrecognized lm_head shape/dtype; disabled\n".utf8))
             return nil
         }
-        // The repo's own quantizer (ops.cpp fp_quantize gs32/bits8 ->
-        // fp_quantized.h fp_quantize kernel): e8m0 group scale = 2^round(log2(
-        // gmax/448)), e4m3 elements of w/sd. Returns (wq uint32 viewed as
-        // [V, 512], scales uint8 [V, 64]); the uint32 view is the same bytes
-        // as per-element uint8 codes in order.
-        let (wq, scales, _) = quantized(
-            lmHeadWeight, groupSize: 32, bits: 8, mode: .mxfp8)
-        self.codes = wq.view(dtype: .uint8)
-        self.scales = scales
+        self.coarseBits = lagunaLmHeadCoarseBits
+        if coarseBits == 6 {
+            self.coarseArrays = Self.buildAffine6(lmHeadWeight: lmHeadWeight)
+        } else {
+            // The repo's own quantizer (ops.cpp fp_quantize gs32/bits8 ->
+            // fp_quantized.h fp_quantize kernel): e8m0 group scale =
+            // 2^round(log2(gmax/448)), e4m3 elements of w/sd. Returns (wq
+            // uint32 viewed as [V, 512], scales uint8 [V, 64]); the uint32
+            // view is the same bytes as per-element uint8 codes in order.
+            let (wq, scales, _) = quantized(
+                lmHeadWeight, groupSize: 32, bits: 8, mode: .mxfp8)
+            self.coarseArrays = [wq.view(dtype: .uint8), scales]
+        }
+    }
+
+    /// Init-time 6-bit affine coarse copy (group 64) with a measured
+    /// certified bound table. All arithmetic is f32 MLX ops; the certificate
+    /// leans on nothing but the arrays built here (module header).
+    private static func buildAffine6(lmHeadWeight: MLXArray) -> [MLXArray] {
+        let vocab = lagunaLmHeadPruneVocab
+        let groups = lagunaLmHeadPruneHidden / 64
+        let wf = lmHeadWeight.asType(.float32).reshaped([vocab, groups, 64])
+        let groupMax = wf.max(axis: -1, keepDims: true)
+        let groupMin = wf.min(axis: -1, keepDims: true)
+        let scaleStored = ((groupMax - groupMin) / 63).asType(.bfloat16)
+        let biasStored = groupMin.asType(.bfloat16)
+        let s = scaleStored.asType(.float32)
+        let b = biasStored.asType(.float32)
+        // Zero-range groups keep q = 0 via the epsilon divisor; their decode
+        // is bf16(min) and the measured bound records the exact residual.
+        let safeScale = maximum(s, MLXArray(Float.leastNormalMagnitude))
+        let q = clip(round((wf - b) / safeScale), min: 0, max: 63)
+        let decoded = s * q + b
+        // Measured per-group bound, padded (1 + 2^-7) so it stays certified
+        // through its own bf16 round-to-nearest storage (<= 2^-8 relative).
+        let bound = (abs(wf - decoded).max(axis: -1, keepDims: true)
+            * (1 + Float(0x1p-7))).asType(.bfloat16)
+
+        let codes = q.asType(.uint8).reshaped([vocab, lagunaLmHeadPruneHidden])
+        // Plane A: q >> 2, element 2b in byte b's low nibble.
+        let high = codes.floorDivide(4).reshaped([vocab, 1024, 2])
+        let planeA = high[.ellipsis, 0] + high[.ellipsis, 1] * 16
+        // Plane B: q & 3, element 4b+i at bits 2i of byte b.
+        let low = (codes % 4).reshaped([vocab, 512, 4])
+        let planeB =
+            low[.ellipsis, 0] + low[.ellipsis, 1] * 4 + low[.ellipsis, 2] * 16
+            + low[.ellipsis, 3] * 64
+        let arrays = [
+            planeA, planeB,
+            scaleStored.reshaped([vocab, groups]),
+            biasStored.reshaped([vocab, groups]),
+            bound.reshaped([vocab, groups]),
+        ]
+        eval(arrays)
+        return arrays
     }
 
     /// Pruned final-row lm_head: full [vocab] BF16 logits row, bit-identical to
@@ -748,17 +963,22 @@ final class LagunaLmHeadPruner {
         precondition(hidden.dtype == .bfloat16 && hidden.size == lagunaLmHeadPruneHidden)
         let vocab = lagunaLmHeadPruneVocab
         let x = hidden.reshaped([lagunaLmHeadPruneHidden])
-        let useCoarseV1 = lagunaLmHeadCoarseUseV1
+        // The 6-bit arm has one kernel version; DARKBLOOM_LMHEAD_COARSE=v1
+        // applies to the 8-bit arm only.
+        let useCoarseV1 = coarseBits == 8 && lagunaLmHeadCoarseUseV1
         let coarseRowsPerThreadgroup = useCoarseV1 ? 8 : 16
         let coarseThreadsPerThreadgroup = coarseRowsPerThreadgroup * 32
+        let coarseInputs = [x] + coarseArrays
 
         let coarseOut: [MLXArray]
         if lagunaLmHeadInlineMaskEnabled {
             let coarseKernel =
-                useCoarseV1
-                ? lagunaLmHeadInlineCoarseKernelV1 : lagunaLmHeadInlineCoarseKernel
+                coarseBits == 6
+                ? lagunaLmHeadAffine6InlineCoarseKernel
+                : useCoarseV1
+                    ? lagunaLmHeadInlineCoarseKernelV1 : lagunaLmHeadInlineCoarseKernel
             coarseOut = coarseKernel(
-                [x, codes, scales],
+                coarseInputs,
                 grid: (
                     vocab / coarseRowsPerThreadgroup * coarseThreadsPerThreadgroup,
                     1,
@@ -769,13 +989,14 @@ final class LagunaLmHeadPruner {
                 outputDTypes: [.float32, .float32]
             )
         } else {
-            // Kill-switch fallback: the new tip's original three-output
-            // coarse kernels still materialize `coarse_bf` for the retained
-            // selector/exact path.
+            // Kill-switch fallback: the three-output coarse kernels still
+            // materialize `coarse_bf` for the retained selector/exact path.
             let coarseKernel =
-                useCoarseV1 ? lagunaLmHeadCoarseKernelV1 : lagunaLmHeadCoarseKernel
+                coarseBits == 6
+                ? lagunaLmHeadAffine6CoarseKernel
+                : useCoarseV1 ? lagunaLmHeadCoarseKernelV1 : lagunaLmHeadCoarseKernel
             coarseOut = coarseKernel(
-                [x, codes, scales],
+                coarseInputs,
                 grid: (
                     vocab / coarseRowsPerThreadgroup * coarseThreadsPerThreadgroup,
                     1,
