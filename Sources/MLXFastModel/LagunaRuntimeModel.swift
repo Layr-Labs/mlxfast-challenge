@@ -248,13 +248,17 @@ let lagunaFusedRoutedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV"] != "0"
 
-/// Scheduling A/B for the merged routed/shared gate/up kernel. The proven R2
-/// schedule is the default; only an explicit selector value of `4` opts into
-/// the R4 control. R4 preserves each row's arithmetic; its only risk is
-/// performance from higher register pressure/occupancy tradeoffs.
-let lagunaRoutedSharedSwiGLUQMVRows4Enabled =
-    ProcessInfo.processInfo.environment[
-        "DARKBLOOM_ROUTED_SHARED_SWIGLU_ROWS"] == "4"
+/// Scheduling A/B for the merged routed/shared gate/up kernel. R1 is the
+/// candidate default. `DARKBLOOM_ROUTED_SHARED_SWIGLU_ROWS=2` restores b38's
+/// R2 kernel and `=4` selects the existing R4 control. All three preserve each
+/// row's arithmetic; only threadgroup ownership and launch geometry differ.
+private let lagunaRoutedSharedSwiGLUQMVRows: Int = {
+    switch ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_SHARED_SWIGLU_ROWS"] {
+    case "4": return 4
+    case "2": return 2
+    default: return 1
+    }
+}()
 
 /// Folds the per-head softplus gate into the output projection's GEMV (see
 /// `lagunaGatedOutputProjectionSource`), with one kernel variant per attention
@@ -3019,6 +3023,134 @@ func lagunaGatedAffineOProj(
     )[0]
 }
 
+private func lagunaGateQMVProductSoftplusSource(heads: Int) -> String {
+    """
+    constexpr int gate_rows = \(heads);
+    constexpr int head_dim = \(LagunaConstants.headDim);
+    constexpr int in_vec = gate_rows * head_dim;
+    constexpr int in_vec_size_w = 2048;
+    constexpr int in_vec_size_g = 64;
+
+    uint lid = thread_position_in_threadgroup.x;
+    uint simd_lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    threadgroup bfloat gate_logits[gate_rows];
+
+    int unit = simd_group / 2;
+    int sub = simd_group % 2;
+    int out_row = unit * 8 + sub * 4;
+    if (out_row < gate_rows) {
+        const device uint8_t* ws = (const device uint8_t*)gate_codes;
+        ws += out_row * in_vec_size_w + simd_lane * 8;
+        uint xoff = simd_lane * 8;
+        thread float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint k = 0; k < 2048; k += 256) {
+            thread float x_thread[8];
+            float sum = 0.0f;
+            for (uint i = 0; i < 8; ++i) {
+                float xv = float(normalized[k + xoff + i]);
+                sum += xv;
+                x_thread[i] = xv;
+            }
+            for (int row = 0; row < 4; ++row) {
+                int clamped = metal::min(out_row + row, gate_rows - 1);
+                const device uint8_t* wl =
+                    (const device uint8_t*)gate_codes +
+                    clamped * in_vec_size_w + (k + simd_lane * 8);
+                float s = float(gate_scales[clamped * in_vec_size_g +
+                    (k / 256) * 8 + simd_lane / 4]);
+                float b = float(gate_biases[clamped * in_vec_size_g +
+                    (k / 256) * 8 + simd_lane / 4]);
+                float accum = 0.0f;
+                for (uint i = 0; i < 8; ++i) {
+                    accum += x_thread[i] * float(wl[i]);
+                }
+                result[row] += s * accum + sum * b;
+            }
+        }
+        for (int row = 0; row < 4; ++row) {
+            result[row] = simd_sum(result[row]);
+            if (simd_lane == 0 && out_row + row < gate_rows) {
+                gate_logits[out_row + row] = bfloat(result[row]);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint elem = threadgroup_position_in_grid.x * 512 + lid;
+    if (elem < uint(in_vec)) {
+        int head = elem / head_dim;
+        float logit = float(gate_logits[head]);
+        float gate;
+        if (metal::isnan(logit)) {
+            gate = NAN;
+        } else {
+            float maxval = metal::max(logit, 0.0f);
+            float minval = metal::min(logit, 0.0f);
+            gate = (metal::isinf(minval) || metal::isinf(maxval))
+                ? maxval
+                : maxval + log1p(metal::exp(minval - maxval));
+        }
+        bfloat gate_bf = bfloat(gate);
+        gated[elem] = bfloat(float(attention_output[elem]) * float(gate_bf));
+    }
+    """
+}
+
+private let lagunaGateQMVProductSoftplusKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_gate_qmv_product_softplus_bf16_h\(heads)_v2",
+            inputNames: [
+                "attention_output", "normalized", "gate_codes", "gate_scales",
+                "gate_biases",
+            ],
+            outputNames: ["gated"],
+            source: lagunaGateQMVProductSoftplusSource(heads: heads),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+private let lagunaFusedGateQMVEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATE_QMV"] != "0"
+
+func lagunaGateQMVProductSoftplus(
+    attentionOutput: MLXArray, normalized: MLXArray,
+    bank: LagunaNativeAffineWeight, heads: Int
+) -> MLXArray? {
+    guard lagunaFusedGateQMVEnabled,
+        bank.mode == .affine, bank.bits == 8, bank.groupSize == 32,
+        let biases = bank.biases,
+        bank.originalShape == [heads, LagunaConstants.hiddenSize],
+        let kernel = lagunaGateQMVProductSoftplusKernels[heads]
+    else { return nil }
+    let inVec = heads * LagunaConstants.headDim
+    let hidden = LagunaConstants.hiddenSize
+    guard attentionOutput.dtype == .bfloat16,
+        attentionOutput.shape == [1, 1, inVec],
+        normalized.dtype == .bfloat16,
+        normalized.shape == [1, 1, hidden],
+        bank.packedCodes.dtype == .uint32,
+        bank.packedCodes.shape == [heads, hidden / 4],
+        bank.scales.dtype == .bfloat16,
+        bank.scales.shape == [heads, hidden / 32],
+        biases.dtype == .bfloat16,
+        biases.shape == [heads, hidden / 32]
+    else { return nil }
+
+    lagunaTrace("gate qmv+product softplus h\(heads)")
+    return kernel(
+        [attentionOutput, normalized, bank.packedCodes, bank.scales, biases],
+        grid: (inVec, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [[1, 1, inVec]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 // MARK: - Norm-folded native-affine QKV projection (one dispatch)
 
 /// Folds the layer's input RMSNorm into the native group-32 affine INT8
@@ -3294,6 +3426,68 @@ func lagunaNormAffineQKV(
         outputShapes: [[1, 1, rows]],
         outputDTypes: [.bfloat16]
     )[0]
+}
+
+/// Decode-only fusion of the embedding gather and layer 0's input RMSNorm.
+private let lagunaEmbedNormKernel = MLXFast.metalKernel(
+    name: "laguna_embed_norm_bf16_2048_v1",
+    inputNames: ["token_ids", "embed_weight", "norm_weight"],
+    outputNames: ["hidden", "normalized"],
+    source: """
+        constexpr uint axis_size = 2048;
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        uint lid = thread_position_in_threadgroup.x;
+        uint simd_lane = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint base = lid * n_reads;
+        uint token = uint(token_ids[0]);
+        const device bfloat* table_row =
+            embed_weight + size_t(token) * axis_size;
+        \(lagunaNormInvMeanScratch)
+        threadgroup float local_sums[simd_size];
+        thread bfloat values[n_reads];
+        float acc = 0.0f;
+        for (uint i = 0; i < n_reads; ++i) {
+            bfloat value = table_row[base + i];
+            values[i] = value;
+            hidden[base + i] = value;
+            float fv = float(value);
+            acc += fv * fv;
+        }
+        acc = simd_sum(acc);
+        \(lagunaNormReductionTail2048)
+        for (uint i = 0; i < n_reads; ++i) {
+            normalized[base + i] =
+                norm_weight[base + i] *
+                bfloat(float(values[i]) * laguna_inv_mean);
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private let lagunaFusedEmbedNormEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_EMBED_NORM"] != "0"
+
+func lagunaEmbedNorm(
+    tokens: MLXArray, embedWeight: MLXArray, normWeight: MLXArray
+) -> (hidden: MLXArray, normalized: MLXArray)? {
+    guard lagunaFusedEmbedNormEnabled,
+        tokens.dtype == .int32, tokens.shape == [1, 1],
+        embedWeight.dtype == .bfloat16,
+        embedWeight.ndim == 2 && embedWeight.dim(1) == LagunaConstants.hiddenSize,
+        normWeight.dtype == .bfloat16,
+        normWeight.shape == [LagunaConstants.hiddenSize]
+    else { return nil }
+    lagunaTrace("embed+norm")
+    let outputs = lagunaEmbedNormKernel(
+        [tokens, embedWeight, normWeight],
+        grid: (512, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [[1, 1, LagunaConstants.hiddenSize], [1, 1, LagunaConstants.hiddenSize]],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
 }
 
 /// Keep the stock shapeless unary gate for prefill. Ranked measurement showed
@@ -3596,7 +3790,8 @@ final class LagunaRuntimeAttention: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
         qkRoPEAngles: MLXArray? = nil,
-        qkRoPEOffsets: MLXArray? = nil
+        qkRoPEOffsets: MLXArray? = nil,
+        precomputedNorm: MLXArray? = nil
     ) -> MLXArray {
         let (B, L) = (input.dim(0), input.dim(1))
 
@@ -3606,7 +3801,8 @@ final class LagunaRuntimeAttention: Module {
         var fusedNormQKV:
             (
                 queries: MLXArray, keys: MLXArray, values: MLXArray,
-                gateValues: MLXArray, gateActivated: Bool
+                gateValues: MLXArray, gateActivated: Bool,
+                gateQMV: (row: MLXArray, bank: LagunaNativeAffineWeight)?
             )?
         if lagunaFusedQKVProjectionEnabled, _fusedQKVWeight == nil,
             B == 1, L == 1,
@@ -3638,7 +3834,9 @@ final class LagunaRuntimeAttention: Module {
                 // device-visible normalized row; the NVFP4 tail layers and
                 // any `g_proj`-disabled ablation keep the separate norm.
                 var fusedQKV: MLXArray?
-                if lagunaFusedNormAffineQKVEnabled,
+                var normalizedStorage = precomputedNorm
+                if normalizedStorage == nil,
+                    lagunaFusedNormAffineQKVEnabled,
                     fusedAffine.mode == .affine, fusedAffine.bits == 8,
                     fusedAffine.groupSize == 32,
                     _nativeAffineQKVGateRows == nHeads,
@@ -3655,7 +3853,16 @@ final class LagunaRuntimeAttention: Module {
                 }
                 // Only materialized when the fused kernel declined; the gate
                 // branches below that read it are unreachable when it fired.
-                let normalized = fusedQKV ?? inputNorm(input)
+                let normalized: MLXArray
+                if let fusedQKV {
+                    normalized = fusedQKV
+                } else if let normalizedStorage {
+                    normalized = normalizedStorage
+                } else {
+                    let computed = inputNorm(input)
+                    normalizedStorage = computed
+                    normalized = computed
+                }
                 let qkv =
                     fusedQKV
                     ?? quantizedMM(
@@ -3671,6 +3878,16 @@ final class LagunaRuntimeAttention: Module {
                 let queryDim = nHeads * headDim
                 let kvDim = nKVHeads * headDim
                 let gateStart = queryDim + 2 * kvDim
+                // The native-affine tail keeps g_proj in its own group-32
+                // bank. When the gate-QMV/product kernel is available, pass
+                // the normalized row and bank through instead of materializing
+                // gate logits as a separate array.
+                let deferGateActivation =
+                    lagunaFusedGateProductEnabled
+                    && lagunaUseNativeAffineOProj(layer: layerIdx)
+                    && _nativeAffineOProj != nil
+                    && wo.bias == nil
+                var gateQMV: (row: MLXArray, bank: LagunaNativeAffineWeight)?
                 let gateLogits: MLXArray
                 if _nativeAffineQKVGateRows == nHeads {
                     // The gate rows rode the fused bank's single dispatch;
@@ -3679,18 +3896,24 @@ final class LagunaRuntimeAttention: Module {
                     gateLogits = qkv[.ellipsis, gateStart ..< (gateStart + nHeads)]
                 } else if let affineGate = _nativeAffineGProj {
                     // NVFP4-tail layer: the gate keeps its own group-32 INT8
-                    // bank (the envelope caps g_proj there) and replaces the
-                    // BF16 GEMV one dispatch for one dispatch.
-                    gateLogits = quantizedMM(
-                        normalized,
-                        affineGate.packedCodes,
-                        scales: affineGate.scales,
-                        biases: affineGate.biases,
-                        transpose: true,
-                        groupSize: affineGate.groupSize,
-                        bits: affineGate.bits,
-                        mode: affineGate.mode
-                    )
+                    // bank (the envelope caps g_proj there). The tail fusion
+                    // can consume that bank and the normalized row directly;
+                    // otherwise keep the exact affine GEMV fallback.
+                    if deferGateActivation, lagunaFusedGateQMVEnabled {
+                        gateQMV = (normalized, affineGate)
+                        gateLogits = normalized
+                    } else {
+                        gateLogits = quantizedMM(
+                            normalized,
+                            affineGate.packedCodes,
+                            scales: affineGate.scales,
+                            biases: affineGate.biases,
+                            transpose: true,
+                            groupSize: affineGate.groupSize,
+                            bits: affineGate.bits,
+                            mode: affineGate.mode
+                        )
+                    }
                 } else {
                     gateLogits = gateProjection(normalized)
                 }
@@ -3699,11 +3922,6 @@ final class LagunaRuntimeAttention: Module {
                 // the eager softplus chain entirely; the kernel reproduces
                 // those exact rounding boundaries inside its single dispatch.
                 // Otherwise keep the stock eager activation.
-                let deferGateActivation =
-                    lagunaFusedGateProductEnabled
-                    && lagunaUseNativeAffineOProj(layer: layerIdx)
-                    && _nativeAffineOProj != nil
-                    && wo.bias == nil
                 let gateValues =
                     deferGateActivation
                     ? gateLogits
@@ -3713,10 +3931,11 @@ final class LagunaRuntimeAttention: Module {
                     qkv[.ellipsis, queryDim ..< (queryDim + kvDim)],
                     qkv[.ellipsis, (queryDim + kvDim) ..< gateStart],
                     gateValues,
-                    !deferGateActivation
+                    !deferGateActivation,
+                    gateQMV
                 )
             } else {
-                fusedNormQKV = lagunaFusedNormQKVProjection(
+                if let fused = lagunaFusedNormQKVProjection(
                     residual: input,
                     normWeight: inputNorm.weight,
                     queryWeight: wq.weight,
@@ -3724,7 +3943,12 @@ final class LagunaRuntimeAttention: Module {
                     valueWeight: wv.weight,
                     gateWeight: gateProjection.weight,
                     heads: nHeads
-                )
+                ) {
+                    fusedNormQKV = (
+                        fused.queries, fused.keys, fused.values,
+                        fused.gateValues, fused.gateActivated, nil
+                    )
+                }
             }
         }
         // The fused result already contains every consumer of the normalized
@@ -3733,7 +3957,7 @@ final class LagunaRuntimeAttention: Module {
         // above (rather than its environment flag) preserves the custom
         // fallback if fused-weight preparation declined.
         let normalizedInput: MLXArray? =
-            fusedNormQKV == nil ? inputNorm(input) : nil
+            fusedNormQKV == nil ? (precomputedNorm ?? inputNorm(input)) : nil
 
         var queries: MLXArray
         var keys: MLXArray
@@ -3966,15 +4190,18 @@ final class LagunaRuntimeAttention: Module {
             // per-element gate).
             let projectedGate: MLXArray
             let gateIsActivated: Bool
+            let gateQMV: (row: MLXArray, bank: LagunaNativeAffineWeight)?
             if let fusedNormQKV {
                 projectedGate = fusedNormQKV.gateValues
                 gateIsActivated = fusedNormQKV.gateActivated
+                gateQMV = fusedNormQKV.gateQMV
             } else {
                 guard let normalizedInput else {
                     preconditionFailure("attention gate requires normalized input")
                 }
                 projectedGate = gProj(normalizedInput)
                 gateIsActivated = false
+                gateQMV = nil
             }
             // Native group-32 affine INT8 output projection for the serial
             // decode token. The stock fused kernel folds the gate into the
@@ -4003,14 +4230,17 @@ final class LagunaRuntimeAttention: Module {
                 headDim == LagunaConstants.headDim,
                 output.dtype == .bfloat16, projectedGate.dtype == .bfloat16,
                 output.shape == [1, 1, nHeads * headDim],
-                projectedGate.shape == [1, 1, nHeads]
+                gateQMV != nil
+                    ? gateQMV!.row.shape == [1, 1, LagunaConstants.hiddenSize]
+                    : projectedGate.shape == [1, 1, nHeads]
             {
                 // Raw logits + gated GEMV: ONE dispatch for the softplus
                 // chain, the broadcast product AND the INT8 contraction (see
                 // `lagunaGatedAffineOProjSource`). Only the group-32 affine
                 // INT8 wire format is served; the NVFP4 tail layers fall
                 // through to the two-dispatch chain below.
-                if lagunaFusedGatedAffineOProjEnabled, !gateIsActivated,
+                if gateQMV == nil,
+                    lagunaFusedGatedAffineOProjEnabled, !gateIsActivated,
                     affineWO.mode == .affine, affineWO.bits == 8,
                     affineWO.groupSize == 32,
                     let affineBiases = affineWO.biases,
@@ -4030,7 +4260,13 @@ final class LagunaRuntimeAttention: Module {
                 // compiled-softplus + donated in-place multiply whenever the
                 // gate is already activated or the kernel declines.
                 let gated: MLXArray
-                if !gateIsActivated,
+                if !gateIsActivated, let gateQMV,
+                    let fusedGated = lagunaGateQMVProductSoftplus(
+                        attentionOutput: output, normalized: gateQMV.row,
+                        bank: gateQMV.bank, heads: nHeads)
+                {
+                    gated = fusedGated
+                } else if !gateIsActivated,
                     let fusedGated = lagunaGateProductSoftplus(
                         attentionOutput: output, gateLogits: projectedGate,
                         heads: nHeads)
@@ -4759,7 +4995,7 @@ func lagunaRoutedSwiGLUQMV(
 /// shared) removes one dispatch per sparse layer without touching either
 /// slot's arithmetic: a threadgroup does exactly the work it did before, over
 /// the same bank, in the same order.
-private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
+private let lagunaRoutedSharedSwiGLUQMVR2Kernel = MLXFast.metalKernel(
     name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_v2",
     inputNames: [
         "input", "routed_weight", "routed_scales", "indices",
@@ -4779,9 +5015,6 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
         constexpr uint tiles_per_expert = 128;
         constexpr uint routed_experts = 8;
 
-        // Preserve each expert tile's arithmetic and output address while
-        // exposing all eight routed banks plus the shared bank in each
-        // scheduling wave.
         uint group = threadgroup_position_in_grid.x;
         uint expert_slot = group % (routed_experts + 1);
         uint tile = group / (routed_experts + 1);
@@ -4809,6 +5042,122 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
 
         for (uint block = 0; block < input_width; block += block_width) {
             const device vec<bfloat, 4>* input_vectors =
+                (const device vec<bfloat, 4>*)
+                    (input + block + lane * values_per_lane);
+            for (uint i = 0; i < values_per_lane / 4; ++i) {
+                const vec<bfloat, 4> values = input_vectors[i];
+                input_values[4 * i] = values[0];
+                input_values[4 * i + 1] = values[1];
+                input_values[4 * i + 2] = values[2];
+                input_values[4 * i + 3] = values[3];
+            }
+            for (uint row = 0; row < 2; ++row) {
+                uint logical_row = first_row + row;
+                uint gate_row;
+                uint up_row;
+                if (is_routed) {
+                    uint pair_tile = logical_row / 32;
+                    gate_row = pair_tile * 64 + logical_row % 32;
+                    up_row = gate_row + 32;
+                } else {
+                    gate_row = logical_row;
+                    up_row = gate_row + output_width;
+                }
+                const device uint8_t* gate_weight =
+                    expert_weight + gate_row * packed_row_bytes +
+                    block / 2 + lane * 8;
+                const device uint8_t* up_weight =
+                    expert_weight + up_row * packed_row_bytes +
+                    block / 2 + lane * 8;
+                const device uint8_t* gate_scale =
+                    expert_scales + gate_row * scale_row_bytes +
+                    block / 16 + lane;
+                const device uint8_t* up_scale =
+                    expert_scales + up_row * scale_row_bytes +
+                    block / 16 + lane;
+                gate_result[row] += laguna_nvfp4_qdot_16(
+                    gate_weight, input_values,
+                    laguna_nvfp4_scale(gate_scale[0]));
+                up_result[row] += laguna_nvfp4_qdot_16(
+                    up_weight, input_values,
+                    laguna_nvfp4_scale(up_scale[0]));
+            }
+        }
+        for (uint row = 0; row < 2; ++row) {
+            gate_result[row] = simd_sum(gate_result[row]);
+            up_result[row] = simd_sum(up_result[row]);
+            if (lane == 0) {
+                bfloat gate = bfloat(gate_result[row]);
+                bfloat up = bfloat(up_result[row]);
+                bfloat exp_abs = metal::exp(metal::abs(gate));
+                bfloat denominator = bfloat(1) + exp_abs;
+                bfloat y = bfloat(1) / denominator;
+                bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+                bfloat silu = bfloat(gate * sigmoid);
+                bfloat activation = bfloat(silu * up);
+                if (is_routed) {
+                    routed_activated[
+                        expert_slot * output_width + first_row + row] = activation;
+                } else {
+                    shared_activated[first_row + row] = activation;
+                }
+            }
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
+    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_r1_v3",
+    inputNames: [
+        "input", "routed_weight", "routed_scales", "indices",
+        "shared_weight", "shared_scales",
+    ],
+    outputNames: ["routed_activated", "shared_activated"],
+    source: """
+        constexpr uint input_width = 2048;
+        constexpr uint output_width = 512;
+        constexpr uint fused_width = 1024;
+        constexpr uint packed_row_bytes = 1024;
+        constexpr uint scale_row_bytes = 128;
+        constexpr uint packed_expert_bytes = fused_width * packed_row_bytes;
+        constexpr uint scale_expert_bytes = fused_width * scale_row_bytes;
+        constexpr uint block_width = 512;
+        constexpr uint values_per_lane = 16;
+        constexpr uint tiles_per_expert = 256;
+        constexpr uint routed_experts = 8;
+
+        // Preserve each expert tile's arithmetic and output address while
+        // exposing all eight routed banks plus the shared bank in each
+        // scheduling wave.
+        uint group = threadgroup_position_in_grid.x;
+        uint expert_slot = group % (routed_experts + 1);
+        uint tile = group / (routed_experts + 1);
+        bool is_routed = expert_slot < routed_experts;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint first_row = tile * 2 + simd_group;
+
+        const device uint8_t* expert_weight;
+        const device uint8_t* expert_scales;
+        if (is_routed) {
+            uint expert = uint(indices[expert_slot]);
+            expert_weight =
+                (const device uint8_t*)routed_weight +
+                expert * packed_expert_bytes;
+            expert_scales = routed_scales + expert * scale_expert_bytes;
+        } else {
+            expert_weight = (const device uint8_t*)shared_weight;
+            expert_scales = shared_scales;
+        }
+
+        thread float gate_result[1] = {0.0f};
+        thread float up_result[1] = {0.0f};
+        thread float input_values[values_per_lane];
+
+        for (uint block = 0; block < input_width; block += block_width) {
+            const device vec<bfloat, 4>* input_vectors =
                 (const device vec<bfloat, 4>*)(
                     input + block + lane * values_per_lane);
             for (uint i = 0; i < values_per_lane / 4; ++i) {
@@ -4819,7 +5168,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
                 input_values[4 * i + 3] = values[3];
             }
 
-            for (uint row = 0; row < 2; ++row) {
+            for (uint row = 0; row < 1; ++row) {
                 uint logical_row = first_row + row;
                 uint gate_row;
                 uint up_row;
@@ -4855,7 +5204,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             }
         }
 
-        for (uint row = 0; row < 2; ++row) {
+        for (uint row = 0; row < 1; ++row) {
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
             if (lane == 0) {
@@ -5315,14 +5664,23 @@ func lagunaRoutedSharedSwiGLUQMV(
         ])
 
     lagunaTrace("routed+shared gate/up QMV")
-    let kernel =
-        lagunaRoutedSharedSwiGLUQMVRows4Enabled
-        ? lagunaRoutedSharedSwiGLUQMVRows4Kernel
-        : lagunaRoutedSharedSwiGLUQMVKernel
-    // The R4 control covers eight rows per 64-thread group, so 64 tiles per
-    // each of the nine slots dispatch exactly 576 threadgroups. The default R2
-    // schedule retains its original 128 tiles per slot.
-    let tilesPerSlot = lagunaRoutedSharedSwiGLUQMVRows4Enabled ? 64 : 128
+    let kernel: MLXFast.MLXFastKernel
+    switch lagunaRoutedSharedSwiGLUQMVRows {
+    case 4:
+        kernel = lagunaRoutedSharedSwiGLUQMVRows4Kernel
+    case 2:
+        kernel = lagunaRoutedSharedSwiGLUQMVR2Kernel
+    default:
+        kernel = lagunaRoutedSharedSwiGLUQMVKernel
+    }
+    // R4 covers eight rows per 64-thread group, R2 covers four rows, and R1
+    // covers two rows. Each uses an exact whole number of tiles per slot.
+    let tilesPerSlot: Int
+    switch lagunaRoutedSharedSwiGLUQMVRows {
+    case 4: tilesPerSlot = 64
+    case 2: tilesPerSlot = 128
+    default: tilesPerSlot = 256
+    }
     let outputs = kernel(
         [input, routedWeight, routedScales, indices, sharedWeight, sharedScales],
         grid: (
@@ -6407,6 +6765,15 @@ private let lagunaPrefillMoETailEnabled =
 private let lagunaPrefillSortedMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_SORTED_MOE_TAIL"] != "0"
 
+/// Prefill-only router sidecar (default on; set
+/// `DARKBLOOM_PREFILL_ROUTER_BF16_SIDECAR=0` to restore the FP32 control): the
+/// tournament router already computes the eight FP32 mixture weights once per
+/// row, while the sorted MoE tail converts those same values independently in
+/// every output thread. Emit exact BF16 values alongside the authoritative
+/// FP32 result so the tail can consume them without repeating the conversion.
+private let lagunaPrefillRouterBF16SidecarEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ROUTER_BF16_SIDECAR"] != "0"
+
 /// Batched top-8 selection for multi-token (prefill) routing.
 ///
 /// Exactness against the stock chain it replaces, per row:
@@ -6575,10 +6942,37 @@ private func lagunaPrefillRouterTop8(
 /// scores through registers (no threadgroup memory) and folds them in
 /// ascending-lane order -- bit-identical to stock `weights.sum(axis: -1)`'s
 /// left fold and the IEEE FP32 divide that follows it.
-private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> String {
-    let epilogue =
-        normalizing
-        ? """
+private func lagunaPrefillRouterTournamentKernelSource(
+    normalizing: Bool, sidecar: Bool = false
+) -> String {
+    let epilogue: String
+    if sidecar {
+        epilogue =
+            normalizing
+            ? """
+        float total = 0.0f;
+        for (uint i = 0; i < 8; ++i) {
+            total = simd_shuffle(my_score2, ushort(i)) + total;
+        }
+        if (lane < 8) {
+            const float value = my_score2 / total;
+            router_indices[row * 8 + lane] = my_index2;
+            router_scores[row * 8 + lane] = value;
+            router_scores_bf16[row * 8 + lane] = bfloat(value);
+        }
+        """
+            : """
+        if (lane < 8) {
+            const float value = my_score2;
+            router_indices[row * 8 + lane] = my_index2;
+            router_scores[row * 8 + lane] = value;
+            router_scores_bf16[row * 8 + lane] = bfloat(value);
+        }
+        """
+    } else {
+        epilogue =
+            normalizing
+            ? """
         float total = 0.0f;
         for (uint i = 0; i < 8; ++i) {
             total = simd_shuffle(my_score2, ushort(i)) + total;
@@ -6588,12 +6982,13 @@ private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> Str
             router_scores[row * 8 + lane] = my_score2 / total;
         }
         """
-        : """
+            : """
         if (lane < 8) {
             router_indices[row * 8 + lane] = my_index2;
             router_scores[row * 8 + lane] = my_score2;
         }
         """
+    }
     return """
         uint lane = thread_position_in_threadgroup.x;
         uint row = threadgroup_position_in_grid.y;
@@ -6745,25 +7140,55 @@ private let lagunaPrefillRouterTournamentNormalizingKernel = MLXFast.metalKernel
     ensureRowContiguous: true
 )
 
+private let lagunaPrefillRouterTournamentSidecarKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_router_tournament_sidecar_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores", "router_scores_bf16"],
+    source: lagunaPrefillRouterTournamentKernelSource(normalizing: false, sidecar: true),
+    header: lagunaDecodeRouterTop8Header,
+    ensureRowContiguous: true
+)
+
+private let lagunaPrefillRouterTournamentSidecarNormalizingKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_router_tournament_sidecar_norm_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores", "router_scores_bf16"],
+    source: lagunaPrefillRouterTournamentKernelSource(normalizing: true, sidecar: true),
+    header: lagunaDecodeRouterTop8Header,
+    ensureRowContiguous: true
+)
+
 private func lagunaPrefillRouterTournament(
-    logits: MLXArray, correctionBias: MLXArray, rows: Int, normalizing: Bool
-) -> (MLXArray, MLXArray) {
+    logits: MLXArray, correctionBias: MLXArray, rows: Int, normalizing: Bool,
+    sidecar: Bool = false
+) -> (MLXArray, MLXArray, MLXArray?) {
     precondition(logits.dtype == .bfloat16 || logits.dtype == .float32)
     precondition(correctionBias.dtype == .float32)
     precondition(logits.size == rows * 256)
     precondition(correctionBias.size == 256)
 
-    let kernel =
-        normalizing
-        ? lagunaPrefillRouterTournamentNormalizingKernel : lagunaPrefillRouterTournamentKernel
+    let kernel: MLXFast.MLXFastKernel
+    if sidecar {
+        kernel = normalizing
+            ? lagunaPrefillRouterTournamentSidecarNormalizingKernel
+            : lagunaPrefillRouterTournamentSidecarKernel
+    } else {
+        kernel = normalizing
+            ? lagunaPrefillRouterTournamentNormalizingKernel
+            : lagunaPrefillRouterTournamentKernel
+    }
     let outputs = kernel(
         [logits, correctionBias],
         grid: (256, rows, 1),
         threadGroup: (256, 1, 1),
-        outputShapes: [[1, rows, 8], [1, rows, 8]],
-        outputDTypes: [.uint32, .float32]
+        outputShapes: sidecar
+            ? [[1, rows, 8], [1, rows, 8], [1, rows, 8]]
+            : [[1, rows, 8], [1, rows, 8]],
+        outputDTypes: sidecar
+            ? [.uint32, .float32, .bfloat16]
+            : [.uint32, .float32]
     )
-    return (outputs[0], outputs[1])
+    return (outputs[0], outputs[1], sidecar ? outputs[2] : nil)
 }
 
 private let lagunaPrefillRouterTournamentEnabled =
@@ -6793,7 +7218,9 @@ final class LagunaRuntimeMoEGate: Module {
     /// the same invocation already produced it (the fused residual + RMSNorm +
     /// router dispatch). It is the identical `x @ weight.T` this method would
     /// otherwise issue.
-    func callAsFunction(_ x: MLXArray, logits: MLXArray? = nil) -> (MLXArray, MLXArray) {
+    func callAsFunction(
+        _ x: MLXArray, logits: MLXArray? = nil
+    ) -> (MLXArray, MLXArray, MLXArray?) {
         let projectedLogits = logits ?? x.matmul(weight.T)
         let inds: MLXArray
         var weights: MLXArray
@@ -6807,12 +7234,16 @@ final class LagunaRuntimeMoEGate: Module {
             projectedLogits.dim(2) == 256,
             eScoreCorrectionBias.size == 256
         {
-            lagunaTrace("prefill router tournament")
+            lagunaTrace(
+                lagunaPrefillRouterBF16SidecarEnabled
+                    ? "prefill router tournament bf16 sidecar"
+                    : "prefill router tournament")
             return lagunaPrefillRouterTournament(
                 logits: projectedLogits,
                 correctionBias: eScoreCorrectionBias.asType(.float32),
                 rows: projectedLogits.dim(1),
-                normalizing: normTopkProb
+                normalizing: normTopkProb,
+                sidecar: lagunaPrefillRouterBF16SidecarEnabled
             )
         }
         if lagunaPrefillRouterTop8Enabled,
@@ -6826,12 +7257,13 @@ final class LagunaRuntimeMoEGate: Module {
             eScoreCorrectionBias.size == 256
         {
             lagunaTrace("prefill router top8")
-            return lagunaPrefillRouterTop8(
+            let (prefillInds, prefillWeights) = lagunaPrefillRouterTop8(
                 logits: projectedLogits,
                 correctionBias: eScoreCorrectionBias.asType(.float32),
                 rows: projectedLogits.dim(1),
                 normalizing: normTopkProb
             )
+            return (prefillInds, prefillWeights, nil)
         }
         if lagunaDecodeRouterTop8Enabled,
             lagunaDecodeRouterCastSinkEnabled,
@@ -6853,7 +7285,7 @@ final class LagunaRuntimeMoEGate: Module {
                 normalizing: sinkNormalization
             )
             if sinkNormalization {
-                return (inds, weights)
+                return (inds, weights, nil)
             }
         } else {
             var logits = projectedLogits.asType(.float32)
@@ -6883,7 +7315,7 @@ final class LagunaRuntimeMoEGate: Module {
         if normTopkProb {
             weights = weights / weights.sum(axis: -1, keepDims: true)
         }
-        return (inds, weights)
+        return (inds, weights, nil)
     }
 }
 
@@ -6950,26 +7382,23 @@ private let lagunaPrefillMoETailKernel = MLXFast.metalKernel(
 /// Reading that row directly preserves the stock slot-0-through-slot-7 BF16
 /// multiply/add sequence while deleting the intervening 16 MiB copy at the
 /// ranked 512-token window.
-private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_sorted_moe_tail_bf16_v1",
-    inputNames: [
-        "sorted_expert_outputs", "inverse_order", "router_weights",
-        "shared_output", "residual",
-    ],
-    outputNames: ["output"],
-    source: """
+private func lagunaPrefillSortedMoETailKernelSource(
+    routerWeightType: String
+) -> String {
+    precondition(routerWeightType == "float" || routerWeightType == "bfloat")
+    return """
         constexpr uint hidden = 2048;
         constexpr uint experts = 8;
         constexpr uint n_cols = 4;
 
         uint row = thread_position_in_grid.y;
         uint col = thread_position_in_grid.x * n_cols;
-        const device float* weight_row = router_weights + row * experts;
+        const device \(routerWeightType)* weight_row = router_weights + row * experts;
 
         bfloat expert_weights[experts];
         uint sorted_rows[experts];
         for (uint e = 0; e < experts; ++e) {
-            expert_weights[e] = bfloat(weight_row[e]);
+            expert_weights[e] = \(routerWeightType == "float" ? "bfloat(weight_row[e])" : "weight_row[e]");
             sorted_rows[e] = inverse_order[row * experts + e];
         }
 
@@ -6986,7 +7415,28 @@ private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
             output[row * hidden + col + i] =
                 bfloat(residual[row * hidden + col + i] + r2);
         }
-        """,
+        """
+}
+
+private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_sorted_moe_tail_bf16_v1",
+    inputNames: [
+        "sorted_expert_outputs", "inverse_order", "router_weights",
+        "shared_output", "residual",
+    ],
+    outputNames: ["output"],
+    source: lagunaPrefillSortedMoETailKernelSource(routerWeightType: "float"),
+    ensureRowContiguous: true
+)
+
+private let lagunaPrefillSortedMoETailBF16Kernel = MLXFast.metalKernel(
+    name: "laguna_prefill_sorted_moe_tail_bf16_weights_v1",
+    inputNames: [
+        "sorted_expert_outputs", "inverse_order", "router_weights",
+        "shared_output", "residual",
+    ],
+    outputNames: ["output"],
+    source: lagunaPrefillSortedMoETailKernelSource(routerWeightType: "bfloat"),
     ensureRowContiguous: true
 )
 
@@ -7032,14 +7482,22 @@ private func lagunaPrefillSortedMoETail(
             == rows * LagunaConstants.numExpertsPerTok * LagunaConstants.hiddenSize)
     precondition(inverseOrder.dtype == .uint32)
     precondition(inverseOrder.size == rows * LagunaConstants.numExpertsPerTok)
-    precondition(routerWeights.dtype == .float32)
+    precondition(routerWeights.dtype == .float32 || routerWeights.dtype == .bfloat16)
     precondition(routerWeights.shape == [1, rows, LagunaConstants.numExpertsPerTok])
     precondition(sharedOutput.dtype == .bfloat16)
     precondition(sharedOutput.shape == [1, rows, LagunaConstants.hiddenSize])
     precondition(residual.dtype == .bfloat16)
     precondition(residual.shape == [1, rows, LagunaConstants.hiddenSize])
 
-    return lagunaPrefillSortedMoETailKernel(
+    lagunaTrace(
+        routerWeights.dtype == .bfloat16
+            ? "prefill sorted moe tail bf16 weights"
+            : "prefill sorted moe tail")
+    let kernel =
+        routerWeights.dtype == .bfloat16
+        ? lagunaPrefillSortedMoETailBF16Kernel
+        : lagunaPrefillSortedMoETailKernel
+    return kernel(
         [
             sortedExpertOutputs, inverseOrder, routerWeights, sharedOutput,
             residual,
@@ -7288,7 +7746,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     private func forward(
         _ x: MLXArray, residual: MLXArray?, routerLogits: MLXArray?
     ) -> MLXArray {
-        let (inds, weights) = gate(x, logits: routerLogits)
+        let (inds, weights, prefillRouterWeightsBF16) = gate(x, logits: routerLogits)
         var y: MLXArray
         var routedAlreadyReduced = false
         var sortedTailInverseOrder: MLXArray?
@@ -7507,7 +7965,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     return lagunaPrefillSortedMoETail(
                         sortedExpertOutputs: y,
                         inverseOrder: inverseOrder,
-                        routerWeights: weights,
+                        routerWeights: prefillRouterWeightsBF16 ?? weights,
                         sharedOutput: sharedOut,
                         residual: residual
                     )
@@ -7619,7 +8077,8 @@ final class LagunaRuntimeDecoderLayer: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
         qkRoPEAngles: MLXArray? = nil,
-        qkRoPEOffsets: MLXArray? = nil
+        qkRoPEOffsets: MLXArray? = nil,
+        precomputedNorm: MLXArray? = nil
     ) -> MLXArray {
         let r = selfAttn(
             x,
@@ -7627,7 +8086,8 @@ final class LagunaRuntimeDecoderLayer: Module {
             mask: mask,
             cache: cache,
             qkRoPEAngles: qkRoPEAngles,
-            qkRoPEOffsets: qkRoPEOffsets
+            qkRoPEOffsets: qkRoPEOffsets,
+            precomputedNorm: precomputedNorm
         )
         let h: MLXArray
         let normalized: MLXArray
@@ -7984,6 +8444,7 @@ final class LagunaRuntimeModelInner: Module {
         var fullRoPEAngles: MLXArray?
         var slidingRoPEAngles: MLXArray?
         var qkRoPEOffsets: MLXArray?
+        var layer0PrecomputedNorm: MLXArray?
         if let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
             let fullAtlas = _fullRoPEAngleAtlas,
             let slidingAtlas = _slidingRoPEAngleAtlas,
@@ -8000,7 +8461,19 @@ final class LagunaRuntimeModelInner: Module {
         } else {
             // Verbatim stock fallback for prefill, unsupported caches and
             // positions outside the precomputed atlas.
-            h = embedTokens(inputs)
+            if inputs.shape == [1, 1], lagunaFusedEmbedNormEnabled,
+                let fused = lagunaEmbedNorm(
+                    tokens: inputs,
+                    embedWeight: embedTokens.weight,
+                    normWeight: layers[0].inputLayerNorm.weight)
+            {
+                // One dispatch for the gather and layer 0's input norm; the
+                // raw row still feeds the residual path.
+                h = fused.hidden
+                layer0PrecomputedNorm = fused.normalized
+            } else {
+                h = embedTokens(inputs)
+            }
             let isSingleTokenDecode = h.dim(0) == 1 && h.dim(1) == 1
             fullRoPEAngles =
                 lagunaFusedFullQKNormYaRNEnabled && isSingleTokenDecode
@@ -8087,7 +8560,8 @@ final class LagunaRuntimeModelInner: Module {
                     mask: mask,
                     cache: cache?[i],
                     qkRoPEAngles: qkRoPEAngles,
-                    qkRoPEOffsets: qkRoPEOffsets
+                    qkRoPEOffsets: qkRoPEOffsets,
+                    precomputedNorm: i == 0 ? layer0PrecomputedNorm : nil
                 )
                 if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
                     asyncEval(h)
