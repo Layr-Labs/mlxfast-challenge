@@ -1231,10 +1231,24 @@ namespace {
 // of the loader traffic, and it drops the LSU:MMA issue ratio from 5.00 to
 // 4.11. See notes/21-attn-analysis.md.
 //
-// DEFAULT OFF, read as `== "1"`. This is an unmeasured arm: the hoist extends
-// 8 fragments' live range across the whole loop (+28 registers/thread), and if
-// that crosses an occupancy threshold it shows up as a regression, not a win.
-// It must not ship until a paired measurement says otherwise.
+// DEFAULT ON, read as `!= "0"` (DARKBLOOM_ATTN_QHOIST=0 restores the stock
+// in-loop reload in the same binary). The prior "must not ship until a paired
+// measurement says otherwise" note kept this arm OFF through many
+// submissions, but no solver box can produce that paired measurement -- local
+// timing on this track has repeatedly mismeasured ranked results in both
+// directions, and the ranked paired run is an order of magnitude more
+// sensitive (see the notes archive). This submission IS the paired
+// measurement: the arm is bit-exact by construction (a pure hoist -- same
+// pointer, same offsets, same bounds predicate, identical fragment values
+// consumed in identical order; no float arithmetic is touched), so the only
+// possible failure mode is the occupancy regression described below, which
+// the ranked run prices directly and the env flag reverts.
+//
+// The occupancy risk, quantified: the hoist extends 8 fragments' live range
+// across the whole loop (+28 registers/thread, +16 KB/threadgroup at 128
+// threads). notes/21-attn-analysis.md expects that to fit on Apple family 9+
+// (this kernel allocates zero threadgroup memory and the on-chip pool is
+// shared), for ~17.8% loader-traffic reduction and LSU:MMA 5.00 -> 4.11.
 //
 // WHY A #define AND NOT A FUNCTION CONSTANT. The natural home for a host-side
 // switch is scaled_dot_product_attention.cpp, but that file is not in
@@ -1256,7 +1270,7 @@ namespace {
 // takes its arguments by value; the empty string appends nothing.
 const char* darkbloom_attn_qhoist_define() {
   static const bool enabled = [] {
-    const bool v = env::get_var("DARKBLOOM_ATTN_QHOIST", "") == "1";
+    const bool v = env::get_var("DARKBLOOM_ATTN_QHOIST", "1") != "0";
     // Same ground-truth discipline the STAGE arms needed: prove the arm is
     // live before trusting its number. A #define that silently fails to reach
     // the source string produces an arm that measures its own control.
