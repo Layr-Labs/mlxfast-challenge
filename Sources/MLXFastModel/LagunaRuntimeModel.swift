@@ -4047,6 +4047,37 @@ final class LagunaRuntimeAttention: Module {
 let lagunaNvfp4ScaleFoldEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_FOLD"] != "0"
 
+/// `DARKBLOOM_NVFP4_SCALE_CARRY` (default `1` = carry sign-fold; set `0` for
+/// the stock select form): builds the e4m3 scale's half bit pattern as
+/// `ushort((uint(bits) + (bits & 128u)) << 7)`. For sign-set bytes,
+/// `bits + 128 = 256 + (bits & 127)` and `256 << 7 = 0x8000` lands the sign
+/// on half bit 15 while clearing bit 14; for sign-clear bytes the add is the
+/// identity. Replaces the compare+select+negate chain with one integer add:
+/// 7 -> 5 real AIR ops per scale decode (`xcrun metal -fno-fast-math -S`;
+/// the ternary does NOT fuse at AIR level). The returned float is
+/// bit-identical for all 256 bytes in both scale-fold variants (exhaustive C
+/// bit-compare, with the half emulation itself validated against hardware
+/// over all 65536 patterns), the 16-bit pattern identity is machine-checked
+/// in Lean 4 (`bv_decide`, both the uint-add-then-truncate and direct 16-bit
+/// readings pinned against each other), and the kernel-level FNV-1a output
+/// fingerprint is identical across both settings over 30 interleaved
+/// microbench processes on real-shape banks. Paired local timing bounds the
+/// effect within the contended-box ±1% noise floor (not a regression); the
+/// sign claim rests on strictly-fewer-instructions in an ALU-bound kernel.
+/// Applies only with the scale fold ON; the fold-OFF ablation arm keeps the
+/// stock body.
+///
+/// RESTORED 2026-07-31 after an overlay loss: this shipped in the promoted
+/// accept `b38f18c` (submission `08e09606`) and was deleted 4 hours later by
+/// `1ba2bf6`'s whole-file overlay, which was built on a base predating it.
+/// `59052c2` restored two other mechanisms from the same overlay but not this
+/// one. The body below is `b38f18c`'s, character for character. The claim is
+/// honestly weak on its own -- it rode a multi-mechanism accept and was never
+/// isolated on the ranked box -- so it is carried here as a zero-risk
+/// passenger, not as the reason for this submission.
+let lagunaNvfp4ScaleCarry: Bool =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_CARRY"] != "0"
+
 /// `DARKBLOOM_NVFP4_NIBBLE_SPLIT` (default `1` = split; set `0` for the stock
 /// shuffle, `2` for the 2-constant control arm): a strictly shorter
 /// instruction sequence that produces the SAME eight `half` bit patterns per
@@ -4143,11 +4174,22 @@ private let lagunaSharedSwiGLUQMVHeader: String = {
                         ((c & 0x70007000u) >> 3) | (c & 0x80008000u);
             """
     }
+    // Carry sign-fold pairs only with the fold-ON scale; the ablation arm
+    // (fold OFF) keeps the shipped select body character-for-character.
+    let scaleCarryActive = lagunaNvfp4ScaleCarry && lagunaNvfp4ScaleFoldEnabled
+    let scaleRawExpression =
+        scaleCarryActive
+        ? "ushort((uint(bits) + (bits & 128u)) << 7)"
+        : "ushort(bits & 127) << 7"
+    let scaleSignExpression =
+        scaleCarryActive
+        ? "converted"
+        : "(bits & 128) ? -converted : converted"
     return """
     static inline float laguna_nvfp4_scale(uint8_t bits) {
-        ushort raw = ushort(bits & 127) << 7;
+        ushort raw = \(scaleRawExpression);
         half converted = as_type<half>(raw);
-    \(scale256)    half signed_value = (bits & 128) ? -converted : converted;
+    \(scale256)    half signed_value = \(scaleSignExpression);
     \(scaleTail)
     }
 
@@ -6060,11 +6102,26 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
                 float b_score = is_lower ? other_score : my_score;
 
                 bool lower_wants_better = (lane & sequence) == 0;
+                // `laguna_router_key_before` is a STRICT TOTAL ORDER on the
+                // pair `(key, index)`, so `a_before_b == !b_before_a` whenever
+                // the two operands differ. They always differ here: `my_index`
+                // is seeded to `lane` (0..255, distinct) and a bitonic network
+                // only ever permutes, so no two lanes can hold the same index.
+                // The second comparator call is therefore redundant -- it
+                // recomputes a known negation, including both `metal::isnan`
+                // tests and their branches. One call per stage, 36 stages.
+                //
+                // The `==` (XNOR) spelling below is deliberate: it is the form
+                // measured on the ranked box. `19f0692` and `94df4f9` differ by
+                // exactly this mechanism on the same base `1ba2bf6` and both
+                // published raw seconds/token -- decode 0.0069594397734375 ->
+                // 0.0069361022109375, i.e. **-0.335%**. That pair is the only
+                // same-base adjacent single-mechanism A/B in the public
+                // archive, so the exact expression is kept rather than an
+                // equivalent select-and-negate, whose AIR sequence differs.
                 bool b_before_a = laguna_router_key_before(
                     b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                bool swap = (b_before_a == lower_wants_better);
                 if (swap) {
                     my_key = is_lower ? b_key : a_key;
                     my_index = is_lower ? b_index : a_index;
@@ -6192,6 +6249,15 @@ private let lagunaPrefillMoETailEnabled =
 /// weighted reduction order.
 private let lagunaPrefillSortedMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_SORTED_MOE_TAIL"] != "0"
+
+/// Switchable replacement for `gatherSort`'s generic routed-input and
+/// permutation staging. Source rows and indices are copied byte-for-byte for
+/// every sorted Laguna prefill length, and the inverse permutation is built
+/// directly from the sort order. Set `DARKBLOOM_PREFILL_SORTED_ROW_COPY=0` to
+/// restore the stock `gatherSort` call.
+private let lagunaPrefillSortedRowCopyEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_SORTED_ROW_COPY"] != "0"
 
 /// Batched top-8 selection for multi-token (prefill) routing.
 ///
@@ -6416,11 +6482,13 @@ private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> Str
                 float b_score = is_lower ? other_score : my_score;
 
                 bool lower_wants_better = (lane & sequence) == 0;
+                // Same strict-total-order argument as the decode router: phase
+                // 1 seeds `my_index = lane` and only permutes, so the two
+                // operands never share an index and the second comparator call
+                // is a known negation.
                 bool b_before_a = laguna_router_key_before(
                     b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                bool swap = (b_before_a == lower_wants_better);
                 if (swap) {
                     my_key = is_lower ? b_key : a_key;
                     my_index = is_lower ? b_index : a_index;
@@ -6494,11 +6562,19 @@ private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> Str
                 float b_score = is_lower ? other_score : my_score2;
 
                 bool lower_wants_better = (lane & sequence) == 0;
+                // Phase 2 needs one extra step in the argument because lanes
+                // 64-255 hold WRAPPED DUPLICATES (`lane & 63`) of the 64 real
+                // candidates, so identical triples do exist in the threadgroup.
+                // They are never compared against each other: every partner is
+                // `lane ^ stride` with stride <= 32, which flips a bit inside
+                // the low 6, so partner `& 63` always differs from `lane & 63`.
+                // The 64 candidate slots themselves carry distinct indices --
+                // each is written from a different lane's phase-1 `my_index`,
+                // and phase 1 only permutes 0..255. So the two operands of this
+                // comparison always differ and `a_before_b == !b_before_a`.
                 bool b_before_a = laguna_router_key_before(
                     b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                bool swap = (b_before_a == lower_wants_better);
                 if (swap) {
                     my_key2 = is_lower ? b_key : a_key;
                     my_index2 = is_lower ? b_index : a_index;
@@ -6735,9 +6811,27 @@ private let lagunaPrefillMoETailKernel = MLXFast.metalKernel(
 /// `scatterUnsort(...)[p]` would copy to original flattened slot `p`.
 /// Reading that row directly preserves the stock slot-0-through-slot-7 BF16
 /// multiply/add sequence while deleting the intervening 16 MiB copy at the
-/// ranked 512-token window.
+/// ranked 512-token window. Four adjacent columns travel as one `bfloat4`;
+/// Metal arithmetic is componentwise, and each component retains its own
+/// ordered expert-0-through-expert-7 BF16 product/add chain.
+///
+/// Alignment holds unconditionally: `hidden` is 2048 and `col` is a multiple
+/// of `n_cols` = 4, so every offset is a multiple of 4 bfloats = 8 bytes, and
+/// `n_cols` divides `hidden`, so no partial vector can occur at a row edge.
+///
+/// This is `46b5084`'s body verbatim -- the submission that isolated this one
+/// mechanism on base `1ba2bf6` and published prefill `0.000235720623046875`
+/// s/token against that base's `0.000237182`, i.e. **prefill -0.616%**. Kept
+/// byte-for-byte (including the `_v2` identity and the `reinterpret_cast`
+/// spelling) so the measured artifact is what ships. The rename is hygiene
+/// rather than necessity: MLX's custom-kernel cache invalidates on source
+/// change (`Vendor/mlx-swift/.../metal/custom_kernel.cpp:56-69` clears the
+/// library when the stored source differs), so a same-name body swap would
+/// recompile, not serve a stale kernel. What the rename actually prevents is
+/// two DIFFERENT sources sharing one name inside a process, which would make
+/// them evict each other on every dispatch.
 private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_sorted_moe_tail_bf16_v1",
+    name: "laguna_prefill_sorted_moe_tail_bf16_v2",
     inputNames: [
         "sorted_expert_outputs", "inverse_order", "router_weights",
         "shared_output", "residual",
@@ -6752,26 +6846,29 @@ private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
         uint col = thread_position_in_grid.x * n_cols;
         const device float* weight_row = router_weights + row * experts;
 
-        bfloat expert_weights[experts];
-        uint sorted_rows[experts];
+        bfloat4 total = bfloat4(bfloat(0));
         for (uint e = 0; e < experts; ++e) {
-            expert_weights[e] = bfloat(weight_row[e]);
-            sorted_rows[e] = inverse_order[row * experts + e];
+            bfloat expert_weight = bfloat(weight_row[e]);
+            uint sorted_row = inverse_order[row * experts + e];
+            bfloat4 expert_values =
+                *reinterpret_cast<const device bfloat4*>(
+                    sorted_expert_outputs + sorted_row * hidden + col);
+            bfloat4 product = bfloat4(
+                expert_values * bfloat4(expert_weight));
+            total = bfloat4(product + total);
         }
-
-        for (uint i = 0; i < n_cols; ++i) {
-            bfloat total = bfloat(0);
-            for (uint e = 0; e < experts; ++e) {
-                bfloat product = bfloat(
-                    sorted_expert_outputs[sorted_rows[e] * hidden + col + i] *
-                    expert_weights[e]);
-                total = bfloat(product + total);
-            }
-            bfloat scaled = bfloat(total * bfloat(2.5f));
-            bfloat r2 = bfloat(scaled + shared_output[row * hidden + col + i]);
-            output[row * hidden + col + i] =
-                bfloat(residual[row * hidden + col + i] + r2);
-        }
+        bfloat4 scaled = bfloat4(
+            total * bfloat4(bfloat(2.5f)));
+        bfloat4 shared_values =
+            *reinterpret_cast<const device bfloat4*>(
+                shared_output + row * hidden + col);
+        bfloat4 r2 = bfloat4(scaled + shared_values);
+        bfloat4 residual_values =
+            *reinterpret_cast<const device bfloat4*>(
+                residual + row * hidden + col);
+        *reinterpret_cast<device bfloat4*>(
+            output + row * hidden + col) =
+            bfloat4(residual_values + r2);
         """,
     ensureRowContiguous: true
 )
@@ -6868,6 +6965,77 @@ private func lagunaInterleavedSwiGLU(
 /// product and packs the 512-wide activation into the first half of the
 /// nominal 1024-wide output allocation, avoiding that intermediate's device
 /// round trip. `down_proj`, sorting, and unsorting remain the stock calls.
+/// `gatherSort` expands each token row once per selected expert after sorting
+/// the flattened expert indices. This kernel emits the same contiguous
+/// `[tokenCount * 8, 1, 2048]` BF16 payload for any sorted Laguna prefill,
+/// with one 16-byte copy per lane. The first vector lane also emits the two
+/// integer permutation arrays, avoiding a second metadata dispatch -- in
+/// particular the second `argSort` that `gatherSort` runs over the 4096-element
+/// permutation just to invert it. Inversion of a permutation is a scatter, not
+/// a sort: `inverse_order[order[s]] = s`.
+///
+/// RESTORED 2026-07-31 after an overlay loss: this shipped in the promoted
+/// accept `f6cae93` (submission `94b95579`, 11:59) and was deleted 15 minutes
+/// later by `701c0db`'s whole-file overlay (10 insertions / 99 deletions),
+/// which was built on a base predating it. No promoted tree has carried it
+/// since. The body below is `f6cae93`'s, character for character.
+private let lagunaPrefillSortedRowCopyKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_sorted_route_bf16_top8_v3",
+    inputNames: ["source", "flat_indices", "order"],
+    outputNames: ["sorted", "sorted_indices", "inverse_order"],
+    source: """
+        constexpr uint hidden_vectors = 2048 / 8;
+        constexpr uint experts_per_token = 8;
+
+        uint vector_index = thread_position_in_grid.x;
+        uint sorted_row = thread_position_in_grid.y;
+        uint original_row = order[sorted_row];
+        uint source_row = original_row / experts_per_token;
+        const device uint4* source_vectors =
+            (const device uint4*)(source);
+        device uint4* sorted_vectors = (device uint4*)(sorted);
+        sorted_vectors[sorted_row * hidden_vectors + vector_index] =
+            source_vectors[source_row * hidden_vectors + vector_index];
+
+        if (vector_index == 0) {
+            sorted_indices[sorted_row] = flat_indices[original_row];
+            inverse_order[original_row] = sorted_row;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private func lagunaPrefillSortedRoute(
+    source: MLXArray,
+    flatIndices: MLXArray,
+    order: MLXArray
+) -> (MLXArray, MLXArray, MLXArray) {
+    precondition(source.dtype == .bfloat16)
+    precondition(source.dim(-1) == LagunaConstants.hiddenSize)
+    precondition(source.size.isMultiple(of: LagunaConstants.hiddenSize))
+    precondition(flatIndices.dtype == .uint32)
+    precondition(
+        flatIndices.size
+            == (source.size / LagunaConstants.hiddenSize)
+                * LagunaConstants.numExpertsPerTok)
+    precondition(order.dtype == .uint32)
+    precondition(order.size == flatIndices.size)
+
+    let sortedRows = flatIndices.size
+    let outputs = lagunaPrefillSortedRowCopyKernel(
+        [source, flatIndices, order],
+        grid: (LagunaConstants.hiddenSize / 8, sortedRows, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [
+            [sortedRows, 1, LagunaConstants.hiddenSize],
+            [sortedRows],
+            [sortedRows],
+        ],
+        outputDTypes: [.bfloat16, .uint32, .uint32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 private func lagunaFusedSortedRoutedGateUp(
     _ x: MLXArray,
     indices: MLXArray,
@@ -6889,7 +7057,25 @@ private func lagunaFusedSortedRoutedGateUp(
     var inverseOrder = MLXArray()
     // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
     if doSort {
-        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        if lagunaPrefillSortedRowCopyEnabled,
+            sortedX.dtype == .bfloat16,
+            sortedX.dim(-1) == LagunaConstants.hiddenSize,
+            sortedX.size.isMultiple(of: LagunaConstants.hiddenSize),
+            indices.dtype == .uint32,
+            indices.size
+                == (sortedX.size / LagunaConstants.hiddenSize)
+                    * LagunaConstants.numExpertsPerTok
+        {
+            let flatIndices = indices.flattened()
+            let order = argSort(flatIndices)
+            (sortedX, idx, inverseOrder) = lagunaPrefillSortedRoute(
+                source: sortedX,
+                flatIndices: flatIndices,
+                order: order
+            )
+        } else {
+            (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        }
     }
     // Fused counterpart of SwitchGLU's separate-bank branch:
     //   xUp = upProj(x, idx, sortedIndices: doSort)
