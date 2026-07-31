@@ -77,6 +77,31 @@ let lagunaLmHeadPrunePrefillEnabled =
 private let lagunaLmHeadInlineMaskEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_INLINE_MASK"] != "0"
 
+/// Single-stream co-tiled coarse bank. DEFAULT ON; set
+/// `DARKBLOOM_LMHEAD_COTILE=0` to restore the two-stream codes+scales layout
+/// inside the same binary.
+///
+/// Pure memory relayout of the same MXFP8 bytes (CLAUDE.md: "Pure memory
+/// relayout or co-tiling that preserves quantized values, and
+/// input-independent dequantized caches, remain allowed"): row `r` of the
+/// bank is codes row `r` (2048 e4m3 bytes) followed by scales row `r` (64
+/// e8m0 bytes), so the coarse GEMV walks ONE device stream instead of two.
+/// The 2112-byte row stride keeps every 16-byte `uint4` code load aligned
+/// (2112 == 132 * 16). The kernel arithmetic, launch grid, lane->group
+/// mapping, accumulation order, and both outputs are IDENTICAL to the
+/// two-stream kernel -- only the two base addresses change -- so the notes/68
+/// certificate is untouched and the outputs are bit-identical (verified by
+/// FNV-1a fingerprint over coarse+delta on synthetic banks, hash
+/// 04cd9dbebea4e8d5 both arms, 2026-07-31).
+///
+/// Applies only to the default v3 inline-mask path. Selecting
+/// `DARKBLOOM_LMHEAD_INLINE_MASK=0` or `DARKBLOOM_LMHEAD_COARSE=v1` keeps
+/// the stock two-stream layout and kernels; init retains exactly the layout
+/// the selected path dispatches, so resident overhead stays ~212 MB in every
+/// configuration.
+private let lagunaLmHeadCotileEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COTILE"] != "0"
+
 /// Kernel header: bit-exact MXFP8 element decoders + the certified
 /// half-cell-width table, all inlinable and libm-free.
 private let lagunaLmHeadPruneHeader = """
@@ -284,6 +309,80 @@ private let lagunaLmHeadInlineCoarseKernel = MLXFast.metalKernel(
 
         const device uint8_t* crow = codes + size_t(row) * 2048;
         const device uint8_t* srow = scales + size_t(row) * 64;
+
+        float c_acc = 0.0f;
+        float d_acc = 0.0f;
+        float m_acc = 0.0f;
+        for (uint gg = 0; gg < 2; ++gg) {
+            uint g = 2 * lane + gg;
+            float sd = laguna_e8m0_decode(srow[g]);
+            const device uint4* cptr = (const device uint4*)(crow + g * 32);
+            uint4 packed0 = cptr[0];
+            uint4 packed1 = cptr[1];
+            float cg = 0.0f;
+            float dg = 0.0f;
+            float mg = 0.0f;
+            const device ushort4* xrow = (const device ushort4*)(x + g * 32);
+            #pragma clang loop unroll(full)
+            for (uint w = 0; w < 8; ++w) {
+                uint word = (w < 4u) ? packed0[w & 3u] : packed1[w & 3u];
+                float4 cv4 = laguna_e4m3_decode4(word);
+                // bf16 -> f32 is exactly bits<<16 for every value class.
+                float4 xv4 = as_type<float4>(uint4(xrow[w]) << 16);
+                float4 ax4 = metal::abs(xv4);
+                uint4 b4 = (uint4(word) >> uint4(0u, 8u, 16u, 24u)) & 255u;
+                uint4 mag4 = b4 & 127u;
+                uint4 e4 = mag4 >> 3;
+                float4 hsf = as_type<float4>((metal::max(e4, uint4(1u)) + 116u) << 23);
+                float4 hs4 = metal::select(hsf, float4(186.0f), mag4 == 126u);
+                float4 acv4 = metal::abs(cv4);
+                #pragma clang loop unroll(full)
+                for (uint k = 0; k < 4; ++k) {
+                    float cv = cv4[k];
+                    float xv = xv4[k];
+                    float ax = ax4[k];
+                    cg += xv * cv;
+                    dg += ax * hs4[k];
+                    mg += ax * acv4[k];
+                }
+            }
+            c_acc += sd * cg;
+            d_acc += sd * dg;
+            m_acc += sd * mg;
+        }
+        c_acc = simd_sum(c_acc);
+        d_acc = simd_sum(d_acc);
+        m_acc = simd_sum(m_acc);
+        if (lane == 0) {
+            coarse[row] = c_acc;
+            delta[row] = d_acc * (1.0f + GAMMA) + (2.0f * GAMMA) * m_acc;
+        }
+        """,
+    header: lagunaLmHeadPruneHeader,
+    ensureRowContiguous: true
+)
+
+/// Co-tiled twin of `lagunaLmHeadInlineCoarseKernel`. The body below is the
+/// v3 inline coarse body verbatim except for the two pointer-setup lines:
+/// `crow` walks the single `[100352, 2112]` bank and `srow` is the fixed
+/// 2048-byte offset into the SAME row, where the two-stream kernel pointed it
+/// at the separate scales array. Every subsequent expression -- the group
+/// loop, the `uint4` packed loads, `laguna_e4m3_decode4`, the vectorized hs8
+/// bound, all three accumulators, both `simd_sum`s, and both stores -- is
+/// character-identical, so the outputs carry the same bits.
+private let lagunaLmHeadInlineCoarseCotiledKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_mxfp8_inline_coarse_cotiled_v1",
+    inputNames: ["x", "bank"],
+    outputNames: ["coarse", "delta"],
+    source: """
+        constexpr float GAMMA = 0x1p-15f;
+
+        uint row = threadgroup_position_in_grid.x * 16 +
+            simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        const device uint8_t* crow = bank + size_t(row) * 2112;
+        const device uint8_t* srow = crow + 2048;
 
         float c_acc = 0.0f;
         float d_acc = 0.0f;
@@ -719,8 +818,20 @@ private let lagunaLmHeadInlineExactKernel = MLXFast.metalKernel(
 /// `lagunaLmHeadPruneEnabled` (DARKBLOOM_LM_HEAD_PRUNE, default ON; set "0"
 /// to disable); ~212 MB additional resident memory.
 final class LagunaLmHeadPruner {
-    let codes: MLXArray   // [100352, 2048] uint8 e4m3 elements
-    let scales: MLXArray  // [100352, 64] uint8 e8m0 group scales
+    /// Two-stream layout: [100352, 2048] uint8 e4m3 elements plus
+    /// [100352, 64] uint8 e8m0 group scales. Retained exactly when a
+    /// dispatch path that reads it is selected (co-tiling off, the
+    /// inline-mask kill switch, or the v1 coarse arm).
+    let codes: MLXArray?
+    let scales: MLXArray?
+    /// Single-stream co-tiled layout: [100352, 2112] uint8, row `r` = codes
+    /// row `r` followed by scales row `r`. Retained exactly when the default
+    /// cotiled inline path is selected; same bytes, one device stream.
+    let bank: MLXArray?
+
+    /// The arrays the selected configuration keeps resident (~212 MB in
+    /// every configuration); the runtime evals these once at init.
+    var residentArrays: [MLXArray] { [codes, scales, bank].compactMap { $0 } }
 
     init?(lmHeadWeight: MLXArray) {
         guard lmHeadWeight.shape == [lagunaLmHeadPruneVocab, lagunaLmHeadPruneHidden],
@@ -737,8 +848,22 @@ final class LagunaLmHeadPruner {
         // as per-element uint8 codes in order.
         let (wq, scales, _) = quantized(
             lmHeadWeight, groupSize: 32, bits: 8, mode: .mxfp8)
-        self.codes = wq.view(dtype: .uint8)
-        self.scales = scales
+        let codes = wq.view(dtype: .uint8)
+        if lagunaLmHeadCotileEnabled, lagunaLmHeadInlineMaskEnabled,
+            !lagunaLmHeadCoarseUseV1
+        {
+            // Transform side of the co-tiling: one untimed init-time
+            // concatenation of the exact bytes the quantizer produced. The
+            // transient codes/scales views are released after this init;
+            // only the bank stays resident.
+            self.bank = concatenated([codes, scales], axis: 1)
+            self.codes = nil
+            self.scales = nil
+        } else {
+            self.codes = codes
+            self.scales = scales
+            self.bank = nil
+        }
     }
 
     /// Pruned final-row lm_head: full [vocab] BF16 logits row, bit-identical to
@@ -754,24 +879,47 @@ final class LagunaLmHeadPruner {
 
         let coarseOut: [MLXArray]
         if lagunaLmHeadInlineMaskEnabled {
-            let coarseKernel =
-                useCoarseV1
-                ? lagunaLmHeadInlineCoarseKernelV1 : lagunaLmHeadInlineCoarseKernel
-            coarseOut = coarseKernel(
-                [x, codes, scales],
-                grid: (
-                    vocab / coarseRowsPerThreadgroup * coarseThreadsPerThreadgroup,
-                    1,
-                    1
-                ),
-                threadGroup: (coarseThreadsPerThreadgroup, 1, 1),
-                outputShapes: [[vocab], [vocab]],
-                outputDTypes: [.float32, .float32]
-            )
+            if let bank {
+                // Default: the co-tiled single-stream bank (init retains it
+                // exactly when this path is selected). Same grid, same
+                // shapes, bit-identical outputs.
+                coarseOut = lagunaLmHeadInlineCoarseCotiledKernel(
+                    [x, bank],
+                    grid: (
+                        vocab / coarseRowsPerThreadgroup * coarseThreadsPerThreadgroup,
+                        1,
+                        1
+                    ),
+                    threadGroup: (coarseThreadsPerThreadgroup, 1, 1),
+                    outputShapes: [[vocab], [vocab]],
+                    outputDTypes: [.float32, .float32]
+                )
+            } else {
+                guard let codes, let scales else {
+                    preconditionFailure("lm_head prune: two-stream layout not retained")
+                }
+                let coarseKernel =
+                    useCoarseV1
+                    ? lagunaLmHeadInlineCoarseKernelV1 : lagunaLmHeadInlineCoarseKernel
+                coarseOut = coarseKernel(
+                    [x, codes, scales],
+                    grid: (
+                        vocab / coarseRowsPerThreadgroup * coarseThreadsPerThreadgroup,
+                        1,
+                        1
+                    ),
+                    threadGroup: (coarseThreadsPerThreadgroup, 1, 1),
+                    outputShapes: [[vocab], [vocab]],
+                    outputDTypes: [.float32, .float32]
+                )
+            }
         } else {
             // Kill-switch fallback: the new tip's original three-output
             // coarse kernels still materialize `coarse_bf` for the retained
             // selector/exact path.
+            guard let codes, let scales else {
+                preconditionFailure("lm_head prune: two-stream layout not retained")
+            }
             let coarseKernel =
                 useCoarseV1 ? lagunaLmHeadCoarseKernelV1 : lagunaLmHeadCoarseKernel
             coarseOut = coarseKernel(

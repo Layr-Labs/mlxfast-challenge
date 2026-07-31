@@ -476,14 +476,33 @@ public final class LagunaRuntimeWeightCache {
         let warmDecodeLogits = model(decodeToken, cache: warmupCache)
         eval(warmDecodeLogits)
         // Warm the greedy-token pipeline too. Every scored worker request ends
-        // in `LagunaCorrectness.greedyToken` (reshape -> last row -> argMax),
-        // and the forwards above never run an argmax, so its first use
+        // in `LagunaCorrectness.greedyToken` (reshape -> last row -> argMax ->
+        // item), and the forwards above never run an argmax, so its first use
         // otherwise creates the `argmax_bfloat16` compute pipeline state
         // INSIDE the measured window: a timestamped PSO-miss log showed the
         // compile firing ~0.23 s into the scored prefill request and again in
         // the decode seed, matching a recurring ~17 ms MTLCompilerService
         // interval inside both timed phases in Metal System Trace. Replicating
         // the same ops here moves that one-time compile to untimed init.
+        //
+        // Round 2 (warmup shape audit): finish the replica with the scored
+        // tail's blocking `.item(Int32.self)` readback (raw
+        // `mlx_array_item_uint32` scalar read; no astype, no kernel) so the
+        // whole scored chain has executed once before the protocol hello.
+        // The audited residue is otherwise empty: the runtime model slices to
+        // the last token BEFORE the final norm and lm_head
+        // (`lagunaLastTokenHidden`), so prefill, decode seed, and decode step
+        // all hand greedyToken `[1, 1, vocab]` logits -- there is no
+        // prefill-shaped `[1, 512, vocab]` chain anywhere on the scored path.
+        // A fresh-process op probe (vendored mlx-swift, bf16, V=100352)
+        // confirmed the chain's pipeline set is shape-invariant: the one-time
+        // first-use cost (~17-21 ms/process, MTLCompilerService-active) is
+        // paid by whichever shape runs first, and the other shape then runs
+        // at steady state (~0.4-1.5 ms) with no second spike in either
+        // order; after replicating exactly these warmup ops, the full scored
+        // chain including `item` showed no residual first-use cost at either
+        // shape (reshape is a view, `rows[-1]` lowers to the same
+        // scalar-index gather, argMax reduces the same `[vocab]` row).
         // Input-independent kernel-cache warmup only (TASK.md explicitly
         // allows caches for kernels); constant BOS input, output discarded.
         // `DARKBLOOM_WARM_GREEDY_ARGMAX=0` restores the stock warmup.
@@ -491,7 +510,7 @@ public final class LagunaRuntimeWeightCache {
             let vocabSize = warmDecodeLogits.shape.last, vocabSize > 0
         {
             let rows = warmDecodeLogits.reshaped([-1, vocabSize])
-            eval(rows[-1].argMax())
+            _ = rows[-1].argMax().item(Int32.self)
         }
     }
     /// See the construction-time comment: one `set_wired_limit` call sized

@@ -82,9 +82,9 @@ final class LagunaFusionTraceLog: @unchecked Sendable {
 }
 
 @inline(__always)
-func lagunaTrace(_ site: @autoclosure () -> String) {
+func lagunaTrace(_ site: String) {
     guard lagunaTraceFusion else { return }
-    lagunaTracedFusions.note(site())
+    lagunaTracedFusions.note(site)
 }
 
 // MARK: - Runtime fusion feature flags
@@ -2903,10 +2903,6 @@ private let lagunaGatedAffineOProjKernels: [Int: MLXFast.MLXFastKernel] = {
 let lagunaFusedGatedAffineOProjEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATED_AFFINE_OPROJ"] != "0"
 
-/// Gates only the NVFP4 tail-layer twin so it can be ablated independently.
-let lagunaGatedAffineOProjNVFP4Enabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_GATED_AFFINE_OPROJ_NVFP4"] != "0"
-
 /// Gate product + native-affine INT8 output projection in one dispatch, or
 /// `nil` when any shape, dtype or wire-format guard declines (caller then runs
 /// the exact two-dispatch chain).
@@ -2938,173 +2934,6 @@ func lagunaGatedAffineOProj(
     lagunaTrace("gated affine oproj qmv h\(heads)")
     return kernel(
         [attentionOutput, gateLogits, codes, scales, biases],
-        grid: ((outVec / 8) * 64, 1, 1),
-        threadGroup: (64, 1, 1),
-        outputShapes: [[1, 1, outVec]],
-        outputDTypes: [.bfloat16]
-    )[0]
-}
-
-// MARK: - Gated NVFP4 output projection for the affine tail layers
-
-/// NVFP4 twin of `lagunaGatedAffineOProjSource` for layers using the native
-/// group-16 NVFP4 output projection. It folds the softplus gate, broadcast
-/// product, and contraction into one dispatch while preserving the BF16 gate
-/// rounding point and the stock NVFP4 accumulation geometry.
-private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
-    let scaleFold = lagunaNvfp4ScaleFoldEnabled
-    let weightScale = scaleFold ? "" : " * 16384.0f"
-    let extract = """
-                    const uint xe = c & 0x0F0F0F0Fu;
-                    const uint ge = xe | (xe << 3);
-                    const uint yo = c & 0xF0F0F0F0u;
-                    const uint go = yo | (yo >> 3);
-                    const uint p0 = (ge << 9) & 0x8E008E00u;
-                    const uint p1 = (go << 8) & 0x8E008E00u;
-                    const uint p2 = (ge << 1) & 0x8E008E00u;
-                    const uint p3 = go & 0x8E008E00u;
-    """
-    return """
-    constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
-    constexpr uint out_vec_size = \(LagunaConstants.hiddenSize);
-    constexpr uint gate_heads = \(heads);
-    constexpr uint head_shift = 7;
-    constexpr uint group_size = 16;
-    constexpr uint values_per_thread = 16;
-    constexpr uint codes_per_thread = values_per_thread / 8;
-    constexpr uint block_size = values_per_thread * 32;
-    constexpr uint results_per_simdgroup = 4;
-    constexpr uint num_simdgroups = 2;
-    constexpr uint in_vec_size_g = in_vec_size / group_size;
-
-    uint tile = threadgroup_position_in_grid.x;
-    uint lid = thread_position_in_threadgroup.x;
-    uint simd_gid = simdgroup_index_in_threadgroup;
-    uint simd_lid = thread_index_in_simdgroup;
-
-    threadgroup float gate_table[gate_heads];
-    if (lid < gate_heads) {
-        float logit = float(gate_logits[lid]);
-        float gate;
-        if (metal::isnan(logit)) {
-            gate = NAN;
-        } else {
-            float maxval = metal::max(logit, 0.0f);
-            float minval = metal::min(logit, 0.0f);
-            gate = (metal::isinf(minval) || metal::isinf(maxval))
-                ? maxval
-                : maxval + log1p(metal::exp(minval - maxval));
-        }
-        gate_table[lid] = float(bfloat(gate));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint out_row = tile * (num_simdgroups * results_per_simdgroup) +
-        simd_gid * results_per_simdgroup;
-    const device uint32_t* ws =
-        (const device uint32_t*)weight_codes +
-        out_row * (in_vec_size / 8) + simd_lid * codes_per_thread;
-    const device uint8_t* sc = weight_scales +
-        out_row * in_vec_size_g + simd_lid;
-    const device bfloat* xp = attention_output + simd_lid * values_per_thread;
-
-    thread float x_thread[values_per_thread];
-    thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
-
-    uint column = simd_lid * values_per_thread;
-    for (uint k = 0; k < in_vec_size; k += block_size) {
-        float gate = gate_table[column >> head_shift];
-        for (uint i = 0; i < values_per_thread; ++i) {
-            x_thread[i] = float(bfloat(float(xp[i]) * gate));
-        }
-
-        for (uint row = 0; row < results_per_simdgroup; ++row) {
-            const device uint32_t* wl = ws + row * (in_vec_size / 8);
-            uint8_t sbits = sc[row * in_vec_size_g];
-            ushort sraw = ushort(sbits & 127) << 7;
-            half sconverted = as_type<half>(sraw);
-            float scale = float((sbits & 128) ? -sconverted : sconverted)
-                * 4194304.0f;
-            float accum = 0.0f;
-            #pragma unroll
-            for (uint j = 0; j < codes_per_thread; ++j) {
-                const uint c = wl[j];
-                \(extract)
-                const float2 v04 = float2(as_type<half2>(p0))\(weightScale);
-                const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
-                const float2 v26 = float2(as_type<half2>(p2))\(weightScale);
-                const float2 v37 = float2(as_type<half2>(p3))\(weightScale);
-                accum +=
-                    (x_thread[8 * j] * v04.x +
-                     x_thread[8 * j + 1] * v15.x +
-                     x_thread[8 * j + 2] * v26.x +
-                     x_thread[8 * j + 3] * v37.x);
-                accum +=
-                    (x_thread[8 * j + 4] * v04.y +
-                     x_thread[8 * j + 5] * v15.y +
-                     x_thread[8 * j + 6] * v26.y +
-                     x_thread[8 * j + 7] * v37.y);
-            }
-            result[row] += scale * accum;
-        }
-
-        ws += block_size / 8;
-        sc += block_size / group_size;
-        xp += block_size;
-        column += block_size;
-    }
-
-    for (uint row = 0; row < results_per_simdgroup; ++row) {
-        result[row] = simd_sum(result[row]);
-        if (simd_lid == 0) {
-            projected[out_row + row] = bfloat(result[row]);
-        }
-    }
-    """
-}
-
-private let lagunaGatedAffineOProjNVFP4Kernels: [Int: MLXFast.MLXFastKernel] = {
-    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
-    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
-        kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_v1",
-            inputNames: [
-                "attention_output", "gate_logits", "weight_codes",
-                "weight_scales",
-            ],
-            outputNames: ["projected"],
-            source: lagunaGatedAffineOProjNVFP4Source(heads: heads),
-            ensureRowContiguous: true
-        )
-    }
-    return kernels
-}()
-
-func lagunaGatedAffineOProjNVFP4(
-    attentionOutput: MLXArray,
-    gateLogits: MLXArray,
-    codes: MLXArray,
-    scales: MLXArray,
-    heads: Int
-) -> MLXArray? {
-    guard let kernel = lagunaGatedAffineOProjNVFP4Kernels[heads] else { return nil }
-    let inVec = heads * LagunaConstants.headDim
-    let outVec = LagunaConstants.hiddenSize
-    guard attentionOutput.dtype == .bfloat16,
-        attentionOutput.shape == [1, 1, inVec],
-        gateLogits.dtype == .bfloat16,
-        gateLogits.shape == [1, 1, heads],
-        codes.dtype == .uint32,
-        codes.shape == [outVec, inVec / 8],
-        scales.dtype == .uint8,
-        scales.shape == [outVec, inVec / 16]
-    else {
-        return nil
-    }
-
-    lagunaTrace("gated affine oproj nvfp4 qmv h\(heads)")
-    return kernel(
-        [attentionOutput, gateLogits, codes, scales],
         grid: ((outVec / 8) * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[1, 1, outVec]],
@@ -3511,6 +3340,201 @@ func lagunaTailNormQKVGate(
         outputDTypes: [.bfloat16, .bfloat16]
     )
     return (outputs[0], outputs[1])
+}
+
+// MARK: - Gated NVFP4 tail output projection (one dispatch)
+
+/// NVFP4-tail counterpart of `lagunaGatedAffineOProj` at the other end of the
+/// block: on the tail layers (`lagunaNativeAffineNVFP4From`, default 32-39)
+/// the o_proj bank keeps the exact NVFP4 wire format, so the `.affine` fused
+/// branch declines and the stock decode tail is TWO dispatches —
+/// `lagunaGateProductSoftplus` (softplus + broadcast product over the
+/// 6144/8192-wide attention row) followed by MLX's
+/// `nvfp4_qmv_fast_bfloat16_t_gs_16_b_4_batch_0` over the o_proj bank
+/// (N = 2048 output rows, K = heads * 128; `dispatch_qmv` → `qmv`'s fast
+/// predicate N % 8 == 0 && K % 512 == 0 holds for both head counts,
+/// quantized.cpp:1884-1903, 255-263). This kernel performs both in ONE
+/// dispatch and never materializes the intermediate gated row.
+///
+/// GATE half — one softplus per head in a threadgroup table, the same FP32
+/// `LogAddExp(x, 0)` form with the same NaN/inf guards and the same BF16
+/// rounding point as `lagunaGateProductSoftplusSource` (and as the
+/// `lagunaGatedAffineOProjSource` table this mirrors). The gate factor is
+/// applied inside the K loop at the exact rounding boundary the standalone
+/// product kernel uses, `float(bfloat(float(x) * gate))`, so every x value
+/// entering the contraction is bit-identical to loading the gated row the
+/// two-dispatch chain would have written (BF16 → FP32 conversion is exact).
+/// One gate lookup covers a lane's whole 16-value run: `values_per_thread`
+/// 16 divides `head_dim` 128 and every run starts 16-aligned, so a run never
+/// straddles a head boundary.
+///
+/// QMV half — a textual replica of `fp_qmv_fast_impl<bfloat16_t, 16, 4>`
+/// (fp_quantized.cpp:647) keeping MLX's dispatch geometry EXACTLY:
+/// 64-thread threadgroups, two simdgroups of four rows, `2048 / 8` tiles,
+/// packs_per_thread 2, values_per_thread 16, block_size 512, code base
+/// `out_row * K/2 + simd_lid * 8` bytes advancing 256 per block, scale base
+/// `out_row * K/16 + simd_lid` advancing 32 per block, the E4M3 half-shuffle
+/// scale decode (expression-identical to the vendored `fp8_e4m3::operator
+/// float`, fp8.h:32-46 — no NaN special case in either, so all 256 scale
+/// bytes agree by construction) and the non-folded vendored qdot (see
+/// `lagunaTailNVFP4QMVHeader`), one `result[row] += scale * accum` per block
+/// over ascending k, one `simd_sum` and one BF16 round per output row.
+/// NVFP4 has no biases. The stock kernel's wider vec<T,4> x loads change
+/// only load width, never values or rounding, so computing the gated x
+/// elements inline is the same arithmetic term for term — the same liberty
+/// the shipped `lagunaTailNormQKVGateSource` takes with its norm.
+///
+/// Verified bit-exact against both the shipped two-dispatch chain and the
+/// fully eager softplus chain over production-shaped synthetic NVFP4 banks
+/// (both head counts, checkpoint-realistic and adversarial full-range scale
+/// bytes, FNV-1a fingerprints; see LagunaGatedNVFP4OProjExactnessTests).
+/// Inputs are ordinary dense arrays (`ensureRowContiguous: true`) and the
+/// output is freshly allocated — no cache buffer is ever passed, so the
+/// donation/binding hazard that made `DARKBLOOM_FUSED_KV_WRITE` a ranked
+/// regression is structurally absent, exactly as in the accepted
+/// `lagunaGatedAffineOProj`.
+private func lagunaGatedNVFP4OProjSource(heads: Int) -> String {
+    """
+    constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
+    constexpr uint out_vec_size = \(LagunaConstants.hiddenSize);
+    constexpr uint gate_heads = \(heads);
+    constexpr uint head_shift = 7;              // head_dim == 128
+    constexpr uint values_per_thread = 16;      // pack_factor 8 * packs_per_thread 2
+    constexpr uint block_size = 512;            // values_per_thread * SIMD_SIZE
+    constexpr uint results_per_simdgroup = 4;
+    constexpr uint num_simdgroups = 2;
+    constexpr uint in_vec_size_w = in_vec_size / 2;   // packed-code bytes per row
+    constexpr uint in_vec_size_g = in_vec_size / 16;  // scale groups per row
+
+    uint tile = threadgroup_position_in_grid.x;
+    uint lid = thread_position_in_threadgroup.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    // One softplus per head, in the FP32 form and at the BF16 rounding point
+    // `lagunaGateProductSoftplusSource` uses.
+    threadgroup float gate_table[gate_heads];
+    if (lid < gate_heads) {
+        float logit = float(gate_logits[lid]);
+        float gate;
+        if (metal::isnan(logit)) {
+            gate = NAN;
+        } else {
+            float maxval = metal::max(logit, 0.0f);
+            float minval = metal::min(logit, 0.0f);
+            gate = (metal::isinf(minval) || metal::isinf(maxval))
+                ? maxval
+                : maxval + log1p(metal::exp(minval - maxval));
+        }
+        gate_table[lid] = float(bfloat(gate));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint out_row = tile * (num_simdgroups * results_per_simdgroup) +
+        simd_gid * results_per_simdgroup;
+
+    const device uint8_t* ws = (const device uint8_t*)weight_codes +
+        out_row * in_vec_size_w + simd_lid * 8;  // packs_per_thread 2 * 4 bytes
+    const device uint8_t* sc = weight_scales + out_row * in_vec_size_g +
+        simd_lid;                                // scale_step_per_thread == 1
+    const device bfloat* xp = attention_output + simd_lid * values_per_thread;
+
+    thread float x_thread[values_per_thread];
+    thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    uint column = simd_lid * values_per_thread;
+    for (uint k = 0; k < in_vec_size; k += block_size) {
+        float gate = gate_table[column >> head_shift];
+        for (uint i = 0; i < values_per_thread; ++i) {
+            x_thread[i] = float(bfloat(float(xp[i]) * gate));
+        }
+
+        for (uint row = 0; row < results_per_simdgroup; ++row) {
+            const device uint8_t* wl = ws + row * in_vec_size_w;
+            float scale = laguna_tail_nvfp4_scale(sc[row * in_vec_size_g]);
+            result[row] += laguna_tail_nvfp4_qdot(wl, x_thread, scale);
+        }
+
+        ws += block_size / 2;
+        sc += block_size / 16;
+        xp += block_size;
+        column += block_size;
+    }
+
+    for (uint row = 0; row < results_per_simdgroup; ++row) {
+        result[row] = simd_sum(result[row]);
+        if (simd_lid == 0) {
+            projected[out_row + row] = bfloat(result[row]);
+        }
+    }
+    """
+}
+
+/// One kernel per attention head count, built eagerly so one binary serves
+/// every arm of an ablation and MLX's name-keyed JIT cache never sees two
+/// sources under one name.
+private let lagunaGatedNVFP4OProjKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_gated_nvfp4_oproj_qmv_g16b4_h\(heads)_v1",
+            inputNames: [
+                "attention_output", "gate_logits", "weight_codes",
+                "weight_scales",
+            ],
+            outputNames: ["projected"],
+            source: lagunaGatedNVFP4OProjSource(heads: heads),
+            header: lagunaTailNVFP4QMVHeader,
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+/// `DARKBLOOM_FUSED_GATED_NVFP4_OPROJ` (default ON; set "0" to disable).
+/// Fuses the per-head softplus gate product into the native NVFP4 o_proj
+/// GEMV on the tail layers so their decode attention tail is one dispatch
+/// instead of two. Bit-exact: the gate factor is applied at the same
+/// FP32 -> BF16 rounding point as `lagunaGateProductSoftplus`, and the
+/// contraction keeps MLX's `fp_qmv_fast` geometry and accumulation order
+/// exactly. Falls back to the exact two-dispatch chain whenever the o_proj
+/// bank is not group-16 4-bit NVFP4 or any guard declines.
+let lagunaFusedGatedNVFP4OProjEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATED_NVFP4_OPROJ"] != "0"
+
+/// Gate product + native NVFP4 output projection in one dispatch, or `nil`
+/// when any shape or dtype guard declines (caller then runs the exact
+/// two-dispatch chain).
+func lagunaGatedNVFP4OProj(
+    attentionOutput: MLXArray,
+    gateLogits: MLXArray,
+    codes: MLXArray,
+    scales: MLXArray,
+    heads: Int
+) -> MLXArray? {
+    guard let kernel = lagunaGatedNVFP4OProjKernels[heads] else { return nil }
+    let inVec = heads * LagunaConstants.headDim
+    let outVec = LagunaConstants.hiddenSize
+    guard attentionOutput.dtype == .bfloat16,
+        attentionOutput.shape == [1, 1, inVec],
+        gateLogits.dtype == .bfloat16,
+        gateLogits.shape == [1, 1, heads],
+        codes.dtype == .uint32,
+        codes.shape == [outVec, inVec / 8],
+        scales.dtype == .uint8,
+        scales.shape == [outVec, inVec / 16]
+    else {
+        return nil
+    }
+
+    lagunaTrace("gated nvfp4 oproj qmv h\(heads)")
+    return kernel(
+        [attentionOutput, gateLogits, codes, scales],
+        grid: ((outVec / 8) * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, outVec]],
+        outputDTypes: [.bfloat16]
+    )[0]
 }
 
 // MARK: - Norm-folded native-affine QKV projection (one dispatch)
@@ -4470,12 +4494,15 @@ final class LagunaRuntimeAttention: Module {
                 {
                     return fusedProjection
                 }
-                if lagunaFusedGatedAffineOProjEnabled,
-                    lagunaGatedAffineOProjNVFP4Enabled,
-                    !gateIsActivated,
+                // NVFP4-tail twin of the branch above: on the tail layers the
+                // o_proj bank is exact group-16 NVFP4, so the softplus chain,
+                // the broadcast product AND the NVFP4 contraction run as ONE
+                // dispatch (see `lagunaGatedNVFP4OProjSource`). Any guard
+                // decline falls through to the two-dispatch chain below.
+                if lagunaFusedGatedNVFP4OProjEnabled, !gateIsActivated,
                     affineWO.mode == .nvfp4, affineWO.bits == 4,
-                    affineWO.groupSize == 16,
-                    let fusedProjection = lagunaGatedAffineOProjNVFP4(
+                    affineWO.groupSize == 16, affineWO.biases == nil,
+                    let fusedProjection = lagunaGatedNVFP4OProj(
                         attentionOutput: output,
                         gateLogits: projectedGate,
                         codes: affineWO.packedCodes,
@@ -6780,6 +6807,26 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
             router_scores[lane] = my_score;
         }
         """
+    let compareExchange = """
+                // Give both lanes of a pair the same `(lower, upper)`
+                // argument orientation, keeping every comparator branch
+                // SIMD-coherent. The comparator is a strict total order and
+                // paired expert indices are distinct, so `a_before_b` is
+                // exactly `!b_before_a`; the sequence direction selects the
+                // needed orientation without a second comparator call.
+                float a_key = is_lower ? my_key : other_key;
+                uint a_index = is_lower ? my_index : other_index;
+                float b_key = is_lower ? other_key : my_key;
+                uint b_index = is_lower ? other_index : my_index;
+                bool b_before_a = laguna_router_key_before(
+                    b_key, b_index, a_key, a_index);
+                bool swap = b_before_a == lower_wants_better;
+                if (swap) {
+                    my_key = other_key;
+                    my_index = other_index;
+                    my_score = other_score;
+                }
+        """
     return """
         uint lane = thread_position_in_threadgroup.x;
 
@@ -6834,24 +6881,8 @@ private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
                 }
 
                 bool is_lower = (lane & stride) == 0;
-                float a_key = is_lower ? my_key : other_key;
-                uint a_index = is_lower ? my_index : other_index;
-                float a_score = is_lower ? my_score : other_score;
-                float b_key = is_lower ? other_key : my_key;
-                uint b_index = is_lower ? other_index : my_index;
-                float b_score = is_lower ? other_score : my_score;
-
                 bool lower_wants_better = (lane & sequence) == 0;
-                bool b_before_a = laguna_router_key_before(
-                    b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
-                if (swap) {
-                    my_key = is_lower ? b_key : a_key;
-                    my_index = is_lower ? b_index : a_index;
-                    my_score = is_lower ? b_score : a_score;
-                }
+        \(compareExchange)
             }
         }
 
@@ -6885,7 +6916,7 @@ private let lagunaDecodeRouterTop8Header = """
     """
 
 private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_v3",
+    name: "laguna_decode_router_top8_v4",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterTop8KernelSource(normalizing: false),
@@ -6894,7 +6925,7 @@ private let lagunaDecodeRouterTop8Kernel = MLXFast.metalKernel(
 )
 
 private let lagunaDecodeRouterTop8NormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_norm_v2",
+    name: "laguna_decode_router_top8_norm_v3",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterTop8KernelSource(normalizing: true),
@@ -6967,11 +6998,10 @@ private let lagunaPrefillRouterTop8Enabled =
 private let lagunaPrefillMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_MOE_TAIL"] != "0"
 
-/// Default-off probe: keep the routed down projection in expert-sorted order
-/// and let the fused MoE tail gather each original `(token, slot)` row through
-/// `gatherSort`'s already-computed inverse permutation. This removes
-/// `scatterUnsort`'s full expert-bank copy without changing the eight-slot
-/// weighted reduction order.
+/// Keep the routed down projection in expert-sorted order and let the fused
+/// MoE tail gather each original `(token, slot)` row through `gatherSort`'s
+/// already-computed inverse permutation. This removes `scatterUnsort`'s full
+/// expert-bank copy without changing the eight-slot weighted reduction order.
 private let lagunaPrefillSortedMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_SORTED_MOE_TAIL"] != "0"
 
@@ -7192,21 +7222,17 @@ private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> Str
                 bool is_lower = (lane & stride) == 0;
                 float a_key = is_lower ? my_key : other_key;
                 uint a_index = is_lower ? my_index : other_index;
-                float a_score = is_lower ? my_score : other_score;
                 float b_key = is_lower ? other_key : my_key;
                 uint b_index = is_lower ? other_index : my_index;
-                float b_score = is_lower ? other_score : my_score;
 
                 bool lower_wants_better = (lane & sequence) == 0;
                 bool b_before_a = laguna_router_key_before(
                     b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                bool swap = b_before_a == lower_wants_better;
                 if (swap) {
-                    my_key = is_lower ? b_key : a_key;
-                    my_index = is_lower ? b_index : a_index;
-                    my_score = is_lower ? b_score : a_score;
+                    my_key = other_key;
+                    my_index = other_index;
+                    my_score = other_score;
                 }
             }
         }
@@ -7270,21 +7296,17 @@ private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> Str
                 bool is_lower = (lane & stride) == 0;
                 float a_key = is_lower ? my_key2 : other_key;
                 uint a_index = is_lower ? my_index2 : other_index;
-                float a_score = is_lower ? my_score2 : other_score;
                 float b_key = is_lower ? other_key : my_key2;
                 uint b_index = is_lower ? other_index : my_index2;
-                float b_score = is_lower ? other_score : my_score2;
 
                 bool lower_wants_better = (lane & sequence) == 0;
                 bool b_before_a = laguna_router_key_before(
                     b_key, b_index, a_key, a_index);
-                bool a_before_b = laguna_router_key_before(
-                    a_key, a_index, b_key, b_index);
-                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                bool swap = b_before_a == lower_wants_better;
                 if (swap) {
-                    my_key2 = is_lower ? b_key : a_key;
-                    my_index2 = is_lower ? b_index : a_index;
-                    my_score2 = is_lower ? b_score : a_score;
+                    my_key2 = other_key;
+                    my_index2 = other_index;
+                    my_score2 = other_score;
                 }
             }
         }
@@ -7296,7 +7318,7 @@ private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> Str
 }
 
 private let lagunaPrefillRouterTournamentKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_router_tournament_v1",
+    name: "laguna_prefill_router_tournament_v2",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaPrefillRouterTournamentKernelSource(normalizing: false),
@@ -7305,7 +7327,7 @@ private let lagunaPrefillRouterTournamentKernel = MLXFast.metalKernel(
 )
 
 private let lagunaPrefillRouterTournamentNormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_router_tournament_norm_v1",
+    name: "laguna_prefill_router_tournament_norm_v2",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaPrefillRouterTournamentKernelSource(normalizing: true),
@@ -7517,9 +7539,11 @@ private let lagunaPrefillMoETailKernel = MLXFast.metalKernel(
 /// `scatterUnsort(...)[p]` would copy to original flattened slot `p`.
 /// Reading that row directly preserves the stock slot-0-through-slot-7 BF16
 /// multiply/add sequence while deleting the intervening 16 MiB copy at the
-/// ranked 512-token window.
+/// ranked 512-token window. Four adjacent columns travel as one `bfloat4`;
+/// Metal arithmetic is componentwise, and each component retains its own
+/// ordered expert-0-through-expert-7 BF16 product/add chain.
 private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_sorted_moe_tail_bf16_v1",
+    name: "laguna_prefill_sorted_moe_tail_bf16_v2",
     inputNames: [
         "sorted_expert_outputs", "inverse_order", "router_weights",
         "shared_output", "residual",
@@ -7534,26 +7558,29 @@ private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
         uint col = thread_position_in_grid.x * n_cols;
         const device float* weight_row = router_weights + row * experts;
 
-        bfloat expert_weights[experts];
-        uint sorted_rows[experts];
+        bfloat4 total = bfloat4(bfloat(0));
         for (uint e = 0; e < experts; ++e) {
-            expert_weights[e] = bfloat(weight_row[e]);
-            sorted_rows[e] = inverse_order[row * experts + e];
+            bfloat expert_weight = bfloat(weight_row[e]);
+            uint sorted_row = inverse_order[row * experts + e];
+            bfloat4 expert_values =
+                *reinterpret_cast<const device bfloat4*>(
+                    sorted_expert_outputs + sorted_row * hidden + col);
+            bfloat4 product = bfloat4(
+                expert_values * bfloat4(expert_weight));
+            total = bfloat4(product + total);
         }
-
-        for (uint i = 0; i < n_cols; ++i) {
-            bfloat total = bfloat(0);
-            for (uint e = 0; e < experts; ++e) {
-                bfloat product = bfloat(
-                    sorted_expert_outputs[sorted_rows[e] * hidden + col + i] *
-                    expert_weights[e]);
-                total = bfloat(product + total);
-            }
-            bfloat scaled = bfloat(total * bfloat(2.5f));
-            bfloat r2 = bfloat(scaled + shared_output[row * hidden + col + i]);
-            output[row * hidden + col + i] =
-                bfloat(residual[row * hidden + col + i] + r2);
-        }
+        bfloat4 scaled = bfloat4(
+            total * bfloat4(bfloat(2.5f)));
+        bfloat4 shared_values =
+            *reinterpret_cast<const device bfloat4*>(
+                shared_output + row * hidden + col);
+        bfloat4 r2 = bfloat4(scaled + shared_values);
+        bfloat4 residual_values =
+            *reinterpret_cast<const device bfloat4*>(
+                residual + row * hidden + col);
+        *reinterpret_cast<device bfloat4*>(
+            output + row * hidden + col) =
+            bfloat4(residual_values + r2);
         """,
     ensureRowContiguous: true
 )
@@ -8619,21 +8646,6 @@ final class LagunaRuntimeModelInner: Module {
         let slidingMask = createAttentionMask(
             h: h, cache: cache?[slidingAttentionIdx], windowSize: slidingWindow)
 
-        let isSingleTokenDecode = inputs.shape == [1, 1]
-        let decodeFireMask: UInt64 =
-            switch lagunaDecodeAsyncStage {
-            case .off, .norm, .logits:
-                0
-            case .layer(let idx):
-                UInt64(1) << UInt64(idx)
-            case .ladder(let n):
-                (0..<UInt64(layers.count)).reduce(UInt64(0)) { acc, i in
-                    (Int(i) + 1) % n == 0 ? acc | (UInt64(1) << i) : acc
-                }
-            case .explicit(let mask):
-                mask
-            }
-
         // One cos/sin table per attention family per decode step, shared by
         // every layer of that family (their caches advance in lockstep). Each
         // table is produced by running the family's own RoPE layer over a
@@ -8655,7 +8667,12 @@ final class LagunaRuntimeModelInner: Module {
                         qkRoPEAngles: qkRoPEAngles,
                         qkRoPEOffsets: qkRoPEOffsets
                     )
-                    if isSingleTokenDecode, (decodeFireMask >> UInt64(i)) & 1 == 1 {
+                    if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
+                        asyncEval(h)
+                    }
+                    if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
+                        inputs.shape == [1, 1]
+                    {
                         asyncEval(h)
                     }
                 }
@@ -8667,7 +8684,17 @@ final class LagunaRuntimeModelInner: Module {
                     qkRoPEAngles: qkRoPEAngles,
                     qkRoPEOffsets: qkRoPEOffsets
                 )
-                if isSingleTokenDecode, (decodeFireMask >> UInt64(i)) & 1 == 1 {
+                if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
+                    asyncEval(h)
+                }
+                if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
+                    inputs.shape == [1, 1]
+                {
+                    asyncEval(h)
+                }
+                if case .explicit(let mask) = lagunaDecodeAsyncStage,
+                    (mask >> UInt64(i)) & 1 == 1, inputs.shape == [1, 1]
+                {
                     asyncEval(h)
                 }
                 if lagunaPrefillAsyncLadderStride > 0, h.dim(1) > 1,
@@ -8830,7 +8857,11 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         if lagunaLmHeadPruneEnabled, let lmHead {
             lmHeadPruner = LagunaLmHeadPruner(lmHeadWeight: lmHead.weight)
             if let pruner = lmHeadPruner {
-                eval(pruner.codes, pruner.scales)
+                // The pruner retains exactly one layout for the selected
+                // configuration: the co-tiled single-stream bank by default,
+                // or the two-stream codes+scales pair under any of its
+                // kill switches.
+                eval(pruner.residentArrays)
                 FileHandle.standardError.write(
                     Data("mlxfast: lm_head prune active (mxfp8 coarse copy resident)\n".utf8))
             }
