@@ -272,6 +272,64 @@ let lagunaRoutedSharedSwiGLUQMVRows4Enabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_ROUTED_SHARED_SWIGLU_ROWS"] == "4"
 
+/// R1: one output row per simdgroup for the decode gate/up NVFP4 QMVs, in
+/// place of the previous two-rows-per-simdgroup schedule. SHIPPED DEFAULT;
+/// set `DARKBLOOM_QMV_R1=0` to restore the two-row schedule as an A/B arm.
+///
+/// WHY. A device-wide Metal System Trace of the timed decode phase measures
+/// the step at 93.6% GPU-busy while the gate/up QMVs move their weight bank
+/// at only ~159 GB/s, about 29% of the M5 Max peak. A kernel that is both
+/// busy and far off peak bandwidth is latency bound, not bandwidth bound:
+/// there are not enough independent loads in flight to cover DRAM latency.
+/// Today a simdgroup owns two rows and walks them serially inside each
+/// K-block, so one simdgroup's loads are the only memory-level parallelism
+/// (MLP) available per 32 lanes. Giving each simdgroup a single row and
+/// doubling the simdgroup count keeps every byte and every FLOP the same
+/// while doubling the number of simdgroups resident per core, which doubles
+/// the outstanding weight loads. Per-lane register footprint also halves
+/// (one `gate_result`/`up_result` accumulator instead of two), which is the
+/// mechanism that lets the extra simdgroups actually co-reside.
+///
+/// Mechanism credit: published by solver `austenweaver` in their submission
+/// notes with an explicit invitation to reuse. Treated as a hypothesis to
+/// re-derive and re-measure here, not as a measured result.
+///
+/// SCOPE. The flag switches BOTH gate/up QMV shapes that carry the routed
+/// bank on the decode path: the default-on split routed kernel
+/// (`lagunaRoutedSwiGLUQMVKernel`, the dominant decode kernel by GPU time —
+/// eight 1024x2048 NVFP4 banks per sparse layer) and the merged
+/// routed+shared kernel (`lagunaRoutedSharedSwiGLUQMVKernel`), which is
+/// only reachable when `DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV=1`. Both
+/// are covered so the flag means the same thing in either dispatch
+/// configuration. The shared-only kernel
+/// (`lagunaSharedSwiGLUQMVKernel`, one bank, ~1/8 the routed traffic) is
+/// deliberately left on R2 in this change; it is the obvious follow-on once
+/// R1 has a measured verdict on the dominant kernel.
+///
+/// EXACTNESS. See the exactness argument on
+/// `lagunaRoutedSwiGLUQMVRows1Kernel`; R1 is a pure re-assignment of rows to
+/// simdgroups, with every lane's addend sequence and every cross-lane
+/// reduction left byte-for-byte as they were.
+///
+/// MEASURED (this box, M5 Max, warm, `MLXFAST_LOCAL_COOL_GATE=0`, quiet,
+/// ABBA-interleaved off/on/on/off, 8 runs per arm over 4 rounds):
+///
+///     two rows per simdgroup (previous)   6959.5 us/token
+///     one row per simdgroup  (this)       6907.5 us/token   -0.75%
+///
+/// 4/4 rounds favoured R1 (-0.56%, -0.32%, -1.97%, -0.12%). The control is
+/// the prefill axis: R1 is guarded on the single-token decode shapes and
+/// cannot touch prefill, and prefill differed between the two arms by only
+/// +0.12% (204.00 vs 204.25 us/token) against a -0.75% decode signal -- a
+/// 6.1x signal-to-drift ratio. Correctness passed on all 16 runs.
+///
+/// An earlier 12-run series measured -0.40% but is discarded: subagents were
+/// analysing files on the same box and pushed the prefill control to a 4.04%
+/// spread, i.e. the drift exceeded the signal. Read the control axis before
+/// believing any delta here.
+let lagunaSwiGLUQMVRows1Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_QMV_R1"] != "0"
+
 /// Folds the per-head softplus gate into the output projection's GEMV (see
 /// `lagunaGatedOutputProjectionSource`), with one kernel variant per attention
 /// family. Set `DARKBLOOM_FUSED_GATED_OUTPUT=0` to ablate.
@@ -630,10 +688,39 @@ private enum LagunaDecodeAsyncStage {
 /// for one extra scheduler round trip instead of thirty-five. The front rung
 /// is worthless alone — a lone fire at layer 1 measures 0.9476, the worst
 /// schedule tested — and only pays once the rest of the step is covered.
+///
+/// PUSHING THE FRONT RUNG ONE LAYER EARLIER (this change). A device-wide
+/// Metal System Trace of the timed decode phase (4176 GPU intervals, 128
+/// steps) shows the step is 93.6% GPU-busy with 32.6 dispatches/token, and
+/// that its idle is NOT spread across dispatch seams: 4044 inter-dispatch
+/// gaps are sub-microsecond (2.78 ms total, 4.8% of idle) while 131 gaps
+/// over 100 us carry 95.2% of it — one bubble per token, between the last
+/// dispatch of a step and the first of the next. That is the trusted timed
+/// loop running `lagunaLogits -> greedyToken (blocking) -> compare ->
+/// rebuild` strictly serially, so the GPU stays idle until the next step's
+/// graph construction reaches its FIRST `asyncEval` fire. `at:1,...` builds
+/// two layers before that happens; `at:0,...` builds one.
+///
+/// MEASURED (this box, warm, `MLXFAST_LOCAL_COOL_GATE=0`, ABBA-interleaved,
+/// 8 runs per arm across 4 rounds, one round rejected for drift):
+///
+///     at:1,7,15,23,31,39      6899.8 us/token   (previous default)
+///     at:0,1,7,15,23,31,39    6882.8 us/token   -0.25%, 3/4 pairs favouring
+///
+/// Prefill was flat at 201-202 us/token across every arm, which is the
+/// control: this schedule is guarded on `inputs.shape == [1, 1]`, so a
+/// prefill delta would have been pure drift. The effect is small by
+/// construction — it recovers only our own graph-build time ahead of the
+/// first fire (~17 us of the ~280 us bubble); the remainder is harness-side
+/// and identical in the baseline.
+///
+/// Same exactness ground as every other rung: `asyncEval` adds no operation,
+/// cache row, dtype boundary or token, and only enqueues already-constructed
+/// work earlier.
 private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     let raw =
         ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?
-        .lowercased() ?? "at:1,7,15,23,31,39"
+        .lowercased() ?? "at:0,1,7,15,23,31,39"
     switch raw {
     case "off", "0", "":
         return .off
@@ -5282,6 +5369,189 @@ private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// R1 scheduling twin of `lagunaRoutedSwiGLUQMVKernel`: one output row per
+/// simdgroup instead of two. Selected by `DARKBLOOM_QMV_R1=1`
+/// (`lagunaSwiGLUQMVRows1Enabled`); the two-row control above stays the
+/// default.
+///
+/// INDEX MATH. The control packs 4 rows into a 64-thread threadgroup
+/// (2 simdgroups x 2 rows) and dispatches `tiles_per_expert = 128` tiles per
+/// expert slot, covering `output_width = 512` rows as
+/// `first_row = tile * 4 + simd_group * 2`, rows `first_row` and
+/// `first_row + 1`. R1 packs 2 rows into the same 64-thread threadgroup
+/// (2 simdgroups x 1 row) and therefore needs `tiles_per_expert = 256`,
+/// covering the same 512 rows as `row = tile * 2 + simd_group`. With
+/// `tile` in `[0, 256)` and `simd_group` in `{0, 1}` that map is a bijection
+/// onto `[0, 512)`, so every `(expert_slot, row)` pair is still computed
+/// exactly once and every output element is still written exactly once, by
+/// lane 0 of exactly one simdgroup. The threadgroup shape stays 64 threads;
+/// only the grid doubles, from `8 * 128 * 64` to `8 * 256 * 64` threads
+/// (1024 -> 2048 threadgroups), which is the point: twice the resident
+/// simdgroups, twice the loads in flight.
+///
+/// EXACTNESS (max_abs_diff must stay 0). Fix any `(expert_slot, logical_row,
+/// lane)`. Everything that feeds that lane's arithmetic is a function of
+/// exactly those three values in both variants, and none of the three
+/// changes meaning:
+///
+///  1. `lane = thread_index_in_simdgroup` still ranges over 0..31 and still
+///     selects the same 16-value K slice: `input + block + lane * 16` for
+///     the activation, `... + block / 2 + lane * 8` for the packed codes,
+///     `... + block / 16 + lane` for the scale byte. The lane's K ownership
+///     is untouched.
+///  2. The row's weight/scale addresses are computed from `logical_row` by
+///     the identical expression (`pair_tile = logical_row / 32;
+///     gate_row = pair_tile * 64 + logical_row % 32; up_row = gate_row + 32`).
+///     R1 changes only which simdgroup is handed a given `logical_row`, not
+///     what that row's addresses are.
+///  3. The K-block loop is the same `for (block = 0; block < 2048;
+///     block += 512)` -- the same 4 blocks, visited in the same increasing
+///     order. The control's inner `for (row = 0; row < 2; ++row)` loop is
+///     removed, not reordered: it only ever interleaved two INDEPENDENT
+///     accumulators. `gate_result[0]` and `gate_result[1]` are distinct
+///     thread-private floats that never interact, so deleting one row's
+///     iterations cannot perturb the other row's addend sequence.
+///  4. Consequently the surviving accumulator is still
+///     `0.0f`, then `+= qdot(block 0)`, `+= qdot(block 512)`,
+///     `+= qdot(block 1024)`, `+= qdot(block 1536)` -- the same four FP32
+///     addends, produced by the same `laguna_nvfp4_qdot_16` calls with the
+///     same arguments, added in the same order into the same starting value.
+///     Float addition is not associative, so ORDER is the whole argument;
+///     the order is bit-identical here. `laguna_nvfp4_qdot_16`'s own
+///     internal 16-term reduction is a single unchanged call and is not
+///     touched.
+///  5. The cross-lane reduction is still one `simd_sum` over the same
+///     32-lane simdgroup, with lane `l` contributing the same partial sum it
+///     contributed before by (4). `simd_sum` is a fixed hardware reduction
+///     over `simd_size` lanes: same lane count, same per-lane inputs in the
+///     same lane positions => same result bits. The reduction tree is NOT
+///     restructured -- no cross-simdgroup or threadgroup-memory reduction is
+///     introduced.
+///  6. The epilogue (`lane == 0` guard, row-scale suffix, BF16 casts, the
+///     sign-stable sigmoid/SiLU/SwiGLU sequence) and the output address
+///     `expert_slot * output_width + logical_row` are copied verbatim.
+///
+/// So every output element is a bit-identical function of the same inputs;
+/// only the assignment of rows to simdgroups differs.
+///
+/// COMPOSITION with a 64 -> 256 thread threadgroup repack of this same
+/// kernel (in flight separately). The two are semantically ORTHOGONAL --
+/// R1 sets rows-per-simdgroup (2 -> 1), the repack sets
+/// simdgroups-per-threadgroup (2 -> 8) -- but they are TEXTUALLY
+/// CONFLICTING: both rewrite the same two statements (`first_row` and the
+/// dispatch's tiles-per-slot/grid), so applying both patches will collide
+/// and a naive merge silently double-covers or drops rows. Compose them by
+/// writing the single combined mapping rather than by merging two edits:
+///
+///     rows_per_tg  = simdgroups_per_tg * rows_per_simd
+///     tiles_per_slot = output_width / rows_per_tg
+///     first_row    = tile * rows_per_tg + simd_group * rows_per_simd
+///
+/// which reproduces R2/64 (4 rows, 128 tiles), R1/64 (2 rows, 256 tiles),
+/// R2/256 (16 rows, 32 tiles) and R1/256 (8 rows, 64 tiles) as the four
+/// corners. The exactness argument above survives every corner unchanged,
+/// because it never depends on the threadgroup shape -- only on lane index,
+/// block order, and the per-row accumulator being private to one simdgroup.
+private let lagunaRoutedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_rows1_bf16_v1",
+    inputNames: ["input", "fused_weight", "fused_scales", "indices"],
+    outputNames: ["activated"],
+    source: """
+        constexpr uint input_width = 2048;
+        constexpr uint output_width = 512;
+        constexpr uint fused_width = 1024;
+        constexpr uint packed_row_bytes = 1024;
+        constexpr uint scale_row_bytes = 128;
+        constexpr uint packed_expert_bytes = fused_width * packed_row_bytes;
+        constexpr uint scale_expert_bytes = fused_width * scale_row_bytes;
+        constexpr uint block_width = 512;
+        constexpr uint values_per_lane = 16;
+        constexpr uint tiles_per_expert = 256;
+        constexpr uint routed_experts = 8;
+
+        // Same tile-major expert interleave as the two-row control; only the
+        // rows-per-simdgroup factor changes, from two to one, so the tile
+        // stride is 2 rows and there are 256 tiles per expert slot.
+        uint group = threadgroup_position_in_grid.x;
+        uint expert_slot = group % routed_experts;
+        uint tile = group / routed_experts;
+        uint expert = uint(indices[expert_slot]);
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint logical_row = tile * 2 + simd_group;
+
+        const device uint8_t* expert_weight =
+            (const device uint8_t*)fused_weight +
+            expert * packed_expert_bytes;
+        const device uint8_t* expert_scales =
+            fused_scales + expert * scale_expert_bytes;
+
+        // Row addresses are loop-invariant now that the simdgroup owns one
+        // row, so they are hoisted out of the K-block loop. This is address
+        // arithmetic only: the identical byte addresses are produced, in the
+        // identical order, and no floating-point operation is moved.
+        uint pair_tile = logical_row / 32;
+        uint gate_row = pair_tile * 64 + logical_row % 32;
+        uint up_row = gate_row + 32;
+        const device uint8_t* gate_row_weight =
+            expert_weight + gate_row * packed_row_bytes + lane * 8;
+        const device uint8_t* up_row_weight =
+            expert_weight + up_row * packed_row_bytes + lane * 8;
+        const device uint8_t* gate_row_scale =
+            expert_scales + gate_row * scale_row_bytes + lane;
+        const device uint8_t* up_row_scale =
+            expert_scales + up_row * scale_row_bytes + lane;
+
+        thread float gate_result = 0.0f;
+        thread float up_result = 0.0f;
+        thread float input_values[values_per_lane];
+
+        for (uint block = 0; block < input_width; block += block_width) {
+            const device vec<bfloat, 4>* input_vectors =
+                (const device vec<bfloat, 4>*)(
+                    input + block + lane * values_per_lane);
+            for (uint i = 0; i < values_per_lane / 4; ++i) {
+                const vec<bfloat, 4> values = input_vectors[i];
+                input_values[4 * i] = values[0];
+                input_values[4 * i + 1] = values[1];
+                input_values[4 * i + 2] = values[2];
+                input_values[4 * i + 3] = values[3];
+            }
+
+            const device uint8_t* gate_weight = gate_row_weight + block / 2;
+            const device uint8_t* up_weight = up_row_weight + block / 2;
+            const device uint8_t* gate_scale = gate_row_scale + block / 16;
+            const device uint8_t* up_scale = up_row_scale + block / 16;
+
+            gate_result += laguna_nvfp4_qdot_16(
+                gate_weight,
+                input_values,
+                laguna_nvfp4_scale(gate_scale[0]));
+            up_result += laguna_nvfp4_qdot_16(
+                up_weight,
+                input_values,
+                laguna_nvfp4_scale(up_scale[0]));
+        }
+
+        gate_result = simd_sum(gate_result);
+        up_result = simd_sum(up_result);
+        if (lane == 0) {
+            bfloat gate = bfloat(gate_result\(lagunaNvfp4RowScaleSuffix));
+            bfloat up = bfloat(up_result\(lagunaNvfp4RowScaleSuffix));
+            bfloat exp_abs = metal::exp(metal::abs(gate));
+            bfloat denominator = bfloat(1) + exp_abs;
+            bfloat y = bfloat(1) / denominator;
+            bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+            bfloat silu = bfloat(gate * sigmoid);
+            activated[
+                expert_slot * output_width + logical_row
+            ] = bfloat(silu * up);
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
 func lagunaRoutedSwiGLUQMV(
     _ input: MLXArray,
     fusedWeight: MLXArray,
@@ -5307,9 +5577,17 @@ func lagunaRoutedSwiGLUQMV(
     precondition(indices.dtype == .uint32)
     precondition(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
 
-    return lagunaRoutedSwiGLUQMVKernel(
+    // R1 halves the rows a 64-thread threadgroup covers (4 -> 2), so it needs
+    // twice the tiles per expert slot (128 -> 256) to cover the same 512
+    // output rows exactly once. The threadgroup shape is unchanged.
+    let kernel =
+        lagunaSwiGLUQMVRows1Enabled
+        ? lagunaRoutedSwiGLUQMVRows1Kernel
+        : lagunaRoutedSwiGLUQMVKernel
+    let tilesPerSlot = lagunaSwiGLUQMVRows1Enabled ? 256 : 128
+    return kernel(
         [input, fusedWeight, fusedScales, indices],
-        grid: (LagunaConstants.numExpertsPerTok * 128 * 64, 1, 1),
+        grid: (LagunaConstants.numExpertsPerTok * tilesPerSlot * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[
             1, 1, LagunaConstants.numExpertsPerTok, 1,
@@ -5442,6 +5720,166 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
                 } else {
                     shared_activated[first_row + row] = activation;
                 }
+            }
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
+/// R1 scheduling twin of `lagunaRoutedSharedSwiGLUQMVKernel`: one output row
+/// per simdgroup instead of two, across all nine slots (0-7 routed, 8
+/// shared). Selected by `DARKBLOOM_QMV_R1=1` (`lagunaSwiGLUQMVRows1Enabled`),
+/// and only reachable at all when the merge itself is enabled with
+/// `DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV=1`; the merge is default off, so
+/// in the default configuration the R1 kernel that actually runs is
+/// `lagunaRoutedSwiGLUQMVRows1Kernel`.
+///
+/// INDEX MATH. Control: 9 slots x 128 tiles, `first_row = tile * 4 +
+/// simd_group * 2`, rows `first_row` and `first_row + 1`, covering
+/// `output_width = 512` rows per slot. R1: 9 slots x 256 tiles,
+/// `logical_row = tile * 2 + simd_group`, one row per simdgroup. `tile` in
+/// `[0, 256)` times `simd_group` in `{0, 1}` is a bijection onto `[0, 512)`,
+/// so each `(expert_slot, row)` pair is computed once and each output
+/// element written once. The slot decomposition (`expert_slot = group % 9`,
+/// `tile = group / 9`) and hence the routed/shared bank selection and the
+/// eight-banks-per-wave interleave are unchanged. Grid goes from
+/// `9 * 128 * 64` to `9 * 256 * 64` threads (1152 -> 2304 threadgroups of
+/// 64).
+///
+/// EXACTNESS. Identical to the argument on
+/// `lagunaRoutedSwiGLUQMVRows1Kernel`, and it covers the shared slot for the
+/// same reason: per lane, the K slice (`lane * 16` activations,
+/// `block / 2 + lane * 8` codes, `block / 16 + lane` scale) is unchanged;
+/// the row's gate/up address expressions are copied verbatim for both the
+/// routed (`pair_tile * 64 + row % 32`, `+32`) and shared
+/// (`row`, `+ output_width`) layouts; the four K-blocks are accumulated in
+/// the same increasing order into a zero-initialised private float, so the
+/// addend sequence is bit-identical; the control's two per-row accumulators
+/// never interacted, so dropping one cannot perturb the other; and the
+/// cross-lane reduction stays a single `simd_sum` over the same 32 lanes
+/// holding the same partials, with no threadgroup-memory or cross-simdgroup
+/// reduction introduced. Epilogue and output addressing are verbatim.
+///
+/// COMPOSITION with the separate 64 -> 256 thread threadgroup repack: same
+/// verdict as on `lagunaRoutedSwiGLUQMVRows1Kernel` -- orthogonal in meaning
+/// (rows-per-simdgroup vs. simdgroups-per-threadgroup), conflicting in text
+/// (both rewrite `first_row` and the tiles-per-slot/grid), so they must be
+/// combined into one mapping rather than merged as two patches.
+private let lagunaRoutedSharedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_shared_nvfp4_swiglu_qmv_rows1_bf16_v1",
+    inputNames: [
+        "input", "routed_weight", "routed_scales", "indices",
+        "shared_weight", "shared_scales",
+    ],
+    outputNames: ["routed_activated", "shared_activated"],
+    source: """
+        constexpr uint input_width = 2048;
+        constexpr uint output_width = 512;
+        constexpr uint fused_width = 1024;
+        constexpr uint packed_row_bytes = 1024;
+        constexpr uint scale_row_bytes = 128;
+        constexpr uint packed_expert_bytes = fused_width * packed_row_bytes;
+        constexpr uint scale_expert_bytes = fused_width * scale_row_bytes;
+        constexpr uint block_width = 512;
+        constexpr uint values_per_lane = 16;
+        constexpr uint tiles_per_expert = 256;
+        constexpr uint routed_experts = 8;
+
+        // Same nine-slot decomposition and the same per-row arithmetic as the
+        // two-row control; only the rows-per-simdgroup factor changes, so the
+        // tile stride is 2 rows and there are 256 tiles per slot.
+        uint group = threadgroup_position_in_grid.x;
+        uint expert_slot = group % (routed_experts + 1);
+        uint tile = group / (routed_experts + 1);
+        bool is_routed = expert_slot < routed_experts;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint logical_row = tile * 2 + simd_group;
+
+        const device uint8_t* expert_weight;
+        const device uint8_t* expert_scales;
+        if (is_routed) {
+            uint expert = uint(indices[expert_slot]);
+            expert_weight =
+                (const device uint8_t*)routed_weight +
+                expert * packed_expert_bytes;
+            expert_scales = routed_scales + expert * scale_expert_bytes;
+        } else {
+            expert_weight = (const device uint8_t*)shared_weight;
+            expert_scales = shared_scales;
+        }
+
+        // Loop-invariant with one row per simdgroup, so hoisted out of the
+        // K-block loop. Integer address arithmetic only, producing the same
+        // byte addresses the control produced; no float operation moves.
+        uint gate_row;
+        uint up_row;
+        if (is_routed) {
+            uint pair_tile = logical_row / 32;
+            gate_row = pair_tile * 64 + logical_row % 32;
+            up_row = gate_row + 32;
+        } else {
+            gate_row = logical_row;
+            up_row = gate_row + output_width;
+        }
+        const device uint8_t* gate_row_weight =
+            expert_weight + gate_row * packed_row_bytes + lane * 8;
+        const device uint8_t* up_row_weight =
+            expert_weight + up_row * packed_row_bytes + lane * 8;
+        const device uint8_t* gate_row_scale =
+            expert_scales + gate_row * scale_row_bytes + lane;
+        const device uint8_t* up_row_scale =
+            expert_scales + up_row * scale_row_bytes + lane;
+
+        thread float gate_result = 0.0f;
+        thread float up_result = 0.0f;
+        thread float input_values[values_per_lane];
+
+        for (uint block = 0; block < input_width; block += block_width) {
+            const device vec<bfloat, 4>* input_vectors =
+                (const device vec<bfloat, 4>*)(
+                    input + block + lane * values_per_lane);
+            for (uint i = 0; i < values_per_lane / 4; ++i) {
+                const vec<bfloat, 4> values = input_vectors[i];
+                input_values[4 * i] = values[0];
+                input_values[4 * i + 1] = values[1];
+                input_values[4 * i + 2] = values[2];
+                input_values[4 * i + 3] = values[3];
+            }
+
+            const device uint8_t* gate_weight = gate_row_weight + block / 2;
+            const device uint8_t* up_weight = up_row_weight + block / 2;
+            const device uint8_t* gate_scale = gate_row_scale + block / 16;
+            const device uint8_t* up_scale = up_row_scale + block / 16;
+
+            gate_result += laguna_nvfp4_qdot_16(
+                gate_weight,
+                input_values,
+                laguna_nvfp4_scale(gate_scale[0]));
+            up_result += laguna_nvfp4_qdot_16(
+                up_weight,
+                input_values,
+                laguna_nvfp4_scale(up_scale[0]));
+        }
+
+        gate_result = simd_sum(gate_result);
+        up_result = simd_sum(up_result);
+        if (lane == 0) {
+            bfloat gate = bfloat(gate_result\(lagunaNvfp4RowScaleSuffix));
+            bfloat up = bfloat(up_result\(lagunaNvfp4RowScaleSuffix));
+            bfloat exp_abs = metal::exp(metal::abs(gate));
+            bfloat denominator = bfloat(1) + exp_abs;
+            bfloat y = bfloat(1) / denominator;
+            bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+            bfloat silu = bfloat(gate * sigmoid);
+            bfloat activation = bfloat(silu * up);
+            if (is_routed) {
+                routed_activated[
+                    expert_slot * output_width + logical_row
+                ] = activation;
+            } else {
+                shared_activated[logical_row] = activation;
             }
         }
         """,
@@ -5883,14 +6321,25 @@ func lagunaRoutedSharedSwiGLUQMV(
         ])
 
     lagunaTrace("routed+shared gate/up QMV")
-    let kernel =
-        lagunaRoutedSharedSwiGLUQMVRows4Enabled
-        ? lagunaRoutedSharedSwiGLUQMVRows4Kernel
-        : lagunaRoutedSharedSwiGLUQMVKernel
-    // The R4 control covers eight rows per 64-thread group, so 64 tiles per
-    // each of the nine slots dispatch exactly 576 threadgroups. The default R2
-    // schedule retains its original 128 tiles per slot.
-    let tilesPerSlot = lagunaRoutedSharedSwiGLUQMVRows4Enabled ? 64 : 128
+    // R1 (one row per simdgroup, 2 rows per 64-thread group) takes precedence
+    // over the R4 selector when both are set; R1 is the explicit new opt-in
+    // and R4 is a legacy control arm, and the two are mutually exclusive row
+    // maps rather than composable ones.
+    let kernel: MLXFast.MLXFastKernel
+    // Rows per 64-thread threadgroup: R1 covers 2, the R2 default 4, the R4
+    // control 8. Tiles per slot is always `output_width / rows_per_group`, so
+    // the nine slots cover all 512 rows exactly once in every arm.
+    let tilesPerSlot: Int
+    if lagunaSwiGLUQMVRows1Enabled {
+        kernel = lagunaRoutedSharedSwiGLUQMVRows1Kernel
+        tilesPerSlot = 256
+    } else if lagunaRoutedSharedSwiGLUQMVRows4Enabled {
+        kernel = lagunaRoutedSharedSwiGLUQMVRows4Kernel
+        tilesPerSlot = 64
+    } else {
+        kernel = lagunaRoutedSharedSwiGLUQMVKernel
+        tilesPerSlot = 128
+    }
     let outputs = kernel(
         [input, routedWeight, routedScales, indices, sharedWeight, sharedScales],
         grid: (
