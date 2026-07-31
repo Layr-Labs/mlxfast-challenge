@@ -4188,6 +4188,71 @@ let lagunaNvfp4ScaleCarry: Bool =
 let lagunaNvfp4QdotSeedElisionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_QDOT_SEED_ELIDE"] != "0"
 
+/// `DARKBLOOM_NVFP4_ROW_SEED_PEEL` (default ON; set "0" to restore the
+/// `= {0.0f, 0.0f}` row seeds): the K-loop analogue of the qdot seed elision
+/// one level up. The decode SwiGLU QMV kernels seed `gate_result` / `up_result`
+/// with `+0.0f` and then run FOUR `+=` over the 2048-wide input in 512-value
+/// K blocks, so the first of those four is `fl(+0.0f + q0)`. As with the qdot
+/// seed, `fadd float 0.0, %q0` is NOT foldable without no-signed-zeros and
+/// `device.cpp:631` sets `setFastMathEnabled(false)`, so it is a real FP add:
+/// four per lane per kernel invocation (`gate_result[0..1]`,
+/// `up_result[0..1]`), 32 lanes per simdgroup.
+///
+/// Peeling the first K block makes those four adds assignments. That is NOT
+/// bit-exact on its own -- and unlike the qdot seed elision the `-0.0` it
+/// admits is NOT absorbed by the call site, because the row accumulator IS the
+/// call site: `bfloat(-0.0)` reaches `silu` (`silu(-0.0) == -0.0`, since
+/// `-0.0 < 0` is false so the sigmoid branch is the same `1 - y == 0.5`) and
+/// then `activated[i] = bfloat(silu * up)`, which is a `-0.0` the down
+/// projection only absorbs when the residual stream happens to be nonzero at
+/// that coordinate. That is a data property, not a proof, which is why the
+/// bare peel is not shipped.
+///
+/// This ships the peel PLUS a single `+ 0.0f` sign normalization applied once
+/// per output row by lane 0 only, after `simd_sum`. That is exact by closed
+/// case analysis, with no appeal to model data:
+///
+///  1. **The stock lane accumulator is never `-0.0`.** Its first partial is
+///     `fl(+0.0 + q0)`, and `+0.0 + (-0.0) == +0.0`, so partial 0 is not
+///     `-0.0`; under round-to-nearest a float sum is `-0.0` only when BOTH
+///     addends are, so no later partial is either. Induction closes it.
+///  2. **The peeled lane accumulator equals the stock one, or is `-0.0` where
+///     the stock one is `+0.0`.** Base: `a0 = q0` versus `p0 = fl(+0 + q0)`,
+///     which differ only when `q0 == -0.0`. Step: adding `q` to a `(-0.0,
+///     +0.0)` pair gives `q` on both sides when `q` is nonzero finite, `±Inf`
+///     or NaN; `(+0.0, +0.0)` when `q == +0.0`; and `(-0.0, +0.0)` when
+///     `q == -0.0`. The invariant is preserved and never inverts.
+///  3. **`simd_sum` preserves the invariant.** It is a binary add tree over the
+///     32 lane values (its order is unspecified, but BOTH forms use the same
+///     one). At every node the two forms' operands are pairwise equal or
+///     `(-0.0, +0.0)`, and the case table in 2 applies verbatim, so the
+///     reduced values are equal or `(-0.0, +0.0)`. By 1 the stock reduction is
+///     never `-0.0`, so the difference stays one-directional.
+///  4. **`x + 0.0f` collapses exactly that difference and nothing else.** It
+///     maps `-0.0` to `+0.0` and is the bitwise identity on every other float:
+///     finite nonzero (adding zero is exact), `+0.0`, `±Inf`, and NaN (the
+///     result is the same already-quiet NaN operand). So
+///     `fl(a + 0.0f) == p` bitwise in every case, and the row value entering
+///     `* 4194304.0f`, `bfloat(...)`, the SiLU and `activated[]` is the stock
+///     bit pattern. `(a + 0.0f) * c` cannot contract into an FMA (`fma` is
+///     `a*b + c`), so the normalization survives the Metal compiler.
+///
+/// Net ALU: four adds removed on every one of the 32 lanes, four added on lane
+/// 0 alone -- 124 of 128 per simdgroup per kernel invocation. Applied to the
+/// two SwiGLU QMV kernels the shipped decode path actually dispatches
+/// (`laguna_shared_nvfp4_swiglu_qmv_bf16_v1` and
+/// `laguna_routed_nvfp4_swiglu_qmv_bf16_v2`); the merged routed+shared, R4,
+/// pipelined and nine-slot arms are opt-in A/B kernels off the scored path and
+/// keep their stock seeds. The down kernels need nothing: `input_width` is one
+/// K block there, so `result[row]` is already an assignment.
+///
+/// The four-iteration K loop has a compile-time constant trip count over a
+/// `thread float[16]` staging array, so the Metal compiler must already fully
+/// unroll it; emitting the first block textually is the same machine code with
+/// one fewer add, not an extra unroll.
+let lagunaNvfp4RowSeedPeelEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_ROW_SEED_PEEL"] != "0"
+
 /// `DARKBLOOM_NVFP4_SCALE_DEFER` (default ON; set "0" to restore): moves
 /// the `2^22` that `DARKBLOOM_NVFP4_SCALE_FOLD` parked in
 /// `laguna_nvfp4_scale` out of the per-group scale and onto the per-row
@@ -4229,6 +4294,39 @@ let lagunaNvfp4ScaleDeferEnabled =
 /// `lagunaSharedSwiGLUQMVHeader`; `nvfp4EveryScaleCallSiteHasARowRescaleSite`
 /// pins those two counts equal per kernel so a missed epilogue cannot ship.
 let lagunaNvfp4RowScaleSuffix = lagunaNvfp4ScaleDeferEnabled ? " * 4194304.0f" : ""
+
+/// The three textual pieces of `DARKBLOOM_NVFP4_ROW_SEED_PEEL`. They MUST move
+/// together: the peel is what admits a `-0.0` lane accumulator and the
+/// normalization is what removes it again, so emitting one without the other
+/// is not bit-exact. With the flag off all three are empty and each kernel's
+/// source is character-for-character the pre-peel text.
+let lagunaNvfp4RowSeedInit = lagunaNvfp4RowSeedPeelEnabled ? "" : " = {0.0f, 0.0f}"
+let lagunaNvfp4RowNormalizeOpen = lagunaNvfp4RowSeedPeelEnabled ? "(" : ""
+let lagunaNvfp4RowNormalizeClose = lagunaNvfp4RowSeedPeelEnabled ? " + 0.0f)" : ""
+
+/// Wraps a SwiGLU QMV kernel's K-block body in either the stock single loop
+/// (`+=` every block) or the peeled form (a first block that ASSIGNS, then the
+/// remaining blocks accumulating). `body` is emitted verbatim in both arms with
+/// only the accumulate operator substituted, so the flag isolates the seed and
+/// nothing else -- same pointer arithmetic, same qdot calls, same association.
+func lagunaNvfp4SwiGLUKLoop(_ body: (String) -> String) -> String {
+    guard lagunaNvfp4RowSeedPeelEnabled else {
+        return """
+            for (uint block = 0; block < input_width; block += block_width) {
+            \(body("+="))
+            }
+            """
+    }
+    return """
+        {
+            const uint block = 0;
+        \(body("="))
+        }
+        for (uint block = block_width; block < input_width; block += block_width) {
+        \(body("+="))
+        }
+        """
+}
 
 let lagunaSharedSwiGLUQMVHeader: String = {
     // The two halves of one power-of-two regrouping. They MUST move together:
@@ -4357,11 +4455,48 @@ let lagunaSharedSwiGLUQMVHeader: String = {
     """
 }()
 
-private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_shared_nvfp4_swiglu_qmv_bf16_v1",
-    inputNames: ["input", "fused_weight", "fused_scales"],
-    outputNames: ["activated"],
-    source: """
+let lagunaSharedSwiGLUQMVSource: String = {
+    func blockBody(_ op: String) -> String {
+        """
+                const device vec<bfloat, 4>* input_vectors =
+                    (const device vec<bfloat, 4>*)(
+                        input + block + lane * values_per_lane);
+                for (uint i = 0; i < values_per_lane / 4; ++i) {
+                    const vec<bfloat, 4> values = input_vectors[i];
+                    input_values[4 * i] = values[0];
+                    input_values[4 * i + 1] = values[1];
+                    input_values[4 * i + 2] = values[2];
+                    input_values[4 * i + 3] = values[3];
+                }
+
+                for (uint row = 0; row < 2; ++row) {
+                    uint gate_row = first_row + row;
+                    uint up_row = gate_row + output_width;
+                    const device uint8_t* gate_weight =
+                        (const device uint8_t*)fused_weight +
+                        gate_row * packed_row_bytes + block / 2 + lane * 8;
+                    const device uint8_t* up_weight =
+                        (const device uint8_t*)fused_weight +
+                        up_row * packed_row_bytes + block / 2 + lane * 8;
+                    const device uint8_t* gate_scale =
+                        fused_scales + gate_row * scale_row_bytes +
+                        block / 16 + lane;
+                    const device uint8_t* up_scale =
+                        fused_scales + up_row * scale_row_bytes +
+                        block / 16 + lane;
+
+                    gate_result[row] \(op) laguna_nvfp4_qdot_16(
+                        gate_weight,
+                        input_values,
+                        laguna_nvfp4_scale(gate_scale[0]));
+                    up_result[row] \(op) laguna_nvfp4_qdot_16(
+                        up_weight,
+                        input_values,
+                        laguna_nvfp4_scale(up_scale[0]));
+                }
+        """
+    }
+    return """
         constexpr uint input_width = 2048;
         constexpr uint output_width = 512;
         constexpr uint fused_width = 1024;
@@ -4375,55 +4510,18 @@ private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
         uint lane = thread_index_in_simdgroup;
         uint first_row = tile * 4 + simd_group * 2;
 
-        thread float gate_result[2] = {0.0f, 0.0f};
-        thread float up_result[2] = {0.0f, 0.0f};
+        thread float gate_result[2]\(lagunaNvfp4RowSeedInit);
+        thread float up_result[2]\(lagunaNvfp4RowSeedInit);
         thread float input_values[values_per_lane];
 
-        for (uint block = 0; block < input_width; block += block_width) {
-            const device vec<bfloat, 4>* input_vectors =
-                (const device vec<bfloat, 4>*)(
-                    input + block + lane * values_per_lane);
-            for (uint i = 0; i < values_per_lane / 4; ++i) {
-                const vec<bfloat, 4> values = input_vectors[i];
-                input_values[4 * i] = values[0];
-                input_values[4 * i + 1] = values[1];
-                input_values[4 * i + 2] = values[2];
-                input_values[4 * i + 3] = values[3];
-            }
-
-            for (uint row = 0; row < 2; ++row) {
-                uint gate_row = first_row + row;
-                uint up_row = gate_row + output_width;
-                const device uint8_t* gate_weight =
-                    (const device uint8_t*)fused_weight +
-                    gate_row * packed_row_bytes + block / 2 + lane * 8;
-                const device uint8_t* up_weight =
-                    (const device uint8_t*)fused_weight +
-                    up_row * packed_row_bytes + block / 2 + lane * 8;
-                const device uint8_t* gate_scale =
-                    fused_scales + gate_row * scale_row_bytes +
-                    block / 16 + lane;
-                const device uint8_t* up_scale =
-                    fused_scales + up_row * scale_row_bytes +
-                    block / 16 + lane;
-
-                gate_result[row] += laguna_nvfp4_qdot_16(
-                    gate_weight,
-                    input_values,
-                    laguna_nvfp4_scale(gate_scale[0]));
-                up_result[row] += laguna_nvfp4_qdot_16(
-                    up_weight,
-                    input_values,
-                    laguna_nvfp4_scale(up_scale[0]));
-            }
-        }
+        \(lagunaNvfp4SwiGLUKLoop(blockBody))
 
         for (uint row = 0; row < 2; ++row) {
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
             if (lane == 0) {
-                bfloat gate = bfloat(gate_result[row]\(lagunaNvfp4RowScaleSuffix));
-                bfloat up = bfloat(up_result[row]\(lagunaNvfp4RowScaleSuffix));
+                bfloat gate = bfloat(\(lagunaNvfp4RowNormalizeOpen)gate_result[row]\(lagunaNvfp4RowNormalizeClose)\(lagunaNvfp4RowScaleSuffix));
+                bfloat up = bfloat(\(lagunaNvfp4RowNormalizeOpen)up_result[row]\(lagunaNvfp4RowNormalizeClose)\(lagunaNvfp4RowScaleSuffix));
                 bfloat exp_abs = metal::exp(metal::abs(gate));
                 bfloat denominator = bfloat(1) + exp_abs;
                 bfloat y = bfloat(1) / denominator;
@@ -4432,7 +4530,14 @@ private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
                 activated[first_row + row] = bfloat(silu * up);
             }
         }
-        """,
+        """
+}()
+
+private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
+    name: "laguna_shared_nvfp4_swiglu_qmv_bf16_v1",
+    inputNames: ["input", "fused_weight", "fused_scales"],
+    outputNames: ["activated"],
+    source: lagunaSharedSwiGLUQMVSource,
     header: lagunaSharedSwiGLUQMVHeader,
     ensureRowContiguous: true
 )
@@ -4566,11 +4671,50 @@ func lagunaSharedDownResidual(
     )[0]
 }
 
-private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_bf16_v2",
-    inputNames: ["input", "fused_weight", "fused_scales", "indices"],
-    outputNames: ["activated"],
-    source: """
+let lagunaRoutedSwiGLUQMVSource: String = {
+    func blockBody(_ op: String) -> String {
+        """
+                const device vec<bfloat, 4>* input_vectors =
+                    (const device vec<bfloat, 4>*)(
+                        input + block + lane * values_per_lane);
+                for (uint i = 0; i < values_per_lane / 4; ++i) {
+                    const vec<bfloat, 4> values = input_vectors[i];
+                    input_values[4 * i] = values[0];
+                    input_values[4 * i + 1] = values[1];
+                    input_values[4 * i + 2] = values[2];
+                    input_values[4 * i + 3] = values[3];
+                }
+
+                for (uint row = 0; row < 2; ++row) {
+                    uint logical_row = first_row + row;
+                    uint pair_tile = logical_row / 32;
+                    uint gate_row = pair_tile * 64 + logical_row % 32;
+                    uint up_row = gate_row + 32;
+                    const device uint8_t* gate_weight =
+                        expert_weight + gate_row * packed_row_bytes +
+                        block / 2 + lane * 8;
+                    const device uint8_t* up_weight =
+                        expert_weight + up_row * packed_row_bytes +
+                        block / 2 + lane * 8;
+                    const device uint8_t* gate_scale =
+                        expert_scales + gate_row * scale_row_bytes +
+                        block / 16 + lane;
+                    const device uint8_t* up_scale =
+                        expert_scales + up_row * scale_row_bytes +
+                        block / 16 + lane;
+
+                    gate_result[row] \(op) laguna_nvfp4_qdot_16(
+                        gate_weight,
+                        input_values,
+                        laguna_nvfp4_scale(gate_scale[0]));
+                    up_result[row] \(op) laguna_nvfp4_qdot_16(
+                        up_weight,
+                        input_values,
+                        laguna_nvfp4_scale(up_scale[0]));
+                }
+        """
+    }
+    return """
         constexpr uint input_width = 2048;
         constexpr uint output_width = 512;
         constexpr uint fused_width = 1024;
@@ -4602,57 +4746,18 @@ private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
         const device uint8_t* expert_scales =
             fused_scales + expert * scale_expert_bytes;
 
-        thread float gate_result[2] = {0.0f, 0.0f};
-        thread float up_result[2] = {0.0f, 0.0f};
+        thread float gate_result[2]\(lagunaNvfp4RowSeedInit);
+        thread float up_result[2]\(lagunaNvfp4RowSeedInit);
         thread float input_values[values_per_lane];
 
-        for (uint block = 0; block < input_width; block += block_width) {
-            const device vec<bfloat, 4>* input_vectors =
-                (const device vec<bfloat, 4>*)(
-                    input + block + lane * values_per_lane);
-            for (uint i = 0; i < values_per_lane / 4; ++i) {
-                const vec<bfloat, 4> values = input_vectors[i];
-                input_values[4 * i] = values[0];
-                input_values[4 * i + 1] = values[1];
-                input_values[4 * i + 2] = values[2];
-                input_values[4 * i + 3] = values[3];
-            }
-
-            for (uint row = 0; row < 2; ++row) {
-                uint logical_row = first_row + row;
-                uint pair_tile = logical_row / 32;
-                uint gate_row = pair_tile * 64 + logical_row % 32;
-                uint up_row = gate_row + 32;
-                const device uint8_t* gate_weight =
-                    expert_weight + gate_row * packed_row_bytes +
-                    block / 2 + lane * 8;
-                const device uint8_t* up_weight =
-                    expert_weight + up_row * packed_row_bytes +
-                    block / 2 + lane * 8;
-                const device uint8_t* gate_scale =
-                    expert_scales + gate_row * scale_row_bytes +
-                    block / 16 + lane;
-                const device uint8_t* up_scale =
-                    expert_scales + up_row * scale_row_bytes +
-                    block / 16 + lane;
-
-                gate_result[row] += laguna_nvfp4_qdot_16(
-                    gate_weight,
-                    input_values,
-                    laguna_nvfp4_scale(gate_scale[0]));
-                up_result[row] += laguna_nvfp4_qdot_16(
-                    up_weight,
-                    input_values,
-                    laguna_nvfp4_scale(up_scale[0]));
-            }
-        }
+        \(lagunaNvfp4SwiGLUKLoop(blockBody))
 
         for (uint row = 0; row < 2; ++row) {
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
             if (lane == 0) {
-                bfloat gate = bfloat(gate_result[row]\(lagunaNvfp4RowScaleSuffix));
-                bfloat up = bfloat(up_result[row]\(lagunaNvfp4RowScaleSuffix));
+                bfloat gate = bfloat(\(lagunaNvfp4RowNormalizeOpen)gate_result[row]\(lagunaNvfp4RowNormalizeClose)\(lagunaNvfp4RowScaleSuffix));
+                bfloat up = bfloat(\(lagunaNvfp4RowNormalizeOpen)up_result[row]\(lagunaNvfp4RowNormalizeClose)\(lagunaNvfp4RowScaleSuffix));
                 bfloat exp_abs = metal::exp(metal::abs(gate));
                 bfloat denominator = bfloat(1) + exp_abs;
                 bfloat y = bfloat(1) / denominator;
@@ -4663,7 +4768,14 @@ private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
                 ] = bfloat(silu * up);
             }
         }
-        """,
+        """
+}()
+
+private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_bf16_v2",
+    inputNames: ["input", "fused_weight", "fused_scales", "indices"],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVSource,
     header: lagunaSharedSwiGLUQMVHeader,
     ensureRowContiguous: true
 )
