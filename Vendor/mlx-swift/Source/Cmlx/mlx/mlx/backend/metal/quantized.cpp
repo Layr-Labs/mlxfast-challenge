@@ -1261,8 +1261,21 @@ bool darkbloom_stage_flag(const char* name) {
   return v == "1";
 }
 
+// DARKBLOOM_STAGE_WIDEST is now DEFAULT ON ("0" restores the shipped scalar
+// stores). It is the one lever in this family that needs no host-side
+// certification -- Ws is 16B aligned by construction in the kernel -- so it
+// applies unconditionally and its A/B is unambiguous, unlike WIDELD which is
+// silently downgraded when `wide_ok` declines. Of the ~50 LSU ops the loader
+// issues per thread per k-iteration, 32 are the 2B threadgroup stores this
+// widens to 4x16B; that is the largest single share of a loader that is ~68%
+// of the kernel's LSU traffic after RUNSKIP, in a kernel family the
+// duplication probe puts at ~54% of prefill. Arithmetically inert: identical
+// bytes, identical values, identical destinations and identical accumulation
+// order -- only the store width changes. The remaining STAGE_* levers stay
+// off and are unaffected by this default.
 bool darkbloom_stage_widest() {
-  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_WIDEST");
+  static const bool v =
+      env::get_var("DARKBLOOM_STAGE_WIDEST", "") != "0";
   return v;
 }
 
