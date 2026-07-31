@@ -473,26 +473,7 @@ public final class LagunaRuntimeWeightCache {
         )
         eval(model(prefillTokens, cache: warmupCache))
         let decodeToken = MLXArray([bosToken], [1, 1])
-        let warmDecodeLogits = model(decodeToken, cache: warmupCache)
-        eval(warmDecodeLogits)
-        // Warm the greedy-token pipeline too. Every scored worker request ends
-        // in `LagunaCorrectness.greedyToken` (reshape -> last row -> argMax),
-        // and the forwards above never run an argmax, so its first use
-        // otherwise creates the `argmax_bfloat16` compute pipeline state
-        // INSIDE the measured window: a timestamped PSO-miss log showed the
-        // compile firing ~0.23 s into the scored prefill request and again in
-        // the decode seed, matching a recurring ~17 ms MTLCompilerService
-        // interval inside both timed phases in Metal System Trace. Replicating
-        // the same ops here moves that one-time compile to untimed init.
-        // Input-independent kernel-cache warmup only (TASK.md explicitly
-        // allows caches for kernels); constant BOS input, output discarded.
-        // `DARKBLOOM_WARM_GREEDY_ARGMAX=0` restores the stock warmup.
-        if ProcessInfo.processInfo.environment["DARKBLOOM_WARM_GREEDY_ARGMAX"] != "0",
-            let vocabSize = warmDecodeLogits.shape.last, vocabSize > 0
-        {
-            let rows = warmDecodeLogits.reshaped([-1, vocabSize])
-            eval(rows[-1].argMax())
-        }
+        eval(model(decodeToken, cache: warmupCache))
     }
     /// See the construction-time comment: one `set_wired_limit` call sized
     /// to the live footprint, applied through the public async ticket path

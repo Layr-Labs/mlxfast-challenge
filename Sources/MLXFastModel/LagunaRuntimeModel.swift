@@ -134,6 +134,15 @@ let lagunaFusedRoutedSharedDownResidualEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_ROUTED_SHARED_DOWN_RESIDUAL"] != "0"
 
+/// Output-rows-per-SIMD repartition for the fused routed/shared down-residual
+/// kernel. Default `8` selects the OPS8 twin (more rows/SIMD = more input reuse,
+/// fewer threadgroups); `DARKBLOOM_DOWN_OPS=4` restores the shipped control.
+/// Bit-exact EG256 class: each row's per-expert dot is independent.
+let lagunaDownOPS: Int = {
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DOWN_OPS"] ?? "8"
+    return raw == "4" ? 4 : 8
+}()
+
 /// Routed-expert counterpart to the shared QMV + SwiGLU fusion. Each decode
 /// request supplies exactly eight current-token expert indices; the kernel
 /// reads those banks directly and emits `[1, 1, 8, 1, 512]`.
@@ -1304,7 +1313,7 @@ func lagunaSlidingQKNormRoPE(
 ///    re-derivation. The decode twin (`laguna_sliding_qk_norm_rope_bf16_128_v1`)
 ///    consumes the same table with the same expression.
 private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_v2",
+    name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_v1",
     inputNames: [
         "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
         "offsets",
@@ -1339,7 +1348,6 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         uint base = lane * 4;
         thread bfloat normalized[4];
         float sum = 0.0f;
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             float value = float(input[base + i]);
             sum += value * value;
@@ -1351,7 +1359,6 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
@@ -1359,11 +1366,7 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         }
 
         // Element `p + 64`, the partner of pair `p`, lives 16 lanes away.
-        // Every fixed-four loop in this prefill-only kernel is explicitly
-        // scalarized. This removes loop-control ALU while preserving the
-        // exact source order of the dependent RMS sum and rotary arithmetic.
         thread float paired[4];
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
         }
@@ -1373,7 +1376,6 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
         // Every element rotates, so the lower sixteen lanes own all 64
         // pairs and write both halves of each.
         if (lane < 16) {
-            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
                 float first = float(normalized[i]);
@@ -1399,7 +1401,7 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
 /// (`lagunaSlidingQKNormRoPEKernel`, one SIMD/head, the project's largest
 /// single win); the prefill `*4` was an unaudited divergence from it.
 private let lagunaPrefillSlidingQKNormRoPEH1Kernel = MLXFast.metalKernel(
-    name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_h1_v2",
+    name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_h1_v1",
     inputNames: [
         "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
         "offsets",
@@ -1433,7 +1435,6 @@ private let lagunaPrefillSlidingQKNormRoPEH1Kernel = MLXFast.metalKernel(
         uint base = lane * 4;
         thread bfloat normalized[4];
         float sum = 0.0f;
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             float value = float(input[base + i]);
             sum += value * value;
@@ -1441,18 +1442,13 @@ private let lagunaPrefillSlidingQKNormRoPEH1Kernel = MLXFast.metalKernel(
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
                 bfloat(float(input[base + i]) * inverse_rms);
         }
 
-        // Every fixed-four loop in this prefill-only kernel is explicitly
-        // scalarized. This removes loop-control ALU while preserving the
-        // exact source order of the dependent RMS sum and rotary arithmetic.
         thread float paired[4];
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
         }
@@ -1460,7 +1456,6 @@ private let lagunaPrefillSlidingQKNormRoPEH1Kernel = MLXFast.metalKernel(
         const device float* angle_row =
             angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
         if (lane < 16) {
-            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
                 float first = float(normalized[i]);
@@ -1491,7 +1486,7 @@ private let lagunaPrefillSlidingQKNormRoPEH1Kernel = MLXFast.metalKernel(
 /// and the tail elements 64…127 written verbatim, matching the values the
 /// stock pre-RoPE copy leaves behind.
 private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_full_qk_norm_yarn_bf16_128_v2",
+    name: "laguna_prefill_full_qk_norm_yarn_bf16_128_v1",
     inputNames: [
         "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
         "offsets",
@@ -1527,7 +1522,6 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
         uint base = lane * 4;
         thread bfloat normalized[4];
         float sum = 0.0f;
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             float value = float(input[base + i]);
             sum += value * value;
@@ -1535,7 +1529,6 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
@@ -1543,10 +1536,8 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
         }
 
         // Element `p + 32`, the rotary partner of pair `p` inside the
-        // 64-wide YaRN half, lives 8 lanes away. As in the sliding twin,
-        // scalarize the fixed-four plumbing without changing arithmetic.
+        // 64-wide YaRN half, lives 8 lanes away.
         thread float paired[4];
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
         }
@@ -1555,7 +1546,6 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
             angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
         if (lane < 8) {
             bfloat rounded_mscale = bfloat(yarn_mscale);
-            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
                 float first =
@@ -1569,7 +1559,6 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
                     bfloat(first * sine + second * cosine);
             }
         } else if (lane >= 16) {
-            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 output[base + i] = normalized[i];
             }
@@ -1585,7 +1574,7 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
 /// per threadgroup instead of four changes only launch count/occupancy, not any
 /// head's output value. Matches the proven decode shape.
 private let lagunaPrefillFullQKNormYaRNH1Kernel = MLXFast.metalKernel(
-    name: "laguna_prefill_full_qk_norm_yarn_bf16_128_h1_v2",
+    name: "laguna_prefill_full_qk_norm_yarn_bf16_128_h1_v1",
     inputNames: [
         "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
         "offsets",
@@ -1620,7 +1609,6 @@ private let lagunaPrefillFullQKNormYaRNH1Kernel = MLXFast.metalKernel(
         uint base = lane * 4;
         thread bfloat normalized[4];
         float sum = 0.0f;
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             float value = float(input[base + i]);
             sum += value * value;
@@ -1628,17 +1616,13 @@ private let lagunaPrefillFullQKNormYaRNH1Kernel = MLXFast.metalKernel(
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             normalized[i] =
                 weight[base + i] *
                 bfloat(float(input[base + i]) * inverse_rms);
         }
 
-        // As in the sliding twin, scalarize the fixed-four plumbing without
-        // changing arithmetic.
         thread float paired[4];
-        #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
             paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
         }
@@ -1647,7 +1631,6 @@ private let lagunaPrefillFullQKNormYaRNH1Kernel = MLXFast.metalKernel(
             angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
         if (lane < 8) {
             bfloat rounded_mscale = bfloat(yarn_mscale);
-            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
                 float first =
@@ -1661,7 +1644,6 @@ private let lagunaPrefillFullQKNormYaRNH1Kernel = MLXFast.metalKernel(
                     bfloat(first * sine + second * cosine);
             }
         } else if (lane >= 16) {
-            #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; ++i) {
                 output[base + i] = normalized[i];
             }
@@ -4124,122 +4106,12 @@ let lagunaNvfp4NibbleSplit: Int = {
     else { return 1 }
     return value
 }()
-
-/// Folds the e4m3 group-scale's sign bit into the half bit pattern instead of
-/// negating after conversion. For `bits = 128 + m` the carry `bits + (bits &
-/// 128)` yields `256 + m`, and `(256 + m) << 7 == 0x8000 | (m << 7)` because
-/// `m <= 127` keeps `m << 7 <= 16256 < 0x8000`; IEEE half is sign-magnitude,
-/// so that pattern IS the negation, including `-0.0h`. For `bits < 128` the
-/// add is the identity. Drops `laguna_nvfp4_scale` from seven AIR ops to five
-/// in the innermost K loop of every routed/shared decode QMV.
-/// `DARKBLOOM_NVFP4_SCALE_CARRY=0` restores the negate-after-convert form.
-let lagunaNvfp4ScaleCarry: Bool =
-    ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_CARRY"] != "0"
-
-/// `DARKBLOOM_NVFP4_QDOT_SEED_ELIDE` (default on; set "0" to restore the
-/// `float accum = 0.0f;` seed): removes the one dead FP add per 16-value NVFP4
-/// group. `laguna_nvfp4_qdot_codes_16` seeds its accumulator with the literal
-/// `+0.0f` and then performs four `accum +=`, so the very first of those four
-/// is `fl(+0.0f + t)`. **`fadd float 0.0, %t` is NOT foldable to `%t`** —
-/// `0.0f + (-0.0f)` is `+0.0f`, not `-0.0f`, so eliminating it needs the
-/// no-signed-zeros flag, and `device.cpp:631` sets
-/// `setFastMathEnabled(false)`. The add really is emitted, once per group, and
-/// with ~69 M groups per decoded token across the nine routed/shared
-/// SwiGLU-QMV and down kernels that is ~69 M dead FP adds per token, ~1.4% of
-/// this loop's ALU.
-///
-/// **Bit-exactness is a closed case analysis over signed zero, not a
-/// tolerance.** Write the four partial sums `t0..t3` (`t0` is the first
-/// four-term group of packed word `codes.x`). Current: `a = (((+0 + t0) + t1)
-/// + t2) + t3`. Elided: `a' = ((t0 + t1) + t2) + t3`.
-///
-///  1. If `t0 != -0.0` then `+0.0 + t0 == t0` bit-for-bit (IEEE 754 round-to-
-///     nearest: `+0` is the additive identity for every operand except `-0`),
-///     so `a' == a` and nothing downstream can differ.
-///  2. If `t0 == -0.0` then the current form holds `+0.0` and the elided form
-///     `-0.0`. Both are zeros, so each subsequent add either lands on the same
-///     nonzero value (`±0 + x == x`) or keeps both operands zero. `a` and `a'`
-///     can therefore differ ONLY as `+0.0` versus `-0.0`, and only when all
-///     sixteen products of the group are `-0.0` (a sum of floats is `-0.0`
-///     only if both addends are `-0.0`).
-///  3. `scale` is always finite — `laguna_nvfp4_scale` builds its half from
-///     `(bits & 127) << 7`, whose largest magnitude is 1.875h, so no E4M3 byte
-///     can make it Inf/NaN — hence `scale * (±0.0) == ±0.0` and `qdot`'s
-///     return differs at most in the sign of a zero.
-///  4. Every call site absorbs that sign. The SwiGLU kernels accumulate into
-///     `gate_result`/`up_result`, seeded `+0.0f`: `+0.0 + (-0.0) == +0.0`, and
-///     once the accumulator is nonzero a `±0.0` addend leaves it unchanged, so
-///     a `-0.0` row accumulator is unreachable in either form. The down
-///     kernels assign `result[row]`, `simd_sum` it (again `+0 + -0 == +0`
-///     unless all 32 lanes are `-0.0`), cast to BF16, and then reach the
-///     output only through `routed + shared` / `product + routed_total` /
-///     `residual + r2`, whose left operands are themselves `+0.0`-seeded
-///     accumulations or the residual — so the `-0.0` is absorbed there too.
-///
-/// `LagunaNVFP4QdotSeedTests` executes 1-4 over the adversarial signed-zero
-/// domain on the CPU, including groups whose every NVFP4 code is `-0.0`
-/// (code 8) and every activation `+0.0`.
-///
-/// The two packed-word bodies are emitted textually in BOTH arms of the flag,
-/// so the flag isolates the seed and nothing else. That costs no arithmetic:
-/// the Metal compiler must already fully unroll the two-iteration `j` loop —
-/// `input` is a `thread float[16]` that only stays in registers under constant
-/// indices — so the unrolled text is what it was already compiling.
-let lagunaNvfp4QdotSeedElisionEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_QDOT_SEED_ELIDE"] != "0"
-
-/// `DARKBLOOM_NVFP4_SCALE_DEFER` (default ON; set "0" to restore): moves
-/// the `2^22` that `DARKBLOOM_NVFP4_SCALE_FOLD` parked in
-/// `laguna_nvfp4_scale` out of the per-group scale and onto the per-row
-/// accumulator, one multiply per output row instead of one per 16-value
-/// group. `laguna_nvfp4_scale` drops from five ops to four (and, add, shift,
-/// convert) and the group cost falls by one FP multiply -- the same ~69 M
-/// removals per decoded token as the seed elision above.
-///
-/// Off by default **on purpose**. Unlike the seed elision, the carry sign-fold
-/// and the nibble split, this one is not exact by case analysis: it is exact
-/// under a range condition. Multiplying by an exact power of two is exact and
-/// commutes with rounding, so with `s' = scale * 2^-22` every group product
-/// `fl(s' * accum)` is exactly `2^-22 * fl(scale * accum)`, every partial sum
-/// of those products is exactly `2^-22` times the current one, and the single
-/// epilogue multiply restores it before the one BF16 rounding -- **provided no
-/// product lands in the FP32 subnormal range**, where scaling no longer
-/// commutes with rounding.
-///
-/// The condition, stated exactly: the deferred form diverges only if some
-/// group has `0 < |scale * accum| < 2^-104`. `s'` is at least `2^-17` (the
-/// smallest nonzero E4M3 byte, `2^-9`, over 256), so that needs
-/// `|accum| < 2^-109`; every NVFP4 weight is a multiple of `2^-15` and every
-/// activation is BF16, so a nonzero `accum` below `2^-109` needs all sixteen
-/// activations of the group below roughly `2^-99`. This model cannot produce
-/// them: activations are BF16 roundings of `O(1)` residual-stream and RMSNorm
-/// quantities, and cancellation in BF16 lands on that same coarse grid, so a
-/// hidden value is either exactly zero (which contributes an exact zero and is
-/// safe) or within a few tens of binades of the row's scale. The margin is
-/// ~60 binades — promoted to the shipped default on that basis; the
-/// exact-token gates fail loudly if the range assumption is ever violated.
-let lagunaNvfp4ScaleDeferEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_DEFER"] != "0"
-    && lagunaNvfp4ScaleFoldEnabled
-
-/// The `2^22` that `laguna_nvfp4_scale` stops applying under
-/// `DARKBLOOM_NVFP4_SCALE_DEFER`, re-applied once per output row at the
-/// accumulator-to-BF16 boundary. It appears at exactly one site per
-/// `laguna_nvfp4_scale` call site in every kernel that uses
-/// `lagunaSharedSwiGLUQMVHeader`; `nvfp4EveryScaleCallSiteHasARowRescaleSite`
-/// pins those two counts equal per kernel so a missed epilogue cannot ship.
-let lagunaNvfp4RowScaleSuffix = lagunaNvfp4ScaleDeferEnabled ? " * 4194304.0f" : ""
-
-let lagunaSharedSwiGLUQMVHeader: String = {
+private let lagunaSharedSwiGLUQMVHeader: String = {
     // The two halves of one power-of-two regrouping. They MUST move together:
     // the scale absorbs `2^14` exactly when the weights stop applying it.
     // `4194304.0f == 256 · 16384 == 2^22`.
-    // Under `DARKBLOOM_NVFP4_SCALE_DEFER` the `2^22` leaves the per-group
-    // scale entirely and is re-applied once per output row by
-    // `lagunaNvfp4RowScaleSuffix`; the tail is then the same expression the
-    // unfolded arm uses, for the opposite reason.
     let scaleTail =
-        (lagunaNvfp4ScaleFoldEnabled && !lagunaNvfp4ScaleDeferEnabled)
+        lagunaNvfp4ScaleFoldEnabled
         ? "        return float(signed_value) * 4194304.0f;"
         : "        return float(signed_value);"
     let scale256 = lagunaNvfp4ScaleFoldEnabled ? "" : "        converted *= 256.0;\n"
@@ -4280,58 +4152,11 @@ let lagunaSharedSwiGLUQMVHeader: String = {
                         ((c & 0x70007000u) >> 3) | (c & 0x80008000u);
             """
     }
-    // The carry form only composes with the folded tail, which is where the
-    // sign lands before any further scaling; keep the negate form otherwise.
-    let scaleCarryActive = lagunaNvfp4ScaleCarry && lagunaNvfp4ScaleFoldEnabled
-    let scaleRawExpression =
-        scaleCarryActive
-        ? "ushort((uint(bits) + (bits & 128u)) << 7)"
-        : "ushort(bits & 127) << 7"
-    let scaleSignExpression =
-        scaleCarryActive
-        ? "converted"
-        : "(bits & 128) ? -converted : converted"
-    // One packed 32-bit code word: eight NVFP4 values, four `half2` patterns,
-    // two four-term FP groups. The first group of the FIRST word seeds the
-    // accumulator when the seed elision is enabled; every other group adds.
-    // Word `w` owns `input[8w .. 8w+7]`, exactly the indices the `8 * j` form
-    // produced, so the multiply/add expressions and their association are
-    // untouched.
-    func packedWordBody(_ word: Int) -> String {
-        let codeWord = word == 0 ? "codes.x" : "codes.y"
-        let base = 8 * word
-        let seedOperator =
-            (word == 0 && lagunaNvfp4QdotSeedElisionEnabled)
-            ? "accum =" : "accum +="
-        return """
-                {
-                    const uint c = \(codeWord);
-            \(extract)
-                    const float2 v04 = float2(as_type<half2>(p0))\(weightScale);
-                    const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
-                    const float2 v26 = float2(as_type<half2>(p2))\(weightScale);
-                    const float2 v37 = float2(as_type<half2>(p3))\(weightScale);
-                    \(seedOperator)
-                        (input[\(base)] * v04.x +
-                         input[\(base + 1)] * v15.x +
-                         input[\(base + 2)] * v26.x +
-                         input[\(base + 3)] * v37.x);
-                    accum +=
-                        (input[\(base + 4)] * v04.y +
-                         input[\(base + 5)] * v15.y +
-                         input[\(base + 6)] * v26.y +
-                         input[\(base + 7)] * v37.y);
-                }
-            """
-    }
-    let accumDeclaration =
-        lagunaNvfp4QdotSeedElisionEnabled
-        ? "float accum;" : "float accum = 0.0f;"
     return """
     static inline float laguna_nvfp4_scale(uint8_t bits) {
-        ushort raw = \(scaleRawExpression);
+        ushort raw = ushort(bits & 127) << 7;
         half converted = as_type<half>(raw);
-    \(scale256)    half signed_value = \(scaleSignExpression);
+    \(scale256)    half signed_value = (bits & 128) ? -converted : converted;
     \(scaleTail)
     }
 
@@ -4340,9 +4165,25 @@ let lagunaSharedSwiGLUQMVHeader: String = {
         const thread float* input,
         float scale
     ) {
-        \(accumDeclaration)
-    \(packedWordBody(0))
-    \(packedWordBody(1))
+        float accum = 0.0f;
+        for (uint j = 0; j < 2; ++j) {
+            const uint c = (j == 0) ? codes.x : codes.y;
+    \(extract)
+            const float2 v04 = float2(as_type<half2>(p0))\(weightScale);
+            const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
+            const float2 v26 = float2(as_type<half2>(p2))\(weightScale);
+            const float2 v37 = float2(as_type<half2>(p3))\(weightScale);
+            accum +=
+                (input[8 * j] * v04.x +
+                 input[8 * j + 1] * v15.x +
+                 input[8 * j + 2] * v26.x +
+                 input[8 * j + 3] * v37.x);
+            accum +=
+                (input[8 * j + 4] * v04.y +
+                 input[8 * j + 5] * v15.y +
+                 input[8 * j + 6] * v26.y +
+                 input[8 * j + 7] * v37.y);
+        }
         return scale * accum;
     }
 
@@ -4422,8 +4263,8 @@ private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
             if (lane == 0) {
-                bfloat gate = bfloat(gate_result[row]\(lagunaNvfp4RowScaleSuffix));
-                bfloat up = bfloat(up_result[row]\(lagunaNvfp4RowScaleSuffix));
+                bfloat gate = bfloat(gate_result[row]);
+                bfloat up = bfloat(up_result[row]);
                 bfloat exp_abs = metal::exp(metal::abs(gate));
                 bfloat denominator = bfloat(1) + exp_abs;
                 bfloat y = bfloat(1) / denominator;
@@ -4519,7 +4360,7 @@ private let lagunaSharedDownResidualKernel = MLXFast.metalKernel(
         if (lane == 0) {
             for (uint row = 0; row < outputs_per_simd; ++row) {
                 uint output_row = first_row + row;
-                bfloat shared = bfloat(result[row]\(lagunaNvfp4RowScaleSuffix));
+                bfloat shared = bfloat(result[row]);
                 bfloat r2 = bfloat(routed[output_row] + shared);
                 output[output_row] =
                     bfloat(residual[output_row] + r2);
@@ -4651,8 +4492,8 @@ private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
             if (lane == 0) {
-                bfloat gate = bfloat(gate_result[row]\(lagunaNvfp4RowScaleSuffix));
-                bfloat up = bfloat(up_result[row]\(lagunaNvfp4RowScaleSuffix));
+                bfloat gate = bfloat(gate_result[row]);
+                bfloat up = bfloat(up_result[row]);
                 bfloat exp_abs = metal::exp(metal::abs(gate));
                 bfloat denominator = bfloat(1) + exp_abs;
                 bfloat y = bfloat(1) / denominator;
@@ -4813,8 +4654,8 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
             if (lane == 0) {
-                bfloat gate = bfloat(gate_result[row]\(lagunaNvfp4RowScaleSuffix));
-                bfloat up = bfloat(up_result[row]\(lagunaNvfp4RowScaleSuffix));
+                bfloat gate = bfloat(gate_result[row]);
+                bfloat up = bfloat(up_result[row]);
                 bfloat exp_abs = metal::exp(metal::abs(gate));
                 bfloat denominator = bfloat(1) + exp_abs;
                 bfloat y = bfloat(1) / denominator;
@@ -4939,8 +4780,8 @@ private let lagunaRoutedSharedSwiGLUQMVRows4Kernel = MLXFast.metalKernel(
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
             if (lane == 0) {
-                bfloat gate = bfloat(gate_result[row]\(lagunaNvfp4RowScaleSuffix));
-                bfloat up = bfloat(up_result[row]\(lagunaNvfp4RowScaleSuffix));
+                bfloat gate = bfloat(gate_result[row]);
+                bfloat up = bfloat(up_result[row]);
                 bfloat exp_abs = metal::exp(metal::abs(gate));
                 bfloat denominator = bfloat(1) + exp_abs;
                 bfloat y = bfloat(1) / denominator;
@@ -5082,8 +4923,8 @@ private let lagunaPipelinedRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
             if (lane == 0) {
-                bfloat gate = bfloat(gate_result[row]\(lagunaNvfp4RowScaleSuffix));
-                bfloat up = bfloat(up_result[row]\(lagunaNvfp4RowScaleSuffix));
+                bfloat gate = bfloat(gate_result[row]);
+                bfloat up = bfloat(up_result[row]);
                 bfloat exp_abs = metal::exp(metal::abs(gate));
                 bfloat denominator = bfloat(1) + exp_abs;
                 bfloat y = bfloat(1) / denominator;
@@ -5207,8 +5048,8 @@ private let lagunaNineSlotSwiGLUQMVKernel = MLXFast.metalKernel(
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
             if (lane == 0) {
-                bfloat gate = bfloat(gate_result[row]\(lagunaNvfp4RowScaleSuffix));
-                bfloat up = bfloat(up_result[row]\(lagunaNvfp4RowScaleSuffix));
+                bfloat gate = bfloat(gate_result[row]);
+                bfloat up = bfloat(up_result[row]);
                 bfloat exp_abs = metal::exp(metal::abs(gate));
                 bfloat denominator = bfloat(1) + exp_abs;
                 bfloat y = bfloat(1) / denominator;
@@ -5371,7 +5212,7 @@ private let lagunaRoutedDownReduceKernel = MLXFast.metalKernel(
             for (uint row = 0; row < outputs_per_simd; ++row) {
                 expert_outputs[
                     expert_slot * outputs_per_simd + row
-                ] = bfloat(result[row]\(lagunaNvfp4RowScaleSuffix));
+                ] = bfloat(result[row]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -5511,7 +5352,118 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
         if (lane == 0) {
             for (uint row = 0; row < outputs_per_simd; ++row) {
                 down_outputs[slot * outputs_per_simd + row] =
-                    bfloat(result[row]\(lagunaNvfp4RowScaleSuffix));
+                    bfloat(result[row]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (slot == 0 && lane < outputs_per_simd) {
+            bfloat routed_total = bfloat(0);
+            for (uint routed_slot = 0;
+                 routed_slot < routed_experts;
+                 ++routed_slot) {
+                bfloat route_weight =
+                    bfloat(router_weights[routed_slot]);
+                bfloat product = bfloat(
+                    down_outputs[
+                        routed_slot * outputs_per_simd + lane
+                    ] * route_weight);
+                routed_total = bfloat(product + routed_total);
+            }
+            bfloat routed = bfloat(
+                routed_total * bfloat(2.5f));
+            bfloat shared =
+                down_outputs[shared_slot * outputs_per_simd + lane];
+            bfloat r2 = bfloat(routed + shared);
+            output[first_row + lane] =
+                bfloat(residual[first_row + lane] + r2);
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
+/// Eight-output-rows-per-SIMD twin of the routed/shared down-residual kernel.
+/// BIT-EXACT repartition: each output row's per-expert NVFP4 dot is independent,
+/// `simd_sum` is per-row, the cross-expert weighted reduction visits slots 0..7
+/// in fixed order, and the BF16 rounding boundaries are unchanged. Raising
+/// outputs_per_simd 4 -> 8 doubles the reuse of the 512-wide activated input
+/// (loaded once per SIMD) across output rows, and halves the grid.
+private let lagunaRoutedSharedDownResidualOPS8Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_shared_nvfp4_down_residual_bf16_ops8_v1",
+    inputNames: [
+        "routed_activated", "routed_down_weight", "routed_down_scales",
+        "indices", "router_weights", "shared_activated",
+        "shared_down_weight", "shared_down_scales", "residual",
+    ],
+    outputNames: ["output"],
+    source: """
+        constexpr uint input_width = 512;
+        constexpr uint output_width = 2048;
+        constexpr uint routed_experts = 8;
+        constexpr uint shared_slot = 8;
+        constexpr uint outputs_per_simd = 8;
+        constexpr uint values_per_lane = 16;
+        constexpr uint packed_row_bytes = 256;
+        constexpr uint scale_row_bytes = 32;
+        constexpr uint packed_expert_bytes =
+            output_width * packed_row_bytes;
+        constexpr uint scale_expert_bytes =
+            output_width * scale_row_bytes;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint slot = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint first_row = tile * outputs_per_simd;
+        bool is_shared = slot == shared_slot;
+        uint expert = is_shared ? 0 : uint(indices[slot]);
+
+        const device bfloat* expert_input = is_shared
+            ? shared_activated
+            : routed_activated + slot * input_width;
+        const device uint8_t* expert_weight = is_shared
+            ? (const device uint8_t*)shared_down_weight
+            : (const device uint8_t*)routed_down_weight +
+                expert * packed_expert_bytes;
+        const device uint8_t* expert_scales = is_shared
+            ? shared_down_scales
+            : routed_down_scales + expert * scale_expert_bytes;
+
+        thread float input_values[values_per_lane];
+        const device vec<bfloat, 4>* input_vectors =
+            (const device vec<bfloat, 4>*)(
+                expert_input + lane * values_per_lane);
+        for (uint i = 0; i < values_per_lane / 4; ++i) {
+            const vec<bfloat, 4> values = input_vectors[i];
+            input_values[4 * i] = values[0];
+            input_values[4 * i + 1] = values[1];
+            input_values[4 * i + 2] = values[2];
+            input_values[4 * i + 3] = values[3];
+        }
+
+        thread float result[outputs_per_simd] = {
+            0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
+        };
+        for (uint row = 0; row < outputs_per_simd; ++row) {
+            uint output_row = first_row + row;
+            const device uint8_t* weight =
+                expert_weight + output_row * packed_row_bytes + lane * 8;
+            const device uint8_t* scale =
+                expert_scales + output_row * scale_row_bytes + lane;
+            result[row] = laguna_nvfp4_qdot_16(
+                weight,
+                input_values,
+                laguna_nvfp4_scale(scale[0]));
+            result[row] = simd_sum(result[row]);
+        }
+
+        threadgroup bfloat down_outputs[
+            (routed_experts + 1) * outputs_per_simd
+        ];
+        if (lane == 0) {
+            for (uint row = 0; row < outputs_per_simd; ++row) {
+                down_outputs[slot * outputs_per_simd + row] =
+                    bfloat(result[row]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -5597,13 +5549,18 @@ func lagunaRoutedSharedDownResidual(
     precondition(residual.dtype == .bfloat16)
     precondition(residual.shape == [1, 1, LagunaConstants.hiddenSize])
 
-    return lagunaRoutedSharedDownResidualKernel(
+    let useOPS8 = lagunaDownOPS == 8
+    let kernel = useOPS8
+        ? lagunaRoutedSharedDownResidualOPS8Kernel
+        : lagunaRoutedSharedDownResidualKernel
+    let ops = useOPS8 ? 8 : 4
+    return kernel(
         [
             routedActivated, routedDownWeight, routedDownScales,
             indices, routerWeights, sharedActivated,
             sharedDownWeight, sharedDownScales, residual,
         ],
-        grid: ((LagunaConstants.hiddenSize / 4) * 288, 1, 1),
+        grid: ((LagunaConstants.hiddenSize / ops) * 288, 1, 1),
         threadGroup: (288, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
         outputDTypes: [.bfloat16]
