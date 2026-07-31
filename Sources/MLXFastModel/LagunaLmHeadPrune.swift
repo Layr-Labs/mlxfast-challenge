@@ -20,6 +20,11 @@ import MLXFast
 //      and m_i = sum_j |x_j| * |what_ij|, so delta_i covers BOTH the
 //      quantization error and both kernels' float rounding (depth <= 96
 //      roundings/element-path << gamma = 2^-15 relative; notes/68 section 6).
+//      DEFAULT (DARKBLOOM_LMHEAD_RATIO_BOUND, default ON) the kernel emits the
+//      strictly-not-smaller closed form d_i*(1+61*gamma), which is legal
+//      because |decode_e4m3(code)| <= 30*hs8(code) for all 256 codes gives
+//      m_i <= 30*d_i termwise; that drops the m_i accumulator and its
+//      SIMD reduction. Set the variable to "0" for the accepted two-term form.
 //      The e4m3/e8m0 decoders below are bit-exact replicas of the vendored
 //      fp8.h / fp_quantized.h semantics (no libm: exponent-bit construction).
 //   2. EXACT pass (`lagunaLmHeadInlineExactKernel`): each simdgroup owns a FIXED
@@ -76,6 +81,22 @@ let lagunaLmHeadPrunePrefillEnabled =
 /// dispatch and stored `coarse_bf` output.
 private let lagunaLmHeadInlineMaskEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_INLINE_MASK"] != "0"
+
+/// Replace the per-element `m = sum |x|*|what|` accumulation with its exact
+/// global E4M3 bound `m <= 30*d`. This removes one multiply/add chain and one
+/// SIMD reduction from the bandwidth-heavy coarse pass. Set to "0" for the
+/// accepted three-accumulator implementation.
+///
+/// The bound is per-row arithmetic (see the ratio-bound kernels below), so it
+/// is orthogonal to the pack16 threadgroup geometry: rows-per-threadgroup only
+/// changes which simdgroup owns a row, never a row's lane partition, its
+/// 32-lane `simd_sum` width, or its `sd_g` scale handling. This selector is
+/// likewise orthogonal to `DARKBLOOM_LMHEAD_INLINE_MASK` -- both the
+/// two-output inline twin and the three-output kill-switch twin honor it -- and
+/// it is nested inside `DARKBLOOM_LMHEAD_COARSE`, whose `v1` arm stays the
+/// verbatim scalar pack8 A/B reference.
+private let lagunaLmHeadRatioBoundEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_RATIO_BOUND"] != "0"
 
 /// Kernel header: bit-exact MXFP8 element decoders + the certified
 /// half-cell-width table, all inlinable and libm-free.
@@ -208,6 +229,82 @@ private let lagunaLmHeadCoarseKernel = MLXFast.metalKernel(
     header: lagunaLmHeadPruneHeader,
     ensureRowContiguous: true
 )
+
+/// Same MXFP8 coarse logits and quantization-error sum as the pack16 kernel
+/// above, but the roundoff term uses the exact format-wide inequality
+/// `m <= 30*d`. For every non-top E4M3 code, decoded magnitude divided by its
+/// half-cell width is at most 30 (attained by magnitude 15); the saturated top
+/// code's ratio is smaller. Thus the retained `d*(1+gamma) + 2*gamma*m` is
+/// bounded by `d*(1+61*gamma)`.
+///
+/// The inequality is per element, and both `d` and `m` accumulate the same
+/// per-group `sd_g` scale over the same 2048 elements of one row, so it lifts
+/// to the row sums unchanged under any threadgroup packing. The pack16 row
+/// mapping (`threadgroup_position_in_grid.x * 16 + simdgroup_index_in_...`)
+/// keeps one simdgroup per row, 32 lanes per row, and two groups per lane, so
+/// `c_acc` and `d_acc` are the bit-identical FP32 values the pack16 kernel
+/// computes; only the `m_acc` chain and its `simd_sum` are gone. These kernels
+/// use no threadgroup shared memory, so widening the threadgroup to 512 threads
+/// adds no shared array to size and no barrier to place.
+private let lagunaLmHeadCoarseRatioBoundKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_mxfp8_coarse_ratio_bound_pack16_v1",
+    inputNames: ["x", "codes", "scales"],
+    outputNames: ["coarse", "delta", "coarse_bf"],
+    source: """
+        constexpr float GAMMA = 0x1p-15f;
+
+        uint row = threadgroup_position_in_grid.x * 16 +
+            simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        const device uint8_t* crow = codes + size_t(row) * 2048;
+        const device uint8_t* srow = scales + size_t(row) * 64;
+
+        float c_acc = 0.0f;
+        float d_acc = 0.0f;
+        for (uint gg = 0; gg < 2; ++gg) {
+            uint g = 2 * lane + gg;
+            float sd = laguna_e8m0_decode(srow[g]);
+            const device uint4* cptr = (const device uint4*)(crow + g * 32);
+            uint4 packed0 = cptr[0];
+            uint4 packed1 = cptr[1];
+            float cg = 0.0f;
+            float dg = 0.0f;
+            const device ushort4* xrow = (const device ushort4*)(x + g * 32);
+            #pragma clang loop unroll(full)
+            for (uint w = 0; w < 8; ++w) {
+                uint word = (w < 4u) ? packed0[w & 3u] : packed1[w & 3u];
+                float4 cv4 = laguna_e4m3_decode4(word);
+                float4 xv4 = as_type<float4>(uint4(xrow[w]) << 16);
+                float4 ax4 = metal::abs(xv4);
+                uint4 b4 = (uint4(word) >> uint4(0u, 8u, 16u, 24u)) & 255u;
+                uint4 mag4 = b4 & 127u;
+                uint4 e4 = mag4 >> 3;
+                float4 hsf =
+                    as_type<float4>((metal::max(e4, uint4(1u)) + 116u) << 23);
+                float4 hs4 =
+                    metal::select(hsf, float4(186.0f), mag4 == 126u);
+                #pragma clang loop unroll(full)
+                for (uint k = 0; k < 4; ++k) {
+                    cg += xv4[k] * cv4[k];
+                    dg += ax4[k] * hs4[k];
+                }
+            }
+            c_acc += sd * cg;
+            d_acc += sd * dg;
+        }
+        c_acc = simd_sum(c_acc);
+        d_acc = simd_sum(d_acc);
+        if (lane == 0) {
+            coarse[row] = c_acc;
+            delta[row] = d_acc * (1.0f + 61.0f * GAMMA);
+            coarse_bf[row] = bfloat(c_acc);
+        }
+        """,
+    header: lagunaLmHeadPruneHeader,
+    ensureRowContiguous: true
+)
+
 /// v1 coarse kernel, kept verbatim for same-binary A/B (the paired
 /// measurement protocol requires both arms in one binary). Selected by
 /// `DARKBLOOM_LMHEAD_COARSE=v1`; the shipped default is v2 above. The two
@@ -331,6 +428,81 @@ private let lagunaLmHeadInlineCoarseKernel = MLXFast.metalKernel(
         if (lane == 0) {
             coarse[row] = c_acc;
             delta[row] = d_acc * (1.0f + GAMMA) + (2.0f * GAMMA) * m_acc;
+        }
+        """,
+    header: lagunaLmHeadPruneHeader,
+    ensureRowContiguous: true
+)
+
+/// Same MXFP8 coarse logits and quantization-error sum as the pack16 inline
+/// kernel above, but the roundoff term uses the exact format-wide inequality
+/// `m <= 30*d`. For every non-top E4M3 code, decoded magnitude divided by its
+/// half-cell width is at most 30 (attained by magnitude 15); the saturated top
+/// code's ratio is smaller. Thus the retained `d*(1+gamma) + 2*gamma*m` is
+/// bounded by `d*(1+61*gamma)`.
+///
+/// As with the three-output twin, the inequality is per element and lifts to
+/// the row sums under any threadgroup packing; the pack16 mapping leaves one
+/// simdgroup per row and a 32-lane `simd_sum`, so `coarse` is bit-identical to
+/// the retained kernel's and `delta` only widens. Widening `delta` can only
+/// lower the threshold and admit MORE candidate rows, and an extra candidate
+/// row is written with the stock-exact GEMV value instead of its certified-
+/// below coarse value, so the inline-mask output contract is unchanged: every
+/// slot still has exactly one owning lane, candidate slots are still
+/// bit-identical to the stock full GEMV, and non-candidate slots still carry
+/// `bfloat(coarse)` from the same unchanged FP32 bits.
+private let lagunaLmHeadInlineCoarseRatioBoundKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_mxfp8_inline_coarse_ratio_bound_pack16_v1",
+    inputNames: ["x", "codes", "scales"],
+    outputNames: ["coarse", "delta"],
+    source: """
+        constexpr float GAMMA = 0x1p-15f;
+
+        uint row = threadgroup_position_in_grid.x * 16 +
+            simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        const device uint8_t* crow = codes + size_t(row) * 2048;
+        const device uint8_t* srow = scales + size_t(row) * 64;
+
+        float c_acc = 0.0f;
+        float d_acc = 0.0f;
+        for (uint gg = 0; gg < 2; ++gg) {
+            uint g = 2 * lane + gg;
+            float sd = laguna_e8m0_decode(srow[g]);
+            const device uint4* cptr = (const device uint4*)(crow + g * 32);
+            uint4 packed0 = cptr[0];
+            uint4 packed1 = cptr[1];
+            float cg = 0.0f;
+            float dg = 0.0f;
+            const device ushort4* xrow = (const device ushort4*)(x + g * 32);
+            #pragma clang loop unroll(full)
+            for (uint w = 0; w < 8; ++w) {
+                uint word = (w < 4u) ? packed0[w & 3u] : packed1[w & 3u];
+                float4 cv4 = laguna_e4m3_decode4(word);
+                float4 xv4 = as_type<float4>(uint4(xrow[w]) << 16);
+                float4 ax4 = metal::abs(xv4);
+                uint4 b4 = (uint4(word) >> uint4(0u, 8u, 16u, 24u)) & 255u;
+                uint4 mag4 = b4 & 127u;
+                uint4 e4 = mag4 >> 3;
+                float4 hsf =
+                    as_type<float4>((metal::max(e4, uint4(1u)) + 116u) << 23);
+                float4 hs4 =
+                    metal::select(hsf, float4(186.0f), mag4 == 126u);
+                #pragma clang loop unroll(full)
+                for (uint k = 0; k < 4; ++k) {
+                    cg += xv4[k] * cv4[k];
+                    dg += ax4[k] * hs4[k];
+                }
+            }
+            c_acc += sd * cg;
+            d_acc += sd * dg;
+        }
+        c_acc = simd_sum(c_acc);
+        d_acc = simd_sum(d_acc);
+        if (lane == 0) {
+            coarse[row] = c_acc;
+            delta[row] = d_acc * (1.0f + 61.0f * GAMMA);
         }
         """,
     header: lagunaLmHeadPruneHeader,
@@ -754,9 +926,14 @@ final class LagunaLmHeadPruner {
 
         let coarseOut: [MLXArray]
         if lagunaLmHeadInlineMaskEnabled {
-            let coarseKernel =
-                useCoarseV1
-                ? lagunaLmHeadInlineCoarseKernelV1 : lagunaLmHeadInlineCoarseKernel
+            let coarseKernel: MLXFast.MLXFastKernel =
+                if useCoarseV1 {
+                    lagunaLmHeadInlineCoarseKernelV1
+                } else if lagunaLmHeadRatioBoundEnabled {
+                    lagunaLmHeadInlineCoarseRatioBoundKernel
+                } else {
+                    lagunaLmHeadInlineCoarseKernel
+                }
             coarseOut = coarseKernel(
                 [x, codes, scales],
                 grid: (
@@ -772,8 +949,14 @@ final class LagunaLmHeadPruner {
             // Kill-switch fallback: the new tip's original three-output
             // coarse kernels still materialize `coarse_bf` for the retained
             // selector/exact path.
-            let coarseKernel =
-                useCoarseV1 ? lagunaLmHeadCoarseKernelV1 : lagunaLmHeadCoarseKernel
+            let coarseKernel: MLXFast.MLXFastKernel =
+                if useCoarseV1 {
+                    lagunaLmHeadCoarseKernelV1
+                } else if lagunaLmHeadRatioBoundEnabled {
+                    lagunaLmHeadCoarseRatioBoundKernel
+                } else {
+                    lagunaLmHeadCoarseKernel
+                }
             coarseOut = coarseKernel(
                 [x, codes, scales],
                 grid: (
