@@ -915,6 +915,37 @@ MTL::ComputePipelineState* get_fft_kernel(
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);
 }
 
+// DARKBLOOM_QMV_WIDE_INT8: widen the bits == 8 weight fetch in qdot from eight
+// align(1) byte loads to one uint2.
+//
+// The affine-INT8 attention projections (Q/K/V/gate bank and o_proj) are the
+// largest device read on the decode path, and at values_per_thread == 8 the
+// stock qdot issues one byte load per code. Metal cannot merge align(1) loads,
+// so each simdgroup-wide fetch touches the same two 128-byte lines and returns
+// only 32 useful bytes -- 4x the L1/LSU accesses for identical DRAM traffic.
+// The sibling NVFP4 arm in fp_quantized already carries the equivalent uint2
+// SWAR fetch; this brings the INT8 arm to parity. Bit-exact: same codes, same
+// operand order, same sequential accumulation (see the comment in qdot).
+//
+// DEFAULT ON; an explicit "0" prepends an override define and restores the
+// per-byte loop, giving a same-binary ablation control. Resolved once per
+// process, and the choice is baked into the single JIT source a process
+// compiles rather than entering the pipeline key -- matching the discipline
+// used by the attention arms above.
+//
+// Returns a `const char*` because concatenate() takes its arguments by value;
+// the empty string appends nothing.
+const char* darkbloom_qmv_wide_int8_define() {
+  static const bool disabled = [] {
+    const bool v = env::get_var("DARKBLOOM_QMV_WIDE_INT8", "") == "0";
+    if (env::get_var("DARKBLOOM_STAGE_TRACE", "") == "1") {
+      fprintf(stderr, "mlxfast: qmv wide int8: enabled=%d\n", int(!v));
+    }
+    return v;
+  }();
+  return disabled ? "\n#define DARKBLOOM_QMV_WIDE_INT8 0\n" : "";
+}
+
 MTL::ComputePipelineState* get_quantized_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -928,6 +959,7 @@ MTL::ComputePipelineState* get_quantized_kernel(
         metal::utils(),
         metal::gemm(),
         metal::quantized_utils(),
+        darkbloom_qmv_wide_int8_define(),
         (mode == "affine") ? metal::quantized() : metal::fp_quantized(),
         template_def);
     return kernel_source;

@@ -118,48 +118,6 @@ public protocol QuantizedKVCacheProtocol: KVCache {
     func getQuantizedState() -> ((MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?))?
 }
 
-/// Destination of a single-token decode KV write that a fused kernel
-/// performs itself, instead of handing MLX two `slice_update` dispatches.
-///
-/// `keys` / `values` are the cache's OWN backing arrays in
-/// `[B, kvHeads, capacity, headDim]` row-major layout, and `row` is the
-/// sequence slot the new token belongs in — exactly the slot the stock
-/// `cache[..., row ..< row + 1, 0...] = newRow` assignment would have
-/// written. A producer that consumes this target must write precisely those
-/// bytes and nothing else; the cache's own bookkeeping (`offset`, and the
-/// rotating cache's ring cursor) is advanced by
-/// ``KVCache/commitFusedDecodeWrite(_:)`` afterwards, on the host, so the
-/// trusted worker's per-step offset audit keeps reading a plain `Int`.
-public struct FusedKVWriteTarget {
-    public let keys: MLXArray
-    public let values: MLXArray
-    public let row: Int
-
-    public init(keys: MLXArray, values: MLXArray, row: Int) {
-        self.keys = keys
-        self.values = values
-        self.row = row
-    }
-}
-
-/// True when `array`'s strides are exactly the row-major strides for its
-/// shape, i.e. element `[i0, i1, ...]` sits at `sum(i_k * stride_k)` from the
-/// array's own data pointer with no gaps. That is the only layout property a
-/// fused in-place KV write needs: MLX binds a custom kernel's input buffer at
-/// the array's own data offset, so a view into a larger buffer is fine as
-/// long as its strides are dense.
-func isRowMajorDense(_ array: MLXArray) -> Bool {
-    let shape = array.shape
-    let strides = array.strides
-    guard shape.count == strides.count else { return false }
-    var expected = 1
-    for axis in stride(from: shape.count - 1, through: 0, by: -1) {
-        if shape[axis] != 1, strides[axis] != expected { return false }
-        expected *= shape[axis]
-    }
-    return true
-}
-
 /// Base cache implementation providing default behaviors
 open class BaseKVCache: KVCache {
     public var offset: Int = 0
@@ -169,25 +127,6 @@ open class BaseKVCache: KVCache {
 
     open func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         fatalError("update(keys:values:) must be implemented by subclass")
-    }
-
-    /// Reserve the destination of a one-token decode KV write so a fused
-    /// producer kernel can write it directly. Returns nil when this cache
-    /// cannot serve the write in place; the caller must then fall back to
-    /// ``update(keys:values:)``, which stays correct because this call only
-    /// ever grows the backing store (never advances `offset`).
-    ///
-    /// Default: unsupported.
-    open func fusedDecodeWriteTarget() -> FusedKVWriteTarget? { nil }
-
-    /// Advance the cache past a completed fused write and return the same
-    /// `(keys, values)` slices ``update(keys:values:)`` would have returned
-    /// for that token. Must be called exactly once per successful
-    /// ``fusedDecodeWriteTarget()``.
-    ///
-    /// Default: unsupported.
-    open func commitFusedDecodeWrite(_ target: FusedKVWriteTarget) -> (MLXArray, MLXArray)? {
-        nil
     }
 
     open var state: [MLXArray] {
@@ -460,64 +399,6 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         return (returnedKeys, returnedValues)
     }
 
-    /// `update`'s growth block, specialized to a one-token append on an
-    /// already-populated cache. Verbatim same allocation sizes, same
-    /// `concatenated` shape sequence and same next growth boundary, so a
-    /// later `update` on the grown store behaves exactly as if `update` had
-    /// grown it. Idempotent: a second call is a no-op once there is slack.
-    private func growForDecodeAppend() {
-        guard let currentKeys = self.keys, let currentValues = self.values else { return }
-        let previous = self.offset
-        guard previous + 1 > currentKeys.dim(2) else { return }
-
-        let B = currentKeys.dim(0)
-        let kvHeads = currentKeys.dim(1)
-        let kHeadDim = currentKeys.dim(3)
-        let vHeadDim = currentValues.dim(3)
-
-        let nSteps = (step + 1 - 1) / step
-        let newK = MLXArray.zeros([B, kvHeads, nSteps * step, kHeadDim], dtype: currentKeys.dtype)
-        let newV = MLXArray.zeros(
-            [B, kvHeads, nSteps * step, vHeadDim], dtype: currentValues.dtype)
-
-        var trimmedKeys = currentKeys
-        var trimmedValues = currentValues
-        if previous % step != 0 {
-            trimmedKeys = trimmedKeys[.ellipsis, ..<previous, 0...]
-            trimmedValues = trimmedValues[.ellipsis, ..<previous, 0...]
-        }
-        self.keys = concatenated([trimmedKeys, newK], axis: 2)
-        self.values = concatenated([trimmedValues, newV], axis: 2)
-    }
-
-    public override func fusedDecodeWriteTarget() -> FusedKVWriteTarget? {
-        // Exact type only. `ChunkedKVCache` inherits this class but overrides
-        // `update` with front-trimming semantics this fast path does not
-        // reproduce, and any future subclass is opted out until it opts in.
-        guard type(of: self) == KVCacheSimple.self else { return nil }
-        guard self.keys != nil, self.values != nil else { return nil }
-        growForDecodeAppend()
-        guard let currentKeys = self.keys, let currentValues = self.values else { return nil }
-        let row = self.offset
-        guard row >= 0, row + 1 <= currentKeys.dim(2), row + 1 <= currentValues.dim(2),
-            isRowMajorDense(currentKeys), isRowMajorDense(currentValues)
-        else { return nil }
-        return FusedKVWriteTarget(keys: currentKeys, values: currentValues, row: row)
-    }
-
-    public override func commitFusedDecodeWrite(_ target: FusedKVWriteTarget) -> (
-        MLXArray, MLXArray
-    )? {
-        guard let currentKeys = self.keys, let currentValues = self.values,
-            target.row == self.offset
-        else { return nil }
-        self.offset += 1
-        return (
-            currentKeys[.ellipsis, ..<self.offset, 0...],
-            currentValues[.ellipsis, ..<self.offset, 0...]
-        )
-    }
-
     public override var state: [MLXArray] {
         get {
             guard let keys = self.keys, let values = self.values else { return [] }
@@ -756,54 +637,6 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
                 updateConcat(keys: keys, values: values)
             }
         return result
-    }
-
-    /// The ring slot `updateInPlace` would assign a one-token append to,
-    /// or nil when this step still needs `updateInPlace`'s grow/trim work
-    /// (those reallocate the store, so they stay on the stock path).
-    private func fusedDecodeRow() -> Int? {
-        // Exact type only. `CompilableRotatingKVCache` inherits this class but
-        // keeps its ring cursor as graph state (`idxArray`), which these
-        // host-`Int` derivations would silently desynchronize.
-        guard type(of: self) == RotatingKVCache.self else { return nil }
-        guard let currentKeys = self.keys else { return nil }
-        let cacheLength = currentKeys.dim(2)
-        // "May not have hit the max size yet" -- grow branch.
-        if offset >= cacheLength && cacheLength < maxCacheSize { return nil }
-        // Trim branch.
-        if cacheLength - maxCacheSize > 0 { return nil }
-        // Rotate if we've hit the end.
-        let row = idx == maxCacheSize ? keep : idx
-        guard row >= 0, row + 1 <= cacheLength else { return nil }
-        return row
-    }
-
-    public override func fusedDecodeWriteTarget() -> FusedKVWriteTarget? {
-        guard let currentKeys = self.keys, let currentValues = self.values,
-            let row = fusedDecodeRow(),
-            row + 1 <= currentValues.dim(2),
-            isRowMajorDense(currentKeys), isRowMajorDense(currentValues)
-        else { return nil }
-        return FusedKVWriteTarget(keys: currentKeys, values: currentValues, row: row)
-    }
-
-    public override func commitFusedDecodeWrite(_ target: FusedKVWriteTarget) -> (
-        MLXArray, MLXArray
-    )? {
-        guard let currentKeys = self.keys, let currentValues = self.values,
-            let row = fusedDecodeRow(), row == target.row
-        else { return nil }
-        // Mirrors `updateInPlace`'s tail exactly: the rotation the row
-        // derivation already applied, then both counters.
-        idx = row + 1
-        offset += 1
-        if offset < maxCacheSize {
-            return (
-                currentKeys[.ellipsis, ..<offset, 0...],
-                currentValues[.ellipsis, ..<offset, 0...]
-            )
-        }
-        return (currentKeys, currentValues)
     }
 
     public override var state: [MLXArray] {

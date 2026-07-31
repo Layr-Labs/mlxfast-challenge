@@ -294,8 +294,46 @@ inline U qdot(
   }
 
   else if (bits == 8) {
-    for (int i = 0; i < values_per_thread; i++) {
-      accum += x_thread[i] * w[i];
+#ifndef DARKBLOOM_QMV_WIDE_INT8
+#define DARKBLOOM_QMV_WIDE_INT8 1
+#endif
+    if constexpr (DARKBLOOM_QMV_WIDE_INT8 && values_per_thread == 8) {
+      // Widened weight load for the qmv_fast family (values_per_thread == 8,
+      // e.g. the group-32 affine INT8 attention projections). `w` is a
+      // const device uint8_t*, so the generic loop below emits eight
+      // align(1) byte loads that Metal cannot merge: each simdgroup-wide
+      // byte load touches the same two 128-byte lines and returns only 32
+      // useful bytes, costing 4x the L1/LSU accesses for identical DRAM
+      // traffic. One uint2 covers all eight codes.
+      //
+      // Bit-exact vs the generic path: as_type<uchar4> reinterprets the
+      // little-endian byte order, so lo/hi lanes 0..7 are exactly w[0..7];
+      // each product keeps its `x_thread[i] * <code>` operand order and the
+      // eight `accum +=` statements keep their sequential order, so the
+      // float accumulation tree and the `scale * accum + sum * bias` tail
+      // are unchanged.
+      //
+      // The uint2 load is 8-byte aligned at every values_per_thread == 8
+      // call site: lane offsets into the row are simd_lid * 8 bytes and the
+      // qmv_fast contract requires in_vec_size % 512 == 0, so both the row
+      // stride and the k-loop advance are multiples of 8 bytes.
+      const device uint2* wq = (const device uint2*)w;
+      const uint2 packed = wq[0];
+      const uchar4 lo = as_type<uchar4>(packed.x);
+      const uchar4 hi = as_type<uchar4>(packed.y);
+
+      accum += x_thread[0] * lo.x;
+      accum += x_thread[1] * lo.y;
+      accum += x_thread[2] * lo.z;
+      accum += x_thread[3] * lo.w;
+      accum += x_thread[4] * hi.x;
+      accum += x_thread[5] * hi.y;
+      accum += x_thread[6] * hi.z;
+      accum += x_thread[7] * hi.w;
+    } else {
+      for (int i = 0; i < values_per_thread; i++) {
+        accum += x_thread[i] * w[i];
+      }
     }
   }
 
