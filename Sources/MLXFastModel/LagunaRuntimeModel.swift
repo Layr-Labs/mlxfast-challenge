@@ -243,10 +243,16 @@ let lagunaPrefillFusedResidualRMSNormEnabled =
 
 /// Issues the routed and shared gate/up NVFP4 QMVs as one nine-slot dispatch
 /// (see `lagunaRoutedSharedSwiGLUQMVKernel`). Set
-/// `DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV=0` to ablate.
+/// `DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV=1` to opt into the merge.
+///
+/// The separate routed and shared dispatches are the default so the shared
+/// gate/up work, which depends only on the hidden state, can be scheduled
+/// without waiting for the routed top-8 indices consumed by the merged path.
+/// Both paths preserve their existing arithmetic and expert mappings; this
+/// selector changes scheduling only.
 let lagunaFusedRoutedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment[
-        "DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV"] != "0"
+        "DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV"] == "1"
 
 /// Scheduling A/B for the merged routed/shared gate/up kernel. The proven R2
 /// schedule is the default; only an explicit selector value of `4` opts into
@@ -5974,11 +5980,10 @@ private let lagunaPrefillRouterTop8Enabled =
 private let lagunaPrefillMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_MOE_TAIL"] != "0"
 
-/// Default-off probe: keep the routed down projection in expert-sorted order
-/// and let the fused MoE tail gather each original `(token, slot)` row through
-/// `gatherSort`'s already-computed inverse permutation. This removes
-/// `scatterUnsort`'s full expert-bank copy without changing the eight-slot
-/// weighted reduction order.
+/// Keep the routed down projection in expert-sorted order and let the fused
+/// MoE tail gather each original `(token, slot)` row through `gatherSort`'s
+/// already-computed inverse permutation. This removes `scatterUnsort`'s full
+/// expert-bank copy without changing the eight-slot weighted reduction order.
 private let lagunaPrefillSortedMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_SORTED_MOE_TAIL"] != "0"
 
@@ -6524,9 +6529,11 @@ private let lagunaPrefillMoETailKernel = MLXFast.metalKernel(
 /// `scatterUnsort(...)[p]` would copy to original flattened slot `p`.
 /// Reading that row directly preserves the stock slot-0-through-slot-7 BF16
 /// multiply/add sequence while deleting the intervening 16 MiB copy at the
-/// ranked 512-token window.
+/// ranked 512-token window. Four adjacent columns travel as one `bfloat4`;
+/// Metal arithmetic is componentwise, and each component retains its own
+/// ordered expert-0-through-expert-7 BF16 product/add chain.
 private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_sorted_moe_tail_bf16_v1",
+    name: "laguna_prefill_sorted_moe_tail_bf16_v2",
     inputNames: [
         "sorted_expert_outputs", "inverse_order", "router_weights",
         "shared_output", "residual",
@@ -6541,26 +6548,29 @@ private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
         uint col = thread_position_in_grid.x * n_cols;
         const device float* weight_row = router_weights + row * experts;
 
-        bfloat expert_weights[experts];
-        uint sorted_rows[experts];
+        bfloat4 total = bfloat4(bfloat(0));
         for (uint e = 0; e < experts; ++e) {
-            expert_weights[e] = bfloat(weight_row[e]);
-            sorted_rows[e] = inverse_order[row * experts + e];
+            bfloat expert_weight = bfloat(weight_row[e]);
+            uint sorted_row = inverse_order[row * experts + e];
+            bfloat4 expert_values =
+                *reinterpret_cast<const device bfloat4*>(
+                    sorted_expert_outputs + sorted_row * hidden + col);
+            bfloat4 product = bfloat4(
+                expert_values * bfloat4(expert_weight));
+            total = bfloat4(product + total);
         }
-
-        for (uint i = 0; i < n_cols; ++i) {
-            bfloat total = bfloat(0);
-            for (uint e = 0; e < experts; ++e) {
-                bfloat product = bfloat(
-                    sorted_expert_outputs[sorted_rows[e] * hidden + col + i] *
-                    expert_weights[e]);
-                total = bfloat(product + total);
-            }
-            bfloat scaled = bfloat(total * bfloat(2.5f));
-            bfloat r2 = bfloat(scaled + shared_output[row * hidden + col + i]);
-            output[row * hidden + col + i] =
-                bfloat(residual[row * hidden + col + i] + r2);
-        }
+        bfloat4 scaled = bfloat4(
+            total * bfloat4(bfloat(2.5f)));
+        bfloat4 shared_values =
+            *reinterpret_cast<const device bfloat4*>(
+                shared_output + row * hidden + col);
+        bfloat4 r2 = bfloat4(scaled + shared_values);
+        bfloat4 residual_values =
+            *reinterpret_cast<const device bfloat4*>(
+                residual + row * hidden + col);
+        *reinterpret_cast<device bfloat4*>(
+            output + row * hidden + col) =
+            bfloat4(residual_values + r2);
         """,
     ensureRowContiguous: true
 )
