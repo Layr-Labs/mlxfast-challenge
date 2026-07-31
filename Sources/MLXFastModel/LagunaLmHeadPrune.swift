@@ -47,6 +47,12 @@ import MLXFast
 // `DARKBLOOM_LMHEAD_INLINE_MASK=0` restores the new tip's three-output coarse
 // kernels, fused two-pass lower-bound reduction, dense uint8 selector mask,
 // and coarse_bf-fed exact kernel inside the same binary.
+//
+// `DARKBLOOM_LMHEAD_FOLDED_THRESHOLD=0` restores the standalone threshold
+// dispatch (`laguna_lmhead_lower_max_threshold_v1`) plus the v1 inline exact
+// kernel that reads its [1] output; the shipped default folds that reduction
+// into every threadgroup of the v3 exact kernel, eliminating one dispatch per
+// decode token with bit-identical output.
 
 private let lagunaLmHeadPruneVocab = 100_352
 private let lagunaLmHeadPruneHidden = 2048
@@ -76,6 +82,18 @@ let lagunaLmHeadPrunePrefillEnabled =
 /// dispatch and stored `coarse_bf` output.
 private let lagunaLmHeadInlineMaskEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_INLINE_MASK"] != "0"
+
+/// Folded threshold for the certified exact pass. DEFAULT ON; set
+/// `DARKBLOOM_LMHEAD_FOLDED_THRESHOLD=0` to restore the standalone
+/// `laguna_lmhead_lower_max_threshold_v1` dispatch plus the v1 inline exact
+/// kernel that reads its [1] output. When on, the v3 exact kernel recomputes
+/// the threshold redundantly inside every threadgroup (see its doc comment),
+/// eliminating one kernel dispatch per decode token with bit-identical
+/// logits. Only applies to the inline-mask path; the
+/// `DARKBLOOM_LMHEAD_INLINE_MASK=0` fallback still dispatches the standalone
+/// threshold kernel.
+private let lagunaLmHeadFoldedThresholdEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_FOLDED_THRESHOLD"] != "0"
 
 /// Kernel header: bit-exact MXFP8 element decoders + the certified
 /// half-cell-width table, all inlinable and libm-free.
@@ -713,6 +731,139 @@ private let lagunaLmHeadInlineExactKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Folded-threshold exact pass. Byte-identical to
+/// `lagunaLmHeadInlineExactKernel` except that the standalone
+/// `laguna_lmhead_lower_max_threshold_v1` dispatch is eliminated: instead of
+/// reading its [1] `thr` output, EVERY threadgroup recomputes the threshold
+/// from the 128 stage-1 `partial_max` values. The prologue below replicates
+/// the threshold kernel's loading pattern (four consecutive partials per lane
+/// over the 32 lanes of each simdgroup, covering 0..127 exactly), its
+/// reduction sequence (the per-lane `laguna_lmhead_max_pair` ladder then
+/// `laguna_lmhead_simd_max`), and its rounding discipline (threadgroup
+/// temporary store of `metal::abs(total) * 0x1p-6f` plus barrier before the
+/// final subtraction, preserving the separate float32 rounding of the
+/// multiply and preventing mul/sub contraction) expression-for-expression.
+/// Each simdgroup owns one slot of the threadgroup temporary, so there is no
+/// cross-simdgroup write race; the barrier sits before any early return and
+/// is reached by every thread. Every threadgroup therefore computes the
+/// identical float from the identical inputs with the identical instruction
+/// sequence -- deterministic, race-free, and bit-identical to the value the
+/// standalone kernel would have written. The added work is a fixed 512-byte
+/// load plus a 32-lane reduction per threadgroup, independent of the decode
+/// token index and of the candidate count; in exchange one dispatch (and its
+/// [1]-element buffer round-trip) vanishes from the per-token chain. The
+/// stage-1 kernel still runs: its reduction rows span 49 coarse threadgroups
+/// and cannot fold into the coarse kernel. Set
+/// `DARKBLOOM_LMHEAD_FOLDED_THRESHOLD=0` to restore the standalone threshold
+/// dispatch and the v1 inline kernel.
+private let lagunaLmHeadFoldedExactKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_inline_mask_block_v3",
+    inputNames: ["coarse", "delta", "partial_max", "lm_head", "x"],
+    outputNames: ["assembled"],
+    source: """
+        constexpr uint VOCAB = 100352;
+        constexpr uint K = 2048;
+
+        uint tgid = threadgroup_position_in_grid.x;
+        uint sgid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        // --- folded threshold: replica of
+        // laguna_lmhead_lower_max_threshold_v1 begin ---
+        // One temporary slot per simdgroup (256 threads / 32 = 8): no
+        // cross-simdgroup write race, and the barrier below is in
+        // non-divergent code reached by every thread of the threadgroup.
+        constexpr uint READS = 4;
+        threadgroup float rounded_beta[8];
+
+        float total = -metal::numeric_limits<float>::infinity();
+        uint thr_base = lane * READS;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < READS; ++i) {
+            total = laguna_lmhead_max_pair(partial_max[thr_base + i], total);
+        }
+        total = laguna_lmhead_simd_max(total);
+
+        if (lane == 0) {
+            rounded_beta[sgid] = metal::abs(total) * 0x1p-6f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float thr = total - rounded_beta[sgid];
+        // --- folded threshold: replica end ---
+
+        // This simdgroup's fixed four output rows. VOCAB is 3136 * 32, so the
+        // grid tiles it exactly; the bounds test is belt-and-braces.
+        uint base = tgid * 32 + sgid * 4;
+
+        // Simdgroup-uniform. This is textually the selector's predicate; the
+        // fixed row mapping still gives one owner per output slot.
+        bool any_candidate = false;
+        #pragma unroll
+        for (uint tm = 0; tm < 4; ++tm) {
+            uint r = base + tm;
+            any_candidate = any_candidate ||
+                (r < VOCAB && coarse[r] + delta[r] >= thr);
+        }
+
+        if (!any_candidate) {
+            if (lane < 4 && base + lane < VOCAB) {
+                assembled[base + lane] = bfloat(coarse[base + lane]);
+            }
+            return;
+        }
+
+        // --- stock gemv_al replica begin (gemv.h:151-289) ---
+        thread float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread bfloat inter[4];
+        thread float v_coeff[4];
+        uint bn = lane * 4;
+        for (uint i = 0; i < 16; ++i) {
+            vec<bfloat, 4> xv =
+                *((const device vec<bfloat, 4>*)(x + bn));
+            v_coeff[0] = float(xv.x);
+            v_coeff[1] = float(xv.y);
+            v_coeff[2] = float(xv.z);
+            v_coeff[3] = float(xv.w);
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                const device bfloat* mrow = lm_head + size_t(base + tm) * K;
+                vec<bfloat, 4> mv =
+                    *((const device vec<bfloat, 4>*)(mrow + bn));
+                inter[0] = mv.x;
+                inter[1] = mv.y;
+                inter[2] = mv.z;
+                inter[3] = mv.w;
+                result[tm] += inter[0] * v_coeff[0];
+                result[tm] += inter[1] * v_coeff[1];
+                result[tm] += inter[2] * v_coeff[2];
+                result[tm] += inter[3] * v_coeff[3];
+            }
+            bn += 128;
+        }
+        #pragma unroll
+        for (uint tm = 0; tm < 4; ++tm) {
+            #pragma unroll
+            for (ushort sn = 16; sn >= 1; sn >>= 1) {
+                result[tm] += simd_shuffle_down(result[tm], sn);
+            }
+        }
+        // --- stock gemv_al replica end ---
+        if (lane == 0) {
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                uint r = base + tm;
+                if (r < VOCAB) {
+                    assembled[r] = (coarse[r] + delta[r] >= thr)
+                        ? bfloat(result[tm])
+                        : bfloat(coarse[r]);
+                }
+            }
+        }
+        """,
+    header: lagunaLmHeadLowerMaxHeader,
+    ensureRowContiguous: true
+)
+
 /// Retained init-time MXFP8 coarse copy of lm_head plus the pruned final-row
 /// forward. Built once (untimed init) by
 /// `LagunaRuntimeModel.prepareFusedRuntimeWeights` when
@@ -792,6 +943,10 @@ final class LagunaLmHeadPruner {
         // Threshold on GPU: L = max(coarse - delta); thr = L - |L|/64.
         // The custom pair fuses the six-dispatch MLX expression into two
         // dispatches while reproducing MLX's exact two-pass reduction layout.
+        // With the folded threshold (DEFAULT ON; set
+        // DARKBLOOM_LMHEAD_FOLDED_THRESHOLD=0 to ablate) the second of those
+        // dispatches is eliminated: the v3 exact kernel recomputes `thr`
+        // redundantly inside every threadgroup from the stage-1 partials.
         let lowerMaxPartials = lagunaLmHeadLowerMaxStage1Kernel(
             [coarse, delta],
             grid: (224, 128, 1),
@@ -799,18 +954,28 @@ final class LagunaLmHeadPruner {
             outputShapes: [[128]],
             outputDTypes: [.float32]
         )[0]
-        let thr = lagunaLmHeadLowerMaxThresholdKernel(
-            [lowerMaxPartials],
-            grid: (32, 1, 1),
-            threadGroup: (32, 1, 1),
-            outputShapes: [[1]],
-            outputDTypes: [.float32]
-        )[0]
+        let foldedThreshold =
+            lagunaLmHeadFoldedThresholdEnabled && lagunaLmHeadInlineMaskEnabled
 
         // One threadgroup per 32 output rows, covering the vocabulary exactly
         // once (100352 == 3136 * 32). Every slot has exactly one owning lane.
         let assembled: MLXArray
-        if lagunaLmHeadInlineMaskEnabled {
+        if foldedThreshold {
+            assembled = lagunaLmHeadFoldedExactKernel(
+                [coarse, delta, lowerMaxPartials, lmHeadWeight, x],
+                grid: (vocab / 32 * 256, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[vocab]],
+                outputDTypes: [.bfloat16]
+            )[0]
+        } else if lagunaLmHeadInlineMaskEnabled {
+            let thr = lagunaLmHeadLowerMaxThresholdKernel(
+                [lowerMaxPartials],
+                grid: (32, 1, 1),
+                threadGroup: (32, 1, 1),
+                outputShapes: [[1]],
+                outputDTypes: [.float32]
+            )[0]
             assembled = lagunaLmHeadInlineExactKernel(
                 [coarse, delta, thr, lmHeadWeight, x],
                 grid: (vocab / 32 * 256, 1, 1),
@@ -821,6 +986,13 @@ final class LagunaLmHeadPruner {
         } else {
             // Kill-switch fallback: byte-for-byte the new tip's selector call
             // and exact-kernel inputs, including the stored BF16 coarse output.
+            let thr = lagunaLmHeadLowerMaxThresholdKernel(
+                [lowerMaxPartials],
+                grid: (32, 1, 1),
+                threadGroup: (32, 1, 1),
+                outputShapes: [[1]],
+                outputDTypes: [.float32]
+            )[0]
             let coarseBF = coarseOut[2]
             let isCandidate = lagunaLmHeadSelectKernel(
                 [coarse, delta, thr],
