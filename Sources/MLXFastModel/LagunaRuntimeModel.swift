@@ -2739,6 +2739,575 @@ func lagunaGateProductSoftplus(
     )[0]
 }
 
+// MARK: - Gated native-NVFP4 output projection (one dispatch)
+
+/// Folds the per-head softplus gate product into the native group-16 NVFP4
+/// output-projection QMV. The body below is a textual replica of MLX's
+/// runtime-effective `fp_qmv_fast_impl<bfloat16_t, 16, 4>` geometry and
+/// arithmetic: 64 threads as two SIMD groups, four rows per SIMD group,
+/// sixteen values per lane, 512-wide K blocks, the shipped split-nibble FP4
+/// decode, the shipped E4M3 scale chain, one FP32 accumulator per output row,
+/// `simd_sum`, then one BF16 store.
+///
+/// The only added work is the exact `lagunaGateProductSoftplusSource` prologue
+/// and the input-side BF16 product at the same rounding boundary the standalone
+/// gate-product kernel writes. The qdot expression tree intentionally does not
+/// use the separate custom-MoE kernel's 2^22 scale hoist.
+private func lagunaGatedNVFP4OProjSource(heads: Int) -> String {
+    """
+    constexpr int in_vec_size = \(heads * LagunaConstants.headDim);
+    constexpr int out_vec_size = \(LagunaConstants.hiddenSize);
+    constexpr int gate_heads = \(heads);
+    constexpr int head_shift = 7;                 // head_dim == 128
+    constexpr int packs_per_thread = 2;
+    constexpr int num_simdgroups = 2;
+    constexpr int results_per_simdgroup = 4;
+    constexpr int pack_factor = 8;                // uint32 / 4-bit
+    constexpr int bytes_per_pack = 4;
+    constexpr int values_per_thread = pack_factor * packs_per_thread;
+    constexpr int block_size = values_per_thread * 32;
+    constexpr int group_size = 16;
+    constexpr int scale_step_per_thread = group_size / values_per_thread;
+    constexpr int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+    constexpr int in_vec_size_g = in_vec_size / group_size;
+
+    uint3 tid = threadgroup_position_in_grid;
+    uint lid = thread_index_in_threadgroup;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    threadgroup float gate_table[gate_heads];
+    if (lid < gate_heads) {
+        float logit = float(gate_logits[lid]);
+        float gate;
+        if (metal::isnan(logit)) {
+            gate = NAN;
+        } else {
+            float maxval = metal::max(logit, 0.0f);
+            float minval = metal::min(logit, 0.0f);
+            gate = (metal::isinf(minval) || metal::isinf(maxval))
+                ? maxval
+                : maxval + log1p(metal::exp(minval - maxval));
+        }
+        gate_table[lid] = float(bfloat(gate));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+        simd_gid * results_per_simdgroup;
+    const device uint8_t* ws = (const device uint8_t*)weight_codes;
+    const device uint8_t* sl = weight_scales;
+    ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+    sl += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+
+    thread float x_thread[values_per_thread];
+    thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int k = 0; k < in_vec_size; k += block_size) {
+        const uint column = uint(k) + simd_lid * values_per_thread;
+        const uint head = column >> head_shift;
+        for (int i = 0; i < values_per_thread; ++i) {
+            x_thread[i] = float(bfloat(
+                float(attention_output[column + uint(i)]) * gate_table[head]));
+        }
+
+        for (int row = 0; row < results_per_simdgroup; ++row) {
+            const device uint8_t* wl = ws + row * in_vec_size_w;
+            uint8_t scale_bits = sl[row * in_vec_size_g];
+            uint16_t v = (scale_bits & 127) << 7;
+            half converted = as_type<half>(v);
+            converted *= 256.0;
+            auto sign = scale_bits & 128;
+            float scale = float(sign ? -converted : converted);
+
+            const device uint2* wq = (const device uint2*)wl;
+            const uint2 codes = wq[0];
+            float accum = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 2; j++) {
+                const uint32_t c = (j == 0) ? codes.x : codes.y;
+                const uint32_t xe = c & 0x0F0F0F0Fu;
+                const uint32_t ge = xe | (xe << 3);
+                const uint32_t yo = c & 0xF0F0F0F0u;
+                const uint32_t go = yo | (yo >> 3);
+                const uint32_t p0 = (ge << 9) & 0x8E008E00u;
+                const uint32_t p1 = (go << 8) & 0x8E008E00u;
+                const uint32_t p2 = (ge << 1) & 0x8E008E00u;
+                const uint32_t p3 = go & 0x8E008E00u;
+                const float2 v04 = float2(as_type<half2>(p0)) * 16384.0f;
+                const float2 v15 = float2(as_type<half2>(p1)) * 16384.0f;
+                const float2 v26 = float2(as_type<half2>(p2)) * 16384.0f;
+                const float2 v37 = float2(as_type<half2>(p3)) * 16384.0f;
+                accum +=
+                    (x_thread[8 * j] * v04.x +
+                     x_thread[8 * j + 1] * v15.x +
+                     x_thread[8 * j + 2] * v26.x +
+                     x_thread[8 * j + 3] * v37.x);
+                accum +=
+                    (x_thread[8 * j + 4] * v04.y +
+                     x_thread[8 * j + 5] * v15.y +
+                     x_thread[8 * j + 6] * v26.y +
+                     x_thread[8 * j + 7] * v37.y);
+            }
+            result[row] += scale * accum;
+        }
+
+        ws += block_size * bytes_per_pack / pack_factor;
+        sl += block_size / group_size;
+    }
+
+    for (int row = 0; row < results_per_simdgroup; ++row) {
+        result[row] = simd_sum(result[row]);
+        if (simd_lid == 0) {
+            projected[out_row + row] = bfloat(result[row]);
+        }
+    }
+    """
+}
+
+/// Both head-count variants are constructed eagerly so environment-controlled
+/// ablations select already-defined, uniquely named kernels in one binary.
+private let lagunaGatedNVFP4OProjKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_gated_nvfp4_oproj_qmv_bf16_h\(heads)_v1",
+            inputNames: [
+                "attention_output", "gate_logits", "weight_codes", "weight_scales",
+            ],
+            outputNames: ["projected"],
+            source: lagunaGatedNVFP4OProjSource(heads: heads),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+/// `DARKBLOOM_FUSED_GATED_NVFP4_OPROJ` (default ON; set "0" to disable).
+/// Any disabled or ineligible call keeps the existing gate-product followed by
+/// `quantizedMM` fallback.
+let lagunaFusedGatedNVFP4OProjEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATED_NVFP4_OPROJ"] != "0"
+
+/// Raw softplus gate product + native group-16 NVFP4 output projection in one
+/// dispatch. Every design guard lives here; callers need not assume eligibility.
+private func lagunaGatedNVFP4OProj(
+    attentionOutput: MLXArray,
+    gateLogits: MLXArray,
+    weight: LagunaNativeAffineWeight,
+    outputProjection: Linear,
+    layer: Int,
+    batchSize: Int,
+    sequenceLength: Int,
+    gatePerHead: Bool,
+    gateIsActivated: Bool,
+    heads: Int,
+    headDim: Int
+) -> MLXArray? {
+    guard lagunaFusedGatedNVFP4OProjEnabled,
+        lagunaNativeAffineOProjEnabled,
+        lagunaUseNativeAffineOProj(layer: layer),
+        !gateIsActivated,
+        weight.mode == .nvfp4,
+        weight.bits == 4,
+        weight.groupSize == 16,
+        weight.biases == nil,
+        batchSize == 1,
+        sequenceLength == 1,
+        gatePerHead,
+        outputProjection.bias == nil,
+        let kernel = lagunaGatedNVFP4OProjKernels[heads],
+        headDim == LagunaConstants.headDim
+    else {
+        return nil
+    }
+
+    let inVec = heads * headDim
+    let outVec = LagunaConstants.hiddenSize
+    guard attentionOutput.dtype == .bfloat16,
+        attentionOutput.shape == [1, 1, inVec],
+        gateLogits.dtype == .bfloat16,
+        gateLogits.shape == [1, 1, heads],
+        weight.packedCodes.dtype == .uint32,
+        weight.packedCodes.shape == [outVec, inVec / 8],
+        weight.scales.dtype == .uint8,
+        weight.scales.shape == [outVec, inVec / 16],
+        weight.originalShape == [outVec, inVec]
+    else {
+        return nil
+    }
+
+    lagunaTrace("gated nvfp4 oproj qmv h\(heads)")
+    return kernel(
+        [attentionOutput, gateLogits, weight.packedCodes, weight.scales],
+        grid: (32, (outVec / 8) * 2, 1),
+        threadGroup: (32, 2, 1),
+        outputShapes: [[1, 1, outVec]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+// MARK: - Norm-folded native-NVFP4 QKV + affine gate projection (one dispatch)
+
+/// Folds the layer input RMSNorm into the native group-16 NVFP4 `[Q; K; V]`
+/// QMV and the separate group-32 affine INT8 per-head gate QMV. The QKV half
+/// is a textual replica of `fp_qmv_fast_impl<bfloat16_t, 16, 4>`; the final
+/// threadgroups take a threadgroup-uniform affine-QMV branch over the gate
+/// side bank. Both branches form the exact BF16 value the standalone RMSNorm
+/// would have materialized before either contraction reads it.
+private func lagunaNormNVFP4QKVSource(heads: Int) -> String {
+    """
+    constexpr uint axis_size = \(LagunaConstants.hiddenSize);
+    constexpr uint query_rows = \(heads * LagunaConstants.headDim);
+    constexpr uint kv_rows =
+        \(LagunaConstants.numKeyValueHeads * LagunaConstants.headDim);
+    constexpr uint qkv_rows = query_rows + 2 * kv_rows;
+    constexpr uint gate_rows = \(heads);
+    constexpr uint total_rows = qkv_rows + gate_rows;
+    constexpr uint qkv_tiles = qkv_rows / 8;
+    constexpr uint n_reads = 4;                 // RMS_N_READS
+    constexpr uint norm_threads = axis_size / n_reads;   // 512 virtual threads
+    constexpr uint real_threads = 64;
+    constexpr uint virtual_per_thread = norm_threads / real_threads;  // 8
+    constexpr uint simd_size = 32;
+    constexpr float norm_eps = 1.0e-6f;
+    constexpr uint results_per_simdgroup = 4;
+    constexpr uint num_simdgroups = 2;
+
+    uint tile = threadgroup_position_in_grid.x;
+    uint lid = thread_position_in_threadgroup.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    threadgroup float local_inv_mean[1];
+    threadgroup float local_sums[simd_size];
+
+    // --- rms_single_row replica, 512 virtual threads over 64 real ones ---
+    if (lid < simd_size) {
+        local_sums[lid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j = 0; j < virtual_per_thread; ++j) {
+        uint base = (lid + j * real_threads) * n_reads;
+        float acc = 0.0f;
+        for (uint i = 0; i < n_reads; ++i) {
+            float xi = float(residual[base + i]);
+            acc += xi * xi;
+        }
+        acc = simd_sum(acc);
+        if (simd_lid == 0) {
+            local_sums[simd_gid + num_simdgroups * j] = acc;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_gid == 0) {
+        float total = simd_sum(local_sums[simd_lid]);
+        if (simd_lid == 0) {
+            local_inv_mean[0] =
+                metal::precise::rsqrt(total / float(axis_size) + norm_eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float laguna_inv_mean = local_inv_mean[0];
+
+    if (tile < qkv_tiles) {
+        {
+            // --- fp_qmv_fast_impl<bfloat16_t, 16, 4> QKV replica ---
+            constexpr int in_vec_size = int(axis_size);
+            constexpr int packs_per_thread = 2;
+            constexpr int pack_factor = 8;      // uint32 / 4-bit
+            constexpr int bytes_per_pack = 4;
+            constexpr int values_per_thread =
+                pack_factor * packs_per_thread;
+            constexpr int block_size = values_per_thread * 32;
+            constexpr int group_size = 16;
+            constexpr int scale_step_per_thread =
+                group_size / values_per_thread;
+            constexpr int in_vec_size_w =
+                in_vec_size * bytes_per_pack / pack_factor;
+            constexpr int in_vec_size_g = in_vec_size / group_size;
+
+            const int out_row = int(tile) *
+                    (int(num_simdgroups) * int(results_per_simdgroup)) +
+                int(simd_gid) * int(results_per_simdgroup);
+            const device uint8_t* ws = (const device uint8_t*)qkv_codes;
+            const device uint8_t* sl = qkv_scales;
+            ws += out_row * in_vec_size_w +
+                int(simd_lid) * packs_per_thread * bytes_per_pack;
+            sl += out_row * in_vec_size_g +
+                int(simd_lid) / scale_step_per_thread;
+
+            thread float x_thread[values_per_thread];
+            thread float result[results_per_simdgroup] = {
+                0.0f, 0.0f, 0.0f, 0.0f
+            };
+
+            for (int k = 0; k < in_vec_size; k += block_size) {
+                const uint column = uint(k) + simd_lid * values_per_thread;
+                for (int i = 0; i < values_per_thread; ++i) {
+                    x_thread[i] = float(bfloat(
+                        norm_weight[column + uint(i)] *
+                        bfloat(float(residual[column + uint(i)]) *
+                            laguna_inv_mean)));
+                }
+
+                for (int row = 0; row < int(results_per_simdgroup); ++row) {
+                    const device uint8_t* wl = ws + row * in_vec_size_w;
+                    uint8_t scale_bits = sl[row * in_vec_size_g];
+                    uint16_t v = (scale_bits & 127) << 7;
+                    half converted = as_type<half>(v);
+                    converted *= 256.0;
+                    auto sign = scale_bits & 128;
+                    float scale = float(sign ? -converted : converted);
+
+                    const device uint2* wq = (const device uint2*)wl;
+                    const uint2 codes = wq[0];
+                    float accum = 0.0f;
+                    #pragma unroll
+                    for (int j = 0; j < 2; j++) {
+                        const uint32_t c = (j == 0) ? codes.x : codes.y;
+                        const uint32_t xe = c & 0x0F0F0F0Fu;
+                        const uint32_t ge = xe | (xe << 3);
+                        const uint32_t yo = c & 0xF0F0F0F0u;
+                        const uint32_t go = yo | (yo >> 3);
+                        const uint32_t p0 = (ge << 9) & 0x8E008E00u;
+                        const uint32_t p1 = (go << 8) & 0x8E008E00u;
+                        const uint32_t p2 = (ge << 1) & 0x8E008E00u;
+                        const uint32_t p3 = go & 0x8E008E00u;
+                        const float2 v04 =
+                            float2(as_type<half2>(p0)) * 16384.0f;
+                        const float2 v15 =
+                            float2(as_type<half2>(p1)) * 16384.0f;
+                        const float2 v26 =
+                            float2(as_type<half2>(p2)) * 16384.0f;
+                        const float2 v37 =
+                            float2(as_type<half2>(p3)) * 16384.0f;
+                        accum +=
+                            (x_thread[8 * j] * v04.x +
+                             x_thread[8 * j + 1] * v15.x +
+                             x_thread[8 * j + 2] * v26.x +
+                             x_thread[8 * j + 3] * v37.x);
+                        accum +=
+                            (x_thread[8 * j + 4] * v04.y +
+                             x_thread[8 * j + 5] * v15.y +
+                             x_thread[8 * j + 6] * v26.y +
+                             x_thread[8 * j + 7] * v37.y);
+                    }
+                    result[row] += scale * accum;
+                }
+
+                ws += block_size * bytes_per_pack / pack_factor;
+                sl += block_size / group_size;
+            }
+
+            for (int row = 0; row < int(results_per_simdgroup); ++row) {
+                result[row] = simd_sum(result[row]);
+                if (simd_lid == 0) {
+                    projected[out_row + row] = bfloat(result[row]);
+                }
+            }
+        }
+    } else {
+        {
+            // --- affine_qmv_fast<bfloat16_t, 32, 8> gate replica ---
+            constexpr uint values_per_thread = 8;
+            constexpr uint block_size = 256;
+            constexpr uint group_size = 32;
+            constexpr uint scale_step_per_thread =
+                group_size / values_per_thread;
+            constexpr uint in_vec_size_g = axis_size / group_size;
+
+            uint gate_row = (tile - qkv_tiles) *
+                    (num_simdgroups * results_per_simdgroup) +
+                simd_gid * results_per_simdgroup;
+            const device uint8_t* ws = (const device uint8_t*)gate_codes +
+                gate_row * axis_size + simd_lid * values_per_thread;
+            const device bfloat* sc = gate_scales +
+                gate_row * in_vec_size_g +
+                simd_lid / scale_step_per_thread;
+            const device bfloat* bs = gate_biases +
+                gate_row * in_vec_size_g +
+                simd_lid / scale_step_per_thread;
+
+            thread float x_thread[values_per_thread];
+            thread float result[results_per_simdgroup] = {
+                0.0f, 0.0f, 0.0f, 0.0f
+            };
+
+            uint column = simd_lid * values_per_thread;
+            for (uint k = 0; k < axis_size; k += block_size) {
+                float sum = 0.0f;
+                for (uint i = 0; i < values_per_thread; ++i) {
+                    float value = float(bfloat(
+                        norm_weight[column + i] *
+                        bfloat(float(residual[column + i]) *
+                            laguna_inv_mean)));
+                    sum += value;
+                    x_thread[i] = value;
+                }
+
+                for (uint row = 0; row < results_per_simdgroup; ++row) {
+                    const device uint8_t* wl = ws + row * axis_size;
+                    float scale = float(sc[row * in_vec_size_g]);
+                    float bias = float(bs[row * in_vec_size_g]);
+                    float accum = 0.0f;
+                    for (uint i = 0; i < values_per_thread; ++i) {
+                        accum += x_thread[i] * wl[i];
+                    }
+                    result[row] += scale * accum + sum * bias;
+                }
+
+                ws += block_size;
+                sc += block_size / group_size;
+                bs += block_size / group_size;
+                column += block_size;
+            }
+
+            for (uint row = 0; row < results_per_simdgroup; ++row) {
+                result[row] = simd_sum(result[row]);
+                if (simd_lid == 0) {
+                    projected[qkv_rows + gate_row + row] =
+                        bfloat(result[row]);
+                }
+            }
+        }
+    }
+    """
+}
+
+/// Both attention families are eagerly constructed under distinct names so
+/// environment-controlled ablations never change a JIT kernel's source/name
+/// pairing inside one worker binary.
+private let lagunaNormNVFP4QKVKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_norm_nvfp4_qkv_qmv_bf16_h\(heads)_gi8g32_inl_v1",
+            inputNames: [
+                "residual", "norm_weight", "qkv_codes", "qkv_scales",
+                "gate_codes", "gate_scales", "gate_biases",
+            ],
+            outputNames: ["projected"],
+            source: lagunaNormNVFP4QKVSource(heads: heads),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+/// `DARKBLOOM_FUSED_NORM_NVFP4_QKV` (default ON; set "0" to disable).
+/// Disabled and ineligible calls preserve the separate input RMSNorm, NVFP4
+/// QKV QMV, and affine INT8 `g_proj` QMV chain.
+let lagunaFusedNormNVFP4QKVEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_NORM_NVFP4_QKV"] != "0"
+
+/// Input RMSNorm + native NVFP4 `[Q; K; V]` + separate affine INT8 per-head
+/// gate projection, or `nil` when any coverage, module, wire, dtype, or shape
+/// guard declines. The returned row is `[Q | K | V | g_proj]`.
+private func lagunaNormNVFP4QKV(
+    residual: MLXArray,
+    inputNorm: RMSNorm,
+    qkvWeight: LagunaNativeAffineWeight,
+    gateWeight: LagunaNativeAffineWeight,
+    queryProjection: Linear,
+    keyProjection: Linear,
+    valueProjection: Linear,
+    gateProjection: Linear,
+    qkvGateRows: Int,
+    layer: Int,
+    batchSize: Int,
+    sequenceLength: Int,
+    gatingEnabled: Bool,
+    gatePerHead: Bool,
+    heads: Int,
+    kvHeads: Int,
+    headDim: Int
+) -> MLXArray? {
+    guard lagunaFusedNormNVFP4QKVEnabled,
+        lagunaFusedQKVProjectionEnabled,
+        lagunaNativeAffineQKVEnabled,
+        lagunaUseNativeAffineQKV(layer: layer),
+        lagunaNativeAffineGProjEnabled,
+        lagunaUseNativeAffineGProj(layer: layer),
+        qkvWeight.mode == .nvfp4,
+        qkvWeight.bits == 4,
+        qkvWeight.groupSize == 16,
+        qkvWeight.biases == nil,
+        qkvGateRows == 0,
+        gateWeight.mode == .affine,
+        gateWeight.bits == 8,
+        gateWeight.groupSize == 32,
+        let gateBiases = gateWeight.biases,
+        batchSize == 1,
+        sequenceLength == 1,
+        gatingEnabled,
+        gatePerHead,
+        let kernel = lagunaNormNVFP4QKVKernels[heads],
+        headDim == LagunaConstants.headDim,
+        kvHeads == LagunaConstants.numKeyValueHeads,
+        type(of: inputNorm) == RMSNorm.self,
+        inputNorm.eps == Float(LagunaConstants.rmsNormEpsilon),
+        type(of: queryProjection) == Linear.self,
+        type(of: keyProjection) == Linear.self,
+        type(of: valueProjection) == Linear.self,
+        type(of: gateProjection) == Linear.self,
+        queryProjection.bias == nil,
+        keyProjection.bias == nil,
+        valueProjection.bias == nil,
+        gateProjection.bias == nil
+    else {
+        return nil
+    }
+
+    let hidden = LagunaConstants.hiddenSize
+    let queryRows = heads * headDim
+    let kvRows = kvHeads * headDim
+    let qkvRows = queryRows + 2 * kvRows
+    let totalRows = qkvRows + heads
+    guard residual.dtype == .bfloat16,
+        residual.shape == [1, 1, hidden],
+        inputNorm.weight.dtype == .bfloat16,
+        inputNorm.weight.shape == [hidden],
+        queryProjection.weight.dtype == .bfloat16,
+        queryProjection.weight.shape == [queryRows, hidden],
+        keyProjection.weight.dtype == .bfloat16,
+        keyProjection.weight.shape == [kvRows, hidden],
+        valueProjection.weight.dtype == .bfloat16,
+        valueProjection.weight.shape == [kvRows, hidden],
+        gateProjection.weight.dtype == .bfloat16,
+        gateProjection.weight.shape == [heads, hidden],
+        qkvWeight.packedCodes.dtype == .uint32,
+        qkvWeight.packedCodes.shape == [qkvRows, hidden / 8],
+        qkvWeight.scales.dtype == .uint8,
+        qkvWeight.scales.shape == [qkvRows, hidden / 16],
+        qkvWeight.originalShape == [qkvRows, hidden],
+        gateWeight.packedCodes.dtype == .uint32,
+        gateWeight.packedCodes.shape == [heads, hidden / 4],
+        gateWeight.scales.dtype == .bfloat16,
+        gateWeight.scales.shape == [heads, hidden / 32],
+        gateBiases.dtype == .bfloat16,
+        gateBiases.shape == [heads, hidden / 32],
+        gateWeight.originalShape == [heads, hidden]
+    else {
+        return nil
+    }
+
+    lagunaTrace("norm+nvfp4 qkv+affine gate qmv h\(heads)")
+    return kernel(
+        [
+            residual, inputNorm.weight, qkvWeight.packedCodes, qkvWeight.scales,
+            gateWeight.packedCodes, gateWeight.scales, gateBiases,
+        ],
+        grid: ((totalRows / 8) * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, totalRows]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 // MARK: - Gated native-affine INT8 output projection (one dispatch)
 
 /// Folds the per-head softplus gate product into the native group-32 affine
@@ -3512,8 +4081,31 @@ final class LagunaRuntimeAttention: Module {
                 // bank, so no consumer downstream of here needs a
                 // device-visible normalized row; the NVFP4 tail layers and
                 // any guard decline keep the separate norm.
+                var fusedNVFP4QKVGate: MLXArray?
+                if let affineGate = _nativeAffineGProj {
+                    fusedNVFP4QKVGate = lagunaNormNVFP4QKV(
+                        residual: input,
+                        inputNorm: inputNorm,
+                        qkvWeight: fusedAffine,
+                        gateWeight: affineGate,
+                        queryProjection: wq,
+                        keyProjection: wk,
+                        valueProjection: wv,
+                        gateProjection: gateProjection,
+                        qkvGateRows: _nativeAffineQKVGateRows,
+                        layer: layerIdx,
+                        batchSize: B,
+                        sequenceLength: L,
+                        gatingEnabled: gatingEnabled,
+                        gatePerHead: gatePerHead,
+                        heads: nHeads,
+                        kvHeads: nKVHeads,
+                        headDim: headDim)
+                }
                 var fusedQKV: MLXArray?
-                if lagunaFusedNormAffineQKVEnabled,
+                if let fusedNVFP4QKVGate {
+                    fusedQKV = fusedNVFP4QKVGate
+                } else if lagunaFusedNormAffineQKVEnabled,
                     fusedAffine.mode == .affine, fusedAffine.bits == 8,
                     fusedAffine.groupSize == 32,
                     _nativeAffineQKVGateRows == nHeads,
@@ -3547,10 +4139,11 @@ final class LagunaRuntimeAttention: Module {
                 let kvDim = nKVHeads * headDim
                 let gateStart = queryDim + 2 * kvDim
                 let gateLogits: MLXArray
-                if _nativeAffineQKVGateRows == nHeads {
-                    // The gate rows rode the fused bank's single dispatch;
-                    // slice them out of its tail. Same row-local math as a
-                    // standalone group-32 INT8 gate qmv.
+                if _nativeAffineQKVGateRows == nHeads || fusedNVFP4QKVGate != nil {
+                    // The gate rows rode the fused bank's single dispatch
+                    // (INT8 layers: appended to the affine bank; NVFP4 tail:
+                    // Kernel A emits the affine gate bank after the NVFP4
+                    // Q/K/V rows); slice them out of its tail.
                     gateLogits = qkv[.ellipsis, gateStart ..< (gateStart + nHeads)]
                 } else if let affineGate = _nativeAffineGProj {
                     // NVFP4-tail layer: the gate keeps its own group-32 INT8
@@ -3575,7 +4168,7 @@ final class LagunaRuntimeAttention: Module {
                 // those exact rounding boundaries inside its single dispatch.
                 // Otherwise keep the stock eager activation.
                 let deferGateActivation =
-                    lagunaFusedGateProductEnabled
+                    (lagunaFusedGateProductEnabled || lagunaFusedGatedNVFP4OProjEnabled)
                     && lagunaUseNativeAffineOProj(layer: layerIdx)
                     && _nativeAffineOProj != nil
                     && wo.bias == nil
@@ -3824,6 +4417,25 @@ final class LagunaRuntimeAttention: Module {
                 output.shape == [1, 1, nHeads * headDim],
                 projectedGate.shape == [1, 1, nHeads]
             {
+                // Raw logits + gated NVFP4 QMV: ONE dispatch for the exact
+                // softplus chain, BF16 gate product, and stock group-16 NVFP4
+                // contraction. Its wrapper owns every wire/shape/coverage
+                // guard, so INT8 layouts and all declines continue unchanged.
+                if let fusedProjection = lagunaGatedNVFP4OProj(
+                    attentionOutput: output,
+                    gateLogits: projectedGate,
+                    weight: affineWO,
+                    outputProjection: wo,
+                    layer: layerIdx,
+                    batchSize: B,
+                    sequenceLength: L,
+                    gatePerHead: gatePerHead,
+                    gateIsActivated: gateIsActivated,
+                    heads: nHeads,
+                    headDim: headDim)
+                {
+                    return fusedProjection
+                }
                 // Raw logits + gated affine GEMV: ONE dispatch for the softplus
                 // chain, the broadcast product AND the INT8 contraction (see
                 // `lagunaGatedAffineOProjSource`). Only the group-32 affine
