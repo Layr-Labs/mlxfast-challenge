@@ -349,11 +349,18 @@ struct fp8_e4m3 {
   }
 
   operator float16_t() {
-    uint16_t v = (bits & 127) << 7;
+    // Carry sign-fold: for sign-set bytes, bits + 128 = 256 + (bits & 127)
+    // and 256 << 7 = 0x8000 lands the sign on half bit 15 while clearing
+    // bit 14; for sign-clear bytes the add is the identity. Bit-identical
+    // to the select form for all 256 bytes (the *= 256.0 sign commutes for
+    // every finite half magnitude this decode can produce -- max exponent
+    // field is 15 < 31), one integer add replacing the
+    // compare+select+negate chain. Same transform as the runtime header's
+    // DARKBLOOM_NVFP4_SCALE_CARRY carry sign-fold.
+    uint16_t v = uint16_t((uint(bits) + (bits & 128u)) << 7);
     half converted = as_type<half>(v);
     converted *= 256.0;
-    auto sign = bits & 128;
-    return (sign ? -converted : converted);
+    return converted;
   }
 
   operator bfloat16_t() {

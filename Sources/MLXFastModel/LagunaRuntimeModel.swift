@@ -4097,6 +4097,28 @@ let lagunaNvfp4NibbleSplit: Int = {
     else { return 1 }
     return value
 }()
+/// `DARKBLOOM_NVFP4_SCALE_CARRY` (default `1` = carry sign-fold; set `0` for
+/// the stock select form): builds the e4m3 scale's half bit pattern as
+/// `ushort((uint(bits) + (bits & 128u)) << 7)`. For sign-set bytes,
+/// `bits + 128 = 256 + (bits & 127)` and `256 << 7 = 0x8000` lands the sign
+/// on half bit 15 while clearing bit 14; for sign-clear bytes the add is the
+/// identity. Replaces the compare+select+negate chain with one integer add:
+/// 7 -> 5 real AIR ops per scale decode (`xcrun metal -fno-fast-math -S`;
+/// the ternary does NOT fuse at AIR level). The returned float is
+/// bit-identical for all 256 bytes in both scale-fold variants (exhaustive C
+/// bit-compare, with the half emulation itself validated against hardware
+/// over all 65536 patterns), the 16-bit pattern identity is machine-checked
+/// in Lean 4 (`bv_decide`, both the uint-add-then-truncate and direct 16-bit
+/// readings pinned against each other), and the kernel-level FNV-1a output
+/// fingerprint is identical across both settings over 30 interleaved
+/// microbench processes on real-shape banks. Paired local timing bounds the
+/// effect within the contended-box ±1% noise floor (not a regression); the
+/// sign claim rests on strictly-fewer-instructions in an ALU-bound kernel.
+/// Applies only with the scale fold ON; the fold-OFF ablation arm keeps the
+/// stock body.
+let lagunaNvfp4ScaleCarry: Bool =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_CARRY"] != "0"
+
 private let lagunaSharedSwiGLUQMVHeader: String = {
     // The two halves of one power-of-two regrouping. They MUST move together:
     // the scale absorbs `2^14` exactly when the weights stop applying it.
@@ -4143,11 +4165,22 @@ private let lagunaSharedSwiGLUQMVHeader: String = {
                         ((c & 0x70007000u) >> 3) | (c & 0x80008000u);
             """
     }
+    // Carry sign-fold pairs only with the fold-ON scale; the ablation arm
+    // (fold OFF) keeps the shipped select body character-for-character.
+    let scaleCarryActive = lagunaNvfp4ScaleCarry && lagunaNvfp4ScaleFoldEnabled
+    let scaleRawExpression =
+        scaleCarryActive
+        ? "ushort((uint(bits) + (bits & 128u)) << 7)"
+        : "ushort(bits & 127) << 7"
+    let scaleSignExpression =
+        scaleCarryActive
+        ? "converted"
+        : "(bits & 128) ? -converted : converted"
     return """
     static inline float laguna_nvfp4_scale(uint8_t bits) {
-        ushort raw = ushort(bits & 127) << 7;
+        ushort raw = \(scaleRawExpression);
         half converted = as_type<half>(raw);
-    \(scale256)    half signed_value = (bits & 128) ? -converted : converted;
+    \(scale256)    half signed_value = \(scaleSignExpression);
     \(scaleTail)
     }
 
