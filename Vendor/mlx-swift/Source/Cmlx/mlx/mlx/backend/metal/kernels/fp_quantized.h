@@ -99,10 +99,23 @@ inline U qdot(const device uint8_t* w, const thread U* x_thread, U scale) {
 #pragma unroll
     for (int j = 0; j < 2; j++) {
       const uint32_t c = (j == 0) ? codes.x : codes.y;
-      const uint32_t p0 = ((c & 0x00070007u) << 9) | ((c & 0x00080008u) << 12);
-      const uint32_t p1 = ((c & 0x00700070u) << 5) | ((c & 0x00800080u) << 8);
-      const uint32_t p2 = ((c & 0x07000700u) << 1) | ((c & 0x08000800u) << 4);
-      const uint32_t p3 = ((c & 0x70007000u) >> 3) | (c & 0x80008000u);
+      // Split-nibble decode: a strictly shorter integer sequence that
+      // produces the SAME eight `half` bit patterns per code word as the
+      // stock shift+mask. Separate the even/odd nibbles once and slide each
+      // nibble's sign three places so magnitude and sign sit at a fixed
+      // offset, then one shift+mask yields a whole half2. 13 int ops per
+      // code word (-6) and three mask constants instead of eight (-5 live
+      // constant registers). Bit-exact by construction: every form is an OR
+      // of masked shifts, and all 33 single-bit basis words plus 300k random
+      // words agree bit-for-bit with stock.
+      const uint32_t xe = c & 0x0F0F0F0Fu;
+      const uint32_t ge = xe | (xe << 3);
+      const uint32_t yo = c & 0xF0F0F0F0u;
+      const uint32_t go = yo | (yo >> 3);
+      const uint32_t p0 = (ge << 9) & 0x8E008E00u;
+      const uint32_t p1 = (go << 8) & 0x8E008E00u;
+      const uint32_t p2 = (ge << 1) & 0x8E008E00u;
+      const uint32_t p3 = go & 0x8E008E00u;
       const float2 v04 = float2(as_type<half2>(p0)) * 16384.0f;
       const float2 v15 = float2(as_type<half2>(p1)) * 16384.0f;
       const float2 v26 = float2(as_type<half2>(p2)) * 16384.0f;
@@ -260,18 +273,20 @@ static inline uint32_t fp4nv_pack4(const thread uint8_t* p) {
 // when walking those four bytes.
 template <typename T>
 static inline void fp4nv_decode8(uint32_t c, float scale, thread T* out) {
-  const float2 v0 = float2(as_type<half2>(
-                        ((c & 0x00070007u) << 9) | ((c & 0x00080008u) << 12))) *
-      scale;
-  const float2 v1 = float2(as_type<half2>(
-                        ((c & 0x00700070u) << 5) | ((c & 0x00800080u) << 8))) *
-      scale;
-  const float2 v2 = float2(as_type<half2>(
-                        ((c & 0x07000700u) << 1) | ((c & 0x08000800u) << 4))) *
-      scale;
-  const float2 v3 =
-      float2(as_type<half2>(((c & 0x70007000u) >> 3) | (c & 0x80008000u))) *
-      scale;
+  // Split-nibble decode: identical half bit patterns to stock with fewer
+  // integer ops and fewer live constant registers. See qdot() for the
+  // bit-exactness argument.
+  const uint32_t xe = c & 0x0F0F0F0Fu;
+  const uint32_t ge = xe | (xe << 3);
+  const uint32_t yo = c & 0xF0F0F0F0u;
+  const uint32_t go = yo | (yo >> 3);
+  const float2 v0 =
+      float2(as_type<half2>((ge << 9) & 0x8E008E00u)) * scale;
+  const float2 v1 =
+      float2(as_type<half2>((go << 8) & 0x8E008E00u)) * scale;
+  const float2 v2 =
+      float2(as_type<half2>((ge << 1) & 0x8E008E00u)) * scale;
+  const float2 v3 = float2(as_type<half2>(go & 0x8E008E00u)) * scale;
   out[0] = T(v0.x);
   out[1] = T(v1.x);
   out[2] = T(v2.x);
