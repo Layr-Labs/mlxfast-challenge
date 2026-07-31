@@ -472,19 +472,6 @@ let lagunaFusedSlidingQKNormRoPEEnabled =
 private let lagunaPrefillQKNormRoPEEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_QK_NORM_ROPE"] != "0"
 
-/// Heads-per-threadgroup repartition for the prefill QK-norm+RoPE kernels.
-/// The shipped kernels pack four heads (four SIMDs) per threadgroup; this
-/// selects a one-head-per-threadgroup twin (one SIMD) instead -- the proven
-/// DECODE shape. Bit-exact in the EG256 class: each head is one SIMD and all
-/// per-head arithmetic is SIMD-local, so only threadgroup composition changes.
-/// Default `1` selects H1; `DARKBLOOM_PREFILL_QK_HEADS=4` restores the control.
-let lagunaPrefillQKHeadsPerGroup: Int = {
-    let raw =
-        ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_QK_HEADS"]
-        ?? "1"
-    return raw == "4" ? 4 : 1
-}()
-
 /// Terminal-prefill projection banking. The last decoder layer consumes Q and
 /// the per-head gate for only the final supplied row, while K/V must still be
 /// produced for every row so the cache advances normally. Retained `[Q; G]`
@@ -1257,295 +1244,6 @@ func lagunaSlidingQKNormRoPE(
     return (outputs[0], outputs[1])
 }
 
-// MARK: - Decode QK-norm/RoPE with the KV-cache write folded in
-
-/// `DARKBLOOM_FUSED_KV_WRITE` (default OFF — MEASURED REGRESSION ON THE RANKED M5:
-/// submission b5e8cc0 measured decode 8.3729 ms/token with this ON versus 7.0403
-/// ms/token with it OFF on the identical tree, i.e. 18.9% SLOWER, despite 17/17
-/// paired local rounds favouring it and bit-exact output+cache fingerprints.
-/// Removing 80 dispatches/token is NOT a win on the M5: the in-place cache write
-/// passes the cache arrays as non-contiguous kernel inputs, which appears to cost
-/// far more there than the launches it saves. Set "1" to re-enable): let the
-/// decode QK-norm+RoPE kernel land the new token's K and V rows in the KV
-/// cache itself, removing the two `slice_update` dispatches MLX would
-/// otherwise issue per layer per token (80 of the ~497 decode dispatches).
-///
-/// This is a dispatch-count change only. The K row is the value the fused
-/// kernel already computed, written to the address `slice_update` would have
-/// written it to; the V row is a byte copy of the projection's V slice. No
-/// arithmetic, rounding, accumulation order or launch geometry changes.
-///
-/// Ordering. MLX encodes with `MTLDispatchTypeConcurrent` and inserts a
-/// global `memoryBarrier(BarrierScopeBuffers)` before any dispatch that
-/// *reads* a buffer an earlier dispatch in the same encoder *wrote*
-/// (`CommandEncoder::set_input_array` / `maybeInsertBarrier`,
-/// backend/metal/device.cpp). MLX sees the cache arrays only as inputs here,
-/// so the barrier that orders the write against the SDPA that reads it comes
-/// from `queries`: SDPA consumes this kernel's `queries` output, which is in
-/// the encoder's previous-output set, and the barrier it triggers is buffer
-/// *scope*, not per-resource. The guard below therefore also requires the
-/// exact decode shape SDPA's `kv_copy_unless` accepts without a staging copy
-/// (`strides.back() == 1` and `B == 1`), so no un-barriered op can read the
-/// cache between the write and the SDPA that consumes `queries`.
-let lagunaFusedKVWriteEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_KV_WRITE"] == "1"
-
-/// 0-d `int32` cache-row constants, so a decode step's forty fused KV writes
-/// cost forty array lookups instead of forty scalar-array constructions.
-/// Grown on demand and never shrunk; MLX arrays are immutable, so one
-/// constant per row index serves every layer and every step.
-private final class LagunaKVRowConstants: @unchecked Sendable {
-    static let shared = LagunaKVRowConstants()
-    private var constants: [MLXArray] = []
-    private let lock = NSLock()
-
-    func constant(_ row: Int) -> MLXArray {
-        lock.lock()
-        defer { lock.unlock() }
-        if row < constants.count { return constants[row] }
-        let target = max(row + 1, 1024)
-        var grown: [MLXArray] = []
-        grown.reserveCapacity(target - constants.count)
-        for value in constants.count ..< target {
-            grown.append(MLXArray(Int32(value)))
-        }
-        eval(grown)
-        constants.append(contentsOf: grown)
-        return constants[row]
-    }
-}
-
-/// Body shared by the two KV-writing decode kernels. `queryHeads` and the
-/// rotation block are the only differences from their non-writing twins, and
-/// both are spliced in verbatim from those kernels — the RMSNorm reduction,
-/// the `simd_shuffle` partner fetch, the BF16 boundaries and the write order
-/// are character-for-character identical, so the K row this lands in the
-/// cache is the same bit pattern the `slice_update` pair would have landed.
-private func lagunaDecodeQKNormKVWriteSource(
-    queryHeads: Int,
-    rotation: String
-) -> String {
-    """
-    constexpr uint head_dim = 128;
-    constexpr uint query_heads = \(queryHeads);
-
-    uint head = threadgroup_position_in_grid.x;
-    uint lane = thread_index_in_simdgroup;
-
-    const device bfloat* input;
-    const device bfloat* weight;
-    uint kv_head = head - query_heads;
-    if (head < query_heads) {
-        input = raw_queries + head * head_dim;
-        weight = query_weight;
-    } else {
-        input = raw_keys + kv_head * head_dim;
-        weight = key_weight;
-    }
-
-    uint base = lane * 4;
-    thread bfloat normalized[4];
-    float sum = 0.0f;
-    for (uint i = 0; i < 4; ++i) {
-        float value = float(input[base + i]);
-        sum += value * value;
-    }
-    sum = simd_sum(sum);
-    float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
-
-    for (uint i = 0; i < 4; ++i) {
-        normalized[i] =
-            weight[base + i] *
-            bfloat(float(input[base + i]) * inverse_rms);
-    }
-
-    // The K row goes straight to the ring slot `slice_update` would have
-    // filled: MLX binds `cache_keys` at the cache array's own data offset,
-    // and `cache_keys_strides[1]` is its kv-head stride in elements.
-    device bfloat* output;
-    if (head < query_heads) {
-        output = queries + head * head_dim;
-    } else {
-        output =
-            (device bfloat*)cache_keys
-            + long(cache_keys_strides[1]) * long(kv_head)
-            + long(kv_row) * long(head_dim);
-    }
-
-    \(rotation)
-
-    // V is untouched by QK-norm and RoPE, so its cache row is a byte copy of
-    // the projection's V slice; the eight kv-head threadgroups own it, four
-    // elements per lane, exactly covering the 128-wide row.
-    if (head >= query_heads) {
-        device bfloat* value_row =
-            (device bfloat*)cache_values
-            + long(cache_values_strides[1]) * long(kv_head)
-            + long(kv_row) * long(head_dim);
-        const device bfloat* value_source = raw_values + kv_head * head_dim;
-        for (uint i = 0; i < 4; ++i) {
-            value_row[base + i] = value_source[base + i];
-        }
-    }
-    """
-}
-
-private let lagunaSlidingQKNormRoPEKVWriteKernel = MLXFast.metalKernel(
-    name: "laguna_sliding_qk_norm_rope_kvwrite_bf16_128_v1",
-    inputNames: [
-        "raw_queries", "raw_keys", "raw_values", "query_weight", "key_weight",
-        "angles", "cache_keys", "cache_values", "kv_row",
-    ],
-    outputNames: ["queries"],
-    source: lagunaDecodeQKNormKVWriteSource(
-        queryHeads: LagunaConstants.slidingAttentionHeads,
-        rotation: """
-            constexpr uint rotary_pairs = 64;
-            thread float paired[4];
-            for (uint i = 0; i < 4; ++i) {
-                paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
-            }
-            if (lane < 16) {
-                for (uint i = 0; i < 4; ++i) {
-                    uint pair = base + i;
-                    float first = float(normalized[i]);
-                    float second = paired[i];
-                    float cosine = angles[pair];
-                    float sine = angles[pair + rotary_pairs];
-                    output[pair] = bfloat(first * cosine - second * sine);
-                    output[pair + rotary_pairs] =
-                        bfloat(first * sine + second * cosine);
-                }
-            }
-            """
-    ),
-    // Every input here is already dense at its own data offset, and the two
-    // cache arrays MUST NOT be staged through a contiguous copy: the copy is
-    // what the kernel would then write into.
-    ensureRowContiguous: false
-)
-
-private let lagunaFullQKNormYaRNKVWriteKernel = MLXFast.metalKernel(
-    name: "laguna_full_qk_norm_yarn_kvwrite_bf16_128_v1",
-    inputNames: [
-        "raw_queries", "raw_keys", "raw_values", "query_weight", "key_weight",
-        "angles", "cache_keys", "cache_values", "kv_row",
-    ],
-    outputNames: ["queries"],
-    source: lagunaDecodeQKNormKVWriteSource(
-        queryHeads: LagunaConstants.fullAttentionHeads,
-        rotation: """
-            constexpr uint rotary_pairs = 32;
-            constexpr float yarn_mscale = 1.3465735912322998f;
-            thread float paired[4];
-            for (uint i = 0; i < 4; ++i) {
-                paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
-            }
-            if (lane < 8) {
-                bfloat rounded_mscale = bfloat(yarn_mscale);
-                for (uint i = 0; i < 4; ++i) {
-                    uint pair = base + i;
-                    float first =
-                        float(bfloat(normalized[i] * rounded_mscale));
-                    float second =
-                        float(bfloat(bfloat(paired[i]) * rounded_mscale));
-                    float cosine = angles[pair];
-                    float sine = angles[pair + rotary_pairs];
-                    output[pair] = bfloat(first * cosine - second * sine);
-                    output[pair + rotary_pairs] =
-                        bfloat(first * sine + second * cosine);
-                }
-            } else if (lane >= 16) {
-                for (uint i = 0; i < 4; ++i) {
-                    output[base + i] = normalized[i];
-                }
-            }
-            """
-    ),
-    ensureRowContiguous: false
-)
-
-/// Shape/layout contract every fused in-place KV write must satisfy.
-/// Anything outside it keeps the stock kernel plus `cache.update`.
-func lagunaFusedKVWriteAccepts(
-    target: FusedKVWriteTarget,
-    kvHeads: Int,
-    headDim: Int,
-    rawValues: MLXArray
-) -> Bool {
-    let keyShape = target.keys.shape
-    let valueShape = target.values.shape
-    guard keyShape.count == 4, valueShape.count == 4 else { return false }
-    guard keyShape[0] == 1, keyShape[1] == kvHeads, keyShape[3] == headDim else { return false }
-    guard valueShape[0] == 1, valueShape[1] == kvHeads, valueShape[3] == headDim else {
-        return false
-    }
-    guard target.keys.dtype == .bfloat16, target.values.dtype == .bfloat16 else { return false }
-    guard target.row >= 0, target.row < keyShape[2], target.row < valueShape[2] else {
-        return false
-    }
-    // The cache slices SDPA is handed must reach `sdpa_vector` without a
-    // staging copy (see the ordering note on `lagunaFusedKVWriteEnabled`);
-    // `kv_copy_unless` accepts `strides.back() == 1 && shape[0] == 1`, which
-    // a row-major-dense `[1, kvHeads, T, headDim]` store always satisfies.
-    guard target.keys.strides.last == 1, target.values.strides.last == 1 else { return false }
-    guard rawValues.dtype == .bfloat16, rawValues.size == kvHeads * headDim else { return false }
-    return true
-}
-
-/// Sliding-layer decode QK-norm + RoPE that also lands the K and V cache
-/// rows. Returns only the rotated queries; K and V now live in the cache.
-func lagunaSlidingQKNormRoPEKVWrite(
-    rawQueries: MLXArray,
-    rawKeys: MLXArray,
-    rawValues: MLXArray,
-    queryWeight: MLXArray,
-    keyWeight: MLXArray,
-    angles: MLXArray,
-    target: FusedKVWriteTarget
-) -> MLXArray {
-    let heads = LagunaConstants.slidingAttentionHeads
-    let kvHeads = LagunaConstants.numKeyValueHeads
-    lagunaTrace("sliding qk norm+rope+kv write")
-    let outputs = lagunaSlidingQKNormRoPEKVWriteKernel(
-        [
-            rawQueries, rawKeys, rawValues, queryWeight, keyWeight, angles,
-            target.keys, target.values, LagunaKVRowConstants.shared.constant(target.row),
-        ],
-        grid: ((heads + kvHeads) * 32, 1, 1),
-        threadGroup: (32, 1, 1),
-        outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
-        outputDTypes: [.bfloat16]
-    )
-    return outputs[0]
-}
-
-/// Full-attention twin of `lagunaSlidingQKNormRoPEKVWrite`.
-func lagunaFullQKNormYaRNKVWrite(
-    rawQueries: MLXArray,
-    rawKeys: MLXArray,
-    rawValues: MLXArray,
-    queryWeight: MLXArray,
-    keyWeight: MLXArray,
-    angles: MLXArray,
-    target: FusedKVWriteTarget
-) -> MLXArray {
-    let heads = LagunaConstants.fullAttentionHeads
-    let kvHeads = LagunaConstants.numKeyValueHeads
-    lagunaTrace("full qk norm+yarn+kv write")
-    let outputs = lagunaFullQKNormYaRNKVWriteKernel(
-        [
-            rawQueries, rawKeys, rawValues, queryWeight, keyWeight, angles,
-            target.keys, target.values, LagunaKVRowConstants.shared.constant(target.row),
-        ],
-        grid: ((heads + kvHeads) * 32, 1, 1),
-        threadGroup: (32, 1, 1),
-        outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
-        outputDTypes: [.bfloat16]
-    )
-    return outputs[0]
-}
-
 /// Multi-token sliding-layer Q/K RMSNorm + plain RoPE fusion. One dispatch
 /// replaces the stock four (`rms_single_row` q, `rms_single_row` k,
 /// `rope_bfloat16` q, `rope_bfloat16` k) for a whole prefill layer and
@@ -1634,86 +1332,6 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
             angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
         // Every element rotates, so the lower sixteen lanes own all 64
         // pairs and write both halves of each.
-        if (lane < 16) {
-            for (uint i = 0; i < 4; ++i) {
-                uint pair = base + i;
-                float first = float(normalized[i]);
-                float second = paired[i];
-                float cosine = angle_row[pair];
-                float sine = angle_row[pair + rotary_pairs];
-                output[pair] = bfloat(first * cosine - second * sine);
-                output[pair + rotary_pairs] =
-                    bfloat(first * sine + second * cosine);
-            }
-        }
-        """,
-    ensureRowContiguous: true
-)
-
-/// One-head-per-threadgroup twin of the prefill sliding QK-norm+RoPE kernel
-/// (H1). BIT-EXACT repartition in the EG256 class: the `*4` original packs
-/// four heads (four SIMDs) per threadgroup; this twin packs one (one SIMD).
-/// Each head's work is fully SIMD-local -- RMSNorm `simd_sum`, the within-SIMD
-/// `lane ^ 16` rotary-partner shuffle, and every BF16 rounding boundary never
-/// cross heads -- so the value each head writes is identical regardless of how
-/// many heads share a threadgroup. This matches the proven DECODE shape
-/// (`lagunaSlidingQKNormRoPEKernel`, one SIMD/head, the project's largest
-/// single win); the prefill `*4` was an unaudited divergence from it.
-private let lagunaPrefillSlidingQKNormRoPEH1Kernel = MLXFast.metalKernel(
-    name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_h1_v1",
-    inputNames: [
-        "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
-        "offsets",
-    ],
-    outputNames: ["queries", "keys"],
-    source: """
-        constexpr uint head_dim = 128;
-        constexpr uint rotary_pairs = 64;
-        constexpr uint query_heads = 64;
-        constexpr uint kv_heads = 8;
-
-        uint t = threadgroup_position_in_grid.y;
-        uint length = threadgroups_per_grid.y;
-        uint head = threadgroup_position_in_grid.x;
-        uint lane = thread_index_in_simdgroup;
-
-        const device bfloat* input;
-        const device bfloat* weight;
-        device bfloat* output;
-        if (head < query_heads) {
-            input = raw_queries + (t * query_heads + head) * head_dim;
-            weight = query_weight;
-            output = queries + (head * length + t) * head_dim;
-        } else {
-            uint khead = head - query_heads;
-            input = raw_keys + (t * kv_heads + khead) * head_dim;
-            weight = key_weight;
-            output = keys + (khead * length + t) * head_dim;
-        }
-
-        uint base = lane * 4;
-        thread bfloat normalized[4];
-        float sum = 0.0f;
-        for (uint i = 0; i < 4; ++i) {
-            float value = float(input[base + i]);
-            sum += value * value;
-        }
-        sum = simd_sum(sum);
-        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
-
-        for (uint i = 0; i < 4; ++i) {
-            normalized[i] =
-                weight[base + i] *
-                bfloat(float(input[base + i]) * inverse_rms);
-        }
-
-        thread float paired[4];
-        for (uint i = 0; i < 4; ++i) {
-            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
-        }
-
-        const device float* angle_row =
-            angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
         if (lane < 16) {
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
@@ -1826,91 +1444,6 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// One-head-per-threadgroup twin of the prefill full-attention QK-norm+YaRN
-/// kernel (H1). Bit-exact repartition (EG256 class): each head is one SIMD and
-/// all per-head arithmetic (RMSNorm `simd_sum`, the within-SIMD `lane ^ 8` YaRN
-/// partner shuffle, the mscale round-trip) is SIMD-local, so grouping one head
-/// per threadgroup instead of four changes only launch count/occupancy, not any
-/// head's output value. Matches the proven decode shape.
-private let lagunaPrefillFullQKNormYaRNH1Kernel = MLXFast.metalKernel(
-    name: "laguna_prefill_full_qk_norm_yarn_bf16_128_h1_v1",
-    inputNames: [
-        "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
-        "offsets",
-    ],
-    outputNames: ["queries", "keys"],
-    source: """
-        constexpr uint head_dim = 128;
-        constexpr uint rotary_pairs = 32;
-        constexpr uint query_heads = 48;
-        constexpr uint kv_heads = 8;
-        constexpr float yarn_mscale = 1.3465735912322998f;
-
-        uint t = threadgroup_position_in_grid.y;
-        uint length = threadgroups_per_grid.y;
-        uint head = threadgroup_position_in_grid.x;
-        uint lane = thread_index_in_simdgroup;
-
-        const device bfloat* input;
-        const device bfloat* weight;
-        device bfloat* output;
-        if (head < query_heads) {
-            input = raw_queries + (t * query_heads + head) * head_dim;
-            weight = query_weight;
-            output = queries + (head * length + t) * head_dim;
-        } else {
-            uint khead = head - query_heads;
-            input = raw_keys + (t * kv_heads + khead) * head_dim;
-            weight = key_weight;
-            output = keys + (khead * length + t) * head_dim;
-        }
-
-        uint base = lane * 4;
-        thread bfloat normalized[4];
-        float sum = 0.0f;
-        for (uint i = 0; i < 4; ++i) {
-            float value = float(input[base + i]);
-            sum += value * value;
-        }
-        sum = simd_sum(sum);
-        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
-
-        for (uint i = 0; i < 4; ++i) {
-            normalized[i] =
-                weight[base + i] *
-                bfloat(float(input[base + i]) * inverse_rms);
-        }
-
-        thread float paired[4];
-        for (uint i = 0; i < 4; ++i) {
-            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
-        }
-
-        const device float* angle_row =
-            angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
-        if (lane < 8) {
-            bfloat rounded_mscale = bfloat(yarn_mscale);
-            for (uint i = 0; i < 4; ++i) {
-                uint pair = base + i;
-                float first =
-                    float(bfloat(normalized[i] * rounded_mscale));
-                float second =
-                    float(bfloat(bfloat(paired[i]) * rounded_mscale));
-                float cosine = angle_row[pair];
-                float sine = angle_row[pair + rotary_pairs];
-                output[pair] = bfloat(first * cosine - second * sine);
-                output[pair + rotary_pairs] =
-                    bfloat(first * sine + second * cosine);
-            }
-        } else if (lane >= 16) {
-            for (uint i = 0; i < 4; ++i) {
-                output[base + i] = normalized[i];
-            }
-        }
-        """,
-    ensureRowContiguous: true
-)
-
 private func lagunaPrefillSlidingQKNormRoPE(
     rawQueries: MLXArray,
     rawKeys: MLXArray,
@@ -1937,16 +1470,10 @@ private func lagunaPrefillSlidingQKNormRoPE(
     precondition((heads + kvHeads) % 4 == 0)
 
     lagunaTrace("prefill sliding qk norm+rope")
-    let useH1 = lagunaPrefillQKHeadsPerGroup == 1
-    let headsPerGroup = useH1 ? 1 : 4
-    let threadGroupSize = headsPerGroup * 32
-    let kernel = useH1
-        ? lagunaPrefillSlidingQKNormRoPEH1Kernel
-        : lagunaPrefillSlidingQKNormRoPEKernel
-    let outputs = kernel(
+    let outputs = lagunaPrefillSlidingQKNormRoPEKernel(
         [rawQueries, rawKeys, queryWeight, keyWeight, angles, offsets],
-        grid: ((heads + kvHeads) / headsPerGroup * threadGroupSize, length, 1),
-        threadGroup: (threadGroupSize, 1, 1),
+        grid: ((heads + kvHeads) / 4 * 128, length, 1),
+        threadGroup: (128, 1, 1),
         outputShapes: [
             [1, heads, length, LagunaConstants.headDim],
             [1, kvHeads, length, LagunaConstants.headDim],
@@ -1982,16 +1509,10 @@ private func lagunaPrefillFullQKNormYaRN(
     precondition((heads + kvHeads) % 4 == 0)
 
     lagunaTrace("prefill full qk norm+yarn")
-    let useH1 = lagunaPrefillQKHeadsPerGroup == 1
-    let headsPerGroup = useH1 ? 1 : 4
-    let threadGroupSize = headsPerGroup * 32
-    let kernel = useH1
-        ? lagunaPrefillFullQKNormYaRNH1Kernel
-        : lagunaPrefillFullQKNormYaRNKernel
-    let outputs = kernel(
+    let outputs = lagunaPrefillFullQKNormYaRNKernel(
         [rawQueries, rawKeys, queryWeight, keyWeight, angles, offsets],
-        grid: ((heads + kvHeads) / headsPerGroup * threadGroupSize, length, 1),
-        threadGroup: (threadGroupSize, 1, 1),
+        grid: ((heads + kvHeads) / 4 * 128, length, 1),
+        threadGroup: (128, 1, 1),
         outputShapes: [
             [1, heads, length, LagunaConstants.headDim],
             [1, kvHeads, length, LagunaConstants.headDim],
@@ -3007,51 +2528,23 @@ func lagunaGateProductSoftplus(
     )[0]
 }
 
-// MARK: - Gated native-affine output projection (one dispatch)
+// MARK: - Gated native-affine INT8 output projection (one dispatch)
 
-/// Folds the per-head softplus gate PRODUCT into the native group-32 affine
-/// INT8 output-projection GEMV, so the decode tail is one dispatch instead of
-/// two (`lagunaGateProductSoftplus` then MLX's `quantizedMM`).
+/// Folds the per-head softplus gate product into the native group-32 affine
+/// INT8 output-projection GEMV, turning the decode attention tail from two
+/// dispatches (`lagunaGateProductSoftplus` then `quantizedMM`) into one. The
+/// INT8 twin of the BF16 `lagunaGatedOutputProjectionSource`, which stopped
+/// applying once the native affine o_proj layout shipped.
 ///
-/// This is the INT8 twin of `lagunaGatedOutputProjectionSource`, which already
-/// does exactly this for the BF16 `wo` weight. When the o_proj native affine
-/// layout shipped, that fusion stopped applying (MLX's `quantizedMM` owns the
-/// contraction), and the gate product came back as its own dispatch — see the
-/// call-site comment in `LagunaRuntimeAttention.callAsFunction`. This kernel
-/// gives it back.
-///
-/// EXACTNESS. The body is a textual replica of
-/// `affine_qmv_fast<bfloat16_t, group_size = 32, bits = 8>`
-/// (`quantized.h:qmv_fast_impl` + `load_vector` + `qdot`) at the shapes MLX
-/// itself dispatches for `[2048, heads * 128] x [heads * 128]`:
-///  * `qmv`'s host side picks `bn = 8`, `group_dims (32, 2, 1)`,
-///    `grid_dims (1, out / 8, 1)`, and `fast = (N % 8 == 0 && K % 512 == 0)`,
-///    which both `[2048, 8192]` and `[2048, 6144]` satisfy. This kernel keeps
-///    that geometry EXACTLY — 64-thread threadgroups, two simdgroups, four
-///    rows each, `out / 8` threadgroups — so no row changes which lane or
-///    which k-block computes which product. (Geometry is deliberately not a
-///    knob here: a retiling that is bit-exact on paper still moves timings
-///    differently between Apple Silicon generations.)
-///  * `packs_per_thread = 2`, `pack_factor = 4`, so `values_per_thread = 8`
-///    and `block_size = 256`; lane `l` owns columns `256k + 8l ..< 256k + 8l
-///    + 8` and scale/bias group `(256k + 8l) / 32`, and the accumulation runs
-///    k-block by k-block into one FP32 register per row, exactly as MLX's
-///    `result[row] += qdot(...)` does, with the same
-///    `scale * accum + sum * bias` epilogue per block and the same
-///    `simd_sum` + single BF16 round at the end.
-///  * The gate: `values_per_thread == 8` divides `head_dim == 128`, so a
-///    lane's eight values always lie in ONE head and take one gate factor.
-///    The factor is `float(bfloat(softplus_f32(float(logit))))` — the same
-///    FP32 `LogAddExp` form, NaN/inf guards and BF16 rounding point
-///    `lagunaGateProductSoftplusSource` uses — and the gated activation is
-///    `float(bfloat(float(x) * gate))`, which is the exact BF16 element the
-///    standalone kernel would have written and `load_vector` would then have
-///    widened back to FP32. So `x_thread` and `sum` are bit-identical to the
-///    two-dispatch chain's.
-///
-/// The softplus is evaluated once per head per threadgroup into threadgroup
-/// memory rather than once per element: the values are identical (softplus is
-/// a pure function of the logit) and it keeps the added ALU off the k-loop.
+/// The kernel body is a textual replica of MLX's
+/// `affine_qmv_fast<bfloat16_t, group_size = 32, bits = 8>` keeping MLX's
+/// dispatch geometry EXACTLY: `bn = 8`, `values_per_thread = 8`,
+/// `block_size = 256`, two simdgroups of four rows, one FP32 accumulator per
+/// row stepped k-block by k-block, `scale * accum + sum * bias` per block,
+/// `simd_sum` then one BF16 round. The softplus gate factor is multiplied
+/// into the input row at each k-block at the same FP32 -> BF16 rounding point
+/// `lagunaGateProductSoftplusSource` uses, so the contraction is bit-identical
+/// to applying the gate first and then running the stock affine GEMV.
 private func lagunaGatedAffineOProjSource(heads: Int) -> String {
     """
     constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
@@ -3162,12 +2655,13 @@ private let lagunaGatedAffineOProjKernels: [Int: MLXFast.MLXFastKernel] = {
 }()
 
 /// `DARKBLOOM_FUSED_GATED_AFFINE_OPROJ` (default ON; set "0" to disable).
-/// Locally resolved at +2.53 us/layer (t = 3.63, p = 0.0003, paired ABBA,
-/// FNV-1a fingerprints identical); all inputs ordinary dense arrays with
-/// `ensureRowContiguous: true`, so the non-contiguous-input mechanism behind
-/// the fused-KV-write ranked regression does not apply here. End-to-end
-/// bit-exactness re-verified against a same-box levers-off trace: top-8
-/// step-63 logits identical over a 512-token teacher-forced case.
+/// Fuses the per-head softplus gate product into the native group-32 affine
+/// INT8 o_proj GEMV so the decode attention tail is one dispatch instead of
+/// two. Bit-exact: the gate factor is applied at the same FP32 -> BF16
+/// rounding point as `lagunaGateProductSoftplus`, and the contraction keeps
+/// MLX's affine GEMV geometry and accumulation order exactly. Falls back to
+/// the exact two-dispatch chain whenever the affine o proj is not group-32
+/// INT8 (the NVFP4 tail layers) or any guard declines.
 let lagunaFusedGatedAffineOProjEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATED_AFFINE_OPROJ"] != "0"
 
@@ -3205,283 +2699,6 @@ func lagunaGatedAffineOProj(
         grid: ((outVec / 8) * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[1, 1, outVec]],
-        outputDTypes: [.bfloat16]
-    )[0]
-}
-
-// MARK: - Norm-folded native-affine QKV projection (one dispatch)
-
-/// Folds the layer's input RMSNorm into the native group-32 affine INT8
-/// `[Q; K; V; G]` GEMV, so the head of the decode attention block is one
-/// dispatch instead of two (`MLXFast.rmsNorm` then MLX's `quantizedMM`).
-///
-/// Counterpart of `lagunaGatedAffineOProjSource` at the other end of the
-/// block, and the INT8 twin of `lagunaFusedQKVProjectionSource`'s norm
-/// prologue, which already absorbs this same RMSNorm for the BF16 weights.
-///
-/// NO GRID-WIDE REDUCTION IS NEEDED. Every `qmv_fast` threadgroup already
-/// reads the whole 2048-wide input row for its own K loop, so each one can
-/// re-derive the row's mean square privately. The redundancy is 4 KB re-read
-/// and one 2048-element reduction per threadgroup against ~24 MB of weight
-/// traffic.
-///
-/// EXACTNESS, both halves.
-///
-/// GEMV half — a textual replica of `affine_qmv_fast<bfloat16_t, 32, 8>`
-/// (`quantized.h`), keeping MLX's dispatch geometry EXACTLY: `bn = 8`,
-/// `group_dims (32, 2, 1)`, `grid_dims (1, rows / 8, 1)`, two simdgroups of
-/// four rows, `values_per_thread = 8`, `block_size = 256`, one FP32
-/// accumulator per row stepped k-block by k-block, `scale * accum + sum *
-/// bias` per block, `simd_sum` then one BF16 round. Geometry is deliberately
-/// not a knob: a retile that is bit-exact on paper still moves differently
-/// between Apple Silicon generations.
-///
-/// NORM half — `rms_single_row<bfloat16_t, N_READS = 4>` at `axis_size ==
-/// 2048`, which MLX dispatches with 512 threads (sixteen simdgroups). This
-/// kernel has only 64 threads, so it EMULATES that grouping rather than
-/// approximating the mean square:
-///  * Virtual thread `vt` owns elements `4vt ..< 4vt + 4` and lives in
-///    virtual simdgroup `vt / 32` at virtual lane `vt % 32`. Real thread `r`
-///    runs the eight virtual threads `vt = r + 64j`, `j = 0 ..< 8`, in
-///    SEPARATE accumulators — never summed together — so no add is regrouped.
-///  * `vt = r + 64j` has virtual lane `r % 32` (the real lane) and virtual
-///    simdgroup `r / 32 + 2j` (the real simdgroup plus `2j`). So the real
-///    32-lane `simd_sum(acc_j)` reduces exactly the 32 values MLX's
-///    `simd_sum` reduces for virtual simdgroup `simd_gid + 2j`, in the same
-///    order. Real simdgroup 0 covers the even virtual simdgroups and real
-///    simdgroup 1 the odd ones, so all sixteen partials land in `local_sums`
-///    exactly once.
-///  * `local_sums[0 ..< 32]` is zeroed first (MLX zeroes it from virtual
-///    simdgroup 0), the cross-simdgroup fold is the same
-///    `simd_sum(local_sums[lane])` on 32 lanes, and the constant is the same
-///    `metal::precise::rsqrt(acc / 2048 + 1e-6)`.
-///  * The output expression is MLX's verbatim
-///    `w[i] * static_cast<T>(xcache[i] * inv_mean)`: one BF16 round inside
-///    the cast, one on the BF16xBF16 store. `xcache` is re-read from device
-///    instead of held in registers — the same immutable bytes, the same
-///    `float(bfloat)` promotion, so the value is identical.
-///
-/// Two ways to hand the normalized row to the K loop, both bit-exact and
-/// both selectable (`DARKBLOOM_NORM_AFFINE_QKV_STAGE`):
-///  * `tg` stages it in 4 KB of THREADGROUP memory. Measured a large LOSS
-///    (-32.9 +/- 2.8 us/layer, t = -11.7, 0/16 rounds): 4 KB per 64-thread
-///    threadgroup caps resident threadgroups per core, and the stock
-///    `qmv_fast` it replaces allocates NO threadgroup memory at all, so the
-///    occupancy it gives up costs far more than the dispatch it saves.
-///  * `inline` (default) keeps threadgroup memory down to the 132 bytes the
-///    reduction itself needs and re-derives each lane's eight normalized
-///    values inside the K loop from the two 4 KB rows (`residual`,
-///    `norm_weight`), which are L1-resident after the reduction pass. Same
-///    expression, same rounding, one fewer barrier, no occupancy cost.
-private func lagunaNormAffineQKVSource(rows: Int, staged: Bool) -> String {
-    let stagedNormalize = """
-            for (uint j = 0; j < virtual_per_thread; ++j) {
-                uint base = (lid + j * real_threads) * n_reads;
-                for (uint i = 0; i < n_reads; ++i) {
-                    norm_row[base + i] =
-                        norm_weight[base + i] *
-                        bfloat(float(residual[base + i]) * laguna_inv_mean);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        """
-    let scratch =
-        staged
-        ? "threadgroup bfloat norm_row[axis_size];"
-        : "// inline: no staged row, no third barrier"
-    let normalize = staged ? stagedNormalize : ""
-    let loadValue =
-        staged
-        ? "float value = float(norm_row[column + i]);"
-        : """
-        float value = float(bfloat(
-                        norm_weight[column + i] *
-                        bfloat(float(residual[column + i]) * laguna_inv_mean)));
-        """
-    return """
-    \(lagunaNormAffineQKVBody(rows: rows, scratch: scratch, normalize: normalize, loadValue: loadValue))
-    """
-}
-
-private func lagunaNormAffineQKVBody(
-    rows: Int, scratch: String, normalize: String, loadValue: String
-) -> String {
-    """
-    constexpr uint axis_size = \(LagunaConstants.hiddenSize);
-    constexpr uint out_vec_size = \(rows);
-    constexpr uint n_reads = 4;                 // RMS_N_READS
-    constexpr uint norm_threads = axis_size / n_reads;   // 512 virtual threads
-    constexpr uint real_threads = 64;
-    constexpr uint virtual_per_thread = norm_threads / real_threads;  // 8
-    constexpr uint simd_size = 32;
-    constexpr float norm_eps = 1.0e-6f;
-    constexpr uint values_per_thread = 8;       // pack_factor 4 * packs_per_thread 2
-    constexpr uint block_size = 256;            // values_per_thread * SIMD_SIZE
-    constexpr uint results_per_simdgroup = 4;
-    constexpr uint num_simdgroups = 2;
-    constexpr uint group_size = 32;
-    constexpr uint scale_step_per_thread = group_size / values_per_thread;
-    constexpr uint in_vec_size_g = axis_size / group_size;
-
-    uint tile = threadgroup_position_in_grid.x;
-    uint lid = thread_position_in_threadgroup.x;
-    uint simd_gid = simdgroup_index_in_threadgroup;
-    uint simd_lid = thread_index_in_simdgroup;
-
-    threadgroup float local_inv_mean[1];
-    threadgroup float local_sums[simd_size];
-    \(scratch)
-
-    // --- rms_single_row replica, 512 virtual threads over 64 real ones ---
-    if (lid < simd_size) {
-        local_sums[lid] = 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint j = 0; j < virtual_per_thread; ++j) {
-        uint base = (lid + j * real_threads) * n_reads;
-        float acc = 0.0f;
-        for (uint i = 0; i < n_reads; ++i) {
-            float xi = float(residual[base + i]);
-            acc += xi * xi;
-        }
-        acc = simd_sum(acc);
-        if (simd_lid == 0) {
-            local_sums[simd_gid + num_simdgroups * j] = acc;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (simd_gid == 0) {
-        float total = simd_sum(local_sums[simd_lid]);
-        if (simd_lid == 0) {
-            local_inv_mean[0] =
-                metal::precise::rsqrt(total / float(axis_size) + norm_eps);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float laguna_inv_mean = local_inv_mean[0];
-    \(normalize)
-    // --- affine_qmv_fast replica over the normalized row ---
-    uint out_row = tile * (num_simdgroups * results_per_simdgroup) +
-        simd_gid * results_per_simdgroup;
-
-    const device uint8_t* ws = (const device uint8_t*)weight_codes +
-        out_row * axis_size + simd_lid * values_per_thread;
-    const device bfloat* sc = weight_scales + out_row * in_vec_size_g +
-        simd_lid / scale_step_per_thread;
-    const device bfloat* bs = weight_biases + out_row * in_vec_size_g +
-        simd_lid / scale_step_per_thread;
-
-    thread float x_thread[values_per_thread];
-    thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
-
-    uint column = simd_lid * values_per_thread;
-    for (uint k = 0; k < axis_size; k += block_size) {
-        float sum = 0.0f;
-        for (uint i = 0; i < values_per_thread; ++i) {
-            \(loadValue)
-            sum += value;
-            x_thread[i] = value;
-        }
-
-        for (uint row = 0; row < results_per_simdgroup; ++row) {
-            const device uint8_t* wl = ws + row * axis_size;
-            float scale = float(sc[row * in_vec_size_g]);
-            float bias = float(bs[row * in_vec_size_g]);
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
-                accum += x_thread[i] * wl[i];
-            }
-            result[row] += scale * accum + sum * bias;
-        }
-
-        ws += block_size;
-        sc += block_size / group_size;
-        bs += block_size / group_size;
-        column += block_size;
-    }
-
-    for (uint row = 0; row < results_per_simdgroup; ++row) {
-        result[row] = simd_sum(result[row]);
-        if (simd_lid == 0) {
-            projected[out_row + row] = bfloat(result[row]);
-        }
-    }
-    """
-}
-
-/// `DARKBLOOM_NORM_AFFINE_QKV_STAGE` = `inline` (default) or `tg`.
-private let lagunaNormAffineQKVStaged =
-    ProcessInfo.processInfo.environment["DARKBLOOM_NORM_AFFINE_QKV_STAGE"] == "tg"
-
-/// One kernel per reachable `[Q; K; V; (G)]` row count: both head families,
-/// gate rows folded in or not (`DARKBLOOM_NATIVE_AFFINE_GPROJ=0`). All four
-/// are multiples of 8, so `qmv`'s `fast` predicate holds and no tail
-/// threadgroup is ever dispatched.
-private let lagunaNormAffineQKVKernels: [Int: MLXFast.MLXFastKernel] = {
-    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
-    let kvRows = 2 * LagunaConstants.numKeyValueHeads * LagunaConstants.headDim
-    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
-        for gateRows in [0, heads] {
-            let rows = heads * LagunaConstants.headDim + kvRows + gateRows
-            if kernels[rows] != nil { continue }
-            let staged = lagunaNormAffineQKVStaged
-            kernels[rows] = MLXFast.metalKernel(
-                name:
-                    "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_"
-                    + (staged ? "tg" : "inl") + "_v1",
-                inputNames: [
-                    "residual", "norm_weight", "weight_codes", "weight_scales",
-                    "weight_biases",
-                ],
-                outputNames: ["projected"],
-                source: lagunaNormAffineQKVSource(rows: rows, staged: staged),
-                ensureRowContiguous: true
-            )
-        }
-    }
-    return kernels
-}()
-
-/// `DARKBLOOM_FUSED_NORM_AFFINE_QKV` (default OFF; set "1" to enable).
-let lagunaFusedNormAffineQKVEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_NORM_AFFINE_QKV"] == "1"
-
-/// Input RMSNorm + native-affine INT8 `[Q; K; V; (G)]` projection in one
-/// dispatch, or `nil` when any shape, dtype or wire-format guard declines
-/// (caller then runs the exact two-dispatch chain).
-func lagunaNormAffineQKV(
-    residual: MLXArray,
-    normWeight: MLXArray,
-    codes: MLXArray,
-    scales: MLXArray,
-    biases: MLXArray,
-    rows: Int
-) -> MLXArray? {
-    guard let kernel = lagunaNormAffineQKVKernels[rows] else { return nil }
-    let hidden = LagunaConstants.hiddenSize
-    guard residual.dtype == .bfloat16,
-        residual.shape == [1, 1, hidden],
-        normWeight.dtype == .bfloat16,
-        normWeight.shape == [hidden],
-        codes.dtype == .uint32,
-        codes.shape == [rows, hidden / 4],
-        scales.dtype == .bfloat16,
-        scales.shape == [rows, hidden / 32],
-        biases.dtype == .bfloat16,
-        biases.shape == [rows, hidden / 32]
-    else {
-        return nil
-    }
-
-    lagunaTrace("norm+affine qkv qmv r\(rows)")
-    return kernel(
-        [residual, normWeight, codes, scales, biases],
-        grid: ((rows / 8) * 64, 1, 1),
-        threadGroup: (64, 1, 1),
-        outputShapes: [[1, 1, rows]],
         outputDTypes: [.bfloat16]
     )[0]
 }
@@ -3821,43 +3038,17 @@ final class LagunaRuntimeAttention: Module {
             if lagunaUseNativeAffineQKV(layer: layerIdx),
                 let fusedAffine = _nativeAffineQKV
             {
-                // One dispatch for the input RMSNorm AND the INT8 projection
-                // (see `lagunaNormAffineQKVSource`). Requires the group-32
-                // affine INT8 wire format AND the gate rows folded into the
-                // bank, so no consumer downstream of here needs a
-                // device-visible normalized row; the NVFP4 tail layers and
-                // any `g_proj`-disabled ablation keep the separate norm.
-                var fusedQKV: MLXArray?
-                if lagunaFusedNormAffineQKVEnabled,
-                    fusedAffine.mode == .affine, fusedAffine.bits == 8,
-                    fusedAffine.groupSize == 32,
-                    _nativeAffineQKVGateRows == nHeads,
-                    inputNorm.eps == Float(LagunaConstants.rmsNormEpsilon),
-                    let affineBiases = fusedAffine.biases
-                {
-                    fusedQKV = lagunaNormAffineQKV(
-                        residual: input,
-                        normWeight: inputNorm.weight,
-                        codes: fusedAffine.packedCodes,
-                        scales: fusedAffine.scales,
-                        biases: affineBiases,
-                        rows: fusedAffine.originalShape[0])
-                }
-                // Only materialized when the fused kernel declined; the gate
-                // branches below that read it are unreachable when it fired.
-                let normalized = fusedQKV ?? inputNorm(input)
-                let qkv =
-                    fusedQKV
-                    ?? quantizedMM(
-                        normalized,
-                        fusedAffine.packedCodes,
-                        scales: fusedAffine.scales,
-                        biases: fusedAffine.biases,
-                        transpose: true,
-                        groupSize: fusedAffine.groupSize,
-                        bits: fusedAffine.bits,
-                        mode: fusedAffine.mode
-                    )
+                let normalized = inputNorm(input)
+                let qkv = quantizedMM(
+                    normalized,
+                    fusedAffine.packedCodes,
+                    scales: fusedAffine.scales,
+                    biases: fusedAffine.biases,
+                    transpose: true,
+                    groupSize: fusedAffine.groupSize,
+                    bits: fusedAffine.bits,
+                    mode: fusedAffine.mode
+                )
                 let queryDim = nHeads * headDim
                 let kvDim = nKVHeads * headDim
                 let gateStart = queryDim + 2 * kvDim
@@ -4010,48 +3201,8 @@ final class LagunaRuntimeAttention: Module {
             nHeads == LagunaConstants.fullAttentionHeads &&
             qkRoPEAngles?.shape == [1, 1, lagunaRoPEAngleAtlasLength, headDim / 2]
 
-        // Decode KV-cache write folded into the QK-norm/RoPE dispatch. The
-        // kernel lands the K row it already computed, plus a byte copy of the
-        // V row, at the addresses the cache's two `slice_update` dispatches
-        // would have written; the cache then advances its host-side `offset`
-        // (and ring cursor) exactly as `update` would, so the trusted
-        // worker's per-step offset audit is unaffected. Any shape, layout or
-        // cache state outside the accepted contract falls through to the
-        // stock kernel + `attentionWithCacheUpdate` below.
-        var fusedKVCacheState: (keys: MLXArray, values: MLXArray)?
-        if lagunaFusedKVWriteEnabled,
-            useFusedFullQKNormYaRN || useFusedSlidingQKNormRoPE,
-            let qkRoPEAngles,
-            let ringCache = cache as? BaseKVCache,
-            values.dtype == .bfloat16,
-            values.shape == [1, 1, nKVHeads * headDim],
-            let target = ringCache.fusedDecodeWriteTarget(),
-            lagunaFusedKVWriteAccepts(
-                target: target, kvHeads: nKVHeads, headDim: headDim, rawValues: values)
-        {
-            let rotated =
-                useFusedFullQKNormYaRN
-                ? lagunaFullQKNormYaRNKVWrite(
-                    rawQueries: queries, rawKeys: keys, rawValues: values,
-                    queryWeight: qNorm.weight, keyWeight: kNorm.weight,
-                    angles: qkRoPEAngles, target: target)
-                : lagunaSlidingQKNormRoPEKVWrite(
-                    rawQueries: queries, rawKeys: keys, rawValues: values,
-                    queryWeight: qNorm.weight, keyWeight: kNorm.weight,
-                    angles: qkRoPEAngles, target: target)
-            guard let committed = ringCache.commitFusedDecodeWrite(target) else {
-                preconditionFailure(
-                    "fused KV write target was invalidated before its commit")
-            }
-            queries = rotated
-            fusedKVCacheState = (keys: committed.0, values: committed.1)
-        }
-
-        var qkNormRoPEFused = fusedKVCacheState != nil
-        if fusedKVCacheState != nil {
-            // K and V are already in the cache; nothing left to normalize,
-            // rotate or reshape on this path.
-        } else if useFusedFullQKNormYaRN, let qkRoPEAngles {
+        var qkNormRoPEFused = false
+        if useFusedFullQKNormYaRN, let qkRoPEAngles {
             (queries, keys) = lagunaFullQKNormYaRN(
                 rawQueries: queries,
                 rawKeys: keys,
@@ -4107,40 +3258,24 @@ final class LagunaRuntimeAttention: Module {
         // `[B, H, 1, D]` have the same contiguous byte order. Reshape
         // directly so decode does not carry a no-op transpose view through
         // the lazy graph. Multi-token calls still require the real axis swap.
-        if fusedKVCacheState == nil {
-            values =
-                L == 1
-                ? values.reshaped(B, nKVHeads, L, headDim)
-                : values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
-        }
+        values =
+            L == 1
+            ? values.reshaped(B, nKVHeads, L, headDim)
+            : values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
 
         if !qkNormRoPEFused {
             queries = applyRotaryPosition(rope, to: queries, cache: cache)
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
-        let attended: MLXArray
-        if let fusedKVCacheState {
-            // The cache update already happened inside the QK-norm dispatch;
-            // `commitFusedDecodeWrite` returned the very slices
-            // `cache.update` would have returned for this token.
-            attended = MLXFast.scaledDotProductAttention(
-                queries: queries,
-                keys: fusedKVCacheState.keys,
-                values: fusedKVCacheState.values,
-                scale: scale,
-                mask: mask
-            )
-        } else {
-            attended = attentionWithCacheUpdate(
-                queries: queries,
-                keys: keys,
-                values: values,
-                cache: cache,
-                scale: scale,
-                mask: mask
-            )
-        }
+        let attended = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: cache,
+            scale: scale,
+            mask: mask
+        )
         // SDPA returns `[B, H, L, D]`. When `L == 1`, flattening its
         // contiguous head-major payload directly produces the exact
         // `[B, 1, H*D]` byte order; the transpose only changes singleton-axis
@@ -4195,11 +3330,11 @@ final class LagunaRuntimeAttention: Module {
                 output.shape == [1, 1, nHeads * headDim],
                 projectedGate.shape == [1, 1, nHeads]
             {
-                // Raw logits + gated GEMV: ONE dispatch for the softplus
+                // Raw logits + gated affine GEMV: ONE dispatch for the softplus
                 // chain, the broadcast product AND the INT8 contraction (see
                 // `lagunaGatedAffineOProjSource`). Only the group-32 affine
-                // INT8 wire format is served; the NVFP4 tail layers fall
-                // through to the two-dispatch chain below.
+                // INT8 wire format is served; the NVFP4 tail layers and any
+                // guard decline fall through to the two-dispatch chain below.
                 if lagunaFusedGatedAffineOProjEnabled, !gateIsActivated,
                     affineWO.mode == .affine, affineWO.bits == 8,
                     affineWO.groupSize == 32,
@@ -4468,28 +3603,6 @@ let lagunaNvfp4NibbleSplit: Int = {
     else { return 1 }
     return value
 }()
-/// `DARKBLOOM_NVFP4_SCALE_CARRY` (default `1` = carry sign-fold; set `0` for
-/// the stock select form): builds the e4m3 scale's half bit pattern as
-/// `ushort((uint(bits) + (bits & 128u)) << 7)`. For sign-set bytes,
-/// `bits + 128 = 256 + (bits & 127)` and `256 << 7 = 0x8000` lands the sign
-/// on half bit 15 while clearing bit 14; for sign-clear bytes the add is the
-/// identity. Replaces the compare+select+negate chain with one integer add:
-/// 7 -> 5 real AIR ops per scale decode (`xcrun metal -fno-fast-math -S`;
-/// the ternary does NOT fuse at AIR level). The returned float is
-/// bit-identical for all 256 bytes in both scale-fold variants (exhaustive C
-/// bit-compare, with the half emulation itself validated against hardware
-/// over all 65536 patterns), the 16-bit pattern identity is machine-checked
-/// in Lean 4 (`bv_decide`, both the uint-add-then-truncate and direct 16-bit
-/// readings pinned against each other), and the kernel-level FNV-1a output
-/// fingerprint is identical across both settings over 30 interleaved
-/// microbench processes on real-shape banks. Paired local timing bounds the
-/// effect within the contended-box ±1% noise floor (not a regression); the
-/// sign claim rests on strictly-fewer-instructions in an ALU-bound kernel.
-/// Applies only with the scale fold ON; the fold-OFF ablation arm keeps the
-/// stock body.
-let lagunaNvfp4ScaleCarry: Bool =
-    ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_CARRY"] != "0"
-
 private let lagunaSharedSwiGLUQMVHeader: String = {
     // The two halves of one power-of-two regrouping. They MUST move together:
     // the scale absorbs `2^14` exactly when the weights stop applying it.
@@ -4536,22 +3649,11 @@ private let lagunaSharedSwiGLUQMVHeader: String = {
                         ((c & 0x70007000u) >> 3) | (c & 0x80008000u);
             """
     }
-    // Carry sign-fold pairs only with the fold-ON scale; the ablation arm
-    // (fold OFF) keeps the shipped select body character-for-character.
-    let scaleCarryActive = lagunaNvfp4ScaleCarry && lagunaNvfp4ScaleFoldEnabled
-    let scaleRawExpression =
-        scaleCarryActive
-        ? "ushort((uint(bits) + (bits & 128u)) << 7)"
-        : "ushort(bits & 127) << 7"
-    let scaleSignExpression =
-        scaleCarryActive
-        ? "converted"
-        : "(bits & 128) ? -converted : converted"
     return """
     static inline float laguna_nvfp4_scale(uint8_t bits) {
-        ushort raw = \(scaleRawExpression);
+        ushort raw = ushort(bits & 127) << 7;
         half converted = as_type<half>(raw);
-    \(scale256)    half signed_value = \(scaleSignExpression);
+    \(scale256)    half signed_value = (bits & 128) ? -converted : converted;
     \(scaleTail)
     }
 

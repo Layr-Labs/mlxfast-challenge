@@ -160,18 +160,20 @@ static inline uint32_t fp4nv_pack4(const thread uint8_t* p) {
 // when walking those four bytes.
 template <typename T>
 static inline void fp4nv_decode8(uint32_t c, float scale, thread T* out) {
-  const float2 v0 = float2(as_type<half2>(
-                        ((c & 0x00070007u) << 9) | ((c & 0x00080008u) << 12))) *
-      scale;
-  const float2 v1 = float2(as_type<half2>(
-                        ((c & 0x00700070u) << 5) | ((c & 0x00800080u) << 8))) *
-      scale;
-  const float2 v2 = float2(as_type<half2>(
-                        ((c & 0x07000700u) << 1) | ((c & 0x08000800u) << 4))) *
-      scale;
-  const float2 v3 =
-      float2(as_type<half2>(((c & 0x70007000u) >> 3) | (c & 0x80008000u))) *
-      scale;
+  // Split-nibble decode: identical half bit patterns to stock with fewer
+  // integer ops and fewer live constant registers. See fp_quantized.cpp
+  // qdot() for the bit-exactness argument.
+  const uint32_t xe = c & 0x0F0F0F0Fu;
+  const uint32_t ge = xe | (xe << 3);
+  const uint32_t yo = c & 0xF0F0F0F0u;
+  const uint32_t go = yo | (yo >> 3);
+  const float2 v0 =
+      float2(as_type<half2>((ge << 9) & 0x8E008E00u)) * scale;
+  const float2 v1 =
+      float2(as_type<half2>((go << 8) & 0x8E008E00u)) * scale;
+  const float2 v2 =
+      float2(as_type<half2>((ge << 1) & 0x8E008E00u)) * scale;
+  const float2 v3 = float2(as_type<half2>(go & 0x8E008E00u)) * scale;
   out[0] = T(v0.x);
   out[1] = T(v1.x);
   out[2] = T(v2.x);
