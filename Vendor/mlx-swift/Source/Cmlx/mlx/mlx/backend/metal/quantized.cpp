@@ -1393,7 +1393,7 @@ int darkbloom_stage_bm128_variant() {
   static const int v = [] {
     auto s = env::get_var("DARKBLOOM_STAGE_BM128", "");
     if (s.empty()) {
-      return 4;
+      return 3;
     }
     if (s == "1") {
       return 1;
