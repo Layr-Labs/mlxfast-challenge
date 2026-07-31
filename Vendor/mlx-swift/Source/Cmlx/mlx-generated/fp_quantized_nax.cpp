@@ -1760,10 +1760,15 @@ template <
         static_cast<uint32_t>(
             tid.y * (experts / expert_groups) + expert_slot);
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid == 0) {
-      bounds[0] = laguna_sorted_lower_bound(indices, M, expert);
-      bounds[1] = laguna_sorted_lower_bound(indices, M, expert + 1);
+    // `bounds` is disjoint from the reused weight/SwiGLU tile, and the
+    // barrier below already prevents any subsequent shared-memory reuse until
+    // every thread has finished the preceding expert/chunk.  The leading
+    // barrier used here was therefore redundant.  Compute the two independent
+    // searches concurrently as well; both write distinct words and the
+    // following barrier publishes the exact same pair to the threadgroup.
+    if (lid < 2) {
+      bounds[lid] =
+          laguna_sorted_lower_bound(indices, M, expert + lid);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1791,7 +1796,13 @@ template <
           simd_lane_id);
 
       for (int k = 0; k < K_it; ++k) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // The first load is already protected by the published-bounds barrier
+        // above (first chunk) or by the post-MMA barrier below (later chunks).
+        // Keep the barrier between K tiles, where it prevents the loader from
+        // overwriting Ws while another SIMD group still consumes that tile.
+        if (k != 0) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         loader_w.load_unsafe();
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

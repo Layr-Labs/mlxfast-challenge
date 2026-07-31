@@ -776,6 +776,108 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 }
 
+/// Sliding-window cache whose serial-decode steps store K and V through one
+/// slice-update dispatch. The packed ring is
+/// `[1, kvHeads, maxCacheSize, 2, headDim]`; K and V are adjacent per slot,
+/// and SDPA reads squeezed strided views with the same values and row order.
+/// Every non-single-token path materializes the classic split arrays and
+/// delegates to `RotatingKVCache` unchanged.
+public class LagunaPackedRotatingKVCache: RotatingKVCache {
+    /// Nil through prefill; populated on the first serial decode update.
+    var packed: MLXArray?
+
+    public override func innerState() -> [MLXArray] {
+        ([self.keys, self.values, self.packed].compactMap { $0 })
+    }
+
+    /// `kv` is `[1, H, 1, 2, D]` with K at pair index zero and V at one.
+    /// Returns views `[1, H, length, D]`, or nil when the inherited state
+    /// cannot be migrated without changing its ring semantics.
+    public func updatePacked(_ kv: MLXArray) -> (MLXArray, MLXArray)? {
+        guard kv.ndim == 5, kv.dim(0) == 1, kv.dim(2) == 1, kv.dim(3) == 2
+        else { return nil }
+        if packed == nil {
+            guard migrateToPacked(like: kv) else { return nil }
+        }
+        if idx == maxCacheSize {
+            idx = keep
+        }
+        packed![.ellipsis, idx ..< (idx + 1), 0..., 0...] = kv
+        offset += 1
+        idx += 1
+        let length = min(offset, maxCacheSize)
+        return (
+            packed![0..., 0..., ..<length, 0, 0...],
+            packed![0..., 0..., ..<length, 1, 0...]
+        )
+    }
+
+    private func migrateToPacked(like kv: MLXArray) -> Bool {
+        let kvHeads = kv.dim(1)
+        let headDim = kv.dim(4)
+        if let keys = self.keys, let values = self.values {
+            let length = keys.dim(2)
+            guard length <= maxCacheSize, idx == length,
+                keys.dim(0) == 1, keys.dim(1) == kvHeads,
+                keys.dim(3) == headDim, values.dim(3) == headDim,
+                keys.dtype == kv.dtype, values.dtype == kv.dtype
+            else { return false }
+            let buffer = MLXArray.zeros(
+                [1, kvHeads, maxCacheSize, 2, headDim], dtype: kv.dtype)
+            buffer[0..., 0..., ..<length, 0, 0...] = keys
+            buffer[0..., 0..., ..<length, 1, 0...] = values
+            packed = buffer
+            self.keys = nil
+            self.values = nil
+        } else {
+            packed = MLXArray.zeros(
+                [1, kvHeads, maxCacheSize, 2, headDim], dtype: kv.dtype)
+        }
+        return true
+    }
+
+    /// Restore the parent representation before any inherited slow path.
+    func materializeUnpacked() {
+        guard let packed else { return }
+        let length = min(offset, maxCacheSize)
+        self.keys = packed[0..., 0..., ..<length, 0, 0...]
+        self.values = packed[0..., 0..., ..<length, 1, 0...]
+        self.packed = nil
+    }
+
+    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        if packed != nil {
+            materializeUnpacked()
+        }
+        return super.update(keys: keys, values: values)
+    }
+
+    public override var state: [MLXArray] {
+        get {
+            if packed != nil {
+                materializeUnpacked()
+            }
+            return super.state
+        }
+        set {
+            packed = nil
+            super.state = newValue
+        }
+    }
+
+    public override var isTrimmable: Bool {
+        super.isTrimmable
+    }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        if packed != nil, n > 0 {
+            materializeUnpacked()
+        }
+        return super.trim(n)
+    }
+}
+
 /// Pick the supported quantization group size ({32, 64, 128}) closest to the
 /// requested one whose value divides both head dims. Returns nil when no
 /// supported group size is compatible. Upstream 01b8624.
