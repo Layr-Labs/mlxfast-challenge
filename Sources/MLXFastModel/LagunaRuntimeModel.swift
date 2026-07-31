@@ -3513,6 +3513,272 @@ func lagunaTailNormQKVGate(
     return (outputs[0], outputs[1])
 }
 
+/// Rows of layer 0's fused `[Q; K; V; G]` INT8 bank with the per-head gate
+/// folded in: 48 * 128 + 2 * 8 * 128 + 48 = 8240 (layer 0 is full
+/// attention, so `heads == LagunaConstants.fullAttentionHeads`).
+private let lagunaEmbedNormAffineQKVRows =
+    LagunaConstants.fullAttentionHeads * LagunaConstants.headDim
+    + 2 * LagunaConstants.numKeyValueHeads * LagunaConstants.headDim
+    + LagunaConstants.fullAttentionHeads
+
+
+/// Embed-gather counterpart of `lagunaNormAffineQKVSource` (default `inline`
+/// variant) for layer 0's decode step. When the norm+affine-QKV arm fires
+/// for layer 0 today, the row it normalizes still arrives via a SEPARATE
+/// `embedTokens(inputs)` gather dispatch; this kernel folds that gather into
+/// the same dispatch, so layer 0's decode front-end is ONE kernel instead of
+/// two. It takes `token_ids` + `embed_weight` INSTEAD of the residual row
+/// and produces two outputs: the raw gathered row (`hidden`, feeding layer
+/// 0's residual path byte-for-byte) and the projected bank (`projected`,
+/// bit-identical to `lagunaNormAffineQKV`'s output over the gathered row).
+///
+/// NORM half — the twin's exact `rms_single_row<bfloat16_t, N_READS = 4>`
+/// emulation at 64 real threads (512 virtual threads at four elements each,
+/// separate accumulators per virtual thread, one `simd_sum` per virtual
+/// simdgroup, the `simd_gid == 0` cross-fold, and
+/// `metal::precise::rsqrt(total / 2048 + 1e-6)`), with exactly one change:
+/// every `residual[i]` read becomes `table_row[i]`, where `table_row` is the
+/// token's 2048-row gathered with the same idiom `lagunaEmbedNormKernel`
+/// uses (`embed_weight + size_t(uint(token_ids[0])) * axis_size`). Those are
+/// the exact bytes the stock gather writes to the residual row, so the sum
+/// of squares, the inverse mean, and the inline normalized values are
+/// bit-identical to the twin's. The norm loop touches every element of the
+/// row exactly once (real thread `lid`, virtual step `j` covers
+/// `(lid + 64j) * 4 ..< +4`), so the `hidden` output is written from the
+/// same loaded registers in the same loop at zero extra read cost — the
+/// exact gather bytes.
+///
+/// QMV half — the twin's inline `affine_qmv_fast<bfloat16_t, 32, 8>`
+/// replica UNCHANGED: same 64-thread threadgroups, two simdgroups of four
+/// rows, `out_vec_size / 8` tiles, values_per_thread 8, block_size 256, the
+/// same scale/bias group arithmetic, the same per-block
+/// `result[row] += scale * accum + sum * bias` in ascending k, one
+/// `simd_sum`, one BF16 round per output row. The inline normalized-value
+/// expression is the twin's, reading `table_row` instead of `residual`.
+///
+/// Only the inline norm variant is mirrored (the twin's default); the
+/// `DARKBLOOM_NORM_AFFINE_QKV_STAGE=tg` staged ablation is not replicated —
+/// both variants are bit-identical, so the inline form is never a numerics
+/// risk. `DARKBLOOM_FUSED_EMBED_AFFINE_QKV=0` ablates to the stock gather +
+/// the plain norm-affine-QKV arm inside the same binary.
+private let lagunaEmbedNormAffineQKVKernel = MLXFast.metalKernel(
+    name: "laguna_embed_norm_affine_qkv_bf16_h48_v1",
+    inputNames: [
+        "token_ids", "embed_weight", "norm_weight", "weight_codes",
+        "weight_scales", "weight_biases",
+    ],
+    outputNames: ["hidden", "projected"],
+    source: """
+        constexpr uint axis_size = 2048;
+        constexpr uint out_vec_size = 8240;
+        constexpr uint n_reads = 4;                 // RMS_N_READS
+        constexpr uint norm_threads = axis_size / n_reads;   // 512 virtual threads
+        constexpr uint real_threads = 64;
+        constexpr uint virtual_per_thread = norm_threads / real_threads;  // 8
+        constexpr uint simd_size = 32;
+        constexpr float norm_eps = 1.0e-6f;
+        constexpr uint values_per_thread = 8;       // pack_factor 4 * packs_per_thread 2
+        constexpr uint block_size = 256;            // values_per_thread * SIMD_SIZE
+        constexpr uint results_per_simdgroup = 4;
+        constexpr uint num_simdgroups = 2;
+        constexpr uint group_size = 32;
+        constexpr uint scale_step_per_thread = group_size / values_per_thread;
+        constexpr uint in_vec_size_g = axis_size / group_size;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint lid = thread_position_in_threadgroup.x;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+        uint simd_lid = thread_index_in_simdgroup;
+
+        // The gather idiom of `lagunaEmbedNormKernel`: the token's 2048-row,
+        // read straight from the embedding table. These are the exact bytes
+        // the stock `embedTokens(inputs)` gather would have written.
+        uint token = uint(token_ids[0]);
+        const device bfloat* table_row =
+            embed_weight + size_t(token) * axis_size;
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+        // inline: no staged row, no third barrier
+
+        // --- rms_single_row replica, 512 virtual threads over 64 real ones ---
+        if (lid < simd_size) {
+            local_sums[lid] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint j = 0; j < virtual_per_thread; ++j) {
+            uint base = (lid + j * real_threads) * n_reads;
+            float acc = 0.0f;
+            for (uint i = 0; i < n_reads; ++i) {
+                // The norm loop covers each row element exactly once, so the
+                // residual-path output is written from the same registers.
+                bfloat gathered = table_row[base + i];
+                hidden[base + i] = gathered;
+                float xi = float(gathered);
+                acc += xi * xi;
+            }
+            acc = simd_sum(acc);
+            if (simd_lid == 0) {
+                local_sums[simd_gid + num_simdgroups * j] = acc;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_gid == 0) {
+            float total = simd_sum(local_sums[simd_lid]);
+            if (simd_lid == 0) {
+                local_inv_mean[0] =
+                    metal::precise::rsqrt(total / float(axis_size) + norm_eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float laguna_inv_mean = local_inv_mean[0];
+
+        // --- affine_qmv_fast replica over the normalized row ---
+        uint out_row = tile * (num_simdgroups * results_per_simdgroup) +
+            simd_gid * results_per_simdgroup;
+
+        const device uint8_t* ws = (const device uint8_t*)weight_codes +
+            out_row * axis_size + simd_lid * values_per_thread;
+        const device bfloat* sc = weight_scales + out_row * in_vec_size_g +
+            simd_lid / scale_step_per_thread;
+        const device bfloat* bs = weight_biases + out_row * in_vec_size_g +
+            simd_lid / scale_step_per_thread;
+
+        thread float x_thread[values_per_thread];
+        thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        uint column = simd_lid * values_per_thread;
+        for (uint k = 0; k < axis_size; k += block_size) {
+            float sum = 0.0f;
+            for (uint i = 0; i < values_per_thread; ++i) {
+                float value = float(bfloat(
+                                norm_weight[column + i] *
+                                bfloat(float(table_row[column + i]) * laguna_inv_mean)));
+                sum += value;
+                x_thread[i] = value;
+            }
+
+            for (uint row = 0; row < results_per_simdgroup; ++row) {
+                const device uint8_t* wl = ws + row * axis_size;
+                float scale = float(sc[row * in_vec_size_g]);
+                float bias = float(bs[row * in_vec_size_g]);
+                float accum = 0.0f;
+                for (uint i = 0; i < values_per_thread; ++i) {
+                    accum += x_thread[i] * wl[i];
+                }
+                result[row] += scale * accum + sum * bias;
+            }
+
+            ws += block_size;
+            sc += block_size / group_size;
+            bs += block_size / group_size;
+            column += block_size;
+        }
+
+        for (uint row = 0; row < results_per_simdgroup; ++row) {
+            result[row] = simd_sum(result[row]);
+            if (simd_lid == 0) {
+                projected[out_row + row] = bfloat(result[row]);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// `DARKBLOOM_FUSED_EMBED_AFFINE_QKV` (default ON — folds layer 0's decode
+/// embed gather into the norm+affine-QKV dispatch; set "0" to ablate to the
+/// separate gather + plain `lagunaNormAffineQKV` arm).
+private let lagunaFusedEmbedAffineQKVEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_EMBED_AFFINE_QKV"] != "0"
+
+/// Embed gather + input RMSNorm + native-affine INT8 `[Q; K; V; G]`
+/// projection for layer 0's single decode token in one dispatch, or `nil`
+/// when any shape, dtype or wire-format guard declines (caller then runs the
+/// exact gather + norm-affine-QKV chain). Bit-identical to that chain; see
+/// the kernel commentary above.
+func lagunaEmbedNormAffineQKV(
+    tokens: MLXArray,
+    embedWeight: MLXArray,
+    normWeight: MLXArray,
+    codes: MLXArray,
+    scales: MLXArray,
+    biases: MLXArray
+) -> (hidden: MLXArray, qkv: MLXArray)? {
+    guard lagunaFusedEmbedAffineQKVEnabled else { return nil }
+    let hidden = LagunaConstants.hiddenSize
+    let rows = lagunaEmbedNormAffineQKVRows
+    guard tokens.dtype == .int32,
+        tokens.shape == [1, 1],
+        embedWeight.dtype == .bfloat16,
+        embedWeight.ndim == 2 && embedWeight.dim(1) == hidden,
+        normWeight.dtype == .bfloat16,
+        normWeight.shape == [hidden],
+        codes.dtype == .uint32,
+        codes.shape == [rows, hidden / 4],
+        scales.dtype == .bfloat16,
+        scales.shape == [rows, hidden / 32],
+        biases.dtype == .bfloat16,
+        biases.shape == [rows, hidden / 32]
+    else {
+        return nil
+    }
+
+    lagunaTrace("embed+norm+affine qkv qmv h48")
+    let outputs = lagunaEmbedNormAffineQKVKernel(
+        [tokens, embedWeight, normWeight, codes, scales, biases],
+        grid: ((rows / 8) * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, hidden], [1, 1, rows]],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
+/// Layer-0 decode entry point for `lagunaEmbedNormAffineQKV`: resolves the
+/// layer's native-affine INT8 `[Q; K; V; G]` bank (gate rows folded in) and
+/// input-norm weight, then dispatches the fused kernel. Returns nil whenever
+/// any precondition of the plain norm-affine-QKV arm does not hold, so the
+/// caller keeps the exact chain that arm would have run.
+private func lagunaLayer0EmbedNormAffineQKV(
+    tokens: MLXArray,
+    embedWeight: MLXArray,
+    layer0: LagunaRuntimeDecoderLayer
+) -> (hidden: MLXArray, qkv: MLXArray)? {
+    let attention = layer0.selfAttn
+    guard lagunaFusedEmbedAffineQKVEnabled,
+        lagunaFusedQKVProjectionEnabled,
+        lagunaFusedNormAffineQKVEnabled,
+        lagunaUseNativeAffineQKV(layer: 0),
+        attention.layerIdx == 0,
+        attention.nHeads == LagunaConstants.fullAttentionHeads,
+        attention.nKVHeads == LagunaConstants.numKeyValueHeads,
+        attention.headDim == LagunaConstants.headDim,
+        attention.gatingEnabled, attention.gatePerHead,
+        attention._nativeAffineQKVGateRows == attention.nHeads,
+        layer0.inputLayerNorm.eps == Float(LagunaConstants.rmsNormEpsilon),
+        layer0.inputLayerNorm.weight.dtype == .bfloat16,
+        layer0.inputLayerNorm.weight.shape == [LagunaConstants.hiddenSize],
+        let bank = attention._nativeAffineQKV,
+        bank.mode == .affine, bank.bits == 8, bank.groupSize == 32,
+        bank.originalShape == [
+            lagunaEmbedNormAffineQKVRows, LagunaConstants.hiddenSize,
+        ],
+        let biases = bank.biases
+    else {
+        return nil
+    }
+    return lagunaEmbedNormAffineQKV(
+        tokens: tokens,
+        embedWeight: embedWeight,
+        normWeight: layer0.inputLayerNorm.weight,
+        codes: bank.packedCodes,
+        scales: bank.scales,
+        biases: biases)
+}
+
 // MARK: - Norm-folded native-affine QKV projection (one dispatch)
 
 /// Folds the layer's input RMSNorm into the native group-32 affine INT8
@@ -4070,7 +4336,8 @@ final class LagunaRuntimeAttention: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
         qkRoPEAngles: MLXArray? = nil,
-        qkRoPEOffsets: MLXArray? = nil
+        qkRoPEOffsets: MLXArray? = nil,
+        precomputedFusedQKV: MLXArray? = nil
     ) -> MLXArray {
         let (B, L) = (input.dim(0), input.dim(1))
 
@@ -4112,7 +4379,20 @@ final class LagunaRuntimeAttention: Module {
                 // device-visible normalized row; the NVFP4 tail layers and
                 // any guard decline keep the separate norm.
                 var fusedQKV: MLXArray?
-                if lagunaFusedNormAffineQKVEnabled,
+                if let precomputedFusedQKV {
+                    // Layer 0 only: the embed+norm+affine-QKV kernel already
+                    // ran the token gather, the input RMSNorm AND this exact
+                    // INT8 qmv in ONE dispatch (see
+                    // `lagunaEmbedNormAffineQKVSource`); its output is
+                    // bit-identical to what the `lagunaNormAffineQKV` arm
+                    // below would produce from the gathered row, so both that
+                    // arm and the separate norm are skipped. With `fusedQKV`
+                    // non-nil from here on, every other norm+QKV path below
+                    // (the plain norm-affine arm, the tail arm, the fallback
+                    // `inputNorm(input)`) is unreachable — mutual exclusion
+                    // by construction.
+                    fusedQKV = precomputedFusedQKV
+                } else if lagunaFusedNormAffineQKVEnabled,
                     fusedAffine.mode == .affine, fusedAffine.bits == 8,
                     fusedAffine.groupSize == 32,
                     _nativeAffineQKVGateRows == nHeads,
@@ -8187,7 +8467,8 @@ final class LagunaRuntimeDecoderLayer: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
         qkRoPEAngles: MLXArray? = nil,
-        qkRoPEOffsets: MLXArray? = nil
+        qkRoPEOffsets: MLXArray? = nil,
+        precomputedFusedQKV: MLXArray? = nil
     ) -> MLXArray {
         let r = selfAttn(
             x,
@@ -8195,7 +8476,8 @@ final class LagunaRuntimeDecoderLayer: Module {
             mask: mask,
             cache: cache,
             qkRoPEAngles: qkRoPEAngles,
-            qkRoPEOffsets: qkRoPEOffsets
+            qkRoPEOffsets: qkRoPEOffsets,
+            precomputedFusedQKV: precomputedFusedQKV
         )
         let h: MLXArray
         let normalized: MLXArray
@@ -8552,6 +8834,7 @@ final class LagunaRuntimeModelInner: Module {
         var fullRoPEAngles: MLXArray?
         var slidingRoPEAngles: MLXArray?
         var qkRoPEOffsets: MLXArray?
+        var layer0PrecomputedFusedQKV: MLXArray?
         if let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
             let fullAtlas = _fullRoPEAngleAtlas,
             let slidingAtlas = _slidingRoPEAngleAtlas,
@@ -8568,7 +8851,25 @@ final class LagunaRuntimeModelInner: Module {
         } else {
             // Verbatim stock fallback for prefill, unsupported caches and
             // positions outside the precomputed atlas.
-            h = embedTokens(inputs)
+            if inputs.shape == [1, 1], inputs.dtype == .int32,
+                let fused = lagunaLayer0EmbedNormAffineQKV(
+                    tokens: inputs,
+                    embedWeight: embedTokens.weight,
+                    layer0: layers[0])
+            {
+                // ONE dispatch for the token gather, layer 0's input RMSNorm
+                // AND its INT8 [Q;K;V;G] projection (see
+                // `lagunaEmbedNormAffineQKVSource`). The raw gathered row
+                // still feeds layer 0's residual path byte-for-byte; the
+                // projected bank is handed to layer 0's attention below,
+                // which then skips its own norm+affine-QKV arm (the preset
+                // `fusedQKV` wins inside the attention call — mutual
+                // exclusion by construction).
+                h = fused.hidden
+                layer0PrecomputedFusedQKV = fused.qkv
+            } else {
+                h = embedTokens(inputs)
+            }
             let isSingleTokenDecode = h.dim(0) == 1 && h.dim(1) == 1
             fullRoPEAngles =
                 lagunaFusedFullQKNormYaRNEnabled && isSingleTokenDecode
@@ -8665,7 +8966,8 @@ final class LagunaRuntimeModelInner: Module {
                     mask: mask,
                     cache: cache?[i],
                     qkRoPEAngles: qkRoPEAngles,
-                    qkRoPEOffsets: qkRoPEOffsets
+                    qkRoPEOffsets: qkRoPEOffsets,
+                    precomputedFusedQKV: i == 0 ? layer0PrecomputedFusedQKV : nil
                 )
                 if isSingleTokenDecode, (decodeFireMask >> UInt64(i)) & 1 == 1 {
                     asyncEval(h)
