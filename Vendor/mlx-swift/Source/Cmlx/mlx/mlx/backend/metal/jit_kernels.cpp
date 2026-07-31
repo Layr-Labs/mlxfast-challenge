@@ -1120,7 +1120,9 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
     metal::Device& d,
     const std::string& kernel_name,
     const std::string& template_def,
-    const std::string& mode) {
+    const std::string& mode,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts) {
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
     std::string kernel_source;
@@ -1133,7 +1135,12 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
         template_def);
     return kernel_source;
   });
-  return d.get_kernel(kernel_name, lib);
+  // When hash_name/func_consts are supplied (the expert-aligned gather path,
+  // which binds fc 204 for wide threadgroup-store staging) the function is
+  // specialized and cached by hash_name; the hash carries the actual fc
+  // values so each variant compiles exactly once. With both empty -- all
+  // other callers -- this is the original unspecialized get_kernel.
+  return d.get_kernel(kernel_name, lib, hash_name, func_consts);
 }
 
 MTL::ComputePipelineState* get_gather_qmm_nax_kernel(

@@ -355,7 +355,9 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
     metal::Device& d,
     const std::string& kernel_name,
     const std::string& template_def,
-    const std::string& mode);
+    const std::string& mode,
+    const std::string& hash_name = "",
+    const metal::MTLFCList& func_consts = {});
 
 MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
     metal::Device& d,

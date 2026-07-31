@@ -1281,6 +1281,36 @@ bool darkbloom_stage_novol() {
   return v;
 }
 
+// DARKBLOOM_STAGE_EXPERT_WIDEST: the 16-byte threadgroup-store half of the
+// load_unsafe_wide staging path (function constant 204 in fp_quantized_nax)
+// ported onto the expert-aligned gather pipeline
+// fp_gather_qmm_rhs_expert_nax -- the hot sorted MoE prefill path.
+//
+// ISOLATION FROM THE NON-EXPERT LEVERS. This switch is distinct from the
+// non-expert DARKBLOOM_STAGE_WIDEST/WIDELD switches above, which stay
+// default OFF and drive only fp_gather_qmm_rhs_nax. Binding 204 for the
+// expert kernel uses this expert-specific switch instead, so turning the
+// widened staging on for the expert pipeline by default does NOT silently
+// enable the non-expert A/B arms. Each is resolved ONCE per process
+// (static const), so the specialization key it feeds is fixed for the
+// process lifetime. The resolved values are carried in the specialization
+// key, and the official correctness/warmup phases visit these fixed model
+// shapes before timed measurement.
+//
+// DEFAULT ON, explicit "=0" opt-out (mirrors darkbloom_expert_aligned_gather
+// above). The exactness argument is unchanged from load_unsafe_wide: same
+// bytes decoded to the same threadgroup addresses with the same scale, only
+// the store width changes (see the kernel comment). The shipped expert tile
+// gives each thread 8 packed source bytes, so load_unsafe_wide's 16-byte
+// device-load branch is compile-time ineligible; only WIDEST is wired here.
+// WIDEST needs only the NAXWsChunk16 threadgroup alignment the kernel already
+// guarantees.
+bool darkbloom_stage_expert_widest() {
+  static const bool v =
+      env::get_var("DARKBLOOM_STAGE_EXPERT_WIDEST", "") != "0";
+  return v;
+}
+
 bool darkbloom_expert_aligned_gather() {
   static const bool v =
       env::get_var("DARKBLOOM_EXPERT_ALIGNED_GATHER", "") != "0";
@@ -1596,6 +1626,15 @@ void gather_qmm_rhs_nax(
   const bool stage_runbar = darkbloom_stage_runbar();
   const bool stage_novol = darkbloom_stage_novol();
 
+  // EXPERT-WIDE STAGING (function constant 204 on
+  // fp_gather_qmm_rhs_expert_nax). The expert pipeline reuses the WIDEST slot
+  // but is driven by its OWN default-ON env switch, leaving the non-expert
+  // DARKBLOOM_STAGE_* globals default OFF. The shipped BM64/WM4/WN2 expert
+  // tile gives each thread 8 packed source bytes, so the 16B device-load arm
+  // (WIDELD/fc 205) is statically impossible; wiring only the 16B threadgroup
+  // store avoids a dead specialization dimension.
+  const bool e_stage_widest = expert_aligned && darkbloom_stage_expert_widest();
+
   // Ground truth for the A/B harness. `stage_wideld` is silently downgraded
   // to false when the host alignment certification declines, and `wide_ok`
   // depends on `w.offset()`, which is a runtime property no static reading of
@@ -1609,7 +1648,8 @@ void gather_qmm_rhs_nax(
           stderr,
           "mlxfast: stage active: widest=%d wideld=%d(req=%d wide_ok=%d) "
           "runbar=%d novol=%d expert=%d bm128=%d bm=%d wm=%d wn=%d "
-          "w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d\n",
+          "w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d "
+          "expert_widest=%d(req=%d)\n",
           int(stage_widest),
           int(stage_wideld),
           int(darkbloom_stage_wideld()),
@@ -1626,10 +1666,18 @@ void gather_qmm_rhs_nax(
           bits,
           N,
           K,
-          bn);
+          bn,
+          int(e_stage_widest),
+          int(darkbloom_stage_expert_widest()));
     });
   }
 
+  // Function constants for the path actually taken. The expert kernel
+  // references ONLY fc 204 (it never reads 200-203/205-207: align_* and
+  // run-skip are not part of its body, and runbar/novol are intentionally NOT
+  // ported here). The two paths bind the SAME fc slots but from DIFFERENT
+  // sources: the non-expert path uses the default-OFF DARKBLOOM_STAGE_*
+  // globals, the expert path uses its own default-ON resolved values above.
   metal::MTLFCList func_consts;
   if (!expert_aligned) {
     func_consts = {
@@ -1642,27 +1690,43 @@ void gather_qmm_rhs_nax(
         {&stage_runbar, MTL::DataType::DataTypeBool, 206},
         {&stage_novol, MTL::DataType::DataTypeBool, 207},
     };
+  } else {
+    func_consts = {
+        {&e_stage_widest, MTL::DataType::DataTypeBool, 204},
+    };
   }
 
-  // And the kernel hash that includes the function constants
+  // And the kernel hash that includes the function constants, so the
+  // specialization cache key carries the ACTUAL fc 204 value bound above.
+  // Resolved once per process, so each kname compiles exactly one variant.
   std::string hash_name;
   hash_name.reserve(128);
-  concatenate(
-      hash_name,
-      kname,
-      "_align_M_",
-      align_M ? 't' : 'n',
-      "_align_N_",
-      align_N ? 't' : 'n',
-      "_align_K_",
-      align_K ? 't' : 'n',
-      "_rs_",
-      run_skip ? 't' : 'n',
-      "_stg_",
-      stage_widest ? 'W' : 'n',
-      stage_wideld ? 'L' : 'n',
-      stage_runbar ? 'B' : 'n',
-      stage_novol ? 'V' : 'n');
+  if (expert_aligned) {
+    // The expert kernel takes no align_*/run_skip/runbar/novol function
+    // constants, so only the WIDEST staging bit enters its key.
+    concatenate(
+        hash_name,
+        kname,
+        "_stg_",
+        e_stage_widest ? 'W' : 'n');
+  } else {
+    concatenate(
+        hash_name,
+        kname,
+        "_align_M_",
+        align_M ? 't' : 'n',
+        "_align_N_",
+        align_N ? 't' : 'n',
+        "_align_K_",
+        align_K ? 't' : 'n',
+        "_rs_",
+        run_skip ? 't' : 'n',
+        "_stg_",
+        stage_widest ? 'W' : 'n',
+        stage_wideld ? 'L' : 'n',
+        stage_runbar ? 'B' : 'n',
+        stage_novol ? 'V' : 'n');
+  }
 
   // Get and set the kernel. Every expert-aligned instantiation (static and
   // runtime-shaped alike) is built from a template definition here, because
@@ -1687,7 +1751,7 @@ void gather_qmm_rhs_nax(
         static_expert_shape ? N : 0,
         "bfloat",
         egroups);
-    kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
+    kernel = get_qmm_nax_kernel(d, kname, template_def, mode, hash_name, func_consts);
   } else {
     kernel = get_gather_qmm_nax_kernel(
         d,

@@ -1792,7 +1792,23 @@ template <
 
       for (int k = 0; k < K_it; ++k) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_w.load_unsafe();
+        // DARKBLOOM expert-wide staging (function constant 204): port the
+        // exact 16B threadgroup-store half of load_unsafe_wide onto the active
+        // expert kernel. The shipped BM64/WM4/WN2 tile assigns 8 packed source
+        // bytes to each thread, so the helper's 16B device-load arm is
+        // compile-time ineligible; asking only for wide_store avoids a dead
+        // fc-205 dimension. Decoding, scale selection and destination
+        // addresses are identical to load_unsafe(); only two aligned 16B
+        // threadgroup stores replace the scalar element stores. The helper's
+        // shape and per-thread destination-alignment guards fall back to the
+        // untouched scalar path on any miss. No runbar/novol/run-skip wiring
+        // is added: the expert kernel keeps its existing barriers and run
+        // handling.
+        if (stage_widest) {
+          loader_w.template load_unsafe_wide<true, false>();
+        } else {
+          loader_w.load_unsafe();
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg_active) {
