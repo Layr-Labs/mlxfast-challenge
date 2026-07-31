@@ -6193,6 +6193,17 @@ private let lagunaPrefillMoETailEnabled =
 private let lagunaPrefillSortedMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_SORTED_MOE_TAIL"] != "0"
 
+/// Columns-per-thread repartition for the prefill MoE tail kernels. Default `8`
+/// selects the H8 twin (more columns/thread, fewer threadgroups); `DARKBLOOM_PREFILL_MOE_TAIL_COLS=4`
+/// restores the shipped 4-columns control. Bit-exact EG256 class: each output
+/// column is a fully independent 8-slot BF16 weighted sum.
+let lagunaPrefillMoETailCols: Int = {
+    let raw =
+        ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_MOE_TAIL_COLS"]
+        ?? "8"
+    return raw == "4" ? 4 : 8
+}()
+
 /// Batched top-8 selection for multi-token (prefill) routing.
 ///
 /// Exactness against the stock chain it replaces, per row:
@@ -6730,6 +6741,51 @@ private let lagunaPrefillMoETailKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Eight-columns-per-thread twin of `lagunaPrefillMoETailKernel`. BIT-EXACT
+/// repartition in the EG256 class: each output column's value is a fully
+/// independent 8-slot BF16 weighted-expert sum (slots 0..7 in fixed order),
+/// computed in its own register with no cross-column state, no threadgroup
+/// memory, no barrier. `n_cols` only changes how many independent columns one
+/// thread serializes; it cannot reassociate the 8-element BF16 sum or move any
+/// BF16 rounding boundary. n_cols 4 -> 8 doubles per-thread work and halves
+/// the threadgroup count (less launch overhead for this light kernel).
+private let lagunaPrefillMoETailH8Kernel = MLXFast.metalKernel(
+    name: "laguna_prefill_moe_tail_bf16_h8_v1",
+    inputNames: ["expert_outputs", "router_weights", "shared_output", "residual"],
+    outputNames: ["output"],
+    source: """
+        constexpr uint hidden = 2048;
+        constexpr uint experts = 8;
+        constexpr uint n_cols = 8;
+
+        uint row = thread_position_in_grid.y;
+        uint col = thread_position_in_grid.x * n_cols;
+
+        const device bfloat* expert_row =
+            expert_outputs + (row * experts) * hidden + col;
+        const device float* weight_row = router_weights + row * experts;
+
+        bfloat expert_weights[experts];
+        for (uint e = 0; e < experts; ++e) {
+            expert_weights[e] = bfloat(weight_row[e]);
+        }
+
+        for (uint i = 0; i < n_cols; ++i) {
+            bfloat total = bfloat(0);
+            for (uint e = 0; e < experts; ++e) {
+                bfloat product =
+                    bfloat(expert_row[e * hidden + i] * expert_weights[e]);
+                total = bfloat(product + total);
+            }
+            bfloat scaled = bfloat(total * bfloat(2.5f));
+            bfloat r2 = bfloat(scaled + shared_output[row * hidden + col + i]);
+            output[row * hidden + col + i] =
+                bfloat(residual[row * hidden + col + i] + r2);
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 /// Sorted-input twin of `lagunaPrefillMoETailKernel`. `inverse_order[p]` is
 /// the row in the expert-sorted down-projection output that
 /// `scatterUnsort(...)[p]` would copy to original flattened slot `p`.
@@ -6747,6 +6803,50 @@ private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
         constexpr uint hidden = 2048;
         constexpr uint experts = 8;
         constexpr uint n_cols = 4;
+
+        uint row = thread_position_in_grid.y;
+        uint col = thread_position_in_grid.x * n_cols;
+        const device float* weight_row = router_weights + row * experts;
+
+        bfloat expert_weights[experts];
+        uint sorted_rows[experts];
+        for (uint e = 0; e < experts; ++e) {
+            expert_weights[e] = bfloat(weight_row[e]);
+            sorted_rows[e] = inverse_order[row * experts + e];
+        }
+
+        for (uint i = 0; i < n_cols; ++i) {
+            bfloat total = bfloat(0);
+            for (uint e = 0; e < experts; ++e) {
+                bfloat product = bfloat(
+                    sorted_expert_outputs[sorted_rows[e] * hidden + col + i] *
+                    expert_weights[e]);
+                total = bfloat(product + total);
+            }
+            bfloat scaled = bfloat(total * bfloat(2.5f));
+            bfloat r2 = bfloat(scaled + shared_output[row * hidden + col + i]);
+            output[row * hidden + col + i] =
+                bfloat(residual[row * hidden + col + i] + r2);
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Eight-columns-per-thread twin of `lagunaPrefillSortedMoETailKernel`.
+/// Bit-exact EG256-class repartition: each output column is a fully independent
+/// 8-slot BF16 weighted sum (fixed slot order), so n_cols 4 -> 8 only changes
+/// per-thread serialization, not any column's arithmetic.
+private let lagunaPrefillSortedMoETailH8Kernel = MLXFast.metalKernel(
+    name: "laguna_prefill_sorted_moe_tail_bf16_h8_v1",
+    inputNames: [
+        "sorted_expert_outputs", "inverse_order", "router_weights",
+        "shared_output", "residual",
+    ],
+    outputNames: ["output"],
+    source: """
+        constexpr uint hidden = 2048;
+        constexpr uint experts = 8;
+        constexpr uint n_cols = 8;
 
         uint row = thread_position_in_grid.y;
         uint col = thread_position_in_grid.x * n_cols;
@@ -6795,9 +6895,12 @@ private func lagunaPrefillMoETail(
     precondition(residual.dtype == .bfloat16)
     precondition(residual.shape == [1, rows, LagunaConstants.hiddenSize])
 
-    return lagunaPrefillMoETailKernel(
+    let useH8 = lagunaPrefillMoETailCols == 8
+    let kernel = useH8 ? lagunaPrefillMoETailH8Kernel : lagunaPrefillMoETailKernel
+    let cols = useH8 ? 8 : 4
+    return kernel(
         [expertOutputs, routerWeights, sharedOutput, residual],
-        grid: (LagunaConstants.hiddenSize / 4, rows, 1),
+        grid: (LagunaConstants.hiddenSize / cols, rows, 1),
         threadGroup: (256, 1, 1),
         outputShapes: [[1, rows, LagunaConstants.hiddenSize]],
         outputDTypes: [.bfloat16]
@@ -6825,12 +6928,17 @@ private func lagunaPrefillSortedMoETail(
     precondition(residual.dtype == .bfloat16)
     precondition(residual.shape == [1, rows, LagunaConstants.hiddenSize])
 
-    return lagunaPrefillSortedMoETailKernel(
+    let useH8 = lagunaPrefillMoETailCols == 8
+    let kernel = useH8
+        ? lagunaPrefillSortedMoETailH8Kernel
+        : lagunaPrefillSortedMoETailKernel
+    let cols = useH8 ? 8 : 4
+    return kernel(
         [
             sortedExpertOutputs, inverseOrder, routerWeights, sharedOutput,
             residual,
         ],
-        grid: (LagunaConstants.hiddenSize / 4, rows, 1),
+        grid: (LagunaConstants.hiddenSize / cols, rows, 1),
         threadGroup: (256, 1, 1),
         outputShapes: [[1, rows, LagunaConstants.hiddenSize]],
         outputDTypes: [.bfloat16]
