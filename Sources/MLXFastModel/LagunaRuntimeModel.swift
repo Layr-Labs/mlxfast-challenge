@@ -134,6 +134,15 @@ let lagunaFusedRoutedSharedDownResidualEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_ROUTED_SHARED_DOWN_RESIDUAL"] != "0"
 
+/// Depth-2 software-pipeline selector for the fused routed/shared down
+/// residual kernel. Default ON selects the pipelined twin, which pre-issues
+/// each output row's NVFP4 code/scale loads before the previous row's dot
+/// product is consumed. Set `DARKBLOOM_DOWN_PIPELINE=0` to restore the proven
+/// in-order control kernel. Both twins are bit-exact (same per-row FP32 dot,
+/// same `simd_sum`, same BF16 cross-expert reduction); only load timing differs.
+let lagunaDownPipelineEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_DOWN_PIPELINE"] != "0"
+
 /// Routed-expert counterpart to the shared QMV + SwiGLU fusion. Each decode
 /// request supplies exactly eight current-token expert indices; the kernel
 /// reads those banks directly and emits `[1, 1, 8, 1, 512]`.
@@ -5588,6 +5597,155 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Depth-2 software pipeline of `lagunaRoutedSharedDownResidualKernel`.
+///
+/// The 512-wide activated input is already register-resident (loaded once) and
+/// reused across all four output rows, so the only per-row device traffic is
+/// one `uint2` (8 weight bytes) and one scale byte. This twin issues the NEXT
+/// row's code/scale loads before the CURRENT row's `laguna_nvfp4_qdot_codes_16`
+/// is consumed, giving the memory subsystem an extra outstanding load to
+/// overlap with the ~40-op dequant+FMA compute of the in-flight dot.
+///
+/// BIT-EXACT by construction: each row's dot product is fully independent (no
+/// cross-row accumulation), and the value passed to `laguna_nvfp4_qdot_codes_16`
+/// is the identical `uint2`/`scale` whether loaded one row early or late. The
+/// FP32 accumulation tree, `simd_sum`, the single FP32→BF16 rounding boundary,
+/// and the entire fixed-order BF16 cross-expert reduction (router-weighted sum
+/// slots 0→7, `× 2.5`, `+ shared`, `+ residual`) are byte-for-byte identical to
+/// the control kernel. Only the LOAD TIMING of the per-row codes/scale changes.
+private let lagunaRoutedSharedDownResidualPipelineKernel = MLXFast.metalKernel(
+    name: "laguna_routed_shared_nvfp4_down_residual_pipeline_bf16_v1",
+    inputNames: [
+        "routed_activated", "routed_down_weight", "routed_down_scales",
+        "indices", "router_weights", "shared_activated",
+        "shared_down_weight", "shared_down_scales", "residual",
+    ],
+    outputNames: ["output"],
+    source: """
+        constexpr uint input_width = 512;
+        constexpr uint output_width = 2048;
+        constexpr uint routed_experts = 8;
+        constexpr uint shared_slot = 8;
+        constexpr uint outputs_per_simd = 4;
+        constexpr uint values_per_lane = 16;
+        constexpr uint packed_row_bytes = 256;
+        constexpr uint scale_row_bytes = 32;
+        constexpr uint packed_expert_bytes =
+            output_width * packed_row_bytes;
+        constexpr uint scale_expert_bytes =
+            output_width * scale_row_bytes;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint slot = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint first_row = tile * outputs_per_simd;
+        bool is_shared = slot == shared_slot;
+        uint expert = is_shared ? 0 : uint(indices[slot]);
+
+        const device bfloat* expert_input = is_shared
+            ? shared_activated
+            : routed_activated + slot * input_width;
+        const device uint8_t* expert_weight = is_shared
+            ? (const device uint8_t*)shared_down_weight
+            : (const device uint8_t*)routed_down_weight +
+                expert * packed_expert_bytes;
+        const device uint8_t* expert_scales = is_shared
+            ? shared_down_scales
+            : routed_down_scales + expert * scale_expert_bytes;
+
+        thread float input_values[values_per_lane];
+        const device vec<bfloat, 4>* input_vectors =
+            (const device vec<bfloat, 4>*)(
+                expert_input + lane * values_per_lane);
+        for (uint i = 0; i < values_per_lane / 4; ++i) {
+            const vec<bfloat, 4> values = input_vectors[i];
+            input_values[4 * i] = values[0];
+            input_values[4 * i + 1] = values[1];
+            input_values[4 * i + 2] = values[2];
+            input_values[4 * i + 3] = values[3];
+        }
+
+        // Depth-2 software pipeline: pre-issue row 1's code/scale loads, then
+        // each iteration consumes the in-flight row's loaded values while
+        // issuing the next row's loads. The consumed values are identical to
+        // the control kernel's `packed[0]` / `scale[0]` for the same row.
+        thread float result[outputs_per_simd] = {
+            0.0f, 0.0f, 0.0f, 0.0f
+        };
+        thread uint2 next_codes;
+        thread uint8_t next_scale_bits;
+        {
+            const device uint2* weight =
+                (const device uint2*)(
+                    expert_weight + first_row * packed_row_bytes + lane * 8);
+            const device uint8_t* scale =
+                expert_scales + first_row * scale_row_bytes + lane;
+            next_codes = weight[0];
+            next_scale_bits = scale[0];
+        }
+        for (uint row = 0; row < outputs_per_simd; ++row) {
+            uint output_row = first_row + row;
+            uint2 codes = next_codes;
+            float scale = laguna_nvfp4_scale(next_scale_bits);
+
+            // Issue the next row's loads before consuming this row's dot, so
+            // the load latency overlaps the dequant+FMA compute. The last
+            // iteration's pre-load is discarded (row == outputs_per_simd).
+            if (row + 1 < outputs_per_simd) {
+                const device uint2* next_weight =
+                    (const device uint2*)(
+                        expert_weight +
+                        (output_row + 1) * packed_row_bytes + lane * 8);
+                const device uint8_t* next_scale =
+                    expert_scales + (output_row + 1) * scale_row_bytes + lane;
+                next_codes = next_weight[0];
+                next_scale_bits = next_scale[0];
+            }
+
+            result[row] = laguna_nvfp4_qdot_codes_16(
+                codes,
+                input_values,
+                scale);
+            result[row] = simd_sum(result[row]);
+        }
+
+        threadgroup bfloat down_outputs[
+            (routed_experts + 1) * outputs_per_simd
+        ];
+        if (lane == 0) {
+            for (uint row = 0; row < outputs_per_simd; ++row) {
+                down_outputs[slot * outputs_per_simd + row] =
+                    bfloat(result[row]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (slot == 0 && lane < outputs_per_simd) {
+            bfloat routed_total = bfloat(0);
+            for (uint routed_slot = 0;
+                 routed_slot < routed_experts;
+                 ++routed_slot) {
+                bfloat route_weight =
+                    bfloat(router_weights[routed_slot]);
+                bfloat product = bfloat(
+                    down_outputs[
+                        routed_slot * outputs_per_simd + lane
+                    ] * route_weight);
+                routed_total = bfloat(product + routed_total);
+            }
+            bfloat routed = bfloat(
+                routed_total * bfloat(2.5f));
+            bfloat shared =
+                down_outputs[shared_slot * outputs_per_simd + lane];
+            bfloat r2 = bfloat(routed + shared);
+            output[first_row + lane] =
+                bfloat(residual[first_row + lane] + r2);
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
 func lagunaRoutedSharedDownResidual(
     routedActivated: MLXArray,
     routedDownWeight: MLXArray,
@@ -5643,7 +5801,10 @@ func lagunaRoutedSharedDownResidual(
     precondition(residual.dtype == .bfloat16)
     precondition(residual.shape == [1, 1, LagunaConstants.hiddenSize])
 
-    return lagunaRoutedSharedDownResidualKernel(
+    let kernel = lagunaDownPipelineEnabled
+        ? lagunaRoutedSharedDownResidualPipelineKernel
+        : lagunaRoutedSharedDownResidualKernel
+    return kernel(
         [
             routedActivated, routedDownWeight, routedDownScales,
             indices, routerWeights, sharedActivated,
