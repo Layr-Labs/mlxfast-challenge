@@ -4996,7 +4996,7 @@ func lagunaSharedDownResidual(
 }
 
 private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_bf16_v2",
+    name: "laguna_routed_nvfp4_swiglu_qmv_bf16_v3",
     inputNames: ["input", "fused_weight", "fused_scales", "indices"],
     outputNames: ["activated"],
     source: """
@@ -5020,9 +5020,17 @@ private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
         uint group = threadgroup_position_in_grid.x;
         uint expert_slot = group % routed_experts;
         uint tile = group / routed_experts;
-        uint expert = uint(indices[expert_slot]);
         uint simd_group = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
+        // Threadgroup-uniform value: lane 0 loads the same uint32 every
+        // lane used to load, and the broadcast hands it to all lanes. It
+        // feeds only pointer arithmetic, so this is bit-identical by
+        // construction.
+        uint expert_lane = 0;
+        if (lane == 0) {
+            expert_lane = uint(indices[expert_slot]);
+        }
+        uint expert = simd_broadcast(expert_lane, 0);
         uint first_row = tile * 4 + simd_group * 2;
 
         const device uint8_t* expert_weight =
@@ -5733,7 +5741,7 @@ func lagunaRoutedSharedSwiGLUQMV(
 // keeps the eight expert rows in threadgroup memory and emits only the final
 // 2048-wide routed branch.
 private let lagunaRoutedDownReduceKernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_down_reduce_bf16_v1",
+    name: "laguna_routed_nvfp4_down_reduce_bf16_v2",
     inputNames: [
         "activated", "down_weight", "down_scales", "indices", "router_weights",
     ],
@@ -5755,7 +5763,15 @@ private let lagunaRoutedDownReduceKernel = MLXFast.metalKernel(
         uint expert_slot = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
         uint first_row = tile * outputs_per_simd;
-        uint expert = uint(indices[expert_slot]);
+        // Simdgroup-uniform value: lane 0 loads the same uint32 every lane
+        // used to load, and the broadcast hands it to all 32 lanes. It
+        // feeds only pointer arithmetic, so this is bit-identical by
+        // construction.
+        uint expert_lane = 0;
+        if (lane == 0) {
+            expert_lane = uint(indices[expert_slot]);
+        }
+        uint expert = simd_broadcast(expert_lane, 0);
 
         const device bfloat* expert_input =
             activated + expert_slot * input_width;
@@ -5809,16 +5825,31 @@ private let lagunaRoutedDownReduceKernel = MLXFast.metalKernel(
         // weights cast from FP32 to BF16. Its small strided BF16 reduction
         // initializes with zero, then visits expert slots 0 through 7 in
         // order. The scalar 2.5 is constructed in the BF16 result dtype.
-        if (expert_slot == 0 && lane < outputs_per_simd) {
-            bfloat total = bfloat(0);
-            for (uint slot = 0; slot < experts_per_token; ++slot) {
-                bfloat route_weight = bfloat(router_weights[slot]);
-                bfloat product = bfloat(
-                    expert_outputs[slot * outputs_per_simd + lane] *
-                    route_weight);
-                total = bfloat(product + total);
+        if (expert_slot == 0) {
+            // Lane-parallel load of the eight FP32 router weights plus
+            // converged shuffles, replacing eight serial per-lane loads of
+            // the same addresses. Every lane ends with the same FP32 bits
+            // in the same order; the BF16 cast, the product, and the
+            // eight-step serial `total` rounding chain below are unchanged.
+            float w = 0.0f;
+            if (lane < uint(experts_per_token)) {
+                w = router_weights[lane];
             }
-            routed[first_row + lane] = bfloat(total * bfloat(2.5f));
+            float route_weights[experts_per_token];
+            for (uint s = 0; s < experts_per_token; ++s) {
+                route_weights[s] = simd_shuffle(w, s);
+            }
+            if (lane < outputs_per_simd) {
+                bfloat total = bfloat(0);
+                for (uint slot = 0; slot < experts_per_token; ++slot) {
+                    bfloat route_weight = bfloat(route_weights[slot]);
+                    bfloat product = bfloat(
+                        expert_outputs[slot * outputs_per_simd + lane] *
+                        route_weight);
+                    total = bfloat(product + total);
+                }
+                routed[first_row + lane] = bfloat(total * bfloat(2.5f));
+            }
         }
         """,
     header: lagunaSharedSwiGLUQMVHeader,
@@ -5867,7 +5898,7 @@ func lagunaRoutedDownReduce(
 }
 
 private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_down_residual_bf16_v1",
+    name: "laguna_routed_shared_nvfp4_down_residual_bf16_v2",
     inputNames: [
         "routed_activated", "routed_down_weight", "routed_down_scales",
         "indices", "router_weights", "shared_activated",
@@ -5893,7 +5924,15 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
         uint lane = thread_index_in_simdgroup;
         uint first_row = tile * outputs_per_simd;
         bool is_shared = slot == shared_slot;
-        uint expert = is_shared ? 0 : uint(indices[slot]);
+        // Simdgroup-uniform value: lane 0 loads the same uint32 every lane
+        // used to load (the shared simdgroup keeps the literal 0 it always
+        // used), and the broadcast hands it to all 32 lanes. It feeds only
+        // pointer arithmetic, so this is bit-identical by construction.
+        uint expert_lane = 0;
+        if (!is_shared && lane == 0) {
+            expert_lane = uint(indices[slot]);
+        }
+        uint expert = simd_broadcast(expert_lane, 0);
 
         const device bfloat* expert_input = is_shared
             ? shared_activated
@@ -5945,19 +5984,34 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (slot == 0 && lane < outputs_per_simd) {
-            bfloat routed_total = bfloat(0);
-            for (uint routed_slot = 0;
-                 routed_slot < routed_experts;
-                 ++routed_slot) {
-                bfloat route_weight =
-                    bfloat(router_weights[routed_slot]);
-                bfloat product = bfloat(
-                    down_outputs[
-                        routed_slot * outputs_per_simd + lane
-                    ] * route_weight);
-                routed_total = bfloat(product + routed_total);
+        if (slot == 0) {
+            // Lane-parallel load of the eight FP32 router weights plus
+            // converged shuffles, replacing the serial per-lane loads of
+            // the same addresses by lanes 0-3. Every lane ends with the
+            // same FP32 bits in the same order; the BF16 cast, the product,
+            // and the eight-step serial `routed_total` rounding chain below
+            // are unchanged.
+            float w = 0.0f;
+            if (lane < uint(routed_experts)) {
+                w = router_weights[lane];
             }
+            float route_weights[routed_experts];
+            for (uint s = 0; s < routed_experts; ++s) {
+                route_weights[s] = simd_shuffle(w, s);
+            }
+            if (lane < outputs_per_simd) {
+                bfloat routed_total = bfloat(0);
+                for (uint routed_slot = 0;
+                     routed_slot < routed_experts;
+                     ++routed_slot) {
+                    bfloat route_weight =
+                        bfloat(route_weights[routed_slot]);
+                    bfloat product = bfloat(
+                        down_outputs[
+                            routed_slot * outputs_per_simd + lane
+                        ] * route_weight);
+                    routed_total = bfloat(product + routed_total);
+                }
             bfloat routed = bfloat(
                 routed_total * bfloat(2.5f));
             bfloat shared =
@@ -5965,6 +6019,7 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
             bfloat r2 = bfloat(routed + shared);
             output[first_row + lane] =
                 bfloat(residual[first_row + lane] + r2);
+            }
         }
         """,
     header: lagunaSharedSwiGLUQMVHeader,
