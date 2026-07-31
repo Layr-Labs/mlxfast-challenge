@@ -1415,6 +1415,24 @@ int darkbloom_stage_bm128_variant() {
   return v;
 }
 
+// Halve the threadgroup for the exact Laguna expert path while preserving the
+// 16x32 per-SIMD output fragment and the existing K traversal. Both accepted
+// geometries divide the loader's 2,048-byte packed-weight tile exactly:
+//
+//   unset/32 -> BM=32, WM=2, WN=2 (128 threads, candidate)
+//   other    -> BM=64, WM=4, WN=2 (256 threads, control)
+//
+// BM=48/WM=3 is intentionally excluded: its 192 threads do not divide the
+// packed tile, and QuantizedBlockLoader would leave staging bytes unwritten.
+// The value is fixed once per process, before any timed request.
+int darkbloom_expert_sm16_bm() {
+  static const int v = [] {
+    auto s = env::get_var("DARKBLOOM_EXPERT_SM16_BM", "");
+    return s.empty() || s == "32" ? 32 : 64;
+  }();
+  return v;
+}
+
 // Host half of the wide-access alignment contract. The kernel checks each
 // thread's own offset within a tile; only the host can see the three things
 // below, and a misaligned 16B load is silent corruption rather than a fault,
@@ -1521,15 +1539,25 @@ void gather_qmm_rhs_nax(
     default: break;                          // upstream: bm=64, wm=2, wn=2
   }
 
+  const bool laguna_moe_shape =
+      (K == 2048 && N == 1024) || (K == 512 && N == 2048);
+  const bool expert_geometry_candidate =
+      darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
+      group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
+      bm128 == 4;
+  if (expert_geometry_candidate && darkbloom_expert_sm16_bm() == 32) {
+    bm = 32;
+    wm = 2;
+  }
+
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
-  const bool laguna_moe_shape =
-      (K == 2048 && N == 1024) || (K == 512 && N == 2048);
+  const bool expert_sm16_geometry =
+      (bm == 64 && wm == 4 && wn == 2) ||
+      (bm == 32 && wm == 2 && wn == 2);
   const bool expert_aligned =
-      darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
-      group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
-      align_N && align_K && bm == 64 && wm == 4 && wn == 2;
+      expert_geometry_candidate && expert_sm16_geometry && align_N && align_K;
   std::string type_string = get_type_string(x.dtype());
   static const bool static_laguna_shapes =
       env::get_var("DARKBLOOM_STATIC_NVFP4_SHAPES", "") != "0";
