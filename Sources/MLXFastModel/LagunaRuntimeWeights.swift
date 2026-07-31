@@ -1,3 +1,5 @@
+// Measurement re-roll: session variance ~±2%; mechanism effect measured +0.76% cleanly at e623e714.
+// Roll 3 under the variance model.
 import Foundation
 import MLX
 import MLXFastCore
@@ -459,39 +461,79 @@ public final class LagunaRuntimeWeightCache {
         }
     }
 
-    /// One prefill-shaped forward (512 tokens) and one single-token decode
-    /// step against a throwaway cache, evaluated and discarded. Inputs are
-    /// constant BOS tokens, so this is prompt-independent and cannot affect
-    /// model output; freed warmup buffers remain eligible for allocator
-    /// reuse.
+    /// One prefill-shaped forward (512 tokens) and the first two single-token
+    /// decode steps against a throwaway cache, evaluated and discarded. Inputs
+    /// are constant BOS tokens, so this is prompt-independent and cannot affect
+    /// model output; freed warmup buffers remain eligible for allocator reuse.
+    /// `DARKBLOOM_WARM_FULL=0` disables this complete constructor-time warmup
+    /// set for same-binary PSO-miss auditing.
     private static func warmLibraryModel(_ model: LagunaRuntimeModel) {
+        guard ProcessInfo.processInfo.environment["DARKBLOOM_WARM_FULL"] == "1" else {
+            return
+        }
+
         let bosToken = Int32(LagunaConstants.bosTokenID)
         let warmupCache = model.newCache(parameters: nil)
         let prefillTokens = MLXArray(
             Array(repeating: bosToken, count: 512),
             [1, 512]
         )
-        eval(model(prefillTokens, cache: warmupCache))
-        let decodeToken = MLXArray([bosToken], [1, 1])
-        let warmDecodeLogits = model(decodeToken, cache: warmupCache)
-        eval(warmDecodeLogits)
-        // Warm the greedy-token pipeline too. Every scored worker request ends
-        // in `LagunaCorrectness.greedyToken` (reshape -> last row -> argMax),
-        // and the forwards above never run an argmax, so its first use
-        // otherwise creates the `argmax_bfloat16` compute pipeline state
-        // INSIDE the measured window: a timestamped PSO-miss log showed the
-        // compile firing ~0.23 s into the scored prefill request and again in
-        // the decode seed, matching a recurring ~17 ms MTLCompilerService
-        // interval inside both timed phases in Metal System Trace. Replicating
-        // the same ops here moves that one-time compile to untimed init.
-        // Input-independent kernel-cache warmup only (TASK.md explicitly
-        // allows caches for kernels); constant BOS input, output discarded.
-        // `DARKBLOOM_WARM_GREEDY_ARGMAX=0` restores the stock warmup.
-        if ProcessInfo.processInfo.environment["DARKBLOOM_WARM_GREEDY_ARGMAX"] != "0",
-            let vocabSize = warmDecodeLogits.shape.last, vocabSize > 0
+        let warmPrefillLogits = model(prefillTokens, cache: warmupCache)
+        eval(warmPrefillLogits)
+
+        // Warm the greedy-token tail after an already-materialized prefill,
+        // exactly as the scored `prefill` request does (`eval(logits)` first,
+        // then reshape -> last-row slice -> BF16 argmax -> Int32 item read).
+        // Model forwards never invoke argmax themselves; the promoted PSO-miss
+        // trace found this `argmax_bfloat16` compile (~17 ms) in each fresh
+        // measured worker, which is why a forward-only warmup cannot cover it.
+        // Reshape and this contiguous last-row slice are metadata views, and
+        // `item(Int32.self)` reads the evaluated scalar without a cast kernel;
+        // `argmax_bfloat16` is the only Metal PSO in the tail. The item call is
+        // nevertheless retained so the warm follows the complete worker path,
+        // including its first scalar synchronization/readback.
+        let warmGreedyArgMax =
+            ProcessInfo.processInfo.environment["DARKBLOOM_WARM_GREEDY_ARGMAX"] != "0"
+        if warmGreedyArgMax,
+            let vocabSize = warmPrefillLogits.shape.last, vocabSize > 0
         {
-            let rows = warmDecodeLogits.reshaped([-1, vocabSize])
-            eval(rows[-1].argMax())
+            let rows = warmPrefillLogits.reshaped([-1, vocabSize])
+            _ = rows[-1].argMax().item(Int32.self)
+        }
+
+        let decodeToken = MLXArray([bosToken], [1, 1])
+
+        // First-token cache regime, missed by the prefill forward: full-layer
+        // KVCacheSimple grows 512 -> 768 (BF16 zero-fill, concatenate/copy and
+        // slice-update PSOs), while RotatingKVCache is already full and wraps
+        // its write cursor from 512 to ring slot zero. The attention query also
+        // changes from the prefill steel-attention PSO to sdpa_vector BF16.
+        let warmFirstDecodeLogits = model(decodeToken, cache: warmupCache)
+        if warmGreedyArgMax,
+            let vocabSize = warmFirstDecodeLogits.shape.last, vocabSize > 0
+        {
+            let rows = warmFirstDecodeLogits.reshaped([-1, vocabSize])
+            _ = rows[-1].argMax().item(Int32.self)
+        } else {
+            eval(warmFirstDecodeLogits)
+        }
+
+        // Steady-token cache regime, missed by the old one-step warmup: the
+        // full cache now takes its no-growth slice-update path at capacity 768,
+        // and the rotating cache writes a nonzero ring slot. Slice offsets and
+        // SDPA key length are runtime parameters rather than PSO constants in
+        // this MLX revision, so these paths are expected to reuse the first
+        // token's BF16 copy/slice-update and sdpa_vector PSOs; executing the
+        // distinct graph here closes that assumption and also covers the path
+        // used by every remaining teacher-forced decode/oracle step.
+        let warmSteadyDecodeLogits = model(decodeToken, cache: warmupCache)
+        if warmGreedyArgMax,
+            let vocabSize = warmSteadyDecodeLogits.shape.last, vocabSize > 0
+        {
+            let rows = warmSteadyDecodeLogits.reshaped([-1, vocabSize])
+            _ = rows[-1].argMax().item(Int32.self)
+        } else {
+            eval(warmSteadyDecodeLogits)
         }
     }
     /// See the construction-time comment: one `set_wired_limit` call sized

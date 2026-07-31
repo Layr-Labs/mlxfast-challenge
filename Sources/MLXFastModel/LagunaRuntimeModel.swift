@@ -667,6 +667,30 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     }
 }()
 
+/// `DARKBLOOM_SUBLAYER_SUBMIT` (default ON; set "0" to restore the tip's
+/// decode cadence exactly). The tip submits completed layer outputs at six
+/// boundaries (`1,7,15,23,31,39`). This dose moves submission to the two real
+/// dependency boundaries inside every serial decode layer: after attention,
+/// before its residual/norm/MLP consumer graph is built, and after the MLP
+/// produces the next layer's input. Sparse layers additionally submit the
+/// shared gate/up activation before router top-k is constructed; that branch
+/// depends only on the normalized row, never on expert indices.
+///
+/// `asyncEval` only enqueues an already-constructed graph. No array, operation,
+/// cache update, dtype boundary, reduction order, or returned value changes.
+let lagunaSublayerSubmitEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SUBLAYER_SUBMIT"] != "0"
+
+@inline(__always)
+private func lagunaSubmitDecodeSublayer(
+    _ value: MLXArray, enabled: Bool
+) -> MLXArray {
+    if enabled {
+        asyncEval(value)
+    }
+    return value
+}
+
 /// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `1`; `0`/`off` disables;
 /// `8` restores the prior default): a ranked measurement on the
 /// 1.87782 base scored stride 1 at 1.88526 (+0.40% vs that base, rejected
@@ -6619,10 +6643,12 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     func fusedSharedDownResidual(
         _ x: MLXArray,
         routed: MLXArray,
-        residual: MLXArray
+        residual: MLXArray,
+        sharedActivation: MLXArray? = nil
     ) -> MLXArray? {
         guard lagunaFusedSharedDownResidualEnabled,
-            let inputs = fusedSharedDownInputs(x),
+            let inputs = fusedSharedDownInputs(
+                x, sharedActivation: sharedActivation),
             routed.dtype == .bfloat16,
             routed.shape == [1, 1, LagunaConstants.hiddenSize],
             residual.dtype == .bfloat16,
@@ -7856,6 +7882,26 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     private func forward(
         _ x: MLXArray, residual: MLXArray?, routerLogits: MLXArray?
     ) -> MLXArray {
+        // The shared gate/up QMV consumes only `x`. Build and enqueue it before
+        // `gate` constructs softmax/top-k and before any routed gather consumes
+        // `inds`. The exact same activation is threaded into the existing fused
+        // down paths below, so no shared QMV is duplicated on the guarded
+        // ranked decode path and no value or arithmetic order changes.
+        let earlySharedActivation: MLXArray?
+        if lagunaSublayerSubmitEnabled,
+            x.dtype == .bfloat16,
+            x.shape == [1, 1, LagunaConstants.hiddenSize],
+            !lagunaFusedRoutedSharedSwiGLUQMVEnabled,
+            lagunaFusedRoutedSharedDownResidualEnabled
+                || lagunaFusedSharedDownResidualEnabled,
+            let sharedInputs = sharedExpert.fusedSharedDownInputs(x)
+        {
+            earlySharedActivation = sharedInputs.activated
+            asyncEval(sharedInputs.activated)
+        } else {
+            earlySharedActivation = nil
+        }
+
         let (inds, weights) = gate(x, logits: routerLogits)
         var y: MLXArray
         var routedAlreadyReduced = false
@@ -7937,7 +7983,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 let downWeight = _routedDownWeight,
                 let downScales = _routedDownScales,
                 let sharedInputs = sharedExpert.fusedSharedDownInputs(
-                    x, sharedActivation: mergedSharedActivated),
+                    x,
+                    sharedActivation:
+                        mergedSharedActivated ?? earlySharedActivation),
                 activated.dtype == .bfloat16,
                 activated.shape == [
                     1, 1, LagunaConstants.numExpertsPerTok, 1,
@@ -8144,7 +8192,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
             let output = sharedExpert.fusedSharedDownResidual(
                 x,
                 routed: y,
-                residual: residual
+                residual: residual,
+                sharedActivation: earlySharedActivation
             )
         {
             return output
@@ -8189,6 +8238,9 @@ final class LagunaRuntimeDecoderLayer: Module {
         qkRoPEAngles: MLXArray? = nil,
         qkRoPEOffsets: MLXArray? = nil
     ) -> MLXArray {
+        let submitDecodeSublayers =
+            lagunaSublayerSubmitEnabled
+            && x.shape == [1, 1, LagunaConstants.hiddenSize]
         let r = selfAttn(
             x,
             inputNorm: inputLayerNorm,
@@ -8197,6 +8249,12 @@ final class LagunaRuntimeDecoderLayer: Module {
             qkRoPEAngles: qkRoPEAngles,
             qkRoPEOffsets: qkRoPEOffsets
         )
+        // First real sublayer boundary: attention (including its cache update
+        // and output projection) is fully constructed, while residual/norm and
+        // the independent routed/shared MLP branches have not been appended.
+        if submitDecodeSublayers {
+            asyncEval(r)
+        }
         let h: MLXArray
         let normalized: MLXArray
         var routerLogits: MLXArray?
@@ -8268,7 +8326,9 @@ final class LagunaRuntimeDecoderLayer: Module {
             h.shape == normalized.shape,
             let sparse = mlp as? LagunaRuntimeSparseMoEBlock
         {
-            return sparse(normalized, residual: h, routerLogits: routerLogits)
+            return lagunaSubmitDecodeSublayer(
+                sparse(normalized, residual: h, routerLogits: routerLogits),
+                enabled: submitDecodeSublayers)
         }
         // Multi-token prefill: hand the residual to the sparse block so the
         // prefill MoE tail kernel can fold the final residual add. When any
@@ -8279,7 +8339,9 @@ final class LagunaRuntimeDecoderLayer: Module {
             x.dim(1) > 1,
             let sparse = mlp as? LagunaRuntimeSparseMoEBlock
         {
-            return sparse(normalized, residual: h, routerLogits: routerLogits)
+            return lagunaSubmitDecodeSublayer(
+                sparse(normalized, residual: h, routerLogits: routerLogits),
+                enabled: submitDecodeSublayers)
         }
         // Layer-0-only decode fusion: the dense MLP has no
         // `LagunaRuntimeSparseMoEBlock` branch above to catch it, so its
@@ -8290,10 +8352,12 @@ final class LagunaRuntimeDecoderLayer: Module {
         if let dense = mlp as? LagunaRuntimeMLP,
             let fused = dense.fusedDenseDownResidual(normalized, residual: h)
         {
-            return fused
+            return lagunaSubmitDecodeSublayer(
+                fused, enabled: submitDecodeSublayers)
         }
         let r2 = mlp(normalized)
-        return h + r2
+        return lagunaSubmitDecodeSublayer(
+            h + r2, enabled: submitDecodeSublayers)
     }
 
     /// Final-layer prefill specialization. Every supplied row still produces
@@ -8655,7 +8719,9 @@ final class LagunaRuntimeModelInner: Module {
                         qkRoPEAngles: qkRoPEAngles,
                         qkRoPEOffsets: qkRoPEOffsets
                     )
-                    if isSingleTokenDecode, (decodeFireMask >> UInt64(i)) & 1 == 1 {
+                    if isSingleTokenDecode, !lagunaSublayerSubmitEnabled,
+                        (decodeFireMask >> UInt64(i)) & 1 == 1
+                    {
                         asyncEval(h)
                     }
                 }
@@ -8667,7 +8733,9 @@ final class LagunaRuntimeModelInner: Module {
                     qkRoPEAngles: qkRoPEAngles,
                     qkRoPEOffsets: qkRoPEOffsets
                 )
-                if isSingleTokenDecode, (decodeFireMask >> UInt64(i)) & 1 == 1 {
+                if isSingleTokenDecode, !lagunaSublayerSubmitEnabled,
+                    (decodeFireMask >> UInt64(i)) & 1 == 1
+                {
                     asyncEval(h)
                 }
                 if lagunaPrefillAsyncLadderStride > 0, h.dim(1) > 1,
