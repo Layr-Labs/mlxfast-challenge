@@ -50,6 +50,8 @@ import MLXFast
 
 private let lagunaLmHeadPruneVocab = 100_352
 private let lagunaLmHeadPruneHidden = 2048
+private let lagunaLmHeadPruneGroups = lagunaLmHeadPruneHidden / 32
+private let lagunaLmHeadL2Gamma = Float(sign: .plus, exponent: -15, significand: 1)
 
 /// Master switch for the certified two-pass final-row lm_head (notes/68).
 /// DEFAULT ON: unset, or any value other than "0", enables the certified
@@ -66,6 +68,50 @@ let lagunaLmHeadPruneEnabled =
 let lagunaLmHeadPrunePrefillEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_LM_HEAD_PRUNE_PREFILL"] != "0"
+
+/// Selectable certificate behind the same accepted gs32 MXFP8 lm-head copy.
+/// `sub8` is DEFAULT ON: it splits every accepted group-32 quantization group
+/// into four finer exact Cauchy cells, retaining a conservative performance
+/// step for the ranked acceptance window. Set the selector to `off` for the
+/// promoted incumbent. `sub4` is a still-finer brake; `partition8`/
+/// `partition4` are the opposite, coarse low-metadata research brackets.
+/// `fused-qmv8` uses the partition8 bound.
+/// The old research flip `DARKBLOOM_LMHEAD_NATIVE_L2=1` remains an alias for
+/// gs32 so the independently audited production path is reproducible.
+enum LagunaLmHeadNativeCertificate: String {
+    case off
+    case gs32
+    case sub8
+    case sub4
+    case partition8
+    case partition4
+    case fusedQMV8 = "fused-qmv8"
+
+    var partitionCount: Int {
+        switch self {
+        case .off: return 0
+        case .gs32: return lagunaLmHeadPruneGroups
+        case .sub8: return lagunaLmHeadPruneHidden / 8
+        case .sub4: return lagunaLmHeadPruneHidden / 4
+        case .partition8, .fusedQMV8: return 8
+        case .partition4: return 4
+        }
+    }
+
+    var partitionWidth: Int {
+        partitionCount == 0 ? 0 : lagunaLmHeadPruneHidden / partitionCount
+    }
+}
+
+let lagunaLmHeadNativeCertificate: LagunaLmHeadNativeCertificate = {
+    let environment = ProcessInfo.processInfo.environment
+    if let requested = environment["DARKBLOOM_LMHEAD_NATIVE_CERT"] {
+        return LagunaLmHeadNativeCertificate(rawValue: requested) ?? .off
+    }
+    return environment["DARKBLOOM_LMHEAD_NATIVE_L2"] == "1" ? .gs32 : .sub8
+}()
+
+let lagunaLmHeadNativeL2Enabled = lagunaLmHeadNativeCertificate != .off
 
 /// Inline candidate testing for the certified exact pass. The exact kernel
 /// copies the retained selector's `coarse + delta >= threshold` sequence
@@ -713,6 +759,108 @@ private let lagunaLmHeadInlineExactKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Eight independent 256-value norms for one final hidden row. One 256-thread
+/// group maps one simdgroup to each block; a lane owns eight contiguous float
+/// values. The qmv consumes this single shared result rather than recomputing
+/// the norms in every vocabulary threadgroup.
+private let lagunaLmHeadNativeBlock8NormKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_native_block8_norm_f32_v1",
+    inputNames: ["x"],
+    outputNames: ["block_norms"],
+    source: """
+        constexpr uint BLOCK = 256;
+        uint block = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        const device float* xb = x + block * BLOCK + lane * 8;
+        float sum = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint k = 0; k < 8; ++k) {
+            float value = xb[k];
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        if (lane == 0) {
+            block_norms[block] = metal::sqrt(sum);
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Fixed-geometry model-side specialization of MLX
+/// `mxfp8_qmv_fast_float_gs_32_b_8` with an eight-term certificate epilogue.
+/// The 64-thread/two-simdgroup center contraction preserves native ownership,
+/// pointer steps, decoders, accumulation order, `simd_sum`, and lane-zero F32
+/// stores. Bound inputs become live only after every coarse row is reduced.
+/// Thresholding and exact BF16 fallback remain separate and unchanged.
+private let lagunaLmHeadNativeFusedQMV8Kernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_mxfp8_qmv_f32_block8_bound_v1",
+    inputNames: ["x", "codes", "scales", "block_bound", "block_norms"],
+    outputNames: ["coarse", "delta"],
+    source: """
+        constexpr uint K = 2048;
+        constexpr uint BLOCK = 256;
+        constexpr uint BLOCKS = 8;
+        constexpr uint ROWS_PER_SIMD = 4;
+        constexpr uint ROWS_PER_TG = 8;
+        constexpr float G = 0x1p-15f;
+
+        uint sgid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint out_row = threadgroup_position_in_grid.x * ROWS_PER_TG
+            + sgid * ROWS_PER_SIMD;
+
+        const device uint8_t* ws = codes + size_t(out_row) * K + lane * 8;
+        const device uint8_t* ss = scales + size_t(out_row) * 64 + lane / 4;
+        const device float* xs = x + lane * 8;
+        thread float x_thread[8];
+        thread float result[ROWS_PER_SIMD] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        // Native in_vec_size is a runtime constant, hence no outer unroll.
+        #pragma clang loop unroll(disable)
+        for (uint kb = 0; kb < BLOCKS; ++kb) {
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 8; ++i) {
+                x_thread[i] = xs[i];
+            }
+            for (uint row = 0; row < ROWS_PER_SIMD; ++row) {
+                const device uint8_t* wb = ws + size_t(row) * K;
+                const device uint8_t* sb = ss + size_t(row) * 64;
+                float scale = laguna_e8m0_decode(sb[0]);
+                float accum = 0.0f;
+                for (uint i = 0; i < 8; ++i) {
+                    accum += x_thread[i] * laguna_e4m3_decode(wb[i]);
+                }
+                result[row] += scale * accum;
+            }
+            ws += BLOCK;
+            ss += BLOCK / 32;
+            xs += BLOCK;
+        }
+
+        for (uint row = 0; row < ROWS_PER_SIMD; ++row) {
+            result[row] = simd_sum(result[row]);
+            if (lane == 0) {
+                coarse[out_row + row] = result[row];
+            }
+        }
+
+        if (lane < ROWS_PER_SIMD) {
+            uint row = out_row + lane;
+            const device float* bb = block_bound + size_t(row) * BLOCKS;
+            float bound_acc = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint block = 0; block < BLOCKS; ++block) {
+                bound_acc += bb[block] * block_norms[block];
+            }
+            float value = bound_acc * (1.0f + G);
+            delta[row] = metal::isfinite(value) && value >= 0.0f
+                ? value : metal::numeric_limits<float>::infinity();
+        }
+        """,
+    header: lagunaLmHeadPruneHeader,
+    ensureRowContiguous: true
+)
+
 /// Retained init-time MXFP8 coarse copy of lm_head plus the pruned final-row
 /// forward. Built once (untimed init) by
 /// `LagunaRuntimeModel.prepareFusedRuntimeWeights` when
@@ -721,8 +869,19 @@ private let lagunaLmHeadInlineExactKernel = MLXFast.metalKernel(
 final class LagunaLmHeadPruner {
     let codes: MLXArray   // [100352, 2048] uint8 e4m3 elements
     let scales: MLXArray  // [100352, 64] uint8 e8m0 group scales
+    let nativeCertificate: LagunaLmHeadNativeCertificate
+    /// Directed-conservative gs32 coefficients; 25.7 MB. Nil for every other
+    /// lane so finalist variants do not retain unused metadata.
+    let nativeL2GroupBound: MLXArray?
+    /// All non-gs32 coefficients. Fine sub8/sub4 are 98/196 MiB; coarse
+    /// partition8/partition4 and fused-QMV8 are 3.06/1.53 MiB.
+    let nativeL2StagedBound: MLXArray?
 
-    init?(lmHeadWeight: MLXArray) {
+    init?(
+        lmHeadWeight: MLXArray,
+        prepareNativeL2: Bool = lagunaLmHeadNativeL2Enabled,
+        certificate: LagunaLmHeadNativeCertificate = lagunaLmHeadNativeCertificate
+    ) {
         guard lmHeadWeight.shape == [lagunaLmHeadPruneVocab, lagunaLmHeadPruneHidden],
             lmHeadWeight.dtype == .bfloat16
         else {
@@ -739,12 +898,183 @@ final class LagunaLmHeadPruner {
             lmHeadWeight, groupSize: 32, bits: 8, mode: .mxfp8)
         self.codes = wq.view(dtype: .uint8)
         self.scales = scales
+        let selectedCertificate =
+            prepareNativeL2 ? (certificate == .off ? .gs32 : certificate) : .off
+        self.nativeCertificate = selectedCertificate
+
+        if selectedCertificate != .off {
+            // For partition p and vocabulary row i, store
+            //   B_ip = (||w-q||2 + G||w||2 + G||q||2) * (1+G).
+            // At inference, delta_i=(sum_p B_ip||x_p||2)*(1+G). The first
+            // term is Cauchy-Schwarz. The G terms cover the stock BF16 GEMV
+            // (BF16 products are exact in FP32; <=69 adds) and native MXFP8
+            // fp_qmv_fast (BF16 x E4M3 products exact; <=38 adds). The two
+            // conservative (1+G) factors cover init-time subtraction,
+            // positive init norm reductions/sqrt. The widest 512-value coarse
+            // partition remains below ~258u after sqrt; G=2^-15 is 512u.
+            // Runtime uses a larger directed factor for sub8/sub4 because
+            // their positive bound dots contain 256/512 terms. The existing
+            // |L|/64 beta remains responsible for final BF16 assembly casts.
+            let decoded = dequantized(
+                wq,
+                scales: scales,
+                biases: nil,
+                groupSize: 32,
+                bits: 8,
+                mode: .mxfp8,
+                dtype: .float32
+            )
+            let stock = lmHeadWeight.asType(.float32)
+            let error = stock - decoded
+            let partitions = selectedCertificate.partitionCount
+            let width = selectedCertificate.partitionWidth
+            let errorGroups = error.reshaped([
+                lagunaLmHeadPruneVocab, partitions, width,
+            ])
+            let stockGroups = stock.reshaped([
+                lagunaLmHeadPruneVocab, partitions, width,
+            ])
+            let decodedGroups = decoded.reshaped([
+                lagunaLmHeadPruneVocab, partitions, width,
+            ])
+            let guardFactor = 1 + lagunaLmHeadL2Gamma
+            let bound =
+                (sqrt((errorGroups * errorGroups).sum(axis: 2))
+                    + lagunaLmHeadL2Gamma
+                        * sqrt((stockGroups * stockGroups).sum(axis: 2))
+                    + lagunaLmHeadL2Gamma
+                        * sqrt((decodedGroups * decodedGroups).sum(axis: 2)))
+                * guardFactor
+            if selectedCertificate == .gs32 {
+                self.nativeL2GroupBound = bound
+                self.nativeL2StagedBound = nil
+            } else {
+                self.nativeL2GroupBound = nil
+                self.nativeL2StagedBound = bound
+            }
+            // Materialize before the local decoded/error graph leaves init.
+            // After eval, only codes/scales/the selected bound remain resident;
+            // ~GB-scale Float32 construction intermediates become releasable.
+            eval(self.codes, self.scales, bound)
+        } else {
+            self.nativeL2GroupBound = nil
+            self.nativeL2StagedBound = nil
+        }
+    }
+
+    var residentArrays: [MLXArray] {
+        [codes, scales]
+            + (nativeL2GroupBound.map { [$0] } ?? [])
+            + (nativeL2StagedBound.map { [$0] } ?? [])
+    }
+
+    /// Native MLX MXFP8 QMV plus the selected exact certificate. GS32, the
+    /// fine sub8/sub4 brakes, and coarse partition8/partition4 brackets use an
+    /// ordinary bound matmul. Fused-QMV8 preserves that contraction in a
+    /// model-side kernel and appends only the eight-term bound epilogue.
+    func nativeL2CoarseAndDelta(
+        hidden: MLXArray,
+        certificate: LagunaLmHeadNativeCertificate? = nil
+    ) -> [MLXArray] {
+        precondition(hidden.dtype == .bfloat16 && hidden.size == lagunaLmHeadPruneHidden)
+        let certificate = certificate ?? nativeCertificate
+        precondition(certificate == nativeCertificate && certificate != .off)
+        let x = hidden.reshaped([lagunaLmHeadPruneHidden]).asType(.float32)
+
+        if certificate == .fusedQMV8 {
+            guard let blockBound = nativeL2StagedBound else {
+                preconditionFailure("native lm-head fused-QMV8 metadata was not prepared")
+            }
+            let blockNorms = lagunaLmHeadNativeBlock8NormKernel(
+                [x],
+                grid: (256, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[8]],
+                outputDTypes: [.float32]
+            )[0]
+            return lagunaLmHeadNativeFusedQMV8Kernel(
+                [x, codes, scales, blockBound, blockNorms],
+                grid: (lagunaLmHeadPruneVocab / 8 * 64, 1, 1),
+                threadGroup: (64, 1, 1),
+                outputShapes: [
+                    [lagunaLmHeadPruneVocab], [lagunaLmHeadPruneVocab],
+                ],
+                outputDTypes: [.float32, .float32]
+            )
+        }
+
+        let bound: MLXArray
+        if certificate == .gs32, let groupBound = nativeL2GroupBound {
+            bound = groupBound
+        } else if let stagedBound = nativeL2StagedBound {
+            bound = stagedBound
+        } else {
+            preconditionFailure("native lm-head certificate metadata was not prepared")
+        }
+        let packed = codes.view(dtype: .uint32).reshaped([
+            lagunaLmHeadPruneVocab, lagunaLmHeadPruneHidden / 4,
+        ])
+        let coarse = quantizedMM(
+            x.reshaped([1, lagunaLmHeadPruneHidden]),
+            packed,
+            scales: scales,
+            biases: nil,
+            transpose: true,
+            groupSize: 32,
+            bits: 8,
+            mode: .mxfp8
+        ).reshaped([lagunaLmHeadPruneVocab])
+        let partitions = certificate.partitionCount
+        let groupedX = x.reshaped([partitions, certificate.partitionWidth])
+        let xGroupNorm = sqrt((groupedX * groupedX).sum(axis: 1))
+        let runtimeGamma: Float
+        switch certificate {
+        case .sub8:
+            runtimeGamma = Float(sign: .plus, exponent: -14, significand: 1)
+        case .sub4:
+            runtimeGamma = Float(sign: .plus, exponent: -13, significand: 1)
+        default:
+            runtimeGamma = lagunaLmHeadL2Gamma
+        }
+        let delta = matmul(
+            bound,
+            xGroupNorm.reshaped([partitions, 1])
+        ).reshaped([lagunaLmHeadPruneVocab]) * (1 + runtimeGamma)
+        return [coarse, delta]
+    }
+
+    /// Retained custom coarse pair, exposed internally for same-binary tests.
+    func incumbentCoarseAndDelta(hidden: MLXArray) -> [MLXArray] {
+        precondition(hidden.dtype == .bfloat16 && hidden.size == lagunaLmHeadPruneHidden)
+        let x = hidden.reshaped([lagunaLmHeadPruneHidden])
+        let useCoarseV1 = lagunaLmHeadCoarseUseV1
+        let rowsPerThreadgroup = useCoarseV1 ? 8 : 16
+        let threadsPerThreadgroup = rowsPerThreadgroup * 32
+        let kernel =
+            useCoarseV1 ? lagunaLmHeadInlineCoarseKernelV1 : lagunaLmHeadInlineCoarseKernel
+        return kernel(
+            [x, codes, scales],
+            grid: (
+                lagunaLmHeadPruneVocab / rowsPerThreadgroup * threadsPerThreadgroup,
+                1,
+                1
+            ),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [
+                [lagunaLmHeadPruneVocab], [lagunaLmHeadPruneVocab],
+            ],
+            outputDTypes: [.float32, .float32]
+        )
     }
 
     /// Pruned final-row lm_head: full [vocab] BF16 logits row, bit-identical to
     /// the stock pass in every candidate slot and certified-below elsewhere,
     /// so the downstream argmax emits the stock token.
-    func logits(hidden: MLXArray, lmHeadWeight: MLXArray) -> MLXArray {
+    func logits(
+        hidden: MLXArray,
+        lmHeadWeight: MLXArray,
+        useNativeL2: Bool? = nil
+    ) -> MLXArray {
         precondition(hidden.dtype == .bfloat16 && hidden.size == lagunaLmHeadPruneHidden)
         let vocab = lagunaLmHeadPruneVocab
         let x = hidden.reshaped([lagunaLmHeadPruneHidden])
@@ -752,8 +1082,13 @@ final class LagunaLmHeadPruner {
         let coarseRowsPerThreadgroup = useCoarseV1 ? 8 : 16
         let coarseThreadsPerThreadgroup = coarseRowsPerThreadgroup * 32
 
+        let useNativeL2 = useNativeL2 ?? lagunaLmHeadNativeL2Enabled
         let coarseOut: [MLXArray]
-        if lagunaLmHeadInlineMaskEnabled {
+        if useNativeL2 {
+            let native = nativeL2CoarseAndDelta(hidden: x)
+            coarseOut = lagunaLmHeadInlineMaskEnabled
+                ? native : native + [native[0].asType(.bfloat16)]
+        } else if lagunaLmHeadInlineMaskEnabled {
             let coarseKernel =
                 useCoarseV1
                 ? lagunaLmHeadInlineCoarseKernelV1 : lagunaLmHeadInlineCoarseKernel
