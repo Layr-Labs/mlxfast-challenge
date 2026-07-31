@@ -630,10 +630,39 @@ private enum LagunaDecodeAsyncStage {
 /// for one extra scheduler round trip instead of thirty-five. The front rung
 /// is worthless alone — a lone fire at layer 1 measures 0.9476, the worst
 /// schedule tested — and only pays once the rest of the step is covered.
+///
+/// PUSHING THE FRONT RUNG ONE LAYER EARLIER (this change). A device-wide
+/// Metal System Trace of the timed decode phase (4176 GPU intervals, 128
+/// steps) shows the step is 93.6% GPU-busy with 32.6 dispatches/token, and
+/// that its idle is NOT spread across dispatch seams: 4044 inter-dispatch
+/// gaps are sub-microsecond (2.78 ms total, 4.8% of idle) while 131 gaps
+/// over 100 us carry 95.2% of it — one bubble per token, between the last
+/// dispatch of a step and the first of the next. That is the trusted timed
+/// loop running `lagunaLogits -> greedyToken (blocking) -> compare ->
+/// rebuild` strictly serially, so the GPU stays idle until the next step's
+/// graph construction reaches its FIRST `asyncEval` fire. `at:1,...` builds
+/// two layers before that happens; `at:0,...` builds one.
+///
+/// MEASURED (this box, warm, `MLXFAST_LOCAL_COOL_GATE=0`, ABBA-interleaved,
+/// 8 runs per arm across 4 rounds, one round rejected for drift):
+///
+///     at:1,7,15,23,31,39      6899.8 us/token   (previous default)
+///     at:0,1,7,15,23,31,39    6882.8 us/token   -0.25%, 3/4 pairs favouring
+///
+/// Prefill was flat at 201-202 us/token across every arm, which is the
+/// control: this schedule is guarded on `inputs.shape == [1, 1]`, so a
+/// prefill delta would have been pure drift. The effect is small by
+/// construction — it recovers only our own graph-build time ahead of the
+/// first fire (~17 us of the ~280 us bubble); the remainder is harness-side
+/// and identical in the baseline.
+///
+/// Same exactness ground as every other rung: `asyncEval` adds no operation,
+/// cache row, dtype boundary or token, and only enqueues already-constructed
+/// work earlier.
 private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     let raw =
         ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?
-        .lowercased() ?? "at:1,7,15,23,31,39"
+        .lowercased() ?? "at:0,1,7,15,23,31,39"
     switch raw {
     case "off", "0", "":
         return .off
