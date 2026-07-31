@@ -1287,8 +1287,8 @@ bool darkbloom_expert_aligned_gather() {
   return v;
 }
 
-// DARKBLOOM_EXPERT_GATHER_GROUPS (default 128; "64" restores the promoted
-// four-experts-per-threadgroup schedule and "256" selects one expert per
+// DARKBLOOM_EXPERT_GATHER_GROUPS (default 256; "128" restores the promoted
+// two-experts-per-threadgroup schedule and "64" selects four experts per
 // threadgroup, both kept as A/B controls): how many threadgroups the
 // expert-aligned gather QMM spreads the 256 experts over. More threadgroups
 // means the hardware scheduler overlaps per-expert staging drains and MMA
@@ -1300,7 +1300,7 @@ bool darkbloom_expert_aligned_gather() {
 // the promoted 64 schedule, 128 captures roughly two-thirds of the 256
 // schedule's prefill gain while keeping the measured speedup comfortably
 // mid-band; 256 measures closer to the acceptance ceiling in the single-shot
-// harness regime and is staged as its own follow-up chunk.
+// harness regime and is now the default follow-up chunk.
 int darkbloom_expert_gather_groups() {
   static const int v = [] {
     auto s = env::get_var("DARKBLOOM_EXPERT_GATHER_GROUPS", "");
