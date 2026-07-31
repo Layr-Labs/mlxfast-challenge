@@ -2377,22 +2377,17 @@ private func lagunaGatedOutputProjectionSource(
         """
 }
 
-/// `DARKBLOOM_L5_UNROLL` (default `2`; `1` restores the pre-unroll loop
-/// verbatim, `4`/`8` deepen it): block-loop unroll depth for the gated output
-/// projection. Every depth divides both block counts — 64 heads and 48 — so no
-/// tail loop is ever needed, and depth `1` emits the pre-patch loop, which
-/// makes it a true ablation control rather than an approximation of one.
-///
-/// The depth sweep {1, 2, 4} on this kernel is the highest-information
-/// measurement left on this box. It decides whether outstanding loads per
-/// thread — rather than bandwidth or occupancy — is what limits this whole
-/// kernel family. A monotone rise toward 596 GB/s would mean the 462.9 µs /
-/// 4.52% ceiling that L1+L5 have been sized against is itself too low.
+/// `DARKBLOOM_L5_UNROLL` (default `4`; `1` restores the pre-unroll loop
+/// verbatim, `2` restores the prior default, and `8` deepens it): block-loop
+/// unroll depth for the gated output projection. Every depth divides both
+/// block counts, so no tail loop is needed and each output row keeps the same
+/// load and accumulation order. Set `DARKBLOOM_L5_UNROLL=2` for a same-binary
+/// control.
 let lagunaGatedOutputUnroll: Int = {
     guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_L5_UNROLL"],
         let value = Int(raw), [1, 2, 4, 8].contains(value)
     else {
-        return 2
+        return 4
     }
     return value
 }()
