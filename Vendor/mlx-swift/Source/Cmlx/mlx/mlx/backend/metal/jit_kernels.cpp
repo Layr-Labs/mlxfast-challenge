@@ -1256,7 +1256,14 @@ namespace {
 // takes its arguments by value; the empty string appends nothing.
 const char* darkbloom_attn_qhoist_define() {
   static const bool enabled = [] {
-    const bool v = env::get_var("DARKBLOOM_ATTN_QHOIST", "") == "1";
+    // DEFAULT ON. Measured on an M5 Max against the same binary with the arm
+    // off: prefill -4.18% against a baseline whose own run-to-run drift was
+    // 0.89% (paired, cooled, interleaved with a repeated control). The decode
+    // reading moved -1.09% but that box's decode drift was 3.48% in the same
+    // series, so only the prefill number is treated as signal here.
+    //
+    // Set DARKBLOOM_ATTN_QHOIST=0 to restore the per-iteration Qtile reload.
+    const bool v = env::get_var("DARKBLOOM_ATTN_QHOIST", "") != "0";
     // Same ground-truth discipline the STAGE arms needed: prove the arm is
     // live before trusting its number. A #define that silently fails to reach
     // the source string produces an arm that measures its own control.
