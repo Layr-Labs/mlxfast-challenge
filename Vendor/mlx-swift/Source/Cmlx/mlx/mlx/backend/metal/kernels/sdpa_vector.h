@@ -352,22 +352,26 @@ template <
       const device T* pipe_values_b = pair_values + inner_v_stride;
       U pipe_ka[4];
       U pipe_kb[4];
-      pipe_ka[0] = pair_keys[0];
-      pipe_ka[1] = pair_keys[1];
-      pipe_ka[2] = pair_keys[2];
-      pipe_ka[3] = pair_keys[3];
-      pipe_kb[0] = pipe_keys_b[0];
-      pipe_kb[1] = pipe_keys_b[1];
-      pipe_kb[2] = pipe_keys_b[2];
-      pipe_kb[3] = pipe_keys_b[3];
-      const T pipe_va0 = pair_values[0];
-      const T pipe_va1 = pair_values[1];
-      const T pipe_va2 = pair_values[2];
-      const T pipe_va3 = pair_values[3];
-      const T pipe_vb0 = pipe_values_b[0];
-      const T pipe_vb1 = pipe_values_b[1];
-      const T pipe_vb2 = pipe_values_b[2];
-      const T pipe_vb3 = pipe_values_b[3];
+      const vec<T, 4> v_ka = *((const device vec<T, 4>*)pair_keys);
+      const vec<T, 4> v_kb = *((const device vec<T, 4>*)pipe_keys_b);
+      pipe_ka[0] = v_ka[0];
+      pipe_ka[1] = v_ka[1];
+      pipe_ka[2] = v_ka[2];
+      pipe_ka[3] = v_ka[3];
+      pipe_kb[0] = v_kb[0];
+      pipe_kb[1] = v_kb[1];
+      pipe_kb[2] = v_kb[2];
+      pipe_kb[3] = v_kb[3];
+      const vec<T, 4> v_va = *((const device vec<T, 4>*)pair_values);
+      const vec<T, 4> v_vb = *((const device vec<T, 4>*)pipe_values_b);
+      const T pipe_va0 = v_va[0];
+      const T pipe_va1 = v_va[1];
+      const T pipe_va2 = v_va[2];
+      const T pipe_va3 = v_va[3];
+      const T pipe_vb0 = v_vb[0];
+      const T pipe_vb1 = v_vb[1];
+      const T pipe_vb2 = v_vb[2];
+      const T pipe_vb3 = v_vb[3];
       // Manual full unroll of the qk_per_thread == 4 element loop. Same
       // loads, same fmuladd chain order per score: identical FP sequence.
 
@@ -450,14 +454,16 @@ template <
       pair_values += 2 * inner_v_stride;
     }
     if (i < N) {
-      pair_k[0] = pair_keys[0];
-      pair_k[1] = pair_keys[1];
-      pair_k[2] = pair_keys[2];
-      pair_k[3] = pair_keys[3];
-      const T pipe_va0 = pair_values[0];
-      const T pipe_va1 = pair_values[1];
-      const T pipe_va2 = pair_values[2];
-      const T pipe_va3 = pair_values[3];
+      const vec<T, 4> v_k = *((const device vec<T, 4>*)pair_keys);
+      pair_k[0] = v_k[0];
+      pair_k[1] = v_k[1];
+      pair_k[2] = v_k[2];
+      pair_k[3] = v_k[3];
+      const vec<T, 4> v_va = *((const device vec<T, 4>*)pair_values);
+      const T pipe_va0 = v_va[0];
+      const T pipe_va1 = v_va[1];
+      const T pipe_va2 = v_va[2];
+      const T pipe_va3 = v_va[3];
       // Manual full unroll of the qk_per_thread == 4 element loop. Same
       // loads, same fmuladd chain order per score: identical FP sequence.
 
