@@ -664,6 +664,22 @@ private let lagunaPrefillAsyncLadderStride: Int = {
     return n
 }()
 
+/// Process-constant bitmask of prefill asyncEval fire layers (bit i ⇒ fire
+/// after layer i). Same fire set as `(i + 1) % stride == 0` for the default
+/// ladder; kills the hot-loop remainder test. Bit-exact control-flow only.
+/// Empty when prefill async is off.
+private let lagunaPrefillAsyncFireMask: UInt64 = {
+    let stride = lagunaPrefillAsyncLadderStride
+    guard stride > 0 else { return 0 }
+    var mask: UInt64 = 0
+    var i = stride - 1
+    while i < 64 {
+        mask |= 1 << UInt64(i)
+        i += stride
+    }
+    return mask
+}()
+
 private let lagunaRoPEAngleAtlasLength = 4096
 
 /// The shared 512-thread RMSNorm prologue emitted by three decode kernels.
@@ -7449,8 +7465,8 @@ final class LagunaRuntimeModelInner: Module {
                 {
                     asyncEval(h)
                 }
-                if lagunaPrefillAsyncLadderStride > 0, h.dim(1) > 1,
-                    (i + 1) % lagunaPrefillAsyncLadderStride == 0
+                if lagunaPrefillAsyncFireMask != 0, h.dim(1) > 1,
+                    (lagunaPrefillAsyncFireMask >> UInt64(i)) & 1 == 1
                 {
                     asyncEval(h)
                 }
