@@ -134,6 +134,37 @@ let lagunaFusedRoutedSharedDownResidualEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_ROUTED_SHARED_DOWN_RESIDUAL"] != "0"
 
+/// Dependency-chain split of the merged routed+shared down dispatch
+/// (`DARKBLOOM_SPLIT_SHARED_DOWN`, default ON; set "0" to restore the
+/// merged nine-simdgroup kernel). The same argument as the promoted
+/// routed/shared gate-up split, applied to the down projection: in the
+/// merged kernel, slot 8 (the shared expert's down GEMV) reads only
+/// `shared_activated` -- it has no data dependency on `indices`,
+/// `router_weights`, or the routed activations -- yet it cannot start until
+/// the routed gate/up QMV retires, because the merged dispatch's input set
+/// is the union of both halves'. Splitting issues a bare shared-down GEMV
+/// whose only input is the shared activation, and a routed-down kernel that
+/// folds the join (router-weighted routed reduction, 2.5 routed scale,
+/// shared add, residual add) into its epilogue.
+///
+/// Scheduling: MLX's concurrent encoder inserts buffer-scope barriers, so
+/// overlap is decided by op-creation order. The forward path creates
+/// shared gate/up BEFORE the router top-8 and the shared down BETWEEN the
+/// top-8 and the routed gate/up, which yields the encode windows
+/// `[shared gate/up || top-8] -> [shared down || routed gate/up] ->
+/// [routed down + join]`, taking the whole shared-expert chain off the
+/// critical path. The join kernel also drops from 288 threads (nine
+/// simdgroups, an awkward packing) to 256 (eight).
+///
+/// Arithmetically inert: both kernels are textual replicas of the merged
+/// kernel's two halves -- same qdot, same `simd_sum`, same BF16 cast on
+/// each slot's result, and a join epilogue that is character-identical
+/// except that the shared BF16 value arrives from a device buffer instead
+/// of threadgroup slot 8 (the stored bits are the same
+/// `bfloat(result[row])` either way).
+let lagunaSplitSharedDownEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SPLIT_SHARED_DOWN"] != "0"
+
 /// Routed-expert counterpart to the shared QMV + SwiGLU fusion. Each decode
 /// request supplies exactly eight current-token expert indices; the kernel
 /// reads those banks directly and emits `[1, 1, 8, 1, 512]`.
@@ -5442,6 +5473,258 @@ func lagunaRoutedSharedDownResidual(
     )[0]
 }
 
+/// Bare shared-expert down GEMV: the merged kernel's slot-8 path, verbatim,
+/// with the per-row BF16 result landing in a device vector instead of
+/// threadgroup slot 8. One simdgroup per four-output tile. Its only inputs
+/// are the shared activation and the shared down bank, so the concurrent
+/// encoder can run it against the routed gate/up QMV (see
+/// `lagunaSplitSharedDownEnabled`).
+private let lagunaSharedDownKernel = MLXFast.metalKernel(
+    name: "laguna_shared_nvfp4_down_bf16_v1",
+    inputNames: ["shared_activated", "shared_down_weight", "shared_down_scales"],
+    outputNames: ["shared_down"],
+    source: """
+        constexpr uint outputs_per_simd = 4;
+        constexpr uint values_per_lane = 16;
+        constexpr uint packed_row_bytes = 256;
+        constexpr uint scale_row_bytes = 32;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+        uint first_row = tile * outputs_per_simd;
+
+        thread float input_values[values_per_lane];
+        const device vec<bfloat, 4>* input_vectors =
+            (const device vec<bfloat, 4>*)(
+                shared_activated + lane * values_per_lane);
+        for (uint i = 0; i < values_per_lane / 4; ++i) {
+            const vec<bfloat, 4> values = input_vectors[i];
+            input_values[4 * i] = values[0];
+            input_values[4 * i + 1] = values[1];
+            input_values[4 * i + 2] = values[2];
+            input_values[4 * i + 3] = values[3];
+        }
+
+        thread float result[outputs_per_simd] = {
+            0.0f, 0.0f, 0.0f, 0.0f
+        };
+        for (uint row = 0; row < outputs_per_simd; ++row) {
+            uint output_row = first_row + row;
+            const device uint8_t* weight =
+                (const device uint8_t*)shared_down_weight +
+                output_row * packed_row_bytes + lane * 8;
+            const device uint8_t* scale =
+                shared_down_scales + output_row * scale_row_bytes + lane;
+            result[row] = laguna_nvfp4_qdot_16(
+                weight,
+                input_values,
+                laguna_nvfp4_scale(scale[0]));
+            result[row] = simd_sum(result[row]);
+        }
+        if (lane == 0) {
+            for (uint row = 0; row < outputs_per_simd; ++row) {
+                shared_down[first_row + row] = bfloat(result[row]);
+            }
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
+/// Routed-down + join half of the split: the merged kernel minus its shared
+/// slot. Eight routed simdgroups fill the same threadgroup staging slots,
+/// and the slot-0 epilogue is character-identical to the merged kernel's --
+/// same router-weight products, same sequential slot order, same 2.5 routed
+/// scale, same BF16 rounding points -- except `shared` loads the
+/// `lagunaSharedDownKernel` result from the device vector instead of
+/// threadgroup slot 8. The stored bits are the same `bfloat(result[row])`
+/// value either way, so the join arithmetic sees identical operands.
+private let lagunaRoutedDownSharedJoinKernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_down_shared_join_bf16_v1",
+    inputNames: [
+        "routed_activated", "routed_down_weight", "routed_down_scales",
+        "indices", "router_weights", "shared_down", "residual",
+    ],
+    outputNames: ["output"],
+    source: """
+        constexpr uint input_width = 512;
+        constexpr uint output_width = 2048;
+        constexpr uint routed_experts = 8;
+        constexpr uint outputs_per_simd = 4;
+        constexpr uint values_per_lane = 16;
+        constexpr uint packed_row_bytes = 256;
+        constexpr uint scale_row_bytes = 32;
+        constexpr uint packed_expert_bytes =
+            output_width * packed_row_bytes;
+        constexpr uint scale_expert_bytes =
+            output_width * scale_row_bytes;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint slot = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint first_row = tile * outputs_per_simd;
+        uint expert = uint(indices[slot]);
+
+        const device bfloat* expert_input =
+            routed_activated + slot * input_width;
+        const device uint8_t* expert_weight =
+            (const device uint8_t*)routed_down_weight +
+                expert * packed_expert_bytes;
+        const device uint8_t* expert_scales =
+            routed_down_scales + expert * scale_expert_bytes;
+
+        thread float input_values[values_per_lane];
+        const device vec<bfloat, 4>* input_vectors =
+            (const device vec<bfloat, 4>*)(
+                expert_input + lane * values_per_lane);
+        for (uint i = 0; i < values_per_lane / 4; ++i) {
+            const vec<bfloat, 4> values = input_vectors[i];
+            input_values[4 * i] = values[0];
+            input_values[4 * i + 1] = values[1];
+            input_values[4 * i + 2] = values[2];
+            input_values[4 * i + 3] = values[3];
+        }
+
+        thread float result[outputs_per_simd] = {
+            0.0f, 0.0f, 0.0f, 0.0f
+        };
+        for (uint row = 0; row < outputs_per_simd; ++row) {
+            uint output_row = first_row + row;
+            const device uint8_t* weight =
+                expert_weight + output_row * packed_row_bytes + lane * 8;
+            const device uint8_t* scale =
+                expert_scales + output_row * scale_row_bytes + lane;
+            result[row] = laguna_nvfp4_qdot_16(
+                weight,
+                input_values,
+                laguna_nvfp4_scale(scale[0]));
+            result[row] = simd_sum(result[row]);
+        }
+
+        threadgroup bfloat down_outputs[
+            routed_experts * outputs_per_simd
+        ];
+        if (lane == 0) {
+            for (uint row = 0; row < outputs_per_simd; ++row) {
+                down_outputs[slot * outputs_per_simd + row] =
+                    bfloat(result[row]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (slot == 0 && lane < outputs_per_simd) {
+            bfloat routed_total = bfloat(0);
+            for (uint routed_slot = 0;
+                 routed_slot < routed_experts;
+                 ++routed_slot) {
+                bfloat route_weight =
+                    bfloat(router_weights[routed_slot]);
+                bfloat product = bfloat(
+                    down_outputs[
+                        routed_slot * outputs_per_simd + lane
+                    ] * route_weight);
+                routed_total = bfloat(product + routed_total);
+            }
+            bfloat routed = bfloat(
+                routed_total * bfloat(2.5f));
+            bfloat shared = shared_down[first_row + lane];
+            bfloat r2 = bfloat(routed + shared);
+            output[first_row + lane] =
+                bfloat(residual[first_row + lane] + r2);
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
+/// Split-path wrapper: bare shared-down GEMV over the shared activation.
+/// Issue this as soon as the shared gate/up lands (before the routed
+/// gate/up), so the concurrent encoder can overlap it with the routed QMV.
+func lagunaSharedDown(
+    sharedActivated: MLXArray,
+    sharedDownWeight: MLXArray,
+    sharedDownScales: MLXArray
+) -> MLXArray {
+    precondition(sharedActivated.dtype == .bfloat16)
+    precondition(
+        sharedActivated.shape == [
+            1, 1, LagunaConstants.sharedExpertIntermediateSize,
+        ])
+    precondition(sharedDownWeight.dtype == .uint32)
+    precondition(
+        sharedDownWeight.shape == [
+            LagunaConstants.hiddenSize,
+            LagunaConstants.sharedExpertIntermediateSize / 8,
+        ])
+    precondition(sharedDownScales.dtype == .uint8)
+    precondition(
+        sharedDownScales.shape == [
+            LagunaConstants.hiddenSize,
+            LagunaConstants.sharedExpertIntermediateSize / 16,
+        ])
+
+    return lagunaSharedDownKernel(
+        [sharedActivated, sharedDownWeight, sharedDownScales],
+        grid: ((LagunaConstants.hiddenSize / 4) * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+/// Split-path wrapper: routed down + join over a precomputed shared-down
+/// vector. Preconditions mirror `lagunaRoutedSharedDownResidual`'s routed
+/// half.
+func lagunaRoutedDownSharedJoin(
+    routedActivated: MLXArray,
+    routedDownWeight: MLXArray,
+    routedDownScales: MLXArray,
+    indices: MLXArray,
+    routerWeights: MLXArray,
+    sharedDown: MLXArray,
+    residual: MLXArray
+) -> MLXArray {
+    precondition(routedActivated.dtype == .bfloat16)
+    precondition(
+        routedActivated.shape == [
+            1, 1, LagunaConstants.numExpertsPerTok, 1,
+            LagunaConstants.moeIntermediateSize,
+        ])
+    precondition(routedDownWeight.dtype == .uint32)
+    precondition(
+        routedDownWeight.shape == [
+            LagunaConstants.numExperts,
+            LagunaConstants.hiddenSize,
+            LagunaConstants.moeIntermediateSize / 8,
+        ])
+    precondition(routedDownScales.dtype == .uint8)
+    precondition(
+        routedDownScales.shape == [
+            LagunaConstants.numExperts,
+            LagunaConstants.hiddenSize,
+            LagunaConstants.moeIntermediateSize / 16,
+        ])
+    precondition(indices.dtype == .uint32)
+    precondition(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
+    precondition(routerWeights.dtype == .float32)
+    precondition(routerWeights.shape == [1, 1, LagunaConstants.numExpertsPerTok])
+    precondition(sharedDown.dtype == .bfloat16)
+    precondition(sharedDown.shape == [1, 1, LagunaConstants.hiddenSize])
+    precondition(residual.dtype == .bfloat16)
+    precondition(residual.shape == [1, 1, LagunaConstants.hiddenSize])
+
+    return lagunaRoutedDownSharedJoinKernel(
+        [
+            routedActivated, routedDownWeight, routedDownScales,
+            indices, routerWeights, sharedDown, residual,
+        ],
+        grid: ((LagunaConstants.hiddenSize / 4) * 256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 // MARK: - Layer-0 dense MLP fusion (BF16, no quantization)
 //
 // Layer 0's `gate_proj`/`up_proj`/`down_proj` are plain BF16 `Linear`, never
@@ -7074,7 +7357,53 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     private func forward(
         _ x: MLXArray, residual: MLXArray?, routerLogits: MLXArray?
     ) -> MLXArray {
+        // Split-shared-down pre-issue (`lagunaSplitSharedDownEnabled`): the
+        // shared gate/up is created BEFORE the router top-8 so the
+        // concurrent encoder's barrier windows come out as
+        // `[shared gate/up || top-8] -> [shared down || routed gate/up] ->
+        // [routed down + join]` -- op-creation order decides overlap under
+        // MLX's buffer-scope barriers. Only meaningful when the routed and
+        // shared gate/up QMVs are split (the merged nine-slot dispatch would
+        // hand the shared activation over only alongside the routed one).
+        // Lazy MLX: if a later guard declines and these arrays are never
+        // consumed, they are never evaluated -- no wasted work on fallback.
+        var preSharedActivated: MLXArray?
+        var preSharedBanks:
+            (
+                gateUpWeight: MLXArray, gateUpScales: MLXArray,
+                downWeight: MLXArray, downScales: MLXArray
+            )?
+        if lagunaSplitSharedDownEnabled,
+            lagunaFusedRoutedSharedDownResidualEnabled,
+            !lagunaFusedRoutedSharedSwiGLUQMVEnabled,
+            x.dim(1) == 1,
+            x.dtype == .bfloat16,
+            x.shape == [1, 1, LagunaConstants.hiddenSize],
+            let banks = sharedExpert.fusedSharedBanks(x)
+        {
+            lagunaTrace("shared gate/up QMV + SwiGLU (pre-top8)")
+            preSharedActivated = lagunaSharedSwiGLUQMV(
+                x,
+                fusedWeight: banks.gateUpWeight,
+                fusedScales: banks.gateUpScales
+            )
+            preSharedBanks = banks
+        }
         let (inds, weights) = gate(x, logits: routerLogits)
+        // The shared down is created here -- after the top-8, before the
+        // routed gate/up below -- completing the barrier-window layout
+        // described above.
+        var preSharedDown: MLXArray?
+        if let sharedActivated = preSharedActivated,
+            let banks = preSharedBanks
+        {
+            lagunaTrace("shared down (pre-routed)")
+            preSharedDown = lagunaSharedDown(
+                sharedActivated: sharedActivated,
+                sharedDownWeight: banks.downWeight,
+                sharedDownScales: banks.downScales
+            )
+        }
         var y: MLXArray
         var routedAlreadyReduced = false
         var sortedTailInverseOrder: MLXArray?
@@ -7150,7 +7479,44 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 activated = lagunaInterleavedSwiGLU(
                     gateUp, split: _fusedRoutedGateUpSplit)
             }
-            if lagunaFusedRoutedSharedDownResidualEnabled,
+            if let sharedDown = preSharedDown,
+                let residual,
+                let downWeight = _routedDownWeight,
+                let downScales = _routedDownScales,
+                activated.dtype == .bfloat16,
+                activated.shape == [
+                    1, 1, LagunaConstants.numExpertsPerTok, 1,
+                    LagunaConstants.moeIntermediateSize,
+                ],
+                downWeight.dtype == .uint32,
+                downWeight.shape == [
+                    LagunaConstants.numExperts,
+                    LagunaConstants.hiddenSize,
+                    LagunaConstants.moeIntermediateSize / 8,
+                ],
+                downScales.dtype == .uint8,
+                downScales.shape == [
+                    LagunaConstants.numExperts,
+                    LagunaConstants.hiddenSize,
+                    LagunaConstants.moeIntermediateSize / 16,
+                ],
+                weights.dtype == .float32,
+                weights.shape == [1, 1, LagunaConstants.numExpertsPerTok],
+                routedScalingFactor == Float(LagunaConstants.moeRoutedScalingFactor),
+                residual.dtype == .bfloat16,
+                residual.shape == [1, 1, LagunaConstants.hiddenSize]
+            {
+                lagunaTrace("routed down + shared join")
+                return lagunaRoutedDownSharedJoin(
+                    routedActivated: activated,
+                    routedDownWeight: downWeight,
+                    routedDownScales: downScales,
+                    indices: inds,
+                    routerWeights: weights,
+                    sharedDown: sharedDown,
+                    residual: residual
+                )
+            } else if lagunaFusedRoutedSharedDownResidualEnabled,
                 let residual,
                 let downWeight = _routedDownWeight,
                 let downScales = _routedDownScales,
