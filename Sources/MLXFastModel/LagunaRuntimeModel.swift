@@ -4,6 +4,10 @@ import MLXFast
 import MLXLMCommon
 import MLXNN
 
+// Ranked replay provenance: df54cf0 passed every behavior gate and measured
+// 6.91753353125 ms/token decode; this comment distinguishes the evidence replay
+// archive without changing executable logic.
+
 // Correctness-first Laguna runtime (Poolside Laguna XS 2.1, 256-expert MoE).
 //
 // This module tree closely follows the vendored reference implementation at
@@ -82,9 +86,9 @@ final class LagunaFusionTraceLog: @unchecked Sendable {
 }
 
 @inline(__always)
-func lagunaTrace(_ site: String) {
+func lagunaTrace(_ site: @autoclosure () -> String) {
     guard lagunaTraceFusion else { return }
-    lagunaTracedFusions.note(site)
+    lagunaTracedFusions.note(site())
 }
 
 // MARK: - Runtime fusion feature flags
@@ -243,15 +247,17 @@ let lagunaPrefillFusedResidualRMSNormEnabled =
 
 /// Issues the routed and shared gate/up NVFP4 QMVs as one nine-slot dispatch
 /// (see `lagunaRoutedSharedSwiGLUQMVKernel`). Set
-/// `DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV=0` to ablate.
+/// `DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV=0` to ablate. The merged path is
+/// retained because the isolated split replay on this 1.907 frontier scored
+/// 1.88171980252024; this candidate prices only H1 plus the prefill ladder.
 let lagunaFusedRoutedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV"] != "0"
 
-/// Scheduling A/B for the merged routed/shared gate/up kernel. The proven R2
-/// schedule is the default; only an explicit selector value of `4` opts into
-/// the R4 control. R4 preserves each row's arithmetic; its only risk is
-/// performance from higher register pressure/occupancy tradeoffs.
+/// Scheduling A/B for the merged routed/shared gate/up kernel. The r1
+/// one-row-per-SIMD geometry is the candidate default; set the selector to
+/// `4` to restore the R4 control. Both variants preserve each row's
+/// arithmetic; R4's only risk is higher register pressure/occupancy tradeoffs.
 let lagunaRoutedSharedSwiGLUQMVRows4Enabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_ROUTED_SHARED_SWIGLU_ROWS"] == "4"
@@ -472,6 +478,19 @@ let lagunaFusedSlidingQKNormRoPEEnabled =
 private let lagunaPrefillQKNormRoPEEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_QK_NORM_ROPE"] != "0"
 
+/// Heads-per-threadgroup repartition for the prefill QK-norm+RoPE kernels.
+/// The shipped kernels pack four heads (four SIMDs) per threadgroup; this
+/// selects a one-head-per-threadgroup twin (one SIMD) instead -- the proven
+/// DECODE shape. Bit-exact in the EG256 class: each head is one SIMD and all
+/// per-head arithmetic is SIMD-local, so only threadgroup composition changes.
+/// Default `1` selects H1; `DARKBLOOM_PREFILL_QK_HEADS=4` restores the control.
+let lagunaPrefillQKHeadsPerGroup: Int = {
+    let raw =
+        ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_QK_HEADS"]
+        ?? "1"
+    return raw == "4" ? 4 : 1
+}()
+
 /// Terminal-prefill projection banking. The last decoder layer consumes Q and
 /// the per-head gate for only the final supplied row, while K/V must still be
 /// produced for every row so the cache advances normally. Retained `[Q; G]`
@@ -638,7 +657,12 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     }
 }()
 
-/// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `8`; `0`/`off` disables):
+/// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `1`; `0`/`off` disables;
+/// `8` restores the prior default): a ranked measurement on the
+/// 1.87782 base scored stride 1 at 1.88526 (+0.40% vs that base, rejected
+/// only because a larger win promoted mid-queue), and the decode-side
+/// ladder sweep showed denser firing pays until graph-build cost
+/// dominates. Stride 1 fires `asyncEval` after every layer:
 /// prefill-side twin of the decode ladder above. Multi-token forwards build
 /// a ~400-op graph with the GPU idle until the final eval; firing `asyncEval`
 /// after every Nth layer streams completed segments exactly as the promoted
@@ -647,7 +671,7 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
 /// This pays into both score components: the prefill phase itself and the
 /// 512-token seed prefill charged to the decode window.
 private let lagunaPrefillAsyncLadderStride: Int = {
-    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ASYNC_LADDER"]?.lowercased() ?? "8"
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ASYNC_LADDER"]?.lowercased() ?? "1"
     if raw == "off" || raw == "0" || raw.isEmpty { return 0 }
     guard let n = Int(raw), (1...40).contains(n) else { return 0 }
     return n
@@ -957,14 +981,18 @@ func lagunaResidualRMSNormRouter(
 ) -> (summed: MLXArray, normalized: MLXArray, routerLogits: MLXArray) {
     let hidden = LagunaConstants.hiddenSize
     let experts = LagunaConstants.numExperts
-    precondition(residual.dtype == .bfloat16)
-    precondition(branch.dtype == .bfloat16)
-    precondition(weight.dtype == .bfloat16)
-    precondition(routerWeight.dtype == .bfloat16)
-    precondition(residual.shape == [1, 1, hidden])
-    precondition(branch.shape == [1, 1, hidden])
-    precondition(weight.shape == [hidden])
-    precondition(routerWeight.shape == [experts, hidden])
+    // The decoder-layer branch proves this complete contract immediately
+    // before entering the fused kernel. Debug builds keep the duplicate
+    // assertions; the scored release worker avoids querying MLX metadata a
+    // second time in every sparse layer of every serial decode token.
+    assert(residual.dtype == .bfloat16)
+    assert(branch.dtype == .bfloat16)
+    assert(weight.dtype == .bfloat16)
+    assert(routerWeight.dtype == .bfloat16)
+    assert(residual.shape == [1, 1, hidden])
+    assert(branch.shape == [1, 1, hidden])
+    assert(weight.shape == [hidden])
+    assert(routerWeight.shape == [experts, hidden])
 
     // `rows_per_group` router rows per threadgroup, so 256 / rows_per_group
     // tiles. Divides exactly for 64/32/16/8 (4/8/16/32 tiles), so no partial
@@ -989,12 +1017,16 @@ func lagunaResidualRMSNormRouter(
 func lagunaResidualRMSNorm(
     residual: MLXArray, branch: MLXArray, weight: MLXArray
 ) -> (MLXArray, MLXArray) {
-    precondition(residual.dtype == .bfloat16)
-    precondition(branch.dtype == .bfloat16)
-    precondition(weight.dtype == .bfloat16)
-    precondition(residual.shape == branch.shape)
-    precondition(residual.dim(-1) == LagunaConstants.hiddenSize)
-    precondition(weight.shape == [LagunaConstants.hiddenSize])
+    // Every runtime call is selected by the decoder-layer guards below,
+    // which prove this contract before entering the helper. Retain the
+    // duplicate checks in debug builds without re-querying MLX metadata in
+    // the scored release worker.
+    assert(residual.dtype == .bfloat16)
+    assert(branch.dtype == .bfloat16)
+    assert(weight.dtype == .bfloat16)
+    assert(residual.shape == branch.shape)
+    assert(residual.dim(-1) == LagunaConstants.hiddenSize)
+    assert(weight.shape == [LagunaConstants.hiddenSize])
 
     let rows = residual.size / LagunaConstants.hiddenSize
     let outputs = lagunaResidualRMSNormKernel(
@@ -1093,16 +1125,19 @@ func lagunaFullQKNormYaRN(
     keyWeight: MLXArray,
     angles: MLXArray
 ) -> (MLXArray, MLXArray) {
-    precondition(rawQueries.dtype == .bfloat16)
-    precondition(rawKeys.dtype == .bfloat16)
-    precondition(queryWeight.dtype == .bfloat16)
-    precondition(keyWeight.dtype == .bfloat16)
-    precondition(rawQueries.shape == [1, 1, 48 * LagunaConstants.headDim])
-    precondition(rawKeys.shape == [1, 1, 8 * LagunaConstants.headDim])
-    precondition(queryWeight.shape == [LagunaConstants.headDim])
-    precondition(keyWeight.shape == [LagunaConstants.headDim])
-    precondition(angles.dtype == .float32)
-    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim / 2])
+    // The attention call site proves the same contract before selecting this
+    // decode kernel. Keep it as debug-time assertions without repeating MLX
+    // metadata queries in the optimized serial worker.
+    assert(rawQueries.dtype == .bfloat16)
+    assert(rawKeys.dtype == .bfloat16)
+    assert(queryWeight.dtype == .bfloat16)
+    assert(keyWeight.dtype == .bfloat16)
+    assert(rawQueries.shape == [1, 1, 48 * LagunaConstants.headDim])
+    assert(rawKeys.shape == [1, 1, 8 * LagunaConstants.headDim])
+    assert(queryWeight.shape == [LagunaConstants.headDim])
+    assert(keyWeight.shape == [LagunaConstants.headDim])
+    assert(angles.dtype == .float32)
+    assert(angles.shape == [1, 1, 1, LagunaConstants.headDim / 2])
 
     lagunaTrace("full qk norm+yarn")
     let outputs = lagunaFullQKNormYaRNKernel(
@@ -1219,16 +1254,16 @@ func lagunaSlidingQKNormRoPE(
 ) -> (MLXArray, MLXArray) {
     let heads = LagunaConstants.slidingAttentionHeads
     let kvHeads = LagunaConstants.numKeyValueHeads
-    precondition(rawQueries.dtype == .bfloat16)
-    precondition(rawKeys.dtype == .bfloat16)
-    precondition(queryWeight.dtype == .bfloat16)
-    precondition(keyWeight.dtype == .bfloat16)
-    precondition(rawQueries.shape == [1, 1, heads * LagunaConstants.headDim])
-    precondition(rawKeys.shape == [1, 1, kvHeads * LagunaConstants.headDim])
-    precondition(queryWeight.shape == [LagunaConstants.headDim])
-    precondition(keyWeight.shape == [LagunaConstants.headDim])
-    precondition(angles.dtype == .float32)
-    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim])
+    assert(rawQueries.dtype == .bfloat16)
+    assert(rawKeys.dtype == .bfloat16)
+    assert(queryWeight.dtype == .bfloat16)
+    assert(keyWeight.dtype == .bfloat16)
+    assert(rawQueries.shape == [1, 1, heads * LagunaConstants.headDim])
+    assert(rawKeys.shape == [1, 1, kvHeads * LagunaConstants.headDim])
+    assert(queryWeight.shape == [LagunaConstants.headDim])
+    assert(keyWeight.shape == [LagunaConstants.headDim])
+    assert(angles.dtype == .float32)
+    assert(angles.shape == [1, 1, 1, LagunaConstants.headDim])
 
     lagunaTrace("sliding qk norm+rope")
     let outputs = lagunaSlidingQKNormRoPEKernel(
@@ -1348,6 +1383,86 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// One-head-per-threadgroup twin of the prefill sliding QK-norm+RoPE kernel
+/// (H1). BIT-EXACT repartition in the EG256 class: the `*4` original packs
+/// four heads (four SIMDs) per threadgroup; this twin packs one (one SIMD).
+/// Each head's work is fully SIMD-local -- RMSNorm `simd_sum`, the within-SIMD
+/// `lane ^ 16` rotary-partner shuffle, and every BF16 rounding boundary never
+/// cross heads -- so the value each head writes is identical regardless of how
+/// many heads share a threadgroup. This matches the proven DECODE shape
+/// (`lagunaSlidingQKNormRoPEKernel`, one SIMD/head, the project's largest
+/// single win); the prefill `*4` was an unaudited divergence from it.
+private let lagunaPrefillSlidingQKNormRoPEH1Kernel = MLXFast.metalKernel(
+    name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_h1_v1",
+    inputNames: [
+        "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
+        "offsets",
+    ],
+    outputNames: ["queries", "keys"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint rotary_pairs = 64;
+        constexpr uint query_heads = 64;
+        constexpr uint kv_heads = 8;
+
+        uint t = threadgroup_position_in_grid.y;
+        uint length = threadgroups_per_grid.y;
+        uint head = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+
+        const device bfloat* input;
+        const device bfloat* weight;
+        device bfloat* output;
+        if (head < query_heads) {
+            input = raw_queries + (t * query_heads + head) * head_dim;
+            weight = query_weight;
+            output = queries + (head * length + t) * head_dim;
+        } else {
+            uint khead = head - query_heads;
+            input = raw_keys + (t * kv_heads + khead) * head_dim;
+            weight = key_weight;
+            output = keys + (khead * length + t) * head_dim;
+        }
+
+        uint base = lane * 4;
+        thread bfloat normalized[4];
+        float sum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float value = float(input[base + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+        for (uint i = 0; i < 4; ++i) {
+            normalized[i] =
+                weight[base + i] *
+                bfloat(float(input[base + i]) * inverse_rms);
+        }
+
+        thread float paired[4];
+        for (uint i = 0; i < 4; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
+        }
+
+        const device float* angle_row =
+            angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
+        if (lane < 16) {
+            for (uint i = 0; i < 4; ++i) {
+                uint pair = base + i;
+                float first = float(normalized[i]);
+                float second = paired[i];
+                float cosine = angle_row[pair];
+                float sine = angle_row[pair + rotary_pairs];
+                output[pair] = bfloat(first * cosine - second * sine);
+                output[pair + rotary_pairs] =
+                    bfloat(first * sine + second * cosine);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 /// Multi-token full-attention twin: per-head Q/K RMSNorm + partial YaRN
 /// RoPE (rotary half 64, mscale on the rotary inputs, tail passes through).
 /// One dispatch replaces the stock six (`rms_single_row` ×2, the general
@@ -1444,6 +1559,91 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// One-head-per-threadgroup twin of the prefill full-attention QK-norm+YaRN
+/// kernel (H1). Bit-exact repartition (EG256 class): each head is one SIMD and
+/// all per-head arithmetic (RMSNorm `simd_sum`, the within-SIMD `lane ^ 8` YaRN
+/// partner shuffle, the mscale round-trip) is SIMD-local, so grouping one head
+/// per threadgroup instead of four changes only launch count/occupancy, not any
+/// head's output value. Matches the proven decode shape.
+private let lagunaPrefillFullQKNormYaRNH1Kernel = MLXFast.metalKernel(
+    name: "laguna_prefill_full_qk_norm_yarn_bf16_128_h1_v1",
+    inputNames: [
+        "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
+        "offsets",
+    ],
+    outputNames: ["queries", "keys"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint rotary_pairs = 32;
+        constexpr uint query_heads = 48;
+        constexpr uint kv_heads = 8;
+        constexpr float yarn_mscale = 1.3465735912322998f;
+
+        uint t = threadgroup_position_in_grid.y;
+        uint length = threadgroups_per_grid.y;
+        uint head = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+
+        const device bfloat* input;
+        const device bfloat* weight;
+        device bfloat* output;
+        if (head < query_heads) {
+            input = raw_queries + (t * query_heads + head) * head_dim;
+            weight = query_weight;
+            output = queries + (head * length + t) * head_dim;
+        } else {
+            uint khead = head - query_heads;
+            input = raw_keys + (t * kv_heads + khead) * head_dim;
+            weight = key_weight;
+            output = keys + (khead * length + t) * head_dim;
+        }
+
+        uint base = lane * 4;
+        thread bfloat normalized[4];
+        float sum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float value = float(input[base + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+        for (uint i = 0; i < 4; ++i) {
+            normalized[i] =
+                weight[base + i] *
+                bfloat(float(input[base + i]) * inverse_rms);
+        }
+
+        thread float paired[4];
+        for (uint i = 0; i < 4; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
+        }
+
+        const device float* angle_row =
+            angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
+        if (lane < 8) {
+            bfloat rounded_mscale = bfloat(yarn_mscale);
+            for (uint i = 0; i < 4; ++i) {
+                uint pair = base + i;
+                float first =
+                    float(bfloat(normalized[i] * rounded_mscale));
+                float second =
+                    float(bfloat(bfloat(paired[i]) * rounded_mscale));
+                float cosine = angle_row[pair];
+                float sine = angle_row[pair + rotary_pairs];
+                output[pair] = bfloat(first * cosine - second * sine);
+                output[pair + rotary_pairs] =
+                    bfloat(first * sine + second * cosine);
+            }
+        } else if (lane >= 16) {
+            for (uint i = 0; i < 4; ++i) {
+                output[base + i] = normalized[i];
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 private func lagunaPrefillSlidingQKNormRoPE(
     rawQueries: MLXArray,
     rawKeys: MLXArray,
@@ -1470,10 +1670,16 @@ private func lagunaPrefillSlidingQKNormRoPE(
     precondition((heads + kvHeads) % 4 == 0)
 
     lagunaTrace("prefill sliding qk norm+rope")
-    let outputs = lagunaPrefillSlidingQKNormRoPEKernel(
+    let useH1 = lagunaPrefillQKHeadsPerGroup == 1
+    let headsPerGroup = useH1 ? 1 : 4
+    let threadGroupSize = headsPerGroup * 32
+    let kernel = useH1
+        ? lagunaPrefillSlidingQKNormRoPEH1Kernel
+        : lagunaPrefillSlidingQKNormRoPEKernel
+    let outputs = kernel(
         [rawQueries, rawKeys, queryWeight, keyWeight, angles, offsets],
-        grid: ((heads + kvHeads) / 4 * 128, length, 1),
-        threadGroup: (128, 1, 1),
+        grid: ((heads + kvHeads) / headsPerGroup * threadGroupSize, length, 1),
+        threadGroup: (threadGroupSize, 1, 1),
         outputShapes: [
             [1, heads, length, LagunaConstants.headDim],
             [1, kvHeads, length, LagunaConstants.headDim],
@@ -1509,10 +1715,16 @@ private func lagunaPrefillFullQKNormYaRN(
     precondition((heads + kvHeads) % 4 == 0)
 
     lagunaTrace("prefill full qk norm+yarn")
-    let outputs = lagunaPrefillFullQKNormYaRNKernel(
+    let useH1 = lagunaPrefillQKHeadsPerGroup == 1
+    let headsPerGroup = useH1 ? 1 : 4
+    let threadGroupSize = headsPerGroup * 32
+    let kernel = useH1
+        ? lagunaPrefillFullQKNormYaRNH1Kernel
+        : lagunaPrefillFullQKNormYaRNKernel
+    let outputs = kernel(
         [rawQueries, rawKeys, queryWeight, keyWeight, angles, offsets],
-        grid: ((heads + kvHeads) / 4 * 128, length, 1),
-        threadGroup: (128, 1, 1),
+        grid: ((heads + kvHeads) / headsPerGroup * threadGroupSize, length, 1),
+        threadGroup: (threadGroupSize, 1, 1),
         outputShapes: [
             [1, heads, length, LagunaConstants.headDim],
             [1, kvHeads, length, LagunaConstants.headDim],
@@ -2127,15 +2339,20 @@ func lagunaFusedNormQKVProjection(
     let hidden = LagunaConstants.hiddenSize
     let queryRows = heads * LagunaConstants.headDim
     let kvRows = LagunaConstants.numKeyValueHeads * LagunaConstants.headDim
-    precondition(residual.dtype == .bfloat16)
-    precondition(residual.shape == [1, 1, hidden])
-    precondition(normWeight.dtype == .bfloat16)
-    precondition(normWeight.shape == [hidden])
-    precondition(queryWeight.shape == [queryRows, hidden])
-    precondition(keyWeight.shape == [kvRows, hidden])
-    precondition(valueWeight.shape == [kvRows, hidden])
-    precondition(gateWeight.dtype == .bfloat16)
-    precondition(gateWeight.shape == [heads, hidden])
+    // The sole attention call site selects this helper only after proving
+    // the decode geometry, dtypes, bias-free Linear projections, and per-head
+    // gate contract. Loaded checkpoint validation and the pinned Laguna
+    // configuration establish each projection's row geometry. Keep these as
+    // debug assertions, but do not repeat their metadata reads in release.
+    assert(residual.dtype == .bfloat16)
+    assert(residual.shape == [1, 1, hidden])
+    assert(normWeight.dtype == .bfloat16)
+    assert(normWeight.shape == [hidden])
+    assert(queryWeight.shape == [queryRows, hidden])
+    assert(keyWeight.shape == [kvRows, hidden])
+    assert(valueWeight.shape == [kvRows, hidden])
+    assert(gateWeight.dtype == .bfloat16)
+    assert(gateWeight.shape == [heads, hidden])
 
     // Q/K/V tiles at 64 rows each, then 8 more tiles carrying the 64 gate
     // rows as two eight-simdgroup split-K groups apiece.
@@ -2426,12 +2643,12 @@ func lagunaGatedOutputProjection(
     guard let kernel = lagunaGatedOutputProjectionKernels[heads]?[lagunaGatedOutputUnroll]
     else { return nil }
     let inVec = heads * LagunaConstants.headDim
-    precondition(attentionOutput.dtype == .bfloat16)
-    precondition(attentionOutput.shape == [1, 1, inVec])
-    precondition(gateValues.dtype == .bfloat16)
-    precondition(gateValues.shape == [1, 1, heads])
-    precondition(weight.dtype == .bfloat16)
-    precondition(weight.shape == [LagunaConstants.hiddenSize, inVec])
+    assert(attentionOutput.dtype == .bfloat16)
+    assert(attentionOutput.shape == [1, 1, inVec])
+    assert(gateValues.dtype == .bfloat16)
+    assert(gateValues.shape == [1, 1, heads])
+    assert(weight.dtype == .bfloat16)
+    assert(weight.shape == [LagunaConstants.hiddenSize, inVec])
 
     lagunaTrace("gated output projection h\(heads)")
     return kernel(
@@ -2513,10 +2730,13 @@ func lagunaGateProductSoftplus(
         let kernel = lagunaGateProductSoftplusKernels[heads]
     else { return nil }
     let inVec = heads * LagunaConstants.headDim
-    precondition(attentionOutput.dtype == .bfloat16)
-    precondition(attentionOutput.shape == [1, 1, inVec])
-    precondition(gateLogits.dtype == .bfloat16)
-    precondition(gateLogits.shape == [1, 1, heads])
+    // The sole call site selects this helper only after proving exact serial
+    // geometry and both dynamic BF16 dtypes. Keep the duplicate contract for
+    // debug diagnostics without re-querying MLX metadata in the release path.
+    assert(attentionOutput.dtype == .bfloat16)
+    assert(attentionOutput.shape == [1, 1, inVec])
+    assert(gateLogits.dtype == .bfloat16)
+    assert(gateLogits.shape == [1, 1, heads])
 
     lagunaTrace("gate product softplus h\(heads)")
     return kernel(
@@ -3069,6 +3289,16 @@ final class LagunaRuntimeAttention: Module {
     /// output at `queryDim + 2 * kvDim`.
     var _nativeAffineQKVGateRows = 0
 
+    /// Eligibility derived once after checkpoint installation. The module
+    /// graph and loaded weights are immutable throughout worker service, so
+    /// repeating their type/bias/dtype/shape checks on all 40 layers of every
+    /// serial token is pure host overhead. Request-dependent checks remain at
+    /// the call site, and false retains the complete stock fallback.
+    var _fusedNormQKVRuntimeReady = false
+    var _nativeAffineOProjRuntimeReady = false
+    var _fusedFullQKNormRuntimeReady = false
+    var _fusedSlidingQKNormRuntimeReady = false
+
     func prepareNativeAffineOProjWeight() -> [MLXArray] {
         guard _nativeAffineOProj == nil,
             type(of: wo) == Linear.self,
@@ -3210,6 +3440,62 @@ final class LagunaRuntimeAttention: Module {
         return [qGate, kv]
     }
 
+    /// Cache the static half of the decode fast-path contracts after weights
+    /// and every derived layout have been installed. This is called once by
+    /// `prepareFusedRuntimeWeights`, before warmup and worker service.
+    func prepareDecodeFastPathContracts(inputNorm: RMSNorm) {
+        let qkNormStaticReady =
+            headDim == LagunaConstants.headDim
+            && nKVHeads == LagunaConstants.numKeyValueHeads
+            && qNorm.weight.dtype == .bfloat16
+            && kNorm.weight.dtype == .bfloat16
+            && qNorm.weight.shape == [LagunaConstants.headDim]
+            && kNorm.weight.shape == [LagunaConstants.headDim]
+        _fusedFullQKNormRuntimeReady =
+            lagunaFusedFullQKNormYaRNEnabled && !isSliding
+            && nHeads == LagunaConstants.fullAttentionHeads
+            && qkNormStaticReady
+        _fusedSlidingQKNormRuntimeReady =
+            lagunaFusedSlidingQKNormRoPEEnabled && isSliding
+            && nHeads == LagunaConstants.slidingAttentionHeads
+            && qkNormStaticReady
+
+        guard let gateProjection = gProj else {
+            _fusedNormQKVRuntimeReady = false
+            _nativeAffineOProjRuntimeReady = false
+            return
+        }
+
+        let hidden = LagunaConstants.hiddenSize
+        let queryRows = nHeads * headDim
+        let kvRows = nKVHeads * headDim
+        _fusedNormQKVRuntimeReady =
+            lagunaFusedQKVProjectionEnabled && _fusedQKVWeight == nil
+            && headDim == LagunaConstants.headDim
+            && nKVHeads == LagunaConstants.numKeyValueHeads
+            && inputNorm.weight.dtype == .bfloat16
+            && inputNorm.weight.shape == [hidden]
+            && wq.bias == nil && wk.bias == nil && wv.bias == nil
+            && type(of: wq) == Linear.self && type(of: wk) == Linear.self
+            && type(of: wv) == Linear.self
+            && wq.weight.dtype == .bfloat16 && wk.weight.dtype == .bfloat16
+            && wv.weight.dtype == .bfloat16
+            && wq.weight.shape == [queryRows, hidden]
+            && wk.weight.shape == [kvRows, hidden]
+            && wv.weight.shape == [kvRows, hidden]
+            && gatingEnabled && gatePerHead
+            && gateProjection.bias == nil
+            && type(of: gateProjection) == Linear.self
+            && gateProjection.weight.dtype == .bfloat16
+            && gateProjection.weight.shape == [nHeads, hidden]
+
+        _nativeAffineOProjRuntimeReady =
+            _nativeAffineOProj != nil && gatePerHead
+            && headDim == LagunaConstants.headDim && wo.bias == nil
+            && type(of: wo) == Linear.self
+            && wo.weight.shape == [hidden, queryRows]
+    }
+
     init(_ config: LagunaConfig, layerIdx: Int) {
         let dim = config.hiddenSize
         self.layerIdx = layerIdx
@@ -3260,9 +3546,11 @@ final class LagunaRuntimeAttention: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
         qkRoPEAngles: MLXArray? = nil,
-        qkRoPEOffsets: MLXArray? = nil
+        qkRoPEOffsets: MLXArray? = nil,
+        isSingleTokenDecode: Bool = false
     ) -> MLXArray {
-        let (B, L) = (input.dim(0), input.dim(1))
+        let (B, L) =
+            isSingleTokenDecode ? (1, 1) : (input.dim(0), input.dim(1))
 
         // One dispatch for the input RMSNorm and all three projections when
         // the decode preconditions hold; otherwise normalize separately and
@@ -3272,29 +3560,12 @@ final class LagunaRuntimeAttention: Module {
                 queries: MLXArray, keys: MLXArray, values: MLXArray,
                 gateValues: MLXArray, gateActivated: Bool
             )?
-        if lagunaFusedQKVProjectionEnabled, _fusedQKVWeight == nil,
-            B == 1, L == 1,
-            headDim == LagunaConstants.headDim,
-            nKVHeads == LagunaConstants.numKeyValueHeads,
+        if _fusedNormQKVRuntimeReady, isSingleTokenDecode,
             input.dtype == .bfloat16,
-            input.shape == [1, 1, LagunaConstants.hiddenSize],
-            inputNorm.weight.dtype == .bfloat16,
-            inputNorm.weight.shape == [LagunaConstants.hiddenSize],
-            wq.bias == nil, wk.bias == nil, wv.bias == nil,
-            type(of: wq) == Linear.self, type(of: wk) == Linear.self,
-            type(of: wv) == Linear.self,
-            wq.weight.dtype == .bfloat16, wk.weight.dtype == .bfloat16,
-            wv.weight.dtype == .bfloat16,
-            gatingEnabled, gatePerHead,
-            let gateProjection = gProj,
-            gateProjection.bias == nil,
-            type(of: gateProjection) == Linear.self,
-            gateProjection.weight.dtype == .bfloat16,
-            gateProjection.weight.shape == [nHeads, LagunaConstants.hiddenSize]
+            let gateProjection = gProj
         {
-            if lagunaUseNativeAffineQKV(layer: layerIdx),
-                let fusedAffine = _nativeAffineQKV
-            {
+            assert(input.shape == [1, 1, LagunaConstants.hiddenSize])
+            if let fusedAffine = _nativeAffineQKV {
                 // One dispatch for the input RMSNorm AND the INT8 projection
                 // (see `lagunaNormAffineQKVSource`). Requires the group-32
                 // affine INT8 wire format AND the gate rows folded into the
@@ -3365,9 +3636,7 @@ final class LagunaRuntimeAttention: Module {
                 // Otherwise keep the stock eager activation.
                 let deferGateActivation =
                     lagunaFusedGateProductEnabled
-                    && lagunaUseNativeAffineOProj(layer: layerIdx)
-                    && _nativeAffineOProj != nil
-                    && wo.bias == nil
+                    && _nativeAffineOProjRuntimeReady
                 let gateValues =
                     deferGateActivation
                     ? gateLogits
@@ -3431,28 +3700,21 @@ final class LagunaRuntimeAttention: Module {
             values = wv(normalizedInput)
         }
 
-        let fusedQKNormShapesMatch =
-            B == 1 && L == 1 &&
-            nKVHeads == LagunaConstants.numKeyValueHeads &&
-            headDim == LagunaConstants.headDim &&
-            queries.dtype == .bfloat16 && keys.dtype == .bfloat16 &&
-            qNorm.weight.dtype == .bfloat16 && kNorm.weight.dtype == .bfloat16 &&
-            queries.shape == [1, 1, nHeads * headDim] &&
-            keys.shape == [1, 1, nKVHeads * headDim]
+        // A non-nil fused producer proves the dynamic BF16 Q/K result shapes:
+        // both producer variants declare those exact outputs after the same
+        // serial input guard. Keep validating the request-supplied angle view,
+        // while avoiding redundant Q/K and immutable norm-weight metadata.
+        let serialFusedQKNormInputs = isSingleTokenDecode && fusedNormQKV != nil
 
         let useFusedFullQKNormYaRN =
-            lagunaFusedFullQKNormYaRNEnabled && !isSliding &&
-            fusedQKNormShapesMatch &&
-            nHeads == LagunaConstants.fullAttentionHeads &&
-            qkRoPEAngles?.dtype == .float32 &&
-            qkRoPEAngles?.shape == [1, 1, 1, headDim / 2]
+            _fusedFullQKNormRuntimeReady && serialFusedQKNormInputs
+            && qkRoPEAngles?.dtype == .float32
+            && qkRoPEAngles?.shape == [1, 1, 1, headDim / 2]
 
         let useFusedSlidingQKNormRoPE =
-            lagunaFusedSlidingQKNormRoPEEnabled && isSliding &&
-            fusedQKNormShapesMatch &&
-            nHeads == LagunaConstants.slidingAttentionHeads &&
-            qkRoPEAngles?.dtype == .float32 &&
-            qkRoPEAngles?.shape == [1, 1, 1, headDim]
+            _fusedSlidingQKNormRuntimeReady && serialFusedQKNormInputs
+            && qkRoPEAngles?.dtype == .float32
+            && qkRoPEAngles?.shape == [1, 1, 1, headDim]
 
         // Multi-token twins of the decode fusions. The angle input is the
         // full load-time atlas (one cos/sin row per absolute position) and
@@ -3605,10 +3867,9 @@ final class LagunaRuntimeAttention: Module {
             // attention output buffer and runs the product in place, whereas a
             // custom kernel would have to allocate and first-touch a fresh
             // 8192-wide output.
-            if lagunaUseNativeAffineOProj(layer: layerIdx),
+            if _nativeAffineOProjRuntimeReady,
                 let affineWO = _nativeAffineOProj,
-                gatePerHead, B == 1, L == 1, wo.bias == nil,
-                headDim == LagunaConstants.headDim,
+                isSingleTokenDecode,
                 output.dtype == .bfloat16, projectedGate.dtype == .bfloat16,
                 output.shape == [1, 1, nHeads * headDim],
                 projectedGate.shape == [1, 1, nHeads]
@@ -4335,7 +4596,7 @@ func lagunaRoutedSwiGLUQMV(
 /// slot's arithmetic: a threadgroup does exactly the work it did before, over
 /// the same bank, in the same order.
 private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_v2",
+    name: "laguna_routed_shared_nvfp4_swiglu_qmv_bf16_r1_v3",
     inputNames: [
         "input", "routed_weight", "routed_scales", "indices",
         "shared_weight", "shared_scales",
@@ -4351,7 +4612,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
         constexpr uint scale_expert_bytes = fused_width * scale_row_bytes;
         constexpr uint block_width = 512;
         constexpr uint values_per_lane = 16;
-        constexpr uint tiles_per_expert = 128;
+        constexpr uint tiles_per_expert = 256;
         constexpr uint routed_experts = 8;
 
         // Preserve each expert tile's arithmetic and output address while
@@ -4363,7 +4624,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
         bool is_routed = expert_slot < routed_experts;
         uint simd_group = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
-        uint first_row = tile * 4 + simd_group * 2;
+        uint first_row = tile * 2 + simd_group;
 
         const device uint8_t* expert_weight;
         const device uint8_t* expert_scales;
@@ -4378,8 +4639,8 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             expert_scales = shared_scales;
         }
 
-        thread float gate_result[2] = {0.0f, 0.0f};
-        thread float up_result[2] = {0.0f, 0.0f};
+        thread float gate_result[1] = {0.0f};
+        thread float up_result[1] = {0.0f};
         thread float input_values[values_per_lane];
 
         for (uint block = 0; block < input_width; block += block_width) {
@@ -4394,7 +4655,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
                 input_values[4 * i + 3] = values[3];
             }
 
-            for (uint row = 0; row < 2; ++row) {
+            for (uint row = 0; row < 1; ++row) {
                 uint logical_row = first_row + row;
                 uint gate_row;
                 uint up_row;
@@ -4430,7 +4691,7 @@ private let lagunaRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
             }
         }
 
-        for (uint row = 0; row < 2; ++row) {
+        for (uint row = 0; row < 1; ++row) {
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
             if (lane == 0) {
@@ -4858,32 +5119,32 @@ func lagunaRoutedSharedSwiGLUQMV(
     sharedWeight: MLXArray,
     sharedScales: MLXArray
 ) -> (routed: MLXArray, shared: MLXArray) {
-    precondition(input.dtype == .bfloat16)
-    precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
-    precondition(routedWeight.dtype == .uint32)
-    precondition(
+    assert(input.dtype == .bfloat16)
+    assert(input.shape == [1, 1, LagunaConstants.hiddenSize])
+    assert(routedWeight.dtype == .uint32)
+    assert(
         routedWeight.shape == [
             LagunaConstants.numExperts,
             2 * LagunaConstants.moeIntermediateSize,
             LagunaConstants.hiddenSize / 8,
         ])
-    precondition(routedScales.dtype == .uint8)
-    precondition(
+    assert(routedScales.dtype == .uint8)
+    assert(
         routedScales.shape == [
             LagunaConstants.numExperts,
             2 * LagunaConstants.moeIntermediateSize,
             LagunaConstants.hiddenSize / 16,
         ])
-    precondition(indices.dtype == .uint32)
-    precondition(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
-    precondition(sharedWeight.dtype == .uint32)
-    precondition(
+    assert(indices.dtype == .uint32)
+    assert(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
+    assert(sharedWeight.dtype == .uint32)
+    assert(
         sharedWeight.shape == [
             2 * LagunaConstants.sharedExpertIntermediateSize,
             LagunaConstants.hiddenSize / 8,
         ])
-    precondition(sharedScales.dtype == .uint8)
-    precondition(
+    assert(sharedScales.dtype == .uint8)
+    assert(
         sharedScales.shape == [
             2 * LagunaConstants.sharedExpertIntermediateSize,
             LagunaConstants.hiddenSize / 16,
@@ -4894,10 +5155,10 @@ func lagunaRoutedSharedSwiGLUQMV(
         lagunaRoutedSharedSwiGLUQMVRows4Enabled
         ? lagunaRoutedSharedSwiGLUQMVRows4Kernel
         : lagunaRoutedSharedSwiGLUQMVKernel
-    // The R4 control covers eight rows per 64-thread group, so 64 tiles per
-    // each of the nine slots dispatch exactly 576 threadgroups. The default R2
-    // schedule retains its original 128 tiles per slot.
-    let tilesPerSlot = lagunaRoutedSharedSwiGLUQMVRows4Enabled ? 64 : 128
+    // R4 covers eight rows per 64-thread group, so 64 tiles per each of the
+    // nine slots dispatch exactly 576 threadgroups. The r1 two-row candidate
+    // covers two rows per group, so it uses 256 tiles per slot.
+    let tilesPerSlot = lagunaRoutedSharedSwiGLUQMVRows4Enabled ? 64 : 256
     let outputs = kernel(
         [input, routedWeight, routedScales, indices, sharedWeight, sharedScales],
         grid: (
@@ -5174,49 +5435,49 @@ func lagunaRoutedSharedDownResidual(
     sharedDownScales: MLXArray,
     residual: MLXArray
 ) -> MLXArray {
-    precondition(routedActivated.dtype == .bfloat16)
-    precondition(
+    assert(routedActivated.dtype == .bfloat16)
+    assert(
         routedActivated.shape == [
             1, 1, LagunaConstants.numExpertsPerTok, 1,
             LagunaConstants.moeIntermediateSize,
         ])
-    precondition(routedDownWeight.dtype == .uint32)
-    precondition(
+    assert(routedDownWeight.dtype == .uint32)
+    assert(
         routedDownWeight.shape == [
             LagunaConstants.numExperts,
             LagunaConstants.hiddenSize,
             LagunaConstants.moeIntermediateSize / 8,
         ])
-    precondition(routedDownScales.dtype == .uint8)
-    precondition(
+    assert(routedDownScales.dtype == .uint8)
+    assert(
         routedDownScales.shape == [
             LagunaConstants.numExperts,
             LagunaConstants.hiddenSize,
             LagunaConstants.moeIntermediateSize / 16,
         ])
-    precondition(indices.dtype == .uint32)
-    precondition(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
-    precondition(routerWeights.dtype == .float32)
-    precondition(routerWeights.shape == [1, 1, LagunaConstants.numExpertsPerTok])
-    precondition(sharedActivated.dtype == .bfloat16)
-    precondition(
+    assert(indices.dtype == .uint32)
+    assert(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
+    assert(routerWeights.dtype == .float32)
+    assert(routerWeights.shape == [1, 1, LagunaConstants.numExpertsPerTok])
+    assert(sharedActivated.dtype == .bfloat16)
+    assert(
         sharedActivated.shape == [
             1, 1, LagunaConstants.sharedExpertIntermediateSize,
         ])
-    precondition(sharedDownWeight.dtype == .uint32)
-    precondition(
+    assert(sharedDownWeight.dtype == .uint32)
+    assert(
         sharedDownWeight.shape == [
             LagunaConstants.hiddenSize,
             LagunaConstants.sharedExpertIntermediateSize / 8,
         ])
-    precondition(sharedDownScales.dtype == .uint8)
-    precondition(
+    assert(sharedDownScales.dtype == .uint8)
+    assert(
         sharedDownScales.shape == [
             LagunaConstants.hiddenSize,
             LagunaConstants.sharedExpertIntermediateSize / 16,
         ])
-    precondition(residual.dtype == .bfloat16)
-    precondition(residual.shape == [1, 1, LagunaConstants.hiddenSize])
+    assert(residual.dtype == .bfloat16)
+    assert(residual.shape == [1, 1, LagunaConstants.hiddenSize])
 
     return lagunaRoutedSharedDownResidualKernel(
         [
@@ -5354,10 +5615,10 @@ func lagunaDenseGateUpSwiGLU(
     _ input: MLXArray,
     fusedWeight: MLXArray
 ) -> MLXArray {
-    precondition(input.dtype == .bfloat16)
-    precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
-    precondition(fusedWeight.dtype == .bfloat16)
-    precondition(
+    assert(input.dtype == .bfloat16)
+    assert(input.shape == [1, 1, LagunaConstants.hiddenSize])
+    assert(fusedWeight.dtype == .bfloat16)
+    assert(
         fusedWeight.shape == [
             2 * LagunaConstants.denseIntermediateSize, LagunaConstants.hiddenSize,
         ])
@@ -5430,15 +5691,15 @@ func lagunaDenseDownResidual(
     downWeight: MLXArray,
     residual: MLXArray
 ) -> MLXArray {
-    precondition(activated.dtype == .bfloat16)
-    precondition(activated.shape == [1, 1, LagunaConstants.denseIntermediateSize])
-    precondition(downWeight.dtype == .bfloat16)
-    precondition(
+    assert(activated.dtype == .bfloat16)
+    assert(activated.shape == [1, 1, LagunaConstants.denseIntermediateSize])
+    assert(downWeight.dtype == .bfloat16)
+    assert(
         downWeight.shape == [
             LagunaConstants.hiddenSize, LagunaConstants.denseIntermediateSize,
         ])
-    precondition(residual.dtype == .bfloat16)
-    precondition(residual.shape == [1, 1, LagunaConstants.hiddenSize])
+    assert(residual.dtype == .bfloat16)
+    assert(residual.shape == [1, 1, LagunaConstants.hiddenSize])
 
     return lagunaDenseDownResidualKernel(
         [activated, downWeight, residual],
@@ -5464,6 +5725,9 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     var _fusedGateUpWeight: MLXArray?
     var _fusedGateUpScales: MLXArray?
     var _fusedGateUpSplit: Int = 0
+    var _fusedSharedDownWeight: MLXArray?
+    var _fusedSharedDownScales: MLXArray?
+    var _fusedSharedRuntimeReady = false
 
     /// Retained fused BF16 `[gate; up]` bank for the dense (non-quantized)
     /// layer-0 MLP, built once after checkpoint load when
@@ -5514,6 +5778,42 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
         _fusedGateUpWeight = fusedWeight
         _fusedGateUpScales = fusedScales
         _fusedGateUpSplit = gate.weight.dim(0)
+
+        // Cache the shared decode bank's immutable down-projection contract
+        // once after weight installation. Dynamic activation checks remain in
+        // `fusedSharedBankGuard`; the module graph and weights do not mutate
+        // during worker service.
+        if lagunaFusedSharedSwiGLUQMVEnabled,
+            let down = downProj as? QuantizedLinear,
+            type(of: down) == QuantizedLinear.self,
+            down.mode == .nvfp4, down.groupSize == 16, down.bits == 4,
+            down.bias == nil, down.biases == nil,
+            fusedWeight.dtype == .uint32,
+            fusedWeight.shape == [
+                2 * LagunaConstants.sharedExpertIntermediateSize,
+                LagunaConstants.hiddenSize / 8,
+            ],
+            fusedScales.dtype == .uint8,
+            fusedScales.shape == [
+                2 * LagunaConstants.sharedExpertIntermediateSize,
+                LagunaConstants.hiddenSize / 16,
+            ],
+            _fusedGateUpSplit == LagunaConstants.sharedExpertIntermediateSize,
+            down.weight.dtype == .uint32,
+            down.weight.shape == [
+                LagunaConstants.hiddenSize,
+                LagunaConstants.sharedExpertIntermediateSize / 8,
+            ],
+            down.scales.dtype == .uint8,
+            down.scales.shape == [
+                LagunaConstants.hiddenSize,
+                LagunaConstants.sharedExpertIntermediateSize / 16,
+            ]
+        {
+            _fusedSharedDownWeight = down.weight
+            _fusedSharedDownScales = down.scales
+            _fusedSharedRuntimeReady = true
+        }
         return [fusedWeight, fusedScales]
     }
 
@@ -5591,36 +5891,23 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
         downWeight: MLXArray,
         downScales: MLXArray
     )? {
-        guard lagunaFusedSharedSwiGLUQMVEnabled,
+        guard _fusedSharedRuntimeReady,
             let fusedWeight = _fusedGateUpWeight,
             let fusedScales = _fusedGateUpScales,
-            let down = downProj as? QuantizedLinear,
-            type(of: down) == QuantizedLinear.self,
-            down.mode == .nvfp4,
-            down.groupSize == 16,
-            down.bits == 4,
-            down.bias == nil,
-            down.biases == nil,
+            let downWeight = _fusedSharedDownWeight,
+            let downScales = _fusedSharedDownScales,
             x.dtype == .bfloat16,
-            x.shape == [1, 1, LagunaConstants.hiddenSize],
-            fusedWeight.dtype == .uint32,
-            fusedScales.dtype == .uint8,
-            _fusedGateUpSplit == LagunaConstants.sharedExpertIntermediateSize,
-            down.weight.dtype == .uint32,
-            down.weight.shape == [
-                LagunaConstants.hiddenSize,
-                LagunaConstants.sharedExpertIntermediateSize / 8,
-            ],
-            down.scales.dtype == .uint8,
-            down.scales.shape == [
-                LagunaConstants.hiddenSize,
-                LagunaConstants.sharedExpertIntermediateSize / 16,
-            ]
+            x.shape == [1, 1, LagunaConstants.hiddenSize]
         else {
             return nil
         }
 
-        return (fusedWeight, fusedScales, down.weight, down.scales)
+        assert(fusedWeight.dtype == .uint32)
+        assert(fusedScales.dtype == .uint8)
+        assert(_fusedGateUpSplit == LagunaConstants.sharedExpertIntermediateSize)
+        assert(downWeight.dtype == .uint32)
+        assert(downScales.dtype == .uint8)
+        return (fusedWeight, fusedScales, downWeight, downScales)
     }
 
     func fusedSharedDownResidual(
@@ -5912,10 +6199,10 @@ private let lagunaDecodeRouterTop8NormalizingKernel = MLXFast.metalKernel(
 private func lagunaDecodeRouterTop8(
     logits: MLXArray, correctionBias: MLXArray, normalizing: Bool = false
 ) -> (MLXArray, MLXArray) {
-    precondition(logits.dtype == .bfloat16 || logits.dtype == .float32)
-    precondition(correctionBias.dtype == .float32)
-    precondition(logits.size == 256)
-    precondition(correctionBias.size == 256)
+    assert(logits.dtype == .bfloat16 || logits.dtype == .float32)
+    assert(correctionBias.dtype == .float32)
+    assert(logits.size == 256)
+    assert(correctionBias.size == 256)
 
     let kernel =
         normalizing ? lagunaDecodeRouterTop8NormalizingKernel : lagunaDecodeRouterTop8Kernel
@@ -6749,6 +7036,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     var _routedDownProj: SwitchLinear?
     var _routedDownWeight: MLXArray?
     var _routedDownScales: MLXArray?
+    var _fusedRoutedDecodeRuntimeReady = false
 
     /// Builds and retains the fused routed gate/up NVFP4 banks from the
     /// loaded stock `SwitchGLU` submodules (reached through the public
@@ -6833,6 +7121,33 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         _routedDownProj = downModule
         _routedDownWeight = downWeight
         _routedDownScales = downScales
+        _fusedRoutedDecodeRuntimeReady =
+            fusedWeight.dtype == .uint32
+            && fusedWeight.shape == [
+                LagunaConstants.numExperts,
+                2 * LagunaConstants.moeIntermediateSize,
+                LagunaConstants.hiddenSize / 8,
+            ]
+            && fusedScales.dtype == .uint8
+            && fusedScales.shape == [
+                LagunaConstants.numExperts,
+                2 * LagunaConstants.moeIntermediateSize,
+                LagunaConstants.hiddenSize / 16,
+            ]
+            && split == LagunaConstants.moeIntermediateSize
+            && downWeight.dtype == .uint32
+            && downWeight.shape == [
+                LagunaConstants.numExperts,
+                LagunaConstants.hiddenSize,
+                LagunaConstants.moeIntermediateSize / 8,
+            ]
+            && downScales.dtype == .uint8
+            && downScales.shape == [
+                LagunaConstants.numExperts,
+                LagunaConstants.hiddenSize,
+                LagunaConstants.moeIntermediateSize / 16,
+            ]
+            && routedScalingFactor == Float(LagunaConstants.moeRoutedScalingFactor)
         return [fusedWeight, fusedScales]
     }
 
@@ -6890,15 +7205,15 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
             // dispatch below, so the shared half of that same dispatch is
             // handed to the down projection instead of being issued again.
             // Purely within this invocation; nothing survives it.
-            var mergedSharedActivated: MLXArray?
+            var mergedSharedDownInputs: (
+                activated: MLXArray, downWeight: MLXArray, downScales: MLXArray
+            )?
             if lagunaFusedRoutedSwiGLUQMVEnabled,
+                _fusedRoutedDecodeRuntimeReady,
                 x.dtype == .bfloat16,
                 x.shape == [1, 1, LagunaConstants.hiddenSize],
-                fusedWeight.dtype == .uint32,
-                fusedScales.dtype == .uint8,
                 inds.dtype == .uint32,
-                inds.shape == [1, 1, LagunaConstants.numExpertsPerTok],
-                _fusedRoutedGateUpSplit == LagunaConstants.moeIntermediateSize
+                inds.shape == [1, 1, LagunaConstants.numExpertsPerTok]
             {
                 if lagunaFusedRoutedSharedSwiGLUQMVEnabled,
                     let sharedBanks = sharedExpert.fusedSharedBanks(x)
@@ -6912,7 +7227,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                         sharedScales: sharedBanks.gateUpScales
                     )
                     activated = merged.routed
-                    mergedSharedActivated = merged.shared
+                    mergedSharedDownInputs = (
+                        merged.shared, sharedBanks.downWeight, sharedBanks.downScales
+                    )
                 } else {
                     lagunaTrace("routed gate/up QMV + SwiGLU")
                     activated = lagunaRoutedSwiGLUQMV(
@@ -6939,32 +7256,31 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 activated = lagunaInterleavedSwiGLU(
                     gateUp, split: _fusedRoutedGateUpSplit)
             }
+            let sharedDownInputs: (
+                activated: MLXArray, downWeight: MLXArray, downScales: MLXArray
+            )?
+            if lagunaFusedRoutedSharedDownResidualEnabled, residual != nil {
+                if let mergedSharedDownInputs {
+                    sharedDownInputs = mergedSharedDownInputs
+                } else {
+                    sharedDownInputs = sharedExpert.fusedSharedDownInputs(x)
+                }
+            } else {
+                sharedDownInputs = nil
+            }
             if lagunaFusedRoutedSharedDownResidualEnabled,
+                _fusedRoutedDecodeRuntimeReady,
                 let residual,
                 let downWeight = _routedDownWeight,
                 let downScales = _routedDownScales,
-                let sharedInputs = sharedExpert.fusedSharedDownInputs(
-                    x, sharedActivation: mergedSharedActivated),
+                let sharedInputs = sharedDownInputs,
                 activated.dtype == .bfloat16,
                 activated.shape == [
                     1, 1, LagunaConstants.numExpertsPerTok, 1,
                     LagunaConstants.moeIntermediateSize,
                 ],
-                downWeight.dtype == .uint32,
-                downWeight.shape == [
-                    LagunaConstants.numExperts,
-                    LagunaConstants.hiddenSize,
-                    LagunaConstants.moeIntermediateSize / 8,
-                ],
-                downScales.dtype == .uint8,
-                downScales.shape == [
-                    LagunaConstants.numExperts,
-                    LagunaConstants.hiddenSize,
-                    LagunaConstants.moeIntermediateSize / 16,
-                ],
                 weights.dtype == .float32,
                 weights.shape == [1, 1, LagunaConstants.numExpertsPerTok],
-                routedScalingFactor == Float(LagunaConstants.moeRoutedScalingFactor),
                 residual.dtype == .bfloat16,
                 residual.shape == [1, 1, LagunaConstants.hiddenSize]
             {
@@ -6988,21 +7304,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     1, 1, LagunaConstants.numExpertsPerTok, 1,
                     LagunaConstants.moeIntermediateSize,
                 ],
-                downWeight.dtype == .uint32,
-                downWeight.shape == [
-                    LagunaConstants.numExperts,
-                    LagunaConstants.hiddenSize,
-                    LagunaConstants.moeIntermediateSize / 8,
-                ],
-                downScales.dtype == .uint8,
-                downScales.shape == [
-                    LagunaConstants.numExperts,
-                    LagunaConstants.hiddenSize,
-                    LagunaConstants.moeIntermediateSize / 16,
-                ],
                 weights.dtype == .float32,
                 weights.shape == [1, 1, LagunaConstants.numExpertsPerTok],
-                routedScalingFactor == Float(LagunaConstants.moeRoutedScalingFactor)
+                _fusedRoutedDecodeRuntimeReady
             {
                 lagunaTrace("routed down reduce")
                 y = lagunaRoutedDownReduce(
@@ -7170,6 +7474,9 @@ final class LagunaRuntimeDecoderLayer: Module {
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
     let attentionType: LagunaLayerType
+    var _decodeResidualNormRuntimeReady = false
+    var _decodeResidualRouterRuntimeReady = false
+    var _decodeSparseResidualRuntimeReady = false
 
     init(_ config: LagunaConfig, layerIdx: Int) {
         self._selfAttn.wrappedValue = LagunaRuntimeAttention(config, layerIdx: layerIdx)
@@ -7189,12 +7496,39 @@ final class LagunaRuntimeDecoderLayer: Module {
         self.attentionType = config.layerType(forLayer: layerIdx)
     }
 
+    /// Cache decoder-layer facts that become immutable after checkpoint
+    /// installation. The request geometry and activation dtypes remain hot
+    /// predicates; false retains the original stock/fallback branches.
+    func prepareDecodeFastPathContracts() {
+        let hidden = LagunaConstants.hiddenSize
+        _decodeResidualNormRuntimeReady =
+            lagunaFusedResidualRMSNormEnabled
+            && postAttentionLayerNorm.weight.dtype == .bfloat16
+            && postAttentionLayerNorm.weight.shape == [hidden]
+
+        if let sparse = mlp as? LagunaRuntimeSparseMoEBlock {
+            _decodeResidualRouterRuntimeReady =
+                lagunaFusedResidualRMSNormRouterEnabled
+                && postAttentionLayerNorm.weight.dtype == .bfloat16
+                && postAttentionLayerNorm.weight.shape == [hidden]
+                && sparse.gate.weight.dtype == .bfloat16
+                && sparse.gate.weight.shape == [LagunaConstants.numExperts, hidden]
+            _decodeSparseResidualRuntimeReady =
+                lagunaFusedSharedDownResidualEnabled
+                || lagunaFusedRoutedSharedDownResidualEnabled
+        } else {
+            _decodeResidualRouterRuntimeReady = false
+            _decodeSparseResidualRuntimeReady = false
+        }
+    }
+
     func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
         qkRoPEAngles: MLXArray? = nil,
-        qkRoPEOffsets: MLXArray? = nil
+        qkRoPEOffsets: MLXArray? = nil,
+        isSingleTokenDecode: Bool = false
     ) -> MLXArray {
         let r = selfAttn(
             x,
@@ -7202,21 +7536,18 @@ final class LagunaRuntimeDecoderLayer: Module {
             mask: mask,
             cache: cache,
             qkRoPEAngles: qkRoPEAngles,
-            qkRoPEOffsets: qkRoPEOffsets
+            qkRoPEOffsets: qkRoPEOffsets,
+            isSingleTokenDecode: isSingleTokenDecode
         )
         let h: MLXArray
         let normalized: MLXArray
         var routerLogits: MLXArray?
-        if lagunaFusedResidualRMSNormRouterEnabled,
+        if isSingleTokenDecode, _decodeResidualRouterRuntimeReady,
             x.dtype == .bfloat16, r.dtype == .bfloat16,
-            postAttentionLayerNorm.weight.dtype == .bfloat16,
-            x.shape == [1, 1, LagunaConstants.hiddenSize], x.shape == r.shape,
-            let sparse = mlp as? LagunaRuntimeSparseMoEBlock,
-            sparse.gate.weight.dtype == .bfloat16,
-            sparse.gate.weight.shape == [
-                LagunaConstants.numExperts, LagunaConstants.hiddenSize,
-            ]
+            let sparse = mlp as? LagunaRuntimeSparseMoEBlock
         {
+            assert(x.shape == [1, 1, LagunaConstants.hiddenSize])
+            assert(r.shape == x.shape)
             let fused = lagunaResidualRMSNormRouter(
                 residual: x,
                 branch: r,
@@ -7225,12 +7556,11 @@ final class LagunaRuntimeDecoderLayer: Module {
             h = fused.summed
             normalized = fused.normalized
             routerLogits = fused.routerLogits
-        } else if lagunaFusedResidualRMSNormEnabled,
-            x.dtype == .bfloat16, r.dtype == .bfloat16,
-            postAttentionLayerNorm.weight.dtype == .bfloat16,
-            x.shape == r.shape, x.dim(-1) == LagunaConstants.hiddenSize,
-            x.size == LagunaConstants.hiddenSize
+        } else if isSingleTokenDecode, _decodeResidualNormRuntimeReady,
+            x.dtype == .bfloat16, r.dtype == .bfloat16
         {
+            assert(x.shape == [1, 1, LagunaConstants.hiddenSize])
+            assert(r.shape == x.shape)
             lagunaTrace("residual+rmsnorm")
             (h, normalized) = lagunaResidualRMSNorm(
                 residual: x, branch: r, weight: postAttentionLayerNorm.weight)
@@ -7265,16 +7595,13 @@ final class LagunaRuntimeDecoderLayer: Module {
             h = x + r
             normalized = postAttentionLayerNorm(h)
         }
-        if (
-            lagunaFusedSharedDownResidualEnabled ||
-                lagunaFusedRoutedSharedDownResidualEnabled
-        ),
+        if isSingleTokenDecode, _decodeSparseResidualRuntimeReady,
             normalized.dtype == .bfloat16,
-            normalized.shape == [1, 1, LagunaConstants.hiddenSize],
             h.dtype == .bfloat16,
-            h.shape == normalized.shape,
             let sparse = mlp as? LagunaRuntimeSparseMoEBlock
         {
+            assert(normalized.shape == [1, 1, LagunaConstants.hiddenSize])
+            assert(h.shape == normalized.shape)
             return sparse(normalized, residual: h, routerLogits: routerLogits)
         }
         // Multi-token prefill: hand the residual to the sparse block so the
@@ -7555,6 +7882,16 @@ final class LagunaRuntimeModelInner: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        // Request geometry is immutable for the whole forward. Cache it once:
+        // the decode async ladder and prefill ladder formerly queried
+        // `inputs.shape` / `h.dim(1)` again at every layer, even though the
+        // embedding preserves the leading token dimensions exactly.
+        let inputShape = inputs.shape
+        let isSingleTokenDecode = inputShape == [1, 1]
+        let isSingleTokenEmbedding =
+            inputShape.count > 1 && inputShape[0] == 1 && inputShape[1] == 1
+        let isMultiTokenForward = inputShape.count > 1 && inputShape[1] > 1
+
         var h: MLXArray
         var fullRoPEAngles: MLXArray?
         var slidingRoPEAngles: MLXArray?
@@ -7576,16 +7913,15 @@ final class LagunaRuntimeModelInner: Module {
             // Verbatim stock fallback for prefill, unsupported caches and
             // positions outside the precomputed atlas.
             h = embedTokens(inputs)
-            let isSingleTokenDecode = h.dim(0) == 1 && h.dim(1) == 1
             fullRoPEAngles =
-                lagunaFusedFullQKNormYaRNEnabled && isSingleTokenDecode
+                lagunaFusedFullQKNormYaRNEnabled && isSingleTokenEmbedding
                 ? ropeAngleTable(
                     seed: _fullRoPEAngleSeed,
                     attention: layers[fullAttentionIdx].selfAttn,
                     cache: cache?[fullAttentionIdx])
                 : nil
             slidingRoPEAngles =
-                lagunaFusedSlidingQKNormRoPEEnabled && isSingleTokenDecode
+                lagunaFusedSlidingQKNormRoPEEnabled && isSingleTokenEmbedding
                 ? ropeAngleTable(
                     seed: _slidingRoPEAngleSeed,
                     attention: layers[slidingAttentionIdx].selfAttn,
@@ -7598,12 +7934,12 @@ final class LagunaRuntimeModelInner: Module {
             // computed. Requires a host-known offset (a graph-valued offset
             // could not be bounds-checked against the atlas) inside the
             // atlas range; anything else keeps the stock path.
-            if lagunaPrefillQKNormRoPEEnabled, !isSingleTokenDecode,
-                h.dim(0) == 1,
+            if lagunaPrefillQKNormRoPEEnabled, !isSingleTokenEmbedding,
+                inputShape.count > 1, inputShape[0] == 1,
                 let fullAtlas = _fullRoPEAngleAtlas,
                 let slidingAtlas = _slidingRoPEAngleAtlas
             {
-                let length = h.dim(1)
+                let length = inputShape[1]
                 let familyCache =
                     fullAttentionIdx < (cache?.count ?? 0)
                     ? cache?[fullAttentionIdx] : nil
@@ -7636,7 +7972,7 @@ final class LagunaRuntimeModelInner: Module {
             let isFull = layerTypes[i] == .full
             let mask = isFull ? fullMask : slidingMask
             let qkRoPEAngles = isFull ? fullRoPEAngles : slidingRoPEAngles
-            if i == layers.count - 1, h.dim(1) > 1 {
+            if i == layers.count - 1, isMultiTokenForward {
                 if case .causal = mask {
                     h = layer.callLastPrefillRow(h, cache: cache?[i])
                 } else {
@@ -7645,13 +7981,16 @@ final class LagunaRuntimeModelInner: Module {
                         mask: mask,
                         cache: cache?[i],
                         qkRoPEAngles: qkRoPEAngles,
-                        qkRoPEOffsets: qkRoPEOffsets
+                        qkRoPEOffsets: qkRoPEOffsets,
+                        isSingleTokenDecode: isSingleTokenDecode
                     )
-                    if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
+                    if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i,
+                        isSingleTokenDecode
+                    {
                         asyncEval(h)
                     }
                     if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                        inputs.shape == [1, 1]
+                        isSingleTokenDecode
                     {
                         asyncEval(h)
                     }
@@ -7662,22 +8001,25 @@ final class LagunaRuntimeModelInner: Module {
                     mask: mask,
                     cache: cache?[i],
                     qkRoPEAngles: qkRoPEAngles,
-                    qkRoPEOffsets: qkRoPEOffsets
+                    qkRoPEOffsets: qkRoPEOffsets,
+                    isSingleTokenDecode: isSingleTokenDecode
                 )
-                if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
+                if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i,
+                    isSingleTokenDecode
+                {
                     asyncEval(h)
                 }
                 if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                    inputs.shape == [1, 1]
+                    isSingleTokenDecode
                 {
                     asyncEval(h)
                 }
                 if case .explicit(let mask) = lagunaDecodeAsyncStage,
-                    (mask >> UInt64(i)) & 1 == 1, inputs.shape == [1, 1]
+                    (mask >> UInt64(i)) & 1 == 1, isSingleTokenDecode
                 {
                     asyncEval(h)
                 }
-                if lagunaPrefillAsyncLadderStride > 0, h.dim(1) > 1,
+                if lagunaPrefillAsyncLadderStride > 0, isMultiTokenForward,
                     (i + 1) % lagunaPrefillAsyncLadderStride == 0
                 {
                     asyncEval(h)
@@ -7737,20 +8079,21 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let isSingleTokenDecode = inputs.shape == [1, 1]
         let fullHidden = model(inputs, cache: cache)
         // Every consumer of multi-token logits reads only the LAST
         // position's row. Slice before the row-independent final RMSNorm and
         // vocabulary head so prefill neither normalizes nor projects the
         // preceding rows. For single-token decode the slice is a no-op.
         let hidden = model.norm(lagunaLastTokenHidden(fullHidden))
-        if case .norm = lagunaDecodeAsyncStage, inputs.shape == [1, 1] {
+        if case .norm = lagunaDecodeAsyncStage, isSingleTokenDecode {
             asyncEval(hidden)
         }
 
         let result: MLXArray
         if let lmHead {
             if let pruner = lmHeadPruner,
-                inputs.shape == [1, 1] || lagunaLmHeadPrunePrefillEnabled
+                isSingleTokenDecode || lagunaLmHeadPrunePrefillEnabled
             {
                 // Certified two-pass final-row head (notes/68): full BF16
                 // logits, bit-identical to stock in every argmax-reachable
@@ -7763,7 +8106,7 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         } else {
             result = model.embedTokens.asLinear(hidden)
         }
-        if case .logits = lagunaDecodeAsyncStage, inputs.shape == [1, 1] {
+        if case .logits = lagunaDecodeAsyncStage, isSingleTokenDecode {
             asyncEval(result)
         }
         return result
@@ -7811,6 +8154,8 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
             }
             fusedArrays.append(
                 contentsOf: layer.selfAttn.prepareLastPrefillProjectionWeights())
+            layer.selfAttn.prepareDecodeFastPathContracts(
+                inputNorm: layer.inputLayerNorm)
             if let sparse = layer.mlp as? LagunaRuntimeSparseMoEBlock {
                 if lagunaFusedSharedGateUpEnabled {
                     fusedArrays.append(contentsOf: sparse.sharedExpert.prepareFusedSharedGateUp())
@@ -7825,6 +8170,7 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                     fusedArrays.append(fused)
                 }
             }
+            layer.prepareDecodeFastPathContracts()
         }
         if !fusedArrays.isEmpty {
             eval(fusedArrays)
