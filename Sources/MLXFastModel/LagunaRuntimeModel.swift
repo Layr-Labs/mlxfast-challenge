@@ -82,9 +82,13 @@ final class LagunaFusionTraceLog: @unchecked Sendable {
 }
 
 @inline(__always)
-func lagunaTrace(_ site: String) {
+func lagunaTrace(_ site: @autoclosure () -> String) {
+    // Autoclosure: the interpolated site string is only built when tracing is
+    // enabled. Call sites sit on the per-layer decode path, so an eager
+    // `String` argument would pay the interpolation for every layer of every
+    // token even with the trace off.
     guard lagunaTraceFusion else { return }
-    lagunaTracedFusions.note(site)
+    lagunaTracedFusions.note(site())
 }
 
 // MARK: - Runtime fusion feature flags
@@ -2783,8 +2787,82 @@ func lagunaGateProductSoftplus(
 /// into the input row at each k-block at the same FP32 -> BF16 rounding point
 /// `lagunaGateProductSoftplusSource` uses, so the contraction is bit-identical
 /// to applying the gate first and then running the stock affine GEMV.
-private func lagunaGatedAffineOProjSource(heads: Int) -> String {
-    """
+func lagunaGatedAffineOProjSource(heads: Int) -> String {
+    // `DARKBLOOM_NVFP4_QDOT_SEED_ELIDE` and `DARKBLOOM_NVFP4_ROW_SEED_PEEL`,
+    // the two dead-`+0.0f` mechanisms already promoted on the NVFP4 decode
+    // kernels, applied to this INT8 twin. Nothing NVFP4-specific is involved
+    // in either -- both are statements about a `+0.0f`-seeded FP32
+    // accumulator -- so they reuse the existing flags rather than adding two
+    // more, and one env var ablates every site of each mechanism at once.
+    //
+    // The remaining two retrofit mechanisms do NOT apply here:
+    // `DARKBLOOM_NVFP4_SCALE_CARRY` needs an E4M3 byte (this kernel reads BF16
+    // affine scales and biases directly), and `DARKBLOOM_NVFP4_SCALE_DEFER`
+    // needs a shared power-of-two factor (this kernel's per-group scale is
+    // data, and its `sum * bias` term is not a common factor of the row).
+    let elideSeed = lagunaNvfp4QdotSeedElisionEnabled
+    let firstValue = elideSeed ? "1" : "0"
+    let sumPrologue =
+        elideSeed
+        ? """
+                float sum = float(bfloat(float(xp[0]) * gate));
+                x_thread[0] = sum;
+        """
+        : "        float sum = 0.0f;"
+    let accumPrologue =
+        elideSeed
+        ? "            float accum = x_thread[0] * wl[0];"
+        : "            float accum = 0.0f;"
+    let rowSeedInit =
+        lagunaNvfp4RowSeedPeelEnabled ? "" : " = {0.0f, 0.0f, 0.0f, 0.0f}"
+    // Emitted verbatim in both arms with only the accumulate operator
+    // substituted, so the peel flag isolates the row seed and nothing else.
+    func kBlockBody(_ op: String) -> String {
+        """
+                float gate = gate_table[column >> head_shift];
+        \(sumPrologue)
+                for (uint i = \(firstValue); i < values_per_thread; ++i) {
+                    float value = float(bfloat(float(xp[i]) * gate));
+                    sum += value;
+                    x_thread[i] = value;
+                }
+
+                for (uint row = 0; row < results_per_simdgroup; ++row) {
+                    const device uint8_t* wl = ws + row * in_vec_size;
+                    float scale = float(sc[row * in_vec_size_g]);
+                    float bias = float(bs[row * in_vec_size_g]);
+        \(accumPrologue)
+                    for (uint i = \(firstValue); i < values_per_thread; ++i) {
+                        accum += x_thread[i] * wl[i];
+                    }
+                    result[row] \(op) scale * accum + sum * bias;
+                }
+
+                ws += block_size;
+                sc += block_size / group_size;
+                bs += block_size / group_size;
+                xp += block_size;
+                column += block_size;
+        """
+    }
+    let kLoop: String
+    if lagunaNvfp4RowSeedPeelEnabled {
+        kLoop = """
+            {
+            \(kBlockBody("="))
+            }
+            for (uint k = block_size; k < in_vec_size; k += block_size) {
+            \(kBlockBody("+="))
+            }
+            """
+    } else {
+        kLoop = """
+            for (uint k = 0; k < in_vec_size; k += block_size) {
+            \(kBlockBody("+="))
+            }
+            """
+    }
+    return """
     constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
     constexpr uint out_vec_size = \(LagunaConstants.hiddenSize);
     constexpr uint gate_heads = \(heads);
@@ -2833,40 +2911,15 @@ private func lagunaGatedAffineOProjSource(heads: Int) -> String {
     const device bfloat* xp = attention_output + simd_lid * values_per_thread;
 
     thread float x_thread[values_per_thread];
-    thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+    thread float result[results_per_simdgroup]\(rowSeedInit);
 
     uint column = simd_lid * values_per_thread;
-    for (uint k = 0; k < in_vec_size; k += block_size) {
-        float gate = gate_table[column >> head_shift];
-        float sum = 0.0f;
-        for (uint i = 0; i < values_per_thread; ++i) {
-            float value = float(bfloat(float(xp[i]) * gate));
-            sum += value;
-            x_thread[i] = value;
-        }
-
-        for (uint row = 0; row < results_per_simdgroup; ++row) {
-            const device uint8_t* wl = ws + row * in_vec_size;
-            float scale = float(sc[row * in_vec_size_g]);
-            float bias = float(bs[row * in_vec_size_g]);
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
-                accum += x_thread[i] * wl[i];
-            }
-            result[row] += scale * accum + sum * bias;
-        }
-
-        ws += block_size;
-        sc += block_size / group_size;
-        bs += block_size / group_size;
-        xp += block_size;
-        column += block_size;
-    }
+    \(kLoop)
 
     for (uint row = 0; row < results_per_simdgroup; ++row) {
         result[row] = simd_sum(result[row]);
         if (simd_lid == 0) {
-            projected[out_row + row] = bfloat(result[row]);
+            projected[out_row + row] = bfloat(\(lagunaNvfp4RowNormalizeOpen)result[row]\(lagunaNvfp4RowNormalizeClose));
         }
     }
     """
@@ -2902,6 +2955,13 @@ private let lagunaGatedAffineOProjKernels: [Int: MLXFast.MLXFastKernel] = {
 /// INT8 (the NVFP4 tail layers) or any guard declines.
 let lagunaFusedGatedAffineOProjEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATED_AFFINE_OPROJ"] != "0"
+
+/// `DARKBLOOM_GATED_AFFINE_OPROJ_NVFP4` (default ON; set "0" to ablate).
+/// Gates ONLY the NVFP4 tail-layer twin (`lagunaGatedAffineOProjNVFP4`), so
+/// the twin's effect can be measured against the two-dispatch chain in one
+/// binary without touching the promoted INT8 path.
+let lagunaGatedAffineOProjNVFP4Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_GATED_AFFINE_OPROJ_NVFP4"] != "0"
 
 /// Gate product + native-affine INT8 output projection in one dispatch, or
 /// `nil` when any shape, dtype or wire-format guard declines (caller then runs
@@ -3340,6 +3400,324 @@ func lagunaTailNormQKVGate(
         outputDTypes: [.bfloat16, .bfloat16]
     )
     return (outputs[0], outputs[1])
+}
+
+// MARK: - Gated NVFP4 output projection for the affine tail layers (one dispatch)
+
+/// NVFP4 twin of `lagunaGatedAffineOProjSource` for the affine tail layers
+/// (>= `lagunaNativeAffineNVFP4From`, default 32). The INT8 twin only reaches
+/// the group-32 affine INT8 layers; this extends the same gate-product fusion
+/// to the 8 NVFP4 tail layers so the decode attention tail is one dispatch
+/// for ALL 40 layers instead of 32.
+///
+/// The kernel mirrors the INT8 twin's softplus-gate prologue (identical FP32
+/// form and BF16 rounding point) and dispatch geometry, but the contraction
+/// decodes NVFP4 group-16 4-bit codes instead of INT8 bytes. The decode is the
+/// proven split-nibble extraction (13 int ops / 3 masks) bit-identical to the
+/// stock `fp_quantized` `qdot`: each `uint32` code word yields eight `half`
+/// bit patterns via masked shifts, then one E4M3 scale (decoded through
+/// `laguna_nvfp4_scale`) is applied per group of 16 values, and the gated
+/// input row is the contraction's left operand. The gate factor is applied at
+/// the same FP32 -> BF16 rounding point as `lagunaGateProductSoftplusSource`,
+/// so the contraction is bit-identical to gating first then running the stock
+/// NVFP4 affine GEMV.
+func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
+    let scaleFold = lagunaNvfp4ScaleFoldEnabled
+    let weightScale = scaleFold ? "" : " * 16384.0f"
+    // The two halves of the `DARKBLOOM_NVFP4_SCALE_FOLD` regrouping MUST move
+    // together, exactly as `lagunaSharedSwiGLUQMVHeader` moves them: the group
+    // scale absorbs `2^22 == 256 * 16384` precisely when the decoded weights
+    // stop applying their `2^14`. With the fold off the half-domain `* 256.0`
+    // correction returns and the float tail goes away; the tail is NOT
+    // unconditional (see the commit that made it so).
+    let scale256 = scaleFold ? "" : "        sconverted *= 256.0;\n"
+    // `DARKBLOOM_NVFP4_SCALE_DEFER` moves that `2^22` off the per-group scale
+    // and onto the per-row accumulator, where it is one multiply per output
+    // row instead of one per K block per row (`lagunaNvfp4RowScaleSuffix`
+    // re-applies it in the epilogue). Same power-of-two argument as the
+    // SwiGLU kernels: scaling by an exact power of two touches only the
+    // exponent, so it commutes with rounding and every product, partial sum
+    // and `simd_sum` node is exactly `2^-22 x` its old value, restored before
+    // the single BF16 round -- provided no product lands in the FP32
+    // subnormal range. That needs `0 < |scale * accum| < 2^-104`, and with
+    // `s' >= 2^-17` it needs `|accum| < 2^-109`; every NVFP4 weight is a
+    // multiple of `2^-15` and every input here is a BF16 gated attention
+    // output, so a nonzero `accum` that small needs all sixteen inputs of the
+    // group below roughly `2^-99`. ~60 binades of margin, the same margin the
+    // flag was promoted on.
+    let scaleTail =
+        (scaleFold && !lagunaNvfp4ScaleDeferEnabled) ? " * 4194304.0f" : ""
+    // `DARKBLOOM_NVFP4_SCALE_CARRY`, the same sign-fold `laguna_nvfp4_scale`
+    // ships: for `sbits = 128 + m` the carry `sbits + (sbits & 128)` is
+    // `256 + m`, and `(256 + m) << 7 == 0x8000 | (m << 7)` because `m <= 127`
+    // keeps `m << 7 <= 16256 < 0x8000`. IEEE half is sign-magnitude, so that
+    // pattern IS the negation (including `-0.0h`), and the `ushort` truncation
+    // discards only bit 15 of the shifted `uint`, which the mask form dropped
+    // too. For `sbits < 128` the add is the identity. Drops the select and its
+    // negate from the innermost K loop; composes with the folded tail only,
+    // exactly as `lagunaSharedSwiGLUQMVHeader`'s `scaleCarryActive` does.
+    let scaleCarryActive = lagunaNvfp4ScaleCarry && scaleFold
+    let scaleRawExpression =
+        scaleCarryActive
+        ? "ushort((uint(sbits) + (sbits & 128u)) << 7)"
+        : "ushort(sbits & 127) << 7"
+    let scaleSignExpression =
+        scaleCarryActive
+        ? "sconverted"
+        : "(sbits & 128) ? -sconverted : sconverted"
+    // nibble-split case 1 (default), bit-identical to the SwiGLU header
+    let extract = """
+                    const uint xe = c & 0x0F0F0F0Fu;
+                    const uint ge = xe | (xe << 3);
+                    const uint yo = c & 0xF0F0F0F0u;
+                    const uint go = yo | (yo >> 3);
+                    const uint p0 = (ge << 9) & 0x8E008E00u;
+                    const uint p1 = (go << 8) & 0x8E008E00u;
+                    const uint p2 = (ge << 1) & 0x8E008E00u;
+                    const uint p3 = go & 0x8E008E00u;
+    """
+    // `DARKBLOOM_NVFP4_QDOT_SEED_ELIDE`, the same dead `+0.0f` this file
+    // already elides in `laguna_nvfp4_qdot_codes_16`: seeding `accum` with
+    // `0.0f` and then running four `accum +=` makes the first of those four a
+    // real `fl(+0.0f + t0)`. `fadd float 0.0, %t0` is NOT foldable to `%t0`
+    // without no-signed-zeros, and MLX sets `setFastMathEnabled(false)`
+    // (`device.cpp:631`), so the add is emitted once per (K block, row).
+    //
+    // The ON arm assigns on the first four-term group. Making that group's
+    // operator textual means spelling the two code words out instead of
+    // looping `j`, which is the machine code the compiler must already emit:
+    // `codes_per_thread` is the constant 2, the loop already carries
+    // `#pragma unroll`, and `x_thread` is a `thread float[16]` that only stays
+    // in registers under constant indices. Word `w` owns
+    // `x_thread[8w .. 8w+7]` -- exactly the indices `8 * j` produced -- so
+    // every multiply, every add and their association are untouched. The OFF
+    // arm keeps the `j` loop verbatim so it stays token-identical to the
+    // pre-retrofit kernel.
+    func contractionGroups(
+        codeIndex: String,
+        valueIndex: (Int) -> String,
+        seedOperator: String
+    ) -> String {
+        """
+                    const uint c = wl[\(codeIndex)];
+        \(extract)
+                    const float2 v04 = float2(as_type<half2>(p0))\(weightScale);
+                    const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
+                    const float2 v26 = float2(as_type<half2>(p2))\(weightScale);
+                    const float2 v37 = float2(as_type<half2>(p3))\(weightScale);
+                    \(seedOperator)
+                        (x_thread[\(valueIndex(0))] * v04.x +
+                         x_thread[\(valueIndex(1))] * v15.x +
+                         x_thread[\(valueIndex(2))] * v26.x +
+                         x_thread[\(valueIndex(3))] * v37.x);
+                    accum +=
+                        (x_thread[\(valueIndex(4))] * v04.y +
+                         x_thread[\(valueIndex(5))] * v15.y +
+                         x_thread[\(valueIndex(6))] * v26.y +
+                         x_thread[\(valueIndex(7))] * v37.y);
+        """
+    }
+    let accumDeclaration =
+        lagunaNvfp4QdotSeedElisionEnabled ? "float accum;" : "float accum = 0.0f;"
+    let contraction: String
+    if lagunaNvfp4QdotSeedElisionEnabled {
+        contraction = (0 ..< 2).map { word in
+            """
+                        {
+            \(contractionGroups(
+                codeIndex: "\(word)",
+                valueIndex: { "\(8 * word + $0)" },
+                seedOperator: word == 0 ? "accum =" : "accum +="))
+                        }
+            """
+        }.joined(separator: "\n")
+    } else {
+        contraction = """
+                    #pragma unroll
+                    for (uint j = 0; j < codes_per_thread; ++j) {
+            \(contractionGroups(
+                codeIndex: "j",
+                valueIndex: { $0 == 0 ? "8 * j" : "8 * j + \($0)" },
+                seedOperator: "accum +="))
+                    }
+            """
+    }
+    // `DARKBLOOM_NVFP4_ROW_SEED_PEEL`, the same peel the decode SwiGLU QMV
+    // kernels ship: `result[]` is seeded `{0.0f, ...}` and then accumulated
+    // once per K block, so the first of those adds is `fl(+0.0f + q0)` -- a
+    // real add for the same no-signed-zeros reason. Peeling the first K block
+    // makes it an assignment; the `+ 0.0f` that `lagunaNvfp4RowNormalizeOpen`
+    // / `Close` add on lane 0 after `simd_sum` is what makes the peel exact
+    // (see the flag's doc comment for the four-step case analysis -- it
+    // applies verbatim here, and the `-0.0` is NOT absorbed downstream because
+    // this kernel's output reaches `residual + branch`, which preserves `-0.0`
+    // wherever the residual coordinate is itself `-0.0`).
+    //
+    // The body is emitted verbatim in both arms from ONE builder with only the
+    // accumulate operator substituted, so the flag isolates the seed and
+    // nothing else -- same pointer arithmetic, same scale decode, same
+    // contraction, same association.
+    let rowSeedInit =
+        lagunaNvfp4RowSeedPeelEnabled ? "" : " = {0.0f, 0.0f, 0.0f, 0.0f}"
+    func kBlockBody(_ op: String) -> String {
+        """
+                float gate = gate_table[column >> head_shift];
+                for (uint i = 0; i < values_per_thread; ++i) {
+                    x_thread[i] = float(bfloat(float(xp[i]) * gate));
+                }
+
+                for (uint row = 0; row < results_per_simdgroup; ++row) {
+                    const device uint32_t* wl = ws + row * (in_vec_size / 8);
+                    // Decode the E4M3 scale for this 16-value group.
+                    uint8_t sbits = sc[row * in_vec_size_g];
+                    ushort sraw = \(scaleRawExpression);
+                    half sconverted = as_type<half>(sraw);
+        \(scale256)        float scale = float(\(scaleSignExpression))\(scaleTail);
+                    // Decode the two uint32 code words (16 values) via split-nibble and
+                    // dot with the gated input, accumulating in FP32.
+                    \(accumDeclaration)
+        \(contraction)
+                    result[row] \(op) scale * accum;
+                }
+
+                ws += block_size / 8;
+                sc += block_size / group_size;
+                xp += block_size;
+                column += block_size;
+        """
+    }
+    let kLoop: String
+    if lagunaNvfp4RowSeedPeelEnabled {
+        kLoop = """
+            {
+            \(kBlockBody("="))
+            }
+            for (uint k = block_size; k < in_vec_size; k += block_size) {
+            \(kBlockBody("+="))
+            }
+            """
+    } else {
+        kLoop = """
+            for (uint k = 0; k < in_vec_size; k += block_size) {
+            \(kBlockBody("+="))
+            }
+            """
+    }
+    return """
+    constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
+    constexpr uint out_vec_size = \(LagunaConstants.hiddenSize);
+    constexpr uint gate_heads = \(heads);
+    constexpr uint head_shift = 7;              // head_dim == 128
+    constexpr uint group_size = 16;             // NVFP4 group size
+    // Each lane owns one 16-value group per K step: 2 uint32 codes + 1 E4M3 scale.
+    constexpr uint values_per_thread = 16;
+    constexpr uint codes_per_thread = values_per_thread / 8;   // 2 uint32
+    constexpr uint block_size = values_per_thread * 32; // 512 (SIMD_SIZE)
+    constexpr uint results_per_simdgroup = 4;
+    constexpr uint num_simdgroups = 2;
+    constexpr uint in_vec_size_g = in_vec_size / group_size;   // scales per row
+
+    uint tile = threadgroup_position_in_grid.x;
+    uint lid = thread_position_in_threadgroup.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    // One softplus per head, in the FP32 form and at the BF16 rounding point
+    // `lagunaGateProductSoftplusSource` uses.
+    threadgroup float gate_table[gate_heads];
+    if (lid < gate_heads) {
+        float logit = float(gate_logits[lid]);
+        float gate;
+        if (metal::isnan(logit)) {
+            gate = NAN;
+        } else {
+            float maxval = metal::max(logit, 0.0f);
+            float minval = metal::min(logit, 0.0f);
+            gate = (metal::isinf(minval) || metal::isinf(maxval))
+                ? maxval
+                : maxval + log1p(metal::exp(minval - maxval));
+        }
+        gate_table[lid] = float(bfloat(gate));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint out_row = tile * (num_simdgroups * results_per_simdgroup) +
+        simd_gid * results_per_simdgroup;
+
+    // NVFP4 layout: codes uint32 [out_vec_size, in_vec_size / 8],
+    // scales uint8 [out_vec_size, in_vec_size / 16].
+    const device uint32_t* ws =
+        (const device uint32_t*)weight_codes +
+        out_row * (in_vec_size / 8) + simd_lid * codes_per_thread;
+    const device uint8_t* sc = weight_scales +
+        out_row * in_vec_size_g + simd_lid;
+    const device bfloat* xp = attention_output + simd_lid * values_per_thread;
+
+    thread float x_thread[values_per_thread];
+    thread float result[results_per_simdgroup]\(rowSeedInit);
+
+    uint column = simd_lid * values_per_thread;
+    \(kLoop)
+
+    for (uint row = 0; row < results_per_simdgroup; ++row) {
+        result[row] = simd_sum(result[row]);
+        if (simd_lid == 0) {
+            projected[out_row + row] = bfloat(\(lagunaNvfp4RowNormalizeOpen)result[row]\(lagunaNvfp4RowNormalizeClose)\(lagunaNvfp4RowScaleSuffix));
+        }
+    }
+    """
+}
+
+private let lagunaGatedAffineOProjNVFP4Kernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_v1",
+            inputNames: [
+                "attention_output", "gate_logits", "weight_codes",
+                "weight_scales",
+            ],
+            outputNames: ["projected"],
+            source: lagunaGatedAffineOProjNVFP4Source(heads: heads),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+/// Gate product + native NVFP4 output projection in one dispatch, or `nil`
+/// when any shape, dtype or wire-format guard declines (caller then runs the
+/// exact two-dispatch chain). The NVFP4 twin of `lagunaGatedAffineOProj`.
+func lagunaGatedAffineOProjNVFP4(
+    attentionOutput: MLXArray,
+    gateLogits: MLXArray,
+    codes: MLXArray,
+    scales: MLXArray,
+    heads: Int
+) -> MLXArray? {
+    guard let kernel = lagunaGatedAffineOProjNVFP4Kernels[heads] else { return nil }
+    let inVec = heads * LagunaConstants.headDim
+    let outVec = LagunaConstants.hiddenSize
+    guard attentionOutput.dtype == .bfloat16,
+        attentionOutput.shape == [1, 1, inVec],
+        gateLogits.dtype == .bfloat16,
+        gateLogits.shape == [1, 1, heads],
+        codes.dtype == .uint32,
+        codes.shape == [outVec, inVec / 8],
+        scales.dtype == .uint8,
+        scales.shape == [outVec, inVec / 16]
+    else {
+        return nil
+    }
+
+    lagunaTrace("gated affine oproj nvfp4 qmv h\(heads)")
+    return kernel(
+        [attentionOutput, gateLogits, codes, scales],
+        grid: ((outVec / 8) * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, outVec]],
+        outputDTypes: [.bfloat16]
+    )[0]
 }
 
 // MARK: - Norm-folded native-affine QKV projection (one dispatch)
@@ -4299,6 +4677,27 @@ final class LagunaRuntimeAttention: Module {
                 {
                     return fusedProjection
                 }
+                // NVFP4 twin: ONE dispatch for the softplus chain, the broadcast
+                // product AND the NVFP4 contraction (see
+                // `lagunaGatedAffineOProjNVFP4Source`) on the affine tail layers
+                // (>= lagunaNativeAffineNVFP4From). Splits the proven nibble
+                // decode and folds the gate; bit-identical to gating first then
+                // the stock NVFP4 affine GEMV. Guard declines fall through.
+                // `DARKBLOOM_GATED_AFFINE_OPROJ_NVFP4=0` ablates just this
+                // branch (the INT8 twin keeps its own flag) for same-binary A/B.
+                if lagunaFusedGatedAffineOProjEnabled, lagunaGatedAffineOProjNVFP4Enabled,
+                    !gateIsActivated,
+                    affineWO.mode == .nvfp4, affineWO.bits == 4,
+                    affineWO.groupSize == 16,
+                    let fusedProjection = lagunaGatedAffineOProjNVFP4(
+                        attentionOutput: output,
+                        gateLogits: projectedGate,
+                        codes: affineWO.packedCodes,
+                        scales: affineWO.scales,
+                        heads: nHeads)
+                {
+                    return fusedProjection
+                }
                 // Raw logits + fused kernel: one dispatch reproduces the
                 // softplus chain AND the broadcast product bit-exactly (see
                 // `lagunaGateProductSoftplusSource`). Falls back to the stock
@@ -4560,7 +4959,10 @@ let lagunaNvfp4NibbleSplit: Int = {
 /// `m <= 127` keeps `m << 7 <= 16256 < 0x8000`; IEEE half is sign-magnitude,
 /// so that pattern IS the negation, including `-0.0h`. For `bits < 128` the
 /// add is the identity. Drops `laguna_nvfp4_scale` from seven AIR ops to five
-/// in the innermost K loop of every routed/shared decode QMV.
+/// in the innermost K loop of every routed/shared decode QMV, and the same
+/// five-op form from the hand-written inline E4M3 decode in
+/// `lagunaGatedAffineOProjNVFP4Source`, whose `scaleCarryActive` mirrors this
+/// flag's composition rule (carry only under the fold).
 /// `DARKBLOOM_NVFP4_SCALE_CARRY=0` restores the negate-after-convert form.
 let lagunaNvfp4ScaleCarry: Bool =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_CARRY"] != "0"
@@ -4609,6 +5011,15 @@ let lagunaNvfp4ScaleCarry: Bool =
 /// domain on the CPU, including groups whose every NVFP4 code is `-0.0`
 /// (code 8) and every activation `+0.0`.
 ///
+/// The flag also gates the same mechanism in the two gated o_proj kernels:
+/// `lagunaGatedAffineOProjNVFP4Source`'s `accum` (whose four `+=` become an
+/// assignment plus three) and `lagunaGatedAffineOProjSource`'s `accum` AND
+/// `sum` (whose eight `+=` each become an assignment plus seven). Nothing
+/// NVFP4-specific is involved -- the argument is about a `+0.0f`-seeded FP32
+/// accumulator -- and step 4 closes at those call sites too whenever the row
+/// peel is off, because `result[]` is then `+0.0f`-seeded and absorbs the sign
+/// of a zero exactly as the SwiGLU accumulators do.
+///
 /// The two packed-word bodies are emitted textually in BOTH arms of the flag,
 /// so the flag isolates the seed and nothing else. That costs no arithmetic:
 /// the Metal compiler must already fully unroll the two-iteration `j` loop —
@@ -4616,6 +5027,84 @@ let lagunaNvfp4ScaleCarry: Bool =
 /// indices — so the unrolled text is what it was already compiling.
 let lagunaNvfp4QdotSeedElisionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_QDOT_SEED_ELIDE"] != "0"
+
+/// `DARKBLOOM_NVFP4_ROW_SEED_PEEL` (default ON; set "0" to restore the
+/// `= {0.0f, 0.0f}` row seeds): the K-loop analogue of the qdot seed elision
+/// one level up. The decode SwiGLU QMV kernels seed `gate_result` / `up_result`
+/// with `+0.0f` and then run FOUR `+=` over the 2048-wide input in 512-value
+/// K blocks, so the first of those four is `fl(+0.0f + q0)`. As with the qdot
+/// seed, `fadd float 0.0, %q0` is NOT foldable without no-signed-zeros and
+/// `device.cpp:631` sets `setFastMathEnabled(false)`, so it is a real FP add:
+/// four per lane per kernel invocation (`gate_result[0..1]`,
+/// `up_result[0..1]`), 32 lanes per simdgroup.
+///
+/// Peeling the first K block makes those four adds assignments. That is NOT
+/// bit-exact on its own -- and unlike the qdot seed elision the `-0.0` it
+/// admits is NOT absorbed by the call site, because the row accumulator IS the
+/// call site: `bfloat(-0.0)` reaches `silu` (`silu(-0.0) == -0.0`, since
+/// `-0.0 < 0` is false so the sigmoid branch is the same `1 - y == 0.5`) and
+/// then `activated[i] = bfloat(silu * up)`, which is a `-0.0` the down
+/// projection only absorbs when the residual stream happens to be nonzero at
+/// that coordinate. That is a data property, not a proof, which is why the
+/// bare peel is not shipped.
+///
+/// This ships the peel PLUS a single `+ 0.0f` sign normalization applied once
+/// per output row by lane 0 only, after `simd_sum`. That is exact by closed
+/// case analysis, with no appeal to model data:
+///
+///  1. **The stock lane accumulator is never `-0.0`.** Its first partial is
+///     `fl(+0.0 + q0)`, and `+0.0 + (-0.0) == +0.0`, so partial 0 is not
+///     `-0.0`; under round-to-nearest a float sum is `-0.0` only when BOTH
+///     addends are, so no later partial is either. Induction closes it.
+///  2. **The peeled lane accumulator equals the stock one, or is `-0.0` where
+///     the stock one is `+0.0`.** Base: `a0 = q0` versus `p0 = fl(+0 + q0)`,
+///     which differ only when `q0 == -0.0`. Step: adding `q` to a `(-0.0,
+///     +0.0)` pair gives `q` on both sides when `q` is nonzero finite, `±Inf`
+///     or NaN; `(+0.0, +0.0)` when `q == +0.0`; and `(-0.0, +0.0)` when
+///     `q == -0.0`. The invariant is preserved and never inverts.
+///  3. **`simd_sum` preserves the invariant.** It is a binary add tree over the
+///     32 lane values (its order is unspecified, but BOTH forms use the same
+///     one). At every node the two forms' operands are pairwise equal or
+///     `(-0.0, +0.0)`, and the case table in 2 applies verbatim, so the
+///     reduced values are equal or `(-0.0, +0.0)`. By 1 the stock reduction is
+///     never `-0.0`, so the difference stays one-directional.
+///  4. **`x + 0.0f` collapses exactly that difference and nothing else.** It
+///     maps `-0.0` to `+0.0` and is the bitwise identity on every other float:
+///     finite nonzero (adding zero is exact), `+0.0`, `±Inf`, and NaN (the
+///     result is the same already-quiet NaN operand). So
+///     `fl(a + 0.0f) == p` bitwise in every case, and the row value entering
+///     `* 4194304.0f`, `bfloat(...)`, the SiLU and `activated[]` is the stock
+///     bit pattern. `(a + 0.0f) * c` cannot contract into an FMA (`fma` is
+///     `a*b + c`), so the normalization survives the Metal compiler.
+///
+/// Net ALU: four adds removed on every one of the 32 lanes, four added on lane
+/// 0 alone -- 124 of 128 per simdgroup per kernel invocation. Applied to the
+/// two SwiGLU QMV kernels the shipped decode path actually dispatches
+/// (`laguna_shared_nvfp4_swiglu_qmv_bf16_v1` and
+/// `laguna_routed_nvfp4_swiglu_qmv_bf16_v2`); the merged routed+shared, R4,
+/// pipelined and nine-slot arms are opt-in A/B kernels off the scored path and
+/// keep their stock seeds. The down kernels need nothing: `input_width` is one
+/// K block there, so `result[row]` is already an assignment.
+///
+/// The flag ALSO gates the same peel and the same lane-0 normalization in both
+/// gated o_proj kernels (`lagunaGatedAffineOProjSource`,
+/// `lagunaGatedAffineOProjNVFP4Source`), whose `result[4]` row accumulators
+/// have the identical shape: seeded `+0.0f`, one `+=` per K block, then
+/// `simd_sum` and one BF16 round. Steps 1-4 transfer verbatim. Their `-0.0` is
+/// likewise NOT absorbed downstream: the o_proj output is the attention
+/// block's return value and reaches `bfloat(residual[i] + branch[i])`, and an
+/// add absorbs `-0.0` against every operand except another `-0.0`, so
+/// divergence would hinge on the residual coordinate itself being `-0.0` --
+/// reachable in principle (NVFP4 code 8 decodes to `-0.0` and the embedding is
+/// NVFP4), hence a data property rather than a proof, hence the
+/// normalization.
+///
+/// The four-iteration K loop has a compile-time constant trip count over a
+/// `thread float[16]` staging array, so the Metal compiler must already fully
+/// unroll it; emitting the first block textually is the same machine code with
+/// one fewer add, not an extra unroll.
+let lagunaNvfp4RowSeedPeelEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_ROW_SEED_PEEL"] != "0"
 
 /// `DARKBLOOM_NVFP4_SCALE_DEFER` (default ON; set "0" to restore): moves
 /// the `2^22` that `DARKBLOOM_NVFP4_SCALE_FOLD` parked in
@@ -4657,7 +5146,42 @@ let lagunaNvfp4ScaleDeferEnabled =
 /// `laguna_nvfp4_scale` call site in every kernel that uses
 /// `lagunaSharedSwiGLUQMVHeader`; `nvfp4EveryScaleCallSiteHasARowRescaleSite`
 /// pins those two counts equal per kernel so a missed epilogue cannot ship.
+/// It is also the epilogue of `lagunaGatedAffineOProjNVFP4Source`, whose
+/// hand-written inline E4M3 decode drops the same `2^22` under the flag.
 let lagunaNvfp4RowScaleSuffix = lagunaNvfp4ScaleDeferEnabled ? " * 4194304.0f" : ""
+
+/// The three textual pieces of `DARKBLOOM_NVFP4_ROW_SEED_PEEL`. They MUST move
+/// together: the peel is what admits a `-0.0` lane accumulator and the
+/// normalization is what removes it again, so emitting one without the other
+/// is not bit-exact. With the flag off all three are empty and each kernel's
+/// source is character-for-character the pre-peel text.
+let lagunaNvfp4RowSeedInit = lagunaNvfp4RowSeedPeelEnabled ? "" : " = {0.0f, 0.0f}"
+let lagunaNvfp4RowNormalizeOpen = lagunaNvfp4RowSeedPeelEnabled ? "(" : ""
+let lagunaNvfp4RowNormalizeClose = lagunaNvfp4RowSeedPeelEnabled ? " + 0.0f)" : ""
+
+/// Wraps a SwiGLU QMV kernel's K-block body in either the stock single loop
+/// (`+=` every block) or the peeled form (a first block that ASSIGNS, then the
+/// remaining blocks accumulating). `body` is emitted verbatim in both arms with
+/// only the accumulate operator substituted, so the flag isolates the seed and
+/// nothing else -- same pointer arithmetic, same qdot calls, same association.
+func lagunaNvfp4SwiGLUKLoop(_ body: (String) -> String) -> String {
+    guard lagunaNvfp4RowSeedPeelEnabled else {
+        return """
+            for (uint block = 0; block < input_width; block += block_width) {
+            \(body("+="))
+            }
+            """
+    }
+    return """
+        {
+            const uint block = 0;
+        \(body("="))
+        }
+        for (uint block = block_width; block < input_width; block += block_width) {
+        \(body("+="))
+        }
+        """
+}
 
 let lagunaSharedSwiGLUQMVHeader: String = {
     // The two halves of one power-of-two regrouping. They MUST move together:
@@ -4786,11 +5310,48 @@ let lagunaSharedSwiGLUQMVHeader: String = {
     """
 }()
 
-private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_shared_nvfp4_swiglu_qmv_bf16_v1",
-    inputNames: ["input", "fused_weight", "fused_scales"],
-    outputNames: ["activated"],
-    source: """
+let lagunaSharedSwiGLUQMVSource: String = {
+    func blockBody(_ op: String) -> String {
+        """
+                const device vec<bfloat, 4>* input_vectors =
+                    (const device vec<bfloat, 4>*)(
+                        input + block + lane * values_per_lane);
+                for (uint i = 0; i < values_per_lane / 4; ++i) {
+                    const vec<bfloat, 4> values = input_vectors[i];
+                    input_values[4 * i] = values[0];
+                    input_values[4 * i + 1] = values[1];
+                    input_values[4 * i + 2] = values[2];
+                    input_values[4 * i + 3] = values[3];
+                }
+
+                for (uint row = 0; row < 2; ++row) {
+                    uint gate_row = first_row + row;
+                    uint up_row = gate_row + output_width;
+                    const device uint8_t* gate_weight =
+                        (const device uint8_t*)fused_weight +
+                        gate_row * packed_row_bytes + block / 2 + lane * 8;
+                    const device uint8_t* up_weight =
+                        (const device uint8_t*)fused_weight +
+                        up_row * packed_row_bytes + block / 2 + lane * 8;
+                    const device uint8_t* gate_scale =
+                        fused_scales + gate_row * scale_row_bytes +
+                        block / 16 + lane;
+                    const device uint8_t* up_scale =
+                        fused_scales + up_row * scale_row_bytes +
+                        block / 16 + lane;
+
+                    gate_result[row] \(op) laguna_nvfp4_qdot_16(
+                        gate_weight,
+                        input_values,
+                        laguna_nvfp4_scale(gate_scale[0]));
+                    up_result[row] \(op) laguna_nvfp4_qdot_16(
+                        up_weight,
+                        input_values,
+                        laguna_nvfp4_scale(up_scale[0]));
+                }
+        """
+    }
+    return """
         constexpr uint input_width = 2048;
         constexpr uint output_width = 512;
         constexpr uint fused_width = 1024;
@@ -4804,55 +5365,18 @@ private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
         uint lane = thread_index_in_simdgroup;
         uint first_row = tile * 4 + simd_group * 2;
 
-        thread float gate_result[2] = {0.0f, 0.0f};
-        thread float up_result[2] = {0.0f, 0.0f};
+        thread float gate_result[2]\(lagunaNvfp4RowSeedInit);
+        thread float up_result[2]\(lagunaNvfp4RowSeedInit);
         thread float input_values[values_per_lane];
 
-        for (uint block = 0; block < input_width; block += block_width) {
-            const device vec<bfloat, 4>* input_vectors =
-                (const device vec<bfloat, 4>*)(
-                    input + block + lane * values_per_lane);
-            for (uint i = 0; i < values_per_lane / 4; ++i) {
-                const vec<bfloat, 4> values = input_vectors[i];
-                input_values[4 * i] = values[0];
-                input_values[4 * i + 1] = values[1];
-                input_values[4 * i + 2] = values[2];
-                input_values[4 * i + 3] = values[3];
-            }
-
-            for (uint row = 0; row < 2; ++row) {
-                uint gate_row = first_row + row;
-                uint up_row = gate_row + output_width;
-                const device uint8_t* gate_weight =
-                    (const device uint8_t*)fused_weight +
-                    gate_row * packed_row_bytes + block / 2 + lane * 8;
-                const device uint8_t* up_weight =
-                    (const device uint8_t*)fused_weight +
-                    up_row * packed_row_bytes + block / 2 + lane * 8;
-                const device uint8_t* gate_scale =
-                    fused_scales + gate_row * scale_row_bytes +
-                    block / 16 + lane;
-                const device uint8_t* up_scale =
-                    fused_scales + up_row * scale_row_bytes +
-                    block / 16 + lane;
-
-                gate_result[row] += laguna_nvfp4_qdot_16(
-                    gate_weight,
-                    input_values,
-                    laguna_nvfp4_scale(gate_scale[0]));
-                up_result[row] += laguna_nvfp4_qdot_16(
-                    up_weight,
-                    input_values,
-                    laguna_nvfp4_scale(up_scale[0]));
-            }
-        }
+        \(lagunaNvfp4SwiGLUKLoop(blockBody))
 
         for (uint row = 0; row < 2; ++row) {
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
             if (lane == 0) {
-                bfloat gate = bfloat(gate_result[row]\(lagunaNvfp4RowScaleSuffix));
-                bfloat up = bfloat(up_result[row]\(lagunaNvfp4RowScaleSuffix));
+                bfloat gate = bfloat(\(lagunaNvfp4RowNormalizeOpen)gate_result[row]\(lagunaNvfp4RowNormalizeClose)\(lagunaNvfp4RowScaleSuffix));
+                bfloat up = bfloat(\(lagunaNvfp4RowNormalizeOpen)up_result[row]\(lagunaNvfp4RowNormalizeClose)\(lagunaNvfp4RowScaleSuffix));
                 bfloat exp_abs = metal::exp(metal::abs(gate));
                 bfloat denominator = bfloat(1) + exp_abs;
                 bfloat y = bfloat(1) / denominator;
@@ -4861,7 +5385,14 @@ private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
                 activated[first_row + row] = bfloat(silu * up);
             }
         }
-        """,
+        """
+}()
+
+private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
+    name: "laguna_shared_nvfp4_swiglu_qmv_bf16_v1",
+    inputNames: ["input", "fused_weight", "fused_scales"],
+    outputNames: ["activated"],
+    source: lagunaSharedSwiGLUQMVSource,
     header: lagunaSharedSwiGLUQMVHeader,
     ensureRowContiguous: true
 )
@@ -4995,11 +5526,50 @@ func lagunaSharedDownResidual(
     )[0]
 }
 
-private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_bf16_v2",
-    inputNames: ["input", "fused_weight", "fused_scales", "indices"],
-    outputNames: ["activated"],
-    source: """
+let lagunaRoutedSwiGLUQMVSource: String = {
+    func blockBody(_ op: String) -> String {
+        """
+                const device vec<bfloat, 4>* input_vectors =
+                    (const device vec<bfloat, 4>*)(
+                        input + block + lane * values_per_lane);
+                for (uint i = 0; i < values_per_lane / 4; ++i) {
+                    const vec<bfloat, 4> values = input_vectors[i];
+                    input_values[4 * i] = values[0];
+                    input_values[4 * i + 1] = values[1];
+                    input_values[4 * i + 2] = values[2];
+                    input_values[4 * i + 3] = values[3];
+                }
+
+                for (uint row = 0; row < 2; ++row) {
+                    uint logical_row = first_row + row;
+                    uint pair_tile = logical_row / 32;
+                    uint gate_row = pair_tile * 64 + logical_row % 32;
+                    uint up_row = gate_row + 32;
+                    const device uint8_t* gate_weight =
+                        expert_weight + gate_row * packed_row_bytes +
+                        block / 2 + lane * 8;
+                    const device uint8_t* up_weight =
+                        expert_weight + up_row * packed_row_bytes +
+                        block / 2 + lane * 8;
+                    const device uint8_t* gate_scale =
+                        expert_scales + gate_row * scale_row_bytes +
+                        block / 16 + lane;
+                    const device uint8_t* up_scale =
+                        expert_scales + up_row * scale_row_bytes +
+                        block / 16 + lane;
+
+                    gate_result[row] \(op) laguna_nvfp4_qdot_16(
+                        gate_weight,
+                        input_values,
+                        laguna_nvfp4_scale(gate_scale[0]));
+                    up_result[row] \(op) laguna_nvfp4_qdot_16(
+                        up_weight,
+                        input_values,
+                        laguna_nvfp4_scale(up_scale[0]));
+                }
+        """
+    }
+    return """
         constexpr uint input_width = 2048;
         constexpr uint output_width = 512;
         constexpr uint fused_width = 1024;
@@ -5031,57 +5601,18 @@ private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
         const device uint8_t* expert_scales =
             fused_scales + expert * scale_expert_bytes;
 
-        thread float gate_result[2] = {0.0f, 0.0f};
-        thread float up_result[2] = {0.0f, 0.0f};
+        thread float gate_result[2]\(lagunaNvfp4RowSeedInit);
+        thread float up_result[2]\(lagunaNvfp4RowSeedInit);
         thread float input_values[values_per_lane];
 
-        for (uint block = 0; block < input_width; block += block_width) {
-            const device vec<bfloat, 4>* input_vectors =
-                (const device vec<bfloat, 4>*)(
-                    input + block + lane * values_per_lane);
-            for (uint i = 0; i < values_per_lane / 4; ++i) {
-                const vec<bfloat, 4> values = input_vectors[i];
-                input_values[4 * i] = values[0];
-                input_values[4 * i + 1] = values[1];
-                input_values[4 * i + 2] = values[2];
-                input_values[4 * i + 3] = values[3];
-            }
-
-            for (uint row = 0; row < 2; ++row) {
-                uint logical_row = first_row + row;
-                uint pair_tile = logical_row / 32;
-                uint gate_row = pair_tile * 64 + logical_row % 32;
-                uint up_row = gate_row + 32;
-                const device uint8_t* gate_weight =
-                    expert_weight + gate_row * packed_row_bytes +
-                    block / 2 + lane * 8;
-                const device uint8_t* up_weight =
-                    expert_weight + up_row * packed_row_bytes +
-                    block / 2 + lane * 8;
-                const device uint8_t* gate_scale =
-                    expert_scales + gate_row * scale_row_bytes +
-                    block / 16 + lane;
-                const device uint8_t* up_scale =
-                    expert_scales + up_row * scale_row_bytes +
-                    block / 16 + lane;
-
-                gate_result[row] += laguna_nvfp4_qdot_16(
-                    gate_weight,
-                    input_values,
-                    laguna_nvfp4_scale(gate_scale[0]));
-                up_result[row] += laguna_nvfp4_qdot_16(
-                    up_weight,
-                    input_values,
-                    laguna_nvfp4_scale(up_scale[0]));
-            }
-        }
+        \(lagunaNvfp4SwiGLUKLoop(blockBody))
 
         for (uint row = 0; row < 2; ++row) {
             gate_result[row] = simd_sum(gate_result[row]);
             up_result[row] = simd_sum(up_result[row]);
             if (lane == 0) {
-                bfloat gate = bfloat(gate_result[row]\(lagunaNvfp4RowScaleSuffix));
-                bfloat up = bfloat(up_result[row]\(lagunaNvfp4RowScaleSuffix));
+                bfloat gate = bfloat(\(lagunaNvfp4RowNormalizeOpen)gate_result[row]\(lagunaNvfp4RowNormalizeClose)\(lagunaNvfp4RowScaleSuffix));
+                bfloat up = bfloat(\(lagunaNvfp4RowNormalizeOpen)up_result[row]\(lagunaNvfp4RowNormalizeClose)\(lagunaNvfp4RowScaleSuffix));
                 bfloat exp_abs = metal::exp(metal::abs(gate));
                 bfloat denominator = bfloat(1) + exp_abs;
                 bfloat y = bfloat(1) / denominator;
@@ -5092,7 +5623,14 @@ private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
                 ] = bfloat(silu * up);
             }
         }
-        """,
+        """
+}()
+
+private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_bf16_v2",
+    inputNames: ["input", "fused_weight", "fused_scales", "indices"],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVSource,
     header: lagunaSharedSwiGLUQMVHeader,
     ensureRowContiguous: true
 )
@@ -8434,6 +8972,28 @@ final class LagunaRuntimeModelInner: Module {
         let slidingMask = createAttentionMask(
             h: h, cache: cache?[slidingAttentionIdx], windowSize: slidingWindow)
 
+        // Host-side scheduling constants hoisted out of the 40-layer loop:
+        // the decode-shape test and the asyncEval fire schedule are invariant
+        // across layers. Every schedule family normalizes to one bitmask over
+        // layer indices (bit `i` fires after layer `i`), so the loop body is
+        // a single shift-and-test per layer instead of three enum pattern
+        // matches and a modulo. `.norm`/`.logits` fire after the loop and are
+        // excluded here. Bit-exact: identical fire set, identical ordering.
+        let isSingleTokenDecode = inputs.shape == [1, 1]
+        let decodeFireMask: UInt64 =
+            switch lagunaDecodeAsyncStage {
+            case .off, .norm, .logits:
+                0
+            case .layer(let idx):
+                UInt64(1) << UInt64(idx)
+            case .ladder(let n):
+                (0..<UInt64(layers.count)).reduce(UInt64(0)) { acc, i in
+                    (Int(i) + 1) % n == 0 ? acc | (UInt64(1) << i) : acc
+                }
+            case .explicit(let mask):
+                mask
+            }
+
         // One cos/sin table per attention family per decode step, shared by
         // every layer of that family (their caches advance in lockstep). Each
         // table is produced by running the family's own RoPE layer over a
@@ -8455,12 +9015,7 @@ final class LagunaRuntimeModelInner: Module {
                         qkRoPEAngles: qkRoPEAngles,
                         qkRoPEOffsets: qkRoPEOffsets
                     )
-                    if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
-                        asyncEval(h)
-                    }
-                    if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                        inputs.shape == [1, 1]
-                    {
+                    if isSingleTokenDecode, (decodeFireMask >> UInt64(i)) & 1 == 1 {
                         asyncEval(h)
                     }
                 }
@@ -8472,17 +9027,7 @@ final class LagunaRuntimeModelInner: Module {
                     qkRoPEAngles: qkRoPEAngles,
                     qkRoPEOffsets: qkRoPEOffsets
                 )
-                if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
-                    asyncEval(h)
-                }
-                if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                    inputs.shape == [1, 1]
-                {
-                    asyncEval(h)
-                }
-                if case .explicit(let mask) = lagunaDecodeAsyncStage,
-                    (mask >> UInt64(i)) & 1 == 1, inputs.shape == [1, 1]
-                {
+                if isSingleTokenDecode, (decodeFireMask >> UInt64(i)) & 1 == 1 {
                     asyncEval(h)
                 }
                 if lagunaPrefillAsyncLadderStride > 0, h.dim(1) > 1,
