@@ -3020,11 +3020,19 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
 
         for (uint row = 0; row < results_per_simdgroup; ++row) {
             const device uint32_t* wl = ws + row * (in_vec_size / 8);
+            // E4M3 scale WITHOUT the 2^22: deferred to the per-row epilogue
+            // (one multiply per row instead of one per group). Power-of-two
+            // scaling commutes with every rounding in the chain, so each
+            // group product, partial sum and simd_sum is exactly 2^-22 times
+            // its folded value and the single epilogue multiply restores it
+            // before the one BF16 round -- bit-identical (the FP32-subnormal
+            // escape needs |scale x accum| < 2^-104, unreachable for O(1)
+            // attention values; the same promoted range argument as
+            // `fea7f28e`'s DARKBLOOM_NVFP4_SCALE_DEFER).
             uint8_t sbits = sc[row * in_vec_size_g];
             ushort sraw = ushort(sbits & 127) << 7;
             half sconverted = as_type<half>(sraw);
-            float scale = float((sbits & 128) ? -sconverted : sconverted)
-                * 4194304.0f;
+            float scale = float((sbits & 128) ? -sconverted : sconverted);
             float accum = 0.0f;
             #pragma unroll
             for (uint j = 0; j < codes_per_thread; ++j) {
@@ -3055,7 +3063,7 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
     }
 
     for (uint row = 0; row < results_per_simdgroup; ++row) {
-        result[row] = simd_sum(result[row]);
+        result[row] = simd_sum(result[row] * 4194304.0f);
         if (simd_lid == 0) {
             projected[out_row + row] = bfloat(result[row]);
         }
