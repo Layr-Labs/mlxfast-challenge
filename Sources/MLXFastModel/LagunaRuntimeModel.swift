@@ -7186,6 +7186,11 @@ final class LagunaRuntimeModelInner: Module {
     var _fullRoPEAngleAtlas: MLXArray?
     var _slidingRoPEAngleAtlas: MLXArray?
 
+    /// Process-constant per-layer full-attention flags + decode async fire mask.
+    /// Pure control-flow; kill DARKBLOOM_LAYER_PLAN=0.
+    private let layerIsFull: [Bool]
+    private let decodeAsyncFireMask: UInt64
+
     init(_ config: LagunaConfig) {
         precondition(config.vocabSize > 0)
 
@@ -7202,6 +7207,30 @@ final class LagunaRuntimeModelInner: Module {
         self.slidingWindow = config.slidingWindow
         self.fullAttentionIdx = config.layerTypes.firstIndex(of: .full) ?? 0
         self.slidingAttentionIdx = config.layerTypes.firstIndex(of: .sliding) ?? 0
+        let planEnabled =
+            ProcessInfo.processInfo.environment["DARKBLOOM_LAYER_PLAN"] != "0"
+        if planEnabled {
+            self.layerIsFull = config.layerTypes.map { $0 == .full }
+            var mask: UInt64 = 0
+            switch lagunaDecodeAsyncStage {
+            case .off, .norm, .logits:
+                break
+            case .layer(let idx):
+                if (0..<64).contains(idx) { mask = 1 << UInt64(idx) }
+            case .ladder(let n):
+                var i = n - 1
+                while i < config.numHiddenLayers {
+                    mask |= 1 << UInt64(i)
+                    i += n
+                }
+            case .explicit(let m):
+                mask = m
+            }
+            self.decodeAsyncFireMask = mask
+        } else {
+            self.layerIsFull = []
+            self.decodeAsyncFireMask = 0
+        }
         self._fullRoPEAngleSeed = MLXArray(
             Array(repeating: Float(0.7426255941390991), count: LagunaConstants.headDim / 4)
                 + Array(repeating: Float(0), count: LagunaConstants.headDim / 4),
@@ -7403,8 +7432,10 @@ final class LagunaRuntimeModelInner: Module {
         // seed row, so the angles are the exact floats that layer's kernel
         // would have computed rather than a re-derivation.
 
+        let useLayerPlan = !layerIsFull.isEmpty
+        let isDecodeShape = inputs.shape == [1, 1]
         for (i, layer) in layers.enumerated() {
-            let isFull = layerTypes[i] == .full
+            let isFull = useLayerPlan ? layerIsFull[i] : (layerTypes[i] == .full)
             let mask = isFull ? fullMask : slidingMask
             let qkRoPEAngles = isFull ? fullRoPEAngles : slidingRoPEAngles
             if i == layers.count - 1, h.dim(1) > 1 {
@@ -7418,13 +7449,19 @@ final class LagunaRuntimeModelInner: Module {
                         qkRoPEAngles: qkRoPEAngles,
                         qkRoPEOffsets: qkRoPEOffsets
                     )
-                    if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
-                        asyncEval(h)
-                    }
-                    if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                        inputs.shape == [1, 1]
-                    {
-                        asyncEval(h)
+                    if isDecodeShape {
+                        if useLayerPlan {
+                            if (decodeAsyncFireMask >> UInt64(i)) & 1 == 1 {
+                                asyncEval(h)
+                            }
+                        } else {
+                            if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i {
+                                asyncEval(h)
+                            }
+                            if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0 {
+                                asyncEval(h)
+                            }
+                        }
                     }
                 }
             } else {
@@ -7436,18 +7473,24 @@ final class LagunaRuntimeModelInner: Module {
                     qkRoPEOffsets: qkRoPEOffsets,
                     precomputedNorm: i == 0 ? layer0PrecomputedNorm : nil
                 )
-                if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
-                    asyncEval(h)
-                }
-                if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
-                    inputs.shape == [1, 1]
-                {
-                    asyncEval(h)
-                }
-                if case .explicit(let mask) = lagunaDecodeAsyncStage,
-                    (mask >> UInt64(i)) & 1 == 1, inputs.shape == [1, 1]
-                {
-                    asyncEval(h)
+                if isDecodeShape {
+                    if useLayerPlan {
+                        if (decodeAsyncFireMask >> UInt64(i)) & 1 == 1 {
+                            asyncEval(h)
+                        }
+                    } else {
+                        if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i {
+                            asyncEval(h)
+                        }
+                        if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0 {
+                            asyncEval(h)
+                        }
+                        if case .explicit(let mask) = lagunaDecodeAsyncStage,
+                            (mask >> UInt64(i)) & 1 == 1
+                        {
+                            asyncEval(h)
+                        }
+                    }
                 }
                 if lagunaPrefillAsyncLadderStride > 0, h.dim(1) > 1,
                     (i + 1) % lagunaPrefillAsyncLadderStride == 0
