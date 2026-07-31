@@ -3129,15 +3129,15 @@ func lagunaGatedAffineOProjNVFP4(
 /// idiom reports 0 bit mismatches over all 256 scale bytes against the
 /// `fp8_e4m3` chain (fp_quantized.cpp:385-388).
 ///
-/// `laguna_nvfp4_qdot_codes_16` is deliberately NOT reused here: the shipped
-/// default (`DARKBLOOM_NVFP4_SCALE_FOLD` on) moves the `16384.0f` from the
-/// sixteen per-value multiplies into the scale — a documented bit-exact
-/// power-of-two regrouping, but one expression away from the text the stock
-/// `fp_qmv_fast` kernel actually compiles (its `qdot` keeps the per-value
-/// `* 16384.0f` and its scale carries no fold). This header keeps the
-/// vendored placement exactly, so every product, partial sum and rounding
-/// decision matches the dispatch it replaces term for term. With the fold
-/// disabled the two helpers are expression-identical anyway.
+/// The promoted vendored `fp_qmv_fast` helper folds the exact `2^14`
+/// renormalization from the sixteen decoded values into its one group-scale
+/// multiply. This custom twin uses the same placement: its decoded values and
+/// every partial sum are exactly `2^-14` times the unfolded form, and
+/// `(scale * 16384.0f) * accum` restores the same result at the existing final
+/// group multiply. Finite E4M3 checkpoint scales satisfy `abs(scale) <= 448`,
+/// so the folded scale remains finite. The accumulator's `+0.0f` seed and both `+=`
+/// operations deliberately remain unchanged; this is only the promoted scale
+/// fold, not seed elision or row-scale deferral.
 private let lagunaTailNVFP4QMVHeader = """
     static inline float laguna_tail_nvfp4_scale(uint8_t bits) {
         ushort raw = ushort(bits & 127) << 7;
@@ -3171,10 +3171,10 @@ private let lagunaTailNVFP4QMVHeader = """
             const uint32_t p1 = (go << 8) & 0x8E008E00u;
             const uint32_t p2 = (ge << 1) & 0x8E008E00u;
             const uint32_t p3 = go & 0x8E008E00u;
-            const float2 v04 = float2(as_type<half2>(p0)) * 16384.0f;
-            const float2 v15 = float2(as_type<half2>(p1)) * 16384.0f;
-            const float2 v26 = float2(as_type<half2>(p2)) * 16384.0f;
-            const float2 v37 = float2(as_type<half2>(p3)) * 16384.0f;
+            const float2 v04 = float2(as_type<half2>(p0));
+            const float2 v15 = float2(as_type<half2>(p1));
+            const float2 v26 = float2(as_type<half2>(p2));
+            const float2 v37 = float2(as_type<half2>(p3));
             accum +=
                 (x_thread[8 * j] * v04.x +
                  x_thread[8 * j + 1] * v15.x +
@@ -3186,7 +3186,7 @@ private let lagunaTailNVFP4QMVHeader = """
                  x_thread[8 * j + 6] * v26.y +
                  x_thread[8 * j + 7] * v37.y);
         }
-        return scale * accum;
+        return (scale * 16384.0f) * accum;
     }
     """
 
@@ -3234,9 +3234,9 @@ private let lagunaTailNVFP4QMVHeader = """
 /// values_per_thread 16, block_size 512, in_vec_size_w = 1024 bytes per row,
 /// in_vec_size_g = 128 groups per row, scale base `out_row * 128 + simd_lid`
 /// advancing 32 groups per block, the E4M3 half-shuffle scale decode and the
-/// non-folded vendored qdot (see `lagunaTailNVFP4QMVHeader`), one
-/// `result[row] += scale * accum` per block over ascending k, one `simd_sum`
-/// and one BF16 round per output row. NVFP4 has no biases.
+/// promoted scale-folded vendored qdot (see `lagunaTailNVFP4QMVHeader`), one
+/// folded qdot result added per block over ascending k, one `simd_sum` and one
+/// BF16 round per output row. NVFP4 has no biases.
 ///
 /// GATE half (tiles `qkv_rows/8 ..< (qkv_rows + gate_rows)/8`) — the twin's
 /// textual `affine_qmv_fast<bfloat16_t, 32, 8>` replica for the 48/64 gate
