@@ -7,9 +7,8 @@
 
 using namespace mlx::steel;
 
-// DARKBLOOM_ATTN_QHOIST default. DEFAULT OFF: unless the compiler is invoked
-// with -DDARKBLOOM_ATTN_QHOIST=1, the kernel below is byte-for-byte the
-// upstream algorithm.
+// DARKBLOOM_ATTN_QHOIST default. DEFAULT ON: hoist loop-invariant Q fragments
+// out of the K-block loop (pure hoist; bit-exact). Set 0 to ablate.
 //
 // NOTE ON WHICH TWIN RUNS. steel/attn is a JIT family: the runtime-effective
 // source is the string in Cmlx/mlx-generated/steel_attention_nax.cpp, and the
@@ -20,7 +19,7 @@ using namespace mlx::steel;
 // tools/build-mlx-metallib.sh -- the AOT copy is reachable only by adding the
 // define to the metallib build flags by hand.
 #ifndef DARKBLOOM_ATTN_QHOIST
-#define DARKBLOOM_ATTN_QHOIST 0
+#define DARKBLOOM_ATTN_QHOIST 1
 #endif
 
 // DARKBLOOM_ATTN_QBLOCK_MAJOR default. DEFAULT ON for the standalone ranked
@@ -267,8 +266,16 @@ template <
   // Restricted to
   // do_causal && !has_mask so the all-masked proof rests on the causal mask
   // alone; the timed window passes no array mask.
+  // Per-simdgroup causal mask start: blocks with kb < sg_kb_min_causal are
+  // fully below this simdgroup's diagonal, so the causal mask is a pure no-op
+  // there. Raising the start from the threadgroup-wide kb_min_causal saves the
+  // mask loop without changing any stored score (all those sites are unmasked).
+  int sg_kb_min_causal = kb_min_causal;
   int sg_kb_lim = kb_lim;
   if (do_causal && !has_mask) {
+    int sg_q_min =
+        int(tidl.x) * BQ + params->qL_off + int(tm);
+    sg_kb_min_causal = max(0, sg_q_min + 1) / BK;
     int sg_q_max =
         int(tidl.x) * BQ + params->qL_off + int(tm) + kU * TQ;
     sg_kb_lim = min(kb_lim, (sg_q_max + BK - 1) / BK);
@@ -440,7 +447,7 @@ template <
     }
 
     // Mask out if causal
-    if (do_causal && kb >= kb_min_causal) {
+    if (do_causal && kb >= sg_kb_min_causal) {
       constexpr auto neg_inf = Limits<AccumType>::finite_min;
 
       const int base_row = int(tidl.x) * BQ + params->qL_off + tm;

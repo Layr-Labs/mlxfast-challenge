@@ -1231,10 +1231,12 @@ namespace {
 // of the loader traffic, and it drops the LSU:MMA issue ratio from 5.00 to
 // 4.11. See notes/21-attn-analysis.md.
 //
-// DEFAULT OFF, read as `== "1"`. This is an unmeasured arm: the hoist extends
-// 8 fragments' live range across the whole loop (+28 registers/thread), and if
-// that crosses an occupancy threshold it shows up as a regression, not a win.
-// It must not ship until a paired measurement says otherwise.
+// DEFAULT ON, read as `!= "0"`. Pure hoist of loop-invariant Q fragment loads
+// -- same pointer, same offsets, same bounds predicate, same mma order. The
+// hoist extends 8 fragments' live range across the whole loop
+// (+28 registers/thread); if that crosses an occupancy threshold it shows up
+// as a regression, not a win, so keep `DARKBLOOM_ATTN_QHOIST=0` as the
+// same-binary ablation.
 //
 // WHY A #define AND NOT A FUNCTION CONSTANT. The natural home for a host-side
 // switch is scaled_dot_product_attention.cpp, but that file is not in
@@ -1252,11 +1254,11 @@ namespace {
 // lib_name with no on-disk persistence, so exactly one variant is ever
 // compiled and a fresh process picks up a changed environment cleanly.
 //
-// Returns a `const char*` rather than a std::string because concatenate()
-// takes its arguments by value; the empty string appends nothing.
+// Always prepends an explicit 0/1 define so the host choice wins over the
+// source-string default regardless of which way it faces.
 const char* darkbloom_attn_qhoist_define() {
   static const bool enabled = [] {
-    const bool v = env::get_var("DARKBLOOM_ATTN_QHOIST", "") == "1";
+    const bool v = env::get_var("DARKBLOOM_ATTN_QHOIST", "1") != "0";
     // Same ground-truth discipline the STAGE arms needed: prove the arm is
     // live before trusting its number. A #define that silently fails to reach
     // the source string produces an arm that measures its own control.
@@ -1265,7 +1267,8 @@ const char* darkbloom_attn_qhoist_define() {
     }
     return v;
   }();
-  return enabled ? "\n#define DARKBLOOM_ATTN_QHOIST 1\n" : "";
+  return enabled ? "\n#define DARKBLOOM_ATTN_QHOIST 1\n"
+                 : "\n#define DARKBLOOM_ATTN_QHOIST 0\n";
 }
 
 // DARKBLOOM_ATTN_QBLOCK_MAJOR: present the existing (query-block, query-head)

@@ -1228,7 +1228,7 @@ int darkbloom_gather_run_skip_pct() {
 }
 
 // DARKBLOOM_STAGE_*: attack the per-run staging cost in
-// fp_gather_qmm_rhs_nax. Independent, each default OFF, each "1" to enable.
+// fp_gather_qmm_rhs_nax.
 //
 // The duplication probe puts the routed gather-QMMs at ~54% of prefill, while
 // RUNSKIP removing ~40% of their MMA work moved prefill only 5.88%. The
@@ -1241,10 +1241,15 @@ int darkbloom_gather_run_skip_pct() {
 // scales with E[runs intersecting a band]=2.93: after RUNSKIP the loader is
 // ~68% of the kernel's LSU traffic. These levers attack that.
 //
-//   DARKBLOOM_STAGE_WIDEST  fc 204  32x2B -> 4x16B threadgroup stores
-//   DARKBLOOM_STAGE_WIDELD  fc 205  16x1B -> 1x16B device weight load
-//   DARKBLOOM_STAGE_RUNBAR  fc 206  drop 2 provably dead per-run barriers
-//   DARKBLOOM_STAGE_NOVOL   fc 207  drop the vestigial volatile in the k-loop
+//   DARKBLOOM_STAGE_WIDEST  fc 204  32x2B -> 4x16B threadgroup stores  (DEFAULT ON)
+//   DARKBLOOM_STAGE_WIDELD  fc 205  16x1B -> 1x16B device weight load  (DEFAULT ON)
+//   DARKBLOOM_STAGE_RUNBAR  fc 206  drop 2 provably dead per-run barriers (OFF)
+//   DARKBLOOM_STAGE_NOVOL   fc 207  drop the vestigial volatile in the k-loop (OFF)
+//
+// WIDEST and WIDELD are pure access-width changes: same bytes, same addresses,
+// same nibble decode, same scale mapping. They ship DEFAULT ON (`!= "0"`).
+// RUNBAR and NOVOL stay DEFAULT OFF -- earlier ranked packages that shipped
+// RUNBAR alone or with the WIDE pair failed measure-job, so they stay opt-in.
 //
 // These compose with RUNSKIP above rather than competing with it: RUNSKIP
 // elides per-simdgroup MMA work, these cut the threadgroup-wide loader cost
@@ -1256,28 +1261,32 @@ int darkbloom_gather_run_skip_pct() {
 // that changes mid-process forces a JIT build that can land inside a timed
 // region (see notes/12, the 1:N dispatch-prefix regression).
 
-bool darkbloom_stage_flag(const char* name) {
+bool darkbloom_stage_flag_opt_in(const char* name) {
   auto v = env::get_var(name, "");
   return v == "1";
 }
 
+bool darkbloom_stage_flag_default_on(const char* name) {
+  return env::get_var(name, "1") != "0";
+}
+
 bool darkbloom_stage_widest() {
-  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_WIDEST");
+  static const bool v = darkbloom_stage_flag_default_on("DARKBLOOM_STAGE_WIDEST");
   return v;
 }
 
 bool darkbloom_stage_wideld() {
-  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_WIDELD");
+  static const bool v = darkbloom_stage_flag_default_on("DARKBLOOM_STAGE_WIDELD");
   return v;
 }
 
 bool darkbloom_stage_runbar() {
-  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_RUNBAR");
+  static const bool v = darkbloom_stage_flag_opt_in("DARKBLOOM_STAGE_RUNBAR");
   return v;
 }
 
 bool darkbloom_stage_novol() {
-  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_NOVOL");
+  static const bool v = darkbloom_stage_flag_opt_in("DARKBLOOM_STAGE_NOVOL");
   return v;
 }
 
@@ -1602,7 +1611,7 @@ void gather_qmm_rhs_nax(
   // the source can settle. Without this, a rejected gate is indistinguishable
   // from a lever that does nothing -- the exact confound that makes an
   // A/B arm meaningless. One shot per process, default off, stderr only.
-  if (darkbloom_stage_flag("DARKBLOOM_STAGE_TRACE")) {
+  if (darkbloom_stage_flag_opt_in("DARKBLOOM_STAGE_TRACE")) {
     static std::once_flag once;
     std::call_once(once, [&]() {
       fprintf(

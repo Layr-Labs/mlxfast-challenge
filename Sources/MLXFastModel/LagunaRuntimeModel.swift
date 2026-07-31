@@ -243,10 +243,22 @@ let lagunaPrefillFusedResidualRMSNormEnabled =
 
 /// Issues the routed and shared gate/up NVFP4 QMVs as one nine-slot dispatch
 /// (see `lagunaRoutedSharedSwiGLUQMVKernel`). Set
-/// `DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV=0` to ablate.
+/// `DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV=1` to restore the merge.
+///
+/// DEFAULT OFF: the merge is a dependency-chain pessimisation on the decode
+/// step. The routed half consumes `inds`, so the merged dispatch cannot be
+/// enqueued until the top-8 kernel retires -- but the shared half consumes
+/// only `x`, which is ready the moment `residual+rmsnorm+router` lands.
+/// Merging therefore parks the shared expert's gate/up work behind a
+/// dispatch it has no data dependency on. Splitting spends one extra
+/// dispatch per sparse layer to expose that work for overlap.
+///
+/// Proven +0.98% as submission 796ebd8 (yoyo); tip 1ba2bf6 re-enabled the
+/// merge as part of a different package. Re-split is arithmetically inert:
+/// each half keeps its own kernel, row mapping, and accumulation order.
 let lagunaFusedRoutedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment[
-        "DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV"] != "0"
+        "DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV"] == "1"
 
 /// Scheduling A/B for the merged routed/shared gate/up kernel. The proven R2
 /// schedule is the default; only an explicit selector value of `4` opts into
