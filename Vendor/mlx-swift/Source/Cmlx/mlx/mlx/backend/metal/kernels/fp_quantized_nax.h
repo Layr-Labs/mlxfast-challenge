@@ -1547,11 +1547,18 @@ template <
     const constant int& N,
     const constant int& K,
     const constant int& run_skip_pct,
+    const constant int& stage_widest_pct,
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]]) {
   (void)run_skip_pct;
+#ifdef DARKBLOOM_EXPERT_STAGE_WIDEST
+  const bool widest_tile = stage_widest_pct >= 100 ||
+      int((tid.y * 61u) % 100u) < stage_widest_pct;
+#else
+  (void)stage_widest_pct;
+#endif
   static_assert(transpose, "expert-aligned Laguna QMM requires NT weights");
   static_assert(group_size == 16, "expert-aligned Laguna QMM requires gs16");
   static_assert(bits == 4, "expert-aligned Laguna QMM requires NVFP4");
@@ -1649,7 +1656,15 @@ template <
 
       for (int k = 0; k < K_it; ++k) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+#ifdef DARKBLOOM_EXPERT_STAGE_WIDEST
+        if (widest_tile) {
+          loader_w.template load_unsafe_wide<true, false>();
+        } else {
+          loader_w.load_unsafe();
+        }
+#else
         loader_w.load_unsafe();
+#endif
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg_active) {

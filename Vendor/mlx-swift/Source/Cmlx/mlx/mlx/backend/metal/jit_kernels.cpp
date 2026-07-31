@@ -1116,6 +1116,22 @@ MTL::ComputePipelineState* get_steel_gemm_segmented_nax_kernel(
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);
 }
 
+// Expert staging-store width is source-gated once per process. Keep the
+// percentage as a runtime scalar so changing its strength does not create a
+// second pipeline specialization during a timed forward.
+const char* darkbloom_expert_stage_widest_define() {
+  static const bool enabled = [] {
+    const bool on =
+        env::get_var("DARKBLOOM_EXPERT_STAGE_WIDEST", "") != "0";
+    if (env::get_var("DARKBLOOM_STAGE_TRACE", "") == "1") {
+      fprintf(
+          stderr, "mlxfast: expert stage widest: enabled=%d\n", int(on));
+    }
+    return on;
+  }();
+  return enabled ? "\n#define DARKBLOOM_EXPERT_STAGE_WIDEST 1\n" : "";
+}
+
 MTL::ComputePipelineState* get_qmm_nax_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -1129,6 +1145,9 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
         metal::utils(),
         metal::gemm_nax(),
         metal::quantized_utils(),
+        kernel_name.find("_expert_") != std::string::npos
+            ? darkbloom_expert_stage_widest_define()
+            : "",
         (mode == "affine") ? metal::quantized_nax() : metal::fp_quantized_nax(),
         template_def);
     return kernel_source;
@@ -1162,6 +1181,9 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
     bool is_affine = mode == "affine";
     concatenate(
         kernel_source,
+        kernel_name.find("_expert_") != std::string::npos
+            ? darkbloom_expert_stage_widest_define()
+            : "",
         is_affine ? metal::quantized_nax() : metal::fp_quantized_nax(),
         get_template_definition(
             lib_name,

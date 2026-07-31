@@ -1281,6 +1281,29 @@ bool darkbloom_stage_novol() {
   return v;
 }
 
+// Expert kernels are assembled from a separate template and cannot use the
+// sibling function-constant staging selector. Keep the band-sized strength as
+// a runtime scalar so only one Metal pipeline is compiled per process.
+constexpr int kDarkbloomExpertStageWidestPct = 30;
+
+int darkbloom_expert_stage_widest_pct() {
+  static const int pct = [] {
+    auto value = env::get_var("DARKBLOOM_EXPERT_STAGE_WIDEST", "");
+    if (value.empty()) {
+      return kDarkbloomExpertStageWidestPct;
+    }
+    if (value == "1") {
+      return 100;
+    }
+    if (value.rfind("1:", 0) != 0) {
+      return kDarkbloomExpertStageWidestPct;
+    }
+    int parsed = std::atoi(value.c_str() + 2);
+    return parsed < 1 ? 1 : (parsed > 100 ? 100 : parsed);
+  }();
+  return pct;
+}
+
 bool darkbloom_expert_aligned_gather() {
   static const bool v =
       env::get_var("DARKBLOOM_EXPERT_ALIGNED_GATHER", "") != "0";
@@ -1595,6 +1618,8 @@ void gather_qmm_rhs_nax(
   const bool stage_wideld = darkbloom_stage_wideld() && wide_ok;
   const bool stage_runbar = darkbloom_stage_runbar();
   const bool stage_novol = darkbloom_stage_novol();
+  const int expert_stage_widest_pct =
+      darkbloom_expert_stage_widest_pct();
 
   // Ground truth for the A/B harness. `stage_wideld` is silently downgraded
   // to false when the host alignment certification declines, and `wide_ok`
@@ -1727,6 +1752,9 @@ void gather_qmm_rhs_nax(
   compute_encoder.set_bytes(N, c++);
   compute_encoder.set_bytes(K, c++);
   compute_encoder.set_bytes(run_skip_pct, c++);
+  if (expert_aligned) {
+    compute_encoder.set_bytes(expert_stage_widest_pct, c++);
+  }
 
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
