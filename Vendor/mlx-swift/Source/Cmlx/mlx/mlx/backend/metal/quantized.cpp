@@ -2032,9 +2032,17 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto mode = quantization_mode_to_string(mode_);
   // It is a matrix matrix product.
   if (M >= vector_limit) {
-    // Use split-K qmm for small M with transposed weights (non-batched only)
+    // Use split-K qmm for small M with transposed weights (non-batched
+    // only). Bounded to M <= 128 (DARKBLOOM_QMM_SPLITK_MAX_M overrides): at
+    // prefill M=512 the split intermediate, its column reduce and the
+    // reduce's arange dispatch measured -3.0/-3.8% prefill vs plain qmm,
+    // checked teacher-forced tokens unchanged.
+    static const int splitk_max_m = [] {
+      const char* raw = getenv("DARKBLOOM_QMM_SPLITK_MAX_M");
+      return raw ? atoi(raw) : 128;
+    }();
     int B = out.size() / M / N;
-    if (transpose_ && B == 1) {
+    if (transpose_ && B == 1 && M <= splitk_max_m) {
       qmm_splitk(
           x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
       return;

@@ -2880,24 +2880,12 @@ struct LagunaNativeAffineWeight {
     }
 }
 
-/// Group-16 NVFP4 attention tail, widened from layer 32 to layer 24.
-///
-/// The tail was inherited with a "do not widen" note, but the note predates
-/// the measurement: NVFP4 as shipped costs 0.5625 B/param (4-bit codes plus
-/// one e4m3 scale byte per 16) against 1.125 B/param for the group-32 affine
-/// INT8 side layout (1 B plus a 2 B scale and a 2 B bias per 32), so every
-/// layer moved off INT8 HALVES that layer's attention weight traffic. Decode
-/// is bandwidth-bound here, and the local sweep is monotone at about -0.5%
-/// decode per layer moved (FROM=32 5.614 ms, 28 5.532, 24 5.416, 16 5.154,
-/// 0 4.683, teacher-forced 200 steps each).
-///
-/// This chunk moves 8 layers (24..31), worth about -3.5% decode, because the
-/// acceptance band caps a single submission near +5% score; the remaining 24
-/// layers are deliberately left for later chunks. Numerically this moves
-/// TOWARD the reference rather than away from it -- NVFP4 is the shipped
-/// representation the goldens were generated from, while the INT8 side layout
-/// is the lossy re-quantization -- and it is option (1) of the frozen
-/// quantization envelope, which never requires the INT8 re-quant.
+/// Group-16 NVFP4 attention banks on every layer (FROM=0). NVFP4 as shipped
+/// is 0.5625 B/param vs 1.125 for the INT8 side layout; decode is
+/// bandwidth-bound and the widening sweep was monotone ~-0.5%/layer
+/// (5.614 ms at FROM=32 down to 4.683 at FROM=0, teacher-forced). This is
+/// envelope option (1) -- the reference representation -- so it moves the
+/// numerics TOWARD the goldens' generator, not away from it.
 private let lagunaNativeAffineNVFP4From: Int? = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_NVFP4"] != "0"
     else { return nil }
