@@ -1127,10 +1127,13 @@ namespace {
 // DARKBLOOM_ATTN_* levers below: resolved once per process, never part of a
 // pipeline specialization key, so exactly one variant is ever compiled per
 // run and A/B arms are separate runs of the same binary with the env var
-// flipped. Default OFF: unset compiles byte-identical stock staging (the
-// guarded blocks preprocess away). Injection is gated on the expert kernel
-// name so every other fp_quantized_nax JIT source stays byte-identical in
-// both arms.
+// flipped. SHIPPED DEFAULT ON (the unset/"1" path): unset injects the define
+// so the ranked run -- which sets no DARKBLOOM_* vars -- gets the stage-2
+// pipeline. DARKBLOOM_STAGE2_GATHER=0 is the control arm that rolls back to
+// byte-identical stock staging (the guarded blocks preprocess away), the
+// same != "0" shipped-default pattern as darkbloom_expert_aligned_gather.
+// Injection is gated on the expert kernel name so every other
+// fp_quantized_nax JIT source stays byte-identical in both arms.
 //
 // The stderr line is the ground-truth trace the STAGE_* levers lacked: those
 // function constants only ever reached the NON-expert fp_gather_qmm_rhs_nax,
@@ -1139,7 +1142,7 @@ namespace {
 // pipeline was built from the stage-2 source.
 const char* darkbloom_stage2_gather_define() {
   static const char* define = [] {
-    const bool v = env::get_var("DARKBLOOM_STAGE2_GATHER", "") == "1";
+    const bool v = env::get_var("DARKBLOOM_STAGE2_GATHER", "") != "0";
     if (v || env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1") {
       fprintf(
           stderr,
