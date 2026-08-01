@@ -4589,16 +4589,19 @@ private let lagunaTailNormQKVGateKernels: [Int: MLXFast.MLXFastKernel] = {
     return kernels
 }()
 
-/// `DARKBLOOM_TAIL_NORM_QKV_GATE` (default ON; set "0" to ablate and restore
-/// the exact three-dispatch chain — stock RMSNorm + NVFP4 QKV qmv + INT8
-/// gate qmv — inside the same binary).
+/// `DARKBLOOM_TAIL_NORM_QKV_GATE` (default OFF; set "1" to re-enable).
+/// With NVFP4 widened to every attention layer, recomputing the 2048-element
+/// RMS reduction in every QKV output tile costs more than the two dispatches
+/// this fusion removes. A hot-start A/B/A on the current all-NVFP4 tree
+/// measured 4.583 vs 4.672 ms/steady decode step (-1.9%) for the exact stock
+/// three-dispatch chain. The opt-in arm remains for architecture ablation.
 private let lagunaTailNormQKVGateEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_TAIL_NORM_QKV_GATE"] != "0"
+    ProcessInfo.processInfo.environment["DARKBLOOM_TAIL_NORM_QKV_GATE"] == "1"
 
 /// Layer-count knob for the tail fused norm+QKV+gate kernel, parsed exactly
-/// like the other fusion layer knobs: layers `32 <= layerIdx < N` are
-/// eligible (default 40, the whole NVFP4 tail window), clamped to
-/// 0...numHiddenLayers, and forced to 0 when the fusion is ablated.
+/// like the other fusion layer knobs: NVFP4 layers below `N` are eligible
+/// when the fusion is explicitly enabled (default 40), clamped to
+/// 0...numHiddenLayers, and forced to 0 when the fusion is disabled.
 private let lagunaTailNormQKVGateLayers: Int = {
     guard lagunaTailNormQKVGateEnabled else { return 0 }
     let requested = Int(
