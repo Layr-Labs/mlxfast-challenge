@@ -4407,9 +4407,10 @@ private let lagunaTailNVFP4QMVHeader = """
 /// Decode only: the wrapper returns nil unless every shape, dtype and
 /// wire-format guard holds, and the call site sits inside the B==1/L==1
 /// native-affine QKV branch, so prefill and every multi-token call keep the
-/// stock three-dispatch chain. `DARKBLOOM_TAIL_NORM_QKV_GATE=0` ablates
-/// inside the same binary; `DARKBLOOM_TAIL_NORM_QKV_GATE_LAYERS=N` bounds
-/// coverage to layers 32 <= layerIdx < N (default 40).
+/// stock three-dispatch chain. The fused path is now an opt-in control:
+/// `DARKBLOOM_TAIL_NORM_QKV_GATE=1` enables it inside the same binary and
+/// `DARKBLOOM_TAIL_NORM_QKV_GATE_LAYERS=N` bounds its upper coverage (default
+/// 40); the active NVFP4 boundary supplies the lower layer bound.
 private func lagunaTailNormQKVGateSource(heads: Int) -> String {
     let qkvRows =
         (heads + 2 * LagunaConstants.numKeyValueHeads) * LagunaConstants.headDim
@@ -4589,16 +4590,17 @@ private let lagunaTailNormQKVGateKernels: [Int: MLXFast.MLXFastKernel] = {
     return kernels
 }()
 
-/// `DARKBLOOM_TAIL_NORM_QKV_GATE` (default ON; set "0" to ablate and restore
-/// the exact three-dispatch chain — stock RMSNorm + NVFP4 QKV qmv + INT8
-/// gate qmv — inside the same binary).
+/// `DARKBLOOM_TAIL_NORM_QKV_GATE` (default OFF; set "1" to restore the fused
+/// control). On the all-NVFP4 frontier the exact three-dispatch chain — stock
+/// RMSNorm + NVFP4 QKV qmv + INT8 gate qmv — is faster: it computes RMSNorm
+/// once instead of repeating the prologue and barriers in every output tile.
 private let lagunaTailNormQKVGateEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_TAIL_NORM_QKV_GATE"] != "0"
+    ProcessInfo.processInfo.environment["DARKBLOOM_TAIL_NORM_QKV_GATE"] == "1"
 
 /// Layer-count knob for the tail fused norm+QKV+gate kernel, parsed exactly
-/// like the other fusion layer knobs: layers `32 <= layerIdx < N` are
-/// eligible (default 40, the whole NVFP4 tail window), clamped to
-/// 0...numHiddenLayers, and forced to 0 when the fusion is ablated.
+/// like the other fusion layer knobs: NVFP4 layers below `N` are eligible
+/// (default 40, the whole active NVFP4 window), clamped to 0...numHiddenLayers
+/// and forced to 0 while the fusion is disabled.
 private let lagunaTailNormQKVGateLayers: Int = {
     guard lagunaTailNormQKVGateEnabled else { return 0 }
     let requested = Int(
