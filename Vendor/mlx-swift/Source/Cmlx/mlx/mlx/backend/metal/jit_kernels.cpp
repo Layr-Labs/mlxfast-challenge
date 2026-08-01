@@ -949,7 +949,8 @@ MTL::ComputePipelineState* get_gather_qmm_kernel(
     int bk,
     int wm,
     int wn,
-    bool transpose) {
+    bool transpose,
+    bool lhs) {
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
     std::string kernel_source;
@@ -961,7 +962,12 @@ MTL::ComputePipelineState* get_gather_qmm_kernel(
         is_affine ? metal::quantized() : metal::fp_quantized(),
         get_template_definition(
             lib_name,
-            (is_affine ? "affine" : "fp") + std::string("_gather_qmm_rhs"),
+            (is_affine ? "affine" : "fp") +
+                std::string(
+                    // Only the fp (nvfp4) family defines the lhs-indirect
+                    // rhs kernels; the dispatch never requests an affine lhs
+                    // variant.
+                    lhs ? "_gather_qmm_rhs_lhs" : "_gather_qmm_rhs"),
             get_type_string(x.dtype()),
             group_size,
             bits,
@@ -1220,7 +1226,8 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
     int bk,
     int wm,
     int wn,
-    bool transpose) {
+    bool transpose,
+    bool lhs) {
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
     std::string kernel_source;
@@ -1239,7 +1246,11 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
                 std::string(
                     kernel_name.find("_expert_") != std::string::npos
                         ? "_gather_qmm_rhs_expert_nax"
-                        : "_gather_qmm_rhs_nax"),
+                        // Only the fp (nvfp4) family defines the lhs-indirect
+                        // rhs kernels; the dispatch never requests an affine
+                        // lhs variant.
+                        : (lhs ? "_gather_qmm_rhs_lhs_nax"
+                               : "_gather_qmm_rhs_nax")),
             get_type_string(x.dtype()),
             group_size,
             bits,

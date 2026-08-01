@@ -2012,6 +2012,131 @@ template <
       w, scales, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
+// Row-indirect (lhs-gathered) drop-in for mlx::steel::BlockLoader with
+// reduction_dim == 1, used by the lhs variant of fp_gather_qmm_rhs
+// (DARKBLOOM_PREFILL_LHS_GATHER). It stages the SAME values to the SAME
+// threadgroup addresses as the stock loader would from a materialized
+// activation gather -- staged row (bi + i) reads device row lhs_rows[bi + i]
+// instead of the contiguous row -- so the downstream barriers, MMA, and
+// stores are bit-for-bit unchanged; only the device row addressing is
+// indirect. Rows past the tile bound are zero-filled (and their lhs_rows
+// entries never read), matching BlockLoader::load_safe.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short tgp_size,
+    short n_reads = (BCOLS * BROWS) / (tgp_size),
+    short TCOLS = BCOLS / n_reads,
+    short TROWS = tgp_size / TCOLS>
+struct GatheredRowBlockLoader {
+  const int src_ld;
+  int col_offset;
+
+  // Thread location indices (identical assignment to BlockLoader)
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  // threadgroup and device memory
+  threadgroup T* dst;
+  const device T* src;
+  const device uint32_t* lhs_rows;
+
+  struct ReadVector {
+    uint8_t v[sizeof(T) * n_reads];
+  };
+
+  /* Constructor */
+  METAL_FUNC GatheredRowBlockLoader(
+      const device T* src_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      const device uint32_t* lhs_rows_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      : src_ld(src_ld_),
+        col_offset(0),
+        thread_idx(simd_group_id * 32 + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj(n_reads * (thread_idx % TCOLS)),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_),
+        lhs_rows(lhs_rows_) {}
+
+  /* Load from device memory into threadgroup memory - without bound checking */
+  METAL_FUNC void load_unsafe() const {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < BROWS; i += TROWS) {
+      const device T* row_src =
+          src + size_t(lhs_rows[bi + i]) * src_ld + col_offset + bj;
+      *((threadgroup ReadVector*)(&dst[i * dst_ld])) =
+          *((const device ReadVector*)(row_src));
+    }
+  }
+
+  /* Load from device memory into threadgroup memory - with bound checking */
+  METAL_FUNC void load_safe(short2 src_tile_dim) const {
+    src_tile_dim = src_tile_dim - short2(bj, bi);
+
+    // Skip loading if thread has no valid reads
+    if (src_tile_dim.x <= 0 || src_tile_dim.y <= 0) {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < BROWS; i += TROWS) {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < n_reads; j++) {
+          dst[i * dst_ld + j] = T(0);
+        }
+      }
+      return;
+    }
+
+    // Use fast thread memory for bound checks
+    bool tmp_idx[n_reads];
+    T tmp_val[n_reads];
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < BROWS; i += TROWS) {
+      const bool row_ok = i < src_tile_dim.y;
+      // Out-of-range rows fall back to the x base for their (discarded)
+      // dummy reads so lhs_rows is never indexed past the valid rows.
+      const device T* row_src =
+          src + (row_ok ? size_t(lhs_rows[bi + i]) * src_ld : 0) +
+          col_offset + bj;
+
+      // Make sure tmp_idx only contains valid indices
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < n_reads; j++) {
+        tmp_idx[j] = row_ok && (j < src_tile_dim.x);
+      }
+
+      // Read valid indices into tmp_val
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < n_reads; j++) {
+        tmp_val[j] = row_src[(tmp_idx[j] ? j : 0)];
+      }
+
+      // Zero out unneeded values
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < n_reads; j++) {
+        tmp_val[j] = tmp_idx[j] ? tmp_val[j] : T(0);
+      }
+
+      // Copy values to threadgroup memory
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < n_reads; j++) {
+        dst[i * dst_ld + j] = tmp_val[j];
+      }
+    }
+  }
+
+  /* Iteration helper (reduction_dim == 1: advance the column window) */
+  METAL_FUNC void next() {
+    col_offset += BCOLS;
+  }
+};
+
 template <
     typename T,
     int group_size,
@@ -2021,16 +2146,25 @@ template <
     int BK,
     int WM,
     int WN,
-    bool transpose>
-[[kernel]] void fp_gather_qmm_rhs(
+    bool transpose,
+    bool lhs_gather>
+METAL_FUNC void fp_gather_qmm_rhs_impl(
     const device T* x,
     const device uint32_t* w,
     const device uint8_t* scales,
     const device uint32_t* indices,
+    // DARKBLOOM_PREFILL_LHS_GATHER: per-output-row activation source rows,
+    // used in place of a materialized activation gather when lhs_gather is
+    // true; nullptr and never dereferenced otherwise.
+    const device uint32_t* lhs_indices,
     device T* y,
     const constant int& M,
     const constant int& N,
     const constant int& K,
+    // Threadgroup staging is declared by the [[kernel]] wrappers (address-
+    // space objects may only live at kernel scope) and passed through.
+    threadgroup T* Xs,
+    threadgroup T* Ws,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]]) {
@@ -2053,6 +2187,14 @@ template <
       transpose ? BK_padded : BN_padded>;
   using loader_x_t =
       mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  // DARKBLOOM_PREFILL_LHS_GATHER: the lhs variant stages x rows through
+  // lhs_indices with identical threadgroup contents (see
+  // GatheredRowBlockLoader), so a single loader handle drives the stock
+  // gemm loops below unchanged.
+  using loader_x_lhs_t =
+      GatheredRowBlockLoader<T, BM, BK, BK_padded, WM * WN * SIMD_SIZE>;
+  using loader_x_any_t =
+      metal::conditional_t<lhs_gather, loader_x_lhs_t, loader_x_t>;
   using loader_w_t = QuantizedBlockLoader<
       T,
       transpose ? BN : BK,
@@ -2062,9 +2204,6 @@ template <
       WM * WN * SIMD_SIZE,
       group_size,
       bits>;
-
-  threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
 
   // Compute the block
   const int K_w = K * bytes_per_pack / pack_factor;
@@ -2089,9 +2228,13 @@ template <
   const short2 tile_w =
       transpose ? short2(k_remain, tgp_bn) : short2(tgp_bn, k_remain);
 
-  // Move x and output to the correct block
+  // Move x and output to the correct block. With lhs_gather, x stays at the
+  // ungathered base: block rows are resolved through lhs_indices at staging
+  // time instead of by advancing the row base.
   auto wl = (const device uint8_t*)w;
-  x += y_row_long * K;
+  if constexpr (!lhs_gather) {
+    x += y_row_long * K;
+  }
   y += y_row_long * N + y_col_long;
   wl += transpose ? y_col_long * K_w : y_col * bytes_per_pack / pack_factor;
   scales += transpose ? y_col_long * K_g : y_col / group_size;
@@ -2120,7 +2263,14 @@ template <
     thread mma_t mma_op(simd_group_id, simd_lane_id);
 
     // Prepare threadgroup loading operations
-    thread loader_x_t loader_x(x, K, Xs, simd_group_id, simd_lane_id);
+    thread loader_x_any_t loader_x = [&] {
+      if constexpr (lhs_gather) {
+        return loader_x_any_t(
+            x, K, Xs, lhs_indices + y_row, simd_group_id, simd_lane_id);
+      } else {
+        return loader_x_any_t(x, K, Xs, simd_group_id, simd_lane_id);
+      }
+    }();
     thread loader_w_t loader_w(
         wl + index * stride_w,
         scales + index * stride_s,
@@ -2203,6 +2353,97 @@ template <
       }
     }
   }
+}
+
+// DARKBLOOM_PREFILL_LHS_GATHER wrappers: the stock kernel keeps its exact
+// signature (and, inlined with lhs_gather == false, its exact compiled
+// code); the lhs variant takes the extra lhs_indices buffer and stages
+// activation rows through it.
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool transpose>
+[[kernel]] void fp_gather_qmm_rhs(
+    const device T* x,
+    const device uint32_t* w,
+    const device uint8_t* scales,
+    const device uint32_t* indices,
+    device T* y,
+    const constant int& M,
+    const constant int& N,
+    const constant int& K,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int BN_padded = (BN + 16 / sizeof(T));
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
+  fp_gather_qmm_rhs_impl<T, group_size, bits, BM, BN, BK, WM, WN, transpose, false>(
+      x,
+      w,
+      scales,
+      indices,
+      nullptr,
+      y,
+      M,
+      N,
+      K,
+      Xs,
+      Ws,
+      tid,
+      simd_group_id,
+      simd_lane_id);
+}
+
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool transpose>
+[[kernel]] void fp_gather_qmm_rhs_lhs(
+    const device T* x,
+    const device uint32_t* w,
+    const device uint8_t* scales,
+    const device uint32_t* indices,
+    const device uint32_t* lhs_indices,
+    device T* y,
+    const constant int& M,
+    const constant int& N,
+    const constant int& K,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int BN_padded = (BN + 16 / sizeof(T));
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
+  fp_gather_qmm_rhs_impl<T, group_size, bits, BM, BN, BK, WM, WN, transpose, true>(
+      x,
+      w,
+      scales,
+      indices,
+      lhs_indices,
+      y,
+      M,
+      N,
+      K,
+      Xs,
+      Ws,
+      tid,
+      simd_group_id,
+      simd_lane_id);
 }
 
 template <typename T, const int group_size, const int bits>

@@ -237,6 +237,21 @@ let lagunaExpertAlignedGatherEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_EXPERT_ALIGNED_GATHER"] != "0"
 
+/// `DARKBLOOM_PREFILL_LHS_GATHER` (default on; set "0" to restore the
+/// materialized activation gather): the sorted-regime prefill gate/up
+/// gather-QMM reads its activation rows through the sort permutation
+/// (`order / m`) as kernel-side lhs indices instead of first materializing
+/// the ~16 MB-per-layer gathered activation copy (512 tokens x 8 experts x
+/// 2048 BF16). The kernel reads the same values in the same k-ascending
+/// order, so the path is bit-exact against the gather it replaces; only row
+/// addressing changes. The sorted expert table, inverse permutation, and
+/// down-projection call are unchanged, and the backend rhs kernels (expert
+/// nax, non-expert nax, and non-nax alike) all accept the extra lhs buffer,
+/// so every hardware/flag combination takes a lhs-indirect kernel. The
+/// flag-off path is byte-identical to the original dispatch.
+let lagunaPrefillLhsGatherEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_LHS_GATHER"] != "0"
+
 /// Decode post-attention residual + RMSNorm fusion. The kernel emits
 /// both the rounded BF16 residual (needed by the following skip connection)
 /// and the normalized row (consumed immediately by the MLP), eliminating a
@@ -8396,9 +8411,25 @@ private func lagunaFusedSortedRoutedGateUp(
     // SwitchGLU: `var idx = indices` / `var inverseOrder = MLXArray()`
     var idx = indices
     var inverseOrder = MLXArray()
+    // lhs row indices for the gather-QMM when the materialized activation
+    // gather is elided (DARKBLOOM_PREFILL_LHS_GATHER); nil keeps the stock
+    // gathered-x dispatch byte-identical.
+    var lhsIndices: MLXArray? = nil
     // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
     if doSort {
-        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        if lagunaPrefillLhsGatherEnabled {
+            // Sorted route table without the ~16 MB activation gather:
+            // `lhsIndices` carries each sorted row's source row so the
+            // kernel can read x in place; `sortedX` stays the ungathered
+            // expanded input. Every output row reads the same values in the
+            // same k-ascending order as the materialized form.
+            let (lhs, sortedIdx, invOrder) = gatherSortIndices(x: sortedX, indices: indices)
+            lhsIndices = lhs
+            idx = sortedIdx
+            inverseOrder = invOrder
+        } else {
+            (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        }
     }
     // Fused counterpart of SwitchGLU's separate-bank branch:
     //   xUp = upProj(x, idx, sortedIndices: doSort)
@@ -8410,12 +8441,17 @@ private func lagunaFusedSortedRoutedGateUp(
     // mode: mode, sortedIndices: sortedIndices)`. Issuing that once over the
     // tile-interleaved `fusedWeight`/`fusedScales` bank instead of twice over
     // the separate banks is the fusion; every other argument matches the
-    // stock call exactly (group 16, 4-bit, NVFP4, transpose, doSort).
+    // stock call exactly (group 16, 4-bit, NVFP4, transpose, doSort). When
+    // `lhsIndices` is non-nil the op contract is the sorted regime's usual
+    // one with the activation gather folded into the kernel: the output
+    // shape, sorted-expert dispatch, and every downstream consumer see no
+    // difference.
     let gateUp = MLX.gatherQuantizedMM(
         sortedX,
         fusedWeight,
         scales: fusedScales,
         biases: nil,
+        lhsIndices: lhsIndices,
         rhsIndices: idx,
         transpose: true,
         groupSize: 16,

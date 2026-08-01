@@ -1498,6 +1498,7 @@ void gather_qmm_rhs_nax(
     const array& w_,
     const array& scales_,
     const std::optional<array>& biases_,
+    const std::optional<array>& lhs_indices_,
     const array& indices_,
     array& out,
     bool transpose,
@@ -1511,6 +1512,16 @@ void gather_qmm_rhs_nax(
     const std::string mode) {
   // Start by normalizing the indices
   array indices = ensure_row_contiguous(indices_, d, s);
+
+  // A caller-supplied lhs (the sorted prefill MoE route table) carries one
+  // source-row index per OUTPUT row; the rhs kernels below then read x rows
+  // through it instead of through a materialized gather, so no broadcast or
+  // copy of x is needed. The rhs indices remain sorted by construction of
+  // the only caller that supplies both (Laguna prefill sorts the route
+  // table), so the sorted-rhs kernel variants apply unchanged.
+  const bool has_lhs = lhs_indices_.has_value();
+  array lhs_indices =
+      has_lhs ? ensure_row_contiguous(*lhs_indices_, d, s) : indices;
 
   // Broadcast x with indices. If we are here that means lhs_indices were not
   // provided so the lhs_indices are implied to be the shape of x broadcasted
@@ -1530,7 +1541,7 @@ void gather_qmm_rhs_nax(
   };
 
   // Normalize the input arrays
-  array x = broadcast_with_indices(x_);
+  array x = has_lhs ? ensure_row_contiguous(x_, d, s) : broadcast_with_indices(x_);
   array w = ensure_row_contiguous(w_, d, s);
   array scales = ensure_row_contiguous(scales_, d, s);
 
@@ -1633,17 +1644,23 @@ void gather_qmm_rhs_nax(
     }
   }
 
-  // Make the kernel name
+  // Make the kernel name. The lhs-gather variants are distinct kernels
+  // (extra lhs_indices buffer); the no-lhs names are byte-identical to the
+  // stock dispatch so the rhs-only path compiles the same pipelines as
+  // before.
   std::string kname;
   kname.reserve(64);
   concatenate(
       kname,
       mode +
           (static_expert_shape
-               ? "_gather_qmm_rhs_expert_static_nax_nt_"
+               ? (has_lhs ? "_gather_qmm_rhs_expert_static_lhs_nax_nt_"
+                          : "_gather_qmm_rhs_expert_static_nax_nt_")
                : (expert_aligned
-                      ? "_gather_qmm_rhs_expert_nax_nt_"
-               : (transpose ? "_gather_qmm_rhs_nax_nt_"
+                      ? (has_lhs ? "_gather_qmm_rhs_expert_lhs_nax_nt_"
+                                 : "_gather_qmm_rhs_expert_nax_nt_")
+               : (transpose ? (has_lhs ? "_gather_qmm_rhs_lhs_nax_nt_"
+                                       : "_gather_qmm_rhs_nax_nt_")
                             : "_gather_qmm_rhs_nax_nn_"))),
       type_string,
       "_gs_",
@@ -1764,7 +1781,8 @@ void gather_qmm_rhs_nax(
   if (expert_aligned) {
     auto template_def = get_template_definition(
         kname,
-        "fp_gather_qmm_rhs_expert_nax",
+        has_lhs ? "fp_gather_qmm_rhs_expert_lhs_nax"
+                : "fp_gather_qmm_rhs_expert_nax",
         get_type_string(x.dtype()),
         group_size,
         bits,
@@ -1794,7 +1812,8 @@ void gather_qmm_rhs_nax(
         bk,
         wm,
         wn,
-        transpose);
+        transpose,
+        has_lhs);
   }
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -1818,6 +1837,9 @@ void gather_qmm_rhs_nax(
     compute_encoder.set_input_array(biases, c++);
   }
   compute_encoder.set_input_array(indices, c++);
+  if (has_lhs) {
+    compute_encoder.set_input_array(lhs_indices, c++);
+  }
   compute_encoder.set_output_array(out, c++);
   compute_encoder.set_bytes(M, c++);
   compute_encoder.set_bytes(N, c++);
@@ -1832,6 +1854,7 @@ void gather_qmm_rhs(
     const array& w_,
     const array& scales_,
     const std::optional<array>& biases_,
+    const std::optional<array>& lhs_indices_,
     const array& indices_,
     array& out,
     bool transpose,
@@ -1850,6 +1873,7 @@ void gather_qmm_rhs(
         /* const array& w_ = */ w_,
         /* const array& scales_ = */ scales_,
         /* const std::optional<array>& biases_ = */ biases_,
+        /* const std::optional<array>& lhs_indices_ = */ lhs_indices_,
         /* const array& indices_ = */ indices_,
         /* array& out = */ out,
         /* bool transpose = */ transpose,
@@ -1865,6 +1889,14 @@ void gather_qmm_rhs(
 
   // Start by normalizing the indices
   array indices = ensure_row_contiguous(indices_, d, s);
+
+  // A caller-supplied lhs (the sorted prefill MoE route table) carries one
+  // source-row index per OUTPUT row; the rhs kernels below then read x rows
+  // through it instead of through a materialized gather, so no broadcast or
+  // copy of x is needed.
+  const bool has_lhs = lhs_indices_.has_value();
+  array lhs_indices =
+      has_lhs ? ensure_row_contiguous(*lhs_indices_, d, s) : indices;
 
   // Broadcast x with indices. If we are here that means lhs_indices were not
   // provided so the lhs_indices are implied to be the shape of x broadcasted
@@ -1884,7 +1916,7 @@ void gather_qmm_rhs(
   };
 
   // Normalize the input arrays
-  array x = broadcast_with_indices(x_);
+  array x = has_lhs ? ensure_row_contiguous(x_, d, s) : broadcast_with_indices(x_);
   array w = ensure_row_contiguous(w_, d, s);
   array scales = ensure_row_contiguous(scales_, d, s);
 
@@ -1896,13 +1928,18 @@ void gather_qmm_rhs(
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
 
-  // Make the kernel name
+  // Make the kernel name. The lhs-gather variants are distinct kernels
+  // (extra lhs_indices buffer); the no-lhs names are byte-identical to the
+  // stock dispatch.
   std::string kname;
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
   concatenate(
       kname,
-      mode + (transpose ? "_gather_qmm_rhs_nt_" : "_gather_qmm_rhs_nn_"),
+      mode +
+          (transpose ? (has_lhs ? "_gather_qmm_rhs_lhs_nt_"
+                                : "_gather_qmm_rhs_nt_")
+                     : "_gather_qmm_rhs_nn_"),
       type_string,
       "_gs_",
       group_size,
@@ -1954,7 +1991,8 @@ void gather_qmm_rhs(
       bk,
       wm,
       wn,
-      transpose);
+      transpose,
+      has_lhs);
   compute_encoder.set_compute_pipeline_state(kernel);
 
   MTL::Size group_dims(32, wn, wm);
@@ -1969,6 +2007,9 @@ void gather_qmm_rhs(
     compute_encoder.set_input_array(biases, c++);
   }
   compute_encoder.set_input_array(indices, c++);
+  if (has_lhs) {
+    compute_encoder.set_input_array(lhs_indices, c++);
+  }
   compute_encoder.set_output_array(out, c++);
   compute_encoder.set_bytes(M, c++);
   compute_encoder.set_bytes(N, c++);
@@ -2096,18 +2137,32 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   // matmuls and reuse reading x and w.
   //
   // TODO: Tune 16 and 4 here a bit better.
-  if (M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4) {
+  //
+  // A caller-supplied lhs (the sorted prefill MoE route table) carries one
+  // source-row index per OUTPUT row; the ops.cpp default lhs is the identity
+  // arange over x's batch, whose size equals x's row count. The rhs indices
+  // are sorted by construction of the only caller that supplies both indices
+  // (Laguna prefill sorts the route table before calling), so the sorted-rhs
+  // kernels apply unchanged; the row indirection moves from a materialized
+  // gather into the kernels' lhs buffer. Affine keeps the stock route: only
+  // the fp (nvfp4) rhs kernels have lhs-indirect variants.
+  const bool lhs_supplied =
+      lhs_indices.size() != static_cast<size_t>(x.size() / K);
+  if (M == 1 && B >= 16 && B / E >= 4 &&
+      (right_sorted_ == true ||
+       (lhs_supplied && transpose_ && mode != "affine"))) {
     gather_qmm_rhs(
         x,
         w,
         scales,
         biases,
+        lhs_supplied ? std::optional<array>(lhs_indices) : std::nullopt,
         rhs_indices,
         out,
         transpose_,
         group_size_,
         bits_,
-        x.size() / K,
+        lhs_supplied ? static_cast<int>(out.size() / N) : x.size() / K,
         N,
         K,
         d,

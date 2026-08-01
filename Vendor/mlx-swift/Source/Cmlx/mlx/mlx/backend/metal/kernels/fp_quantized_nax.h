@@ -1225,6 +1225,68 @@ template <
       w, scales, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
+// Row-indirect (lhs-gathered) counterparts of NAXTile::load / load_safe used
+// by the lhs variants of the rhs gather-QMM kernels. Tile element (row tr,
+// col c) reads src_col[lhs_rows[tr] * ld + c] -- the SAME value the
+// contiguous forms read at src_col[tr * ld + c] when the activation gather
+// has been materialized first (lhs_rows[tr] is then that row's source index),
+// so the fragment contents, the MMA chain, and every downstream float
+// operation are bit-for-bit unchanged; only the row addressing is indirect.
+// Rows at or beyond lim_rows and columns at or beyond lim_cols write 0 and
+// are never read, matching the load_safe contract (and never reading past
+// the lhs_indices array on partial chunks).
+template <class Frag, typename T, typename U>
+METAL_FUNC void nax_frag_load_lhs_rows(
+    thread typename Frag::template dtype_frag_t<T>& dst,
+    const device U* src_col,
+    const device uint32_t* lhs_rows,
+    const int ld,
+    const short lim_rows,
+    const short lim_cols,
+    const short off_x,
+    const short off_y) {
+  const short2 sc = Frag::get_coord();
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < Frag::kElemRows; i++) {
+    const short r = sc.y + off_x + i * Frag::kElemRowsJump;
+    const short c = sc.x + off_y;
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < Frag::kElemCols; j++) {
+      if (r < lim_rows && (c + j) < lim_cols) {
+        dst[i * Frag::kElemCols + j] =
+            static_cast<T>(src_col[size_t(lhs_rows[r]) * size_t(ld) + (c + j)]);
+      } else {
+        dst[i * Frag::kElemCols + j] = T(0);
+      }
+    }
+  }
+}
+
+template <class ATile, typename U>
+METAL_FUNC void nax_tile_load_lhs_rows(
+    thread ATile& tile,
+    const device U* src_col,
+    const device uint32_t* lhs_rows,
+    const int ld,
+    const short lim_rows,
+    const short lim_cols) {
+  using Frag = typename ATile::NAXFrag_t;
+  using T = typename ATile::elem_type;
+  const_for_loop<0, ATile::kTileRows, 1>([&](auto idx_row) {
+    const_for_loop<0, ATile::kTileCols, 1>([&](auto idx_col) {
+      nax_frag_load_lhs_rows<Frag, T>(
+          tile.template frag_at<idx_row.value, idx_col.value>(),
+          src_col,
+          lhs_rows,
+          ld,
+          lim_rows,
+          lim_cols,
+          short(idx_row.value * ATile::kFragRows),
+          short(idx_col.value * ATile::kFragCols));
+    });
+  });
+}
+
 template <
     typename T,
     int group_size,
@@ -1235,12 +1297,17 @@ template <
     int WM,
     int WN,
     bool transpose,
+    bool lhs_gather,
     typename Wtype = bfloat>
-[[kernel]] void fp_gather_qmm_rhs_nax(
+METAL_FUNC void fp_gather_qmm_rhs_nax_impl(
     const device T* x,
     const device uint32_t* w,
     const device uint8_t* scales,
     const device uint32_t* indices,
+    // DARKBLOOM_PREFILL_LHS_GATHER: per-output-row activation source rows,
+    // used in place of a materialized activation gather when lhs_gather is
+    // true; nullptr and never dereferenced otherwise.
+    const device uint32_t* lhs_indices,
     device T* y,
     const constant int& M,
     const constant int& N,
@@ -1250,6 +1317,9 @@ template <
     // in the pipeline specialization key, so one variant is compiled per
     // process and no JIT compile can land inside a timed forward.
     const constant int& run_skip_pct,
+    // Threadgroup staging is declared by the [[kernel]] wrappers (address-
+    // space objects may only live at kernel scope) and passed through.
+    threadgroup Wtype* Ws,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]]) {
@@ -1267,17 +1337,6 @@ template <
       WM * WN * SIMD_SIZE,
       group_size,
       bits>;
-
-  // 16B-aligned backing store for Ws: identical element count, identical
-  // contents, identical relative addresses. DARKBLOOM_STAGE_WIDEST needs Ws
-  // itself 16B-aligned so that every thread's dst = Ws + bi*BK_padded +
-  // bj*pack_factor is too (BK_padded*sizeof == 144 and bj*pack_factor*sizeof
-  // in {0, 64} are all multiples of 16).
-  constexpr int kWsElems = transpose ? BN * BK_padded : BK * BN_padded;
-  constexpr int kWsPerChunk = 16 / sizeof(Wtype);
-  threadgroup NAXWsChunk16<Wtype>
-      Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
-  threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
 
   // Compute the block
   const int K_w = K * bytes_per_pack / pack_factor;
@@ -1301,9 +1360,13 @@ template <
   const short2 tile_w =
       transpose ? short2(k_remain, tgp_bn) : short2(tgp_bn, k_remain);
 
-  // Move x and output to the correct block
+  // Move x and output to the correct block. With lhs_gather, x stays at the
+  // ungathered base: block rows are resolved through lhs_indices at load
+  // time instead of by advancing the row base.
   auto wl = (const device uint8_t*)w;
-  x += y_row_long * K;
+  if constexpr (!lhs_gather) {
+    x += y_row_long * K;
+  }
   y += y_row_long * N + y_col_long;
   wl += transpose ? y_col_long * K_w : y_col * bytes_per_pack / pack_factor;
   scales += transpose ? y_col_long * K_g : y_col / group_size;
@@ -1396,6 +1459,12 @@ template <
     Dtile.clear();
 
     const device T* xn = x + tm * K;
+    // lhs-gather cursors: tile row r of this simdgroup's band reads
+    // activation row lhs_rows[r]; xcol is the k-tile column cursor and
+    // advances by BK in lockstep with xn.
+    const device uint32_t* lhs_rows =
+        lhs_gather ? lhs_indices + y_row + tm : nullptr;
+    const device T* xcol = x;
 
     // Prepare threadgroup loading operations
     thread loader_w_t loader_w(
@@ -1444,7 +1513,10 @@ template <
 
               volatile int compiler_barrier;
 
-              if constexpr (kAlignedM.value) {
+              if constexpr (lhs_gather) {
+                nax_tile_load_lhs_rows(
+                    Atile, xcol + kk1, lhs_rows, K, sgp_sm, SK);
+              } else if constexpr (kAlignedM.value) {
                 Atile.load(xn + kk1, K);
               } else {
                 Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
@@ -1477,6 +1549,7 @@ template <
           }
 
           xn += BK;
+          xcol += BK;
           loader_w.next();
         }
 
@@ -1495,7 +1568,12 @@ template <
               volatile int compiler_barrier;
 
               const short psk = min(int(SK), max(0, (BK - kk1)));
-              Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
+              if constexpr (lhs_gather) {
+                nax_tile_load_lhs_rows(
+                    Atile, xcol + kk1, lhs_rows, K, sgp_sm, psk);
+              } else {
+                Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
+              }
 
               if constexpr (transpose) {
                 Btile.template load<Wtype, BK_padded, 1>(
@@ -1556,6 +1634,134 @@ template <
   }
 }
 
+// DARKBLOOM_PREFILL_LHS_GATHER wrappers: the stock kernel keeps its exact
+// signature (and, inlined with lhs_gather == false, its exact compiled
+// code); the lhs variant takes the extra lhs_indices buffer and resolves
+// activation rows through it.
+template <
+    typename T,
+    int group_size,
+    const int bits,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool transpose,
+    typename Wtype = bfloat>
+[[kernel]] void fp_gather_qmm_rhs_nax(
+    const device T* x,
+    const device uint32_t* w,
+    const device uint8_t* scales,
+    const device uint32_t* indices,
+    device T* y,
+    const constant int& M,
+    const constant int& N,
+    const constant int& K,
+    const constant int& run_skip_pct,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = (BK + 16 / sizeof(Wtype));
+  constexpr int BN_padded = (BN + 16 / sizeof(Wtype));
+  // 16B-aligned backing store for Ws: identical element count, identical
+  // contents, identical relative addresses. DARKBLOOM_STAGE_WIDEST needs Ws
+  // itself 16B-aligned so that every thread's dst = Ws + bi*BK_padded +
+  // bj*pack_factor is too (BK_padded*sizeof == 144 and bj*pack_factor*sizeof
+  // in {0, 64} are all multiples of 16).
+  constexpr int kWsElems = transpose ? BN * BK_padded : BK * BN_padded;
+  constexpr int kWsPerChunk = 16 / sizeof(Wtype);
+  threadgroup NAXWsChunk16<Wtype>
+      Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
+  threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
+  fp_gather_qmm_rhs_nax_impl<
+      T,
+      group_size,
+      bits,
+      BM,
+      BN,
+      BK,
+      WM,
+      WN,
+      transpose,
+      false,
+      Wtype>(
+      x,
+      w,
+      scales,
+      indices,
+      nullptr,
+      y,
+      M,
+      N,
+      K,
+      run_skip_pct,
+      Ws,
+      tid,
+      simd_group_id,
+      simd_lane_id);
+}
+
+template <
+    typename T,
+    int group_size,
+    const int bits,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool transpose,
+    typename Wtype = bfloat>
+[[kernel]] void fp_gather_qmm_rhs_lhs_nax(
+    const device T* x,
+    const device uint32_t* w,
+    const device uint8_t* scales,
+    const device uint32_t* indices,
+    const device uint32_t* lhs_indices,
+    device T* y,
+    const constant int& M,
+    const constant int& N,
+    const constant int& K,
+    const constant int& run_skip_pct,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = (BK + 16 / sizeof(Wtype));
+  constexpr int BN_padded = (BN + 16 / sizeof(Wtype));
+  constexpr int kWsElems = transpose ? BN * BK_padded : BK * BN_padded;
+  constexpr int kWsPerChunk = 16 / sizeof(Wtype);
+  threadgroup NAXWsChunk16<Wtype>
+      Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
+  threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
+  fp_gather_qmm_rhs_nax_impl<
+      T,
+      group_size,
+      bits,
+      BM,
+      BN,
+      BK,
+      WM,
+      WN,
+      transpose,
+      true,
+      Wtype>(
+      x,
+      w,
+      scales,
+      indices,
+      lhs_indices,
+      y,
+      M,
+      N,
+      K,
+      run_skip_pct,
+      Ws,
+      tid,
+      simd_group_id,
+      simd_lane_id);
+}
+
 METAL_FUNC int laguna_sorted_lower_bound(
     const device uint32_t* indices,
     const int count,
@@ -1596,17 +1802,31 @@ template <
     const int fixed_K = 0,
     const int fixed_N = 0,
     typename Wtype = bfloat,
-    int tg_expert_groups = 64>
-[[kernel]] void fp_gather_qmm_rhs_expert_nax(
+    int tg_expert_groups = 64,
+    bool lhs_gather = false>
+METAL_FUNC void fp_gather_qmm_rhs_expert_nax_impl(
     const device T* x,
     const device uint32_t* w,
     const device uint8_t* scales,
     const device uint32_t* indices,
+    // DARKBLOOM_PREFILL_LHS_GATHER: per-output-row activation source rows,
+    // used in place of a materialized activation gather when lhs_gather is
+    // true; nullptr and never dereferenced otherwise.
+    const device uint32_t* lhs_indices,
     device T* y,
     const constant int& M,
     const constant int& N,
     const constant int& K,
     const constant int& run_skip_pct,
+    // Threadgroup staging is declared by the [[kernel]] wrappers (address-
+    // space objects may only live at kernel scope) and passed through:
+    // Ws (and Ws2 under DARKBLOOM_STAGE2_GATHER) is the weight staging
+    // buffer, bounds the per-expert run interval scratch.
+    threadgroup Wtype* Ws,
+#ifdef DARKBLOOM_STAGE2_GATHER
+    threadgroup Wtype* Ws2,
+#endif
+    threadgroup int* bounds,
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -1639,24 +1859,7 @@ template <
       group_size,
       bits>;
 
-  constexpr int kWsElems = BN * BK_padded;
-  constexpr int kWsPerChunk = 16 / sizeof(Wtype);
-  threadgroup NAXWsChunk16<Wtype>
-      Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
-  threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
-#ifdef DARKBLOOM_STAGE2_GATHER
-  // Stage-2 double buffering: a second staging region with identical
-  // geometry, ping-ponged with Ws across k-iterations so tile k+1 stages
-  // while the MMAs consume tile k. Doubles staging threadgroup memory
-  // (2 x BN x BK_padded x sizeof(Wtype) = 18,432 B at BN=BK=64/bfloat) --
-  // an occupancy trade, deliberately NOT a tile-geometry change.
-  threadgroup NAXWsChunk16<Wtype>
-      Ws2_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
-  threadgroup Wtype* Ws2 = (threadgroup Wtype*)Ws2_storage;
-#endif
-  threadgroup bfloat* gate_up_stage =
-      (threadgroup bfloat*)Ws_storage;
-  threadgroup int bounds[2];
+  threadgroup bfloat* gate_up_stage = (threadgroup bfloat*)Ws;
 
   const int K_w = kernel_K * bytes_per_pack / pack_factor;
   const int K_g = kernel_K / group_size;
@@ -1747,6 +1950,12 @@ template <
 
       const device T* xn =
           x + size_t(chunk_start + tm) * kernel_K;
+      // lhs-gather cursors: tile row r of this chunk band reads activation
+      // row lhs_rows[r]; xcol is the k-tile column cursor and advances by BK
+      // in lockstep with xn.
+      const device uint32_t* lhs_rows =
+          lhs_gather ? lhs_indices + chunk_start + tm : nullptr;
+      const device T* xcol = x;
 
       // Per-k-tile advances of the loader's walk, spelled with the same
       // expressions QuantizedBlockLoader uses (reduction_dim == 1 here):
@@ -1759,7 +1968,15 @@ template <
         if (sg_active) {
           STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            if (sgp_sm == SM) {
+            if constexpr (lhs_gather) {
+              nax_tile_load_lhs_rows(
+                  Atile[kk1 / SK],
+                  xcol + kk1,
+                  lhs_rows,
+                  kernel_K,
+                  sgp_sm,
+                  SK);
+            } else if (sgp_sm == SM) {
               Atile[kk1 / SK].load(xn + kk1, kernel_K);
             } else {
               Atile[kk1 / SK].load_safe(
@@ -1810,6 +2027,7 @@ template <
         }
 
         xn += BK;
+        xcol += BK;
       }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1873,6 +2091,12 @@ template <
 
       const device T* xn =
           x + size_t(chunk_start + tm) * kernel_K;
+      // lhs-gather cursors: tile row r of this chunk band reads activation
+      // row lhs_rows[r]; xcol is the k-tile column cursor and advances by BK
+      // in lockstep with xn.
+      const device uint32_t* lhs_rows =
+          lhs_gather ? lhs_indices + chunk_start + tm : nullptr;
+      const device T* xcol = x;
 #ifndef DARKBLOOM_STAGE2_GATHER
       thread loader_w_t loader_w(
           wl + size_t(expert) * stride_w,
@@ -1901,7 +2125,10 @@ template <
             NAXTile<T, TM, TK> Atile;
             NAXTile<Wtype, TN, TK> Btile;
 
-            if (sgp_sm == SM) {
+            if constexpr (lhs_gather) {
+              nax_tile_load_lhs_rows(
+                  Atile, xcol + kk1, lhs_rows, kernel_K, sgp_sm, SK);
+            } else if (sgp_sm == SM) {
               Atile.load(xn + kk1, kernel_K);
             } else {
               Atile.load_safe(
@@ -1921,6 +2148,7 @@ template <
         }
 
         xn += BK;
+        xcol += BK;
         loader_w.next();
       }
 #else
@@ -1992,7 +2220,10 @@ template <
             NAXTile<T, TM, TK> Atile;
             NAXTile<Wtype, TN, TK> Btile;
 
-            if (sgp_sm == SM) {
+            if constexpr (lhs_gather) {
+              nax_tile_load_lhs_rows(
+                  Atile, xcol + kk1, lhs_rows, kernel_K, sgp_sm, SK);
+            } else if (sgp_sm == SM) {
               Atile.load(xn + kk1, kernel_K);
             } else {
               Atile.load_safe(
@@ -2024,6 +2255,7 @@ template <
         }
 
         xn += BK;
+        xcol += BK;
         // Joint barrier: publishes tile k+1 for the next iteration's MMAs
         // (RAW) and retires this iteration's reads of tile k before that
         // buffer is overwritten (WAR).
@@ -2079,4 +2311,167 @@ template <
 #endif // DARKBLOOM_GATHER_XMAJOR
     }
   }
+}
+
+// DARKBLOOM_PREFILL_LHS_GATHER wrappers: the stock kernel keeps its exact
+// signature (and, inlined with lhs_gather == false, its exact compiled
+// code); the lhs variant takes the extra lhs_indices buffer and resolves
+// activation rows through it. The wrappers keep the stock template parameter
+// list so existing template definitions instantiate unchanged.
+template <
+    typename T,
+    int group_size,
+    const int bits,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool transpose,
+    const int fixed_K = 0,
+    const int fixed_N = 0,
+    typename Wtype = bfloat,
+    int tg_expert_groups = 64>
+[[kernel]] void fp_gather_qmm_rhs_expert_nax(
+    const device T* x,
+    const device uint32_t* w,
+    const device uint8_t* scales,
+    const device uint32_t* indices,
+    device T* y,
+    const constant int& M,
+    const constant int& N,
+    const constant int& K,
+    const constant int& run_skip_pct,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = BK + 16 / sizeof(Wtype);
+  constexpr int kWsElems = BN * BK_padded;
+  constexpr int kWsPerChunk = 16 / sizeof(Wtype);
+  threadgroup NAXWsChunk16<Wtype>
+      Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
+  threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
+#ifdef DARKBLOOM_STAGE2_GATHER
+  // Stage-2 double buffering: a second staging region with identical
+  // geometry, ping-ponged with Ws across k-iterations so tile k+1 stages
+  // while the MMAs consume tile k. Doubles staging threadgroup memory
+  // (2 x BN x BK_padded x sizeof(Wtype) = 18,432 B at BN=BK=64/bfloat) --
+  // an occupancy trade, deliberately NOT a tile-geometry change.
+  threadgroup NAXWsChunk16<Wtype>
+      Ws2_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
+  threadgroup Wtype* Ws2 = (threadgroup Wtype*)Ws2_storage;
+#endif
+  threadgroup int bounds[2];
+  fp_gather_qmm_rhs_expert_nax_impl<
+      T,
+      group_size,
+      bits,
+      BM,
+      BN,
+      BK,
+      WM,
+      WN,
+      transpose,
+      fixed_K,
+      fixed_N,
+      Wtype,
+      tg_expert_groups,
+      false>(
+      x,
+      w,
+      scales,
+      indices,
+      nullptr,
+      y,
+      M,
+      N,
+      K,
+      run_skip_pct,
+      Ws,
+#ifdef DARKBLOOM_STAGE2_GATHER
+      Ws2,
+#endif
+      bounds,
+      tid,
+      lid,
+      simd_group_id,
+      simd_lane_id);
+}
+
+template <
+    typename T,
+    int group_size,
+    const int bits,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool transpose,
+    const int fixed_K = 0,
+    const int fixed_N = 0,
+    typename Wtype = bfloat,
+    int tg_expert_groups = 64>
+[[kernel]] void fp_gather_qmm_rhs_expert_lhs_nax(
+    const device T* x,
+    const device uint32_t* w,
+    const device uint8_t* scales,
+    const device uint32_t* indices,
+    const device uint32_t* lhs_indices,
+    device T* y,
+    const constant int& M,
+    const constant int& N,
+    const constant int& K,
+    const constant int& run_skip_pct,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = BK + 16 / sizeof(Wtype);
+  constexpr int kWsElems = BN * BK_padded;
+  constexpr int kWsPerChunk = 16 / sizeof(Wtype);
+  threadgroup NAXWsChunk16<Wtype>
+      Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
+  threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
+#ifdef DARKBLOOM_STAGE2_GATHER
+  threadgroup NAXWsChunk16<Wtype>
+      Ws2_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
+  threadgroup Wtype* Ws2 = (threadgroup Wtype*)Ws2_storage;
+#endif
+  threadgroup int bounds[2];
+  fp_gather_qmm_rhs_expert_nax_impl<
+      T,
+      group_size,
+      bits,
+      BM,
+      BN,
+      BK,
+      WM,
+      WN,
+      transpose,
+      fixed_K,
+      fixed_N,
+      Wtype,
+      tg_expert_groups,
+      true>(
+      x,
+      w,
+      scales,
+      indices,
+      lhs_indices,
+      y,
+      M,
+      N,
+      K,
+      run_skip_pct,
+      Ws,
+#ifdef DARKBLOOM_STAGE2_GATHER
+      Ws2,
+#endif
+      bounds,
+      tid,
+      lid,
+      simd_group_id,
+      simd_lane_id);
 }

@@ -136,6 +136,37 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
     )
 }
 
+/// `gatherSort` without the activation gather: returns the same sorted
+/// expert table (`indices[order]`) and inverse permutation, plus the
+/// per-sorted-row source row indices (`order / m`) for the gather-QMM's
+/// lhs indirection, which reads the activation rows through the
+/// permutation inside the kernel instead of materializing the gathered
+/// copy. The `x` argument is accepted (and unused) only to keep the call
+/// sites structurally identical to `gatherSort`.
+public func gatherSortIndices(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+    let m = indices.dim(-1)
+    let indices = indices.flattened()
+    let order = argSort(indices)
+    let inverseOrder: MLXArray
+    if inversePermutationScatterEnabled && order.size > 0 {
+        inverseOrder = inversePermutationScatterKernel(
+            [order],
+            grid: (order.size, 1, 1),
+            threadGroup: (min(order.size, 256), 1, 1),
+            outputShapes: [[order.size]],
+            outputDTypes: [.uint32]
+        )[0]
+    } else {
+        inverseOrder = argSort(order)
+    }
+
+    return (
+        order.floorDivide(m),
+        indices[order],
+        inverseOrder
+    )
+}
+
 public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) -> MLXArray {
     var x = x[invOrder]
     if let shape {
