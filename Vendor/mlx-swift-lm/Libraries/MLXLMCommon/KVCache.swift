@@ -324,6 +324,11 @@ public func createSSMMask(h: MLXArray, cache: MambaCache?) -> MLXArray? {
 
 /// Standard KV cache implementation based on Python's KVCache
 /// See https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/base.py#L11
+/// `DARKBLOOM_KV_PREFILL_HEADROOM` (default ON; set `"0"` to restore exact-fit
+/// retain on step-boundary prefills). See `KVCacheSimple.update`.
+private let darkbloomKVPrefillHeadroomEnabled: Bool =
+    ProcessInfo.processInfo.environment["DARKBLOOM_KV_PREFILL_HEADROOM"] != "0"
+
 public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var keys: MLXArray?
     internal var values: MLXArray?
@@ -348,13 +353,51 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         // directly in this no-slack case. Shapes, offsets, returned values,
         // and the next growth boundary are identical; only the redundant
         // zero-fill and full-prompt slice updates disappear.
+        //
+        // DARKBLOOM_KV_PREFILL_HEADROOM (default ON; set "0" to restore the
+        // exact-fit retain above): instead allocate capacity =
+        // tokenCount + step and copy the prompt once. Returned views remain
+        // keys[..., :tokenCount, :] with identical element values (BF16 /
+        // FP store is a bit copy). The unused tail is zeros and is never
+        // attended — makeMask / fusedAppend / SDPA all bound by `offset`.
+        //
+        // Why this moves fewer bytes on the scored path: a 512-token prefill
+        // with step 256 lands on the exact boundary, so the first decode
+        // token previously forced a full-buffer growth concat (copy every
+        // prefill KV row into a 768-slot backing for each full-attention
+        // layer) and kept the fused append path offline until step 2.
+        // Prefill pays one prompt-sized copy into a spare-tailed buffer;
+        // decode never rewrites the prefill rows, and fused append engages
+        // from step 1. Correctness is an exact bound: the live prefix is a
+        // pure store of the same dtype values, capacity is only a zero pad,
+        // and every consumer of this cache still slices to `offset`.
         if self.keys == nil, previous == 0, tokenCount > 0,
             tokenCount.isMultiple(of: step)
         {
-            self.keys = keys
-            self.values = values
+            if !darkbloomKVPrefillHeadroomEnabled {
+                self.keys = keys
+                self.values = values
+                self.offset = tokenCount
+                return (keys, values)
+            }
+            let B = keys.dim(0)
+            let kvHeads = keys.dim(1)
+            let kHeadDim = keys.dim(3)
+            let vHeadDim = values.dim(3)
+            let capacity = tokenCount + step
+            let newK = MLXArray.zeros(
+                [B, kvHeads, capacity, kHeadDim], dtype: keys.dtype)
+            let newV = MLXArray.zeros(
+                [B, kvHeads, capacity, vHeadDim], dtype: values.dtype)
+            newK[.ellipsis, ..<tokenCount, 0...] = keys
+            newV[.ellipsis, ..<tokenCount, 0...] = values
+            self.keys = newK
+            self.values = newV
             self.offset = tokenCount
-            return (keys, values)
+            return (
+                newK[.ellipsis, ..<tokenCount, 0...],
+                newV[.ellipsis, ..<tokenCount, 0...]
+            )
         }
 
         let reset =
