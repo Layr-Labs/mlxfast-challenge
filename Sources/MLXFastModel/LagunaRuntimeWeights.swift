@@ -372,16 +372,25 @@ public final class LagunaRuntimeWeightCache {
                 // allocations are permanently resident, MLX's stock 50 MiB
                 // referenced-byte commit threshold splits every sparse layer
                 // across several command buffers even though the layer's
-                // weights no longer create residency pressure. A 512 MiB
-                // budget fits one complete decode layer (attention plus the
-                // routed/shared gate-up and down banks are ~507 MiB for the
-                // 200 MB / 200-op command buffers: the post-anupsv-loader regime
-                // re-test winner (6 Latin pairs: decode 5/6, prefill 4/6). Explicit
-                // MLX_ values win; DARKBLOOM kill switch supports same-binary A/B.
+                // weights no longer create residency pressure.
+                //
+                // Commit cadence is now driven by the OP criterion alone:
+                // MLX's size counter tallies data_size() of every DISTINCT
+                // bound buffer, and a MoE gather binds the whole 256-expert
+                // bank, so with the old 200 "MB" ceiling the size criterion
+                // fired every ~1.25 sparse layers and forced ~30 fence-
+                // separated command buffers per decode step at positions
+                // dictated by weight sizes. Raising the size ceiling out of
+                // range and committing every 64 ops instead cuts the cadence
+                // roughly in half (mirrored 400-step A/B: -0.5 to -0.8%
+                // decode wall vs the 200/200 regime, direction consistent
+                // across every pair). Pure command grouping: no arithmetic,
+                // no dispatch order change. Explicit MLX_ values win;
+                // DARKBLOOM kill switch supports same-binary A/B.
                 let env = ProcessInfo.processInfo.environment
                 if env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" {
-                    setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
-                    setenv("MLX_MAX_OPS_PER_BUFFER", "200", 0)
+                    setenv("MLX_MAX_MB_PER_BUFFER", "100000", 0)
+                    setenv("MLX_MAX_OPS_PER_BUFFER", "64", 0)
                 }
                 startupMemoryPolicy = nil
             }
