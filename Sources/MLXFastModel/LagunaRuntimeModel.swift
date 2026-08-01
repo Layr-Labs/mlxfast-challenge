@@ -7052,7 +7052,7 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
 /// division -- MLX builds every runtime library, this kernel included, with
 /// fast math disabled, so `scores[lane] / total` is the same division the
 /// binary kernel would perform.
-private func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
+func lagunaDecodeRouterTop8KernelSource(normalizing: Bool) -> String {
     let epilogue =
         normalizing
         ? """
@@ -7193,9 +7193,337 @@ private let lagunaDecodeRouterTop8NormalizingKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-private func lagunaDecodeRouterTop8(
-    logits: MLXArray, correctionBias: MLXArray, normalizing: Bool = false
+/// Decode selection specialization: sort the 32 experts owned by each
+/// SIMD group, retain that group's first eight, then merge the eight sorted
+/// lists in a balanced tree which truncates every intermediate list back to
+/// eight entries.
+///
+/// This is deliberately different from both earlier failed experiments:
+///
+///  * `dcccc1` retained 64 candidates and bitonic-sorted the 64-entry union
+///    four times (one wrapped copy per 64-lane block). It removed barriers,
+///    but executed the same 36 comparator stages over all 256 lanes as the
+///    live full sort.
+///  * `726dad` used the local sorted order, but materialized complete 16-,
+///    32-, and 64-entry intermediate lists. Entries ranked 8...63 can never
+///    affect the requested top eight, so carrying them through later levels
+///    bought no observable result.
+///
+/// Here each of the seven internal tree nodes is exactly a merge of two
+/// sorted length-eight lists followed by truncation to eight. Four first-level
+/// merges and the two second-level merges stay inside SIMD groups 0 and 1;
+/// only the initial local-list publication and the final two-list publication
+/// cross SIMD groups. Thus the kernel has two threadgroup barriers, versus 12
+/// in the live 256-entry network. It performs 1,920 local-sort plus 224 unique
+/// merge compare-exchanges (2,144 total), versus 4,608 for the live network;
+/// its comparator dependency depth is 27 stages versus 36 live, 36 in
+/// `dcccc1`, and 30 in `726dad`.
+///
+/// Exactness contract:
+///
+///  * The sigmoid, corrected choice key, and BF16-to-FP32 boundary are copied
+///    verbatim from the live kernel.
+///  * Every compare uses the live strict `(choice key, original index)` total
+///    order, including its NaN placement, exact ties, and signed zero.
+///  * The uncorrected sigmoid score is payload and moves with its key/index;
+///    it is never recomputed or reassociated.
+///  * The epilogue is the live rank-order left fold and FP32 division copied
+///    verbatim. Truncation is exact because a member of the global top eight
+///    cannot rank below eight in any subset containing it.
+func lagunaDecodeRouterEightWayMergeKernelSource(normalizing: Bool) -> String {
+    let epilogue =
+        normalizing
+        ? """
+        float total = 0.0f;
+        for (uint i = 0; i < 8; ++i) {
+            total = simd_shuffle(my_score, ushort(i)) + total;
+        }
+        if (lane < 8) {
+            router_indices[lane] = my_index;
+            router_scores[lane] = my_score / total;
+        }
+        """
+        : """
+        if (lane < 8) {
+            router_indices[lane] = my_index;
+            router_scores[lane] = my_score;
+        }
+        """
+
+    return """
+        uint lane = thread_position_in_threadgroup.x;
+        uint simd_lane = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        threadgroup float candidate_keys[64];
+        threadgroup uint candidate_indices[64];
+        threadgroup float candidate_scores[64];
+
+        float x = float(logits[lane]);
+        float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+        float my_score = x < 0.0f ? y : 1.0f - y;
+        float my_key = -(my_score + float(correction_bias[lane]));
+        uint my_index = lane;
+
+        // Sort each independent 32-expert SIMD group ascending. This is the
+        // live network's sequence=2...32 register-only prefix, with the
+        // direction bit intentionally relative to the local SIMD lane so all
+        // eight published lists have rank zero at their first entry.
+        for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
+            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+                float other_key = simd_shuffle_xor(my_key, ushort(stride));
+                uint other_index = simd_shuffle_xor(my_index, ushort(stride));
+                float other_score = simd_shuffle_xor(my_score, ushort(stride));
+
+                bool is_lower = (simd_lane & stride) == 0;
+                float a_key = is_lower ? my_key : other_key;
+                uint a_index = is_lower ? my_index : other_index;
+                float a_score = is_lower ? my_score : other_score;
+                float b_key = is_lower ? other_key : my_key;
+                uint b_index = is_lower ? other_index : my_index;
+                float b_score = is_lower ? other_score : my_score;
+
+                bool lower_wants_better = (simd_lane & sequence) == 0;
+                bool b_before_a = laguna_router_key_before(
+                    b_key, b_index, a_key, a_index);
+                bool a_before_b = laguna_router_key_before(
+                    a_key, a_index, b_key, b_index);
+                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                if (swap) {
+                    my_key = is_lower ? b_key : a_key;
+                    my_index = is_lower ? b_index : a_index;
+                    my_score = is_lower ? b_score : a_score;
+                }
+            }
+        }
+
+        if (simd_lane < 8) {
+            uint candidate = simd_group * 8 + simd_lane;
+            candidate_keys[candidate] = my_key;
+            candidate_indices[candidate] = my_index;
+            candidate_scores[candidate] = my_score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // SIMD groups 0 and 1 each consume four local lists. Their low/high
+        // 16-lane halves first merge adjacent list pairs. Reversing the right
+        // input makes a bitonic 16-entry sequence; the four compare stages
+        // sort it, and lanes 0...7 retain precisely the merged top eight.
+        if (simd_group < 2) {
+            uint pair_half = simd_lane >> 4;
+            uint pair_lane = simd_lane & 15;
+            uint left_list = simd_group * 4 + pair_half * 2;
+            uint source_list = left_list + (pair_lane >= 8 ? 1 : 0);
+            uint source_rank = pair_lane < 8 ? pair_lane : 15 - pair_lane;
+            uint source = source_list * 8 + source_rank;
+            my_key = candidate_keys[source];
+            my_index = candidate_indices[source];
+            my_score = candidate_scores[source];
+
+            for (uint stride = 8; stride > 0; stride >>= 1) {
+                float other_key = simd_shuffle_xor(my_key, ushort(stride));
+                uint other_index = simd_shuffle_xor(my_index, ushort(stride));
+                float other_score = simd_shuffle_xor(my_score, ushort(stride));
+                bool is_lower = (pair_lane & stride) == 0;
+                float a_key = is_lower ? my_key : other_key;
+                uint a_index = is_lower ? my_index : other_index;
+                float a_score = is_lower ? my_score : other_score;
+                float b_key = is_lower ? other_key : my_key;
+                uint b_index = is_lower ? other_index : my_index;
+                float b_score = is_lower ? other_score : my_score;
+                bool swap = laguna_router_key_before(
+                    b_key, b_index, a_key, a_index);
+                if (swap) {
+                    my_key = is_lower ? b_key : a_key;
+                    my_index = is_lower ? b_index : a_index;
+                    my_score = is_lower ? b_score : a_score;
+                }
+            }
+
+            // Merge the two retained lists in this SIMD group. Both 16-lane
+            // halves execute the same merge so no shuffle is issued under a
+            // partially-active SIMD mask; only lanes 0...7 publish the result.
+            pair_lane = simd_lane & 15;
+            uint quad_source = pair_lane < 8 ? pair_lane : 31 - pair_lane;
+            my_key = simd_shuffle(my_key, ushort(quad_source));
+            my_index = simd_shuffle(my_index, ushort(quad_source));
+            my_score = simd_shuffle(my_score, ushort(quad_source));
+
+            for (uint stride = 8; stride > 0; stride >>= 1) {
+                float other_key = simd_shuffle_xor(my_key, ushort(stride));
+                uint other_index = simd_shuffle_xor(my_index, ushort(stride));
+                float other_score = simd_shuffle_xor(my_score, ushort(stride));
+                bool is_lower = (pair_lane & stride) == 0;
+                float a_key = is_lower ? my_key : other_key;
+                uint a_index = is_lower ? my_index : other_index;
+                float a_score = is_lower ? my_score : other_score;
+                float b_key = is_lower ? other_key : my_key;
+                uint b_index = is_lower ? other_index : my_index;
+                float b_score = is_lower ? other_score : my_score;
+                bool swap = laguna_router_key_before(
+                    b_key, b_index, a_key, a_index);
+                if (swap) {
+                    my_key = is_lower ? b_key : a_key;
+                    my_index = is_lower ? b_index : a_index;
+                    my_score = is_lower ? b_score : a_score;
+                }
+            }
+
+            if (simd_lane < 8) {
+                uint candidate = simd_group * 8 + simd_lane;
+                candidate_keys[candidate] = my_key;
+                candidate_indices[candidate] = my_index;
+                candidate_scores[candidate] = my_score;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // SIMD group 0 performs the final sorted-8 + sorted-8 -> sorted-8
+        // merge. As above, its high half is a harmless duplicate. The winners
+        // finish in lanes 0...7, exactly where the unchanged live epilogue
+        // expects the rank-ordered payload.
+        if (simd_group == 0) {
+            uint pair_lane = simd_lane & 15;
+            uint source = pair_lane < 8 ? pair_lane : 23 - pair_lane;
+            my_key = candidate_keys[source];
+            my_index = candidate_indices[source];
+            my_score = candidate_scores[source];
+
+            for (uint stride = 8; stride > 0; stride >>= 1) {
+                float other_key = simd_shuffle_xor(my_key, ushort(stride));
+                uint other_index = simd_shuffle_xor(my_index, ushort(stride));
+                float other_score = simd_shuffle_xor(my_score, ushort(stride));
+                bool is_lower = (pair_lane & stride) == 0;
+                float a_key = is_lower ? my_key : other_key;
+                uint a_index = is_lower ? my_index : other_index;
+                float a_score = is_lower ? my_score : other_score;
+                float b_key = is_lower ? other_key : my_key;
+                uint b_index = is_lower ? other_index : my_index;
+                float b_score = is_lower ? other_score : my_score;
+                bool swap = laguna_router_key_before(
+                    b_key, b_index, a_key, a_index);
+                if (swap) {
+                    my_key = is_lower ? b_key : a_key;
+                    my_index = is_lower ? b_index : a_index;
+                    my_score = is_lower ? b_score : a_score;
+                }
+            }
+        }
+
+        // Byte-for-byte live rank-order fold/divide and score payload writes.
+        \(epilogue)
+        """
+}
+
+private let lagunaDecodeRouterEightWayMergeKernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_top8_8way_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterEightWayMergeKernelSource(normalizing: false),
+    header: lagunaDecodeRouterTop8Header,
+    ensureRowContiguous: true
+)
+
+private let lagunaDecodeRouterEightWayMergeNormalizingKernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_top8_norm_8way_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterEightWayMergeKernelSource(normalizing: true),
+    header: lagunaDecodeRouterTop8Header,
+    ensureRowContiguous: true
+)
+
+/// Explicit same-binary selector for parity tests. Production selects the
+/// kernel from the immutable decoder-layer identity; tests can still drive
+/// either implementation without rebuilding or mutating process environment.
+func lagunaDecodeRouterTop8Selection(
+    logits: MLXArray,
+    correctionBias: MLXArray,
+    normalizing: Bool,
+    eightWayMerge: Bool
 ) -> (MLXArray, MLXArray) {
+    precondition(logits.dtype == .bfloat16 || logits.dtype == .float32)
+    precondition(correctionBias.dtype == .float32)
+    precondition(logits.size == 256)
+    precondition(correctionBias.size == 256)
+
+    let kernel: MLXFast.MLXFastKernel
+    if eightWayMerge {
+        kernel =
+            normalizing
+            ? lagunaDecodeRouterEightWayMergeNormalizingKernel
+            : lagunaDecodeRouterEightWayMergeKernel
+    } else {
+        kernel =
+            normalizing ? lagunaDecodeRouterTop8NormalizingKernel : lagunaDecodeRouterTop8Kernel
+    }
+    let outputs = kernel(
+        [logits, correctionBias],
+        grid: (256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1, 1, 8], [1, 1, 8]],
+        outputDTypes: [.uint32, .float32]
+    )
+    return (outputs[0], outputs[1])
+}
+
+private let lagunaDecodeRouterEightWayDefaultLayers = 22
+private let lagunaDecodeRouterEightWayMaximumLayers = 39
+
+/// Parse the acceptance-band chunk size once. Only the documented 0...39
+/// values are accepted; a typo falls back to the ranked default instead of
+/// silently changing how much decode work is optimized.
+func lagunaDecodeRouterEightWayLayerLimit(_ rawValue: String?) -> Int {
+    guard let rawValue,
+        let value = Int(rawValue),
+        (0...lagunaDecodeRouterEightWayMaximumLayers).contains(value)
+    else {
+        return lagunaDecodeRouterEightWayDefaultLayers
+    }
+    return value
+}
+
+/// Pure layer mapping used by production and static tests. Laguna layer 0 is
+/// dense; its 39 sparse router instances are decoder layers 1...39. A limit
+/// of N therefore selects exactly sparse layers 1...N, independent of call
+/// order, warmup, compilation, or how many requests the process has served.
+func lagunaDecodeRouterEightWayLayerSelected(
+    layerIdx: Int,
+    layerLimit: Int,
+    fullOff: Bool
+) -> Bool {
+    !fullOff
+        && layerIdx >= 1
+        && layerIdx <= lagunaDecodeRouterEightWayMaximumLayers
+        && layerIdx <= layerLimit
+}
+
+private let lagunaDecodeRouterEightWayConfiguredLayerLimit =
+    lagunaDecodeRouterEightWayLayerLimit(
+        ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ROUTER_8WAY_LAYERS"])
+
+/// Emergency same-binary kill switch. The layer-count control also accepts
+/// zero, while this independent switch restores all 39 live full-sort routers
+/// even if a nonzero chunk was configured.
+private let lagunaDecodeRouterEightWayFullOff =
+    ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ROUTER_8WAY_MERGE"] == "0"
+
+private func lagunaDecodeRouterTop8(
+    logits: MLXArray,
+    correctionBias: MLXArray,
+    normalizing: Bool = false,
+    eightWayMerge: Bool
+) -> (MLXArray, MLXArray) {
+    if eightWayMerge {
+        return lagunaDecodeRouterTop8Selection(
+            logits: logits,
+            correctionBias: correctionBias,
+            normalizing: normalizing,
+            eightWayMerge: true
+        )
+    }
+
+    // Keep non-selected layers on the live full-sort dispatch byte-for-byte.
     precondition(logits.dtype == .bfloat16 || logits.dtype == .float32)
     precondition(correctionBias.dtype == .float32)
     precondition(logits.size == 256)
@@ -7636,14 +7964,20 @@ final class LagunaRuntimeMoEGate: Module {
     let topK: Int
     let normTopkProb: Bool
     let routerLogitSoftcapping: Float
+    let useDecodeRouterEightWayMerge: Bool
 
     @ParameterInfo(key: "weight") var weight: MLXArray
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
 
-    init(_ config: LagunaConfig) {
+    init(_ config: LagunaConfig, layerIdx: Int) {
         self.topK = config.numExpertsPerTok
         self.normTopkProb = config.normTopkProb
         self.routerLogitSoftcapping = Float(config.moeRouterLogitSoftcapping)
+        self.useDecodeRouterEightWayMerge = lagunaDecodeRouterEightWayLayerSelected(
+            layerIdx: layerIdx,
+            layerLimit: lagunaDecodeRouterEightWayConfiguredLayerLimit,
+            fullOff: lagunaDecodeRouterEightWayFullOff
+        )
         self._weight.wrappedValue = zeros([config.numExperts, config.hiddenSize])
         self._eScoreCorrectionBias.wrappedValue = zeros([config.numExperts])
     }
@@ -7709,7 +8043,8 @@ final class LagunaRuntimeMoEGate: Module {
             (inds, weights) = lagunaDecodeRouterTop8(
                 logits: projectedLogits,
                 correctionBias: eScoreCorrectionBias.asType(.float32),
-                normalizing: sinkNormalization
+                normalizing: sinkNormalization,
+                eightWayMerge: useDecodeRouterEightWayMerge
             )
             if sinkNormalization {
                 return (inds, weights)
@@ -7727,7 +8062,8 @@ final class LagunaRuntimeMoEGate: Module {
                 lagunaTrace("decode router top8 (fp32 logits)")
                 (inds, weights) = lagunaDecodeRouterTop8(
                     logits: logits,
-                    correctionBias: eScoreCorrectionBias.asType(.float32)
+                    correctionBias: eScoreCorrectionBias.asType(.float32),
+                    eightWayMerge: useDecodeRouterEightWayMerge
                 )
             } else {
                 let scores = sigmoid(logits)
@@ -8190,9 +8526,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         return [packed]
     }
 
-    init(_ config: LagunaConfig) {
+    init(_ config: LagunaConfig, layerIdx: Int) {
         self.routedScalingFactor = Float(config.moeRoutedScalingFactor)
-        self._gate.wrappedValue = LagunaRuntimeMoEGate(config)
+        self._gate.wrappedValue = LagunaRuntimeMoEGate(config, layerIdx: layerIdx)
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
@@ -8545,7 +8881,7 @@ final class LagunaRuntimeDecoderLayer: Module {
         self._selfAttn.wrappedValue = LagunaRuntimeAttention(config, layerIdx: layerIdx)
 
         if config.isSparse(layer: layerIdx) {
-            self.mlp = LagunaRuntimeSparseMoEBlock(config)
+            self.mlp = LagunaRuntimeSparseMoEBlock(config, layerIdx: layerIdx)
         } else {
             self.mlp = LagunaRuntimeMLP(
                 dimensions: config.hiddenSize, hiddenDimensions: config.intermediateSize)
