@@ -1807,7 +1807,7 @@ func lagunaSlidingFusedAttention(
 /// partial rotary, folded mscale roundings, passthrough tail) and the
 /// pair path's runtime-length loop + single-row tail at gqa_factor 6.
 let lagunaFusedFullAttentionEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_ATTN"] == "1"
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_ATTN"] != "0"
 
 private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
     name: "laguna_full_fused_attn_grow_v1",
