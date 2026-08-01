@@ -4,29 +4,8 @@ import MLXFast
 import MLXLMCommon
 import MLXNN
 
-// Correctness-first Laguna runtime (Poolside Laguna XS 2.1, 256-expert MoE).
-//
-// This module tree closely follows the vendored reference implementation at
-// `Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Laguna.swift` (`LagunaModel` /
-// `LagunaModelInner`), which is the behavior oracle for this port. It is a
-// reimplementation rather than a wrapper for two load-bearing reasons:
-//
-// 1. The Poolside checkpoint stores the MoE router as a raw BF16
-//    `mlp.gate.weight` matrix next to the F32
-//    `mlp.gate.e_score_correction_bias`, while only expert projections are
-//    NVFP4. The runtime mirrors those parameter paths exactly.
-// 2. The vendored `LagunaModelInner`/`LagunaDecoderLayer` types are
-//    fileprivate and `LagunaConfiguration`'s stored properties are internal
-//    to MLXLLM, so the runtime layers (cache geometry, future fast-engine
-//    and exact-verification waves) could not reach the internals through a
-//    plain wrapper.
-//
-// All math is expressed with standard MLX ops and the vendored shared
-// primitives (`attentionWithCacheUpdate`, `initializeRope`,
-// `applyRotaryPosition`, `SwitchGLU`, `weightedExpertSum`, `RMSNorm`,
-// `createAttentionMask`). No custom Metal kernels in this increment; the
-// fused fast-engine and exact-pair/exact-four style optimizations are a
-// later layer on top of this reference target.
+// Laguna XS 2.1 runtime port. The vendored Laguna model remains its behavior
+// oracle; this module mirrors the checkpoint's BF16 router and NVFP4 experts.
 
 func lagunaLastTokenRange(sequenceLength: Int) -> Range<Int>? {
     sequenceLength > 1 ? (sequenceLength - 1)..<sequenceLength : nil
@@ -1753,6 +1732,41 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Shares immutable cache parameter arrays across fused-attention layers in
+/// one serial decode forward. Set `DARKBLOOM_SHARED_FUSED_ATTN_PARAMS=0` for
+/// the original per-layer arrays.
+let lagunaSharedFusedAttentionParamsEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_FUSED_ATTN_PARAMS"] != "0"
+
+final class LagunaFusedAttentionParameterPool {
+    private var slidingWriteIdx: Int?
+    private var slidingParams: MLXArray?
+    private var fullWriteIdx: Int?
+    private var fullCapacity: Int?
+    private var fullParams: MLXArray?
+
+    func sliding(writeIdx: Int) -> MLXArray {
+        if slidingWriteIdx == writeIdx, let slidingParams { return slidingParams }
+        let params = MLXArray([UInt32(writeIdx)])
+        slidingWriteIdx = writeIdx
+        slidingParams = params
+        return params
+    }
+
+    func full(writeIdx: Int, capacity: Int) -> MLXArray {
+        if fullWriteIdx == writeIdx, fullCapacity == capacity, let fullParams {
+            return fullParams
+        }
+        let params = MLXArray([
+            UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
+        ])
+        fullWriteIdx = writeIdx
+        fullCapacity = capacity
+        fullParams = params
+        return params
+    }
+}
+
 /// Fused decode attention for a sliding layer in the steady ring regime.
 /// Returns `[1, heads, 1, headDim]` attended output; the caller advances the
 /// cache clock via `RotatingKVCache.fusedRingAdvance()`.
@@ -1766,7 +1780,8 @@ func lagunaSlidingFusedAttention(
     cacheKeys: MLXArray,
     cacheValues: MLXArray,
     writeIdx: Int,
-    scale: MLXArray
+    scale: MLXArray,
+    parameterPool: LagunaFusedAttentionParameterPool? = nil
 ) -> MLXArray {
     let heads = LagunaConstants.slidingAttentionHeads
     let kvHeads = LagunaConstants.numKeyValueHeads
@@ -1790,7 +1805,9 @@ func lagunaSlidingFusedAttention(
     precondition(scale.dtype == .float32 && scale.size == 1)
 
     lagunaTrace("sliding fused attention")
-    let params = MLXArray([UInt32(writeIdx)])
+    let params =
+        parameterPool?.sliding(writeIdx: writeIdx)
+        ?? MLXArray([UInt32(writeIdx)])
     return lagunaSlidingFusedAttentionKernel(
         [
             rawQueries, rawKeys, rawValues,
@@ -2252,7 +2269,8 @@ func lagunaFullFusedAttention(
     cacheKeys: MLXArray,
     cacheValues: MLXArray,
     writeIdx: Int,
-    scale: MLXArray
+    scale: MLXArray,
+    parameterPool: LagunaFusedAttentionParameterPool? = nil
 ) -> MLXArray {
     let heads = LagunaConstants.fullAttentionHeads
     let kvHeads = LagunaConstants.numKeyValueHeads
@@ -2276,9 +2294,11 @@ func lagunaFullFusedAttention(
     precondition(scale.dtype == .float32 && scale.size == 1)
 
     lagunaTrace("full fused attention")
-    let params = MLXArray([
-        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
-    ])
+    let params =
+        parameterPool?.full(writeIdx: writeIdx, capacity: capacity)
+        ?? MLXArray([
+            UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
+        ])
     return lagunaFullFusedAttentionKernel(
         [
             rawQueries, rawKeys, rawValues,
@@ -5457,7 +5477,8 @@ final class LagunaRuntimeAttention: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
         qkRoPEAngles: MLXArray? = nil,
-        qkRoPEOffsets: MLXArray? = nil
+        qkRoPEOffsets: MLXArray? = nil,
+        fusedAttentionParameterPool: LagunaFusedAttentionParameterPool? = nil
     ) -> MLXArray {
         let (B, L) = (input.dim(0), input.dim(1))
 
@@ -5738,7 +5759,8 @@ final class LagunaRuntimeAttention: Module {
                 cacheKeys: ring.keys,
                 cacheValues: ring.values,
                 writeIdx: ring.writeIdx,
-                scale: _fusedAttnScale
+                scale: _fusedAttnScale,
+                parameterPool: fusedAttentionParameterPool
             )
             rotating.fusedRingAdvance()
             qkNormRoPEFused = true
@@ -5764,7 +5786,8 @@ final class LagunaRuntimeAttention: Module {
                 cacheKeys: append.keys,
                 cacheValues: append.values,
                 writeIdx: append.writeIdx,
-                scale: _fusedAttnScale
+                scale: _fusedAttnScale,
+                parameterPool: fusedAttentionParameterPool
             )
             simple.fusedAppendAdvance()
             qkNormRoPEFused = true
@@ -10512,7 +10535,8 @@ final class LagunaRuntimeDecoderLayer: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
         qkRoPEAngles: MLXArray? = nil,
-        qkRoPEOffsets: MLXArray? = nil
+        qkRoPEOffsets: MLXArray? = nil,
+        fusedAttentionParameterPool: LagunaFusedAttentionParameterPool? = nil
     ) -> MLXArray {
         let r = selfAttn(
             x,
@@ -10520,7 +10544,8 @@ final class LagunaRuntimeDecoderLayer: Module {
             mask: mask,
             cache: cache,
             qkRoPEAngles: qkRoPEAngles,
-            qkRoPEOffsets: qkRoPEOffsets
+            qkRoPEOffsets: qkRoPEOffsets,
+            fusedAttentionParameterPool: fusedAttentionParameterPool
         )
         let h: MLXArray
         let normalized: MLXArray
@@ -10961,6 +10986,10 @@ final class LagunaRuntimeModelInner: Module {
             h: h, cache: cache?[slidingAttentionIdx], windowSize: slidingWindow)
 
         let isSingleTokenDecode = inputs.shape == [1, 1]
+        let fusedAttentionParameterPool: LagunaFusedAttentionParameterPool? =
+            isSingleTokenDecode && lagunaSharedFusedAttentionParamsEnabled
+            ? LagunaFusedAttentionParameterPool()
+            : nil
         let decodeFireMask: UInt64 =
             switch lagunaDecodeAsyncStage {
             case .off, .norm, .logits:
@@ -10994,7 +11023,8 @@ final class LagunaRuntimeModelInner: Module {
                         mask: mask,
                         cache: cache?[i],
                         qkRoPEAngles: qkRoPEAngles,
-                        qkRoPEOffsets: qkRoPEOffsets
+                        qkRoPEOffsets: qkRoPEOffsets,
+                        fusedAttentionParameterPool: fusedAttentionParameterPool
                     )
                     if isSingleTokenDecode, (decodeFireMask >> UInt64(i)) & 1 == 1 {
                         asyncEval(h)
@@ -11006,7 +11036,8 @@ final class LagunaRuntimeModelInner: Module {
                     mask: mask,
                     cache: cache?[i],
                     qkRoPEAngles: qkRoPEAngles,
-                    qkRoPEOffsets: qkRoPEOffsets
+                    qkRoPEOffsets: qkRoPEOffsets,
+                    fusedAttentionParameterPool: fusedAttentionParameterPool
                 )
                 if isSingleTokenDecode, (decodeFireMask >> UInt64(i)) & 1 == 1 {
                     asyncEval(h)
