@@ -1804,7 +1804,7 @@ func lagunaSlidingFusedAttention(
     )[0]
 }
 
-/// `DARKBLOOM_FUSED_FULL_ATTN` (default off; set "1" to enable): decode
+/// `DARKBLOOM_FUSED_FULL_ATTN` (default on; set "0" to disable): decode
 /// fused attention for the ten full-attention layers once the cache backing
 /// has spare capacity (from the second decode step on; the first step's
 /// stock growth concat is kept). Same design as the sliding twin above —
@@ -1814,7 +1814,21 @@ func lagunaSlidingFusedAttention(
 /// partial rotary, folded mscale roundings, passthrough tail) and the
 /// pair path's runtime-length loop + single-row tail at gqa_factor 6.
 let lagunaFusedFullAttentionEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_ATTN"] == "1"
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_ATTN"] != "0"
+
+/// Diagnostic-only coupling control for the historical second whole-model
+/// constructor decode. Full-attention fusion no longer implies this rewarm;
+/// set the flag explicitly only when reproducing the retired bundled arm.
+let lagunaFusedFullAttentionWholeModelWarmupEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_FUSED_FULL_ATTN_WHOLE_MODEL_WARMUP"] == "1"
+
+/// Compile only the full-attention custom kernel during untimed construction,
+/// using tiny throwaway arrays. Unlike the retired whole-model rewarm, this
+/// does not execute another Laguna layer or retain request/cache state.
+let lagunaFusedFullAttentionKernelWarmupEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_FUSED_FULL_ATTN_KERNEL_WARMUP"] != "0"
 
 private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
     name: "laguna_full_fused_attn_grow_v1",
@@ -2276,6 +2290,43 @@ func lagunaFullFusedAttention(
         outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
         outputDTypes: [.bfloat16]
     )[0]
+}
+
+/// Force creation of `lagunaFullFusedAttentionKernel`'s pipeline state with
+/// production Q/K/V geometry and a minimal two-row cache. Every tensor is
+/// deterministic, input-independent, evaluated once, and released before the
+/// constructor clears transient allocator cache and wires resident weights.
+func lagunaWarmFullFusedAttentionKernel() {
+    let headDim = LagunaConstants.headDim
+    let heads = LagunaConstants.fullAttentionHeads
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    let rawQueries = MLXArray.zeros(
+        [1, 1, heads * headDim], dtype: .bfloat16)
+    let rawKeys = MLXArray.zeros(
+        [1, 1, kvHeads * headDim], dtype: .bfloat16)
+    let rawValues = MLXArray.zeros(
+        [1, 1, kvHeads * headDim], dtype: .bfloat16)
+    let queryWeight = MLXArray.ones([headDim], dtype: .bfloat16)
+    let keyWeight = MLXArray.ones([headDim], dtype: .bfloat16)
+    let angles = MLXArray.zeros(
+        [1, 1, 1, headDim / 2], dtype: .float32)
+    let cacheKeys = MLXArray.zeros(
+        [1, kvHeads, 2, headDim], dtype: .bfloat16)
+    let cacheValues = MLXArray.zeros(
+        [1, kvHeads, 2, headDim], dtype: .bfloat16)
+    let scale = MLXArray([pow(Float(headDim), -0.5)])
+    eval(lagunaFullFusedAttention(
+        rawQueries: rawQueries,
+        rawKeys: rawKeys,
+        rawValues: rawValues,
+        queryWeight: queryWeight,
+        keyWeight: keyWeight,
+        angles: angles,
+        cacheKeys: cacheKeys,
+        cacheValues: cacheValues,
+        writeIdx: 1,
+        scale: scale
+    ))
 }
 
 /// Multi-token sliding-layer Q/K RMSNorm + plain RoPE fusion. One dispatch
@@ -9782,7 +9833,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     /// `DARKBLOOM_PACKED_SCALES` walk-order scale-interleaved copy of the
     /// fused routed gate/up scales ([experts, 4096, 32] uint8); see
     /// `lagunaRoutedSwiGLUQMVPackedKernel` for the layout contract. Nil
-    /// unless the flag is set to zero (default ON).
+    /// when the flag is set to zero (default ON).
     var _packedRoutedGateUpBank: MLXArray?
 
     /// Builds and retains the fused routed gate/up NVFP4 banks from the

@@ -178,6 +178,23 @@ private let lagunaLmHeadCoarseV5Enabled =
 private let lagunaLmHeadV5StatsEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_V5_STATS"] == "1"
 
+/// Tight v5 assembly threshold: use the BF16 predecessor of the exact coarse-
+/// argmax row instead of the retained `e_r - |e_r|/64` two-ulp band. This is
+/// the highest representable threshold that still forces every skipped
+/// `bfloat(coarse)` value strictly below `bfloat(e_r)`. Set to "0" for the
+/// retained arithmetic/barrier threshold in the same binary.
+private let lagunaLmHeadBF16PredecessorThresholdEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LMHEAD_BF16_PREDECESSOR_THRESHOLD"] != "0"
+
+/// Refine the predecessor threshold to the exact FP32 midpoint between the
+/// predecessor and rounded exact row. Because candidacy is `>=`, a skipped
+/// coarse value is strictly below the tie boundary and rounds to the
+/// predecessor or lower. Set to "0" for the submitted predecessor-value arm.
+private let lagunaLmHeadBF16MidpointThresholdEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LMHEAD_BF16_MIDPOINT_THRESHOLD"] != "0"
+
 /// One-line stderr trace hooks (DARKBLOOM_TRACE_FUSION=1) so a silently
 /// declining v4 guard is visible in run logs.
 private let lagunaTraceFusionEnabled =
@@ -1836,6 +1853,117 @@ private let lagunaLmHeadExactWinnerThresholdKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Tight exact-winner threshold. The argmax reduction and single-row stock
+/// GEMV are textually identical to `lagunaLmHeadExactWinnerThresholdKernel`.
+/// Only the epilogue changes.
+///
+/// Let `b = bfloat(e_r)` and `p = predecessor(b)` in the ordered BF16 value
+/// set. Monotonic BF16 rounding gives `bfloat(e_winner) >= b` because
+/// `e_winner >= e_r`. A non-candidate has `coarse_i + delta_i < p`, hence
+/// `coarse_i < p`; monotonic round-to-nearest therefore gives
+/// `bfloat(coarse_i) <= p < b <= bfloat(e_winner)`. The true winner remains a
+/// candidate because its certified upper bound is at least `e_winner`, while
+/// `p < e_r <= e_winner`. This proof covers either sign and exact BF16 values.
+/// Finite zero maps to negative-min-subnormal; real model logits are finite.
+private let lagunaLmHeadExactWinnerBF16PredecessorThresholdKernel = MLXFast.metalKernel(
+    name: lagunaLmHeadBF16MidpointThresholdEnabled
+        ? "laguna_lmhead_exact_winner_bf16_midpoint_threshold_v1"
+        : "laguna_lmhead_exact_winner_bf16_predecessor_threshold_v1",
+    inputNames: ["partial_max", "partial_idx", "lm_head", "x"],
+    outputNames: ["threshold"],
+    source: """
+        constexpr uint VOCAB = 100352;
+        constexpr uint K = 2048;
+        constexpr uint READS = 4;
+        uint lid = thread_position_in_threadgroup.x;
+        threadgroup uint winner_row[1];
+
+        // Verbatim final argmax over the retained 128 partials.
+        float best = -metal::numeric_limits<float>::infinity();
+        uint best_idx = 0xFFFFFFFFu;
+        uint base = lid * READS;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < READS; ++i) {
+            float v = partial_max[base + i];
+            uint idx = partial_idx[base + i];
+            if (v > best || (v == best && idx < best_idx)) {
+                best = v;
+                best_idx = idx;
+            }
+        }
+        #pragma clang loop unroll(full)
+        for (ushort sn = 16; sn >= 1; sn >>= 1) {
+            float ov = simd_shuffle_down(best, sn);
+            uint oi = simd_shuffle_down(best_idx, sn);
+            if (ov > best || (ov == best && oi < best_idx)) {
+                best = ov;
+                best_idx = oi;
+            }
+        }
+        if (lid == 0) {
+            winner_row[0] = metal::min(best_idx, uint(VOCAB - 1));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint r = winner_row[0];
+
+        // --- stock gemv_al replica begin (single row r; gemv.h:151-289) ---
+        float result = 0.0f;
+        thread bfloat inter[4];
+        thread float v_coeff[4];
+        uint bn = lid * 4;
+        const device bfloat* mrow = lm_head + size_t(r) * K;
+        for (uint i = 0; i < 16; ++i) {
+            vec<bfloat, 4> xv =
+                *((const device vec<bfloat, 4>*)(x + bn));
+            v_coeff[0] = float(xv.x);
+            v_coeff[1] = float(xv.y);
+            v_coeff[2] = float(xv.z);
+            v_coeff[3] = float(xv.w);
+            vec<bfloat, 4> mv =
+                *((const device vec<bfloat, 4>*)(mrow + bn));
+            inter[0] = mv.x;
+            inter[1] = mv.y;
+            inter[2] = mv.z;
+            inter[3] = mv.w;
+            result += inter[0] * v_coeff[0];
+            result += inter[1] * v_coeff[1];
+            result += inter[2] * v_coeff[2];
+            result += inter[3] * v_coeff[3];
+            bn += 128;
+        }
+        #pragma unroll
+        for (ushort sn = 16; sn >= 1; sn >>= 1) {
+            result += simd_shuffle_down(result, sn);
+        }
+        // --- stock gemv_al replica end ---
+        if (lid == 0) {
+            bfloat rounded = bfloat(result);
+            // Expand through the numeric BF16->FP32 conversion, whose bits are
+            // exactly `bf16_bits << 16`; do not reinterpret the Metal wrapper.
+            ushort bits = ushort(as_type<uint>(float(rounded)) >> 16);
+            ushort magnitude = bits & 0x7FFFu;
+            ushort predecessor_bits;
+            if (magnitude == 0u) {
+                predecessor_bits = 0x8001u;  // predecessor of either zero
+            } else if ((bits & 0x8000u) == 0u) {
+                predecessor_bits = bits - 1u;
+            } else {
+                predecessor_bits = bits + 1u;
+            }
+            float predecessor =
+                as_type<float>(uint(predecessor_bits) << 16);
+            if (\(lagunaLmHeadBF16MidpointThresholdEnabled ? "true" : "false")) {
+                float rounded_value = as_type<float>(uint(bits) << 16);
+                threshold[0] = predecessor +
+                    (rounded_value - predecessor) * 0.5f;
+            } else {
+                threshold[0] = predecessor;
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 /// GPU candidate marking: one byte per vocabulary row, set when the row's
 /// certified upper bound reaches the threshold. A dense mask rather than a
 /// compacted index list, because the exact pass below owns a FIXED output
@@ -2429,7 +2557,11 @@ final class LagunaLmHeadPruner {
                 outputShapes: [[128], [128]],
                 outputDTypes: [.float32, .uint32]
             )
-            let thr5 = lagunaLmHeadExactWinnerThresholdKernel(
+            let thresholdKernel =
+                lagunaLmHeadBF16PredecessorThresholdEnabled
+                ? lagunaLmHeadExactWinnerBF16PredecessorThresholdKernel
+                : lagunaLmHeadExactWinnerThresholdKernel
+            let thr5 = thresholdKernel(
                 [argmaxPartials[0], argmaxPartials[1], lmHeadWeight, x],
                 grid: (32, 1, 1),
                 threadGroup: (32, 1, 1),
