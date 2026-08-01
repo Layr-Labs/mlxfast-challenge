@@ -318,6 +318,15 @@ let lagunaRoutedSharedSwiGLUQMVRows4Enabled =
 let lagunaSwiGLUQMVRows1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_QMV_R1"] != "0"
 
+/// The same R1 scheduling for the shared-expert gate/up decode QMV: one
+/// output row per simdgroup, 256 tiles covering all 512 shared rows exactly
+/// once. Every row retains its activation/code/scale addresses, K-block
+/// order, 32-lane reduction, BF16 casts and SwiGLU epilogue; the removed
+/// two-row loop only interleaved two private accumulator pairs. Set
+/// `DARKBLOOM_SHARED_QMV_R1=0` to restore the two-row control.
+let lagunaSharedSwiGLUQMVRows1Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_QMV_R1"] != "0"
+
 /// Folds the per-head softplus gate into the output projection's GEMV (see
 /// `lagunaGatedOutputProjectionSource`), with one kernel variant per attention
 /// family. Set `DARKBLOOM_FUSED_GATED_OUTPUT=0` to ablate.
@@ -2820,6 +2829,116 @@ func lagunaGateProductSoftplus(
     )[0]
 }
 
+// MARK: - Prefill gate-product epilogue (one dispatch)
+
+/// Prefill twin of the decode gate-product fold. The stock chain between the
+/// gate projection and the output projection at L > 1 is the compiled
+/// shapeless softplus (`lagunaCompiledSoftplusGate`: BF16→FP32 cast,
+/// `LogAddExp(x, 0)`, FP32→BF16 cast, one dispatch) followed by the
+/// broadcast product against the SDPA output's transposed lazy view
+/// (`output.reshaped(B, L, H, D) * gate[..., newAxis]`, which materializes
+/// the [B, L, H*D] row-major form the output projection consumes — one
+/// dispatch, plus a copy whenever the transposed reshape cannot ride the
+/// multiply's general path). This kernel performs the whole epilogue in one
+/// dispatch, reading the SDPA output in its native [B, H, L, D] layout and
+/// writing the o_proj-ready [B, L, H*D] gated tensor directly, so the
+/// transposed-view round trip is gone too.
+///
+/// Bit-exactness, boundary for boundary (the softplus text is VERBATIM the
+/// promoted decode twin's, whose equivalence to the stock chain is
+/// ranked-proven — it ran on every decode token of the e23e82c5/ad14f90b
+/// submissions, which passed the hidden gates):
+///
+/// - the gate logit read is the same BF16 value the stock compiled softplus
+///   reads (`gProj(normalizedInput)`'s raw output row);
+/// - the FP32 softplus is MLX's `LogAddExp<float>` verbatim (same
+///   `maxval + log1p(exp(minval - maxval))` form, same NaN/inf guards, same
+///   Goldberg `log1p` from the metal utils preamble). It is recomputed per
+///   element of a head — the same FP32 op stream the standalone softplus
+///   dispatch runs once per head, on the same input bits;
+/// - the gate rounds to BF16 exactly where the stock `.asType(.bfloat16)`
+///   rounds it, and the product rounds once to BF16 exactly where MLX's
+///   BF16 binary multiply rounds `float(bfloat(float(values[i]) * gate))`;
+/// - the attention-output read is the same BF16 value the stock multiply
+///   reads (any copy the lazy transposed reshape inserts preserves bits).
+///
+/// Grid mapping mirrors the other prefill kernels: `threadgroups_per_grid.y`
+/// is L, so no shape constant is baked and any L dispatches the same
+/// compiled kernel; thread `row` of token `t` writes
+/// `gated[t * (H*D) + row]` from `attention_output[(head*L + t)*D + d]`,
+/// one thread per output element, consecutive threads reading and writing
+/// contiguously inside each 128-element head row.
+private func lagunaPrefillGateProductSoftplusSource(heads: Int) -> String {
+    """
+    constexpr uint HEAD_DIM = \(LagunaConstants.headDim);
+    constexpr uint HEADS = \(heads);
+    uint row = thread_position_in_grid.x;
+    uint t = threadgroup_position_in_grid.y;
+    uint length = threadgroups_per_grid.y;
+    uint head = row / HEAD_DIM;
+    float logit = float(gate_logits[t * HEADS + head]);
+    float gate;
+    if (metal::isnan(logit)) {
+        gate = NAN;
+    } else {
+        float maxval = metal::max(logit, 0.0f);
+        float minval = metal::min(logit, 0.0f);
+        gate = (metal::isinf(minval) || metal::isinf(maxval))
+            ? maxval
+            : maxval + log1p(metal::exp(minval - maxval));
+    }
+    bfloat gate_bf = bfloat(gate);
+    gated[t * (HEADS * HEAD_DIM) + row] = bfloat(
+        float(attention_output[(head * length + t) * HEAD_DIM + row % HEAD_DIM])
+            * float(gate_bf));
+    """
+}
+
+private let lagunaPrefillGateProductSoftplusKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_prefill_gate_product_softplus_bf16_h\(heads)_v1",
+            inputNames: ["attention_output", "gate_logits"],
+            outputNames: ["gated"],
+            source: lagunaPrefillGateProductSoftplusSource(heads: heads),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+/// Set `DARKBLOOM_PREFILL_GATE_PRODUCT=0` to ablate and restore the exact
+/// stock prefill chain (compiled softplus + transpose/multiply).
+private let lagunaPrefillGateProductEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_GATE_PRODUCT"] != "0"
+
+/// Returns the gated prefill attention output `[1, L, heads*headDim]`, or nil
+/// when the preconditions do not hold (caller falls back to the stock chain).
+/// Bit-identical to the stock compiled-softplus + broadcast-product chain;
+/// see the kernel commentary above.
+func lagunaPrefillGateProductSoftplus(
+    attentionOutput: MLXArray, gateLogits: MLXArray, heads: Int, length: Int
+) -> MLXArray? {
+    guard lagunaPrefillGateProductEnabled,
+        let kernel = lagunaPrefillGateProductSoftplusKernels[heads]
+    else { return nil }
+    let inVec = heads * LagunaConstants.headDim
+    precondition(attentionOutput.dtype == .bfloat16)
+    precondition(attentionOutput.shape == [1, heads, length, LagunaConstants.headDim])
+    precondition(gateLogits.dtype == .bfloat16)
+    precondition(gateLogits.shape == [1, length, heads])
+
+    lagunaTrace("prefill gate product softplus h\(heads)")
+    return kernel(
+        [attentionOutput, gateLogits],
+        grid: (inVec, length, 1),
+        threadGroup: (128, 1, 1),
+        outputShapes: [[1, length, inVec]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 // MARK: - Gated native-affine INT8 output projection (one dispatch)
 
 /// Folds the per-head softplus gate product into the native group-32 affine
@@ -4599,6 +4718,26 @@ final class LagunaRuntimeAttention: Module {
             {
                 return attentionGateProjection(output, projectedGate, wo.weight)
             }
+            // Prefill gate-epilogue fold: ONE dispatch for the softplus
+            // chain AND the broadcast product over all L rows, reading the
+            // SDPA output in its native [B, H, L, D] layout and writing the
+            // o_proj-ready [B, L, H*D] gated tensor — the compiled-softplus
+            // dispatch, the transposed-view round trip and the separate
+            // multiply below are all replaced. Bit-identical to the stock
+            // chain (see `lagunaPrefillGateProductSoftplusSource`); any
+            // guard decline falls through to it verbatim.
+            if !gateIsActivated, gatePerHead, L > 1, B == 1,
+                attended.dtype == .bfloat16, projectedGate.dtype == .bfloat16,
+                attended.shape == [B, nHeads, L, headDim],
+                projectedGate.shape == [B, L, nHeads],
+                let fused = lagunaPrefillGateProductSoftplus(
+                    attentionOutput: attended,
+                    gateLogits: projectedGate,
+                    heads: nHeads,
+                    length: L)
+            {
+                return wo(fused)
+            }
             let gate =
                 gateIsActivated
                 ? projectedGate
@@ -5107,6 +5246,96 @@ private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// R1 scheduling twin of `lagunaSharedSwiGLUQMVKernel`: each simdgroup owns
+/// one output row rather than two. Two simdgroups per 64-thread group and 256
+/// tiles cover all 512 shared rows exactly once — the same bijection the
+/// promoted routed R1 twin (`lagunaRoutedSwiGLUQMVRows1Kernel`) uses. For any
+/// row and lane the activation, code and scale addresses, the four K blocks,
+/// the qdot calls, the FP32 addition order, the simd reduction, the BF16
+/// casts, the SwiGLU epilogue and the output address are identical; the
+/// removed R2 loop only interleaved two private accumulator pairs.
+private let lagunaSharedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
+    name: "laguna_shared_nvfp4_swiglu_qmv_rows1_bf16_v1",
+    inputNames: ["input", "fused_weight", "fused_scales"],
+    outputNames: ["activated"],
+    source: """
+        constexpr uint input_width = 2048;
+        constexpr uint output_width = 512;
+        constexpr uint packed_row_bytes = 1024;
+        constexpr uint scale_row_bytes = 128;
+        constexpr uint block_width = 512;
+        constexpr uint values_per_lane = 16;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint row = tile * 2 + simd_group;
+        uint gate_row = row;
+        uint up_row = row + output_width;
+
+        const device uint8_t* gate_row_weight =
+            (const device uint8_t*)fused_weight +
+            gate_row * packed_row_bytes + lane * 8;
+        const device uint8_t* up_row_weight =
+            (const device uint8_t*)fused_weight +
+            up_row * packed_row_bytes + lane * 8;
+        const device uint8_t* gate_row_scale =
+            fused_scales + gate_row * scale_row_bytes + lane;
+        const device uint8_t* up_row_scale =
+            fused_scales + up_row * scale_row_bytes + lane;
+
+        thread float gate_result = 0.0f;
+        thread float up_result = 0.0f;
+        thread float input_values[values_per_lane];
+
+        for (uint block = 0; block < input_width; block += block_width) {
+            const device vec<bfloat, 4>* input_vectors =
+                (const device vec<bfloat, 4>*)(
+                    input + block + lane * values_per_lane);
+            for (uint i = 0; i < values_per_lane / 4; ++i) {
+                const vec<bfloat, 4> values = input_vectors[i];
+                input_values[4 * i] = values[0];
+                input_values[4 * i + 1] = values[1];
+                input_values[4 * i + 2] = values[2];
+                input_values[4 * i + 3] = values[3];
+            }
+
+            const device uint8_t* gate_weight =
+                gate_row_weight + block / 2;
+            const device uint8_t* up_weight =
+                up_row_weight + block / 2;
+            const device uint8_t* gate_scale =
+                gate_row_scale + block / 16;
+            const device uint8_t* up_scale =
+                up_row_scale + block / 16;
+
+            gate_result += laguna_nvfp4_qdot_16(
+                gate_weight,
+                input_values,
+                laguna_nvfp4_scale(gate_scale[0]));
+            up_result += laguna_nvfp4_qdot_16(
+                up_weight,
+                input_values,
+                laguna_nvfp4_scale(up_scale[0]));
+        }
+
+        gate_result = simd_sum(gate_result);
+        up_result = simd_sum(up_result);
+        if (lane == 0) {
+            bfloat gate = bfloat(gate_result\(lagunaNvfp4RowScaleSuffix));
+            bfloat up = bfloat(up_result\(lagunaNvfp4RowScaleSuffix));
+            bfloat exp_abs = metal::exp(metal::abs(gate));
+            bfloat denominator = bfloat(1) + exp_abs;
+            bfloat y = bfloat(1) / denominator;
+            bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+            bfloat silu = bfloat(gate * sigmoid);
+            activated[row] = bfloat(silu * up);
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
 func lagunaSharedSwiGLUQMV(
     _ input: MLXArray,
     fusedWeight: MLXArray,
@@ -5127,9 +5356,10 @@ func lagunaSharedSwiGLUQMV(
             LagunaConstants.hiddenSize / 16,
         ])
 
-    return lagunaSharedSwiGLUQMVKernel(
+    return (lagunaSharedSwiGLUQMVRows1Enabled
+        ? lagunaSharedSwiGLUQMVRows1Kernel : lagunaSharedSwiGLUQMVKernel)(
         [input, fusedWeight, fusedScales],
-        grid: (128 * 64, 1, 1),
+        grid: ((lagunaSharedSwiGLUQMVRows1Enabled ? 256 : 128) * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.sharedExpertIntermediateSize]],
         outputDTypes: [.bfloat16]
