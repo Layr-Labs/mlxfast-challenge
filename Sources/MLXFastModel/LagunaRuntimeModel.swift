@@ -4263,38 +4263,41 @@ func lagunaGatedAffineOProjNVFP4(
 }
 
 
-/// Header shared by the two NVFP4-tail kernels below: the NVFP4 per-group
-/// scale decode and the 16-value qdot, expression-for-expression the vendored
-/// `dequantize_scale<float, 16>` (fp_quantized.cpp:180-187) and
-/// `qdot<float, 16, 4>` (fp_quantized.cpp:246-269, 285) that the stock
-/// `fp_qmv_fast_impl<bfloat16_t, 16, 4>` calls. The scale decode cannot use
-/// the vendored `fp8_e4m3` bit cast — the custom-kernel preamble
-/// (`metal::utils()`, custom_kernel.cpp:71) does not include `fp8.h` — so it
-/// uses the same half-shuffle form the shipped `laguna_nvfp4_scale` uses:
-/// E4M3's exponent bias is 7 against half's 15, so `(bits & 127) << 7` lands
-/// the E4M3 magnitude in half format already divided by 256 and the
-/// `*= 256.0` restores it, an exact power-of-two scaling in both directions
-/// (the half-domain intermediate peaks at 1.875, the scale at 480, against
-/// half's finite max of 65504). The vendored file's own port of this exact
-/// idiom reports 0 bit mismatches over all 256 scale bytes against the
-/// `fp8_e4m3` chain (fp_quantized.cpp:385-388).
-///
-/// `laguna_nvfp4_qdot_codes_16` is deliberately NOT reused here: the shipped
-/// default (`DARKBLOOM_NVFP4_SCALE_FOLD` on) moves the `16384.0f` from the
-/// sixteen per-value multiplies into the scale — a documented bit-exact
-/// power-of-two regrouping, but one expression away from the text the stock
-/// `fp_qmv_fast` kernel actually compiles (its `qdot` keeps the per-value
-/// `* 16384.0f` and its scale carries no fold). This header keeps the
-/// vendored placement exactly, so every product, partial sum and rounding
-/// decision matches the dispatch it replaces term for term. With the fold
-/// disabled the two helpers are expression-identical anyway.
-private let lagunaTailNVFP4QMVHeader = """
-    static inline float laguna_tail_nvfp4_scale(uint8_t bits) {
-        ushort raw = ushort(bits & 127) << 7;
+/// Exact E4M3 scale decode and stock-order 16-value qdot for the fused tail.
+/// The stock path shifts the 7-bit magnitude into a half (thereby dividing by
+/// 256), restores that factor in half, applies the sign, then multiplies its
+/// float scale by 16384 before the accumulated qdot. The enabled path folds
+/// both powers of two into one exact float multiply (`256 * 16384 = 2^22`).
+/// `bits + (bits & 128)` moves E4M3's sign to half bit 15 when shifted while
+/// retaining the magnitude. Every E4M3 magnitude is finite; the half-form
+/// intermediate is at most 1.875, so neither formulation rounds or overflows.
+/// An exhaustive comparison over all 256 scale bytes is bit-identical,
+/// including both signed zeros. The environment switch keeps the original
+/// expression as a direct timing and correctness control.
+private let lagunaTailNVFP4ScaleFoldEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_TAIL_NVFP4_SCALE_FOLD"] != "0"
+
+private let lagunaTailNVFP4ScaleDecode = lagunaTailNVFP4ScaleFoldEnabled
+    ? """
+        return float(as_type<half>(raw)) * 4194304.0f;
+    """
+    : """
         half converted = as_type<half>(raw);
         converted *= 256.0;
         half signed_value = (bits & 128) ? -converted : converted;
         return float(signed_value);
+    """
+
+private let lagunaTailNVFP4QDotReturn = lagunaTailNVFP4ScaleFoldEnabled
+    ? "return scale * accum;"
+    : "return (scale * 16384.0f) * accum;"
+
+private let lagunaTailNVFP4QMVHeader = """
+    static inline float laguna_tail_nvfp4_scale(uint8_t bits) {
+        \(lagunaTailNVFP4ScaleFoldEnabled
+            ? "ushort raw = ushort(bits + (bits & 128)) << 7;"
+            : "ushort raw = ushort(bits & 127) << 7;")
+        \(lagunaTailNVFP4ScaleDecode)
     }
 
     static inline float laguna_tail_nvfp4_qdot(
@@ -4336,7 +4339,7 @@ private let lagunaTailNVFP4QMVHeader = """
                  x_thread[8 * j + 6] * v26.y +
                  x_thread[8 * j + 7] * v37.y);
         }
-        return (scale * 16384.0f) * accum;
+        \(lagunaTailNVFP4QDotReturn)
     }
     """
 
@@ -4572,7 +4575,7 @@ private let lagunaTailNormQKVGateKernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_tail_norm_qkv_gate_bf16_h\(heads)_v1",
+            name: "laguna_tail_norm_qkv_gate_bf16_h\(heads)_sf\(lagunaTailNVFP4ScaleFoldEnabled ? 1 : 0)_v2",
             inputNames: [
                 "residual", "norm_weight", "weight_codes", "weight_scales",
                 "gate_codes", "gate_scales", "gate_biases",
