@@ -294,8 +294,23 @@ inline U qdot(
   }
 
   else if (bits == 8) {
-    for (int i = 0; i < values_per_thread; i++) {
-      accum += x_thread[i] * w[i];
+    if constexpr (values_per_thread == 8) {
+      // The qmv-fast group-32 affine-INT8 shape owns eight aligned bytes.
+      // Read them as two words, then extract in the original byte order.
+      const uint32_t w_lo = ((const device uint32_t*)w)[0];
+      const uint32_t w_hi = ((const device uint32_t*)w)[1];
+      accum += x_thread[0] * U(w_lo & 0xff);
+      accum += x_thread[1] * U((w_lo >> 8) & 0xff);
+      accum += x_thread[2] * U((w_lo >> 16) & 0xff);
+      accum += x_thread[3] * U((w_lo >> 24) & 0xff);
+      accum += x_thread[4] * U(w_hi & 0xff);
+      accum += x_thread[5] * U((w_hi >> 8) & 0xff);
+      accum += x_thread[6] * U((w_hi >> 16) & 0xff);
+      accum += x_thread[7] * U((w_hi >> 24) & 0xff);
+    } else {
+      for (int i = 0; i < values_per_thread; i++) {
+        accum += x_thread[i] * w[i];
+      }
     }
   }
 
