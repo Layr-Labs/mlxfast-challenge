@@ -3750,6 +3750,164 @@ private func lagunaNormAffineQKVBody(
 private let lagunaNormAffineQKVStaged =
     ProcessInfo.processInfo.environment["DARKBLOOM_NORM_AFFINE_QKV_STAGE"] == "tg"
 
+/// Register-prefetch depth for the inline norm-folded affine QKV kernel.
+/// Default 4; set DARKBLOOM_NORM_AFFINE_QKV_PF=0 to restore the accepted
+/// inline kernel. The first depth weight blocks are read before the RMSNorm
+/// reduction and consumed afterward in exactly the original K order. Only
+/// immutable reads move; all floating-point operations and storage boundaries
+/// remain unchanged.
+let lagunaNormAffineQKVPrefetchDepth: Int = {
+    let raw =
+        ProcessInfo.processInfo.environment["DARKBLOOM_NORM_AFFINE_QKV_PF"] ?? "4"
+    return min(max(Int(raw) ?? 4, 0), 4)
+}()
+
+/// Register-prefetch twin of the accepted inline kernel. The norm reduction
+/// and affine-QMV arithmetic are textual replicas of the accepted source. The
+/// first depth K blocks are loaded into registers before the norm prologue,
+/// then consumed in the same row/i sequence as the original loop.
+private func lagunaNormAffineQKVPrefetchSource(rows: Int, depth: Int) -> String {
+    """
+    constexpr uint axis_size = \(LagunaConstants.hiddenSize);
+    constexpr uint out_vec_size = \(rows);
+    constexpr uint n_reads = 4;
+    constexpr uint norm_threads = axis_size / n_reads;
+    constexpr uint real_threads = 64;
+    constexpr uint virtual_per_thread = norm_threads / real_threads;
+    constexpr uint simd_size = 32;
+    constexpr float norm_eps = 1.0e-6f;
+    constexpr uint values_per_thread = 8;
+    constexpr uint block_size = 256;
+    constexpr uint results_per_simdgroup = 4;
+    constexpr uint num_simdgroups = 2;
+    constexpr uint group_size = 32;
+    constexpr uint scale_step_per_thread = group_size / values_per_thread;
+    constexpr uint in_vec_size_g = axis_size / group_size;
+    constexpr uint pf_depth = \(depth);
+
+    uint tile = threadgroup_position_in_grid.x;
+    uint lid = thread_position_in_threadgroup.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    threadgroup float local_inv_mean[1];
+    threadgroup float local_sums[simd_size];
+
+    uint out_row = tile * (num_simdgroups * results_per_simdgroup) +
+        simd_gid * results_per_simdgroup;
+
+    const device uint8_t* ws = (const device uint8_t*)weight_codes +
+        out_row * axis_size + simd_lid * values_per_thread;
+    const device bfloat* sc = weight_scales + out_row * in_vec_size_g +
+        simd_lid / scale_step_per_thread;
+    const device bfloat* bs = weight_biases + out_row * in_vec_size_g +
+        simd_lid / scale_step_per_thread;
+
+    uint8_t pf_w[pf_depth][results_per_simdgroup][values_per_thread];
+    float pf_s[pf_depth][results_per_simdgroup];
+    float pf_b[pf_depth][results_per_simdgroup];
+    for (uint d = 0; d < pf_depth; ++d) {
+        for (uint row = 0; row < results_per_simdgroup; ++row) {
+            const device uint8_t* wl = ws + d * block_size + row * axis_size;
+            for (uint i = 0; i < values_per_thread; ++i) {
+                pf_w[d][row][i] = wl[i];
+            }
+            pf_s[d][row] =
+                float(sc[d * (block_size / group_size) + row * in_vec_size_g]);
+            pf_b[d][row] =
+                float(bs[d * (block_size / group_size) + row * in_vec_size_g]);
+        }
+    }
+
+    if (lid < simd_size) {
+        local_sums[lid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j = 0; j < virtual_per_thread; ++j) {
+        uint base = (lid + j * real_threads) * n_reads;
+        float acc = 0.0f;
+        for (uint i = 0; i < n_reads; ++i) {
+            float xi = float(residual[base + i]);
+            acc += xi * xi;
+        }
+        acc = simd_sum(acc);
+        if (simd_lid == 0) {
+            local_sums[simd_gid + num_simdgroups * j] = acc;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_gid == 0) {
+        float total = simd_sum(local_sums[simd_lid]);
+        if (simd_lid == 0) {
+            local_inv_mean[0] =
+                metal::precise::rsqrt(total / float(axis_size) + norm_eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float laguna_inv_mean = local_inv_mean[0];
+    thread float x_thread[values_per_thread];
+    thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    uint column = simd_lid * values_per_thread;
+    for (uint d = 0; d < pf_depth; ++d) {
+        float sum = 0.0f;
+        for (uint i = 0; i < values_per_thread; ++i) {
+            float value = float(bfloat(
+                            norm_weight[column + i] *
+                            bfloat(float(residual[column + i]) * laguna_inv_mean)));
+            sum += value;
+            x_thread[i] = value;
+        }
+        for (uint row = 0; row < results_per_simdgroup; ++row) {
+            float accum = 0.0f;
+            for (uint i = 0; i < values_per_thread; ++i) {
+                accum += x_thread[i] * pf_w[d][row][i];
+            }
+            result[row] += pf_s[d][row] * accum + sum * pf_b[d][row];
+        }
+        ws += block_size;
+        sc += block_size / group_size;
+        bs += block_size / group_size;
+        column += block_size;
+    }
+
+    for (uint k = pf_depth * block_size; k < axis_size; k += block_size) {
+        float sum = 0.0f;
+        for (uint i = 0; i < values_per_thread; ++i) {
+            float value = float(bfloat(
+                            norm_weight[column + i] *
+                            bfloat(float(residual[column + i]) * laguna_inv_mean)));
+            sum += value;
+            x_thread[i] = value;
+        }
+        for (uint row = 0; row < results_per_simdgroup; ++row) {
+            const device uint8_t* wl = ws + row * axis_size;
+            float scale = float(sc[row * in_vec_size_g]);
+            float bias = float(bs[row * in_vec_size_g]);
+            float accum = 0.0f;
+            for (uint i = 0; i < values_per_thread; ++i) {
+                accum += x_thread[i] * wl[i];
+            }
+            result[row] += scale * accum + sum * bias;
+        }
+        ws += block_size;
+        sc += block_size / group_size;
+        bs += block_size / group_size;
+        column += block_size;
+    }
+
+    for (uint row = 0; row < results_per_simdgroup; ++row) {
+        result[row] = simd_sum(result[row]);
+        if (simd_lid == 0) {
+            projected[out_row + row] = bfloat(result[row]);
+        }
+    }
+    """
+}
+
 /// One kernel per reachable `[Q; K; V; (G)]` row count: both head families,
 /// gate rows folded in or not. All four are multiples of 8, so `qmv`'s `fast`
 /// predicate holds and no tail threadgroup is ever dispatched.
@@ -3761,16 +3919,21 @@ private let lagunaNormAffineQKVKernels: [Int: MLXFast.MLXFastKernel] = {
             let rows = heads * LagunaConstants.headDim + kvRows + gateRows
             if kernels[rows] != nil { continue }
             let staged = lagunaNormAffineQKVStaged
+            let prefetchDepth = staged ? 0 : lagunaNormAffineQKVPrefetchDepth
             kernels[rows] = MLXFast.metalKernel(
-                name:
-                    "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_"
-                    + (staged ? "tg" : "inl") + "_v1",
+                name: prefetchDepth > 0
+                    ? "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_pf\(prefetchDepth)_v1"
+                    : "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_"
+                        + (staged ? "tg" : "inl") + "_v1",
                 inputNames: [
                     "residual", "norm_weight", "weight_codes", "weight_scales",
                     "weight_biases",
                 ],
                 outputNames: ["projected"],
-                source: lagunaNormAffineQKVSource(rows: rows, staged: staged),
+                source: prefetchDepth > 0
+                    ? lagunaNormAffineQKVPrefetchSource(
+                        rows: rows, depth: prefetchDepth)
+                    : lagunaNormAffineQKVSource(rows: rows, staged: staged),
                 ensureRowContiguous: true
             )
         }
@@ -3815,7 +3978,10 @@ func lagunaNormAffineQKV(
         return nil
     }
 
-    lagunaTrace("norm+affine qkv qmv r\(rows)")
+    lagunaTrace(
+        lagunaNormAffineQKVPrefetchDepth > 0 && !lagunaNormAffineQKVStaged
+            ? "norm+affine qkv qmv r\(rows) pf\(lagunaNormAffineQKVPrefetchDepth)"
+            : "norm+affine qkv qmv r\(rows)")
     return kernel(
         [residual, normWeight, codes, scales, biases],
         grid: ((rows / 8) * 64, 1, 1),
