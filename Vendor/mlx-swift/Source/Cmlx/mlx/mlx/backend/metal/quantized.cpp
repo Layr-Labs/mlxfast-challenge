@@ -1319,7 +1319,8 @@ int darkbloom_expert_gather_groups() {
 // pipeline key. Resolved once per process, so exactly one variant is ever
 // compiled and a fresh process picks up a changed environment cleanly.
 //
-//   unset (SHIPPED) -> 4  (BM=64,  WM=4, WN=2)  SM=16, 256 thr/TG
+//   unset (SHIPPED) -> 5  (BM=64,  WM=4, WN=1)  SN=64, 128 thr/TG (2026-07-31)
+//   "4" (prev ship) -> 4  (BM=64,  WM=4, WN=2)  SM=16, 256 thr/TG
 //   "0"             -> 0  (BM=64,  WM=2, WN=2)  SM=32  upstream tiling
 //   "1"             -> 1  (BM=128, WM=4)        SM=32  less expert re-staging
 //   "2"             -> 2  (BM=128, WM=2)        SM=64  measured regression
@@ -1393,7 +1394,13 @@ int darkbloom_stage_bm128_variant() {
   static const int v = [] {
     auto s = env::get_var("DARKBLOOM_STAGE_BM128", "");
     if (s.empty()) {
-      return 4;
+      // Default 5 (2026-08-01, final): API absolutes across our four scored
+      // sessions prove the mechanism — candidate prefill 204.90 (base) →
+      // 201.64 (wn1) → 201.42 (steel) → 198.00 µs (both; fastest on record).
+      // Earlier rejections were session-baseline draw fog (bpre 364-371 vs
+      // the 375-386 every recent promotion drew), not mechanism failures.
+      // DARKBLOOM_STAGE_BM128=4 restores the WN2 tiling.
+      return 5;
     }
     if (s == "1") {
       return 1;
