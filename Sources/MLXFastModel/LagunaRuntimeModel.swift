@@ -3783,15 +3783,23 @@ func lagunaGateProductSoftplus(
 /// into the input row at each k-block at the same FP32 -> BF16 rounding point
 /// `lagunaGateProductSoftplusSource` uses, so the contraction is bit-identical
 /// to applying the gate first and then running the stock affine GEMV.
-private func lagunaGatedAffineOProjSource(heads: Int) -> String {
-    """
+func lagunaGatedAffineOProjSource(heads: Int, resultsPerSimdgroup: Int = 4) -> String {
+    // The per-SIMD-group accumulator array width is coupled to
+    // `results_per_simdgroup`: its zero-initializer must list exactly that many
+    // elements or Metal rejects it ("excess elements"). Render the list to
+    // width so both the stock (4) and R1 (1) arms compile; at width 4 this is
+    // byte-identical to the frontier's `{0.0f, 0.0f, 0.0f, 0.0f}`.
+    let resultInitializer =
+        Array(repeating: "0.0f", count: resultsPerSimdgroup)
+        .joined(separator: ", ")
+    return """
     constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
     constexpr uint out_vec_size = \(LagunaConstants.hiddenSize);
     constexpr uint gate_heads = \(heads);
     constexpr uint head_shift = 7;              // head_dim == 128
     constexpr uint values_per_thread = 8;       // pack_factor 4 * packs_per_thread 2
     constexpr uint block_size = 256;            // values_per_thread * SIMD_SIZE
-    constexpr uint results_per_simdgroup = 4;
+    constexpr uint results_per_simdgroup = \(resultsPerSimdgroup);
     constexpr uint num_simdgroups = 2;
     constexpr uint group_size = 32;
     constexpr uint scale_step_per_thread = group_size / values_per_thread;
@@ -3833,7 +3841,7 @@ private func lagunaGatedAffineOProjSource(heads: Int) -> String {
     const device bfloat* xp = attention_output + simd_lid * values_per_thread;
 
     thread float x_thread[values_per_thread];
-    thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+    thread float result[results_per_simdgroup] = {\(resultInitializer)};
 
     uint column = simd_lid * values_per_thread;
     for (uint k = 0; k < in_vec_size; k += block_size) {
@@ -3892,6 +3900,58 @@ private let lagunaGatedAffineOProjKernels: [Int: MLXFast.MLXFastKernel] = {
     return kernels
 }()
 
+/// `DARKBLOOM_OPROJ_QMV_R1` (default ON; set "0" for the stock control). R1 scheduling
+/// twin of the gated affine INT8 output-projection QMV: one output row per
+/// SIMD group instead of four, launching 4x as many threadgroups so more
+/// independent INT8 weight streams are in flight to hide the o_proj
+/// weight-read latency on the memory-bound decode GEMV -- the same
+/// latency-hiding lever the accepted `DARKBLOOM_QMV_R1` (routed gate/up) and
+/// `DARKBLOOM_SHARED_QMV_R1` (shared gate/up) schedules pull on their sites.
+/// Default OFF pending ranked/local A/B evidence; when OFF the stock four-row
+/// kernel and grid run byte-for-byte as before.
+///
+/// Bit-exact: the R1 kernel source is `lagunaGatedAffineOProjSource` with
+/// `results_per_simdgroup` set to 1 instead of 4. Two source tokens are
+/// coupled to that constant and render to width: the constant declaration
+/// itself, and the per-SIMD-group accumulator's zero-initializer
+/// (`result[results_per_simdgroup] = {0.0f}` at width 1 vs
+/// `{0.0f, 0.0f, 0.0f, 0.0f}` at width 4 -- a wrongly sized list is a Metal
+/// compile error). Both render byte-identically to the frontier at width 4.
+/// Neither touches the arithmetic: each output row keeps its exact k-block
+/// order, per-block `scale * accum + sum * bias` accumulation from a
+/// zero-initialized accumulator, softplus gate fold at the identical
+/// FP32 -> BF16 rounding point, 32-lane `simd_sum`, and single BF16 round.
+/// The stock kernel already computes each output row in a fully independent
+/// accumulator (there is no cross-SIMD-group reduction), and the `out_row =
+/// tile * (num_simdgroups * results_per_simdgroup) + simd_gid *
+/// results_per_simdgroup` mapping degenerates to `tile * 2 + simd_gid` at
+/// `results_per_simdgroup == 1`, so reassigning ownership from four rows per
+/// SIMD group to one -- and quadrupling the tile count -- is a pure schedule
+/// change with identical per-row arithmetic.
+let lagunaGatedAffineOProjRows1Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_OPROJ_QMV_R1"] != "0"
+
+/// R1 scheduling twins of `lagunaGatedAffineOProjKernels`. Built eagerly for
+/// both head counts so one binary serves every arm of an ablation and MLX's
+/// name-keyed JIT cache never sees two sources under one name.
+private let lagunaGatedAffineOProjRows1Kernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_gated_affine_oproj_qmv_i8g32_h\(heads)_rows1_bf16_v1",
+            inputNames: [
+                "attention_output", "gate_logits", "weight_codes",
+                "weight_scales", "weight_biases",
+            ],
+            outputNames: ["projected"],
+            source: lagunaGatedAffineOProjSource(
+                heads: heads, resultsPerSimdgroup: 1),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
 /// `DARKBLOOM_FUSED_GATED_AFFINE_OPROJ` (default ON; set "0" to disable).
 /// Fuses the per-head softplus gate product into the native group-32 affine
 /// INT8 o_proj GEMV so the decode attention tail is one dispatch instead of
@@ -3916,9 +3976,14 @@ func lagunaGatedAffineOProj(
     codes: MLXArray,
     scales: MLXArray,
     biases: MLXArray,
-    heads: Int
+    heads: Int,
+    rows1: Bool = lagunaGatedAffineOProjRows1Enabled
 ) -> MLXArray? {
-    guard let kernel = lagunaGatedAffineOProjKernels[heads] else { return nil }
+    let kernels =
+        rows1
+        ? lagunaGatedAffineOProjRows1Kernels
+        : lagunaGatedAffineOProjKernels
+    guard let kernel = kernels[heads] else { return nil }
     let inVec = heads * LagunaConstants.headDim
     let outVec = LagunaConstants.hiddenSize
     guard attentionOutput.dtype == .bfloat16,
@@ -3935,10 +4000,13 @@ func lagunaGatedAffineOProj(
         return nil
     }
 
-    lagunaTrace("gated affine oproj qmv h\(heads)")
+    // Rows per threadgroup: `num_simdgroups (2) * results_per_simdgroup`.
+    // Stock keeps four rows per SIMD group (8); R1 keeps one (2).
+    let rowsPerGroup = rows1 ? 2 : 8
+    lagunaTrace("gated affine oproj qmv h\(heads)\(rows1 ? " rows1" : "")")
     return kernel(
         [attentionOutput, gateLogits, codes, scales, biases],
-        grid: ((outVec / 8) * 64, 1, 1),
+        grid: ((outVec / rowsPerGroup) * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[1, 1, outVec]],
         outputDTypes: [.bfloat16]
