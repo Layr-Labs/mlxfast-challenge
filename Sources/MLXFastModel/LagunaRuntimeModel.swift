@@ -324,6 +324,9 @@ let lagunaSwiGLUQMVRows1Enabled =
 let lagunaSharedSwiGLUQMVRows1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_QMV_R1"] != "0"
 
+let lagunaSharedSwiGLUQMVCotiledEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_QMV_COTILED"] != "0"
+
 /// Folds the per-head softplus gate into the output projection's GEMV (see
 /// `lagunaGatedOutputProjectionSource`), with one kernel variant per attention
 /// family. Set `DARKBLOOM_FUSED_GATED_OUTPUT=0` to ablate.
@@ -6213,88 +6216,12 @@ let lagunaNvfp4NibbleSplit: Int = {
 let lagunaNvfp4ScaleCarry: Bool =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_CARRY"] != "0"
 
-/// `DARKBLOOM_NVFP4_QDOT_SEED_ELIDE` (default on; set "0" to restore the
-/// `float accum = 0.0f;` seed): removes the one dead FP add per 16-value NVFP4
-/// group. `laguna_nvfp4_qdot_codes_16` seeds its accumulator with the literal
-/// `+0.0f` and then performs four `accum +=`, so the very first of those four
-/// is `fl(+0.0f + t)`. **`fadd float 0.0, %t` is NOT foldable to `%t`** —
-/// `0.0f + (-0.0f)` is `+0.0f`, not `-0.0f`, so eliminating it needs the
-/// no-signed-zeros flag, and `device.cpp:631` sets
-/// `setFastMathEnabled(false)`. The add really is emitted, once per group, and
-/// with ~69 M groups per decoded token across the nine routed/shared
-/// SwiGLU-QMV and down kernels that is ~69 M dead FP adds per token, ~1.4% of
-/// this loop's ALU.
-///
-/// **Bit-exactness is a closed case analysis over signed zero, not a
-/// tolerance.** Write the four partial sums `t0..t3` (`t0` is the first
-/// four-term group of packed word `codes.x`). Current: `a = (((+0 + t0) + t1)
-/// + t2) + t3`. Elided: `a' = ((t0 + t1) + t2) + t3`.
-///
-///  1. If `t0 != -0.0` then `+0.0 + t0 == t0` bit-for-bit (IEEE 754 round-to-
-///     nearest: `+0` is the additive identity for every operand except `-0`),
-///     so `a' == a` and nothing downstream can differ.
-///  2. If `t0 == -0.0` then the current form holds `+0.0` and the elided form
-///     `-0.0`. Both are zeros, so each subsequent add either lands on the same
-///     nonzero value (`±0 + x == x`) or keeps both operands zero. `a` and `a'`
-///     can therefore differ ONLY as `+0.0` versus `-0.0`, and only when all
-///     sixteen products of the group are `-0.0` (a sum of floats is `-0.0`
-///     only if both addends are `-0.0`).
-///  3. `scale` is always finite — `laguna_nvfp4_scale` builds its half from
-///     `(bits & 127) << 7`, whose largest magnitude is 1.875h, so no E4M3 byte
-///     can make it Inf/NaN — hence `scale * (±0.0) == ±0.0` and `qdot`'s
-///     return differs at most in the sign of a zero.
-///  4. Every call site absorbs that sign. The SwiGLU kernels accumulate into
-///     `gate_result`/`up_result`, seeded `+0.0f`: `+0.0 + (-0.0) == +0.0`, and
-///     once the accumulator is nonzero a `±0.0` addend leaves it unchanged, so
-///     a `-0.0` row accumulator is unreachable in either form. The down
-///     kernels assign `result[row]`, `simd_sum` it (again `+0 + -0 == +0`
-///     unless all 32 lanes are `-0.0`), cast to BF16, and then reach the
-///     output only through `routed + shared` / `product + routed_total` /
-///     `residual + r2`, whose left operands are themselves `+0.0`-seeded
-///     accumulations or the residual — so the `-0.0` is absorbed there too.
-///
-/// `LagunaNVFP4QdotSeedTests` executes 1-4 over the adversarial signed-zero
-/// domain on the CPU, including groups whose every NVFP4 code is `-0.0`
-/// (code 8) and every activation `+0.0`.
-///
-/// The two packed-word bodies are emitted textually in BOTH arms of the flag,
-/// so the flag isolates the seed and nothing else. That costs no arithmetic:
-/// the Metal compiler must already fully unroll the two-iteration `j` loop —
-/// `input` is a `thread float[16]` that only stays in registers under constant
-/// indices — so the unrolled text is what it was already compiling.
+/// NVFP4 qdot seed-elision switch; set to 0 for the seeded control.
 let lagunaNvfp4QdotSeedElisionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_QDOT_SEED_ELIDE"] != "0"
 
-/// `DARKBLOOM_NVFP4_SCALE_DEFER` (default ON; set "0" to restore): moves
-/// the `2^22` that `DARKBLOOM_NVFP4_SCALE_FOLD` parked in
-/// `laguna_nvfp4_scale` out of the per-group scale and onto the per-row
-/// accumulator, one multiply per output row instead of one per 16-value
-/// group. `laguna_nvfp4_scale` drops from five ops to four (and, add, shift,
-/// convert) and the group cost falls by one FP multiply -- the same ~69 M
-/// removals per decoded token as the seed elision above.
+/// Defers the folded power-of-two scale to the row epilogue; set to 0 to restore.
 ///
-/// Off by default **on purpose**. Unlike the seed elision, the carry sign-fold
-/// and the nibble split, this one is not exact by case analysis: it is exact
-/// under a range condition. Multiplying by an exact power of two is exact and
-/// commutes with rounding, so with `s' = scale * 2^-22` every group product
-/// `fl(s' * accum)` is exactly `2^-22 * fl(scale * accum)`, every partial sum
-/// of those products is exactly `2^-22` times the current one, and the single
-/// epilogue multiply restores it before the one BF16 rounding -- **provided no
-/// product lands in the FP32 subnormal range**, where scaling no longer
-/// commutes with rounding.
-///
-/// The condition, stated exactly: the deferred form diverges only if some
-/// group has `0 < |scale * accum| < 2^-104`. `s'` is at least `2^-17` (the
-/// smallest nonzero E4M3 byte, `2^-9`, over 256), so that needs
-/// `|accum| < 2^-109`; every NVFP4 weight is a multiple of `2^-15` and every
-/// activation is BF16, so a nonzero `accum` below `2^-109` needs all sixteen
-/// activations of the group below roughly `2^-99`. This model cannot produce
-/// them: activations are BF16 roundings of `O(1)` residual-stream and RMSNorm
-/// quantities, and cancellation in BF16 lands on that same coarse grid, so a
-/// hidden value is either exactly zero (which contributes an exact zero and is
-/// safe) or within a few tens of binades of the row's scale. The margin is
-/// ~60 binades — promoted to the shipped default on that basis; the
-/// exact-token gates fail loudly if the range assumption is ever violated.
 let lagunaNvfp4ScaleDeferEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_DEFER"] != "0"
     && lagunaNvfp4ScaleFoldEnabled
@@ -6587,10 +6514,83 @@ private let lagunaSharedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+private let lagunaSharedSwiGLUQMVCotiledRows1Kernel = MLXFast.metalKernel(
+    name: "laguna_shared_nvfp4_swiglu_qmv_cotiled_rows1_bf16_v1",
+    inputNames: ["input", "cotiled_weight", "cotiled_scales"],
+    outputNames: ["activated"],
+    source: """
+        constexpr uint input_width = 2048;
+        constexpr uint output_width = 512;
+        constexpr uint block_width = 512;
+        constexpr uint blocks = input_width / block_width;
+        constexpr uint values_per_lane = 16;
+        constexpr uint simd_size = 32;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint row = tile * 2 + simd_group;
+
+        const device uint4* code_pairs =
+            (const device uint4*)cotiled_weight;
+        const device uchar2* scale_pairs =
+            (const device uchar2*)cotiled_scales;
+
+        thread float gate_result = 0.0f;
+        thread float up_result = 0.0f;
+        thread float input_values[values_per_lane];
+
+        for (uint block = 0; block < input_width; block += block_width) {
+            const device vec<bfloat, 4>* input_vectors =
+                (const device vec<bfloat, 4>*) (
+                    input + block + lane * values_per_lane);
+            for (uint i = 0; i < values_per_lane / 4; ++i) {
+                const vec<bfloat, 4> values = input_vectors[i];
+                input_values[4 * i] = values[0];
+                input_values[4 * i + 1] = values[1];
+                input_values[4 * i + 2] = values[2];
+                input_values[4 * i + 3] = values[3];
+            }
+
+            uint block_index = block / block_width;
+            size_t pair_index =
+                (size_t(row) * blocks + block_index) * simd_size + lane;
+            const uint4 codes = code_pairs[pair_index];
+            const uchar2 scale_bits = scale_pairs[pair_index];
+
+            gate_result += laguna_nvfp4_qdot_codes_16(
+                codes.xy,
+                input_values,
+                laguna_nvfp4_scale(scale_bits.x));
+            up_result += laguna_nvfp4_qdot_codes_16(
+                codes.zw,
+                input_values,
+                laguna_nvfp4_scale(scale_bits.y));
+        }
+
+        gate_result = simd_sum(gate_result);
+        up_result = simd_sum(up_result);
+        if (lane == 0) {
+            bfloat gate = bfloat(gate_result\(lagunaNvfp4RowScaleSuffix));
+            bfloat up = bfloat(up_result\(lagunaNvfp4RowScaleSuffix));
+            bfloat exp_abs = metal::exp(metal::abs(gate));
+            bfloat denominator = bfloat(1) + exp_abs;
+            bfloat y = bfloat(1) / denominator;
+            bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+            bfloat silu = bfloat(gate * sigmoid);
+            activated[row] = bfloat(silu * up);
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
 func lagunaSharedSwiGLUQMV(
     _ input: MLXArray,
     fusedWeight: MLXArray,
-    fusedScales: MLXArray
+    fusedScales: MLXArray,
+    cotiledWeight: MLXArray? = nil,
+    cotiledScales: MLXArray? = nil
 ) -> MLXArray {
     precondition(input.dtype == .bfloat16)
     precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
@@ -6606,6 +6606,29 @@ func lagunaSharedSwiGLUQMV(
             2 * LagunaConstants.sharedExpertIntermediateSize,
             LagunaConstants.hiddenSize / 16,
         ])
+
+    if lagunaSharedSwiGLUQMVCotiledEnabled,
+        lagunaSharedSwiGLUQMVRows1Enabled,
+        let cotiledWeight,
+        let cotiledScales,
+        cotiledWeight.dtype == .uint32,
+        cotiledWeight.shape == [
+            LagunaConstants.sharedExpertIntermediateSize, 4, 32, 4,
+        ],
+        cotiledScales.dtype == .uint8,
+        cotiledScales.shape == [
+            LagunaConstants.sharedExpertIntermediateSize, 4, 32, 2,
+        ]
+    {
+        lagunaTrace("shared gate/up QMV + SwiGLU (co-tiled R1)")
+        return lagunaSharedSwiGLUQMVCotiledRows1Kernel(
+            [input, cotiledWeight, cotiledScales],
+            grid: (256 * 64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[1, 1, LagunaConstants.sharedExpertIntermediateSize]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
 
     let kernel =
         lagunaSharedSwiGLUQMVRows1Enabled
@@ -8282,6 +8305,9 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     var _fusedGateUpScales: MLXArray?
     var _fusedGateUpSplit: Int = 0
 
+    var _cotiledGateUpWeight: MLXArray?
+    var _cotiledGateUpScales: MLXArray?
+
     /// Retained fused BF16 `[gate; up]` bank for the dense (non-quantized)
     /// layer-0 MLP, built once after checkpoint load when
     /// `DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU` is enabled. Mutually exclusive
@@ -8331,7 +8357,34 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
         _fusedGateUpWeight = fusedWeight
         _fusedGateUpScales = fusedScales
         _fusedGateUpSplit = gate.weight.dim(0)
-        return [fusedWeight, fusedScales]
+
+        var prepared = [fusedWeight, fusedScales]
+        if lagunaSharedSwiGLUQMVCotiledEnabled,
+            gate.weight.shape == [
+                LagunaConstants.sharedExpertIntermediateSize,
+                LagunaConstants.hiddenSize / 8,
+            ],
+            gate.scales.shape == [
+                LagunaConstants.sharedExpertIntermediateSize,
+                LagunaConstants.hiddenSize / 16,
+            ]
+        {
+            let rows = LagunaConstants.sharedExpertIntermediateSize
+            let blocks = 4
+            let lanes = 32
+            let gateWeightBlocks = gate.weight.reshaped([rows, blocks, lanes, 2])
+            let upWeightBlocks = up.weight.reshaped([rows, blocks, lanes, 2])
+            let cotiledWeight = contiguous(
+                concatenated([gateWeightBlocks, upWeightBlocks], axis: 3))
+            let gateScaleBlocks = gate.scales.reshaped([rows, blocks, lanes])
+            let upScaleBlocks = up.scales.reshaped([rows, blocks, lanes])
+            let cotiledScales = contiguous(
+                stacked([gateScaleBlocks, upScaleBlocks], axis: 3))
+            _cotiledGateUpWeight = cotiledWeight
+            _cotiledGateUpScales = cotiledScales
+            prepared.append(contentsOf: [cotiledWeight, cotiledScales])
+        }
+        return prepared
     }
 
     /// Builds and retains the fused BF16 gate/up bank from layer 0's dense
@@ -8395,7 +8448,9 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             ?? lagunaSharedSwiGLUQMV(
                 x,
                 fusedWeight: banks.gateUpWeight,
-                fusedScales: banks.gateUpScales
+                fusedScales: banks.gateUpScales,
+                cotiledWeight: _cotiledGateUpWeight,
+                cotiledScales: _cotiledGateUpScales
             )
         return (activated, banks.downWeight, banks.downScales)
     }
@@ -8538,7 +8593,9 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
                     lagunaSharedSwiGLUQMV(
                         x,
                         fusedWeight: fusedWeight,
-                        fusedScales: fusedScales
+                        fusedScales: fusedScales,
+                        cotiledWeight: _cotiledGateUpWeight,
+                        cotiledScales: _cotiledGateUpScales
                     )
                 )
             }
