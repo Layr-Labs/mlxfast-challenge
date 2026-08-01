@@ -564,6 +564,15 @@ private let lagunaLastPrefillProjectionBanksEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_LAST_PREFILL_PROJECTION_BANKS"] != "0"
 
+/// Terminal sliding-layer prefill twin: the final call consumes only the last
+/// query row but still writes every K/V row. The stock path launches separate
+/// Q/K RMSNorm and Q/K RoPE work; this arm uses one 32-thread dispatch over
+/// 64 Q-head jobs plus `L * 8` K-head jobs. Set the flag to `0` to restore the
+/// four-dispatch path.
+private let lagunaLastPrefillQKNormRoPEEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LAST_PREFILL_QK_NORM_ROPE"] != "0"
+
 /// Full-attention counterpart: fuses per-head Q/K RMSNorm with partial YaRN
 /// RoPE. One stock FP32 probe row carries the authoritative rotary factors,
 /// while the custom kernel preserves the normalized BF16 boundary and tail.
@@ -2476,6 +2485,87 @@ private let lagunaPrefillSlidingQKNormRoPEH1Kernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Terminal sliding-prefill twin with a singleton Q row. One dispatch covers
+/// the 64 final-row Q heads and all L*8 K heads, so it removes the separate
+/// qNorm/kNorm/rope(q)/rope(k) dispatch chain in `callLastPrefillRow` while
+/// retaining the H1 arithmetic and BF16 boundaries verbatim.
+private let lagunaLastPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
+    name: "laguna_last_prefill_sliding_qk_norm_rope_bf16_128_v1",
+    inputNames: [
+        "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
+        "offsets", "lengths",
+    ],
+    outputNames: ["queries", "keys"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint rotary_pairs = 64;
+        constexpr uint query_heads = 64;
+        constexpr uint kv_heads = 8;
+
+        uint job = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+        uint length = uint(lengths);
+        bool is_query = job < query_heads;
+        uint head = is_query ? job : (job - query_heads) % kv_heads;
+        uint t = is_query ? 0 : (job - query_heads) / kv_heads;
+
+        const device bfloat* input;
+        const device bfloat* weight;
+        device bfloat* output;
+        if (is_query) {
+            input = raw_queries + head * head_dim;
+            weight = query_weight;
+            output = queries + head * head_dim;
+        } else {
+            input = raw_keys + (t * kv_heads + head) * head_dim;
+            weight = key_weight;
+            output = keys + (head * length + t) * head_dim;
+        }
+
+        uint base = lane * 4;
+        thread bfloat normalized[4];
+        float sum = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            float value = float(input[base + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            normalized[i] =
+                weight[base + i] *
+                bfloat(float(input[base + i]) * inverse_rms);
+        }
+
+        thread float paired[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
+        }
+
+        uint position = uint(offsets[0]) + (is_query ? (length - 1) : t);
+        const device float* angle_row =
+            angles + position * (2 * rotary_pairs);
+        if (lane < 16) {
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+                uint pair = base + i;
+                float first = float(normalized[i]);
+                float second = paired[i];
+                float cosine = angle_row[pair];
+                float sine = angle_row[pair + rotary_pairs];
+                output[pair] = bfloat(first * cosine - second * sine);
+                output[pair + rotary_pairs] =
+                    bfloat(first * sine + second * cosine);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 /// Multi-token full-attention twin: per-head Q/K RMSNorm + partial YaRN
 /// RoPE (rotary half 64, mscale on the rotary inputs, tail passes through).
 /// One dispatch replaces the stock six (`rms_single_row` ×2, the general
@@ -2712,6 +2802,46 @@ private func lagunaPrefillSlidingQKNormRoPE(
         ],
         outputDTypes: [.bfloat16, .bfloat16]
     )
+    return (outputs[0], outputs[1])
+}
+
+private func lagunaLastPrefillSlidingQKNormRoPE(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray,
+    offsets: MLXArray,
+    length: Int
+) -> (MLXArray, MLXArray)? {
+    let heads = LagunaConstants.slidingAttentionHeads
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    guard length > 1,
+        rawQueries.dtype == .bfloat16,
+        rawKeys.dtype == .bfloat16,
+        queryWeight.dtype == .bfloat16,
+        keyWeight.dtype == .bfloat16,
+        rawQueries.shape == [1, 1, heads * LagunaConstants.headDim],
+        rawKeys.shape == [1, length, kvHeads * LagunaConstants.headDim],
+        queryWeight.shape == [LagunaConstants.headDim],
+        keyWeight.shape == [LagunaConstants.headDim],
+        angles.dtype == .float32,
+        angles.shape == [1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim],
+        offsets.dtype == .int32 && offsets.size == 1
+    else {
+        return nil
+    }
+    let outputs = lagunaLastPrefillSlidingQKNormRoPEKernel(
+        [rawQueries, rawKeys, queryWeight, keyWeight, angles, offsets, Int32(length)],
+        grid: ((heads + kvHeads * length) * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [
+            [1, heads, 1, LagunaConstants.headDim],
+            [1, kvHeads, length, LagunaConstants.headDim],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    lagunaTrace("last prefill sliding qk norm+rope")
     return (outputs[0], outputs[1])
 }
 
@@ -5820,7 +5950,12 @@ final class LagunaRuntimeAttention: Module {
     /// gate/projection run only for the last query; its RoPE offset is advanced
     /// by the discarded query-row count so it remains at the supplied
     /// sequence's final absolute position.
-    func callLastPrefillRow(_ x: MLXArray, cache: KVCache?) -> MLXArray {
+    func callLastPrefillRow(
+        _ x: MLXArray,
+        cache: KVCache?,
+        qkRoPEAngles: MLXArray? = nil,
+        qkRoPEOffsets: MLXArray? = nil
+    ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
         precondition(L > 1)
 
@@ -5860,16 +5995,47 @@ final class LagunaRuntimeAttention: Module {
             bankedGate = nil
         }
 
-        queries = qNorm(queries.reshaped(B, 1, nHeads, headDim)).transposed(0, 2, 1, 3)
-        keys = kNorm(keys.reshaped(B, L, nKVHeads, headDim)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
 
-        if let offsetArray = graphOffsetArray(for: cache) {
-            queries = rope(queries, offset: offsetArray + Int32(L - 1))
+        let fusedLastQK: (MLXArray, MLXArray)? = {
+            guard lagunaLastPrefillQKNormRoPEEnabled,
+                B == 1,
+                isSliding,
+                nHeads == LagunaConstants.slidingAttentionHeads,
+                nKVHeads == LagunaConstants.numKeyValueHeads,
+                headDim == LagunaConstants.headDim,
+                queries.dtype == .bfloat16,
+                keys.dtype == .bfloat16,
+                qNorm.weight.dtype == .bfloat16,
+                kNorm.weight.dtype == .bfloat16,
+                queries.shape == [1, 1, nHeads * headDim],
+                keys.shape == [1, L, nKVHeads * headDim],
+                let angles = qkRoPEAngles,
+                let offsets = qkRoPEOffsets
+            else {
+                return nil
+            }
+            return lagunaLastPrefillSlidingQKNormRoPE(
+                rawQueries: queries,
+                rawKeys: keys,
+                queryWeight: qNorm.weight,
+                keyWeight: kNorm.weight,
+                angles: angles,
+                offsets: offsets,
+                length: L)
+        }()
+        if let fusedLastQK {
+            (queries, keys) = fusedLastQK
         } else {
-            queries = rope(queries, offset: (cache?.offset ?? 0) + L - 1)
+            queries = qNorm(queries.reshaped(B, 1, nHeads, headDim)).transposed(0, 2, 1, 3)
+            keys = kNorm(keys.reshaped(B, L, nKVHeads, headDim)).transposed(0, 2, 1, 3)
+            if let offsetArray = graphOffsetArray(for: cache) {
+                queries = rope(queries, offset: offsetArray + Int32(L - 1))
+            } else {
+                queries = rope(queries, offset: (cache?.offset ?? 0) + L - 1)
+            }
+            keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
         let attended = attentionWithCacheUpdate(
             queries: queries,
@@ -10414,9 +10580,19 @@ final class LagunaRuntimeDecoderLayer: Module {
     /// Final-layer prefill specialization. Every supplied row still produces
     /// and commits its K/V state, but only the last query/output row proceeds
     /// through attention output projection and the terminal MLP.
-    func callLastPrefillRow(_ x: MLXArray, cache: KVCache?) -> MLXArray {
+    func callLastPrefillRow(
+        _ x: MLXArray,
+        cache: KVCache?,
+        qkRoPEAngles: MLXArray? = nil,
+        qkRoPEOffsets: MLXArray? = nil
+    ) -> MLXArray {
         let normalized = inputLayerNorm(x)
-        let r = selfAttn.callLastPrefillRow(normalized, cache: cache)
+        let r = selfAttn.callLastPrefillRow(
+            normalized,
+            cache: cache,
+            qkRoPEAngles: qkRoPEAngles,
+            qkRoPEOffsets: qkRoPEOffsets
+        )
         let h = lagunaLastTokenHidden(x) + r
         let r2 = mlp(postAttentionLayerNorm(h))
         return h + r2
@@ -10777,7 +10953,12 @@ final class LagunaRuntimeModelInner: Module {
             let qkRoPEAngles = isFull ? fullRoPEAngles : slidingRoPEAngles
             if i == layers.count - 1, h.dim(1) > 1 {
                 if case .causal = mask {
-                    h = layer.callLastPrefillRow(h, cache: cache?[i])
+                    h = layer.callLastPrefillRow(
+                        h,
+                        cache: cache?[i],
+                        qkRoPEAngles: qkRoPEAngles,
+                        qkRoPEOffsets: qkRoPEOffsets
+                    )
                 } else {
                     h = layer(
                         h,
