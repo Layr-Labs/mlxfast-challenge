@@ -457,6 +457,15 @@ public final class LagunaRuntimeWeightCache {
         if libraryModel != nil, config.numHiddenLayers >= 16 {
             Self.wireResidentWeightsIfEnabled()
         }
+        // The worker's phase-start `Memory.clearCache()` is charged inside the
+        // measured window, at a cost set by the free buffers init leaves. The
+        // only post-warmup clear sits behind a wiring flag and a 96 GiB guard,
+        // so declining either frees warmup transients on the scored path.
+        // Clearing here makes that reset free by construction. Frees nothing
+        // the scored path needs: live weights and KV state are active memory.
+        if ProcessInfo.processInfo.environment["DARKBLOOM_INIT_CLEAR_CACHE"] != "0" {
+            Memory.clearCache()
+        }
     }
 
     /// One prefill-shaped forward (512 tokens) and one single-token decode
@@ -485,6 +494,17 @@ public final class LagunaRuntimeWeightCache {
         if lagunaFusedFullAttentionEnabled {
             warmDecodeLogits = model(decodeToken, cache: warmupCache)
             eval(warmDecodeLogits)
+        }
+        // One step leaves steps 1-2 cold: the standard cache's
+        // `fusedAppendPrepare` engages only after the stock growth concat, so
+        // its one-time `contiguous(currentKeys)` first runs on the SECOND
+        // scored step and compiles inside the measured window. Constant BOS
+        // input, output discarded. "0" restores the one-step warmup.
+        if ProcessInfo.processInfo.environment["DARKBLOOM_WARM_DECODE_STEPS"] != "0" {
+            for _ in 0 ..< 2 {
+                warmDecodeLogits = model(decodeToken, cache: warmupCache)
+                eval(warmDecodeLogits)
+            }
         }
         // Warm the greedy-token pipeline too. Every scored worker request ends
         // in `LagunaCorrectness.greedyToken` (reshape -> last row -> argMax),
