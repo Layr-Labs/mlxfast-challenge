@@ -278,6 +278,15 @@ let lagunaFusedResidualRMSNormEnabled =
 let lagunaPrefillFusedResidualRMSNormEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_RESIDUAL_RMS"] != "0"
 
+/// Terminal-row prefill counterpart of the ordinary single-token residual /
+/// RMSNorm / router and residual-aware MoE paths. The final prefill layer
+/// intentionally computes only the last query row, so its MLP has the same
+/// `[1, 1, hidden]` shape as decode. Set to "0" for a same-binary control
+/// that restores the old standalone post-attention norm, MLP, and residual
+/// add sequence.
+private let lagunaTerminalPrefillFusionEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_TERMINAL_PREFILL_FUSION"] != "0"
+
 /// Issues the routed and shared gate/up NVFP4 QMVs as one nine-slot dispatch
 /// (see `lagunaRoutedSharedSwiGLUQMVKernel`). Set
 /// `DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV=1` to restore the merge.
@@ -5878,6 +5887,24 @@ final class LagunaRuntimeAttention: Module {
 
         if gatingEnabled, let gProj {
             let projectedGate = bankedGate ?? gProj(lastInput)
+            // The terminal query is a singleton row, so it satisfies the same
+            // decode gate-product shape as the ordinary attention path. Keep
+            // the validated softplus/product kernel here as well; if its
+            // dtype or hardware guard declines, the original scalar gate
+            // chain below remains unchanged.
+            if lagunaFusedGatedOutputProjectionEnabled,
+                gatePerHead,
+                output.dtype == .bfloat16,
+                projectedGate.dtype == output.dtype,
+                output.shape == [1, 1, nHeads * headDim],
+                projectedGate.shape == [1, 1, nHeads],
+                let gated = lagunaGateProductSoftplus(
+                    attentionOutput: output,
+                    gateLogits: projectedGate,
+                    heads: nHeads)
+            {
+                return wo(gated)
+            }
             let gate =
                 gatePerHead && projectedGate.dtype == output.dtype
                 ? lagunaCompiledSoftplusGate(projectedGate)
@@ -10332,8 +10359,79 @@ final class LagunaRuntimeDecoderLayer: Module {
     func callLastPrefillRow(_ x: MLXArray, cache: KVCache?) -> MLXArray {
         let normalized = inputLayerNorm(x)
         let r = selfAttn.callLastPrefillRow(normalized, cache: cache)
-        let h = lagunaLastTokenHidden(x) + r
-        let r2 = mlp(postAttentionLayerNorm(h))
+        // The terminal-row path has the same single-row shape as decode, but
+        // historically bypassed the normal residual/RMSNorm/router fusion
+        // and the residual-aware MoE tail below. Reuse those existing exact
+        // paths here: `lastResidual + r` is the same h that the stock add
+        // would produce, and the fused helper is row-local (it never reads
+        // discarded query rows). Keep the post-attention values explicit so
+        // the exact stock fallback remains one `postAttentionLayerNorm` plus
+        // one MLP and one residual add.
+        let lastResidual = lagunaLastTokenHidden(x)
+        var h = lastResidual + r
+        if !lagunaTerminalPrefillFusionEnabled {
+            let normalized = postAttentionLayerNorm(h)
+            return h + mlp(normalized)
+        }
+        let normalizedAfterAttention: MLXArray
+        var routerLogits: MLXArray?
+        if lagunaFusedResidualRMSNormRouterEnabled,
+            r.dtype == .bfloat16,
+            postAttentionLayerNorm.weight.dtype == .bfloat16,
+            lastResidual.dtype == .bfloat16,
+            lastResidual.shape == [1, 1, LagunaConstants.hiddenSize],
+            r.shape == lastResidual.shape,
+            let sparse = mlp as? LagunaRuntimeSparseMoEBlock,
+            sparse.gate.weight.dtype == .bfloat16,
+            sparse.gate.weight.shape == [
+                LagunaConstants.numExperts, LagunaConstants.hiddenSize,
+            ]
+        {
+            let fused = lagunaResidualRMSNormRouter(
+                residual: lastResidual,
+                branch: r,
+                weight: postAttentionLayerNorm.weight,
+                routerWeight: sparse.gate.weight)
+            h = fused.summed
+            normalizedAfterAttention = fused.normalized
+            routerLogits = fused.routerLogits
+        } else if lagunaFusedResidualRMSNormEnabled,
+            r.dtype == .bfloat16,
+            postAttentionLayerNorm.weight.dtype == .bfloat16,
+            lastResidual.dtype == .bfloat16,
+            lastResidual.shape == [1, 1, LagunaConstants.hiddenSize],
+            r.shape == lastResidual.shape
+        {
+            lagunaTrace("terminal prefill residual+rmsnorm")
+            let (summed, normed) = lagunaResidualRMSNorm(
+                residual: lastResidual,
+                branch: r,
+                weight: postAttentionLayerNorm.weight)
+            h = summed
+            normalizedAfterAttention = normed
+            routerLogits = nil
+        } else {
+            normalizedAfterAttention = postAttentionLayerNorm(h)
+            routerLogits = nil
+        }
+
+        if let sparse = mlp as? LagunaRuntimeSparseMoEBlock {
+            // This is the same residual-aware single-token call used by the
+            // ordinary decoder path. It may select the validated fused
+            // routed/shared down-residual kernel, while declining to the
+            // exact stock `h + mlp(normalized)` sequence when guards are off.
+            return sparse(
+                normalizedAfterAttention,
+                residual: h,
+                routerLogits: routerLogits)
+        }
+        if let dense = mlp as? LagunaRuntimeMLP,
+            let fused = dense.fusedDenseDownResidual(
+                normalizedAfterAttention, residual: h)
+        {
+            return fused
+        }
+        let r2 = mlp(normalizedAfterAttention)
         return h + r2
     }
 }
