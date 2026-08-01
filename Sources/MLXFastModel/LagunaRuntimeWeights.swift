@@ -473,7 +473,20 @@ public final class LagunaRuntimeWeightCache {
         )
         eval(model(prefillTokens, cache: warmupCache))
         let decodeToken = MLXArray([bosToken], [1, 1])
-        let warmDecodeLogits = model(decodeToken, cache: warmupCache)
+        var warmDecodeLogits = model(decodeToken, cache: warmupCache)
+        eval(warmDecodeLogits)
+        // Second warmup decode step: the fused full-attention decode kernel
+        // only engages once the KVCacheSimple backing has spare capacity —
+        // i.e. from the SECOND single-token step (the first step performs the
+        // stock growth concat). One warmup step therefore never dispatched
+        // it, and its JIT compile (~60 ms, MTLCompilerService) landed inside
+        // the timed decode window on sandboxed workers, which cannot reuse
+        // the on-disk shader cache across processes; a per-step telemetry
+        // read showed the compile spread across scored steps 2-7 while
+        // unsandboxed runs (warm disk cache) never reproduced it. The extra
+        // step also exercises the sliding fused kernel's steady wrap slot
+        // for good measure. Input-independent (constant BOS), untimed init.
+        warmDecodeLogits = model(decodeToken, cache: warmupCache)
         eval(warmDecodeLogits)
         // Warm the greedy-token pipeline too. Every scored worker request ends
         // in `LagunaCorrectness.greedyToken` (reshape -> last row -> argMax),

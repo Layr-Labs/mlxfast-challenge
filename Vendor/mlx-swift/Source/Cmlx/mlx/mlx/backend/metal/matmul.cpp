@@ -79,19 +79,6 @@ ensure_batch_contiguous(const array& x, metal::Device& d, const Stream& s) {
   return std::make_tuple(false, x_copy.strides()[x_copy.ndim() - 2], x_copy);
 }
 
-// Prefill split-K threadgroup regrouping. This preserves BK=512, the
-// 4096-element partition size, the partition count, and SM=SN=32 while
-// changing 128x128/WM4xWN4 threadgroups to 64x64/WM2xWN2. Each output keeps
-// the same k-ascending in-register MMA chain; only threadgroup ownership
-// changes. Set DARKBLOOM_STEEL_PREFILL_TILE=0 for the accepted geometry.
-static bool darkbloom_steel_prefill_tile() {
-  static bool enabled = []() {
-    const char* value = getenv("DARKBLOOM_STEEL_PREFILL_TILE");
-    return value == nullptr || atoi(value) != 0;
-  }();
-  return enabled;
-}
-
 } // namespace
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -695,10 +682,6 @@ void steel_gemm_splitk_axpby_nax(
   if ((M + N) / 2 < 512 || K <= 4096) {
     bm = bn = 64;
     bk = 256;
-    wm = wn = 2;
-  }
-  if (darkbloom_steel_prefill_tile() && (M + N) / 2 >= 512 && K > 4096) {
-    bm = bn = 64;
     wm = wn = 2;
   }
   if (K <= 1024) {
