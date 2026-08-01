@@ -1804,7 +1804,8 @@ func lagunaSlidingFusedAttention(
     )[0]
 }
 
-/// `DARKBLOOM_FUSED_FULL_ATTN` (default off; set "1" to enable): decode
+/// `DARKBLOOM_FUSED_FULL_ATTN` (default on; set "0" for the stock control):
+/// decode
 /// fused attention for the ten full-attention layers once the cache backing
 /// has spare capacity (from the second decode step on; the first step's
 /// stock growth concat is kept). Same design as the sliding twin above —
@@ -1813,8 +1814,16 @@ func lagunaSlidingFusedAttention(
 /// (textual replica of `laguna_full_qk_norm_yarn_bf16_128_v4`: 64-dim
 /// partial rotary, folded mscale roundings, passthrough tail) and the
 /// pair path's runtime-length loop + single-row tail at gqa_factor 6.
+///
+/// Held off until now because the gate had a second consumer in
+/// `warmLibraryModel`: it also enabled an extra whole-model 40-layer decode
+/// forward whose only purpose was reaching this kernel's JIT compile. That
+/// forward, not this kernel, is what regressed ranked prefill — the fused
+/// branch cannot execute during a 512-token prefill. The warmup is now
+/// `lagunaWarmFullFusedAttention()`, one direct dispatch, so the hot path
+/// and the compile are no longer coupled.
 let lagunaFusedFullAttentionEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_ATTN"] == "1"
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_ATTN"] != "0"
 
 private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
     name: "laguna_full_fused_attn_grow_v1",
@@ -2276,6 +2285,43 @@ func lagunaFullFusedAttention(
         outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
         outputDTypes: [.bfloat16]
     )[0]
+}
+
+/// Compiles `laguna_full_fused_attn_grow_v1` at init with one direct
+/// dispatch on input-independent two-row caches, replacing the whole-model
+/// warmup forward the fusion gate used to trigger.
+///
+/// This reaches the production pipeline, verified against the vendored MLX
+/// rather than assumed: `backend/common/metal_kernel.cpp` derives a custom
+/// kernel's generated name and source from the declared name, template
+/// arguments, input/output dtypes, scalar-vs-array status, and whether an
+/// input under eight elements takes the constant address space; array
+/// shapes/strides/ndim enter only if the Metal body references their
+/// generated metadata, and this body references none.
+/// `backend/metal/custom_kernel.cpp` keys the library and pipeline cache on
+/// that name and source, so grid and dynamic extents are not specialization
+/// keys. Here every dtype matches production, `params` (3) and `scale` (1)
+/// stay constant-address, and the two-row caches stay device inputs.
+///
+/// Input-independent kernel-cache warmup only: constant arrays, no decoder
+/// layer, no prompt, no request or model-cache state, output discarded.
+func lagunaWarmFullFusedAttention() {
+    let heads = LagunaConstants.fullAttentionHeads
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    let dim = LagunaConstants.headDim
+    let attended = lagunaFullFusedAttention(
+        rawQueries: MLXArray.ones([1, 1, heads * dim], dtype: .bfloat16),
+        rawKeys: MLXArray.ones([1, 1, kvHeads * dim], dtype: .bfloat16),
+        rawValues: MLXArray.ones([1, 1, kvHeads * dim], dtype: .bfloat16),
+        queryWeight: MLXArray.ones([dim], dtype: .bfloat16),
+        keyWeight: MLXArray.ones([dim], dtype: .bfloat16),
+        angles: MLXArray.zeros([1, 1, 1, dim / 2], dtype: .float32),
+        cacheKeys: MLXArray.zeros([1, kvHeads, 2, dim], dtype: .bfloat16),
+        cacheValues: MLXArray.zeros([1, kvHeads, 2, dim], dtype: .bfloat16),
+        writeIdx: 0,
+        scale: MLXArray([Float(1)])
+    )
+    eval(attended)
 }
 
 /// Multi-token sliding-layer Q/K RMSNorm + plain RoPE fusion. One dispatch
