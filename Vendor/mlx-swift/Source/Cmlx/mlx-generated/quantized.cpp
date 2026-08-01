@@ -294,8 +294,37 @@ inline U qdot(
   }
 
   else if (bits == 8) {
-    for (int i = 0; i < values_per_thread; i++) {
-      accum += x_thread[i] * w[i];
+    if constexpr (values_per_thread == 8) {
+      // Two 32-bit word loads instead of eight single-byte loads. The
+      // pointer is 4-byte aligned at every bits==8 call site that reaches
+      // this specialization: qmv_fast_impl offsets each lane by
+      // simd_lid * packs_per_thread * bytes_per_pack = 8 * simd_lid bytes,
+      // every row stride is in_vec_size_w = in_vec_size bytes and the host
+      // only dispatches qmv_fast when K % 512 == 0, and batch offsets are
+      // whole uint32 strides. Apple GPUs are little-endian, so word lane j
+      // holds bytes w[4j..4j+3] in ascending order and each extracted byte
+      // equals the w[i] it replaces: U((w_lo >> (8*i)) & 0xff) == U(w[i])
+      // for i in [0,4), likewise w_hi for [4,8). The accumulation order
+      // and expression tree are unchanged: x_thread[i] * <byte i> in
+      // ascending i, one accum += per term, then scale * accum + sum *
+      // bias below. Scope: bits == 8 with values_per_thread == 8 only
+      // (qmv_fast); every other arm of this template and the
+      // values_per_thread == 4 (qmv_impl) / 16, 32 (qmv_quad_impl)
+      // instantiations of this arm keep the original byte loop verbatim.
+      const uint32_t w_lo = ((const device uint32_t*)w)[0];
+      const uint32_t w_hi = ((const device uint32_t*)w)[1];
+      accum += x_thread[0] * U(w_lo & 0xff);
+      accum += x_thread[1] * U((w_lo >> 8) & 0xff);
+      accum += x_thread[2] * U((w_lo >> 16) & 0xff);
+      accum += x_thread[3] * U((w_lo >> 24) & 0xff);
+      accum += x_thread[4] * U(w_hi & 0xff);
+      accum += x_thread[5] * U((w_hi >> 8) & 0xff);
+      accum += x_thread[6] * U((w_hi >> 16) & 0xff);
+      accum += x_thread[7] * U((w_hi >> 24) & 0xff);
+    } else {
+      for (int i = 0; i < values_per_thread; i++) {
+        accum += x_thread[i] * w[i];
+      }
     }
   }
 
