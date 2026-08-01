@@ -2820,6 +2820,127 @@ func lagunaGateProductSoftplus(
     )[0]
 }
 
+// MARK: - Prefill token-major gate product softplus (one dispatch)
+
+/// Prefill (multi-token) counterpart of `lagunaGateProductSoftplusSource` over
+/// the **token-major** attention row. After the stock
+/// `attended.transposed(0, 2, 1, 3).reshaped(B, L, -1)` the prefill gate tail
+/// is two dispatches:
+///
+///  1. `lagunaCompiledSoftplusGate(projectedGate)` — FP32 softplus + BF16
+///     round over `[B, L, H]`;
+///  2. broadcast product against the token-major `[B, L, H*D]` attention row.
+///
+/// This kernel does both in ONE dispatch. It deliberately does **not** absorb
+/// the transpose: a prior 3→1 epilogue that also folded head-major→token-major
+/// address remapping failed official transfer (7c2f810 −3.46%). Keeping MLX's
+/// stock transpose and fusing only the elementwise softplus+product matches
+/// the decode gate-product class that is already promoted and bit-exact.
+///
+/// EXACTNESS. Every output element is independent. The softplus is the same
+/// FP32 `LogAddExp` form with the same NaN/inf guards and BF16 rounding point
+/// as `lagunaGateProductSoftplusSource` / `lagunaCompiledSoftplusGate`. The
+/// product rounds once to BF16 exactly where MLX's BF16 binary multiply
+/// rounds `float(bfloat(float(x) * gate))`. Indexing is pure token-major:
+/// `gated[b, l, h*D + d] = bfloat(float(att[b, l, h*D + d]) * float(gate_bf))`
+/// with `gate_bf = bfloat(softplus_f32(float(logit[b, l, h])))`.
+///
+/// Geometry. Four consecutive elements per thread (`values_per_thread = 4`)
+/// with `head_dim % 4 == 0`, so every thread's four indices live in ONE head
+/// and softplus is thread-uniform: each thread computes it once, not four
+/// times. Elements remain independent — no reassociation across positions —
+/// so the written values match the one-thread-per-element form bit for bit.
+/// Threadgroup size 128 covers 512 elements (four heads) and does not need a
+/// barrier: softplus is not shared across threads.
+private func lagunaPrefillGateProductSoftplusSource(heads: Int) -> String {
+    """
+    constexpr uint head_dim = \(LagunaConstants.headDim);
+    constexpr uint gate_heads = \(heads);
+    constexpr uint row_width = gate_heads * head_dim;
+    constexpr uint values_per_thread = 4;
+
+    uint tid = thread_position_in_grid.x;
+    uint l = threadgroup_position_in_grid.y;
+    uint b = threadgroup_position_in_grid.z;
+    uint length = threadgroups_per_grid.y;
+
+    uint base_e = tid * values_per_thread;
+    uint head = base_e / head_dim;
+    uint row = b * length + l;
+
+    float logit = float(gate_logits[row * gate_heads + head]);
+    float gate;
+    if (metal::isnan(logit)) {
+        gate = NAN;
+    } else {
+        float maxval = metal::max(logit, 0.0f);
+        float minval = metal::min(logit, 0.0f);
+        gate = (metal::isinf(minval) || metal::isinf(maxval))
+            ? maxval
+            : maxval + log1p(metal::exp(minval - maxval));
+    }
+    bfloat gate_bf = bfloat(gate);
+    uint base_idx = row * row_width + base_e;
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < values_per_thread; ++i) {
+        gated[base_idx + i] =
+            bfloat(float(attention_output[base_idx + i]) * float(gate_bf));
+    }
+    """
+}
+
+private let lagunaPrefillGateProductSoftplusKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_prefill_gate_product_softplus_bf16_h\(heads)_v2",
+            inputNames: ["attention_output", "gate_logits"],
+            outputNames: ["gated"],
+            source: lagunaPrefillGateProductSoftplusSource(heads: heads),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+/// Set `DARKBLOOM_PREFILL_GATE_PRODUCT=0` to ablate and restore the stock
+/// two-dispatch prefill softplus + broadcast multiply after the transpose.
+private let lagunaPrefillGateProductEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_GATE_PRODUCT"] != "0"
+
+/// Returns the gated token-major attention output `[B, L, heads*headDim]` for
+/// a multi-token prefill, or nil when preconditions do not hold. Bit-identical
+/// to `compiled softplus + broadcast multiply` on the already-transposed row.
+func lagunaPrefillGateProductSoftplus(
+    attentionOutput: MLXArray, gateLogits: MLXArray, heads: Int
+) -> MLXArray? {
+    guard lagunaPrefillGateProductEnabled,
+        let kernel = lagunaPrefillGateProductSoftplusKernels[heads]
+    else { return nil }
+    let headDim = LagunaConstants.headDim
+    let inVec = heads * headDim
+    precondition(attentionOutput.dtype == .bfloat16)
+    precondition(attentionOutput.ndim == 3)
+    precondition(attentionOutput.dim(2) == inVec)
+    precondition(gateLogits.dtype == .bfloat16)
+    precondition(gateLogits.ndim == 3)
+    precondition(gateLogits.dim(2) == heads)
+    let B = attentionOutput.dim(0)
+    let L = attentionOutput.dim(1)
+    precondition(L > 1)
+    precondition(gateLogits.shape == [B, L, heads])
+    precondition(inVec % 4 == 0)
+
+    lagunaTrace("prefill gate product softplus h\(heads)")
+    return kernel(
+        [attentionOutput, gateLogits],
+        grid: (inVec / 4, L, B),
+        threadGroup: (128, 1, 1),
+        outputShapes: [[B, L, inVec]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 // MARK: - Gated native-affine INT8 output projection (one dispatch)
 
 /// Folds the per-head softplus gate product into the native group-32 affine
@@ -4599,6 +4720,23 @@ final class LagunaRuntimeAttention: Module {
             {
                 return attentionGateProjection(output, projectedGate, wo.weight)
             }
+            // Prefill softplus+product fold: ONE dispatch replaces the
+            // compiled softplus and the broadcast multiply on the already
+            // token-major row (see `lagunaPrefillGateProductSoftplusSource`).
+            // Stock transpose is kept deliberately — the 3→1 epilogue that
+            // also absorbed the layout remap failed official transfer.
+            // Decode (L == 1) keeps the paths above; only multi-token raw
+            // per-head BF16 logits are eligible.
+            if L > 1, !gateIsActivated, gatePerHead,
+                headDim == LagunaConstants.headDim,
+                output.dtype == .bfloat16, projectedGate.dtype == .bfloat16,
+                output.shape == [B, L, nHeads * headDim],
+                projectedGate.shape == [B, L, nHeads],
+                let gated = lagunaPrefillGateProductSoftplus(
+                    attentionOutput: output, gateLogits: projectedGate, heads: nHeads)
+            {
+                return wo(gated)
+            }
             let gate =
                 gateIsActivated
                 ? projectedGate
@@ -4688,6 +4826,71 @@ final class LagunaRuntimeAttention: Module {
 
         if gatingEnabled, let gProj {
             let projectedGate = bankedGate ?? gProj(lastInput)
+            // Last-query prefill is decode-shaped `[B, 1, ·]`. Reuse the same
+            // softplus+product / gated-affine folds the main decode path uses
+            // so the final layer does not fall back to the two/three-dispatch
+            // stock chain while every other layer is already fused.
+            if gatePerHead, B == 1,
+                headDim == LagunaConstants.headDim,
+                output.dtype == .bfloat16, projectedGate.dtype == .bfloat16,
+                output.shape == [1, 1, nHeads * headDim],
+                projectedGate.shape == [1, 1, nHeads]
+            {
+                if lagunaUseNativeAffineOProj(layer: layerIdx),
+                    let affineWO = _nativeAffineOProj,
+                    wo.bias == nil
+                {
+                    if lagunaFusedGatedAffineOProjEnabled,
+                        affineWO.mode == .affine, affineWO.bits == 8,
+                        affineWO.groupSize == 32,
+                        let affineBiases = affineWO.biases,
+                        let fusedProjection = lagunaGatedAffineOProj(
+                            attentionOutput: output,
+                            gateLogits: projectedGate,
+                            codes: affineWO.packedCodes,
+                            scales: affineWO.scales,
+                            biases: affineBiases,
+                            heads: nHeads)
+                    {
+                        return fusedProjection
+                    }
+                    if lagunaFusedGatedAffineOProjEnabled,
+                        lagunaGatedAffineOProjNVFP4Enabled,
+                        affineWO.mode == .nvfp4, affineWO.bits == 4,
+                        affineWO.groupSize == 16,
+                        let fusedProjection = lagunaGatedAffineOProjNVFP4(
+                            attentionOutput: output,
+                            gateLogits: projectedGate,
+                            codes: affineWO.packedCodes,
+                            scales: affineWO.scales,
+                            heads: nHeads)
+                    {
+                        return fusedProjection
+                    }
+                    if let fusedGated = lagunaGateProductSoftplus(
+                        attentionOutput: output, gateLogits: projectedGate,
+                        heads: nHeads)
+                    {
+                        lagunaTrace("last prefill native affine gated oproj h\(nHeads)")
+                        return quantizedMM(
+                            fusedGated,
+                            affineWO.packedCodes,
+                            scales: affineWO.scales,
+                            biases: affineWO.biases,
+                            transpose: true,
+                            groupSize: affineWO.groupSize,
+                            bits: affineWO.bits,
+                            mode: affineWO.mode
+                        )
+                    }
+                }
+                if let fusedGated = lagunaGateProductSoftplus(
+                    attentionOutput: output, gateLogits: projectedGate,
+                    heads: nHeads)
+                {
+                    return wo(fusedGated)
+                }
+            }
             let gate =
                 gatePerHead && projectedGate.dtype == output.dtype
                 ? lagunaCompiledSoftplusGate(projectedGate)
