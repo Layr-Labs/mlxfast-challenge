@@ -2760,11 +2760,67 @@ private func lagunaPrefillFullQKNormYaRN(
     return (outputs[0], outputs[1])
 }
 
+struct LagunaIndexedAffineMetadata {
+    let indices: MLXArray
+    let lut: MLXArray
+
+    var arrays: [MLXArray] { [indices, lut] }
+}
+
+private let lagunaIndexedAffineMetadataEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_AFFINE_METADATA_INDEXED"] != "0"
+
+/// Builds a lossless UInt16 indirection for the exact BF16 `(scale,bias)`
+/// bit pairs. The LUT stores both BF16 payloads in one UInt32; the kernels
+/// reconstruct each value with bit casts, so no floating-point operation or
+/// rounding boundary changes. Banks with more than 65,536 distinct pairs
+/// decline and retain the raw two-array path.
+private func lagunaIndexedAffineMetadata(
+    scales: MLXArray, biases: MLXArray?
+) -> LagunaIndexedAffineMetadata? {
+    guard lagunaIndexedAffineMetadataEnabled,
+        scales.dtype == .bfloat16,
+        let biases,
+        biases.dtype == .bfloat16,
+        biases.shape == scales.shape
+    else {
+        return nil
+    }
+
+    let scaleBits = scales.view(dtype: .uint16).asArray(UInt16.self)
+    let biasBits = biases.view(dtype: .uint16).asArray(UInt16.self)
+    precondition(scaleBits.count == biasBits.count)
+
+    var lookup: [UInt32: UInt16] = [:]
+    lookup.reserveCapacity(min(scaleBits.count, Int(UInt16.max) + 1))
+    var lut: [UInt32] = []
+    lut.reserveCapacity(min(scaleBits.count, Int(UInt16.max) + 1))
+    var indices: [UInt16] = []
+    indices.reserveCapacity(scaleBits.count)
+    for (scale, bias) in zip(scaleBits, biasBits) {
+        let pair = UInt32(scale) | (UInt32(bias) << 16)
+        if let index = lookup[pair] {
+            indices.append(index)
+            continue
+        }
+        guard lut.count <= Int(UInt16.max) else { return nil }
+        let index = UInt16(lut.count)
+        lookup[pair] = index
+        lut.append(pair)
+        indices.append(index)
+    }
+
+    return LagunaIndexedAffineMetadata(
+        indices: MLXArray(indices).reshaped(scales.shape),
+        lut: MLXArray(lut))
+}
+
 struct LagunaNativeAffineWeight {
     let packedCodes: MLXArray
     let scales: MLXArray
     let biases: MLXArray?
     let originalShape: [Int]
+    var indexedMetadata: LagunaIndexedAffineMetadata? = nil
     /// Wire format of this side layout. The shipped layout is group-32 affine
     /// INT8; the NVFP4 probe below can build group-16 4-bit NVFP4 instead, and
     /// the decode dispatch reads these three fields so one call site serves both.
@@ -2772,7 +2828,11 @@ struct LagunaNativeAffineWeight {
     var bits: Int = 8
     var mode: QuantizationMode = .affine
 
-    var arrays: [MLXArray] { [packedCodes, scales] + (biases.map { [$0] } ?? []) }
+    var arrays: [MLXArray] {
+        [packedCodes, scales]
+            + (biases.map { [$0] } ?? [])
+            + (indexedMetadata?.arrays ?? [])
+    }
 }
 
 /// REAL (not simulated) NVFP4 side layout for layers `>= N`
@@ -3783,8 +3843,33 @@ func lagunaGateProductSoftplus(
 /// into the input row at each k-block at the same FP32 -> BF16 rounding point
 /// `lagunaGateProductSoftplusSource` uses, so the contraction is bit-identical
 /// to applying the gate first and then running the stock affine GEMV.
-private func lagunaGatedAffineOProjSource(heads: Int) -> String {
-    """
+private func lagunaGatedAffineOProjSource(heads: Int, indexedMetadata: Bool = false) -> String {
+    let metadataPointers = indexedMetadata
+        ? """
+        const device ushort* md = weight_metadata_indices + out_row * in_vec_size_g +
+            simd_lid / scale_step_per_thread;
+        const device uint* metadata_lut = weight_metadata_lut;
+        """
+        : """
+        const device bfloat* sc = weight_scales + out_row * in_vec_size_g +
+            simd_lid / scale_step_per_thread;
+        const device bfloat* bs = weight_biases + out_row * in_vec_size_g +
+            simd_lid / scale_step_per_thread;
+        """
+    let metadataLoad = indexedMetadata
+        ? """
+            uint metadata_pair = metadata_lut[md[row * in_vec_size_g]];
+            float scale = float(as_type<bfloat>(ushort(metadata_pair)));
+            float bias = float(as_type<bfloat>(ushort(metadata_pair >> 16)));
+        """
+        : """
+            float scale = float(sc[row * in_vec_size_g]);
+            float bias = float(bs[row * in_vec_size_g]);
+        """
+    let metadataAdvance = indexedMetadata
+        ? "md += block_size / group_size;"
+        : "sc += block_size / group_size;\n        bs += block_size / group_size;"
+    return """
     constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
     constexpr uint out_vec_size = \(LagunaConstants.hiddenSize);
     constexpr uint gate_heads = \(heads);
@@ -3826,10 +3911,7 @@ private func lagunaGatedAffineOProjSource(heads: Int) -> String {
 
     const device uint8_t* ws = (const device uint8_t*)weight_codes +
         out_row * in_vec_size + simd_lid * values_per_thread;
-    const device bfloat* sc = weight_scales + out_row * in_vec_size_g +
-        simd_lid / scale_step_per_thread;
-    const device bfloat* bs = weight_biases + out_row * in_vec_size_g +
-        simd_lid / scale_step_per_thread;
+    \(metadataPointers)
     const device bfloat* xp = attention_output + simd_lid * values_per_thread;
 
     thread float x_thread[values_per_thread];
@@ -3847,8 +3929,7 @@ private func lagunaGatedAffineOProjSource(heads: Int) -> String {
 
         for (uint row = 0; row < results_per_simdgroup; ++row) {
             const device uint8_t* wl = ws + row * in_vec_size;
-            float scale = float(sc[row * in_vec_size_g]);
-            float bias = float(bs[row * in_vec_size_g]);
+            \(metadataLoad)
             float accum = 0.0f;
             for (uint i = 0; i < values_per_thread; ++i) {
                 accum += x_thread[i] * wl[i];
@@ -3857,8 +3938,7 @@ private func lagunaGatedAffineOProjSource(heads: Int) -> String {
         }
 
         ws += block_size;
-        sc += block_size / group_size;
-        bs += block_size / group_size;
+        \(metadataAdvance)
         xp += block_size;
         column += block_size;
     }
@@ -3892,6 +3972,23 @@ private let lagunaGatedAffineOProjKernels: [Int: MLXFast.MLXFastKernel] = {
     return kernels
 }()
 
+private let lagunaGatedAffineOProjIndexedKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_gated_affine_oproj_qmv_i8g32_h\(heads)_indexed_v1",
+            inputNames: [
+                "attention_output", "gate_logits", "weight_codes",
+                "weight_metadata_indices", "weight_metadata_lut",
+            ],
+            outputNames: ["projected"],
+            source: lagunaGatedAffineOProjSource(heads: heads, indexedMetadata: true),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
 /// `DARKBLOOM_FUSED_GATED_AFFINE_OPROJ` (default ON; set "0" to disable).
 /// Fuses the per-head softplus gate product into the native group-32 affine
 /// INT8 o_proj GEMV so the decode attention tail is one dispatch instead of
@@ -3916,9 +4013,9 @@ func lagunaGatedAffineOProj(
     codes: MLXArray,
     scales: MLXArray,
     biases: MLXArray,
+    indexedMetadata: LagunaIndexedAffineMetadata?,
     heads: Int
 ) -> MLXArray? {
-    guard let kernel = lagunaGatedAffineOProjKernels[heads] else { return nil }
     let inVec = heads * LagunaConstants.headDim
     let outVec = LagunaConstants.hiddenSize
     guard attentionOutput.dtype == .bfloat16,
@@ -3935,6 +4032,27 @@ func lagunaGatedAffineOProj(
         return nil
     }
 
+    if let indexedMetadata {
+        guard let kernel = lagunaGatedAffineOProjIndexedKernels[heads],
+            indexedMetadata.indices.dtype == .uint16,
+            indexedMetadata.indices.shape == [outVec, inVec / 32],
+            indexedMetadata.lut.dtype == .uint32,
+            indexedMetadata.lut.ndim == 1
+        else { return nil }
+        lagunaTrace("gated affine oproj qmv h\(heads) indexed")
+        return kernel(
+            [
+                attentionOutput, gateLogits, codes,
+                indexedMetadata.indices, indexedMetadata.lut,
+            ],
+            grid: ((outVec / 8) * 64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[1, 1, outVec]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+
+    guard let kernel = lagunaGatedAffineOProjKernels[heads] else { return nil }
     lagunaTrace("gated affine oproj qmv h\(heads)")
     return kernel(
         [attentionOutput, gateLogits, codes, scales, biases],
@@ -4727,8 +4845,48 @@ let lagunaNormAffineQKVPrefetchDepth: Int = {
 /// prologue into registers, and (b) those blocks peeled off the k-loop,
 /// consuming the registers with the identical per-i accumulation order.
 /// Same values, same operation order per output row -> bit-exact.
-private func lagunaNormAffineQKVPrefetchSource(rows: Int, depth: Int) -> String {
-    """
+private func lagunaNormAffineQKVPrefetchSource(
+    rows: Int, depth: Int, indexedMetadata: Bool = false
+) -> String {
+    let metadataPointers = indexedMetadata
+        ? """
+        const device ushort* md = weight_metadata_indices + out_row * in_vec_size_g +
+            simd_lid / scale_step_per_thread;
+        const device uint* metadata_lut = weight_metadata_lut;
+        """
+        : """
+        const device bfloat* sc = weight_scales + out_row * in_vec_size_g +
+            simd_lid / scale_step_per_thread;
+        const device bfloat* bs = weight_biases + out_row * in_vec_size_g +
+            simd_lid / scale_step_per_thread;
+        """
+    let prefetchMetadata = indexedMetadata
+        ? """
+            uint metadata_pair = metadata_lut[
+                md[d * (block_size / group_size) + row * in_vec_size_g]];
+            pf_s[d][row] = float(as_type<bfloat>(ushort(metadata_pair)));
+            pf_b[d][row] = float(as_type<bfloat>(ushort(metadata_pair >> 16)));
+        """
+        : """
+            pf_s[d][row] =
+                float(sc[d * (block_size / group_size) + row * in_vec_size_g]);
+            pf_b[d][row] =
+                float(bs[d * (block_size / group_size) + row * in_vec_size_g]);
+        """
+    let metadataLoad = indexedMetadata
+        ? """
+            uint metadata_pair = metadata_lut[md[row * in_vec_size_g]];
+            float scale = float(as_type<bfloat>(ushort(metadata_pair)));
+            float bias = float(as_type<bfloat>(ushort(metadata_pair >> 16)));
+        """
+        : """
+            float scale = float(sc[row * in_vec_size_g]);
+            float bias = float(bs[row * in_vec_size_g]);
+        """
+    let metadataAdvance = indexedMetadata
+        ? "md += block_size / group_size;"
+        : "sc += block_size / group_size;\n        bs += block_size / group_size;"
+    return """
     constexpr uint axis_size = \(LagunaConstants.hiddenSize);
     constexpr uint out_vec_size = \(rows);
     constexpr uint n_reads = 4;                 // RMS_N_READS
@@ -4763,10 +4921,7 @@ private func lagunaNormAffineQKVPrefetchSource(rows: Int, depth: Int) -> String 
 
     const device uint8_t* ws = (const device uint8_t*)weight_codes +
         out_row * axis_size + simd_lid * values_per_thread;
-    const device bfloat* sc = weight_scales + out_row * in_vec_size_g +
-        simd_lid / scale_step_per_thread;
-    const device bfloat* bs = weight_biases + out_row * in_vec_size_g +
-        simd_lid / scale_step_per_thread;
+    \(metadataPointers)
 
     uint8_t pf_w[pf_depth][results_per_simdgroup][values_per_thread];
     float pf_s[pf_depth][results_per_simdgroup];
@@ -4777,10 +4932,7 @@ private func lagunaNormAffineQKVPrefetchSource(rows: Int, depth: Int) -> String 
             for (uint i = 0; i < values_per_thread; ++i) {
                 pf_w[d][row][i] = wl[i];
             }
-            pf_s[d][row] =
-                float(sc[d * (block_size / group_size) + row * in_vec_size_g]);
-            pf_b[d][row] =
-                float(bs[d * (block_size / group_size) + row * in_vec_size_g]);
+            \(prefetchMetadata)
         }
     }
 
@@ -4838,8 +4990,7 @@ private func lagunaNormAffineQKVPrefetchSource(rows: Int, depth: Int) -> String 
             result[row] += pf_s[d][row] * accum + sum * pf_b[d][row];
         }
         ws += block_size;
-        sc += block_size / group_size;
-        bs += block_size / group_size;
+        \(metadataAdvance)
         column += block_size;
     }
     for (uint k = pf_depth * block_size; k < axis_size; k += block_size) {
@@ -4854,8 +5005,7 @@ private func lagunaNormAffineQKVPrefetchSource(rows: Int, depth: Int) -> String 
 
         for (uint row = 0; row < results_per_simdgroup; ++row) {
             const device uint8_t* wl = ws + row * axis_size;
-            float scale = float(sc[row * in_vec_size_g]);
-            float bias = float(bs[row * in_vec_size_g]);
+            \(metadataLoad)
             float accum = 0.0f;
             for (uint i = 0; i < values_per_thread; ++i) {
                 accum += x_thread[i] * wl[i];
@@ -4864,8 +5014,7 @@ private func lagunaNormAffineQKVPrefetchSource(rows: Int, depth: Int) -> String 
         }
 
         ws += block_size;
-        sc += block_size / group_size;
-        bs += block_size / group_size;
+        \(metadataAdvance)
         column += block_size;
     }
 
@@ -4910,6 +5059,31 @@ private let lagunaNormAffineQKVKernels: [Int: MLXFast.MLXFastKernel] = {
     return kernels
 }()
 
+private let lagunaNormAffineQKVIndexedKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    let pf = lagunaNormAffineQKVStaged ? 0 : lagunaNormAffineQKVPrefetchDepth
+    guard pf > 0 else { return kernels }
+    let kvRows = 2 * LagunaConstants.numKeyValueHeads * LagunaConstants.headDim
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        for gateRows in [0, heads] {
+            let rows = heads * LagunaConstants.headDim + kvRows + gateRows
+            if kernels[rows] != nil { continue }
+            kernels[rows] = MLXFast.metalKernel(
+                name: "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_pf\(pf)_indexed_v1",
+                inputNames: [
+                    "residual", "norm_weight", "weight_codes",
+                    "weight_metadata_indices", "weight_metadata_lut",
+                ],
+                outputNames: ["projected"],
+                source: lagunaNormAffineQKVPrefetchSource(
+                    rows: rows, depth: pf, indexedMetadata: true),
+                ensureRowContiguous: true
+            )
+        }
+    }
+    return kernels
+}()
+
 /// `DARKBLOOM_FUSED_NORM_AFFINE_QKV` (default ON; set "0" to disable). Folds
 /// the input RMSNorm into the native group-32 affine INT8 QKV GEMV so the
 /// decode attention head is one dispatch instead of two. Bit-exact (inline
@@ -4929,9 +5103,9 @@ func lagunaNormAffineQKV(
     codes: MLXArray,
     scales: MLXArray,
     biases: MLXArray,
+    indexedMetadata: LagunaIndexedAffineMetadata?,
     rows: Int
 ) -> MLXArray? {
-    guard let kernel = lagunaNormAffineQKVKernels[rows] else { return nil }
     let hidden = LagunaConstants.hiddenSize
     guard residual.dtype == .bfloat16,
         residual.shape == [1, 1, hidden],
@@ -4947,6 +5121,28 @@ func lagunaNormAffineQKV(
         return nil
     }
 
+    if let indexedMetadata {
+        guard let kernel = lagunaNormAffineQKVIndexedKernels[rows],
+            indexedMetadata.indices.dtype == .uint16,
+            indexedMetadata.indices.shape == [rows, hidden / 32],
+            indexedMetadata.lut.dtype == .uint32,
+            indexedMetadata.lut.ndim == 1
+        else { return nil }
+        lagunaTrace(
+            "norm+affine qkv qmv r\(rows) pf\(lagunaNormAffineQKVPrefetchDepth) indexed")
+        return kernel(
+            [
+                residual, normWeight, codes,
+                indexedMetadata.indices, indexedMetadata.lut,
+            ],
+            grid: ((rows / 8) * 64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[1, 1, rows]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+
+    guard let kernel = lagunaNormAffineQKVKernels[rows] else { return nil }
     lagunaTrace(
         lagunaNormAffineQKVPrefetchDepth > 0 && !lagunaNormAffineQKVStaged
             ? "norm+affine qkv qmv r\(rows) pf\(lagunaNormAffineQKVPrefetchDepth)"
@@ -5078,10 +5274,12 @@ final class LagunaRuntimeAttention: Module {
             type(of: wo) == Linear.self,
             wo.bias == nil,
             wo.weight.shape == [LagunaConstants.hiddenSize, nHeads * headDim],
-            let quantizedWO = lagunaNativeAffineWeight(wo.weight, layer: layerIdx)
+            var quantizedWO = lagunaNativeAffineWeight(wo.weight, layer: layerIdx)
         else {
             return []
         }
+        quantizedWO.indexedMetadata = lagunaIndexedAffineMetadata(
+            scales: quantizedWO.scales, biases: quantizedWO.biases)
         _nativeAffineOProj = quantizedWO
         return quantizedWO.arrays
     }
@@ -5134,7 +5332,7 @@ final class LagunaRuntimeAttention: Module {
         if biasBlocks.allSatisfy({ $0 != nil }) {
             biases = concatenated(biasBlocks.compactMap { $0 }, axis: 0)
         }
-        let fused = LagunaNativeAffineWeight(
+        var fused = LagunaNativeAffineWeight(
             packedCodes: packedCodes,
             scales: scales,
             biases: biases,
@@ -5146,6 +5344,8 @@ final class LagunaRuntimeAttention: Module {
             bits: q.bits,
             mode: q.mode
         )
+        fused.indexedMetadata = lagunaIndexedAffineMetadata(
+            scales: fused.scales, biases: fused.biases)
         _nativeAffineQKV = fused
         return fused.arrays + (_nativeAffineGProj?.arrays ?? [])
     }
@@ -5319,6 +5519,7 @@ final class LagunaRuntimeAttention: Module {
                         codes: fusedAffine.packedCodes,
                         scales: fusedAffine.scales,
                         biases: affineBiases,
+                        indexedMetadata: fusedAffine.indexedMetadata,
                         rows: fusedAffine.originalShape[0])
                 }
 
@@ -5719,6 +5920,7 @@ final class LagunaRuntimeAttention: Module {
                         codes: affineWO.packedCodes,
                         scales: affineWO.scales,
                         biases: affineBiases,
+                        indexedMetadata: affineWO.indexedMetadata,
                         heads: nHeads)
                 {
                     return fusedProjection
