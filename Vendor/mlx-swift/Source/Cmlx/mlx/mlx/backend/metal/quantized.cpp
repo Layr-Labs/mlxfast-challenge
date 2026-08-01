@@ -1481,10 +1481,19 @@ bool darkbloom_stage_wide_load_ok(
 int darkbloom_gather_xmajor_ct() {
   static const int v = [] {
     const std::string s = env::get_var("DARKBLOOM_GATHER_XMAJOR", "");
-    if (s.empty() || s == "0") {
+    // DEFAULT ON at the tuned fold (was opt-in). The mechanism shipped
+    // fully implemented, trace-guarded, and class-A bit-exact (see the
+    // kernel block: independent per-tile accumulators, unchanged
+    // accumulation order) but dark; the byte model says it targets the
+    // dominant remaining prefill cost -- the x re-reads are ~half the
+    // expert-gather chains' DRAM bytes and the fold divides them by 4 --
+    // and the ranked paired run is the only instrument that can price it.
+    // DARKBLOOM_GATHER_XMAJOR=0 restores the stock one-tile walk in the
+    // same binary; explicit 2/4/8/16 select other folds.
+    if (s == "0") {
       return 0;
     }
-    if (s == "1") {
+    if (s.empty() || s == "1") {
       return 4; // tuned default fold
     }
     const int ct = atoi(s.c_str());
