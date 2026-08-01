@@ -524,6 +524,74 @@ void steel_matmul_regular_axpby(
   compute_encoder.add_temporaries(std::move(copies));
 }
 
+// Laguna's lossless BF16 QKV side layout keeps the original 4,096-byte row
+// allocation but stores most 32-value blocks in 49 bytes. Only the B-fragment
+// load differs from the regular NAX GEMM; the matrix instruction sequence and
+// FP32 accumulation order are unchanged. The extra physical output column is
+// the host-side layout marker and is deliberately never dispatched or read.
+void steel_matmul_lossless_bf16_qkv_nax(
+    const Stream& s,
+    metal::Device& d,
+    const array& a,
+    const array& packed_b,
+    array& out,
+    int M,
+    int logical_N,
+    int K,
+    int lda,
+    int physical_N,
+    std::vector<array>& copies) {
+  using namespace mlx::steel;
+
+  constexpr int bm = 64;
+  constexpr int bn = 128;
+  constexpr int bk = 256;
+  constexpr int wm = 2;
+  constexpr int wn = 4;
+
+  std::ostringstream kname;
+  kname << "steel_gemm_lossless_bf16_qkv_nax_" << type_to_name(out)
+        << "_bm" << bm << "_bn" << bn << "_bk" << bk << "_wm" << wm
+        << "_wn" << wn;
+  const std::string kernel_name = kname.str();
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel = get_steel_gemm_lossless_bf16_nax_kernel(
+      d, kernel_name, out, bm, bn, bk, wm, wn);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  int tiles_n = (logical_N + bn - 1) / bn;
+  int tiles_m = (M + bm - 1) / bm;
+  constexpr int swizzle_log = 2;
+  GEMMParams params{/* M = */ M,
+                    /* N = */ logical_N,
+                    /* K = */ K,
+                    /* lda = */ lda,
+                    /* ldb = */ K,
+                    /* ldd = */ physical_N,
+                    /* tiles_n = */ tiles_n,
+                    /* tiles_m = */ tiles_m,
+                    /* batch_stride_a = */ 0,
+                    /* batch_stride_b = */ 0,
+                    /* batch_stride_d = */ int64_t(M) * physical_N,
+                    /* swizzle_log = */ swizzle_log,
+                    /* gemm_k_iterations_aligned = */ K / bk,
+                    /* batch_ndim = */ 0};
+
+  constexpr int swizzle_tile = 1 << swizzle_log;
+  const int grid_m = (tiles_m + swizzle_tile - 1) / swizzle_tile;
+  const int grid_n = tiles_n * swizzle_tile;
+  const MTL::Size group_dims = MTL::Size(32, wn, wm);
+  const MTL::Size grid_dims = MTL::Size(grid_n, grid_m, 1);
+
+  compute_encoder.set_input_array(a, 0);
+  compute_encoder.set_input_array(packed_b, 1);
+  compute_encoder.set_output_array(out, 2);
+  compute_encoder.set_bytes(params, 3);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  compute_encoder.add_temporaries(std::move(copies));
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Split k steel matmul
 ///////////////////////////////////////////////////////////////////////////////
@@ -1340,6 +1408,30 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     A_batch_stride = {0};
     B_batch_stride = {0};
     batch_shape = {1};
+  }
+
+  // The marker is one extra output row in the packed QKV bank. Restrict the
+  // specialized path to Laguna's two exact QKV bank widths, BF16, K=2048,
+  // M>1, one batch, and the ordinary NT projection layout. Decode (M=1) and
+  // every unmarked matmul retain the accepted dispatch unchanged.
+  const bool lossless_bf16_qkv = metal::is_nax_available() && M > 1 &&
+      K == 2048 && (N == 8193 || N == 10241) &&
+      a.dtype() == bfloat16 && b.dtype() == bfloat16 &&
+      out.dtype() == bfloat16 && !a_transposed && b_transposed &&
+      batch_size_out == 1 && a_cols == K && b_cols == K && b.offset() == 0;
+  if (lossless_bf16_qkv) {
+    return steel_matmul_lossless_bf16_qkv_nax(
+        s,
+        d,
+        a,
+        b,
+        out,
+        M,
+        N - 1,
+        K,
+        a_cols,
+        N,
+        copies);
   }
 
   /////////////////////////////////////////////////////////////////////////////
