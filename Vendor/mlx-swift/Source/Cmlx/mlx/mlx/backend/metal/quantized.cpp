@@ -1319,7 +1319,8 @@ int darkbloom_expert_gather_groups() {
 // pipeline key. Resolved once per process, so exactly one variant is ever
 // compiled and a fresh process picks up a changed environment cleanly.
 //
-//   unset (SHIPPED) -> 4  (BM=64,  WM=4, WN=2)  SM=16, 256 thr/TG
+//   unset (SHIPPED) -> 5  (BM=64,  WM=4, WN=1)  SM=16, 128 thr/TG
+//   "4" (previous) -> 4  (BM=64,  WM=4, WN=2)  SM=16, 256 thr/TG
 //   "0"             -> 0  (BM=64,  WM=2, WN=2)  SM=32  upstream tiling
 //   "1"             -> 1  (BM=128, WM=4)        SM=32  less expert re-staging
 //   "2"             -> 2  (BM=128, WM=2)        SM=64  measured regression
@@ -1354,7 +1355,14 @@ int darkbloom_expert_gather_groups() {
 // variant 5, which also moved WN. max_abs_diff = 0 on every timed run and on
 // the full 1025-step gate.
 //
-// WHY VARIANT 4 AND NOT 5. Both reach SM=16. They differ in where the extra
+// HISTORICAL VARIANT-5 CAVEAT. The comparison below predates the `wn == 1`
+// expert-path admission and therefore timed the non-expert fallback rather
+// than this kernel. Once admitted, WN1 measured positive locally and the
+// exact official PR #882 composition reached 0.00019800089453125 prefill,
+// versus 0.0002012216796875 for the accepted WN2 split-K crown. Keep the old
+// table as provenance, not as pricing evidence for the now-active WN1 arm.
+//
+// WHY VARIANT 4 AND NOT 5 (historical, pre-admission). Both reach SM=16. They differ in where the extra
 // row-split is paid for, and measurement says that is worth an order of
 // magnitude:
 //
@@ -1393,7 +1401,7 @@ int darkbloom_stage_bm128_variant() {
   static const int v = [] {
     auto s = env::get_var("DARKBLOOM_STAGE_BM128", "");
     if (s.empty()) {
-      return 4;
+      return 5;
     }
     if (s == "1") {
       return 1;
