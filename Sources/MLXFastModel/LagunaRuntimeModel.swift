@@ -4373,7 +4373,8 @@ private let lagunaTailNVFP4QMVHeader = """
 /// native-affine QKV branch, so prefill and every multi-token call keep the
 /// stock three-dispatch chain. `DARKBLOOM_TAIL_NORM_QKV_GATE=0` ablates
 /// inside the same binary; `DARKBLOOM_TAIL_NORM_QKV_GATE_LAYERS=N` bounds
-/// coverage to layers 32 <= layerIdx < N (default 40).
+/// coverage to layers `lagunaNativeAffineNVFP4From <= layerIdx < N`
+/// (default 40).
 private func lagunaTailNormQKVGateSource(heads: Int) -> String {
     let qkvRows =
         (heads + 2 * LagunaConstants.numKeyValueHeads) * LagunaConstants.headDim
@@ -4560,9 +4561,9 @@ private let lagunaTailNormQKVGateEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_TAIL_NORM_QKV_GATE"] != "0"
 
 /// Layer-count knob for the tail fused norm+QKV+gate kernel, parsed exactly
-/// like the other fusion layer knobs: layers `32 <= layerIdx < N` are
-/// eligible (default 40, the whole NVFP4 tail window), clamped to
-/// 0...numHiddenLayers, and forced to 0 when the fusion is ablated.
+/// like the other fusion layer knobs: native-NVFP4 tail layers below `N` are
+/// eligible (default 40), clamped to 0...numHiddenLayers, and forced to 0
+/// when the fusion is ablated.
 private let lagunaTailNormQKVGateLayers: Int = {
     guard lagunaTailNormQKVGateEnabled else { return 0 }
     let requested = Int(
@@ -4589,7 +4590,8 @@ func lagunaTailNormQKVGate(
     let qkvRows =
         (heads + 2 * LagunaConstants.numKeyValueHeads) * LagunaConstants.headDim
     guard lagunaTailNormQKVGateEnabled,
-        layerIdx >= 32, layerIdx < lagunaTailNormQKVGateLayers,
+        layerIdx >= (lagunaNativeAffineNVFP4From ?? 32),
+        layerIdx < lagunaTailNormQKVGateLayers,
         qkvBank.mode == .nvfp4, qkvBank.bits == 4, qkvBank.groupSize == 16,
         qkvBank.biases == nil,
         qkvBank.originalShape == [qkvRows, hidden],
