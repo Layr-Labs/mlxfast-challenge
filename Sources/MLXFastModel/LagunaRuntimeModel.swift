@@ -3471,6 +3471,129 @@ private func lagunaTailNormQKVGateSource(heads: Int) -> String {
     """
 }
 
+/// Two-dispatch tail counterpart of `lagunaTailNormQKVGateSource`.
+///
+/// The current one-dispatch kernel recomputes the exact 2048-wide RMS
+/// reduction independently in every QKV/gate threadgroup.  That is 1,030
+/// reductions on a 48-head layer and 1,288 on a 64-head layer.  This twin
+/// consumes the BF16 row produced once by the stock `RMSNorm` dispatch, then
+/// keeps the merged NVFP4 QKV + affine-INT8 gate projection byte-for-byte at
+/// the same accumulation and output-rounding boundaries.  It therefore uses
+/// two dispatches instead of the stock three while removing the replicated
+/// reduction, its three barriers, and the repeated residual/norm-weight
+/// reads from every projection threadgroup.
+private func lagunaTailQKVGateFromNormalizedSource(heads: Int) -> String {
+    let qkvRows =
+        (heads + 2 * LagunaConstants.numKeyValueHeads) * LagunaConstants.headDim
+    return """
+    constexpr uint axis_size = \(LagunaConstants.hiddenSize);
+    constexpr uint qkv_rows = \(qkvRows);
+    constexpr uint qkv_tiles = qkv_rows / 8;
+    constexpr uint results_per_simdgroup = 4;
+    constexpr uint num_simdgroups = 2;
+    constexpr uint nv_values_per_thread = 16;
+    constexpr uint nv_block_size = 512;
+    constexpr uint nv_in_vec_size_w = axis_size / 2;
+    constexpr uint nv_in_vec_size_g = axis_size / 16;
+    constexpr uint gate_values_per_thread = 8;
+    constexpr uint gate_block_size = 256;
+    constexpr uint gate_group_size = 32;
+    constexpr uint gate_scale_step = gate_group_size / gate_values_per_thread;
+    constexpr uint gate_in_vec_size_g = axis_size / gate_group_size;
+
+    uint tile = threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    if (tile < qkv_tiles) {
+        // Exact fp_qmv_fast_impl<bfloat16_t, 16, 4> row arithmetic.
+        uint out_row = tile * (num_simdgroups * results_per_simdgroup) +
+            simd_gid * results_per_simdgroup;
+
+        const device uint8_t* ws = (const device uint8_t*)weight_codes +
+            out_row * nv_in_vec_size_w + simd_lid * 8;
+        const device uint8_t* sc = weight_scales +
+            out_row * nv_in_vec_size_g + simd_lid;
+
+        thread float x_thread[nv_values_per_thread];
+        thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        uint column = simd_lid * nv_values_per_thread;
+        for (uint k = 0; k < axis_size; k += nv_block_size) {
+            for (uint i = 0; i < nv_values_per_thread; ++i) {
+                x_thread[i] = float(normalized[column + i]);
+            }
+
+            for (uint row = 0; row < results_per_simdgroup; ++row) {
+                const device uint8_t* wl = ws + row * nv_in_vec_size_w;
+                float scale = laguna_tail_nvfp4_scale(sc[row * nv_in_vec_size_g]);
+                result[row] += laguna_tail_nvfp4_qdot(wl, x_thread, scale);
+            }
+
+            ws += nv_block_size / 2;
+            sc += nv_block_size / 16;
+            column += nv_block_size;
+        }
+
+        for (uint row = 0; row < results_per_simdgroup; ++row) {
+            result[row] = simd_sum(result[row]);
+            if (simd_lid == 0) {
+                qkv[out_row + row] = bfloat(result[row]);
+            }
+        }
+    } else {
+        // Exact affine qmv_fast_impl<bfloat16_t, 32, 8> gate arithmetic.
+        uint gate_tile = tile - qkv_tiles;
+        uint gate_out_row =
+            gate_tile * (num_simdgroups * results_per_simdgroup) +
+            simd_gid * results_per_simdgroup;
+
+        const device uint8_t* ws = (const device uint8_t*)gate_codes +
+            gate_out_row * axis_size + simd_lid * gate_values_per_thread;
+        const device bfloat* sc = gate_scales +
+            gate_out_row * gate_in_vec_size_g + simd_lid / gate_scale_step;
+        const device bfloat* bs = gate_biases +
+            gate_out_row * gate_in_vec_size_g + simd_lid / gate_scale_step;
+
+        thread float x_thread[gate_values_per_thread];
+        thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        uint column = simd_lid * gate_values_per_thread;
+        for (uint k = 0; k < axis_size; k += gate_block_size) {
+            float sum = 0.0f;
+            for (uint i = 0; i < gate_values_per_thread; ++i) {
+                float value = float(normalized[column + i]);
+                sum += value;
+                x_thread[i] = value;
+            }
+
+            for (uint row = 0; row < results_per_simdgroup; ++row) {
+                const device uint8_t* wl = ws + row * axis_size;
+                float scale = float(sc[row * gate_in_vec_size_g]);
+                float bias = float(bs[row * gate_in_vec_size_g]);
+                float accum = 0.0f;
+                for (uint i = 0; i < gate_values_per_thread; ++i) {
+                    accum += x_thread[i] * wl[i];
+                }
+                result[row] += scale * accum + sum * bias;
+            }
+
+            ws += gate_block_size;
+            sc += gate_block_size / gate_group_size;
+            bs += gate_block_size / gate_group_size;
+            column += gate_block_size;
+        }
+
+        for (uint row = 0; row < results_per_simdgroup; ++row) {
+            result[row] = simd_sum(result[row]);
+            if (simd_lid == 0) {
+                gate_logits[gate_out_row + row] = bfloat(result[row]);
+            }
+        }
+    }
+    """
+}
+
 /// One kernel per attention head count, built eagerly so one binary serves
 /// every arm of an ablation and MLX's name-keyed JIT cache never sees two
 /// sources under one name.
@@ -3491,6 +3614,31 @@ private let lagunaTailNormQKVGateKernels: [Int: MLXFast.MLXFastKernel] = {
     }
     return kernels
 }()
+
+private let lagunaTailQKVGateFromNormalizedKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_tail_qkv_gate_from_normalized_bf16_h\(heads)_v1",
+            inputNames: [
+                "normalized", "weight_codes", "weight_scales",
+                "gate_codes", "gate_scales", "gate_biases",
+            ],
+            outputNames: ["qkv", "gate_logits"],
+            source: lagunaTailQKVGateFromNormalizedSource(heads: heads),
+            header: lagunaTailNVFP4QMVHeader,
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+/// Default ON.  Set `DARKBLOOM_TAIL_SPLIT_RMS_QKV_GATE=0` to restore the
+/// promoted one-dispatch kernel, which recomputes RMSNorm per projection
+/// threadgroup.  The master `DARKBLOOM_TAIL_NORM_QKV_GATE=0` switch still
+/// restores the stock three-dispatch chain.
+private let lagunaTailSplitRMSQKVGateEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_TAIL_SPLIT_RMS_QKV_GATE"] != "0"
 
 /// `DARKBLOOM_TAIL_NORM_QKV_GATE` (default ON; set "0" to ablate and restore
 /// the exact three-dispatch chain — stock RMSNorm + NVFP4 QKV qmv + INT8
@@ -3559,6 +3707,61 @@ func lagunaTailNormQKVGate(
     let outputs = kernel(
         [
             residual, normWeight, qkvBank.packedCodes, qkvBank.scales,
+            gateBank.packedCodes, gateBank.scales, gateBiases,
+        ],
+        grid: (((qkvRows + heads) / 8) * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, qkvRows], [1, 1, heads]],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
+/// Merged native NVFP4 QKV + affine-INT8 gate projection from the exact BF16
+/// row emitted by the stock RMSNorm.  Shape and wire-format guards mirror
+/// `lagunaTailNormQKVGate`; a decline lets the caller use that promoted
+/// one-dispatch kernel unchanged.
+func lagunaTailQKVGateFromNormalized(
+    normalized: MLXArray,
+    qkvBank: LagunaNativeAffineWeight,
+    gateBank: LagunaNativeAffineWeight,
+    heads: Int,
+    layerIdx: Int
+) -> (qkv: MLXArray, gateLogits: MLXArray)? {
+    let hidden = LagunaConstants.hiddenSize
+    let qkvRows =
+        (heads + 2 * LagunaConstants.numKeyValueHeads) * LagunaConstants.headDim
+    guard lagunaTailNormQKVGateEnabled,
+        lagunaTailSplitRMSQKVGateEnabled,
+        layerIdx >= 32, layerIdx < lagunaTailNormQKVGateLayers,
+        qkvBank.mode == .nvfp4, qkvBank.bits == 4, qkvBank.groupSize == 16,
+        qkvBank.biases == nil,
+        qkvBank.originalShape == [qkvRows, hidden],
+        gateBank.mode == .affine, gateBank.bits == 8, gateBank.groupSize == 32,
+        let gateBiases = gateBank.biases,
+        gateBank.originalShape == [heads, hidden],
+        let kernel = lagunaTailQKVGateFromNormalizedKernels[heads]
+    else { return nil }
+    guard normalized.dtype == .bfloat16,
+        normalized.shape == [1, 1, hidden],
+        qkvBank.packedCodes.dtype == .uint32,
+        qkvBank.packedCodes.shape == [qkvRows, hidden / 8],
+        qkvBank.scales.dtype == .uint8,
+        qkvBank.scales.shape == [qkvRows, hidden / 16],
+        gateBank.packedCodes.dtype == .uint32,
+        gateBank.packedCodes.shape == [heads, hidden / 4],
+        gateBank.scales.dtype == .bfloat16,
+        gateBank.scales.shape == [heads, hidden / 32],
+        gateBiases.dtype == .bfloat16,
+        gateBiases.shape == [heads, hidden / 32]
+    else {
+        return nil
+    }
+
+    lagunaTrace("tail rms split + qkv+gate h\(heads)")
+    let outputs = kernel(
+        [
+            normalized, qkvBank.packedCodes, qkvBank.scales,
             gateBank.packedCodes, gateBank.scales, gateBiases,
         ],
         grid: (((qkvRows + heads) / 8) * 64, 1, 1),
@@ -4184,18 +4387,34 @@ final class LagunaRuntimeAttention: Module {
                         rows: fusedAffine.originalShape[0])
                 }
 
-                // NVFP4-tail counterpart: one dispatch for the input
-                // RMSNorm, the NVFP4 [Q;K;V] bank qmv AND the separate INT8
-                // gate bank qmv (see `lagunaTailNormQKVGateSource`). The raw
-                // gate logits land in `fusedTailGateLogits` and take the
-                // same defer/eager-activation path below as the stock gate
-                // qmv's output. Falls through to the stock three-dispatch
-                // chain whenever the kernel declines.
+                // NVFP4 tail: normalize once, then merge the QKV and gate
+                // projections. This avoids repeating the 2048-wide RMS
+                // reduction in every projection threadgroup while retaining
+                // two dispatches instead of the stock three. The promoted
+                // one-dispatch norm+QKV+gate kernel remains the fail-closed
+                // fallback and same-binary ablation arm.
                 var fusedTailGateLogits: MLXArray?
+                if fusedQKV == nil,
+                    lagunaTailSplitRMSQKVGateEnabled,
+                    inputNorm.eps == Float(LagunaConstants.rmsNormEpsilon),
+                    let affineGate = _nativeAffineGProj
+                {
+                    let normalizedInput = inputNorm(input)
+                    if let tailSplit = lagunaTailQKVGateFromNormalized(
+                        normalized: normalizedInput,
+                        qkvBank: fusedAffine,
+                        gateBank: affineGate,
+                        heads: nHeads,
+                        layerIdx: layerIdx)
+                    {
+                        fusedQKV = tailSplit.qkv
+                        fusedTailGateLogits = tailSplit.gateLogits
+                    }
+                }
                 if fusedQKV == nil,
                     inputNorm.eps == Float(LagunaConstants.rmsNormEpsilon),
                     let affineGate = _nativeAffineGProj,
-                    let tailFused = lagunaTailNormQKVGate(
+                    let tailInline = lagunaTailNormQKVGate(
                         residual: input,
                         normWeight: inputNorm.weight,
                         qkvBank: fusedAffine,
@@ -4203,8 +4422,8 @@ final class LagunaRuntimeAttention: Module {
                         heads: nHeads,
                         layerIdx: layerIdx)
                 {
-                    fusedQKV = tailFused.qkv
-                    fusedTailGateLogits = tailFused.gateLogits
+                    fusedQKV = tailInline.qkv
+                    fusedTailGateLogits = tailInline.gateLogits
                 }
                 // Only materialized when the fused kernel declined; the gate
                 // branches below that read it are unreachable when it fired.
