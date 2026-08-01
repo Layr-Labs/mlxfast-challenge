@@ -1298,8 +1298,14 @@ private let lagunaLmHeadInt6CoarseRatioBoundDeltaBF16PrecomputedAbsKernel =
 /// exact; sd*q multiplies a power of two by a <=4-bit-magnitude integer
 /// float: exact. Accumulation depth is ~45 roundings/element-path, under
 /// the depth <= 96 budget assumed by gamma = 2^-15.
+///
+/// The 16 rows in a threadgroup consume the same 64 activation-group L1 sums.
+/// The first 64 threads reproduce the accepted `ag` chain once into 256 bytes
+/// of threadgroup memory, avoiding 15 redundant abs/add chains per group with
+/// no extra dispatch. The stored FP32 values are then read in the original
+/// lane and `gg` order, so the bound arithmetic is bit-identical.
 private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_int5_inline_coarse_ratio_bound_delta_bf16_v5",
+    name: "laguna_lmhead_int5_inline_coarse_ratio_bound_delta_bf16_tgabs_v1",
     inputNames: ["x", "codes_lo", "codes_hi", "scales"],
     outputNames: ["coarse", "delta"],
     source: """
@@ -1308,6 +1314,31 @@ private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKerne
         uint row = threadgroup_position_in_grid.x * 16 +
             simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
+        uint lid = thread_position_in_threadgroup.x;
+
+        threadgroup float shared_abs_group_sums[64];
+        if (lid < 64) {
+            uint g = lid;
+            const device ushort4* xrow =
+                (const device ushort4*)(x + g * 32);
+            float ag = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint w = 0; w < 4; ++w) {
+                float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
+                float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
+                float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
+                float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
+                float4 axe = metal::abs(xe);
+                float4 axo = metal::abs(xo);
+                #pragma clang loop unroll(full)
+                for (uint k = 0; k < 4; ++k) {
+                    ag += axe[k];
+                    ag += axo[k];
+                }
+            }
+            shared_abs_group_sums[g] = ag;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         const device uint8_t* lorow = codes_lo + size_t(row) * 1024;
         const device uint8_t* hirow = codes_hi + size_t(row) * 256;
@@ -1322,7 +1353,6 @@ private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKerne
             uint hb = ((const device uint*)(hirow + g * 4))[0];
             const device ushort4* xrow = (const device ushort4*)(x + g * 32);
             float cg = 0.0f;
-            float ag = 0.0f;
             #pragma clang loop unroll(full)
             for (uint w = 0; w < 4; ++w) {
                 // Word w: elements 8w..8w+7 of the group. Nibble plane byte
@@ -1342,18 +1372,14 @@ private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKerne
                 float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
                 float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
                 float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
-                float4 axe = metal::abs(xe);
-                float4 axo = metal::abs(xo);
                 #pragma clang loop unroll(full)
                 for (uint k = 0; k < 4; ++k) {
                     cg += xe[k] * ve[k];
                     cg += xo[k] * vo[k];
-                    ag += axe[k];
-                    ag += axo[k];
                 }
             }
             c_acc += sd * cg;
-            d_acc += (0.5f * sd) * ag;
+            d_acc += (0.5f * sd) * shared_abs_group_sums[g];
         }
         c_acc = simd_sum(c_acc);
         d_acc = simd_sum(d_acc);
