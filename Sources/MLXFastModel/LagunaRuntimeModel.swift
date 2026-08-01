@@ -8836,6 +8836,25 @@ private let lagunaPrefillMoETailEnabled =
 private let lagunaPrefillSortedMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_SORTED_MOE_TAIL"] != "0"
 
+/// Switchable replacement for `gatherSort`'s generic routed-input and
+/// permutation staging. Source rows and indices are copied byte-for-byte for
+/// every sorted Laguna prefill length, and the inverse permutation is built
+/// directly from the sort order.
+private let lagunaPrefillSortedRowCopyEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_SORTED_ROW_COPY"] != "0"
+
+/// Geometry dial for the row-tiled copy. Sixteen rows is the locally-priced
+/// successor; retained alternatives let the same compiled kernel recover the
+/// prior rung or price launch-count versus occupancy without changing
+/// addresses or arithmetic.
+private let lagunaPrefillSortedRowCopyGroupRows: Int = {
+    let requested = Int(
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_PREFILL_SORTED_ROW_COPY_GROUP_ROWS"] ?? "16") ?? 16
+    return [4, 8, 16].contains(requested) ? requested : 16
+}()
+
 /// Batched top-8 selection for multi-token (prefill) routing.
 ///
 /// Exactness against the stock chain it replaces, per row:
@@ -9678,6 +9697,72 @@ private func lagunaInterleavedSwiGLU(
     return compiledSiluProduct(gate, up)
 }
 
+/// `gatherSort` expands each token row once per selected expert after sorting
+/// the flattened expert indices. This kernel emits the same contiguous
+/// `[tokenCount * 8, 1, 2048]` BF16 payload for any sorted Laguna prefill,
+/// with one 16-byte copy per lane. The first vector lane also emits the two
+/// integer permutation arrays, avoiding a second metadata dispatch.
+private let lagunaPrefillSortedRowCopyKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_sorted_route_bf16_top8_row8_v4",
+    inputNames: ["source", "flat_indices", "order"],
+    outputNames: ["sorted", "sorted_indices", "inverse_order"],
+    source: """
+        constexpr uint hidden_vectors = 2048 / 8;
+        constexpr uint experts_per_token = 8;
+
+        uint vector_lane = thread_position_in_grid.x;
+        uint sorted_row = thread_position_in_grid.y;
+        uint original_row = order[sorted_row];
+        uint source_row = original_row / experts_per_token;
+        const device uint4* source_vectors =
+            (const device uint4*)(source);
+        device uint4* sorted_vectors = (device uint4*)(sorted);
+        for (uint vector_index = vector_lane;
+             vector_index < hidden_vectors;
+             vector_index += 32) {
+            sorted_vectors[sorted_row * hidden_vectors + vector_index] =
+                source_vectors[source_row * hidden_vectors + vector_index];
+        }
+
+        if (vector_lane == 0) {
+            sorted_indices[sorted_row] = flat_indices[original_row];
+            inverse_order[original_row] = sorted_row;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private func lagunaPrefillSortedRoute(
+    source: MLXArray,
+    flatIndices: MLXArray,
+    order: MLXArray
+) -> (MLXArray, MLXArray, MLXArray) {
+    precondition(source.dtype == .bfloat16)
+    precondition(source.dim(-1) == LagunaConstants.hiddenSize)
+    precondition(source.size.isMultiple(of: LagunaConstants.hiddenSize))
+    precondition(flatIndices.dtype == .uint32)
+    precondition(
+        flatIndices.size
+            == (source.size / LagunaConstants.hiddenSize)
+                * LagunaConstants.numExpertsPerTok)
+    precondition(order.dtype == .uint32)
+    precondition(order.size == flatIndices.size)
+
+    let sortedRows = flatIndices.size
+    let outputs = lagunaPrefillSortedRowCopyKernel(
+        [source, flatIndices, order],
+        grid: (32, sortedRows, 1),
+        threadGroup: (32, lagunaPrefillSortedRowCopyGroupRows, 1),
+        outputShapes: [
+            [sortedRows, 1, LagunaConstants.hiddenSize],
+            [sortedRows],
+            [sortedRows],
+        ],
+        outputDTypes: [.bfloat16, .uint32, .uint32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 /// Prefill (multi-token, SORTED-regime) counterpart to the decode-only fused
 /// gate/up dispatch in `LagunaRuntimeSparseMoEBlock.forward`. One gather-QMM
 /// consumes the retained `[gate32, up32]`-interleaved NVFP4 bank in place of
@@ -9706,9 +9791,26 @@ private func lagunaFusedSortedRoutedGateUp(
     var idx = indices
     var inverseOrder = MLXArray()
     // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
-    //
     if doSort {
-        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        if lagunaPrefillSortedRowCopyEnabled,
+            sortedX.dtype == .bfloat16,
+            sortedX.dim(-1) == LagunaConstants.hiddenSize,
+            sortedX.size.isMultiple(of: LagunaConstants.hiddenSize),
+            indices.dtype == .uint32,
+            indices.size
+                == (sortedX.size / LagunaConstants.hiddenSize)
+                    * LagunaConstants.numExpertsPerTok
+        {
+            let flatIndices = indices.flattened()
+            let order = argSort(flatIndices)
+            (sortedX, idx, inverseOrder) = lagunaPrefillSortedRoute(
+                source: sortedX,
+                flatIndices: flatIndices,
+                order: order
+            )
+        } else {
+            (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        }
     }
     // Fused counterpart of SwitchGLU's separate-bank branch:
     //   xUp = upProj(x, idx, sortedIndices: doSort)
