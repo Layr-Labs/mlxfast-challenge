@@ -494,12 +494,6 @@ struct QuantizedBlockLoader {
       (BCOLS_PACKED * BROWS >= tgp_size);
   // A single 16B device load covers this thread's whole source run.
   MLX_MTL_CONST bool kWideLoadShapeOk = kWidenShapeOk && (kSrcBytes == 16);
-  // A single 8B device load covers it instead (the 256-thread expert-aligned
-  // geometry: n_reads 8, one packed byte each). Same exactness class as the
-  // 16B form -- the same bytes reach the same sb[] slots -- and the host
-  // certification for 16B bases is strictly stronger than the 8B one, so it
-  // is reused unchanged; only the per-thread offset check relaxes to 8B.
-  MLX_MTL_CONST bool kWideLoad8ShapeOk = kWidenShapeOk && (kSrcBytes == 8);
 
   struct alignas(16) WideChunk {
     T v[kWideElems];
@@ -508,9 +502,6 @@ struct QuantizedBlockLoader {
   // in bounds for every instantiation, including the 8-bit ones where
   // kSrcBytes is 32 and the wide-load path is statically disabled.
   struct alignas(16) WideSrc {
-    uint8_t b[kSrcBytes];
-  };
-  struct alignas(8) WideSrc8 {
     uint8_t b[kSrcBytes];
   };
 
@@ -542,9 +533,8 @@ struct QuantizedBlockLoader {
 
     const bool store_ok =
         wide_store && kWidenShapeOk && ((dst_byte_off() & 15) == 0);
-    const bool load_ok = wide_load &&
-        ((kWideLoadShapeOk && ((src_byte_off() & 15) == 0)) ||
-         (kWideLoad8ShapeOk && ((src_byte_off() & 7) == 0)));
+    const bool load_ok =
+        wide_load && kWideLoadShapeOk && ((src_byte_off() & 15) == 0);
 
     // Nothing widened for this thread: run the untouched scalar path.
     if (!store_ok && !load_ok) {
@@ -560,16 +550,6 @@ struct QuantizedBlockLoader {
     if constexpr (kWideLoadShapeOk) {
       if (load_ok) {
         WideSrc packed = *((const device WideSrc*)src);
-        STEEL_PRAGMA_UNROLL
-        for (short b = 0; b < kSrcBytes; b++) {
-          sb[b] = packed.b[b];
-        }
-        took_wide_load = true;
-      }
-    }
-    if constexpr (kWideLoad8ShapeOk) {
-      if (load_ok) {
-        WideSrc8 packed = *((const device WideSrc8*)src);
         STEEL_PRAGMA_UNROLL
         for (short b = 0; b < kSrcBytes; b++) {
           sb[b] = packed.b[b];
@@ -1759,9 +1739,7 @@ template <
     const int fixed_K = 0,
     const int fixed_N = 0,
     typename Wtype = bfloat,
-    int tg_expert_groups = 64,
-    bool wide_store = false,
-    bool wide_load = false>
+    int tg_expert_groups = 64>
 [[kernel]] void fp_gather_qmm_rhs_expert_nax(
     const device T* x,
     const device uint32_t* w,
@@ -2049,19 +2027,7 @@ template <
 
       for (int k = 0; k < K_it; ++k) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // DARKBLOOM_EXPERT_STAGE_WIDEST / DARKBLOOM_EXPERT_STAGE_WIDELD:
-        // same bytes, same addresses, same nibble decode, same scale mapping
-        // -- only the access widths change (16 scalar 2B threadgroup stores
-        // -> 2 16B stores per thread; 8 scalar 1B device loads -> 1 8B load
-        // per thread). See load_unsafe_wide. The store side needs no host
-        // certification (Ws is 16B aligned by construction); the load side
-        // is host-certified via darkbloom_stage_wide_load_ok and per-thread
-        // self-guarded, falling back to the scalar path on any misalignment.
-        if constexpr (wide_store || wide_load) {
-          loader_w.template load_unsafe_wide<wide_store, wide_load>();
-        } else {
-          loader_w.load_unsafe();
-        }
+        loader_w.load_unsafe();
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg_active) {

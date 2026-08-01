@@ -112,6 +112,15 @@ let lagunaFusedQKVEnabled =
 let lagunaFusedSharedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_GATE_UP"] != "0"
 
+/// `DARKBLOOM_PREFILL_DEFER_TRANSPOSE` (default on; set "0" to disable):
+/// prefill attention keeps the SDPA output transpose as a lazy strided view
+/// and lets the per-head gate broadcast multiply materialize the token-major
+/// result directly, collapsing the transpose copy pass and the multiply pass
+/// into one. Elementwise and value-identical; decode (`L == 1`) never takes
+/// this path.
+let lagunaDeferPrefillTransposeEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_DEFER_TRANSPOSE"] != "0"
+
 /// Decode-only shared-expert NVFP4 QMV + SwiGLU fusion. This consumes the
 /// retained row-concatenated `[gate; up]` bank and emits only the 512-wide
 /// BF16 activation, preserving the two independent QMV casts and every BF16
@@ -4644,9 +4653,20 @@ final class LagunaRuntimeAttention: Module {
         // contiguous head-major payload directly produces the exact
         // `[B, 1, H*D]` byte order; the transpose only changes singleton-axis
         // metadata. Preserve the real transpose for prefill.
+        // Prefill with a per-head gate defers the transpose materialization:
+        // the transpose stays a lazy strided view and the gate broadcast
+        // multiply below writes the token-major contiguous result directly,
+        // collapsing the copy pass and the multiply pass into one. Same
+        // elementwise BF16 multiply of the same values — removing the
+        // intermediate copy cannot change any product.
+        let deferPrefillTranspose =
+            L > 1 && gatingEnabled && gatePerHead && gProj != nil
+            && lagunaDeferPrefillTransposeEnabled
         var output =
             L == 1
             ? attended.reshaped(B, L, -1)
+            : deferPrefillTranspose
+            ? attended.transposed(0, 2, 1, 3)
             : attended.transposed(0, 2, 1, 3).reshaped(B, L, -1)
 
         if gatingEnabled, let gProj {
@@ -4794,8 +4814,10 @@ final class LagunaRuntimeAttention: Module {
                 : softplus(projectedGate.asType(.float32)).asType(output.dtype)
             if gatePerHead {
                 output =
-                    (output.reshaped(B, L, nHeads, headDim) * gate[.ellipsis, .newAxis])
-                    .reshaped(B, L, -1)
+                    deferPrefillTranspose
+                    ? (output * gate[.ellipsis, .newAxis]).reshaped(B, L, -1)
+                    : (output.reshaped(B, L, nHeads, headDim) * gate[.ellipsis, .newAxis])
+                        .reshaped(B, L, -1)
             } else {
                 output = output * gate
             }
