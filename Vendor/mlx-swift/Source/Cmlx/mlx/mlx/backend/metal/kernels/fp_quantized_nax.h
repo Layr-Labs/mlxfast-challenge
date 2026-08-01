@@ -141,7 +141,13 @@ inline void dequantize(uint8_t w, U scale, threadgroup U* w_local) {
 
 // Per-group NVFP4 scale with fp4's 2^14 renormalization folded in (Change 1).
 static inline float fp4nv_scale_x16384(uint8_t s) {
-  return float(*(thread fp8_e4m3*)(&s)) * 16384.0f;
+  if (s < 16u) {
+    return float(uint(s) << 5);
+  }
+  ushort raw = ushort((uint(s) + uint(s & 128u)) << 7);
+  half converted = as_type<half>(raw);
+  converted *= 256.0h;
+  return float(converted) * 16384.0f;
 }
 
 // Four packed bytes -> one uint32 in little-endian nibble order. Read through
