@@ -4615,6 +4615,15 @@ func lagunaTailNormQKVGate(
 
 // MARK: - Norm-folded native-affine QKV projection (one dispatch)
 
+/// Four SIMDs amortize the exact RMS replica across 16 QMV rows. Each SIMD
+/// still owns four rows; virtual RMS slots map as `g + 4*j`. Set
+/// `DARKBLOOM_NORM_AFFINE_QKV_SIMDGROUPS=2` for the 8-row control.
+private let lagunaNormAffineQKVSimdgroups =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NORM_AFFINE_QKV_SIMDGROUPS"] == "2" ? 2 : 4
+private let lagunaNormAffineQKVThreadgroupSize = lagunaNormAffineQKVSimdgroups * 32
+private let lagunaNormAffineQKVRowsPerThreadgroup = lagunaNormAffineQKVSimdgroups * 4
+
 /// Folds the layer's input RMSNorm into the native group-32 affine INT8
 /// `[Q; K; V; (G)]` GEMV, so the head of the decode attention block is one
 /// dispatch instead of two (`MLXFast.rmsNorm` then MLX's `quantizedMM`).
@@ -4629,23 +4638,21 @@ func lagunaTailNormQKVGate(
 ///
 /// EXACTNESS, both halves.
 ///
-/// GEMV half -- a textual replica of `affine_qmv_fast<bfloat16_t, 32, 8>`
-/// keeping MLX's dispatch geometry EXACTLY.
+/// GEMV half -- a textual replica of `affine_qmv_fast<bfloat16_t, 32, 8>`;
+/// each SIMD keeps MLX's QMV lane/K/reduction geometry exactly.
 ///
 /// NORM half -- `rms_single_row<bfloat16_t, N_READS = 4>` at `axis_size ==
 /// 2048`, which MLX dispatches with 512 threads (sixteen simdgroups). This
-/// kernel has only 64 threads, so it EMULATES that grouping rather than
-/// approximating the mean square: virtual thread `vt = r + 64j` runs in a
-/// separate accumulator, real `simd_sum(acc_j)` reduces exactly the 32 values
-/// MLX's `simd_sum` reduces for virtual simdgroup `simd_gid + 2j`, in the same
-/// order, then the cross-simdgroup fold and `metal::precise::rsqrt` constant
-/// match. The output expression is MLX's verbatim
+/// selected kernel emulates that grouping: `vt = r + real_threads*j` uses a
+/// separate accumulator and writes virtual group
+/// `simd_gid + num_simdgroups*j`. All 16 partials reach the stock slots/order;
+/// the cross-group fold and `metal::precise::rsqrt` match. The output is MLX's
 /// `w[i] * static_cast<T>(xcache[i] * inv_mean)`.
 ///
 /// Two ways to hand the normalized row to the K loop, both bit-exact and both
 /// selectable (`DARKBLOOM_NORM_AFFINE_QKV_STAGE`):
 ///  * `tg` stages it in 4 KB of THREADGROUP memory. Measured a large LOSS
-///    (-32.9 us/layer): 4 KB per 64-thread threadgroup caps resident
+///    (-32.9 us/layer): 4 KB per threadgroup caps resident
 ///    threadgroups per core.
 ///  * `inline` (default) keeps threadgroup memory down to the 132 bytes the
 ///    reduction itself needs and re-derives each lane's eight normalized
@@ -4685,19 +4692,21 @@ private func lagunaNormAffineQKVSource(rows: Int, staged: Bool) -> String {
 private func lagunaNormAffineQKVBody(
     rows: Int, scratch: String, normalize: String, loadValue: String
 ) -> String {
+    let realThreads = lagunaNormAffineQKVThreadgroupSize
+    let simdgroups = lagunaNormAffineQKVSimdgroups
     return """
     constexpr uint axis_size = \(LagunaConstants.hiddenSize);
     constexpr uint out_vec_size = \(rows);
     constexpr uint n_reads = 4;                 // RMS_N_READS
     constexpr uint norm_threads = axis_size / n_reads;   // 512 virtual threads
-    constexpr uint real_threads = 64;
-    constexpr uint virtual_per_thread = norm_threads / real_threads;  // 8
+    constexpr uint real_threads = \(realThreads);
+    constexpr uint virtual_per_thread = norm_threads / real_threads;
     constexpr uint simd_size = 32;
     constexpr float norm_eps = 1.0e-6f;
     constexpr uint values_per_thread = 8;       // pack_factor 4 * packs_per_thread 2
     constexpr uint block_size = 256;            // values_per_thread * SIMD_SIZE
     constexpr uint results_per_simdgroup = 4;
-    constexpr uint num_simdgroups = 2;
+    constexpr uint num_simdgroups = \(simdgroups);
     constexpr uint group_size = 32;
     constexpr uint scale_step_per_thread = group_size / values_per_thread;
     constexpr uint in_vec_size_g = axis_size / group_size;
@@ -4711,7 +4720,7 @@ private func lagunaNormAffineQKVBody(
     threadgroup float local_sums[simd_size];
     \(scratch)
 
-    // --- rms_single_row replica, 512 virtual threads over 64 real ones ---
+    // --- rms_single_row replica over the selected real threads ---
     if (lid < simd_size) {
         local_sums[lid] = 0.0f;
     }
@@ -4795,9 +4804,8 @@ private func lagunaNormAffineQKVBody(
 private let lagunaNormAffineQKVStaged =
     ProcessInfo.processInfo.environment["DARKBLOOM_NORM_AFFINE_QKV_STAGE"] == "tg"
 
-/// `DARKBLOOM_NORM_AFFINE_QKV_PF` (default 4 = register-prefetch depth 4,
-/// **DEFAULT ON**; set "0" to restore the stock inline kernel; 1...4
-/// clamped). QmvLimiter study (notes/exp-qmvlimiter.md): the fused kernel's
+/// `DARKBLOOM_NORM_AFFINE_QKV_PF` selects register-prefetch depth 0...4.
+/// Defaults to 2 for SG4 and 4 for the SG2 control. QmvLimiter study: the fused kernel's
 /// RMS prologue (three barriers + the 2048-element reduction) runs
 /// dead-serial BEFORE the first weight byte of each threadgroup's short
 /// 18 KB stream, costing ~9% of the dispatch (harness noprol probe); the
@@ -4805,17 +4813,11 @@ private let lagunaNormAffineQKVStaged =
 /// loads ABOVE the prologue so the weight stream is in flight while the
 /// reduction runs, then consumes them from registers in the exact stock
 /// order. Pure reads of immutable weights and an identical FP schedule ->
-/// bit-identical (standalone-harness memcmp on all output rows, random
-/// banks, r10304 and r8240; model-level 130/130 max_abs_diff=0). Depth-4
-/// measured -11.9%/-12.2% kernel-level at decode clocks (48.61->42.84 us
-/// r10304, 39.34->34.55 us r8240; 554/549 GB/s vs 488/482 stock; projected
-/// ~-171 us/step), depth curve monotone pf1->pf4, occupancy unchanged
-/// (maxTotalThreadsPerThreadgroup 1024, +64 B thread state). Ignored under
-/// the `tg` staged variant.
+/// bit-identical. Ignored under the `tg` staged variant.
 let lagunaNormAffineQKVPrefetchDepth: Int = {
-    let raw =
-        ProcessInfo.processInfo.environment["DARKBLOOM_NORM_AFFINE_QKV_PF"] ?? "4"
-    return min(max(Int(raw) ?? 4, 0), 4)
+    let fallback = lagunaNormAffineQKVSimdgroups == 4 ? 2 : 4
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_NORM_AFFINE_QKV_PF"] ?? ""
+    return min(max(Int(raw) ?? fallback, 0), 4)
 }()
 
 /// Register-prefetch twin of the inline `lagunaNormAffineQKVSource`. The
@@ -4828,6 +4830,8 @@ let lagunaNormAffineQKVPrefetchDepth: Int = {
 private func lagunaNormAffineQKVPrefetchSource(
     rows: Int, depth: Int, indexed: Bool = false
 ) -> String {
+    let realThreads = lagunaNormAffineQKVThreadgroupSize
+    let simdgroups = lagunaNormAffineQKVSimdgroups
     let metadataPointers = indexed
         ? """
         const device ushort* mi = metadata_indices + out_row * in_vec_size_g +
@@ -4873,14 +4877,14 @@ private func lagunaNormAffineQKVPrefetchSource(
     constexpr uint out_vec_size = \(rows);
     constexpr uint n_reads = 4;                 // RMS_N_READS
     constexpr uint norm_threads = axis_size / n_reads;   // 512 virtual threads
-    constexpr uint real_threads = 64;
-    constexpr uint virtual_per_thread = norm_threads / real_threads;  // 8
+    constexpr uint real_threads = \(realThreads);
+    constexpr uint virtual_per_thread = norm_threads / real_threads;
     constexpr uint simd_size = 32;
     constexpr float norm_eps = 1.0e-6f;
     constexpr uint values_per_thread = 8;       // pack_factor 4 * packs_per_thread 2
     constexpr uint block_size = 256;            // values_per_thread * SIMD_SIZE
     constexpr uint results_per_simdgroup = 4;
-    constexpr uint num_simdgroups = 2;
+    constexpr uint num_simdgroups = \(simdgroups);
     constexpr uint group_size = 32;
     constexpr uint scale_step_per_thread = group_size / values_per_thread;
     constexpr uint in_vec_size_g = axis_size / group_size;
@@ -5021,11 +5025,12 @@ private let lagunaNormAffineQKVKernels: [Int: MLXFast.MLXFastKernel] = {
             if kernels[rows] != nil { continue }
             let staged = lagunaNormAffineQKVStaged
             let pf = staged ? 0 : lagunaNormAffineQKVPrefetchDepth
+            let sg = lagunaNormAffineQKVSimdgroups
             kernels[rows] = MLXFast.metalKernel(
                 name: pf > 0
-                    ? "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_pf\(pf)_v1"
+                    ? "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_pf\(pf)_sg\(sg)_v1"
                     : "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_"
-                        + (staged ? "tg" : "inl") + "_v1",
+                        + (staged ? "tg" : "inl") + "_sg\(sg)_v1",
                 inputNames: [
                     "residual", "norm_weight", "weight_codes", "weight_scales",
                     "weight_biases",
@@ -5047,13 +5052,14 @@ private let lagunaNormAffineQKVIndexedKernels: [Int: MLXFast.MLXFastKernel] = {
         return kernels
     }
     let kvRows = 2 * LagunaConstants.numKeyValueHeads * LagunaConstants.headDim
+    let sg = lagunaNormAffineQKVSimdgroups
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         for gateRows in [0, heads] {
             let rows = heads * LagunaConstants.headDim + kvRows + gateRows
             if kernels[rows] != nil { continue }
             kernels[rows] = MLXFast.metalKernel(
                 name: "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_"
-                    + "pf\(lagunaNormAffineQKVPrefetchDepth)_idx_v1",
+                    + "pf\(lagunaNormAffineQKVPrefetchDepth)_idx_sg\(sg)_v1",
                 inputNames: [
                     "residual", "norm_weight", "weight_codes",
                     "metadata_indices", "metadata_lut",
@@ -5091,7 +5097,9 @@ func lagunaNormAffineQKV(
     indexedMetadata: LagunaIndexedAffineMetadata? = nil,
     rows: Int
 ) -> MLXArray? {
-    guard let kernel = lagunaNormAffineQKVKernels[rows] else { return nil }
+    guard rows.isMultiple(of: lagunaNormAffineQKVRowsPerThreadgroup),
+        let kernel = lagunaNormAffineQKVKernels[rows]
+    else { return nil }
     let hidden = LagunaConstants.hiddenSize
     guard residual.dtype == .bfloat16,
         residual.shape == [1, 1, hidden],
@@ -5120,8 +5128,11 @@ func lagunaNormAffineQKV(
                 + "pf\(lagunaNormAffineQKVPrefetchDepth) indexed")
         return indexedKernel(
             [residual, normWeight, codes, metadata.indices, metadata.lut],
-            grid: ((rows / 8) * 64, 1, 1),
-            threadGroup: (64, 1, 1),
+            grid: (
+                (rows / lagunaNormAffineQKVRowsPerThreadgroup)
+                    * lagunaNormAffineQKVThreadgroupSize,
+                1, 1),
+            threadGroup: (lagunaNormAffineQKVThreadgroupSize, 1, 1),
             outputShapes: [[1, 1, rows]],
             outputDTypes: [.bfloat16]
         )[0]
@@ -5133,8 +5144,11 @@ func lagunaNormAffineQKV(
             : "norm+affine qkv qmv r\(rows)")
     return kernel(
         [residual, normWeight, codes, scales, biases],
-        grid: ((rows / 8) * 64, 1, 1),
-        threadGroup: (64, 1, 1),
+        grid: (
+            (rows / lagunaNormAffineQKVRowsPerThreadgroup)
+                * lagunaNormAffineQKVThreadgroupSize,
+            1, 1),
+        threadGroup: (lagunaNormAffineQKVThreadgroupSize, 1, 1),
         outputShapes: [[1, 1, rows]],
         outputDTypes: [.bfloat16]
     )[0]
@@ -6116,31 +6130,84 @@ final class LagunaRuntimeAttention: Module {
 
 /// `DARKBLOOM_NVFP4_SCALE_FOLD` (default on; set "0" to restore the pre-fold
 /// arithmetic): hoists the `2^14` out of `laguna_nvfp4_qdot_16`'s sixteen
-/// per-call multiplies into the one multiply `laguna_nvfp4_scale` already
-/// performs (−16 scalar multiplies per call). Bit-exact: power-of-two
-/// scaling touches only the exponent field, so every product, partial sum,
-/// and rounding decision is exactly `2^-14 ×` its old value and the `2^14`
-/// reappears once before the single final rounding. The half→float dtype
-/// move was range-checked by enumerating all 256 E4M3 scale bytes through
-/// both paths (zero divergence, 136x headroom); the compiler cannot do the
-/// fold itself under `setFastMathEnabled(false)`. Pure arithmetic identity
-/// inside our own Metal source — no MLX-observable shape/dtype/order
-/// changes; see the original submission note for the full derivation.
+/// per-call multiplies and folds it into the one multiply
+/// `laguna_nvfp4_scale` already performs. **−16 scalar multiplies per
+/// `qdot_16` call, −16.5% of the dequantize ALU, ~−1104 M float multiplies per
+/// token across L8 + L9, and nothing added** (`notes/57` §10).
+///
+/// Bit-exact. `16384 == 2^14`, and scaling a binary float by an exact power of
+/// two touches only the exponent field, so every product, partial sum and
+/// rounding decision in the accumulator chain is exactly `2^-14 ×` its old
+/// value — same bits, different exponent — and the `2^14` reappears once in
+/// the scale before the single final rounding.
+///
+/// **The dtype move is range-checked, not assumed** (`notes/58` §1a). The
+/// multiply moves from half to float because `4194304` overflows half, and a
+/// power-of-two argument does NOT by itself survive a dtype change — so all
+/// 256 E4M3 scale bytes were enumerated through both paths, in half and in
+/// float, with an explicit `isfinite` check on the old path. **Zero
+/// divergence, and no overflow is reachable:** the shuffle
+/// `(bits & 127) << 7` maps E4M3 into half format, and since E4M3's exponent
+/// bias is 7 against half's 15 it already yields the scale divided by 256 —
+/// which is exactly what the old `*= 256.0` corrected. The half-domain
+/// intermediate therefore peaks at **1.875**, and the scale at **480**,
+/// against half's finite max of 65504. **136x headroom.**
+///
+/// The compiler cannot do this fold itself: `device.cpp:631` sets
+/// `setFastMathEnabled(false)`, so reassociating `Σ(a·h·2^14)` into
+/// `2^14·Σ(a·h)` is forbidden and all sixteen multiplies really are emitted.
+/// `device.cpp` is outside `editablePaths`, so it is done by hand.
+///
+/// Safe under the `notes/00` kernel-selection rule: this is a pure arithmetic
+/// identity **inside our own Metal source**. No shape, dtype, tile count or
+/// reduction order that MLX can observe changes, so it cannot alter which
+/// kernel MLX selects.
 let lagunaNvfp4ScaleFoldEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_FOLD"] != "0"
 
-/// `DARKBLOOM_NVFP4_NIBBLE_SPLIT` (default `1` = split; `0` stock shuffle,
-/// `2` the 2-constant control arm): a strictly shorter integer sequence
-/// producing the SAME eight `half` bit patterns per code word (19 → 13 int
-/// ops per word, eight → three mask constants); values, FP32 accumulation
-/// order, and the single final BF16 round are untouched. Arm `2` keeps the
-/// 19-op structure with two constants, isolating register pressure from
-/// instruction count. Bit-exact by construction: every form is an OR of
-/// masked shifts, pinned by the 33 single-bit basis words (all verified
-/// bit-for-bit vs stock, plus 300k random words and the full NVFP4
-/// alphabet); see the original submission note for the derivation.
-/// Composes with `DARKBLOOM_NVFP4_SCALE_FOLD` (that flag scales the decoded
-/// weights, this one only assembles their bits).
+/// `DARKBLOOM_NVFP4_NIBBLE_SPLIT` (default `1` = split; set `0` for the stock
+/// shuffle, `2` for the 2-constant control arm): a strictly shorter
+/// instruction sequence that produces the SAME eight `half` bit patterns per
+/// code word. Values, dtypes, FP32 accumulation and its order, and the single
+/// final BF16 round are untouched -- only the integer sequence that builds the
+/// half bit patterns changes.
+///
+///   0  stock. Each of the four `half2` words takes its own magnitude
+///      shift+mask, its own sign shift+mask and an OR: 5 int ops (4 for `p3`,
+///      whose sign is already in place) = **19 per code word, 38 per 16-value
+///      group**, spread over **eight distinct 32-bit mask constants**.
+///
+///   1  split. Separate the even and odd nibbles once, and in the same step
+///      slide each nibble's sign three places so magnitude and sign sit at a
+///      FIXED offset from one another. After that one shift+mask yields a
+///      whole `half2`:
+///
+///          xe = c & 0x0F0F0F0F   even nibbles: mag 4j..4j+2, sign 4j+3
+///          ge = xe | (xe << 3)   sign copied to 4j+6 -- those bits are zero
+///                                in `xe`, so the OR cannot collide
+///          yo = c & 0xF0F0F0F0   odd nibbles
+///          go = yo | (yo >> 3)   mag copied down to 4j-3..4j-1, sign kept
+///          p0 = (ge << 9) & M    p2 = (ge << 1) & M
+///          p1 = (go << 8) & M    p3 =  go       & M     M = 0x8E008E00
+///
+///      **13 int ops per code word, 26 per group (-12), and three mask
+///      constants instead of eight (-5 live constant registers).**
+///
+///   2  the op-count control. Identical 19-op structure to stock -- shift
+///      first, then mask -- but only TWO distinct mask constants. It isolates
+///      "fewer live constants" from "fewer instructions": if `2` alone moves
+///      the needle the win is register pressure, if only `1` moves it the win
+///      is the instruction count.
+///
+/// Bit-exactness is by construction, not tolerance. Every form here is an OR
+/// of masked shifts, so each output bit is an OR of a fixed subset of input
+/// bits and the 33 single-bit basis words pin the function completely. All 33
+/// basis words plus 300 000 random words agree bit-for-bit with stock, and
+/// decoding every (nibble position, code) pair through both yields the
+/// identical float -- the NVFP4 alphabet {0, .5, 1, 1.5, 2, 3, 4, 6} x 2^-14.
+///
+/// Composes with `DARKBLOOM_NVFP4_SCALE_FOLD`: that flag scales the decoded
+/// weights, this one only changes how their bits are assembled.
 let lagunaNvfp4NibbleSplit: Int = {
     guard
         let raw = ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_NIBBLE_SPLIT"],
@@ -6161,31 +6228,87 @@ let lagunaNvfp4ScaleCarry: Bool =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_CARRY"] != "0"
 
 /// `DARKBLOOM_NVFP4_QDOT_SEED_ELIDE` (default on; set "0" to restore the
-/// `float accum = 0.0f;` seed): removes the one dead FP add per 16-value
-/// NVFP4 group (~69 M/decoded token; not compiler-foldable because
-/// `+0 + -0 == +0` and `device.cpp` disables fast math). Bit-exact by a
-/// closed signed-zero case analysis — the elided and seeded forms can differ
-/// only as `+0.0` vs `-0.0` at the group sum, and every call site's
-/// `+0.0`-seeded accumulation or residual add absorbs that sign; see the
-/// original submission note and `LagunaNVFP4QdotSeedTests`, which executes
-/// the analysis over the adversarial signed-zero domain (all-`-0.0` groups
-/// included). Both flag arms emit the packed-word bodies textually, so the
-/// flag isolates the seed and nothing else.
+/// `float accum = 0.0f;` seed): removes the one dead FP add per 16-value NVFP4
+/// group. `laguna_nvfp4_qdot_codes_16` seeds its accumulator with the literal
+/// `+0.0f` and then performs four `accum +=`, so the very first of those four
+/// is `fl(+0.0f + t)`. **`fadd float 0.0, %t` is NOT foldable to `%t`** —
+/// `0.0f + (-0.0f)` is `+0.0f`, not `-0.0f`, so eliminating it needs the
+/// no-signed-zeros flag, and `device.cpp:631` sets
+/// `setFastMathEnabled(false)`. The add really is emitted, once per group, and
+/// with ~69 M groups per decoded token across the nine routed/shared
+/// SwiGLU-QMV and down kernels that is ~69 M dead FP adds per token, ~1.4% of
+/// this loop's ALU.
+///
+/// **Bit-exactness is a closed case analysis over signed zero, not a
+/// tolerance.** Write the four partial sums `t0..t3` (`t0` is the first
+/// four-term group of packed word `codes.x`). Current: `a = (((+0 + t0) + t1)
+/// + t2) + t3`. Elided: `a' = ((t0 + t1) + t2) + t3`.
+///
+///  1. If `t0 != -0.0` then `+0.0 + t0 == t0` bit-for-bit (IEEE 754 round-to-
+///     nearest: `+0` is the additive identity for every operand except `-0`),
+///     so `a' == a` and nothing downstream can differ.
+///  2. If `t0 == -0.0` then the current form holds `+0.0` and the elided form
+///     `-0.0`. Both are zeros, so each subsequent add either lands on the same
+///     nonzero value (`±0 + x == x`) or keeps both operands zero. `a` and `a'`
+///     can therefore differ ONLY as `+0.0` versus `-0.0`, and only when all
+///     sixteen products of the group are `-0.0` (a sum of floats is `-0.0`
+///     only if both addends are `-0.0`).
+///  3. `scale` is always finite — `laguna_nvfp4_scale` builds its half from
+///     `(bits & 127) << 7`, whose largest magnitude is 1.875h, so no E4M3 byte
+///     can make it Inf/NaN — hence `scale * (±0.0) == ±0.0` and `qdot`'s
+///     return differs at most in the sign of a zero.
+///  4. Every call site absorbs that sign. The SwiGLU kernels accumulate into
+///     `gate_result`/`up_result`, seeded `+0.0f`: `+0.0 + (-0.0) == +0.0`, and
+///     once the accumulator is nonzero a `±0.0` addend leaves it unchanged, so
+///     a `-0.0` row accumulator is unreachable in either form. The down
+///     kernels assign `result[row]`, `simd_sum` it (again `+0 + -0 == +0`
+///     unless all 32 lanes are `-0.0`), cast to BF16, and then reach the
+///     output only through `routed + shared` / `product + routed_total` /
+///     `residual + r2`, whose left operands are themselves `+0.0`-seeded
+///     accumulations or the residual — so the `-0.0` is absorbed there too.
+///
+/// `LagunaNVFP4QdotSeedTests` executes 1-4 over the adversarial signed-zero
+/// domain on the CPU, including groups whose every NVFP4 code is `-0.0`
+/// (code 8) and every activation `+0.0`.
+///
+/// The two packed-word bodies are emitted textually in BOTH arms of the flag,
+/// so the flag isolates the seed and nothing else. That costs no arithmetic:
+/// the Metal compiler must already fully unroll the two-iteration `j` loop —
+/// `input` is a `thread float[16]` that only stays in registers under constant
+/// indices — so the unrolled text is what it was already compiling.
 let lagunaNvfp4QdotSeedElisionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_QDOT_SEED_ELIDE"] != "0"
 
 /// `DARKBLOOM_NVFP4_SCALE_DEFER` (default ON; set "0" to restore): moves
 /// the `2^22` that `DARKBLOOM_NVFP4_SCALE_FOLD` parked in
-/// `laguna_nvfp4_scale` off the per-group scale and onto the per-row
-/// accumulator — one multiply per output row instead of one per 16-value
-/// group. Exact under a range condition, not case analysis: power-of-two
-/// scaling commutes with rounding unless a product lands in the FP32
-/// subnormal range, which here needs a group with `0 < |scale * accum| <
-/// 2^-104`, i.e. all sixteen BF16 activations below ~`2^-99` — unreachable
-/// for this model's O(1) residual/RMSNorm activation grid (~60 binades of
-/// margin; full derivation in the original submission note). Promoted to
-/// the shipped default on that basis; the exact-token gates fail loudly if
-/// the range assumption is ever violated.
+/// `laguna_nvfp4_scale` out of the per-group scale and onto the per-row
+/// accumulator, one multiply per output row instead of one per 16-value
+/// group. `laguna_nvfp4_scale` drops from five ops to four (and, add, shift,
+/// convert) and the group cost falls by one FP multiply -- the same ~69 M
+/// removals per decoded token as the seed elision above.
+///
+/// Off by default **on purpose**. Unlike the seed elision, the carry sign-fold
+/// and the nibble split, this one is not exact by case analysis: it is exact
+/// under a range condition. Multiplying by an exact power of two is exact and
+/// commutes with rounding, so with `s' = scale * 2^-22` every group product
+/// `fl(s' * accum)` is exactly `2^-22 * fl(scale * accum)`, every partial sum
+/// of those products is exactly `2^-22` times the current one, and the single
+/// epilogue multiply restores it before the one BF16 rounding -- **provided no
+/// product lands in the FP32 subnormal range**, where scaling no longer
+/// commutes with rounding.
+///
+/// The condition, stated exactly: the deferred form diverges only if some
+/// group has `0 < |scale * accum| < 2^-104`. `s'` is at least `2^-17` (the
+/// smallest nonzero E4M3 byte, `2^-9`, over 256), so that needs
+/// `|accum| < 2^-109`; every NVFP4 weight is a multiple of `2^-15` and every
+/// activation is BF16, so a nonzero `accum` below `2^-109` needs all sixteen
+/// activations of the group below roughly `2^-99`. This model cannot produce
+/// them: activations are BF16 roundings of `O(1)` residual-stream and RMSNorm
+/// quantities, and cancellation in BF16 lands on that same coarse grid, so a
+/// hidden value is either exactly zero (which contributes an exact zero and is
+/// safe) or within a few tens of binades of the row's scale. The margin is
+/// ~60 binades — promoted to the shipped default on that basis; the
+/// exact-token gates fail loudly if the range assumption is ever violated.
 let lagunaNvfp4ScaleDeferEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_DEFER"] != "0"
     && lagunaNvfp4ScaleFoldEnabled
@@ -6865,15 +6988,11 @@ func lagunaRoutedSwiGLUQMV(
 /// the identical one-byte scale and uint2 code loads and runs the textually
 /// identical dequant/accumulate/SwiGLU chain — only scale address computation
 /// differs.
-/// Shared body of the packed routed gate/up QMV. `prologue` runs after the
-/// tile/lane declarations and `expertExpression` supplies the selected
-/// expert row — `""`/`indices[...]` for the accepted v1 kernel, the top-8
-/// prologue/`top8_winner` for the top-8 prologue twin below.
-/// Every other line is the identical accepted text for both.
-func lagunaRoutedSwiGLUQMVPackedKernelSource(
-    prologue: String, expertExpression: String
-) -> String {
-    """
+private let lagunaRoutedSwiGLUQMVPackedKernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_bf16_v1",
+    inputNames: ["input", "fused_weight", "packed_scales", "indices"],
+    outputNames: ["activated"],
+    source: """
         constexpr uint input_width = 2048;
         constexpr uint output_width = 512;
         constexpr uint block_width = 512;
@@ -6890,11 +7009,10 @@ func lagunaRoutedSwiGLUQMVPackedKernelSource(
         uint group = threadgroup_position_in_grid.x;
         uint expert_slot = group % routed_experts;
         uint tile = group / routed_experts;
+        uint expert = uint(indices[expert_slot]);
         uint simd_group = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
         uint first_row = tile * 4 + simd_group * 2;
-        \(prologue)
-        uint expert = \(expertExpression);
 
         const device uint8_t* expert_weight =
             (const device uint8_t*)fused_weight +
@@ -6964,15 +7082,7 @@ func lagunaRoutedSwiGLUQMVPackedKernelSource(
                 ] = bfloat(silu * up);
             }
         }
-        """
-}
-
-private let lagunaRoutedSwiGLUQMVPackedKernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_bf16_v1",
-    inputNames: ["input", "fused_weight", "packed_scales", "indices"],
-    outputNames: ["activated"],
-    source: lagunaRoutedSwiGLUQMVPackedKernelSource(
-        prologue: "", expertExpression: "uint(indices[expert_slot])"),
+        """,
     header: lagunaSharedSwiGLUQMVHeader,
     ensureRowContiguous: true
 )
@@ -7004,133 +7114,6 @@ func lagunaRoutedSwiGLUQMVPacked(
 
     return lagunaRoutedSwiGLUQMVPackedKernel(
         [input, fusedWeight, packedScales, indices],
-        grid: (LagunaConstants.numExpertsPerTok * 128 * 64, 1, 1),
-        threadGroup: (64, 1, 1),
-        outputShapes: [[
-            1, 1, LagunaConstants.numExpertsPerTok, 1,
-            LagunaConstants.moeIntermediateSize,
-        ]],
-        outputDTypes: [.bfloat16]
-    )[0]
-}
-
-// Decode router top-8 prologue: a twin of the packed routed gate/up QMV
-// that selects its expert in-kernel from the router logits instead of the
-// standalone top-8 dispatch's indices, so it joins that dispatch's barrier
-// group — one serialized window fewer per sparse layer per decode step.
-// Exact: the standalone selection is the top 8 of a strict total order
-// (`laguna_router_ordinal_before`, indices unique), so the k-th comparator
-// minimum reproduces it exactly; scores/keys use the identical FP32 text
-// and `float(bf16 bias)` equals the standalone kernel's FP32-cast input.
-// Verified bitwise incl. exact ties in LagunaRouterTop8PrologueTests.
-
-/// `DARKBLOOM_ROUTER_TOP8_PROLOGUE` (default ON; "0" restores the stock
-/// indices-consuming routed QMV dispatch order).
-let lagunaRouterTop8PrologueEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_TOP8_PROLOGUE"] != "0"
-
-/// Simd-shuffle-only comparator-minimum extraction; lane `l` owns experts
-/// `l + 32j`, `mask` bit `j` marks extracted. The threadgroup runs
-/// `expert_slot + 1` rounds (uniform bound) and keeps the last winner.
-let lagunaRouterTop8PrologueHeader = """
-    METAL_FUNC float laguna_router_top8_score(float x) {
-        float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
-        return x < 0.0f ? y : 1.0f - y;
-    }
-
-    METAL_FUNC uint laguna_router_top8_extract_round(
-        threadgroup const uint* keys, thread uint& mask, uint lane) {
-        uint best_ordinal = 0xFFFFFFFFu;
-        uint best_index = 256u;
-        for (uint j = 0; j < 8; ++j) {
-            if ((mask & (1u << j)) != 0u) {
-                continue;
-            }
-            uint e = lane + 32u * j;
-            uint o = keys[e];
-            if (laguna_router_ordinal_before(o, e, best_ordinal, best_index)) {
-                best_ordinal = o;
-                best_index = e;
-            }
-        }
-        for (ushort offset = 16; offset > 0; offset >>= 1) {
-            uint other_ordinal = simd_shuffle_xor(best_ordinal, offset);
-            uint other_index = simd_shuffle_xor(best_index, offset);
-            if (laguna_router_ordinal_before(
-                other_ordinal, other_index, best_ordinal, best_index)) {
-                best_ordinal = other_ordinal;
-                best_index = other_index;
-            }
-        }
-        if ((best_index & 31u) == lane) {
-            mask |= 1u << (best_index >> 5u);
-        }
-        return best_index;
-    }
-    """
-
-private let lagunaRouterTop8ProloguePrelude = """
-    threadgroup uint top8_keys[256];
-        threadgroup uint top8_winner;
-        {
-            uint flat = simd_group * 32 + lane;
-            for (uint i = 0; i < 4; ++i) {
-                uint e = flat * 4 + i;
-                top8_keys[e] = laguna_router_key_ordinal(
-                    -(laguna_router_top8_score(float(logits[e]))
-                        + float(correction_bias[e])));
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group == 0) {
-                uint mask = 0u;
-                uint winner = 0u;
-                for (uint r = 0; r <= expert_slot; ++r) {
-                    winner = laguna_router_top8_extract_round(
-                        top8_keys, mask, lane);
-                }
-                if (lane == 0) {
-                    top8_winner = winner;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    """
-
-private let lagunaRoutedSwiGLUQMVPackedTop8Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8p_bf16_v1",
-    inputNames: [
-        "input", "fused_weight", "packed_scales", "logits", "correction_bias",
-    ],
-    outputNames: ["activated"],
-    source: lagunaRoutedSwiGLUQMVPackedKernelSource(
-        prologue: lagunaRouterTop8ProloguePrelude,
-        expertExpression: "top8_winner"),
-    header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
-        + "\n" + lagunaRouterTop8PrologueHeader,
-    ensureRowContiguous: true
-)
-
-/// Same operands and dispatch as `lagunaRoutedSwiGLUQMVPacked` with
-/// `indices` replaced by the router logits and BF16 correction bias; the
-/// caller's guards pin the bank shapes.
-func lagunaRoutedSwiGLUQMVPackedTop8(
-    _ input: MLXArray,
-    fusedWeight: MLXArray,
-    packedScales: MLXArray,
-    logits: MLXArray,
-    correctionBias: MLXArray
-) -> MLXArray {
-    precondition(input.dtype == .bfloat16)
-    precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
-    precondition(fusedWeight.dtype == .uint32)
-    precondition(packedScales.dtype == .uint8)
-    precondition(logits.dtype == .bfloat16)
-    precondition(logits.size == LagunaConstants.numExperts)
-    precondition(correctionBias.dtype == .bfloat16)
-    precondition(correctionBias.size == LagunaConstants.numExperts)
-
-    return lagunaRoutedSwiGLUQMVPackedTop8Kernel(
-        [input, fusedWeight, packedScales, logits, correctionBias],
         grid: (LagunaConstants.numExpertsPerTok * 128 * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[
@@ -8868,7 +8851,7 @@ private func lagunaDecodeRouterOrdinalKernelSource(
         """
 }
 
-let lagunaDecodeRouterOrdinalHeader = """
+private let lagunaDecodeRouterOrdinalHeader = """
     METAL_FUNC uint laguna_router_key_ordinal(float key) {
         uint bits = as_type<uint>(key);
         uint magnitude = bits & 0x7FFFFFFFu;
@@ -10250,36 +10233,13 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 {
                     lagunaPackedScalesLog.note(
                         "active", "routed swiglu qmv packed dispatch")
-                    // Top-8 prologue: bit-identical in-kernel selection
-                    // (see lagunaRoutedSwiGLUQMVPackedTop8Kernel) removes this
-                    // dispatch's dependency on the standalone top-8, and
-                    // with it one barrier window per sparse layer.
-                    if lagunaRouterTop8PrologueEnabled,
-                        let logits = routerLogits,
-                        logits.dtype == .bfloat16,
-                        logits.size == LagunaConstants.numExperts,
-                        gate.topK == LagunaConstants.numExpertsPerTok,
-                        gate.routerLogitSoftcapping == 0,
-                        gate.eScoreCorrectionBias.dtype == .bfloat16,
-                        gate.eScoreCorrectionBias.size == LagunaConstants.numExperts
-                    {
-                        lagunaTrace("routed gate/up QMV + SwiGLU (packed, top8 prologue)")
-                        activated = lagunaRoutedSwiGLUQMVPackedTop8(
-                            x,
-                            fusedWeight: fusedWeight,
-                            packedScales: packedBank,
-                            logits: logits,
-                            correctionBias: gate.eScoreCorrectionBias
-                        )
-                    } else {
-                        lagunaTrace("routed gate/up QMV + SwiGLU (packed scales)")
-                        activated = lagunaRoutedSwiGLUQMVPacked(
-                            x,
-                            fusedWeight: fusedWeight,
-                            packedScales: packedBank,
-                            indices: inds
-                        )
-                    }
+                    lagunaTrace("routed gate/up QMV + SwiGLU (packed scales)")
+                    activated = lagunaRoutedSwiGLUQMVPacked(
+                        x,
+                        fusedWeight: fusedWeight,
+                        packedScales: packedBank,
+                        indices: inds
+                    )
                 } else {
                     if lagunaPackedScalesEnabled {
                         lagunaPackedScalesLog.note(
