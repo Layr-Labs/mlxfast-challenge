@@ -293,24 +293,9 @@ template <
   // DARKBLOOM_GQA_PAIR_HEADS: preserve each head's exact key order and
   // reduction tree while sharing the K/V device reads across adjacent heads.
   if constexpr (D == 128 && V == 128 && DARKBLOOM_GQA_PAIR_HEADS == 2) {
-  // Vector-load eligibility: the pair path issues 8-byte vec<T,4> K/V loads
-  // (T is 2 bytes at D == V == 128), so every element offset in the K/V
-  // indexing must be a multiple of 4 elements and the base pointers 8-byte
-  // aligned. simd_lid * qk_per_thread is always a multiple of 4 here; the
-  // strides and bases are checked at runtime. Ineligible layouts fall back
-  // to the stock per-head path below, which the pair path reproduces
-  // bit-for-bit by construction (same key order, same reduction tree), so
-  // the fallback changes nothing but speed.
-  const bool pair_vec_aligned =
-      (((k_seq_stride | v_seq_stride | k_head_stride | v_head_stride) & 3) ==
-       0) &&
-      ((reinterpret_cast<uintptr_t>(keys) |
-        reinterpret_cast<uintptr_t>(values)) &
-       7) == 0;
   const bool use_gqa_pair =
       (gqa_factor == 8 || gqa_factor == 6) &&
       tpg.y == 1 && (tpg.x % 2) == 0 &&
-      pair_vec_aligned &&
       !has_mask && !do_causal && !has_sinks;
   if (use_gqa_pair) {
     const int pair_idx = tid.x;
@@ -365,36 +350,24 @@ template <
     for (; i + BN < N; i += 2 * BN) {
       const device T* pipe_keys_b = pair_keys + inner_k_stride;
       const device T* pipe_values_b = pair_values + inner_v_stride;
-      // 8-byte vec<T,4> loads (alignment certified by pair_vec_aligned at
-      // entry). Identical elements in identical order to the four scalar
-      // loads each replaces; the T -> U conversion points are unchanged, so
-      // the FP sequence is character-identical.
-      const vec<T, 4> vec_ka =
-          *reinterpret_cast<const device vec<T, 4>*>(pair_keys);
-      const vec<T, 4> vec_kb =
-          *reinterpret_cast<const device vec<T, 4>*>(pipe_keys_b);
       U pipe_ka[4];
       U pipe_kb[4];
-      pipe_ka[0] = vec_ka.x;
-      pipe_ka[1] = vec_ka.y;
-      pipe_ka[2] = vec_ka.z;
-      pipe_ka[3] = vec_ka.w;
-      pipe_kb[0] = vec_kb.x;
-      pipe_kb[1] = vec_kb.y;
-      pipe_kb[2] = vec_kb.z;
-      pipe_kb[3] = vec_kb.w;
-      const vec<T, 4> vec_va =
-          *reinterpret_cast<const device vec<T, 4>*>(pair_values);
-      const vec<T, 4> vec_vb =
-          *reinterpret_cast<const device vec<T, 4>*>(pipe_values_b);
-      const T pipe_va0 = vec_va.x;
-      const T pipe_va1 = vec_va.y;
-      const T pipe_va2 = vec_va.z;
-      const T pipe_va3 = vec_va.w;
-      const T pipe_vb0 = vec_vb.x;
-      const T pipe_vb1 = vec_vb.y;
-      const T pipe_vb2 = vec_vb.z;
-      const T pipe_vb3 = vec_vb.w;
+      pipe_ka[0] = pair_keys[0];
+      pipe_ka[1] = pair_keys[1];
+      pipe_ka[2] = pair_keys[2];
+      pipe_ka[3] = pair_keys[3];
+      pipe_kb[0] = pipe_keys_b[0];
+      pipe_kb[1] = pipe_keys_b[1];
+      pipe_kb[2] = pipe_keys_b[2];
+      pipe_kb[3] = pipe_keys_b[3];
+      const T pipe_va0 = pair_values[0];
+      const T pipe_va1 = pair_values[1];
+      const T pipe_va2 = pair_values[2];
+      const T pipe_va3 = pair_values[3];
+      const T pipe_vb0 = pipe_values_b[0];
+      const T pipe_vb1 = pipe_values_b[1];
+      const T pipe_vb2 = pipe_values_b[2];
+      const T pipe_vb3 = pipe_values_b[3];
       // Manual full unroll of the qk_per_thread == 4 element loop. Same
       // loads, same fmuladd chain order per score: identical FP sequence.
 
@@ -477,18 +450,14 @@ template <
       pair_values += 2 * inner_v_stride;
     }
     if (i < N) {
-      const vec<T, 4> vec_kt =
-          *reinterpret_cast<const device vec<T, 4>*>(pair_keys);
-      const vec<T, 4> vec_vt =
-          *reinterpret_cast<const device vec<T, 4>*>(pair_values);
-      pair_k[0] = vec_kt.x;
-      pair_k[1] = vec_kt.y;
-      pair_k[2] = vec_kt.z;
-      pair_k[3] = vec_kt.w;
-      const T pipe_va0 = vec_vt.x;
-      const T pipe_va1 = vec_vt.y;
-      const T pipe_va2 = vec_vt.z;
-      const T pipe_va3 = vec_vt.w;
+      pair_k[0] = pair_keys[0];
+      pair_k[1] = pair_keys[1];
+      pair_k[2] = pair_keys[2];
+      pair_k[3] = pair_keys[3];
+      const T pipe_va0 = pair_values[0];
+      const T pipe_va1 = pair_values[1];
+      const T pipe_va2 = pair_values[2];
+      const T pipe_va3 = pair_values[3];
       // Manual full unroll of the qk_per_thread == 4 element loop. Same
       // loads, same fmuladd chain order per score: identical FP sequence.
 

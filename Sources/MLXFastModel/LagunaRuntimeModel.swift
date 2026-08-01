@@ -156,6 +156,16 @@ let lagunaFusedRoutedSwiGLUQMVEnabled =
 let lagunaPackedScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] != "0"
 
+/// Same-size A/B for the packed routed-scale bank. When enabled, the side
+/// bank is laid out lane-major as `[expert][tile][logical row][lane][kblock]
+/// [gate/up]`, so one aligned 8-byte load supplies all four K-block scales
+/// for one output row. The quantized values, scale bytes, accumulation order,
+/// and BF16 boundaries are unchanged. It is default-ON for the candidate;
+/// set `DARKBLOOM_PACKED_SCALE_WORDS=0` to run the old packed layout as the
+/// same-binary A/B control.
+let lagunaPackedScaleWordsEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALE_WORDS"] != "0"
+
 /// One-shot stderr visibility for the packed-scales arm: with the flag set,
 /// the arm MUST announce either "active" (bank built / packed dispatch taken)
 /// or "inactive" (a guard declined and the stock kernel ran instead), so a
@@ -587,29 +597,6 @@ let lagunaFusedFullQKNormYaRNEnabled =
 /// to re-enable.
 let lagunaRoPEAngleAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] == "1"
-
-/// Zero-dispatch decode angle carrier: serve the two per-step RoPE angle rows
-/// as contiguous row VIEWS of the load-time FP32 position atlases instead of
-/// running the two probe RoPE dispatches every token. Unlike the fused
-/// embedding+atlas kernel above (default OFF; its fixed kernel cost measured
-/// −0.23%), this path adds no kernel at all: the atlas row for position `p`
-/// is bit-identical to the probe output at `p` by construction (the atlas IS
-/// the family's own stock RoPE run over the broadcast probe seed), and a
-/// row slice of the contiguous `[1, 1, 4096, D]` atlas is a zero-copy
-/// row-contiguous view, so the two probe dispatches vanish from the front of
-/// every decode step with no replacement work. The stock `embedTokens`
-/// gather is unchanged.
-///
-/// MEASURED (2026-08-01, M5 Max 128 GB, driver rig, 150-step cool-floor
-/// ABBA): views are +0.01..+0.07 ms/step vs the probe dispatches — the two
-/// probes are off the critical path (they overlap the embedding gather and
-/// layer-0 front), so removing them buys nothing, and aliasing the ~3 MB
-/// atlas buffers as per-step kernel inputs appears to add slight
-/// resource-tracking cost. Default OFF, same promoted-era conclusion as the
-/// fused embedding+atlas kernel above. Set `DARKBLOOM_ROPE_ATLAS_VIEWS=1`
-/// to re-measure.
-let lagunaRoPEAtlasViewsEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ATLAS_VIEWS"] == "1"
 
 /// `DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU` (default on; set "0" to disable):
 /// after checkpoint load, retain one row-concatenated BF16 `[gate; up]` bank
@@ -1352,923 +1339,6 @@ func lagunaSlidingQKNormRoPE(
         outputDTypes: [.bfloat16, .bfloat16]
     )
     return (outputs[0], outputs[1])
-}
-
-/// `DARKBLOOM_FUSED_SLIDING_ATTN` (default on; set "0" to disable): decode
-/// fused attention for the thirty sliding-window layers in the steady
-/// wrapped regime. ONE dispatch replaces the four-stage dependency chain
-/// [QK-norm+RoPE kernel] -> [K cache slice-assign] -> [V cache
-/// slice-assign] -> [sdpa_vector]: it computes the new token's per-head
-/// Q/K RMSNorm + plain RoPE in threadgroup memory (textual replica of
-/// `laguna_sliding_qk_norm_rope_bf16_128_v1`), persists the new K/V row
-/// into the ring backing at the slot `RotatingKVCache.updateInPlace` would
-/// have written, and attends over the full 512-slot ring in slot order with
-/// the GQA-pair schedule of the shipped `sdpa_vector` pair path (textual
-/// replica: same key visit order per simdgroup, same online-softmax text
-/// including the alpha-skip rescale, same two-plane combine and reduction
-/// trees). Bit-exactness of the substitution: at slot `write_idx` every
-/// threadgroup substitutes the just-computed row from threadgroup memory —
-/// the values pass through the same `bfloat` storage rounding the separate
-/// kernels would have written to and re-read from the cache, so scores and
-/// output are bit-identical, and no threadgroup ever reads slot
-/// `write_idx` from device memory, making the concurrent slot write
-/// race-free by construction (its only consumers are future steps, ordered
-/// by command-buffer sequencing). Removes 3 dispatches + their encoder-wide
-/// barriers per sliding layer per decode step.
-let lagunaFusedSlidingAttentionEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_ATTN"] != "0"
-
-private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
-    name: "laguna_sliding_fused_attn_ring_v1",
-    inputNames: [
-        "raw_queries", "raw_keys", "raw_values",
-        "query_weight", "key_weight", "angles",
-        "k_cache", "v_cache", "params", "scale_arr",
-    ],
-    outputNames: ["attended"],
-    source: """
-        constexpr uint head_dim = 128;
-        constexpr uint window = 512;
-        constexpr uint gqa = 8;
-        constexpr int BN = 32;
-        constexpr int BD = 32;
-        constexpr int qk_per_thread = 4;
-        constexpr int v_per_thread = 4;
-        constexpr uint rotary_pairs = 64;
-        constexpr int N = 512;
-
-        typedef float U;
-
-        uint pair_tg = threadgroup_position_in_grid.x;
-        uint head0 = pair_tg * 2;
-        uint head1 = head0 + 1;
-        uint kv_head = head0 / gqa;
-        uint sg = simdgroup_index_in_threadgroup;
-        uint lane = thread_index_in_simdgroup;
-        uint widx = params[0];
-        float scale = scale_arr[0];
-
-        threadgroup bfloat tg_q0[head_dim];
-        threadgroup bfloat tg_q1[head_dim];
-        threadgroup bfloat tg_k[head_dim];
-        threadgroup bfloat tg_v[head_dim];
-
-        // Phase 1: per-head RMSNorm + plain RoPE, textual replica of
-        // laguna_sliding_qk_norm_rope_bf16_128_v1 with the device row
-        // writes retargeted at threadgroup memory. simdgroups 0/1/2 own
-        // q0/q1/k; simdgroup 3 copies the raw V row (stored unmodified).
-        if (sg < 3) {
-            const device bfloat* input =
-                sg == 0 ? raw_queries + head0 * head_dim
-                : sg == 1 ? raw_queries + head1 * head_dim
-                          : raw_keys + kv_head * head_dim;
-            const device bfloat* weight =
-                sg == 2 ? key_weight : query_weight;
-            threadgroup bfloat* outrow =
-                sg == 0 ? tg_q0 : sg == 1 ? tg_q1 : tg_k;
-
-            uint base = lane * 4;
-            thread bfloat normalized[4];
-            float sum = 0.0f;
-            for (uint i = 0; i < 4; ++i) {
-                float value = float(input[base + i]);
-                sum += value * value;
-            }
-            sum = simd_sum(sum);
-            float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
-            for (uint i = 0; i < 4; ++i) {
-                normalized[i] =
-                    weight[base + i] *
-                    bfloat(float(input[base + i]) * inverse_rms);
-            }
-            thread float paired[4];
-            for (uint i = 0; i < 4; ++i) {
-                paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
-            }
-            if (lane < 16) {
-                for (uint i = 0; i < 4; ++i) {
-                    uint pair = base + i;
-                    float first = float(normalized[i]);
-                    float second = paired[i];
-                    float cosine = angles[pair];
-                    float sine = angles[pair + rotary_pairs];
-                    outrow[pair] = bfloat(first * cosine - second * sine);
-                    outrow[pair + rotary_pairs] =
-                        bfloat(first * sine + second * cosine);
-                }
-            }
-        } else if (sg == 3) {
-            const device bfloat* vin = raw_values + kv_head * head_dim;
-            for (uint i = lane; i < head_dim; i += 32) {
-                tg_v[i] = vin[i];
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Phase 2: one writer threadgroup per KV head persists the new row
-        // for future steps. No threadgroup reads slot widx from device this
-        // dispatch (all substitute the threadgroup copy), so cross-group
-        // ordering is irrelevant; the next step observes the write through
-        // command-buffer sequencing.
-        if ((head0 % gqa) == 0 && sg == 0) {
-            device bfloat* kc = (device bfloat*)k_cache +
-                (size_t)kv_head * (window * head_dim) +
-                (size_t)widx * head_dim;
-            device bfloat* vc = (device bfloat*)v_cache +
-                (size_t)kv_head * (window * head_dim) +
-                (size_t)widx * head_dim;
-            for (uint i = lane; i < head_dim; i += 32) {
-                kc[i] = tg_k[i];
-                vc[i] = tg_v[i];
-            }
-        }
-
-        // Phase 3: GQA-pair attention over the ring in slot order, textual
-        // replica of the sdpa_vector pair path at fixed kL = 512 (steady
-        // ring: the 8-trip two-deep pipeline covers all 16 slots per
-        // simdgroup with no tail).
-        threadgroup U outputs[4 * BN * BD];
-        threadgroup U max_scores[2 * BN];
-        threadgroup U sum_exp_scores[2 * BN];
-
-        const device bfloat* pair_keys = k_cache +
-            (size_t)kv_head * (window * head_dim) +
-            (size_t)sg * head_dim + lane * qk_per_thread;
-        const device bfloat* pair_values = v_cache +
-            (size_t)kv_head * (window * head_dim) +
-            (size_t)sg * head_dim + lane * v_per_thread;
-        const int inner_k_stride = BN * int(head_dim);
-        const int inner_v_stride = BN * int(head_dim);
-
-        thread U pair_q0[qk_per_thread];
-        thread U pair_q1[qk_per_thread];
-        thread U pair_o0[v_per_thread];
-        thread U pair_o1[v_per_thread];
-
-        for (int j = 0; j < qk_per_thread; ++j) {
-            pair_q0[j] =
-                static_cast<U>(scale) * tg_q0[lane * qk_per_thread + j];
-            pair_q1[j] =
-                static_cast<U>(scale) * tg_q1[lane * qk_per_thread + j];
-        }
-        for (int j = 0; j < v_per_thread; ++j) {
-            pair_o0[j] = 0;
-            pair_o1[j] = 0;
-        }
-
-        U pair_max0 = metal::numeric_limits<U>::lowest();
-        U pair_max1 = metal::numeric_limits<U>::lowest();
-        U pair_sum0 = 0;
-        U pair_sum1 = 0;
-
-        int i = sg;
-        for (; i + BN < N; i += 2 * BN) {
-            const device bfloat* pipe_keys_b = pair_keys + inner_k_stride;
-            const device bfloat* pipe_values_b = pair_values + inner_v_stride;
-            const bool sub_a = uint(i) == widx;
-            const bool sub_b = uint(i + BN) == widx;
-            U pipe_ka[4];
-            U pipe_kb[4];
-            T_LOAD_K(pipe_ka, sub_a, pair_keys);
-            T_LOAD_K(pipe_kb, sub_b, pipe_keys_b);
-            bfloat pipe_va0, pipe_va1, pipe_va2, pipe_va3;
-            bfloat pipe_vb0, pipe_vb1, pipe_vb2, pipe_vb3;
-            T_LOAD_V(pipe_va0, pipe_va1, pipe_va2, pipe_va3, sub_a,
-                pair_values);
-            T_LOAD_V(pipe_vb0, pipe_vb1, pipe_vb2, pipe_vb3, sub_b,
-                pipe_values_b);
-
-            U pair_score0 = 0;
-            U pair_score1 = 0;
-            pair_score0 += pair_q0[0] * pipe_ka[0];
-            pair_score1 += pair_q1[0] * pipe_ka[0];
-            pair_score0 += pair_q0[1] * pipe_ka[1];
-            pair_score1 += pair_q1[1] * pipe_ka[1];
-            pair_score0 += pair_q0[2] * pipe_ka[2];
-            pair_score1 += pair_q1[2] * pipe_ka[2];
-            pair_score0 += pair_q0[3] * pipe_ka[3];
-            pair_score1 += pair_q1[3] * pipe_ka[3];
-            pair_score0 = simd_sum(pair_score0);
-            pair_score1 = simd_sum(pair_score1);
-
-            U pair_new_max0 = metal::max(pair_max0, pair_score0);
-            U pair_new_max1 = metal::max(pair_max1, pair_score1);
-            U pair_factor0;
-            U pair_factor1;
-            LAGUNA_RESCALE(pair_factor0, pair_max0 - pair_new_max0);
-            LAGUNA_RESCALE(pair_factor1, pair_max1 - pair_new_max1);
-            U pair_exp0 = metal::fast::exp(pair_score0 - pair_new_max0);
-            U pair_exp1 = metal::fast::exp(pair_score1 - pair_new_max1);
-
-            pair_max0 = pair_new_max0;
-            pair_max1 = pair_new_max1;
-            pair_sum0 = pair_sum0 * pair_factor0 + pair_exp0;
-            pair_sum1 = pair_sum1 * pair_factor1 + pair_exp1;
-
-            pair_o0[0] = pair_o0[0] * pair_factor0 + pair_exp0 * pipe_va0;
-            pair_o1[0] = pair_o1[0] * pair_factor1 + pair_exp1 * pipe_va0;
-            pair_o0[1] = pair_o0[1] * pair_factor0 + pair_exp0 * pipe_va1;
-            pair_o1[1] = pair_o1[1] * pair_factor1 + pair_exp1 * pipe_va1;
-            pair_o0[2] = pair_o0[2] * pair_factor0 + pair_exp0 * pipe_va2;
-            pair_o1[2] = pair_o1[2] * pair_factor1 + pair_exp1 * pipe_va2;
-            pair_o0[3] = pair_o0[3] * pair_factor0 + pair_exp0 * pipe_va3;
-            pair_o1[3] = pair_o1[3] * pair_factor1 + pair_exp1 * pipe_va3;
-
-            U pipeb_score0 = 0;
-            U pipeb_score1 = 0;
-            pipeb_score0 += pair_q0[0] * pipe_kb[0];
-            pipeb_score1 += pair_q1[0] * pipe_kb[0];
-            pipeb_score0 += pair_q0[1] * pipe_kb[1];
-            pipeb_score1 += pair_q1[1] * pipe_kb[1];
-            pipeb_score0 += pair_q0[2] * pipe_kb[2];
-            pipeb_score1 += pair_q1[2] * pipe_kb[2];
-            pipeb_score0 += pair_q0[3] * pipe_kb[3];
-            pipeb_score1 += pair_q1[3] * pipe_kb[3];
-            pipeb_score0 = simd_sum(pipeb_score0);
-            pipeb_score1 = simd_sum(pipeb_score1);
-
-            U pipeb_new_max0 = metal::max(pair_max0, pipeb_score0);
-            U pipeb_new_max1 = metal::max(pair_max1, pipeb_score1);
-            U pipeb_factor0;
-            U pipeb_factor1;
-            LAGUNA_RESCALE(pipeb_factor0, pair_max0 - pipeb_new_max0);
-            LAGUNA_RESCALE(pipeb_factor1, pair_max1 - pipeb_new_max1);
-            U pipeb_exp0 = metal::fast::exp(pipeb_score0 - pipeb_new_max0);
-            U pipeb_exp1 = metal::fast::exp(pipeb_score1 - pipeb_new_max1);
-
-            pair_max0 = pipeb_new_max0;
-            pair_max1 = pipeb_new_max1;
-            pair_sum0 = pair_sum0 * pipeb_factor0 + pipeb_exp0;
-            pair_sum1 = pair_sum1 * pipeb_factor1 + pipeb_exp1;
-
-            pair_o0[0] = pair_o0[0] * pipeb_factor0 + pipeb_exp0 * pipe_vb0;
-            pair_o1[0] = pair_o1[0] * pipeb_factor1 + pipeb_exp1 * pipe_vb0;
-            pair_o0[1] = pair_o0[1] * pipeb_factor0 + pipeb_exp0 * pipe_vb1;
-            pair_o1[1] = pair_o1[1] * pipeb_factor1 + pipeb_exp1 * pipe_vb1;
-            pair_o0[2] = pair_o0[2] * pipeb_factor0 + pipeb_exp0 * pipe_vb2;
-            pair_o1[2] = pair_o1[2] * pipeb_factor1 + pipeb_exp1 * pipe_vb2;
-            pair_o0[3] = pair_o0[3] * pipeb_factor0 + pipeb_exp0 * pipe_vb3;
-            pair_o1[3] = pair_o1[3] * pipeb_factor1 + pipeb_exp1 * pipe_vb3;
-
-            pair_keys += 2 * inner_k_stride;
-            pair_values += 2 * inner_v_stride;
-        }
-
-        // Combine: promoted two-plane exchange, textual replica of the
-        // sdpa_vector pair path epilogue.
-        constexpr int pair_planes = 2;
-        constexpr int pair_plane_size = BN * BD;
-        if (lane == 0) {
-            max_scores[sg] = pair_max0;
-            max_scores[BN + sg] = pair_max1;
-            sum_exp_scores[sg] = pair_sum0;
-            sum_exp_scores[BN + sg] = pair_sum1;
-        }
-        for (int p = 0; p < pair_planes; ++p) {
-            outputs[p * pair_plane_size + lane * BD + sg] = pair_o0[p];
-            outputs[
-                (pair_planes + p) * pair_plane_size + lane * BD + sg] =
-                pair_o1[p];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        pair_max0 = max_scores[lane];
-        pair_max1 = max_scores[BN + lane];
-        U pair_global_max0 = simd_max(pair_max0);
-        U pair_global_max1 = simd_max(pair_max1);
-        U pair_global_factor0 = metal::fast::exp(pair_max0 - pair_global_max0);
-        U pair_global_factor1 = metal::fast::exp(pair_max1 - pair_global_max1);
-        pair_sum0 = simd_sum(sum_exp_scores[lane] * pair_global_factor0);
-        pair_sum1 = simd_sum(sum_exp_scores[BN + lane] * pair_global_factor1);
-
-        for (int p = 0; p < pair_planes; ++p) {
-            U acc0 = simd_sum(
-                outputs[p * pair_plane_size + sg * BD + lane] *
-                pair_global_factor0);
-            U acc1 = simd_sum(
-                outputs[
-                    (pair_planes + p) * pair_plane_size + sg * BD + lane] *
-                pair_global_factor1);
-            pair_o0[p] = pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
-            pair_o1[p] = pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int p = 0; p < pair_planes; ++p) {
-            outputs[p * pair_plane_size + lane * BD + sg] =
-                pair_o0[pair_planes + p];
-            outputs[
-                (pair_planes + p) * pair_plane_size + lane * BD + sg] =
-                pair_o1[pair_planes + p];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int p = 0; p < pair_planes; ++p) {
-            U acc0 = simd_sum(
-                outputs[p * pair_plane_size + sg * BD + lane] *
-                pair_global_factor0);
-            U acc1 = simd_sum(
-                outputs[
-                    (pair_planes + p) * pair_plane_size + sg * BD + lane] *
-                pair_global_factor1);
-            pair_o0[pair_planes + p] =
-                pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
-            pair_o1[pair_planes + p] =
-                pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
-        }
-
-        if (lane == 0) {
-            device bfloat* pair_out0 =
-                attended + head0 * head_dim + sg * v_per_thread;
-            device bfloat* pair_out1 =
-                attended + head1 * head_dim + sg * v_per_thread;
-            for (int p = 0; p < v_per_thread; ++p) {
-                pair_out0[p] = static_cast<bfloat>(pair_o0[p]);
-                pair_out1[p] = static_cast<bfloat>(pair_o1[p]);
-            }
-        }
-        """,
-    header: """
-        // Alpha-skip rescale, replica of sdpa_vector.h's shipped
-        // DARKBLOOM_RESCALE_FACTOR (DARKBLOOM_ALPHASKIP == 1 arm).
-        #define LAGUNA_RESCALE(dst, delta_expr)         \\
-          do {                                          \\
-            const float db_delta_ = (delta_expr);       \\
-            if (as_type<uint>(db_delta_) == 0u) {       \\
-              dst = float(1.0f);                        \\
-            } else {                                    \\
-              dst = metal::fast::exp(db_delta_);        \\
-            }                                           \\
-          } while (false)
-
-        // K loads: 8-byte vec loads from the ring, or the threadgroup
-        // substitute for the just-written slot. Same elements, same order,
-        // same bfloat -> float conversion points as the scalar form.
-        #define T_LOAD_K(dst, substitute, ptr)                     \\
-          do {                                                     \\
-            if (substitute) {                                      \\
-              dst[0] = tg_k[lane * qk_per_thread + 0];             \\
-              dst[1] = tg_k[lane * qk_per_thread + 1];             \\
-              dst[2] = tg_k[lane * qk_per_thread + 2];             \\
-              dst[3] = tg_k[lane * qk_per_thread + 3];             \\
-            } else {                                               \\
-              const vec<bfloat, 4> v_ =                            \\
-                  *reinterpret_cast<const device vec<bfloat, 4>*>( \\
-                      ptr);                                        \\
-              dst[0] = v_.x;                                       \\
-              dst[1] = v_.y;                                       \\
-              dst[2] = v_.z;                                       \\
-              dst[3] = v_.w;                                       \\
-            }                                                      \\
-          } while (false)
-
-        #define T_LOAD_V(d0, d1, d2, d3, substitute, ptr)          \\
-          do {                                                     \\
-            if (substitute) {                                      \\
-              d0 = tg_v[lane * v_per_thread + 0];                  \\
-              d1 = tg_v[lane * v_per_thread + 1];                  \\
-              d2 = tg_v[lane * v_per_thread + 2];                  \\
-              d3 = tg_v[lane * v_per_thread + 3];                  \\
-            } else {                                               \\
-              const vec<bfloat, 4> v_ =                            \\
-                  *reinterpret_cast<const device vec<bfloat, 4>*>( \\
-                      ptr);                                        \\
-              d0 = v_.x;                                           \\
-              d1 = v_.y;                                           \\
-              d2 = v_.z;                                           \\
-              d3 = v_.w;                                           \\
-            }                                                      \\
-          } while (false)
-
-        // (trailing newline required: the JIT concatenates the generated
-        // [[kernel]] signature directly after this header string)
-
-        """,
-    ensureRowContiguous: true
-)
-
-/// Fused decode attention for a sliding layer in the steady ring regime.
-/// Returns `[1, heads, 1, headDim]` attended output; the caller advances the
-/// cache clock via `RotatingKVCache.fusedRingAdvance()`.
-func lagunaSlidingFusedAttention(
-    rawQueries: MLXArray,
-    rawKeys: MLXArray,
-    rawValues: MLXArray,
-    queryWeight: MLXArray,
-    keyWeight: MLXArray,
-    angles: MLXArray,
-    cacheKeys: MLXArray,
-    cacheValues: MLXArray,
-    writeIdx: Int,
-    scale: MLXArray
-) -> MLXArray {
-    let heads = LagunaConstants.slidingAttentionHeads
-    let kvHeads = LagunaConstants.numKeyValueHeads
-    let window = LagunaConstants.slidingWindow
-    precondition(rawQueries.dtype == .bfloat16)
-    precondition(rawKeys.dtype == .bfloat16)
-    precondition(rawValues.dtype == .bfloat16)
-    precondition(rawQueries.shape == [1, 1, heads * LagunaConstants.headDim])
-    precondition(rawKeys.shape == [1, 1, kvHeads * LagunaConstants.headDim])
-    precondition(rawValues.shape == [1, 1, kvHeads * LagunaConstants.headDim])
-    precondition(queryWeight.shape == [LagunaConstants.headDim])
-    precondition(keyWeight.shape == [LagunaConstants.headDim])
-    precondition(angles.dtype == .float32)
-    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim])
-    precondition(cacheKeys.dtype == .bfloat16)
-    precondition(
-        cacheKeys.shape == [1, kvHeads, window, LagunaConstants.headDim])
-    precondition(
-        cacheValues.shape == [1, kvHeads, window, LagunaConstants.headDim])
-    precondition(writeIdx >= 0 && writeIdx < window)
-    precondition(scale.dtype == .float32 && scale.size == 1)
-
-    lagunaTrace("sliding fused attention")
-    let params = MLXArray([UInt32(writeIdx)])
-    return lagunaSlidingFusedAttentionKernel(
-        [
-            rawQueries, rawKeys, rawValues,
-            queryWeight, keyWeight, angles,
-            cacheKeys, cacheValues, params, scale,
-        ],
-        grid: ((heads / 2) * 1024, 1, 1),
-        threadGroup: (1024, 1, 1),
-        outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
-        outputDTypes: [.bfloat16]
-    )[0]
-}
-
-/// `DARKBLOOM_FUSED_FULL_ATTN` (default off; set "1" to enable): decode
-/// fused attention for the ten full-attention layers once the cache backing
-/// has spare capacity (from the second decode step on; the first step's
-/// stock growth concat is kept). Same design as the sliding twin above —
-/// ONE dispatch replaces [QK-norm+YaRN kernel] -> [K slice-assign] ->
-/// [V slice-assign] -> [sdpa_vector] — with the full-attention phase-1 text
-/// (textual replica of `laguna_full_qk_norm_yarn_bf16_128_v4`: 64-dim
-/// partial rotary, folded mscale roundings, passthrough tail) and the
-/// pair path's runtime-length loop + single-row tail at gqa_factor 6.
-let lagunaFusedFullAttentionEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_ATTN"] == "1"
-
-private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
-    name: "laguna_full_fused_attn_grow_v1",
-    inputNames: [
-        "raw_queries", "raw_keys", "raw_values",
-        "query_weight", "key_weight", "angles",
-        "k_cache", "v_cache", "params", "scale_arr",
-    ],
-    outputNames: ["attended"],
-    source: """
-        constexpr uint head_dim = 128;
-        constexpr uint gqa = 6;
-        constexpr int BN = 32;
-        constexpr int BD = 32;
-        constexpr int qk_per_thread = 4;
-        constexpr int v_per_thread = 4;
-        constexpr uint rotary_pairs = 32;
-        constexpr float yarn_mscale = 1.3465735912322998f;
-
-        typedef float U;
-
-        uint pair_tg = threadgroup_position_in_grid.x;
-        uint head0 = pair_tg * 2;
-        uint head1 = head0 + 1;
-        uint kv_head = head0 / gqa;
-        uint sg = simdgroup_index_in_threadgroup;
-        uint lane = thread_index_in_simdgroup;
-        uint widx = params[0];
-        int N = int(params[1]);
-        uint capacity = params[2];
-        float scale = scale_arr[0];
-
-        threadgroup bfloat tg_q0[head_dim];
-        threadgroup bfloat tg_q1[head_dim];
-        threadgroup bfloat tg_k[head_dim];
-        threadgroup bfloat tg_v[head_dim];
-
-        // Phase 1: per-head RMSNorm + partial YaRN RoPE, textual replica of
-        // laguna_full_qk_norm_yarn_bf16_128_v4 with the device row writes
-        // retargeted at threadgroup memory.
-        if (sg < 3) {
-            const device bfloat* input =
-                sg == 0 ? raw_queries + head0 * head_dim
-                : sg == 1 ? raw_queries + head1 * head_dim
-                          : raw_keys + kv_head * head_dim;
-            const device bfloat* weight =
-                sg == 2 ? key_weight : query_weight;
-            threadgroup bfloat* outrow =
-                sg == 0 ? tg_q0 : sg == 1 ? tg_q1 : tg_k;
-
-            uint base = lane * 4;
-            thread bfloat normalized[4];
-            float sum = 0.0f;
-            for (uint i = 0; i < 4; ++i) {
-                float value = float(input[base + i]);
-                sum += value * value;
-            }
-            sum = simd_sum(sum);
-            float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
-            for (uint i = 0; i < 4; ++i) {
-                normalized[i] =
-                    weight[base + i] *
-                    bfloat(float(input[base + i]) * inverse_rms);
-            }
-            thread float paired[4];
-            for (uint i = 0; i < 4; ++i) {
-                paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
-            }
-            if (lane < 8) {
-                bfloat rounded_mscale = bfloat(yarn_mscale);
-                for (uint i = 0; i < 4; ++i) {
-                    uint pair = base + i;
-                    float first =
-                        float(bfloat(normalized[i] * rounded_mscale));
-                    float second =
-                        float(bfloat(bfloat(paired[i]) * rounded_mscale));
-                    float cosine = angles[pair];
-                    float sine = angles[pair + rotary_pairs];
-                    outrow[pair] = bfloat(first * cosine - second * sine);
-                    outrow[pair + rotary_pairs] =
-                        bfloat(first * sine + second * cosine);
-                }
-            } else if (lane >= 16) {
-                for (uint i = 0; i < 4; ++i) {
-                    outrow[base + i] = normalized[i];
-                }
-            }
-        } else if (sg == 3) {
-            const device bfloat* vin = raw_values + kv_head * head_dim;
-            for (uint i = lane; i < head_dim; i += 32) {
-                tg_v[i] = vin[i];
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Phase 2: one writer threadgroup per KV head persists the new row.
-        if ((head0 % gqa) == 0 && sg == 0) {
-            device bfloat* kc = (device bfloat*)k_cache +
-                (size_t)kv_head * (capacity * head_dim) +
-                (size_t)widx * head_dim;
-            device bfloat* vc = (device bfloat*)v_cache +
-                (size_t)kv_head * (capacity * head_dim) +
-                (size_t)widx * head_dim;
-            for (uint i = lane; i < head_dim; i += 32) {
-                kc[i] = tg_k[i];
-                vc[i] = tg_v[i];
-            }
-        }
-
-        // Phase 3: GQA-pair attention over the first N rows in slot order,
-        // textual replica of the sdpa_vector pair path (runtime N, tail
-        // row included).
-        threadgroup U outputs[4 * BN * BD];
-        threadgroup U max_scores[2 * BN];
-        threadgroup U sum_exp_scores[2 * BN];
-
-        const device bfloat* pair_keys = k_cache +
-            (size_t)kv_head * (capacity * head_dim) +
-            (size_t)sg * head_dim + lane * qk_per_thread;
-        const device bfloat* pair_values = v_cache +
-            (size_t)kv_head * (capacity * head_dim) +
-            (size_t)sg * head_dim + lane * v_per_thread;
-        const int inner_k_stride = BN * int(head_dim);
-        const int inner_v_stride = BN * int(head_dim);
-
-        thread U pair_q0[qk_per_thread];
-        thread U pair_q1[qk_per_thread];
-        thread U pair_k[qk_per_thread];
-        thread U pair_o0[v_per_thread];
-        thread U pair_o1[v_per_thread];
-
-        for (int j = 0; j < qk_per_thread; ++j) {
-            pair_q0[j] =
-                static_cast<U>(scale) * tg_q0[lane * qk_per_thread + j];
-            pair_q1[j] =
-                static_cast<U>(scale) * tg_q1[lane * qk_per_thread + j];
-        }
-        for (int j = 0; j < v_per_thread; ++j) {
-            pair_o0[j] = 0;
-            pair_o1[j] = 0;
-        }
-
-        U pair_max0 = metal::numeric_limits<U>::lowest();
-        U pair_max1 = metal::numeric_limits<U>::lowest();
-        U pair_sum0 = 0;
-        U pair_sum1 = 0;
-
-        int i = sg;
-        for (; i + BN < N; i += 2 * BN) {
-            const device bfloat* pipe_keys_b = pair_keys + inner_k_stride;
-            const device bfloat* pipe_values_b = pair_values + inner_v_stride;
-            const bool sub_a = uint(i) == widx;
-            const bool sub_b = uint(i + BN) == widx;
-            U pipe_ka[4];
-            U pipe_kb[4];
-            T_LOAD_K(pipe_ka, sub_a, pair_keys);
-            T_LOAD_K(pipe_kb, sub_b, pipe_keys_b);
-            bfloat pipe_va0, pipe_va1, pipe_va2, pipe_va3;
-            bfloat pipe_vb0, pipe_vb1, pipe_vb2, pipe_vb3;
-            T_LOAD_V(pipe_va0, pipe_va1, pipe_va2, pipe_va3, sub_a,
-                pair_values);
-            T_LOAD_V(pipe_vb0, pipe_vb1, pipe_vb2, pipe_vb3, sub_b,
-                pipe_values_b);
-
-            U pair_score0 = 0;
-            U pair_score1 = 0;
-            pair_score0 += pair_q0[0] * pipe_ka[0];
-            pair_score1 += pair_q1[0] * pipe_ka[0];
-            pair_score0 += pair_q0[1] * pipe_ka[1];
-            pair_score1 += pair_q1[1] * pipe_ka[1];
-            pair_score0 += pair_q0[2] * pipe_ka[2];
-            pair_score1 += pair_q1[2] * pipe_ka[2];
-            pair_score0 += pair_q0[3] * pipe_ka[3];
-            pair_score1 += pair_q1[3] * pipe_ka[3];
-            pair_score0 = simd_sum(pair_score0);
-            pair_score1 = simd_sum(pair_score1);
-
-            U pair_new_max0 = metal::max(pair_max0, pair_score0);
-            U pair_new_max1 = metal::max(pair_max1, pair_score1);
-            U pair_factor0;
-            U pair_factor1;
-            LAGUNA_RESCALE(pair_factor0, pair_max0 - pair_new_max0);
-            LAGUNA_RESCALE(pair_factor1, pair_max1 - pair_new_max1);
-            U pair_exp0 = metal::fast::exp(pair_score0 - pair_new_max0);
-            U pair_exp1 = metal::fast::exp(pair_score1 - pair_new_max1);
-
-            pair_max0 = pair_new_max0;
-            pair_max1 = pair_new_max1;
-            pair_sum0 = pair_sum0 * pair_factor0 + pair_exp0;
-            pair_sum1 = pair_sum1 * pair_factor1 + pair_exp1;
-
-            pair_o0[0] = pair_o0[0] * pair_factor0 + pair_exp0 * pipe_va0;
-            pair_o1[0] = pair_o1[0] * pair_factor1 + pair_exp1 * pipe_va0;
-            pair_o0[1] = pair_o0[1] * pair_factor0 + pair_exp0 * pipe_va1;
-            pair_o1[1] = pair_o1[1] * pair_factor1 + pair_exp1 * pipe_va1;
-            pair_o0[2] = pair_o0[2] * pair_factor0 + pair_exp0 * pipe_va2;
-            pair_o1[2] = pair_o1[2] * pair_factor1 + pair_exp1 * pipe_va2;
-            pair_o0[3] = pair_o0[3] * pair_factor0 + pair_exp0 * pipe_va3;
-            pair_o1[3] = pair_o1[3] * pair_factor1 + pair_exp1 * pipe_va3;
-
-            U pipeb_score0 = 0;
-            U pipeb_score1 = 0;
-            pipeb_score0 += pair_q0[0] * pipe_kb[0];
-            pipeb_score1 += pair_q1[0] * pipe_kb[0];
-            pipeb_score0 += pair_q0[1] * pipe_kb[1];
-            pipeb_score1 += pair_q1[1] * pipe_kb[1];
-            pipeb_score0 += pair_q0[2] * pipe_kb[2];
-            pipeb_score1 += pair_q1[2] * pipe_kb[2];
-            pipeb_score0 += pair_q0[3] * pipe_kb[3];
-            pipeb_score1 += pair_q1[3] * pipe_kb[3];
-            pipeb_score0 = simd_sum(pipeb_score0);
-            pipeb_score1 = simd_sum(pipeb_score1);
-
-            U pipeb_new_max0 = metal::max(pair_max0, pipeb_score0);
-            U pipeb_new_max1 = metal::max(pair_max1, pipeb_score1);
-            U pipeb_factor0;
-            U pipeb_factor1;
-            LAGUNA_RESCALE(pipeb_factor0, pair_max0 - pipeb_new_max0);
-            LAGUNA_RESCALE(pipeb_factor1, pair_max1 - pipeb_new_max1);
-            U pipeb_exp0 = metal::fast::exp(pipeb_score0 - pipeb_new_max0);
-            U pipeb_exp1 = metal::fast::exp(pipeb_score1 - pipeb_new_max1);
-
-            pair_max0 = pipeb_new_max0;
-            pair_max1 = pipeb_new_max1;
-            pair_sum0 = pair_sum0 * pipeb_factor0 + pipeb_exp0;
-            pair_sum1 = pair_sum1 * pipeb_factor1 + pipeb_exp1;
-
-            pair_o0[0] = pair_o0[0] * pipeb_factor0 + pipeb_exp0 * pipe_vb0;
-            pair_o1[0] = pair_o1[0] * pipeb_factor1 + pipeb_exp1 * pipe_vb0;
-            pair_o0[1] = pair_o0[1] * pipeb_factor0 + pipeb_exp0 * pipe_vb1;
-            pair_o1[1] = pair_o1[1] * pipeb_factor1 + pipeb_exp1 * pipe_vb1;
-            pair_o0[2] = pair_o0[2] * pipeb_factor0 + pipeb_exp0 * pipe_vb2;
-            pair_o1[2] = pair_o1[2] * pipeb_factor1 + pipeb_exp1 * pipe_vb2;
-            pair_o0[3] = pair_o0[3] * pipeb_factor0 + pipeb_exp0 * pipe_vb3;
-            pair_o1[3] = pair_o1[3] * pipeb_factor1 + pipeb_exp1 * pipe_vb3;
-
-            pair_keys += 2 * inner_k_stride;
-            pair_values += 2 * inner_v_stride;
-        }
-        if (i < N) {
-            const bool sub_t = uint(i) == widx;
-            T_LOAD_K(pair_k, sub_t, pair_keys);
-            bfloat pipe_va0, pipe_va1, pipe_va2, pipe_va3;
-            T_LOAD_V(pipe_va0, pipe_va1, pipe_va2, pipe_va3, sub_t,
-                pair_values);
-
-            U pair_score0 = 0;
-            U pair_score1 = 0;
-            pair_score0 += pair_q0[0] * pair_k[0];
-            pair_score1 += pair_q1[0] * pair_k[0];
-            pair_score0 += pair_q0[1] * pair_k[1];
-            pair_score1 += pair_q1[1] * pair_k[1];
-            pair_score0 += pair_q0[2] * pair_k[2];
-            pair_score1 += pair_q1[2] * pair_k[2];
-            pair_score0 += pair_q0[3] * pair_k[3];
-            pair_score1 += pair_q1[3] * pair_k[3];
-            pair_score0 = simd_sum(pair_score0);
-            pair_score1 = simd_sum(pair_score1);
-
-            U pair_new_max0 = metal::max(pair_max0, pair_score0);
-            U pair_new_max1 = metal::max(pair_max1, pair_score1);
-            U pair_factor0;
-            U pair_factor1;
-            LAGUNA_RESCALE(pair_factor0, pair_max0 - pair_new_max0);
-            LAGUNA_RESCALE(pair_factor1, pair_max1 - pair_new_max1);
-            U pair_exp0 = metal::fast::exp(pair_score0 - pair_new_max0);
-            U pair_exp1 = metal::fast::exp(pair_score1 - pair_new_max1);
-
-            pair_max0 = pair_new_max0;
-            pair_max1 = pair_new_max1;
-            pair_sum0 = pair_sum0 * pair_factor0 + pair_exp0;
-            pair_sum1 = pair_sum1 * pair_factor1 + pair_exp1;
-
-            pair_o0[0] = pair_o0[0] * pair_factor0 + pair_exp0 * pipe_va0;
-            pair_o1[0] = pair_o1[0] * pair_factor1 + pair_exp1 * pipe_va0;
-            pair_o0[1] = pair_o0[1] * pair_factor0 + pair_exp0 * pipe_va1;
-            pair_o1[1] = pair_o1[1] * pair_factor1 + pair_exp1 * pipe_va1;
-            pair_o0[2] = pair_o0[2] * pair_factor0 + pair_exp0 * pipe_va2;
-            pair_o1[2] = pair_o1[2] * pair_factor1 + pair_exp1 * pipe_va2;
-            pair_o0[3] = pair_o0[3] * pair_factor0 + pair_exp0 * pipe_va3;
-            pair_o1[3] = pair_o1[3] * pair_factor1 + pair_exp1 * pipe_va3;
-        }
-
-        // Combine: promoted two-plane exchange, textual replica of the
-        // sdpa_vector pair path epilogue.
-        constexpr int pair_planes = 2;
-        constexpr int pair_plane_size = BN * BD;
-        if (lane == 0) {
-            max_scores[sg] = pair_max0;
-            max_scores[BN + sg] = pair_max1;
-            sum_exp_scores[sg] = pair_sum0;
-            sum_exp_scores[BN + sg] = pair_sum1;
-        }
-        for (int p = 0; p < pair_planes; ++p) {
-            outputs[p * pair_plane_size + lane * BD + sg] = pair_o0[p];
-            outputs[
-                (pair_planes + p) * pair_plane_size + lane * BD + sg] =
-                pair_o1[p];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        pair_max0 = max_scores[lane];
-        pair_max1 = max_scores[BN + lane];
-        U pair_global_max0 = simd_max(pair_max0);
-        U pair_global_max1 = simd_max(pair_max1);
-        U pair_global_factor0 = metal::fast::exp(pair_max0 - pair_global_max0);
-        U pair_global_factor1 = metal::fast::exp(pair_max1 - pair_global_max1);
-        pair_sum0 = simd_sum(sum_exp_scores[lane] * pair_global_factor0);
-        pair_sum1 = simd_sum(sum_exp_scores[BN + lane] * pair_global_factor1);
-
-        for (int p = 0; p < pair_planes; ++p) {
-            U acc0 = simd_sum(
-                outputs[p * pair_plane_size + sg * BD + lane] *
-                pair_global_factor0);
-            U acc1 = simd_sum(
-                outputs[
-                    (pair_planes + p) * pair_plane_size + sg * BD + lane] *
-                pair_global_factor1);
-            pair_o0[p] = pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
-            pair_o1[p] = pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int p = 0; p < pair_planes; ++p) {
-            outputs[p * pair_plane_size + lane * BD + sg] =
-                pair_o0[pair_planes + p];
-            outputs[
-                (pair_planes + p) * pair_plane_size + lane * BD + sg] =
-                pair_o1[pair_planes + p];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int p = 0; p < pair_planes; ++p) {
-            U acc0 = simd_sum(
-                outputs[p * pair_plane_size + sg * BD + lane] *
-                pair_global_factor0);
-            U acc1 = simd_sum(
-                outputs[
-                    (pair_planes + p) * pair_plane_size + sg * BD + lane] *
-                pair_global_factor1);
-            pair_o0[pair_planes + p] =
-                pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
-            pair_o1[pair_planes + p] =
-                pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
-        }
-
-        if (lane == 0) {
-            device bfloat* pair_out0 =
-                attended + head0 * head_dim + sg * v_per_thread;
-            device bfloat* pair_out1 =
-                attended + head1 * head_dim + sg * v_per_thread;
-            for (int p = 0; p < v_per_thread; ++p) {
-                pair_out0[p] = static_cast<bfloat>(pair_o0[p]);
-                pair_out1[p] = static_cast<bfloat>(pair_o1[p]);
-            }
-        }
-        """,
-    header: """
-        #define LAGUNA_RESCALE(dst, delta_expr)         \\
-          do {                                          \\
-            const float db_delta_ = (delta_expr);       \\
-            if (as_type<uint>(db_delta_) == 0u) {       \\
-              dst = float(1.0f);                        \\
-            } else {                                    \\
-              dst = metal::fast::exp(db_delta_);        \\
-            }                                           \\
-          } while (false)
-
-        #define T_LOAD_K(dst, substitute, ptr)                     \\
-          do {                                                     \\
-            if (substitute) {                                      \\
-              dst[0] = tg_k[lane * qk_per_thread + 0];             \\
-              dst[1] = tg_k[lane * qk_per_thread + 1];             \\
-              dst[2] = tg_k[lane * qk_per_thread + 2];             \\
-              dst[3] = tg_k[lane * qk_per_thread + 3];             \\
-            } else {                                               \\
-              const vec<bfloat, 4> v_ =                            \\
-                  *reinterpret_cast<const device vec<bfloat, 4>*>( \\
-                      ptr);                                        \\
-              dst[0] = v_.x;                                       \\
-              dst[1] = v_.y;                                       \\
-              dst[2] = v_.z;                                       \\
-              dst[3] = v_.w;                                       \\
-            }                                                      \\
-          } while (false)
-
-        #define T_LOAD_V(d0, d1, d2, d3, substitute, ptr)          \\
-          do {                                                     \\
-            if (substitute) {                                      \\
-              d0 = tg_v[lane * v_per_thread + 0];                  \\
-              d1 = tg_v[lane * v_per_thread + 1];                  \\
-              d2 = tg_v[lane * v_per_thread + 2];                  \\
-              d3 = tg_v[lane * v_per_thread + 3];                  \\
-            } else {                                               \\
-              const vec<bfloat, 4> v_ =                            \\
-                  *reinterpret_cast<const device vec<bfloat, 4>*>( \\
-                      ptr);                                        \\
-              d0 = v_.x;                                           \\
-              d1 = v_.y;                                           \\
-              d2 = v_.z;                                           \\
-              d3 = v_.w;                                           \\
-            }                                                      \\
-          } while (false)
-
-        // (trailing newline required: the JIT concatenates the generated
-        // [[kernel]] signature directly after this header string)
-
-        """,
-    ensureRowContiguous: true
-)
-
-/// Fused decode attention for a full-attention layer with spare backing
-/// capacity. Returns `[1, heads, 1, headDim]`; the caller advances the
-/// cache clock via `KVCacheSimple.fusedAppendAdvance()`.
-func lagunaFullFusedAttention(
-    rawQueries: MLXArray,
-    rawKeys: MLXArray,
-    rawValues: MLXArray,
-    queryWeight: MLXArray,
-    keyWeight: MLXArray,
-    angles: MLXArray,
-    cacheKeys: MLXArray,
-    cacheValues: MLXArray,
-    writeIdx: Int,
-    scale: MLXArray
-) -> MLXArray {
-    let heads = LagunaConstants.fullAttentionHeads
-    let kvHeads = LagunaConstants.numKeyValueHeads
-    let capacity = cacheKeys.dim(2)
-    precondition(rawQueries.dtype == .bfloat16)
-    precondition(rawKeys.dtype == .bfloat16)
-    precondition(rawValues.dtype == .bfloat16)
-    precondition(rawQueries.shape == [1, 1, heads * LagunaConstants.headDim])
-    precondition(rawKeys.shape == [1, 1, kvHeads * LagunaConstants.headDim])
-    precondition(rawValues.shape == [1, 1, kvHeads * LagunaConstants.headDim])
-    precondition(queryWeight.shape == [LagunaConstants.headDim])
-    precondition(keyWeight.shape == [LagunaConstants.headDim])
-    precondition(angles.dtype == .float32)
-    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim / 2])
-    precondition(cacheKeys.dtype == .bfloat16)
-    precondition(
-        cacheKeys.shape == [1, kvHeads, capacity, LagunaConstants.headDim])
-    precondition(
-        cacheValues.shape == [1, kvHeads, capacity, LagunaConstants.headDim])
-    precondition(writeIdx >= 0 && writeIdx < capacity)
-    precondition(scale.dtype == .float32 && scale.size == 1)
-
-    lagunaTrace("full fused attention")
-    let params = MLXArray([
-        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
-    ])
-    return lagunaFullFusedAttentionKernel(
-        [
-            rawQueries, rawKeys, rawValues,
-            queryWeight, keyWeight, angles,
-            cacheKeys, cacheValues, params, scale,
-        ],
-        grid: ((heads / 2) * 1024, 1, 1),
-        threadGroup: (1024, 1, 1),
-        outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
-        outputDTypes: [.bfloat16]
-    )[0]
 }
 
 /// Multi-token sliding-layer Q/K RMSNorm + plain RoPE fusion. One dispatch
@@ -4820,10 +3890,6 @@ final class LagunaRuntimeAttention: Module {
     let gatePerHead: Bool
     let isSliding: Bool
     let layerIdx: Int
-    /// Retained `[1]` FP32 carrier of `scale` for the fused decode
-    /// attention kernel (same float the stock SDPA call passes), built once
-    /// so the per-step graph adds no fresh scalar upload for it.
-    lazy var _fusedAttnScale: MLXArray = MLXArray([scale])
     let attentionGateProjection: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray
 
     @ModuleInfo(key: "q_proj") var wq: Linear
@@ -5239,11 +4305,7 @@ final class LagunaRuntimeAttention: Module {
         var queries: MLXArray
         var keys: MLXArray
         var values: MLXArray
-        // The retained BF16 [Wq; Wk; Wv] bank is PREFILL-ONLY: at decode it
-        // would override the INT8 fused norm+QKV path (measured +1.4 ms/step
-        // when force-enabled), while at L > 1 it collapses three steel GEMMs
-        // into one.
-        if let fusedQKVWeight = _fusedQKVWeight, L > 1 {
+        if let fusedQKVWeight = _fusedQKVWeight {
             guard let normalizedInput else {
                 preconditionFailure("retained fused QKV requires normalized input")
             }
@@ -5326,60 +4388,7 @@ final class LagunaRuntimeAttention: Module {
             qkRoPEAngles?.shape == [1, 1, lagunaRoPEAngleAtlasLength, headDim / 2]
 
         var qkNormRoPEFused = false
-        var fusedAttended: MLXArray?
-        if lagunaFusedSlidingAttentionEnabled,
-            useFusedSlidingQKNormRoPE,
-            let fusedAngles = qkRoPEAngles,
-            values.dtype == .bfloat16,
-            values.shape == [1, 1, nKVHeads * headDim],
-            let rotating = cache as? RotatingKVCache,
-            rotating.maxSize == LagunaConstants.slidingWindow,
-            let ring = rotating.fusedRingPrepare()
-        {
-            // One dispatch replaces the QK-norm+RoPE kernel, both cache
-            // slice-assign dispatches, and sdpa_vector; see the kernel doc.
-            // The clock advance below mirrors updateInPlace(tokenCount: 1).
-            fusedAttended = lagunaSlidingFusedAttention(
-                rawQueries: queries,
-                rawKeys: keys,
-                rawValues: values,
-                queryWeight: qNorm.weight,
-                keyWeight: kNorm.weight,
-                angles: fusedAngles,
-                cacheKeys: ring.keys,
-                cacheValues: ring.values,
-                writeIdx: ring.writeIdx,
-                scale: _fusedAttnScale
-            )
-            rotating.fusedRingAdvance()
-            qkNormRoPEFused = true
-        } else if lagunaFusedFullAttentionEnabled,
-            useFusedFullQKNormYaRN,
-            let fusedAngles = qkRoPEAngles,
-            values.dtype == .bfloat16,
-            values.shape == [1, 1, nKVHeads * headDim],
-            let simple = cache as? KVCacheSimple,
-            let append = simple.fusedAppendPrepare()
-        {
-            // Full-attention twin of the fused branch above; engages from
-            // the second decode step (the first step's growth concat stays
-            // stock). The clock advance mirrors the stock single-token
-            // update.
-            fusedAttended = lagunaFullFusedAttention(
-                rawQueries: queries,
-                rawKeys: keys,
-                rawValues: values,
-                queryWeight: qNorm.weight,
-                keyWeight: kNorm.weight,
-                angles: fusedAngles,
-                cacheKeys: append.keys,
-                cacheValues: append.values,
-                writeIdx: append.writeIdx,
-                scale: _fusedAttnScale
-            )
-            simple.fusedAppendAdvance()
-            qkNormRoPEFused = true
-        } else if useFusedFullQKNormYaRN, let qkRoPEAngles {
+        if useFusedFullQKNormYaRN, let qkRoPEAngles {
             (queries, keys) = lagunaFullQKNormYaRN(
                 rawQueries: queries,
                 rawKeys: keys,
@@ -5445,16 +4454,14 @@ final class LagunaRuntimeAttention: Module {
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
-        let attended =
-            fusedAttended
-            ?? attentionWithCacheUpdate(
-                queries: queries,
-                keys: keys,
-                values: values,
-                cache: cache,
-                scale: scale,
-                mask: mask
-            )
+        let attended = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: cache,
+            scale: scale,
+            mask: mask
+        )
         // SDPA returns `[B, H, L, D]`. When `L == 1`, flattening its
         // contiguous head-major payload directly produces the exact
         // `[B, 1, H*D]` byte order; the transpose only changes singleton-axis
@@ -6590,6 +5597,120 @@ private let lagunaRoutedSwiGLUQMVPackedKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Lane-major twin of the packed-scale routed QMV. The side bank stores the
+/// four K-block gate/up bytes for one `(logical row, lane)` consecutively, so
+/// each SIMD lane issues one aligned 8-byte load before the K loop instead of
+/// eight independent byte loads. The loaded bytes are consumed in the same
+/// block/row order as `lagunaRoutedSwiGLUQMVPackedKernel`.
+private let lagunaRoutedSwiGLUQMVPackedScaleWordsKernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_scale_words_bf16_v1",
+    inputNames: ["input", "fused_weight", "packed_scales", "indices"],
+    outputNames: ["activated"],
+    source: """
+        constexpr uint input_width = 2048;
+        constexpr uint output_width = 512;
+        constexpr uint block_width = 512;
+        constexpr uint values_per_lane = 16;
+        constexpr uint routed_experts = 8;
+        constexpr uint fused_row_bytes = 1024;
+        constexpr uint fused_expert_bytes = 1024 * fused_row_bytes;
+        constexpr uint scale_word_bytes = 8;
+        constexpr uint scale_lane_count = 32;
+        constexpr uint scale_row_bytes = scale_lane_count * scale_word_bytes;
+        constexpr uint scale_tile_bytes = 4 * scale_row_bytes;
+        constexpr uint packed_expert_bytes = 128 * scale_tile_bytes;
+
+        uint group = threadgroup_position_in_grid.x;
+        uint expert_slot = group % routed_experts;
+        uint tile = group / routed_experts;
+        uint expert = uint(indices[expert_slot]);
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint first_row = tile * 4 + simd_group * 2;
+
+        const device uint8_t* expert_weight =
+            (const device uint8_t*)fused_weight +
+            expert * fused_expert_bytes;
+        const device uint8_t* tile_scales =
+            packed_scales + expert * packed_expert_bytes
+            + tile * scale_tile_bytes;
+
+        // Each word contains [k0 gate, k0 up, k1 gate, k1 up, ...]. Keep the
+        // two words in registers while the input and code streams are read.
+        thread uint2 scale_words[2];
+        for (uint row = 0; row < 2; ++row) {
+            uint logical_row = simd_group * 2 + row;
+            const device uint2* row_words =
+                (const device uint2*)(
+                    tile_scales + logical_row * scale_row_bytes);
+            scale_words[row] = row_words[lane];
+        }
+
+        thread float gate_result[2] = {0.0f, 0.0f};
+        thread float up_result[2] = {0.0f, 0.0f};
+        thread float input_values[values_per_lane];
+
+        for (uint block = 0; block < input_width; block += block_width) {
+            const device vec<bfloat, 4>* input_vectors =
+                (const device vec<bfloat, 4>*) (
+                    input + block + lane * values_per_lane);
+            for (uint i = 0; i < values_per_lane / 4; ++i) {
+                const vec<bfloat, 4> values = input_vectors[i];
+                input_values[4 * i] = values[0];
+                input_values[4 * i + 1] = values[1];
+                input_values[4 * i + 2] = values[2];
+                input_values[4 * i + 3] = values[3];
+            }
+
+            for (uint row = 0; row < 2; ++row) {
+                uint logical_row = tile * 4 + simd_group * 2 + row;
+                uint gate_row = (logical_row / 32) * 64 + logical_row % 32;
+                uint up_row = gate_row + 32;
+                const device uint8_t* gate_weight =
+                    expert_weight + gate_row * fused_row_bytes
+                    + block / 2 + lane * 8;
+                const device uint8_t* up_weight =
+                    expert_weight + up_row * fused_row_bytes
+                    + block / 2 + lane * 8;
+                uint word_offset = (block / block_width) * 2;
+                uint word_index = word_offset >> 2;
+                uint byte_index = word_offset & 3;
+                uint packed_word = word_index == 0
+                    ? scale_words[row].x : scale_words[row].y;
+                uint scale_pair = packed_word >> (byte_index * 8);
+
+                gate_result[row] += laguna_nvfp4_qdot_16(
+                    gate_weight,
+                    input_values,
+                    laguna_nvfp4_scale(uint8_t(scale_pair & 0xff)));
+                up_result[row] += laguna_nvfp4_qdot_16(
+                    up_weight,
+                    input_values,
+                    laguna_nvfp4_scale(uint8_t((scale_pair >> 8) & 0xff)));
+            }
+        }
+
+        for (uint row = 0; row < 2; ++row) {
+            gate_result[row] = simd_sum(gate_result[row]);
+            up_result[row] = simd_sum(up_result[row]);
+            if (lane == 0) {
+                bfloat gate = bfloat(gate_result[row]\(lagunaNvfp4RowScaleSuffix));
+                bfloat up = bfloat(up_result[row]\(lagunaNvfp4RowScaleSuffix));
+                bfloat exp_abs = metal::exp(metal::abs(gate));
+                bfloat denominator = bfloat(1) + exp_abs;
+                bfloat y = bfloat(1) / denominator;
+                bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+                bfloat silu = bfloat(gate * sigmoid);
+                activated[
+                    expert_slot * output_width + first_row + row
+                ] = bfloat(silu * up);
+            }
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
 func lagunaRoutedSwiGLUQMVPacked(
     _ input: MLXArray,
     fusedWeight: MLXArray,
@@ -6615,7 +5736,15 @@ func lagunaRoutedSwiGLUQMVPacked(
     precondition(indices.dtype == .uint32)
     precondition(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
 
-    return lagunaRoutedSwiGLUQMVPackedKernel(
+    let kernel = lagunaPackedScaleWordsEnabled
+        ? lagunaRoutedSwiGLUQMVPackedScaleWordsKernel
+        : lagunaRoutedSwiGLUQMVPackedKernel
+    lagunaPackedScalesLog.note(
+        "active",
+        lagunaPackedScaleWordsEnabled
+            ? "routed swiglu qmv packed scale words dispatch"
+            : "routed swiglu qmv packed dispatch")
+    return kernel(
         [input, fusedWeight, packedScales, indices],
         grid: (LagunaConstants.numExpertsPerTok * 128 * 64, 1, 1),
         threadGroup: (64, 1, 1),
@@ -7359,40 +6488,13 @@ func lagunaRoutedDownReduce(
     )[0]
 }
 
-/// Encode-order lever for the 9-slot down+residual dispatch. MLX's eval
-/// traversal visits a node's inputs in declaration order, and Metal memory
-/// barriers are encoder-wide. Hypothesis was that listing the shared-expert
-/// inputs first would let the shared SwiGLU QMV overlap the router top-8
-/// latency; MEASURED (2026-08-01, M5 Max 128 GB, driver rig, 150-step
-/// cool-floor windows): shared-first REGRESSES ~+0.10 ms/step. Cause: in
-/// the shipped routed-first order the shared QMV is encoded after the
-/// routed QMV with no intervening barrier, so it already overlaps the
-/// routed QMV on the GPU; moving it before the top-8 barrier makes the
-/// barrier ahead of the routed QMV wait on the shared QMV too, LENGTHENING
-/// the critical path (barriers are encoder-wide, not per-resource). Kept as
-/// an opt-in A/B arm (`DARKBLOOM_SHARED_FIRST_DOWN=1`) for re-measurement
-/// if the surrounding dispatch anatomy changes; both orders are bit-exact
-/// (pure input permutation, kernel body addresses inputs by name; the
-/// reordered variant carries a new kernel name because the JIT cache keys
-/// signatures by name).
-let lagunaSharedFirstDownOrderEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_FIRST_DOWN"] == "1"
-
 private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
-    name: lagunaSharedFirstDownOrderEnabled
-        ? "laguna_routed_shared_nvfp4_down_residual_bf16_v2sf"
-        : "laguna_routed_shared_nvfp4_down_residual_bf16_v1",
-    inputNames: lagunaSharedFirstDownOrderEnabled
-        ? [
-            "shared_activated", "shared_down_weight", "shared_down_scales",
-            "routed_activated", "routed_down_weight", "routed_down_scales",
-            "indices", "router_weights", "residual",
-        ]
-        : [
-            "routed_activated", "routed_down_weight", "routed_down_scales",
-            "indices", "router_weights", "shared_activated",
-            "shared_down_weight", "shared_down_scales", "residual",
-        ],
+    name: "laguna_routed_shared_nvfp4_down_residual_bf16_v1",
+    inputNames: [
+        "routed_activated", "routed_down_weight", "routed_down_scales",
+        "indices", "router_weights", "shared_activated",
+        "shared_down_weight", "shared_down_scales", "residual",
+    ],
     outputNames: ["output"],
     source: """
         constexpr uint input_width = 512;
@@ -7547,17 +6649,11 @@ func lagunaRoutedSharedDownResidual(
     precondition(residual.shape == [1, 1, LagunaConstants.hiddenSize])
 
     return lagunaRoutedSharedDownResidualKernel(
-        lagunaSharedFirstDownOrderEnabled
-            ? [
-                sharedActivated, sharedDownWeight, sharedDownScales,
-                routedActivated, routedDownWeight, routedDownScales,
-                indices, routerWeights, residual,
-            ]
-            : [
-                routedActivated, routedDownWeight, routedDownScales,
-                indices, routerWeights, sharedActivated,
-                sharedDownWeight, sharedDownScales, residual,
-            ],
+        [
+            routedActivated, routedDownWeight, routedDownScales,
+            indices, routerWeights, sharedActivated,
+            sharedDownWeight, sharedDownScales, residual,
+        ],
         grid: ((LagunaConstants.hiddenSize / 4) * 288, 1, 1),
         threadGroup: (288, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
@@ -9433,7 +8529,6 @@ private func lagunaFusedSortedRoutedGateUp(
     var idx = indices
     var inverseOrder = MLXArray()
     // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
-    //
     if doSort {
         (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
     }
@@ -9596,11 +8691,19 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         _routedDownWeight = downWeight
         _routedDownScales = downScales
         var prepared = [fusedWeight, fusedScales]
-        prepared.append(
-            contentsOf: preparePackedRoutedGateUpBank(
-                fusedScales: fusedScales,
-                experts: experts,
-                split: split))
+        if lagunaPackedScaleWordsEnabled {
+            prepared.append(
+                contentsOf: preparePackedRoutedGateUpScaleWordsBank(
+                    fusedScales: fusedScales,
+                    experts: experts,
+                    split: split))
+        } else {
+            prepared.append(
+                contentsOf: preparePackedRoutedGateUpBank(
+                    fusedScales: fusedScales,
+                    experts: experts,
+                    split: split))
+        }
         return prepared
     }
 
@@ -9651,6 +8754,58 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         let packed = contiguous(take(rowBlocks, MLXArray(order), axis: 1))
         _packedRoutedGateUpBank = packed
         lagunaPackedScalesLog.note("active", "packed routed gate/up bank prepared")
+        return [packed]
+    }
+
+    /// Builds the same-size lane-major side bank used by
+    /// `lagunaRoutedSwiGLUQMVPackedScaleWordsKernel`. The source rows are
+    /// gathered in the kernel's logical-row / K-block / gate-up order, then
+    /// transposed so each `(logical row, lane)` owns one contiguous 8-byte
+    /// word containing all four K-block pairs.
+    func preparePackedRoutedGateUpScaleWordsBank(
+        fusedScales: MLXArray,
+        experts: Int,
+        split: Int
+    ) -> [MLXArray] {
+        guard lagunaPackedScalesEnabled, lagunaPackedScaleWordsEnabled else {
+            return []
+        }
+        guard split == LagunaConstants.moeIntermediateSize,
+            experts == LagunaConstants.numExperts,
+            LagunaConstants.hiddenSize == 2048
+        else {
+            lagunaPackedScalesLog.note(
+                "inactive",
+                "packed scale words bank (geometry guard declined)")
+            return []
+        }
+
+        let rows = 2 * split
+        let tileCount = split / 4
+        let rowBlocks = fusedScales.reshaped([experts, rows * 4, 32])
+        var order = [Int32]()
+        order.reserveCapacity(tileCount * 4 * 4 * 2)
+        for tile in 0..<tileCount {
+            for localRow in 0..<4 {
+                let logicalRow = tile * 4 + localRow
+                let gateRow = (logicalRow / 32) * 64 + logicalRow % 32
+                let upRow = gateRow + 32
+                for kblock in 0..<4 {
+                    order.append(Int32(gateRow * 4 + kblock))
+                    order.append(Int32(upRow * 4 + kblock))
+                }
+            }
+        }
+
+        // take -> [expert, tile*row*kblock*gateup, lane]. Move lane ahead
+        // of the two small scale axes, then force a single contiguous buffer.
+        let gathered = take(rowBlocks, MLXArray(order), axis: 1)
+            .reshaped([experts, tileCount, 4, 4, 2, 32])
+            .transposed(0, 1, 2, 5, 3, 4)
+        let packed = contiguous(gathered).reshaped([experts, 4096, 32])
+        _packedRoutedGateUpBank = packed
+        lagunaPackedScalesLog.note(
+            "active", "packed routed gate/up scale words bank prepared")
         return [packed]
     }
 
@@ -10344,7 +9499,7 @@ final class LagunaRuntimeModelInner: Module {
     private func decodeRoPEAtlasPosition(
         inputs: MLXArray, cache: [KVCache]?
     ) -> Int? {
-        guard lagunaRoPEAngleAtlasEnabled || lagunaRoPEAtlasViewsEnabled,
+        guard lagunaRoPEAngleAtlasEnabled,
             lagunaFusedFullQKNormYaRNEnabled,
             lagunaFusedSlidingQKNormRoPEEnabled,
             inputs.dtype == .int32,
@@ -10394,8 +9549,7 @@ final class LagunaRuntimeModelInner: Module {
         var fullRoPEAngles: MLXArray?
         var slidingRoPEAngles: MLXArray?
         var qkRoPEOffsets: MLXArray?
-        if lagunaRoPEAngleAtlasEnabled,
-            let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
+        if let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
             let fullAtlas = _fullRoPEAngleAtlas,
             let slidingAtlas = _slidingRoPEAngleAtlas,
             let atlasOutputs = lagunaDecodeEmbeddingRoPEAtlas(
@@ -10408,21 +9562,6 @@ final class LagunaRuntimeModelInner: Module {
             h = atlasOutputs.hidden
             fullRoPEAngles = atlasOutputs.fullAngles
             slidingRoPEAngles = atlasOutputs.slidingAngles
-        } else if lagunaRoPEAtlasViewsEnabled,
-            let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
-            let fullAtlas = _fullRoPEAngleAtlas,
-            let slidingAtlas = _slidingRoPEAngleAtlas
-        {
-            // Zero-dispatch angle carrier: stock embedding gather plus two
-            // zero-copy row views of the load-time atlases. The atlas row at
-            // `position` carries the same FP32 floats the probe dispatch
-            // would have produced (the atlas is that probe, broadcast over
-            // positions at load time), and the row slice of the contiguous
-            // atlas is row-contiguous, so the fused QK-norm+RoPE kernels
-            // consume it without any copy or added kernel.
-            h = embedTokens(inputs)
-            fullRoPEAngles = fullAtlas[0..., 0..., position..<(position + 1), 0...]
-            slidingRoPEAngles = slidingAtlas[0..., 0..., position..<(position + 1), 0...]
         } else {
             // Verbatim stock fallback for prefill, unsupported caches and
             // positions outside the precomputed atlas.
