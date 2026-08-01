@@ -1797,7 +1797,7 @@ func lagunaSlidingFusedAttention(
     )[0]
 }
 
-/// `DARKBLOOM_FUSED_FULL_ATTN` (default off; set "1" to enable): decode
+/// `DARKBLOOM_FUSED_FULL_ATTN` (default on; set "0" to disable): decode
 /// fused attention for the ten full-attention layers once the cache backing
 /// has spare capacity (from the second decode step on; the first step's
 /// stock growth concat is kept). Same design as the sliding twin above —
@@ -1807,7 +1807,7 @@ func lagunaSlidingFusedAttention(
 /// partial rotary, folded mscale roundings, passthrough tail) and the
 /// pair path's runtime-length loop + single-row tail at gqa_factor 6.
 let lagunaFusedFullAttentionEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_ATTN"] == "1"
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_ATTN"] != "0"
 
 private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
     name: "laguna_full_fused_attn_grow_v1",
