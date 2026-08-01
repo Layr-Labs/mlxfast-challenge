@@ -2063,7 +2063,7 @@ private let lagunaLmHeadInlineExactKernel = MLXFast.metalKernel(
 /// `coarse` is untouched FP32, so skipped slots keep the exact bits the FP32
 /// arm would store.
 private let lagunaLmHeadInlineExactDeltaBF16Kernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_exact_inline_mask_block_delta_bf16_v1",
+    name: "laguna_lmhead_exact_inline_mask_block_delta_bf16_lane0_mask_v1",
     inputNames: ["coarse", "delta", "thr", "lm_head", "x"],
     outputNames: ["assembled"],
     source: """
@@ -2078,17 +2078,22 @@ private let lagunaLmHeadInlineExactDeltaBF16Kernel = MLXFast.metalKernel(
         // grid tiles it exactly; the bounds test is belt-and-braces.
         uint base = tgid * 32 + sgid * 4;
 
-        // Simdgroup-uniform. This is textually the selector's predicate; the
-        // fixed row mapping still gives one owner per output slot.
-        bool any_candidate = false;
-        #pragma unroll
-        for (uint tm = 0; tm < 4; ++tm) {
-            uint r = base + tm;
-            any_candidate = any_candidate ||
-                (r < VOCAB && coarse[r] + float(delta[r]) >= thr[0]);
+        // The predicate is simdgroup-uniform, so lane 0 forms it once and
+        // broadcasts the four row decisions. Reusing the mask below removes
+        // the same coarse/delta/threshold reads from the final write path.
+        uint candidate_mask = 0;
+        if (lane == 0) {
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                uint r = base + tm;
+                if (r < VOCAB && coarse[r] + float(delta[r]) >= thr[0]) {
+                    candidate_mask |= 1u << tm;
+                }
+            }
         }
+        candidate_mask = simd_broadcast(candidate_mask, 0);
 
-        if (!any_candidate) {
+        if (candidate_mask == 0) {
             if (lane < 4 && base + lane < VOCAB) {
                 assembled[base + lane] = bfloat(coarse[base + lane]);
             }
@@ -2136,7 +2141,7 @@ private let lagunaLmHeadInlineExactDeltaBF16Kernel = MLXFast.metalKernel(
             for (uint tm = 0; tm < 4; ++tm) {
                 uint r = base + tm;
                 if (r < VOCAB) {
-                    assembled[r] = (coarse[r] + float(delta[r]) >= thr[0])
+                    assembled[r] = (candidate_mask & (1u << tm)) != 0
                         ? bfloat(result[tm])
                         : bfloat(coarse[r]);
                 }
