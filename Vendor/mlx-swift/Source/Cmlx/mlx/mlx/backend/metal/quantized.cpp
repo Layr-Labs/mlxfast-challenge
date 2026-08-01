@@ -1394,13 +1394,9 @@ int darkbloom_stage_bm128_variant() {
   static const int v = [] {
     auto s = env::get_var("DARKBLOOM_STAGE_BM128", "");
     if (s.empty()) {
-      // Default 5 (2026-08-01, final): API absolutes across our four scored
-      // sessions prove the mechanism — candidate prefill 204.90 (base) →
-      // 201.64 (wn1) → 201.42 (steel) → 198.00 µs (both; fastest on record).
-      // Earlier rejections were session-baseline draw fog (bpre 364-371 vs
-      // the 375-386 every recent promotion drew), not mechanism failures.
-      // DARKBLOOM_STAGE_BM128=4 restores the WN2 tiling.
-      return 5;
+      // Default 4: BM64/WM4/WN2 256 thr/TG. M5 HOLD +0.20% on tip 2.118.
+      // DARKBLOOM_STAGE_BM128=5 restores WN1.
+      return 4;
     }
     if (s == "1") {
       return 1;
