@@ -473,8 +473,19 @@ public final class LagunaRuntimeWeightCache {
         )
         eval(model(prefillTokens, cache: warmupCache))
         let decodeToken = MLXArray([bosToken], [1, 1])
-        let warmDecodeLogits = model(decodeToken, cache: warmupCache)
+        var warmDecodeLogits = model(decodeToken, cache: warmupCache)
         eval(warmDecodeLogits)
+        // The full-attention twin is held default-off after two ranked-exact
+        // full-bundle runs showed a large prefill regression. Only an explicit
+        // full-fusion A/B needs the second decode step that reaches its
+        // spare-capacity path and moves that kernel's JIT compile to untimed
+        // initialization. Default sliding-only execution is fully warmed by
+        // the first decode step against the wrapped 512-token cache and keeps
+        // the promoted one-step constructor warmup contract.
+        if lagunaFusedFullAttentionEnabled {
+            warmDecodeLogits = model(decodeToken, cache: warmupCache)
+            eval(warmDecodeLogits)
+        }
         // Warm the greedy-token pipeline too. Every scored worker request ends
         // in `LagunaCorrectness.greedyToken` (reshape -> last row -> argMax),
         // and the forwards above never run an argmax, so its first use

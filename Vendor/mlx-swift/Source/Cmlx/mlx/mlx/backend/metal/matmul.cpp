@@ -92,17 +92,6 @@ static bool darkbloom_steel_prefill_tile() {
   return enabled;
 }
 
-
-// Ground-truth dispatch trace (DARKBLOOM_STEEL_TRACE=1): prints the actual
-// steel kernel base name + geometry at every nax GEMM dispatch. Never set
-// inside timed windows (stderr I/O).
-static bool darkbloom_steel_trace() {
-  static bool v = []() {
-    const char* e = getenv("DARKBLOOM_STEEL_TRACE");
-    return e && atoi(e) != 0;
-  }();
-  return v;
-}
 } // namespace
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -355,13 +344,6 @@ void steel_matmul_regular_axpby_nax(
     compute_encoder.set_bytes(params, 5);
   }
 
-  if (darkbloom_steel_trace()) {
-    fprintf(
-        stderr,
-        "[darkbloom][steel] %s M=%d N=%d K=%d grid=(%lu,%lu,%lu)\n",
-        base_name.c_str(), M, N, K, grid_dims.width, grid_dims.height,
-        grid_dims.depth);
-  }
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 
   // Record copies
@@ -821,13 +803,6 @@ void steel_gemm_splitk_axpby_nax(
   compute_encoder.set_output_array(C_split, 2);
 
   compute_encoder.set_bytes(params, 3);
-  if (darkbloom_steel_trace()) {
-    fprintf(
-        stderr,
-        "[darkbloom][steel] %s M=%d N=%d K=%d parts=%d psize=%d grid.x=%lu\n",
-        base_name.c_str(), M, N, K, split_k_partitions,
-        split_k_partition_size, grid_dims.width);
-  }
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 
   // Do accum kernel
