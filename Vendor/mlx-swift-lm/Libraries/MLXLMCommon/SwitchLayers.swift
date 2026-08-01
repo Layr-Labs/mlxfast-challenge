@@ -112,10 +112,63 @@ private let inversePermutationScatterKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+/// Fused route table for the sorted MoE regime: one dispatch produces all
+/// three `order`-derived integer tables (`inverse[order[i]] = i`,
+/// `quotient[i] = order[i] / m`, `sortedIndices[i] = indices[order[i]]`),
+/// replacing the separate inverse-scatter, floorDivide, and indices-gather
+/// dispatches. Pure integer loads/stores with exactly one writer per output
+/// slot, so every output bit is identical to the three stock ops it
+/// replaces. DEFAULT ON; set `DARKBLOOM_ROUTE_TABLE_FUSED=0` to restore the
+/// separate dispatches. The 16 MB activation gather is deliberately NOT
+/// folded in: it is a locality shuffle the expert QMM reads sequentially,
+/// not redundant work.
+private let routeTableFusedEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTE_TABLE_FUSED"] != "0"
+
+private let routeTableFusedKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_table_u32_v1",
+    inputNames: ["order", "indices", "m_arr"],
+    outputNames: ["inverse", "quotient", "sortedIndices"],
+    source: """
+        uint i = thread_position_in_grid.x;
+        uint o = order[i];
+        inverse[o] = i;
+        quotient[i] = o / m_arr;
+        sortedIndices[i] = indices[o];
+        """,
+    ensureRowContiguous: false
+)
+
+/// Process-lifetime cache for the scalar `m` kernel input (experts per
+/// token): input-independent, so building it once avoids a per-call fill.
+/// Single-threaded call sites (model forward), matching the vendored
+/// `wiredTicketRetainer` precedent.
+nonisolated(unsafe) private var routeTableMScalarCache: [Int: MLXArray] = [:]
+private func routeTableMScalar(_ m: Int) -> MLXArray {
+    if let cached = routeTableMScalarCache[m] { return cached }
+    let scalar = MLXArray(UInt32(m))
+    routeTableMScalarCache[m] = scalar
+    return scalar
+}
+
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
     let order = argSort(indices)
+    if routeTableFusedEnabled, order.size > 0, indices.dtype == .uint32 {
+        let tables = routeTableFusedKernel(
+            [order, indices, routeTableMScalar(m)],
+            grid: (order.size, 1, 1),
+            threadGroup: (min(order.size, 256), 1, 1),
+            outputShapes: [[order.size], [order.size], [order.size]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+        return (
+            x.flattened(start: 0, end: -3)[tables[1]],
+            tables[2],
+            tables[0]
+        )
+    }
     let inverseOrder: MLXArray
     if inversePermutationScatterEnabled && order.size > 0 {
         inverseOrder = inversePermutationScatterKernel(
