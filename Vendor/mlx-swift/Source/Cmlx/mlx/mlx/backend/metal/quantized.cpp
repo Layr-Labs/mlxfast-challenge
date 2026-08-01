@@ -1319,7 +1319,8 @@ int darkbloom_expert_gather_groups() {
 // pipeline key. Resolved once per process, so exactly one variant is ever
 // compiled and a fresh process picks up a changed environment cleanly.
 //
-//   unset (SHIPPED) -> 4  (BM=64,  WM=4, WN=2)  SM=16, 256 thr/TG
+//   unset (SHIPPED) -> 5  (BM=64,  WM=4, WN=1)  SN=64, 128 thr/TG (2026-07-31)
+//   "4" (prev ship) -> 4  (BM=64,  WM=4, WN=2)  SM=16, 256 thr/TG
 //   "0"             -> 0  (BM=64,  WM=2, WN=2)  SM=32  upstream tiling
 //   "1"             -> 1  (BM=128, WM=4)        SM=32  less expert re-staging
 //   "2"             -> 2  (BM=128, WM=2)        SM=64  measured regression
@@ -1393,7 +1394,12 @@ int darkbloom_stage_bm128_variant() {
   static const int v = [] {
     auto s = env::get_var("DARKBLOOM_STAGE_BM128", "");
     if (s.empty()) {
-      return 4;
+      // Default flipped 4 -> 5 (2026-07-31, GatherX/Main): BM64/WM4/WN1 on
+      // the (now wn1-admitting) expert path measured -4.2% gate/up, -3.0%
+      // down kernel-level (bit-identical outputs) and -1.34% prefill wall
+      // (5/5 like-regime pairs, both orders, Welch t~6, decode unchanged).
+      // Explicit DARKBLOOM_STAGE_BM128=4 restores the previous default.
+      return 5;
     }
     if (s == "1") {
       return 1;
