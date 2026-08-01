@@ -2812,6 +2812,116 @@ func lagunaGateProductSoftplus(
     )[0]
 }
 
+// MARK: - Prefill gate-product epilogue (one dispatch)
+
+/// Prefill twin of the decode gate-product fold. The stock chain between the
+/// gate projection and the output projection at L > 1 is the compiled
+/// shapeless softplus (`lagunaCompiledSoftplusGate`: BF16→FP32 cast,
+/// `LogAddExp(x, 0)`, FP32→BF16 cast, one dispatch) followed by the
+/// broadcast product against the SDPA output's transposed lazy view
+/// (`output.reshaped(B, L, H, D) * gate[..., newAxis]`, which materializes
+/// the [B, L, H*D] row-major form the output projection consumes — one
+/// dispatch, plus a copy whenever the transposed reshape cannot ride the
+/// multiply's general path). This kernel performs the whole epilogue in one
+/// dispatch, reading the SDPA output in its native [B, H, L, D] layout and
+/// writing the o_proj-ready [B, L, H*D] gated tensor directly, so the
+/// transposed-view round trip is gone too.
+///
+/// Bit-exactness, boundary for boundary (the softplus text is VERBATIM the
+/// promoted decode twin's, whose equivalence to the stock chain is
+/// ranked-proven — it ran on every decode token of the e23e82c5/ad14f90b
+/// submissions, which passed the hidden gates):
+///
+/// - the gate logit read is the same BF16 value the stock compiled softplus
+///   reads (`gProj(normalizedInput)`'s raw output row);
+/// - the FP32 softplus is MLX's `LogAddExp<float>` verbatim (same
+///   `maxval + log1p(exp(minval - maxval))` form, same NaN/inf guards, same
+///   Goldberg `log1p` from the metal utils preamble). It is recomputed per
+///   element of a head — the same FP32 op stream the standalone softplus
+///   dispatch runs once per head, on the same input bits;
+/// - the gate rounds to BF16 exactly where the stock `.asType(.bfloat16)`
+///   rounds it, and the product rounds once to BF16 exactly where MLX's
+///   BF16 binary multiply rounds `float(bfloat(float(values[i]) * gate))`;
+/// - the attention-output read is the same BF16 value the stock multiply
+///   reads (any copy the lazy transposed reshape inserts preserves bits).
+///
+/// Grid mapping mirrors the other prefill kernels: `threadgroups_per_grid.y`
+/// is L, so no shape constant is baked and any L dispatches the same
+/// compiled kernel; thread `row` of token `t` writes
+/// `gated[t * (H*D) + row]` from `attention_output[(head*L + t)*D + d]`,
+/// one thread per output element, consecutive threads reading and writing
+/// contiguously inside each 128-element head row.
+private func lagunaPrefillGateProductSoftplusSource(heads: Int) -> String {
+    """
+    constexpr uint HEAD_DIM = \(LagunaConstants.headDim);
+    constexpr uint HEADS = \(heads);
+    uint row = thread_position_in_grid.x;
+    uint t = threadgroup_position_in_grid.y;
+    uint length = threadgroups_per_grid.y;
+    uint head = row / HEAD_DIM;
+    float logit = float(gate_logits[t * HEADS + head]);
+    float gate;
+    if (metal::isnan(logit)) {
+        gate = NAN;
+    } else {
+        float maxval = metal::max(logit, 0.0f);
+        float minval = metal::min(logit, 0.0f);
+        gate = (metal::isinf(minval) || metal::isinf(maxval))
+            ? maxval
+            : maxval + log1p(metal::exp(minval - maxval));
+    }
+    bfloat gate_bf = bfloat(gate);
+    gated[t * (HEADS * HEAD_DIM) + row] = bfloat(
+        float(attention_output[(head * length + t) * HEAD_DIM + row % HEAD_DIM])
+            * float(gate_bf));
+    """
+}
+
+private let lagunaPrefillGateProductSoftplusKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_prefill_gate_product_softplus_bf16_h\(heads)_v1",
+            inputNames: ["attention_output", "gate_logits"],
+            outputNames: ["gated"],
+            source: lagunaPrefillGateProductSoftplusSource(heads: heads),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+/// Set `DARKBLOOM_PREFILL_GATE_PRODUCT=0` to ablate and restore the exact
+/// stock prefill chain (compiled softplus + transpose/multiply).
+private let lagunaPrefillGateProductEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_GATE_PRODUCT"] != "0"
+
+/// Returns the gated prefill attention output `[1, L, heads*headDim]`, or nil
+/// when the preconditions do not hold (caller falls back to the stock chain).
+/// Bit-identical to the stock compiled-softplus + broadcast-product chain;
+/// see the kernel commentary above.
+func lagunaPrefillGateProductSoftplus(
+    attentionOutput: MLXArray, gateLogits: MLXArray, heads: Int, length: Int
+) -> MLXArray? {
+    guard lagunaPrefillGateProductEnabled,
+        let kernel = lagunaPrefillGateProductSoftplusKernels[heads]
+    else { return nil }
+    let inVec = heads * LagunaConstants.headDim
+    precondition(attentionOutput.dtype == .bfloat16)
+    precondition(attentionOutput.shape == [1, heads, length, LagunaConstants.headDim])
+    precondition(gateLogits.dtype == .bfloat16)
+    precondition(gateLogits.shape == [1, length, heads])
+
+    lagunaTrace("prefill gate product softplus h\(heads)")
+    return kernel(
+        [attentionOutput, gateLogits],
+        grid: (inVec, length, 1),
+        threadGroup: (128, 1, 1),
+        outputShapes: [[1, length, inVec]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 // MARK: - Gated native-affine INT8 output projection (one dispatch)
 
 /// Folds the per-head softplus gate product into the native group-32 affine
@@ -3066,11 +3176,19 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
 
         for (uint row = 0; row < results_per_simdgroup; ++row) {
             const device uint32_t* wl = ws + row * (in_vec_size / 8);
+            // E4M3 scale WITHOUT the 2^22: deferred to the per-row epilogue
+            // (one multiply per row instead of one per group). Power-of-two
+            // scaling commutes with every rounding in the chain, so each
+            // group product, partial sum and simd_sum is exactly 2^-22 times
+            // its folded value and the single epilogue multiply restores it
+            // before the one BF16 round -- bit-identical (the FP32-subnormal
+            // escape needs |scale x accum| < 2^-104, unreachable for O(1)
+            // attention values; the same promoted range argument as
+            // `fea7f28e`'s DARKBLOOM_NVFP4_SCALE_DEFER).
             uint8_t sbits = sc[row * in_vec_size_g];
             ushort sraw = ushort(sbits & 127) << 7;
             half sconverted = as_type<half>(sraw);
-            float scale = float((sbits & 128) ? -sconverted : sconverted)
-                * 4194304.0f;
+            float scale = float((sbits & 128) ? -sconverted : sconverted);
             float accum = 0.0f;
             #pragma unroll
             for (uint j = 0; j < codes_per_thread; ++j) {
@@ -3101,7 +3219,7 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
     }
 
     for (uint row = 0; row < results_per_simdgroup; ++row) {
-        result[row] = simd_sum(result[row]);
+        result[row] = simd_sum(result[row] * 4194304.0f);
         if (simd_lid == 0) {
             projected[out_row + row] = bfloat(result[row]);
         }
@@ -4588,6 +4706,26 @@ final class LagunaRuntimeAttention: Module {
                 L == 1, wo.bias == nil, MLXHardwareInfo.isCompiledDecodeSupported
             {
                 return attentionGateProjection(output, projectedGate, wo.weight)
+            }
+            // Prefill gate-epilogue fold: ONE dispatch for the softplus
+            // chain AND the broadcast product over all L rows, reading the
+            // SDPA output in its native [B, H, L, D] layout and writing the
+            // o_proj-ready [B, L, H*D] gated tensor — the compiled-softplus
+            // dispatch, the transposed-view round trip and the separate
+            // multiply below are all replaced. Bit-identical to the stock
+            // chain (see `lagunaPrefillGateProductSoftplusSource`); any
+            // guard decline falls through to it verbatim.
+            if !gateIsActivated, gatePerHead, L > 1, B == 1,
+                attended.dtype == .bfloat16, projectedGate.dtype == .bfloat16,
+                attended.shape == [B, nHeads, L, headDim],
+                projectedGate.shape == [B, L, nHeads],
+                let fused = lagunaPrefillGateProductSoftplus(
+                    attentionOutput: attended,
+                    gateLogits: projectedGate,
+                    heads: nHeads,
+                    length: L)
+            {
+                return wo(fused)
             }
             let gate =
                 gateIsActivated
