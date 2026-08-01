@@ -332,9 +332,14 @@ let lagunaSharedSwiGLUQMVRows1Enabled =
 
 /// Folds the per-head softplus gate into the output projection's GEMV (see
 /// `lagunaGatedOutputProjectionSource`), with one kernel variant per attention
-/// family. Set `DARKBLOOM_FUSED_GATED_OUTPUT=0` to ablate.
+/// family. Default OFF (`DARKBLOOM_FUSED_GATED_OUTPUT=1` restores the fused
+/// control): the same regime shift that retired the tail norm+QKV fusion
+/// applies here — on the all-NVFP4 frontier each fused output tile re-stages
+/// the softplus gate table and its barrier, and the stock chain amortizes
+/// that work once per layer. Local ablation A/B is border-positive; this
+/// default is the single-variable ranked test of that reading.
 let lagunaFusedGatedOutputProjectionEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATED_OUTPUT"] != "0"
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATED_OUTPUT"] == "1"
 
 /// Issues Q, K and V as one dispatch over the three stock weights (see
 /// `lagunaFusedQKVProjectionSource`). Unlike `DARKBLOOM_FUSED_QKV` this keeps
