@@ -3776,8 +3776,22 @@ func lagunaGateProductSoftplus(
 /// into the input row at each k-block at the same FP32 -> BF16 rounding point
 /// `lagunaGateProductSoftplusSource` uses, so the contraction is bit-identical
 /// to applying the gate first and then running the stock affine GEMV.
-private func lagunaGatedAffineOProjSource(heads: Int) -> String {
-    """
+private func lagunaGatedAffineOProjSource(heads: Int, gateActivated: Bool) -> String {
+    let gateBody = gateActivated
+        ? "gate = float(gate_logits[lid]);"
+        : """
+        float logit = float(gate_logits[lid]);
+        if (metal::isnan(logit)) {
+            gate = NAN;
+        } else {
+            float maxval = metal::max(logit, 0.0f);
+            float minval = metal::min(logit, 0.0f);
+            gate = (metal::isinf(minval) || metal::isinf(maxval))
+                ? maxval
+                : maxval + log1p(metal::exp(minval - maxval));
+        }
+        """
+    return """
     constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
     constexpr uint out_vec_size = \(LagunaConstants.hiddenSize);
     constexpr uint gate_heads = \(heads);
@@ -3799,17 +3813,8 @@ private func lagunaGatedAffineOProjSource(heads: Int) -> String {
     // `lagunaGateProductSoftplusSource` uses.
     threadgroup float gate_table[gate_heads];
     if (lid < gate_heads) {
-        float logit = float(gate_logits[lid]);
         float gate;
-        if (metal::isnan(logit)) {
-            gate = NAN;
-        } else {
-            float maxval = metal::max(logit, 0.0f);
-            float minval = metal::min(logit, 0.0f);
-            gate = (metal::isinf(minval) || metal::isinf(maxval))
-                ? maxval
-                : maxval + log1p(metal::exp(minval - maxval));
-        }
+        \(gateBody)
         gate_table[lid] = float(bfloat(gate));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3868,19 +3873,24 @@ private func lagunaGatedAffineOProjSource(heads: Int) -> String {
 /// One kernel per attention head count, built eagerly so one binary serves
 /// every arm of an ablation and MLX's name-keyed JIT cache never sees two
 /// sources under one name.
-private let lagunaGatedAffineOProjKernels: [Int: MLXFast.MLXFastKernel] = {
-    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+private let lagunaGatedAffineOProjKernels: [String: MLXFast.MLXFastKernel] = {
+    var kernels: [String: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
-        kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_gated_affine_oproj_qmv_i8g32_h\(heads)_v1",
-            inputNames: [
-                "attention_output", "gate_logits", "weight_codes",
-                "weight_scales", "weight_biases",
-            ],
-            outputNames: ["projected"],
-            source: lagunaGatedAffineOProjSource(heads: heads),
-            ensureRowContiguous: true
-        )
+        for gateActivated in [false, true] {
+            let key = "\(heads):\(gateActivated)"
+            kernels[key] = MLXFast.metalKernel(
+                name: "laguna_gated_affine_oproj_qmv_i8g32_h\(heads)_"
+                    + (gateActivated ? "gateact" : "v1"),
+                inputNames: [
+                    "attention_output", "gate_logits", "weight_codes",
+                    "weight_scales", "weight_biases",
+                ],
+                outputNames: ["projected"],
+                source: lagunaGatedAffineOProjSource(
+                    heads: heads, gateActivated: gateActivated),
+                ensureRowContiguous: true
+            )
+        }
     }
     return kernels
 }()
@@ -3909,9 +3919,11 @@ func lagunaGatedAffineOProj(
     codes: MLXArray,
     scales: MLXArray,
     biases: MLXArray,
-    heads: Int
+    heads: Int,
+    gateActivated: Bool
 ) -> MLXArray? {
-    guard let kernel = lagunaGatedAffineOProjKernels[heads] else { return nil }
+    guard let kernel = lagunaGatedAffineOProjKernels["\(heads):\(gateActivated)"]
+    else { return nil }
     let inVec = heads * LagunaConstants.headDim
     let outVec = LagunaConstants.hiddenSize
     guard attentionOutput.dtype == .bfloat16,
@@ -4713,6 +4725,19 @@ let lagunaNormAffineQKVPrefetchDepth: Int = {
     return min(max(Int(raw) ?? 4, 0), 4)
 }()
 
+/// Decode-only gate activation at the fused INT8 QKV+G producer. The gate
+/// logit is first rounded to BF16 by the affine contraction exactly as before;
+/// its softplus is then evaluated once at the same FP32->BF16 boundary the
+/// fused o_proj used to repeat in every output tile. This is implemented by
+/// the register-prefetch producer, so disabling that producer also disables
+/// preactivation. Default ON; set
+/// `DARKBLOOM_NORM_AFFINE_QKV_PREACTIVATE_GATE=0` for the raw-gate control.
+private let lagunaNormAffineQKVPreactivateGate =
+    !lagunaNormAffineQKVStaged
+    && lagunaNormAffineQKVPrefetchDepth > 0
+    && ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NORM_AFFINE_QKV_PREACTIVATE_GATE"] != "0"
+
 /// Register-prefetch twin of the inline `lagunaNormAffineQKVSource`. The
 /// NORM half and the k-loop arithmetic are textually the stock inline
 /// variant's; the only changes are (a) the stream-pointer setup and the
@@ -4721,7 +4746,14 @@ let lagunaNormAffineQKVPrefetchDepth: Int = {
 /// consuming the registers with the identical per-i accumulation order.
 /// Same values, same operation order per output row -> bit-exact.
 private func lagunaNormAffineQKVPrefetchSource(rows: Int, depth: Int) -> String {
-    """
+    let gateRows: Int =
+        switch rows {
+        case 10_304: LagunaConstants.slidingAttentionHeads
+        case 8_240: LagunaConstants.fullAttentionHeads
+        default: 0
+        }
+    let gateStart = rows - gateRows
+    return """
     constexpr uint axis_size = \(LagunaConstants.hiddenSize);
     constexpr uint out_vec_size = \(rows);
     constexpr uint n_reads = 4;                 // RMS_N_READS
@@ -4738,6 +4770,8 @@ private func lagunaNormAffineQKVPrefetchSource(rows: Int, depth: Int) -> String 
     constexpr uint scale_step_per_thread = group_size / values_per_thread;
     constexpr uint in_vec_size_g = axis_size / group_size;
     constexpr uint pf_depth = \(depth);
+    constexpr bool preactivate_gate = \(lagunaNormAffineQKVPreactivateGate ? "true" : "false");
+    constexpr uint gate_start = \(gateStart);
 
     uint tile = threadgroup_position_in_grid.x;
     uint lid = thread_position_in_threadgroup.x;
@@ -4865,7 +4899,23 @@ private func lagunaNormAffineQKVPrefetchSource(rows: Int, depth: Int) -> String 
     for (uint row = 0; row < results_per_simdgroup; ++row) {
         result[row] = simd_sum(result[row]);
         if (simd_lid == 0) {
-            projected[out_row + row] = bfloat(result[row]);
+            bfloat rounded = bfloat(result[row]);
+            if (preactivate_gate && out_row + row >= gate_start) {
+                float logit = float(rounded);
+                float gate;
+                if (metal::isnan(logit)) {
+                    gate = NAN;
+                } else {
+                    float maxval = metal::max(logit, 0.0f);
+                    float minval = metal::min(logit, 0.0f);
+                    gate = (metal::isinf(minval) || metal::isinf(maxval))
+                        ? maxval
+                        : maxval + log1p(metal::exp(minval - maxval));
+                }
+                projected[out_row + row] = bfloat(gate);
+            } else {
+                projected[out_row + row] = rounded;
+            }
         }
     }
     """
@@ -4885,7 +4935,8 @@ private let lagunaNormAffineQKVKernels: [Int: MLXFast.MLXFastKernel] = {
             let pf = staged ? 0 : lagunaNormAffineQKVPrefetchDepth
             kernels[rows] = MLXFast.metalKernel(
                 name: pf > 0
-                    ? "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_pf\(pf)_v1"
+                    ? "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_pf\(pf)_"
+                        + (lagunaNormAffineQKVPreactivateGate ? "gateact" : "v1")
                     : "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_"
                         + (staged ? "tg" : "inl") + "_v1",
                 inputNames: [
@@ -5299,6 +5350,7 @@ final class LagunaRuntimeAttention: Module {
                 // device-visible normalized row; the NVFP4 tail layers and
                 // any guard decline keep the separate norm.
                 var fusedQKV: MLXArray?
+                var fusedQKVGateActivated = false
                 if lagunaFusedNormAffineQKVEnabled,
                     fusedAffine.mode == .affine, fusedAffine.bits == 8,
                     fusedAffine.groupSize == 32,
@@ -5313,6 +5365,8 @@ final class LagunaRuntimeAttention: Module {
                         scales: fusedAffine.scales,
                         biases: affineBiases,
                         rows: fusedAffine.originalShape[0])
+                    fusedQKVGateActivated =
+                        fusedQKV != nil && lagunaNormAffineQKVPreactivateGate
                 }
 
                 // NVFP4-tail counterpart: one dispatch for the input
@@ -5389,12 +5443,12 @@ final class LagunaRuntimeAttention: Module {
                 // those exact rounding boundaries inside its single dispatch.
                 // Otherwise keep the stock eager activation.
                 let deferGateActivation =
-                    lagunaFusedGateProductEnabled
+                    !fusedQKVGateActivated && lagunaFusedGateProductEnabled
                     && lagunaUseNativeAffineOProj(layer: layerIdx)
                     && _nativeAffineOProj != nil
                     && wo.bias == nil
                 let gateValues =
-                    deferGateActivation
+                    fusedQKVGateActivated || deferGateActivation
                     ? gateLogits
                     : softplus(gateLogits.asType(.float32)).asType(.bfloat16)
                 fusedNormQKV = (
@@ -5402,7 +5456,7 @@ final class LagunaRuntimeAttention: Module {
                     qkv[.ellipsis, queryDim ..< (queryDim + kvDim)],
                     qkv[.ellipsis, (queryDim + kvDim) ..< gateStart],
                     gateValues,
-                    !deferGateActivation
+                    fusedQKVGateActivated || !deferGateActivation
                 )
             } else {
                 fusedNormQKV = lagunaFusedNormQKVProjection(
@@ -5697,12 +5751,13 @@ final class LagunaRuntimeAttention: Module {
                 output.shape == [1, 1, nHeads * headDim],
                 projectedGate.shape == [1, 1, nHeads]
             {
-                // Raw logits + gated affine GEMV: ONE dispatch for the softplus
-                // chain, the broadcast product AND the INT8 contraction (see
-                // `lagunaGatedAffineOProjSource`). Only the group-32 affine
-                // INT8 wire format is served; the NVFP4 tail layers and any
-                // guard decline fall through to the two-dispatch chain below.
-                if lagunaFusedGatedAffineOProjEnabled, !gateIsActivated,
+                // Gated affine GEMV: ONE dispatch for the broadcast product
+                // and INT8 contraction (see `lagunaGatedAffineOProjSource`).
+                // The raw-logit variant also performs softplus; the activated
+                // variant reuses the producer's exact BF16 gate. Only the
+                // group-32 affine INT8 wire format is served; the NVFP4 tail
+                // layers and any guard decline fall through below.
+                if lagunaFusedGatedAffineOProjEnabled,
                     affineWO.mode == .affine, affineWO.bits == 8,
                     affineWO.groupSize == 32,
                     let affineBiases = affineWO.biases,
@@ -5712,7 +5767,8 @@ final class LagunaRuntimeAttention: Module {
                         codes: affineWO.packedCodes,
                         scales: affineWO.scales,
                         biases: affineBiases,
-                        heads: nHeads)
+                        heads: nHeads,
+                        gateActivated: gateIsActivated)
                 {
                     return fusedProjection
                 }
