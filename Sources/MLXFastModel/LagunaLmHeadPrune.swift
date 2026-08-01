@@ -1134,7 +1134,7 @@ private let lagunaLmHeadInt6CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKerne
 /// identical FP32 bit pattern.
 private let lagunaLmHeadInt6CoarseRatioBoundDeltaBF16PrecomputedAbsKernel =
     MLXFast.metalKernel(
-        name: "laguna_lmhead_int6_inline_coarse_ratio_bound_delta_bf16_preabs_v1",
+        name: "laguna_lmhead_int6_inline_coarse_ratio_bound_delta_bf16_preabs_v2",
         inputNames: ["x", "codes_lo", "codes_hi", "scales", "abs_group_sums"],
         outputNames: ["coarse", "delta"],
         source: """
@@ -1147,6 +1147,10 @@ private let lagunaLmHeadInt6CoarseRatioBoundDeltaBF16PrecomputedAbsKernel =
             const device uint8_t* lorow = codes_lo + size_t(row) * 1024;
             const device uint8_t* hirow = codes_hi + size_t(row) * 512;
             const device uint8_t* srow = scales + size_t(row) * 64;
+            // Lane l consumes groups 2l and 2l+1. Fetch their adjacent FP32
+            // bounds in one aligned transaction while preserving the loop's
+            // scalar arithmetic and group order below.
+            float2 abs_pair = ((const device float2*)abs_group_sums)[lane];
 
             float c_acc = 0.0f;
             float d_acc = 0.0f;
@@ -1183,7 +1187,7 @@ private let lagunaLmHeadInt6CoarseRatioBoundDeltaBF16PrecomputedAbsKernel =
                     }
                 }
                 c_acc += sd * cg;
-                d_acc += (0.5f * sd) * abs_group_sums[g];
+                d_acc += (0.5f * sd) * abs_pair[gg];
             }
             c_acc = simd_sum(c_acc);
             d_acc = simd_sum(d_acc);
