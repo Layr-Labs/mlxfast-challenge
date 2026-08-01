@@ -640,6 +640,15 @@ let lagunaFusedDenseGateUpSwiGLUEnabled =
 let lagunaFusedDenseDownResidualEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_DENSE_DOWN_RESIDUAL"] != "0"
 
+/// `DARKBLOOM_PREFILL_DENSE_FUSED_GATE_UP` (default on; set "0" to
+/// disable): extend the retained dense BF16 `[gate; up]` bank to multi-token
+/// prefill, serving the layer-0 dense MLP's gate and up projections from one
+/// matmul instead of two stock dispatches. Set "0" to restore the stock
+/// separate-matmul prefill dispatch byte-for-byte.
+let lagunaPrefillDenseFusedGateUpEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_DENSE_FUSED_GATE_UP"] != "0"
+
 /// `DARKBLOOM_ROUTER_ROWS_PER_GROUP` (default `8`; set `64` to restore the
 /// pre-widening shape, `32`/`16` for intermediate points, `4`/`2`/`1` for the
 /// sub-8 shapes): router output rows owned by one threadgroup in
@@ -8352,6 +8361,26 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             )
             let gate = gateUp[.ellipsis, 0 ..< _fusedGateUpSplit]
             let up = gateUp[.ellipsis, _fusedGateUpSplit...]
+            return downProj(compiledSiluProduct(gate, up))
+        }
+        if x.dim(1) > 1, lagunaPrefillDenseFusedGateUpEnabled,
+            let fusedWeight = _fusedDenseGateUpWeight,
+            x.dtype == .bfloat16,
+            x.dim(2) == LagunaConstants.hiddenSize,
+            fusedWeight.dtype == .bfloat16,
+            fusedWeight.shape
+                == [2 * LagunaConstants.denseIntermediateSize, LagunaConstants.hiddenSize]
+        {
+            // Prefill arm of the dense [gate; up] bank: one BF16 matmul over
+            // the row-concatenated bank replaces the stock separate gate/up
+            // matmuls for the layer-0 dense MLP. Each output row is the dot
+            // product of the same input row with the same weight row (gate
+            // rows first, exactly as the decode GEMV arm relies on).
+            lagunaTrace("prefill dense fused [gate; up] bank matmul")
+            let intermediate = LagunaConstants.denseIntermediateSize
+            let gateUp = matmul(x, fusedWeight.transposed())
+            let gate = gateUp[.ellipsis, 0 ..< intermediate]
+            let up = gateUp[.ellipsis, intermediate...]
             return downProj(compiledSiluProduct(gate, up))
         }
         return downProj(compiledSiluProduct(gateProj(x), upProj(x)))
