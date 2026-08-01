@@ -3783,6 +3783,20 @@ func lagunaGateProductSoftplus(
 /// into the input row at each k-block at the same FP32 -> BF16 rounding point
 /// `lagunaGateProductSoftplusSource` uses, so the contraction is bit-identical
 /// to applying the gate first and then running the stock affine GEMV.
+/// `DARKBLOOM_OPROJ_R1` (default 1 = one output row per simdgroup; "4"
+/// restores the shipped four-row control). The gated output projection QMVs
+/// carry no norm prologue, so narrowing the rows each simdgroup owns costs no
+/// redundant work and launches four times as many independent simdgroups to
+/// hide the weight-read latency. Every row keeps its K-block order and its
+/// 32-lane reduction; only which simdgroup owns which row moves. Same
+/// schedule as the promoted routed and shared expert QMVs, carried to BOTH
+/// o_proj twins: the group-32 INT8 kernel on layers 0-31 and the NVFP4
+/// group-16 kernel on the tail layers 32-39.
+let lagunaOProjResultsPerSimdgroup: Int = {
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_OPROJ_R1"] ?? "1"
+    return [1, 2, 4].contains(Int(raw) ?? 1) ? (Int(raw) ?? 1) : 1
+}()
+
 private func lagunaGatedAffineOProjSource(heads: Int) -> String {
     """
     constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
@@ -3791,7 +3805,7 @@ private func lagunaGatedAffineOProjSource(heads: Int) -> String {
     constexpr uint head_shift = 7;              // head_dim == 128
     constexpr uint values_per_thread = 8;       // pack_factor 4 * packs_per_thread 2
     constexpr uint block_size = 256;            // values_per_thread * SIMD_SIZE
-    constexpr uint results_per_simdgroup = 4;
+    constexpr uint results_per_simdgroup = \(lagunaOProjResultsPerSimdgroup);
     constexpr uint num_simdgroups = 2;
     constexpr uint group_size = 32;
     constexpr uint scale_step_per_thread = group_size / values_per_thread;
@@ -3833,7 +3847,9 @@ private func lagunaGatedAffineOProjSource(heads: Int) -> String {
     const device bfloat* xp = attention_output + simd_lid * values_per_thread;
 
     thread float x_thread[values_per_thread];
-    thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+    thread float result[results_per_simdgroup];
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < results_per_simdgroup; ++r) { result[r] = 0.0f; }
 
     uint column = simd_lid * values_per_thread;
     for (uint k = 0; k < in_vec_size; k += block_size) {
@@ -3938,7 +3954,7 @@ func lagunaGatedAffineOProj(
     lagunaTrace("gated affine oproj qmv h\(heads)")
     return kernel(
         [attentionOutput, gateLogits, codes, scales, biases],
-        grid: ((outVec / 8) * 64, 1, 1),
+        grid: ((outVec / (2 * lagunaOProjResultsPerSimdgroup)) * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[1, 1, outVec]],
         outputDTypes: [.bfloat16]
@@ -3973,7 +3989,7 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
     constexpr uint values_per_thread = 16;
     constexpr uint codes_per_thread = values_per_thread / 8;
     constexpr uint block_size = values_per_thread * 32;
-    constexpr uint results_per_simdgroup = 4;
+    constexpr uint results_per_simdgroup = \(lagunaOProjResultsPerSimdgroup);
     constexpr uint num_simdgroups = 2;
     constexpr uint in_vec_size_g = in_vec_size / group_size;
 
@@ -4009,7 +4025,9 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
     const device bfloat* xp = attention_output + simd_lid * values_per_thread;
 
     thread float x_thread[values_per_thread];
-    thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+    thread float result[results_per_simdgroup];
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < results_per_simdgroup; ++r) { result[r] = 0.0f; }
 
     uint column = simd_lid * values_per_thread;
     for (uint k = 0; k < in_vec_size; k += block_size) {
@@ -4107,7 +4125,7 @@ func lagunaGatedAffineOProjNVFP4(
     lagunaTrace("gated affine oproj nvfp4 qmv h\(heads)")
     return kernel(
         [attentionOutput, gateLogits, codes, scales],
-        grid: ((outVec / 8) * 64, 1, 1),
+        grid: ((outVec / (2 * lagunaOProjResultsPerSimdgroup)) * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[1, 1, outVec]],
         outputDTypes: [.bfloat16]
