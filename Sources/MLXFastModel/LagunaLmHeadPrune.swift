@@ -2063,7 +2063,7 @@ private let lagunaLmHeadInlineExactKernel = MLXFast.metalKernel(
 /// `coarse` is untouched FP32, so skipped slots keep the exact bits the FP32
 /// arm would store.
 private let lagunaLmHeadInlineExactDeltaBF16Kernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_exact_inline_mask_block_delta_bf16_lane0_mask_v1",
+    name: "laguna_lmhead_exact_inline_mask_block_delta_bf16_row_selective_v1",
     inputNames: ["coarse", "delta", "thr", "lm_head", "x"],
     outputNames: ["assembled"],
     source: """
@@ -2114,17 +2114,19 @@ private let lagunaLmHeadInlineExactDeltaBF16Kernel = MLXFast.metalKernel(
             v_coeff[3] = float(xv.w);
             #pragma unroll
             for (uint tm = 0; tm < 4; ++tm) {
-                const device bfloat* mrow = lm_head + size_t(base + tm) * K;
-                vec<bfloat, 4> mv =
-                    *((const device vec<bfloat, 4>*)(mrow + bn));
-                inter[0] = mv.x;
-                inter[1] = mv.y;
-                inter[2] = mv.z;
-                inter[3] = mv.w;
-                result[tm] += inter[0] * v_coeff[0];
-                result[tm] += inter[1] * v_coeff[1];
-                result[tm] += inter[2] * v_coeff[2];
-                result[tm] += inter[3] * v_coeff[3];
+                if ((candidate_mask & (1u << tm)) != 0) {
+                    const device bfloat* mrow = lm_head + size_t(base + tm) * K;
+                    vec<bfloat, 4> mv =
+                        *((const device vec<bfloat, 4>*)(mrow + bn));
+                    inter[0] = mv.x;
+                    inter[1] = mv.y;
+                    inter[2] = mv.z;
+                    inter[3] = mv.w;
+                    result[tm] += inter[0] * v_coeff[0];
+                    result[tm] += inter[1] * v_coeff[1];
+                    result[tm] += inter[2] * v_coeff[2];
+                    result[tm] += inter[3] * v_coeff[3];
+                }
             }
             bn += 128;
         }
