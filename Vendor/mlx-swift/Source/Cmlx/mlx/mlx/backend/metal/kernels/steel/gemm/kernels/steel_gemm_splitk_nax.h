@@ -143,3 +143,143 @@ template <
     });
   });
 }
+template <
+    typename T,
+    typename OutT,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool transpose_a,
+    bool transpose_b,
+    typename AccumType = float>
+[[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void gemm_splitk_fused_nax(
+    const device T* A [[buffer(0)]],
+    const device T* B [[buffer(1)]],
+    device OutT* D [[buffer(2)]],
+    const constant GEMMSpiltKParams* params [[buffer(3)]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]]) { // clang-format on
+  // Single-dispatch replay of the exact split-K arithmetic: per partition
+  // the SAME gemm_loop as gemm_splitk_nax (fresh tile, partition-specific
+  // K-alignment), partitions chained in FP32 in the accum kernel's
+  // ascending order (the old f32 intermediate round-tripped exactly), and
+  // one final OutT cast identical to the accum epilogue.
+  const int linear_tid = tid.x;
+
+  const int tn_swizzled = params->tiles_n << params->swizzle_log;
+  const int tm_swizzled =
+      (params->tiles_m + (1 << params->swizzle_log) - 1) >> params->swizzle_log;
+
+  const int xy_flat = linear_tid;
+  const int grid_x = xy_flat % tn_swizzled;
+  const int grid_y = xy_flat / tn_swizzled;
+  const int tid_y = (grid_y << params->swizzle_log) +
+      (grid_x & ((1 << params->swizzle_log) - 1));
+  const int tid_x = grid_x >> params->swizzle_log;
+  if (params->tiles_n <= tid_x || params->tiles_m <= tid_y) {
+    return;
+  }
+
+  const int c_row = tid_y * BM;
+  const int c_col = tid_x * BN;
+  const size_t c_row_long = size_t(c_row);
+  const size_t c_col_long = size_t(c_col);
+
+  D += c_row_long * params->ldc + c_col_long;
+
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+
+  const short tm = SM * (simd_group_id / WN);
+  const short tn = SN * (simd_group_id % WN);
+
+  const int sgp_sm_int =
+      align_M ? int(SM) : min(int(SM), params->M - (c_row + tm));
+  const short sgp_sm = short(sgp_sm_int);
+  const bool is_unaligned_sm = align_M ? false : (sgp_sm != SM);
+  const int sgp_sn_int =
+      align_N ? int(SN) : min(int(SN), params->N - (c_col + tn));
+  const short sgp_sn = short(sgp_sn_int);
+  const bool is_unaligned_sn = align_N ? false : (sgp_sn != SN);
+
+  D += tm * params->ldc + tn;
+
+  NAXTile<AccumType, TM, TN> Dtile;
+  constexpr short kElems = NAXTile<AccumType, TM, TN>::kElemsPerTile;
+  thread AccumType run_sum[kElems];
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kElems; i++) {
+    run_sum[i] = AccumType(0);
+  }
+
+  for (int tid_z = 0; tid_z < params->split_k_partitions; tid_z++) {
+    const int k_start = params->split_k_partition_size * tid_z;
+    const int k_end = min(k_start + params->split_k_partition_size, params->K);
+    const size_t k_start_long = size_t(k_start);
+
+    const device T* Ap = A +
+        (transpose_a ? (c_row_long + k_start_long * params->lda)
+                     : (k_start_long + c_row_long * params->lda)) +
+        (transpose_a ? size_t(tm) : size_t(tm) * params->lda);
+    const device T* Bp = B +
+        (transpose_b ? (k_start_long + c_col_long * params->ldb)
+                     : (c_col_long + k_start_long * params->ldb)) +
+        (transpose_b ? size_t(tn) * params->ldb : size_t(tn));
+
+    const int partition_k_size = k_end - k_start;
+    const int partition_k_iters = partition_k_size / BK;
+    const bool partition_k_aligned = (partition_k_size % BK) == 0;
+
+    dispatch_bool(partition_k_aligned, [&](auto kAlignedK) {
+      dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
+        dispatch_bool(align_N || !is_unaligned_sn, [&](auto kAlignedN) {
+          Dtile = gemm_loop<
+              T,
+              SM,
+              SN,
+              SK,
+              BK,
+              transpose_a,
+              transpose_b,
+              kAlignedM.value,
+              kAlignedN.value,
+              kAlignedK.value,
+              AccumType>(
+              Ap,
+              Bp,
+              params->lda,
+              params->ldb,
+              partition_k_size,
+              partition_k_iters,
+              sgp_sm,
+              sgp_sn);
+        });
+      });
+    });
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElems; i++) {
+      run_sum[i] += Dtile.elems()[i];
+    }
+  }
+
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kElems; i++) {
+    Dtile.elems()[i] = run_sum[i];
+  }
+
+  dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
+    dispatch_bool(align_N || !is_unaligned_sn, [&](auto kAlignedN) {
+      if constexpr (kAlignedM && kAlignedN) {
+        Dtile.store(D, int(params->ldc));
+      } else {
+        Dtile.store_safe(D, int(params->ldc), short2(sgp_sn, sgp_sm));
+      }
+    });
+  });
+}

@@ -733,6 +733,67 @@ void steel_gemm_splitk_axpby_nax(
   const int bk_iters_per_partition = split_k_partition_size / bk;
   const int split_k_partition_stride = M * N;
 
+  // Fused split-K replay (DARKBLOOM_STEEL_SPLITK_FUSED=0 restores the
+  // shipped two-dispatch chain): one dispatch runs the identical
+  // per-partition gemm_loop, chains partitions in FP32 in the accum
+  // kernel's ascending order (the old f32 intermediate round-tripped
+  // exactly, so the chain is bit-identical), and applies the accum's
+  // single OutT rounding at the final store. No intermediate, no accum.
+  static const bool steel_splitk_fused_enabled = [] {
+    const char* raw = getenv("DARKBLOOM_STEEL_SPLITK_FUSED");
+    return !(raw && raw[0] == '0');
+  }();
+  const bool fused_plain_epilogue = !CHECK_AB || (alpha == 1.0f && beta == 0.0f);
+  if (steel_splitk_fused_enabled && fused_plain_epilogue) {
+    const bool align_M = (M % bm) == 0;
+    const bool align_N = (N % bn) == 0;
+    metal::MTLFCList func_consts = {
+        {&align_M, MTL::DataType::DataTypeBool, 200},
+        {&align_N, MTL::DataType::DataTypeBool, 201}};
+
+    std::ostringstream kname;
+    // clang-format off
+    kname << "steel_gemm_splitk_fused_nax_"
+          << (transpose_a ? 't' : 'n')
+          << (transpose_b ? 't' : 'n')
+          << "_" << type_to_name(a)
+          << "_" << type_to_name(out)
+          << "_bm" << bm << "_bn" << bn << "_bk" << bk
+          << "_wm" << wm << "_wn" << wn; // clang-format on
+    std::string base_name = kname.str();
+    // clang-format off
+    kname << "_align_M_" << (align_M ? 't' : 'n')
+          << "_align_N_" << (align_N ? 't' : 'n'); // clang-format on
+    std::string hash_name = kname.str();
+
+    auto& compute_encoder = metal::get_command_encoder(s);
+    auto kernel = get_steel_gemm_splitk_fused_nax_kernel(
+        d, base_name, hash_name, func_consts, a, out,
+        transpose_a, transpose_b, bm, bn, bk, wm, wn);
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    int tn = (N + bn - 1) / bn;
+    int tm = (M + bm - 1) / bm;
+    int swizzle_log = tm <= 3 ? 0 : 1;
+    int tile = 1 << swizzle_log;
+    int tm_swizzled = (tm + tile - 1) / tile;
+    int tn_swizzled = tn * tile;
+
+    GEMMSpiltKParams params{
+        M, N, K, lda, ldb, N, tn, tm,
+        split_k_partitions, split_k_partition_stride,
+        split_k_partition_size, swizzle_log, bk_iters_per_partition};
+
+    MTL::Size group_dims = MTL::Size(32, wn, wm);
+    MTL::Size grid_dims = MTL::Size(tn_swizzled * tm_swizzled, 1, 1);
+    compute_encoder.set_input_array(a, 0);
+    compute_encoder.set_input_array(b, 1);
+    compute_encoder.set_output_array(out, 2);
+    compute_encoder.set_bytes(params, 3);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+    return;
+  }
+
   array C_split({split_k_partitions, M, N}, float32, nullptr, {});
   C_split.set_data(allocator::malloc(C_split.nbytes()));
   copies.push_back(C_split);
