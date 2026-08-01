@@ -140,7 +140,7 @@ let lagunaFusedRoutedSharedDownResidualEnabled =
 let lagunaFusedRoutedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_SWIGLU_QMV"] != "0"
 
-/// `DARKBLOOM_PACKED_SCALES` (default ON; set "0" to disable): decode-only
+/// `DARKBLOOM_PACKED_SCALES` (default OFF; set "1" to enable): decode-only
 /// scale-interleaved side copy of the fused routed gate/up NVFP4 bank. The
 /// stock `lagunaRoutedSwiGLUQMV` reads codes and E4M3 scales from two separate
 /// tensors (four device streams per simdgroup iteration: gate codes, up
@@ -154,7 +154,7 @@ let lagunaFusedRoutedSwiGLUQMVEnabled =
 /// Memory: +~32 MB resident per sparse layer while enabled (the stock fused
 /// code bank stays resident for prefill and fallback paths).
 let lagunaPackedScalesEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] != "0"
+    ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] == "1"
 
 /// One-shot stderr visibility for the packed-scales arm: with the flag set,
 /// the arm MUST announce either "active" (bank built / packed dispatch taken)
@@ -9992,7 +9992,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     /// `DARKBLOOM_PACKED_SCALES` walk-order scale-interleaved copy of the
     /// fused routed gate/up scales ([experts, 4096, 32] uint8); see
     /// `lagunaRoutedSwiGLUQMVPackedKernel` for the layout contract. Nil
-    /// when the flag is set to zero (default ON).
+    /// when the flag is unset (default OFF).
     var _packedRoutedGateUpBank: MLXArray?
 
     /// Builds and retains the fused routed gate/up NVFP4 banks from the
