@@ -1319,7 +1319,8 @@ int darkbloom_expert_gather_groups() {
 // pipeline key. Resolved once per process, so exactly one variant is ever
 // compiled and a fresh process picks up a changed environment cleanly.
 //
-//   unset (SHIPPED) -> 4  (BM=64,  WM=4, WN=2)  SM=16, 256 thr/TG
+//   unset (SHIPPED) -> 5  (BM=64,  WM=4, WN=1)  SN=64, 128 thr/TG (2026-07-31)
+//   "4" (prev ship) -> 4  (BM=64,  WM=4, WN=2)  SM=16, 256 thr/TG
 //   "0"             -> 0  (BM=64,  WM=2, WN=2)  SM=32  upstream tiling
 //   "1"             -> 1  (BM=128, WM=4)        SM=32  less expert re-staging
 //   "2"             -> 2  (BM=128, WM=2)        SM=64  measured regression
@@ -1393,6 +1394,10 @@ int darkbloom_stage_bm128_variant() {
   static const int v = [] {
     auto s = env::get_var("DARKBLOOM_STAGE_BM128", "");
     if (s.empty()) {
+      // wn1 (variant 5) measured -1.34% prefill local (5/5 pairs, t~6) but
+      // its first ranked draw (f39c080a) came back -1.76 vs expected +0.4;
+      // default stays 4 in this submission to isolate the steel split-K
+      // mechanism; the =5 arm ships in the follow-up submission.
       return 4;
     }
     if (s == "1") {

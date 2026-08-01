@@ -154,8 +154,15 @@ let lagunaFusedRoutedSwiGLUQMVEnabled =
 /// computation changes, so the packed dispatch is bit-exact (class A).
 /// Memory: +~302 MB resident per sparse layer while enabled (the stock fused
 /// bank stays resident for prefill and for the fallback paths).
+/// `DARKBLOOM_PACKED_SCALES=build` is the residency CONTROL arm: the side
+/// bank is built, evaluated, and wired exactly as in the `=1` arm, but the
+/// STOCK kernel dispatches — isolating the +11.8 GB residency side effect
+/// from the packed kernel itself.
+private let lagunaPackedScalesMode =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"]
 let lagunaPackedScalesEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] == "1"
+    lagunaPackedScalesMode == "1" || lagunaPackedScalesMode == "build"
+let lagunaPackedScalesDispatchEnabled = lagunaPackedScalesMode == "1"
 
 /// One-shot stderr visibility for the packed-scales arm: with the flag set,
 /// the arm MUST announce either "active" (bank built / packed dispatch taken)
@@ -8153,7 +8160,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     )
                     activated = merged.routed
                     mergedSharedActivated = merged.shared
-                } else if lagunaPackedScalesEnabled,
+                } else if lagunaPackedScalesDispatchEnabled,
                     let packedBank = _packedRoutedGateUpBank
                 {
                     lagunaPackedScalesLog.note(
