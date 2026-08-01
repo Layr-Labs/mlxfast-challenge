@@ -241,9 +241,11 @@ private let lagunaLmHeadDeltaBF16Enabled =
 /// Precompute the 64 activation-group L1 sums once, then reuse them across
 /// every vocabulary row in the shipped INT6 ratio-bound coarse pass. The
 /// producer preserves the accepted per-group FP32 addition order exactly;
-/// only the redundant per-row `abs` and addition work is removed. Set
-/// `DARKBLOOM_LMHEAD_PRECOMPUTE_ABS_GROUPS=0` to restore the accepted kernel
-/// byte-for-byte without launching the producer.
+/// only the redundant per-row `abs` and addition work is removed. This switch
+/// controls the standalone producer; a caller-supplied exact sum (for example
+/// the final-RMSNorm fusion) is independent and is ablated at its producer.
+/// Set `DARKBLOOM_LMHEAD_PRECOMPUTE_ABS_GROUPS=0` to disable this standalone
+/// dispatch.
 private let lagunaLmHeadPrecomputeAbsGroupsEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_LMHEAD_PRECOMPUTE_ABS_GROUPS"] != "0"
@@ -255,12 +257,14 @@ private let lagunaLmHeadPrecomputeAbsGroupsEnabled =
 /// (device-checked: per-step candidate counts identical across all 134
 /// pruner calls; notes/exp-v5preabs.md).
 ///
-/// EXPERIMENTAL, default OFF (`DARKBLOOM_LMHEAD_V5_PREABS=1` to enable):
+/// EXPERIMENTAL standalone producer, default OFF
+/// (`DARKBLOOM_LMHEAD_V5_PREABS=1` to enable):
 /// unlike the int6 arm, the paired A/B measured a REGRESSION on v5 (+40
 /// us/step mean, 3/4 pairs) -- the extra serialized producer dispatch costs
 /// more than the removed per-row abs/add ALU on the bandwidth-bound 1344
-/// B/row kernel. Unset keeps the accepted v5 kernel byte-for-byte with no
-/// producer dispatch.
+/// B/row kernel. Unset keeps that standalone dispatch off. An exact sum
+/// supplied by the final-RMSNorm fusion is consumed independently; use its
+/// own selector to restore the inline v5 kernel.
 private let lagunaLmHeadV5PreabsEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_V5_PREABS"] == "1"
 
@@ -2188,6 +2192,17 @@ final class LagunaLmHeadPruner {
         return [codes, scales].compactMap { $0 }
     }
 
+    /// Whether the active coarse arm has an exact precomputed-abs consumer.
+    /// This lets the caller retain stock RMSNorm on fallback arms that would
+    /// otherwise ignore the fused kernel's second output.
+    var consumesPrecomputedAbsGroupSums: Bool {
+        if int5CodesLo != nil && int5CodesHi != nil && int5Scales != nil {
+            return true
+        }
+        return int6CodesLo != nil && int6CodesHi != nil && int6Scales != nil
+            && lagunaLmHeadRatioBoundEnabled && lagunaLmHeadDeltaBF16Enabled
+    }
+
     init?(lmHeadWeight: MLXArray) {
         guard lmHeadWeight.shape == [lagunaLmHeadPruneVocab, lagunaLmHeadPruneHidden],
             lmHeadWeight.dtype == .bfloat16
@@ -2379,8 +2394,17 @@ final class LagunaLmHeadPruner {
     /// Pruned final-row lm_head: full [vocab] BF16 logits row, bit-identical to
     /// the stock pass in every candidate slot and certified-below elsewhere,
     /// so the downstream argmax emits the stock token.
-    func logits(hidden: MLXArray, lmHeadWeight: MLXArray) -> MLXArray {
+    func logits(
+        hidden: MLXArray,
+        lmHeadWeight: MLXArray,
+        precomputedAbsGroupSums: MLXArray? = nil
+    ) -> MLXArray {
         precondition(hidden.dtype == .bfloat16 && hidden.size == lagunaLmHeadPruneHidden)
+        if let precomputedAbsGroupSums {
+            precondition(
+                precomputedAbsGroupSums.dtype == .float32
+                    && precomputedAbsGroupSums.shape == [64])
+        }
         let vocab = lagunaLmHeadPruneVocab
         let x = hidden.reshaped([lagunaLmHeadPruneHidden])
         // v5 arm: int5 coarse pass + exact-winner threshold. Early return so
@@ -2389,20 +2413,27 @@ final class LagunaLmHeadPruner {
         // with stage one an ARGMAX over `coarse` alone (no `delta` read) and
         // the threshold kernel absorbing the winner row's 4 KB GEMV.
         if let lo5 = int5CodesLo, let hi5 = int5CodesHi, let s5 = int5Scales {
-            // Opt-in (DARKBLOOM_LMHEAD_V5_PREABS=1): reuse the int6 arm's
-            // [64] abs-group-sums producer (the sums depend only on x) and
-            // skip the inline per-row `ag` chain. Default OFF -- measured
-            // +40 us/step on v5 (notes/exp-v5preabs.md) -- keeping the
-            // accepted v5 kernel byte-for-byte with no producer dispatch.
+            // Prefer caller-supplied exact sums (the fused final RMSNorm),
+            // otherwise the opt-in DARKBLOOM_LMHEAD_V5_PREABS standalone
+            // producer. The standalone dispatch measured +40 us/step on v5;
+            // fusing its work into an already-required producer is the new
+            // experiment this interface enables.
+            let absGroupSums5: MLXArray? =
+                if let precomputedAbsGroupSums {
+                    precomputedAbsGroupSums
+                } else if lagunaLmHeadV5PreabsEnabled {
+                    lagunaLmHeadAbsGroupSumsKernel(
+                        [x],
+                        grid: (64, 1, 1),
+                        threadGroup: (64, 1, 1),
+                        outputShapes: [[64]],
+                        outputDTypes: [.float32]
+                    )[0]
+                } else {
+                    nil
+                }
             let coarseOut5: [MLXArray]
-            if lagunaLmHeadV5PreabsEnabled {
-                let absGroupSums5 = lagunaLmHeadAbsGroupSumsKernel(
-                    [x],
-                    grid: (64, 1, 1),
-                    threadGroup: (64, 1, 1),
-                    outputShapes: [[64]],
-                    outputDTypes: [.float32]
-                )[0]
+            if let absGroupSums5 {
                 coarseOut5 =
                     lagunaLmHeadInt5CoarseRatioBoundDeltaBF16PrecomputedAbsKernel(
                         [x, lo5, hi5, s5, absGroupSums5],
@@ -2470,18 +2501,24 @@ final class LagunaLmHeadPruner {
             (useInt6 || (lagunaLmHeadInlineMaskEnabled && !useCoarseV1))
             && lagunaLmHeadRatioBoundEnabled && lagunaLmHeadDeltaBF16Enabled
 
-        // The shipped INT6 + ratio-bound + BF16-delta arm is the only consumer
-        // in this atomic experiment. Every other arm reaches its accepted
-        // kernel without paying for the producer dispatch.
+        // The INT6 + ratio-bound + BF16-delta arm is the only v4 consumer.
+        // Prefer caller-supplied exact sums; otherwise honor the standalone
+        // producer selector. Every other arm keeps its accepted inline path.
         let absGroupSums: MLXArray? =
-            if useInt6, useDeltaBF16, lagunaLmHeadPrecomputeAbsGroupsEnabled {
-                lagunaLmHeadAbsGroupSumsKernel(
-                    [x],
-                    grid: (64, 1, 1),
-                    threadGroup: (64, 1, 1),
-                    outputShapes: [[64]],
-                    outputDTypes: [.float32]
-                )[0]
+            if useInt6, useDeltaBF16 {
+                if let precomputedAbsGroupSums {
+                    precomputedAbsGroupSums
+                } else if lagunaLmHeadPrecomputeAbsGroupsEnabled {
+                    lagunaLmHeadAbsGroupSumsKernel(
+                        [x],
+                        grid: (64, 1, 1),
+                        threadGroup: (64, 1, 1),
+                        outputShapes: [[64]],
+                        outputDTypes: [.float32]
+                    )[0]
+                } else {
+                    nil
+                }
             } else {
                 nil
             }
