@@ -82,9 +82,9 @@ final class LagunaFusionTraceLog: @unchecked Sendable {
 }
 
 @inline(__always)
-func lagunaTrace(_ site: @autoclosure () -> String) {
+func lagunaTrace(_ site: String) {
     guard lagunaTraceFusion else { return }
-    lagunaTracedFusions.note(site())
+    lagunaTracedFusions.note(site)
 }
 
 // MARK: - Runtime fusion feature flags
@@ -139,44 +139,6 @@ let lagunaFusedRoutedSharedDownResidualEnabled =
 /// reads those banks directly and emits `[1, 1, 8, 1, 512]`.
 let lagunaFusedRoutedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_SWIGLU_QMV"] != "0"
-
-/// `DARKBLOOM_PACKED_SCALES` (default OFF; set "1" to enable): decode-only
-/// scale-interleaved side copy of the fused routed gate/up NVFP4 bank. The
-/// stock `lagunaRoutedSwiGLUQMV` reads codes and E4M3 scales from two separate
-/// tensors (four device streams per simdgroup iteration: gate codes, up
-/// codes, gate scales, up scales). The packed bank stores, in the kernel's
-/// exact walk order `[expert][tile 128][k-block 4][row-pair sub 8]`, one
-/// 288-byte region per (row, k-block) = 32 scale bytes followed by that
-/// block's 256 code bytes, so each threadgroup reads one contiguous
-/// 2,304-byte span per k-block (a 9,216-byte sequential tile region total).
-/// Load count, load widths, dequant expressions, accumulation order, and
-/// every BF16 boundary are identical to the stock kernel — only address
-/// computation changes, so the packed dispatch is bit-exact (class A).
-/// Memory: +~302 MB resident per sparse layer while enabled (the stock fused
-/// bank stays resident for prefill and for the fallback paths).
-let lagunaPackedScalesEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] == "1"
-
-/// One-shot stderr visibility for the packed-scales arm: with the flag set,
-/// the arm MUST announce either "active" (bank built / packed dispatch taken)
-/// or "inactive" (a guard declined and the stock kernel ran instead), so a
-/// silently-declining guard can never measure its own control.
-final class LagunaPackedScalesLog: @unchecked Sendable {
-    private var seen: Set<String> = []
-    private let lock = NSLock()
-
-    func note(_ state: String, _ site: String) {
-        lock.lock()
-        let isNew = seen.insert(site).inserted
-        lock.unlock()
-        if isNew {
-            FileHandle.standardError.write(
-                Data("mlxfast: packed-scales \(state): \(site)\n".utf8))
-        }
-    }
-}
-
-let lagunaPackedScalesLog = LagunaPackedScalesLog()
 
 /// Decode-only routed NVFP4 down-QMV plus BF16 router weighting, fixed-order
 /// expert reduction, and the Laguna 2.5 routed scale. The custom kernel emits
@@ -604,9 +566,8 @@ let lagunaFusedDenseDownResidualEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_DENSE_DOWN_RESIDUAL"] != "0"
 
 /// `DARKBLOOM_ROUTER_ROWS_PER_GROUP` (default `8`; set `64` to restore the
-/// pre-widening shape, `32`/`16` for intermediate points, `4`/`2`/`1` for the
-/// sub-8 shapes): router output rows owned by one threadgroup in
-/// `laguna_residual_rms_router_bf16_2048`.
+/// pre-widening shape, `32`/`16` for intermediate points): router output rows
+/// owned by one threadgroup in `laguna_residual_rms_router_bf16_2048`.
 ///
 /// The router GEMV reads the whole `[256, 2048]` BF16 gate — 1,048,576 B —
 /// once per sparse layer. At `64` (16 simdgroups x 4 rows) the 256 rows need
@@ -621,17 +582,10 @@ let lagunaFusedDenseDownResidualEnabled =
 /// over `router_blocks` in `(block, i)` order, its own `simd_shuffle_down`
 /// ladder, and one BF16 round. No add is regrouped: the reduction tree exists
 /// only at lane level and this knob does not touch it.
-///
-/// SUB-8 IS MEASURED NULL (`notes/exp-rpgrouter.md`, 2026-07-31, 6.15 ms era):
-/// rpg1 vs rpg8 paired A/B mean −5 µs/step (−29.5/−13.5/+25.5/−4.0 µs, inside
-/// the ~18 µs local floor); rpg4/rpg2 single runs +25/+35 µs. Each extra tile
-/// re-runs the barriered 2048-wide norm before its router rows, so below 8 the
-/// redundant norm cancels whatever row-latency overlap the extra threadgroups
-/// buy. Do not re-sweep; the values stay accepted only as ablation controls.
 let lagunaRouterRowsPerGroup: Int = {
     guard
         let raw = ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_ROWS_PER_GROUP"],
-        let value = Int(raw), [1, 2, 4, 8, 16, 32, 64].contains(value)
+        let value = Int(raw), [8, 16, 32, 64].contains(value)
     else {
         return 8
     }
@@ -977,7 +931,7 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
 /// name or four sources would thrash one cache entry.
 private let lagunaResidualRMSNormRouterKernels: [Int: MLXFast.MLXFastKernel] =
     Dictionary(
-        uniqueKeysWithValues: [1, 2, 4, 8, 16, 32, 64].map { rowsPerGroup in
+        uniqueKeysWithValues: [8, 16, 32, 64].map { rowsPerGroup in
             (
                 rowsPerGroup,
                 MLXFast.metalKernel(
@@ -1047,7 +1001,7 @@ func lagunaResidualRMSNormRouter(
     precondition(routerWeight.shape == [experts, hidden])
 
     // `rows_per_group` router rows per threadgroup, so 256 / rows_per_group
-    // tiles. Divides exactly for 64/32/16/8/4/2/1 (4..256 tiles), so no partial
+    // tiles. Divides exactly for 64/32/16/8 (4/8/16/32 tiles), so no partial
     // tile is dispatched and no row is computed twice or missed. The 512-thread
     // threadgroup and `n_reads == 4` are NOT knobs: they are load-bearing for
     // the `rms_single_row` correspondence (each thread squares its own
@@ -1055,7 +1009,7 @@ func lagunaResidualRMSNormRouter(
     // summation and forfeits bit-exactness.
     let rowsPerGroup = lagunaRouterRowsPerGroup
     let tiles = experts / rowsPerGroup
-    lagunaTrace("residual+rmsnorm+router rpg\(rowsPerGroup)")
+    lagunaTrace("residual+rmsnorm+router")
     let outputs = lagunaResidualRMSNormRouterKernels[rowsPerGroup]!(
         [residual, branch, weight, routerWeight],
         grid: (tiles * 512, 1, 1),
@@ -2949,10 +2903,6 @@ private let lagunaGatedAffineOProjKernels: [Int: MLXFast.MLXFastKernel] = {
 let lagunaFusedGatedAffineOProjEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATED_AFFINE_OPROJ"] != "0"
 
-/// Gates only the NVFP4 tail-layer twin so it can be ablated independently.
-let lagunaGatedAffineOProjNVFP4Enabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_GATED_AFFINE_OPROJ_NVFP4"] != "0"
-
 /// Gate product + native-affine INT8 output projection in one dispatch, or
 /// `nil` when any shape, dtype or wire-format guard declines (caller then runs
 /// the exact two-dispatch chain).
@@ -2984,173 +2934,6 @@ func lagunaGatedAffineOProj(
     lagunaTrace("gated affine oproj qmv h\(heads)")
     return kernel(
         [attentionOutput, gateLogits, codes, scales, biases],
-        grid: ((outVec / 8) * 64, 1, 1),
-        threadGroup: (64, 1, 1),
-        outputShapes: [[1, 1, outVec]],
-        outputDTypes: [.bfloat16]
-    )[0]
-}
-
-// MARK: - Gated NVFP4 output projection for the affine tail layers
-
-/// NVFP4 twin of `lagunaGatedAffineOProjSource` for layers using the native
-/// group-16 NVFP4 output projection. It folds the softplus gate, broadcast
-/// product, and contraction into one dispatch while preserving the BF16 gate
-/// rounding point and the stock NVFP4 accumulation geometry.
-private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
-    let scaleFold = lagunaNvfp4ScaleFoldEnabled
-    let weightScale = scaleFold ? "" : " * 16384.0f"
-    let extract = """
-                    const uint xe = c & 0x0F0F0F0Fu;
-                    const uint ge = xe | (xe << 3);
-                    const uint yo = c & 0xF0F0F0F0u;
-                    const uint go = yo | (yo >> 3);
-                    const uint p0 = (ge << 9) & 0x8E008E00u;
-                    const uint p1 = (go << 8) & 0x8E008E00u;
-                    const uint p2 = (ge << 1) & 0x8E008E00u;
-                    const uint p3 = go & 0x8E008E00u;
-    """
-    return """
-    constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
-    constexpr uint out_vec_size = \(LagunaConstants.hiddenSize);
-    constexpr uint gate_heads = \(heads);
-    constexpr uint head_shift = 7;
-    constexpr uint group_size = 16;
-    constexpr uint values_per_thread = 16;
-    constexpr uint codes_per_thread = values_per_thread / 8;
-    constexpr uint block_size = values_per_thread * 32;
-    constexpr uint results_per_simdgroup = 4;
-    constexpr uint num_simdgroups = 2;
-    constexpr uint in_vec_size_g = in_vec_size / group_size;
-
-    uint tile = threadgroup_position_in_grid.x;
-    uint lid = thread_position_in_threadgroup.x;
-    uint simd_gid = simdgroup_index_in_threadgroup;
-    uint simd_lid = thread_index_in_simdgroup;
-
-    threadgroup float gate_table[gate_heads];
-    if (lid < gate_heads) {
-        float logit = float(gate_logits[lid]);
-        float gate;
-        if (metal::isnan(logit)) {
-            gate = NAN;
-        } else {
-            float maxval = metal::max(logit, 0.0f);
-            float minval = metal::min(logit, 0.0f);
-            gate = (metal::isinf(minval) || metal::isinf(maxval))
-                ? maxval
-                : maxval + log1p(metal::exp(minval - maxval));
-        }
-        gate_table[lid] = float(bfloat(gate));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint out_row = tile * (num_simdgroups * results_per_simdgroup) +
-        simd_gid * results_per_simdgroup;
-    const device uint32_t* ws =
-        (const device uint32_t*)weight_codes +
-        out_row * (in_vec_size / 8) + simd_lid * codes_per_thread;
-    const device uint8_t* sc = weight_scales +
-        out_row * in_vec_size_g + simd_lid;
-    const device bfloat* xp = attention_output + simd_lid * values_per_thread;
-
-    thread float x_thread[values_per_thread];
-    thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
-
-    uint column = simd_lid * values_per_thread;
-    for (uint k = 0; k < in_vec_size; k += block_size) {
-        float gate = gate_table[column >> head_shift];
-        for (uint i = 0; i < values_per_thread; ++i) {
-            x_thread[i] = float(bfloat(float(xp[i]) * gate));
-        }
-
-        for (uint row = 0; row < results_per_simdgroup; ++row) {
-            const device uint32_t* wl = ws + row * (in_vec_size / 8);
-            uint8_t sbits = sc[row * in_vec_size_g];
-            ushort sraw = ushort(sbits & 127) << 7;
-            half sconverted = as_type<half>(sraw);
-            float scale = float((sbits & 128) ? -sconverted : sconverted)
-                * 4194304.0f;
-            float accum = 0.0f;
-            #pragma unroll
-            for (uint j = 0; j < codes_per_thread; ++j) {
-                const uint c = wl[j];
-                \(extract)
-                const float2 v04 = float2(as_type<half2>(p0))\(weightScale);
-                const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
-                const float2 v26 = float2(as_type<half2>(p2))\(weightScale);
-                const float2 v37 = float2(as_type<half2>(p3))\(weightScale);
-                accum +=
-                    (x_thread[8 * j] * v04.x +
-                     x_thread[8 * j + 1] * v15.x +
-                     x_thread[8 * j + 2] * v26.x +
-                     x_thread[8 * j + 3] * v37.x);
-                accum +=
-                    (x_thread[8 * j + 4] * v04.y +
-                     x_thread[8 * j + 5] * v15.y +
-                     x_thread[8 * j + 6] * v26.y +
-                     x_thread[8 * j + 7] * v37.y);
-            }
-            result[row] += scale * accum;
-        }
-
-        ws += block_size / 8;
-        sc += block_size / group_size;
-        xp += block_size;
-        column += block_size;
-    }
-
-    for (uint row = 0; row < results_per_simdgroup; ++row) {
-        result[row] = simd_sum(result[row]);
-        if (simd_lid == 0) {
-            projected[out_row + row] = bfloat(result[row]);
-        }
-    }
-    """
-}
-
-private let lagunaGatedAffineOProjNVFP4Kernels: [Int: MLXFast.MLXFastKernel] = {
-    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
-    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
-        kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_v1",
-            inputNames: [
-                "attention_output", "gate_logits", "weight_codes",
-                "weight_scales",
-            ],
-            outputNames: ["projected"],
-            source: lagunaGatedAffineOProjNVFP4Source(heads: heads),
-            ensureRowContiguous: true
-        )
-    }
-    return kernels
-}()
-
-func lagunaGatedAffineOProjNVFP4(
-    attentionOutput: MLXArray,
-    gateLogits: MLXArray,
-    codes: MLXArray,
-    scales: MLXArray,
-    heads: Int
-) -> MLXArray? {
-    guard let kernel = lagunaGatedAffineOProjNVFP4Kernels[heads] else { return nil }
-    let inVec = heads * LagunaConstants.headDim
-    let outVec = LagunaConstants.hiddenSize
-    guard attentionOutput.dtype == .bfloat16,
-        attentionOutput.shape == [1, 1, inVec],
-        gateLogits.dtype == .bfloat16,
-        gateLogits.shape == [1, 1, heads],
-        codes.dtype == .uint32,
-        codes.shape == [outVec, inVec / 8],
-        scales.dtype == .uint8,
-        scales.shape == [outVec, inVec / 16]
-    else {
-        return nil
-    }
-
-    lagunaTrace("gated affine oproj nvfp4 qmv h\(heads)")
-    return kernel(
-        [attentionOutput, gateLogits, codes, scales],
         grid: ((outVec / 8) * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[1, 1, outVec]],
@@ -3557,6 +3340,201 @@ func lagunaTailNormQKVGate(
         outputDTypes: [.bfloat16, .bfloat16]
     )
     return (outputs[0], outputs[1])
+}
+
+// MARK: - Gated NVFP4 tail output projection (one dispatch)
+
+/// NVFP4-tail counterpart of `lagunaGatedAffineOProj` at the other end of the
+/// block: on the tail layers (`lagunaNativeAffineNVFP4From`, default 32-39)
+/// the o_proj bank keeps the exact NVFP4 wire format, so the `.affine` fused
+/// branch declines and the stock decode tail is TWO dispatches —
+/// `lagunaGateProductSoftplus` (softplus + broadcast product over the
+/// 6144/8192-wide attention row) followed by MLX's
+/// `nvfp4_qmv_fast_bfloat16_t_gs_16_b_4_batch_0` over the o_proj bank
+/// (N = 2048 output rows, K = heads * 128; `dispatch_qmv` → `qmv`'s fast
+/// predicate N % 8 == 0 && K % 512 == 0 holds for both head counts,
+/// quantized.cpp:1884-1903, 255-263). This kernel performs both in ONE
+/// dispatch and never materializes the intermediate gated row.
+///
+/// GATE half — one softplus per head in a threadgroup table, the same FP32
+/// `LogAddExp(x, 0)` form with the same NaN/inf guards and the same BF16
+/// rounding point as `lagunaGateProductSoftplusSource` (and as the
+/// `lagunaGatedAffineOProjSource` table this mirrors). The gate factor is
+/// applied inside the K loop at the exact rounding boundary the standalone
+/// product kernel uses, `float(bfloat(float(x) * gate))`, so every x value
+/// entering the contraction is bit-identical to loading the gated row the
+/// two-dispatch chain would have written (BF16 → FP32 conversion is exact).
+/// One gate lookup covers a lane's whole 16-value run: `values_per_thread`
+/// 16 divides `head_dim` 128 and every run starts 16-aligned, so a run never
+/// straddles a head boundary.
+///
+/// QMV half — a textual replica of `fp_qmv_fast_impl<bfloat16_t, 16, 4>`
+/// (fp_quantized.cpp:647) keeping MLX's dispatch geometry EXACTLY:
+/// 64-thread threadgroups, two simdgroups of four rows, `2048 / 8` tiles,
+/// packs_per_thread 2, values_per_thread 16, block_size 512, code base
+/// `out_row * K/2 + simd_lid * 8` bytes advancing 256 per block, scale base
+/// `out_row * K/16 + simd_lid` advancing 32 per block, the E4M3 half-shuffle
+/// scale decode (expression-identical to the vendored `fp8_e4m3::operator
+/// float`, fp8.h:32-46 — no NaN special case in either, so all 256 scale
+/// bytes agree by construction) and the non-folded vendored qdot (see
+/// `lagunaTailNVFP4QMVHeader`), one `result[row] += scale * accum` per block
+/// over ascending k, one `simd_sum` and one BF16 round per output row.
+/// NVFP4 has no biases. The stock kernel's wider vec<T,4> x loads change
+/// only load width, never values or rounding, so computing the gated x
+/// elements inline is the same arithmetic term for term — the same liberty
+/// the shipped `lagunaTailNormQKVGateSource` takes with its norm.
+///
+/// Verified bit-exact against both the shipped two-dispatch chain and the
+/// fully eager softplus chain over production-shaped synthetic NVFP4 banks
+/// (both head counts, checkpoint-realistic and adversarial full-range scale
+/// bytes, FNV-1a fingerprints; see LagunaGatedNVFP4OProjExactnessTests).
+/// Inputs are ordinary dense arrays (`ensureRowContiguous: true`) and the
+/// output is freshly allocated — no cache buffer is ever passed, so the
+/// donation/binding hazard that made `DARKBLOOM_FUSED_KV_WRITE` a ranked
+/// regression is structurally absent, exactly as in the accepted
+/// `lagunaGatedAffineOProj`.
+private func lagunaGatedNVFP4OProjSource(heads: Int) -> String {
+    """
+    constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
+    constexpr uint out_vec_size = \(LagunaConstants.hiddenSize);
+    constexpr uint gate_heads = \(heads);
+    constexpr uint head_shift = 7;              // head_dim == 128
+    constexpr uint values_per_thread = 16;      // pack_factor 8 * packs_per_thread 2
+    constexpr uint block_size = 512;            // values_per_thread * SIMD_SIZE
+    constexpr uint results_per_simdgroup = 4;
+    constexpr uint num_simdgroups = 2;
+    constexpr uint in_vec_size_w = in_vec_size / 2;   // packed-code bytes per row
+    constexpr uint in_vec_size_g = in_vec_size / 16;  // scale groups per row
+
+    uint tile = threadgroup_position_in_grid.x;
+    uint lid = thread_position_in_threadgroup.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    // One softplus per head, in the FP32 form and at the BF16 rounding point
+    // `lagunaGateProductSoftplusSource` uses.
+    threadgroup float gate_table[gate_heads];
+    if (lid < gate_heads) {
+        float logit = float(gate_logits[lid]);
+        float gate;
+        if (metal::isnan(logit)) {
+            gate = NAN;
+        } else {
+            float maxval = metal::max(logit, 0.0f);
+            float minval = metal::min(logit, 0.0f);
+            gate = (metal::isinf(minval) || metal::isinf(maxval))
+                ? maxval
+                : maxval + log1p(metal::exp(minval - maxval));
+        }
+        gate_table[lid] = float(bfloat(gate));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint out_row = tile * (num_simdgroups * results_per_simdgroup) +
+        simd_gid * results_per_simdgroup;
+
+    const device uint8_t* ws = (const device uint8_t*)weight_codes +
+        out_row * in_vec_size_w + simd_lid * 8;  // packs_per_thread 2 * 4 bytes
+    const device uint8_t* sc = weight_scales + out_row * in_vec_size_g +
+        simd_lid;                                // scale_step_per_thread == 1
+    const device bfloat* xp = attention_output + simd_lid * values_per_thread;
+
+    thread float x_thread[values_per_thread];
+    thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    uint column = simd_lid * values_per_thread;
+    for (uint k = 0; k < in_vec_size; k += block_size) {
+        float gate = gate_table[column >> head_shift];
+        for (uint i = 0; i < values_per_thread; ++i) {
+            x_thread[i] = float(bfloat(float(xp[i]) * gate));
+        }
+
+        for (uint row = 0; row < results_per_simdgroup; ++row) {
+            const device uint8_t* wl = ws + row * in_vec_size_w;
+            float scale = laguna_tail_nvfp4_scale(sc[row * in_vec_size_g]);
+            result[row] += laguna_tail_nvfp4_qdot(wl, x_thread, scale);
+        }
+
+        ws += block_size / 2;
+        sc += block_size / 16;
+        xp += block_size;
+        column += block_size;
+    }
+
+    for (uint row = 0; row < results_per_simdgroup; ++row) {
+        result[row] = simd_sum(result[row]);
+        if (simd_lid == 0) {
+            projected[out_row + row] = bfloat(result[row]);
+        }
+    }
+    """
+}
+
+/// One kernel per attention head count, built eagerly so one binary serves
+/// every arm of an ablation and MLX's name-keyed JIT cache never sees two
+/// sources under one name.
+private let lagunaGatedNVFP4OProjKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_gated_nvfp4_oproj_qmv_g16b4_h\(heads)_v1",
+            inputNames: [
+                "attention_output", "gate_logits", "weight_codes",
+                "weight_scales",
+            ],
+            outputNames: ["projected"],
+            source: lagunaGatedNVFP4OProjSource(heads: heads),
+            header: lagunaTailNVFP4QMVHeader,
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+/// `DARKBLOOM_FUSED_GATED_NVFP4_OPROJ` (default ON; set "0" to disable).
+/// Fuses the per-head softplus gate product into the native NVFP4 o_proj
+/// GEMV on the tail layers so their decode attention tail is one dispatch
+/// instead of two. Bit-exact: the gate factor is applied at the same
+/// FP32 -> BF16 rounding point as `lagunaGateProductSoftplus`, and the
+/// contraction keeps MLX's `fp_qmv_fast` geometry and accumulation order
+/// exactly. Falls back to the exact two-dispatch chain whenever the o_proj
+/// bank is not group-16 4-bit NVFP4 or any guard declines.
+let lagunaFusedGatedNVFP4OProjEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATED_NVFP4_OPROJ"] != "0"
+
+/// Gate product + native NVFP4 output projection in one dispatch, or `nil`
+/// when any shape or dtype guard declines (caller then runs the exact
+/// two-dispatch chain).
+func lagunaGatedNVFP4OProj(
+    attentionOutput: MLXArray,
+    gateLogits: MLXArray,
+    codes: MLXArray,
+    scales: MLXArray,
+    heads: Int
+) -> MLXArray? {
+    guard let kernel = lagunaGatedNVFP4OProjKernels[heads] else { return nil }
+    let inVec = heads * LagunaConstants.headDim
+    let outVec = LagunaConstants.hiddenSize
+    guard attentionOutput.dtype == .bfloat16,
+        attentionOutput.shape == [1, 1, inVec],
+        gateLogits.dtype == .bfloat16,
+        gateLogits.shape == [1, 1, heads],
+        codes.dtype == .uint32,
+        codes.shape == [outVec, inVec / 8],
+        scales.dtype == .uint8,
+        scales.shape == [outVec, inVec / 16]
+    else {
+        return nil
+    }
+
+    lagunaTrace("gated nvfp4 oproj qmv h\(heads)")
+    return kernel(
+        [attentionOutput, gateLogits, codes, scales],
+        grid: ((outVec / 8) * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, outVec]],
+        outputDTypes: [.bfloat16]
+    )[0]
 }
 
 // MARK: - Norm-folded native-affine QKV projection (one dispatch)
@@ -4516,12 +4494,15 @@ final class LagunaRuntimeAttention: Module {
                 {
                     return fusedProjection
                 }
-                if lagunaFusedGatedAffineOProjEnabled,
-                    lagunaGatedAffineOProjNVFP4Enabled,
-                    !gateIsActivated,
+                // NVFP4-tail twin of the branch above: on the tail layers the
+                // o_proj bank is exact group-16 NVFP4, so the softplus chain,
+                // the broadcast product AND the NVFP4 contraction run as ONE
+                // dispatch (see `lagunaGatedNVFP4OProjSource`). Any guard
+                // decline falls through to the two-dispatch chain below.
+                if lagunaFusedGatedNVFP4OProjEnabled, !gateIsActivated,
                     affineWO.mode == .nvfp4, affineWO.bits == 4,
-                    affineWO.groupSize == 16,
-                    let fusedProjection = lagunaGatedAffineOProjNVFP4(
+                    affineWO.groupSize == 16, affineWO.biases == nil,
+                    let fusedProjection = lagunaGatedNVFP4OProj(
                         attentionOutput: output,
                         gateLogits: projectedGate,
                         codes: affineWO.packedCodes,
@@ -5355,137 +5336,6 @@ func lagunaRoutedSwiGLUQMV(
 
     return lagunaRoutedSwiGLUQMVKernel(
         [input, fusedWeight, fusedScales, indices],
-        grid: (LagunaConstants.numExpertsPerTok * 128 * 64, 1, 1),
-        threadGroup: (64, 1, 1),
-        outputShapes: [[
-            1, 1, LagunaConstants.numExpertsPerTok, 1,
-            LagunaConstants.moeIntermediateSize,
-        ]],
-        outputDTypes: [.bfloat16]
-    )[0]
-}
-
-/// `DARKBLOOM_PACKED_SCALES` twin of `lagunaRoutedSwiGLUQMVKernel` consuming
-/// the walk-order scale-interleaved side bank built by
-/// `preparePackedRoutedGateUpBank`. Bank layout, per expert:
-/// `[tile 128][k-block 4][sub 8][288 bytes]` where `sub =
-/// (simd_group*2 + row)*2 + {0 gate, 1 up}` and a 288-byte region is the
-/// row's 32 E4M3 scale bytes for that 512-value K block followed by its 256
-/// code bytes. The stock kernel's `gate_row/up_row` remap is baked into the
-/// bank, so per (row, k-block, lane) this kernel issues the identical loads
-/// (one scale byte + one uint2 of codes) and runs the textually identical
-/// dequant/accumulate/SwiGLU chain — only the address computation differs,
-/// turning four scattered device streams per simdgroup iteration into one
-/// contiguous 2,304-byte span per threadgroup per k-block.
-private let lagunaRoutedSwiGLUQMVPackedKernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_bf16_v1",
-    inputNames: ["input", "packed_bank", "indices"],
-    outputNames: ["activated"],
-    source: """
-        constexpr uint input_width = 2048;
-        constexpr uint output_width = 512;
-        constexpr uint block_width = 512;
-        constexpr uint values_per_lane = 16;
-        constexpr uint routed_experts = 8;
-        // 32 scale bytes + 256 code bytes for one row's 512-value K block.
-        constexpr uint region_bytes = 288;
-        constexpr uint pair_bytes = 2 * region_bytes;
-        constexpr uint kblock_bytes = 4 * pair_bytes;
-        constexpr uint tile_bytes = 4 * kblock_bytes;
-        constexpr uint packed_expert_bytes = 128 * tile_bytes;
-
-        uint group = threadgroup_position_in_grid.x;
-        uint expert_slot = group % routed_experts;
-        uint tile = group / routed_experts;
-        uint expert = uint(indices[expert_slot]);
-        uint simd_group = simdgroup_index_in_threadgroup;
-        uint lane = thread_index_in_simdgroup;
-        uint first_row = tile * 4 + simd_group * 2;
-
-        const device uint8_t* tile_packed =
-            (const device uint8_t*)packed_bank +
-            expert * packed_expert_bytes + tile * tile_bytes;
-
-        thread float gate_result[2] = {0.0f, 0.0f};
-        thread float up_result[2] = {0.0f, 0.0f};
-        thread float input_values[values_per_lane];
-
-        for (uint block = 0; block < input_width; block += block_width) {
-            const device vec<bfloat, 4>* input_vectors =
-                (const device vec<bfloat, 4>*)(
-                    input + block + lane * values_per_lane);
-            for (uint i = 0; i < values_per_lane / 4; ++i) {
-                const vec<bfloat, 4> values = input_vectors[i];
-                input_values[4 * i] = values[0];
-                input_values[4 * i + 1] = values[1];
-                input_values[4 * i + 2] = values[2];
-                input_values[4 * i + 3] = values[3];
-            }
-
-            const device uint8_t* block_packed =
-                tile_packed + (block / block_width) * kblock_bytes;
-            for (uint row = 0; row < 2; ++row) {
-                const device uint8_t* pair_packed =
-                    block_packed + (simd_group * 2 + row) * pair_bytes;
-                const device uint8_t* gate_scale = pair_packed + lane;
-                const device uint8_t* gate_weight =
-                    pair_packed + 32 + lane * 8;
-                const device uint8_t* up_scale =
-                    pair_packed + region_bytes + lane;
-                const device uint8_t* up_weight =
-                    pair_packed + region_bytes + 32 + lane * 8;
-
-                gate_result[row] += laguna_nvfp4_qdot_16(
-                    gate_weight,
-                    input_values,
-                    laguna_nvfp4_scale(gate_scale[0]));
-                up_result[row] += laguna_nvfp4_qdot_16(
-                    up_weight,
-                    input_values,
-                    laguna_nvfp4_scale(up_scale[0]));
-            }
-        }
-
-        for (uint row = 0; row < 2; ++row) {
-            gate_result[row] = simd_sum(gate_result[row]);
-            up_result[row] = simd_sum(up_result[row]);
-            if (lane == 0) {
-                bfloat gate = bfloat(gate_result[row]\(lagunaNvfp4RowScaleSuffix));
-                bfloat up = bfloat(up_result[row]\(lagunaNvfp4RowScaleSuffix));
-                bfloat exp_abs = metal::exp(metal::abs(gate));
-                bfloat denominator = bfloat(1) + exp_abs;
-                bfloat y = bfloat(1) / denominator;
-                bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
-                bfloat silu = bfloat(gate * sigmoid);
-                activated[
-                    expert_slot * output_width + first_row + row
-                ] = bfloat(silu * up);
-            }
-        }
-        """,
-    header: lagunaSharedSwiGLUQMVHeader,
-    ensureRowContiguous: true
-)
-
-func lagunaRoutedSwiGLUQMVPacked(
-    _ input: MLXArray,
-    packedBank: MLXArray,
-    indices: MLXArray
-) -> MLXArray {
-    precondition(input.dtype == .bfloat16)
-    precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
-    precondition(packedBank.dtype == .uint8)
-    precondition(
-        packedBank.shape == [
-            LagunaConstants.numExperts,
-            2 * LagunaConstants.moeIntermediateSize * 4,
-            288,
-        ])
-    precondition(indices.dtype == .uint32)
-    precondition(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
-
-    return lagunaRoutedSwiGLUQMVPackedKernel(
-        [input, packedBank, indices],
         grid: (LagunaConstants.numExpertsPerTok * 128 * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[
@@ -7919,11 +7769,6 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     var _routedDownProj: SwitchLinear?
     var _routedDownWeight: MLXArray?
     var _routedDownScales: MLXArray?
-    /// `DARKBLOOM_PACKED_SCALES` walk-order scale-interleaved copy of the
-    /// fused routed gate/up bank ([experts, 4096, 288] uint8); see
-    /// `lagunaRoutedSwiGLUQMVPackedKernel` for the layout contract. Nil
-    /// unless the flag is set (default OFF costs nothing).
-    var _packedRoutedGateUpBank: MLXArray?
 
     /// Builds and retains the fused routed gate/up NVFP4 banks from the
     /// loaded stock `SwitchGLU` submodules (reached through the public
@@ -8008,72 +7853,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         _routedDownProj = downModule
         _routedDownWeight = downWeight
         _routedDownScales = downScales
-        var prepared = [fusedWeight, fusedScales]
-        prepared.append(
-            contentsOf: preparePackedRoutedGateUpBank(
-                fusedWeight: fusedWeight,
-                fusedScales: fusedScales,
-                experts: experts,
-                split: split))
-        return prepared
-    }
-
-    /// Builds the `DARKBLOOM_PACKED_SCALES` side bank from the (lazy) fused
-    /// routed gate/up arrays: bytes are only reordered, never recomputed.
-    /// Per expert the packed layout is `[tile 128][k-block 4][sub 8][288 B]`
-    /// with `sub = (simd_group*2 + row)*2 + {0 gate, 1 up}` and each region
-    /// = 32 scale bytes ++ 256 code bytes for that row's 512-value K block —
-    /// the exact byte stream `lagunaRoutedSwiGLUQMVPackedKernel` walks. The
-    /// row remap below (gateRow = (logical/32)*64 + logical%32, up = +32) is
-    /// the stock kernel's mapping over the 32-row gate/up-interleaved fused
-    /// bank, baked into storage order. Memory: ~302 MB per sparse layer,
-    /// resident only while the flag is set.
-    func preparePackedRoutedGateUpBank(
-        fusedWeight: MLXArray,
-        fusedScales: MLXArray,
-        experts: Int,
-        split: Int
-    ) -> [MLXArray] {
-        guard lagunaPackedScalesEnabled else { return [] }
-        guard split == LagunaConstants.moeIntermediateSize,
-            experts == LagunaConstants.numExperts,
-            LagunaConstants.hiddenSize == 2048
-        else {
-            lagunaPackedScalesLog.note(
-                "inactive", "packed routed gate/up bank (geometry guard declined)")
-            return []
-        }
-        let rows = 2 * split  // 1024 fused (gate/up-interleaved) rows
-        let codeBytes = fusedWeight.view(dtype: .uint8)  // [E, rows, 1024]
-        let rowBlocks = concatenated(
-            [
-                fusedScales.reshaped([experts, rows, 4, 32]),
-                codeBytes.reshaped([experts, rows, 4, 256]),
-            ], axis: 3
-        ).reshaped([experts, rows * 4, 288])
-        // Walk-order gather over row-block regions: packed position
-        // (tile, kblock, sub) reads fused row-block (fusedRow, kblock).
-        var order = [Int32]()
-        order.reserveCapacity(rows * 4)
-        for tile in 0..<(rows / 8) {
-            for kblock in 0..<4 {
-                for sub in 0..<8 {
-                    let logicalRow = tile * 4 + sub / 2
-                    let gateRow = (logicalRow / 32) * 64 + logicalRow % 32
-                    let fusedRow = sub % 2 == 0 ? gateRow : gateRow + 32
-                    order.append(Int32(fusedRow * 4 + kblock))
-                }
-            }
-        }
-        // `take(axis: 1)` materializes with permuted strides (NOT
-        // row-contiguous), and the custom kernel's `ensureRowContiguous`
-        // would then re-copy all ~302 MB on EVERY dispatch (~1.7 ms/layer,
-        // measured). Force the one-time row-contiguous materialization here,
-        // at init, so dispatches bind the bank buffer directly.
-        let packed = contiguous(take(rowBlocks, MLXArray(order), axis: 1))
-        _packedRoutedGateUpBank = packed
-        lagunaPackedScalesLog.note("active", "packed routed gate/up bank prepared")
-        return [packed]
+        return [fusedWeight, fusedScales]
     }
 
     init(_ config: LagunaConfig) {
@@ -8153,23 +7933,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     )
                     activated = merged.routed
                     mergedSharedActivated = merged.shared
-                } else if lagunaPackedScalesEnabled,
-                    let packedBank = _packedRoutedGateUpBank
-                {
-                    lagunaPackedScalesLog.note(
-                        "active", "routed swiglu qmv packed dispatch")
-                    lagunaTrace("routed gate/up QMV + SwiGLU (packed scales)")
-                    activated = lagunaRoutedSwiGLUQMVPacked(
-                        x,
-                        packedBank: packedBank,
-                        indices: inds
-                    )
                 } else {
-                    if lagunaPackedScalesEnabled {
-                        lagunaPackedScalesLog.note(
-                            "inactive",
-                            "routed swiglu qmv packed (bank missing; stock kernel dispatched)")
-                    }
                     lagunaTrace("routed gate/up QMV + SwiGLU")
                     activated = lagunaRoutedSwiGLUQMV(
                         x,
@@ -8882,21 +8646,6 @@ final class LagunaRuntimeModelInner: Module {
         let slidingMask = createAttentionMask(
             h: h, cache: cache?[slidingAttentionIdx], windowSize: slidingWindow)
 
-        let isSingleTokenDecode = inputs.shape == [1, 1]
-        let decodeFireMask: UInt64 =
-            switch lagunaDecodeAsyncStage {
-            case .off, .norm, .logits:
-                0
-            case .layer(let idx):
-                UInt64(1) << UInt64(idx)
-            case .ladder(let n):
-                (0..<UInt64(layers.count)).reduce(UInt64(0)) { acc, i in
-                    (Int(i) + 1) % n == 0 ? acc | (UInt64(1) << i) : acc
-                }
-            case .explicit(let mask):
-                mask
-            }
-
         // One cos/sin table per attention family per decode step, shared by
         // every layer of that family (their caches advance in lockstep). Each
         // table is produced by running the family's own RoPE layer over a
@@ -8918,7 +8667,12 @@ final class LagunaRuntimeModelInner: Module {
                         qkRoPEAngles: qkRoPEAngles,
                         qkRoPEOffsets: qkRoPEOffsets
                     )
-                    if isSingleTokenDecode, (decodeFireMask >> UInt64(i)) & 1 == 1 {
+                    if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
+                        asyncEval(h)
+                    }
+                    if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
+                        inputs.shape == [1, 1]
+                    {
                         asyncEval(h)
                     }
                 }
@@ -8930,7 +8684,17 @@ final class LagunaRuntimeModelInner: Module {
                     qkRoPEAngles: qkRoPEAngles,
                     qkRoPEOffsets: qkRoPEOffsets
                 )
-                if isSingleTokenDecode, (decodeFireMask >> UInt64(i)) & 1 == 1 {
+                if case .layer(let idx) = lagunaDecodeAsyncStage, idx == i, inputs.shape == [1, 1] {
+                    asyncEval(h)
+                }
+                if case .ladder(let n) = lagunaDecodeAsyncStage, (i + 1) % n == 0,
+                    inputs.shape == [1, 1]
+                {
+                    asyncEval(h)
+                }
+                if case .explicit(let mask) = lagunaDecodeAsyncStage,
+                    (mask >> UInt64(i)) & 1 == 1, inputs.shape == [1, 1]
+                {
                     asyncEval(h)
                 }
                 if lagunaPrefillAsyncLadderStride > 0, h.dim(1) > 1,
@@ -9093,9 +8857,13 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         if lagunaLmHeadPruneEnabled, let lmHead {
             lmHeadPruner = LagunaLmHeadPruner(lmHeadWeight: lmHead.weight)
             if let pruner = lmHeadPruner {
+                // The pruner retains exactly one layout for the selected
+                // configuration: the co-tiled single-stream bank by default,
+                // or the two-stream codes+scales pair under any of its
+                // kill switches.
                 eval(pruner.residentArrays)
                 FileHandle.standardError.write(
-                    Data("mlxfast: lm_head prune active (coarse copy resident)\n".utf8))
+                    Data("mlxfast: lm_head prune active (mxfp8 coarse copy resident)\n".utf8))
             }
         }
     }
