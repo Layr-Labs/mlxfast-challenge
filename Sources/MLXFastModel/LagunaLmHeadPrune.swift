@@ -214,6 +214,45 @@ private let lagunaLmHeadPrecomputeAbsGroupsEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_LMHEAD_PRECOMPUTE_ABS_GROUPS"] != "0"
 
+/// Two-stage coarse prescreen (`DARKBLOOM_LMHEAD_INT5_PRESCREEN`, default ON;
+/// set "0" to disable). Rides ONLY the shipped default arm -- the int6 v4
+/// coarse copy under the ratio bound with the BF16 delta store -- and replaces
+/// that arm's single 1600 B/row coarse traversal with:
+///
+///   STAGE 1 (all rows): a certified coarse pass over a narrower INT5 planar
+///   copy (nibble plane [V, 1024] + 1-bit plane [V, 256] + power-of-two scale
+///   bytes [V, 64] = 1344 B/row, -16% coarse bytes), producing `coarse5` (f32)
+///   and a round-up BF16 `delta5`, then the unchanged lower-max/threshold pair
+///   for `thr5`. The stage-1 certificate is the SAME flat-half-cell chain as
+///   the int6 arm's (see the INT5 kernel below), so every row that could be
+///   the argmax -- including the true argmax row -- survives stage 1.
+///
+///   STAGE 2 (survivors only): re-screen with the EXISTING resident int6
+///   planes. Non-survivor rows never touch the int6 planes (that skip is the
+///   byte saving); survivors run the int6 ratio-bound delta-bf16 arithmetic
+///   textually, and the same lower-max/threshold pair over the stage-2 outputs
+///   yields `thr6`.
+///
+///   EXACT pass: unchanged stock-GEMV arithmetic with a three-way slot
+///   selection (stage-2 candidate -> exact GEMV; stage-1 survivor that stage 2
+///   screened out -> `bfloat(coarse6)`; stage-1 non-survivor ->
+///   `bfloat(coarse5)`), so the emitted token stays the stock token.
+///
+/// Bytes per token: the all-rows traversal drops from ~160.6 MB (int6
+/// 1600 B/row) to ~134.9 MB (int5 1344 B/row); stage 2 adds one 6 B/row
+/// predicate read plus 1600 B for each of the few stage-1 survivors, and the
+/// second reduction pass adds ~0.6 MB -- ~24 MB/token saved net. Memory: the
+/// INT5 planes are ~135 MB additional resident (the int6 planes stay resident
+/// for stage 2).
+///
+/// The INT5 planes are built at untimed init and VERIFIED (`|q5| <= 15` on the
+/// actual tensor); on violation the prescreen disables itself and the shipped
+/// single-stage int6 path runs unchanged. Every other flag combination
+/// (prescreen off, ratio bound off, delta-bf16 off, v4 off, inline mask off)
+/// reaches the shipped code path byte-for-byte.
+private let lagunaLmHeadInt5PrescreenEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_INT5_PRESCREEN"] != "0"
+
 /// Kernel header: bit-exact MXFP8 element decoders + the certified
 /// half-cell-width table, all inlinable and libm-free.
 private let lagunaLmHeadPruneHeader = """
@@ -1203,6 +1242,257 @@ private let lagunaLmHeadInt6CoarseRatioBoundDeltaBF16PrecomputedAbsKernel =
         ensureRowContiguous: true
     )
 
+/// Stage 1 of the INT5 prescreen (`DARKBLOOM_LMHEAD_INT5_PRESCREEN`, default
+/// ON, riding only the int6+ratio-bound+delta-bf16 arm): the certified coarse
+/// pass over the planar INT5 copy. Same launch geometry as the int6 v4 coarse
+/// kernel (16 rows/threadgroup, 512 threads, one simdgroup per row, lane owns
+/// 2 consecutive 32-element groups), same fused coarse+delta outputs, 1344
+/// bytes/row instead of 1600 (-16%).
+///
+/// The accumulation is a TEXTUAL copy of
+/// `laguna_lmhead_int6_inline_coarse_ratio_bound_delta_bf16_v4` -- same lane
+/// partition, same `gg`/`w`/`k` loop order and unrolls, same `cg`/`ag` chains,
+/// same `sd` handling, same two `simd_sum`s, same round-up BF16 epilogue --
+/// only the plane unpack and two constants differ: the high plane is 1 bit
+/// per element instead of 2 (`value = u5 - 16` in [-15, 15]) and the closed
+/// form uses `61*gamma` instead of `125*gamma`.
+///
+/// Certificate (the INT5 twin of the int6 flat-half-cell chain):
+///   * Codes. The planes carry `u5` in five bits and the kernel decodes
+///     `q5 = u5 - 16`. `buildInt5Planes` picks `sd5 = 2^e` so that
+///     `gmax/sd5 < 15.5` and then VERIFIES `max|q5| <= 15` on the actual
+///     tensor, disabling the prescreen if that ever fails. There is no clamp,
+///     so the guard is what establishes the range: on this arm `u5` is in
+///     [1, 31] and `|q5| <= 15` for every element the kernel can ever decode.
+///     (Were `u5 = 0` reachable the ratio below would be 32, not 30 -- the
+///     init guard is load-bearing, which is why it is a hard disable rather
+///     than a warning.)
+///   * Half cell. `sd5` is a power of two, so `w/sd5` is exact in float and
+///     `|w_ij - sd5*q5_ij| <= sd5/2` EXACTLY (flat half-cell, no clamp).
+///     Hence `d_i = sum_g (0.5*sd5_g) * sum_{j in g} |x_j|
+///                >= sum_j |x_j| * |w_ij - what_ij|`
+///     (`0.5*sd5` is exact: both factors are powers of two), and
+///     `delta_i = d_i*(1+gamma) + 2*gamma*m_i` with
+///     `m_i = sum_g sd5_g * sum_{j in g} |x_j|*|q5_ij|` covers the
+///     quantization error plus this kernel's float rounding exactly as in the
+///     int6 argument (accumulation depth here is ~45 roundings/element-path,
+///     under the depth <= 96 budget assumed by gamma = 2^-15).
+///   * Ratio bound. Per element the `m` term contributes `sd5*|x_j|*|q5_ij|`
+///     and the `d` term contributes `(0.5*sd5)*|x_j|` -- the SAME elements
+///     under the SAME positive power-of-two group scale `sd5_g`. Their ratio
+///     is exactly `2*|q5_ij| <= 30`, so the inequality lifts termwise to the
+///     row sums: `m_i <= 30*d_i`.
+///   * Substitution. `d_i*(1+gamma) + 2*gamma*m_i <= d_i*(1 + gamma +
+///     60*gamma) = d_i*(1 + 61*gamma)`, and the two scalars agree exactly in
+///     FP32: `(1+gamma) + 30*(2*gamma) == 1 + 61*gamma` bit-for-bit
+///     (`61*2^-15` spans 15 significand bits, well inside FP32's 24). This is
+///     numerically the SAME closed form as the MXFP8 arm's -- the E4M3 table's
+///     maximum ratio is also 30 -- so the epilogue constant is shared, not
+///     borrowed loosely.
+///
+/// The round-up BF16 `delta5` store is the same bit surgery as the int6
+/// delta-bf16 kernel with the same sign-clear argument (`d_acc` is a sum of
+/// products of `|x_j| >= 0` and positive halved power-of-two scales), and it
+/// can only WIDEN the bound: candidacy is monotone in delta, so rounding up
+/// only lowers `L5`/`thr5` and raises each row's `coarse5 + delta5` -- both
+/// movements admit stage-2 rows and never drop one.
+///
+/// Decode exactness: float4(uint4) of values <= 31 and the -16.0f offset are
+/// exact; sd*q multiplies a power of two by a <=4-bit integer float: exact.
+private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_int5_coarse_ratio_bound_delta_bf16_v1",
+    inputNames: ["x", "codes_lo", "codes_hi", "scales"],
+    outputNames: ["coarse", "delta"],
+    source: """
+        constexpr float GAMMA = 0x1p-15f;
+
+        uint row = threadgroup_position_in_grid.x * 16 +
+            simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        const device uint8_t* lorow = codes_lo + size_t(row) * 1024;
+        const device uint8_t* hirow = codes_hi + size_t(row) * 256;
+        const device uint8_t* srow = scales + size_t(row) * 64;
+
+        float c_acc = 0.0f;
+        float d_acc = 0.0f;
+        for (uint gg = 0; gg < 2; ++gg) {
+            uint g = 2 * lane + gg;
+            float sd = laguna_e8m0_decode(srow[g]);
+            uint4 lo4 = ((const device uint4*)(lorow + g * 16))[0];
+            uint hw32 = ((const device uint*)(hirow + g * 4))[0];
+            const device ushort4* xrow = (const device ushort4*)(x + g * 32);
+            float cg = 0.0f;
+            float ag = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint w = 0; w < 4; ++w) {
+                // Word w: elements 8w..8w+7 of the group. Nibble plane byte
+                // b holds elements 2b (low) / 2b+1 (high); 1-bit plane byte
+                // b holds elements 8b..8b+7, element j at bit j.
+                uint lw = lo4[w];
+                uint hb = (hw32 >> (8u * w)) & 255u;
+                uint4 ne = (uint4(lw) >> uint4(0u, 8u, 16u, 24u)) & 15u;
+                uint4 no = (uint4(lw) >> uint4(4u, 12u, 20u, 28u)) & 15u;
+                uint4 he = (uint4(hb) >> uint4(0u, 2u, 4u, 6u)) & 1u;
+                uint4 ho = (uint4(hb) >> uint4(1u, 3u, 5u, 7u)) & 1u;
+                // Offset-binary decode: value = u5 - 16 in [-15, 15], exact.
+                float4 ve = float4(ne | (he << 4u)) - 16.0f;
+                float4 vo = float4(no | (ho << 4u)) - 16.0f;
+                // bf16 -> f32 is exactly bits<<16 for every value class.
+                float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
+                float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
+                float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
+                float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
+                float4 axe = metal::abs(xe);
+                float4 axo = metal::abs(xo);
+                #pragma clang loop unroll(full)
+                for (uint k = 0; k < 4; ++k) {
+                    cg += xe[k] * ve[k];
+                    cg += xo[k] * vo[k];
+                    ag += axe[k];
+                    ag += axo[k];
+                }
+            }
+            c_acc += sd * cg;
+            d_acc += (0.5f * sd) * ag;
+        }
+        c_acc = simd_sum(c_acc);
+        d_acc = simd_sum(d_acc);
+        if (lane == 0) {
+            coarse[row] = c_acc;
+            // Closed-form INT5 bound (m <= 30*d, see above), rounded UP to
+            // BF16 by the same bit surgery as the int6 delta-bf16 kernel.
+            float d_up = d_acc * (1.0f + 61.0f * GAMMA);
+            uint dbits = as_type<uint>(d_up);
+            uint dtrunc = dbits & 0xFFFF0000u;
+            if (dtrunc != dbits) {
+                dtrunc += 0x00010000u;
+            }
+            delta[row] = as_type<bfloat>(ushort(dtrunc >> 16));
+        }
+        """,
+    header: lagunaLmHeadPruneHeader,
+    ensureRowContiguous: true
+)
+
+/// Stage 2 of the INT5 prescreen: the int6 coarse pass restricted to stage-1
+/// survivors. Same 16-rows/threadgroup geometry as the int6 v4 coarse kernel,
+/// launched over ALL rows; each simdgroup first evaluates its row's stage-1
+/// survivor predicate -- every lane reads the same three scalars
+/// (`coarse5[row]`, `delta5[row]`, `thr5[0]`), so the predicate is
+/// simdgroup-uniform, the whole simdgroup takes one branch, and the early
+/// return is divergence-safe (this kernel has no threadgroup barrier to skip).
+///
+/// Non-survivor rows: lane 0 writes the sentinel pair `coarse6[row] = -inf`,
+/// `delta6[row] = bf16(0)` and the simdgroup returns WITHOUT touching the
+/// int6 planes -- that skipped 1600 B/row read is where the prescreen's byte
+/// saving lives. In the downstream lower-max reduction the sentinel
+/// contributes `-inf - 0 = -inf`, which never wins the max (no NaN can arise:
+/// only `inf - inf` would produce one, and `delta6` is 0 there).
+///
+/// Survivor rows run the int6 ratio-bound delta-bf16 arithmetic TEXTUALLY
+/// (copied from `laguna_lmhead_int6_inline_coarse_ratio_bound_delta_bf16_v4`:
+/// same lane partition, same loop order, same plane decode, same FP32
+/// accumulation, same `125*gamma` closed form, same round-up BF16 store), so
+/// a survivor's `coarse6`/`delta6` are bit-identical to what the single-stage
+/// int6 kernel would have produced for that row, and the already-proven int6
+/// certificate applies to them unchanged.
+///
+/// Why `thr6` from these outputs is a valid threshold: every stage-1 survivor
+/// satisfies `coarse6[r] - delta6[r] <= logit_r` (int6 certificate), so
+/// `L6 = max over survivors of (coarse6 - delta6)` is <= the true max logit
+/// (non-survivor sentinels are -inf and never selected), and the true argmax
+/// row IS a stage-1 survivor by the stage-1 certificate
+/// (`coarse5[m] + delta5[m] >= logit_m = max >= L5 >= thr5`), so it reaches
+/// stage 2, satisfies `coarse6[m] + delta6[m] >= logit_m >= L6 >= thr6`, and
+/// is a stage-2 candidate for the exact pass.
+private let lagunaLmHeadInt6RescreenKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_int6_rescreen_v1",
+    inputNames: ["x", "codes_lo", "codes_hi", "scales", "coarse5", "delta5", "thr5"],
+    outputNames: ["coarse", "delta"],
+    source: """
+        constexpr float GAMMA = 0x1p-15f;
+
+        uint row = threadgroup_position_in_grid.x * 16 +
+            simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        // Simdgroup-uniform stage-1 survivor test (textually the exact pass's
+        // predicate over the stage-1 outputs). Non-survivors write the
+        // -inf/0 sentinel pair and never read the int6 planes.
+        bool survivor = coarse5[row] + float(delta5[row]) >= thr5[0];
+        if (!survivor) {
+            if (lane == 0) {
+                coarse[row] = -metal::numeric_limits<float>::infinity();
+                delta[row] = as_type<bfloat>(ushort(0));
+            }
+            return;
+        }
+
+        const device uint8_t* lorow = codes_lo + size_t(row) * 1024;
+        const device uint8_t* hirow = codes_hi + size_t(row) * 512;
+        const device uint8_t* srow = scales + size_t(row) * 64;
+
+        float c_acc = 0.0f;
+        float d_acc = 0.0f;
+        for (uint gg = 0; gg < 2; ++gg) {
+            uint g = 2 * lane + gg;
+            float sd = laguna_e8m0_decode(srow[g]);
+            uint4 lo4 = ((const device uint4*)(lorow + g * 16))[0];
+            uint2 hi2 = ((const device uint2*)(hirow + g * 8))[0];
+            const device ushort4* xrow = (const device ushort4*)(x + g * 32);
+            float cg = 0.0f;
+            float ag = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint w = 0; w < 4; ++w) {
+                // Word w: elements 8w..8w+7 of the group. Nibble plane byte
+                // b holds elements 2b (low) / 2b+1 (high); 2-bit plane byte
+                // b holds elements 4b..4b+3 at bits 0,2,4,6.
+                uint lw = lo4[w];
+                uint hw = ((w & 2u) ? hi2.y : hi2.x) >> ((w & 1u) * 16u);
+                uint4 ne = (uint4(lw) >> uint4(0u, 8u, 16u, 24u)) & 15u;
+                uint4 no = (uint4(lw) >> uint4(4u, 12u, 20u, 28u)) & 15u;
+                uint4 he = (uint4(hw) >> uint4(0u, 4u, 8u, 12u)) & 3u;
+                uint4 ho = (uint4(hw) >> uint4(2u, 6u, 10u, 14u)) & 3u;
+                // Offset-binary decode: value = u - 32 in [-31, 31], exact.
+                float4 ve = float4(ne | (he << 4u)) - 32.0f;
+                float4 vo = float4(no | (ho << 4u)) - 32.0f;
+                // bf16 -> f32 is exactly bits<<16 for every value class.
+                float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
+                float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
+                float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
+                float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
+                float4 axe = metal::abs(xe);
+                float4 axo = metal::abs(xo);
+                #pragma clang loop unroll(full)
+                for (uint k = 0; k < 4; ++k) {
+                    cg += xe[k] * ve[k];
+                    cg += xo[k] * vo[k];
+                    ag += axe[k];
+                    ag += axo[k];
+                }
+            }
+            c_acc += sd * cg;
+            d_acc += (0.5f * sd) * ag;
+        }
+        c_acc = simd_sum(c_acc);
+        d_acc = simd_sum(d_acc);
+        if (lane == 0) {
+            coarse[row] = c_acc;
+            // Same FP32 bound as the int6 kernel, then rounded UP to BF16.
+            float d_up = d_acc * (1.0f + 125.0f * GAMMA);
+            uint dbits = as_type<uint>(d_up);
+            uint dtrunc = dbits & 0xFFFF0000u;
+            if (dtrunc != dbits) {
+                dtrunc += 0x00010000u;
+            }
+            delta[row] = as_type<bfloat>(ushort(dtrunc >> 16));
+        }
+        """,
+    header: lagunaLmHeadPruneHeader,
+    ensureRowContiguous: true
+)
+
 /// Same-binary A/B selector for the coarse kernel (v2 default).
 private let lagunaLmHeadCoarseUseV1 =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COARSE"] == "v1"
@@ -1679,6 +1969,137 @@ private let lagunaLmHeadInlineExactDeltaBF16Kernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Exact pass for the INT5 prescreen chain: the inline-mask delta-bf16 exact
+/// kernel with a two-stage candidate predicate and a three-way slot selection.
+/// The structure is copied from
+/// `laguna_lmhead_exact_inline_mask_block_delta_bf16_v1` -- the same fixed
+/// four-row block per simdgroup, the same simdgroup-uniform `any_candidate`
+/// gate, the same TEXTUAL stock `gemv_al_bfloat16` replica (untouched), the
+/// same single owning lane per output slot, the same `bfloat` casts.
+///
+/// Per row r:
+///   survivor  = coarse5[r] + float(delta5[r]) >= thr5[0]     (stage 1)
+///   candidate = survivor && coarse6[r] + float(delta6[r]) >= thr6[0]
+/// `coarse6`/`delta6` are consulted only behind `survivor` (short-circuit
+/// `&&`), so the -inf/0 sentinel a non-survivor row holds is never used in a
+/// value; even if it were evaluated, `-inf + 0 >= thr6` is false for the
+/// finite `thr6` this chain produces, so the logic stays well-defined.
+///
+/// Slot values:
+///   * candidate -> `bfloat(exact GEMV result)`: bit-identical to the stock
+///     full GEMV by the same fixed row-to-thread mapping argument as the
+///     single-stage kernel (R1). The true argmax row is always a candidate
+///     (stage-1 certificate promotes it to stage 2; stage-2 certificate
+///     promotes it here), so the winner slot carries the stock winner value.
+///   * survivor-non-candidate -> `bfloat(coarse6[r])`: stage 2 established
+///     `coarse6[r] + float(delta6[r]) < thr6 = L6 - |L6|/64` with
+///     `delta6 >= 0`, so `coarse6[r] < thr6 <= L6 <=` the true max -- strictly
+///     below the winner by the same beta-margin argument the single-stage
+///     proof uses (the 2^-6 relative margin absorbs both BF16 casts, which
+///     move a value by at most 2^-8 relative each).
+///   * non-survivor -> `bfloat(coarse5[r])`: stage 1 established
+///     `coarse5[r] + float(delta5[r]) < thr5 = L5 - |L5|/64` with
+///     `delta5 >= 0`, so `coarse5[r] < thr5 <= L5 <=` the true max -- the
+///     identical margin argument on the stage-1 chain.
+/// Every vocabulary slot is written by exactly one lane on exactly one path,
+/// so the row is fully covered with no race and no uninitialized slot, and
+/// the downstream argmax emits the stock token.
+private let lagunaLmHeadExactTwoStageKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_two_stage_v1",
+    inputNames: [
+        "coarse5", "delta5", "thr5", "coarse6", "delta6", "thr6", "lm_head",
+        "x",
+    ],
+    outputNames: ["assembled"],
+    source: """
+        constexpr uint VOCAB = 100352;
+        constexpr uint K = 2048;
+
+        uint tgid = threadgroup_position_in_grid.x;
+        uint sgid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        // This simdgroup's fixed four output rows. VOCAB is 3136 * 32, so the
+        // grid tiles it exactly; the bounds test is belt-and-braces.
+        uint base = tgid * 32 + sgid * 4;
+
+        // Simdgroup-uniform. Stage-2 candidacy behind the stage-1 survivor
+        // test; the fixed row mapping still gives one owner per output slot.
+        bool any_candidate = false;
+        #pragma unroll
+        for (uint tm = 0; tm < 4; ++tm) {
+            uint r = base + tm;
+            any_candidate = any_candidate ||
+                (r < VOCAB && coarse5[r] + float(delta5[r]) >= thr5[0] &&
+                    coarse6[r] + float(delta6[r]) >= thr6[0]);
+        }
+
+        if (!any_candidate) {
+            if (lane < 4 && base + lane < VOCAB) {
+                uint r = base + lane;
+                bool survivor = coarse5[r] + float(delta5[r]) >= thr5[0];
+                assembled[r] =
+                    survivor ? bfloat(coarse6[r]) : bfloat(coarse5[r]);
+            }
+            return;
+        }
+
+        // --- stock gemv_al replica begin (gemv.h:151-289) ---
+        thread float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread bfloat inter[4];
+        thread float v_coeff[4];
+        uint bn = lane * 4;
+        for (uint i = 0; i < 16; ++i) {
+            vec<bfloat, 4> xv =
+                *((const device vec<bfloat, 4>*)(x + bn));
+            v_coeff[0] = float(xv.x);
+            v_coeff[1] = float(xv.y);
+            v_coeff[2] = float(xv.z);
+            v_coeff[3] = float(xv.w);
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                const device bfloat* mrow = lm_head + size_t(base + tm) * K;
+                vec<bfloat, 4> mv =
+                    *((const device vec<bfloat, 4>*)(mrow + bn));
+                inter[0] = mv.x;
+                inter[1] = mv.y;
+                inter[2] = mv.z;
+                inter[3] = mv.w;
+                result[tm] += inter[0] * v_coeff[0];
+                result[tm] += inter[1] * v_coeff[1];
+                result[tm] += inter[2] * v_coeff[2];
+                result[tm] += inter[3] * v_coeff[3];
+            }
+            bn += 128;
+        }
+        #pragma unroll
+        for (uint tm = 0; tm < 4; ++tm) {
+            #pragma unroll
+            for (ushort sn = 16; sn >= 1; sn >>= 1) {
+                result[tm] += simd_shuffle_down(result[tm], sn);
+            }
+        }
+        // --- stock gemv_al replica end ---
+        if (lane == 0) {
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                uint r = base + tm;
+                if (r < VOCAB) {
+                    bool survivor =
+                        coarse5[r] + float(delta5[r]) >= thr5[0];
+                    bool candidate = survivor &&
+                        coarse6[r] + float(delta6[r]) >= thr6[0];
+                    assembled[r] = candidate
+                        ? bfloat(result[tm])
+                        : (survivor ? bfloat(coarse6[r])
+                                    : bfloat(coarse5[r]));
+                }
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 /// Retained init-time MXFP8 coarse copy of lm_head plus the pruned final-row
 /// forward. Built once (untimed init) by
 /// `LagunaRuntimeModel.prepareFusedRuntimeWeights` when
@@ -1695,13 +2116,30 @@ final class LagunaLmHeadPruner {
     let int6CodesLo: MLXArray?
     let int6CodesHi: MLXArray?
     let int6Scales: MLXArray?
+    /// INT5 prescreen planes (DARKBLOOM_LMHEAD_INT5_PRESCREEN, default ON,
+    /// riding only the int6+ratio-bound+delta-bf16 arm): nibble plane
+    /// [V, 1024] (same byte packing as the int6 nibble plane), 1-bit plane
+    /// [V, 256] (byte b holds elements 8b..8b+7, element j at bit j), and
+    /// power-of-two scale bytes [V, 64] (e8m0 byte semantics). Built ONLY
+    /// when the int6 planes built and the ratio-bound + delta-bf16 selectors
+    /// are on; nil disables the prescreen and the shipped single-stage int6
+    /// path runs unchanged.
+    let int5CodesLo: MLXArray?
+    let int5CodesHi: MLXArray?
+    let int5Scales: MLXArray?
 
     /// The resident coarse-copy arrays of the ACTIVE arm, for the untimed
     /// init-time eval in `prepareFusedRuntimeWeights` (the shipped call named
     /// `codes`/`scales` directly, which are nil under v4).
     var residentArrays: [MLXArray] {
         if let lo = int6CodesLo, let hi = int6CodesHi, let s6 = int6Scales {
-            return [lo, hi, s6]
+            var arrays = [lo, hi, s6]
+            if let lo5 = int5CodesLo, let hi5 = int5CodesHi,
+                let s5 = int5Scales
+            {
+                arrays += [lo5, hi5, s5]
+            }
+            return arrays
         }
         return [codes, scales].compactMap { $0 }
     }
@@ -1727,6 +2165,50 @@ final class LagunaLmHeadPruner {
                 FileHandle.standardError.write(
                     Data("fusion active: lmhead-int6-coarse-v4\n".utf8))
             }
+            // INT5 prescreen: rides only this arm, and only under the
+            // ratio-bound + delta-bf16 selectors the two-stage chain's
+            // kernels assume; any other combination leaves the planes nil
+            // and the shipped single-stage int6 path byte-for-byte.
+            if lagunaLmHeadInt5PrescreenEnabled,
+                lagunaLmHeadRatioBoundEnabled, lagunaLmHeadDeltaBF16Enabled
+            {
+                if let p5 = LagunaLmHeadPruner.buildInt5Planes(lmHeadWeight) {
+                    self.int5CodesLo = p5.lo
+                    self.int5CodesHi = p5.hi
+                    self.int5Scales = p5.scales
+                    if lagunaTraceFusionEnabled {
+                        FileHandle.standardError.write(
+                            Data(
+                                "fusion active: lmhead-int5-prescreen\n".utf8))
+                    }
+                } else {
+                    // buildInt5Planes already reported the overflow on
+                    // stderr; the int6 single-stage path runs unchanged.
+                    self.int5CodesLo = nil
+                    self.int5CodesHi = nil
+                    self.int5Scales = nil
+                    if lagunaTraceFusionEnabled {
+                        FileHandle.standardError.write(
+                            Data(
+                                "fusion inactive: lmhead-int5-prescreen (int5 code overflow)\n"
+                                    .utf8))
+                    }
+                }
+            } else {
+                self.int5CodesLo = nil
+                self.int5CodesHi = nil
+                self.int5Scales = nil
+                if lagunaTraceFusionEnabled {
+                    let reason =
+                        !lagunaLmHeadInt5PrescreenEnabled
+                        ? "flag off"
+                        : "ratio-bound/delta-bf16 selector off"
+                    FileHandle.standardError.write(
+                        Data(
+                            "fusion inactive: lmhead-int5-prescreen (\(reason))\n"
+                                .utf8))
+                }
+            }
             return
         }
         if lagunaLmHeadCoarseV4Enabled, !lagunaLmHeadInlineMaskEnabled {
@@ -1738,6 +2220,15 @@ final class LagunaLmHeadPruner {
         self.int6CodesLo = nil
         self.int6CodesHi = nil
         self.int6Scales = nil
+        self.int5CodesLo = nil
+        self.int5CodesHi = nil
+        self.int5Scales = nil
+        if lagunaTraceFusionEnabled {
+            FileHandle.standardError.write(
+                Data(
+                    "fusion inactive: lmhead-int5-prescreen (int6 arm inactive)\n"
+                        .utf8))
+        }
         // The repo's own quantizer (ops.cpp fp_quantize gs32/bits8 ->
         // fp_quantized.h fp_quantize kernel): e8m0 group scale = 2^round(log2(
         // gmax/448)), e4m3 elements of w/sd. Returns (wq uint32 viewed as
@@ -1800,6 +2291,67 @@ final class LagunaLmHeadPruner {
         return (lo, hi, sdByte.asType(.uint8))
     }
 
+    /// Builds the INT5 prescreen planes (untimed init).
+    ///
+    /// Scale rule: for each 32-element group with gmax = max|w|, sd5 = 2^e
+    /// with e = floor_exp(gmax) - 3, bumped by one when the gmax mantissa is
+    /// >= 1.9375, so that gmax/sd5 < 15.5 EXACTLY. Then q5 = round(w/sd5)
+    /// (the quotient is exact: sd5 is a power of two) satisfies |q5| <= 15
+    /// and |w - sd5*q5| <= sd5/2 exactly -- the flat half-cell the stage-1
+    /// kernel's d-term uses. The no-overflow property is additionally
+    /// verified here on the actual tensor; on violation the caller DISABLES
+    /// the prescreen (the int6 single-stage path runs unchanged).
+    private static func buildInt5Planes(
+        _ lmHeadWeight: MLXArray
+    ) -> (lo: MLXArray, hi: MLXArray, scales: MLXArray)? {
+        let vocab = lagunaLmHeadPruneVocab
+        let hidden = lagunaLmHeadPruneHidden
+        let w = lmHeadWeight.asType(.float32).reshaped([vocab, hidden / 32, 32])
+        let gmax = MLX.abs(w).max(axis: 2)  // [V, 64] float32, contiguous
+        let gbits = gmax.view(dtype: .uint32)
+        let biasedE = (gbits >> 23).asType(.int32)
+        let mant = gbits & MLXArray(UInt32(0x007F_FFFF))
+        // bump when mantissa >= 0.9375 * 2^23 (i.e. m >= 15.5/8).
+        let bump = (mant .>= MLXArray(UInt32(0x78_0000))).asType(.int32)
+        let sdByte = clip(biasedE - 3 + bump, min: 0, max: 255)
+        let sd = which(
+            sdByte .== 0,
+            MLXArray(Float(bitPattern: 0x0040_0000)),  // 2^-127, e8m0 semantics
+            (sdByte.asType(.uint32) << 23).view(dtype: .float32))
+        let q = (w / sd.expandedDimensions(axis: 2)).round()
+        // Init-time certificate guard: no code may leave [-15, 15].
+        let maxCode = MLX.abs(q).max().item(Float.self)
+        guard maxCode <= 15.0 else {
+            FileHandle.standardError.write(
+                Data(
+                    "mlxfast: lm_head int5 prescreen: code overflow (\(maxCode)); prescreen disabled\n"
+                        .utf8))
+            return nil
+        }
+        // Offset-binary u5 = q5 + 16 in [1, 31]; planar-pack 4+1 bits.
+        let u = (q + 16).asType(.uint8).reshaped([vocab, hidden])
+        let u16 = u.view(dtype: .uint16)  // [V, 1024]: elem 2b low byte
+        let lo =
+            ((u16 & MLXArray(UInt16(0x000F)))
+            | ((u16 >> 4) & MLXArray(UInt16(0x00F0)))).asType(.uint8)
+        let u32 = u.view(dtype: .uint32)  // [V, 512]: elem 4b low byte
+        // 1-bit plane: bit 4 of each element, 8 elements per byte, element j
+        // at bit j. First gather each uint32's four bit-4s (element k's byte
+        // sits at bits 8k..8k+7, so its bit 4 is bit 8k+4) into bits 0..3,
+        // then merge adjacent half-bytes through a uint16 view exactly like
+        // the nibble plane's byte merge.
+        let h4 =
+            (((u32 >> 4) & MLXArray(UInt32(0x01)))
+            | ((u32 >> 11) & MLXArray(UInt32(0x02)))
+            | ((u32 >> 18) & MLXArray(UInt32(0x04)))
+            | ((u32 >> 25) & MLXArray(UInt32(0x08)))).asType(.uint8)
+        let h16 = h4.view(dtype: .uint16)  // [V, 256]: half-byte 2b low byte
+        let hi =
+            ((h16 & MLXArray(UInt16(0x000F)))
+            | ((h16 >> 4) & MLXArray(UInt16(0x00F0)))).asType(.uint8)
+        return (lo, hi, sdByte.asType(.uint8))
+    }
+
     /// Pruned final-row lm_head: full [vocab] BF16 logits row, bit-identical to
     /// the stock pass in every candidate slot and certified-below elsewhere,
     /// so the downstream argmax emits the stock token.
@@ -1825,9 +2377,94 @@ final class LagunaLmHeadPruner {
             (useInt6 || (lagunaLmHeadInlineMaskEnabled && !useCoarseV1))
             && lagunaLmHeadRatioBoundEnabled && lagunaLmHeadDeltaBF16Enabled
 
+        // Two-stage INT5 prescreen (DARKBLOOM_LMHEAD_INT5_PRESCREEN, default
+        // ON). Taken ONLY when the int6 arm is active, the ratio-bound +
+        // delta-bf16 selectors are on (useDeltaBF16), and the INT5 planes
+        // built at init (they are built only under exactly those selectors,
+        // so their presence implies the flag and arm). Every other flag
+        // combination falls through to the shipped code below byte-for-byte.
+        //
+        // Chain: int5 coarse over all rows (1344 B/row) -> lower-max ->
+        // threshold (thr5) -> int6 re-screen over stage-1 survivors only ->
+        // lower-max -> threshold (thr6) -> two-stage exact pass. The
+        // lower-max/threshold pair is REUSED verbatim on both stages (it is
+        // shape-generic over a [V] f32 coarse plus [V] bf16 delta); on stage
+        // 2 the -inf/0 sentinel rows contribute -inf - 0 = -inf and never win
+        // the max, and L6 is a valid lower bound on the true max logit
+        // because the true argmax row IS a stage-1 survivor (stage-1
+        // certificate) and every survivor's coarse6 - delta6 is <= its true
+        // logit (int6 certificate). Dispatches go 5 -> 7; bytes, which are
+        // what the decode wall prices, drop by ~24 MB/token.
+        if useInt6, useDeltaBF16,
+            let lo5 = int5CodesLo, let hi5 = int5CodesHi, let s5 = int5Scales,
+            let lo6 = int6CodesLo, let hi6 = int6CodesHi, let s6 = int6Scales
+        {
+            // Stage 1: INT5 coarse pass over all rows, same launch geometry
+            // as the int6 v4 coarse kernel.
+            let coarse5Out = lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel(
+                [x, lo5, hi5, s5],
+                grid: (vocab / 16 * 512, 1, 1),
+                threadGroup: (512, 1, 1),
+                outputShapes: [[vocab], [vocab]],
+                outputDTypes: [.float32, .bfloat16]
+            )
+            let coarse5 = coarse5Out[0]
+            let delta5 = coarse5Out[1]
+            let partials5 = lagunaLmHeadLowerMaxStage1DeltaBF16Kernel(
+                [coarse5, delta5],
+                grid: (224, 128, 1),
+                threadGroup: (224, 1, 1),
+                outputShapes: [[128]],
+                outputDTypes: [.float32]
+            )[0]
+            let thr5 = lagunaLmHeadLowerMaxThresholdKernel(
+                [partials5],
+                grid: (32, 1, 1),
+                threadGroup: (32, 1, 1),
+                outputShapes: [[1]],
+                outputDTypes: [.float32]
+            )[0]
+            // Stage 2: int6 re-screen; non-survivors skip the int6 planes.
+            let coarse6Out = lagunaLmHeadInt6RescreenKernel(
+                [x, lo6, hi6, s6, coarse5, delta5, thr5],
+                grid: (vocab / 16 * 512, 1, 1),
+                threadGroup: (512, 1, 1),
+                outputShapes: [[vocab], [vocab]],
+                outputDTypes: [.float32, .bfloat16]
+            )
+            let coarse6 = coarse6Out[0]
+            let delta6 = coarse6Out[1]
+            let partials6 = lagunaLmHeadLowerMaxStage1DeltaBF16Kernel(
+                [coarse6, delta6],
+                grid: (224, 128, 1),
+                threadGroup: (224, 1, 1),
+                outputShapes: [[128]],
+                outputDTypes: [.float32]
+            )[0]
+            let thr6 = lagunaLmHeadLowerMaxThresholdKernel(
+                [partials6],
+                grid: (32, 1, 1),
+                threadGroup: (32, 1, 1),
+                outputShapes: [[1]],
+                outputDTypes: [.float32]
+            )[0]
+            // Exact pass with the three-way slot selection; one threadgroup
+            // per 32 output rows, one owning lane per slot, as shipped.
+            let assembled = lagunaLmHeadExactTwoStageKernel(
+                [coarse5, delta5, thr5, coarse6, delta6, thr6, lmHeadWeight, x],
+                grid: (vocab / 32 * 256, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[vocab]],
+                outputDTypes: [.bfloat16]
+            )[0]
+            return assembled.reshaped([1, 1, vocab])
+        }
+
         // The shipped INT6 + ratio-bound + BF16-delta arm is the only consumer
         // in this atomic experiment. Every other arm reaches its accepted
-        // kernel without paying for the producer dispatch.
+        // kernel without paying for the producer dispatch. When the INT5
+        // prescreen takes the arm above it returns before this producer, so
+        // the prescreen path never dispatches it.
         let absGroupSums: MLXArray? =
             if useInt6, useDeltaBF16, lagunaLmHeadPrecomputeAbsGroupsEnabled {
                 lagunaLmHeadAbsGroupSumsKernel(
