@@ -144,6 +144,27 @@ private let lagunaLmHeadInlineMaskEnabled =
 private let lagunaLmHeadCoarseV4Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COARSE_V4"] != "0"
 
+/// v5 coarse copy (D5): replaces the v4 planar int6 copy with a planar-packed
+/// symmetric int5 copy (nibble plane + 1-bit plane + e8m0-style power-of-two
+/// group scales, 1344 B/row vs v4's 1600 B/row and MXFP8's 2112 B/row, -36.4%
+/// coarse bytes vs MXFP8). The certificate is the v4 chain with the constants
+/// halved: codes are u = q + 16, q = round(w/sd) in [-15, 15], sd = 2^e chosen
+/// at init so gmax/sd < 15.5 (no clamp; verified at init), so
+/// |w_ij - sd*q_ij| <= sd/2 EXACTLY and the flat half-cell still holds. The
+/// ratio bound becomes m <= 30*d (2*|q| <= 30), hence
+/// delta = d*(1 + 61*gamma) with `(1+gamma) + 30*(2*gamma) == 1 + 61*gamma`
+/// bit-for-bit in FP32 (61*2^-15 spans 16 significand bits, inside FP32's 24).
+/// The downstream lower-max/threshold/exact-mask machinery is untouched; the
+/// exact pass still recomputes every candidate row with the textual stock
+/// BF16 GEMV, so the emitted token stays the stock token.
+/// DEFAULT ON; set `DARKBLOOM_LMHEAD_COARSE_V5=0` to restore the v4 int6
+/// copy. Nested inside the v4 arm (requires inline mask) AND inside the ratio
+/// bound: with `DARKBLOOM_LMHEAD_RATIO_BOUND=0` the init declines v5 and the
+/// v4 int6 copy builds instead, so every OFF arm reaches text that predates
+/// this change.
+private let lagunaLmHeadCoarseV5Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COARSE_V5"] != "0"
+
 /// One-line stderr trace hooks (DARKBLOOM_TRACE_FUSION=1) so a silently
 /// declining v4 guard is visible in run logs.
 private let lagunaTraceFusionEnabled =
@@ -1081,7 +1102,204 @@ private let lagunaLmHeadInt6CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKerne
     ensureRowContiguous: true
 )
 
-/// Same-binary A/B selector for the coarse kernel (v2 default).
+/// v5 coarse pass over the planar int5 copy (DARKBLOOM_LMHEAD_COARSE_V5=1,
+/// default ON). Same launch geometry as the v4 int6 kernels (16
+/// rows/threadgroup, one simdgroup per row, lane = 2 consecutive 32-element
+/// groups), same fused coarse+delta outputs, 1344 B/row read instead of 1600.
+///
+/// The kernel text is the v4 int6 ratio-bound kernel's with exactly three
+/// format deltas: the 1-bit plane replaces the 2-bit plane (one uint per
+/// 32-element group instead of two), the offset-binary decode is
+/// `u - 16` instead of `u - 32`, and the closed-form epilogue is
+/// `d*(1 + 61*gamma)` instead of `d*(1 + 125*gamma)`. The lane partition, the
+/// `gg`/`w`/`k` loop order and unrolls, the nibble-plane decode, the bf16
+/// `x` decode, the FP32 accumulation, the `sd_g` handling and the two 32-lane
+/// `simd_sum`s are all textually unchanged, so `c_acc` and `d_acc` are the
+/// v4 kernel's arithmetic over a finer grid.
+///
+/// Certificate (the int5 twin of the int6 ratio-bound argument above):
+///   * Codes. The planes carry `u` in five bits and the kernel decodes
+///     `q = u - 16`. `buildInt5Planes` picks `sd = 2^e` so that
+///     `gmax/sd < 15.5` and then VERIFIES `max|q| <= 15` on the actual tensor,
+///     declining to the v4 int6 copy if that ever fails. There is no clamp,
+///     so the guard is what establishes the range: `|q| <= 15` for every
+///     element the kernel can ever decode.
+///   * Per element. The `m` term contributes `sd*|x_j|*|q_ij|` and the `d`
+///     term contributes `(0.5*sd)*|x_j|` -- the SAME elements under the SAME
+///     positive power-of-two group scale `sd_g`. Their ratio is exactly
+///     `2*|q_ij| <= 30`, so the inequality lifts termwise to the row sums:
+///     `m_i <= 30*d_i`.
+///   * Substitution. `d_i*(1+gamma) + 2*gamma*m_i <= d_i*(1 + gamma +
+///     60*gamma) = d_i*(1 + 61*gamma)`, and the two scalars agree exactly in
+///     FP32: `(1+gamma) + 30*(2*gamma) == 1 + 61*gamma` bit-for-bit
+///     (`61*2^-15` spans 16 significand bits, well inside FP32's 24).
+///
+/// Widening `delta` is always safe by the same monotonicity argument as the
+/// int6 arm: candidacy is monotone in delta, so the exact pass's candidate
+/// set can only GROW, and a newly admitted row is written with the
+/// stock-exact GEMV value, which cannot move the argmax.
+///
+/// Decode exactness: float4(uint4) of values <= 31 and the -16.0f offset are
+/// exact; sd*q multiplies a power of two by a <=4-bit integer float: exact.
+private let lagunaLmHeadInt5CoarseRatioBoundKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_int5_inline_coarse_ratio_bound_v5",
+    inputNames: ["x", "codes_lo", "codes_hi", "scales"],
+    outputNames: ["coarse", "delta"],
+    source: """
+        constexpr float GAMMA = 0x1p-15f;
+
+        uint row = threadgroup_position_in_grid.x * 16 +
+            simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        const device uint8_t* lorow = codes_lo + size_t(row) * 1024;
+        const device uint8_t* hirow = codes_hi + size_t(row) * 256;
+        const device uint8_t* srow = scales + size_t(row) * 64;
+
+        float c_acc = 0.0f;
+        float d_acc = 0.0f;
+        for (uint gg = 0; gg < 2; ++gg) {
+            uint g = 2 * lane + gg;
+            float sd = laguna_e8m0_decode(srow[g]);
+            uint4 lo4 = ((const device uint4*)(lorow + g * 16))[0];
+            // 1-bit plane: one uint per 32-element group, bit i = element i.
+            uint hb = ((const device uint*)(hirow + g * 4))[0];
+            const device ushort4* xrow = (const device ushort4*)(x + g * 32);
+            float cg = 0.0f;
+            float ag = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint w = 0; w < 4; ++w) {
+                // Word w: elements 8w..8w+7 of the group. Nibble plane byte
+                // b holds elements 2b (low) / 2b+1 (high); 1-bit plane bit
+                // i holds element i of the group.
+                uint lw = lo4[w];
+                uint4 ne = (uint4(lw) >> uint4(0u, 8u, 16u, 24u)) & 15u;
+                uint4 no = (uint4(lw) >> uint4(4u, 12u, 20u, 28u)) & 15u;
+                uint4 he = (uint4(hb) >> uint4(
+                    8u * w + 0u, 8u * w + 2u, 8u * w + 4u, 8u * w + 6u)) & 1u;
+                uint4 ho = (uint4(hb) >> uint4(
+                    8u * w + 1u, 8u * w + 3u, 8u * w + 5u, 8u * w + 7u)) & 1u;
+                // Offset-binary decode: value = u - 16 in [-15, 15], exact.
+                float4 ve = float4(ne | (he << 4u)) - 16.0f;
+                float4 vo = float4(no | (ho << 4u)) - 16.0f;
+                // bf16 -> f32 is exactly bits<<16 for every value class.
+                float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
+                float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
+                float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
+                float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
+                float4 axe = metal::abs(xe);
+                float4 axo = metal::abs(xo);
+                #pragma clang loop unroll(full)
+                for (uint k = 0; k < 4; ++k) {
+                    cg += xe[k] * ve[k];
+                    cg += xo[k] * vo[k];
+                    ag += axe[k];
+                    ag += axo[k];
+                }
+            }
+            c_acc += sd * cg;
+            d_acc += (0.5f * sd) * ag;
+        }
+        c_acc = simd_sum(c_acc);
+        d_acc = simd_sum(d_acc);
+        if (lane == 0) {
+            coarse[row] = c_acc;
+            delta[row] = d_acc * (1.0f + 61.0f * GAMMA);
+        }
+        """,
+    header: lagunaLmHeadPruneHeader,
+    ensureRowContiguous: true
+)
+
+/// The shipped default on the v5 arm: the int5 ratio-bound coarse kernel with
+/// `delta` narrowed to BF16 (`DARKBLOOM_LMHEAD_DELTA_BF16`, default ON, nested
+/// inside the ratio bound). Everything above the epilogue is a TEXTUAL copy of
+/// the kernel directly above -- same lane partition, same loop order, same
+/// plane decode, same FP32 accumulation, same `sd_g` handling, same two
+/// `simd_sum`s -- so `coarse` and the FP32 bound `d_acc * (1 + 61*GAMMA)` are
+/// bit-identical to that kernel's; only the store narrows, with the same
+/// round-toward-+infinity bit surgery the int6 twin uses (same sign-clear
+/// argument: `d_acc` is a sum of products of `|x_j|` and positive powers of
+/// two). Downstream this reuses the SAME narrowed-delta consumers as every
+/// other arm -- `lagunaLmHeadLowerMaxStage1DeltaBF16Kernel` and
+/// `lagunaLmHeadInlineExactDeltaBF16Kernel` -- so one arm selection still
+/// implies one `delta` dtype for every reader.
+private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_int5_inline_coarse_ratio_bound_delta_bf16_v5",
+    inputNames: ["x", "codes_lo", "codes_hi", "scales"],
+    outputNames: ["coarse", "delta"],
+    source: """
+        constexpr float GAMMA = 0x1p-15f;
+
+        uint row = threadgroup_position_in_grid.x * 16 +
+            simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        const device uint8_t* lorow = codes_lo + size_t(row) * 1024;
+        const device uint8_t* hirow = codes_hi + size_t(row) * 256;
+        const device uint8_t* srow = scales + size_t(row) * 64;
+
+        float c_acc = 0.0f;
+        float d_acc = 0.0f;
+        for (uint gg = 0; gg < 2; ++gg) {
+            uint g = 2 * lane + gg;
+            float sd = laguna_e8m0_decode(srow[g]);
+            uint4 lo4 = ((const device uint4*)(lorow + g * 16))[0];
+            // 1-bit plane: one uint per 32-element group, bit i = element i.
+            uint hb = ((const device uint*)(hirow + g * 4))[0];
+            const device ushort4* xrow = (const device ushort4*)(x + g * 32);
+            float cg = 0.0f;
+            float ag = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint w = 0; w < 4; ++w) {
+                // Word w: elements 8w..8w+7 of the group. Nibble plane byte
+                // b holds elements 2b (low) / 2b+1 (high); 1-bit plane bit
+                // i holds element i of the group.
+                uint lw = lo4[w];
+                uint4 ne = (uint4(lw) >> uint4(0u, 8u, 16u, 24u)) & 15u;
+                uint4 no = (uint4(lw) >> uint4(4u, 12u, 20u, 28u)) & 15u;
+                uint4 he = (uint4(hb) >> uint4(
+                    8u * w + 0u, 8u * w + 2u, 8u * w + 4u, 8u * w + 6u)) & 1u;
+                uint4 ho = (uint4(hb) >> uint4(
+                    8u * w + 1u, 8u * w + 3u, 8u * w + 5u, 8u * w + 7u)) & 1u;
+                // Offset-binary decode: value = u - 16 in [-15, 15], exact.
+                float4 ve = float4(ne | (he << 4u)) - 16.0f;
+                float4 vo = float4(no | (ho << 4u)) - 16.0f;
+                // bf16 -> f32 is exactly bits<<16 for every value class.
+                float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
+                float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
+                float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
+                float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
+                float4 axe = metal::abs(xe);
+                float4 axo = metal::abs(xo);
+                #pragma clang loop unroll(full)
+                for (uint k = 0; k < 4; ++k) {
+                    cg += xe[k] * ve[k];
+                    cg += xo[k] * vo[k];
+                    ag += axe[k];
+                    ag += axo[k];
+                }
+            }
+            c_acc += sd * cg;
+            d_acc += (0.5f * sd) * ag;
+        }
+        c_acc = simd_sum(c_acc);
+        d_acc = simd_sum(d_acc);
+        if (lane == 0) {
+            coarse[row] = c_acc;
+            // Same FP32 bound as the kernel above, then rounded UP to BF16.
+            float d_up = d_acc * (1.0f + 61.0f * GAMMA);
+            uint dbits = as_type<uint>(d_up);
+            uint dtrunc = dbits & 0xFFFF0000u;
+            if (dtrunc != dbits) {
+                dtrunc += 0x00010000u;
+            }
+            delta[row] = as_type<bfloat>(ushort(dtrunc >> 16));
+        }
+        """,
+    header: lagunaLmHeadPruneHeader,
+    ensureRowContiguous: true
+)
 private let lagunaLmHeadCoarseUseV1 =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COARSE"] == "v1"
 
@@ -1573,11 +1791,20 @@ final class LagunaLmHeadPruner {
     let int6CodesLo: MLXArray?
     let int6CodesHi: MLXArray?
     let int6Scales: MLXArray?
+    /// v5 planar int5 coarse copy (DARKBLOOM_LMHEAD_COARSE_V5=1): nibble
+    /// plane [V, 1024], 1-bit plane [V, 256], power-of-two scale bytes
+    /// [V, 64] (same e8m0 byte semantics as v4).
+    let int5CodesLo: MLXArray?
+    let int5CodesHi: MLXArray?
+    let int5Scales: MLXArray?
 
     /// The resident coarse-copy arrays of the ACTIVE arm, for the untimed
     /// init-time eval in `prepareFusedRuntimeWeights` (the shipped call named
-    /// `codes`/`scales` directly, which are nil under v4).
+    /// `codes`/`scales` directly, which are nil under v4/v5).
     var residentArrays: [MLXArray] {
+        if let lo = int5CodesLo, let hi = int5CodesHi, let s5 = int5Scales {
+            return [lo, hi, s5]
+        }
         if let lo = int6CodesLo, let hi = int6CodesHi, let s6 = int6Scales {
             return [lo, hi, s6]
         }
@@ -1592,6 +1819,36 @@ final class LagunaLmHeadPruner {
                 Data("mlxfast: lm_head prune: unrecognized lm_head shape/dtype; disabled\n".utf8))
             return nil
         }
+        if lagunaLmHeadCoarseV5Enabled, lagunaLmHeadCoarseV4Enabled,
+            lagunaLmHeadInlineMaskEnabled, lagunaLmHeadRatioBoundEnabled,
+            let planes5 = LagunaLmHeadPruner.buildInt5Planes(lmHeadWeight)
+        {
+            // v5: the int5 copy replaces the v4 int6 copy entirely on this arm.
+            self.int5CodesLo = planes5.lo
+            self.int5CodesHi = planes5.hi
+            self.int5Scales = planes5.scales
+            self.int6CodesLo = nil
+            self.int6CodesHi = nil
+            self.int6Scales = nil
+            self.codes = nil
+            self.scales = nil
+            if lagunaTraceFusionEnabled {
+                FileHandle.standardError.write(
+                    Data("fusion active: lmhead-int5-coarse-v5\n".utf8))
+            }
+            return
+        }
+        if lagunaLmHeadCoarseV5Enabled, lagunaLmHeadCoarseV4Enabled,
+            lagunaLmHeadInlineMaskEnabled, !lagunaLmHeadRatioBoundEnabled
+        {
+            FileHandle.standardError.write(
+                Data(
+                    "mlxfast: lm_head coarse v5 ignored (ratio bound disabled); using v4\n"
+                        .utf8))
+        }
+        self.int5CodesLo = nil
+        self.int5CodesHi = nil
+        self.int5Scales = nil
         if lagunaLmHeadCoarseV4Enabled, lagunaLmHeadInlineMaskEnabled,
             let planes = LagunaLmHeadPruner.buildInt6Planes(lmHeadWeight)
         {
@@ -1678,6 +1935,68 @@ final class LagunaLmHeadPruner {
         return (lo, hi, sdByte.asType(.uint8))
     }
 
+    /// Builds the v5 planar int5 copy (untimed init).
+    ///
+    /// Scale rule: for each 32-element group with gmax = max|w|, sd = 2^e
+    /// with e = floor_exp(gmax) - 3, bumped by one when the gmax mantissa m
+    /// is >= 1.9375 (mantissa FIELD >= 0.9375 * 2^23 = 0x780000, since the
+    /// field stores m - 1), so that gmax/sd < 15.5 EXACTLY: without the bump
+    /// gmax/sd < 2^(e+1)/2^(floor_exp-3) = 16, and with it gmax/sd < 8.
+    /// Then q = round(w/sd) (the quotient is exact: sd is a power of two)
+    /// satisfies |q| <= 15 and |w - sd*q| <= sd/2 exactly -- the flat
+    /// half-cell the kernel's d-term uses. The no-overflow property is
+    /// additionally verified here on the actual tensor; on violation the
+    /// pruner falls back to the v4 int6 copy.
+    ///
+    /// Plane layout: the nibble plane is identical to v4's (u & 15); the
+    /// 1-bit plane packs bit 4 of u (u in [1, 31]), one bit per element,
+    /// bit i of each 32-bit group word = element i of the group.
+    private static func buildInt5Planes(
+        _ lmHeadWeight: MLXArray
+    ) -> (lo: MLXArray, hi: MLXArray, scales: MLXArray)? {
+        let vocab = lagunaLmHeadPruneVocab
+        let hidden = lagunaLmHeadPruneHidden
+        let w = lmHeadWeight.asType(.float32).reshaped([vocab, hidden / 32, 32])
+        let gmax = MLX.abs(w).max(axis: 2)  // [V, 64] float32, contiguous
+        let gbits = gmax.view(dtype: .uint32)
+        let biasedE = (gbits >> 23).asType(.int32)
+        let mant = gbits & MLXArray(UInt32(0x007F_FFFF))
+        // bump when mantissa m >= 1.9375 (i.e. m >= 15.5/8), so gmax/sd < 15.5.
+        let bump = (mant .>= MLXArray(UInt32(0x78_0000))).asType(.int32)
+        let sdByte = clip(biasedE - 3 + bump, min: 0, max: 255)
+        let sd = which(
+            sdByte .== 0,
+            MLXArray(Float(bitPattern: 0x0040_0000)),  // 2^-127, e8m0 semantics
+            (sdByte.asType(.uint32) << 23).view(dtype: .float32))
+        let q = (w / sd.expandedDimensions(axis: 2)).round()
+        // Init-time certificate guard: no code may leave [-15, 15].
+        let maxCode = MLX.abs(q).max().item(Float.self)
+        guard maxCode <= 15.0 else {
+            FileHandle.standardError.write(
+                Data(
+                    "mlxfast: lm_head coarse v5: int5 code overflow (\(maxCode)); using v4 int6\n"
+                        .utf8))
+            return nil
+        }
+        // Offset-binary u = q + 16 in [1, 31]; planar-pack 4+1 bits.
+        let u = (q + 16).asType(.uint8).reshaped([vocab, hidden])
+        let u16 = u.view(dtype: .uint16)  // [V, 1024]: elem 2b low byte
+        let lo =
+            ((u16 & MLXArray(UInt16(0x000F)))
+            | ((u16 >> 4) & MLXArray(UInt16(0x00F0)))).asType(.uint8)
+        let u64 = u.view(dtype: .uint64)  // [V, 256]: elem 8b+k at byte k, bit 4
+        let hi =
+            (((u64 >> 4) & MLXArray(UInt64(0x01)))
+            | ((u64 >> 11) & MLXArray(UInt64(0x02)))
+            | ((u64 >> 18) & MLXArray(UInt64(0x04)))
+            | ((u64 >> 25) & MLXArray(UInt64(0x08)))
+            | ((u64 >> 32) & MLXArray(UInt64(0x10)))
+            | ((u64 >> 39) & MLXArray(UInt64(0x20)))
+            | ((u64 >> 46) & MLXArray(UInt64(0x40)))
+            | ((u64 >> 53) & MLXArray(UInt64(0x80)))).asType(.uint8)
+        return (lo, hi, sdByte.asType(.uint8))
+    }
+
     /// Pruned final-row lm_head: full [vocab] BF16 logits row, bit-identical to
     /// the stock pass in every candidate slot and certified-below elsewhere,
     /// so the downstream argmax emits the stock token.
@@ -1697,14 +2016,33 @@ final class LagunaLmHeadPruner {
         // only the two nested selectors. Either way this single flag drives the
         // coarse store AND both downstream readers, so one arm selection always
         // means one `delta` dtype.
+        let useInt5 =
+            int5CodesLo != nil && int5CodesHi != nil && int5Scales != nil
         let useInt6 =
-            int6CodesLo != nil && int6CodesHi != nil && int6Scales != nil
+            !useInt5 && int6CodesLo != nil && int6CodesHi != nil
+                && int6Scales != nil
         let useDeltaBF16 =
-            (useInt6 || (lagunaLmHeadInlineMaskEnabled && !useCoarseV1))
+            (useInt5 || useInt6 || (lagunaLmHeadInlineMaskEnabled && !useCoarseV1))
             && lagunaLmHeadRatioBoundEnabled && lagunaLmHeadDeltaBF16Enabled
 
         let coarseOut: [MLXArray]
-        if let lo = int6CodesLo, let hi = int6CodesHi, let s6 = int6Scales {
+        if let lo = int5CodesLo, let hi = int5CodesHi, let s5 = int5Scales {
+            // v5 int5 coarse pass: 16 rows per threadgroup like pack16. The
+            // v5 arm is nested inside the ratio bound (init declines it under
+            // DARKBLOOM_LMHEAD_RATIO_BOUND=0), so it carries only the
+            // delta-narrowing selector.
+            let coarseKernel: MLXFast.MLXFastKernel =
+                useDeltaBF16
+                ? lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel
+                : lagunaLmHeadInt5CoarseRatioBoundKernel
+            coarseOut = coarseKernel(
+                [x, lo, hi, s5],
+                grid: (vocab / 16 * 512, 1, 1),
+                threadGroup: (512, 1, 1),
+                outputShapes: [[vocab], [vocab]],
+                outputDTypes: [.float32, useDeltaBF16 ? .bfloat16 : .float32]
+            )
+        } else if let lo = int6CodesLo, let hi = int6CodesHi, let s6 = int6Scales {
             // v4 int6 coarse pass: 16 rows per threadgroup like pack16.
             let coarseKernel: MLXFast.MLXFastKernel =
                 if useDeltaBF16 {
