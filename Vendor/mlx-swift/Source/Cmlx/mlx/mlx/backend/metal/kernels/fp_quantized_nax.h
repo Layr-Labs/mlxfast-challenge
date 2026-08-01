@@ -299,32 +299,11 @@ struct QuantizedBlockLoader {
     stage();
   }
 
-  // DARKBLOOM_STAGE_WIDEST / DARKBLOOM_STAGE_WIDELD.
-  //
-  // BIT-EXACTNESS. This writes exactly the same values to exactly the same
-  // threadgroup addresses as load_unsafe(), decoded from exactly the same
-  // source bytes with exactly the same scale for every element. NO FLOAT
-  // ARITHMETIC IS TOUCHED AT ALL -- only the *width* of the device loads and
-  // the threadgroup stores changes. The per-element expression is character
-  // for character the one in dequantize<T, 4>:
-  //     scale * Dequantize<4, T>{}(byte)        (low nibble)
-  //     scale * Dequantize<4, T>{}(byte >> 4)   (high nibble)
-  // so this is a strictly stronger exactness class than a barrier removal:
-  // there is no reassociation, no accumulation-order change, and no rounding
-  // boundary anywhere in the diff.
-  //
-  // ALIGNMENT IS A CORRECTNESS PRECONDITION, NOT AN ASSUMPTION. A misaligned
-  // wide access is silent corruption, not a fault, so the preconditions are
-  // split between the two places that can actually see them:
-  //   * the HOST checks what only it knows -- the weight buffer's own byte
-  //     offset, the per-expert stride, and the tile column base (see
-  //     darkbloom_stage_wide_load_ok in quantized.cpp),
-  //   * this loader checks what only it knows -- each thread's own offset
-  //     within the tile, below, using integer arithmetic on the same
-  //     expressions the constructor used (no pointer-to-integer casts, which
-  //     MSL does not provide for threadgroup addresses).
-  // If any precondition fails the thread runs the untouched scalar path, so
-  // an unexpected shape degrades to today's code rather than corrupting.
+  // Wide staging: identical values at identical threadgroup addresses, decoded
+  // from identical source bytes with identical scales. No float arithmetic
+  // changes -- only access WIDTH. Alignment is a checked precondition: the host
+  // certifies base/stride/column-step, this loader checks each thread's own
+  // offset, and any failure runs the untouched scalar path.
 
   // Elements per 16B threadgroup store, and how many such stores cover the
   // 32 contiguous elements this thread owns.
@@ -1596,7 +1575,9 @@ template <
     const int fixed_K = 0,
     const int fixed_N = 0,
     typename Wtype = bfloat,
-    int tg_expert_groups = 64>
+    int tg_expert_groups = 64,
+    bool wide_store = false,
+    bool wide_load = false>
 [[kernel]] void fp_gather_qmm_rhs_expert_nax(
     const device T* x,
     const device uint32_t* w,
@@ -1884,7 +1865,19 @@ template <
 
       for (int k = 0; k < K_it; ++k) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_w.load_unsafe();
+        // DARKBLOOM_EXPERT_STAGE_WIDEST / DARKBLOOM_EXPERT_STAGE_WIDELD:
+        // same bytes, same addresses, same nibble decode, same scale mapping
+        // -- only the access widths change (16 scalar 2B threadgroup stores
+        // -> 2 16B stores per thread; 8 scalar 1B device loads -> 1 8B load
+        // per thread). See load_unsafe_wide. The store side needs no host
+        // certification (Ws is 16B aligned by construction); the load side
+        // is host-certified via darkbloom_stage_wide_load_ok and per-thread
+        // self-guarded, falling back to the scalar path on any misalignment.
+        if constexpr (wide_store || wide_load) {
+          loader_w.template load_unsafe_wide<wide_store, wide_load>();
+        } else {
+          loader_w.load_unsafe();
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg_active) {

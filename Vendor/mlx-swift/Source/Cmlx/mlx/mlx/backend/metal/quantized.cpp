@@ -1287,6 +1287,27 @@ bool darkbloom_expert_aligned_gather() {
   return v;
 }
 
+// DARKBLOOM_EXPERT_STAGE_WIDEST (default ON; "0" = A/B control): 16B
+// threadgroup stores in the expert-aligned gather QMM loader. Store side only;
+// Ws is 16B aligned by construction and every thread's dst offset is a multiple
+// of 16 at the shipped geometry. Same bytes, same addresses, same decode.
+bool darkbloom_expert_stage_widest() {
+  static const bool v =
+      env::get_var("DARKBLOOM_EXPERT_STAGE_WIDEST", "") != "0";
+  return v;
+}
+
+// DARKBLOOM_EXPERT_STAGE_WIDELD (default ON; "0" = A/B control): one 8B device
+// load per thread instead of 8 scalar byte loads. Host-certified via
+// darkbloom_stage_wide_load_ok (its 16B conditions are strictly stronger than
+// the 8B ones needed); the kernel self-guards each thread's offset and falls
+// back to the scalar path rather than corrupting.
+bool darkbloom_expert_stage_wideld() {
+  static const bool v =
+      env::get_var("DARKBLOOM_EXPERT_STAGE_WIDELD", "") != "0";
+  return v;
+}
+
 // DARKBLOOM_EXPERT_GATHER_GROUPS (default 128; "64" restores the promoted
 // four-experts-per-threadgroup schedule and "256" selects one expert per
 // threadgroup, both kept as A/B controls): how many threadgroups the
@@ -1581,6 +1602,14 @@ void gather_qmm_rhs_nax(
   // darkbloom_expert_gather_groups), so each setting compiles exactly one
   // pipeline for the process lifetime.
   const int egroups = darkbloom_expert_gather_groups();
+  const bool expert_widest = expert_aligned && darkbloom_expert_stage_widest();
+  // Certified per weight bank; the banks are prepared once at init and
+  // retained, so each bank's certification -- and therefore its kernel name
+  // -- is stable for the process lifetime, and warmup compiles both
+  // pipelines before the first scored request.
+  const bool expert_wideld = expert_aligned &&
+      darkbloom_expert_stage_wideld() &&
+      darkbloom_stage_wide_load_ok(w, transpose, bits, N, K, bn);
 
   // DARKBLOOM_STAGE2_GATHER ground truth at the DISPATCH site. The define
   // itself is injected at JIT assembly (jit_kernels.cpp, expert kernels
@@ -1670,7 +1699,10 @@ void gather_qmm_rhs_nax(
       static_expert_shape
           ? ("_k_" + std::to_string(K) + "_n_" + std::to_string(N))
           : "",
-      expert_aligned ? ("_eg_" + std::to_string(egroups)) : "");
+      expert_aligned
+          ? ("_eg_" + std::to_string(egroups) + (expert_widest ? "_ws_1" : "_ws_0") +
+             (expert_wideld ? "_wl_1" : "_wl_0"))
+          : "");
 
   // Skipping dead runs is a pure work elision (see function constant 203 in
   // fp_quantized_nax): it drops only matmuls whose results store_slice never
@@ -1706,8 +1738,9 @@ void gather_qmm_rhs_nax(
       fprintf(
           stderr,
           "mlxfast: stage active: widest=%d wideld=%d(req=%d wide_ok=%d) "
-          "runbar=%d novol=%d expert=%d bm128=%d bm=%d wm=%d wn=%d "
-          "w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d\n",
+          "runbar=%d novol=%d expert=%d expert_ws=%d expert_wl=%d bm128=%d "
+          "bm=%d wm=%d wn=%d w.offset=%zu transpose=%d bits=%d N=%d K=%d "
+          "bn=%d\n",
           int(stage_widest),
           int(stage_wideld),
           int(darkbloom_stage_wideld()),
@@ -1715,6 +1748,8 @@ void gather_qmm_rhs_nax(
           int(stage_runbar),
           int(stage_novol),
           int(expert_aligned),
+          int(expert_widest),
+          int(expert_wideld),
           bm128,
           bm,
           wm,
@@ -1784,7 +1819,9 @@ void gather_qmm_rhs_nax(
         static_expert_shape ? K : 0,
         static_expert_shape ? N : 0,
         "bfloat",
-        egroups);
+        egroups,
+        expert_widest,
+        expert_wideld);
     kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
   } else {
     kernel = get_gather_qmm_nax_kernel(
