@@ -399,6 +399,47 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         return (returnedKeys, returnedValues)
     }
 
+    // MARK: - Fused-decode append access (MLXFastModel fused attention)
+    //
+    // Mirrors the single-token `update` bookkeeping for the fused decode
+    // attention kernel, which performs the slot write itself and attends
+    // over the first `offset + 1` rows with the new row substituted from
+    // registers. Engages only when the backing already has spare capacity
+    // for one more row (i.e. after the first decode step's stock growth
+    // concat), so the growth/reset branches above are provably not taken.
+
+    /// Tracks the one-time contiguization of the backing arrays; in-place
+    /// kernel writes require row-contiguous backings (a non-contiguous
+    /// backing would be copied per step by `ensureRowContiguous` and the
+    /// slot writes lost). After the first decode step's growth concat the
+    /// backings are concat outputs and already contiguous; `contiguous()`
+    /// is then an identity-value op.
+    private var fusedAppendContiguized = false
+
+    /// Append state for the fused decode attention kernel, or nil when the
+    /// backing has no spare row (growth would be required — the stock path
+    /// handles that step). `writeIdx` is the slot the stock single-token
+    /// update would slice-assign; the kernel must attend over
+    /// `writeIdx + 1` rows.
+    public func fusedAppendPrepare() -> (keys: MLXArray, values: MLXArray, writeIdx: Int)? {
+        guard let currentKeys = keys, let currentValues = values,
+            offset + 1 <= currentKeys.dim(2),
+            currentValues.dim(2) == currentKeys.dim(2)
+        else { return nil }
+        if !fusedAppendContiguized {
+            keys = contiguous(currentKeys)
+            values = contiguous(currentValues)
+            fusedAppendContiguized = true
+        }
+        return (keys!, values!, offset)
+    }
+
+    /// Advance the logical clock exactly as the stock single-token update
+    /// would, after the fused kernel has performed the slot write itself.
+    public func fusedAppendAdvance() {
+        offset += 1
+    }
+
     public override var state: [MLXArray] {
         get {
             guard let keys = self.keys, let values = self.values else { return [] }
@@ -637,6 +678,55 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
                 updateConcat(keys: keys, values: values)
             }
         return result
+    }
+
+    // MARK: - Fused-decode ring access (MLXFastModel fused attention)
+    //
+    // The fused decode attention kernel performs this cache's single-token
+    // update itself: it writes the new normed+roped K row and raw V row
+    // directly into the ring backing at the slot `updateInPlace` would have
+    // slice-assigned, and attends over the full ring in slot order with the
+    // new row substituted from registers — the same buffers, values, and
+    // slot visit order the stock update + SDPA pair produces. These
+    // accessors expose exactly the state that path needs and mirror
+    // updateInPlace's `tokenCount == 1` bookkeeping. They engage only in
+    // the steady wrapped regime (buffer at capacity, `keep == 0`), where
+    // updateInPlace's growth and trim branches are provably no-ops.
+
+    /// Tracks the one-time contiguization of the ring backing. In-place
+    /// kernel writes require the backing arrays to be row-contiguous
+    /// (otherwise `ensureRowContiguous` would hand the kernel a fresh copy
+    /// each step and the slot writes would be lost); the prompt-retained
+    /// values array in particular is a transposed view after prefill.
+    private var fusedRingContiguized = false
+
+    /// Steady-ring state for the fused decode attention kernel, or nil
+    /// when the ring is not yet at capacity (shorter prompts, growth
+    /// phase) or a `keep` prefix is configured. `writeIdx` is the slot the
+    /// next single-token update would overwrite (after the wrap check).
+    /// On first use this rebinds the backing arrays to `contiguous(...)`
+    /// copies — identical bytes, contiguous layout — so the fused kernel's
+    /// in-place slot writes persist across steps.
+    public func fusedRingPrepare() -> (keys: MLXArray, values: MLXArray, writeIdx: Int)? {
+        guard keep == 0, let currentKeys = keys, let currentValues = values,
+            currentKeys.dim(2) == maxCacheSize,
+            currentValues.dim(2) == maxCacheSize,
+            offset >= maxCacheSize
+        else { return nil }
+        if !fusedRingContiguized {
+            keys = contiguous(currentKeys)
+            values = contiguous(currentValues)
+            fusedRingContiguized = true
+        }
+        return (keys!, values!, idx == maxCacheSize ? keep : idx)
+    }
+
+    /// Advance the logical clock exactly as `updateInPlace(tokenCount: 1)`
+    /// would, after the fused kernel has performed the slot write itself.
+    public func fusedRingAdvance() {
+        if idx == maxCacheSize { idx = keep }
+        offset += 1
+        idx += 1
     }
 
     public override var state: [MLXArray] {
