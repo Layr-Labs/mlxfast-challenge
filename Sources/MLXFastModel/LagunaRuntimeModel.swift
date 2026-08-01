@@ -278,6 +278,15 @@ let lagunaFusedResidualRMSNormEnabled =
 let lagunaPrefillFusedResidualRMSNormEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_RESIDUAL_RMS"] != "0"
 
+/// Terminal-row prefill counterpart of the ordinary single-token residual /
+/// RMSNorm / router and residual-aware MoE paths. The final prefill layer
+/// intentionally computes only the last query row, so its MLP has the same
+/// `[1, 1, hidden]` shape as decode. Set to "0" for a same-binary control
+/// that restores the old standalone post-attention norm, MLP, and residual
+/// add sequence.
+private let lagunaTerminalPrefillFusionEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_TERMINAL_PREFILL_FUSION"] != "0"
+
 /// Issues the routed and shared gate/up NVFP4 QMVs as one nine-slot dispatch
 /// (see `lagunaRoutedSharedSwiGLUQMVKernel`). Set
 /// `DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV=1` to restore the merge.
@@ -6095,6 +6104,24 @@ final class LagunaRuntimeAttention: Module {
 
         if gatingEnabled, let gProj {
             let projectedGate = bankedGate ?? gProj(lastInput)
+            // The terminal query is a singleton row, so it satisfies the same
+            // decode gate-product shape as the ordinary attention path. Keep
+            // the validated softplus/product kernel here as well; if its
+            // dtype or hardware guard declines, the original scalar gate
+            // chain below remains unchanged.
+            if lagunaFusedGatedOutputProjectionEnabled,
+                gatePerHead,
+                output.dtype == .bfloat16,
+                projectedGate.dtype == output.dtype,
+                output.shape == [1, 1, nHeads * headDim],
+                projectedGate.shape == [1, 1, nHeads],
+                let gated = lagunaGateProductSoftplus(
+                    attentionOutput: output,
+                    gateLogits: projectedGate,
+                    heads: nHeads)
+            {
+                return wo(gated)
+            }
             let gate =
                 gatePerHead && projectedGate.dtype == output.dtype
                 ? lagunaCompiledSoftplusGate(projectedGate)
@@ -7498,131 +7525,6 @@ private let lagunaPipelinedRoutedSharedSwiGLUQMVKernel = MLXFast.metalKernel(
                 if (is_routed) {
                     routed_activated[
                         expert_slot * output_width + first_row + row
-                    ] = activation;
-                } else {
-                    shared_activated[first_row + row] = activation;
-                }
-            }
-        }
-        """,
-    header: lagunaSharedSwiGLUQMVHeader,
-    ensureRowContiguous: true
-)
-
-/// Same per-row arithmetic as `lagunaRoutedSharedSwiGLUQMVKernel`, with
-/// TensorFold ownership inverted: one SIMD group owns one expert slot and one
-/// threadgroup owns all nine slots for a two-row tile. The activation row is
-/// staged once in 4 KiB of threadgroup memory. There are 256 tiles rather than
-/// 128 four-row tiles, leaving the total SIMD work and every row's reduction
-/// order unchanged while cutting slot-level threadgroups from 1,152 to 256.
-private let lagunaNineSlotSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_nine_slot_nvfp4_swiglu_qmv_bf16_v1",
-    inputNames: [
-        "input", "routed_weight", "routed_scales", "indices",
-        "shared_weight", "shared_scales",
-    ],
-    outputNames: ["routed_activated", "shared_activated"],
-    source: """
-        constexpr uint input_width = 2048;
-        constexpr uint output_width = 512;
-        constexpr uint fused_width = 1024;
-        constexpr uint packed_row_bytes = 1024;
-        constexpr uint scale_row_bytes = 128;
-        constexpr uint packed_expert_bytes = fused_width * packed_row_bytes;
-        constexpr uint scale_expert_bytes = fused_width * scale_row_bytes;
-        constexpr uint block_width = 512;
-        constexpr uint values_per_lane = 16;
-        constexpr uint routed_experts = 8;
-        constexpr uint slots = routed_experts + 1;
-        constexpr uint threads_per_group = slots * 32;
-
-        uint tile = threadgroup_position_in_grid.x;
-        uint slot = simdgroup_index_in_threadgroup;
-        uint lane = thread_index_in_simdgroup;
-        uint lid = thread_position_in_threadgroup.x;
-        uint first_row = tile * 2;
-        bool is_routed = slot < routed_experts;
-
-        threadgroup bfloat input_tile[input_width];
-        for (uint i = lid; i < input_width; i += threads_per_group) {
-            input_tile[i] = input[i];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        const device uint8_t* expert_weight;
-        const device uint8_t* expert_scales;
-        if (is_routed) {
-            uint expert = uint(indices[slot]);
-            expert_weight =
-                (const device uint8_t*)routed_weight +
-                expert * packed_expert_bytes;
-            expert_scales = routed_scales + expert * scale_expert_bytes;
-        } else {
-            expert_weight = (const device uint8_t*)shared_weight;
-            expert_scales = shared_scales;
-        }
-
-        thread float gate_result[2] = {0.0f, 0.0f};
-        thread float up_result[2] = {0.0f, 0.0f};
-        thread float input_values[values_per_lane];
-
-        for (uint block = 0; block < input_width; block += block_width) {
-            uint input_base = block + lane * values_per_lane;
-            for (uint i = 0; i < values_per_lane; ++i) {
-                input_values[i] = float(input_tile[input_base + i]);
-            }
-
-            for (uint row = 0; row < 2; ++row) {
-                uint logical_row = first_row + row;
-                uint gate_row;
-                uint up_row;
-                if (is_routed) {
-                    uint pair_tile = logical_row / 32;
-                    gate_row = pair_tile * 64 + logical_row % 32;
-                    up_row = gate_row + 32;
-                } else {
-                    gate_row = logical_row;
-                    up_row = gate_row + output_width;
-                }
-                const device uint8_t* gate_weight =
-                    expert_weight + gate_row * packed_row_bytes +
-                    block / 2 + lane * 8;
-                const device uint8_t* up_weight =
-                    expert_weight + up_row * packed_row_bytes +
-                    block / 2 + lane * 8;
-                const device uint8_t* gate_scale =
-                    expert_scales + gate_row * scale_row_bytes +
-                    block / 16 + lane;
-                const device uint8_t* up_scale =
-                    expert_scales + up_row * scale_row_bytes +
-                    block / 16 + lane;
-
-                gate_result[row] += laguna_nvfp4_qdot_16(
-                    gate_weight,
-                    input_values,
-                    laguna_nvfp4_scale(gate_scale[0]));
-                up_result[row] += laguna_nvfp4_qdot_16(
-                    up_weight,
-                    input_values,
-                    laguna_nvfp4_scale(up_scale[0]));
-            }
-        }
-
-        for (uint row = 0; row < 2; ++row) {
-            gate_result[row] = simd_sum(gate_result[row]);
-            up_result[row] = simd_sum(up_result[row]);
-            if (lane == 0) {
-                bfloat gate = bfloat(gate_result[row]\(lagunaNvfp4RowScaleSuffix));
-                bfloat up = bfloat(up_result[row]\(lagunaNvfp4RowScaleSuffix));
-                bfloat exp_abs = metal::exp(metal::abs(gate));
-                bfloat denominator = bfloat(1) + exp_abs;
-                bfloat y = bfloat(1) / denominator;
-                bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
-                bfloat silu = bfloat(gate * sigmoid);
-                bfloat activation = bfloat(silu * up);
-                if (is_routed) {
-                    routed_activated[
-                        slot * output_width + first_row + row
                     ] = activation;
                 } else {
                     shared_activated[first_row + row] = activation;
@@ -10627,8 +10529,79 @@ final class LagunaRuntimeDecoderLayer: Module {
     func callLastPrefillRow(_ x: MLXArray, cache: KVCache?) -> MLXArray {
         let normalized = inputLayerNorm(x)
         let r = selfAttn.callLastPrefillRow(normalized, cache: cache)
-        let h = lagunaLastTokenHidden(x) + r
-        let r2 = mlp(postAttentionLayerNorm(h))
+        // The terminal-row path has the same single-row shape as decode, but
+        // historically bypassed the normal residual/RMSNorm/router fusion
+        // and the residual-aware MoE tail below. Reuse those existing exact
+        // paths here: `lastResidual + r` is the same h that the stock add
+        // would produce, and the fused helper is row-local (it never reads
+        // discarded query rows). Keep the post-attention values explicit so
+        // the exact stock fallback remains one `postAttentionLayerNorm` plus
+        // one MLP and one residual add.
+        let lastResidual = lagunaLastTokenHidden(x)
+        var h = lastResidual + r
+        if !lagunaTerminalPrefillFusionEnabled {
+            let normalized = postAttentionLayerNorm(h)
+            return h + mlp(normalized)
+        }
+        let normalizedAfterAttention: MLXArray
+        var routerLogits: MLXArray?
+        if lagunaFusedResidualRMSNormRouterEnabled,
+            r.dtype == .bfloat16,
+            postAttentionLayerNorm.weight.dtype == .bfloat16,
+            lastResidual.dtype == .bfloat16,
+            lastResidual.shape == [1, 1, LagunaConstants.hiddenSize],
+            r.shape == lastResidual.shape,
+            let sparse = mlp as? LagunaRuntimeSparseMoEBlock,
+            sparse.gate.weight.dtype == .bfloat16,
+            sparse.gate.weight.shape == [
+                LagunaConstants.numExperts, LagunaConstants.hiddenSize,
+            ]
+        {
+            let fused = lagunaResidualRMSNormRouter(
+                residual: lastResidual,
+                branch: r,
+                weight: postAttentionLayerNorm.weight,
+                routerWeight: sparse.gate.weight)
+            h = fused.summed
+            normalizedAfterAttention = fused.normalized
+            routerLogits = fused.routerLogits
+        } else if lagunaFusedResidualRMSNormEnabled,
+            r.dtype == .bfloat16,
+            postAttentionLayerNorm.weight.dtype == .bfloat16,
+            lastResidual.dtype == .bfloat16,
+            lastResidual.shape == [1, 1, LagunaConstants.hiddenSize],
+            r.shape == lastResidual.shape
+        {
+            lagunaTrace("terminal prefill residual+rmsnorm")
+            let (summed, normed) = lagunaResidualRMSNorm(
+                residual: lastResidual,
+                branch: r,
+                weight: postAttentionLayerNorm.weight)
+            h = summed
+            normalizedAfterAttention = normed
+            routerLogits = nil
+        } else {
+            normalizedAfterAttention = postAttentionLayerNorm(h)
+            routerLogits = nil
+        }
+
+        if let sparse = mlp as? LagunaRuntimeSparseMoEBlock {
+            // This is the same residual-aware single-token call used by the
+            // ordinary decoder path. It may select the validated fused
+            // routed/shared down-residual kernel, while declining to the
+            // exact stock `h + mlp(normalized)` sequence when guards are off.
+            return sparse(
+                normalizedAfterAttention,
+                residual: h,
+                routerLogits: routerLogits)
+        }
+        if let dense = mlp as? LagunaRuntimeMLP,
+            let fused = dense.fusedDenseDownResidual(
+                normalizedAfterAttention, residual: h)
+        {
+            return fused
+        }
+        let r2 = mlp(normalizedAfterAttention)
         return h + r2
     }
 }
