@@ -9708,7 +9708,14 @@ private func lagunaFusedSortedRoutedGateUp(
     // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
     //
     if doSort {
-        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        // `expertCount` is what ADMITS the counting-sort path inside
+        // `gatherSort` -- without it `bins` is 0, the admissibility guard
+        // declines, and the stock `argSort` chain runs regardless of the
+        // flag. Laguna routes into a fixed 256-expert space, so the bin
+        // count is a model constant, not prompt-derived.
+        (sortedX, idx, inverseOrder) = gatherSort(
+            x: sortedX, indices: indices,
+            expertCount: LagunaConstants.numExperts)
     }
     // Fused counterpart of SwitchGLU's separate-bank branch:
     //   xUp = upProj(x, idx, sortedIndices: doSort)
