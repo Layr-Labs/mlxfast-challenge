@@ -119,6 +119,19 @@ let lagunaFusedSharedGateUpEnabled =
 let lagunaFusedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_SWIGLU_QMV"] != "0"
 
+/// `DARKBLOOM_PREFILL_SHARED_FUSED_GATE_UP` (default on; set "0" to
+/// disable): extend the retained row-concatenated NVFP4 `[gate; up]` bank to
+/// multi-token prefill, serving the shared expert's gate and up projections
+/// from one quantized matmul instead of two stock dispatches. Each quantized
+/// output row is computed independently of the bank's row count, so the
+/// split halves are bit-exact vs. the separate gate/up dispatches -- the
+/// same row-independence argument the decode arm already ships, here applied
+/// to prefill's GEMM shape. Set "0" to restore the stock separate-bank
+/// prefill dispatch byte-for-byte.
+let lagunaPrefillSharedFusedGateUpEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_SHARED_FUSED_GATE_UP"] != "0"
+
 /// Decode-only shared-expert down QMV plus both sparse-block residual adds.
 /// The kernel preserves the stock BF16 down-projection result, the inner
 /// `routed + shared` rounding, and the outer `h + r2` rounding while avoiding
@@ -322,6 +335,25 @@ let lagunaSwiGLUQMVRows1Enabled =
 /// family. Set `DARKBLOOM_FUSED_GATED_OUTPUT=0` to ablate.
 let lagunaFusedGatedOutputProjectionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATED_OUTPUT"] != "0"
+
+/// `DARKBLOOM_TERMINAL_PREFILL_OPROJ` (default on; set "0" to disable): the
+/// terminal prefill row computes a single query row, so its attention tail has
+/// the same `[1, 1, H*D]` / `[1, 1, H]` shapes as a decode step and can take
+/// the same native-affine gated output projection decode already takes. That
+/// replaces a compiled softplus, a broadcast multiply and a 33.5 MB BF16
+/// `wo` GEMV with one dispatch against the quantized side bank the decode path
+/// carries for the very same layer.
+let lagunaTerminalPrefillOProjEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_TERMINAL_PREFILL_OPROJ"] != "0"
+
+/// `DARKBLOOM_TERMINAL_PREFILL_QBANK` (default on; set "0" to disable): the
+/// terminal prefill row's Q projection is a one-row GEMV, so it reads the
+/// quantized `[Q;K;V]` side bank the layer already carries (leading
+/// `nHeads * headDim` rows, a row-contiguous view) plus the separate INT8 gate
+/// bank, instead of the retained 33.8 MB BF16 `[Q;gate]` bank. K and V keep the
+/// BF16 bank: they still cover every supplied token.
+let lagunaTerminalPrefillQBankEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_TERMINAL_PREFILL_QBANK"] != "0"
 
 /// Issues Q, K and V as one dispatch over the three stock weights (see
 /// `lagunaFusedQKVProjectionSource`). Unlike `DARKBLOOM_FUSED_QKV` this keeps
@@ -5822,7 +5854,61 @@ final class LagunaRuntimeAttention: Module {
         var keys: MLXArray
         var values: MLXArray
         let bankedGate: MLXArray?
-        if lagunaLastPrefillProjectionBanksEnabled,
+        // The terminal row's Q projection is a single-row GEMV, exactly the
+        // shape decode issues, so it can read the quantized `[Q;K;V]` side
+        // bank this layer already carries instead of the 33.8 MB BF16 `[Q;gate]`
+        // bank. Q occupies the leading `nHeads * headDim` rows of that bank
+        // (assembled q, k, v in order), and a leading-row slice of the packed
+        // codes and scales is row contiguous, so the slice is a view: no copy,
+        // no repacking. The per-head gate comes from its own INT8 bank on the
+        // NVFP4 tail layers, the same bank decode reads. K and V keep the
+        // retained BF16 bank because they must still cover every supplied
+        // token. `DARKBLOOM_TERMINAL_PREFILL_QBANK=0` restores the BF16 path.
+        if lagunaTerminalPrefillQBankEnabled,
+            lagunaUseNativeAffineQKV(layer: layerIdx),
+            let qkvBank = _nativeAffineQKV,
+            let affineGate = _nativeAffineGProj,
+            let kvWeight = _lastPrefillKVWeight,
+            B == 1,
+            isSliding, gatingEnabled, gatePerHead,
+            lastInput.dtype == .bfloat16,
+            x.dtype == .bfloat16,
+            lastInput.shape == [1, 1, LagunaConstants.hiddenSize],
+            x.shape == [1, L, LagunaConstants.hiddenSize],
+            kvWeight.dtype == .bfloat16,
+            kvWeight.shape == [2 * nKVHeads * headDim, LagunaConstants.hiddenSize],
+            qkvBank.originalShape[1] == LagunaConstants.hiddenSize,
+            qkvBank.originalShape[0]
+                >= nHeads * headDim + 2 * nKVHeads * headDim
+        {
+            let queryDim = nHeads * headDim
+            queries = quantizedMM(
+                lastInput,
+                qkvBank.packedCodes[0 ..< queryDim, 0...],
+                scales: qkvBank.scales[0 ..< queryDim, 0...],
+                biases: qkvBank.biases.map { $0[0 ..< queryDim, 0...] },
+                transpose: true,
+                groupSize: qkvBank.groupSize,
+                bits: qkvBank.bits,
+                mode: qkvBank.mode
+            )
+            bankedGate = quantizedMM(
+                lastInput,
+                affineGate.packedCodes,
+                scales: affineGate.scales,
+                biases: affineGate.biases,
+                transpose: true,
+                groupSize: affineGate.groupSize,
+                bits: affineGate.bits,
+                mode: affineGate.mode
+            )
+
+            let kv = matmul(x, kvWeight.T)
+            let kvDim = nKVHeads * headDim
+            keys = kv[.ellipsis, 0 ..< kvDim]
+            values = kv[.ellipsis, kvDim ..< (2 * kvDim)]
+            lagunaTrace("terminal prefill Q from quantized QKV bank")
+        } else if lagunaLastPrefillProjectionBanksEnabled,
             let qGateWeight = _lastPrefillQGateWeight,
             let kvWeight = _lastPrefillKVWeight,
             B == 1,
@@ -5878,6 +5964,73 @@ final class LagunaRuntimeAttention: Module {
 
         if gatingEnabled, let gProj {
             let projectedGate = bankedGate ?? gProj(lastInput)
+            // The terminal prefill row carries the same `[1, 1, H*D]` output
+            // and `[1, 1, H]` gate shapes every decode step carries, so it can
+            // take the native-affine gated output projection the ordinary
+            // decode path already takes (the block guarded by
+            // `lagunaUseNativeAffineOProj` in `callAsFunction`): ONE dispatch
+            // for the softplus chain, the broadcast product and the
+            // contraction, reading the quantized side bank instead of the
+            // 33.5 MB BF16 `wo`. Same bank, same kernel, same layer as decode,
+            // so the only numeric exposure is the weight quantization the
+            // ranked decode path already carries on this layer.
+            // `DARKBLOOM_TERMINAL_PREFILL_OPROJ=0` restores the chain below.
+            if lagunaTerminalPrefillOProjEnabled,
+                lagunaUseNativeAffineOProj(layer: layerIdx),
+                let affineWO = _nativeAffineOProj,
+                gatePerHead, B == 1, wo.bias == nil,
+                headDim == LagunaConstants.headDim,
+                output.dtype == .bfloat16, projectedGate.dtype == .bfloat16,
+                output.shape == [1, 1, nHeads * headDim],
+                projectedGate.shape == [1, 1, nHeads]
+            {
+                if lagunaFusedGatedAffineOProjEnabled,
+                    affineWO.mode == .affine, affineWO.bits == 8,
+                    affineWO.groupSize == 32,
+                    let affineBiases = affineWO.biases,
+                    let fusedProjection = lagunaGatedAffineOProj(
+                        attentionOutput: output,
+                        gateLogits: projectedGate,
+                        codes: affineWO.packedCodes,
+                        scales: affineWO.scales,
+                        biases: affineBiases,
+                        heads: nHeads)
+                {
+                    lagunaTrace("terminal prefill gated affine oproj h\(nHeads)")
+                    return fusedProjection
+                }
+                if lagunaFusedGatedAffineOProjEnabled,
+                    lagunaGatedAffineOProjNVFP4Enabled,
+                    affineWO.mode == .nvfp4, affineWO.bits == 4,
+                    affineWO.groupSize == 16,
+                    let fusedProjection = lagunaGatedAffineOProjNVFP4(
+                        attentionOutput: output,
+                        gateLogits: projectedGate,
+                        codes: affineWO.packedCodes,
+                        scales: affineWO.scales,
+                        heads: nHeads)
+                {
+                    lagunaTrace(
+                        "terminal prefill gated affine oproj nvfp4 h\(nHeads)")
+                    return fusedProjection
+                }
+            }
+            // One dispatch reproduces the softplus chain and the broadcast
+            // product bit-exactly (see `lagunaGateProductSoftplusSource`),
+            // replacing the compiled softplus plus the separate multiply.
+            if lagunaFusedGatedOutputProjectionEnabled,
+                gatePerHead,
+                output.dtype == .bfloat16,
+                projectedGate.dtype == output.dtype,
+                output.shape == [1, 1, nHeads * headDim],
+                projectedGate.shape == [1, 1, nHeads],
+                let gated = lagunaGateProductSoftplus(
+                    attentionOutput: output,
+                    gateLogits: projectedGate,
+                    heads: nHeads)
+            {
+                return wo(gated)
+            }
             let gate =
                 gatePerHead && projectedGate.dtype == output.dtype
                 ? lagunaCompiledSoftplusGate(projectedGate)
@@ -8255,6 +8408,38 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             // quantized output row is computed independently, so the split
             // halves are bit-exact vs. the separate gate/up dispatches.
             lagunaTrace("shared fused [gate; up] bank QMM")
+            let gateUp = MLX.quantizedMM(
+                x,
+                fusedWeight,
+                scales: fusedScales,
+                biases: nil,
+                transpose: true,
+                groupSize: 16,
+                bits: 4,
+                mode: .nvfp4
+            )
+            let gate = gateUp[.ellipsis, 0 ..< _fusedGateUpSplit]
+            let up = gateUp[.ellipsis, _fusedGateUpSplit...]
+            return downProj(compiledSiluProduct(gate, up))
+        }
+        if x.dim(1) > 1, lagunaPrefillSharedFusedGateUpEnabled,
+            let fusedWeight = _fusedGateUpWeight, let fusedScales = _fusedGateUpScales,
+            x.dtype == .bfloat16,
+            x.dim(2) == LagunaConstants.hiddenSize,
+            fusedWeight.dtype == .uint32,
+            fusedScales.dtype == .uint8,
+            fusedWeight.shape == [2 * _fusedGateUpSplit, LagunaConstants.hiddenSize],
+            _fusedGateUpSplit == LagunaConstants.sharedExpertIntermediateSize
+        {
+            // Prefill arm of the retained [gate; up] bank: one quantized
+            // matmul over the row-concatenated bank replaces the stock
+            // separate gate/up dispatches. Mirrors the decode arm's argument
+            // exactly (transpose, group 16, 4-bit, .nvfp4, no affine biases,
+            // no bias add; the `prepareFusedSharedGateUp` guards pin those
+            // literals): each quantized output row is computed independently
+            // of the bank's row count, so the split halves are bit-exact vs.
+            // the separate dispatches.
+            lagunaTrace("prefill shared fused [gate; up] bank QMM")
             let gateUp = MLX.quantizedMM(
                 x,
                 fusedWeight,

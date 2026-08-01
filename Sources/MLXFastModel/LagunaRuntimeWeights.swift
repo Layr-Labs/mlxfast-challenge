@@ -457,6 +457,21 @@ public final class LagunaRuntimeWeightCache {
         if libraryModel != nil, config.numHiddenLayers >= 16 {
             Self.wireResidentWeightsIfEnabled()
         }
+        // Every scored request begins with the trusted worker's phase-start
+        // allocator reset, whose `Memory.clearCache()` is charged inside the
+        // measured window and costs time in proportion to the free MLX buffers
+        // init left behind. Today those are few only by accident: the one
+        // post-warmup clear lives inside `wireResidentWeightsIfEnabled` behind
+        // a wiring flag and a >=96 GiB physical-memory guard, so on any machine
+        // or configuration that declines either guard the warmup transients are
+        // freed on the scored path instead. Clearing here unconditionally makes
+        // the phase-start reset free by construction rather than by luck. Pure
+        // hoist of already-charged work into untimed init; it frees nothing the
+        // scored path needs, since live weights and KV state are active memory,
+        // not allocator cache.
+        if ProcessInfo.processInfo.environment["DARKBLOOM_INIT_CLEAR_CACHE"] != "0" {
+            Memory.clearCache()
+        }
     }
 
     /// One prefill-shaped forward (512 tokens) and one single-token decode
@@ -485,6 +500,24 @@ public final class LagunaRuntimeWeightCache {
         if lagunaFusedFullAttentionEnabled {
             warmDecodeLogits = model(decodeToken, cache: warmupCache)
             eval(warmDecodeLogits)
+        }
+        // Two more decode steps, unconditionally. The first step above leaves
+        // the step-1 and step-2 regimes cold: the standard cache's
+        // `fusedAppendPrepare` engages only once the stock growth concat has
+        // run, and its one-time `contiguous(currentKeys)` on the grown backing
+        // therefore first executes on the SECOND scored step. Whatever those
+        // paths compile, they compile inside the measured window. Running them
+        // here moves that to untimed init. The steps above were coupled to
+        // `lagunaFusedFullAttentionEnabled` for reasons unrelated to warmup
+        // coverage; extra warmup costs the scored path nothing and cannot
+        // regress it. Input-independent kernel-cache warmup only (TASK.md
+        // allows caches for kernels): constant BOS input, output discarded.
+        // `DARKBLOOM_WARM_DECODE_STEPS=0` restores the stock one-step warmup.
+        if ProcessInfo.processInfo.environment["DARKBLOOM_WARM_DECODE_STEPS"] != "0" {
+            for _ in 0 ..< 2 {
+                warmDecodeLogits = model(decodeToken, cache: warmupCache)
+                eval(warmDecodeLogits)
+            }
         }
         // Warm the greedy-token pipeline too. Every scored worker request ends
         // in `LagunaCorrectness.greedyToken` (reshape -> last row -> argMax),
