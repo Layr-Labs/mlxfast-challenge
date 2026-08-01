@@ -154,8 +154,15 @@ let lagunaFusedRoutedSwiGLUQMVEnabled =
 /// computation changes, so the packed dispatch is bit-exact (class A).
 /// Memory: +~302 MB resident per sparse layer while enabled (the stock fused
 /// bank stays resident for prefill and for the fallback paths).
+/// `DARKBLOOM_PACKED_SCALES=build` is the residency CONTROL arm: the side
+/// bank is built, evaluated, and wired exactly as in the `=1` arm, but the
+/// STOCK kernel dispatches — isolating the +11.8 GB residency side effect
+/// from the packed kernel itself.
+private let lagunaPackedScalesMode =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"]
 let lagunaPackedScalesEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] == "1"
+    lagunaPackedScalesMode == "1" || lagunaPackedScalesMode == "build"
+let lagunaPackedScalesDispatchEnabled = lagunaPackedScalesMode == "1"
 
 /// One-shot stderr visibility for the packed-scales arm: with the flag set,
 /// the arm MUST announce either "active" (bank built / packed dispatch taken)
@@ -3751,6 +3758,187 @@ private func lagunaNormAffineQKVBody(
 private let lagunaNormAffineQKVStaged =
     ProcessInfo.processInfo.environment["DARKBLOOM_NORM_AFFINE_QKV_STAGE"] == "tg"
 
+/// `DARKBLOOM_NORM_AFFINE_QKV_PF` (default 4 = register-prefetch depth 4,
+/// **DEFAULT ON**; set "0" to restore the stock inline kernel; 1...4
+/// clamped). QmvLimiter study (notes/exp-qmvlimiter.md): the fused kernel's
+/// RMS prologue (three barriers + the 2048-element reduction) runs
+/// dead-serial BEFORE the first weight byte of each threadgroup's short
+/// 18 KB stream, costing ~9% of the dispatch (harness noprol probe); the
+/// prefetch variant issues the first `depth` k-blocks' code/scale/bias
+/// loads ABOVE the prologue so the weight stream is in flight while the
+/// reduction runs, then consumes them from registers in the exact stock
+/// order. Pure reads of immutable weights and an identical FP schedule ->
+/// bit-identical (standalone-harness memcmp on all output rows, random
+/// banks, r10304 and r8240; model-level 130/130 max_abs_diff=0). Depth-4
+/// measured -11.9%/-12.2% kernel-level at decode clocks (48.61->42.84 us
+/// r10304, 39.34->34.55 us r8240; 554/549 GB/s vs 488/482 stock; projected
+/// ~-171 us/step), depth curve monotone pf1->pf4, occupancy unchanged
+/// (maxTotalThreadsPerThreadgroup 1024, +64 B thread state). Ignored under
+/// the `tg` staged variant.
+let lagunaNormAffineQKVPrefetchDepth: Int = {
+    let raw =
+        ProcessInfo.processInfo.environment["DARKBLOOM_NORM_AFFINE_QKV_PF"] ?? "4"
+    return min(max(Int(raw) ?? 4, 0), 4)
+}()
+
+/// Register-prefetch twin of the inline `lagunaNormAffineQKVSource`. The
+/// NORM half and the k-loop arithmetic are textually the stock inline
+/// variant's; the only changes are (a) the stream-pointer setup and the
+/// first `depth` k-blocks' weight/scale/bias loads hoisted above the
+/// prologue into registers, and (b) those blocks peeled off the k-loop,
+/// consuming the registers with the identical per-i accumulation order.
+/// Same values, same operation order per output row -> bit-exact.
+private func lagunaNormAffineQKVPrefetchSource(rows: Int, depth: Int) -> String {
+    """
+    constexpr uint axis_size = \(LagunaConstants.hiddenSize);
+    constexpr uint out_vec_size = \(rows);
+    constexpr uint n_reads = 4;                 // RMS_N_READS
+    constexpr uint norm_threads = axis_size / n_reads;   // 512 virtual threads
+    constexpr uint real_threads = 64;
+    constexpr uint virtual_per_thread = norm_threads / real_threads;  // 8
+    constexpr uint simd_size = 32;
+    constexpr float norm_eps = 1.0e-6f;
+    constexpr uint values_per_thread = 8;       // pack_factor 4 * packs_per_thread 2
+    constexpr uint block_size = 256;            // values_per_thread * SIMD_SIZE
+    constexpr uint results_per_simdgroup = 4;
+    constexpr uint num_simdgroups = 2;
+    constexpr uint group_size = 32;
+    constexpr uint scale_step_per_thread = group_size / values_per_thread;
+    constexpr uint in_vec_size_g = axis_size / group_size;
+    constexpr uint pf_depth = \(depth);
+
+    uint tile = threadgroup_position_in_grid.x;
+    uint lid = thread_position_in_threadgroup.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    threadgroup float local_inv_mean[1];
+    threadgroup float local_sums[simd_size];
+
+    // Stream pointers and the first pf_depth k-blocks' loads issued BEFORE
+    // the norm reduction: the weight stream is in flight while the prologue
+    // runs. Pure reads of immutable weights, consumed below in the stock
+    // k-loop's exact per-i order.
+    uint out_row = tile * (num_simdgroups * results_per_simdgroup) +
+        simd_gid * results_per_simdgroup;
+
+    const device uint8_t* ws = (const device uint8_t*)weight_codes +
+        out_row * axis_size + simd_lid * values_per_thread;
+    const device bfloat* sc = weight_scales + out_row * in_vec_size_g +
+        simd_lid / scale_step_per_thread;
+    const device bfloat* bs = weight_biases + out_row * in_vec_size_g +
+        simd_lid / scale_step_per_thread;
+
+    uint8_t pf_w[pf_depth][results_per_simdgroup][values_per_thread];
+    float pf_s[pf_depth][results_per_simdgroup];
+    float pf_b[pf_depth][results_per_simdgroup];
+    for (uint d = 0; d < pf_depth; ++d) {
+        for (uint row = 0; row < results_per_simdgroup; ++row) {
+            const device uint8_t* wl = ws + d * block_size + row * axis_size;
+            for (uint i = 0; i < values_per_thread; ++i) {
+                pf_w[d][row][i] = wl[i];
+            }
+            pf_s[d][row] =
+                float(sc[d * (block_size / group_size) + row * in_vec_size_g]);
+            pf_b[d][row] =
+                float(bs[d * (block_size / group_size) + row * in_vec_size_g]);
+        }
+    }
+
+    // --- rms_single_row replica, textually the stock inline variant's ---
+    if (lid < simd_size) {
+        local_sums[lid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j = 0; j < virtual_per_thread; ++j) {
+        uint base = (lid + j * real_threads) * n_reads;
+        float acc = 0.0f;
+        for (uint i = 0; i < n_reads; ++i) {
+            float xi = float(residual[base + i]);
+            acc += xi * xi;
+        }
+        acc = simd_sum(acc);
+        if (simd_lid == 0) {
+            local_sums[simd_gid + num_simdgroups * j] = acc;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_gid == 0) {
+        float total = simd_sum(local_sums[simd_lid]);
+        if (simd_lid == 0) {
+            local_inv_mean[0] =
+                metal::precise::rsqrt(total / float(axis_size) + norm_eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float laguna_inv_mean = local_inv_mean[0];
+
+    // --- affine_qmv_fast replica; first pf_depth blocks consume the
+    // prefetched registers with the identical accumulation order ---
+    thread float x_thread[values_per_thread];
+    thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    uint column = simd_lid * values_per_thread;
+    for (uint d = 0; d < pf_depth; ++d) {
+        float sum = 0.0f;
+        for (uint i = 0; i < values_per_thread; ++i) {
+            float value = float(bfloat(
+                            norm_weight[column + i] *
+                            bfloat(float(residual[column + i]) * laguna_inv_mean)));
+            sum += value;
+            x_thread[i] = value;
+        }
+        for (uint row = 0; row < results_per_simdgroup; ++row) {
+            float accum = 0.0f;
+            for (uint i = 0; i < values_per_thread; ++i) {
+                accum += x_thread[i] * pf_w[d][row][i];
+            }
+            result[row] += pf_s[d][row] * accum + sum * pf_b[d][row];
+        }
+        ws += block_size;
+        sc += block_size / group_size;
+        bs += block_size / group_size;
+        column += block_size;
+    }
+    for (uint k = pf_depth * block_size; k < axis_size; k += block_size) {
+        float sum = 0.0f;
+        for (uint i = 0; i < values_per_thread; ++i) {
+            float value = float(bfloat(
+                            norm_weight[column + i] *
+                            bfloat(float(residual[column + i]) * laguna_inv_mean)));
+            sum += value;
+            x_thread[i] = value;
+        }
+
+        for (uint row = 0; row < results_per_simdgroup; ++row) {
+            const device uint8_t* wl = ws + row * axis_size;
+            float scale = float(sc[row * in_vec_size_g]);
+            float bias = float(bs[row * in_vec_size_g]);
+            float accum = 0.0f;
+            for (uint i = 0; i < values_per_thread; ++i) {
+                accum += x_thread[i] * wl[i];
+            }
+            result[row] += scale * accum + sum * bias;
+        }
+
+        ws += block_size;
+        sc += block_size / group_size;
+        bs += block_size / group_size;
+        column += block_size;
+    }
+
+    for (uint row = 0; row < results_per_simdgroup; ++row) {
+        result[row] = simd_sum(result[row]);
+        if (simd_lid == 0) {
+            projected[out_row + row] = bfloat(result[row]);
+        }
+    }
+    """
+}
+
 /// One kernel per reachable `[Q; K; V; (G)]` row count: both head families,
 /// gate rows folded in or not. All four are multiples of 8, so `qmv`'s `fast`
 /// predicate holds and no tail threadgroup is ever dispatched.
@@ -3762,16 +3950,20 @@ private let lagunaNormAffineQKVKernels: [Int: MLXFast.MLXFastKernel] = {
             let rows = heads * LagunaConstants.headDim + kvRows + gateRows
             if kernels[rows] != nil { continue }
             let staged = lagunaNormAffineQKVStaged
+            let pf = staged ? 0 : lagunaNormAffineQKVPrefetchDepth
             kernels[rows] = MLXFast.metalKernel(
-                name:
-                    "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_"
-                    + (staged ? "tg" : "inl") + "_v1",
+                name: pf > 0
+                    ? "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_pf\(pf)_v1"
+                    : "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_"
+                        + (staged ? "tg" : "inl") + "_v1",
                 inputNames: [
                     "residual", "norm_weight", "weight_codes", "weight_scales",
                     "weight_biases",
                 ],
                 outputNames: ["projected"],
-                source: lagunaNormAffineQKVSource(rows: rows, staged: staged),
+                source: pf > 0
+                    ? lagunaNormAffineQKVPrefetchSource(rows: rows, depth: pf)
+                    : lagunaNormAffineQKVSource(rows: rows, staged: staged),
                 ensureRowContiguous: true
             )
         }
@@ -3816,7 +4008,10 @@ func lagunaNormAffineQKV(
         return nil
     }
 
-    lagunaTrace("norm+affine qkv qmv r\(rows)")
+    lagunaTrace(
+        lagunaNormAffineQKVPrefetchDepth > 0 && !lagunaNormAffineQKVStaged
+            ? "norm+affine qkv qmv r\(rows) pf\(lagunaNormAffineQKVPrefetchDepth)"
+            : "norm+affine qkv qmv r\(rows)")
     return kernel(
         [residual, normWeight, codes, scales, biases],
         grid: ((rows / 8) * 64, 1, 1),
@@ -8267,7 +8462,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     )
                     activated = merged.routed
                     mergedSharedActivated = merged.shared
-                } else if lagunaPackedScalesEnabled,
+                } else if lagunaPackedScalesDispatchEnabled,
                     let packedBank = _packedRoutedGateUpBank
                 {
                     lagunaPackedScalesLog.note(

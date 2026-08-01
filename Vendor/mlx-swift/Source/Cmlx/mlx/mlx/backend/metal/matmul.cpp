@@ -79,6 +79,7 @@ ensure_batch_contiguous(const array& x, metal::Device& d, const Stream& s) {
   return std::make_tuple(false, x_copy.strides()[x_copy.ndim() - 2], x_copy);
 }
 
+<<<<<<< Updated upstream
 // Prefill split-K threadgroup regrouping. This preserves BK=512, the
 // 4096-element partition size, the partition count, and SM=SN=32 while
 // changing 128x128/WM4xWN4 threadgroups to 64x64/WM2xWN2. Each output keeps
@@ -92,6 +93,49 @@ static bool darkbloom_steel_prefill_tile() {
   return enabled;
 }
 
+=======
+
+// SteelSweep (notes/exp-steelsweep.md): flag-gated prefill split-K tile
+// regrouping. 0/unset = stock (byte-identical dispatch). 1 = on the
+// large-shape branch only ((M+N)/2 >= 512 && K > 4096), regroup
+// 128/128/512/wm4/wn4 -> 64/64/512/wm2/wn2. SM = BM/WM and SN = BN/WN stay
+// 32x32: identical per-simdgroup gemm_loop, identical
+// split_k_partition_size/partitions, so every output element keeps the exact
+// same k-ascending in-register MMA chain -- the change only re-partitions
+// WHICH threadgroup hosts which simdgroups (class A; bit-identical,
+// memcmp-proven at both o_proj shapes in the standalone harness).
+static int darkbloom_steel_prefill_tile() {
+  static int v = []() {
+    const char* e = getenv("DARKBLOOM_STEEL_PREFILL_TILE");
+    // Ranked verdict 2026-08-01: the 64/64/wm2/wn2 regroup INVERTED on the
+    // ranked box (9cb51530 −0.68% vs base; bb7f7b35 consistent) despite
+    // −16..−18% kernel-level and −1.46% prefill local (both like-regime,
+    // t~6). Occupancy-family local evidence does not transfer from a loaded
+    // box. Default restored to stock; =1 kept as a measured control arm.
+    int val = e ? atoi(e) : 0;
+    if (val != 0) {
+      fprintf(
+          stderr,
+          "[darkbloom] steel_prefill_tile=%d (splitk_nax large-shape "
+          "bm64/bn64/wm2/wn2)\n",
+          val);
+    }
+    return val;
+  }();
+  return v;
+}
+
+// Ground-truth dispatch trace (DARKBLOOM_STEEL_TRACE=1): prints the actual
+// steel kernel base name + geometry at every nax GEMM dispatch. Never set
+// inside timed windows (stderr I/O).
+static bool darkbloom_steel_trace() {
+  static bool v = []() {
+    const char* e = getenv("DARKBLOOM_STEEL_TRACE");
+    return e && atoi(e) != 0;
+  }();
+  return v;
+}
+>>>>>>> Stashed changes
 } // namespace
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -344,6 +388,13 @@ void steel_matmul_regular_axpby_nax(
     compute_encoder.set_bytes(params, 5);
   }
 
+  if (darkbloom_steel_trace()) {
+    fprintf(
+        stderr,
+        "[darkbloom][steel] %s M=%d N=%d K=%d grid=(%lu,%lu,%lu)\n",
+        base_name.c_str(), M, N, K, grid_dims.width, grid_dims.height,
+        grid_dims.depth);
+  }
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 
   // Record copies
@@ -697,7 +748,13 @@ void steel_gemm_splitk_axpby_nax(
     bk = 256;
     wm = wn = 2;
   }
+<<<<<<< Updated upstream
   if (darkbloom_steel_prefill_tile() && (M + N) / 2 >= 512 && K > 4096) {
+=======
+  if (darkbloom_steel_prefill_tile() == 1 && (M + N) / 2 >= 512 && K > 4096) {
+    // Pure TG regrouping of the same SM=SN=32 simdgroup geometry; partition
+    // size/count and bk untouched (see darkbloom_steel_prefill_tile()).
+>>>>>>> Stashed changes
     bm = bn = 64;
     wm = wn = 2;
   }
@@ -803,6 +860,13 @@ void steel_gemm_splitk_axpby_nax(
   compute_encoder.set_output_array(C_split, 2);
 
   compute_encoder.set_bytes(params, 3);
+  if (darkbloom_steel_trace()) {
+    fprintf(
+        stderr,
+        "[darkbloom][steel] %s M=%d N=%d K=%d parts=%d psize=%d grid.x=%lu\n",
+        base_name.c_str(), M, N, K, split_k_partitions,
+        split_k_partition_size, grid_dims.width);
+  }
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 
   // Do accum kernel
