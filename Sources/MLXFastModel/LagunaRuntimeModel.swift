@@ -201,30 +201,7 @@ let lagunaFusedRoutedDownReduceEnabled =
 let lagunaFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_GATE_UP"] != "0"
 
-/// `DARKBLOOM_PREFILL_FUSED_GATE_UP` (default on; set "0" to disable):
-/// prefill/SORTED-regime counterpart to `DARKBLOOM_FUSED_ROUTED_GATE_UP`
-/// above. Serves the multi-token sorted gather-GEMM path (`indices.size >=
-/// 64` -- `SwitchGLU`'s own threshold for taking `gatherSort`, which every
-/// timed 512-token prefill request clears) from the same retained
-/// row-concatenated NVFP4 `[gate; up]` bank the decode path already keeps
-/// resident, instead of the stock two separate sorted gather-QMMs
-/// (`gate_proj` then `up_proj`). Mechanism: one N=1024 gather-GEMM has half
-/// the run-loop iterations and dispatch overhead of two N=512 ones, and,
-/// like the decode fusion above, each *gathered* output row's K-loop and
-/// scale application reads only its own weight/scale row independent of
-/// which bank that row lives in -- so the fused dispatch is bit-exact
-/// against the two separate ones it replaces.
-///
-/// The `DARKBLOOM_FUSED_ROUTED_GATE_UP` comment above records an earlier
-/// ablation that measured this same idea hurting the M=512 sorted prefill
-/// path; that measurement pre-dates RUNSKIP. A later measurement on a
-/// RUNSKIP-era tree (note ba4561c, never landed) found this specific
-/// prefill fusion a ~4% prefill win (373.5us -> 358.5us) instead. Shipped
-/// default ON, behind its own flag, so it can be ablated and re-measured on
-/// the ranked box independently of both the older decode-only flag and the
-/// stale prefill finding. See `lagunaFusedSortedRoutedGateUp` and its call
-/// site in `LagunaRuntimeSparseMoEBlock.forward` for the exact op-for-op
-/// mirror of `SwitchGLU.callAsFunction`'s sorted branch.
+/// Fuses the sorted prefill gate/up gather-GEMMs; set `0` to disable.
 let lagunaPrefillFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_GATE_UP"] != "0"
 
@@ -247,56 +224,11 @@ let lagunaExpertAlignedGatherEnabled =
 let lagunaFusedResidualRMSNormEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_RESIDUAL_RMS"] != "0"
 
-/// `DARKBLOOM_PREFILL_FUSED_RESIDUAL_RMS` (default on; set "0" to ablate):
-/// prefill (multi-token) counterpart of `lagunaFusedResidualRMSNormEnabled`
-/// above, gated independently per this file's convention of separate
-/// per-regime flags (see the router fusion split, `DARKBLOOM_FUSED_ROUTER`
-/// vs. `DARKBLOOM_PREFILL_ROUTER_TOURNAMENT`). Reuses the IDENTICAL
-/// `lagunaResidualRMSNorm` kernel the decode branch already calls -- no new
-/// Metal source -- because that kernel's Swift wrapper and Metal body are
-/// already fully row-count-general: `rows` is derived from
-/// `residual.size / hiddenSize` (not hardcoded), the dispatch grid is
-/// `rows` independent threadgroups, and the kernel body's own row index
-/// (`threadgroup_position_in_grid.x`) plus all of its scratch
-/// (`local_sums`, the running mean-square accumulator) are per-threadgroup
-/// -- one row's computation never reads another row's data. Only the
-/// call-site guard restricted it to decode; this flag lifts that
-/// restriction for `x.dim(1) > 1` specifically, leaving the decode branch
-/// above completely untouched (mutually exclusive guards: decode requires
-/// `x.size == hiddenSize`, i.e. exactly one row; this branch requires
-/// `x.dim(1) > 1`).
-///
-/// Exactness: with this flag off, EVERY prefill forward already falls
-/// through this same call site's stock `else` arm (`h = x + r`; `normalized
-/// = postAttentionLayerNorm(h)`) unconditionally, since the decode branch's
-/// `x.size == hiddenSize` guard is always false for `L > 1` -- confirmed by
-/// reading the guard, not assumed. That is the exact two-op sequence the
-/// kernel already reproduces bit-for-bit for decode's `L == 1` case, and
-/// RMSNorm has no cross-token interaction in either the stock ops or the
-/// kernel, so the per-row equivalence already proven for one row holds row
-/// by row for any `L`.
+/// Reuses the row-general residual+RMSNorm kernel for multi-token prefill.
 let lagunaPrefillFusedResidualRMSNormEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_RESIDUAL_RMS"] != "0"
 
-/// Issues the routed and shared gate/up NVFP4 QMVs as one nine-slot dispatch
-/// (see `lagunaRoutedSharedSwiGLUQMVKernel`). Set
-/// `DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV=1` to restore the merge.
-///
-/// DEFAULT OFF: the merge is a dependency-chain pessimisation on the decode
-/// step. The routed half consumes `inds`, so the merged dispatch cannot be
-/// enqueued until the top-8 kernel retires -- but the shared half consumes
-/// only `x`, which is ready the moment `residual+rmsnorm+router` lands.
-/// Merging therefore parks the shared expert's gate/up work behind a
-/// dispatch it has no data dependency on. Splitting spends one extra
-/// dispatch per sparse layer to expose that work for overlap.
-///
-/// The merge was chosen against an earlier tree, before the native-affine
-/// rollout reshaped the surrounding anatomy, so its A/B is stale rather than
-/// wrong. Splitting is arithmetically inert: each half keeps its own kernel,
-/// its own row mapping, and its own accumulation order -- the routed rows go
-/// through `lagunaRoutedSwiGLUQMV` and the shared rows through
-/// `lagunaSharedSwiGLUQMV`, both of which are the same kernels the merged
-/// form was built from.
+/// Optional merged routed/shared gate-up dispatch; split execution is default.
 let lagunaFusedRoutedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_ROUTED_SHARED_SWIGLU_QMV"] == "1"
@@ -337,12 +269,6 @@ let lagunaFusedGatedOutputProjectionEnabled =
 let lagunaFusedQKVProjectionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV_PROJECTION"] != "0"
 
-/// TensorFold-derived within-token batching for the serial decode stream.
-/// A native group-32 affine INT8 side layout packs Q/K/V into one batched
-/// quantized matmul, cutting their weight traffic without speculating future
-/// tokens or changing the KV dependency. Prefill stays on the original BF16
-/// projections. Two ranked chunks proved 28 layers; this final bounded chunk
-/// widens the same layout to all 40 layers.
 private let lagunaNativeAffineQKVLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_QKV"] != "0"
     else { return 0 }
@@ -353,15 +279,6 @@ private let lagunaNativeAffineQKVLayerCount: Int = {
 }()
 let lagunaNativeAffineQKVEnabled = lagunaNativeAffineQKVLayerCount > 0
 
-/// Depth-selection mode for both native affine INT8 attention layouts.
-///
-/// **Default (unset or anything but `1`) is the shipped PREFIX predicate**
-/// `layer < count`, so the shipped semantics are byte-for-byte what the ranked
-/// chunks proved. `DARKBLOOM_NATIVE_AFFINE_SUFFIX=1` selects the LAST `count`
-/// layers (`layer >= numHiddenLayers - count`) instead. It exists to measure
-/// whether the quantization perturbation the argmax gate sees depends on the
-/// DEPTH of the quantized site (an early layer's error has 39 more layers of
-/// amplification runway than a late one's) at matched weight-traffic coverage.
 private let lagunaNativeAffineSuffixSelection =
     ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_SUFFIX"] == "1"
 
@@ -402,20 +319,6 @@ private func lagunaUseNativeAffineQKV(layer: Int) -> Bool {
         onlyLayer: lagunaNativeAffineQKVOnlyLayer)
 }
 
-/// The same native group-32 affine INT8 side layout applied to the attention
-/// output projection. `o_proj` is the single largest BF16 decode weight read
-/// left in the attention block — 30 sliding layers at `[2048, 8192]` plus 10
-/// full-attention layers at `[2048, 6144]` is ~1.2 GB of the decode token's
-/// weight traffic — and unlike Q/K/V it is read *after* SDPA, so quantizing it
-/// changes nothing about the KV dependency or the cache contents.
-///
-/// Decode only: prefill and every non-`[1, 1, ·]` call keep the BF16 parameter,
-/// which stays authoritative and resident. The first 16 layers are the
-/// acceptance-band-safe first chunk; later submissions can widen the same
-/// layout the way `DARKBLOOM_NATIVE_AFFINE_QKV_LAYERS` was widened.
-///
-/// Set `DARKBLOOM_NATIVE_AFFINE_OPROJ=0` (or `..._LAYERS=0`) to fall back to
-/// the exact stock gated projection inside the same binary.
 private let lagunaNativeAffineOProjLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OPROJ"] != "0"
     else { return 0 }
@@ -675,6 +578,14 @@ let lagunaRouterRowsPerGroup: Int = {
     return value
 }()
 
+/// Adds one decode-only enqueue point after the final RMSNorm when the normal
+/// per-layer async schedule is active. The layer-39 fire can only enqueue the
+/// decoder stack; this extra fire lets the GPU execute the dependent final
+/// norm while the host constructs the lm_head graph. Set
+/// `DARKBLOOM_DECODE_TAIL_NORM_ASYNC=0` for the exact prior schedule.
+private let lagunaDecodeTailNormAsyncEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_TAIL_NORM_ASYNC"] != "0"
+
 /// `DARKBLOOM_DECODE_ASYNC_STAGE` (default `at:1,7,15,23,31,39`): process-once
 /// boundary schedule for decode-step async scheduling. Active only when the
 /// invocation input shape is exactly `[1, 1]`; prefill and multi-token shapes
@@ -688,6 +599,20 @@ private enum LagunaDecodeAsyncStage {
     case explicit(UInt64)
     case norm
     case logits
+
+    /// Whether this schedule should enqueue the final RMSNorm. The historical
+    /// `.norm` probe remains independent of the new kill switch; only ordinary
+    /// per-layer schedules gain the extra fire.
+    var firesAfterFinalNorm: Bool {
+        switch self {
+        case .layer, .ladder, .explicit:
+            return lagunaDecodeTailNormAsyncEnabled
+        case .norm:
+            return true
+        case .off, .logits:
+            return false
+        }
+    }
 }
 
 /// Two schedule families, both special cases of the `at:i,j,k` boundary set:
@@ -11077,7 +11002,7 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         // vocabulary head so prefill neither normalizes nor projects the
         // preceding rows. For single-token decode the slice is a no-op.
         let hidden = model.norm(lagunaLastTokenHidden(fullHidden))
-        if case .norm = lagunaDecodeAsyncStage, inputs.shape == [1, 1] {
+        if inputs.shape == [1, 1], lagunaDecodeAsyncStage.firesAfterFinalNorm {
             asyncEval(hidden)
         }
 
