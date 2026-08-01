@@ -849,6 +849,50 @@ void qmm_splitk(
   int k_partition_size = K / split_k;
   int split_k_partition_stride = M * N;
 
+  // Fused split-K replay (DARKBLOOM_QMM_SPLITK_FUSED=0 restores the shipped
+  // three-dispatch chain): one dispatch runs the identical per-partition
+  // loader/MMA schedule, emulates each partition store's T-rounding
+  // in-register, and chains partitions in FP32 in the same order the
+  // strided reduce summed the old intermediate — bit-identical output with
+  // no intermediate buffer, no reduce and no second dispatch.
+  static const bool splitk_fused_enabled = [] {
+    const char* raw = getenv("DARKBLOOM_QMM_SPLITK_FUSED");
+    return !(raw && raw[0] == '0');
+  }();
+  if (splitk_fused_enabled && !biases && mode != "affine" &&
+      M % 32 == 0 && N % 32 == 0) {
+    auto& compute_encoder = metal::get_command_encoder(s);
+    MTL::Size group_dims(32, 2, 2);
+    MTL::Size grid_dims(n_tiles, m_tiles, 1);
+    bool aligned = N % 32 == 0;
+    std::string type_string = get_type_string(x.dtype());
+    std::string kname;
+    kname.reserve(64);
+    concatenate(
+        kname,
+        mode + "_qmm_t_splitk_fused_",
+        type_string,
+        "_gs_",
+        group_size,
+        "_b_",
+        bits,
+        aligned ? "_alN_true" : "_alN_false");
+    auto kernel = get_quantized_kernel_wrapped(
+        d, kname, "qmm_t_splitk_fused", mode, type_string, group_size, bits, aligned);
+    compute_encoder.set_compute_pipeline_state(kernel);
+    int c = 0;
+    compute_encoder.set_input_array(w, c++);
+    compute_encoder.set_input_array(scales, c++);
+    compute_encoder.set_input_array(x, c++);
+    compute_encoder.set_output_array(out, c++);
+    compute_encoder.set_bytes(K, c++);
+    compute_encoder.set_bytes(N, c++);
+    compute_encoder.set_bytes(M, c++);
+    compute_encoder.set_bytes(k_partition_size, c++);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+    return;
+  }
+
   // Allocate intermediate buffer: insert split_k at the front so that
   // partition_stride = M * N matches the leading stride of the buffer.
   auto& compute_encoder = metal::get_command_encoder(s);
