@@ -520,7 +520,7 @@ METAL_FUNC void fp_qmv_quad_impl(
   }
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int num_simdgroups = 2>
 METAL_FUNC void fp_qmv_fast_impl(
     const device uint32_t* w,
     const device uint8_t* scales,
@@ -532,7 +532,6 @@ METAL_FUNC void fp_qmv_fast_impl(
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int packs_per_thread = 2;
-  constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int pack_factor = get_pack_factor<32, bits>();
   constexpr int bytes_per_pack = get_bytes_per_pack<32>();
@@ -1569,6 +1568,61 @@ template <typename T, int group_size, int bits>
       w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
+// Wide-threadgroup twin of fp_gather_qmv_fast: num_simdgroups simdgroups of
+// four rows per threadgroup instead of the fixed two. Bit-exact at whole-row
+// granularity: a row's K reduction is simdgroup-local and its per-lane column
+// ownership, block order and single simd_sum are unchanged; the geometry only
+// moves whole rows between threadgroups. The host dispatches this only when
+// out_vec_size % (4 * num_simdgroups) == 0.
+template <typename T, int group_size, int bits, int num_simdgroups>
+[[kernel]] void fp_gather_qmv_fast_wide(
+    const device uint32_t* w,
+    const device uint8_t* scales,
+    const device T* x,
+    const device uint32_t* lhs_indices,
+    const device uint32_t* rhs_indices,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* s_strides,
+    const constant int& batch_ndims,
+    const constant int* batch_shape,
+    const constant int64_t* lhs_strides,
+    const constant int64_t* rhs_strides,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  int M = x_shape[x_batch_ndims];
+  adjust_matrix_offsets(
+      x,
+      w,
+      scales,
+      lhs_indices,
+      rhs_indices,
+      y,
+      out_vec_size * M,
+      batch_ndims,
+      batch_shape,
+      lhs_strides,
+      rhs_strides,
+      x_batch_ndims,
+      x_shape,
+      x_strides,
+      w_batch_ndims,
+      w_shape,
+      w_strides,
+      s_strides,
+      tid);
+  fp_qmv_fast_impl<T, group_size, bits, num_simdgroups>(
+      w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
 template <typename T, int group_size, int bits>
 [[kernel]] void fp_gather_qmv(
     const device uint32_t* w,
@@ -1792,6 +1846,126 @@ template <
       lid,
       simd_gid,
       simd_lid);
+}
+
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const bool aligned_N,
+    const int BM = 32,
+    const int BK = 32,
+    const int BN = 32>
+[[kernel]] void fp_qmm_t_splitk_fused(
+    const device uint32_t* w [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    const device T* x [[buffer(2)]],
+    device T* y [[buffer(3)]],
+    const constant int& K [[buffer(4)]],
+    const constant int& N [[buffer(5)]],
+    const constant int& M [[buffer(6)]],
+    const constant int& k_partition_size [[buffer(7)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  // Single-dispatch replay of the exact split-K arithmetic: per partition
+  // the SAME loader/MMA schedule as fp_qmm_t_impl, the partition store's
+  // T-round emulated in-register, partitions FP32-chained in the reduce's
+  // order, final store via the standard BlockMMA path (same output round).
+  static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
+  static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
+
+  (void)lid;
+
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int pack_factor = get_pack_factor<8, bits>();
+  constexpr int bytes_per_pack = get_bytes_per_pack();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  using mma_t = mlx::steel::
+      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using loader_w_t = QuantizedBlockLoader<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      1,
+      WM * WN * SIMD_SIZE,
+      group_size,
+      bits>;
+
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+
+  auto wl = (const device uint8_t*)w;
+
+  const device T* x_row = x + y_row * static_cast<int64_t>(K);
+  wl += y_col * K_w;
+  scales += y_col * K_g;
+  y += y_row * static_cast<int64_t>(N) + y_col;
+
+  const short num_els = min(BM, M - y_row);
+  const short num_outs = min(BN, N - y_col);
+  const int num_partitions = K / k_partition_size;
+
+  mma_t mma_store(simd_gid, simd_lid);
+  constexpr int kfrag = decltype(mma_store.Ctile)::kElemsPerTile;
+  thread float run_sum[kfrag];
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kfrag; i++) {
+    run_sum[i] = 0.0f;
+  }
+
+  for (int p = 0; p < num_partitions; p++) {
+    const int k_start = p * k_partition_size;
+    const device T* xp = x_row + k_start;
+    const device uint8_t* wlp = wl + k_start * bytes_per_pack / pack_factor;
+    const device uint8_t* scp = scales + k_start / group_size;
+
+    loader_x_t loader_x(xp, K, Xs, simd_gid, simd_lid);
+    loader_w_t loader_w(wlp, scp, K, Ws, simd_gid, simd_lid);
+    mma_t mma_op(simd_gid, simd_lid);
+
+    // Host guard requires M % BM == 0 and N % BN == 0 (and aligned_N), so
+    // only the all-aligned load path of fp_qmm_t_impl is replayed here.
+    for (int k = 0; k < k_partition_size; k += BK) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      loader_x.load_unsafe();
+      loader_w.load_unsafe();
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      mma_op.mma(Xs, Ws);
+      loader_x.next();
+      loader_w.next();
+    }
+
+    // Emulated partition store: T-round each accumulator element exactly as
+    // store_result's U-cast would have, then FP32-chain in partition order
+    // exactly as the strided reduce summed the old bf16 intermediate.
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kfrag; i++) {
+      run_sum[i] += static_cast<float>(static_cast<T>(mma_op.Ctile.elems()[i]));
+    }
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kfrag; i++) {
+    mma_store.Ctile.elems()[i] = run_sum[i];
+  }
+  if (num_els < BM || num_outs < BN) {
+    mma_store.store_result_safe(y, N, short2(num_outs, num_els));
+  } else {
+    mma_store.store_result(y, N);
+  }
 }
 
 template <

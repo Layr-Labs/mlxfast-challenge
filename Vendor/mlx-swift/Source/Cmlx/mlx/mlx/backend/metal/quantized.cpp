@@ -849,6 +849,50 @@ void qmm_splitk(
   int k_partition_size = K / split_k;
   int split_k_partition_stride = M * N;
 
+  // Fused split-K replay (DARKBLOOM_QMM_SPLITK_FUSED=0 restores the shipped
+  // three-dispatch chain): one dispatch runs the identical per-partition
+  // loader/MMA schedule, emulates each partition store's T-rounding
+  // in-register, and chains partitions in FP32 in the same order the
+  // strided reduce summed the old intermediate — bit-identical output with
+  // no intermediate buffer, no reduce and no second dispatch.
+  static const bool splitk_fused_enabled = [] {
+    const char* raw = getenv("DARKBLOOM_QMM_SPLITK_FUSED");
+    return !(raw && raw[0] == '0');
+  }();
+  if (splitk_fused_enabled && !biases && mode != "affine" &&
+      M % 32 == 0 && N % 32 == 0) {
+    auto& compute_encoder = metal::get_command_encoder(s);
+    MTL::Size group_dims(32, 2, 2);
+    MTL::Size grid_dims(n_tiles, m_tiles, 1);
+    bool aligned = N % 32 == 0;
+    std::string type_string = get_type_string(x.dtype());
+    std::string kname;
+    kname.reserve(64);
+    concatenate(
+        kname,
+        mode + "_qmm_t_splitk_fused_",
+        type_string,
+        "_gs_",
+        group_size,
+        "_b_",
+        bits,
+        aligned ? "_alN_true" : "_alN_false");
+    auto kernel = get_quantized_kernel_wrapped(
+        d, kname, "qmm_t_splitk_fused", mode, type_string, group_size, bits, aligned);
+    compute_encoder.set_compute_pipeline_state(kernel);
+    int c = 0;
+    compute_encoder.set_input_array(w, c++);
+    compute_encoder.set_input_array(scales, c++);
+    compute_encoder.set_input_array(x, c++);
+    compute_encoder.set_output_array(out, c++);
+    compute_encoder.set_bytes(K, c++);
+    compute_encoder.set_bytes(N, c++);
+    compute_encoder.set_bytes(M, c++);
+    compute_encoder.set_bytes(k_partition_size, c++);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+    return;
+  }
+
   // Allocate intermediate buffer: insert split_k at the front so that
   // partition_stride = M * N matches the leading stride of the buffer.
   auto& compute_encoder = metal::get_command_encoder(s);
@@ -1019,30 +1063,61 @@ void gather_qmv(
 
   int bn = 8;
   int bk = 32;
-  MTL::Size group_dims(bk, 2, 1);
-  MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
+  // DARKBLOOM_GATHER_QMV_WIDE: simdgroups per threadgroup for the fast fp
+  // gather qmv (default 2, the stock geometry; 4/8 select 128/256-thread
+  // threadgroups). Wider won local interleaved A/Bs (-0.5%) but the same
+  // geometry family regressed on the ranked M5 despite winning locally, so
+  // the default stays stock and the knob exists for on-box A/B. 4/8 re-tile
+  // WHOLE output rows only — a bit-exact scheduling change: each row's K
+  // reduction keeps its per-lane column ownership, block order and single
+  // simd_sum unchanged.
+  static const int wide_ns = []() {
+    const char* raw = getenv("DARKBLOOM_GATHER_QMV_WIDE");
+    if (raw == nullptr) {
+      return 2;
+    }
+    int v = atoi(raw);
+    return (v == 4 || v == 8) ? v : 2;
+  }();
 
   std::string kname;
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
   bool fast = N % bn == 0 && K % 512 == 0;
+  bool wide =
+      fast && mode != "affine" && wide_ns > 2 && N % (4 * wide_ns) == 0;
+  MTL::Size group_dims(bk, wide ? wide_ns : 2, 1);
+  MTL::Size grid_dims(
+      M, wide ? (N / (4 * wide_ns)) : ((N + bn - 1) / bn), B);
   concatenate(
       kname,
-      mode + (fast ? "_gather_qmv_fast_" : "_gather_qmv_"),
+      mode +
+          (wide ? "_gather_qmv_fast_wide_w" + std::to_string(wide_ns) + "_"
+                : (fast ? "_gather_qmv_fast_" : "_gather_qmv_")),
       type_string,
       "_gs_",
       group_size,
       "_b_",
       bits);
 
-  auto kernel = get_quantized_kernel_wrapped(
-      d,
-      kname,
-      (fast ? "gather_qmv_fast" : "gather_qmv"),
-      mode,
-      type_string,
-      group_size,
-      bits);
+  auto kernel = wide
+      ? get_quantized_kernel_wrapped(
+            d,
+            kname,
+            "gather_qmv_fast_wide",
+            mode,
+            type_string,
+            group_size,
+            bits,
+            wide_ns)
+      : get_quantized_kernel_wrapped(
+            d,
+            kname,
+            (fast ? "gather_qmv_fast" : "gather_qmv"),
+            mode,
+            type_string,
+            group_size,
+            bits);
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);

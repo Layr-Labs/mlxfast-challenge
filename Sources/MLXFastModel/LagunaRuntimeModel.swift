@@ -4099,7 +4099,9 @@ func lagunaGatedAffineOProj(
 /// group-16 NVFP4 output projection. It folds the softplus gate, broadcast
 /// product, and contraction into one dispatch while preserving the BF16 gate
 /// rounding point and the stock NVFP4 accumulation geometry.
-private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
+private func lagunaGatedAffineOProjNVFP4Source(
+    heads: Int, numSimdgroups: Int, rowsPerSimdgroup: Int
+) -> String {
     let scaleFold = lagunaNvfp4ScaleFoldEnabled
     let weightScale = scaleFold ? "" : " * 16384.0f"
     let extract = """
@@ -4121,8 +4123,8 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
     constexpr uint values_per_thread = 16;
     constexpr uint codes_per_thread = values_per_thread / 8;
     constexpr uint block_size = values_per_thread * 32;
-    constexpr uint results_per_simdgroup = 4;
-    constexpr uint num_simdgroups = 2;
+    constexpr uint results_per_simdgroup = \(rowsPerSimdgroup);
+    constexpr uint num_simdgroups = \(numSimdgroups);
     constexpr uint in_vec_size_g = in_vec_size / group_size;
 
     uint tile = threadgroup_position_in_grid.x;
@@ -4157,7 +4159,7 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
     const device bfloat* xp = attention_output + simd_lid * values_per_thread;
 
     thread float x_thread[values_per_thread];
-    thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+    thread float result[results_per_simdgroup] = {0.0f};
 
     uint column = simd_lid * values_per_thread;
     for (uint k = 0; k < in_vec_size; k += block_size) {
@@ -4213,17 +4215,37 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
     """
 }
 
+/// Separate geometry knob for the o_proj NVFP4 qmv
+/// (`DARKBLOOM_OPROJ_GEOM=g<simdgroups>x<rows>`, default the stock `g2x4`;
+/// wider variants won local A/Bs but regressed on the ranked box — see the
+/// QKV knob's doc) so QKV and o_proj geometry experiments never confound
+/// each other. Same bit-exactness argument as the QKV knob: whole-row
+/// granularity only.
+private let lagunaOProjNVFP4Geometry: (numSimdgroups: Int, rowsPerSimdgroup: Int) = {
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_OPROJ_GEOM"] ?? "g2x4"
+    let parts = raw.dropFirst().split(separator: "x")
+    guard raw.hasPrefix("g"), parts.count == 2,
+        let ns = Int(parts[0]), let rps = Int(parts[1]),
+        [1, 2, 4, 8].contains(ns), rps > 0, rps <= 16,
+        512 % (32 * ns) == 0,
+        LagunaConstants.hiddenSize % (ns * rps) == 0
+    else { return (2, 4) }
+    return (ns, rps)
+}()
+
 private let lagunaGatedAffineOProjNVFP4Kernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    let (ns, rps) = lagunaOProjNVFP4Geometry
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_v1",
+            name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_g\(ns)x\(rps)_v1",
             inputNames: [
                 "attention_output", "gate_logits", "weight_codes",
                 "weight_scales",
             ],
             outputNames: ["projected"],
-            source: lagunaGatedAffineOProjNVFP4Source(heads: heads),
+            source: lagunaGatedAffineOProjNVFP4Source(
+                heads: heads, numSimdgroups: ns, rowsPerSimdgroup: rps),
             ensureRowContiguous: true
         )
     }
@@ -4253,10 +4275,12 @@ func lagunaGatedAffineOProjNVFP4(
     }
 
     lagunaTrace("gated affine oproj nvfp4 qmv h\(heads)")
+    let (ns, rps) = lagunaOProjNVFP4Geometry
+    let tgThreads = 32 * ns
     return kernel(
         [attentionOutput, gateLogits, codes, scales],
-        grid: ((outVec / 8) * 64, 1, 1),
-        threadGroup: (64, 1, 1),
+        grid: ((outVec / (ns * rps)) * tgThreads, 1, 1),
+        threadGroup: (tgThreads, 1, 1),
         outputShapes: [[1, 1, outVec]],
         outputDTypes: [.bfloat16]
     )[0]
@@ -4410,22 +4434,24 @@ private let lagunaTailNVFP4QMVHeader = """
 /// stock three-dispatch chain. `DARKBLOOM_TAIL_NORM_QKV_GATE=0` ablates
 /// inside the same binary; `DARKBLOOM_TAIL_NORM_QKV_GATE_LAYERS=N` bounds
 /// coverage to layers 32 <= layerIdx < N (default 40).
-private func lagunaTailNormQKVGateSource(heads: Int) -> String {
+private func lagunaTailNormQKVGateSource(
+    heads: Int, numSimdgroups: Int, rowsPerSimdgroup: Int
+) -> String {
     let qkvRows =
         (heads + 2 * LagunaConstants.numKeyValueHeads) * LagunaConstants.headDim
     return """
     constexpr uint axis_size = \(LagunaConstants.hiddenSize);
     constexpr uint qkv_rows = \(qkvRows);
     constexpr uint gate_rows = \(heads);
-    constexpr uint qkv_tiles = qkv_rows / 8;
+    constexpr uint qkv_tiles = qkv_rows / \(numSimdgroups * rowsPerSimdgroup);
     constexpr uint n_reads = 4;                 // RMS_N_READS
     constexpr uint norm_threads = axis_size / n_reads;   // 512 virtual threads
-    constexpr uint real_threads = 64;
-    constexpr uint virtual_per_thread = norm_threads / real_threads;  // 8
+    constexpr uint real_threads = \(32 * numSimdgroups);
+    constexpr uint virtual_per_thread = norm_threads / real_threads;
     constexpr uint simd_size = 32;
     constexpr float norm_eps = 1.0e-6f;
-    constexpr uint results_per_simdgroup = 4;
-    constexpr uint num_simdgroups = 2;
+    constexpr uint results_per_simdgroup = \(rowsPerSimdgroup);
+    constexpr uint num_simdgroups = \(numSimdgroups);
     constexpr uint nv_values_per_thread = 16;   // pack_factor 8 * packs_per_thread 2
     constexpr uint nv_block_size = 512;         // nv_values_per_thread * SIMD_SIZE
     constexpr uint nv_in_vec_size_w = axis_size / 2;
@@ -4486,7 +4512,7 @@ private func lagunaTailNormQKVGateSource(heads: Int) -> String {
             out_row * nv_in_vec_size_g + simd_lid;
 
         thread float x_thread[nv_values_per_thread];
-        thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread float result[results_per_simdgroup] = {0.0f};
 
         uint column = simd_lid * nv_values_per_thread;
         for (uint k = 0; k < axis_size; k += nv_block_size) {
@@ -4515,6 +4541,10 @@ private func lagunaTailNormQKVGateSource(heads: Int) -> String {
         }
     } else {
         // --- affine qmv_fast_impl<bfloat16_t, 32, 8> replica for the gate ---
+        // Row-bound guards (simdgroup-uniform, whole-row granularity) let the
+        // gate bank tile with a ceil'd final tile when rows_per_tile does not
+        // divide gate_rows; guarded rows are never loaded, computed or stored,
+        // so every produced row's arithmetic is untouched.
         uint gate_tile = tile - qkv_tiles;
         uint gate_out_row =
             gate_tile * (num_simdgroups * results_per_simdgroup) +
@@ -4528,7 +4558,11 @@ private func lagunaTailNormQKVGateSource(heads: Int) -> String {
             gate_out_row * gate_in_vec_size_g + simd_lid / gate_scale_step;
 
         thread float x_thread[gate_values_per_thread];
-        thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread float result[results_per_simdgroup] = {0.0f};
+
+        uint gate_live_rows = (gate_out_row < gate_rows)
+            ? min(uint(results_per_simdgroup), gate_rows - gate_out_row)
+            : 0;
 
         uint column = simd_lid * gate_values_per_thread;
         for (uint k = 0; k < axis_size; k += gate_block_size) {
@@ -4541,7 +4575,7 @@ private func lagunaTailNormQKVGateSource(heads: Int) -> String {
                 x_thread[i] = value;
             }
 
-            for (uint row = 0; row < results_per_simdgroup; ++row) {
+            for (uint row = 0; row < gate_live_rows; ++row) {
                 const device uint8_t* wl = ws + row * axis_size;
                 float scale = float(sc[row * gate_in_vec_size_g]);
                 float bias = float(bs[row * gate_in_vec_size_g]);
@@ -4558,7 +4592,7 @@ private func lagunaTailNormQKVGateSource(heads: Int) -> String {
             column += gate_block_size;
         }
 
-        for (uint row = 0; row < results_per_simdgroup; ++row) {
+        for (uint row = 0; row < gate_live_rows; ++row) {
             result[row] = simd_sum(result[row]);
             if (simd_lid == 0) {
                 gate_logits[gate_out_row + row] = bfloat(result[row]);
@@ -4568,20 +4602,54 @@ private func lagunaTailNormQKVGateSource(heads: Int) -> String {
     """
 }
 
+/// Threadgroup geometry knob `DARKBLOOM_TAIL_QKV_GEOM` = `g<simdgroups>x<rows>`
+/// (default `g2x4`, the stock `fp_qmv_fast` shape). Wider variants (`g4x4`,
+/// `g8x4`) measured -1.8% decode wall locally — mirrored 400-step A/B AND a
+/// fresh-worker 128-step box-protocol replay — but the ranked M5 measured
+/// them ~+3% SLOWER (run 30719874747 vs the same content at stock geometry),
+/// most plausibly a Metal-compiler-version difference between the boxes, so
+/// the shipped default stays stock and the knob remains for on-box A/B only.
+/// Every geometry is bit-identical: a row's K reduction never leaves its
+/// simdgroup and keeps the same per-lane column ownership, block order and
+/// single `simd_sum`, and the norm emulation's virtual-thread mapping
+/// (`vt = r + real_threads * j`, slot `simd_gid + num_simdgroups * j`) lands
+/// the same 16 partials in the same `local_sums` slots for every
+/// `real_threads` divisor of 512. Geometry only moves whole rows between
+/// threadgroups.
+private let lagunaTailNormQKVGateGeometry: (numSimdgroups: Int, rowsPerSimdgroup: Int) = {
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_TAIL_QKV_GEOM"] ?? "g2x4"
+    let parts = raw.dropFirst().split(separator: "x")
+    guard raw.hasPrefix("g"), parts.count == 2,
+        let ns = Int(parts[0]), let rps = Int(parts[1]),
+        [1, 2, 4, 8].contains(ns), rps > 0, rps <= 16
+    else { return (2, 4) }
+    return (ns, rps)
+}()
+
 /// One kernel per attention head count, built eagerly so one binary serves
 /// every arm of an ablation and MLX's name-keyed JIT cache never sees two
-/// sources under one name.
+/// sources under one name. The kernel name carries the scale-fold arm and the
+/// geometry so ablation arms never collide in the JIT cache either.
 private let lagunaTailNormQKVGateKernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    let (ns, rps) = lagunaTailNormQKVGateGeometry
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        let qkvRows =
+            (heads + 2 * LagunaConstants.numKeyValueHeads) * LagunaConstants.headDim
+        // The QKV bank must tile exactly (its half carries no row guard); the
+        // gate half bounds its ceil'd final tile itself. The norm emulation
+        // needs real_threads to divide the 512 virtual threads.
+        guard qkvRows % (ns * rps) == 0, 512 % (32 * ns) == 0
+        else { continue }
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_tail_norm_qkv_gate_bf16_h\(heads)_sf\(lagunaTailNVFP4ScaleFoldEnabled ? 1 : 0)_v2",
+            name: "laguna_tail_norm_qkv_gate_bf16_h\(heads)_sf\(lagunaTailNVFP4ScaleFoldEnabled ? 1 : 0)_g\(ns)x\(rps)_v2",
             inputNames: [
                 "residual", "norm_weight", "weight_codes", "weight_scales",
                 "gate_codes", "gate_scales", "gate_biases",
             ],
             outputNames: ["qkv", "gate_logits"],
-            source: lagunaTailNormQKVGateSource(heads: heads),
+            source: lagunaTailNormQKVGateSource(
+                heads: heads, numSimdgroups: ns, rowsPerSimdgroup: rps),
             header: lagunaTailNVFP4QMVHeader,
             ensureRowContiguous: true
         )
@@ -4657,13 +4725,17 @@ func lagunaTailNormQKVGate(
     }
 
     lagunaTrace("tail norm+qkv+gate h\(heads)")
+    let (ns, rps) = lagunaTailNormQKVGateGeometry
+    let tgThreads = 32 * ns
+    let rowsPerTile = ns * rps
+    let tiles = qkvRows / rowsPerTile + (heads + rowsPerTile - 1) / rowsPerTile
     let outputs = kernel(
         [
             residual, normWeight, qkvBank.packedCodes, qkvBank.scales,
             gateBank.packedCodes, gateBank.scales, gateBiases,
         ],
-        grid: (((qkvRows + heads) / 8) * 64, 1, 1),
-        threadGroup: (64, 1, 1),
+        grid: (tiles * tgThreads, 1, 1),
+        threadGroup: (tgThreads, 1, 1),
         outputShapes: [[1, 1, qkvRows], [1, 1, heads]],
         outputDTypes: [.bfloat16, .bfloat16]
     )
