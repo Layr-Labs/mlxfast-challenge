@@ -140,22 +140,21 @@ let lagunaFusedRoutedSharedDownResidualEnabled =
 let lagunaFusedRoutedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_SWIGLU_QMV"] != "0"
 
-/// `DARKBLOOM_PACKED_SCALES` (default OFF; set "1" to enable): decode-only
+/// `DARKBLOOM_PACKED_SCALES` (default ON; set "0" to disable): decode-only
 /// scale-interleaved side copy of the fused routed gate/up NVFP4 bank. The
 /// stock `lagunaRoutedSwiGLUQMV` reads codes and E4M3 scales from two separate
 /// tensors (four device streams per simdgroup iteration: gate codes, up
-/// codes, gate scales, up scales). The packed bank stores, in the kernel's
-/// exact walk order `[expert][tile 128][k-block 4][row-pair sub 8]`, one
-/// 288-byte region per (row, k-block) = 32 scale bytes followed by that
-/// block's 256 code bytes, so each threadgroup reads one contiguous
-/// 2,304-byte span per k-block (a 9,216-byte sequential tile region total).
-/// Load count, load widths, dequant expressions, accumulation order, and
-/// every BF16 boundary are identical to the stock kernel — only address
-/// computation changes, so the packed dispatch is bit-exact (class A).
-/// Memory: +~302 MB resident per sparse layer while enabled (the stock fused
-/// bank stays resident for prefill and for the fallback paths).
+/// codes, gate scales, up scales). The packed side bank stores only the 32
+/// scale bytes for each row and K block, in the kernel's exact walk order
+/// `[expert][tile 128][k-block 4][row-pair sub 8]`; the resident fused code
+/// bank is reused directly. Load widths, dequant expressions, accumulation
+/// order, and every BF16 boundary are identical to the stock kernel — only
+/// scale address computation changes, so the packed dispatch is bit-exact
+/// (class A).
+/// Memory: +~32 MB resident per sparse layer while enabled (the stock fused
+/// code bank stays resident for prefill and fallback paths).
 let lagunaPackedScalesEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] == "1"
+    ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] != "0"
 
 /// One-shot stderr visibility for the packed-scales arm: with the flag set,
 /// the arm MUST announce either "active" (bank built / packed dispatch taken)
@@ -5480,20 +5479,18 @@ func lagunaRoutedSwiGLUQMV(
 }
 
 /// `DARKBLOOM_PACKED_SCALES` twin of `lagunaRoutedSwiGLUQMVKernel` consuming
-/// the walk-order scale-interleaved side bank built by
+/// the walk-order scale side bank built by
 /// `preparePackedRoutedGateUpBank`. Bank layout, per expert:
-/// `[tile 128][k-block 4][sub 8][288 bytes]` where `sub =
-/// (simd_group*2 + row)*2 + {0 gate, 1 up}` and a 288-byte region is the
-/// row's 32 E4M3 scale bytes for that 512-value K block followed by its 256
-/// code bytes. The stock kernel's `gate_row/up_row` remap is baked into the
-/// bank, so per (row, k-block, lane) this kernel issues the identical loads
-/// (one scale byte + one uint2 of codes) and runs the textually identical
-/// dequant/accumulate/SwiGLU chain — only the address computation differs,
-/// turning four scattered device streams per simdgroup iteration into one
-/// contiguous 2,304-byte span per threadgroup per k-block.
+/// `[tile 128][k-block 4][sub 8][32 scale bytes]` where `sub =
+/// (simd_group*2 + row)*2 + {0 gate, 1 up}`. The stock kernel's
+/// `gate_row/up_row` remap is baked into the scale bank while its fused code
+/// bank is reused directly, so per (row, k-block, lane) this kernel issues
+/// the identical one-byte scale and uint2 code loads and runs the textually
+/// identical dequant/accumulate/SwiGLU chain — only scale address computation
+/// differs.
 private let lagunaRoutedSwiGLUQMVPackedKernel = MLXFast.metalKernel(
     name: "laguna_routed_nvfp4_swiglu_qmv_packed_bf16_v1",
-    inputNames: ["input", "packed_bank", "indices"],
+    inputNames: ["input", "fused_weight", "packed_scales", "indices"],
     outputNames: ["activated"],
     source: """
         constexpr uint input_width = 2048;
@@ -5501,12 +5498,13 @@ private let lagunaRoutedSwiGLUQMVPackedKernel = MLXFast.metalKernel(
         constexpr uint block_width = 512;
         constexpr uint values_per_lane = 16;
         constexpr uint routed_experts = 8;
-        // 32 scale bytes + 256 code bytes for one row's 512-value K block.
-        constexpr uint region_bytes = 288;
-        constexpr uint pair_bytes = 2 * region_bytes;
-        constexpr uint kblock_bytes = 4 * pair_bytes;
-        constexpr uint tile_bytes = 4 * kblock_bytes;
-        constexpr uint packed_expert_bytes = 128 * tile_bytes;
+        constexpr uint fused_row_bytes = 1024;
+        constexpr uint fused_expert_bytes = 1024 * fused_row_bytes;
+        constexpr uint scale_row_bytes = 32;
+        constexpr uint scale_sub_bytes = 8 * scale_row_bytes;
+        constexpr uint scale_kblock_bytes = scale_sub_bytes;
+        constexpr uint scale_tile_bytes = 4 * scale_kblock_bytes;
+        constexpr uint packed_expert_bytes = 128 * scale_tile_bytes;
 
         uint group = threadgroup_position_in_grid.x;
         uint expert_slot = group % routed_experts;
@@ -5516,9 +5514,12 @@ private let lagunaRoutedSwiGLUQMVPackedKernel = MLXFast.metalKernel(
         uint lane = thread_index_in_simdgroup;
         uint first_row = tile * 4 + simd_group * 2;
 
-        const device uint8_t* tile_packed =
-            (const device uint8_t*)packed_bank +
-            expert * packed_expert_bytes + tile * tile_bytes;
+        const device uint8_t* expert_weight =
+            (const device uint8_t*)fused_weight +
+            expert * fused_expert_bytes;
+        const device uint8_t* tile_scales =
+            packed_scales + expert * packed_expert_bytes
+            + tile * scale_tile_bytes;
 
         thread float gate_result[2] = {0.0f, 0.0f};
         thread float up_result[2] = {0.0f, 0.0f};
@@ -5536,18 +5537,23 @@ private let lagunaRoutedSwiGLUQMVPackedKernel = MLXFast.metalKernel(
                 input_values[4 * i + 3] = values[3];
             }
 
-            const device uint8_t* block_packed =
-                tile_packed + (block / block_width) * kblock_bytes;
+            const device uint8_t* block_scales =
+                tile_scales + (block / block_width) * scale_kblock_bytes;
             for (uint row = 0; row < 2; ++row) {
-                const device uint8_t* pair_packed =
-                    block_packed + (simd_group * 2 + row) * pair_bytes;
-                const device uint8_t* gate_scale = pair_packed + lane;
-                const device uint8_t* gate_weight =
-                    pair_packed + 32 + lane * 8;
+                uint logical_row = tile * 4 + simd_group * 2 + row;
+                uint gate_row = (logical_row / 32) * 64 + logical_row % 32;
+                uint up_row = gate_row + 32;
+                uint sub = simd_group * 2 + row;
+                const device uint8_t* gate_scale =
+                    block_scales + sub * 2 * scale_row_bytes + lane;
                 const device uint8_t* up_scale =
-                    pair_packed + region_bytes + lane;
+                    gate_scale + scale_row_bytes;
+                const device uint8_t* gate_weight =
+                    expert_weight + gate_row * fused_row_bytes
+                    + block / 2 + lane * 8;
                 const device uint8_t* up_weight =
-                    pair_packed + region_bytes + 32 + lane * 8;
+                    expert_weight + up_row * fused_row_bytes
+                    + block / 2 + lane * 8;
 
                 gate_result[row] += laguna_nvfp4_qdot_16(
                     gate_weight,
@@ -5583,23 +5589,31 @@ private let lagunaRoutedSwiGLUQMVPackedKernel = MLXFast.metalKernel(
 
 func lagunaRoutedSwiGLUQMVPacked(
     _ input: MLXArray,
-    packedBank: MLXArray,
+    fusedWeight: MLXArray,
+    packedScales: MLXArray,
     indices: MLXArray
 ) -> MLXArray {
     precondition(input.dtype == .bfloat16)
     precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
-    precondition(packedBank.dtype == .uint8)
+    precondition(fusedWeight.dtype == .uint32)
     precondition(
-        packedBank.shape == [
+        fusedWeight.shape == [
+            LagunaConstants.numExperts,
+            2 * LagunaConstants.moeIntermediateSize,
+            LagunaConstants.hiddenSize / 8,
+        ])
+    precondition(packedScales.dtype == .uint8)
+    precondition(
+        packedScales.shape == [
             LagunaConstants.numExperts,
             2 * LagunaConstants.moeIntermediateSize * 4,
-            288,
+            LagunaConstants.hiddenSize / 64,
         ])
     precondition(indices.dtype == .uint32)
     precondition(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
 
     return lagunaRoutedSwiGLUQMVPackedKernel(
-        [input, packedBank, indices],
+        [input, fusedWeight, packedScales, indices],
         grid: (LagunaConstants.numExpertsPerTok * 128 * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[
@@ -7193,7 +7207,190 @@ private let lagunaDecodeRouterTop8NormalizingKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-private func lagunaDecodeRouterTop8(
+/// Default-on decode-router payload optimization. Set
+/// `DARKBLOOM_ROUTER_ORDINAL=0` for the accepted float-payload fallback. The
+/// accepted bitonic
+/// network carries `(float key, uint index, float score)` through all 36
+/// compare/exchange stages. The ordinal arm preserves that network's exact
+/// stage, shuffle, barrier, and pair-role geometry, but replaces the live
+/// payload with `(uint ordinal, uint index)`. `laguna_router_key_ordinal`
+/// canonicalizes both signed zeros and every NaN before applying the usual
+/// monotone IEEE-754 bit transform, so unsigned ordinal comparison plus the
+/// original expert-index tie break is exactly `laguna_router_key_before`.
+/// Only final lanes 0...7 recompute their pre-bias sigmoid score.
+private func lagunaDecodeRouterOrdinalKernelSource(
+    normalizing: Bool, scoreTable: Bool = false
+) -> String {
+    let scoreStorage =
+        scoreTable
+        ? "threadgroup float original_scores[256];"
+        : ""
+    let scoreStore =
+        scoreTable
+        ? "original_scores[lane] = score;"
+        : ""
+    let winnerScore =
+        scoreTable
+        ? """
+            my_score = original_scores[my_index];
+        """
+        : """
+            float winner_x = float(logits[my_index]);
+            float winner_y = 1.0f / (1.0f + metal::exp(metal::abs(winner_x)));
+            my_score = winner_x < 0.0f ? winner_y : 1.0f - winner_y;
+        """
+    let epilogue =
+        normalizing
+        ? """
+        float my_score = 0.0f;
+        if (lane < 8) {
+        \(winnerScore)
+        }
+        float total = 0.0f;
+        for (uint i = 0; i < 8; ++i) {
+            total = simd_shuffle(my_score, ushort(i)) + total;
+        }
+        if (lane < 8) {
+            router_indices[lane] = my_index;
+            router_scores[lane] = my_score / total;
+        }
+        """
+        : """
+        if (lane < 8) {
+            float my_score = 0.0f;
+        \(winnerScore)
+            router_indices[lane] = my_index;
+            router_scores[lane] = my_score;
+        }
+        """
+    return """
+        uint lane = thread_position_in_threadgroup.x;
+
+        threadgroup uint xchg_ordinals[256];
+        threadgroup uint xchg_indices[256];
+        \(scoreStorage)
+
+        float x = float(logits[lane]);
+        float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+        float score = x < 0.0f ? y : 1.0f - y;
+        \(scoreStore)
+        float key = -(score + float(correction_bias[lane]));
+        uint my_ordinal = laguna_router_key_ordinal(key);
+        uint my_index = lane;
+
+        // Byte-for-byte the accepted 256-element Batcher schedule and pair
+        // roles: 30 intra-simdgroup stages and six cross-simdgroup stages.
+        // Only the exact sortable payload representation differs.
+        for (uint sequence = 2; sequence <= 256; sequence <<= 1) {
+            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+                uint other_ordinal;
+                uint other_index;
+                if (stride < 32) {
+                    other_ordinal = simd_shuffle_xor(my_ordinal, ushort(stride));
+                    other_index = simd_shuffle_xor(my_index, ushort(stride));
+                } else {
+                    xchg_ordinals[lane] = my_ordinal;
+                    xchg_indices[lane] = my_index;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    uint partner = lane ^ stride;
+                    other_ordinal = xchg_ordinals[partner];
+                    other_index = xchg_indices[partner];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+
+                bool is_lower = (lane & stride) == 0;
+                bool lower_wants_better = (lane & sequence) == 0;
+                bool want_better = lower_wants_better == is_lower;
+                bool other_before_my = laguna_router_ordinal_before(
+                    other_ordinal, other_index, my_ordinal, my_index);
+                // Expert indices are globally unique, so `my` and `other`
+                // can never compare equal. This is the accepted a/b pair-role
+                // rule reduced algebraically to a direct take-other decision.
+                bool take_other = want_better ? other_before_my : !other_before_my;
+                if (take_other) {
+                    my_ordinal = other_ordinal;
+                    my_index = other_index;
+                }
+            }
+        }
+
+        \(epilogue)
+        """
+}
+
+private let lagunaDecodeRouterOrdinalHeader = """
+    METAL_FUNC uint laguna_router_key_ordinal(float key) {
+        uint bits = as_type<uint>(key);
+        uint magnitude = bits & 0x7FFFFFFFu;
+        if (magnitude > 0x7F800000u) {
+            return 0xFFFFFFFFu;
+        }
+        // The accepted comparator considers -0 and +0 equal and breaks that
+        // tie only by original expert index.
+        if (magnitude == 0u) {
+            return 0x80000000u;
+        }
+        return (bits & 0x80000000u) != 0u ? ~bits : (bits ^ 0x80000000u);
+    }
+
+    METAL_FUNC bool laguna_router_ordinal_before(
+        uint a, uint a_index, uint b, uint b_index) {
+        if (a < b) {
+            return true;
+        }
+        if (b < a) {
+            return false;
+        }
+        return a_index < b_index;
+    }
+    """
+
+private let lagunaDecodeRouterOrdinalKernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_top8_ordinal_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterOrdinalKernelSource(normalizing: false),
+    header: lagunaDecodeRouterOrdinalHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaDecodeRouterOrdinalNormalizingKernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_top8_ordinal_norm_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterOrdinalKernelSource(normalizing: true),
+    header: lagunaDecodeRouterOrdinalHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaDecodeRouterOrdinalScoreTableKernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_top8_ordinal_table_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterOrdinalKernelSource(normalizing: false, scoreTable: true),
+    header: lagunaDecodeRouterOrdinalHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaDecodeRouterOrdinalScoreTableNormalizingKernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_top8_ordinal_table_norm_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterOrdinalKernelSource(normalizing: true, scoreTable: true),
+    header: lagunaDecodeRouterOrdinalHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaDecodeRouterOrdinalEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_ORDINAL"] != "0"
+
+/// The default ordinal arm preserves each original score once in TG memory;
+/// set `DARKBLOOM_ROUTER_ORDINAL_SCORE_TABLE=0` to recompute only the final
+/// eight sigmoid scores instead.
+private let lagunaDecodeRouterOrdinalScoreTableEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_ORDINAL_SCORE_TABLE"] != "0"
+
+func lagunaDecodeRouterTop8AcceptedForTesting(
     logits: MLXArray, correctionBias: MLXArray, normalizing: Bool = false
 ) -> (MLXArray, MLXArray) {
     precondition(logits.dtype == .bfloat16 || logits.dtype == .float32)
@@ -7211,6 +7408,70 @@ private func lagunaDecodeRouterTop8(
         outputDTypes: [.uint32, .float32]
     )
     return (outputs[0], outputs[1])
+}
+
+func lagunaDecodeRouterTop8OrdinalForTesting(
+    logits: MLXArray, correctionBias: MLXArray, normalizing: Bool = false
+) -> (MLXArray, MLXArray) {
+    precondition(logits.dtype == .bfloat16 || logits.dtype == .float32)
+    precondition(correctionBias.dtype == .float32)
+    precondition(logits.size == 256)
+    precondition(correctionBias.size == 256)
+
+    let kernel =
+        normalizing
+        ? lagunaDecodeRouterOrdinalNormalizingKernel : lagunaDecodeRouterOrdinalKernel
+    let outputs = kernel(
+        [logits, correctionBias],
+        grid: (256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1, 1, 8], [1, 1, 8]],
+        outputDTypes: [.uint32, .float32]
+    )
+    return (outputs[0], outputs[1])
+}
+
+func lagunaDecodeRouterTop8OrdinalScoreTableForTesting(
+    logits: MLXArray, correctionBias: MLXArray, normalizing: Bool = false
+) -> (MLXArray, MLXArray) {
+    precondition(logits.dtype == .bfloat16 || logits.dtype == .float32)
+    precondition(correctionBias.dtype == .float32)
+    precondition(logits.size == 256)
+    precondition(correctionBias.size == 256)
+
+    let kernel =
+        normalizing
+        ? lagunaDecodeRouterOrdinalScoreTableNormalizingKernel
+        : lagunaDecodeRouterOrdinalScoreTableKernel
+    let outputs = kernel(
+        [logits, correctionBias],
+        grid: (256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1, 1, 8], [1, 1, 8]],
+        outputDTypes: [.uint32, .float32]
+    )
+    return (outputs[0], outputs[1])
+}
+
+private func lagunaDecodeRouterTop8(
+    logits: MLXArray, correctionBias: MLXArray, normalizing: Bool = false
+) -> (MLXArray, MLXArray) {
+    if lagunaDecodeRouterOrdinalEnabled {
+        if lagunaDecodeRouterOrdinalScoreTableEnabled {
+            return lagunaDecodeRouterTop8OrdinalScoreTableForTesting(
+                logits: logits,
+                correctionBias: correctionBias,
+                normalizing: normalizing
+            )
+        }
+        return lagunaDecodeRouterTop8OrdinalForTesting(
+            logits: logits, correctionBias: correctionBias, normalizing: normalizing)
+    }
+    return lagunaDecodeRouterTop8AcceptedForTesting(
+        logits: logits,
+        correctionBias: correctionBias,
+        normalizing: normalizing
+    )
 }
 
 /// Default-on after same-binary bitwise checks over smooth, tied, and extreme
@@ -7586,6 +7847,122 @@ private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> Str
         """
 }
 
+/// Ordinal-payload mirror of the default-on prefill tournament, selected by
+/// the same default-on `DARKBLOOM_ROUTER_ORDINAL` switch as decode.
+/// Its two-phase schedule, extraction geometry, single inter-phase barrier,
+/// wrapped 64-candidate duplicate lanes, and final rank order are identical
+/// to the accepted kernel above. Only the sorting payload changes from
+/// `(float key, uint index, float score)` to `(uint ordinal, uint index)`.
+/// One per-row score table preserves the original sigmoid bytes for the
+/// final eight indexed loads without carrying scores through either network.
+private func lagunaPrefillRouterTournamentOrdinalKernelSource(normalizing: Bool) -> String {
+    let epilogue =
+        normalizing
+        ? """
+        float my_score2 = lane < 8 ? original_scores[my_index2] : 0.0f;
+        float total = 0.0f;
+        for (uint i = 0; i < 8; ++i) {
+            total = simd_shuffle(my_score2, ushort(i)) + total;
+        }
+        if (lane < 8) {
+            router_indices[row * 8 + lane] = my_index2;
+            router_scores[row * 8 + lane] = my_score2 / total;
+        }
+        """
+        : """
+        if (lane < 8) {
+            router_indices[row * 8 + lane] = my_index2;
+            router_scores[row * 8 + lane] = original_scores[my_index2];
+        }
+        """
+    return """
+        uint lane = thread_position_in_threadgroup.x;
+        uint row = threadgroup_position_in_grid.y;
+
+        threadgroup uint xchg_ordinals[256];
+        threadgroup uint xchg_indices[256];
+        threadgroup uint candidate_ordinals[64];
+        threadgroup uint candidate_indices[64];
+        threadgroup float original_scores[256];
+
+        float x = float(logits[row * 256 + lane]);
+        float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+        float score = x < 0.0f ? y : 1.0f - y;
+        original_scores[lane] = score;
+        float key = -(score + float(correction_bias[lane]));
+        uint my_ordinal = laguna_router_key_ordinal(key);
+        uint my_index = lane;
+
+        // Phase 1: identical 15-stage local 32-lane Batcher sorts.
+        for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
+            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+                uint other_ordinal = simd_shuffle_xor(my_ordinal, ushort(stride));
+                uint other_index = simd_shuffle_xor(my_index, ushort(stride));
+
+                bool is_lower = (lane & stride) == 0;
+                bool lower_wants_better = (lane & sequence) == 0;
+                bool want_better = lower_wants_better == is_lower;
+                bool other_before_my = laguna_router_ordinal_before(
+                    other_ordinal, other_index, my_ordinal, my_index);
+                bool take_other = want_better ? other_before_my : !other_before_my;
+                if (take_other) {
+                    my_ordinal = other_ordinal;
+                    my_index = other_index;
+                }
+            }
+        }
+
+        // Identical direction-aware local-top-8 extraction.
+        uint block = lane >> 5;
+        uint within_block = lane & 31;
+        bool block_ascending = (block & 1) == 0;
+        uint rank_in_block = block_ascending ? within_block : (31 - within_block);
+        bool is_local_top8 = block_ascending ? (within_block < 8) : (within_block >= 24);
+        if (is_local_top8) {
+            candidate_ordinals[block * 8 + rank_in_block] = my_ordinal;
+            candidate_indices[block * 8 + rank_in_block] = my_index;
+        }
+        // This accepted inter-phase barrier also makes every lane's initial
+        // original_scores store visible before the final indexed reads.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Phase 2: identical wrapped 64-candidate, 21-stage Batcher sort.
+        uint my_ordinal2 = candidate_ordinals[lane & 63];
+        uint my_index2 = candidate_indices[lane & 63];
+        for (uint sequence = 2; sequence <= 64; sequence <<= 1) {
+            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+                uint other_ordinal;
+                uint other_index;
+                if (stride < 32) {
+                    other_ordinal = simd_shuffle_xor(my_ordinal2, ushort(stride));
+                    other_index = simd_shuffle_xor(my_index2, ushort(stride));
+                } else {
+                    xchg_ordinals[lane] = my_ordinal2;
+                    xchg_indices[lane] = my_index2;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    uint partner = lane ^ stride;
+                    other_ordinal = xchg_ordinals[partner];
+                    other_index = xchg_indices[partner];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+
+                bool is_lower = (lane & stride) == 0;
+                bool lower_wants_better = (lane & sequence) == 0;
+                bool want_better = lower_wants_better == is_lower;
+                bool other_before_my = laguna_router_ordinal_before(
+                    other_ordinal, other_index, my_ordinal2, my_index2);
+                bool take_other = want_better ? other_before_my : !other_before_my;
+                if (take_other) {
+                    my_ordinal2 = other_ordinal;
+                    my_index2 = other_index;
+                }
+            }
+        }
+
+        \(epilogue)
+        """
+}
+
 private let lagunaPrefillRouterTournamentKernel = MLXFast.metalKernel(
     name: "laguna_prefill_router_tournament_v1",
     inputNames: ["logits", "correction_bias"],
@@ -7604,7 +7981,25 @@ private let lagunaPrefillRouterTournamentNormalizingKernel = MLXFast.metalKernel
     ensureRowContiguous: true
 )
 
-private func lagunaPrefillRouterTournament(
+private let lagunaPrefillRouterTournamentOrdinalKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_router_tournament_ordinal_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaPrefillRouterTournamentOrdinalKernelSource(normalizing: false),
+    header: lagunaDecodeRouterOrdinalHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaPrefillRouterTournamentOrdinalNormalizingKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_router_tournament_ordinal_norm_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaPrefillRouterTournamentOrdinalKernelSource(normalizing: true),
+    header: lagunaDecodeRouterOrdinalHeader,
+    ensureRowContiguous: true
+)
+
+func lagunaPrefillRouterTournamentAcceptedForTesting(
     logits: MLXArray, correctionBias: MLXArray, rows: Int, normalizing: Bool
 ) -> (MLXArray, MLXArray) {
     precondition(logits.dtype == .bfloat16 || logits.dtype == .float32)
@@ -7623,6 +8018,47 @@ private func lagunaPrefillRouterTournament(
         outputDTypes: [.uint32, .float32]
     )
     return (outputs[0], outputs[1])
+}
+
+func lagunaPrefillRouterTournamentOrdinalForTesting(
+    logits: MLXArray, correctionBias: MLXArray, rows: Int, normalizing: Bool
+) -> (MLXArray, MLXArray) {
+    precondition(logits.dtype == .bfloat16 || logits.dtype == .float32)
+    precondition(correctionBias.dtype == .float32)
+    precondition(logits.size == rows * 256)
+    precondition(correctionBias.size == 256)
+
+    let kernel =
+        normalizing
+        ? lagunaPrefillRouterTournamentOrdinalNormalizingKernel
+        : lagunaPrefillRouterTournamentOrdinalKernel
+    let outputs = kernel(
+        [logits, correctionBias],
+        grid: (256, rows, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1, rows, 8], [1, rows, 8]],
+        outputDTypes: [.uint32, .float32]
+    )
+    return (outputs[0], outputs[1])
+}
+
+private func lagunaPrefillRouterTournament(
+    logits: MLXArray, correctionBias: MLXArray, rows: Int, normalizing: Bool
+) -> (MLXArray, MLXArray) {
+    if lagunaDecodeRouterOrdinalEnabled {
+        return lagunaPrefillRouterTournamentOrdinalForTesting(
+            logits: logits,
+            correctionBias: correctionBias,
+            rows: rows,
+            normalizing: normalizing
+        )
+    }
+    return lagunaPrefillRouterTournamentAcceptedForTesting(
+        logits: logits,
+        correctionBias: correctionBias,
+        rows: rows,
+        normalizing: normalizing
+    )
 }
 
 private let lagunaPrefillRouterTournamentEnabled =
@@ -8034,9 +8470,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     var _routedDownWeight: MLXArray?
     var _routedDownScales: MLXArray?
     /// `DARKBLOOM_PACKED_SCALES` walk-order scale-interleaved copy of the
-    /// fused routed gate/up bank ([experts, 4096, 288] uint8); see
+    /// fused routed gate/up scales ([experts, 4096, 32] uint8); see
     /// `lagunaRoutedSwiGLUQMVPackedKernel` for the layout contract. Nil
-    /// unless the flag is set (default OFF costs nothing).
+    /// unless the flag is set to zero (default ON).
     var _packedRoutedGateUpBank: MLXArray?
 
     /// Builds and retains the fused routed gate/up NVFP4 banks from the
@@ -8125,7 +8561,6 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         var prepared = [fusedWeight, fusedScales]
         prepared.append(
             contentsOf: preparePackedRoutedGateUpBank(
-                fusedWeight: fusedWeight,
                 fusedScales: fusedScales,
                 experts: experts,
                 split: split))
@@ -8134,16 +8569,14 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
 
     /// Builds the `DARKBLOOM_PACKED_SCALES` side bank from the (lazy) fused
     /// routed gate/up arrays: bytes are only reordered, never recomputed.
-    /// Per expert the packed layout is `[tile 128][k-block 4][sub 8][288 B]`
-    /// with `sub = (simd_group*2 + row)*2 + {0 gate, 1 up}` and each region
-    /// = 32 scale bytes ++ 256 code bytes for that row's 512-value K block —
-    /// the exact byte stream `lagunaRoutedSwiGLUQMVPackedKernel` walks. The
-    /// row remap below (gateRow = (logical/32)*64 + logical%32, up = +32) is
-    /// the stock kernel's mapping over the 32-row gate/up-interleaved fused
-    /// bank, baked into storage order. Memory: ~302 MB per sparse layer,
-    /// resident only while the flag is set.
+    /// Per expert the packed layout is `[tile 128][k-block 4][sub 8][32 B]`
+    /// with `sub = (simd_group*2 + row)*2 + {0 gate, 1 up}`. The row remap
+    /// below (gateRow = (logical/32)*64 + logical%32, up = +32) is the stock
+    /// kernel's mapping over the 32-row gate/up-interleaved fused bank, baked
+    /// into scale storage order. The code bytes remain in the resident fused
+    /// weight bank, so this side copy is ~32 MB per sparse layer instead of
+    /// duplicating the ~256 MB code bank.
     func preparePackedRoutedGateUpBank(
-        fusedWeight: MLXArray,
         fusedScales: MLXArray,
         experts: Int,
         split: Int
@@ -8158,15 +8591,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
             return []
         }
         let rows = 2 * split  // 1024 fused (gate/up-interleaved) rows
-        let codeBytes = fusedWeight.view(dtype: .uint8)  // [E, rows, 1024]
-        let rowBlocks = concatenated(
-            [
-                fusedScales.reshaped([experts, rows, 4, 32]),
-                codeBytes.reshaped([experts, rows, 4, 256]),
-            ], axis: 3
-        ).reshaped([experts, rows * 4, 288])
-        // Walk-order gather over row-block regions: packed position
-        // (tile, kblock, sub) reads fused row-block (fusedRow, kblock).
+        let rowBlocks = fusedScales.reshaped([experts, rows * 4, 32])
+        // Walk-order gather over scale row-blocks: packed position (tile,
+        // kblock, sub) reads fused scale row-block (fusedRow, kblock).
         var order = [Int32]()
         order.reserveCapacity(rows * 4)
         for tile in 0..<(rows / 8) {
@@ -8181,9 +8608,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         }
         // `take(axis: 1)` materializes with permuted strides (NOT
         // row-contiguous), and the custom kernel's `ensureRowContiguous`
-        // would then re-copy all ~302 MB on EVERY dispatch (~1.7 ms/layer,
-        // measured). Force the one-time row-contiguous materialization here,
-        // at init, so dispatches bind the bank buffer directly.
+        // would then re-copy the side bank on EVERY dispatch. Force the
+        // one-time row-contiguous materialization here, at init, so dispatches
+        // bind the bank buffer directly.
         let packed = contiguous(take(rowBlocks, MLXArray(order), axis: 1))
         _packedRoutedGateUpBank = packed
         lagunaPackedScalesLog.note("active", "packed routed gate/up bank prepared")
@@ -8275,7 +8702,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     lagunaTrace("routed gate/up QMV + SwiGLU (packed scales)")
                     activated = lagunaRoutedSwiGLUQMVPacked(
                         x,
-                        packedBank: packedBank,
+                        fusedWeight: fusedWeight,
+                        packedScales: packedBank,
                         indices: inds
                     )
                 } else {

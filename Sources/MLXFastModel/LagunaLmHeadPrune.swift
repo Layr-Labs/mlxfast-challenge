@@ -204,6 +204,16 @@ private let lagunaLmHeadRatioBoundEnabled =
 private let lagunaLmHeadDeltaBF16Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_DELTA_BF16"] != "0"
 
+/// Precompute the 64 activation-group L1 sums once, then reuse them across
+/// every vocabulary row in the shipped INT6 ratio-bound coarse pass. The
+/// producer preserves the accepted per-group FP32 addition order exactly;
+/// only the redundant per-row `abs` and addition work is removed. Set
+/// `DARKBLOOM_LMHEAD_PRECOMPUTE_ABS_GROUPS=0` to restore the accepted kernel
+/// byte-for-byte without launching the producer.
+private let lagunaLmHeadPrecomputeAbsGroupsEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LMHEAD_PRECOMPUTE_ABS_GROUPS"] != "0"
+
 /// Kernel header: bit-exact MXFP8 element decoders + the certified
 /// half-cell-width table, all inlinable and libm-free.
 private let lagunaLmHeadPruneHeader = """
@@ -765,6 +775,41 @@ private let lagunaLmHeadInlineCoarseKernelV1 = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// One thread per 32-element activation group. Each thread reproduces the
+/// accepted INT6 coarse kernel's local `ag` chain textually and stores its
+/// exact FP32 result. The 256-byte output is consumed by every vocabulary row
+/// instead of recomputing the same 32 absolute values and additions 100,352
+/// times. There is deliberately no SIMD reduction or reassociation here.
+private let lagunaLmHeadAbsGroupSumsKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_abs_group_sums_v1",
+    inputNames: ["x"],
+    outputNames: ["abs_group_sums"],
+    source: """
+        uint g = thread_position_in_grid.x;
+        const device ushort4* xrow =
+            (const device ushort4*)(x + g * 32);
+        float ag = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint w = 0; w < 4; ++w) {
+            // bf16 -> f32 is exactly bits<<16 for every value class.
+            float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
+            float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
+            float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
+            float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
+            float4 axe = metal::abs(xe);
+            float4 axo = metal::abs(xo);
+            #pragma clang loop unroll(full)
+            for (uint k = 0; k < 4; ++k) {
+                ag += axe[k];
+                ag += axo[k];
+            }
+        }
+        abs_group_sums[g] = ag;
+        """,
+    header: lagunaLmHeadPruneHeader,
+    ensureRowContiguous: true
+)
+
 /// v4 coarse pass over the planar int6 copy (DARKBLOOM_LMHEAD_COARSE_V4=1).
 /// Same launch geometry as the pack16 MXFP8 kernel (16 rows/threadgroup, one
 /// simdgroup per row, lane = 2 consecutive 32-element groups), same fused
@@ -1080,6 +1125,83 @@ private let lagunaLmHeadInt6CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKerne
     header: lagunaLmHeadPruneHeader,
     ensureRowContiguous: true
 )
+
+/// Default INT6 ratio-bound coarse pass consuming the exact `[64]` FP32 group
+/// sums produced once by `lagunaLmHeadAbsGroupSumsKernel`. The code/scale
+/// decode, `cg` chain, lane ownership, `gg` order, SIMD reductions, bound
+/// epilogue, and directed BF16 store are copied from the accepted kernel
+/// above. Only the per-row reconstruction of `ag` is replaced by a load of the
+/// identical FP32 bit pattern.
+private let lagunaLmHeadInt6CoarseRatioBoundDeltaBF16PrecomputedAbsKernel =
+    MLXFast.metalKernel(
+        name: "laguna_lmhead_int6_inline_coarse_ratio_bound_delta_bf16_preabs_v1",
+        inputNames: ["x", "codes_lo", "codes_hi", "scales", "abs_group_sums"],
+        outputNames: ["coarse", "delta"],
+        source: """
+            constexpr float GAMMA = 0x1p-15f;
+
+            uint row = threadgroup_position_in_grid.x * 16 +
+                simdgroup_index_in_threadgroup;
+            uint lane = thread_index_in_simdgroup;
+
+            const device uint8_t* lorow = codes_lo + size_t(row) * 1024;
+            const device uint8_t* hirow = codes_hi + size_t(row) * 512;
+            const device uint8_t* srow = scales + size_t(row) * 64;
+
+            float c_acc = 0.0f;
+            float d_acc = 0.0f;
+            for (uint gg = 0; gg < 2; ++gg) {
+                uint g = 2 * lane + gg;
+                float sd = laguna_e8m0_decode(srow[g]);
+                uint4 lo4 = ((const device uint4*)(lorow + g * 16))[0];
+                uint2 hi2 = ((const device uint2*)(hirow + g * 8))[0];
+                const device ushort4* xrow = (const device ushort4*)(x + g * 32);
+                float cg = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint w = 0; w < 4; ++w) {
+                    // Word w: elements 8w..8w+7 of the group. Nibble plane byte
+                    // b holds elements 2b (low) / 2b+1 (high); 2-bit plane byte
+                    // b holds elements 4b..4b+3 at bits 0,2,4,6.
+                    uint lw = lo4[w];
+                    uint hw = ((w & 2u) ? hi2.y : hi2.x) >> ((w & 1u) * 16u);
+                    uint4 ne = (uint4(lw) >> uint4(0u, 8u, 16u, 24u)) & 15u;
+                    uint4 no = (uint4(lw) >> uint4(4u, 12u, 20u, 28u)) & 15u;
+                    uint4 he = (uint4(hw) >> uint4(0u, 4u, 8u, 12u)) & 3u;
+                    uint4 ho = (uint4(hw) >> uint4(2u, 6u, 10u, 14u)) & 3u;
+                    // Offset-binary decode: value = u - 32 in [-31, 31], exact.
+                    float4 ve = float4(ne | (he << 4u)) - 32.0f;
+                    float4 vo = float4(no | (ho << 4u)) - 32.0f;
+                    // bf16 -> f32 is exactly bits<<16 for every value class.
+                    float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
+                    float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
+                    float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
+                    float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
+                    #pragma clang loop unroll(full)
+                    for (uint k = 0; k < 4; ++k) {
+                        cg += xe[k] * ve[k];
+                        cg += xo[k] * vo[k];
+                    }
+                }
+                c_acc += sd * cg;
+                d_acc += (0.5f * sd) * abs_group_sums[g];
+            }
+            c_acc = simd_sum(c_acc);
+            d_acc = simd_sum(d_acc);
+            if (lane == 0) {
+                coarse[row] = c_acc;
+                // Same FP32 bound as the accepted kernel, rounded UP to BF16.
+                float d_up = d_acc * (1.0f + 125.0f * GAMMA);
+                uint dbits = as_type<uint>(d_up);
+                uint dtrunc = dbits & 0xFFFF0000u;
+                if (dtrunc != dbits) {
+                    dtrunc += 0x00010000u;
+                }
+                delta[row] = as_type<bfloat>(ushort(dtrunc >> 16));
+            }
+            """,
+        header: lagunaLmHeadPruneHeader,
+        ensureRowContiguous: true
+    )
 
 /// Same-binary A/B selector for the coarse kernel (v2 default).
 private let lagunaLmHeadCoarseUseV1 =
@@ -1703,24 +1825,51 @@ final class LagunaLmHeadPruner {
             (useInt6 || (lagunaLmHeadInlineMaskEnabled && !useCoarseV1))
             && lagunaLmHeadRatioBoundEnabled && lagunaLmHeadDeltaBF16Enabled
 
+        // The shipped INT6 + ratio-bound + BF16-delta arm is the only consumer
+        // in this atomic experiment. Every other arm reaches its accepted
+        // kernel without paying for the producer dispatch.
+        let absGroupSums: MLXArray? =
+            if useInt6, useDeltaBF16, lagunaLmHeadPrecomputeAbsGroupsEnabled {
+                lagunaLmHeadAbsGroupSumsKernel(
+                    [x],
+                    grid: (64, 1, 1),
+                    threadGroup: (64, 1, 1),
+                    outputShapes: [[64]],
+                    outputDTypes: [.float32]
+                )[0]
+            } else {
+                nil
+            }
+
         let coarseOut: [MLXArray]
         if let lo = int6CodesLo, let hi = int6CodesHi, let s6 = int6Scales {
             // v4 int6 coarse pass: 16 rows per threadgroup like pack16.
-            let coarseKernel: MLXFast.MLXFastKernel =
-                if useDeltaBF16 {
-                    lagunaLmHeadInt6CoarseRatioBoundDeltaBF16Kernel
-                } else if lagunaLmHeadRatioBoundEnabled {
-                    lagunaLmHeadInt6CoarseRatioBoundKernel
-                } else {
-                    lagunaLmHeadInt6CoarseKernel
-                }
-            coarseOut = coarseKernel(
-                [x, lo, hi, s6],
-                grid: (vocab / 16 * 512, 1, 1),
-                threadGroup: (512, 1, 1),
-                outputShapes: [[vocab], [vocab]],
-                outputDTypes: [.float32, useDeltaBF16 ? .bfloat16 : .float32]
-            )
+            if let absGroupSums {
+                coarseOut =
+                    lagunaLmHeadInt6CoarseRatioBoundDeltaBF16PrecomputedAbsKernel(
+                        [x, lo, hi, s6, absGroupSums],
+                        grid: (vocab / 16 * 512, 1, 1),
+                        threadGroup: (512, 1, 1),
+                        outputShapes: [[vocab], [vocab]],
+                        outputDTypes: [.float32, .bfloat16]
+                    )
+            } else {
+                let coarseKernel: MLXFast.MLXFastKernel =
+                    if useDeltaBF16 {
+                        lagunaLmHeadInt6CoarseRatioBoundDeltaBF16Kernel
+                    } else if lagunaLmHeadRatioBoundEnabled {
+                        lagunaLmHeadInt6CoarseRatioBoundKernel
+                    } else {
+                        lagunaLmHeadInt6CoarseKernel
+                    }
+                coarseOut = coarseKernel(
+                    [x, lo, hi, s6],
+                    grid: (vocab / 16 * 512, 1, 1),
+                    threadGroup: (512, 1, 1),
+                    outputShapes: [[vocab], [vocab]],
+                    outputDTypes: [.float32, useDeltaBF16 ? .bfloat16 : .float32]
+                )
+            }
         } else if lagunaLmHeadInlineMaskEnabled {
             let coarseKernel: MLXFast.MLXFastKernel =
                 if useCoarseV1 {
