@@ -1,3 +1,4 @@
+// Ranked replay marker: this C++ comment is outside the embedded Metal source.
 namespace mlx::core::metal {
 
 const char* steel_attention_nax() {
@@ -1550,8 +1551,16 @@ template <
   // Restricted to
   // do_causal && !has_mask so the all-masked proof rests on the causal mask
   // alone; the timed window passes no array mask.
+  // Tighten the lower bound to this simdgroup's first query row. For every
+  // block below this bound the causal predicate is the identity for every
+  // element already loaded into Stile, so the select loop can be skipped
+  // without changing a value or any arithmetic order.
+  int sg_kb_min_causal = kb_min_causal;
   int sg_kb_lim = kb_lim;
   if (do_causal && !has_mask) {
+    int sg_q_min =
+        int(tidl.x) * BQ + params->qL_off + int(tm);
+    sg_kb_min_causal = max(0, sg_q_min + 1) / BK;
     int sg_q_max =
         int(tidl.x) * BQ + params->qL_off + int(tm) + kU * TQ;
     sg_kb_lim = min(kb_lim, (sg_q_max + BK - 1) / BK);
@@ -1721,7 +1730,7 @@ template <
     }
 
     // Mask out if causal
-    if (do_causal && kb >= kb_min_causal) {
+    if (do_causal && kb >= sg_kb_min_causal) {
       constexpr auto neg_inf = Limits<AccumType>::finite_min;
 
       const int base_row = int(tidl.x) * BQ + params->qL_off + tm;
