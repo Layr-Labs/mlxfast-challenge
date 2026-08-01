@@ -8456,10 +8456,10 @@ private func lagunaDecodeRouterOrdinalKernelSource(
     let winnerScore =
         scoreTable
         ? """
-            my_score = original_scores[my_index];
+            my_score = original_scores[my_index & 0xFFu];
         """
         : """
-            float winner_x = float(logits[my_index]);
+            float winner_x = float(logits[my_index & 0xFFu]);
             float winner_y = 1.0f / (1.0f + metal::exp(metal::abs(winner_x)));
             my_score = winner_x < 0.0f ? winner_y : 1.0f - winner_y;
         """
@@ -8475,7 +8475,7 @@ private func lagunaDecodeRouterOrdinalKernelSource(
             total = simd_shuffle(my_score, ushort(i)) + total;
         }
         if (lane < 8) {
-            router_indices[lane] = my_index;
+            router_indices[lane] = uint(my_index & 0xFFu);
             router_scores[lane] = my_score / total;
         }
         """
@@ -8483,15 +8483,14 @@ private func lagunaDecodeRouterOrdinalKernelSource(
         if (lane < 8) {
             float my_score = 0.0f;
         \(winnerScore)
-            router_indices[lane] = my_index;
+            router_indices[lane] = uint(my_index & 0xFFu);
             router_scores[lane] = my_score;
         }
         """
     return """
         uint lane = thread_position_in_threadgroup.x;
 
-        threadgroup uint xchg_ordinals[256];
-        threadgroup uint xchg_indices[256];
+        threadgroup ulong xchg_packed[256];
         \(scoreStorage)
 
         float x = float(logits[lane]);
@@ -8499,47 +8498,48 @@ private func lagunaDecodeRouterOrdinalKernelSource(
         float score = x < 0.0f ? y : 1.0f - y;
         \(scoreStore)
         float key = -(score + float(correction_bias[lane]));
-        uint my_ordinal = laguna_router_key_ordinal(key);
-        uint my_index = lane;
+        uint ord = laguna_router_key_ordinal(key);
+        // Pack (ordinal, expert_index) into one uint64. Ordinal occupies the
+        // high 32 bits; the 8-bit expert index occupies bits 0..7. A single
+        // uint64 compare then reproduces laguna_router_ordinal_before exactly:
+        // ordinal dominates, and when ordinals tie, the index breaks the tie,
+        // because the index is in the low bits of the same word. This halves
+        // the per-stage shuffle count (1 simd_shuffle_xor instead of 2) and
+        // halves the cross-simdgroup shared-memory traffic (1 load instead of
+        // 2). The sort schedule, pair roles, and take-other decision are
+        // byte-for-byte the accepted ordinal kernel's.
+        ulong my_packed = (ulong(ord) << 8) | ulong(lane);
 
-        // Byte-for-byte the accepted 256-element Batcher schedule and pair
-        // roles: 30 intra-simdgroup stages and six cross-simdgroup stages.
-        // Only the exact sortable payload representation differs.
         for (uint sequence = 2; sequence <= 256; sequence <<= 1) {
             for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
-                uint other_ordinal;
-                uint other_index;
+                ulong other_packed;
                 if (stride < 32) {
-                    other_ordinal = simd_shuffle_xor(my_ordinal, ushort(stride));
-                    other_index = simd_shuffle_xor(my_index, ushort(stride));
+                    other_packed = simd_shuffle_xor(my_packed, ushort(stride));
                 } else {
-                    xchg_ordinals[lane] = my_ordinal;
-                    xchg_indices[lane] = my_index;
+                    xchg_packed[lane] = my_packed;
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                     uint partner = lane ^ stride;
-                    other_ordinal = xchg_ordinals[partner];
-                    other_index = xchg_indices[partner];
+                    other_packed = xchg_packed[partner];
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
 
                 bool is_lower = (lane & stride) == 0;
                 bool lower_wants_better = (lane & sequence) == 0;
                 bool want_better = lower_wants_better == is_lower;
-                bool other_before_my = laguna_router_ordinal_before(
-                    other_ordinal, other_index, my_ordinal, my_index);
-                // Expert indices are globally unique, so `my` and `other`
-                // can never compare equal. This is the accepted a/b pair-role
-                // rule reduced algebraically to a direct take-other decision.
+                // Direct uint64 compare replaces laguna_router_ordinal_before.
+                bool other_before_my = other_packed < my_packed;
                 bool take_other = want_better ? other_before_my : !other_before_my;
                 if (take_other) {
-                    my_ordinal = other_ordinal;
-                    my_index = other_index;
+                    my_packed = other_packed;
                 }
             }
         }
 
+        // Unpack the winner index for the epilogue.
+        uint my_index = uint(my_packed & 0xFFu);
+
         \(epilogue)
-        """
+    """
 }
 
 private let lagunaDecodeRouterOrdinalHeader = """
