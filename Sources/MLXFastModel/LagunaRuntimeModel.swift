@@ -112,6 +112,13 @@ let lagunaFusedQKVEnabled =
 let lagunaFusedSharedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_GATE_UP"] != "0"
 
+/// Multi-token use of the retained NVFP4 `[gate; up]` bank. Quantized output
+/// rows are independent, so slicing preserves the two original projections.
+/// Set `DARKBLOOM_PREFILL_SHARED_FUSED_GATE_UP=0` for the stock dispatches.
+let lagunaPrefillSharedFusedGateUpEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_SHARED_FUSED_GATE_UP"] != "0"
+
 /// Decode-only shared-expert NVFP4 QMV + SwiGLU fusion. This consumes the
 /// retained row-concatenated `[gate; up]` bank and emits only the 512-wide
 /// BF16 activation, preserving the two independent QMV casts and every BF16
@@ -277,6 +284,15 @@ let lagunaFusedResidualRMSNormEnabled =
 /// by row for any `L`.
 let lagunaPrefillFusedResidualRMSNormEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_RESIDUAL_RMS"] != "0"
+
+/// Terminal-row prefill counterpart of the ordinary single-token residual /
+/// RMSNorm / router and residual-aware MoE paths. The final prefill layer
+/// intentionally computes only the last query row, so its MLP has the same
+/// `[1, 1, hidden]` shape as decode. Set to "0" for a same-binary control
+/// that restores the old standalone post-attention norm, MLP, and residual
+/// add sequence.
+private let lagunaTerminalPrefillFusionEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_TERMINAL_PREFILL_FUSION"] != "0"
 
 /// Issues the routed and shared gate/up NVFP4 QMVs as one nine-slot dispatch
 /// (see `lagunaRoutedSharedSwiGLUQMVKernel`). Set
@@ -5878,6 +5894,20 @@ final class LagunaRuntimeAttention: Module {
 
         if gatingEnabled, let gProj {
             let projectedGate = bankedGate ?? gProj(lastInput)
+            // Reuse the exact decode gate-product path for this singleton row.
+            if lagunaFusedGatedOutputProjectionEnabled,
+                gatePerHead,
+                output.dtype == .bfloat16,
+                projectedGate.dtype == output.dtype,
+                output.shape == [1, 1, nHeads * headDim],
+                projectedGate.shape == [1, 1, nHeads],
+                let gated = lagunaGateProductSoftplus(
+                    attentionOutput: output,
+                    gateLogits: projectedGate,
+                    heads: nHeads)
+            {
+                return wo(gated)
+            }
             let gate =
                 gatePerHead && projectedGate.dtype == output.dtype
                 ? lagunaCompiledSoftplusGate(projectedGate)
@@ -8269,6 +8299,32 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             let up = gateUp[.ellipsis, _fusedGateUpSplit...]
             return downProj(compiledSiluProduct(gate, up))
         }
+        if x.dim(1) > 1, lagunaPrefillSharedFusedGateUpEnabled,
+            let fusedWeight = _fusedGateUpWeight, let fusedScales = _fusedGateUpScales,
+            x.dtype == .bfloat16,
+            x.dim(2) == LagunaConstants.hiddenSize,
+            fusedWeight.dtype == .uint32,
+            fusedScales.dtype == .uint8,
+            fusedWeight.shape == [2 * _fusedGateUpSplit, LagunaConstants.hiddenSize],
+            _fusedGateUpSplit == LagunaConstants.sharedExpertIntermediateSize
+        {
+            // The prepared bank pins transpose/group/bits/mode/biases; its
+            // independent rows reproduce the separate gate/up calls.
+            lagunaTrace("prefill shared fused [gate; up] bank QMM")
+            let gateUp = MLX.quantizedMM(
+                x,
+                fusedWeight,
+                scales: fusedScales,
+                biases: nil,
+                transpose: true,
+                groupSize: 16,
+                bits: 4,
+                mode: .nvfp4
+            )
+            let gate = gateUp[.ellipsis, 0 ..< _fusedGateUpSplit]
+            let up = gateUp[.ellipsis, _fusedGateUpSplit...]
+            return downProj(compiledSiluProduct(gate, up))
+        }
         return downProj(compiledSiluProduct(gateProj(x), upProj(x)))
     }
 }
@@ -10332,8 +10388,69 @@ final class LagunaRuntimeDecoderLayer: Module {
     func callLastPrefillRow(_ x: MLXArray, cache: KVCache?) -> MLXArray {
         let normalized = inputLayerNorm(x)
         let r = selfAttn.callLastPrefillRow(normalized, cache: cache)
-        let h = lagunaLastTokenHidden(x) + r
-        let r2 = mlp(postAttentionLayerNorm(h))
+        // Reuse the exact single-token residual/RMS/router path for the last row.
+        let lastResidual = lagunaLastTokenHidden(x)
+        var h = lastResidual + r
+        if !lagunaTerminalPrefillFusionEnabled {
+            let normalized = postAttentionLayerNorm(h)
+            return h + mlp(normalized)
+        }
+        let normalizedAfterAttention: MLXArray
+        var routerLogits: MLXArray?
+        if lagunaFusedResidualRMSNormRouterEnabled,
+            r.dtype == .bfloat16,
+            postAttentionLayerNorm.weight.dtype == .bfloat16,
+            lastResidual.dtype == .bfloat16,
+            lastResidual.shape == [1, 1, LagunaConstants.hiddenSize],
+            r.shape == lastResidual.shape,
+            let sparse = mlp as? LagunaRuntimeSparseMoEBlock,
+            sparse.gate.weight.dtype == .bfloat16,
+            sparse.gate.weight.shape == [
+                LagunaConstants.numExperts, LagunaConstants.hiddenSize,
+            ]
+        {
+            let fused = lagunaResidualRMSNormRouter(
+                residual: lastResidual,
+                branch: r,
+                weight: postAttentionLayerNorm.weight,
+                routerWeight: sparse.gate.weight)
+            h = fused.summed
+            normalizedAfterAttention = fused.normalized
+            routerLogits = fused.routerLogits
+        } else if lagunaFusedResidualRMSNormEnabled,
+            r.dtype == .bfloat16,
+            postAttentionLayerNorm.weight.dtype == .bfloat16,
+            lastResidual.dtype == .bfloat16,
+            lastResidual.shape == [1, 1, LagunaConstants.hiddenSize],
+            r.shape == lastResidual.shape
+        {
+            lagunaTrace("terminal prefill residual+rmsnorm")
+            let (summed, normed) = lagunaResidualRMSNorm(
+                residual: lastResidual,
+                branch: r,
+                weight: postAttentionLayerNorm.weight)
+            h = summed
+            normalizedAfterAttention = normed
+            routerLogits = nil
+        } else {
+            normalizedAfterAttention = postAttentionLayerNorm(h)
+            routerLogits = nil
+        }
+
+        if let sparse = mlp as? LagunaRuntimeSparseMoEBlock {
+            // The guarded residual-aware MoE call retains the exact stock fallback.
+            return sparse(
+                normalizedAfterAttention,
+                residual: h,
+                routerLogits: routerLogits)
+        }
+        if let dense = mlp as? LagunaRuntimeMLP,
+            let fused = dense.fusedDenseDownResidual(
+                normalizedAfterAttention, residual: h)
+        {
+            return fused
+        }
+        let r2 = mlp(normalizedAfterAttention)
         return h + r2
     }
 }

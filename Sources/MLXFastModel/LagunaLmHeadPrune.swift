@@ -264,6 +264,15 @@ private let lagunaLmHeadPrecomputeAbsGroupsEnabled =
 private let lagunaLmHeadV5PreabsEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_V5_PREABS"] == "1"
 
+/// Losslessly store v5's two adjacent e8m0 scale exponents in one byte.
+/// Default ON after same-binary A/B; set `DARKBLOOM_LMHEAD_V5_PACKED_SCALES=0`
+/// to restore the accepted layout. The init-time range guard falls back to
+/// `[V, 64]` unless every exponent is in `[112, 127]`.
+private let lagunaLmHeadV5PackedScalesEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LMHEAD_V5_PACKED_SCALES"] != "0"
+private let lagunaLmHeadV5PackedScaleBase: UInt16 = 112
+
 /// Kernel header: bit-exact MXFP8 element decoders + the certified
 /// half-cell-width table, all inlinable and libm-free.
 private let lagunaLmHeadPruneHeader = """
@@ -1298,11 +1307,7 @@ private let lagunaLmHeadInt6CoarseRatioBoundDeltaBF16PrecomputedAbsKernel =
 /// exact; sd*q multiplies a power of two by a <=4-bit-magnitude integer
 /// float: exact. Accumulation depth is ~45 roundings/element-path, under
 /// the depth <= 96 budget assumed by gamma = 2^-15.
-private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_int5_inline_coarse_ratio_bound_delta_bf16_v5",
-    inputNames: ["x", "codes_lo", "codes_hi", "scales"],
-    outputNames: ["coarse", "delta"],
-    source: """
+private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Source = """
         constexpr float GAMMA = 0x1p-15f;
 
         uint row = threadgroup_position_in_grid.x * 16 +
@@ -1368,10 +1373,50 @@ private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKerne
             }
             delta[row] = as_type<bfloat>(ushort(dtrunc >> 16));
         }
-        """,
-    header: lagunaLmHeadPruneHeader,
-    ensureRowContiguous: true
-)
+        """
+
+private func lagunaLmHeadReplacingUnique(
+    _ source: String, _ needle: String, with replacement: String
+) -> String {
+    let pieces = source.components(separatedBy: needle)
+    precondition(pieces.count == 2, "lm_head v5 packed-scale source anchor changed")
+    return pieces[0] + replacement + pieces[1]
+}
+
+private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16PackedScaleSource: String = {
+    let row64 = "const device uint8_t* srow = scales + size_t(row) * 64;"
+    let row32 = row64.replacingOccurrences(of: "64;", with: "32;")
+        + "\nuint scale_pair = uint(srow[lane]);"
+    let decode64 = "    float sd = laguna_e8m0_decode(srow[g]);"
+    let decode32 =
+        "    float sd = as_type<float>((\(lagunaLmHeadV5PackedScaleBase)u + "
+        + "((scale_pair >> (4u * gg)) & 15u)) << 23);"
+    let withPackedRow = lagunaLmHeadReplacingUnique(
+        lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Source, row64, with: row32)
+    return lagunaLmHeadReplacingUnique(withPackedRow, decode64, with: decode32)
+}()
+
+private func makeLagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel(
+    name: String, source: String
+) -> MLXFast.MLXFastKernel {
+    MLXFast.metalKernel(
+        name: name,
+        inputNames: ["x", "codes_lo", "codes_hi", "scales"],
+        outputNames: ["coarse", "delta"],
+        source: source,
+        header: lagunaLmHeadPruneHeader,
+        ensureRowContiguous: true)
+}
+
+private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel =
+    makeLagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel(
+        name: "laguna_lmhead_int5_inline_coarse_ratio_bound_delta_bf16_v5",
+        source: lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Source)
+
+private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16PackedScaleKernel =
+    makeLagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel(
+        name: "laguna_lmhead_int5_inline_coarse_ratio_bound_delta_bf16_scale32_v1",
+        source: lagunaLmHeadInt5CoarseRatioBoundDeltaBF16PackedScaleSource)
 
 /// v5 int5 ratio-bound coarse pass consuming the exact `[64]` FP32 group sums
 /// produced once by `lagunaLmHeadAbsGroupSumsKernel` (the SAME producer the
@@ -2063,7 +2108,7 @@ private let lagunaLmHeadInlineExactKernel = MLXFast.metalKernel(
 /// `coarse` is untouched FP32, so skipped slots keep the exact bits the FP32
 /// arm would store.
 private let lagunaLmHeadInlineExactDeltaBF16Kernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_exact_inline_mask_block_delta_bf16_lane0_mask_v1",
+    name: "laguna_lmhead_exact_inline_mask_block_delta_bf16_row_at_time_v1",
     inputNames: ["coarse", "delta", "thr", "lm_head", "x"],
     outputNames: ["assembled"],
     source: """
@@ -2101,19 +2146,22 @@ private let lagunaLmHeadInlineExactDeltaBF16Kernel = MLXFast.metalKernel(
         }
 
         // --- stock gemv_al replica begin (gemv.h:151-289) ---
-        thread float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        thread bfloat inter[4];
-        thread float v_coeff[4];
-        uint bn = lane * 4;
-        for (uint i = 0; i < 16; ++i) {
-            vec<bfloat, 4> xv =
-                *((const device vec<bfloat, 4>*)(x + bn));
-            v_coeff[0] = float(xv.x);
-            v_coeff[1] = float(xv.y);
-            v_coeff[2] = float(xv.z);
-            v_coeff[3] = float(xv.w);
-            #pragma unroll
-            for (uint tm = 0; tm < 4; ++tm) {
+        uint pending = candidate_mask;
+        while (pending != 0) {
+            uint tm = ctz(pending);
+            pending &= pending - 1;
+
+            thread float result = 0.0f;
+            thread bfloat inter[4];
+            thread float v_coeff[4];
+            uint bn = lane * 4;
+            for (uint i = 0; i < 16; ++i) {
+                vec<bfloat, 4> xv =
+                    *((const device vec<bfloat, 4>*)(x + bn));
+                v_coeff[0] = float(xv.x);
+                v_coeff[1] = float(xv.y);
+                v_coeff[2] = float(xv.z);
+                v_coeff[3] = float(xv.w);
                 const device bfloat* mrow = lm_head + size_t(base + tm) * K;
                 vec<bfloat, 4> mv =
                     *((const device vec<bfloat, 4>*)(mrow + bn));
@@ -2121,29 +2169,29 @@ private let lagunaLmHeadInlineExactDeltaBF16Kernel = MLXFast.metalKernel(
                 inter[1] = mv.y;
                 inter[2] = mv.z;
                 inter[3] = mv.w;
-                result[tm] += inter[0] * v_coeff[0];
-                result[tm] += inter[1] * v_coeff[1];
-                result[tm] += inter[2] * v_coeff[2];
-                result[tm] += inter[3] * v_coeff[3];
+                result += inter[0] * v_coeff[0];
+                result += inter[1] * v_coeff[1];
+                result += inter[2] * v_coeff[2];
+                result += inter[3] * v_coeff[3];
+                bn += 128;
             }
-            bn += 128;
-        }
-        #pragma unroll
-        for (uint tm = 0; tm < 4; ++tm) {
             #pragma unroll
             for (ushort sn = 16; sn >= 1; sn >>= 1) {
-                result[tm] += simd_shuffle_down(result[tm], sn);
+                result += simd_shuffle_down(result, sn);
+            }
+            if (lane == 0) {
+                assembled[base + tm] = bfloat(result);
             }
         }
         // --- stock gemv_al replica end ---
         if (lane == 0) {
             #pragma unroll
             for (uint tm = 0; tm < 4; ++tm) {
-                uint r = base + tm;
-                if (r < VOCAB) {
-                    assembled[r] = (candidate_mask & (1u << tm)) != 0
-                        ? bfloat(result[tm])
-                        : bfloat(coarse[r]);
+                if ((candidate_mask & (1u << tm)) == 0) {
+                    uint r = base + tm;
+                    if (r < VOCAB) {
+                        assembled[r] = bfloat(coarse[r]);
+                    }
                 }
             }
         }
@@ -2169,8 +2217,8 @@ final class LagunaLmHeadPruner {
     let int6Scales: MLXArray?
     /// v5 planar int5 coarse copy (DARKBLOOM_LMHEAD_COARSE_V5=1): nibble
     /// plane [V, 1024], 1-bit plane [V, 256] (element j of each 32-element
-    /// group at bit j of the group's uint32 word), power-of-two scale bytes
-    /// [V, 64] (same e8m0 byte semantics as v4).
+    /// group at bit j of the group's uint32 word), with either losslessly
+    /// pair-packed [V, 32] scale exponents or the original [V, 64] e8m0 bytes.
     let int5CodesLo: MLXArray?
     let int5CodesHi: MLXArray?
     let int5Scales: MLXArray?
@@ -2373,7 +2421,29 @@ final class LagunaLmHeadPruner {
         let hi =
             ((nib16 & MLXArray(UInt16(0x000F)))
             | ((nib16 >> 4) & MLXArray(UInt16(0x00F0)))).asType(.uint8)
-        return (lo, hi, sdByte.asType(.uint8))
+        let fullScales = sdByte.asType(.uint8)
+        guard lagunaLmHeadV5PackedScalesEnabled && !lagunaLmHeadV5PreabsEnabled else {
+            return (lo, hi, fullScales)
+        }
+
+        // Pure relayout: decline unless both exponents in every pair fit the
+        // four-bit offset envelope used by the packed kernel.
+        let scaleBase = MLXArray(Int32(lagunaLmHeadV5PackedScaleBase))
+        let scaleLimit = MLXArray(Int32(lagunaLmHeadV5PackedScaleBase + 15))
+        let scaleRangeOK = ((sdByte .>= scaleBase) .&& (sdByte .<= scaleLimit))
+            .all().item(Bool.self)
+        guard scaleRangeOK else {
+            FileHandle.standardError.write(
+                Data("mlxfast: lm_head v5 scale32 declined; using scale64\n".utf8))
+            return (lo, hi, fullScales)
+        }
+
+        let offsets = (sdByte - scaleBase).asType(.uint8)
+        let pairs = offsets.view(dtype: .uint16)  // adjacent groups, [V, 32]
+        let packedScales =
+            ((pairs & MLXArray(UInt16(0x000F)))
+            | ((pairs >> 4) & MLXArray(UInt16(0x00F0)))).asType(.uint8)
+        return (lo, hi, packedScales)
     }
 
     /// Pruned final-row lm_head: full [vocab] BF16 logits row, bit-identical to
@@ -2412,7 +2482,11 @@ final class LagunaLmHeadPruner {
                         outputDTypes: [.float32, .bfloat16]
                     )
             } else {
-                coarseOut5 = lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel(
+                let coarseKernel: MLXFast.MLXFastKernel =
+                    s5.shape.last == 32
+                    ? lagunaLmHeadInt5CoarseRatioBoundDeltaBF16PackedScaleKernel
+                    : lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel
+                coarseOut5 = coarseKernel(
                     [x, lo5, hi5, s5],
                     grid: (vocab / 16 * 512, 1, 1),
                     threadGroup: (512, 1, 1),
