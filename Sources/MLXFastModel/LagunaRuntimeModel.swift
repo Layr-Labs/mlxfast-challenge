@@ -4632,6 +4632,12 @@ func lagunaTailNormQKVGate(
 
 // MARK: - Norm-folded native-affine QKV projection (one dispatch)
 
+private let lagunaNormAffineQKVSimdgroups =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NORM_AFFINE_QKV_SIMDGROUPS"] == "2" ? 2 : 4
+private let lagunaNormAffineQKVThreadgroupSize = lagunaNormAffineQKVSimdgroups * 32
+private let lagunaNormAffineQKVRowsPerThreadgroup = lagunaNormAffineQKVSimdgroups * 4
+
 /// Folds the layer's input RMSNorm into the native group-32 affine INT8
 /// `[Q; K; V; (G)]` GEMV, so the head of the decode attention block is one
 /// dispatch instead of two (`MLXFast.rmsNorm` then MLX's `quantizedMM`).
@@ -4646,23 +4652,18 @@ func lagunaTailNormQKVGate(
 ///
 /// EXACTNESS, both halves.
 ///
-/// GEMV half -- a textual replica of `affine_qmv_fast<bfloat16_t, 32, 8>`
-/// keeping MLX's dispatch geometry EXACTLY.
+/// GEMV half -- each SIMD keeps MLX's QMV lane/K/reduction geometry exactly.
 ///
 /// NORM half -- `rms_single_row<bfloat16_t, N_READS = 4>` at `axis_size ==
 /// 2048`, which MLX dispatches with 512 threads (sixteen simdgroups). This
-/// kernel has only 64 threads, so it EMULATES that grouping rather than
-/// approximating the mean square: virtual thread `vt = r + 64j` runs in a
-/// separate accumulator, real `simd_sum(acc_j)` reduces exactly the 32 values
-/// MLX's `simd_sum` reduces for virtual simdgroup `simd_gid + 2j`, in the same
-/// order, then the cross-simdgroup fold and `metal::precise::rsqrt` constant
-/// match. The output expression is MLX's verbatim
+/// selected kernel emulates that grouping. All 16 partials reach the stock
+/// slots/order; the cross-group fold and `metal::precise::rsqrt` match. Output is
 /// `w[i] * static_cast<T>(xcache[i] * inv_mean)`.
 ///
 /// Two ways to hand the normalized row to the K loop, both bit-exact and both
 /// selectable (`DARKBLOOM_NORM_AFFINE_QKV_STAGE`):
 ///  * `tg` stages it in 4 KB of THREADGROUP memory. Measured a large LOSS
-///    (-32.9 us/layer): 4 KB per 64-thread threadgroup caps resident
+///    (-32.9 us/layer): 4 KB per threadgroup caps resident
 ///    threadgroups per core.
 ///  * `inline` (default) keeps threadgroup memory down to the 132 bytes the
 ///    reduction itself needs and re-derives each lane's eight normalized
@@ -4702,19 +4703,21 @@ private func lagunaNormAffineQKVSource(rows: Int, staged: Bool) -> String {
 private func lagunaNormAffineQKVBody(
     rows: Int, scratch: String, normalize: String, loadValue: String
 ) -> String {
+    let realThreads = lagunaNormAffineQKVThreadgroupSize
+    let simdgroups = lagunaNormAffineQKVSimdgroups
     return """
     constexpr uint axis_size = \(LagunaConstants.hiddenSize);
     constexpr uint out_vec_size = \(rows);
     constexpr uint n_reads = 4;                 // RMS_N_READS
     constexpr uint norm_threads = axis_size / n_reads;   // 512 virtual threads
-    constexpr uint real_threads = 64;
-    constexpr uint virtual_per_thread = norm_threads / real_threads;  // 8
+    constexpr uint real_threads = \(realThreads);
+    constexpr uint virtual_per_thread = norm_threads / real_threads;
     constexpr uint simd_size = 32;
     constexpr float norm_eps = 1.0e-6f;
     constexpr uint values_per_thread = 8;       // pack_factor 4 * packs_per_thread 2
     constexpr uint block_size = 256;            // values_per_thread * SIMD_SIZE
     constexpr uint results_per_simdgroup = 4;
-    constexpr uint num_simdgroups = 2;
+    constexpr uint num_simdgroups = \(simdgroups);
     constexpr uint group_size = 32;
     constexpr uint scale_step_per_thread = group_size / values_per_thread;
     constexpr uint in_vec_size_g = axis_size / group_size;
@@ -4728,7 +4731,7 @@ private func lagunaNormAffineQKVBody(
     threadgroup float local_sums[simd_size];
     \(scratch)
 
-    // --- rms_single_row replica, 512 virtual threads over 64 real ones ---
+    // --- rms_single_row replica over the selected real threads ---
     if (lid < simd_size) {
         local_sums[lid] = 0.0f;
     }
@@ -4812,9 +4815,7 @@ private func lagunaNormAffineQKVBody(
 private let lagunaNormAffineQKVStaged =
     ProcessInfo.processInfo.environment["DARKBLOOM_NORM_AFFINE_QKV_STAGE"] == "tg"
 
-/// `DARKBLOOM_NORM_AFFINE_QKV_PF` (default 4 = register-prefetch depth 4,
-/// **DEFAULT ON**; set "0" to restore the stock inline kernel; 1...4
-/// clamped). QmvLimiter study (notes/exp-qmvlimiter.md): the fused kernel's
+/// Prefetch depth defaults to 2 for SG4 and 4 for the SG2 control. The kernel's
 /// RMS prologue (three barriers + the 2048-element reduction) runs
 /// dead-serial BEFORE the first weight byte of each threadgroup's short
 /// 18 KB stream, costing ~9% of the dispatch (harness noprol probe); the
@@ -4822,17 +4823,11 @@ private let lagunaNormAffineQKVStaged =
 /// loads ABOVE the prologue so the weight stream is in flight while the
 /// reduction runs, then consumes them from registers in the exact stock
 /// order. Pure reads of immutable weights and an identical FP schedule ->
-/// bit-identical (standalone-harness memcmp on all output rows, random
-/// banks, r10304 and r8240; model-level 130/130 max_abs_diff=0). Depth-4
-/// measured -11.9%/-12.2% kernel-level at decode clocks (48.61->42.84 us
-/// r10304, 39.34->34.55 us r8240; 554/549 GB/s vs 488/482 stock; projected
-/// ~-171 us/step), depth curve monotone pf1->pf4, occupancy unchanged
-/// (maxTotalThreadsPerThreadgroup 1024, +64 B thread state). Ignored under
-/// the `tg` staged variant.
+/// bit-identical. Ignored under the `tg` staged variant.
 let lagunaNormAffineQKVPrefetchDepth: Int = {
-    let raw =
-        ProcessInfo.processInfo.environment["DARKBLOOM_NORM_AFFINE_QKV_PF"] ?? "4"
-    return min(max(Int(raw) ?? 4, 0), 4)
+    let fallback = lagunaNormAffineQKVSimdgroups == 4 ? 2 : 4
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_NORM_AFFINE_QKV_PF"] ?? ""
+    return min(max(Int(raw) ?? fallback, 0), 4)
 }()
 
 /// Register-prefetch twin of the inline `lagunaNormAffineQKVSource`. The
@@ -4845,6 +4840,8 @@ let lagunaNormAffineQKVPrefetchDepth: Int = {
 private func lagunaNormAffineQKVPrefetchSource(
     rows: Int, depth: Int, indexed: Bool = false
 ) -> String {
+    let realThreads = lagunaNormAffineQKVThreadgroupSize
+    let simdgroups = lagunaNormAffineQKVSimdgroups
     let metadataPointers = indexed
         ? """
         const device ushort* mi = metadata_indices + out_row * in_vec_size_g +
@@ -4890,14 +4887,14 @@ private func lagunaNormAffineQKVPrefetchSource(
     constexpr uint out_vec_size = \(rows);
     constexpr uint n_reads = 4;                 // RMS_N_READS
     constexpr uint norm_threads = axis_size / n_reads;   // 512 virtual threads
-    constexpr uint real_threads = 64;
-    constexpr uint virtual_per_thread = norm_threads / real_threads;  // 8
+    constexpr uint real_threads = \(realThreads);
+    constexpr uint virtual_per_thread = norm_threads / real_threads;
     constexpr uint simd_size = 32;
     constexpr float norm_eps = 1.0e-6f;
     constexpr uint values_per_thread = 8;       // pack_factor 4 * packs_per_thread 2
     constexpr uint block_size = 256;            // values_per_thread * SIMD_SIZE
     constexpr uint results_per_simdgroup = 4;
-    constexpr uint num_simdgroups = 2;
+    constexpr uint num_simdgroups = \(simdgroups);
     constexpr uint group_size = 32;
     constexpr uint scale_step_per_thread = group_size / values_per_thread;
     constexpr uint in_vec_size_g = axis_size / group_size;
@@ -5038,11 +5035,12 @@ private let lagunaNormAffineQKVKernels: [Int: MLXFast.MLXFastKernel] = {
             if kernels[rows] != nil { continue }
             let staged = lagunaNormAffineQKVStaged
             let pf = staged ? 0 : lagunaNormAffineQKVPrefetchDepth
+            let sg = lagunaNormAffineQKVSimdgroups
             kernels[rows] = MLXFast.metalKernel(
                 name: pf > 0
-                    ? "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_pf\(pf)_v1"
+                    ? "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_pf\(pf)_sg\(sg)_v1"
                     : "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_"
-                        + (staged ? "tg" : "inl") + "_v1",
+                        + (staged ? "tg" : "inl") + "_sg\(sg)_v1",
                 inputNames: [
                     "residual", "norm_weight", "weight_codes", "weight_scales",
                     "weight_biases",
@@ -5064,13 +5062,14 @@ private let lagunaNormAffineQKVIndexedKernels: [Int: MLXFast.MLXFastKernel] = {
         return kernels
     }
     let kvRows = 2 * LagunaConstants.numKeyValueHeads * LagunaConstants.headDim
+    let sg = lagunaNormAffineQKVSimdgroups
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         for gateRows in [0, heads] {
             let rows = heads * LagunaConstants.headDim + kvRows + gateRows
             if kernels[rows] != nil { continue }
             kernels[rows] = MLXFast.metalKernel(
                 name: "laguna_norm_affine_qkv_qmv_i8g32_r\(rows)_"
-                    + "pf\(lagunaNormAffineQKVPrefetchDepth)_idx_v1",
+                    + "pf\(lagunaNormAffineQKVPrefetchDepth)_idx_sg\(sg)_v1",
                 inputNames: [
                     "residual", "norm_weight", "weight_codes",
                     "metadata_indices", "metadata_lut",
@@ -5108,7 +5107,9 @@ func lagunaNormAffineQKV(
     indexedMetadata: LagunaIndexedAffineMetadata? = nil,
     rows: Int
 ) -> MLXArray? {
-    guard let kernel = lagunaNormAffineQKVKernels[rows] else { return nil }
+    guard rows.isMultiple(of: lagunaNormAffineQKVRowsPerThreadgroup),
+        let kernel = lagunaNormAffineQKVKernels[rows]
+    else { return nil }
     let hidden = LagunaConstants.hiddenSize
     guard residual.dtype == .bfloat16,
         residual.shape == [1, 1, hidden],
@@ -5137,8 +5138,11 @@ func lagunaNormAffineQKV(
                 + "pf\(lagunaNormAffineQKVPrefetchDepth) indexed")
         return indexedKernel(
             [residual, normWeight, codes, metadata.indices, metadata.lut],
-            grid: ((rows / 8) * 64, 1, 1),
-            threadGroup: (64, 1, 1),
+            grid: (
+                (rows / lagunaNormAffineQKVRowsPerThreadgroup)
+                    * lagunaNormAffineQKVThreadgroupSize,
+                1, 1),
+            threadGroup: (lagunaNormAffineQKVThreadgroupSize, 1, 1),
             outputShapes: [[1, 1, rows]],
             outputDTypes: [.bfloat16]
         )[0]
@@ -5150,8 +5154,11 @@ func lagunaNormAffineQKV(
             : "norm+affine qkv qmv r\(rows)")
     return kernel(
         [residual, normWeight, codes, scales, biases],
-        grid: ((rows / 8) * 64, 1, 1),
-        threadGroup: (64, 1, 1),
+        grid: (
+            (rows / lagunaNormAffineQKVRowsPerThreadgroup)
+                * lagunaNormAffineQKVThreadgroupSize,
+            1, 1),
+        threadGroup: (lagunaNormAffineQKVThreadgroupSize, 1, 1),
         outputShapes: [[1, 1, rows]],
         outputDTypes: [.bfloat16]
     )[0]
