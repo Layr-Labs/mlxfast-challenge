@@ -127,6 +127,24 @@ private let routeCountingSortEnabled =
 
 private let routeSortTile = 128
 
+/// Number of routed experts per token (Laguna numExpertsPerTok = 8). The
+/// fused scatter divides the flattened slot index by this to derive the
+/// token row, and re-emits the expert id directly, so downstream
+/// `floorDivide` and `indices[order]` gather dispatches can be elided from
+/// the serial chain. Only engaged when the actual `m = indices.dim(-1)`
+/// equals this constant, so correctness is preserved for any model that
+/// routes through here.
+private let routeSortDivisor = 8
+
+/// DEFAULT ON. Fuse the `order.floorDivide(m)` and `indices[order]` index
+/// arithmetic directly into the counting-sort scatter stage, eliminating
+/// two dispatches on the prefill sorted-MoE serial dependency chain.
+/// Bit-exact by construction (pure integer work); set
+/// `DARKBLOOM_ROUTE_INDEX_FUSION=0` to restore the separate
+/// elementwise/gather dispatches in the same binary.
+private let routeIndexFusionEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTE_INDEX_FUSION"] != "0"
+
 private let routeTileHistKernel = MLXFast.metalKernel(
     name: "mlx_lm_route_csort_hist_u32_v1",
     inputNames: ["keys"],
@@ -204,6 +222,39 @@ private let routeScatterKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+/// Fused scatter: emits `order`, `orderDiv = order / routeSortDivisor`, and
+/// `indicesGathered = indices[order]` in one dispatch. At the write site the
+/// kernel holds `idx` (flattened slot) and `k == keys[idx] == indices[idx]`,
+/// so `orderDiv` (token row) and `indicesGathered` (expert id) are derived
+/// from the same values already used to write `order` — no extra loads, no
+/// FP, bit-exact by construction. The kernel executes the same stability
+/// walk as the stock scatter; only the outputs differ.
+private let routeScatterFusedKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort_scatter_fused_u32_v1",
+    inputNames: ["keys", "tile_hist", "base"],
+    outputNames: ["order", "orderDiv", "indicesGathered"],
+    source: """
+        constexpr uint TILE = \(routeSortTile);
+        constexpr uint M = \(routeSortDivisor);
+        uint t = threadgroup_position_in_grid.x;
+        uint k = thread_position_in_threadgroup.x;
+        uint off = base[k];
+        for (uint tp = 0; tp < t; ++tp) {
+            off += tile_hist[tp * 256 + k];
+        }
+        for (uint i = 0; i < TILE; ++i) {
+            uint idx = t * TILE + i;
+            if (keys[idx] == k) {
+                order[off] = idx;
+                orderDiv[off] = idx / M;
+                indicesGathered[off] = k;
+                ++off;
+            }
+        }
+        """,
+    ensureRowContiguous: false
+)
+
 private func routeCountingSort(_ indices: MLXArray) -> MLXArray? {
     let n = indices.size
     guard routeCountingSortEnabled, n > 0, n % routeSortTile == 0 else { return nil }
@@ -231,10 +282,64 @@ private func routeCountingSort(_ indices: MLXArray) -> MLXArray? {
     )[0]
 }
 
+/// Fused variant of `routeCountingSort` that emits, alongside `order`, the
+/// two derived index arrays `gatherSort` otherwise computes via separate
+/// dispatches: `orderDiv = order / m` (token row for each sorted slot) and
+/// `indicesGathered = indices[order]` (expert id for each sorted slot).
+/// At the scatter write site the kernel already holds `idx` (flattened slot)
+/// and `k == keys[idx] == indices[idx]`, so all three outputs fall out of the
+/// same values already in flight — pure integer work, no FP, bit-exact by
+/// construction. Returns nil when the fused path is disabled or inapplicable
+/// (so the caller falls back to the stock `floorDivide` + gather chain).
+private func routeCountingSortFused(_ indices: MLXArray)
+    -> (order: MLXArray, orderDiv: MLXArray, indicesGathered: MLXArray)? {
+    let n = indices.size
+    guard routeCountingSortEnabled, routeIndexFusionEnabled,
+        n > 0, n % routeSortTile == 0 else { return nil }
+    let tiles = n / routeSortTile
+    let hist = routeTileHistKernel(
+        [indices],
+        grid: (tiles * routeSortTile, 1, 1),
+        threadGroup: (routeSortTile, 1, 1),
+        outputShapes: [[tiles * 256]],
+        outputDTypes: [.uint32]
+    )[0]
+    let base = routeScanKernel(
+        [hist],
+        grid: (256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[256]],
+        outputDTypes: [.uint32]
+    )[0]
+    let fused = routeScatterFusedKernel(
+        [indices, hist, base],
+        grid: (tiles * 256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[n], [n], [n]],
+        outputDTypes: [.uint32, .uint32, .uint32]
+    )
+    return (fused[0], fused[1], fused[2])
+}
+
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
-    let order = routeCountingSort(indices) ?? argSort(indices)
+    // Use the fused ordered-gather only when the divisor matches (bit-exact);
+    // otherwise fall back to the stock floorDivide + gather chain.
+    let fusedOrder = (m == routeSortDivisor)
+        ? routeCountingSortFused(indices) : nil
+    let order: MLXArray
+    let sortedX: MLXArray
+    let idxOut: MLXArray
+    if let fusedOrder {
+        order = fusedOrder.order
+        sortedX = x.flattened(start: 0, end: -3)[fusedOrder.orderDiv]
+        idxOut = fusedOrder.indicesGathered
+    } else {
+        order = routeCountingSort(indices) ?? argSort(indices)
+        sortedX = x.flattened(start: 0, end: -3)[order.floorDivide(m)]
+        idxOut = indices[order]
+    }
     let inverseOrder: MLXArray
     if inversePermutationScatterEnabled && order.size > 0 {
         inverseOrder = inversePermutationScatterKernel(
@@ -249,8 +354,8 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
     }
 
     return (
-        x.flattened(start: 0, end: -3)[order.floorDivide(m)],
-        indices[order],
+        sortedX,
+        idxOut,
         inverseOrder
     )
 }
