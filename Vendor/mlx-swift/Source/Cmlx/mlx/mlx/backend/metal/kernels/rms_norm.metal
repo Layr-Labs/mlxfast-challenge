@@ -19,6 +19,7 @@ template <typename T, int N_READS = RMS_N_READS>
     constant uint& w_stride,
     uint gid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
+    uint grid_size [[threads_per_grid]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
   constexpr int SIMD_SIZE = 32;
@@ -26,6 +27,59 @@ template <typename T, int N_READS = RMS_N_READS>
   threadgroup float local_inv_mean[1];
   threadgroup float local_sums[SIMD_SIZE];
 
+  // Laguna BF16 single-row 2048 specialization. The grid-width guard keeps
+  // the 512-row prefill launch on the generic path: one 2048-wide row is
+  // exactly 512 threads at RMS_N_READS=4, while prefill dispatches 512 of
+  // those threadgroups as a 262144-thread grid. The fixed row has sixteen
+  // simdgroup partials. Write those to slots 0...15 while lanes 16...31 of
+  // simdgroup zero initialize the disjoint unused slots, then rendezvous once.
+  // This produces the exact 32-lane second-reduction input of the generic
+  // path while removing its preceding zero-fill barrier. The square order,
+  // simd reductions, precise rsqrt, BF16 cast point, and weight multiply are
+  // unchanged.
+  if constexpr (metal::is_same_v<T, bfloat16_t> && N_READS == 4) {
+    if (axis_size == 2048 && grid_size == 512 && w_stride == 1) {
+      constexpr uint laguna_simdgroups = 16;
+      const device T* row_x =
+          x + gid * size_t(axis_size) + lid * N_READS;
+      const device T* row_w = w + lid * N_READS;
+      device T* row_out =
+          out + gid * size_t(axis_size) + lid * N_READS;
+
+      float acc = 0;
+      float xcache[N_READS];
+      for (int i = 0; i < N_READS; i++) {
+        float xi = row_x[i];
+        xcache[i] = xi;
+        acc += xi * xi;
+      }
+      acc = simd_sum(acc);
+
+      if (simd_group_id == 0 && simd_lane_id >= laguna_simdgroups) {
+        local_sums[simd_lane_id] = 0;
+      }
+      if (simd_lane_id == 0) {
+        local_sums[simd_group_id] = acc;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      if (simd_group_id == 0) {
+        acc = simd_sum(local_sums[simd_lane_id]);
+        if (simd_lane_id == 0) {
+          local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      for (int i = 0; i < N_READS; i++) {
+        row_out[i] =
+            row_w[i] * static_cast<T>(xcache[i] * local_inv_mean[0]);
+      }
+      return;
+    }
+  }
+
+  // Generic RMSNorm path.
   float acc = 0;
   x += gid * size_t(axis_size) + lid * N_READS;
   w += w_stride * lid * N_READS;
