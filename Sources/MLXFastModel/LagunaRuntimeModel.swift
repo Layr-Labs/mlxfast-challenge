@@ -6369,6 +6369,14 @@ let lagunaNvfp4ScaleDeferEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_DEFER"] != "0"
     && lagunaNvfp4ScaleFoldEnabled
 
+/// Exact common-case shortcut for the folded/deferred E4M3 scale decoder.
+/// Bytes 0...15 are positive and their old carry expression reduces to the
+/// direct half bit pattern. Kept independently ablatable from the generic
+/// prefill fp_quantized helpers.
+let lagunaNvfp4LowScaleFastEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NVFP4_LOW_SCALE_FAST"] != "0"
+
 /// The `2^22` that `laguna_nvfp4_scale` stops applying under
 /// `DARKBLOOM_NVFP4_SCALE_DEFER`, re-applied once per output row at the
 /// accumulator-to-BF16 boundary. It appears at exactly one site per
@@ -6438,6 +6446,15 @@ let lagunaSharedSwiGLUQMVHeader: String = {
         scaleCarryActive
         ? "converted"
         : "(bits & 128) ? -converted : converted"
+    let lowScaleFastPath =
+        (lagunaNvfp4LowScaleFastEnabled && lagunaNvfp4ScaleDeferEnabled)
+        ? """
+                if (bits < 16u) {
+                    ushort fast_raw = ushort(bits) << 7;
+                    return float(as_type<half>(fast_raw));
+                }
+          """
+        : ""
     // One packed 32-bit code word: eight NVFP4 values, four `half2` patterns,
     // two four-term FP groups. The first group of the FIRST word seeds the
     // accumulator when the seed elision is enabled; every other group adds.
@@ -6476,6 +6493,7 @@ let lagunaSharedSwiGLUQMVHeader: String = {
         ? "float accum;" : "float accum = 0.0f;"
     return """
     static inline float laguna_nvfp4_scale(uint8_t bits) {
+    \(lowScaleFastPath)
         ushort raw = \(scaleRawExpression);
         half converted = as_type<half>(raw);
     \(scale256)    half signed_value = \(scaleSignExpression);
@@ -10207,7 +10225,10 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                         gate.routerLogitSoftcapping == 0,
                         gate.eScoreCorrectionBias.size == LagunaConstants.numExperts
                     {
-                        lagunaTrace("routed gate/up QMV + SwiGLU (packed, producer keys)")
+                        lagunaTrace(
+                            lagunaNvfp4LowScaleFastEnabled
+                                ? "routed gate/up QMV + SwiGLU (packed, low-scale fast)"
+                                : "routed gate/up QMV + SwiGLU (packed, producer keys)")
                         activated = lagunaRoutedSwiGLUQMVPackedTop8(
                             x,
                             fusedWeight: fusedWeight,
