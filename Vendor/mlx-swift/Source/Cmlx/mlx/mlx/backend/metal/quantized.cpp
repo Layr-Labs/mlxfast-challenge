@@ -1593,6 +1593,18 @@ bool darkbloom_swiglu_reglocal() {
   return v;
 }
 
+bool darkbloom_bsearch_hoist() {
+  static const bool v =
+      env::get_var("DARKBLOOM_BSEARCH_HOIST", "") != "0";
+  return v;
+}
+
+bool darkbloom_expert_epilogue_barrier_elide() {
+  static const bool v =
+      env::get_var("DARKBLOOM_EXPERT_EPILOGUE_BARRIER_ELIDE", "") != "0";
+  return v;
+}
+
 void gather_qmm_rhs_nax(
     const array& x_,
     const array& w_,
@@ -1773,7 +1785,8 @@ void gather_qmm_rhs_nax(
           : "",
       expert_aligned
           ? ("_eg_" + std::to_string(egroups) + (expert_widest ? "_ws_1" : "_ws_0") +
-             (expert_wideld ? "_wl_1" : "_wl_0"))
+             (expert_wideld ? "_wl_1" : "_wl_0") +
+             (darkbloom_expert_epilogue_barrier_elide() ? "_eb_1" : "_eb_0"))
           : "");
 
   // Skipping dead runs is a pure work elision (see function constant 203 in

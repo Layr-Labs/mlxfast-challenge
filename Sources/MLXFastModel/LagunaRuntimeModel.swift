@@ -1326,13 +1326,26 @@ func lagunaSlidingQKNormRoPE(
 let lagunaFusedSlidingAttentionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_ATTN"] != "0"
 
+/// Default-on exact replacement of the bound attention scale in both fused
+/// decode attention kernels. Laguna's head dimension is fixed at 128, and
+/// 0x3db504f3 is the exact FP32 bit pattern of the host-provided 1/sqrt(128)
+/// value. The kill switch retains the bound-input path for same-binary A/B.
+let lagunaFusedAttnScaleLiteralEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_FUSED_ATTN_SCALE_LITERAL"] != "0"
+
+private let lagunaFusedAttnScaleSourceLine =
+    lagunaFusedAttnScaleLiteralEnabled
+    ? "float scale = as_type<float>(0x3db504f3u);"
+    : "float scale = scale_arr[0];"
+
 private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
     name: "laguna_sliding_fused_attn_ring_v1",
     inputNames: [
         "raw_queries", "raw_keys", "raw_values",
         "query_weight", "key_weight", "angles",
-        "k_cache", "v_cache", "params", "scale_arr",
-    ],
+        "k_cache", "v_cache", "params",
+    ] + (lagunaFusedAttnScaleLiteralEnabled ? [] : ["scale_arr"]),
     outputNames: ["attended"],
     source: """
         constexpr uint head_dim = 128;
@@ -1354,7 +1367,7 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
         uint sg = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
         uint widx = params[0];
-        float scale = scale_arr[0];
+        \(lagunaFusedAttnScaleSourceLine)
 
         threadgroup bfloat tg_q0[head_dim];
         threadgroup bfloat tg_q1[head_dim];
@@ -1737,8 +1750,8 @@ func lagunaSlidingFusedAttention(
         [
             rawQueries, rawKeys, rawValues,
             queryWeight, keyWeight, angles,
-            cacheKeys, cacheValues, params, scale,
-        ],
+            cacheKeys, cacheValues, params,
+        ] + (lagunaFusedAttnScaleLiteralEnabled ? [] : [scale]),
         grid: ((heads / 2) * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
@@ -1801,8 +1814,8 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
     inputNames: [
         "raw_queries", "raw_keys", "raw_values",
         "query_weight", "key_weight", "angles",
-        "k_cache", "v_cache", "params", "scale_arr",
-    ],
+        "k_cache", "v_cache", "params",
+    ] + (lagunaFusedAttnScaleLiteralEnabled ? [] : ["scale_arr"]),
     outputNames: ["attended"],
     source: """
         constexpr uint head_dim = 128;
@@ -1825,7 +1838,7 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
         uint widx = params[0];
         int N = int(params[1]);
         uint capacity = params[2];
-        float scale = scale_arr[0];
+        \(lagunaFusedAttnScaleSourceLine)
 
         threadgroup bfloat tg_q0[head_dim];
         threadgroup bfloat tg_q1[head_dim];
@@ -2249,8 +2262,8 @@ func lagunaFullFusedAttention(
         [
             rawQueries, rawKeys, rawValues,
             queryWeight, keyWeight, angles,
-            cacheKeys, cacheValues, params, scale,
-        ],
+            cacheKeys, cacheValues, params,
+        ] + (lagunaFusedAttnScaleLiteralEnabled ? [] : [scale]),
         grid: ((heads / 2) * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
@@ -4467,9 +4480,35 @@ private let lagunaTailNVFP4QMVHeader = """
 private let lagunaDecodeNVFP4QKVR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_NVFP4_QKV_R1"] != "0"
 
+/// Packs four independent one-row SIMD groups into each QKV threadgroup.
+/// `..._SIMDGROUPS=2` restores the promoted two-group scheduling control.
+private let lagunaDecodeNVFP4QKVR1SIMDGroups =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_DECODE_NVFP4_QKV_R1_SIMDGROUPS"] == "2" ? 2 : 4
+
+/// Transfer the common group-16 NVFP4 qdot helper already used by the live
+/// sparse kernels to static one-token QKV R1. It preserves nibble decode and
+/// product order while moving the exact 2^22 factor from four group results
+/// to the existing row epilogue. The old tail helper remains an A/B control.
+private let lagunaDecodeNVFP4QKVCommonQDotEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_DECODE_NVFP4_QKV_COMMON_QDOT"] != "0"
+
+private let lagunaDecodeNVFP4QKVQDotName =
+    lagunaDecodeNVFP4QKVCommonQDotEnabled
+    ? "laguna_nvfp4_qdot_16" : "laguna_tail_nvfp4_qdot"
+
+private let lagunaDecodeNVFP4QKVScaleName =
+    lagunaDecodeNVFP4QKVCommonQDotEnabled
+    ? "laguna_nvfp4_scale" : "laguna_tail_nvfp4_scale"
+
+private let lagunaDecodeNVFP4QKVRowScaleSuffix =
+    lagunaDecodeNVFP4QKVCommonQDotEnabled
+    ? lagunaNvfp4RowScaleSuffix : ""
+
 private let lagunaDecodeNVFP4QKVR1Source = """
     constexpr uint axis_size = 2048;
-    constexpr uint num_simdgroups = 2;
+    constexpr uint num_simdgroups = \(lagunaDecodeNVFP4QKVR1SIMDGroups);
     constexpr uint values_per_thread = 16;
     constexpr uint block_size = 512;
     constexpr uint in_vec_size_w = axis_size / 2;
@@ -4493,8 +4532,8 @@ private let lagunaDecodeNVFP4QKVR1Source = """
         for (uint i = 0; i < values_per_thread; ++i) {
             x_thread[i] = float(normalized[column + i]);
         }
-        result += laguna_tail_nvfp4_qdot(
-            ws, x_thread, laguna_tail_nvfp4_scale(sc[0]));
+        result += \(lagunaDecodeNVFP4QKVQDotName)(
+            ws, x_thread, \(lagunaDecodeNVFP4QKVScaleName)(sc[0]));
         ws += block_size / 2;
         sc += block_size / 16;
         column += block_size;
@@ -4502,7 +4541,8 @@ private let lagunaDecodeNVFP4QKVR1Source = """
 
     result = simd_sum(result);
     if (simd_lid == 0) {
-        projected[out_row] = bfloat(result);
+        projected[out_row] =
+            bfloat(result\(lagunaDecodeNVFP4QKVRowScaleSuffix));
     }
     """
 
@@ -4510,11 +4550,14 @@ private let lagunaDecodeNVFP4QKVR1Kernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_decode_nvfp4_qkv_h\(heads)_r1_v1",
+            name: "laguna_decode_nvfp4_qkv_h\(heads)_r1_v1"
+                + "_sg\(lagunaDecodeNVFP4QKVR1SIMDGroups)"
+                + (lagunaDecodeNVFP4QKVCommonQDotEnabled ? "_cq1" : ""),
             inputNames: ["normalized", "weight_codes", "weight_scales"],
             outputNames: ["projected"],
             source: lagunaDecodeNVFP4QKVR1Source,
-            header: lagunaTailNVFP4QMVHeader,
+            header: lagunaDecodeNVFP4QKVCommonQDotEnabled
+                ? lagunaSharedSwiGLUQMVHeader : lagunaTailNVFP4QMVHeader,
             ensureRowContiguous: true)
     }
     return kernels
@@ -4537,14 +4580,17 @@ private func lagunaDecodeNVFP4QKVR1(
         bank.packedCodes.shape == [rows, hidden / 8],
         bank.scales.dtype == .uint8,
         bank.scales.shape == [rows, hidden / 16],
-        rows % 2 == 0,
+        rows % lagunaDecodeNVFP4QKVR1SIMDGroups == 0,
         let kernel = lagunaDecodeNVFP4QKVR1Kernels[heads]
     else { return nil }
     lagunaTrace("decode nvfp4 qkv r1 h\(heads)")
+    if lagunaDecodeNVFP4QKVCommonQDotEnabled {
+        lagunaTrace("decode nvfp4 qkv common qdot")
+    }
     return kernel(
         [normalized, bank.packedCodes, bank.scales],
-        grid: ((rows / 2) * 64, 1, 1),
-        threadGroup: (64, 1, 1),
+        grid: (rows * 32, 1, 1),
+        threadGroup: (lagunaDecodeNVFP4QKVR1SIMDGroups * 32, 1, 1),
         outputShapes: [[1, 1, rows]],
         outputDTypes: [.bfloat16]
     )[0]
@@ -9967,7 +10013,10 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 let fusedScales = _fusedRoutedGateUpScales,
                 let downProj = _routedDownProj,
                 x.dim(1) > 1,
-                inds.size >= 64,
+                // The fused bank is only valid once the gathered region spans
+                // both 512-row gate/up halves. Shorter prompts must retain the
+                // stock path; the former 64-row sort threshold was too low.
+                inds.size >= 2 * LagunaConstants.moeIntermediateSize,
                 fusedWeight.dtype == .uint32,
                 fusedScales.dtype == .uint8,
                 _fusedRoutedGateUpSplit == LagunaConstants.moeIntermediateSize
