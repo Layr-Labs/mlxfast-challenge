@@ -4467,7 +4467,58 @@ private let lagunaTailNVFP4QMVHeader = """
 private let lagunaDecodeNVFP4QKVR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_NVFP4_QKV_R1"] != "0"
 
+private let lagunaDecodeNVFP4QKVR1VecXEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_NVFP4_QKV_VECX"] != "0"
+
 private let lagunaDecodeNVFP4QKVR1Source = """
+    constexpr uint axis_size = 2048;
+    constexpr uint num_simdgroups = 2;
+    constexpr uint values_per_thread = 16;
+    constexpr uint block_size = 512;
+    constexpr uint in_vec_size_w = axis_size / 2;
+    constexpr uint in_vec_size_g = axis_size / 16;
+
+    uint tile = threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    uint out_row = tile * num_simdgroups + simd_gid;
+
+    const device uint8_t* ws = (const device uint8_t*)weight_codes +
+        out_row * in_vec_size_w + simd_lid * 8;
+    const device uint8_t* sc = weight_scales +
+        out_row * in_vec_size_g + simd_lid;
+
+    thread float x_thread[values_per_thread];
+    thread float result = 0.0f;
+
+    uint column = simd_lid * values_per_thread;
+    for (uint k = 0; k < axis_size; k += block_size) {
+        // vec<bfloat,4> loads for the lane's x stripe (the same values in
+        // the same float() conversion order as the former 16 scalar loads;
+        // 4 transactions instead of 16 per block).
+        const device vec<bfloat, 4>* input_vectors =
+            (const device vec<bfloat, 4>*)(normalized + column);
+        for (uint i = 0; i < values_per_thread / 4; ++i) {
+            const vec<bfloat, 4> values = input_vectors[i];
+            x_thread[4 * i] = float(values[0]);
+            x_thread[4 * i + 1] = float(values[1]);
+            x_thread[4 * i + 2] = float(values[2]);
+            x_thread[4 * i + 3] = float(values[3]);
+        }
+        result += laguna_tail_nvfp4_qdot(
+            ws, x_thread, laguna_tail_nvfp4_scale(sc[0]));
+        ws += block_size / 2;
+        sc += block_size / 16;
+        column += block_size;
+    }
+
+    result = simd_sum(result);
+    if (simd_lid == 0) {
+        projected[out_row] = bfloat(result);
+    }
+    """
+
+private let lagunaDecodeNVFP4QKVR1ScalarSource = """
     constexpr uint axis_size = 2048;
     constexpr uint num_simdgroups = 2;
     constexpr uint values_per_thread = 16;
@@ -4510,10 +4561,13 @@ private let lagunaDecodeNVFP4QKVR1Kernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_decode_nvfp4_qkv_h\(heads)_r1_v1",
+            name: lagunaDecodeNVFP4QKVR1VecXEnabled
+                ? "laguna_decode_nvfp4_qkv_h\(heads)_r1_v2"
+                : "laguna_decode_nvfp4_qkv_h\(heads)_r1_v1",
             inputNames: ["normalized", "weight_codes", "weight_scales"],
             outputNames: ["projected"],
-            source: lagunaDecodeNVFP4QKVR1Source,
+            source: lagunaDecodeNVFP4QKVR1VecXEnabled
+                ? lagunaDecodeNVFP4QKVR1Source : lagunaDecodeNVFP4QKVR1ScalarSource,
             header: lagunaTailNVFP4QMVHeader,
             ensureRowContiguous: true)
     }
