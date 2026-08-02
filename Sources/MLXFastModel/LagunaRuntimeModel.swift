@@ -573,11 +573,13 @@ private let lagunaLastPrefillProjectionBanksEnabled =
 /// Full-attention counterpart: fuses per-head Q/K RMSNorm with partial YaRN
 /// RoPE. One stock FP32 probe row carries the authoritative rotary factors,
 /// while the custom kernel preserves the normalized BF16 boundary and tail.
-/// Folds the MoE router's `[256, 2048]` projection into the post-attention
-/// residual + RMSNorm kernel, which is the dispatch immediately before it and
-/// its only producer. Set `DARKBLOOM_FUSED_RESIDUAL_RMS_ROUTER=0` to ablate.
+/// `DARKBLOOM_FUSED_RESIDUAL_RMS_ROUTER` (default OFF; set "1" to restore the
+/// fused control). The current eight-router-row geometry launches 32
+/// threadgroups, and every group repeats the same 2,048-element residual add
+/// and RMSNorm before computing its router rows. The exact separate chain
+/// computes that producer once and is faster on the current composition.
 let lagunaFusedResidualRMSNormRouterEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_RESIDUAL_RMS_ROUTER"] != "0"
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_RESIDUAL_RMS_ROUTER"] == "1"
 
 let lagunaFusedFullQKNormYaRNEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_QK_NORM_YARN"] != "0"
