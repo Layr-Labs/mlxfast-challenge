@@ -4107,6 +4107,12 @@ func lagunaGatedAffineOProj(
 private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
     let scaleFold = lagunaNvfp4ScaleFoldEnabled
     let weightScale = scaleFold ? "" : " * 16384.0f"
+    let scaleDecode = lagunaDecodeNVFP4PositiveScaleEnabled
+        ? "ushort sraw = ushort(sbits) << 7;\n"
+            + "            float scale = float(as_type<half>(sraw));"
+        : "ushort sraw = ushort(sbits & 127) << 7;\n"
+            + "            half sconverted = as_type<half>(sraw);\n"
+            + "            float scale = float((sbits & 128) ? -sconverted : sconverted);"
     let extract = """
                     const uint xe = c & 0x0F0F0F0Fu;
                     const uint ge = xe | (xe << 3);
@@ -4177,9 +4183,7 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
             // epilogue. Every partial remains the exact 2^-22 rescaling of
             // the control until the multiply before the existing BF16 round.
             uint8_t sbits = sc[row * in_vec_size_g];
-            ushort sraw = ushort(sbits & 127) << 7;
-            half sconverted = as_type<half>(sraw);
-            float scale = float((sbits & 128) ? -sconverted : sconverted);
+            \(scaleDecode)
             float accum = 0.0f;
             #pragma unroll
             for (uint j = 0; j < codes_per_thread; ++j) {
@@ -4299,7 +4303,9 @@ private let lagunaTailNVFP4QDotReturn = lagunaTailNVFP4ScaleFoldEnabled
 
 private let lagunaTailNVFP4QMVHeader = """
     static inline float laguna_tail_nvfp4_scale(uint8_t bits) {
-        \(lagunaTailNVFP4ScaleFoldEnabled
+        \(lagunaDecodeNVFP4PositiveScaleEnabled
+            ? "ushort raw = ushort(bits) << 7;"
+            : lagunaTailNVFP4ScaleFoldEnabled
             ? "ushort raw = ushort(bits + (bits & 128)) << 7;"
             : "ushort raw = ushort(bits & 127) << 7;")
         \(lagunaTailNVFP4ScaleDecode)
@@ -6380,6 +6386,13 @@ let lagunaNvfp4NibbleSplit: Int = {
 let lagunaNvfp4ScaleCarry: Bool =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_CARRY"] != "0"
 
+/// All checkpoint NVFP4 scale bytes used by the decode-only kernels are
+/// positive. Set `DARKBLOOM_DECODE_NVFP4_POSITIVE_SCALE=0` for the signed
+/// control path.
+let lagunaDecodeNVFP4PositiveScaleEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_DECODE_NVFP4_POSITIVE_SCALE"] != "0"
+
 /// `DARKBLOOM_NVFP4_QDOT_SEED_ELIDE` (default on; set "0" to restore the
 /// `float accum = 0.0f;` seed): removes the one dead FP add per 16-value NVFP4
 /// group. `laguna_nvfp4_qdot_codes_16` seeds its accumulator with the literal
@@ -6535,6 +6548,13 @@ let lagunaSharedSwiGLUQMVHeader: String = {
         scaleCarryActive
         ? "converted"
         : "(bits & 128) ? -converted : converted"
+    let positiveScaleFastPath =
+        lagunaNvfp4ScaleDeferEnabled && lagunaDecodeNVFP4PositiveScaleEnabled
+        ? """
+        ushort fast_raw = ushort(bits) << 7;
+        return float(as_type<half>(fast_raw));
+        """
+        : ""
     // One packed 32-bit code word: eight NVFP4 values, four `half2` patterns,
     // two four-term FP groups. The first group of the FIRST word seeds the
     // accumulator when the seed elision is enabled; every other group adds.
@@ -6573,6 +6593,7 @@ let lagunaSharedSwiGLUQMVHeader: String = {
         ? "float accum;" : "float accum = 0.0f;"
     return """
     static inline float laguna_nvfp4_scale(uint8_t bits) {
+    \(positiveScaleFastPath)
         ushort raw = \(scaleRawExpression);
         half converted = as_type<half>(raw);
     \(scale256)    half signed_value = \(scaleSignExpression);
