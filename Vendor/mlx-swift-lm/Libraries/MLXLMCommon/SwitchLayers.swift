@@ -231,9 +231,117 @@ private func routeCountingSort(_ indices: MLXArray) -> MLXArray? {
     )[0]
 }
 
+/// Fused twin of the counting-sort scatter: at the exact write point where
+/// the stock scatter emits `order[off] = idx`, every downstream index
+/// product of the sorted-MoE chain is already known — `idx / m` is the
+/// gathered row (`order.floorDivide(m)`), the tested key `k` IS
+/// `indices[order[off]]`, and `off` is the inverse permutation entry for
+/// `idx`. Emitting all three here removes the standalone floorDivide, the
+/// `indices[order]` take, and the inverse-permutation dispatch from the
+/// serial sort->gather dependency chain, with byte-identical integer
+/// outputs by construction (same values, same producers' input-order walk).
+/// DEFAULT ON; `DARKBLOOM_ROUTE_FUSED_SCATTER=0` restores the stock chain.
+private let routeFusedScatterEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTE_FUSED_SCATTER"] != "0"
+
+private let routeFusedScatterTopK = 8
+
+private let routeFusedScatterKernel: MLXFast.MLXFastKernel = {
+    let m = routeFusedScatterTopK
+    return MLXFast.metalKernel(
+        name: "mlx_lm_route_csort_scatter_fused_m\(m)_u32_v2",
+        inputNames: ["keys", "tile_hist"],
+        outputNames: ["row_order", "sorted_keys", "inverse_order"],
+        source: """
+            constexpr uint TILE = \(routeSortTile);
+            constexpr uint M = \(m);
+            uint t = threadgroup_position_in_grid.x;
+            uint k = thread_position_in_threadgroup.x;
+            uint simd_id = k / 32;
+            uint lane = k % 32;
+            uint tiles = tile_hist_shape[0] / 256;
+            // In-threadgroup exclusive scan over the 256 key totals replaces
+            // the standalone scan dispatch (and its serial lane-0 loop).
+            // Integer addition is associative and commutative, so any
+            // summation order produces the byte-identical base table.
+            uint total = 0;
+            for (uint tp = 0; tp < tiles; ++tp) {
+                total += tile_hist[tp * 256 + k];
+            }
+            uint lane_excl = simd_prefix_exclusive_sum(total);
+            threadgroup uint simd_totals[8];
+            if (lane == 31) {
+                simd_totals[simd_id] = lane_excl + total;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint simd_base = 0;
+            for (uint s = 0; s < simd_id; ++s) {
+                simd_base += simd_totals[s];
+            }
+            // Rank base for key k in tile t: global base + earlier tiles.
+            uint off = simd_base + lane_excl;
+            for (uint tp = 0; tp < t; ++tp) {
+                off += tile_hist[tp * 256 + k];
+            }
+            // Walk this tile's slice in input order: stability by
+            // construction, exactly the stock scatter's write order.
+            for (uint i = 0; i < TILE; ++i) {
+                uint idx = t * TILE + i;
+                if (keys[idx] == k) {
+                    row_order[off] = idx / M;
+                    sorted_keys[off] = k;
+                    inverse_order[idx] = off;
+                    ++off;
+                }
+            }
+            """,
+        ensureRowContiguous: false
+    )
+}()
+
+/// One-shot stderr announcement on the fused path's first engagement, so
+/// "did it actually run" stays observable (guards decline silently).
+private let routeFusedScatterAnnounce: Void = FileHandle.standardError.write(
+    Data("mlx_lm: fused route scatter active\n".utf8))
+
+private func routeCountingSortFused(
+    _ indices: MLXArray, m: Int
+) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray)? {
+    let n = indices.size
+    guard routeFusedScatterEnabled, routeCountingSortEnabled,
+        indices.dtype == .uint32,
+        n > 0, n % routeSortTile == 0,
+        m == routeFusedScatterTopK
+    else { return nil }
+    _ = routeFusedScatterAnnounce
+    let tiles = n / routeSortTile
+    let hist = routeTileHistKernel(
+        [indices],
+        grid: (tiles * routeSortTile, 1, 1),
+        threadGroup: (routeSortTile, 1, 1),
+        outputShapes: [[tiles * 256]],
+        outputDTypes: [.uint32]
+    )[0]
+    let outputs = routeFusedScatterKernel(
+        [indices, hist],
+        grid: (tiles * 256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[n], [n], [n]],
+        outputDTypes: [.uint32, .uint32, .uint32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
+    if let fused = routeCountingSortFused(indices, m: m) {
+        return (
+            x.flattened(start: 0, end: -3)[fused.rowOrder],
+            fused.sortedKeys,
+            fused.inverseOrder
+        )
+    }
     let order = routeCountingSort(indices) ?? argSort(indices)
     let inverseOrder: MLXArray
     if inversePermutationScatterEnabled && order.size > 0 {
