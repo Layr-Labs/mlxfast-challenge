@@ -308,6 +308,17 @@ MTL::ComputePipelineState* get_steel_gemm_fused_nax_kernel(
     int wm,
     int wn);
 
+MTL::ComputePipelineState* get_steel_gemm_lossless_bf16_nax_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array& out,
+    int bm,
+    int bn,
+    int bk,
+    int wm,
+    int wn,
+    int packed_k);
+
 MTL::ComputePipelineState* get_steel_gemm_gather_nax_kernel(
     metal::Device& d,
     const std::string& kernel_name,

@@ -524,6 +524,72 @@ void steel_matmul_regular_axpby(
   compute_encoder.add_temporaries(std::move(copies));
 }
 
+// Laguna's lossless BF16 output-projection layout leaves the logical matrix
+// shape unchanged and uses an offset-one contiguous view as its structural
+// tag. Only the B-fragment load changes; the NAX matrix instruction sequence,
+// FP32 accumulator, K order, output shape, and store are the ordinary path.
+void steel_matmul_lossless_bf16_oproj_nax(
+    const Stream& s,
+    metal::Device& d,
+    const array& a,
+    const array& packed_b,
+    array& out,
+    int M,
+    int N,
+    int K,
+    int lda,
+    std::vector<array>& copies) {
+  using namespace mlx::steel;
+
+  constexpr int bm = 64;
+  constexpr int bn = 128;
+  const int bk = (K >= 8192 && K > (M + N)) ? 64 : 256;
+  constexpr int wm = 2;
+  constexpr int wn = 4;
+
+  std::ostringstream kname;
+  kname << "steel_gemm_lossless_bf16_oproj_nax_" << type_to_name(out)
+        << "_k" << K << "_bm" << bm << "_bn" << bn << "_bk" << bk
+        << "_wm" << wm << "_wn" << wn;
+  const std::string kernel_name = kname.str();
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel = get_steel_gemm_lossless_bf16_nax_kernel(
+      d, kernel_name, out, bm, bn, bk, wm, wn, K);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  const int tiles_n = (N + bn - 1) / bn;
+  const int tiles_m = (M + bm - 1) / bm;
+  constexpr int swizzle_log = 2;
+  GEMMParams params{/* M = */ M,
+                    /* N = */ N,
+                    /* K = */ K,
+                    /* lda = */ lda,
+                    /* ldb = */ K,
+                    /* ldd = */ N,
+                    /* tiles_n = */ tiles_n,
+                    /* tiles_m = */ tiles_m,
+                    /* batch_stride_a = */ 0,
+                    /* batch_stride_b = */ 0,
+                    /* batch_stride_d = */ int64_t(M) * N,
+                    /* swizzle_log = */ swizzle_log,
+                    /* gemm_k_iterations_aligned = */ K / bk,
+                    /* batch_ndim = */ 0};
+
+  constexpr int swizzle_tile = 1 << swizzle_log;
+  const int grid_m = (tiles_m + swizzle_tile - 1) / swizzle_tile;
+  const int grid_n = tiles_n * swizzle_tile;
+  const MTL::Size group_dims = MTL::Size(32, wn, wm);
+  const MTL::Size grid_dims = MTL::Size(grid_n, grid_m, 1);
+
+  compute_encoder.set_input_array(a, 0);
+  compute_encoder.set_input_array(packed_b, 1);
+  compute_encoder.set_output_array(out, 2);
+  compute_encoder.set_bytes(params, 3);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  compute_encoder.add_temporaries(std::move(copies));
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Split k steel matmul
 ///////////////////////////////////////////////////////////////////////////////
@@ -1340,6 +1406,19 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     A_batch_stride = {0};
     B_batch_stride = {0};
     batch_shape = {1};
+  }
+
+  // Offset one is the lossless-layout tag produced by Laguna's initialization
+  // packer. Keep the selector narrower than the model contract so an ordinary
+  // strided matmul can never enter it accidentally.
+  const bool lossless_bf16_oproj = metal::is_nax_available() && M > 1 &&
+      N == 2048 && (K == 6144 || K == 8192) &&
+      a.dtype() == bfloat16 && b.dtype() == bfloat16 &&
+      out.dtype() == bfloat16 && !a_transposed && b_transposed &&
+      batch_size_out == 1 && a_cols == K && b_cols == K && b.offset() == 1;
+  if (lossless_bf16_oproj) {
+    return steel_matmul_lossless_bf16_oproj_nax(
+        s, d, a, b, out, M, N, K, a_cols, copies);
   }
 
   /////////////////////////////////////////////////////////////////////////////

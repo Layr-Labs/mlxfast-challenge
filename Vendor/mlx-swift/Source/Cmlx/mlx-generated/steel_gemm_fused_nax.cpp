@@ -85,6 +85,176 @@ void gemm_epilogue(
   });
 }
 
+///////////////////////////////////////////////////////////////////////////////
+// Lossless packed-B BF16 path for Laguna prefill output projections.
+///////////////////////////////////////////////////////////////////////////////
+
+template <typename T, int PACKED_K>
+METAL_FUNC T laguna_lossless_bf16_value(
+    const device T* packed,
+    const int row,
+    const int column) {
+  constexpr int kBlockValues = 32;
+  constexpr int kRecordBytes = 49;
+  constexpr int kPrimaryBytes =
+      (PACKED_K / kBlockValues) * kRecordBytes;
+  constexpr int kRawSlotBytes = kBlockValues * int(sizeof(ushort));
+  constexpr int kRawSlots =
+      (PACKED_K * int(sizeof(ushort)) - kPrimaryBytes) / kRawSlotBytes;
+
+  const device uchar* row_base =
+      reinterpret_cast<const device uchar*>(packed) +
+      size_t(row) * PACKED_K * sizeof(ushort);
+  const int block = column / kBlockValues;
+  const int within = column % kBlockValues;
+  const device uchar* record = row_base + block * kRecordBytes;
+  const uint base = record[48];
+
+  if (base == 255u) {
+    const uint slot = record[32];
+    if (slot >= uint(kRawSlots)) {
+      return as_type<T>(ushort(0x7fc1));
+    }
+    const device ushort* raw = reinterpret_cast<const device ushort*>(
+        row_base + kPrimaryBytes + slot * kRawSlotBytes);
+    return as_type<T>(raw[within]);
+  }
+  const uint sign_mantissa = record[within];
+  const uint pair = record[32 + within / 2];
+  const uint delta = (pair >> ((within & 1) * 4)) & 15u;
+  const ushort bits = ushort(
+      ((sign_mantissa & 128u) << 8) |
+      ((base + delta) << 7) |
+      (sign_mantissa & 127u));
+  return as_type<T>(bits);
+}
+
+template <typename T, short TR, short TC, int PACKED_K>
+METAL_FUNC void laguna_load_lossless_btile(
+    thread NAXTile<T, TR, TC>& tile,
+    const device T* packed,
+    const int row_base,
+    const int column_base) {
+  const short2 sc = BaseNAXFrag::get_coord();
+  STEEL_PRAGMA_UNROLL
+  for (short fr = 0; fr < TR; ++fr) {
+    STEEL_PRAGMA_UNROLL
+    for (short fc = 0; fc < TC; ++fc) {
+      thread auto& frag = tile.frag_at(fr, fc);
+      STEEL_PRAGMA_UNROLL
+      for (short er = 0; er < BaseNAXFrag::kElemRows; ++er) {
+        const int row = row_base + fr * BaseNAXFrag::kFragRows + sc.y +
+            er * BaseNAXFrag::kElemRowsJump;
+        STEEL_PRAGMA_UNROLL
+        for (short ec = 0; ec < BaseNAXFrag::kElemCols; ++ec) {
+          const int column =
+              column_base + fc * BaseNAXFrag::kFragCols + sc.x + ec;
+          frag[er * BaseNAXFrag::kElemCols + ec] =
+              laguna_lossless_bf16_value<T, PACKED_K>(packed, row, column);
+        }
+      }
+    }
+  }
+}
+
+template <
+    typename T,
+    short SM,
+    short SN,
+    short SK,
+    short BK,
+    int PACKED_K,
+    bool kAlignedM,
+    typename AccumType = float>
+METAL_FUNC auto laguna_lossless_bf16_gemm_loop(
+    const device T* A,
+    const device T* packed_B,
+    const int lda,
+    const int output_row_base,
+    const short sgp_sm) {
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+
+  NAXTile<AccumType, TM, TN> Dtile;
+  Dtile.clear();
+  STEEL_PRAGMA_NO_UNROLL
+  for (int kk0 = 0; kk0 < PACKED_K / BK; ++kk0) {
+    threadgroup_barrier(mem_flags::mem_none);
+    STEEL_PRAGMA_NO_UNROLL
+    for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+      NAXTile<T, TM, TK> Atile;
+      NAXTile<T, TN, TK> Btile;
+      if constexpr (kAlignedM) {
+        Atile.load(A + kk1, lda);
+      } else {
+        Atile.load_safe(A + kk1, lda, short2(SK, sgp_sm));
+      }
+      laguna_load_lossless_btile<T, TN, TK, PACKED_K>(
+          Btile, packed_B, output_row_base, kk0 * BK + kk1);
+      tile_matmad_nax(
+          Dtile,
+          Atile,
+          metal::bool_constant<false>{},
+          Btile,
+          metal::bool_constant<true>{});
+    }
+    A += BK;
+  }
+  return Dtile;
+}
+
+template <
+    typename T,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    int PACKED_K,
+    typename AccumType = float>
+[[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void
+gemm_lossless_bf16_b(
+    const device T* A [[buffer(0)]],
+    const device T* packed_B [[buffer(1)]],
+    device T* D [[buffer(2)]],
+    const constant GEMMParams* params [[buffer(3)]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]]) {
+  const int tid_y = ((tid.y) << params->swizzle_log) +
+      ((tid.x) & ((1 << params->swizzle_log) - 1));
+  const int tid_x = (tid.x) >> params->swizzle_log;
+  if (params->tiles_n <= tid_x || params->tiles_m <= tid_y) {
+    return;
+  }
+
+  threadgroup_barrier(mem_flags::mem_none);
+  const int c_row = tid_y * BM;
+  const int c_col = tid_x * BN;
+  A += size_t(c_row) * params->lda;
+  D += size_t(c_row) * params->ldd + c_col;
+
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+  const short tm = SM * (simd_group_id / WN);
+  const short tn = SN * (simd_group_id % WN);
+  const short sgp_sm = short(min(int(SM), params->M - (c_row + tm)));
+
+  A += tm * params->lda;
+  D += tm * params->ldd + tn;
+  dispatch_bool(sgp_sm == SM, [&](auto kAlignedM) {
+    auto Dtile = laguna_lossless_bf16_gemm_loop<
+        T, SM, SN, SK, BK, PACKED_K, kAlignedM.value, AccumType>(
+        A, packed_B, params->lda, c_col + tn, sgp_sm);
+    if constexpr (kAlignedM) {
+      Dtile.store(D, int(params->ldd));
+    } else {
+      Dtile.store_safe(D, int(params->ldd), short2(SN, sgp_sm));
+    }
+  });
+}
+
 // clang-format off
 template <
     typename T,

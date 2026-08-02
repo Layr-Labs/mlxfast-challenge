@@ -31,4 +31,11 @@
 instantiate_gemm_shapes_helper(float16, half, float16, half);
 instantiate_gemm_shapes_helper(bfloat16, bfloat, bfloat16, bfloat);
 instantiate_gemm_shapes_helper(float32, float, float32, float);
+
+instantiate_kernel(
+    "steel_gemm_lossless_bf16_oproj_nax_bfloat16_k6144_bm64_bn128_bk256_wm2_wn4",
+    gemm_lossless_bf16_b, bfloat, 64, 128, 256, 2, 4, 6144, float);
+instantiate_kernel(
+    "steel_gemm_lossless_bf16_oproj_nax_bfloat16_k8192_bm64_bn128_bk64_wm2_wn4",
+    gemm_lossless_bf16_b, bfloat, 64, 128, 64, 2, 4, 8192, float);
 // clang-format on

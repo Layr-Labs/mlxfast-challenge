@@ -104,6 +104,32 @@ func lagunaTrace(_ site: @autoclosure () -> String) {
 let lagunaFusedQKVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] == "1"
 
+/// Exact BF16 prefill output-projection streaming for M5 NAX. The side layout
+/// stores every BF16 bit losslessly in fewer normally-read bytes and rebuilds
+/// the original words in the matrix fragment loader. The terminal layer uses
+/// the existing one-row path, so the maximum useful rollout is layers 0..<39.
+private let lagunaLosslessBF16OProjLayerCount: Int = {
+    guard ProcessInfo.processInfo.environment["DARKBLOOM_LOSSLESS_BF16_OPROJ"] != "0"
+    else { return 0 }
+    let requested = Int(
+        ProcessInfo.processInfo.environment["DARKBLOOM_LOSSLESS_BF16_OPROJ_LAYERS"]
+            ?? "39") ?? 39
+    return min(max(requested, 0), LagunaConstants.numHiddenLayers - 1)
+}()
+
+private let lagunaNAXArchitectureAvailable: Bool = {
+    let architecture = GPU.deviceInfo().architecture
+    guard let marker = architecture.range(of: "_g") else { return false }
+    let digits = architecture[marker.upperBound...].prefix { $0.isNumber }
+    guard let generation = Int(String(digits)) else { return false }
+    return generation >= 17
+}()
+
+private func lagunaUseLosslessBF16OProj(layer: Int) -> Bool {
+    lagunaNAXArchitectureAvailable
+        && layer >= 0 && layer < lagunaLosslessBF16OProjLayerCount
+}
+
 /// `DARKBLOOM_FUSED_SHARED_GATE_UP` (default on; set "0" to disable): after
 /// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
 /// shared expert and serve single-token decode from one quantized matmul.
@@ -2918,6 +2944,116 @@ struct LagunaNativeAffineWeight {
     }
 }
 
+/// Packs one BF16 output-projection row without changing any bit. Each block
+/// of 32 values stores 32 sign/mantissa bytes, 16 four-bit exponent deltas,
+/// and one base exponent (49 bytes instead of 64). Blocks whose exponent span
+/// exceeds 15 use raw slots in the unused tail of the same physical row.
+/// Element zero is a storage tag: the returned logical matrix is the
+/// contiguous offset-one view, so its shape and matmul output remain exactly
+/// `[2048, K]` and `[M, 2048]` while the backend can distinguish the codec.
+private func lagunaLosslessBF16OProjPackSource(k: Int) -> String {
+    """
+    constexpr uint K = \(k);
+    constexpr uint block_values = 32;
+    constexpr uint blocks_per_row = K / block_values;
+    constexpr uint record_bytes = 49;
+    constexpr uint primary_bytes = blocks_per_row * record_bytes;
+    constexpr uint raw_slot_bytes = block_values * sizeof(ushort);
+    constexpr uint raw_slots =
+        (K * sizeof(ushort) - primary_bytes) / raw_slot_bytes;
+
+    threadgroup atomic_uint exception_count;
+    const uint row = threadgroup_position_in_grid.x;
+    const uint block = thread_index_in_threadgroup;
+    if (block == 0) {
+        atomic_store_explicit(&exception_count, 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const device ushort* src =
+        reinterpret_cast<const device ushort*>(weight)
+        + row * K + block * block_values;
+    device uchar* row_out = reinterpret_cast<device uchar*>(packed)
+        + sizeof(ushort) + row * K * sizeof(ushort);
+    device uchar* record = row_out + block * record_bytes;
+
+    ushort bits[block_values];
+    uint min_exp = 255u;
+    uint max_exp = 0u;
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < block_values; ++i) {
+        const ushort value = src[i];
+        bits[i] = value;
+        const uint exponent = (uint(value) >> 7) & 255u;
+        min_exp = min(min_exp, exponent);
+        max_exp = max(max_exp, exponent);
+    }
+
+    if (max_exp - min_exp <= 15u && min_exp != 255u) {
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < block_values; ++i) {
+            const ushort value = bits[i];
+            record[i] = uchar(
+                ((uint(value) >> 8) & 128u) | (uint(value) & 127u));
+        }
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < block_values; i += 2) {
+            const uint d0 = ((uint(bits[i]) >> 7) & 255u) - min_exp;
+            const uint d1 = ((uint(bits[i + 1]) >> 7) & 255u) - min_exp;
+            record[32 + i / 2] = uchar(d0 | (d1 << 4));
+        }
+        record[48] = uchar(min_exp);
+    } else {
+        const uint slot = atomic_fetch_add_explicit(
+            &exception_count, 1u, memory_order_relaxed);
+        record[48] = uchar(255u);
+        record[32] = uchar(slot);
+        if (slot < raw_slots) {
+            device ushort* raw = reinterpret_cast<device ushort*>(
+                row_out + primary_bytes + slot * raw_slot_bytes);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < block_values; ++i) {
+                raw[i] = bits[i];
+            }
+        }
+    }
+    """
+}
+
+private let lagunaLosslessBF16OProjPackK6144Kernel = MLXFast.metalKernel(
+    name: "laguna_lossless_bf16_oproj_pack_k6144_v1",
+    inputNames: ["weight"], outputNames: ["packed"],
+    source: lagunaLosslessBF16OProjPackSource(k: 6144),
+    ensureRowContiguous: true
+)
+
+private let lagunaLosslessBF16OProjPackK8192Kernel = MLXFast.metalKernel(
+    name: "laguna_lossless_bf16_oproj_pack_k8192_v1",
+    inputNames: ["weight"], outputNames: ["packed"],
+    source: lagunaLosslessBF16OProjPackSource(k: 8192),
+    ensureRowContiguous: true
+)
+
+private func lagunaPackLosslessBF16OProj(_ weight: MLXArray) -> MLXArray {
+    precondition(weight.dtype == .bfloat16)
+    precondition(weight.shape[0] == LagunaConstants.hiddenSize)
+    let rows = weight.dim(0)
+    let k = weight.dim(1)
+    precondition(k == 6144 || k == 8192)
+    let kernel = k == 6144
+        ? lagunaLosslessBF16OProjPackK6144Kernel
+        : lagunaLosslessBF16OProjPackK8192Kernel
+    let blocks = k / 32
+    let storage = kernel(
+        [weight],
+        grid: (rows * blocks, 1, 1),
+        threadGroup: (blocks, 1, 1),
+        outputShapes: [[rows * k + 1]],
+        outputDTypes: [.bfloat16]
+    )[0]
+    return storage[1 ..< (rows * k + 1)].reshaped(rows, k)
+}
+
 /// Group-16 NVFP4 attention tail, widened from layer 32 to layer 24.
 ///
 /// The tail was inherited with a "do not widen" note, but the note predates
@@ -5302,6 +5438,11 @@ final class LagunaRuntimeAttention: Module {
     /// prefill path, and every decode fallback.
     var _nativeAffineOProj: LagunaNativeAffineWeight?
 
+    /// Exact losslessly packed BF16 `wo.weight` side layout for multi-token
+    /// M5 NAX prefill. The authoritative weight and all fallback paths remain
+    /// intact; this view is never built on pre-NAX devices.
+    var _losslessPrefillOProjWeight: MLXArray?
+
     /// Derived native group-32 affine INT8 layout for the attention per-head
     /// gate projection, used only by the serial decode call. Retained
     /// separately only on layers whose QKV bank is NOT group-32 INT8 (the
@@ -5335,6 +5476,22 @@ final class LagunaRuntimeAttention: Module {
         }
         _nativeAffineOProj = preparedWO
         return preparedWO.arrays
+    }
+
+    func prepareLosslessPrefillOProjWeight() -> MLXArray? {
+        guard _losslessPrefillOProjWeight == nil,
+            lagunaUseLosslessBF16OProj(layer: layerIdx),
+            type(of: wo) == Linear.self, wo.bias == nil,
+            wo.weight.dtype == .bfloat16, wo.weight.ndim == 2,
+            wo.weight.dim(0) == LagunaConstants.hiddenSize,
+            wo.weight.dim(1) == nHeads * headDim,
+            wo.weight.dim(1) == 6144 || wo.weight.dim(1) == 8192
+        else {
+            return nil
+        }
+        let packed = lagunaPackLosslessBF16OProj(wo.weight)
+        _losslessPrefillOProjWeight = packed
+        return packed
     }
 
     func prepareNativeAffineQKVWeight() -> [MLXArray] {
@@ -6091,6 +6248,19 @@ final class LagunaRuntimeAttention: Module {
             }
         }
 
+        if L > 1, B == 1,
+            let packedWO = _losslessPrefillOProjWeight,
+            output.dtype == .bfloat16,
+            output.shape == [1, L, nHeads * headDim],
+            packedWO.dtype == .bfloat16,
+            packedWO.shape == [LagunaConstants.hiddenSize, nHeads * headDim]
+        {
+            // `packedWO` is an offset-one contiguous view. The vendored M5
+            // NAX selector recognizes that exact structural marker, rebuilds
+            // every original BF16 word in registers, and returns the ordinary
+            // `[1, L, 2048]` matrix without a padded column or cleanup copy.
+            return matmul(output, packedWO.T)
+        }
         return wo(output)
     }
 
@@ -11143,6 +11313,9 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
             if lagunaUseNativeAffineOProj(layer: layer.selfAttn.layerIdx) {
                 fusedArrays.append(
                     contentsOf: layer.selfAttn.prepareNativeAffineOProjWeight())
+            }
+            if let packed = layer.selfAttn.prepareLosslessPrefillOProjWeight() {
+                fusedArrays.append(packed)
             }
             if lagunaFusedQKVEnabled, let fused = layer.selfAttn.prepareFusedQKVWeight() {
                 fusedArrays.append(fused)
