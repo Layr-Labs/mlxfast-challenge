@@ -1326,13 +1326,25 @@ func lagunaSlidingQKNormRoPE(
 let lagunaFusedSlidingAttentionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_ATTN"] != "0"
 
+/// Default-on exact replacement of the bound attention scale in both fused
+/// attention kernels. Laguna's head dimension is fixed at 128, and
+/// 0x3db504f3 is the exact FP32 bit pattern of 1/sqrt(128).
+let lagunaFusedAttnScaleLiteralEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_FUSED_ATTN_SCALE_LITERAL"] != "0"
+
+private let lagunaFusedAttnScaleSourceLine =
+    lagunaFusedAttnScaleLiteralEnabled
+    ? "float scale = as_type<float>(0x3db504f3u);"
+    : "float scale = scale_arr[0];"
+
 private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
     name: "laguna_sliding_fused_attn_ring_v1",
     inputNames: [
         "raw_queries", "raw_keys", "raw_values",
         "query_weight", "key_weight", "angles",
-        "k_cache", "v_cache", "params", "scale_arr",
-    ],
+        "k_cache", "v_cache", "params",
+    ] + (lagunaFusedAttnScaleLiteralEnabled ? [] : ["scale_arr"]),
     outputNames: ["attended"],
     source: """
         constexpr uint head_dim = 128;
@@ -1354,7 +1366,7 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
         uint sg = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
         uint widx = params[0];
-        float scale = scale_arr[0];
+        \(lagunaFusedAttnScaleSourceLine)
 
         threadgroup bfloat tg_q0[head_dim];
         threadgroup bfloat tg_q1[head_dim];
@@ -1737,8 +1749,8 @@ func lagunaSlidingFusedAttention(
         [
             rawQueries, rawKeys, rawValues,
             queryWeight, keyWeight, angles,
-            cacheKeys, cacheValues, params, scale,
-        ],
+            cacheKeys, cacheValues, params,
+        ] + (lagunaFusedAttnScaleLiteralEnabled ? [] : [scale]),
         grid: ((heads / 2) * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
@@ -1801,8 +1813,8 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
     inputNames: [
         "raw_queries", "raw_keys", "raw_values",
         "query_weight", "key_weight", "angles",
-        "k_cache", "v_cache", "params", "scale_arr",
-    ],
+        "k_cache", "v_cache", "params",
+    ] + (lagunaFusedAttnScaleLiteralEnabled ? [] : ["scale_arr"]),
     outputNames: ["attended"],
     source: """
         constexpr uint head_dim = 128;
@@ -1825,7 +1837,7 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
         uint widx = params[0];
         int N = int(params[1]);
         uint capacity = params[2];
-        float scale = scale_arr[0];
+        \(lagunaFusedAttnScaleSourceLine)
 
         threadgroup bfloat tg_q0[head_dim];
         threadgroup bfloat tg_q1[head_dim];
@@ -2249,8 +2261,8 @@ func lagunaFullFusedAttention(
         [
             rawQueries, rawKeys, rawValues,
             queryWeight, keyWeight, angles,
-            cacheKeys, cacheValues, params, scale,
-        ],
+            cacheKeys, cacheValues, params,
+        ] + (lagunaFusedAttnScaleLiteralEnabled ? [] : [scale]),
         grid: ((heads / 2) * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
