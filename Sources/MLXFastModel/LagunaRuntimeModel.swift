@@ -684,6 +684,35 @@ private let lagunaPrefillAsyncLadderStride: Int = {
     return n
 }()
 
+/// Chunked long-context prefill (stock `LLMModel.prepare` semantics,
+/// Vendor/mlx-swift-lm/Libraries/MLXLLM/LLMModel.swift:21-36). The vendored
+/// reference feeds prompts in 512-token slices, evaluating the cache between
+/// slices; this runtime used to forward the whole prompt in one shot.
+/// Single-shot prefill defeats the sliding-window bound:
+/// `RotatingKVCache.updateConcat` only trims on its SECOND multi-token
+/// update, so one [1, L] forward keeps all L K/V rows on every sliding layer
+/// and forces a materialized LxL bool mask (`RotatingKVCache.makeMask`),
+/// which also disables the steel kernel's causal tile-skip. Beyond ~8k that
+/// turns 30 of 40 layers into dense masked LxL attention and prefill
+/// collapses quadratically (measured 2672 -> 381 tok/s at 8k -> 64k vs the
+/// chunked baseline's 3418 -> 2074). The slice loop below restores the
+/// bounded sliding cache, small per-chunk masks, and the tile-skip.
+/// Invisible to every gate: the ranked window and all public/hidden base
+/// prompts are 512 tokens (one slice either way), and chunked prefill IS
+/// the golden-generating reference behavior at longer prompts.
+/// Default ON; set `DARKBLOOM_PREFILL_CHUNK=0` for single-shot prefill.
+private let lagunaPrefillChunkEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_CHUNK"] != "0"
+
+/// Slice length for chunked prefill; 512 matches the stock
+/// `GenerateParameters.prefillStepSize` default exactly.
+private let lagunaPrefillChunkSize: Int = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_CHUNK_SIZE"],
+        let n = Int(raw), n >= 64
+    else { return 512 }
+    return n
+}()
+
 private let lagunaRoPEAngleAtlasLength = 4096
 
 /// The shared 512-thread RMSNorm prologue emitted by three decode kernels.
@@ -10690,6 +10719,28 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        // Chunked long-context prefill (see `lagunaPrefillChunkEnabled`):
+        // mirror the stock `LLMModel.prepare` slice loop for direct callers
+        // so a [1, L] prompt with L > 512 is fed in bounded slices with the
+        // cache evaluated (and the sliding caches trimmed) between slices.
+        // Single-token decode and ranked-window prefills (L <= 512) never
+        // enter this loop, so the scored path is bit-identical with or
+        // without the flag.
+        if lagunaPrefillChunkEnabled,
+            let cache,
+            inputs.ndim == 2,
+            inputs.dim(0) == 1,
+            inputs.dim(1) > lagunaPrefillChunkSize
+        {
+            var remaining = inputs
+            while remaining.dim(1) > lagunaPrefillChunkSize {
+                _ = callAsFunction(
+                    remaining[0..., ..<lagunaPrefillChunkSize], cache: cache)
+                eval(cache)
+                remaining = remaining[0..., lagunaPrefillChunkSize...]
+            }
+            return callAsFunction(remaining, cache: cache)
+        }
         let fullHidden = model(inputs, cache: cache)
         // Every consumer of multi-token logits reads only the LAST
         // position's row. Slice before the row-independent final RMSNorm and
