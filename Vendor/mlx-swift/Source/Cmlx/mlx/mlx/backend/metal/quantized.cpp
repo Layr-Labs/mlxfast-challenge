@@ -1544,18 +1544,10 @@ int darkbloom_gather_xmajor_ct() {
   return v;
 }
 
-// DARKBLOOM_SWIGLU_REGLOCAL: register-local swiglu epilogue in the
-// expert-aligned gather-QMM (fp_gather_qmm_rhs_expert_nax). With the
-// shipped variant-5 tiling (WN=1: one simdgroup owns the full BN=64 column
-// band of its rows) the fused swiglu epilogue can read gate/up straight
-// from the MMA Dtile fragments instead of round-tripping them through
-// threadgroup memory with two barriers per column tile; the kernel guards
-// itself to that geometry and the values are bit-identical (same bfloat
-// casts of the same Dtile floats, same expression chain, same store
-// addresses). Default ON; "0" restores the stock threadgroup-staged
-// epilogue in the same binary. Parsed once per process; MUST stay in
-// lockstep with the JIT define injected in jit_kernels.cpp
-// (get_qmm_nax_kernel calls this same function).
+// DARKBLOOM_SWIGLU_REGLOCAL: register-local swiglu epilogue (WN=1 only,
+// bit-identical: same bfloat casts/expression order/store addresses).
+// "0" restores stock. MUST stay in lockstep with the jit_kernels.cpp
+// define (get_qmm_nax_kernel calls this same function).
 bool darkbloom_swiglu_reglocal() {
   static const bool v =
       env::get_var("DARKBLOOM_SWIGLU_REGLOCAL", "") != "0";
