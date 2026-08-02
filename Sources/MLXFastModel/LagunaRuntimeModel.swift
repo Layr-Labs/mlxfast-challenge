@@ -134,6 +134,23 @@ let lagunaFusedRoutedSharedDownResidualEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_ROUTED_SHARED_DOWN_RESIDUAL"] != "0"
 
+/// Split the first N sparse-layer routed/shared down projections back into
+/// their exact independent kernels. The shared branch depends only on the
+/// normalized row, while the routed branch waits for router/top-8 and routed
+/// gate/up, so the lower-fusion schedule exposes useful overlap. Zero restores
+/// the accepted all-layer merge; 39 selects every sparse layer.
+private let lagunaSplitRoutedSharedDownLayerCount: Int = {
+    let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_SPLIT_ROUTED_SHARED_DOWN_LAYERS"] ?? "9"
+    return min(max(Int(raw) ?? 9, 0), LagunaConstants.numHiddenLayers - 1)
+}()
+
+@inline(__always)
+private func lagunaUseMergedRoutedSharedDown(layerIdx: Int) -> Bool {
+    lagunaFusedRoutedSharedDownResidualEnabled
+        && (layerIdx == 0 || layerIdx > lagunaSplitRoutedSharedDownLayerCount)
+}
+
 /// Routed-expert counterpart to the shared QMV + SwiGLU fusion. Each decode
 /// request supplies exactly eight current-token expert indices; the kernel
 /// reads those banks directly and emits `[1, 1, 8, 1, 512]`.
@@ -9948,6 +9965,7 @@ private func lagunaFusedSortedRoutedGateUp(
 
 final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     let routedScalingFactor: Float
+    let layerIdx: Int
 
     @ModuleInfo(key: "gate") var gate: LagunaRuntimeMoEGate
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
@@ -10115,8 +10133,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         return [packed]
     }
 
-    init(_ config: LagunaConfig) {
+    init(_ config: LagunaConfig, layerIdx: Int) {
         self.routedScalingFactor = Float(config.moeRoutedScalingFactor)
+        self.layerIdx = layerIdx
         self._gate.wrappedValue = LagunaRuntimeMoEGate(config)
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
@@ -10254,7 +10273,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 activated = lagunaInterleavedSwiGLU(
                     gateUp, split: _fusedRoutedGateUpSplit)
             }
-            if lagunaFusedRoutedSharedDownResidualEnabled,
+            if lagunaUseMergedRoutedSharedDown(layerIdx: layerIdx),
                 let residual,
                 let downWeight = _routedDownWeight,
                 let downScales = _routedDownScales,
@@ -10490,7 +10509,7 @@ final class LagunaRuntimeDecoderLayer: Module {
         self._selfAttn.wrappedValue = LagunaRuntimeAttention(config, layerIdx: layerIdx)
 
         if config.isSparse(layer: layerIdx) {
-            self.mlp = LagunaRuntimeSparseMoEBlock(config)
+            self.mlp = LagunaRuntimeSparseMoEBlock(config, layerIdx: layerIdx)
         } else {
             self.mlp = LagunaRuntimeMLP(
                 dimensions: config.hiddenSize, hiddenDimensions: config.intermediateSize)
