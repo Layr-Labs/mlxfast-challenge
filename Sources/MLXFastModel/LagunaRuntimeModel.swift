@@ -134,6 +134,15 @@ let lagunaFusedRoutedSharedDownResidualEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_ROUTED_SHARED_DOWN_RESIDUAL"] != "0"
 
+/// Exact decode-only co-tiling experiment for the fused sparse down kernel.
+/// Eight 256-thread SIMD groups own eight output rows: each group computes one
+/// routed expert across all rows, then one shared row. This retains the exact
+/// per-row qdot/reduction tree while reusing routed activations across rows and
+/// moving from the 288-thread to the 256-thread residency class.
+let lagunaRoutedSharedDownTile8Enabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTED_SHARED_DOWN_TILE8"] != "0"
+
 /// Routed-expert counterpart to the shared QMV + SwiGLU fusion. Each decode
 /// request supplies exactly eight current-token expert indices; the kernel
 /// reads those banks directly and emits `[1, 1, 8, 1, 512]`.
@@ -7952,6 +7961,127 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+private let lagunaRoutedSharedDownResidualTile8Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_shared_nvfp4_down_residual_bf16_tile8_256_v1",
+    inputNames: [
+        "routed_activated", "routed_down_weight", "routed_down_scales",
+        "indices", "router_weights", "shared_activated",
+        "shared_down_weight", "shared_down_scales", "residual",
+    ],
+    outputNames: ["output"],
+    source: """
+        constexpr uint input_width = 512;
+        constexpr uint output_rows_per_group = 8;
+        constexpr uint routed_experts = 8;
+        constexpr uint shared_slot = 8;
+        constexpr uint values_per_lane = 16;
+        constexpr uint packed_row_bytes = 256;
+        constexpr uint scale_row_bytes = 32;
+        constexpr uint packed_expert_bytes = 2048 * packed_row_bytes;
+        constexpr uint scale_expert_bytes = 2048 * scale_row_bytes;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint routed_slot = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint first_row = tile * output_rows_per_group;
+        uint expert = uint(indices[routed_slot]);
+
+        const device bfloat* routed_input =
+            routed_activated + routed_slot * input_width;
+        const device uint8_t* routed_weight =
+            (const device uint8_t*)routed_down_weight +
+            expert * packed_expert_bytes;
+        const device uint8_t* routed_scales =
+            routed_down_scales + expert * scale_expert_bytes;
+
+        thread float input_values[values_per_lane];
+        const device vec<bfloat, 4>* routed_vectors =
+            (const device vec<bfloat, 4>*)(
+                routed_input + lane * values_per_lane);
+        for (uint i = 0; i < values_per_lane / 4; ++i) {
+            const vec<bfloat, 4> values = routed_vectors[i];
+            input_values[4 * i] = values[0];
+            input_values[4 * i + 1] = values[1];
+            input_values[4 * i + 2] = values[2];
+            input_values[4 * i + 3] = values[3];
+        }
+
+        threadgroup bfloat down_outputs[
+            (routed_experts + 1) * output_rows_per_group
+        ];
+        for (uint row = 0; row < output_rows_per_group; ++row) {
+            uint output_row = first_row + row;
+            const device uint8_t* weight =
+                routed_weight + output_row * packed_row_bytes + lane * 8;
+            const device uint8_t* scale =
+                routed_scales + output_row * scale_row_bytes + lane;
+            float result = laguna_nvfp4_qdot_16(
+                weight,
+                input_values,
+                laguna_nvfp4_scale(scale[0]));
+            result = simd_sum(result);
+            if (lane == 0) {
+                down_outputs[
+                    routed_slot * output_rows_per_group + row
+                ] = bfloat(result\(lagunaNvfp4RowScaleSuffix));
+            }
+        }
+
+        // The eight SIMD groups divide the eight shared rows one-to-one. Each
+        // shared qdot still uses one complete 32-lane SIMD reduction, exactly
+        // matching the promoted per-row arithmetic tree.
+        const device vec<bfloat, 4>* shared_vectors =
+            (const device vec<bfloat, 4>*)(
+                shared_activated + lane * values_per_lane);
+        for (uint i = 0; i < values_per_lane / 4; ++i) {
+            const vec<bfloat, 4> values = shared_vectors[i];
+            input_values[4 * i] = values[0];
+            input_values[4 * i + 1] = values[1];
+            input_values[4 * i + 2] = values[2];
+            input_values[4 * i + 3] = values[3];
+        }
+        uint shared_row = first_row + routed_slot;
+        const device uint8_t* shared_weight =
+            (const device uint8_t*)shared_down_weight +
+            shared_row * packed_row_bytes + lane * 8;
+        const device uint8_t* shared_scale =
+            shared_down_scales + shared_row * scale_row_bytes + lane;
+        float shared_result = laguna_nvfp4_qdot_16(
+            shared_weight,
+            input_values,
+            laguna_nvfp4_scale(shared_scale[0]));
+        shared_result = simd_sum(shared_result);
+        if (lane == 0) {
+            down_outputs[
+                shared_slot * output_rows_per_group + routed_slot
+            ] = bfloat(shared_result\(lagunaNvfp4RowScaleSuffix));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (routed_slot == 0 && lane < output_rows_per_group) {
+            bfloat routed_total = bfloat(0);
+            for (uint slot = 0; slot < routed_experts; ++slot) {
+                bfloat route_weight = bfloat(router_weights[slot]);
+                bfloat product = bfloat(
+                    down_outputs[
+                        slot * output_rows_per_group + lane
+                    ] * route_weight);
+                routed_total = bfloat(product + routed_total);
+            }
+            bfloat routed = bfloat(routed_total * bfloat(2.5f));
+            bfloat shared =
+                down_outputs[
+                    shared_slot * output_rows_per_group + lane
+                ];
+            bfloat r2 = bfloat(routed + shared);
+            output[first_row + lane] =
+                bfloat(residual[first_row + lane] + r2);
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
 func lagunaRoutedSharedDownResidual(
     routedActivated: MLXArray,
     routedDownWeight: MLXArray,
@@ -8007,8 +8137,16 @@ func lagunaRoutedSharedDownResidual(
     precondition(residual.dtype == .bfloat16)
     precondition(residual.shape == [1, 1, LagunaConstants.hiddenSize])
 
-    return lagunaRoutedSharedDownResidualKernel(
-        lagunaSharedFirstDownOrderEnabled
+    let kernel = lagunaRoutedSharedDownTile8Enabled
+        ? lagunaRoutedSharedDownResidualTile8Kernel
+        : lagunaRoutedSharedDownResidualKernel
+    let inputs = lagunaRoutedSharedDownTile8Enabled
+        ? [
+            routedActivated, routedDownWeight, routedDownScales,
+            indices, routerWeights, sharedActivated,
+            sharedDownWeight, sharedDownScales, residual,
+        ]
+        : lagunaSharedFirstDownOrderEnabled
             ? [
                 sharedActivated, sharedDownWeight, sharedDownScales,
                 routedActivated, routedDownWeight, routedDownScales,
@@ -8018,9 +8156,15 @@ func lagunaRoutedSharedDownResidual(
                 routedActivated, routedDownWeight, routedDownScales,
                 indices, routerWeights, sharedActivated,
                 sharedDownWeight, sharedDownScales, residual,
-            ],
-        grid: (LagunaConstants.hiddenSize * 288, 1, 1),
-        threadGroup: (288, 1, 1),
+            ]
+    let threadGroupSize = lagunaRoutedSharedDownTile8Enabled ? 256 : 288
+    let groups = lagunaRoutedSharedDownTile8Enabled
+        ? LagunaConstants.hiddenSize / 8
+        : LagunaConstants.hiddenSize
+    return kernel(
+        inputs,
+        grid: (groups * threadGroupSize, 1, 1),
+        threadGroup: (threadGroupSize, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
         outputDTypes: [.bfloat16]
     )[0]
@@ -10283,7 +10427,10 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 residual.dtype == .bfloat16,
                 residual.shape == [1, 1, LagunaConstants.hiddenSize]
             {
-                lagunaTrace("routed+shared down residual")
+                lagunaTrace(
+                    lagunaRoutedSharedDownTile8Enabled
+                        ? "routed+shared down residual tile8/256"
+                        : "routed+shared down residual")
                 return lagunaRoutedSharedDownResidual(
                     routedActivated: activated,
                     routedDownWeight: downWeight,
