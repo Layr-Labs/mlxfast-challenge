@@ -7841,10 +7841,63 @@ func lagunaRoutedDownReduce(
 let lagunaSharedFirstDownOrderEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_FIRST_DOWN"] == "1"
 
+/// Decode-only exact scheduling lever for the routed/shared down epilogue.
+/// The default moves each routed slot's BF16 router-weight product into the
+/// producer SIMD group before the existing threadgroup barrier.  The ordered
+/// BF16 reduction remains after that barrier, unchanged.  Set to `0` for the
+/// original post-barrier product as a same-binary control.
+let lagunaRoutedDownPreBarrierProductEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_DOWN_PREBARRIER"] != "0"
+
+private let lagunaRoutedDownStoreSource =
+    lagunaRoutedDownPreBarrierProductEnabled
+    ? """
+        if (lane < outputs_per_simd) {
+            uint idx = slot * outputs_per_simd + lane;
+            bfloat down = bfloat(result[lane]\(lagunaNvfp4RowScaleSuffix));
+            if (slot < routed_experts) {
+                bfloat route_weight = bfloat(router_weights[slot]);
+                down_outputs[idx] = bfloat(down * route_weight);
+            } else {
+                down_outputs[idx] = down;
+            }
+        }
+        """
+    : """
+        if (lane == 0) {
+            for (uint row = 0; row < outputs_per_simd; ++row) {
+                down_outputs[slot * outputs_per_simd + row] =
+                    bfloat(result[row]\(lagunaNvfp4RowScaleSuffix));
+            }
+        }
+        """
+
+private let lagunaRoutedDownReduceSource =
+    lagunaRoutedDownPreBarrierProductEnabled
+    ? """
+                bfloat product = down_outputs[
+                    routed_slot * outputs_per_simd + lane
+                ];
+                routed_total = bfloat(product + routed_total);
+        """
+    : """
+                bfloat route_weight =
+                    bfloat(router_weights[routed_slot]);
+                bfloat product = bfloat(
+                    down_outputs[
+                        routed_slot * outputs_per_simd + lane
+                    ] * route_weight);
+                routed_total = bfloat(product + routed_total);
+        """
+
 private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
-    name: lagunaSharedFirstDownOrderEnabled
-        ? "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v4sf"
-        : "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v4",
+    name: lagunaRoutedDownPreBarrierProductEnabled
+        ? (lagunaSharedFirstDownOrderEnabled
+            ? "laguna_routed_shared_nvfp4_down_residual_bf16_pw_v5sf"
+            : "laguna_routed_shared_nvfp4_down_residual_bf16_pw_v5")
+        : (lagunaSharedFirstDownOrderEnabled
+            ? "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v4sf"
+            : "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v4"),
     inputNames: lagunaSharedFirstDownOrderEnabled
         ? [
             "shared_activated", "shared_down_weight", "shared_down_scales",
@@ -7918,12 +7971,7 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
         threadgroup bfloat down_outputs[
             (routed_experts + 1) * outputs_per_simd
         ];
-        if (lane == 0) {
-            for (uint row = 0; row < outputs_per_simd; ++row) {
-                down_outputs[slot * outputs_per_simd + row] =
-                    bfloat(result[row]\(lagunaNvfp4RowScaleSuffix));
-            }
-        }
+        \(lagunaRoutedDownStoreSource)
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (slot == 0 && lane < outputs_per_simd) {
@@ -7931,13 +7979,7 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
             for (uint routed_slot = 0;
                  routed_slot < routed_experts;
                  ++routed_slot) {
-                bfloat route_weight =
-                    bfloat(router_weights[routed_slot]);
-                bfloat product = bfloat(
-                    down_outputs[
-                        routed_slot * outputs_per_simd + lane
-                    ] * route_weight);
-                routed_total = bfloat(product + routed_total);
+                \(lagunaRoutedDownReduceSource)
             }
             bfloat routed = bfloat(
                 routed_total * bfloat(2.5f));
