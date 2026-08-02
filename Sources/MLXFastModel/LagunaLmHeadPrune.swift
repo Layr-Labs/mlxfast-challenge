@@ -127,6 +127,24 @@ let lagunaLmHeadPrunePrefillEnabled =
 private let lagunaLmHeadInlineMaskEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_INLINE_MASK"] != "0"
 
+/// Exact-pass packing: the historical pack8 geometry is available only as an
+/// explicit same-binary control. Unset and every other value use pack32.
+/// Each simdgroup still owns exactly four rows, preserving all row-local GEMV
+/// arithmetic; only the number of independent blocks in one threadgroup moves.
+private let lagunaLmHeadExactUsesPack8 =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_EXACT_PACK"] == "8"
+private let lagunaLmHeadExactSIMDgroupsPerThreadgroup =
+    lagunaLmHeadExactUsesPack8 ? 8 : 32
+private let lagunaLmHeadExactRowsPerThreadgroup =
+    lagunaLmHeadExactSIMDgroupsPerThreadgroup * 4
+private let lagunaLmHeadExactThreadsPerThreadgroup =
+    lagunaLmHeadExactSIMDgroupsPerThreadgroup * 32
+private let lagunaLmHeadExactTotalGrid =
+    lagunaLmHeadPruneVocab / lagunaLmHeadExactRowsPerThreadgroup
+        * lagunaLmHeadExactThreadsPerThreadgroup
+private let lagunaLmHeadExactPackIdentity =
+    lagunaLmHeadExactUsesPack8 ? "pack8" : "pack32"
+
 
 /// v5 coarse copy (exp-hybridcoarse section 7): planar-packed symmetric int5
 /// (nibble plane 1024 B + 1-bit plane 256 B + 64 power-of-two group scale
@@ -1481,23 +1499,24 @@ private let lagunaLmHeadSelectKernel = MLXFast.metalKernel(
 /// GEMV's by construction (R1).
 ///
 /// The skipped work is the byte saving: with |C| in the single-to-low-double
-/// digits, all but a handful of the 3136 threadgroups take the coarse branch
-/// and never touch `lm_head`.
+/// digits, all but a handful of the selected exact-pass threadgroups take the
+/// coarse branch and never touch `lm_head`.
 private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_exact_block_v2",
+    name: "laguna_lmhead_exact_block_\(lagunaLmHeadExactPackIdentity)_v2",
     inputNames: ["coarse_bf", "lm_head", "x", "is_cand"],
     outputNames: ["assembled"],
     source: """
         constexpr uint VOCAB = 100352;
         constexpr uint K = 2048;
+        constexpr uint ROWS_PER_THREADGROUP = \(lagunaLmHeadExactRowsPerThreadgroup);
 
         uint tgid = threadgroup_position_in_grid.x;
         uint sgid = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
 
-        // This simdgroup's fixed four output rows. VOCAB is 3136 * 32, so the
-        // grid tiles it exactly; the bounds test is belt-and-braces.
-        uint base = tgid * 32 + sgid * 4;
+        // This simdgroup's fixed four output rows. The selected row block
+        // tiles VOCAB exactly; the bounds test is belt-and-braces.
+        uint base = tgid * ROWS_PER_THREADGROUP + sgid * 4;
 
         // Simdgroup-uniform: every lane reads the same four mask bytes.
         bool any_candidate = false;
@@ -1575,20 +1594,21 @@ private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
 /// that kernel plus its selector and `coarse_bf` input. The new tip's fused
 /// lower-bound reduction is shared unchanged by both paths.
 private let lagunaLmHeadInlineExactKernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_exact_inline_mask_block_v1",
+    name: "laguna_lmhead_exact_inline_mask_block_\(lagunaLmHeadExactPackIdentity)_v1",
     inputNames: ["coarse", "delta", "thr", "lm_head", "x"],
     outputNames: ["assembled"],
     source: """
         constexpr uint VOCAB = 100352;
         constexpr uint K = 2048;
+        constexpr uint ROWS_PER_THREADGROUP = \(lagunaLmHeadExactRowsPerThreadgroup);
 
         uint tgid = threadgroup_position_in_grid.x;
         uint sgid = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
 
-        // This simdgroup's fixed four output rows. VOCAB is 3136 * 32, so the
-        // grid tiles it exactly; the bounds test is belt-and-braces.
-        uint base = tgid * 32 + sgid * 4;
+        // This simdgroup's fixed four output rows. The selected row block
+        // tiles VOCAB exactly; the bounds test is belt-and-braces.
+        uint base = tgid * ROWS_PER_THREADGROUP + sgid * 4;
 
         // Simdgroup-uniform. This is textually the selector's predicate; the
         // fixed row mapping still gives one owner per output slot.
@@ -1673,20 +1693,21 @@ private let lagunaLmHeadInlineExactKernel = MLXFast.metalKernel(
 /// `coarse` is untouched FP32, so skipped slots keep the exact bits the FP32
 /// arm would store.
 private let lagunaLmHeadInlineExactDeltaBF16Kernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_exact_inline_mask_block_delta_bf16_lane0_mask_v1",
+    name: "laguna_lmhead_exact_inline_mask_block_delta_bf16_lane0_mask_\(lagunaLmHeadExactPackIdentity)_v1",
     inputNames: ["coarse", "delta", "thr", "lm_head", "x"],
     outputNames: ["assembled"],
     source: """
         constexpr uint VOCAB = 100352;
         constexpr uint K = 2048;
+        constexpr uint ROWS_PER_THREADGROUP = \(lagunaLmHeadExactRowsPerThreadgroup);
 
         uint tgid = threadgroup_position_in_grid.x;
         uint sgid = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
 
-        // This simdgroup's fixed four output rows. VOCAB is 3136 * 32, so the
-        // grid tiles it exactly; the bounds test is belt-and-braces.
-        uint base = tgid * 32 + sgid * 4;
+        // This simdgroup's fixed four output rows. The selected row block
+        // tiles VOCAB exactly; the bounds test is belt-and-braces.
+        uint base = tgid * ROWS_PER_THREADGROUP + sgid * 4;
 
         // The predicate is simdgroup-uniform, so lane 0 forms it once and
         // broadcasts the four row decisions. Reusing the mask below removes
@@ -1950,8 +1971,8 @@ final class LagunaLmHeadPruner {
             }
             let assembled5 = lagunaLmHeadInlineExactDeltaBF16Kernel(
                 [coarse5, delta5, thr5, lmHeadWeight, x],
-                grid: (vocab / 32 * 256, 1, 1),
-                threadGroup: (256, 1, 1),
+                grid: (lagunaLmHeadExactTotalGrid, 1, 1),
+                threadGroup: (lagunaLmHeadExactThreadsPerThreadgroup, 1, 1),
                 outputShapes: [[vocab]],
                 outputDTypes: [.bfloat16]
             )[0]
@@ -2048,8 +2069,8 @@ final class LagunaLmHeadPruner {
             outputDTypes: [.float32]
         )[0]
 
-        // One threadgroup per 32 output rows, covering the vocabulary exactly
-        // once (100352 == 3136 * 32). Every slot has exactly one owning lane.
+        // The selected exact-pass geometry covers the vocabulary exactly once.
+        // Every slot has exactly one owning lane.
         let assembled: MLXArray
         if lagunaLmHeadInlineMaskEnabled {
             let exactKernel =
@@ -2058,8 +2079,8 @@ final class LagunaLmHeadPruner {
                 : lagunaLmHeadInlineExactKernel
             assembled = exactKernel(
                 [coarse, delta, thr, lmHeadWeight, x],
-                grid: (vocab / 32 * 256, 1, 1),
-                threadGroup: (256, 1, 1),
+                grid: (lagunaLmHeadExactTotalGrid, 1, 1),
+                threadGroup: (lagunaLmHeadExactThreadsPerThreadgroup, 1, 1),
                 outputShapes: [[vocab]],
                 outputDTypes: [.bfloat16]
             )[0]
@@ -2076,8 +2097,8 @@ final class LagunaLmHeadPruner {
             )[0]
             assembled = lagunaLmHeadExactKernel(
                 [coarseBF, lmHeadWeight, x, isCandidate],
-                grid: (vocab / 32 * 256, 1, 1),
-                threadGroup: (256, 1, 1),
+                grid: (lagunaLmHeadExactTotalGrid, 1, 1),
+                threadGroup: (lagunaLmHeadExactThreadsPerThreadgroup, 1, 1),
                 outputShapes: [[vocab]],
                 outputDTypes: [.bfloat16]
             )[0]
