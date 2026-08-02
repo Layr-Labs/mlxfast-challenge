@@ -4070,6 +4070,7 @@ func lagunaGatedAffineOProjNVFP4Source(
     seedElide: Bool = lagunaNvfp4QmvSeedElisionEnabled,
     preActivatedGate: Bool = false
 ) -> String {
+    let coTiled = lagunaGatedAffineOProjNVFP4C4Enabled
     let scaleFold = lagunaNvfp4ScaleFoldEnabled
     let weightScale = scaleFold ? "" : " * 16384.0f"
     // Sign-carry fold: E4M3 is sign-magnitude, so carrying the sign bit into
@@ -4117,6 +4118,46 @@ func lagunaGatedAffineOProjNVFP4Source(
                     const uint p2 = (ge << 1) & 0x8E008E00u;
                     const uint p3 = go & 0x8E008E00u;
     """
+    let pointerSetup = coTiled
+        ? """
+            const device uint32_t* ws =
+                (const device uint32_t*)weight_codes + out_row *
+                (in_vec_size / 8) + simd_lid * codes_per_thread * 4;
+            const device uint8_t* sc = weight_scales +
+                out_row * in_vec_size_g + simd_lid * 4;
+        """
+        : """
+            const device uint32_t* ws =
+                (const device uint32_t*)weight_codes + out_row *
+                (in_vec_size / 8) + simd_lid * codes_per_thread;
+            const device uint8_t* sc = weight_scales +
+                out_row * in_vec_size_g + simd_lid;
+        """
+    let coTiledLoads = coTiled
+        ? """
+            const device uint4* wb = (const device uint4*)ws;
+            const uint4 b0 = wb[0], b1 = wb[1];
+            const uint2 row_codes[4] = {
+                uint2(b0.x, b0.y), uint2(b0.z, b0.w),
+                uint2(b1.x, b1.y), uint2(b1.z, b1.w)};
+            const uchar4 scale_bits = *((const device uchar4*)sc);
+        """
+        : ""
+    let rowPointer = coTiled ? "" :
+        "const device uint32_t* wl = ws + row * (in_vec_size / 8);"
+    let scaleLoad = coTiled ? "uint8_t sbits = scale_bits[row];" :
+        "uint8_t sbits = sc[row * in_vec_size_g];"
+    let codeLoad = coTiled ? "const uint c = row_codes[row][j];" :
+        "const uint c = wl[j];"
+    let advance = coTiled
+        ? """
+            ws += (block_size / 8) * 4;
+            sc += (block_size / group_size) * 4;
+        """
+        : """
+            ws += block_size / 8;
+            sc += block_size / group_size;
+        """
     let gateSetup = preActivatedGate ? "" : """
     threadgroup float gt[gate_heads];
     if(lid<gate_heads){
@@ -4165,11 +4206,7 @@ func lagunaGatedAffineOProjNVFP4Source(
 
     uint out_row = tile * (num_simdgroups * results_per_simdgroup) +
         simd_gid * results_per_simdgroup;
-    const device uint32_t* ws =
-        (const device uint32_t*)weight_codes +
-        out_row * (in_vec_size / 8) + simd_lid * codes_per_thread;
-    const device uint8_t* sc = weight_scales +
-        out_row * in_vec_size_g + simd_lid;
+    \(pointerSetup)
     const device bfloat* xp = attention_output + simd_lid * values_per_thread;
 
     thread float x_thread[values_per_thread];
@@ -4178,18 +4215,19 @@ func lagunaGatedAffineOProjNVFP4Source(
     uint column = simd_lid * values_per_thread;
     for (uint k = 0; k < in_vec_size; k += block_size) {
         \(loadInput)
+        \(coTiledLoads)
 
         for (uint row = 0; row < results_per_simdgroup; ++row) {
-            const device uint32_t* wl = ws + row * (in_vec_size / 8);
+            \(rowPointer)
             // Defer the exact E4M3 2^22 renormalization to the per-row
             // epilogue. Every partial remains the exact 2^-22 rescaling of
             // the control until the multiply before the existing BF16 round.
-            uint8_t sbits = sc[row * in_vec_size_g];
+            \(scaleLoad)
             \(scaleDecode)
             \(accumDecl)
             #pragma unroll
             for (uint j = 0; j < codes_per_thread; ++j) {
-                const uint c = wl[j];
+                \(codeLoad)
                 \(extract)
                 const float2 v04 = float2(as_type<half2>(p0))\(weightScale);
                 const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
@@ -4205,8 +4243,7 @@ func lagunaGatedAffineOProjNVFP4Source(
             result[row] += scale * accum;
         }
 
-        ws += block_size / 8;
-        sc += block_size / group_size;
+        \(advance)
         xp += block_size;
         column += block_size;
     }
@@ -4220,11 +4257,17 @@ func lagunaGatedAffineOProjNVFP4Source(
     """
 }
 
+/// Decode-only co-tiling of the four NVFP4 output rows already owned by one
+/// SIMD group. The control override changes only the derived load layout.
+let lagunaGatedAffineOProjNVFP4C4Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_OPROJ_NVFP4_C4"] != "0"
+
 private let lagunaGatedAffineOProjNVFP4Kernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_v1"
+            name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_"
+                + (lagunaGatedAffineOProjNVFP4C4Enabled ? "c4" : "r4") + "_v2"
                 + (lagunaNvfp4QmvSignCarryEnabled ? "_sc1" : "")
                 + (lagunaNvfp4QmvSeedElisionEnabled ? "_se1" : ""),
             inputNames: [
@@ -4326,7 +4369,8 @@ private let lagunaActivatedOProjKernels: [Int: MLXFast.MLXFastKernel] = {
     var result: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         result[heads] = MLXFast.metalKernel(
-            name: "laguna_oproj_act_h\(heads)_v1"
+            name: "laguna_oproj_act_h\(heads)_"
+                + (lagunaGatedAffineOProjNVFP4C4Enabled ? "c4" : "r4") + "_v2"
                 + (lagunaNvfp4QmvSignCarryEnabled ? "_sc1" : "")
                 + (lagunaNvfp4QmvSeedElisionEnabled ? "_se1" : ""),
             inputNames: [
@@ -4367,6 +4411,9 @@ func lagunaGatedAffineOProjNVFP4(
     }
 
     lagunaTrace("gated affine oproj nvfp4 qmv h\(heads)")
+    if lagunaGatedAffineOProjNVFP4C4Enabled {
+        lagunaTrace("decode nvfp4 oproj c4")
+    }
     return kernel(
         [attentionOutput, gateLogits, codes, scales],
         grid: ((outVec / 8) * 64, 1, 1),
@@ -5167,6 +5214,25 @@ final class LagunaRuntimeAttention: Module {
         {
             preparedWO.indexedMetadata = lagunaIndexedAffineMetadata(
                 scales: preparedWO.scales, biases: biases)
+        }
+        if lagunaGatedAffineOProjNVFP4C4Enabled,
+            preparedWO.mode == .nvfp4, preparedWO.bits == 4,
+            preparedWO.groupSize == 16
+        {
+            let rows = LagunaConstants.hiddenSize
+            let width = nHeads * headDim
+            let blocks = width / 512
+            preparedWO = LagunaNativeAffineWeight(
+                packedCodes: preparedWO.packedCodes
+                    .reshaped([rows / 4, 4, blocks, 32, 2])
+                    .transposed(0, 2, 3, 1, 4)
+                    .reshaped([rows, width / 8]),
+                scales: preparedWO.scales
+                    .reshaped([rows / 4, 4, blocks, 32])
+                    .transposed(0, 2, 3, 1)
+                    .reshaped([rows, width / 16]),
+                biases: nil, originalShape: preparedWO.originalShape,
+                groupSize: 16, bits: 4, mode: .nvfp4)
         }
         _nativeAffineOProj = preparedWO
         return preparedWO.arrays

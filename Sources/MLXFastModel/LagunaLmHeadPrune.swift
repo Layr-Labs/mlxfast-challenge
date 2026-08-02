@@ -2,101 +2,11 @@ import Foundation
 import MLX
 import MLXFast
 
-// Certified two-pass lm_head elision for the final-token projection (notes/68).
-//
-// Stock lm_head reads the full BF16 [100352, 2048] weight (411 MB) for the
-// final hidden row at the DRAM wall. This module, gated by
-// DARKBLOOM_LM_HEAD_PRUNE (DEFAULT ON; set "0" to disable; unset = shipped
-// path), replaces it for
-// both prefill's already-sliced last hidden row and single-token decode with:
-//
-//   1. COARSE pass (`lagunaLmHeadInlineCoarseKernel`): one fused GEMV over an
-//      init-time MXFP8 copy of lm_head (gs32 e8m0+e4m3, 211.9 MB) built with
-//      the repo's own `quantized(..., mode: .mxfp8)`, producing per-row coarse
-//      logit c_i and a certified bound delta_i. delta_i =
-//      d_i*(1+gamma) + 2*gamma*m_i with
-//      d_i = sum_g sd_g * sum_{j in g} |x_j| * hs8(code_ij)
-//          >= sum_j |x_j| * |w_ij - what_ij|   (half-ulp cells, top cell 186)
-//      and m_i = sum_j |x_j| * |what_ij|, so delta_i covers BOTH the
-//      quantization error and both kernels' float rounding (depth <= 96
-//      roundings/element-path << gamma = 2^-15 relative; notes/68 section 6).
-//      DEFAULT (DARKBLOOM_LMHEAD_RATIO_BOUND, default ON) the kernel emits the
-//      strictly-not-smaller closed form d_i*(1+61*gamma), which is legal
-//      because |decode_e4m3(code)| <= 30*hs8(code) for all 256 codes gives
-//      m_i <= 30*d_i termwise; that drops the m_i accumulator and its
-//      SIMD reduction. Set the variable to "0" for the accepted two-term form.
-//      Ratio certificate, all 256 codes, using this file's own decoders
-//      (mag = b & 127, e = mag >> 3, m = mag & 7):
-//        e == 0 (denormal, mag 0..7): decode = m*2^-9, hs8 = 2^-10,
-//          ratio = 2m <= 14 (attained mag 7).
-//        e >= 1, mag != 126: decode = (8+m)*2^(e-10), hs8 = 2^(e-11),
-//          ratio = 16 + 2m <= 30 (attained m = 7, e.g. mag 15 and mag 127,
-//          the latter decoding to 480 with hs8 = 16).
-//        mag == 126 (saturated top, decode 448, open cell hs8 186):
-//          ratio = 448/186 = 2.409.
-//      So max ratio = 30, exactly attained. The inequality is per element
-//      over the SAME elements with the SAME non-negative group scales sd_g
-//      (e8m0 decodes to a positive power of two for every byte), and |x_j|
-//      >= 0, so it lifts termwise to the row sums: m_i <= 30*d_i, hence
-//      d_i*(1+gamma) + 2*gamma*m_i <= d_i*(1 + gamma + 60*gamma)
-//      = d_i*(1 + 61*gamma). Both scalar constants are exact in FP32
-//      (1+2^-15 and 1+61*2^-15 need 15 mantissa bits) and 2*gamma = 2^-14
-//      is a power of two, so the substitution is exact at the constant
-//      level: (1+gamma) + 30*(2*gamma) == (1+61*gamma) bit-for-bit.
-//      FP32 evaluation note: the one-term form can land at most ~3 ulps
-//      (~1.8e-7 relative) below the two-term form when m_acc sits exactly
-//      at 30*d_acc. That is absorbed many times over by the certificate's
-//      own rounding headroom -- gamma = 2^-15 = 3.05e-5 against the
-//      <= 96*2^-24 = 5.7e-6 of accumulated FP32 rounding it must cover,
-//      a >5x margin -- so the emitted delta still bounds the true error.
-//      DEFAULT (DARKBLOOM_LMHEAD_DELTA_BF16, default ON, nested inside the
-//      ratio bound) delta_i is stored as BF16 rounded toward +infinity
-//      instead of FP32, halving that buffer's write and both of its reads
-//      (401,408 -> 200,704 bytes per token per traversal, ~0.6 MB/token in
-//      all). delta is only ever COMPARED downstream and candidacy is
-//      MONOTONE in it -- a larger delta lowers L = max(coarse - delta) and
-//      hence the threshold, and raises each row's `coarse + delta` -- so
-//      rounding it up only widens the certified bound and only grows the
-//      candidate set. `coarse` stays FP32: it would have to round DOWN for
-//      the L path and UP for the candidate test, which one buffer cannot do.
-//      Set the variable to "0" for the FP32 delta round trip.
-//      BOTH selectors are ARM-ORTHOGONAL: they apply identically on the
-//      DARKBLOOM_LMHEAD_COARSE_V4 int6 arm (the shipped default), where the
-//      flat half-cell makes the ratio 2*|q| instead of a format table. The
-//      int6 codes decode to q = u - 32 and `buildInt6Planes` VERIFIES
-//      max|q| <= 31 on the actual tensor (declining to the MXFP8 copy if it
-//      ever fails), so per element the m term sd*|x_j|*|q_ij| is at most 62x
-//      the d term (0.5*sd)*|x_j| -- same elements, same positive power-of-two
-//      sd_g -- giving m_i <= 62*d_i and the closed form d_i*(1 + 125*gamma).
-//      That substitution is likewise exact in FP32: (1+gamma) + 62*(2*gamma)
-//      == 1 + 125*gamma bit-for-bit. See the int6 ratio-bound kernel below.
-//      The e4m3/e8m0 decoders below are bit-exact replicas of the vendored
-//      fp8.h / fp_quantized.h semantics (no libm: exponent-bit construction).
-//   2. EXACT pass (`lagunaLmHeadInlineExactKernel`): each simdgroup owns a FIXED
-//      block of four output rows and runs a full BF16 GEMV over that block
-//      only when `coarse[r] + delta[r] >= threshold` for one of its rows,
-//      writing `bfloat(coarse[r])` otherwise. The predicate and BF16 cast are
-//      textually the same operations as the retained mask/coarse_bf path, so
-//      NaNs, signed zero, and every stored FP32 coarse bit keep their existing
-//      behavior while the selector dispatch and both temporary buffers vanish.
-//      The per-row arithmetic is a TEXTUAL replica of the stock
-//      `gemv_al_bfloat16` (bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0; see gemv.h
-//      GEMVKernel::run with kAligned=true) -- same lane partition, same
-//      sequential f32 order, same vec4 loads, same simd tree, same BF16 cast
-//      -- and, because the row-to-thread mapping is the stock one rather than
-//      an indirection, each candidate row's output is bit-identical to the
-//      stock full GEMV's (R1). Every vocabulary slot is written by exactly one
-//      lane on exactly one path, so the row is fully covered with no race and
-//      no uninitialized slot. Non-candidate slots keep the BF16 coarse value,
-//      which the certificate shows is strictly below the winner; the harness
-//      argmaxes the returned row (LagunaCorrectness.swift:108), so the emitted
-//      token is the stock token.
-// The threshold beta widens the candidate set slightly vs the raw lower bound
-// L; it is the BF16-cast safety margin from the assembly proof.
-//
-// `DARKBLOOM_LMHEAD_INLINE_MASK=0` restores the new tip's three-output coarse
-// kernels, fused two-pass lower-bound reduction, dense uint8 selector mask,
-// and coarse_bf-fed exact kernel inside the same binary.
+// Certified two-pass final-token lm_head elision. A compact quantized pass
+// computes coarse logits plus conservative error bounds; an exact stock-order
+// BF16 GEMV is run only for argmax-reachable rows. The proof, format tables,
+// rounding analysis, selector map, and experiment history live in the reusable
+// mlxfast-decode-optimizer skill so this editable source stays under budget.
 
 private let lagunaLmHeadPruneVocab = 100_352
 private let lagunaLmHeadPruneHidden = 2048
@@ -810,11 +720,7 @@ private let lagunaLmHeadInlineCoarseKernelV1 = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// One thread per 32-element activation group. Each thread reproduces the
-/// accepted INT6 coarse kernel's local `ag` chain textually and stores its
-/// exact FP32 result. The 256-byte output is consumed by every vocabulary row
-/// instead of recomputing the same 32 absolute values and additions 100,352
-/// times. There is deliberately no SIMD reduction or reassociation here.
+/// One exact activation L1 sum per 32-element group (retained control helper).
 private let lagunaLmHeadAbsGroupSumsKernel = MLXFast.metalKernel(
     name: "laguna_lmhead_abs_group_sums_v1",
     inputNames: ["x"],
@@ -845,51 +751,8 @@ private let lagunaLmHeadAbsGroupSumsKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// Same launch geometry as the v4 int6 kernels (16 rows/threadgroup, one
-/// simdgroup per row, lane = 2 consecutive 32-element groups), same fused
-/// coarse+delta outputs, 1344 B/row vs 1600 (nibble plane 1024 B + 1-bit
-/// plane 256 B + 64 scale bytes; 2048 elements x 5 bits = 1280 B of codes).
-/// All loads stay word-aligned: uint4 per lane-group from the nibble plane
-/// (16 B stride, 1024 B rows), one uint per lane-group from the 1-bit plane
-/// (4 B stride, 256 B rows), ushort4 from x.
-///
-/// This is the v5 twin of `lagunaLmHeadInt6CoarseRatioBoundDeltaBF16Kernel`
-/// -- the ratio bound and the BF16-up delta store are folded in (v5 is only
-/// active when both shipped-default selectors are on; init declines
-/// otherwise), so this arm carries exactly one coarse kernel.
-///
-/// Certificate (mirrors the v4 chain with int5 constants):
-///   * Scale. sd = 2^e per 32-element group with e = floorexp(gmax) - 3,
-///     +1 when mantissa(gmax) >= 1.9375 (bit-exact integer test
-///     mant >= 0x780000), so gmax/sd < 15.5 EXACTLY in both cases
-///     (8m < 15.5 when m < 1.9375; 4m < 8 otherwise). Scale byte stored
-///     with e8m0 semantics, decoded by the existing `laguna_e8m0_decode`.
-///   * Codes. q = round(w/sd): sd is a power of two so w/sd is EXACT in
-///     f32, and rounding an exact quotient < 15.5 gives |q| <= 15 -- no
-///     clamp, and `buildInt5Planes` VERIFIES max|q| <= 15 on the actual
-///     tensor, declining to the v4/MXFP8 copy if that ever fails. So
-///     u = q + 16 is in [1, 31] and |w - sd*q| <= sd/2 EXACTLY (flat
-///     half-cell; 0.5*sd is exact, both factors powers of two). Were u = 0
-///     reachable the ratio below would be 32, not 30 -- the init guard is
-///     load-bearing, exactly as on the v4 arm.
-///   * Ratio bound. The m term contributes sd*|x_j|*|q_ij| and the d term
-///     (0.5*sd)*|x_j| -- same elements, same positive power-of-two group
-///     scale -- so their ratio is exactly 2*|q_ij| <= 30, m_i <= 30*d_i
-///     termwise, and d_i*(1+gamma) + 2*gamma*m_i <= d_i*(1 + 61*gamma).
-///     The scalars agree exactly in FP32: (1+gamma) + 30*(2*gamma) ==
-///     1 + 61*gamma bit-for-bit -- the SAME constant already certified for
-///     the MXFP8 arm at the top of this file.
-///   * Store. The FP32 bound d_acc*(1 + 61*GAMMA) is rounded UP to BF16 by
-///     the same sign-clear mask-and-bump bit surgery as both shipped twins
-///     (d_acc is a sum of non-negative products, so its sign bit is clear);
-///     widening delta only admits candidates (monotone, verbatim v4
-///     argument), and on this arm delta does not even feed the threshold --
-///     only the candidate test (the threshold is the exact-winner kernel's
-///     e_r - |e_r|/64).
-/// Decode exactness: float4(uint4) of values <= 31 and the -16.0f offset are
-/// exact; sd*q multiplies a power of two by a <=4-bit-magnitude integer
-/// float: exact. Accumulation depth is ~45 roundings/element-path, under
-/// the depth <= 96 budget assumed by gamma = 2^-15.
+/// V5 int5 coarse+bound kernel. Its complete control certificate is maintained
+/// in the reusable optimizer skill; the executable source stays compact.
 private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKernel(
     name: "laguna_lmhead_int5_inline_coarse_ratio_bound_delta_bf16_v5",
     inputNames: ["x", "codes_lo", "codes_hi", "scales"],
