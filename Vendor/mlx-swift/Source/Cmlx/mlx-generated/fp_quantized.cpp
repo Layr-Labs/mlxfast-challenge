@@ -434,12 +434,6 @@ inline void dequantize(uint8_t w, U scale, threadgroup U* w_local) {
 
 // Per-group NVFP4 scale with fp4's 2^14 renormalization folded in (Change 1).
 static inline float fp4nv_scale_x16384(uint8_t s) {
-  // E4M3 bytes 0...15 are exactly s * 2^-9; after the 2^14 fold this is
-  // the integer s * 32, so avoid the generic fp8 conversion in the common
-  // positive range.  All exceptional bytes retain the stock expression.
-  if (s < 16u) {
-    return float(uint(s) << 5);
-  }
   return float(*(thread fp8_e4m3*)(&s)) * 16384.0f;
 }
 
