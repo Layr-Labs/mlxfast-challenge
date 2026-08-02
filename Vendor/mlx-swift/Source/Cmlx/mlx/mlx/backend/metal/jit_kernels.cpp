@@ -1407,6 +1407,7 @@ const char* darkbloom_attn_qblock_zigzag_define() {
   return enabled ? "" : "\n#define DARKBLOOM_ATTN_QBLOCK_ZIGZAG 0\n";
 }
 
+
 } // namespace
 
 MTL::ComputePipelineState* get_steel_attention_nax_kernel(
