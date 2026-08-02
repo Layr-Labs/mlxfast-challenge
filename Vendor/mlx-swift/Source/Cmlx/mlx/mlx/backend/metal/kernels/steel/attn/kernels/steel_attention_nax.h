@@ -584,7 +584,13 @@ template <
     Otile.template row_bin_op<MulOp>(factor);
     }
 
-    simdgroup_barrier(mem_flags::mem_none);
+    // The score/softmax section above and the P@V section below are both
+    // simdgroup-local on this path; sg_active is simdgroup-uniform (see
+    // above), so inactive simdgroups have no pending simdgroup-scope work
+    // to order and may skip the barrier entirely.
+    if (sg_active) {
+      simdgroup_barrier(mem_flags::mem_none);
+    }
 
     // Do O = P @ V
     STEEL_PRAGMA_UNROLL
@@ -593,7 +599,12 @@ template <
       for (short id = 0; id < TD; id += 2) {
         if constexpr (BD == 128) {
           if (id == 4) {
-            threadgroup_barrier(mem_flags::mem_none);
+            // Simdgroups own disjoint query rows here, so only this
+            // simdgroup's tensor-op stream needs ordering between the two
+            // head-dimension halves; the threadgroup-wide barrier is
+            // narrower than the dependency requires. Adopted from
+            // a-github-name's 7557466e, credited in the submission note.
+            simdgroup_barrier(mem_flags::mem_none);
           }
         }
 

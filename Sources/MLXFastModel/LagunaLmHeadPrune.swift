@@ -128,6 +128,21 @@ private let lagunaLmHeadInlineMaskEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_INLINE_MASK"] != "0"
 
 
+/// MEASURED DEAD END, int4 (2026-08-02): the same planar arm at four bits
+/// per code (1088 B/row, -19%) measured -1.53% decode on the public
+/// teacher-forced fixture and was rejected on its ranked run. Cause: this
+/// arm's COST is prompt-dependent. Halving the code precision doubles the
+/// bound, and free-run candidate counts over 60 steps went to p50 1646 /
+/// p90 14202 / max 38394 against int5's 5 / 59 / 626 -- each admitted row
+/// costs a 4 KB BF16 exact-GEMV read, so a p90 step pays ~56 MB against
+/// the 26 MB/step the narrower plane saves. int5 is the optimum of the
+/// one-pass family: int6 leaves bytes on the table, int3 admits ~99k of
+/// the 100352 rows and destroys the pruning entirely.
+/// The fix, if this vein is reopened: a two-level pass -- nibble-only
+/// coarse, then a bit-plane refinement over candidates (256 B each instead
+/// of 4 KB) before the exact pass -- which keeps int5's tight candidate set
+/// while reading int4's bytes.
+///
 /// v5 coarse copy (exp-hybridcoarse section 7): planar-packed symmetric int5
 /// (nibble plane 1024 B + 1-bit plane 256 B + 64 power-of-two group scale
 /// bytes = 1344 B/row, -16.0% vs v4's 1600 B/row) plus EXACT-WINNER
