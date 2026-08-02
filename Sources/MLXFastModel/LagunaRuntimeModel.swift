@@ -7213,7 +7213,7 @@ let lagunaRoutedGateUpR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1"] != "0"
 
 private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v1",
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_scalar_bf16_v2",
     inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
     outputNames: ["activated"],
     source: """
@@ -7253,15 +7253,11 @@ private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
         thread float input_values[values_per_lane];
 
         for (uint block = 0; block < input_width; block += block_width) {
-            const device vec<bfloat, 4>* input_vectors =
-                (const device vec<bfloat, 4>*) (
-                    input + block + lane * values_per_lane);
-            for (uint i = 0; i < values_per_lane / 4; ++i) {
-                const vec<bfloat, 4> values = input_vectors[i];
-                input_values[4 * i] = values[0];
-                input_values[4 * i + 1] = values[1];
-                input_values[4 * i + 2] = values[2];
-                input_values[4 * i + 3] = values[3];
+            // Scalar x stripe loads (A/B against the shipped vec<bfloat,4>
+            // form): identical values in the identical order into
+            // input_values[]; the QKV R1 measured scalar faster on M5.
+            for (uint i = 0; i < values_per_lane; ++i) {
+                input_values[i] = float(input[block + lane * values_per_lane + i]);
             }
 
             const device uint8_t* block_scales =
