@@ -4100,6 +4100,12 @@ func lagunaGatedAffineOProj(
 
 // MARK: - Gated NVFP4 output projection for the affine tail layers
 
+/// Extends the exact E4M3 sign-carry identity used by the routed/shared QMV
+/// header to the native NVFP4 attention output projection. The separate flag
+/// keeps the existing QMV carry optimization enabled in the control arm.
+private let lagunaGatedAffineOProjScaleCarryEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_GATED_AFFINE_OPROJ_SCALE_CARRY"] != "0"
+
 /// NVFP4 twin of `lagunaGatedAffineOProjSource` for layers using the native
 /// group-16 NVFP4 output projection. It folds the softplus gate, broadcast
 /// product, and contraction into one dispatch while preserving the BF16 gate
@@ -4177,9 +4183,13 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
             // epilogue. Every partial remains the exact 2^-22 rescaling of
             // the control until the multiply before the existing BF16 round.
             uint8_t sbits = sc[row * in_vec_size_g];
-            ushort sraw = ushort(sbits & 127) << 7;
+            ushort sraw = \(lagunaGatedAffineOProjScaleCarryEnabled
+                ? "ushort((uint(sbits) + (sbits & 128u)) << 7)"
+                : "ushort(sbits & 127) << 7");
             half sconverted = as_type<half>(sraw);
-            float scale = float((sbits & 128) ? -sconverted : sconverted);
+            float scale = \(lagunaGatedAffineOProjScaleCarryEnabled
+                ? "float(sconverted)"
+                : "float((sbits & 128) ? -sconverted : sconverted)");
             float accum = 0.0f;
             #pragma unroll
             for (uint j = 0; j < codes_per_thread; ++j) {
@@ -4222,7 +4232,7 @@ private let lagunaGatedAffineOProjNVFP4Kernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_v1",
+            name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_\(lagunaGatedAffineOProjScaleCarryEnabled ? "carry_v1" : "v1")",
             inputNames: [
                 "attention_output", "gate_logits", "weight_codes",
                 "weight_scales",
