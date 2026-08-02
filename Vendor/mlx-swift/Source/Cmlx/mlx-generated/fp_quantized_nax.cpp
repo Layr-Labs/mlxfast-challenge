@@ -1699,6 +1699,7 @@ template <
   }
 }
 
+template <bool direct_sorted_lhs>
 METAL_FUNC int laguna_sorted_lower_bound(
     const device uint32_t* indices,
     const int count,
@@ -1707,13 +1708,53 @@ METAL_FUNC int laguna_sorted_lower_bound(
   int hi = count;
   while (lo < hi) {
     const int mid = lo + (hi - lo) / 2;
-    if (indices[mid] < value) {
+    const uint32_t key = direct_sorted_lhs
+        ? (indices[mid] & 0xffu)
+        : indices[mid];
+    if (key < value) {
       lo = mid + 1;
     } else {
       hi = mid;
     }
   }
   return lo;
+}
+
+template <typename T, short tile_rows, short tile_cols>
+METAL_FUNC void laguna_load_direct_sorted_lhs(
+    thread NAXTile<T, tile_rows, tile_cols>& tile,
+    const device T* x,
+    const device uint32_t* indices,
+    const int sorted_row_base,
+    const int k_col,
+    const int K,
+    const short valid_rows) {
+  using Frag = typename NAXTile<T, tile_rows, tile_cols>::NAXFrag_t;
+  const short2 sc = Frag::get_coord();
+  STEEL_PRAGMA_UNROLL
+  for (short fr = 0; fr < tile_rows; ++fr) {
+    STEEL_PRAGMA_UNROLL
+    for (short fc = 0; fc < tile_cols; ++fc) {
+      thread auto& frag = tile.frag_at(fr, fc);
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < Frag::kElemRows; ++i) {
+        const short local_row = fr * Frag::kFragRows + sc.y
+            + i * Frag::kElemRowsJump;
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < Frag::kElemCols; ++j) {
+          if (local_row < valid_rows) {
+            const uint32_t source_row =
+                indices[sorted_row_base + local_row] >> 8;
+            const short local_col = fc * Frag::kFragCols + sc.x + j;
+            frag[i * Frag::kElemCols + j] =
+                x[size_t(source_row) * K + k_col + local_col];
+          } else {
+            frag[i * Frag::kElemCols + j] = T(0);
+          }
+        }
+      }
+    }
+  }
 }
 
 // Laguna prefill sorts the M routed rows by expert before this QMM. The stock
@@ -1739,7 +1780,8 @@ template <
     const int fixed_K = 0,
     const int fixed_N = 0,
     typename Wtype = bfloat,
-    int tg_expert_groups = 64>
+    int tg_expert_groups = 64,
+    bool direct_sorted_lhs = false>
 [[kernel]] void fp_gather_qmm_rhs_expert_nax(
     const device T* x,
     const device uint32_t* w,
@@ -1845,8 +1887,10 @@ template <
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0) {
-      bounds[0] = laguna_sorted_lower_bound(indices, M, expert);
-      bounds[1] = laguna_sorted_lower_bound(indices, M, expert + 1);
+      bounds[0] = laguna_sorted_lower_bound<direct_sorted_lhs>(
+          indices, M, expert);
+      bounds[1] = laguna_sorted_lower_bound<direct_sorted_lhs>(
+          indices, M, expert + 1);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1888,8 +1932,9 @@ template <
         Dtile[ct].clear();
       }
 
-      const device T* xn =
-          x + size_t(chunk_start + tm) * kernel_K;
+      const device T* xn = direct_sorted_lhs
+          ? x
+          : x + size_t(chunk_start + tm) * kernel_K;
 
       // Per-k-tile advances of the loader's walk, spelled with the same
       // expressions QuantizedBlockLoader uses (reduction_dim == 1 here):
@@ -1902,7 +1947,11 @@ template <
         if (sg_active) {
           STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            if (sgp_sm == SM) {
+            if constexpr (direct_sorted_lhs) {
+              laguna_load_direct_sorted_lhs(
+                  Atile[kk1 / SK], x, indices, chunk_start + tm,
+                  k * BK + kk1, kernel_K, sgp_sm);
+            } else if (sgp_sm == SM) {
               Atile[kk1 / SK].load(xn + kk1, kernel_K);
             } else {
               Atile[kk1 / SK].load_safe(
@@ -2014,8 +2063,9 @@ template <
       NAXTile<float, TM, TN> Dtile;
       Dtile.clear();
 
-      const device T* xn =
-          x + size_t(chunk_start + tm) * kernel_K;
+      const device T* xn = direct_sorted_lhs
+          ? x
+          : x + size_t(chunk_start + tm) * kernel_K;
 #ifndef DARKBLOOM_STAGE2_GATHER
       thread loader_w_t loader_w(
           wl + size_t(expert) * stride_w,
@@ -2036,7 +2086,11 @@ template <
             NAXTile<T, TM, TK> Atile;
             NAXTile<Wtype, TN, TK> Btile;
 
-            if (sgp_sm == SM) {
+            if constexpr (direct_sorted_lhs) {
+              laguna_load_direct_sorted_lhs(
+                  Atile, x, indices, chunk_start + tm,
+                  k * BK + kk1, kernel_K, sgp_sm);
+            } else if (sgp_sm == SM) {
               Atile.load(xn + kk1, kernel_K);
             } else {
               Atile.load_safe(
@@ -2127,7 +2181,11 @@ template <
             NAXTile<T, TM, TK> Atile;
             NAXTile<Wtype, TN, TK> Btile;
 
-            if (sgp_sm == SM) {
+            if constexpr (direct_sorted_lhs) {
+              laguna_load_direct_sorted_lhs(
+                  Atile, x, indices, chunk_start + tm,
+                  k * BK + kk1, kernel_K, sgp_sm);
+            } else if (sgp_sm == SM) {
               Atile.load(xn + kk1, kernel_K);
             } else {
               Atile.load_safe(

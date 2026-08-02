@@ -234,6 +234,31 @@ let lagunaFusedRoutedGateUpEnabled =
 let lagunaPrefillFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_GATE_UP"] != "0"
 
+/// M5-NAX-only removal of the routed prefill activation-expansion copy.
+/// `gatherSort` normally materializes eight copies of every 2,048-wide token
+/// row before the expert-aligned QMM. The direct path carries the stable sort's
+/// original token row alongside each expert id and lets the same NAX fragment
+/// load those BF16 values directly. Eight sparse layers are the first
+/// acceptance-band-sized rung; zero restores the promoted materialized path.
+private let lagunaPrefillDirectSortedLHSLayers: Int = {
+    let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_DIRECT_SORTED_LHS_LAYERS"] ?? "8"
+    return min(max(Int(raw) ?? 8, 0), LagunaConstants.numHiddenLayers - 1)
+}()
+
+private let lagunaNAXArchitectureAvailable: Bool = {
+    let architecture = GPU.deviceInfo().architecture
+    guard let marker = architecture.range(of: "_g") else { return false }
+    let digits = architecture[marker.upperBound...].prefix { $0.isNumber }
+    guard let generation = Int(String(digits)) else { return false }
+    return generation >= 17
+}()
+
+private func lagunaUsePrefillDirectSortedLHS(layer: Int) -> Bool {
+    lagunaNAXArchitectureAvailable && layer > 0
+        && layer <= lagunaPrefillDirectSortedLHSLayers
+}
+
 /// The expert-aligned gather-QMM consumes a 32-row gate/up-interleaved bank
 /// and writes the packed 512-wide SwiGLU result into the first half of its
 /// oversized MLX output allocation. The same environment switch controls the
@@ -9872,7 +9897,8 @@ private func lagunaFusedSortedRoutedGateUp(
     fusedScales: MLXArray,
     split: Int,
     downProj: SwitchLinear,
-    deferUnsort: Bool
+    deferUnsort: Bool,
+    directSortedLHS: Bool
 ) -> (output: MLXArray, inverseOrder: MLXArray?) {
     // SwitchGLU: `var x = MLX.expandedDimensions(x, axes: [-2, -3])`
     var sortedX = MLX.expandedDimensions(x, axes: [-2, -3])
@@ -9884,9 +9910,15 @@ private func lagunaFusedSortedRoutedGateUp(
     // SwitchGLU: `var idx = indices` / `var inverseOrder = MLXArray()`
     var idx = indices
     var inverseOrder = MLXArray()
+    var packedIndices: MLXArray?
     // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
     //
-    if doSort {
+    if doSort && directSortedLHS {
+        let plan = gatherSortPackedLHS(indices: indices)
+        idx = plan.sortedIndices
+        packedIndices = plan.packedIndices
+        inverseOrder = plan.inverseOrder
+    } else if doSort {
         (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
     }
     // Fused counterpart of SwitchGLU's separate-bank branch:
@@ -9905,12 +9937,14 @@ private func lagunaFusedSortedRoutedGateUp(
         fusedWeight,
         scales: fusedScales,
         biases: nil,
-        rhsIndices: idx,
+        rhsIndices: packedIndices ?? idx,
         transpose: true,
         groupSize: 16,
         bits: 4,
         mode: .nvfp4,
-        sortedIndices: doSort
+        // `false` is the explicit backend marker for the packed direct-LHS
+        // carrier. The ordinary materialized path remains marked sorted.
+        sortedIndices: doSort && !directSortedLHS
     )
     let activated: MLXArray
     if lagunaExpertAlignedGatherEnabled {
@@ -9939,6 +9973,7 @@ private func lagunaFusedSortedRoutedGateUp(
 
 final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     let routedScalingFactor: Float
+    let layerIdx: Int
 
     @ModuleInfo(key: "gate") var gate: LagunaRuntimeMoEGate
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
@@ -10106,8 +10141,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         return [packed]
     }
 
-    init(_ config: LagunaConfig) {
+    init(_ config: LagunaConfig, layerIdx: Int) {
         self.routedScalingFactor = Float(config.moeRoutedScalingFactor)
+        self.layerIdx = layerIdx
         self._gate.wrappedValue = LagunaRuntimeMoEGate(config)
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
@@ -10359,7 +10395,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     deferUnsort:
                         lagunaPrefillSortedMoETailEnabled
                         && lagunaPrefillMoETailEnabled
-                        && residual != nil
+                        && residual != nil,
+                    directSortedLHS: lagunaUsePrefillDirectSortedLHS(layer: layerIdx)
                 )
                 y = routed.output
                 sortedTailInverseOrder = routed.inverseOrder
@@ -10481,7 +10518,7 @@ final class LagunaRuntimeDecoderLayer: Module {
         self._selfAttn.wrappedValue = LagunaRuntimeAttention(config, layerIdx: layerIdx)
 
         if config.isSparse(layer: layerIdx) {
-            self.mlp = LagunaRuntimeSparseMoEBlock(config)
+            self.mlp = LagunaRuntimeSparseMoEBlock(config, layerIdx: layerIdx)
         } else {
             self.mlp = LagunaRuntimeMLP(
                 dimensions: config.hiddenSize, hiddenDimensions: config.intermediateSize)

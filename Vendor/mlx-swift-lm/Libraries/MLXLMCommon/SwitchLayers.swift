@@ -136,6 +136,36 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
     )
 }
 
+/// Build the stable expert-sorted route plan without materializing the
+/// expanded activation rows. The low byte remains the sorted expert id and
+/// the upper bits carry the original token row (`order / routesPerToken`).
+/// A Laguna-specific M5 NAX kernel consumes this lossless integer carrier;
+/// ordinary `gatherSort` callers and every non-NAX fallback remain unchanged.
+public func gatherSortPackedLHS(
+    indices: MLXArray
+) -> (sortedIndices: MLXArray, packedIndices: MLXArray, inverseOrder: MLXArray) {
+    let routesPerToken = indices.dim(-1)
+    let flattened = indices.flattened()
+    let order = argSort(flattened)
+    let inverseOrder: MLXArray
+    if inversePermutationScatterEnabled && order.size > 0 {
+        inverseOrder = inversePermutationScatterKernel(
+            [order],
+            grid: (order.size, 1, 1),
+            threadGroup: (min(order.size, 256), 1, 1),
+            outputShapes: [[order.size]],
+            outputDTypes: [.uint32]
+        )[0]
+    } else {
+        inverseOrder = argSort(order)
+    }
+
+    let sortedIndices = flattened[order]
+    let lhsRows = order.floorDivide(routesPerToken)
+    let packedIndices = sortedIndices + lhsRows * MLXArray(UInt32(256))
+    return (sortedIndices, packedIndices, inverseOrder)
+}
+
 public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) -> MLXArray {
     var x = x[invOrder]
     if let shape {
