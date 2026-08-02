@@ -4100,6 +4100,16 @@ func lagunaGatedAffineOProj(
 
 // MARK: - Gated NVFP4 output projection for the affine tail layers
 
+/// Extends the signed-zero-safe seed elision already used by the promoted
+/// routed/shared NVFP4 QMV helper to the native attention output projection.
+/// The only exceptional intermediate is `-0` instead of `+0`; the existing
+/// `+0`-seeded `result[row] += scale * accum` absorbs that sign before the
+/// SIMD reduction and BF16 store. Every nonzero operation remains unchanged.
+/// The separate flag leaves the promoted helper enabled in the control arm.
+private let lagunaGatedAffineOProjQdotSeedElisionEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GATED_AFFINE_OPROJ_QDOT_SEED_ELIDE"] != "0"
+
 /// NVFP4 twin of `lagunaGatedAffineOProjSource` for layers using the native
 /// group-16 NVFP4 output projection. It folds the softplus gate, broadcast
 /// product, and contraction into one dispatch while preserving the BF16 gate
@@ -4117,6 +4127,34 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
                     const uint p2 = (ge << 1) & 0x8E008E00u;
                     const uint p3 = go & 0x8E008E00u;
     """
+    func qdotWordBody(_ word: Int) -> String {
+        let base = word * 8
+        let seedOperator =
+            (word == 0 && lagunaGatedAffineOProjQdotSeedElisionEnabled)
+            ? "accum =" : "accum +="
+        return """
+                {
+                    const uint c = wl[\(word)];
+                    \(extract)
+                    const float2 v04 = float2(as_type<half2>(p0))\(weightScale);
+                    const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
+                    const float2 v26 = float2(as_type<half2>(p2))\(weightScale);
+                    const float2 v37 = float2(as_type<half2>(p3))\(weightScale);
+                    \(seedOperator)
+                        (x_thread[\(base)] * v04.x +
+                         x_thread[\(base + 1)] * v15.x +
+                         x_thread[\(base + 2)] * v26.x +
+                         x_thread[\(base + 3)] * v37.x);
+                    accum +=
+                        (x_thread[\(base + 4)] * v04.y +
+                         x_thread[\(base + 5)] * v15.y +
+                         x_thread[\(base + 6)] * v26.y +
+                         x_thread[\(base + 7)] * v37.y);
+                }
+            """
+    }
+    let accumDeclaration = lagunaGatedAffineOProjQdotSeedElisionEnabled
+        ? "float accum;" : "float accum = 0.0f;"
     return """
     constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
     constexpr uint out_vec_size = \(LagunaConstants.hiddenSize);
@@ -4180,26 +4218,9 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
             ushort sraw = ushort(sbits & 127) << 7;
             half sconverted = as_type<half>(sraw);
             float scale = float((sbits & 128) ? -sconverted : sconverted);
-            float accum = 0.0f;
-            #pragma unroll
-            for (uint j = 0; j < codes_per_thread; ++j) {
-                const uint c = wl[j];
-                \(extract)
-                const float2 v04 = float2(as_type<half2>(p0))\(weightScale);
-                const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
-                const float2 v26 = float2(as_type<half2>(p2))\(weightScale);
-                const float2 v37 = float2(as_type<half2>(p3))\(weightScale);
-                accum +=
-                    (x_thread[8 * j] * v04.x +
-                     x_thread[8 * j + 1] * v15.x +
-                     x_thread[8 * j + 2] * v26.x +
-                     x_thread[8 * j + 3] * v37.x);
-                accum +=
-                    (x_thread[8 * j + 4] * v04.y +
-                     x_thread[8 * j + 5] * v15.y +
-                     x_thread[8 * j + 6] * v26.y +
-                     x_thread[8 * j + 7] * v37.y);
-            }
+            \(accumDeclaration)
+            \(qdotWordBody(0))
+            \(qdotWordBody(1))
             result[row] += scale * accum;
         }
 
@@ -4222,7 +4243,7 @@ private let lagunaGatedAffineOProjNVFP4Kernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_v1",
+            name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_\(lagunaGatedAffineOProjQdotSeedElisionEnabled ? "seed_v1" : "v1")",
             inputNames: [
                 "attention_output", "gate_logits", "weight_codes",
                 "weight_scales",
