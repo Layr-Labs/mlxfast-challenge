@@ -380,7 +380,7 @@ public final class LagunaRuntimeWeightCache {
                 // MLX_ values win; DARKBLOOM kill switch supports same-binary A/B.
                 let env = ProcessInfo.processInfo.environment
                 if env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" {
-                    setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
+                    setenv("MLX_MAX_MB_PER_BUFFER", "400", 0)
                     setenv("MLX_MAX_OPS_PER_BUFFER", "200", 0)
                 }
                 startupMemoryPolicy = nil
