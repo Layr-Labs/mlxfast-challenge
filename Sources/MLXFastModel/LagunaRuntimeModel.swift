@@ -6438,6 +6438,18 @@ let lagunaSharedSwiGLUQMVHeader: String = {
         scaleCarryActive
         ? "converted"
         : "(bits & 128) ? -converted : converted"
+    // E4M3 bytes 0...15 are a linear positive run.  In the default folded
+    // deferred-scale arm the half bit pattern is already the exact value
+    // needed by the qdot; skip the carry/sign setup for this overwhelmingly
+    // common case.  Keep every ablation's source unchanged.
+    let lowScaleFastPath = lagunaNvfp4ScaleDeferEnabled
+        ? """
+        if (bits < 16u) {
+            ushort fast_raw = ushort(bits) << 7;
+            return float(as_type<half>(fast_raw));
+        }
+        """
+        : ""
     // One packed 32-bit code word: eight NVFP4 values, four `half2` patterns,
     // two four-term FP groups. The first group of the FIRST word seeds the
     // accumulator when the seed elision is enabled; every other group adds.
@@ -6476,6 +6488,7 @@ let lagunaSharedSwiGLUQMVHeader: String = {
         ? "float accum;" : "float accum = 0.0f;"
     return """
     static inline float laguna_nvfp4_scale(uint8_t bits) {
+    \(lowScaleFastPath)
         ushort raw = \(scaleRawExpression);
         half converted = as_type<half>(raw);
     \(scale256)    half signed_value = \(scaleSignExpression);

@@ -290,6 +290,9 @@ inline void dequantize(uint8_t w, U scale, threadgroup U* w_local) {
 
 // Per-group NVFP4 scale with fp4's 2^14 renormalization folded in (Change 1).
 static inline float fp4nv_scale_x16384(uint8_t s) {
+  if (s < 16u) {
+    return float(uint(s) << 5);
+  }
   return float(*(thread fp8_e4m3*)(&s)) * 16384.0f;
 }
 
