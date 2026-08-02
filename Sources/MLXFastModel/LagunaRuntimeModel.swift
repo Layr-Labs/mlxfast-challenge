@@ -756,8 +756,11 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     }
 }()
 
-/// Diagnostic front-edge rung: enqueue layer 0's already-constructed QKV and
-/// gate projections before the rest of that layer's graph is built.
+/// Submits the layer-0 QKV and per-head gate projection pair as soon as both
+/// sibling graph values exist.  The regular decode ladder still owns the
+/// later layer boundaries; this single front-edge cut only overlaps GPU
+/// projection work with construction of the rest of layer 0.  It is guarded
+/// to the serial one-token shape and is a scheduling-only change.
 private let lagunaAttentionProjectionAsyncEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ATTN_PROJECTION_ASYNC"] != "0"
 
