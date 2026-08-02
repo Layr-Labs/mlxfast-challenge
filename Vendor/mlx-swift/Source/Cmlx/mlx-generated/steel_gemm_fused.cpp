@@ -27,6 +27,31 @@ constant bool do_axpby [[function_constant(110)]];
 constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
 constant bool align_K [[function_constant(202)]];
+constant bool dense_prefill_swiglu [[function_constant(203)]];
+
+METAL_FUNC bfloat dense_prefill_swiglu_value(
+    float gate_accum,
+    float up_accum) {
+  bfloat gate = bfloat(gate_accum);
+  bfloat up = bfloat(up_accum);
+  bfloat exp_abs = metal::exp(metal::abs(gate));
+  bfloat denominator = bfloat(1) + exp_abs;
+  bfloat z = bfloat(1) / denominator;
+  bfloat sigmoid = gate < bfloat(0) ? z : bfloat(1) - z;
+  bfloat silu = bfloat(gate * sigmoid);
+  return bfloat(silu * up);
+}
+
+template <typename MMA_t>
+METAL_FUNC void dense_prefill_swiglu_epilogue(
+    thread MMA_t& gate_mma,
+    thread const MMA_t& up_mma) {
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < decltype(gate_mma.Ctile)::kElemsPerTile; ++i) {
+    gate_mma.Ctile.elems()[i] = float(dense_prefill_swiglu_value(
+        gate_mma.Ctile.elems()[i], up_mma.Ctile.elems()[i]));
+  }
+}
 
 // clang-format off
 template <
@@ -142,6 +167,48 @@ template <
 
   // Prepare iterations
   int gemm_k_iterations = params->gemm_k_iterations_aligned;
+
+  if constexpr (metal::is_same_v<T, bfloat>) {
+    if (dense_prefill_swiglu) {
+    const device T* B_up = B + (params->N / 2) * params->ldb;
+    thread loader_b_t loader_b_up(
+        B_up, params->ldb, Bs, simd_group_id, simd_lane_id);
+    thread mma_t mma_up(simd_group_id, simd_lane_id);
+    const short2 tile_dims_A =
+        transpose_a ? short2(tgp_bm, BK) : short2(BK, tgp_bm);
+
+    for (int k = 0; k < gemm_k_iterations; ++k) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (align_M || tgp_bm == BM) {
+        loader_a.load_unsafe();
+      } else {
+        loader_a.load_safe(tile_dims_A);
+      }
+      loader_b.load_unsafe();
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      mma_op.mma(As, Bs);
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      loader_b_up.load_unsafe();
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      mma_up.mma(As, Bs);
+
+      loader_a.next();
+      loader_b.next();
+      loader_b_up.next();
+    }
+
+    threadgroup_barrier(mem_flags::mem_none);
+    dense_prefill_swiglu_epilogue(mma_op, mma_up);
+    if (align_M || tgp_bm == BM) {
+      return mma_op.store_result(D, params->ldd);
+    }
+      return mma_op.store_result_safe(
+          D, params->ldd, short2(BN, tgp_bm));
+    }
+  }
 
   // Do unaligned K iterations first
   if (!align_K) {

@@ -103,6 +103,29 @@ static bool darkbloom_steel_trace() {
   }();
   return v;
 }
+
+static bool darkbloom_dense_prefill_swiglu_enabled() {
+  static const bool enabled =
+      env::get_var("DARKBLOOM_PREFILL_DENSE_GATE_UP_SWIGLU", "1") != "0";
+  return enabled;
+}
+
+template <bool CHECK_AB>
+static bool is_laguna_dense_prefill_swiglu(
+    const array& a,
+    const array& b,
+    const array& out,
+    int M,
+    int N,
+    int K,
+    int batch_size_out,
+    bool transpose_a,
+    bool transpose_b) {
+  return !CHECK_AB && darkbloom_dense_prefill_swiglu_enabled() &&
+      batch_size_out == 1 && M > 1 && N == 16384 && K == 2048 &&
+      !transpose_a && transpose_b && a.dtype() == bfloat16 &&
+      b.dtype() == bfloat16 && out.dtype() == bfloat16;
+}
 } // namespace
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -210,7 +233,7 @@ void steel_matmul_regular_axpby_nax(
     int batch_size_out,
     int lda,
     int ldb,
-    int ldd,
+    int stock_ldd,
     bool transpose_a,
     bool transpose_b,
     std::vector<array>& copies,
@@ -218,7 +241,7 @@ void steel_matmul_regular_axpby_nax(
     Strides batch_strides,
     int64_t A_batch_stride,
     int64_t B_batch_stride,
-    int64_t matrix_stride_out,
+    int64_t stock_matrix_stride_out,
     int64_t C_batch_stride /* = 0*/,
     float alpha /* = 1.0f */,
     float beta /* = 0.0f */) {
@@ -236,6 +259,23 @@ void steel_matmul_regular_axpby_nax(
     bm = 64;
     wm = 2;
   }
+
+  const bool dense_prefill_swiglu = is_laguna_dense_prefill_swiglu<CHECK_AB>(
+      a,
+      b,
+      out,
+      M,
+      N,
+      K,
+      batch_size_out,
+      transpose_a,
+      transpose_b);
+  const int output_width = N / 2;
+  const int dispatch_n = dense_prefill_swiglu ? output_width : N;
+  const int ldd = dense_prefill_swiglu ? output_width : stock_ldd;
+  const int64_t matrix_stride_out = dense_prefill_swiglu
+      ? int64_t(M) * ldd
+      : stock_matrix_stride_out;
 
   // Prepare kernel name
   std::ostringstream kname;
@@ -265,6 +305,7 @@ void steel_matmul_regular_axpby_nax(
       {&align_M, MTL::DataType::DataTypeBool, 200},
       {&align_N, MTL::DataType::DataTypeBool, 201},
       {&align_K, MTL::DataType::DataTypeBool, 202},
+      {&dense_prefill_swiglu, MTL::DataType::DataTypeBool, 203},
   };
 
   // clang-format off
@@ -273,7 +314,8 @@ void steel_matmul_regular_axpby_nax(
         << "_do_axpby_" << (do_axpby ? 't' : 'n')
         << "_align_M_" << (align_M ? 't' : 'n')
         << "_align_N_" << (align_N ? 't' : 'n')
-        << "_align_K_" << (align_K ? 't' : 'n'); // clang-format on
+        << "_align_K_" << (align_K ? 't' : 'n')
+        << "_dense_prefill_swiglu_" << (dense_prefill_swiglu ? 't' : 'n'); // clang-format on
 
   std::string hash_name = kname.str();
 
@@ -296,7 +338,7 @@ void steel_matmul_regular_axpby_nax(
   compute_encoder.set_compute_pipeline_state(kernel);
 
   // Use problem size to determine threadblock swizzle
-  int tn = (N + bn - 1) / bn;
+  int tn = (dispatch_n + bn - 1) / bn;
   int tm = (M + bm - 1) / bm;
 
   // TODO: Explore device-based tuning for swizzle
@@ -382,7 +424,7 @@ void steel_matmul_regular_axpby(
     int batch_size_out,
     int lda,
     int ldb,
-    int ldd,
+    int stock_ldd,
     bool transpose_a,
     bool transpose_b,
     std::vector<array>& copies,
@@ -390,7 +432,7 @@ void steel_matmul_regular_axpby(
     Strides batch_strides,
     int64_t A_batch_stride,
     int64_t B_batch_stride,
-    int64_t matrix_stride_out,
+    int64_t stock_matrix_stride_out,
     int64_t C_batch_stride /* = 0*/,
     float alpha /* = 1.0f */,
     float beta /* = 0.0f */) {
@@ -402,6 +444,23 @@ void steel_matmul_regular_axpby(
 
   char devc = d.get_architecture().back();
   GEMM_TPARAM_MACRO(devc)
+
+  const bool dense_prefill_swiglu = is_laguna_dense_prefill_swiglu<CHECK_AB>(
+      a,
+      b,
+      out,
+      M,
+      N,
+      K,
+      batch_size_out,
+      transpose_a,
+      transpose_b);
+  const int output_width = N / 2;
+  const int dispatch_n = dense_prefill_swiglu ? output_width : N;
+  const int ldd = dense_prefill_swiglu ? output_width : stock_ldd;
+  const int64_t matrix_stride_out = dense_prefill_swiglu
+      ? int64_t(M) * ldd
+      : stock_matrix_stride_out;
 
   // Prepare kernel name
   std::ostringstream kname;
@@ -431,6 +490,7 @@ void steel_matmul_regular_axpby(
       {&align_M, MTL::DataType::DataTypeBool, 200},
       {&align_N, MTL::DataType::DataTypeBool, 201},
       {&align_K, MTL::DataType::DataTypeBool, 202},
+      {&dense_prefill_swiglu, MTL::DataType::DataTypeBool, 203},
   };
 
   // clang-format off
@@ -439,7 +499,8 @@ void steel_matmul_regular_axpby(
         << "_do_axpby_" << (do_axpby ? 't' : 'n')
         << "_align_M_" << (align_M ? 't' : 'n')
         << "_align_N_" << (align_N ? 't' : 'n')
-        << "_align_K_" << (align_K ? 't' : 'n'); // clang-format on
+        << "_align_K_" << (align_K ? 't' : 'n')
+        << "_dense_prefill_swiglu_" << (dense_prefill_swiglu ? 't' : 'n'); // clang-format on
 
   std::string hash_name = kname.str();
 
@@ -462,7 +523,7 @@ void steel_matmul_regular_axpby(
   compute_encoder.set_compute_pipeline_state(kernel);
 
   // Use problem size to determine threadblock swizzle
-  int tn = (N + bn - 1) / bn;
+  int tn = (dispatch_n + bn - 1) / bn;
   int tm = (M + bm - 1) / bm;
 
   // TODO: Explore device-based tuning for swizzle

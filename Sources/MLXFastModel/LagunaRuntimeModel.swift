@@ -539,6 +539,9 @@ let lagunaRoPEAtlasViewsEnabled =
 let lagunaFusedDenseGateUpSwiGLUEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU"] != "0"
 
+let lagunaPrefillDenseGateUpSwiGLUEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_DENSE_GATE_UP_SWIGLU"] != "0"
+
 /// `DARKBLOOM_FUSED_DENSE_DOWN_RESIDUAL` (default on; set "0" to disable):
 /// layer-0-only decode fusion of the dense MLP's down projection with the
 /// decoder layer's `h + r2` residual add (see `lagunaDenseDownResidual`).
@@ -7791,6 +7794,29 @@ func lagunaDenseGateUpSwiGLU(
     )[0]
 }
 
+func lagunaPrefillDenseGateUpSwiGLU(
+    _ input: MLXArray,
+    fusedWeight: MLXArray
+) -> MLXArray {
+    let rows = input.dim(1)
+    precondition(rows > 1)
+    precondition(input.dtype == .bfloat16)
+    precondition(input.shape == [1, rows, LagunaConstants.hiddenSize])
+    precondition(fusedWeight.dtype == .bfloat16)
+    precondition(
+        fusedWeight.shape == [
+            2 * LagunaConstants.denseIntermediateSize, LagunaConstants.hiddenSize,
+        ])
+
+    let gateUp = matmul(input, fusedWeight.T)
+    precondition(
+        gateUp.shape == [
+            1, rows, 2 * LagunaConstants.denseIntermediateSize,
+        ])
+    return gateUp.reshaped([-1])[0 ..< gateUp.size / 2]
+        .reshaped([1, rows, LagunaConstants.denseIntermediateSize])
+}
+
 private let lagunaDenseDownResidualKernel = MLXFast.metalKernel(
     name: "laguna_dense_down_residual_bf16_v1",
     inputNames: ["activated", "down_weight", "residual"],
@@ -7890,7 +7916,8 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
 
     /// Retained fused BF16 `[gate; up]` bank for the dense (non-quantized)
     /// layer-0 MLP, built once after checkpoint load when
-    /// `DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU` is enabled. Mutually exclusive
+    /// `DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU` or its default-off prefill twin
+    /// is enabled. Mutually exclusive
     /// with `_fusedGateUpWeight`/`_fusedGateUpScales` above: those guard on
     /// `QuantizedLinear` (the NVFP4 shared-expert instance of this class),
     /// this one guards on plain `Linear` (the dense layer-0 instance), and
@@ -8129,6 +8156,32 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if lagunaPrefillDenseGateUpSwiGLUEnabled,
+            x.dim(1) > 1,
+            let fusedWeight = _fusedDenseGateUpWeight,
+            x.dtype == .bfloat16,
+            x.dim(0) == 1,
+            x.dim(2) == LagunaConstants.hiddenSize,
+            type(of: gateProj) == Linear.self,
+            type(of: upProj) == Linear.self,
+            type(of: downProj) == Linear.self,
+            gateProj.bias == nil, upProj.bias == nil, downProj.bias == nil,
+            fusedWeight.dtype == .bfloat16,
+            fusedWeight.shape == [
+                2 * LagunaConstants.denseIntermediateSize,
+                LagunaConstants.hiddenSize,
+            ],
+            downProj.weight.dtype == .bfloat16,
+            downProj.weight.shape == [
+                LagunaConstants.hiddenSize,
+                LagunaConstants.denseIntermediateSize,
+            ]
+        {
+            lagunaTrace("dense prefill paired gate/up GEMM + SwiGLU")
+            return downProj(
+                lagunaPrefillDenseGateUpSwiGLU(
+                    x, fusedWeight: fusedWeight))
+        }
         if x.dim(1) == 1,
             let fusedWeight = _fusedGateUpWeight, let fusedScales = _fusedGateUpScales
         {
@@ -10772,7 +10825,8 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                     fusedArrays.append(contentsOf: sparse.prepareFusedRoutedGateUp())
                 }
             } else if let dense = layer.mlp as? LagunaRuntimeMLP {
-                if lagunaFusedDenseGateUpSwiGLUEnabled,
+                if (lagunaFusedDenseGateUpSwiGLUEnabled
+                    || lagunaPrefillDenseGateUpSwiGLUEnabled),
                     let fused = dense.prepareFusedDenseGateUp()
                 {
                     fusedArrays.append(fused)

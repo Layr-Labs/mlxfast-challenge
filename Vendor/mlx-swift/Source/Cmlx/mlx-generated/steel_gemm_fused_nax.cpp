@@ -23,6 +23,31 @@ constant bool do_axpby [[function_constant(110)]];
 constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
 constant bool align_K [[function_constant(202)]];
+constant bool dense_prefill_swiglu [[function_constant(203)]];
+
+METAL_FUNC bfloat dense_prefill_swiglu_value(
+    float gate_accum,
+    float up_accum) {
+  bfloat gate = bfloat(gate_accum);
+  bfloat up = bfloat(up_accum);
+  bfloat exp_abs = metal::exp(metal::abs(gate));
+  bfloat denominator = bfloat(1) + exp_abs;
+  bfloat z = bfloat(1) / denominator;
+  bfloat sigmoid = gate < bfloat(0) ? z : bfloat(1) - z;
+  bfloat silu = bfloat(gate * sigmoid);
+  return bfloat(silu * up);
+}
+
+template <typename Tile_t>
+METAL_FUNC void dense_prefill_swiglu_epilogue(
+    thread Tile_t& gate_tile,
+    thread const Tile_t& up_tile) {
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < Tile_t::kElemsPerTile; ++i) {
+    gate_tile.elems()[i] = float(dense_prefill_swiglu_value(
+        gate_tile.elems()[i], up_tile.elems()[i]));
+  }
+}
 
 // clang-format off
 template <
@@ -193,29 +218,59 @@ template <
   dispatch_bool(align_K, [&](auto kAlignedK) {
     dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
       dispatch_bool(align_N || !is_unaligned_sn, [&](auto kAlignedN) {
-        Dtile = gemm_loop<
-            T,
-            SM,
-            SN,
-            SK,
-            BK,
-            transpose_a,
-            transpose_b,
-            kAlignedM.value,
-            kAlignedN.value,
-            kAlignedK.value,
-            AccumType>(
-            A,
-            B,
-            params->lda,
-            params->ldb,
-            params->K,
-            params->gemm_k_iterations_aligned,
-            sgp_sm,
-            sgp_sn);
-        if (use_out_source) {
-          gemm_epilogue<kAlignedM.value, kAlignedN.value>(
-              Dtile, C, params, addmm_params, sgp_sm, sgp_sn);
+        if (dense_prefill_swiglu) {
+          NAXTile<AccumType, TM, TN> Dtile_up;
+          const device T* B_up =
+              B + (params->N / 2) * params->ldb;
+          gemm_loop_dense_prefill_swiglu<
+              T,
+              SM,
+              SN,
+              SK,
+              BK,
+              transpose_a,
+              transpose_b,
+              kAlignedM.value,
+              kAlignedN.value,
+              kAlignedK.value,
+              AccumType>(
+              Dtile,
+              Dtile_up,
+              A,
+              B,
+              B_up,
+              params->lda,
+              params->ldb,
+              params->K,
+              params->gemm_k_iterations_aligned,
+              sgp_sm,
+              sgp_sn);
+          dense_prefill_swiglu_epilogue(Dtile, Dtile_up);
+        } else {
+          Dtile = gemm_loop<
+              T,
+              SM,
+              SN,
+              SK,
+              BK,
+              transpose_a,
+              transpose_b,
+              kAlignedM.value,
+              kAlignedN.value,
+              kAlignedK.value,
+              AccumType>(
+              A,
+              B,
+              params->lda,
+              params->ldb,
+              params->K,
+              params->gemm_k_iterations_aligned,
+              sgp_sm,
+              sgp_sn);
+          if (use_out_source) {
+            gemm_epilogue<kAlignedM.value, kAlignedN.value>(
+                Dtile, C, params, addmm_params, sgp_sm, sgp_sn);
+          }
         }
         if constexpr (kAlignedM && kAlignedN) {
           Dtile.store(D, int(params->ldd));
