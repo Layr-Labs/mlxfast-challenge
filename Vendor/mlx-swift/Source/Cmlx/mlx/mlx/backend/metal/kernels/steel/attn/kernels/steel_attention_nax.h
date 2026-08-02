@@ -584,7 +584,11 @@ template <
     Otile.template row_bin_op<MulOp>(factor);
     }
 
-    simdgroup_barrier(mem_flags::mem_none);
+    // Both adjacent phases are simdgroup-local. sg_active is uniform within
+    // each simdgroup, so an inactive group has no pending work to order.
+    if (sg_active) {
+      simdgroup_barrier(mem_flags::mem_none);
+    }
 
     // Do O = P @ V
     STEEL_PRAGMA_UNROLL
