@@ -1331,6 +1331,22 @@ bool darkbloom_expert_aligned_gather() {
   return v;
 }
 
+// Expert-aligned NVFP4 staging width controls. Both default on; setting either
+// variable to "0" restores scalar staging for that side in the same binary.
+// The template values are baked into the pipeline name for process-lifetime
+// stability.
+bool darkbloom_expert_stage_widest() {
+  static const bool v =
+      env::get_var("DARKBLOOM_EXPERT_STAGE_WIDEST", "") != "0";
+  return v;
+}
+
+bool darkbloom_expert_stage_wideld() {
+  static const bool v =
+      env::get_var("DARKBLOOM_EXPERT_STAGE_WIDELD", "") != "0";
+  return v;
+}
+
 // DARKBLOOM_EXPERT_GATHER_GROUPS (default 128; "64" restores the promoted
 // four-experts-per-threadgroup schedule and "256" selects one expert per
 // threadgroup, both kept as A/B controls): how many threadgroups the
@@ -1625,6 +1641,10 @@ void gather_qmm_rhs_nax(
   // darkbloom_expert_gather_groups), so each setting compiles exactly one
   // pipeline for the process lifetime.
   const int egroups = darkbloom_expert_gather_groups();
+  const bool expert_widest = expert_aligned && darkbloom_expert_stage_widest();
+  const bool expert_wideld = expert_aligned &&
+      darkbloom_expert_stage_wideld() &&
+      darkbloom_stage_wide_load_ok(w, transpose, bits, N, K, bn);
 
   // DARKBLOOM_STAGE2_GATHER ground truth at the DISPATCH site. The define
   // itself is injected at JIT assembly (jit_kernels.cpp, expert kernels
@@ -1714,7 +1734,11 @@ void gather_qmm_rhs_nax(
       static_expert_shape
           ? ("_k_" + std::to_string(K) + "_n_" + std::to_string(N))
           : "",
-      expert_aligned ? ("_eg_" + std::to_string(egroups)) : "");
+      expert_aligned
+          ? ("_eg_" + std::to_string(egroups) +
+             (expert_widest ? "_ws_1" : "_ws_0") +
+             (expert_wideld ? "_wl_1" : "_wl_0"))
+          : "");
 
   // Skipping dead runs is a pure work elision (see function constant 203 in
   // fp_quantized_nax): it drops only matmuls whose results store_slice never
@@ -1750,8 +1774,9 @@ void gather_qmm_rhs_nax(
       fprintf(
           stderr,
           "mlxfast: stage active: widest=%d wideld=%d(req=%d wide_ok=%d) "
-          "runbar=%d novol=%d expert=%d bm128=%d bm=%d wm=%d wn=%d "
-          "w.offset=%zu transpose=%d bits=%d N=%d K=%d bn=%d\n",
+          "runbar=%d novol=%d expert=%d expert_ws=%d expert_wl=%d bm128=%d "
+          "bm=%d wm=%d wn=%d w.offset=%zu transpose=%d bits=%d N=%d K=%d "
+          "bn=%d\n",
           int(stage_widest),
           int(stage_wideld),
           int(darkbloom_stage_wideld()),
@@ -1759,6 +1784,8 @@ void gather_qmm_rhs_nax(
           int(stage_runbar),
           int(stage_novol),
           int(expert_aligned),
+          int(expert_widest),
+          int(expert_wideld),
           bm128,
           bm,
           wm,
@@ -1828,7 +1855,9 @@ void gather_qmm_rhs_nax(
         static_expert_shape ? K : 0,
         static_expert_shape ? N : 0,
         "bfloat",
-        egroups);
+        egroups,
+        expert_widest,
+        expert_wideld);
     kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
   } else {
     kernel = get_gather_qmm_nax_kernel(
