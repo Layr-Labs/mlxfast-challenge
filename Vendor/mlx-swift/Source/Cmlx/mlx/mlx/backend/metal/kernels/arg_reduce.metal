@@ -70,6 +70,64 @@ IndexValPair<U> simd_shuffle_down(IndexValPair<U> data, uint16_t delta) {
       simd_shuffle_down(data.index, delta), simd_shuffle_down(data.val, delta)};
 }
 
+template <typename T, typename Op, int N_READS>
+METAL_FUNC IndexValPair<T> arg_reduce_generic(
+    const device T* in,
+    int64_t in_idx,
+    int64_t axis_stride,
+    size_t axis_size,
+    uint3 lid,
+    uint3 lsize) {
+  Op op;
+  IndexValPair<T> best{0, Op::init};
+
+  // Loop over the reduction axis in lsize*N_READS buckets.
+  for (uint r = 0; r < ceildiv(axis_size, N_READS * lsize.x); r++) {
+    uint32_t current_index = r * lsize.x * N_READS + lid.x * N_READS;
+    uint32_t offset = current_index;
+    const device T* current_in = in + in_idx + current_index * axis_stride;
+    T vals[N_READS];
+    for (int i = 0; i < N_READS; i++) {
+      vals[i] = (current_index < axis_size) ? *current_in : T(Op::init);
+      current_index++;
+      current_in += axis_stride;
+    }
+    best = op.template reduce_many<N_READS>(best, vals, offset);
+  }
+  return best;
+}
+
+template <typename Op>
+METAL_FUNC IndexValPair<bfloat16_t> argmax_bfloat16_100352(
+    const device bfloat16_t* in,
+    int64_t in_idx,
+    uint32_t lid) {
+  constexpr uint32_t reads = 4;
+  constexpr uint32_t wave_size = 4096;
+  constexpr uint32_t full_waves = 24;
+  Op op;
+  IndexValPair<bfloat16_t> best{0, Op::init};
+
+  // The fixed vocabulary is 24 complete 4,096-element waves followed by one
+  // 2,048-element half wave. Preserve the generic loop's per-lane read order,
+  // but remove its 100,352 dynamic bounds checks.
+  for (uint32_t r = 0; r < full_waves; r++) {
+    uint32_t offset = r * wave_size + lid * reads;
+    const device bfloat16_t* current_in = in + in_idx + offset;
+    bfloat16_t vals[reads] = {
+        current_in[0], current_in[1], current_in[2], current_in[3]};
+    best = op.template reduce_many<reads>(best, vals, offset);
+  }
+  if (lid < 512) {
+    uint32_t offset = 98304 + lid * 4;
+    const device bfloat16_t* current_in = in + in_idx + offset;
+    bfloat16_t vals[reads] = {
+        current_in[0], current_in[1], current_in[2], current_in[3]};
+    best = op.template reduce_many<reads>(best, vals, offset);
+  }
+  return best;
+}
+
 template <typename T, typename Op, int N_READS = 4>
 [[kernel]] void arg_reduce_general(
     const device T* in [[buffer(0)]],
@@ -109,24 +167,22 @@ template <typename T, typename Op, int N_READS = 4>
   auto in_idx = elem_to_loc(row_idx, shape, in_strides, ndim);
   auto out_idx = elem_to_loc(row_idx, shape, out_strides, ndim);
 
-  IndexValPair<T> best{0, Op::init};
+  IndexValPair<T> best;
+  if constexpr (metal::is_same_v<T, bfloat16_t> &&
+                metal::is_same_v<Op, ArgMax<bfloat16_t>>) {
+    if (axis_size == 100352 && axis_stride == 1 && ndim == 0 &&
+        lsize.x == 1024) {
+      best = argmax_bfloat16_100352<Op>(in, in_idx, lid.x);
+    } else {
+      best = arg_reduce_generic<T, Op, N_READS>(
+          in, in_idx, axis_stride, axis_size, lid, lsize);
+    }
+  } else {
+    best = arg_reduce_generic<T, Op, N_READS>(
+        in, in_idx, axis_stride, axis_size, lid, lsize);
+  }
 
   threadgroup IndexValPair<T> local_data[32];
-
-  // Loop over the reduction axis in lsize*N_READS buckets
-  for (uint r = 0; r < ceildiv(axis_size, N_READS * lsize.x); r++) {
-    // Read the current value
-    uint32_t current_index = r * lsize.x * N_READS + lid.x * N_READS;
-    uint32_t offset = current_index;
-    const device T* current_in = in + in_idx + current_index * axis_stride;
-    T vals[N_READS];
-    for (int i = 0; i < N_READS; i++) {
-      vals[i] = (current_index < axis_size) ? *current_in : T(Op::init);
-      current_index++;
-      current_in += axis_stride;
-    }
-    best = op.template reduce_many<N_READS>(best, vals, offset);
-  }
   // At this point we have reduced the axis into thread group best values so we
   // need to reduce across the thread group.
 
