@@ -8971,11 +8971,187 @@ private func lagunaDecodeRouterTop8(
     )
 }
 
+/// `DARKBLOOM_DECODE_ROUTER_TOURNAMENT` (default ON; set to `0` to ablate):
+/// decode-only replacement for `lagunaDecodeRouterTop8`, using a proven two-stage
+/// local-then-cross reduction: 8 local top-k merges plus one 64-wide merge,
+/// instead of the full 256-wide top-k network.
+private func lagunaDecodeRouterTournamentKernelSource(normalizing: Bool) -> String {
+    let epilogue =
+        normalizing
+        ? """
+        float total = 0.0f;
+        for (uint i = 0; i < 8; ++i) {
+            total = simd_shuffle(my_score2, ushort(i)) + total;
+        }
+        if (lane < 8) {
+            router_indices[lane] = my_index2;
+            router_scores[lane] = my_score2 / total;
+        }
+        """
+        : """
+        if (lane < 8) {
+            router_indices[lane] = my_index2;
+            router_scores[lane] = my_score2;
+        }
+        """
+    return """
+        uint lane = thread_position_in_threadgroup.x;
+
+        threadgroup float xchg_keys[256];
+        threadgroup uint xchg_indices[256];
+        threadgroup float xchg_scores[256];
+        threadgroup float candidate_keys[64];
+        threadgroup uint candidate_indices[64];
+        threadgroup float candidate_scores[64];
+
+        float x = float(logits[lane]);
+        float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+        float my_score = x < 0.0f ? y : 1.0f - y;
+        float my_key = -(my_score + float(correction_bias[lane]));
+        uint my_index = lane;
+
+        // Phase 1: eight independent 32-lane bitonic sorts, one per simdgroup.
+        for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
+            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+                float other_key = simd_shuffle_xor(my_key, ushort(stride));
+                uint other_index = simd_shuffle_xor(my_index, ushort(stride));
+                float other_score = simd_shuffle_xor(my_score, ushort(stride));
+
+                bool is_lower = (lane & stride) == 0;
+                float a_key = is_lower ? my_key : other_key;
+                uint a_index = is_lower ? my_index : other_index;
+                float a_score = is_lower ? my_score : other_score;
+                float b_key = is_lower ? other_key : my_key;
+                uint b_index = is_lower ? other_index : my_index;
+                float b_score = is_lower ? other_score : my_score;
+
+                bool lower_wants_better = (lane & sequence) == 0;
+                bool b_before_a = laguna_router_key_before(
+                    b_key, b_index, a_key, a_index);
+                bool a_before_b = laguna_router_key_before(
+                    a_key, a_index, b_key, b_index);
+                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                if (swap) {
+                    my_key = is_lower ? b_key : a_key;
+                    my_index = is_lower ? b_index : a_index;
+                    my_score = is_lower ? b_score : a_score;
+                }
+            }
+        }
+
+        // Extract each block's local top-8, correcting for block direction.
+        uint block = lane >> 5;
+        uint within_block = lane & 31;
+        bool block_ascending = (block & 1) == 0;
+        uint rank_in_block = block_ascending ? within_block : (31 - within_block);
+        bool is_local_top8 = block_ascending ? (within_block < 8) : (within_block >= 24);
+        if (is_local_top8) {
+            candidate_keys[block * 8 + rank_in_block] = my_key;
+            candidate_indices[block * 8 + rank_in_block] = my_index;
+            candidate_scores[block * 8 + rank_in_block] = my_score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Phase 2: bitonic-sort the 64-candidate union.
+        float my_key2 = candidate_keys[lane & 63];
+        uint my_index2 = candidate_indices[lane & 63];
+        float my_score2 = candidate_scores[lane & 63];
+        for (uint sequence = 2; sequence <= 64; sequence <<= 1) {
+            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+                float other_key;
+                uint other_index;
+                float other_score;
+                if (stride < 32) {
+                    other_key = simd_shuffle_xor(my_key2, ushort(stride));
+                    other_index = simd_shuffle_xor(my_index2, ushort(stride));
+                    other_score = simd_shuffle_xor(my_score2, ushort(stride));
+                } else {
+                    xchg_keys[lane] = my_key2;
+                    xchg_indices[lane] = my_index2;
+                    xchg_scores[lane] = my_score2;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    uint partner = lane ^ stride;
+                    other_key = xchg_keys[partner];
+                    other_index = xchg_indices[partner];
+                    other_score = xchg_scores[partner];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+
+                bool is_lower = (lane & stride) == 0;
+                float a_key = is_lower ? my_key2 : other_key;
+                uint a_index = is_lower ? my_index2 : other_index;
+                float a_score = is_lower ? my_score2 : other_score;
+                float b_key = is_lower ? other_key : my_key2;
+                uint b_index = is_lower ? other_index : my_index2;
+                float b_score = is_lower ? other_score : my_score2;
+
+                bool lower_wants_better = (lane & sequence) == 0;
+                bool b_before_a = laguna_router_key_before(
+                    b_key, b_index, a_key, a_index);
+                bool a_before_b = laguna_router_key_before(
+                    a_key, a_index, b_key, b_index);
+                bool swap = lower_wants_better ? b_before_a : a_before_b;
+                if (swap) {
+                    my_key2 = is_lower ? b_key : a_key;
+                    my_index2 = is_lower ? b_index : a_index;
+                    my_score2 = is_lower ? b_score : a_score;
+                }
+            }
+        }
+
+        \(epilogue)
+        """
+}
+
+private let lagunaDecodeRouterTournamentKernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_tournament_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterTournamentKernelSource(normalizing: false),
+    header: lagunaDecodeRouterTop8Header,
+    ensureRowContiguous: true
+)
+
+private let lagunaDecodeRouterTournamentNormalizingKernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_tournament_norm_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterTournamentKernelSource(normalizing: true),
+    header: lagunaDecodeRouterTop8Header,
+    ensureRowContiguous: true
+)
+
+private func lagunaDecodeRouterTournament(
+    logits: MLXArray, correctionBias: MLXArray, normalizing: Bool = false
+) -> (MLXArray, MLXArray) {
+    precondition(logits.dtype == .bfloat16 || logits.dtype == .float32)
+    precondition(correctionBias.dtype == .float32)
+    precondition(logits.size == 256)
+    precondition(correctionBias.size == 256)
+
+    let kernel =
+        normalizing
+        ? lagunaDecodeRouterTournamentNormalizingKernel
+        : lagunaDecodeRouterTournamentKernel
+    let outputs = kernel(
+        [logits, correctionBias],
+        grid: (256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1, 1, 8], [1, 1, 8]],
+        outputDTypes: [.uint32, .float32]
+    )
+    return (outputs[0], outputs[1])
+}
+
 /// Default-on after same-binary bitwise checks over smooth, tied, and extreme
 /// rows plus a 39-stage compiled latency probe. Set
 /// `DARKBLOOM_FUSED_ROUTER=0` for a stock-path ablation.
 private let lagunaDecodeRouterTop8Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTER"] != "0"
+
+/// Decode-only top-8 tournament switch.
+private let lagunaDecodeRouterTournamentEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ROUTER_TOURNAMENT"] != "0"
 
 /// Decode-only cast sinking for the fused router. The BF16 router GEMV result
 /// is consumed directly and converted to FP32 by the top-8 kernel's first
@@ -9635,15 +9811,28 @@ final class LagunaRuntimeMoEGate: Module {
             // Cast-sink path: consumes the BF16 router GEMV directly. The
             // norm sink is a separate flag, so name it separately.
             let sinkNormalization = normTopkProb && lagunaDecodeRouterNormSinkEnabled
-            lagunaTrace(
-                sinkNormalization
-                    ? "decode router top8 (cast sink + norm sink)"
-                    : "decode router top8 (cast sink)")
-            (inds, weights) = lagunaDecodeRouterTop8(
-                logits: projectedLogits,
-                correctionBias: eScoreCorrectionBias.asType(.float32),
-                normalizing: sinkNormalization
-            )
+            let useTournament = lagunaDecodeRouterTournamentEnabled
+            if useTournament {
+                lagunaTrace(
+                    sinkNormalization
+                        ? "decode router top8 tournament (cast sink + norm sink)"
+                        : "decode router top8 tournament (cast sink)")
+                (inds, weights) = lagunaDecodeRouterTournament(
+                    logits: projectedLogits,
+                    correctionBias: eScoreCorrectionBias.asType(.float32),
+                    normalizing: sinkNormalization
+                )
+            } else {
+                lagunaTrace(
+                    sinkNormalization
+                        ? "decode router top8 (cast sink + norm sink)"
+                        : "decode router top8 (cast sink)")
+                (inds, weights) = lagunaDecodeRouterTop8(
+                    logits: projectedLogits,
+                    correctionBias: eScoreCorrectionBias.asType(.float32),
+                    normalizing: sinkNormalization
+                )
+            }
             if sinkNormalization {
                 return (inds, weights)
             }
@@ -9657,11 +9846,19 @@ final class LagunaRuntimeMoEGate: Module {
                 eScoreCorrectionBias.size == 256
             {
                 // Stock-cast path: FP32 logits, no cast sink.
-                lagunaTrace("decode router top8 (fp32 logits)")
-                (inds, weights) = lagunaDecodeRouterTop8(
-                    logits: logits,
-                    correctionBias: eScoreCorrectionBias.asType(.float32)
-                )
+                if lagunaDecodeRouterTournamentEnabled {
+                    lagunaTrace("decode router top8 tournament (fp32 logits)")
+                    (inds, weights) = lagunaDecodeRouterTournament(
+                        logits: logits,
+                        correctionBias: eScoreCorrectionBias.asType(.float32)
+                    )
+                } else {
+                    lagunaTrace("decode router top8 (fp32 logits)")
+                    (inds, weights) = lagunaDecodeRouterTop8(
+                        logits: logits,
+                        correctionBias: eScoreCorrectionBias.asType(.float32)
+                    )
+                }
             } else {
                 let scores = sigmoid(logits)
                 let scoresForChoice =
