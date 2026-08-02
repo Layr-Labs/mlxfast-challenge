@@ -1598,10 +1598,26 @@ void gather_qmm_rhs_nax(
     default: break;                          // upstream: bm=64, wm=2, wn=2
   }
 
+  // Packed expert-chain view authored by LagunaRuntimeModel. The ordinary
+  // logical [N=2048, K=2048] quantized shape carries the interleaved gate/up
+  // bank followed by the flattened down bank (plus an ignored duplicate that
+  // fills the rectangular view). Its natural output width is the final hidden
+  // size, so the public GatherQMM API and output allocation stay unchanged.
+  const bool expert_chain_shape =
+      mode == "nvfp4" && K == 2048 && N == 2048;
+  if (expert_chain_shape) {
+    // Match the promoted BM64/SM16 expert geometry. The chain keeps its
+    // 64x512 rounded BF16 activation in per-simdgroup fragments, so only the
+    // ordinary 9-KiB dequant staging tile occupies threadgroup memory.
+    bm = 64;
+    wm = 4;
+    wn = 1;
+  }
+
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
-  const bool laguna_moe_shape =
+  const bool laguna_moe_shape = expert_chain_shape ||
       (K == 2048 && N == 1024) || (K == 512 && N == 2048);
   // wn == 1 admitted 2026-07-31 (GatherX): DARKBLOOM_STAGE_BM128=5's
   // BM64/WM4/WN1 tiling (128 thr/TG, SN=64/TN=4) previously fell off the
@@ -1613,7 +1629,10 @@ void gather_qmm_rhs_nax(
   const bool expert_aligned =
       darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
       group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
-      align_N && align_K && bm == 64 && wm == 4 && (wn == 2 || wn == 1);
+      align_N && align_K &&
+      (expert_chain_shape
+           ? (bm == 64 && wm == 4 && wn == 1)
+           : (bm == 64 && wm == 4 && (wn == 2 || wn == 1)));
   std::string type_string = get_type_string(x.dtype());
   static const bool static_laguna_shapes =
       env::get_var("DARKBLOOM_STATIC_NVFP4_SHAPES", "") != "0";
@@ -1690,12 +1709,14 @@ void gather_qmm_rhs_nax(
   concatenate(
       kname,
       mode +
-          (static_expert_shape
+          (expert_chain_shape && expert_aligned
+               ? "_gather_qmm_rhs_expert_chain_static_nax_nt_"
+               : (static_expert_shape
                ? "_gather_qmm_rhs_expert_static_nax_nt_"
                : (expert_aligned
                       ? "_gather_qmm_rhs_expert_nax_nt_"
                : (transpose ? "_gather_qmm_rhs_nax_nt_"
-                            : "_gather_qmm_rhs_nax_nn_"))),
+                            : "_gather_qmm_rhs_nax_nn_")))),
       type_string,
       "_gs_",
       group_size,
@@ -1815,7 +1836,9 @@ void gather_qmm_rhs_nax(
   if (expert_aligned) {
     auto template_def = get_template_definition(
         kname,
-        "fp_gather_qmm_rhs_expert_nax",
+        expert_chain_shape
+            ? "fp_gather_qmm_rhs_expert_chain_nax"
+            : "fp_gather_qmm_rhs_expert_nax",
         get_type_string(x.dtype()),
         group_size,
         bits,
@@ -1854,9 +1877,15 @@ void gather_qmm_rhs_nax(
   // xmajor_ct adjacent column tiles per threadgroup, so grid.x shrinks by
   // the same factor. N is certified 1024 or 2048 on the expert path (bn=64),
   // so the division is always exact.
-  const int xmajor_ct = expert_aligned ? darkbloom_gather_xmajor_ct() : 0;
+  const int xmajor_ct =
+      (expert_aligned && !expert_chain_shape)
+      ? darkbloom_gather_xmajor_ct()
+      : 0;
   MTL::Size grid_dims(
-      xmajor_ct > 1 ? (N / bn) / xmajor_ct : ((N + bn - 1) / bn),
+      expert_chain_shape
+          ? 1
+          : (xmajor_ct > 1 ? (N / bn) / xmajor_ct
+                           : ((N + bn - 1) / bn)),
       expert_aligned ? egroups : (M + bm - 1) / bm,
       1);
 

@@ -243,6 +243,34 @@ let lagunaExpertAlignedGatherEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_EXPERT_ALIGNED_GATHER"] != "0"
 
+/// Mirrors MLX's NAX generation guard for the M5-only expert chain.
+private let lagunaNAXGenerationAvailable: Bool = {
+    guard #available(macOS 26.2, *) else { return false }
+    let architecture = GPU.deviceInfo().architecture.lowercased()
+    let suffix = Array(architecture.suffix(3))
+    guard suffix.count == 3,
+        let generation = Int(String(suffix[0...1]))
+    else {
+        return false
+    }
+    let family = suffix[2]
+    return generation >= (family == "p" ? 18 : 17)
+}()
+
+/// M5-only gate/up -> BF16 SwiGLU -> down expert-chain fusion.
+let lagunaPrefillExpertChainEnabled =
+    lagunaNAXGenerationAvailable
+    && ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_EXPERT_CHAIN"] != "0"
+
+/// Full sparse-layer rollout; the removed 512-wide BF16 intermediate is under
+/// two percent of expert bytes, so the mechanism is safely inside the band.
+let lagunaPrefillExpertChainLayerCount: Int = {
+    let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_EXPERT_CHAIN_LAYERS"]
+    return max(0, min(39, raw.flatMap(Int.init) ?? 39))
+}()
+
 /// Decode post-attention residual + RMSNorm fusion. The kernel emits
 /// both the rounded BF16 residual (needed by the following skip connection)
 /// and the normalized row (consumed immediately by the MLP), eliminating a
@@ -9946,7 +9974,44 @@ private func lagunaFusedSortedRoutedGateUp(
     return (MLX.squeezed(result, axis: -2), nil)
 }
 
+/// Sorted prefill wrapper for the NAX packed expert-chain gather-QMM.
+private func lagunaFusedSortedRoutedChain(
+    _ x: MLXArray,
+    indices: MLXArray,
+    chainWeight: MLXArray,
+    chainScales: MLXArray,
+    deferUnsort: Bool
+) -> (output: MLXArray, inverseOrder: MLXArray?) {
+    var sortedX = MLX.expandedDimensions(x, axes: [-2, -3])
+    let doSort = indices.size >= 64
+    var idx = indices
+    var inverseOrder = MLXArray()
+    if doSort {
+        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+    }
+    var result = MLX.gatherQuantizedMM(
+        sortedX,
+        chainWeight,
+        scales: chainScales,
+        biases: nil,
+        rhsIndices: idx,
+        transpose: true,
+        groupSize: 16,
+        bits: 4,
+        mode: .nvfp4,
+        sortedIndices: doSort
+    )
+    if doSort && deferUnsort {
+        return (result, inverseOrder)
+    }
+    if doSort {
+        result = scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape)
+    }
+    return (MLX.squeezed(result, axis: -2), nil)
+}
+
 final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
+    let layerIdx: Int
     let routedScalingFactor: Float
 
     @ModuleInfo(key: "gate") var gate: LagunaRuntimeMoEGate
@@ -9964,6 +10029,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     var _fusedRoutedGateUpWeight: MLXArray?
     var _fusedRoutedGateUpScales: MLXArray?
     var _fusedRoutedGateUpSplit: Int = 0
+    /// NAX chain view: [interleaved gate/up, down, ignored down duplicate].
+    var _fusedRoutedChainWeight: MLXArray?
+    var _fusedRoutedChainScales: MLXArray?
     var _routedDownProj: SwitchLinear?
     var _routedDownWeight: MLXArray?
     var _routedDownScales: MLXArray?
@@ -10057,6 +10125,37 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         _routedDownWeight = downWeight
         _routedDownScales = downScales
         var prepared = [fusedWeight, fusedScales]
+        if lagunaPrefillExpertChainEnabled,
+            layerIdx > 0,
+            layerIdx <= lagunaPrefillExpertChainLayerCount
+        {
+            let fusedWeightFlat = fusedWeight.reshaped([experts, -1])
+            let fusedScalesFlat = fusedScales.reshaped([experts, -1])
+            let downWeightFlat = downWeight.reshaped([experts, -1])
+            let downScalesFlat = downScales.reshaped([experts, -1])
+            // [gateUp, down, down] fills [expert, hidden, hidden]; the final
+            // duplicate is never read by the chain kernel.
+            if fusedWeightFlat.dim(1) == 2 * downWeightFlat.dim(1),
+                fusedScalesFlat.dim(1) == 2 * downScalesFlat.dim(1)
+            {
+                let chainWeight = concatenated(
+                    [fusedWeightFlat, downWeightFlat, downWeightFlat], axis: 1
+                ).reshaped([
+                    experts, LagunaConstants.hiddenSize,
+                    LagunaConstants.hiddenSize / 8,
+                ])
+                let chainScales = concatenated(
+                    [fusedScalesFlat, downScalesFlat, downScalesFlat], axis: 1
+                ).reshaped([
+                    experts, LagunaConstants.hiddenSize,
+                    LagunaConstants.hiddenSize / 16,
+                ])
+                _fusedRoutedChainWeight = chainWeight
+                _fusedRoutedChainScales = chainScales
+                prepared.append(chainWeight)
+                prepared.append(chainScales)
+            }
+        }
         prepared.append(
             contentsOf: preparePackedRoutedGateUpBank(
                 fusedScales: fusedScales,
@@ -10115,7 +10214,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         return [packed]
     }
 
-    init(_ config: LagunaConfig) {
+    init(_ config: LagunaConfig, layerIdx: Int) {
+        self.layerIdx = layerIdx
         self.routedScalingFactor = Float(config.moeRoutedScalingFactor)
         self._gate.wrappedValue = LagunaRuntimeMoEGate(config)
         self._switchMLP.wrappedValue = SwitchGLU(
@@ -10347,7 +10447,38 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
             // produced, so every consumer below (including the
             // `lagunaPrefillMoETailEnabled` tail fusion) is unaffected by
             // which branch ran.
-            if lagunaPrefillFusedRoutedGateUpEnabled,
+            if lagunaPrefillExpertChainEnabled,
+                let chainWeight = _fusedRoutedChainWeight,
+                let chainScales = _fusedRoutedChainScales,
+                x.dim(1) > 1,
+                inds.size >= 64,
+                chainWeight.dtype == .uint32,
+                chainScales.dtype == .uint8,
+                chainWeight.shape == [
+                    LagunaConstants.numExperts,
+                    LagunaConstants.hiddenSize,
+                    LagunaConstants.hiddenSize / 8,
+                ],
+                chainScales.shape == [
+                    LagunaConstants.numExperts,
+                    LagunaConstants.hiddenSize,
+                    LagunaConstants.hiddenSize / 16,
+                ]
+            {
+                lagunaTrace("prefill fused routed expert chain")
+                let routed = lagunaFusedSortedRoutedChain(
+                    x,
+                    indices: inds,
+                    chainWeight: chainWeight,
+                    chainScales: chainScales,
+                    deferUnsort:
+                        lagunaPrefillSortedMoETailEnabled
+                        && lagunaPrefillMoETailEnabled
+                        && residual != nil
+                )
+                y = routed.output
+                sortedTailInverseOrder = routed.inverseOrder
+            } else if lagunaPrefillFusedRoutedGateUpEnabled,
                 let fusedWeight = _fusedRoutedGateUpWeight,
                 let fusedScales = _fusedRoutedGateUpScales,
                 let downProj = _routedDownProj,
@@ -10490,7 +10621,7 @@ final class LagunaRuntimeDecoderLayer: Module {
         self._selfAttn.wrappedValue = LagunaRuntimeAttention(config, layerIdx: layerIdx)
 
         if config.isSparse(layer: layerIdx) {
-            self.mlp = LagunaRuntimeSparseMoEBlock(config)
+            self.mlp = LagunaRuntimeSparseMoEBlock(config, layerIdx: layerIdx)
         } else {
             self.mlp = LagunaRuntimeMLP(
                 dimensions: config.hiddenSize, hiddenDimensions: config.intermediateSize)

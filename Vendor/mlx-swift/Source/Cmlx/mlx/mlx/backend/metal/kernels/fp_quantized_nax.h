@@ -1573,6 +1573,260 @@ METAL_FUNC int laguna_sorted_lower_bound(
   return lo;
 }
 
+// Laguna packed expert chain. Keep the existing rounded BF16 SwiGLU boundary
+// in threadgroup memory, then run down with unchanged NAX fragment geometry
+// and ascending BK/SK accumulation order.
+template <
+    typename T,
+    int group_size,
+    const int bits,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool transpose,
+    const int fixed_K = 0,
+    const int fixed_N = 0,
+    typename Wtype = bfloat,
+    int tg_expert_groups = 256>
+[[kernel]] void fp_gather_qmm_rhs_expert_chain_nax(
+    const device T* x,
+    const device uint32_t* w,
+    const device uint8_t* scales,
+    const device uint32_t* indices,
+    device T* y,
+    const constant int& M,
+    const constant int& N,
+    const constant int& K,
+    const constant int& run_skip_pct,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]]) {
+  (void)run_skip_pct;
+  (void)N;
+  (void)K;
+  static_assert(transpose, "Laguna expert chain requires NT weights");
+  static_assert(group_size == 16, "Laguna expert chain requires gs16");
+  static_assert(bits == 4, "Laguna expert chain requires NVFP4");
+  static_assert(BM == 64 && BN == 64 && BK == 64,
+                "Laguna expert chain has fixed 64x64x64 geometry");
+  static_assert(WM == 4 && WN == 1,
+                "Laguna expert chain requires SM16/SN64 fragments");
+
+  constexpr int kExperts = 256;
+  constexpr int kHidden = 2048;
+  constexpr int kIntermediate = 512;
+  constexpr int kGateUpRows = 2 * kIntermediate;
+  constexpr int kPackFactor = get_pack_factor<8, bits>();
+  constexpr int kBytesPerPack = get_bytes_per_pack();
+  constexpr int kBKPad = BK + 16 / sizeof(Wtype);
+  constexpr int kExpertGroups = tg_expert_groups;
+  constexpr int kPackedKBytes = kHidden * kBytesPerPack / kPackFactor;
+  constexpr int kGateGroups = kHidden / group_size;
+  constexpr int kDownKBytes =
+      kIntermediate * kBytesPerPack / kPackFactor;
+  constexpr int kDownGroups = kIntermediate / group_size;
+  constexpr size_t kExpertWeightStride =
+      size_t(kHidden) * size_t(kPackedKBytes);
+  constexpr size_t kExpertScaleStride =
+      size_t(kHidden) * size_t(kGateGroups);
+  constexpr size_t kDownWeightOffset =
+      size_t(kGateUpRows) * size_t(kPackedKBytes);
+  constexpr size_t kDownScaleOffset =
+      size_t(kGateUpRows) * size_t(kGateGroups);
+  static_assert(kExperts % kExpertGroups == 0);
+  static_assert(fixed_K == 0 || fixed_K == kHidden);
+  static_assert(fixed_N == 0 || fixed_N == kHidden);
+
+  using loader_w_t = QuantizedBlockLoader<
+      Wtype,
+      BN,
+      BK,
+      kBKPad,
+      true,
+      WM * WN * SIMD_SIZE,
+      group_size,
+      bits>;
+
+  constexpr int kWsElems = BN * kBKPad;
+  constexpr int kWsPerChunk = 16 / sizeof(Wtype);
+  threadgroup NAXWsChunk16<Wtype>
+      Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
+  threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
+  threadgroup int bounds[2];
+
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+  const short tm = SM * (simd_group_id / WN);
+  const short tn = SN * (simd_group_id % WN);
+
+  for (int expert_slot = 0; expert_slot < kExperts / kExpertGroups;
+       ++expert_slot) {
+    const uint32_t expert = static_cast<uint32_t>(
+        tid.y * (kExperts / kExpertGroups) + expert_slot);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+      bounds[0] = laguna_sorted_lower_bound(indices, M, expert);
+      bounds[1] = laguna_sorted_lower_bound(indices, M, expert + 1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const device uint8_t* expert_w =
+        (const device uint8_t*)w + size_t(expert) * kExpertWeightStride;
+    const device uint8_t* expert_s =
+        scales + size_t(expert) * kExpertScaleStride;
+
+    for (int chunk_start = bounds[0]; chunk_start < bounds[1];
+         chunk_start += BM) {
+      const short chunk_rows = short(min(BM, bounds[1] - chunk_start));
+      const short sgp_sm =
+          min(int(SM), max(0, int(chunk_rows) - int(tm)));
+      const bool sg_active = sgp_sm > 0;
+
+      // Retain the stock-rounded 64x512 BF16 activation in fragments: no
+      // device intermediate, extra weight stream, or 32-KiB TG-memory use.
+      NAXTile<bfloat, TM, TK>
+          activation_tiles[kIntermediate / BN][BN / SK];
+
+      STEEL_PRAGMA_UNROLL
+      for (int ct = 0; ct < kGateUpRows / BN; ++ct) {
+        NAXTile<float, TM, TN> Dtile;
+        Dtile.clear();
+        const int y_col = ct * BN;
+        thread loader_w_t loader_w(
+            expert_w + size_t(y_col) * kPackedKBytes,
+            expert_s + size_t(y_col) * kGateGroups,
+            kHidden,
+            Ws,
+            simd_group_id,
+            simd_lane_id);
+        const device T* xn =
+            x + size_t(chunk_start + tm) * kHidden;
+
+        for (int k = 0; k < kHidden / BK; ++k) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          loader_w.load_unsafe();
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (sg_active) {
+            STEEL_PRAGMA_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<Wtype, TN, TK> Btile;
+              if (sgp_sm == SM) {
+                Atile.load(xn + kk1, kHidden);
+              } else {
+                Atile.load_safe(
+                    xn + kk1, kHidden, short2(SK, sgp_sm));
+              }
+              Btile.template load<Wtype, kBKPad, 1>(
+                  Ws + tn * kBKPad + kk1);
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<true>{});
+            }
+          }
+          xn += BK;
+          loader_w.next();
+        }
+
+        if (sg_active) {
+          constexpr int kActivationTiles = kIntermediate / BN;
+          const int act_ct = ct % kActivationTiles;
+          const bool is_up = ct >= kActivationTiles;
+          STEEL_PRAGMA_UNROLL
+          for (int frag = 0; frag < TN; ++frag) {
+            STEEL_PRAGMA_UNROLL
+            for (int elem = 0;
+                 elem < NAXTile<float, TM, TN>::kElemsPerFrag;
+                 ++elem) {
+              const bfloat projected =
+                  bfloat(Dtile.frag_at(0, frag)[elem]);
+              if (!is_up) {
+                activation_tiles[act_ct][frag / TK]
+                    .frag_at(0, frag % TK)[elem] = projected;
+              } else {
+                const bfloat gate =
+                    activation_tiles[act_ct][frag / TK]
+                        .frag_at(0, frag % TK)[elem];
+                const bfloat exp_abs = metal::exp(metal::abs(gate));
+                const bfloat denominator = bfloat(1) + exp_abs;
+                const bfloat z = bfloat(1) / denominator;
+                const bfloat sigmoid =
+                    gate < bfloat(0) ? z : bfloat(1) - z;
+                const bfloat silu = bfloat(gate * sigmoid);
+                activation_tiles[act_ct][frag / TK]
+                    .frag_at(0, frag % TK)[elem] =
+                        bfloat(silu * projected);
+              }
+            }
+          }
+        }
+      }
+
+      for (int ct = 0; ct < kHidden / BN; ++ct) {
+        NAXTile<float, TM, TN> Dtile;
+        Dtile.clear();
+        const int y_col = ct * BN;
+        thread loader_w_t loader_w(
+            expert_w + kDownWeightOffset +
+                size_t(y_col) * kDownKBytes,
+            expert_s + kDownScaleOffset +
+                size_t(y_col) * kDownGroups,
+            kIntermediate,
+            Ws,
+            simd_group_id,
+            simd_lane_id);
+
+        for (int k = 0; k < kIntermediate / BK; ++k) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          loader_w.load_unsafe();
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (sg_active) {
+            STEEL_PRAGMA_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<bfloat, TM, TK> Atile =
+                  activation_tiles[k][kk1 / SK];
+              NAXTile<Wtype, TN, TK> Btile;
+              Btile.template load<Wtype, kBKPad, 1>(
+                  Ws + tn * kBKPad + kk1);
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<true>{});
+            }
+          }
+          loader_w.next();
+        }
+
+        if (sg_active) {
+          device T* yn = y +
+              size_t(chunk_start + tm) * kHidden + y_col + tn;
+          if (sgp_sm == SM) {
+            Dtile.store(yn, kHidden);
+          } else {
+            Dtile.store_slice(
+                yn,
+                kHidden,
+                short2(0, 0),
+                short2(SN, sgp_sm));
+          }
+        }
+      }
+    }
+  }
+}
+
 // Laguna prefill sorts the M routed rows by expert before this QMM. The stock
 // kernel assigns fixed 64-row tiles, then walks every expert run intersecting
 // a tile; a run crossing a tile boundary stages the same expert weight tile
