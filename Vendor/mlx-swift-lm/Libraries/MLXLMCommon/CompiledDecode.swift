@@ -246,16 +246,16 @@ public enum CompiledDecode {
         return { owner($0) }
     }
 
-    /// Choose the shortest attention view that preserves the long-cache
-    /// vector-SDPA reduction partition.
+    /// Choose a short attention view for the compiled fast tier.
     ///
-    /// Lengths above 1024 stay on MLX's two-pass vector SDPA on large M-series
-    /// devices. The first such length is exactly 1025: attention views share
-    /// the full backing allocation, so unlike cache storage they do not need
-    /// tranche alignment. This preserves the full buffer's block partition
-    /// for Laguna's six-way GQA on every MLX architecture category (`s`: 128
-    /// blocks, `d`: 128, other: 64) while scanning the shortest possible view.
-    /// This is a kernel boundary, not a benchmark prompt/token constant.
+    /// MLX's large-device host dispatcher switches vector SDPA to its two-pass
+    /// implementation at `k.shape(2) >= 1024`.  The one-pass kernel is the
+    /// tuned path for Laguna's one-token decode, while the two-pass variant is
+    /// tuned for genuinely long contexts.  Keep the fast view below that
+    /// boundary whenever the current cache plus one normal growth tranche fits;
+    /// the full backing cache remains available through the tiered fallback for
+    /// longer contexts.  Attention views share the backing allocation and do
+    /// not require cache-tranche alignment.
     static func initialAttentionLength(
         currentOffset: Int,
         growthStep: Int,
@@ -266,11 +266,17 @@ public enum CompiledDecode {
         else { return nil }
         let (withHeadroom, overflow) = currentOffset.addingReportingOverflow(growthStep)
         guard !overflow else { return nil }
-        let needed = max(withHeadroom, 1025)
+        let onePassThreshold = 1024
+        // Leave one growth tranche of headroom below the SDPA boundary.  The
+        // usual Laguna step is 256, so the timed 512-token prefill promotes a
+        // 768-wide fast view and never enters the 1025-row two-pass regime.
+        let onePassFloor = max(1, onePassThreshold - growthStep)
+        let needed = max(withHeadroom, onePassFloor)
+        let rounded = roundedCapacity(atLeast: needed, step: growthStep)
         let capacity =
-            needed == 1025
-            ? needed
-            : roundedCapacity(atLeast: needed, step: growthStep)
+            needed < onePassThreshold
+            ? min(onePassThreshold - 1, rounded)
+            : rounded
         return min(callerUpperBound, capacity)
     }
 
