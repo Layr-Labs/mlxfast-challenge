@@ -584,7 +584,9 @@ template <
     Otile.template row_bin_op<MulOp>(factor);
     }
 
-    simdgroup_barrier(mem_flags::mem_none);
+    if (sg_active) {
+      simdgroup_barrier(mem_flags::mem_none);
+    }
 
     // Do O = P @ V
     STEEL_PRAGMA_UNROLL
