@@ -593,7 +593,9 @@ template <
       for (short id = 0; id < TD; id += 2) {
         if constexpr (BD == 128) {
           if (id == 4) {
-            threadgroup_barrier(mem_flags::mem_none);
+            // Simdgroups own disjoint query rows; only order this simdgroup's
+            // tensor-op stream between the two head-dimension halves.
+            simdgroup_barrier(mem_flags::mem_none);
           }
         }
 
@@ -633,7 +635,9 @@ template <
 
   // Normalize output
 
-  threadgroup_barrier(mem_flags::mem_none);
+  // Each simdgroup owns disjoint query rows and register-private softmax/O
+  // state. Only order this simdgroup's tensor-op stream before normalization.
+  simdgroup_barrier(mem_flags::mem_none);
 
   metal::vec<AccumType, kRowsPT> rcp;
   STEEL_PRAGMA_UNROLL
