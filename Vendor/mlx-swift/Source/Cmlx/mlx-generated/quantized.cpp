@@ -294,8 +294,30 @@ inline U qdot(
   }
 
   else if (bits == 8) {
-    for (int i = 0; i < values_per_thread; i++) {
-      accum += x_thread[i] * w[i];
+    if constexpr (values_per_thread == 8) {
+      // Two 32-bit word loads instead of eight single-byte loads. The
+      // pointer is 4-byte aligned at every bits==8 site reaching this
+      // specialization: qmv_fast_impl offsets lanes by 8 * simd_lid bytes,
+      // row stride is in_vec_size bytes, the host dispatches qmv_fast only
+      // when K % 512 == 0, and batch offsets are whole uint32 strides.
+      // Little-endian, so U((w_lo >> (8*i)) & 0xff) == U(w[i]) for i in
+      // [0,4), w_hi likewise for [4,8). Accumulation order and expression
+      // tree unchanged. Scope: bits == 8, values_per_thread == 8 only;
+      // every other arm keeps the original byte loop verbatim.
+      const uint32_t w_lo = ((const device uint32_t*)w)[0];
+      const uint32_t w_hi = ((const device uint32_t*)w)[1];
+      accum += x_thread[0] * U(w_lo & 0xff);
+      accum += x_thread[1] * U((w_lo >> 8) & 0xff);
+      accum += x_thread[2] * U((w_lo >> 16) & 0xff);
+      accum += x_thread[3] * U((w_lo >> 24) & 0xff);
+      accum += x_thread[4] * U(w_hi & 0xff);
+      accum += x_thread[5] * U((w_hi >> 8) & 0xff);
+      accum += x_thread[6] * U((w_hi >> 16) & 0xff);
+      accum += x_thread[7] * U((w_hi >> 24) & 0xff);
+    } else {
+      for (int i = 0; i < values_per_thread; i++) {
+        accum += x_thread[i] * w[i];
+      }
     }
   }
 
