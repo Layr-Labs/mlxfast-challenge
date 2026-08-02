@@ -88,6 +88,25 @@ let lagunaFusedQKVEnabled =
 /// shared expert and serve single-token decode from one quantized matmul.
 /// Multi-token prefill remains on the stock separate banks so the ranked
 /// prefill path and its smaller gather/GEMM shapes are unchanged.
+/// Chunked prefill coverage for the shared-expert fused [gate; up] bank
+/// QMM (see the branch in `LagunaRuntimeMLP.callAsFunction`). Counts
+/// decoder layers from 1; 0 disables the prefill branch entirely.
+///
+/// DEFAULT 0 (measured NOT bit-exact): the mechanism's whole gain is that
+/// the fused N=1024 shape selects a non-split kernel where the separate
+/// N=512 projections select split-K — but split-K reduces K in a different
+/// association order, so the halves are NOT bit-identical to the separate
+/// dispatches (local M5 Max free-run token hash diverges with the branch
+/// on: eaed0b49 vs f56da8b8). Two public in-flight submissions carry this
+/// mechanism with a bit-exactness claim their own selection argument
+/// contradicts; kept opt-in here purely to re-measure if their ranked runs
+/// somehow pass the hidden exact-token gates.
+let lagunaPrefillFusedSharedGateUpLayers: Int = {
+    let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_FUSED_SHARED_GATE_UP_LAYERS"] ?? "0"
+    return min(max(Int(raw) ?? 0, 0), LagunaConstants.numHiddenLayers)
+}()
+
 let lagunaFusedSharedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_GATE_UP"] != "0"
 
@@ -1326,13 +1345,30 @@ func lagunaSlidingQKNormRoPE(
 let lagunaFusedSlidingAttentionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_ATTN"] != "0"
 
+/// `DARKBLOOM_FUSED_ATTN_SCALE_LITERAL` (default ON; "0" restores the bound
+/// scale_arr input): both fused decode attention kernels always run
+/// head_dim 128, so the softmax scale is the compile-time constant
+/// 1/sqrt(128). Embedding its exact FP32 bit pattern (0x3db504f3 — the
+/// identical value the host binds via `_fusedAttnScale`) removes one
+/// argument binding and one device scalar read per dispatch (~40 per decode
+/// token). Bit-exact: same bits feed the same multiply.
+/// (Mechanism from shikharpant's public 45c0e25 note.)
+let lagunaFusedAttnScaleLiteralEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_FUSED_ATTN_SCALE_LITERAL"] != "0"
+
+private let lagunaFusedAttnScaleSourceLine =
+    lagunaFusedAttnScaleLiteralEnabled
+    ? "float scale = as_type<float>(0x3db504f3u);"
+    : "float scale = scale_arr[0];"
+
 private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
     name: "laguna_sliding_fused_attn_ring_v1",
     inputNames: [
         "raw_queries", "raw_keys", "raw_values",
         "query_weight", "key_weight", "angles",
-        "k_cache", "v_cache", "params", "scale_arr",
-    ],
+        "k_cache", "v_cache", "params",
+    ] + (lagunaFusedAttnScaleLiteralEnabled ? [] : ["scale_arr"]),
     outputNames: ["attended"],
     source: """
         constexpr uint head_dim = 128;
@@ -1354,7 +1390,7 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
         uint sg = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
         uint widx = params[0];
-        float scale = scale_arr[0];
+        \(lagunaFusedAttnScaleSourceLine)
 
         threadgroup bfloat tg_q0[head_dim];
         threadgroup bfloat tg_q1[head_dim];
@@ -1737,8 +1773,8 @@ func lagunaSlidingFusedAttention(
         [
             rawQueries, rawKeys, rawValues,
             queryWeight, keyWeight, angles,
-            cacheKeys, cacheValues, params, scale,
-        ],
+            cacheKeys, cacheValues, params,
+        ] + (lagunaFusedAttnScaleLiteralEnabled ? [] : [scale]),
         grid: ((heads / 2) * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
@@ -1801,8 +1837,8 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
     inputNames: [
         "raw_queries", "raw_keys", "raw_values",
         "query_weight", "key_weight", "angles",
-        "k_cache", "v_cache", "params", "scale_arr",
-    ],
+        "k_cache", "v_cache", "params",
+    ] + (lagunaFusedAttnScaleLiteralEnabled ? [] : ["scale_arr"]),
     outputNames: ["attended"],
     source: """
         constexpr uint head_dim = 128;
@@ -1825,7 +1861,7 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
         uint widx = params[0];
         int N = int(params[1]);
         uint capacity = params[2];
-        float scale = scale_arr[0];
+        \(lagunaFusedAttnScaleSourceLine)
 
         threadgroup bfloat tg_q0[head_dim];
         threadgroup bfloat tg_q1[head_dim];
@@ -2249,8 +2285,8 @@ func lagunaFullFusedAttention(
         [
             rawQueries, rawKeys, rawValues,
             queryWeight, keyWeight, angles,
-            cacheKeys, cacheValues, params, scale,
-        ],
+            cacheKeys, cacheValues, params,
+        ] + (lagunaFusedAttnScaleLiteralEnabled ? [] : [scale]),
         grid: ((heads / 2) * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
@@ -3972,6 +4008,23 @@ let lagunaGatedAffineOProjNVFP4Enabled =
 /// the intermediate `half` with one carrying add. Exhaustively bit-identical
 /// over all 256 E4M3 bytes (`LagunaNVFP4QMVFoldTests`); the two power-of-two
 /// scale factors were already folded to the per-row `* 4194304.0f` epilogue.
+/// `DARKBLOOM_OPROJ_R1` (default ON): one output row per simdgroup in the
+/// gated NVFP4 o_proj QMV (1024 tiles of 2 rows instead of 256 tiles of 8),
+/// the same row-ownership re-tiling already promoted on the QKV, routed
+/// gate/up and routed/shared down QMVs. Rows are independent reductions --
+/// no threadgroup communication, no barrier -- so each row executes the
+/// identical loads, split-nibble decodes, FP32 product order, one simd_sum
+/// and one BF16 round; only which simdgroup owns a row changes. "0" restores
+/// the four-row schedule in the same binary.
+/// MEASURED NEGATIVE on this machine, default OFF: an isolated chained
+/// kernel probe timed the four-row schedule at 21.5-22.0 us per dispatch
+/// and the one-row schedule at 22.2-22.4 us. The kernel moves 9.4 MB per
+/// dispatch, i.e. ~427 GB/s against the 471 GB/s this machine sustains on
+/// that access pattern -- already bandwidth-bound, so extra parallelism
+/// buys nothing and costs a little.
+let lagunaOProjR1Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_OPROJ_R1"] == "1"
+
 let lagunaNvfp4QmvSignCarryEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_QMV_SIGN_CARRY"] != "0"
 
@@ -4152,7 +4205,7 @@ func lagunaGatedAffineOProjNVFP4Source(
     constexpr uint values_per_thread = 16;
     constexpr uint codes_per_thread = values_per_thread / 8;
     constexpr uint block_size = values_per_thread * 32;
-    constexpr uint results_per_simdgroup = 4;
+    constexpr uint results_per_simdgroup = \(lagunaOProjR1Enabled ? 1 : 4);
     constexpr uint num_simdgroups = 2;
     constexpr uint in_vec_size_g = in_vec_size / group_size;
 
@@ -4173,7 +4226,7 @@ func lagunaGatedAffineOProjNVFP4Source(
     const device bfloat* xp = attention_output + simd_lid * values_per_thread;
 
     thread float x_thread[values_per_thread];
-    thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+    thread float result[results_per_simdgroup] = {0.0f\(lagunaOProjR1Enabled ? "" : ", 0.0f, 0.0f, 0.0f")};
 
     uint column = simd_lid * values_per_thread;
     for (uint k = 0; k < in_vec_size; k += block_size) {
@@ -4225,6 +4278,7 @@ private let lagunaGatedAffineOProjNVFP4Kernels: [Int: MLXFast.MLXFastKernel] = {
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
             name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_v1"
+                + (lagunaOProjR1Enabled ? "_r1" : "")
                 + (lagunaNvfp4QmvSignCarryEnabled ? "_sc1" : "")
                 + (lagunaNvfp4QmvSeedElisionEnabled ? "_se1" : ""),
             inputNames: [
@@ -4327,8 +4381,10 @@ private let lagunaActivatedOProjKernels: [Int: MLXFast.MLXFastKernel] = {
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         result[heads] = MLXFast.metalKernel(
             name: "laguna_oproj_act_h\(heads)_v1"
+                + (lagunaOProjR1Enabled ? "_r1" : "")
                 + (lagunaNvfp4QmvSignCarryEnabled ? "_sc1" : "")
-                + (lagunaNvfp4QmvSeedElisionEnabled ? "_se1" : ""),
+                + (lagunaNvfp4QmvSeedElisionEnabled ? "_se1" : "")
+                + (lagunaE4M3SignDomainCertified ? "_sd1" : ""),
             inputNames: [
                 "attention_output", "gate_values", "weight_codes",
                 "weight_scales",
@@ -4369,7 +4425,7 @@ func lagunaGatedAffineOProjNVFP4(
     lagunaTrace("gated affine oproj nvfp4 qmv h\(heads)")
     return kernel(
         [attentionOutput, gateLogits, codes, scales],
-        grid: ((outVec / 8) * 64, 1, 1),
+        grid: ((outVec / (lagunaOProjR1Enabled ? 2 : 8)) * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[1, 1, outVec]],
         outputDTypes: [.bfloat16]
@@ -4467,6 +4523,28 @@ private let lagunaTailNVFP4QMVHeader = """
 private let lagunaDecodeNVFP4QKVR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_NVFP4_QKV_R1"] != "0"
 
+/// Default-on transfer of the promoted sparse NVFP4 qdot helper to QKV R1. The
+/// common helper preserves the same nibble decode/product order while
+/// eliding the dead `+0` seed and moving the exact 2^22 factor from each of
+/// four K groups to the row's existing BF16 epilogue. Prefill cannot select
+/// QKV R1. Setting the selector to `0` keeps the old tail helper available as
+/// a same-binary control.
+private let lagunaDecodeNVFP4QKVCommonQDotEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_DECODE_NVFP4_QKV_COMMON_QDOT"] != "0"
+
+private let lagunaDecodeNVFP4QKVQDotName =
+    lagunaDecodeNVFP4QKVCommonQDotEnabled
+    ? "laguna_nvfp4_qdot_16" : "laguna_tail_nvfp4_qdot"
+
+private let lagunaDecodeNVFP4QKVScaleName =
+    lagunaDecodeNVFP4QKVCommonQDotEnabled
+    ? "laguna_nvfp4_scale" : "laguna_tail_nvfp4_scale"
+
+private let lagunaDecodeNVFP4QKVRowScaleSuffix =
+    lagunaDecodeNVFP4QKVCommonQDotEnabled
+    ? lagunaNvfp4RowScaleSuffix : ""
+
 private let lagunaDecodeNVFP4QKVR1Source = """
     constexpr uint axis_size = 2048;
     constexpr uint num_simdgroups = 2;
@@ -4493,8 +4571,8 @@ private let lagunaDecodeNVFP4QKVR1Source = """
         for (uint i = 0; i < values_per_thread; ++i) {
             x_thread[i] = float(normalized[column + i]);
         }
-        result += laguna_tail_nvfp4_qdot(
-            ws, x_thread, laguna_tail_nvfp4_scale(sc[0]));
+        result += \(lagunaDecodeNVFP4QKVQDotName)(
+            ws, x_thread, \(lagunaDecodeNVFP4QKVScaleName)(sc[0]));
         ws += block_size / 2;
         sc += block_size / 16;
         column += block_size;
@@ -4502,7 +4580,8 @@ private let lagunaDecodeNVFP4QKVR1Source = """
 
     result = simd_sum(result);
     if (simd_lid == 0) {
-        projected[out_row] = bfloat(result);
+        projected[out_row] =
+            bfloat(result\(lagunaDecodeNVFP4QKVRowScaleSuffix));
     }
     """
 
@@ -4510,11 +4589,13 @@ private let lagunaDecodeNVFP4QKVR1Kernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_decode_nvfp4_qkv_h\(heads)_r1_v1",
+            name: "laguna_decode_nvfp4_qkv_h\(heads)_r1_v1"
+                + (lagunaDecodeNVFP4QKVCommonQDotEnabled ? "_cq1" : ""),
             inputNames: ["normalized", "weight_codes", "weight_scales"],
             outputNames: ["projected"],
             source: lagunaDecodeNVFP4QKVR1Source,
-            header: lagunaTailNVFP4QMVHeader,
+            header: lagunaDecodeNVFP4QKVCommonQDotEnabled
+                ? lagunaSharedSwiGLUQMVHeader : lagunaTailNVFP4QMVHeader,
             ensureRowContiguous: true)
     }
     return kernels
@@ -4541,6 +4622,9 @@ private func lagunaDecodeNVFP4QKVR1(
         let kernel = lagunaDecodeNVFP4QKVR1Kernels[heads]
     else { return nil }
     lagunaTrace("decode nvfp4 qkv r1 h\(heads)")
+    if lagunaDecodeNVFP4QKVCommonQDotEnabled {
+        lagunaTrace("decode nvfp4 qkv common qdot")
+    }
     return kernel(
         [normalized, bank.packedCodes, bank.scales],
         grid: ((rows / 2) * 64, 1, 1),
@@ -7888,6 +7972,10 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     var _fusedGateUpScales: MLXArray?
     var _fusedGateUpSplit: Int = 0
 
+    /// Decoder layer index, set once during fused-weight preparation; used
+    /// only by the chunked prefill fused-bank branch below.
+    var _decoderLayerIdx: Int = -1
+
     /// Retained fused BF16 `[gate; up]` bank for the dense (non-quantized)
     /// layer-0 MLP, built once after checkpoint load when
     /// `DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU` is enabled. Mutually exclusive
@@ -8129,6 +8217,43 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        // Chunked prefill reuse of the resident [gate; up] bank (mechanism
+        // converged on independently by two public in-flight submissions,
+        // b398b88 and 58a7111, credited): at the scored prefill shape each
+        // separate M=512, N=512, K=2048 shared projection selects a split-K
+        // quantized matmul; the row-concatenated bank's N=1024 selects the
+        // faster non-split NAX static-shape kernel. Same QMM literals, same
+        // resident bank, view split at the original width -- each quantized
+        // output row is computed independently, so both halves are bit-exact
+        // vs. the separate dispatches. Chunked to the first
+        // DARKBLOOM_PREFILL_FUSED_SHARED_GATE_UP_LAYERS decoder layers
+        // (default 20) for the acceptance band; 0 disables.
+        if x.dim(1) > 1,
+            lagunaPrefillFusedSharedGateUpLayers > 0,
+            _decoderLayerIdx > 0,
+            _decoderLayerIdx <= lagunaPrefillFusedSharedGateUpLayers,
+            let fusedWeight = _fusedGateUpWeight,
+            let fusedScales = _fusedGateUpScales,
+            x.dtype == .bfloat16,
+            fusedWeight.dtype == .uint32,
+            fusedScales.dtype == .uint8,
+            _fusedGateUpSplit == LagunaConstants.sharedExpertIntermediateSize
+        {
+            lagunaTrace("shared prefill fused [gate; up] bank QMM")
+            let gateUp = MLX.quantizedMM(
+                x,
+                fusedWeight,
+                scales: fusedScales,
+                biases: nil,
+                transpose: true,
+                groupSize: 16,
+                bits: 4,
+                mode: .nvfp4
+            )
+            let gate = gateUp[.ellipsis, 0 ..< _fusedGateUpSplit]
+            let up = gateUp[.ellipsis, _fusedGateUpSplit...]
+            return downProj(compiledSiluProduct(gate, up))
+        }
         if x.dim(1) == 1,
             let fusedWeight = _fusedGateUpWeight, let fusedScales = _fusedGateUpScales
         {
@@ -9967,7 +10092,16 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 let fusedScales = _fusedRoutedGateUpScales,
                 let downProj = _routedDownProj,
                 x.dim(1) > 1,
-                inds.size >= 64,
+                // Correctness guard: the fused bank's valid gather region is
+                // 2 * moeIntermediateSize rows (1024), NOT SwitchGLU's 64-row
+                // sort-regime threshold. With the old `>= 64` bound, prompts
+                // of 8..127 tokens (inds.size in [64, 1016]) produced wrong
+                // prefill logits (staircase break confirmed at exactly 1024
+                // gathered rows; 64-token repro degenerates to "and and
+                // and..."). The scored 512-token window (4096 rows) never
+                // triggered it; hidden GPQA/free-run prompts have no length
+                // guarantee. Credit: Grbarajas's public bug-report submission.
+                inds.size >= 2 * LagunaConstants.moeIntermediateSize,
                 fusedWeight.dtype == .uint32,
                 fusedScales.dtype == .uint8,
                 _fusedRoutedGateUpSplit == LagunaConstants.moeIntermediateSize
@@ -10750,7 +10884,7 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     /// derived side copy.
     func prepareFusedRuntimeWeights() {
         var fusedArrays = model.prepareRoPEAngleAtlases()
-        for layer in model.layers {
+        for (layerIndex, layer) in model.layers.enumerated() {
             if lagunaUseNativeAffineQKV(layer: layer.selfAttn.layerIdx) {
                 fusedArrays.append(
                     contentsOf: layer.selfAttn.prepareNativeAffineQKVWeight())
@@ -10766,6 +10900,7 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                 contentsOf: layer.selfAttn.prepareLastPrefillProjectionWeights())
             if let sparse = layer.mlp as? LagunaRuntimeSparseMoEBlock {
                 if lagunaFusedSharedGateUpEnabled {
+                    sparse.sharedExpert._decoderLayerIdx = layerIndex
                     fusedArrays.append(contentsOf: sparse.sharedExpert.prepareFusedSharedGateUp())
                 }
                 if lagunaFusedRoutedGateUpEnabled {
