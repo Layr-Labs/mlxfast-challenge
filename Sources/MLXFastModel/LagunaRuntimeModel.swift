@@ -5133,15 +5133,14 @@ private let lagunaNormAffineQKVIndexedKernels: [Int: MLXFast.MLXFastKernel] = {
     return kernels
 }()
 
-/// `DARKBLOOM_FUSED_NORM_AFFINE_QKV` (default ON; set "0" to disable). Folds
-/// the input RMSNorm into the native group-32 affine INT8 QKV GEMV so the
-/// decode attention head is one dispatch instead of two. Bit-exact (inline
-/// variant re-derives normalized values from L1-resident rows with no
-/// occupancy cost). Applies only on group-32 INT8 layers with the gate rows
-/// folded into the QKV bank; the NVFP4 tail layers and any guard decline keep
-/// the separate norm + projection.
+/// `DARKBLOOM_FUSED_NORM_AFFINE_QKV` (default OFF; set "1" to restore the
+/// fused control). On the current affine frontier the exact two-dispatch
+/// chain is faster: it computes RMSNorm once instead of repeating the
+/// reduction and barriers in every eight-output-row projection tile. Applies
+/// only on group-32 INT8 layers with the gate rows folded into the QKV bank;
+/// the NVFP4 tail layers and any guard decline already keep the separate path.
 let lagunaFusedNormAffineQKVEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_NORM_AFFINE_QKV"] != "0"
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_NORM_AFFINE_QKV"] == "1"
 
 /// Input RMSNorm + native-affine INT8 `[Q; K; V; (G)]` projection in one
 /// dispatch, or `nil` when any shape, dtype or wire-format guard declines
