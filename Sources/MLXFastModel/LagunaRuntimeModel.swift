@@ -4099,9 +4099,21 @@ func lagunaGatedAffineOProj(
 /// group-16 NVFP4 output projection. It folds the softplus gate, broadcast
 /// product, and contraction into one dispatch while preserving the BF16 gate
 /// rounding point and the stock NVFP4 accumulation geometry.
-private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
+/// Two output rows per SIMD is the all-layer NVFP4 decode default. Set
+/// `DARKBLOOM_NVFP4_OPROJ_ROWS=4` to restore the previous four-row schedule.
+/// Row arithmetic is unchanged; this only doubles independent weight streams
+/// now that the NVFP4 representation covers every attention layer.
+private let lagunaNVFP4OProjRowsPerSIMD =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_OPROJ_ROWS"] == "4"
+    ? 4 : 2
+
+private func lagunaGatedAffineOProjNVFP4Source(
+    heads: Int, resultsPerSIMD: Int = 4
+) -> String {
     let scaleFold = lagunaNvfp4ScaleFoldEnabled
     let weightScale = scaleFold ? "" : " * 16384.0f"
+    let resultInitializer = resultsPerSIMD == 2
+        ? "{0.0f, 0.0f}" : "{0.0f, 0.0f, 0.0f, 0.0f}"
     let extract = """
                     const uint xe = c & 0x0F0F0F0Fu;
                     const uint ge = xe | (xe << 3);
@@ -4121,7 +4133,7 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
     constexpr uint values_per_thread = 16;
     constexpr uint codes_per_thread = values_per_thread / 8;
     constexpr uint block_size = values_per_thread * 32;
-    constexpr uint results_per_simdgroup = 4;
+    constexpr uint results_per_simdgroup = \(resultsPerSIMD);
     constexpr uint num_simdgroups = 2;
     constexpr uint in_vec_size_g = in_vec_size / group_size;
 
@@ -4157,7 +4169,7 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
     const device bfloat* xp = attention_output + simd_lid * values_per_thread;
 
     thread float x_thread[values_per_thread];
-    thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+    thread float result[results_per_simdgroup] = \(resultInitializer);
 
     uint column = simd_lid * values_per_thread;
     for (uint k = 0; k < in_vec_size; k += block_size) {
@@ -4217,13 +4229,16 @@ private let lagunaGatedAffineOProjNVFP4Kernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_v1",
+            name: lagunaNVFP4OProjRowsPerSIMD == 2
+                ? "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_r2_v1"
+                : "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_v1",
             inputNames: [
                 "attention_output", "gate_logits", "weight_codes",
                 "weight_scales",
             ],
             outputNames: ["projected"],
-            source: lagunaGatedAffineOProjNVFP4Source(heads: heads),
+            source: lagunaGatedAffineOProjNVFP4Source(
+                heads: heads, resultsPerSIMD: lagunaNVFP4OProjRowsPerSIMD),
             ensureRowContiguous: true
         )
     }
@@ -4255,7 +4270,9 @@ func lagunaGatedAffineOProjNVFP4(
     lagunaTrace("gated affine oproj nvfp4 qmv h\(heads)")
     return kernel(
         [attentionOutput, gateLogits, codes, scales],
-        grid: ((outVec / 8) * 64, 1, 1),
+        grid: (
+            (outVec / (2 * lagunaNVFP4OProjRowsPerSIMD)) * 64,
+            1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[1, 1, outVec]],
         outputDTypes: [.bfloat16]
