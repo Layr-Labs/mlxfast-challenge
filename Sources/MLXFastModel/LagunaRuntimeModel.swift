@@ -4038,6 +4038,34 @@ let lagunaFusedGatedAffineOProjEnabled =
 let lagunaGatedAffineOProjNVFP4Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_GATED_AFFINE_OPROJ_NVFP4"] != "0"
 
+/// `DARKBLOOM_NVFP4_QMV_SIGN_CARRY` (default OFF): in the standalone NVFP4
+/// o_proj QMV decode (`lagunaGatedAffineOProjNVFP4Source`), fold the E4M3
+/// group-scale sign bit into the half bit pattern instead of a conditional
+/// negate — the same bit-exact transform ivanfioravanti's 71b80b1f applied to
+/// the fused tail qdot (`DARKBLOOM_TAIL_NVFP4_SCALE_FOLD`), which this
+/// standalone kernel did not carry. For `bits = 128 + m` the carry
+/// `bits + (bits & 128)` yields `256 + m`, and `(256 + m) << 7 ==
+/// 0x8000 | (m << 7)` because `m <= 127` keeps `m << 7 <= 16256 < 0x8000`;
+/// IEEE half is sign-magnitude, so that pattern IS the negation, including
+/// `-0.0h`. For `bits < 128` the add is the identity. Replaces the branch and
+/// the intermediate `half` with one carrying add. Exhaustively bit-identical
+/// over all 256 E4M3 bytes (`LagunaNVFP4QMVFoldTests`); the two power-of-two
+/// scale factors were already folded to the per-row `* 4194304.0f` epilogue.
+let lagunaNvfp4QmvSignCarryEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_QMV_SIGN_CARRY"] != "0"
+
+/// `DARKBLOOM_NVFP4_QMV_SEED_ELIDE` (default OFF): in the same o_proj QMV
+/// decode, assign the first four-term product group to the accumulator instead
+/// of adding it to a `+0.0f` seed, removing one dead FP add per output row per
+/// K block. `fadd 0.0, %t` is not foldable under `setFastMathEnabled(false)`
+/// (`0.0 + (-0.0) == +0.0 != -0.0`), so the add is really emitted. Eliding it
+/// can only flip the sign of an all-`-0.0` group's zero, which the
+/// `+0.0f`-seeded `result[row]` accumulator (`+0.0 + -0.0 == +0.0`) and the
+/// BF16 epilogue absorb, so the kernel output is bit-identical
+/// (`LagunaNVFP4QMVFoldTests`).
+let lagunaNvfp4QmvSeedElisionEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_QMV_SEED_ELIDE"] != "0"
+
 /// Gate product + native-affine INT8 output projection in one dispatch, or
 /// `nil` when any shape, dtype or wire-format guard declines (caller then runs
 /// the exact two-dispatch chain).
@@ -4099,9 +4127,45 @@ func lagunaGatedAffineOProj(
 /// group-16 NVFP4 output projection. It folds the softplus gate, broadcast
 /// product, and contraction into one dispatch while preserving the BF16 gate
 /// rounding point and the stock NVFP4 accumulation geometry.
-private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
+func lagunaGatedAffineOProjNVFP4Source(
+    heads: Int,
+    signCarry: Bool = lagunaNvfp4QmvSignCarryEnabled,
+    seedElide: Bool = lagunaNvfp4QmvSeedElisionEnabled
+) -> String {
     let scaleFold = lagunaNvfp4ScaleFoldEnabled
     let weightScale = scaleFold ? "" : " * 16384.0f"
+    // Sign-carry fold: E4M3 is sign-magnitude, so carrying the sign bit into
+    // the half pattern is the exact negation over all 256 bytes (incl. -0.0h);
+    // the OFF arm keeps the negate-after-convert form verbatim.
+    let scaleDecode = signCarry
+        ? "ushort sraw = ushort(sbits + (sbits & 128)) << 7;\n"
+            + "        float scale = float(as_type<half>(sraw));"
+        : "ushort sraw = ushort(sbits & 127) << 7;\n"
+            + "        half sconverted = as_type<half>(sraw);\n"
+            + "        float scale = float((sbits & 128) ? -sconverted : sconverted);"
+    // Seed elision: assign the first four-term group instead of adding it to a
+    // dead `+0.0f` seed. Only a signed-zero can differ, and the `+0.0f`-seeded
+    // `result[row]` plus BF16 epilogue absorb it. OFF arm keeps the seed.
+    let accumDecl = seedElide ? "float accum;" : "float accum = 0.0f;"
+    let firstAccum = seedElide
+        ? "if (j == 0) {\n"
+            + "                accum =\n"
+            + "                    (x_thread[8 * j] * v04.x +\n"
+            + "                     x_thread[8 * j + 1] * v15.x +\n"
+            + "                     x_thread[8 * j + 2] * v26.x +\n"
+            + "                     x_thread[8 * j + 3] * v37.x);\n"
+            + "            } else {\n"
+            + "                accum +=\n"
+            + "                    (x_thread[8 * j] * v04.x +\n"
+            + "                     x_thread[8 * j + 1] * v15.x +\n"
+            + "                     x_thread[8 * j + 2] * v26.x +\n"
+            + "                     x_thread[8 * j + 3] * v37.x);\n"
+            + "            }"
+        : "accum +=\n"
+            + "                (x_thread[8 * j] * v04.x +\n"
+            + "                 x_thread[8 * j + 1] * v15.x +\n"
+            + "                 x_thread[8 * j + 2] * v26.x +\n"
+            + "                 x_thread[8 * j + 3] * v37.x);"
     let extract = """
                     const uint xe = c & 0x0F0F0F0Fu;
                     const uint ge = xe | (xe << 3);
@@ -4172,10 +4236,8 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
             // epilogue. Every partial remains the exact 2^-22 rescaling of
             // the control until the multiply before the existing BF16 round.
             uint8_t sbits = sc[row * in_vec_size_g];
-            ushort sraw = ushort(sbits & 127) << 7;
-            half sconverted = as_type<half>(sraw);
-            float scale = float((sbits & 128) ? -sconverted : sconverted);
-            float accum = 0.0f;
+            \(scaleDecode)
+            \(accumDecl)
             #pragma unroll
             for (uint j = 0; j < codes_per_thread; ++j) {
                 const uint c = wl[j];
@@ -4184,11 +4246,7 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
                 const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
                 const float2 v26 = float2(as_type<half2>(p2))\(weightScale);
                 const float2 v37 = float2(as_type<half2>(p3))\(weightScale);
-                accum +=
-                    (x_thread[8 * j] * v04.x +
-                     x_thread[8 * j + 1] * v15.x +
-                     x_thread[8 * j + 2] * v26.x +
-                     x_thread[8 * j + 3] * v37.x);
+                \(firstAccum)
                 accum +=
                     (x_thread[8 * j + 4] * v04.y +
                      x_thread[8 * j + 5] * v15.y +
@@ -4217,7 +4275,9 @@ private let lagunaGatedAffineOProjNVFP4Kernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_v1",
+            name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_v1"
+                + (lagunaNvfp4QmvSignCarryEnabled ? "_sc1" : "")
+                + (lagunaNvfp4QmvSeedElisionEnabled ? "_se1" : ""),
             inputNames: [
                 "attention_output", "gate_logits", "weight_codes",
                 "weight_scales",
