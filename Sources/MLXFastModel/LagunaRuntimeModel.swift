@@ -722,7 +722,7 @@ private enum LagunaDecodeAsyncStage {
 private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     let raw =
         ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?
-        .lowercased() ?? "at:0,1,7,15,23,31,39"
+        .lowercased() ?? "at:1,7,15,23,31,39"
     switch raw {
     case "off", "0", "":
         return .off
