@@ -11071,7 +11071,19 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         // position's row. Slice before the row-independent final RMSNorm and
         // vocabulary head so prefill neither normalizes nor projects the
         // preceding rows. For single-token decode the slice is a no-op.
-        let hidden = model.norm(lagunaLastTokenHidden(fullHidden))
+        let finalInput = lagunaLastTokenHidden(fullHidden)
+        let pruneThisCall = inputs.shape == [1, 1] || lagunaLmHeadPrunePrefillEnabled
+        let finalNormL1: LagunaFinalNormL1Output?
+        if let pruner = lmHeadPruner, pruner.acceptsFinalNormL1, pruneThisCall {
+            // Same single dispatch as the stock final RMSNorm, with its exact
+            // 512-thread reduction/output topology plus 64 conservative L1
+            // bounds for the immediately dependent INT5 coarse head.
+            finalNormL1 = lagunaFinalNormL1(
+                finalInput, weight: model.norm.weight, eps: model.norm.eps)
+        } else {
+            finalNormL1 = nil
+        }
+        let hidden = finalNormL1?.normalized ?? model.norm(finalInput)
         if case .norm = lagunaDecodeAsyncStage, inputs.shape == [1, 1] {
             asyncEval(hidden)
         }
@@ -11079,13 +11091,15 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         let result: MLXArray
         if let lmHead {
             if let pruner = lmHeadPruner,
-                inputs.shape == [1, 1] || lagunaLmHeadPrunePrefillEnabled
+                pruneThisCall
             {
                 // Certified two-pass final-row head (notes/68): full BF16
                 // logits, bit-identical to stock in every argmax-reachable
                 // slot. When enabled, prefill has already sliced to the last
                 // hidden row; decode always retains this pruner.
-                result = pruner.logits(hidden: hidden, lmHeadWeight: lmHead.weight)
+                result = pruner.logits(
+                    hidden: hidden, lmHeadWeight: lmHead.weight,
+                    groupL1Bounds: finalNormL1?.groupL1Bounds)
             } else {
                 result = lmHead(hidden)
             }

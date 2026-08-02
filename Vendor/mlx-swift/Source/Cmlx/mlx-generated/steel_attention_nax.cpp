@@ -1545,9 +1545,10 @@ template <
   // leaves every finite nonzero accumulator bit-identical; an exactly-zero
   // accumulator can differ only in its zero sign, which is numerically equal
   // through the final positive normalization and all downstream arithmetic.
-  // The kb trip count and every barrier stay untouched (the P@V loop contains
-  // a threadgroup_barrier at BD == 128, so a per-simdgroup trip count would be
-  // undefined behaviour); sg_active is simdgroup-uniform (tidl.x and tm only).
+  // The kb trip count and every threadgroup barrier stay untouched (the P@V
+  // loop contains one at BD == 128, so a per-simdgroup trip count would be
+  // undefined behaviour); sg_active is simdgroup-uniform (tidl.x and tm only),
+  // so inactive simdgroups can also skip their mem_none simdgroup barrier.
   // Restricted to
   // do_causal && !has_mask so the all-masked proof rests on the causal mask
   // alone; the timed window passes no array mask.
@@ -1630,9 +1631,9 @@ template <
 
     Stile.clear();
 
-    // Causal elision: guard the score computation and the zero P@V work, but
-    // never a barrier or the outer-loop pointer advance. See the sg_kb_lim
-    // comment above for the exactness argument.
+    // Causal elision: guard the score computation, the zero P@V work, and the
+    // simdgroup-local barrier, but never a threadgroup barrier or the
+    // outer-loop pointer advance. See the sg_kb_lim comment above.
     const bool sg_active = kb < sg_kb_lim;
     if (sg_active) {
 
@@ -1866,7 +1867,9 @@ template <
     Otile.template row_bin_op<MulOp>(factor);
     }
 
-    simdgroup_barrier(mem_flags::mem_none);
+    if (sg_active) {
+      simdgroup_barrier(mem_flags::mem_none);
+    }
 
     // Do O = P @ V
     STEEL_PRAGMA_UNROLL
