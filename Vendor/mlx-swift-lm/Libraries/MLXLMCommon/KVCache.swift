@@ -324,12 +324,87 @@ public func createSSMMask(h: MLXArray, cache: MambaCache?) -> MLXArray? {
 
 /// Standard KV cache implementation based on Python's KVCache
 /// See https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/base.py#L11
+public struct KVCacheSimpleFirstGrowLayout: Equatable, Sendable {
+    public let writeIdx: Int
+    public let targetCapacity: Int
+    public let logicalLengthAfter: Int
+    public let seedKeyStrides: [Int]
+    public let seedValueStrides: [Int]
+    public let seedByteCount: Int
+    public let destinationByteCount: Int
+    public let appendedByteCount: Int
+    public let unusedByteCount: Int
+
+    public init?(
+        offset: Int,
+        step: Int,
+        batchSize: Int,
+        kvHeads: Int,
+        keyHeadDim: Int,
+        valueHeadDim: Int,
+        keyCapacity: Int,
+        valueCapacity: Int,
+        keyItemSize: Int,
+        valueItemSize: Int,
+        keyStrides: [Int],
+        valueStrides: [Int]
+    ) {
+        guard offset == 512,
+            step == 256,
+            keyCapacity == offset,
+            valueCapacity == offset,
+            batchSize > 0,
+            kvHeads > 0,
+            keyHeadDim > 0,
+            valueHeadDim > 0,
+            keyItemSize > 0,
+            valueItemSize > 0,
+            keyStrides.count == 4,
+            valueStrides.count == 4,
+            keyStrides[1] > 0,
+            keyStrides[2] > 0,
+            valueStrides[1] > 0,
+            valueStrides[2] > 0,
+            keyStrides[1] <= Int(UInt32.max),
+            keyStrides[2] <= Int(UInt32.max),
+            valueStrides[1] <= Int(UInt32.max),
+            valueStrides[2] <= Int(UInt32.max),
+            keyStrides[3] == 1,
+            valueStrides[3] == 1
+        else { return nil }
+
+        self.writeIdx = offset
+        self.targetCapacity = offset + step
+        self.logicalLengthAfter = offset + 1
+        self.seedKeyStrides = keyStrides
+        self.seedValueStrides = valueStrides
+        self.seedByteCount =
+            batchSize * kvHeads * offset
+            * (keyHeadDim * keyItemSize + valueHeadDim * valueItemSize)
+        self.destinationByteCount =
+            batchSize * kvHeads * (offset + step)
+            * (keyHeadDim * keyItemSize + valueHeadDim * valueItemSize)
+        self.appendedByteCount =
+            batchSize * kvHeads
+            * (keyHeadDim * keyItemSize + valueHeadDim * valueItemSize)
+        self.unusedByteCount =
+            self.destinationByteCount - self.seedByteCount - self.appendedByteCount
+    }
+}
+
 public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var keys: MLXArray?
     internal var values: MLXArray?
     public var step = 256
+    public let fusedFirstGrowEnabled: Bool
 
     public override init() {
+        self.fusedFirstGrowEnabled = false
+        super.init()
+    }
+
+    public init(fusedFirstGrowEnabled: Bool) {
+        self.fusedFirstGrowEnabled = fusedFirstGrowEnabled
         super.init()
     }
 
@@ -416,6 +491,79 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     /// is then an identity-value op.
     private var fusedAppendContiguized = false
 
+    /// Exact one-shot growth state for Laguna's full-attention M1 path.
+    /// Preparing is side-effect free: the custom attention kernel consumes
+    /// the retained prompt arrays directly and owns allocation/filling of the
+    /// contiguous 768-row outputs. Every other shape, offset, step, or cache
+    /// configuration falls through to the ordinary `update` growth path.
+    public func fusedFirstGrowPrepare() -> (
+        keys: MLXArray,
+        values: MLXArray,
+        layout: KVCacheSimpleFirstGrowLayout
+    )? {
+        guard fusedFirstGrowEnabled,
+            step == 256,
+            offset == 512,
+            let currentKeys = keys,
+            let currentValues = values,
+            currentKeys.ndim == 4,
+            currentValues.ndim == 4,
+            currentKeys.dim(2) == offset,
+            currentValues.dim(0) == currentKeys.dim(0),
+            currentValues.dim(1) == currentKeys.dim(1),
+            currentValues.dim(2) == offset,
+            let layout = KVCacheSimpleFirstGrowLayout(
+                offset: offset,
+                step: step,
+                batchSize: currentKeys.dim(0),
+                kvHeads: currentKeys.dim(1),
+                keyHeadDim: currentKeys.dim(3),
+                valueHeadDim: currentValues.dim(3),
+                keyCapacity: currentKeys.dim(2),
+                valueCapacity: currentValues.dim(2),
+                keyItemSize: currentKeys.itemSize,
+                valueItemSize: currentValues.itemSize,
+                keyStrides: currentKeys.strides,
+                valueStrides: currentValues.strides
+            )
+        else { return nil }
+        return (currentKeys, currentValues, layout)
+    }
+
+    /// Adopt the fully populated outputs of the fused first-growth kernel and
+    /// advance the logical position by exactly the one supplied decode token.
+    /// The outputs are custom-kernel allocations, hence contiguous and ready
+    /// for the existing `fusedAppendPrepare` path on every later decode step.
+    public func fusedFirstGrowCommit(
+        keys grownKeys: MLXArray,
+        values grownValues: MLXArray,
+        expectedWriteIdx: Int
+    ) {
+        precondition(fusedFirstGrowEnabled)
+        precondition(step == 256)
+        precondition(offset == expectedWriteIdx && expectedWriteIdx == 512)
+        guard let currentKeys = self.keys, let currentValues = self.values else {
+            preconditionFailure("fused first grow requires retained seed state")
+        }
+        precondition(currentKeys.dim(2) == expectedWriteIdx)
+        precondition(currentValues.dim(2) == expectedWriteIdx)
+        precondition(grownKeys.ndim == 4 && grownValues.ndim == 4)
+        precondition(grownKeys.dim(2) == 768 && grownValues.dim(2) == 768)
+        precondition(grownKeys.dtype == currentKeys.dtype)
+        precondition(grownValues.dtype == currentValues.dtype)
+        precondition(grownKeys.dim(0) == currentKeys.dim(0))
+        precondition(grownValues.dim(0) == currentValues.dim(0))
+        precondition(grownKeys.dim(1) == currentKeys.dim(1))
+        precondition(grownValues.dim(1) == currentValues.dim(1))
+        precondition(grownKeys.dim(3) == currentKeys.dim(3))
+        precondition(grownValues.dim(3) == currentValues.dim(3))
+
+        self.keys = grownKeys
+        self.values = grownValues
+        self.offset = expectedWriteIdx + 1
+        self.fusedAppendContiguized = true
+    }
+
     /// Append state for the fused decode attention kernel, or nil when the
     /// backing has no spare row (growth would be required — the stock path
     /// handles that step). `writeIdx` is the slot the stock single-token
@@ -459,6 +607,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             self.keys = newValue[0]
             self.values = newValue[1]
             self.offset = self.keys!.dim(2)
+            self.fusedAppendContiguized = false
         }
     }
 
@@ -514,7 +663,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     }
 
     public override func copy() -> any KVCache {
-        let new = KVCacheSimple()
+        let new = KVCacheSimple(fusedFirstGrowEnabled: fusedFirstGrowEnabled)
         new.step = self.step
         let s = self.state
         if !s.isEmpty {

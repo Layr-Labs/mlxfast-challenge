@@ -498,82 +498,18 @@ let lagunaFusedFullQKNormYaRNEnabled =
 /// under the pre-r=1 regime) — the same regime-rot pattern the tail QKV
 /// fusion showed in reverse. Values are unchanged by construction (the
 /// atlas rows are the family's own stock RoPE outputs, copied); free-run
-/// token hash and 1,600 teacher-forced steps are identical across arms.
-/// Set `DARKBLOOM_ROPE_ANGLE_ATLAS=0` to restore the stock fallback
-/// (`embedTokens` gather + `ropeAngleTable` probes).
 let lagunaRoPEAngleAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] != "0"
 
-/// Zero-dispatch decode angle carrier: serve the two per-step RoPE angle rows
-/// as contiguous row VIEWS of the load-time FP32 position atlases instead of
-/// running the two probe RoPE dispatches every token. Unlike the fused
-/// embedding+atlas kernel above (default OFF; its fixed kernel cost measured
-/// −0.23%), this path adds no kernel at all: the atlas row for position `p`
-/// is bit-identical to the probe output at `p` by construction (the atlas IS
-/// the family's own stock RoPE run over the broadcast probe seed), and a
-/// row slice of the contiguous `[1, 1, 4096, D]` atlas is a zero-copy
-/// row-contiguous view, so the two probe dispatches vanish from the front of
-/// every decode step with no replacement work. The stock `embedTokens`
-/// gather is unchanged.
-///
-/// MEASURED (2026-08-01, M5 Max 128 GB, driver rig, 150-step cool-floor
-/// ABBA): views are +0.01..+0.07 ms/step vs the probe dispatches — the two
-/// probes are off the critical path (they overlap the embedding gather and
-/// layer-0 front), so removing them buys nothing, and aliasing the ~3 MB
-/// atlas buffers as per-step kernel inputs appears to add slight
-/// resource-tracking cost. Default OFF, same promoted-era conclusion as the
-/// fused embedding+atlas kernel above. Set `DARKBLOOM_ROPE_ATLAS_VIEWS=1`
-/// to re-measure.
 let lagunaRoPEAtlasViewsEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ATLAS_VIEWS"] == "1"
 
-/// `DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU` (default on; set "0" to disable):
-/// after checkpoint load, retain one row-concatenated BF16 `[gate; up]` bank
-/// for layer 0's dense (non-quantized) MLP and serve single-token decode's
-/// gate/up projections plus the SiLU-gated product from one dispatch (see
-/// `LagunaRuntimeMLP.fusedDenseDownResidual` and `lagunaDenseGateUpSwiGLU`).
-/// Layer 0 is the only layer whose MLP is plain BF16 `Linear` rather than
-/// NVFP4 `QuantizedLinear`, so every gate/up fusion flag above (all guarded
-/// on `QuantizedLinear`) always declines for it; this is its dedicated
-/// counterpart.
 let lagunaFusedDenseGateUpSwiGLUEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU"] != "0"
 
-/// `DARKBLOOM_FUSED_DENSE_DOWN_RESIDUAL` (default on; set "0" to disable):
-/// layer-0-only decode fusion of the dense MLP's down projection with the
-/// decoder layer's `h + r2` residual add (see `lagunaDenseDownResidual`).
-/// Every other down+residual fusion flag in this file requires
-/// `mlp as? LagunaRuntimeSparseMoEBlock`, which layer 0 never satisfies, so
-/// layer 0's residual add was the one MLP-side decode dispatch left with no
-/// fusion counterpart at all before this flag.
 let lagunaFusedDenseDownResidualEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_DENSE_DOWN_RESIDUAL"] != "0"
 
-/// `DARKBLOOM_ROUTER_ROWS_PER_GROUP` (default `8`; set `64` to restore the
-/// pre-widening shape, `32`/`16` for intermediate points, `4`/`2`/`1` for the
-/// sub-8 shapes): router output rows owned by one threadgroup in
-/// `laguna_residual_rms_router_bf16_2048`.
-///
-/// The router GEMV reads the whole `[256, 2048]` BF16 gate — 1,048,576 B —
-/// once per sparse layer. At `64` (16 simdgroups x 4 rows) the 256 rows need
-/// `256/64 = 4` threadgroups, and it measures 140.2 GB/s against a 575 GB/s
-/// box (`notes/47` §2a): four threadgroups cannot cover the machine's cores.
-/// Each halving doubles the tile count at constant total work, 8 -> 32
-/// threadgroups. `rows_out` stays 256 in every setting, so no wave
-/// quantization hole is created (`notes/50` §6b-§6d).
-///
-/// Bit-exact. `rows_per_group` changes only WHICH THREADGROUP OWNS WHICH ROW.
-/// Every output row keeps its own private FP32 accumulator, its own K-loop
-/// over `router_blocks` in `(block, i)` order, its own `simd_shuffle_down`
-/// ladder, and one BF16 round. No add is regrouped: the reduction tree exists
-/// only at lane level and this knob does not touch it.
-///
-/// SUB-8 IS MEASURED NULL (`notes/exp-rpgrouter.md`, 2026-07-31, 6.15 ms era):
-/// rpg1 vs rpg8 paired A/B mean −5 µs/step (−29.5/−13.5/+25.5/−4.0 µs, inside
-/// the ~18 µs local floor); rpg4/rpg2 single runs +25/+35 µs. Each extra tile
-/// re-runs the barriered 2048-wide norm before its router rows, so below 8 the
-/// redundant norm cancels whatever row-latency overlap the extra threadgroups
-/// buy. Do not re-sweep; the values stay accepted only as ablation controls.
 let lagunaRouterRowsPerGroup: Int = {
     guard
         let raw = ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_ROWS_PER_GROUP"],
@@ -584,12 +520,6 @@ let lagunaRouterRowsPerGroup: Int = {
     return value
 }()
 
-/// `DARKBLOOM_DECODE_ASYNC_STAGE` (default `at:1,7,15,23,31,39`): process-once
-/// boundary schedule for decode-step async scheduling. Active only when the
-/// invocation input shape is exactly `[1, 1]`; prefill and multi-token shapes
-/// are never asyncEval'd. `off`/`0` disables it; `norm` and `logits` remain
-/// process-once ablation points, as does any single layer index `0`-`39`.
-/// No operation, cache row, or token is added.
 private enum LagunaDecodeAsyncStage {
     case off
     case layer(Int)
@@ -599,29 +529,6 @@ private enum LagunaDecodeAsyncStage {
     case logits
 }
 
-/// Two schedule families, both special cases of the `at:i,j,k` boundary set:
-/// `ladderN` fires after every `N`th layer, and `at:` names the boundaries
-/// outright. `asyncEval` adds no operation, cache row, dtype boundary or
-/// token — it only enqueues already-constructed work earlier — so every
-/// schedule here is bit-exact and the choice is purely a measurement.
-///
-/// MEASURED, `notes/52` (two Latin squares, 66 runs, 66/66 `passed_correctness`,
-/// steady step 8..128, all contrasts 6/6 paired). `off` is 10.3735 ms and the
-/// previous `ladder8` default 9.4533, so overlap was already worth +9.7%; the
-/// remaining prize is 0.15 ms and this default takes essentially all of it:
-///
-///     ladder8   (5 fires)  1.0000   the promoted default, unswept
-///     ladder6   (6 fires)  1.0064
-///     ladder2  (20 fires)  1.0169
-///     ladder1  (40 fires)  1.0178
-///     at:1,7,15,23,31,39   1.0170   <- six fires, ties forty
-///
-/// `ladderN`'s first fire is at layer `N-1`, so it structurally skips the
-/// widest GPU-idle window in the step: the front. Adding ONE rung at layer 1
-/// to `ladder8`'s own boundaries is worth as much as quadrupling the ladder,
-/// for one extra scheduler round trip instead of thirty-five. The front rung
-/// is worthless alone — a lone fire at layer 1 measures 0.9476, the worst
-/// schedule tested — and only pays once the rest of the step is covered.
 private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     let raw =
         ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?
@@ -634,11 +541,6 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     case "logits":
         return .logits
     default:
-        // `at:i,j,k` — an arbitrary boundary set, as a bitmask over decoder
-        // layer indices (bit `i` ⇒ fire after layer `i`). `ladderN` and the
-        // single-rung forms are both special cases of it, so every schedule
-        // shape can be measured without a rebuild. Indices ≥ 64 are rejected
-        // rather than silently dropped; Laguna has 40 layers.
         if raw.hasPrefix("at:") {
             var mask: UInt64 = 0
             for field in raw.dropFirst(3).split(separator: ",") {
@@ -659,24 +561,9 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     }
 }()
 
-/// Diagnostic front-edge rung: enqueue layer 0's already-constructed QKV and
-/// gate projections before the rest of that layer's graph is built.
 private let lagunaAttentionProjectionAsyncEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ATTN_PROJECTION_ASYNC"] != "0"
 
-/// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `1`; `0`/`off` disables;
-/// `8` restores the prior default): a ranked measurement on the
-/// 1.87782 base scored stride 1 at 1.88526 (+0.40% vs that base, rejected
-/// only because a larger win promoted mid-queue), and the decode-side
-/// ladder sweep showed denser firing pays until graph-build cost
-/// dominates. Stride 1 fires `asyncEval` after every layer:
-/// prefill-side twin of the decode ladder above. Multi-token forwards build
-/// a ~400-op graph with the GPU idle until the final eval; firing `asyncEval`
-/// after every Nth layer streams completed segments exactly as the promoted
-/// decode ladder does. Same exactness ground: no operation, order, cache
-/// write, or token changes — only when already-constructed work is enqueued.
-/// This pays into both score components: the prefill phase itself and the
-/// 512-token seed prefill charged to the decode window.
 private let lagunaPrefillAsyncLadderStride: Int = {
     let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ASYNC_LADDER"]?.lowercased() ?? "1"
     if raw == "off" || raw == "0" || raw.isEmpty { return 0 }
@@ -686,28 +573,8 @@ private let lagunaPrefillAsyncLadderStride: Int = {
 
 private let lagunaRoPEAngleAtlasLength = 4096
 
-/// The shared 512-thread RMSNorm prologue emitted by three decode kernels.
-///
-/// 512 threads / 16 simdgroups square one 2048-wide row, `simd_sum` inside
-/// each simdgroup, the sixteen partials meet in `local_sums`, and one inverse
-/// RMS comes back out. Gathering those sixteen partials genuinely needs
-/// threadgroup memory -- `simd_shuffle*` reaches only the 32 lanes of the
-/// calling simdgroup, so no shuffle crosses from simdgroup 5 to simdgroup 0.
-///
-/// A `DARKBLOOM_SHUF_NORM_BCAST` / `DARKBLOOM_SHUF_NORM_INIT` pair once made
-/// the two non-gather barriers here optional. Both were measured locally at
-/// -0.70% steady step (6/6 pairs, t=4.77, 95% CI excluding zero) and shipped
-/// as submission `58864bf4`, which the ranked runner **rejected at -0.07%**.
-/// The effect did not exist on the ranked box. Barrier removal has only ever
-/// paid in narrow 32-thread kernels (`9e06de6`, +1.73%), where the rendezvous
-/// is a large fraction of the kernel; in a 512-thread kernel it is free.
-/// Removed rather than left default-OFF so nobody re-derives it.
 private let lagunaNormInvMeanScratch = "threadgroup float local_inv_mean[1];"
 
-/// Emits the cross-simdgroup half of that prologue, from the sixteen partial
-/// writes through to a `float laguna_inv_mean` the normalize loop consumes.
-/// The emitted text is line for line what the three kernels shipped, plus a
-/// register alias for `local_inv_mean[0]`.
 private func lagunaNormReductionTail(
     lane: String,
     simdGroup: String,
@@ -734,70 +601,17 @@ private func lagunaNormReductionTail(
         "threadgroup_barrier(mem_flags::mem_threadgroup);",
         "float laguna_inv_mean = local_inv_mean[0];",
     ]
-    // The first line inherits the enclosing literal's indentation, exactly as
-    // the `\(epilogue)` interpolation in the router kernel does.
     return lines.joined(separator: "\n        ")
 }
 
-/// The 2048-row prologue shared by both residual+RMSNorm kernels.
 private let lagunaNormReductionTail2048 = lagunaNormReductionTail(
     lane: "simd_lane", simdGroup: "simd_group",
     denominator: "2048.0f", epsilon: "1.0e-6f")
 
-/// The fused QKV kernel names the same two builtins `lane` and `simd_group`
-/// and spells its constants differently, but the reduction is the same shape.
 private let lagunaNormReductionTailQKV = lagunaNormReductionTail(
     lane: "lane", simdGroup: "simd_group",
     denominator: "float(in_vec_size)", epsilon: "norm_eps")
 
-/// Post-attention residual add + RMSNorm with the MoE router's projection
-/// folded in.
-///
-/// Every sparse layer follows this norm with a `[256, 2048]` BF16 GEMV whose
-/// only input is the normalized row, so that GEMV is the very next link in the
-/// dependency chain and nothing can overlap it. Folding it in costs each
-/// threadgroup a redundant 4 KB read of the normalized row it just produced
-/// and removes a kernel from the chain.
-///
-/// Exactness: the router half replicates MLX's gemv for out_vec 256 and in_vec
-/// 2048, which selects BM 4, BN 1, SM 1, SN 32, TM 4, TN 4. Lane `l` covers
-/// columns `4l + 128i`, products accumulate in `i` then `tn` order in FP32,
-/// and the simdgroup reduces with the same `simd_shuffle_down` ladder before
-/// one BF16 round. The norm half is untouched.
-///
-/// `rowsPerGroup` (see `DARKBLOOM_ROUTER_ROWS_PER_GROUP`) chooses only WHICH
-/// THREADGROUP OWNS WHICH ROW. 256 divides evenly by 64/32/16/8, every row
-/// keeps its own private accumulator and its own `(block, i)` K-loop, and no
-/// add is regrouped. **At `rowsPerGroup == 64` this emits the pre-widening
-/// kernel** — no guard, no unroll, the same four-element initializer, and
-/// `tile * rows_per_group` is the literal 64 the old
-/// `tile * (simd_size * rows_per_thread / 2)` folded to. That is what makes
-/// `DARKBLOOM_ROUTER_ROWS_PER_GROUP=64` a null by construction and therefore a
-/// usable control (`notes/50` §7e).
-///
-/// Below 16 rows per group there are fewer rows than simdgroups, so
-/// `rows_per_thread` bottoms out at 1 and the surplus simdgroups sit out the
-/// router phase behind `active_simd_groups`. They still run the norm, which
-/// needs all 512 threads, and the guard opens *after* the norm's
-/// `threadgroup_barrier` and closes *after* the logit write, so no thread is
-/// skipped past a barrier and no row goes unwritten.
-///
-/// At `rows_per_thread == 1` the block loop is also unrolled four deep. This
-/// is the load-level-parallelism half of `notes/50` §6b-ter: `tiles *
-/// rows_per_group == 256` at every tiling, so retiling alone cannot add a
-/// single outstanding load and leaves in-flight bytes pinned at 64 KB — which
-/// is the whole of the measured 140 GB/s. Hoisting four blocks' weight loads
-/// takes that to 256 KB.
-///
-/// **LOADS ONLY.** `router_result[0]` stays a single accumulator stepped in
-/// strict `(block, i)` order: block 0's four products, then block 1's, and so
-/// on into the same register. Giving each unrolled step its own partial and
-/// summing the four at the end would regroup 64 sequential FP32 adds into a
-/// tree — bit-exactness lost, every local check still green, the hidden
-/// exact-token gate failed. `router_blocks == 16` and `16 % 4 == 0`, so there
-/// is no tail. The `normalized_row` coefficients are read inline rather than
-/// staged: at one row per thread both cost `n_reads` threadgroup reads per
-/// block, so staging would buy nothing and cost 16 registers per unroll step.
 private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
     let simdGroups = 512 / 32
     let rowsPerThread = rowsPerGroup >= simdGroups ? rowsPerGroup / simdGroups : 1
@@ -911,7 +725,6 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // --- router projection ---
         \(guardOpen)\
         uint router_row = tile * rows_per_group + simd_group * rows_per_thread;
         thread float router_result[rows_per_thread] = {\(zeros)};
@@ -932,11 +745,6 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
         """
 }
 
-/// One kernel per supported `rows_per_group`, all built eagerly so that every
-/// arm of an ablation is served by the same binary (`notes/00`'s one-binary
-/// rule). MLX keys its JIT library cache by name and clears it when a name's
-/// source changes (`custom_kernel.cpp:58-68`), so the variant MUST be in the
-/// name or four sources would thrash one cache entry.
 private let lagunaResidualRMSNormRouterKernels: [Int: MLXFast.MLXFastKernel] =
     Dictionary(
         uniqueKeysWithValues: [1, 2, 4, 8, 16, 32, 64].map { rowsPerGroup in
@@ -959,8 +767,6 @@ private let lagunaResidualRMSNormRouterKernels: [Int: MLXFast.MLXFastKernel] =
             )
         })
 
-/// Residual add + RMSNorm for the layers whose MLP is not a sparse block
-/// (layer 0) and for any shape the router fusion above declines.
 private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
     name: "laguna_residual_rms_bf16_2048_v1",
     inputNames: ["residual", "branch", "weight"],
@@ -1019,13 +825,6 @@ func lagunaResidualRMSNormRouter(
     precondition(routerWeight.shape == [experts, hidden])
     precondition(correctionBias.shape == [experts])
 
-    // `rows_per_group` router rows per threadgroup, so 256 / rows_per_group
-    // tiles. Divides exactly for 64/32/16/8/4/2/1 (4..256 tiles), so no partial
-    // tile is dispatched and no row is computed twice or missed. The 512-thread
-    // threadgroup and `n_reads == 4` are NOT knobs: they are load-bearing for
-    // the `rms_single_row` correspondence (each thread squares its own
-    // contiguous four elements), and moving either regroups the FP32 RMS
-    // summation and forfeits bit-exactness.
     let rowsPerGroup = lagunaRouterRowsPerGroup
     let tiles = experts / rowsPerGroup
     lagunaTrace("residual+rmsnorm+router rpg\(rowsPerGroup)")
@@ -1065,7 +864,6 @@ func lagunaResidualRMSNorm(
     return (outputs[0], outputs[1])
 }
 
-// MARK: - Attention
 
 private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
     name: "laguna_full_qk_norm_yarn_bf16_128_v4",
@@ -1099,10 +897,6 @@ private let lagunaFullQKNormYaRNKernel = MLXFast.metalKernel(
             float value = float(input[base + i]);
             sum += value * value;
         }
-        // `simd_sum` already returns the total to every lane, so each lane
-        // derives the same `precise::rsqrt` locally. That removes the
-        // threadgroup slot and the barrier this one-simdgroup-per-head kernel
-        // would otherwise pay for on every head.
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
@@ -1176,27 +970,6 @@ func lagunaFullQKNormYaRN(
     return (outputs[0], outputs[1])
 }
 
-/// Sliding-layer twin of the full-attention QK-norm+RoPE kernel above. The
-/// thirty sliding layers carry plain RoPE -- the whole 128-element head
-/// rotates, the angle scale is one, and there is no YaRN mscale -- so their
-/// per-head RMSNorm and rotation stayed on the stock four-dispatch path
-/// (`q_norm`, `k_norm`, RoPE(q), RoPE(k)) while the ten full-attention layers
-/// were fused. This kernel closes that gap: one dispatch per decode step per
-/// layer for all 72 heads, emitting the transposed `[1, heads, 1, 128]` layout
-/// attention consumes directly.
-///
-/// Exactness, link for link with the pair it replaces:
-///  * The RMSNorm half mirrors `rms_single_row` (rms_norm.metal) at
-///    axis_size 128 with N_READS 4 and a 32-thread group: lane `l` owns the
-///    contiguous block `[4l, 4l+4)`, accumulates `float(x)^2` in index order,
-///    `simd_sum`s, and applies `precise::rsqrt(acc / 128 + eps)`. The
-///    `bfloat(...)` inside `w[i] * bfloat(x[i] * inv_mean)` is load-bearing:
-///    it is the same rounding the separate kernel would have written out and
-///    the rotation would have read back.
-///  * The rotation mirrors `rope_single_impl<T, false>` for `dims == 128`:
-///    pair `p` couples elements `p` and `p + 64`, and `cos`/`sin` come from a
-///    table produced by that very kernel (see `_slidingRoPEAngleSeed`), so
-///    they are the same floats, not a re-derivation.
 private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
     name: "laguna_sliding_qk_norm_rope_bf16_128_v1",
     inputNames: ["raw_queries", "raw_keys", "query_weight", "key_weight", "angles"],
@@ -1227,10 +1000,6 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
             float value = float(input[base + i]);
             sum += value * value;
         }
-        // `simd_sum` already returns the total to every lane, so each lane
-        // derives the same `precise::rsqrt` locally. That removes the
-        // threadgroup slot and the barrier this one-simdgroup-per-head kernel
-        // would otherwise pay for on every head.
         sum = simd_sum(sum);
         float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
@@ -1240,7 +1009,6 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
                 bfloat(float(input[base + i]) * inverse_rms);
         }
 
-        // Element `p + 64`, the partner of pair `p`, lives 16 lanes away.
         thread float paired[4];
         for (uint i = 0; i < 4; ++i) {
             paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
@@ -1250,8 +1018,6 @@ private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
             head < query_heads
             ? queries + head * head_dim
             : keys + (head - query_heads) * head_dim;
-        // Every element rotates, so the lower sixteen lanes own all 64 pairs
-        // and write both halves of each.
         if (lane < 16) {
             for (uint i = 0; i < 4; ++i) {
                 uint pair = base + i;
@@ -1302,27 +1068,6 @@ func lagunaSlidingQKNormRoPE(
     return (outputs[0], outputs[1])
 }
 
-/// `DARKBLOOM_FUSED_SLIDING_ATTN` (default on; set "0" to disable): decode
-/// fused attention for the thirty sliding-window layers in the steady
-/// wrapped regime. ONE dispatch replaces the four-stage dependency chain
-/// [QK-norm+RoPE kernel] -> [K cache slice-assign] -> [V cache
-/// slice-assign] -> [sdpa_vector]: it computes the new token's per-head
-/// Q/K RMSNorm + plain RoPE in threadgroup memory (textual replica of
-/// `laguna_sliding_qk_norm_rope_bf16_128_v1`), persists the new K/V row
-/// into the ring backing at the slot `RotatingKVCache.updateInPlace` would
-/// have written, and attends over the full 512-slot ring in slot order with
-/// the GQA-pair schedule of the shipped `sdpa_vector` pair path (textual
-/// replica: same key visit order per simdgroup, same online-softmax text
-/// including the alpha-skip rescale, same two-plane combine and reduction
-/// trees). Bit-exactness of the substitution: at slot `write_idx` every
-/// threadgroup substitutes the just-computed row from threadgroup memory —
-/// the values pass through the same `bfloat` storage rounding the separate
-/// kernels would have written to and re-read from the cache, so scores and
-/// output are bit-identical, and no threadgroup ever reads slot
-/// `write_idx` from device memory, making the concurrent slot write
-/// race-free by construction (its only consumers are future steps, ordered
-/// by command-buffer sequencing). Removes 3 dispatches + their encoder-wide
-/// barriers per sliding layer per decode step.
 let lagunaFusedSlidingAttentionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_ATTN"] != "0"
 
@@ -1361,10 +1106,6 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
         threadgroup bfloat tg_k[head_dim];
         threadgroup bfloat tg_v[head_dim];
 
-        // Phase 1: per-head RMSNorm + plain RoPE, textual replica of
-        // laguna_sliding_qk_norm_rope_bf16_128_v1 with the device row
-        // writes retargeted at threadgroup memory. simdgroups 0/1/2 own
-        // q0/q1/k; simdgroup 3 copies the raw V row (stored unmodified).
         if (sg < 3) {
             const device bfloat* input =
                 sg == 0 ? raw_queries + head0 * head_dim
@@ -1413,11 +1154,6 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Phase 2: one writer threadgroup per KV head persists the new row
-        // for future steps. No threadgroup reads slot widx from device this
-        // dispatch (all substitute the threadgroup copy), so cross-group
-        // ordering is irrelevant; the next step observes the write through
-        // command-buffer sequencing.
         if ((head0 % gqa) == 0 && sg == 0) {
             device bfloat* kc = (device bfloat*)k_cache +
                 (size_t)kv_head * (window * head_dim) +
@@ -1431,10 +1167,6 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
             }
         }
 
-        // Phase 3: GQA-pair attention over the ring in slot order, textual
-        // replica of the sdpa_vector pair path at fixed kL = 512 (steady
-        // ring: the 8-trip two-deep pipeline covers all 16 slots per
-        // simdgroup with no tail).
         threadgroup U outputs[4 * BN * BD];
         threadgroup U max_scores[2 * BN];
         threadgroup U sum_exp_scores[2 * BN];
@@ -1562,6 +1294,530 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
             pair_values += 2 * inner_v_stride;
         }
 
+        constexpr int pair_planes = 2;
+        constexpr int pair_plane_size = BN * BD;
+        if (lane == 0) {
+            max_scores[sg] = pair_max0;
+            max_scores[BN + sg] = pair_max1;
+            sum_exp_scores[sg] = pair_sum0;
+            sum_exp_scores[BN + sg] = pair_sum1;
+        }
+        for (int p = 0; p < pair_planes; ++p) {
+            outputs[p * pair_plane_size + lane * BD + sg] = pair_o0[p];
+            outputs[
+                (pair_planes + p) * pair_plane_size + lane * BD + sg] =
+                pair_o1[p];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        pair_max0 = max_scores[lane];
+        pair_max1 = max_scores[BN + lane];
+        U pair_global_max0 = simd_max(pair_max0);
+        U pair_global_max1 = simd_max(pair_max1);
+        U pair_global_factor0 = metal::fast::exp(pair_max0 - pair_global_max0);
+        U pair_global_factor1 = metal::fast::exp(pair_max1 - pair_global_max1);
+        pair_sum0 = simd_sum(sum_exp_scores[lane] * pair_global_factor0);
+        pair_sum1 = simd_sum(sum_exp_scores[BN + lane] * pair_global_factor1);
+
+        for (int p = 0; p < pair_planes; ++p) {
+            U acc0 = simd_sum(
+                outputs[p * pair_plane_size + sg * BD + lane] *
+                pair_global_factor0);
+            U acc1 = simd_sum(
+                outputs[
+                    (pair_planes + p) * pair_plane_size + sg * BD + lane] *
+                pair_global_factor1);
+            pair_o0[p] = pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
+            pair_o1[p] = pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int p = 0; p < pair_planes; ++p) {
+            outputs[p * pair_plane_size + lane * BD + sg] =
+                pair_o0[pair_planes + p];
+            outputs[
+                (pair_planes + p) * pair_plane_size + lane * BD + sg] =
+                pair_o1[pair_planes + p];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int p = 0; p < pair_planes; ++p) {
+            U acc0 = simd_sum(
+                outputs[p * pair_plane_size + sg * BD + lane] *
+                pair_global_factor0);
+            U acc1 = simd_sum(
+                outputs[
+                    (pair_planes + p) * pair_plane_size + sg * BD + lane] *
+                pair_global_factor1);
+            pair_o0[pair_planes + p] =
+                pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
+            pair_o1[pair_planes + p] =
+                pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
+        }
+
+        if (lane == 0) {
+            device bfloat* pair_out0 =
+                attended + head0 * head_dim + sg * v_per_thread;
+            device bfloat* pair_out1 =
+                attended + head1 * head_dim + sg * v_per_thread;
+            for (int p = 0; p < v_per_thread; ++p) {
+                pair_out0[p] = static_cast<bfloat>(pair_o0[p]);
+                pair_out1[p] = static_cast<bfloat>(pair_o1[p]);
+            }
+        }
+        """,
+    header: """
+        #define LAGUNA_RESCALE(dst, delta_expr)         \\
+          do {                                          \\
+            const float db_delta_ = (delta_expr);       \\
+            if (as_type<uint>(db_delta_) == 0u) {       \\
+              dst = float(1.0f);                        \\
+            } else {                                    \\
+              dst = metal::fast::exp(db_delta_);        \\
+            }                                           \\
+          } while (false)
+
+        #define T_LOAD_K(dst, substitute, ptr)                     \\
+          do {                                                     \\
+            if (substitute) {                                      \\
+              dst[0] = tg_k[lane * qk_per_thread + 0];             \\
+              dst[1] = tg_k[lane * qk_per_thread + 1];             \\
+              dst[2] = tg_k[lane * qk_per_thread + 2];             \\
+              dst[3] = tg_k[lane * qk_per_thread + 3];             \\
+            } else {                                               \\
+              const vec<bfloat, 4> v_ =                            \\
+                  *reinterpret_cast<const device vec<bfloat, 4>*>( \\
+                      ptr);                                        \\
+              dst[0] = v_.x;                                       \\
+              dst[1] = v_.y;                                       \\
+              dst[2] = v_.z;                                       \\
+              dst[3] = v_.w;                                       \\
+            }                                                      \\
+          } while (false)
+
+        #define T_LOAD_V(d0, d1, d2, d3, substitute, ptr)          \\
+          do {                                                     \\
+            if (substitute) {                                      \\
+              d0 = tg_v[lane * v_per_thread + 0];                  \\
+              d1 = tg_v[lane * v_per_thread + 1];                  \\
+              d2 = tg_v[lane * v_per_thread + 2];                  \\
+              d3 = tg_v[lane * v_per_thread + 3];                  \\
+            } else {                                               \\
+              const vec<bfloat, 4> v_ =                            \\
+                  *reinterpret_cast<const device vec<bfloat, 4>*>( \\
+                      ptr);                                        \\
+              d0 = v_.x;                                           \\
+              d1 = v_.y;                                           \\
+              d2 = v_.z;                                           \\
+              d3 = v_.w;                                           \\
+            }                                                      \\
+          } while (false)
+
+
+        """,
+    ensureRowContiguous: true
+)
+
+func lagunaSlidingFusedAttention(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    rawValues: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray,
+    cacheKeys: MLXArray,
+    cacheValues: MLXArray,
+    writeIdx: Int,
+    scale: MLXArray
+) -> MLXArray {
+    let heads = LagunaConstants.slidingAttentionHeads
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    let window = LagunaConstants.slidingWindow
+    precondition(rawQueries.dtype == .bfloat16)
+    precondition(rawKeys.dtype == .bfloat16)
+    precondition(rawValues.dtype == .bfloat16)
+    precondition(rawQueries.shape == [1, 1, heads * LagunaConstants.headDim])
+    precondition(rawKeys.shape == [1, 1, kvHeads * LagunaConstants.headDim])
+    precondition(rawValues.shape == [1, 1, kvHeads * LagunaConstants.headDim])
+    precondition(queryWeight.shape == [LagunaConstants.headDim])
+    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(angles.dtype == .float32)
+    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim])
+    precondition(cacheKeys.dtype == .bfloat16)
+    precondition(
+        cacheKeys.shape == [1, kvHeads, window, LagunaConstants.headDim])
+    precondition(
+        cacheValues.shape == [1, kvHeads, window, LagunaConstants.headDim])
+    precondition(writeIdx >= 0 && writeIdx < window)
+    precondition(scale.dtype == .float32 && scale.size == 1)
+
+    lagunaTrace("sliding fused attention")
+    let params = lagunaParamsAtlasEnabled
+        ? lagunaRingIdxAtlas[writeIdx] : MLXArray([UInt32(writeIdx)])
+    return lagunaSlidingFusedAttentionKernel(
+        [
+            rawQueries, rawKeys, rawValues,
+            queryWeight, keyWeight, angles,
+            cacheKeys, cacheValues, params, scale,
+        ],
+        grid: ((heads / 2) * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+private enum LagunaRingIdxAtlasStore {
+    nonisolated(unsafe) static let entries: [MLXArray] = {
+        let atlas = (0..<LagunaConstants.slidingWindow).map {
+            MLXArray([UInt32($0)])
+        }
+        for entry in atlas { eval(entry) }
+        return atlas
+    }()
+}
+
+private var lagunaRingIdxAtlas: [MLXArray] { LagunaRingIdxAtlasStore.entries }
+
+let lagunaParamsAtlasEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PARAMS_ATLAS"] != "0"
+
+let lagunaFusedFullAttentionEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_ATTN"] != "0"
+
+/// Fuses full-cache 512 -> 768 growth into M1's attention reads by default;
+/// exact `DARKBLOOM_FUSED_FULL_ATTN_FIRST_GROW=0` disables it.
+let lagunaFusedFullAttentionFirstGrowEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_FUSED_FULL_ATTN_FIRST_GROW"] != "0"
+
+/// Diagnostic-only coupling control for the historical second whole-model
+/// constructor decode. Full-attention fusion no longer implies this rewarm;
+/// set the flag explicitly only when reproducing the retired bundled arm.
+let lagunaFusedFullAttentionWholeModelWarmupEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_FUSED_FULL_ATTN_WHOLE_MODEL_WARMUP"] == "1"
+
+/// Compile only the full-attention custom kernel during untimed construction,
+/// using tiny throwaway arrays. Unlike the retired whole-model rewarm, this
+/// does not execute another Laguna layer or retain request/cache state.
+let lagunaFusedFullAttentionKernelWarmupEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_FUSED_FULL_ATTN_KERNEL_WARMUP"] != "0"
+
+private let lagunaFullFusedAttentionFirstGrowKernel = MLXFast.metalKernel(
+    name: "laguna_full_fused_attn_first_grow_v1",
+    inputNames: [
+        "raw_queries", "raw_keys", "raw_values",
+        "query_weight", "key_weight", "angles",
+        "seed_k_cache", "seed_v_cache", "params", "scale_arr",
+    ],
+    outputNames: ["attended", "grown_k_cache", "grown_v_cache"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint gqa = 6;
+        constexpr int BN = 32;
+        constexpr int BD = 32;
+        constexpr int qk_per_thread = 4;
+        constexpr int v_per_thread = 4;
+        constexpr uint rotary_pairs = 32;
+        constexpr float yarn_mscale = 1.3465735912322998f;
+
+        typedef float U;
+
+        uint pair_tg = threadgroup_position_in_grid.x;
+        uint head0 = pair_tg * 2;
+        uint head1 = head0 + 1;
+        uint kv_head = head0 / gqa;
+        uint sg = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint widx = params[0];
+        int N = int(params[1]);
+        uint target_capacity = params[2];
+        uint seed_k_head_stride = params[3];
+        uint seed_k_row_stride = params[4];
+        uint seed_v_head_stride = params[5];
+        uint seed_v_row_stride = params[6];
+        const bool owns_seed_copy = (head0 % gqa) == 0;
+        float scale = scale_arr[0];
+
+        threadgroup bfloat tg_q0[head_dim];
+        threadgroup bfloat tg_q1[head_dim];
+        threadgroup bfloat tg_k[head_dim];
+        threadgroup bfloat tg_v[head_dim];
+
+        // Phase 1: per-head RMSNorm + partial YaRN RoPE, textual replica of
+        // laguna_full_qk_norm_yarn_bf16_128_v4 with the device row writes
+        // retargeted at threadgroup memory.
+        if (sg < 3) {
+            const device bfloat* input =
+                sg == 0 ? raw_queries + head0 * head_dim
+                : sg == 1 ? raw_queries + head1 * head_dim
+                          : raw_keys + kv_head * head_dim;
+            const device bfloat* weight =
+                sg == 2 ? key_weight : query_weight;
+            threadgroup bfloat* outrow =
+                sg == 0 ? tg_q0 : sg == 1 ? tg_q1 : tg_k;
+
+            uint base = lane * 4;
+            thread bfloat normalized[4];
+            float sum = 0.0f;
+            for (uint i = 0; i < 4; ++i) {
+                float value = float(input[base + i]);
+                sum += value * value;
+            }
+            sum = simd_sum(sum);
+            float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+            for (uint i = 0; i < 4; ++i) {
+                normalized[i] =
+                    weight[base + i] *
+                    bfloat(float(input[base + i]) * inverse_rms);
+            }
+            thread float paired[4];
+            for (uint i = 0; i < 4; ++i) {
+                paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
+            }
+            if (lane < 8) {
+                bfloat rounded_mscale = bfloat(yarn_mscale);
+                for (uint i = 0; i < 4; ++i) {
+                    uint pair = base + i;
+                    float first =
+                        float(bfloat(normalized[i] * rounded_mscale));
+                    float second =
+                        float(bfloat(bfloat(paired[i]) * rounded_mscale));
+                    float cosine = angles[pair];
+                    float sine = angles[pair + rotary_pairs];
+                    outrow[pair] = bfloat(first * cosine - second * sine);
+                    outrow[pair + rotary_pairs] =
+                        bfloat(first * sine + second * cosine);
+                }
+            } else if (lane >= 16) {
+                for (uint i = 0; i < 4; ++i) {
+                    outrow[base + i] = normalized[i];
+                }
+            }
+        } else if (sg == 3) {
+            const device bfloat* vin = raw_values + kv_head * head_dim;
+            for (uint i = lane; i < head_dim; i += 32) {
+                tg_v[i] = vin[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Phase 2: the one copy-owning threadgroup per KV head appends the
+        // current row to the fresh contiguous backing. Seed rows are copied
+        // below from the exact vectors already loaded for attention.
+        if (owns_seed_copy) {
+            device bfloat* head_k = grown_k_cache +
+                (size_t)kv_head * (target_capacity * head_dim);
+            device bfloat* head_v = grown_v_cache +
+                (size_t)kv_head * (target_capacity * head_dim);
+            if (sg == 0) {
+                device bfloat* kc = head_k + (size_t)widx * head_dim;
+                device bfloat* vc = head_v + (size_t)widx * head_dim;
+                for (uint i = lane; i < head_dim; i += 32) {
+                    kc[i] = tg_k[i];
+                    vc[i] = tg_v[i];
+                }
+            }
+            // Match the stock concat's zeroed spare rows without a separate
+            // fill dispatch. These writes never read or revisit seed bytes.
+            uint linear_tid = sg * 32 + lane;
+            uint first_unused = widx + 1;
+            uint unused_elements =
+                (target_capacity - first_unused) * head_dim;
+            for (uint flat = linear_tid; flat < unused_elements; flat += 1024) {
+                size_t destination =
+                    (size_t)first_unused * head_dim + flat;
+                head_k[destination] = bfloat(0.0f);
+                head_v[destination] = bfloat(0.0f);
+            }
+        }
+
+        // Phase 3: GQA-pair attention over the first N rows in slot order,
+        // textual replica of the sdpa_vector pair path (runtime N, tail
+        // row included).
+        threadgroup U outputs[4 * BN * BD];
+        threadgroup U max_scores[2 * BN];
+        threadgroup U sum_exp_scores[2 * BN];
+
+        const device bfloat* pair_keys = seed_k_cache +
+            (size_t)kv_head * seed_k_head_stride +
+            (size_t)sg * seed_k_row_stride + lane * qk_per_thread;
+        const device bfloat* pair_values = seed_v_cache +
+            (size_t)kv_head * seed_v_head_stride +
+            (size_t)sg * seed_v_row_stride + lane * v_per_thread;
+        device bfloat* pair_grown_keys = grown_k_cache +
+            (size_t)kv_head * (target_capacity * head_dim) +
+            (size_t)sg * head_dim + lane * qk_per_thread;
+        device bfloat* pair_grown_values = grown_v_cache +
+            (size_t)kv_head * (target_capacity * head_dim) +
+            (size_t)sg * head_dim + lane * v_per_thread;
+        const int inner_k_stride = BN * int(seed_k_row_stride);
+        const int inner_v_stride = BN * int(seed_v_row_stride);
+        const int inner_grown_stride = BN * int(head_dim);
+
+        thread U pair_q0[qk_per_thread];
+        thread U pair_q1[qk_per_thread];
+        thread U pair_k[qk_per_thread];
+        thread U pair_o0[v_per_thread];
+        thread U pair_o1[v_per_thread];
+
+        for (int j = 0; j < qk_per_thread; ++j) {
+            pair_q0[j] =
+                static_cast<U>(scale) * tg_q0[lane * qk_per_thread + j];
+            pair_q1[j] =
+                static_cast<U>(scale) * tg_q1[lane * qk_per_thread + j];
+        }
+        for (int j = 0; j < v_per_thread; ++j) {
+            pair_o0[j] = 0;
+            pair_o1[j] = 0;
+        }
+
+        U pair_max0 = metal::numeric_limits<U>::lowest();
+        U pair_max1 = metal::numeric_limits<U>::lowest();
+        U pair_sum0 = 0;
+        U pair_sum1 = 0;
+
+        int i = sg;
+        for (; i + BN < N; i += 2 * BN) {
+            const device bfloat* pipe_keys_b = pair_keys + inner_k_stride;
+            const device bfloat* pipe_values_b = pair_values + inner_v_stride;
+            device bfloat* grown_keys_b = pair_grown_keys + inner_grown_stride;
+            device bfloat* grown_values_b = pair_grown_values + inner_grown_stride;
+            const bool sub_a = uint(i) == widx;
+            const bool sub_b = uint(i + BN) == widx;
+            U pipe_ka[4];
+            U pipe_kb[4];
+            T_LOAD_K(pipe_ka, sub_a, pair_keys, pair_grown_keys);
+            T_LOAD_K(pipe_kb, sub_b, pipe_keys_b, grown_keys_b);
+            bfloat pipe_va0, pipe_va1, pipe_va2, pipe_va3;
+            bfloat pipe_vb0, pipe_vb1, pipe_vb2, pipe_vb3;
+            T_LOAD_V(pipe_va0, pipe_va1, pipe_va2, pipe_va3, sub_a,
+                pair_values, pair_grown_values);
+            T_LOAD_V(pipe_vb0, pipe_vb1, pipe_vb2, pipe_vb3, sub_b,
+                pipe_values_b, grown_values_b);
+
+            U pair_score0 = 0;
+            U pair_score1 = 0;
+            pair_score0 += pair_q0[0] * pipe_ka[0];
+            pair_score1 += pair_q1[0] * pipe_ka[0];
+            pair_score0 += pair_q0[1] * pipe_ka[1];
+            pair_score1 += pair_q1[1] * pipe_ka[1];
+            pair_score0 += pair_q0[2] * pipe_ka[2];
+            pair_score1 += pair_q1[2] * pipe_ka[2];
+            pair_score0 += pair_q0[3] * pipe_ka[3];
+            pair_score1 += pair_q1[3] * pipe_ka[3];
+            pair_score0 = simd_sum(pair_score0);
+            pair_score1 = simd_sum(pair_score1);
+
+            U pair_new_max0 = metal::max(pair_max0, pair_score0);
+            U pair_new_max1 = metal::max(pair_max1, pair_score1);
+            U pair_factor0;
+            U pair_factor1;
+            LAGUNA_RESCALE(pair_factor0, pair_max0 - pair_new_max0);
+            LAGUNA_RESCALE(pair_factor1, pair_max1 - pair_new_max1);
+            U pair_exp0 = metal::fast::exp(pair_score0 - pair_new_max0);
+            U pair_exp1 = metal::fast::exp(pair_score1 - pair_new_max1);
+
+            pair_max0 = pair_new_max0;
+            pair_max1 = pair_new_max1;
+            pair_sum0 = pair_sum0 * pair_factor0 + pair_exp0;
+            pair_sum1 = pair_sum1 * pair_factor1 + pair_exp1;
+
+            pair_o0[0] = pair_o0[0] * pair_factor0 + pair_exp0 * pipe_va0;
+            pair_o1[0] = pair_o1[0] * pair_factor1 + pair_exp1 * pipe_va0;
+            pair_o0[1] = pair_o0[1] * pair_factor0 + pair_exp0 * pipe_va1;
+            pair_o1[1] = pair_o1[1] * pair_factor1 + pair_exp1 * pipe_va1;
+            pair_o0[2] = pair_o0[2] * pair_factor0 + pair_exp0 * pipe_va2;
+            pair_o1[2] = pair_o1[2] * pair_factor1 + pair_exp1 * pipe_va2;
+            pair_o0[3] = pair_o0[3] * pair_factor0 + pair_exp0 * pipe_va3;
+            pair_o1[3] = pair_o1[3] * pair_factor1 + pair_exp1 * pipe_va3;
+
+            U pipeb_score0 = 0;
+            U pipeb_score1 = 0;
+            pipeb_score0 += pair_q0[0] * pipe_kb[0];
+            pipeb_score1 += pair_q1[0] * pipe_kb[0];
+            pipeb_score0 += pair_q0[1] * pipe_kb[1];
+            pipeb_score1 += pair_q1[1] * pipe_kb[1];
+            pipeb_score0 += pair_q0[2] * pipe_kb[2];
+            pipeb_score1 += pair_q1[2] * pipe_kb[2];
+            pipeb_score0 += pair_q0[3] * pipe_kb[3];
+            pipeb_score1 += pair_q1[3] * pipe_kb[3];
+            pipeb_score0 = simd_sum(pipeb_score0);
+            pipeb_score1 = simd_sum(pipeb_score1);
+
+            U pipeb_new_max0 = metal::max(pair_max0, pipeb_score0);
+            U pipeb_new_max1 = metal::max(pair_max1, pipeb_score1);
+            U pipeb_factor0;
+            U pipeb_factor1;
+            LAGUNA_RESCALE(pipeb_factor0, pair_max0 - pipeb_new_max0);
+            LAGUNA_RESCALE(pipeb_factor1, pair_max1 - pipeb_new_max1);
+            U pipeb_exp0 = metal::fast::exp(pipeb_score0 - pipeb_new_max0);
+            U pipeb_exp1 = metal::fast::exp(pipeb_score1 - pipeb_new_max1);
+
+            pair_max0 = pipeb_new_max0;
+            pair_max1 = pipeb_new_max1;
+            pair_sum0 = pair_sum0 * pipeb_factor0 + pipeb_exp0;
+            pair_sum1 = pair_sum1 * pipeb_factor1 + pipeb_exp1;
+
+            pair_o0[0] = pair_o0[0] * pipeb_factor0 + pipeb_exp0 * pipe_vb0;
+            pair_o1[0] = pair_o1[0] * pipeb_factor1 + pipeb_exp1 * pipe_vb0;
+            pair_o0[1] = pair_o0[1] * pipeb_factor0 + pipeb_exp0 * pipe_vb1;
+            pair_o1[1] = pair_o1[1] * pipeb_factor1 + pipeb_exp1 * pipe_vb1;
+            pair_o0[2] = pair_o0[2] * pipeb_factor0 + pipeb_exp0 * pipe_vb2;
+            pair_o1[2] = pair_o1[2] * pipeb_factor1 + pipeb_exp1 * pipe_vb2;
+            pair_o0[3] = pair_o0[3] * pipeb_factor0 + pipeb_exp0 * pipe_vb3;
+            pair_o1[3] = pair_o1[3] * pipeb_factor1 + pipeb_exp1 * pipe_vb3;
+
+            pair_keys += 2 * inner_k_stride;
+            pair_values += 2 * inner_v_stride;
+            pair_grown_keys += 2 * inner_grown_stride;
+            pair_grown_values += 2 * inner_grown_stride;
+        }
+        if (i < N) {
+            const bool sub_t = uint(i) == widx;
+            T_LOAD_K(pair_k, sub_t, pair_keys, pair_grown_keys);
+            bfloat pipe_va0, pipe_va1, pipe_va2, pipe_va3;
+            T_LOAD_V(pipe_va0, pipe_va1, pipe_va2, pipe_va3, sub_t,
+                pair_values, pair_grown_values);
+
+            U pair_score0 = 0;
+            U pair_score1 = 0;
+            pair_score0 += pair_q0[0] * pair_k[0];
+            pair_score1 += pair_q1[0] * pair_k[0];
+            pair_score0 += pair_q0[1] * pair_k[1];
+            pair_score1 += pair_q1[1] * pair_k[1];
+            pair_score0 += pair_q0[2] * pair_k[2];
+            pair_score1 += pair_q1[2] * pair_k[2];
+            pair_score0 += pair_q0[3] * pair_k[3];
+            pair_score1 += pair_q1[3] * pair_k[3];
+            pair_score0 = simd_sum(pair_score0);
+            pair_score1 = simd_sum(pair_score1);
+
+            U pair_new_max0 = metal::max(pair_max0, pair_score0);
+            U pair_new_max1 = metal::max(pair_max1, pair_score1);
+            U pair_factor0;
+            U pair_factor1;
+            LAGUNA_RESCALE(pair_factor0, pair_max0 - pair_new_max0);
+            LAGUNA_RESCALE(pair_factor1, pair_max1 - pair_new_max1);
+            U pair_exp0 = metal::fast::exp(pair_score0 - pair_new_max0);
+            U pair_exp1 = metal::fast::exp(pair_score1 - pair_new_max1);
+
+            pair_max0 = pair_new_max0;
+            pair_max1 = pair_new_max1;
+            pair_sum0 = pair_sum0 * pair_factor0 + pair_exp0;
+            pair_sum1 = pair_sum1 * pair_factor1 + pair_exp1;
+
+            pair_o0[0] = pair_o0[0] * pair_factor0 + pair_exp0 * pipe_va0;
+            pair_o1[0] = pair_o1[0] * pair_factor1 + pair_exp1 * pipe_va0;
+            pair_o0[1] = pair_o0[1] * pair_factor0 + pair_exp0 * pipe_va1;
+            pair_o1[1] = pair_o1[1] * pair_factor1 + pair_exp1 * pipe_va1;
+            pair_o0[2] = pair_o0[2] * pair_factor0 + pair_exp0 * pipe_va2;
+            pair_o1[2] = pair_o1[2] * pair_factor1 + pair_exp1 * pipe_va2;
+            pair_o0[3] = pair_o0[3] * pair_factor0 + pair_exp0 * pipe_va3;
+            pair_o1[3] = pair_o1[3] * pair_factor1 + pair_exp1 * pipe_va3;
+        }
+
         // Combine: promoted two-plane exchange, textual replica of the
         // sdpa_vector pair path epilogue.
         constexpr int pair_planes = 2;
@@ -1636,8 +1892,6 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
         }
         """,
     header: """
-        // Alpha-skip rescale, replica of sdpa_vector.h's shipped
-        // DARKBLOOM_RESCALE_FACTOR (DARKBLOOM_ALPHASKIP == 1 arm).
         #define LAGUNA_RESCALE(dst, delta_expr)         \\
           do {                                          \\
             const float db_delta_ = (delta_expr);       \\
@@ -1648,10 +1902,7 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
             }                                           \\
           } while (false)
 
-        // K loads: 8-byte vec loads from the ring, or the threadgroup
-        // substitute for the just-written slot. Same elements, same order,
-        // same bfloat -> float conversion points as the scalar form.
-        #define T_LOAD_K(dst, substitute, ptr)                     \\
+        #define T_LOAD_K(dst, substitute, ptr, grown_k_ptr)        \\
           do {                                                     \\
             if (substitute) {                                      \\
               dst[0] = tg_k[lane * qk_per_thread + 0];             \\
@@ -1659,17 +1910,20 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
               dst[2] = tg_k[lane * qk_per_thread + 2];             \\
               dst[3] = tg_k[lane * qk_per_thread + 3];             \\
             } else {                                               \\
-              const vec<bfloat, 4> v_ =                            \\
+              const vec<bfloat, 4> seed_k_vec =                    \\
                   *reinterpret_cast<const device vec<bfloat, 4>*>( \\
                       ptr);                                        \\
-              dst[0] = v_.x;                                       \\
-              dst[1] = v_.y;                                       \\
-              dst[2] = v_.z;                                       \\
-              dst[3] = v_.w;                                       \\
+              if (owns_seed_copy) {                                \\
+                *reinterpret_cast<device vec<bfloat, 4>*>(grown_k_ptr) = seed_k_vec; \\
+              }                                                    \\
+              dst[0] = seed_k_vec.x;                               \\
+              dst[1] = seed_k_vec.y;                               \\
+              dst[2] = seed_k_vec.z;                               \\
+              dst[3] = seed_k_vec.w;                               \\
             }                                                      \\
           } while (false)
 
-        #define T_LOAD_V(d0, d1, d2, d3, substitute, ptr)          \\
+        #define T_LOAD_V(d0, d1, d2, d3, substitute, ptr, grown_v_ptr) \\
           do {                                                     \\
             if (substitute) {                                      \\
               d0 = tg_v[lane * v_per_thread + 0];                  \\
@@ -1677,13 +1931,16 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
               d2 = tg_v[lane * v_per_thread + 2];                  \\
               d3 = tg_v[lane * v_per_thread + 3];                  \\
             } else {                                               \\
-              const vec<bfloat, 4> v_ =                            \\
+              const vec<bfloat, 4> seed_v_vec =                    \\
                   *reinterpret_cast<const device vec<bfloat, 4>*>( \\
                       ptr);                                        \\
-              d0 = v_.x;                                           \\
-              d1 = v_.y;                                           \\
-              d2 = v_.z;                                           \\
-              d3 = v_.w;                                           \\
+              if (owns_seed_copy) {                                \\
+                *reinterpret_cast<device vec<bfloat, 4>*>(grown_v_ptr) = seed_v_vec; \\
+              }                                                    \\
+              d0 = seed_v_vec.x;                                   \\
+              d1 = seed_v_vec.y;                                   \\
+              d2 = seed_v_vec.z;                                   \\
+              d3 = seed_v_vec.w;                                   \\
             }                                                      \\
           } while (false)
 
@@ -1691,110 +1948,76 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
         // [[kernel]] signature directly after this header string)
 
         """,
-    ensureRowContiguous: true
+    ensureRowContiguous: false
 )
 
-/// Fused decode attention for a sliding layer in the steady ring regime.
-/// Returns `[1, heads, 1, headDim]` attended output; the caller advances the
-/// cache clock via `RotatingKVCache.fusedRingAdvance()`.
-func lagunaSlidingFusedAttention(
+/// One-time full-attention M1 dispatch that fills a fresh contiguous cache
+/// while consuming the retained 512-row prompt directly. The attended output
+/// preserves the stock fused kernel's logical row and reduction order; the
+/// other two outputs become the cache backing for every later stock append.
+func lagunaFullFusedAttentionFirstGrow(
     rawQueries: MLXArray,
     rawKeys: MLXArray,
     rawValues: MLXArray,
     queryWeight: MLXArray,
     keyWeight: MLXArray,
     angles: MLXArray,
-    cacheKeys: MLXArray,
-    cacheValues: MLXArray,
+    seedCacheKeys: MLXArray,
+    seedCacheValues: MLXArray,
+    seedKeyStrides: [Int],
+    seedValueStrides: [Int],
     writeIdx: Int,
+    targetCapacity: Int,
     scale: MLXArray
-) -> MLXArray {
-    let heads = LagunaConstants.slidingAttentionHeads
+) -> (attended: MLXArray, keys: MLXArray, values: MLXArray) {
+    let heads = LagunaConstants.fullAttentionHeads
     let kvHeads = LagunaConstants.numKeyValueHeads
-    let window = LagunaConstants.slidingWindow
+    precondition(writeIdx == 512 && targetCapacity == 768)
     precondition(rawQueries.dtype == .bfloat16)
     precondition(rawKeys.dtype == .bfloat16)
     precondition(rawValues.dtype == .bfloat16)
     precondition(rawQueries.shape == [1, 1, heads * LagunaConstants.headDim])
     precondition(rawKeys.shape == [1, 1, kvHeads * LagunaConstants.headDim])
     precondition(rawValues.shape == [1, 1, kvHeads * LagunaConstants.headDim])
+    precondition(queryWeight.dtype == .bfloat16)
+    precondition(keyWeight.dtype == .bfloat16)
     precondition(queryWeight.shape == [LagunaConstants.headDim])
     precondition(keyWeight.shape == [LagunaConstants.headDim])
     precondition(angles.dtype == .float32)
-    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim])
-    precondition(cacheKeys.dtype == .bfloat16)
+    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim / 2])
+    precondition(seedCacheKeys.dtype == .bfloat16)
+    precondition(seedCacheValues.dtype == .bfloat16)
     precondition(
-        cacheKeys.shape == [1, kvHeads, window, LagunaConstants.headDim])
+        seedCacheKeys.shape == [1, kvHeads, writeIdx, LagunaConstants.headDim])
     precondition(
-        cacheValues.shape == [1, kvHeads, window, LagunaConstants.headDim])
-    precondition(writeIdx >= 0 && writeIdx < window)
+        seedCacheValues.shape == [1, kvHeads, writeIdx, LagunaConstants.headDim])
+    precondition(seedKeyStrides.count == 4 && seedKeyStrides[3] == 1)
+    precondition(seedValueStrides.count == 4 && seedValueStrides[3] == 1)
     precondition(scale.dtype == .float32 && scale.size == 1)
 
-    lagunaTrace("sliding fused attention")
-    let params = lagunaParamsAtlasEnabled
-        ? lagunaRingIdxAtlas[writeIdx] : MLXArray([UInt32(writeIdx)])
-    return lagunaSlidingFusedAttentionKernel(
+    lagunaTrace("full fused attention first grow")
+    let params = MLXArray([
+        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(targetCapacity),
+        UInt32(seedKeyStrides[1]), UInt32(seedKeyStrides[2]),
+        UInt32(seedValueStrides[1]), UInt32(seedValueStrides[2]),
+    ])
+    let outputs = lagunaFullFusedAttentionFirstGrowKernel(
         [
             rawQueries, rawKeys, rawValues,
             queryWeight, keyWeight, angles,
-            cacheKeys, cacheValues, params, scale,
+            seedCacheKeys, seedCacheValues, params, scale,
         ],
         grid: ((heads / 2) * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
-        outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
-        outputDTypes: [.bfloat16]
-    )[0]
+        outputShapes: [
+            [1, heads, 1, LagunaConstants.headDim],
+            [1, kvHeads, targetCapacity, LagunaConstants.headDim],
+            [1, kvHeads, targetCapacity, LagunaConstants.headDim],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1], outputs[2])
 }
-
-/// Pre-materialized 4-byte uniform buffers for every possible sliding ring
-/// write index (2 KB total, built on first touch during untimed warmup):
-/// replaces a fresh 1-element MLXArray allocation per sliding-attention call
-/// (30/step). Input-independent: all 512 values built unconditionally; the
-/// lookup indexes by the cache's ring position (request-local state), the
-/// same contract as the RoPE angle atlases. Worker decode is
-/// single-threaded, so the write-once unsafe opt-out is sound.
-private enum LagunaRingIdxAtlasStore {
-    nonisolated(unsafe) static let entries: [MLXArray] = {
-        let atlas = (0..<LagunaConstants.slidingWindow).map {
-            MLXArray([UInt32($0)])
-        }
-        for entry in atlas { eval(entry) }
-        return atlas
-    }()
-}
-
-private var lagunaRingIdxAtlas: [MLXArray] { LagunaRingIdxAtlasStore.entries }
-
-/// `DARKBLOOM_PARAMS_ATLAS=0` restores the per-call fresh 1-element array
-/// (ablation control for the atlas above; identical bytes either way).
-let lagunaParamsAtlasEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_PARAMS_ATLAS"] != "0"
-
-/// `DARKBLOOM_FUSED_FULL_ATTN` (default on; set "0" to disable): decode
-/// fused attention for the ten full-attention layers once the cache backing
-/// has spare capacity (from the second decode step on; the first step's
-/// stock growth concat is kept). Same design as the sliding twin above —
-/// ONE dispatch replaces [QK-norm+YaRN kernel] -> [K slice-assign] ->
-/// [V slice-assign] -> [sdpa_vector] — with the full-attention phase-1 text
-/// (textual replica of `laguna_full_qk_norm_yarn_bf16_128_v4`: 64-dim
-/// partial rotary, folded mscale roundings, passthrough tail) and the
-/// pair path's runtime-length loop + single-row tail at gqa_factor 6.
-let lagunaFusedFullAttentionEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_ATTN"] != "0"
-
-/// Diagnostic-only coupling control for the historical second whole-model
-/// constructor decode. Full-attention fusion no longer implies this rewarm;
-/// set the flag explicitly only when reproducing the retired bundled arm.
-let lagunaFusedFullAttentionWholeModelWarmupEnabled =
-    ProcessInfo.processInfo.environment[
-        "DARKBLOOM_FUSED_FULL_ATTN_WHOLE_MODEL_WARMUP"] == "1"
-
-/// Compile only the full-attention custom kernel during untimed construction,
-/// using tiny throwaway arrays. Unlike the retired whole-model rewarm, this
-/// does not execute another Laguna layer or retain request/cache state.
-let lagunaFusedFullAttentionKernelWarmupEnabled =
-    ProcessInfo.processInfo.environment[
-        "DARKBLOOM_FUSED_FULL_ATTN_KERNEL_WARMUP"] != "0"
 
 private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
     name: "laguna_full_fused_attn_grow_v1",
@@ -5649,6 +5872,45 @@ final class LagunaRuntimeAttention: Module {
                 scale: _fusedAttnScale
             )
             rotating.fusedRingAdvance()
+            qkNormRoPEFused = true
+        } else if lagunaFusedFullAttentionEnabled,
+            lagunaFusedFullAttentionFirstGrowEnabled,
+            useFusedFullQKNormYaRN,
+            let fusedAngles = qkRoPEAngles,
+            values.dtype == .bfloat16,
+            values.shape == [1, 1, nKVHeads * headDim],
+            let simple = cache as? KVCacheSimple,
+            let grow = simple.fusedFirstGrowPrepare(),
+            grow.keys.dtype == .bfloat16,
+            grow.values.dtype == .bfloat16,
+            grow.keys.shape == [1, nKVHeads, 512, headDim],
+            grow.values.shape == [1, nKVHeads, 512, headDim]
+        {
+            // M1 reads the retained strided prompt directly for attention.
+            // The copy-owning GQA group writes each loaded seed vector once
+            // into fresh contiguous outputs and appends the supplied row;
+            // later decode calls return to the unchanged stock fused path.
+            let grown = lagunaFullFusedAttentionFirstGrow(
+                rawQueries: queries,
+                rawKeys: keys,
+                rawValues: values,
+                queryWeight: qNorm.weight,
+                keyWeight: kNorm.weight,
+                angles: fusedAngles,
+                seedCacheKeys: grow.keys,
+                seedCacheValues: grow.values,
+                seedKeyStrides: grow.layout.seedKeyStrides,
+                seedValueStrides: grow.layout.seedValueStrides,
+                writeIdx: grow.layout.writeIdx,
+                targetCapacity: grow.layout.targetCapacity,
+                scale: _fusedAttnScale
+            )
+            fusedAttended = grown.attended
+            simple.fusedFirstGrowCommit(
+                keys: grown.keys,
+                values: grown.values,
+                expectedWriteIdx: grow.layout.writeIdx
+            )
             qkNormRoPEFused = true
         } else if lagunaFusedFullAttentionEnabled,
             useFusedFullQKNormYaRN,
@@ -10733,7 +10995,8 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     public func newCache(parameters _: GenerateParameters?) -> [KVCache] {
         (0..<configuration.numHiddenLayers).map { layerIndex in
             if configuration.layerTypes[layerIndex] == .full {
-                StandardKVCache()
+                StandardKVCache(
+                    fusedFirstGrowEnabled: lagunaFusedFullAttentionFirstGrowEnabled)
             } else {
                 RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
             }
