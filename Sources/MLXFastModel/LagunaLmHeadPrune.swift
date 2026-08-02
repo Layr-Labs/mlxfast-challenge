@@ -162,6 +162,16 @@ private let lagunaLmHeadCoarseV5Enabled =
 private let lagunaLmHeadV5StatsEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_V5_STATS"] == "1"
 
+/// Row-selective exact GEMV on the v5 BF16-delta arm (default ON).
+/// Inside each four-row simdgroup block, only rows whose candidate bit is set
+/// load `lm_head` and run the stock ordered FMA chain; inactive rows write
+/// `bfloat(coarse[r])` without touching the weight row. Active-row arithmetic,
+/// ownership, launch geometry, and certificate predicate are unchanged.
+/// `DARKBLOOM_LMHEAD_ROW_SELECTIVE_EXACT=0` restores the unconditional four-row
+/// exact kernel on the same v5 path.
+private let lagunaLmHeadRowSelectiveExactEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_ROW_SELECTIVE_EXACT"] != "0"
+
 /// Tight v5 assembly threshold: use the BF16 predecessor of the exact coarse-
 /// argmax row instead of the retained `e_r - |e_r|/64` two-ulp band. This is
 /// the highest representable threshold that still forces every skipped
@@ -1761,6 +1771,100 @@ private let lagunaLmHeadInlineExactDeltaBF16Kernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+
+/// v5-only twin of `lagunaLmHeadInlineExactDeltaBF16Kernel` that skips the
+/// stock GEMV body for rows whose candidate bit is clear. Same inputs, grid,
+/// ownership, and active-row arithmetic; inactive rows never address `lm_head`.
+private let lagunaLmHeadInlineExactDeltaBF16RowSelectiveKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_inline_mask_block_delta_bf16_row_selective_v1",
+    inputNames: ["coarse", "delta", "thr", "lm_head", "x"],
+    outputNames: ["assembled"],
+    source: """
+        constexpr uint VOCAB = 100352;
+        constexpr uint K = 2048;
+
+        uint tgid = threadgroup_position_in_grid.x;
+        uint sgid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        uint base = tgid * 32 + sgid * 4;
+
+        uint candidate_mask = 0;
+        if (lane == 0) {
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                uint r = base + tm;
+                if (r < VOCAB && coarse[r] + float(delta[r]) >= thr[0]) {
+                    candidate_mask |= 1u << tm;
+                }
+            }
+        }
+        candidate_mask = simd_broadcast(candidate_mask, 0);
+
+        if (candidate_mask == 0) {
+            if (lane < 4 && base + lane < VOCAB) {
+                assembled[base + lane] = bfloat(coarse[base + lane]);
+            }
+            return;
+        }
+
+        // --- stock gemv_al replica begin (row-selective) ---
+        thread float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread bfloat inter[4];
+        thread float v_coeff[4];
+        uint bn = lane * 4;
+        for (uint i = 0; i < 16; ++i) {
+            vec<bfloat, 4> xv =
+                *((const device vec<bfloat, 4>*)(x + bn));
+            v_coeff[0] = float(xv.x);
+            v_coeff[1] = float(xv.y);
+            v_coeff[2] = float(xv.z);
+            v_coeff[3] = float(xv.w);
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                if ((candidate_mask & (1u << tm)) == 0u) {
+                    continue;
+                }
+                const device bfloat* mrow = lm_head + size_t(base + tm) * K;
+                vec<bfloat, 4> mv =
+                    *((const device vec<bfloat, 4>*)(mrow + bn));
+                inter[0] = mv.x;
+                inter[1] = mv.y;
+                inter[2] = mv.z;
+                inter[3] = mv.w;
+                result[tm] += inter[0] * v_coeff[0];
+                result[tm] += inter[1] * v_coeff[1];
+                result[tm] += inter[2] * v_coeff[2];
+                result[tm] += inter[3] * v_coeff[3];
+            }
+            bn += 128;
+        }
+        #pragma unroll
+        for (uint tm = 0; tm < 4; ++tm) {
+            if ((candidate_mask & (1u << tm)) == 0u) {
+                continue;
+            }
+            #pragma unroll
+            for (ushort sn = 16; sn >= 1; sn >>= 1) {
+                result[tm] += simd_shuffle_down(result[tm], sn);
+            }
+        }
+        // --- stock gemv_al replica end ---
+        if (lane == 0) {
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                uint r = base + tm;
+                if (r < VOCAB) {
+                    assembled[r] = (candidate_mask & (1u << tm)) != 0
+                        ? bfloat(result[tm])
+                        : bfloat(coarse[r]);
+                }
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 /// Retained init-time MXFP8 coarse copy of lm_head plus the pruned final-row
 /// forward. Built once (untimed init) by
 /// `LagunaRuntimeModel.prepareFusedRuntimeWeights` when
@@ -1948,7 +2052,11 @@ final class LagunaLmHeadPruner {
                 FileHandle.standardError.write(
                     Data("lmhead-v5 candidates: \(count)\n".utf8))
             }
-            let assembled5 = lagunaLmHeadInlineExactDeltaBF16Kernel(
+            let exact5 =
+                lagunaLmHeadRowSelectiveExactEnabled
+                ? lagunaLmHeadInlineExactDeltaBF16RowSelectiveKernel
+                : lagunaLmHeadInlineExactDeltaBF16Kernel
+            let assembled5 = exact5(
                 [coarse5, delta5, thr5, lmHeadWeight, x],
                 grid: (vocab / 32 * 256, 1, 1),
                 threadGroup: (256, 1, 1),
