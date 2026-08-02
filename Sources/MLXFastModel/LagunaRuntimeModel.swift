@@ -1828,7 +1828,8 @@ func lagunaSlidingFusedAttention(
     precondition(scale.dtype == .float32 && scale.size == 1)
 
     lagunaTrace("sliding fused attention")
-    let params = MLXArray([UInt32(writeIdx)])
+    let params = lagunaParamsAtlasEnabled
+        ? lagunaRingIdxAtlas[writeIdx] : MLXArray([UInt32(writeIdx)])
     return lagunaSlidingFusedAttentionKernel(
         [
             rawQueries, rawKeys, rawValues,
@@ -1841,6 +1842,36 @@ func lagunaSlidingFusedAttention(
         outputDTypes: [.bfloat16]
     )[0]
 }
+
+/// Pre-materialized 4-byte uniform buffers for every possible sliding ring
+/// write index. The sliding fused-attention wrapper runs 30 times per decode
+/// step, and building a fresh 1-element `MLXArray` per call costs an
+/// mlx::array allocation, an MTLBuffer from the allocator, a 4-byte copy and
+/// a graph node — pure CPU/encode overhead for bytes that cycle through the
+/// same 512 values. The atlas holds all of them (2 KB total), materialized on
+/// first touch, which the constructor warmup's decode step triggers outside
+/// every scored window. Input-independent by construction: every possible
+/// value is built unconditionally; the per-step lookup indexes by the cache's
+/// own ring position (request-local state, not token content), the same
+/// contract as the RoPE angle atlases.
+/// (Worker decode is single-threaded; the atlas is written once by the
+/// initializer and only read afterwards, so the unsafe opt-out is sound.)
+private enum LagunaRingIdxAtlasStore {
+    nonisolated(unsafe) static let entries: [MLXArray] = {
+        let atlas = (0..<LagunaConstants.slidingWindow).map {
+            MLXArray([UInt32($0)])
+        }
+        for entry in atlas { eval(entry) }
+        return atlas
+    }()
+}
+
+private var lagunaRingIdxAtlas: [MLXArray] { LagunaRingIdxAtlasStore.entries }
+
+/// `DARKBLOOM_PARAMS_ATLAS=0` restores the per-call fresh 1-element array
+/// (ablation control for the atlas above; identical bytes either way).
+let lagunaParamsAtlasEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PARAMS_ATLAS"] != "0"
 
 /// `DARKBLOOM_FUSED_FULL_ATTN` (default on; set "0" to disable): decode
 /// fused attention for the ten full-attention layers once the cache backing
@@ -8100,8 +8131,14 @@ private let lagunaDenseGateUpSwiGLUKernel = MLXFast.metalKernel(
 
         uint column = lane * values_per_thread;
         for (uint block = 0; block < blocks; ++block) {
+            // vec<bfloat,4> activation load: same bytes, same per-element
+            // float conversion in the same order as the scalar loop — the
+            // pattern this kernel already uses for its weight rows.
+            // Alignment: column = lane * 4 elements = 8-byte multiples.
+            const vec<bfloat, 4> c4 =
+                *((const device vec<bfloat, 4>*)(input + column));
             for (uint i = 0; i < values_per_thread; ++i) {
-                coefficients[i] = float(input[column + i]);
+                coefficients[i] = float(c4[i]);
             }
             for (uint row = 0; row < rows_per_thread; ++row) {
                 const device vec<bfloat, 4>* gate_row_values =
@@ -8191,8 +8228,11 @@ private let lagunaDenseDownResidualKernel = MLXFast.metalKernel(
 
         uint column = lane * values_per_thread;
         for (uint block = 0; block < blocks; ++block) {
+            // vec<bfloat,4> activation load — see the gate/up twin's note.
+            const vec<bfloat, 4> c4 =
+                *((const device vec<bfloat, 4>*)(activated + column));
             for (uint i = 0; i < values_per_thread; ++i) {
-                coefficients[i] = float(activated[column + i]);
+                coefficients[i] = float(c4[i]);
             }
             for (uint row = 0; row < rows_per_thread; ++row) {
                 const device vec<bfloat, 4>* row_values =

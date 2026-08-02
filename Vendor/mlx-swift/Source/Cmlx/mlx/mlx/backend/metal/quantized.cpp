@@ -254,13 +254,31 @@ void qmv(
 
   int bn = 8;
   int bk = 32;
-  MTL::Size group_dims(bk, 2, 1);
-  MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
+  // DARKBLOOM_QMV_WIDE: simdgroups per threadgroup for the fast fp qmv
+  // (default 2 = stock; 4/8 select 128/256-thread threadgroups). Bit-exact
+  // whole-row re-tiling. Local A/B favored w4 by -0.75% but the ranked box
+  // measured w4 +0.4% SLOWER (candidate decode 5.3285 vs 5.302-5.307 on
+  // adjacent runs) - the fifth straight non-transfer for work-partition
+  // changes - so the default stays stock and the knob remains for
+  // controlled ranked A/B only.
+  // Read per call (not latched): the Swift init-time microbench selects the
+  // machine-local winner by re-pointing this env before the first scored
+  // dispatch; a getenv per qmv call is ~100ns against a >=100us dispatch.
+  int qmv_wide_ns = 2;
+  if (const char* raw = getenv("DARKBLOOM_QMV_WIDE")) {
+    int v = atoi(raw);
+    qmv_wide_ns = (v == 2 || v == 4 || v == 8) ? v : 2;
+  }
 
   std::string kname;
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
   bool fast = N % bn == 0 && K % 512 == 0;
+  bool wide = fast && mode != "affine" && qmv_wide_ns > 2 &&
+      N % (4 * qmv_wide_ns) == 0;
+  MTL::Size group_dims(bk, wide ? qmv_wide_ns : 2, 1);
+  MTL::Size grid_dims(
+      M, wide ? (N / (4 * qmv_wide_ns)) : ((N + bn - 1) / bn), B);
 
   concatenate(
       kname,
@@ -270,16 +288,28 @@ void qmv(
       group_size,
       "_b_",
       bits,
-      B > 1 ? "_batch_1" : "_batch_0");
-  auto kernel = get_quantized_kernel_wrapped(
-      d,
-      kname,
-      (fast ? "qmv_fast" : "qmv"),
-      mode,
-      type_string,
-      group_size,
-      bits,
-      B > 1);
+      B > 1 ? "_batch_1" : "_batch_0",
+      wide ? "_w" + std::to_string(qmv_wide_ns) : "");
+  auto kernel = wide
+      ? get_quantized_kernel_wrapped(
+            d,
+            kname,
+            "qmv_fast",
+            mode,
+            type_string,
+            group_size,
+            bits,
+            B > 1,
+            qmv_wide_ns)
+      : get_quantized_kernel_wrapped(
+            d,
+            kname,
+            (fast ? "qmv_fast" : "qmv"),
+            mode,
+            type_string,
+            group_size,
+            bits,
+            B > 1);
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -1063,13 +1093,27 @@ void gather_qmv(
 
   int bn = 8;
   int bk = 32;
-  MTL::Size group_dims(bk, 2, 1);
-  MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
+  // DARKBLOOM_GATHER_QMV_WIDE: simdgroups per threadgroup for the fast fp
+  // gather qmv (default 2 = stock; 4/8 select 128/256-thread threadgroups).
+  // Same bit-exact whole-row re-tiling argument as DARKBLOOM_QMV_WIDE.
+  static const int gqmv_wide_ns = []() {
+    const char* raw = getenv("DARKBLOOM_GATHER_QMV_WIDE");
+    if (raw == nullptr) {
+      return 2;
+    }
+    int v = atoi(raw);
+    return (v == 2 || v == 4 || v == 8) ? v : 2;
+  }();
 
   std::string kname;
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
   bool fast = N % bn == 0 && K % 512 == 0;
+  bool wide = fast && mode != "affine" && gqmv_wide_ns > 2 &&
+      N % (4 * gqmv_wide_ns) == 0;
+  MTL::Size group_dims(bk, wide ? gqmv_wide_ns : 2, 1);
+  MTL::Size grid_dims(
+      M, wide ? (N / (4 * gqmv_wide_ns)) : ((N + bn - 1) / bn), B);
   concatenate(
       kname,
       mode + (fast ? "_gather_qmv_fast_" : "_gather_qmv_"),
@@ -1077,16 +1121,27 @@ void gather_qmv(
       "_gs_",
       group_size,
       "_b_",
-      bits);
+      bits,
+      wide ? "_w" + std::to_string(gqmv_wide_ns) : "");
 
-  auto kernel = get_quantized_kernel_wrapped(
-      d,
-      kname,
-      (fast ? "gather_qmv_fast" : "gather_qmv"),
-      mode,
-      type_string,
-      group_size,
-      bits);
+  auto kernel = wide
+      ? get_quantized_kernel_wrapped(
+            d,
+            kname,
+            "gather_qmv_fast",
+            mode,
+            type_string,
+            group_size,
+            bits,
+            gqmv_wide_ns)
+      : get_quantized_kernel_wrapped(
+            d,
+            kname,
+            (fast ? "gather_qmv_fast" : "gather_qmv"),
+            mode,
+            type_string,
+            group_size,
+            bits);
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
