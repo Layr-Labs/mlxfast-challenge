@@ -1557,16 +1557,16 @@ void gather_qmm_rhs_nax(
     int M,
     int N,
     int K,
+    bool direct_sorted_lhs,
     metal::Device& d,
     const Stream& s,
     const std::string mode) {
   // Start by normalizing the indices
   array indices = ensure_row_contiguous(indices_, d, s);
 
-  // Broadcast x with indices. If we are here that means lhs_indices were not
-  // provided so the lhs_indices are implied to be the shape of x broadcasted
-  // with rhs_indices. We need only broadcast x and copy it as if applying the
-  // lhs_indices.
+  // The direct path leaves the original token rows compact; its packed route
+  // carrier tells the expert kernel which source row belongs at each sorted
+  // position. Ordinary calls retain the implicit-LHS broadcast/copy.
   auto broadcast_with_indices = [&d, &s, &indices](const array& x) {
     if (x.size() / x.shape(-2) / x.shape(-1) == indices.size()) {
       return ensure_row_contiguous(x, d, s);
@@ -1581,9 +1581,14 @@ void gather_qmm_rhs_nax(
   };
 
   // Normalize the input arrays
-  array x = broadcast_with_indices(x_);
+  array x = direct_sorted_lhs ? ensure_row_contiguous(x_, d, s)
+                              : broadcast_with_indices(x_);
   array w = ensure_row_contiguous(w_, d, s);
   array scales = ensure_row_contiguous(scales_, d, s);
+
+  if (direct_sorted_lhs) {
+    M = indices.size();
+  }
 
   // TODO: Tune the block sizes
   int bm = 64, bn = 64, bk = 64;
@@ -1614,6 +1619,10 @@ void gather_qmm_rhs_nax(
       darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
       group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
       align_N && align_K && bm == 64 && wm == 4 && (wn == 2 || wn == 1);
+  if (direct_sorted_lhs && !expert_aligned) {
+    throw std::runtime_error(
+        "direct sorted LHS requires the expert-aligned Laguna NAX kernel");
+  }
   std::string type_string = get_type_string(x.dtype());
   static const bool static_laguna_shapes =
       env::get_var("DARKBLOOM_STATIC_NVFP4_SHAPES", "") != "0";
@@ -1714,7 +1723,8 @@ void gather_qmm_rhs_nax(
       static_expert_shape
           ? ("_k_" + std::to_string(K) + "_n_" + std::to_string(N))
           : "",
-      expert_aligned ? ("_eg_" + std::to_string(egroups)) : "");
+      expert_aligned ? ("_eg_" + std::to_string(egroups)) : "",
+      expert_aligned && direct_sorted_lhs ? "_direct_lhs" : "");
 
   // Skipping dead runs is a pure work elision (see function constant 203 in
   // fp_quantized_nax): it drops only matmuls whose results store_slice never
@@ -1828,7 +1838,8 @@ void gather_qmm_rhs_nax(
         static_expert_shape ? K : 0,
         static_expert_shape ? N : 0,
         "bfloat",
-        egroups);
+        egroups,
+        direct_sorted_lhs ? "true" : "false");
     kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
   } else {
     kernel = get_gather_qmm_nax_kernel(
@@ -1891,6 +1902,7 @@ void gather_qmm_rhs(
     int M,
     int N,
     int K,
+    bool direct_sorted_lhs,
     metal::Device& d,
     const Stream& s,
     const std::string mode) {
@@ -1909,9 +1921,17 @@ void gather_qmm_rhs(
         /* int M = */ M,
         /* int N = */ N,
         /* int K = */ K,
+        /* bool direct_sorted_lhs = */ direct_sorted_lhs,
         /* metal::Device& d = */ d,
         /* const Stream& s = */ s,
         /* const std::string mode = */ mode);
+  }
+
+  // The direct carrier is only implemented by the M5 NAX kernel. Fail closed
+  // if architecture dispatch ever violates the Swift-side generation guard.
+  if (direct_sorted_lhs) {
+    throw std::runtime_error(
+        "direct sorted LHS requires the M5 NAX gather-QMM path");
   }
 
   // Start by normalizing the indices
@@ -2147,7 +2167,14 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   // matmuls and reuse reading x and w.
   //
   // TODO: Tune 16 and 4 here a bit better.
-  if (M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4) {
+  const bool direct_sorted_lhs =
+      M == 1 && B >= 16 && !right_sorted_ && B / E >= 4 &&
+      metal::is_nax_available() && transpose_ && group_size_ == 16 &&
+      bits_ == 4 && mode == "nvfp4" && E == 256 &&
+      B == rhs_indices.size() && lhs_indices.size() == rhs_indices.size() &&
+      x.size() / K * 8 == rhs_indices.size();
+  if (M == 1 && B >= 16 && (right_sorted_ || direct_sorted_lhs) &&
+      B / E >= 4) {
     gather_qmm_rhs(
         x,
         w,
@@ -2161,6 +2188,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         x.size() / K,
         N,
         K,
+        direct_sorted_lhs,
         d,
         s,
         mode);
