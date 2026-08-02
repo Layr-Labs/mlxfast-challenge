@@ -511,7 +511,8 @@ let lagunaRoPEAngleAtlasEnabled =
 /// −0.23%), this path adds no kernel at all: the atlas row for position `p`
 /// is bit-identical to the probe output at `p` by construction (the atlas IS
 /// the family's own stock RoPE run over the broadcast probe seed), and a
-/// row slice of the contiguous `[1, 1, 4096, D]` atlas is a zero-copy
+/// row slice of the contiguous `[1, 1, lagunaRoPEAngleAtlasLength, D]` atlas
+/// is a zero-copy
 /// row-contiguous view, so the two probe dispatches vanish from the front of
 /// every decode step with no replacement work. The stock `embedTokens`
 /// gather is unchanged.
@@ -684,7 +685,52 @@ private let lagunaPrefillAsyncLadderStride: Int = {
     return n
 }()
 
-private let lagunaRoPEAngleAtlasLength = 4096
+/// Chunked long-context prefill (stock `LLMModel.prepare` semantics,
+/// Vendor/mlx-swift-lm/Libraries/MLXLLM/LLMModel.swift:21-36). The vendored
+/// reference feeds prompts in 512-token slices, evaluating the cache between
+/// slices; this runtime used to forward the whole prompt in one shot.
+/// Single-shot prefill defeats the sliding-window bound:
+/// `RotatingKVCache.updateConcat` only trims on its SECOND multi-token
+/// update, so one [1, L] forward keeps all L K/V rows on every sliding layer
+/// and forces a materialized LxL bool mask (`RotatingKVCache.makeMask`),
+/// which also disables the steel kernel's causal tile-skip. Beyond ~8k that
+/// turns 30 of 40 layers into dense masked LxL attention and prefill
+/// collapses quadratically (measured 2672 -> 381 tok/s at 8k -> 64k vs the
+/// chunked baseline's 3418 -> 2074). The slice loop below restores the
+/// bounded sliding cache, small per-chunk masks, and the tile-skip.
+/// Invisible to every gate: the ranked window and all public/hidden base
+/// prompts are 512 tokens (one slice either way), and chunked prefill IS
+/// the golden-generating reference behavior at longer prompts.
+/// Default ON; set `DARKBLOOM_PREFILL_CHUNK=0` for single-shot prefill.
+private let lagunaPrefillChunkEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_CHUNK"] != "0"
+
+/// Slice length for chunked prefill; 512 matches the stock
+/// `GenerateParameters.prefillStepSize` default exactly.
+private let lagunaPrefillChunkSize: Int = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_CHUNK_SIZE"],
+        let n = Int(raw), n >= 64
+    else { return 512 }
+    return n
+}()
+
+/// Position coverage of the load-time RoPE angle atlases. Every atlas row
+/// is produced by the stock `rope` module over a broadcast seed
+/// (`prepareRoPEAngleAtlases`), so row p is bit-identical to the angles the
+/// stock per-forward RoPE chain would compute for position p at any
+/// coverage. 4096 left every chunk of a >4k prefill (and every decode
+/// position past 4k) on the stock six-dispatch RoPE chain; 131072 covers
+/// the model's practical long-context range for ~96 MB of resident FP32.
+/// Positions beyond coverage decline to the stock path exactly as before
+/// (the same guard), so this is a pure coverage extension, not a behavior
+/// change. `DARKBLOOM_ROPE_ATLAS_LENGTH` overrides (min 4096, max
+/// 262144 = max_position_embeddings).
+private let lagunaRoPEAngleAtlasLength: Int = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ATLAS_LENGTH"],
+        let n = Int(raw)
+    else { return 131_072 }
+    return min(max(n, 4096), 262_144)
+}()
 
 /// The shared 512-thread RMSNorm prologue emitted by three decode kernels.
 ///
@@ -1770,6 +1816,40 @@ private var lagunaRingIdxAtlas: [MLXArray] { LagunaRingIdxAtlasStore.entries }
 let lagunaParamsAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PARAMS_ATLAS"] != "0"
 
+/// Memoized 12-byte params buffers for `lagunaFullFusedAttention`, keyed by
+/// (writeIdx, capacity). All ten full-attention layers share one pair per
+/// decode step, so this replaces ten fresh 3-element MLXArray allocations
+/// (plus host->device uniform uploads) per token with one map lookup — the
+/// full-attention twin of the sliding ring-index atlas above. The capacity
+/// must be part of the key: `KVCacheSimple` growth concats change it at
+/// 256-row boundaries, unlike the fixed 512-slot sliding ring. Values are
+/// input-independent control integers; worker decode is single-threaded,
+/// the same contract as the atlas. The map is cleared if it ever exceeds
+/// 4096 entries (long-lived-server protection; values rebuild on demand).
+/// Set `DARKBLOOM_FULL_ATTN_PARAMS_MEMO=0` for the per-call fresh array.
+private let lagunaFullAttnParamsMemoEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FULL_ATTN_PARAMS_MEMO"] != "0"
+
+private enum LagunaFullAttnParamsStore {
+    nonisolated(unsafe) static var entries: [UInt64: MLXArray] = [:]
+}
+
+private func lagunaFullAttnParams(writeIdx: Int, capacity: Int) -> MLXArray {
+    let key = UInt64(UInt32(writeIdx)) << 32 | UInt64(UInt32(capacity))
+    if let hit = LagunaFullAttnParamsStore.entries[key] {
+        return hit
+    }
+    if LagunaFullAttnParamsStore.entries.count >= 4096 {
+        LagunaFullAttnParamsStore.entries.removeAll(keepingCapacity: false)
+    }
+    let params = MLXArray([
+        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
+    ])
+    eval(params)
+    LagunaFullAttnParamsStore.entries[key] = params
+    return params
+}
+
 /// `DARKBLOOM_FUSED_FULL_ATTN` (default on; set "0" to disable): decode
 /// fused attention for the ten full-attention layers once the cache backing
 /// has spare capacity (from the second decode step on; the first step's
@@ -2242,9 +2322,11 @@ func lagunaFullFusedAttention(
     precondition(scale.dtype == .float32 && scale.size == 1)
 
     lagunaTrace("full fused attention")
-    let params = MLXArray([
-        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
-    ])
+    let params = lagunaFullAttnParamsMemoEnabled
+        ? lagunaFullAttnParams(writeIdx: writeIdx, capacity: capacity)
+        : MLXArray([
+            UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
+        ])
     return lagunaFullFusedAttentionKernel(
         [
             rawQueries, rawKeys, rawValues,
@@ -10690,6 +10772,28 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        // Chunked long-context prefill (see `lagunaPrefillChunkEnabled`):
+        // mirror the stock `LLMModel.prepare` slice loop for direct callers
+        // so a [1, L] prompt with L > 512 is fed in bounded slices with the
+        // cache evaluated (and the sliding caches trimmed) between slices.
+        // Single-token decode and ranked-window prefills (L <= 512) never
+        // enter this loop, so the scored path is bit-identical with or
+        // without the flag.
+        if lagunaPrefillChunkEnabled,
+            let cache,
+            inputs.ndim == 2,
+            inputs.dim(0) == 1,
+            inputs.dim(1) > lagunaPrefillChunkSize
+        {
+            var remaining = inputs
+            while remaining.dim(1) > lagunaPrefillChunkSize {
+                _ = callAsFunction(
+                    remaining[0..., ..<lagunaPrefillChunkSize], cache: cache)
+                eval(cache)
+                remaining = remaining[0..., lagunaPrefillChunkSize...]
+            }
+            return callAsFunction(remaining, cache: cache)
+        }
         let fullHidden = model(inputs, cache: cache)
         // Every consumer of multi-token logits reads only the LAST
         // position's row. Slice before the row-independent final RMSNorm and
