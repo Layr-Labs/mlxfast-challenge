@@ -671,7 +671,12 @@ METAL_FUNC void fp_qmm_t_impl(
   dispatch_bool(aligned_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
       for (int k = 0; k < kernel_K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Static-K kernels have no prior consumer of Ws on the first tile.
+        // Keep the overwrite barrier for subsequent tiles and every dynamic
+        // K instantiation, where the loop-carried dependency is real.
+        if (fixed_K == 0 || k > 0) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
@@ -710,8 +715,12 @@ METAL_FUNC void fp_qmm_t_impl(
         loader_w.next();
       }
 
-      // Store results to device memory
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Static-K stores consume only the completed per-simdgroup register
+      // tile. Ws is dead here, so there is no threadgroup dependency left to
+      // order; retain the conservative barrier for dynamic-K kernels.
+      if (fixed_K == 0) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
 
       if constexpr (kAlignedM.value && kAlignedN.value) {
         Dtile.store(y + tm * kernel_N + tn, kernel_N);
@@ -1681,7 +1690,11 @@ template <
 #endif
   threadgroup bfloat* gate_up_stage =
       (threadgroup bfloat*)Ws_storage;
+#ifdef DARKBLOOM_BSEARCH_HOIST
+  threadgroup int bounds[experts / expert_groups + 1];
+#else
   threadgroup int bounds[2];
+#endif
 
   const int K_w = kernel_K * bytes_per_pack / pack_factor;
   const int K_g = kernel_K / group_size;
@@ -1733,6 +1746,19 @@ template <
       (WN == 1) && (BN == 64) && ((BM / WM) == 16);
 #endif // DARKBLOOM_SWIGLU_REGLOCAL
 
+#ifdef DARKBLOOM_BSEARCH_HOIST
+  // Hoist: all slot bounds once, one lower_bound per thread (same integers
+  // as the per-slot lid==0 searches), one barrier instead of two per slot.
+  for (int b = int(lid); b <= experts / expert_groups;
+       b += WM * WN * SIMD_SIZE) {
+    bounds[b] = laguna_sorted_lower_bound(
+        indices,
+        M,
+        static_cast<uint32_t>(tid.y * (experts / expert_groups) + b));
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif
+
   for (int expert_slot = 0; expert_slot < experts / expert_groups;
        ++expert_slot) {
     // Keep each threadgroup's row intervals and expert weight regions
@@ -1741,6 +1767,10 @@ template <
         static_cast<uint32_t>(
             tid.y * (experts / expert_groups) + expert_slot);
 
+#ifdef DARKBLOOM_BSEARCH_HOIST
+    const int run_start = bounds[expert_slot];
+    const int run_end = bounds[expert_slot + 1];
+#else
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0) {
       bounds[0] = laguna_sorted_lower_bound(indices, M, expert);
@@ -1750,6 +1780,7 @@ template <
 
     const int run_start = bounds[0];
     const int run_end = bounds[1];
+#endif
     for (int chunk_start = run_start; chunk_start < run_end;
          chunk_start += BM) {
       const short chunk_rows =
