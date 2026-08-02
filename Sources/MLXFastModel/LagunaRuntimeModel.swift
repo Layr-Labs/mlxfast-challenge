@@ -589,17 +589,19 @@ let lagunaFusedFullQKNormYaRNEnabled =
 /// removing the two per-token probe RoPE dispatches without changing their
 /// values.
 ///
-/// Default OFF since the decode fusion-stack audit: with every other lever
-/// at default, the atlas measures −0.23% steady decode (se 0.03%, 0/2 ABBA
-/// pairs favoring ON, quiescent-machine rig) — the fused kernel's fixed cost
-/// now exceeds the two tiny probe dispatches it removes, the same
-/// promoted-era-value rot its prefill sibling showed (ranked −0.79%
-/// re-land). The OFF path is the verbatim stock fallback below
-/// (`embedTokens` gather + `ropeAngleTable` probes), exercised with zero
-/// token mismatches in every audit arm. Set `DARKBLOOM_ROPE_ANGLE_ATLAS=1`
-/// to re-enable.
+/// Default ON since the r=1-regime re-sweep (2026-08-02, M5 Max driver rig):
+/// under the current one-row QMV geometry + counting-sort frontier the arm
+/// measures −0.55..−0.7% steady decode, 4/4 mirrored pairs favoring ON
+/// (medians 4.521/4.535/4.536/4.533 vs controls 4.563/4.557/4.574/4.543),
+/// inverting the earlier fusion-stack-audit conclusion (−0.23% against ON
+/// under the pre-r=1 regime) — the same regime-rot pattern the tail QKV
+/// fusion showed in reverse. Values are unchanged by construction (the
+/// atlas rows are the family's own stock RoPE outputs, copied); free-run
+/// token hash and 1,600 teacher-forced steps are identical across arms.
+/// Set `DARKBLOOM_ROPE_ANGLE_ATLAS=0` to restore the stock fallback
+/// (`embedTokens` gather + `ropeAngleTable` probes).
 let lagunaRoPEAngleAtlasEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] == "1"
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] != "0"
 
 /// Zero-dispatch decode angle carrier: serve the two per-step RoPE angle rows
 /// as contiguous row VIEWS of the load-time FP32 position atlases instead of
