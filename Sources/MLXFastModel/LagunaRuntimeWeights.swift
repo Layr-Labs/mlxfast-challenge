@@ -347,9 +347,9 @@ public final class LagunaRuntimeWeightCache {
         self.loader = loader
         self.config = config
         // Select the startup memory profile BEFORE the model load. Laguna
-        // retains no alternate weight layouts. The full profile only installs
-        // the post-wire command-buffer budget below; the documented
-        // low-memory profile for <64 GiB machines caps the MLX allocator
+        // retains no alternate weight layouts. The full profile installs the
+        // qualified BFS scheduler and post-wire command-buffer defaults below;
+        // the documented low-memory profile for <64 GiB machines caps the MLX allocator
         // cache at 6 GiB, shortens command buffers, and clears free
         // warmup buffers before the worker protocol hello -- pure memory
         // management: compiled decode and every other ranked code path stay
