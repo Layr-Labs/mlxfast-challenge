@@ -4550,6 +4550,186 @@ private func lagunaDecodeNVFP4QKVR1(
     )[0]
 }
 
+/// Default-on fold of the per-head gate's group-32 affine INT8 rows into the
+/// decode QKV R1 dispatch on NVFP4-bank layers. The promoted path pays one
+/// extra standalone gate dispatch per layer per decode step (the softplus
+/// gate QMV, `laguna_gate_sp_*`) for a [heads, 2048] projection whose grid
+/// is a single-digit threadgroup count; appending the gate rows after the
+/// Q/K/V rows lets them ride the QKV dispatch's full occupancy instead.
+/// Every row's K-loop is independent, the QKV rows keep the R1 arm's exact
+/// walk, and the gate rows replicate the promoted gate kernel's per-row
+/// schedule (8 consecutive columns per lane, 256-column blocks, serial
+/// `sum`/`accum` in index order, `scale * accum + sum * bias`, one
+/// `simd_sum`) followed by its exact softplus epilogue (BF16 boundary,
+/// hi/lo split, `log1p(exp(lo-hi))`, BF16 store), so every output bit
+/// matches the promoted two-dispatch chain and the fused tail carries
+/// ACTIVATED gate values for the pre-activated o_proj consumer. The fold
+/// therefore engages only when that consumer's guards hold; any decline
+/// falls back to the promoted ladder unchanged.
+/// `DARKBLOOM_DECODE_QKV_GATE_FOLD=0` restores the separate gate dispatch.
+private let lagunaDecodeQKVGateFoldEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_QKV_GATE_FOLD"] != "0"
+
+private func lagunaDecodeNVFP4QKVGateR1Source(qkvRows: Int) -> String {
+    """
+    constexpr uint axis_size = 2048;
+    constexpr uint num_simdgroups = 2;
+    constexpr uint qkv_rows = \(qkvRows);
+
+    uint tile = threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    uint out_row = tile * num_simdgroups + simd_gid;
+
+    if (out_row < qkv_rows) {
+        constexpr uint values_per_thread = 16;
+        constexpr uint block_size = 512;
+        constexpr uint in_vec_size_w = axis_size / 2;
+        constexpr uint in_vec_size_g = axis_size / 16;
+
+        const device uint8_t* ws = (const device uint8_t*)weight_codes +
+            out_row * in_vec_size_w + simd_lid * 8;
+        const device uint8_t* sc = weight_scales +
+            out_row * in_vec_size_g + simd_lid;
+
+        thread float x_thread[values_per_thread];
+        thread float result = 0.0f;
+
+        uint column = simd_lid * values_per_thread;
+        for (uint k = 0; k < axis_size; k += block_size) {
+            for (uint i = 0; i < values_per_thread; ++i) {
+                x_thread[i] = float(normalized[column + i]);
+            }
+            result += laguna_tail_nvfp4_qdot(
+                ws, x_thread, laguna_tail_nvfp4_scale(sc[0]));
+            ws += block_size / 2;
+            sc += block_size / 16;
+            column += block_size;
+        }
+
+        result = simd_sum(result);
+        if (simd_lid == 0) {
+            projected[out_row] = bfloat(result);
+        }
+    } else {
+        constexpr uint values_per_thread = 8;
+        constexpr uint block_size = 256;
+        constexpr uint in_vec_size_g = axis_size / 32;
+
+        uint gate_row = out_row - qkv_rows;
+        const device uint8_t* ws = (const device uint8_t*)gate_codes +
+            gate_row * axis_size + simd_lid * values_per_thread;
+        const device bfloat* sc = gate_scales +
+            gate_row * in_vec_size_g + simd_lid / 4;
+        const device bfloat* bs = gate_biases +
+            gate_row * in_vec_size_g + simd_lid / 4;
+
+        thread float x_thread[values_per_thread];
+        thread float result = 0.0f;
+
+        uint column = simd_lid * values_per_thread;
+        for (uint k = 0; k < axis_size; k += block_size) {
+            float sum = 0.0f;
+            for (uint i = 0; i < values_per_thread; ++i) {
+                float value = float(normalized[column + i]);
+                sum += value;
+                x_thread[i] = value;
+            }
+            float scale = float(sc[0]);
+            float bias = float(bs[0]);
+            float accum = 0.0f;
+            for (uint i = 0; i < values_per_thread; ++i) {
+                accum += x_thread[i] * ws[i];
+            }
+            result += scale * accum + sum * bias;
+            ws += block_size;
+            sc += block_size / 32;
+            bs += block_size / 32;
+            column += block_size;
+        }
+
+        result = simd_sum(result);
+        if (simd_lid == 0) {
+            float l = float(bfloat(result));
+            float g;
+            if (metal::isnan(l)) g = NAN;
+            else {
+                float hi = metal::max(l, 0.0f);
+                float lo = metal::min(l, 0.0f);
+                g = (metal::isinf(lo) || metal::isinf(hi))
+                    ? hi : hi + log1p(metal::exp(lo - hi));
+            }
+            projected[out_row] = bfloat(g);
+        }
+    }
+    """
+}
+
+private let lagunaDecodeNVFP4QKVGateR1Kernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        let rows = (heads + 2 * LagunaConstants.numKeyValueHeads) * LagunaConstants.headDim
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_decode_nvfp4_qkv_gate_sp_h\(heads)_r1_v1",
+            inputNames: [
+                "normalized", "weight_codes", "weight_scales",
+                "gate_codes", "gate_scales", "gate_biases",
+            ],
+            outputNames: ["projected"],
+            source: lagunaDecodeNVFP4QKVGateR1Source(qkvRows: rows),
+            header: lagunaTailNVFP4QMVHeader,
+            ensureRowContiguous: true)
+    }
+    return kernels
+}()
+
+private func lagunaDecodeNVFP4QKVGateR1(
+    normalized: MLXArray,
+    bank: LagunaNativeAffineWeight,
+    gate: LagunaNativeAffineWeight?,
+    heads: Int
+) -> MLXArray? {
+    guard lagunaDecodeQKVGateFoldEnabled,
+        lagunaDecodeNVFP4QKVR1Enabled,
+        let gate
+    else { return nil }
+    let rows = (heads + 2 * LagunaConstants.numKeyValueHeads) * LagunaConstants.headDim
+    let hidden = LagunaConstants.hiddenSize
+    guard normalized.dtype == .bfloat16,
+        normalized.shape == [1, 1, hidden],
+        bank.mode == .nvfp4, bank.bits == 4, bank.groupSize == 16,
+        bank.biases == nil,
+        bank.originalShape == [rows, hidden],
+        bank.packedCodes.dtype == .uint32,
+        bank.packedCodes.shape == [rows, hidden / 8],
+        bank.scales.dtype == .uint8,
+        bank.scales.shape == [rows, hidden / 16],
+        gate.mode == .affine, gate.bits == 8, gate.groupSize == 32,
+        gate.originalShape == [heads, hidden],
+        gate.packedCodes.dtype == .uint32,
+        gate.packedCodes.shape == [heads, hidden / 4],
+        gate.scales.dtype == .bfloat16,
+        gate.scales.shape == [heads, hidden / 32],
+        let gateBiases = gate.biases,
+        gateBiases.dtype == .bfloat16,
+        gateBiases.shape == [heads, hidden / 32],
+        rows % 2 == 0, heads % 2 == 0,
+        let kernel = lagunaDecodeNVFP4QKVGateR1Kernels[heads]
+    else { return nil }
+    lagunaTrace("decode nvfp4 qkv+gate r1 h\(heads)")
+    let total = rows + heads
+    return kernel(
+        [
+            normalized, bank.packedCodes, bank.scales,
+            gate.packedCodes, gate.scales, gateBiases,
+        ],
+        grid: ((total / 2) * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, total]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 
 private func lagunaNormAffineQKVSource(rows: Int, staged: Bool) -> String {
     let stagedNormalize = """
@@ -5423,13 +5603,32 @@ final class LagunaRuntimeAttention: Module {
                 // Only materialized when the fused kernel declined; the gate
                 // branches below that read it are unreachable when it fired.
                 let normalized = fusedQKV ?? inputNorm(input)
+                // The folded QKV+gate kernel emits ACTIVATED gate values via
+                // the promoted softplus epilogue, so it engages only when
+                // the pre-activated o_proj consumer's guards hold; any
+                // decline falls back to the promoted ladder below.
+                let gateFoldOProjEligible =
+                    lagunaGateSoftplusEnabled
+                    && lagunaFusedGatedAffineOProjEnabled
+                    && lagunaGatedAffineOProjNVFP4Enabled
+                    && lagunaUseNativeAffineOProj(layer: layerIdx)
+                    && _nativeAffineOProj?.mode == .nvfp4
+                    && _nativeAffineOProj?.bits == 4
+                    && _nativeAffineOProj?.groupSize == 16
+                let decodeNVFP4QKVGateR1 =
+                    (fusedQKV == nil && gateFoldOProjEligible)
+                    ? lagunaDecodeNVFP4QKVGateR1(
+                        normalized: normalized, bank: fusedAffine,
+                        gate: _nativeAffineGProj, heads: nHeads)
+                    : nil
                 let decodeNVFP4QKVR1 =
-                    fusedQKV == nil
+                    (fusedQKV == nil && decodeNVFP4QKVGateR1 == nil)
                     ? lagunaDecodeNVFP4QKVR1(
                         normalized: normalized, bank: fusedAffine, heads: nHeads)
                     : nil
                 let qkv =
                     fusedQKV
+                    ?? decodeNVFP4QKVGateR1
                     ?? decodeNVFP4QKVR1
                     ?? quantizedMM(
                         normalized,
@@ -5456,6 +5655,12 @@ final class LagunaRuntimeAttention: Module {
                     // slice them out of its tail. Same row-local math as a
                     // standalone group-32 INT8 gate qmv.
                     gateLogits = qkv[.ellipsis, gateStart ..< (gateStart + nHeads)]
+                } else if decodeNVFP4QKVGateR1 != nil {
+                    // The gate rows rode the NVFP4 QKV R1 dispatch and carry
+                    // the promoted softplus epilogue's ACTIVATED values;
+                    // slice them from the fused output's tail.
+                    gateLogits = qkv[.ellipsis, gateStart ..< (gateStart + nHeads)]
+                    gateProjectionActivated = true
                 } else if let affineGate = _nativeAffineGProj {
                     // NVFP4-tail layer: the gate keeps its own group-32 INT8
                     // bank (the envelope caps g_proj there) and replaces the
@@ -6557,6 +6762,217 @@ func lagunaSharedSwiGLUQMV(
         outputShapes: [[1, 1, LagunaConstants.sharedExpertIntermediateSize]],
         outputDTypes: [.bfloat16]
     )[0]
+}
+
+/// Default-on merge of the decode router top-8 selection into the shared
+/// expert's SwiGLU QMV dispatch. Both are independent siblings of the fused
+/// residual+RMS+router kernel (the selection consumes the router logits, the
+/// shared QMV consumes the normed MoE input), and the promoted selection
+/// kernel is a single 256-thread threadgroup — a launch whose grid leaves
+/// the GPU idle for its whole duration, 39 times per decode step. Appending
+/// one selection threadgroup to the shared QMV's 256 lets it ride the same
+/// dispatch. Tiles 0..<256 are textually the rows1 shared arm; tile 256
+/// reproduces the accepted ordinal kernel's outputs at 64 threads:
+/// selection by repeated minimum extraction under the identical strict
+/// total order (`laguna_router_key_ordinal`, then original expert index) is
+/// byte-identical to the accepted Batcher sort's rank sequence as an
+/// algorithmic property, and every FP boundary — the stable sigmoid score,
+/// the score-table winner lookup, the ascending-rank `total = s_i + total`
+/// accumulation, the FP32 divide — replicates the accepted expressions.
+/// `DARKBLOOM_SHARED_TOP8_MERGE=0` restores the separate dispatches.
+private let lagunaSharedTop8MergeEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_TOP8_MERGE"] != "0"
+
+private let lagunaSharedSwiGLUTop8QMVKernel = MLXFast.metalKernel(
+    name: "laguna_shared_nvfp4_swiglu_qmv_rows1_top8_bf16_v1",
+    inputNames: [
+        "input", "fused_weight", "fused_scales", "logits", "correction_bias",
+    ],
+    outputNames: ["activated", "router_indices", "router_scores"],
+    source: """
+        constexpr uint input_width = 2048;
+        constexpr uint output_width = 512;
+        constexpr uint packed_row_bytes = 1024;
+        constexpr uint scale_row_bytes = 128;
+        constexpr uint block_width = 512;
+        constexpr uint values_per_lane = 16;
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        if (tile < 256) {
+            uint row = tile * 2 + simd_group;
+
+            const device uint8_t* gate_row_weight =
+                (const device uint8_t*)fused_weight +
+                row * packed_row_bytes + lane * 8;
+            const device uint8_t* up_row_weight =
+                (const device uint8_t*)fused_weight +
+                (row + output_width) * packed_row_bytes + lane * 8;
+            const device uint8_t* gate_row_scale =
+                fused_scales + row * scale_row_bytes + lane;
+            const device uint8_t* up_row_scale =
+                fused_scales + (row + output_width) * scale_row_bytes + lane;
+
+            thread float gate_result = 0.0f;
+            thread float up_result = 0.0f;
+            thread float input_values[values_per_lane];
+
+            for (uint block = 0; block < input_width; block += block_width) {
+                const device vec<bfloat, 4>* input_vectors =
+                    (const device vec<bfloat, 4>*) (
+                        input + block + lane * values_per_lane);
+                for (uint i = 0; i < values_per_lane / 4; ++i) {
+                    const vec<bfloat, 4> values = input_vectors[i];
+                    input_values[4 * i] = values[0];
+                    input_values[4 * i + 1] = values[1];
+                    input_values[4 * i + 2] = values[2];
+                    input_values[4 * i + 3] = values[3];
+                }
+
+                gate_result += laguna_nvfp4_qdot_16(
+                    gate_row_weight + block / 2,
+                    input_values,
+                    laguna_nvfp4_scale(gate_row_scale[block / 16]));
+                up_result += laguna_nvfp4_qdot_16(
+                    up_row_weight + block / 2,
+                    input_values,
+                    laguna_nvfp4_scale(up_row_scale[block / 16]));
+            }
+
+            gate_result = simd_sum(gate_result);
+            up_result = simd_sum(up_result);
+            if (lane == 0) {
+                bfloat gate = bfloat(gate_result\(lagunaNvfp4RowScaleSuffix));
+                bfloat up = bfloat(up_result\(lagunaNvfp4RowScaleSuffix));
+                bfloat exp_abs = metal::exp(metal::abs(gate));
+                bfloat denominator = bfloat(1) + exp_abs;
+                bfloat y = bfloat(1) / denominator;
+                bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+                bfloat silu = bfloat(gate * sigmoid);
+                activated[row] = bfloat(silu * up);
+            }
+        } else {
+            threadgroup float tg_scores[256];
+            threadgroup uint tg_ord[256];
+            threadgroup uint tg_claimed[256];
+            threadgroup uint tg_pick_ord[2];
+            threadgroup uint tg_pick_idx[2];
+
+            uint tid = simd_group * 32 + lane;
+            for (uint j = 0; j < 4; ++j) {
+                uint e = tid * 4 + j;
+                float x = float(logits[e]);
+                float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+                float score = x < 0.0f ? y : 1.0f - y;
+                tg_scores[e] = score;
+                float key = -(score + correction_bias[e]);
+                tg_ord[e] = laguna_router_key_ordinal(key);
+                tg_claimed[e] = 0u;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            thread uint sel_index[8];
+            for (uint r = 0; r < 8; ++r) {
+                uint best_ord = 0xFFFFFFFFu;
+                uint best_idx = 0xFFFFFFFFu;
+                for (uint j = 0; j < 4; ++j) {
+                    uint e = tid * 4 + j;
+                    if (tg_claimed[e] == 0u &&
+                        laguna_router_ordinal_before(
+                            tg_ord[e], e, best_ord, best_idx))
+                    {
+                        best_ord = tg_ord[e];
+                        best_idx = e;
+                    }
+                }
+                for (uint s = 16; s > 0; s >>= 1) {
+                    uint other_ord = simd_shuffle_xor(best_ord, ushort(s));
+                    uint other_idx = simd_shuffle_xor(best_idx, ushort(s));
+                    if (laguna_router_ordinal_before(
+                            other_ord, other_idx, best_ord, best_idx))
+                    {
+                        best_ord = other_ord;
+                        best_idx = other_idx;
+                    }
+                }
+                if (lane == 0) {
+                    tg_pick_ord[simd_group] = best_ord;
+                    tg_pick_idx[simd_group] = best_idx;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                uint pick_ord = tg_pick_ord[0];
+                uint pick_idx = tg_pick_idx[0];
+                if (laguna_router_ordinal_before(
+                        tg_pick_ord[1], tg_pick_idx[1], pick_ord, pick_idx))
+                {
+                    pick_ord = tg_pick_ord[1];
+                    pick_idx = tg_pick_idx[1];
+                }
+                sel_index[r] = pick_idx;
+                if (tid == pick_idx / 4) {
+                    tg_claimed[pick_idx] = 1u;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            float my_score = 0.0f;
+            if (tid < 8) {
+                my_score = tg_scores[sel_index[tid]];
+            }
+            float total = 0.0f;
+            for (uint i = 0; i < 8; ++i) {
+                total = simd_shuffle(my_score, ushort(i)) + total;
+            }
+            if (tid < 8) {
+                router_indices[tid] = sel_index[tid];
+                router_scores[tid] = my_score / total;
+            }
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader,
+    ensureRowContiguous: true
+)
+
+func lagunaSharedSwiGLUTop8QMV(
+    _ input: MLXArray,
+    fusedWeight: MLXArray,
+    fusedScales: MLXArray,
+    logits: MLXArray,
+    correctionBias: MLXArray
+) -> (activated: MLXArray, indices: MLXArray, weights: MLXArray)? {
+    guard lagunaSharedTop8MergeEnabled,
+        lagunaSharedSwiGLUQMVRows1Enabled,
+        input.dtype == .bfloat16,
+        input.shape == [1, 1, LagunaConstants.hiddenSize],
+        fusedWeight.dtype == .uint32,
+        fusedWeight.shape == [
+            2 * LagunaConstants.sharedExpertIntermediateSize,
+            LagunaConstants.hiddenSize / 8,
+        ],
+        fusedScales.dtype == .uint8,
+        fusedScales.shape == [
+            2 * LagunaConstants.sharedExpertIntermediateSize,
+            LagunaConstants.hiddenSize / 16,
+        ],
+        logits.dtype == .bfloat16,
+        logits.size == LagunaConstants.numExperts,
+        correctionBias.dtype == .float32,
+        correctionBias.size == LagunaConstants.numExperts
+    else { return nil }
+    lagunaTrace("decode shared swiglu qmv + router top8 merge")
+    let outputs = lagunaSharedSwiGLUTop8QMVKernel(
+        [input, fusedWeight, fusedScales, logits, correctionBias],
+        grid: (257 * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [
+            [1, 1, LagunaConstants.sharedExpertIntermediateSize],
+            [1, 1, 8], [1, 1, 8],
+        ],
+        outputDTypes: [.bfloat16, .uint32, .float32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
 }
 
 private let lagunaSharedDownResidualKernel = MLXFast.metalKernel(
@@ -9772,7 +10188,36 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         _ x: MLXArray, residual: MLXArray?, routerLogits: MLXArray?,
         routerKeys: MLXArray? = nil
     ) -> MLXArray {
-        let (inds, weights) = gate(x, logits: routerLogits)
+        // Merged shared-QMV + router-top8 dispatch (decode only). Set when
+        // the merged kernel fired: the shared activation is handed to the
+        // down projection instead of being issued again, and the routes come
+        // from the merged kernel's selection tile. Purely within this
+        // invocation; nothing survives it. Guards mirror the standalone
+        // score-table/cast-sink/norm-sink top-8 route exactly, so any
+        // decline reproduces the promoted two-dispatch behavior.
+        var mergedSharedActivated: MLXArray?
+        var mergedRoutes: (MLXArray, MLXArray)?
+        if lagunaDecodeRouterTop8Enabled,
+            lagunaDecodeRouterCastSinkEnabled,
+            lagunaDecodeRouterNormSinkEnabled,
+            lagunaDecodeRouterOrdinalEnabled,
+            lagunaDecodeRouterOrdinalScoreTableEnabled,
+            gate.normTopkProb,
+            gate.topK == LagunaConstants.numExpertsPerTok,
+            gate.routerLogitSoftcapping == 0,
+            let routerLogits,
+            let banks = sharedExpert.fusedSharedBanks(x),
+            let merged = lagunaSharedSwiGLUTop8QMV(
+                x,
+                fusedWeight: banks.gateUpWeight,
+                fusedScales: banks.gateUpScales,
+                logits: routerLogits,
+                correctionBias: gate.eScoreCorrectionBias.asType(.float32))
+        {
+            mergedSharedActivated = merged.activated
+            mergedRoutes = (merged.indices, merged.weights)
+        }
+        let (inds, weights) = mergedRoutes ?? gate(x, logits: routerLogits)
         var y: MLXArray
         var routedAlreadyReduced = false
         var sortedTailInverseOrder: MLXArray?
@@ -9795,11 +10240,6 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
             // fully stock sorted gather-GEMM path and never see the fused
             // bank.
             let activated: MLXArray
-            // Set when the routed and shared gate/up QMVs were issued as one
-            // dispatch below, so the shared half of that same dispatch is
-            // handed to the down projection instead of being issued again.
-            // Purely within this invocation; nothing survives it.
-            var mergedSharedActivated: MLXArray?
             if lagunaFusedRoutedSwiGLUQMVEnabled,
                 x.dtype == .bfloat16,
                 x.shape == [1, 1, LagunaConstants.hiddenSize],
