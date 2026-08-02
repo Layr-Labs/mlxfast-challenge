@@ -4490,8 +4490,14 @@ private let lagunaDecodeNVFP4QKVR1Source = """
 
     uint column = simd_lid * values_per_thread;
     for (uint k = 0; k < axis_size; k += block_size) {
-        for (uint i = 0; i < values_per_thread; ++i) {
-            x_thread[i] = float(normalized[column + i]);
+        const device vec<bfloat, 4>* input_vectors =
+            (const device vec<bfloat, 4>*)(normalized + column);
+        for (uint i = 0; i < values_per_thread / 4; ++i) {
+            const vec<bfloat, 4> values = input_vectors[i];
+            x_thread[4 * i] = float(values[0]);
+            x_thread[4 * i + 1] = float(values[1]);
+            x_thread[4 * i + 2] = float(values[2]);
+            x_thread[4 * i + 3] = float(values[3]);
         }
         result += laguna_tail_nvfp4_qdot(
             ws, x_thread, laguna_tail_nvfp4_scale(sc[0]));
