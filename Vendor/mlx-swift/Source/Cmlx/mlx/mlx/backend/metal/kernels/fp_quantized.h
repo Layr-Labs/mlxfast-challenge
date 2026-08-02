@@ -520,7 +520,7 @@ METAL_FUNC void fp_qmv_quad_impl(
   }
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int num_simdgroups = 2>
 METAL_FUNC void fp_qmv_fast_impl(
     const device uint32_t* w,
     const device uint8_t* scales,
@@ -532,7 +532,6 @@ METAL_FUNC void fp_qmv_fast_impl(
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int packs_per_thread = 2;
-  constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int pack_factor = get_pack_factor<32, bits>();
   constexpr int bytes_per_pack = get_bytes_per_pack<32>();
@@ -1228,7 +1227,12 @@ template <typename T, int group_size, int bits, int D, bool batched>
       w, scales, x, y, in_vec_size, out_vec_size, tid, quad_gid, quad_lid);
 }
 
-template <typename T, int group_size, int bits, bool batched>
+// num_simdgroups defaults to the stock 2; the host's wide branch instantiates
+// 4/8 for 128/256-thread threadgroups — a bit-exact whole-row re-tiling
+// (each row's K reduction keeps its per-lane column ownership, block order
+// and single simd_sum; geometry only moves whole rows between threadgroups).
+template <typename T, int group_size, int bits, bool batched,
+          int num_simdgroups = 2>
 [[kernel]] void fp_qmv_fast(
     const device uint32_t* w,
     const device uint8_t* scales,
@@ -1263,7 +1267,7 @@ template <typename T, int group_size, int bits, bool batched>
         s_strides,
         tid);
   }
-  fp_qmv_fast_impl<T, group_size, bits>(
+  fp_qmv_fast_impl<T, group_size, bits, num_simdgroups>(
       w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 

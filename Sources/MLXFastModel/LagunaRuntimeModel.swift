@@ -332,7 +332,9 @@ let lagunaSharedSwiGLUQMVRows1Enabled =
 
 /// Folds the per-head softplus gate into the output projection's GEMV (see
 /// `lagunaGatedOutputProjectionSource`), with one kernel variant per attention
-/// family. Set `DARKBLOOM_FUSED_GATED_OUTPUT=0` to ablate.
+/// family. Set `DARKBLOOM_FUSED_GATED_OUTPUT=0` to ablate. (Single-variable
+/// ranked ablation measured decode-neutral — candidate decode 5.307 vs 5.302
+/// ms/token on adjacent same-era runs — so the fusion stays.)
 let lagunaFusedGatedOutputProjectionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATED_OUTPUT"] != "0"
 
