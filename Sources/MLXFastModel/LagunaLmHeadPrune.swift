@@ -156,6 +156,13 @@ private let lagunaLmHeadCoarseV5Enabled =
     // DARKBLOOM_LMHEAD_COARSE_V5=0 restores the int6 v4 arm byte-for-byte.
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COARSE_V5"] != "0"
 
+/// Skip the stock exact GEMV work for v5 rows whose inline candidate bit is
+/// clear. DEFAULT ON; only literal "0" selects the unconditional four-row
+/// exact loop for same-binary A/B.
+private let lagunaLmHeadRowSelectiveExactEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LMHEAD_ROW_SELECTIVE_EXACT"] != "0"
+
 /// Debug instrumentation for the v5 arm: per-step candidate count on stderr
 /// (forces a GPU sync per decode step; NEVER set on a timing run). Used once
 /// to confirm the offline candidate percentiles transfer to the device.
@@ -1658,7 +1665,9 @@ private let lagunaLmHeadInlineExactKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// The shipped default: the inline-mask exact pass over a BF16 `delta`.
+/// The v5 inline-mask exact pass over a BF16 `delta`, with lm_head rows read
+/// only for inline candidates. The unconditional four-row loop remains below
+/// as a process-scoped same-binary control.
 /// Textually the kernel above with the two `delta[r]` reads widened by
 /// `float(...)` -- an exact conversion -- and nothing else changed: the same
 /// fixed four-row block per simdgroup, the same stock `gemv_al_bfloat16`
@@ -1672,6 +1681,100 @@ private let lagunaLmHeadInlineExactKernel = MLXFast.metalKernel(
 /// certified-below `bfloat(coarse[r])`, which cannot move the argmax.
 /// `coarse` is untouched FP32, so skipped slots keep the exact bits the FP32
 /// arm would store.
+private let lagunaLmHeadInlineExactDeltaBF16RowSelectiveKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_inline_mask_block_delta_bf16_row_selective_v1",
+    inputNames: ["coarse", "delta", "thr", "lm_head", "x"],
+    outputNames: ["assembled"],
+    source: """
+        constexpr uint VOCAB = 100352;
+        constexpr uint K = 2048;
+
+        uint tgid = threadgroup_position_in_grid.x;
+        uint sgid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        // This simdgroup's fixed four output rows. VOCAB is 3136 * 32, so the
+        // grid tiles it exactly; the bounds test is belt-and-braces.
+        uint base = tgid * 32 + sgid * 4;
+
+        // The predicate is simdgroup-uniform, so lane 0 forms it once and
+        // broadcasts the four row decisions. Reusing the mask below removes
+        // the same coarse/delta/threshold reads from the final write path.
+        uint candidate_mask = 0;
+        if (lane == 0) {
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                uint r = base + tm;
+                if (r < VOCAB && coarse[r] + float(delta[r]) >= thr[0]) {
+                    candidate_mask |= 1u << tm;
+                }
+            }
+        }
+        candidate_mask = simd_broadcast(candidate_mask, 0);
+
+        if (candidate_mask == 0) {
+            if (lane < 4 && base + lane < VOCAB) {
+                assembled[base + lane] = bfloat(coarse[base + lane]);
+            }
+            return;
+        }
+
+        // --- stock gemv_al replica begin (gemv.h:151-289) ---
+        thread float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread bfloat inter[4];
+        thread float v_coeff[4];
+        uint bn = lane * 4;
+        for (uint i = 0; i < 16; ++i) {
+            vec<bfloat, 4> xv =
+                *((const device vec<bfloat, 4>*)(x + bn));
+            v_coeff[0] = float(xv.x);
+            v_coeff[1] = float(xv.y);
+            v_coeff[2] = float(xv.z);
+            v_coeff[3] = float(xv.w);
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                if ((candidate_mask & (1u << tm)) != 0) {
+                    const device bfloat* mrow = lm_head + size_t(base + tm) * K;
+                    vec<bfloat, 4> mv =
+                        *((const device vec<bfloat, 4>*)(mrow + bn));
+                    inter[0] = mv.x;
+                    inter[1] = mv.y;
+                    inter[2] = mv.z;
+                    inter[3] = mv.w;
+                    result[tm] += inter[0] * v_coeff[0];
+                    result[tm] += inter[1] * v_coeff[1];
+                    result[tm] += inter[2] * v_coeff[2];
+                    result[tm] += inter[3] * v_coeff[3];
+                }
+            }
+            bn += 128;
+        }
+        #pragma unroll
+        for (uint tm = 0; tm < 4; ++tm) {
+            #pragma unroll
+            for (ushort sn = 16; sn >= 1; sn >>= 1) {
+                result[tm] += simd_shuffle_down(result[tm], sn);
+            }
+        }
+        // --- stock gemv_al replica end ---
+        if (lane == 0) {
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                uint r = base + tm;
+                if (r < VOCAB) {
+                    assembled[r] = (candidate_mask & (1u << tm)) != 0
+                        ? bfloat(result[tm])
+                        : bfloat(coarse[r]);
+                }
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Original unconditional BF16-delta exact pass. The non-v5 path keeps this
+/// binding and JIT identity unchanged; literal
+/// `DARKBLOOM_LMHEAD_ROW_SELECTIVE_EXACT=0` also selects it for v5.
 private let lagunaLmHeadInlineExactDeltaBF16Kernel = MLXFast.metalKernel(
     name: "laguna_lmhead_exact_inline_mask_block_delta_bf16_lane0_mask_v1",
     inputNames: ["coarse", "delta", "thr", "lm_head", "x"],
@@ -1948,7 +2051,11 @@ final class LagunaLmHeadPruner {
                 FileHandle.standardError.write(
                     Data("lmhead-v5 candidates: \(count)\n".utf8))
             }
-            let assembled5 = lagunaLmHeadInlineExactDeltaBF16Kernel(
+            let exactKernel5 =
+                lagunaLmHeadRowSelectiveExactEnabled
+                ? lagunaLmHeadInlineExactDeltaBF16RowSelectiveKernel
+                : lagunaLmHeadInlineExactDeltaBF16Kernel
+            let assembled5 = exactKernel5(
                 [coarse5, delta5, thr5, lmHeadWeight, x],
                 grid: (vocab / 32 * 256, 1, 1),
                 threadGroup: (256, 1, 1),
