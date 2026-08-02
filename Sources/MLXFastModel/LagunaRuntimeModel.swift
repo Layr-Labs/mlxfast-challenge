@@ -4601,6 +4601,19 @@ private let lagunaTailNormQKVGateEnabled =
 /// like the other fusion layer knobs: NVFP4 layers below `N` are eligible
 /// (default 40, the whole active NVFP4 window), clamped to 0...numHiddenLayers
 /// and forced to 0 while the fusion is disabled.
+/// Lowest layer index the fused norm+QKV+gate kernel is allowed to claim
+/// (`DARKBLOOM_TAIL_NORM_QKV_GATE_FROM`, default 32). See the derivation at
+/// the guard in `lagunaTailNormQKVGate` for why this is 32 rather than
+/// tracking the NVFP4 window: the fusion re-derives the 2048-wide RMSNorm in
+/// each of its ~1288 threadgroups, so its cost grows with coverage while the
+/// dispatch it saves does not. Set `=0` to reproduce the widened behaviour.
+private let lagunaTailNormQKVGateFrom: Int = {
+    let requested = Int(
+        ProcessInfo.processInfo.environment["DARKBLOOM_TAIL_NORM_QKV_GATE_FROM"]
+            ?? "32") ?? 32
+    return min(max(requested, 0), LagunaConstants.numHiddenLayers)
+}()
+
 private let lagunaTailNormQKVGateLayers: Int = {
     guard lagunaTailNormQKVGateEnabled else { return 0 }
     let requested = Int(
@@ -4627,10 +4640,34 @@ func lagunaTailNormQKVGate(
     let qkvRows =
         (heads + 2 * LagunaConstants.numKeyValueHeads) * LagunaConstants.headDim
     guard lagunaTailNormQKVGateEnabled,
-        // The format guards below already select the covered layers; the
-        // old fixed `>= 32` floor stranded widened NVFP4 layers on the
+        // The format guards below already select the covered layers, so this
+        // floor is purely an economic choice about WHERE the fusion pays.
+        //
+        // It was widened to track `lagunaNativeAffineNVFP4From` on the
+        // reasoning that layers left below it were "stranded" on the
         // 3-dispatch fallback (separate norm + generic NVFP4 qmv + gate qmv).
-        layerIdx >= (lagunaNativeAffineNVFP4From ?? 32),
+        // The ranked record says the fallback is the cheaper path once the
+        // covered set is large, and the effect is separable from the NVFP4
+        // widening it rode in with:
+        //
+        // Fitting the marginal byte rate on four submissions that changed
+        // ONLY the `_NVFP4_FROM` literal against a floor-32 base (24->17,
+        // 17->12, 17->10, 17->8) gives 622.9 +/- 22.7 GB/s (3.6% sd, n=4,
+        // two different bases). The two submissions that ALSO widened this
+        // floor both fall off that fit in the same direction, normalised per
+        // covered layer: 1451ee6 (12 layers) predicted -128.8 us / observed
+        // -86.2 us, and db17321 (32 layers) predicted -541.6 us / observed
+        // -441.6 us -- a fusion cost of +3.13 to +3.55 us per layer, sign
+        // consistent across independent authors, bases and coverage sizes.
+        //
+        // The mechanism is the same one that makes this kernel a win at eight
+        // layers and a loss at forty: it re-derives the 2048-wide RMSNorm in
+        // every one of its ~1288 threadgroups, so the redundant reduction
+        // scales with coverage while the dispatch saving does not.
+        //
+        // `DARKBLOOM_TAIL_NORM_QKV_GATE_FROM` restores any other floor in the
+        // same binary; `=0` reproduces the widened behaviour exactly.
+        layerIdx >= lagunaTailNormQKVGateFrom,
         layerIdx < lagunaTailNormQKVGateLayers,
         qkvBank.mode == .nvfp4, qkvBank.bits == 4, qkvBank.groupSize == 16,
         qkvBank.biases == nil,
