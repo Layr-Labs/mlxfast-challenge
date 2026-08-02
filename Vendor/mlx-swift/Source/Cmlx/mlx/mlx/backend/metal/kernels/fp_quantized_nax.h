@@ -139,9 +139,12 @@ inline void dequantize(uint8_t w, U scale, threadgroup U* w_local) {
 // mismatches out of 404,226,048 staged values.
 ///////////////////////////////////////////////////////////////////////////////
 
-// Per-group NVFP4 scale with fp4's 2^14 renormalization folded in (Change 1).
+// Per-group NVFP4 scale with both fp8's 2^8 decode and fp4's 2^14
+// renormalization folded into one exact float multiply. Adding the sign bit
+// to itself carries it into half bit 15 when the byte is shifted by seven.
 static inline float fp4nv_scale_x16384(uint8_t s) {
-  return float(*(thread fp8_e4m3*)(&s)) * 16384.0f;
+  const ushort raw = ushort((uint(s) + (uint(s) & 128u)) << 7);
+  return float(as_type<half>(raw)) * 4194304.0f;
 }
 
 // Four packed bytes -> one uint32 in little-endian nibble order. Read through
