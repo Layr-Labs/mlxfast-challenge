@@ -112,10 +112,129 @@ private let inversePermutationScatterKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+/// Stable counting sort for the flattened route table: uint32 keys in
+/// `[0, 256)`, `argSort`-identical output by construction. The vendored
+/// mbsort is stable at every stage (thread sort swaps only on strictly-less,
+/// the merge prefers A on ties), so its tie order is input order; a stable
+/// counting sort therefore reproduces the exact permutation for EVERY input,
+/// not just tested ones. Three dispatches replace the comparison-sort chain.
+/// Counts use threadgroup atomics (sums are commutative -> deterministic);
+/// the scatter is one thread per key walking the tile slice in input order,
+/// so no write order ever depends on scheduling.
+/// DEFAULT ON; `DARKBLOOM_ROUTE_COUNTING_SORT=0` restores `argSort`.
+private let routeCountingSortEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTE_COUNTING_SORT"] != "0"
+
+private let routeSortTile = 128
+
+private let routeTileHistKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort_hist_u32_v1",
+    inputNames: ["keys"],
+    outputNames: ["tile_hist"],
+    source: """
+        constexpr uint TILE = \(routeSortTile);
+        uint t = threadgroup_position_in_grid.x;
+        uint lid = thread_position_in_threadgroup.x;
+        threadgroup atomic_uint counts[256];
+        atomic_store_explicit(&counts[lid], 0u, memory_order_relaxed);
+        atomic_store_explicit(&counts[lid + 128], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint key = keys[t * TILE + lid];
+        atomic_fetch_add_explicit(&counts[key], 1u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tile_hist[t * 256 + lid] =
+            atomic_load_explicit(&counts[lid], memory_order_relaxed);
+        tile_hist[t * 256 + lid + 128] =
+            atomic_load_explicit(&counts[lid + 128], memory_order_relaxed);
+        """,
+    ensureRowContiguous: false
+)
+
+private let routeScanKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort_scan_u32_v1",
+    inputNames: ["tile_hist"],
+    outputNames: ["base"],
+    source: """
+        // One threadgroup of 256 threads: total per key, then exclusive scan
+        // over keys, serial on lane 0 (256 adds, launched once per forward).
+        uint k = thread_position_in_threadgroup.x;
+        uint tiles = tile_hist_shape[0] / 256;
+        uint total = 0;
+        for (uint t = 0; t < tiles; ++t) {
+            total += tile_hist[t * 256 + k];
+        }
+        threadgroup uint totals[256];
+        totals[k] = total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (k == 0) {
+            uint acc = 0;
+            for (uint i = 0; i < 256; ++i) {
+                uint c = totals[i];
+                totals[i] = acc;
+                acc += c;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        base[k] = totals[k];
+        """,
+    ensureRowContiguous: false
+)
+
+private let routeScatterKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort_scatter_u32_v1",
+    inputNames: ["keys", "tile_hist", "base"],
+    outputNames: ["order"],
+    source: """
+        constexpr uint TILE = \(routeSortTile);
+        uint t = threadgroup_position_in_grid.x;
+        uint k = thread_position_in_threadgroup.x;
+        // Rank base for key k in tile t: global base + counts in earlier tiles.
+        uint off = base[k];
+        for (uint tp = 0; tp < t; ++tp) {
+            off += tile_hist[tp * 256 + k];
+        }
+        // Walk this tile's slice in input order: stability by construction.
+        for (uint i = 0; i < TILE; ++i) {
+            uint idx = t * TILE + i;
+            if (keys[idx] == k) {
+                order[off++] = idx;
+            }
+        }
+        """,
+    ensureRowContiguous: false
+)
+
+private func routeCountingSort(_ indices: MLXArray) -> MLXArray? {
+    let n = indices.size
+    guard routeCountingSortEnabled, n > 0, n % routeSortTile == 0 else { return nil }
+    let tiles = n / routeSortTile
+    let hist = routeTileHistKernel(
+        [indices],
+        grid: (tiles * routeSortTile, 1, 1),
+        threadGroup: (routeSortTile, 1, 1),
+        outputShapes: [[tiles * 256]],
+        outputDTypes: [.uint32]
+    )[0]
+    let base = routeScanKernel(
+        [hist],
+        grid: (256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[256]],
+        outputDTypes: [.uint32]
+    )[0]
+    return routeScatterKernel(
+        [indices, hist, base],
+        grid: (tiles * 256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[n]],
+        outputDTypes: [.uint32]
+    )[0]
+}
+
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
-    let order = argSort(indices)
+    let order = routeCountingSort(indices) ?? argSort(indices)
     let inverseOrder: MLXArray
     if inversePermutationScatterEnabled && order.size > 0 {
         inverseOrder = inversePermutationScatterKernel(
