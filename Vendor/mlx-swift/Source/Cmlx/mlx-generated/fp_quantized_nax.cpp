@@ -1835,22 +1835,6 @@ template <
   const short tm = SM * (simd_group_id / WN);
   const short tn = SN * (simd_group_id % WN);
 
-#ifdef DARKBLOOM_SWIGLU_REGLOCAL
-  // DARKBLOOM_SWIGLU_REGLOCAL: compute the fused swiglu epilogue straight
-  // from the MMA Dtile fragments instead of round-tripping them through
-  // gate_up_stage. Only legal when one simdgroup owns the FULL BN-wide
-  // column band of its rows (WN == 1 -> SN == BN, tn == 0) at the shipped
-  // variant-5 geometry (BN = 64, SM = BM / WM = 16 -> TM = 1, TN = 4):
-  // then the gate column c and the up column c + 32 of the same output row
-  // live in the SAME LANE at the same element slot of Dtile fragments j
-  // and j + 2 (BaseNAXFrag layout: col = 16 * j + fn + jj, row = fm + 8 *
-  // i), so silu can be computed register-locally with zero cross-lane
-  // traffic. Every other geometry keeps the stock threadgroup-staged
-  // epilogue below unchanged.
-  constexpr bool kSwigluRegLocal =
-      (WN == 1) && (BN == 64) && ((BM / WM) == 16);
-#endif // DARKBLOOM_SWIGLU_REGLOCAL
-
   for (int expert_slot = 0; expert_slot < experts / expert_groups;
        ++expert_slot) {
     // Keep each threadgroup's row intervals and expert weight regions
@@ -1859,7 +1843,12 @@ template <
         static_cast<uint32_t>(
             tid.y * (experts / expert_groups) + expert_slot);
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // With Laguna's EG256 model geometry this threadgroup owns one expert slot,
+    // so there is no preceding slot whose threadgroup-memory reads must retire.
+    // Multi-slot specializations retain the original WAR barrier.
+    if constexpr (experts / expert_groups > 1) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     if (lid == 0) {
       bounds[0] = laguna_sorted_lower_bound(indices, M, expert);
       bounds[1] = laguna_sorted_lower_bound(indices, M, expert + 1);
@@ -1971,58 +1960,14 @@ template <
         xn += BK;
       }
 
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Static routed-down (K=512,N=2048) stores its register-resident Dtile
+      // directly to device memory and never aliases Ws as gate_up_stage.
+      if constexpr (!(fixed_K == 512 && fixed_N == 2048)) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
       const bool fuse_swiglu =
           kernel_N == 1024 && kernel_K == 2048;
       if (fuse_swiglu) {
-#ifdef DARKBLOOM_SWIGLU_REGLOCAL
-        // Register-local swiglu (geometry guard: kSwigluRegLocal above).
-        // EXACTNESS (class A, bit-exact): gate and up are the SAME float
-        // Dtile elements the stock path routes through gate_up_stage, cast
-        // to bfloat by the same static_cast the tile store performs; the
-        // swiglu chain replicates the stock expressions type-for-type in
-        // textual order and writes the same y address. Only the
-        // threadgroup round-trip and its two barriers per ct disappear.
-        // fp contract(off) pins the rounding boundaries: no FMA fusion may
-        // move the chain off the stock scalar sequence.
-        if constexpr (kSwigluRegLocal) {
-#pragma clang fp contract(off)
-          constexpr int activated_cols = BN / 2;
-          const short qid = short(simd_lane_id >> 2);
-          const short fm = (qid & 4) | ((short(simd_lane_id) >> 1) & 3);
-          const short fn = ((qid & 2) | (short(simd_lane_id) & 1)) * 4;
-          STEEL_PRAGMA_UNROLL
-          for (int ct = 0; ct < kFoldCT; ++ct) {
-            STEEL_PRAGMA_UNROLL
-            for (short jf = 0; jf < 2; ++jf) {
-              STEEL_PRAGMA_UNROLL
-              for (short ie = 0; ie < 2; ++ie) {
-                const short row = fm + ie * 8;
-                if (row < sgp_sm) {
-                  STEEL_PRAGMA_UNROLL
-                  for (short jj = 0; jj < 4; ++jj) {
-                    const int col = jf * 16 + fn + jj;
-                    const bfloat gate = static_cast<bfloat>(
-                        Dtile[ct].frag_at(0, jf)[ie * 4 + jj]);
-                    const bfloat up = static_cast<bfloat>(
-                        Dtile[ct].frag_at(0, jf + 2)[ie * 4 + jj]);
-                    const bfloat exp_abs = metal::exp(metal::abs(gate));
-                    const bfloat denominator = bfloat(1) + exp_abs;
-                    const bfloat z = bfloat(1) / denominator;
-                    const bfloat sigmoid =
-                        gate < bfloat(0) ? z : bfloat(1) - z;
-                    const bfloat silu = bfloat(gate * sigmoid);
-                    y[size_t(chunk_start + tm + row) * (kernel_N / 2) +
-                      size_t(tid.x * kFoldCT + ct) * activated_cols + col] =
-                        bfloat(silu * up);
-                  }
-                }
-              }
-            }
-          }
-        }
-        if constexpr (!kSwigluRegLocal) {
-#endif // DARKBLOOM_SWIGLU_REGLOCAL
         STEEL_PRAGMA_UNROLL
         for (int ct = 0; ct < kFoldCT; ++ct) {
           if (sg_active) {
@@ -2057,9 +2002,6 @@ template <
           // the end of its swiglu).
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-#ifdef DARKBLOOM_SWIGLU_REGLOCAL
-        }
-#endif // DARKBLOOM_SWIGLU_REGLOCAL
       } else if (sg_active) {
         STEEL_PRAGMA_UNROLL
         for (int ct = 0; ct < kFoldCT; ++ct) {
@@ -2233,50 +2175,14 @@ template <
       }
 #endif // DARKBLOOM_STAGE2_GATHER
 
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Static routed-down (K=512,N=2048) stores its register-resident Dtile
+      // directly to device memory and never aliases Ws as gate_up_stage.
+      if constexpr (!(fixed_K == 512 && fixed_N == 2048)) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
       const bool fuse_swiglu =
           kernel_N == 1024 && kernel_K == 2048;
       if (fuse_swiglu) {
-#ifdef DARKBLOOM_SWIGLU_REGLOCAL
-        // Register-local swiglu, non-folded arm: identical mechanism and
-        // exactness argument as the DARKBLOOM_GATHER_XMAJOR site above,
-        // with the single Dtile and the stock per-threadgroup y column
-        // base.
-        if constexpr (kSwigluRegLocal) {
-#pragma clang fp contract(off)
-          constexpr int activated_cols = BN / 2;
-          const short qid = short(simd_lane_id >> 2);
-          const short fm = (qid & 4) | ((short(simd_lane_id) >> 1) & 3);
-          const short fn = ((qid & 2) | (short(simd_lane_id) & 1)) * 4;
-          STEEL_PRAGMA_UNROLL
-          for (short jf = 0; jf < 2; ++jf) {
-            STEEL_PRAGMA_UNROLL
-            for (short ie = 0; ie < 2; ++ie) {
-              const short row = fm + ie * 8;
-              if (row < sgp_sm) {
-                STEEL_PRAGMA_UNROLL
-                for (short jj = 0; jj < 4; ++jj) {
-                  const int col = jf * 16 + fn + jj;
-                  const bfloat gate = static_cast<bfloat>(
-                      Dtile.frag_at(0, jf)[ie * 4 + jj]);
-                  const bfloat up = static_cast<bfloat>(
-                      Dtile.frag_at(0, jf + 2)[ie * 4 + jj]);
-                  const bfloat exp_abs = metal::exp(metal::abs(gate));
-                  const bfloat denominator = bfloat(1) + exp_abs;
-                  const bfloat z = bfloat(1) / denominator;
-                  const bfloat sigmoid =
-                      gate < bfloat(0) ? z : bfloat(1) - z;
-                  const bfloat silu = bfloat(gate * sigmoid);
-                  y[size_t(chunk_start + tm + row) * (kernel_N / 2) +
-                    size_t(tid.x) * activated_cols + col] =
-                      bfloat(silu * up);
-                }
-              }
-            }
-          }
-        }
-        if constexpr (!kSwigluRegLocal) {
-#endif // DARKBLOOM_SWIGLU_REGLOCAL
         if (sg_active) {
           Dtile.template store<bfloat, BN, 1>(
               gate_up_stage + tm * BN + tn);
@@ -2305,9 +2211,6 @@ template <
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-#ifdef DARKBLOOM_SWIGLU_REGLOCAL
-        }
-#endif // DARKBLOOM_SWIGLU_REGLOCAL
       } else if (sg_active) {
         device T* yn =
             y + size_t(chunk_start + tm) * kernel_N + y_col + tn;

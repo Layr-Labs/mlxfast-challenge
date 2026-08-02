@@ -1119,10 +1119,6 @@ MTL::ComputePipelineState* get_steel_gemm_segmented_nax_kernel(
 // Defined in quantized.cpp; parses DARKBLOOM_GATHER_XMAJOR once per process.
 int darkbloom_gather_xmajor_ct();
 
-// Defined in quantized.cpp; parses DARKBLOOM_SWIGLU_REGLOCAL once per
-// process.
-bool darkbloom_swiglu_reglocal();
-
 namespace {
 
 // DARKBLOOM_STAGE2_GATHER: double-buffered (stage-2) weight staging in the
@@ -1182,29 +1178,6 @@ const char* darkbloom_gather_xmajor_define() {
   return define.c_str();
 }
 
-// DARKBLOOM_SWIGLU_REGLOCAL: register-local swiglu epilogue in the
-// expert-aligned gather-QMM. Injected exactly like the levers above:
-// resolved once per process, gated on the expert kernel name, never part
-// of a pipeline specialization key. Default ON -- unset injects the define
-// and the kernel's own geometry guard (WN==1, BN==64, SM==16) picks the
-// register-local path only for the shipped variant-5 tiling; "0" compiles
-// the stock threadgroup-staged epilogue (the guarded blocks preprocess
-// away, byte-identical stock source).
-const char* darkbloom_swiglu_reglocal_define() {
-  static const char* define = [] {
-    const bool v = darkbloom_swiglu_reglocal();
-    if (!v || env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1") {
-      fprintf(
-          stderr,
-          "mlxfast: fusion %s: swiglu_reglocal "
-          "(expert gather-QMM JIT source)\n",
-          v ? "active" : "inactive");
-    }
-    return v ? "\n#define DARKBLOOM_SWIGLU_REGLOCAL 1\n" : "";
-  }();
-  return define;
-}
-
 } // namespace
 
 MTL::ComputePipelineState* get_qmm_nax_kernel(
@@ -1223,9 +1196,6 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
             : "",
         (kernel_name.find("_expert_") != std::string::npos)
             ? darkbloom_gather_xmajor_define()
-            : "",
-        (kernel_name.find("_expert_") != std::string::npos)
-            ? darkbloom_swiglu_reglocal_define()
             : "",
         metal::gemm_nax(),
         metal::quantized_utils(),
