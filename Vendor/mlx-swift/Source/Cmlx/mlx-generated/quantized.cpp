@@ -294,8 +294,13 @@ inline U qdot(
   }
 
   else if (bits == 8) {
-    for (int i = 0; i < values_per_thread; i++) {
-      accum += x_thread[i] * w[i];
+    const device uchar4* ws = (const device uchar4*)w;
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      uchar4 codes = ws[i];
+      accum += x_thread[4 * i] * codes[0];
+      accum += x_thread[4 * i + 1] * codes[1];
+      accum += x_thread[4 * i + 2] * codes[2];
+      accum += x_thread[4 * i + 3] * codes[3];
     }
   }
 

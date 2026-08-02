@@ -756,6 +756,11 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     }
 }()
 
+/// Diagnostic front-edge rung: enqueue layer 0's already-constructed QKV and
+/// gate projections before the rest of that layer's graph is built.
+private let lagunaAttentionProjectionAsyncEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ATTN_PROJECTION_ASYNC"] != "0"
+
 /// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `1`; `0`/`off` disables;
 /// `8` restores the prior default): a ranked measurement on the
 /// 1.87782 base scored stride 1 at 1.88526 (+0.40% vs that base, rejected
@@ -5642,6 +5647,12 @@ final class LagunaRuntimeAttention: Module {
                     )
                 } else {
                     gateLogits = gateProjection(normalized)
+                }
+                if lagunaAttentionProjectionAsyncEnabled,
+                    layerIdx == 0, B == 1, L == 1
+                {
+                    lagunaTrace("attention projection async rung layer 0")
+                    asyncEval(qkv, gateLogits)
                 }
                 // When the fused gate-product kernel will consume the gate at
                 // the output projection, hand it the RAW BF16 logits and skip
