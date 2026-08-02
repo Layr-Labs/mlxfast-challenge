@@ -1593,6 +1593,21 @@ bool darkbloom_swiglu_reglocal() {
   return v;
 }
 
+bool darkbloom_bsearch_hoist() {
+  static const bool v =
+      env::get_var("DARKBLOOM_BSEARCH_HOIST", "") != "0";
+  return v;
+}
+
+// DARKBLOOM_EXPERT_EPILOGUE_BARRIER_ELIDE: skip the expert gather-QMM's
+// post-MMA epilogue barrier when the selected epilogue touches no
+// threadgroup memory (regLocal swiglu / device stores). Default ON.
+bool darkbloom_expert_epilogue_barrier_elide() {
+  static const bool v =
+      env::get_var("DARKBLOOM_EXPERT_EPILOGUE_BARRIER_ELIDE", "") != "0";
+  return v;
+}
+
 void gather_qmm_rhs_nax(
     const array& x_,
     const array& w_,
