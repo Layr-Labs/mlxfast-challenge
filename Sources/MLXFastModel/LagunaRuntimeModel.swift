@@ -4467,9 +4467,39 @@ private let lagunaTailNVFP4QMVHeader = """
 private let lagunaDecodeNVFP4QKVR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_NVFP4_QKV_R1"] != "0"
 
+/// Pack four independent one-row SIMD groups into each QKV threadgroup. The
+/// selector changes only launch ownership: every SIMD group still evaluates
+/// one complete row with the same K-block order, reduction and BF16 epilogue.
+/// Set the variable to `2` to restore the promoted two-group control.
+private let lagunaDecodeNVFP4QKVR1SIMDGroups =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_DECODE_NVFP4_QKV_R1_SIMDGROUPS"] == "2" ? 2 : 4
+
+/// Default-on transfer of the promoted sparse NVFP4 qdot helper to QKV R1. The
+/// common helper preserves the same nibble decode/product order while
+/// eliding the dead `+0` seed and moving the exact 2^22 factor from each of
+/// four K groups to the row's existing BF16 epilogue. Prefill cannot select
+/// QKV R1. Setting the selector to `0` keeps the old tail helper available as
+/// a same-binary control.
+private let lagunaDecodeNVFP4QKVCommonQDotEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_DECODE_NVFP4_QKV_COMMON_QDOT"] != "0"
+
+private let lagunaDecodeNVFP4QKVQDotName =
+    lagunaDecodeNVFP4QKVCommonQDotEnabled
+    ? "laguna_nvfp4_qdot_16" : "laguna_tail_nvfp4_qdot"
+
+private let lagunaDecodeNVFP4QKVScaleName =
+    lagunaDecodeNVFP4QKVCommonQDotEnabled
+    ? "laguna_nvfp4_scale" : "laguna_tail_nvfp4_scale"
+
+private let lagunaDecodeNVFP4QKVRowScaleSuffix =
+    lagunaDecodeNVFP4QKVCommonQDotEnabled
+    ? lagunaNvfp4RowScaleSuffix : ""
+
 private let lagunaDecodeNVFP4QKVR1Source = """
     constexpr uint axis_size = 2048;
-    constexpr uint num_simdgroups = 2;
+    constexpr uint num_simdgroups = \(lagunaDecodeNVFP4QKVR1SIMDGroups);
     constexpr uint values_per_thread = 16;
     constexpr uint block_size = 512;
     constexpr uint in_vec_size_w = axis_size / 2;
@@ -4493,8 +4523,8 @@ private let lagunaDecodeNVFP4QKVR1Source = """
         for (uint i = 0; i < values_per_thread; ++i) {
             x_thread[i] = float(normalized[column + i]);
         }
-        result += laguna_tail_nvfp4_qdot(
-            ws, x_thread, laguna_tail_nvfp4_scale(sc[0]));
+        result += \(lagunaDecodeNVFP4QKVQDotName)(
+            ws, x_thread, \(lagunaDecodeNVFP4QKVScaleName)(sc[0]));
         ws += block_size / 2;
         sc += block_size / 16;
         column += block_size;
@@ -4502,7 +4532,8 @@ private let lagunaDecodeNVFP4QKVR1Source = """
 
     result = simd_sum(result);
     if (simd_lid == 0) {
-        projected[out_row] = bfloat(result);
+        projected[out_row] =
+            bfloat(result\(lagunaDecodeNVFP4QKVRowScaleSuffix));
     }
     """
 
@@ -4510,11 +4541,14 @@ private let lagunaDecodeNVFP4QKVR1Kernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_decode_nvfp4_qkv_h\(heads)_r1_v1",
+            name: "laguna_decode_nvfp4_qkv_h\(heads)_r1_v1"
+                + "_sg\(lagunaDecodeNVFP4QKVR1SIMDGroups)"
+                + (lagunaDecodeNVFP4QKVCommonQDotEnabled ? "_cq1" : ""),
             inputNames: ["normalized", "weight_codes", "weight_scales"],
             outputNames: ["projected"],
             source: lagunaDecodeNVFP4QKVR1Source,
-            header: lagunaTailNVFP4QMVHeader,
+            header: lagunaDecodeNVFP4QKVCommonQDotEnabled
+                ? lagunaSharedSwiGLUQMVHeader : lagunaTailNVFP4QMVHeader,
             ensureRowContiguous: true)
     }
     return kernels
@@ -4537,14 +4571,17 @@ private func lagunaDecodeNVFP4QKVR1(
         bank.packedCodes.shape == [rows, hidden / 8],
         bank.scales.dtype == .uint8,
         bank.scales.shape == [rows, hidden / 16],
-        rows % 2 == 0,
+        rows % lagunaDecodeNVFP4QKVR1SIMDGroups == 0,
         let kernel = lagunaDecodeNVFP4QKVR1Kernels[heads]
     else { return nil }
     lagunaTrace("decode nvfp4 qkv r1 h\(heads)")
+    if lagunaDecodeNVFP4QKVCommonQDotEnabled {
+        lagunaTrace("decode nvfp4 qkv common qdot")
+    }
     return kernel(
         [normalized, bank.packedCodes, bank.scales],
-        grid: ((rows / 2) * 64, 1, 1),
-        threadGroup: (64, 1, 1),
+        grid: (rows * 32, 1, 1),
+        threadGroup: (lagunaDecodeNVFP4QKVR1SIMDGroups * 32, 1, 1),
         outputShapes: [[1, 1, rows]],
         outputDTypes: [.bfloat16]
     )[0]
