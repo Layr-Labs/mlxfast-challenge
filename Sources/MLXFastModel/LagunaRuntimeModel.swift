@@ -4135,13 +4135,25 @@ func lagunaGatedAffineOProjNVFP4Source(
     let loadInput = preActivatedGate
         ? """
         float g=float(gate_values[column>>head_shift]);
-        for(uint i=0;i<values_per_thread;++i)
-            x_thread[i]=float(bfloat(float(xp[i])*g));
+        const device vec<bfloat, 4>* xvecs = (const device vec<bfloat, 4>*)xp;
+        for (uint i = 0; i < values_per_thread / 4; ++i) {
+            const vec<bfloat, 4> xv4 = xvecs[i];
+            x_thread[4 * i] = float(bfloat(float(xv4[0]) * g));
+            x_thread[4 * i + 1] = float(bfloat(float(xv4[1]) * g));
+            x_thread[4 * i + 2] = float(bfloat(float(xv4[2]) * g));
+            x_thread[4 * i + 3] = float(bfloat(float(xv4[3]) * g));
+        }
         """
         : """
         float g=gt[column>>head_shift];
-        for(uint i=0;i<values_per_thread;++i)
-            x_thread[i]=float(bfloat(float(xp[i])*g));
+        const device vec<bfloat, 4>* xvecs = (const device vec<bfloat, 4>*)xp;
+        for (uint i = 0; i < values_per_thread / 4; ++i) {
+            const vec<bfloat, 4> xv4 = xvecs[i];
+            x_thread[4 * i] = float(bfloat(float(xv4[0]) * g));
+            x_thread[4 * i + 1] = float(bfloat(float(xv4[1]) * g));
+            x_thread[4 * i + 2] = float(bfloat(float(xv4[2]) * g));
+            x_thread[4 * i + 3] = float(bfloat(float(xv4[3]) * g));
+        }
         """
     return """
     constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
@@ -4224,7 +4236,7 @@ private let lagunaGatedAffineOProjNVFP4Kernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_v1"
+            name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_v2"
                 + (lagunaNvfp4QmvSignCarryEnabled ? "_sc1" : "")
                 + (lagunaNvfp4QmvSeedElisionEnabled ? "_se1" : ""),
             inputNames: [
@@ -4326,7 +4338,7 @@ private let lagunaActivatedOProjKernels: [Int: MLXFast.MLXFastKernel] = {
     var result: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         result[heads] = MLXFast.metalKernel(
-            name: "laguna_oproj_act_h\(heads)_v1"
+            name: "laguna_oproj_act_h\(heads)_v2"
                 + (lagunaNvfp4QmvSignCarryEnabled ? "_sc1" : "")
                 + (lagunaNvfp4QmvSeedElisionEnabled ? "_se1" : ""),
             inputNames: [
