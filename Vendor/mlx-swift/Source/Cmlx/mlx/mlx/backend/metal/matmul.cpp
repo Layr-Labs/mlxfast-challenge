@@ -235,6 +235,27 @@ void steel_matmul_regular_axpby_nax(
 
     bm = 64;
     wm = 2;
+
+    // DARKBLOOM_NAX_TILE: the temp routing above tunes bm/bk/wm for the
+    // Max/Ultra classes but leaves bn=128/wn=4 at the generic defaults.
+    // On narrow-N shapes (o_proj prefill: M=512, N=2048 -> only 8x16 =
+    // 128 threadgroups, ~3 waves on a 40-core GPU) that under-fills the
+    // machine. Variant 1 narrows the N tile to bn=64/wn=2 for every
+    // shape; variant 2 does it only when N <= 4096. Pure column
+    // re-partitioning: each output element's k-ascending MMA chain is
+    // untouched, so every variant is bit-exact. Default 0 = stock.
+    static const int nax_tile_variant = []() {
+      const char* raw = getenv("DARKBLOOM_NAX_TILE");
+      if (raw == nullptr) {
+        return 0;
+      }
+      int v = atoi(raw);
+      return (v >= 0 && v <= 2) ? v : 0;
+    }();
+    if (nax_tile_variant == 1 || (nax_tile_variant == 2 && N <= 4096)) {
+      bn = 64;
+      wn = 2;
+    }
   }
 
   // Prepare kernel name
@@ -303,6 +324,24 @@ void steel_matmul_regular_axpby_nax(
   int swizzle_log = tm <= 3 ? 0 : 1;
   if (devc == 's' || devc == 'c' || devc == 'd') {
     swizzle_log = 2;
+    // DARKBLOOM_NAX_SWIZZLE: override the Max/Ultra swizzle grouping.
+    // Pure tile-order permutation — no threadgroup's arithmetic or output
+    // ownership changes — so every value is bit-exact. At the frozen
+    // 512-token prefill (bm=64 -> tm=8), swizzle 3 groups all eight
+    // M-tile rows so each weight block streams from DRAM once instead of
+    // twice; the QKV weight block (~42 MB) is at SLC scale, exactly the
+    // regime where the second pass misses.
+    static const int swz = []() {
+      const char* raw = getenv("DARKBLOOM_NAX_SWIZZLE");
+      if (raw == nullptr) {
+        return -1;
+      }
+      int v = atoi(raw);
+      return (v >= 0 && v <= 5) ? v : -1;
+    }();
+    if (swz >= 0) {
+      swizzle_log = swz;
+    }
   }
 
   // Prepare steel matmul params
