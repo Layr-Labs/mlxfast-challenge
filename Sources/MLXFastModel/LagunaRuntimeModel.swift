@@ -4348,6 +4348,97 @@ private let lagunaTailNVFP4QMVHeader = """
     }
     """
 
+/// Decode-only, static-shape R1 schedule for the live group-16 NVFP4 QKV
+/// bank. The generated QMV gives each SIMD group four output rows. This twin
+/// keeps every row's K order, FP32 accumulator, simd reduction and BF16 cast
+/// intact while giving each SIMD one row, matching the M5-positive routed and
+/// shared expert schedules. Multi-token prefill cannot pass the shape guard.
+private let lagunaDecodeNVFP4QKVR1Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_NVFP4_QKV_R1"] != "0"
+
+private let lagunaDecodeNVFP4QKVR1Source = """
+    constexpr uint axis_size = 2048;
+    constexpr uint num_simdgroups = 2;
+    constexpr uint values_per_thread = 16;
+    constexpr uint block_size = 512;
+    constexpr uint in_vec_size_w = axis_size / 2;
+    constexpr uint in_vec_size_g = axis_size / 16;
+
+    uint tile = threadgroup_position_in_grid.x;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    uint out_row = tile * num_simdgroups + simd_gid;
+
+    const device uint8_t* ws = (const device uint8_t*)weight_codes +
+        out_row * in_vec_size_w + simd_lid * 8;
+    const device uint8_t* sc = weight_scales +
+        out_row * in_vec_size_g + simd_lid;
+
+    thread float x_thread[values_per_thread];
+    thread float result = 0.0f;
+
+    uint column = simd_lid * values_per_thread;
+    for (uint k = 0; k < axis_size; k += block_size) {
+        for (uint i = 0; i < values_per_thread; ++i) {
+            x_thread[i] = float(normalized[column + i]);
+        }
+        result += laguna_tail_nvfp4_qdot(
+            ws, x_thread, laguna_tail_nvfp4_scale(sc[0]));
+        ws += block_size / 2;
+        sc += block_size / 16;
+        column += block_size;
+    }
+
+    result = simd_sum(result);
+    if (simd_lid == 0) {
+        projected[out_row] = bfloat(result);
+    }
+    """
+
+private let lagunaDecodeNVFP4QKVR1Kernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_decode_nvfp4_qkv_h\(heads)_r1_v1",
+            inputNames: ["normalized", "weight_codes", "weight_scales"],
+            outputNames: ["projected"],
+            source: lagunaDecodeNVFP4QKVR1Source,
+            header: lagunaTailNVFP4QMVHeader,
+            ensureRowContiguous: true)
+    }
+    return kernels
+}()
+
+private func lagunaDecodeNVFP4QKVR1(
+    normalized: MLXArray,
+    bank: LagunaNativeAffineWeight,
+    heads: Int
+) -> MLXArray? {
+    guard lagunaDecodeNVFP4QKVR1Enabled else { return nil }
+    let rows = (heads + 2 * LagunaConstants.numKeyValueHeads) * LagunaConstants.headDim
+    let hidden = LagunaConstants.hiddenSize
+    guard normalized.dtype == .bfloat16,
+        normalized.shape == [1, 1, hidden],
+        bank.mode == .nvfp4, bank.bits == 4, bank.groupSize == 16,
+        bank.biases == nil,
+        bank.originalShape == [rows, hidden],
+        bank.packedCodes.dtype == .uint32,
+        bank.packedCodes.shape == [rows, hidden / 8],
+        bank.scales.dtype == .uint8,
+        bank.scales.shape == [rows, hidden / 16],
+        rows % 2 == 0,
+        let kernel = lagunaDecodeNVFP4QKVR1Kernels[heads]
+    else { return nil }
+    lagunaTrace("decode nvfp4 qkv r1 h\(heads)")
+    return kernel(
+        [normalized, bank.packedCodes, bank.scales],
+        grid: ((rows / 2) * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, rows]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 
 /// NVFP4-tail counterpart of `lagunaNormAffineQKVSource`, extended to also
 /// absorb the separate INT8 gate qmv: on the tail layers (32-39) the stock
@@ -5605,8 +5696,14 @@ final class LagunaRuntimeAttention: Module {
                 // Only materialized when the fused kernel declined; the gate
                 // branches below that read it are unreachable when it fired.
                 let normalized = fusedQKV ?? inputNorm(input)
+                let decodeNVFP4QKVR1 =
+                    fusedQKV == nil
+                    ? lagunaDecodeNVFP4QKVR1(
+                        normalized: normalized, bank: fusedAffine, heads: nHeads)
+                    : nil
                 let qkv =
                     fusedQKV
+                    ?? decodeNVFP4QKVR1
                     ?? quantizedMM(
                         normalized,
                         fusedAffine.packedCodes,
