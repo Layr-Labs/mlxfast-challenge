@@ -3991,6 +3991,17 @@ let lagunaNvfp4QmvSignCarryEnabled =
 let lagunaE4M3SignDomainCertified =
     ProcessInfo.processInfo.environment["DARKBLOOM_E4M3_SIGN_DOMAIN"] != "0"
 
+/// Decode-only NVFP4 scale early-return for certified-positive E4M3 scale
+/// bytes (default ON). When scale-defer is active, `laguna_nvfp4_scale`
+/// returns `float(as_type<half>(ushort(bits) << 7))` for every byte instead
+/// of only the `bits < 16` linear run. Bit-identical to the sign-domain
+/// general path under the checkpoint census (no sign bit on any scale byte
+/// the decode kernels read). `DARKBLOOM_DECODE_NVFP4_POSITIVE_SCALE=0`
+/// restores the tip's bits-under-16 fast path only.
+let lagunaDecodeNVFP4PositiveScaleEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_DECODE_NVFP4_POSITIVE_SCALE"] != "0"
+
 /// `DARKBLOOM_NVFP4_QMV_SEED_ELIDE` (default OFF): in the same o_proj QMV
 /// decode, assign the first four-term product group to the accumulator instead
 /// of adding it to a `+0.0f` seed, removing one dead FP add per output row per
@@ -6295,13 +6306,22 @@ let lagunaSharedSwiGLUQMVHeader: String = {
     // deferred-scale arm the half bit pattern is already the exact value
     // needed by the qdot; skip the carry/sign setup for this overwhelmingly
     // common case.  Keep every ablation's source unchanged.
+    // Positive-scale early return (default ON): every deferred scale byte is
+    // census-positive, so the half payload is exactly `bits << 7`. This
+    // collapses the carry/sign setup for the common path; kill-switch keeps
+    // the tip's bits-under-16 linear-run shortcut only.
     let lowScaleFastPath = lagunaNvfp4ScaleDeferEnabled
-        ? """
+        ? (lagunaDecodeNVFP4PositiveScaleEnabled
+            ? """
+        ushort fast_raw = ushort(bits) << 7;
+        return float(as_type<half>(fast_raw));
+        """
+            : """
         if (bits < 16u) {
             ushort fast_raw = ushort(bits) << 7;
             return float(as_type<half>(fast_raw));
         }
-        """
+        """)
         : ""
     // One packed 32-bit code word: eight NVFP4 values, four `half2` patterns,
     // two four-term FP groups. The first group of the FIRST word seeds the
