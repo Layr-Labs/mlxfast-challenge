@@ -1828,7 +1828,8 @@ func lagunaSlidingFusedAttention(
     precondition(scale.dtype == .float32 && scale.size == 1)
 
     lagunaTrace("sliding fused attention")
-    let params = MLXArray([UInt32(writeIdx)])
+    let params = lagunaParamsAtlasEnabled
+        ? lagunaRingIdxAtlas[writeIdx] : MLXArray([UInt32(writeIdx)])
     return lagunaSlidingFusedAttentionKernel(
         [
             rawQueries, rawKeys, rawValues,
@@ -1841,6 +1842,36 @@ func lagunaSlidingFusedAttention(
         outputDTypes: [.bfloat16]
     )[0]
 }
+
+/// Pre-materialized 4-byte uniform buffers for every possible sliding ring
+/// write index. The sliding fused-attention wrapper runs 30 times per decode
+/// step, and building a fresh 1-element `MLXArray` per call costs an
+/// mlx::array allocation, an MTLBuffer from the allocator, a 4-byte copy and
+/// a graph node — pure CPU/encode overhead for bytes that cycle through the
+/// same 512 values. The atlas holds all of them (2 KB total), materialized on
+/// first touch, which the constructor warmup's decode step triggers outside
+/// every scored window. Input-independent by construction: every possible
+/// value is built unconditionally; the per-step lookup indexes by the cache's
+/// own ring position (request-local state, not token content), the same
+/// contract as the RoPE angle atlases.
+/// (Worker decode is single-threaded; the atlas is written once by the
+/// initializer and only read afterwards, so the unsafe opt-out is sound.)
+private enum LagunaRingIdxAtlasStore {
+    nonisolated(unsafe) static let entries: [MLXArray] = {
+        let atlas = (0..<LagunaConstants.slidingWindow).map {
+            MLXArray([UInt32($0)])
+        }
+        for entry in atlas { eval(entry) }
+        return atlas
+    }()
+}
+
+private var lagunaRingIdxAtlas: [MLXArray] { LagunaRingIdxAtlasStore.entries }
+
+/// `DARKBLOOM_PARAMS_ATLAS=0` restores the per-call fresh 1-element array
+/// (ablation control for the atlas above; identical bytes either way).
+let lagunaParamsAtlasEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PARAMS_ATLAS"] != "0"
 
 /// `DARKBLOOM_FUSED_FULL_ATTN` (default on; set "0" to disable): decode
 /// fused attention for the ten full-attention layers once the cache backing
@@ -5403,6 +5434,62 @@ final class LagunaRuntimeAttention: Module {
             fused.indexedMetadata = lagunaIndexedAffineMetadata(
                 scales: fused.scales, biases: biases)
         }
+        // DARKBLOOM_QMV_SCALES4: permute the NVFP4 scale plane's CONTENT into
+        // 4-row bundles ([row/4][group][row%4] byte order, shape unchanged)
+        // so the dispatcher's `_s4` kernel arm reads each k-block's four row
+        // scales as one aligned uchar4 covering a fully-consumed cache line.
+        // Same bytes for the same (row, group) — a pure relayout of a
+        // decode-only side bank (prefill runs the BF16 Linears); the kernel
+        // arm and this packing flip together on the same env.
+        if fused.mode == .nvfp4, fused.bits == 4, fused.groupSize == 16,
+            totalRows % 4 == 0,
+            ProcessInfo.processInfo.environment["DARKBLOOM_QMV_SCALES4"] != "0"
+        {
+            let groups = wq.weight.dim(1) / 16
+            let packedScales = fused.scales
+                .reshaped([totalRows / 4, 4, groups])
+                .transposed(0, 2, 1)
+                .reshaped([totalRows, groups])
+            fused = LagunaNativeAffineWeight(
+                packedCodes: fused.packedCodes,
+                scales: packedScales,
+                biases: fused.biases,
+                originalShape: fused.originalShape,
+                groupSize: fused.groupSize,
+                bits: fused.bits,
+                mode: fused.mode
+            )
+        }
+        // DARKBLOOM_QMV_CODES4: bundle the NVFP4 code plane's CONTENT so the
+        // four rows a simdgroup reduces read their per-(k-block, lane) 8-byte
+        // code chunks from one contiguous 32-byte span (two uint4 loads in
+        // the dispatcher's `_c4` kernel arm) instead of four uint2 loads
+        // striding whole 1 KiB rows. Word order within a row-quad becomes
+        // [k-block][lane][row%4][word]; every (row, k) keeps its exact uint32
+        // words — a pure relayout of a decode-only side bank (prefill runs
+        // the BF16 Linears). The guard mirrors the dispatcher's `_c4`
+        // predicate exactly (K == 2048, N in {10240, 8192}) so the packing
+        // and the kernel arm flip together on the same env.
+        if fused.mode == .nvfp4, fused.bits == 4, fused.groupSize == 16,
+            totalRows == 10240 || totalRows == 8192,
+            wq.weight.dim(1) == 2048,
+            ProcessInfo.processInfo.environment["DARKBLOOM_QMV_CODES4"] != "0"
+        {
+            let blocks = wq.weight.dim(1) / 512
+            let packedWords = fused.packedCodes
+                .reshaped([totalRows / 4, 4, blocks, 32, 2])
+                .transposed(0, 2, 3, 1, 4)
+                .reshaped([totalRows, wq.weight.dim(1) / 8])
+            fused = LagunaNativeAffineWeight(
+                packedCodes: packedWords,
+                scales: fused.scales,
+                biases: fused.biases,
+                originalShape: fused.originalShape,
+                groupSize: fused.groupSize,
+                bits: fused.bits,
+                mode: fused.mode
+            )
+        }
         _nativeAffineQKV = fused
         return fused.arrays + (_nativeAffineGProj?.arrays ?? [])
     }
@@ -8098,8 +8185,14 @@ private let lagunaDenseGateUpSwiGLUKernel = MLXFast.metalKernel(
 
         uint column = lane * values_per_thread;
         for (uint block = 0; block < blocks; ++block) {
+            // vec<bfloat,4> activation load: same bytes, same per-element
+            // float conversion in the same order as the scalar loop — the
+            // pattern this kernel already uses for its weight rows.
+            // Alignment: column = lane * 4 elements = 8-byte multiples.
+            const vec<bfloat, 4> c4 =
+                *((const device vec<bfloat, 4>*)(input + column));
             for (uint i = 0; i < values_per_thread; ++i) {
-                coefficients[i] = float(input[column + i]);
+                coefficients[i] = float(c4[i]);
             }
             for (uint row = 0; row < rows_per_thread; ++row) {
                 const device vec<bfloat, 4>* gate_row_values =
@@ -8189,8 +8282,11 @@ private let lagunaDenseDownResidualKernel = MLXFast.metalKernel(
 
         uint column = lane * values_per_thread;
         for (uint block = 0; block < blocks; ++block) {
+            // vec<bfloat,4> activation load — see the gate/up twin's note.
+            const vec<bfloat, 4> c4 =
+                *((const device vec<bfloat, 4>*)(activated + column));
             for (uint i = 0; i < values_per_thread; ++i) {
-                coefficients[i] = float(activated[column + i]);
+                coefficients[i] = float(c4[i]);
             }
             for (uint row = 0; row < rows_per_thread; ++row) {
                 const device vec<bfloat, 4>* row_values =

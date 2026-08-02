@@ -175,6 +175,66 @@ inline U qdot(const device uint8_t* w, const thread U* x_thread, U scale) {
   return scale * accum;
 }
 
+// By-value twin of the bits == 4 / values_per_thread == 16 qdot
+// specialization above: identical arithmetic on an already-loaded uint2 so
+// the codes4 kernel arm can feed all four bundle rows from one contiguous
+// 32-byte load pair instead of four 8-byte device reads striding whole rows.
+template <typename U>
+inline U qdot_codes4(const uint2 codes, const thread U* x_thread, U scale) {
+  U accum;
+  {
+    const uint32_t c = codes.x;
+    const uint32_t xe = c & 0x0F0F0F0Fu;
+    const uint32_t ge = xe | (xe << 3);
+    const uint32_t yo = c & 0xF0F0F0F0u;
+    const uint32_t go = yo | (yo >> 3);
+    const uint32_t p0 = (ge << 9) & 0x8E008E00u;
+    const uint32_t p1 = (go << 8) & 0x8E008E00u;
+    const uint32_t p2 = (ge << 1) & 0x8E008E00u;
+    const uint32_t p3 = go & 0x8E008E00u;
+    const float2 v04 = float2(as_type<half2>(p0));
+    const float2 v15 = float2(as_type<half2>(p1));
+    const float2 v26 = float2(as_type<half2>(p2));
+    const float2 v37 = float2(as_type<half2>(p3));
+    accum =
+        (x_thread[0] * v04.x +
+         x_thread[1] * v15.x +
+         x_thread[2] * v26.x +
+         x_thread[3] * v37.x);
+    accum +=
+        (x_thread[4] * v04.y +
+         x_thread[5] * v15.y +
+         x_thread[6] * v26.y +
+         x_thread[7] * v37.y);
+  }
+  {
+    const uint32_t c = codes.y;
+    const uint32_t xe = c & 0x0F0F0F0Fu;
+    const uint32_t ge = xe | (xe << 3);
+    const uint32_t yo = c & 0xF0F0F0F0u;
+    const uint32_t go = yo | (yo >> 3);
+    const uint32_t p0 = (ge << 9) & 0x8E008E00u;
+    const uint32_t p1 = (go << 8) & 0x8E008E00u;
+    const uint32_t p2 = (ge << 1) & 0x8E008E00u;
+    const uint32_t p3 = go & 0x8E008E00u;
+    const float2 v04 = float2(as_type<half2>(p0));
+    const float2 v15 = float2(as_type<half2>(p1));
+    const float2 v26 = float2(as_type<half2>(p2));
+    const float2 v37 = float2(as_type<half2>(p3));
+    accum +=
+        (x_thread[8] * v04.x +
+         x_thread[9] * v15.x +
+         x_thread[10] * v26.x +
+         x_thread[11] * v37.x);
+    accum +=
+        (x_thread[12] * v04.y +
+         x_thread[13] * v15.y +
+         x_thread[14] * v26.y +
+         x_thread[15] * v37.y);
+  }
+  return (scale * 16384.0f) * accum;
+}
+
 template <typename U, int values_per_thread, int bits>
 inline U
 qdot_safe(const device uint8_t* w, const thread U* x_thread, U scale, int N) {
@@ -520,7 +580,8 @@ METAL_FUNC void fp_qmv_quad_impl(
   }
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int num_simdgroups = 2,
+          int scales4 = 0, int codes4 = 0>
 METAL_FUNC void fp_qmv_fast_impl(
     const device uint32_t* w,
     const device uint8_t* scales,
@@ -532,7 +593,6 @@ METAL_FUNC void fp_qmv_fast_impl(
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int packs_per_thread = 2;
-  constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int pack_factor = get_pack_factor<32, bits>();
   constexpr int bytes_per_pack = get_bytes_per_pack<32>();
@@ -552,8 +612,21 @@ METAL_FUNC void fp_qmv_fast_impl(
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
-  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
-  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  // codes4 packs the four simdgroup rows' per-(k-block, lane) 8-byte code
+  // chunks contiguously: bundle base = quad base + block * (SIMD_SIZE * 32)
+  // + lane * 32, row r at +r*8. Same bytes per (row, k) — a pure relayout.
+  if (codes4) {
+    ws += out_row * in_vec_size_w +
+        simd_lid * results_per_simdgroup * packs_per_thread * bytes_per_pack;
+  } else {
+    ws +=
+        out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  }
+  if (scales4) {
+    scales += out_row * in_vec_size_g + simd_lid * 4;
+  } else {
+    scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  }
   x += tid.x * in_vec_size + simd_lid * values_per_thread;
   y += tid.x * out_vec_size + out_row;
 
@@ -580,16 +653,42 @@ METAL_FUNC void fp_qmv_fast_impl(
     load_vector<T, U, values_per_thread>(x, x_thread);
 #endif
 
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-      const device auto* sl = scales + row * in_vec_size_g;
+    uchar4 s4 = uchar4(0);
+    if (scales4) {
+      s4 = *((const device uchar4*)scales);
+    }
+    if constexpr (codes4 != 0) {
+      const device uint4* wb = (const device uint4*)ws;
+      const uint4 b0 = wb[0];
+      const uint4 b1 = wb[1];
+      const uint2 wrow[4] = {
+          uint2(b0.x, b0.y),
+          uint2(b0.z, b0.w),
+          uint2(b1.x, b1.y),
+          uint2(b1.z, b1.w)};
+#pragma unroll
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        const device auto* sl = scales + row * in_vec_size_g;
+        U s = dequantize_scale<U, group_size>(scales4 ? s4[row] : sl[0]);
+        result[row] += qdot_codes4<U>(wrow[row], x_thread, s);
+      }
+    } else {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+        const device auto* sl = scales + row * in_vec_size_g;
 
-      U s = dequantize_scale<U, group_size>(sl[0]);
-      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s);
+        U s = dequantize_scale<U, group_size>(scales4 ? s4[row] : sl[0]);
+        result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s);
+      }
     }
 
-    ws += block_size * bytes_per_pack / pack_factor;
-    scales += block_size / group_size;
+    ws += (codes4 ? results_per_simdgroup : 1) * block_size * bytes_per_pack /
+        pack_factor;
+    if (scales4) {
+      scales += (block_size / group_size) * 4;
+    } else {
+      scales += block_size / group_size;
+    }
     x += block_size;
   }
 
@@ -1228,7 +1327,12 @@ template <typename T, int group_size, int bits, int D, bool batched>
       w, scales, x, y, in_vec_size, out_vec_size, tid, quad_gid, quad_lid);
 }
 
-template <typename T, int group_size, int bits, bool batched>
+// num_simdgroups defaults to the stock 2; the host's wide branch instantiates
+// 4/8 for 128/256-thread threadgroups — a bit-exact whole-row re-tiling
+// (each row's K reduction keeps its per-lane column ownership, block order
+// and single simd_sum; geometry only moves whole rows between threadgroups).
+template <typename T, int group_size, int bits, bool batched,
+          int num_simdgroups = 2, int scales4 = 0, int codes4 = 0>
 [[kernel]] void fp_qmv_fast(
     const device uint32_t* w,
     const device uint8_t* scales,
@@ -1263,7 +1367,7 @@ template <typename T, int group_size, int bits, bool batched>
         s_strides,
         tid);
   }
-  fp_qmv_fast_impl<T, group_size, bits>(
+  fp_qmv_fast_impl<T, group_size, bits, num_simdgroups, scales4, codes4>(
       w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
@@ -1520,7 +1624,7 @@ template <
       w, scales, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int num_simdgroups = 2>
 [[kernel]] void fp_gather_qmv_fast(
     const device uint32_t* w,
     const device uint8_t* scales,
@@ -1565,7 +1669,7 @@ template <typename T, int group_size, int bits>
       w_strides,
       s_strides,
       tid);
-  fp_qmv_fast_impl<T, group_size, bits>(
+  fp_qmv_fast_impl<T, group_size, bits, num_simdgroups>(
       w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
