@@ -398,6 +398,22 @@ public final class LagunaRuntimeWeightCache {
             libraryModel = nil
             loadError = error
         }
+        // Machine-local, deterministic, input-independent selection of the
+        // fast-qmv threadgroup width (untimed constructor work). All widths
+        // are bit-exact by construction — a row's K reduction never leaves
+        // its simdgroup; the geometry only moves whole rows between
+        // threadgroups — so the choice cannot change any output. The optimum
+        // is machine-dependent (wave quantization tracks GPU core count):
+        // paired ranked runs and local A/B disagreed on the winner across
+        // two M5 Max bins, which is exactly why the pick happens HERE, on
+        // the machine that will run the scored window, from a min-of-N
+        // microbench on synthetic fixed tensors at the real [Q;K;V]-bank
+        // shape. Ties within 1% break to the stock width, so the selection
+        // is bounded below by stock behavior. No token, prompt, or input
+        // dependence of any kind: the probe tensors are constants, and the
+        // winner is latched once per process into the same env knob the
+        // dispatcher reads (`DARKBLOOM_QMV_WIDE`; presetting it skips the
+        // tuner and pins the width).
         // Constructor-time warmup: the runtime worker builds this cache
         // before the benchmark protocol handshake, so the Metal
         // pipeline-state creation and MLX kernel-cache population triggered
@@ -407,6 +423,63 @@ public final class LagunaRuntimeWeightCache {
         // warmup.
         if let model = libraryModel, config.numHiddenLayers >= 16 {
             Self.warmLibraryModel(model)
+            // Machine-local, deterministic, input-independent selection of
+            // the fast-qmv threadgroup width (untimed constructor work).
+            // Every width is bit-exact by construction — a row's K reduction
+            // never leaves its simdgroup; the geometry only moves whole rows
+            // between threadgroups — so the pick cannot change any output.
+            // The optimum is machine-dependent (wave quantization tracks GPU
+            // core count) AND context-dependent (an isolated dispatch and
+            // one overlapping the surrounding decode stream disagree on this
+            // very kernel), so the probe times REAL warmup decode steps on
+            // this machine, mirrored 2-4-8-8-4-2 with a min statistic so
+            // cache growth and thermal drift cancel. Constant BOS tokens
+            // only: no prompt or input dependence. Ties within 1% break to
+            // the stock width, bounding the selection below by stock
+            // behavior. Presetting `DARKBLOOM_QMV_WIDE` pins the width and
+            // skips the probe; `DARKBLOOM_QMV_AUTOTUNE=0` disables it.
+            // RANKED LESSON (b56c7433): the probe itself is thermally
+            // expensive — ~100 extra init decode steps plus a prefill land
+            // AFTER the cool gate and directly before the timed window, and
+            // its ranked run measured the candidate at 39.6C / 1586 MHz
+            // (throttled) with prefill +9%. Default OFF (opt-in =1) until a
+            // cool-down-aware variant exists.
+            if ProcessInfo.processInfo.environment["DARKBLOOM_QMV_WIDE"] == nil,
+                ProcessInfo.processInfo.environment["DARKBLOOM_QMV_AUTOTUNE"]
+                    == "1"
+            {
+                let bosToken = Int32(LagunaConstants.bosTokenID)
+                let tuneCache = model.newCache(parameters: nil)
+                let seed = MLXArray(
+                    Array(repeating: bosToken, count: 512), [1, 512])
+                eval(model(seed, cache: tuneCache))
+                let tok = MLXArray([bosToken], [1, 1])
+                var best: [Int: Double] = [2: .infinity, 4: .infinity, 8: .infinity]
+                for width in [2, 4, 8, 8, 4, 2] {
+                    setenv("DARKBLOOM_QMV_WIDE", "\(width)", 1)
+                    for _ in 0..<3 { eval(model(tok, cache: tuneCache)) }
+                    for _ in 0..<12 {
+                        let t0 = DispatchTime.now().uptimeNanoseconds
+                        eval(model(tok, cache: tuneCache))
+                        let dt = Double(
+                            DispatchTime.now().uptimeNanoseconds &- t0)
+                        if dt < best[width]! { best[width] = dt }
+                    }
+                }
+                var winner = 2
+                if best[4]! < best[2]! * 0.99 { winner = 4 }
+                if best[8]! < best[2]! * 0.99, best[8]! < best[winner]! {
+                    winner = 8
+                }
+                setenv("DARKBLOOM_QMV_WIDE", "\(winner)", 1)
+                FileHandle.standardError.write(
+                    Data(
+                        ("mlxfast: qmv width autotune (in-stream): "
+                            + "w2=\(Int(best[2]! / 1000))us "
+                            + "w4=\(Int(best[4]! / 1000))us "
+                            + "w8=\(Int(best[8]! / 1000))us -> w\(winner)\n")
+                            .utf8))
+            }
             if startupMemoryPolicy?.clearAllocatorCacheAfterWarmup == true {
                 // Pipeline state is process-lifetime state, while free
                 // warmup allocations are exactly the pressure a low-memory
