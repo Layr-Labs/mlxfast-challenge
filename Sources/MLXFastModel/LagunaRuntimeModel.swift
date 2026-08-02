@@ -4099,7 +4099,9 @@ func lagunaGatedAffineOProj(
 /// group-16 NVFP4 output projection. It folds the softplus gate, broadcast
 /// product, and contraction into one dispatch while preserving the BF16 gate
 /// rounding point and the stock NVFP4 accumulation geometry.
-private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
+private func lagunaGatedAffineOProjNVFP4Source(
+    heads: Int, preActivatedGate: Bool = false
+) -> String {
     let scaleFold = lagunaNvfp4ScaleFoldEnabled
     let weightScale = scaleFold ? "" : " * 16384.0f"
     let extract = """
@@ -4112,6 +4114,37 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
                     const uint p2 = (ge << 1) & 0x8E008E00u;
                     const uint p3 = go & 0x8E008E00u;
     """
+    let gateSetup = preActivatedGate ? "" : """
+    threadgroup float gate_table[gate_heads];
+    if (lid < gate_heads) {
+        float logit = float(gate_logits[lid]);
+        float gate;
+        if (metal::isnan(logit)) {
+            gate = NAN;
+        } else {
+            float maxval = metal::max(logit, 0.0f);
+            float minval = metal::min(logit, 0.0f);
+            gate = (metal::isinf(minval) || metal::isinf(maxval))
+                ? maxval
+                : maxval + log1p(metal::exp(minval - maxval));
+        }
+        gate_table[lid] = float(bfloat(gate));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    """
+    let loadInput = preActivatedGate
+        ? """
+        float gate = float(gate_values[column >> head_shift]);
+        for (uint i = 0; i < values_per_thread; ++i) {
+            x_thread[i] = float(bfloat(float(xp[i]) * gate));
+        }
+        """
+        : """
+        float gate = gate_table[column >> head_shift];
+        for (uint i = 0; i < values_per_thread; ++i) {
+            x_thread[i] = float(bfloat(float(xp[i]) * gate));
+        }
+        """
     return """
     constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
     constexpr uint out_vec_size = \(LagunaConstants.hiddenSize);
@@ -4130,22 +4163,7 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
     uint simd_gid = simdgroup_index_in_threadgroup;
     uint simd_lid = thread_index_in_simdgroup;
 
-    threadgroup float gate_table[gate_heads];
-    if (lid < gate_heads) {
-        float logit = float(gate_logits[lid]);
-        float gate;
-        if (metal::isnan(logit)) {
-            gate = NAN;
-        } else {
-            float maxval = metal::max(logit, 0.0f);
-            float minval = metal::min(logit, 0.0f);
-            gate = (metal::isinf(minval) || metal::isinf(maxval))
-                ? maxval
-                : maxval + log1p(metal::exp(minval - maxval));
-        }
-        gate_table[lid] = float(bfloat(gate));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \(gateSetup)
 
     uint out_row = tile * (num_simdgroups * results_per_simdgroup) +
         simd_gid * results_per_simdgroup;
@@ -4161,10 +4179,7 @@ private func lagunaGatedAffineOProjNVFP4Source(heads: Int) -> String {
 
     uint column = simd_lid * values_per_thread;
     for (uint k = 0; k < in_vec_size; k += block_size) {
-        float gate = gate_table[column >> head_shift];
-        for (uint i = 0; i < values_per_thread; ++i) {
-            x_thread[i] = float(bfloat(float(xp[i]) * gate));
-        }
+        \(loadInput)
 
         for (uint row = 0; row < results_per_simdgroup; ++row) {
             const device uint32_t* wl = ws + row * (in_vec_size / 8);
@@ -4229,6 +4244,65 @@ private let lagunaGatedAffineOProjNVFP4Kernels: [Int: MLXFast.MLXFastKernel] = {
     }
     return kernels
 }()
+
+/// Smaller producer split: materialize only the per-head BF16 softplus gate,
+/// then keep the attention product inside the custom NVFP4 QMV. Compared with
+/// the one-dispatch control this removes the repeated transcendental table and
+/// threadgroup barrier from every output tile without allocating the large
+/// gated-attention row.
+private let lagunaNVFP4OProjGateActivationSplitEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NVFP4_OPROJ_GATE_ACTIVATION_SPLIT"] != "0"
+
+private let lagunaNVFP4OProjActivatedGateKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_gated_affine_oproj_nvfp4_qmv_h\(heads)_activated_v1",
+            inputNames: [
+                "attention_output", "gate_values", "weight_codes",
+                "weight_scales",
+            ],
+            outputNames: ["projected"],
+            source: lagunaGatedAffineOProjNVFP4Source(
+                heads: heads, preActivatedGate: true),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+private func lagunaActivatedGateOProjNVFP4(
+    attentionOutput: MLXArray,
+    gateValues: MLXArray,
+    codes: MLXArray,
+    scales: MLXArray,
+    heads: Int
+) -> MLXArray? {
+    guard lagunaNVFP4OProjGateActivationSplitEnabled,
+        let kernel = lagunaNVFP4OProjActivatedGateKernels[heads]
+    else { return nil }
+    let inVec = heads * LagunaConstants.headDim
+    let outVec = LagunaConstants.hiddenSize
+    guard attentionOutput.dtype == .bfloat16,
+        attentionOutput.shape == [1, 1, inVec],
+        gateValues.dtype == .bfloat16,
+        gateValues.shape == [1, 1, heads],
+        codes.dtype == .uint32,
+        codes.shape == [outVec, inVec / 8],
+        scales.dtype == .uint8,
+        scales.shape == [outVec, inVec / 16]
+    else { return nil }
+
+    lagunaTrace("affine oproj nvfp4 qmv h\(heads) activated gate")
+    return kernel(
+        [attentionOutput, gateValues, codes, scales],
+        grid: ((outVec / 8) * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, outVec]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
 
 func lagunaGatedAffineOProjNVFP4(
     attentionOutput: MLXArray,
@@ -5991,6 +6065,22 @@ final class LagunaRuntimeAttention: Module {
                         heads: nHeads)
                 {
                     return fusedProjection
+                }
+                if lagunaNVFP4OProjGateActivationSplitEnabled,
+                    !gateIsActivated,
+                    affineWO.mode == .nvfp4, affineWO.bits == 4,
+                    affineWO.groupSize == 16
+                {
+                    let activatedGate = lagunaCompiledSoftplusGate(projectedGate)
+                    if let splitProjection = lagunaActivatedGateOProjNVFP4(
+                        attentionOutput: output,
+                        gateValues: activatedGate,
+                        codes: affineWO.packedCodes,
+                        scales: affineWO.scales,
+                        heads: nHeads)
+                    {
+                        return splitProjection
+                    }
                 }
                 if lagunaFusedGatedAffineOProjEnabled,
                     lagunaGatedAffineOProjNVFP4Enabled,
