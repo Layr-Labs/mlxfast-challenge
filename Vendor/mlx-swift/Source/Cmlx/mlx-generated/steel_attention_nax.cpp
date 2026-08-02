@@ -1429,7 +1429,11 @@ template <
   const ulong physical_qblock = physical_linear / ulong(params->H);
   const ulong logical_head =
       physical_linear - physical_qblock * ulong(params->H);
-#if DARKBLOOM_ATTN_QBLOCK_ZIGZAG
+#if defined(DARKBLOOM_ATTN_QBLOCK_DESCEND) && DARKBLOOM_ATTN_QBLOCK_DESCEND
+  // LPT order: strictly descending causal query blocks (heaviest first).
+  // Same bijection class as the zigzag below -- presentation order only.
+  const ulong logical_qblock = ulong(params->NQ) - 1 - physical_qblock;
+#elif DARKBLOOM_ATTN_QBLOCK_ZIGZAG
   // Present causal work high, low, second-high, second-low, ... while keeping
   // every query block's heads contiguous. Even ranks map injectively onto the
   // upper half in descending order; odd ranks map onto the lower half in
@@ -1866,7 +1870,13 @@ template <
     Otile.template row_bin_op<MulOp>(factor);
     }
 
-    simdgroup_barrier(mem_flags::mem_none);
+    // The score/softmax section above and the P@V section below are both
+    // simdgroup-local on this path; sg_active is simdgroup-uniform (see
+    // above), so inactive simdgroups have no pending simdgroup-scope work
+    // to order and may skip the barrier entirely.
+    if (sg_active) {
+      simdgroup_barrier(mem_flags::mem_none);
+    }
 
     // Do O = P @ V
     STEEL_PRAGMA_UNROLL

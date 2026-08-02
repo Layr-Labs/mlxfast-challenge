@@ -1407,6 +1407,26 @@ const char* darkbloom_attn_qblock_zigzag_define() {
   return enabled ? "" : "\n#define DARKBLOOM_ATTN_QBLOCK_ZIGZAG 0\n";
 }
 
+// DARKBLOOM_ATTN_QBLOCK_DESCEND: replace the zigzag presentation with a
+// strictly descending (LPT, longest-processing-time-first) causal query
+// block order. Under causality the highest-index query block owns the most
+// keys; launching it first drains the tail of the wave with the small
+// blocks. Pure tile-order permutation like the arms above -- no
+// threadgroup's arithmetic or output ownership changes. Default OFF
+// (zigzag stays the shipped order); an explicit 1 opts in.
+const char* darkbloom_attn_qblock_descend_define() {
+  static const bool enabled = [] {
+    const bool v =
+        env::get_var("DARKBLOOM_ATTN_QBLOCK_DESCEND", "0") == "1";
+    if (env::get_var("DARKBLOOM_ATTN_TRACE", "") == "1") {
+      fprintf(
+          stderr, "mlxfast: attn qblock-descend: enabled=%d\n", int(v));
+    }
+    return v;
+  }();
+  return enabled ? "\n#define DARKBLOOM_ATTN_QBLOCK_DESCEND 1\n" : "";
+}
+
 } // namespace
 
 MTL::ComputePipelineState* get_steel_attention_nax_kernel(
@@ -1430,6 +1450,7 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
         darkbloom_attn_qhoist_define(),
         darkbloom_attn_qblock_major_define(),
         darkbloom_attn_qblock_zigzag_define(),
+        darkbloom_attn_qblock_descend_define(),
         metal::steel_attention_nax(),
         get_template_definition(
             lib_name,
