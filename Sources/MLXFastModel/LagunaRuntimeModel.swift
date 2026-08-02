@@ -330,6 +330,44 @@ let lagunaSwiGLUQMVRows1Enabled =
 let lagunaSharedSwiGLUQMVRows1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_QMV_R1"] != "0"
 
+/// `DARKBLOOM_QMV_TILE` A/Bs output rows per threadgroup for the packed
+/// routed gate/up decode QMV (`lagunaRoutedSwiGLUQMVPacked*`):
+///   "1" (default): 1 row per simdgroup, threadgroup 32, 512 tiles/expert.
+///   "2": 1 row per simdgroup, 2 rows/threadgroup, 256 tiles/expert,
+///     threadgroup 64.
+///   "4": 4 rows/threadgroup, 2 rows per simdgroup, 128 tiles/expert,
+///     threadgroup 64 — the pre-2026-08-02 schedule.
+/// Any other value (including unset) selects the default. A crucible
+/// auto-kernel campaign on the identical per-expert shape (1024x2048 nvfp4
+/// matvec) found 1 row per 32-thread threadgroup ~18% faster than multi-row
+/// threadgroups; promoted to default after interleaved A/B on M3 Ultra
+/// showed tg1 −1.3% decode s/token vs rows4 (base 0.009140, tg1 0.009024,
+/// 2 runs each; token drift identical to main). Every geometry preserves
+/// each output row's exact K-block walk order, `laguna_nvfp4_qdot_16`
+/// inner op, and simd_sum reduction — only the row→threadgroup mapping
+/// changes. Distinct kernel-name suffixes (`_tg2`/`_tg1`) keep MLXFast's
+/// pipeline cache from aliasing the variants.
+enum LagunaQMVTileGeometry: Int {
+    case rows4 = 4
+    case rows2 = 2
+    case rows1 = 1
+
+    /// Tiles per expert: 512 output rows / rows per threadgroup.
+    var tilesPerExpert: Int { 512 / rawValue }
+    /// Simdgroups per threadgroup: 2 for rows4/rows2, 1 for rows1.
+    var threadgroupSize: Int { rawValue == 1 ? 32 : 64 }
+    /// Kernel-name suffix keeping pipeline cache entries distinct.
+    var kernelNameSuffix: String { rawValue == 4 ? "" : "_tg\(rawValue)" }
+}
+
+let lagunaQMVTileGeometry: LagunaQMVTileGeometry = {
+    switch ProcessInfo.processInfo.environment["DARKBLOOM_QMV_TILE"] {
+    case "2": return .rows2
+    case "4": return .rows4
+    default: return .rows1
+    }
+}()
+
 /// Folds the per-head softplus gate into the output projection's GEMV (see
 /// `lagunaGatedOutputProjectionSource`), with one kernel variant per attention
 /// family. Set `DARKBLOOM_FUSED_GATED_OUTPUT=0` to ablate.
@@ -7168,10 +7206,20 @@ func lagunaRoutedSwiGLUQMVPacked(
     precondition(indices.dtype == .uint32)
     precondition(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
 
-    return lagunaRoutedSwiGLUQMVPackedKernel(
+    let geometry = lagunaQMVTileGeometry
+    let kernel: MLXFast.MLXFastKernel
+    switch geometry {
+    case .rows2: kernel = lagunaRoutedSwiGLUQMVPackedTG2Kernel
+    case .rows1: kernel = lagunaRoutedSwiGLUQMVPackedTG1Kernel
+    case .rows4: kernel = lagunaRoutedSwiGLUQMVPackedKernel
+    }
+    return kernel(
         [input, fusedWeight, packedScales, indices],
-        grid: (LagunaConstants.numExpertsPerTok * 128 * 64, 1, 1),
-        threadGroup: (64, 1, 1),
+        grid: (
+            LagunaConstants.numExpertsPerTok * geometry.tilesPerExpert
+                * geometry.threadgroupSize, 1, 1
+        ),
+        threadGroup: (geometry.threadgroupSize, 1, 1),
         outputShapes: [[
             1, 1, LagunaConstants.numExpertsPerTok, 1,
             LagunaConstants.moeIntermediateSize,
@@ -7346,10 +7394,20 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
     precondition(routerKeys.dtype == .uint32)
     precondition(routerKeys.size == LagunaConstants.numExperts)
 
-    return lagunaRoutedSwiGLUQMVPackedTop8Kernel(
+    let geometry = lagunaQMVTileGeometry
+    let kernel: MLXFast.MLXFastKernel
+    switch geometry {
+    case .rows2: kernel = lagunaRoutedSwiGLUQMVPackedTop8TG2Kernel
+    case .rows1: kernel = lagunaRoutedSwiGLUQMVPackedTop8TG1Kernel
+    case .rows4: kernel = lagunaRoutedSwiGLUQMVPackedTop8Kernel
+    }
+    return kernel(
         [input, fusedWeight, packedScales, routerKeys],
-        grid: (LagunaConstants.numExpertsPerTok * 128 * 64, 1, 1),
-        threadGroup: (64, 1, 1),
+        grid: (
+            LagunaConstants.numExpertsPerTok * geometry.tilesPerExpert
+                * geometry.threadgroupSize, 1, 1
+        ),
+        threadGroup: (geometry.threadgroupSize, 1, 1),
         outputShapes: [[
             1, 1, LagunaConstants.numExpertsPerTok, 1,
             LagunaConstants.moeIntermediateSize,
@@ -7357,6 +7415,163 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
         outputDTypes: [.bfloat16]
     )[0]
 }
+
+/// Compact-geometry sibling of `lagunaRoutedSwiGLUQMVPackedSelectedSource`
+/// for the `DARKBLOOM_QMV_TILE` A/B (`LagunaQMVTileGeometry.rows2/rows1`):
+/// one output row per simdgroup instead of two. `rowsPerThreadgroup` is 2
+/// (256 tiles/expert, threadgroup 64) or 1 (512 tiles/expert, threadgroup
+/// 32). Per output row the arithmetic is bit-identical to the accepted
+/// kernel: same K-block walk order, same `laguna_nvfp4_qdot_16` inner op,
+/// same simd_sum tree, same SwiGLU epilogue. Only the row→threadgroup
+/// mapping changes, so the packed scale side bank (laid out per 4-row tile)
+/// is re-indexed analytically: `packed_tile = logical_row / 4`,
+/// `sub = logical_row % 4`, which is exactly the (tile, simd_group*2 + row)
+/// pair the accepted kernel would use for that row — the bank is never
+/// read past `packed_expert_bytes` since `logical_row <= 511` keeps
+/// `packed_tile <= 127`.
+func lagunaRoutedSwiGLUQMVPackedCompactSource(
+    prologue: String, expertExpression: String, rowsPerThreadgroup: Int
+) -> String {
+    precondition(rowsPerThreadgroup == 2 || rowsPerThreadgroup == 1)
+    return """
+            constexpr uint input_width = 2048;
+            constexpr uint output_width = 512;
+            constexpr uint block_width = 512;
+            constexpr uint values_per_lane = 16;
+            constexpr uint routed_experts = 8;
+            constexpr uint fused_row_bytes = 1024;
+            constexpr uint fused_expert_bytes = 1024 * fused_row_bytes;
+            constexpr uint scale_row_bytes = 32;
+            constexpr uint scale_sub_bytes = 8 * scale_row_bytes;
+            constexpr uint scale_kblock_bytes = scale_sub_bytes;
+            constexpr uint scale_tile_bytes = 4 * scale_kblock_bytes;
+            constexpr uint packed_expert_bytes = 128 * scale_tile_bytes;
+            constexpr uint rows_per_threadgroup = \(rowsPerThreadgroup);
+
+            uint group = threadgroup_position_in_grid.x;
+            uint expert_slot = group % routed_experts;
+            uint tile = group / routed_experts;
+            uint simd_group = simdgroup_index_in_threadgroup;
+            uint lane = thread_index_in_simdgroup;
+            uint first_row = tile * rows_per_threadgroup + simd_group;
+            \(prologue)
+            uint expert = \(expertExpression);
+
+            const device uint8_t* expert_weight =
+                (const device uint8_t*)fused_weight + expert * fused_expert_bytes;
+            const device uint8_t* tile_scales =
+                packed_scales + expert * packed_expert_bytes
+                + (first_row / 4) * scale_tile_bytes;
+
+            thread float gate_result[1] = {0.0f};
+            thread float up_result[1] = {0.0f};
+            thread float input_values[values_per_lane];
+
+            for (uint block = 0; block < input_width; block += block_width) {
+                const device vec<bfloat, 4>* input_vectors =
+                    (const device vec<bfloat, 4>*) (
+                        input + block + lane * values_per_lane);
+                for (uint i = 0; i < values_per_lane / 4; ++i) {
+                    const vec<bfloat, 4> values = input_vectors[i];
+                    input_values[4 * i] = values[0];
+                    input_values[4 * i + 1] = values[1];
+                    input_values[4 * i + 2] = values[2];
+                    input_values[4 * i + 3] = values[3];
+                }
+
+                const device uint8_t* block_scales =
+                    tile_scales + (block / block_width) * scale_kblock_bytes;
+                for (uint row = 0; row < 1; ++row) {
+                    uint logical_row = first_row + row;
+                    uint gate_row = (logical_row / 32) * 64 + logical_row % 32;
+                    uint up_row = gate_row + 32;
+                    uint sub = logical_row % 4;
+                    const device uint8_t* gate_scale =
+                        block_scales + sub * 2 * scale_row_bytes + lane;
+                    const device uint8_t* up_scale = gate_scale + scale_row_bytes;
+                    const device uint8_t* gate_weight =
+                        expert_weight + gate_row * fused_row_bytes
+                        + block / 2 + lane * 8;
+                    const device uint8_t* up_weight =
+                        expert_weight + up_row * fused_row_bytes
+                        + block / 2 + lane * 8;
+
+                    gate_result[row] += laguna_nvfp4_qdot_16(
+                        gate_weight, input_values,
+                        laguna_nvfp4_scale(gate_scale[0]));
+                    up_result[row] += laguna_nvfp4_qdot_16(
+                        up_weight, input_values,
+                        laguna_nvfp4_scale(up_scale[0]));
+                }
+            }
+
+            for (uint row = 0; row < 1; ++row) {
+                gate_result[row] = simd_sum(gate_result[row]);
+                up_result[row] = simd_sum(up_result[row]);
+                if (lane == 0) {
+                    bfloat gate = bfloat(gate_result[row]\(lagunaNvfp4RowScaleSuffix));
+                    bfloat up = bfloat(up_result[row]\(lagunaNvfp4RowScaleSuffix));
+                    bfloat exp_abs = metal::exp(metal::abs(gate));
+                    bfloat denominator = bfloat(1) + exp_abs;
+                    bfloat y = bfloat(1) / denominator;
+                    bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+                    bfloat silu = bfloat(gate * sigmoid);
+                    activated[expert_slot * output_width + first_row + row] =
+                        bfloat(silu * up);
+                }
+            }
+            """
+}
+
+private let lagunaRoutedSwiGLUQMVPackedTG2Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_bf16_v1_tg2",
+    inputNames: ["input", "fused_weight", "packed_scales", "indices"],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVPackedCompactSource(
+        prologue: "",
+        expertExpression: "uint(indices[expert_slot])",
+        rowsPerThreadgroup: 2),
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaRoutedSwiGLUQMVPackedTG1Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_bf16_v1_tg1",
+    inputNames: ["input", "fused_weight", "packed_scales", "indices"],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVPackedCompactSource(
+        prologue: "",
+        expertExpression: "uint(indices[expert_slot])",
+        rowsPerThreadgroup: 1),
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaRoutedSwiGLUQMVPackedTop8TG2Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_bf16_v1_tg2",
+    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVPackedCompactSource(
+        prologue: lagunaRouterTop8PrecomputedPrelude,
+        expertExpression: "top8_winner",
+        rowsPerThreadgroup: 2),
+    header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
+        + "\n" + lagunaRouterTop8PrologueHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaRoutedSwiGLUQMVPackedTop8TG1Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_bf16_v1_tg1",
+    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVPackedCompactSource(
+        prologue: lagunaRouterTop8PrecomputedPrelude,
+        expertExpression: "top8_winner",
+        rowsPerThreadgroup: 1),
+    header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
+        + "\n" + lagunaRouterTop8PrologueHeader,
+    ensureRowContiguous: true
+)
 
 /// The routed and shared gate/up QMVs read the same activation row, write
 /// different outputs, and share an identical tile shape: 128 tiles of four
