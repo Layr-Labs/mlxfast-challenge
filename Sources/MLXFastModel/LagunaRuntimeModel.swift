@@ -1423,6 +1423,9 @@ func lagunaSlidingQKNormRoPE(
 let lagunaFusedSlidingAttentionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_ATTN"] != "0"
 
+private let lagunaFusedAttentionHostChecksEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ATTN_HOST_CHECKS"] == "1"
+
 private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
     name: "laguna_sliding_fused_attn_ring_v1",
     inputNames: [
@@ -1827,6 +1830,33 @@ func lagunaSlidingFusedAttention(
     precondition(writeIdx >= 0 && writeIdx < window)
     precondition(scale.dtype == .float32 && scale.size == 1)
 
+    return lagunaSlidingFusedAttentionLaunch(
+        rawQueries: rawQueries,
+        rawKeys: rawKeys,
+        rawValues: rawValues,
+        queryWeight: queryWeight,
+        keyWeight: keyWeight,
+        angles: angles,
+        cacheKeys: cacheKeys,
+        cacheValues: cacheValues,
+        writeIdx: writeIdx,
+        scale: scale
+    )
+}
+
+private func lagunaSlidingFusedAttentionLaunch(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    rawValues: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray,
+    cacheKeys: MLXArray,
+    cacheValues: MLXArray,
+    writeIdx: Int,
+    scale: MLXArray
+) -> MLXArray {
+    let heads = LagunaConstants.slidingAttentionHeads
     lagunaTrace("sliding fused attention")
     let params = MLXArray([UInt32(writeIdx)])
     return lagunaSlidingFusedAttentionKernel(
@@ -2313,6 +2343,34 @@ func lagunaFullFusedAttention(
     precondition(writeIdx >= 0 && writeIdx < capacity)
     precondition(scale.dtype == .float32 && scale.size == 1)
 
+    return lagunaFullFusedAttentionLaunch(
+        rawQueries: rawQueries,
+        rawKeys: rawKeys,
+        rawValues: rawValues,
+        queryWeight: queryWeight,
+        keyWeight: keyWeight,
+        angles: angles,
+        cacheKeys: cacheKeys,
+        cacheValues: cacheValues,
+        writeIdx: writeIdx,
+        scale: scale
+    )
+}
+
+private func lagunaFullFusedAttentionLaunch(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    rawValues: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray,
+    cacheKeys: MLXArray,
+    cacheValues: MLXArray,
+    writeIdx: Int,
+    scale: MLXArray
+) -> MLXArray {
+    let heads = LagunaConstants.fullAttentionHeads
+    let capacity = cacheKeys.dim(2)
     lagunaTrace("full fused attention")
     let params = MLXArray([
         UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
@@ -5798,18 +5856,33 @@ final class LagunaRuntimeAttention: Module {
             // One dispatch replaces the QK-norm+RoPE kernel, both cache
             // slice-assign dispatches, and sdpa_vector; see the kernel doc.
             // The clock advance below mirrors updateInPlace(tokenCount: 1).
-            fusedAttended = lagunaSlidingFusedAttention(
-                rawQueries: queries,
-                rawKeys: keys,
-                rawValues: values,
-                queryWeight: qNorm.weight,
-                keyWeight: kNorm.weight,
-                angles: fusedAngles,
-                cacheKeys: ring.keys,
-                cacheValues: ring.values,
-                writeIdx: ring.writeIdx,
-                scale: _fusedAttnScale
-            )
+            if lagunaFusedAttentionHostChecksEnabled {
+                fusedAttended = lagunaSlidingFusedAttention(
+                    rawQueries: queries,
+                    rawKeys: keys,
+                    rawValues: values,
+                    queryWeight: qNorm.weight,
+                    keyWeight: kNorm.weight,
+                    angles: fusedAngles,
+                    cacheKeys: ring.keys,
+                    cacheValues: ring.values,
+                    writeIdx: ring.writeIdx,
+                    scale: _fusedAttnScale
+                )
+            } else {
+                fusedAttended = lagunaSlidingFusedAttentionLaunch(
+                    rawQueries: queries,
+                    rawKeys: keys,
+                    rawValues: values,
+                    queryWeight: qNorm.weight,
+                    keyWeight: kNorm.weight,
+                    angles: fusedAngles,
+                    cacheKeys: ring.keys,
+                    cacheValues: ring.values,
+                    writeIdx: ring.writeIdx,
+                    scale: _fusedAttnScale
+                )
+            }
             rotating.fusedRingAdvance()
             qkNormRoPEFused = true
         } else if lagunaFusedFullAttentionEnabled,
@@ -5824,18 +5897,33 @@ final class LagunaRuntimeAttention: Module {
             // the second decode step (the first step's growth concat stays
             // stock). The clock advance mirrors the stock single-token
             // update.
-            fusedAttended = lagunaFullFusedAttention(
-                rawQueries: queries,
-                rawKeys: keys,
-                rawValues: values,
-                queryWeight: qNorm.weight,
-                keyWeight: kNorm.weight,
-                angles: fusedAngles,
-                cacheKeys: append.keys,
-                cacheValues: append.values,
-                writeIdx: append.writeIdx,
-                scale: _fusedAttnScale
-            )
+            if lagunaFusedAttentionHostChecksEnabled {
+                fusedAttended = lagunaFullFusedAttention(
+                    rawQueries: queries,
+                    rawKeys: keys,
+                    rawValues: values,
+                    queryWeight: qNorm.weight,
+                    keyWeight: kNorm.weight,
+                    angles: fusedAngles,
+                    cacheKeys: append.keys,
+                    cacheValues: append.values,
+                    writeIdx: append.writeIdx,
+                    scale: _fusedAttnScale
+                )
+            } else {
+                fusedAttended = lagunaFullFusedAttentionLaunch(
+                    rawQueries: queries,
+                    rawKeys: keys,
+                    rawValues: values,
+                    queryWeight: qNorm.weight,
+                    keyWeight: kNorm.weight,
+                    angles: fusedAngles,
+                    cacheKeys: append.keys,
+                    cacheValues: append.values,
+                    writeIdx: append.writeIdx,
+                    scale: _fusedAttnScale
+                )
+            }
             simple.fusedAppendAdvance()
             qkNormRoPEFused = true
         } else if useFusedFullQKNormYaRN, let qkRoPEAngles {
