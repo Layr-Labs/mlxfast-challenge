@@ -8506,6 +8506,93 @@ private let lagunaDecodeRouterOrdinalScoreTableNormalizingKernel = MLXFast.metal
     ensureRowContiguous: true
 )
 
+/// Decode selector for the sortable ordinals already emitted by
+/// `lagunaResidualRMSNormRouter`. One SIMD owns the 256 experts as eight
+/// lane-local entries and performs the same eight comparator-minimum rounds
+/// the routed gate/up QMV already uses. Only the winning eight BF16 logits are
+/// converted back to their pre-bias sigmoid scores; their rank-order left
+/// fold and divisions are identical to the accepted normalizing epilogue.
+private func lagunaDecodeRouterPrecomputedKeySource(normalizing: Bool) -> String {
+    let epilogue = normalizing
+        ? """
+        float total = 0.0f;
+        for (uint i = 0; i < 8; ++i) {
+            total = simd_shuffle(my_score, ushort(i)) + total;
+        }
+        if (lane < 8) {
+            router_indices[lane] = my_index;
+            router_scores[lane] = my_score / total;
+        }
+        """
+        : """
+        if (lane < 8) {
+            router_indices[lane] = my_index;
+            router_scores[lane] = my_score;
+        }
+        """
+    return """
+        uint lane = thread_position_in_threadgroup.x;
+        thread uint lane_keys[8];
+        for (uint j = 0; j < 8; ++j) {
+            lane_keys[j] = router_keys[lane + 32u * j];
+        }
+
+        uint selected_mask = 0u;
+        uint my_index = 0u;
+        float my_score = 0.0f;
+        for (uint rank = 0; rank < 8; ++rank) {
+            uint winner = laguna_router_top8_extract_round(
+                lane_keys, selected_mask, lane);
+            if (lane == rank) {
+                my_index = winner;
+                float x = float(logits[winner]);
+                float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+                my_score = x < 0.0f ? y : 1.0f - y;
+            }
+        }
+
+        \(epilogue)
+        """
+}
+
+private let lagunaDecodeRouterPrecomputedKeyKernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_top8_precomputed_keys_v1",
+    inputNames: ["logits", "router_keys"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterPrecomputedKeySource(normalizing: false),
+    header: lagunaDecodeRouterOrdinalHeader + "\n" + lagunaRouterTop8PrologueHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaDecodeRouterPrecomputedKeyNormalizingKernel = MLXFast.metalKernel(
+    name: "laguna_decode_router_top8_precomputed_keys_norm_v1",
+    inputNames: ["logits", "router_keys"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaDecodeRouterPrecomputedKeySource(normalizing: true),
+    header: lagunaDecodeRouterOrdinalHeader + "\n" + lagunaRouterTop8PrologueHeader,
+    ensureRowContiguous: true
+)
+
+/// Default-on reuse of the fused producer's exact sortable ordinals. Set to
+/// `0` to restore the accepted independent 256-lane ordinal network.
+private let lagunaDecodeRouterPrecomputedSelectorEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTER_PRECOMPUTED_SELECTOR"] != "0"
+
+/// The selector's all-layer local delta is large enough to exceed the ranked
+/// acceptance window, so ship it in cumulative sparse-layer rungs. Layer 0 is
+/// dense; a value of 12 enables decoder layers 1...12. Later accepted rungs
+/// can raise this toward all 39 sparse layers without changing any enabled
+/// layer's kernel. The environment override is an experiment control only.
+private let lagunaDecodeRouterPrecomputedSelectorLayers: Int = {
+    guard
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_ROUTER_PRECOMPUTED_SELECTOR_LAYERS"],
+        let value = Int(raw)
+    else { return 12 }
+    return min(max(value, 0), LagunaConstants.numHiddenLayers - 1)
+}()
+
 private let lagunaDecodeRouterOrdinalEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_ORDINAL"] != "0"
 
@@ -8572,6 +8659,27 @@ func lagunaDecodeRouterTop8OrdinalScoreTableForTesting(
         [logits, correctionBias],
         grid: (256, 1, 1),
         threadGroup: (256, 1, 1),
+        outputShapes: [[1, 1, 8], [1, 1, 8]],
+        outputDTypes: [.uint32, .float32]
+    )
+    return (outputs[0], outputs[1])
+}
+
+func lagunaDecodeRouterTop8PrecomputedForTesting(
+    logits: MLXArray, routerKeys: MLXArray, normalizing: Bool = false
+) -> (MLXArray, MLXArray) {
+    precondition(logits.dtype == .bfloat16)
+    precondition(logits.size == LagunaConstants.numExperts)
+    precondition(routerKeys.dtype == .uint32)
+    precondition(routerKeys.size == LagunaConstants.numExperts)
+
+    let kernel = normalizing
+        ? lagunaDecodeRouterPrecomputedKeyNormalizingKernel
+        : lagunaDecodeRouterPrecomputedKeyKernel
+    let outputs = kernel(
+        [logits, routerKeys],
+        grid: (32, 1, 1),
+        threadGroup: (32, 1, 1),
         outputShapes: [[1, 1, 8], [1, 1, 8]],
         outputDTypes: [.uint32, .float32]
     )
@@ -9197,14 +9305,16 @@ final class LagunaRuntimeMoEGate: Module {
     let topK: Int
     let normTopkProb: Bool
     let routerLogitSoftcapping: Float
+    let layerIdx: Int
 
     @ParameterInfo(key: "weight") var weight: MLXArray
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
 
-    init(_ config: LagunaConfig) {
+    init(_ config: LagunaConfig, layerIdx: Int) {
         self.topK = config.numExpertsPerTok
         self.normTopkProb = config.normTopkProb
         self.routerLogitSoftcapping = Float(config.moeRouterLogitSoftcapping)
+        self.layerIdx = layerIdx
         self._weight.wrappedValue = zeros([config.numExperts, config.hiddenSize])
         self._eScoreCorrectionBias.wrappedValue = zeros([config.numExperts])
     }
@@ -9213,7 +9323,10 @@ final class LagunaRuntimeMoEGate: Module {
     /// the same invocation already produced it (the fused residual + RMSNorm +
     /// router dispatch). It is the identical `x @ weight.T` this method would
     /// otherwise issue.
-    func callAsFunction(_ x: MLXArray, logits: MLXArray? = nil) -> (MLXArray, MLXArray) {
+    func callAsFunction(
+        _ x: MLXArray, logits: MLXArray? = nil,
+        precomputedKeys: MLXArray? = nil
+    ) -> (MLXArray, MLXArray) {
         let projectedLogits = logits ?? x.matmul(weight.T)
         let inds: MLXArray
         var weights: MLXArray
@@ -9250,6 +9363,24 @@ final class LagunaRuntimeMoEGate: Module {
                 logits: projectedLogits,
                 correctionBias: eScoreCorrectionBias.asType(.float32),
                 rows: projectedLogits.dim(1),
+                normalizing: normTopkProb
+            )
+        }
+        if lagunaDecodeRouterPrecomputedSelectorEnabled,
+            layerIdx > 0,
+            layerIdx <= lagunaDecodeRouterPrecomputedSelectorLayers,
+            let precomputedKeys,
+            routerLogitSoftcapping == 0,
+            topK == LagunaConstants.numExpertsPerTok,
+            projectedLogits.dtype == .bfloat16,
+            projectedLogits.size == LagunaConstants.numExperts,
+            precomputedKeys.dtype == .uint32,
+            precomputedKeys.size == LagunaConstants.numExperts
+        {
+            lagunaTrace("decode router top8 (producer keys)")
+            return lagunaDecodeRouterTop8PrecomputedForTesting(
+                logits: projectedLogits,
+                routerKeys: precomputedKeys,
                 normalizing: normTopkProb
             )
         }
@@ -9743,9 +9874,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         return [packed]
     }
 
-    init(_ config: LagunaConfig) {
+    init(_ config: LagunaConfig, layerIdx: Int) {
         self.routedScalingFactor = Float(config.moeRoutedScalingFactor)
-        self._gate.wrappedValue = LagunaRuntimeMoEGate(config)
+        self._gate.wrappedValue = LagunaRuntimeMoEGate(config, layerIdx: layerIdx)
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
@@ -9772,7 +9903,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         _ x: MLXArray, residual: MLXArray?, routerLogits: MLXArray?,
         routerKeys: MLXArray? = nil
     ) -> MLXArray {
-        let (inds, weights) = gate(x, logits: routerLogits)
+        let (inds, weights) = gate(
+            x, logits: routerLogits, precomputedKeys: routerKeys)
         var y: MLXArray
         var routedAlreadyReduced = false
         var sortedTailInverseOrder: MLXArray?
@@ -10105,7 +10237,7 @@ final class LagunaRuntimeDecoderLayer: Module {
         self._selfAttn.wrappedValue = LagunaRuntimeAttention(config, layerIdx: layerIdx)
 
         if config.isSparse(layer: layerIdx) {
-            self.mlp = LagunaRuntimeSparseMoEBlock(config)
+            self.mlp = LagunaRuntimeSparseMoEBlock(config, layerIdx: layerIdx)
         } else {
             self.mlp = LagunaRuntimeMLP(
                 dimensions: config.hiddenSize, hiddenDimensions: config.intermediateSize)
