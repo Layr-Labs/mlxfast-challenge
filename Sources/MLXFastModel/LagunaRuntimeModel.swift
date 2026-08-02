@@ -112,6 +112,19 @@ let lagunaFusedQKVEnabled =
 let lagunaFusedSharedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_GATE_UP"] != "0"
 
+/// Bounded prefill coverage for the shared-expert fused [gate; up] bank.
+/// The bank is already retained for the decode fusion, so this only changes
+/// which sparse shared experts use its single N=1024 QMM during multi-token
+/// prefill. Keep the default below the frozen per-submission prefill band;
+/// the environment knob allows a later ranked chunk to widen it deliberately.
+private let lagunaPrefillFusedSharedGateUpLayerLimit: Int = {
+    let requested = Int(
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_PREFILL_FUSED_SHARED_GATE_UP_LAYERS"] ?? "20"
+    ) ?? 20
+    return min(max(requested, 0), LagunaConstants.numHiddenLayers)
+}()
+
 /// Decode-only shared-expert NVFP4 QMV + SwiGLU fusion. This consumes the
 /// retained row-concatenated `[gate; up]` bank and emits only the 512-wide
 /// BF16 activation, preserving the two independent QMV casts and every BF16
@@ -7813,6 +7826,9 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     var _fusedGateUpWeight: MLXArray?
     var _fusedGateUpScales: MLXArray?
     var _fusedGateUpSplit: Int = 0
+    /// Only sparse shared-expert instances in the bounded prefill chunk set
+    /// this flag. Decode uses the same retained bank for every sparse layer.
+    var _prefillFusedGateUpEnabled: Bool
 
     /// Retained fused BF16 `[gate; up]` bank for the dense (non-quantized)
     /// layer-0 MLP, built once after checkpoint load when
@@ -7824,10 +7840,15 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     /// one of the two banks is ever non-nil on a given instance.
     var _fusedDenseGateUpWeight: MLXArray?
 
-    init(dimensions: Int, hiddenDimensions: Int) {
+    init(
+        dimensions: Int,
+        hiddenDimensions: Int,
+        prefillFusedGateUpEnabled: Bool = false
+    ) {
         self._gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
         self._upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
         self._downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
+        self._prefillFusedGateUpEnabled = prefillFusedGateUpEnabled
     }
 
     /// Builds and retains the fused gate/up NVFP4 bank from the loaded
@@ -8082,6 +8103,33 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             // quantized output row is computed independently, so the split
             // halves are bit-exact vs. the separate gate/up dispatches.
             lagunaTrace("shared fused [gate; up] bank QMM")
+            let gateUp = MLX.quantizedMM(
+                x,
+                fusedWeight,
+                scales: fusedScales,
+                biases: nil,
+                transpose: true,
+                groupSize: 16,
+                bits: 4,
+                mode: .nvfp4
+            )
+            let gate = gateUp[.ellipsis, 0 ..< _fusedGateUpSplit]
+            let up = gateUp[.ellipsis, _fusedGateUpSplit...]
+            return downProj(compiledSiluProduct(gate, up))
+        }
+        if x.dim(1) > 1,
+            _prefillFusedGateUpEnabled,
+            let fusedWeight = _fusedGateUpWeight,
+            let fusedScales = _fusedGateUpScales,
+            fusedWeight.dtype == .uint32,
+            fusedScales.dtype == .uint8,
+            _fusedGateUpSplit == LagunaConstants.sharedExpertIntermediateSize
+        {
+            // The retained bank is already built for decode. At the scored
+            // prefill shape, one N=1024 quantized matmul replaces the two
+            // stock N=512 matmuls; each output row remains independent and
+            // the gate/up halves retain the original SwiGLU boundaries.
+            lagunaTrace("shared prefill fused [gate; up] bank QMM")
             let gateUp = MLX.quantizedMM(
                 x,
                 fusedWeight,
@@ -9669,7 +9717,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         return [packed]
     }
 
-    init(_ config: LagunaConfig) {
+    init(_ config: LagunaConfig, layerIdx: Int) {
         self.routedScalingFactor = Float(config.moeRoutedScalingFactor)
         self._gate.wrappedValue = LagunaRuntimeMoEGate(config)
         self._switchMLP.wrappedValue = SwitchGLU(
@@ -9679,7 +9727,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         )
         self._sharedExpert.wrappedValue = LagunaRuntimeMLP(
             dimensions: config.hiddenSize,
-            hiddenDimensions: config.sharedExpertIntermediateSize
+            hiddenDimensions: config.sharedExpertIntermediateSize,
+            prefillFusedGateUpEnabled:
+                layerIdx > 0 && layerIdx <= lagunaPrefillFusedSharedGateUpLayerLimit
         )
     }
 
@@ -10031,7 +10081,7 @@ final class LagunaRuntimeDecoderLayer: Module {
         self._selfAttn.wrappedValue = LagunaRuntimeAttention(config, layerIdx: layerIdx)
 
         if config.isSparse(layer: layerIdx) {
-            self.mlp = LagunaRuntimeSparseMoEBlock(config)
+            self.mlp = LagunaRuntimeSparseMoEBlock(config, layerIdx: layerIdx)
         } else {
             self.mlp = LagunaRuntimeMLP(
                 dimensions: config.hiddenSize, hiddenDimensions: config.intermediateSize)
