@@ -636,6 +636,20 @@ let lagunaRoPEAtlasViewsEnabled =
 let lagunaFusedDenseGateUpSwiGLUEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU"] != "0"
 
+/// Exact layer-0 dense gate/up scheduling probe. Both values keep four output
+/// rows per SIMD group and therefore preserve every row's K loop and reduction;
+/// 256 splits each barrier-free 512-thread group into two independently
+/// schedulable groups. An adjacent 256/512/256 bracket measured 6.590/6.620/
+/// 6.593 ms/token locally; 128 threads lost the gain at 6.610. Keep 512 as a
+/// same-binary rollback.
+let lagunaDenseGateUpThreads: Int = {
+    guard
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DENSE_GATE_UP_THREADS"],
+        let value = Int(raw), value == 256 || value == 512
+    else { return 256 }
+    return value
+}()
+
 /// `DARKBLOOM_FUSED_DENSE_DOWN_RESIDUAL` (default on; set "0" to disable):
 /// layer-0-only decode fusion of the dense MLP's down projection with the
 /// decoder layer's `h + r2` residual add (see `lagunaDenseDownResidual`).
@@ -755,6 +769,11 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
         return .off
     }
 }()
+
+/// Diagnostic front-edge rung: enqueue layer 0's already-constructed QKV and
+/// gate projections before the rest of that layer's graph is built.
+private let lagunaAttentionProjectionAsyncEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ATTN_PROJECTION_ASYNC"] != "0"
 
 /// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `1`; `0`/`off` disables;
 /// `8` restores the prior default): a ranked measurement on the
@@ -5643,6 +5662,12 @@ final class LagunaRuntimeAttention: Module {
                 } else {
                     gateLogits = gateProjection(normalized)
                 }
+                if lagunaAttentionProjectionAsyncEnabled,
+                    layerIdx == 0, B == 1, L == 1
+                {
+                    lagunaTrace("attention projection async rung layer 0")
+                    asyncEval(qkv, gateLogits)
+                }
                 // When the fused gate-product kernel will consume the gate at
                 // the output projection, hand it the RAW BF16 logits and skip
                 // the eager softplus chain entirely; the kernel reproduces
@@ -8064,18 +8089,16 @@ func lagunaRoutedSharedDownResidual(
 // rounding order above (lines 1789-1797): round the GEMV accumulator to BF16
 // first, matching stock `downProj`'s own output rounding, then add the
 // residual and round once more -- reproducing stock `h + r2` bit-for-bit.
-private let lagunaDenseGateUpSwiGLUKernel = MLXFast.metalKernel(
-    name: "laguna_dense_gate_up_swiglu_bf16_v1",
-    inputNames: ["input", "fused_weight"],
-    outputNames: ["activated"],
-    source: """
+private func lagunaDenseGateUpSwiGLUSource(threadCount: Int) -> String {
+    let rowsPerGroup = (threadCount / 32) * 4
+    return """
         constexpr uint in_vec_size = 2048;
         constexpr uint output_width = 8192;
         constexpr uint rows_per_thread = 4;
         constexpr uint values_per_thread = 4;
         constexpr uint block_width = 128;
         constexpr uint blocks = in_vec_size / block_width;
-        constexpr uint rows_per_group = 64;
+        constexpr uint rows_per_group = \(rowsPerGroup);
 
         uint tile = threadgroup_position_in_grid.x;
         uint simd_group = simdgroup_index_in_threadgroup;
@@ -8130,9 +8153,22 @@ private let lagunaDenseGateUpSwiGLUKernel = MLXFast.metalKernel(
                 activated[row_base + row] = bfloat(silu * up);
             }
         }
-        """,
-    ensureRowContiguous: true
-)
+        """
+}
+
+private let lagunaDenseGateUpSwiGLUKernels: [Int: MLXFast.MLXFastKernel] =
+    Dictionary(uniqueKeysWithValues: [256, 512].map { threadCount in
+        (
+            threadCount,
+            MLXFast.metalKernel(
+                name: "laguna_dense_gate_up_swiglu_bf16_t\(threadCount)_v1",
+                inputNames: ["input", "fused_weight"],
+                outputNames: ["activated"],
+                source: lagunaDenseGateUpSwiGLUSource(threadCount: threadCount),
+                ensureRowContiguous: true
+            )
+        )
+    })
 
 /// `fusedWeight` is `concatenated([gateProj.weight, upProj.weight], axis: 0)`
 /// -- gate rows first -- built once by `LagunaRuntimeMLP.prepareFusedDenseGateUp()`.
@@ -8148,10 +8184,17 @@ func lagunaDenseGateUpSwiGLU(
             2 * LagunaConstants.denseIntermediateSize, LagunaConstants.hiddenSize,
         ])
 
-    return lagunaDenseGateUpSwiGLUKernel(
+    let threadCount = lagunaDenseGateUpThreads
+    let rowsPerGroup = (threadCount / 32) * 4
+    guard let kernel = lagunaDenseGateUpSwiGLUKernels[threadCount] else {
+        preconditionFailure("unsupported dense gate/up thread count")
+    }
+    return kernel(
         [input, fusedWeight],
-        grid: ((LagunaConstants.denseIntermediateSize / 64) * 512, 1, 1),
-        threadGroup: (512, 1, 1),
+        grid: (
+            (LagunaConstants.denseIntermediateSize / rowsPerGroup) * threadCount,
+            1, 1),
+        threadGroup: (threadCount, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.denseIntermediateSize]],
         outputDTypes: [.bfloat16]
     )[0]
