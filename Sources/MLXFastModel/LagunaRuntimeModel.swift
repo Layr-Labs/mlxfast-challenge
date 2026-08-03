@@ -584,12 +584,13 @@ let lagunaRouterRowsPerGroup: Int = {
     return value
 }()
 
-/// `DARKBLOOM_DECODE_ASYNC_STAGE` (default `at:1,7,15,23,31,39`): process-once
-/// boundary schedule for decode-step async scheduling. Active only when the
-/// invocation input shape is exactly `[1, 1]`; prefill and multi-token shapes
-/// are never asyncEval'd. `off`/`0` disables it; `norm` and `logits` remain
-/// process-once ablation points, as does any single layer index `0`-`39`.
-/// No operation, cache row, or token is added.
+/// `DARKBLOOM_DECODE_ASYNC_STAGE` (default densified ladder2+front
+/// `at:0,1,3,5,...,39`; prior sparse tip was `at:0,1,7,15,23,31,39`):
+/// process-once boundary schedule for decode-step async scheduling. Active
+/// only when the invocation input shape is exactly `[1, 1]`; prefill and
+/// multi-token shapes are never asyncEval'd. `off`/`0` disables it; `norm`
+/// and `logits` remain process-once ablation points, as does any single
+/// layer index `0`-`39`. No operation, cache row, or token is added.
 private enum LagunaDecodeAsyncStage {
     case off
     case layer(Int)
@@ -622,10 +623,19 @@ private enum LagunaDecodeAsyncStage {
 /// for one extra scheduler round trip instead of thirty-five. The front rung
 /// is worthless alone — a lone fire at layer 1 measures 0.9476, the worst
 /// schedule tested — and only pays once the rest of the step is covered.
+///
+/// H13 (joint-schedule axis, this compose): tip already ships front rungs
+/// `0,1` on a sparse every-8 body (`at:0,1,7,15,23,31,39`). notes/52 shows
+/// denser bodies still paid a little on the older base (ladder2≈ladder1), and
+/// those knobs were never re-jointed under the H11 expert-path pack (e165
+/// static-K barrier elision + residual seed peel). Default densifies to
+/// ladder2 boundaries **plus** the proven front rung at layer 0 — still pure
+/// `asyncEval` timing, bit-exact, env-overridable. Restore the prior sparse
+/// tip default with `DARKBLOOM_DECODE_ASYNC_STAGE=at:0,1,7,15,23,31,39`.
 private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     let raw =
         ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?
-        .lowercased() ?? "at:0,1,7,15,23,31,39"
+        .lowercased() ?? "at:0,1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31,33,35,37,39"
     switch raw {
     case "off", "0", "":
         return .off
@@ -3795,6 +3805,18 @@ func lagunaGateProductSoftplus(
 
 // MARK: - Gated native-affine INT8 output projection (one dispatch)
 
+/// `DARKBLOOM_SEED_ELIDE_RESIDUAL` (default on; "0" restores the byte-identical
+/// stock strings): peels the first product of the INT8 `accum` loops so the dead
+/// `+0.0f` seed add goes away -- same closed signed-zero case as the NVFP4 qdot.
+let lagunaSeedElideResidualEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SEED_ELIDE_RESIDUAL"] != "0"
+
+private func lagunaSeedElideResidualInit(_ firstTerm: String) -> String {
+    lagunaSeedElideResidualEnabled ? firstTerm : "0.0f"
+}
+
+private let lagunaSeedElideResidualFrom = lagunaSeedElideResidualEnabled ? "1" : "0"
+
 /// Exact per-head softplus gate plus group-32 affine INT8 output GEMV.
 private func lagunaGatedAffineOProjSource(heads: Int, indexed: Bool = false) -> String {
     let metadataPointers = indexed
@@ -3885,8 +3907,8 @@ private func lagunaGatedAffineOProjSource(heads: Int, indexed: Bool = false) -> 
         for (uint row = 0; row < results_per_simdgroup; ++row) {
             const device uint8_t* wl = ws + row * in_vec_size;
             \(metadataLoad)
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
+            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * wl[0]"));
+            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
                 accum += x_thread[i] * wl[i];
             }
             result[row] += scale * accum + sum * bias;
@@ -4742,8 +4764,8 @@ private func lagunaNormAffineQKVBody(
             const device uint8_t* wl = ws + row * axis_size;
             float scale = float(sc[row * in_vec_size_g]);
             float bias = float(bs[row * in_vec_size_g]);
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
+            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * wl[0]"));
+            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
                 accum += x_thread[i] * wl[i];
             }
             result[row] += scale * accum + sum * bias;
@@ -4938,8 +4960,8 @@ private func lagunaNormAffineQKVPrefetchSource(
             x_thread[i] = value;
         }
         for (uint row = 0; row < results_per_simdgroup; ++row) {
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
+            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * pf_w[d][row][0]"));
+            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
                 accum += x_thread[i] * pf_w[d][row][i];
             }
             result[row] += pf_s[d][row] * accum + sum * pf_b[d][row];
@@ -4961,8 +4983,8 @@ private func lagunaNormAffineQKVPrefetchSource(
         for (uint row = 0; row < results_per_simdgroup; ++row) {
             const device uint8_t* wl = ws + row * axis_size;
             \(metadataLoad)
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
+            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * wl[0]"));
+            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
                 accum += x_thread[i] * wl[i];
             }
             result[row] += scale * accum + sum * bias;
