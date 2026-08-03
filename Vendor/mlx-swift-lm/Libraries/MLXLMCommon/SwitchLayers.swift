@@ -249,7 +249,7 @@ private let routeFusedScatterTopK = 8
 private let routeFusedScatterKernel: MLXFast.MLXFastKernel = {
     let m = routeFusedScatterTopK
     return MLXFast.metalKernel(
-        name: "mlx_lm_route_csort_scatter_fused_m\(m)_u32_v3",
+        name: "mlx_lm_route_csort_scatter_fused_m\(m)_u32_v4",
         inputNames: ["keys"],
         outputNames: ["row_order", "sorted_keys", "inverse_order"],
         source: """
@@ -272,14 +272,20 @@ private let routeFusedScatterKernel: MLXFast.MLXFastKernel = {
             atomic_store_explicit(&tg_before[k], 0u, memory_order_relaxed);
             threadgroup_barrier(mem_flags::mem_threadgroup);
             uint before_limit = t * TILE;
-            for (uint idx = k; idx < n; idx += 256) {
+            uint split = before_limit > k
+                ? k + ((before_limit - k + 255u) / 256u) * 256u
+                : k;
+            split = metal::min(split, n);
+            for (uint idx = k; idx < split; idx += 256) {
                 uint key = keys[idx];
                 atomic_fetch_add_explicit(
                     &tg_total[key], 1u, memory_order_relaxed);
-                if (idx < before_limit) {
-                    atomic_fetch_add_explicit(
-                        &tg_before[key], 1u, memory_order_relaxed);
-                }
+                atomic_fetch_add_explicit(
+                    &tg_before[key], 1u, memory_order_relaxed);
+            }
+            for (uint idx = split; idx < n; idx += 256) {
+                atomic_fetch_add_explicit(
+                    &tg_total[keys[idx]], 1u, memory_order_relaxed);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             uint total = atomic_load_explicit(&tg_total[k], memory_order_relaxed);

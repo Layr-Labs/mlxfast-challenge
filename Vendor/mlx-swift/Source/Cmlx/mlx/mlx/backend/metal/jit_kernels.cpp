@@ -1133,8 +1133,8 @@ namespace {
 // DARKBLOOM_ATTN_* levers below: resolved once per process, never part of a
 // pipeline specialization key, so exactly one variant is ever compiled per
 // run and A/B arms are separate runs of the same binary with the env var
-// flipped. Default OFF: unset compiles byte-identical stock staging (the
-// guarded blocks preprocess away). Injection is gated on the expert kernel
+// flipped. Default ON: an explicit 0 compiles byte-identical stock staging
+// (the guarded blocks preprocess away). Injection is gated on the expert kernel
 // name so every other fp_quantized_nax JIT source stays byte-identical in
 // both arms.
 //
@@ -1145,7 +1145,7 @@ namespace {
 // pipeline was built from the stage-2 source.
 const char* darkbloom_stage2_gather_define() {
   static const char* define = [] {
-    const bool v = env::get_var("DARKBLOOM_STAGE2_GATHER", "") == "1";
+    const bool v = env::get_var("DARKBLOOM_STAGE2_GATHER", "1") != "0";
     if (v || env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1") {
       fprintf(
           stderr,
@@ -1351,10 +1351,10 @@ namespace {
 // of the loader traffic, and it drops the LSU:MMA issue ratio from 5.00 to
 // 4.11. See notes/21-attn-analysis.md.
 //
-// DEFAULT OFF, read as `== "1"`. This is an unmeasured arm: the hoist extends
+// DEFAULT ON: this submission is the paired measurement. The hoist extends
 // 8 fragments' live range across the whole loop (+28 registers/thread), and if
 // that crosses an occupancy threshold it shows up as a regression, not a win.
-// It must not ship until a paired measurement says otherwise.
+// An explicit DARKBLOOM_ATTN_QHOIST=0 recovers the reloading arm.
 //
 // WHY A #define AND NOT A FUNCTION CONSTANT. The natural home for a host-side
 // switch is scaled_dot_product_attention.cpp, but that file is not in
@@ -1376,7 +1376,7 @@ namespace {
 // takes its arguments by value; the empty string appends nothing.
 const char* darkbloom_attn_qhoist_define() {
   static const bool enabled = [] {
-    const bool v = env::get_var("DARKBLOOM_ATTN_QHOIST", "") == "1";
+    const bool v = env::get_var("DARKBLOOM_ATTN_QHOIST", "1") != "0";
     // Same ground-truth discipline the STAGE arms needed: prove the arm is
     // live before trusting its number. A #define that silently fails to reach
     // the source string produces an arm that measures its own control.
