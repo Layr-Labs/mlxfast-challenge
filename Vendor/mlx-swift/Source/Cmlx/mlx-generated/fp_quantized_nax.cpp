@@ -2142,24 +2142,19 @@ template <
 
       for (int k = 0; k < K_it; ++k) {
         // Bit-exact A-operand hoist (the XMAJOR arm's shipped pattern at
-        // one-eighth its register cost): this iteration's x fragments load
-        // into registers BEFORE the two staging barriers, overlapping the
-        // sorted-x device reads with the weight staging they previously
-        // serialized behind. x is read-only, the A registers carry no
-        // dependence on Ws, both barriers remain, and the MMA chain
-        // (k ascending, kk1 ascending, same Dtile) is untouched, so every
-        // accumulation happens in the identical order on identical values.
-        // The partial-row arm uses load_rows: at this instantiation
-        // load_safe's column predicate is a tautology (widest touched
-        // column is 31 < SK), so bytes, addresses, and zero-fills are
-        // identical while the row predicate hoists out of the contiguous
-        // four-element runs and the Int<1> contiguous branch is restored.
+        // 1/8 its register cost): x fragments load before both staging
+        // barriers; x is read-only, A has no Ws dependence, barriers and
+        // the MMA chain order are untouched. load_rows replaces load_safe
+        // on partial rows: its column predicate is a tautology here
+        // (max column 31 < SK), so bytes/addresses/zero-fills match.
         NAXTile<T, TM, TK> Atile[BK / SK];
         if (sg_active) {
           STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             if (sgp_sm == SM) {
-              Atile[kk1 / SK].load(xn + kk1, kernel_K);
+              // 8B alignment certified: fn multiples of 4 elems, off_y in
+              // {0,16}, kk1 in {0,32}, str_x = 2048. Same bytes, same slots.
+              Atile[kk1 / SK].load_contig(xn + kk1, kernel_K);
             } else {
               Atile[kk1 / SK].load_rows(xn + kk1, kernel_K, sgp_sm);
             }
@@ -2310,7 +2305,11 @@ template <
       }
 #endif // DARKBLOOM_STAGE2_GATHER
 
+#ifndef DARKBLOOM_SWIGLU_REGLOCAL
+      // Staged-epilogue arm only: reg-local epilogues read no threadgroup
+      // memory and the next chunk's k-loop opens with its own WAR barrier.
       threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif // DARKBLOOM_SWIGLU_REGLOCAL
       const bool fuse_swiglu =
           kernel_N == 1024 && kernel_K == 2048;
       if (fuse_swiglu) {
