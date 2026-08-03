@@ -477,6 +477,9 @@ private let lagunaLastPrefillProjectionBanksEnabled =
 private let lagunaTerminalPrefillFusionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_TERMINAL_FUSION"] != "0"
 
+private let lagunaTerminalGatedOutputEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_TERMINAL_GATED_OUTPUT"] != "0"
+
 /// Full-attention counterpart: fuses per-head Q/K RMSNorm with partial YaRN
 /// RoPE. One stock FP32 probe row carries the authoritative rotary factors,
 /// while the custom kernel preserves the normalized BF16 boundary and tail.
@@ -6102,6 +6105,15 @@ final class LagunaRuntimeAttention: Module {
                 gatePerHead && projectedGate.dtype == output.dtype
                 ? lagunaCompiledSoftplusGate(projectedGate)
                 : softplus(projectedGate.asType(.float32)).asType(output.dtype)
+            if lagunaTerminalGatedOutputEnabled, gatePerHead, B == 1,
+                wo.bias == nil, output.dtype == .bfloat16,
+                gate.dtype == .bfloat16, wo.weight.dtype == .bfloat16,
+                let projection = lagunaGatedOutputProjection(
+                    attentionOutput: output, gateValues: gate,
+                    weight: wo.weight, heads: nHeads)
+            {
+                return projection
+            }
             if gatePerHead {
                 output =
                     (output.reshaped(B, 1, nHeads, headDim) * gate[.ellipsis, .newAxis])
