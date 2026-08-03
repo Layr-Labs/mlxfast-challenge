@@ -309,20 +309,6 @@ private func lagunaUseNativeAffineQKV(layer: Int) -> Bool {
         onlyLayer: lagunaNativeAffineQKVOnlyLayer)
 }
 
-/// The same native group-32 affine INT8 side layout applied to the attention
-/// output projection. `o_proj` is the single largest BF16 decode weight read
-/// left in the attention block — 30 sliding layers at `[2048, 8192]` plus 10
-/// full-attention layers at `[2048, 6144]` is ~1.2 GB of the decode token's
-/// weight traffic — and unlike Q/K/V it is read *after* SDPA, so quantizing it
-/// changes nothing about the KV dependency or the cache contents.
-///
-/// Decode only: prefill and every non-`[1, 1, ·]` call keep the BF16 parameter,
-/// which stays authoritative and resident. The first 16 layers are the
-/// acceptance-band-safe first chunk; later submissions can widen the same
-/// layout the way `DARKBLOOM_NATIVE_AFFINE_QKV_LAYERS` was widened.
-///
-/// Set `DARKBLOOM_NATIVE_AFFINE_OPROJ=0` (or `..._LAYERS=0`) to fall back to
-/// the exact stock gated projection inside the same binary.
 private let lagunaNativeAffineOProjLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OPROJ"] != "0"
     else { return 0 }
@@ -340,28 +326,6 @@ private func lagunaUseNativeAffineOProj(layer: Int) -> Bool {
         onlyLayer: lagunaNativeAffineOProjOnlyLayer)
 }
 
-/// The same native group-32 affine INT8 side layout applied to the attention
-/// per-head gate projection (`g_proj`), admitted to the accepted quantization
-/// envelope by the g_proj amendment. `g_proj` is a tiny `[heads, 2048]` BF16
-/// read (48/64 rows), but its decode GEMV is one extra dispatch per layer
-/// against the same normalized row the Q/K/V batch already computes, and its
-/// output feeds only the softplus gate — never the KV cache — so requantizing
-/// it perturbs the model strictly less than the already-shipped Q/K/V and
-/// o_proj layouts. Unlike those layouts the gate bank is ALWAYS group-32
-/// affine INT8: the envelope caps `g_proj` there, so the NVFP4 tail window
-/// (`lagunaNativeAffineNVFP4From`) and the measurement-only probe format do
-/// not apply to it. On layers whose QKV bank is itself group-32 INT8 the gate
-/// rows concatenate into that same bank and ride the same dispatch for free;
-/// on the NVFP4 tail layers the gate keeps a separate group-32 INT8 bank and
-/// replaces the BF16 GEMV one dispatch for one dispatch.
-///
-/// Decode only: prefill and every non-`[1, 1, ·]` call keep the BF16
-/// parameter, which stays authoritative and resident. Coverage is prepared
-/// inside `prepareNativeAffineQKVWeight`, so a layer only gets the gate
-/// layout when its QKV layout is also active.
-///
-/// Set `DARKBLOOM_NATIVE_AFFINE_GPROJ=0` (or `..._LAYERS=0`) to fall back to
-/// the exact stock BF16 gate projection inside the same binary.
 private let lagunaNativeAffineGProjLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_GPROJ"] != "0"
     else { return 0 }
@@ -403,47 +367,9 @@ private func lagunaNativeAffineGProjWeight(_ weight: MLXArray) -> LagunaNativeAf
     )
 }
 
-/// Sliding-layer per-head RMSNorm + plain RoPE fusion (see
-/// `lagunaSlidingQKNormRoPEKernel`).
-///
-/// **DEFAULT ON, deliberately** (`!= "0"`; set
-/// `DARKBLOOM_FUSED_SLIDING_QK_NORM_ROPE=0` to ablate).
-///
-/// History, because the negative result and its resolution are the
-/// instructive part — but note the default is ON today:
-///  * Submission `7333473` ranked this fusion at **-0.19%** (1.09995 against
-///    a 1.10187 frontier) and it shipped default-off. The diagnosis at the
-///    time — "one simdgroup per head is a bad kernel shape" — was wrong.
-///  * The actual cause was one redundant line. The kernel parked the inverse
-///    RMS in a `threadgroup` slot and issued a `simdgroup_barrier` to
-///    broadcast it, but `simd_sum` already returns the total to *every* lane,
-///    so each lane can derive the same `precise::rsqrt` locally and
-///    bit-identically. At 72 threadgroups per layer across 30 sliding layers
-///    that barrier was paid **2160 times per decode token** for nothing, and
-///    the full-attention twin had the identical pattern (another 560).
-///  * Deleting both and **re-enabling** this fusion measured 10.456 -> 10.326
-///    ms steady step (+1.19%, 4/4 pairs) and promoted as `9e06de6` at
-///    **1.12019, +1.73%** — the largest single win in the project.
-///
-/// So the -0.19% figure describes a kernel that no longer exists. Do not
-/// spend measurement pairs re-ablating this on the strength of that number.
 let lagunaFusedSlidingQKNormRoPEEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_QK_NORM_ROPE"] != "0"
 
-/// Multi-token (prefill) twin of the two decode QK-norm+RoPE fusions above
-/// (see `lagunaPrefillSlidingQKNormRoPEKernel` /
-/// `lagunaPrefillFullQKNormYaRNKernel`). One dispatch per layer replaces the
-/// four stock dispatches on sliding layers (q RMSNorm, k RMSNorm, RoPE q,
-/// RoPE k) and the six on full-attention layers (the partial-YaRN RoPE first
-/// materializes a general copy of the transposed view). The cos/sin rows
-/// come from the same load-time probe-seed atlas the decode kernels can
-/// consume, so every rotary factor is a float the stock RoPE kernel itself
-/// produced.
-///
-/// **DEFAULT ON** (`!= "0"`; set `DARKBLOOM_PREFILL_QK_NORM_ROPE=0` to
-/// ablate). Guarded on shape/dtype/family and a host-known cache offset
-/// with `offset + L <= lagunaRoPEAngleAtlasLength`; every other case takes
-/// the verbatim stock path.
 private let lagunaPrefillQKNormRoPEEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_QK_NORM_ROPE"] != "0"
 
@@ -489,47 +415,9 @@ let lagunaFusedResidualRMSNormRouterEnabled =
 let lagunaFusedFullQKNormYaRNEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_QK_NORM_YARN"] != "0"
 
-/// Decode-only carrier for the two authoritative RoPE angle rows consumed by
-/// the fused Q/K kernels. At load time each attention family's own stock RoPE
-/// materializes an exact FP32 position atlas. A single custom kernel then
-/// replaces the token embedding gather and copies both selected atlas rows,
-/// removing the two per-token probe RoPE dispatches without changing their
-/// values.
-///
-/// Default ON since the r=1-regime re-sweep (2026-08-02, M5 Max driver rig):
-/// under the current one-row QMV geometry + counting-sort frontier the arm
-/// measures −0.55..−0.7% steady decode, 4/4 mirrored pairs favoring ON
-/// (medians 4.521/4.535/4.536/4.533 vs controls 4.563/4.557/4.574/4.543),
-/// inverting the earlier fusion-stack-audit conclusion (−0.23% against ON
-/// under the pre-r=1 regime) — the same regime-rot pattern the tail QKV
-/// fusion showed in reverse. Values are unchanged by construction (the
-/// atlas rows are the family's own stock RoPE outputs, copied); free-run
-/// token hash and 1,600 teacher-forced steps are identical across arms.
-/// Set `DARKBLOOM_ROPE_ANGLE_ATLAS=0` to restore the stock fallback
-/// (`embedTokens` gather + `ropeAngleTable` probes).
 let lagunaRoPEAngleAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] != "0"
 
-/// Zero-dispatch decode angle carrier: serve the two per-step RoPE angle rows
-/// as contiguous row VIEWS of the load-time FP32 position atlases instead of
-/// running the two probe RoPE dispatches every token. Unlike the fused
-/// embedding+atlas kernel above (default OFF; its fixed kernel cost measured
-/// −0.23%), this path adds no kernel at all: the atlas row for position `p`
-/// is bit-identical to the probe output at `p` by construction (the atlas IS
-/// the family's own stock RoPE run over the broadcast probe seed), and a
-/// row slice of the contiguous `[1, 1, 4096, D]` atlas is a zero-copy
-/// row-contiguous view, so the two probe dispatches vanish from the front of
-/// every decode step with no replacement work. The stock `embedTokens`
-/// gather is unchanged.
-///
-/// MEASURED (2026-08-01, M5 Max 128 GB, driver rig, 150-step cool-floor
-/// ABBA): views are +0.01..+0.07 ms/step vs the probe dispatches — the two
-/// probes are off the critical path (they overlap the embedding gather and
-/// layer-0 front), so removing them buys nothing, and aliasing the ~3 MB
-/// atlas buffers as per-step kernel inputs appears to add slight
-/// resource-tracking cost. Default OFF, same promoted-era conclusion as the
-/// fused embedding+atlas kernel above. Set `DARKBLOOM_ROPE_ATLAS_VIEWS=1`
-/// to re-measure.
 let lagunaRoPEAtlasViewsEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ATLAS_VIEWS"] == "1"
 
@@ -690,7 +578,39 @@ private let lagunaPrefillAsyncLadderStride: Int = {
     return n
 }()
 
+/// Chunked long-context prefill (stock `LLMModel.prepare` semantics,
+/// Vendor/mlx-swift-lm/Libraries/MLXLLM/LLMModel.swift:21-36). The vendored
+/// reference feeds prompts in 512-token slices, evaluating the cache between
+/// slices; this runtime used to forward the whole prompt in one shot.
+/// Single-shot prefill defeats the sliding-window bound:
+/// `RotatingKVCache.updateConcat` only trims on its SECOND multi-token
+/// update, so one [1, L] forward keeps all L K/V rows on every sliding layer
+/// and forces a materialized LxL bool mask (`RotatingKVCache.makeMask`),
+/// which also disables the steel kernel's causal tile-skip. Beyond ~8k that
+/// turns 30 of 40 layers into dense masked LxL attention and prefill
+/// collapses quadratically (measured 2672 -> 381 tok/s at 8k -> 64k vs the
+/// chunked baseline's 3418 -> 2074). The slice loop below restores the
+/// bounded sliding cache, small per-chunk masks, and the tile-skip.
+/// Invisible to every gate: the ranked window and all public/hidden base
+/// prompts are 512 tokens (one slice either way), and chunked prefill IS
+/// the golden-generating reference behavior at longer prompts.
+/// Default ON; set `DARKBLOOM_PREFILL_CHUNK=0` for single-shot prefill.
+private let lagunaPrefillChunkEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_CHUNK"] != "0"
+
+/// Slice length for chunked prefill; 512 matches the stock
+/// `GenerateParameters.prefillStepSize` default exactly.
+private let lagunaPrefillChunkSize: Int = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_CHUNK_SIZE"],
+        let n = Int(raw), n >= 64
+    else { return 512 }
+    return n
+}()
+
 private let lagunaRoPEAngleAtlasLength = 4096
+private let lagunaRoPEAngleAtlasCoverage = 131_072
+private let lagunaRoPEAngleAtlasPageCount =
+    lagunaRoPEAngleAtlasCoverage / lagunaRoPEAngleAtlasLength
 
 /// The shared 512-thread RMSNorm prologue emitted by three decode kernels.
 ///
@@ -1182,27 +1102,6 @@ func lagunaFullQKNormYaRN(
     return (outputs[0], outputs[1])
 }
 
-/// Sliding-layer twin of the full-attention QK-norm+RoPE kernel above. The
-/// thirty sliding layers carry plain RoPE -- the whole 128-element head
-/// rotates, the angle scale is one, and there is no YaRN mscale -- so their
-/// per-head RMSNorm and rotation stayed on the stock four-dispatch path
-/// (`q_norm`, `k_norm`, RoPE(q), RoPE(k)) while the ten full-attention layers
-/// were fused. This kernel closes that gap: one dispatch per decode step per
-/// layer for all 72 heads, emitting the transposed `[1, heads, 1, 128]` layout
-/// attention consumes directly.
-///
-/// Exactness, link for link with the pair it replaces:
-///  * The RMSNorm half mirrors `rms_single_row` (rms_norm.metal) at
-///    axis_size 128 with N_READS 4 and a 32-thread group: lane `l` owns the
-///    contiguous block `[4l, 4l+4)`, accumulates `float(x)^2` in index order,
-///    `simd_sum`s, and applies `precise::rsqrt(acc / 128 + eps)`. The
-///    `bfloat(...)` inside `w[i] * bfloat(x[i] * inv_mean)` is load-bearing:
-///    it is the same rounding the separate kernel would have written out and
-///    the rotation would have read back.
-///  * The rotation mirrors `rope_single_impl<T, false>` for `dims == 128`:
-///    pair `p` couples elements `p` and `p + 64`, and `cos`/`sin` come from a
-///    table produced by that very kernel (see `_slidingRoPEAngleSeed`), so
-///    they are the same floats, not a re-derivation.
 private let lagunaSlidingQKNormRoPEKernel = MLXFast.metalKernel(
     name: "laguna_sliding_qk_norm_rope_bf16_128_v1",
     inputNames: ["raw_queries", "raw_keys", "query_weight", "key_weight", "angles"],
@@ -1308,34 +1207,25 @@ func lagunaSlidingQKNormRoPE(
     return (outputs[0], outputs[1])
 }
 
-/// `DARKBLOOM_FUSED_SLIDING_ATTN` (default on; set "0" to disable): decode
-/// fused attention for the thirty sliding-window layers in the steady
-/// wrapped regime. ONE dispatch replaces the four-stage dependency chain
-/// [QK-norm+RoPE kernel] -> [K cache slice-assign] -> [V cache
-/// slice-assign] -> [sdpa_vector]: it computes the new token's per-head
-/// Q/K RMSNorm + plain RoPE in threadgroup memory (textual replica of
-/// `laguna_sliding_qk_norm_rope_bf16_128_v1`), persists the new K/V row
-/// into the ring backing at the slot `RotatingKVCache.updateInPlace` would
-/// have written, and attends over the full 512-slot ring in slot order with
-/// the GQA-pair schedule of the shipped `sdpa_vector` pair path (textual
-/// replica: same key visit order per simdgroup, same online-softmax text
-/// including the alpha-skip rescale, same two-plane combine and reduction
-/// trees). Bit-exactness of the substitution: at slot `write_idx` every
-/// threadgroup substitutes the just-computed row from threadgroup memory —
-/// the values pass through the same `bfloat` storage rounding the separate
-/// kernels would have written to and re-read from the cache, so scores and
-/// output are bit-identical, and no threadgroup ever reads slot
-/// `write_idx` from device memory, making the concurrent slot write
-/// race-free by construction (its only consumers are future steps, ordered
-/// by command-buffer sequencing). Removes 3 dispatches + their encoder-wide
-/// barriers per sliding layer per decode step.
 let lagunaFusedSlidingAttentionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_ATTN"] != "0"
 
-private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
-    name: "laguna_sliding_fused_attn_ring_v1",
-    inputNames: [
-        "raw_queries", "raw_keys", "raw_values",
+/// Feed the contiguous decode QKV result directly to fused attention, avoiding
+/// three slice/view graph nodes and binding the producer row only once.
+private let lagunaDirectPackedQKVAttentionEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_DIRECT_PACKED_QKV_ATTN"] != "0"
+
+private func makeLagunaSlidingFusedAttentionKernel(
+    name: String, keyOffset: Int, valueOffset: Int
+) -> MLXFast.MLXFastKernel {
+    let packed = keyOffset != 0
+    let queryBase = packed ? "raw_qkv" : "raw_queries"
+    let keyBase = packed ? "raw_qkv + \(keyOffset)" : "raw_keys"
+    let valueBase = packed ? "raw_qkv + \(valueOffset)" : "raw_values"
+    let qkvInputs = packed ? ["raw_qkv"] : ["raw_queries", "raw_keys", "raw_values"]
+    return MLXFast.metalKernel(
+    name: name,
+    inputNames: qkvInputs + [
         "query_weight", "key_weight", "angles",
         "k_cache", "v_cache", "params", "scale_arr",
     ],
@@ -1373,9 +1263,9 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
         // q0/q1/k; simdgroup 3 copies the raw V row (stored unmodified).
         if (sg < 3) {
             const device bfloat* input =
-                sg == 0 ? raw_queries + head0 * head_dim
-                : sg == 1 ? raw_queries + head1 * head_dim
-                          : raw_keys + kv_head * head_dim;
+                sg == 0 ? \(queryBase) + head0 * head_dim
+                : sg == 1 ? \(queryBase) + head1 * head_dim
+                          : \(keyBase) + kv_head * head_dim;
             const device bfloat* weight =
                 sg == 2 ? key_weight : query_weight;
             threadgroup bfloat* outrow =
@@ -1412,7 +1302,7 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
                 }
             }
         } else if (sg == 3) {
-            const device bfloat* vin = raw_values + kv_head * head_dim;
+            const device bfloat* vin = \(valueBase) + kv_head * head_dim;
             for (uint i = lane; i < head_dim; i += 32) {
                 tg_v[i] = vin[i];
             }
@@ -1699,6 +1589,17 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
         """,
     ensureRowContiguous: true
 )
+}
+
+private let lagunaSlidingFusedAttentionKernel =
+    makeLagunaSlidingFusedAttentionKernel(
+        name: "laguna_sliding_fused_attn_ring_v1", keyOffset: 0, valueOffset: 0)
+private let lagunaSlidingFusedAttentionPackedQKVKernel =
+    makeLagunaSlidingFusedAttentionKernel(
+        name: "laguna_sliding_fused_attn_ring_packed_qkv_v1",
+        keyOffset: LagunaConstants.slidingAttentionHeads * LagunaConstants.headDim,
+        valueOffset: (LagunaConstants.slidingAttentionHeads
+            + LagunaConstants.numKeyValueHeads) * LagunaConstants.headDim)
 
 /// Fused decode attention for a sliding layer in the steady ring regime.
 /// Returns `[1, heads, 1, headDim]` attended output; the caller advances the
@@ -1752,6 +1653,53 @@ func lagunaSlidingFusedAttention(
     )[0]
 }
 
+/// Packed-QKV twin of the steady-ring fused attention path. The decode QKV
+/// producer already writes `[Q, K, V]` into one contiguous BF16 row, so this
+/// avoids three slice/view nodes and binds that row only once.
+private func lagunaSlidingFusedAttentionPackedQKV(
+    rawQKV: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray,
+    cacheKeys: MLXArray,
+    cacheValues: MLXArray,
+    writeIdx: Int,
+    scale: MLXArray
+) -> MLXArray {
+    let heads = LagunaConstants.slidingAttentionHeads
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    let window = LagunaConstants.slidingWindow
+    precondition(rawQKV.dtype == .bfloat16)
+    precondition(rawQKV.shape == [
+        1, 1, (heads + 2 * kvHeads) * LagunaConstants.headDim,
+    ])
+    precondition(queryWeight.dtype == .bfloat16)
+    precondition(keyWeight.dtype == .bfloat16)
+    precondition(queryWeight.shape == [LagunaConstants.headDim])
+    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(angles.dtype == .float32)
+    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim])
+    precondition(cacheKeys.dtype == .bfloat16)
+    precondition(cacheValues.dtype == .bfloat16)
+    precondition(cacheKeys.shape == [1, kvHeads, window, LagunaConstants.headDim])
+    precondition(cacheValues.shape == [1, kvHeads, window, LagunaConstants.headDim])
+    precondition(writeIdx >= 0 && writeIdx < window)
+    precondition(scale.dtype == .float32 && scale.size == 1)
+    lagunaTrace("sliding packed QKV fused attention")
+    let params = lagunaParamsAtlasEnabled
+        ? lagunaRingIdxAtlas[writeIdx] : MLXArray([UInt32(writeIdx)])
+    return lagunaSlidingFusedAttentionPackedQKVKernel(
+        [
+            rawQKV, queryWeight, keyWeight, angles,
+            cacheKeys, cacheValues, params, scale,
+        ],
+        grid: ((heads / 2) * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 /// Pre-materialized 4-byte uniform buffers for every possible sliding ring
 /// write index (2 KB total, built on first touch during untimed warmup):
 /// replaces a fresh 1-element MLXArray allocation per sliding-attention call
@@ -1776,15 +1724,6 @@ private var lagunaRingIdxAtlas: [MLXArray] { LagunaRingIdxAtlasStore.entries }
 let lagunaParamsAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PARAMS_ATLAS"] != "0"
 
-/// `DARKBLOOM_FUSED_FULL_ATTN` (default on; set "0" to disable): decode
-/// fused attention for the ten full-attention layers once the cache backing
-/// has spare capacity (from the second decode step on; the first step's
-/// stock growth concat is kept). Same design as the sliding twin above —
-/// ONE dispatch replaces [QK-norm+YaRN kernel] -> [K slice-assign] ->
-/// [V slice-assign] -> [sdpa_vector] — with the full-attention phase-1 text
-/// (textual replica of `laguna_full_qk_norm_yarn_bf16_128_v4`: 64-dim
-/// partial rotary, folded mscale roundings, passthrough tail) and the
-/// pair path's runtime-length loop + single-row tail at gqa_factor 6.
 let lagunaFusedFullAttentionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_FULL_ATTN"] != "0"
 
@@ -1802,10 +1741,17 @@ let lagunaFusedFullAttentionKernelWarmupEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_FULL_ATTN_KERNEL_WARMUP"] != "0"
 
-private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
-    name: "laguna_full_fused_attn_grow_v1",
-    inputNames: [
-        "raw_queries", "raw_keys", "raw_values",
+private func makeLagunaFullFusedAttentionKernel(
+    name: String, keyOffset: Int, valueOffset: Int
+) -> MLXFast.MLXFastKernel {
+    let packed = keyOffset != 0
+    let queryBase = packed ? "raw_qkv" : "raw_queries"
+    let keyBase = packed ? "raw_qkv + \(keyOffset)" : "raw_keys"
+    let valueBase = packed ? "raw_qkv + \(valueOffset)" : "raw_values"
+    let qkvInputs = packed ? ["raw_qkv"] : ["raw_queries", "raw_keys", "raw_values"]
+    return MLXFast.metalKernel(
+    name: name,
+    inputNames: qkvInputs + [
         "query_weight", "key_weight", "angles",
         "k_cache", "v_cache", "params", "scale_arr",
     ],
@@ -1843,9 +1789,9 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
         // retargeted at threadgroup memory.
         if (sg < 3) {
             const device bfloat* input =
-                sg == 0 ? raw_queries + head0 * head_dim
-                : sg == 1 ? raw_queries + head1 * head_dim
-                          : raw_keys + kv_head * head_dim;
+                sg == 0 ? \(queryBase) + head0 * head_dim
+                : sg == 1 ? \(queryBase) + head1 * head_dim
+                          : \(keyBase) + kv_head * head_dim;
             const device bfloat* weight =
                 sg == 2 ? key_weight : query_weight;
             threadgroup bfloat* outrow =
@@ -1889,7 +1835,7 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
                 }
             }
         } else if (sg == 3) {
-            const device bfloat* vin = raw_values + kv_head * head_dim;
+            const device bfloat* vin = \(valueBase) + kv_head * head_dim;
             for (uint i = lane; i < head_dim; i += 32) {
                 tg_v[i] = vin[i];
             }
@@ -2210,6 +2156,17 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
         """,
     ensureRowContiguous: true
 )
+}
+
+private let lagunaFullFusedAttentionKernel =
+    makeLagunaFullFusedAttentionKernel(
+        name: "laguna_full_fused_attn_grow_v1", keyOffset: 0, valueOffset: 0)
+private let lagunaFullFusedAttentionPackedQKVKernel =
+    makeLagunaFullFusedAttentionKernel(
+        name: "laguna_full_fused_attn_grow_packed_qkv_v1",
+        keyOffset: LagunaConstants.fullAttentionHeads * LagunaConstants.headDim,
+        valueOffset: (LagunaConstants.fullAttentionHeads
+            + LagunaConstants.numKeyValueHeads) * LagunaConstants.headDim)
 
 /// Fused decode attention for a full-attention layer with spare backing
 /// capacity. Returns `[1, heads, 1, headDim]`; the caller advances the
@@ -2264,6 +2221,52 @@ func lagunaFullFusedAttention(
     )[0]
 }
 
+/// Packed-QKV twin of the full-attention fused decode path.
+private func lagunaFullFusedAttentionPackedQKV(
+    rawQKV: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray,
+    cacheKeys: MLXArray,
+    cacheValues: MLXArray,
+    writeIdx: Int,
+    scale: MLXArray
+) -> MLXArray {
+    let heads = LagunaConstants.fullAttentionHeads
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    let capacity = cacheKeys.dim(2)
+    precondition(rawQKV.dtype == .bfloat16)
+    precondition(rawQKV.shape == [
+        1, 1, (heads + 2 * kvHeads) * LagunaConstants.headDim,
+    ])
+    precondition(queryWeight.dtype == .bfloat16)
+    precondition(keyWeight.dtype == .bfloat16)
+    precondition(queryWeight.shape == [LagunaConstants.headDim])
+    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(angles.dtype == .float32)
+    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim / 2])
+    precondition(cacheKeys.dtype == .bfloat16)
+    precondition(cacheValues.dtype == .bfloat16)
+    precondition(cacheKeys.shape == [1, kvHeads, capacity, LagunaConstants.headDim])
+    precondition(cacheValues.shape == [1, kvHeads, capacity, LagunaConstants.headDim])
+    precondition(writeIdx >= 0 && writeIdx < capacity)
+    precondition(scale.dtype == .float32 && scale.size == 1)
+    lagunaTrace("full packed QKV fused attention")
+    let params = MLXArray([
+        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
+    ])
+    return lagunaFullFusedAttentionPackedQKVKernel(
+        [
+            rawQKV, queryWeight, keyWeight, angles,
+            cacheKeys, cacheValues, params, scale,
+        ],
+        grid: ((heads / 2) * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 /// Force creation of `lagunaFullFusedAttentionKernel`'s pipeline state with
 /// production Q/K/V geometry and a minimal two-row cache. Every tensor is
 /// deterministic, input-independent, evaluated once, and released before the
@@ -2299,33 +2302,31 @@ func lagunaWarmFullFusedAttentionKernel() {
         writeIdx: 1,
         scale: scale
     ))
+    guard lagunaDirectPackedQKVAttentionEnabled else { return }
+
+    let packedFull = MLXArray.zeros(
+        [1, 1, (heads + 2 * kvHeads) * headDim], dtype: .bfloat16)
+    eval(lagunaFullFusedAttentionPackedQKV(
+        rawQKV: packedFull,
+        queryWeight: queryWeight, keyWeight: keyWeight, angles: angles,
+        cacheKeys: cacheKeys, cacheValues: cacheValues, writeIdx: 1,
+        scale: scale))
+
+    let slidingHeads = LagunaConstants.slidingAttentionHeads
+    let packedSliding = MLXArray.zeros(
+        [1, 1, (slidingHeads + 2 * kvHeads) * headDim], dtype: .bfloat16)
+    let slidingAngles = MLXArray.zeros(
+        [1, 1, 1, headDim], dtype: .float32)
+    let slidingKeys = MLXArray.zeros(
+        [1, kvHeads, LagunaConstants.slidingWindow, headDim], dtype: .bfloat16)
+    let slidingValues = MLXArray.zeros(
+        [1, kvHeads, LagunaConstants.slidingWindow, headDim], dtype: .bfloat16)
+    eval(lagunaSlidingFusedAttentionPackedQKV(
+        rawQKV: packedSliding, queryWeight: queryWeight,
+        keyWeight: keyWeight, angles: slidingAngles, cacheKeys: slidingKeys,
+        cacheValues: slidingValues, writeIdx: 0, scale: scale))
 }
 
-/// Multi-token sliding-layer Q/K RMSNorm + plain RoPE fusion. One dispatch
-/// replaces the stock four (`rms_single_row` q, `rms_single_row` k,
-/// `rope_bfloat16` q, `rope_bfloat16` k) for a whole prefill layer and
-/// writes both outputs directly in the `[1, heads, L, 128]` layout SDPA and
-/// the cache update consume, so the transposed-view round trip is gone too.
-///
-/// Grid mapping: one threadgroup of 128 threads (four simdgroups) per
-/// (head-block, token); each simdgroup owns one (token, head) row, exactly
-/// the row `rms_single_row` gets at axis_size 128 (N_READS 4, one 32-lane
-/// simdgroup per row). `threadgroups_per_grid.y` is L, so no shape constant
-/// is baked and any L dispatches the same compiled kernel.
-///
-/// Exactness, link for link with the stock chain:
-///  * The norm replicates `rms_single_row` at axis_size 128: lane `l` owns
-///    the contiguous block `[4l, 4l+4)`, squares in index order, `simd_sum`
-///    (the stock single-simdgroup threadgroup then sums `local_sums`, which
-///    adds only zeros), `precise::rsqrt(acc / 128 + 1e-6)`, and the BF16
-///    rounding inside `w[i] * bfloat(x[i] * inv)` — the same expression the
-///    shipped decode kernels use against the same stock kernel.
-///  * The rotation replicates `rope_impl<T, _, 4>` (`rope_bfloat16`,
-///    non-traditional, dims 128): pair `p` couples `p` and `p + 64`, and the
-///    cos/sin floats are read from the probe-seed atlas row for the token's
-///    absolute position — values the stock RoPE kernel computed, not a
-///    re-derivation. The decode twin (`laguna_sliding_qk_norm_rope_bf16_128_v1`)
-///    consumes the same table with the same expression.
 private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
     name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_v2",
     inputNames: [
@@ -2499,20 +2500,6 @@ private let lagunaPrefillSlidingQKNormRoPEH1Kernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// Multi-token full-attention twin: per-head Q/K RMSNorm + partial YaRN
-/// RoPE (rotary half 64, mscale on the rotary inputs, tail passes through).
-/// One dispatch replaces the stock six (`rms_single_row` ×2, the general
-/// copy each partial RoPE materializes first ×2, `rope_freqs_bfloat16` ×2).
-///
-/// Exactness mirrors the shipped decode kernel
-/// (`laguna_full_qk_norm_yarn_bf16_128_v4`) against the same stock chain:
-/// the same rms_single_row reproduction; the same mscale round-trip
-/// `float(bfloat(x * bfloat(mscale)))` the stock
-/// `rope_input_with_mscale<bfloat16, true>` applies under the negative-scale
-/// sentinel; the same probe-seed angle row (the FP32 probe recovers
-/// `fl(fl(1/mscale) * mscale) == 1.0f`, so the atlas carries pure cos/sin);
-/// and the tail elements 64…127 written verbatim, matching the values the
-/// stock pre-RoPE copy leaves behind.
 private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
     name: "laguna_prefill_full_qk_norm_yarn_bf16_128_v2",
     inputNames: [
@@ -3425,40 +3412,6 @@ func lagunaFusedNormQKVProjection(
     return (outputs[0], outputs[1], outputs[2], outputs[3], true)
 }
 
-/// Decode-only fusion of the per-head attention gate with the output
-/// projection. The stock decode path is two dispatches: one compiled
-/// elementwise kernel that softplus-gates the attention output, and one GEMV
-/// over `o_proj`. This kernel folds the gate into the GEMV's vector loads, so
-/// the 8192-wide gated row is never materialized and the layer spends one
-/// dispatch instead of two.
-///
-/// Exactness. The fused QKV producer has already reproduced
-/// `softplus(gate.asType(.float32)).asType(.bfloat16)` after preserving the
-/// projection's intermediate BF16 rounding boundary. This consumer applies
-/// the same BF16 gate product as stock. The projection reproduces MLX's
-/// `gemv` for this shape exactly: out_vec 2048 and in_vec 8192 select BM 4,
-/// BN 1, SM 1, SN 32, TM 4, TN 4, so a thread owns four output rows, lane `l`
-/// covers input columns `4l + 128i`, products accumulate in `i` then `tn`
-/// order in FP32, and the simdgroup reduces with the same
-/// `simd_shuffle_down` ladder (16, 8, 4, 2, 1) before lane 0 rounds once to
-/// BF16. Because column `4l + 128i` always lies inside head `i`, the gate a
-/// thread needs at step `i` is simply `gate_values[i]`.
-/// Depth-2 block unroll, `notes/54` §11: L5 is the only large kernel whose
-/// in-flight budget is small enough for memory-level parallelism to bind at
-/// all. It holds 512 KB against `lm_head`'s 1280 KB, and at the top of the
-/// measured 287–947 ns latency bracket 512 KB supports 554 GB/s against L5's
-/// measured 553.8. Hoisting two blocks' loads takes that to 1.05 MB, which
-/// clears the 596.1 GB/s fabric ceiling under every calibration in the
-/// bracket. If L5 is fabric-bound instead this is flat — a result, not a
-/// failure. L5's 0.40 waves are what make the ~20 extra registers free: at
-/// 3.2 threadgroups per core against a capacity of 8 there is no occupancy to
-/// lose (`notes/46` §6).
-///
-/// **LOADS ONLY.** `result[row]` stays one accumulator per row, stepped in
-/// strict `(block, i)` order — block 0's four products then block 1's, into
-/// the same register. Per-unroll partial sums combined at the end would
-/// regroup the FP32 chain into a tree and forfeit bit-exactness while passing
-/// every local check. `blocks == heads` is 64 or 48, both even, so no tail.
 private func lagunaGatedOutputProjectionSource(
     heads: Int, unroll: Int, compact: Bool = false
 ) -> String {
@@ -3714,25 +3667,6 @@ func lagunaGatedOutputProjection(
     )[0]
 }
 
-/// Decode-only producer/consumer fusion for the per-head output gate. The
-/// stock chain between the gate projection and the output projection is four
-/// dispatches — BF16→FP32 cast, `LogAddExp(x, 0)`, FP32→BF16 cast, and the
-/// broadcast product against the attention row — all over a 48/64-element
-/// logit vector and a 6144/8192-element row. This kernel performs the same
-/// four steps in one dispatch, reproducing each rounding boundary exactly:
-///
-/// - the FP32 softplus is MLX's `LogAddExp<float>` verbatim (same
-///   `maxval + log1p(exp(minval - maxval))` form, same NaN/inf guards, and
-///   the same `log1p`: MLX's own Goldberg implementation from its metal
-///   utils preamble, which is also what the eager softplus dispatch uses);
-/// - the gate is rounded to BF16 exactly where the stock `.asType(.bfloat16)`
-///   rounds it, and the product rounds once to BF16 exactly where MLX's BF16
-///   binary multiply rounds `float(bfloat(float(values[i]) * gate))`.
-///
-/// Every output element is therefore bit-identical to the four-dispatch
-/// chain; the only change is dispatch count. One thread per output element;
-/// the softplus is recomputed per element of a head, which is the same FP32
-/// op stream the standalone softplus dispatch would run once per head.
 private func lagunaGateProductSoftplusSource(heads: Int) -> String {
     """
     constexpr int HEAD_DIM = \(LagunaConstants.headDim);
@@ -4397,20 +4331,6 @@ func lagunaGatedAffineOProjNVFP4(
 private let lagunaTailNVFP4ScaleFoldEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_TAIL_NVFP4_SCALE_FOLD"] != "0"
 
-/// `DARKBLOOM_QKV_TAIL_FOLD` (default ON for the ranked run; set "0" to restore
-/// the frontier q/k/v QMV): ports the two exactness-proven ALU
-/// micro-elisions the o_proj (`lagunaGatedAffineOProjNVFP4Source`) and MoE
-/// (`lagunaSharedSwiGLUQMVHeader`) NVFP4 QMVs already ship into the decode
-/// q/k/v NVFP4 tail QMV (`lagunaDecodeNVFP4QKVR1Source` +
-/// `lagunaTailNVFP4QMVHeader`): (1) seed elision -- assign the first four-term
-/// product group instead of adding it to a dead `+0.0f` seed; and (2) scale
-/// defer -- return the RAW half from `laguna_tail_nvfp4_scale` and apply the
-/// folded `2^22` once per output row at the R1 epilogue instead of once per
-/// 16-value group. Both are pure instruction-count reductions: identical bytes,
-/// loads, geometry and reduction order (the R1 one-row-per-simdgroup schedule
-/// and the `simd_sum` order are untouched). When OFF the generated kernel
-/// source, name and dispatch are byte-identical to the frontier q/k/v QMV;
-/// ranked correctness is the CXXC exact-token gate.
 private let lagunaTailNVFP4QKVTailFoldEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_QKV_TAIL_FOLD"] != "0"
 
@@ -4537,11 +4457,6 @@ private let lagunaTailNVFP4QMVHeader = """
     }
     """
 
-/// Decode-only, static-shape R1 schedule for the live group-16 NVFP4 QKV
-/// bank. The generated QMV gives each SIMD group four output rows. This twin
-/// keeps every row's K order, FP32 accumulator, simd reduction and BF16 cast
-/// intact while giving each SIMD one row, matching the M5-positive routed and
-/// shared expert schedules. Multi-token prefill cannot pass the shape guard.
 private let lagunaDecodeNVFP4QKVR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_NVFP4_QKV_R1"] != "0"
 
@@ -5448,6 +5363,7 @@ final class LagunaRuntimeAttention: Module {
                 queries: MLXArray, keys: MLXArray, values: MLXArray,
                 gateValues: MLXArray, gateActivated: Bool
             )?
+        var directPackedQKV: MLXArray?
         if lagunaFusedQKVProjectionEnabled, _fusedQKVWeight == nil,
             B == 1, L == 1,
             headDim == LagunaConstants.headDim,
@@ -5521,6 +5437,11 @@ final class LagunaRuntimeAttention: Module {
                         bits: fusedAffine.bits,
                         mode: fusedAffine.mode
                     )
+                if lagunaDirectPackedQKVAttentionEnabled,
+                    decodeNVFP4QKVR1 != nil
+                {
+                    directPackedQKV = qkv
+                }
                 let queryDim = nHeads * headDim
                 let kvDim = nKVHeads * headDim
                 let gateStart = queryDim + 2 * kvDim
@@ -5586,13 +5507,18 @@ final class LagunaRuntimeAttention: Module {
                     gateProjectionActivated || deferGateActivation
                     ? gateLogits
                     : softplus(gateLogits.asType(.float32)).asType(.bfloat16)
-                fusedNormQKV = (
-                    qkv[.ellipsis, 0 ..< queryDim],
-                    qkv[.ellipsis, queryDim ..< (queryDim + kvDim)],
-                    qkv[.ellipsis, (queryDim + kvDim) ..< gateStart],
-                    gateValues,
-                    gateProjectionActivated || !deferGateActivation
-                )
+                if directPackedQKV != nil {
+                    fusedNormQKV = (
+                        qkv, qkv, qkv, gateValues,
+                        gateProjectionActivated || !deferGateActivation)
+                } else {
+                    fusedNormQKV = (
+                        qkv[.ellipsis, 0 ..< queryDim],
+                        qkv[.ellipsis, queryDim ..< (queryDim + kvDim)],
+                        qkv[.ellipsis, (queryDim + kvDim) ..< gateStart],
+                        gateValues,
+                        gateProjectionActivated || !deferGateActivation)
+                }
             } else {
                 fusedNormQKV = lagunaFusedNormQKVProjection(
                     residual: input,
@@ -5649,6 +5575,64 @@ final class LagunaRuntimeAttention: Module {
             values = wv(normalizedInput)
         }
 
+        var fusedAttended: MLXArray?
+        if let packed = directPackedQKV,
+            lagunaFusedSlidingAttentionEnabled, isSliding,
+            nHeads == LagunaConstants.slidingAttentionHeads,
+            nKVHeads == LagunaConstants.numKeyValueHeads,
+            headDim == LagunaConstants.headDim,
+            packed.dtype == .bfloat16,
+            packed.shape == [1, 1, (nHeads + 2 * nKVHeads) * headDim],
+            qNorm.weight.dtype == .bfloat16,
+            kNorm.weight.dtype == .bfloat16,
+            let angles = qkRoPEAngles,
+            angles.dtype == .float32,
+            angles.shape == [1, 1, 1, headDim],
+            let rotating = cache as? RotatingKVCache,
+            rotating.maxSize == LagunaConstants.slidingWindow,
+            let ring = rotating.fusedRingPrepare()
+        {
+            fusedAttended = lagunaSlidingFusedAttentionPackedQKV(
+                rawQKV: packed,
+                queryWeight: qNorm.weight, keyWeight: kNorm.weight,
+                angles: angles, cacheKeys: ring.keys, cacheValues: ring.values,
+                writeIdx: ring.writeIdx, scale: _fusedAttnScale)
+            rotating.fusedRingAdvance()
+        } else if let packed = directPackedQKV,
+            lagunaFusedFullAttentionEnabled, !isSliding,
+            nHeads == LagunaConstants.fullAttentionHeads,
+            nKVHeads == LagunaConstants.numKeyValueHeads,
+            headDim == LagunaConstants.headDim,
+            packed.dtype == .bfloat16,
+            packed.shape == [1, 1, (nHeads + 2 * nKVHeads) * headDim],
+            qNorm.weight.dtype == .bfloat16,
+            kNorm.weight.dtype == .bfloat16,
+            let angles = qkRoPEAngles,
+            angles.dtype == .float32,
+            angles.shape == [1, 1, 1, headDim / 2],
+            let simple = cache as? KVCacheSimple,
+            let append = simple.fusedAppendPrepare()
+        {
+            fusedAttended = lagunaFullFusedAttentionPackedQKV(
+                rawQKV: packed,
+                queryWeight: qNorm.weight, keyWeight: kNorm.weight,
+                angles: angles, cacheKeys: append.keys,
+                cacheValues: append.values, writeIdx: append.writeIdx,
+                scale: _fusedAttnScale)
+            simple.fusedAppendAdvance()
+        }
+
+        if fusedAttended == nil {
+            var qkNormRoPEFused = false
+            if let packed = directPackedQKV {
+                let queryDim = nHeads * headDim
+                let kvDim = nKVHeads * headDim
+                queries = packed[.ellipsis, 0 ..< queryDim]
+                keys = packed[.ellipsis, queryDim ..< (queryDim + kvDim)]
+                values = packed[
+                    .ellipsis, (queryDim + kvDim) ..< (queryDim + 2 * kvDim)]
+            }
+
         let fusedQKNormShapesMatch =
             B == 1 && L == 1 &&
             nKVHeads == LagunaConstants.numKeyValueHeads &&
@@ -5702,8 +5686,6 @@ final class LagunaRuntimeAttention: Module {
             nHeads == LagunaConstants.fullAttentionHeads &&
             qkRoPEAngles?.shape == [1, 1, lagunaRoPEAngleAtlasLength, headDim / 2]
 
-        var qkNormRoPEFused = false
-        var fusedAttended: MLXArray?
         if lagunaFusedSlidingAttentionEnabled,
             useFusedSlidingQKNormRoPE,
             let fusedAngles = qkRoPEAngles,
@@ -5820,6 +5802,7 @@ final class LagunaRuntimeAttention: Module {
         if !qkNormRoPEFused {
             queries = applyRotaryPosition(rope, to: queries, cache: cache)
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        }
         }
 
         let attended =
@@ -10500,6 +10483,10 @@ final class LagunaRuntimeModelInner: Module {
     let _slidingRoPEAngleSeed: MLXArray
     var _fullRoPEAngleAtlas: MLXArray?
     var _slidingRoPEAngleAtlas: MLXArray?
+    var _fullRoPEAnglePages: [MLXArray?] = Array(
+        repeating: nil, count: lagunaRoPEAngleAtlasPageCount)
+    var _slidingRoPEAnglePages: [MLXArray?] = Array(
+        repeating: nil, count: lagunaRoPEAngleAtlasPageCount)
 
     init(_ config: LagunaConfig) {
         precondition(config.vocabSize > 0)
@@ -10572,6 +10559,44 @@ final class LagunaRuntimeModelInner: Module {
         _fullRoPEAngleAtlas = fullAtlas
         _slidingRoPEAngleAtlas = slidingAtlas
         return [fullAtlas, slidingAtlas]
+    }
+
+    /// Lazily materialize only post-page-zero positions. Ranked 512-token
+    /// prefill and decode retain the original page-zero fields and fast path.
+    private func longRoPEAnglePage(position: Int, length: Int) -> (
+        full: MLXArray, sliding: MLXArray, localOffset: Int
+    )? {
+        guard position >= lagunaRoPEAngleAtlasLength, length > 0,
+            position < lagunaRoPEAngleAtlasCoverage,
+            length <= lagunaRoPEAngleAtlasCoverage - position
+        else { return nil }
+        let page = position / lagunaRoPEAngleAtlasLength
+        let localOffset = position % lagunaRoPEAngleAtlasLength
+        guard page < lagunaRoPEAngleAtlasPageCount,
+            localOffset + length <= lagunaRoPEAngleAtlasLength
+        else { return nil }
+        if let full = _fullRoPEAnglePages[page],
+            let sliding = _slidingRoPEAnglePages[page]
+        {
+            return (full, sliding, localOffset)
+        }
+        let fullSeed = broadcast(
+            _fullRoPEAngleSeed,
+            to: [
+                1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim / 2,
+            ])
+        let slidingSeed = broadcast(
+            _slidingRoPEAngleSeed,
+            to: [
+                1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim,
+            ])
+        let base = page * lagunaRoPEAngleAtlasLength
+        let full = layers[fullAttentionIdx].selfAttn.rope(fullSeed, offset: base)
+        let sliding = layers[slidingAttentionIdx].selfAttn.rope(
+            slidingSeed, offset: base)
+        _fullRoPEAnglePages[page] = full
+        _slidingRoPEAnglePages[page] = sliding
+        return (full, sliding, localOffset)
     }
 
     /// Return a host position only for the exact direct-decode cache pair.
@@ -10700,6 +10725,12 @@ final class LagunaRuntimeModelInner: Module {
                         fullRoPEAngles = fullAtlas
                         slidingRoPEAngles = slidingAtlas
                         qkRoPEOffsets = MLXArray([Int32(offset)])
+                    } else if let page = longRoPEAnglePage(
+                        position: offset, length: length)
+                    {
+                        fullRoPEAngles = page.full
+                        slidingRoPEAngles = page.sliding
+                        qkRoPEOffsets = MLXArray([Int32(page.localOffset)])
                     }
                 }
             }
@@ -10824,6 +10855,28 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        // Chunked long-context prefill (see `lagunaPrefillChunkEnabled`):
+        // mirror the stock `LLMModel.prepare` slice loop for direct callers
+        // so a [1, L] prompt with L > 512 is fed in bounded slices with the
+        // cache evaluated (and the sliding caches trimmed) between slices.
+        // Single-token decode and ranked-window prefills (L <= 512) never
+        // enter this loop, so the scored path is bit-identical with or
+        // without the flag.
+        if lagunaPrefillChunkEnabled,
+            let cache,
+            inputs.ndim == 2,
+            inputs.dim(0) == 1,
+            inputs.dim(1) > lagunaPrefillChunkSize
+        {
+            var remaining = inputs
+            while remaining.dim(1) > lagunaPrefillChunkSize {
+                _ = callAsFunction(
+                    remaining[0..., ..<lagunaPrefillChunkSize], cache: cache)
+                eval(cache)
+                remaining = remaining[0..., lagunaPrefillChunkSize...]
+            }
+            return callAsFunction(remaining, cache: cache)
+        }
         let fullHidden = model(inputs, cache: cache)
         // Every consumer of multi-token logits reads only the LAST
         // position's row. Slice before the row-independent final RMSNorm and
