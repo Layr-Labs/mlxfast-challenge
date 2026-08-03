@@ -176,6 +176,10 @@ using namespace metal;
 
 #define MLX_MTL_CONST static constant constexpr const
 
+#ifndef DARKBLOOM_DENSE_AHOIST
+#define DARKBLOOM_DENSE_AHOIST 1
+#endif
+
 MLX_MTL_CONST int SIMD_SIZE = 32;
 MLX_MTL_CONST int QUAD_SIZE = 4;
 
@@ -819,6 +823,45 @@ METAL_FUNC void fp_qmm_t_impl(
 
   dispatch_bool(aligned_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
+#if DARKBLOOM_DENSE_AHOIST
+      for (int k = 0; k < kernel_K; k += BK) {
+        NAXTile<T, TM, TK> Atile_h[BK / SK];
+        STEEL_PRAGMA_UNROLL
+        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          if constexpr (kAlignedM.value) {
+            Atile_h[kk1 / SK].load(x + kk1, kernel_K);
+          } else {
+            Atile_h[kk1 / SK].load_rows(x + kk1, kernel_K, sgp_sm);
+          }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (kAlignedN.value) {
+          loader_w.load_unsafe();
+        } else {
+          loader_w.load_safe(short2(BK, tgp_bn));
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        STEEL_PRAGMA_NO_UNROLL
+        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          NAXTile<Wtype, TN, TK> Btile;
+
+          Btile.template load<Wtype, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+          tile_matmad_nax(
+              Dtile,
+              Atile_h[kk1 / SK],
+              metal::bool_constant<transpose_a>{},
+              Btile,
+              metal::bool_constant<transpose_b>{});
+        }
+
+        x += BK;
+        loader_w.next();
+      }
+#else
       for (int k = 0; k < kernel_K; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if constexpr (kAlignedN.value) {
@@ -858,6 +901,7 @@ METAL_FUNC void fp_qmm_t_impl(
         x += BK;
         loader_w.next();
       }
+#endif
 
       // Store results to device memory
       threadgroup_barrier(mem_flags::mem_threadgroup);
