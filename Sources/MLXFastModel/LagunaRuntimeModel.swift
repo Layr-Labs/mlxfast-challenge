@@ -923,8 +923,10 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
         thread float router_result[rows_per_thread] = {\(zeros)};
         \(accumulate)
 
-        for (uint r = 0; r < rows_per_thread; ++r) {
-            for (ushort delta = 16; delta >= 1; delta >>= 1) {
+        // Loop interchange: each row's delta sequence (16,8,4,2,1) and +=
+        // order are unchanged; the independent chains interleave.
+        for (ushort delta = 16; delta >= 1; delta >>= 1) {
+            for (uint r = 0; r < rows_per_thread; ++r) {
                 router_result[r] +=
                     metal::simd_shuffle_down(router_result[r], delta);
             }
@@ -1502,8 +1504,27 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
             pair_score1 += pair_q1[2] * pipe_ka[2];
             pair_score0 += pair_q0[3] * pipe_ka[3];
             pair_score1 += pair_q1[3] * pipe_ka[3];
-            pair_score0 = simd_sum(pair_score0);
-            pair_score1 = simd_sum(pair_score1);
+            U pipeb_score0 = 0;
+            U pipeb_score1 = 0;
+            pipeb_score0 += pair_q0[0] * pipe_kb[0];
+            pipeb_score1 += pair_q1[0] * pipe_kb[0];
+            pipeb_score0 += pair_q0[1] * pipe_kb[1];
+            pipeb_score1 += pair_q1[1] * pipe_kb[1];
+            pipeb_score0 += pair_q0[2] * pipe_kb[2];
+            pipeb_score1 += pair_q1[2] * pipe_kb[2];
+            pipeb_score0 += pair_q0[3] * pipe_kb[3];
+            pipeb_score1 += pair_q1[3] * pipe_kb[3];
+            // One packed componentwise simd_sum for both planes: each
+            // component keeps its own butterfly; updates below unchanged.
+            {
+                const vec<U, 4> packed_scores = simd_sum(
+                    vec<U, 4>(pair_score0, pair_score1,
+                              pipeb_score0, pipeb_score1));
+                pair_score0 = packed_scores.x;
+                pair_score1 = packed_scores.y;
+                pipeb_score0 = packed_scores.z;
+                pipeb_score1 = packed_scores.w;
+            }
 
             U pair_new_max0 = metal::max(pair_max0, pair_score0);
             U pair_new_max1 = metal::max(pair_max1, pair_score1);
@@ -1527,19 +1548,6 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
             pair_o1[2] = pair_o1[2] * pair_factor1 + pair_exp1 * pipe_va2;
             pair_o0[3] = pair_o0[3] * pair_factor0 + pair_exp0 * pipe_va3;
             pair_o1[3] = pair_o1[3] * pair_factor1 + pair_exp1 * pipe_va3;
-
-            U pipeb_score0 = 0;
-            U pipeb_score1 = 0;
-            pipeb_score0 += pair_q0[0] * pipe_kb[0];
-            pipeb_score1 += pair_q1[0] * pipe_kb[0];
-            pipeb_score0 += pair_q0[1] * pipe_kb[1];
-            pipeb_score1 += pair_q1[1] * pipe_kb[1];
-            pipeb_score0 += pair_q0[2] * pipe_kb[2];
-            pipeb_score1 += pair_q1[2] * pipe_kb[2];
-            pipeb_score0 += pair_q0[3] * pipe_kb[3];
-            pipeb_score1 += pair_q1[3] * pipe_kb[3];
-            pipeb_score0 = simd_sum(pipeb_score0);
-            pipeb_score1 = simd_sum(pipeb_score1);
 
             U pipeb_new_max0 = metal::max(pair_max0, pipeb_score0);
             U pipeb_new_max1 = metal::max(pair_max1, pipeb_score1);
@@ -1975,8 +1983,27 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
             pair_score1 += pair_q1[2] * pipe_ka[2];
             pair_score0 += pair_q0[3] * pipe_ka[3];
             pair_score1 += pair_q1[3] * pipe_ka[3];
-            pair_score0 = simd_sum(pair_score0);
-            pair_score1 = simd_sum(pair_score1);
+            U pipeb_score0 = 0;
+            U pipeb_score1 = 0;
+            pipeb_score0 += pair_q0[0] * pipe_kb[0];
+            pipeb_score1 += pair_q1[0] * pipe_kb[0];
+            pipeb_score0 += pair_q0[1] * pipe_kb[1];
+            pipeb_score1 += pair_q1[1] * pipe_kb[1];
+            pipeb_score0 += pair_q0[2] * pipe_kb[2];
+            pipeb_score1 += pair_q1[2] * pipe_kb[2];
+            pipeb_score0 += pair_q0[3] * pipe_kb[3];
+            pipeb_score1 += pair_q1[3] * pipe_kb[3];
+            // One packed componentwise simd_sum for both planes: each
+            // component keeps its own butterfly; updates below unchanged.
+            {
+                const vec<U, 4> packed_scores = simd_sum(
+                    vec<U, 4>(pair_score0, pair_score1,
+                              pipeb_score0, pipeb_score1));
+                pair_score0 = packed_scores.x;
+                pair_score1 = packed_scores.y;
+                pipeb_score0 = packed_scores.z;
+                pipeb_score1 = packed_scores.w;
+            }
 
             U pair_new_max0 = metal::max(pair_max0, pair_score0);
             U pair_new_max1 = metal::max(pair_max1, pair_score1);
@@ -2000,19 +2027,6 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
             pair_o1[2] = pair_o1[2] * pair_factor1 + pair_exp1 * pipe_va2;
             pair_o0[3] = pair_o0[3] * pair_factor0 + pair_exp0 * pipe_va3;
             pair_o1[3] = pair_o1[3] * pair_factor1 + pair_exp1 * pipe_va3;
-
-            U pipeb_score0 = 0;
-            U pipeb_score1 = 0;
-            pipeb_score0 += pair_q0[0] * pipe_kb[0];
-            pipeb_score1 += pair_q1[0] * pipe_kb[0];
-            pipeb_score0 += pair_q0[1] * pipe_kb[1];
-            pipeb_score1 += pair_q1[1] * pipe_kb[1];
-            pipeb_score0 += pair_q0[2] * pipe_kb[2];
-            pipeb_score1 += pair_q1[2] * pipe_kb[2];
-            pipeb_score0 += pair_q0[3] * pipe_kb[3];
-            pipeb_score1 += pair_q1[3] * pipe_kb[3];
-            pipeb_score0 = simd_sum(pipeb_score0);
-            pipeb_score1 = simd_sum(pipeb_score1);
 
             U pipeb_new_max0 = metal::max(pair_max0, pipeb_score0);
             U pipeb_new_max1 = metal::max(pair_max1, pipeb_score1);
@@ -3352,8 +3366,10 @@ private func lagunaFusedQKVProjectionSource(
 
         \(projectionLoop)
 
-        for (uint row = 0; row < rows_per_thread; ++row) {
-            for (ushort delta = 16; delta >= 1; delta >>= 1) {
+        // Loop interchange: each row's delta sequence (16,8,4,2,1) and +=
+        // order are unchanged; the independent chains interleave.
+        for (ushort delta = 16; delta >= 1; delta >>= 1) {
+            for (uint row = 0; row < rows_per_thread; ++row) {
                 result[row] += metal::simd_shuffle_down(result[row], delta);
             }
         }
@@ -3635,8 +3651,10 @@ private func lagunaGatedOutputProjectionSource(
 
         \(body)
 
-        for (uint row = 0; row < rows_per_thread; ++row) {
-            for (ushort delta = 16; delta >= 1; delta >>= 1) {
+        // Loop interchange: each row's delta sequence (16,8,4,2,1) and +=
+        // order are unchanged; the independent chains interleave.
+        for (ushort delta = 16; delta >= 1; delta >>= 1) {
+            for (uint row = 0; row < rows_per_thread; ++row) {
                 result[row] += metal::simd_shuffle_down(result[row], delta);
             }
         }
@@ -3801,6 +3819,23 @@ func lagunaGateProductSoftplus(
 
 // MARK: - Gated native-affine INT8 output projection (one dispatch)
 
+/// `DARKBLOOM_SEED_ELIDE_RESIDUAL` (default on; "0" restores the byte-identical
+/// stock strings): peels the first product of the INT8 `accum` loops so the dead
+/// `+0.0f` seed add goes away -- same closed signed-zero case as the NVFP4 qdot.
+let lagunaSeedElideResidualEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SEED_ELIDE_RESIDUAL"] != "0"
+
+private func lagunaSeedElideResidualInit(_ firstTerm: String) -> String {
+    lagunaSeedElideResidualEnabled ? firstTerm : "0.0f"
+}
+
+private let lagunaSeedElideResidualFrom = lagunaSeedElideResidualEnabled ? "1" : "0"
+
+/// Same peel for the normalized block sums: seeds from the index-zero value.
+private let lagunaNormSeedPeel = lagunaSeedElideResidualEnabled
+    ? "float sum; { float v = float(bfloat(norm_weight[column] * bfloat(float(residual[column]) * laguna_inv_mean))); sum = v; x_thread[0] = v; }"
+    : "float sum = 0.0f;"
+
 /// Exact per-head softplus gate plus group-32 affine INT8 output GEMV.
 private func lagunaGatedAffineOProjSource(heads: Int, indexed: Bool = false) -> String {
     let metadataPointers = indexed
@@ -3881,8 +3916,12 @@ private func lagunaGatedAffineOProjSource(heads: Int, indexed: Bool = false) -> 
     uint column = simd_lid * values_per_thread;
     for (uint k = 0; k < in_vec_size; k += block_size) {
         float gate = gate_table[column >> head_shift];
-        float sum = 0.0f;
-        for (uint i = 0; i < values_per_thread; ++i) {
+        \(lagunaSeedElideResidualEnabled ? """
+        float seed_value = float(bfloat(float(xp[0]) * gate));
+        x_thread[0] = seed_value;
+        """ : "")
+        float sum = \(lagunaSeedElideResidualInit("seed_value"));
+        for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
             float value = float(bfloat(float(xp[i]) * gate));
             sum += value;
             x_thread[i] = value;
@@ -3891,8 +3930,8 @@ private func lagunaGatedAffineOProjSource(heads: Int, indexed: Bool = false) -> 
         for (uint row = 0; row < results_per_simdgroup; ++row) {
             const device uint8_t* wl = ws + row * in_vec_size;
             \(metadataLoad)
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
+            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * wl[0]"));
+            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
                 accum += x_thread[i] * wl[i];
             }
             result[row] += scale * accum + sum * bias;
@@ -4141,13 +4180,33 @@ func lagunaGatedAffineOProjNVFP4Source(
     let loadInput = preActivatedGate
         ? """
         float g=float(gate_values[column>>head_shift]);
-        for(uint i=0;i<values_per_thread;++i)
-            x_thread[i]=float(bfloat(float(xp[i])*g));
+        // 16B-certified vec4 activation loads (xp byte offset = 32*lane,
+        // 1024B block stride, buffer offset 0): same elements, same
+        // per-element float(bfloat(float(v)*g)) chain in the same order.
+        const device vec<bfloat, 4>* xv = (const device vec<bfloat, 4>*)xp;
+        #pragma unroll
+        for (uint i4 = 0; i4 < values_per_thread / 4; ++i4) {
+            const vec<bfloat, 4> v4 = xv[i4];
+            x_thread[4 * i4 + 0] = float(bfloat(float(v4.x) * g));
+            x_thread[4 * i4 + 1] = float(bfloat(float(v4.y) * g));
+            x_thread[4 * i4 + 2] = float(bfloat(float(v4.z) * g));
+            x_thread[4 * i4 + 3] = float(bfloat(float(v4.w) * g));
+        }
         """
         : """
         float g=gt[column>>head_shift];
-        for(uint i=0;i<values_per_thread;++i)
-            x_thread[i]=float(bfloat(float(xp[i])*g));
+        // 16B-certified vec4 activation loads (xp byte offset = 32*lane,
+        // 1024B block stride, buffer offset 0): same elements, same
+        // per-element float(bfloat(float(v)*g)) chain in the same order.
+        const device vec<bfloat, 4>* xv = (const device vec<bfloat, 4>*)xp;
+        #pragma unroll
+        for (uint i4 = 0; i4 < values_per_thread / 4; ++i4) {
+            const vec<bfloat, 4> v4 = xv[i4];
+            x_thread[4 * i4 + 0] = float(bfloat(float(v4.x) * g));
+            x_thread[4 * i4 + 1] = float(bfloat(float(v4.y) * g));
+            x_thread[4 * i4 + 2] = float(bfloat(float(v4.z) * g));
+            x_thread[4 * i4 + 3] = float(bfloat(float(v4.w) * g));
+        }
         """
     return """
     constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
@@ -4193,9 +4252,12 @@ func lagunaGatedAffineOProjNVFP4Source(
             uint8_t sbits = sc[row * in_vec_size_g];
             \(scaleDecode)
             \(accumDecl)
+            // 8B-aligned code pair (element index even at every site):
+            // one uint2 load, identical words in identical j order.
+            const uint2 cw = *(const device uint2*)wl;
             #pragma unroll
             for (uint j = 0; j < codes_per_thread; ++j) {
-                const uint c = wl[j];
+                const uint c = (j == 0) ? cw.x : cw.y;
                 \(extract)
                 const float2 v04 = float2(as_type<half2>(p0))\(weightScale);
                 const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
@@ -4217,10 +4279,19 @@ func lagunaGatedAffineOProjNVFP4Source(
         column += block_size;
     }
 
-    for (uint row = 0; row < results_per_simdgroup; ++row) {
-        result[row] = simd_sum(result[row] * 4194304.0f);
+    // One packed componentwise simd_sum (K3-receipted): per-component
+    // butterfly, multiply-before-sum, and write order all stock.
+    {
+        const vec<float, 4> packed_res = simd_sum(
+            vec<float, 4>(result[0] * 4194304.0f,
+                          result[1] * 4194304.0f,
+                          result[2] * 4194304.0f,
+                          result[3] * 4194304.0f));
         if (simd_lid == 0) {
-            projected[out_row + row] = bfloat(result[row]);
+            projected[out_row + 0] = bfloat(packed_res.x);
+            projected[out_row + 1] = bfloat(packed_res.y);
+            projected[out_row + 2] = bfloat(packed_res.z);
+            projected[out_row + 3] = bfloat(packed_res.w);
         }
     }
     """
@@ -4698,8 +4769,11 @@ private func lagunaNormAffineQKVBody(
 
     for (uint j = 0; j < virtual_per_thread; ++j) {
         uint base = (lid + j * real_threads) * n_reads;
-        float acc = 0.0f;
-        for (uint i = 0; i < n_reads; ++i) {
+        \(lagunaSeedElideResidualEnabled ? """
+        float x0 = float(residual[base]);
+        """ : "")
+        float acc = \(lagunaSeedElideResidualInit("x0 * x0"));
+        for (uint i = \(lagunaSeedElideResidualFrom); i < n_reads; ++i) {
             float xi = float(residual[base + i]);
             acc += xi * xi;
         }
@@ -4737,8 +4811,11 @@ private func lagunaNormAffineQKVBody(
 
     uint column = simd_lid * values_per_thread;
     for (uint k = 0; k < axis_size; k += block_size) {
-        float sum = 0.0f;
-        for (uint i = 0; i < values_per_thread; ++i) {
+        \(lagunaSeedElideResidualEnabled ? """
+        float sum;
+        { uint i = 0; \(loadValue) sum = value; x_thread[0] = value; }
+        """ : "float sum = 0.0f;")
+        for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
             \(loadValue)
             sum += value;
             x_thread[i] = value;
@@ -4748,8 +4825,8 @@ private func lagunaNormAffineQKVBody(
             const device uint8_t* wl = ws + row * axis_size;
             float scale = float(sc[row * in_vec_size_g]);
             float bias = float(bs[row * in_vec_size_g]);
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
+            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * wl[0]"));
+            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
                 accum += x_thread[i] * wl[i];
             }
             result[row] += scale * accum + sum * bias;
@@ -4905,8 +4982,11 @@ private func lagunaNormAffineQKVPrefetchSource(
 
     for (uint j = 0; j < virtual_per_thread; ++j) {
         uint base = (lid + j * real_threads) * n_reads;
-        float acc = 0.0f;
-        for (uint i = 0; i < n_reads; ++i) {
+        \(lagunaSeedElideResidualEnabled ? """
+        float x0 = float(residual[base]);
+        """ : "")
+        float acc = \(lagunaSeedElideResidualInit("x0 * x0"));
+        for (uint i = \(lagunaSeedElideResidualFrom); i < n_reads; ++i) {
             float xi = float(residual[base + i]);
             acc += xi * xi;
         }
@@ -4935,8 +5015,8 @@ private func lagunaNormAffineQKVPrefetchSource(
 
     uint column = simd_lid * values_per_thread;
     for (uint d = 0; d < pf_depth; ++d) {
-        float sum = 0.0f;
-        for (uint i = 0; i < values_per_thread; ++i) {
+        \(lagunaNormSeedPeel)
+        for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
             float value = float(bfloat(
                             norm_weight[column + i] *
                             bfloat(float(residual[column + i]) * laguna_inv_mean)));
@@ -4944,8 +5024,8 @@ private func lagunaNormAffineQKVPrefetchSource(
             x_thread[i] = value;
         }
         for (uint row = 0; row < results_per_simdgroup; ++row) {
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
+            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * pf_w[d][row][0]"));
+            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
                 accum += x_thread[i] * pf_w[d][row][i];
             }
             result[row] += pf_s[d][row] * accum + sum * pf_b[d][row];
@@ -4955,8 +5035,8 @@ private func lagunaNormAffineQKVPrefetchSource(
         column += block_size;
     }
     for (uint k = pf_depth * block_size; k < axis_size; k += block_size) {
-        float sum = 0.0f;
-        for (uint i = 0; i < values_per_thread; ++i) {
+        \(lagunaNormSeedPeel)
+        for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
             float value = float(bfloat(
                             norm_weight[column + i] *
                             bfloat(float(residual[column + i]) * laguna_inv_mean)));
@@ -4967,8 +5047,8 @@ private func lagunaNormAffineQKVPrefetchSource(
         for (uint row = 0; row < results_per_simdgroup; ++row) {
             const device uint8_t* wl = ws + row * axis_size;
             \(metadataLoad)
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
+            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * wl[0]"));
+            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
                 accum += x_thread[i] * wl[i];
             }
             result[row] += scale * accum + sum * bias;
@@ -7332,6 +7412,27 @@ private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
         thread float up_result = 0.0f;
         thread float input_values[values_per_lane];
 
+        // Depth-1 weight staging: block b+1's gate/up code words (the same
+        // uint2 laguna_nvfp4_qdot_16 loads internally) and scale bytes are
+        // issued before block b's qdots consume b's registers, so the
+        // expert-dependent weight stream rides under the current block's
+        // compute. Same bytes, same addresses, same nibble decode via
+        // laguna_nvfp4_qdot_codes_16, identical accumulation order.
+        uint2 gate_codes;
+        uint2 up_codes;
+        uint8_t gate_sb;
+        uint8_t up_sb;
+        {
+            const device uint8_t* first_scales =
+                row_scales + sub * 2 * scale_row_bytes + lane;
+            gate_sb = first_scales[0];
+            up_sb = first_scales[scale_row_bytes];
+            gate_codes = *(const device uint2*)(
+                expert_weight + gate_row * fused_row_bytes + lane * 8);
+            up_codes = *(const device uint2*)(
+                expert_weight + up_row * fused_row_bytes + lane * 8);
+        }
+
         for (uint block = 0; block < input_width; block += block_width) {
             const device vec<bfloat, 4>* input_vectors =
                 (const device vec<bfloat, 4>*) (
@@ -7344,24 +7445,31 @@ private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
                 input_values[4 * i + 3] = values[3];
             }
 
-            const device uint8_t* block_scales =
-                row_scales + (block / block_width) * scale_kblock_bytes;
-            const device uint8_t* gate_scale =
-                block_scales + sub * 2 * scale_row_bytes + lane;
-            const device uint8_t* up_scale = gate_scale + scale_row_bytes;
-            const device uint8_t* gate_weight =
-                expert_weight + gate_row * fused_row_bytes
-                + block / 2 + lane * 8;
-            const device uint8_t* up_weight =
-                expert_weight + up_row * fused_row_bytes
-                + block / 2 + lane * 8;
+            const uint2 cur_gate_codes = gate_codes;
+            const uint2 cur_up_codes = up_codes;
+            const uint8_t cur_gate_sb = gate_sb;
+            const uint8_t cur_up_sb = up_sb;
+            const uint next_block = block + block_width;
+            if (next_block < input_width) {
+                const device uint8_t* next_scales =
+                    row_scales + (next_block / block_width) * scale_kblock_bytes
+                    + sub * 2 * scale_row_bytes + lane;
+                gate_sb = next_scales[0];
+                up_sb = next_scales[scale_row_bytes];
+                gate_codes = *(const device uint2*)(
+                    expert_weight + gate_row * fused_row_bytes
+                    + next_block / 2 + lane * 8);
+                up_codes = *(const device uint2*)(
+                    expert_weight + up_row * fused_row_bytes
+                    + next_block / 2 + lane * 8);
+            }
 
-            gate_result += laguna_nvfp4_qdot_16(
-                gate_weight, input_values,
-                laguna_nvfp4_scale(gate_scale[0]));
-            up_result += laguna_nvfp4_qdot_16(
-                up_weight, input_values,
-                laguna_nvfp4_scale(up_scale[0]));
+            gate_result += laguna_nvfp4_qdot_codes_16(
+                cur_gate_codes, input_values,
+                laguna_nvfp4_scale(cur_gate_sb));
+            up_result += laguna_nvfp4_qdot_codes_16(
+                cur_up_codes, input_values,
+                laguna_nvfp4_scale(cur_up_sb));
         }
 
         gate_result = simd_sum(gate_result);
@@ -7468,17 +7576,30 @@ private let lagunaRoutedDownReduceKernel = MLXFast.metalKernel(
         thread float result[outputs_per_simd] = {
             0.0f, 0.0f, 0.0f, 0.0f
         };
+        // Rows' code words/scales stage first; one packed simd_sum, same
+        // bytes/decode/order per component as stock.
+        uint2 row_codes[outputs_per_simd];
+        uint8_t row_sb[outputs_per_simd];
         for (uint row = 0; row < outputs_per_simd; ++row) {
             uint output_row = first_row + row;
-            const device uint8_t* weight =
-                expert_weight + output_row * packed_row_bytes + lane * 8;
-            const device uint8_t* scale =
-                expert_scales + output_row * scale_row_bytes + lane;
-            result[row] = laguna_nvfp4_qdot_16(
-                weight,
+            row_codes[row] = *(const device uint2*)(
+                expert_weight + output_row * packed_row_bytes + lane * 8);
+            row_sb[row] =
+                expert_scales[output_row * scale_row_bytes + lane];
+        }
+        for (uint row = 0; row < outputs_per_simd; ++row) {
+            result[row] = laguna_nvfp4_qdot_codes_16(
+                row_codes[row],
                 input_values,
-                laguna_nvfp4_scale(scale[0]));
-            result[row] = simd_sum(result[row]);
+                laguna_nvfp4_scale(row_sb[row]));
+        }
+        {
+            const vec<float, 4> packed_rows = simd_sum(
+                vec<float, 4>(result[0], result[1], result[2], result[3]));
+            result[0] = packed_rows.x;
+            result[1] = packed_rows.y;
+            result[2] = packed_rows.z;
+            result[3] = packed_rows.w;
         }
 
         threadgroup bfloat expert_outputs[
@@ -7912,8 +8033,10 @@ private let lagunaDenseDownResidualKernel = MLXFast.metalKernel(
             column += block_width;
         }
 
-        for (uint row = 0; row < rows_per_thread; ++row) {
-            for (ushort delta = 16; delta >= 1; delta >>= 1) {
+        // Loop interchange: each row's delta sequence (16,8,4,2,1) and +=
+        // order are unchanged; the independent chains interleave.
+        for (ushort delta = 16; delta >= 1; delta >>= 1) {
+            for (uint row = 0; row < rows_per_thread; ++row) {
                 result[row] += metal::simd_shuffle_down(result[row], delta);
             }
         }
