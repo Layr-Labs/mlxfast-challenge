@@ -4138,16 +4138,17 @@ func lagunaGatedAffineOProjNVFP4Source(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     """
-    let loadInput = preActivatedGate
-        ? """
-        float g=float(gate_values[column>>head_shift]);
-        for(uint i=0;i<values_per_thread;++i)
-            x_thread[i]=float(bfloat(float(xp[i])*g));
-        """
-        : """
-        float g=gt[column>>head_shift];
-        for(uint i=0;i<values_per_thread;++i)
-            x_thread[i]=float(bfloat(float(xp[i])*g));
+    let loadInput = (preActivatedGate
+        ? "float g=float(gate_values[column>>head_shift]);"
+        : "float g=gt[column>>head_shift];") + """
+
+        for(uint i=0;i<values_per_thread;i+=4){
+            vec<bfloat,4> v=*((const device vec<bfloat,4>*)(xp+i));
+            x_thread[i]=float(bfloat(float(v.x)*g));
+            x_thread[i+1]=float(bfloat(float(v.y)*g));
+            x_thread[i+2]=float(bfloat(float(v.z)*g));
+            x_thread[i+3]=float(bfloat(float(v.w)*g));
+        }
         """
     return """
     constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
@@ -4193,9 +4194,10 @@ func lagunaGatedAffineOProjNVFP4Source(
             uint8_t sbits = sc[row * in_vec_size_g];
             \(scaleDecode)
             \(accumDecl)
+            const uint2 cw = *((const device uint2*)wl);
             #pragma unroll
             for (uint j = 0; j < codes_per_thread; ++j) {
-                const uint c = wl[j];
+                const uint c = j == 0 ? cw.x : cw.y;
                 \(extract)
                 const float2 v04 = float2(as_type<half2>(p0))\(weightScale);
                 const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
