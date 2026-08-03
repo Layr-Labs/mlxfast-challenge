@@ -340,28 +340,8 @@ private func lagunaUseNativeAffineOProj(layer: Int) -> Bool {
         onlyLayer: lagunaNativeAffineOProjOnlyLayer)
 }
 
-/// The same native group-32 affine INT8 side layout applied to the attention
-/// per-head gate projection (`g_proj`), admitted to the accepted quantization
-/// envelope by the g_proj amendment. `g_proj` is a tiny `[heads, 2048]` BF16
-/// read (48/64 rows), but its decode GEMV is one extra dispatch per layer
-/// against the same normalized row the Q/K/V batch already computes, and its
-/// output feeds only the softplus gate — never the KV cache — so requantizing
-/// it perturbs the model strictly less than the already-shipped Q/K/V and
-/// o_proj layouts. Unlike those layouts the gate bank is ALWAYS group-32
-/// affine INT8: the envelope caps `g_proj` there, so the NVFP4 tail window
-/// (`lagunaNativeAffineNVFP4From`) and the measurement-only probe format do
-/// not apply to it. On layers whose QKV bank is itself group-32 INT8 the gate
-/// rows concatenate into that same bank and ride the same dispatch for free;
-/// on the NVFP4 tail layers the gate keeps a separate group-32 INT8 bank and
-/// replaces the BF16 GEMV one dispatch for one dispatch.
-///
-/// Decode only: prefill and every non-`[1, 1, ·]` call keep the BF16
-/// parameter, which stays authoritative and resident. Coverage is prepared
-/// inside `prepareNativeAffineQKVWeight`, so a layer only gets the gate
-/// layout when its QKV layout is also active.
-///
-/// Set `DARKBLOOM_NATIVE_AFFINE_GPROJ=0` (or `..._LAYERS=0`) to fall back to
-/// the exact stock BF16 gate projection inside the same binary.
+/// Accepted group-32 affine INT8 side layout for decode `g_proj`; prefill and
+/// failed guards retain the authoritative BF16 projection.
 private let lagunaNativeAffineGProjLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_GPROJ"] != "0"
     else { return 0 }
@@ -430,29 +410,17 @@ private func lagunaNativeAffineGProjWeight(_ weight: MLXArray) -> LagunaNativeAf
 let lagunaFusedSlidingQKNormRoPEEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_QK_NORM_ROPE"] != "0"
 
-/// Multi-token (prefill) twin of the two decode QK-norm+RoPE fusions above
-/// (see `lagunaPrefillSlidingQKNormRoPEKernel` /
-/// `lagunaPrefillFullQKNormYaRNKernel`). One dispatch per layer replaces the
-/// four stock dispatches on sliding layers (q RMSNorm, k RMSNorm, RoPE q,
-/// RoPE k) and the six on full-attention layers (the partial-YaRN RoPE first
-/// materializes a general copy of the transposed view). The cos/sin rows
-/// come from the same load-time probe-seed atlas the decode kernels can
-/// consume, so every rotary factor is a float the stock RoPE kernel itself
-/// produced.
-///
-/// **DEFAULT ON** (`!= "0"`; set `DARKBLOOM_PREFILL_QK_NORM_ROPE=0` to
-/// ablate). Guarded on shape/dtype/family and a host-known cache offset
-/// with `offset + L <= lagunaRoPEAngleAtlasLength`; every other case takes
-/// the verbatim stock path.
+/// Prefill Q/K RMSNorm+RoPE fusion using the authoritative angle atlas.
+/// Set `DARKBLOOM_PREFILL_QK_NORM_ROPE=0` for the guarded stock fallback.
 private let lagunaPrefillQKNormRoPEEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_QK_NORM_ROPE"] != "0"
 
-/// Heads-per-threadgroup repartition for the prefill QK-norm+RoPE kernels.
-/// The shipped kernels pack four heads (four SIMDs) per threadgroup; this
-/// selects a one-head-per-threadgroup twin (one SIMD) instead -- the proven
-/// DECODE shape. Bit-exact in the EG256 class: each head is one SIMD and all
-/// per-head arithmetic is SIMD-local, so only threadgroup composition changes.
-/// Default `1` selects H1; `DARKBLOOM_PREFILL_QK_HEADS=4` restores the control.
+/// Final sliding-layer one-query/all-key Q/K norm+RoPE fusion.
+private let lagunaTerminalPrefillQKNormRoPEEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_TERMINAL_PREFILL_QK_NORM_ROPE"] != "0"
+
+/// Prefill heads per threadgroup: default H1; set to 4 for the control.
 let lagunaPrefillQKHeadsPerGroup: Int = {
     let raw =
         ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_QK_HEADS"]
@@ -460,20 +428,12 @@ let lagunaPrefillQKHeadsPerGroup: Int = {
     return raw == "4" ? 4 : 1
 }()
 
-/// Terminal-prefill projection banking. The last decoder layer consumes Q and
-/// the per-head gate for only the final supplied row, while K/V must still be
-/// produced for every row so the cache advances normally. Retained `[Q; G]`
-/// and `[K; V]` BF16 banks therefore turn four independent projections into
-/// two without changing any output row's contraction or rounding. Set
-/// `DARKBLOOM_LAST_PREFILL_PROJECTION_BANKS=0` to restore the four stock
-/// `Linear` calls and skip allocating the two derived banks.
+/// Terminal-prefill exact `[Q; G]` final-row and `[K; V]` all-row banks.
 private let lagunaLastPrefillProjectionBanksEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_LAST_PREFILL_PROJECTION_BANKS"] != "0"
 
-/// `DARKBLOOM_TERMINAL_FUSION` (default ON; set "0" to disable): current-API
-/// port of overlay-dropped `9f98995`. `callLastPrefillRow` reuses the ordinary
-/// path's accepted row-local fused residual+RMSNorm(+router)+MoE-tail helpers.
+/// Terminal-row residual+RMSNorm(+router)+MoE-tail fusion; `0` disables.
 private let lagunaTerminalPrefillFusionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_TERMINAL_FUSION"] != "0"
 
@@ -2301,31 +2261,8 @@ func lagunaWarmFullFusedAttentionKernel() {
     ))
 }
 
-/// Multi-token sliding-layer Q/K RMSNorm + plain RoPE fusion. One dispatch
-/// replaces the stock four (`rms_single_row` q, `rms_single_row` k,
-/// `rope_bfloat16` q, `rope_bfloat16` k) for a whole prefill layer and
-/// writes both outputs directly in the `[1, heads, L, 128]` layout SDPA and
-/// the cache update consume, so the transposed-view round trip is gone too.
-///
-/// Grid mapping: one threadgroup of 128 threads (four simdgroups) per
-/// (head-block, token); each simdgroup owns one (token, head) row, exactly
-/// the row `rms_single_row` gets at axis_size 128 (N_READS 4, one 32-lane
-/// simdgroup per row). `threadgroups_per_grid.y` is L, so no shape constant
-/// is baked and any L dispatches the same compiled kernel.
-///
-/// Exactness, link for link with the stock chain:
-///  * The norm replicates `rms_single_row` at axis_size 128: lane `l` owns
-///    the contiguous block `[4l, 4l+4)`, squares in index order, `simd_sum`
-///    (the stock single-simdgroup threadgroup then sums `local_sums`, which
-///    adds only zeros), `precise::rsqrt(acc / 128 + 1e-6)`, and the BF16
-///    rounding inside `w[i] * bfloat(x[i] * inv)` — the same expression the
-///    shipped decode kernels use against the same stock kernel.
-///  * The rotation replicates `rope_impl<T, _, 4>` (`rope_bfloat16`,
-///    non-traditional, dims 128): pair `p` couples `p` and `p + 64`, and the
-///    cos/sin floats are read from the probe-seed atlas row for the token's
-///    absolute position — values the stock RoPE kernel computed, not a
-///    re-derivation. The decode twin (`laguna_sliding_qk_norm_rope_bf16_128_v1`)
-///    consumes the same table with the same expression.
+/// Multi-token sliding Q/K RMSNorm+RoPE fusion. Each SIMD owns one head row,
+/// reproduces the stock reduction/rounding order, and writes SDPA layout.
 private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
     name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_v2",
     inputNames: [
@@ -2412,15 +2349,7 @@ private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// One-head-per-threadgroup twin of the prefill sliding QK-norm+RoPE kernel
-/// (H1). BIT-EXACT repartition in the EG256 class: the `*4` original packs
-/// four heads (four SIMDs) per threadgroup; this twin packs one (one SIMD).
-/// Each head's work is fully SIMD-local -- RMSNorm `simd_sum`, the within-SIMD
-/// `lane ^ 16` rotary-partner shuffle, and every BF16 rounding boundary never
-/// cross heads -- so the value each head writes is identical regardless of how
-/// many heads share a threadgroup. This matches the proven DECODE shape
-/// (`lagunaSlidingQKNormRoPEKernel`, one SIMD/head, the project's largest
-/// single win); the prefill `*4` was an unaudited divergence from it.
+/// One-head-per-threadgroup geometry twin; all arithmetic is SIMD-local.
 private let lagunaPrefillSlidingQKNormRoPEH1Kernel = MLXFast.metalKernel(
     name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_h1_v2",
     inputNames: [
@@ -2499,20 +2428,85 @@ private let lagunaPrefillSlidingQKNormRoPEH1Kernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// Multi-token full-attention twin: per-head Q/K RMSNorm + partial YaRN
-/// RoPE (rotary half 64, mscale on the rotary inputs, tail passes through).
-/// One dispatch replaces the stock six (`rms_single_row` ×2, the general
-/// copy each partial RoPE materializes first ×2, `rope_freqs_bfloat16` ×2).
-///
-/// Exactness mirrors the shipped decode kernel
-/// (`laguna_full_qk_norm_yarn_bf16_128_v4`) against the same stock chain:
-/// the same rms_single_row reproduction; the same mscale round-trip
-/// `float(bfloat(x * bfloat(mscale)))` the stock
-/// `rope_input_with_mscale<bfloat16, true>` applies under the negative-scale
-/// sentinel; the same probe-seed angle row (the FP32 probe recovers
-/// `fl(fl(1/mscale) * mscale) == 1.0f`, so the atlas carries pure cos/sin);
-/// and the tail elements 64…127 written verbatim, matching the values the
-/// stock pre-RoPE copy leaves behind.
+/// Flat exact terminal task list: 64 query heads plus every key row/head.
+private let lagunaTerminalPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
+    name: "laguna_terminal_prefill_sliding_qk_norm_rope_bf16_128_v1",
+    inputNames: [
+        "raw_queries", "raw_keys", "query_weight", "key_weight", "angles",
+        "offsets", "length_value",
+    ],
+    outputNames: ["queries", "keys"],
+    source: """
+        constexpr uint head_dim = 128;
+        constexpr uint rotary_pairs = 64;
+        constexpr uint query_heads = 64;
+        constexpr uint kv_heads = 8;
+
+        uint task = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+        uint length = uint(length_value);
+        uint token;
+        const device bfloat* input;
+        const device bfloat* weight;
+        device bfloat* output;
+        if (task < query_heads) {
+            uint head = task;
+            token = length - 1;
+            input = raw_queries + head * head_dim;
+            weight = query_weight;
+            output = queries + head * head_dim;
+        } else {
+            uint key_task = task - query_heads;
+            token = key_task / kv_heads;
+            uint head = key_task - token * kv_heads;
+            input = raw_keys + (token * kv_heads + head) * head_dim;
+            weight = key_weight;
+            output = keys + (head * length + token) * head_dim;
+        }
+
+        uint base = lane * 4;
+        thread bfloat normalized[4];
+        float sum = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            float value = float(input[base + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        float inverse_rms = metal::precise::rsqrt(
+            sum / 128.0f + 1.0e-6f);
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            normalized[i] = weight[base + i]
+                * bfloat(float(input[base + i]) * inverse_rms);
+        }
+
+        thread float paired[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
+        }
+        const device float* angle_row = angles
+            + (uint(offsets[0]) + token) * (2 * rotary_pairs);
+        if (lane < 16) {
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+                uint pair = base + i;
+                float first = float(normalized[i]);
+                float second = paired[i];
+                float cosine = angle_row[pair];
+                float sine = angle_row[pair + rotary_pairs];
+                output[pair] = bfloat(first * cosine - second * sine);
+                output[pair + rotary_pairs] =
+                    bfloat(first * sine + second * cosine);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Multi-token full-attention Q/K RMSNorm+partial-YaRN fusion, preserving the
+/// stock BF16 mscale round-trip, rotary expression, and untouched tail.
 private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
     name: "laguna_prefill_full_qk_norm_yarn_bf16_128_v2",
     inputNames: [
@@ -2601,12 +2595,7 @@ private let lagunaPrefillFullQKNormYaRNKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// One-head-per-threadgroup twin of the prefill full-attention QK-norm+YaRN
-/// kernel (H1). Bit-exact repartition (EG256 class): each head is one SIMD and
-/// all per-head arithmetic (RMSNorm `simd_sum`, the within-SIMD `lane ^ 8` YaRN
-/// partner shuffle, the mscale round-trip) is SIMD-local, so grouping one head
-/// per threadgroup instead of four changes only launch count/occupancy, not any
-/// head's output value. Matches the proven decode shape.
+/// One-head-per-threadgroup full-attention twin; arithmetic is SIMD-local.
 private let lagunaPrefillFullQKNormYaRNH1Kernel = MLXFast.metalKernel(
     name: "laguna_prefill_full_qk_norm_yarn_bf16_128_h1_v2",
     inputNames: [
@@ -2731,6 +2720,50 @@ private func lagunaPrefillSlidingQKNormRoPE(
         threadGroup: (threadGroupSize, 1, 1),
         outputShapes: [
             [1, heads, length, LagunaConstants.headDim],
+            [1, kvHeads, length, LagunaConstants.headDim],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
+private func lagunaTerminalPrefillSlidingQKNormRoPE(
+    rawQueries: MLXArray,
+    rawKeys: MLXArray,
+    queryWeight: MLXArray,
+    keyWeight: MLXArray,
+    angles: MLXArray,
+    offsets: MLXArray,
+    length: Int
+) -> (MLXArray, MLXArray) {
+    let heads = LagunaConstants.slidingAttentionHeads
+    let kvHeads = LagunaConstants.numKeyValueHeads
+    precondition(rawQueries.dtype == .bfloat16)
+    precondition(rawKeys.dtype == .bfloat16)
+    precondition(queryWeight.dtype == .bfloat16)
+    precondition(keyWeight.dtype == .bfloat16)
+    precondition(rawQueries.shape == [1, 1, heads * LagunaConstants.headDim])
+    precondition(rawKeys.shape == [1, length, kvHeads * LagunaConstants.headDim])
+    precondition(queryWeight.shape == [LagunaConstants.headDim])
+    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(
+        angles.shape == [1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim])
+    precondition(angles.dtype == .float32)
+    precondition(offsets.dtype == .int32 && offsets.size == 1)
+    precondition(length > 1)
+
+    lagunaTrace("terminal prefill sliding qk norm+rope")
+    let tasks = heads + kvHeads * length
+    let kernelInputs: [any ScalarOrArray] = [
+        rawQueries, rawKeys, queryWeight, keyWeight, angles, offsets,
+        Int32(length),
+    ]
+    let outputs = lagunaTerminalPrefillSlidingQKNormRoPEKernel(
+        kernelInputs,
+        grid: (tasks * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [
+            [1, heads, 1, LagunaConstants.headDim],
             [1, kvHeads, length, LagunaConstants.headDim],
         ],
         outputDTypes: [.bfloat16, .bfloat16]
@@ -6033,7 +6066,12 @@ final class LagunaRuntimeAttention: Module {
     /// gate/projection run only for the last query; its RoPE offset is advanced
     /// by the discarded query-row count so it remains at the supplied
     /// sequence's final absolute position.
-    func callLastPrefillRow(_ x: MLXArray, cache: KVCache?) -> MLXArray {
+    func callLastPrefillRow(
+        _ x: MLXArray,
+        cache: KVCache?,
+        qkRoPEAngles: MLXArray? = nil,
+        qkRoPEOffsets: MLXArray? = nil
+    ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
         precondition(L > 1)
 
@@ -6073,16 +6111,52 @@ final class LagunaRuntimeAttention: Module {
             bankedGate = nil
         }
 
-        queries = qNorm(queries.reshaped(B, 1, nHeads, headDim)).transposed(0, 2, 1, 3)
-        keys = kNorm(keys.reshaped(B, L, nKVHeads, headDim)).transposed(0, 2, 1, 3)
+        let useTerminalFusedQKNormRoPE =
+            lagunaTerminalPrefillQKNormRoPEEnabled && isSliding && B == 1 &&
+            nHeads == LagunaConstants.slidingAttentionHeads &&
+            nKVHeads == LagunaConstants.numKeyValueHeads &&
+            headDim == LagunaConstants.headDim &&
+            queries.dtype == .bfloat16 && keys.dtype == .bfloat16 &&
+            qNorm.weight.dtype == .bfloat16 && kNorm.weight.dtype == .bfloat16 &&
+            queries.shape == [1, 1, nHeads * headDim] &&
+            keys.shape == [1, L, nKVHeads * headDim] &&
+            qkRoPEAngles?.dtype == .float32 &&
+            qkRoPEAngles?.shape == [
+                1, 1, lagunaRoPEAngleAtlasLength, headDim,
+            ] &&
+            qkRoPEOffsets?.dtype == .int32 && qkRoPEOffsets?.size == 1
+
+        var qkNormRoPEFused = false
+        if useTerminalFusedQKNormRoPE,
+            let angles = qkRoPEAngles, let offsets = qkRoPEOffsets
+        {
+            (queries, keys) = lagunaTerminalPrefillSlidingQKNormRoPE(
+                rawQueries: queries,
+                rawKeys: keys,
+                queryWeight: qNorm.weight,
+                keyWeight: kNorm.weight,
+                angles: angles,
+                offsets: offsets,
+                length: L)
+            qkNormRoPEFused = true
+        } else {
+            queries =
+                qNorm(queries.reshaped(B, 1, nHeads, headDim))
+                .transposed(0, 2, 1, 3)
+            keys =
+                kNorm(keys.reshaped(B, L, nKVHeads, headDim))
+                .transposed(0, 2, 1, 3)
+        }
         values = values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
 
-        if let offsetArray = graphOffsetArray(for: cache) {
-            queries = rope(queries, offset: offsetArray + Int32(L - 1))
-        } else {
-            queries = rope(queries, offset: (cache?.offset ?? 0) + L - 1)
+        if !qkNormRoPEFused {
+            if let offsetArray = graphOffsetArray(for: cache) {
+                queries = rope(queries, offset: offsetArray + Int32(L - 1))
+            } else {
+                queries = rope(queries, offset: (cache?.offset ?? 0) + L - 1)
+            }
+            keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
         let attended = attentionWithCacheUpdate(
             queries: queries,
@@ -10305,12 +10379,21 @@ final class LagunaRuntimeDecoderLayer: Module {
 
     /// Final-layer prefill specialization: every row commits K/V, but only the
     /// last query/output row runs attention output projection + the terminal MLP.
-    func callLastPrefillRow(_ x: MLXArray, cache: KVCache?) -> MLXArray {
+    func callLastPrefillRow(
+        _ x: MLXArray,
+        cache: KVCache?,
+        qkRoPEAngles: MLXArray? = nil,
+        qkRoPEOffsets: MLXArray? = nil
+    ) -> MLXArray {
         if lagunaTerminalPrefillFusionEnabled {
             // Fused terminal row (see flag doc). Reuses the ordinary path's
             // accepted row-local fusion; `else` is the exact stock fallback.
             let normalized = inputLayerNorm(x)
-            let r = selfAttn.callLastPrefillRow(normalized, cache: cache)
+            let r = selfAttn.callLastPrefillRow(
+                normalized,
+                cache: cache,
+                qkRoPEAngles: qkRoPEAngles,
+                qkRoPEOffsets: qkRoPEOffsets)
             let lastResidual = lagunaLastTokenHidden(x)
             let h: MLXArray
             let normalizedAfterAttention: MLXArray
@@ -10378,7 +10461,11 @@ final class LagunaRuntimeDecoderLayer: Module {
             return h + r2
         } else {
             let normalized = inputLayerNorm(x)
-            let r = selfAttn.callLastPrefillRow(normalized, cache: cache)
+            let r = selfAttn.callLastPrefillRow(
+                normalized,
+                cache: cache,
+                qkRoPEAngles: qkRoPEAngles,
+                qkRoPEOffsets: qkRoPEOffsets)
             let h = lagunaLastTokenHidden(x) + r
             let r2 = mlp(postAttentionLayerNorm(h))
             return h + r2
@@ -10740,7 +10827,11 @@ final class LagunaRuntimeModelInner: Module {
             let qkRoPEAngles = isFull ? fullRoPEAngles : slidingRoPEAngles
             if i == layers.count - 1, h.dim(1) > 1 {
                 if case .causal = mask {
-                    h = layer.callLastPrefillRow(h, cache: cache?[i])
+                    h = layer.callLastPrefillRow(
+                        h,
+                        cache: cache?[i],
+                        qkRoPEAngles: qkRoPEAngles,
+                        qkRoPEOffsets: qkRoPEOffsets)
                 } else {
                     h = layer(
                         h,
