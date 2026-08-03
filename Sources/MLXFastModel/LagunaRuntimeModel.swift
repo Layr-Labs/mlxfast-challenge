@@ -504,6 +504,15 @@ let lagunaFusedFullQKNormYaRNEnabled =
 let lagunaRoPEAngleAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] != "0"
 
+/// Decode-only experiment: extend the existing embedding + RoPE-atlas
+/// carrier with layer 0's input RMSNorm. The kernel still emits the raw BF16
+/// embedding row because the decoder residual consumes it after attention;
+/// only the otherwise-standalone normalized row is handed to layer 0's
+/// unchanged NVFP4 QKV path. Set the flag to exact `0` for the prior entry
+/// kernel and standalone layer-0 normalization.
+let lagunaEmbeddingFirstRMSNormEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_EMBEDDING_FIRST_RMS"] != "0"
+
 /// Zero-dispatch decode angle carrier: serve the two per-step RoPE angle rows
 /// as contiguous row VIEWS of the load-time FP32 position atlases instead of
 /// running the two probe RoPE dispatches every token. Unlike the fused
@@ -5152,6 +5161,19 @@ final class LagunaRuntimeAttention: Module {
     /// output at `queryDim + 2 * kvDim`.
     var _nativeAffineQKVGateRows = 0
 
+    /// True only for the shipped layer-0 decode bank whose QKV consumer still
+    /// needs a materialized normalized row. The group-32 affine alternative
+    /// already fuses RMSNorm into its projection and must not take the entry
+    /// fusion, or both kernels would repeat the normalization work.
+    var acceptsEmbeddingFirstRMSNorm: Bool {
+        guard layerIdx == 0, lagunaUseNativeAffineQKV(layer: layerIdx),
+            let bank = _nativeAffineQKV
+        else {
+            return false
+        }
+        return bank.mode == .nvfp4 && bank.bits == 4 && bank.groupSize == 16
+    }
+
     func prepareNativeAffineOProjWeight() -> [MLXArray] {
         guard _nativeAffineOProj == nil,
             type(of: wo) == Linear.self,
@@ -5355,10 +5377,21 @@ final class LagunaRuntimeAttention: Module {
         inputNorm: RMSNorm,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
+        precomputedInputNorm: MLXArray? = nil,
         qkRoPEAngles: MLXArray? = nil,
         qkRoPEOffsets: MLXArray? = nil
     ) -> MLXArray {
         let (B, L) = (input.dim(0), input.dim(1))
+        let entryNormalized: MLXArray? = {
+            guard let precomputedInputNorm,
+                B == 1, L == 1,
+                precomputedInputNorm.dtype == .bfloat16,
+                precomputedInputNorm.shape == input.shape
+            else {
+                return nil
+            }
+            return precomputedInputNorm
+        }()
 
         // One dispatch for the input RMSNorm and all three projections when
         // the decode preconditions hold; otherwise normalize separately and
@@ -5422,7 +5455,7 @@ final class LagunaRuntimeAttention: Module {
                 let fusedTailGateLogits: MLXArray? = nil
                 // Only materialized when the fused kernel declined; the gate
                 // branches below that read it are unreachable when it fired.
-                let normalized = fusedQKV ?? inputNorm(input)
+                let normalized = fusedQKV ?? entryNormalized ?? inputNorm(input)
                 let decodeNVFP4QKVR1 =
                     fusedQKV == nil
                     ? lagunaDecodeNVFP4QKVR1(
@@ -5531,7 +5564,7 @@ final class LagunaRuntimeAttention: Module {
         // above (rather than its environment flag) preserves the custom
         // fallback if fused-weight preparation declined.
         let normalizedInput: MLXArray? =
-            fusedNormQKV == nil ? inputNorm(input) : nil
+            fusedNormQKV == nil ? (entryNormalized ?? inputNorm(input)) : nil
 
         var queries: MLXArray
         var keys: MLXArray
@@ -6222,6 +6255,17 @@ let lagunaNvfp4ScaleDeferEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_DEFER"] != "0"
     && lagunaNvfp4ScaleFoldEnabled
 
+/// The historical low-byte shortcut in `laguna_nvfp4_scale` is opt-in.
+/// Isolated M5 evidence found its branch/control dependence slower than the
+/// branch-free carry/sign path even though it deletes a few integer ops for
+/// E4M3 bytes 0...15. Keep both sources available for same-binary brackets,
+/// and put the discriminator in every consumer's PSO name because MLX caches
+/// JIT libraries by kernel name.
+let lagunaDecodeNVFP4LowScaleEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_NVFP4_LOW_SCALE"] == "1"
+private let lagunaNVFP4LowScalePipelineSuffix =
+    lagunaDecodeNVFP4LowScaleEnabled ? "_ls1" : "_ls0"
+
 /// The `2^22` that `laguna_nvfp4_scale` stops applying under
 /// `DARKBLOOM_NVFP4_SCALE_DEFER`, re-applied once per output row at the
 /// accumulator-to-BF16 boundary. It appears at exactly one site per
@@ -6297,7 +6341,8 @@ let lagunaSharedSwiGLUQMVHeader: String = {
     // deferred-scale arm the half bit pattern is already the exact value
     // needed by the qdot; skip the carry/sign setup for this overwhelmingly
     // common case.  Keep every ablation's source unchanged.
-    let lowScaleFastPath = lagunaNvfp4ScaleDeferEnabled
+    let lowScaleFastPath =
+        (lagunaNvfp4ScaleDeferEnabled && lagunaDecodeNVFP4LowScaleEnabled)
         ? """
         if (bits < 16u) {
             ushort fast_raw = ushort(bits) << 7;
@@ -6373,7 +6418,8 @@ let lagunaSharedSwiGLUQMVHeader: String = {
 }()
 
 private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_shared_nvfp4_swiglu_qmv_bf16_v1",
+    name: "laguna_shared_nvfp4_swiglu_qmv_bf16_v1"
+        + lagunaNVFP4LowScalePipelineSuffix,
     inputNames: ["input", "fused_weight", "fused_scales"],
     outputNames: ["activated"],
     source: """
@@ -6455,7 +6501,8 @@ private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
 /// One-output-row scheduling twin of `lagunaSharedSwiGLUQMVKernel`.
 /// Arithmetic is textually identical per row; only row ownership changes.
 private let lagunaSharedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
-    name: "laguna_shared_nvfp4_swiglu_qmv_rows1_bf16_v1",
+    name: "laguna_shared_nvfp4_swiglu_qmv_rows1_bf16_v1"
+        + lagunaNVFP4LowScalePipelineSuffix,
     inputNames: ["input", "fused_weight", "fused_scales"],
     outputNames: ["activated"],
     source: """
@@ -6560,7 +6607,8 @@ func lagunaSharedSwiGLUQMV(
 }
 
 private let lagunaSharedDownResidualKernel = MLXFast.metalKernel(
-    name: "laguna_shared_nvfp4_down_residual_bf16_v1",
+    name: "laguna_shared_nvfp4_down_residual_bf16_v1"
+        + lagunaNVFP4LowScalePipelineSuffix,
     inputNames: [
         "activated", "down_weight", "down_scales", "routed", "residual",
     ],
@@ -6660,7 +6708,8 @@ func lagunaSharedDownResidual(
 }
 
 private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_bf16_v2",
+    name: "laguna_routed_nvfp4_swiglu_qmv_bf16_v2"
+        + lagunaNVFP4LowScalePipelineSuffix,
     inputNames: ["input", "fused_weight", "fused_scales", "indices"],
     outputNames: ["activated"],
     source: """
@@ -6765,7 +6814,8 @@ private let lagunaRoutedSwiGLUQMVKernel = MLXFast.metalKernel(
 /// one output row rather than two. Two simdgroups per 64-thread group and 256
 /// tiles cover all 512 expert rows exactly once.
 private let lagunaRoutedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_rows1_bf16_v1",
+    name: "laguna_routed_nvfp4_swiglu_qmv_rows1_bf16_v1"
+        + lagunaNVFP4LowScalePipelineSuffix,
     inputNames: ["input", "fused_weight", "fused_scales", "indices"],
     outputNames: ["activated"],
     source: """
@@ -6913,7 +6963,8 @@ func lagunaRoutedSwiGLUQMV(
 /// identical dequant/accumulate/SwiGLU chain — only scale address computation
 /// differs.
 private let lagunaRoutedSwiGLUQMVPackedKernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_bf16_v1",
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_bf16_v1"
+        + lagunaNVFP4LowScalePipelineSuffix,
     inputNames: ["input", "fused_weight", "packed_scales", "indices"],
     outputNames: ["activated"],
     source: """
@@ -7190,7 +7241,8 @@ private let lagunaRouterTop8PrecomputedPrelude = """
     """
 
 private let lagunaRoutedSwiGLUQMVPackedTop8Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_bf16_v1",
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_bf16_v1"
+        + lagunaNVFP4LowScalePipelineSuffix,
     inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
     outputNames: ["activated"],
     source: lagunaRoutedSwiGLUQMVPackedSelectedSource(
@@ -7213,7 +7265,8 @@ let lagunaRoutedGateUpR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1"] != "0"
 
 private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v1",
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v1"
+        + lagunaNVFP4LowScalePipelineSuffix,
     inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
     outputNames: ["activated"],
     source: """
@@ -7309,6 +7362,10 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
     packedScales: MLXArray,
     routerKeys: MLXArray
 ) -> MLXArray {
+    lagunaTrace(
+        lagunaDecodeNVFP4LowScaleEnabled
+            ? "sparse nvfp4 low-scale branch"
+            : "sparse nvfp4 branch-free scale")
     precondition(input.dtype == .bfloat16)
     precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
     precondition(fusedWeight.dtype == .uint32)
@@ -7341,7 +7398,8 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
 }
 
 private let lagunaRoutedDownReduceKernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_down_reduce_bf16_v1",
+    name: "laguna_routed_nvfp4_down_reduce_bf16_v1"
+        + lagunaNVFP4LowScalePipelineSuffix,
     inputNames: [
         "activated", "down_weight", "down_scales", "indices", "router_weights",
     ],
@@ -7494,9 +7552,10 @@ let lagunaSharedFirstDownOrderEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_FIRST_DOWN"] == "1"
 
 private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
-    name: lagunaSharedFirstDownOrderEnabled
+    name: (lagunaSharedFirstDownOrderEnabled
         ? "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v4sf"
-        : "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v4",
+        : "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v4")
+        + lagunaNVFP4LowScalePipelineSuffix,
     inputNames: lagunaSharedFirstDownOrderEnabled
         ? [
             "shared_activated", "shared_down_weight", "shared_down_scales",
@@ -10123,6 +10182,7 @@ final class LagunaRuntimeDecoderLayer: Module {
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
+        precomputedInputNorm: MLXArray? = nil,
         qkRoPEAngles: MLXArray? = nil,
         qkRoPEOffsets: MLXArray? = nil
     ) -> MLXArray {
@@ -10131,6 +10191,7 @@ final class LagunaRuntimeDecoderLayer: Module {
             inputNorm: inputLayerNorm,
             mask: mask,
             cache: cache,
+            precomputedInputNorm: precomputedInputNorm,
             qkRoPEAngles: qkRoPEAngles,
             qkRoPEOffsets: qkRoPEOffsets
         )
@@ -10254,6 +10315,13 @@ final class LagunaRuntimeDecoderLayer: Module {
 
 // MARK: - Model
 
+struct LagunaDecodeEmbeddingRoPEAtlasOutputs {
+    let hidden: MLXArray
+    let normalized: MLXArray?
+    let fullAngles: MLXArray
+    let slidingAngles: MLXArray
+}
+
 /// Single-token embedding gather plus position-atlas row selection. The
 /// embedding row is copied as BF16 bits; the angle rows are copied as FP32
 /// bits. The stock embedding and the two stock probe RoPE calls produce the
@@ -10308,7 +10376,7 @@ private func lagunaDecodeEmbeddingRoPEAtlas(
     fullAtlas: MLXArray,
     slidingAtlas: MLXArray,
     position: Int
-) -> (hidden: MLXArray, fullAngles: MLXArray, slidingAngles: MLXArray)? {
+) -> LagunaDecodeEmbeddingRoPEAtlasOutputs? {
     guard tokens.dtype == .int32,
         tokens.shape == [1, 1],
         embeddingWeight.dtype == .bfloat16,
@@ -10347,7 +10415,129 @@ private func lagunaDecodeEmbeddingRoPEAtlas(
         outputDTypes: [.bfloat16, .float32, .float32]
     )
     lagunaTrace("decode embedding+rope atlas")
-    return (outputs[0], outputs[1], outputs[2])
+    return LagunaDecodeEmbeddingRoPEAtlasOutputs(
+        hidden: outputs[0], normalized: nil,
+        fullAngles: outputs[1], slidingAngles: outputs[2])
+}
+
+/// Singleton embedding + atlas carrier with the first decoder RMSNorm folded
+/// into the same 512-thread launch. Its RMS half deliberately mirrors
+/// `rms_single_row<bfloat16_t, 4>`: four contiguous values per thread, the
+/// same per-thread accumulation order, the same 16-SIMD reduction tree,
+/// precise rsqrt, BF16 normalization boundary, BF16 weight multiply, and
+/// final BF16 store. The embedding row is read once; its untouched BF16 bits
+/// are also written to `hidden` for the decoder residual.
+private let lagunaDecodeEmbeddingRoPEAtlasRMSNormKernel = MLXFast.metalKernel(
+    name: "laguna_decode_embedding_rope_atlas_rms_bf16_2048_v1",
+    inputNames: [
+        "tokens", "embedding_weight", "norm_weight", "full_atlas",
+        "sliding_atlas", "atlas_position",
+    ],
+    outputNames: ["hidden", "normalized", "full_angles", "sliding_angles"],
+    source: """
+        constexpr uint hidden_size = 2048;
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint full_width = 64;
+        constexpr uint sliding_width = 128;
+
+        uint lid = thread_position_in_threadgroup.x;
+        uint simd_lane = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint token = uint(tokens[0]);
+        uint position = uint(atlas_position);
+        uint base = lid * n_reads;
+
+        \(lagunaNormInvMeanScratch)
+        threadgroup float local_sums[simd_size];
+
+        const device bfloat* embedding_row =
+            embedding_weight + token * hidden_size;
+        thread float xcache[n_reads];
+        float acc = 0.0f;
+        for (uint i = 0; i < n_reads; ++i) {
+            bfloat value = embedding_row[base + i];
+            hidden[base + i] = value;
+            float xi = float(value);
+            xcache[i] = xi;
+            acc += xi * xi;
+        }
+
+        acc = simd_sum(acc);
+        \(lagunaNormReductionTail2048)
+
+        for (uint i = 0; i < n_reads; ++i) {
+            normalized[base + i] =
+                norm_weight[base + i] *
+                bfloat(xcache[i] * laguna_inv_mean);
+        }
+
+        if (lid < full_width / 4) {
+            const device vec<float, 4>* atlas_vectors =
+                (const device vec<float, 4> *)(
+                    full_atlas + position * full_width);
+            ((device vec<float, 4> *)(full_angles))[lid] =
+                atlas_vectors[lid];
+        }
+        if (lid < sliding_width / 4) {
+            const device vec<float, 4>* atlas_vectors =
+                (const device vec<float, 4> *)(
+                    sliding_atlas + position * sliding_width);
+            ((device vec<float, 4> *)(sliding_angles))[lid] =
+                atlas_vectors[lid];
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+func lagunaDecodeEmbeddingRoPEAtlasRMSNorm(
+    tokens: MLXArray,
+    embeddingWeight: MLXArray,
+    normWeight: MLXArray,
+    fullAtlas: MLXArray,
+    slidingAtlas: MLXArray,
+    position: Int
+) -> LagunaDecodeEmbeddingRoPEAtlasOutputs? {
+    guard tokens.dtype == .int32,
+        tokens.shape == [1, 1],
+        embeddingWeight.dtype == .bfloat16,
+        embeddingWeight.ndim == 2,
+        embeddingWeight.dim(0) > 0,
+        embeddingWeight.dim(1) == LagunaConstants.hiddenSize,
+        normWeight.dtype == .bfloat16,
+        normWeight.shape == [LagunaConstants.hiddenSize],
+        fullAtlas.dtype == .float32,
+        fullAtlas.shape == [
+            1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim / 2,
+        ],
+        slidingAtlas.dtype == .float32,
+        slidingAtlas.shape == [
+            1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim,
+        ],
+        position >= 0, position < lagunaRoPEAngleAtlasLength
+    else {
+        return nil
+    }
+
+    let outputs = lagunaDecodeEmbeddingRoPEAtlasRMSNormKernel(
+        [
+            tokens, embeddingWeight, normWeight, fullAtlas, slidingAtlas,
+            Int32(position),
+        ],
+        grid: (512, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [
+            [1, 1, LagunaConstants.hiddenSize],
+            [1, 1, LagunaConstants.hiddenSize],
+            [1, 1, 1, LagunaConstants.headDim / 2],
+            [1, 1, 1, LagunaConstants.headDim],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16, .float32, .float32]
+    )
+    lagunaTrace("decode embedding+rope atlas+first rmsnorm")
+    return LagunaDecodeEmbeddingRoPEAtlasOutputs(
+        hidden: outputs[0], normalized: outputs[1],
+        fullAngles: outputs[2], slidingAngles: outputs[3])
 }
 
 /// The Laguna text tower: unscaled embedding and 40 decoder layers. The final
@@ -10493,6 +10683,7 @@ final class LagunaRuntimeModelInner: Module {
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         var h: MLXArray
+        var firstLayerNormalized: MLXArray?
         var fullRoPEAngles: MLXArray?
         var slidingRoPEAngles: MLXArray?
         var qkRoPEOffsets: MLXArray?
@@ -10500,14 +10691,27 @@ final class LagunaRuntimeModelInner: Module {
             let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
             let fullAtlas = _fullRoPEAngleAtlas,
             let slidingAtlas = _slidingRoPEAngleAtlas,
-            let atlasOutputs = lagunaDecodeEmbeddingRoPEAtlas(
-                tokens: inputs,
-                embeddingWeight: embedTokens.weight,
-                fullAtlas: fullAtlas,
-                slidingAtlas: slidingAtlas,
-                position: position)
+            let atlasOutputs =
+                lagunaEmbeddingFirstRMSNormEnabled
+                    && layers[0].inputLayerNorm.eps
+                        == Float(LagunaConstants.rmsNormEpsilon)
+                    && layers[0].selfAttn.acceptsEmbeddingFirstRMSNorm
+                ? lagunaDecodeEmbeddingRoPEAtlasRMSNorm(
+                    tokens: inputs,
+                    embeddingWeight: embedTokens.weight,
+                    normWeight: layers[0].inputLayerNorm.weight,
+                    fullAtlas: fullAtlas,
+                    slidingAtlas: slidingAtlas,
+                    position: position)
+                : lagunaDecodeEmbeddingRoPEAtlas(
+                    tokens: inputs,
+                    embeddingWeight: embedTokens.weight,
+                    fullAtlas: fullAtlas,
+                    slidingAtlas: slidingAtlas,
+                    position: position)
         {
             h = atlasOutputs.hidden
+            firstLayerNormalized = atlasOutputs.normalized
             fullRoPEAngles = atlasOutputs.fullAngles
             slidingRoPEAngles = atlasOutputs.slidingAngles
         } else if lagunaRoPEAtlasViewsEnabled,
@@ -10612,6 +10816,7 @@ final class LagunaRuntimeModelInner: Module {
                         h,
                         mask: mask,
                         cache: cache?[i],
+                        precomputedInputNorm: i == 0 ? firstLayerNormalized : nil,
                         qkRoPEAngles: qkRoPEAngles,
                         qkRoPEOffsets: qkRoPEOffsets
                     )
@@ -10624,6 +10829,7 @@ final class LagunaRuntimeModelInner: Module {
                     h,
                     mask: mask,
                     cache: cache?[i],
+                    precomputedInputNorm: i == 0 ? firstLayerNormalized : nil,
                     qkRoPEAngles: qkRoPEAngles,
                     qkRoPEOffsets: qkRoPEOffsets
                 )
