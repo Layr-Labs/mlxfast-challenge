@@ -340,28 +340,7 @@ private func lagunaUseNativeAffineOProj(layer: Int) -> Bool {
         onlyLayer: lagunaNativeAffineOProjOnlyLayer)
 }
 
-/// The same native group-32 affine INT8 side layout applied to the attention
-/// per-head gate projection (`g_proj`), admitted to the accepted quantization
-/// envelope by the g_proj amendment. `g_proj` is a tiny `[heads, 2048]` BF16
-/// read (48/64 rows), but its decode GEMV is one extra dispatch per layer
-/// against the same normalized row the Q/K/V batch already computes, and its
-/// output feeds only the softplus gate — never the KV cache — so requantizing
-/// it perturbs the model strictly less than the already-shipped Q/K/V and
-/// o_proj layouts. Unlike those layouts the gate bank is ALWAYS group-32
-/// affine INT8: the envelope caps `g_proj` there, so the NVFP4 tail window
-/// (`lagunaNativeAffineNVFP4From`) and the measurement-only probe format do
-/// not apply to it. On layers whose QKV bank is itself group-32 INT8 the gate
-/// rows concatenate into that same bank and ride the same dispatch for free;
-/// on the NVFP4 tail layers the gate keeps a separate group-32 INT8 bank and
-/// replaces the BF16 GEMV one dispatch for one dispatch.
-///
-/// Decode only: prefill and every non-`[1, 1, ·]` call keep the BF16
-/// parameter, which stays authoritative and resident. Coverage is prepared
-/// inside `prepareNativeAffineQKVWeight`, so a layer only gets the gate
-/// layout when its QKV layout is also active.
-///
-/// Set `DARKBLOOM_NATIVE_AFFINE_GPROJ=0` (or `..._LAYERS=0`) to fall back to
-/// the exact stock BF16 gate projection inside the same binary.
+/// Accepted group-32 affine INT8 side layout for decode `g_proj`.
 private let lagunaNativeAffineGProjLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_GPROJ"] != "0"
     else { return 0 }
@@ -3801,6 +3780,18 @@ func lagunaGateProductSoftplus(
 
 // MARK: - Gated native-affine INT8 output projection (one dispatch)
 
+/// Remove the dead `+0.0f` seed from the INT8 accumulation loops by peeling
+/// their first product. Setting `DARKBLOOM_SEED_ELIDE_RESIDUAL=0` restores
+/// the promoted source strings for a same-binary fallback.
+let lagunaSeedElideResidualEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SEED_ELIDE_RESIDUAL"] != "0"
+
+private func lagunaSeedElideResidualInit(_ firstTerm: String) -> String {
+    lagunaSeedElideResidualEnabled ? firstTerm : "0.0f"
+}
+
+private let lagunaSeedElideResidualFrom = lagunaSeedElideResidualEnabled ? "1" : "0"
+
 /// Exact per-head softplus gate plus group-32 affine INT8 output GEMV.
 private func lagunaGatedAffineOProjSource(heads: Int, indexed: Bool = false) -> String {
     let metadataPointers = indexed
@@ -3891,8 +3882,8 @@ private func lagunaGatedAffineOProjSource(heads: Int, indexed: Bool = false) -> 
         for (uint row = 0; row < results_per_simdgroup; ++row) {
             const device uint8_t* wl = ws + row * in_vec_size;
             \(metadataLoad)
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
+            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * wl[0]"));
+            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
                 accum += x_thread[i] * wl[i];
             }
             result[row] += scale * accum + sum * bias;
@@ -4748,8 +4739,8 @@ private func lagunaNormAffineQKVBody(
             const device uint8_t* wl = ws + row * axis_size;
             float scale = float(sc[row * in_vec_size_g]);
             float bias = float(bs[row * in_vec_size_g]);
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
+            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * wl[0]"));
+            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
                 accum += x_thread[i] * wl[i];
             }
             result[row] += scale * accum + sum * bias;
@@ -4944,8 +4935,8 @@ private func lagunaNormAffineQKVPrefetchSource(
             x_thread[i] = value;
         }
         for (uint row = 0; row < results_per_simdgroup; ++row) {
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
+            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * pf_w[d][row][0]"));
+            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
                 accum += x_thread[i] * pf_w[d][row][i];
             }
             result[row] += pf_s[d][row] * accum + sum * pf_b[d][row];
@@ -4967,8 +4958,8 @@ private func lagunaNormAffineQKVPrefetchSource(
         for (uint row = 0; row < results_per_simdgroup; ++row) {
             const device uint8_t* wl = ws + row * axis_size;
             \(metadataLoad)
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
+            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * wl[0]"));
+            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
                 accum += x_thread[i] * wl[i];
             }
             result[row] += scale * accum + sum * bias;

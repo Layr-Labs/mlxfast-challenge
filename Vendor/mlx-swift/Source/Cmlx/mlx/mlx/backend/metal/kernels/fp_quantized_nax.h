@@ -1875,7 +1875,9 @@ template <
         xn += BK;
       }
 
+#ifndef DARKBLOOM_SWIGLU_REGLOCAL
       threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif
       const bool fuse_swiglu =
           kernel_N == 1024 && kernel_K == 2048;
       if (fuse_swiglu) {
