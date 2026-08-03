@@ -68,12 +68,7 @@ func lagunaTrace(_ site: @autoclosure () -> String) {
 
 // MARK: - Runtime fusion feature flags
 
-// Each fusion below concatenates the OUTPUT ROWS of same-dtype projections
-// that consume the same input. Per-row gemv/qmv/gather-qmv arithmetic is
-// independent of which rows share a dispatch (every output row keeps its own
-// K-loop and scale application in the original order), so the fused dispatch
-// is bit-exact against the separate dispatches it replaces. The per-head
-// g_proj (N=64) uses a different split-K gemv variant and is never fused.
+// Fusions preserve each output row's K-loop, scaling and rounding order.
 
 /// `DARKBLOOM_FUSED_QKV` (default OFF; set "1" to enable): after checkpoint
 /// load, retain one row-concatenated `[Wq; Wk; Wv]` BF16 weight per attention
@@ -119,19 +114,7 @@ let lagunaFusedRoutedSharedDownResidualEnabled =
 let lagunaFusedRoutedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_SWIGLU_QMV"] != "0"
 
-/// `DARKBLOOM_PACKED_SCALES` (default ON; set "0" to disable): decode-only
-/// scale-interleaved side copy of the fused routed gate/up NVFP4 bank. The
-/// stock `lagunaRoutedSwiGLUQMV` reads codes and E4M3 scales from two separate
-/// tensors (four device streams per simdgroup iteration: gate codes, up
-/// codes, gate scales, up scales). The packed side bank stores only the 32
-/// scale bytes for each row and K block, in the kernel's exact walk order
-/// `[expert][tile 128][k-block 4][row-pair sub 8]`; the resident fused code
-/// bank is reused directly. Load widths, dequant expressions, accumulation
-/// order, and every BF16 boundary are identical to the stock kernel — only
-/// scale address computation changes, so the packed dispatch is bit-exact
-/// (class A).
-/// Memory: +~32 MB resident per sparse layer while enabled (the stock fused
-/// code bank stays resident for prefill and fallback paths).
+/// Decode-only scale-interleaved side bank; values and arithmetic are unchanged.
 let lagunaPackedScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] != "0"
 
@@ -140,6 +123,11 @@ let lagunaPackedScalesEnabled =
 /// The OFF arm restores the promoted selector dependency exactly.
 private let lagunaRouterPrecomputedKeysEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_PRECOMPUTED_KEYS"] != "0"
+
+/// Let the decode packed routed QMV publish the selector outputs it already
+/// derives. Set `DARKBLOOM_PACKED_ROUTER_OUTPUTS=0` for the standalone path.
+private let lagunaPackedRouterOutputsEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_ROUTER_OUTPUTS"] != "0"
 
 /// One-shot stderr visibility for the packed-scales arm: with the flag set,
 /// the arm MUST announce either "active" (bank built / packed dispatch taken)
@@ -168,21 +156,7 @@ let lagunaPackedScalesLog = LagunaPackedScalesLog()
 let lagunaFusedRoutedDownReduceEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_DOWN_REDUCE"] != "0"
 
-/// `DARKBLOOM_FUSED_ROUTED_GATE_UP` (default on; set "0" to disable): after
-/// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
-/// sparse layer's routed experts and serve single-token decode's gate/up from
-/// one gather-QMM dispatch. DECODE-ONLY: the module tree, checkpoint keys,
-/// and every multi-token (prefill) forward stay fully stock -- ablation
-/// showed the fused bank helps decode (~+1.9%) but badly hurts the M=512
-/// sorted gather-GEMM prefill path, so prefill always dispatches the stock
-/// separate banks.
-///
-/// That prefill finding pre-dates RUNSKIP. See
-/// `DARKBLOOM_PREFILL_FUSED_GATE_UP` immediately below for the current,
-/// separately-flagged, post-RUNSKIP re-measurement of the same fusion idea
-/// applied to the sorted prefill path -- this flag and its history are left
-/// as-is (decode-only) rather than folded together, so each can be ablated
-/// independently.
+/// Decode-only row-concatenated routed `[gate; up]` bank; prefill stays separate.
 let lagunaFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_GATE_UP"] != "0"
 
@@ -216,18 +190,11 @@ let lagunaPrefillFusedResidualRMSNormEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_RESIDUAL_RMS"] != "0"
 
 
-/// One output row per simdgroup for the default split routed gate/up decode
-/// QMV. Official submission `b56a6d9` passed all 1,344 exact-token checks:
-/// every row retains its K-block order and 32-lane reduction while the grid
-/// exposes twice as many independent simdgroups to cover memory latency.
-/// Set `DARKBLOOM_QMV_R1=0` to restore the two-row control.
+/// One output row per SIMD group; set `DARKBLOOM_QMV_R1=0` for the R2 control.
 let lagunaSwiGLUQMVRows1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_QMV_R1"] != "0"
 
-/// Shared-expert twin of the accepted routed R1 schedule. The shared branch
-/// is dependency-independent from router top-8 and runs concurrently with it;
-/// one row per SIMD group exposes twice as many weight streams while keeping
-/// each row's four K-block accumulations and reduction tree unchanged.
+/// Shared-expert twin of the exact routed R1 schedule.
 let lagunaSharedSwiGLUQMVRows1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_QMV_R1"] != "0"
 
@@ -244,12 +211,7 @@ let lagunaFusedGatedOutputProjectionEnabled =
 let lagunaFusedQKVProjectionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV_PROJECTION"] != "0"
 
-/// TensorFold-derived within-token batching for the serial decode stream.
-/// A native group-32 affine INT8 side layout packs Q/K/V into one batched
-/// quantized matmul, cutting their weight traffic without speculating future
-/// tokens or changing the KV dependency. Prefill stays on the original BF16
-/// projections. Two ranked chunks proved 28 layers; this final bounded chunk
-/// widens the same layout to all 40 layers.
+/// Decode-only accepted group-32 affine INT8 Q/K/V side layout.
 private let lagunaNativeAffineQKVLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_QKV"] != "0"
     else { return 0 }
@@ -260,22 +222,11 @@ private let lagunaNativeAffineQKVLayerCount: Int = {
 }()
 let lagunaNativeAffineQKVEnabled = lagunaNativeAffineQKVLayerCount > 0
 
-/// Depth-selection mode for both native affine INT8 attention layouts.
-///
-/// **Default (unset or anything but `1`) is the shipped PREFIX predicate**
-/// `layer < count`, so the shipped semantics are byte-for-byte what the ranked
-/// chunks proved. `DARKBLOOM_NATIVE_AFFINE_SUFFIX=1` selects the LAST `count`
-/// layers (`layer >= numHiddenLayers - count`) instead. It exists to measure
-/// whether the quantization perturbation the argmax gate sees depends on the
-/// DEPTH of the quantized site (an early layer's error has 39 more layers of
-/// amplification runway than a late one's) at matched weight-traffic coverage.
+/// Optional suffix selection for affine-layout depth probes.
 private let lagunaNativeAffineSuffixSelection =
     ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_SUFFIX"] == "1"
 
-/// Restricts a native affine layout to exactly one layer index, for
-/// amplification-vs-depth probes. Unset (or out of range) keeps the normal
-/// prefix/suffix coverage. The layer count must still be non-zero, so the
-/// layout is prepared and dispatched exactly as it would be in a ranked run.
+/// Optional one-layer affine-layout probe.
 private func lagunaNativeAffineOnlyLayer(_ key: String) -> Int? {
     guard let raw = ProcessInfo.processInfo.environment[key],
         let value = Int(raw),
@@ -309,20 +260,7 @@ private func lagunaUseNativeAffineQKV(layer: Int) -> Bool {
         onlyLayer: lagunaNativeAffineQKVOnlyLayer)
 }
 
-/// The same native group-32 affine INT8 side layout applied to the attention
-/// output projection. `o_proj` is the single largest BF16 decode weight read
-/// left in the attention block — 30 sliding layers at `[2048, 8192]` plus 10
-/// full-attention layers at `[2048, 6144]` is ~1.2 GB of the decode token's
-/// weight traffic — and unlike Q/K/V it is read *after* SDPA, so quantizing it
-/// changes nothing about the KV dependency or the cache contents.
-///
-/// Decode only: prefill and every non-`[1, 1, ·]` call keep the BF16 parameter,
-/// which stays authoritative and resident. The first 16 layers are the
-/// acceptance-band-safe first chunk; later submissions can widen the same
-/// layout the way `DARKBLOOM_NATIVE_AFFINE_QKV_LAYERS` was widened.
-///
-/// Set `DARKBLOOM_NATIVE_AFFINE_OPROJ=0` (or `..._LAYERS=0`) to fall back to
-/// the exact stock gated projection inside the same binary.
+/// Decode-only accepted group-32 affine INT8 attention output layout.
 private let lagunaNativeAffineOProjLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OPROJ"] != "0"
     else { return 0 }
@@ -340,28 +278,7 @@ private func lagunaUseNativeAffineOProj(layer: Int) -> Bool {
         onlyLayer: lagunaNativeAffineOProjOnlyLayer)
 }
 
-/// The same native group-32 affine INT8 side layout applied to the attention
-/// per-head gate projection (`g_proj`), admitted to the accepted quantization
-/// envelope by the g_proj amendment. `g_proj` is a tiny `[heads, 2048]` BF16
-/// read (48/64 rows), but its decode GEMV is one extra dispatch per layer
-/// against the same normalized row the Q/K/V batch already computes, and its
-/// output feeds only the softplus gate — never the KV cache — so requantizing
-/// it perturbs the model strictly less than the already-shipped Q/K/V and
-/// o_proj layouts. Unlike those layouts the gate bank is ALWAYS group-32
-/// affine INT8: the envelope caps `g_proj` there, so the NVFP4 tail window
-/// (`lagunaNativeAffineNVFP4From`) and the measurement-only probe format do
-/// not apply to it. On layers whose QKV bank is itself group-32 INT8 the gate
-/// rows concatenate into that same bank and ride the same dispatch for free;
-/// on the NVFP4 tail layers the gate keeps a separate group-32 INT8 bank and
-/// replaces the BF16 GEMV one dispatch for one dispatch.
-///
-/// Decode only: prefill and every non-`[1, 1, ·]` call keep the BF16
-/// parameter, which stays authoritative and resident. Coverage is prepared
-/// inside `prepareNativeAffineQKVWeight`, so a layer only gets the gate
-/// layout when its QKV layout is also active.
-///
-/// Set `DARKBLOOM_NATIVE_AFFINE_GPROJ=0` (or `..._LAYERS=0`) to fall back to
-/// the exact stock BF16 gate projection inside the same binary.
+/// Decode-only group-32 affine INT8 per-head gate layout.
 private let lagunaNativeAffineGProjLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_GPROJ"] != "0"
     else { return 0 }
@@ -442,7 +359,7 @@ let lagunaFusedSlidingQKNormRoPEEnabled =
 ///
 /// **DEFAULT ON** (`!= "0"`; set `DARKBLOOM_PREFILL_QK_NORM_ROPE=0` to
 /// ablate). Guarded on shape/dtype/family and a host-known cache offset
-/// with `offset + L <= lagunaRoPEAngleAtlasLength`; every other case takes
+/// when the requested positions fit one retained atlas page; other cases take
 /// the verbatim stock path.
 private let lagunaPrefillQKNormRoPEEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_QK_NORM_ROPE"] != "0"
@@ -510,26 +427,7 @@ let lagunaFusedFullQKNormYaRNEnabled =
 let lagunaRoPEAngleAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] != "0"
 
-/// Zero-dispatch decode angle carrier: serve the two per-step RoPE angle rows
-/// as contiguous row VIEWS of the load-time FP32 position atlases instead of
-/// running the two probe RoPE dispatches every token. Unlike the fused
-/// embedding+atlas kernel above (default OFF; its fixed kernel cost measured
-/// −0.23%), this path adds no kernel at all: the atlas row for position `p`
-/// is bit-identical to the probe output at `p` by construction (the atlas IS
-/// the family's own stock RoPE run over the broadcast probe seed), and a
-/// row slice of the contiguous `[1, 1, 4096, D]` atlas is a zero-copy
-/// row-contiguous view, so the two probe dispatches vanish from the front of
-/// every decode step with no replacement work. The stock `embedTokens`
-/// gather is unchanged.
-///
-/// MEASURED (2026-08-01, M5 Max 128 GB, driver rig, 150-step cool-floor
-/// ABBA): views are +0.01..+0.07 ms/step vs the probe dispatches — the two
-/// probes are off the critical path (they overlap the embedding gather and
-/// layer-0 front), so removing them buys nothing, and aliasing the ~3 MB
-/// atlas buffers as per-step kernel inputs appears to add slight
-/// resource-tracking cost. Default OFF, same promoted-era conclusion as the
-/// fused embedding+atlas kernel above. Set `DARKBLOOM_ROPE_ATLAS_VIEWS=1`
-/// to re-measure.
+/// Optional zero-dispatch decode views into the load-time RoPE atlases.
 let lagunaRoPEAtlasViewsEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ATLAS_VIEWS"] == "1"
 
@@ -555,31 +453,7 @@ let lagunaFusedDenseGateUpSwiGLUEnabled =
 let lagunaFusedDenseDownResidualEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_DENSE_DOWN_RESIDUAL"] != "0"
 
-/// `DARKBLOOM_ROUTER_ROWS_PER_GROUP` (default `8`; set `64` to restore the
-/// pre-widening shape, `32`/`16` for intermediate points, `4`/`2`/`1` for the
-/// sub-8 shapes): router output rows owned by one threadgroup in
-/// `laguna_residual_rms_router_bf16_2048`.
-///
-/// The router GEMV reads the whole `[256, 2048]` BF16 gate — 1,048,576 B —
-/// once per sparse layer. At `64` (16 simdgroups x 4 rows) the 256 rows need
-/// `256/64 = 4` threadgroups, and it measures 140.2 GB/s against a 575 GB/s
-/// box (`notes/47` §2a): four threadgroups cannot cover the machine's cores.
-/// Each halving doubles the tile count at constant total work, 8 -> 32
-/// threadgroups. `rows_out` stays 256 in every setting, so no wave
-/// quantization hole is created (`notes/50` §6b-§6d).
-///
-/// Bit-exact. `rows_per_group` changes only WHICH THREADGROUP OWNS WHICH ROW.
-/// Every output row keeps its own private FP32 accumulator, its own K-loop
-/// over `router_blocks` in `(block, i)` order, its own `simd_shuffle_down`
-/// ladder, and one BF16 round. No add is regrouped: the reduction tree exists
-/// only at lane level and this knob does not touch it.
-///
-/// SUB-8 IS MEASURED NULL (`notes/exp-rpgrouter.md`, 2026-07-31, 6.15 ms era):
-/// rpg1 vs rpg8 paired A/B mean −5 µs/step (−29.5/−13.5/+25.5/−4.0 µs, inside
-/// the ~18 µs local floor); rpg4/rpg2 single runs +25/+35 µs. Each extra tile
-/// re-runs the barriered 2048-wide norm before its router rows, so below 8 the
-/// redundant norm cancels whatever row-latency overlap the extra threadgroups
-/// buy. Do not re-sweep; the values stay accepted only as ablation controls.
+/// Router rows per threadgroup; 8 is the measured default.
 let lagunaRouterRowsPerGroup: Int = {
     guard
         let raw = ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_ROWS_PER_GROUP"],
@@ -590,12 +464,7 @@ let lagunaRouterRowsPerGroup: Int = {
     return value
 }()
 
-/// `DARKBLOOM_DECODE_ASYNC_STAGE` (default `at:1,7,15,23,31,39`): process-once
-/// boundary schedule for decode-step async scheduling. Active only when the
-/// invocation input shape is exactly `[1, 1]`; prefill and multi-token shapes
-/// are never asyncEval'd. `off`/`0` disables it; `norm` and `logits` remain
-/// process-once ablation points, as does any single layer index `0`-`39`.
-/// No operation, cache row, or token is added.
+/// Decode-only async scheduling controls.
 private enum LagunaDecodeAsyncStage {
     case off
     case layer(Int)
@@ -605,29 +474,7 @@ private enum LagunaDecodeAsyncStage {
     case logits
 }
 
-/// Two schedule families, both special cases of the `at:i,j,k` boundary set:
-/// `ladderN` fires after every `N`th layer, and `at:` names the boundaries
-/// outright. `asyncEval` adds no operation, cache row, dtype boundary or
-/// token — it only enqueues already-constructed work earlier — so every
-/// schedule here is bit-exact and the choice is purely a measurement.
-///
-/// MEASURED, `notes/52` (two Latin squares, 66 runs, 66/66 `passed_correctness`,
-/// steady step 8..128, all contrasts 6/6 paired). `off` is 10.3735 ms and the
-/// previous `ladder8` default 9.4533, so overlap was already worth +9.7%; the
-/// remaining prize is 0.15 ms and this default takes essentially all of it:
-///
-///     ladder8   (5 fires)  1.0000   the promoted default, unswept
-///     ladder6   (6 fires)  1.0064
-///     ladder2  (20 fires)  1.0169
-///     ladder1  (40 fires)  1.0178
-///     at:1,7,15,23,31,39   1.0170   <- six fires, ties forty
-///
-/// `ladderN`'s first fire is at layer `N-1`, so it structurally skips the
-/// widest GPU-idle window in the step: the front. Adding ONE rung at layer 1
-/// to `ladder8`'s own boundaries is worth as much as quadrupling the ladder,
-/// for one extra scheduler round trip instead of thirty-five. The front rung
-/// is worthless alone — a lone fire at layer 1 measures 0.9476, the worst
-/// schedule tested — and only pays once the rest of the step is covered.
+/// Parse a layer, ladder, or explicit boundary schedule without changing ops.
 private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     let raw =
         ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ASYNC_STAGE"]?
@@ -665,24 +512,28 @@ private let lagunaDecodeAsyncStage: LagunaDecodeAsyncStage = {
     }
 }()
 
+/// Process-constant form of the layer-boundary schedule. Decode forwards only
+/// need one mask-and-test instead of rebuilding the same switch/reduce result.
+private let lagunaDecodeAsyncBoundaryMask: UInt64 = {
+    switch lagunaDecodeAsyncStage {
+    case .layer(let index):
+        UInt64(1) << UInt64(index)
+    case .ladder(let step):
+        stride(from: step - 1, to: LagunaConstants.numHiddenLayers, by: step)
+            .reduce(UInt64(0)) { $0 | (UInt64(1) << UInt64($1)) }
+    case .explicit(let mask):
+        mask
+    case .off, .norm, .logits:
+        0
+    }
+}()
+
 /// Diagnostic front-edge rung: enqueue layer 0's already-constructed QKV and
 /// gate projections before the rest of that layer's graph is built.
 private let lagunaAttentionProjectionAsyncEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ATTN_PROJECTION_ASYNC"] != "0"
 
-/// `DARKBLOOM_PREFILL_ASYNC_LADDER` (default `1`; `0`/`off` disables;
-/// `8` restores the prior default): a ranked measurement on the
-/// 1.87782 base scored stride 1 at 1.88526 (+0.40% vs that base, rejected
-/// only because a larger win promoted mid-queue), and the decode-side
-/// ladder sweep showed denser firing pays until graph-build cost
-/// dominates. Stride 1 fires `asyncEval` after every layer:
-/// prefill-side twin of the decode ladder above. Multi-token forwards build
-/// a ~400-op graph with the GPU idle until the final eval; firing `asyncEval`
-/// after every Nth layer streams completed segments exactly as the promoted
-/// decode ladder does. Same exactness ground: no operation, order, cache
-/// write, or token changes — only when already-constructed work is enqueued.
-/// This pays into both score components: the prefill phase itself and the
-/// 512-token seed prefill charged to the decode window.
+/// Prefill async ladder; stride 1 is the measured default.
 private let lagunaPrefillAsyncLadderStride: Int = {
     let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ASYNC_LADDER"]?.lowercased() ?? "1"
     if raw == "off" || raw == "0" || raw.isEmpty { return 0 }
@@ -690,30 +541,27 @@ private let lagunaPrefillAsyncLadderStride: Int = {
     return n
 }()
 
-private let lagunaRoPEAngleAtlasLength = 4096
+// Direct worker forwards bypass LLMModel.prepare, whose standard path evaluates
+// long prompts in bounded chunks. Reproduce that production behavior here.
+// RotatingKVCache can discard rows older than its sliding window only between
+// evaluated updates; one monolithic prompt therefore retains all L rows and
+// makes the sliding layers quadratic. Window-sized chunks bound each steady
+// update to window + chunk - 1 rows. Every supplied token is still processed
+// once in causal order, cache offsets advance normally, intermediate logits
+// are discarded, and only the final chunk's logits are returned.
+private let lagunaPrefillChunkSize = LagunaConstants.slidingWindow
 
-/// The shared 512-thread RMSNorm prologue emitted by three decode kernels.
-///
-/// 512 threads / 16 simdgroups square one 2048-wide row, `simd_sum` inside
-/// each simdgroup, the sixteen partials meet in `local_sums`, and one inverse
-/// RMS comes back out. Gathering those sixteen partials genuinely needs
-/// threadgroup memory -- `simd_shuffle*` reaches only the 32 lanes of the
-/// calling simdgroup, so no shuffle crosses from simdgroup 5 to simdgroup 0.
-///
-/// A `DARKBLOOM_SHUF_NORM_BCAST` / `DARKBLOOM_SHUF_NORM_INIT` pair once made
-/// the two non-gather barriers here optional. Both were measured locally at
-/// -0.70% steady step (6/6 pairs, t=4.77, 95% CI excluding zero) and shipped
-/// as submission `58864bf4`, which the ranked runner **rejected at -0.07%**.
-/// The effect did not exist on the ranked box. Barrier removal has only ever
-/// paid in narrow 32-thread kernels (`9e06de6`, +1.73%), where the rendezvous
-/// is a large fraction of the kernel; in a 512-thread kernel it is free.
-/// Removed rather than left default-OFF so nobody re-derives it.
+// Keep long-context coverage while binding only the position page used by a
+// forward. Pages are independently generated by the same stock RoPE modules.
+private let lagunaRoPEAngleAtlasCoverage = 131_072
+private let lagunaRoPEAngleAtlasPageLength = 4096
+private let lagunaRoPEAngleAtlasPageCount =
+    lagunaRoPEAngleAtlasCoverage / lagunaRoPEAngleAtlasPageLength
+
+/// Shared cross-SIMD RMSNorm scratch; barriers preserve the exact reduction.
 private let lagunaNormInvMeanScratch = "threadgroup float local_inv_mean[1];"
 
-/// Emits the cross-simdgroup half of that prologue, from the sixteen partial
-/// writes through to a `float laguna_inv_mean` the normalize loop consumes.
-/// The emitted text is line for line what the three kernels shipped, plus a
-/// register alias for `local_inv_mean[0]`.
+/// Emit the shared exact cross-SIMD RMSNorm reduction tail.
 private func lagunaNormReductionTail(
     lane: String,
     simdGroup: String,
@@ -740,8 +588,6 @@ private func lagunaNormReductionTail(
         "threadgroup_barrier(mem_flags::mem_threadgroup);",
         "float laguna_inv_mean = local_inv_mean[0];",
     ]
-    // The first line inherits the enclosing literal's indentation, exactly as
-    // the `\(epilogue)` interpolation in the router kernel does.
     return lines.joined(separator: "\n        ")
 }
 
@@ -756,55 +602,11 @@ private let lagunaNormReductionTailQKV = lagunaNormReductionTail(
     lane: "lane", simdGroup: "simd_group",
     denominator: "float(in_vec_size)", epsilon: "norm_eps")
 
-/// Post-attention residual add + RMSNorm with the MoE router's projection
-/// folded in.
-///
-/// Every sparse layer follows this norm with a `[256, 2048]` BF16 GEMV whose
-/// only input is the normalized row, so that GEMV is the very next link in the
-/// dependency chain and nothing can overlap it. Folding it in costs each
-/// threadgroup a redundant 4 KB read of the normalized row it just produced
-/// and removes a kernel from the chain.
-///
-/// Exactness: the router half replicates MLX's gemv for out_vec 256 and in_vec
-/// 2048, which selects BM 4, BN 1, SM 1, SN 32, TM 4, TN 4. Lane `l` covers
-/// columns `4l + 128i`, products accumulate in `i` then `tn` order in FP32,
-/// and the simdgroup reduces with the same `simd_shuffle_down` ladder before
-/// one BF16 round. The norm half is untouched.
-///
-/// `rowsPerGroup` (see `DARKBLOOM_ROUTER_ROWS_PER_GROUP`) chooses only WHICH
-/// THREADGROUP OWNS WHICH ROW. 256 divides evenly by 64/32/16/8, every row
-/// keeps its own private accumulator and its own `(block, i)` K-loop, and no
-/// add is regrouped. **At `rowsPerGroup == 64` this emits the pre-widening
-/// kernel** — no guard, no unroll, the same four-element initializer, and
-/// `tile * rows_per_group` is the literal 64 the old
-/// `tile * (simd_size * rows_per_thread / 2)` folded to. That is what makes
-/// `DARKBLOOM_ROUTER_ROWS_PER_GROUP=64` a null by construction and therefore a
-/// usable control (`notes/50` §7e).
-///
-/// Below 16 rows per group there are fewer rows than simdgroups, so
-/// `rows_per_thread` bottoms out at 1 and the surplus simdgroups sit out the
-/// router phase behind `active_simd_groups`. They still run the norm, which
-/// needs all 512 threads, and the guard opens *after* the norm's
-/// `threadgroup_barrier` and closes *after* the logit write, so no thread is
-/// skipped past a barrier and no row goes unwritten.
-///
-/// At `rows_per_thread == 1` the block loop is also unrolled four deep. This
-/// is the load-level-parallelism half of `notes/50` §6b-ter: `tiles *
-/// rows_per_group == 256` at every tiling, so retiling alone cannot add a
-/// single outstanding load and leaves in-flight bytes pinned at 64 KB — which
-/// is the whole of the measured 140 GB/s. Hoisting four blocks' weight loads
-/// takes that to 256 KB.
-///
-/// **LOADS ONLY.** `router_result[0]` stays a single accumulator stepped in
-/// strict `(block, i)` order: block 0's four products, then block 1's, and so
-/// on into the same register. Giving each unrolled step its own partial and
-/// summing the four at the end would regroup 64 sequential FP32 adds into a
-/// tree — bit-exactness lost, every local check still green, the hidden
-/// exact-token gate failed. `router_blocks == 16` and `16 % 4 == 0`, so there
-/// is no tail. The `normalized_row` coefficients are read inline rather than
-/// staged: at one row per thread both cost `n_reads` threadgroup reads per
-/// block, so staging would buy nothing and cost 16 registers per unroll step.
-private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
+/// Fused residual, RMSNorm and router projection. Retiling changes ownership
+/// only; each row retains its stock FP32 product/reduction order and BF16 cast.
+private func lagunaResidualRMSNormRouterSource(
+    rowsPerGroup: Int, packedRouterOutputs: Bool
+) -> String {
     let simdGroups = 512 / 32
     let rowsPerThread = rowsPerGroup >= simdGroups ? rowsPerGroup / simdGroups : 1
     let activeSimdGroups = rowsPerGroup / rowsPerThread
@@ -812,6 +614,8 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
     let guardOpen = activeSimdGroups < simdGroups
         ? "        if (simd_group < active_simd_groups) {\n" : ""
     let guardClose = activeSimdGroups < simdGroups ? "        }\n" : ""
+    let routerScoreStore = packedRouterOutputs
+        ? "router_keys[256 + router_row + r] = as_type<uint>(score);" : ""
     let routerStore = lagunaRouterPrecomputedKeysEnabled
         ? """
                 bfloat logit = bfloat(router_result[r]);
@@ -821,6 +625,7 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
                 float score = x < 0.0f ? y : 1.0f - y;
                 router_keys[router_row + r] = laguna_router_key_ordinal(
                     -(score + float(correction_bias[router_row + r])));
+                \(routerScoreStore)
         """
         : "router_logits[router_row + r] = bfloat(router_result[r]);"
 
@@ -943,27 +748,41 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
 /// rule). MLX keys its JIT library cache by name and clears it when a name's
 /// source changes (`custom_kernel.cpp:58-68`), so the variant MUST be in the
 /// name or four sources would thrash one cache entry.
-private let lagunaResidualRMSNormRouterKernels: [Int: MLXFast.MLXFastKernel] =
+private func makeLagunaResidualRMSNormRouterKernels(
+    packedRouterOutputs: Bool
+) -> [Int: MLXFast.MLXFastKernel] {
     Dictionary(
         uniqueKeysWithValues: [1, 2, 4, 8, 16, 32, 64].map { rowsPerGroup in
             (
                 rowsPerGroup,
                 MLXFast.metalKernel(
                     name: "laguna_residual_rms_router_bf16_2048_rpg\(rowsPerGroup)_"
-                        + (lagunaRouterPrecomputedKeysEnabled ? "keys_v1" : "v2"),
+                        + (lagunaRouterPrecomputedKeysEnabled
+                            ? (packedRouterOutputs ? "keys_scores_v1" : "keys_v1")
+                            : "v2"),
                     inputNames: lagunaRouterPrecomputedKeysEnabled
                         ? ["residual", "branch", "weight", "router_weight", "correction_bias"]
                         : ["residual", "branch", "weight", "router_weight"],
                     outputNames: lagunaRouterPrecomputedKeysEnabled
                         ? ["summed", "normalized", "router_logits", "router_keys"]
                         : ["summed", "normalized", "router_logits"],
-                    source: lagunaResidualRMSNormRouterSource(rowsPerGroup: rowsPerGroup),
+                    source: lagunaResidualRMSNormRouterSource(
+                        rowsPerGroup: rowsPerGroup,
+                        packedRouterOutputs: packedRouterOutputs),
                     header: lagunaRouterPrecomputedKeysEnabled
                         ? lagunaDecodeRouterOrdinalHeader : "",
                     ensureRowContiguous: true
                 )
             )
         })
+}
+
+private let lagunaResidualRMSNormRouterKernels =
+    makeLagunaResidualRMSNormRouterKernels(packedRouterOutputs: false)
+private let lagunaResidualRMSNormRouterPackedOutputKernels =
+    lagunaRouterPrecomputedKeysEnabled
+    ? makeLagunaResidualRMSNormRouterKernels(packedRouterOutputs: true)
+    : lagunaResidualRMSNormRouterKernels
 
 /// Residual add + RMSNorm for the layers whose MLP is not a sparse block
 /// (layer 0) and for any shape the router fusion above declines.
@@ -1009,7 +828,8 @@ private let lagunaResidualRMSNormKernel = MLXFast.metalKernel(
 
 func lagunaResidualRMSNormRouter(
     residual: MLXArray, branch: MLXArray, weight: MLXArray,
-    routerWeight: MLXArray, correctionBias: MLXArray
+    routerWeight: MLXArray, correctionBias: MLXArray,
+    packedRouterOutputs: Bool = true
 ) -> (summed: MLXArray, normalized: MLXArray, routerLogits: MLXArray,
     routerKeys: MLXArray?) {
     let hidden = LagunaConstants.hiddenSize
@@ -1038,12 +858,20 @@ func lagunaResidualRMSNormRouter(
     let inputs = lagunaRouterPrecomputedKeysEnabled
         ? [residual, branch, weight, routerWeight, correctionBias]
         : [residual, branch, weight, routerWeight]
-    let outputs = lagunaResidualRMSNormRouterKernels[rowsPerGroup]!(
+    let usePackedRouterOutputs =
+        packedRouterOutputs
+        && lagunaPackedRouterOutputsEnabled
+        && lagunaRouterPrecomputedKeysEnabled
+    let kernels = usePackedRouterOutputs
+        ? lagunaResidualRMSNormRouterPackedOutputKernels
+        : lagunaResidualRMSNormRouterKernels
+    let outputs = kernels[rowsPerGroup]!(
         inputs,
         grid: (tiles * 512, 1, 1),
         threadGroup: (512, 1, 1),
         outputShapes: [[1, 1, hidden], [1, 1, hidden], [1, 1, experts]]
-            + (lagunaRouterPrecomputedKeysEnabled ? [[1, 1, experts]] : []),
+            + (lagunaRouterPrecomputedKeysEnabled
+                ? [[1, 1, usePackedRouterOutputs ? 2 * experts : experts]] : []),
         outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
             + (lagunaRouterPrecomputedKeysEnabled ? [.uint32] : [])
     )
@@ -1776,6 +1604,31 @@ private var lagunaRingIdxAtlas: [MLXArray] { LagunaRingIdxAtlasStore.entries }
 let lagunaParamsAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PARAMS_ATLAS"] != "0"
 
+private let lagunaSharedFullAttnParamsEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_FULL_ATTN_PARAMS"] != "0"
+
+/// One carrier per serial forward: the first full-attention layer creates the
+/// exact cache tuple and the remaining nine layers reuse it without a global
+/// dictionary, synchronous materialization, or additional MLXArray literals.
+final class LagunaFullAttentionParameterPool {
+    private var writeIdx: Int?
+    private var capacity: Int?
+    private var params: MLXArray?
+
+    func get(writeIdx: Int, capacity: Int) -> MLXArray {
+        if self.writeIdx == writeIdx, self.capacity == capacity, let params {
+            return params
+        }
+        let params = MLXArray([
+            UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
+        ])
+        self.writeIdx = writeIdx
+        self.capacity = capacity
+        self.params = params
+        return params
+    }
+}
+
 /// `DARKBLOOM_FUSED_FULL_ATTN` (default on; set "0" to disable): decode
 /// fused attention for the ten full-attention layers once the cache backing
 /// has spare capacity (from the second decode step on; the first step's
@@ -2224,7 +2077,8 @@ func lagunaFullFusedAttention(
     cacheKeys: MLXArray,
     cacheValues: MLXArray,
     writeIdx: Int,
-    scale: MLXArray
+    scale: MLXArray,
+    parameterPool: LagunaFullAttentionParameterPool? = nil
 ) -> MLXArray {
     let heads = LagunaConstants.fullAttentionHeads
     let kvHeads = LagunaConstants.numKeyValueHeads
@@ -2248,9 +2102,8 @@ func lagunaFullFusedAttention(
     precondition(scale.dtype == .float32 && scale.size == 1)
 
     lagunaTrace("full fused attention")
-    let params = MLXArray([
-        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
-    ])
+    let params = parameterPool?.get(writeIdx: writeIdx, capacity: capacity)
+        ?? MLXArray([UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity)])
     return lagunaFullFusedAttentionKernel(
         [
             rawQueries, rawKeys, rawValues,
@@ -2714,7 +2567,7 @@ private func lagunaPrefillSlidingQKNormRoPE(
     precondition(keyWeight.shape == [LagunaConstants.headDim])
     precondition(angles.dtype == .float32)
     precondition(
-        angles.shape == [1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim])
+        angles.shape == [1, 1, lagunaRoPEAngleAtlasPageLength, LagunaConstants.headDim])
     precondition(offsets.dtype == .int32 && offsets.size == 1)
     precondition((heads + kvHeads) % 4 == 0)
 
@@ -2759,7 +2612,9 @@ private func lagunaPrefillFullQKNormYaRN(
     precondition(keyWeight.shape == [LagunaConstants.headDim])
     precondition(angles.dtype == .float32)
     precondition(
-        angles.shape == [1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim / 2])
+        angles.shape == [
+            1, 1, lagunaRoPEAngleAtlasPageLength, LagunaConstants.headDim / 2,
+        ])
     precondition(offsets.dtype == .int32 && offsets.size == 1)
     precondition((heads + kvHeads) % 4 == 0)
 
@@ -5436,7 +5291,8 @@ final class LagunaRuntimeAttention: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
         qkRoPEAngles: MLXArray? = nil,
-        qkRoPEOffsets: MLXArray? = nil
+        qkRoPEOffsets: MLXArray? = nil,
+        fullAttentionParameterPool: LagunaFullAttentionParameterPool? = nil
     ) -> MLXArray {
         let (B, L) = (input.dim(0), input.dim(1))
 
@@ -5694,13 +5550,13 @@ final class LagunaRuntimeAttention: Module {
             lagunaPrefillQKNormRoPEEnabled && isSliding &&
             prefillQKNormShapesMatch &&
             nHeads == LagunaConstants.slidingAttentionHeads &&
-            qkRoPEAngles?.shape == [1, 1, lagunaRoPEAngleAtlasLength, headDim]
+            qkRoPEAngles?.shape == [1, 1, lagunaRoPEAngleAtlasPageLength, headDim]
 
         let usePrefillFusedFullQKNormYaRN =
             lagunaPrefillQKNormRoPEEnabled && !isSliding &&
             prefillQKNormShapesMatch &&
             nHeads == LagunaConstants.fullAttentionHeads &&
-            qkRoPEAngles?.shape == [1, 1, lagunaRoPEAngleAtlasLength, headDim / 2]
+            qkRoPEAngles?.shape == [1, 1, lagunaRoPEAngleAtlasPageLength, headDim / 2]
 
         var qkNormRoPEFused = false
         var fusedAttended: MLXArray?
@@ -5752,7 +5608,8 @@ final class LagunaRuntimeAttention: Module {
                 cacheKeys: append.keys,
                 cacheValues: append.values,
                 writeIdx: append.writeIdx,
-                scale: _fusedAttnScale
+                scale: _fusedAttnScale,
+                parameterPool: fullAttentionParameterPool
             )
             simple.fusedAppendAdvance()
             qkNormRoPEFused = true
@@ -7269,6 +7126,34 @@ private let lagunaRouterTop8PrecomputedPrelude = """
         }
     """
 
+/// Expert slot seven performs all eight extraction rounds. Its first R1 row
+/// publishes the complete route with one writer and no extra synchronization.
+private let lagunaRouterTop8OutputPrelude = """
+    thread uint top8_keys[8];
+        for (uint j = 0; j < 8; ++j) {
+            top8_keys[j] = router_keys[lane + 32u * j];
+        }
+        uint top8_mask = 0u;
+        uint top8_winner = 0u;
+        bool publish = tile == 0 && expert_slot == 7 && simd_group == 0;
+        float route_total = 0.0f;
+        for (uint r = 0; r <= expert_slot; ++r) {
+            top8_winner = laguna_router_top8_extract_round(
+                top8_keys, top8_mask, lane);
+            if (publish && lane == 0) {
+                float score = as_type<float>(router_keys[256 + top8_winner]);
+                router_indices[r] = top8_winner;
+                router_scores[r] = score;
+                route_total = score + route_total;
+            }
+        }
+        if (publish && lane == 0) {
+            for (uint r = 0; r < 8; ++r) {
+                router_scores[r] = router_scores[r] / route_total;
+            }
+        }
+    """
+
 private let lagunaRoutedSwiGLUQMVPackedTop8Kernel = MLXFast.metalKernel(
     name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_bf16_v1",
     inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
@@ -7292,11 +7177,8 @@ private let lagunaRoutedSwiGLUQMVPackedTop8Kernel = MLXFast.metalKernel(
 let lagunaRoutedGateUpR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1"] != "0"
 
-private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v1",
-    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
-    outputNames: ["activated"],
-    source: """
+private func lagunaRoutedSwiGLUQMVPackedTop8R1Source(prologue: String) -> String {
+    """
         constexpr uint input_width = 2048;
         constexpr uint output_width = 512;
         constexpr uint block_width = 512;
@@ -7316,7 +7198,7 @@ private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
         uint simd_group = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
         uint logical_row = tile * 2 + simd_group;
-        \(lagunaRouterTop8PrecomputedPrelude)
+        \(prologue)
         uint expert = top8_winner;
 
         const device uint8_t* expert_weight =
@@ -7377,7 +7259,26 @@ private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
             activated[expert_slot * output_width + logical_row] =
                 bfloat(silu * up);
         }
-        """,
+        """
+}
+
+private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v1",
+    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVPackedTop8R1Source(
+        prologue: lagunaRouterTop8PrecomputedPrelude),
+    header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
+        + "\n" + lagunaRouterTop8PrologueHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaRoutedSwiGLUQMVPackedRouterR1Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_router_r1_bf16_v1",
+    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
+    outputNames: ["activated", "router_indices", "router_scores"],
+    source: lagunaRoutedSwiGLUQMVPackedTop8R1Source(
+        prologue: lagunaRouterTop8OutputPrelude),
     header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
         + "\n" + lagunaRouterTop8PrologueHeader,
     ensureRowContiguous: true
@@ -7394,7 +7295,9 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
     precondition(fusedWeight.dtype == .uint32)
     precondition(packedScales.dtype == .uint8)
     precondition(routerKeys.dtype == .uint32)
-    precondition(routerKeys.size == LagunaConstants.numExperts)
+    precondition(
+        routerKeys.size == LagunaConstants.numExperts
+            || routerKeys.size == 2 * LagunaConstants.numExperts)
 
     if lagunaRoutedGateUpR1Enabled {
         return lagunaRoutedSwiGLUQMVPackedTop8R1Kernel(
@@ -7418,6 +7321,37 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
         ]],
         outputDTypes: [.bfloat16]
     )[0]
+}
+
+func lagunaRoutedSwiGLUQMVPackedRouterR1(
+    _ input: MLXArray,
+    fusedWeight: MLXArray,
+    packedScales: MLXArray,
+    routerKeys: MLXArray
+) -> (activated: MLXArray, indices: MLXArray, weights: MLXArray) {
+    precondition(input.dtype == .bfloat16)
+    precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
+    precondition(fusedWeight.dtype == .uint32)
+    precondition(packedScales.dtype == .uint8)
+    precondition(routerKeys.dtype == .uint32)
+    precondition(routerKeys.size == 2 * LagunaConstants.numExperts)
+    precondition(lagunaRoutedGateUpR1Enabled)
+
+    let outputs = lagunaRoutedSwiGLUQMVPackedRouterR1Kernel(
+        [input, fusedWeight, packedScales, routerKeys],
+        grid: (LagunaConstants.numExpertsPerTok * 256 * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [
+            [
+                1, 1, LagunaConstants.numExpertsPerTok, 1,
+                LagunaConstants.moeIntermediateSize,
+            ],
+            [1, 1, LagunaConstants.numExpertsPerTok],
+            [1, 1, LagunaConstants.numExpertsPerTok],
+        ],
+        outputDTypes: [.bfloat16, .uint32, .float32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
 }
 
 private let lagunaRoutedDownReduceKernel = MLXFast.metalKernel(
@@ -9838,21 +9772,81 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        forward(x, residual: nil, routerLogits: nil)
+        forward(
+            x, residual: nil, routerLogits: nil,
+            packedRouterOutputs: false)
     }
 
     func callAsFunction(
         _ x: MLXArray, residual: MLXArray, routerLogits: MLXArray? = nil,
-        routerKeys: MLXArray? = nil
+        routerKeys: MLXArray? = nil, packedRouterOutputs: Bool = true
     ) -> MLXArray {
-        forward(x, residual: residual, routerLogits: routerLogits, routerKeys: routerKeys)
+        forward(
+            x, residual: residual, routerLogits: routerLogits,
+            routerKeys: routerKeys, packedRouterOutputs: packedRouterOutputs)
     }
 
     private func forward(
         _ x: MLXArray, residual: MLXArray?, routerLogits: MLXArray?,
-        routerKeys: MLXArray? = nil
+        routerKeys: MLXArray? = nil, packedRouterOutputs: Bool
     ) -> MLXArray {
-        let (inds, weights) = gate(x, logits: routerLogits)
+        let packedRoute: (
+            activated: MLXArray, indices: MLXArray, weights: MLXArray
+        )?
+        if packedRouterOutputs,
+            lagunaPackedRouterOutputsEnabled,
+            lagunaRouterPrecomputedKeysEnabled,
+            lagunaPackedScalesEnabled,
+            lagunaFusedRoutedSwiGLUQMVEnabled,
+            lagunaRoutedGateUpR1Enabled,
+            lagunaDecodeRouterTop8Enabled,
+            lagunaDecodeRouterCastSinkEnabled,
+            lagunaDecodeRouterNormSinkEnabled,
+            gate.routerLogitSoftcapping == 0,
+            gate.normTopkProb,
+            gate.topK == LagunaConstants.numExpertsPerTok,
+            gate.eScoreCorrectionBias.dtype == .float32,
+            gate.eScoreCorrectionBias.shape == [LagunaConstants.numExperts],
+            x.dtype == .bfloat16,
+            x.shape == [1, 1, LagunaConstants.hiddenSize],
+            let fusedWeight = _fusedRoutedGateUpWeight,
+            fusedWeight.dtype == .uint32,
+            fusedWeight.shape == [
+                LagunaConstants.numExperts,
+                2 * LagunaConstants.moeIntermediateSize,
+                LagunaConstants.hiddenSize / 8,
+            ],
+            let packedBank = _packedRoutedGateUpBank,
+            packedBank.dtype == .uint8,
+            packedBank.shape == [
+                LagunaConstants.numExperts,
+                2 * LagunaConstants.moeIntermediateSize * 4,
+                LagunaConstants.hiddenSize / 64,
+            ],
+            _fusedRoutedGateUpSplit == LagunaConstants.moeIntermediateSize,
+            _fusedRoutedGateUpScales != nil,
+            _routedDownProj != nil,
+            let routerKeys,
+            routerKeys.dtype == .uint32,
+            routerKeys.shape == [1, 1, 2 * LagunaConstants.numExperts]
+        {
+            lagunaTrace("routed gate/up QMV + SwiGLU + router outputs (R1)")
+            packedRoute = lagunaRoutedSwiGLUQMVPackedRouterR1(
+                x,
+                fusedWeight: fusedWeight,
+                packedScales: packedBank,
+                routerKeys: routerKeys)
+        } else {
+            packedRoute = nil
+        }
+        let inds: MLXArray
+        let weights: MLXArray
+        if let packedRoute {
+            inds = packedRoute.indices
+            weights = packedRoute.weights
+        } else {
+            (inds, weights) = gate(x, logits: routerLogits)
+        }
         var y: MLXArray
         var routedAlreadyReduced = false
         var sortedTailInverseOrder: MLXArray?
@@ -9894,10 +9888,13 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 {
                     lagunaPackedScalesLog.note(
                         "active", "routed swiglu qmv packed dispatch")
-                    if lagunaRouterPrecomputedKeysEnabled,
+                    if let packedRoute {
+                        activated = packedRoute.activated
+                    } else if lagunaRouterPrecomputedKeysEnabled,
                         let routerKeys,
                         routerKeys.dtype == .uint32,
-                        routerKeys.size == LagunaConstants.numExperts,
+                        routerKeys.size == LagunaConstants.numExperts
+                            || routerKeys.size == 2 * LagunaConstants.numExperts,
                         gate.topK == LagunaConstants.numExpertsPerTok,
                         gate.routerLogitSoftcapping == 0,
                         gate.eScoreCorrectionBias.size == LagunaConstants.numExperts
@@ -10204,7 +10201,8 @@ final class LagunaRuntimeDecoderLayer: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
         qkRoPEAngles: MLXArray? = nil,
-        qkRoPEOffsets: MLXArray? = nil
+        qkRoPEOffsets: MLXArray? = nil,
+        fullAttentionParameterPool: LagunaFullAttentionParameterPool? = nil
     ) -> MLXArray {
         let r = selfAttn(
             x,
@@ -10212,7 +10210,8 @@ final class LagunaRuntimeDecoderLayer: Module {
             mask: mask,
             cache: cache,
             qkRoPEAngles: qkRoPEAngles,
-            qkRoPEOffsets: qkRoPEOffsets
+            qkRoPEOffsets: qkRoPEOffsets,
+            fullAttentionParameterPool: fullAttentionParameterPool
         )
         let h: MLXArray
         let normalized: MLXArray
@@ -10332,7 +10331,8 @@ final class LagunaRuntimeDecoderLayer: Module {
                     branch: r,
                     weight: postAttentionLayerNorm.weight,
                     routerWeight: sparse.gate.weight,
-                    correctionBias: sparse.gate.eScoreCorrectionBias)
+                    correctionBias: sparse.gate.eScoreCorrectionBias,
+                    packedRouterOutputs: false)
                 h = fused.summed
                 normalizedAfterAttention = fused.normalized
                 routerLogits = fused.routerLogits
@@ -10366,7 +10366,8 @@ final class LagunaRuntimeDecoderLayer: Module {
             {
                 return sparse(
                     normalizedAfterAttention, residual: h,
-                    routerLogits: routerLogits, routerKeys: routerKeys)
+                    routerLogits: routerLogits, routerKeys: routerKeys,
+                    packedRouterOutputs: false)
             }
             if let dense = mlp as? LagunaRuntimeMLP,
                 let fused = dense.fusedDenseDownResidual(
@@ -10451,13 +10452,13 @@ private func lagunaDecodeEmbeddingRoPEAtlas(
         ],
         fullAtlas.dtype == .float32,
         fullAtlas.shape == [
-            1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim / 2,
+            1, 1, lagunaRoPEAngleAtlasPageLength, LagunaConstants.headDim / 2,
         ],
         slidingAtlas.dtype == .float32,
         slidingAtlas.shape == [
-            1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim,
+            1, 1, lagunaRoPEAngleAtlasPageLength, LagunaConstants.headDim,
         ],
-        position >= 0, position < lagunaRoPEAngleAtlasLength
+        position >= 0, position < lagunaRoPEAngleAtlasPageLength
     else {
         return nil
     }
@@ -10498,8 +10499,10 @@ final class LagunaRuntimeModelInner: Module {
     let slidingAttentionIdx: Int
     let _fullRoPEAngleSeed: MLXArray
     let _slidingRoPEAngleSeed: MLXArray
-    var _fullRoPEAngleAtlas: MLXArray?
-    var _slidingRoPEAngleAtlas: MLXArray?
+    var _fullRoPEAnglePages: [MLXArray?] = Array(
+        repeating: nil, count: lagunaRoPEAngleAtlasPageCount)
+    var _slidingRoPEAnglePages: [MLXArray?] = Array(
+        repeating: nil, count: lagunaRoPEAngleAtlasPageCount)
 
     init(_ config: LagunaConfig) {
         precondition(config.vocabSize > 0)
@@ -10550,28 +10553,57 @@ final class LagunaRuntimeModelInner: Module {
         else {
             return []
         }
-        if let fullAtlas = _fullRoPEAngleAtlas,
-            let slidingAtlas = _slidingRoPEAngleAtlas
+        if let full = _fullRoPEAnglePages[0],
+            let sliding = _slidingRoPEAnglePages[0]
         {
-            return [fullAtlas, slidingAtlas]
+            return [full, sliding]
         }
+        return makeRoPEAnglePage(0).map { [$0.full, $0.sliding] } ?? []
+    }
 
+    /// Later pages are input-independent and retained after first use. Page 0
+    /// is evaluated during startup; a long request pays only one stock RoPE
+    /// page graph each time it crosses another 4096-position boundary.
+    private func makeRoPEAnglePage(_ page: Int) -> (
+        full: MLXArray, sliding: MLXArray
+    )? {
+        guard page >= 0, page < lagunaRoPEAngleAtlasPageCount else { return nil }
+        if let full = _fullRoPEAnglePages[page],
+            let sliding = _slidingRoPEAnglePages[page]
+        {
+            return (full, sliding)
+        }
         let fullSeed = broadcast(
             _fullRoPEAngleSeed,
             to: [
-                1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim / 2,
+                1, 1, lagunaRoPEAngleAtlasPageLength, LagunaConstants.headDim / 2,
             ])
         let slidingSeed = broadcast(
             _slidingRoPEAngleSeed,
             to: [
-                1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim,
+                1, 1, lagunaRoPEAngleAtlasPageLength, LagunaConstants.headDim,
             ])
-        let fullAtlas = layers[fullAttentionIdx].selfAttn.rope(fullSeed, offset: 0)
-        let slidingAtlas = layers[slidingAttentionIdx].selfAttn.rope(
-            slidingSeed, offset: 0)
-        _fullRoPEAngleAtlas = fullAtlas
-        _slidingRoPEAngleAtlas = slidingAtlas
-        return [fullAtlas, slidingAtlas]
+        let base = page * lagunaRoPEAngleAtlasPageLength
+        let full = layers[fullAttentionIdx].selfAttn.rope(fullSeed, offset: base)
+        let sliding = layers[slidingAttentionIdx].selfAttn.rope(slidingSeed, offset: base)
+        _fullRoPEAnglePages[page] = full
+        _slidingRoPEAnglePages[page] = sliding
+        return (full, sliding)
+    }
+
+    private func ropeAnglePage(position: Int, length: Int) -> (
+        full: MLXArray, sliding: MLXArray, localOffset: Int
+    )? {
+        guard position >= 0, length > 0,
+            position < lagunaRoPEAngleAtlasCoverage,
+            length <= lagunaRoPEAngleAtlasCoverage - position
+        else { return nil }
+        let page = position / lagunaRoPEAngleAtlasPageLength
+        let localOffset = position % lagunaRoPEAngleAtlasPageLength
+        guard localOffset + length <= lagunaRoPEAngleAtlasPageLength,
+            let arrays = makeRoPEAnglePage(page)
+        else { return nil }
+        return (arrays.full, arrays.sliding, localOffset)
     }
 
     /// Return a host position only for the exact direct-decode cache pair.
@@ -10585,8 +10617,8 @@ final class LagunaRuntimeModelInner: Module {
             lagunaFusedSlidingQKNormRoPEEnabled,
             inputs.dtype == .int32,
             inputs.shape == [1, 1],
-            _fullRoPEAngleAtlas != nil,
-            _slidingRoPEAngleAtlas != nil,
+            _fullRoPEAnglePages[0] != nil,
+            _slidingRoPEAnglePages[0] != nil,
             let cache,
             fullAttentionIdx < cache.count,
             slidingAttentionIdx < cache.count
@@ -10607,7 +10639,7 @@ final class LagunaRuntimeModelInner: Module {
         let slidingPosition = slidingCache.offset
         guard fullPosition == slidingPosition,
             fullPosition >= 0,
-            fullPosition < lagunaRoPEAngleAtlasLength
+            fullPosition < lagunaRoPEAngleAtlasCoverage
         else {
             return nil
         }
@@ -10632,22 +10664,20 @@ final class LagunaRuntimeModelInner: Module {
         var qkRoPEOffsets: MLXArray?
         if lagunaRoPEAngleAtlasEnabled,
             let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
-            let fullAtlas = _fullRoPEAngleAtlas,
-            let slidingAtlas = _slidingRoPEAngleAtlas,
+            let page = ropeAnglePage(position: position, length: 1),
             let atlasOutputs = lagunaDecodeEmbeddingRoPEAtlas(
                 tokens: inputs,
                 embeddingWeight: embedTokens.weight,
-                fullAtlas: fullAtlas,
-                slidingAtlas: slidingAtlas,
-                position: position)
+                fullAtlas: page.full,
+                slidingAtlas: page.sliding,
+                position: page.localOffset)
         {
             h = atlasOutputs.hidden
             fullRoPEAngles = atlasOutputs.fullAngles
             slidingRoPEAngles = atlasOutputs.slidingAngles
         } else if lagunaRoPEAtlasViewsEnabled,
             let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
-            let fullAtlas = _fullRoPEAngleAtlas,
-            let slidingAtlas = _slidingRoPEAngleAtlas
+            let page = ropeAnglePage(position: position, length: 1)
         {
             // Zero-dispatch angle carrier: stock embedding gather plus two
             // zero-copy row views of the load-time atlases. The atlas row at
@@ -10657,8 +10687,9 @@ final class LagunaRuntimeModelInner: Module {
             // atlas is row-contiguous, so the fused QK-norm+RoPE kernels
             // consume it without any copy or added kernel.
             h = embedTokens(inputs)
-            fullRoPEAngles = fullAtlas[0..., 0..., position..<(position + 1), 0...]
-            slidingRoPEAngles = slidingAtlas[0..., 0..., position..<(position + 1), 0...]
+            let local = page.localOffset
+            fullRoPEAngles = page.full[0..., 0..., local..<(local + 1), 0...]
+            slidingRoPEAngles = page.sliding[0..., 0..., local..<(local + 1), 0...]
         } else {
             // Verbatim stock fallback for prefill, unsupported caches and
             // positions outside the precomputed atlas.
@@ -10678,7 +10709,7 @@ final class LagunaRuntimeModelInner: Module {
                     attention: layers[slidingAttentionIdx].selfAttn,
                     cache: cache?[slidingAttentionIdx])
                 : nil
-            // Prefill: hand every layer the family's load-time angle atlas
+            // Prefill: hand every layer the family's matching angle page
             // plus the cache offset the stock `applyRotaryPosition` would
             // have used, so the fused multi-token QK-norm+RoPE kernels read
             // the same cos/sin floats the stock rope dispatches would have
@@ -10686,9 +10717,7 @@ final class LagunaRuntimeModelInner: Module {
             // could not be bounds-checked against the atlas) inside the
             // atlas range; anything else keeps the stock path.
             if lagunaPrefillQKNormRoPEEnabled, !isSingleTokenDecode,
-                h.dim(0) == 1,
-                let fullAtlas = _fullRoPEAngleAtlas,
-                let slidingAtlas = _slidingRoPEAngleAtlas
+                h.dim(0) == 1
             {
                 let length = h.dim(1)
                 let familyCache =
@@ -10696,10 +10725,10 @@ final class LagunaRuntimeModelInner: Module {
                     ? cache?[fullAttentionIdx] : nil
                 if graphOffsetArray(for: familyCache) == nil {
                     let offset = familyCache?.offset ?? 0
-                    if offset >= 0, offset + length <= lagunaRoPEAngleAtlasLength {
-                        fullRoPEAngles = fullAtlas
-                        slidingRoPEAngles = slidingAtlas
-                        qkRoPEOffsets = MLXArray([Int32(offset)])
+                    if let page = ropeAnglePage(position: offset, length: length) {
+                        fullRoPEAngles = page.full
+                        slidingRoPEAngles = page.sliding
+                        qkRoPEOffsets = MLXArray([Int32(page.localOffset)])
                     }
                 }
             }
@@ -10713,20 +10742,11 @@ final class LagunaRuntimeModelInner: Module {
         let slidingMask = createAttentionMask(
             h: h, cache: cache?[slidingAttentionIdx], windowSize: slidingWindow)
 
-        let isSingleTokenDecode = inputs.shape == [1, 1]
-        let decodeFireMask: UInt64 =
-            switch lagunaDecodeAsyncStage {
-            case .off, .norm, .logits:
-                0
-            case .layer(let idx):
-                UInt64(1) << UInt64(idx)
-            case .ladder(let n):
-                (0..<UInt64(layers.count)).reduce(UInt64(0)) { acc, i in
-                    (Int(i) + 1) % n == 0 ? acc | (UInt64(1) << i) : acc
-                }
-            case .explicit(let mask):
-                mask
-            }
+        let isSingleTokenDecode = inputs.ndim == 2 && inputs.dim(0) == 1 && inputs.dim(1) == 1
+        let decodeFireMask = isSingleTokenDecode ? lagunaDecodeAsyncBoundaryMask : 0
+        let fullAttentionParameterPool: LagunaFullAttentionParameterPool? =
+            isSingleTokenDecode && lagunaSharedFullAttnParamsEnabled
+            ? LagunaFullAttentionParameterPool() : nil
 
         // One cos/sin table per attention family per decode step, shared by
         // every layer of that family (their caches advance in lockstep). Each
@@ -10747,7 +10767,8 @@ final class LagunaRuntimeModelInner: Module {
                         mask: mask,
                         cache: cache?[i],
                         qkRoPEAngles: qkRoPEAngles,
-                        qkRoPEOffsets: qkRoPEOffsets
+                        qkRoPEOffsets: qkRoPEOffsets,
+                        fullAttentionParameterPool: fullAttentionParameterPool
                     )
                     if isSingleTokenDecode, (decodeFireMask >> UInt64(i)) & 1 == 1 {
                         asyncEval(h)
@@ -10759,7 +10780,8 @@ final class LagunaRuntimeModelInner: Module {
                     mask: mask,
                     cache: cache?[i],
                     qkRoPEAngles: qkRoPEAngles,
-                    qkRoPEOffsets: qkRoPEOffsets
+                    qkRoPEOffsets: qkRoPEOffsets,
+                    fullAttentionParameterPool: fullAttentionParameterPool
                 )
                 if isSingleTokenDecode, (decodeFireMask >> UInt64(i)) & 1 == 1 {
                     asyncEval(h)
@@ -10824,6 +10846,21 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        // Evaluate bounded slices so rotating caches trim between updates.
+        if let cache,
+            inputs.ndim == 2,
+            inputs.dim(0) == 1,
+            inputs.dim(1) > lagunaPrefillChunkSize
+        {
+            var remaining = inputs
+            while remaining.dim(1) > lagunaPrefillChunkSize {
+                _ = callAsFunction(
+                    remaining[0..., ..<lagunaPrefillChunkSize], cache: cache)
+                eval(cache)
+                remaining = remaining[0..., lagunaPrefillChunkSize...]
+            }
+            return callAsFunction(remaining, cache: cache)
+        }
         let fullHidden = model(inputs, cache: cache)
         // Every consumer of multi-token logits reads only the LAST
         // position's row. Slice before the row-independent final RMSNorm and
