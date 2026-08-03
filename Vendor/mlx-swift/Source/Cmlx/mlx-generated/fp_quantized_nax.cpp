@@ -820,7 +820,9 @@ METAL_FUNC void fp_qmm_t_impl(
   dispatch_bool(aligned_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
       for (int k = 0; k < kernel_K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (fixed_K == 0 || k > 0) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
@@ -859,8 +861,9 @@ METAL_FUNC void fp_qmm_t_impl(
         loader_w.next();
       }
 
-      // Store results to device memory
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (fixed_K == 0) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
 
       if constexpr (kAlignedM.value && kAlignedN.value) {
         Dtile.store(y + tm * kernel_N + tn, kernel_N);

@@ -4545,6 +4545,10 @@ private let lagunaTailNVFP4QMVHeader = """
 private let lagunaDecodeNVFP4QKVR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_NVFP4_QKV_R1"] != "0"
 
+/// DARKBLOOM_QKV_VECX=0 -> scalar stripe loads, byte-identical. bit-exact.
+private let lagunaQKVVecXEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_QKV_VECX"] != "0"
+
 private let lagunaDecodeNVFP4QKVR1Source = """
     constexpr uint axis_size = 2048;
     constexpr uint num_simdgroups = 2;
@@ -4568,9 +4572,19 @@ private let lagunaDecodeNVFP4QKVR1Source = """
 
     uint column = simd_lid * values_per_thread;
     for (uint k = 0; k < axis_size; k += block_size) {
+        \(lagunaQKVVecXEnabled ? """
+        const device vec<bfloat,4>* xv =
+            (const device vec<bfloat,4>*)(normalized + column);
+        for (uint i = 0; i < values_per_thread / 4; ++i) {
+            const vec<bfloat,4> v = xv[i];
+            x_thread[4*i] = v[0]; x_thread[4*i+1] = v[1];
+            x_thread[4*i+2] = v[2]; x_thread[4*i+3] = v[3];
+        }
+        """ : """
         for (uint i = 0; i < values_per_thread; ++i) {
             x_thread[i] = float(normalized[column + i]);
         }
+        """)
         result += laguna_tail_nvfp4_qdot(
             ws, x_thread, laguna_tail_nvfp4_scale(sc[0]));
         ws += block_size / 2;
