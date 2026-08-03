@@ -2018,7 +2018,13 @@ template <
         xn += BK;
       }
 
+      // H21: trailing epilogue barrier only needed for staged SwiGLU reads of
+      // gate_up_stage. Default DARKBLOOM_SWIGLU_REGLOCAL is register-only, and
+      // the next chunk's k-loop opens with its own WAR barrier, so compile the
+      // barrier out under REGLOCAL (metaspartan 762dc99 harvest).
+#ifndef DARKBLOOM_SWIGLU_REGLOCAL
       threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif // DARKBLOOM_SWIGLU_REGLOCAL
       const bool fuse_swiglu =
           kernel_N == 1024 && kernel_K == 2048;
       if (fuse_swiglu) {
@@ -2309,7 +2315,13 @@ template <
       }
 #endif // DARKBLOOM_STAGE2_GATHER
 
+      // H21: trailing epilogue barrier only needed for staged SwiGLU reads of
+      // gate_up_stage. Default DARKBLOOM_SWIGLU_REGLOCAL is register-only, and
+      // the next chunk's k-loop opens with its own WAR barrier, so compile the
+      // barrier out under REGLOCAL (metaspartan 762dc99 harvest).
+#ifndef DARKBLOOM_SWIGLU_REGLOCAL
       threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif // DARKBLOOM_SWIGLU_REGLOCAL
       const bool fuse_swiglu =
           kernel_N == 1024 && kernel_K == 2048;
       if (fuse_swiglu) {
