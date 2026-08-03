@@ -2175,7 +2175,14 @@ template <
       }
 #endif // DARKBLOOM_STAGE2_GATHER
 
+#ifndef DARKBLOOM_SWIGLU_REGLOCAL
+      // Needed only by the staged epilogue arm (its gate_up_stage reads
+      // race the k-loop's last staging otherwise). The register-local arm
+      // reads no threadgroup memory in any epilogue, and the next chunk's
+      // k-loop opens with its own WAR barrier, so under the default this
+      // barrier guards nothing and is compiled away with its arm.
       threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif // DARKBLOOM_SWIGLU_REGLOCAL
       const bool fuse_swiglu =
           kernel_N == 1024 && kernel_K == 2048;
       if (fuse_swiglu) {
