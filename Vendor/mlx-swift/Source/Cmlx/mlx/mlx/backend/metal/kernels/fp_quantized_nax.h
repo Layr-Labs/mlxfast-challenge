@@ -476,66 +476,6 @@ struct QuantizedBlockLoader {
     }
   }
 
-  // DARKBLOOM_STAGE2_GATHER: register-staged twin of load_unsafe(), split in
-  // two so fp_gather_qmm_rhs_expert_nax can issue tile k+1's device fetch
-  // BEFORE the MMAs that consume tile k. fetch_stage2 reads exactly the bytes
-  // stage() reads -- this thread's n_reads packed bytes and its
-  // n_steps_per_read scale bytes -- into thread registers; store_stage2 then
-  // runs the identical decode chain (same expressions, same single rounding
-  // per element, same destination addresses) from those registers. Values and
-  // addresses are unchanged on every path; only WHEN the device reads issue
-  // moves. fp4nv_pack4 has a thread-space overload with identical
-  // little-endian assembly, so the fp4nv fast path stays bit-identical too.
-#ifdef DARKBLOOM_STAGE2_GATHER
-  void fetch_stage2(
-      thread uint8_t (&sb)[kSrcBytes],
-      thread uint8_t (&ss)[n_steps_per_read]) const {
-    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
-      return;
-    }
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < n_steps_per_read; i++) {
-      ss[i] = scales[i];
-    }
-    STEEL_PRAGMA_UNROLL
-    for (short b = 0; b < kSrcBytes; b++) {
-      sb[b] = src[b];
-    }
-  }
-
-  void store_stage2(
-      const thread uint8_t (&sb)[kSrcBytes],
-      const thread uint8_t (&ss)[n_steps_per_read]) const {
-    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
-      return;
-    }
-    if constexpr (fp4nv_fast) {
-      int k = 0;
-      for (int i = 0; i < n_steps_per_read; i++) {
-        const float scale = fp4nv_scale_x16384(ss[i]);
-        for (int j = 0; j < n_reads_per_scale / 4; j++) {
-          T vals[8];
-          fp4nv_decode8<T>(fp4nv_pack4(sb + k), scale, vals);
-          for (int e = 0; e < 8; e++) {
-            dst[k * pack_factor + e] = vals[e];
-          }
-          k += 4;
-        }
-      }
-    } else {
-      int k = 0;
-      for (int i = 0; i < n_steps_per_read; i++) {
-        T scale = dequantize_scale<T, group_size>(ss[i]);
-        for (int j = 0; j < n_reads_per_scale; j++) {
-          dequantize<T, bits>(
-              sb[k * bytes_per_pack], scale, dst + k * pack_factor);
-          k++;
-        }
-      }
-    }
-  }
-#endif // DARKBLOOM_STAGE2_GATHER
-
   void load_safe(short2 src_tile_dim) const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
       return;
@@ -1606,6 +1546,92 @@ METAL_FUNC int laguna_sorted_lower_bound(
 // Per-output arithmetic is unchanged: the same NAX fragment coordinates,
 // K_it/BK/SK traversal, BF16 weight staging boundary and tile_matmad sequence
 // are used. Only the rows grouped into a threadgroup change.
+
+// DARKBLOOM_EXPERT_GATHER_VEC4 support, local to this kernel's two operand
+// reads (not added to the shared NAXTile/NAXFrag_t template in gemm_nax.cpp,
+// so every other dispatch path built from that template -- steel_gemm
+// fused/gather/splitk/segmented, the non-expert qmm templates, plain
+// gather_qmm -- keeps an unchanged JIT source string). Mirrors the
+// file-local pair_vec_aligned pattern in sdpa_vector.h: a small vec4-load
+// eligibility helper scoped to the one kernel that uses it, built entirely
+// from NAXTile/NAXFrag_t's existing public interface (frag_at, get_coord,
+// the kElem*/kFrag* constants) with no changes to that shared template.
+template <typename T>
+struct darkbloom_expert_rebind_vec4 {};
+template <typename T>
+struct darkbloom_expert_rebind_vec4<device T*> {
+  using type = const device metal::vec<remove_cv_t<T>, 4>*;
+};
+template <typename T>
+struct darkbloom_expert_rebind_vec4<threadgroup T*> {
+  using type = const threadgroup metal::vec<remove_cv_t<T>, 4>*;
+};
+template <typename T>
+using darkbloom_expert_rebind_vec4_t =
+    typename darkbloom_expert_rebind_vec4<remove_cv_t<T>>::type;
+
+// Fragment-level vec4 load: NAXFrag_t::load's contiguous (StrY==1) branch,
+// restricted to identical source/destination element types (no
+// per-element cast). See the ALIGNMENT PROOF comment at the call sites.
+template <typename NAXFrag_t, typename T, typename SrcPtrType, typename StrX>
+METAL_FUNC void darkbloom_expert_load_contig_frag(
+    thread typename NAXFrag_t::template dtype_frag_t<T>& dst,
+    SrcPtrType src,
+    StrX str_x,
+    short off_x,
+    short off_y) {
+  static_assert(
+      metal::is_same_v<T, metal::pointer_element_t<SrcPtrType>>,
+      "darkbloom_expert_load_contig_frag requires identical source/"
+      "destination element types (no per-element cast)");
+  const short2 sc = NAXFrag_t::get_coord();
+  src += sc.y * str_x + sc.x;
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < NAXFrag_t::kElemRows; i++) {
+    const auto addr = src + (off_x + i * NAXFrag_t::kElemRowsJump) * str_x + off_y;
+    const auto v =
+        *reinterpret_cast<darkbloom_expert_rebind_vec4_t<SrcPtrType>>(addr);
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < NAXFrag_t::kElemCols; j++) {
+      dst[i * NAXFrag_t::kElemCols + j] = v[j];
+    }
+  }
+}
+
+// Tile-level vec4 load, A-side (device, runtime row stride).
+template <typename TileT, typename U>
+METAL_FUNC void darkbloom_expert_load_contig_a(
+    thread TileT& tile, const device U* src, int ld) {
+  using NAXFrag_t = typename TileT::NAXFrag_t;
+  const_for_loop<0, TileT::kTileRows, 1>([&](auto idx_row) {
+    const_for_loop<0, TileT::kTileCols, 1>([&](auto idx_col) {
+      darkbloom_expert_load_contig_frag<NAXFrag_t, U>(
+          tile.template frag_at<idx_row.value, idx_col.value>(),
+          src,
+          ld,
+          short(idx_row.value * TileT::kFragRows),
+          short(idx_col.value * TileT::kFragCols));
+    });
+  });
+}
+
+// Tile-level vec4 load, B-side (threadgroup, compile-time row stride).
+template <int str_x, typename TileT, typename U>
+METAL_FUNC void darkbloom_expert_load_contig_b(
+    thread TileT& tile, const threadgroup U* src) {
+  using NAXFrag_t = typename TileT::NAXFrag_t;
+  const_for_loop<0, TileT::kTileRows, 1>([&](auto idx_row) {
+    const_for_loop<0, TileT::kTileCols, 1>([&](auto idx_col) {
+      darkbloom_expert_load_contig_frag<NAXFrag_t, U>(
+          tile.template frag_at<idx_row.value, idx_col.value>(),
+          src,
+          Int<str_x>{},
+          short(idx_row.value * TileT::kFragRows),
+          short(idx_col.value * TileT::kFragCols));
+    });
+  });
+}
+
 template <
     typename T,
     int group_size,
@@ -1653,6 +1679,22 @@ template <
   const int kernel_K = fixed_K > 0 ? fixed_K : K;
   const int kernel_N = fixed_N > 0 ? fixed_N : N;
   static_assert(experts % expert_groups == 0);
+#ifdef DARKBLOOM_EXPERT_GATHER_VEC4
+  // Hoisted out of the k/chunk_start/expert_slot/kk1 nest: kernel_K is fixed
+  // for the whole dispatch, and every offset ever added to x before a
+  // load_contig call -- kk1 in {0,32}, (chunk_start+tm)*kernel_K for any
+  // runtime chunk_start/tm -- is a multiple of kernel_K's own alignment
+  // class or of 32, both multiples of four elements once kernel_K is. So the
+  // byte alignment of every candidate address reduces to one check on
+  // kernel_K's parity and x's own base alignment, invariant across every
+  // iteration of every one of those loops; evaluating it per kk1 (as an
+  // earlier draft did) would have re-run a pointer cast and an AND on every
+  // lane, every unrolled kk1 step, every k step, and every chunk/expert_slot
+  // in the hottest loop nest in the kernel, for a value that never changes.
+  // See the ALIGNMENT PROOF comment at the call site for the full argument.
+  const bool darkbloom_vec4_a_ok =
+      ((kernel_K & 3) == 0) && ((reinterpret_cast<uintptr_t>(x) & 7) == 0);
+#endif
 
   using loader_w_t = QuantizedBlockLoader<
       Wtype,
@@ -1669,16 +1711,6 @@ template <
   threadgroup NAXWsChunk16<Wtype>
       Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
   threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
-#ifdef DARKBLOOM_STAGE2_GATHER
-  // Stage-2 double buffering: a second staging region with identical
-  // geometry, ping-ponged with Ws across k-iterations so tile k+1 stages
-  // while the MMAs consume tile k. Doubles staging threadgroup memory
-  // (2 x BN x BK_padded x sizeof(Wtype) = 18,432 B at BN=BK=64/bfloat) --
-  // an occupancy trade, deliberately NOT a tile-geometry change.
-  threadgroup NAXWsChunk16<Wtype>
-      Ws2_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
-  threadgroup Wtype* Ws2 = (threadgroup Wtype*)Ws2_storage;
-#endif
   threadgroup bfloat* gate_up_stage =
       (threadgroup bfloat*)Ws_storage;
 #ifdef DARKBLOOM_BSEARCH_HOIST
@@ -1692,20 +1724,7 @@ template <
   const int K_it = kernel_K / BK;
   const size_t stride_w = size_t(kernel_N) * K_w;
   const size_t stride_s = size_t(kernel_N) * K_g;
-#ifdef DARKBLOOM_GATHER_XMAJOR
-  // DARKBLOOM_GATHER_XMAJOR: one threadgroup owns kFoldCT ADJACENT column
-  // tiles of this expert's output (the dispatch site divides grid.x by the
-  // same value this kernel was compiled with). Takes precedence over
-  // DARKBLOOM_STAGE2_GATHER if both are ever set; the arms are meant to be
-  // exclusive.
-  constexpr int kFoldCT = DARKBLOOM_GATHER_XMAJOR;
-  static_assert(
-      kFoldCT == 2 || kFoldCT == 4 || kFoldCT == 8 || kFoldCT == 16,
-      "DARKBLOOM_GATHER_XMAJOR must be 2, 4, 8, or 16");
-  const int y_col = tid.x * BN * kFoldCT;
-#else
   const int y_col = tid.x * BN;
-#endif
 
   auto wl = (const device uint8_t*)w + size_t(y_col) * K_w;
   const device uint8_t* scale_base =
@@ -1780,214 +1799,11 @@ template <
           min(int(SM), max(0, int(chunk_rows) - int(tm)));
       const bool sg_active = sgp_sm > 0;
 
-#ifdef DARKBLOOM_GATHER_XMAJOR
-      // The stock kernel computes ONE BN-wide column tile per threadgroup,
-      // so the 16 (gate/up) / 32 (down) column-tile threadgroups each
-      // re-stream this expert run's x rows from DRAM -- half the chain's
-      // DRAM bytes at ~625 GB/s (notes/exp-stage2.md section 4.3). Here the
-      // k-loop is OUTER and the column walk INNER: the A fragments for
-      // k-tile k are loaded from device once and reused across all kFoldCT
-      // weight tiles, so x device traffic divides by kFoldCT structurally.
-      // Weight traffic, staging geometry, and barrier count per staged tile
-      // are unchanged.
-      //
-      // EXACTNESS (class A, bit-exact): every output element still belongs
-      // to exactly one (threadgroup, ct) pair and is accumulated by the same
-      // simdgroup in the same order -- k ascending, kk1 ascending, the same
-      // tile_matmad_nax chain into its own dedicated Dtile accumulator --
-      // from the same Atile values (same addresses, same load/load_safe
-      // selection) and the same staged weight values (same loader geometry,
-      // based at column y_col + ct*BN and k-tile k, exactly the pointers a
-      // persistent stock loader holds after k next() calls). Only the
-      // assignment of column tiles to threadgroups and the interleaving
-      // across INDEPENDENT accumulators change; no float operation, no
-      // accumulation order, no rounding boundary moves.
-      NAXTile<float, TM, TN> Dtile[kFoldCT];
-      STEEL_PRAGMA_UNROLL
-      for (int ct = 0; ct < kFoldCT; ++ct) {
-        Dtile[ct].clear();
-      }
-
-      const device T* xn =
-          x + size_t(chunk_start + tm) * kernel_K;
-
-      // Per-k-tile advances of the loader's walk, spelled with the same
-      // expressions QuantizedBlockLoader uses (reduction_dim == 1 here):
-      // tile_stride = BCOLS_PACKED * bytes_per_pack, scales += n_groups.
-      constexpr int kWTileBytes = (BK / pack_factor) * bytes_per_pack;
-      constexpr int kSTileBytes = BK / group_size;
-
-      for (int k = 0; k < K_it; ++k) {
-        NAXTile<T, TM, TK> Atile[BK / SK];
-        if (sg_active) {
-          STEEL_PRAGMA_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            if (sgp_sm == SM) {
-              Atile[kk1 / SK].load(xn + kk1, kernel_K);
-            } else {
-              Atile[kk1 / SK].load_safe(
-                  xn + kk1, kernel_K, short2(SK, sgp_sm));
-            }
-          }
-        }
-
-        // Unrolled so Dtile[ct] indexing stays register-resident.
-        STEEL_PRAGMA_UNROLL
-        for (int ct = 0; ct < kFoldCT; ++ct) {
-          // Fresh loader per (ct, k): the constructor's pointer math plus
-          // these offsets is identical to a persistent per-ct loader after
-          // k next() calls.
-          thread loader_w_t loader_w(
-              wl + size_t(expert) * stride_w +
-                  size_t(ct) * size_t(BN) * K_w +
-                  size_t(k) * kWTileBytes,
-              scale_base + size_t(expert) * stride_s +
-                  size_t(ct) * size_t(BN) * K_g +
-                  size_t(k) * kSTileBytes,
-              kernel_K,
-              Ws,
-              simd_group_id,
-              simd_lane_id);
-
-          // WAR: previous tile's Btile reads retire before restaging.
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          loader_w.load_unsafe();
-          // RAW: staged tile visible to every simdgroup before its MMAs.
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-
-          if (sg_active) {
-            STEEL_PRAGMA_UNROLL
-            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-              NAXTile<Wtype, TN, TK> Btile;
-              Btile.template load<Wtype, BK_padded, 1>(
-                  Ws + tn * BK_padded + kk1);
-
-              tile_matmad_nax(
-                  Dtile[ct],
-                  Atile[kk1 / SK],
-                  metal::bool_constant<false>{},
-                  Btile,
-                  metal::bool_constant<true>{});
-            }
-          }
-        }
-
-        xn += BK;
-      }
-
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      const bool fuse_swiglu =
-          kernel_N == 1024 && kernel_K == 2048;
-      if (fuse_swiglu) {
-#ifdef DARKBLOOM_SWIGLU_REGLOCAL
-        // Register-local swiglu (geometry guard: kSwigluRegLocal above).
-        // EXACTNESS (class A, bit-exact): gate and up are the SAME float
-        // Dtile elements the stock path routes through gate_up_stage, cast
-        // to bfloat by the same static_cast the tile store performs; the
-        // swiglu chain replicates the stock expressions type-for-type in
-        // textual order and writes the same y address. Only the
-        // threadgroup round-trip and its two barriers per ct disappear.
-        // fp contract(off) pins the rounding boundaries: no FMA fusion may
-        // move the chain off the stock scalar sequence.
-        if constexpr (kSwigluRegLocal) {
-#pragma clang fp contract(off)
-          constexpr int activated_cols = BN / 2;
-          const short qid = short(simd_lane_id >> 2);
-          const short fm = (qid & 4) | ((short(simd_lane_id) >> 1) & 3);
-          const short fn = ((qid & 2) | (short(simd_lane_id) & 1)) * 4;
-          STEEL_PRAGMA_UNROLL
-          for (int ct = 0; ct < kFoldCT; ++ct) {
-            STEEL_PRAGMA_UNROLL
-            for (short jf = 0; jf < 2; ++jf) {
-              STEEL_PRAGMA_UNROLL
-              for (short ie = 0; ie < 2; ++ie) {
-                const short row = fm + ie * 8;
-                if (row < sgp_sm) {
-                  STEEL_PRAGMA_UNROLL
-                  for (short jj = 0; jj < 4; ++jj) {
-                    const int col = jf * 16 + fn + jj;
-                    const bfloat gate = static_cast<bfloat>(
-                        Dtile[ct].frag_at(0, jf)[ie * 4 + jj]);
-                    const bfloat up = static_cast<bfloat>(
-                        Dtile[ct].frag_at(0, jf + 2)[ie * 4 + jj]);
-                    const bfloat exp_abs = metal::exp(metal::abs(gate));
-                    const bfloat denominator = bfloat(1) + exp_abs;
-                    const bfloat z = bfloat(1) / denominator;
-                    const bfloat sigmoid =
-                        gate < bfloat(0) ? z : bfloat(1) - z;
-                    const bfloat silu = bfloat(gate * sigmoid);
-                    y[size_t(chunk_start + tm + row) * (kernel_N / 2) +
-                      size_t(tid.x * kFoldCT + ct) * activated_cols + col] =
-                        bfloat(silu * up);
-                  }
-                }
-              }
-            }
-          }
-        }
-        if constexpr (!kSwigluRegLocal) {
-#endif // DARKBLOOM_SWIGLU_REGLOCAL
-        STEEL_PRAGMA_UNROLL
-        for (int ct = 0; ct < kFoldCT; ++ct) {
-          if (sg_active) {
-            Dtile[ct].template store<bfloat, BN, 1>(
-                gate_up_stage + tm * BN + tn);
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          if (sg_active && (simd_group_id % WN) == 0) {
-            constexpr int activated_cols = BN / 2;
-            for (int linear = simd_lane_id;
-                 linear < int(sgp_sm) * activated_cols;
-                 linear += SIMD_SIZE) {
-              const int row = linear / activated_cols;
-              const int col = linear % activated_cols;
-              const bfloat gate =
-                  gate_up_stage[(tm + row) * BN + col];
-              const bfloat up =
-                  gate_up_stage[(tm + row) * BN + activated_cols + col];
-              const bfloat exp_abs = metal::exp(metal::abs(gate));
-              const bfloat denominator = bfloat(1) + exp_abs;
-              const bfloat z = bfloat(1) / denominator;
-              const bfloat sigmoid =
-                  gate < bfloat(0) ? z : bfloat(1) - z;
-              const bfloat silu = bfloat(gate * sigmoid);
-              y[size_t(chunk_start + tm + row) * (kernel_N / 2) +
-                size_t(tid.x * kFoldCT + ct) * activated_cols + col] =
-                  bfloat(silu * up);
-            }
-          }
-          // Retires this ct's swiglu reads of gate_up_stage before the next
-          // ct's Dtile store overwrites it (stock pays the same barrier at
-          // the end of its swiglu).
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-#ifdef DARKBLOOM_SWIGLU_REGLOCAL
-        }
-#endif // DARKBLOOM_SWIGLU_REGLOCAL
-      } else if (sg_active) {
-        STEEL_PRAGMA_UNROLL
-        for (int ct = 0; ct < kFoldCT; ++ct) {
-          device T* yn =
-              y + size_t(chunk_start + tm) * kernel_N + y_col +
-              ct * BN + tn;
-          if (sgp_sm == SM) {
-            Dtile[ct].store(yn, kernel_N);
-          } else {
-            Dtile[ct].store_slice(
-                yn,
-                kernel_N,
-                short2(0, 0),
-                short2(SN, sgp_sm));
-          }
-        }
-      }
-#else
       NAXTile<float, TM, TN> Dtile;
       Dtile.clear();
 
       const device T* xn =
           x + size_t(chunk_start + tm) * kernel_K;
-#ifndef DARKBLOOM_STAGE2_GATHER
       thread loader_w_t loader_w(
           wl + size_t(expert) * stride_w,
           scale_base + size_t(expert) * stride_s,
@@ -2010,12 +1826,77 @@ template <
         // column is 31 < SK), so bytes, addresses, and zero-fills are
         // identical while the row predicate hoists out of the contiguous
         // four-element runs and the Int<1> contiguous branch is restored.
+        //
+        // DARKBLOOM_EXPERT_GATHER_VEC4 widens only those full-row A and
+        // staged-weight B fragment reads: each four-bfloat run becomes one
+        // vec<bfloat, 4> load (8 bytes), with identical bytes, addresses,
+        // element order, and float arithmetic. Original load_contig mechanism
+        // by metaspartan (submissions d3811066, 762dc99); ported here by
+        // Claude Fable 5. Implemented as darkbloom_expert_load_contig_a/_b
+        // above (kernel-local, not a NAXTile/NAXFrag_t member) so only this
+        // kernel's JIT source changes shape.
+        //
+        // ALIGNMENT PROOF. In each fragment, r = off_x + i * 8, where off_x
+        // is a tile-row multiple of 16 and i is 0 or 1; off_y is a tile-column
+        // multiple of kFragCols == 16 (0 or 16 here because TK == 2). Thus
+        // every fragment-local term is a multiple of four elements.
+        //
+        // B side: this kernel's only host instantiation fixes BK=64 and
+        // Wtype=bfloat, so BK_padded = 64 + 16/2 = 72. The static_assert at
+        // the load site keeps that row stride a multiple of four. Therefore
+        // tn * BK_padded and kk1 (0 or 32, SK=32) are also multiples of four.
+        // Ws is 16-byte aligned by its NAXWsChunk16 backing store -- a
+        // compile-time, type-system guarantee, so no runtime check is needed
+        // -- so its absolute four-bfloat runs are always 8-byte aligned.
+        //
+        // A side: kernel_K is 2048 or 512 for every real dispatch of this
+        // kernel (expert_aligned requires laguna_moe_shape), so
+        // (chunk_start+tm)*kernel_K, r*kernel_K, and kk1 are all multiples of
+        // four whenever kernel_K is. But row-stride parity alone does not
+        // prove the ABSOLUTE base address is 8-byte aligned: x may be a
+        // row-contiguous view with a nonzero element offset
+        // (ensure_row_contiguous passes an already-contiguous array through
+        // unchanged, offset included). Rather than reason about x's
+        // provenance, the guard checks the actual runtime pointer directly,
+        // mirroring the proven pair_vec_aligned check in sdpa_vector.h (also
+        // a device-pointer vec4-load eligibility test): (kernel_K & 3) == 0
+        // keeps every row's element offset a multiple of four relative to x,
+        // and reinterpret_cast<uintptr_t>(x) & 7 confirms that base pointer
+        // is itself 8-byte aligned in absolute memory. Together they
+        // guarantee every row of every fragment, at any chunk_start/tm/kk1,
+        // is 8-byte aligned regardless of x's offset or origin -- computed
+        // once as darkbloom_vec4_a_ok above (loop-invariant, see that
+        // comment), not per kk1/lane. If it's false, the scalar load runs
+        // unchanged. The partial-row case remains on load_rows; no tail or
+        // remainder reaches load_contig. At both sites T is bfloat and
+        // equals the source element type; the frag helper's static_assert
+        // makes any future converting use a hard compile error.
+        //
+        // UNIFORMITY. darkbloom_vec4_a_ok depends only on kernel_K (a
+        // kernel-wide constant-buffer value) and x (the raw kernel
+        // parameter) -- never on simd_lane_id or simd_group_id -- so every
+        // lane in every simdgroup evaluates the identical branch; the guard
+        // cannot diverge within a simdgroup. Neither load nor
+        // darkbloom_expert_load_contig_a/_frag contains a
+        // threadgroup_barrier, simdgroup_barrier, or simdgroup-collective
+        // call (simd_shuffle*, tile_matmad*) -- both are pure per-lane loads
+        // from device/threadgroup memory into thread-local registers, so
+        // there is nothing collective for a hypothetical divergence to
+        // corrupt even before considering uniformity.
         NAXTile<T, TM, TK> Atile[BK / SK];
         if (sg_active) {
           STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             if (sgp_sm == SM) {
+#ifdef DARKBLOOM_EXPERT_GATHER_VEC4
+              if (darkbloom_vec4_a_ok) {
+                darkbloom_expert_load_contig_a(Atile[kk1 / SK], xn + kk1, kernel_K);
+              } else {
+                Atile[kk1 / SK].load(xn + kk1, kernel_K);
+              }
+#else
               Atile[kk1 / SK].load(xn + kk1, kernel_K);
+#endif
             } else {
               Atile[kk1 / SK].load_rows(xn + kk1, kernel_K, sgp_sm);
             }
@@ -2050,8 +1931,17 @@ template <
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             NAXTile<Wtype, TN, TK> Btile;
 
+#ifdef DARKBLOOM_EXPERT_GATHER_VEC4
+            static_assert(
+                (BK_padded % 4) == 0,
+                "DARKBLOOM_EXPERT_GATHER_VEC4 requires a 4-element-aligned "
+                "Ws row stride");
+            darkbloom_expert_load_contig_b<BK_padded>(
+                Btile, Ws + tn * BK_padded + kk1);
+#else
             Btile.template load<Wtype, BK_padded, 1>(
                 Ws + tn * BK_padded + kk1);
+#endif
 
             tile_matmad_nax(
                 Dtile,
@@ -2066,113 +1956,6 @@ template <
         xn += BK;
         loader_w.next();
       }
-#else
-      // DARKBLOOM_STAGE2_GATHER: software-pipelined staging. The stock loop
-      // serializes every k-iteration as
-      //     barrier ; stage(k) ; barrier ; mma(k)
-      // so all 8 staging simdgroups idle during mma and the mma simdgroups
-      // idle during staging (at EG256 the mean expert run is ~16 rows, so
-      // usually only 2 of 8 simdgroups have MMA work). Here tile k+1's
-      // device fetch issues BEFORE the MMAs that consume tile k, its
-      // decode+threadgroup-store lands after them, and one joint barrier per
-      // iteration both publishes tile k+1 (RAW) and retires tile k's reads
-      // before that buffer is overwritten by tile k+2 (WAR).
-      //
-      // EXACTNESS (class A): the staged VALUES for every tile are produced
-      // by the identical decode chain from the identical device bytes to the
-      // identical addresses within a buffer (fetch_stage2/store_stage2 are
-      // textual twins of stage() with the source bytes passing through
-      // registers); the MMA consumption order -- k ascending, kk1 ascending,
-      // the same tile_matmad_nax chain into the same Dtile -- and every
-      // output's accumulation order are untouched. Only WHEN loads issue and
-      // WHICH of two identical-layout buffers holds odd tiles change.
-      thread loader_w_t loader_even(
-          wl + size_t(expert) * stride_w,
-          scale_base + size_t(expert) * stride_s,
-          kernel_K,
-          Ws,
-          simd_group_id,
-          simd_lane_id);
-      thread loader_w_t loader_odd(
-          wl + size_t(expert) * stride_w,
-          scale_base + size_t(expert) * stride_s,
-          kernel_K,
-          Ws2,
-          simd_group_id,
-          simd_lane_id);
-      loader_odd.next();
-
-      // WAR: the previous chunk's reads of Ws retire before tile 0
-      // overwrites it (the stock loop pays this same barrier at the top of
-      // its first k-iteration).
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      loader_even.load_unsafe();
-      loader_even.next();
-      loader_even.next();
-      // RAW: tile 0 visible to every simdgroup before its MMAs.
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-
-      for (int k = 0; k < K_it; ++k) {
-        const bool have_next = (k + 1) < K_it;
-        const bool next_odd = ((k + 1) & 1) != 0;
-        uint8_t sb[loader_w_t::kSrcBytes];
-        uint8_t ss[loader_w_t::n_steps_per_read];
-        // Explicit parity branches rather than a loader pointer: with the
-        // static-shape K_it this loop fully unrolls, the parity is a
-        // constant per iteration, and both loaders stay register-resident.
-        if (have_next) {
-          if (next_odd) {
-            loader_odd.fetch_stage2(sb, ss);
-          } else {
-            loader_even.fetch_stage2(sb, ss);
-          }
-        }
-
-        threadgroup Wtype* Wsk = (k & 1) ? Ws2 : Ws;
-        if (sg_active) {
-          STEEL_PRAGMA_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            NAXTile<T, TM, TK> Atile;
-            NAXTile<Wtype, TN, TK> Btile;
-
-            if (sgp_sm == SM) {
-              Atile.load(xn + kk1, kernel_K);
-            } else {
-              Atile.load_safe(
-                  xn + kk1, kernel_K, short2(SK, sgp_sm));
-            }
-            Btile.template load<Wtype, BK_padded, 1>(
-                Wsk + tn * BK_padded + kk1);
-
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile,
-                metal::bool_constant<true>{});
-
-          }
-        }
-
-        if (have_next) {
-          if (next_odd) {
-            loader_odd.store_stage2(sb, ss);
-            loader_odd.next();
-            loader_odd.next();
-          } else {
-            loader_even.store_stage2(sb, ss);
-            loader_even.next();
-            loader_even.next();
-          }
-        }
-
-        xn += BK;
-        // Joint barrier: publishes tile k+1 for the next iteration's MMAs
-        // (RAW) and retires this iteration's reads of tile k before that
-        // buffer is overwritten (WAR).
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-      }
-#endif // DARKBLOOM_STAGE2_GATHER
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
       const bool fuse_swiglu =
@@ -2262,7 +2045,6 @@ template <
               short2(SN, sgp_sm));
         }
       }
-#endif // DARKBLOOM_GATHER_XMAJOR
     }
   }
 }

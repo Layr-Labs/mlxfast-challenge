@@ -1116,73 +1116,15 @@ MTL::ComputePipelineState* get_steel_gemm_segmented_nax_kernel(
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);
 }
 
-// Defined in quantized.cpp; parses DARKBLOOM_GATHER_XMAJOR once per process.
-int darkbloom_gather_xmajor_ct();
-
 // Defined in quantized.cpp; parses DARKBLOOM_SWIGLU_REGLOCAL once per
 // process.
 bool darkbloom_swiglu_reglocal();
 
 bool darkbloom_bsearch_hoist();
 
+bool darkbloom_expert_gather_vec4();
+
 namespace {
-
-// DARKBLOOM_STAGE2_GATHER: double-buffered (stage-2) weight staging in the
-// expert-aligned prefill gather-QMM (fp_gather_qmm_rhs_expert_nax). Injected
-// as a source-level #define at JIT assembly time, exactly like the
-// DARKBLOOM_ATTN_* levers below: resolved once per process, never part of a
-// pipeline specialization key, so exactly one variant is ever compiled per
-// run and A/B arms are separate runs of the same binary with the env var
-// flipped. Default OFF: unset compiles byte-identical stock staging (the
-// guarded blocks preprocess away). Injection is gated on the expert kernel
-// name so every other fp_quantized_nax JIT source stays byte-identical in
-// both arms.
-//
-// The stderr line is the ground-truth trace the STAGE_* levers lacked: those
-// function constants only ever reached the NON-expert fp_gather_qmm_rhs_nax,
-// so flipping them measured their own control. This one fires from the
-// expert kernel's own JIT assembly, so "active" means the dispatched
-// pipeline was built from the stage-2 source.
-const char* darkbloom_stage2_gather_define() {
-  static const char* define = [] {
-    const bool v = env::get_var("DARKBLOOM_STAGE2_GATHER", "") == "1";
-    if (v || env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1") {
-      fprintf(
-          stderr,
-          "mlxfast: fusion %s: stage2_gather (expert gather-QMM JIT source)\n",
-          v ? "active" : "inactive");
-    }
-    return v ? "\n#define DARKBLOOM_STAGE2_GATHER 1\n" : "";
-  }();
-  return define;
-}
-
-// DARKBLOOM_GATHER_XMAJOR: fold adjacent column tiles of the expert-aligned
-// prefill gather-QMM into one threadgroup so the expert run's x fragments
-// are loaded once per k-tile instead of once per column tile (x DRAM
-// traffic divides by the fold). Injected exactly like the stage2 define
-// above: resolved once per process, gated on the expert kernel name, never
-// part of a pipeline specialization key; A/B arms are separate runs. The
-// fold value comes from darkbloom_gather_xmajor_ct() (quantized.cpp), the
-// SAME function the dispatch site uses to divide grid.x, so the compiled
-// kernel and the launch geometry cannot disagree.
-const char* darkbloom_gather_xmajor_define() {
-  static const std::string define = [] {
-    const int ct = darkbloom_gather_xmajor_ct();
-    if (ct > 1 || env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1") {
-      fprintf(
-          stderr,
-          "mlxfast: fusion %s: gatherx "
-          "(expert gather-QMM JIT source, ct=%d)\n",
-          ct > 1 ? "active" : "inactive",
-          ct);
-    }
-    return ct > 1
-        ? "\n#define DARKBLOOM_GATHER_XMAJOR " + std::to_string(ct) + "\n"
-        : std::string();
-  }();
-  return define.c_str();
-}
 
 // DARKBLOOM_SWIGLU_REGLOCAL: register-local swiglu epilogue in the
 // expert-aligned gather-QMM. Injected exactly like the levers above:
@@ -1222,6 +1164,21 @@ const char* darkbloom_bsearch_hoist_define() {
   return define;
 }
 
+const char* darkbloom_expert_gather_vec4_define() {
+  static const char* define = [] {
+    const bool v = darkbloom_expert_gather_vec4();
+    if (!v || env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1") {
+      fprintf(
+          stderr,
+          "mlxfast: fusion %s: expert_gather_vec4 "
+          "(expert gather-QMM JIT source)\n",
+          v ? "active" : "inactive");
+    }
+    return v ? "\n#define DARKBLOOM_EXPERT_GATHER_VEC4 1\n" : "";
+  }();
+  return define;
+}
+
 } // namespace
 
 MTL::ComputePipelineState* get_qmm_nax_kernel(
@@ -1232,21 +1189,13 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
     std::string kernel_source;
+    const bool is_expert = kernel_name.find("_expert_") != std::string::npos;
     concatenate(
         kernel_source,
         metal::utils(),
-        (kernel_name.find("_expert_") != std::string::npos)
-            ? darkbloom_stage2_gather_define()
-            : "",
-        (kernel_name.find("_expert_") != std::string::npos)
-            ? darkbloom_gather_xmajor_define()
-            : "",
-        (kernel_name.find("_expert_") != std::string::npos)
-            ? darkbloom_swiglu_reglocal_define()
-            : "",
-        (kernel_name.find("_expert_") != std::string::npos)
-            ? darkbloom_bsearch_hoist_define()
-            : "",
+        is_expert ? darkbloom_swiglu_reglocal_define() : "",
+        is_expert ? darkbloom_bsearch_hoist_define() : "",
+        is_expert ? darkbloom_expert_gather_vec4_define() : "",
         metal::gemm_nax(),
         metal::quantized_utils(),
         (mode == "affine") ? metal::quantized_nax() : metal::fp_quantized_nax(),

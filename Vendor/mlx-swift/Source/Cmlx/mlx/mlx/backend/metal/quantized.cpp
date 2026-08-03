@@ -1549,32 +1549,6 @@ bool darkbloom_stage_wide_load_ok(
 
 } // namespace
 
-// DARKBLOOM_GATHER_XMAJOR: fold this many ADJACENT BN-wide column tiles of
-// the expert-aligned gather-QMM into one threadgroup, so each threadgroup
-// loads the expert run's x fragments once per k-tile and reuses them across
-// the fold -- x DRAM traffic divides by the fold, weight traffic unchanged
-// (the chains are DRAM-bound with x re-reads ~half the bytes, see
-// notes/exp-stage2.md section 4.3). "1" selects the tuned default fold;
-// explicit 2/4/8/16 override it, anything else is OFF. Parsed once per
-// process. MUST stay in lockstep with the JIT define injected in
-// jit_kernels.cpp (get_qmm_nax_kernel calls this same function): the
-// dispatch divides grid.x by exactly the value the kernel was compiled
-// with.
-int darkbloom_gather_xmajor_ct() {
-  static const int v = [] {
-    const std::string s = env::get_var("DARKBLOOM_GATHER_XMAJOR", "");
-    if (s.empty() || s == "0") {
-      return 0;
-    }
-    if (s == "1") {
-      return 4; // tuned default fold
-    }
-    const int ct = atoi(s.c_str());
-    return (ct == 2 || ct == 4 || ct == 8 || ct == 16) ? ct : 0;
-  }();
-  return v;
-}
-
 // DARKBLOOM_SWIGLU_REGLOCAL: register-local swiglu epilogue in the
 // expert-aligned gather-QMM (fp_gather_qmm_rhs_expert_nax). With the
 // shipped variant-5 tiling (WN=1: one simdgroup owns the full BN=64 column
@@ -1596,6 +1570,12 @@ bool darkbloom_swiglu_reglocal() {
 bool darkbloom_bsearch_hoist() {
   static const bool v =
       env::get_var("DARKBLOOM_BSEARCH_HOIST", "") != "0";
+  return v;
+}
+
+bool darkbloom_expert_gather_vec4() {
+  static const bool v =
+      env::get_var("DARKBLOOM_EXPERT_GATHER_VEC4", "") != "0";
   return v;
 }
 
@@ -1688,64 +1668,6 @@ void gather_qmm_rhs_nax(
   const bool expert_wideld = expert_aligned &&
       darkbloom_expert_stage_wideld() &&
       darkbloom_stage_wide_load_ok(w, transpose, bits, N, K, bn);
-
-  // DARKBLOOM_STAGE2_GATHER ground truth at the DISPATCH site. The define
-  // itself is injected at JIT assembly (jit_kernels.cpp, expert kernels
-  // only); this one-shot line proves a flagged run actually dispatches the
-  // expert-aligned path that define targets -- the exact confound that made
-  // the STAGE_WIDEST/WIDELD arms measure their own control (those function
-  // constants only ever reached the non-expert kernel). "active" requires
-  // BOTH the flag and the expert path; a declining guard prints "inactive".
-  {
-    static const bool stage2_flag =
-        env::get_var("DARKBLOOM_STAGE2_GATHER", "") == "1";
-    static const bool trace_fusion =
-        env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1";
-    if (stage2_flag || trace_fusion) {
-      static std::once_flag stage2_once;
-      std::call_once(stage2_once, [&]() {
-        fprintf(
-            stderr,
-            "mlxfast: fusion %s: stage2_gather "
-            "(dispatch expert=%d egroups=%d N=%d K=%d M=%d)\n",
-            (stage2_flag && expert_aligned) ? "active" : "inactive",
-            int(expert_aligned),
-            egroups,
-            N,
-            K,
-            M);
-      });
-    }
-  }
-
-  // DARKBLOOM_GATHER_XMAJOR ground truth at the DISPATCH site, same
-  // contract as the stage2 line above: "active" requires BOTH the flag and
-  // the expert path (the define is only injected into expert kernels), so a
-  // declining guard prints "inactive" instead of silently measuring the
-  // control.
-  {
-    static const int xmajor_trace_ct = darkbloom_gather_xmajor_ct();
-    static const bool trace_fusion =
-        env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1";
-    if (xmajor_trace_ct > 1 || trace_fusion) {
-      static std::once_flag xmajor_once;
-      std::call_once(xmajor_once, [&]() {
-        fprintf(
-            stderr,
-            "mlxfast: fusion %s: gatherx "
-            "(dispatch expert=%d ct=%d grid_x=%d N=%d K=%d M=%d)\n",
-            (xmajor_trace_ct > 1 && expert_aligned) ? "active" : "inactive",
-            int(expert_aligned),
-            xmajor_trace_ct,
-            (xmajor_trace_ct > 1 && expert_aligned)
-                ? (N / bn) / xmajor_trace_ct
-                : (N + bn - 1) / bn,
-            N,
-            K,
-            M);
-      });
-    }
-  }
 
   // Make the kernel name
   std::string kname;
@@ -1921,13 +1843,8 @@ void gather_qmm_rhs_nax(
   compute_encoder.set_compute_pipeline_state(kernel);
 
   MTL::Size group_dims(32, wn, wm);
-  // DARKBLOOM_GATHER_XMAJOR: the expert kernel was compiled to walk
-  // xmajor_ct adjacent column tiles per threadgroup, so grid.x shrinks by
-  // the same factor. N is certified 1024 or 2048 on the expert path (bn=64),
-  // so the division is always exact.
-  const int xmajor_ct = expert_aligned ? darkbloom_gather_xmajor_ct() : 0;
   MTL::Size grid_dims(
-      xmajor_ct > 1 ? (N / bn) / xmajor_ct : ((N + bn - 1) / bn),
+      (N + bn - 1) / bn,
       expert_aligned ? egroups : (M + bm - 1) / bm,
       1);
 
