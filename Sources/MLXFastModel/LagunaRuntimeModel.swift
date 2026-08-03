@@ -140,6 +140,25 @@ let lagunaPackedScalesEnabled =
 /// The OFF arm restores the promoted selector dependency exactly.
 private let lagunaRouterPrecomputedKeysEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_PRECOMPUTED_KEYS"] != "0"
+/// `DARKBLOOM_ROUTER_LOCAL_LISTS` (default ON; set "0" to disable) moves the
+/// repeated packed-R1 lane-local top-8 scans into the fused router producer.
+/// The format is valid only when exact producer ordinals are enabled and one
+/// producer threadgroup owns a contiguous eight-expert tile. It is also gated
+/// on the packed R1 consumer: without that consumer the producer sort saves no
+/// work, and the exact old R1/non-R1 selector requires original-order keys.
+private let lagunaRouterLocalListsEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_LOCAL_LISTS"] != "0"
+
+/// `DARKBLOOM_ROUTER_QMV_GATE_FOLD` (default ON; set "0" to disable) lets
+/// the packed local-list QMV publish the same normalized top-8 payload that
+/// would otherwise require a separate one-threadgroup gate dispatch.
+private let lagunaRouterQMVGateFoldEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_QMV_GATE_FOLD"] != "0"
+
+private func lagunaRouterLocalListsActive(rowsPerGroup: Int) -> Bool {
+    lagunaRouterLocalListsEnabled && lagunaRouterPrecomputedKeysEnabled
+        && lagunaRoutedGateUpR1Enabled && rowsPerGroup == 8
+}
 
 /// One-shot stderr visibility for the packed-scales arm: with the flag set,
 /// the arm MUST announce either "active" (bank built / packed dispatch taken)
@@ -504,6 +523,15 @@ let lagunaFusedFullQKNormYaRNEnabled =
 let lagunaRoPEAngleAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] != "0"
 
+/// Decode-only experiment: extend the existing embedding + RoPE-atlas
+/// carrier with layer 0's input RMSNorm. The kernel still emits the raw BF16
+/// embedding row because the decoder residual consumes it after attention;
+/// only the otherwise-standalone normalized row is handed to layer 0's
+/// unchanged NVFP4 QKV path. Set the flag to exact `0` for the prior entry
+/// kernel and standalone layer-0 normalization.
+let lagunaEmbeddingFirstRMSNormEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_EMBEDDING_FIRST_RMS"] != "0"
+
 /// Zero-dispatch decode angle carrier: serve the two per-step RoPE angle rows
 /// as contiguous row VIEWS of the load-time FP32 position atlases instead of
 /// running the two probe RoPE dispatches every token. Unlike the fused
@@ -806,8 +834,27 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
     let guardOpen = activeSimdGroups < simdGroups
         ? "        if (simd_group < active_simd_groups) {\n" : ""
     let guardClose = activeSimdGroups < simdGroups ? "        }\n" : ""
-    let routerStore = lagunaRouterPrecomputedKeysEnabled
+    let localLists = lagunaRouterLocalListsActive(rowsPerGroup: rowsPerGroup)
+    let routerScratch = localLists
         ? """
+        threadgroup uint router_tile_ordinals[8];
+        threadgroup uint router_tile_indices[8];
+        """
+        : ""
+    let routerStore: String
+    if localLists {
+        routerStore = """
+                bfloat logit = bfloat(router_result[r]);
+                router_logits[router_row + r] = logit;
+                float x = float(logit);
+                float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+                float score = x < 0.0f ? y : 1.0f - y;
+                router_tile_ordinals[simd_group] = laguna_router_key_ordinal(
+                    -(score + float(correction_bias[router_row + r])));
+                router_tile_indices[simd_group] = router_row + r;
+        """
+    } else if lagunaRouterPrecomputedKeysEnabled {
+        routerStore = """
                 bfloat logit = bfloat(router_result[r]);
                 router_logits[router_row + r] = logit;
                 float x = float(logit);
@@ -816,8 +863,47 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
                 router_keys[router_row + r] = laguna_router_key_ordinal(
                     -(score + float(correction_bias[router_row + r])));
         """
-        : "router_logits[router_row + r] = bfloat(router_result[r]);"
-
+    } else {
+        routerStore = "router_logits[router_row + r] = bfloat(router_result[r]);"
+    }
+    let routerListSort = localLists
+        ? """
+        // All 512 threads cross this barrier. The eight active simdgroups have
+        // now published one exact (ordinal, original-index) pair apiece.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            uint my_ordinal = simd_lane < 8
+                ? router_tile_ordinals[simd_lane] : 0xFFFFFFFFu;
+            uint my_index = simd_lane < 8
+                ? router_tile_indices[simd_lane] : 256u;
+            // 1 + 2 + 3 = six compare-exchange stages for eight elements.
+            for (uint sequence = 2; sequence <= 8; sequence <<= 1) {
+                for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+                    uint other_ordinal =
+                        simd_shuffle_xor(my_ordinal, ushort(stride));
+                    uint other_index =
+                        simd_shuffle_xor(my_index, ushort(stride));
+                    bool is_lower = (simd_lane & stride) == 0;
+                    bool lower_wants_better = (simd_lane & sequence) == 0;
+                    bool want_better = lower_wants_better == is_lower;
+                    bool other_before_my = laguna_router_ordinal_before(
+                        other_ordinal, other_index, my_ordinal, my_index);
+                    bool take_other =
+                        want_better ? other_before_my : !other_before_my;
+                    if (take_other) {
+                        my_ordinal = other_ordinal;
+                        my_index = other_index;
+                    }
+                }
+            }
+            if (simd_lane < 8) {
+                uint list_position = tile * 8 + simd_lane;
+                router_keys[list_position] = my_ordinal;
+                router_sorted_indices[list_position] = my_index;
+            }
+        }
+        """
+        : ""
     let accumulate: String
     if rowsPerThread == 1 {
         accumulate = """
@@ -884,6 +970,7 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
         \(lagunaNormInvMeanScratch)
         threadgroup float local_sums[simd_size];
         threadgroup bfloat normalized_row[axis_size];
+        \(routerScratch)
 
         thread bfloat values[n_reads];
         float acc = 0.0f;
@@ -929,6 +1016,7 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
             }
         }
         \(guardClose)
+        \(routerListSort)
         """
 }
 
@@ -940,16 +1028,21 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
 private let lagunaResidualRMSNormRouterKernels: [Int: MLXFast.MLXFastKernel] =
     Dictionary(
         uniqueKeysWithValues: [1, 2, 4, 8, 16, 32, 64].map { rowsPerGroup in
-            (
+            let localLists = lagunaRouterLocalListsActive(rowsPerGroup: rowsPerGroup)
+            let variant = localLists
+                ? "local_lists_v1"
+                : (lagunaRouterPrecomputedKeysEnabled ? "keys_v1" : "v2")
+            return (
                 rowsPerGroup,
                 MLXFast.metalKernel(
                     name: "laguna_residual_rms_router_bf16_2048_rpg\(rowsPerGroup)_"
-                        + (lagunaRouterPrecomputedKeysEnabled ? "keys_v1" : "v2"),
+                        + variant,
                     inputNames: lagunaRouterPrecomputedKeysEnabled
                         ? ["residual", "branch", "weight", "router_weight", "correction_bias"]
                         : ["residual", "branch", "weight", "router_weight"],
                     outputNames: lagunaRouterPrecomputedKeysEnabled
                         ? ["summed", "normalized", "router_logits", "router_keys"]
+                            + (localLists ? ["router_sorted_indices"] : [])
                         : ["summed", "normalized", "router_logits"],
                     source: lagunaResidualRMSNormRouterSource(rowsPerGroup: rowsPerGroup),
                     header: lagunaRouterPrecomputedKeysEnabled
@@ -1005,7 +1098,7 @@ func lagunaResidualRMSNormRouter(
     residual: MLXArray, branch: MLXArray, weight: MLXArray,
     routerWeight: MLXArray, correctionBias: MLXArray
 ) -> (summed: MLXArray, normalized: MLXArray, routerLogits: MLXArray,
-    routerKeys: MLXArray?) {
+    routerKeys: MLXArray?, routerSortedIndices: MLXArray?) {
     let hidden = LagunaConstants.hiddenSize
     let experts = LagunaConstants.numExperts
     precondition(residual.dtype == .bfloat16)
@@ -1028,6 +1121,7 @@ func lagunaResidualRMSNormRouter(
     // summation and forfeits bit-exactness.
     let rowsPerGroup = lagunaRouterRowsPerGroup
     let tiles = experts / rowsPerGroup
+    let localLists = lagunaRouterLocalListsActive(rowsPerGroup: rowsPerGroup)
     lagunaTrace("residual+rmsnorm+router rpg\(rowsPerGroup)")
     let inputs = lagunaRouterPrecomputedKeysEnabled
         ? [residual, branch, weight, routerWeight, correctionBias]
@@ -1037,11 +1131,17 @@ func lagunaResidualRMSNormRouter(
         grid: (tiles * 512, 1, 1),
         threadGroup: (512, 1, 1),
         outputShapes: [[1, 1, hidden], [1, 1, hidden], [1, 1, experts]]
-            + (lagunaRouterPrecomputedKeysEnabled ? [[1, 1, experts]] : []),
+            + (lagunaRouterPrecomputedKeysEnabled ? [[1, 1, experts]] : [])
+            + (localLists ? [[1, 1, experts]] : []),
         outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
             + (lagunaRouterPrecomputedKeysEnabled ? [.uint32] : [])
+            + (localLists ? [.uint32] : [])
     )
-    return (outputs[0], outputs[1], outputs[2], outputs.count > 3 ? outputs[3] : nil)
+    return (
+        outputs[0], outputs[1], outputs[2],
+        outputs.count > 3 ? outputs[3] : nil,
+        outputs.count > 4 ? outputs[4] : nil
+    )
 }
 
 func lagunaResidualRMSNorm(
@@ -5152,6 +5252,19 @@ final class LagunaRuntimeAttention: Module {
     /// output at `queryDim + 2 * kvDim`.
     var _nativeAffineQKVGateRows = 0
 
+    /// True only for the shipped layer-0 decode bank whose QKV consumer still
+    /// needs a materialized normalized row. The group-32 affine alternative
+    /// already fuses RMSNorm into its projection and must not take the entry
+    /// fusion, or both kernels would repeat the normalization work.
+    var acceptsEmbeddingFirstRMSNorm: Bool {
+        guard layerIdx == 0, lagunaUseNativeAffineQKV(layer: layerIdx),
+            let bank = _nativeAffineQKV
+        else {
+            return false
+        }
+        return bank.mode == .nvfp4 && bank.bits == 4 && bank.groupSize == 16
+    }
+
     func prepareNativeAffineOProjWeight() -> [MLXArray] {
         guard _nativeAffineOProj == nil,
             type(of: wo) == Linear.self,
@@ -5355,10 +5468,21 @@ final class LagunaRuntimeAttention: Module {
         inputNorm: RMSNorm,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
+        precomputedInputNorm: MLXArray? = nil,
         qkRoPEAngles: MLXArray? = nil,
         qkRoPEOffsets: MLXArray? = nil
     ) -> MLXArray {
         let (B, L) = (input.dim(0), input.dim(1))
+        let entryNormalized: MLXArray? = {
+            guard let precomputedInputNorm,
+                B == 1, L == 1,
+                precomputedInputNorm.dtype == .bfloat16,
+                precomputedInputNorm.shape == input.shape
+            else {
+                return nil
+            }
+            return precomputedInputNorm
+        }()
 
         // One dispatch for the input RMSNorm and all three projections when
         // the decode preconditions hold; otherwise normalize separately and
@@ -5422,7 +5546,7 @@ final class LagunaRuntimeAttention: Module {
                 let fusedTailGateLogits: MLXArray? = nil
                 // Only materialized when the fused kernel declined; the gate
                 // branches below that read it are unreachable when it fired.
-                let normalized = fusedQKV ?? inputNorm(input)
+                let normalized = fusedQKV ?? entryNormalized ?? inputNorm(input)
                 let decodeNVFP4QKVR1 =
                     fusedQKV == nil
                     ? lagunaDecodeNVFP4QKVR1(
@@ -5531,7 +5655,7 @@ final class LagunaRuntimeAttention: Module {
         // above (rather than its environment flag) preserves the custom
         // fallback if fused-weight preparation declined.
         let normalizedInput: MLXArray? =
-            fusedNormQKV == nil ? inputNorm(input) : nil
+            fusedNormQKV == nil ? (entryNormalized ?? inputNorm(input)) : nil
 
         var queries: MLXArray
         var keys: MLXArray
@@ -7212,11 +7336,117 @@ private let lagunaRoutedSwiGLUQMVPackedTop8Kernel = MLXFast.metalKernel(
 let lagunaRoutedGateUpR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1"] != "0"
 
-private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v1",
-    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
-    outputNames: ["activated"],
-    source: """
+private let lagunaRouterLocalListMergePrelude = """
+    uint list_cursor = 0u;
+        uint list_position = lane * 8u;
+        uint candidate_ordinal = router_keys[list_position];
+        uint candidate_index = router_sorted_indices[list_position];
+        uint top8_winner = 0u;
+        for (uint r = 0; r <= expert_slot; ++r) {
+            uint best_ordinal = candidate_ordinal;
+            uint best_index = candidate_index;
+            uint best_list = lane;
+            for (ushort offset = 16; offset > 0; offset >>= 1) {
+                uint other_ordinal =
+                    simd_shuffle_xor(best_ordinal, offset);
+                uint other_index = simd_shuffle_xor(best_index, offset);
+                uint other_list = simd_shuffle_xor(best_list, offset);
+                bool other_before = laguna_router_ordinal_before(
+                    other_ordinal, other_index, best_ordinal, best_index);
+                bool same_candidate =
+                    other_ordinal == best_ordinal && other_index == best_index;
+                if (other_before ||
+                    (same_candidate && other_list < best_list)) {
+                    best_ordinal = other_ordinal;
+                    best_index = other_index;
+                    best_list = other_list;
+                }
+            }
+            top8_winner = best_index;
+            // `expert_slot <= 7`; reload only when another round exists, so
+            // even one list winning every round never reads beyond rank 7.
+            if (r < expert_slot && lane == best_list) {
+                ++list_cursor;
+                uint next_position = list_position + list_cursor;
+                candidate_ordinal = router_keys[next_position];
+                candidate_index = router_sorted_indices[next_position];
+            }
+        }
+    """
+
+/// Local-list selector twin that lets one already-scheduled QMV simdgroup
+/// publish the gate payload. All ordinary QMV simdgroups stop after their
+/// requested rank exactly as before. Only group zero's first simdgroup runs
+/// through rank seven, retaining the eight winners in lanes 0...7 and
+/// reproducing the accepted FP32 sigmoid/normalization epilogue.
+private let lagunaRouterLocalListGateFoldPrelude = """
+    uint list_cursor = 0u;
+        uint list_position = lane * 8u;
+        uint candidate_ordinal = router_keys[list_position];
+        uint candidate_index = router_sorted_indices[list_position];
+        uint top8_winner = 0u;
+        uint payload_index = 0u;
+        bool emits_router_payload = group == 0u && simd_group == 0u;
+        uint merge_rounds = emits_router_payload ? 8u : expert_slot + 1u;
+        for (uint r = 0; r < merge_rounds; ++r) {
+            uint best_ordinal = candidate_ordinal;
+            uint best_index = candidate_index;
+            uint best_list = lane;
+            for (ushort offset = 16; offset > 0; offset >>= 1) {
+                uint other_ordinal =
+                    simd_shuffle_xor(best_ordinal, offset);
+                uint other_index = simd_shuffle_xor(best_index, offset);
+                uint other_list = simd_shuffle_xor(best_list, offset);
+                bool other_before = laguna_router_ordinal_before(
+                    other_ordinal, other_index, best_ordinal, best_index);
+                bool same_candidate =
+                    other_ordinal == best_ordinal && other_index == best_index;
+                if (other_before ||
+                    (same_candidate && other_list < best_list)) {
+                    best_ordinal = other_ordinal;
+                    best_index = other_index;
+                    best_list = other_list;
+                }
+            }
+            if (r == expert_slot) {
+                top8_winner = best_index;
+            }
+            if (emits_router_payload && lane == r) {
+                payload_index = best_index;
+            }
+            if (r + 1u < merge_rounds && lane == best_list) {
+                ++list_cursor;
+                uint next_position = list_position + list_cursor;
+                candidate_ordinal = router_keys[next_position];
+                candidate_index = router_sorted_indices[next_position];
+            }
+        }
+        if (emits_router_payload) {
+            float my_score = 0.0f;
+            if (lane < 8u) {
+                float winner_x = float(router_logits[payload_index]);
+                float winner_y =
+                    1.0f / (1.0f + metal::exp(metal::abs(winner_x)));
+                my_score = winner_x < 0.0f ? winner_y : 1.0f - winner_y;
+            }
+            float total = 0.0f;
+            for (uint i = 0; i < 8u; ++i) {
+                total = simd_shuffle(my_score, ushort(i)) + total;
+            }
+            if (lane < 8u) {
+                router_indices[lane] = payload_index;
+                router_scores[lane] = my_score / total;
+            }
+        }
+    """
+
+/// Shared packed-R1 arithmetic body. Selector variants supply only the
+/// prologue that chooses `top8_winner`; every weight/scale address, qdot,
+/// reduction, SwiGLU operation, and BF16 store below is common source.
+private func lagunaRoutedSwiGLUQMVPackedTop8R1Source(
+    prologue: String
+) -> String {
+    """
         constexpr uint input_width = 2048;
         constexpr uint output_width = 512;
         constexpr uint block_width = 512;
@@ -7236,7 +7466,7 @@ private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
         uint simd_group = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
         uint logical_row = tile * 2 + simd_group;
-        \(lagunaRouterTop8PrecomputedPrelude)
+        \(prologue)
         uint expert = top8_winner;
 
         const device uint8_t* expert_weight =
@@ -7297,11 +7527,46 @@ private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
             activated[expert_slot * output_width + logical_row] =
                 bfloat(silu * up);
         }
-        """,
+        """
+}
+
+private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v1",
+    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVPackedTop8R1Source(
+        prologue: lagunaRouterTop8PrecomputedPrelude),
     header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
         + "\n" + lagunaRouterTop8PrologueHeader,
     ensureRowContiguous: true
 )
+
+private let lagunaRoutedSwiGLUQMVPackedLocalListsR1Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_local_lists_r1_bf16_v1",
+    inputNames: [
+        "input", "fused_weight", "packed_scales", "router_keys",
+        "router_sorted_indices",
+    ],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVPackedTop8R1Source(
+        prologue: lagunaRouterLocalListMergePrelude),
+    header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaRoutedSwiGLUQMVPackedLocalListsGateFoldR1Kernel =
+    MLXFast.metalKernel(
+        name: "laguna_routed_nvfp4_swiglu_qmv_packed_local_lists_gate_fold_r1_bf16_v1",
+        inputNames: [
+            "input", "fused_weight", "packed_scales", "router_keys",
+            "router_sorted_indices", "router_logits",
+        ],
+        outputNames: ["activated", "router_indices", "router_scores"],
+        source: lagunaRoutedSwiGLUQMVPackedTop8R1Source(
+            prologue: lagunaRouterLocalListGateFoldPrelude),
+        header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader,
+        ensureRowContiguous: true
+    )
 
 func lagunaRoutedSwiGLUQMVPackedTop8(
     _ input: MLXArray,
@@ -7339,6 +7604,75 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
         outputDTypes: [.bfloat16]
     )[0]
 }
+func lagunaRoutedSwiGLUQMVPackedLocalListsR1(
+    _ input: MLXArray,
+    fusedWeight: MLXArray,
+    packedScales: MLXArray,
+    routerKeys: MLXArray,
+    routerSortedIndices: MLXArray
+) -> MLXArray {
+    precondition(lagunaRouterLocalListsActive(rowsPerGroup: lagunaRouterRowsPerGroup))
+    precondition(input.dtype == .bfloat16)
+    precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
+    precondition(fusedWeight.dtype == .uint32)
+    precondition(packedScales.dtype == .uint8)
+    precondition(routerKeys.dtype == .uint32)
+    precondition(routerKeys.size == LagunaConstants.numExperts)
+    precondition(routerSortedIndices.dtype == .uint32)
+    precondition(routerSortedIndices.size == LagunaConstants.numExperts)
+
+    return lagunaRoutedSwiGLUQMVPackedLocalListsR1Kernel(
+        [input, fusedWeight, packedScales, routerKeys, routerSortedIndices],
+        grid: (LagunaConstants.numExpertsPerTok * 256 * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[
+            1, 1, LagunaConstants.numExpertsPerTok, 1,
+            LagunaConstants.moeIntermediateSize,
+        ]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+func lagunaRoutedSwiGLUQMVPackedLocalListsGateFoldR1(
+    _ input: MLXArray,
+    fusedWeight: MLXArray,
+    packedScales: MLXArray,
+    routerKeys: MLXArray,
+    routerSortedIndices: MLXArray,
+    routerLogits: MLXArray
+) -> (MLXArray, MLXArray, MLXArray) {
+    precondition(lagunaRouterLocalListsActive(rowsPerGroup: lagunaRouterRowsPerGroup))
+    precondition(input.dtype == .bfloat16)
+    precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
+    precondition(fusedWeight.dtype == .uint32)
+    precondition(packedScales.dtype == .uint8)
+    precondition(routerKeys.dtype == .uint32)
+    precondition(routerKeys.size == LagunaConstants.numExperts)
+    precondition(routerSortedIndices.dtype == .uint32)
+    precondition(routerSortedIndices.size == LagunaConstants.numExperts)
+    precondition(routerLogits.dtype == .bfloat16)
+    precondition(routerLogits.size == LagunaConstants.numExperts)
+
+    let outputs = lagunaRoutedSwiGLUQMVPackedLocalListsGateFoldR1Kernel(
+        [
+            input, fusedWeight, packedScales, routerKeys, routerSortedIndices,
+            routerLogits,
+        ],
+        grid: (LagunaConstants.numExpertsPerTok * 256 * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [
+            [
+                1, 1, LagunaConstants.numExpertsPerTok, 1,
+                LagunaConstants.moeIntermediateSize,
+            ],
+            [1, 1, LagunaConstants.numExpertsPerTok],
+            [1, 1, LagunaConstants.numExpertsPerTok],
+        ],
+        outputDTypes: [.bfloat16, .uint32, .float32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 
 private let lagunaRoutedDownReduceKernel = MLXFast.metalKernel(
     name: "laguna_routed_nvfp4_down_reduce_bf16_v1",
@@ -9763,16 +10097,18 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
 
     func callAsFunction(
         _ x: MLXArray, residual: MLXArray, routerLogits: MLXArray? = nil,
-        routerKeys: MLXArray? = nil
+        routerKeys: MLXArray? = nil, routerSortedIndices: MLXArray? = nil
     ) -> MLXArray {
-        forward(x, residual: residual, routerLogits: routerLogits, routerKeys: routerKeys)
+        forward(
+            x, residual: residual, routerLogits: routerLogits,
+            routerKeys: routerKeys, routerSortedIndices: routerSortedIndices)
     }
 
     private func forward(
         _ x: MLXArray, residual: MLXArray?, routerLogits: MLXArray?,
-        routerKeys: MLXArray? = nil
+        routerKeys: MLXArray? = nil, routerSortedIndices: MLXArray? = nil
     ) -> MLXArray {
-        let (inds, weights) = gate(x, logits: routerLogits)
+        var (inds, weights) = gate(x, logits: routerLogits)
         var y: MLXArray
         var routedAlreadyReduced = false
         var sortedTailInverseOrder: MLXArray?
@@ -9814,7 +10150,55 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 {
                     lagunaPackedScalesLog.note(
                         "active", "routed swiglu qmv packed dispatch")
-                    if lagunaRouterPrecomputedKeysEnabled,
+                    if lagunaRouterLocalListsActive(
+                        rowsPerGroup: lagunaRouterRowsPerGroup),
+                        let routerKeys,
+                        let routerSortedIndices,
+                        routerKeys.dtype == .uint32,
+                        routerKeys.size == LagunaConstants.numExperts,
+                        routerSortedIndices.dtype == .uint32,
+                        routerSortedIndices.size == LagunaConstants.numExperts,
+                        gate.topK == LagunaConstants.numExpertsPerTok,
+                        gate.routerLogitSoftcapping == 0,
+                        gate.eScoreCorrectionBias.size == LagunaConstants.numExperts
+                    {
+                        if lagunaRouterQMVGateFoldEnabled,
+                            lagunaDecodeRouterTop8Enabled,
+                            lagunaDecodeRouterCastSinkEnabled,
+                            lagunaDecodeRouterNormSinkEnabled,
+                            gate.normTopkProb,
+                            let routerLogits,
+                            routerLogits.dtype == .bfloat16,
+                            routerLogits.size == LagunaConstants.numExperts
+                        {
+                            lagunaTrace(
+                                "routed gate/up QMV + SwiGLU (packed, local lists + gate fold)")
+                            let folded =
+                                lagunaRoutedSwiGLUQMVPackedLocalListsGateFoldR1(
+                                    x,
+                                    fusedWeight: fusedWeight,
+                                    packedScales: packedBank,
+                                    routerKeys: routerKeys,
+                                    routerSortedIndices: routerSortedIndices,
+                                    routerLogits: routerLogits
+                                )
+                            activated = folded.0
+                            inds = folded.1
+                            weights = folded.2
+                        } else {
+                            lagunaTrace(
+                                "routed gate/up QMV + SwiGLU (packed, local lists)")
+                            activated = lagunaRoutedSwiGLUQMVPackedLocalListsR1(
+                                x,
+                                fusedWeight: fusedWeight,
+                                packedScales: packedBank,
+                                routerKeys: routerKeys,
+                                routerSortedIndices: routerSortedIndices
+                            )
+                        }
+                    } else if lagunaRouterPrecomputedKeysEnabled,
+                        !lagunaRouterLocalListsActive(
+                            rowsPerGroup: lagunaRouterRowsPerGroup),
                         let routerKeys,
                         routerKeys.dtype == .uint32,
                         routerKeys.size == LagunaConstants.numExperts,
@@ -10123,6 +10507,7 @@ final class LagunaRuntimeDecoderLayer: Module {
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
+        precomputedInputNorm: MLXArray? = nil,
         qkRoPEAngles: MLXArray? = nil,
         qkRoPEOffsets: MLXArray? = nil
     ) -> MLXArray {
@@ -10131,6 +10516,7 @@ final class LagunaRuntimeDecoderLayer: Module {
             inputNorm: inputLayerNorm,
             mask: mask,
             cache: cache,
+            precomputedInputNorm: precomputedInputNorm,
             qkRoPEAngles: qkRoPEAngles,
             qkRoPEOffsets: qkRoPEOffsets
         )
@@ -10138,6 +10524,7 @@ final class LagunaRuntimeDecoderLayer: Module {
         let normalized: MLXArray
         var routerLogits: MLXArray?
         var routerKeys: MLXArray?
+        var routerSortedIndices: MLXArray?
         if lagunaFusedResidualRMSNormRouterEnabled,
             x.dtype == .bfloat16, r.dtype == .bfloat16,
             postAttentionLayerNorm.weight.dtype == .bfloat16,
@@ -10158,6 +10545,7 @@ final class LagunaRuntimeDecoderLayer: Module {
             normalized = fused.normalized
             routerLogits = fused.routerLogits
             routerKeys = fused.routerKeys
+            routerSortedIndices = fused.routerSortedIndices
         } else if lagunaFusedResidualRMSNormEnabled,
             x.dtype == .bfloat16, r.dtype == .bfloat16,
             postAttentionLayerNorm.weight.dtype == .bfloat16,
@@ -10210,7 +10598,7 @@ final class LagunaRuntimeDecoderLayer: Module {
         {
             return sparse(
                 normalized, residual: h, routerLogits: routerLogits,
-                routerKeys: routerKeys)
+                routerKeys: routerKeys, routerSortedIndices: routerSortedIndices)
         }
         // Multi-token prefill: hand the residual to the sparse block so the
         // prefill MoE tail kernel can fold the final residual add. When any
@@ -10223,7 +10611,7 @@ final class LagunaRuntimeDecoderLayer: Module {
         {
             return sparse(
                 normalized, residual: h, routerLogits: routerLogits,
-                routerKeys: routerKeys)
+                routerKeys: routerKeys, routerSortedIndices: routerSortedIndices)
         }
         // Layer-0-only decode fusion: the dense MLP has no
         // `LagunaRuntimeSparseMoEBlock` branch above to catch it, so its
@@ -10253,6 +10641,13 @@ final class LagunaRuntimeDecoderLayer: Module {
 }
 
 // MARK: - Model
+
+struct LagunaDecodeEmbeddingRoPEAtlasOutputs {
+    let hidden: MLXArray
+    let normalized: MLXArray?
+    let fullAngles: MLXArray
+    let slidingAngles: MLXArray
+}
 
 /// Single-token embedding gather plus position-atlas row selection. The
 /// embedding row is copied as BF16 bits; the angle rows are copied as FP32
@@ -10308,7 +10703,7 @@ private func lagunaDecodeEmbeddingRoPEAtlas(
     fullAtlas: MLXArray,
     slidingAtlas: MLXArray,
     position: Int
-) -> (hidden: MLXArray, fullAngles: MLXArray, slidingAngles: MLXArray)? {
+) -> LagunaDecodeEmbeddingRoPEAtlasOutputs? {
     guard tokens.dtype == .int32,
         tokens.shape == [1, 1],
         embeddingWeight.dtype == .bfloat16,
@@ -10347,7 +10742,129 @@ private func lagunaDecodeEmbeddingRoPEAtlas(
         outputDTypes: [.bfloat16, .float32, .float32]
     )
     lagunaTrace("decode embedding+rope atlas")
-    return (outputs[0], outputs[1], outputs[2])
+    return LagunaDecodeEmbeddingRoPEAtlasOutputs(
+        hidden: outputs[0], normalized: nil,
+        fullAngles: outputs[1], slidingAngles: outputs[2])
+}
+
+/// Singleton embedding + atlas carrier with the first decoder RMSNorm folded
+/// into the same 512-thread launch. Its RMS half deliberately mirrors
+/// `rms_single_row<bfloat16_t, 4>`: four contiguous values per thread, the
+/// same per-thread accumulation order, the same 16-SIMD reduction tree,
+/// precise rsqrt, BF16 normalization boundary, BF16 weight multiply, and
+/// final BF16 store. The embedding row is read once; its untouched BF16 bits
+/// are also written to `hidden` for the decoder residual.
+private let lagunaDecodeEmbeddingRoPEAtlasRMSNormKernel = MLXFast.metalKernel(
+    name: "laguna_decode_embedding_rope_atlas_rms_bf16_2048_v1",
+    inputNames: [
+        "tokens", "embedding_weight", "norm_weight", "full_atlas",
+        "sliding_atlas", "atlas_position",
+    ],
+    outputNames: ["hidden", "normalized", "full_angles", "sliding_angles"],
+    source: """
+        constexpr uint hidden_size = 2048;
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint full_width = 64;
+        constexpr uint sliding_width = 128;
+
+        uint lid = thread_position_in_threadgroup.x;
+        uint simd_lane = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint token = uint(tokens[0]);
+        uint position = uint(atlas_position);
+        uint base = lid * n_reads;
+
+        \(lagunaNormInvMeanScratch)
+        threadgroup float local_sums[simd_size];
+
+        const device bfloat* embedding_row =
+            embedding_weight + token * hidden_size;
+        thread float xcache[n_reads];
+        float acc = 0.0f;
+        for (uint i = 0; i < n_reads; ++i) {
+            bfloat value = embedding_row[base + i];
+            hidden[base + i] = value;
+            float xi = float(value);
+            xcache[i] = xi;
+            acc += xi * xi;
+        }
+
+        acc = simd_sum(acc);
+        \(lagunaNormReductionTail2048)
+
+        for (uint i = 0; i < n_reads; ++i) {
+            normalized[base + i] =
+                norm_weight[base + i] *
+                bfloat(xcache[i] * laguna_inv_mean);
+        }
+
+        if (lid < full_width / 4) {
+            const device vec<float, 4>* atlas_vectors =
+                (const device vec<float, 4> *)(
+                    full_atlas + position * full_width);
+            ((device vec<float, 4> *)(full_angles))[lid] =
+                atlas_vectors[lid];
+        }
+        if (lid < sliding_width / 4) {
+            const device vec<float, 4>* atlas_vectors =
+                (const device vec<float, 4> *)(
+                    sliding_atlas + position * sliding_width);
+            ((device vec<float, 4> *)(sliding_angles))[lid] =
+                atlas_vectors[lid];
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+func lagunaDecodeEmbeddingRoPEAtlasRMSNorm(
+    tokens: MLXArray,
+    embeddingWeight: MLXArray,
+    normWeight: MLXArray,
+    fullAtlas: MLXArray,
+    slidingAtlas: MLXArray,
+    position: Int
+) -> LagunaDecodeEmbeddingRoPEAtlasOutputs? {
+    guard tokens.dtype == .int32,
+        tokens.shape == [1, 1],
+        embeddingWeight.dtype == .bfloat16,
+        embeddingWeight.ndim == 2,
+        embeddingWeight.dim(0) > 0,
+        embeddingWeight.dim(1) == LagunaConstants.hiddenSize,
+        normWeight.dtype == .bfloat16,
+        normWeight.shape == [LagunaConstants.hiddenSize],
+        fullAtlas.dtype == .float32,
+        fullAtlas.shape == [
+            1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim / 2,
+        ],
+        slidingAtlas.dtype == .float32,
+        slidingAtlas.shape == [
+            1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim,
+        ],
+        position >= 0, position < lagunaRoPEAngleAtlasLength
+    else {
+        return nil
+    }
+
+    let outputs = lagunaDecodeEmbeddingRoPEAtlasRMSNormKernel(
+        [
+            tokens, embeddingWeight, normWeight, fullAtlas, slidingAtlas,
+            Int32(position),
+        ],
+        grid: (512, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [
+            [1, 1, LagunaConstants.hiddenSize],
+            [1, 1, LagunaConstants.hiddenSize],
+            [1, 1, 1, LagunaConstants.headDim / 2],
+            [1, 1, 1, LagunaConstants.headDim],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16, .float32, .float32]
+    )
+    lagunaTrace("decode embedding+rope atlas+first rmsnorm")
+    return LagunaDecodeEmbeddingRoPEAtlasOutputs(
+        hidden: outputs[0], normalized: outputs[1],
+        fullAngles: outputs[2], slidingAngles: outputs[3])
 }
 
 /// The Laguna text tower: unscaled embedding and 40 decoder layers. The final
@@ -10493,6 +11010,7 @@ final class LagunaRuntimeModelInner: Module {
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         var h: MLXArray
+        var firstLayerNormalized: MLXArray?
         var fullRoPEAngles: MLXArray?
         var slidingRoPEAngles: MLXArray?
         var qkRoPEOffsets: MLXArray?
@@ -10500,14 +11018,27 @@ final class LagunaRuntimeModelInner: Module {
             let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
             let fullAtlas = _fullRoPEAngleAtlas,
             let slidingAtlas = _slidingRoPEAngleAtlas,
-            let atlasOutputs = lagunaDecodeEmbeddingRoPEAtlas(
-                tokens: inputs,
-                embeddingWeight: embedTokens.weight,
-                fullAtlas: fullAtlas,
-                slidingAtlas: slidingAtlas,
-                position: position)
+            let atlasOutputs =
+                lagunaEmbeddingFirstRMSNormEnabled
+                    && layers[0].inputLayerNorm.eps
+                        == Float(LagunaConstants.rmsNormEpsilon)
+                    && layers[0].selfAttn.acceptsEmbeddingFirstRMSNorm
+                ? lagunaDecodeEmbeddingRoPEAtlasRMSNorm(
+                    tokens: inputs,
+                    embeddingWeight: embedTokens.weight,
+                    normWeight: layers[0].inputLayerNorm.weight,
+                    fullAtlas: fullAtlas,
+                    slidingAtlas: slidingAtlas,
+                    position: position)
+                : lagunaDecodeEmbeddingRoPEAtlas(
+                    tokens: inputs,
+                    embeddingWeight: embedTokens.weight,
+                    fullAtlas: fullAtlas,
+                    slidingAtlas: slidingAtlas,
+                    position: position)
         {
             h = atlasOutputs.hidden
+            firstLayerNormalized = atlasOutputs.normalized
             fullRoPEAngles = atlasOutputs.fullAngles
             slidingRoPEAngles = atlasOutputs.slidingAngles
         } else if lagunaRoPEAtlasViewsEnabled,
@@ -10612,6 +11143,7 @@ final class LagunaRuntimeModelInner: Module {
                         h,
                         mask: mask,
                         cache: cache?[i],
+                        precomputedInputNorm: i == 0 ? firstLayerNormalized : nil,
                         qkRoPEAngles: qkRoPEAngles,
                         qkRoPEOffsets: qkRoPEOffsets
                     )
@@ -10624,6 +11156,7 @@ final class LagunaRuntimeModelInner: Module {
                     h,
                     mask: mask,
                     cache: cache?[i],
+                    precomputedInputNorm: i == 0 ? firstLayerNormalized : nil,
                     qkRoPEAngles: qkRoPEAngles,
                     qkRoPEOffsets: qkRoPEOffsets
                 )
