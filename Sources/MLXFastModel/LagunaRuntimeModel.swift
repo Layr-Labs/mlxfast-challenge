@@ -4135,13 +4135,25 @@ func lagunaGatedAffineOProjNVFP4Source(
     let loadInput = preActivatedGate
         ? """
         float g=float(gate_values[column>>head_shift]);
-        for(uint i=0;i<values_per_thread;++i)
-            x_thread[i]=float(bfloat(float(xp[i])*g));
+        const device vec<bfloat, 4>* xvecs = (const device vec<bfloat, 4>*)xp;
+        for (uint i = 0; i < values_per_thread / 4; ++i) {
+            const vec<bfloat, 4> xv4 = xvecs[i];
+            x_thread[4 * i] = float(bfloat(float(xv4[0]) * g));
+            x_thread[4 * i + 1] = float(bfloat(float(xv4[1]) * g));
+            x_thread[4 * i + 2] = float(bfloat(float(xv4[2]) * g));
+            x_thread[4 * i + 3] = float(bfloat(float(xv4[3]) * g));
+        }
         """
         : """
         float g=gt[column>>head_shift];
-        for(uint i=0;i<values_per_thread;++i)
-            x_thread[i]=float(bfloat(float(xp[i])*g));
+        const device vec<bfloat, 4>* xvecs = (const device vec<bfloat, 4>*)xp;
+        for (uint i = 0; i < values_per_thread / 4; ++i) {
+            const vec<bfloat, 4> xv4 = xvecs[i];
+            x_thread[4 * i] = float(bfloat(float(xv4[0]) * g));
+            x_thread[4 * i + 1] = float(bfloat(float(xv4[1]) * g));
+            x_thread[4 * i + 2] = float(bfloat(float(xv4[2]) * g));
+            x_thread[4 * i + 3] = float(bfloat(float(xv4[3]) * g));
+        }
         """
     return """
     constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
