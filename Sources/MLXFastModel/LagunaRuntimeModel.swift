@@ -98,6 +98,15 @@ let lagunaFusedSharedGateUpEnabled =
 let lagunaFusedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_SWIGLU_QMV"] != "0"
 
+/// Extend the retained row-concatenated NVFP4 `[gate; up]` bank to
+/// multi-token prefill, serving the shared expert's gate and up projections
+/// from one quantized matmul instead of two stock dispatches. Each output row
+/// is independent of the bank's row count, so the split halves are bit-exact
+/// with the separate gate/up projections.
+let lagunaPrefillSharedFusedGateUpEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_SHARED_FUSED_GATE_UP"] != "0"
+
 /// Decode-only shared-expert down QMV plus both sparse-block residual adds.
 /// The kernel preserves the stock BF16 down-projection result, the inner
 /// `routed + shared` rounding, and the outer `h + r2` rounding while avoiding
@@ -8230,6 +8239,36 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             // quantized output row is computed independently, so the split
             // halves are bit-exact vs. the separate gate/up dispatches.
             lagunaTrace("shared fused [gate; up] bank QMM")
+            let gateUp = MLX.quantizedMM(
+                x,
+                fusedWeight,
+                scales: fusedScales,
+                biases: nil,
+                transpose: true,
+                groupSize: 16,
+                bits: 4,
+                mode: .nvfp4
+            )
+            let gate = gateUp[.ellipsis, 0 ..< _fusedGateUpSplit]
+            let up = gateUp[.ellipsis, _fusedGateUpSplit...]
+            return downProj(compiledSiluProduct(gate, up))
+        }
+        if x.dim(1) > 1, lagunaPrefillSharedFusedGateUpEnabled,
+            let fusedWeight = _fusedGateUpWeight,
+            let fusedScales = _fusedGateUpScales,
+            x.dtype == .bfloat16,
+            x.dim(2) == LagunaConstants.hiddenSize,
+            fusedWeight.dtype == .uint32,
+            fusedScales.dtype == .uint8,
+            fusedWeight.shape == [
+                2 * _fusedGateUpSplit, LagunaConstants.hiddenSize / 8,
+            ],
+            fusedScales.shape == [
+                2 * _fusedGateUpSplit, LagunaConstants.hiddenSize / 16,
+            ],
+            _fusedGateUpSplit == LagunaConstants.sharedExpertIntermediateSize
+        {
+            lagunaTrace("prefill shared fused [gate; up] bank QMM")
             let gateUp = MLX.quantizedMM(
                 x,
                 fusedWeight,
