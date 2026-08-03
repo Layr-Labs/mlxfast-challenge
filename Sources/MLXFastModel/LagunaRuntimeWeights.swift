@@ -347,9 +347,9 @@ public final class LagunaRuntimeWeightCache {
         self.loader = loader
         self.config = config
         // Select the startup memory profile BEFORE the model load. Laguna
-        // retains no alternate weight layouts. The full profile installs the
-        // qualified BFS scheduler and post-wire command-buffer defaults below;
-        // the documented low-memory profile for <64 GiB machines caps the MLX allocator
+        // retains no alternate weight layouts. The full profile only installs
+        // the post-wire command-buffer budget below; the documented
+        // low-memory profile for <64 GiB machines caps the MLX allocator
         // cache at 6 GiB, shortens command buffers, and clears free
         // warmup buffers before the worker protocol hello -- pure memory
         // management: compiled decode and every other ranked code path stay
@@ -379,9 +379,6 @@ public final class LagunaRuntimeWeightCache {
                 // re-test winner (6 Latin pairs: decode 5/6, prefill 4/6). Explicit
                 // MLX_ values win; DARKBLOOM kill switch supports same-binary A/B.
                 let env = ProcessInfo.processInfo.environment
-                // P4: full-profile BFS width default from 776a79e1 / dda29d26.
-                // setenv overwrite=0 keeps any explicit MLX_BFS_MAX_WIDTH.
-                setenv("MLX_BFS_MAX_WIDTH", "50", 0)
                 if env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" {
                     setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
                     setenv("MLX_MAX_OPS_PER_BUFFER", "200", 0)

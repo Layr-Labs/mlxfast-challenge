@@ -1593,12 +1593,6 @@ bool darkbloom_swiglu_reglocal() {
   return v;
 }
 
-bool darkbloom_bsearch_hoist() {
-  static const bool v =
-      env::get_var("DARKBLOOM_BSEARCH_HOIST", "") != "0";
-  return v;
-}
-
 void gather_qmm_rhs_nax(
     const array& x_,
     const array& w_,
