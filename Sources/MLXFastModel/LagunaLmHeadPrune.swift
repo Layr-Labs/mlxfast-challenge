@@ -128,6 +128,14 @@ private let lagunaLmHeadInlineMaskEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_INLINE_MASK"] != "0"
 
 
+/// Narrower planes measured 2026-08-02, none carried: int4 one-pass looked
+/// -1.53% on the public fixture but its cost is prompt-dependent (free-run
+/// candidates p50 1646 / p90 14202 vs int5's 5 / 59, each costing a 4 KB
+/// exact-GEMV read) and it was rejected ranked; int3 admits ~99k rows and
+/// kills the pruning; a two-level form fixes the tail but its extra
+/// full-vocab dispatch cancels the 26 MB saved (4.532 vs 4.539 ms over ten
+/// arms). int5 is this family's optimum.
+///
 /// v5 coarse copy (exp-hybridcoarse section 7): planar-packed symmetric int5
 /// (nibble plane 1024 B + 1-bit plane 256 B + 64 power-of-two group scale
 /// bytes = 1344 B/row, -16.0% vs v4's 1600 B/row) plus EXACT-WINNER
