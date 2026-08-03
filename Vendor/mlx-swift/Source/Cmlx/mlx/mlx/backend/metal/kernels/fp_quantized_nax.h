@@ -354,6 +354,15 @@ struct QuantizedBlockLoader {
   // certification for 16B bases is strictly stronger than the 8B one, so it
   // is reused unchanged; only the per-thread offset check relaxes to 8B.
   MLX_MTL_CONST bool kWideLoad8ShapeOk = kWidenShapeOk && (kSrcBytes == 8);
+  // Expert-aligned Laguna FP4 staging owns exactly one 16-value scale group
+  // per thread: two 32-bit codewords, one E4M3 scale, and two 16B stores.
+  // Keep that native shape intact instead of unpacking the 8B device load to
+  // sb[] and reconstructing the same two words before decode. Besides the
+  // register-copy removal, this makes the single scale load/decode explicit;
+  // the generic chunk walk visits that same scale twice.
+  MLX_MTL_CONST bool kFP4CodePairShapeOk = kWideLoad8ShapeOk && fp4nv_fast &&
+      (n_steps_per_read == 1) && (kWideChunks == 2) &&
+      (kSrcBytesPerChunk == 4);
 
   struct alignas(16) WideChunk {
     T v[kWideElems];
@@ -404,6 +413,43 @@ struct QuantizedBlockLoader {
     if (!store_ok && !load_ok) {
       load_unsafe();
       return;
+    }
+
+    // DARKBLOOM_FP4_CODEPAIR: direct native-codeword path for the shipped
+    // expert-aligned geometry. `uint2` is 8B aligned; the host certifies the
+    // tile base and load_ok self-checks this thread's offset before the cast.
+    // codes.x/codes.y are exactly the little-endian words fp4nv_pack4 would
+    // rebuild from sb[0...3]/sb[4...7]. Both decode calls use the one scale
+    // governing all 16 values, and write the same two WideChunks to the same
+    // addresses. No floating-point expression or rounding boundary changes.
+    if constexpr (kFP4CodePairShapeOk) {
+      if (load_ok) {
+        const uint2 codes = *((const device uint2*)src);
+        const float scale = fp4nv_scale_x16384(scales[0]);
+        WideChunk out;
+        fp4nv_decode8<T>(codes.x, scale, out.v);
+        if (store_ok) {
+          *((threadgroup WideChunk*)dst) = out;
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < kWideElems; j++) {
+            dst[j] = out.v[j];
+          }
+        }
+
+        // Reuse the same register scratch after the first chunk has reached
+        // threadgroup memory, matching the old chunk loop's live range.
+        fp4nv_decode8<T>(codes.y, scale, out.v);
+        if (store_ok) {
+          *((threadgroup WideChunk*)(dst + kWideElems)) = out;
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < kWideElems; j++) {
+            dst[kWideElems + j] = out.v[j];
+          }
+        }
+        return;
+      }
     }
 
     uint8_t sb[kSrcBytes];
@@ -1681,7 +1727,11 @@ template <
 #endif
   threadgroup bfloat* gate_up_stage =
       (threadgroup bfloat*)Ws_storage;
+#ifdef DARKBLOOM_BSEARCH_HOIST
+  threadgroup int bounds[experts / expert_groups + 1];
+#else
   threadgroup int bounds[2];
+#endif
 
   const int K_w = kernel_K * bytes_per_pack / pack_factor;
   const int K_g = kernel_K / group_size;
@@ -1733,6 +1783,19 @@ template <
       (WN == 1) && (BN == 64) && ((BM / WM) == 16);
 #endif // DARKBLOOM_SWIGLU_REGLOCAL
 
+#ifdef DARKBLOOM_BSEARCH_HOIST
+  // Hoist: all slot bounds once, one lower_bound per thread (same integers
+  // as the per-slot lid==0 searches), one barrier instead of two per slot.
+  for (int b = int(lid); b <= experts / expert_groups;
+       b += WM * WN * SIMD_SIZE) {
+    bounds[b] = laguna_sorted_lower_bound(
+        indices,
+        M,
+        static_cast<uint32_t>(tid.y * (experts / expert_groups) + b));
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif
+
   for (int expert_slot = 0; expert_slot < experts / expert_groups;
        ++expert_slot) {
     // Keep each threadgroup's row intervals and expert weight regions
@@ -1741,6 +1804,10 @@ template <
         static_cast<uint32_t>(
             tid.y * (experts / expert_groups) + expert_slot);
 
+#ifdef DARKBLOOM_BSEARCH_HOIST
+    const int run_start = bounds[expert_slot];
+    const int run_end = bounds[expert_slot + 1];
+#else
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0) {
       bounds[0] = laguna_sorted_lower_bound(indices, M, expert);
@@ -1750,6 +1817,7 @@ template <
 
     const int run_start = bounds[0];
     const int run_end = bounds[1];
+#endif
     for (int chunk_start = run_start; chunk_start < run_end;
          chunk_start += BM) {
       const short chunk_rows =
