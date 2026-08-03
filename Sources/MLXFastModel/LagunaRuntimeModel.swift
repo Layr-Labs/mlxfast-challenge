@@ -4391,16 +4391,92 @@ func lagunaGatedAffineOProjNVFP4(
 private let lagunaTailNVFP4ScaleFoldEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_TAIL_NVFP4_SCALE_FOLD"] != "0"
 
-private let lagunaTailNVFP4ScaleDecode = lagunaTailNVFP4ScaleFoldEnabled
-    ? """
-        return float(as_type<half>(raw)) * 4194304.0f;
-    """
-    : """
-        half converted = as_type<half>(raw);
-        converted *= 256.0;
-        half signed_value = (bits & 128) ? -converted : converted;
-        return float(signed_value);
-    """
+/// `DARKBLOOM_QKV_TAIL_FOLD` (default ON for the ranked run; set "0" to restore
+/// the frontier q/k/v QMV): ports the two exactness-proven ALU
+/// micro-elisions the o_proj (`lagunaGatedAffineOProjNVFP4Source`) and MoE
+/// (`lagunaSharedSwiGLUQMVHeader`) NVFP4 QMVs already ship into the decode
+/// q/k/v NVFP4 tail QMV (`lagunaDecodeNVFP4QKVR1Source` +
+/// `lagunaTailNVFP4QMVHeader`): (1) seed elision -- assign the first four-term
+/// product group instead of adding it to a dead `+0.0f` seed; and (2) scale
+/// defer -- return the RAW half from `laguna_tail_nvfp4_scale` and apply the
+/// folded `2^22` once per output row at the R1 epilogue instead of once per
+/// 16-value group. Both are pure instruction-count reductions: identical bytes,
+/// loads, geometry and reduction order (the R1 one-row-per-simdgroup schedule
+/// and the `simd_sum` order are untouched). When OFF the generated kernel
+/// source, name and dispatch are byte-identical to the frontier q/k/v QMV;
+/// ranked correctness is the CXXC exact-token gate.
+private let lagunaTailNVFP4QKVTailFoldEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_QKV_TAIL_FOLD"] != "0"
+
+/// Seed-elision half of `DARKBLOOM_QKV_TAIL_FOLD`, kept as its own constant so
+/// the two elisions can later split behind independent env sub-flags.
+let lagunaTailNVFP4QKVSeedElisionEnabled = lagunaTailNVFP4QKVTailFoldEnabled
+
+/// Scale-defer half of `DARKBLOOM_QKV_TAIL_FOLD`. Composes only with the active
+/// fold arm, exactly like MoE's
+/// `lagunaNvfp4ScaleDeferEnabled && lagunaNvfp4ScaleFoldEnabled`: deferring the
+/// `2^22` only makes sense once the fold has parked it in the scale.
+let lagunaTailNVFP4QKVScaleDeferEnabled =
+    lagunaTailNVFP4QKVTailFoldEnabled && lagunaTailNVFP4ScaleFoldEnabled
+
+/// Body of `laguna_tail_nvfp4_scale`. The folded arm parks `256 * 16384 == 2^22`
+/// in the scale; under scale-defer it returns the RAW half and the `2^22` is
+/// re-applied once per output row by `lagunaTailNVFP4RowScaleSuffixSource` at
+/// the R1 epilogue. Explicit bool params (no env) so both arms are exercisable
+/// under plain `swift test`, mirroring `lagunaGatedAffineOProjNVFP4Source`. The
+/// non-defer and unfolded arms reproduce the frontier text verbatim.
+func lagunaTailNVFP4ScaleDecodeSource(scaleFold: Bool, scaleDefer: Bool) -> String {
+    guard scaleFold else {
+        return "    half converted = as_type<half>(raw);\n"
+            + "    converted *= 256.0;\n"
+            + "    half signed_value = (bits & 128) ? -converted : converted;\n"
+            + "    return float(signed_value);"
+    }
+    return scaleDefer
+        ? "    return float(as_type<half>(raw));"
+        : "    return float(as_type<half>(raw)) * 4194304.0f;"
+}
+
+/// Accumulator declaration for `laguna_tail_nvfp4_qdot`: the seed-elided arm
+/// drops the dead `= 0` initializer because the first group now assigns.
+func lagunaTailNVFP4QDotAccumDeclSource(seedElide: Bool) -> String {
+    seedElide ? "float accum;" : "float accum = 0;"
+}
+
+/// First four-term product group of `laguna_tail_nvfp4_qdot`. Seed-elided, the
+/// first code word (`j == 0`) assigns the accumulator; every other word adds.
+/// The `if (j == 0)` / `else` split and the multiply/add expressions are the
+/// exact text o_proj's `firstAccum` emits, so the association is untouched --
+/// only a signed-zero can differ, absorbed by the `+0.0f`-seeded `result` and
+/// the BF16 epilogue. The non-elided arm reproduces the frontier group verbatim.
+func lagunaTailNVFP4QDotFirstGroupSource(seedElide: Bool) -> String {
+    seedElide
+        ? "if (j == 0) {\n"
+            + "                accum =\n"
+            + "                    (x_thread[8 * j] * v04.x +\n"
+            + "                     x_thread[8 * j + 1] * v15.x +\n"
+            + "                     x_thread[8 * j + 2] * v26.x +\n"
+            + "                     x_thread[8 * j + 3] * v37.x);\n"
+            + "            } else {\n"
+            + "                accum +=\n"
+            + "                    (x_thread[8 * j] * v04.x +\n"
+            + "                     x_thread[8 * j + 1] * v15.x +\n"
+            + "                     x_thread[8 * j + 2] * v26.x +\n"
+            + "                     x_thread[8 * j + 3] * v37.x);\n"
+            + "            }"
+        : "accum +=\n"
+            + "            (x_thread[8 * j] * v04.x +\n"
+            + "             x_thread[8 * j + 1] * v15.x +\n"
+            + "             x_thread[8 * j + 2] * v26.x +\n"
+            + "             x_thread[8 * j + 3] * v37.x);"
+}
+
+/// The deferred `2^22` re-applied once per output row at the R1 epilogue when
+/// scale-defer is active (empty otherwise), mirroring MoE's
+/// `lagunaNvfp4RowScaleSuffix`.
+func lagunaTailNVFP4RowScaleSuffixSource(scaleDefer: Bool) -> String {
+    scaleDefer ? " * 4194304.0f" : ""
+}
 
 private let lagunaTailNVFP4QDotReturn = lagunaTailNVFP4ScaleFoldEnabled
     ? "return scale * accum;"
@@ -4413,7 +4489,7 @@ private let lagunaTailNVFP4QMVHeader = """
                 ? "ushort raw = ushort(bits) << 7;"
                 : "ushort raw = ushort(bits + (bits & 128)) << 7;")
             : "ushort raw = ushort(bits & 127) << 7;")
-        \(lagunaTailNVFP4ScaleDecode)
+        \(lagunaTailNVFP4ScaleDecodeSource(scaleFold: lagunaTailNVFP4ScaleFoldEnabled, scaleDefer: lagunaTailNVFP4QKVScaleDeferEnabled))
     }
 
     static inline float laguna_tail_nvfp4_qdot(
@@ -4421,7 +4497,7 @@ private let lagunaTailNVFP4QMVHeader = """
         const thread float* x_thread,
         float scale
     ) {
-        float accum = 0;
+        \(lagunaTailNVFP4QDotAccumDeclSource(seedElide: lagunaTailNVFP4QKVSeedElisionEnabled))
         const device uint2* wq = (const device uint2*)w;
         const uint2 codes = wq[0];
     #pragma unroll
@@ -4444,11 +4520,7 @@ private let lagunaTailNVFP4QMVHeader = """
             const float2 v15 = float2(as_type<half2>(p1));
             const float2 v26 = float2(as_type<half2>(p2));
             const float2 v37 = float2(as_type<half2>(p3));
-            accum +=
-                (x_thread[8 * j] * v04.x +
-                 x_thread[8 * j + 1] * v15.x +
-                 x_thread[8 * j + 2] * v26.x +
-                 x_thread[8 * j + 3] * v37.x);
+            \(lagunaTailNVFP4QDotFirstGroupSource(seedElide: lagunaTailNVFP4QKVSeedElisionEnabled))
             accum +=
                 (x_thread[8 * j + 4] * v04.y +
                  x_thread[8 * j + 5] * v15.y +
@@ -4500,7 +4572,7 @@ private let lagunaDecodeNVFP4QKVR1Source = """
         column += block_size;
     }
 
-    result = simd_sum(result);
+    result = simd_sum(result\(lagunaTailNVFP4RowScaleSuffixSource(scaleDefer: lagunaTailNVFP4QKVScaleDeferEnabled)));
     if (simd_lid == 0) {
         projected[out_row] = bfloat(result);
     }
@@ -4510,7 +4582,9 @@ private let lagunaDecodeNVFP4QKVR1Kernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_decode_nvfp4_qkv_h\(heads)_r1_v1",
+            name: "laguna_decode_nvfp4_qkv_h\(heads)_r1_v1"
+                + (lagunaTailNVFP4QKVSeedElisionEnabled ? "_se1" : "")
+                + (lagunaTailNVFP4QKVScaleDeferEnabled ? "_sd1" : ""),
             inputNames: ["normalized", "weight_codes", "weight_scales"],
             outputNames: ["projected"],
             source: lagunaDecodeNVFP4QKVR1Source,
