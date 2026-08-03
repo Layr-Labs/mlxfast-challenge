@@ -312,6 +312,11 @@ private let routeFusedScatterKernel: MLXFast.MLXFastKernel = {
     )
 }()
 
+/// One-shot stderr announcement on the fused path's first engagement, so
+/// "did it actually run" stays observable (guards decline silently).
+private let routeFusedScatterAnnounce: Void = FileHandle.standardError.write(
+    Data("mlx_lm: fused route scatter active\n".utf8))
+
 private func routeCountingSortFused(
     _ indices: MLXArray, m: Int
 ) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray)? {
@@ -321,6 +326,7 @@ private func routeCountingSortFused(
         n > 0, n % routeSortTile == 0,
         m == routeFusedScatterTopK
     else { return nil }
+    _ = routeFusedScatterAnnounce
     let tiles = n / routeSortTile
     let outputs = routeFusedScatterKernel(
         [indices],

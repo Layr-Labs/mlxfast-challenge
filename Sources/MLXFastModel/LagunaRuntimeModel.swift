@@ -210,6 +210,15 @@ let lagunaExpertAlignedGatherEnabled =
 let lagunaFusedResidualRMSNormEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_RESIDUAL_RMS"] != "0"
 
+/// Decode-only ownership transfer for the active NVFP4 attention tail. The
+/// output-projection epilogue already owns each final BF16 branch row, so it
+/// can form the following rounded residual once. Sparse router tiles then
+/// normalize that summed row directly instead of all 32 tiles rereading both
+/// operands and reconstructing the same 2,048 additions. Set exact `0` for
+/// the prior branch-output plus residual/RMS/router path.
+let lagunaOProjResidualOwnershipEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_OPROJ_RESIDUAL_OWNERSHIP"] != "0"
+
 /// Multi-token use of the row-general residual+RMSNorm kernel; its independent
 /// row dispatch preserves the stock add and normalization order per token.
 let lagunaPrefillFusedResidualRMSNormEnabled =
@@ -750,55 +759,11 @@ private let lagunaNormReductionTailQKV = lagunaNormReductionTail(
     lane: "lane", simdGroup: "simd_group",
     denominator: "float(in_vec_size)", epsilon: "norm_eps")
 
-/// Post-attention residual add + RMSNorm with the MoE router's projection
-/// folded in.
-///
-/// Every sparse layer follows this norm with a `[256, 2048]` BF16 GEMV whose
-/// only input is the normalized row, so that GEMV is the very next link in the
-/// dependency chain and nothing can overlap it. Folding it in costs each
-/// threadgroup a redundant 4 KB read of the normalized row it just produced
-/// and removes a kernel from the chain.
-///
-/// Exactness: the router half replicates MLX's gemv for out_vec 256 and in_vec
-/// 2048, which selects BM 4, BN 1, SM 1, SN 32, TM 4, TN 4. Lane `l` covers
-/// columns `4l + 128i`, products accumulate in `i` then `tn` order in FP32,
-/// and the simdgroup reduces with the same `simd_shuffle_down` ladder before
-/// one BF16 round. The norm half is untouched.
-///
-/// `rowsPerGroup` (see `DARKBLOOM_ROUTER_ROWS_PER_GROUP`) chooses only WHICH
-/// THREADGROUP OWNS WHICH ROW. 256 divides evenly by 64/32/16/8, every row
-/// keeps its own private accumulator and its own `(block, i)` K-loop, and no
-/// add is regrouped. **At `rowsPerGroup == 64` this emits the pre-widening
-/// kernel** — no guard, no unroll, the same four-element initializer, and
-/// `tile * rows_per_group` is the literal 64 the old
-/// `tile * (simd_size * rows_per_thread / 2)` folded to. That is what makes
-/// `DARKBLOOM_ROUTER_ROWS_PER_GROUP=64` a null by construction and therefore a
-/// usable control (`notes/50` §7e).
-///
-/// Below 16 rows per group there are fewer rows than simdgroups, so
-/// `rows_per_thread` bottoms out at 1 and the surplus simdgroups sit out the
-/// router phase behind `active_simd_groups`. They still run the norm, which
-/// needs all 512 threads, and the guard opens *after* the norm's
-/// `threadgroup_barrier` and closes *after* the logit write, so no thread is
-/// skipped past a barrier and no row goes unwritten.
-///
-/// At `rows_per_thread == 1` the block loop is also unrolled four deep. This
-/// is the load-level-parallelism half of `notes/50` §6b-ter: `tiles *
-/// rows_per_group == 256` at every tiling, so retiling alone cannot add a
-/// single outstanding load and leaves in-flight bytes pinned at 64 KB — which
-/// is the whole of the measured 140 GB/s. Hoisting four blocks' weight loads
-/// takes that to 256 KB.
-///
-/// **LOADS ONLY.** `router_result[0]` stays a single accumulator stepped in
-/// strict `(block, i)` order: block 0's four products, then block 1's, and so
-/// on into the same register. Giving each unrolled step its own partial and
-/// summing the four at the end would regroup 64 sequential FP32 adds into a
-/// tree — bit-exactness lost, every local check still green, the hidden
-/// exact-token gate failed. `router_blocks == 16` and `16 % 4 == 0`, so there
-/// is no tail. The `normalized_row` coefficients are read inline rather than
-/// staged: at one row per thread both cost `n_reads` threadgroup reads per
-/// block, so staging would buy nothing and cost 16 registers per unroll step.
-private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
+/// Fused residual/RMS/router source. Row tiling changes ownership only; each
+/// output keeps the accepted FP32 accumulation and reduction order.
+private func lagunaResidualRMSNormRouterSource(
+    rowsPerGroup: Int, fromSummed: Bool = false
+) -> String {
     let simdGroups = 512 / 32
     let rowsPerThread = rowsPerGroup >= simdGroups ? rowsPerGroup / simdGroups : 1
     let activeSimdGroups = rowsPerGroup / rowsPerThread
@@ -817,6 +782,16 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
                     -(score + float(correction_bias[router_row + r])));
         """
         : "router_logits[router_row + r] = bfloat(router_result[r]);"
+    let summedLoad = fromSummed
+        ? "bfloat value = summed[base + i];"
+        : "bfloat value = bfloat(residual[base + i] + branch[base + i]);"
+    let summedStore = fromSummed
+        ? ""
+        : """
+            if (tile == 0) {
+                summed[base + i] = value;
+            }
+        """
 
     let accumulate: String
     if rowsPerThread == 1 {
@@ -888,11 +863,9 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
         thread bfloat values[n_reads];
         float acc = 0.0f;
         for (uint i = 0; i < n_reads; ++i) {
-            bfloat value = bfloat(residual[base + i] + branch[base + i]);
+            \(summedLoad)
             values[i] = value;
-            if (tile == 0) {
-                summed[base + i] = value;
-            }
+            \(summedStore)
             float fv = float(value);
             acc += fv * fv;
         }
@@ -952,6 +925,32 @@ private let lagunaResidualRMSNormRouterKernels: [Int: MLXFast.MLXFastKernel] =
                         ? ["summed", "normalized", "router_logits", "router_keys"]
                         : ["summed", "normalized", "router_logits"],
                     source: lagunaResidualRMSNormRouterSource(rowsPerGroup: rowsPerGroup),
+                    header: lagunaRouterPrecomputedKeysEnabled
+                        ? lagunaDecodeRouterOrdinalHeader : "",
+                    ensureRowContiguous: true
+                )
+            )
+        })
+
+/// Direct-summed twin of the accepted router family. It retains the identical
+/// normalization and router body while deleting the residual/branch inputs
+/// and the already-owned summed output.
+private let lagunaRMSNormRouterFromSummedKernels: [Int: MLXFast.MLXFastKernel] =
+    Dictionary(
+        uniqueKeysWithValues: [1, 2, 4, 8, 16, 32, 64].map { rowsPerGroup in
+            (
+                rowsPerGroup,
+                MLXFast.metalKernel(
+                    name: "laguna_rms_router_from_summed_bf16_2048_rpg\(rowsPerGroup)_"
+                        + (lagunaRouterPrecomputedKeysEnabled ? "keys_v1" : "v1"),
+                    inputNames: lagunaRouterPrecomputedKeysEnabled
+                        ? ["summed", "weight", "router_weight", "correction_bias"]
+                        : ["summed", "weight", "router_weight"],
+                    outputNames: lagunaRouterPrecomputedKeysEnabled
+                        ? ["normalized", "router_logits", "router_keys"]
+                        : ["normalized", "router_logits"],
+                    source: lagunaResidualRMSNormRouterSource(
+                        rowsPerGroup: rowsPerGroup, fromSummed: true),
                     header: lagunaRouterPrecomputedKeysEnabled
                         ? lagunaDecodeRouterOrdinalHeader : "",
                     ensureRowContiguous: true
@@ -1042,6 +1041,39 @@ func lagunaResidualRMSNormRouter(
             + (lagunaRouterPrecomputedKeysEnabled ? [.uint32] : [])
     )
     return (outputs[0], outputs[1], outputs[2], outputs.count > 3 ? outputs[3] : nil)
+}
+
+func lagunaRMSNormRouterFromSummed(
+    summed: MLXArray, weight: MLXArray,
+    routerWeight: MLXArray, correctionBias: MLXArray
+) -> (normalized: MLXArray, routerLogits: MLXArray, routerKeys: MLXArray?) {
+    let hidden = LagunaConstants.hiddenSize
+    let experts = LagunaConstants.numExperts
+    precondition(summed.dtype == .bfloat16)
+    precondition(weight.dtype == .bfloat16)
+    precondition(routerWeight.dtype == .bfloat16)
+    precondition(correctionBias.dtype == .float32 || correctionBias.dtype == .bfloat16)
+    precondition(summed.shape == [1, 1, hidden])
+    precondition(weight.shape == [hidden])
+    precondition(routerWeight.shape == [experts, hidden])
+    precondition(correctionBias.shape == [experts])
+
+    let rowsPerGroup = lagunaRouterRowsPerGroup
+    let tiles = experts / rowsPerGroup
+    lagunaTrace("rmsnorm+router from oproj residual rpg\(rowsPerGroup)")
+    let inputs = lagunaRouterPrecomputedKeysEnabled
+        ? [summed, weight, routerWeight, correctionBias]
+        : [summed, weight, routerWeight]
+    let outputs = lagunaRMSNormRouterFromSummedKernels[rowsPerGroup]!(
+        inputs,
+        grid: (tiles * 512, 1, 1),
+        threadGroup: (512, 1, 1),
+        outputShapes: [[1, 1, hidden], [1, 1, experts]]
+            + (lagunaRouterPrecomputedKeysEnabled ? [[1, 1, experts]] : []),
+        outputDTypes: [.bfloat16, .bfloat16]
+            + (lagunaRouterPrecomputedKeysEnabled ? [.uint32] : [])
+    )
+    return (outputs[0], outputs[1], outputs.count > 2 ? outputs[2] : nil)
 }
 
 func lagunaResidualRMSNorm(
@@ -4068,7 +4100,8 @@ func lagunaGatedAffineOProjNVFP4Source(
     heads: Int,
     signCarry: Bool = lagunaNvfp4QmvSignCarryEnabled,
     seedElide: Bool = lagunaNvfp4QmvSeedElisionEnabled,
-    preActivatedGate: Bool = false
+    preActivatedGate: Bool = false,
+    foldResidual: Bool = false
 ) -> String {
     let scaleFold = lagunaNvfp4ScaleFoldEnabled
     let weightScale = scaleFold ? "" : " * 16384.0f"
@@ -4143,6 +4176,12 @@ func lagunaGatedAffineOProjNVFP4Source(
         for(uint i=0;i<values_per_thread;++i)
             x_thread[i]=float(bfloat(float(xp[i])*g));
         """
+    let outputStore = foldResidual
+        ? """
+            bfloat branch = bfloat(result[row]);
+            summed[out_row + row] = bfloat(residual[out_row + row] + branch);
+        """
+        : "projected[out_row + row] = bfloat(result[row]);"
     return """
     constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
     constexpr uint out_vec_size = \(LagunaConstants.hiddenSize);
@@ -4214,7 +4253,7 @@ func lagunaGatedAffineOProjNVFP4Source(
     for (uint row = 0; row < results_per_simdgroup; ++row) {
         result[row] = simd_sum(result[row] * 4194304.0f);
         if (simd_lid == 0) {
-            projected[out_row + row] = bfloat(result[row]);
+            \(outputStore)
         }
     }
     """
@@ -4233,6 +4272,26 @@ private let lagunaGatedAffineOProjNVFP4Kernels: [Int: MLXFast.MLXFastKernel] = {
             ],
             outputNames: ["projected"],
             source: lagunaGatedAffineOProjNVFP4Source(heads: heads),
+            ensureRowContiguous: true
+        )
+    }
+    return kernels
+}()
+
+private let lagunaGatedAffineOProjNVFP4ResidualKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_gated_affine_oproj_nvfp4_residual_h\(heads)_v1"
+                + (lagunaNvfp4QmvSignCarryEnabled ? "_sc1" : "")
+                + (lagunaNvfp4QmvSeedElisionEnabled ? "_se1" : ""),
+            inputNames: [
+                "attention_output", "gate_logits", "weight_codes",
+                "weight_scales", "residual",
+            ],
+            outputNames: ["summed"],
+            source: lagunaGatedAffineOProjNVFP4Source(
+                heads: heads, foldResidual: true),
             ensureRowContiguous: true
         )
     }
@@ -4340,18 +4399,34 @@ private let lagunaActivatedOProjKernels: [Int: MLXFast.MLXFastKernel] = {
     return result
 }()
 
+private let lagunaActivatedOProjResidualKernels: [Int: MLXFast.MLXFastKernel] = {
+    var result: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        result[heads] = MLXFast.metalKernel(
+            name: "laguna_oproj_act_residual_h\(heads)_v1"
+                + (lagunaNvfp4QmvSignCarryEnabled ? "_sc1" : "")
+                + (lagunaNvfp4QmvSeedElisionEnabled ? "_se1" : ""),
+            inputNames: [
+                "attention_output", "gate_values", "weight_codes",
+                "weight_scales", "residual",
+            ],
+            outputNames: ["summed"],
+            source: lagunaGatedAffineOProjNVFP4Source(
+                heads: heads, preActivatedGate: true, foldResidual: true),
+            ensureRowContiguous: true)
+    }
+    return result
+}()
+
 func lagunaGatedAffineOProjNVFP4(
     attentionOutput: MLXArray,
     gateLogits: MLXArray,
     codes: MLXArray,
     scales: MLXArray,
     heads: Int,
-    gateIsActivated: Bool = false
-) -> MLXArray? {
-    let selected = gateIsActivated
-        ? (lagunaGateSoftplusEnabled ? lagunaActivatedOProjKernels[heads] : nil)
-        : lagunaGatedAffineOProjNVFP4Kernels[heads]
-    guard let kernel = selected else { return nil }
+    gateIsActivated: Bool = false,
+    residual: MLXArray? = nil
+) -> (value: MLXArray, ownsResidual: Bool)? {
     let inVec = heads * LagunaConstants.headDim
     let outVec = LagunaConstants.hiddenSize
     guard attentionOutput.dtype == .bfloat16,
@@ -4366,14 +4441,34 @@ func lagunaGatedAffineOProjNVFP4(
         return nil
     }
 
-    lagunaTrace("gated affine oproj nvfp4 qmv h\(heads)")
-    return kernel(
-        [attentionOutput, gateLogits, codes, scales],
+    let ownsResidual = lagunaOProjResidualOwnershipEnabled
+        && residual?.dtype == .bfloat16
+        && residual?.shape == [1, 1, outVec]
+    let selected = gateIsActivated
+        ? (lagunaGateSoftplusEnabled
+            ? (ownsResidual
+                ? lagunaActivatedOProjResidualKernels[heads]
+                : lagunaActivatedOProjKernels[heads])
+            : nil)
+        : (ownsResidual
+            ? lagunaGatedAffineOProjNVFP4ResidualKernels[heads]
+            : lagunaGatedAffineOProjNVFP4Kernels[heads])
+    guard let kernel = selected else { return nil }
+
+    lagunaTrace(
+        ownsResidual
+            ? "gated affine oproj owns residual h\(heads)"
+            : "gated affine oproj nvfp4 qmv h\(heads)")
+    let inputs = [attentionOutput, gateLogits, codes, scales]
+        + (ownsResidual ? [residual!] : [])
+    let value = kernel(
+        inputs,
         grid: ((outVec / 8) * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[1, 1, outVec]],
         outputDTypes: [.bfloat16]
     )[0]
+    return (value, ownsResidual)
 }
 
 
@@ -5081,6 +5176,16 @@ private let lagunaSlidingAttentionGateProjection = makeLagunaAttentionGateProjec
     headDim: LagunaConstants.headDim
 )
 
+struct LagunaAttentionOutput {
+    let value: MLXArray
+    let ownsResidual: Bool
+
+    init(_ value: MLXArray, ownsResidual: Bool = false) {
+        self.value = value
+        self.ownsResidual = ownsResidual
+    }
+}
+
 /// Laguna attention: GQA with per-head QK-norm, per-layer-type RoPE (YaRN on
 /// full-attention layers over the first half of the head, plain RoPE on
 /// sliding layers over the whole head), and per-head softplus output gating.
@@ -5357,7 +5462,7 @@ final class LagunaRuntimeAttention: Module {
         cache: KVCache?,
         qkRoPEAngles: MLXArray? = nil,
         qkRoPEOffsets: MLXArray? = nil
-    ) -> MLXArray {
+    ) -> LagunaAttentionOutput {
         let (B, L) = (input.dim(0), input.dim(1))
 
         // One dispatch for the input RMSNorm and all three projections when
@@ -5825,7 +5930,7 @@ final class LagunaRuntimeAttention: Module {
                         indexedMetadata: affineWO.indexedMetadata,
                         heads: nHeads)
                 {
-                    return fusedProjection
+                    return LagunaAttentionOutput(fusedProjection)
                 }
                 if lagunaFusedGatedAffineOProjEnabled, !gateIsActivated,
                     affineWO.mode == .affine, affineWO.bits == 8,
@@ -5839,7 +5944,7 @@ final class LagunaRuntimeAttention: Module {
                         biases: affineBiases,
                         heads: nHeads)
                 {
-                    return fusedProjection
+                    return LagunaAttentionOutput(fusedProjection)
                 }
                 if lagunaFusedGatedAffineOProjEnabled,
                     lagunaGatedAffineOProjNVFP4Enabled,
@@ -5852,9 +5957,12 @@ final class LagunaRuntimeAttention: Module {
                         codes: affineWO.packedCodes,
                         scales: affineWO.scales,
                         heads: nHeads,
-                        gateIsActivated: true)
+                        gateIsActivated: true,
+                        residual: input)
                 {
-                    return fusedProjection
+                    return LagunaAttentionOutput(
+                        fusedProjection.value,
+                        ownsResidual: fusedProjection.ownsResidual)
                 }
                 if lagunaFusedGatedAffineOProjEnabled,
                     lagunaGatedAffineOProjNVFP4Enabled,
@@ -5866,9 +5974,12 @@ final class LagunaRuntimeAttention: Module {
                         gateLogits: projectedGate,
                         codes: affineWO.packedCodes,
                         scales: affineWO.scales,
-                        heads: nHeads)
+                        heads: nHeads,
+                        residual: input)
                 {
-                    return fusedProjection
+                    return LagunaAttentionOutput(
+                        fusedProjection.value,
+                        ownsResidual: fusedProjection.ownsResidual)
                 }
                 // Raw logits + fused kernel: one dispatch reproduces the
                 // softplus chain AND the broadcast product bit-exactly (see
@@ -5893,7 +6004,7 @@ final class LagunaRuntimeAttention: Module {
                         .reshaped(B, L, -1)
                 }
                 lagunaTrace("native affine gated output projection h\(nHeads)")
-                return quantizedMM(
+                return LagunaAttentionOutput(quantizedMM(
                     gated,
                     affineWO.packedCodes,
                     scales: affineWO.scales,
@@ -5902,7 +6013,7 @@ final class LagunaRuntimeAttention: Module {
                     groupSize: affineWO.groupSize,
                     bits: affineWO.bits,
                     mode: affineWO.mode
-                )
+                ))
             }
             if lagunaFusedGatedOutputProjectionEnabled,
                 gateIsActivated, gatePerHead, L == 1, B == 1, wo.bias == nil,
@@ -5920,14 +6031,15 @@ final class LagunaRuntimeAttention: Module {
                     heads: nHeads
                 )
                 if let projection {
-                    return projection
+                    return LagunaAttentionOutput(projection)
                 }
             }
             if !gateIsActivated,
                 gatePerHead && projectedGate.dtype == output.dtype,
                 L == 1, wo.bias == nil, MLXHardwareInfo.isCompiledDecodeSupported
             {
-                return attentionGateProjection(output, projectedGate, wo.weight)
+                return LagunaAttentionOutput(
+                    attentionGateProjection(output, projectedGate, wo.weight))
             }
             let gate =
                 gateIsActivated
@@ -5944,7 +6056,7 @@ final class LagunaRuntimeAttention: Module {
             }
         }
 
-        return wo(output)
+        return LagunaAttentionOutput(wo(output))
     }
 
     /// Prefill-only final-layer attention when the caller consumes just the
@@ -10126,7 +10238,7 @@ final class LagunaRuntimeDecoderLayer: Module {
         qkRoPEAngles: MLXArray? = nil,
         qkRoPEOffsets: MLXArray? = nil
     ) -> MLXArray {
-        let r = selfAttn(
+        let attention = selfAttn(
             x,
             inputNorm: inputLayerNorm,
             mask: mask,
@@ -10134,11 +10246,35 @@ final class LagunaRuntimeDecoderLayer: Module {
             qkRoPEAngles: qkRoPEAngles,
             qkRoPEOffsets: qkRoPEOffsets
         )
+        let r = attention.value
         let h: MLXArray
         let normalized: MLXArray
         var routerLogits: MLXArray?
         var routerKeys: MLXArray?
-        if lagunaFusedResidualRMSNormRouterEnabled,
+        if attention.ownsResidual {
+            h = r
+            if lagunaFusedResidualRMSNormRouterEnabled,
+                h.dtype == .bfloat16,
+                postAttentionLayerNorm.weight.dtype == .bfloat16,
+                h.shape == [1, 1, LagunaConstants.hiddenSize],
+                let sparse = mlp as? LagunaRuntimeSparseMoEBlock,
+                sparse.gate.weight.dtype == .bfloat16,
+                sparse.gate.weight.shape == [
+                    LagunaConstants.numExperts, LagunaConstants.hiddenSize,
+                ]
+            {
+                let fused = lagunaRMSNormRouterFromSummed(
+                    summed: h,
+                    weight: postAttentionLayerNorm.weight,
+                    routerWeight: sparse.gate.weight,
+                    correctionBias: sparse.gate.eScoreCorrectionBias)
+                normalized = fused.normalized
+                routerLogits = fused.routerLogits
+                routerKeys = fused.routerKeys
+            } else {
+                normalized = postAttentionLayerNorm(h)
+            }
+        } else if lagunaFusedResidualRMSNormRouterEnabled,
             x.dtype == .bfloat16, r.dtype == .bfloat16,
             postAttentionLayerNorm.weight.dtype == .bfloat16,
             x.shape == [1, 1, LagunaConstants.hiddenSize], x.shape == r.shape,
