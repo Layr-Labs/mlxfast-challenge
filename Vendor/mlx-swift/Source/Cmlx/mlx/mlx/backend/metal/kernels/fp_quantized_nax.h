@@ -1681,11 +1681,7 @@ template <
 #endif
   threadgroup bfloat* gate_up_stage =
       (threadgroup bfloat*)Ws_storage;
-#ifdef DARKBLOOM_BSEARCH_HOIST
-  threadgroup int bounds[experts / expert_groups + 1];
-#else
   threadgroup int bounds[2];
-#endif
 
   const int K_w = kernel_K * bytes_per_pack / pack_factor;
   const int K_g = kernel_K / group_size;
@@ -1737,19 +1733,6 @@ template <
       (WN == 1) && (BN == 64) && ((BM / WM) == 16);
 #endif // DARKBLOOM_SWIGLU_REGLOCAL
 
-#ifdef DARKBLOOM_BSEARCH_HOIST
-  // Hoist: all slot bounds once, one lower_bound per thread (same integers
-  // as the per-slot lid==0 searches), one barrier instead of two per slot.
-  for (int b = int(lid); b <= experts / expert_groups;
-       b += WM * WN * SIMD_SIZE) {
-    bounds[b] = laguna_sorted_lower_bound(
-        indices,
-        M,
-        static_cast<uint32_t>(tid.y * (experts / expert_groups) + b));
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-#endif
-
   for (int expert_slot = 0; expert_slot < experts / expert_groups;
        ++expert_slot) {
     // Keep each threadgroup's row intervals and expert weight regions
@@ -1758,10 +1741,6 @@ template <
         static_cast<uint32_t>(
             tid.y * (experts / expert_groups) + expert_slot);
 
-#ifdef DARKBLOOM_BSEARCH_HOIST
-    const int run_start = bounds[expert_slot];
-    const int run_end = bounds[expert_slot + 1];
-#else
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0) {
       bounds[0] = laguna_sorted_lower_bound(indices, M, expert);
@@ -1771,7 +1750,6 @@ template <
 
     const int run_start = bounds[0];
     const int run_end = bounds[1];
-#endif
     for (int chunk_start = run_start; chunk_start < run_end;
          chunk_start += BM) {
       const short chunk_rows =
@@ -1997,30 +1975,6 @@ template <
           simd_lane_id);
 
       for (int k = 0; k < K_it; ++k) {
-        // Bit-exact A-operand hoist (the XMAJOR arm's shipped pattern at
-        // one-eighth its register cost): this iteration's x fragments load
-        // into registers BEFORE the two staging barriers, overlapping the
-        // sorted-x device reads with the weight staging they previously
-        // serialized behind. x is read-only, the A registers carry no
-        // dependence on Ws, both barriers remain, and the MMA chain
-        // (k ascending, kk1 ascending, same Dtile) is untouched, so every
-        // accumulation happens in the identical order on identical values.
-        // The partial-row arm uses load_rows: at this instantiation
-        // load_safe's column predicate is a tautology (widest touched
-        // column is 31 < SK), so bytes, addresses, and zero-fills are
-        // identical while the row predicate hoists out of the contiguous
-        // four-element runs and the Int<1> contiguous branch is restored.
-        NAXTile<T, TM, TK> Atile[BK / SK];
-        if (sg_active) {
-          STEEL_PRAGMA_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            if (sgp_sm == SM) {
-              Atile[kk1 / SK].load(xn + kk1, kernel_K);
-            } else {
-              Atile[kk1 / SK].load_rows(xn + kk1, kernel_K, sgp_sm);
-            }
-          }
-        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // DARKBLOOM_EXPERT_STAGE_WIDEST / DARKBLOOM_EXPERT_STAGE_WIDELD:
         // same bytes, same addresses, same nibble decode, same scale mapping
@@ -2048,14 +2002,21 @@ template <
           // Scheduling only: no arithmetic, order, or rounding change.
           STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
             NAXTile<Wtype, TN, TK> Btile;
 
+            if (sgp_sm == SM) {
+              Atile.load(xn + kk1, kernel_K);
+            } else {
+              Atile.load_safe(
+                  xn + kk1, kernel_K, short2(SK, sgp_sm));
+            }
             Btile.template load<Wtype, BK_padded, 1>(
                 Ws + tn * BK_padded + kk1);
 
             tile_matmad_nax(
                 Dtile,
-                Atile[kk1 / SK],
+                Atile,
                 metal::bool_constant<false>{},
                 Btile,
                 metal::bool_constant<true>{});

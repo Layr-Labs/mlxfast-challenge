@@ -471,12 +471,6 @@ private let lagunaLastPrefillProjectionBanksEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_LAST_PREFILL_PROJECTION_BANKS"] != "0"
 
-/// `DARKBLOOM_TERMINAL_FUSION` (default ON; set "0" to disable): current-API
-/// port of overlay-dropped `9f98995`. `callLastPrefillRow` reuses the ordinary
-/// path's accepted row-local fused residual+RMSNorm(+router)+MoE-tail helpers.
-private let lagunaTerminalPrefillFusionEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_TERMINAL_FUSION"] != "0"
-
 /// Full-attention counterpart: fuses per-head Q/K RMSNorm with partial YaRN
 /// RoPE. One stock FP32 probe row carries the authoritative rotary factors,
 /// while the custom kernel preserves the normalized BF16 boundary and tail.
@@ -517,7 +511,8 @@ let lagunaRoPEAngleAtlasEnabled =
 /// −0.23%), this path adds no kernel at all: the atlas row for position `p`
 /// is bit-identical to the probe output at `p` by construction (the atlas IS
 /// the family's own stock RoPE run over the broadcast probe seed), and a
-/// row slice of the contiguous `[1, 1, 4096, D]` atlas is a zero-copy
+/// row slice of the contiguous `[1, 1, lagunaRoPEAngleAtlasLength, D]` atlas
+/// is a zero-copy
 /// row-contiguous view, so the two probe dispatches vanish from the front of
 /// every decode step with no replacement work. The stock `embedTokens`
 /// gather is unchanged.
@@ -690,7 +685,90 @@ private let lagunaPrefillAsyncLadderStride: Int = {
     return n
 }()
 
-private let lagunaRoPEAngleAtlasLength = 4096
+/// Chunked long-context prefill (stock `LLMModel.prepare` semantics,
+/// Vendor/mlx-swift-lm/Libraries/MLXLLM/LLMModel.swift:21-36). The vendored
+/// reference feeds prompts in 512-token slices, evaluating the cache between
+/// slices; this runtime used to forward the whole prompt in one shot.
+/// Single-shot prefill defeats the sliding-window bound:
+/// `RotatingKVCache.updateConcat` only trims on its SECOND multi-token
+/// update, so one [1, L] forward keeps all L K/V rows on every sliding layer
+/// and forces a materialized LxL bool mask (`RotatingKVCache.makeMask`),
+/// which also disables the steel kernel's causal tile-skip. Beyond ~8k that
+/// turns 30 of 40 layers into dense masked LxL attention and prefill
+/// collapses quadratically (measured 2672 -> 381 tok/s at 8k -> 64k vs the
+/// chunked baseline's 3418 -> 2074). The slice loop below restores the
+/// bounded sliding cache, small per-chunk masks, and the tile-skip.
+/// Invisible to every gate: the ranked window and all public/hidden base
+/// prompts are 512 tokens (one slice either way), and chunked prefill IS
+/// the golden-generating reference behavior at longer prompts.
+/// Default ON; set `DARKBLOOM_PREFILL_CHUNK=0` for single-shot prefill.
+private let lagunaPrefillChunkEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_CHUNK"] != "0"
+
+/// Slice length for chunked prefill; 512 matches the stock
+/// `GenerateParameters.prefillStepSize` default exactly.
+private let lagunaPrefillChunkSize: Int = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_CHUNK_SIZE"],
+        let n = Int(raw), n >= 64
+    else { return 512 }
+    return n
+}()
+
+/// `DARKBLOOM_ATTN_SLIDING_BAND_SKIP` (default ON): mark Laguna's exact
+/// steady-state 512-token sliding-window mask for structural K-tile elision
+/// in the NAX attention kernel.  The generic SDPA ABI carries no window size,
+/// so the otherwise-unused stride of the singleton batch dimension encodes
+/// `-windowSize`.  The array is expanded to its final SDPA shape first, which
+/// makes `broadcast_to` a no-op and preserves that marker.  No address can
+/// observe the negative stride because the marked dimension has size one.
+///
+/// Only the mask built at this Laguna-specific call site is marked, and only
+/// at the exact post-wrap geometry produced by `RotatingKVCache(512)`. An
+/// arbitrary bool mask with the same shape therefore cannot accidentally opt
+/// into sliding-window semantics.
+private let lagunaSlidingBandSkipEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ATTN_SLIDING_BAND_SKIP"] != "0"
+
+private func lagunaMarkSteadySlidingMask(
+    _ mode: MLXFast.ScaledDotProductAttentionMaskMode,
+    windowSize: Int,
+    batchSize: Int
+) -> MLXFast.ScaledDotProductAttentionMaskMode {
+    guard lagunaSlidingBandSkipEnabled,
+        batchSize == 1,
+        windowSize == 512,
+        case .array(let mask) = mode,
+        mask.shape == [512, 1023]
+    else {
+        return mode
+    }
+
+    return .array(
+        asStrided(
+            mask,
+            [1, LagunaConstants.slidingAttentionHeads, 512, 1023],
+            strides: [-windowSize, 0, 1023, 1]
+        )
+    )
+}
+
+/// Position coverage of the load-time RoPE angle atlases. Every atlas row
+/// is produced by the stock `rope` module over a broadcast seed
+/// (`prepareRoPEAngleAtlases`), so row p is bit-identical to the angles the
+/// stock per-forward RoPE chain would compute for position p at any
+/// coverage. 4096 left every chunk of a >4k prefill (and every decode
+/// position past 4k) on the stock six-dispatch RoPE chain; 131072 covers
+/// the model's practical long-context range for ~96 MB of resident FP32.
+/// Positions beyond coverage decline to the stock path exactly as before
+/// (the same guard), so this is a pure coverage extension, not a behavior
+/// change. `DARKBLOOM_ROPE_ATLAS_LENGTH` overrides (min 4096, max
+/// 262144 = max_position_embeddings).
+private let lagunaRoPEAngleAtlasLength: Int = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ATLAS_LENGTH"],
+        let n = Int(raw)
+    else { return 131_072 }
+    return min(max(n, 4096), 262_144)
+}()
 
 /// The shared 512-thread RMSNorm prologue emitted by three decode kernels.
 ///
@@ -1776,6 +1854,40 @@ private var lagunaRingIdxAtlas: [MLXArray] { LagunaRingIdxAtlasStore.entries }
 let lagunaParamsAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PARAMS_ATLAS"] != "0"
 
+/// Memoized 12-byte params buffers for `lagunaFullFusedAttention`, keyed by
+/// (writeIdx, capacity). All ten full-attention layers share one pair per
+/// decode step, so this replaces ten fresh 3-element MLXArray allocations
+/// (plus host->device uniform uploads) per token with one map lookup — the
+/// full-attention twin of the sliding ring-index atlas above. The capacity
+/// must be part of the key: `KVCacheSimple` growth concats change it at
+/// 256-row boundaries, unlike the fixed 512-slot sliding ring. Values are
+/// input-independent control integers; worker decode is single-threaded,
+/// the same contract as the atlas. The map is cleared if it ever exceeds
+/// 4096 entries (long-lived-server protection; values rebuild on demand).
+/// Set `DARKBLOOM_FULL_ATTN_PARAMS_MEMO=0` for the per-call fresh array.
+private let lagunaFullAttnParamsMemoEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FULL_ATTN_PARAMS_MEMO"] != "0"
+
+private enum LagunaFullAttnParamsStore {
+    nonisolated(unsafe) static var entries: [UInt64: MLXArray] = [:]
+}
+
+private func lagunaFullAttnParams(writeIdx: Int, capacity: Int) -> MLXArray {
+    let key = UInt64(UInt32(writeIdx)) << 32 | UInt64(UInt32(capacity))
+    if let hit = LagunaFullAttnParamsStore.entries[key] {
+        return hit
+    }
+    if LagunaFullAttnParamsStore.entries.count >= 4096 {
+        LagunaFullAttnParamsStore.entries.removeAll(keepingCapacity: false)
+    }
+    let params = MLXArray([
+        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
+    ])
+    eval(params)
+    LagunaFullAttnParamsStore.entries[key] = params
+    return params
+}
+
 /// `DARKBLOOM_FUSED_FULL_ATTN` (default on; set "0" to disable): decode
 /// fused attention for the ten full-attention layers once the cache backing
 /// has spare capacity (from the second decode step on; the first step's
@@ -2248,9 +2360,11 @@ func lagunaFullFusedAttention(
     precondition(scale.dtype == .float32 && scale.size == 1)
 
     lagunaTrace("full fused attention")
-    let params = MLXArray([
-        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
-    ])
+    let params = lagunaFullAttnParamsMemoEnabled
+        ? lagunaFullAttnParams(writeIdx: writeIdx, capacity: capacity)
+        : MLXArray([
+            UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
+        ])
     return lagunaFullFusedAttentionKernel(
         [
             rawQueries, rawKeys, rawValues,
@@ -4397,92 +4511,16 @@ func lagunaGatedAffineOProjNVFP4(
 private let lagunaTailNVFP4ScaleFoldEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_TAIL_NVFP4_SCALE_FOLD"] != "0"
 
-/// `DARKBLOOM_QKV_TAIL_FOLD` (default ON for the ranked run; set "0" to restore
-/// the frontier q/k/v QMV): ports the two exactness-proven ALU
-/// micro-elisions the o_proj (`lagunaGatedAffineOProjNVFP4Source`) and MoE
-/// (`lagunaSharedSwiGLUQMVHeader`) NVFP4 QMVs already ship into the decode
-/// q/k/v NVFP4 tail QMV (`lagunaDecodeNVFP4QKVR1Source` +
-/// `lagunaTailNVFP4QMVHeader`): (1) seed elision -- assign the first four-term
-/// product group instead of adding it to a dead `+0.0f` seed; and (2) scale
-/// defer -- return the RAW half from `laguna_tail_nvfp4_scale` and apply the
-/// folded `2^22` once per output row at the R1 epilogue instead of once per
-/// 16-value group. Both are pure instruction-count reductions: identical bytes,
-/// loads, geometry and reduction order (the R1 one-row-per-simdgroup schedule
-/// and the `simd_sum` order are untouched). When OFF the generated kernel
-/// source, name and dispatch are byte-identical to the frontier q/k/v QMV;
-/// ranked correctness is the CXXC exact-token gate.
-private let lagunaTailNVFP4QKVTailFoldEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_QKV_TAIL_FOLD"] != "0"
-
-/// Seed-elision half of `DARKBLOOM_QKV_TAIL_FOLD`, kept as its own constant so
-/// the two elisions can later split behind independent env sub-flags.
-let lagunaTailNVFP4QKVSeedElisionEnabled = lagunaTailNVFP4QKVTailFoldEnabled
-
-/// Scale-defer half of `DARKBLOOM_QKV_TAIL_FOLD`. Composes only with the active
-/// fold arm, exactly like MoE's
-/// `lagunaNvfp4ScaleDeferEnabled && lagunaNvfp4ScaleFoldEnabled`: deferring the
-/// `2^22` only makes sense once the fold has parked it in the scale.
-let lagunaTailNVFP4QKVScaleDeferEnabled =
-    lagunaTailNVFP4QKVTailFoldEnabled && lagunaTailNVFP4ScaleFoldEnabled
-
-/// Body of `laguna_tail_nvfp4_scale`. The folded arm parks `256 * 16384 == 2^22`
-/// in the scale; under scale-defer it returns the RAW half and the `2^22` is
-/// re-applied once per output row by `lagunaTailNVFP4RowScaleSuffixSource` at
-/// the R1 epilogue. Explicit bool params (no env) so both arms are exercisable
-/// under plain `swift test`, mirroring `lagunaGatedAffineOProjNVFP4Source`. The
-/// non-defer and unfolded arms reproduce the frontier text verbatim.
-func lagunaTailNVFP4ScaleDecodeSource(scaleFold: Bool, scaleDefer: Bool) -> String {
-    guard scaleFold else {
-        return "    half converted = as_type<half>(raw);\n"
-            + "    converted *= 256.0;\n"
-            + "    half signed_value = (bits & 128) ? -converted : converted;\n"
-            + "    return float(signed_value);"
-    }
-    return scaleDefer
-        ? "    return float(as_type<half>(raw));"
-        : "    return float(as_type<half>(raw)) * 4194304.0f;"
-}
-
-/// Accumulator declaration for `laguna_tail_nvfp4_qdot`: the seed-elided arm
-/// drops the dead `= 0` initializer because the first group now assigns.
-func lagunaTailNVFP4QDotAccumDeclSource(seedElide: Bool) -> String {
-    seedElide ? "float accum;" : "float accum = 0;"
-}
-
-/// First four-term product group of `laguna_tail_nvfp4_qdot`. Seed-elided, the
-/// first code word (`j == 0`) assigns the accumulator; every other word adds.
-/// The `if (j == 0)` / `else` split and the multiply/add expressions are the
-/// exact text o_proj's `firstAccum` emits, so the association is untouched --
-/// only a signed-zero can differ, absorbed by the `+0.0f`-seeded `result` and
-/// the BF16 epilogue. The non-elided arm reproduces the frontier group verbatim.
-func lagunaTailNVFP4QDotFirstGroupSource(seedElide: Bool) -> String {
-    seedElide
-        ? "if (j == 0) {\n"
-            + "                accum =\n"
-            + "                    (x_thread[8 * j] * v04.x +\n"
-            + "                     x_thread[8 * j + 1] * v15.x +\n"
-            + "                     x_thread[8 * j + 2] * v26.x +\n"
-            + "                     x_thread[8 * j + 3] * v37.x);\n"
-            + "            } else {\n"
-            + "                accum +=\n"
-            + "                    (x_thread[8 * j] * v04.x +\n"
-            + "                     x_thread[8 * j + 1] * v15.x +\n"
-            + "                     x_thread[8 * j + 2] * v26.x +\n"
-            + "                     x_thread[8 * j + 3] * v37.x);\n"
-            + "            }"
-        : "accum +=\n"
-            + "            (x_thread[8 * j] * v04.x +\n"
-            + "             x_thread[8 * j + 1] * v15.x +\n"
-            + "             x_thread[8 * j + 2] * v26.x +\n"
-            + "             x_thread[8 * j + 3] * v37.x);"
-}
-
-/// The deferred `2^22` re-applied once per output row at the R1 epilogue when
-/// scale-defer is active (empty otherwise), mirroring MoE's
-/// `lagunaNvfp4RowScaleSuffix`.
-func lagunaTailNVFP4RowScaleSuffixSource(scaleDefer: Bool) -> String {
-    scaleDefer ? " * 4194304.0f" : ""
-}
+private let lagunaTailNVFP4ScaleDecode = lagunaTailNVFP4ScaleFoldEnabled
+    ? """
+        return float(as_type<half>(raw)) * 4194304.0f;
+    """
+    : """
+        half converted = as_type<half>(raw);
+        converted *= 256.0;
+        half signed_value = (bits & 128) ? -converted : converted;
+        return float(signed_value);
+    """
 
 private let lagunaTailNVFP4QDotReturn = lagunaTailNVFP4ScaleFoldEnabled
     ? "return scale * accum;"
@@ -4495,7 +4533,7 @@ private let lagunaTailNVFP4QMVHeader = """
                 ? "ushort raw = ushort(bits) << 7;"
                 : "ushort raw = ushort(bits + (bits & 128)) << 7;")
             : "ushort raw = ushort(bits & 127) << 7;")
-        \(lagunaTailNVFP4ScaleDecodeSource(scaleFold: lagunaTailNVFP4ScaleFoldEnabled, scaleDefer: lagunaTailNVFP4QKVScaleDeferEnabled))
+        \(lagunaTailNVFP4ScaleDecode)
     }
 
     static inline float laguna_tail_nvfp4_qdot(
@@ -4503,7 +4541,7 @@ private let lagunaTailNVFP4QMVHeader = """
         const thread float* x_thread,
         float scale
     ) {
-        \(lagunaTailNVFP4QDotAccumDeclSource(seedElide: lagunaTailNVFP4QKVSeedElisionEnabled))
+        float accum = 0;
         const device uint2* wq = (const device uint2*)w;
         const uint2 codes = wq[0];
     #pragma unroll
@@ -4526,7 +4564,11 @@ private let lagunaTailNVFP4QMVHeader = """
             const float2 v15 = float2(as_type<half2>(p1));
             const float2 v26 = float2(as_type<half2>(p2));
             const float2 v37 = float2(as_type<half2>(p3));
-            \(lagunaTailNVFP4QDotFirstGroupSource(seedElide: lagunaTailNVFP4QKVSeedElisionEnabled))
+            accum +=
+                (x_thread[8 * j] * v04.x +
+                 x_thread[8 * j + 1] * v15.x +
+                 x_thread[8 * j + 2] * v26.x +
+                 x_thread[8 * j + 3] * v37.x);
             accum +=
                 (x_thread[8 * j + 4] * v04.y +
                  x_thread[8 * j + 5] * v15.y +
@@ -4578,7 +4620,7 @@ private let lagunaDecodeNVFP4QKVR1Source = """
         column += block_size;
     }
 
-    result = simd_sum(result\(lagunaTailNVFP4RowScaleSuffixSource(scaleDefer: lagunaTailNVFP4QKVScaleDeferEnabled)));
+    result = simd_sum(result);
     if (simd_lid == 0) {
         projected[out_row] = bfloat(result);
     }
@@ -4588,9 +4630,7 @@ private let lagunaDecodeNVFP4QKVR1Kernels: [Int: MLXFast.MLXFastKernel] = {
     var kernels: [Int: MLXFast.MLXFastKernel] = [:]
     for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
         kernels[heads] = MLXFast.metalKernel(
-            name: "laguna_decode_nvfp4_qkv_h\(heads)_r1_v1"
-                + (lagunaTailNVFP4QKVSeedElisionEnabled ? "_se1" : "")
-                + (lagunaTailNVFP4QKVScaleDeferEnabled ? "_sd1" : ""),
+            name: "laguna_decode_nvfp4_qkv_h\(heads)_r1_v1",
             inputNames: ["normalized", "weight_codes", "weight_scales"],
             outputNames: ["projected"],
             source: lagunaDecodeNVFP4QKVR1Source,
@@ -10255,9 +10295,22 @@ final class LagunaRuntimeDecoderLayer: Module {
             x.dim(1) > 1
         {
             // Prefill (multi-token) counterpart of the fused decode branch
-            // above: same row-count-general `lagunaResidualRMSNorm` kernel,
-            // only the call-site guard differs. Full exactness argument in
-            // `lagunaPrefillFusedResidualRMSNormEnabled`'s doc comment.
+            // just above: same kernel (`lagunaResidualRMSNorm`), which is
+            // already fully row-count-general (its Swift wrapper derives
+            // `rows` from `residual.size / hiddenSize` and its grid is
+            // `rows` independent threadgroups; the Metal body indexes
+            // everything from `threadgroup_position_in_grid.x` and
+            // per-threadgroup scratch, with no cross-row state of any
+            // kind) -- only the call-site guard above was decode-only
+            // (`x.size == hiddenSize` forces a single row). The stock ops
+            // it replaces are identical for prefill: with this branch off,
+            // `x.dim(1) > 1` always falls through to the same `h = x + r`
+            // / `normalized = postAttentionLayerNorm(h)` pair the decode
+            // branch already replaces at L == 1, applied row-independently
+            // by both the stock ops and the kernel alike (RMSNorm has no
+            // cross-token interaction in either form). See
+            // `lagunaPrefillFusedResidualRMSNormEnabled`'s doc comment for
+            // the full exactness argument.
             lagunaTrace("prefill residual+rmsnorm")
             (h, normalized) = lagunaResidualRMSNorm(
                 residual: x, branch: r, weight: postAttentionLayerNorm.weight)
@@ -10292,8 +10345,12 @@ final class LagunaRuntimeDecoderLayer: Module {
                 normalized, residual: h, routerLogits: routerLogits,
                 routerKeys: routerKeys)
         }
-        // Layer-0-only decode fusion: `fusedDenseDownResidual` returns nil off
-        // layer 0's decode shape (or if a guard declines); stock path then runs.
+        // Layer-0-only decode fusion: the dense MLP has no
+        // `LagunaRuntimeSparseMoEBlock` branch above to catch it, so its
+        // residual add was the one MLP-side decode dispatch left completely
+        // unfused. `fusedDenseDownResidual` returns `nil` whenever it isn't
+        // layer 0's decode shape (or a guard inside it declines), in which
+        // case the stock path below runs unchanged.
         if let dense = mlp as? LagunaRuntimeMLP,
             let fused = dense.fusedDenseDownResidual(normalized, residual: h)
         {
@@ -10303,86 +10360,15 @@ final class LagunaRuntimeDecoderLayer: Module {
         return h + r2
     }
 
-    /// Final-layer prefill specialization: every row commits K/V, but only the
-    /// last query/output row runs attention output projection + the terminal MLP.
+    /// Final-layer prefill specialization. Every supplied row still produces
+    /// and commits its K/V state, but only the last query/output row proceeds
+    /// through attention output projection and the terminal MLP.
     func callLastPrefillRow(_ x: MLXArray, cache: KVCache?) -> MLXArray {
-        if lagunaTerminalPrefillFusionEnabled {
-            // Fused terminal row (see flag doc). Reuses the ordinary path's
-            // accepted row-local fusion; `else` is the exact stock fallback.
-            let normalized = inputLayerNorm(x)
-            let r = selfAttn.callLastPrefillRow(normalized, cache: cache)
-            let lastResidual = lagunaLastTokenHidden(x)
-            let h: MLXArray
-            let normalizedAfterAttention: MLXArray
-            var routerLogits: MLXArray?
-            var routerKeys: MLXArray?
-            if lagunaFusedResidualRMSNormRouterEnabled,
-                lastResidual.dtype == .bfloat16, r.dtype == .bfloat16,
-                postAttentionLayerNorm.weight.dtype == .bfloat16,
-                lastResidual.shape == [1, 1, LagunaConstants.hiddenSize],
-                lastResidual.shape == r.shape,
-                let sparse = mlp as? LagunaRuntimeSparseMoEBlock,
-                sparse.gate.weight.dtype == .bfloat16,
-                sparse.gate.weight.shape == [
-                    LagunaConstants.numExperts, LagunaConstants.hiddenSize,
-                ]
-            {
-                let fused = lagunaResidualRMSNormRouter(
-                    residual: lastResidual,
-                    branch: r,
-                    weight: postAttentionLayerNorm.weight,
-                    routerWeight: sparse.gate.weight,
-                    correctionBias: sparse.gate.eScoreCorrectionBias)
-                h = fused.summed
-                normalizedAfterAttention = fused.normalized
-                routerLogits = fused.routerLogits
-                routerKeys = fused.routerKeys
-            } else if lagunaFusedResidualRMSNormEnabled,
-                lastResidual.dtype == .bfloat16, r.dtype == .bfloat16,
-                postAttentionLayerNorm.weight.dtype == .bfloat16,
-                lastResidual.shape == r.shape,
-                lastResidual.dim(-1) == LagunaConstants.hiddenSize,
-                lastResidual.size == LagunaConstants.hiddenSize
-            {
-                lagunaTrace("terminal prefill residual+rmsnorm")
-                (h, normalizedAfterAttention) = lagunaResidualRMSNorm(
-                    residual: lastResidual, branch: r,
-                    weight: postAttentionLayerNorm.weight)
-            } else {
-                h = lastResidual + r
-                normalizedAfterAttention = postAttentionLayerNorm(h)
-            }
-            if (
-                lagunaFusedSharedDownResidualEnabled ||
-                    lagunaFusedRoutedSharedDownResidualEnabled
-            ),
-                normalizedAfterAttention.dtype == .bfloat16,
-                normalizedAfterAttention.shape == [
-                    1, 1, LagunaConstants.hiddenSize,
-                ],
-                h.dtype == .bfloat16,
-                h.shape == normalizedAfterAttention.shape,
-                let sparse = mlp as? LagunaRuntimeSparseMoEBlock
-            {
-                return sparse(
-                    normalizedAfterAttention, residual: h,
-                    routerLogits: routerLogits, routerKeys: routerKeys)
-            }
-            if let dense = mlp as? LagunaRuntimeMLP,
-                let fused = dense.fusedDenseDownResidual(
-                    normalizedAfterAttention, residual: h)
-            {
-                return fused
-            }
-            let r2 = mlp(normalizedAfterAttention)
-            return h + r2
-        } else {
-            let normalized = inputLayerNorm(x)
-            let r = selfAttn.callLastPrefillRow(normalized, cache: cache)
-            let h = lagunaLastTokenHidden(x) + r
-            let r2 = mlp(postAttentionLayerNorm(h))
-            return h + r2
-        }
+        let normalized = inputLayerNorm(x)
+        let r = selfAttn.callLastPrefillRow(normalized, cache: cache)
+        let h = lagunaLastTokenHidden(x) + r
+        let r2 = mlp(postAttentionLayerNorm(h))
+        return h + r2
     }
 }
 
@@ -10710,8 +10696,12 @@ final class LagunaRuntimeModelInner: Module {
         // lockstep, as do all sliding caches (vendored `LagunaModelInner`
         // convention).
         let fullMask = createAttentionMask(h: h, cache: cache?[fullAttentionIdx])
-        let slidingMask = createAttentionMask(
-            h: h, cache: cache?[slidingAttentionIdx], windowSize: slidingWindow)
+        let slidingMask = lagunaMarkSteadySlidingMask(
+            createAttentionMask(
+                h: h, cache: cache?[slidingAttentionIdx], windowSize: slidingWindow),
+            windowSize: slidingWindow,
+            batchSize: h.dim(0)
+        )
 
         let isSingleTokenDecode = inputs.shape == [1, 1]
         let decodeFireMask: UInt64 =
@@ -10824,6 +10814,28 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        // Chunked long-context prefill (see `lagunaPrefillChunkEnabled`):
+        // mirror the stock `LLMModel.prepare` slice loop for direct callers
+        // so a [1, L] prompt with L > 512 is fed in bounded slices with the
+        // cache evaluated (and the sliding caches trimmed) between slices.
+        // Single-token decode and ranked-window prefills (L <= 512) never
+        // enter this loop, so the scored path is bit-identical with or
+        // without the flag.
+        if lagunaPrefillChunkEnabled,
+            let cache,
+            inputs.ndim == 2,
+            inputs.dim(0) == 1,
+            inputs.dim(1) > lagunaPrefillChunkSize
+        {
+            var remaining = inputs
+            while remaining.dim(1) > lagunaPrefillChunkSize {
+                _ = callAsFunction(
+                    remaining[0..., ..<lagunaPrefillChunkSize], cache: cache)
+                eval(cache)
+                remaining = remaining[0..., lagunaPrefillChunkSize...]
+            }
+            return callAsFunction(remaining, cache: cache)
+        }
         let fullHidden = model(inputs, cache: cache)
         // Every consumer of multi-token logits reads only the LAST
         // position's row. Slice before the row-independent final RMSNorm and

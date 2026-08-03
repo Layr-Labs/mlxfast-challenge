@@ -42,6 +42,14 @@ const char* steel_attention_nax() {
 #define DARKBLOOM_ATTN_QBLOCK_ZIGZAG 1
 #endif
 
+#ifndef DARKBLOOM_ATTN_SLIDING_BAND_SKIP
+#define DARKBLOOM_ATTN_SLIDING_BAND_SKIP 1
+#endif
+
+#ifndef DARKBLOOM_ATTN_SLIDING_MASK_INTERIOR_SKIP
+#define DARKBLOOM_ATTN_SLIDING_MASK_INTERIOR_SKIP 1
+#endif
+
 ///////////////////////////////////////////////////////////////////////////////
 // Contents from "mlx/backend/metal/kernels/steel/defines.h"
 ///////////////////////////////////////////////////////////////////////////////
@@ -1557,6 +1565,8 @@ template <
   // without changing a value or any arithmetic order.
   int sg_kb_min_causal = kb_min_causal;
   int sg_kb_lim = kb_lim;
+  int sg_kb_first_active = 0;
+  bool marked_sliding_band = false;
   if (do_causal && !has_mask) {
     int sg_q_min =
         int(tidl.x) * BQ + params->qL_off + int(tm);
@@ -1565,6 +1575,29 @@ template <
         int(tidl.x) * BQ + params->qL_off + int(tm) + kU * TQ;
     sg_kb_lim = min(kb_lim, (sg_q_max + BK - 1) / BK);
   }
+
+
+#if DARKBLOOM_ATTN_SLIDING_BAND_SKIP
+  // Laguna's steady 512-token slice uses the same row-major bool band mask
+  // on [qL,kL]=[512,1023]. The model marks that verified mask with -512 in
+  // the otherwise-unused stride of its singleton batch dimension; shape
+  // alone never opts a generic bool mask into these semantics. Skip K blocks
+  // wholly outside the band while retaining both boundary blocks.
+  if constexpr (is_same_v<MaskType, bool> && BQ == 64 && BK == 32 && BD == 128) {
+    if (has_mask && !do_causal && params->B == 1 && params->H == 64 &&
+        params->gqa_factor == 8 && params->qL == 512 && params->kL == 1023 &&
+        params->NQ == 8 && params->NK == 32 && params->qL_off == 511 &&
+        mask_params->M_strides[0] == -512 && mask_params->M_strides[1] == 0 &&
+        mask_params->M_strides[2] == 1023) {
+      const int sg_q_min = int(tidl.x) * BQ + int(tm);
+      const int sg_q_max = sg_q_min + kU * TQ;
+      sg_kb_first_active = sg_q_min / BK;
+      sg_kb_lim = min(sg_kb_lim,
+          (sg_q_max + params->qL_off + BK - 1) / BK);
+      marked_sliding_band = true;
+    }
+  }
+#endif
 
   const bool is_last_bq = int(tidl.x) == (params->NQ_aligned);
   // const bool is_last_tq = int(simd_group_id) >= (params->qL_rem / UQ);
@@ -1633,7 +1666,7 @@ template <
     // Causal elision: guard the score computation and the zero P@V work, but
     // never a barrier or the outer-loop pointer advance. See the sg_kb_lim
     // comment above for the exactness argument.
-    const bool sg_active = kb < sg_kb_lim;
+    const bool sg_active = kb >= sg_kb_first_active && kb < sg_kb_lim;
     if (sg_active) {
 
     STEEL_PRAGMA_UNROLL
@@ -1757,8 +1790,19 @@ template <
       }
     }
 
-    // Other masking as needed
-    if (has_mask) {
+    // Other masking as needed. In the wrapped steady state qL_off is exactly
+    // window-1, so this simdgroup's first and last active BK blocks are the
+    // only ones that can contain false mask cells: q starts on a 16-row
+    // boundary and BK is 32. Preserve those two boundary loads verbatim; all
+    // intervening blocks are proven all-true by the marked producer contract.
+#if DARKBLOOM_ATTN_SLIDING_MASK_INTERIOR_SKIP
+    const bool apply_array_mask =
+        !marked_sliding_band ||
+        kb == sg_kb_first_active || kb + 1 == sg_kb_lim;
+#else
+    constexpr bool apply_array_mask = true;
+#endif
+    if (has_mask && apply_array_mask) {
       constexpr auto neg_inf = Limits<AccumType>::finite_min;
 
       const int base_row = int(tidl.x) * BQ + tm;
