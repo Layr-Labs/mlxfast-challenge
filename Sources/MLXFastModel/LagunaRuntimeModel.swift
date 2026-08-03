@@ -7383,6 +7383,148 @@ private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// `DARKBLOOM_ROUTED_GATEUP_R1_PF` (default ON; set "0" to fall back to the
+/// unmodified R1 literal above): depth-1 register prefetch of the BF16 input
+/// row inside the routed gate/up packed QMV. The input row address depends
+/// only on `lane` — never on the routed expert — so the k = 0 block's loads
+/// can be issued ABOVE the serial top-8 prologue, which is ~40 dependent
+/// `simd_shuffle_xor` rounds with no DRAM traffic of its own, and each later
+/// k-block's loads can be issued before the current block's qdots. The
+/// DRAM latency then sits under ALU that would otherwise run dead-serial in
+/// front of it.
+///
+/// Bit-exactness: the prefetch moves only WHEN the input bytes land in
+/// registers. The same bytes are read, converted to float in the same
+/// per-vector order into the same `input_values` slots, and the
+/// `gate_result` / `up_result` accumulation sequence, the weight/scale
+/// pointer arithmetic, the `simd_sum` order and the SwiGLU/BF16 epilogue are
+/// textually the R1 variant's. No reassociation.
+///
+/// The kernel name carries a `_pf1` suffix (the `_sc1`/`_se1` convention) so
+/// the name-keyed custom-kernel library cache can never see two different
+/// sources under one name.
+let lagunaRoutedGateUpR1PrefetchEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1_PF"] != "0"
+
+private let lagunaRoutedSwiGLUQMVPackedTop8R1PrefetchKernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v1_pf1",
+    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
+    outputNames: ["activated"],
+    source: """
+        constexpr uint input_width = 2048;
+        constexpr uint output_width = 512;
+        constexpr uint block_width = 512;
+        constexpr uint values_per_lane = 16;
+        constexpr uint vectors_per_lane = values_per_lane / 4;
+        constexpr uint routed_experts = 8;
+        constexpr uint fused_row_bytes = 1024;
+        constexpr uint fused_expert_bytes = 1024 * fused_row_bytes;
+        constexpr uint scale_row_bytes = 32;
+        constexpr uint scale_sub_bytes = 8 * scale_row_bytes;
+        constexpr uint scale_kblock_bytes = scale_sub_bytes;
+        constexpr uint scale_tile_bytes = 4 * scale_kblock_bytes;
+        constexpr uint packed_expert_bytes = 128 * scale_tile_bytes;
+
+        uint group = threadgroup_position_in_grid.x;
+        uint expert_slot = group % routed_experts;
+        uint tile = group / routed_experts;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint logical_row = tile * 2 + simd_group;
+
+        // k = 0 issued above the serial top-8 prologue: the input address is
+        // a function of `lane` alone, so it is known before the winner is.
+        thread vec<bfloat, 4> pf_current[vectors_per_lane];
+        thread vec<bfloat, 4> pf_next[vectors_per_lane];
+        {
+            const device vec<bfloat, 4>* input_vectors =
+                (const device vec<bfloat, 4>*) (
+                    input + lane * values_per_lane);
+            for (uint i = 0; i < vectors_per_lane; ++i) {
+                pf_current[i] = input_vectors[i];
+            }
+        }
+
+        \(lagunaRouterTop8PrecomputedPrelude)
+        uint expert = top8_winner;
+
+        const device uint8_t* expert_weight =
+            (const device uint8_t*)fused_weight + expert * fused_expert_bytes;
+        const device uint8_t* row_scales =
+            packed_scales + expert * packed_expert_bytes
+            + (logical_row / 4) * scale_tile_bytes;
+        uint sub = logical_row % 4;
+        uint gate_row = (logical_row / 32) * 64 + logical_row % 32;
+        uint up_row = gate_row + 32;
+
+        thread float gate_result = 0.0f;
+        thread float up_result = 0.0f;
+        thread float input_values[values_per_lane];
+
+        for (uint block = 0; block < input_width; block += block_width) {
+            const bool has_next = block + block_width < input_width;
+            if (has_next) {
+                const device vec<bfloat, 4>* next_vectors =
+                    (const device vec<bfloat, 4>*) (
+                        input + block + block_width + lane * values_per_lane);
+                for (uint i = 0; i < vectors_per_lane; ++i) {
+                    pf_next[i] = next_vectors[i];
+                }
+            }
+
+            for (uint i = 0; i < vectors_per_lane; ++i) {
+                const vec<bfloat, 4> values = pf_current[i];
+                input_values[4 * i] = values[0];
+                input_values[4 * i + 1] = values[1];
+                input_values[4 * i + 2] = values[2];
+                input_values[4 * i + 3] = values[3];
+            }
+
+            const device uint8_t* block_scales =
+                row_scales + (block / block_width) * scale_kblock_bytes;
+            const device uint8_t* gate_scale =
+                block_scales + sub * 2 * scale_row_bytes + lane;
+            const device uint8_t* up_scale = gate_scale + scale_row_bytes;
+            const device uint8_t* gate_weight =
+                expert_weight + gate_row * fused_row_bytes
+                + block / 2 + lane * 8;
+            const device uint8_t* up_weight =
+                expert_weight + up_row * fused_row_bytes
+                + block / 2 + lane * 8;
+
+            gate_result += laguna_nvfp4_qdot_16(
+                gate_weight, input_values,
+                laguna_nvfp4_scale(gate_scale[0]));
+            up_result += laguna_nvfp4_qdot_16(
+                up_weight, input_values,
+                laguna_nvfp4_scale(up_scale[0]));
+
+            if (has_next) {
+                for (uint i = 0; i < vectors_per_lane; ++i) {
+                    pf_current[i] = pf_next[i];
+                }
+            }
+        }
+
+        gate_result = simd_sum(gate_result);
+        up_result = simd_sum(up_result);
+        if (lane == 0) {
+            bfloat gate = bfloat(gate_result\(lagunaNvfp4RowScaleSuffix));
+            bfloat up = bfloat(up_result\(lagunaNvfp4RowScaleSuffix));
+            bfloat exp_abs = metal::exp(metal::abs(gate));
+            bfloat denominator = bfloat(1) + exp_abs;
+            bfloat y = bfloat(1) / denominator;
+            bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+            bfloat silu = bfloat(gate * sigmoid);
+            activated[expert_slot * output_width + logical_row] =
+                bfloat(silu * up);
+        }
+        """,
+    header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
+        + "\n" + lagunaRouterTop8PrologueHeader,
+    ensureRowContiguous: true
+)
+
 func lagunaRoutedSwiGLUQMVPackedTop8(
     _ input: MLXArray,
     fusedWeight: MLXArray,
@@ -7397,7 +7539,11 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
     precondition(routerKeys.size == LagunaConstants.numExperts)
 
     if lagunaRoutedGateUpR1Enabled {
-        return lagunaRoutedSwiGLUQMVPackedTop8R1Kernel(
+        let r1Kernel =
+            lagunaRoutedGateUpR1PrefetchEnabled
+            ? lagunaRoutedSwiGLUQMVPackedTop8R1PrefetchKernel
+            : lagunaRoutedSwiGLUQMVPackedTop8R1Kernel
+        return r1Kernel(
             [input, fusedWeight, packedScales, routerKeys],
             grid: (LagunaConstants.numExpertsPerTok * 256 * 64, 1, 1),
             threadGroup: (64, 1, 1),
