@@ -639,8 +639,6 @@ METAL_FUNC void fp_qmm_t_impl(
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
   constexpr short SK = 32;
-  static_assert(SK == 32, "dense NAX fragment width");
-  static_assert(SK % 16 == 0, "dense NAX fragment divisibility");
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
@@ -1999,39 +1997,27 @@ template <
           simd_lane_id);
 
       for (int k = 0; k < K_it; ++k) {
-        // Bit-exact A-operand hoist (the XMAJOR arm's shipped pattern at
-        // one-eighth its register cost): this iteration's x fragments load
-        // into registers BEFORE the two staging barriers, overlapping the
-        // sorted-x device reads with the weight staging they previously
-        // serialized behind. x is read-only, the A registers carry no
-        // dependence on Ws, both barriers remain, and the MMA chain
-        // (k ascending, kk1 ascending, same Dtile) is untouched, so every
-        // accumulation happens in the identical order on identical values.
-        // The partial-row arm uses load_rows: at this instantiation
-        // load_safe's column predicate is a tautology (widest touched
-        // column is 31 < SK), so bytes, addresses, and zero-fills are
-        // identical while the row predicate hoists out of the contiguous
-        // four-element runs and the Int<1> contiguous branch is restored.
+        // Bit-exact A-operand hoist (XMAJOR arm's shipped pattern, 1/8
+        // register cost): loads precede both barriers; order untouched.
+        // load_rows: column predicate tautological, same bytes/zero-fills.
         NAXTile<T, TM, TK> Atile[BK / SK];
         if (sg_active) {
           STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             if (sgp_sm == SM) {
-              Atile[kk1 / SK].load(xn + kk1, kernel_K);
+              // 8B alignment certified: fn multiples of 4 elems, off_y in
+              // {0,16}, kk1 in {0,32}, str_x = 2048. Same bytes, same slots.
+              Atile[kk1 / SK].load_contig(xn + kk1, kernel_K);
             } else {
-              Atile[kk1 / SK].load_rows(xn + kk1, kernel_K, sgp_sm);
+              // Same 8B-aligned runs as the full-row arm.
+              Atile[kk1 / SK].load_rows_contig(xn + kk1, kernel_K, sgp_sm);
             }
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // DARKBLOOM_EXPERT_STAGE_WIDEST / DARKBLOOM_EXPERT_STAGE_WIDELD:
-        // same bytes, same addresses, same nibble decode, same scale mapping
-        // -- only the access widths change (16 scalar 2B threadgroup stores
-        // -> 2 16B stores per thread; 8 scalar 1B device loads -> 1 8B load
-        // per thread). See load_unsafe_wide. The store side needs no host
-        // certification (Ws is 16B aligned by construction); the load side
-        // is host-certified via darkbloom_stage_wide_load_ok and per-thread
-        // self-guarded, falling back to the scalar path on any misalignment.
+        // WIDEST/WIDELD: same bytes/addresses/decode, only access widths
+        // change; store side 16B-aligned by construction, load side
+        // host-certified + self-guarded. See load_unsafe_wide.
         if constexpr (wide_store || wide_load) {
           loader_w.template load_unsafe_wide<wide_store, wide_load>();
         } else {
@@ -2040,19 +2026,15 @@ template <
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg_active) {
-          // PRAGMA-VARIANT 01: SK-step staging+MMA loop, 2 iterations
-          // (BK=64/SK=32): Atile TMxTK=1x2 device frags + Btile TNxTK=2x2
-          // threadgroup frags per step, serially-dependent Dtile MMA chain.
-          // Full unroll + volatile removal let the second step's 6 fragment
-          // loads hoist ahead of the first step's MMAs. This kernel is built
-          // WITHOUT function constants (static expert shape path), so the
-          // stage_novol lever never reaches it -- the volatile must go here.
-          // Scheduling only: no arithmetic, order, or rounding change.
+          // PRAGMA-VARIANT 01: full unroll + volatile removal (scheduling
+          // only; no arithmetic, order, or rounding change).
           STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             NAXTile<Wtype, TN, TK> Btile;
 
-            Btile.template load<Wtype, BK_padded, 1>(
+            // Ws is 16B-aligned (NAXWsChunk16), BK_padded*2B = 144B row
+            // stride, runs at multiples of 8B: same bytes, same slots.
+            Btile.template load_contig_tg<Wtype, BK_padded>(
                 Ws + tn * BK_padded + kk1);
 
             tile_matmad_nax(
@@ -2069,16 +2051,8 @@ template <
         loader_w.next();
       }
 #else
-      // DARKBLOOM_STAGE2_GATHER: software-pipelined staging. The stock loop
-      // serializes every k-iteration as
-      //     barrier ; stage(k) ; barrier ; mma(k)
-      // so all 8 staging simdgroups idle during mma and the mma simdgroups
-      // idle during staging (at EG256 the mean expert run is ~16 rows, so
-      // usually only 2 of 8 simdgroups have MMA work). Here tile k+1's
-      // device fetch issues BEFORE the MMAs that consume tile k, its
-      // decode+threadgroup-store lands after them, and one joint barrier per
-      // iteration both publishes tile k+1 (RAW) and retires tile k's reads
-      // before that buffer is overwritten by tile k+2 (WAR).
+      // DARKBLOOM_STAGE2_GATHER: double-buffered staging arm (ranked
+      // receipt 297bf8c6: prefill +4.2%, default OFF).
       //
       // EXACTNESS (class A): the staged VALUES for every tile are produced
       // by the identical decode chain from the identical device bytes to the
@@ -2176,7 +2150,11 @@ template <
       }
 #endif // DARKBLOOM_STAGE2_GATHER
 
+#ifndef DARKBLOOM_SWIGLU_REGLOCAL
+      // Staged-epilogue arm only: reg-local epilogues read no threadgroup
+      // memory and the next chunk's k-loop opens with its own WAR barrier.
       threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif // DARKBLOOM_SWIGLU_REGLOCAL
       const bool fuse_swiglu =
           kernel_N == 1024 && kernel_K == 2048;
       if (fuse_swiglu) {
