@@ -2138,6 +2138,7 @@ template <
           Ws,
           simd_group_id,
           simd_lane_id);
+      static_assert(BK >= SK, "A-hoist requires a nonempty fragment set");
 
       for (int k = 0; k < K_it; ++k) {
         // Bit-exact A-operand hoist (the XMAJOR arm's shipped pattern at
