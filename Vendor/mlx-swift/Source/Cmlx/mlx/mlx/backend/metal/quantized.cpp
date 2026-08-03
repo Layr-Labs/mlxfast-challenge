@@ -1698,7 +1698,7 @@ void gather_qmm_rhs_nax(
   // BOTH the flag and the expert path; a declining guard prints "inactive".
   {
     static const bool stage2_flag =
-        env::get_var("DARKBLOOM_STAGE2_GATHER", "") == "1";
+        env::get_var("DARKBLOOM_STAGE2_GATHER", "") != "0";
     static const bool trace_fusion =
         env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1";
     if (stage2_flag || trace_fusion) {

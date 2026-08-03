@@ -1145,7 +1145,7 @@ namespace {
 // pipeline was built from the stage-2 source.
 const char* darkbloom_stage2_gather_define() {
   static const char* define = [] {
-    const bool v = env::get_var("DARKBLOOM_STAGE2_GATHER", "") == "1";
+    const bool v = env::get_var("DARKBLOOM_STAGE2_GATHER", "") != "0";
     if (v || env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1") {
       fprintf(
           stderr,
