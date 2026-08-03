@@ -2138,6 +2138,8 @@ template <
           Ws,
           simd_group_id,
           simd_lane_id);
+      static_assert(BK % SK == 0, "A-hoist fragment count drift");
+      static_assert(BK >= SK, "A-hoist requires at least one fragment");
 
       for (int k = 0; k < K_it; ++k) {
         // Bit-exact A-operand hoist (the XMAJOR arm's shipped pattern at
