@@ -1824,6 +1824,9 @@ template <
 #endif
   threadgroup bfloat* gate_up_stage =
       (threadgroup bfloat*)Ws_storage;
+#ifdef DARKBLOOM_M8_COOP_TAIL
+  threadgroup float m8_tail_c[8 * 64];
+#endif
 #ifdef DARKBLOOM_BSEARCH_HOIST
   threadgroup int bounds[experts / expert_groups + 1];
 #else
@@ -2125,6 +2128,91 @@ template <
         }
       }
 #else
+#ifdef DARKBLOOM_M8_COOP_TAIL
+      if constexpr (
+          metal::is_same_v<T, bfloat> && metal::is_same_v<Wtype, bfloat> &&
+          BM == 64 && BN == 64 && BK == 64 && WM == 4 && WN == 1) {
+        if (chunk_rows <= 8) {
+          constexpr int kM8 = 8, kN8 = 64, kK8 = 16;
+          const device T* xn8 = x + size_t(chunk_start) * kernel_K;
+          thread loader_w_t loader_w8(
+              wl + size_t(expert) * stride_w,
+              scale_base + size_t(expert) * stride_s,
+              kernel_K, Ws, simd_group_id, simd_lane_id);
+          constexpr auto m8_desc = mpp::tensor_ops::matmul2d_descriptor(
+              kM8, kN8, kK8, false, true, true,
+              mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+          mpp::tensor_ops::matmul2d<
+              m8_desc, metal::execution_simdgroups<4>> m8_op;
+          auto m8_a0 = tensor(
+              const_cast<device T*>(xn8), extents<int, kK8, kM8>(),
+              array<int, 2>{1, kernel_K});
+          auto m8_b0 = tensor(
+              Ws, extents<int, kK8, kN8>(),
+              array<int, 2>{1, BK_padded});
+          auto m8_c = m8_op.get_destination_cooperative_tensor<
+              decltype(m8_a0), decltype(m8_b0), float>();
+#pragma clang loop unroll(full)
+          for (uint16_t i = 0; i < m8_c.get_capacity(); ++i) {
+            if (m8_c.is_valid_element(i)) {
+              m8_c[i] = 0.0f;
+            }
+          }
+          for (int k = 0; k < K_it; ++k) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if constexpr (wide_store || wide_load) {
+              loader_w8.template load_unsafe_wide<wide_store, wide_load>();
+            } else {
+              loader_w8.load_unsafe();
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            STEEL_PRAGMA_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += kK8) {
+              auto m8_a = tensor(
+                  const_cast<device T*>(xn8 + kk1),
+                  extents<int, kK8, kM8>(),
+                  array<int, 2>{1, kernel_K});
+              auto m8_b = tensor(
+                  Ws + kk1, extents<int, kK8, kN8>(),
+                  array<int, 2>{1, BK_padded});
+              m8_op.run(m8_a, m8_b, m8_c);
+            }
+            xn8 += BK;
+            loader_w8.next();
+          }
+          auto m8_out = tensor(m8_tail_c, extents<int, kN8, kM8>());
+          m8_c.store(m8_out);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          const bool fuse_swiglu8 = kernel_N == 1024 && kernel_K == 2048;
+          if (fuse_swiglu8) {
+#pragma clang fp contract(off)
+            constexpr int ac = BN / 2;
+            for (int linear = int(lid);
+                 linear < int(chunk_rows) * ac; linear += 128) {
+              const int row = linear / ac, col = linear % ac;
+              const bfloat gate = bfloat(m8_tail_c[row * kN8 + col]);
+              const bfloat up = bfloat(m8_tail_c[row * kN8 + ac + col]);
+              const bfloat exp_abs = metal::exp(metal::abs(gate));
+              const bfloat denominator = bfloat(1) + exp_abs;
+              const bfloat z = bfloat(1) / denominator;
+              const bfloat sigmoid = gate < bfloat(0) ? z : bfloat(1) - z;
+              const bfloat silu = bfloat(gate * sigmoid);
+              y[size_t(chunk_start + row) * (kernel_N / 2) +
+                size_t(tid.x) * ac + col] = bfloat(silu * up);
+            }
+          } else {
+            for (int linear = int(lid);
+                 linear < int(chunk_rows) * BN; linear += 128) {
+              const int row = linear / BN, col = linear % BN;
+              y[size_t(chunk_start + row) * kernel_N + y_col + col] =
+                  static_cast<T>(m8_tail_c[row * kN8 + col]);
+            }
+          }
+          continue;
+        }
+      }
+#endif
+
       NAXTile<float, TM, TN> Dtile;
       Dtile.clear();
 
