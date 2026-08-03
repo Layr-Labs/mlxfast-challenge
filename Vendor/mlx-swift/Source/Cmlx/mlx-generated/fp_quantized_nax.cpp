@@ -2140,6 +2140,30 @@ template <
           simd_lane_id);
 
       for (int k = 0; k < K_it; ++k) {
+        // Bit-exact A-operand hoist (the XMAJOR arm's shipped pattern at
+        // one-eighth its register cost): this iteration's x fragments load
+        // into registers BEFORE the two staging barriers, overlapping the
+        // sorted-x device reads with the weight staging they previously
+        // serialized behind. x is read-only, the A registers carry no
+        // dependence on Ws, both barriers remain, and the MMA chain
+        // (k ascending, kk1 ascending, same Dtile) is untouched, so every
+        // accumulation happens in the identical order on identical values.
+        // The partial-row arm uses load_rows: at this instantiation
+        // load_safe's column predicate is a tautology (widest touched
+        // column is 31 < SK), so bytes, addresses, and zero-fills are
+        // identical while the row predicate hoists out of the contiguous
+        // four-element runs and the Int<1> contiguous branch is restored.
+        NAXTile<T, TM, TK> Atile[BK / SK];
+        if (sg_active) {
+          STEEL_PRAGMA_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            if (sgp_sm == SM) {
+              Atile[kk1 / SK].load(xn + kk1, kernel_K);
+            } else {
+              Atile[kk1 / SK].load_rows(xn + kk1, kernel_K, sgp_sm);
+            }
+          }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // DARKBLOOM_EXPERT_STAGE_WIDEST / DARKBLOOM_EXPERT_STAGE_WIDELD:
         // same bytes, same addresses, same nibble decode, same scale mapping
@@ -2159,21 +2183,14 @@ template <
         if (sg_active) {
           STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            NAXTile<T, TM, TK> Atile;
             NAXTile<Wtype, TN, TK> Btile;
 
-            if (sgp_sm == SM) {
-              Atile.load(xn + kk1, kernel_K);
-            } else {
-              Atile.load_safe(
-                  xn + kk1, kernel_K, short2(SK, sgp_sm));
-            }
             Btile.template load<Wtype, BK_padded, 1>(
                 Ws + tn * BK_padded + kk1);
 
             tile_matmad_nax(
                 Dtile,
-                Atile,
+                Atile[kk1 / SK],
                 metal::bool_constant<false>{},
                 Btile,
                 metal::bool_constant<true>{});
