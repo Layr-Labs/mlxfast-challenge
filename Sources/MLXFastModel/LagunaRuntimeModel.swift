@@ -471,6 +471,12 @@ private let lagunaLastPrefillProjectionBanksEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_LAST_PREFILL_PROJECTION_BANKS"] != "0"
 
+/// `DARKBLOOM_TERMINAL_FUSION` (default ON; set "0" to disable): current-API
+/// port of overlay-dropped `9f98995`. `callLastPrefillRow` reuses the ordinary
+/// path's accepted row-local fused residual+RMSNorm(+router)+MoE-tail helpers.
+private let lagunaTerminalPrefillFusionEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_TERMINAL_FUSION"] != "0"
+
 /// Full-attention counterpart: fuses per-head Q/K RMSNorm with partial YaRN
 /// RoPE. One stock FP32 probe row carries the authoritative rotary factors,
 /// while the custom kernel preserves the normalized BF16 boundary and tail.
@@ -10249,22 +10255,9 @@ final class LagunaRuntimeDecoderLayer: Module {
             x.dim(1) > 1
         {
             // Prefill (multi-token) counterpart of the fused decode branch
-            // just above: same kernel (`lagunaResidualRMSNorm`), which is
-            // already fully row-count-general (its Swift wrapper derives
-            // `rows` from `residual.size / hiddenSize` and its grid is
-            // `rows` independent threadgroups; the Metal body indexes
-            // everything from `threadgroup_position_in_grid.x` and
-            // per-threadgroup scratch, with no cross-row state of any
-            // kind) -- only the call-site guard above was decode-only
-            // (`x.size == hiddenSize` forces a single row). The stock ops
-            // it replaces are identical for prefill: with this branch off,
-            // `x.dim(1) > 1` always falls through to the same `h = x + r`
-            // / `normalized = postAttentionLayerNorm(h)` pair the decode
-            // branch already replaces at L == 1, applied row-independently
-            // by both the stock ops and the kernel alike (RMSNorm has no
-            // cross-token interaction in either form). See
-            // `lagunaPrefillFusedResidualRMSNormEnabled`'s doc comment for
-            // the full exactness argument.
+            // above: same row-count-general `lagunaResidualRMSNorm` kernel,
+            // only the call-site guard differs. Full exactness argument in
+            // `lagunaPrefillFusedResidualRMSNormEnabled`'s doc comment.
             lagunaTrace("prefill residual+rmsnorm")
             (h, normalized) = lagunaResidualRMSNorm(
                 residual: x, branch: r, weight: postAttentionLayerNorm.weight)
@@ -10299,12 +10292,8 @@ final class LagunaRuntimeDecoderLayer: Module {
                 normalized, residual: h, routerLogits: routerLogits,
                 routerKeys: routerKeys)
         }
-        // Layer-0-only decode fusion: the dense MLP has no
-        // `LagunaRuntimeSparseMoEBlock` branch above to catch it, so its
-        // residual add was the one MLP-side decode dispatch left completely
-        // unfused. `fusedDenseDownResidual` returns `nil` whenever it isn't
-        // layer 0's decode shape (or a guard inside it declines), in which
-        // case the stock path below runs unchanged.
+        // Layer-0-only decode fusion: `fusedDenseDownResidual` returns nil off
+        // layer 0's decode shape (or if a guard declines); stock path then runs.
         if let dense = mlp as? LagunaRuntimeMLP,
             let fused = dense.fusedDenseDownResidual(normalized, residual: h)
         {
@@ -10314,15 +10303,86 @@ final class LagunaRuntimeDecoderLayer: Module {
         return h + r2
     }
 
-    /// Final-layer prefill specialization. Every supplied row still produces
-    /// and commits its K/V state, but only the last query/output row proceeds
-    /// through attention output projection and the terminal MLP.
+    /// Final-layer prefill specialization: every row commits K/V, but only the
+    /// last query/output row runs attention output projection + the terminal MLP.
     func callLastPrefillRow(_ x: MLXArray, cache: KVCache?) -> MLXArray {
-        let normalized = inputLayerNorm(x)
-        let r = selfAttn.callLastPrefillRow(normalized, cache: cache)
-        let h = lagunaLastTokenHidden(x) + r
-        let r2 = mlp(postAttentionLayerNorm(h))
-        return h + r2
+        if lagunaTerminalPrefillFusionEnabled {
+            // Fused terminal row (see flag doc). Reuses the ordinary path's
+            // accepted row-local fusion; `else` is the exact stock fallback.
+            let normalized = inputLayerNorm(x)
+            let r = selfAttn.callLastPrefillRow(normalized, cache: cache)
+            let lastResidual = lagunaLastTokenHidden(x)
+            let h: MLXArray
+            let normalizedAfterAttention: MLXArray
+            var routerLogits: MLXArray?
+            var routerKeys: MLXArray?
+            if lagunaFusedResidualRMSNormRouterEnabled,
+                lastResidual.dtype == .bfloat16, r.dtype == .bfloat16,
+                postAttentionLayerNorm.weight.dtype == .bfloat16,
+                lastResidual.shape == [1, 1, LagunaConstants.hiddenSize],
+                lastResidual.shape == r.shape,
+                let sparse = mlp as? LagunaRuntimeSparseMoEBlock,
+                sparse.gate.weight.dtype == .bfloat16,
+                sparse.gate.weight.shape == [
+                    LagunaConstants.numExperts, LagunaConstants.hiddenSize,
+                ]
+            {
+                let fused = lagunaResidualRMSNormRouter(
+                    residual: lastResidual,
+                    branch: r,
+                    weight: postAttentionLayerNorm.weight,
+                    routerWeight: sparse.gate.weight,
+                    correctionBias: sparse.gate.eScoreCorrectionBias)
+                h = fused.summed
+                normalizedAfterAttention = fused.normalized
+                routerLogits = fused.routerLogits
+                routerKeys = fused.routerKeys
+            } else if lagunaFusedResidualRMSNormEnabled,
+                lastResidual.dtype == .bfloat16, r.dtype == .bfloat16,
+                postAttentionLayerNorm.weight.dtype == .bfloat16,
+                lastResidual.shape == r.shape,
+                lastResidual.dim(-1) == LagunaConstants.hiddenSize,
+                lastResidual.size == LagunaConstants.hiddenSize
+            {
+                lagunaTrace("terminal prefill residual+rmsnorm")
+                (h, normalizedAfterAttention) = lagunaResidualRMSNorm(
+                    residual: lastResidual, branch: r,
+                    weight: postAttentionLayerNorm.weight)
+            } else {
+                h = lastResidual + r
+                normalizedAfterAttention = postAttentionLayerNorm(h)
+            }
+            if (
+                lagunaFusedSharedDownResidualEnabled ||
+                    lagunaFusedRoutedSharedDownResidualEnabled
+            ),
+                normalizedAfterAttention.dtype == .bfloat16,
+                normalizedAfterAttention.shape == [
+                    1, 1, LagunaConstants.hiddenSize,
+                ],
+                h.dtype == .bfloat16,
+                h.shape == normalizedAfterAttention.shape,
+                let sparse = mlp as? LagunaRuntimeSparseMoEBlock
+            {
+                return sparse(
+                    normalizedAfterAttention, residual: h,
+                    routerLogits: routerLogits, routerKeys: routerKeys)
+            }
+            if let dense = mlp as? LagunaRuntimeMLP,
+                let fused = dense.fusedDenseDownResidual(
+                    normalizedAfterAttention, residual: h)
+            {
+                return fused
+            }
+            let r2 = mlp(normalizedAfterAttention)
+            return h + r2
+        } else {
+            let normalized = inputLayerNorm(x)
+            let r = selfAttn.callLastPrefillRow(normalized, cache: cache)
+            let h = lagunaLastTokenHidden(x) + r
+            let r2 = mlp(postAttentionLayerNorm(h))
+            return h + r2
+        }
     }
 }
 
