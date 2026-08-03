@@ -3795,6 +3795,18 @@ func lagunaGateProductSoftplus(
 
 // MARK: - Gated native-affine INT8 output projection (one dispatch)
 
+/// `DARKBLOOM_SEED_ELIDE_RESIDUAL` (default on; "0" restores the byte-identical
+/// stock strings): peels the first product of the INT8 `accum` loops so the dead
+/// `+0.0f` seed add goes away -- same closed signed-zero case as the NVFP4 qdot.
+let lagunaSeedElideResidualEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SEED_ELIDE_RESIDUAL"] != "0"
+
+private func lagunaSeedElideResidualInit(_ firstTerm: String) -> String {
+    lagunaSeedElideResidualEnabled ? firstTerm : "0.0f"
+}
+
+private let lagunaSeedElideResidualFrom = lagunaSeedElideResidualEnabled ? "1" : "0"
+
 /// Exact per-head softplus gate plus group-32 affine INT8 output GEMV.
 private func lagunaGatedAffineOProjSource(heads: Int, indexed: Bool = false) -> String {
     let metadataPointers = indexed
@@ -3875,8 +3887,12 @@ private func lagunaGatedAffineOProjSource(heads: Int, indexed: Bool = false) -> 
     uint column = simd_lid * values_per_thread;
     for (uint k = 0; k < in_vec_size; k += block_size) {
         float gate = gate_table[column >> head_shift];
-        float sum = 0.0f;
-        for (uint i = 0; i < values_per_thread; ++i) {
+        \(lagunaSeedElideResidualEnabled ? """
+        float seed_value = float(bfloat(float(xp[0]) * gate));
+        x_thread[0] = seed_value;
+        """ : "")
+        float sum = \(lagunaSeedElideResidualInit("seed_value"));
+        for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
             float value = float(bfloat(float(xp[i]) * gate));
             sum += value;
             x_thread[i] = value;
@@ -3885,8 +3901,8 @@ private func lagunaGatedAffineOProjSource(heads: Int, indexed: Bool = false) -> 
         for (uint row = 0; row < results_per_simdgroup; ++row) {
             const device uint8_t* wl = ws + row * in_vec_size;
             \(metadataLoad)
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
+            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * wl[0]"));
+            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
                 accum += x_thread[i] * wl[i];
             }
             result[row] += scale * accum + sum * bias;
@@ -4692,8 +4708,11 @@ private func lagunaNormAffineQKVBody(
 
     for (uint j = 0; j < virtual_per_thread; ++j) {
         uint base = (lid + j * real_threads) * n_reads;
-        float acc = 0.0f;
-        for (uint i = 0; i < n_reads; ++i) {
+        \(lagunaSeedElideResidualEnabled ? """
+        float x0 = float(residual[base]);
+        """ : "")
+        float acc = \(lagunaSeedElideResidualInit("x0 * x0"));
+        for (uint i = \(lagunaSeedElideResidualFrom); i < n_reads; ++i) {
             float xi = float(residual[base + i]);
             acc += xi * xi;
         }
@@ -4731,8 +4750,11 @@ private func lagunaNormAffineQKVBody(
 
     uint column = simd_lid * values_per_thread;
     for (uint k = 0; k < axis_size; k += block_size) {
-        float sum = 0.0f;
-        for (uint i = 0; i < values_per_thread; ++i) {
+        \(lagunaSeedElideResidualEnabled ? """
+        float sum;
+        { uint i = 0; \(loadValue) sum = value; x_thread[0] = value; }
+        """ : "float sum = 0.0f;")
+        for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
             \(loadValue)
             sum += value;
             x_thread[i] = value;
@@ -4742,8 +4764,8 @@ private func lagunaNormAffineQKVBody(
             const device uint8_t* wl = ws + row * axis_size;
             float scale = float(sc[row * in_vec_size_g]);
             float bias = float(bs[row * in_vec_size_g]);
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
+            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * wl[0]"));
+            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
                 accum += x_thread[i] * wl[i];
             }
             result[row] += scale * accum + sum * bias;
@@ -4899,8 +4921,11 @@ private func lagunaNormAffineQKVPrefetchSource(
 
     for (uint j = 0; j < virtual_per_thread; ++j) {
         uint base = (lid + j * real_threads) * n_reads;
-        float acc = 0.0f;
-        for (uint i = 0; i < n_reads; ++i) {
+        \(lagunaSeedElideResidualEnabled ? """
+        float x0 = float(residual[base]);
+        """ : "")
+        float acc = \(lagunaSeedElideResidualInit("x0 * x0"));
+        for (uint i = \(lagunaSeedElideResidualFrom); i < n_reads; ++i) {
             float xi = float(residual[base + i]);
             acc += xi * xi;
         }
@@ -4929,8 +4954,8 @@ private func lagunaNormAffineQKVPrefetchSource(
 
     uint column = simd_lid * values_per_thread;
     for (uint d = 0; d < pf_depth; ++d) {
-        float sum = 0.0f;
-        for (uint i = 0; i < values_per_thread; ++i) {
+        \(lagunaSeedElideResidualEnabled ? "float sum; { float v = float(bfloat(norm_weight[column] * bfloat(float(residual[column]) * laguna_inv_mean))); sum = v; x_thread[0] = v; }" : "float sum = 0.0f;")
+        for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
             float value = float(bfloat(
                             norm_weight[column + i] *
                             bfloat(float(residual[column + i]) * laguna_inv_mean)));
@@ -4938,8 +4963,8 @@ private func lagunaNormAffineQKVPrefetchSource(
             x_thread[i] = value;
         }
         for (uint row = 0; row < results_per_simdgroup; ++row) {
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
+            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * pf_w[d][row][0]"));
+            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
                 accum += x_thread[i] * pf_w[d][row][i];
             }
             result[row] += pf_s[d][row] * accum + sum * pf_b[d][row];
@@ -4949,8 +4974,8 @@ private func lagunaNormAffineQKVPrefetchSource(
         column += block_size;
     }
     for (uint k = pf_depth * block_size; k < axis_size; k += block_size) {
-        float sum = 0.0f;
-        for (uint i = 0; i < values_per_thread; ++i) {
+        \(lagunaSeedElideResidualEnabled ? "float sum; { float v = float(bfloat(norm_weight[column] * bfloat(float(residual[column]) * laguna_inv_mean))); sum = v; x_thread[0] = v; }" : "float sum = 0.0f;")
+        for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
             float value = float(bfloat(
                             norm_weight[column + i] *
                             bfloat(float(residual[column + i]) * laguna_inv_mean)));
@@ -4961,8 +4986,8 @@ private func lagunaNormAffineQKVPrefetchSource(
         for (uint row = 0; row < results_per_simdgroup; ++row) {
             const device uint8_t* wl = ws + row * axis_size;
             \(metadataLoad)
-            float accum = 0.0f;
-            for (uint i = 0; i < values_per_thread; ++i) {
+            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * wl[0]"));
+            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
                 accum += x_thread[i] * wl[i];
             }
             result[row] += scale * accum + sum * bias;
