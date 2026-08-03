@@ -639,6 +639,7 @@ METAL_FUNC void fp_qmm_t_impl(
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
   constexpr short SK = 32;
+  static_assert(BK > 0, "QMM K tile must remain positive");
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
@@ -671,7 +672,14 @@ METAL_FUNC void fp_qmm_t_impl(
   dispatch_bool(aligned_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
       for (int k = 0; k < kernel_K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // First-iteration WAR elision for static-K instantiations: at k == 0
+        // no simdgroup has read Ws yet in this dispatch, so there is nothing
+        // to order before the first stage; kernel_K is a compile-time
+        // constant there, the loop unrolls fully, and the guard folds away.
+        // Dynamic-K instantiations keep the unconditional stock barrier.
+        if (fixed_K == 0 || k > 0) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
@@ -710,8 +718,13 @@ METAL_FUNC void fp_qmm_t_impl(
         loader_w.next();
       }
 
-      // Store results to device memory
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Store results to device memory. Static-K elision: the stores read
+      // only each simdgroup's own register tiles — Ws is dead after the
+      // final MMA and no threadgroup memory is read past this point, so
+      // the barrier orders nothing there; dynamic-K instantiations keep it.
+      if (fixed_K == 0) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
 
       if constexpr (kAlignedM.value && kAlignedN.value) {
         Dtile.store(y + tm * kernel_N + tn, kernel_N);
