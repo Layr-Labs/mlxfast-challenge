@@ -27,6 +27,10 @@ using namespace metal;
 
 #define MLX_MTL_CONST static constant constexpr const
 
+#ifndef DARKBLOOM_DENSE_AHOIST
+#define DARKBLOOM_DENSE_AHOIST 1
+#endif
+
 MLX_MTL_CONST int SIMD_SIZE = 32;
 MLX_MTL_CONST int QUAD_SIZE = 4;
 
@@ -82,62 +86,10 @@ inline void dequantize(uint8_t w, U scale, threadgroup U* w_local) {
   }
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// NVFP4 block-loader staging fast path.
-//
-// Two bit-exact rewrites of the fp4 staging chain QuantizedBlockLoader runs
-// (the qmm / gather-qmm prefill kernels). Both rest on one observation about
-// `fp4_e2m1::operator float16_t()`:
-//
-//     half converted = as_type<half>(ushort((bits & 7) << 9));
-//     converted *= 16384.0;                        // 2^14
-//     return bits & 8 ? -converted : converted;
-//
-// The 3-bit magnitude field is *bit-embedded* into a half -- fp4's 2-bit
-// exponent lands in the low two bits of half's 5-bit exponent field and fp4's
-// single mantissa bit lands in half mantissa bit 9 -- so the reinterpreted
-// half is already the right number up to a fixed power of two: exactly
-// {0, .5, 1, 1.5, 2, 3, 4, 6} * 2^-14. The `* 16384.0` is a pure
-// renormalization, never a rounding step. (0.5 * 2^-14 == 2^-15 is a half
-// subnormal, and its bit pattern is precisely the one we started from, so
-// nothing rounds there either.)
-//
-// CHANGE 1 -- hoist the 2^14 out of the per-value converts into the one
-// per-group scale. The loader stores `scale * value`, so with
-//     s = the e4m3 group scale (at most 4 significant bits, |s| in
-//         [2^-9, 448] or NaN)
-//     m = an fp4 magnitude in {0, .5, 1, 1.5, 2, 3, 4, 6}
-// today's chain rounds `s * (m * 2^-14 * 2^14)` once and the folded chain
-// rounds `(s * 2^14) * (m * 2^-14)` once. Every factor is exact in binary FP:
-//   * s * 2^14 only shifts an exponent -- no rounding -- and can neither
-//     overflow (448 * 2^14 = 7340032, far inside float) nor underflow
-//     (2^-9 * 2^14 = 2^5),
-//   * m * 2^-14 is exactly representable in half, bfloat and float,
-//   * so both orderings are the SAME real number rounded once to the same
-//     destination type: identical bits.
-// The per-value multiply count drops from `n_reads * pack_factor` to one.
-// This is the loader-side sibling of the 2^22 fold `laguna_nvfp4_scale`
-// already carries in the decode custom kernels.
-//
-// Restricted to group_size == 16, the e4m3 (NVFP4) scale. mxfp4's e8m0 scales
-// (group_size 32) reach 2^127, where s * 2^14 would overflow to inf, so those
-// instantiations keep the original chain byte for byte.
-//
-// CHANGE 2 -- spread eight nibbles per uint32 instead of two per byte. The
-// byte-at-a-time chain costs AND + SHL + half multiply + AND + compare +
-// select per nibble plus a SHR per byte (~104 scalar ops per thread per
-// k-iteration at 16 values). The uint-at-a-time spread is four masked-
-// shift-OR groups, 19 integer ops per uint32, each producing a half2 whose
-// two lanes are two nibbles with the sign folded into the same OR. Ported
-// from `laguna_nvfp4_qdot_16` in the decode custom kernels. The half bit
-// patterns it builds are exactly the ones fp4_e2m1 builds one lane at a time,
-// so the staged values are unchanged.
-//
-// Verified by exhaustive GPU enumeration against the byte-at-a-time chain for
-// bfloat16_t, float16_t and float: all 256 scale bytes x all 256 packed
-// bytes, and all 256 scale bytes x all 65536 four-nibble codes -- 0 bit
-// mismatches out of 404,226,048 staged values.
-///////////////////////////////////////////////////////////////////////////////
+// Bit-exact NVFP4 loader fast path: fold the exact 2^14 normalization into
+// group-16 e4m3 scales and unpack four bytes at once. Exhaustive enumeration
+// covered 404,226,048 staged values with zero bit mismatches. Group-32 e8m0
+// keeps the original path because the scale fold can overflow there.
 
 // Per-group NVFP4 scale with fp4's 2^14 renormalization folded in (Change 1).
 static inline float fp4nv_scale_x16384(uint8_t s) {
@@ -670,6 +622,45 @@ METAL_FUNC void fp_qmm_t_impl(
 
   dispatch_bool(aligned_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
+#if DARKBLOOM_DENSE_AHOIST
+      for (int k = 0; k < kernel_K; k += BK) {
+        NAXTile<T, TM, TK> Atile_h[BK / SK];
+        STEEL_PRAGMA_UNROLL
+        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          if constexpr (kAlignedM.value) {
+            Atile_h[kk1 / SK].load(x + kk1, kernel_K);
+          } else {
+            Atile_h[kk1 / SK].load_rows(x + kk1, kernel_K, sgp_sm);
+          }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (kAlignedN.value) {
+          loader_w.load_unsafe();
+        } else {
+          loader_w.load_safe(short2(BK, tgp_bn));
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        STEEL_PRAGMA_NO_UNROLL
+        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          NAXTile<Wtype, TN, TK> Btile;
+
+          Btile.template load<Wtype, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+          tile_matmad_nax(
+              Dtile,
+              Atile_h[kk1 / SK],
+              metal::bool_constant<transpose_a>{},
+              Btile,
+              metal::bool_constant<transpose_b>{});
+        }
+
+        x += BK;
+        loader_w.next();
+      }
+#else
       for (int k = 0; k < kernel_K; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if constexpr (kAlignedN.value) {
@@ -709,6 +700,7 @@ METAL_FUNC void fp_qmm_t_impl(
         x += BK;
         loader_w.next();
       }
+#endif
 
       // Store results to device memory
       threadgroup_barrier(mem_flags::mem_threadgroup);
