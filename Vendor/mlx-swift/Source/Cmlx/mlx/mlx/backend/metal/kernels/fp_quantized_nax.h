@@ -354,6 +354,15 @@ struct QuantizedBlockLoader {
   // certification for 16B bases is strictly stronger than the 8B one, so it
   // is reused unchanged; only the per-thread offset check relaxes to 8B.
   MLX_MTL_CONST bool kWideLoad8ShapeOk = kWidenShapeOk && (kSrcBytes == 8);
+  // Expert-aligned Laguna FP4 staging owns exactly one 16-value scale group
+  // per thread: two 32-bit codewords, one E4M3 scale, and two 16B stores.
+  // Keep that native shape intact instead of unpacking the 8B device load to
+  // sb[] and reconstructing the same two words before decode. Besides the
+  // register-copy removal, this makes the single scale load/decode explicit;
+  // the generic chunk walk visits that same scale twice.
+  MLX_MTL_CONST bool kFP4CodePairShapeOk = kWideLoad8ShapeOk && fp4nv_fast &&
+      (n_steps_per_read == 1) && (kWideChunks == 2) &&
+      (kSrcBytesPerChunk == 4);
 
   struct alignas(16) WideChunk {
     T v[kWideElems];
@@ -404,6 +413,48 @@ struct QuantizedBlockLoader {
     if (!store_ok && !load_ok) {
       load_unsafe();
       return;
+    }
+
+    // DARKBLOOM_FP4_CODEPAIR: direct native-codeword path for the shipped
+    // expert-aligned geometry. `uint2` is 8B aligned; the host certifies the
+    // tile base and load_ok self-checks this thread's offset before the cast.
+    // codes.x/codes.y are exactly the little-endian words fp4nv_pack4 would
+    // rebuild from sb[0...3]/sb[4...7]. Both decode calls use the one scale
+    // governing all 16 values, and write the same two WideChunks to the same
+    // addresses. No floating-point expression or rounding boundary changes.
+    if constexpr (kFP4CodePairShapeOk) {
+      static_assert(kSrcBytes == sizeof(uint2), "FP4 code-pair width drift");
+      static_assert(kWideChunks == 2, "FP4 code-pair chunk drift");
+      static_assert(
+          kSrcBytesPerChunk == sizeof(uint32_t), "FP4 codeword width drift");
+      static_assert(n_steps_per_read == 1, "FP4 scale-step drift");
+      if (load_ok) {
+        const uint2 codes = *((const device uint2*)src);
+        const float scale = fp4nv_scale_x16384(scales[0]);
+        WideChunk out;
+        fp4nv_decode8<T>(codes.x, scale, out.v);
+        if (store_ok) {
+          *((threadgroup WideChunk*)dst) = out;
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < kWideElems; j++) {
+            dst[j] = out.v[j];
+          }
+        }
+
+        // Reuse the same register scratch after the first chunk has reached
+        // threadgroup memory, matching the old chunk loop's live range.
+        fp4nv_decode8<T>(codes.y, scale, out.v);
+        if (store_ok) {
+          *((threadgroup WideChunk*)(dst + kWideElems)) = out;
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < kWideElems; j++) {
+            dst[kWideElems + j] = out.v[j];
+          }
+        }
+        return;
+      }
     }
 
     uint8_t sb[kSrcBytes];
@@ -671,7 +722,11 @@ METAL_FUNC void fp_qmm_t_impl(
   dispatch_bool(aligned_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
       for (int k = 0; k < kernel_K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Static-K: no prior Ws consumer on first tile. Keep barrier for
+        // later tiles and every dynamic-K instantiation.
+        if (fixed_K == 0 || k > 0) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
@@ -710,8 +765,11 @@ METAL_FUNC void fp_qmm_t_impl(
         loader_w.next();
       }
 
-      // Store results to device memory
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Static-K store uses register tiles only; Ws is dead after the loop.
+      // Dynamic-K keeps the conservative barrier.
+      if (fixed_K == 0) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
 
       if constexpr (kAlignedM.value && kAlignedN.value) {
         Dtile.store(y + tm * kernel_N + tn, kernel_N);
@@ -1997,30 +2055,6 @@ template <
           simd_lane_id);
 
       for (int k = 0; k < K_it; ++k) {
-        // Bit-exact A-operand hoist (the XMAJOR arm's shipped pattern at
-        // one-eighth its register cost): this iteration's x fragments load
-        // into registers BEFORE the two staging barriers, overlapping the
-        // sorted-x device reads with the weight staging they previously
-        // serialized behind. x is read-only, the A registers carry no
-        // dependence on Ws, both barriers remain, and the MMA chain
-        // (k ascending, kk1 ascending, same Dtile) is untouched, so every
-        // accumulation happens in the identical order on identical values.
-        // The partial-row arm uses load_rows: at this instantiation
-        // load_safe's column predicate is a tautology (widest touched
-        // column is 31 < SK), so bytes, addresses, and zero-fills are
-        // identical while the row predicate hoists out of the contiguous
-        // four-element runs and the Int<1> contiguous branch is restored.
-        NAXTile<T, TM, TK> Atile[BK / SK];
-        if (sg_active) {
-          STEEL_PRAGMA_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            if (sgp_sm == SM) {
-              Atile[kk1 / SK].load(xn + kk1, kernel_K);
-            } else {
-              Atile[kk1 / SK].load_rows(xn + kk1, kernel_K, sgp_sm);
-            }
-          }
-        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // DARKBLOOM_EXPERT_STAGE_WIDEST / DARKBLOOM_EXPERT_STAGE_WIDELD:
         // same bytes, same addresses, same nibble decode, same scale mapping
@@ -2048,14 +2082,21 @@ template <
           // Scheduling only: no arithmetic, order, or rounding change.
           STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
             NAXTile<Wtype, TN, TK> Btile;
 
+            if (sgp_sm == SM) {
+              Atile.load(xn + kk1, kernel_K);
+            } else {
+              Atile.load_safe(
+                  xn + kk1, kernel_K, short2(SK, sgp_sm));
+            }
             Btile.template load<Wtype, BK_padded, 1>(
                 Ws + tn * BK_padded + kk1);
 
             tile_matmad_nax(
                 Dtile,
-                Atile[kk1 / SK],
+                Atile,
                 metal::bool_constant<false>{},
                 Btile,
                 metal::bool_constant<true>{});
