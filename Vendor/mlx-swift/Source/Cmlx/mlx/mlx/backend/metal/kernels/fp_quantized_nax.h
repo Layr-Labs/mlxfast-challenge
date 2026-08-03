@@ -1995,6 +1995,7 @@ template <
           Ws,
           simd_group_id,
           simd_lane_id);
+      static_assert(SK == 32, "A-hoist fragment width drift");
 
       for (int k = 0; k < K_it; ++k) {
         // Bit-exact A-operand hoist (the XMAJOR arm's shipped pattern at
