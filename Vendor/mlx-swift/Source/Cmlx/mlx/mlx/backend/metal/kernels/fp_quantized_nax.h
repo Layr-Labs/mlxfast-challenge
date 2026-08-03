@@ -476,65 +476,6 @@ struct QuantizedBlockLoader {
     }
   }
 
-  // DARKBLOOM_STAGE2_GATHER: register-staged twin of load_unsafe(), split in
-  // two so fp_gather_qmm_rhs_expert_nax can issue tile k+1's device fetch
-  // BEFORE the MMAs that consume tile k. fetch_stage2 reads exactly the bytes
-  // stage() reads -- this thread's n_reads packed bytes and its
-  // n_steps_per_read scale bytes -- into thread registers; store_stage2 then
-  // runs the identical decode chain (same expressions, same single rounding
-  // per element, same destination addresses) from those registers. Values and
-  // addresses are unchanged on every path; only WHEN the device reads issue
-  // moves. fp4nv_pack4 has a thread-space overload with identical
-  // little-endian assembly, so the fp4nv fast path stays bit-identical too.
-#ifdef DARKBLOOM_STAGE2_GATHER
-  void fetch_stage2(
-      thread uint8_t (&sb)[kSrcBytes],
-      thread uint8_t (&ss)[n_steps_per_read]) const {
-    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
-      return;
-    }
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < n_steps_per_read; i++) {
-      ss[i] = scales[i];
-    }
-    STEEL_PRAGMA_UNROLL
-    for (short b = 0; b < kSrcBytes; b++) {
-      sb[b] = src[b];
-    }
-  }
-
-  void store_stage2(
-      const thread uint8_t (&sb)[kSrcBytes],
-      const thread uint8_t (&ss)[n_steps_per_read]) const {
-    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
-      return;
-    }
-    if constexpr (fp4nv_fast) {
-      int k = 0;
-      for (int i = 0; i < n_steps_per_read; i++) {
-        const float scale = fp4nv_scale_x16384(ss[i]);
-        for (int j = 0; j < n_reads_per_scale / 4; j++) {
-          T vals[8];
-          fp4nv_decode8<T>(fp4nv_pack4(sb + k), scale, vals);
-          for (int e = 0; e < 8; e++) {
-            dst[k * pack_factor + e] = vals[e];
-          }
-          k += 4;
-        }
-      }
-    } else {
-      int k = 0;
-      for (int i = 0; i < n_steps_per_read; i++) {
-        T scale = dequantize_scale<T, group_size>(ss[i]);
-        for (int j = 0; j < n_reads_per_scale; j++) {
-          dequantize<T, bits>(
-              sb[k * bytes_per_pack], scale, dst + k * pack_factor);
-          k++;
-        }
-      }
-    }
-  }
-#endif // DARKBLOOM_STAGE2_GATHER
 
   void load_safe(short2 src_tile_dim) const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
@@ -671,7 +612,9 @@ METAL_FUNC void fp_qmm_t_impl(
   dispatch_bool(aligned_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
       for (int k = 0; k < kernel_K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (fixed_K == 0 || k > 0) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
@@ -710,8 +653,9 @@ METAL_FUNC void fp_qmm_t_impl(
         loader_w.next();
       }
 
-      // Store results to device memory
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (fixed_K == 0) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
 
       if constexpr (kAlignedM.value && kAlignedN.value) {
         Dtile.store(y + tm * kernel_N + tn, kernel_N);
@@ -1669,16 +1613,6 @@ template <
   threadgroup NAXWsChunk16<Wtype>
       Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
   threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
-#ifdef DARKBLOOM_STAGE2_GATHER
-  // Stage-2 double buffering: a second staging region with identical
-  // geometry, ping-ponged with Ws across k-iterations so tile k+1 stages
-  // while the MMAs consume tile k. Doubles staging threadgroup memory
-  // (2 x BN x BK_padded x sizeof(Wtype) = 18,432 B at BN=BK=64/bfloat) --
-  // an occupancy trade, deliberately NOT a tile-geometry change.
-  threadgroup NAXWsChunk16<Wtype>
-      Ws2_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
-  threadgroup Wtype* Ws2 = (threadgroup Wtype*)Ws2_storage;
-#endif
   threadgroup bfloat* gate_up_stage =
       (threadgroup bfloat*)Ws_storage;
 #ifdef DARKBLOOM_BSEARCH_HOIST
@@ -1987,7 +1921,6 @@ template <
 
       const device T* xn =
           x + size_t(chunk_start + tm) * kernel_K;
-#ifndef DARKBLOOM_STAGE2_GATHER
       thread loader_w_t loader_w(
           wl + size_t(expert) * stride_w,
           scale_base + size_t(expert) * stride_s,
@@ -2066,113 +1999,6 @@ template <
         xn += BK;
         loader_w.next();
       }
-#else
-      // DARKBLOOM_STAGE2_GATHER: software-pipelined staging. The stock loop
-      // serializes every k-iteration as
-      //     barrier ; stage(k) ; barrier ; mma(k)
-      // so all 8 staging simdgroups idle during mma and the mma simdgroups
-      // idle during staging (at EG256 the mean expert run is ~16 rows, so
-      // usually only 2 of 8 simdgroups have MMA work). Here tile k+1's
-      // device fetch issues BEFORE the MMAs that consume tile k, its
-      // decode+threadgroup-store lands after them, and one joint barrier per
-      // iteration both publishes tile k+1 (RAW) and retires tile k's reads
-      // before that buffer is overwritten by tile k+2 (WAR).
-      //
-      // EXACTNESS (class A): the staged VALUES for every tile are produced
-      // by the identical decode chain from the identical device bytes to the
-      // identical addresses within a buffer (fetch_stage2/store_stage2 are
-      // textual twins of stage() with the source bytes passing through
-      // registers); the MMA consumption order -- k ascending, kk1 ascending,
-      // the same tile_matmad_nax chain into the same Dtile -- and every
-      // output's accumulation order are untouched. Only WHEN loads issue and
-      // WHICH of two identical-layout buffers holds odd tiles change.
-      thread loader_w_t loader_even(
-          wl + size_t(expert) * stride_w,
-          scale_base + size_t(expert) * stride_s,
-          kernel_K,
-          Ws,
-          simd_group_id,
-          simd_lane_id);
-      thread loader_w_t loader_odd(
-          wl + size_t(expert) * stride_w,
-          scale_base + size_t(expert) * stride_s,
-          kernel_K,
-          Ws2,
-          simd_group_id,
-          simd_lane_id);
-      loader_odd.next();
-
-      // WAR: the previous chunk's reads of Ws retire before tile 0
-      // overwrites it (the stock loop pays this same barrier at the top of
-      // its first k-iteration).
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      loader_even.load_unsafe();
-      loader_even.next();
-      loader_even.next();
-      // RAW: tile 0 visible to every simdgroup before its MMAs.
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-
-      for (int k = 0; k < K_it; ++k) {
-        const bool have_next = (k + 1) < K_it;
-        const bool next_odd = ((k + 1) & 1) != 0;
-        uint8_t sb[loader_w_t::kSrcBytes];
-        uint8_t ss[loader_w_t::n_steps_per_read];
-        // Explicit parity branches rather than a loader pointer: with the
-        // static-shape K_it this loop fully unrolls, the parity is a
-        // constant per iteration, and both loaders stay register-resident.
-        if (have_next) {
-          if (next_odd) {
-            loader_odd.fetch_stage2(sb, ss);
-          } else {
-            loader_even.fetch_stage2(sb, ss);
-          }
-        }
-
-        threadgroup Wtype* Wsk = (k & 1) ? Ws2 : Ws;
-        if (sg_active) {
-          STEEL_PRAGMA_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            NAXTile<T, TM, TK> Atile;
-            NAXTile<Wtype, TN, TK> Btile;
-
-            if (sgp_sm == SM) {
-              Atile.load(xn + kk1, kernel_K);
-            } else {
-              Atile.load_safe(
-                  xn + kk1, kernel_K, short2(SK, sgp_sm));
-            }
-            Btile.template load<Wtype, BK_padded, 1>(
-                Wsk + tn * BK_padded + kk1);
-
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile,
-                metal::bool_constant<true>{});
-
-          }
-        }
-
-        if (have_next) {
-          if (next_odd) {
-            loader_odd.store_stage2(sb, ss);
-            loader_odd.next();
-            loader_odd.next();
-          } else {
-            loader_even.store_stage2(sb, ss);
-            loader_even.next();
-            loader_even.next();
-          }
-        }
-
-        xn += BK;
-        // Joint barrier: publishes tile k+1 for the next iteration's MMAs
-        // (RAW) and retires this iteration's reads of tile k before that
-        // buffer is overwritten (WAR).
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-      }
-#endif // DARKBLOOM_STAGE2_GATHER
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
       const bool fuse_swiglu =
