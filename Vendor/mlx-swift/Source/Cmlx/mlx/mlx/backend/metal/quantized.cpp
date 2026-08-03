@@ -1561,18 +1561,9 @@ bool darkbloom_stage_wide_load_ok(
 // dispatch divides grid.x by exactly the value the kernel was compiled
 // with.
 int darkbloom_gather_xmajor_ct() {
-  static const int v = [] {
-    const std::string s = env::get_var("DARKBLOOM_GATHER_XMAJOR", "");
-    if (s.empty() || s == "0") {
-      return 0;
-    }
-    if (s == "1") {
-      return 4; // tuned default fold
-    }
-    const int ct = atoi(s.c_str());
-    return (ct == 2 || ct == 4 || ct == 8 || ct == 16) ? ct : 0;
-  }();
-  return v;
+  // XMAJOR kernel arms removed with the dead staging code; keep the
+  // dispatch/JIT contract coherent by pinning the fold OFF.
+  return 0;
 }
 
 // DARKBLOOM_SWIGLU_REGLOCAL: register-local swiglu epilogue in the
