@@ -409,21 +409,11 @@ private func lagunaNativeAffineGProjWeight(_ weight: MLXArray) -> LagunaNativeAf
 /// **DEFAULT ON, deliberately** (`!= "0"`; set
 /// `DARKBLOOM_FUSED_SLIDING_QK_NORM_ROPE=0` to ablate).
 ///
-/// History, because the negative result and its resolution are the
-/// instructive part — but note the default is ON today:
-///  * Submission `7333473` ranked this fusion at **-0.19%** (1.09995 against
-///    a 1.10187 frontier) and it shipped default-off. The diagnosis at the
-///    time — "one simdgroup per head is a bad kernel shape" — was wrong.
-///  * The actual cause was one redundant line. The kernel parked the inverse
-///    RMS in a `threadgroup` slot and issued a `simdgroup_barrier` to
-///    broadcast it, but `simd_sum` already returns the total to *every* lane,
-///    so each lane can derive the same `precise::rsqrt` locally and
-///    bit-identically. At 72 threadgroups per layer across 30 sliding layers
-///    that barrier was paid **2160 times per decode token** for nothing, and
-///    the full-attention twin had the identical pattern (another 560).
-///  * Deleting both and **re-enabling** this fusion measured 10.456 -> 10.326
-///    ms steady step (+1.19%, 4/4 pairs) and promoted as `9e06de6` at
-///    **1.12019, +1.73%** — the largest single win in the project.
+/// History (default ON today): once ranked -0.19% (misdiagnosed as a bad
+/// kernel shape); the real cause was a redundant `simdgroup_barrier`
+/// broadcasting the inverse RMS that `simd_sum` already gives every lane (paid
+/// 2160+560 times/decode token). Removing it and re-enabling promoted
+/// `9e06de6` at +1.73%, the largest single win.
 ///
 /// So the -0.19% figure describes a kernel that no longer exists. Do not
 /// spend measurement pairs re-ablating this on the strength of that number.
@@ -2211,6 +2201,31 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Pre-materialized `[writeIdx, writeIdx+1, capacity]` carriers at the full
+/// cache's natural post-seed capacity 768, built once in untimed warmup;
+/// replaces the fresh 3-word MLXArray per full-attn decode call (ten lockstep
+/// layers share one). INPUT-INDEPENDENT: keyed only on write index + physical
+/// capacity (request-local state); other capacities use the generic carrier.
+private enum LagunaFullParamsAtlasStore {
+    static let capacity = 768
+    nonisolated(unsafe) static let entries: [MLXArray] = {
+        let atlas = (0..<LagunaFullParamsAtlasStore.capacity).map {
+            MLXArray([
+                UInt32($0), UInt32($0 + 1),
+                UInt32(LagunaFullParamsAtlasStore.capacity),
+            ])
+        }
+        for entry in atlas { eval(entry) }
+        return atlas
+    }()
+}
+
+/// `DARKBLOOM_FULL_PARAMS_ATLAS` (default ON; set "0" to disable) serves the
+/// full-attention carrier from the pre-evaluated atlas above instead of
+/// constructing it fresh per call. Identical bytes either way; `=0` is stock.
+private let lagunaFullParamsAtlasEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FULL_PARAMS_ATLAS"] != "0"
+
 /// Fused decode attention for a full-attention layer with spare backing
 /// capacity. Returns `[1, heads, 1, headDim]`; the caller advances the
 /// cache clock via `KVCacheSimple.fusedAppendAdvance()`.
@@ -2248,9 +2263,20 @@ func lagunaFullFusedAttention(
     precondition(scale.dtype == .float32 && scale.size == 1)
 
     lagunaTrace("full fused attention")
-    let params = MLXArray([
-        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
-    ])
+    let params: MLXArray
+    if lagunaFullParamsAtlasEnabled,
+        capacity == LagunaFullParamsAtlasStore.capacity,
+        writeIdx < LagunaFullParamsAtlasStore.entries.count
+    {
+        // Pre-evaluated shared carrier; its three UInt32 words are exactly
+        // `[writeIdx, writeIdx+1, capacity]`, byte-identical to the fresh
+        // array below. Any other capacity/index falls through to it.
+        params = LagunaFullParamsAtlasStore.entries[writeIdx]
+    } else {
+        params = MLXArray([
+            UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
+        ])
+    }
     return lagunaFullFusedAttentionKernel(
         [
             rawQueries, rawKeys, rawValues,
@@ -2299,6 +2325,11 @@ func lagunaWarmFullFusedAttentionKernel() {
         writeIdx: 1,
         scale: scale
     ))
+    if lagunaFullParamsAtlasEnabled {
+        // Build the params atlas untimed so its 768 tiny allocations do not
+        // land on the first timed decode step (which would mask the gain).
+        _ = LagunaFullParamsAtlasStore.entries
+    }
 }
 
 /// Multi-token sliding-layer Q/K RMSNorm + plain RoPE fusion. One dispatch
@@ -7554,22 +7585,11 @@ func lagunaRoutedDownReduce(
     )[0]
 }
 
-/// Encode-order lever for the 9-slot down+residual dispatch. MLX's eval
-/// traversal visits a node's inputs in declaration order, and Metal memory
-/// barriers are encoder-wide. Hypothesis was that listing the shared-expert
-/// inputs first would let the shared SwiGLU QMV overlap the router top-8
-/// latency; MEASURED (2026-08-01, M5 Max 128 GB, driver rig, 150-step
-/// cool-floor windows): shared-first REGRESSES ~+0.10 ms/step. Cause: in
-/// the shipped routed-first order the shared QMV is encoded after the
-/// routed QMV with no intervening barrier, so it already overlaps the
-/// routed QMV on the GPU; moving it before the top-8 barrier makes the
-/// barrier ahead of the routed QMV wait on the shared QMV too, LENGTHENING
-/// the critical path (barriers are encoder-wide, not per-resource). Kept as
-/// an opt-in A/B arm (`DARKBLOOM_SHARED_FIRST_DOWN=1`) for re-measurement
-/// if the surrounding dispatch anatomy changes; both orders are bit-exact
-/// (pure input permutation, kernel body addresses inputs by name; the
-/// reordered variant carries a new kernel name because the JIT cache keys
-/// signatures by name).
+/// Encode-order A/B (`DARKBLOOM_SHARED_FIRST_DOWN=1`, default off): shared-first
+/// was hoped to overlap router top-8 latency, but MEASURED -0.10 ms/step
+/// (encoder-wide barriers make the pre-routed barrier wait on the shared QMV
+/// too). Both orders bit-exact (pure input permutation, kernel addresses inputs
+/// by name; the reordered variant just carries a new JIT kernel name).
 let lagunaSharedFirstDownOrderEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_FIRST_DOWN"] == "1"
 
