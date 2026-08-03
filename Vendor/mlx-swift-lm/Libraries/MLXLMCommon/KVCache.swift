@@ -322,6 +322,17 @@ public func createSSMMask(h: MLXArray, cache: MambaCache?) -> MLXArray? {
     return nil
 }
 
+/// `DARKBLOOM_KV_PRE_GROW` (default ON; set "0" to disable): when the first
+/// cache update lands exactly on an allocation-step boundary (a seed prefill
+/// whose length is a multiple of `step`, e.g. 512 with step 256), allocate
+/// one extra `step` of headroom so the first single-token decode update has
+/// spare capacity and engages `fusedAppendPrepare` — the fused decode
+/// attention path — instead of the stock zero-alloc + concat growth.
+/// Memory-layout only: returned slices cover the same rows with the same
+/// bytes; the trailing zero slots are never read.
+let kvCachePreGrowEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_KV_PRE_GROW"] != "0"
+
 /// Standard KV cache implementation based on Python's KVCache
 /// See https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/base.py#L11
 public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
@@ -351,6 +362,37 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         if self.keys == nil, previous == 0, tokenCount > 0,
             tokenCount.isMultiple(of: step)
         {
+            if kvCachePreGrowEnabled {
+                // Pre-grow: allocate one extra `step` of slots so the first
+                // single-token decode update has spare capacity and takes the
+                // fused append path (`fusedAppendPrepare` guards on
+                // `offset + 1 <= dim(2)`) instead of the step-1 growth
+                // concat. The prefill K/V rows are slice-assigned into the
+                // fresh backing and the returned prefix slices carry the same
+                // bytes the retain path returns — identical shapes, offsets,
+                // and next growth boundary (768); only the zero trailing
+                // headroom (read by neither SDPA nor the fused kernel) is
+                // new. Same allocation idiom as `CompilableKVCache`'s
+                // preallocated backing.
+                let B = keys.dim(0)
+                let kvHeads = keys.dim(1)
+                let kHeadDim = keys.dim(3)
+                let vHeadDim = values.dim(3)
+                let capacity = tokenCount + step
+                let newK = MLXArray.zeros(
+                    [B, kvHeads, capacity, kHeadDim], dtype: keys.dtype)
+                let newV = MLXArray.zeros(
+                    [B, kvHeads, capacity, vHeadDim], dtype: values.dtype)
+                newK[.ellipsis, ..<tokenCount, 0...] = keys
+                newV[.ellipsis, ..<tokenCount, 0...] = values
+                self.keys = newK
+                self.values = newV
+                self.offset = tokenCount
+                return (
+                    self.keys![.ellipsis, ..<self.offset, 0...],
+                    self.values![.ellipsis, ..<self.offset, 0...]
+                )
+            }
             self.keys = keys
             self.values = values
             self.offset = tokenCount
