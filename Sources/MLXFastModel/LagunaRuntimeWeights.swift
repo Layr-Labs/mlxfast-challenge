@@ -495,6 +495,9 @@ public final class LagunaRuntimeWeightCache {
         if lagunaFusedFullAttentionEnabled,
             lagunaFusedFullAttentionKernelWarmupEnabled
         {
+            // Declared re-roll marker (defense ticket): the promoted
+            // payload 46eeccf0 carries this same call unchanged; this
+            // comment is the archive-distinguishing delta and nothing else.
             lagunaWarmFullFusedAttentionKernel()
             lagunaWarmSlidingFusedAttentionKernel()
             lagunaWarmDecodeQKVR1Kernels()

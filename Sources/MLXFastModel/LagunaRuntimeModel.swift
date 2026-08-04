@@ -4816,6 +4816,9 @@ private func lagunaDecodeNVFP4QKVR1(
 private let lagunaWarmQKVR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_WARM_QKV_R1"] == "1"
 
+// Declared re-roll marker (defense ticket 2): the promoted payload
+// 46eeccf0 carries this warmup unchanged; this comment is the
+// archive-distinguishing delta and nothing else.
 func lagunaWarmDecodeQKVR1Kernels() {
     guard lagunaWarmQKVR1Enabled else { return }
     let hidden = LagunaConstants.hiddenSize
@@ -10838,12 +10841,20 @@ private func lagunaDecodeEmbeddingRoPEAtlas(
 /// RMSNorm remains a child of this module for checkpoint compatibility, but
 /// the scored wrapper applies it after selecting the only consumed row.
 private let lagunaPhaseCacheLimitBytes: Int = {
-    guard
-        let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_PHASE_CACHE_LIMIT_GB"],
-        let gb = Int(raw), gb > 0
-    else { return 0 }
-    return gb << 30
+    if let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PHASE_CACHE_LIMIT_GB"]
+    {
+        let gb = Int(raw) ?? 0
+        return gb > 0 ? gb << 30 : 0
+    }
+    // RANKED-MEASURED NULL (submission 8e232791 / PR 1426): a 32 GiB
+    // in-window limit ran live on the M5 via a >= 96 GiB physical-memory
+    // guard and returned decode 5112.3 / prefill 191.0 us/token — dead
+    // center of this content's class. With the 48 GB local dose already
+    // measured prefill-adverse, the knob is priced on both machine
+    // classes and the default returns to off; the env override remains
+    // for anyone who wants to re-buy the receipt.
+    return 0
 }()
 
 final class LagunaRuntimeModelInner: Module {
