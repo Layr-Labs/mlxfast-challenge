@@ -18,6 +18,36 @@ func lagunaLastTokenHidden(_ hidden: MLXArray) -> MLXArray {
     return hidden[0..., range, 0...]
 }
 
+// MARK: - Allocation-free shape checks
+//
+// `MLXArray.shape` builds a fresh Swift `[Int]` and comparing it against a
+// dimension literal builds a second one, so each such guard on the decode path
+// costs two heap allocations. `ndim` and `shapeN` are direct C accessors that
+// allocate nothing, and the `ndim` test short-circuits `shapeN`'s
+// dimensionality precondition.
+
+extension MLXArray {
+    /// True when the shape is exactly the listed dimensions.
+    @inline(__always) func dims(_ d0: Int) -> Bool { ndim == 1 && dim(0) == d0 }
+    @inline(__always) func dims(_ d0: Int, _ d1: Int) -> Bool { ndim == 2 && shape2 == (d0, d1) }
+    @inline(__always) func dims(_ d0: Int, _ d1: Int, _ d2: Int) -> Bool {
+        ndim == 3 && shape3 == (d0, d1, d2)
+    }
+    @inline(__always) func dims(_ d0: Int, _ d1: Int, _ d2: Int, _ d3: Int) -> Bool {
+        ndim == 4 && shape4 == (d0, d1, d2, d3)
+    }
+    @inline(__always) func dims(_ d0: Int, _ d1: Int, _ d2: Int, _ d3: Int, _ d4: Int) -> Bool {
+        ndim == 5 && dim(0) == d0 && dim(1) == d1 && dim(2) == d2 && dim(3) == d3 && dim(4) == d4
+    }
+
+    /// True when `other` has an identical shape.
+    @inline(__always) func sameDims(_ other: MLXArray) -> Bool {
+        guard ndim == other.ndim else { return false }
+        for axis in 0..<ndim where dim(axis) != other.dim(axis) { return false }
+        return true
+    }
+}
+
 /// Builds the `initializeRope` scaling dictionary for a per-type Laguna RoPE
 /// spec. For `default` RoPE only the type is consulted; for YaRN the factory
 /// reads factor / original context / betas. The XS config also serializes
@@ -48,27 +78,11 @@ private let lagunaTracedFusions = LagunaFusionTraceLog()
 
 final class LagunaFusionTraceLog: @unchecked Sendable {
     private var seen: Set<String> = []
-    private var counts: [String: Int] = [:]
-    private var total = 0
     private let lock = NSLock()
-    private let countDispatch =
-        ProcessInfo.processInfo.environment["DARKBLOOM_COUNT_DISPATCH"] == "1"
 
     func note(_ site: String) {
         lock.lock()
         let isNew = seen.insert(site).inserted
-        if countDispatch {
-            counts[site, default: 0] += 1
-            total += 1
-            if total % 5000 == 0 {
-                let top = counts.sorted { $0.value > $1.value }
-                    .prefix(14)
-                    .map { "\($0.key)=\($0.value)" }
-                    .joined(separator: " ")
-                FileHandle.standardError.write(
-                    Data("mlxfast: dispatch-count total=\(total) \(top)\n".utf8))
-            }
-        }
         lock.unlock()
         if isNew {
             FileHandle.standardError.write(Data("mlxfast: fusion active: \(site)\n".utf8))
@@ -207,14 +221,30 @@ let lagunaFusedRoutedGateUpEnabled =
 let lagunaPrefillFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_GATE_UP"] != "0"
 
-/// The expert-aligned gather-QMM consumes a 32-row gate/up-interleaved bank
-/// and writes the packed 512-wide SwiGLU result into the first half of its
-/// oversized MLX output allocation. The same environment switch controls the
-/// backend dispatch and this view interpretation, keeping its ablation path
-/// coherent.
-let lagunaExpertAlignedGatherEnabled =
-    ProcessInfo.processInfo.environment[
-        "DARKBLOOM_EXPERT_ALIGNED_GATHER"] != "0"
+func lagunaNAXAvailable(architecture: String, osSupportsNAX: Bool) -> Bool {
+    guard osSupportsNAX,
+        let generation = Int(architecture.suffix(3).prefix(2))
+    else { return false }
+    return generation >= (architecture.hasSuffix("p") ? 18 : 17)
+}
+
+func lagunaExpertAlignedStageEnabled(_ value: String?) -> Bool {
+    ["", "4", "5"].contains(value ?? "")
+}
+
+let lagunaExpertAlignedGatherEnabled = {
+    let environment = ProcessInfo.processInfo.environment
+    guard environment["DARKBLOOM_EXPERT_ALIGNED_GATHER"] != "0",
+        lagunaExpertAlignedStageEnabled(environment["DARKBLOOM_STAGE_BM128"]),
+        #available(macOS 26.2, *)
+    else { return false }
+    let configured = environment["MLX_METAL_GPU_ARCH"]
+    return lagunaNAXAvailable(
+        architecture: configured.flatMap { $0.isEmpty ? nil : $0 }
+            ?? GPU.deviceInfo().architecture,
+        osSupportsNAX: true
+    )
+}()
 
 /// Decode post-attention residual + RMSNorm fusion. The kernel emits
 /// both the rounded BF16 residual (needed by the following skip connection)
@@ -939,10 +969,8 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
         thread float router_result[rows_per_thread] = {\(zeros)};
         \(accumulate)
 
-        // Loop interchange: each row's delta sequence (16,8,4,2,1) and +=
-        // order are unchanged; the independent chains interleave.
-        for (ushort delta = 16; delta >= 1; delta >>= 1) {
-            for (uint r = 0; r < rows_per_thread; ++r) {
+        for (uint r = 0; r < rows_per_thread; ++r) {
+            for (ushort delta = 16; delta >= 1; delta >>= 1) {
                 router_result[r] +=
                     metal::simd_shuffle_down(router_result[r], delta);
             }
@@ -1037,11 +1065,11 @@ func lagunaResidualRMSNormRouter(
     precondition(weight.dtype == .bfloat16)
     precondition(routerWeight.dtype == .bfloat16)
     precondition(correctionBias.dtype == .float32 || correctionBias.dtype == .bfloat16)
-    precondition(residual.shape == [1, 1, hidden])
-    precondition(branch.shape == [1, 1, hidden])
-    precondition(weight.shape == [hidden])
-    precondition(routerWeight.shape == [experts, hidden])
-    precondition(correctionBias.shape == [experts])
+    precondition(residual.dims(1, 1, hidden))
+    precondition(branch.dims(1, 1, hidden))
+    precondition(weight.dims(hidden))
+    precondition(routerWeight.dims(experts, hidden))
+    precondition(correctionBias.dims(experts))
 
     // `rows_per_group` router rows per threadgroup, so 256 / rows_per_group
     // tiles. Divides exactly for 64/32/16/8/4/2/1 (4..256 tiles), so no partial
@@ -1074,9 +1102,9 @@ func lagunaResidualRMSNorm(
     precondition(residual.dtype == .bfloat16)
     precondition(branch.dtype == .bfloat16)
     precondition(weight.dtype == .bfloat16)
-    precondition(residual.shape == branch.shape)
+    precondition(residual.sameDims(branch))
     precondition(residual.dim(-1) == LagunaConstants.hiddenSize)
-    precondition(weight.shape == [LagunaConstants.hiddenSize])
+    precondition(weight.dims(LagunaConstants.hiddenSize))
 
     let rows = residual.size / LagunaConstants.hiddenSize
     let outputs = lagunaResidualRMSNormKernel(
@@ -1179,12 +1207,12 @@ func lagunaFullQKNormYaRN(
     precondition(rawKeys.dtype == .bfloat16)
     precondition(queryWeight.dtype == .bfloat16)
     precondition(keyWeight.dtype == .bfloat16)
-    precondition(rawQueries.shape == [1, 1, 48 * LagunaConstants.headDim])
-    precondition(rawKeys.shape == [1, 1, 8 * LagunaConstants.headDim])
-    precondition(queryWeight.shape == [LagunaConstants.headDim])
-    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(rawQueries.dims(1, 1, 48 * LagunaConstants.headDim))
+    precondition(rawKeys.dims(1, 1, 8 * LagunaConstants.headDim))
+    precondition(queryWeight.dims(LagunaConstants.headDim))
+    precondition(keyWeight.dims(LagunaConstants.headDim))
     precondition(angles.dtype == .float32)
-    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim / 2])
+    precondition(angles.dims(1, 1, 1, LagunaConstants.headDim / 2))
 
     lagunaTrace("full qk norm+yarn")
     let outputs = lagunaFullQKNormYaRNKernel(
@@ -1305,12 +1333,12 @@ func lagunaSlidingQKNormRoPE(
     precondition(rawKeys.dtype == .bfloat16)
     precondition(queryWeight.dtype == .bfloat16)
     precondition(keyWeight.dtype == .bfloat16)
-    precondition(rawQueries.shape == [1, 1, heads * LagunaConstants.headDim])
-    precondition(rawKeys.shape == [1, 1, kvHeads * LagunaConstants.headDim])
-    precondition(queryWeight.shape == [LagunaConstants.headDim])
-    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(rawQueries.dims(1, 1, heads * LagunaConstants.headDim))
+    precondition(rawKeys.dims(1, 1, kvHeads * LagunaConstants.headDim))
+    precondition(queryWeight.dims(LagunaConstants.headDim))
+    precondition(keyWeight.dims(LagunaConstants.headDim))
     precondition(angles.dtype == .float32)
-    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim])
+    precondition(angles.dims(1, 1, 1, LagunaConstants.headDim))
 
     lagunaTrace("sliding qk norm+rope")
     let outputs = lagunaSlidingQKNormRoPEKernel(
@@ -1520,27 +1548,8 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
             pair_score1 += pair_q1[2] * pipe_ka[2];
             pair_score0 += pair_q0[3] * pipe_ka[3];
             pair_score1 += pair_q1[3] * pipe_ka[3];
-            U pipeb_score0 = 0;
-            U pipeb_score1 = 0;
-            pipeb_score0 += pair_q0[0] * pipe_kb[0];
-            pipeb_score1 += pair_q1[0] * pipe_kb[0];
-            pipeb_score0 += pair_q0[1] * pipe_kb[1];
-            pipeb_score1 += pair_q1[1] * pipe_kb[1];
-            pipeb_score0 += pair_q0[2] * pipe_kb[2];
-            pipeb_score1 += pair_q1[2] * pipe_kb[2];
-            pipeb_score0 += pair_q0[3] * pipe_kb[3];
-            pipeb_score1 += pair_q1[3] * pipe_kb[3];
-            // One packed componentwise simd_sum for both planes: each
-            // component keeps its own butterfly; updates below unchanged.
-            {
-                const vec<U, 4> packed_scores = simd_sum(
-                    vec<U, 4>(pair_score0, pair_score1,
-                              pipeb_score0, pipeb_score1));
-                pair_score0 = packed_scores.x;
-                pair_score1 = packed_scores.y;
-                pipeb_score0 = packed_scores.z;
-                pipeb_score1 = packed_scores.w;
-            }
+            pair_score0 = simd_sum(pair_score0);
+            pair_score1 = simd_sum(pair_score1);
 
             U pair_new_max0 = metal::max(pair_max0, pair_score0);
             U pair_new_max1 = metal::max(pair_max1, pair_score1);
@@ -1564,6 +1573,19 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
             pair_o1[2] = pair_o1[2] * pair_factor1 + pair_exp1 * pipe_va2;
             pair_o0[3] = pair_o0[3] * pair_factor0 + pair_exp0 * pipe_va3;
             pair_o1[3] = pair_o1[3] * pair_factor1 + pair_exp1 * pipe_va3;
+
+            U pipeb_score0 = 0;
+            U pipeb_score1 = 0;
+            pipeb_score0 += pair_q0[0] * pipe_kb[0];
+            pipeb_score1 += pair_q1[0] * pipe_kb[0];
+            pipeb_score0 += pair_q0[1] * pipe_kb[1];
+            pipeb_score1 += pair_q1[1] * pipe_kb[1];
+            pipeb_score0 += pair_q0[2] * pipe_kb[2];
+            pipeb_score1 += pair_q1[2] * pipe_kb[2];
+            pipeb_score0 += pair_q0[3] * pipe_kb[3];
+            pipeb_score1 += pair_q1[3] * pipe_kb[3];
+            pipeb_score0 = simd_sum(pipeb_score0);
+            pipeb_score1 = simd_sum(pipeb_score1);
 
             U pipeb_new_max0 = metal::max(pair_max0, pipeb_score0);
             U pipeb_new_max1 = metal::max(pair_max1, pipeb_score1);
@@ -1745,18 +1767,18 @@ func lagunaSlidingFusedAttention(
     precondition(rawQueries.dtype == .bfloat16)
     precondition(rawKeys.dtype == .bfloat16)
     precondition(rawValues.dtype == .bfloat16)
-    precondition(rawQueries.shape == [1, 1, heads * LagunaConstants.headDim])
-    precondition(rawKeys.shape == [1, 1, kvHeads * LagunaConstants.headDim])
-    precondition(rawValues.shape == [1, 1, kvHeads * LagunaConstants.headDim])
-    precondition(queryWeight.shape == [LagunaConstants.headDim])
-    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(rawQueries.dims(1, 1, heads * LagunaConstants.headDim))
+    precondition(rawKeys.dims(1, 1, kvHeads * LagunaConstants.headDim))
+    precondition(rawValues.dims(1, 1, kvHeads * LagunaConstants.headDim))
+    precondition(queryWeight.dims(LagunaConstants.headDim))
+    precondition(keyWeight.dims(LagunaConstants.headDim))
     precondition(angles.dtype == .float32)
-    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim])
+    precondition(angles.dims(1, 1, 1, LagunaConstants.headDim))
     precondition(cacheKeys.dtype == .bfloat16)
     precondition(
-        cacheKeys.shape == [1, kvHeads, window, LagunaConstants.headDim])
+        cacheKeys.dims(1, kvHeads, window, LagunaConstants.headDim))
     precondition(
-        cacheValues.shape == [1, kvHeads, window, LagunaConstants.headDim])
+        cacheValues.dims(1, kvHeads, window, LagunaConstants.headDim))
     precondition(writeIdx >= 0 && writeIdx < window)
     precondition(scale.dtype == .float32 && scale.size == 1)
 
@@ -1999,27 +2021,8 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
             pair_score1 += pair_q1[2] * pipe_ka[2];
             pair_score0 += pair_q0[3] * pipe_ka[3];
             pair_score1 += pair_q1[3] * pipe_ka[3];
-            U pipeb_score0 = 0;
-            U pipeb_score1 = 0;
-            pipeb_score0 += pair_q0[0] * pipe_kb[0];
-            pipeb_score1 += pair_q1[0] * pipe_kb[0];
-            pipeb_score0 += pair_q0[1] * pipe_kb[1];
-            pipeb_score1 += pair_q1[1] * pipe_kb[1];
-            pipeb_score0 += pair_q0[2] * pipe_kb[2];
-            pipeb_score1 += pair_q1[2] * pipe_kb[2];
-            pipeb_score0 += pair_q0[3] * pipe_kb[3];
-            pipeb_score1 += pair_q1[3] * pipe_kb[3];
-            // One packed componentwise simd_sum for both planes: each
-            // component keeps its own butterfly; updates below unchanged.
-            {
-                const vec<U, 4> packed_scores = simd_sum(
-                    vec<U, 4>(pair_score0, pair_score1,
-                              pipeb_score0, pipeb_score1));
-                pair_score0 = packed_scores.x;
-                pair_score1 = packed_scores.y;
-                pipeb_score0 = packed_scores.z;
-                pipeb_score1 = packed_scores.w;
-            }
+            pair_score0 = simd_sum(pair_score0);
+            pair_score1 = simd_sum(pair_score1);
 
             U pair_new_max0 = metal::max(pair_max0, pair_score0);
             U pair_new_max1 = metal::max(pair_max1, pair_score1);
@@ -2043,6 +2046,19 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
             pair_o1[2] = pair_o1[2] * pair_factor1 + pair_exp1 * pipe_va2;
             pair_o0[3] = pair_o0[3] * pair_factor0 + pair_exp0 * pipe_va3;
             pair_o1[3] = pair_o1[3] * pair_factor1 + pair_exp1 * pipe_va3;
+
+            U pipeb_score0 = 0;
+            U pipeb_score1 = 0;
+            pipeb_score0 += pair_q0[0] * pipe_kb[0];
+            pipeb_score1 += pair_q1[0] * pipe_kb[0];
+            pipeb_score0 += pair_q0[1] * pipe_kb[1];
+            pipeb_score1 += pair_q1[1] * pipe_kb[1];
+            pipeb_score0 += pair_q0[2] * pipe_kb[2];
+            pipeb_score1 += pair_q1[2] * pipe_kb[2];
+            pipeb_score0 += pair_q0[3] * pipe_kb[3];
+            pipeb_score1 += pair_q1[3] * pipe_kb[3];
+            pipeb_score0 = simd_sum(pipeb_score0);
+            pipeb_score1 = simd_sum(pipeb_score1);
 
             U pipeb_new_max0 = metal::max(pair_max0, pipeb_score0);
             U pipeb_new_max1 = metal::max(pair_max1, pipeb_score1);
@@ -2262,23 +2278,25 @@ func lagunaFullFusedAttention(
     precondition(rawQueries.dtype == .bfloat16)
     precondition(rawKeys.dtype == .bfloat16)
     precondition(rawValues.dtype == .bfloat16)
-    precondition(rawQueries.shape == [1, 1, heads * LagunaConstants.headDim])
-    precondition(rawKeys.shape == [1, 1, kvHeads * LagunaConstants.headDim])
-    precondition(rawValues.shape == [1, 1, kvHeads * LagunaConstants.headDim])
-    precondition(queryWeight.shape == [LagunaConstants.headDim])
-    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(rawQueries.dims(1, 1, heads * LagunaConstants.headDim))
+    precondition(rawKeys.dims(1, 1, kvHeads * LagunaConstants.headDim))
+    precondition(rawValues.dims(1, 1, kvHeads * LagunaConstants.headDim))
+    precondition(queryWeight.dims(LagunaConstants.headDim))
+    precondition(keyWeight.dims(LagunaConstants.headDim))
     precondition(angles.dtype == .float32)
-    precondition(angles.shape == [1, 1, 1, LagunaConstants.headDim / 2])
+    precondition(angles.dims(1, 1, 1, LagunaConstants.headDim / 2))
     precondition(cacheKeys.dtype == .bfloat16)
     precondition(
-        cacheKeys.shape == [1, kvHeads, capacity, LagunaConstants.headDim])
+        cacheKeys.dims(1, kvHeads, capacity, LagunaConstants.headDim))
     precondition(
-        cacheValues.shape == [1, kvHeads, capacity, LagunaConstants.headDim])
+        cacheValues.dims(1, kvHeads, capacity, LagunaConstants.headDim))
     precondition(writeIdx >= 0 && writeIdx < capacity)
     precondition(scale.dtype == .float32 && scale.size == 1)
 
     lagunaTrace("full fused attention")
-    let params = lagunaFullAttnParams(writeIdx: writeIdx, capacity: capacity)
+    let params = MLXArray([
+        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
+    ])
     return lagunaFullFusedAttentionKernel(
         [
             rawQueries, rawKeys, rawValues,
@@ -2292,53 +2310,11 @@ func lagunaFullFusedAttention(
     )[0]
 }
 
-/// `DARKBLOOM_FULL_ATTN_PARAMS_MEMO=1` enables. MEASURED on a 6+6 paired
-/// local A/B: means 9159.7 on vs 9177.1 off, 17.4 us (0.19%) in the
-/// mechanism's favour but a permutation test puts that at p = 0.29 — i.e.
-/// indistinguishable from noise on this box. Kept default OFF; the ten
-/// full-attention layers of one decode forward share
-/// the same `(writeIdx, capacity)` pair, so a one-entry last-key cache
-/// removes nine redundant three-element array nodes per forward. Mechanism
-/// ported with credit from submission `acea9e92` (PR 1395). No request
-/// output is retained: the cached array is a pure function of two integers
-/// that the caller already holds.
-private let lagunaFullAttnParamsMemoEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FULL_ATTN_PARAMS_MEMO"] == "1"
-
-private enum LagunaFullAttnParamsMemoStore {
-    nonisolated(unsafe) static var writeIdx = -1
-    nonisolated(unsafe) static var capacity = -1
-    nonisolated(unsafe) static var params: MLXArray?
-}
-
-private func lagunaFullAttnParams(writeIdx: Int, capacity: Int) -> MLXArray {
-    let fresh = MLXArray([
-        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
-    ])
-    guard lagunaFullAttnParamsMemoEnabled else { return fresh }
-    if LagunaFullAttnParamsMemoStore.writeIdx == writeIdx,
-        LagunaFullAttnParamsMemoStore.capacity == capacity,
-        let cached = LagunaFullAttnParamsMemoStore.params
-    {
-        return cached
-    }
-    LagunaFullAttnParamsMemoStore.writeIdx = writeIdx
-    LagunaFullAttnParamsMemoStore.capacity = capacity
-    LagunaFullAttnParamsMemoStore.params = fresh
-    return fresh
-}
-
 /// Force creation of `lagunaFullFusedAttentionKernel`'s pipeline state with
 /// production Q/K/V geometry and a minimal two-row cache. Every tensor is
 /// deterministic, input-independent, evaluated once, and released before the
 /// constructor clears transient allocator cache and wires resident weights.
-/// `DARKBLOOM_WARM_FULL_ATTN=0` disables the inherited warmup so the
-/// long-standing assumption behind it can be measured rather than assumed.
-private let lagunaWarmFullAttnEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_WARM_FULL_ATTN"] != "0"
-
 func lagunaWarmFullFusedAttentionKernel() {
-    guard lagunaWarmFullAttnEnabled else { return }
     let headDim = LagunaConstants.headDim
     let heads = LagunaConstants.fullAttentionHeads
     let kvHeads = LagunaConstants.numKeyValueHeads
@@ -2358,45 +2334,6 @@ func lagunaWarmFullFusedAttentionKernel() {
         [1, kvHeads, 2, headDim], dtype: .bfloat16)
     let scale = MLXArray([pow(Float(headDim), -0.5)])
     eval(lagunaFullFusedAttention(
-        rawQueries: rawQueries,
-        rawKeys: rawKeys,
-        rawValues: rawValues,
-        queryWeight: queryWeight,
-        keyWeight: keyWeight,
-        angles: angles,
-        cacheKeys: cacheKeys,
-        cacheValues: cacheValues,
-        writeIdx: 1,
-        scale: scale
-    ))
-}
-
-/// `DARKBLOOM_WARM_SLIDING_ATTN=0` disables. Same contract as the
-/// full-attention warmup above: force `lagunaSlidingFusedAttentionKernel`'s
-/// pipeline state with production geometry so the first scored decode step
-/// does not pay a JIT pipeline build. Deterministic, input-independent,
-/// evaluated once, released before the constructor wires resident weights.
-private let lagunaWarmSlidingAttnEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_WARM_SLIDING_ATTN"] == "1"
-
-func lagunaWarmSlidingFusedAttentionKernel() {
-    guard lagunaWarmSlidingAttnEnabled else { return }
-    let headDim = LagunaConstants.headDim
-    let heads = LagunaConstants.slidingAttentionHeads
-    let kvHeads = LagunaConstants.numKeyValueHeads
-    let window = LagunaConstants.slidingWindow
-    let rawQueries = MLXArray.zeros([1, 1, heads * headDim], dtype: .bfloat16)
-    let rawKeys = MLXArray.zeros([1, 1, kvHeads * headDim], dtype: .bfloat16)
-    let rawValues = MLXArray.zeros([1, 1, kvHeads * headDim], dtype: .bfloat16)
-    let queryWeight = MLXArray.ones([headDim], dtype: .bfloat16)
-    let keyWeight = MLXArray.ones([headDim], dtype: .bfloat16)
-    let angles = MLXArray.zeros([1, 1, 1, headDim], dtype: .float32)
-    let cacheKeys = MLXArray.zeros(
-        [1, kvHeads, window, headDim], dtype: .bfloat16)
-    let cacheValues = MLXArray.zeros(
-        [1, kvHeads, window, headDim], dtype: .bfloat16)
-    let scale = MLXArray([pow(Float(headDim), -0.5)])
-    eval(lagunaSlidingFusedAttention(
         rawQueries: rawQueries,
         rawKeys: rawKeys,
         rawValues: rawValues,
@@ -2817,13 +2754,13 @@ private func lagunaPrefillSlidingQKNormRoPE(
     precondition(rawKeys.dtype == .bfloat16)
     precondition(queryWeight.dtype == .bfloat16)
     precondition(keyWeight.dtype == .bfloat16)
-    precondition(rawQueries.shape == [1, length, heads * LagunaConstants.headDim])
-    precondition(rawKeys.shape == [1, length, kvHeads * LagunaConstants.headDim])
-    precondition(queryWeight.shape == [LagunaConstants.headDim])
-    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(rawQueries.dims(1, length, heads * LagunaConstants.headDim))
+    precondition(rawKeys.dims(1, length, kvHeads * LagunaConstants.headDim))
+    precondition(queryWeight.dims(LagunaConstants.headDim))
+    precondition(keyWeight.dims(LagunaConstants.headDim))
     precondition(angles.dtype == .float32)
     precondition(
-        angles.shape == [1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim])
+        angles.dims(1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim))
     precondition(offsets.dtype == .int32 && offsets.size == 1)
     precondition((heads + kvHeads) % 4 == 0)
 
@@ -2862,13 +2799,13 @@ private func lagunaPrefillFullQKNormYaRN(
     precondition(rawKeys.dtype == .bfloat16)
     precondition(queryWeight.dtype == .bfloat16)
     precondition(keyWeight.dtype == .bfloat16)
-    precondition(rawQueries.shape == [1, length, heads * LagunaConstants.headDim])
-    precondition(rawKeys.shape == [1, length, kvHeads * LagunaConstants.headDim])
-    precondition(queryWeight.shape == [LagunaConstants.headDim])
-    precondition(keyWeight.shape == [LagunaConstants.headDim])
+    precondition(rawQueries.dims(1, length, heads * LagunaConstants.headDim))
+    precondition(rawKeys.dims(1, length, kvHeads * LagunaConstants.headDim))
+    precondition(queryWeight.dims(LagunaConstants.headDim))
+    precondition(keyWeight.dims(LagunaConstants.headDim))
     precondition(angles.dtype == .float32)
     precondition(
-        angles.shape == [1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim / 2])
+        angles.dims(1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim / 2))
     precondition(offsets.dtype == .int32 && offsets.size == 1)
     precondition((heads + kvHeads) % 4 == 0)
 
@@ -2908,7 +2845,7 @@ private func lagunaIndexedAffineMetadata(
 ) -> LagunaIndexedAffineMetadata? {
     guard lagunaAffineMetadataIndexedEnabled,
         scales.dtype == .bfloat16, biases.dtype == .bfloat16,
-        scales.shape == biases.shape, scales.size > 0
+        scales.sameDims(biases), scales.size > 0
     else {
         return nil
     }
@@ -3461,10 +3398,8 @@ private func lagunaFusedQKVProjectionSource(
 
         \(projectionLoop)
 
-        // Loop interchange: each row's delta sequence (16,8,4,2,1) and +=
-        // order are unchanged; the independent chains interleave.
-        for (ushort delta = 16; delta >= 1; delta >>= 1) {
-            for (uint row = 0; row < rows_per_thread; ++row) {
+        for (uint row = 0; row < rows_per_thread; ++row) {
+            for (ushort delta = 16; delta >= 1; delta >>= 1) {
                 result[row] += metal::simd_shuffle_down(result[row], delta);
             }
         }
@@ -3510,14 +3445,14 @@ func lagunaFusedNormQKVProjection(
     let queryRows = heads * LagunaConstants.headDim
     let kvRows = LagunaConstants.numKeyValueHeads * LagunaConstants.headDim
     precondition(residual.dtype == .bfloat16)
-    precondition(residual.shape == [1, 1, hidden])
+    precondition(residual.dims(1, 1, hidden))
     precondition(normWeight.dtype == .bfloat16)
-    precondition(normWeight.shape == [hidden])
-    precondition(queryWeight.shape == [queryRows, hidden])
-    precondition(keyWeight.shape == [kvRows, hidden])
-    precondition(valueWeight.shape == [kvRows, hidden])
+    precondition(normWeight.dims(hidden))
+    precondition(queryWeight.dims(queryRows, hidden))
+    precondition(keyWeight.dims(kvRows, hidden))
+    precondition(valueWeight.dims(kvRows, hidden))
     precondition(gateWeight.dtype == .bfloat16)
-    precondition(gateWeight.shape == [heads, hidden])
+    precondition(gateWeight.dims(heads, hidden))
 
     // Q/K/V tiles at 64 rows each, then 8 more tiles carrying the 64 gate
     // rows as two eight-simdgroup split-K groups apiece.
@@ -3746,10 +3681,8 @@ private func lagunaGatedOutputProjectionSource(
 
         \(body)
 
-        // Loop interchange: each row's delta sequence (16,8,4,2,1) and +=
-        // order are unchanged; the independent chains interleave.
-        for (ushort delta = 16; delta >= 1; delta >>= 1) {
-            for (uint row = 0; row < rows_per_thread; ++row) {
+        for (uint row = 0; row < rows_per_thread; ++row) {
+            for (ushort delta = 16; delta >= 1; delta >>= 1) {
                 result[row] += metal::simd_shuffle_down(result[row], delta);
             }
         }
@@ -3811,11 +3744,11 @@ func lagunaGatedOutputProjection(
     else { return nil }
     let inVec = heads * LagunaConstants.headDim
     precondition(attentionOutput.dtype == .bfloat16)
-    precondition(attentionOutput.shape == [1, 1, inVec])
+    precondition(attentionOutput.dims(1, 1, inVec))
     precondition(gateValues.dtype == .bfloat16)
-    precondition(gateValues.shape == [1, 1, heads])
+    precondition(gateValues.dims(1, 1, heads))
     precondition(weight.dtype == .bfloat16)
-    precondition(weight.shape == [LagunaConstants.hiddenSize, inVec])
+    precondition(weight.dims(LagunaConstants.hiddenSize, inVec))
 
     lagunaTrace("gated output projection h\(heads)")
     return kernel(
@@ -3898,9 +3831,9 @@ func lagunaGateProductSoftplus(
     else { return nil }
     let inVec = heads * LagunaConstants.headDim
     precondition(attentionOutput.dtype == .bfloat16)
-    precondition(attentionOutput.shape == [1, 1, inVec])
+    precondition(attentionOutput.dims(1, 1, inVec))
     precondition(gateLogits.dtype == .bfloat16)
-    precondition(gateLogits.shape == [1, 1, heads])
+    precondition(gateLogits.dims(1, 1, heads))
 
     lagunaTrace("gate product softplus h\(heads)")
     return kernel(
@@ -3913,34 +3846,6 @@ func lagunaGateProductSoftplus(
 }
 
 // MARK: - Gated native-affine INT8 output projection (one dispatch)
-
-/// `DARKBLOOM_SEED_ELIDE_RESIDUAL` (default on; "0" restores the byte-identical
-/// stock strings): peels the first product of the INT8 `accum` loops so the dead
-/// `+0.0f` seed add goes away -- same closed signed-zero case as the NVFP4 qdot.
-let lagunaSeedElideResidualEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_SEED_ELIDE_RESIDUAL"] != "0"
-
-private func lagunaSeedElideResidualInit(_ firstTerm: String) -> String {
-    lagunaSeedElideResidualEnabled ? firstTerm : "0.0f"
-}
-
-private let lagunaSeedElideResidualFrom = lagunaSeedElideResidualEnabled ? "1" : "0"
-
-/// Same peel for the normalized block sums: seeds from the index-zero value.
-private let lagunaNormSeedPeel = lagunaSeedElideResidualEnabled
-    ? "float sum; { float v = float(bfloat(norm_weight[column] * bfloat(float(residual[column]) * laguna_inv_mean))); sum = v; x_thread[0] = v; }"
-    : "float sum = 0.0f;"
-
-/// `DARKBLOOM_PREFILL_FUSED_SHARED=1` — default OFF, RANKED GATE-FAILED
-/// (submission aab78c4d / PR 1409): locally -4.3% prefill at p = 0.001
-/// with max_abs_diff 0 on twelve 1025-step runs AND a clean local-submit,
-/// yet the hidden M5 correctness gates rejected it. The row-locality
-/// argument holds for the arithmetic but NOT for kernel selection: at
-/// M = 512 the qmm matrix path picks its tiling by N, and the doubled-N
-/// concatenated bank can change per-row accumulation order — enough to
-/// flip a near-tie argmax on hidden prompts. Left in-tree as the receipt.
-private let lagunaPrefillFusedSharedEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_SHARED"] == "1"
 
 /// Exact per-head softplus gate plus group-32 affine INT8 output GEMV.
 private func lagunaGatedAffineOProjSource(heads: Int, indexed: Bool = false) -> String {
@@ -4022,12 +3927,8 @@ private func lagunaGatedAffineOProjSource(heads: Int, indexed: Bool = false) -> 
     uint column = simd_lid * values_per_thread;
     for (uint k = 0; k < in_vec_size; k += block_size) {
         float gate = gate_table[column >> head_shift];
-        \(lagunaSeedElideResidualEnabled ? """
-        float seed_value = float(bfloat(float(xp[0]) * gate));
-        x_thread[0] = seed_value;
-        """ : "")
-        float sum = \(lagunaSeedElideResidualInit("seed_value"));
-        for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
+        float sum = 0.0f;
+        for (uint i = 0; i < values_per_thread; ++i) {
             float value = float(bfloat(float(xp[i]) * gate));
             sum += value;
             x_thread[i] = value;
@@ -4036,8 +3937,8 @@ private func lagunaGatedAffineOProjSource(heads: Int, indexed: Bool = false) -> 
         for (uint row = 0; row < results_per_simdgroup; ++row) {
             const device uint8_t* wl = ws + row * in_vec_size;
             \(metadataLoad)
-            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * wl[0]"));
-            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
+            float accum = 0.0f;
+            for (uint i = 0; i < values_per_thread; ++i) {
                 accum += x_thread[i] * wl[i];
             }
             result[row] += scale * accum + sum * bias;
@@ -4169,15 +4070,15 @@ func lagunaGatedAffineOProj(
     let inVec = heads * LagunaConstants.headDim
     let outVec = LagunaConstants.hiddenSize
     guard attentionOutput.dtype == .bfloat16,
-        attentionOutput.shape == [1, 1, inVec],
+        attentionOutput.dims(1, 1, inVec),
         gateLogits.dtype == .bfloat16,
-        gateLogits.shape == [1, 1, heads],
+        gateLogits.dims(1, 1, heads),
         codes.dtype == .uint32,
-        codes.shape == [outVec, inVec / 4],
+        codes.dims(outVec, inVec / 4),
         scales.dtype == .bfloat16,
-        scales.shape == [outVec, inVec / 32],
+        scales.dims(outVec, inVec / 32),
         biases.dtype == .bfloat16,
-        biases.shape == [outVec, inVec / 32]
+        biases.dims(outVec, inVec / 32)
     else {
         return nil
     }
@@ -4185,7 +4086,7 @@ func lagunaGatedAffineOProj(
     if let metadata = indexedMetadata,
         let kernel = lagunaGatedAffineOProjIndexedKernels[heads],
         metadata.indices.dtype == .uint16,
-        metadata.indices.shape == [outVec, inVec / 32],
+        metadata.indices.dims(outVec, inVec / 32),
         metadata.lut.dtype == .uint32,
         metadata.lut.ndim == 1,
         metadata.lut.size <= 65_536
@@ -4286,33 +4187,13 @@ func lagunaGatedAffineOProjNVFP4Source(
     let loadInput = preActivatedGate
         ? """
         float g=float(gate_values[column>>head_shift]);
-        // 16B-certified vec4 activation loads (xp byte offset = 32*lane,
-        // 1024B block stride, buffer offset 0): same elements, same
-        // per-element float(bfloat(float(v)*g)) chain in the same order.
-        const device vec<bfloat, 4>* xv = (const device vec<bfloat, 4>*)xp;
-        #pragma unroll
-        for (uint i4 = 0; i4 < values_per_thread / 4; ++i4) {
-            const vec<bfloat, 4> v4 = xv[i4];
-            x_thread[4 * i4 + 0] = float(bfloat(float(v4.x) * g));
-            x_thread[4 * i4 + 1] = float(bfloat(float(v4.y) * g));
-            x_thread[4 * i4 + 2] = float(bfloat(float(v4.z) * g));
-            x_thread[4 * i4 + 3] = float(bfloat(float(v4.w) * g));
-        }
+        for(uint i=0;i<values_per_thread;++i)
+            x_thread[i]=float(bfloat(float(xp[i])*g));
         """
         : """
         float g=gt[column>>head_shift];
-        // 16B-certified vec4 activation loads (xp byte offset = 32*lane,
-        // 1024B block stride, buffer offset 0): same elements, same
-        // per-element float(bfloat(float(v)*g)) chain in the same order.
-        const device vec<bfloat, 4>* xv = (const device vec<bfloat, 4>*)xp;
-        #pragma unroll
-        for (uint i4 = 0; i4 < values_per_thread / 4; ++i4) {
-            const vec<bfloat, 4> v4 = xv[i4];
-            x_thread[4 * i4 + 0] = float(bfloat(float(v4.x) * g));
-            x_thread[4 * i4 + 1] = float(bfloat(float(v4.y) * g));
-            x_thread[4 * i4 + 2] = float(bfloat(float(v4.z) * g));
-            x_thread[4 * i4 + 3] = float(bfloat(float(v4.w) * g));
-        }
+        for(uint i=0;i<values_per_thread;++i)
+            x_thread[i]=float(bfloat(float(xp[i])*g));
         """
     return """
     constexpr uint in_vec_size = \(heads * LagunaConstants.headDim);
@@ -4358,12 +4239,9 @@ func lagunaGatedAffineOProjNVFP4Source(
             uint8_t sbits = sc[row * in_vec_size_g];
             \(scaleDecode)
             \(accumDecl)
-            // 8B-aligned code pair (element index even at every site):
-            // one uint2 load, identical words in identical j order.
-            const uint2 cw = *(const device uint2*)wl;
             #pragma unroll
             for (uint j = 0; j < codes_per_thread; ++j) {
-                const uint c = (j == 0) ? cw.x : cw.y;
+                const uint c = wl[j];
                 \(extract)
                 const float2 v04 = float2(as_type<half2>(p0))\(weightScale);
                 const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
@@ -4385,19 +4263,10 @@ func lagunaGatedAffineOProjNVFP4Source(
         column += block_size;
     }
 
-    // One packed componentwise simd_sum (K3-receipted): per-component
-    // butterfly, multiply-before-sum, and write order all stock.
-    {
-        const vec<float, 4> packed_res = simd_sum(
-            vec<float, 4>(result[0] * 4194304.0f,
-                          result[1] * 4194304.0f,
-                          result[2] * 4194304.0f,
-                          result[3] * 4194304.0f));
+    for (uint row = 0; row < results_per_simdgroup; ++row) {
+        result[row] = simd_sum(result[row] * 4194304.0f);
         if (simd_lid == 0) {
-            projected[out_row + 0] = bfloat(packed_res.x);
-            projected[out_row + 1] = bfloat(packed_res.y);
-            projected[out_row + 2] = bfloat(packed_res.z);
-            projected[out_row + 3] = bfloat(packed_res.w);
+            projected[out_row + row] = bfloat(result[row]);
         }
     }
     """
@@ -4491,10 +4360,10 @@ private func lagunaGateSoftplus(
         let biases = bank.biases,
         let kernel = lagunaGateSoftplusKernels[heads],
         input.dtype == .bfloat16,
-        input.shape == [1, 1, LagunaConstants.hiddenSize],
-        bank.packedCodes.shape == [heads, LagunaConstants.hiddenSize / 4],
-        bank.scales.shape == [heads, LagunaConstants.hiddenSize / 32],
-        biases.shape == [heads, LagunaConstants.hiddenSize / 32]
+        input.dims(1, 1, LagunaConstants.hiddenSize),
+        bank.packedCodes.dims(heads, LagunaConstants.hiddenSize / 4),
+        bank.scales.dims(heads, LagunaConstants.hiddenSize / 32),
+        biases.dims(heads, LagunaConstants.hiddenSize / 32)
     else { return nil }
 
     return kernel(
@@ -4538,13 +4407,13 @@ func lagunaGatedAffineOProjNVFP4(
     let inVec = heads * LagunaConstants.headDim
     let outVec = LagunaConstants.hiddenSize
     guard attentionOutput.dtype == .bfloat16,
-        attentionOutput.shape == [1, 1, inVec],
+        attentionOutput.dims(1, 1, inVec),
         gateLogits.dtype == .bfloat16,
-        gateLogits.shape == [1, 1, heads],
+        gateLogits.dims(1, 1, heads),
         codes.dtype == .uint32,
-        codes.shape == [outVec, inVec / 8],
+        codes.dims(outVec, inVec / 8),
         scales.dtype == .uint8,
-        scales.shape == [outVec, inVec / 16]
+        scales.dims(outVec, inVec / 16)
     else {
         return nil
     }
@@ -4786,14 +4655,14 @@ private func lagunaDecodeNVFP4QKVR1(
     let rows = (heads + 2 * LagunaConstants.numKeyValueHeads) * LagunaConstants.headDim
     let hidden = LagunaConstants.hiddenSize
     guard normalized.dtype == .bfloat16,
-        normalized.shape == [1, 1, hidden],
+        normalized.dims(1, 1, hidden),
         bank.mode == .nvfp4, bank.bits == 4, bank.groupSize == 16,
         bank.biases == nil,
         bank.originalShape == [rows, hidden],
         bank.packedCodes.dtype == .uint32,
-        bank.packedCodes.shape == [rows, hidden / 8],
+        bank.packedCodes.dims(rows, hidden / 8),
         bank.scales.dtype == .uint8,
-        bank.scales.shape == [rows, hidden / 16],
+        bank.scales.dims(rows, hidden / 16),
         rows % 2 == 0,
         let kernel = lagunaDecodeNVFP4QKVR1Kernels[heads]
     else { return nil }
@@ -4807,38 +4676,6 @@ private func lagunaDecodeNVFP4QKVR1(
     )[0]
 }
 
-
-/// `DARKBLOOM_WARM_QKV_R1=1` enables: force the two `lagunaDecodeNVFP4QKVR1`
-/// pipelines (h48 and h64) at init with production geometry. MEASURED and
-/// NULL on a 6+6 paired local A/B (means 9185.3 on vs 9189.9 off; the 3+3
-/// signal that preceded it was machine drift, ~100 us across the block).
-/// Default OFF.
-private let lagunaWarmQKVR1Enabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_WARM_QKV_R1"] == "1"
-
-func lagunaWarmDecodeQKVR1Kernels() {
-    guard lagunaWarmQKVR1Enabled else { return }
-    let hidden = LagunaConstants.hiddenSize
-    let normalized = MLXArray.zeros([1, 1, hidden], dtype: .bfloat16)
-    for heads in [
-        LagunaConstants.slidingAttentionHeads,
-        LagunaConstants.fullAttentionHeads,
-    ] {
-        guard let kernel = lagunaDecodeNVFP4QKVR1Kernels[heads] else { continue }
-        let rows =
-            (heads + 2 * LagunaConstants.numKeyValueHeads)
-            * LagunaConstants.headDim
-        let codes = MLXArray.zeros([rows, hidden / 8], dtype: .uint32)
-        let scales = MLXArray.zeros([rows, hidden / 16], dtype: .uint8)
-        eval(kernel(
-            [normalized, codes, scales],
-            grid: ((rows / 2) * 64, 1, 1),
-            threadGroup: (64, 1, 1),
-            outputShapes: [[1, 1, rows]],
-            outputDTypes: [.bfloat16]
-        )[0])
-    }
-}
 
 private func lagunaNormAffineQKVSource(rows: Int, staged: Bool) -> String {
     let stagedNormalize = """
@@ -4907,11 +4744,8 @@ private func lagunaNormAffineQKVBody(
 
     for (uint j = 0; j < virtual_per_thread; ++j) {
         uint base = (lid + j * real_threads) * n_reads;
-        \(lagunaSeedElideResidualEnabled ? """
-        float x0 = float(residual[base]);
-        """ : "")
-        float acc = \(lagunaSeedElideResidualInit("x0 * x0"));
-        for (uint i = \(lagunaSeedElideResidualFrom); i < n_reads; ++i) {
+        float acc = 0.0f;
+        for (uint i = 0; i < n_reads; ++i) {
             float xi = float(residual[base + i]);
             acc += xi * xi;
         }
@@ -4949,11 +4783,8 @@ private func lagunaNormAffineQKVBody(
 
     uint column = simd_lid * values_per_thread;
     for (uint k = 0; k < axis_size; k += block_size) {
-        \(lagunaSeedElideResidualEnabled ? """
-        float sum;
-        { uint i = 0; \(loadValue) sum = value; x_thread[0] = value; }
-        """ : "float sum = 0.0f;")
-        for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
+        float sum = 0.0f;
+        for (uint i = 0; i < values_per_thread; ++i) {
             \(loadValue)
             sum += value;
             x_thread[i] = value;
@@ -4963,8 +4794,8 @@ private func lagunaNormAffineQKVBody(
             const device uint8_t* wl = ws + row * axis_size;
             float scale = float(sc[row * in_vec_size_g]);
             float bias = float(bs[row * in_vec_size_g]);
-            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * wl[0]"));
-            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
+            float accum = 0.0f;
+            for (uint i = 0; i < values_per_thread; ++i) {
                 accum += x_thread[i] * wl[i];
             }
             result[row] += scale * accum + sum * bias;
@@ -5120,11 +4951,8 @@ private func lagunaNormAffineQKVPrefetchSource(
 
     for (uint j = 0; j < virtual_per_thread; ++j) {
         uint base = (lid + j * real_threads) * n_reads;
-        \(lagunaSeedElideResidualEnabled ? """
-        float x0 = float(residual[base]);
-        """ : "")
-        float acc = \(lagunaSeedElideResidualInit("x0 * x0"));
-        for (uint i = \(lagunaSeedElideResidualFrom); i < n_reads; ++i) {
+        float acc = 0.0f;
+        for (uint i = 0; i < n_reads; ++i) {
             float xi = float(residual[base + i]);
             acc += xi * xi;
         }
@@ -5153,8 +4981,8 @@ private func lagunaNormAffineQKVPrefetchSource(
 
     uint column = simd_lid * values_per_thread;
     for (uint d = 0; d < pf_depth; ++d) {
-        \(lagunaNormSeedPeel)
-        for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
+        float sum = 0.0f;
+        for (uint i = 0; i < values_per_thread; ++i) {
             float value = float(bfloat(
                             norm_weight[column + i] *
                             bfloat(float(residual[column + i]) * laguna_inv_mean)));
@@ -5162,8 +4990,8 @@ private func lagunaNormAffineQKVPrefetchSource(
             x_thread[i] = value;
         }
         for (uint row = 0; row < results_per_simdgroup; ++row) {
-            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * pf_w[d][row][0]"));
-            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
+            float accum = 0.0f;
+            for (uint i = 0; i < values_per_thread; ++i) {
                 accum += x_thread[i] * pf_w[d][row][i];
             }
             result[row] += pf_s[d][row] * accum + sum * pf_b[d][row];
@@ -5173,8 +5001,8 @@ private func lagunaNormAffineQKVPrefetchSource(
         column += block_size;
     }
     for (uint k = pf_depth * block_size; k < axis_size; k += block_size) {
-        \(lagunaNormSeedPeel)
-        for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
+        float sum = 0.0f;
+        for (uint i = 0; i < values_per_thread; ++i) {
             float value = float(bfloat(
                             norm_weight[column + i] *
                             bfloat(float(residual[column + i]) * laguna_inv_mean)));
@@ -5185,8 +5013,8 @@ private func lagunaNormAffineQKVPrefetchSource(
         for (uint row = 0; row < results_per_simdgroup; ++row) {
             const device uint8_t* wl = ws + row * axis_size;
             \(metadataLoad)
-            float accum = \(lagunaSeedElideResidualInit("x_thread[0] * wl[0]"));
-            for (uint i = \(lagunaSeedElideResidualFrom); i < values_per_thread; ++i) {
+            float accum = 0.0f;
+            for (uint i = 0; i < values_per_thread; ++i) {
                 accum += x_thread[i] * wl[i];
             }
             result[row] += scale * accum + sum * bias;
@@ -5291,15 +5119,15 @@ func lagunaNormAffineQKV(
     guard let kernel = lagunaNormAffineQKVKernels[rows] else { return nil }
     let hidden = LagunaConstants.hiddenSize
     guard residual.dtype == .bfloat16,
-        residual.shape == [1, 1, hidden],
+        residual.dims(1, 1, hidden),
         normWeight.dtype == .bfloat16,
-        normWeight.shape == [hidden],
+        normWeight.dims(hidden),
         codes.dtype == .uint32,
-        codes.shape == [rows, hidden / 4],
+        codes.dims(rows, hidden / 4),
         scales.dtype == .bfloat16,
-        scales.shape == [rows, hidden / 32],
+        scales.dims(rows, hidden / 32),
         biases.dtype == .bfloat16,
-        biases.shape == [rows, hidden / 32]
+        biases.dims(rows, hidden / 32)
     else {
         return nil
     }
@@ -5307,7 +5135,7 @@ func lagunaNormAffineQKV(
     if let metadata = indexedMetadata,
         let indexedKernel = lagunaNormAffineQKVIndexedKernels[rows],
         metadata.indices.dtype == .uint16,
-        metadata.indices.shape == [rows, hidden / 32],
+        metadata.indices.dims(rows, hidden / 32),
         metadata.lut.dtype == .uint32,
         metadata.lut.ndim == 1,
         metadata.lut.size <= 65_536
@@ -5454,7 +5282,7 @@ final class LagunaRuntimeAttention: Module {
         guard _nativeAffineOProj == nil,
             type(of: wo) == Linear.self,
             wo.bias == nil,
-            wo.weight.shape == [LagunaConstants.hiddenSize, nHeads * headDim],
+            wo.weight.dims(LagunaConstants.hiddenSize, nHeads * headDim),
             let quantizedWO = lagunaNativeAffineWeight(wo.weight, layer: layerIdx)
         else {
             return []
@@ -5493,7 +5321,7 @@ final class LagunaRuntimeAttention: Module {
             type(of: gProj) == Linear.self,
             gProj.bias == nil,
             gProj.weight.dtype == .bfloat16,
-            gProj.weight.shape == [nHeads, LagunaConstants.hiddenSize]
+            gProj.weight.dims(nHeads, LagunaConstants.hiddenSize)
         {
             gate = lagunaNativeAffineGProjWeight(gProj.weight)
         }
@@ -5590,10 +5418,10 @@ final class LagunaRuntimeAttention: Module {
             wk.weight.dtype == .bfloat16,
             wv.weight.dtype == .bfloat16,
             gProj.weight.dtype == .bfloat16,
-            wq.weight.shape == [nHeads * headDim, LagunaConstants.hiddenSize],
-            wk.weight.shape == [nKVHeads * headDim, LagunaConstants.hiddenSize],
-            wv.weight.shape == [nKVHeads * headDim, LagunaConstants.hiddenSize],
-            gProj.weight.shape == [nHeads, LagunaConstants.hiddenSize]
+            wq.weight.dims(nHeads * headDim, LagunaConstants.hiddenSize),
+            wk.weight.dims(nKVHeads * headDim, LagunaConstants.hiddenSize),
+            wv.weight.dims(nKVHeads * headDim, LagunaConstants.hiddenSize),
+            gProj.weight.dims(nHeads, LagunaConstants.hiddenSize)
         else {
             return []
         }
@@ -5671,9 +5499,9 @@ final class LagunaRuntimeAttention: Module {
             headDim == LagunaConstants.headDim,
             nKVHeads == LagunaConstants.numKeyValueHeads,
             input.dtype == .bfloat16,
-            input.shape == [1, 1, LagunaConstants.hiddenSize],
+            input.dims(1, 1, LagunaConstants.hiddenSize),
             inputNorm.weight.dtype == .bfloat16,
-            inputNorm.weight.shape == [LagunaConstants.hiddenSize],
+            inputNorm.weight.dims(LagunaConstants.hiddenSize),
             wq.bias == nil, wk.bias == nil, wv.bias == nil,
             type(of: wq) == Linear.self, type(of: wk) == Linear.self,
             type(of: wv) == Linear.self,
@@ -5684,7 +5512,7 @@ final class LagunaRuntimeAttention: Module {
             gateProjection.bias == nil,
             type(of: gateProjection) == Linear.self,
             gateProjection.weight.dtype == .bfloat16,
-            gateProjection.weight.shape == [nHeads, LagunaConstants.hiddenSize]
+            gateProjection.weight.dims(nHeads, LagunaConstants.hiddenSize)
         {
             if lagunaUseNativeAffineQKV(layer: layerIdx),
                 let fusedAffine = _nativeAffineQKV
@@ -5873,22 +5701,22 @@ final class LagunaRuntimeAttention: Module {
             headDim == LagunaConstants.headDim &&
             queries.dtype == .bfloat16 && keys.dtype == .bfloat16 &&
             qNorm.weight.dtype == .bfloat16 && kNorm.weight.dtype == .bfloat16 &&
-            queries.shape == [1, 1, nHeads * headDim] &&
-            keys.shape == [1, 1, nKVHeads * headDim]
+            queries.dims(1, 1, nHeads * headDim) &&
+            keys.dims(1, 1, nKVHeads * headDim)
 
         let useFusedFullQKNormYaRN =
             lagunaFusedFullQKNormYaRNEnabled && !isSliding &&
             fusedQKNormShapesMatch &&
             nHeads == LagunaConstants.fullAttentionHeads &&
             qkRoPEAngles?.dtype == .float32 &&
-            qkRoPEAngles?.shape == [1, 1, 1, headDim / 2]
+            qkRoPEAngles?.dims(1, 1, 1, headDim / 2) == true
 
         let useFusedSlidingQKNormRoPE =
             lagunaFusedSlidingQKNormRoPEEnabled && isSliding &&
             fusedQKNormShapesMatch &&
             nHeads == LagunaConstants.slidingAttentionHeads &&
             qkRoPEAngles?.dtype == .float32 &&
-            qkRoPEAngles?.shape == [1, 1, 1, headDim]
+            qkRoPEAngles?.dims(1, 1, 1, headDim) == true
 
         // Multi-token twins of the decode fusions. The angle input is the
         // full load-time atlas (one cos/sin row per absolute position) and
@@ -5903,8 +5731,8 @@ final class LagunaRuntimeAttention: Module {
             headDim == LagunaConstants.headDim &&
             queries.dtype == .bfloat16 && keys.dtype == .bfloat16 &&
             qNorm.weight.dtype == .bfloat16 && kNorm.weight.dtype == .bfloat16 &&
-            queries.shape == [1, L, nHeads * headDim] &&
-            keys.shape == [1, L, nKVHeads * headDim] &&
+            queries.dims(1, L, nHeads * headDim) &&
+            keys.dims(1, L, nKVHeads * headDim) &&
             qkRoPEAngles?.dtype == .float32 &&
             qkRoPEOffsets?.dtype == .int32 && qkRoPEOffsets?.size == 1
 
@@ -5912,13 +5740,13 @@ final class LagunaRuntimeAttention: Module {
             lagunaPrefillQKNormRoPEEnabled && isSliding &&
             prefillQKNormShapesMatch &&
             nHeads == LagunaConstants.slidingAttentionHeads &&
-            qkRoPEAngles?.shape == [1, 1, lagunaRoPEAngleAtlasLength, headDim]
+            qkRoPEAngles?.dims(1, 1, lagunaRoPEAngleAtlasLength, headDim) == true
 
         let usePrefillFusedFullQKNormYaRN =
             lagunaPrefillQKNormRoPEEnabled && !isSliding &&
             prefillQKNormShapesMatch &&
             nHeads == LagunaConstants.fullAttentionHeads &&
-            qkRoPEAngles?.shape == [1, 1, lagunaRoPEAngleAtlasLength, headDim / 2]
+            qkRoPEAngles?.dims(1, 1, lagunaRoPEAngleAtlasLength, headDim / 2) == true
 
         var qkNormRoPEFused = false
         var fusedAttended: MLXArray?
@@ -5926,7 +5754,7 @@ final class LagunaRuntimeAttention: Module {
             useFusedSlidingQKNormRoPE,
             let fusedAngles = qkRoPEAngles,
             values.dtype == .bfloat16,
-            values.shape == [1, 1, nKVHeads * headDim],
+            values.dims(1, 1, nKVHeads * headDim),
             let rotating = cache as? RotatingKVCache,
             rotating.maxSize == LagunaConstants.slidingWindow,
             let ring = rotating.fusedRingPrepare()
@@ -5952,7 +5780,7 @@ final class LagunaRuntimeAttention: Module {
             useFusedFullQKNormYaRN,
             let fusedAngles = qkRoPEAngles,
             values.dtype == .bfloat16,
-            values.shape == [1, 1, nKVHeads * headDim],
+            values.dims(1, 1, nKVHeads * headDim),
             let simple = cache as? KVCacheSimple,
             let append = simple.fusedAppendPrepare()
         {
@@ -6030,10 +5858,14 @@ final class LagunaRuntimeAttention: Module {
         // `[B, H, 1, D]` have the same contiguous byte order. Reshape
         // directly so decode does not carry a no-op transpose view through
         // the lazy graph. Multi-token calls still require the real axis swap.
-        values =
-            L == 1
-            ? values.reshaped(B, nKVHeads, L, headDim)
-            : values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
+        // A fused attention branch consumed the raw values already, so the
+        // head-major layout only exists for the stock SDPA fallback.
+        if fusedAttended == nil {
+            values =
+                L == 1
+                ? values.reshaped(B, nKVHeads, L, headDim)
+                : values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
+        }
 
         if !qkNormRoPEFused {
             queries = applyRotaryPosition(rope, to: queries, cache: cache)
@@ -6101,8 +5933,8 @@ final class LagunaRuntimeAttention: Module {
                 gatePerHead, B == 1, L == 1, wo.bias == nil,
                 headDim == LagunaConstants.headDim,
                 output.dtype == .bfloat16, projectedGate.dtype == .bfloat16,
-                output.shape == [1, 1, nHeads * headDim],
-                projectedGate.shape == [1, 1, nHeads]
+                output.dims(1, 1, nHeads * headDim),
+                projectedGate.dims(1, 1, nHeads)
             {
                 // Raw logits + gated affine GEMV: ONE dispatch for the softplus
                 // chain, the broadcast product AND the INT8 contraction (see
@@ -6207,9 +6039,9 @@ final class LagunaRuntimeAttention: Module {
                 headDim == LagunaConstants.headDim,
                 output.dtype == .bfloat16, projectedGate.dtype == .bfloat16,
                 wo.weight.dtype == .bfloat16,
-                output.shape == [1, 1, nHeads * headDim],
-                projectedGate.shape == [1, 1, nHeads],
-                wo.weight.shape == [LagunaConstants.hiddenSize, nHeads * headDim]
+                output.dims(1, 1, nHeads * headDim),
+                projectedGate.dims(1, 1, nHeads),
+                wo.weight.dims(LagunaConstants.hiddenSize, nHeads * headDim)
             {
                 let projection = lagunaGatedOutputProjection(
                     attentionOutput: output,
@@ -6267,12 +6099,12 @@ final class LagunaRuntimeAttention: Module {
             isSliding, gatingEnabled, gatePerHead,
             lastInput.dtype == .bfloat16,
             x.dtype == .bfloat16,
-            lastInput.shape == [1, 1, LagunaConstants.hiddenSize],
-            x.shape == [1, L, LagunaConstants.hiddenSize],
+            lastInput.dims(1, 1, LagunaConstants.hiddenSize),
+            x.dims(1, L, LagunaConstants.hiddenSize),
             qGateWeight.dtype == .bfloat16,
             kvWeight.dtype == .bfloat16,
-            qGateWeight.shape == [nHeads * headDim + nHeads, LagunaConstants.hiddenSize],
-            kvWeight.shape == [2 * nKVHeads * headDim, LagunaConstants.hiddenSize]
+            qGateWeight.dims(nHeads * headDim + nHeads, LagunaConstants.hiddenSize),
+            kvWeight.dims(2 * nKVHeads * headDim, LagunaConstants.hiddenSize)
         {
             let qGate = matmul(lastInput, qGateWeight.T)
             let queryDim = nHeads * headDim
@@ -6829,19 +6661,15 @@ func lagunaSharedSwiGLUQMV(
     fusedScales: MLXArray
 ) -> MLXArray {
     precondition(input.dtype == .bfloat16)
-    precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
+    precondition(input.dims(1, 1, LagunaConstants.hiddenSize))
     precondition(fusedWeight.dtype == .uint32)
     precondition(
-        fusedWeight.shape == [
-            2 * LagunaConstants.sharedExpertIntermediateSize,
-            LagunaConstants.hiddenSize / 8,
-        ])
+        fusedWeight.dims(2 * LagunaConstants.sharedExpertIntermediateSize,
+            LagunaConstants.hiddenSize / 8))
     precondition(fusedScales.dtype == .uint8)
     precondition(
-        fusedScales.shape == [
-            2 * LagunaConstants.sharedExpertIntermediateSize,
-            LagunaConstants.hiddenSize / 16,
-        ])
+        fusedScales.dims(2 * LagunaConstants.sharedExpertIntermediateSize,
+            LagunaConstants.hiddenSize / 16))
 
     let kernel =
         lagunaSharedSwiGLUQMVRows1Enabled
@@ -6930,23 +6758,19 @@ func lagunaSharedDownResidual(
 ) -> MLXArray {
     precondition(activated.dtype == .bfloat16)
     precondition(
-        activated.shape == [1, 1, LagunaConstants.sharedExpertIntermediateSize])
+        activated.dims(1, 1, LagunaConstants.sharedExpertIntermediateSize))
     precondition(downWeight.dtype == .uint32)
     precondition(
-        downWeight.shape == [
-            LagunaConstants.hiddenSize,
-            LagunaConstants.sharedExpertIntermediateSize / 8,
-        ])
+        downWeight.dims(LagunaConstants.hiddenSize,
+            LagunaConstants.sharedExpertIntermediateSize / 8))
     precondition(downScales.dtype == .uint8)
     precondition(
-        downScales.shape == [
-            LagunaConstants.hiddenSize,
-            LagunaConstants.sharedExpertIntermediateSize / 16,
-        ])
+        downScales.dims(LagunaConstants.hiddenSize,
+            LagunaConstants.sharedExpertIntermediateSize / 16))
     precondition(routed.dtype == .bfloat16)
-    precondition(routed.shape == [1, 1, LagunaConstants.hiddenSize])
+    precondition(routed.dims(1, 1, LagunaConstants.hiddenSize))
     precondition(residual.dtype == .bfloat16)
-    precondition(residual.shape == [1, 1, LagunaConstants.hiddenSize])
+    precondition(residual.dims(1, 1, LagunaConstants.hiddenSize))
 
     return lagunaSharedDownResidualKernel(
         [activated, downWeight, downScales, routed, residual],
@@ -7165,23 +6989,17 @@ func lagunaRoutedSwiGLUQMV(
     indices: MLXArray
 ) -> MLXArray {
     precondition(input.dtype == .bfloat16)
-    precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
+    precondition(input.dims(1, 1, LagunaConstants.hiddenSize))
     precondition(fusedWeight.dtype == .uint32)
     precondition(
-        fusedWeight.shape == [
-            LagunaConstants.numExperts,
-            2 * LagunaConstants.moeIntermediateSize,
-            LagunaConstants.hiddenSize / 8,
-        ])
+        fusedWeight.dims(LagunaConstants.numExperts, 2 * LagunaConstants.moeIntermediateSize,
+            LagunaConstants.hiddenSize / 8))
     precondition(fusedScales.dtype == .uint8)
     precondition(
-        fusedScales.shape == [
-            LagunaConstants.numExperts,
-            2 * LagunaConstants.moeIntermediateSize,
-            LagunaConstants.hiddenSize / 16,
-        ])
+        fusedScales.dims(LagunaConstants.numExperts, 2 * LagunaConstants.moeIntermediateSize,
+            LagunaConstants.hiddenSize / 16))
     precondition(indices.dtype == .uint32)
-    precondition(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
+    precondition(indices.dims(1, 1, LagunaConstants.numExpertsPerTok))
 
     let kernel =
         lagunaSwiGLUQMVRows1Enabled
@@ -7316,23 +7134,17 @@ func lagunaRoutedSwiGLUQMVPacked(
     indices: MLXArray
 ) -> MLXArray {
     precondition(input.dtype == .bfloat16)
-    precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
+    precondition(input.dims(1, 1, LagunaConstants.hiddenSize))
     precondition(fusedWeight.dtype == .uint32)
     precondition(
-        fusedWeight.shape == [
-            LagunaConstants.numExperts,
-            2 * LagunaConstants.moeIntermediateSize,
-            LagunaConstants.hiddenSize / 8,
-        ])
+        fusedWeight.dims(LagunaConstants.numExperts, 2 * LagunaConstants.moeIntermediateSize,
+            LagunaConstants.hiddenSize / 8))
     precondition(packedScales.dtype == .uint8)
     precondition(
-        packedScales.shape == [
-            LagunaConstants.numExperts,
-            2 * LagunaConstants.moeIntermediateSize * 4,
-            LagunaConstants.hiddenSize / 64,
-        ])
+        packedScales.dims(LagunaConstants.numExperts, 2 * LagunaConstants.moeIntermediateSize * 4,
+            LagunaConstants.hiddenSize / 64))
     precondition(indices.dtype == .uint32)
-    precondition(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
+    precondition(indices.dims(1, 1, LagunaConstants.numExpertsPerTok))
 
     return lagunaRoutedSwiGLUQMVPackedKernel(
         [input, fusedWeight, packedScales, indices],
@@ -7511,7 +7323,7 @@ let lagunaRoutedGateUpR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1"] != "0"
 
 private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v1",
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2",
     inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
     outputNames: ["activated"],
     source: """
@@ -7636,7 +7448,7 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
     routerKeys: MLXArray
 ) -> MLXArray {
     precondition(input.dtype == .bfloat16)
-    precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
+    precondition(input.dims(1, 1, LagunaConstants.hiddenSize))
     precondition(fusedWeight.dtype == .uint32)
     precondition(packedScales.dtype == .uint8)
     precondition(routerKeys.dtype == .uint32)
@@ -7667,7 +7479,7 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
 }
 
 private let lagunaRoutedDownReduceKernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_down_reduce_bf16_v1",
+    name: "laguna_routed_nvfp4_down_reduce_bf16_v2",
     inputNames: [
         "activated", "down_weight", "down_scales", "indices", "router_weights",
     ],
@@ -7781,28 +7593,20 @@ func lagunaRoutedDownReduce(
 ) -> MLXArray {
     precondition(activated.dtype == .bfloat16)
     precondition(
-        activated.shape == [
-            1, 1, LagunaConstants.numExpertsPerTok, 1,
-            LagunaConstants.moeIntermediateSize,
-        ])
+        activated.dims(1, 1, LagunaConstants.numExpertsPerTok, 1,
+            LagunaConstants.moeIntermediateSize))
     precondition(downWeight.dtype == .uint32)
     precondition(
-        downWeight.shape == [
-            LagunaConstants.numExperts,
-            LagunaConstants.hiddenSize,
-            LagunaConstants.moeIntermediateSize / 8,
-        ])
+        downWeight.dims(LagunaConstants.numExperts, LagunaConstants.hiddenSize,
+            LagunaConstants.moeIntermediateSize / 8))
     precondition(downScales.dtype == .uint8)
     precondition(
-        downScales.shape == [
-            LagunaConstants.numExperts,
-            LagunaConstants.hiddenSize,
-            LagunaConstants.moeIntermediateSize / 16,
-        ])
+        downScales.dims(LagunaConstants.numExperts, LagunaConstants.hiddenSize,
+            LagunaConstants.moeIntermediateSize / 16))
     precondition(indices.dtype == .uint32)
-    precondition(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
+    precondition(indices.dims(1, 1, LagunaConstants.numExpertsPerTok))
     precondition(routerWeights.dtype == .float32)
-    precondition(routerWeights.shape == [1, 1, LagunaConstants.numExpertsPerTok])
+    precondition(routerWeights.dims(1, 1, LagunaConstants.numExpertsPerTok))
 
     return lagunaRoutedDownReduceKernel(
         [activated, downWeight, downScales, indices, routerWeights],
@@ -7834,8 +7638,8 @@ let lagunaSharedFirstDownOrderEnabled =
 
 private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
     name: lagunaSharedFirstDownOrderEnabled
-        ? "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v4sf"
-        : "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v4",
+        ? "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v5sf"
+        : "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v5",
     inputNames: lagunaSharedFirstDownOrderEnabled
         ? [
             "shared_activated", "shared_down_weight", "shared_down_scales",
@@ -7853,7 +7657,7 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
         constexpr uint output_width = 2048;
         constexpr uint routed_experts = 8;
         constexpr uint shared_slot = 8;
-        constexpr uint outputs_per_simd = 1;
+        constexpr uint outputs_per_simd = 4;
         constexpr uint values_per_lane = 16;
         constexpr uint packed_row_bytes = 256;
         constexpr uint scale_row_bytes = 32;
@@ -7956,47 +7760,33 @@ func lagunaRoutedSharedDownResidual(
 ) -> MLXArray {
     precondition(routedActivated.dtype == .bfloat16)
     precondition(
-        routedActivated.shape == [
-            1, 1, LagunaConstants.numExpertsPerTok, 1,
-            LagunaConstants.moeIntermediateSize,
-        ])
+        routedActivated.dims(1, 1, LagunaConstants.numExpertsPerTok, 1,
+            LagunaConstants.moeIntermediateSize))
     precondition(routedDownWeight.dtype == .uint32)
     precondition(
-        routedDownWeight.shape == [
-            LagunaConstants.numExperts,
-            LagunaConstants.hiddenSize,
-            LagunaConstants.moeIntermediateSize / 8,
-        ])
+        routedDownWeight.dims(LagunaConstants.numExperts, LagunaConstants.hiddenSize,
+            LagunaConstants.moeIntermediateSize / 8))
     precondition(routedDownScales.dtype == .uint8)
     precondition(
-        routedDownScales.shape == [
-            LagunaConstants.numExperts,
-            LagunaConstants.hiddenSize,
-            LagunaConstants.moeIntermediateSize / 16,
-        ])
+        routedDownScales.dims(LagunaConstants.numExperts, LagunaConstants.hiddenSize,
+            LagunaConstants.moeIntermediateSize / 16))
     precondition(indices.dtype == .uint32)
-    precondition(indices.shape == [1, 1, LagunaConstants.numExpertsPerTok])
+    precondition(indices.dims(1, 1, LagunaConstants.numExpertsPerTok))
     precondition(routerWeights.dtype == .float32)
-    precondition(routerWeights.shape == [1, 1, LagunaConstants.numExpertsPerTok])
+    precondition(routerWeights.dims(1, 1, LagunaConstants.numExpertsPerTok))
     precondition(sharedActivated.dtype == .bfloat16)
     precondition(
-        sharedActivated.shape == [
-            1, 1, LagunaConstants.sharedExpertIntermediateSize,
-        ])
+        sharedActivated.dims(1, 1, LagunaConstants.sharedExpertIntermediateSize))
     precondition(sharedDownWeight.dtype == .uint32)
     precondition(
-        sharedDownWeight.shape == [
-            LagunaConstants.hiddenSize,
-            LagunaConstants.sharedExpertIntermediateSize / 8,
-        ])
+        sharedDownWeight.dims(LagunaConstants.hiddenSize,
+            LagunaConstants.sharedExpertIntermediateSize / 8))
     precondition(sharedDownScales.dtype == .uint8)
     precondition(
-        sharedDownScales.shape == [
-            LagunaConstants.hiddenSize,
-            LagunaConstants.sharedExpertIntermediateSize / 16,
-        ])
+        sharedDownScales.dims(LagunaConstants.hiddenSize,
+            LagunaConstants.sharedExpertIntermediateSize / 16))
     precondition(residual.dtype == .bfloat16)
-    precondition(residual.shape == [1, 1, LagunaConstants.hiddenSize])
+    precondition(residual.dims(1, 1, LagunaConstants.hiddenSize))
 
     return lagunaRoutedSharedDownResidualKernel(
         lagunaSharedFirstDownOrderEnabled
@@ -8010,7 +7800,7 @@ func lagunaRoutedSharedDownResidual(
                 indices, routerWeights, sharedActivated,
                 sharedDownWeight, sharedDownScales, residual,
             ],
-        grid: (LagunaConstants.hiddenSize * 288, 1, 1),
+        grid: (LagunaConstants.hiddenSize / 4 * 288, 1, 1),
         threadGroup: (288, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
         outputDTypes: [.bfloat16]
@@ -8114,12 +7904,10 @@ func lagunaDenseGateUpSwiGLU(
     fusedWeight: MLXArray
 ) -> MLXArray {
     precondition(input.dtype == .bfloat16)
-    precondition(input.shape == [1, 1, LagunaConstants.hiddenSize])
+    precondition(input.dims(1, 1, LagunaConstants.hiddenSize))
     precondition(fusedWeight.dtype == .bfloat16)
     precondition(
-        fusedWeight.shape == [
-            2 * LagunaConstants.denseIntermediateSize, LagunaConstants.hiddenSize,
-        ])
+        fusedWeight.dims(2 * LagunaConstants.denseIntermediateSize, LagunaConstants.hiddenSize))
 
     return lagunaDenseGateUpSwiGLUKernel(
         [input, fusedWeight],
@@ -8171,10 +7959,8 @@ private let lagunaDenseDownResidualKernel = MLXFast.metalKernel(
             column += block_width;
         }
 
-        // Loop interchange: each row's delta sequence (16,8,4,2,1) and +=
-        // order are unchanged; the independent chains interleave.
-        for (ushort delta = 16; delta >= 1; delta >>= 1) {
-            for (uint row = 0; row < rows_per_thread; ++row) {
+        for (uint row = 0; row < rows_per_thread; ++row) {
+            for (ushort delta = 16; delta >= 1; delta >>= 1) {
                 result[row] += metal::simd_shuffle_down(result[row], delta);
             }
         }
@@ -8195,14 +7981,12 @@ func lagunaDenseDownResidual(
     residual: MLXArray
 ) -> MLXArray {
     precondition(activated.dtype == .bfloat16)
-    precondition(activated.shape == [1, 1, LagunaConstants.denseIntermediateSize])
+    precondition(activated.dims(1, 1, LagunaConstants.denseIntermediateSize))
     precondition(downWeight.dtype == .bfloat16)
     precondition(
-        downWeight.shape == [
-            LagunaConstants.hiddenSize, LagunaConstants.denseIntermediateSize,
-        ])
+        downWeight.dims(LagunaConstants.hiddenSize, LagunaConstants.denseIntermediateSize))
     precondition(residual.dtype == .bfloat16)
-    precondition(residual.shape == [1, 1, LagunaConstants.hiddenSize])
+    precondition(residual.dims(1, 1, LagunaConstants.hiddenSize))
 
     return lagunaDenseDownResidualKernel(
         [activated, downWeight, residual],
@@ -8266,8 +8050,8 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             gate.weight.dtype == .uint32, up.weight.dtype == .uint32,
             gate.scales.ndim == 2, up.scales.ndim == 2,
             gate.scales.dtype == .uint8, up.scales.dtype == .uint8,
-            gate.weight.shape == up.weight.shape,
-            gate.scales.shape == up.scales.shape,
+            gate.weight.sameDims(up.weight),
+            gate.scales.sameDims(up.scales),
             gate.scales.dim(0) == gate.weight.dim(0),
             gate.weight.dim(1) * 8 == gate.scales.dim(1) * 16
         else {
@@ -8298,8 +8082,8 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             gateProj.bias == nil, upProj.bias == nil,
             gateProj.weight.dtype == .bfloat16,
             upProj.weight.dtype == .bfloat16,
-            gateProj.weight.shape == [intermediate, hidden],
-            upProj.weight.shape == [intermediate, hidden]
+            gateProj.weight.dims(intermediate, hidden),
+            upProj.weight.dims(intermediate, hidden)
         else {
             return nil
         }
@@ -8366,20 +8150,16 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             down.bias == nil,
             down.biases == nil,
             x.dtype == .bfloat16,
-            x.shape == [1, 1, LagunaConstants.hiddenSize],
+            x.dims(1, 1, LagunaConstants.hiddenSize),
             fusedWeight.dtype == .uint32,
             fusedScales.dtype == .uint8,
             _fusedGateUpSplit == LagunaConstants.sharedExpertIntermediateSize,
             down.weight.dtype == .uint32,
-            down.weight.shape == [
-                LagunaConstants.hiddenSize,
-                LagunaConstants.sharedExpertIntermediateSize / 8,
-            ],
+            down.weight.dims(LagunaConstants.hiddenSize,
+                LagunaConstants.sharedExpertIntermediateSize / 8),
             down.scales.dtype == .uint8,
-            down.scales.shape == [
-                LagunaConstants.hiddenSize,
-                LagunaConstants.sharedExpertIntermediateSize / 16,
-            ]
+            down.scales.dims(LagunaConstants.hiddenSize,
+                LagunaConstants.sharedExpertIntermediateSize / 16)
         else {
             return nil
         }
@@ -8395,9 +8175,9 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
         guard lagunaFusedSharedDownResidualEnabled,
             let inputs = fusedSharedDownInputs(x),
             routed.dtype == .bfloat16,
-            routed.shape == [1, 1, LagunaConstants.hiddenSize],
+            routed.dims(1, 1, LagunaConstants.hiddenSize),
             residual.dtype == .bfloat16,
-            residual.shape == [1, 1, LagunaConstants.hiddenSize]
+            residual.dims(1, 1, LagunaConstants.hiddenSize)
         else {
             return nil
         }
@@ -8432,9 +8212,9 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
         let intermediate = LagunaConstants.denseIntermediateSize
         guard x.dim(1) == 1,
             x.dtype == .bfloat16,
-            x.shape == [1, 1, hidden],
+            x.dims(1, 1, hidden),
             residual.dtype == .bfloat16,
-            residual.shape == [1, 1, hidden],
+            residual.dims(1, 1, hidden),
             type(of: gateProj) == Linear.self,
             type(of: upProj) == Linear.self,
             type(of: downProj) == Linear.self,
@@ -8442,9 +8222,9 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             gateProj.weight.dtype == .bfloat16,
             upProj.weight.dtype == .bfloat16,
             downProj.weight.dtype == .bfloat16,
-            gateProj.weight.shape == [intermediate, hidden],
-            upProj.weight.shape == [intermediate, hidden],
-            downProj.weight.shape == [hidden, intermediate]
+            gateProj.weight.dims(intermediate, hidden),
+            upProj.weight.dims(intermediate, hidden),
+            downProj.weight.dims(hidden, intermediate)
         else {
             return nil
         }
@@ -8453,7 +8233,7 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
         if lagunaFusedDenseGateUpSwiGLUEnabled,
             let fusedWeight = _fusedDenseGateUpWeight,
             fusedWeight.dtype == .bfloat16,
-            fusedWeight.shape == [2 * intermediate, hidden]
+            fusedWeight.dims(2 * intermediate, hidden)
         {
             lagunaTrace("dense gate/up GEMV + SwiGLU")
             activated = lagunaDenseGateUpSwiGLU(x, fusedWeight: fusedWeight)
@@ -8475,7 +8255,7 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
         {
             if lagunaFusedSharedSwiGLUQMVEnabled,
                 x.dtype == .bfloat16,
-                x.shape == [1, 1, LagunaConstants.hiddenSize],
+                x.dims(1, 1, LagunaConstants.hiddenSize),
                 fusedWeight.dtype == .uint32,
                 fusedScales.dtype == .uint8,
                 _fusedGateUpSplit == LagunaConstants.sharedExpertIntermediateSize
@@ -8497,35 +8277,6 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             // quantized output row is computed independently, so the split
             // halves are bit-exact vs. the separate gate/up dispatches.
             lagunaTrace("shared fused [gate; up] bank QMM")
-            let gateUp = MLX.quantizedMM(
-                x,
-                fusedWeight,
-                scales: fusedScales,
-                biases: nil,
-                transpose: true,
-                groupSize: 16,
-                bits: 4,
-                mode: .nvfp4
-            )
-            let gate = gateUp[.ellipsis, 0 ..< _fusedGateUpSplit]
-            let up = gateUp[.ellipsis, _fusedGateUpSplit...]
-            return downProj(compiledSiluProduct(gate, up))
-        }
-        // `DARKBLOOM_PREFILL_FUSED_SHARED=1` (default off): use the same
-        // resident row-concatenated [gate; up] bank for the multi-token
-        // prefill forward. The bit-exactness argument above is row-local and
-        // does not depend on M: each quantized output row's K-loop is the
-        // same computation whether the projection is dispatched as one bank
-        // or two, for every input row. One QMM replaces two per sparse
-        // layer, and the normalized input is read once instead of twice.
-        if lagunaPrefillFusedSharedEnabled, x.dim(1) > 1,
-            let fusedWeight = _fusedGateUpWeight,
-            let fusedScales = _fusedGateUpScales,
-            x.dtype == .bfloat16,
-            fusedWeight.dtype == .uint32,
-            fusedScales.dtype == .uint8
-        {
-            lagunaTrace("prefill shared fused [gate; up] bank QMM")
             let gateUp = MLX.quantizedMM(
                 x,
                 fusedWeight,
@@ -9740,74 +9491,14 @@ private let lagunaPrefillMoETailKernel = MLXFast.metalKernel(
 /// Reading that row directly preserves the stock slot-0-through-slot-7 BF16
 /// multiply/add sequence while deleting the intervening 16 MiB copy at the
 /// ranked 512-token window.
-/// `DARKBLOOM_PREFILL_TAIL_WIDELD=1` — default OFF, measured NULL on a
-/// 12+12 order-balanced paired local A/B (dec 19.8 us p = 0.24, pre 4.2 us
-/// p = 0.13). The first 6+6 fixed-order block showed dec -110 us at
-/// p = 0.003; inverting the within-pair order reversed it — the "effect"
-/// was a 90 us first-in-pair position artifact, now controlled for by
-/// alternating arm order. Kept as the receipt:
-/// same tail reduction with the loads issued as 8-byte `vec<bfloat, 4>`
-/// reads — eight expert rows, the shared row, and the residual row each
-/// loaded once per 4-column block instead of per element. `col` is a
-/// multiple of 4 so every run is 8-byte aligned; the per-column
-/// accumulation chain below is textually identical in value and order
-/// (same products, same bfloat roundings, ascending e then ascending i),
-/// so the kernel is bit-exact against v1. Distinct kernel name keeps the
-/// name-keyed JIT cache from ever seeing two sources under one name.
-private let lagunaPrefillTailWideLoadsEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_TAIL_WIDELD"] == "1"
-
 private let lagunaPrefillSortedMoETailKernel = MLXFast.metalKernel(
-    name: lagunaPrefillTailWideLoadsEnabled
-        ? "laguna_prefill_sorted_moe_tail_bf16_v2w"
-        : "laguna_prefill_sorted_moe_tail_bf16_v1",
+    name: "laguna_prefill_sorted_moe_tail_bf16_v1",
     inputNames: [
         "sorted_expert_outputs", "inverse_order", "router_weights",
         "shared_output", "residual",
     ],
     outputNames: ["output"],
-    source: lagunaPrefillTailWideLoadsEnabled
-        ? """
-        constexpr uint hidden = 2048;
-        constexpr uint experts = 8;
-        constexpr uint n_cols = 4;
-
-        uint row = thread_position_in_grid.y;
-        uint col = thread_position_in_grid.x * n_cols;
-        const device float* weight_row = router_weights + row * experts;
-
-        bfloat expert_weights[experts];
-        uint sorted_rows[experts];
-        for (uint e = 0; e < experts; ++e) {
-            expert_weights[e] = bfloat(weight_row[e]);
-            sorted_rows[e] = inverse_order[row * experts + e];
-        }
-
-        vec<bfloat, 4> expert_vals[experts];
-        for (uint e = 0; e < experts; ++e) {
-            expert_vals[e] = *(const device vec<bfloat, 4>*)(
-                sorted_expert_outputs + sorted_rows[e] * hidden + col);
-        }
-        const vec<bfloat, 4> shared_vals = *(const device vec<bfloat, 4>*)(
-            shared_output + row * hidden + col);
-        const vec<bfloat, 4> residual_vals = *(const device vec<bfloat, 4>*)(
-            residual + row * hidden + col);
-
-        for (uint i = 0; i < n_cols; ++i) {
-            bfloat total = bfloat(0);
-            for (uint e = 0; e < experts; ++e) {
-                bfloat product = bfloat(
-                    expert_vals[e][i] *
-                    expert_weights[e]);
-                total = bfloat(product + total);
-            }
-            bfloat scaled = bfloat(total * bfloat(2.5f));
-            bfloat r2 = bfloat(scaled + shared_vals[i]);
-            output[row * hidden + col + i] =
-                bfloat(residual_vals[i] + r2);
-        }
-        """
-        : """
+    source: """
         constexpr uint hidden = 2048;
         constexpr uint experts = 8;
         constexpr uint n_cols = 4;
@@ -9849,15 +9540,13 @@ private func lagunaPrefillMoETail(
     let rows = expertOutputs.dim(1)
     precondition(expertOutputs.dtype == .bfloat16)
     precondition(
-        expertOutputs.shape == [
-            1, rows, LagunaConstants.numExpertsPerTok, LagunaConstants.hiddenSize,
-        ])
+        expertOutputs.dims(1, rows, LagunaConstants.numExpertsPerTok, LagunaConstants.hiddenSize))
     precondition(routerWeights.dtype == .float32)
-    precondition(routerWeights.shape == [1, rows, LagunaConstants.numExpertsPerTok])
+    precondition(routerWeights.dims(1, rows, LagunaConstants.numExpertsPerTok))
     precondition(sharedOutput.dtype == .bfloat16)
-    precondition(sharedOutput.shape == [1, rows, LagunaConstants.hiddenSize])
+    precondition(sharedOutput.dims(1, rows, LagunaConstants.hiddenSize))
     precondition(residual.dtype == .bfloat16)
-    precondition(residual.shape == [1, rows, LagunaConstants.hiddenSize])
+    precondition(residual.dims(1, rows, LagunaConstants.hiddenSize))
 
     return lagunaPrefillMoETailKernel(
         [expertOutputs, routerWeights, sharedOutput, residual],
@@ -9883,11 +9572,11 @@ private func lagunaPrefillSortedMoETail(
     precondition(inverseOrder.dtype == .uint32)
     precondition(inverseOrder.size == rows * LagunaConstants.numExpertsPerTok)
     precondition(routerWeights.dtype == .float32)
-    precondition(routerWeights.shape == [1, rows, LagunaConstants.numExpertsPerTok])
+    precondition(routerWeights.dims(1, rows, LagunaConstants.numExpertsPerTok))
     precondition(sharedOutput.dtype == .bfloat16)
-    precondition(sharedOutput.shape == [1, rows, LagunaConstants.hiddenSize])
+    precondition(sharedOutput.dims(1, rows, LagunaConstants.hiddenSize))
     precondition(residual.dtype == .bfloat16)
-    precondition(residual.shape == [1, rows, LagunaConstants.hiddenSize])
+    precondition(residual.dims(1, rows, LagunaConstants.hiddenSize))
 
     return lagunaPrefillSortedMoETailKernel(
         [
@@ -10073,8 +9762,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
             gateWeight.dtype == .uint32, upWeight.dtype == .uint32,
             gateScales.dtype == .uint8, upScales.dtype == .uint8,
             downWeight.dtype == .uint32, downScales.dtype == .uint8,
-            gateWeight.shape == upWeight.shape,
-            gateScales.shape == upScales.shape,
+            gateWeight.sameDims(upWeight),
+            gateScales.sameDims(upScales),
             gateScales.dim(0) == gateWeight.dim(0),
             gateScales.dim(1) == gateWeight.dim(1),
             gateWeight.dim(2) * 8 == gateScales.dim(2) * 16,
@@ -10232,11 +9921,11 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
             var mergedSharedActivated: MLXArray?
             if lagunaFusedRoutedSwiGLUQMVEnabled,
                 x.dtype == .bfloat16,
-                x.shape == [1, 1, LagunaConstants.hiddenSize],
+                x.dims(1, 1, LagunaConstants.hiddenSize),
                 fusedWeight.dtype == .uint32,
                 fusedScales.dtype == .uint8,
                 inds.dtype == .uint32,
-                inds.shape == [1, 1, LagunaConstants.numExpertsPerTok],
+                inds.dims(1, 1, LagunaConstants.numExpertsPerTok),
                 _fusedRoutedGateUpSplit == LagunaConstants.moeIntermediateSize
             {
                 if lagunaPackedScalesEnabled,
@@ -10306,27 +9995,19 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 let sharedInputs = sharedExpert.fusedSharedDownInputs(
                     x, sharedActivation: mergedSharedActivated),
                 activated.dtype == .bfloat16,
-                activated.shape == [
-                    1, 1, LagunaConstants.numExpertsPerTok, 1,
-                    LagunaConstants.moeIntermediateSize,
-                ],
+                activated.dims(1, 1, LagunaConstants.numExpertsPerTok, 1,
+                    LagunaConstants.moeIntermediateSize),
                 downWeight.dtype == .uint32,
-                downWeight.shape == [
-                    LagunaConstants.numExperts,
-                    LagunaConstants.hiddenSize,
-                    LagunaConstants.moeIntermediateSize / 8,
-                ],
+                downWeight.dims(LagunaConstants.numExperts, LagunaConstants.hiddenSize,
+                    LagunaConstants.moeIntermediateSize / 8),
                 downScales.dtype == .uint8,
-                downScales.shape == [
-                    LagunaConstants.numExperts,
-                    LagunaConstants.hiddenSize,
-                    LagunaConstants.moeIntermediateSize / 16,
-                ],
+                downScales.dims(LagunaConstants.numExperts, LagunaConstants.hiddenSize,
+                    LagunaConstants.moeIntermediateSize / 16),
                 weights.dtype == .float32,
-                weights.shape == [1, 1, LagunaConstants.numExpertsPerTok],
+                weights.dims(1, 1, LagunaConstants.numExpertsPerTok),
                 routedScalingFactor == Float(LagunaConstants.moeRoutedScalingFactor),
                 residual.dtype == .bfloat16,
-                residual.shape == [1, 1, LagunaConstants.hiddenSize]
+                residual.dims(1, 1, LagunaConstants.hiddenSize)
             {
                 lagunaTrace("routed+shared down residual")
                 return lagunaRoutedSharedDownResidual(
@@ -10344,24 +10025,16 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 let downWeight = _routedDownWeight,
                 let downScales = _routedDownScales,
                 activated.dtype == .bfloat16,
-                activated.shape == [
-                    1, 1, LagunaConstants.numExpertsPerTok, 1,
-                    LagunaConstants.moeIntermediateSize,
-                ],
+                activated.dims(1, 1, LagunaConstants.numExpertsPerTok, 1,
+                    LagunaConstants.moeIntermediateSize),
                 downWeight.dtype == .uint32,
-                downWeight.shape == [
-                    LagunaConstants.numExperts,
-                    LagunaConstants.hiddenSize,
-                    LagunaConstants.moeIntermediateSize / 8,
-                ],
+                downWeight.dims(LagunaConstants.numExperts, LagunaConstants.hiddenSize,
+                    LagunaConstants.moeIntermediateSize / 8),
                 downScales.dtype == .uint8,
-                downScales.shape == [
-                    LagunaConstants.numExperts,
-                    LagunaConstants.hiddenSize,
-                    LagunaConstants.moeIntermediateSize / 16,
-                ],
+                downScales.dims(LagunaConstants.numExperts, LagunaConstants.hiddenSize,
+                    LagunaConstants.moeIntermediateSize / 16),
                 weights.dtype == .float32,
-                weights.shape == [1, 1, LagunaConstants.numExpertsPerTok],
+                weights.dims(1, 1, LagunaConstants.numExpertsPerTok),
                 routedScalingFactor == Float(LagunaConstants.moeRoutedScalingFactor)
             {
                 lagunaTrace("routed down reduce")
@@ -10431,13 +10104,13 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 inverseOrder.dtype == .uint32,
                 inverseOrder.size == x.dim(1) * LagunaConstants.numExpertsPerTok,
                 weights.dtype == .float32,
-                weights.shape == [1, x.dim(1), LagunaConstants.numExpertsPerTok],
+                weights.dims(1, x.dim(1), LagunaConstants.numExpertsPerTok),
                 routedScalingFactor == Float(LagunaConstants.moeRoutedScalingFactor),
                 residual.dtype == .bfloat16,
-                residual.shape == [1, x.dim(1), LagunaConstants.hiddenSize]
+                residual.dims(1, x.dim(1), LagunaConstants.hiddenSize)
             {
                 let sharedOut = sharedExpert(x)
-                if sharedOut.dtype == .bfloat16, sharedOut.shape == residual.shape {
+                if sharedOut.dtype == .bfloat16, sharedOut.sameDims(residual) {
                     lagunaTrace("prefill sorted moe tail")
                     return lagunaPrefillSortedMoETail(
                         sortedExpertOutputs: y,
@@ -10477,13 +10150,13 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 y.dim(2) == LagunaConstants.numExpertsPerTok,
                 y.dim(3) == LagunaConstants.hiddenSize,
                 weights.dtype == .float32,
-                weights.shape == [1, x.dim(1), LagunaConstants.numExpertsPerTok],
+                weights.dims(1, x.dim(1), LagunaConstants.numExpertsPerTok),
                 routedScalingFactor == Float(LagunaConstants.moeRoutedScalingFactor),
                 residual.dtype == .bfloat16,
-                residual.shape == [1, x.dim(1), LagunaConstants.hiddenSize]
+                residual.dims(1, x.dim(1), LagunaConstants.hiddenSize)
             {
                 let sharedOut = sharedExpert(x)
-                if sharedOut.dtype == .bfloat16, sharedOut.shape == residual.shape {
+                if sharedOut.dtype == .bfloat16, sharedOut.sameDims(residual) {
                     lagunaTrace("prefill moe tail")
                     return lagunaPrefillMoETail(
                         expertOutputs: y,
@@ -10571,12 +10244,10 @@ final class LagunaRuntimeDecoderLayer: Module {
         if lagunaFusedResidualRMSNormRouterEnabled,
             x.dtype == .bfloat16, r.dtype == .bfloat16,
             postAttentionLayerNorm.weight.dtype == .bfloat16,
-            x.shape == [1, 1, LagunaConstants.hiddenSize], x.shape == r.shape,
+            x.dims(1, 1, LagunaConstants.hiddenSize), x.sameDims(r),
             let sparse = mlp as? LagunaRuntimeSparseMoEBlock,
             sparse.gate.weight.dtype == .bfloat16,
-            sparse.gate.weight.shape == [
-                LagunaConstants.numExperts, LagunaConstants.hiddenSize,
-            ]
+            sparse.gate.weight.dims(LagunaConstants.numExperts, LagunaConstants.hiddenSize)
         {
             let fused = lagunaResidualRMSNormRouter(
                 residual: x,
@@ -10591,7 +10262,7 @@ final class LagunaRuntimeDecoderLayer: Module {
         } else if lagunaFusedResidualRMSNormEnabled,
             x.dtype == .bfloat16, r.dtype == .bfloat16,
             postAttentionLayerNorm.weight.dtype == .bfloat16,
-            x.shape == r.shape, x.dim(-1) == LagunaConstants.hiddenSize,
+            x.sameDims(r), x.dim(-1) == LagunaConstants.hiddenSize,
             x.size == LagunaConstants.hiddenSize
         {
             lagunaTrace("residual+rmsnorm")
@@ -10600,7 +10271,7 @@ final class LagunaRuntimeDecoderLayer: Module {
         } else if lagunaPrefillFusedResidualRMSNormEnabled,
             x.dtype == .bfloat16, r.dtype == .bfloat16,
             postAttentionLayerNorm.weight.dtype == .bfloat16,
-            x.shape == r.shape, x.ndim == 3, x.dim(0) == 1,
+            x.sameDims(r), x.ndim == 3, x.dim(0) == 1,
             x.dim(-1) == LagunaConstants.hiddenSize,
             x.dim(1) > 1
         {
@@ -10620,9 +10291,9 @@ final class LagunaRuntimeDecoderLayer: Module {
                 lagunaFusedRoutedSharedDownResidualEnabled
         ),
             normalized.dtype == .bfloat16,
-            normalized.shape == [1, 1, LagunaConstants.hiddenSize],
+            normalized.dims(1, 1, LagunaConstants.hiddenSize),
             h.dtype == .bfloat16,
-            h.shape == normalized.shape,
+            h.sameDims(normalized),
             let sparse = mlp as? LagunaRuntimeSparseMoEBlock
         {
             return sparse(
@@ -10669,13 +10340,11 @@ final class LagunaRuntimeDecoderLayer: Module {
             if lagunaFusedResidualRMSNormRouterEnabled,
                 lastResidual.dtype == .bfloat16, r.dtype == .bfloat16,
                 postAttentionLayerNorm.weight.dtype == .bfloat16,
-                lastResidual.shape == [1, 1, LagunaConstants.hiddenSize],
-                lastResidual.shape == r.shape,
+                lastResidual.dims(1, 1, LagunaConstants.hiddenSize),
+                lastResidual.sameDims(r),
                 let sparse = mlp as? LagunaRuntimeSparseMoEBlock,
                 sparse.gate.weight.dtype == .bfloat16,
-                sparse.gate.weight.shape == [
-                    LagunaConstants.numExperts, LagunaConstants.hiddenSize,
-                ]
+                sparse.gate.weight.dims(LagunaConstants.numExperts, LagunaConstants.hiddenSize)
             {
                 let fused = lagunaResidualRMSNormRouter(
                     residual: lastResidual,
@@ -10690,7 +10359,7 @@ final class LagunaRuntimeDecoderLayer: Module {
             } else if lagunaFusedResidualRMSNormEnabled,
                 lastResidual.dtype == .bfloat16, r.dtype == .bfloat16,
                 postAttentionLayerNorm.weight.dtype == .bfloat16,
-                lastResidual.shape == r.shape,
+                lastResidual.sameDims(r),
                 lastResidual.dim(-1) == LagunaConstants.hiddenSize,
                 lastResidual.size == LagunaConstants.hiddenSize
             {
@@ -10707,11 +10376,9 @@ final class LagunaRuntimeDecoderLayer: Module {
                     lagunaFusedRoutedSharedDownResidualEnabled
             ),
                 normalizedAfterAttention.dtype == .bfloat16,
-                normalizedAfterAttention.shape == [
-                    1, 1, LagunaConstants.hiddenSize,
-                ],
+                normalizedAfterAttention.dims(1, 1, LagunaConstants.hiddenSize),
                 h.dtype == .bfloat16,
-                h.shape == normalizedAfterAttention.shape,
+                h.sameDims(normalizedAfterAttention),
                 let sparse = mlp as? LagunaRuntimeSparseMoEBlock
             {
                 return sparse(
@@ -10794,19 +10461,13 @@ private func lagunaDecodeEmbeddingRoPEAtlas(
     position: Int
 ) -> (hidden: MLXArray, fullAngles: MLXArray, slidingAngles: MLXArray)? {
     guard tokens.dtype == .int32,
-        tokens.shape == [1, 1],
+        tokens.dims(1, 1),
         embeddingWeight.dtype == .bfloat16,
-        embeddingWeight.shape == [
-            LagunaConstants.vocabSize, LagunaConstants.hiddenSize,
-        ],
+        embeddingWeight.dims(LagunaConstants.vocabSize, LagunaConstants.hiddenSize),
         fullAtlas.dtype == .float32,
-        fullAtlas.shape == [
-            1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim / 2,
-        ],
+        fullAtlas.dims(1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim / 2),
         slidingAtlas.dtype == .float32,
-        slidingAtlas.shape == [
-            1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim,
-        ],
+        slidingAtlas.dims(1, 1, lagunaRoPEAngleAtlasLength, LagunaConstants.headDim),
         position >= 0, position < lagunaRoPEAngleAtlasLength
     else {
         return nil
@@ -10837,15 +10498,6 @@ private func lagunaDecodeEmbeddingRoPEAtlas(
 /// The Laguna text tower: unscaled embedding and 40 decoder layers. The final
 /// RMSNorm remains a child of this module for checkpoint compatibility, but
 /// the scored wrapper applies it after selecting the only consumed row.
-private let lagunaPhaseCacheLimitBytes: Int = {
-    guard
-        let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_PHASE_CACHE_LIMIT_GB"],
-        let gb = Int(raw), gb > 0
-    else { return 0 }
-    return gb << 30
-}()
-
 final class LagunaRuntimeModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     @ModuleInfo(key: "layers") var layers: [LagunaRuntimeDecoderLayer]
@@ -10859,6 +10511,9 @@ final class LagunaRuntimeModelInner: Module {
     let _slidingRoPEAngleSeed: MLXArray
     var _fullRoPEAngleAtlas: MLXArray?
     var _slidingRoPEAngleAtlas: MLXArray?
+    /// Which layers fire `asyncEval` during single-token decode. Derived from
+    /// the process-wide async-stage flag and the fixed layer count.
+    let decodeFireMask: UInt64
 
     init(_ config: LagunaConfig) {
         precondition(config.vocabSize > 0)
@@ -10891,6 +10546,19 @@ final class LagunaRuntimeModelInner: Module {
                 + Array(repeating: Float(0), count: LagunaConstants.headDim / 2),
             [1, 1, 1, LagunaConstants.headDim]
         )
+        self.decodeFireMask =
+            switch lagunaDecodeAsyncStage {
+            case .off, .norm, .logits:
+                0
+            case .layer(let idx):
+                UInt64(1) << UInt64(idx)
+            case .ladder(let n):
+                (0..<UInt64(config.numHiddenLayers)).reduce(UInt64(0)) { acc, i in
+                    (Int(i) + 1) % n == 0 ? acc | (UInt64(1) << i) : acc
+                }
+            case .explicit(let mask):
+                mask
+            }
     }
 
     /// Materialize exact position rows with the same stock RoPE instances the
@@ -10943,7 +10611,7 @@ final class LagunaRuntimeModelInner: Module {
             lagunaFusedFullQKNormYaRNEnabled,
             lagunaFusedSlidingQKNormRoPEEnabled,
             inputs.dtype == .int32,
-            inputs.shape == [1, 1],
+            inputs.dims(1, 1),
             _fullRoPEAngleAtlas != nil,
             _slidingRoPEAngleAtlas != nil,
             let cache,
@@ -11072,20 +10740,7 @@ final class LagunaRuntimeModelInner: Module {
         let slidingMask = createAttentionMask(
             h: h, cache: cache?[slidingAttentionIdx], windowSize: slidingWindow)
 
-        let isSingleTokenDecode = inputs.shape == [1, 1]
-        let decodeFireMask: UInt64 =
-            switch lagunaDecodeAsyncStage {
-            case .off, .norm, .logits:
-                0
-            case .layer(let idx):
-                UInt64(1) << UInt64(idx)
-            case .ladder(let n):
-                (0..<UInt64(layers.count)).reduce(UInt64(0)) { acc, i in
-                    (Int(i) + 1) % n == 0 ? acc | (UInt64(1) << i) : acc
-                }
-            case .explicit(let mask):
-                mask
-            }
+        let isSingleTokenDecode = inputs.dims(1, 1)
 
         // One cos/sin table per attention family per decode step, shared by
         // every layer of that family (their caches advance in lockstep). Each
@@ -11183,32 +10838,20 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        // The trusted per-phase reset pins Memory.cacheLimit to 6 GiB at the
-        // START of each charged phase only; the freeze policy states in so
-        // many words that "editable code may change Memory.cacheLimit again
-        // inside the charged window". With every phase-start cache empty the
-        // limit governs how many freed transients the allocator may retain
-        // for reuse during the phase; 6 GiB is ~20x below MLX's own default
-        // for a 128 GiB machine. `DARKBLOOM_PHASE_CACHE_LIMIT_GB` raises it
-        // (default off; the set is a mutex-guarded scalar store, charged like
-        // all other work).
-        if lagunaPhaseCacheLimitBytes > 0 {
-            Memory.cacheLimit = lagunaPhaseCacheLimitBytes
-        }
         let fullHidden = model(inputs, cache: cache)
         // Every consumer of multi-token logits reads only the LAST
         // position's row. Slice before the row-independent final RMSNorm and
         // vocabulary head so prefill neither normalizes nor projects the
         // preceding rows. For single-token decode the slice is a no-op.
         let hidden = model.norm(lagunaLastTokenHidden(fullHidden))
-        if case .norm = lagunaDecodeAsyncStage, inputs.shape == [1, 1] {
+        if case .norm = lagunaDecodeAsyncStage, inputs.dims(1, 1) {
             asyncEval(hidden)
         }
 
         let result: MLXArray
         if let lmHead {
             if let pruner = lmHeadPruner,
-                inputs.shape == [1, 1] || lagunaLmHeadPrunePrefillEnabled
+                inputs.dims(1, 1) || lagunaLmHeadPrunePrefillEnabled
             {
                 // Certified two-pass final-row head (notes/68): full BF16
                 // logits, bit-identical to stock in every argmax-reachable
@@ -11221,7 +10864,7 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         } else {
             result = model.embedTokens.asLinear(hidden)
         }
-        if case .logits = lagunaDecodeAsyncStage, inputs.shape == [1, 1] {
+        if case .logits = lagunaDecodeAsyncStage, inputs.dims(1, 1) {
             asyncEval(result)
         }
         return result
