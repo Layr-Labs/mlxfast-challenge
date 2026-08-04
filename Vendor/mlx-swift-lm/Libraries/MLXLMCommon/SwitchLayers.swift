@@ -271,15 +271,20 @@ private let routeFusedScatterKernel: MLXFast.MLXFastKernel = {
             atomic_store_explicit(&tg_total[k], 0u, memory_order_relaxed);
             atomic_store_explicit(&tg_before[k], 0u, memory_order_relaxed);
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            // Split at the before-limit boundary so the tail segment
+            // carries no branch; identical counters, identical adds.
             uint before_limit = t * TILE;
-            for (uint idx = k; idx < n; idx += 256) {
+            uint idx = k;
+            for (; idx < before_limit; idx += 256) {
                 uint key = keys[idx];
                 atomic_fetch_add_explicit(
                     &tg_total[key], 1u, memory_order_relaxed);
-                if (idx < before_limit) {
-                    atomic_fetch_add_explicit(
-                        &tg_before[key], 1u, memory_order_relaxed);
-                }
+                atomic_fetch_add_explicit(
+                    &tg_before[key], 1u, memory_order_relaxed);
+            }
+            for (; idx < n; idx += 256) {
+                atomic_fetch_add_explicit(
+                    &tg_total[keys[idx]], 1u, memory_order_relaxed);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             uint total = atomic_load_explicit(&tg_total[k], memory_order_relaxed);
