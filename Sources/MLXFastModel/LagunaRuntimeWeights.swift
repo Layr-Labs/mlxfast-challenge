@@ -384,8 +384,13 @@ public final class LagunaRuntimeWeightCache {
                 setenv("MLX_BFS_MAX_WIDTH", "50", 0)
                 if env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" {
                     setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
-                    // 200 -> 400 ops: halve CB boundaries; see note.
-                    setenv("MLX_MAX_OPS_PER_BUFFER", "400", 0)
+                    // 400 -> 800 ops: halve CB boundaries again. Gated ABBA
+                    // receipt: prefill 196.0 vs 201.2 us/token (-2.6%, all
+                    // four runs ordered), decode -0.5% (mixed pairs).
+                    // overwrite=0 keeps any explicit MLX_MAX_OPS_PER_BUFFER
+                    // authoritative. Independently priced as OPS800 by
+                    // a-github-name's 2ab00e9.
+                    setenv("MLX_MAX_OPS_PER_BUFFER", "800", 0)
                 }
                 startupMemoryPolicy = nil
             }
@@ -496,8 +501,6 @@ public final class LagunaRuntimeWeightCache {
             lagunaFusedFullAttentionKernelWarmupEnabled
         {
             lagunaWarmFullFusedAttentionKernel()
-            lagunaWarmSlidingFusedAttentionKernel()
-            lagunaWarmDecodeQKVR1Kernels()
         }
         // Warm the greedy-token pipeline too. Every scored worker request ends
         // in `LagunaCorrectness.greedyToken` (reshape -> last row -> argMax),
