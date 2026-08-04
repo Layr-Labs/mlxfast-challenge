@@ -84,83 +84,32 @@ func lagunaTrace(_ site: @autoclosure () -> String) {
 
 // MARK: - Runtime fusion feature flags
 
-// Each fusion below concatenates the OUTPUT ROWS of same-dtype projections
-// that consume the same input. Per-row gemv/qmv/gather-qmv arithmetic is
-// independent of which rows share a dispatch (every output row keeps its own
-// K-loop and scale application in the original order), so the fused dispatch
-// is bit-exact against the separate dispatches it replaces. The per-head
-// g_proj (N=64) uses a different split-K gemv variant and is never fused.
-
-/// `DARKBLOOM_FUSED_QKV` (default OFF; set "1" to enable): after checkpoint
-/// load, retain one row-concatenated `[Wq; Wk; Wv]` BF16 weight per attention
-/// layer and serve Q/K/V from a single projection dispatch. Ablation on the
-/// paired local benchmark showed a mild prefill cost with no decode gain, so
-/// this ships opt-in.
+// Fusion switches retain their promoted OFF arms for ranked ablation.
 let lagunaFusedQKVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] == "1"
 
-/// `DARKBLOOM_FUSED_SHARED_GATE_UP` (default on; set "0" to disable): after
-/// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
-/// shared expert and serve single-token decode from one quantized matmul.
-/// Multi-token prefill remains on the stock separate banks so the ranked
-/// prefill path and its smaller gather/GEMM shapes are unchanged.
 let lagunaFusedSharedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_GATE_UP"] != "0"
 
-/// Decode-only shared-expert NVFP4 QMV + SwiGLU fusion. This consumes the
-/// retained row-concatenated `[gate; up]` bank and emits only the 512-wide
-/// BF16 activation, preserving the two independent QMV casts and every BF16
-/// boundary in the compiled SiLU product.
 let lagunaFusedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_SWIGLU_QMV"] != "0"
 
-/// Decode-only shared-expert down QMV plus both sparse-block residual adds.
-/// The kernel preserves the stock BF16 down-projection result, the inner
-/// `routed + shared` rounding, and the outer `h + r2` rounding while avoiding
-/// the intermediate shared/r2 materializations and the final elementwise
-/// dispatch.
 let lagunaFusedSharedDownResidualEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_DOWN_RESIDUAL"] != "0"
 
-/// Higher-fusion decode path: the eight routed down projections and the
-/// shared down projection share one 288-thread dispatch, which also performs
-/// the exact router reduction, routed scale, and both BF16 residual adds.
 let lagunaFusedRoutedSharedDownResidualEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_ROUTED_SHARED_DOWN_RESIDUAL"] != "0"
 
-/// Routed-expert counterpart to the shared QMV + SwiGLU fusion. Each decode
-/// request supplies exactly eight current-token expert indices; the kernel
-/// reads those banks directly and emits `[1, 1, 8, 1, 512]`.
 let lagunaFusedRoutedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_SWIGLU_QMV"] != "0"
 
-/// `DARKBLOOM_PACKED_SCALES` (default ON; set "0" to disable): decode-only
-/// scale-interleaved side copy of the fused routed gate/up NVFP4 bank. The
-/// stock `lagunaRoutedSwiGLUQMV` reads codes and E4M3 scales from two separate
-/// tensors (four device streams per simdgroup iteration: gate codes, up
-/// codes, gate scales, up scales). The packed side bank stores only the 32
-/// scale bytes for each row and K block, in the kernel's exact walk order
-/// `[expert][tile 128][k-block 4][row-pair sub 8]`; the resident fused code
-/// bank is reused directly. Load widths, dequant expressions, accumulation
-/// order, and every BF16 boundary are identical to the stock kernel — only
-/// scale address computation changes, so the packed dispatch is bit-exact
-/// (class A).
-/// Memory: +~32 MB resident per sparse layer while enabled (the stock fused
-/// code bank stays resident for prefill and fallback paths).
 let lagunaPackedScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] != "0"
 
-/// Publish exact corrected router ordinals from the existing fused producer
-/// so routed QMV consumers avoid repeating the nonlinear key construction.
-/// The OFF arm restores the promoted selector dependency exactly.
 private let lagunaRouterPrecomputedKeysEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_PRECOMPUTED_KEYS"] != "0"
 
-/// One-shot stderr visibility for the packed-scales arm: with the flag set,
-/// the arm MUST announce either "active" (bank built / packed dispatch taken)
-/// or "inactive" (a guard declined and the stock kernel ran instead), so a
-/// silently-declining guard can never measure its own control.
 final class LagunaPackedScalesLog: @unchecked Sendable {
     private var seen: Set<String> = []
     private let lock = NSLock()
@@ -178,74 +127,46 @@ final class LagunaPackedScalesLog: @unchecked Sendable {
 
 let lagunaPackedScalesLog = LagunaPackedScalesLog()
 
-/// Decode-only routed NVFP4 down-QMV plus BF16 router weighting, fixed-order
-/// expert reduction, and the Laguna 2.5 routed scale. The custom kernel emits
-/// one 2048-wide branch instead of materializing eight expert rows.
 let lagunaFusedRoutedDownReduceEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_DOWN_REDUCE"] != "0"
 
-/// `DARKBLOOM_FUSED_ROUTED_GATE_UP` (default on; set "0" to disable): after
-/// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
-/// sparse layer's routed experts and serve single-token decode's gate/up from
-/// one gather-QMM dispatch. DECODE-ONLY: the module tree, checkpoint keys,
-/// and every multi-token (prefill) forward stay fully stock -- ablation
-/// showed the fused bank helps decode (~+1.9%) but badly hurts the M=512
-/// sorted gather-GEMM prefill path, so prefill always dispatches the stock
-/// separate banks.
-///
-/// That prefill finding pre-dates RUNSKIP. See
-/// `DARKBLOOM_PREFILL_FUSED_GATE_UP` immediately below for the current,
-/// separately-flagged, post-RUNSKIP re-measurement of the same fusion idea
-/// applied to the sorted prefill path -- this flag and its history are left
-/// as-is (decode-only) rather than folded together, so each can be ablated
-/// independently.
 let lagunaFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_GATE_UP"] != "0"
 
-/// Multi-token sorted gather-GEMM counterpart to the decode gate/up fusion;
-/// independently ablatable and row-arithmetic-identical to separate banks.
 let lagunaPrefillFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_GATE_UP"] != "0"
 
-/// The expert-aligned gather-QMM consumes a 32-row gate/up-interleaved bank
-/// and writes the packed 512-wide SwiGLU result into the first half of its
-/// oversized MLX output allocation. The same environment switch controls the
-/// backend dispatch and this view interpretation, keeping its ablation path
-/// coherent.
 let lagunaExpertAlignedGatherEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_EXPERT_ALIGNED_GATHER"] != "0"
 
-/// Decode post-attention residual + RMSNorm fusion. The kernel emits
-/// both the rounded BF16 residual (needed by the following skip connection)
-/// and the normalized row (consumed immediately by the MLP), eliminating a
-/// separate residual-add materialization/read. Restricted to the single-row
-/// (`x.size == hiddenSize`) decode shape at its call site; see
-/// `lagunaPrefillFusedResidualRMSNormEnabled` immediately below for the
-/// multi-token counterpart, gated independently.
 let lagunaFusedResidualRMSNormEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_RESIDUAL_RMS"] != "0"
 
-/// Multi-token use of the row-general residual+RMSNorm kernel; its independent
-/// row dispatch preserves the stock add and normalization order per token.
 let lagunaPrefillFusedResidualRMSNormEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_RESIDUAL_RMS"] != "0"
 
-
-/// One output row per simdgroup for the default split routed gate/up decode
-/// QMV. Official submission `b56a6d9` passed all 1,344 exact-token checks:
-/// every row retains its K-block order and 32-lane reduction while the grid
-/// exposes twice as many independent simdgroups to cover memory latency.
-/// Set `DARKBLOOM_QMV_R1=0` to restore the two-row control.
 let lagunaSwiGLUQMVRows1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_QMV_R1"] != "0"
 
-/// Shared-expert twin of the accepted routed R1 schedule. The shared branch
-/// is dependency-independent from router top-8 and runs concurrently with it;
-/// one row per SIMD group exposes twice as many weight streams while keeping
-/// each row's four K-block accumulations and reduction tree unchanged.
 let lagunaSharedSwiGLUQMVRows1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_QMV_R1"] != "0"
+
+/// `DARKBLOOM_BFLOAT_SILU_TABLE` (default ON; set `0` to restore the promoted
+/// arithmetic kernels): exact finite-domain compilation of the BF16-rounded
+/// SiLU epilogue used by the routed and shared decode QMVs. The promoted
+/// kernels round `gate_result` to BF16 *before* SiLU, so the epilogue has only
+/// 65,536 possible inputs. During untimed preparation a tiny Metal kernel runs
+/// the promoted expression for every BF16 bit pattern on the current GPU and
+/// retains the resulting 128 KiB `[UInt16]` table. The LUT twins bitcast the
+/// rounded gate to its table index and bitcast the stored result back to BF16;
+/// the following `bfloat(silu * up)` remains textually unchanged.
+///
+/// This is not an approximation or a new numerical representation: the table
+/// is an input-independent cache of the device's own promoted BF16 operation.
+/// The OFF arm dispatches the existing kernels byte-for-byte unchanged.
+let lagunaBFloatSiLUTableEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_BFLOAT_SILU_TABLE"] != "0"
 
 /// Folds the per-head softplus gate into the output projection's GEMV (see
 /// `lagunaGatedOutputProjectionSource`), with one kernel variant per attention
@@ -6670,6 +6591,61 @@ let lagunaSharedSwiGLUQMVHeader: String = {
     """
 }()
 
+/// Builds the complete BF16 -> BF16 SiLU map with the exact expression used
+/// by the promoted decode kernels. The dummy scalar only gives MLX's custom
+/// kernel wrapper a stable input signature; the table is input-independent.
+private let lagunaBFloatSiLUTableKernel = MLXFast.metalKernel(
+    name: "laguna_bfloat_silu_table_u16_v1",
+    inputNames: ["dummy"],
+    outputNames: ["table"],
+    source: """
+        uint code = thread_position_in_grid.x;
+        bfloat gate = as_type<bfloat>(ushort(code));
+        bfloat exp_abs = metal::exp(metal::abs(gate));
+        bfloat denominator = bfloat(1) + exp_abs;
+        bfloat y = bfloat(1) / denominator;
+        bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+        bfloat silu = bfloat(gate * sigmoid);
+        table[code] = as_type<ushort>(silu);
+        """,
+    ensureRowContiguous: false
+)
+
+private enum LagunaBFloatSiLUTable {
+    // Immutable after construction and evaluated during single-threaded model
+    // preparation. `nonisolated(unsafe)` documents MLXArray's missing
+    // Sendable conformance without introducing actor hops on the hot path.
+    nonisolated(unsafe) static let values: MLXArray = lagunaBFloatSiLUTableKernel(
+        [MLXArray([Int32(0)])],
+        grid: (1 << 16, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1 << 16]],
+        outputDTypes: [.uint16]
+    )[0]
+}
+
+private func lagunaBFloatSiLUTSource(_ source: String) -> String {
+    let dead = [
+        "bfloat exp_abs = metal::exp(metal::abs(gate));",
+        "bfloat denominator = bfloat(1) + exp_abs;",
+        "bfloat y = bfloat(1) / denominator;",
+        "bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;",
+    ]
+    let needle = "bfloat silu = bfloat(gate * sigmoid);"
+    precondition(source.contains(needle))
+    return dead.reduce(source) { $0.replacingOccurrences(of: $1, with: "") }
+        .replacingOccurrences(
+            of: needle,
+            with: "bfloat silu = as_type<bfloat>(silu_table[as_type<ushort>(gate)]);"
+        )
+}
+
+#if DEBUG
+func lagunaBFloatSiLUTableForTesting() -> MLXArray {
+    LagunaBFloatSiLUTable.values
+}
+#endif
+
 private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
     name: "laguna_shared_nvfp4_swiglu_qmv_bf16_v1",
     inputNames: ["input", "fused_weight", "fused_scales"],
@@ -6752,11 +6728,7 @@ private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
 
 /// One-output-row scheduling twin of `lagunaSharedSwiGLUQMVKernel`.
 /// Arithmetic is textually identical per row; only row ownership changes.
-private let lagunaSharedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
-    name: "laguna_shared_nvfp4_swiglu_qmv_rows1_bf16_v1",
-    inputNames: ["input", "fused_weight", "fused_scales"],
-    outputNames: ["activated"],
-    source: """
+private let lagunaSharedSwiGLUQMVRows1Source = """
         constexpr uint input_width = 2048;
         constexpr uint output_width = 512;
         constexpr uint packed_row_bytes = 1024;
@@ -6818,7 +6790,22 @@ private let lagunaSharedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
             bfloat silu = bfloat(gate * sigmoid);
             activated[row] = bfloat(silu * up);
         }
-        """,
+        """
+
+private let lagunaSharedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
+    name: "laguna_shared_nvfp4_swiglu_qmv_rows1_bf16_v1",
+    inputNames: ["input", "fused_weight", "fused_scales"],
+    outputNames: ["activated"],
+    source: lagunaSharedSwiGLUQMVRows1Source,
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaSharedSwiGLUQMVRows1LUTKernel = MLXFast.metalKernel(
+    name: "laguna_shared_nvfp4_swiglu_qmv_rows1_silut_bf16_v1",
+    inputNames: ["input", "fused_weight", "fused_scales", "silu_table"],
+    outputNames: ["activated"],
+    source: lagunaBFloatSiLUTSource(lagunaSharedSwiGLUQMVRows1Source),
     header: lagunaSharedSwiGLUQMVHeader,
     ensureRowContiguous: true
 )
@@ -6842,6 +6829,18 @@ func lagunaSharedSwiGLUQMV(
             2 * LagunaConstants.sharedExpertIntermediateSize,
             LagunaConstants.hiddenSize / 16,
         ])
+
+    if lagunaBFloatSiLUTableEnabled, lagunaSharedSwiGLUQMVRows1Enabled {
+        let table = LagunaBFloatSiLUTable.values
+        precondition(table.dtype == .uint16 && table.shape == [1 << 16])
+        return lagunaSharedSwiGLUQMVRows1LUTKernel(
+            [input, fusedWeight, fusedScales, table],
+            grid: (256 * 64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[1, 1, LagunaConstants.sharedExpertIntermediateSize]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
 
     let kernel =
         lagunaSharedSwiGLUQMVRows1Enabled
@@ -7510,11 +7509,7 @@ private let lagunaRoutedSwiGLUQMVPackedTop8Kernel = MLXFast.metalKernel(
 let lagunaRoutedGateUpR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1"] != "0"
 
-private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v1",
-    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
-    outputNames: ["activated"],
-    source: """
+private let lagunaRoutedSwiGLUQMVPackedTop8R1Source = """
         constexpr uint input_width = 2048;
         constexpr uint output_width = 512;
         constexpr uint block_width = 512;
@@ -7623,7 +7618,25 @@ private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
             activated[expert_slot * output_width + logical_row] =
                 bfloat(silu * up);
         }
-        """,
+        """
+
+private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v1",
+    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVPackedTop8R1Source,
+    header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
+        + "\n" + lagunaRouterTop8PrologueHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaRoutedSwiGLUQMVPackedTop8R1LUTKernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_silut_bf16_v1",
+    inputNames: [
+        "input", "fused_weight", "packed_scales", "router_keys", "silu_table",
+    ],
+    outputNames: ["activated"],
+    source: lagunaBFloatSiLUTSource(lagunaRoutedSwiGLUQMVPackedTop8R1Source),
     header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
         + "\n" + lagunaRouterTop8PrologueHeader,
     ensureRowContiguous: true
@@ -7642,6 +7655,20 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
     precondition(routerKeys.dtype == .uint32)
     precondition(routerKeys.size == LagunaConstants.numExperts)
 
+    if lagunaBFloatSiLUTableEnabled, lagunaRoutedGateUpR1Enabled {
+        let table = LagunaBFloatSiLUTable.values
+        precondition(table.dtype == .uint16 && table.shape == [1 << 16])
+        return lagunaRoutedSwiGLUQMVPackedTop8R1LUTKernel(
+            [input, fusedWeight, packedScales, routerKeys, table],
+            grid: (LagunaConstants.numExpertsPerTok * 256 * 64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[
+                1, 1, LagunaConstants.numExpertsPerTok, 1,
+                LagunaConstants.moeIntermediateSize,
+            ]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
     if lagunaRoutedGateUpR1Enabled {
         return lagunaRoutedSwiGLUQMVPackedTop8R1Kernel(
             [input, fusedWeight, packedScales, routerKeys],
@@ -11255,6 +11282,9 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     /// derived side copy.
     func prepareFusedRuntimeWeights() {
         var fusedArrays = model.prepareRoPEAngleAtlases()
+        if lagunaBFloatSiLUTableEnabled {
+            fusedArrays.append(LagunaBFloatSiLUTable.values)
+        }
         for layer in model.layers {
             if lagunaUseNativeAffineQKV(layer: layer.selfAttn.layerIdx) {
                 fusedArrays.append(

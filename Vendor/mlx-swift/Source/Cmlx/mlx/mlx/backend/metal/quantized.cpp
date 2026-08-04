@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
@@ -1584,6 +1585,36 @@ bool darkbloom_swiglu_reglocal() {
   return v;
 }
 
+// Exact finite-domain compilation of the BF16-rounded expert SwiGLU
+// epilogue. The table is generated once by Metal from the promoted expression
+// and then read by the existing expert kernel; "0" restores that expression.
+bool darkbloom_prefill_bfloat_silu_table() {
+  static const bool v =
+      env::get_var("DARKBLOOM_PREFILL_BFLOAT_SILU_TABLE", "") != "0";
+  return v;
+}
+
+MTL::ComputePipelineState* get_bfloat_silu_table_kernel(metal::Device& d);
+
+array& darkbloom_bfloat_silu_table(
+    metal::Device& d,
+    const Stream& s) {
+  static std::mutex mutex;
+  static std::optional<array> table;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (!table) {
+    table.emplace(
+        allocator::malloc((1 << 16) * sizeof(uint16_t)),
+        Shape{1 << 16},
+        uint16);
+    auto& encoder = metal::get_command_encoder(s);
+    encoder.set_compute_pipeline_state(get_bfloat_silu_table_kernel(d));
+    encoder.set_output_array(*table, 0);
+    encoder.dispatch_threads(MTL::Size(1 << 16, 1, 1), MTL::Size(256, 1, 1));
+  }
+  return *table;
+}
+
 bool darkbloom_bsearch_hoist() {
   static const bool v =
       env::get_var("DARKBLOOM_BSEARCH_HOIST", "") != "0";
@@ -1931,6 +1962,9 @@ void gather_qmm_rhs_nax(
     compute_encoder.set_input_array(biases, c++);
   }
   compute_encoder.set_input_array(indices, c++);
+  if (expert_aligned && darkbloom_prefill_bfloat_silu_table()) {
+    compute_encoder.set_input_array(darkbloom_bfloat_silu_table(d, s), c++);
+  }
   compute_encoder.set_output_array(out, c++);
   compute_encoder.set_bytes(M, c++);
   compute_encoder.set_bytes(N, c++);

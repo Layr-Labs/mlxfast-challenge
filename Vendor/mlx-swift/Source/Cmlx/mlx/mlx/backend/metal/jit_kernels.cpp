@@ -1123,6 +1123,8 @@ int darkbloom_gather_xmajor_ct();
 // process.
 bool darkbloom_swiglu_reglocal();
 
+bool darkbloom_prefill_bfloat_silu_table();
+
 bool darkbloom_bsearch_hoist();
 
 namespace {
@@ -1207,6 +1209,21 @@ const char* darkbloom_swiglu_reglocal_define() {
   return define;
 }
 
+const char* darkbloom_prefill_bfloat_silu_table_define() {
+  static const char* define = [] {
+    const bool v = darkbloom_prefill_bfloat_silu_table();
+    if (!v || env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1") {
+      fprintf(
+          stderr,
+          "mlxfast: fusion %s: prefill_bfloat_silu_table "
+          "(expert gather-QMM JIT source)\n",
+          v ? "active" : "inactive");
+    }
+    return v ? "\n#define DARKBLOOM_PREFILL_BFLOAT_SILU_TABLE 1\n" : "";
+  }();
+  return define;
+}
+
 const char* darkbloom_bsearch_hoist_define() {
   static const char* define = [] {
     const bool v = darkbloom_bsearch_hoist();
@@ -1245,6 +1262,9 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
             ? darkbloom_swiglu_reglocal_define()
             : "",
         (kernel_name.find("_expert_") != std::string::npos)
+            ? darkbloom_prefill_bfloat_silu_table_define()
+            : "",
+        (kernel_name.find("_expert_") != std::string::npos)
             ? darkbloom_bsearch_hoist_define()
             : "",
         metal::gemm_nax(),
@@ -1254,6 +1274,28 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
     return kernel_source;
   });
   return d.get_kernel(kernel_name, lib);
+}
+
+MTL::ComputePipelineState* get_bfloat_silu_table_kernel(metal::Device& d) {
+  constexpr const char* name = "darkbloom_bfloat_silu_table_u16_v1";
+  auto lib = d.get_library(name, [&]() {
+    std::string source = metal::utils();
+    source += R"metal(
+      [[kernel]] void darkbloom_bfloat_silu_table_u16_v1(
+          device ushort* table [[buffer(0)]],
+          uint code [[thread_position_in_grid]]) {
+        bfloat gate = as_type<bfloat>(ushort(code));
+        bfloat exp_abs = metal::exp(metal::abs(gate));
+        bfloat denominator = bfloat(1) + exp_abs;
+        bfloat y = bfloat(1) / denominator;
+        bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+        bfloat silu = bfloat(gate * sigmoid);
+        table[code] = as_type<ushort>(silu);
+      }
+    )metal";
+    return source;
+  });
+  return d.get_kernel(name, lib);
 }
 
 MTL::ComputePipelineState* get_gather_qmm_nax_kernel(

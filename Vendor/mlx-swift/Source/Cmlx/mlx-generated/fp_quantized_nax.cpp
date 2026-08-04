@@ -1687,6 +1687,22 @@ METAL_FUNC int laguna_sorted_lower_bound(
   return lo;
 }
 
+METAL_FUNC bfloat darkbloom_prefill_bfloat_silu(
+#ifdef DARKBLOOM_PREFILL_BFLOAT_SILU_TABLE
+    const device ushort* silu_table,
+#endif
+    bfloat gate) {
+#ifdef DARKBLOOM_PREFILL_BFLOAT_SILU_TABLE
+  return as_type<bfloat>(silu_table[as_type<ushort>(gate)]);
+#else
+  const bfloat exp_abs = metal::exp(metal::abs(gate));
+  const bfloat denominator = bfloat(1) + exp_abs;
+  const bfloat z = bfloat(1) / denominator;
+  const bfloat sigmoid = gate < bfloat(0) ? z : bfloat(1) - z;
+  return bfloat(gate * sigmoid);
+#endif
+}
+
 // Laguna prefill sorts the M routed rows by expert before this QMM. The stock
 // kernel assigns fixed 64-row tiles, then walks every expert run intersecting
 // a tile; a run crossing a tile boundary stages the same expert weight tile
@@ -1718,6 +1734,9 @@ template <
     const device uint32_t* w,
     const device uint8_t* scales,
     const device uint32_t* indices,
+#ifdef DARKBLOOM_PREFILL_BFLOAT_SILU_TABLE
+    const device ushort* silu_table,
+#endif
     device T* y,
     const constant int& M,
     const constant int& N,
@@ -1790,17 +1809,8 @@ template <
   const short tn = SN * (simd_group_id % WN);
 
 #ifdef DARKBLOOM_SWIGLU_REGLOCAL
-  // DARKBLOOM_SWIGLU_REGLOCAL: compute the fused swiglu epilogue straight
-  // from the MMA Dtile fragments instead of round-tripping them through
-  // gate_up_stage. Only legal when one simdgroup owns the FULL BN-wide
-  // column band of its rows (WN == 1 -> SN == BN, tn == 0) at the shipped
-  // variant-5 geometry (BN = 64, SM = BM / WM = 16 -> TM = 1, TN = 4):
-  // then the gate column c and the up column c + 32 of the same output row
-  // live in the SAME LANE at the same element slot of Dtile fragments j
-  // and j + 2 (BaseNAXFrag layout: col = 16 * j + fn + jj, row = fm + 8 *
-  // i), so silu can be computed register-locally with zero cross-lane
-  // traffic. Every other geometry keeps the stock threadgroup-staged
-  // epilogue below unchanged.
+  // Register-local epilogue is legal only when one simdgroup owns the full
+  // BN=64 band at SM=16; gate/up then occupy matching lane/fragment slots.
   constexpr bool kSwigluRegLocal =
       (WN == 1) && (BN == 64) && ((BM / WM) == 16);
 #endif // DARKBLOOM_SWIGLU_REGLOCAL
@@ -1961,12 +1971,11 @@ template <
                       Dtile.frag_at(0, jf)[ie * 4 + jj]);
                   const bfloat up = static_cast<bfloat>(
                       Dtile.frag_at(0, jf + 2)[ie * 4 + jj]);
-                  const bfloat exp_abs = metal::exp(metal::abs(gate));
-                  const bfloat denominator = bfloat(1) + exp_abs;
-                  const bfloat z = bfloat(1) / denominator;
-                  const bfloat sigmoid =
-                      gate < bfloat(0) ? z : bfloat(1) - z;
-                  const bfloat silu = bfloat(gate * sigmoid);
+                  const bfloat silu = darkbloom_prefill_bfloat_silu(
+#ifdef DARKBLOOM_PREFILL_BFLOAT_SILU_TABLE
+                      silu_table,
+#endif
+                      gate);
                   y[size_t(chunk_start + tm + row) * (kernel_N / 2) +
                     size_t(tid.x) * activated_cols + col] =
                       bfloat(silu * up);
@@ -1993,12 +2002,11 @@ template <
                 gate_up_stage[(tm + row) * BN + col];
             const bfloat up =
                 gate_up_stage[(tm + row) * BN + activated_cols + col];
-            const bfloat exp_abs = metal::exp(metal::abs(gate));
-            const bfloat denominator = bfloat(1) + exp_abs;
-            const bfloat z = bfloat(1) / denominator;
-            const bfloat sigmoid =
-                gate < bfloat(0) ? z : bfloat(1) - z;
-            const bfloat silu = bfloat(gate * sigmoid);
+            const bfloat silu = darkbloom_prefill_bfloat_silu(
+#ifdef DARKBLOOM_PREFILL_BFLOAT_SILU_TABLE
+                silu_table,
+#endif
+                gate);
             y[size_t(chunk_start + tm + row) * (kernel_N / 2) +
               size_t(tid.x) * activated_cols + col] =
                 bfloat(silu * up);
