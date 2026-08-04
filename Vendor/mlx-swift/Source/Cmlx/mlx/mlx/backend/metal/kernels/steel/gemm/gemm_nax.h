@@ -49,7 +49,7 @@ auto gemm_loop(
 
   STEEL_PRAGMA_NO_UNROLL
   for (int kk0 = 0; kk0 < gemm_k_iterations_; kk0++) {
-    threadgroup_barrier(mem_flags::mem_none);
+    simdgroup_barrier(mem_flags::mem_none);
 
     STEEL_PRAGMA_NO_UNROLL
     for (int kk1 = 0; kk1 < BK; kk1 += SK) {
