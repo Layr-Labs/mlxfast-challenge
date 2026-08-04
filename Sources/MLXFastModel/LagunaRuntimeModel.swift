@@ -1332,6 +1332,66 @@ func lagunaSlidingQKNormRoPE(
 let lagunaFusedSlidingAttentionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_ATTN"] != "0"
 
+/// Frontier two-plane combine epilogue, shared by both fused attention kernels
+/// (col-0 body -> verbatim after 8-space strip). Same operands, per-component
+/// reduction trees, divisions, zero guards, and store order as the scalar
+/// frontier form (`U pair_global_max0 = simd_max(pair_max0); ...` with per-plane
+/// `simd_sum`); only the SIMD reductions are issued packed as vector components
+/// (ILP), which is bit-exact -- validated max_abs_diff==0 across the paired
+/// correctness gate. Laguna head_dim 128 / BD 32 = 4 planes = 2 pairs, so
+/// pair_planes==2 and the two `vec<U, 4>` accumulators map
+/// x=head0/plane0*f0, y=head1/plane0*f1, z=head0/plane1*f0, w=head1/plane1*f1.
+private let lagunaFusedAttentionPackedEpilogue = """
+const vec<U, 2> packed_pair_max =
+    simd_max(vec<U, 2>(pair_max0, pair_max1));
+U pair_global_max0 = packed_pair_max.x;
+U pair_global_max1 = packed_pair_max.y;
+U pair_global_factor0 = metal::fast::exp(pair_max0 - pair_global_max0);
+U pair_global_factor1 = metal::fast::exp(pair_max1 - pair_global_max1);
+const vec<U, 2> packed_pair_sum = simd_sum(vec<U, 2>(
+    sum_exp_scores[lane] * pair_global_factor0,
+    sum_exp_scores[BN + lane] * pair_global_factor1));
+pair_sum0 = packed_pair_sum.x;
+pair_sum1 = packed_pair_sum.y;
+
+const vec<U, 4> packed_pair_acc_lo = simd_sum(vec<U, 4>(
+    outputs[0 * pair_plane_size + sg * BD + lane] * pair_global_factor0,
+    outputs[2 * pair_plane_size + sg * BD + lane] * pair_global_factor1,
+    outputs[1 * pair_plane_size + sg * BD + lane] * pair_global_factor0,
+    outputs[3 * pair_plane_size + sg * BD + lane] * pair_global_factor1));
+U acc00 = packed_pair_acc_lo.x;
+U acc10 = packed_pair_acc_lo.y;
+U acc01 = packed_pair_acc_lo.z;
+U acc11 = packed_pair_acc_lo.w;
+pair_o0[0] = pair_sum0 == 0 ? acc00 : (acc00 / pair_sum0);
+pair_o1[0] = pair_sum1 == 0 ? acc10 : (acc10 / pair_sum1);
+pair_o0[1] = pair_sum0 == 0 ? acc01 : (acc01 / pair_sum0);
+pair_o1[1] = pair_sum1 == 0 ? acc11 : (acc11 / pair_sum1);
+
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for (int p = 0; p < pair_planes; ++p) {
+    outputs[p * pair_plane_size + lane * BD + sg] =
+        pair_o0[pair_planes + p];
+    outputs[
+        (pair_planes + p) * pair_plane_size + lane * BD + sg] =
+        pair_o1[pair_planes + p];
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+const vec<U, 4> packed_pair_acc_hi = simd_sum(vec<U, 4>(
+    outputs[0 * pair_plane_size + sg * BD + lane] * pair_global_factor0,
+    outputs[2 * pair_plane_size + sg * BD + lane] * pair_global_factor1,
+    outputs[1 * pair_plane_size + sg * BD + lane] * pair_global_factor0,
+    outputs[3 * pair_plane_size + sg * BD + lane] * pair_global_factor1));
+acc00 = packed_pair_acc_hi.x;
+acc10 = packed_pair_acc_hi.y;
+acc01 = packed_pair_acc_hi.z;
+acc11 = packed_pair_acc_hi.w;
+pair_o0[2] = pair_sum0 == 0 ? acc00 : (acc00 / pair_sum0);
+pair_o1[2] = pair_sum1 == 0 ? acc10 : (acc10 / pair_sum1);
+pair_o0[3] = pair_sum0 == 0 ? acc01 : (acc01 / pair_sum0);
+pair_o1[3] = pair_sum1 == 0 ? acc11 : (acc11 / pair_sum1);
+"""
+
 private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
     name: "laguna_sliding_fused_attn_ring_v1",
     inputNames: [
@@ -1588,47 +1648,7 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
 
         pair_max0 = max_scores[lane];
         pair_max1 = max_scores[BN + lane];
-        U pair_global_max0 = simd_max(pair_max0);
-        U pair_global_max1 = simd_max(pair_max1);
-        U pair_global_factor0 = metal::fast::exp(pair_max0 - pair_global_max0);
-        U pair_global_factor1 = metal::fast::exp(pair_max1 - pair_global_max1);
-        pair_sum0 = simd_sum(sum_exp_scores[lane] * pair_global_factor0);
-        pair_sum1 = simd_sum(sum_exp_scores[BN + lane] * pair_global_factor1);
-
-        for (int p = 0; p < pair_planes; ++p) {
-            U acc0 = simd_sum(
-                outputs[p * pair_plane_size + sg * BD + lane] *
-                pair_global_factor0);
-            U acc1 = simd_sum(
-                outputs[
-                    (pair_planes + p) * pair_plane_size + sg * BD + lane] *
-                pair_global_factor1);
-            pair_o0[p] = pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
-            pair_o1[p] = pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int p = 0; p < pair_planes; ++p) {
-            outputs[p * pair_plane_size + lane * BD + sg] =
-                pair_o0[pair_planes + p];
-            outputs[
-                (pair_planes + p) * pair_plane_size + lane * BD + sg] =
-                pair_o1[pair_planes + p];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int p = 0; p < pair_planes; ++p) {
-            U acc0 = simd_sum(
-                outputs[p * pair_plane_size + sg * BD + lane] *
-                pair_global_factor0);
-            U acc1 = simd_sum(
-                outputs[
-                    (pair_planes + p) * pair_plane_size + sg * BD + lane] *
-                pair_global_factor1);
-            pair_o0[pair_planes + p] =
-                pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
-            pair_o1[pair_planes + p] =
-                pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
-        }
+        \(lagunaFusedAttentionPackedEpilogue)
 
         if (lane == 0) {
             device bfloat* pair_out0 =
@@ -2104,47 +2124,7 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
 
         pair_max0 = max_scores[lane];
         pair_max1 = max_scores[BN + lane];
-        U pair_global_max0 = simd_max(pair_max0);
-        U pair_global_max1 = simd_max(pair_max1);
-        U pair_global_factor0 = metal::fast::exp(pair_max0 - pair_global_max0);
-        U pair_global_factor1 = metal::fast::exp(pair_max1 - pair_global_max1);
-        pair_sum0 = simd_sum(sum_exp_scores[lane] * pair_global_factor0);
-        pair_sum1 = simd_sum(sum_exp_scores[BN + lane] * pair_global_factor1);
-
-        for (int p = 0; p < pair_planes; ++p) {
-            U acc0 = simd_sum(
-                outputs[p * pair_plane_size + sg * BD + lane] *
-                pair_global_factor0);
-            U acc1 = simd_sum(
-                outputs[
-                    (pair_planes + p) * pair_plane_size + sg * BD + lane] *
-                pair_global_factor1);
-            pair_o0[p] = pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
-            pair_o1[p] = pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int p = 0; p < pair_planes; ++p) {
-            outputs[p * pair_plane_size + lane * BD + sg] =
-                pair_o0[pair_planes + p];
-            outputs[
-                (pair_planes + p) * pair_plane_size + lane * BD + sg] =
-                pair_o1[pair_planes + p];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int p = 0; p < pair_planes; ++p) {
-            U acc0 = simd_sum(
-                outputs[p * pair_plane_size + sg * BD + lane] *
-                pair_global_factor0);
-            U acc1 = simd_sum(
-                outputs[
-                    (pair_planes + p) * pair_plane_size + sg * BD + lane] *
-                pair_global_factor1);
-            pair_o0[pair_planes + p] =
-                pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
-            pair_o1[pair_planes + p] =
-                pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
-        }
+        \(lagunaFusedAttentionPackedEpilogue)
 
         if (lane == 0) {
             device bfloat* pair_out0 =
