@@ -29,6 +29,46 @@ METAL_FUNC void gemm_loop_aligned(
   }
 }
 
+// DARKBLOOM_STAGE2_GATHER twin of gemm_loop_aligned. Identical barriers, MMA
+// order and next() sequence; the only difference is that loader_b's device
+// reads for tile k+1 are issued after the RAW barrier and before tile k's MMA,
+// so the MMA covers their latency instead of the threadgroup leaving them
+// exposed between the two barriers. A separate function rather than a flag on
+// gemm_loop_aligned because that one is shared with the affine quantized path,
+// whose loader has no prefetch()/commit().
+template <typename T, typename mma_t, typename loader_a_t, typename loader_b_t>
+METAL_FUNC void gemm_loop_aligned_stage2(
+    threadgroup T* As,
+    threadgroup T* Bs,
+    thread mma_t& mma_op,
+    thread loader_a_t& loader_a,
+    thread loader_b_t& loader_b,
+    const int k_iterations) {
+  typename loader_b_t::StageRegs rb;
+  loader_b.template prefetch<false>(rb);
+
+  for (int k = 0; k < k_iterations; k++) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    loader_a.load_unsafe();
+    loader_b.commit(rb);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Guarded: one tile past the last would read outside this weight bank.
+    if (k + 1 < k_iterations) {
+      loader_b.template prefetch<true>(rb);
+    }
+
+    // Multiply and accumulate threadgroup elements
+    mma_op.mma(As, Bs);
+
+    // Prepare for next iteration
+    loader_a.next();
+    loader_b.next();
+  }
+}
+
 template <
     bool rows_aligned,
     bool cols_aligned,

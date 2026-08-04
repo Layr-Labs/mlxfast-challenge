@@ -935,6 +935,12 @@ MTL::ComputePipelineState* get_quantized_kernel(
   return d.get_kernel(kernel_name, lib);
 }
 
+namespace {
+// Defined with the other DARKBLOOM source-level defines below; declared here
+// because the non-NAX gather-QMM builder is the earlier of its two callers.
+const char* darkbloom_stage2_gather_define();
+} // namespace
+
 MTL::ComputePipelineState* get_gather_qmm_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -958,6 +964,9 @@ MTL::ComputePipelineState* get_gather_qmm_kernel(
     bool is_affine = mode == "affine";
     concatenate(
         kernel_source,
+        // Only fp_quantized.h has the split-stage loader; the affine loader is
+        // untouched, so the define never reaches its source.
+        is_affine ? "" : darkbloom_stage2_gather_define(),
         is_affine ? metal::quantized() : metal::fp_quantized(),
         get_template_definition(
             lib_name,
@@ -1127,14 +1136,19 @@ bool darkbloom_bsearch_hoist();
 
 namespace {
 
-// DARKBLOOM_STAGE2_GATHER: double-buffered (stage-2) weight staging in the
-// expert-aligned prefill gather-QMM (fp_gather_qmm_rhs_expert_nax). Injected
+// DARKBLOOM_STAGE2_GATHER: two-stage (prefetch/commit) weight staging in the
+// expert-aligned prefill gather-QMM (fp_gather_qmm_rhs_expert_nax). The tile's
+// device read is issued one k-iteration early, into registers, so the MMA
+// covers its latency; the threadgroup store stays between the same two
+// barriers. No extra threadgroup memory, so no occupancy trade. Injected
 // as a source-level #define at JIT assembly time, exactly like the
 // DARKBLOOM_ATTN_* levers below: resolved once per process, never part of a
 // pipeline specialization key, so exactly one variant is ever compiled per
 // run and A/B arms are separate runs of the same binary with the env var
-// flipped. Default OFF: unset compiles byte-identical stock staging (the
-// guarded blocks preprocess away). Injection is gated on the expert kernel
+// flipped. Default ON, like the other shipped fusion levers, because the
+// ranked runner sets no DARKBLOOM_* variable; DARKBLOOM_STAGE2_GATHER=0
+// compiles byte-identical stock staging (the guarded blocks preprocess
+// away) and is the A/B control. Injection is gated on the expert kernel
 // name so every other fp_quantized_nax JIT source stays byte-identical in
 // both arms.
 //
@@ -1145,8 +1159,8 @@ namespace {
 // pipeline was built from the stage-2 source.
 const char* darkbloom_stage2_gather_define() {
   static const char* define = [] {
-    const bool v = env::get_var("DARKBLOOM_STAGE2_GATHER", "") == "1";
-    if (v || env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1") {
+    const bool v = env::get_var("DARKBLOOM_STAGE2_GATHER", "") != "0";
+    if (!v || env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1") {
       fprintf(
           stderr,
           "mlxfast: fusion %s: stage2_gather (expert gather-QMM JIT source)\n",

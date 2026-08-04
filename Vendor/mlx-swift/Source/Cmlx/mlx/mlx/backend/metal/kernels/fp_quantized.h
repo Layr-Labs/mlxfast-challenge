@@ -421,6 +421,92 @@ struct QuantizedBlockLoader {
     stage();
   }
 
+  // DARKBLOOM_STAGE2_GATHER. stage() is a fused load->decode->store sitting
+  // between the k-loop's two barriers, so its device-read latency has nothing
+  // to hide behind. prefetch()/commit() split it so the read for tile k+1 can
+  // be issued before the MMA of tile k (see gemm_loop_aligned_stage2 in
+  // quantized_utils.h). Only the read's position in the schedule changes: the
+  // same bytes from the same addresses, with the same scale, reach the same
+  // decode expression and the same dst addresses.
+  //
+  // stage() itself is deliberately left byte-for-byte untouched. This loader is
+  // shared with qmm_t/qmm_n/gather_qmm, and the decode below is duplicated
+  // rather than factored out of stage() so that no kernel other than the one
+  // opting into the split can see any codegen change at all.
+  MLX_MTL_CONST short kSrcBytes = n_reads * bytes_per_pack;
+  // packed_uchar4 has alignment 1, so reading the run as uint32s adds no
+  // address precondition the byte-at-a-time loop did not already satisfy.
+  MLX_MTL_CONST bool kChunk4 = (bytes_per_pack == 1) && ((kSrcBytes % 4) == 0);
+
+  struct StageRegs {
+    uint8_t sb[kSrcBytes];
+    uint8_t sc;
+    bool staged;
+  };
+
+  void read_into(thread StageRegs& r) const {
+    if constexpr (kChunk4) {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kSrcBytes / 4; i++) {
+        const uint32_t c = fp4nv_pack4(src + i * 4);
+        STEEL_PRAGMA_UNROLL
+        for (short b = 0; b < 4; b++) {
+          r.sb[i * 4 + b] = uint8_t((c >> (8 * b)) & 0xFFu);
+        }
+      }
+    } else {
+      STEEL_PRAGMA_UNROLL
+      for (short b = 0; b < kSrcBytes; b++) {
+        r.sb[b] = src[b];
+      }
+    }
+    r.sc = *scales;
+  }
+
+  // Issues this thread's device reads for the current tile, or (advance) the
+  // next one. Reached through a copy of the loader so the stride is next()'s
+  // own arithmetic rather than a second copy of it.
+  template <bool advance>
+  void prefetch(thread StageRegs& r) const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      r.staged = false;
+      return;
+    }
+    if constexpr (advance) {
+      QuantizedBlockLoader nxt = *this;
+      nxt.next();
+      nxt.read_into(r);
+    } else {
+      read_into(r);
+    }
+    r.staged = true;
+  }
+
+  // Decode and store the prefetched tile. Must sit exactly where
+  // load_unsafe() did, between the WAR and RAW barriers.
+  void commit(const thread StageRegs& r) const {
+    // Unstaged means bi >= BROWS, where load_unsafe() also stores nothing.
+    if (!r.staged) {
+      return;
+    }
+    if constexpr (fp4nv_fast) {
+      const float scale = fp4nv_scale_x16384(r.sc);
+      for (int i = 0; i < n_reads / 4; i++) {
+        T vals[8];
+        fp4nv_decode8<T>(fp4nv_pack4(r.sb + i * 4), scale, vals);
+        for (int j = 0; j < 8; j++) {
+          dst[i * 8 + j] = vals[j];
+        }
+      }
+    } else {
+      T scale = dequantize_scale<T, group_size>(r.sc);
+      for (int i = 0; i < n_reads; i++) {
+        dequantize<T, bits>(
+            r.sb[i * bytes_per_pack], scale, dst + i * pack_factor);
+      }
+    }
+  }
+
   void load_safe(short2 src_tile_dim) const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
       return;
@@ -2100,7 +2186,11 @@ template <
 
     // Matrices are all aligned check nothing
     if (align_M && align_N) {
+#ifdef DARKBLOOM_STAGE2_GATHER
+      gemm_loop_aligned_stage2(Xs, Ws, mma_op, loader_x, loader_w, K_it);
+#else
       gemm_loop_aligned(Xs, Ws, mma_op, loader_x, loader_w, K_it);
+#endif
       if (!align_K) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         gemm_loop_finalize(Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
@@ -2116,7 +2206,11 @@ template <
     } else {
       // Tile aligned so check outside of the hot loop
       if ((align_M || tgp_bm == BM) && (align_N || tgp_bn == BN)) {
+#ifdef DARKBLOOM_STAGE2_GATHER
+        gemm_loop_aligned_stage2(Xs, Ws, mma_op, loader_x, loader_w, K_it);
+#else
         gemm_loop_aligned(Xs, Ws, mma_op, loader_x, loader_w, K_it);
+#endif
         if (!align_K) {
           threadgroup_barrier(mem_flags::mem_threadgroup);
           gemm_loop_finalize(
