@@ -1222,6 +1222,14 @@ const char* darkbloom_bsearch_hoist_define() {
   return define;
 }
 
+const char* darkbloom_m8_coop_tail_define() {
+  static const char* define = [] {
+    const bool v = env::get_var("DARKBLOOM_M8_COOP_TAIL", "") != "0";
+    return v ? "\n#define DARKBLOOM_M8_COOP_TAIL 1\n" : "";
+  }();
+  return define;
+}
+
 } // namespace
 
 MTL::ComputePipelineState* get_qmm_nax_kernel(
@@ -1246,6 +1254,9 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
             : "",
         (kernel_name.find("_expert_") != std::string::npos)
             ? darkbloom_bsearch_hoist_define()
+            : "",
+        (kernel_name.find("_expert_") != std::string::npos)
+            ? darkbloom_m8_coop_tail_define()
             : "",
         metal::gemm_nax(),
         metal::quantized_utils(),
