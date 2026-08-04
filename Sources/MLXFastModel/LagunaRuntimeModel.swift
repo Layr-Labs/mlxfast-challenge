@@ -119,21 +119,13 @@ let lagunaFusedRoutedSharedDownResidualEnabled =
 let lagunaFusedRoutedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_SWIGLU_QMV"] != "0"
 
-/// `DARKBLOOM_PACKED_SCALES` (default ON; set "0" to disable): decode-only
-/// scale-interleaved side copy of the fused routed gate/up NVFP4 bank. The
-/// stock `lagunaRoutedSwiGLUQMV` reads codes and E4M3 scales from two separate
-/// tensors (four device streams per simdgroup iteration: gate codes, up
-/// codes, gate scales, up scales). The packed side bank stores only the 32
-/// scale bytes for each row and K block, in the kernel's exact walk order
-/// `[expert][tile 128][k-block 4][row-pair sub 8]`; the resident fused code
-/// bank is reused directly. Load widths, dequant expressions, accumulation
-/// order, and every BF16 boundary are identical to the stock kernel — only
-/// scale address computation changes, so the packed dispatch is bit-exact
-/// (class A).
-/// Memory: +~32 MB resident per sparse layer while enabled (the stock fused
-/// code bank stays resident for prefill and fallback paths).
+/// Decode-only walk-order copy of routed gate/up E4M3 scale bytes.
 let lagunaPackedScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] != "0"
+
+/// Lossless 6-bit decode bank; `0` restores the accepted uint8 side bank.
+let lagunaPackedScale6Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALE6"] != "0"
 
 /// Publish exact corrected router ordinals from the existing fused producer
 /// so routed QMV consumers avoid repeating the nonlinear key construction.
@@ -141,10 +133,6 @@ let lagunaPackedScalesEnabled =
 private let lagunaRouterPrecomputedKeysEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_PRECOMPUTED_KEYS"] != "0"
 
-/// One-shot stderr visibility for the packed-scales arm: with the flag set,
-/// the arm MUST announce either "active" (bank built / packed dispatch taken)
-/// or "inactive" (a guard declined and the stock kernel ran instead), so a
-/// silently-declining guard can never measure its own control.
 final class LagunaPackedScalesLog: @unchecked Sendable {
     private var seen: Set<String> = []
     private let lock = NSLock()
@@ -687,6 +675,35 @@ private let lagunaPrefillAsyncLadderStride: Int = {
     let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ASYNC_LADDER"]?.lowercased() ?? "1"
     if raw == "off" || raw == "0" || raw.isEmpty { return 0 }
     guard let n = Int(raw), (1...40).contains(n) else { return 0 }
+    return n
+}()
+
+/// Chunked long-context prefill (stock `LLMModel.prepare` semantics,
+/// Vendor/mlx-swift-lm/Libraries/MLXLLM/LLMModel.swift:21-36). The vendored
+/// reference feeds prompts in 512-token slices, evaluating the cache between
+/// slices; this runtime used to forward the whole prompt in one shot.
+/// Single-shot prefill defeats the sliding-window bound:
+/// `RotatingKVCache.updateConcat` only trims on its SECOND multi-token
+/// update, so one [1, L] forward keeps all L K/V rows on every sliding layer
+/// and forces a materialized LxL bool mask (`RotatingKVCache.makeMask`),
+/// which also disables the steel kernel's causal tile-skip. Beyond ~8k that
+/// turns 30 of 40 layers into dense masked LxL attention and prefill
+/// collapses quadratically (measured 2672 -> 381 tok/s at 8k -> 64k vs the
+/// chunked baseline's 3418 -> 2074). The slice loop below restores the
+/// bounded sliding cache, small per-chunk masks, and the tile-skip.
+/// Invisible to every gate: the ranked window and all public/hidden base
+/// prompts are 512 tokens (one slice either way), and chunked prefill IS
+/// the golden-generating reference behavior at longer prompts.
+/// Default ON; set `DARKBLOOM_PREFILL_CHUNK=0` for single-shot prefill.
+private let lagunaPrefillChunkEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_CHUNK"] != "0"
+
+/// Slice length for chunked prefill; 512 matches the stock
+/// `GenerateParameters.prefillStepSize` default exactly.
+private let lagunaPrefillChunkSize: Int = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_CHUNK_SIZE"],
+        let n = Int(raw), n >= 64
+    else { return 512 }
     return n
 }()
 
@@ -6982,16 +6999,7 @@ func lagunaRoutedSwiGLUQMV(
     )[0]
 }
 
-/// `DARKBLOOM_PACKED_SCALES` twin of `lagunaRoutedSwiGLUQMVKernel` consuming
-/// the walk-order scale side bank built by
-/// `preparePackedRoutedGateUpBank`. Bank layout, per expert:
-/// `[tile 128][k-block 4][sub 8][32 scale bytes]` where `sub =
-/// (simd_group*2 + row)*2 + {0 gate, 1 up}`. The stock kernel's
-/// `gate_row/up_row` remap is baked into the scale bank while its fused code
-/// bank is reused directly, so per (row, k-block, lane) this kernel issues
-/// the identical one-byte scale and uint2 code loads and runs the textually
-/// identical dequant/accumulate/SwiGLU chain — only scale address computation
-/// differs.
+/// Walk-order-scale twin of the routed SwiGLU QMV.
 private let lagunaRoutedSwiGLUQMVPackedKernel = MLXFast.metalKernel(
     name: "laguna_routed_nvfp4_swiglu_qmv_packed_bf16_v1",
     inputNames: ["input", "fused_weight", "packed_scales", "indices"],
@@ -7281,22 +7289,30 @@ private let lagunaRoutedSwiGLUQMVPackedTop8Kernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// `DARKBLOOM_ROUTED_GATEUP_R1` (default ON; set "0" to restore the accepted
-/// two-rows-per-simdgroup pipeline): one output row per simdgroup for the
-/// routed gate/up packed QMV, with twice the threadgroups — the promoted
-/// down-kernel R1 retile's ownership geometry (isolated receipt `8d35b19d`,
-/// composed in promoted `05e7894f`) applied to its gate/up sibling. Per
-/// output row the operation sequence is identical: same bank bytes via
-/// `bank_tile = logical_row / 4`, `sub = logical_row % 4`, same qdot and
-/// `simd_sum` order, same suffix/SwiGLU/BF16 boundaries, one writer per row.
+/// One output row per simdgroup for the routed gate/up packed QMV.
 let lagunaRoutedGateUpR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1"] != "0"
 
-private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v1",
-    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
-    outputNames: ["activated"],
-    source: """
+private func lagunaRoutedSwiGLUQMVPackedTop8R1Source(_ scale6: Bool) -> String {
+    let scaleBytes = scale6 ? 24 : 32
+    let scaleLoad = scale6
+        ? """
+            const device uint8_t* scale_pair = block_scales
+                + sub * 2 * scale_row_bytes + ((3 * lane) >> 1);
+            uint scale_pair_bits = uint(scale_pair[0])
+                | (uint(scale_pair[1]) << 8);
+            scale_pair_bits >>= (lane & 1) * 4;
+            uint gate_scale_bits = scale_pair_bits & 63;
+            uint up_scale_bits = (scale_pair_bits >> 6) & 63;
+        """
+        : """
+            const device uint8_t* gate_scale =
+                block_scales + sub * 2 * scale_row_bytes + lane;
+            const device uint8_t* up_scale = gate_scale + scale_row_bytes;
+            uint gate_scale_bits = gate_scale[0];
+            uint up_scale_bits = up_scale[0];
+        """
+    return """
         constexpr uint input_width = 2048;
         constexpr uint output_width = 512;
         constexpr uint block_width = 512;
@@ -7304,7 +7320,7 @@ private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
         constexpr uint routed_experts = 8;
         constexpr uint fused_row_bytes = 1024;
         constexpr uint fused_expert_bytes = 1024 * fused_row_bytes;
-        constexpr uint scale_row_bytes = 32;
+        constexpr uint scale_row_bytes = \(scaleBytes);
         constexpr uint scale_sub_bytes = 8 * scale_row_bytes;
         constexpr uint scale_kblock_bytes = scale_sub_bytes;
         constexpr uint scale_tile_bytes = 4 * scale_kblock_bytes;
@@ -7346,9 +7362,7 @@ private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
 
             const device uint8_t* block_scales =
                 row_scales + (block / block_width) * scale_kblock_bytes;
-            const device uint8_t* gate_scale =
-                block_scales + sub * 2 * scale_row_bytes + lane;
-            const device uint8_t* up_scale = gate_scale + scale_row_bytes;
+            \(scaleLoad)
             const device uint8_t* gate_weight =
                 expert_weight + gate_row * fused_row_bytes
                 + block / 2 + lane * 8;
@@ -7358,10 +7372,10 @@ private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
 
             gate_result += laguna_nvfp4_qdot_16(
                 gate_weight, input_values,
-                laguna_nvfp4_scale(gate_scale[0]));
+                laguna_nvfp4_scale(uint8_t(gate_scale_bits)));
             up_result += laguna_nvfp4_qdot_16(
                 up_weight, input_values,
-                laguna_nvfp4_scale(up_scale[0]));
+                laguna_nvfp4_scale(uint8_t(up_scale_bits)));
         }
 
         gate_result = simd_sum(gate_result);
@@ -7377,7 +7391,24 @@ private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
             activated[expert_slot * output_width + logical_row] =
                 bfloat(silu * up);
         }
-        """,
+        """
+}
+
+private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v1",
+    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVPackedTop8R1Source(false),
+    header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
+        + "\n" + lagunaRouterTop8PrologueHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaRoutedSwiGLUQMVPackedTop8R1Scale6Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_scale6_bf16_v1",
+    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVPackedTop8R1Source(true),
     header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
         + "\n" + lagunaRouterTop8PrologueHeader,
     ensureRowContiguous: true
@@ -7397,7 +7428,10 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
     precondition(routerKeys.size == LagunaConstants.numExperts)
 
     if lagunaRoutedGateUpR1Enabled {
-        return lagunaRoutedSwiGLUQMVPackedTop8R1Kernel(
+        let kernel = packedScales.dim(2) == 48
+            ? lagunaRoutedSwiGLUQMVPackedTop8R1Scale6Kernel
+            : lagunaRoutedSwiGLUQMVPackedTop8R1Kernel
+        return kernel(
             [input, fusedWeight, packedScales, routerKeys],
             grid: (LagunaConstants.numExpertsPerTok * 256 * 64, 1, 1),
             threadGroup: (64, 1, 1),
@@ -9661,25 +9695,16 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ModuleInfo(key: "shared_expert") var sharedExpert: LagunaRuntimeMLP
 
-    /// Retained fused NVFP4 `[gate32, up32]` routed-expert banks (per-expert
-    /// output rows interleaved in matched 32-row tiles), built once after
-    /// checkpoint load when `DARKBLOOM_FUSED_ROUTED_GATE_UP` is enabled, plus
-    /// a reference to the stock `switch_mlp.down_proj` module for the fused
-    /// decode path. Plain stored properties with a leading underscore so
-    /// Module reflection never treats the derived layout as checkpoint
-    /// parameters or a second child module; `switchMLP` keeps the original
-    /// separate banks for checkpoint parameter integrity.
+    /// Init-derived decode banks; the stock modules remain authoritative.
     var _fusedRoutedGateUpWeight: MLXArray?
     var _fusedRoutedGateUpScales: MLXArray?
     var _fusedRoutedGateUpSplit: Int = 0
     var _routedDownProj: SwitchLinear?
     var _routedDownWeight: MLXArray?
     var _routedDownScales: MLXArray?
-    /// `DARKBLOOM_PACKED_SCALES` walk-order scale-interleaved copy of the
-    /// fused routed gate/up scales ([experts, 4096, 32] uint8); see
-    /// `lagunaRoutedSwiGLUQMVPackedKernel` for the layout contract. Nil
-    /// when the flag is set to zero (default ON).
+    /// Walk-order uint8 bank and optional lossless u6 Top8-R1 bank.
     var _packedRoutedGateUpBank: MLXArray?
+    var _packedRoutedGateUpScale6Bank: MLXArray?
 
     /// Builds and retains the fused routed gate/up NVFP4 banks from the
     /// loaded stock `SwitchGLU` submodules (reached through the public
@@ -9773,15 +9798,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         return prepared
     }
 
-    /// Builds the `DARKBLOOM_PACKED_SCALES` side bank from the (lazy) fused
-    /// routed gate/up arrays: bytes are only reordered, never recomputed.
-    /// Per expert the packed layout is `[tile 128][k-block 4][sub 8][32 B]`
-    /// with `sub = (simd_group*2 + row)*2 + {0 gate, 1 up}`. The row remap
-    /// below (gateRow = (logical/32)*64 + logical%32, up = +32) is the stock
-    /// kernel's mapping over the 32-row gate/up-interleaved fused bank, baked
-    /// into scale storage order. The code bytes remain in the resident fused
-    /// weight bank, so this side copy is ~32 MB per sparse layer instead of
-    /// duplicating the ~256 MB code bank.
+    /// Builds the decode walk-order scale banks without changing scale codes.
     func preparePackedRoutedGateUpBank(
         fusedScales: MLXArray,
         experts: Int,
@@ -9812,15 +9829,36 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 }
             }
         }
-        // `take(axis: 1)` materializes with permuted strides (NOT
-        // row-contiguous), and the custom kernel's `ensureRowContiguous`
-        // would then re-copy the side bank on EVERY dispatch. Force the
-        // one-time row-contiguous materialization here, at init, so dispatches
-        // bind the bank buffer directly.
+        // Materialize once so decode binds a row-contiguous buffer directly.
         let packed = contiguous(take(rowBlocks, MLXArray(order), axis: 1))
         _packedRoutedGateUpBank = packed
         lagunaPackedScalesLog.note("active", "packed routed gate/up bank prepared")
-        return [packed]
+        guard lagunaPackedScale6Enabled, lagunaRoutedGateUpR1Enabled,
+            lagunaRouterPrecomputedKeysEnabled
+        else { return [packed] }
+        let maxCode = fusedScales.max().item(UInt8.self)
+        guard maxCode <= 63 else {
+            lagunaPackedScalesLog.note(
+                "inactive", "6-bit routed scale bank (code \(maxCode) > 63)")
+            return [packed]
+        }
+
+        // Pair gate/up bytes lane-wise, then pair adjacent 12-bit lane words.
+        let lanePairs = contiguous(
+            packed.reshaped([experts, rows * 2, 2, 32]).transposed(0, 1, 3, 2))
+        let raw16 = lanePairs.view(dtype: .uint16).reshaped([experts, rows * 2, 32])
+        let q12 = (raw16 & MLXArray(UInt16(0x003F)))
+            | ((raw16 >> 2) & MLXArray(UInt16(0x0FC0)))
+        let pairs = q12.view(dtype: .uint32)
+        let packed24 = (pairs & MLXArray(UInt32(0x0000_0FFF)))
+            | ((pairs >> 4) & MLXArray(UInt32(0x00FF_F000)))
+        let bytes = packed24.view(dtype: .uint8).reshaped(
+            [experts, rows * 2, 16, 4])
+        let scale6 = contiguous(
+            take(bytes, MLXArray([Int32(0), 1, 2]), axis: 3)
+        ).reshaped([experts, rows * 2, 48])
+        _packedRoutedGateUpScale6Bank = scale6
+        return [packed, scale6]
     }
 
     init(_ config: LagunaConfig) {
@@ -9906,7 +9944,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                         activated = lagunaRoutedSwiGLUQMVPackedTop8(
                             x,
                             fusedWeight: fusedWeight,
-                            packedScales: packedBank,
+                            packedScales: _packedRoutedGateUpScale6Bank ?? packedBank,
                             routerKeys: routerKeys
                         )
                     } else {
@@ -10824,6 +10862,28 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        // Chunked long-context prefill (see `lagunaPrefillChunkEnabled`):
+        // mirror the stock `LLMModel.prepare` slice loop for direct callers
+        // so a [1, L] prompt with L > 512 is fed in bounded slices with the
+        // cache evaluated (and the sliding caches trimmed) between slices.
+        // Single-token decode and ranked-window prefills (L <= 512) never
+        // enter this loop, so the scored path is bit-identical with or
+        // without the flag.
+        if lagunaPrefillChunkEnabled,
+            let cache,
+            inputs.ndim == 2,
+            inputs.dim(0) == 1,
+            inputs.dim(1) > lagunaPrefillChunkSize
+        {
+            var remaining = inputs
+            while remaining.dim(1) > lagunaPrefillChunkSize {
+                _ = callAsFunction(
+                    remaining[0..., ..<lagunaPrefillChunkSize], cache: cache)
+                eval(cache)
+                remaining = remaining[0..., lagunaPrefillChunkSize...]
+            }
+            return callAsFunction(remaining, cache: cache)
+        }
         let fullHidden = model(inputs, cache: cache)
         // Every consumer of multi-token logits reads only the LAST
         // position's row. Slice before the row-independent final RMSNorm and
@@ -10843,7 +10903,11 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                 // logits, bit-identical to stock in every argmax-reachable
                 // slot. When enabled, prefill has already sliced to the last
                 // hidden row; decode always retains this pruner.
-                result = pruner.logits(hidden: hidden, lmHeadWeight: lmHead.weight)
+                result = pruner.logits(
+                    hidden: hidden,
+                    lmHeadWeight: lmHead.weight,
+                    useFusedRefinement: inputs.shape == [1, 1]
+                )
             } else {
                 result = lmHead(hidden)
             }
