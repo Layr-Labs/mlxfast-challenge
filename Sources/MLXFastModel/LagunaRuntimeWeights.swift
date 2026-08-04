@@ -496,8 +496,6 @@ public final class LagunaRuntimeWeightCache {
             lagunaFusedFullAttentionKernelWarmupEnabled
         {
             lagunaWarmFullFusedAttentionKernel()
-            lagunaWarmSlidingFusedAttentionKernel()
-            lagunaWarmDecodeQKVR1Kernels()
         }
         // Warm the greedy-token pipeline too. Every scored worker request ends
         // in `LagunaCorrectness.greedyToken` (reshape -> last row -> argMax),
