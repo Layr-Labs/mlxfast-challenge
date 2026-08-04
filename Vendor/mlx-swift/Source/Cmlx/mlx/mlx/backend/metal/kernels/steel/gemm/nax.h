@@ -95,6 +95,108 @@ struct BaseNAXFrag {
     }
   }
 
+
+  // Contiguous vec4 `load` for 8B-aligned Int<1> call sites (certified per
+  // site): identical elements, identical slots, pure access-width change.
+  template <
+      typename T,
+      typename StrX,
+      typename OffX = Int<0>,
+      typename OffY = Int<0>>
+  METAL_FUNC static constexpr void load_contig(
+      thread dtype_frag_t<T>& dst,
+      const device T* src,
+      StrX str_x,
+      OffX off_x = {},
+      OffY off_y = {}) {
+    const short2 sc = get_coord();
+    src += sc.y * str_x + sc.x;
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      const auto r = off_x + i * kElemRowsJump;
+      const auto c = off_y;
+      static_assert(kElemCols == 4, "load_contig assumes 4-element runs");
+      const metal::vec<T, 4> v =
+          *reinterpret_cast<const device metal::vec<T, 4>*>(
+              &src[r * str_x + c]);
+      dst[i * kElemCols + 0] = v.x;
+      dst[i * kElemCols + 1] = v.y;
+      dst[i * kElemCols + 2] = v.z;
+      dst[i * kElemCols + 3] = v.w;
+    }
+  }
+
+  // Row-limited device vec4 twin (certified call sites only): identical
+  // row predicate and zero-fills as load_rows, vec4 on whole runs.
+  template <
+      typename T,
+      typename StrX,
+      typename LimX,
+      typename OffX = Int<0>,
+      typename OffY = Int<0>>
+  METAL_FUNC static constexpr void load_rows_contig(
+      thread dtype_frag_t<T>& dst,
+      const device T* src,
+      StrX str_x,
+      LimX lim_x,
+      OffX off_x = {},
+      OffY off_y = {}) {
+    const short2 sc = get_coord();
+    src += sc.y * str_x + sc.x;
+    auto lx = lim_x - sc.y;
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      const auto r = off_x + i * kElemRowsJump;
+      const auto c = off_y;
+      if (r < lx) {
+        const metal::vec<T, 4> v =
+            *reinterpret_cast<const device metal::vec<T, 4>*>(
+                &src[r * str_x + c]);
+        dst[i * kElemCols + 0] = v.x;
+        dst[i * kElemCols + 1] = v.y;
+        dst[i * kElemCols + 2] = v.z;
+        dst[i * kElemCols + 3] = v.w;
+      } else {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < kElemCols; j++) {
+          dst[i * kElemCols + j] = T(0);
+        }
+      }
+    }
+  }
+
+  // Threadgroup twin of load_contig; same certification contract.
+  template <
+      typename T,
+      typename StrX,
+      typename OffX = Int<0>,
+      typename OffY = Int<0>>
+  METAL_FUNC static constexpr void load_contig_tg(
+      thread dtype_frag_t<T>& dst,
+      const threadgroup T* src,
+      StrX str_x,
+      OffX off_x = {},
+      OffY off_y = {}) {
+    const short2 sc = get_coord();
+    src += sc.y * str_x + sc.x;
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      const auto r = off_x + i * kElemRowsJump;
+      const auto c = off_y;
+      static_assert(kElemCols == 4, "load_contig_tg assumes 4-element runs");
+      const metal::vec<T, 4> v =
+          *reinterpret_cast<const threadgroup metal::vec<T, 4>*>(
+              &src[r * str_x + c]);
+      dst[i * kElemCols + 0] = v.x;
+      dst[i * kElemCols + 1] = v.y;
+      dst[i * kElemCols + 2] = v.z;
+      dst[i * kElemCols + 3] = v.w;
+    }
+  }
+
   template <
       typename T,
       typename SrcPtrType,
@@ -706,6 +808,51 @@ struct NAXTile {
       });
     });
   }
+
+  template <typename U>
+  METAL_FUNC void
+  load_rows_contig(const device U* src, const int ld, const short n_rows) {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::load_rows_contig(
+            frag_at<idx_row.value, idx_col.value>(),
+            src,
+            ld,
+            n_rows,
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+
+  template <typename U, int str_x>
+  METAL_FUNC void load_contig_tg(const threadgroup U* src) {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::load_contig_tg(
+            frag_at<idx_row.value, idx_col.value>(),
+            src,
+            Int<str_x>{},
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+
+  template <typename U>
+  METAL_FUNC void load_contig(const device U* src, const int ld) {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::load_contig(
+            frag_at<idx_row.value, idx_col.value>(),
+            src,
+            ld,
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+
 
   template <typename U>
   METAL_FUNC void store(device U* dst, const int ld) const {
