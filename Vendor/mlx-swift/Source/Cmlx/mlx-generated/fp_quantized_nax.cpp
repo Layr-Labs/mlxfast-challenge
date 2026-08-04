@@ -919,7 +919,6 @@ METAL_FUNC void fp_qmm_n_impl(
       NAXTile<T, TM, TK> Atile;
       NAXTile<Wtype, TK, TN> Btile;
 
-      volatile int compiler_barrier;
 
       Atile.load(x + kk1, K);
       Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * ldb_tgp);
@@ -931,7 +930,6 @@ METAL_FUNC void fp_qmm_n_impl(
           Btile,
           metal::bool_constant<transpose_b>{});
 
-      (void)compiler_barrier;
     }
 
     x += BK;
