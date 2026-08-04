@@ -383,8 +383,15 @@ public final class LagunaRuntimeWeightCache {
                 // setenv overwrite=0 keeps any explicit MLX_BFS_MAX_WIDTH.
                 setenv("MLX_BFS_MAX_WIDTH", "50", 0)
                 if env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" {
+                    // 200 MB: the promoted 21f1d1a3 setting. A 400 probe
+                    // measured prefill-adverse on afef4cbb (197.7 vs 191);
+                    // with the 800-ops probe decode-adverse on 7eea7ed6, the
+                    // promoted 200/400 pair stands as a measured local
+                    // optimum -- CB-sizing probes are closed.
                     setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
-                    setenv("MLX_MAX_OPS_PER_BUFFER", "200", 0)
+                    // 400 ops: the promoted 21f1d1a3 setting; an 800 probe
+                    // measured decode-adverse on submission 7eea7ed6.
+                    setenv("MLX_MAX_OPS_PER_BUFFER", "400", 0)
                 }
                 startupMemoryPolicy = nil
             }
