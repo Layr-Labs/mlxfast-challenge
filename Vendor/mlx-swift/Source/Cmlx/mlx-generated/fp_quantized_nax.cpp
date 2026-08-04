@@ -152,6 +152,7 @@ struct fp8_e8m0 {
 // Copyright © 2025 Apple Inc.
 
 #include <metal_simdgroup>
+// crucible parity re-roll probe (no functional change; measured-best content)
 #include <metal_stdlib>
 
 

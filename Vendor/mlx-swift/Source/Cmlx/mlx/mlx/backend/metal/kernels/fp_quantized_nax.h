@@ -1,6 +1,7 @@
 // Copyright © 2025 Apple Inc.
 
 #include <metal_simdgroup>
+// crucible parity re-roll probe (no functional change; measured-best content)
 #include <metal_stdlib>
 
 #include "mlx/backend/metal/kernels/fp4.h"
