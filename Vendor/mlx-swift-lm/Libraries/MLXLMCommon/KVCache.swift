@@ -6,31 +6,13 @@ import MLXNN
 
 /// Implementation of KV cache functionality for MLX Swift
 ///
-///
 /// ## Quantized Cache Usage
 ///
-/// **Standard caches:**
-/// ```swift
-/// let cache = KVCacheSimple()
-/// let (keys, values) = cache.update(keys: keys, values: values)
-/// let output = MLXFast.scaledDotProductAttention(queries: q, keys: keys, values: values, ...)
-/// ```
+/// Standard: `KVCacheSimple().update(keys:values:)` then
+/// `MLXFast.scaledDotProductAttention`.
 ///
-/// **Quantized cache:**
-/// ```swift
-/// let quantizedCache = QuantizedKVCache(groupSize: 64, bits: 4)
-/// let (qKeys, qValues) = quantizedCache.updateQuantized(keys: keys, values: values)
-///
-/// let output = quantizedScaledDotProductAttention(
-///     queries: queries,
-///     quantizedKeys: qKeys,
-///     quantizedValues: qValues,
-///     scale: scale,
-///     mask: mask,
-///     groupSize: quantizedCache.groupSize,
-///     bits: quantizedCache.bits
-/// )
-/// ```
+/// Quantized: `QuantizedKVCache(groupSize: 64, bits: 4)` with
+/// `updateQuantized` + `quantizedScaledDotProductAttention`.
 ///
 /// Interface for Key/Value cache for LLMs.
 ///
@@ -60,8 +42,8 @@ public protocol KVCache: Evaluatable, Updatable {
 
     /// Create an attention mask for this cache
     ///
-    /// This method encapsulates cache-specific mask creation logic. Implementations should handle offset capping, window size logic,
-    /// and optimization decisions (symbolic vs array masks).
+    /// Cache-specific mask creation: offset capping, window logic, and
+    /// symbolic-vs-array decisions.
     ///
     /// - Parameters:
     ///   - n: The sequence length for the new tokens
@@ -78,19 +60,9 @@ public protocol KVCache: Evaluatable, Updatable {
 
 /// Protocol for caches that support efficient quantized operations
 ///
-/// **Usage Example:**
-/// ```swift
-/// // Efficient quantized path
-/// if let quantizedCache = cache as? QuantizedKVCacheProtocol {
-///     let (qKeys, qValues) = quantizedCache.updateQuantized(keys: k, values: v)
-///     // Use native quantized operations
-///     let scores = quantizedMM(queries, w: qKeys.0, scales: qKeys.1, biases: qKeys.2, ...)
-/// } else {
-///     // Regular path
-///     let (k, v) = cache.update(keys: k, values: v)
-///     let output = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, ...)
-/// }
-/// ```
+/// Quantized path: `updateQuantized(keys:values:)` then native
+/// `quantizedMM`; regular path: `update` then
+/// `MLXFast.scaledDotProductAttention`.
 public protocol QuantizedKVCacheProtocol: KVCache {
     /// The quantization group size used
     var groupSize: Int { get }
@@ -322,6 +294,12 @@ public func createSSMMask(h: MLXArray, cache: MambaCache?) -> MLXArray? {
     return nil
 }
 
+/// `DARKBLOOM_KV_PRE_GROW` (default ON): pre-grow the no-slack first
+/// allocation by one `step` so decode step 1 engages `fusedAppendPrepare`.
+/// Memory-layout only.
+let kvCachePreGrowEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_KV_PRE_GROW"] != "0"
+
 /// Standard KV cache implementation based on Python's KVCache
 /// See https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/base.py#L11
 public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
@@ -351,6 +329,31 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         if self.keys == nil, previous == 0, tokenCount > 0,
             tokenCount.isMultiple(of: step)
         {
+            if kvCachePreGrowEnabled {
+                // One extra `step` of headroom: the first single-token decode
+                // update then fits `fusedAppendPrepare`'s spare-capacity
+                // guard instead of the step-1 zero-alloc + concat growth.
+                // Slice-assign the prefill rows into the fresh backing;
+                // returned prefix slices carry identical bytes, shapes,
+                // offsets, and the next growth boundary; only zero trailing
+                // headroom (read by nothing) is new.
+                let capacity = tokenCount + step
+                let newK = MLXArray.zeros(
+                    [keys.dim(0), keys.dim(1), capacity, keys.dim(3)],
+                    dtype: keys.dtype)
+                let newV = MLXArray.zeros(
+                    [values.dim(0), values.dim(1), capacity, values.dim(3)],
+                    dtype: values.dtype)
+                newK[.ellipsis, ..<tokenCount, 0...] = keys
+                newV[.ellipsis, ..<tokenCount, 0...] = values
+                self.keys = newK
+                self.values = newV
+                self.offset = tokenCount
+                return (
+                    self.keys![.ellipsis, ..<self.offset, 0...],
+                    self.values![.ellipsis, ..<self.offset, 0...]
+                )
+            }
             self.keys = keys
             self.values = values
             self.offset = tokenCount
@@ -701,12 +704,10 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     private var fusedRingContiguized = false
 
     /// Steady-ring state for the fused decode attention kernel, or nil
-    /// when the ring is not yet at capacity (shorter prompts, growth
-    /// phase) or a `keep` prefix is configured. `writeIdx` is the slot the
-    /// next single-token update would overwrite (after the wrap check).
-    /// On first use this rebinds the backing arrays to `contiguous(...)`
-    /// copies — identical bytes, contiguous layout — so the fused kernel's
-    /// in-place slot writes persist across steps.
+    /// when the ring is not yet at capacity or a `keep` prefix is
+    /// configured. `writeIdx` is the slot the next update overwrites.
+    /// Rebinds the backing to contiguous copies so in-place slot writes
+    /// persist across steps.
     public func fusedRingPrepare() -> (keys: MLXArray, values: MLXArray, writeIdx: Int)? {
         guard keep == 0, let currentKeys = keys, let currentValues = values,
             currentKeys.dim(2) == maxCacheSize,
@@ -2130,12 +2131,9 @@ public func quantizedScaledDotProductAttention(
 
 // MARK: - Dynamic Cache Quantization
 
-/// Dynamically quantize KV caches during generation if conditions are met
-///
-/// Converts regular caches to quantized caches when:
-/// - kvBits is specified
-/// - The cache is not already quantized
-/// - The cache offset is greater than quantizedKVStart
+/// Dynamically quantize KV caches during generation when kvBits is set,
+/// the cache is not already quantized, and offset exceeds
+/// quantizedKVStart.
 ///
 /// - Parameters:
 ///   - cache: Array of KV caches to potentially quantize
