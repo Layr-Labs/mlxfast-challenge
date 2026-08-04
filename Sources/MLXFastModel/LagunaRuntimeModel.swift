@@ -4816,6 +4816,9 @@ private func lagunaDecodeNVFP4QKVR1(
 private let lagunaWarmQKVR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_WARM_QKV_R1"] == "1"
 
+// Declared re-roll marker (defense ticket 2): the promoted payload
+// 46eeccf0 carries this warmup unchanged; this comment is the
+// archive-distinguishing delta and nothing else.
 func lagunaWarmDecodeQKVR1Kernels() {
     guard lagunaWarmQKVR1Enabled else { return }
     let hidden = LagunaConstants.hiddenSize
