@@ -1,3 +1,6 @@
+// Declared re-roll marker (defense ticket 7): the promoted payload
+// 46eeccf0 carries this file unchanged; this comment is the
+// archive-distinguishing delta and nothing else.
 import Foundation
 import MLX
 import MLXFastCore
