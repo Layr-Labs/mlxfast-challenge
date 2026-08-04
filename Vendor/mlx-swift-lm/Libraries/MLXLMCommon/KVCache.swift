@@ -799,6 +799,10 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        // Contract: at the scored 512-token window with a 512 sliding
+        // window, cappedOffset + n == windowSize, so the symbolic .causal
+        // mode below is what both the chunked and single-shot prefill
+        // paths take; no array mask is materialized on the scored path.
         if n > 1 {
             // Multi-token case
             let actualWindowSize = windowSize ?? maxCacheSize
