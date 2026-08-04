@@ -2017,9 +2017,20 @@ template <
           STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             if (sgp_sm == SM) {
+#ifdef DARKBLOOM_NAX_CONTIG_LOADS
+              // 8B alignment certified: fn multiples of 4 elems, off_y in
+              // {0,16}, kk1 in {0,32}, str_x = 2048. Same bytes, same slots.
+              Atile[kk1 / SK].load_contig(xn + kk1, kernel_K);
+#else
               Atile[kk1 / SK].load(xn + kk1, kernel_K);
+#endif
             } else {
+#ifdef DARKBLOOM_NAX_CONTIG_LOADS
+              // Same 8B-aligned runs as the full-row arm.
+              Atile[kk1 / SK].load_rows_contig(xn + kk1, kernel_K, sgp_sm);
+#else
               Atile[kk1 / SK].load_rows(xn + kk1, kernel_K, sgp_sm);
+#endif
             }
           }
         }
@@ -2052,8 +2063,15 @@ template <
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             NAXTile<Wtype, TN, TK> Btile;
 
+#ifdef DARKBLOOM_NAX_CONTIG_LOADS
+            // Ws is 16B-aligned (NAXWsChunk16), BK_padded*2B = 144B row
+            // stride, runs at multiples of 8B: same bytes, same slots.
+            Btile.template load_contig_tg<Wtype, BK_padded>(
+                Ws + tn * BK_padded + kk1);
+#else
             Btile.template load<Wtype, BK_padded, 1>(
                 Ws + tn * BK_padded + kk1);
+#endif
 
             tile_matmad_nax(
                 Dtile,

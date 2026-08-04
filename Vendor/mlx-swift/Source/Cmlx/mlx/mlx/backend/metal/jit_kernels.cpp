@@ -1157,6 +1157,32 @@ const char* darkbloom_stage2_gather_define() {
   return define;
 }
 
+// DARKBLOOM_NAX_CONTIG_LOADS: vec4 contiguous fragment loaders in the
+// expert-aligned prefill gather-QMM (fp_gather_qmm_rhs_expert_nax). Injected
+// as a source-level #define at JIT assembly time, exactly like the
+// DARKBLOOM_STAGE2_GATHER lever above: resolved once per process, never part
+// of a pipeline specialization key, gated on the expert kernel name so every
+// other fp_quantized_nax JIT source stays byte-identical in both arms.
+// Default ON: unset (or any value other than "0") compiles the certified
+// vec4 load_contig/load_rows_contig/load_contig_tg twins -- a pure
+// access-width change reading identical bytes into identical slots; "0"
+// restores the byte-identical stock scalar loaders (guarded branches
+// preprocess to load/load_rows).
+const char* darkbloom_nax_contig_loads_define() {
+  static const char* define = [] {
+    const bool v = env::get_var("DARKBLOOM_NAX_CONTIG_LOADS", "") != "0";
+    if (v || env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1") {
+      fprintf(
+          stderr,
+          "mlxfast: fusion %s: nax_contig_loads "
+          "(expert gather-QMM JIT source)\n",
+          v ? "active" : "inactive");
+    }
+    return v ? "\n#define DARKBLOOM_NAX_CONTIG_LOADS 1\n" : "";
+  }();
+  return define;
+}
+
 // DARKBLOOM_GATHER_XMAJOR: fold adjacent column tiles of the expert-aligned
 // prefill gather-QMM into one threadgroup so the expert run's x fragments
 // are loaded once per k-tile instead of once per column tile (x DRAM
@@ -1246,6 +1272,9 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
             : "",
         (kernel_name.find("_expert_") != std::string::npos)
             ? darkbloom_bsearch_hoist_define()
+            : "",
+        (kernel_name.find("_expert_") != std::string::npos)
+            ? darkbloom_nax_contig_loads_define()
             : "",
         metal::gemm_nax(),
         metal::quantized_utils(),

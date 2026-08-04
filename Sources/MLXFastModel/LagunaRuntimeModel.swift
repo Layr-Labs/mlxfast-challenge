@@ -75,13 +75,6 @@ func lagunaTrace(_ site: @autoclosure () -> String) {
 // is bit-exact against the separate dispatches it replaces. The per-head
 // g_proj (N=64) uses a different split-K gemv variant and is never fused.
 
-/// `DARKBLOOM_FUSED_QKV` (default OFF; set "1" to enable): after checkpoint
-/// load, retain one row-concatenated `[Wq; Wk; Wv]` BF16 weight per attention
-/// layer and serve Q/K/V from a single projection dispatch. Ablation on the
-/// paired local benchmark showed a mild prefill cost with no decode gain, so
-/// this ships opt-in.
-let lagunaFusedQKVEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] == "1"
 
 /// `DARKBLOOM_FUSED_SHARED_GATE_UP` (default on; set "0" to disable): after
 /// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
@@ -510,28 +503,6 @@ let lagunaFusedFullQKNormYaRNEnabled =
 let lagunaRoPEAngleAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] != "0"
 
-/// Zero-dispatch decode angle carrier: serve the two per-step RoPE angle rows
-/// as contiguous row VIEWS of the load-time FP32 position atlases instead of
-/// running the two probe RoPE dispatches every token. Unlike the fused
-/// embedding+atlas kernel above (default OFF; its fixed kernel cost measured
-/// −0.23%), this path adds no kernel at all: the atlas row for position `p`
-/// is bit-identical to the probe output at `p` by construction (the atlas IS
-/// the family's own stock RoPE run over the broadcast probe seed), and a
-/// row slice of the contiguous `[1, 1, 4096, D]` atlas is a zero-copy
-/// row-contiguous view, so the two probe dispatches vanish from the front of
-/// every decode step with no replacement work. The stock `embedTokens`
-/// gather is unchanged.
-///
-/// MEASURED (2026-08-01, M5 Max 128 GB, driver rig, 150-step cool-floor
-/// ABBA): views are +0.01..+0.07 ms/step vs the probe dispatches — the two
-/// probes are off the critical path (they overlap the embedding gather and
-/// layer-0 front), so removing them buys nothing, and aliasing the ~3 MB
-/// atlas buffers as per-step kernel inputs appears to add slight
-/// resource-tracking cost. Default OFF, same promoted-era conclusion as the
-/// fused embedding+atlas kernel above. Set `DARKBLOOM_ROPE_ATLAS_VIEWS=1`
-/// to re-measure.
-let lagunaRoPEAtlasViewsEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ATLAS_VIEWS"] == "1"
 
 /// `DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU` (default on; set "0" to disable):
 /// after checkpoint load, retain one row-concatenated BF16 `[gate; up]` bank
@@ -2866,42 +2837,6 @@ private let lagunaNativeAffineNVFP4From: Int? = {
     return min(max(value, 0), LagunaConstants.numHiddenLayers)
 }()
 
-/// Diagnostic-only numeric-format probe; unset on the shipped path.
-private let lagunaNativeAffineProbeFormat: (mode: QuantizationMode, groupSize: Int, bits: Int)? = {
-    switch ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_PROBE_FORMAT"] {
-    case "nvfp4": return (.nvfp4, 16, 4)
-    case "mxfp8": return (.mxfp8, 32, 8)
-    case "mxfp4": return (.mxfp4, 32, 4)
-    default: return nil
-    }
-}()
-
-private let lagunaNativeAffineProbeFormatFrom: Int = {
-    guard
-        let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_NATIVE_AFFINE_PROBE_FORMAT_FROM"],
-        let value = Int(raw)
-    else {
-        return 0
-    }
-    return min(max(value, 0), LagunaConstants.numHiddenLayers)
-}()
-
-private func lagunaNativeAffineProbeRoundTrip(_ weight: MLXArray, layer: Int?) -> MLXArray {
-    guard let probe = lagunaNativeAffineProbeFormat,
-        weight.dim(1).isMultiple(of: probe.groupSize),
-        layer.map({ $0 >= lagunaNativeAffineProbeFormatFrom }) ?? true
-    else {
-        return weight
-    }
-    let (codes, scales, biases) = quantized(
-        weight, groupSize: probe.groupSize, bits: probe.bits, mode: probe.mode)
-    return dequantized(
-        codes, scales: scales, biases: biases,
-        groupSize: probe.groupSize, bits: probe.bits, mode: probe.mode,
-        dtype: .bfloat16)
-}
-
 func lagunaNativeAffineWeight(
     _ weight: MLXArray, layer: Int? = nil
 ) -> LagunaNativeAffineWeight? {
@@ -2910,7 +2845,7 @@ func lagunaNativeAffineWeight(
     else {
         return nil
     }
-    let source = lagunaNativeAffineProbeRoundTrip(weight, layer: layer)
+    let source = weight
     if let from = lagunaNativeAffineNVFP4From,
         (layer ?? 0) >= from,
         weight.dim(1).isMultiple(of: 16)
@@ -5322,34 +5257,6 @@ final class LagunaRuntimeAttention: Module {
         return fused.arrays + (_nativeAffineGProj?.arrays ?? [])
     }
 
-    /// Builds and retains the fused QKV weight from the loaded q/k/v
-    /// projection weights. Called once after weights are installed and
-    /// evaluated (before warmup); returns the new array so the caller can
-    /// batch a single eval. Fuses only the exact stock configuration: three
-    /// plain bias-free `Linear` projections of one dtype over the same input
-    /// width, so the fused matmul is `matmul(x, w.T)` with every original
-    /// output row unchanged.
-    func prepareFusedQKVWeight() -> MLXArray? {
-        guard _fusedQKVWeight == nil,
-            type(of: wq) == Linear.self,
-            type(of: wk) == Linear.self,
-            type(of: wv) == Linear.self,
-            wq.bias == nil, wk.bias == nil, wv.bias == nil,
-            wq.weight.ndim == 2, wk.weight.ndim == 2, wv.weight.ndim == 2,
-            wq.weight.dtype == wk.weight.dtype,
-            wk.weight.dtype == wv.weight.dtype,
-            wq.weight.dim(1) == wk.weight.dim(1),
-            wk.weight.dim(1) == wv.weight.dim(1),
-            wq.weight.dim(0) == nHeads * headDim,
-            wk.weight.dim(0) == nKVHeads * headDim,
-            wv.weight.dim(0) == nKVHeads * headDim
-        else {
-            return nil
-        }
-        let fused = concatenated([wq.weight, wk.weight, wv.weight], axis: 0)
-        _fusedQKVWeight = fused
-        return fused
-    }
 
     /// Build the two terminal-prefill projection banks once after checkpoint
     /// load. Only the final sliding layer can dispatch them. Concatenating
@@ -7554,40 +7461,13 @@ func lagunaRoutedDownReduce(
     )[0]
 }
 
-/// Encode-order lever for the 9-slot down+residual dispatch. MLX's eval
-/// traversal visits a node's inputs in declaration order, and Metal memory
-/// barriers are encoder-wide. Hypothesis was that listing the shared-expert
-/// inputs first would let the shared SwiGLU QMV overlap the router top-8
-/// latency; MEASURED (2026-08-01, M5 Max 128 GB, driver rig, 150-step
-/// cool-floor windows): shared-first REGRESSES ~+0.10 ms/step. Cause: in
-/// the shipped routed-first order the shared QMV is encoded after the
-/// routed QMV with no intervening barrier, so it already overlaps the
-/// routed QMV on the GPU; moving it before the top-8 barrier makes the
-/// barrier ahead of the routed QMV wait on the shared QMV too, LENGTHENING
-/// the critical path (barriers are encoder-wide, not per-resource). Kept as
-/// an opt-in A/B arm (`DARKBLOOM_SHARED_FIRST_DOWN=1`) for re-measurement
-/// if the surrounding dispatch anatomy changes; both orders are bit-exact
-/// (pure input permutation, kernel body addresses inputs by name; the
-/// reordered variant carries a new kernel name because the JIT cache keys
-/// signatures by name).
-let lagunaSharedFirstDownOrderEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_FIRST_DOWN"] == "1"
-
 private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
-    name: lagunaSharedFirstDownOrderEnabled
-        ? "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v4sf"
-        : "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v4",
-    inputNames: lagunaSharedFirstDownOrderEnabled
-        ? [
-            "shared_activated", "shared_down_weight", "shared_down_scales",
-            "routed_activated", "routed_down_weight", "routed_down_scales",
-            "indices", "router_weights", "residual",
-        ]
-        : [
-            "routed_activated", "routed_down_weight", "routed_down_scales",
-            "indices", "router_weights", "shared_activated",
-            "shared_down_weight", "shared_down_scales", "residual",
-        ],
+    name: "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v4",
+    inputNames: [
+        "routed_activated", "routed_down_weight", "routed_down_scales",
+        "indices", "router_weights", "shared_activated",
+        "shared_down_weight", "shared_down_scales", "residual",
+    ],
     outputNames: ["output"],
     source: """
         constexpr uint input_width = 512;
@@ -7740,17 +7620,11 @@ func lagunaRoutedSharedDownResidual(
     precondition(residual.shape == [1, 1, LagunaConstants.hiddenSize])
 
     return lagunaRoutedSharedDownResidualKernel(
-        lagunaSharedFirstDownOrderEnabled
-            ? [
-                sharedActivated, sharedDownWeight, sharedDownScales,
-                routedActivated, routedDownWeight, routedDownScales,
-                indices, routerWeights, residual,
-            ]
-            : [
-                routedActivated, routedDownWeight, routedDownScales,
-                indices, routerWeights, sharedActivated,
-                sharedDownWeight, sharedDownScales, residual,
-            ],
+        [
+            routedActivated, routedDownWeight, routedDownScales,
+            indices, routerWeights, sharedActivated,
+            sharedDownWeight, sharedDownScales, residual,
+        ],
         grid: (LagunaConstants.hiddenSize * 288, 1, 1),
         threadGroup: (288, 1, 1),
         outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
@@ -8698,23 +8572,6 @@ private let lagunaDecodeRouterCastSinkEnabled =
 private let lagunaDecodeRouterNormSinkEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTER_NORM"] != "0"
 
-/// Prefill counterpart of the fused decode router: one dispatch per sparse
-/// layer replaces the stock multi-token routing chain (FP32 cast, sigmoid,
-/// correction-bias add, negate, `argPartition`'s full 256-wide merge argsort,
-/// the top-8 slice, `takeAlong`, and — when `norm_topk_prob` is set — the
-/// row sum and broadcast divide).
-///
-/// DEFAULT OFF: submission `fe01af9` shipped this together with the prefill
-/// MoE tail and ranked **-0.68%** against its own base (1.11254 vs 1.12019).
-/// The per-lane predecessor-count selection is ~10x the ALU of the batched
-/// merge sort it replaced, and at 512 rows the stock sort amortizes to a few
-/// microseconds per layer — there was nothing to save, only kernel shape to
-/// lose. Kept behind `DARKBLOOM_PREFILL_ROUTER_TOP8=1` because the
-/// bit-exactness argument (Metal `ArgPartition` IS the stable merge argsort)
-/// is verified and useful.
-private let lagunaPrefillRouterTop8Enabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ROUTER_TOP8"] == "1"
-
 /// Prefill MoE tail fusion: the weighted expert-output combine, the fixed
 /// 2.5 routed scale, the shared-expert add and the residual add collapse
 /// into one elementwise kernel, so the `[1, L, 8, 2048]` expert bank is read
@@ -8732,119 +8589,10 @@ private let lagunaPrefillMoETailEnabled =
 private let lagunaPrefillSortedMoETailEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_SORTED_MOE_TAIL"] != "0"
 
-/// Batched top-8 selection for multi-token (prefill) routing.
-///
-/// Exactness against the stock chain it replaces, per row:
-///  * The sigmoid is the same numerically-stable form the FP32 `sigmoid`
-///    kernel computes after the standalone cast (`float(bfloat)` widening is
-///    exact), already ranked-validated by the decode router kernel.
-///  * The selection reproduces `argPartition(-scoresForChoice, kth: 7)`
-///    exactly: on Metal `ArgPartition::eval_gpu` IS `gpu_merge_sort`
-///    (sort.cpp routes it to the same stable merge argsort as `argSort`), so
-///    the stock "partition" is a fully sorted row. `laguna_router_key_before`
-///    is a strict total order (choice key, then original expert index, with
-///    the sort's NaN placement), so counting predecessors gives every expert
-///    a unique rank equal to its stable-argsort position; ranks 0..<8 emit in
-///    rank order, which is byte-identical to the stock argsort slice.
-///  * Mixture weights are the pre-bias sigmoid scores of the selected
-///    experts, exactly `takeAlong(scores, inds)`.
-///  * The normalizing epilogue reproduces `weights.sum(axis: -1)` (an
-///    8-element `row_reduce_small` walked in index order from zero) and the
-///    IEEE FP32 broadcast divide — the same two dispatches the decode norm
-///    sink already replaces, one row at a time.
-private func lagunaPrefillRouterTop8KernelSource(normalizing: Bool) -> String {
-    let epilogue =
-        normalizing
-        ? """
-                float total = 0.0f;
-                for (uint i = 0; i < 8; ++i) {
-                    total = selected_scores[i] + total;
-                }
-                router_scores[row * 8 + lane] = selected_scores[lane] / total;
-        """
-        : """
-                router_scores[row * 8 + lane] = selected_scores[lane];
-        """
-    return """
-        uint lane = thread_position_in_threadgroup.x;
-        uint row = threadgroup_position_in_grid.y;
-
-        threadgroup float choice_keys[256];
-        threadgroup float selected_scores[8];
-
-        float x = float(logits[row * 256 + lane]);
-        float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
-        float score = x < 0.0f ? y : 1.0f - y;
-        float corrected = score + float(correction_bias[lane]);
-        float my_key = -corrected;
-        choice_keys[lane] = my_key;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Stable-argsort rank by predecessor count under the strict total
-        // order (key, then original index). Ranks are a permutation of
-        // 0..255, so the eight winners land in distinct output slots in
-        // exactly the stock argsort-slice order.
-        uint rank = 0;
-        for (uint j = 0; j < 256; ++j) {
-            rank += laguna_router_key_before(
-                choice_keys[j], j, my_key, lane) ? 1 : 0;
-        }
-        if (rank < 8) {
-            router_indices[row * 8 + rank] = lane;
-            selected_scores[rank] = score;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (lane < 8) {
-        \(epilogue)
-        }
-        """
-}
-
-private let lagunaPrefillRouterTop8Kernel = MLXFast.metalKernel(
-    name: "laguna_prefill_router_top8_v1",
-    inputNames: ["logits", "correction_bias"],
-    outputNames: ["router_indices", "router_scores"],
-    source: lagunaPrefillRouterTop8KernelSource(normalizing: false),
-    header: lagunaDecodeRouterTop8Header,
-    ensureRowContiguous: true
-)
-
-private let lagunaPrefillRouterTop8NormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_router_top8_norm_v1",
-    inputNames: ["logits", "correction_bias"],
-    outputNames: ["router_indices", "router_scores"],
-    source: lagunaPrefillRouterTop8KernelSource(normalizing: true),
-    header: lagunaDecodeRouterTop8Header,
-    ensureRowContiguous: true
-)
-
-private func lagunaPrefillRouterTop8(
-    logits: MLXArray, correctionBias: MLXArray, rows: Int, normalizing: Bool
-) -> (MLXArray, MLXArray) {
-    precondition(logits.dtype == .bfloat16 || logits.dtype == .float32)
-    precondition(correctionBias.dtype == .float32)
-    precondition(logits.size == rows * 256)
-    precondition(correctionBias.size == 256)
-
-    let kernel =
-        normalizing
-        ? lagunaPrefillRouterTop8NormalizingKernel : lagunaPrefillRouterTop8Kernel
-    let outputs = kernel(
-        [logits, correctionBias],
-        grid: (256, rows, 1),
-        threadGroup: (256, 1, 1),
-        outputShapes: [[1, rows, 8], [1, rows, 8]],
-        outputDTypes: [.uint32, .float32]
-    )
-    return (outputs[0], outputs[1])
-}
-
 /// `DARKBLOOM_PREFILL_ROUTER_TOURNAMENT` (default on; set "0" to ablate):
-/// credited re-land of saucegod's `aeabc27` two-stage tournament, the
-/// mechanism this replaces `lagunaPrefillRouterTop8` above's O(256) per-lane
-/// predecessor count with (that one stays in the tree, default off, as its
-/// own independent ablation point -- `DARKBLOOM_PREFILL_ROUTER_TOP8=1`).
+/// credited re-land of saucegod's `aeabc27` two-stage tournament, replacing
+/// the stock multi-token routing chain's O(256) selection with a cheaper
+/// two-stage tournament.
 ///
 /// Same comparator, same total order, same normalization idiom as the
 /// promoted decode router (`laguna_router_key_before`,
@@ -8890,9 +8638,8 @@ private func lagunaPrefillRouterTop8(
 /// order applied consistently preserves relative order within any subset,
 /// the sorted union's first 8 entries are the row's true top-8 IN THE SAME
 /// ORDER the full 256-element stable argsort would have produced them --
-/// same proof structure the promoted decode kernel and the existing
-/// (default-off) `lagunaPrefillRouterTop8` predecessor-count kernel both
-/// already rely on for their own exactness arguments.
+/// same proof structure the promoted decode kernel already relies on for
+/// its own exactness argument.
 ///
 /// The normalizing epilogue reuses the decode kernel's own trick verbatim:
 /// after phase 2, ranks 0..<8 are physical lanes 0..<8, all within
@@ -9309,24 +9056,6 @@ final class LagunaRuntimeMoEGate: Module {
         {
             lagunaTrace("prefill router tournament")
             return lagunaPrefillRouterTournament(
-                logits: projectedLogits,
-                correctionBias: eScoreCorrectionBias.asType(.float32),
-                rows: projectedLogits.dim(1),
-                normalizing: normTopkProb
-            )
-        }
-        if lagunaPrefillRouterTop8Enabled,
-            routerLogitSoftcapping == 0,
-            topK == 8,
-            projectedLogits.dtype == .bfloat16,
-            projectedLogits.ndim == 3,
-            projectedLogits.dim(0) == 1,
-            projectedLogits.dim(1) > 1,
-            projectedLogits.dim(2) == 256,
-            eScoreCorrectionBias.size == 256
-        {
-            lagunaTrace("prefill router top8")
-            return lagunaPrefillRouterTop8(
                 logits: projectedLogits,
                 correctionBias: eScoreCorrectionBias.asType(.float32),
                 rows: projectedLogits.dim(1),
@@ -10580,7 +10309,7 @@ final class LagunaRuntimeModelInner: Module {
     private func decodeRoPEAtlasPosition(
         inputs: MLXArray, cache: [KVCache]?
     ) -> Int? {
-        guard lagunaRoPEAngleAtlasEnabled || lagunaRoPEAtlasViewsEnabled,
+        guard lagunaRoPEAngleAtlasEnabled,
             lagunaFusedFullQKNormYaRNEnabled,
             lagunaFusedSlidingQKNormRoPEEnabled,
             inputs.dtype == .int32,
@@ -10644,21 +10373,6 @@ final class LagunaRuntimeModelInner: Module {
             h = atlasOutputs.hidden
             fullRoPEAngles = atlasOutputs.fullAngles
             slidingRoPEAngles = atlasOutputs.slidingAngles
-        } else if lagunaRoPEAtlasViewsEnabled,
-            let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
-            let fullAtlas = _fullRoPEAngleAtlas,
-            let slidingAtlas = _slidingRoPEAngleAtlas
-        {
-            // Zero-dispatch angle carrier: stock embedding gather plus two
-            // zero-copy row views of the load-time atlases. The atlas row at
-            // `position` carries the same FP32 floats the probe dispatch
-            // would have produced (the atlas is that probe, broadcast over
-            // positions at load time), and the row slice of the contiguous
-            // atlas is row-contiguous, so the fused QK-norm+RoPE kernels
-            // consume it without any copy or added kernel.
-            h = embedTokens(inputs)
-            fullRoPEAngles = fullAtlas[0..., 0..., position..<(position + 1), 0...]
-            slidingRoPEAngles = slidingAtlas[0..., 0..., position..<(position + 1), 0...]
         } else {
             // Verbatim stock fallback for prefill, unsupported caches and
             // positions outside the precomputed atlas.
@@ -10892,9 +10606,6 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
             if lagunaUseNativeAffineOProj(layer: layer.selfAttn.layerIdx) {
                 fusedArrays.append(
                     contentsOf: layer.selfAttn.prepareNativeAffineOProjWeight())
-            }
-            if lagunaFusedQKVEnabled, let fused = layer.selfAttn.prepareFusedQKVWeight() {
-                fusedArrays.append(fused)
             }
             fusedArrays.append(
                 contentsOf: layer.selfAttn.prepareLastPrefillProjectionWeights())
