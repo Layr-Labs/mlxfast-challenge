@@ -30,6 +30,9 @@ public enum LagunaConstants {
     public static let numExperts = 256
     public static let numExpertsPerTok = 8
     public static let moeIntermediateSize = 512
+    /// Half the row count of the fused [gate; up] shared-expert bank the
+    /// runtime retains at init: the bank concatenates the two 512-row NVFP4
+    /// projections, and every consumer splits it at exactly this boundary.
     public static let sharedExpertIntermediateSize = 512
     public static let moeRoutedScalingFactor = 2.5
     /// `bos_token_id` from the pinned checkpoint config; used only for
