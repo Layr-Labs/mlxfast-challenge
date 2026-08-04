@@ -384,7 +384,13 @@ public final class LagunaRuntimeWeightCache {
                 setenv("MLX_BFS_MAX_WIDTH", "50", 0)
                 if env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" {
                     setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
-                    setenv("MLX_MAX_OPS_PER_BUFFER", "200", 0)
+                    // 200 -> 400 ops: halve CB boundaries; see note.
+                    // Identical-tree replicate marker. The submission service
+                    // deduplicates byte-identical archives, so an independent
+                    // ranked receipt for the same compiled runtime needs one
+                    // compile-neutral byte difference. This is replicate B of
+                    // A/B/C for submission 5d522d6a-d562-408b-809a-d7e2bd5c60ce.
+                    setenv("MLX_MAX_OPS_PER_BUFFER", "400", 0)
                 }
                 startupMemoryPolicy = nil
             }
