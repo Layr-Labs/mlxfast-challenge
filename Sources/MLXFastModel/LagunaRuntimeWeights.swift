@@ -381,11 +381,11 @@ public final class LagunaRuntimeWeightCache {
                 let env = ProcessInfo.processInfo.environment
                 // P4: full-profile BFS width default from 776a79e1 / dda29d26.
                 // setenv overwrite=0 keeps any explicit MLX_BFS_MAX_WIDTH.
-                setenv("MLX_BFS_MAX_WIDTH", "50", 0)
+                setenv("MLX_BFS_MAX_WIDTH", "100", 0)
                 if env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" {
                     setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
                     // 200 -> 400 ops: halve CB boundaries; see note.
-                    setenv("MLX_MAX_OPS_PER_BUFFER", "400", 0)
+                    setenv("MLX_MAX_OPS_PER_BUFFER", "800", 0)
                 }
                 startupMemoryPolicy = nil
             }
@@ -496,8 +496,6 @@ public final class LagunaRuntimeWeightCache {
             lagunaFusedFullAttentionKernelWarmupEnabled
         {
             lagunaWarmFullFusedAttentionKernel()
-            lagunaWarmSlidingFusedAttentionKernel()
-            lagunaWarmDecodeQKVR1Kernels()
         }
         // Warm the greedy-token pipeline too. Every scored worker request ends
         // in `LagunaCorrectness.greedyToken` (reshape -> last row -> argMax),
