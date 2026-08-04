@@ -639,8 +639,6 @@ METAL_FUNC void fp_qmm_t_impl(
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
   constexpr short SK = 32;
-  static_assert(SK == 32, "dense NAX fragment width");
-  static_assert(SK % 16 == 0, "dense NAX fragment divisibility");
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
