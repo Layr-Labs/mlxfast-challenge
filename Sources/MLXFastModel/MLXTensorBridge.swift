@@ -2,6 +2,10 @@ import Foundation
 import MLX
 import MLXFastCore
 
+// Calibration marker for the paired identical-tree M5 noise measurement: the
+// submission service deduplicates byte-identical archives, so run B needs one
+// compile-neutral byte difference. Remove after the measurement.
+
 public protocol MLXTensorBridge {
     associatedtype Array
 
