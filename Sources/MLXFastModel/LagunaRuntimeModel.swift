@@ -4816,6 +4816,9 @@ private func lagunaDecodeNVFP4QKVR1(
 private let lagunaWarmQKVR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_WARM_QKV_R1"] == "1"
 
+// Declared re-roll marker (defense ticket 2): the promoted payload
+// 46eeccf0 carries this warmup unchanged; this comment is the
+// archive-distinguishing delta and nothing else.
 func lagunaWarmDecodeQKVR1Kernels() {
     guard lagunaWarmQKVR1Enabled else { return }
     let hidden = LagunaConstants.hiddenSize
@@ -10838,12 +10841,25 @@ private func lagunaDecodeEmbeddingRoPEAtlas(
 /// RMSNorm remains a child of this module for checkpoint compatibility, but
 /// the scored wrapper applies it after selecting the only consumed row.
 private let lagunaPhaseCacheLimitBytes: Int = {
-    guard
-        let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_PHASE_CACHE_LIMIT_GB"],
-        let gb = Int(raw), gb > 0
-    else { return 0 }
-    return gb << 30
+    if let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PHASE_CACHE_LIMIT_GB"]
+    {
+        let gb = Int(raw) ?? 0
+        return gb > 0 ? gb << 30 : 0
+    }
+    // Ranked-dose default: on machines with the M5 runner's headroom
+    // (>= 96 GiB physical), restore the full profile's declared-but-never-
+    // applied 32 GiB in-window cache limit. The freeze policy states the
+    // trusted 6 GiB phase-start reset "pins the phase-start state only"
+    // and that editable code may change the limit inside the charged
+    // window. Pure memory management: allocation never changes computed
+    // values, so tokens are bit-identical either way. On smaller machines
+    // (including this seat's 48 GB bench, where a 10 GiB dose measured
+    // prefill-adverse under memory pressure) the default stays off.
+    if ProcessInfo.processInfo.physicalMemory >= 96 << 30 {
+        return 32 << 30
+    }
+    return 0
 }()
 
 final class LagunaRuntimeModelInner: Module {
