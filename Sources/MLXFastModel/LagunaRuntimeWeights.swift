@@ -380,12 +380,15 @@ public final class LagunaRuntimeWeightCache {
                 // MLX_ values win; DARKBLOOM kill switch supports same-binary A/B.
                 let env = ProcessInfo.processInfo.environment
                 // P4: full-profile BFS width default from 776a79e1 / dda29d26.
+                // Re-tested at the 800-op cap (f2fadb2c): width 100 measured
+                // decode 5112.0 / prefill 191.15 vs 50's 5100.8 / 190.99 --
+                // worse on both axes, so 50 survives the regime change.
                 // setenv overwrite=0 keeps any explicit MLX_BFS_MAX_WIDTH.
                 setenv("MLX_BFS_MAX_WIDTH", "50", 0)
                 if env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" {
                     setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
                     // 200 -> 400 ops: halve CB boundaries; see note.
-                    setenv("MLX_MAX_OPS_PER_BUFFER", "400", 0)
+                    setenv("MLX_MAX_OPS_PER_BUFFER", "800", 0)
                 }
                 startupMemoryPolicy = nil
             }
@@ -496,8 +499,6 @@ public final class LagunaRuntimeWeightCache {
             lagunaFusedFullAttentionKernelWarmupEnabled
         {
             lagunaWarmFullFusedAttentionKernel()
-            lagunaWarmSlidingFusedAttentionKernel()
-            lagunaWarmDecodeQKVR1Kernels()
         }
         // Warm the greedy-token pipeline too. Every scored worker request ends
         // in `LagunaCorrectness.greedyToken` (reshape -> last row -> argMax),
