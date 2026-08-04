@@ -1321,7 +1321,14 @@ bool darkbloom_stage_runbar() {
 }
 
 bool darkbloom_stage_novol() {
-  static const bool v = darkbloom_stage_flag("DARKBLOOM_STAGE_NOVOL");
+  // Default ON (was opt-in): dropping the vestigial k-loop volatile measured
+  // -1.77% prefill on a 4-arm interleaved A/B (M5 Max, 2026-07-28) with
+  // decode neutral and correctness green on every arm; its three siblings
+  // (WIDEST/WIDELD/RUNBAR) re-measured negative the same night and stay
+  // opt-in. Scheduling-only (fc 207 selects the no-volatile pipeline
+  // variant; no arithmetic, order, or rounding change). Set
+  // DARKBLOOM_STAGE_NOVOL=0 to restore the volatile arm for paired A/B.
+  static const bool v = env::get_var("DARKBLOOM_STAGE_NOVOL", "1") != "0";
   return v;
 }
 
