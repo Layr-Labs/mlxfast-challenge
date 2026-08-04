@@ -384,8 +384,10 @@ public final class LagunaRuntimeWeightCache {
                 setenv("MLX_BFS_MAX_WIDTH", "50", 0)
                 if env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" {
                     setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
-                    // 200 -> 400 ops: halve CB boundaries; see note.
-                    setenv("MLX_MAX_OPS_PER_BUFFER", "400", 0)
+                    // 400 -> 800 repeated at 5100.8/5100.6 us on the M5;
+                    // composed receipt 10e83d6: 5057.861 us decode, exact.
+                    // keep explicit MLX_ overrides authoritative via overwrite=0.
+                    setenv("MLX_MAX_OPS_PER_BUFFER", "800", 0)
                 }
                 startupMemoryPolicy = nil
             }
