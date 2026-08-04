@@ -373,17 +373,24 @@ public final class LagunaRuntimeWeightCache {
                 // referenced-byte commit threshold splits every sparse layer
                 // across several command buffers even though the layer's
                 // weights no longer create residency pressure. A 512 MiB
-                // budget fits one complete decode layer (attention plus the
-                // routed/shared gate-up and down banks are ~507 MiB for the
-                // 200 MB / 200-op command buffers: the post-anupsv-loader regime
-                // re-test winner (6 Latin pairs: decode 5/6, prefill 4/6). Explicit
-                // MLX_ values win; DARKBLOOM kill switch supports same-binary A/B.
+                // budget fits one complete decode layer (~507 MiB).
+                // Every decode split is charged to the BYTE threshold; the
+                // 200-op one never fires, so bytes alone set batching and
+                // 200 MiB splits a layer apart. 2048 batches ~4 layers: paired
+                // sweep (64 steps/arm, control spread 0.46%) 200 -> 7.731 ms,
+                // 512 -> 7.529, 2048 -> 7.417 (+4.05%), 100000 saturated;
+                // bit-identical tokens, 22.3 GB peak RSS unchanged. Prefill
+                // takes a flat ~-3.4..-4.7% step above 200, so 2048 is the
+                // 0.75/0.25-weighted optimum, not decode's. Raising the op
+                // budget too adds nothing (-0.29%).
+                // Explicit MLX_ values win; DARKBLOOM kill switch supports
+                // same-binary A/B.
                 let env = ProcessInfo.processInfo.environment
                 // P4: full-profile BFS width default from 776a79e1 / dda29d26.
                 // setenv overwrite=0 keeps any explicit MLX_BFS_MAX_WIDTH.
                 setenv("MLX_BFS_MAX_WIDTH", "50", 0)
                 if env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" {
-                    setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
+                    setenv("MLX_MAX_MB_PER_BUFFER", "2048", 0)
                     setenv("MLX_MAX_OPS_PER_BUFFER", "200", 0)
                 }
                 startupMemoryPolicy = nil
