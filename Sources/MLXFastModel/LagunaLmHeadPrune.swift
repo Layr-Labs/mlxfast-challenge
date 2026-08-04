@@ -156,12 +156,6 @@ private let lagunaLmHeadCoarseV5Enabled =
     // DARKBLOOM_LMHEAD_COARSE_V5=0 restores the int6 v4 arm byte-for-byte.
     ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COARSE_V5"] != "0"
 
-/// Debug instrumentation for the v5 arm: per-step candidate count on stderr
-/// (forces a GPU sync per decode step; NEVER set on a timing run). Used once
-/// to confirm the offline candidate percentiles transfer to the device.
-private let lagunaLmHeadV5StatsEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_V5_STATS"] == "1"
-
 /// Tight v5 assembly threshold: use the BF16 predecessor of the exact coarse-
 /// argmax row instead of the retained `e_r - |e_r|/64` two-ulp band. This is
 /// the highest representable threshold that still forces every skipped
@@ -1941,13 +1935,6 @@ final class LagunaLmHeadPruner {
                 outputShapes: [[1]],
                 outputDTypes: [.float32]
             )[0]
-            if lagunaLmHeadV5StatsEnabled {
-                // Debug-only: forces a per-step GPU sync; never on timing runs.
-                let count = (coarse5 + delta5.asType(.float32) .>= thr5)
-                    .asType(.int32).sum().item(Int32.self)
-                FileHandle.standardError.write(
-                    Data("lmhead-v5 candidates: \(count)\n".utf8))
-            }
             let assembled5 = lagunaLmHeadInlineExactDeltaBF16Kernel(
                 [coarse5, delta5, thr5, lmHeadWeight, x],
                 grid: (vocab / 32 * 256, 1, 1),
