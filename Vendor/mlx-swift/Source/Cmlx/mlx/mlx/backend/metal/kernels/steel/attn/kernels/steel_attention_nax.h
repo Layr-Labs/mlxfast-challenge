@@ -23,6 +23,15 @@ using namespace mlx::steel;
 #define DARKBLOOM_ATTN_QHOIST 0
 #endif
 
+// DARKBLOOM_ATTN_KVPREFETCH default. DEFAULT ON for the standalone ranked
+// candidate: cross-kb K-only software pipeline (double-buffer the K device
+// reads so K[kb+1] stages during P@V[kb]). QHOIST is left OFF to bound
+// register pressure (audit-nax Candidate 2). Force off with
+// `#define DARKBLOOM_ATTN_KVPREFETCH 0`.
+#ifndef DARKBLOOM_ATTN_KVPREFETCH
+#define DARKBLOOM_ATTN_KVPREFETCH 1
+#endif
+
 // DARKBLOOM_ATTN_QBLOCK_MAJOR default. DEFAULT ON for the standalone ranked
 // candidate: remap the stock physical grid into query-block-major logical
 // order. The mapping is a pure permutation of threadgroups; it does not alter
@@ -336,6 +345,41 @@ template <
   }
 #endif
 
+  // DARKBLOOM_ATTN_KVPREFETCH -- cross-kb K-only software pipeline.
+  // K advances every kb (K += BK*K_strides[2] at loop bottom) and is read
+  // fresh inside QK^T every kb. We ping-pong two K buffers so kb+1's reads
+  // issue during P@V[kb], hiding the LSU behind the softmax/MMA ALU. QHOIST
+  // is OFF here (pristine default), bounding the live register set.
+  // EXACTNESS: staged fragments use the same base pointer, per-(ik,id)
+  // offset, stride and bounds predicate (incl. the is_last_k load_rows arm)
+  // as the in-loop load they replace; the mma consumes them in the identical
+  // (iq,ik,id) order. Only WHEN the reads issue moves. No reassociation.
+#if DARKBLOOM_ATTN_KVPREFETCH
+  constexpr int nKfrags_KVPF = (TK / 2) * TD;
+  typename NAXTile<T, 2, 1>::frag_type Kpipe_r0[2][nKfrags_KVPF];
+  typename NAXTile<T, 2, 1>::frag_type Kpipe_r1[2][nKfrags_KVPF];
+  // prologue: stage kb=0 into slot 0
+  {
+    const int is_last_k_pro = (0 == (params->NK_aligned));
+    STEEL_PRAGMA_UNROLL
+    for (short ik = 0; ik < TK; ik += 2) {
+      STEEL_PRAGMA_UNROLL
+      for (short id = 0; id < TD; id++) {
+        NAXTile<T, 2, 1> Kt;
+        const int K_load_off = ik * kU * int(params->K_strides[2]) + id * kU;
+        if (!align_K && is_last_k_pro) {
+          Kt.load_rows(K + K_load_off, int(params->K_strides[2]), lim_rows_k - ik * kU);
+        } else {
+          Kt.load(K + K_load_off, int(params->K_strides[2]));
+        }
+        Kpipe_r0[0][(ik / 2) * TD + id] = Kt.frag_at(0, 0);
+        Kpipe_r1[0][(ik / 2) * TD + id] = Kt.frag_at(1, 0);
+      }
+    }
+  }
+  int Kpipe_cur = 0;
+#endif
+
   // Loop over KV seq length
   for (int kb = 0; kb < kb_lim; kb++) {
     const int is_last_k = (kb == (params->NK_aligned));
@@ -396,6 +440,10 @@ template <
           }
 #endif
 
+#if DARKBLOOM_ATTN_KVPREFETCH
+          Ktile.frag_at(0, 0) = Kpipe_r0[Kpipe_cur][(ik / 2) * TD + id];
+          Ktile.frag_at(1, 0) = Kpipe_r1[Kpipe_cur][(ik / 2) * TD + id];
+#else
           if (!align_K && is_last_k) {
             Ktile.load_rows(
                 K + K_load_off,
@@ -404,6 +452,7 @@ template <
           } else {
             Ktile.load(K + K_load_off, int(params->K_strides[2]));
           }
+#endif
 
           stile_t::NAXFrag_t::mma(
               Stile.frag_at(iq, ik),
@@ -626,6 +675,30 @@ template <
       }
     }
 
+#if DARKBLOOM_ATTN_KVPREFETCH
+    // stage K for kb+1 during/after P@V[kb] (LSU overlaps softmax+MMA ALU)
+    if (kb + 1 < kb_lim) {
+      const int Knxt = 1 - Kpipe_cur;
+      const device T* Kp = K + BK * int(params->K_strides[2]);
+      const int is_last_k_nxt = ((kb + 1) == (params->NK_aligned));
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik += 2) {
+        STEEL_PRAGMA_UNROLL
+        for (short id = 0; id < TD; id++) {
+          NAXTile<T, 2, 1> Kt;
+          const int K_load_off = ik * kU * int(params->K_strides[2]) + id * kU;
+          if (!align_K && is_last_k_nxt) {
+            Kt.load_rows(Kp + K_load_off, int(params->K_strides[2]), lim_rows_k - ik * kU);
+          } else {
+            Kt.load(Kp + K_load_off, int(params->K_strides[2]));
+          }
+          Kpipe_r0[Knxt][(ik / 2) * TD + id] = Kt.frag_at(0, 0);
+          Kpipe_r1[Knxt][(ik / 2) * TD + id] = Kt.frag_at(1, 0);
+        }
+      }
+      Kpipe_cur = Knxt;
+    }
+#endif
     // Prepare for next iteration
     K += BK * int(params->K_strides[2]);
     V += BK * int(params->V_strides[2]);
