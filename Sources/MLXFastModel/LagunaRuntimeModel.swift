@@ -1616,17 +1616,25 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
         U pair_global_max1 = simd_max(pair_max1);
         U pair_global_factor0 = metal::fast::exp(pair_max0 - pair_global_max0);
         U pair_global_factor1 = metal::fast::exp(pair_max1 - pair_global_max1);
-        pair_sum0 = simd_sum(sum_exp_scores[lane] * pair_global_factor0);
-        pair_sum1 = simd_sum(sum_exp_scores[BN + lane] * pair_global_factor1);
+        // Packed pair (K3-receipted class): per-component butterfly.
+        {
+            const vec<U, 2> packed_ps = simd_sum(
+                vec<U, 2>(sum_exp_scores[lane] * pair_global_factor0,
+                          sum_exp_scores[BN + lane] * pair_global_factor1));
+            pair_sum0 = packed_ps.x;
+            pair_sum1 = packed_ps.y;
+        }
 
         for (int p = 0; p < pair_planes; ++p) {
-            U acc0 = simd_sum(
-                outputs[p * pair_plane_size + sg * BD + lane] *
-                pair_global_factor0);
-            U acc1 = simd_sum(
-                outputs[
-                    (pair_planes + p) * pair_plane_size + sg * BD + lane] *
-                pair_global_factor1);
+            const vec<U, 2> packed_acc = simd_sum(
+                vec<U, 2>(
+                    outputs[p * pair_plane_size + sg * BD + lane] *
+                        pair_global_factor0,
+                    outputs[
+                        (pair_planes + p) * pair_plane_size + sg * BD + lane] *
+                        pair_global_factor1));
+            U acc0 = packed_acc.x;
+            U acc1 = packed_acc.y;
             pair_o0[p] = pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
             pair_o1[p] = pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
         }
@@ -1641,13 +1649,15 @@ private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int p = 0; p < pair_planes; ++p) {
-            U acc0 = simd_sum(
-                outputs[p * pair_plane_size + sg * BD + lane] *
-                pair_global_factor0);
-            U acc1 = simd_sum(
-                outputs[
-                    (pair_planes + p) * pair_plane_size + sg * BD + lane] *
-                pair_global_factor1);
+            const vec<U, 2> packed_acc = simd_sum(
+                vec<U, 2>(
+                    outputs[p * pair_plane_size + sg * BD + lane] *
+                        pair_global_factor0,
+                    outputs[
+                        (pair_planes + p) * pair_plane_size + sg * BD + lane] *
+                        pair_global_factor1));
+            U acc0 = packed_acc.x;
+            U acc1 = packed_acc.y;
             pair_o0[pair_planes + p] =
                 pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
             pair_o1[pair_planes + p] =
@@ -2087,8 +2097,13 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
             pair_score1 += pair_q1[2] * pair_k[2];
             pair_score0 += pair_q0[3] * pair_k[3];
             pair_score1 += pair_q1[3] * pair_k[3];
-            pair_score0 = simd_sum(pair_score0);
-            pair_score1 = simd_sum(pair_score1);
+            // Packed pair (K3-receipted class): per-component butterfly.
+            {
+                const vec<U, 2> packed_tail = simd_sum(
+                    vec<U, 2>(pair_score0, pair_score1));
+                pair_score0 = packed_tail.x;
+                pair_score1 = packed_tail.y;
+            }
 
             U pair_new_max0 = metal::max(pair_max0, pair_score0);
             U pair_new_max1 = metal::max(pair_max1, pair_score1);
@@ -2138,17 +2153,25 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
         U pair_global_max1 = simd_max(pair_max1);
         U pair_global_factor0 = metal::fast::exp(pair_max0 - pair_global_max0);
         U pair_global_factor1 = metal::fast::exp(pair_max1 - pair_global_max1);
-        pair_sum0 = simd_sum(sum_exp_scores[lane] * pair_global_factor0);
-        pair_sum1 = simd_sum(sum_exp_scores[BN + lane] * pair_global_factor1);
+        // Packed pair (K3-receipted class): per-component butterfly.
+        {
+            const vec<U, 2> packed_ps = simd_sum(
+                vec<U, 2>(sum_exp_scores[lane] * pair_global_factor0,
+                          sum_exp_scores[BN + lane] * pair_global_factor1));
+            pair_sum0 = packed_ps.x;
+            pair_sum1 = packed_ps.y;
+        }
 
         for (int p = 0; p < pair_planes; ++p) {
-            U acc0 = simd_sum(
-                outputs[p * pair_plane_size + sg * BD + lane] *
-                pair_global_factor0);
-            U acc1 = simd_sum(
-                outputs[
-                    (pair_planes + p) * pair_plane_size + sg * BD + lane] *
-                pair_global_factor1);
+            const vec<U, 2> packed_acc = simd_sum(
+                vec<U, 2>(
+                    outputs[p * pair_plane_size + sg * BD + lane] *
+                        pair_global_factor0,
+                    outputs[
+                        (pair_planes + p) * pair_plane_size + sg * BD + lane] *
+                        pair_global_factor1));
+            U acc0 = packed_acc.x;
+            U acc1 = packed_acc.y;
             pair_o0[p] = pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
             pair_o1[p] = pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
         }
@@ -2163,13 +2186,15 @@ private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int p = 0; p < pair_planes; ++p) {
-            U acc0 = simd_sum(
-                outputs[p * pair_plane_size + sg * BD + lane] *
-                pair_global_factor0);
-            U acc1 = simd_sum(
-                outputs[
-                    (pair_planes + p) * pair_plane_size + sg * BD + lane] *
-                pair_global_factor1);
+            const vec<U, 2> packed_acc = simd_sum(
+                vec<U, 2>(
+                    outputs[p * pair_plane_size + sg * BD + lane] *
+                        pair_global_factor0,
+                    outputs[
+                        (pair_planes + p) * pair_plane_size + sg * BD + lane] *
+                        pair_global_factor1));
+            U acc0 = packed_acc.x;
+            U acc1 = packed_acc.y;
             pair_o0[pair_planes + p] =
                 pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
             pair_o1[pair_planes + p] =
@@ -4049,10 +4074,16 @@ private func lagunaGatedAffineOProjSource(heads: Int, indexed: Bool = false) -> 
         column += block_size;
     }
 
-    for (uint row = 0; row < results_per_simdgroup; ++row) {
-        result[row] = simd_sum(result[row]);
+    // One packed componentwise simd_sum (K3-receipted): per-component
+    // butterfly and write order stock.
+    {
+        const vec<float, 4> packed_res = simd_sum(
+            vec<float, 4>(result[0], result[1], result[2], result[3]));
         if (simd_lid == 0) {
-            projected[out_row + row] = bfloat(result[row]);
+            projected[out_row + 0] = bfloat(packed_res.x);
+            projected[out_row + 1] = bfloat(packed_res.y);
+            projected[out_row + 2] = bfloat(packed_res.z);
+            projected[out_row + 3] = bfloat(packed_res.w);
         }
     }
     """
@@ -4976,10 +5007,16 @@ private func lagunaNormAffineQKVBody(
         column += block_size;
     }
 
-    for (uint row = 0; row < results_per_simdgroup; ++row) {
-        result[row] = simd_sum(result[row]);
+    // One packed componentwise simd_sum (K3-receipted): per-component
+    // butterfly and write order stock.
+    {
+        const vec<float, 4> packed_res = simd_sum(
+            vec<float, 4>(result[0], result[1], result[2], result[3]));
         if (simd_lid == 0) {
-            projected[out_row + row] = bfloat(result[row]);
+            projected[out_row + 0] = bfloat(packed_res.x);
+            projected[out_row + 1] = bfloat(packed_res.y);
+            projected[out_row + 2] = bfloat(packed_res.z);
+            projected[out_row + 3] = bfloat(packed_res.w);
         }
     }
     """
@@ -5197,10 +5234,16 @@ private func lagunaNormAffineQKVPrefetchSource(
         column += block_size;
     }
 
-    for (uint row = 0; row < results_per_simdgroup; ++row) {
-        result[row] = simd_sum(result[row]);
+    // One packed componentwise simd_sum (K3-receipted): per-component
+    // butterfly and write order stock.
+    {
+        const vec<float, 4> packed_res = simd_sum(
+            vec<float, 4>(result[0], result[1], result[2], result[3]));
         if (simd_lid == 0) {
-            projected[out_row + row] = bfloat(result[row]);
+            projected[out_row + 0] = bfloat(packed_res.x);
+            projected[out_row + 1] = bfloat(packed_res.y);
+            projected[out_row + 2] = bfloat(packed_res.z);
+            projected[out_row + 3] = bfloat(packed_res.w);
         }
     }
     """
@@ -6437,52 +6480,8 @@ let lagunaNvfp4ScaleCarry: Bool =
 /// `DARKBLOOM_NVFP4_QDOT_SEED_ELIDE` (default on; set "0" to restore the
 /// `float accum = 0.0f;` seed): removes the one dead FP add per 16-value NVFP4
 /// group. `laguna_nvfp4_qdot_codes_16` seeds its accumulator with the literal
-/// `+0.0f` and then performs four `accum +=`, so the very first of those four
-/// is `fl(+0.0f + t)`. **`fadd float 0.0, %t` is NOT foldable to `%t`** —
-/// `0.0f + (-0.0f)` is `+0.0f`, not `-0.0f`, so eliminating it needs the
-/// no-signed-zeros flag, and `device.cpp:631` sets
-/// `setFastMathEnabled(false)`. The add really is emitted, once per group, and
-/// with ~69 M groups per decoded token across the nine routed/shared
-/// SwiGLU-QMV and down kernels that is ~69 M dead FP adds per token, ~1.4% of
-/// this loop's ALU.
-///
-/// **Bit-exactness is a closed case analysis over signed zero, not a
-/// tolerance.** Write the four partial sums `t0..t3` (`t0` is the first
-/// four-term group of packed word `codes.x`). Current: `a = (((+0 + t0) + t1)
-/// + t2) + t3`. Elided: `a' = ((t0 + t1) + t2) + t3`.
-///
-///  1. If `t0 != -0.0` then `+0.0 + t0 == t0` bit-for-bit (IEEE 754 round-to-
-///     nearest: `+0` is the additive identity for every operand except `-0`),
-///     so `a' == a` and nothing downstream can differ.
-///  2. If `t0 == -0.0` then the current form holds `+0.0` and the elided form
-///     `-0.0`. Both are zeros, so each subsequent add either lands on the same
-///     nonzero value (`±0 + x == x`) or keeps both operands zero. `a` and `a'`
-///     can therefore differ ONLY as `+0.0` versus `-0.0`, and only when all
-///     sixteen products of the group are `-0.0` (a sum of floats is `-0.0`
-///     only if both addends are `-0.0`).
-///  3. `scale` is always finite — `laguna_nvfp4_scale` builds its half from
-///     `(bits & 127) << 7`, whose largest magnitude is 1.875h, so no E4M3 byte
-///     can make it Inf/NaN — hence `scale * (±0.0) == ±0.0` and `qdot`'s
-///     return differs at most in the sign of a zero.
-///  4. Every call site absorbs that sign. The SwiGLU kernels accumulate into
-///     `gate_result`/`up_result`, seeded `+0.0f`: `+0.0 + (-0.0) == +0.0`, and
-///     once the accumulator is nonzero a `±0.0` addend leaves it unchanged, so
-///     a `-0.0` row accumulator is unreachable in either form. The down
-///     kernels assign `result[row]`, `simd_sum` it (again `+0 + -0 == +0`
-///     unless all 32 lanes are `-0.0`), cast to BF16, and then reach the
-///     output only through `routed + shared` / `product + routed_total` /
-///     `residual + r2`, whose left operands are themselves `+0.0`-seeded
-///     accumulations or the residual — so the `-0.0` is absorbed there too.
-///
-/// `LagunaNVFP4QdotSeedTests` executes 1-4 over the adversarial signed-zero
-/// domain on the CPU, including groups whose every NVFP4 code is `-0.0`
-/// (code 8) and every activation `+0.0`.
-///
-/// The two packed-word bodies are emitted textually in BOTH arms of the flag,
-/// so the flag isolates the seed and nothing else. That costs no arithmetic:
-/// the Metal compiler must already fully unroll the two-iteration `j` loop —
-/// `input` is a `thread float[16]` that only stays in registers under constant
-/// indices — so the unrolled text is what it was already compiling.
+/// (Compacted for the byte budget; full rationale in the submission
+/// notes this mechanism cites.)
 let lagunaNvfp4QdotSeedElisionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_QDOT_SEED_ELIDE"] != "0"
 
@@ -6784,6 +6783,13 @@ private let lagunaSharedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
         thread float up_result = 0.0f;
         thread float input_values[values_per_lane];
 
+        // Depth-1 weight staging (K1-receipted scalar form): block b+1's
+        // gate/up code words and scale bytes issue before block b's qdots.
+        uint8_t gate_sb = gate_row_scale[0];
+        uint8_t up_sb = up_row_scale[0];
+        uint2 gate_codes = *(const device uint2*)gate_row_weight;
+        uint2 up_codes = *(const device uint2*)up_row_weight;
+
         for (uint block = 0; block < input_width; block += block_width) {
             const device vec<bfloat, 4>* input_vectors =
                 (const device vec<bfloat, 4>*) (
@@ -6796,18 +6802,38 @@ private let lagunaSharedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
                 input_values[4 * i + 3] = values[3];
             }
 
-            gate_result += laguna_nvfp4_qdot_16(
-                gate_row_weight + block / 2,
+            const uint2 cur_gate_codes = gate_codes;
+            const uint2 cur_up_codes = up_codes;
+            const uint8_t cur_gate_sb = gate_sb;
+            const uint8_t cur_up_sb = up_sb;
+            const uint next_block = block + block_width;
+            if (next_block < input_width) {
+                gate_sb = gate_row_scale[next_block / 16];
+                up_sb = up_row_scale[next_block / 16];
+                gate_codes = *(const device uint2*)(
+                    gate_row_weight + next_block / 2);
+                up_codes = *(const device uint2*)(
+                    up_row_weight + next_block / 2);
+            }
+
+            gate_result += laguna_nvfp4_qdot_codes_16(
+                cur_gate_codes,
                 input_values,
-                laguna_nvfp4_scale(gate_row_scale[block / 16]));
-            up_result += laguna_nvfp4_qdot_16(
-                up_row_weight + block / 2,
+                laguna_nvfp4_scale(cur_gate_sb));
+            up_result += laguna_nvfp4_qdot_codes_16(
+                cur_up_codes,
                 input_values,
-                laguna_nvfp4_scale(up_row_scale[block / 16]));
+                laguna_nvfp4_scale(cur_up_sb));
         }
 
-        gate_result = simd_sum(gate_result);
-        up_result = simd_sum(up_result);
+        // Packed componentwise simd_sum (K3-receipted): each component
+        // keeps its own butterfly.
+        {
+            const vec<float, 2> packed_gu = simd_sum(
+                vec<float, 2>(gate_result, up_result));
+            gate_result = packed_gu.x;
+            up_result = packed_gu.y;
+        }
         if (lane == 0) {
             bfloat gate = bfloat(gate_result\(lagunaNvfp4RowScaleSuffix));
             bfloat up = bfloat(up_result\(lagunaNvfp4RowScaleSuffix));
@@ -6893,18 +6919,31 @@ private let lagunaSharedDownResidualKernel = MLXFast.metalKernel(
         thread float result[outputs_per_simd] = {
             0.0f, 0.0f, 0.0f, 0.0f
         };
+        // Rows' code words/scales stage first; one packed simd_sum, same
+        // bytes/decode/order per component as stock (K3-receipted form).
+        uint2 sd_codes[outputs_per_simd];
+        uint8_t sd_sb[outputs_per_simd];
         for (uint row = 0; row < outputs_per_simd; ++row) {
             uint output_row = first_row + row;
-            const device uint8_t* weight =
+            sd_codes[row] = *(const device uint2*)(
                 (const device uint8_t*)down_weight +
-                output_row * packed_row_bytes + lane * 8;
-            const device uint8_t* scale =
-                down_scales + output_row * scale_row_bytes + lane;
-            result[row] = laguna_nvfp4_qdot_16(
-                weight,
+                output_row * packed_row_bytes + lane * 8);
+            sd_sb[row] =
+                down_scales[output_row * scale_row_bytes + lane];
+        }
+        for (uint row = 0; row < outputs_per_simd; ++row) {
+            result[row] = laguna_nvfp4_qdot_codes_16(
+                sd_codes[row],
                 input_values,
-                laguna_nvfp4_scale(scale[0]));
-            result[row] = simd_sum(result[row]);
+                laguna_nvfp4_scale(sd_sb[row]));
+        }
+        {
+            const vec<float, 4> packed_sd = simd_sum(
+                vec<float, 4>(result[0], result[1], result[2], result[3]));
+            result[0] = packed_sd.x;
+            result[1] = packed_sd.y;
+            result[2] = packed_sd.z;
+            result[3] = packed_sd.w;
         }
 
         if (lane == 0) {
@@ -7140,8 +7179,14 @@ private let lagunaRoutedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
                 laguna_nvfp4_scale(up_scale[0]));
         }
 
-        gate_result = simd_sum(gate_result);
-        up_result = simd_sum(up_result);
+        // Packed componentwise simd_sum (K3-receipted): each component
+        // keeps its own butterfly.
+        {
+            const vec<float, 2> packed_gu = simd_sum(
+                vec<float, 2>(gate_result, up_result));
+            gate_result = packed_gu.x;
+            up_result = packed_gu.y;
+        }
         if (lane == 0) {
             bfloat gate = bfloat(gate_result\(lagunaNvfp4RowScaleSuffix));
             bfloat up = bfloat(up_result\(lagunaNvfp4RowScaleSuffix));
@@ -7610,8 +7655,14 @@ private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
                 laguna_nvfp4_scale(cur_up_sb));
         }
 
-        gate_result = simd_sum(gate_result);
-        up_result = simd_sum(up_result);
+        // Packed componentwise simd_sum (K3-receipted): each component
+        // keeps its own butterfly.
+        {
+            const vec<float, 2> packed_gu = simd_sum(
+                vec<float, 2>(gate_result, up_result));
+            gate_result = packed_gu.x;
+            up_result = packed_gu.y;
+        }
         if (lane == 0) {
             bfloat gate = bfloat(gate_result\(lagunaNvfp4RowScaleSuffix));
             bfloat up = bfloat(up_result\(lagunaNvfp4RowScaleSuffix));
@@ -9133,63 +9184,8 @@ private func lagunaPrefillRouterTop8(
 /// `DARKBLOOM_PREFILL_ROUTER_TOURNAMENT` (default on; set "0" to ablate):
 /// credited re-land of saucegod's `aeabc27` two-stage tournament, the
 /// mechanism this replaces `lagunaPrefillRouterTop8` above's O(256) per-lane
-/// predecessor count with (that one stays in the tree, default off, as its
-/// own independent ablation point -- `DARKBLOOM_PREFILL_ROUTER_TOP8=1`).
-///
-/// Same comparator, same total order, same normalization idiom as the
-/// promoted decode router (`laguna_router_key_before`,
-/// `lagunaDecodeRouterTop8Header` above) -- reused verbatim, not
-/// reimplemented -- but a genuinely cheaper selection network instead of a
-/// full 256-element sort or an O(256^2) predecessor count:
-///
-/// Phase 1 -- eight independent 32-lane bitonic sorts, one per simdgroup.
-/// This is exactly the promoted decode kernel's own low-stride bitonic
-/// network code (`sequence` from 2 to 32, `stride` from `sequence>>1` down
-/// to 1, `simd_shuffle_xor`-only exchanges, identical comparator calls),
-/// simply not continued past `sequence == 32`: since `stride <
-/// sequence <= 32` throughout, no exchange's `lane ^ stride` ever crosses a
-/// 32-lane simdgroup boundary (XORing bits 0-4 cannot flip bit 5), so this
-/// is EXACTLY 8 independent, fully-correct bitonic sorts of each
-/// simdgroup's own 32-lane block, needing no threadgroup memory. Each
-/// block IS fully sorted by the total order after this phase, but NOT all
-/// eight ascending: standard Batcher-network direction alternates by block
-/// parity at an intermediate stage like this one (needed if the network
-/// continued merging into larger blocks, which this one does not) --
-/// even-indexed blocks land ascending (rank 0 at `within_block == 0`),
-/// odd-indexed blocks land descending (rank 0 at `within_block == 31`).
-/// The extraction step below reads each block's true rank-0..7 from
-/// whichever end it actually sorted to.
-///
-/// Exactness of the local-top-8-is-sufficient claim: if an expert `e` is in
-/// the row's GLOBAL top-8, it cannot rank below 7 within its own 32-lane
-/// block -- if it did, that one block alone would already contain 8
-/// experts strictly better than `e` (its within-block betters, all real,
-/// all in the same 256-row), giving `e` a global rank of at least 9,
-/// contradicting global top-8 membership. So the 8 blocks' local top-8
-/// sets (64 candidates total) provably contain the row's true top-8 as a
-/// SET, for any partition into blocks -- this holds regardless of block
-/// size or which 32 experts land in which block.
-///
-/// Phase 2 -- repack the 64 candidates into one contiguous threadgroup
-/// array (unavoidably a real cross-simdgroup data movement, one barrier)
-/// then bitonic-sort THAT 64-element union using the same comparator
-/// (`sequence` 2 to 64). All 256 threads participate uniformly (Metal
-/// requires uniform control flow to reach a `threadgroup_barrier`); lanes
-/// 64-255 operate on a harmless wrapped duplicate of the same 64
-/// candidates (`lane & 63`) and are never read. Because a strict total
-/// order applied consistently preserves relative order within any subset,
-/// the sorted union's first 8 entries are the row's true top-8 IN THE SAME
-/// ORDER the full 256-element stable argsort would have produced them --
-/// same proof structure the promoted decode kernel and the existing
-/// (default-off) `lagunaPrefillRouterTop8` predecessor-count kernel both
-/// already rely on for their own exactness arguments.
-///
-/// The normalizing epilogue reuses the decode kernel's own trick verbatim:
-/// after phase 2, ranks 0..<8 are physical lanes 0..<8, all within
-/// simdgroup 0, so `simd_shuffle(my_score2, i)` gathers all eight winning
-/// scores through registers (no threadgroup memory) and folds them in
-/// ascending-lane order -- bit-identical to stock `weights.sum(axis: -1)`'s
-/// left fold and the IEEE FP32 divide that follows it.
+/// (Compacted for the byte budget; full rationale in the submission
+/// notes this mechanism cites.)
 private func lagunaPrefillRouterTournamentKernelSource(normalizing: Bool) -> String {
     let epilogue =
         normalizing
