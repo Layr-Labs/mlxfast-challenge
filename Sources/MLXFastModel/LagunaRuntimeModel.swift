@@ -2292,18 +2292,16 @@ func lagunaFullFusedAttention(
     )[0]
 }
 
-/// `DARKBLOOM_FULL_ATTN_PARAMS_MEMO=1` enables. MEASURED on a 6+6 paired
-/// local A/B: means 9159.7 on vs 9177.1 off, 17.4 us (0.19%) in the
-/// mechanism's favour but a permutation test puts that at p = 0.29 — i.e.
-/// indistinguishable from noise on this box. Kept default OFF; the ten
-/// full-attention layers of one decode forward share
-/// the same `(writeIdx, capacity)` pair, so a one-entry last-key cache
-/// removes nine redundant three-element array nodes per forward. Mechanism
-/// ported with credit from submission `acea9e92` (PR 1395). No request
-/// output is retained: the cached array is a pure function of two integers
-/// that the caller already holds.
+/// `DARKBLOOM_FULL_ATTN_PARAMS_MEMO=0` disables. The ten full-attention layers
+/// of one decode forward share the same `(writeIdx, capacity)` pair, so a
+/// one-entry last-key cache removes nine redundant three-element array nodes
+/// per forward. The earlier implementation constructed `fresh` before its
+/// cache-hit check, accidentally paying the very MLXArray construction it was
+/// intended to remove on every hit. Check the key first and allocate only on
+/// a miss. No request output is retained: the cached array is a pure function
+/// of two host offsets that the caller already holds.
 private let lagunaFullAttnParamsMemoEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_FULL_ATTN_PARAMS_MEMO"] == "1"
+    ProcessInfo.processInfo.environment["DARKBLOOM_FULL_ATTN_PARAMS_MEMO"] != "0"
 
 private enum LagunaFullAttnParamsMemoStore {
     nonisolated(unsafe) static var writeIdx = -1
@@ -2312,16 +2310,20 @@ private enum LagunaFullAttnParamsMemoStore {
 }
 
 private func lagunaFullAttnParams(writeIdx: Int, capacity: Int) -> MLXArray {
-    let fresh = MLXArray([
-        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
-    ])
-    guard lagunaFullAttnParamsMemoEnabled else { return fresh }
+    guard lagunaFullAttnParamsMemoEnabled else {
+        return MLXArray([
+            UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
+        ])
+    }
     if LagunaFullAttnParamsMemoStore.writeIdx == writeIdx,
         LagunaFullAttnParamsMemoStore.capacity == capacity,
         let cached = LagunaFullAttnParamsMemoStore.params
     {
         return cached
     }
+    let fresh = MLXArray([
+        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
+    ])
     LagunaFullAttnParamsMemoStore.writeIdx = writeIdx
     LagunaFullAttnParamsMemoStore.capacity = capacity
     LagunaFullAttnParamsMemoStore.params = fresh
@@ -6434,88 +6436,15 @@ let lagunaNvfp4NibbleSplit: Int = {
 let lagunaNvfp4ScaleCarry: Bool =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_CARRY"] != "0"
 
-/// `DARKBLOOM_NVFP4_QDOT_SEED_ELIDE` (default on; set "0" to restore the
-/// `float accum = 0.0f;` seed): removes the one dead FP add per 16-value NVFP4
-/// group. `laguna_nvfp4_qdot_codes_16` seeds its accumulator with the literal
-/// `+0.0f` and then performs four `accum +=`, so the very first of those four
-/// is `fl(+0.0f + t)`. **`fadd float 0.0, %t` is NOT foldable to `%t`** —
-/// `0.0f + (-0.0f)` is `+0.0f`, not `-0.0f`, so eliminating it needs the
-/// no-signed-zeros flag, and `device.cpp:631` sets
-/// `setFastMathEnabled(false)`. The add really is emitted, once per group, and
-/// with ~69 M groups per decoded token across the nine routed/shared
-/// SwiGLU-QMV and down kernels that is ~69 M dead FP adds per token, ~1.4% of
-/// this loop's ALU.
-///
-/// **Bit-exactness is a closed case analysis over signed zero, not a
-/// tolerance.** Write the four partial sums `t0..t3` (`t0` is the first
-/// four-term group of packed word `codes.x`). Current: `a = (((+0 + t0) + t1)
-/// + t2) + t3`. Elided: `a' = ((t0 + t1) + t2) + t3`.
-///
-///  1. If `t0 != -0.0` then `+0.0 + t0 == t0` bit-for-bit (IEEE 754 round-to-
-///     nearest: `+0` is the additive identity for every operand except `-0`),
-///     so `a' == a` and nothing downstream can differ.
-///  2. If `t0 == -0.0` then the current form holds `+0.0` and the elided form
-///     `-0.0`. Both are zeros, so each subsequent add either lands on the same
-///     nonzero value (`±0 + x == x`) or keeps both operands zero. `a` and `a'`
-///     can therefore differ ONLY as `+0.0` versus `-0.0`, and only when all
-///     sixteen products of the group are `-0.0` (a sum of floats is `-0.0`
-///     only if both addends are `-0.0`).
-///  3. `scale` is always finite — `laguna_nvfp4_scale` builds its half from
-///     `(bits & 127) << 7`, whose largest magnitude is 1.875h, so no E4M3 byte
-///     can make it Inf/NaN — hence `scale * (±0.0) == ±0.0` and `qdot`'s
-///     return differs at most in the sign of a zero.
-///  4. Every call site absorbs that sign. The SwiGLU kernels accumulate into
-///     `gate_result`/`up_result`, seeded `+0.0f`: `+0.0 + (-0.0) == +0.0`, and
-///     once the accumulator is nonzero a `±0.0` addend leaves it unchanged, so
-///     a `-0.0` row accumulator is unreachable in either form. The down
-///     kernels assign `result[row]`, `simd_sum` it (again `+0 + -0 == +0`
-///     unless all 32 lanes are `-0.0`), cast to BF16, and then reach the
-///     output only through `routed + shared` / `product + routed_total` /
-///     `residual + r2`, whose left operands are themselves `+0.0`-seeded
-///     accumulations or the residual — so the `-0.0` is absorbed there too.
-///
-/// `LagunaNVFP4QdotSeedTests` executes 1-4 over the adversarial signed-zero
-/// domain on the CPU, including groups whose every NVFP4 code is `-0.0`
-/// (code 8) and every activation `+0.0`.
-///
-/// The two packed-word bodies are emitted textually in BOTH arms of the flag,
-/// so the flag isolates the seed and nothing else. That costs no arithmetic:
-/// the Metal compiler must already fully unroll the two-iteration `j` loop —
-/// `input` is a `thread float[16]` that only stays in registers under constant
-/// indices — so the unrolled text is what it was already compiling.
+/// Remove the first +0.0 add in each NVFP4 qdot group. Signed-zero equivalence
+/// is covered by `LagunaNVFP4QdotSeedTests`; the submission note retains the
+/// full case proof. Set `DARKBLOOM_NVFP4_QDOT_SEED_ELIDE=0` to restore it.
 let lagunaNvfp4QdotSeedElisionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_QDOT_SEED_ELIDE"] != "0"
 
-/// `DARKBLOOM_NVFP4_SCALE_DEFER` (default ON; set "0" to restore): moves
-/// the `2^22` that `DARKBLOOM_NVFP4_SCALE_FOLD` parked in
-/// `laguna_nvfp4_scale` out of the per-group scale and onto the per-row
-/// accumulator, one multiply per output row instead of one per 16-value
-/// group. `laguna_nvfp4_scale` drops from five ops to four (and, add, shift,
-/// convert) and the group cost falls by one FP multiply -- the same ~69 M
-/// removals per decoded token as the seed elision above.
-///
-/// Off by default **on purpose**. Unlike the seed elision, the carry sign-fold
-/// and the nibble split, this one is not exact by case analysis: it is exact
-/// under a range condition. Multiplying by an exact power of two is exact and
-/// commutes with rounding, so with `s' = scale * 2^-22` every group product
-/// `fl(s' * accum)` is exactly `2^-22 * fl(scale * accum)`, every partial sum
-/// of those products is exactly `2^-22` times the current one, and the single
-/// epilogue multiply restores it before the one BF16 rounding -- **provided no
-/// product lands in the FP32 subnormal range**, where scaling no longer
-/// commutes with rounding.
-///
-/// The condition, stated exactly: the deferred form diverges only if some
-/// group has `0 < |scale * accum| < 2^-104`. `s'` is at least `2^-17` (the
-/// smallest nonzero E4M3 byte, `2^-9`, over 256), so that needs
-/// `|accum| < 2^-109`; every NVFP4 weight is a multiple of `2^-15` and every
-/// activation is BF16, so a nonzero `accum` below `2^-109` needs all sixteen
-/// activations of the group below roughly `2^-99`. This model cannot produce
-/// them: activations are BF16 roundings of `O(1)` residual-stream and RMSNorm
-/// quantities, and cancellation in BF16 lands on that same coarse grid, so a
-/// hidden value is either exactly zero (which contributes an exact zero and is
-/// safe) or within a few tens of binades of the row's scale. The margin is
-/// ~60 binades — promoted to the shipped default on that basis; the
-/// exact-token gates fail loudly if the range assumption is ever violated.
+/// Defer the folded scale's 2^22 from every NVFP4 group to each output row.
+/// The promoted range proof excludes the only divergent case: a nonzero
+/// product entering the FP32 subnormal range. Set the flag to 0 to restore.
 let lagunaNvfp4ScaleDeferEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_NVFP4_SCALE_DEFER"] != "0"
     && lagunaNvfp4ScaleFoldEnabled
@@ -6784,6 +6713,12 @@ private let lagunaSharedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
         thread float up_result = 0.0f;
         thread float input_values[values_per_lane];
 
+        // Stage block b+1's code words and scales before block b's qdots.
+        uint8_t gate_sb = gate_row_scale[0];
+        uint8_t up_sb = up_row_scale[0];
+        uint2 gate_codes = *(const device uint2*)gate_row_weight;
+        uint2 up_codes = *(const device uint2*)up_row_weight;
+
         for (uint block = 0; block < input_width; block += block_width) {
             const device vec<bfloat, 4>* input_vectors =
                 (const device vec<bfloat, 4>*) (
@@ -6796,18 +6731,36 @@ private let lagunaSharedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
                 input_values[4 * i + 3] = values[3];
             }
 
-            gate_result += laguna_nvfp4_qdot_16(
-                gate_row_weight + block / 2,
+            const uint2 cur_gate_codes = gate_codes;
+            const uint2 cur_up_codes = up_codes;
+            const uint8_t cur_gate_sb = gate_sb;
+            const uint8_t cur_up_sb = up_sb;
+            const uint next_block = block + block_width;
+            if (next_block < input_width) {
+                gate_sb = gate_row_scale[next_block / 16];
+                up_sb = up_row_scale[next_block / 16];
+                gate_codes = *(const device uint2*)(
+                    gate_row_weight + next_block / 2);
+                up_codes = *(const device uint2*)(
+                    up_row_weight + next_block / 2);
+            }
+
+            gate_result += laguna_nvfp4_qdot_codes_16(
+                cur_gate_codes,
                 input_values,
-                laguna_nvfp4_scale(gate_row_scale[block / 16]));
-            up_result += laguna_nvfp4_qdot_16(
-                up_row_weight + block / 2,
+                laguna_nvfp4_scale(cur_gate_sb));
+            up_result += laguna_nvfp4_qdot_codes_16(
+                cur_up_codes,
                 input_values,
-                laguna_nvfp4_scale(up_row_scale[block / 16]));
+                laguna_nvfp4_scale(cur_up_sb));
         }
 
-        gate_result = simd_sum(gate_result);
-        up_result = simd_sum(up_result);
+        {
+            const vec<float, 2> packed_gu = simd_sum(
+                vec<float, 2>(gate_result, up_result));
+            gate_result = packed_gu.x;
+            up_result = packed_gu.y;
+        }
         if (lane == 0) {
             bfloat gate = bfloat(gate_result\(lagunaNvfp4RowScaleSuffix));
             bfloat up = bfloat(up_result\(lagunaNvfp4RowScaleSuffix));
@@ -6893,18 +6846,29 @@ private let lagunaSharedDownResidualKernel = MLXFast.metalKernel(
         thread float result[outputs_per_simd] = {
             0.0f, 0.0f, 0.0f, 0.0f
         };
+        uint2 sd_codes[outputs_per_simd];
+        uint8_t sd_sb[outputs_per_simd];
         for (uint row = 0; row < outputs_per_simd; ++row) {
             uint output_row = first_row + row;
-            const device uint8_t* weight =
+            sd_codes[row] = *(const device uint2*)(
                 (const device uint8_t*)down_weight +
-                output_row * packed_row_bytes + lane * 8;
-            const device uint8_t* scale =
-                down_scales + output_row * scale_row_bytes + lane;
-            result[row] = laguna_nvfp4_qdot_16(
-                weight,
+                output_row * packed_row_bytes + lane * 8);
+            sd_sb[row] =
+                down_scales[output_row * scale_row_bytes + lane];
+        }
+        for (uint row = 0; row < outputs_per_simd; ++row) {
+            result[row] = laguna_nvfp4_qdot_codes_16(
+                sd_codes[row],
                 input_values,
-                laguna_nvfp4_scale(scale[0]));
-            result[row] = simd_sum(result[row]);
+                laguna_nvfp4_scale(sd_sb[row]));
+        }
+        {
+            const vec<float, 4> packed_sd = simd_sum(
+                vec<float, 4>(result[0], result[1], result[2], result[3]));
+            result[0] = packed_sd.x;
+            result[1] = packed_sd.y;
+            result[2] = packed_sd.z;
+            result[3] = packed_sd.w;
         }
 
         if (lane == 0) {
@@ -11214,7 +11178,10 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                 // logits, bit-identical to stock in every argmax-reachable
                 // slot. When enabled, prefill has already sliced to the last
                 // hidden row; decode always retains this pruner.
-                result = pruner.logits(hidden: hidden, lmHeadWeight: lmHead.weight)
+                result = pruner.logits(
+                    hidden: hidden,
+                    lmHeadWeight: lmHead.weight,
+                    useFusedRefinement: inputs.shape == [1, 1])
             } else {
                 result = lmHead(hidden)
             }
