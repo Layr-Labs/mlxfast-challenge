@@ -1590,6 +1590,41 @@ bool darkbloom_bsearch_hoist() {
   return v;
 }
 
+// DARKBLOOM_STAGE2_GATHER: overlap weight staging with the MMA chain in the
+// expert-aligned prefill gather-QMM (fp_gather_qmm_rhs_expert_nax). Stock
+// fuses the staging device loads, the nibble decode, and the threadgroup
+// stores into one step wedged between the WAR and RAW barriers, so every
+// thread waits out the device read latency with no arithmetic in flight,
+// K_it times per expert chunk.
+//
+//   0  stock fused staging (guarded blocks preprocess away byte-identically)
+//   1  split staging + two Ws buffers, one barrier per k iteration; costs
+//      2x threadgroup memory, so fewer threadgroups stay co-resident
+//   2  split staging + one Ws buffer, both barriers kept; the next tile's
+//      device reads are issued an iteration early and fly across the RAW
+//      barrier and the MMA chain, at zero occupancy cost
+//
+// Default 1. Parsed once per process; MUST stay in lockstep with the JIT
+// define injected in jit_kernels.cpp (get_qmm_nax_kernel calls this same
+// function), because the variant chooses the kernel's threadgroup
+// allocation as well as its loop shape.
+int darkbloom_stage2_gather_variant() {
+  static const int v = [] {
+    const std::string s = env::get_var("DARKBLOOM_STAGE2_GATHER", "");
+    if (s.empty()) {
+      return 1;
+    }
+    if (s == "0") {
+      return 0;
+    }
+    if (s == "1") {
+      return 1;
+    }
+    return 2;
+  }();
+  return v;
+}
+
 void gather_qmm_rhs_nax(
     const array& x_,
     const array& w_,
@@ -1686,27 +1721,25 @@ void gather_qmm_rhs_nax(
   // expert-aligned path that define targets -- the exact confound that made
   // the STAGE_WIDEST/WIDELD arms measure their own control (those function
   // constants only ever reached the non-expert kernel). "active" requires
-  // BOTH the flag and the expert path; a declining guard prints "inactive".
+  // BOTH a non-zero variant and the expert path; a declining guard prints
+  // "inactive". Printed unconditionally (once) so an official receipt log
+  // carries the resolved variant even when no trace env var is set.
   {
-    static const bool stage2_flag =
-        env::get_var("DARKBLOOM_STAGE2_GATHER", "") == "1";
-    static const bool trace_fusion =
-        env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1";
-    if (stage2_flag || trace_fusion) {
-      static std::once_flag stage2_once;
-      std::call_once(stage2_once, [&]() {
-        fprintf(
-            stderr,
-            "mlxfast: fusion %s: stage2_gather "
-            "(dispatch expert=%d egroups=%d N=%d K=%d M=%d)\n",
-            (stage2_flag && expert_aligned) ? "active" : "inactive",
-            int(expert_aligned),
-            egroups,
-            N,
-            K,
-            M);
-      });
-    }
+    static const int stage2_variant = darkbloom_stage2_gather_variant();
+    static std::once_flag stage2_once;
+    std::call_once(stage2_once, [&]() {
+      fprintf(
+          stderr,
+          "mlxfast: fusion %s: stage2_gather v%d "
+          "(dispatch expert=%d egroups=%d N=%d K=%d M=%d)\n",
+          (stage2_variant != 0 && expert_aligned) ? "active" : "inactive",
+          stage2_variant,
+          int(expert_aligned),
+          egroups,
+          N,
+          K,
+          M);
+    });
   }
 
   // DARKBLOOM_GATHER_XMAJOR ground truth at the DISPATCH site, same
