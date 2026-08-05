@@ -6670,6 +6670,36 @@ let lagunaSharedSwiGLUQMVHeader: String = {
     """
 }()
 
+/// `DARKBLOOM_MOE_OUTER_SEED_ELIDE` (default ON; `0` restores): peel outer
+/// `gate/up = 0; += qdot` seed on decode MoE SwiGLU QMVs (shared R1 + routed
+/// packed-top8 R1). Inner qdot already seed-elides per group; outer K-loop
+/// still zero-seeds. Closed signed-zero case; BF16 SiLU epilogue absorbs.
+let lagunaMoeOuterSeedElisionEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_MOE_OUTER_SEED_ELIDE"] != "0"
+
+/// Outer gate/up accumulate for one K-block qdot pair (block0 assign vs +=).
+private func lagunaMoeOuterQdotAccumulate(
+    seedElide: Bool,
+    gateExpr: String,
+    upExpr: String
+) -> String {
+    if seedElide {
+        return """
+            if (block == 0) {
+                gate_result = \(gateExpr);
+                up_result = \(upExpr);
+            } else {
+                gate_result += \(gateExpr);
+                up_result += \(upExpr);
+            }
+        """
+    }
+    return """
+            gate_result += \(gateExpr);
+            up_result += \(upExpr);
+    """
+}
+
 private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
     name: "laguna_shared_nvfp4_swiglu_qmv_bf16_v1",
     inputNames: ["input", "fused_weight", "fused_scales"],
@@ -6753,7 +6783,8 @@ private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
 /// One-output-row scheduling twin of `lagunaSharedSwiGLUQMVKernel`.
 /// Arithmetic is textually identical per row; only row ownership changes.
 private let lagunaSharedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
-    name: "laguna_shared_nvfp4_swiglu_qmv_rows1_bf16_v1",
+    name: "laguna_shared_nvfp4_swiglu_qmv_rows1_bf16_v1"
+        + (lagunaMoeOuterSeedElisionEnabled ? "_ose1" : ""),
     inputNames: ["input", "fused_weight", "fused_scales"],
     outputNames: ["activated"],
     source: """
@@ -6780,8 +6811,8 @@ private let lagunaSharedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
         const device uint8_t* up_row_scale =
             fused_scales + (row + output_width) * scale_row_bytes + lane;
 
-        thread float gate_result = 0.0f;
-        thread float up_result = 0.0f;
+        thread float gate_result\(lagunaMoeOuterSeedElisionEnabled ? "" : " = 0.0f");
+        thread float up_result\(lagunaMoeOuterSeedElisionEnabled ? "" : " = 0.0f");
         thread float input_values[values_per_lane];
 
         for (uint block = 0; block < input_width; block += block_width) {
@@ -6796,14 +6827,21 @@ private let lagunaSharedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
                 input_values[4 * i + 3] = values[3];
             }
 
-            gate_result += laguna_nvfp4_qdot_16(
-                gate_row_weight + block / 2,
-                input_values,
-                laguna_nvfp4_scale(gate_row_scale[block / 16]));
-            up_result += laguna_nvfp4_qdot_16(
-                up_row_weight + block / 2,
-                input_values,
-                laguna_nvfp4_scale(up_row_scale[block / 16]));
+        \(lagunaMoeOuterQdotAccumulate(
+            seedElide: lagunaMoeOuterSeedElisionEnabled,
+            gateExpr: """
+            laguna_nvfp4_qdot_16(
+                            gate_row_weight + block / 2,
+                            input_values,
+                            laguna_nvfp4_scale(gate_row_scale[block / 16]))
+            """,
+            upExpr: """
+            laguna_nvfp4_qdot_16(
+                            up_row_weight + block / 2,
+                            input_values,
+                            laguna_nvfp4_scale(up_row_scale[block / 16]))
+            """
+        ))
         }
 
         gate_result = simd_sum(gate_result);
@@ -7511,7 +7549,8 @@ let lagunaRoutedGateUpR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1"] != "0"
 
 private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v1",
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v1"
+        + (lagunaMoeOuterSeedElisionEnabled ? "_ose1" : ""),
     inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
     outputNames: ["activated"],
     source: """
@@ -7546,8 +7585,8 @@ private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
         uint gate_row = (logical_row / 32) * 64 + logical_row % 32;
         uint up_row = gate_row + 32;
 
-        thread float gate_result = 0.0f;
-        thread float up_result = 0.0f;
+        thread float gate_result\(lagunaMoeOuterSeedElisionEnabled ? "" : " = 0.0f");
+        thread float up_result\(lagunaMoeOuterSeedElisionEnabled ? "" : " = 0.0f");
         thread float input_values[values_per_lane];
 
         // Depth-1 weight staging: block b+1's gate/up code words (the same
@@ -7602,12 +7641,19 @@ private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
                     + next_block / 2 + lane * 8);
             }
 
-            gate_result += laguna_nvfp4_qdot_codes_16(
-                cur_gate_codes, input_values,
-                laguna_nvfp4_scale(cur_gate_sb));
-            up_result += laguna_nvfp4_qdot_codes_16(
-                cur_up_codes, input_values,
-                laguna_nvfp4_scale(cur_up_sb));
+        \(lagunaMoeOuterQdotAccumulate(
+            seedElide: lagunaMoeOuterSeedElisionEnabled,
+            gateExpr: """
+            laguna_nvfp4_qdot_codes_16(
+                            cur_gate_codes, input_values,
+                            laguna_nvfp4_scale(cur_gate_sb))
+            """,
+            upExpr: """
+            laguna_nvfp4_qdot_codes_16(
+                            cur_up_codes, input_values,
+                            laguna_nvfp4_scale(cur_up_sb))
+            """
+        ))
         }
 
         gate_result = simd_sum(gate_result);
