@@ -8031,8 +8031,87 @@ func lagunaRoutedSharedDownResidual(
 // 8192) minus its gate multiply, with `lagunaSharedDownResidualKernel`'s
 // round-then-add-then-round epilogue reproducing stock `h + r2`
 // bit-for-bit.
+
+/// `DARKBLOOM_DENSE_SEED_ELIDE` (default ON; set "0" to restore): peels the
+/// dead `+0.0f` seed on layer-0 dense BF16 GEMVs (`gate/up` SwiGLU and
+/// `down+residual`). Same closed signed-zero case as
+/// `DARKBLOOM_SEED_ELIDE_RESIDUAL` / NVFP4 qdot seed elision: the first
+/// product of the first K-block assigns the accumulator instead of adding to
+/// a zero seed. Only a pure `-0.0` first product can differ, and the BF16
+/// epilogue (SiLU/up product, or `residual + down`) absorbs it. Layer 0 runs
+/// every decode step; this is pure ALU with unchanged bytes, geometry, and
+/// reduction order (shuffle-down trees untouched).
+let lagunaDenseSeedElisionEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_DENSE_SEED_ELIDE"] != "0"
+
+/// Dense gate/up inner product for one 4-wide weight/activation chunk.
+/// Seed-elided arm assigns the first product on `block == 0`, then adds;
+/// later blocks always add. OFF arm is the stock always-`+=` text.
+private func lagunaDenseGateUpChunkBody(seedElide: Bool) -> String {
+    if seedElide {
+        return """
+                        if (block == 0) {
+                            gate_result[row] = float(gw[0]) * coefficients[0];
+                            up_result[row] = float(uw[0]) * coefficients[0];
+                            for (uint i = 1; i < values_per_thread; ++i) {
+                                gate_result[row] += float(gw[i]) * coefficients[i];
+                                up_result[row] += float(uw[i]) * coefficients[i];
+                            }
+                        } else {
+                            for (uint i = 0; i < values_per_thread; ++i) {
+                                gate_result[row] += float(gw[i]) * coefficients[i];
+                                up_result[row] += float(uw[i]) * coefficients[i];
+                            }
+                        }
+        """
+    }
+    return """
+                        for (uint i = 0; i < values_per_thread; ++i) {
+                            gate_result[row] += float(gw[i]) * coefficients[i];
+                            up_result[row] += float(uw[i]) * coefficients[i];
+                        }
+    """
+}
+
+private func lagunaDenseDownChunkBody(seedElide: Bool) -> String {
+    if seedElide {
+        return """
+                        if (block == 0) {
+                            result[row] = float(w[0]) * coefficients[0];
+                            for (uint i = 1; i < values_per_thread; ++i) {
+                                result[row] += float(w[i]) * coefficients[i];
+                            }
+                        } else {
+                            for (uint i = 0; i < values_per_thread; ++i) {
+                                result[row] += float(w[i]) * coefficients[i];
+                            }
+                        }
+        """
+    }
+    return """
+                        for (uint i = 0; i < values_per_thread; ++i) {
+                            result[row] += float(w[i]) * coefficients[i];
+                        }
+    """
+}
+
+private let lagunaDenseGateUpResultDecl = lagunaDenseSeedElisionEnabled
+    ? """
+        thread float gate_result[rows_per_thread];
+        thread float up_result[rows_per_thread];
+    """
+    : """
+        thread float gate_result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
+        thread float up_result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
+    """
+
+private let lagunaDenseDownResultDecl = lagunaDenseSeedElisionEnabled
+    ? "thread float result[rows_per_thread];"
+    : "thread float result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};"
+
 private let lagunaDenseGateUpSwiGLUKernel = MLXFast.metalKernel(
-    name: "laguna_dense_gate_up_swiglu_bf16_v1",
+    name: "laguna_dense_gate_up_swiglu_bf16_v1"
+        + (lagunaDenseSeedElisionEnabled ? "_se1" : ""),
     inputNames: ["input", "fused_weight"],
     outputNames: ["activated"],
     source: """
@@ -8050,8 +8129,7 @@ private let lagunaDenseGateUpSwiGLUKernel = MLXFast.metalKernel(
 
         uint row_base = tile * rows_per_group + simd_group * rows_per_thread;
 
-        thread float gate_result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
-        thread float up_result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
+        \(lagunaDenseGateUpResultDecl)
         thread float coefficients[values_per_thread];
 
         uint column = lane * values_per_thread;
@@ -8075,10 +8153,7 @@ private let lagunaDenseGateUpSwiGLUKernel = MLXFast.metalKernel(
                         fused_weight +
                         (output_width + row_base + row) * in_vec_size + column);
                 const vec<bfloat, 4> uw = up_row_values[0];
-                for (uint i = 0; i < values_per_thread; ++i) {
-                    gate_result[row] += float(gw[i]) * coefficients[i];
-                    up_result[row] += float(uw[i]) * coefficients[i];
-                }
+        \(lagunaDenseGateUpChunkBody(seedElide: lagunaDenseSeedElisionEnabled))
             }
             column += block_width;
         }
@@ -8131,7 +8206,8 @@ func lagunaDenseGateUpSwiGLU(
 }
 
 private let lagunaDenseDownResidualKernel = MLXFast.metalKernel(
-    name: "laguna_dense_down_residual_bf16_v1",
+    name: "laguna_dense_down_residual_bf16_v1"
+        + (lagunaDenseSeedElisionEnabled ? "_se1" : ""),
     inputNames: ["activated", "down_weight", "residual"],
     outputNames: ["output"],
     source: """
@@ -8148,7 +8224,7 @@ private let lagunaDenseDownResidualKernel = MLXFast.metalKernel(
 
         uint row_base = tile * rows_per_group + simd_group * rows_per_thread;
 
-        thread float result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
+        \(lagunaDenseDownResultDecl)
         thread float coefficients[values_per_thread];
 
         uint column = lane * values_per_thread;
@@ -8164,9 +8240,7 @@ private let lagunaDenseDownResidualKernel = MLXFast.metalKernel(
                     (const device vec<bfloat, 4>*)(
                         down_weight + (row_base + row) * in_vec_size + column);
                 const vec<bfloat, 4> w = row_values[0];
-                for (uint i = 0; i < values_per_thread; ++i) {
-                    result[row] += float(w[i]) * coefficients[i];
-                }
+        \(lagunaDenseDownChunkBody(seedElide: lagunaDenseSeedElisionEnabled))
             }
             column += block_width;
         }
