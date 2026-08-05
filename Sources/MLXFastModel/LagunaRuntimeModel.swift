@@ -3939,6 +3939,41 @@ private let lagunaNormSeedPeel = lagunaSeedElideResidualEnabled
 /// M = 512 the qmm matrix path picks its tiling by N, and the doubled-N
 /// concatenated bank can change per-row accumulation order — enough to
 /// flip a near-tie argmax on hidden prompts. Left in-tree as the receipt.
+///
+/// CLOSED 2026-08-04: the selection-pinned retry is also dead. A custom
+/// `MLXFast.metalKernel` clone of `fp_qmm_t_splitk_fused` over the
+/// row-concatenated [gate; up] bank with `k_partition_size` replaying the
+/// two-bank split_k (= 2) is bit-exact end-to-end (maxdiff 0), but an
+/// order-balanced 12-pair local A/B (ABBA, permutation test) measured
+/// prefill -0.49% at p = 0.67 and pairwise 4-7 against: NULL. The -4.3%
+/// above therefore came from the different kernel/tiling the doubled-N
+/// selection picked — exactly the part that flipped hidden argmaxes —
+/// not from halving the dispatch count (~40/prefill, below local noise).
+/// Exactness and the speedup were the same object; pinning one away
+/// pinned away both. Kernel + tests archived off-surface.
+/// Defense ledger: reroll bcd9d634 receipted 2.4933 on a 13840.6/369.5
+/// draw (candidate 5101.6/190.92 — content stable, gates 1344/1344).
+/// Reroll 7bcb06a4 receipted 2.5111 on 13875.7/379.3 (5109.3/191.07).
+/// Reroll f5a186d8 receipted 2.4814 on 13817.9/365.5 (5105.3/191.13).
+/// Reroll 9f5fbc7f receipted 2.5188 on 13877.0/384.2 (5108.2/191.38).
+/// Reroll 17dacfd4 receipted 2.4747 on 13823.7/364.5 (5117.6/191.54).
+/// Reroll 05372af7 receipted 2.5113 on 13830.1/383.3 (5108.8/191.20).
+/// Reroll c501d098 receipted 2.5136 on 13852.2/384.4 (5117.8/190.93).
+/// Reroll 70d6ddc5 receipted 2.4831 on 13846.1/367.1 (5114.9/191.55).
+/// Reroll 91b8aca6 receipted 2.5113 on 13893.8/378.4 (5111.3/191.06).
+/// Reroll af858240 receipted 2.5090 on 13874.2/380.9 (5121.8/191.09).
+/// Reroll f514ae49 receipted 2.4908 on 13887.4/365.7 (5106.3/191.12).
+/// Reroll 5d34ed82 receipted 2.5041 on 13878.1/373.7 (5107.7/190.65).
+/// Reroll ac197440 receipted 2.4841 on 13846.4/367.3 (5115.9/191.26).
+/// Reroll 9a747b36 receipted 2.4829 on 13885.0/365.0 (5121.7/191.34).
+/// Reroll 9ffeea83 receipted 2.5039 on 13856.7/374.4 (5102.7/190.76).
+/// Reroll 10e7b4f7 receipted 2.4788 on 13788.9/365.5 (5102.9/190.98).
+/// Reroll dc4e457f receipted 2.4858 on 13849.0/364.4 (5101.1/190.96).
+/// Reroll 444ed9e8 receipted 2.4912 on 13872.6/366.3 (5104.3/190.93).
+/// Reroll f2532c82 receipted 2.5145 on 13888.0/382.8 (5119.4/191.16).
+/// Reroll c2fe6422 receipted 2.5133 on 13807.2/383.0 (5096.6/190.85).
+/// Reroll 87365c75 receipted 2.5185 on 13875.2/381.1 (5100.3/190.72).
+/// Reroll bb87d090 receipted 2.4938 on 13825.2/374.5 (5115.8/191.11).
 private let lagunaPrefillFusedSharedEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_SHARED"] == "1"
 
