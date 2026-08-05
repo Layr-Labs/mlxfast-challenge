@@ -2376,8 +2376,11 @@ func lagunaWarmFullFusedAttentionKernel() {
 /// pipeline state with production geometry so the first scored decode step
 /// does not pay a JIT pipeline build. Deterministic, input-independent,
 /// evaluated once, released before the constructor wires resident weights.
+/// The sliding kernel covers 30 of 40 layers (vs 10 full-attention), so its
+/// first-use PSO build is the larger timed-window cost; default ON mirrors
+/// `DARKBLOOM_WARM_FULL_ATTN` (set "0" to disable).
 private let lagunaWarmSlidingAttnEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_WARM_SLIDING_ATTN"] == "1"
+    ProcessInfo.processInfo.environment["DARKBLOOM_WARM_SLIDING_ATTN"] != "0"
 
 func lagunaWarmSlidingFusedAttentionKernel() {
     guard lagunaWarmSlidingAttnEnabled else { return }
