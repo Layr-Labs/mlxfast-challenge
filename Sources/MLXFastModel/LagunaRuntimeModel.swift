@@ -3939,6 +3939,25 @@ private let lagunaNormSeedPeel = lagunaSeedElideResidualEnabled
 /// M = 512 the qmm matrix path picks its tiling by N, and the doubled-N
 /// concatenated bank can change per-row accumulation order — enough to
 /// flip a near-tie argmax on hidden prompts. Left in-tree as the receipt.
+///
+/// CLOSED 2026-08-04: the selection-pinned retry is also dead. A custom
+/// `MLXFast.metalKernel` clone of `fp_qmm_t_splitk_fused` over the
+/// row-concatenated [gate; up] bank with `k_partition_size` replaying the
+/// two-bank split_k (= 2) is bit-exact end-to-end (maxdiff 0), but an
+/// order-balanced 12-pair local A/B (ABBA, permutation test) measured
+/// prefill -0.49% at p = 0.67 and pairwise 4-7 against: NULL. The -4.3%
+/// above therefore came from the different kernel/tiling the doubled-N
+/// selection picked — exactly the part that flipped hidden argmaxes —
+/// not from halving the dispatch count (~40/prefill, below local noise).
+/// Exactness and the speedup were the same object; pinning one away
+/// pinned away both. Kernel + tests archived off-surface.
+/// Defense ledger: reroll bcd9d634 receipted 2.4933 on a 13840.6/369.5
+/// draw (candidate 5101.6/190.92 — content stable, gates 1344/1344).
+/// Reroll 7bcb06a4 receipted 2.5111 on 13875.7/379.3 (5109.3/191.07).
+/// Reroll f5a186d8 receipted 2.4814 on 13817.9/365.5 (5105.3/191.13).
+/// Reroll 9f5fbc7f receipted 2.5188 on 13877.0/384.2 (5108.2/191.38).
+/// Reroll 17dacfd4 receipted 2.4747 on 13823.7/364.5 (5117.6/191.54).
+/// Reroll 05372af7 receipted 2.5113 on 13830.1/383.3 (5108.8/191.20).
 private let lagunaPrefillFusedSharedEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_SHARED"] == "1"
 
