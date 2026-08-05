@@ -249,7 +249,7 @@ private let routeFusedScatterTopK = 8
 private let routeFusedScatterKernel: MLXFast.MLXFastKernel = {
     let m = routeFusedScatterTopK
     return MLXFast.metalKernel(
-        name: "mlx_lm_route_csort_scatter_fused_m\(m)_u32_v3",
+        name: "mlx_lm_route_csort_scatter_fused_m\(m)_u32_v4",
         inputNames: ["keys"],
         outputNames: ["row_order", "sorted_keys", "inverse_order"],
         source: """
