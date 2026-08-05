@@ -207,6 +207,16 @@ let lagunaFusedRoutedGateUpEnabled =
 let lagunaPrefillFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_GATE_UP"] != "0"
 
+/// Number of leading sparse layers whose routed expert banks are dequantized
+/// once during untimed initialization and retained as BF16 gather-MM operands
+/// for multi-token forwards. Decode keeps the original NVFP4 QMV path. This is
+/// an input-independent dequantized cache, not a new weight representation.
+private let lagunaPrefillBF16ExpertLayers: Int = {
+    let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_BF16_EXPERT_LAYERS"] ?? "1"
+    return min(max(Int(raw) ?? 0, 0), LagunaConstants.numHiddenLayers - 1)
+}()
+
 /// The expert-aligned gather-QMM consumes a 32-row gate/up-interleaved bank
 /// and writes the packed 512-wide SwiGLU result into the first half of its
 /// oversized MLX output allocation. The same environment switch controls the
@@ -9939,6 +9949,8 @@ private func lagunaFusedSortedRoutedGateUp(
     fusedScales: MLXArray,
     split: Int,
     downProj: SwitchLinear,
+    prefillGateUpWeightT: MLXArray?,
+    prefillDownWeightT: MLXArray?,
     deferUnsort: Bool
 ) -> (output: MLXArray, inverseOrder: MLXArray?) {
     // SwitchGLU: `var x = MLX.expandedDimensions(x, axes: [-2, -3])`
@@ -9967,20 +9979,30 @@ private func lagunaFusedSortedRoutedGateUp(
     // tile-interleaved `fusedWeight`/`fusedScales` bank instead of twice over
     // the separate banks is the fusion; every other argument matches the
     // stock call exactly (group 16, 4-bit, NVFP4, transpose, doSort).
-    let gateUp = MLX.gatherQuantizedMM(
-        sortedX,
-        fusedWeight,
-        scales: fusedScales,
-        biases: nil,
-        rhsIndices: idx,
-        transpose: true,
-        groupSize: 16,
-        bits: 4,
-        mode: .nvfp4,
-        sortedIndices: doSort
-    )
+    let usesBF16Cache = prefillGateUpWeightT != nil && prefillDownWeightT != nil
+    let gateUp: MLXArray
+    if let prefillGateUpWeightT, usesBF16Cache {
+        gateUp = MLX.gatherMM(
+            sortedX,
+            prefillGateUpWeightT,
+            rhsIndices: idx,
+            sortedIndices: doSort)
+    } else {
+        gateUp = MLX.gatherQuantizedMM(
+            sortedX,
+            fusedWeight,
+            scales: fusedScales,
+            biases: nil,
+            rhsIndices: idx,
+            transpose: true,
+            groupSize: 16,
+            bits: 4,
+            mode: .nvfp4,
+            sortedIndices: doSort
+        )
+    }
     let activated: MLXArray
-    if lagunaExpertAlignedGatherEnabled {
+    if lagunaExpertAlignedGatherEnabled && !usesBF16Cache {
         // The expert kernel writes rows with a physical stride of `split`
         // into the allocation's contiguous prefix. Slice that prefix before
         // restoring the logical shape expected by down_proj.
@@ -9992,7 +10014,16 @@ private func lagunaFusedSortedRoutedGateUp(
         activated = lagunaInterleavedSwiGLU(gateUp, split: split)
     }
     // SwitchGLU: `x = downProj(activated, idx, sortedIndices: doSort)`
-    var result = downProj(activated, idx, sortedIndices: doSort)
+    var result: MLXArray
+    if let prefillDownWeightT, usesBF16Cache {
+        result = MLX.gatherMM(
+            activated,
+            prefillDownWeightT,
+            rhsIndices: idx,
+            sortedIndices: doSort)
+    } else {
+        result = downProj(activated, idx, sortedIndices: doSort)
+    }
     // SwitchGLU: `if doSort { x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape) }`
     if doSort && !deferUnsort {
         result = scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape)
@@ -10006,6 +10037,7 @@ private func lagunaFusedSortedRoutedGateUp(
 
 final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     let routedScalingFactor: Float
+    let layerIdx: Int
 
     @ModuleInfo(key: "gate") var gate: LagunaRuntimeMoEGate
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
@@ -10030,6 +10062,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     /// `lagunaRoutedSwiGLUQMVPackedKernel` for the layout contract. Nil
     /// when the flag is set to zero (default ON).
     var _packedRoutedGateUpBank: MLXArray?
+    var _prefillBF16GateUpWeightT: MLXArray?
+    var _prefillBF16DownWeightT: MLXArray?
 
     /// Builds and retains the fused routed gate/up NVFP4 banks from the
     /// loaded stock `SwitchGLU` submodules (reached through the public
@@ -10123,6 +10157,33 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         return prepared
     }
 
+    /// Retain dense BF16 transposed operands for the first N sparse layers.
+    /// `dequantized` produces exactly the BF16 values the NVFP4 gather loader
+    /// stages per group; contiguous transposes are materialized before timing.
+    func preparePrefillBF16ExpertWeights() -> [MLXArray] {
+        guard layerIdx > 0, layerIdx <= lagunaPrefillBF16ExpertLayers,
+            _prefillBF16GateUpWeightT == nil, _prefillBF16DownWeightT == nil,
+            let fusedWeight = _fusedRoutedGateUpWeight,
+            let fusedScales = _fusedRoutedGateUpScales,
+            let downWeight = _routedDownWeight,
+            let downScales = _routedDownScales
+        else { return [] }
+
+        let gateUpWeightT = contiguous(
+            dequantized(
+                fusedWeight, scales: fusedScales, biases: nil,
+                groupSize: 16, bits: 4, mode: .nvfp4, dtype: .bfloat16
+            ).swappedAxes(-1, -2))
+        let downWeightT = contiguous(
+            dequantized(
+                downWeight, scales: downScales, biases: nil,
+                groupSize: 16, bits: 4, mode: .nvfp4, dtype: .bfloat16
+            ).swappedAxes(-1, -2))
+        _prefillBF16GateUpWeightT = gateUpWeightT
+        _prefillBF16DownWeightT = downWeightT
+        return [gateUpWeightT, downWeightT]
+    }
+
     /// Builds the `DARKBLOOM_PACKED_SCALES` side bank from the (lazy) fused
     /// routed gate/up arrays: bytes are only reordered, never recomputed.
     /// Per expert the packed layout is `[tile 128][k-block 4][sub 8][32 B]`
@@ -10173,8 +10234,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         return [packed]
     }
 
-    init(_ config: LagunaConfig) {
+    init(_ config: LagunaConfig, layerIdx: Int) {
         self.routedScalingFactor = Float(config.moeRoutedScalingFactor)
+        self.layerIdx = layerIdx
         self._gate.wrappedValue = LagunaRuntimeMoEGate(config)
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
@@ -10410,6 +10472,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     fusedScales: fusedScales,
                     split: _fusedRoutedGateUpSplit,
                     downProj: downProj,
+                    prefillGateUpWeightT: _prefillBF16GateUpWeightT,
+                    prefillDownWeightT: _prefillBF16DownWeightT,
                     deferUnsort:
                         lagunaPrefillSortedMoETailEnabled
                         && lagunaPrefillMoETailEnabled
@@ -10535,7 +10599,7 @@ final class LagunaRuntimeDecoderLayer: Module {
         self._selfAttn.wrappedValue = LagunaRuntimeAttention(config, layerIdx: layerIdx)
 
         if config.isSparse(layer: layerIdx) {
-            self.mlp = LagunaRuntimeSparseMoEBlock(config)
+            self.mlp = LagunaRuntimeSparseMoEBlock(config, layerIdx: layerIdx)
         } else {
             self.mlp = LagunaRuntimeMLP(
                 dimensions: config.hiddenSize, hiddenDimensions: config.intermediateSize)
@@ -11275,6 +11339,8 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                 }
                 if lagunaFusedRoutedGateUpEnabled {
                     fusedArrays.append(contentsOf: sparse.prepareFusedRoutedGateUp())
+                    fusedArrays.append(
+                        contentsOf: sparse.preparePrefillBF16ExpertWeights())
                 }
             } else if let dense = layer.mlp as? LagunaRuntimeMLP {
                 if lagunaFusedDenseGateUpSwiGLUEnabled,
