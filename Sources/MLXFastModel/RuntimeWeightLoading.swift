@@ -42,6 +42,12 @@ func loadRuntimeWeightValues<Value>(
     loadedWeights.reserveCapacity(denseStore.tensorNames.count)
     var expectedLoadedNames: Set<String> = []
     var nameTracker = RuntimeWeightNameTracker()
+    // Prefetch shard headers in sorted order to warm the filesystem cache
+    // before the per-tensor materialization loop. No bytes copied yet.
+    for shardName in shardNames {
+        let shard = directory.appendingPathComponent(shardName)
+        _ = try Safetensors.readHeader(shard)
+    }
     for shardName in shardNames {
         let expectedNames = denseStore.tensorNames(inShard: shardName)
         expectedLoadedNames.formUnion(expectedNames)
