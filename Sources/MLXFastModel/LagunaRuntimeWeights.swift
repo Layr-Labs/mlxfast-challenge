@@ -991,6 +991,39 @@ let lagunaRoutedDownScaleBytes =
     + LagunaConstants.numExperts * LagunaConstants.hiddenSize
     * (LagunaConstants.moeIntermediateSize / 32)
 
+/// `DARKBLOOM_SHARED_SCALE_HALVE` (default ON; set "0" to restore the stock
+/// full-resolution shared scale planes): extends the certified group-32 scale
+/// halving (`lagunaHalvedGroup32ScalePlane`, already shipped for the routed
+/// gate/up and down planes) to the SHARED expert's NVFP4 scale planes. The
+/// shared gate/up and down projections are the last decode-path NVFP4 QMVs
+/// still reading a full-resolution (one byte / 16 weights) scale plane; every
+/// routed plane is already halved. The shared planes come from the same MLX
+/// `fp_quantize` path, so the per-simdgroup absmax makes both halves of every
+/// 32-weight span byte-identical -- verified, not assumed:
+/// `lagunaHalvedGroup32ScalePlane` returns nil (and the dispatch keeps the
+/// stock full-resolution kernel) unless the halved bank reproduces the plane
+/// byte for byte, so a build where the property does not hold loses speed,
+/// never correctness. Lossless relayout, inside the frozen quantization
+/// envelope. Certified on-box: the shared down and gate/up planes both halve.
+let lagunaSharedScaleHalveEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_SCALE_HALVE"] != "0"
+
+/// Byte length of the halved shared down-projection scale plane, header
+/// included: `hiddenSize` output rows, one byte per 32-weight span across the
+/// shared intermediate axis.
+let lagunaSharedDownScaleBytes =
+    lagunaScalePatchHeaderBytes
+    + LagunaConstants.hiddenSize
+    * (LagunaConstants.sharedExpertIntermediateSize / 32)
+
+/// Byte length of the halved shared gate/up scale plane, header included: the
+/// fused `[gate; up]` bank has `2 * sharedExpertIntermediateSize` rows, one
+/// byte per 32-weight span across the hidden axis.
+let lagunaSharedGateUpScaleBytes =
+    lagunaScalePatchHeaderBytes
+    + 2 * LagunaConstants.sharedExpertIntermediateSize
+    * (LagunaConstants.hiddenSize / 32)
+
 /// Halves a group-16 NVFP4 uint8 scale plane along its last (group) axis by
 /// keeping only the even-indexed byte of every adjacent group pair, so a
 /// decode kernel reads one scale byte per 32 weights instead of two.
