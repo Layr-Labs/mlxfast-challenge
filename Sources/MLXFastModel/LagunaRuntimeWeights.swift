@@ -386,12 +386,6 @@ public final class LagunaRuntimeWeightCache {
                     setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
                     setenv("MLX_MAX_OPS_PER_BUFFER", "200", 0)
                 }
-                // LOCAL PROBE ONLY (not for submission): override the op cap
-                // so the command-buffer boundary phase can be swept without a
-                // rebuild per value. Overwrite=1 deliberately beats the 200.
-                if let probeOps = env["DARKBLOOM_PROBE_CB_OPS"], !probeOps.isEmpty {
-                    setenv("MLX_MAX_OPS_PER_BUFFER", probeOps, 1)
-                }
                 startupMemoryPolicy = nil
             }
         } else {
@@ -1025,6 +1019,13 @@ let lagunaRoutedDownScaleBytes =
     lagunaScalePatchHeaderBytes
     + LagunaConstants.numExperts * LagunaConstants.hiddenSize
     * (LagunaConstants.moeIntermediateSize / 32)
+
+/// Byte length of the halved shared expert down-projection scale plane,
+/// header included.
+let lagunaSharedDownScaleBytes =
+    lagunaScalePatchHeaderBytes
+    + LagunaConstants.hiddenSize
+    * (LagunaConstants.sharedExpertIntermediateSize / 32)
 
 /// Halves a group-16 NVFP4 uint8 scale plane along its last (group) axis by
 /// keeping only the even-indexed byte of every adjacent group pair, so a
