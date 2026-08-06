@@ -614,7 +614,10 @@ METAL_FUNC void fp_qmm_t_impl(
   dispatch_bool(aligned_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
       for (int k = 0; k < kernel_K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Dead at k==0 for fixed_K>0: no prior-iteration Ws read to order.
+        if (fixed_K == 0 || k > 0) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
@@ -653,8 +656,10 @@ METAL_FUNC void fp_qmm_t_impl(
         loader_w.next();
       }
 
-      // Store results to device memory
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Dead for fixed_K>0: no next iteration, epilogue never touches Ws.
+      if (fixed_K == 0) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
 
       if constexpr (kAlignedM.value && kAlignedN.value) {
         Dtile.store(y + tm * kernel_N + tn, kernel_N);
@@ -1521,22 +1526,58 @@ template <
     });
   }
 }
-
 METAL_FUNC int laguna_sorted_lower_bound(
     const device uint32_t* indices,
     const int count,
-    const uint32_t value) {
+    const uint32_t value,
+    const bool marked) {
   int lo = 0;
   int hi = count;
   while (lo < hi) {
-    const int mid = lo + (hi - lo) / 2;
-    if (indices[mid] < value) {
+    const int mid = lo + ((hi - lo) / 2);
+    const uint32_t index = indices[mid];
+    const uint32_t expert = marked ? ((index >> 16) & 0xffu) : index;
+    if (expert < value) {
       lo = mid + 1;
     } else {
       hi = mid;
     }
   }
   return lo;
+}
+
+template <typename T>
+METAL_FUNC void laguna_load_lhs(thread NAXTile<T, 1, 2>& t,
+    const device T* x, const device uint32_t* marked_indices, int q,
+    int route_count, uint rows, int K, int k, short nr) {
+  const short2 sc = BaseNAXFrag::get_coord();
+  for (short c = 0; c < 2; ++c) {
+    thread auto& f = t.frag_at(0, c);
+    for (short i = 0; i < 2; ++i) {
+      const short r = sc.y + i * 8;
+      const uint position = uint(q + r);
+      const uint index = r < nr ? marked_indices[position] : 0u;
+      const uint marker = index & 0xff000000u;
+      const uint mapped_row = index & 0xffffu;
+      uint xr = rows;
+      if (r < nr) {
+        if (marker == 0xdb000000u && mapped_row < rows) {
+          xr = mapped_row;
+        } else if (marker == 0xda000000u && position < rows) {
+          xr = position;
+        } else {
+          // Raw ids retain the implicit top-8 or flat LHS broadcast.
+          xr = route_count == int(rows) * 8 ? position / 8 : position;
+        }
+      }
+      vec<T, 4> v = T(0);
+      if (xr < rows) {
+        const device T* p = x + xr * K + k + c * 16 + sc.x;
+        v = *reinterpret_cast<const device vec<T, 4>*>(p);
+      }
+      for (short j = 0; j < 4; ++j) f[i * 4 + j] = v[j];
+    }
+  }
 }
 
 // Laguna prefill sorts the M routed rows by expert before this QMM. The stock
@@ -1564,22 +1605,26 @@ template <
     typename Wtype = bfloat,
     int tg_expert_groups = 64,
     bool wide_store = false,
-    bool wide_load = false>
+    bool wide_load = false,
+    bool gather_lhs = false>
 [[kernel]] void fp_gather_qmm_rhs_expert_nax(
     const device T* x,
     const device uint32_t* w,
     const device uint8_t* scales,
     const device uint32_t* indices,
+    const device uint32_t* lhs_indices,
     device T* y,
     const constant int& M,
     const constant int& N,
     const constant int& K,
     const constant int& run_skip_pct,
+    const constant int& x_rows,
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]]) {
   (void)run_skip_pct;
+  (void)x_rows;
   static_assert(transpose, "expert-aligned Laguna QMM requires NT weights");
   static_assert(group_size == 16, "expert-aligned Laguna QMM requires gs16");
   static_assert(bits == 4, "expert-aligned Laguna QMM requires NVFP4");
@@ -1596,6 +1641,9 @@ template <
   const int kernel_K = fixed_K > 0 ? fixed_K : K;
   const int kernel_N = fixed_N > 0 ? fixed_N : N;
   static_assert(experts % expert_groups == 0);
+  const uint32_t batch_marker = indices[0] & 0xff000000u;
+  const bool marked_batch = gather_lhs &&
+      (batch_marker == 0xda000000u || batch_marker == 0xdb000000u);
 
   using loader_w_t = QuantizedBlockLoader<
       Wtype,
@@ -1665,7 +1713,8 @@ template <
     bounds[b] = laguna_sorted_lower_bound(
         indices,
         M,
-        static_cast<uint32_t>(tid.y * (experts / expert_groups) + b));
+        static_cast<uint32_t>(tid.y * (experts / expert_groups) + b),
+        marked_batch);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 #endif
@@ -1684,8 +1733,10 @@ template <
 #else
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0) {
-      bounds[0] = laguna_sorted_lower_bound(indices, M, expert);
-      bounds[1] = laguna_sorted_lower_bound(indices, M, expert + 1);
+      bounds[0] = laguna_sorted_lower_bound(
+          indices, M, expert, marked_batch);
+      bounds[1] = laguna_sorted_lower_bound(
+          indices, M, expert + 1, marked_batch);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1703,8 +1754,8 @@ template <
       NAXTile<float, TM, TN> Dtile;
       Dtile.clear();
 
-      const device T* xn =
-          x + size_t(chunk_start + tm) * kernel_K;
+      const device T* xn = gather_lhs ? x
+          : x + size_t(chunk_start + tm) * kernel_K;
       thread loader_w_t loader_w(
           wl + size_t(expert) * stride_w,
           scale_base + size_t(expert) * stride_s,
@@ -1731,7 +1782,11 @@ template <
         if (sg_active) {
           STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            if (sgp_sm == SM) {
+            if constexpr (gather_lhs) {
+              laguna_load_lhs(
+                  Atile[kk1 / SK], x, lhs_indices, chunk_start + tm,
+                  M, uint(x_rows), kernel_K, k * BK + kk1, sgp_sm);
+            } else if (sgp_sm == SM) {
               // 8B alignment certified: fn multiples of 4 elems, off_y in
               // {0,16}, kk1 in {0,32}, str_x = 2048. Same bytes, same slots.
               Atile[kk1 / SK].load_contig(xn + kk1, kernel_K);
@@ -1795,7 +1850,7 @@ template <
       threadgroup_barrier(mem_flags::mem_threadgroup);
 #endif // DARKBLOOM_SWIGLU_REGLOCAL
       const bool fuse_swiglu =
-          kernel_N == 1024 && kernel_K == 2048;
+          marked_batch && kernel_N == 1024 && kernel_K == 2048;
       if (fuse_swiglu) {
 #ifdef DARKBLOOM_SWIGLU_REGLOCAL
         // Register-local swiglu, non-folded arm: identical mechanism and

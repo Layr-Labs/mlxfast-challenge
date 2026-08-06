@@ -1388,83 +1388,9 @@ int darkbloom_expert_gather_groups() {
   return v;
 }
 
-// DARKBLOOM_STAGE_BM128: select the gather-GEMM m-tiling. NOT a function
-// constant -- it changes the template instantiation, so it is already in
-// `kname` (`_bm_`/`_wm_`/`_wn_`) and therefore in the library name and the
-// pipeline key. Resolved once per process, so exactly one variant is ever
-// compiled and a fresh process picks up a changed environment cleanly.
-//
-//   unset (SHIPPED) -> 5  (BM=64,  WM=4, WN=1)  SN=64, 128 thr/TG (2026-07-31)
-//   "4" (prev ship) -> 4  (BM=64,  WM=4, WN=2)  SM=16, 256 thr/TG
-//   "0"             -> 0  (BM=64,  WM=2, WN=2)  SM=32  upstream tiling
-//   "1"             -> 1  (BM=128, WM=4)        SM=32  less expert re-staging
-//   "2"             -> 2  (BM=128, WM=2)        SM=64  measured regression
-//   "3"             -> 3  (BM=128, WM=8)        SM=16  both mechanisms
-//   "5"             -> 5  (BM=64,  WM=4, WN=1)  SM=16, 128 thr/TG
-//
-// WHY SM=16 IS THE WIN. DARKBLOOM_PREFILL_GATHER_RUNSKIP elides a run for a
-// simdgroup only when the intersection with its SM-row band is EMPTY. On
-// PARTIAL overlap the simdgroup still computes all SM rows and store_slice
-// discards the rest. `tm = SM * (simd_group_id / WN)` gives bands of
-// SM = BM/WM rows, so halving SM narrows the band and converts partial
-// overlaps into full elisions. Simulated over uniform routing (the model
-// reproduces the measured 4.92 runs/tile and 40.5% elision):
-//
-//   SM=32 (upstream)  elision 40.5%  MMA 2.93x ideal  34% of rows useful
-//   SM=16             elision 60.7%  MMA 1.94x ideal  52% of rows useful
-//
-// This is the FRAGSKIP prize reached through TILING instead of predication:
-// FRAGSKIP was rejected because a 16-row predicate is thread-varying and
-// tile_matmad_nax is a simdgroup-collective op that cannot be lane-masked.
-// Here the RUNSKIP predicate is untouched and stays simdgroup-uniform; only
-// the bands are narrower.
-//
-// EXACTNESS. BM, BN, BK, SK and WN are all untouched, so SN=32, TN=2 and TK=2
-// are exactly upstream and the per-row K partition is identical: every output
-// element is still accumulated over the same K_it x (BK/SK) sequence, in the
-// same order, inside one simdgroup's fragment accumulator. The ONLY thing that
-// changes is which rows a simdgroup owns -- `tm = SM * (simd_group_id / WN)`
-// with SM 32 -> 16 -- and how many row-fragments it holds (TM 2 -> 1). That is
-// the "regroup rows across simdgroups" class, arithmetic-neutral by
-// construction rather than by argument. This is a strictly weaker change than
-// variant 5, which also moved WN. max_abs_diff = 0 on every timed run and on
-// the full 1025-step gate.
-//
-// WHY VARIANT 4 AND NOT 5. Both reach SM=16. They differ in where the extra
-// row-split is paid for, and measurement says that is worth an order of
-// magnitude:
-//
-//              WM  WN  SM  SN  TM  TN  Dtile   threads/TG   vs upstream
-//   variant 5   4   1  16  64   1   4  32 flt      128        +2.13%
-//   variant 4   4   2  16  32   1   2  16 flt      256       +15.40%
-//
-// Variant 5 buys the split from the column axis, so TN doubles 2 -> 4 and each
-// simdgroup reads twice as much Btile out of Ws. Variant 4 buys it from the
-// thread count: TN stays at the upstream 2, Dtile HALVES 32 -> 16 floats, and
-// threads/threadgroup double 128 -> 256. Total useful work is identical in both
-// -- each thread simply covers half the rows -- but variant 4 additionally
-// halves the accumulator register footprint and doubles the parallelism
-// available to hide staging latency, which is 39.5% of prefill. The elision
-// model priced only the MMA term (-5.0 pp) and therefore under-predicted this
-// by ~3x; the occupancy term was never in it.
-//
-// MEASURED (ABBA, one binary per series, quiescence-gated, prefill axis,
-// "+" = the named variant faster):
-//
-//   variant 4 vs 0 (upstream)   +15.40%   4/4 pairs
-//   variant 4 vs 5              +17.47%   4/4 pairs
-//   variant 5 vs 0              +2.13%   10/12 pairs, se 0.68%, t = +3.13
-//
-// The two variant-4 series have zero distributional overlap with their
-// controls (e.g. 342-371 us against 414-434 us) and are unanimous across 8
-// paired samples. Steady-state decode step is flat (-0.18%); the positive
-// composite decode reading is the 512-token seed prefill folding in.
-//
-// The unset path is the SHIPPED path: `mlxfast submit` packages source, not
-// environment, and the ranked runner sets no DARKBLOOM_* variables. So the
-// empty string selects the winning variant here, exactly as
-// kDarkbloomDefaultRunSkipPct does above. Explicit "0" keeps the upstream
-// tiling reachable as an A/B control arm.
+// Select the expert gather tiling once per process. The empty value ships
+// variant 5; "0" restores upstream, and 1-5 select the switch arms below.
+// Tiling dimensions are already part of the kernel and pipeline keys.
 int darkbloom_stage_bm128_variant() {
   static const int v = [] {
     auto s = env::get_var("DARKBLOOM_STAGE_BM128", "");
@@ -1590,12 +1516,14 @@ bool darkbloom_bsearch_hoist() {
   return v;
 }
 
+
 void gather_qmm_rhs_nax(
     const array& x_,
     const array& w_,
     const array& scales_,
     const std::optional<array>& biases_,
     const array& indices_,
+    const array* lhs_indices_,
     array& out,
     bool transpose,
     int group_size,
@@ -1606,13 +1534,11 @@ void gather_qmm_rhs_nax(
     metal::Device& d,
     const Stream& s,
     const std::string mode) {
-  // Start by normalizing the indices
+  const bool gather_lhs = lhs_indices_ != nullptr;
+  // A non-null pointer selects DA/DB decoding of the normalized RHS.
   array indices = ensure_row_contiguous(indices_, d, s);
+  array lhs_indices = array::unsafe_weak_copy(indices);
 
-  // Broadcast x with indices. If we are here that means lhs_indices were not
-  // provided so the lhs_indices are implied to be the shape of x broadcasted
-  // with rhs_indices. We need only broadcast x and copy it as if applying the
-  // lhs_indices.
   auto broadcast_with_indices = [&d, &s, &indices](const array& x) {
     if (x.size() / x.shape(-2) / x.shape(-1) == indices.size()) {
       return ensure_row_contiguous(x, d, s);
@@ -1626,10 +1552,11 @@ void gather_qmm_rhs_nax(
     return ensure_row_contiguous(new_x, d, s);
   };
 
-  // Normalize the input arrays
-  array x = broadcast_with_indices(x_);
+  array x = gather_lhs ? ensure_row_contiguous(x_, d, s)
+                       : broadcast_with_indices(x_);
   array w = ensure_row_contiguous(w_, d, s);
   array scales = ensure_row_contiguous(scales_, d, s);
+  const int x_rows = x.size() / K;
 
   // TODO: Tune the block sizes
   int bm = 64, bn = 64, bk = 64;
@@ -1770,7 +1697,8 @@ void gather_qmm_rhs_nax(
           : "",
       expert_aligned
           ? ("_eg_" + std::to_string(egroups) + (expert_widest ? "_ws_1" : "_ws_0") +
-             (expert_wideld ? "_wl_1" : "_wl_0"))
+             (expert_wideld ? "_wl_1" : "_wl_0") +
+             (gather_lhs ? "_lhs_1" : "_lhs_0"))
           : "");
 
   // Skipping dead runs is a pure work elision (see function constant 203 in
@@ -1890,7 +1818,8 @@ void gather_qmm_rhs_nax(
         "bfloat",
         egroups,
         expert_widest,
-        expert_wideld);
+        expert_wideld,
+        gather_lhs);
     kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
   } else {
     kernel = get_gather_qmm_nax_kernel(
@@ -1931,11 +1860,17 @@ void gather_qmm_rhs_nax(
     compute_encoder.set_input_array(biases, c++);
   }
   compute_encoder.set_input_array(indices, c++);
+  if (expert_aligned) {
+    compute_encoder.set_input_array(lhs_indices, c++);
+  }
   compute_encoder.set_output_array(out, c++);
   compute_encoder.set_bytes(M, c++);
   compute_encoder.set_bytes(N, c++);
   compute_encoder.set_bytes(K, c++);
   compute_encoder.set_bytes(run_skip_pct, c++);
+  if (expert_aligned) {
+    compute_encoder.set_bytes(x_rows, c++);
+  }
 
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
@@ -1946,6 +1881,7 @@ void gather_qmm_rhs(
     const array& scales_,
     const std::optional<array>& biases_,
     const array& indices_,
+    const array* lhs_indices_,
     array& out,
     bool transpose,
     int group_size,
@@ -1964,6 +1900,7 @@ void gather_qmm_rhs(
         /* const array& scales_ = */ scales_,
         /* const std::optional<array>& biases_ = */ biases_,
         /* const array& indices_ = */ indices_,
+        /* const array* lhs_indices_ = */ lhs_indices_,
         /* array& out = */ out,
         /* bool transpose = */ transpose,
         /* int group_size = */ group_size,
@@ -2205,22 +2142,49 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
 
+  const int x_matrices = x.size() / M / K;
+  const int bm128 = darkbloom_stage_bm128_variant();
+  // DB is routed-shaped; DA is flat. Raw ids retain public GatherQMM semantics.
+  const int routed_rows =
+      rhs_indices.ndim() == 3 ? rhs_indices.shape(1) : 0;
+  const bool routed_marked_shape =
+      rhs_indices.ndim() == 3 && rhs_indices.shape(0) == 1 &&
+      rhs_indices.shape(2) == 8 && routed_rows <= 65536 &&
+      B == routed_rows * 8 && x_matrices == routed_rows;
+  const bool flat_marked_shape =
+      rhs_indices.ndim() == 1 && rhs_indices.shape(0) == B &&
+      x_matrices == B;
+  const bool marked_rhs_shape =
+      right_sorted_ && !left_sorted_ && rhs_indices.size() == B &&
+      rhs_indices.flags().row_contiguous &&
+      (routed_marked_shape || flat_marked_shape);
+  const bool marked_rhs =
+      metal::is_nax_available() && marked_rhs_shape && M == 1 &&
+      B >= 64 && E == 256 && B / E >= 4 && x.dtype() == bfloat16 &&
+      transpose_ && group_size_ == 16 && bits_ == 4 && mode == "nvfp4" &&
+      K == 2048 && N == 1024 && !biases.has_value() &&
+      darkbloom_expert_aligned_gather() && (bm128 == 4 || bm128 == 5);
+  const bool contiguous_right_sorted =
+      right_sorted_ && B == x_matrices;
+
   // We are walking x in order and w is also in order so we can batch up the
   // matmuls and reuse reading x and w.
   //
   // TODO: Tune 16 and 4 here a bit better.
-  if (M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4) {
+  if (M == 1 && B >= 16 &&
+      (contiguous_right_sorted || marked_rhs) && B / E >= 4) {
     gather_qmm_rhs(
         x,
         w,
         scales,
         biases,
         rhs_indices,
+        marked_rhs ? &rhs_indices : nullptr,
         out,
         transpose_,
         group_size_,
         bits_,
-        x.size() / K,
+        marked_rhs ? B : x.size() / K,
         N,
         K,
         d,
