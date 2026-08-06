@@ -160,7 +160,7 @@ let lagunaFusedRoutedSwiGLUQMVEnabled =
 /// order, and every BF16 boundary are identical to the stock kernel — only
 /// scale address computation changes, so the packed dispatch is bit-exact
 /// (class A).
-/// Memory: +~16 MiB resident per sparse layer while enabled (the stock fused
+/// Memory: +~32 MB resident per sparse layer while enabled (the stock fused
 /// code bank stays resident for prefill and fallback paths).
 let lagunaPackedScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] != "0"
@@ -220,20 +220,6 @@ let lagunaFusedRoutedGateUpEnabled =
 /// independently ablatable and row-arithmetic-identical to separate banks.
 let lagunaPrefillFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_GATE_UP"] != "0"
-
-/// Exact prefill-only reuse of the certified packed decode scale bank by the
-/// expert-aligned NAX path. Setting the flag to zero keeps the stock fused
-/// scale plane and backend specialization.
-let lagunaPrefillExpertPairwiseScalesEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_EXPERT_PAIRWISE_SCALES"] != "0"
-
-/// The compact marker is legal only for GatherQMM's sorted RHS expert path,
-/// whose batching guard requires at least four routed rows per expert. Shorter
-/// prefills keep the original full scale plane so no generic kernel can ever
-/// observe the marker representation.
-func lagunaPrefillExpertPairwiseScalesAdmitted(routedRows: Int) -> Bool {
-    routedRows >= 4 * LagunaConstants.numExperts
-}
 
 func lagunaNAXAvailable(architecture: String, osSupportsNAX: Bool) -> Bool {
     guard osSupportsNAX,
@@ -7857,15 +7843,6 @@ func lagunaRoutedDownReduce(
 let lagunaSharedFirstDownOrderEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_FIRST_DOWN"] == "1"
 
-/// Stages all four output rows' code words and scale bytes before issuing the
-/// first qdot in the fused routed+shared down kernel.  This is the exact load
-/// schedule already used by the promoted standalone routed-down kernel; the
-/// row arithmetic and reduction order stay unchanged.  Set
-/// `DARKBLOOM_FUSED_DOWN_ROW_STAGING=0` to retain the current crown kernel.
-let lagunaFusedDownRowStagingEnabled =
-    ProcessInfo.processInfo.environment[
-        "DARKBLOOM_FUSED_DOWN_ROW_STAGING"] != "0"
-
 private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
     name: lagunaSharedFirstDownOrderEnabled
         ? "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v5sf"
@@ -7987,136 +7964,6 @@ if (slot == 0 && lane < outputs_per_simd) {
     ensureRowContiguous: true
 )
 
-/// Exact load-scheduled twin of `lagunaRoutedSharedDownResidualKernel`.
-/// Four `uint2` code words and four authoritative scale bytes are read before
-/// any qdot.  Each row then executes the inherited qdot, scale conversion,
-/// SIMD reduction, BF16 boundary, routed accumulation, shared add, and
-/// residual add in the same order as the crown.
-private let lagunaRoutedSharedDownResidualStagedKernel = MLXFast.metalKernel(
-    name: lagunaSharedFirstDownOrderEnabled
-        ? "laguna_routed_shared_nvfp4_down_residual_bf16_stage4_v6sf"
-        : "laguna_routed_shared_nvfp4_down_residual_bf16_stage4_v6",
-    inputNames: lagunaSharedFirstDownOrderEnabled
-        ? [
-            "shared_activated", "shared_down_weight", "shared_down_scales",
-            "routed_activated", "routed_down_weight", "routed_down_scales",
-            "indices", "router_weights", "residual",
-        ]
-        : [
-            "routed_activated", "routed_down_weight", "routed_down_scales",
-            "indices", "router_weights", "shared_activated",
-            "shared_down_weight", "shared_down_scales", "residual",
-        ],
-    outputNames: ["output"],
-    source: """
-constexpr uint input_width = 512;
-constexpr uint output_width = 2048;
-constexpr uint routed_experts = 8;
-constexpr uint shared_slot = 8;
-constexpr uint outputs_per_simd = 4;
-constexpr uint values_per_lane = 16;
-constexpr uint packed_row_bytes = 256;
-constexpr uint scale_patch_bytes = \(lagunaScalePatchHeaderBytes);
-constexpr uint shared_scale_row_bytes = 32;
-constexpr uint routed_scale_row_bytes = 16;
-constexpr uint packed_expert_bytes =
-    output_width * packed_row_bytes;
-constexpr uint scale_expert_bytes =
-    output_width * routed_scale_row_bytes;
-
-uint tile = threadgroup_position_in_grid.x;
-uint slot = simdgroup_index_in_threadgroup;
-uint lane = thread_index_in_simdgroup;
-uint first_row = tile * outputs_per_simd;
-bool is_shared = slot == shared_slot;
-uint expert = is_shared ? 0 : uint(indices[slot]);
-
-const device bfloat* expert_input = is_shared
-    ? shared_activated
-    : routed_activated + slot * input_width;
-const device uint8_t* expert_weight = is_shared
-    ? (const device uint8_t*)shared_down_weight
-    : (const device uint8_t*)routed_down_weight +
-        expert * packed_expert_bytes;
-const device uint8_t* expert_scales = is_shared
-    ? shared_down_scales
-    : routed_down_scales + scale_patch_bytes
-        + expert * scale_expert_bytes;
-uint scale_row_bytes =
-    is_shared ? shared_scale_row_bytes : routed_scale_row_bytes;
-uint scale_lane = is_shared ? lane : (lane >> 1);
-
-thread float input_values[values_per_lane];
-const device vec<bfloat, 4>* input_vectors =
-    (const device vec<bfloat, 4>*)(
-        expert_input + lane * values_per_lane);
-for (uint i = 0; i < values_per_lane / 4; ++i) {
-    const vec<bfloat, 4> values = input_vectors[i];
-    input_values[4 * i] = values[0];
-    input_values[4 * i + 1] = values[1];
-    input_values[4 * i + 2] = values[2];
-    input_values[4 * i + 3] = values[3];
-}
-
-thread float result[outputs_per_simd] = {0.0f};
-uint2 row_codes[outputs_per_simd];
-uint8_t row_sb[outputs_per_simd];
-for (uint row = 0; row < outputs_per_simd; ++row) {
-    uint output_row = first_row + row;
-    row_codes[row] = *(const device uint2*)(
-        expert_weight + output_row * packed_row_bytes + lane * 8);
-    const device uint8_t* scale =
-        expert_scales + output_row * scale_row_bytes + scale_lane;
-    row_sb[row] =
-        (!is_shared && expert == 0 && output_row == 0 && lane == 1)
-        ? routed_down_scales[0]
-        : scale[0];
-}
-for (uint row = 0; row < outputs_per_simd; ++row) {
-    result[row] = laguna_nvfp4_qdot_codes_16(
-        row_codes[row],
-        input_values,
-        laguna_nvfp4_scale(row_sb[row]));
-    result[row] = simd_sum(result[row]);
-}
-
-threadgroup bfloat down_outputs[
-    (routed_experts + 1) * outputs_per_simd
-];
-if (lane == 0) {
-    for (uint row = 0; row < outputs_per_simd; ++row) {
-        down_outputs[slot * outputs_per_simd + row] =
-            bfloat(result[row]\(lagunaNvfp4RowScaleSuffix));
-    }
-}
-threadgroup_barrier(mem_flags::mem_threadgroup);
-
-if (slot == 0 && lane < outputs_per_simd) {
-    bfloat routed_total = bfloat(0);
-    for (uint routed_slot = 0;
-         routed_slot < routed_experts;
-         ++routed_slot) {
-        bfloat route_weight =
-            bfloat(router_weights[routed_slot]);
-        bfloat product = bfloat(
-            down_outputs[
-                routed_slot * outputs_per_simd + lane
-            ] * route_weight);
-        routed_total = bfloat(product + routed_total);
-    }
-    bfloat routed = bfloat(
-        routed_total * bfloat(2.5f));
-    bfloat shared =
-        down_outputs[shared_slot * outputs_per_simd + lane];
-    bfloat r2 = bfloat(routed + shared);
-    output[first_row + lane] =
-        bfloat(residual[first_row + lane] + r2);
-}
-""",
-    header: lagunaSharedSwiGLUQMVHeader,
-    ensureRowContiguous: true
-)
-
 func lagunaRoutedSharedDownResidual(
     routedActivated: MLXArray,
     routedDownWeight: MLXArray,
@@ -8126,8 +7973,7 @@ func lagunaRoutedSharedDownResidual(
     sharedActivated: MLXArray,
     sharedDownWeight: MLXArray,
     sharedDownScales: MLXArray,
-    residual: MLXArray,
-    staged: Bool = lagunaFusedDownRowStagingEnabled
+    residual: MLXArray
 ) -> MLXArray {
     precondition(routedActivated.dtype == .bfloat16)
     precondition(
@@ -8157,10 +8003,7 @@ func lagunaRoutedSharedDownResidual(
     precondition(residual.dtype == .bfloat16)
     precondition(residual.dims(1, 1, LagunaConstants.hiddenSize))
 
-    let kernel = staged
-        ? lagunaRoutedSharedDownResidualStagedKernel
-        : lagunaRoutedSharedDownResidualKernel
-    return kernel(
+    return lagunaRoutedSharedDownResidualKernel(
         lagunaSharedFirstDownOrderEnabled
             ? [
                 sharedActivated, sharedDownWeight, sharedDownScales,
@@ -9927,7 +9770,6 @@ private func lagunaFusedSortedRoutedGateUp(
     indices: MLXArray,
     fusedWeight: MLXArray,
     fusedScales: MLXArray,
-    pairwiseScales: MLXArray?,
     split: Int,
     downProj: SwitchLinear,
     deferUnsort: Bool
@@ -9961,7 +9803,7 @@ private func lagunaFusedSortedRoutedGateUp(
     let gateUp = MLX.gatherQuantizedMM(
         sortedX,
         fusedWeight,
-        scales: pairwiseScales ?? fusedScales,
+        scales: fusedScales,
         biases: nil,
         rhsIndices: idx,
         transpose: true,
@@ -10012,9 +9854,6 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     /// separate banks for checkpoint parameter integrity.
     var _fusedRoutedGateUpWeight: MLXArray?
     var _fusedRoutedGateUpScales: MLXArray?
-    /// Shape-preserving marker view over the existing packed decode scale bank
-    /// for the M5 expert prefill NAX loader. It owns no storage.
-    var _fusedRoutedGateUpPairwiseScales: MLXArray?
     var _fusedRoutedGateUpSplit: Int = 0
     var _routedDownProj: SwitchLinear?
     var _routedDownWeight: MLXArray?
@@ -10129,14 +9968,6 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 fusedScales: fusedScales,
                 experts: experts,
                 split: split))
-        if lagunaPrefillExpertPairwiseScalesEnabled,
-            lagunaExpertAlignedGatherEnabled,
-            let packedScales = _packedRoutedGateUpBank,
-            let pairwiseView = lagunaPackedPrefillScaleView(packedScales)
-        {
-            _fusedRoutedGateUpPairwiseScales = pairwiseView
-            prepared.append(pairwiseView)
-        }
         return prepared
     }
 
@@ -10352,20 +10183,11 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 _fusedRoutedGateUpSplit == LagunaConstants.moeIntermediateSize
             {
                 lagunaTrace("prefill fused routed gate/up")
-                let pairwiseScales =
-                    lagunaPrefillExpertPairwiseScalesAdmitted(routedRows: inds.size)
-                    ? _fusedRoutedGateUpPairwiseScales : nil
-                if lagunaPrefillExpertPairwiseScalesEnabled {
-                    lagunaPackedScalesLog.note(
-                        pairwiseScales == nil ? "inactive" : "active",
-                        "packed routed gate/up prefill scale view consumed")
-                }
                 let routed = lagunaFusedSortedRoutedGateUp(
                     x,
                     indices: inds,
                     fusedWeight: fusedWeight,
                     fusedScales: fusedScales,
-                    pairwiseScales: pairwiseScales,
                     split: _fusedRoutedGateUpSplit,
                     downProj: downProj,
                     deferUnsort:
@@ -11069,7 +10891,6 @@ final class LagunaRuntimeModelInner: Module {
                     asyncEval(h)
                 }
             }
-            lagunaInjectLayerWork(layer: i, isSingleTokenDecode: isSingleTokenDecode)
         }
 
         return h
@@ -11245,260 +11066,3 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         return weights.filter { !$0.key.contains("rotary_emb.inv_freq") }
     }
 }
-
-// ============================================================================
-// BEGIN M5 HARDWARE-CONSTANT INSTRUMENT — research measurement, NOT a ranking
-// attempt (PR #27). This block deliberately SLOWS the tree.
-//
-// It injects a known, output-neutral quantity of GPU work into the scored
-// forward so that two receipt observables (`prefill_seconds_per_token`,
-// `decode_seconds_per_token`) can be differenced across submissions into
-// hardware constants of the ranked M5 Max:
-//
-//   S = 512000 * prefill_seconds_per_token            (ms, 512-token forward)
-//   T = 1000 * decode_seconds_per_token - S/128       (ms, steady 1-tok step)
-//
-//   DRAM GB/s     = (bytes_B - bytes_A) / (T_B - T_A)
-//   matrix FLOP/s = (flop_B  - flop_A)  / (S_B - S_A)
-//   per-dispatch  = (T_C - T_A) / (dispatch_C - dispatch_A)
-//
-// Output neutrality: every injected kernel writes only into a dedicated sink
-// tensor that no model tensor ever reads, and the sink write is sentinel-gated
-// so it never actually fires. The injected arrays are forced with `asyncEval`,
-// which is what makes them execute (a dangling MLX output would be pruned) and
-// keeps them ahead of the real work in the same stream.
-//
-// Structure invariants that make the differences clean:
-//   * exactly one `asyncEval` per layer boundary in every configuration, so
-//     command-buffer count never varies between runs;
-//   * the bandwidth magnitude is varied per *dispatch* (`SWEEP_PASSES`), never
-//     by dispatch count, and every matmul reuses one `matA`/`matB` pair.
-//     `CommandEncoder::set_input_array` charges `data_size()` of each distinct
-//     buffer once per command buffer (`device.cpp:316-321`) and
-//     `needs_commit()` trips at 40 Mi items on `*g` / 50 Mi on `*s`
-//     (`device.cpp:484-487`, `:574-595`), so holding the bound-buffer set and
-//     the dispatch count fixed holds the injected commit count fixed and it
-//     cancels in `T_B - T_A`;
-//   * empty dispatches bind only 1- and 256-item arrays, so they add no byte
-//     charge at all, and are spread across all 40 layer boundaries so their
-//     launch ramp sits between real dispatches rather than at the step head;
-//   * injection magnitudes are host-side counts and buffer-passed uniforms
-//     only — never a Metal function constant, so no pipeline is recompiled
-//     mid-process (`quantized.cpp:1214-1220` precedent).
-//
-// Delete this block and the single `lagunaInjectLayerWork` call in
-// `LagunaRuntimeModelInner.callAsFunction` to remove the instrument entirely.
-// ============================================================================
-
-private func lagunaInjectEnvInt(_ key: String, _ fallback: Int) -> Int {
-    guard let raw = ProcessInfo.processInfo.environment[key], let value = Int(raw),
-        value >= 0
-    else { return fallback }
-    return value
-}
-
-/// DRAM sweep dispatches injected per single-token decode step. Held constant
-/// across every submitted configuration: the bandwidth magnitude is varied
-/// through `lagunaInjectSweepPasses` (bytes *per* dispatch) so that dispatch
-/// count and the bound-buffer set are identical in every run and the
-/// command-buffer term cancels in `T_B - T_A`.
-///
-/// Every knob below defaults to 0 so that `lagunaInjectActive` is false and the
-/// instrument is fully inert in the committed tree. A configuration is selected
-/// by environment variable for local differencing, or by an explicit source
-/// edit for an authorised official receipt.
-private let lagunaInjectDecodeSweeps = lagunaInjectEnvInt(
-    "DARKBLOOM_INJECT_DECODE_SWEEPS", 0)
-/// Passes over the 256 MiB pool per sweep dispatch. Buffer-passed uniform,
-/// never a Metal function constant.
-private let lagunaInjectSweepPasses = max(
-    1, lagunaInjectEnvInt("DARKBLOOM_INJECT_SWEEP_PASSES", 1))
-/// 512x8192 @ 8192x2048 bf16 matmuls injected per multi-token forward.
-private let lagunaInjectPrefillMatmuls = lagunaInjectEnvInt(
-    "DARKBLOOM_INJECT_PREFILL_MATMULS", 0)
-/// Empty dispatches injected per single-token decode step.
-private let lagunaInjectDecodeEmpty = lagunaInjectEnvInt(
-    "DARKBLOOM_INJECT_DECODE_EMPTY", 0)
-/// Empty dispatches injected per multi-token forward.
-private let lagunaInjectPrefillEmpty = lagunaInjectEnvInt(
-    "DARKBLOOM_INJECT_PREFILL_EMPTY", 0)
-/// 1 spreads the empty dispatches over all 40 layer boundaries; 0 batches them
-/// all at one boundary. Local-only control used to test whether the measured
-/// per-dispatch cost depends on placement.
-private let lagunaInjectEmptySpread = lagunaInjectEnvInt(
-    "DARKBLOOM_INJECT_EMPTY_SPREAD", 1) != 0
-/// Threadgroups per empty dispatch (256 threads each). Set 8 to reproduce
-/// `0411779d`'s geometry, on which n=0/100/400 lie on one M5 curve.
-private let lagunaInjectEmptyThreadgroups = lagunaInjectEnvInt(
-    "DARKBLOOM_INJECT_EMPTY_TG", 160)
-/// 0 unchains the empties: each binds a never-written control array, so no
-/// `memoryBarrier` is emitted (`device.cpp:325`). Unchained outputs all stay in
-/// `pending` so a recycled buffer cannot re-trip it as a WAW (`:331`).
-private let lagunaInjectEmptyChain = lagunaInjectEnvInt(
-    "DARKBLOOM_INJECT_EMPTY_CHAIN", 1) != 0
-
-private let lagunaInjectPoolUInt4 = 1 << 24  // 16,777,216 x 16 B = 256 MiB
-/// 256 threadgroups x 256 threads, 256 uint4 per thread. The pass loop lives
-/// inside the thread, so a threadgroup re-reads its own `perThread * 4 KiB`
-/// window immediately; cross-pass cache hits are possible whenever
-/// `resident_threadgroups * window` fits in cache. At 256 total threadgroups
-/// every threadgroup is resident, the resident window is the whole 256 MiB
-/// pool, and reuse is impossible on any cache size. Measured marginal rates
-/// on M4 Pro against the 262.5 GB/s sequential control from #21: 2^16 threads
-/// 242 GB/s, 2^17 245 GB/s, 2^18 339 GB/s (above the 273 GB/s hardware peak,
-/// i.e. cache-served). A larger machine has more resident threadgroups, so the
-/// safe direction is fewer threadgroups, not more.
-private let lagunaInjectSweepThreads = 1 << 16
-private let lagunaInjectSweepPerThread = lagunaInjectPoolUInt4 / lagunaInjectSweepThreads
-private let lagunaInjectMatmulM = 512
-private let lagunaInjectMatmulK = 8192
-private let lagunaInjectMatmulN = 2048
-
-/// Bytes read from DRAM per injected sweep dispatch.
-let lagunaInjectSweepBytes = lagunaInjectPoolUInt4 * 16 * lagunaInjectSweepPasses
-/// FLOPs issued per injected matmul dispatch (2 * M * N * K).
-let lagunaInjectMatmulFlops = 2 * lagunaInjectMatmulM * lagunaInjectMatmulN * lagunaInjectMatmulK
-
-private let lagunaInjectSweepKernel = MLXFast.metalKernel(
-    name: "laguna_inject_dram_sweep_u4_v2",
-    inputNames: ["pool", "control"],
-    outputNames: ["sink"],
-    source: """
-            constexpr uint kThreads = \(lagunaInjectSweepThreads);
-            constexpr uint kPerThread = \(lagunaInjectSweepPerThread);
-            constexpr uint kMask = \(lagunaInjectPoolUInt4 - 1);
-            const device uint4* quads = (const device uint4*)pool;
-            uint gid = thread_position_in_grid.x;
-            uint idx = (gid + control[0]) & kMask;
-            uint passes = control[1];
-            uint4 acc = uint4(0u);
-            for (uint p = 0; p < passes; ++p) {
-                for (uint i = 0; i < kPerThread; ++i) {
-                    acc ^= quads[idx];
-                    idx = (idx + kThreads) & kMask;
-                }
-            }
-            uint folded = acc.x ^ acc.y ^ acc.z ^ acc.w;
-            if (folded == 0xFFFFFFFFu) {
-                sink[gid & 255u] = folded;
-            }
-        """,
-    ensureRowContiguous: true
-)
-
-/// `prev` is bound only to chain the dispatches. MLX inserts a memory barrier
-/// when a dispatch binds a buffer a previous dispatch wrote
-/// (`device.cpp:325`, `:339`), and its encoder is otherwise
-/// `DispatchTypeConcurrent` (`device.cpp:548`), so without the chain these
-/// dispatches would run concurrently and measure nothing. Chained, they
-/// serialize exactly like the model's dependent dispatch stream.
-private let lagunaInjectEmptyKernel = MLXFast.metalKernel(
-    name: "laguna_inject_empty_dispatch_v1",
-    inputNames: ["control", "prev"],
-    outputNames: ["sink"],
-    source: """
-            uint gid = thread_position_in_grid.x;
-            if (control[0] == 0xFFFFFFFFu) {
-                sink[gid & 255u] = gid + prev[0];
-            }
-        """,
-    ensureRowContiguous: true
-)
-
-/// Process-lifetime scratch. First touched from `warmLibraryModel`'s untimed
-/// warm prefill/decode, so the 296 MB allocation and the JIT compiles happen
-/// before any timed window and before the resident-weight wiring walk.
-private enum LagunaInjectStore {
-    struct Scratch {
-        let pool: MLXArray
-        let control: [MLXArray]
-        let matA: MLXArray
-        let matB: MLXArray
-    }
-
-    nonisolated(unsafe) static let scratch: Scratch = {
-        let pool = MLXArray.zeros([lagunaInjectPoolUInt4 * 4], dtype: .uint32)
-        let control = (0..<8).map {
-            MLXArray([UInt32($0 + 1), UInt32(lagunaInjectSweepPasses)])
-        }
-        let matA = MLXArray.zeros(
-            [lagunaInjectMatmulM, lagunaInjectMatmulK], dtype: .bfloat16)
-        let matB = MLXArray.zeros(
-            [lagunaInjectMatmulK, lagunaInjectMatmulN], dtype: .bfloat16)
-        eval([pool, matA, matB] + control)
-        return Scratch(pool: pool, control: control, matA: matA, matB: matB)
-    }()
-}
-
-/// Tail of the injected-dispatch dependency chain, carried across layer
-/// boundaries. MLX's compute encoder is `DispatchTypeConcurrent`
-/// (`device.cpp:548`) and only inserts a barrier on a real hazard
-/// (`device.cpp:325`, `:339`), so an unchained injected dispatch runs
-/// concurrently with real work and costs almost nothing. Chaining reproduces
-/// the strictly serialised stream the real model runs in, which is the regime
-/// whose marginal cost it reads. See `research/tanjiro-pr47-d1.md`.
-private enum LagunaInjectChain {
-    nonisolated(unsafe) static var tail: MLXArray?
-}
-
-/// Layer `layer`'s share of `total` units, spread evenly over the 40 layers.
-private func lagunaInjectShare(_ total: Int, layer: Int) -> Int {
-    guard total > 0 else { return 0 }
-    let layers = LagunaConstants.numHiddenLayers
-    return (layer + 1) * total / layers - layer * total / layers
-}
-
-private let lagunaInjectActive =
-    lagunaInjectDecodeSweeps + lagunaInjectPrefillMatmuls + lagunaInjectDecodeEmpty
-    + lagunaInjectPrefillEmpty > 0
-
-func lagunaInjectLayerWork(layer: Int, isSingleTokenDecode: Bool) {
-    guard lagunaInjectActive else { return }
-    let sweeps = lagunaInjectShare(
-        isSingleTokenDecode ? lagunaInjectDecodeSweeps : 0, layer: layer)
-    let matmuls = lagunaInjectShare(
-        isSingleTokenDecode ? 0 : lagunaInjectPrefillMatmuls, layer: layer)
-    let emptyTotal = isSingleTokenDecode ? lagunaInjectDecodeEmpty : lagunaInjectPrefillEmpty
-    let empties =
-        lagunaInjectEmptySpread
-        ? lagunaInjectShare(emptyTotal, layer: layer) : (layer == 0 ? emptyTotal : 0)
-    let scratch = LagunaInjectStore.scratch
-    var pending: [MLXArray] = []
-    pending.reserveCapacity(sweeps + matmuls + empties)
-    for k in 0..<sweeps {
-        pending.append(
-            lagunaInjectSweepKernel(
-                [scratch.pool, scratch.control[(layer + k) & 7]],
-                grid: (lagunaInjectSweepThreads, 1, 1),
-                threadGroup: (256, 1, 1),
-                outputShapes: [[256]],
-                outputDTypes: [.uint32]
-            )[0])
-    }
-    for _ in 0..<matmuls {
-        pending.append(matmul(scratch.matA, scratch.matB))
-    }
-    if empties > 0 {
-        var tail = LagunaInjectChain.tail ?? scratch.control[0]
-        for k in 0..<empties {
-            tail = lagunaInjectEmptyKernel(
-                [
-                    scratch.control[(layer + k) & 7],
-                    lagunaInjectEmptyChain ? tail : scratch.control[7],
-                ],
-                grid: (lagunaInjectEmptyThreadgroups * 256, 1, 1),
-                threadGroup: (256, 1, 1),
-                outputShapes: [[256]],
-                outputDTypes: [.uint32]
-            )[0]
-            if !lagunaInjectEmptyChain { pending.append(tail) }
-        }
-        LagunaInjectChain.tail = tail
-        if lagunaInjectEmptyChain { pending.append(tail) }
-    }
-    guard !pending.isEmpty else { return }
-    asyncEval(pending)
-}
-
-// END M5 HARDWARE-CONSTANT INSTRUMENT
-// ============================================================================
