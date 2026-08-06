@@ -221,6 +221,14 @@ let lagunaFusedRoutedGateUpEnabled =
 let lagunaPrefillFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_GATE_UP"] != "0"
 
+/// Decode-only second-stage lossless scale encoding for routed gate/up.
+/// Morgan's producer invariant first collapses adjacent group-16 pairs; this
+/// arm then stores the remaining 64 bytes as one row base plus 4-bit deltas
+/// whenever the loaded row span fits. Non-fitting rows use the retained stock
+/// plane through the bank's exact 0xFF escape. Default ON; set "0" to keep the
+/// promoted packed-scale kernel byte-for-byte.
+let lagunaExpertScaleDeltaEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_EXPERT_SCALE_DELTA"] != "0"
 func lagunaNAXAvailable(architecture: String, osSupportsNAX: Bool) -> Bool {
     guard osSupportsNAX,
         let generation = Int(architecture.suffix(3).prefix(2))
@@ -7652,6 +7660,171 @@ if (lane == 0) {
     ensureRowContiguous: true
 )
 
+private let lagunaRoutedSwiGLUQMVDeltaTop8R1Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_delta_top8keys_r1_bf16_v1",
+    inputNames: [
+        "input", "fused_weight", "stock_scales", "scale_nibbles",
+        "scale_bases", "router_keys",
+    ],
+    outputNames: ["activated"],
+    source: """
+constexpr uint input_width = 2048;
+constexpr uint output_width = 512;
+constexpr uint block_width = 512;
+constexpr uint values_per_lane = 16;
+constexpr uint routed_experts = 8;
+constexpr uint fused_row_bytes = 1024;
+constexpr uint fused_expert_bytes = 1024 * fused_row_bytes;
+constexpr uint scale_groups_per_row = 128;
+constexpr uint scale_nibble_bytes_per_row = 32;
+
+uint group = threadgroup_position_in_grid.x;
+uint expert_slot = group % routed_experts;
+uint tile = group / routed_experts;
+uint simd_group = simdgroup_index_in_threadgroup;
+uint lane = thread_index_in_simdgroup;
+uint logical_row = tile * 2 + simd_group;
+\(lagunaRouterTop8PrecomputedPrelude)
+uint expert = top8_winner;
+
+const device uint8_t* expert_weight =
+    (const device uint8_t*)fused_weight + expert * fused_expert_bytes;
+uint gate_row = (logical_row / 32) * 64 + logical_row % 32;
+uint up_row = gate_row + 32;
+uint gate_scale_row = expert * 1024 + gate_row;
+uint up_scale_row = expert * 1024 + up_row;
+
+// The common arm reads each row's complete four-block scale description once:
+// one base byte plus one aligned ushort holding four 4-bit deltas. Morgan's
+// pairwise bank needs four dependent byte loads per row. The 0xFF escape is
+// row-uniform and reads the retained stock plane only for the certified rare
+// rows that do not fit the exact base+delta representation.
+uint gate_base = uint(scale_bases[gate_scale_row]);
+uint up_base = uint(scale_bases[up_scale_row]);
+const device uint8_t* gate_stock_scales =
+    stock_scales + gate_scale_row * scale_groups_per_row;
+const device uint8_t* up_stock_scales =
+    stock_scales + up_scale_row * scale_groups_per_row;
+const device uint16_t* gate_delta_ptr = (const device uint16_t*)(
+    scale_nibbles + gate_scale_row * scale_nibble_bytes_per_row
+    + (lane >> 1) * 2);
+const device uint16_t* up_delta_ptr = (const device uint16_t*)(
+    scale_nibbles + up_scale_row * scale_nibble_bytes_per_row
+    + (lane >> 1) * 2);
+uint gate_deltas = gate_base == 0xFFu ? 0u : uint(gate_delta_ptr[0]);
+uint up_deltas = up_base == 0xFFu ? 0u : uint(up_delta_ptr[0]);
+
+thread float gate_result = 0.0f;
+thread float up_result = 0.0f;
+thread float input_values[values_per_lane];
+
+uint2 gate_codes = *(const device uint2*)(
+    expert_weight + gate_row * fused_row_bytes + lane * 8);
+uint2 up_codes = *(const device uint2*)(
+    expert_weight + up_row * fused_row_bytes + lane * 8);
+uint8_t gate_sb = gate_base == 0xFFu
+    ? gate_stock_scales[lane]
+    : uint8_t(gate_base + (gate_deltas & 0x0Fu));
+uint8_t up_sb = up_base == 0xFFu
+    ? up_stock_scales[lane]
+    : uint8_t(up_base + (up_deltas & 0x0Fu));
+
+for (uint block = 0; block < input_width; block += block_width) {
+    const device vec<bfloat, 4>* input_vectors =
+        (const device vec<bfloat, 4>*)(
+            input + block + lane * values_per_lane);
+    for (uint i = 0; i < values_per_lane / 4; ++i) {
+        const vec<bfloat, 4> values = input_vectors[i];
+        input_values[4 * i] = values[0];
+        input_values[4 * i + 1] = values[1];
+        input_values[4 * i + 2] = values[2];
+        input_values[4 * i + 3] = values[3];
+    }
+
+    const uint2 cur_gate_codes = gate_codes;
+    const uint2 cur_up_codes = up_codes;
+    const uint8_t cur_gate_sb = gate_sb;
+    const uint8_t cur_up_sb = up_sb;
+    const uint next_block = block + block_width;
+    if (next_block < input_width) {
+        uint next_kblock = next_block / block_width;
+        uint next_group = next_block / 16 + lane;
+        gate_sb = gate_base == 0xFFu
+            ? gate_stock_scales[next_group]
+            : uint8_t(gate_base + ((gate_deltas >> (next_kblock * 4)) & 0x0Fu));
+        up_sb = up_base == 0xFFu
+            ? up_stock_scales[next_group]
+            : uint8_t(up_base + ((up_deltas >> (next_kblock * 4)) & 0x0Fu));
+        gate_codes = *(const device uint2*)(
+            expert_weight + gate_row * fused_row_bytes
+            + next_block / 2 + lane * 8);
+        up_codes = *(const device uint2*)(
+            expert_weight + up_row * fused_row_bytes
+            + next_block / 2 + lane * 8);
+    }
+
+    gate_result += laguna_nvfp4_qdot_codes_16(
+        cur_gate_codes, input_values,
+        laguna_nvfp4_scale(cur_gate_sb));
+    up_result += laguna_nvfp4_qdot_codes_16(
+        cur_up_codes, input_values,
+        laguna_nvfp4_scale(cur_up_sb));
+}
+
+gate_result = simd_sum(gate_result);
+up_result = simd_sum(up_result);
+if (lane == 0) {
+    bfloat gate = bfloat(gate_result\(lagunaNvfp4RowScaleSuffix));
+    bfloat up = bfloat(up_result\(lagunaNvfp4RowScaleSuffix));
+    bfloat exp_abs = metal::exp(metal::abs(gate));
+    bfloat denominator = bfloat(1) + exp_abs;
+    bfloat y = bfloat(1) / denominator;
+    bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+    bfloat silu = bfloat(gate * sigmoid);
+    activated[expert_slot * output_width + logical_row] =
+        bfloat(silu * up);
+}
+""",
+    header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
+        + "\n" + lagunaRouterTop8PrologueHeader,
+    ensureRowContiguous: true
+)
+
+func lagunaRoutedSwiGLUQMVDeltaTop8(
+    _ input: MLXArray,
+    fusedWeight: MLXArray,
+    stockScales: MLXArray,
+    scaleNibbles: MLXArray,
+    scaleBases: MLXArray,
+    routerKeys: MLXArray
+) -> MLXArray {
+    let rows = LagunaConstants.numExperts * 2 * LagunaConstants.moeIntermediateSize
+    precondition(input.dtype == .bfloat16)
+    precondition(input.dims(1, 1, LagunaConstants.hiddenSize))
+    precondition(fusedWeight.dtype == .uint32)
+    precondition(stockScales.dtype == .uint8)
+    precondition(stockScales.dims(
+        LagunaConstants.numExperts, 2 * LagunaConstants.moeIntermediateSize,
+        LagunaConstants.hiddenSize / 16))
+    precondition(scaleNibbles.dtype == .uint8)
+    precondition(scaleNibbles.dims(rows, LagunaConstants.hiddenSize / 64))
+    precondition(scaleBases.dtype == .uint8)
+    precondition(scaleBases.dims(rows))
+    precondition(routerKeys.dtype == .uint32)
+    precondition(routerKeys.size == LagunaConstants.numExperts)
+
+    return lagunaRoutedSwiGLUQMVDeltaTop8R1Kernel(
+        [input, fusedWeight, stockScales, scaleNibbles, scaleBases, routerKeys],
+        grid: (LagunaConstants.numExpertsPerTok * 256 * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[
+            1, 1, LagunaConstants.numExpertsPerTok, 1,
+            LagunaConstants.moeIntermediateSize,
+        ]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 func lagunaRoutedSwiGLUQMVPackedTop8(
     _ input: MLXArray,
     fusedWeight: MLXArray,
@@ -9854,6 +10027,10 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     /// separate banks for checkpoint parameter integrity.
     var _fusedRoutedGateUpWeight: MLXArray?
     var _fusedRoutedGateUpScales: MLXArray?
+    /// Pairwise lane-major row-base representation for the routed gate/up
+    /// decode kernel. The original fused plane remains the exact escape arm.
+    var _fusedRoutedGateUpDeltaNibbles: MLXArray?
+    var _fusedRoutedGateUpDeltaBases: MLXArray?
     var _fusedRoutedGateUpSplit: Int = 0
     var _routedDownProj: SwitchLinear?
     var _routedDownWeight: MLXArray?
@@ -9954,6 +10131,16 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         _routedDownProj = downModule
         _routedDownWeight = downWeight
         var prepared = [fusedWeight, fusedScales]
+        if lagunaExpertScaleDeltaEnabled,
+            let deltaBank = lagunaLaneMajorNVFP4ScaleBank(
+                fusedScales.reshaped([experts * 2 * split, scaleDepth]),
+                site: "routed gate/up", layer: -1, pairwise: true,
+                enabled: true)
+        {
+            _fusedRoutedGateUpDeltaNibbles = deltaBank.nibbles
+            _fusedRoutedGateUpDeltaBases = deltaBank.bases
+            prepared.append(contentsOf: deltaBank.arrays)
+        }
         // The shipped down plane is already in kernel order, so flat pair 0
         // (expert 0, output row 0, groups 0/1) is the only pair the quantizer
         // can leave unequal.
@@ -10042,7 +10229,28 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 {
                     lagunaPackedScalesLog.note(
                         "active", "routed swiglu qmv packed dispatch")
-                    if lagunaRouterPrecomputedKeysEnabled,
+                    if lagunaExpertScaleDeltaEnabled,
+                        lagunaRoutedGateUpR1Enabled,
+                        let deltaNibbles = _fusedRoutedGateUpDeltaNibbles,
+                        let deltaBases = _fusedRoutedGateUpDeltaBases,
+                        lagunaRouterPrecomputedKeysEnabled,
+                        let routerKeys,
+                        routerKeys.dtype == .uint32,
+                        routerKeys.size == LagunaConstants.numExperts,
+                        gate.topK == LagunaConstants.numExpertsPerTok,
+                        gate.routerLogitSoftcapping == 0,
+                        gate.eScoreCorrectionBias.size == LagunaConstants.numExperts
+                    {
+                        lagunaTrace("routed gate/up QMV + SwiGLU (pairwise delta scales)")
+                        activated = lagunaRoutedSwiGLUQMVDeltaTop8(
+                            x,
+                            fusedWeight: fusedWeight,
+                            stockScales: fusedScales,
+                            scaleNibbles: deltaNibbles,
+                            scaleBases: deltaBases,
+                            routerKeys: routerKeys
+                        )
+                    } else if lagunaRouterPrecomputedKeysEnabled,
                         let routerKeys,
                         routerKeys.dtype == .uint32,
                         routerKeys.size == LagunaConstants.numExperts,
@@ -11324,4 +11532,3 @@ func lagunaInjectLayerWork(layer: Int, isSingleTokenDecode: Bool) {
 
 // END M5 HARDWARE-CONSTANT INSTRUMENT
 // ============================================================================
-

@@ -878,9 +878,10 @@ struct LagunaLaneMajorScaleBank {
 /// than declining the whole plane; the certificate then requires every
 /// non-escaped row to reproduce the plane byte for byte.
 func lagunaLaneMajorNVFP4ScaleBank(
-    _ scales: MLXArray, site: String, layer: Int, pairwise: Bool = false
+    _ scales: MLXArray, site: String, layer: Int, pairwise: Bool = false,
+    enabled: Bool = lagunaAttnScaleLaneMajorEnabled
 ) -> LagunaLaneMajorScaleBank? {
-    guard lagunaAttnScaleLaneMajorEnabled,
+    guard enabled,
         scales.dtype == .uint8, scales.ndim == 2,
         scales.dim(1).isMultiple(of: 64)
     else {
