@@ -6664,16 +6664,16 @@ if (bits < 16u) {
         const float2 v15 = float2(as_type<half2>(p1))\(weightScale);
         const float2 v26 = float2(as_type<half2>(p2))\(weightScale);
         const float2 v37 = float2(as_type<half2>(p3))\(weightScale);
-        \(seedOperator)
-            (input[\(base)] * v04.x +
-             input[\(base + 1)] * v15.x +
-             input[\(base + 2)] * v26.x +
-             input[\(base + 3)] * v37.x);
-        accum +=
-            (input[\(base + 4)] * v04.y +
-             input[\(base + 5)] * v15.y +
-             input[\(base + 6)] * v26.y +
-             input[\(base + 7)] * v37.y);
+        const float4 w_a = float4(v04.x, v15.x, v26.x, v37.x);
+        const float4 w_b = float4(v04.y, v15.y, v26.y, v37.y);
+        const float4 in_a = float4(
+            input[\(base)], input[\(base + 1)],
+            input[\(base + 2)], input[\(base + 3)]);
+        const float4 in_b = float4(
+            input[\(base + 4)], input[\(base + 5)],
+            input[\(base + 6)], input[\(base + 7)]);
+        \(seedOperator) dot(w_a, in_a);
+        accum += dot(w_b, in_b);
     }
 """
     }
