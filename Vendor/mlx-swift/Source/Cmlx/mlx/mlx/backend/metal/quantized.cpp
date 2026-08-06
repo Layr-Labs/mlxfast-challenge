@@ -1629,7 +1629,17 @@ void gather_qmm_rhs_nax(
   // Normalize the input arrays
   array x = broadcast_with_indices(x_);
   array w = ensure_row_contiguous(w_, d, s);
-  array scales = ensure_row_contiguous(scales_, d, s);
+  // The Laguna runtime's certified pairwise expert scale plane is a
+  // row-contiguous, shape-preserving view at a unique 128-byte offset. Keep
+  // that offset intact so the exact expert specialization below can consume
+  // its compact physical rows. All ordinary scale arrays retain the stock
+  // normalization path.
+  const bool pairwise_scale_marker =
+      scales_.dtype() == uint8 && scales_.flags().row_contiguous &&
+      scales_.offset() == 128;
+  array scales = pairwise_scale_marker
+      ? scales_
+      : ensure_row_contiguous(scales_, d, s);
 
   // TODO: Tune the block sizes
   int bm = 64, bn = 64, bk = 64;
@@ -1660,6 +1670,14 @@ void gather_qmm_rhs_nax(
       darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
       group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
       align_N && align_K && bm == 64 && wm == 4 && (wn == 2 || wn == 1);
+  const bool expert_pairwise_scales =
+      pairwise_scale_marker && expert_aligned && mode == "nvfp4" &&
+      K == 2048 && N == 1024 && scales_.ndim() == 3 &&
+      scales_.shape(-1) == K / group_size;
+  if (pairwise_scale_marker && !expert_pairwise_scales) {
+    throw std::runtime_error(
+        "[gather_qmm] Laguna pairwise scale marker reached a non-expert path");
+  }
   std::string type_string = get_type_string(x.dtype());
   static const bool static_laguna_shapes =
       env::get_var("DARKBLOOM_STATIC_NVFP4_SHAPES", "") != "0";
@@ -1770,7 +1788,8 @@ void gather_qmm_rhs_nax(
           : "",
       expert_aligned
           ? ("_eg_" + std::to_string(egroups) + (expert_widest ? "_ws_1" : "_ws_0") +
-             (expert_wideld ? "_wl_1" : "_wl_0"))
+             (expert_wideld ? "_wl_1" : "_wl_0") +
+             (expert_pairwise_scales ? "_ps_1" : "_ps_0"))
           : "");
 
   // Skipping dead runs is a pure work elision (see function constant 203 in
@@ -1890,7 +1909,8 @@ void gather_qmm_rhs_nax(
         "bfloat",
         egroups,
         expert_widest,
-        expert_wideld);
+        expert_wideld,
+        expert_pairwise_scales);
     kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
   } else {
     kernel = get_gather_qmm_nax_kernel(

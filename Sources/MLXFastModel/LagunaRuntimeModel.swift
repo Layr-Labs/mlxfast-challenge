@@ -221,6 +221,13 @@ let lagunaFusedRoutedGateUpEnabled =
 let lagunaPrefillFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_GATE_UP"] != "0"
 
+/// Exact prefill-only scale-plane compaction for the expert-aligned NAX path.
+/// The prepared marker view is installed only after the loaded scale bytes pass
+/// `lagunaPairwisePrefillScalePlane`'s reconstruction certificate; setting the
+/// flag to zero keeps the stock fused scale plane and backend specialization.
+let lagunaPrefillExpertPairwiseScalesEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_EXPERT_PAIRWISE_SCALES"] != "0"
+
 func lagunaNAXAvailable(architecture: String, osSupportsNAX: Bool) -> Bool {
     guard osSupportsNAX,
         let generation = Int(architecture.suffix(3).prefix(2))
@@ -9770,6 +9777,7 @@ private func lagunaFusedSortedRoutedGateUp(
     indices: MLXArray,
     fusedWeight: MLXArray,
     fusedScales: MLXArray,
+    pairwiseScales: MLXArray?,
     split: Int,
     downProj: SwitchLinear,
     deferUnsort: Bool
@@ -9803,7 +9811,7 @@ private func lagunaFusedSortedRoutedGateUp(
     let gateUp = MLX.gatherQuantizedMM(
         sortedX,
         fusedWeight,
-        scales: fusedScales,
+        scales: pairwiseScales ?? fusedScales,
         biases: nil,
         rhsIndices: idx,
         transpose: true,
@@ -9854,6 +9862,10 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     /// separate banks for checkpoint parameter integrity.
     var _fusedRoutedGateUpWeight: MLXArray?
     var _fusedRoutedGateUpScales: MLXArray?
+    /// Shape-preserving, offset-marked side plane for the M5 expert prefill
+    /// NAX loader. Nil on non-NAX hardware, when disabled, or when the loaded
+    /// checkpoint fails the exact adjacent-pair certificate.
+    var _fusedRoutedGateUpPairwiseScales: MLXArray?
     var _fusedRoutedGateUpSplit: Int = 0
     var _routedDownProj: SwitchLinear?
     var _routedDownWeight: MLXArray?
@@ -9954,6 +9966,17 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         _routedDownProj = downModule
         _routedDownWeight = downWeight
         var prepared = [fusedWeight, fusedScales]
+        if lagunaPrefillExpertPairwiseScalesEnabled,
+            lagunaExpertAlignedGatherEnabled,
+            // gate and up were quantized in separate calls. Their only legal
+            // mismatches are pair zero of fused expert-0 rows 0 and 32.
+            let pairwiseScales = lagunaPairwisePrefillScalePlane(
+                fusedScales,
+                allowedFlatPairs: [0, 32 * (scaleDepth / 2)])
+        {
+            _fusedRoutedGateUpPairwiseScales = pairwiseScales
+            prepared.append(pairwiseScales)
+        }
         // The shipped down plane is already in kernel order, so flat pair 0
         // (expert 0, output row 0, groups 0/1) is the only pair the quantizer
         // can leave unequal.
@@ -10188,6 +10211,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     indices: inds,
                     fusedWeight: fusedWeight,
                     fusedScales: fusedScales,
+                    pairwiseScales: _fusedRoutedGateUpPairwiseScales,
                     split: _fusedRoutedGateUpSplit,
                     downProj: downProj,
                     deferUnsort:
@@ -11324,4 +11348,3 @@ func lagunaInjectLayerWork(layer: Int, isSingleTokenDecode: Bool) {
 
 // END M5 HARDWARE-CONSTANT INSTRUMENT
 // ============================================================================
-

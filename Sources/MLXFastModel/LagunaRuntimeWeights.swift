@@ -978,6 +978,70 @@ func lagunaLaneMajorScaleBankReproducesScales(
 /// full Apple GPU cache line.
 let lagunaScalePatchHeaderBytes = 128
 
+/// Builds the shape-preserving marker view consumed by the expert-aligned
+/// prefill NAX kernel's pairwise-scale specialization.  Every physical row is
+/// `[even group scales][first odd scale][unused padding]`; the public view
+/// retains the stock shape and starts at a distinctive 128-byte offset so the
+/// MLX backend can select the compact interpretation without changing the
+/// `gatherQuantizedMM` API or its shape validation.
+///
+/// This is fail closed. `allowedFlatPairs` names the only adjacent pairs whose
+/// odd byte may differ; each row's first odd byte is copied into the first byte
+/// of that row's otherwise-unused second half. Every other odd byte must equal
+/// its even partner. The full-
+/// size physical rows are intentional: they give the existing primitive its
+/// expected logical extent while the timed kernel reads only `groups / 2`
+/// bytes from each normal row -- one 64-byte cache line at the fused gate/up
+/// geometry instead of two.
+func lagunaPairwisePrefillScalePlane(
+    _ scales: MLXArray, allowedFlatPairs: [Int]
+) -> MLXArray? {
+    guard scales.dtype == .uint8, scales.ndim >= 2,
+        scales.dim(-1) >= 2, scales.dim(-1) % 2 == 0,
+        !allowedFlatPairs.isEmpty,
+        allowedFlatPairs.count <= lagunaScalePatchHeaderBytes
+    else {
+        return nil
+    }
+    let groups = scales.dim(-1)
+    let half = groups / 2
+    let rows = scales.size / groups
+    let pairs = scales.reshaped([rows * half, 2])
+    let even = pairs[0..., 0].reshaped([rows, half])
+    let odd = pairs[0..., 1].reshaped([rows, half])
+
+    guard allowedFlatPairs.allSatisfy({ $0 >= 0 && $0 < rows * half }) else {
+        return nil
+    }
+    let mismatch = (even .!= odd).asType(.int32).reshaped([-1])
+    var violationCount = mismatch.sum()
+    for pair in allowedFlatPairs {
+        violationCount = violationCount - mismatch[pair]
+    }
+    let violations = violationCount.item(Int32.self)
+    guard violations == 0 else { return nil }
+
+    let firstOdd = odd[0..., 0].reshaped([rows, 1])
+    let padding = MLXArray.zeros([rows, half - 1], dtype: .uint8)
+    let physicalRows = contiguous(
+        concatenated([even, firstOdd, padding], axis: 1))
+    let marker = MLXArray.zeros([lagunaScalePatchHeaderBytes], dtype: .uint8)
+    let backing = contiguous(
+        concatenated([marker, physicalRows.reshaped([-1])]))
+
+    var strides = [Int](repeating: 1, count: scales.ndim)
+    if scales.ndim > 1 {
+        for axis in stride(from: scales.ndim - 2, through: 0, by: -1) {
+            strides[axis] = strides[axis + 1] * scales.dim(axis + 1)
+        }
+    }
+    return asStrided(
+        backing,
+        scales.shape,
+        strides: strides,
+        offset: lagunaScalePatchHeaderBytes)
+}
+
 /// Byte length of the halved packed routed gate/up scale bank, header included.
 let lagunaPackedRoutedGateUpScaleBytes =
     lagunaScalePatchHeaderBytes
