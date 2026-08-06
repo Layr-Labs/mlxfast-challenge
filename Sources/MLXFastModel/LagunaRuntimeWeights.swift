@@ -715,6 +715,16 @@ let lagunaAttnScalePairwiseQKVEnabled =
 let lagunaAttnScalePairwiseOProjEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ATTN_SCALE_PAIRWISE_OPROJ"] != "0"
 
+/// Successor census (2026-08-06): a three-bit row delta is not a useful next
+/// rung. Only roughly four-fifths of QKV rows and almost no o_proj rows span
+/// at most seven codes after pair collapse; a uniform plane increases traffic,
+/// while a mixed bitstream saves only about 2.5 MB/token and adds extraction.
+/// Keep the four-bit format unless a different producer invariant appears.
+/// A lossless o_proj pair-LUT successor was exact too, but repeated ON/OFF hot
+/// brackets put its 1 KiB constant lookup behind the existing integer extract.
+/// QKV `uchar4` vector-shift unpack was exact but about 4% behind its scalar
+/// control even though that control ran second on the hotter local host.
+
 /// `DARKBLOOM_ATTN_SCALE_NARROW_LOG=1` reports which scale plane each attention
 /// QMV dispatch reads. Off by default so the scored dispatch pays no lock and
 /// no string interpolation, exactly as `lagunaTrace` is gated.
