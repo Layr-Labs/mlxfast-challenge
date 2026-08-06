@@ -715,6 +715,25 @@ let lagunaAttnScalePairwiseQKVEnabled =
 let lagunaAttnScalePairwiseOProjEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ATTN_SCALE_PAIRWISE_OPROJ"] != "0"
 
+/// The pairwise banks above certify that lanes `2j` and `2j + 1` reconstruct
+/// the same E4M3 scale byte on every non-escaped row.  The decode-only QKV and
+/// o_proj kernels may therefore decode that byte once in the even lane and
+/// transfer the resulting `float` bit pattern with `simd_shuffle_xor`.  Escaped
+/// rows remain on the stock per-lane scale plane and never share a value.
+///
+/// These switches select distinct kernel names and leave the inherited
+/// pairwise kernels resident as an exact in-binary fallback.  They are split by
+/// site so an official paired run can ablate QKV and o_proj independently.
+let lagunaAttnScaleLaneBroadcastQKVEnabled =
+    lagunaAttnScalePairwiseQKVEnabled
+    && ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ATTN_SCALE_LANE_BROADCAST_QKV"] != "0"
+
+let lagunaAttnScaleLaneBroadcastOProjEnabled =
+    lagunaAttnScalePairwiseOProjEnabled
+    && ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ATTN_SCALE_LANE_BROADCAST_OPROJ"] != "0"
+
 /// `DARKBLOOM_ATTN_SCALE_NARROW_LOG=1` reports which scale plane each attention
 /// QMV dispatch reads. Off by default so the scored dispatch pays no lock and
 /// no string interpolation, exactly as `lagunaTrace` is gated.
