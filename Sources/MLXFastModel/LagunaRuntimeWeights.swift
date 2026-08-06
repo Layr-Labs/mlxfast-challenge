@@ -991,6 +991,22 @@ let lagunaRoutedDownScaleBytes =
     + LagunaConstants.numExperts * LagunaConstants.hiddenSize
     * (LagunaConstants.moeIntermediateSize / 32)
 
+/// Byte length of the halved shared-expert fused gate/up scale plane, header
+/// included. The fused plane is `[2 * shared, hidden / 16]` full-width; the
+/// halved form keeps one byte per group pair: `[2 * shared, hidden / 32]`.
+let lagunaSharedGateUpScaleBytes =
+    lagunaScalePatchHeaderBytes
+    + 2 * LagunaConstants.sharedExpertIntermediateSize
+    * (LagunaConstants.hiddenSize / 32)
+
+/// Byte length of the halved shared-expert down-projection scale plane,
+/// header included. Full width is `[hidden, shared / 16]`; halved keeps one
+/// byte per group pair: `[hidden, shared / 32]`.
+let lagunaSharedDownScaleBytes =
+    lagunaScalePatchHeaderBytes
+    + LagunaConstants.hiddenSize
+    * (LagunaConstants.sharedExpertIntermediateSize / 32)
+
 /// Halves a group-16 NVFP4 uint8 scale plane along its last (group) axis by
 /// keeping only the even-indexed byte of every adjacent group pair, so a
 /// decode kernel reads one scale byte per 32 weights instead of two.
