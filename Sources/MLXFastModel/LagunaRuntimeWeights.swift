@@ -386,6 +386,12 @@ public final class LagunaRuntimeWeightCache {
                     setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
                     setenv("MLX_MAX_OPS_PER_BUFFER", "200", 0)
                 }
+                // LOCAL PROBE ONLY (not for submission): override the op cap
+                // so the command-buffer boundary phase can be swept without a
+                // rebuild per value. Overwrite=1 deliberately beats the 200.
+                if let probeOps = env["DARKBLOOM_PROBE_CB_OPS"], !probeOps.isEmpty {
+                    setenv("MLX_MAX_OPS_PER_BUFFER", probeOps, 1)
+                }
                 startupMemoryPolicy = nil
             }
         } else {
