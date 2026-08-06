@@ -28,9 +28,10 @@ inline constexpr short get_bytes_per_pack() {
 }
 
 template <typename T, int group_size>
-static inline T dequantize_scale(uint8_t s) {
+static inline __attribute__((always_inline)) T dequantize_scale(uint8_t s) {
   if constexpr (group_size == 16) {
-    // Use nv scale
+    // NVFP4 e4m3 scale — hot path for Laguna MoE (group 16). Inlined to avoid
+    // per-dot call overhead in gather-QMV; caller hoists scale * 16384 fold.
     return T(*(thread fp8_e4m3*)(&s));
   } else {
     return T(*(thread fp8_e8m0*)(&s));
