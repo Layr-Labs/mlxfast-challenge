@@ -160,7 +160,7 @@ let lagunaFusedRoutedSwiGLUQMVEnabled =
 /// order, and every BF16 boundary are identical to the stock kernel — only
 /// scale address computation changes, so the packed dispatch is bit-exact
 /// (class A).
-/// Memory: +~32 MB resident per sparse layer while enabled (the stock fused
+/// Memory: +~16 MiB resident per sparse layer while enabled (the stock fused
 /// code bank stays resident for prefill and fallback paths).
 let lagunaPackedScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] != "0"
@@ -220,6 +220,12 @@ let lagunaFusedRoutedGateUpEnabled =
 /// independently ablatable and row-arithmetic-identical to separate banks.
 let lagunaPrefillFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_GATE_UP"] != "0"
+
+/// Exact prefill-only reuse of the certified packed decode scale bank by the
+/// expert-aligned NAX path. Setting the flag to zero keeps the stock fused
+/// scale plane and backend specialization.
+let lagunaPrefillExpertPairwiseScalesEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_EXPERT_PAIRWISE_SCALES"] != "0"
 
 func lagunaNAXAvailable(architecture: String, osSupportsNAX: Bool) -> Bool {
     guard osSupportsNAX,
@@ -9770,6 +9776,7 @@ private func lagunaFusedSortedRoutedGateUp(
     indices: MLXArray,
     fusedWeight: MLXArray,
     fusedScales: MLXArray,
+    pairwiseScales: MLXArray?,
     split: Int,
     downProj: SwitchLinear,
     deferUnsort: Bool
@@ -9803,7 +9810,7 @@ private func lagunaFusedSortedRoutedGateUp(
     let gateUp = MLX.gatherQuantizedMM(
         sortedX,
         fusedWeight,
-        scales: fusedScales,
+        scales: pairwiseScales ?? fusedScales,
         biases: nil,
         rhsIndices: idx,
         transpose: true,
@@ -9854,6 +9861,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     /// separate banks for checkpoint parameter integrity.
     var _fusedRoutedGateUpWeight: MLXArray?
     var _fusedRoutedGateUpScales: MLXArray?
+    /// Shape-preserving marker view over the existing packed decode scale bank
+    /// for the M5 expert prefill NAX loader. It owns no storage.
+    var _fusedRoutedGateUpPairwiseScales: MLXArray?
     var _fusedRoutedGateUpSplit: Int = 0
     var _routedDownProj: SwitchLinear?
     var _routedDownWeight: MLXArray?
@@ -9968,6 +9978,14 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 fusedScales: fusedScales,
                 experts: experts,
                 split: split))
+        if lagunaPrefillExpertPairwiseScalesEnabled,
+            lagunaExpertAlignedGatherEnabled,
+            let packedScales = _packedRoutedGateUpBank,
+            let pairwiseView = lagunaPackedPrefillScaleView(packedScales)
+        {
+            _fusedRoutedGateUpPairwiseScales = pairwiseView
+            prepared.append(pairwiseView)
+        }
         return prepared
     }
 
@@ -10188,6 +10206,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     indices: inds,
                     fusedWeight: fusedWeight,
                     fusedScales: fusedScales,
+                    pairwiseScales: _fusedRoutedGateUpPairwiseScales,
                     split: _fusedRoutedGateUpSplit,
                     downProj: downProj,
                     deferUnsort:
@@ -11324,4 +11343,3 @@ func lagunaInjectLayerWork(layer: Int, isSingleTokenDecode: Bool) {
 
 // END M5 HARDWARE-CONSTANT INSTRUMENT
 // ============================================================================
-
