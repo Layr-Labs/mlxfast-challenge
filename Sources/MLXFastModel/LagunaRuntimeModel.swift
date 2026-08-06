@@ -165,6 +165,20 @@ let lagunaFusedRoutedSwiGLUQMVEnabled =
 let lagunaPackedScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] != "0"
 
+/// Store Morgan's certified pairwise routed gate/up scale bytes in logical
+/// fused-row order instead of decode walk order. The byte count and values are
+/// unchanged; a whole row's four K-block scale chunks become one 64-byte
+/// cache-line-local run. Set to zero to restore the promoted packed layout and
+/// kernel byte-for-byte.
+let lagunaExpertScaleInterchangeEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_EXPERT_SCALE_INTERCHANGE"] != "0"
+
+/// M5-only prefill consumer for the same row-major compact bank. The existing
+/// NAX hardware predicate keeps non-NAX machines on the stock full scale plane.
+let lagunaExpertScaleInterchangePrefillEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_EXPERT_SCALE_INTERCHANGE_PREFILL"] != "0"
+
 /// Publish exact corrected router ordinals from the existing fused producer
 /// so routed QMV consumers avoid repeating the nonlinear key construction.
 /// The OFF arm restores the promoted selector dependency exactly.
@@ -7652,6 +7666,143 @@ if (lane == 0) {
     ensureRowContiguous: true
 )
 
+/// Row-major twin of the promoted packed R1 kernel. It reads the same exact
+/// certified even scale bytes and the same two exception bytes, but each
+/// fused output row owns one contiguous 64-byte run spanning all four K
+/// blocks. Per-row qdot, reduction, SiLU, and BF16 rounding are unchanged.
+private let lagunaRoutedSwiGLUQMVRowMajorTop8R1Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_rowmajor_top8keys_r1_bf16_v1",
+    inputNames: ["input", "fused_weight", "rowmajor_scales", "router_keys"],
+    outputNames: ["activated"],
+    source: """
+constexpr uint input_width = 2048;
+constexpr uint output_width = 512;
+constexpr uint block_width = 512;
+constexpr uint values_per_lane = 16;
+constexpr uint routed_experts = 8;
+constexpr uint fused_row_bytes = 1024;
+constexpr uint fused_expert_bytes = 1024 * fused_row_bytes;
+constexpr uint scale_patch_bytes = \(lagunaScalePatchHeaderBytes);
+constexpr uint scale_row_bytes = 64;
+constexpr uint scale_expert_bytes = 1024 * scale_row_bytes;
+
+uint group = threadgroup_position_in_grid.x;
+uint expert_slot = group % routed_experts;
+uint tile = group / routed_experts;
+uint simd_group = simdgroup_index_in_threadgroup;
+uint lane = thread_index_in_simdgroup;
+uint logical_row = tile * 2 + simd_group;
+\(lagunaRouterTop8PrecomputedPrelude)
+uint expert = top8_winner;
+
+const device uint8_t* expert_weight =
+    (const device uint8_t*)fused_weight + expert * fused_expert_bytes;
+uint gate_row = (logical_row / 32) * 64 + logical_row % 32;
+uint up_row = gate_row + 32;
+const device uint8_t* expert_scales =
+    rowmajor_scales + scale_patch_bytes + expert * scale_expert_bytes;
+const device uint8_t* gate_scales =
+    expert_scales + gate_row * scale_row_bytes;
+const device uint8_t* up_scales =
+    expert_scales + up_row * scale_row_bytes;
+
+thread float gate_result = 0.0f;
+thread float up_result = 0.0f;
+thread float input_values[values_per_lane];
+
+uint2 gate_codes = *(const device uint2*)(
+    expert_weight + gate_row * fused_row_bytes + lane * 8);
+uint2 up_codes = *(const device uint2*)(
+    expert_weight + up_row * fused_row_bytes + lane * 8);
+bool patch_lane = expert == 0 && logical_row == 0 && lane == 1;
+uint8_t gate_sb = patch_lane
+    ? rowmajor_scales[0]
+    : gate_scales[lane >> 1];
+uint8_t up_sb = patch_lane
+    ? rowmajor_scales[1]
+    : up_scales[lane >> 1];
+
+for (uint block = 0; block < input_width; block += block_width) {
+    const device vec<bfloat, 4>* input_vectors =
+        (const device vec<bfloat, 4>*) (
+            input + block + lane * values_per_lane);
+    for (uint i = 0; i < values_per_lane / 4; ++i) {
+        const vec<bfloat, 4> values = input_vectors[i];
+        input_values[4 * i] = values[0];
+        input_values[4 * i + 1] = values[1];
+        input_values[4 * i + 2] = values[2];
+        input_values[4 * i + 3] = values[3];
+    }
+
+    const uint2 cur_gate_codes = gate_codes;
+    const uint2 cur_up_codes = up_codes;
+    const uint8_t cur_gate_sb = gate_sb;
+    const uint8_t cur_up_sb = up_sb;
+    const uint next_block = block + block_width;
+    if (next_block < input_width) {
+        uint next_scale = next_block / 32 + (lane >> 1);
+        gate_sb = gate_scales[next_scale];
+        up_sb = up_scales[next_scale];
+        gate_codes = *(const device uint2*)(
+            expert_weight + gate_row * fused_row_bytes
+            + next_block / 2 + lane * 8);
+        up_codes = *(const device uint2*)(
+            expert_weight + up_row * fused_row_bytes
+            + next_block / 2 + lane * 8);
+    }
+
+    gate_result += laguna_nvfp4_qdot_codes_16(
+        cur_gate_codes, input_values,
+        laguna_nvfp4_scale(cur_gate_sb));
+    up_result += laguna_nvfp4_qdot_codes_16(
+        cur_up_codes, input_values,
+        laguna_nvfp4_scale(cur_up_sb));
+}
+
+gate_result = simd_sum(gate_result);
+up_result = simd_sum(up_result);
+if (lane == 0) {
+    bfloat gate = bfloat(gate_result\(lagunaNvfp4RowScaleSuffix));
+    bfloat up = bfloat(up_result\(lagunaNvfp4RowScaleSuffix));
+    bfloat exp_abs = metal::exp(metal::abs(gate));
+    bfloat denominator = bfloat(1) + exp_abs;
+    bfloat y = bfloat(1) / denominator;
+    bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+    bfloat silu = bfloat(gate * sigmoid);
+    activated[expert_slot * output_width + logical_row] =
+        bfloat(silu * up);
+}
+""",
+    header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
+        + "\n" + lagunaRouterTop8PrologueHeader,
+    ensureRowContiguous: true
+)
+
+func lagunaRoutedSwiGLUQMVRowMajorTop8(
+    _ input: MLXArray,
+    fusedWeight: MLXArray,
+    rowMajorScales: MLXArray,
+    routerKeys: MLXArray
+) -> MLXArray {
+    precondition(input.dtype == .bfloat16)
+    precondition(input.dims(1, 1, LagunaConstants.hiddenSize))
+    precondition(fusedWeight.dtype == .uint32)
+    precondition(rowMajorScales.dtype == .uint8)
+    precondition(rowMajorScales.size == lagunaPackedRoutedGateUpScaleBytes)
+    precondition(routerKeys.dtype == .uint32)
+    precondition(routerKeys.size == LagunaConstants.numExperts)
+    return lagunaRoutedSwiGLUQMVRowMajorTop8R1Kernel(
+        [input, fusedWeight, rowMajorScales, routerKeys],
+        grid: (LagunaConstants.numExpertsPerTok * 256 * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[
+            1, 1, LagunaConstants.numExpertsPerTok, 1,
+            LagunaConstants.moeIntermediateSize,
+        ]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 func lagunaRoutedSwiGLUQMVPackedTop8(
     _ input: MLXArray,
     fusedWeight: MLXArray,
@@ -9770,6 +9921,7 @@ private func lagunaFusedSortedRoutedGateUp(
     indices: MLXArray,
     fusedWeight: MLXArray,
     fusedScales: MLXArray,
+    pairwiseScales: MLXArray?,
     split: Int,
     downProj: SwitchLinear,
     deferUnsort: Bool
@@ -9803,7 +9955,7 @@ private func lagunaFusedSortedRoutedGateUp(
     let gateUp = MLX.gatherQuantizedMM(
         sortedX,
         fusedWeight,
-        scales: fusedScales,
+        scales: pairwiseScales ?? fusedScales,
         biases: nil,
         rhsIndices: idx,
         transpose: true,
@@ -9870,6 +10022,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     /// the halved plane would not be bit-exact, in which case the routed QMV
     /// path reads the full fused scales instead.
     var _packedRoutedGateUpBank: MLXArray?
+    var _fusedRoutedGateUpPairwiseScales: MLXArray?
+    var _routedGateUpScaleBankIsRowMajor = false
 
     /// Builds and retains the fused routed gate/up NVFP4 banks from the
     /// loaded stock `SwitchGLU` submodules (reached through the public
@@ -9963,11 +10117,32 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
             _routedDownScales = halvedDown
             prepared.append(halvedDown)
         }
-        prepared.append(
-            contentsOf: preparePackedRoutedGateUpBank(
-                fusedScales: fusedScales,
-                experts: experts,
-                split: split))
+        // Reuse Morgan's exact group-pair certificate, changing only the
+        // compact plane's physical order. The two exception bytes retain the
+        // same header slots as the promoted packed bank.
+        if lagunaPackedScalesEnabled,
+            lagunaExpertScaleInterchangeEnabled,
+            let rowMajor = lagunaHalvedGroup32ScalePlane(
+                fusedScales,
+                allowedFlatPairs: [0, 32 * (scaleDepth / 2)])
+        {
+            _packedRoutedGateUpBank = rowMajor
+            _routedGateUpScaleBankIsRowMajor = true
+            prepared.append(rowMajor)
+            if lagunaExpertScaleInterchangePrefillEnabled,
+                lagunaExpertAlignedGatherEnabled,
+                let marker = lagunaRowMajorPairwisePrefillScaleView(rowMajor)
+            {
+                _fusedRoutedGateUpPairwiseScales = marker
+                prepared.append(marker)
+            }
+        } else {
+            prepared.append(
+                contentsOf: preparePackedRoutedGateUpBank(
+                    fusedScales: fusedScales,
+                    experts: experts,
+                    split: split))
+        }
         return prepared
     }
 
@@ -10042,7 +10217,35 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 {
                     lagunaPackedScalesLog.note(
                         "active", "routed swiglu qmv packed dispatch")
-                    if lagunaRouterPrecomputedKeysEnabled,
+                    if _routedGateUpScaleBankIsRowMajor,
+                        lagunaRoutedGateUpR1Enabled,
+                        lagunaRouterPrecomputedKeysEnabled,
+                        let routerKeys,
+                        routerKeys.dtype == .uint32,
+                        routerKeys.size == LagunaConstants.numExperts,
+                        gate.topK == LagunaConstants.numExpertsPerTok,
+                        gate.routerLogitSoftcapping == 0,
+                        gate.eScoreCorrectionBias.size == LagunaConstants.numExperts
+                    {
+                        lagunaTrace("routed gate/up QMV + SwiGLU (row-major scales)")
+                        activated = lagunaRoutedSwiGLUQMVRowMajorTop8(
+                            x,
+                            fusedWeight: fusedWeight,
+                            rowMajorScales: packedBank,
+                            routerKeys: routerKeys
+                        )
+                    } else if _routedGateUpScaleBankIsRowMajor {
+                        // A row-major bank must never reach the promoted
+                        // walk-order reader. If any decode contract declines,
+                        // restore the exact full-scale kernel instead.
+                        lagunaTrace("routed gate/up QMV + SwiGLU (row-major fallback)")
+                        activated = lagunaRoutedSwiGLUQMV(
+                            x,
+                            fusedWeight: fusedWeight,
+                            fusedScales: fusedScales,
+                            indices: inds
+                        )
+                    } else if lagunaRouterPrecomputedKeysEnabled,
                         let routerKeys,
                         routerKeys.dtype == .uint32,
                         routerKeys.size == LagunaConstants.numExperts,
@@ -10188,6 +10391,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     indices: inds,
                     fusedWeight: fusedWeight,
                     fusedScales: fusedScales,
+                    pairwiseScales: _fusedRoutedGateUpPairwiseScales,
                     split: _fusedRoutedGateUpSplit,
                     downProj: downProj,
                     deferUnsort:
@@ -11324,4 +11528,3 @@ func lagunaInjectLayerWork(layer: Int, isSingleTokenDecode: Bool) {
 
 // END M5 HARDWARE-CONSTANT INSTRUMENT
 // ============================================================================
-

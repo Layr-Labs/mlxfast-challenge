@@ -978,6 +978,28 @@ func lagunaLaneMajorScaleBankReproducesScales(
 /// full Apple GPU cache line.
 let lagunaScalePatchHeaderBytes = 128
 
+/// Shape-preserving marker over a certified row-major pairwise scale bank.
+/// The backing is `[128-byte patch header][64 bytes per fused output row]`;
+/// the public shape remains the stock `[256, 1024, 128]` so
+/// `gatherQuantizedMM` keeps its ordinary semantic validation. Only the M5
+/// expert-aligned backend specialization recognizes the evaluated compact-row
+/// strides and consumes the backing directly.
+func lagunaRowMajorPairwisePrefillScaleView(_ bank: MLXArray) -> MLXArray? {
+    let rows = 2 * LagunaConstants.moeIntermediateSize
+    let groups = LagunaConstants.hiddenSize / 16
+    let compactGroups = groups / 2
+    let expectedBytes = lagunaScalePatchHeaderBytes
+        + LagunaConstants.numExperts * rows * compactGroups
+    guard bank.dtype == .uint8, bank.ndim == 1, bank.size == expectedBytes else {
+        return nil
+    }
+    return asStrided(
+        bank,
+        [LagunaConstants.numExperts, rows, groups],
+        strides: [rows * compactGroups, compactGroups, 0],
+        offset: 0)
+}
+
 /// Byte length of the halved packed routed gate/up scale bank, header included.
 let lagunaPackedRoutedGateUpScaleBytes =
     lagunaScalePatchHeaderBytes
