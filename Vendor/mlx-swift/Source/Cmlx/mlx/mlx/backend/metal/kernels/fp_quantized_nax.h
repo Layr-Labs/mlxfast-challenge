@@ -614,7 +614,10 @@ METAL_FUNC void fp_qmm_t_impl(
   dispatch_bool(aligned_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
       for (int k = 0; k < kernel_K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Dead at k==0 for fixed_K>0: no prior-iteration Ws read to order.
+        if (fixed_K == 0 || k > 0) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
@@ -653,8 +656,10 @@ METAL_FUNC void fp_qmm_t_impl(
         loader_w.next();
       }
 
-      // Store results to device memory
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Dead for fixed_K>0: no next iteration, epilogue never touches Ws.
+      if (fixed_K == 0) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
 
       if constexpr (kAlignedM.value && kAlignedN.value) {
         Dtile.store(y + tm * kernel_N + tn, kernel_N);
@@ -1539,6 +1544,26 @@ METAL_FUNC int laguna_sorted_lower_bound(
   return lo;
 }
 
+template <typename T>
+METAL_FUNC void laguna_load_lhs(thread NAXTile<T, 1, 2>& t,
+    const device T* x, const device uint32_t* lhs, int q, uint rows,
+    int K, int k, short nr) {
+  const short2 sc = BaseNAXFrag::get_coord();
+  for (short c = 0; c < 2; ++c) {
+    thread auto& f = t.frag_at(0, c);
+    for (short i = 0; i < 2; ++i) {
+      const short r = sc.y + i * 8;
+      const uint xr = r < nr ? lhs[q + r] : rows;
+      vec<T, 4> v = T(0);
+      if (xr < rows) {
+        const device T* p = x + xr * K + k + c * 16 + sc.x;
+        v = *reinterpret_cast<const device vec<T, 4>*>(p);
+      }
+      for (short j = 0; j < 4; ++j) f[i * 4 + j] = v[j];
+    }
+  }
+}
+
 // Laguna prefill sorts the M routed rows by expert before this QMM. The stock
 // kernel assigns fixed 64-row tiles, then walks every expert run intersecting
 // a tile; a run crossing a tile boundary stages the same expert weight tile
@@ -1564,12 +1589,14 @@ template <
     typename Wtype = bfloat,
     int tg_expert_groups = 64,
     bool wide_store = false,
-    bool wide_load = false>
+    bool wide_load = false,
+    bool gather_lhs = false>
 [[kernel]] void fp_gather_qmm_rhs_expert_nax(
     const device T* x,
     const device uint32_t* w,
     const device uint8_t* scales,
     const device uint32_t* indices,
+    const device uint32_t* lhs_indices,
     device T* y,
     const constant int& M,
     const constant int& N,
@@ -1703,8 +1730,8 @@ template <
       NAXTile<float, TM, TN> Dtile;
       Dtile.clear();
 
-      const device T* xn =
-          x + size_t(chunk_start + tm) * kernel_K;
+      const device T* xn = gather_lhs ? x
+          : x + size_t(chunk_start + tm) * kernel_K;
       thread loader_w_t loader_w(
           wl + size_t(expert) * stride_w,
           scale_base + size_t(expert) * stride_s,
@@ -1731,7 +1758,11 @@ template <
         if (sg_active) {
           STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            if (sgp_sm == SM) {
+            if constexpr (gather_lhs) {
+              laguna_load_lhs(
+                  Atile[kk1 / SK], x, lhs_indices, chunk_start + tm,
+                  M / 8, kernel_K, k * BK + kk1, sgp_sm);
+            } else if (sgp_sm == SM) {
               // 8B alignment certified: fn multiples of 4 elems, off_y in
               // {0,16}, kk1 in {0,32}, str_x = 2048. Same bytes, same slots.
               Atile[kk1 / SK].load_contig(xn + kk1, kernel_K);

@@ -249,7 +249,7 @@ private let routeFusedScatterTopK = 8
 private let routeFusedScatterKernel: MLXFast.MLXFastKernel = {
     let m = routeFusedScatterTopK
     return MLXFast.metalKernel(
-        name: "mlx_lm_route_csort_scatter_fused_m\(m)_u32_v4",
+        name: "mlx_lm_route_csort_scatter_fused_m\(m)_u32_v3",
         inputNames: ["keys"],
         outputNames: ["row_order", "sorted_keys", "inverse_order"],
         source: """
@@ -337,16 +337,15 @@ private func routeCountingSortFused(
     return (outputs[0], outputs[1], outputs[2])
 }
 
-public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+public func gatherSortMetadata(
+    indices: MLXArray
+) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
     if let fused = routeCountingSortFused(indices, m: m) {
-        return (
-            x.flattened(start: 0, end: -3)[fused.rowOrder],
-            fused.sortedKeys,
-            fused.inverseOrder
-        )
+        return fused
     }
+
     let order = routeCountingSort(indices) ?? argSort(indices)
     let inverseOrder: MLXArray
     if inversePermutationScatterEnabled && order.size > 0 {
@@ -361,10 +360,15 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
         inverseOrder = argSort(order)
     }
 
+    return (order.floorDivide(m), indices[order], inverseOrder)
+}
+
+public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+    let sorted = gatherSortMetadata(indices: indices)
     return (
-        x.flattened(start: 0, end: -3)[order.floorDivide(m)],
-        indices[order],
-        inverseOrder
+        x.flattened(start: 0, end: -3)[sorted.rowOrder],
+        sorted.sortedKeys,
+        sorted.inverseOrder
     )
 }
 

@@ -1590,12 +1590,19 @@ bool darkbloom_bsearch_hoist() {
   return v;
 }
 
+bool darkbloom_sorted_x_lhs_indices() {
+  static const bool v =
+      env::get_var("DARKBLOOM_SORTED_X_LHS_INDICES", "") != "0";
+  return v;
+}
+
 void gather_qmm_rhs_nax(
     const array& x_,
     const array& w_,
     const array& scales_,
     const std::optional<array>& biases_,
     const array& indices_,
+    const array* lhs_indices_,
     array& out,
     bool transpose,
     int group_size,
@@ -1606,13 +1613,12 @@ void gather_qmm_rhs_nax(
     metal::Device& d,
     const Stream& s,
     const std::string mode) {
-  // Start by normalizing the indices
   array indices = ensure_row_contiguous(indices_, d, s);
+  const bool gather_lhs = lhs_indices_ != nullptr;
+  array lhs_indices = gather_lhs
+      ? ensure_row_contiguous(*lhs_indices_, d, s)
+      : array::unsafe_weak_copy(indices);
 
-  // Broadcast x with indices. If we are here that means lhs_indices were not
-  // provided so the lhs_indices are implied to be the shape of x broadcasted
-  // with rhs_indices. We need only broadcast x and copy it as if applying the
-  // lhs_indices.
   auto broadcast_with_indices = [&d, &s, &indices](const array& x) {
     if (x.size() / x.shape(-2) / x.shape(-1) == indices.size()) {
       return ensure_row_contiguous(x, d, s);
@@ -1626,8 +1632,8 @@ void gather_qmm_rhs_nax(
     return ensure_row_contiguous(new_x, d, s);
   };
 
-  // Normalize the input arrays
-  array x = broadcast_with_indices(x_);
+  array x = gather_lhs ? ensure_row_contiguous(x_, d, s)
+                       : broadcast_with_indices(x_);
   array w = ensure_row_contiguous(w_, d, s);
   array scales = ensure_row_contiguous(scales_, d, s);
 
@@ -1770,7 +1776,8 @@ void gather_qmm_rhs_nax(
           : "",
       expert_aligned
           ? ("_eg_" + std::to_string(egroups) + (expert_widest ? "_ws_1" : "_ws_0") +
-             (expert_wideld ? "_wl_1" : "_wl_0"))
+             (expert_wideld ? "_wl_1" : "_wl_0") +
+             (gather_lhs ? "_lhs_1" : "_lhs_0"))
           : "");
 
   // Skipping dead runs is a pure work elision (see function constant 203 in
@@ -1890,7 +1897,8 @@ void gather_qmm_rhs_nax(
         "bfloat",
         egroups,
         expert_widest,
-        expert_wideld);
+        expert_wideld,
+        gather_lhs);
     kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
   } else {
     kernel = get_gather_qmm_nax_kernel(
@@ -1931,6 +1939,9 @@ void gather_qmm_rhs_nax(
     compute_encoder.set_input_array(biases, c++);
   }
   compute_encoder.set_input_array(indices, c++);
+  if (expert_aligned) {
+    compute_encoder.set_input_array(lhs_indices, c++);
+  }
   compute_encoder.set_output_array(out, c++);
   compute_encoder.set_bytes(M, c++);
   compute_encoder.set_bytes(N, c++);
@@ -1946,6 +1957,7 @@ void gather_qmm_rhs(
     const array& scales_,
     const std::optional<array>& biases_,
     const array& indices_,
+    const array* lhs_indices_,
     array& out,
     bool transpose,
     int group_size,
@@ -1964,6 +1976,7 @@ void gather_qmm_rhs(
         /* const array& scales_ = */ scales_,
         /* const std::optional<array>& biases_ = */ biases_,
         /* const array& indices_ = */ indices_,
+        /* const array* lhs_indices_ = */ lhs_indices_,
         /* array& out = */ out,
         /* bool transpose = */ transpose,
         /* int group_size = */ group_size,
@@ -2205,22 +2218,34 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
 
+  const int x_matrices = x.size() / M / K;
+  const int bm128 = darkbloom_stage_bm128_variant();
+  const bool sorted_x_lhs =
+      darkbloom_sorted_x_lhs_indices() && metal::is_nax_available() &&
+      both_sorted_ && M == 1 && B >= 64 && E == 256 && B / E >= 4 &&
+      B == x_matrices * 8 && lhs_indices.size() == B &&
+      rhs_indices.size() == B && x.dtype() == bfloat16 &&
+      transpose_ && group_size_ == 16 && bits_ == 4 && mode == "nvfp4" &&
+      K == 2048 && N == 1024 && !biases.has_value() &&
+      darkbloom_expert_aligned_gather() && (bm128 == 4 || bm128 == 5);
+
   // We are walking x in order and w is also in order so we can batch up the
   // matmuls and reuse reading x and w.
   //
   // TODO: Tune 16 and 4 here a bit better.
-  if (M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4) {
+  if (M == 1 && B >= 16 && (right_sorted_ || sorted_x_lhs) && B / E >= 4) {
     gather_qmm_rhs(
         x,
         w,
         scales,
         biases,
         rhs_indices,
+        sorted_x_lhs ? &lhs_indices : nullptr,
         out,
         transpose_,
         group_size_,
         bits_,
-        x.size() / K,
+        sorted_x_lhs ? B : x.size() / K,
         N,
         K,
         d,
