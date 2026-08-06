@@ -165,6 +165,12 @@ let lagunaFusedRoutedSwiGLUQMVEnabled =
 let lagunaPackedScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] != "0"
 
+/// Decode-only co-tiling of the already-accepted routed gate/up code bank.
+/// Each logical row owns four aligned `[gate 256 B][up 256 B]` K-blocks;
+/// Morgan's certified pairwise scale bank remains a separate 16-byte stream.
+let lagunaCotiledPairwiseK1Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_COTILED_PAIRWISE_K1"] != "0"
+
 /// Publish exact corrected router ordinals from the existing fused producer
 /// so routed QMV consumers avoid repeating the nonlinear key construction.
 /// The OFF arm restores the promoted selector dependency exactly.
@@ -7537,11 +7543,17 @@ private let lagunaRoutedSwiGLUQMVPackedTop8Kernel = MLXFast.metalKernel(
 let lagunaRoutedGateUpR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1"] != "0"
 
-private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2",
-    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
-    outputNames: ["activated"],
-    source: """
+private func lagunaRoutedSwiGLUQMVPackedTop8R1Source(cotiled: Bool) -> String {
+    let weightPrelude = cotiled
+        ? "const device uint8_t* row_unit=(const device uint8_t*)fused_weight+expert*fused_expert_bytes+logical_row*2048;"
+        : "const device uint8_t* expert_weight=(const device uint8_t*)fused_weight+expert*fused_expert_bytes; uint gate_row=(logical_row/32)*64+logical_row%32; uint up_row=gate_row+32;"
+    let firstCodeLoad = cotiled
+        ? "const device uint8_t* q=row_unit+lane*8; gate_codes=*(const device uint2*)q; up_codes=*(const device uint2*)(q+256);"
+        : "gate_codes=*(const device uint2*)(expert_weight+gate_row*fused_row_bytes+lane*8); up_codes=*(const device uint2*)(expert_weight+up_row*fused_row_bytes+lane*8);"
+    let nextCodeLoad = cotiled
+        ? "const device uint8_t* q=row_unit+(next_block/block_width)*512+lane*8; gate_codes=*(const device uint2*)q; up_codes=*(const device uint2*)(q+256);"
+        : "gate_codes=*(const device uint2*)(expert_weight+gate_row*fused_row_bytes+next_block/2+lane*8); up_codes=*(const device uint2*)(expert_weight+up_row*fused_row_bytes+next_block/2+lane*8);"
+    return """
 constexpr uint input_width = 2048;
 constexpr uint output_width = 512;
 constexpr uint block_width = 512;
@@ -7565,14 +7577,11 @@ uint logical_row = tile * 2 + simd_group;
 \(lagunaRouterTop8PrecomputedPrelude)
 uint expert = top8_winner;
 
-const device uint8_t* expert_weight =
-    (const device uint8_t*)fused_weight + expert * fused_expert_bytes;
+\(weightPrelude)
 const device uint8_t* row_scales =
     packed_scales + scale_patch_bytes + expert * packed_expert_bytes
     + (logical_row / 4) * scale_tile_bytes;
 uint sub = logical_row % 4;
-uint gate_row = (logical_row / 32) * 64 + logical_row % 32;
-uint up_row = gate_row + 32;
 
 thread float gate_result = 0.0f;
 thread float up_result = 0.0f;
@@ -7588,10 +7597,7 @@ uint8_t up_sb;
     bool patch_lane = expert == 0 && logical_row == 0 && lane == 1;
     gate_sb = patch_lane ? packed_scales[0] : first_scales[0];
     up_sb = patch_lane ? packed_scales[1] : first_scales[scale_row_bytes];
-    gate_codes = *(const device uint2*)(
-        expert_weight + gate_row * fused_row_bytes + lane * 8);
-    up_codes = *(const device uint2*)(
-        expert_weight + up_row * fused_row_bytes + lane * 8);
+    \(firstCodeLoad)
 }
 
 for (uint block = 0; block < input_width; block += block_width) {
@@ -7617,12 +7623,7 @@ for (uint block = 0; block < input_width; block += block_width) {
             + sub * 2 * scale_row_bytes + (lane >> 1);
         gate_sb = next_scales[0];
         up_sb = next_scales[scale_row_bytes];
-        gate_codes = *(const device uint2*)(
-            expert_weight + gate_row * fused_row_bytes
-            + next_block / 2 + lane * 8);
-        up_codes = *(const device uint2*)(
-            expert_weight + up_row * fused_row_bytes
-            + next_block / 2 + lane * 8);
+        \(nextCodeLoad)
     }
 
     gate_result += laguna_nvfp4_qdot_codes_16(
@@ -7646,7 +7647,24 @@ if (lane == 0) {
     activated[expert_slot * output_width + logical_row] =
         bfloat(silu * up);
 }
-""",
+"""
+}
+
+private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2",
+    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVPackedTop8R1Source(cotiled: false),
+    header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
+        + "\n" + lagunaRouterTop8PrologueHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaRoutedSwiGLUQMVCotiledTop8R1Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_cotiled_top8keys_r1_pairwise_bf16_v1",
+    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVPackedTop8R1Source(cotiled: true),
     header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
         + "\n" + lagunaRouterTop8PrologueHeader,
     ensureRowContiguous: true
@@ -7656,7 +7674,8 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
     _ input: MLXArray,
     fusedWeight: MLXArray,
     packedScales: MLXArray,
-    routerKeys: MLXArray
+    routerKeys: MLXArray,
+    cotiledWeight: MLXArray? = nil
 ) -> MLXArray {
     precondition(input.dtype == .bfloat16)
     precondition(input.dims(1, 1, LagunaConstants.hiddenSize))
@@ -7667,6 +7686,20 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
     precondition(routerKeys.size == LagunaConstants.numExperts)
 
     if lagunaRoutedGateUpR1Enabled {
+        if lagunaCotiledPairwiseK1Enabled, let cotiledWeight {
+            precondition(cotiledWeight.dtype == .uint32)
+            precondition(cotiledWeight.size == fusedWeight.size)
+            return lagunaRoutedSwiGLUQMVCotiledTop8R1Kernel(
+                [input, cotiledWeight, packedScales, routerKeys],
+                grid: (LagunaConstants.numExpertsPerTok * 256 * 64, 1, 1),
+                threadGroup: (64, 1, 1),
+                outputShapes: [[
+                    1, 1, LagunaConstants.numExpertsPerTok, 1,
+                    LagunaConstants.moeIntermediateSize,
+                ]],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
         return lagunaRoutedSwiGLUQMVPackedTop8R1Kernel(
             [input, fusedWeight, packedScales, routerKeys],
             grid: (LagunaConstants.numExpertsPerTok * 256 * 64, 1, 1),
@@ -9870,6 +9903,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     /// the halved plane would not be bit-exact, in which case the routed QMV
     /// path reads the full fused scales instead.
     var _packedRoutedGateUpBank: MLXArray?
+    var _cotiledRoutedGateUpCodes: MLXArray?
 
     /// Builds and retains the fused routed gate/up NVFP4 banks from the
     /// loaded stock `SwitchGLU` submodules (reached through the public
@@ -9954,6 +9988,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         _routedDownProj = downModule
         _routedDownWeight = downWeight
         var prepared = [fusedWeight, fusedScales]
+        prepared.append(
+            contentsOf: prepareCotiledRoutedGateUpCodes(
+                fusedWeight: fusedWeight, experts: experts, split: split))
         // The shipped down plane is already in kernel order, so flat pair 0
         // (expert 0, output row 0, groups 0/1) is the only pair the quantizer
         // can leave unequal.
@@ -9969,6 +10006,38 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 experts: experts,
                 split: split))
         return prepared
+    }
+
+    /// Pure permutation of the fused code bank into the exact decode walk:
+    /// one 2 KiB power-of-two unit per logical row, with gate/up adjacent for
+    /// each of four 512-value K blocks. No code nibble is changed.
+    func prepareCotiledRoutedGateUpCodes(
+        fusedWeight: MLXArray, experts: Int, split: Int
+    ) -> [MLXArray] {
+        guard lagunaCotiledPairwiseK1Enabled,
+            lagunaPackedScalesEnabled,
+            lagunaRoutedGateUpR1Enabled,
+            lagunaRouterPrecomputedKeysEnabled,
+            split == LagunaConstants.moeIntermediateSize,
+            experts == LagunaConstants.numExperts,
+            LagunaConstants.hiddenSize == 2048,
+            fusedWeight.dtype == .uint32,
+            fusedWeight.dim(2) == 256
+        else { return [] }
+        let rows = 2 * split
+        let blocks = fusedWeight.reshaped([experts, rows * 4, 64])
+        var order = [Int32]()
+        order.reserveCapacity(rows * 4)
+        for logicalRow in 0..<split {
+            let gateRow = (logicalRow / 32) * 64 + logicalRow % 32
+            for block in 0..<4 {
+                order.append(Int32(gateRow * 4 + block))
+                order.append(Int32((gateRow + 32) * 4 + block))
+            }
+        }
+        let cotiled = contiguous(take(blocks, MLXArray(order), axis: 1))
+        _cotiledRoutedGateUpCodes = cotiled
+        return [cotiled]
     }
 
     init(_ config: LagunaConfig) {
@@ -10055,7 +10124,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                             x,
                             fusedWeight: fusedWeight,
                             packedScales: packedBank,
-                            routerKeys: routerKeys
+                            routerKeys: routerKeys,
+                            cotiledWeight: _cotiledRoutedGateUpCodes
                         )
                     } else {
                         lagunaTrace("routed gate/up QMV + SwiGLU (packed scales)")
@@ -11324,4 +11394,3 @@ func lagunaInjectLayerWork(layer: Int, isSingleTokenDecode: Bool) {
 
 // END M5 HARDWARE-CONSTANT INSTRUMENT
 // ============================================================================
-
