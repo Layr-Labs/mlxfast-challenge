@@ -476,6 +476,124 @@ struct QuantizedBlockLoader {
     }
   }
 
+#ifdef DARKBLOOM_STAGE2_GATHER
+  // DARKBLOOM_STAGE2_GATHER: two-phase staging.
+  //
+  // load_unsafe()/load_unsafe_wide() issue this thread's device reads and then
+  // immediately consume them, so the read latency sits on the critical path of
+  // the barrier that publishes the tile. prefetch() issues exactly those reads
+  // into registers and commit() performs exactly the decode and threadgroup
+  // stores, letting the caller place independent work (the MMA of the tile
+  // already resident in the other Ws buffer) between them.
+  //
+  // BIT-EXACTNESS. prefetch() reads the same source bytes and the same scale
+  // bytes, through the same width selection, that load_unsafe_wide() reads.
+  // commit() is the same chunk loop, character for character, operating on
+  // those bytes from registers instead of from `src`/`scales`. Neither the
+  // decode expressions, the scale-to-element mapping, nor the destination
+  // addresses change, so no float operation is reassociated or rerounded.
+  struct StageRegs {
+    uint8_t sb[kSrcBytes];
+    uint8_t sc[n_steps_per_read];
+  };
+
+  template <bool wide_load>
+  StageRegs prefetch() const {
+    StageRegs r;
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return r;
+    }
+
+    const bool load_ok = wide_load &&
+        ((kWideLoadShapeOk && ((src_byte_off() & 15) == 0)) ||
+         (kWideLoad8ShapeOk && ((src_byte_off() & 7) == 0)));
+
+    bool took_wide_load = false;
+    if constexpr (kWideLoadShapeOk) {
+      if (load_ok) {
+        WideSrc packed = *((const device WideSrc*)src);
+        STEEL_PRAGMA_UNROLL
+        for (short b = 0; b < kSrcBytes; b++) {
+          r.sb[b] = packed.b[b];
+        }
+        took_wide_load = true;
+      }
+    }
+    if constexpr (kWideLoad8ShapeOk) {
+      if (load_ok) {
+        WideSrc8 packed = *((const device WideSrc8*)src);
+        STEEL_PRAGMA_UNROLL
+        for (short b = 0; b < kSrcBytes; b++) {
+          r.sb[b] = packed.b[b];
+        }
+        took_wide_load = true;
+      }
+    }
+    if (!took_wide_load) {
+      STEEL_PRAGMA_UNROLL
+      for (short b = 0; b < kSrcBytes; b++) {
+        r.sb[b] = src[b * bytes_per_pack];
+      }
+    }
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < n_steps_per_read; i++) {
+      r.sc[i] = scales[i];
+    }
+    return r;
+  }
+
+  template <bool wide_store>
+  void commit(thread const StageRegs& r) const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    if constexpr (kWidenShapeOk) {
+      const bool store_ok = wide_store && ((dst_byte_off() & 15) == 0);
+      STEEL_PRAGMA_UNROLL
+      for (short c = 0; c < kWideChunks; c++) {
+        const short e0 = c * kWideElems;
+        const short k0 = c * kSrcBytesPerChunk;
+        WideChunk out;
+        if constexpr (fp4nv_fast && (kSrcBytesPerChunk % 4) == 0) {
+          const float scale =
+              fp4nv_scale_x16384(r.sc[k0 / n_reads_per_scale]);
+          STEEL_PRAGMA_UNROLL
+          for (short b = 0; b < kSrcBytesPerChunk / 4; b++) {
+            fp4nv_decode8<T>(
+                fp4nv_pack4(r.sb + k0 + b * 4), scale, &out.v[b * 8]);
+          }
+        } else {
+          T scale = dequantize_scale<T, group_size>(
+              r.sc[k0 / n_reads_per_scale]);
+          STEEL_PRAGMA_UNROLL
+          for (short b = 0; b < kSrcBytesPerChunk; b++) {
+            dequantize_pair(r.sb[k0 + b], scale, &out.v[b * pack_factor]);
+          }
+        }
+
+        if (store_ok) {
+          *((threadgroup WideChunk*)(dst + e0)) = out;
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < kWideElems; j++) {
+            dst[e0 + j] = out.v[j];
+          }
+        }
+      }
+    } else {
+      int k = 0;
+      for (int i = 0; i < n_steps_per_read; i++) {
+        T scale = dequantize_scale<T, group_size>(r.sc[i]);
+        for (int j = 0; j < n_reads_per_scale; j++) {
+          dequantize<T, bits>(
+              r.sb[k * bytes_per_pack], scale, dst + k * pack_factor);
+          k++;
+        }
+      }
+    }
+  }
+#endif // DARKBLOOM_STAGE2_GATHER
 
   void load_safe(short2 src_tile_dim) const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
@@ -614,10 +732,7 @@ METAL_FUNC void fp_qmm_t_impl(
   dispatch_bool(aligned_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
       for (int k = 0; k < kernel_K; k += BK) {
-        // Dead at k==0 for fixed_K>0: no prior-iteration Ws read to order.
-        if (fixed_K == 0 || k > 0) {
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
@@ -656,10 +771,8 @@ METAL_FUNC void fp_qmm_t_impl(
         loader_w.next();
       }
 
-      // Dead for fixed_K>0: no next iteration, epilogue never touches Ws.
-      if (fixed_K == 0) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-      }
+      // Store results to device memory
+      threadgroup_barrier(mem_flags::mem_threadgroup);
 
       if constexpr (kAlignedM.value && kAlignedN.value) {
         Dtile.store(y + tm * kernel_N + tn, kernel_N);
@@ -1614,8 +1727,21 @@ template <
 
   constexpr int kWsElems = BN * BK_padded;
   constexpr int kWsPerChunk = 16 / sizeof(Wtype);
+#if defined(DARKBLOOM_STAGE2_GATHER) && DARKBLOOM_STAGE2_GATHER == 1
+  // Variant 1 only: two Ws buffers so tile k+1 can be staged while tile k is
+  // still being consumed. kWsElems * sizeof(Wtype) is a multiple of 16 (BN and
+  // BK_padded are both multiples of 8 at every instantiation that reaches
+  // here), so the second buffer keeps the 16B alignment the wide staging
+  // stores require. gate_up_stage still aliases buffer 0: it holds BM * BN
+  // bfloats, which fits inside one Ws buffer, and it is only touched after the
+  // k loop has drained. Doubling the allocation costs co-residency, which is
+  // why variant 2 is the default.
+  threadgroup NAXWsChunk16<Wtype>
+      Ws_storage[(2 * kWsElems + kWsPerChunk - 1) / kWsPerChunk];
+#else
   threadgroup NAXWsChunk16<Wtype>
       Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
+#endif
   threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
   threadgroup bfloat* gate_up_stage =
       (threadgroup bfloat*)Ws_storage;
@@ -1718,6 +1844,162 @@ template <
           simd_group_id,
           simd_lane_id);
 
+#if defined(DARKBLOOM_STAGE2_GATHER) && DARKBLOOM_STAGE2_GATHER == 1
+      // Variant 1: double-buffered weight staging.
+      //
+      // Stock runs two threadgroup barriers per k iteration around a single Ws
+      // buffer: one WAR barrier before staging tile k (the previous tile's MMA
+      // must have finished reading) and one RAW barrier after it. Every thread
+      // therefore waits for the whole threadgroup's staging device reads with
+      // no arithmetic in flight, K_it times.
+      //
+      // With two buffers, tile k+1 lands in the buffer tile k is not using, so
+      // a single barrier per iteration is sufficient and the staging reads can
+      // be issued before it: prefetch() pulls tile k+1 into registers, the
+      // barrier publishes tile k, the MMA consumes tile k, and only then does
+      // commit() write tile k+1. The device read latency is covered by the
+      // barrier wait plus the MMA chain instead of being exposed.
+      //
+      // HAZARDS. MMA(k) reads buffer k&1, staged by the prologue (k == 0) or by
+      // commit() in iteration k-1, with this iteration's barrier in between:
+      // RAW safe. commit() in iteration k writes buffer (k+1)&1 == (k-1)&1,
+      // last read by MMA(k-1), again with this iteration's barrier in between:
+      // WAR safe. The prologue barrier covers the previous chunk's epilogue.
+      //
+      // BIT-EXACTNESS. next() is called exactly K_it times as before, so each
+      // iteration decodes the same tile from the same bytes with the same
+      // scales into the same per-thread slots; only the buffer base differs.
+      // The MMA chain (k ascending, kk1 ascending, one Dtile) is untouched.
+      threadgroup Wtype* const w_dst0 = loader_w.dst;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      {
+        typename loader_w_t::StageRegs pf0 =
+            loader_w.template prefetch<wide_load>();
+        loader_w.template commit<wide_store>(pf0);
+      }
+      loader_w.next();
+
+      for (int k = 0; k < K_it; ++k) {
+        NAXTile<T, TM, TK> Atile[BK / SK];
+        if (sg_active) {
+          STEEL_PRAGMA_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            if (sgp_sm == SM) {
+              Atile[kk1 / SK].load_contig(xn + kk1, kernel_K);
+            } else {
+              Atile[kk1 / SK].load_rows_contig(xn + kk1, kernel_K, sgp_sm);
+            }
+          }
+        }
+
+        const bool stage_next = (k + 1) < K_it;
+        typename loader_w_t::StageRegs pf;
+        if (stage_next) {
+          pf = loader_w.template prefetch<wide_load>();
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg_active) {
+          threadgroup Wtype* Ws_cur = Ws + ((k & 1) ? kWsElems : 0);
+          STEEL_PRAGMA_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<Wtype, TN, TK> Btile;
+
+            Btile.template load_contig_tg<Wtype, BK_padded>(
+                Ws_cur + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile[kk1 / SK],
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<true>{});
+          }
+        }
+
+        if (stage_next) {
+          loader_w.dst = w_dst0 + (((k + 1) & 1) ? kWsElems : 0);
+          loader_w.template commit<wide_store>(pf);
+          loader_w.next();
+        }
+
+        xn += BK;
+      }
+#elif defined(DARKBLOOM_STAGE2_GATHER)
+      // Variant 2: register-prefetched weight staging, single Ws buffer.
+      //
+      // Same overlap goal as variant 1 without doubling threadgroup memory.
+      // Stock's staging step is fused: the device 4-bit loads, the nibble
+      // decode, and the threadgroup stores all sit between the WAR and RAW
+      // barriers, so the device read latency is exposed with no arithmetic in
+      // flight, K_it times. Splitting the step lets tile k+1's device reads be
+      // issued one iteration early, right after tile k is published, so they
+      // are in flight across the RAW barrier and the whole MMA chain and only
+      // the threadgroup stores remain between the barriers.
+      //
+      // Both barriers stay: with one buffer, commit(k) still overwrites the
+      // tile MMA(k-1) read (WAR, first barrier) and MMA(k) still reads what
+      // commit(k) wrote (RAW, second barrier). The win is latency hiding, not
+      // barrier count, and threadgroup occupancy is byte-for-byte unchanged.
+      //
+      // pf is loop-carried across the back-edge, which is what keeps the
+      // device loads from sinking back down to their use inside commit(). The
+      // (k + 1) < K_it guard is required: an unguarded prefetch on the last
+      // iteration would read weight rows past the end of this expert's block.
+      // No barrier sits inside that guard, so control flow stays uniform.
+      //
+      // BIT-EXACTNESS. prefetch()/commit() together perform exactly the byte
+      // gather, scale reads, decode, and stores that the fused staging step
+      // performs, in the same per-thread slots; next() is still called K_it
+      // times and the MMA chain (k ascending, kk1 ascending, one Dtile) is
+      // untouched.
+      typename loader_w_t::StageRegs pf =
+          loader_w.template prefetch<wide_load>();
+
+      for (int k = 0; k < K_it; ++k) {
+        NAXTile<T, TM, TK> Atile[BK / SK];
+        if (sg_active) {
+          STEEL_PRAGMA_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            if (sgp_sm == SM) {
+              Atile[kk1 / SK].load_contig(xn + kk1, kernel_K);
+            } else {
+              Atile[kk1 / SK].load_rows_contig(xn + kk1, kernel_K, sgp_sm);
+            }
+          }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        loader_w.template commit<wide_store>(pf);
+        loader_w.next();
+        if ((k + 1) < K_it) {
+          pf = loader_w.template prefetch<wide_load>();
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg_active) {
+          STEEL_PRAGMA_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<Wtype, TN, TK> Btile;
+
+            Btile.template load_contig_tg<Wtype, BK_padded>(
+                Ws + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile[kk1 / SK],
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<true>{});
+          }
+        }
+
+        xn += BK;
+      }
+#else
       for (int k = 0; k < K_it; ++k) {
         // Bit-exact A-operand hoist (the XMAJOR arm's shipped pattern at
         // one-eighth its register cost): this iteration's x fragments load
@@ -1793,6 +2075,7 @@ template <
         xn += BK;
         loader_w.next();
       }
+#endif // DARKBLOOM_STAGE2_GATHER
 
 #ifndef DARKBLOOM_SWIGLU_REGLOCAL
       // Staged-epilogue arm only: reg-local epilogues read no threadgroup
