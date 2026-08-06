@@ -209,13 +209,43 @@ public enum SwiftTransform {
 
         var copiedTensors = 0
         var stagedHeaders: [String: SafetensorsHeader] = [:]
+        // Layer-major shard ordering improves runtime DenseTensorStore locality:
+        // within each shard, sort by (layer_index, tensor_kind) so that
+        // attention Q/K/V/O + norms for layer N are contiguous before MoE
+        // experts of layer N. This clusters the per-layer working set without
+        // changing any byte content or index mapping.
+        func layerOrder(_ name: String) -> (Int, Int) {
+            // Extract layer index from "model.layers.{i}." else sort head/tail first/last.
+            if let r = name.range(of: "model.layers.") {
+                let suffix = name[r.upperBound...]
+                let idxStr = suffix.prefix(while: { $0.isNumber })
+                if let idx = Int(idxStr) {
+                    // kind priority: norms(0) < attn(1) < mlp gate(2) < experts(3) < shared(4)
+                    let kind: Int
+                    if name.contains(".input_layernorm") || name.contains(".post_attention_layernorm") { kind = 0 }
+                    else if name.contains(".self_attn.") { kind = 1 }
+                    else if name.contains(".mlp.gate.") { kind = 2 }
+                    else if name.contains("switch_mlp") { kind = 3 }
+                    else if name.contains("shared_expert") { kind = 4 }
+                    else { kind = 5 }
+                    return (idx, kind)
+                }
+            }
+            if name.hasPrefix("model.embed_tokens") { return (-1, 0) }
+            if name.hasPrefix("lm_head") || name.hasPrefix("model.norm") { return (1000, 0) }
+            return (999, 0)
+        }
         for shardName in textKeysByShard.keys.sorted() {
             let source = referenceDirectory.appendingPathComponent(shardName)
             let destination = stagingDirectory.appendingPathComponent(shardName)
             guard let header = validatedHeaders[shardName] else {
                 throw MLXFastError.invalidInput("missing validated header for checkpoint shard \(shardName)")
             }
-            let selectedNames = textKeysByShard[shardName, default: []].sorted()
+            let selectedNames = textKeysByShard[shardName, default: []].sorted { a, b in
+                let oa = layerOrder(a), ob = layerOrder(b)
+                if oa != ob { return oa < ob }
+                return a < b
+            }
             if Set(selectedNames) == Set(header.tensors.keys) {
                 // Poolside's reference is already text-only. Preserve the
                 // byte-identical shard and use an APFS copy-on-write clone
