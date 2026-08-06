@@ -165,6 +165,25 @@ let lagunaFusedRoutedSwiGLUQMVEnabled =
 let lagunaPackedScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] != "0"
 
+/// Extend the quantizer-proven group-32 scale halving to the shared expert's
+/// fused gate/up and down projections. Preparation verifies every discarded
+/// odd byte and retains each independently-quantized tensor's first-pair
+/// exception in the existing patch header. If any proof fails, the fused
+/// shared path declines and the stock modules remain available. DEFAULT ON;
+/// set to `0` for the promoted full-scale control arm in the same binary.
+let lagunaSharedScalePairwiseEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_SHARED_SCALE_PAIRWISE"] != "0"
+
+private let lagunaSharedGateUpPairwiseScaleBytes =
+    lagunaScalePatchHeaderBytes
+    + 2 * LagunaConstants.sharedExpertIntermediateSize
+    * (LagunaConstants.hiddenSize / 32)
+private let lagunaSharedDownPairwiseScaleBytes =
+    lagunaScalePatchHeaderBytes
+    + LagunaConstants.hiddenSize
+    * (LagunaConstants.sharedExpertIntermediateSize / 32)
+
 /// Publish exact corrected router ordinals from the existing fused producer
 /// so routed QMV consumers avoid repeating the nonlinear key construction.
 /// The OFF arm restores the promoted selector dependency exactly.
@@ -6712,7 +6731,8 @@ static inline float laguna_nvfp4_qdot_16(
 }()
 
 private let lagunaSharedSwiGLUQMVKernel = MLXFast.metalKernel(
-    name: "laguna_shared_nvfp4_swiglu_qmv_bf16_v1",
+    name: "laguna_shared_nvfp4_swiglu_qmv_bf16_v1"
+        + (lagunaSharedScalePairwiseEnabled ? "_spw1" : ""),
     inputNames: ["input", "fused_weight", "fused_scales"],
     outputNames: ["activated"],
     source: """
@@ -6720,7 +6740,9 @@ constexpr uint input_width = 2048;
 constexpr uint output_width = 512;
 constexpr uint fused_width = 1024;
 constexpr uint packed_row_bytes = 1024;
-constexpr uint scale_row_bytes = 128;
+constexpr uint scale_patch_bytes = \(lagunaSharedScalePairwiseEnabled
+    ? lagunaScalePatchHeaderBytes : 0);
+constexpr uint scale_row_bytes = \(lagunaSharedScalePairwiseEnabled ? 64 : 128);
 constexpr uint block_width = 512;
 constexpr uint values_per_lane = 16;
 
@@ -6755,20 +6777,28 @@ for (uint block = 0; block < input_width; block += block_width) {
             (const device uint8_t*)fused_weight +
             up_row * packed_row_bytes + block / 2 + lane * 8;
         const device uint8_t* gate_scale =
-            fused_scales + gate_row * scale_row_bytes +
-            block / 16 + lane;
+            fused_scales + scale_patch_bytes + gate_row * scale_row_bytes +
+            block / \(lagunaSharedScalePairwiseEnabled ? 32 : 16)
+            + \(lagunaSharedScalePairwiseEnabled ? "(lane >> 1)" : "lane");
         const device uint8_t* up_scale =
-            fused_scales + up_row * scale_row_bytes +
-            block / 16 + lane;
+            fused_scales + scale_patch_bytes + up_row * scale_row_bytes +
+            block / \(lagunaSharedScalePairwiseEnabled ? 32 : 16)
+            + \(lagunaSharedScalePairwiseEnabled ? "(lane >> 1)" : "lane");
+        uint8_t gate_sb = \(lagunaSharedScalePairwiseEnabled
+            ? "(gate_row == 0 && block == 0 && lane == 1 ? fused_scales[0] : gate_scale[0])"
+            : "gate_scale[0]");
+        uint8_t up_sb = \(lagunaSharedScalePairwiseEnabled
+            ? "(up_row == output_width && block == 0 && lane == 1 ? fused_scales[1] : up_scale[0])"
+            : "up_scale[0]");
 
         gate_result[row] += laguna_nvfp4_qdot_16(
             gate_weight,
             input_values,
-            laguna_nvfp4_scale(gate_scale[0]));
+            laguna_nvfp4_scale(gate_sb));
         up_result[row] += laguna_nvfp4_qdot_16(
             up_weight,
             input_values,
-            laguna_nvfp4_scale(up_scale[0]));
+            laguna_nvfp4_scale(up_sb));
     }
 }
 
@@ -6794,14 +6824,17 @@ for (uint row = 0; row < 2; ++row) {
 /// One-output-row scheduling twin of `lagunaSharedSwiGLUQMVKernel`.
 /// Arithmetic is textually identical per row; only row ownership changes.
 private let lagunaSharedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
-    name: "laguna_shared_nvfp4_swiglu_qmv_rows1_bf16_v1",
+    name: "laguna_shared_nvfp4_swiglu_qmv_rows1_bf16_v1"
+        + (lagunaSharedScalePairwiseEnabled ? "_spw1" : ""),
     inputNames: ["input", "fused_weight", "fused_scales"],
     outputNames: ["activated"],
     source: """
 constexpr uint input_width = 2048;
 constexpr uint output_width = 512;
 constexpr uint packed_row_bytes = 1024;
-constexpr uint scale_row_bytes = 128;
+constexpr uint scale_patch_bytes = \(lagunaSharedScalePairwiseEnabled
+    ? lagunaScalePatchHeaderBytes : 0);
+constexpr uint scale_row_bytes = \(lagunaSharedScalePairwiseEnabled ? 64 : 128);
 constexpr uint block_width = 512;
 constexpr uint values_per_lane = 16;
 
@@ -6817,9 +6850,12 @@ const device uint8_t* up_row_weight =
     (const device uint8_t*)fused_weight +
     (row + output_width) * packed_row_bytes + lane * 8;
 const device uint8_t* gate_row_scale =
-    fused_scales + row * scale_row_bytes + lane;
+    fused_scales + scale_patch_bytes + row * scale_row_bytes
+    + \(lagunaSharedScalePairwiseEnabled ? "(lane >> 1)" : "lane");
 const device uint8_t* up_row_scale =
-    fused_scales + (row + output_width) * scale_row_bytes + lane;
+    fused_scales + scale_patch_bytes +
+    (row + output_width) * scale_row_bytes
+    + \(lagunaSharedScalePairwiseEnabled ? "(lane >> 1)" : "lane");
 
 thread float gate_result = 0.0f;
 thread float up_result = 0.0f;
@@ -6837,14 +6873,24 @@ for (uint block = 0; block < input_width; block += block_width) {
         input_values[4 * i + 3] = values[3];
     }
 
+    const device uint8_t* gate_scale =
+        gate_row_scale + block / \(lagunaSharedScalePairwiseEnabled ? 32 : 16);
+    const device uint8_t* up_scale =
+        up_row_scale + block / \(lagunaSharedScalePairwiseEnabled ? 32 : 16);
+    uint8_t gate_sb = \(lagunaSharedScalePairwiseEnabled
+        ? "(row == 0 && block == 0 && lane == 1 ? fused_scales[0] : gate_scale[0])"
+        : "gate_scale[0]");
+    uint8_t up_sb = \(lagunaSharedScalePairwiseEnabled
+        ? "(row == 0 && block == 0 && lane == 1 ? fused_scales[1] : up_scale[0])"
+        : "up_scale[0]");
     gate_result += laguna_nvfp4_qdot_16(
         gate_row_weight + block / 2,
         input_values,
-        laguna_nvfp4_scale(gate_row_scale[block / 16]));
+        laguna_nvfp4_scale(gate_sb));
     up_result += laguna_nvfp4_qdot_16(
         up_row_weight + block / 2,
         input_values,
-        laguna_nvfp4_scale(up_row_scale[block / 16]));
+        laguna_nvfp4_scale(up_sb));
 }
 
 gate_result = simd_sum(gate_result);
@@ -6877,8 +6923,11 @@ func lagunaSharedSwiGLUQMV(
             LagunaConstants.hiddenSize / 8))
     precondition(fusedScales.dtype == .uint8)
     precondition(
-        fusedScales.dims(2 * LagunaConstants.sharedExpertIntermediateSize,
-            LagunaConstants.hiddenSize / 16))
+        lagunaSharedScalePairwiseEnabled
+            ? fusedScales.size == lagunaSharedGateUpPairwiseScaleBytes
+            : fusedScales.dims(
+                2 * LagunaConstants.sharedExpertIntermediateSize,
+                LagunaConstants.hiddenSize / 16))
 
     let kernel =
         lagunaSharedSwiGLUQMVRows1Enabled
@@ -6895,7 +6944,8 @@ func lagunaSharedSwiGLUQMV(
 }
 
 private let lagunaSharedDownResidualKernel = MLXFast.metalKernel(
-    name: "laguna_shared_nvfp4_down_residual_bf16_v1",
+    name: "laguna_shared_nvfp4_down_residual_bf16_v1"
+        + (lagunaSharedScalePairwiseEnabled ? "_spw1" : ""),
     inputNames: [
         "activated", "down_weight", "down_scales", "routed", "residual",
     ],
@@ -6906,7 +6956,9 @@ constexpr uint output_width = 2048;
 constexpr uint outputs_per_simd = 4;
 constexpr uint values_per_lane = 16;
 constexpr uint packed_row_bytes = 256;
-constexpr uint scale_row_bytes = 32;
+constexpr uint scale_patch_bytes = \(lagunaSharedScalePairwiseEnabled
+    ? lagunaScalePatchHeaderBytes : 0);
+constexpr uint scale_row_bytes = \(lagunaSharedScalePairwiseEnabled ? 16 : 32);
 
 uint group = threadgroup_position_in_grid.x;
 uint simd_group = simdgroup_index_in_threadgroup;
@@ -6936,11 +6988,15 @@ for (uint row = 0; row < outputs_per_simd; ++row) {
         (const device uint8_t*)down_weight +
         output_row * packed_row_bytes + lane * 8;
     const device uint8_t* scale =
-        down_scales + output_row * scale_row_bytes + lane;
+        down_scales + scale_patch_bytes + output_row * scale_row_bytes
+        + \(lagunaSharedScalePairwiseEnabled ? "(lane >> 1)" : "lane");
+    uint8_t scale_byte = \(lagunaSharedScalePairwiseEnabled
+        ? "(output_row == 0 && lane == 1 ? down_scales[0] : scale[0])"
+        : "scale[0]");
     result[row] = laguna_nvfp4_qdot_16(
         weight,
         input_values,
-        laguna_nvfp4_scale(scale[0]));
+        laguna_nvfp4_scale(scale_byte));
     result[row] = simd_sum(result[row]);
 }
 
@@ -6974,8 +7030,11 @@ func lagunaSharedDownResidual(
             LagunaConstants.sharedExpertIntermediateSize / 8))
     precondition(downScales.dtype == .uint8)
     precondition(
-        downScales.dims(LagunaConstants.hiddenSize,
-            LagunaConstants.sharedExpertIntermediateSize / 16))
+        lagunaSharedScalePairwiseEnabled
+            ? downScales.size == lagunaSharedDownPairwiseScaleBytes
+            : downScales.dims(
+                LagunaConstants.hiddenSize,
+                LagunaConstants.sharedExpertIntermediateSize / 16))
     precondition(routed.dtype == .bfloat16)
     precondition(routed.dims(1, 1, LagunaConstants.hiddenSize))
     precondition(residual.dtype == .bfloat16)
@@ -7844,9 +7903,10 @@ let lagunaSharedFirstDownOrderEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_FIRST_DOWN"] == "1"
 
 private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
-    name: lagunaSharedFirstDownOrderEnabled
+    name: (lagunaSharedFirstDownOrderEnabled
         ? "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v5sf"
-        : "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v5",
+        : "laguna_routed_shared_nvfp4_down_residual_bf16_r1_v5")
+        + (lagunaSharedScalePairwiseEnabled ? "_spw1" : ""),
     inputNames: lagunaSharedFirstDownOrderEnabled
         ? [
             "shared_activated", "shared_down_weight", "shared_down_scales",
@@ -7868,7 +7928,8 @@ constexpr uint outputs_per_simd = 4;
 constexpr uint values_per_lane = 16;
 constexpr uint packed_row_bytes = 256;
 constexpr uint scale_patch_bytes = \(lagunaScalePatchHeaderBytes);
-constexpr uint shared_scale_row_bytes = 32;
+constexpr uint shared_scale_row_bytes =
+    \(lagunaSharedScalePairwiseEnabled ? 16 : 32);
 constexpr uint routed_scale_row_bytes = 16;
 constexpr uint packed_expert_bytes =
     output_width * packed_row_bytes;
@@ -7890,12 +7951,15 @@ const device uint8_t* expert_weight = is_shared
     : (const device uint8_t*)routed_down_weight +
         expert * packed_expert_bytes;
 const device uint8_t* expert_scales = is_shared
-    ? shared_down_scales
+    ? shared_down_scales + \(lagunaSharedScalePairwiseEnabled
+        ? "scale_patch_bytes" : "0")
     : routed_down_scales + scale_patch_bytes
         + expert * scale_expert_bytes;
 uint scale_row_bytes =
     is_shared ? shared_scale_row_bytes : routed_scale_row_bytes;
-uint scale_lane = is_shared ? lane : (lane >> 1);
+uint scale_lane = is_shared
+    ? \(lagunaSharedScalePairwiseEnabled ? "(lane >> 1)" : "lane")
+    : (lane >> 1);
 
 thread float input_values[values_per_lane];
 const device vec<bfloat, 4>* input_vectors =
@@ -7917,7 +7981,11 @@ for (uint row = 0; row < outputs_per_simd; ++row) {
     const device uint8_t* scale =
         expert_scales + output_row * scale_row_bytes + scale_lane;
     uint8_t sb =
-        (!is_shared && expert == 0 && output_row == 0 && lane == 1)
+        \(lagunaSharedScalePairwiseEnabled
+            ? "(is_shared && output_row == 0 && lane == 1)\n"
+                + "        ? shared_down_scales[0]\n"
+                + "        : (!is_shared && expert == 0 && output_row == 0 && lane == 1)"
+            : "(!is_shared && expert == 0 && output_row == 0 && lane == 1)")
         ? routed_down_scales[0]
         : scale[0];
     result[row] = laguna_nvfp4_qdot_16(
@@ -7998,8 +8066,11 @@ func lagunaRoutedSharedDownResidual(
             LagunaConstants.sharedExpertIntermediateSize / 8))
     precondition(sharedDownScales.dtype == .uint8)
     precondition(
-        sharedDownScales.dims(LagunaConstants.hiddenSize,
-            LagunaConstants.sharedExpertIntermediateSize / 16))
+        lagunaSharedScalePairwiseEnabled
+            ? sharedDownScales.size == lagunaSharedDownPairwiseScaleBytes
+            : sharedDownScales.dims(
+                LagunaConstants.hiddenSize,
+                LagunaConstants.sharedExpertIntermediateSize / 16))
     precondition(residual.dtype == .bfloat16)
     precondition(residual.dims(1, 1, LagunaConstants.hiddenSize))
 
@@ -8221,6 +8292,7 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     /// on the dense (BF16) layer-0 MLP.
     var _fusedGateUpWeight: MLXArray?
     var _fusedGateUpScales: MLXArray?
+    var _pairwiseSharedDownScales: MLXArray?
     var _fusedGateUpSplit: Int = 0
 
     /// Retained fused BF16 `[gate; up]` bank for the dense (non-quantized)
@@ -8269,10 +8341,43 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
         }
         let fusedWeight = concatenated([gate.weight, up.weight], axis: 0)
         let fusedScales = concatenated([gate.scales, up.scales], axis: 0)
+        var prepared = [fusedWeight]
+        let runtimeScales: MLXArray
+        if lagunaSharedScalePairwiseEnabled {
+            // Gate and up were quantized by independent producer calls. In the
+            // fused [gate; up] plane their exceptional first pairs are flat
+            // pair 0 and pair 32768 respectively.
+            guard let pairwiseGateUp = lagunaHalvedGroup32ScalePlane(
+                fusedScales,
+                allowedFlatPairs: [
+                    0,
+                    LagunaConstants.sharedExpertIntermediateSize
+                        * (LagunaConstants.hiddenSize / 32),
+                ]),
+                let down = downProj as? QuantizedLinear,
+                type(of: down) == QuantizedLinear.self,
+                down.mode == .nvfp4, down.groupSize == 16, down.bits == 4,
+                down.scales.dtype == .uint8,
+                down.scales.dims(
+                    LagunaConstants.hiddenSize,
+                    LagunaConstants.sharedExpertIntermediateSize / 16),
+                let pairwiseDown = lagunaHalvedGroup32ScalePlane(
+                    down.scales, allowedFlatPairs: [0])
+            else {
+                return []
+            }
+            runtimeScales = pairwiseGateUp
+            _pairwiseSharedDownScales = pairwiseDown
+            prepared.append(contentsOf: [pairwiseGateUp, pairwiseDown])
+        } else {
+            runtimeScales = fusedScales
+            _pairwiseSharedDownScales = nil
+            prepared.append(fusedScales)
+        }
         _fusedGateUpWeight = fusedWeight
-        _fusedGateUpScales = fusedScales
+        _fusedGateUpScales = runtimeScales
         _fusedGateUpSplit = gate.weight.dim(0)
-        return [fusedWeight, fusedScales]
+        return prepared
     }
 
     /// Builds and retains the fused BF16 gate/up bank from layer 0's dense
@@ -8367,14 +8472,29 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             down.weight.dtype == .uint32,
             down.weight.dims(LagunaConstants.hiddenSize,
                 LagunaConstants.sharedExpertIntermediateSize / 8),
-            down.scales.dtype == .uint8,
-            down.scales.dims(LagunaConstants.hiddenSize,
-                LagunaConstants.sharedExpertIntermediateSize / 16)
+            down.scales.dtype == .uint8
         else {
             return nil
         }
+        let downScales: MLXArray
+        if lagunaSharedScalePairwiseEnabled {
+            guard fusedScales.size == lagunaSharedGateUpPairwiseScaleBytes,
+                let pairwiseDown = _pairwiseSharedDownScales,
+                pairwiseDown.size == lagunaSharedDownPairwiseScaleBytes
+            else { return nil }
+            downScales = pairwiseDown
+        } else {
+            guard fusedScales.dims(
+                    2 * LagunaConstants.sharedExpertIntermediateSize,
+                    LagunaConstants.hiddenSize / 16),
+                down.scales.dims(
+                    LagunaConstants.hiddenSize,
+                    LagunaConstants.sharedExpertIntermediateSize / 16)
+            else { return nil }
+            downScales = down.scales
+        }
 
-        return (fusedWeight, fusedScales, down.weight, down.scales)
+        return (fusedWeight, fusedScales, down.weight, downScales)
     }
 
     func fusedSharedDownResidual(
@@ -11324,4 +11444,3 @@ func lagunaInjectLayerWork(layer: Int, isSingleTokenDecode: Bool) {
 
 // END M5 HARDWARE-CONSTANT INSTRUMENT
 // ============================================================================
-
