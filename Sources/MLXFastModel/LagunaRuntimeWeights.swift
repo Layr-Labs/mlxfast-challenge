@@ -386,12 +386,6 @@ public final class LagunaRuntimeWeightCache {
                     setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
                     setenv("MLX_MAX_OPS_PER_BUFFER", "200", 0)
                 }
-                // LOCAL PROBE ONLY (not for submission): override the op cap
-                // so the command-buffer boundary phase can be swept without a
-                // rebuild per value. Overwrite=1 deliberately beats the 200.
-                if let probeOps = env["DARKBLOOM_PROBE_CB_OPS"], !probeOps.isEmpty {
-                    setenv("MLX_MAX_OPS_PER_BUFFER", probeOps, 1)
-                }
                 startupMemoryPolicy = nil
             }
         } else {
@@ -984,35 +978,6 @@ func lagunaLaneMajorScaleBankReproducesScales(
 /// full Apple GPU cache line.
 let lagunaScalePatchHeaderBytes = 128
 
-/// Presents the already-certified decode scale bank to the expert-aligned M5
-/// prefill primitive without copying it. The logical shape remains the stock
-/// `[256, 1024, 128]` required by `gatherQuantizedMM`; the bounded marker
-/// strides describe one 64-byte compact row while the last logical scale axis
-/// aliases its row base. Only the exact backend specialization recognizes this
-/// shape/stride contract and applies the packed walk-order address map.
-///
-/// `packed` was produced by `preparePackedRoutedGateUpBank`, whose fail-closed
-/// `lagunaHalvedGroup32ScalePlane` certificate already proved every discarded
-/// odd byte and retained the two exact exceptions in its 128-byte header. This
-/// helper allocates no data and introduces no second resident scale plane.
-func lagunaPackedPrefillScaleView(_ packed: MLXArray) -> MLXArray? {
-    let rows = 2 * LagunaConstants.moeIntermediateSize
-    let groups = LagunaConstants.hiddenSize / 16
-    let compactGroups = groups / 2
-    let shape = [LagunaConstants.numExperts, rows, groups]
-    let expectedBytes = lagunaScalePatchHeaderBytes
-        + LagunaConstants.numExperts * rows * compactGroups
-    guard packed.dtype == .uint8, packed.ndim == 1,
-        packed.size == expectedBytes
-    else { return nil }
-
-    return asStrided(
-        packed,
-        shape,
-        strides: [rows * compactGroups, compactGroups, 0],
-        offset: 0)
-}
-
 /// Byte length of the halved packed routed gate/up scale bank, header included.
 let lagunaPackedRoutedGateUpScaleBytes =
     lagunaScalePatchHeaderBytes
@@ -1082,7 +1047,7 @@ extension LagunaRuntimeSparseMoEBlock {
     /// below (gateRow = (logical/32)*64 + logical%32, up = +32) is the stock
     /// kernel's mapping over the 32-row gate/up-interleaved fused bank, baked
     /// into scale storage order. The code bytes remain in the resident fused
-    /// weight bank, so this side copy is ~16 MiB per sparse layer instead of
+    /// weight bank, so this side copy is ~32 MB per sparse layer instead of
     /// duplicating the ~256 MB code bank.
     func preparePackedRoutedGateUpBank(
         fusedScales: MLXArray,
