@@ -9224,8 +9224,10 @@ if (lane < 8) {
     return """
 uint lane = thread_position_in_threadgroup.x;
 
-threadgroup uint xchg_ordinals[256];
-threadgroup uint xchg_indices[256];
+// Ordinal and index are one comparator record. Moving them as uint2 preserves
+// both components bit-for-bit while halving the low-stride shuffle calls and
+// the number of cross-simdgroup threadgroup operations.
+threadgroup uint2 xchg_pairs[256];
 \(scoreStorage)
 
 float x = float(logits[lane]);
@@ -9233,23 +9235,18 @@ float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
 float score = x < 0.0f ? y : 1.0f - y;
 \(scoreStore)
 float key = -(score + float(correction_bias[lane]));
-uint my_ordinal = laguna_router_key_ordinal(key);
-uint my_index = lane;
+uint2 my_pair = uint2(laguna_router_key_ordinal(key), lane);
 
 for (uint sequence = 2; sequence <= 256; sequence <<= 1) {
     for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
-        uint other_ordinal;
-        uint other_index;
+        uint2 other_pair;
         if (stride < 32) {
-            other_ordinal = simd_shuffle_xor(my_ordinal, ushort(stride));
-            other_index = simd_shuffle_xor(my_index, ushort(stride));
+            other_pair = simd_shuffle_xor(my_pair, ushort(stride));
         } else {
-            xchg_ordinals[lane] = my_ordinal;
-            xchg_indices[lane] = my_index;
+            xchg_pairs[lane] = my_pair;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             uint partner = lane ^ stride;
-            other_ordinal = xchg_ordinals[partner];
-            other_index = xchg_indices[partner];
+            other_pair = xchg_pairs[partner];
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
@@ -9257,15 +9254,15 @@ for (uint sequence = 2; sequence <= 256; sequence <<= 1) {
         bool lower_wants_better = (lane & sequence) == 0;
         bool want_better = lower_wants_better == is_lower;
         bool other_before_my = laguna_router_ordinal_before(
-            other_ordinal, other_index, my_ordinal, my_index);
+            other_pair.x, other_pair.y, my_pair.x, my_pair.y);
         bool take_other = want_better ? other_before_my : !other_before_my;
         if (take_other) {
-            my_ordinal = other_ordinal;
-            my_index = other_index;
+            my_pair = other_pair;
         }
     }
 }
 
+uint my_index = my_pair.y;
 \(epilogue)
 """
 }
@@ -9296,7 +9293,7 @@ METAL_FUNC bool laguna_router_ordinal_before(
 """
 
 private let lagunaDecodeRouterOrdinalKernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_ordinal_v1",
+    name: "laguna_decode_router_top8_ordinal_v2",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterOrdinalKernelSource(normalizing: false),
@@ -9305,7 +9302,7 @@ private let lagunaDecodeRouterOrdinalKernel = MLXFast.metalKernel(
 )
 
 private let lagunaDecodeRouterOrdinalNormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_ordinal_norm_v1",
+    name: "laguna_decode_router_top8_ordinal_norm_v2",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterOrdinalKernelSource(normalizing: true),
@@ -9314,7 +9311,7 @@ private let lagunaDecodeRouterOrdinalNormalizingKernel = MLXFast.metalKernel(
 )
 
 private let lagunaDecodeRouterOrdinalScoreTableKernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_ordinal_table_v1",
+    name: "laguna_decode_router_top8_ordinal_table_v2",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterOrdinalKernelSource(normalizing: false, scoreTable: true),
@@ -9323,7 +9320,7 @@ private let lagunaDecodeRouterOrdinalScoreTableKernel = MLXFast.metalKernel(
 )
 
 private let lagunaDecodeRouterOrdinalScoreTableNormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_decode_router_top8_ordinal_table_norm_v1",
+    name: "laguna_decode_router_top8_ordinal_table_norm_v2",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaDecodeRouterOrdinalKernelSource(normalizing: true, scoreTable: true),
