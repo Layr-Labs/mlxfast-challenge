@@ -9340,6 +9340,21 @@ private let lagunaDecodeRouterOrdinalEnabled =
 private let lagunaDecodeRouterOrdinalScoreTableEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_ORDINAL_SCORE_TABLE"] != "0"
 
+/// The two-phase 32 -> 64 tournament produces the same globally ordered top
+/// eight as the full 256-entry bitonic network while avoiding its repeated
+/// cross-simdgroup stages. The optimized second phase runs only one logical
+/// copy on the first 64 threads. Keep the full-sort path as an in-binary
+/// fallback and for the score-recompute ablation.
+// Ranked replay nonce: active64 receipt 1 was exact and raw-faster in both
+// phases; this source-only marker intentionally leaves the executable tree
+// unchanged while producing a distinct submission archive.
+// Receipt 2 confirmed the same raw-positive tree; nonce 3 settles paired draw.
+// Receipt 3 also beat the current crown raw; nonce 4 replays after retiring
+// the exact-but-negative routed/shared merged-dispatch successor.
+// Receipt 4 remained crown-positive raw; nonce 5 continues the paired replay.
+private let lagunaDecodeRouterTournamentEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ROUTER_TOURNAMENT"] != "0"
+
 func lagunaDecodeRouterTop8AcceptedForTesting(
     logits: MLXArray, correctionBias: MLXArray, normalizing: Bool = false
 ) -> (MLXArray, MLXArray) {
@@ -9408,6 +9423,15 @@ private func lagunaDecodeRouterTop8(
 ) -> (MLXArray, MLXArray) {
     if lagunaDecodeRouterOrdinalEnabled {
         if lagunaDecodeRouterOrdinalScoreTableEnabled {
+            if lagunaDecodeRouterTournamentEnabled {
+                return lagunaPrefillRouterTournamentOrdinalForTesting(
+                    logits: logits,
+                    correctionBias: correctionBias,
+                    rows: 1,
+                    normalizing: normalizing,
+                    pairwiseFinalists: lagunaRouterPairwiseFinalistsEnabled
+                )
+            }
             return lagunaDecodeRouterTop8OrdinalScoreTableForTesting(
                 logits: logits,
                 correctionBias: correctionBias,
@@ -9775,7 +9799,9 @@ for (uint sequence = 2; sequence <= 64; sequence <<= 1) {
 /// `(float key, uint index, float score)` to `(uint ordinal, uint index)`.
 /// One per-row score table preserves the original sigmoid bytes for the
 /// final eight indexed loads without carrying scores through either network.
-private func lagunaPrefillRouterTournamentOrdinalKernelSource(normalizing: Bool) -> String {
+private func lagunaPrefillRouterTournamentOrdinalKernelSource(
+    normalizing: Bool, pairwiseFinalists: Bool = false
+) -> String {
     let epilogue =
         normalizing
         ? """
@@ -9795,12 +9821,169 @@ if (lane < 8) {
     router_scores[row * 8 + lane] = original_scores[my_index2];
 }
 """
+    let finalistScratch =
+        pairwiseFinalists
+        ? """
+threadgroup uint finalist_ordinals[16];
+threadgroup uint finalist_indices[16];
+"""
+        : """
+threadgroup uint xchg_ordinals[64];
+threadgroup uint xchg_indices[64];
+"""
+    let finalistSelection =
+        pairwiseFinalists
+        ? """
+// Merge eight already-sorted local top-8 lists hierarchically. Each 16-lane
+// bitonic merge consumes two ascending lists (the second loaded in reverse),
+// and retaining only its first eight is exact: anything discarded already
+// has eight better candidates in that same subset.
+uint my_ordinal2 = 0u;
+uint my_index2 = 0u;
+if (lane < 64) {
+    uint simd_lane = lane & 31u;
+    uint pair = (lane >> 5) * 2u + (simd_lane >> 4);
+    uint pair_lane = simd_lane & 15u;
+    uint candidate_rank = pair_lane < 8u ? pair_lane : (23u - pair_lane);
+    uint candidate_offset = pair * 16u + candidate_rank;
+    uint merged_ordinal = candidate_ordinals[candidate_offset];
+    uint merged_index = candidate_indices[candidate_offset];
+
+    for (uint stride = 8u; stride > 0u; stride >>= 1) {
+        uint other_ordinal = simd_shuffle_xor(merged_ordinal, ushort(stride));
+        uint other_index = simd_shuffle_xor(merged_index, ushort(stride));
+        bool is_lower = (pair_lane & stride) == 0u;
+        bool other_before_my = laguna_router_ordinal_before(
+            other_ordinal, other_index, merged_ordinal, merged_index);
+        bool take_other = is_lower ? other_before_my : !other_before_my;
+        if (take_other) {
+            merged_ordinal = other_ordinal;
+            merged_index = other_index;
+        }
+    }
+
+    // Each simdgroup now owns two sorted pair-top8 lists at lanes 0...7 and
+    // 16...23. Repack the latter in reverse into lanes 8...15, then merge.
+    uint gather_lane = simd_lane < 8u
+        ? simd_lane
+        : (simd_lane < 16u ? (31u - simd_lane) : simd_lane);
+    uint half_ordinal = simd_shuffle(merged_ordinal, ushort(gather_lane));
+    uint half_index = simd_shuffle(merged_index, ushort(gather_lane));
+    if (simd_lane < 16u) {
+        for (uint stride = 8u; stride > 0u; stride >>= 1) {
+            uint other_ordinal = simd_shuffle_xor(half_ordinal, ushort(stride));
+            uint other_index = simd_shuffle_xor(half_index, ushort(stride));
+            bool is_lower = (simd_lane & stride) == 0u;
+            bool other_before_my = laguna_router_ordinal_before(
+                other_ordinal, other_index, half_ordinal, half_index);
+            bool take_other = is_lower ? other_before_my : !other_before_my;
+            if (take_other) {
+                half_ordinal = other_ordinal;
+                half_index = other_index;
+            }
+        }
+    }
+
+    if (simd_lane < 8u) {
+        uint half_id = lane >> 5;
+        finalist_ordinals[half_id * 8u + simd_lane] = half_ordinal;
+        finalist_indices[half_id * 8u + simd_lane] = half_index;
+    }
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+// The two simdgroups' half-top8 lists are the only remaining candidates.
+// Merge them in simdgroup 0; lanes 0...7 finish in global rank order.
+if (lane < 16u) {
+    uint finalist_rank = lane < 8u ? lane : (23u - lane);
+    uint merged_ordinal = finalist_ordinals[finalist_rank];
+    uint merged_index = finalist_indices[finalist_rank];
+    for (uint stride = 8u; stride > 0u; stride >>= 1) {
+        uint other_ordinal = simd_shuffle_xor(merged_ordinal, ushort(stride));
+        uint other_index = simd_shuffle_xor(merged_index, ushort(stride));
+        bool is_lower = (lane & stride) == 0u;
+        bool other_before_my = laguna_router_ordinal_before(
+            other_ordinal, other_index, merged_ordinal, merged_index);
+        bool take_other = is_lower ? other_before_my : !other_before_my;
+        if (take_other) {
+            merged_ordinal = other_ordinal;
+            merged_index = other_index;
+        }
+    }
+    my_ordinal2 = merged_ordinal;
+    my_index2 = merged_index;
+}
+"""
+        : """
+uint my_ordinal2 = 0u;
+uint my_index2 = 0u;
+if (lane < 64) {
+    my_ordinal2 = candidate_ordinals[lane];
+    my_index2 = candidate_indices[lane];
+}
+
+// Sort one 64-candidate set instead of four duplicate copies. Sequences up to
+// 32 are simdgroup-local, so inactive simdgroups can skip them entirely.
+if (lane < 64) {
+for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
+    for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+        uint other_ordinal = simd_shuffle_xor(my_ordinal2, ushort(stride));
+        uint other_index = simd_shuffle_xor(my_index2, ushort(stride));
+
+        bool is_lower = (lane & stride) == 0;
+        bool lower_wants_better = (lane & sequence) == 0;
+        bool want_better = lower_wants_better == is_lower;
+        bool other_before_my = laguna_router_ordinal_before(
+            other_ordinal, other_index, my_ordinal2, my_index2);
+        bool take_other = want_better ? other_before_my : !other_before_my;
+        if (take_other) {
+            my_ordinal2 = other_ordinal;
+            my_index2 = other_index;
+        }
+    }
+}
+}
+
+// The first stage of sequence 64 crosses the two active simdgroups. All 256
+// threads reach the barrier, but only the 64 live candidates touch memory or
+// execute the comparator.
+if (lane < 64) {
+    xchg_ordinals[lane] = my_ordinal2;
+    xchg_indices[lane] = my_index2;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+if (lane < 64) {
+    uint partner = lane ^ 32u;
+    uint other_ordinal = xchg_ordinals[partner];
+    uint other_index = xchg_indices[partner];
+    bool is_lower = (lane & 32u) == 0;
+    bool other_before_my = laguna_router_ordinal_before(
+        other_ordinal, other_index, my_ordinal2, my_index2);
+    bool take_other = is_lower ? other_before_my : !other_before_my;
+    if (take_other) {
+        my_ordinal2 = other_ordinal;
+        my_index2 = other_index;
+    }
+
+    for (uint stride = 16; stride > 0; stride >>= 1) {
+        other_ordinal = simd_shuffle_xor(my_ordinal2, ushort(stride));
+        other_index = simd_shuffle_xor(my_index2, ushort(stride));
+        is_lower = (lane & stride) == 0;
+        other_before_my = laguna_router_ordinal_before(
+            other_ordinal, other_index, my_ordinal2, my_index2);
+        take_other = is_lower ? other_before_my : !other_before_my;
+        if (take_other) {
+            my_ordinal2 = other_ordinal;
+            my_index2 = other_index;
+        }
+    }
+}
+"""
     return """
 uint lane = thread_position_in_threadgroup.x;
 uint row = threadgroup_position_in_grid.y;
 
-threadgroup uint xchg_ordinals[256];
-threadgroup uint xchg_indices[256];
+\(finalistScratch)
 threadgroup uint candidate_ordinals[64];
 threadgroup uint candidate_indices[64];
 threadgroup float original_scores[256];
@@ -9842,37 +10025,7 @@ if (is_local_top8) {
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-uint my_ordinal2 = candidate_ordinals[lane & 63];
-uint my_index2 = candidate_indices[lane & 63];
-for (uint sequence = 2; sequence <= 64; sequence <<= 1) {
-    for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
-        uint other_ordinal;
-        uint other_index;
-        if (stride < 32) {
-            other_ordinal = simd_shuffle_xor(my_ordinal2, ushort(stride));
-            other_index = simd_shuffle_xor(my_index2, ushort(stride));
-        } else {
-            xchg_ordinals[lane] = my_ordinal2;
-            xchg_indices[lane] = my_index2;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint partner = lane ^ stride;
-            other_ordinal = xchg_ordinals[partner];
-            other_index = xchg_indices[partner];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        bool is_lower = (lane & stride) == 0;
-        bool lower_wants_better = (lane & sequence) == 0;
-        bool want_better = lower_wants_better == is_lower;
-        bool other_before_my = laguna_router_ordinal_before(
-            other_ordinal, other_index, my_ordinal2, my_index2);
-        bool take_other = want_better ? other_before_my : !other_before_my;
-        if (take_other) {
-            my_ordinal2 = other_ordinal;
-            my_index2 = other_index;
-        }
-    }
-}
+\(finalistSelection)
 
 \(epilogue)
 """
@@ -9897,7 +10050,7 @@ private let lagunaPrefillRouterTournamentNormalizingKernel = MLXFast.metalKernel
 )
 
 private let lagunaPrefillRouterTournamentOrdinalKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_router_tournament_ordinal_v1",
+    name: "laguna_prefill_router_tournament_ordinal_active64_v2",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaPrefillRouterTournamentOrdinalKernelSource(normalizing: false),
@@ -9906,13 +10059,41 @@ private let lagunaPrefillRouterTournamentOrdinalKernel = MLXFast.metalKernel(
 )
 
 private let lagunaPrefillRouterTournamentOrdinalNormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_router_tournament_ordinal_norm_v1",
+    name: "laguna_prefill_router_tournament_ordinal_norm_active64_v2",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaPrefillRouterTournamentOrdinalKernelSource(normalizing: true),
     header: lagunaDecodeRouterOrdinalHeader,
     ensureRowContiguous: true
 )
+
+private let lagunaPrefillRouterTournamentOrdinalPairwiseKernel = MLXFast.metalKernel(
+    name: "laguna_prefill_router_tournament_ordinal_pairwise_v1",
+    inputNames: ["logits", "correction_bias"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaPrefillRouterTournamentOrdinalKernelSource(
+        normalizing: false, pairwiseFinalists: true),
+    header: lagunaDecodeRouterOrdinalHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaPrefillRouterTournamentOrdinalPairwiseNormalizingKernel =
+    MLXFast.metalKernel(
+        name: "laguna_prefill_router_tournament_ordinal_pairwise_norm_v1",
+        inputNames: ["logits", "correction_bias"],
+        outputNames: ["router_indices", "router_scores"],
+        source: lagunaPrefillRouterTournamentOrdinalKernelSource(
+            normalizing: true, pairwiseFinalists: true),
+        header: lagunaDecodeRouterOrdinalHeader,
+        ensureRowContiguous: true
+    )
+
+/// Default-on successor to active64: merge the eight sorted local-top8 lists
+/// hierarchically instead of fully sorting their 64-element union. Set to 0
+/// to restore the four-receipt active64 finalist network in the same binary.
+private let lagunaRouterPairwiseFinalistsEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTER_PAIRWISE_FINALISTS"] != "0"
 
 func lagunaPrefillRouterTournamentAcceptedForTesting(
     logits: MLXArray, correctionBias: MLXArray, rows: Int, normalizing: Bool
@@ -9936,17 +10117,26 @@ func lagunaPrefillRouterTournamentAcceptedForTesting(
 }
 
 func lagunaPrefillRouterTournamentOrdinalForTesting(
-    logits: MLXArray, correctionBias: MLXArray, rows: Int, normalizing: Bool
+    logits: MLXArray, correctionBias: MLXArray, rows: Int, normalizing: Bool,
+    pairwiseFinalists: Bool = false
 ) -> (MLXArray, MLXArray) {
     precondition(logits.dtype == .bfloat16 || logits.dtype == .float32)
     precondition(correctionBias.dtype == .float32)
     precondition(logits.size == rows * 256)
     precondition(correctionBias.size == 256)
 
-    let kernel =
-        normalizing
-        ? lagunaPrefillRouterTournamentOrdinalNormalizingKernel
-        : lagunaPrefillRouterTournamentOrdinalKernel
+    let kernel: MLXFast.MLXFastKernel
+    if pairwiseFinalists {
+        kernel =
+            normalizing
+            ? lagunaPrefillRouterTournamentOrdinalPairwiseNormalizingKernel
+            : lagunaPrefillRouterTournamentOrdinalPairwiseKernel
+    } else {
+        kernel =
+            normalizing
+            ? lagunaPrefillRouterTournamentOrdinalNormalizingKernel
+            : lagunaPrefillRouterTournamentOrdinalKernel
+    }
     let outputs = kernel(
         [logits, correctionBias],
         grid: (256, rows, 1),
@@ -9965,7 +10155,8 @@ private func lagunaPrefillRouterTournament(
             logits: logits,
             correctionBias: correctionBias,
             rows: rows,
-            normalizing: normalizing
+            normalizing: normalizing,
+            pairwiseFinalists: lagunaRouterPairwiseFinalistsEnabled
         )
     }
     return lagunaPrefillRouterTournamentAcceptedForTesting(
