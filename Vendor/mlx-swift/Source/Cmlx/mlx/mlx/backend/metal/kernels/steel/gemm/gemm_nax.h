@@ -57,7 +57,19 @@ auto gemm_loop(
       NAXTile<T, RB, CB> Btile;
       const int k = kk1;
 
-      volatile int compiler_barrier;
+      // The vestigial `volatile int compiler_barrier` that used to sit here
+      // (declared uninitialized, read at the bottom of the body) fenced the
+      // compiler out of interleaving the next tile's loads with the running
+      // mma chain. Releasing it is a codegen-only change: the loop body, the
+      // k-ascending iteration order, and the single `tile_matmad_nax` chain
+      // per iteration are all unchanged, so no accumulation is reassociated
+      // and outputs stay bit-identical. This is the same release already
+      // shipped on the NVFP4 gather kernels -- `fp_gather_qmm_rhs_expert_nax`
+      // carries neither the pragma nor the barrier, and the non-expert twin
+      // guards the read behind function constant 207 (`stage_novol`),
+      // measured at -6.72 us ranked. `STEEL_PRAGMA_NO_UNROLL` is deliberately
+      // KEPT: a related arm that additionally unrolled this loop spilled its
+      // per-iteration register staging and measured 0.41x paired prefill.
 
       const int A_offset = transpose_a ? k * lda : k;
       const int B_offset = transpose_b ? k : k * ldb;
@@ -84,8 +96,6 @@ auto gemm_loop(
           metal::bool_constant<transpose_a>{},
           Btile,
           metal::bool_constant<transpose_b>{});
-
-      (void)compiler_barrier;
     }
 
     A += transpose_a ? (BK * lda) : BK;

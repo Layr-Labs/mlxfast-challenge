@@ -1507,8 +1507,11 @@ auto gemm_loop(
       NAXTile<T, RB, CB> Btile;
       const int k = kk1;
 
-      volatile int compiler_barrier;
-
+      // Vestigial scheduling fence released; see the AOT twin at
+      // mlx/backend/metal/kernels/steel/gemm/gemm_nax.h. Codegen-only:
+      // same body, same k-ascending order, same single mma chain, so the
+      // accumulation is not reassociated and outputs are bit-identical.
+      // NO_UNROLL is kept deliberately.
       const int A_offset = transpose_a ? k * lda : k;
       const int B_offset = transpose_b ? k : k * ldb;
 
@@ -1534,8 +1537,6 @@ auto gemm_loop(
           metal::bool_constant<transpose_a>{},
           Btile,
           metal::bool_constant<transpose_b>{});
-
-      (void)compiler_barrier;
     }
 
     A += transpose_a ? (BK * lda) : BK;
