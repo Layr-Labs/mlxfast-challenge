@@ -8985,10 +8985,11 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if x.dim(1) == 1,
-            let fusedWeight = _fusedGateUpWeight, let fusedScales = _fusedGateUpScales
-        {
-            if lagunaFusedSharedSwiGLUQMVEnabled,
+        if let fusedWeight = _fusedGateUpWeight, let fusedScales = _fusedGateUpScales {
+            // The QMV+SwiGLU kernel below is a single-row form and stays gated
+            // on one token; the row-concatenated bank underneath it is not.
+            if x.dim(1) == 1,
+                lagunaFusedSharedSwiGLUQMVEnabled,
                 x.dtype == .bfloat16,
                 x.dims(1, 1, LagunaConstants.hiddenSize),
                 fusedWeight.dtype == .uint32,
@@ -9011,6 +9012,21 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             // guards in `prepareFusedSharedGateUp` pin those literals). Each
             // quantized output row is computed independently, so the split
             // halves are bit-exact vs. the separate gate/up dispatches.
+            //
+            // Row independence does not depend on the row count, so this arm
+            // now also serves multi-token prefill, where it replaces two
+            // separate NVFP4 dispatches per sparse layer -- 78 across the
+            // window -- each of which re-read the same [512, 2048] activation.
+            // The bank is built unconditionally at init and was already
+            // resident, so prefill was paying to keep it and declining to use
+            // it. This is the same transform already promoted for the ROUTED
+            // experts (`DARKBLOOM_PREFILL_FUSED_GATE_UP`), whose own doc
+            // records that the original "prefill stays on separate banks"
+            // finding pre-dated RUNSKIP and was overturned on re-measurement;
+            // the shared expert never got that re-measurement. It is NOT the
+            // refuted routed/shared cross-branch merge, which fused two
+            // different experts' dispatches into one -- this concatenates the
+            // shared expert's own gate and up banks and adds no threadgroups.
             lagunaTrace("shared fused [gate; up] bank QMM")
             let gateUp = MLX.quantizedMM(
                 x,
