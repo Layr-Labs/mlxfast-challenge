@@ -96,20 +96,19 @@ using namespace metal;
 
 // Laguna decode uses eight query heads per KV head on sliding layers and six
 // on full-attention layers. The stock vector kernel launches one 1024-thread
-// group per query head, so each resident K/V row is reread for every owned
-// query head. Pair adjacent query heads inside one threadgroup: they retain
-// independent online-softmax state and the exact stock 32-simdgroup reduction
-// tree, but share each K/V load. The host grid is unchanged; its upper half
-// returns uniformly before touching memory.
+// group per query head, and the promoted pair kernel still rereads every K/V
+// row four or three times per KV head. Schedule exactly two groups per KV head:
+// four query heads on sliding layers and three on full-attention layers. Every
+// head retains independent online-softmax state and the exact stock
+// 32-simdgroup reduction tree, while each group shares one K/V load.
 //
-// Two heads are deliberately conservative. Their four two-plane exchange
-// banks consume the same 16 KiB as the promoted one-head/four-plane kernel,
-// while query/output register state only doubles. This path is restricted to
-// the scored D=V=128, even Laguna GQA (8 or 6), one-query, unmasked,
-// sink-free vector shape. Both factors are even, so no adjacent pair crosses
-// a KV-head ownership boundary.
-#ifndef DARKBLOOM_GQA_PAIR_HEADS
-#define DARKBLOOM_GQA_PAIR_HEADS 2
+// The host grid is unchanged. Only the first two groups per KV head execute;
+// all remaining groups return uniformly before touching memory. Six recycled
+// exchange planes cover the 12 or 16 output components in two or three rounds,
+// consuming 25 KiB total threadgroup memory. The path remains restricted to
+// the scored D=V=128, GQA 8/6, one-query, unmasked, sink-free vector shape.
+#ifndef DARKBLOOM_GQA_KV_GROUPS
+#define DARKBLOOM_GQA_KV_GROUPS 2
 #endif
 
 // ---------------------------------------------------------------------------
@@ -132,10 +131,10 @@ using namespace metal;
 //
 // The first key each simdgroup visits is never an alpha == 1 site (max_score
 // starts at Limits<U>::finite_min, so factor is +0.0 there): 0 / 960 960.
-// The dispatched kernel is this one-pass `sdpa_vector`, on the GQA-pair path,
-// for BOTH families -- the host routes to `sdpa_vector_2pass` only at
-// kL >= 1024 and the frozen window peaks at 640, and the generic (non-pair)
-// path of this kernel logged zero decode sites.
+// The dispatched kernel is this one-pass `sdpa_vector`, on the grouped-GQA
+// path, for BOTH families -- the host routes to `sdpa_vector_2pass` only at
+// kL >= 1024 and the frozen window peaks at 640, and the generic path of this
+// kernel logged zero decode sites.
 //
 // WHAT IS *NOT* ELIDED, AND WHY. The obvious elision -- skipping the
 // `sum * factor` and `o[j] * factor` multiplies -- is both INEXACT and
@@ -282,328 +281,187 @@ template <
   // sum_exp_scores) would exceed the 32 KiB per-threadgroup limit - a hard
   // metallib compile error, not a slow kernel. PLANES never exceeds 4.
   constexpr int v_planes = PLANES < v_per_thread ? PLANES : v_per_thread;
-  constexpr int exchange_planes =
-      (D == 128 && V == 128 && DARKBLOOM_GQA_PAIR_HEADS == 2)
-      ? 4
-      : v_planes;
+  constexpr bool grouped_gqa_storage =
+      D == 128 && V == 128 && DARKBLOOM_GQA_KV_GROUPS == 2;
+  constexpr int exchange_planes = grouped_gqa_storage ? 6 : v_planes;
+  constexpr int state_heads = grouped_gqa_storage ? 4 : 1;
   threadgroup U outputs[exchange_planes * BN * BD];
-  threadgroup U max_scores[DARKBLOOM_GQA_PAIR_HEADS * BN];
-  threadgroup U sum_exp_scores[DARKBLOOM_GQA_PAIR_HEADS * BN];
+  threadgroup U max_scores[state_heads * BN];
+  threadgroup U sum_exp_scores[state_heads * BN];
 
-  // DARKBLOOM_GQA_PAIR_HEADS: preserve each head's exact key order and
-  // reduction tree while sharing the K/V device reads across adjacent heads.
-  if constexpr (D == 128 && V == 128 && DARKBLOOM_GQA_PAIR_HEADS == 2) {
-  // Vector-load eligibility: the pair path issues 8-byte vec<T,4> K/V loads
-  // (T is 2 bytes at D == V == 128), so every element offset in the K/V
-  // indexing must be a multiple of 4 elements and the base pointers 8-byte
-  // aligned. simd_lid * qk_per_thread is always a multiple of 4 here; the
-  // strides and bases are checked at runtime. Ineligible layouts fall back
-  // to the stock per-head path below, which the pair path reproduces
-  // bit-for-bit by construction (same key order, same reduction tree), so
-  // the fallback changes nothing but speed.
-  const bool pair_vec_aligned =
-      (((k_seq_stride | v_seq_stride | k_head_stride | v_head_stride) & 3) ==
-       0) &&
-      ((reinterpret_cast<uintptr_t>(keys) |
-        reinterpret_cast<uintptr_t>(values)) &
-       7) == 0;
-  const bool use_gqa_pair =
-      (gqa_factor == 8 || gqa_factor == 6) &&
-      tpg.y == 1 && (tpg.x % 2) == 0 &&
-      pair_vec_aligned &&
-      !has_mask && !do_causal && !has_sinks;
-  if (use_gqa_pair) {
-    const int pair_idx = tid.x;
-    const int q_head0 = 2 * pair_idx;
-    if (q_head0 >= int(tpg.x)) {
+  // Preserve every head's key order and reduction tree while sharing each K/V
+  // device read across one half of the heads owned by a KV head.
+  if constexpr (grouped_gqa_storage) {
+    // The grouped path issues 8-byte vec<T,4> K/V loads (T is 2 bytes at
+    // D == V == 128), so every element offset in the K/V indexing must be a
+    // multiple of four and the base pointers must be 8-byte aligned.
+    const bool group_vec_aligned =
+        (((k_seq_stride | v_seq_stride | k_head_stride | v_head_stride) & 3) ==
+         0) &&
+        ((reinterpret_cast<uintptr_t>(keys) |
+          reinterpret_cast<uintptr_t>(values)) &
+         7) == 0;
+    const bool use_gqa_group =
+        (gqa_factor == 8 || gqa_factor == 6) &&
+        tpg.y == 1 && (tpg.x % gqa_factor) == 0 &&
+        group_vec_aligned &&
+        !has_mask && !do_causal && !has_sinks;
+    if (use_gqa_group) {
+      constexpr int max_group_heads = 4;
+      using packed_vec = vec<T, 4>;
+
+      const int group_idx = tid.x;
+      const int kv_head_count = int(tpg.x) / gqa_factor;
+      const int active_group_count =
+          kv_head_count * DARKBLOOM_GQA_KV_GROUPS;
+      if (group_idx >= active_group_count) {
+        return;
+      }
+
+      const int kv_head_idx = group_idx / DARKBLOOM_GQA_KV_GROUPS;
+      const int group_in_kv = group_idx % DARKBLOOM_GQA_KV_GROUPS;
+      const int group_heads = gqa_factor / DARKBLOOM_GQA_KV_GROUPS;
+      const int q_head0 =
+          kv_head_idx * gqa_factor + group_in_kv * group_heads;
+
+      const device T* group_keys =
+          keys + kv_head_idx * k_head_stride + simd_gid * k_seq_stride +
+          simd_lid * qk_per_thread;
+      const device T* group_values =
+          values + kv_head_idx * v_head_stride + simd_gid * v_seq_stride +
+          simd_lid * v_per_thread;
+
+      thread U group_q[max_group_heads][qk_per_thread];
+      thread U group_k[qk_per_thread];
+      thread U group_o[max_group_heads][v_per_thread];
+      thread U group_max[max_group_heads];
+      thread U group_sum[max_group_heads];
+
+      for (int h = 0; h < group_heads; h++) {
+        const device T* query =
+            queries + (q_head0 + h) * D + simd_lid * qk_per_thread;
+        packed_vec query_vec =
+            reinterpret_cast<const device packed_vec*>(query)[0];
+        group_q[h][0] = static_cast<U>(scale) *
+            static_cast<U>(query_vec[0]);
+        group_q[h][1] = static_cast<U>(scale) *
+            static_cast<U>(query_vec[1]);
+        group_q[h][2] = static_cast<U>(scale) *
+            static_cast<U>(query_vec[2]);
+        group_q[h][3] = static_cast<U>(scale) *
+            static_cast<U>(query_vec[3]);
+        group_max[h] = Limits<U>::finite_min;
+        group_sum[h] = 0;
+        for (int j = 0; j < v_per_thread; j++) {
+          group_o[h][j] = 0;
+        }
+      }
+
+      for (int i = simd_gid; i < N; i += BN) {
+        packed_vec key_vec =
+            reinterpret_cast<const device packed_vec*>(group_keys)[0];
+        packed_vec value_vec =
+            reinterpret_cast<const device packed_vec*>(group_values)[0];
+        group_k[0] = static_cast<U>(key_vec[0]);
+        group_k[1] = static_cast<U>(key_vec[1]);
+        group_k[2] = static_cast<U>(key_vec[2]);
+        group_k[3] = static_cast<U>(key_vec[3]);
+
+        thread U scores[max_group_heads];
+        for (int h = 0; h < group_heads; h++) {
+          scores[h] = 0;
+          scores[h] += group_q[h][0] * group_k[0];
+          scores[h] += group_q[h][1] * group_k[1];
+          scores[h] += group_q[h][2] * group_k[2];
+          scores[h] += group_q[h][3] * group_k[3];
+          scores[h] = simd_sum(scores[h]);
+        }
+
+        for (int h = 0; h < group_heads; h++) {
+          U new_max = max(group_max[h], scores[h]);
+          U factor;
+          DARKBLOOM_RESCALE_FACTOR(factor, group_max[h] - new_max);
+          U exp_score = fast::exp(scores[h] - new_max);
+
+          group_max[h] = new_max;
+          group_sum[h] = group_sum[h] * factor + exp_score;
+          group_o[h][0] = group_o[h][0] * factor +
+              exp_score * static_cast<U>(value_vec[0]);
+          group_o[h][1] = group_o[h][1] * factor +
+              exp_score * static_cast<U>(value_vec[1]);
+          group_o[h][2] = group_o[h][2] * factor +
+              exp_score * static_cast<U>(value_vec[2]);
+          group_o[h][3] = group_o[h][3] * factor +
+              exp_score * static_cast<U>(value_vec[3]);
+        }
+
+        group_keys += inner_k_stride;
+        group_values += inner_v_stride;
+      }
+
+      thread U group_factors[max_group_heads];
+      thread U normalized_sums[max_group_heads];
+
+      if (simd_lid == 0) {
+        for (int h = 0; h < group_heads; h++) {
+          max_scores[h * BN + simd_gid] = group_max[h];
+          sum_exp_scores[h * BN + simd_gid] = group_sum[h];
+        }
+      }
+
+      const int output_components = group_heads * v_per_thread;
+      for (int base = 0; base < output_components;
+           base += exchange_planes) {
+        if (base != 0) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (int plane = 0; plane < exchange_planes; plane++) {
+          const int component = base + plane;
+          if (component < output_components) {
+            const int h = component / v_per_thread;
+            const int j = component % v_per_thread;
+            outputs[plane * (BN * BD) + simd_lid * BD + simd_gid] =
+                group_o[h][j];
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (base == 0) {
+          for (int h = 0; h < group_heads; h++) {
+            U local_max = max_scores[h * BN + simd_lid];
+            U reduced_max = simd_max(local_max);
+            group_factors[h] = fast::exp(local_max - reduced_max);
+            normalized_sums[h] = simd_sum(
+                sum_exp_scores[h * BN + simd_lid] * group_factors[h]);
+          }
+        }
+
+        for (int plane = 0; plane < exchange_planes; plane++) {
+          const int component = base + plane;
+          if (component < output_components) {
+            const int h = component / v_per_thread;
+            const int j = component % v_per_thread;
+            U acc = simd_sum(
+                outputs[plane * (BN * BD) + simd_gid * BD + simd_lid] *
+                group_factors[h]);
+            group_o[h][j] = normalized_sums[h] == 0
+                ? acc
+                : (acc / normalized_sums[h]);
+          }
+        }
+      }
+
+      if (simd_lid == 0) {
+        for (int h = 0; h < group_heads; h++) {
+          device T* group_out =
+              out + (q_head0 + h) * V + simd_gid * v_per_thread;
+          for (int j = 0; j < v_per_thread; j++) {
+            group_out[j] = static_cast<T>(group_o[h][j]);
+          }
+        }
+      }
       return;
     }
-    const int q_head1 = q_head0 + 1;
-    const int kv_head_idx = q_head0 / gqa_factor;
-
-    const device T* pair_query0 =
-        queries + q_head0 * D + simd_lid * qk_per_thread;
-    const device T* pair_query1 =
-        queries + q_head1 * D + simd_lid * qk_per_thread;
-    const device T* pair_keys =
-        keys + kv_head_idx * k_head_stride + simd_gid * k_seq_stride +
-        simd_lid * qk_per_thread;
-    const device T* pair_values =
-        values + kv_head_idx * v_head_stride + simd_gid * v_seq_stride +
-        simd_lid * v_per_thread;
-    device T* pair_out0 =
-        out + q_head0 * V + simd_gid * v_per_thread;
-    device T* pair_out1 =
-        out + q_head1 * V + simd_gid * v_per_thread;
-
-    thread U pair_q0[qk_per_thread];
-    thread U pair_q1[qk_per_thread];
-    thread U pair_k[qk_per_thread];
-    thread U pair_o0[v_per_thread];
-    thread U pair_o1[v_per_thread];
-
-    for (int j = 0; j < qk_per_thread; ++j) {
-      pair_q0[j] = static_cast<U>(scale) * pair_query0[j];
-      pair_q1[j] = static_cast<U>(scale) * pair_query1[j];
-    }
-    for (int j = 0; j < v_per_thread; ++j) {
-      pair_o0[j] = 0;
-      pair_o1[j] = 0;
-    }
-
-    U pair_max0 = Limits<U>::finite_min;
-    U pair_max1 = Limits<U>::finite_min;
-    U pair_sum0 = 0;
-    U pair_sum1 = 0;
-
-    // Two-deep software pipeline, loads hoisted: both positions' K and V
-    // rows are read at the top of the trip, then the two positions are
-    // accumulated strictly in order (i before i+BN). Per-position FP
-    // sequence is character-identical to stock; only load placement moved,
-    // and loads have no side effects (no device stores occur in the loop).
-    int i = simd_gid;
-    for (; i + BN < N; i += 2 * BN) {
-      const device T* pipe_keys_b = pair_keys + inner_k_stride;
-      const device T* pipe_values_b = pair_values + inner_v_stride;
-      // 8-byte vec<T,4> loads (alignment certified by pair_vec_aligned at
-      // entry). Identical elements in identical order to the four scalar
-      // loads each replaces; the T -> U conversion points are unchanged, so
-      // the FP sequence is character-identical.
-      const vec<T, 4> vec_ka =
-          *reinterpret_cast<const device vec<T, 4>*>(pair_keys);
-      const vec<T, 4> vec_kb =
-          *reinterpret_cast<const device vec<T, 4>*>(pipe_keys_b);
-      U pipe_ka[4];
-      U pipe_kb[4];
-      pipe_ka[0] = vec_ka.x;
-      pipe_ka[1] = vec_ka.y;
-      pipe_ka[2] = vec_ka.z;
-      pipe_ka[3] = vec_ka.w;
-      pipe_kb[0] = vec_kb.x;
-      pipe_kb[1] = vec_kb.y;
-      pipe_kb[2] = vec_kb.z;
-      pipe_kb[3] = vec_kb.w;
-      const vec<T, 4> vec_va =
-          *reinterpret_cast<const device vec<T, 4>*>(pair_values);
-      const vec<T, 4> vec_vb =
-          *reinterpret_cast<const device vec<T, 4>*>(pipe_values_b);
-      const T pipe_va0 = vec_va.x;
-      const T pipe_va1 = vec_va.y;
-      const T pipe_va2 = vec_va.z;
-      const T pipe_va3 = vec_va.w;
-      const T pipe_vb0 = vec_vb.x;
-      const T pipe_vb1 = vec_vb.y;
-      const T pipe_vb2 = vec_vb.z;
-      const T pipe_vb3 = vec_vb.w;
-      // Manual full unroll of the qk_per_thread == 4 element loop. Same
-      // loads, same fmuladd chain order per score: identical FP sequence.
-
-      U pair_score0 = 0;
-      U pair_score1 = 0;
-      pair_score0 += pair_q0[0] * pipe_ka[0];
-      pair_score1 += pair_q1[0] * pipe_ka[0];
-      pair_score0 += pair_q0[1] * pipe_ka[1];
-      pair_score1 += pair_q1[1] * pipe_ka[1];
-      pair_score0 += pair_q0[2] * pipe_ka[2];
-      pair_score1 += pair_q1[2] * pipe_ka[2];
-      pair_score0 += pair_q0[3] * pipe_ka[3];
-      pair_score1 += pair_q1[3] * pipe_ka[3];
-      pair_score0 = simd_sum(pair_score0);
-      pair_score1 = simd_sum(pair_score1);
-
-      U pair_new_max0 = max(pair_max0, pair_score0);
-      U pair_new_max1 = max(pair_max1, pair_score1);
-      U pair_factor0;
-      U pair_factor1;
-      DARKBLOOM_RESCALE_FACTOR(pair_factor0, pair_max0 - pair_new_max0);
-      DARKBLOOM_RESCALE_FACTOR(pair_factor1, pair_max1 - pair_new_max1);
-      U pair_exp0 = fast::exp(pair_score0 - pair_new_max0);
-      U pair_exp1 = fast::exp(pair_score1 - pair_new_max1);
-
-      pair_max0 = pair_new_max0;
-      pair_max1 = pair_new_max1;
-      pair_sum0 = pair_sum0 * pair_factor0 + pair_exp0;
-      pair_sum1 = pair_sum1 * pair_factor1 + pair_exp1;
-
-      pair_o0[0] = pair_o0[0] * pair_factor0 + pair_exp0 * pipe_va0;
-      pair_o1[0] = pair_o1[0] * pair_factor1 + pair_exp1 * pipe_va0;
-      pair_o0[1] = pair_o0[1] * pair_factor0 + pair_exp0 * pipe_va1;
-      pair_o1[1] = pair_o1[1] * pair_factor1 + pair_exp1 * pipe_va1;
-      pair_o0[2] = pair_o0[2] * pair_factor0 + pair_exp0 * pipe_va2;
-      pair_o1[2] = pair_o1[2] * pair_factor1 + pair_exp1 * pipe_va2;
-      pair_o0[3] = pair_o0[3] * pair_factor0 + pair_exp0 * pipe_va3;
-      pair_o1[3] = pair_o1[3] * pair_factor1 + pair_exp1 * pipe_va3;
-
-      // Manual full unroll of the qk_per_thread == 4 element loop. Same
-      // loads, same fmuladd chain order per score: identical FP sequence.
-
-      U pipeb_score0 = 0;
-      U pipeb_score1 = 0;
-      pipeb_score0 += pair_q0[0] * pipe_kb[0];
-      pipeb_score1 += pair_q1[0] * pipe_kb[0];
-      pipeb_score0 += pair_q0[1] * pipe_kb[1];
-      pipeb_score1 += pair_q1[1] * pipe_kb[1];
-      pipeb_score0 += pair_q0[2] * pipe_kb[2];
-      pipeb_score1 += pair_q1[2] * pipe_kb[2];
-      pipeb_score0 += pair_q0[3] * pipe_kb[3];
-      pipeb_score1 += pair_q1[3] * pipe_kb[3];
-      pipeb_score0 = simd_sum(pipeb_score0);
-      pipeb_score1 = simd_sum(pipeb_score1);
-
-      U pipeb_new_max0 = max(pair_max0, pipeb_score0);
-      U pipeb_new_max1 = max(pair_max1, pipeb_score1);
-      U pipeb_factor0;
-      U pipeb_factor1;
-      DARKBLOOM_RESCALE_FACTOR(pipeb_factor0, pair_max0 - pipeb_new_max0);
-      DARKBLOOM_RESCALE_FACTOR(pipeb_factor1, pair_max1 - pipeb_new_max1);
-      U pipeb_exp0 = fast::exp(pipeb_score0 - pipeb_new_max0);
-      U pipeb_exp1 = fast::exp(pipeb_score1 - pipeb_new_max1);
-
-      pair_max0 = pipeb_new_max0;
-      pair_max1 = pipeb_new_max1;
-      pair_sum0 = pair_sum0 * pipeb_factor0 + pipeb_exp0;
-      pair_sum1 = pair_sum1 * pipeb_factor1 + pipeb_exp1;
-
-      pair_o0[0] = pair_o0[0] * pipeb_factor0 + pipeb_exp0 * pipe_vb0;
-      pair_o1[0] = pair_o1[0] * pipeb_factor1 + pipeb_exp1 * pipe_vb0;
-      pair_o0[1] = pair_o0[1] * pipeb_factor0 + pipeb_exp0 * pipe_vb1;
-      pair_o1[1] = pair_o1[1] * pipeb_factor1 + pipeb_exp1 * pipe_vb1;
-      pair_o0[2] = pair_o0[2] * pipeb_factor0 + pipeb_exp0 * pipe_vb2;
-      pair_o1[2] = pair_o1[2] * pipeb_factor1 + pipeb_exp1 * pipe_vb2;
-      pair_o0[3] = pair_o0[3] * pipeb_factor0 + pipeb_exp0 * pipe_vb3;
-      pair_o1[3] = pair_o1[3] * pipeb_factor1 + pipeb_exp1 * pipe_vb3;
-
-      pair_keys += 2 * inner_k_stride;
-      pair_values += 2 * inner_v_stride;
-    }
-    if (i < N) {
-      const vec<T, 4> vec_kt =
-          *reinterpret_cast<const device vec<T, 4>*>(pair_keys);
-      const vec<T, 4> vec_vt =
-          *reinterpret_cast<const device vec<T, 4>*>(pair_values);
-      pair_k[0] = vec_kt.x;
-      pair_k[1] = vec_kt.y;
-      pair_k[2] = vec_kt.z;
-      pair_k[3] = vec_kt.w;
-      const T pipe_va0 = vec_vt.x;
-      const T pipe_va1 = vec_vt.y;
-      const T pipe_va2 = vec_vt.z;
-      const T pipe_va3 = vec_vt.w;
-      // Manual full unroll of the qk_per_thread == 4 element loop. Same
-      // loads, same fmuladd chain order per score: identical FP sequence.
-
-      U pair_score0 = 0;
-      U pair_score1 = 0;
-      pair_score0 += pair_q0[0] * pair_k[0];
-      pair_score1 += pair_q1[0] * pair_k[0];
-      pair_score0 += pair_q0[1] * pair_k[1];
-      pair_score1 += pair_q1[1] * pair_k[1];
-      pair_score0 += pair_q0[2] * pair_k[2];
-      pair_score1 += pair_q1[2] * pair_k[2];
-      pair_score0 += pair_q0[3] * pair_k[3];
-      pair_score1 += pair_q1[3] * pair_k[3];
-      pair_score0 = simd_sum(pair_score0);
-      pair_score1 = simd_sum(pair_score1);
-
-      U pair_new_max0 = max(pair_max0, pair_score0);
-      U pair_new_max1 = max(pair_max1, pair_score1);
-      U pair_factor0;
-      U pair_factor1;
-      DARKBLOOM_RESCALE_FACTOR(pair_factor0, pair_max0 - pair_new_max0);
-      DARKBLOOM_RESCALE_FACTOR(pair_factor1, pair_max1 - pair_new_max1);
-      U pair_exp0 = fast::exp(pair_score0 - pair_new_max0);
-      U pair_exp1 = fast::exp(pair_score1 - pair_new_max1);
-
-      pair_max0 = pair_new_max0;
-      pair_max1 = pair_new_max1;
-      pair_sum0 = pair_sum0 * pair_factor0 + pair_exp0;
-      pair_sum1 = pair_sum1 * pair_factor1 + pair_exp1;
-
-      pair_o0[0] = pair_o0[0] * pair_factor0 + pair_exp0 * pipe_va0;
-      pair_o1[0] = pair_o1[0] * pair_factor1 + pair_exp1 * pipe_va0;
-      pair_o0[1] = pair_o0[1] * pair_factor0 + pair_exp0 * pipe_va1;
-      pair_o1[1] = pair_o1[1] * pair_factor1 + pair_exp1 * pipe_va1;
-      pair_o0[2] = pair_o0[2] * pair_factor0 + pair_exp0 * pipe_va2;
-      pair_o1[2] = pair_o1[2] * pair_factor1 + pair_exp1 * pipe_va2;
-      pair_o0[3] = pair_o0[3] * pair_factor0 + pair_exp0 * pipe_va3;
-      pair_o1[3] = pair_o1[3] * pair_factor1 + pair_exp1 * pipe_va3;
-
-    }
-
-    // Each head keeps the promoted two-plane combine shape. The additive
-    // head-bank offset changes no producer/consumer pairing or simd_sum tree.
-    constexpr int pair_planes = 2;
-    constexpr int pair_plane_size = BN * BD;
-    if (simd_lid == 0) {
-      max_scores[simd_gid] = pair_max0;
-      max_scores[BN + simd_gid] = pair_max1;
-      sum_exp_scores[simd_gid] = pair_sum0;
-      sum_exp_scores[BN + simd_gid] = pair_sum1;
-    }
-    for (int i = 0; i < pair_planes; ++i) {
-      outputs[i * pair_plane_size + simd_lid * BD + simd_gid] = pair_o0[i];
-      outputs[
-          (pair_planes + i) * pair_plane_size + simd_lid * BD + simd_gid] =
-          pair_o1[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    pair_max0 = max_scores[simd_lid];
-    pair_max1 = max_scores[BN + simd_lid];
-    U pair_global_max0 = simd_max(pair_max0);
-    U pair_global_max1 = simd_max(pair_max1);
-    U pair_global_factor0 = fast::exp(pair_max0 - pair_global_max0);
-    U pair_global_factor1 = fast::exp(pair_max1 - pair_global_max1);
-    pair_sum0 =
-        simd_sum(sum_exp_scores[simd_lid] * pair_global_factor0);
-    pair_sum1 =
-        simd_sum(sum_exp_scores[BN + simd_lid] * pair_global_factor1);
-
-    for (int i = 0; i < pair_planes; ++i) {
-      U acc0 = simd_sum(
-          outputs[i * pair_plane_size + simd_gid * BD + simd_lid] *
-          pair_global_factor0);
-      U acc1 = simd_sum(
-          outputs[
-              (pair_planes + i) * pair_plane_size +
-              simd_gid * BD + simd_lid] *
-          pair_global_factor1);
-      pair_o0[i] = pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
-      pair_o1[i] = pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i = 0; i < pair_planes; ++i) {
-      outputs[i * pair_plane_size + simd_lid * BD + simd_gid] =
-          pair_o0[pair_planes + i];
-      outputs[
-          (pair_planes + i) * pair_plane_size + simd_lid * BD + simd_gid] =
-          pair_o1[pair_planes + i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i = 0; i < pair_planes; ++i) {
-      U acc0 = simd_sum(
-          outputs[i * pair_plane_size + simd_gid * BD + simd_lid] *
-          pair_global_factor0);
-      U acc1 = simd_sum(
-          outputs[
-              (pair_planes + i) * pair_plane_size +
-              simd_gid * BD + simd_lid] *
-          pair_global_factor1);
-      pair_o0[pair_planes + i] =
-          pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
-      pair_o1[pair_planes + i] =
-          pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
-    }
-
-    if (simd_lid == 0) {
-      for (int i = 0; i < v_per_thread; ++i) {
-        pair_out0[i] = static_cast<T>(pair_o0[i]);
-        pair_out1[i] = static_cast<T>(pair_o1[i]);
-      }
-    }
-    return;
-  }
   }
 
   thread U q[qk_per_thread];

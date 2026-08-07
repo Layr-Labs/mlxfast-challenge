@@ -291,35 +291,6 @@ let lagunaSwiGLUQMVRows1Enabled =
 let lagunaSharedSwiGLUQMVRows1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_QMV_R1"] != "0"
 
-/// `DARKBLOOM_SHARED_SCALE_HALVED` (default ON; set "0" to ablate): serves
-/// the shared expert's gate/up and `down_proj` NVFP4 scales from the group-32
-/// halved planes instead of the shipped byte-per-16-weights ones. The routed
-/// gate/up and down banks already ship halved (`DARKBLOOM_PACKED_SCALES`);
-/// the shared expert is the last MoE plane still read at full width, worth
-/// 196,608 bytes per sparse layer of which half is a duplicate the quantizer
-/// wrote twice. Nothing is requantized: `lagunaHalvedGroup32ScalePlane`
-/// installs the plane only when every discarded odd byte is bitwise equal to
-/// its even partner, and the pairs that are not are carried in the patch
-/// header, so the kernels reconstruct the shipped plane exactly. Off means
-/// the stock planes and the stock kernels, byte for byte. Measured on-default
-/// after three order-alternated local-submit pairs (decode -0.171% s/token,
-/// on faster in 3/3) plus token-exact correctness with the flag on.
-let lagunaSharedScaleHalvedEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_SCALE_HALVED"] != "0"
-
-/// `DARKBLOOM_QMV_WIDE_CODES` (default OFF, under measurement): the shared
-/// gate/up QMV reads code words two adjacent groups at a time. Each lane owns
-/// groups `2l` and `2l+1` of a 1024-weight slab and loads their codes in one
-/// aligned `uint4` instead of two strided `uint2`s, halving both the code
-/// loads and the K-loop trip count; the halved scale plane supplies the pair's
-/// single shared byte, so scale loads halve again. NOT bit-exact against the
-/// stock kernel: the products are identical floats, but each lane now sums a
-/// different pair of groups, so the per-lane partials and the simd tree see a
-/// reassociated order. Requires the halved planes
-/// (`DARKBLOOM_SHARED_SCALE_HALVED`); without them the flag is inert.
-let lagunaSharedQMVWideCodesEnabled =
-    ProcessInfo.processInfo.environment["DARKBLOOM_QMV_WIDE_CODES"] == "1"
-
 /// Folds the per-head softplus gate into the output projection's GEMV (see
 /// `lagunaGatedOutputProjectionSource`), with one kernel variant per attention
 /// family. Set `DARKBLOOM_FUSED_GATED_OUTPUT=0` to ablate.
@@ -6836,33 +6807,16 @@ for (uint row = 0; row < 2; ++row) {
 
 /// One-output-row scheduling twin of `lagunaSharedSwiGLUQMVKernel`.
 /// Arithmetic is textually identical per row; only row ownership changes.
-///
-/// `halved` selects the group-32 halved scale plane built by
-/// `lagunaHalvedGroup32ScalePlane`: one byte per 32 weights behind the patch
-/// header, so a simdgroup's 32 lanes read 16 contiguous bytes in place of 32
-/// and each lane issues one scale load per two it issued before. The fused
-/// plane concatenates gate over up, so the only two pairs the quantizer can
-/// leave unequal are gate row 0 and up row 0, carried in header slots 0 and 1.
-private func lagunaSharedSwiGLUQMVRows1Source(halved: Bool) -> String {
-    let scaleRowBytes = halved ? 64 : 128
-    let patch =
-        halved
-        ? "constexpr uint scale_patch_bytes = \(lagunaScalePatchHeaderBytes);\n" : ""
-    let base = halved ? "fused_scales + scale_patch_bytes" : "fused_scales"
-    let laneTerm = halved ? "(lane >> 1)" : "lane"
-    let blockDiv = halved ? 32 : 16
-    func value(_ pointer: String, _ slot: Int) -> String {
-        let read = "\(pointer)[block / \(blockDiv)]"
-        guard halved else { return read }
-        return "(row == 0 && block == 0 && lane == 1)"
-            + " ? fused_scales[\(slot)] : \(read)"
-    }
-    return """
+private let lagunaSharedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
+    name: "laguna_shared_nvfp4_swiglu_qmv_rows1_bf16_v1",
+    inputNames: ["input", "fused_weight", "fused_scales"],
+    outputNames: ["activated"],
+    source: """
 constexpr uint input_width = 2048;
 constexpr uint output_width = 512;
 constexpr uint packed_row_bytes = 1024;
-constexpr uint scale_row_bytes = \(scaleRowBytes);
-\(patch)constexpr uint block_width = 512;
+constexpr uint scale_row_bytes = 128;
+constexpr uint block_width = 512;
 constexpr uint values_per_lane = 16;
 
 uint tile = threadgroup_position_in_grid.x;
@@ -6877,9 +6831,9 @@ const device uint8_t* up_row_weight =
     (const device uint8_t*)fused_weight +
     (row + output_width) * packed_row_bytes + lane * 8;
 const device uint8_t* gate_row_scale =
-    \(base) + row * scale_row_bytes + \(laneTerm);
+    fused_scales + row * scale_row_bytes + lane;
 const device uint8_t* up_row_scale =
-    \(base) + (row + output_width) * scale_row_bytes + \(laneTerm);
+    fused_scales + (row + output_width) * scale_row_bytes + lane;
 
 thread float gate_result = 0.0f;
 thread float up_result = 0.0f;
@@ -6900,120 +6854,11 @@ for (uint block = 0; block < input_width; block += block_width) {
     gate_result += laguna_nvfp4_qdot_16(
         gate_row_weight + block / 2,
         input_values,
-        laguna_nvfp4_scale(\(value("gate_row_scale", 0))));
+        laguna_nvfp4_scale(gate_row_scale[block / 16]));
     up_result += laguna_nvfp4_qdot_16(
         up_row_weight + block / 2,
         input_values,
-        laguna_nvfp4_scale(\(value("up_row_scale", 1))));
-}
-
-gate_result = simd_sum(gate_result);
-up_result = simd_sum(up_result);
-if (lane == 0) {
-    bfloat gate = bfloat(gate_result\(lagunaNvfp4RowScaleSuffix));
-    bfloat up = bfloat(up_result\(lagunaNvfp4RowScaleSuffix));
-    bfloat exp_abs = metal::exp(metal::abs(gate));
-    bfloat denominator = bfloat(1) + exp_abs;
-    bfloat y = bfloat(1) / denominator;
-    bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
-    bfloat silu = bfloat(gate * sigmoid);
-    activated[row] = bfloat(silu * up);
-}
-"""
-}
-
-private let lagunaSharedSwiGLUQMVRows1Kernel = MLXFast.metalKernel(
-    name: "laguna_shared_nvfp4_swiglu_qmv_rows1_bf16_v1",
-    inputNames: ["input", "fused_weight", "fused_scales"],
-    outputNames: ["activated"],
-    source: lagunaSharedSwiGLUQMVRows1Source(halved: false),
-    header: lagunaSharedSwiGLUQMVHeader,
-    ensureRowContiguous: true
-)
-
-private let lagunaSharedSwiGLUQMVRows1HalvedKernel = MLXFast.metalKernel(
-    name: "laguna_shared_nvfp4_swiglu_qmv_rows1_halved_bf16_v1",
-    inputNames: ["input", "fused_weight", "fused_scales"],
-    outputNames: ["activated"],
-    source: lagunaSharedSwiGLUQMVRows1Source(halved: true),
-    header: lagunaSharedSwiGLUQMVHeader,
-    ensureRowContiguous: true
-)
-
-/// Wide-codes twin of the halved R1 kernel: two adjacent groups per lane, one
-/// `uint4` code load and one shared scale byte per pair, two K iterations
-/// instead of four. The pair's second group reuses `laguna_nvfp4_qdot_codes_16`
-/// on the upper half of the `uint4`, so the per-group arithmetic and the
-/// accumulate-then-`simd_sum` shape are unchanged; only the lane-to-group
-/// assignment moves, which is the documented reassociation.
-private let lagunaSharedSwiGLUQMVRows1WideKernel = MLXFast.metalKernel(
-    name: "laguna_shared_nvfp4_swiglu_qmv_rows1_halved_wide_bf16_v1",
-    inputNames: ["input", "fused_weight", "fused_scales"],
-    outputNames: ["activated"],
-    source: """
-constexpr uint input_width = 2048;
-constexpr uint output_width = 512;
-constexpr uint packed_row_bytes = 1024;
-constexpr uint scale_row_bytes = 64;
-constexpr uint scale_patch_bytes = \(lagunaScalePatchHeaderBytes);
-constexpr uint slab_width = 1024;
-constexpr uint values_per_lane = 32;
-
-uint tile = threadgroup_position_in_grid.x;
-uint simd_group = simdgroup_index_in_threadgroup;
-uint lane = thread_index_in_simdgroup;
-uint row = tile * 2 + simd_group;
-
-const device uint8_t* gate_row_weight =
-    (const device uint8_t*)fused_weight +
-    row * packed_row_bytes + lane * 16;
-const device uint8_t* up_row_weight =
-    (const device uint8_t*)fused_weight +
-    (row + output_width) * packed_row_bytes + lane * 16;
-const device uint8_t* gate_row_scale =
-    fused_scales + scale_patch_bytes + row * scale_row_bytes + lane;
-const device uint8_t* up_row_scale =
-    fused_scales + scale_patch_bytes
-    + (row + output_width) * scale_row_bytes + lane;
-
-thread float gate_result = 0.0f;
-thread float up_result = 0.0f;
-thread float input_values[values_per_lane];
-
-for (uint slab = 0; slab < input_width; slab += slab_width) {
-    const device vec<bfloat, 4>* input_vectors =
-        (const device vec<bfloat, 4>*) (
-            input + slab + lane * values_per_lane);
-    for (uint i = 0; i < values_per_lane / 4; ++i) {
-        const vec<bfloat, 4> values = input_vectors[i];
-        input_values[4 * i] = values[0];
-        input_values[4 * i + 1] = values[1];
-        input_values[4 * i + 2] = values[2];
-        input_values[4 * i + 3] = values[3];
-    }
-
-    // The pair's halved byte covers both groups; the header byte restores the
-    // one quantizer exception per plane (gate row 0 / up row 0, pair 0, whose
-    // odd member is the second group of lane 0's first pair).
-    uint8_t gate_sb = gate_row_scale[slab / 32];
-    uint8_t up_sb = up_row_scale[slab / 32];
-    bool patch = row == 0 && slab == 0 && lane == 0;
-    uint8_t gate_sb_b = patch ? fused_scales[0] : gate_sb;
-    uint8_t up_sb_b = patch ? fused_scales[1] : up_sb;
-
-    const uint4 gate_codes =
-        *(const device uint4*)(gate_row_weight + slab / 2);
-    const uint4 up_codes =
-        *(const device uint4*)(up_row_weight + slab / 2);
-
-    gate_result += laguna_nvfp4_qdot_codes_16(
-        gate_codes.xy, input_values, laguna_nvfp4_scale(gate_sb));
-    gate_result += laguna_nvfp4_qdot_codes_16(
-        gate_codes.zw, input_values + 16, laguna_nvfp4_scale(gate_sb_b));
-    up_result += laguna_nvfp4_qdot_codes_16(
-        up_codes.xy, input_values, laguna_nvfp4_scale(up_sb));
-    up_result += laguna_nvfp4_qdot_codes_16(
-        up_codes.zw, input_values + 16, laguna_nvfp4_scale(up_sb_b));
+        laguna_nvfp4_scale(up_row_scale[block / 16]));
 }
 
 gate_result = simd_sum(gate_result);
@@ -7045,30 +6890,14 @@ func lagunaSharedSwiGLUQMV(
         fusedWeight.dims(2 * LagunaConstants.sharedExpertIntermediateSize,
             LagunaConstants.hiddenSize / 8))
     precondition(fusedScales.dtype == .uint8)
-    // A halved plane is the one-dimensional header-plus-even-bytes form; the
-    // stock plane keeps its two-dimensional shape. The shape is the contract,
-    // so a caller cannot pair one form with the other form's kernel.
-    let halved = fusedScales.ndim == 1
-    if halved {
-        precondition(lagunaSharedSwiGLUQMVRows1Enabled)
-        precondition(
-            fusedScales.size == lagunaScalePatchHeaderBytes
-                + 2 * LagunaConstants.sharedExpertIntermediateSize
-                * (LagunaConstants.hiddenSize / 32))
-    } else {
-        precondition(
-            fusedScales.dims(2 * LagunaConstants.sharedExpertIntermediateSize,
-                LagunaConstants.hiddenSize / 16))
-    }
+    precondition(
+        fusedScales.dims(2 * LagunaConstants.sharedExpertIntermediateSize,
+            LagunaConstants.hiddenSize / 16))
 
     let kernel =
-        halved
-        ? (lagunaSharedQMVWideCodesEnabled
-            ? lagunaSharedSwiGLUQMVRows1WideKernel
-            : lagunaSharedSwiGLUQMVRows1HalvedKernel)
-        : (lagunaSharedSwiGLUQMVRows1Enabled
-            ? lagunaSharedSwiGLUQMVRows1Kernel
-            : lagunaSharedSwiGLUQMVKernel)
+        lagunaSharedSwiGLUQMVRows1Enabled
+        ? lagunaSharedSwiGLUQMVRows1Kernel
+        : lagunaSharedSwiGLUQMVKernel
     let tiles = lagunaSharedSwiGLUQMVRows1Enabled ? 256 : 128
     return kernel(
         [input, fusedWeight, fusedScales],
@@ -7085,43 +6914,14 @@ private let lagunaSharedDownResidualKernel = MLXFast.metalKernel(
         "activated", "down_weight", "down_scales", "routed", "residual",
     ],
     outputNames: ["output"],
-    source: lagunaSharedDownResidualSource(halved: false),
-    header: lagunaSharedSwiGLUQMVHeader,
-    ensureRowContiguous: true
-)
-
-private let lagunaSharedDownResidualHalvedKernel = MLXFast.metalKernel(
-    name: "laguna_shared_nvfp4_down_residual_halved_bf16_v1",
-    inputNames: [
-        "activated", "down_weight", "down_scales", "routed", "residual",
-    ],
-    outputNames: ["output"],
-    source: lagunaSharedDownResidualSource(halved: true),
-    header: lagunaSharedSwiGLUQMVHeader,
-    ensureRowContiguous: true
-)
-
-/// `halved` reads the shared `down_proj` scales in the group-32 halved form.
-/// The plane is a single tensor, so flat pair 0 (output row 0, groups 0/1) is
-/// the only pair the quantizer can leave unequal; it lives in header slot 0.
-private func lagunaSharedDownResidualSource(halved: Bool) -> String {
-    let scaleRowBytes = halved ? 16 : 32
-    let patch =
-        halved
-        ? "constexpr uint scale_patch_bytes = \(lagunaScalePatchHeaderBytes);\n" : ""
-    let base = halved ? "down_scales + scale_patch_bytes" : "down_scales"
-    let laneTerm = halved ? "(lane >> 1)" : "lane"
-    let read =
-        halved
-        ? "(output_row == 0 && lane == 1) ? down_scales[0] : scale[0]" : "scale[0]"
-    return """
+    source: """
 constexpr uint input_width = 512;
 constexpr uint output_width = 2048;
 constexpr uint outputs_per_simd = 4;
 constexpr uint values_per_lane = 16;
 constexpr uint packed_row_bytes = 256;
-constexpr uint scale_row_bytes = \(scaleRowBytes);
-\(patch)
+constexpr uint scale_row_bytes = 32;
+
 uint group = threadgroup_position_in_grid.x;
 uint simd_group = simdgroup_index_in_threadgroup;
 uint lane = thread_index_in_simdgroup;
@@ -7150,11 +6950,11 @@ for (uint row = 0; row < outputs_per_simd; ++row) {
         (const device uint8_t*)down_weight +
         output_row * packed_row_bytes + lane * 8;
     const device uint8_t* scale =
-        \(base) + output_row * scale_row_bytes + \(laneTerm);
+        down_scales + output_row * scale_row_bytes + lane;
     result[row] = laguna_nvfp4_qdot_16(
         weight,
         input_values,
-        laguna_nvfp4_scale(\(read)));
+        laguna_nvfp4_scale(scale[0]));
     result[row] = simd_sum(result[row]);
 }
 
@@ -7167,8 +6967,10 @@ if (lane == 0) {
             bfloat(residual[output_row] + r2);
     }
 }
-"""
-}
+""",
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
 
 func lagunaSharedDownResidual(
     _ activated: MLXArray,
@@ -7185,26 +6987,15 @@ func lagunaSharedDownResidual(
         downWeight.dims(LagunaConstants.hiddenSize,
             LagunaConstants.sharedExpertIntermediateSize / 8))
     precondition(downScales.dtype == .uint8)
-    let halved = downScales.ndim == 1
-    if halved {
-        precondition(
-            downScales.size == lagunaScalePatchHeaderBytes
-                + LagunaConstants.hiddenSize
-                * (LagunaConstants.sharedExpertIntermediateSize / 32))
-    } else {
-        precondition(
-            downScales.dims(LagunaConstants.hiddenSize,
-                LagunaConstants.sharedExpertIntermediateSize / 16))
-    }
+    precondition(
+        downScales.dims(LagunaConstants.hiddenSize,
+            LagunaConstants.sharedExpertIntermediateSize / 16))
     precondition(routed.dtype == .bfloat16)
     precondition(routed.dims(1, 1, LagunaConstants.hiddenSize))
     precondition(residual.dtype == .bfloat16)
     precondition(residual.dims(1, 1, LagunaConstants.hiddenSize))
 
-    let kernel =
-        halved
-        ? lagunaSharedDownResidualHalvedKernel : lagunaSharedDownResidualKernel
-    return kernel(
+    return lagunaSharedDownResidualKernel(
         [activated, downWeight, downScales, routed, residual],
         grid: ((LagunaConstants.hiddenSize / 8) * 64, 1, 1),
         threadGroup: (64, 1, 1),
@@ -8091,96 +7882,7 @@ private let lagunaRoutedSharedDownResidualKernel = MLXFast.metalKernel(
             "shared_down_weight", "shared_down_scales", "residual",
         ],
     outputNames: ["output"],
-    source: lagunaRoutedSharedDownResidualSource(sharedHalved: false),
-    header: lagunaSharedSwiGLUQMVHeader,
-    ensureRowContiguous: true
-)
-
-/// Halved-shared twin of `lagunaRoutedSharedDownResidualKernel`. The routed
-/// half already reads the group-32 halved plane; this variant puts the shared
-/// half on the same footing, so both slots take one scale byte per 32 weights
-/// and the whole dispatch reads a single scale form.
-private let lagunaRoutedSharedDownResidualSharedHalvedKernel =
-    MLXFast.metalKernel(
-        name: lagunaSharedFirstDownOrderEnabled
-            ? "laguna_routed_shared_nvfp4_down_residual_bf16_r1_sh_v5sf"
-            : "laguna_routed_shared_nvfp4_down_residual_bf16_r1_sh_v5",
-        inputNames: lagunaSharedFirstDownOrderEnabled
-            ? [
-                "shared_activated", "shared_down_weight", "shared_down_scales",
-                "routed_activated", "routed_down_weight", "routed_down_scales",
-                "indices", "router_weights", "residual",
-            ]
-            : [
-                "routed_activated", "routed_down_weight", "routed_down_scales",
-                "indices", "router_weights", "shared_activated",
-                "shared_down_weight", "shared_down_scales", "residual",
-            ],
-        outputNames: ["output"],
-        source: lagunaRoutedSharedDownResidualSource(sharedHalved: true),
-        header: lagunaSharedSwiGLUQMVHeader,
-        ensureRowContiguous: true
-    )
-
-private func lagunaRoutedSharedDownResidualSource(
-    sharedHalved: Bool, staged: Bool = false
-) -> String {
-    let sharedRowBytes = sharedHalved ? 16 : 32
-    let sharedBase =
-        sharedHalved ? "shared_down_scales + scale_patch_bytes" : "shared_down_scales"
-    let scaleLane = sharedHalved ? "(lane >> 1)" : "is_shared ? lane : (lane >> 1)"
-    let patch =
-        sharedHalved
-        ? "(output_row == 0 && lane == 1 && (is_shared || expert == 0))\n"
-            + "        ? (is_shared ? shared_down_scales[0] : routed_down_scales[0])"
-        : "(!is_shared && expert == 0 && output_row == 0 && lane == 1)\n"
-            + "        ? routed_down_scales[0]"
-    // Same accumulation, scale conversion, reduction, and epilogue order in
-    // both bodies; `staged` only hoists the four code words and scale bytes
-    // ahead of the qdots (the promoted stage4 schedule).
-    let qdots =
-        staged
-        ? """
-        thread float result[outputs_per_simd] = {0.0f};
-        uint2 row_codes[outputs_per_simd];
-        uint8_t row_sb[outputs_per_simd];
-        for (uint row = 0; row < outputs_per_simd; ++row) {
-            uint output_row = first_row + row;
-            row_codes[row] = *(const device uint2*)(
-                expert_weight + output_row * packed_row_bytes + lane * 8);
-            const device uint8_t* scale =
-                expert_scales + output_row * scale_row_bytes + scale_lane;
-            row_sb[row] =
-                \(patch)
-                : scale[0];
-        }
-        for (uint row = 0; row < outputs_per_simd; ++row) {
-            result[row] = laguna_nvfp4_qdot_codes_16(
-                row_codes[row],
-                input_values,
-                laguna_nvfp4_scale(row_sb[row]));
-            result[row] = simd_sum(result[row]);
-        }
-        """
-        : """
-        thread float result[outputs_per_simd] = {0.0f};
-        for (uint row = 0; row < outputs_per_simd; ++row) {
-            uint output_row = first_row + row;
-            const device uint8_t* weight =
-                expert_weight + output_row * packed_row_bytes + lane * 8;
-            const device uint8_t* scale =
-                expert_scales + output_row * scale_row_bytes + scale_lane;
-            uint8_t sb =
-                \(patch)
-                : scale[0];
-            result[row] = laguna_nvfp4_qdot_16(
-                weight,
-                input_values,
-                laguna_nvfp4_scale(sb));
-            result[row] = simd_sum(result[row]);
-        }
-        """
-    return """
+    source: """
 constexpr uint input_width = 512;
 constexpr uint output_width = 2048;
 constexpr uint routed_experts = 8;
@@ -8189,7 +7891,7 @@ constexpr uint outputs_per_simd = 4;
 constexpr uint values_per_lane = 16;
 constexpr uint packed_row_bytes = 256;
 constexpr uint scale_patch_bytes = \(lagunaScalePatchHeaderBytes);
-constexpr uint shared_scale_row_bytes = \(sharedRowBytes);
+constexpr uint shared_scale_row_bytes = 32;
 constexpr uint routed_scale_row_bytes = 16;
 constexpr uint packed_expert_bytes =
     output_width * packed_row_bytes;
@@ -8211,12 +7913,12 @@ const device uint8_t* expert_weight = is_shared
     : (const device uint8_t*)routed_down_weight +
         expert * packed_expert_bytes;
 const device uint8_t* expert_scales = is_shared
-    ? \(sharedBase)
+    ? shared_down_scales
     : routed_down_scales + scale_patch_bytes
         + expert * scale_expert_bytes;
 uint scale_row_bytes =
     is_shared ? shared_scale_row_bytes : routed_scale_row_bytes;
-uint scale_lane = \(scaleLane);
+uint scale_lane = is_shared ? lane : (lane >> 1);
 
 thread float input_values[values_per_lane];
 const device vec<bfloat, 4>* input_vectors =
@@ -8230,7 +7932,23 @@ for (uint i = 0; i < values_per_lane / 4; ++i) {
     input_values[4 * i + 3] = values[3];
 }
 
-\(qdots)
+thread float result[outputs_per_simd] = {0.0f};
+for (uint row = 0; row < outputs_per_simd; ++row) {
+    uint output_row = first_row + row;
+    const device uint8_t* weight =
+        expert_weight + output_row * packed_row_bytes + lane * 8;
+    const device uint8_t* scale =
+        expert_scales + output_row * scale_row_bytes + scale_lane;
+    uint8_t sb =
+        (!is_shared && expert == 0 && output_row == 0 && lane == 1)
+        ? routed_down_scales[0]
+        : scale[0];
+    result[row] = laguna_nvfp4_qdot_16(
+        weight,
+        input_values,
+        laguna_nvfp4_scale(sb));
+    result[row] = simd_sum(result[row]);
+}
 
 threadgroup bfloat down_outputs[
     (routed_experts + 1) * outputs_per_simd
@@ -8264,8 +7982,10 @@ if (slot == 0 && lane < outputs_per_simd) {
     output[first_row + lane] =
         bfloat(residual[first_row + lane] + r2);
 }
-"""
-}
+""",
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
 
 /// Exact load-scheduled twin of `lagunaRoutedSharedDownResidualKernel`.
 /// Four `uint2` code words and four authoritative scale bytes are read before
@@ -8397,32 +8117,6 @@ if (slot == 0 && lane < outputs_per_simd) {
     ensureRowContiguous: true
 )
 
-/// Halved-shared twin of the stage4 kernel: the promoted row-staging load
-/// schedule over the one-byte-per-32 shared scale plane, so the halved
-/// delivery composes with the staging win instead of displacing it.
-private let lagunaRoutedSharedDownResidualStagedSharedHalvedKernel =
-    MLXFast.metalKernel(
-        name: lagunaSharedFirstDownOrderEnabled
-            ? "laguna_routed_shared_nvfp4_down_residual_bf16_sh_stage4_v6sf"
-            : "laguna_routed_shared_nvfp4_down_residual_bf16_sh_stage4_v6",
-        inputNames: lagunaSharedFirstDownOrderEnabled
-            ? [
-                "shared_activated", "shared_down_weight", "shared_down_scales",
-                "routed_activated", "routed_down_weight", "routed_down_scales",
-                "indices", "router_weights", "residual",
-            ]
-            : [
-                "routed_activated", "routed_down_weight", "routed_down_scales",
-                "indices", "router_weights", "shared_activated",
-                "shared_down_weight", "shared_down_scales", "residual",
-            ],
-        outputNames: ["output"],
-        source: lagunaRoutedSharedDownResidualSource(
-            sharedHalved: true, staged: true),
-        header: lagunaSharedSwiGLUQMVHeader,
-        ensureRowContiguous: true
-    )
-
 func lagunaRoutedSharedDownResidual(
     routedActivated: MLXArray,
     routedDownWeight: MLXArray,
@@ -8457,29 +8151,16 @@ func lagunaRoutedSharedDownResidual(
         sharedDownWeight.dims(LagunaConstants.hiddenSize,
             LagunaConstants.sharedExpertIntermediateSize / 8))
     precondition(sharedDownScales.dtype == .uint8)
-    let sharedHalved = sharedDownScales.ndim == 1
-    if sharedHalved {
-        precondition(
-            sharedDownScales.size == lagunaScalePatchHeaderBytes
-                + LagunaConstants.hiddenSize
-                * (LagunaConstants.sharedExpertIntermediateSize / 32))
-    } else {
-        precondition(
-            sharedDownScales.dims(LagunaConstants.hiddenSize,
-                LagunaConstants.sharedExpertIntermediateSize / 16))
-    }
+    precondition(
+        sharedDownScales.dims(LagunaConstants.hiddenSize,
+            LagunaConstants.sharedExpertIntermediateSize / 16))
     precondition(residual.dtype == .bfloat16)
     precondition(residual.dims(1, 1, LagunaConstants.hiddenSize))
 
-    let fusedKernel =
-        sharedHalved
-        ? (staged
-            ? lagunaRoutedSharedDownResidualStagedSharedHalvedKernel
-            : lagunaRoutedSharedDownResidualSharedHalvedKernel)
-        : (staged
-            ? lagunaRoutedSharedDownResidualStagedKernel
-            : lagunaRoutedSharedDownResidualKernel)
-    return fusedKernel(
+    let kernel = staged
+        ? lagunaRoutedSharedDownResidualStagedKernel
+        : lagunaRoutedSharedDownResidualKernel
+    return kernel(
         lagunaSharedFirstDownOrderEnabled
             ? [
                 sharedActivated, sharedDownWeight, sharedDownScales,
@@ -8699,13 +8380,6 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     var _fusedGateUpScales: MLXArray?
     var _fusedGateUpSplit: Int = 0
 
-    /// Group-32 halved twins of the two shared-expert scale planes, built only
-    /// under `DARKBLOOM_SHARED_SCALE_HALVED` and only when the halving is
-    /// provably lossless for the loaded checkpoint. Nil leaves every shared
-    /// dispatch on the stock planes.
-    var _fusedGateUpScalesHalved: MLXArray?
-    var _sharedDownScalesHalved: MLXArray?
-
     /// Retained fused BF16 `[gate; up]` bank for the dense (non-quantized)
     /// layer-0 MLP, built once after checkpoint load when
     /// `DARKBLOOM_FUSED_DENSE_GATE_UP_SWIGLU` is enabled. Mutually exclusive
@@ -8755,35 +8429,7 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
         _fusedGateUpWeight = fusedWeight
         _fusedGateUpScales = fusedScales
         _fusedGateUpSplit = gate.weight.dim(0)
-        var prepared = [fusedWeight, fusedScales]
-        guard lagunaSharedScaleHalvedEnabled else { return prepared }
-        // Gate sits above up in the concatenated plane, so the first pair of
-        // each source tensor becomes flat pair 0 and flat pair
-        // `rows * groups / 2`: the two the quantizer's first simdgroup writes
-        // twice. Everything else must already agree or the plane declines.
-        let gateUpPairs = gate.scales.dim(0) * gate.scales.dim(1) / 2
-        // Only the R1 schedule has a halved twin, so the plane is built only
-        // when that schedule is the one that will run.
-        if lagunaSharedSwiGLUQMVRows1Enabled,
-            let halved = lagunaHalvedGroup32ScalePlane(
-                fusedScales, allowedFlatPairs: [0, gateUpPairs])
-        {
-            _fusedGateUpScalesHalved = halved
-            prepared.append(halved)
-            lagunaPackedScalesLog.note("active", "shared gate/up halved")
-        }
-        if let down = downProj as? QuantizedLinear,
-            type(of: down) == QuantizedLinear.self,
-            down.mode == .nvfp4, down.groupSize == 16, down.bits == 4,
-            down.scales.dtype == .uint8, down.scales.ndim == 2,
-            let halvedDown = lagunaHalvedGroup32ScalePlane(
-                down.scales, allowedFlatPairs: [0])
-        {
-            _sharedDownScalesHalved = halvedDown
-            prepared.append(halvedDown)
-            lagunaPackedScalesLog.note("active", "shared down halved")
-        }
-        return prepared
+        return [fusedWeight, fusedScales]
     }
 
     /// Builds and retains the fused BF16 gate/up bank from layer 0's dense
@@ -8885,14 +8531,7 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             return nil
         }
 
-        // Each site substitutes its halved plane independently: one declining
-        // leaves the other on the halved form rather than forcing both back.
-        return (
-            fusedWeight,
-            _fusedGateUpScalesHalved ?? fusedScales,
-            down.weight,
-            _sharedDownScalesHalved ?? down.scales
-        )
+        return (fusedWeight, fusedScales, down.weight, down.scales)
     }
 
     func fusedSharedDownResidual(
