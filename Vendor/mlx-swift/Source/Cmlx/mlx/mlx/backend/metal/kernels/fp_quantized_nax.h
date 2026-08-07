@@ -206,8 +206,7 @@ template <
     short reduction_dim,
     short tgp_size,
     short group_size,
-    short bits,
-    bool pairwise_scales = false>
+    short bits>
 struct QuantizedBlockLoader {
   MLX_MTL_CONST short pack_factor = get_pack_factor<8, bits>();
   MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack();
@@ -235,10 +234,6 @@ struct QuantizedBlockLoader {
   threadgroup T* dst;
   const device uint8_t* src;
   const device uint8_t* scales;
-  const device uint8_t* pairwise_patch_base;
-  const device uint8_t* pairwise_row_base;
-  int pairwise_patch_slot;
-  int logical_group;
 
   QuantizedBlockLoader(
       const device uint8_t* src_,
@@ -259,47 +254,7 @@ struct QuantizedBlockLoader {
         dst(dst_ + bi * dst_ld + bj * pack_factor),
         src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
             bj * bytes_per_pack),
-        scales(scales_ + bi * src_ld / group_size + group_id),
-        pairwise_patch_base(scales_),
-        pairwise_row_base(scales_),
-        pairwise_patch_slot(-1),
-        logical_group(group_id) {
-    static_assert(
-        !pairwise_scales || reduction_dim == 1,
-        "pairwise scales are only defined for reduction-dimension staging");
-  }
-
-
-  short row_in_tile() const { return bi; }
-
-  void set_pairwise_packed(
-      const device uint8_t* patch_base,
-      const device uint8_t* expert_base,
-      int row,
-      int patch_slot) {
-    // Inverse of preparePackedRoutedGateUpBank's walk-order permutation:
-    // 4 logical gate/up row pairs per tile, 4 K blocks, 8 subrows, 16 bytes.
-    const int within_block = row & 63;
-    const int logical_row = (row >> 6) * 32 + (within_block & 31);
-    const int tile = logical_row >> 2;
-    const int sub = ((logical_row & 3) << 1) + (within_block >> 5);
-    pairwise_patch_base = patch_base;
-    pairwise_row_base = expert_base + tile * 512 + sub * 16;
-    pairwise_patch_slot = patch_slot;
-  }
-
-  uint8_t scale_code(int step) const {
-    if constexpr (pairwise_scales) {
-      const int group = logical_group + step;
-      // Four 32-group K blocks are 128 bytes apart in the inherited packed
-      // bank. Each stores the 16 certified even bytes for this fused row.
-      return group == 1 && pairwise_patch_slot >= 0
-          ? pairwise_patch_base[pairwise_patch_slot]
-          : pairwise_row_base[(group >> 5) * 128 + ((group & 31) >> 1)];
-    } else {
-      return scales[step];
-    }
-  }
+        scales(scales_ + bi * src_ld / group_size + group_id) {}
 
   // The NVFP4 staging fast path applies when the packing is one byte per two
   // values, the scale is e4m3, and the byte run governed by ONE scale splits
@@ -316,7 +271,7 @@ struct QuantizedBlockLoader {
     if constexpr (fp4nv_fast) {
       int k = 0;
       for (int i = 0; i < n_steps_per_read; i++) {
-        const float scale = fp4nv_scale_x16384(scale_code(i));
+        const float scale = fp4nv_scale_x16384(scales[i]);
         for (int j = 0; j < n_reads_per_scale / 4; j++) {
           T vals[8];
           fp4nv_decode8<T>(fp4nv_pack4(src + k), scale, vals);
@@ -329,7 +284,7 @@ struct QuantizedBlockLoader {
     } else {
       int k = 0;
       for (int i = 0; i < n_steps_per_read; i++) {
-        T scale = dequantize_scale<T, group_size>(scale_code(i));
+        T scale = dequantize_scale<T, group_size>(scales[i]);
         for (int j = 0; j < n_reads_per_scale; j++) {
           dequantize<T, bits>(
               src[k * bytes_per_pack], scale, dst + k * pack_factor);
@@ -391,8 +346,11 @@ struct QuantizedBlockLoader {
       // covers it exactly as the scalar loop's `i` would.
       ((n_reads_per_scale % kSrcBytesPerChunk) == 0) &&
       (BCOLS_PACKED * BROWS >= tgp_size);
-  // A single 16B device load covers this thread's whole source run.
-  MLX_MTL_CONST bool kWideLoadShapeOk = kWidenShapeOk && (kSrcBytes == 16);
+  // A whole number of 16B device loads covers this thread's source run. 16B is
+  // the one-load case; 32B (BK 128) is the same bytes into the same sb[] slots
+  // as two contiguous 16B loads, which the alignas(16) WideSrc copy emits.
+  MLX_MTL_CONST bool kWideLoadShapeOk =
+      kWidenShapeOk && ((kSrcBytes == 16) || (kSrcBytes == 32));
   // A single 8B device load covers it instead (the 256-thread expert-aligned
   // geometry: n_reads 8, one packed byte each). Same exactness class as the
   // 16B form -- the same bytes reach the same sb[] slots -- and the host
@@ -404,8 +362,8 @@ struct QuantizedBlockLoader {
     T v[kWideElems];
   };
   // Sized by kSrcBytes rather than a literal 16 so the copy loop below stays
-  // in bounds for every instantiation, including the 8-bit ones where
-  // kSrcBytes is 32 and the wide-load path is statically disabled.
+  // in bounds for every instantiation. kWidenShapeOk already restricts the
+  // wide path to 4-bit staging, so 8-bit instantiations never reach it.
   struct alignas(16) WideSrc {
     uint8_t b[kSrcBytes];
   };
@@ -496,15 +454,14 @@ struct QuantizedBlockLoader {
       // is 4 for bfloat/half staging, 2 for float). Same values either way.
       if constexpr (fp4nv_fast && (kSrcBytesPerChunk % 4) == 0) {
         const float scale =
-            fp4nv_scale_x16384(scale_code(k0 / n_reads_per_scale));
+            fp4nv_scale_x16384(scales[k0 / n_reads_per_scale]);
         STEEL_PRAGMA_UNROLL
         for (short b = 0; b < kSrcBytesPerChunk / 4; b++) {
           fp4nv_decode8<T>(fp4nv_pack4(sb + k0 + b * 4), scale, &out.v[b * 8]);
         }
       } else {
         T scale =
-            dequantize_scale<T, group_size>(
-                scale_code(k0 / n_reads_per_scale));
+            dequantize_scale<T, group_size>(scales[k0 / n_reads_per_scale]);
         STEEL_PRAGMA_UNROLL
         for (short b = 0; b < kSrcBytesPerChunk; b++) {
           dequantize_pair(sb[k0 + b], scale, &out.v[b * pack_factor]);
@@ -548,11 +505,7 @@ struct QuantizedBlockLoader {
   void next() {
     src += tile_stride;
     if (reduction_dim == 1) {
-      if constexpr (pairwise_scales) {
-        logical_group += n_groups;
-      } else {
-        scales += n_groups;
-      }
+      scales += n_groups;
     } else {
       scales += n_groups * group_stride;
     }
@@ -664,10 +617,7 @@ METAL_FUNC void fp_qmm_t_impl(
   dispatch_bool(aligned_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
       for (int k = 0; k < kernel_K; k += BK) {
-        // Dead at k==0 for fixed_K>0: no prior-iteration Ws read to order.
-        if (fixed_K == 0 || k > 0) {
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
@@ -706,10 +656,8 @@ METAL_FUNC void fp_qmm_t_impl(
         loader_w.next();
       }
 
-      // Dead for fixed_K>0: no next iteration, epilogue never touches Ws.
-      if (fixed_K == 0) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-      }
+      // Store results to device memory
+      threadgroup_barrier(mem_flags::mem_threadgroup);
 
       if constexpr (kAlignedM.value && kAlignedN.value) {
         Dtile.store(y + tm * kernel_N + tn, kernel_N);
@@ -1620,7 +1568,12 @@ template <
     int tg_expert_groups = 64,
     bool wide_store = false,
     bool wide_load = false,
-    bool pairwise_scales = false>
+    // Regime discriminator (research instrument, 0 = shipped kernel).
+    // 1 = M2: double the MMA chain only. 2 = S2: double weight load+dequant
+    // +threadgroup staging only. 3 = B2: double the k-loop barrier count
+    // only. Every arm is bit-exact; each adds work to exactly one resource
+    // axis so its marginal wall cost names the binding constraint.
+    int probe = 0>
 [[kernel]] void fp_gather_qmm_rhs_expert_nax(
     const device T* x,
     const device uint32_t* w,
@@ -1639,6 +1592,10 @@ template <
   static_assert(transpose, "expert-aligned Laguna QMM requires NT weights");
   static_assert(group_size == 16, "expert-aligned Laguna QMM requires gs16");
   static_assert(bits == 4, "expert-aligned Laguna QMM requires NVFP4");
+
+  constexpr bool kProbeM2 = (probe == 1);
+  constexpr bool kProbeS2 = (probe == 2);
+  constexpr bool kProbeB2 = (probe == 3);
 
   constexpr int pack_factor = get_pack_factor<8, bits>();
   constexpr int bytes_per_pack = get_bytes_per_pack();
@@ -1661,8 +1618,22 @@ template <
       true,
       WM * WN * SIMD_SIZE,
       group_size,
-      bits,
-      pairwise_scales>;
+      bits>;
+  // The loader's widening is decided by shape constants derived from BN, BK
+  // and tgp_size. When one of them goes false the loader does not fail -- it
+  // silently runs the per-byte scalar chain, which still compiles, still links
+  // and still returns correct values, just with kSrcBytes device loads per
+  // thread per k-iteration instead of one. Asking for widening and not getting
+  // it is a build error rather than a timing mystery.
+  static_assert(
+      !wide_store || loader_w_t::kWidenShapeOk,
+      "expert staging requested a widened threadgroup store but the loader "
+      "shape check disabled it");
+  static_assert(
+      !wide_load ||
+          (loader_w_t::kWideLoadShapeOk || loader_w_t::kWideLoad8ShapeOk),
+      "expert staging requested a widened device load but the loader shape "
+      "check disabled it; the k-loop would fall back to per-byte loads");
 
   constexpr int kWsElems = BN * BK_padded;
   constexpr int kWsPerChunk = 16 / sizeof(Wtype);
@@ -1685,10 +1656,8 @@ template <
   const int y_col = tid.x * BN;
 
   auto wl = (const device uint8_t*)w + size_t(y_col) * K_w;
-  const device uint8_t* scale_base = scales;
-  if constexpr (!pairwise_scales) {
-    scale_base += size_t(y_col) * K_g;
-  }
+  const device uint8_t* scale_base =
+      scales + size_t(y_col) * K_g;
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
@@ -1762,30 +1731,40 @@ template <
       NAXTile<float, TM, TN> Dtile;
       Dtile.clear();
 
+      // M2 shadow accumulator. At probe == 0 nothing below ever reads or
+      // writes it, so it is dead on declaration and emits no code.
+      NAXTile<float, TM, TN> Dshadow;
+      if constexpr (kProbeM2) {
+        Dshadow.clear();
+      }
+
       const device T* xn =
           x + size_t(chunk_start + tm) * kernel_K;
-      const device uint8_t* loader_scales = pairwise_scales
-          ? scales
-          : scale_base + size_t(expert) * stride_s;
       thread loader_w_t loader_w(
           wl + size_t(expert) * stride_w,
-          loader_scales,
+          scale_base + size_t(expert) * stride_s,
           kernel_K,
           Ws,
           simd_group_id,
           simd_lane_id);
-      if constexpr (pairwise_scales) {
-        const int scale_row = y_col + int(loader_w.row_in_tile());
-        const int patch_slot = expert == 0 && scale_row == 0
-            ? 0
-            : (expert == 0 && scale_row == 32 ? 1 : -1);
-        const device uint8_t* packed_expert = scales + 128
-            + size_t(expert) * (size_t(kernel_N) * K_g / 2);
-        loader_w.set_pairwise_packed(
-            scales, packed_expert, scale_row, patch_slot);
-      }
+      // S2 shadow loader: the neighbouring expert's weight region, which is
+      // always in bounds (the w/scales buffers hold all `experts` slabs) and
+      // lands on different cache lines, so the arm really doubles the NVFP4
+      // code+scale device reads, the nibble decode and the threadgroup
+      // stores. Its constructor is pure pointer arithmetic, so at probe != 2
+      // it is dead on declaration.
+      thread loader_w_t loader_w2(
+          wl + size_t((expert + 1) % experts) * stride_w,
+          scale_base + size_t((expert + 1) % experts) * stride_s,
+          kernel_K,
+          Ws,
+          simd_group_id,
+          simd_lane_id);
 
       for (int k = 0; k < K_it; ++k) {
+        if constexpr (kProbeB2) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         // Bit-exact A-operand hoist (the XMAJOR arm's shipped pattern at
         // one-eighth its register cost): this iteration's x fragments load
         // into registers BEFORE the two staging barriers, overlapping the
@@ -1814,6 +1793,22 @@ template <
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        // S2: stage the neighbouring expert's tile into Ws first, then let
+        // the real staging below overwrite it. Every thread writes exactly
+        // the same destination address set in both calls (loader addressing
+        // depends only on lid/simd ids), the sets are disjoint across
+        // threads, and no thread reads Ws in between, so Ws holds precisely
+        // the stock bytes when the MMA loop starts. The intervening barrier
+        // is a threadgroup memory clobber, which is what stops the first
+        // store set from being dead-store eliminated.
+        if constexpr (kProbeS2) {
+          if constexpr (wide_store || wide_load) {
+            loader_w2.template load_unsafe_wide<wide_store, wide_load>();
+          } else {
+            loader_w2.load_unsafe();
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         // DARKBLOOM_EXPERT_STAGE_WIDEST / DARKBLOOM_EXPERT_STAGE_WIDELD:
         // same bytes, same addresses, same nibble decode, same scale mapping
         // -- only the access widths change (16 scalar 2B threadgroup stores
@@ -1830,9 +1825,12 @@ template <
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg_active) {
-          // PRAGMA-VARIANT 01: SK-step staging+MMA loop, 2 iterations
-          // (BK=64/SK=32): Atile TMxTK=1x2 device frags + Btile TNxTK=2x2
-          // threadgroup frags per step, serially-dependent Dtile MMA chain.
+          // PRAGMA-VARIANT 01: SK-step staging+MMA loop, BK/SK iterations
+          // (2 at BK=64, 4 at BK=128): Atile TMxTK=1x2 device frags + Btile
+          // TNxTK=2x2 threadgroup frags per step, serially-dependent Dtile
+          // MMA chain. The global 32-wide chunk index is k*(BK/SK) + kk1/SK,
+          // so every BK enumerates the same chunks in the same ascending
+          // order into the same Dtile: changing BK is bit-identical.
           // Full unroll + volatile removal let the second step's 6 fragment
           // loads hoist ahead of the first step's MMAs. This kernel is built
           // WITHOUT function constants (static expert shape path), so the
@@ -1842,8 +1840,9 @@ template <
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             NAXTile<Wtype, TN, TK> Btile;
 
-            // Ws is 16B-aligned (NAXWsChunk16), BK_padded*2B = 144B row
-            // stride, runs at multiples of 8B: same bytes, same slots.
+            // Ws is 16B-aligned (NAXWsChunk16); BK_padded*2B row stride is
+            // 144B at BK=64 and 272B at BK=128, both multiples of 16, and
+            // kk1*2B steps by 64B: same bytes, same slots.
             Btile.template load_contig_tg<Wtype, BK_padded>(
                 Ws + tn * BK_padded + kk1);
 
@@ -1854,11 +1853,42 @@ template <
                 Btile,
                 metal::bool_constant<true>{});
 
+            // M2: an identical-shape MMA chain into a separate accumulator,
+            // fed by the OTHER already-resident A fragment and the same
+            // Btile. No extra device or threadgroup read, and the operand
+            // pair (A fragment, B column band) is distinct from every pair
+            // the real chain ever uses, so it cannot be common-subexpression
+            // eliminated against it. Dtile is untouched.
+            if constexpr (kProbeM2) {
+              tile_matmad_nax(
+                  Dshadow,
+                  Atile[(kk1 / SK + 1) % (BK / SK)],
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<true>{});
+            }
           }
         }
 
         xn += BK;
         loader_w.next();
+        if constexpr (kProbeS2) {
+          loader_w2.next();
+        }
+        if constexpr (kProbeB2) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+      }
+
+      // M2 sink: keeps the shadow chain live without changing any stored
+      // value. run_skip_pct is host-clamped to [1,100] so the guard is never
+      // true, but it is a runtime constant-buffer scalar the compiler cannot
+      // fold; the MMA intrinsic is convergent, so it cannot be sunk into the
+      // guarded region either.
+      if constexpr (kProbeM2) {
+        if (run_skip_pct > 1000) {
+          y[0] = static_cast<T>(Dshadow.frag_at(0, 0)[0]);
+        }
       }
 
 #ifndef DARKBLOOM_SWIGLU_REGLOCAL
