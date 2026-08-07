@@ -9799,10 +9799,11 @@ if (lane < 8) {
 uint lane = thread_position_in_threadgroup.x;
 uint row = threadgroup_position_in_grid.y;
 
-threadgroup uint xchg_ordinals[256];
-threadgroup uint xchg_indices[256];
-threadgroup uint candidate_ordinals[64];
-threadgroup uint candidate_indices[64];
+// The comparator state is one inseparable pair. Carrying it as uint2 halves
+// the low-stride shuffle count and the cross-simdgroup memory operations while
+// preserving every bit and every comparison operand.
+threadgroup uint2 xchg_pairs[256];
+threadgroup uint2 candidate_pairs[64];
 threadgroup float original_scores[256];
 
 float x = float(logits[row * 256 + lane]);
@@ -9810,23 +9811,20 @@ float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
 float score = x < 0.0f ? y : 1.0f - y;
 original_scores[lane] = score;
 float key = -(score + float(correction_bias[lane]));
-uint my_ordinal = laguna_router_key_ordinal(key);
-uint my_index = lane;
+uint2 my_pair = uint2(laguna_router_key_ordinal(key), lane);
 
 for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
     for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
-        uint other_ordinal = simd_shuffle_xor(my_ordinal, ushort(stride));
-        uint other_index = simd_shuffle_xor(my_index, ushort(stride));
+        const uint2 other_pair = simd_shuffle_xor(my_pair, ushort(stride));
 
         bool is_lower = (lane & stride) == 0;
         bool lower_wants_better = (lane & sequence) == 0;
         bool want_better = lower_wants_better == is_lower;
         bool other_before_my = laguna_router_ordinal_before(
-            other_ordinal, other_index, my_ordinal, my_index);
+            other_pair.x, other_pair.y, my_pair.x, my_pair.y);
         bool take_other = want_better ? other_before_my : !other_before_my;
         if (take_other) {
-            my_ordinal = other_ordinal;
-            my_index = other_index;
+            my_pair = other_pair;
         }
     }
 }
@@ -9837,27 +9835,21 @@ bool block_ascending = (block & 1) == 0;
 uint rank_in_block = block_ascending ? within_block : (31 - within_block);
 bool is_local_top8 = block_ascending ? (within_block < 8) : (within_block >= 24);
 if (is_local_top8) {
-    candidate_ordinals[block * 8 + rank_in_block] = my_ordinal;
-    candidate_indices[block * 8 + rank_in_block] = my_index;
+    candidate_pairs[block * 8 + rank_in_block] = my_pair;
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-uint my_ordinal2 = candidate_ordinals[lane & 63];
-uint my_index2 = candidate_indices[lane & 63];
+uint2 my_pair2 = candidate_pairs[lane & 63];
 for (uint sequence = 2; sequence <= 64; sequence <<= 1) {
     for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
-        uint other_ordinal;
-        uint other_index;
+        uint2 other_pair;
         if (stride < 32) {
-            other_ordinal = simd_shuffle_xor(my_ordinal2, ushort(stride));
-            other_index = simd_shuffle_xor(my_index2, ushort(stride));
+            other_pair = simd_shuffle_xor(my_pair2, ushort(stride));
         } else {
-            xchg_ordinals[lane] = my_ordinal2;
-            xchg_indices[lane] = my_index2;
+            xchg_pairs[lane] = my_pair2;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             uint partner = lane ^ stride;
-            other_ordinal = xchg_ordinals[partner];
-            other_index = xchg_indices[partner];
+            other_pair = xchg_pairs[partner];
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
@@ -9865,15 +9857,15 @@ for (uint sequence = 2; sequence <= 64; sequence <<= 1) {
         bool lower_wants_better = (lane & sequence) == 0;
         bool want_better = lower_wants_better == is_lower;
         bool other_before_my = laguna_router_ordinal_before(
-            other_ordinal, other_index, my_ordinal2, my_index2);
+            other_pair.x, other_pair.y, my_pair2.x, my_pair2.y);
         bool take_other = want_better ? other_before_my : !other_before_my;
         if (take_other) {
-            my_ordinal2 = other_ordinal;
-            my_index2 = other_index;
+            my_pair2 = other_pair;
         }
     }
 }
 
+uint my_index2 = my_pair2.y;
 \(epilogue)
 """
 }
@@ -9897,7 +9889,7 @@ private let lagunaPrefillRouterTournamentNormalizingKernel = MLXFast.metalKernel
 )
 
 private let lagunaPrefillRouterTournamentOrdinalKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_router_tournament_ordinal_v1",
+    name: "laguna_prefill_router_tournament_ordinal_v2",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaPrefillRouterTournamentOrdinalKernelSource(normalizing: false),
@@ -9906,7 +9898,7 @@ private let lagunaPrefillRouterTournamentOrdinalKernel = MLXFast.metalKernel(
 )
 
 private let lagunaPrefillRouterTournamentOrdinalNormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_router_tournament_ordinal_norm_v1",
+    name: "laguna_prefill_router_tournament_ordinal_norm_v2",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaPrefillRouterTournamentOrdinalKernelSource(normalizing: true),
