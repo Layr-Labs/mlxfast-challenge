@@ -1013,6 +1013,29 @@ func lagunaPackedPrefillScaleView(_ packed: MLXArray) -> MLXArray? {
         offset: 0)
 }
 
+/// Presents the certified routed down-projection decode scale plane to the
+/// expert-aligned M5 prefill primitive without copying it. Unlike the fused
+/// gate/up bank, the down plane is already row-major after its 128-byte patch
+/// header, so each logical output row maps to one contiguous 16-byte run.
+/// Only the exact backend marker specialization may interpret this view.
+func lagunaPackedPrefillDownScaleView(_ packed: MLXArray) -> MLXArray? {
+    let rows = LagunaConstants.hiddenSize
+    let groups = LagunaConstants.moeIntermediateSize / 16
+    let compactGroups = groups / 2
+    let shape = [LagunaConstants.numExperts, rows, groups]
+    let expectedBytes = lagunaScalePatchHeaderBytes
+        + LagunaConstants.numExperts * rows * compactGroups
+    guard packed.dtype == .uint8, packed.ndim == 1,
+        packed.size == expectedBytes
+    else { return nil }
+
+    return asStrided(
+        packed,
+        shape,
+        strides: [rows * compactGroups, compactGroups, 0],
+        offset: 0)
+}
+
 /// Byte length of the halved packed routed gate/up scale bank, header included.
 let lagunaPackedRoutedGateUpScaleBytes =
     lagunaScalePatchHeaderBytes

@@ -356,7 +356,7 @@ template <
     short tgp_size,
     short group_size,
     short bits,
-    bool pairwise_scales = false>
+    short pairwise_scale_layout = 0>
 struct QuantizedBlockLoader {
   MLX_MTL_CONST short pack_factor = get_pack_factor<8, bits>();
   MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack();
@@ -414,8 +414,11 @@ struct QuantizedBlockLoader {
         pairwise_patch_slot(-1),
         logical_group(group_id) {
     static_assert(
-        !pairwise_scales || reduction_dim == 1,
+        pairwise_scale_layout == 0 || reduction_dim == 1,
         "pairwise scales are only defined for reduction-dimension staging");
+    static_assert(
+        pairwise_scale_layout >= 0 && pairwise_scale_layout <= 2,
+        "unknown Laguna pairwise scale layout");
   }
 
   short row_in_tile() const { return bi; }
@@ -436,14 +439,30 @@ struct QuantizedBlockLoader {
     pairwise_patch_slot = patch_slot;
   }
 
+  void set_pairwise_rowmajor(
+      const device uint8_t* patch_base,
+      const device uint8_t* expert_base,
+      int row,
+      int patch_slot) {
+    pairwise_patch_base = patch_base;
+    pairwise_row_base =
+        expert_base + size_t(row) * (src_ld / group_size / 2);
+    pairwise_patch_slot = patch_slot;
+  }
+
   uint8_t scale_code(int step) const {
-    if constexpr (pairwise_scales) {
+    if constexpr (pairwise_scale_layout == 1) {
       const int group = logical_group + step;
       // Four 32-group K blocks are 128 bytes apart in the inherited packed
       // bank. Each stores the 16 certified even bytes for this fused row.
       return group == 1 && pairwise_patch_slot >= 0
           ? pairwise_patch_base[pairwise_patch_slot]
           : pairwise_row_base[(group >> 5) * 128 + ((group & 31) >> 1)];
+    } else if constexpr (pairwise_scale_layout == 2) {
+      const int group = logical_group + step;
+      return group == 1 && pairwise_patch_slot >= 0
+          ? pairwise_patch_base[pairwise_patch_slot]
+          : pairwise_row_base[group >> 1];
     } else {
       return scales[step];
     }
@@ -696,7 +715,7 @@ struct QuantizedBlockLoader {
   void next() {
     src += tile_stride;
     if (reduction_dim == 1) {
-      if constexpr (pairwise_scales) {
+      if constexpr (pairwise_scale_layout != 0) {
         logical_group += n_groups;
       } else {
         scales += n_groups;
@@ -1762,7 +1781,7 @@ template <
     int tg_expert_groups = 64,
     bool wide_store = false,
     bool wide_load = false,
-    bool pairwise_scales = false>
+    short pairwise_scale_layout = 0>
 [[kernel]] void fp_gather_qmm_rhs_expert_nax(
     const device T* x,
     const device uint32_t* w,
@@ -1804,7 +1823,7 @@ template <
       WM * WN * SIMD_SIZE,
       group_size,
       bits,
-      pairwise_scales>;
+      pairwise_scale_layout>;
 
   constexpr int kWsElems = BN * BK_padded;
   constexpr int kWsPerChunk = 16 / sizeof(Wtype);
@@ -1828,7 +1847,7 @@ template <
 
   auto wl = (const device uint8_t*)w + size_t(y_col) * K_w;
   const device uint8_t* scale_base = scales;
-  if constexpr (!pairwise_scales) {
+  if constexpr (pairwise_scale_layout == 0) {
     scale_base += size_t(y_col) * K_g;
   }
 
@@ -1906,7 +1925,7 @@ template <
 
       const device T* xn =
           x + size_t(chunk_start + tm) * kernel_K;
-      const device uint8_t* loader_scales = pairwise_scales
+      const device uint8_t* loader_scales = pairwise_scale_layout != 0
           ? scales
           : scale_base + size_t(expert) * stride_s;
       thread loader_w_t loader_w(
@@ -1916,7 +1935,7 @@ template <
           Ws,
           simd_group_id,
           simd_lane_id);
-      if constexpr (pairwise_scales) {
+      if constexpr (pairwise_scale_layout == 1) {
         const int scale_row = y_col + int(loader_w.row_in_tile());
         const int patch_slot = expert == 0 && scale_row == 0
             ? 0
@@ -1924,6 +1943,13 @@ template <
         const device uint8_t* packed_expert = scales + 128
             + size_t(expert) * (size_t(kernel_N) * K_g / 2);
         loader_w.set_pairwise_packed(
+            scales, packed_expert, scale_row, patch_slot);
+      } else if constexpr (pairwise_scale_layout == 2) {
+        const int scale_row = y_col + int(loader_w.row_in_tile());
+        const int patch_slot = expert == 0 && scale_row == 0 ? 0 : -1;
+        const device uint8_t* packed_expert = scales + 128
+            + size_t(expert) * (size_t(kernel_N) * K_g / 2);
+        loader_w.set_pairwise_rowmajor(
             scales, packed_expert, scale_row, patch_slot);
       }
 
