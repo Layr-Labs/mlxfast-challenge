@@ -268,7 +268,7 @@ struct QuantizedBlockLoader {
         pairwise_scale_layout == 0 || reduction_dim == 1,
         "pairwise scales are only defined for reduction-dimension staging");
     static_assert(
-        pairwise_scale_layout >= 0 && pairwise_scale_layout <= 2,
+        pairwise_scale_layout >= 0 && pairwise_scale_layout <= 3,
         "unknown Laguna pairwise scale layout");
   }
 
@@ -302,6 +302,40 @@ struct QuantizedBlockLoader {
     pairwise_patch_slot = patch_slot;
   }
 
+  void set_pairwise_delta(
+      const device uint8_t* base_plane,
+      const device uint8_t* nibble_plane,
+      const device uint8_t* fallback_patch_base,
+      const device uint8_t* fallback_expert_base,
+      int row,
+      int global_row,
+      int patch_slot) {
+    const uint8_t base = base_plane[global_row];
+    scales = nibble_plane
+        + size_t(global_row) * (src_ld / group_size / 4)
+        + (logical_group >> 2);
+    // Escaped rows use the complete crowned walk-order pairwise bank carried
+    // after the compact prefix. This is exactly layout 1's inverse map.
+    const int within_block = row & 63;
+    const int logical_row = (row >> 6) * 32 + (within_block & 31);
+    const int tile = logical_row >> 2;
+    const int sub = ((logical_row & 3) << 1) + (within_block >> 5);
+    pairwise_patch_base = fallback_patch_base;
+    pairwise_row_base = fallback_expert_base + tile * 512 + sub * 16;
+    // Layout 3 reuses the existing patch-slot field: nonnegative values are
+    // admitted-row bases; negative values encode escaped patch slots as
+    // {-1:none, -2:slot0, -3:slot1}. No loader state is added to layouts 0-2.
+    pairwise_patch_slot = base != 0xFFu ? int(base) : -patch_slot - 2;
+  }
+
+  bool has_group1_patch() const {
+    if constexpr (pairwise_scale_layout == 3) {
+      return pairwise_patch_slot <= -2;
+    } else {
+      return pairwise_patch_slot >= 0;
+    }
+  }
+
   uint8_t scale_code(int step) const {
     if constexpr (pairwise_scale_layout == 1) {
       const int group = logical_group + step;
@@ -315,6 +349,18 @@ struct QuantizedBlockLoader {
       return group == 1 && pairwise_patch_slot >= 0
           ? pairwise_patch_base[pairwise_patch_slot]
           : pairwise_row_base[group >> 1];
+    } else if constexpr (pairwise_scale_layout == 3) {
+      const int group = logical_group + step;
+      if (pairwise_patch_slot >= 0) {
+        const int pair = group >> 1;
+        const uint8_t packed = scales[0];
+        return uint8_t(pairwise_patch_slot)
+            + ((packed >> ((pair & 1) * 4)) & 0x0Fu);
+      }
+      const int escape_patch_slot = -pairwise_patch_slot - 2;
+      return group == 1 && escape_patch_slot >= 0
+          ? pairwise_patch_base[escape_patch_slot]
+          : pairwise_row_base[(group >> 5) * 128 + ((group & 31) >> 1)];
     } else {
       return scales[step];
     }
@@ -346,7 +392,7 @@ struct QuantizedBlockLoader {
           const int group = logical_group + i;
           const bool shares_previous =
               i > 0 && ((group >> 1) == ((group - 1) >> 1)) &&
-              !(group == 1 && pairwise_patch_slot >= 0);
+              !(group == 1 && has_group1_patch());
           pair_scales[i] = shares_previous
               ? pair_scales[i - 1]
               : fp4nv_scale_x16384(scale_code(i));
@@ -538,7 +584,7 @@ struct QuantizedBlockLoader {
         const int group = logical_group + i;
         const bool shares_previous =
             i > 0 && ((group >> 1) == ((group - 1) >> 1)) &&
-            !(group == 1 && pairwise_patch_slot >= 0);
+            !(group == 1 && has_group1_patch());
         pair_scales[i] = shares_previous
             ? pair_scales[i - 1]
             : fp4nv_scale_x16384(scale_code(i));
@@ -616,6 +662,9 @@ struct QuantizedBlockLoader {
     if (reduction_dim == 1) {
       if constexpr (pairwise_scale_layout != 0) {
         logical_group += n_groups;
+        if constexpr (pairwise_scale_layout == 3) {
+          scales += n_groups / 4;
+        }
       } else {
         scales += n_groups;
       }
@@ -1856,6 +1905,29 @@ template <
             + size_t(expert) * (size_t(kernel_N) * K_g / 2);
         loader_w.set_pairwise_rowmajor(
             scales, packed_expert, scale_row, patch_slot);
+      } else if constexpr (pairwise_scale_layout == 3) {
+        static_assert(
+            kernel_N == 1024 && K_g == 128,
+            "delta scale layout is restricted to routed gate/up prefill");
+        constexpr size_t kRowsTotal = 256 * 1024;
+        constexpr size_t kCompactRowBytes = 33;
+        const int scale_row = y_col + int(loader_w.row_in_tile());
+        const int global_row = int(expert) * kernel_N + scale_row;
+        const int patch_slot = expert == 0 && scale_row == 0
+            ? 0
+            : (expert == 0 && scale_row == 32 ? 1 : -1);
+        const device uint8_t* delta_nibbles = scales + kRowsTotal;
+        const device uint8_t* fallback = scales + kRowsTotal * kCompactRowBytes;
+        const device uint8_t* fallback_expert = fallback + 128
+            + size_t(expert) * (size_t(kernel_N) * K_g / 2);
+        loader_w.set_pairwise_delta(
+            scales,
+            delta_nibbles,
+            fallback,
+            fallback_expert,
+            scale_row,
+            global_row,
+            patch_slot);
       }
 
       for (int k = 0; k < K_it; ++k) {
