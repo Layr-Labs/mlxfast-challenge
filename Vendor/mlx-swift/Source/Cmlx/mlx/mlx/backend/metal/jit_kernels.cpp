@@ -1125,18 +1125,21 @@ bool darkbloom_swiglu_reglocal();
 
 bool darkbloom_bsearch_hoist();
 
+// Defined in quantized.cpp; parses DARKBLOOM_STAGE2_GATHER once per process.
+int darkbloom_stage2_gather_variant();
+
 namespace {
 
-// DARKBLOOM_STAGE2_GATHER: double-buffered (stage-2) weight staging in the
+// DARKBLOOM_STAGE2_GATHER: split (stage-2) weight staging in the
 // expert-aligned prefill gather-QMM (fp_gather_qmm_rhs_expert_nax). Injected
 // as a source-level #define at JIT assembly time, exactly like the
 // DARKBLOOM_ATTN_* levers below: resolved once per process, never part of a
 // pipeline specialization key, so exactly one variant is ever compiled per
-// run and A/B arms are separate runs of the same binary with the env var
-// flipped. Default OFF: unset compiles byte-identical stock staging (the
-// guarded blocks preprocess away). Injection is gated on the expert kernel
-// name so every other fp_quantized_nax JIT source stays byte-identical in
-// both arms.
+// run and A/B arms are separate runs of the same binary. See
+// darkbloom_stage2_gather_variant in quantized.cpp for the variant meanings;
+// variant 0 compiles byte-identical stock staging (the guarded blocks
+// preprocess away). Injection is gated on the expert kernel name so every
+// other fp_quantized_nax JIT source stays byte-identical across variants.
 //
 // The stderr line is the ground-truth trace the STAGE_* levers lacked: those
 // function constants only ever reached the NON-expert fp_gather_qmm_rhs_nax,
@@ -1144,17 +1147,20 @@ namespace {
 // expert kernel's own JIT assembly, so "active" means the dispatched
 // pipeline was built from the stage-2 source.
 const char* darkbloom_stage2_gather_define() {
-  static const char* define = [] {
-    const bool v = env::get_var("DARKBLOOM_STAGE2_GATHER", "") == "1";
-    if (v || env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1") {
-      fprintf(
-          stderr,
-          "mlxfast: fusion %s: stage2_gather (expert gather-QMM JIT source)\n",
-          v ? "active" : "inactive");
+  static const std::string define = [] {
+    const int v = darkbloom_stage2_gather_variant();
+    fprintf(
+        stderr,
+        "mlxfast: fusion %s: stage2_gather v%d "
+        "(expert gather-QMM JIT source)\n",
+        v != 0 ? "active" : "inactive",
+        v);
+    if (v == 0) {
+      return std::string();
     }
-    return v ? "\n#define DARKBLOOM_STAGE2_GATHER 1\n" : "";
+    return "\n#define DARKBLOOM_STAGE2_GATHER " + std::to_string(v) + "\n";
   }();
-  return define;
+  return define.c_str();
 }
 
 // DARKBLOOM_GATHER_XMAJOR: fold adjacent column tiles of the expert-aligned
