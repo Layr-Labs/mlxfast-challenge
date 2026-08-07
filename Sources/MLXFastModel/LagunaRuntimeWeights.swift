@@ -1013,6 +1013,111 @@ func lagunaPackedPrefillScaleView(_ packed: MLXArray) -> MLXArray? {
         offset: 0)
 }
 
+/// Losslessly narrows the crowned pairwise gate/up prefill scale view one more
+/// step. For each physical fused row, the 64 retained group-32 E4M3 bytes are
+/// represented by one uint8 minimum plus 64 four-bit deltas whenever the row
+/// spans at most 15 codes. A row with a wider span, or with either group-16
+/// pair unequal, receives base 0xFF and is read from the complete crowned
+/// pairwise bank appended to the same allocation.
+///
+/// Buffer layout:
+///   [262144 row bases]
+///   [262144 x 32 packed delta bytes]
+///   [the complete 128-byte-header + pairwise walk-order bank]
+///
+/// The returned zero-stride view is only a marker for the dedicated M5 NAX
+/// loader. Its positive strides describe the 33-byte compact row prefix; the
+/// backend validates that exact marker and the underlying buffer extent before
+/// preserving it. No generic quantized kernel may interpret it.
+func lagunaDeltaPrefillScaleView(
+    scales: MLXArray,
+    pairwisePacked: MLXArray
+) -> MLXArray? {
+    guard lagunaPrefillExpertScaleDeltaEnabled,
+        scales.dtype == .uint8,
+        scales.dims(
+            LagunaConstants.numExperts,
+            2 * LagunaConstants.moeIntermediateSize,
+            LagunaConstants.hiddenSize / 16),
+        pairwisePacked.dtype == .uint8,
+        pairwisePacked.ndim == 1,
+        pairwisePacked.size == lagunaPackedRoutedGateUpScaleBytes
+    else {
+        return nil
+    }
+
+    let experts = LagunaConstants.numExperts
+    let rowsPerExpert = 2 * LagunaConstants.moeIntermediateSize
+    let groups = LagunaConstants.hiddenSize / 16
+    let rows = experts * rowsPerExpert
+    let plane = contiguous(scales).reshaped([rows, groups])
+    let pairHalves = plane.reshaped([rows, groups / 2, 2])
+        .split(parts: 2, axis: 2)
+    let retained = contiguous(pairHalves[0].reshaped([rows, groups / 2]))
+    let pairwise = (pairHalves[0] .== pairHalves[1])
+        .all(axes: [1, 2]).reshaped([rows, 1])
+    let rowMin = retained.min(axis: 1, keepDims: true)
+    let span = retained.max(axis: 1, keepDims: true).asType(.int32)
+        - rowMin.asType(.int32)
+    // 0xFF is the escape sentinel in the runtime loader. Keep the encoding
+    // total even if a future accepted checkpoint contains that E4M3 code.
+    let fits = pairwise .&& (span .<= 15)
+        .&& (rowMin .!= MLXArray(UInt8(0xFF)))
+    let bases = contiguous(
+        which(fits, rowMin, MLXArray(UInt8(0xFF))).reshaped([rows]))
+    let deltas = which(
+        fits,
+        retained.asType(.int32) - rowMin.asType(.int32),
+        MLXArray(Int32(0))
+    ).asType(.uint8)
+    // One byte contains consecutive retained group-32 deltas. The two
+    // staging threads for a row consume its low/high nibble respectively,
+    // making their scale transaction naturally shared by the cache line.
+    let u16 = contiguous(deltas).view(dtype: .uint16)
+    let nibbles = contiguous(
+        ((u16 & MLXArray(UInt16(0x000F)))
+            | ((u16 >> 4) & MLXArray(UInt16(0x00F0)))).asType(.uint8))
+
+    // Full init-time reconstruction certificate. Escaped rows substitute the
+    // authoritative plane; every fitting row must reproduce every one of the
+    // 128 logical group-16 bytes, including pair expansion.
+    let packed = nibbles.asType(.int32).reshaped([rows, groups / 4, 1])
+    let retainedDecoded = concatenated(
+        [packed & 0x0F, (packed >> 4) & 0x0F], axis: 2
+    ).reshaped([rows, groups / 2])
+        + bases.asType(.int32).reshaped([rows, 1])
+    let retainedOne = retainedDecoded.reshaped([rows, groups / 2, 1])
+    let decoded = concatenated([retainedOne, retainedOne], axis: 2)
+        .reshaped([rows, groups]).asType(.uint8)
+    let escaped = (bases .== MLXArray(UInt8(0xFF))).reshaped([rows, 1])
+    let mismatches = (which(escaped, plane, decoded) .!= plane)
+        .asType(.int32).sum().item(Int32.self)
+    guard mismatches == 0 else {
+        lagunaPackedScalesLog.note(
+            "inactive", "prefill expert delta scales (certificate mismatch)")
+        return nil
+    }
+
+    let fitting = Int((bases .!= MLXArray(UInt8(0xFF)))
+        .asType(.int32).sum().item(Int32.self))
+    let combined = contiguous(concatenated([
+        bases,
+        nibbles.reshaped([-1]),
+        pairwisePacked,
+    ]))
+    let compactRowBytes = 1 + groups / 4
+    let expectedBytes = rows * compactRowBytes + pairwisePacked.size
+    guard combined.size == expectedBytes else { return nil }
+    lagunaPackedScalesLog.note(
+        "active",
+        "prefill expert delta scales (escaped \(rows - fitting)/\(rows))")
+    return asStrided(
+        combined,
+        [experts, rowsPerExpert, groups],
+        strides: [rowsPerExpert * compactRowBytes, compactRowBytes, 0],
+        offset: 0)
+}
+
 /// Presents the certified routed down-projection decode scale plane to the
 /// expert-aligned M5 prefill primitive without copying it. Unlike the fused
 /// gate/up bank, the down plane is already row-major after its 128-byte patch

@@ -231,6 +231,13 @@ let lagunaPrefillExpertPairwiseScalesEnabled =
 let lagunaPrefillExpertDownPairwiseScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_EXPERT_DOWN_PAIRWISE_SCALES"] != "0"
 
+/// Exact successor to the pairwise prefill scale views. A certified fitting
+/// row stores one uint8 base plus one four-bit delta for each retained
+/// group-32 scale; escaped rows fall through to the complete crowned pairwise
+/// bank carried in the same buffer. This is prefill-only and defaults on.
+let lagunaPrefillExpertScaleDeltaEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_EXPERT_SCALE_DELTA"] != "0"
+
 /// The compact marker is legal only for GatherQMM's sorted RHS expert path,
 /// whose batching guard requires at least four routed rows per expert. Shorter
 /// prefills keep the original full scale plane so no generic kernel can ever
@@ -10536,8 +10543,16 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
             let packedScales = _packedRoutedGateUpBank,
             let pairwiseView = lagunaPackedPrefillScaleView(packedScales)
         {
-            _fusedRoutedGateUpPairwiseScales = pairwiseView
-            prepared.append(pairwiseView)
+            if let deltaView = lagunaDeltaPrefillScaleView(
+                scales: fusedScales,
+                pairwisePacked: packedScales)
+            {
+                _fusedRoutedGateUpPairwiseScales = deltaView
+                prepared.append(deltaView)
+            } else {
+                _fusedRoutedGateUpPairwiseScales = pairwiseView
+                prepared.append(pairwiseView)
+            }
         }
         return prepared
     }

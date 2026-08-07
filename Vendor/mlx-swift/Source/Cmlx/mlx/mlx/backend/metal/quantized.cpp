@@ -1590,12 +1590,14 @@ bool darkbloom_bsearch_hoist() {
   return v;
 }
 
-// Exact storage markers installed only by Laguna's certified zero-copy expert
-// scale views. Layout 1 is the fused gate/up walk-order bank; layout 2 is the
-// row-major routed down bank. Keep this classifier at the outer GatherQMM
-// boundary as well as the NAX dispatcher: normalizing either zero-stride view
-// would expand each row by repeating its first compact byte and destroy the
-// representation before the specialized loader can see it.
+// Exact storage markers installed only by Laguna's certified expert scale
+// views. Layout 1 is the fused gate/up walk-order pairwise bank; layout 2 is
+// the row-major routed-down pairwise bank; layout 3 is the gate/up base+nibble
+// delta prefix followed by a complete layout-1 escape bank. Keep this
+// classifier at the outer GatherQMM boundary as well as the NAX dispatcher:
+// normalizing any zero-stride marker would expand each row by repeating its
+// first compact byte and destroy the representation before the specialized
+// loader can see it.
 int laguna_expert_pairwise_scale_layout(const array& scales) {
   if (scales.dtype() != uint8 || scales.ndim() != 3 ||
       scales.offset() != 0 || scales.shape(0) != 256 ||
@@ -1609,6 +1611,14 @@ int laguna_expert_pairwise_scale_layout(const array& scales) {
   if (scales.shape(1) == 2048 && scales.shape(2) == 32 &&
       scales.strides()[0] == 2048 * 16 && scales.strides()[1] == 16) {
     return 2;
+  }
+  if (scales.shape(1) == 1024 && scales.shape(2) == 128 &&
+      scales.strides()[0] == 1024 * 33 && scales.strides()[1] == 33) {
+    constexpr size_t rows = 256 * 1024;
+    constexpr size_t required_bytes = rows * 33 + 128 + rows * 64;
+    if (scales.buffer_size() >= required_bytes) {
+      return 3;
+    }
   }
   return 0;
 }
@@ -1694,7 +1704,8 @@ void gather_qmm_rhs_nax(
       group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
       align_N && align_K && bm == 64 && wm == 4 && (wn == 2 || wn == 1);
   const bool pairwise_shape =
-      (pairwise_scale_layout == 1 && K == 2048 && N == 1024) ||
+      ((pairwise_scale_layout == 1 || pairwise_scale_layout == 3) &&
+       K == 2048 && N == 1024) ||
       (pairwise_scale_layout == 2 && K == 512 && N == 2048);
   const int expert_pairwise_scale_layout =
       pairwise_scale_layout != 0 && expert_aligned && mode == "nvfp4" &&
@@ -2264,7 +2275,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
       sorted_rhs && metal::is_nax_available() && transpose_ &&
       group_size_ == 16 && bits_ == 4 && mode == "nvfp4" &&
       !biases.has_value() &&
-      ((pairwise_scale_layout == 1 && K == 2048 && N == 1024) ||
+      (((pairwise_scale_layout == 1 || pairwise_scale_layout == 3) &&
+        K == 2048 && N == 1024) ||
        (pairwise_scale_layout == 2 && K == 512 && N == 2048));
   if (pairwise_scale_layout != 0 && !pairwise_contract) {
     throw std::runtime_error(
