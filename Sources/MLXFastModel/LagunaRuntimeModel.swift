@@ -8163,7 +8163,14 @@ private func lagunaRoutedSharedDownResidualSource(
                 row_codes[row],
                 input_values,
                 laguna_nvfp4_scale(row_sb[row]));
-            result[row] = simd_sum(result[row]);
+        }
+        {
+            const vec<float, 4> packed_rows = simd_sum(
+                vec<float, 4>(result[0], result[1], result[2], result[3]));
+            result[0] = packed_rows.x;
+            result[1] = packed_rows.y;
+            result[2] = packed_rows.z;
+            result[3] = packed_rows.w;
         }
         """
         : """
@@ -8181,7 +8188,14 @@ private func lagunaRoutedSharedDownResidualSource(
                 weight,
                 input_values,
                 laguna_nvfp4_scale(sb));
-            result[row] = simd_sum(result[row]);
+        }
+        {
+            const vec<float, 4> packed_rows = simd_sum(
+                vec<float, 4>(result[0], result[1], result[2], result[3]));
+            result[0] = packed_rows.x;
+            result[1] = packed_rows.y;
+            result[2] = packed_rows.z;
+            result[3] = packed_rows.w;
         }
         """
     return """
