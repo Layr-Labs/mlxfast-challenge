@@ -7712,15 +7712,18 @@ METAL_FUNC uint laguna_router_top8_extract_round(
             best_index = e;
         }
     }
+    // Transport the comparator's (ordinal, expert-index) state as one uint2
+    // through each butterfly step. simd_shuffle_xor moves both components
+    // bit-for-bit from the same source lane; comparator order is unchanged.
+    uint2 best_pair = uint2(best_ordinal, best_index);
     for (ushort offset = 16; offset > 0; offset >>= 1) {
-        uint other_ordinal = simd_shuffle_xor(best_ordinal, offset);
-        uint other_index = simd_shuffle_xor(best_index, offset);
+        const uint2 other_pair = simd_shuffle_xor(best_pair, offset);
         if (laguna_router_ordinal_before(
-            other_ordinal, other_index, best_ordinal, best_index)) {
-            best_ordinal = other_ordinal;
-            best_index = other_index;
+            other_pair.x, other_pair.y, best_pair.x, best_pair.y)) {
+            best_pair = other_pair;
         }
     }
+    best_index = best_pair.y;
     if ((best_index & 31u) == lane) {
         mask |= 1u << (best_index >> 5u);
     }
