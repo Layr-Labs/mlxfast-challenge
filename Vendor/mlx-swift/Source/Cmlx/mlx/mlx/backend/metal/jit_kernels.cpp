@@ -1351,10 +1351,10 @@ namespace {
 // of the loader traffic, and it drops the LSU:MMA issue ratio from 5.00 to
 // 4.11. See notes/21-attn-analysis.md.
 //
-// DEFAULT OFF, read as `== "1"`. This is an unmeasured arm: the hoist extends
-// 8 fragments' live range across the whole loop (+28 registers/thread), and if
-// that crosses an occupancy threshold it shows up as a regression, not a win.
-// It must not ship until a paired measurement says otherwise.
+// DEFAULT OFF, read as `== "1"`. Now a MEASURED arm: the paired ranked run
+// of submission 9474bedb priced the occupancy trade at candidate prefill
+// 199.14 us/token against this tree's 190.9-191.5 class (-4.2%), exactly the
+// register-pressure cliff the original analysis predicted. Keep it off.
 //
 // WHY A #define AND NOT A FUNCTION CONSTANT. The natural home for a host-side
 // switch is scaled_dot_product_attention.cpp, but that file is not in
