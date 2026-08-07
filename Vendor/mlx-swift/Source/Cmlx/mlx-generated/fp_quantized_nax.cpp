@@ -355,8 +355,7 @@ template <
     short reduction_dim,
     short tgp_size,
     short group_size,
-    short bits,
-    short pairwise_scale_layout = 0>
+    short bits>
 struct QuantizedBlockLoader {
   MLX_MTL_CONST short pack_factor = get_pack_factor<8, bits>();
   MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack();
@@ -384,10 +383,6 @@ struct QuantizedBlockLoader {
   threadgroup T* dst;
   const device uint8_t* src;
   const device uint8_t* scales;
-  const device uint8_t* pairwise_patch_base;
-  const device uint8_t* pairwise_row_base;
-  int pairwise_patch_slot;
-  int logical_group;
 
   QuantizedBlockLoader(
       const device uint8_t* src_,
@@ -408,65 +403,7 @@ struct QuantizedBlockLoader {
         dst(dst_ + bi * dst_ld + bj * pack_factor),
         src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
             bj * bytes_per_pack),
-        scales(scales_ + bi * src_ld / group_size + group_id),
-        pairwise_patch_base(scales_),
-        pairwise_row_base(scales_),
-        pairwise_patch_slot(-1),
-        logical_group(group_id) {
-    static_assert(
-        pairwise_scale_layout == 0 || reduction_dim == 1,
-        "pairwise scales are only defined for reduction-dimension staging");
-    static_assert(
-        pairwise_scale_layout >= 0 && pairwise_scale_layout <= 2,
-        "unknown Laguna pairwise scale layout");
-  }
-
-  short row_in_tile() const { return bi; }
-
-  void set_pairwise_packed(
-      const device uint8_t* patch_base,
-      const device uint8_t* expert_base,
-      int row,
-      int patch_slot) {
-    // Inverse of preparePackedRoutedGateUpBank's walk-order permutation:
-    // 4 logical gate/up row pairs per tile, 4 K blocks, 8 subrows, 16 bytes.
-    const int within_block = row & 63;
-    const int logical_row = (row >> 6) * 32 + (within_block & 31);
-    const int tile = logical_row >> 2;
-    const int sub = ((logical_row & 3) << 1) + (within_block >> 5);
-    pairwise_patch_base = patch_base;
-    pairwise_row_base = expert_base + tile * 512 + sub * 16;
-    pairwise_patch_slot = patch_slot;
-  }
-
-  void set_pairwise_rowmajor(
-      const device uint8_t* patch_base,
-      const device uint8_t* expert_base,
-      int row,
-      int patch_slot) {
-    pairwise_patch_base = patch_base;
-    pairwise_row_base =
-        expert_base + size_t(row) * (src_ld / group_size / 2);
-    pairwise_patch_slot = patch_slot;
-  }
-
-  uint8_t scale_code(int step) const {
-    if constexpr (pairwise_scale_layout == 1) {
-      const int group = logical_group + step;
-      // Four 32-group K blocks are 128 bytes apart in the inherited packed
-      // bank. Each stores the 16 certified even bytes for this fused row.
-      return group == 1 && pairwise_patch_slot >= 0
-          ? pairwise_patch_base[pairwise_patch_slot]
-          : pairwise_row_base[(group >> 5) * 128 + ((group & 31) >> 1)];
-    } else if constexpr (pairwise_scale_layout == 2) {
-      const int group = logical_group + step;
-      return group == 1 && pairwise_patch_slot >= 0
-          ? pairwise_patch_base[pairwise_patch_slot]
-          : pairwise_row_base[group >> 1];
-    } else {
-      return scales[step];
-    }
-  }
+        scales(scales_ + bi * src_ld / group_size + group_id) {}
 
   // The NVFP4 staging fast path applies when the packing is one byte per two
   // values, the scale is e4m3, and the byte run governed by ONE scale splits
@@ -481,33 +418,9 @@ struct QuantizedBlockLoader {
   // identical addresses on both paths; see the note above dequantize().
   void stage() const {
     if constexpr (fp4nv_fast) {
-      // A pairwise marker makes adjacent logical group-16 scales aliases of
-      // one certified byte, except for the explicit expert-zero patch. Cache
-      // the decoded float once per physical pair before the source walk. The
-      // same float bits then reach the same fp4nv_decode8 calls; only repeated
-      // byte loads and E4M3 conversions disappear. This is especially useful
-      // at WN=1, where one loader thread owns both groups in a pair.
-      float pair_scales[n_steps_per_read];
-      if constexpr (pairwise_scale_layout != 0) {
-        STEEL_PRAGMA_UNROLL
-        for (short i = 0; i < n_steps_per_read; ++i) {
-          const int group = logical_group + i;
-          const bool shares_previous =
-              i > 0 && ((group >> 1) == ((group - 1) >> 1)) &&
-              !(group == 1 && pairwise_patch_slot >= 0);
-          pair_scales[i] = shares_previous
-              ? pair_scales[i - 1]
-              : fp4nv_scale_x16384(scale_code(i));
-        }
-      }
       int k = 0;
       for (int i = 0; i < n_steps_per_read; i++) {
-        float scale;
-        if constexpr (pairwise_scale_layout != 0) {
-          scale = pair_scales[i];
-        } else {
-          scale = fp4nv_scale_x16384(scale_code(i));
-        }
+        const float scale = fp4nv_scale_x16384(scales[i]);
         for (int j = 0; j < n_reads_per_scale / 4; j++) {
           T vals[8];
           fp4nv_decode8<T>(fp4nv_pack4(src + k), scale, vals);
@@ -520,7 +433,7 @@ struct QuantizedBlockLoader {
     } else {
       int k = 0;
       for (int i = 0; i < n_steps_per_read; i++) {
-        T scale = dequantize_scale<T, group_size>(scale_code(i));
+        T scale = dequantize_scale<T, group_size>(scales[i]);
         for (int j = 0; j < n_reads_per_scale; j++) {
           dequantize<T, bits>(
               src[k * bytes_per_pack], scale, dst + k * pack_factor);
@@ -674,25 +587,6 @@ struct QuantizedBlockLoader {
       }
     }
 
-    // The wide writer splits each logical scale span across multiple
-    // WideChunks. On the pairwise specialization, decode every distinct
-    // physical scale byte exactly once before that chunk loop. This removes
-    // both the per-chunk duplicate conversions and the adjacent-group
-    // duplicate, while the expert-zero patch still receives its own value.
-    float pair_scales[n_steps_per_read];
-    if constexpr (fp4nv_fast && pairwise_scale_layout != 0) {
-      STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < n_steps_per_read; ++i) {
-        const int group = logical_group + i;
-        const bool shares_previous =
-            i > 0 && ((group >> 1) == ((group - 1) >> 1)) &&
-            !(group == 1 && pairwise_patch_slot >= 0);
-        pair_scales[i] = shares_previous
-            ? pair_scales[i - 1]
-            : fp4nv_scale_x16384(scale_code(i));
-      }
-    }
-
     STEEL_PRAGMA_UNROLL
     for (short c = 0; c < kWideChunks; c++) {
       const short e0 = c * kWideElems;
@@ -705,20 +599,15 @@ struct QuantizedBlockLoader {
       // when a 16B chunk covers a whole multiple of them (kSrcBytesPerChunk
       // is 4 for bfloat/half staging, 2 for float). Same values either way.
       if constexpr (fp4nv_fast && (kSrcBytesPerChunk % 4) == 0) {
-        float scale;
-        if constexpr (pairwise_scale_layout != 0) {
-          scale = pair_scales[k0 / n_reads_per_scale];
-        } else {
-          scale = fp4nv_scale_x16384(scale_code(k0 / n_reads_per_scale));
-        }
+        const float scale =
+            fp4nv_scale_x16384(scales[k0 / n_reads_per_scale]);
         STEEL_PRAGMA_UNROLL
         for (short b = 0; b < kSrcBytesPerChunk / 4; b++) {
           fp4nv_decode8<T>(fp4nv_pack4(sb + k0 + b * 4), scale, &out.v[b * 8]);
         }
       } else {
         T scale =
-            dequantize_scale<T, group_size>(
-                scale_code(k0 / n_reads_per_scale));
+            dequantize_scale<T, group_size>(scales[k0 / n_reads_per_scale]);
         STEEL_PRAGMA_UNROLL
         for (short b = 0; b < kSrcBytesPerChunk; b++) {
           dequantize_pair(sb[k0 + b], scale, &out.v[b * pack_factor]);
@@ -736,6 +625,65 @@ struct QuantizedBlockLoader {
     }
   }
 
+  // DARKBLOOM_STAGE2_GATHER: register-staged twin of load_unsafe(), split in
+  // two so fp_gather_qmm_rhs_expert_nax can issue tile k+1's device fetch
+  // BEFORE the MMAs that consume tile k. fetch_stage2 reads exactly the bytes
+  // stage() reads -- this thread's n_reads packed bytes and its
+  // n_steps_per_read scale bytes -- into thread registers; store_stage2 then
+  // runs the identical decode chain (same expressions, same single rounding
+  // per element, same destination addresses) from those registers. Values and
+  // addresses are unchanged on every path; only WHEN the device reads issue
+  // moves. fp4nv_pack4 has a thread-space overload with identical
+  // little-endian assembly, so the fp4nv fast path stays bit-identical too.
+#ifdef DARKBLOOM_STAGE2_GATHER
+  void fetch_stage2(
+      thread uint8_t (&sb)[kSrcBytes],
+      thread uint8_t (&ss)[n_steps_per_read]) const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < n_steps_per_read; i++) {
+      ss[i] = scales[i];
+    }
+    STEEL_PRAGMA_UNROLL
+    for (short b = 0; b < kSrcBytes; b++) {
+      sb[b] = src[b];
+    }
+  }
+
+  void store_stage2(
+      const thread uint8_t (&sb)[kSrcBytes],
+      const thread uint8_t (&ss)[n_steps_per_read]) const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    if constexpr (fp4nv_fast) {
+      int k = 0;
+      for (int i = 0; i < n_steps_per_read; i++) {
+        const float scale = fp4nv_scale_x16384(ss[i]);
+        for (int j = 0; j < n_reads_per_scale / 4; j++) {
+          T vals[8];
+          fp4nv_decode8<T>(fp4nv_pack4(sb + k), scale, vals);
+          for (int e = 0; e < 8; e++) {
+            dst[k * pack_factor + e] = vals[e];
+          }
+          k += 4;
+        }
+      }
+    } else {
+      int k = 0;
+      for (int i = 0; i < n_steps_per_read; i++) {
+        T scale = dequantize_scale<T, group_size>(ss[i]);
+        for (int j = 0; j < n_reads_per_scale; j++) {
+          dequantize<T, bits>(
+              sb[k * bytes_per_pack], scale, dst + k * pack_factor);
+          k++;
+        }
+      }
+    }
+  }
+#endif // DARKBLOOM_STAGE2_GATHER
 
   void load_safe(short2 src_tile_dim) const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
@@ -762,11 +710,7 @@ struct QuantizedBlockLoader {
   void next() {
     src += tile_stride;
     if (reduction_dim == 1) {
-      if constexpr (pairwise_scale_layout != 0) {
-        logical_group += n_groups;
-      } else {
-        scales += n_groups;
-      }
+      scales += n_groups;
     } else {
       scales += n_groups * group_stride;
     }
@@ -878,10 +822,7 @@ METAL_FUNC void fp_qmm_t_impl(
   dispatch_bool(aligned_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
       for (int k = 0; k < kernel_K; k += BK) {
-        // Dead at k==0 for fixed_K>0: no prior-iteration Ws read to order.
-        if (fixed_K == 0 || k > 0) {
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
@@ -920,10 +861,8 @@ METAL_FUNC void fp_qmm_t_impl(
         loader_w.next();
       }
 
-      // Dead for fixed_K>0: no next iteration, epilogue never touches Ws.
-      if (fixed_K == 0) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-      }
+      // Store results to device memory
+      threadgroup_barrier(mem_flags::mem_threadgroup);
 
       if constexpr (kAlignedM.value && kAlignedN.value) {
         Dtile.store(y + tm * kernel_N + tn, kernel_N);
@@ -1827,8 +1766,7 @@ template <
     typename Wtype = bfloat,
     int tg_expert_groups = 64,
     bool wide_store = false,
-    bool wide_load = false,
-    short pairwise_scale_layout = 0>
+    bool wide_load = false>
 [[kernel]] void fp_gather_qmm_rhs_expert_nax(
     const device T* x,
     const device uint32_t* w,
@@ -1869,14 +1807,23 @@ template <
       true,
       WM * WN * SIMD_SIZE,
       group_size,
-      bits,
-      pairwise_scale_layout>;
+      bits>;
 
   constexpr int kWsElems = BN * BK_padded;
   constexpr int kWsPerChunk = 16 / sizeof(Wtype);
   threadgroup NAXWsChunk16<Wtype>
       Ws_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
   threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
+#ifdef DARKBLOOM_STAGE2_GATHER
+  // Stage-2 double buffering: a second staging region with identical
+  // geometry, ping-ponged with Ws across k-iterations so tile k+1 stages
+  // while the MMAs consume tile k. Doubles staging threadgroup memory
+  // (2 x BN x BK_padded x sizeof(Wtype) = 18,432 B at BN=BK=64/bfloat) --
+  // an occupancy trade, deliberately NOT a tile-geometry change.
+  threadgroup NAXWsChunk16<Wtype>
+      Ws2_storage[(kWsElems + kWsPerChunk - 1) / kWsPerChunk];
+  threadgroup Wtype* Ws2 = (threadgroup Wtype*)Ws2_storage;
+#endif
   threadgroup bfloat* gate_up_stage =
       (threadgroup bfloat*)Ws_storage;
 #ifdef DARKBLOOM_BSEARCH_HOIST
@@ -1890,13 +1837,24 @@ template <
   const int K_it = kernel_K / BK;
   const size_t stride_w = size_t(kernel_N) * K_w;
   const size_t stride_s = size_t(kernel_N) * K_g;
+#ifdef DARKBLOOM_GATHER_XMAJOR
+  // DARKBLOOM_GATHER_XMAJOR: one threadgroup owns kFoldCT ADJACENT column
+  // tiles of this expert's output (the dispatch site divides grid.x by the
+  // same value this kernel was compiled with). Takes precedence over
+  // DARKBLOOM_STAGE2_GATHER if both are ever set; the arms are meant to be
+  // exclusive.
+  constexpr int kFoldCT = DARKBLOOM_GATHER_XMAJOR;
+  static_assert(
+      kFoldCT == 2 || kFoldCT == 4 || kFoldCT == 8 || kFoldCT == 16,
+      "DARKBLOOM_GATHER_XMAJOR must be 2, 4, 8, or 16");
+  const int y_col = tid.x * BN * kFoldCT;
+#else
   const int y_col = tid.x * BN;
+#endif
 
   auto wl = (const device uint8_t*)w + size_t(y_col) * K_w;
-  const device uint8_t* scale_base = scales;
-  if constexpr (pairwise_scale_layout == 0) {
-    scale_base += size_t(y_col) * K_g;
-  }
+  const device uint8_t* scale_base =
+      scales + size_t(y_col) * K_g;
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
@@ -1967,38 +1925,221 @@ template <
           min(int(SM), max(0, int(chunk_rows) - int(tm)));
       const bool sg_active = sgp_sm > 0;
 
+#ifdef DARKBLOOM_GATHER_XMAJOR
+      // The stock kernel computes ONE BN-wide column tile per threadgroup,
+      // so the 16 (gate/up) / 32 (down) column-tile threadgroups each
+      // re-stream this expert run's x rows from DRAM -- half the chain's
+      // DRAM bytes at ~625 GB/s (notes/exp-stage2.md section 4.3). Here the
+      // k-loop is OUTER and the column walk INNER: the A fragments for
+      // k-tile k are loaded from device once and reused across all kFoldCT
+      // weight tiles, so x device traffic divides by kFoldCT structurally.
+      // Weight traffic, staging geometry, and barrier count per staged tile
+      // are unchanged.
+      //
+      // EXACTNESS (class A, bit-exact): every output element still belongs
+      // to exactly one (threadgroup, ct) pair and is accumulated by the same
+      // simdgroup in the same order -- k ascending, kk1 ascending, the same
+      // tile_matmad_nax chain into its own dedicated Dtile accumulator --
+      // from the same Atile values (same addresses, same load/load_safe
+      // selection) and the same staged weight values (same loader geometry,
+      // based at column y_col + ct*BN and k-tile k, exactly the pointers a
+      // persistent stock loader holds after k next() calls). Only the
+      // assignment of column tiles to threadgroups and the interleaving
+      // across INDEPENDENT accumulators change; no float operation, no
+      // accumulation order, no rounding boundary moves.
+      NAXTile<float, TM, TN> Dtile[kFoldCT];
+      STEEL_PRAGMA_UNROLL
+      for (int ct = 0; ct < kFoldCT; ++ct) {
+        Dtile[ct].clear();
+      }
+
+      const device T* xn =
+          x + size_t(chunk_start + tm) * kernel_K;
+
+      // Per-k-tile advances of the loader's walk, spelled with the same
+      // expressions QuantizedBlockLoader uses (reduction_dim == 1 here):
+      // tile_stride = BCOLS_PACKED * bytes_per_pack, scales += n_groups.
+      constexpr int kWTileBytes = (BK / pack_factor) * bytes_per_pack;
+      constexpr int kSTileBytes = BK / group_size;
+
+      for (int k = 0; k < K_it; ++k) {
+        NAXTile<T, TM, TK> Atile[BK / SK];
+        if (sg_active) {
+          STEEL_PRAGMA_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            if (sgp_sm == SM) {
+              Atile[kk1 / SK].load(xn + kk1, kernel_K);
+            } else {
+              Atile[kk1 / SK].load_safe(
+                  xn + kk1, kernel_K, short2(SK, sgp_sm));
+            }
+          }
+        }
+
+        // Unrolled so Dtile[ct] indexing stays register-resident.
+        STEEL_PRAGMA_UNROLL
+        for (int ct = 0; ct < kFoldCT; ++ct) {
+          // Fresh loader per (ct, k): the constructor's pointer math plus
+          // these offsets is identical to a persistent per-ct loader after
+          // k next() calls.
+          thread loader_w_t loader_w(
+              wl + size_t(expert) * stride_w +
+                  size_t(ct) * size_t(BN) * K_w +
+                  size_t(k) * kWTileBytes,
+              scale_base + size_t(expert) * stride_s +
+                  size_t(ct) * size_t(BN) * K_g +
+                  size_t(k) * kSTileBytes,
+              kernel_K,
+              Ws,
+              simd_group_id,
+              simd_lane_id);
+
+          // WAR: previous tile's Btile reads retire before restaging.
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          loader_w.load_unsafe();
+          // RAW: staged tile visible to every simdgroup before its MMAs.
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          if (sg_active) {
+            STEEL_PRAGMA_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<Wtype, TN, TK> Btile;
+              Btile.template load<Wtype, BK_padded, 1>(
+                  Ws + tn * BK_padded + kk1);
+
+              tile_matmad_nax(
+                  Dtile[ct],
+                  Atile[kk1 / SK],
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<true>{});
+            }
+          }
+        }
+
+        xn += BK;
+      }
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const bool fuse_swiglu =
+          kernel_N == 1024 && kernel_K == 2048;
+      if (fuse_swiglu) {
+#ifdef DARKBLOOM_SWIGLU_REGLOCAL
+        // Register-local swiglu (geometry guard: kSwigluRegLocal above).
+        // EXACTNESS (class A, bit-exact): gate and up are the SAME float
+        // Dtile elements the stock path routes through gate_up_stage, cast
+        // to bfloat by the same static_cast the tile store performs; the
+        // swiglu chain replicates the stock expressions type-for-type in
+        // textual order and writes the same y address. Only the
+        // threadgroup round-trip and its two barriers per ct disappear.
+        // fp contract(off) pins the rounding boundaries: no FMA fusion may
+        // move the chain off the stock scalar sequence.
+        if constexpr (kSwigluRegLocal) {
+#pragma clang fp contract(off)
+          constexpr int activated_cols = BN / 2;
+          const short qid = short(simd_lane_id >> 2);
+          const short fm = (qid & 4) | ((short(simd_lane_id) >> 1) & 3);
+          const short fn = ((qid & 2) | (short(simd_lane_id) & 1)) * 4;
+          STEEL_PRAGMA_UNROLL
+          for (int ct = 0; ct < kFoldCT; ++ct) {
+            STEEL_PRAGMA_UNROLL
+            for (short jf = 0; jf < 2; ++jf) {
+              STEEL_PRAGMA_UNROLL
+              for (short ie = 0; ie < 2; ++ie) {
+                const short row = fm + ie * 8;
+                if (row < sgp_sm) {
+                  STEEL_PRAGMA_UNROLL
+                  for (short jj = 0; jj < 4; ++jj) {
+                    const int col = jf * 16 + fn + jj;
+                    const bfloat gate = static_cast<bfloat>(
+                        Dtile[ct].frag_at(0, jf)[ie * 4 + jj]);
+                    const bfloat up = static_cast<bfloat>(
+                        Dtile[ct].frag_at(0, jf + 2)[ie * 4 + jj]);
+                    const bfloat exp_abs = metal::exp(metal::abs(gate));
+                    const bfloat denominator = bfloat(1) + exp_abs;
+                    const bfloat z = bfloat(1) / denominator;
+                    const bfloat sigmoid =
+                        gate < bfloat(0) ? z : bfloat(1) - z;
+                    const bfloat silu = bfloat(gate * sigmoid);
+                    y[size_t(chunk_start + tm + row) * (kernel_N / 2) +
+                      size_t(tid.x * kFoldCT + ct) * activated_cols + col] =
+                        bfloat(silu * up);
+                  }
+                }
+              }
+            }
+          }
+        }
+        if constexpr (!kSwigluRegLocal) {
+#endif // DARKBLOOM_SWIGLU_REGLOCAL
+        STEEL_PRAGMA_UNROLL
+        for (int ct = 0; ct < kFoldCT; ++ct) {
+          if (sg_active) {
+            Dtile[ct].template store<bfloat, BN, 1>(
+                gate_up_stage + tm * BN + tn);
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (sg_active && (simd_group_id % WN) == 0) {
+            constexpr int activated_cols = BN / 2;
+            for (int linear = simd_lane_id;
+                 linear < int(sgp_sm) * activated_cols;
+                 linear += SIMD_SIZE) {
+              const int row = linear / activated_cols;
+              const int col = linear % activated_cols;
+              const bfloat gate =
+                  gate_up_stage[(tm + row) * BN + col];
+              const bfloat up =
+                  gate_up_stage[(tm + row) * BN + activated_cols + col];
+              const bfloat exp_abs = metal::exp(metal::abs(gate));
+              const bfloat denominator = bfloat(1) + exp_abs;
+              const bfloat z = bfloat(1) / denominator;
+              const bfloat sigmoid =
+                  gate < bfloat(0) ? z : bfloat(1) - z;
+              const bfloat silu = bfloat(gate * sigmoid);
+              y[size_t(chunk_start + tm + row) * (kernel_N / 2) +
+                size_t(tid.x * kFoldCT + ct) * activated_cols + col] =
+                  bfloat(silu * up);
+            }
+          }
+          // Retires this ct's swiglu reads of gate_up_stage before the next
+          // ct's Dtile store overwrites it (stock pays the same barrier at
+          // the end of its swiglu).
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+#ifdef DARKBLOOM_SWIGLU_REGLOCAL
+        }
+#endif // DARKBLOOM_SWIGLU_REGLOCAL
+      } else if (sg_active) {
+        STEEL_PRAGMA_UNROLL
+        for (int ct = 0; ct < kFoldCT; ++ct) {
+          device T* yn =
+              y + size_t(chunk_start + tm) * kernel_N + y_col +
+              ct * BN + tn;
+          if (sgp_sm == SM) {
+            Dtile[ct].store(yn, kernel_N);
+          } else {
+            Dtile[ct].store_slice(
+                yn,
+                kernel_N,
+                short2(0, 0),
+                short2(SN, sgp_sm));
+          }
+        }
+      }
+#else
       NAXTile<float, TM, TN> Dtile;
       Dtile.clear();
 
       const device T* xn =
           x + size_t(chunk_start + tm) * kernel_K;
-      const device uint8_t* loader_scales = pairwise_scale_layout != 0
-          ? scales
-          : scale_base + size_t(expert) * stride_s;
+#ifndef DARKBLOOM_STAGE2_GATHER
       thread loader_w_t loader_w(
           wl + size_t(expert) * stride_w,
-          loader_scales,
+          scale_base + size_t(expert) * stride_s,
           kernel_K,
           Ws,
           simd_group_id,
           simd_lane_id);
-      if constexpr (pairwise_scale_layout == 1) {
-        const int scale_row = y_col + int(loader_w.row_in_tile());
-        const int patch_slot = expert == 0 && scale_row == 0
-            ? 0
-            : (expert == 0 && scale_row == 32 ? 1 : -1);
-        const device uint8_t* packed_expert = scales + 128
-            + size_t(expert) * (size_t(kernel_N) * K_g / 2);
-        loader_w.set_pairwise_packed(
-            scales, packed_expert, scale_row, patch_slot);
-      } else if constexpr (pairwise_scale_layout == 2) {
-        const int scale_row = y_col + int(loader_w.row_in_tile());
-        const int patch_slot = expert == 0 && scale_row == 0 ? 0 : -1;
-        const device uint8_t* packed_expert = scales + 128
-            + size_t(expert) * (size_t(kernel_N) * K_g / 2);
-        loader_w.set_pairwise_rowmajor(
-            scales, packed_expert, scale_row, patch_slot);
-      }
 
       for (int k = 0; k < K_it; ++k) {
         // Bit-exact A-operand hoist (the XMAJOR arm's shipped pattern at
@@ -2019,12 +2160,9 @@ template <
           STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             if (sgp_sm == SM) {
-              // 8B alignment certified: fn multiples of 4 elems, off_y in
-              // {0,16}, kk1 in {0,32}, str_x = 2048. Same bytes, same slots.
-              Atile[kk1 / SK].load_contig(xn + kk1, kernel_K);
+              Atile[kk1 / SK].load(xn + kk1, kernel_K);
             } else {
-              // Same 8B-aligned runs as the full-row arm.
-              Atile[kk1 / SK].load_rows_contig(xn + kk1, kernel_K, sgp_sm);
+              Atile[kk1 / SK].load_rows(xn + kk1, kernel_K, sgp_sm);
             }
           }
         }
@@ -2049,9 +2187,7 @@ template <
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             NAXTile<Wtype, TN, TK> Btile;
 
-            // Ws is 16B-aligned (NAXWsChunk16), BK_padded*2B = 144B row
-            // stride, runs at multiples of 8B: same bytes, same slots.
-            Btile.template load_contig_tg<Wtype, BK_padded>(
+            Btile.template load<Wtype, BK_padded, 1>(
                 Ws + tn * BK_padded + kk1);
 
             tile_matmad_nax(
@@ -2067,12 +2203,115 @@ template <
         xn += BK;
         loader_w.next();
       }
+#else
+      // DARKBLOOM_STAGE2_GATHER: software-pipelined staging. The stock loop
+      // serializes every k-iteration as
+      //     barrier ; stage(k) ; barrier ; mma(k)
+      // so all 8 staging simdgroups idle during mma and the mma simdgroups
+      // idle during staging (at EG256 the mean expert run is ~16 rows, so
+      // usually only 2 of 8 simdgroups have MMA work). Here tile k+1's
+      // device fetch issues BEFORE the MMAs that consume tile k, its
+      // decode+threadgroup-store lands after them, and one joint barrier per
+      // iteration both publishes tile k+1 (RAW) and retires tile k's reads
+      // before that buffer is overwritten by tile k+2 (WAR).
+      //
+      // EXACTNESS (class A): the staged VALUES for every tile are produced
+      // by the identical decode chain from the identical device bytes to the
+      // identical addresses within a buffer (fetch_stage2/store_stage2 are
+      // textual twins of stage() with the source bytes passing through
+      // registers); the MMA consumption order -- k ascending, kk1 ascending,
+      // the same tile_matmad_nax chain into the same Dtile -- and every
+      // output's accumulation order are untouched. Only WHEN loads issue and
+      // WHICH of two identical-layout buffers holds odd tiles change.
+      thread loader_w_t loader_even(
+          wl + size_t(expert) * stride_w,
+          scale_base + size_t(expert) * stride_s,
+          kernel_K,
+          Ws,
+          simd_group_id,
+          simd_lane_id);
+      thread loader_w_t loader_odd(
+          wl + size_t(expert) * stride_w,
+          scale_base + size_t(expert) * stride_s,
+          kernel_K,
+          Ws2,
+          simd_group_id,
+          simd_lane_id);
+      loader_odd.next();
 
-#ifndef DARKBLOOM_SWIGLU_REGLOCAL
-      // Staged-epilogue arm only: reg-local epilogues read no threadgroup
-      // memory and the next chunk's k-loop opens with its own WAR barrier.
+      // WAR: the previous chunk's reads of Ws retire before tile 0
+      // overwrites it (the stock loop pays this same barrier at the top of
+      // its first k-iteration).
       threadgroup_barrier(mem_flags::mem_threadgroup);
-#endif // DARKBLOOM_SWIGLU_REGLOCAL
+      loader_even.load_unsafe();
+      loader_even.next();
+      loader_even.next();
+      // RAW: tile 0 visible to every simdgroup before its MMAs.
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      for (int k = 0; k < K_it; ++k) {
+        const bool have_next = (k + 1) < K_it;
+        const bool next_odd = ((k + 1) & 1) != 0;
+        uint8_t sb[loader_w_t::kSrcBytes];
+        uint8_t ss[loader_w_t::n_steps_per_read];
+        // Explicit parity branches rather than a loader pointer: with the
+        // static-shape K_it this loop fully unrolls, the parity is a
+        // constant per iteration, and both loaders stay register-resident.
+        if (have_next) {
+          if (next_odd) {
+            loader_odd.fetch_stage2(sb, ss);
+          } else {
+            loader_even.fetch_stage2(sb, ss);
+          }
+        }
+
+        threadgroup Wtype* Wsk = (k & 1) ? Ws2 : Ws;
+        if (sg_active) {
+          STEEL_PRAGMA_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<Wtype, TN, TK> Btile;
+
+            if (sgp_sm == SM) {
+              Atile.load(xn + kk1, kernel_K);
+            } else {
+              Atile.load_safe(
+                  xn + kk1, kernel_K, short2(SK, sgp_sm));
+            }
+            Btile.template load<Wtype, BK_padded, 1>(
+                Wsk + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<true>{});
+
+          }
+        }
+
+        if (have_next) {
+          if (next_odd) {
+            loader_odd.store_stage2(sb, ss);
+            loader_odd.next();
+            loader_odd.next();
+          } else {
+            loader_even.store_stage2(sb, ss);
+            loader_even.next();
+            loader_even.next();
+          }
+        }
+
+        xn += BK;
+        // Joint barrier: publishes tile k+1 for the next iteration's MMAs
+        // (RAW) and retires this iteration's reads of tile k before that
+        // buffer is overwritten (WAR).
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+#endif // DARKBLOOM_STAGE2_GATHER
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
       const bool fuse_swiglu =
           kernel_N == 1024 && kernel_K == 2048;
       if (fuse_swiglu) {
@@ -2160,6 +2399,7 @@ template <
               short2(SN, sgp_sm));
         }
       }
+#endif // DARKBLOOM_GATHER_XMAJOR
     }
   }
 }
