@@ -4,34 +4,6 @@ import Foundation
 import MLX
 import MLXNN
 
-/// Implementation of KV cache functionality for MLX Swift
-///
-///
-/// ## Quantized Cache Usage
-///
-/// **Standard caches:**
-/// ```swift
-/// let cache = KVCacheSimple()
-/// let (keys, values) = cache.update(keys: keys, values: values)
-/// let output = MLXFast.scaledDotProductAttention(queries: q, keys: keys, values: values, ...)
-/// ```
-///
-/// **Quantized cache:**
-/// ```swift
-/// let quantizedCache = QuantizedKVCache(groupSize: 64, bits: 4)
-/// let (qKeys, qValues) = quantizedCache.updateQuantized(keys: keys, values: values)
-///
-/// let output = quantizedScaledDotProductAttention(
-///     queries: queries,
-///     quantizedKeys: qKeys,
-///     quantizedValues: qValues,
-///     scale: scale,
-///     mask: mask,
-///     groupSize: quantizedCache.groupSize,
-///     bits: quantizedCache.bits
-/// )
-/// ```
-///
 /// Interface for Key/Value cache for LLMs.
 ///
 /// See ``LanguageModel/newCache(parameters:)``
@@ -328,8 +300,10 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var keys: MLXArray?
     internal var values: MLXArray?
     public var step = 256
+    public let initialSlack: Bool
 
-    public override init() {
+    public init(initialSlack: Bool = false) {
+        self.initialSlack = initialSlack
         super.init()
     }
 
@@ -338,21 +312,30 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        fusedAppendCapacity = 0
         let previous = self.offset
         let tokenCount = keys.dim(2)
 
-        // When the first update already lands exactly on an allocation-step
-        // boundary, the stock zero allocation has no spare capacity: it
-        // creates arrays with the same sequence length as `keys`/`values`,
-        // then copies the entire inputs into them. Retain the incoming arrays
-        // directly in this no-slack case. Shapes, offsets, returned values,
-        // and the next growth boundary are identical; only the redundant
-        // zero-fill and full-prompt slice updates disappear.
         if self.keys == nil, previous == 0, tokenCount > 0,
             tokenCount.isMultiple(of: step)
         {
-            self.keys = keys
-            self.values = values
+            if initialSlack {
+                self.keys = concatenated([
+                    keys,
+                    MLXArray.zeros(
+                        [keys.dim(0), keys.dim(1), step, keys.dim(3)], dtype: keys.dtype
+                    ),
+                ], axis: 2)
+                self.values = concatenated([
+                    values,
+                    MLXArray.zeros(
+                        [values.dim(0), values.dim(1), step, values.dim(3)], dtype: values.dtype
+                    ),
+                ], axis: 2)
+            } else {
+                self.keys = keys
+                self.values = values
+            }
             self.offset = tokenCount
             return (keys, values)
         }
@@ -405,16 +388,10 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     // attention kernel, which performs the slot write itself and attends
     // over the first `offset + 1` rows with the new row substituted from
     // registers. Engages only when the backing already has spare capacity
-    // for one more row (i.e. after the first decode step's stock growth
-    // concat), so the growth/reset branches above are provably not taken.
+    // for one more row, so the growth/reset branches above are not taken.
 
-    /// Tracks the one-time contiguization of the backing arrays; in-place
-    /// kernel writes require row-contiguous backings (a non-contiguous
-    /// backing would be copied per step by `ensureRowContiguous` and the
-    /// slot writes lost). After the first decode step's growth concat the
-    /// backings are concat outputs and already contiguous; `contiguous()`
-    /// is then an identity-value op.
-    private var fusedAppendContiguized = false
+    /// Nonzero only while both backings remain validated and contiguous.
+    private var fusedAppendCapacity = 0
 
     /// Append state for the fused decode attention kernel, or nil when the
     /// backing has no spare row (growth would be required — the stock path
@@ -422,15 +399,18 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     /// update would slice-assign; the kernel must attend over
     /// `writeIdx + 1` rows.
     public func fusedAppendPrepare() -> (keys: MLXArray, values: MLXArray, writeIdx: Int)? {
-        guard let currentKeys = keys, let currentValues = values,
-            offset + 1 <= currentKeys.dim(2),
-            currentValues.dim(2) == currentKeys.dim(2)
-        else { return nil }
-        if !fusedAppendContiguized {
-            keys = contiguous(currentKeys)
-            values = contiguous(currentValues)
-            fusedAppendContiguized = true
+        if offset < fusedAppendCapacity {
+            return (keys!, values!, offset)
         }
+        fusedAppendCapacity = 0
+        guard type(of: self) == KVCacheSimple.self,
+            let currentKeys = keys, let currentValues = values
+        else { return nil }
+        let capacity = currentKeys.dim(2)
+        guard offset < capacity, currentValues.dim(2) == capacity else { return nil }
+        keys = contiguous(currentKeys)
+        values = contiguous(currentValues)
+        fusedAppendCapacity = capacity
         return (keys!, values!, offset)
     }
 
@@ -456,6 +436,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             guard newValue.count == 2 else {
                 fatalError("KVCacheSimple state must have exactly 2 arrays (keys, values)")
             }
+            fusedAppendCapacity = 0
             self.keys = newValue[0]
             self.values = newValue[1]
             self.offset = self.keys!.dim(2)
@@ -466,6 +447,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
+        fusedAppendCapacity = 0
         let trimmed = min(offset, n)
         offset -= trimmed
         return trimmed
@@ -514,7 +496,9 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     }
 
     public override func copy() -> any KVCache {
-        let new = KVCacheSimple()
+        let new = KVCacheSimple(
+            initialSlack: initialSlack
+        )
         new.step = self.step
         let s = self.state
         if !s.isEmpty {
@@ -670,6 +654,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        fusedRingPrepared = false
         let tokenCount = keys.dim(2)
         let result =
             if tokenCount == 1 {
@@ -693,12 +678,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     // the steady wrapped regime (buffer at capacity, `keep == 0`), where
     // updateInPlace's growth and trim branches are provably no-ops.
 
-    /// Tracks the one-time contiguization of the ring backing. In-place
-    /// kernel writes require the backing arrays to be row-contiguous
-    /// (otherwise `ensureRowContiguous` would hand the kernel a fresh copy
-    /// each step and the slot writes would be lost); the prompt-retained
-    /// values array in particular is a transposed view after prefill.
-    private var fusedRingContiguized = false
+    /// True only while the ring remains validated and contiguous.
+    private var fusedRingPrepared = false
 
     /// Steady-ring state for the fused decode attention kernel, or nil
     /// when the ring is not yet at capacity (shorter prompts, growth
@@ -708,17 +689,20 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     /// copies — identical bytes, contiguous layout — so the fused kernel's
     /// in-place slot writes persist across steps.
     public func fusedRingPrepare() -> (keys: MLXArray, values: MLXArray, writeIdx: Int)? {
-        guard keep == 0, let currentKeys = keys, let currentValues = values,
+        if fusedRingPrepared {
+            return (keys!, values!, idx == maxCacheSize ? 0 : idx)
+        }
+        guard type(of: self) == RotatingKVCache.self,
+            keep == 0,
+            let currentKeys = keys, let currentValues = values,
             currentKeys.dim(2) == maxCacheSize,
             currentValues.dim(2) == maxCacheSize,
             offset >= maxCacheSize
         else { return nil }
-        if !fusedRingContiguized {
-            keys = contiguous(currentKeys)
-            values = contiguous(currentValues)
-            fusedRingContiguized = true
-        }
-        return (keys!, values!, idx == maxCacheSize ? keep : idx)
+        keys = contiguous(currentKeys)
+        values = contiguous(currentValues)
+        fusedRingPrepared = true
+        return (keys!, values!, idx == maxCacheSize ? 0 : idx)
     }
 
     /// Advance the logical clock exactly as `updateInPlace(tokenCount: 1)`
@@ -745,6 +729,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             guard newValue.count == 2 else {
                 fatalError("RotatingKVCache state must have exactly 2 arrays")
             }
+            fusedRingPrepared = false
             self.keys = newValue[0]
             self.values = newValue[1]
             // Note: RotatingKVCache doesn't set offset from keys like KVCache does
@@ -775,6 +760,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             guard let maxSizeVal = Int(newValue[1]) else {
                 fatalError("Failed to convert maxCacheSize '\(newValue[1])' to integer")
             }
+            fusedRingPrepared = false
             self.keep = keepVal
             self.maxCacheSize = maxSizeVal
             self.step = stepVal
@@ -789,6 +775,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
+        fusedRingPrepared = false
         let trimmed = min(offset, n)
         offset -= trimmed
         idx -= trimmed
