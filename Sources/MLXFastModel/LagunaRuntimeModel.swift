@@ -227,6 +227,10 @@ let lagunaPrefillFusedRoutedGateUpEnabled =
 let lagunaPrefillExpertPairwiseScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_EXPERT_PAIRWISE_SCALES"] != "0"
 
+// Official paired-M5 replay nonce 20260807T0236Z; executable source unchanged.
+let lagunaPrefillExpertDownPairwiseScalesEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_EXPERT_DOWN_PAIRWISE_SCALES"] != "0"
+
 /// The compact marker is legal only for GatherQMM's sorted RHS expert path,
 /// whose batching guard requires at least four routed rows per expert. Shorter
 /// prefills keep the original full scale plane so no generic kernel can ever
@@ -10282,7 +10286,10 @@ private func lagunaInterleavedSwiGLU(
 /// expert-aligned path the backend also applies the same rounded-BF16 SiLU
 /// product and packs the 512-wide activation into the first half of the
 /// nominal 1024-wide output allocation, avoiding that intermediate's device
-/// round trip. `down_proj`, sorting, and unsorting remain the stock calls.
+/// round trip. Sorting and unsorting remain the stock calls. The down
+/// projection also remains argument-for-argument stock unless the separately
+/// certified zero-copy down-scale marker is present, in which case the same
+/// `gatherQuantizedMM` call is issued directly with that marker.
 private func lagunaFusedSortedRoutedGateUp(
     _ x: MLXArray,
     indices: MLXArray,
@@ -10291,6 +10298,8 @@ private func lagunaFusedSortedRoutedGateUp(
     pairwiseScales: MLXArray?,
     split: Int,
     downProj: SwitchLinear,
+    downWeight: MLXArray?,
+    downPairwiseScales: MLXArray?,
     deferUnsort: Bool
 ) -> (output: MLXArray, inverseOrder: MLXArray?) {
     // SwitchGLU: `var x = MLX.expandedDimensions(x, axes: [-2, -3])`
@@ -10343,8 +10352,27 @@ private func lagunaFusedSortedRoutedGateUp(
     } else {
         activated = lagunaInterleavedSwiGLU(gateUp, split: split)
     }
-    // SwitchGLU: `x = downProj(activated, idx, sortedIndices: doSort)`
-    var result = downProj(activated, idx, sortedIndices: doSort)
+    // SwitchGLU: `x = downProj(activated, idx, sortedIndices: doSort)`.
+    // The direct form is argument-for-argument identical, but permits the M5
+    // backend to consume the certified zero-copy row-major down scale marker.
+    // If either retained array is absent, keep the exact stock module call.
+    var result: MLXArray
+    if let downWeight, let downPairwiseScales {
+        result = MLX.gatherQuantizedMM(
+            activated,
+            downWeight,
+            scales: downPairwiseScales,
+            biases: nil,
+            rhsIndices: idx,
+            transpose: true,
+            groupSize: 16,
+            bits: 4,
+            mode: .nvfp4,
+            sortedIndices: doSort
+        )
+    } else {
+        result = downProj(activated, idx, sortedIndices: doSort)
+    }
     // SwitchGLU: `if doSort { x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape) }`
     if doSort && !deferUnsort {
         result = scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape)
@@ -10385,6 +10413,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     /// the halved plane would not be bitwise lossless, in which case the
     /// down projection falls back to the stock module.
     var _routedDownScales: MLXArray?
+    /// Shape-preserving marker view over `_routedDownScales` for the M5
+    /// expert-aligned prefill down projection. It owns no storage.
+    var _routedDownPairwiseScales: MLXArray?
     /// `DARKBLOOM_PACKED_SCALES` walk-order scale-interleaved copy of the
     /// fused routed gate/up scales, group-32 halved and prefixed with the
     /// patch header; see `lagunaRoutedSwiGLUQMVPackedKernel` for the layout
@@ -10484,6 +10515,13 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         {
             _routedDownScales = halvedDown
             prepared.append(halvedDown)
+            if lagunaPrefillExpertDownPairwiseScalesEnabled,
+                lagunaExpertAlignedGatherEnabled,
+                let pairwiseDown = lagunaPackedPrefillDownScaleView(halvedDown)
+            {
+                _routedDownPairwiseScales = pairwiseDown
+                prepared.append(pairwiseDown)
+            }
         }
         prepared.append(
             contentsOf: preparePackedRoutedGateUpBank(
@@ -10716,10 +10754,18 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 let pairwiseScales =
                     lagunaPrefillExpertPairwiseScalesAdmitted(routedRows: inds.size)
                     ? _fusedRoutedGateUpPairwiseScales : nil
+                let pairwiseDownScales =
+                    lagunaPrefillExpertPairwiseScalesAdmitted(routedRows: inds.size)
+                    ? _routedDownPairwiseScales : nil
                 if lagunaPrefillExpertPairwiseScalesEnabled {
                     lagunaPackedScalesLog.note(
                         pairwiseScales == nil ? "inactive" : "active",
                         "packed routed gate/up prefill scale view consumed")
+                }
+                if lagunaPrefillExpertDownPairwiseScalesEnabled {
+                    lagunaPackedScalesLog.note(
+                        pairwiseDownScales == nil ? "inactive" : "active",
+                        "packed routed down prefill scale view consumed")
                 }
                 let routed = lagunaFusedSortedRoutedGateUp(
                     x,
@@ -10729,6 +10775,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     pairwiseScales: pairwiseScales,
                     split: _fusedRoutedGateUpSplit,
                     downProj: downProj,
+                    downWeight: _routedDownWeight,
+                    downPairwiseScales: pairwiseDownScales,
                     deferUnsort:
                         lagunaPrefillSortedMoETailEnabled
                         && lagunaPrefillMoETailEnabled
