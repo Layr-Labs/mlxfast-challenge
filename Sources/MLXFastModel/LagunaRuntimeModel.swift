@@ -11725,6 +11725,27 @@ private let lagunaInjectDecodeSweeps = lagunaInjectEnvInt(
 /// never a Metal function constant.
 private let lagunaInjectSweepPasses = max(
     1, lagunaInjectEnvInt("DARKBLOOM_INJECT_SWEEP_PASSES", 1))
+/// DRAM sweep dispatches injected per multi-token prefill forward. The decode
+/// twin above measured the ranked M5 streaming rate at 558.6 GB/s (receipt
+/// `13977b9e` differenced against the inert frontier), but that rate was taken
+/// inside the DECODE window and says nothing about the prefill window, which
+/// is where the remaining slack sits. This knob is the missing prefill byte
+/// axis: same kernel, same 256 MiB cache-defeating pool, same sentinel-gated
+/// sink, so `S_B - S_A` prices prefill bytes directly.
+///
+/// ARMED AT 8 FOR ONE OFFICIAL DIFFERENCING RECEIPT. The frontier is point A
+/// with every knob at 0, so a single receipt yields the constant:
+///
+///   dBytes = 8 x 256 MiB x 1 pass = 2.1475 GB per 512-token forward
+///   S      = 512000 * prefill_seconds_per_token   (ms)
+///   GB/s   = 2.1475 / ((S_B - S_A) / 1000)
+///
+/// At ~558 GB/s that is ~3.84 ms on a 96.6 ms window, about 13 sigma of the
+/// 0.31% candidate-side Cp repeatability measured on the byte-identical
+/// reroll. Decode knobs stay 0 so `T` moves only through the `4*Cp` coupling.
+/// This arm deliberately SLOWS the tree and is expected to be rejected.
+private let lagunaInjectPrefillSweeps = lagunaInjectEnvInt(
+    "DARKBLOOM_INJECT_PREFILL_SWEEPS", 8)
 /// 512x8192 @ 8192x2048 bf16 matmuls injected per multi-token forward.
 private let lagunaInjectPrefillMatmuls = lagunaInjectEnvInt(
     "DARKBLOOM_INJECT_PREFILL_MATMULS", 0)
@@ -11861,13 +11882,14 @@ private func lagunaInjectShare(_ total: Int, layer: Int) -> Int {
 }
 
 private let lagunaInjectActive =
-    lagunaInjectDecodeSweeps + lagunaInjectPrefillMatmuls + lagunaInjectDecodeEmpty
-    + lagunaInjectPrefillEmpty > 0
+    lagunaInjectDecodeSweeps + lagunaInjectPrefillSweeps + lagunaInjectPrefillMatmuls
+    + lagunaInjectDecodeEmpty + lagunaInjectPrefillEmpty > 0
 
 func lagunaInjectLayerWork(layer: Int, isSingleTokenDecode: Bool) {
     guard lagunaInjectActive else { return }
     let sweeps = lagunaInjectShare(
-        isSingleTokenDecode ? lagunaInjectDecodeSweeps : 0, layer: layer)
+        isSingleTokenDecode ? lagunaInjectDecodeSweeps : lagunaInjectPrefillSweeps,
+        layer: layer)
     let matmuls = lagunaInjectShare(
         isSingleTokenDecode ? 0 : lagunaInjectPrefillMatmuls, layer: layer)
     let emptyTotal = isSingleTokenDecode ? lagunaInjectDecodeEmpty : lagunaInjectPrefillEmpty
