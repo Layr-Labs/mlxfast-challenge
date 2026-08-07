@@ -1362,6 +1362,29 @@ bool darkbloom_expert_stage_wideld() {
   return v;
 }
 
+// DARKBLOOM_EXPERT_BK128 (default OFF; "1" enables): doubles the
+// expert-aligned gather QMM's k-block for the down projection only
+// (K 512, N 2048), halving its k-loop trip count from 8 to 4 and with it the
+// per-threadgroup barrier count, at the cost of 17408B rather than 9216B of
+// staged weights. Bit-identical: BK only changes how many 32-wide k-chunks
+// one iteration stages, and every chunk still reaches the same accumulator in
+// the same globally ascending k order. Baked into the kernel name and
+// template, so each setting compiles exactly one pipeline for the process
+// lifetime.
+//
+// Left OFF because the mechanism is unmeasurable on any host we have: MLX
+// only selects the _nax kernels on GPU generation >= 17, so no local
+// benchmark exercises this code, and the modelled effect (~0.1-0.3% prefill,
+// ~0.03-0.08% score) is an order of magnitude under the +/-0.73% local MDE.
+// It is also mutually exclusive with double-buffering the weight tile:
+// 2 * 17408B = 34816B exceeds the 32768B threadgroup limit, whereas
+// 2 * 9216B = 18432B fits, so BK=64 remains the only variant that can stage
+// and multiply concurrently.
+bool darkbloom_expert_bk128() {
+  static const bool v = env::get_var("DARKBLOOM_EXPERT_BK128", "") == "1";
+  return v;
+}
+
 // DARKBLOOM_EXPERT_GATHER_GROUPS (default 128; "64" restores the promoted
 // four-experts-per-threadgroup schedule and "256" selects one expert per
 // threadgroup, both kept as A/B controls): how many threadgroups the
@@ -1590,27 +1613,41 @@ bool darkbloom_bsearch_hoist() {
   return v;
 }
 
-// Exact storage markers installed only by Laguna's certified zero-copy expert
-// scale views. Layout 1 is the fused gate/up walk-order bank; layout 2 is the
-// row-major routed down bank. Keep this classifier at the outer GatherQMM
-// boundary as well as the NAX dispatcher: normalizing either zero-stride view
-// would expand each row by repeating its first compact byte and destroy the
-// representation before the specialized loader can see it.
-int laguna_expert_pairwise_scale_layout(const array& scales) {
-  if (scales.dtype() != uint8 || scales.ndim() != 3 ||
-      scales.offset() != 0 || scales.shape(0) != 256 ||
-      scales.strides()[2] != 0) {
+// Regime discriminator for the routed prefill gather GEMM. Selects a
+// bit-exact work-injection arm compiled into the kernel as a non-type
+// template parameter, so each arm is a distinct pipeline built once per
+// process (never a mid-process function-constant flip). 0 is the shipped
+// kernel and leaves both the template argument list and the kernel name
+// byte-identical to the promoted frontier.
+//   m2 -> 1  double the MMA chain, no extra memory traffic
+//   s2 -> 2  double the weight load+dequant staging (+1 barrier)
+//   b2 -> 3  two extra threadgroup barriers per k-iteration
+//   s3 -> 4  s2's staging work restaged from this expert's own tile, so the
+//            extra reads hit cache instead of DRAM; s3 - s2 is the byte term
+// The official runner strips the environment (benchmark.sh's timed path runs
+// under `sudo env_reset` + `env -i`), so for a ranked measurement arm the
+// compiled-in default IS the arm. Each official receipt flips this one token
+// and nothing else; "" is the shipped kernel and is what stays committed.
+constexpr const char* kNaxGatherProbeDefault = "s3";
+
+int darkbloom_nax_gather_probe() {
+  static const int v = [] {
+    auto s = env::get_var("DARKBLOOM_NAX_GATHER_PROBE", kNaxGatherProbeDefault);
+    if (s == "m2") {
+      return 1;
+    }
+    if (s == "s2") {
+      return 2;
+    }
+    if (s == "b2") {
+      return 3;
+    }
+    if (s == "s3") {
+      return 4;
+    }
     return 0;
-  }
-  if (scales.shape(1) == 1024 && scales.shape(2) == 128 &&
-      scales.strides()[0] == 1024 * 64 && scales.strides()[1] == 64) {
-    return 1;
-  }
-  if (scales.shape(1) == 2048 && scales.shape(2) == 32 &&
-      scales.strides()[0] == 2048 * 16 && scales.strides()[1] == 16) {
-    return 2;
-  }
-  return 0;
+  }();
+  return v;
 }
 
 void gather_qmm_rhs_nax(
@@ -1652,17 +1689,7 @@ void gather_qmm_rhs_nax(
   // Normalize the input arrays
   array x = broadcast_with_indices(x_);
   array w = ensure_row_contiguous(w_, d, s);
-  // Laguna's certified packed decode scale bank is exposed to this prefill
-  // primitive through a bounded shape-preserving view. Its exact expert shape,
-  // zero last-axis stride, and layout-specific 64-byte or 16-byte compact-row
-  // strides form a fail-closed marker; the kernel consumes the inherited
-  // packed bytes directly. Every ordinary scale array retains the stock
-  // normalization path.
-  const int pairwise_scale_layout =
-      laguna_expert_pairwise_scale_layout(scales_);
-  array scales = pairwise_scale_layout != 0
-      ? scales_
-      : ensure_row_contiguous(scales_, d, s);
+  array scales = ensure_row_contiguous(scales_, d, s);
 
   // TODO: Tune the block sizes
   int bm = 64, bn = 64, bk = 64;
@@ -1677,11 +1704,23 @@ void gather_qmm_rhs_nax(
     default: break;                          // upstream: bm=64, wm=2, wn=2
   }
 
+  const bool laguna_moe_shape =
+      (K == 2048 && N == 1024) || (K == 512 && N == 2048);
+  // bk is shared with every non-Laguna shape reaching this dispatch, so the
+  // doubled k-block is applied only under the full expert-aligned predicate
+  // for the down projection. align_K below then re-checks 512 % 128.
+  // down-only is the assigned scope, not a structural limit: BK is orthogonal
+  // to BN, so gate_up (K 2048 % 128 == 0) admits the same change with
+  // kSwigluRegLocal's BN == 64 intact, and carries 2x the tile-iterations.
+  if (darkbloom_expert_bk128() && darkbloom_expert_aligned_gather() &&
+      mode != "affine" && transpose && group_size == 16 && bits == 4 &&
+      K == 512 && N == 2048 && M >= 64 && bm == 64 && wm == 4 && wn == 1) {
+    bk = 128;
+  }
+
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
-  const bool laguna_moe_shape =
-      (K == 2048 && N == 1024) || (K == 512 && N == 2048);
   // wn == 1 admitted 2026-07-31 (GatherX): DARKBLOOM_STAGE_BM128=5's
   // BM64/WM4/WN1 tiling (128 thr/TG, SN=64/TN=4) previously fell off the
   // expert path here and silently measured the NON-expert kernel. On the
@@ -1693,17 +1732,16 @@ void gather_qmm_rhs_nax(
       darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
       group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
       align_N && align_K && bm == 64 && wm == 4 && (wn == 2 || wn == 1);
-  const bool pairwise_shape =
-      (pairwise_scale_layout == 1 && K == 2048 && N == 1024) ||
-      (pairwise_scale_layout == 2 && K == 512 && N == 2048);
-  const int expert_pairwise_scale_layout =
-      pairwise_scale_layout != 0 && expert_aligned && mode == "nvfp4" &&
-              pairwise_shape && scales_.shape(-1) == K / group_size
-          ? pairwise_scale_layout
-          : 0;
-  if (pairwise_scale_layout != 0 && expert_pairwise_scale_layout == 0) {
+  // Positive kernel-selection assert. Falling off expert_aligned dispatches
+  // the non-expert kernel silently, so a bk that only the expert kernel was
+  // reasoned about would be measured on code nobody analysed. bk != 64 is
+  // reachable only from the gate above, whose predicate is a strict superset
+  // of expert_aligned's; this turns that argument into an enforced invariant
+  // rather than a comment that a later edit can invalidate.
+  if (bk != 64 && !expert_aligned) {
     throw std::runtime_error(
-        "[gather_qmm] Laguna pairwise scale marker reached a non-expert path");
+        "[gather_qmm_rhs_nax] widened k-block escaped the expert-aligned "
+        "path; it would silently dispatch the non-expert kernel");
   }
   std::string type_string = get_type_string(x.dtype());
   static const bool static_laguna_shapes =
@@ -1724,6 +1762,31 @@ void gather_qmm_rhs_nax(
   const bool expert_wideld = expert_aligned &&
       darkbloom_expert_stage_wideld() &&
       darkbloom_stage_wide_load_ok(w, transpose, bits, N, K, bn);
+  // Only the expert-aligned kernel carries the probe template parameter; the
+  // shared non-expert builder keeps its stock signature.
+  const int probe_requested = darkbloom_nax_gather_probe();
+  // Interlock, not a safety net: a requested probe that quietly degraded to 0
+  // would inject nothing and still publish a healthy receipt, which reads as a
+  // true null rather than as an instrument that never armed. Failing loudly
+  // makes "the receipt carries timings at all" sufficient evidence that the
+  // probe landed, since the kernel builder throws rather than substituting a
+  // non-probe kernel. Probe 0 -- the shipped default -- never reaches this.
+  //
+  // Scoped to laguna_moe_shape because that -- and only that -- is the object
+  // under measurement. A Laguna-shaped call that falls off expert_aligned is
+  // the real confound and must abort. A non-Laguna shape was never going to be
+  // probed, so aborting on it would trade a whole official receipt
+  // (officialMetrics = null, zero information, one of four) for no scientific
+  // protection. The unfused switchMLP fallback's gate/up is the only such
+  // shape reachable from the scored path (K 2048, N 512); if it ever ran, the
+  // lost gate/up fusion would move S far past the arm's pre-registered cap and
+  // be caught there rather than silently.
+  if (probe_requested != 0 && !expert_aligned && laguna_moe_shape) {
+    throw std::runtime_error(
+        "[gather_qmm_rhs_nax] gather probe requested off the expert-aligned "
+        "path; it would measure an unarmed control");
+  }
+  const int gather_probe = expert_aligned ? probe_requested : 0;
 
   // DARKBLOOM_STAGE2_GATHER ground truth at the DISPATCH site. The define
   // itself is injected at JIT assembly (jit_kernels.cpp, expert kernels
@@ -1815,9 +1878,38 @@ void gather_qmm_rhs_nax(
           : "",
       expert_aligned
           ? ("_eg_" + std::to_string(egroups) + (expert_widest ? "_ws_1" : "_ws_0") +
-             (expert_wideld ? "_wl_1" : "_wl_0") +
-             "_ps_" + std::to_string(expert_pairwise_scale_layout))
-          : "");
+             (expert_wideld ? "_wl_1" : "_wl_0"))
+          : "",
+      // The JIT library cache is keyed on the kernel name alone, so a probe
+      // arm MUST change it. Suffix omitted at probe 0 to keep the shipped
+      // name byte-identical.
+      gather_probe ? ("_pb_" + std::to_string(gather_probe)) : "");
+
+  // Probe ground truth at the DISPATCH site, same contract as the stage2 and
+  // xmajor lines above: "active" requires BOTH a requested probe and the
+  // expert-aligned path, and the printed kname is the one actually handed to
+  // the JIT (whose library cache is keyed on that name alone). Gating on the
+  // REQUESTED probe rather than the applied one is deliberate: an arm whose
+  // expert path declined then prints "inactive" instead of printing nothing,
+  // so a receipt can never silently measure its own control.
+  if (probe_requested != 0 ||
+      env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1") {
+    static std::once_flag probe_once;
+    std::call_once(probe_once, [&]() {
+      fprintf(
+          stderr,
+          "mlxfast: fusion %s: nax_gather_probe=%d req=%d (dispatch expert=%d "
+          "N=%d K=%d M=%d kname=%s)\n",
+          gather_probe ? "active" : "inactive",
+          gather_probe,
+          probe_requested,
+          int(expert_aligned),
+          N,
+          K,
+          M,
+          kname.c_str());
+    });
+  }
 
   // Skipping dead runs is a pure work elision (see function constant 203 in
   // fp_quantized_nax): it drops only matmuls whose results store_slice never
@@ -1937,7 +2029,7 @@ void gather_qmm_rhs_nax(
         egroups,
         expert_widest,
         expert_wideld,
-        expert_pairwise_scale_layout);
+        gather_probe);
     kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
   } else {
     kernel = get_gather_qmm_nax_kernel(
@@ -2236,13 +2328,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   array x = ensure_row_contiguous_matrix(inputs[0], d, s);
   array w = ensure_row_contiguous_matrix(inputs[1], d, s);
-  const int pairwise_scale_layout =
-      laguna_expert_pairwise_scale_layout(inputs[2]);
-  // Preserve the exact zero-copy marker for the dedicated NAX loader. Every
-  // ordinary array keeps the stock row-contiguous normalization.
-  array scales = pairwise_scale_layout != 0
-      ? inputs[2]
-      : ensure_row_contiguous_matrix(inputs[2], d, s);
+  array scales = ensure_row_contiguous_matrix(inputs[2], d, s);
   std::optional<array> biases = std::nullopt;
   if (inputs.size() == 6) {
     biases = ensure_row_contiguous_matrix(inputs[3], d, s);
@@ -2258,25 +2344,11 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
 
-  const bool sorted_rhs =
-      M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4;
-  const bool pairwise_contract =
-      sorted_rhs && metal::is_nax_available() && transpose_ &&
-      group_size_ == 16 && bits_ == 4 && mode == "nvfp4" &&
-      !biases.has_value() &&
-      ((pairwise_scale_layout == 1 && K == 2048 && N == 1024) ||
-       (pairwise_scale_layout == 2 && K == 512 && N == 2048));
-  if (pairwise_scale_layout != 0 && !pairwise_contract) {
-    throw std::runtime_error(
-        "[gather_qmm] Laguna pairwise scale marker reached an unsupported "
-        "outer dispatch");
-  }
-
   // We are walking x in order and w is also in order so we can batch up the
   // matmuls and reuse reading x and w.
   //
   // TODO: Tune 16 and 4 here a bit better.
-  if (sorted_rhs) {
+  if (M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4) {
     gather_qmm_rhs(
         x,
         w,
