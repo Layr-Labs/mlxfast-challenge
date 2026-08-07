@@ -227,6 +227,10 @@ let lagunaPrefillFusedRoutedGateUpEnabled =
 let lagunaPrefillExpertPairwiseScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_EXPERT_PAIRWISE_SCALES"] != "0"
 
+// Official paired-M5 replay nonce 20260807T0034Z; executable source unchanged.
+let lagunaPrefillExpertDownPairwiseScalesEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_EXPERT_DOWN_PAIRWISE_SCALES"] != "0"
+
 /// The compact marker is legal only for GatherQMM's sorted RHS expert path,
 /// whose batching guard requires at least four routed rows per expert. Shorter
 /// prefills keep the original full scale plane so no generic kernel can ever
@@ -7760,6 +7764,17 @@ private let lagunaRoutedSwiGLUQMVPackedTop8Kernel = MLXFast.metalKernel(
 let lagunaRoutedGateUpR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1"] != "0"
 
+/// `DARKBLOOM_ROUTED_SCALE_LANE_BROADCAST` (default ON; set "0" to
+/// ablate): the packed routed gate/up R1 bank stores one certified group-32
+/// scale byte for each XOR-neighbour lane pair. Let the even lane perform the
+/// original byte load and E4M3 conversion, then transfer the exact float bits
+/// to the odd lane. Expert-0's two first-pair patch bytes remain owned by the
+/// patched odd lane. The accepted parent kernel below is retained unchanged
+/// as the off-path.
+let lagunaRoutedScaleLaneBroadcastEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTED_SCALE_LANE_BROADCAST"] != "0"
+
 private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
     name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2",
     inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
@@ -7875,6 +7890,146 @@ if (lane == 0) {
     ensureRowContiguous: true
 )
 
+private let lagunaRoutedSwiGLUQMVPackedTop8R1ScaleLaneKernel =
+    MLXFast.metalKernel(
+        name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_scale_lane_bf16_v1",
+        inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
+        outputNames: ["activated"],
+        source: """
+constexpr uint input_width = 2048;
+constexpr uint output_width = 512;
+constexpr uint block_width = 512;
+constexpr uint values_per_lane = 16;
+constexpr uint routed_experts = 8;
+constexpr uint fused_row_bytes = 1024;
+constexpr uint fused_expert_bytes = 1024 * fused_row_bytes;
+constexpr uint scale_patch_bytes = \(lagunaScalePatchHeaderBytes);
+constexpr uint scale_row_bytes = 16;
+constexpr uint scale_sub_bytes = 8 * scale_row_bytes;
+constexpr uint scale_kblock_bytes = scale_sub_bytes;
+constexpr uint scale_tile_bytes = 4 * scale_kblock_bytes;
+constexpr uint packed_expert_bytes = 128 * scale_tile_bytes;
+
+uint group = threadgroup_position_in_grid.x;
+uint expert_slot = group % routed_experts;
+uint tile = group / routed_experts;
+uint simd_group = simdgroup_index_in_threadgroup;
+uint lane = thread_index_in_simdgroup;
+uint logical_row = tile * 2 + simd_group;
+\(lagunaRouterTop8PrecomputedPrelude)
+uint expert = top8_winner;
+
+const device uint8_t* expert_weight =
+    (const device uint8_t*)fused_weight + expert * fused_expert_bytes;
+const device uint8_t* row_scales =
+    packed_scales + scale_patch_bytes + expert * packed_expert_bytes
+    + (logical_row / 4) * scale_tile_bytes;
+uint sub = logical_row % 4;
+uint gate_row = (logical_row / 32) * 64 + logical_row % 32;
+uint up_row = gate_row + 32;
+
+thread float gate_result = 0.0f;
+thread float up_result = 0.0f;
+thread float input_values[values_per_lane];
+
+uint2 gate_codes;
+uint2 up_codes;
+float gate_scale;
+float up_scale;
+{
+    const device uint8_t* first_scales =
+        row_scales + sub * 2 * scale_row_bytes + (lane >> 1);
+    const bool patch_lane =
+        expert == 0 && logical_row == 0 && lane == 1;
+    const bool owns_scale = (lane & 1) == 0 || patch_lane;
+    const float gate_scale_local = owns_scale
+        ? laguna_nvfp4_scale(
+            patch_lane ? packed_scales[0] : first_scales[0])
+        : 0.0f;
+    const float up_scale_local = owns_scale
+        ? laguna_nvfp4_scale(
+            patch_lane ? packed_scales[1] : first_scales[scale_row_bytes])
+        : 0.0f;
+    const float gate_scale_peer =
+        simd_shuffle_xor(gate_scale_local, ushort(1));
+    const float up_scale_peer =
+        simd_shuffle_xor(up_scale_local, ushort(1));
+    gate_scale = owns_scale ? gate_scale_local : gate_scale_peer;
+    up_scale = owns_scale ? up_scale_local : up_scale_peer;
+    gate_codes = *(const device uint2*)(
+        expert_weight + gate_row * fused_row_bytes + lane * 8);
+    up_codes = *(const device uint2*)(
+        expert_weight + up_row * fused_row_bytes + lane * 8);
+}
+
+for (uint block = 0; block < input_width; block += block_width) {
+    const device vec<bfloat, 4>* input_vectors =
+        (const device vec<bfloat, 4>*) (
+            input + block + lane * values_per_lane);
+    for (uint i = 0; i < values_per_lane / 4; ++i) {
+        const vec<bfloat, 4> values = input_vectors[i];
+        input_values[4 * i] = values[0];
+        input_values[4 * i + 1] = values[1];
+        input_values[4 * i + 2] = values[2];
+        input_values[4 * i + 3] = values[3];
+    }
+
+    const uint2 cur_gate_codes = gate_codes;
+    const uint2 cur_up_codes = up_codes;
+    const float cur_gate_scale = gate_scale;
+    const float cur_up_scale = up_scale;
+    const uint next_block = block + block_width;
+    if (next_block < input_width) {
+        const device uint8_t* next_scales =
+            row_scales + (next_block / block_width) * scale_kblock_bytes
+            + sub * 2 * scale_row_bytes + (lane >> 1);
+        const bool owns_next_scale = (lane & 1) == 0;
+        const float next_gate_scale_local = owns_next_scale
+            ? laguna_nvfp4_scale(next_scales[0]) : 0.0f;
+        const float next_up_scale_local = owns_next_scale
+            ? laguna_nvfp4_scale(next_scales[scale_row_bytes]) : 0.0f;
+        const float next_gate_scale_peer =
+            simd_shuffle_xor(next_gate_scale_local, ushort(1));
+        const float next_up_scale_peer =
+            simd_shuffle_xor(next_up_scale_local, ushort(1));
+        gate_scale = owns_next_scale
+            ? next_gate_scale_local : next_gate_scale_peer;
+        up_scale = owns_next_scale
+            ? next_up_scale_local : next_up_scale_peer;
+        gate_codes = *(const device uint2*)(
+            expert_weight + gate_row * fused_row_bytes
+            + next_block / 2 + lane * 8);
+        up_codes = *(const device uint2*)(
+            expert_weight + up_row * fused_row_bytes
+            + next_block / 2 + lane * 8);
+    }
+
+    gate_result += laguna_nvfp4_qdot_codes_16(
+        cur_gate_codes, input_values, cur_gate_scale);
+    up_result += laguna_nvfp4_qdot_codes_16(
+        cur_up_codes, input_values, cur_up_scale);
+}
+
+gate_result = simd_sum(gate_result);
+up_result = simd_sum(up_result);
+if (lane == 0) {
+    bfloat gate = bfloat(gate_result\(lagunaNvfp4RowScaleSuffix));
+    bfloat up = bfloat(up_result\(lagunaNvfp4RowScaleSuffix));
+    bfloat exp_abs = metal::exp(metal::abs(gate));
+    bfloat denominator = bfloat(1) + exp_abs;
+    bfloat y = bfloat(1) / denominator;
+    bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+    bfloat silu = bfloat(gate * sigmoid);
+    activated[expert_slot * output_width + logical_row] =
+        bfloat(silu * up);
+}
+""",
+        header: lagunaSharedSwiGLUQMVHeader + "\n"
+            + lagunaDecodeRouterOrdinalHeader + "\n"
+            + lagunaRouterTop8PrologueHeader,
+        ensureRowContiguous: true
+    )
+
 func lagunaRoutedSwiGLUQMVPackedTop8(
     _ input: MLXArray,
     fusedWeight: MLXArray,
@@ -7890,7 +8045,10 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
     precondition(routerKeys.size == LagunaConstants.numExperts)
 
     if lagunaRoutedGateUpR1Enabled {
-        return lagunaRoutedSwiGLUQMVPackedTop8R1Kernel(
+        let kernel = lagunaRoutedScaleLaneBroadcastEnabled
+            ? lagunaRoutedSwiGLUQMVPackedTop8R1ScaleLaneKernel
+            : lagunaRoutedSwiGLUQMVPackedTop8R1Kernel
+        return kernel(
             [input, fusedWeight, packedScales, routerKeys],
             grid: (LagunaConstants.numExpertsPerTok * 256 * 64, 1, 1),
             threadGroup: (64, 1, 1),
@@ -10282,7 +10440,10 @@ private func lagunaInterleavedSwiGLU(
 /// expert-aligned path the backend also applies the same rounded-BF16 SiLU
 /// product and packs the 512-wide activation into the first half of the
 /// nominal 1024-wide output allocation, avoiding that intermediate's device
-/// round trip. `down_proj`, sorting, and unsorting remain the stock calls.
+/// round trip. Sorting and unsorting remain the stock calls. The down
+/// projection also remains argument-for-argument stock unless the separately
+/// certified zero-copy down-scale marker is present, in which case the same
+/// `gatherQuantizedMM` call is issued directly with that marker.
 private func lagunaFusedSortedRoutedGateUp(
     _ x: MLXArray,
     indices: MLXArray,
@@ -10291,6 +10452,8 @@ private func lagunaFusedSortedRoutedGateUp(
     pairwiseScales: MLXArray?,
     split: Int,
     downProj: SwitchLinear,
+    downWeight: MLXArray?,
+    downPairwiseScales: MLXArray?,
     deferUnsort: Bool
 ) -> (output: MLXArray, inverseOrder: MLXArray?) {
     // SwitchGLU: `var x = MLX.expandedDimensions(x, axes: [-2, -3])`
@@ -10343,8 +10506,27 @@ private func lagunaFusedSortedRoutedGateUp(
     } else {
         activated = lagunaInterleavedSwiGLU(gateUp, split: split)
     }
-    // SwitchGLU: `x = downProj(activated, idx, sortedIndices: doSort)`
-    var result = downProj(activated, idx, sortedIndices: doSort)
+    // SwitchGLU: `x = downProj(activated, idx, sortedIndices: doSort)`.
+    // The direct form is argument-for-argument identical, but permits the M5
+    // backend to consume the certified zero-copy row-major down scale marker.
+    // If either retained array is absent, keep the exact stock module call.
+    var result: MLXArray
+    if let downWeight, let downPairwiseScales {
+        result = MLX.gatherQuantizedMM(
+            activated,
+            downWeight,
+            scales: downPairwiseScales,
+            biases: nil,
+            rhsIndices: idx,
+            transpose: true,
+            groupSize: 16,
+            bits: 4,
+            mode: .nvfp4,
+            sortedIndices: doSort
+        )
+    } else {
+        result = downProj(activated, idx, sortedIndices: doSort)
+    }
     // SwitchGLU: `if doSort { x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape) }`
     if doSort && !deferUnsort {
         result = scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape)
@@ -10385,6 +10567,9 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     /// the halved plane would not be bitwise lossless, in which case the
     /// down projection falls back to the stock module.
     var _routedDownScales: MLXArray?
+    /// Shape-preserving marker view over `_routedDownScales` for the M5
+    /// expert-aligned prefill down projection. It owns no storage.
+    var _routedDownPairwiseScales: MLXArray?
     /// `DARKBLOOM_PACKED_SCALES` walk-order scale-interleaved copy of the
     /// fused routed gate/up scales, group-32 halved and prefixed with the
     /// patch header; see `lagunaRoutedSwiGLUQMVPackedKernel` for the layout
@@ -10484,6 +10669,13 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         {
             _routedDownScales = halvedDown
             prepared.append(halvedDown)
+            if lagunaPrefillExpertDownPairwiseScalesEnabled,
+                lagunaExpertAlignedGatherEnabled,
+                let pairwiseDown = lagunaPackedPrefillDownScaleView(halvedDown)
+            {
+                _routedDownPairwiseScales = pairwiseDown
+                prepared.append(pairwiseDown)
+            }
         }
         prepared.append(
             contentsOf: preparePackedRoutedGateUpBank(
@@ -10716,10 +10908,18 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 let pairwiseScales =
                     lagunaPrefillExpertPairwiseScalesAdmitted(routedRows: inds.size)
                     ? _fusedRoutedGateUpPairwiseScales : nil
+                let pairwiseDownScales =
+                    lagunaPrefillExpertPairwiseScalesAdmitted(routedRows: inds.size)
+                    ? _routedDownPairwiseScales : nil
                 if lagunaPrefillExpertPairwiseScalesEnabled {
                     lagunaPackedScalesLog.note(
                         pairwiseScales == nil ? "inactive" : "active",
                         "packed routed gate/up prefill scale view consumed")
+                }
+                if lagunaPrefillExpertDownPairwiseScalesEnabled {
+                    lagunaPackedScalesLog.note(
+                        pairwiseDownScales == nil ? "inactive" : "active",
+                        "packed routed down prefill scale view consumed")
                 }
                 let routed = lagunaFusedSortedRoutedGateUp(
                     x,
@@ -10729,6 +10929,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     pairwiseScales: pairwiseScales,
                     split: _fusedRoutedGateUpSplit,
                     downProj: downProj,
+                    downWeight: _routedDownWeight,
+                    downPairwiseScales: pairwiseDownScales,
                     deferUnsort:
                         lagunaPrefillSortedMoETailEnabled
                         && lagunaPrefillMoETailEnabled
