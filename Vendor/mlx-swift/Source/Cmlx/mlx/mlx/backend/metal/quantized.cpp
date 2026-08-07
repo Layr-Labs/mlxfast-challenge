@@ -1590,19 +1590,6 @@ bool darkbloom_bsearch_hoist() {
   return v;
 }
 
-// Exact storage marker installed only by Laguna's certified zero-copy
-// expert-scale view. Keep this predicate at the outer GatherQMM boundary as
-// well as the NAX dispatcher: normalizing a zero-stride marker would expand
-// each row by repeating its first compact byte and destroy the representation
-// before the specialized loader can see it.
-bool laguna_expert_pairwise_scale_marker(const array& scales) {
-  return scales.dtype() == uint8 && scales.ndim() == 3 &&
-      scales.offset() == 0 && scales.shape(0) == 256 &&
-      scales.shape(1) == 1024 && scales.shape(2) == 128 &&
-      scales.strides()[0] == 1024 * 64 &&
-      scales.strides()[1] == 64 && scales.strides()[2] == 0;
-}
-
 void gather_qmm_rhs_nax(
     const array& x_,
     const array& w_,
@@ -1642,16 +1629,7 @@ void gather_qmm_rhs_nax(
   // Normalize the input arrays
   array x = broadcast_with_indices(x_);
   array w = ensure_row_contiguous(w_, d, s);
-  // Laguna's certified packed decode scale bank is exposed to this prefill
-  // primitive through a bounded shape-preserving view. Its exact expert shape,
-  // zero last-axis stride, and 64-byte compact-row strides form a fail-closed
-  // marker; the kernel consumes the inherited packed bytes directly. Every
-  // ordinary scale array retains the stock normalization path.
-  const bool pairwise_scale_marker =
-      laguna_expert_pairwise_scale_marker(scales_);
-  array scales = pairwise_scale_marker
-      ? scales_
-      : ensure_row_contiguous(scales_, d, s);
+  array scales = ensure_row_contiguous(scales_, d, s);
 
   // TODO: Tune the block sizes
   int bm = 64, bn = 64, bk = 64;
@@ -1682,14 +1660,6 @@ void gather_qmm_rhs_nax(
       darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
       group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
       align_N && align_K && bm == 64 && wm == 4 && (wn == 2 || wn == 1);
-  const bool expert_pairwise_scales =
-      pairwise_scale_marker && expert_aligned && mode == "nvfp4" &&
-      K == 2048 && N == 1024 && scales_.ndim() == 3 &&
-      scales_.shape(-1) == K / group_size;
-  if (pairwise_scale_marker && !expert_pairwise_scales) {
-    throw std::runtime_error(
-        "[gather_qmm] Laguna pairwise scale marker reached a non-expert path");
-  }
   std::string type_string = get_type_string(x.dtype());
   static const bool static_laguna_shapes =
       env::get_var("DARKBLOOM_STATIC_NVFP4_SHAPES", "") != "0";
@@ -1800,8 +1770,7 @@ void gather_qmm_rhs_nax(
           : "",
       expert_aligned
           ? ("_eg_" + std::to_string(egroups) + (expert_widest ? "_ws_1" : "_ws_0") +
-             (expert_wideld ? "_wl_1" : "_wl_0") +
-             (expert_pairwise_scales ? "_ps_1" : "_ps_0"))
+             (expert_wideld ? "_wl_1" : "_wl_0"))
           : "");
 
   // Skipping dead runs is a pure work elision (see function constant 203 in
@@ -1921,8 +1890,7 @@ void gather_qmm_rhs_nax(
         "bfloat",
         egroups,
         expert_widest,
-        expert_wideld,
-        expert_pairwise_scales);
+        expert_wideld);
     kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
   } else {
     kernel = get_gather_qmm_nax_kernel(
@@ -2221,13 +2189,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   array x = ensure_row_contiguous_matrix(inputs[0], d, s);
   array w = ensure_row_contiguous_matrix(inputs[1], d, s);
-  const bool pairwise_scale_marker =
-      laguna_expert_pairwise_scale_marker(inputs[2]);
-  // Preserve the exact zero-copy marker for the dedicated NAX loader. Every
-  // ordinary array keeps the stock row-contiguous normalization.
-  array scales = pairwise_scale_marker
-      ? inputs[2]
-      : ensure_row_contiguous_matrix(inputs[2], d, s);
+  array scales = ensure_row_contiguous_matrix(inputs[2], d, s);
   std::optional<array> biases = std::nullopt;
   if (inputs.size() == 6) {
     biases = ensure_row_contiguous_matrix(inputs[3], d, s);
@@ -2243,23 +2205,11 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
 
-  const bool sorted_rhs =
-      M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4;
-  const bool pairwise_contract =
-      sorted_rhs && metal::is_nax_available() && transpose_ &&
-      group_size_ == 16 && bits_ == 4 && mode == "nvfp4" &&
-      K == 2048 && N == 1024 && !biases.has_value();
-  if (pairwise_scale_marker && !pairwise_contract) {
-    throw std::runtime_error(
-        "[gather_qmm] Laguna pairwise scale marker reached an unsupported "
-        "outer dispatch");
-  }
-
   // We are walking x in order and w is also in order so we can batch up the
   // matmuls and reuse reading x and w.
   //
   // TODO: Tune 16 and 4 here a bit better.
-  if (sorted_rhs) {
+  if (M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4) {
     gather_qmm_rhs(
         x,
         w,

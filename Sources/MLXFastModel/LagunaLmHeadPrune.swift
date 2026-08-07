@@ -95,6 +95,18 @@ let lagunaLmHeadFusedRefinementEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_LMHEAD_FUSED_REFINEMENT"] != "0"
 
+/// Same-binary A/B switch for the row-major screen geometry of the three-level
+/// exact dispatch: one row per lane for the base screen and the certified-below
+/// store, then a simdgroup-uniform loop over the balloted survivors that runs
+/// the residual refinement and the BF16 GEMV with the same 32-lane cooperative
+/// arithmetic as the fixed-four-row form. DEFAULT OFF after official receipt
+/// `99b71258` measured it +24.6 us/token on the ranked M5 despite -63.7 us on
+/// M4; set `DARKBLOOM_LMHEAD_ROWMAJOR_REFINE=1` to select it. Both arms emit
+/// bit-identical `assembled` rows.
+let lagunaLmHeadRowMajorRefineEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LMHEAD_ROWMAJOR_REFINE"] == "1"
+
 /// One-line stderr trace hooks (DARKBLOOM_TRACE_FUSION=1) so an active pruner
 /// is visible in run logs.
 private let lagunaTraceFusionEnabled =
@@ -808,6 +820,160 @@ private let lagunaLmHeadRefinedExactKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Row-major screen geometry for the same three-level exact dispatch.
+///
+/// The fixed-four-row form above provisions 32 lanes per four rows because the
+/// rare candidate needs a cooperative GEMV, and pays for that provisioning on
+/// every row: lane 0 alone reads the 16 B of `coarse` and 8 B of `delta` for
+/// its block, and four lanes alone store 8 B of `assembled`. Over the 100352
+/// rows that is 802816 threads to produce 100352 outputs, 25088 sixteen-byte
+/// gather loads where 3136 full-line loads would do, and one L2 line fetched by
+/// up to eight different simdgroups. The screen is 98% of the rows and none of
+/// it needs the provisioning.
+///
+/// Here the screen is one row per lane, so a simdgroup reads a whole 128 B
+/// `coarse` line, a whole 64 B `delta` run and stores a whole 64 B `assembled`
+/// run per instruction, and the dispatch is 100352 threads. The provisioning is
+/// then recovered exactly where it is needed: `simd_ballot` collects the
+/// survivors into a simdgroup-uniform mask and the whole simdgroup walks them
+/// one row at a time, running the identical per-lane group assignment,
+/// `simd_sum` residual reduction, `gemv_al` replica and `simd_shuffle_down`
+/// tree as the four-row form.
+///
+/// Bit-identity, term by term:
+///   * The base screen compares the same `coarse[r] + float(delta[r])` against
+///     the same `thr[0]`; only the lane that reads it changes.
+///   * The residual correction keeps `g = 2*lane + gg`, so every lane holds the
+///     same two group products and `simd_sum` reduces the same 32 values in the
+///     same order.
+///   * `c_refined`, the `0x1.005p-1f` scaling and the mask-and-bump round-UP to
+///     BF16 are copied unchanged, and read the same `thr[0]`.
+///   * The GEMV keeps `bn = lane*4`, the 16-iteration stride-128 walk, the
+///     `bfloat`-by-`float` accumulate order and the 16/8/4/2/1 shuffle tree.
+/// Each row is stored exactly once -- a survivor is skipped by the screen store
+/// and written only by the phase that resolves it -- so no two threads race for
+/// a slot and no store ordering is assumed.
+private let lagunaLmHeadRowMajorRefinedExactKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_fused_int5_sparse_refine_rowmajor_v1",
+    inputNames: [
+        "coarse", "delta", "thr", "lm_head", "x", "codes_bit", "scales",
+    ],
+    outputNames: ["assembled"],
+    source: """
+        constexpr uint VOCAB = 100352;
+        constexpr uint K = 2048;
+
+        uint tgid = threadgroup_position_in_grid.x;
+        uint sgid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        uint sg_base = tgid * 256 + sgid * 32;
+        uint r0 = sg_base + lane;
+        bool in_range = r0 < VOCAB;
+
+        float t = thr[0];
+        float c0 = in_range ? coarse[r0] : -INFINITY;
+        float d0 = in_range ? float(delta[r0]) : 0.0f;
+        bool base_live = in_range && (c0 + d0 >= t);
+
+        uint live_mask = uint((simd_vote::vote_t)simd_ballot(base_live));
+
+        if (in_range && !base_live) {
+            assembled[r0] = bfloat(c0);
+        }
+
+        while (live_mask != 0) {
+            uint l = ctz(live_mask);
+            live_mask &= live_mask - 1;
+            uint r = sg_base + l;
+            float c_r = simd_shuffle(c0, l);
+            float d_r = simd_shuffle(d0, l);
+
+            const device uint8_t* hirow = codes_bit + size_t(r) * 256;
+            const device uint8_t* srow = scales + size_t(r) * 64;
+            float correction = 0.0f;
+            for (uint gg = 0; gg < 2; ++gg) {
+                uint g = 2 * lane + gg;
+                float sd = laguna_e8m0_decode(srow[g]);
+                uint hb = ((const device uint*)(hirow + g * 4))[0];
+                const device ushort4* xrow =
+                    (const device ushort4*)(x + g * 32);
+                float cg = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint w = 0; w < 4; ++w) {
+                    uint hw = hb >> (8u * w);
+                    uint4 he = (uint4(hw) >> uint4(0u, 2u, 4u, 6u)) & 1u;
+                    uint4 ho = (uint4(hw) >> uint4(1u, 3u, 5u, 7u)) & 1u;
+                    float4 ve = float4(he) - 0.5f;
+                    float4 vo = float4(ho) - 0.5f;
+                    float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
+                    float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
+                    float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
+                    float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
+                    #pragma clang loop unroll(full)
+                    for (uint k = 0; k < 4; ++k) {
+                        cg += xe[k] * ve[k];
+                        cg += xo[k] * vo[k];
+                    }
+                }
+                correction += sd * cg;
+            }
+            correction = simd_sum(correction);
+
+            float c_refined = c_r + correction;
+            float d_up = d_r * 0x1.005p-1f;
+            uint dbits = as_type<uint>(d_up);
+            uint dtrunc = dbits & 0xFFFF0000u;
+            if (dtrunc != dbits) {
+                dtrunc += 0x00010000u;
+            }
+            float delta_up = float(as_type<bfloat>(ushort(dtrunc >> 16)));
+            if (c_refined + delta_up < t) {
+                if (lane == 0) {
+                    assembled[r] = bfloat(c_refined);
+                }
+                continue;
+            }
+
+            // --- stock gemv_al replica begin (gemv.h:151-289) ---
+            thread float result = 0.0f;
+            thread bfloat inter[4];
+            thread float v_coeff[4];
+            const device bfloat* mrow = lm_head + size_t(r) * K;
+            uint bn = lane * 4;
+            for (uint i = 0; i < 16; ++i) {
+                vec<bfloat, 4> xv =
+                    *((const device vec<bfloat, 4>*)(x + bn));
+                v_coeff[0] = float(xv.x);
+                v_coeff[1] = float(xv.y);
+                v_coeff[2] = float(xv.z);
+                v_coeff[3] = float(xv.w);
+                vec<bfloat, 4> mv =
+                    *((const device vec<bfloat, 4>*)(mrow + bn));
+                inter[0] = mv.x;
+                inter[1] = mv.y;
+                inter[2] = mv.z;
+                inter[3] = mv.w;
+                result += inter[0] * v_coeff[0];
+                result += inter[1] * v_coeff[1];
+                result += inter[2] * v_coeff[2];
+                result += inter[3] * v_coeff[3];
+                bn += 128;
+            }
+            #pragma unroll
+            for (ushort sn = 16; sn >= 1; sn >>= 1) {
+                result += simd_shuffle_down(result, sn);
+            }
+            // --- stock gemv_al replica end ---
+            if (lane == 0) {
+                assembled[r] = bfloat(result);
+            }
+        }
+        """,
+    header: lagunaLmHeadPruneHeader,
+    ensureRowContiguous: true
+)
+
 /// Init-time int5 coarse copy of lm_head plus the pruned final-row forward.
 /// Built once (untimed init) by
 /// `LagunaRuntimeModel.prepareFusedRuntimeWeights` when
@@ -970,13 +1136,29 @@ final class LagunaLmHeadPruner {
         )[0]
         let assembled =
             refine
-            ? lagunaLmHeadRefinedExactKernel(
-                [coarse, delta, thr, lmHeadWeight, x, int5CodesHi, int5Scales],
-                grid: (vocab / 32 * 256, 1, 1),
-                threadGroup: (256, 1, 1),
-                outputShapes: [[vocab]],
-                outputDTypes: [.bfloat16]
-            )[0]
+            ? (
+                lagunaLmHeadRowMajorRefineEnabled
+                    ? lagunaLmHeadRowMajorRefinedExactKernel(
+                        [
+                            coarse, delta, thr, lmHeadWeight, x, int5CodesHi,
+                            int5Scales,
+                        ],
+                        grid: (vocab, 1, 1),
+                        threadGroup: (256, 1, 1),
+                        outputShapes: [[vocab]],
+                        outputDTypes: [.bfloat16]
+                    )[0]
+                    : lagunaLmHeadRefinedExactKernel(
+                        [
+                            coarse, delta, thr, lmHeadWeight, x, int5CodesHi,
+                            int5Scales,
+                        ],
+                        grid: (vocab / 32 * 256, 1, 1),
+                        threadGroup: (256, 1, 1),
+                        outputShapes: [[vocab]],
+                        outputDTypes: [.bfloat16]
+                    )[0]
+            )
             : lagunaLmHeadInlineExactDeltaBF16Kernel(
                 [coarse, delta, thr, lmHeadWeight, x],
                 grid: (vocab / 32 * 256, 1, 1),

@@ -206,8 +206,7 @@ template <
     short reduction_dim,
     short tgp_size,
     short group_size,
-    short bits,
-    bool pairwise_scales = false>
+    short bits>
 struct QuantizedBlockLoader {
   MLX_MTL_CONST short pack_factor = get_pack_factor<8, bits>();
   MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack();
@@ -235,10 +234,6 @@ struct QuantizedBlockLoader {
   threadgroup T* dst;
   const device uint8_t* src;
   const device uint8_t* scales;
-  const device uint8_t* pairwise_patch_base;
-  const device uint8_t* pairwise_row_base;
-  int pairwise_patch_slot;
-  int logical_group;
 
   QuantizedBlockLoader(
       const device uint8_t* src_,
@@ -259,47 +254,7 @@ struct QuantizedBlockLoader {
         dst(dst_ + bi * dst_ld + bj * pack_factor),
         src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
             bj * bytes_per_pack),
-        scales(scales_ + bi * src_ld / group_size + group_id),
-        pairwise_patch_base(scales_),
-        pairwise_row_base(scales_),
-        pairwise_patch_slot(-1),
-        logical_group(group_id) {
-    static_assert(
-        !pairwise_scales || reduction_dim == 1,
-        "pairwise scales are only defined for reduction-dimension staging");
-  }
-
-
-  short row_in_tile() const { return bi; }
-
-  void set_pairwise_packed(
-      const device uint8_t* patch_base,
-      const device uint8_t* expert_base,
-      int row,
-      int patch_slot) {
-    // Inverse of preparePackedRoutedGateUpBank's walk-order permutation:
-    // 4 logical gate/up row pairs per tile, 4 K blocks, 8 subrows, 16 bytes.
-    const int within_block = row & 63;
-    const int logical_row = (row >> 6) * 32 + (within_block & 31);
-    const int tile = logical_row >> 2;
-    const int sub = ((logical_row & 3) << 1) + (within_block >> 5);
-    pairwise_patch_base = patch_base;
-    pairwise_row_base = expert_base + tile * 512 + sub * 16;
-    pairwise_patch_slot = patch_slot;
-  }
-
-  uint8_t scale_code(int step) const {
-    if constexpr (pairwise_scales) {
-      const int group = logical_group + step;
-      // Four 32-group K blocks are 128 bytes apart in the inherited packed
-      // bank. Each stores the 16 certified even bytes for this fused row.
-      return group == 1 && pairwise_patch_slot >= 0
-          ? pairwise_patch_base[pairwise_patch_slot]
-          : pairwise_row_base[(group >> 5) * 128 + ((group & 31) >> 1)];
-    } else {
-      return scales[step];
-    }
-  }
+        scales(scales_ + bi * src_ld / group_size + group_id) {}
 
   // The NVFP4 staging fast path applies when the packing is one byte per two
   // values, the scale is e4m3, and the byte run governed by ONE scale splits
@@ -316,7 +271,7 @@ struct QuantizedBlockLoader {
     if constexpr (fp4nv_fast) {
       int k = 0;
       for (int i = 0; i < n_steps_per_read; i++) {
-        const float scale = fp4nv_scale_x16384(scale_code(i));
+        const float scale = fp4nv_scale_x16384(scales[i]);
         for (int j = 0; j < n_reads_per_scale / 4; j++) {
           T vals[8];
           fp4nv_decode8<T>(fp4nv_pack4(src + k), scale, vals);
@@ -329,7 +284,7 @@ struct QuantizedBlockLoader {
     } else {
       int k = 0;
       for (int i = 0; i < n_steps_per_read; i++) {
-        T scale = dequantize_scale<T, group_size>(scale_code(i));
+        T scale = dequantize_scale<T, group_size>(scales[i]);
         for (int j = 0; j < n_reads_per_scale; j++) {
           dequantize<T, bits>(
               src[k * bytes_per_pack], scale, dst + k * pack_factor);
@@ -496,15 +451,14 @@ struct QuantizedBlockLoader {
       // is 4 for bfloat/half staging, 2 for float). Same values either way.
       if constexpr (fp4nv_fast && (kSrcBytesPerChunk % 4) == 0) {
         const float scale =
-            fp4nv_scale_x16384(scale_code(k0 / n_reads_per_scale));
+            fp4nv_scale_x16384(scales[k0 / n_reads_per_scale]);
         STEEL_PRAGMA_UNROLL
         for (short b = 0; b < kSrcBytesPerChunk / 4; b++) {
           fp4nv_decode8<T>(fp4nv_pack4(sb + k0 + b * 4), scale, &out.v[b * 8]);
         }
       } else {
         T scale =
-            dequantize_scale<T, group_size>(
-                scale_code(k0 / n_reads_per_scale));
+            dequantize_scale<T, group_size>(scales[k0 / n_reads_per_scale]);
         STEEL_PRAGMA_UNROLL
         for (short b = 0; b < kSrcBytesPerChunk; b++) {
           dequantize_pair(sb[k0 + b], scale, &out.v[b * pack_factor]);
@@ -548,11 +502,7 @@ struct QuantizedBlockLoader {
   void next() {
     src += tile_stride;
     if (reduction_dim == 1) {
-      if constexpr (pairwise_scales) {
-        logical_group += n_groups;
-      } else {
-        scales += n_groups;
-      }
+      scales += n_groups;
     } else {
       scales += n_groups * group_stride;
     }
@@ -664,10 +614,7 @@ METAL_FUNC void fp_qmm_t_impl(
   dispatch_bool(aligned_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
       for (int k = 0; k < kernel_K; k += BK) {
-        // Dead at k==0 for fixed_K>0: no prior-iteration Ws read to order.
-        if (fixed_K == 0 || k > 0) {
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
@@ -706,10 +653,8 @@ METAL_FUNC void fp_qmm_t_impl(
         loader_w.next();
       }
 
-      // Dead for fixed_K>0: no next iteration, epilogue never touches Ws.
-      if (fixed_K == 0) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-      }
+      // Store results to device memory
+      threadgroup_barrier(mem_flags::mem_threadgroup);
 
       if constexpr (kAlignedM.value && kAlignedN.value) {
         Dtile.store(y + tm * kernel_N + tn, kernel_N);
@@ -1619,8 +1564,7 @@ template <
     typename Wtype = bfloat,
     int tg_expert_groups = 64,
     bool wide_store = false,
-    bool wide_load = false,
-    bool pairwise_scales = false>
+    bool wide_load = false>
 [[kernel]] void fp_gather_qmm_rhs_expert_nax(
     const device T* x,
     const device uint32_t* w,
@@ -1661,8 +1605,7 @@ template <
       true,
       WM * WN * SIMD_SIZE,
       group_size,
-      bits,
-      pairwise_scales>;
+      bits>;
 
   constexpr int kWsElems = BN * BK_padded;
   constexpr int kWsPerChunk = 16 / sizeof(Wtype);
@@ -1685,10 +1628,8 @@ template <
   const int y_col = tid.x * BN;
 
   auto wl = (const device uint8_t*)w + size_t(y_col) * K_w;
-  const device uint8_t* scale_base = scales;
-  if constexpr (!pairwise_scales) {
-    scale_base += size_t(y_col) * K_g;
-  }
+  const device uint8_t* scale_base =
+      scales + size_t(y_col) * K_g;
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
@@ -1764,26 +1705,13 @@ template <
 
       const device T* xn =
           x + size_t(chunk_start + tm) * kernel_K;
-      const device uint8_t* loader_scales = pairwise_scales
-          ? scales
-          : scale_base + size_t(expert) * stride_s;
       thread loader_w_t loader_w(
           wl + size_t(expert) * stride_w,
-          loader_scales,
+          scale_base + size_t(expert) * stride_s,
           kernel_K,
           Ws,
           simd_group_id,
           simd_lane_id);
-      if constexpr (pairwise_scales) {
-        const int scale_row = y_col + int(loader_w.row_in_tile());
-        const int patch_slot = expert == 0 && scale_row == 0
-            ? 0
-            : (expert == 0 && scale_row == 32 ? 1 : -1);
-        const device uint8_t* packed_expert = scales + 128
-            + size_t(expert) * (size_t(kernel_N) * K_g / 2);
-        loader_w.set_pairwise_packed(
-            scales, packed_expert, scale_row, patch_slot);
-      }
 
       for (int k = 0; k < K_it; ++k) {
         // Bit-exact A-operand hoist (the XMAJOR arm's shipped pattern at
