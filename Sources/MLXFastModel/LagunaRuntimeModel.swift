@@ -11719,8 +11719,19 @@ private func lagunaInjectEnvInt(_ key: String, _ fallback: Int) -> Int {
 /// instrument is fully inert in the committed tree. A configuration is selected
 /// by environment variable for local differencing, or by an explicit source
 /// edit for an authorised official receipt.
+// ARMED FOR ONE OFFICIAL DIFFERENCING RECEIPT (point B). The committed
+// frontier 2054d45b is point A with every knob at 0, so a single receipt at
+// one sweep yields the ranked M5 DRAM streaming rate directly:
+//
+//   dBytes = 1 dispatch x 256 MiB x 1 pass = 0.26844 GB per steady decode step
+//   T      = 1000 * decode_seconds_per_token - S/128    (ms)
+//   GB/s   = 0.26844 / (T_B - T_A) / 1000
+//
+// Prefill knobs stay 0 so Cp is unchanged and dCd == dT exactly. This arm
+// deliberately SLOWS the tree and is expected to score low and be rejected;
+// it is a measurement, not a ranking attempt. Restore to 0 afterwards.
 private let lagunaInjectDecodeSweeps = lagunaInjectEnvInt(
-    "DARKBLOOM_INJECT_DECODE_SWEEPS", 0)
+    "DARKBLOOM_INJECT_DECODE_SWEEPS", 1)
 /// Passes over the 256 MiB pool per sweep dispatch. Buffer-passed uniform,
 /// never a Metal function constant.
 private let lagunaInjectSweepPasses = max(
