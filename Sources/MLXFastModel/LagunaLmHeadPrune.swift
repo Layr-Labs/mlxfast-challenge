@@ -9,7 +9,7 @@ import MLXFast
 // final hidden row at the DRAM wall. This module, gated by
 // DARKBLOOM_LM_HEAD_PRUNE (DEFAULT ON; set "0" to restore the byte-identical
 // stock pass), replaces it for both prefill's already-sliced last hidden row
-// and single-token decode with four dispatches:
+// and single-token decode with three dispatches:
 //
 //   1. COARSE (`lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel`): one fused
 //      GEMV over an init-time planar int5 copy of lm_head (1344 B/row) that
@@ -30,15 +30,13 @@ import MLXFast
 //      it only grows the candidate set. `coarse` stays FP32: it would have to
 //      round DOWN for the threshold path and UP for the candidate test, which
 //      one buffer cannot do.
-//   2. ARGMAX stage one (`lagunaLmHeadCoarseArgmaxStage1Kernel`): the stock
-//      two-pass reduction layout carrying (value, index) pairs over `coarse`
-//      alone, so `delta` is not read here.
-//   3. THRESHOLD (`lagunaLmHeadExactWinnerBF16PredecessorThresholdKernel`):
-//      finishes the argmax, runs the stock single-row GEMV for the winning row
-//      r, and thresholds just below bfloat(e_r) instead of below the coarse
-//      lower bound L. Sound for ANY r because e_r <= e_winner, which removes
-//      the winner's own quantization delta from the threshold.
-//   4. EXACT (`lagunaLmHeadInlineExactDeltaBF16Kernel`): each simdgroup owns a
+//   2. ARGMAX+THRESHOLD: the coarse kernel's device-atomic argmax writes the
+//      winner index via `atomic_fetch_max` on sign-flipped float bits. The
+//      threshold kernel reads the winner index, runs the stock single-row GEMV
+//      for winning row r, and thresholds just below bfloat(e_r) instead of
+//      below the coarse lower bound L. Sound for ANY r because e_r <= e_winner,
+//      which removes the winner's own quantization delta from the threshold.
+//   3. EXACT (`lagunaLmHeadInlineExactDeltaBF16Kernel`): each simdgroup owns a
 //      FIXED block of four output rows and runs a full BF16 GEMV over that
 //      block only when `coarse[r] + float(delta[r]) >= threshold` for one of
 //      its rows, writing `bfloat(coarse[r])` otherwise. The per-row arithmetic
@@ -61,8 +59,9 @@ import MLXFast
 // the 100352-row vocabulary. The dropped 256 B/row residual bit plane is then
 // re-read INSIDE the exact dispatch, for surviving four-row blocks only, to
 // restore the exact int5 value and the tighter half-cell bound before the BF16
-// GEMV decision. Dispatch count, grid and threadgroup geometry are unchanged;
-// prefill's already-sliced row keeps the one-pass form above.
+// GEMV decision. The argmax is fused into the coarse kernel via a device
+// atomic, reducing the dispatch count from four to three; prefill's
+// already-sliced row keeps the one-pass form above.
 //
 // The e8m0 decoder in the kernel header below is a bit-exact replica of the
 // vendored fp8.h semantics (no libm: exponent-bit construction).
@@ -103,6 +102,8 @@ private let lagunaTraceFusionEnabled =
 /// Kernel header: the bit-exact e8m0 group-scale decoder, inlinable and
 /// libm-free.
 private let lagunaLmHeadPruneHeader = """
+    #include <metal_atomic>
+
     // e8m0 decode, identical to fp8.h:70-77 (bits<<7 as bf16; bits==0 ->
     // 0x40 as bf16 = 2^-127). Exponent-bit construction, exact.
     static inline float laguna_e8m0_decode(uint8_t b) {
@@ -110,6 +111,13 @@ private let lagunaLmHeadPruneHeader = """
             return as_type<float>(0x00400000u);  // 2^-127
         }
         return as_type<float>(uint(b) << 23);
+    }
+
+    // Flip the sign bit so that unsigned uint comparison matches float
+    // ordering (including -0.0 < +0.0). Used by the device-atomic argmax
+    // fused into the coarse kernel.
+    static inline uint laguna_flip_float(float v) {
+        return as_type<uint>(v) ^ 0x80000000u;
     }
     """
 
@@ -155,13 +163,16 @@ private let lagunaLmHeadPruneHeader = """
 private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKernel(
     name: "laguna_lmhead_int5_inline_coarse_ratio_bound_delta_bf16_v6",
     inputNames: ["x", "codes_lo", "codes_hi", "scales"],
-    outputNames: ["coarse", "delta"],
+    outputNames: ["coarse", "delta", "winner_val", "winner_idx"],
     source: """
         constexpr float GAMMA = 0x1p-15f;
 
         uint row = threadgroup_position_in_grid.x * 16 +
             simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
+        uint sgid = simdgroup_index_in_threadgroup;
+        threadgroup float sg_vals[16];
+        threadgroup uint sg_idxs[16];
 
         const device uint8_t* lorow = codes_lo + size_t(row) * 1024;
         const device uint8_t* hirow = codes_hi + size_t(row) * 256;
@@ -179,21 +190,14 @@ private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKerne
             float ag = 0.0f;
             #pragma clang loop unroll(full)
             for (uint w = 0; w < 4; ++w) {
-                // Word w: elements 8w..8w+7 of the group. Nibble plane byte
-                // b holds elements 2b (low) / 2b+1 (high); 1-bit plane bit j
-                // of the group's word holds element j's residual bit.
                 uint lw = lo4[w];
                 uint hw = hb >> (8u * w);
                 uint4 ne = (uint4(lw) >> uint4(0u, 8u, 16u, 24u)) & 15u;
                 uint4 no = (uint4(lw) >> uint4(4u, 12u, 20u, 28u)) & 15u;
                 uint4 he = (uint4(hw) >> uint4(0u, 2u, 4u, 6u)) & 1u;
                 uint4 ho = (uint4(hw) >> uint4(1u, 3u, 5u, 7u)) & 1u;
-                // The nibble stores floor(q/2)+8 and the bit plane stores
-                // q-2*floor(q/2), so joining them rebuilds u = q + 16 in
-                // [1, 31]; offset-binary decode is exact.
                 float4 ve = float4((ne << 1u) | he) - 16.0f;
                 float4 vo = float4((no << 1u) | ho) - 16.0f;
-                // bf16 -> f32 is exactly bits<<16 for every value class.
                 float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
                 float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
                 float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
@@ -215,7 +219,6 @@ private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKerne
         d_acc = simd_sum(d_acc);
         if (lane == 0) {
             coarse[row] = c_acc;
-            // FP32 bound, then rounded UP to BF16 (mask-and-bump, sign clear).
             float d_up = d_acc * (1.0f + 61.0f * GAMMA);
             uint dbits = as_type<uint>(d_up);
             uint dtrunc = dbits & 0xFFFF0000u;
@@ -223,6 +226,30 @@ private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKerne
                 dtrunc += 0x00010000u;
             }
             delta[row] = as_type<bfloat>(ushort(dtrunc >> 16));
+            sg_vals[sgid] = c_acc;
+            sg_idxs[sgid] = row;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgid == 0 && lane == 0) {
+            float best = sg_vals[0];
+            uint best_idx = sg_idxs[0];
+            #pragma unroll
+            for (uint i = 1; i < 16; ++i) {
+                if (sg_vals[i] > best ||
+                    (sg_vals[i] == best && sg_idxs[i] < best_idx)) {
+                    best = sg_vals[i];
+                    best_idx = sg_idxs[i];
+                }
+            }
+            uint flipped = laguna_flip_float(best);
+            uint old = atomic_fetch_max_explicit(
+                (device atomic_uint*)winner_val, flipped,
+                memory_order_relaxed);
+            if (flipped > old) {
+                atomic_store_explicit(
+                    (device atomic_uint*)winner_idx, best_idx,
+                    memory_order_relaxed);
+            }
         }
         """,
     header: lagunaLmHeadPruneHeader,
@@ -253,13 +280,16 @@ private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKerne
 private let lagunaLmHeadInt5BaseCoarseKernel = MLXFast.metalKernel(
     name: "laguna_lmhead_int5_base_coarse_delta_bf16_v1",
     inputNames: ["x", "codes_base", "scales"],
-    outputNames: ["coarse", "delta"],
+    outputNames: ["coarse", "delta", "winner_val", "winner_idx"],
     source: """
         constexpr float GAMMA = 0x1p-15f;
 
         uint row = threadgroup_position_in_grid.x * 16 +
             simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
+        uint sgid = simdgroup_index_in_threadgroup;
+        threadgroup float sg_vals[16];
+        threadgroup uint sg_idxs[16];
 
         const device uint8_t* crow = codes_base + size_t(row) * 1024;
         const device uint8_t* srow = scales + size_t(row) * 64;
@@ -308,102 +338,40 @@ private let lagunaLmHeadInt5BaseCoarseKernel = MLXFast.metalKernel(
                 dtrunc += 0x00010000u;
             }
             delta[row] = as_type<bfloat>(ushort(dtrunc >> 16));
+            sg_vals[sgid] = c_acc;
+            sg_idxs[sgid] = row;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgid == 0 && lane == 0) {
+            float best = sg_vals[0];
+            uint best_idx = sg_idxs[0];
+            #pragma unroll
+            for (uint i = 1; i < 16; ++i) {
+                if (sg_vals[i] > best ||
+                    (sg_vals[i] == best && sg_idxs[i] < best_idx)) {
+                    best = sg_vals[i];
+                    best_idx = sg_idxs[i];
+                }
+            }
+            uint flipped = laguna_flip_float(best);
+            uint old = atomic_fetch_max_explicit(
+                (device atomic_uint*)winner_val, flipped,
+                memory_order_relaxed);
+            if (flipped > old) {
+                atomic_store_explicit(
+                    (device atomic_uint*)winner_idx, best_idx,
+                    memory_order_relaxed);
+            }
         }
         """,
     header: lagunaLmHeadPruneHeader,
     ensureRowContiguous: true
 )
 
-/// Stage one: partial ARGMAX of `coarse` (value + index). Same launch shape
-/// and read partition as the stock two-pass reduction (grid (224, 128),
-/// threadgroup (224, 1), four consecutive values per active thread,
-/// 784-element partitions), and it reads no `delta` at all -- the exact-winner
-/// threshold does not consume the coarse lower bound L, so `coarse - delta` is
-/// never formed and `delta`'s only reader is the exact pass.
-///
-/// The reduction carries (value, index) pairs: value primary, LOWEST index
-/// on ties, making the selected row deterministic for any input. NaN coarse
-/// values lose every `>` comparison and are skipped (no `laguna_lmhead_
-/// max_pair` NaN propagation here) -- correctness never depends on WHICH row
-/// wins: the exact-winner threshold is sound for ANY row index (see the
-/// threshold kernel below), so argmax quality only affects the candidate
-/// count, i.e. speed. Real coarse rows contain no NaN (finite BF16 weights
-/// times finite BF16 activations accumulated in FP32).
-///
-/// Inactive lanes (lid >= 196) and the second-phase padding lanes carry
-/// (-inf, 0xFFFFFFFF) and lose to any read element -- even an all-(-inf)
-/// partition resolves to a real index via the tie-break, so a valid row
-/// index always survives; the threshold kernel additionally clamps.
-private let lagunaLmHeadCoarseArgmaxStage1Kernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_coarse_argmax_stage1_v5",
-    inputNames: ["coarse"],
-    outputNames: ["partial_max", "partial_idx"],
-    source: """
-        constexpr uint ROW_SIZE = 784;
-        constexpr uint READS = 4;
-        constexpr uint ACTIVE_THREADS = ROW_SIZE / READS;
-        constexpr uint SIMD_GROUPS = 7;
-
-        uint row = threadgroup_position_in_grid.y;
-        uint lid = thread_position_in_threadgroup.x;
-        uint simd_lane = thread_index_in_simdgroup;
-        uint simd_group = simdgroup_index_in_threadgroup;
-        threadgroup float shared_vals[32];
-        threadgroup uint shared_idxs[32];
-
-        float best = -metal::numeric_limits<float>::infinity();
-        uint best_idx = 0xFFFFFFFFu;
-        if (lid < ACTIVE_THREADS) {
-            uint base = row * ROW_SIZE + lid * READS;
-            #pragma clang loop unroll(full)
-            for (uint i = 0; i < READS; ++i) {
-                float v = coarse[base + i];
-                if (v > best || (v == best && base + i < best_idx)) {
-                    best = v;
-                    best_idx = base + i;
-                }
-            }
-        }
-
-        #pragma clang loop unroll(full)
-        for (ushort sn = 16; sn >= 1; sn >>= 1) {
-            float ov = simd_shuffle_down(best, sn);
-            uint oi = simd_shuffle_down(best_idx, sn);
-            if (ov > best || (ov == best && oi < best_idx)) {
-                best = ov;
-                best_idx = oi;
-            }
-        }
-        if (simd_lane == 0) {
-            shared_vals[simd_group] = best;
-            shared_idxs[simd_group] = best_idx;
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        best = lid < SIMD_GROUPS
-            ? shared_vals[lid]
-            : -metal::numeric_limits<float>::infinity();
-        best_idx = lid < SIMD_GROUPS ? shared_idxs[lid] : 0xFFFFFFFFu;
-        #pragma clang loop unroll(full)
-        for (ushort sn = 16; sn >= 1; sn >>= 1) {
-            float ov = simd_shuffle_down(best, sn);
-            uint oi = simd_shuffle_down(best_idx, sn);
-            if (ov > best || (ov == best && oi < best_idx)) {
-                best = ov;
-                best_idx = oi;
-            }
-        }
-        if (lid == 0) {
-            partial_max[row] = best;
-            partial_idx[row] = best_idx;
-        }
-        """,
-    ensureRowContiguous: true
-)
-
-/// Tight exact-winner threshold: finish the argmax, run the stock single-row
-/// GEMV for the winning row r, and threshold just below `bfloat(e_r)` rather
-/// than below the coarse lower bound L. Sound for ANY r because
+/// Tight exact-winner threshold: read the coarse-argmax winner index (written
+/// by the device-atomic argmax fused into the coarse kernel), run the stock
+/// single-row GEMV for winning row r, and threshold just below `bfloat(e_r)`
+/// rather than below the coarse lower bound L. Sound for ANY r because
 /// `e_r <= e_winner`, which removes the winner's own quantization delta from
 /// the threshold -- the one number that made pure int5 untenable.
 ///
@@ -421,43 +389,15 @@ private let lagunaLmHeadCoarseArgmaxStage1Kernel = MLXFast.metalKernel(
 /// so a skipped coarse value is strictly below the tie boundary and rounds to
 /// `p` or lower, while the winner's own bound is at least `e_r > midpoint`.
 private let lagunaLmHeadExactWinnerBF16PredecessorThresholdKernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_exact_winner_bf16_midpoint_threshold_v1",
-    inputNames: ["partial_max", "partial_idx", "lm_head", "x"],
+    name: "laguna_lmhead_exact_winner_bf16_midpoint_threshold_v2",
+    inputNames: ["winner_idx", "lm_head", "x"],
     outputNames: ["threshold"],
     source: """
         constexpr uint VOCAB = 100352;
         constexpr uint K = 2048;
-        constexpr uint READS = 4;
         uint lid = thread_position_in_threadgroup.x;
-        threadgroup uint winner_row[1];
 
-        // Verbatim final argmax over the retained 128 partials.
-        float best = -metal::numeric_limits<float>::infinity();
-        uint best_idx = 0xFFFFFFFFu;
-        uint base = lid * READS;
-        #pragma clang loop unroll(full)
-        for (uint i = 0; i < READS; ++i) {
-            float v = partial_max[base + i];
-            uint idx = partial_idx[base + i];
-            if (v > best || (v == best && idx < best_idx)) {
-                best = v;
-                best_idx = idx;
-            }
-        }
-        #pragma clang loop unroll(full)
-        for (ushort sn = 16; sn >= 1; sn >>= 1) {
-            float ov = simd_shuffle_down(best, sn);
-            uint oi = simd_shuffle_down(best_idx, sn);
-            if (ov > best || (ov == best && oi < best_idx)) {
-                best = ov;
-                best_idx = oi;
-            }
-        }
-        if (lid == 0) {
-            winner_row[0] = metal::min(best_idx, uint(VOCAB - 1));
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint r = winner_row[0];
+        uint r = metal::min(winner_idx[0], uint(VOCAB - 1));
 
         // --- stock gemv_al replica begin (single row r; gemv.h:151-289) ---
         float result = 0.0f;
@@ -491,13 +431,11 @@ private let lagunaLmHeadExactWinnerBF16PredecessorThresholdKernel = MLXFast.meta
         // --- stock gemv_al replica end ---
         if (lid == 0) {
             bfloat rounded = bfloat(result);
-            // Expand through the numeric BF16->FP32 conversion, whose bits are
-            // exactly `bf16_bits << 16`; do not reinterpret the Metal wrapper.
             ushort bits = ushort(as_type<uint>(float(rounded)) >> 16);
             ushort magnitude = bits & 0x7FFFu;
             ushort predecessor_bits;
             if (magnitude == 0u) {
-                predecessor_bits = 0x8001u;  // predecessor of either zero
+                predecessor_bits = 0x8001u;
             } else if ((bits & 0x8000u) == 0u) {
                 predecessor_bits = bits - 1u;
             } else {
@@ -930,39 +868,34 @@ final class LagunaLmHeadPruner {
         let vocab = lagunaLmHeadPruneVocab
         let x = hidden.reshaped([lagunaLmHeadPruneHidden])
         let refine = useFusedRefinement && lagunaLmHeadFusedRefinementEnabled
-        // Four dispatches: the int5 coarse pass, argmax stage one over
-        // `coarse` alone (no `delta` read), the exact-winner threshold that
-        // absorbs the winning row's 4 KB GEMV, and the inline-mask exact pass.
-        // With `refine` the first and last dispatch swap to the three-level
-        // form: the coarse pass reads 1088 B/row instead of 1344 B/row and the
-        // exact pass re-reads the residual bit plane for live blocks only.
+        // Three dispatches: the int5 coarse pass (which also writes the
+        // device-atomic argmax winner), the exact-winner threshold that reads
+        // the winner index and runs the 4 KB GEMV, and the inline-mask exact
+        // pass. With `refine` the first and last dispatch swap to the
+        // three-level form: the coarse pass reads 1088 B/row instead of
+        // 1344 B/row and the exact pass re-reads the residual bit plane for
+        // live blocks only.
         let coarseOut =
             refine
             ? lagunaLmHeadInt5BaseCoarseKernel(
                 [x, int5CodesLo, int5Scales],
                 grid: (vocab / 16 * 512, 1, 1),
                 threadGroup: (512, 1, 1),
-                outputShapes: [[vocab], [vocab]],
-                outputDTypes: [.float32, .bfloat16]
+                outputShapes: [[vocab], [vocab], [1], [1]],
+                outputDTypes: [.float32, .bfloat16, .uint32, .uint32]
             )
             : lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel(
                 [x, int5CodesLo, int5CodesHi, int5Scales],
                 grid: (vocab / 16 * 512, 1, 1),
                 threadGroup: (512, 1, 1),
-                outputShapes: [[vocab], [vocab]],
-                outputDTypes: [.float32, .bfloat16]
+                outputShapes: [[vocab], [vocab], [1], [1]],
+                outputDTypes: [.float32, .bfloat16, .uint32, .uint32]
             )
         let coarse = coarseOut[0]
         let delta = coarseOut[1]
-        let argmaxPartials = lagunaLmHeadCoarseArgmaxStage1Kernel(
-            [coarse],
-            grid: (224, 128, 1),
-            threadGroup: (224, 1, 1),
-            outputShapes: [[128], [128]],
-            outputDTypes: [.float32, .uint32]
-        )
+        let winnerIdx = coarseOut[3]
         let thr = lagunaLmHeadExactWinnerBF16PredecessorThresholdKernel(
-            [argmaxPartials[0], argmaxPartials[1], lmHeadWeight, x],
+            [winnerIdx, lmHeadWeight, x],
             grid: (32, 1, 1),
             threadGroup: (32, 1, 1),
             outputShapes: [[1]],
