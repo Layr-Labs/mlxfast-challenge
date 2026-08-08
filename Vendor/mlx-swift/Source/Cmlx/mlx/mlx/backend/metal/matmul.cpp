@@ -92,6 +92,23 @@ static bool darkbloom_steel_prefill_tile() {
   return enabled;
 }
 
+// Regular-NAX skinny-N regrouping, for prefill shapes whose tile count is too
+// small to fill the GPU. Halving bn and wn together holds SN = bn/wn = 32, so
+// SM, SN, SK, TM and TN are unchanged and gemm_loop() sees the identical
+// template instantiation; it uses no threadgroup memory and exchanges no data
+// between simdgroups, so each output keeps the same k-ascending in-register MMA
+// chain and only threadgroup ownership and the grid change. Opt-in: the
+// regrouping trades +33% A re-reads for occupancy and has not been timed on a
+// NAX host yet, so the accepted geometry stays the default. Set
+// DARKBLOOM_STEEL_REGULAR_SKINNY_TILE=1 to enable.
+static bool darkbloom_steel_regular_skinny_tile() {
+  static bool enabled = []() {
+    const char* value = getenv("DARKBLOOM_STEEL_REGULAR_SKINNY_TILE");
+    return value != nullptr && atoi(value) != 0;
+  }();
+  return enabled;
+}
+
 
 // Ground-truth dispatch trace (DARKBLOOM_STEEL_TRACE=1): prints the actual
 // steel kernel base name + geometry at every nax GEMM dispatch. Never set
@@ -235,6 +252,22 @@ void steel_matmul_regular_axpby_nax(
 
     bm = 64;
     wm = 2;
+  }
+
+  // A 512x1024x2048 prefill projection covers only 8x8 tiles, which the
+  // swizzle turns into 64 threadgroups: under two per core on a 40-core M5.
+  // Halving bn and wn doubles that at the cost of re-reading A once more per
+  // n-tile column. tiles_m >= 4 keeps every M=1 decode shape on the accepted
+  // geometry, and the tile ceiling keeps the wide classes (wq, gate/up, and the
+  // 16-tile-wide banks) there too, since those already exceed 3 tiles per core.
+  if (darkbloom_steel_regular_skinny_tile() && bn == 128 && wn == 4 &&
+      (N % 64) == 0) {
+    const int tiles_m = (M + bm - 1) / bm;
+    const int tiles_n = (N + bn - 1) / bn;
+    if (tiles_m >= 4 && tiles_m * tiles_n <= 96) {
+      bn = 64;
+      wn = 2;
+    }
   }
 
   // Prepare kernel name

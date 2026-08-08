@@ -1,4 +1,5 @@
 // Copyright © 2024 Apple Inc.
+// R85-A ranked-channel control probe: comment-only, behaviour-neutral edit.
 
 import Foundation
 import MLX

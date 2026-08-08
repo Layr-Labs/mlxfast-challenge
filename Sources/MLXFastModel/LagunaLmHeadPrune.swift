@@ -971,7 +971,10 @@ final class LagunaLmHeadPruner {
         let assembled =
             refine
             ? lagunaLmHeadRefinedExactKernel(
-                [coarse, delta, thr, lmHeadWeight, x, int5CodesHi, int5Scales],
+                [
+                    coarse, delta, thr, lmHeadWeight, x, int5CodesHi,
+                    int5Scales,
+                ],
                 grid: (vocab / 32 * 256, 1, 1),
                 threadGroup: (256, 1, 1),
                 outputShapes: [[vocab]],

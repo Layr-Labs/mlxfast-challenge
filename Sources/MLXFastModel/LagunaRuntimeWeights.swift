@@ -386,12 +386,6 @@ public final class LagunaRuntimeWeightCache {
                     setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
                     setenv("MLX_MAX_OPS_PER_BUFFER", "200", 0)
                 }
-                // LOCAL PROBE ONLY (not for submission): override the op cap
-                // so the command-buffer boundary phase can be swept without a
-                // rebuild per value. Overwrite=1 deliberately beats the 200.
-                if let probeOps = env["DARKBLOOM_PROBE_CB_OPS"], !probeOps.isEmpty {
-                    setenv("MLX_MAX_OPS_PER_BUFFER", probeOps, 1)
-                }
                 startupMemoryPolicy = nil
             }
         } else {
@@ -423,18 +417,12 @@ public final class LagunaRuntimeWeightCache {
                 Memory.clearCache()
             }
         }
-        // Zero-headroom wired residency (notes/47 §4e follow-up, session
-        // H6): the vendored MLX Device attaches a `MTLResidencySet` to every
-        // command queue, but `ResidencySet::capacity_` defaults to 0, so the
-        // set stays empty and the driver re-establishes residency for the
-        // whole ~21.6 GB RAM-resident text tower on every command buffer
-        // (notes/47 §4d-4e: driver-busy tracks the prefill span, 9-15 ms
-        // kernelStart gaps). notes/47 §6-§7 measured the naive fix -- a
-        // 32 GiB wired limit -- removing that driver work (167.1 -> 9.9 ms)
-        // but regressing under the scored seatbelt, because ~10 GiB of spare
-        // capacity made `ResidencySet::insert`/`erase` issue a Metal
-        // `commit()` for every scored-window allocation and eviction
-        // (resident.cpp:28-50).
+        // Zero-headroom wired residency (history:
+        // notes/LagunaRuntimeWeights.notes.md#wiredresidencymeasurementhistory).
+        // MLX's `MTLResidencySet` defaults to `capacity_ == 0`, so the driver
+        // re-establishes residency for the whole resident text tower on every
+        // command buffer; an oversized wired limit removes that work but then
+        // commits on every scored-window allocation and eviction.
         //
         // This variant closes that hole with capacity discipline instead of
         // new API: wire ONCE at construction time (outside every scored
@@ -453,16 +441,8 @@ public final class LagunaRuntimeWeightCache {
         // Ships DEFAULT-ON at a dosed 42 MiB capacity (the ranked runner
         // sets no environment variables): `DARKBLOOM_WIRED_ZH=0` is the
         // kill switch, `DARKBLOOM_WIRED_ZH_FRACTION` /
-        // `DARKBLOOM_WIRED_ZH_SLACK_MB` override the dose for local A/B
-        // (fraction of live bytes + flat slack; the slack also covers the
-        // MTLBuffer allocatedSize page-rounding inflation over
-        // `Memory.activeMemory` at full wire). A >=96 GiB physical-memory
-        // guard keeps sub-128GB machines on stock behavior. Target machine
-        // (local and ranked) is an M5 Max with 128 GB unified memory:
-        // recommendedMaxWorkingSetSize ~= 115 GB, so even a full ~31 GB
-        // wire is far from the OS cap that `metal::set_wired_limit`
-        // fail-closes on (allocator.cpp:305-312). See the dose table on
-        // `wireResidentWeightsIfEnabled`.
+        // `DARKBLOOM_WIRED_ZH_SLACK_MB` override the dose for local A/B.
+        // Host headroom: notes/LagunaRuntimeWeights.notes.md#wiredresidencyhostheadroom
         if libraryModel != nil, config.numHiddenLayers >= 16 {
             Self.wireResidentWeightsIfEnabled()
         }
@@ -506,11 +486,9 @@ public final class LagunaRuntimeWeightCache {
         // in `LagunaCorrectness.greedyToken` (reshape -> last row -> argMax),
         // and the forwards above never run an argmax, so its first use
         // otherwise creates the `argmax_bfloat16` compute pipeline state
-        // INSIDE the measured window: a timestamped PSO-miss log showed the
-        // compile firing ~0.23 s into the scored prefill request and again in
-        // the decode seed, matching a recurring ~17 ms MTLCompilerService
-        // interval inside both timed phases in Metal System Trace. Replicating
-        // the same ops here moves that one-time compile to untimed init.
+        // INSIDE the measured window (trace:
+        // notes/LagunaRuntimeWeights.notes.md#greedyargmaxpsomisstrace).
+        // Replicating the same ops here moves that compile to untimed init.
         // Input-independent kernel-cache warmup only (TASK.md explicitly
         // allows caches for kernels); constant BOS input, output discarded.
         // `DARKBLOOM_WARM_GREEDY_ARGMAX=0` restores the stock warmup.
@@ -529,18 +507,8 @@ public final class LagunaRuntimeWeightCache {
     /// bytes + 64 MiB ~= 31.4 GiB -- the entire live footprint (weights +
     /// fused banks + lm_head coarse copy) wired in one resize commit, the
     /// full mechanism from notes/47 §4-§7 with the zero-headroom fit-test
-    /// discipline. Measured loaded-local (cool-gated Latin squares, all vs
-    /// unwired control, correctness green every sample):
-    ///   42 MiB -> -4.2% prefill | 350 MiB -> -8.2% | 0.10x -> -11.2%
-    ///   0.20x -> -17.2% | 0.35x -> -20.8% | 1.0x -> -28.3% prefill,
-    ///   -4.2% decode composite (seed-prefill share; steady step null).
-    /// Chunk 1 (42 MiB) ranked +1.24% score (promoted 1.38531), validating
-    /// the ~1:1 loaded-local -> ranked transfer. This configuration ships
-    /// the WHOLE curve in one submission per operator instruction; the
-    /// documented acceptance band (prefill speedup vs calibration in
-    /// [0.952, 1.053]) is expected to reject gains this large in one step
-    /// -- if the ranked run fails with acceptance_band_failed, revert to
-    /// band-sized dose increments (the curve above is the roadmap).
+    /// discipline. Measured dose curve and ranked receipt:
+    /// notes/LagunaRuntimeWeights.notes.md#wiredresidencydosecurve
     ///
     /// Engagement guards: `DARKBLOOM_WIRED_ZH=0` kills it; machines under
     /// 96 GiB physical memory keep stock behavior (the ranked box is an
@@ -984,58 +952,6 @@ func lagunaLaneMajorScaleBankReproducesScales(
 /// full Apple GPU cache line.
 let lagunaScalePatchHeaderBytes = 128
 
-/// Presents the already-certified decode scale bank to the expert-aligned M5
-/// prefill primitive without copying it. The logical shape remains the stock
-/// `[256, 1024, 128]` required by `gatherQuantizedMM`; the bounded marker
-/// strides describe one 64-byte compact row while the last logical scale axis
-/// aliases its row base. Only the exact backend specialization recognizes this
-/// shape/stride contract and applies the packed walk-order address map.
-///
-/// `packed` was produced by `preparePackedRoutedGateUpBank`, whose fail-closed
-/// `lagunaHalvedGroup32ScalePlane` certificate already proved every discarded
-/// odd byte and retained the two exact exceptions in its 128-byte header. This
-/// helper allocates no data and introduces no second resident scale plane.
-func lagunaPackedPrefillScaleView(_ packed: MLXArray) -> MLXArray? {
-    let rows = 2 * LagunaConstants.moeIntermediateSize
-    let groups = LagunaConstants.hiddenSize / 16
-    let compactGroups = groups / 2
-    let shape = [LagunaConstants.numExperts, rows, groups]
-    let expectedBytes = lagunaScalePatchHeaderBytes
-        + LagunaConstants.numExperts * rows * compactGroups
-    guard packed.dtype == .uint8, packed.ndim == 1,
-        packed.size == expectedBytes
-    else { return nil }
-
-    return asStrided(
-        packed,
-        shape,
-        strides: [rows * compactGroups, compactGroups, 0],
-        offset: 0)
-}
-
-/// Presents the certified routed down-projection decode scale plane to the
-/// expert-aligned M5 prefill primitive without copying it. Unlike the fused
-/// gate/up bank, the down plane is already row-major after its 128-byte patch
-/// header, so each logical output row maps to one contiguous 16-byte run.
-/// Only the exact backend marker specialization may interpret this view.
-func lagunaPackedPrefillDownScaleView(_ packed: MLXArray) -> MLXArray? {
-    let rows = LagunaConstants.hiddenSize
-    let groups = LagunaConstants.moeIntermediateSize / 16
-    let compactGroups = groups / 2
-    let shape = [LagunaConstants.numExperts, rows, groups]
-    let expectedBytes = lagunaScalePatchHeaderBytes
-        + LagunaConstants.numExperts * rows * compactGroups
-    guard packed.dtype == .uint8, packed.ndim == 1,
-        packed.size == expectedBytes
-    else { return nil }
-
-    return asStrided(
-        packed,
-        shape,
-        strides: [rows * compactGroups, compactGroups, 0],
-        offset: 0)
-}
-
 /// Byte length of the halved packed routed gate/up scale bank, header included.
 let lagunaPackedRoutedGateUpScaleBytes =
     lagunaScalePatchHeaderBytes
@@ -1056,10 +972,7 @@ let lagunaRoutedDownScaleBytes =
 /// The shipped Laguna checkpoint stores one scale byte per 16 weights, but its
 /// expert planes were produced by MLX's Metal `fp_quantize`, whose
 /// per-simdgroup absmax makes both halves of every 32-weight span carry the
-/// same byte. Census over all 39 sparse layers (234 tensors, 985,300,992
-/// pairs): 985,300,824 pairs are byte-identical and all 168 exceptions are the
-/// very first pair of a tensor, the one span the quantizer's first simdgroup
-/// writes twice.
+/// same byte. Census: notes/LagunaRuntimeWeights.notes.md#group16scalepaircensus
 ///
 /// `allowedFlatPairs` lists the flat pair indices allowed to break the rule.
 /// Their odd byte is copied into a `lagunaScalePatchHeaderBytes` header placed
@@ -1105,7 +1018,7 @@ extension LagunaRuntimeSparseMoEBlock {
     /// below (gateRow = (logical/32)*64 + logical%32, up = +32) is the stock
     /// kernel's mapping over the 32-row gate/up-interleaved fused bank, baked
     /// into scale storage order. The code bytes remain in the resident fused
-    /// weight bank, so this side copy is ~16 MiB per sparse layer instead of
+    /// weight bank, so this side copy is ~32 MB per sparse layer instead of
     /// duplicating the ~256 MB code bank.
     func preparePackedRoutedGateUpBank(
         fusedScales: MLXArray,
