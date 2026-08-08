@@ -27,4 +27,14 @@
 instantiate_gemm_splitk_shapes_helper(float16, half, float32, float);
 instantiate_gemm_splitk_shapes_helper(bfloat16, bfloat, float32, float);
 instantiate_gemm_splitk_shapes_helper(float32, float, float32, float);
+
+#define instantiate_gemm_splitk_hmgate(bm, bn, bk, wm, wn) \
+  instantiate_kernel(                                                \
+      "steel_gemm_splitk_nax_hmgate_nt_bfloat16_float32"            \
+      "_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn,         \
+      gemm_splitk_nax_hmgate, bfloat, bm, bn, bk, wm, wn, false, true, float)
+
+instantiate_gemm_splitk_hmgate(64, 64, 512, 2, 2);
+instantiate_gemm_splitk_hmgate(64, 64, 512, 2, 1);
+instantiate_gemm_splitk_hmgate(128, 128, 512, 4, 4);
 // clang-format on

@@ -703,7 +703,8 @@ void steel_gemm_splitk_axpby_nax(
     bool transpose_b,
     std::vector<array>& copies,
     float alpha = 1.0f,
-    float beta = 0.0f) {
+    float beta = 0.0f,
+    const array* headmajor_gate = nullptr) {
   using namespace mlx::steel;
 
   int bm = 128, bn = 128, bk = 512;
@@ -718,6 +719,13 @@ void steel_gemm_splitk_axpby_nax(
   if (darkbloom_steel_prefill_tile() && (M + N) / 2 >= 512 && K > 4096) {
     bm = bn = 64;
     wm = wn = 2;
+  }
+  // Head-major carrier reuses rounded A across two adjacent BN panels.
+  if (headmajor_gate) {
+    bm = bn = 64;
+    bk = 512;
+    wm = 2;
+    wn = 1;
   }
   if (K <= 1024) {
     split_k_partition_size = K / 2;
@@ -737,8 +745,9 @@ void steel_gemm_splitk_axpby_nax(
   C_split.set_data(allocator::malloc(C_split.nbytes()));
   copies.push_back(C_split);
 
+  const int n_tile_span = headmajor_gate ? 2 * bn : bn;
   const bool align_M = (M % bm) == 0;
-  const bool align_N = (N % bn) == 0;
+  const bool align_N = (N % n_tile_span) == 0;
   const bool align_K = (K % bk) == 0;
 
   // Per-tile align_K is checked at runtime; only the last tile can be unaligned
@@ -749,7 +758,8 @@ void steel_gemm_splitk_axpby_nax(
   std::ostringstream kname;
 
   // clang-format off
-  kname << "steel_gemm_splitk_nax_"
+  kname << (headmajor_gate ? "steel_gemm_splitk_nax_hmgate_"
+                           : "steel_gemm_splitk_nax_")
         << (transpose_a ? 't' : 'n')
         << (transpose_b ? 't' : 'n')
         << "_" << type_to_name(a)
@@ -783,7 +793,7 @@ void steel_gemm_splitk_axpby_nax(
 
   compute_encoder.set_compute_pipeline_state(kernel);
 
-  int tn = (N + bn - 1) / bn;
+  int tn = (N + n_tile_span - 1) / n_tile_span;
   int tm = (M + bm - 1) / bm;
 
   int swizzle_log = tm <= 3 ? 0 : 1;
@@ -821,6 +831,9 @@ void steel_gemm_splitk_axpby_nax(
   compute_encoder.set_output_array(C_split, 2);
 
   compute_encoder.set_bytes(params, 3);
+  if (headmajor_gate) {
+    compute_encoder.set_input_array(*headmajor_gate, 4);
+  }
   if (darkbloom_steel_trace()) {
     fprintf(
         stderr,
@@ -1440,6 +1453,46 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int M = a_pre.shape(-2);
   int N = b_pre.shape(-1);
   int K = a_pre.shape(-1);
+
+  // Catch the inseparable zero-stride carrier before view materialization.
+  const bool hma = a_pre.ndim() == 2 && a_pre.strides()[0] == 128 &&
+      a_pre.strides()[1] == 0;
+  const bool hmg = c_pre.ndim() == 2 &&
+      (c_pre.strides()[0] == 48 || c_pre.strides()[0] == 64) &&
+      c_pre.strides()[1] == 0;
+  if (hma || hmg) {
+    if (!(hma && hmg)) {
+      throw std::runtime_error("[addmm] partial Laguna head-major gate marker");
+    }
+    const int H = K / 128, largest = std::max(M, N);
+    const bool splitk =
+        K >= 3 * largest || (largest <= 1024 && K > 2 * largest);
+    const bool exact = alpha_ == 1.0f && beta_ == 0.0f && M > 1 &&
+        N == 2048 && (H == 48 || H == 64) && K == H * 128 &&
+        a_pre.dtype() == bfloat16 && b_pre.dtype() == bfloat16 &&
+        c_pre.dtype() == bfloat16 && out.dtype() == bfloat16 &&
+        a_pre.shape(0) == M && c_pre.shape(0) == M &&
+        c_pre.shape(1) == N && c_pre.strides()[0] == H &&
+        b_pre.ndim() == 2 && b_pre.shape(0) == K && b_pre.shape(1) == N &&
+        b_pre.strides()[0] == 1 && b_pre.strides()[1] == K &&
+        out.ndim() == 2 && out.shape(0) == M && out.shape(1) == N &&
+        metal::is_nax_available() && splitk;
+    auto span_fits = [](const array& x, size_t bytes) {
+      return x.offset() >= 0 && size_t(x.offset()) <= x.buffer_size() &&
+          bytes <= x.buffer_size() - size_t(x.offset());
+    };
+    // Prove the backing spans despite the carrier's zero stride.
+    const bool spans = span_fits(
+                           a_pre, size_t(M) * H * 128 * sizeof(bfloat16_t)) &&
+        span_fits(c_pre, size_t(M) * H * sizeof(bfloat16_t));
+    if (!exact || !spans) {
+      throw std::runtime_error("[addmm] invalid Laguna head-major gate marker");
+    }
+    std::vector<array> marker_copies;
+    return steel_gemm_splitk_axpby_nax(
+        s, d, a_pre, b_pre, c_pre, out, M, N, K, 1, K, K, false, true,
+        marker_copies, alpha_, beta_, &c_pre);
+  }
 
   // Keep a vector with copies to be cleared in the completed buffer to release
   // the arrays

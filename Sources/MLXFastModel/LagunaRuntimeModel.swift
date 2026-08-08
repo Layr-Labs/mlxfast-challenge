@@ -246,6 +246,56 @@ func lagunaNAXAvailable(architecture: String, osSupportsNAX: Bool) -> Bool {
     return generation >= (architecture.hasSuffix("p") ? 18 : 17)
 }
 
+/// Exact admission for the NAX-only head-major gated `o_proj` carrier.
+func lagunaPrefillHeadMajorGatedOProjAdmitted(
+    batch: Int,
+    length: Int,
+    heads: Int,
+    headDim: Int,
+    outputColumns: Int,
+    architecture: String,
+    osSupportsNAX: Bool
+) -> Bool {
+    let k = heads * headDim
+    let largestOutputAxis = max(length, outputColumns)
+    let splitK =
+        k >= 3 * largestOutputAxis
+        || (largestOutputAxis <= 1024 && k > 2 * largestOutputAxis)
+    return batch == 1
+        && length > 1
+        && (heads == LagunaConstants.fullAttentionHeads
+            || heads == LagunaConstants.slidingAttentionHeads)
+        && headDim == LagunaConstants.headDim
+        && outputColumns == LagunaConstants.hiddenSize
+        && splitK
+        && lagunaNAXAvailable(
+            architecture: architecture, osSupportsNAX: osSupportsNAX)
+}
+
+/// The flag or a zero layer count restores the stock graph.
+private let lagunaPrefillHeadMajorGatedOProjArchitecture: String? = {
+    guard #available(macOS 26.2, *) else { return nil }
+    let configured = ProcessInfo.processInfo.environment["MLX_METAL_GPU_ARCH"]
+    return configured.flatMap { $0.isEmpty ? nil : $0 }
+        ?? GPU.deviceInfo().architecture
+}()
+
+private let lagunaPrefillHeadMajorGatedOProjLayerCount: Int = {
+    let requested = Int(ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_HEADMAJOR_GATED_OPROJ_LAYERS"] ?? "6") ?? 6
+    return min(max(requested, 0), LagunaConstants.numHiddenLayers - 1)
+}()
+
+let lagunaPrefillHeadMajorGatedOProjEnabled: Bool = {
+    guard ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_HEADMAJOR_GATED_OPROJ"] != "0",
+        lagunaPrefillHeadMajorGatedOProjLayerCount > 0,
+        let architecture = lagunaPrefillHeadMajorGatedOProjArchitecture
+    else { return false }
+    return lagunaNAXAvailable(
+        architecture: architecture, osSupportsNAX: true)
+}()
+
 func lagunaExpertAlignedStageEnabled(_ value: String?) -> Bool {
     ["", "4", "5"].contains(value ?? "")
 }
@@ -5408,6 +5458,41 @@ private let lagunaCompiledSoftplusGate: @Sendable (MLXArray) -> MLXArray = {
     return MLXHardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
+/// Zero-copy carriers for native head-major BF16 attention and its BF16 gate.
+private func lagunaPrefillHeadMajorGatedOProj(
+    attended: MLXArray,
+    activatedGate: MLXArray,
+    weight: MLXArray,
+    length: Int,
+    heads: Int
+) -> MLXArray? {
+    let headDim = LagunaConstants.headDim
+    let k = heads * headDim
+    guard attended.dtype == .bfloat16,
+        attended.dims(1, heads, length, headDim),
+        activatedGate.dtype == .bfloat16,
+        activatedGate.dims(1, length, heads),
+        weight.dtype == .bfloat16,
+        weight.dims(LagunaConstants.hiddenSize, k)
+    else { return nil }
+
+    let attendedCarrier = asStrided(
+        attended, [length, k], strides: [headDim, 0], offset: 0)
+    let gateCarrier = asStrided(
+        activatedGate,
+        [length, LagunaConstants.hiddenSize],
+        strides: [heads, 0],
+        offset: 0)
+    lagunaTrace("prefill head-major gated output projection h\(heads)")
+    return addMM(
+        gateCarrier,
+        attendedCarrier,
+        weight.T,
+        alpha: 1,
+        beta: 0
+    ).reshaped(1, length, LagunaConstants.hiddenSize)
+}
+
 /// Decode-only outer compilation of the same gate product with the following
 /// bias-free BF16 output projection. MLX keeps the matmul primitive intact but
 /// schedules the elementwise producer and projection as one compiled graph,
@@ -6136,6 +6221,53 @@ final class LagunaRuntimeAttention: Module {
                 scale: scale,
                 mask: mask
             )
+
+        // Fail-closed carrier; every decline uses the stock path below.
+        if lagunaPrefillHeadMajorGatedOProjEnabled,
+            layerIdx < lagunaPrefillHeadMajorGatedOProjLayerCount,
+            let architecture = lagunaPrefillHeadMajorGatedOProjArchitecture,
+            lagunaPrefillHeadMajorGatedOProjAdmitted(
+                batch: B,
+                length: L,
+                heads: nHeads,
+                headDim: headDim,
+                outputColumns: LagunaConstants.hiddenSize,
+                architecture: architecture,
+                osSupportsNAX: true),
+            gatingEnabled, gatePerHead,
+            let gateProjection = gProj,
+            let normalizedInput,
+            type(of: gateProjection) == Linear.self,
+            gateProjection.bias == nil,
+            gateProjection.weight.dtype == .bfloat16,
+            gateProjection.weight.dims(nHeads, LagunaConstants.hiddenSize),
+            type(of: wo) == Linear.self,
+            wo.bias == nil,
+            normalizedInput.dtype == .bfloat16,
+            normalizedInput.dims(B, L, LagunaConstants.hiddenSize),
+            attended.dtype == .bfloat16,
+            attended.dims(B, nHeads, L, headDim),
+            wo.weight.dtype == .bfloat16,
+            wo.weight.dims(
+                LagunaConstants.hiddenSize, nHeads * LagunaConstants.headDim)
+        {
+            let gateLogits = gateProjection(normalizedInput)
+            if gateLogits.dtype == .bfloat16,
+                gateLogits.dims(B, L, nHeads)
+            {
+                let activatedGate = lagunaCompiledSoftplusGate(gateLogits)
+                if let projection = lagunaPrefillHeadMajorGatedOProj(
+                    attended: attended,
+                    activatedGate: activatedGate,
+                    weight: wo.weight,
+                    length: L,
+                    heads: nHeads)
+                {
+                    return projection
+                }
+            }
+        }
+
         // SDPA returns `[B, H, L, D]`. When `L == 1`, flattening its
         // contiguous head-major payload directly produces the exact
         // `[B, 1, H*D]` byte order; the transpose only changes singleton-axis
@@ -9345,44 +9477,7 @@ private let lagunaDecodeRouterOrdinalScoreTableEnabled =
 /// cross-simdgroup stages. The optimized second phase runs only one logical
 /// copy on the first 64 threads. Keep the full-sort path as an in-binary
 /// fallback and for the score-recompute ablation.
-// Ranked replay nonce: active64 receipt 1 was exact and raw-faster in both
-// phases; this source-only marker intentionally leaves the executable tree
-// unchanged while producing a distinct submission archive.
-// Receipt 2 confirmed the same raw-positive tree; nonce 3 settles paired draw.
-// Receipt 3 also beat the current crown raw; nonce 4 replays after retiring
-// the exact-but-negative routed/shared merged-dispatch successor.
-// Receipt 4 remained crown-positive raw; nonce 5 continues the paired replay.
-// Receipt 5 was the strongest yet at 4.905191 ms decode and 0.187895 ms/token
-// prefill, normalizing 0.2391% above the unchanged crown; nonce 6 replays it
-// after the exact pairwise-finalist successor priced slower and was retired.
-// Receipt 6 improved the raw lead to 0.3388%; nonce 7 continues the same
-// six-receipt exact active64 runtime against paired-baseline variance.
-// Receipt 7 set a new decode best and stayed 0.2771% crown-positive raw;
-// nonce 8 continues the now seven-receipt exact persistence campaign.
-// Receipt 8 was also crown-positive raw; nonce 9 continues the unchanged
-// eight-receipt exact runtime while the paired baseline remains unfavorable.
-// Receipt 9 was the first slightly crown-negative raw draw; nonce 10 preserves
-// the unchanged runtime because its nine-receipt mean remains crown-positive.
-// Receipt 10 was a second small negative draw; nonce 11 continues because the
-// ten-receipt mean still beats the unchanged crown and eight receipts are up.
-// Receipt 11 was a third small raw-negative draw; nonce 12 continues because
-// the eleven-receipt mean remains crown-positive while the successor is built.
-// Receipt 12 returned crown-positive in both phases; nonce 13 replays the same
-// executable tree while its twelve-receipt raw mean remains crown-positive.
-// Receipt 13 was crown-positive by 0.3459% on raw phases; nonce 14 keeps the
-// thirteen-receipt executable tree unchanged while its raw mean leads 0.1400%.
-// Receipt 14 was crown-positive by 0.0385% on raw phases; nonce 15 keeps the
-// fourteen-receipt executable tree unchanged while its raw mean leads 0.1327%.
-// Receipt 15 was crown-positive by 0.1251% on raw phases; nonce 16 keeps the
-// fifteen-receipt executable tree unchanged while its raw mean leads 0.1322%.
-// Receipt 16 was crown-positive by 0.3039% on raw phases; nonce 17 keeps the
-// sixteen-receipt executable tree unchanged while its raw mean leads 0.1429%.
-// Receipt 17 was crown-positive by 0.3584% on raw phases; nonce 18 keeps the
-// seventeen-receipt executable tree unchanged while its raw mean leads 0.1556%.
-// Receipt 18 was crown-positive by 0.0301% on weighted raw phases; nonce 19
-// keeps the eighteen-receipt executable tree unchanged; its mean leads 0.1486%.
-// Receipt 19 was crown-positive by 0.2420% on raw phases; nonce 20 keeps the
-// nineteen-receipt executable tree unchanged while its raw mean leads 0.1535%.
+// Active64 promoted after nineteen exact, mean-positive official receipts.
 private let lagunaDecodeRouterTournamentEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ROUTER_TOURNAMENT"] != "0"
 
