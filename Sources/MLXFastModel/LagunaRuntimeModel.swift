@@ -10183,19 +10183,39 @@ for (uint e = 0; e < experts; ++e) {
     sorted_rows[e] = inverse_order[row * experts + e];
 }
 
+// One 8-byte vector load per expert replaces four scalar 2-byte loads, and the
+// shared/residual/output triple becomes one vector load, load and store. Each
+// column keeps its OWN accumulator and receives the same
+// `bfloat(product + total)` sequence in the same e-ascending order as the
+// scalar form, so no sum is reassociated and every BF16 rounding boundary is
+// preserved. `hidden` and `col` are both multiples of n_cols, so every base is
+// 8-byte aligned as vec<bfloat, 4> requires.
+thread bfloat total[n_cols];
 for (uint i = 0; i < n_cols; ++i) {
-    bfloat total = bfloat(0);
-    for (uint e = 0; e < experts; ++e) {
-        bfloat product = bfloat(
-            sorted_expert_outputs[sorted_rows[e] * hidden + col + i] *
-            expert_weights[e]);
-        total = bfloat(product + total);
-    }
-    bfloat scaled = bfloat(total * bfloat(2.5f));
-    bfloat r2 = bfloat(scaled + shared_output[row * hidden + col + i]);
-    output[row * hidden + col + i] =
-        bfloat(residual[row * hidden + col + i] + r2);
+    total[i] = bfloat(0);
 }
+for (uint e = 0; e < experts; ++e) {
+    const vec<bfloat, 4> ev =
+        *reinterpret_cast<const device vec<bfloat, 4>*>(
+            sorted_expert_outputs + sorted_rows[e] * hidden + col);
+    total[0] = bfloat(bfloat(ev.x * expert_weights[e]) + total[0]);
+    total[1] = bfloat(bfloat(ev.y * expert_weights[e]) + total[1]);
+    total[2] = bfloat(bfloat(ev.z * expert_weights[e]) + total[2]);
+    total[3] = bfloat(bfloat(ev.w * expert_weights[e]) + total[3]);
+}
+
+const vec<bfloat, 4> sh =
+    *reinterpret_cast<const device vec<bfloat, 4>*>(
+        shared_output + row * hidden + col);
+const vec<bfloat, 4> rs =
+    *reinterpret_cast<const device vec<bfloat, 4>*>(
+        residual + row * hidden + col);
+vec<bfloat, 4> ov;
+ov.x = bfloat(rs.x + bfloat(bfloat(total[0] * bfloat(2.5f)) + sh.x));
+ov.y = bfloat(rs.y + bfloat(bfloat(total[1] * bfloat(2.5f)) + sh.y));
+ov.z = bfloat(rs.z + bfloat(bfloat(total[2] * bfloat(2.5f)) + sh.z));
+ov.w = bfloat(rs.w + bfloat(bfloat(total[3] * bfloat(2.5f)) + sh.w));
+*reinterpret_cast<device vec<bfloat, 4>*>(output + row * hidden + col) = ov;
 """,
     ensureRowContiguous: true
 )
