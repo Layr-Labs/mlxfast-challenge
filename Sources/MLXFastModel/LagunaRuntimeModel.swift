@@ -4854,6 +4854,113 @@ private let lagunaDecodeNVFP4QKVLaneMajorKernels: [Int: MLXFast.MLXFastKernel] =
     return kernels
 }()
 
+/// Decode-only fold of the per-head gate softplus QMV into the lane-major
+/// NVFP4 QKV QMV. Both consumers already read the whole `normalized` row and
+/// already ran as two independent 64-thread dispatches, so this concatenates
+/// their grids: threadgroups `rows/2` (QKV, one row per simdgroup) followed by
+/// `heads/8` (gate, four rows per simdgroup). Each branch is the shipped body
+/// verbatim, so every output row keeps its own FP32 accumulator, its own
+/// lane->K partition, its own `simd_sum` tree, its own scale-decode expression
+/// and its own single BF16 store. Which rows share a dispatch cannot change
+/// per-row arithmetic -- the same argument the row-concatenated banks rely on
+/// (see the fusion-flag note above) -- so the pair is bit-exact against the two
+/// dispatches it replaces. Total threadgroups and total reads are unchanged;
+/// only the dispatch count drops. The input RMSNorm is deliberately NOT folded
+/// in: that fusion was re-measured +2.7% under this geometry and defused.
+private func lagunaDecodeNVFP4QKVGateLaneMajorSource(
+    pairwise: Bool, heads: Int
+) -> String {
+    let rows = (heads + 2 * LagunaConstants.numKeyValueHeads) * LagunaConstants.headDim
+    var gate = lagunaGateSoftplusSource(heads: heads)
+    gate = gate.replacingOccurrences(
+        of: "uint tile=threadgroup_position_in_grid.x;",
+        with: "uint tile=threadgroup_position_in_grid.x-db_qkv_tiles;")
+    gate = gate.replacingOccurrences(of: "input[", with: "normalized[")
+    gate = gate.replacingOccurrences(of: "packed_codes", with: "gate_codes")
+    gate = gate.replacingOccurrences(of: "scales+", with: "gate_scales+")
+    gate = gate.replacingOccurrences(of: "biases+", with: "gate_biases+")
+    return """
+constexpr uint db_qkv_tiles = \(rows / 2);
+if (threadgroup_position_in_grid.x < db_qkv_tiles) {
+\(lagunaDecodeNVFP4QKVLaneMajorSource(pairwise: pairwise))
+} else {
+\(gate)
+}
+"""
+}
+
+private let lagunaDecodeNVFP4QKVGateLaneMajorKernels: [Int: MLXFast.MLXFastKernel] = {
+    var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    for heads in [LagunaConstants.slidingAttentionHeads, LagunaConstants.fullAttentionHeads] {
+        kernels[heads] = MLXFast.metalKernel(
+            name: "laguna_decode_nvfp4_qkv_gate_h\(heads)_r1_v1_lm1"
+                + (lagunaAttnScalePairwiseQKVEnabled ? "_pw1" : "")
+                + (lagunaTailNVFP4QKVSeedElisionEnabled ? "_se1" : "")
+                + (lagunaTailNVFP4QKVScaleDeferEnabled ? "_sd1" : ""),
+            inputNames: [
+                "normalized", "weight_codes", "scale_nibbles", "scale_bases",
+                "weight_scales", "gate_codes", "gate_scales", "gate_biases",
+            ],
+            outputNames: ["projected", "gate_values"],
+            source: lagunaDecodeNVFP4QKVGateLaneMajorSource(
+                pairwise: lagunaAttnScalePairwiseQKVEnabled, heads: heads),
+            header: lagunaTailNVFP4QMVHeader,
+            ensureRowContiguous: true)
+    }
+    return kernels
+}()
+
+/// Returns `(qkv, activatedGate)` when the merged dispatch is admissible, else
+/// `nil` so both callers keep their separate shipped dispatches. The guards are
+/// the UNION of `lagunaDecodeNVFP4QKVR1`'s lane-major arm and
+/// `lagunaGateSoftplus`, so the merged kernel fires only where both would have.
+private func lagunaDecodeNVFP4QKVGateLaneMajor(
+    normalized: MLXArray,
+    bank: LagunaNativeAffineWeight,
+    gateBank: LagunaNativeAffineWeight,
+    heads: Int
+) -> (MLXArray, MLXArray)? {
+    guard lagunaDecodeNVFP4QKVR1Enabled, lagunaGateSoftplusEnabled else { return nil }
+    let rows = (heads + 2 * LagunaConstants.numKeyValueHeads) * LagunaConstants.headDim
+    let hidden = LagunaConstants.hiddenSize
+    guard normalized.dtype == .bfloat16,
+        normalized.dims(1, 1, hidden),
+        bank.mode == .nvfp4, bank.bits == 4, bank.groupSize == 16,
+        bank.biases == nil,
+        bank.originalShape == [rows, hidden],
+        bank.packedCodes.dtype == .uint32,
+        bank.packedCodes.dims(rows, hidden / 8),
+        bank.scales.dtype == .uint8,
+        bank.scales.dims(rows, hidden / 16),
+        rows % 2 == 0,
+        let lane = bank.laneMajorScales,
+        lane.pairwise == lagunaAttnScalePairwiseQKVEnabled,
+        lane.nibbles.dtype == .uint8,
+        lane.nibbles.dims(rows, hidden / (lane.pairwise ? 64 : 32)),
+        lane.bases.dtype == .uint8, lane.bases.dims(rows),
+        gateBank.mode == .affine, gateBank.bits == 8, gateBank.groupSize == 32,
+        let gateBiases = gateBank.biases,
+        gateBank.packedCodes.dims(heads, hidden / 4),
+        gateBank.scales.dims(heads, hidden / 32),
+        gateBiases.dims(heads, hidden / 32),
+        heads % 8 == 0,
+        let kernel = lagunaDecodeNVFP4QKVGateLaneMajorKernels[heads]
+    else { return nil }
+
+    lagunaTrace("decode nvfp4 qkv+gate fold h\(heads) lane-major")
+    let out = kernel(
+        [
+            normalized, bank.packedCodes, lane.nibbles, lane.bases, bank.scales,
+            gateBank.packedCodes, gateBank.scales, gateBiases,
+        ],
+        grid: ((rows / 2 + heads / 8) * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, rows], [1, 1, heads]],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (out[0], out[1])
+}
+
 private func lagunaDecodeNVFP4QKVR1(
     normalized: MLXArray,
     bank: LagunaNativeAffineWeight,
@@ -5803,13 +5910,35 @@ final class LagunaRuntimeAttention: Module {
                 // Only materialized when the fused kernel declined; the gate
                 // branches below that read it are unreachable when it fired.
                 let normalized = fusedQKV ?? inputNorm(input)
+                // One dispatch for the NVFP4 QKV projection AND the group-32
+                // INT8 per-head gate softplus. Fires only where both shipped
+                // dispatches would have; see the fold's doc comment.
+                var mergedQKV: MLXArray?
+                var mergedGateActivated: MLXArray?
+                if fusedQKV == nil,
+                    lagunaFusedGatedAffineOProjEnabled,
+                    lagunaGatedAffineOProjNVFP4Enabled,
+                    lagunaUseNativeAffineOProj(layer: layerIdx),
+                    _nativeAffineQKVGateRows != nHeads,
+                    let affineWO = _nativeAffineOProj,
+                    affineWO.mode == .nvfp4, affineWO.bits == 4,
+                    affineWO.groupSize == 16,
+                    let affineGate = _nativeAffineGProj,
+                    let pair = lagunaDecodeNVFP4QKVGateLaneMajor(
+                        normalized: normalized, bank: fusedAffine,
+                        gateBank: affineGate, heads: nHeads)
+                {
+                    mergedQKV = pair.0
+                    mergedGateActivated = pair.1
+                }
                 let decodeNVFP4QKVR1 =
-                    fusedQKV == nil
+                    fusedQKV == nil && mergedQKV == nil
                     ? lagunaDecodeNVFP4QKVR1(
                         normalized: normalized, bank: fusedAffine, heads: nHeads)
                     : nil
                 let qkv =
                     fusedQKV
+                    ?? mergedQKV
                     ?? decodeNVFP4QKVR1
                     ?? quantizedMM(
                         normalized,
@@ -5826,7 +5955,13 @@ final class LagunaRuntimeAttention: Module {
                 let gateStart = queryDim + 2 * kvDim
                 let gateLogits: MLXArray
                 var gateProjectionActivated = false
-                if let fusedTailGateLogits {
+                if let mergedGateActivated {
+                    // The merged dispatch already applied the exact softplus
+                    // chain of the standalone gate kernel, so this is the
+                    // activated gate, identical to lagunaGateSoftplus's result.
+                    gateLogits = mergedGateActivated
+                    gateProjectionActivated = true
+                } else if let fusedTailGateLogits {
                     // Removed tail-fusion placeholder: always nil since the
                     // r=1-regime re-sweep; kept so the defer/eager plumbing
                     // below stays structurally unchanged.
