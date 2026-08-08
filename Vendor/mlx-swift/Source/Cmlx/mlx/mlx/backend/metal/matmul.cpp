@@ -303,6 +303,13 @@ void steel_matmul_regular_axpby_nax(
   int swizzle_log = tm <= 3 ? 0 : 1;
   if (devc == 's' || devc == 'c' || devc == 'd') {
     swizzle_log = 2;
+    if (a.dtype() == bfloat16 && b.dtype() == bfloat16 &&
+        out.dtype() == bfloat16 && M == 512 && N == 8192 && K == 2048 &&
+        batch_size_out == 1 && batch_shape.size() == 1 &&
+        a.shape(-2) == M && !transpose_a && transpose_b && lda == K &&
+        ldb == K && copies.empty()) {
+      swizzle_log = 3;
+    }
   }
 
   // Prepare steel matmul params
