@@ -10262,12 +10262,15 @@ uint row = thread_position_in_grid.y;
 uint col = thread_position_in_grid.x * n_cols;
 const device float* weight_row = router_weights + row * experts;
 
-bfloat expert_weights[experts];
-uint sorted_rows[experts];
-for (uint e = 0; e < experts; ++e) {
-    expert_weights[e] = bfloat(weight_row[e]);
-    sorted_rows[e] = inverse_order[row * experts + e];
+// Every thread in the group owns the same row; stage its uniform operands once.
+threadgroup bfloat expert_weights[experts];
+threadgroup uint sorted_rows[experts];
+uint stage_lid = thread_position_in_threadgroup.x;
+if (stage_lid < experts) {
+    expert_weights[stage_lid] = bfloat(weight_row[stage_lid]);
+    sorted_rows[stage_lid] = inverse_order[row * experts + stage_lid];
 }
+threadgroup_barrier(mem_flags::mem_threadgroup);
 
 for (uint i = 0; i < n_cols; ++i) {
     bfloat total = bfloat(0);
