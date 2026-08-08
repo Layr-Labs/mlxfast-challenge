@@ -2410,22 +2410,34 @@ if (head < query_heads) {
 }
 
 uint base = lane * 4;
+// `base` is a multiple of 4 and every array here is a freshly allocated MLX
+// buffer, so each group of four consecutive elements is one aligned vector
+// access. Values, expression order, the upstream `simd_sum` reduction and the
+// `lane < 16` / `lane ^ 16` pairing are all unchanged; only the number of
+// memory instructions changes (~28 scalar ops per thread down to ~6).
+const vec<bfloat, 4> in_v =
+    *reinterpret_cast<const device vec<bfloat, 4>*>(input + base);
 thread bfloat normalized[4];
 float sum = 0.0f;
-#pragma clang loop unroll(full)
-for (uint i = 0; i < 4; ++i) {
-    float value = float(input[base + i]);
-    sum += value * value;
+{
+    const float v0 = float(in_v.x);
+    const float v1 = float(in_v.y);
+    const float v2 = float(in_v.z);
+    const float v3 = float(in_v.w);
+    sum += v0 * v0;
+    sum += v1 * v1;
+    sum += v2 * v2;
+    sum += v3 * v3;
 }
 sum = simd_sum(sum);
 float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
-#pragma clang loop unroll(full)
-for (uint i = 0; i < 4; ++i) {
-    normalized[i] =
-        weight[base + i] *
-        bfloat(float(input[base + i]) * inverse_rms);
-}
+const vec<bfloat, 4> w_v =
+    *reinterpret_cast<const device vec<bfloat, 4>*>(weight + base);
+normalized[0] = w_v.x * bfloat(float(in_v.x) * inverse_rms);
+normalized[1] = w_v.y * bfloat(float(in_v.y) * inverse_rms);
+normalized[2] = w_v.z * bfloat(float(in_v.z) * inverse_rms);
+normalized[3] = w_v.w * bfloat(float(in_v.w) * inverse_rms);
 
 thread float paired[4];
 #pragma clang loop unroll(full)
@@ -2436,17 +2448,24 @@ for (uint i = 0; i < 4; ++i) {
 const device float* angle_row =
     angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
 if (lane < 16) {
-    #pragma clang loop unroll(full)
-    for (uint i = 0; i < 4; ++i) {
-        uint pair = base + i;
-        float first = float(normalized[i]);
-        float second = paired[i];
-        float cosine = angle_row[pair];
-        float sine = angle_row[pair + rotary_pairs];
-        output[pair] = bfloat(first * cosine - second * sine);
-        output[pair + rotary_pairs] =
-            bfloat(first * sine + second * cosine);
-    }
+    const vec<float, 4> cos_v =
+        *reinterpret_cast<const device vec<float, 4>*>(angle_row + base);
+    const vec<float, 4> sin_v =
+        *reinterpret_cast<const device vec<float, 4>*>(
+            angle_row + base + rotary_pairs);
+    vec<bfloat, 4> lo_v;
+    vec<bfloat, 4> hi_v;
+    lo_v.x = bfloat(float(normalized[0]) * cos_v.x - paired[0] * sin_v.x);
+    hi_v.x = bfloat(float(normalized[0]) * sin_v.x + paired[0] * cos_v.x);
+    lo_v.y = bfloat(float(normalized[1]) * cos_v.y - paired[1] * sin_v.y);
+    hi_v.y = bfloat(float(normalized[1]) * sin_v.y + paired[1] * cos_v.y);
+    lo_v.z = bfloat(float(normalized[2]) * cos_v.z - paired[2] * sin_v.z);
+    hi_v.z = bfloat(float(normalized[2]) * sin_v.z + paired[2] * cos_v.z);
+    lo_v.w = bfloat(float(normalized[3]) * cos_v.w - paired[3] * sin_v.w);
+    hi_v.w = bfloat(float(normalized[3]) * sin_v.w + paired[3] * cos_v.w);
+    *reinterpret_cast<device vec<bfloat, 4>*>(output + base) = lo_v;
+    *reinterpret_cast<device vec<bfloat, 4>*>(output + base + rotary_pairs) =
+        hi_v;
 }
 """,
     ensureRowContiguous: true
@@ -2494,22 +2513,34 @@ if (head < query_heads) {
 }
 
 uint base = lane * 4;
+// `base` is a multiple of 4 and every array here is a freshly allocated MLX
+// buffer, so each group of four consecutive elements is one aligned vector
+// access. Values, expression order, the upstream `simd_sum` reduction and the
+// `lane < 16` / `lane ^ 16` pairing are all unchanged; only the number of
+// memory instructions changes (~28 scalar ops per thread down to ~6).
+const vec<bfloat, 4> in_v =
+    *reinterpret_cast<const device vec<bfloat, 4>*>(input + base);
 thread bfloat normalized[4];
 float sum = 0.0f;
-#pragma clang loop unroll(full)
-for (uint i = 0; i < 4; ++i) {
-    float value = float(input[base + i]);
-    sum += value * value;
+{
+    const float v0 = float(in_v.x);
+    const float v1 = float(in_v.y);
+    const float v2 = float(in_v.z);
+    const float v3 = float(in_v.w);
+    sum += v0 * v0;
+    sum += v1 * v1;
+    sum += v2 * v2;
+    sum += v3 * v3;
 }
 sum = simd_sum(sum);
 float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
 
-#pragma clang loop unroll(full)
-for (uint i = 0; i < 4; ++i) {
-    normalized[i] =
-        weight[base + i] *
-        bfloat(float(input[base + i]) * inverse_rms);
-}
+const vec<bfloat, 4> w_v =
+    *reinterpret_cast<const device vec<bfloat, 4>*>(weight + base);
+normalized[0] = w_v.x * bfloat(float(in_v.x) * inverse_rms);
+normalized[1] = w_v.y * bfloat(float(in_v.y) * inverse_rms);
+normalized[2] = w_v.z * bfloat(float(in_v.z) * inverse_rms);
+normalized[3] = w_v.w * bfloat(float(in_v.w) * inverse_rms);
 
 thread float paired[4];
 #pragma clang loop unroll(full)
@@ -2520,17 +2551,24 @@ for (uint i = 0; i < 4; ++i) {
 const device float* angle_row =
     angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
 if (lane < 16) {
-    #pragma clang loop unroll(full)
-    for (uint i = 0; i < 4; ++i) {
-        uint pair = base + i;
-        float first = float(normalized[i]);
-        float second = paired[i];
-        float cosine = angle_row[pair];
-        float sine = angle_row[pair + rotary_pairs];
-        output[pair] = bfloat(first * cosine - second * sine);
-        output[pair + rotary_pairs] =
-            bfloat(first * sine + second * cosine);
-    }
+    const vec<float, 4> cos_v =
+        *reinterpret_cast<const device vec<float, 4>*>(angle_row + base);
+    const vec<float, 4> sin_v =
+        *reinterpret_cast<const device vec<float, 4>*>(
+            angle_row + base + rotary_pairs);
+    vec<bfloat, 4> lo_v;
+    vec<bfloat, 4> hi_v;
+    lo_v.x = bfloat(float(normalized[0]) * cos_v.x - paired[0] * sin_v.x);
+    hi_v.x = bfloat(float(normalized[0]) * sin_v.x + paired[0] * cos_v.x);
+    lo_v.y = bfloat(float(normalized[1]) * cos_v.y - paired[1] * sin_v.y);
+    hi_v.y = bfloat(float(normalized[1]) * sin_v.y + paired[1] * cos_v.y);
+    lo_v.z = bfloat(float(normalized[2]) * cos_v.z - paired[2] * sin_v.z);
+    hi_v.z = bfloat(float(normalized[2]) * sin_v.z + paired[2] * cos_v.z);
+    lo_v.w = bfloat(float(normalized[3]) * cos_v.w - paired[3] * sin_v.w);
+    hi_v.w = bfloat(float(normalized[3]) * sin_v.w + paired[3] * cos_v.w);
+    *reinterpret_cast<device vec<bfloat, 4>*>(output + base) = lo_v;
+    *reinterpret_cast<device vec<bfloat, 4>*>(output + base + rotary_pairs) =
+        hi_v;
 }
 """,
     ensureRowContiguous: true
