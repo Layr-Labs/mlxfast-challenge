@@ -7767,8 +7767,82 @@ private let lagunaRoutedSwiGLUQMVPackedTop8Kernel = MLXFast.metalKernel(
 let lagunaRoutedGateUpR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1"] != "0"
 
+/// Sorted-stream selector for the R1 routed gate/up kernel. The control
+/// rescans each lane's eight candidates for every requested global rank (36 local
+/// comparisons on average across the eight equally represented expert
+/// slots). This variant sorts those eight candidates once with the optimal
+/// 19-comparator network, then advances only the lane whose head won each
+/// global round. The same `(ordinal, expert index)` comparator defines both
+/// the local network and the unchanged SIMD butterfly, so selected experts
+/// and all downstream arithmetic remain bit-identical. Three paired local
+/// contrasts favored the sorted arm by 0.73%, 0.36%, and 0.50% in steady
+/// decode; set `DARKBLOOM_ROUTED_GATEUP_SORTED_TOP8=0` to restore the rescan
+/// control.
+private let lagunaRoutedGateUpSortedTop8Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_SORTED_TOP8"] != "0"
+
+private let lagunaRouterTop8SortedHeader = """
+METAL_FUNC void laguna_router_pair_exchange(
+    thread uint2& a, thread uint2& b) {
+    if (laguna_router_ordinal_before(b.x, b.y, a.x, a.y)) {
+        const uint2 temp = a;
+        a = b;
+        b = temp;
+    }
+}
+"""
+
+private let lagunaRouterTop8SortedPrelude = """
+thread uint2 top8_pairs[8];
+for (uint j = 0; j < 8; ++j) {
+    top8_pairs[j] = uint2(router_keys[lane + 32u * j], lane + 32u * j);
+}
+laguna_router_pair_exchange(top8_pairs[0], top8_pairs[1]);
+laguna_router_pair_exchange(top8_pairs[2], top8_pairs[3]);
+laguna_router_pair_exchange(top8_pairs[4], top8_pairs[5]);
+laguna_router_pair_exchange(top8_pairs[6], top8_pairs[7]);
+laguna_router_pair_exchange(top8_pairs[0], top8_pairs[2]);
+laguna_router_pair_exchange(top8_pairs[1], top8_pairs[3]);
+laguna_router_pair_exchange(top8_pairs[4], top8_pairs[6]);
+laguna_router_pair_exchange(top8_pairs[5], top8_pairs[7]);
+laguna_router_pair_exchange(top8_pairs[1], top8_pairs[2]);
+laguna_router_pair_exchange(top8_pairs[5], top8_pairs[6]);
+laguna_router_pair_exchange(top8_pairs[0], top8_pairs[4]);
+laguna_router_pair_exchange(top8_pairs[3], top8_pairs[7]);
+laguna_router_pair_exchange(top8_pairs[1], top8_pairs[5]);
+laguna_router_pair_exchange(top8_pairs[2], top8_pairs[6]);
+laguna_router_pair_exchange(top8_pairs[1], top8_pairs[4]);
+laguna_router_pair_exchange(top8_pairs[3], top8_pairs[6]);
+laguna_router_pair_exchange(top8_pairs[2], top8_pairs[4]);
+laguna_router_pair_exchange(top8_pairs[3], top8_pairs[5]);
+laguna_router_pair_exchange(top8_pairs[3], top8_pairs[4]);
+
+uint top8_local_rank = 0u;
+uint top8_winner = 0u;
+for (uint r = 0; r <= expert_slot; ++r) {
+    uint2 best_pair = top8_pairs[top8_local_rank];
+    for (ushort offset = 16; offset > 0; offset >>= 1) {
+        const uint2 other_pair = simd_shuffle_xor(best_pair, offset);
+        if (laguna_router_ordinal_before(
+            other_pair.x, other_pair.y, best_pair.x, best_pair.y)) {
+            best_pair = other_pair;
+        }
+    }
+    top8_winner = best_pair.y;
+    if ((top8_winner & 31u) == lane) {
+        ++top8_local_rank;
+    }
+}
+"""
+
+private let lagunaRoutedGateUpR1Top8Prelude =
+    lagunaRoutedGateUpSortedTop8Enabled
+    ? lagunaRouterTop8SortedPrelude : lagunaRouterTop8PrecomputedPrelude
+
 private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2",
+    name: lagunaRoutedGateUpSortedTop8Enabled
+        ? "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_sorted_bf16_v1"
+        : "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2",
     inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
     outputNames: ["activated"],
     source: """
@@ -7792,7 +7866,7 @@ uint tile = group / routed_experts;
 uint simd_group = simdgroup_index_in_threadgroup;
 uint lane = thread_index_in_simdgroup;
 uint logical_row = tile * 2 + simd_group;
-\(lagunaRouterTop8PrecomputedPrelude)
+\(lagunaRoutedGateUpR1Top8Prelude)
 uint expert = top8_winner;
 
 const device uint8_t* expert_weight =
@@ -7878,7 +7952,9 @@ if (lane == 0) {
 }
 """,
     header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
-        + "\n" + lagunaRouterTop8PrologueHeader,
+        + "\n" + lagunaRouterTop8PrologueHeader
+        + (lagunaRoutedGateUpSortedTop8Enabled
+            ? "\n" + lagunaRouterTop8SortedHeader : ""),
     ensureRowContiguous: true
 )
 
