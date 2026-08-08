@@ -11,7 +11,7 @@ import MLXFast
 // stock pass), replaces it for both prefill's already-sliced last hidden row
 // and single-token decode with four dispatches:
 //
-//   1. COARSE (`lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel`): one fused
+//   1. COARSE (`lagunaLmHeadCoarseKernel`): one fused
 //      GEMV over an init-time planar int5 copy of lm_head (1344 B/row) that
 //      emits each row's coarse logit c_i and a certified error bound delta_i.
 //      With d_i = sum_j |x_j| * (sd_g/2) >= sum_j |x_j| * |w_ij - what_ij|
@@ -38,7 +38,7 @@ import MLXFast
 //      r, and thresholds just below bfloat(e_r) instead of below the coarse
 //      lower bound L. Sound for ANY r because e_r <= e_winner, which removes
 //      the winner's own quantization delta from the threshold.
-//   4. EXACT (`lagunaLmHeadInlineExactDeltaBF16Kernel`): each simdgroup owns a
+//   4. EXACT (`lagunaLmHeadExactKernel`): each simdgroup owns a
 //      FIXED block of four output rows and runs a full BF16 GEMV over that
 //      block only when `coarse[r] + float(delta[r]) >= threshold` for one of
 //      its rows, writing `bfloat(coarse[r])` otherwise. The per-row arithmetic
@@ -113,17 +113,14 @@ private let lagunaLmHeadPruneHeader = """
     }
     """
 
-/// The one-pass coarse kernel, used for prefill's already-sliced final row and
-/// as the same-binary decode control arm: 16 rows/threadgroup, one simdgroup
-/// per row, lane = 2 consecutive 32-element groups, fused coarse+delta
-/// outputs, 1344 B/row (nibble plane 1024 B + 1-bit plane 256 B + 64 scale
-/// bytes; 2048 elements x 5 bits = 1280 B of codes). All loads stay
-/// word-aligned: uint4 per lane-group from the nibble plane (16 B stride,
-/// 1024 B rows), one uint per lane-group from the 1-bit plane (4 B stride,
-/// 256 B rows), ushort4 from x. The ratio bound and the BF16-up delta store
-/// are folded in.
+/// Unified coarse kernel for both prefill's one-pass int5 screen and decode's
+/// base-plane-only screen. `mode[0]==0` selects the one-pass form (reads the
+/// 1-bit plane for exact int5 decode, half-cell bound, 1344 B/row); `mode[0]==1`
+/// selects the base-plane-only form (midpoint code, full-cell bound, 1088
+/// B/row). Both paths share the same 16-rows/threadgroup launch and lane
+/// partition, folding coarse+delta outputs.
 ///
-/// Certificate:
+/// Prefill (mode 0) certificate:
 ///   * Scale. sd = 2^e per 32-element group with e = floorexp(gmax) - 3,
 ///     +1 when mantissa(gmax) >= 1.9375 (bit-exact integer test
 ///     mant >= 0x780000), so gmax/sd < 15.5 EXACTLY in both cases
@@ -134,27 +131,27 @@ private let lagunaLmHeadPruneHeader = """
 ///     clamp, and `buildInt5Planes` VERIFIES max|q| <= 15 on the actual
 ///     tensor, declining to the stock head if that ever fails. So
 ///     u = q + 16 is in [1, 31] and |w - sd*q| <= sd/2 EXACTLY (flat
-///     half-cell; 0.5*sd is exact, both factors powers of two). Were u = 0
-///     reachable the ratio below would be 32, not 30 -- the init guard is
-///     load-bearing.
+///     half-cell; 0.5*sd is exact, both factors powers of two).
 ///   * Ratio bound. The m term contributes sd*|x_j|*|q_ij| and the d term
 ///     (0.5*sd)*|x_j| -- same elements, same positive power-of-two group
 ///     scale -- so their ratio is exactly 2*|q_ij| <= 30, m_i <= 30*d_i
 ///     termwise, and d_i*(1+gamma) + 2*gamma*m_i <= d_i*(1 + 61*gamma).
-///     The scalars agree exactly in FP32: (1+gamma) + 30*(2*gamma) ==
-///     1 + 61*gamma bit-for-bit.
 ///   * Store. The FP32 bound d_acc*(1 + 61*GAMMA) is rounded UP to BF16 by
-///     sign-clear mask-and-bump bit surgery (d_acc is a sum of non-negative
-///     products, so its sign bit is clear); widening delta only admits
-///     candidates (monotone), and delta does not feed the threshold at all --
-///     only the candidate test.
-/// Decode exactness: float4(uint4) of values <= 31 and the -16.0f offset are
-/// exact; sd*q multiplies a power of two by a <=4-bit-magnitude integer
-/// float: exact. Accumulation depth is ~45 roundings/element-path, under
-/// the depth <= 96 budget assumed by gamma = 2^-15.
-private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_int5_inline_coarse_ratio_bound_delta_bf16_v6",
-    inputNames: ["x", "codes_lo", "codes_hi", "scales"],
+///     sign-clear mask-and-bump bit surgery; widening delta only admits
+///     candidates (monotone), and delta does not feed the threshold.
+/// Decode (mode 1) certificate:
+///   * Midpoint code. The nibble is H = floor(q/2) + 8, so q = 2H + b - 16
+///     with b the residual bit this path does not read. Substituting the
+///     cell midpoint b = 0.5 gives q0 = 2H - 15.5 and |q - q0| = 0.5 EXACTLY,
+///     so |w - sd*q0| <= |w - sd*q| + 0.5*sd <= sd: the full cell, twice the
+///     one-pass kernel's half-cell. That is why d_acc accumulates sd*ag here
+///     and (0.5*sd)*ag there.
+///   * Ratio bound. H <= 15 so |q0| <= 15.5, giving m_i <= 15.5*d_i
+///     termwise and d_i*(1+gamma) + 2*gamma*m_i <= d_i*(1 + 32*gamma).
+///   * Store. Identical sign-clear mask-and-bump round-UP to BF16.
+private let lagunaLmHeadCoarseKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_int5_coarse_delta_bf16_v7",
+    inputNames: ["x", "codes_lo", "codes_hi", "scales", "mode"],
     outputNames: ["coarse", "delta"],
     source: """
         constexpr float GAMMA = 0x1p-15f;
@@ -164,144 +161,86 @@ private let lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel = MLXFast.metalKerne
         uint lane = thread_index_in_simdgroup;
 
         const device uint8_t* lorow = codes_lo + size_t(row) * 1024;
-        const device uint8_t* hirow = codes_hi + size_t(row) * 256;
         const device uint8_t* srow = scales + size_t(row) * 64;
 
         float c_acc = 0.0f;
         float d_acc = 0.0f;
-        for (uint gg = 0; gg < 2; ++gg) {
-            uint g = 2 * lane + gg;
-            float sd = laguna_e8m0_decode(srow[g]);
-            uint4 lo4 = ((const device uint4*)(lorow + g * 16))[0];
-            uint hb = ((const device uint*)(hirow + g * 4))[0];
-            const device ushort4* xrow = (const device ushort4*)(x + g * 32);
-            float cg = 0.0f;
-            float ag = 0.0f;
-            #pragma clang loop unroll(full)
-            for (uint w = 0; w < 4; ++w) {
-                // Word w: elements 8w..8w+7 of the group. Nibble plane byte
-                // b holds elements 2b (low) / 2b+1 (high); 1-bit plane bit j
-                // of the group's word holds element j's residual bit.
-                uint lw = lo4[w];
-                uint hw = hb >> (8u * w);
-                uint4 ne = (uint4(lw) >> uint4(0u, 8u, 16u, 24u)) & 15u;
-                uint4 no = (uint4(lw) >> uint4(4u, 12u, 20u, 28u)) & 15u;
-                uint4 he = (uint4(hw) >> uint4(0u, 2u, 4u, 6u)) & 1u;
-                uint4 ho = (uint4(hw) >> uint4(1u, 3u, 5u, 7u)) & 1u;
-                // The nibble stores floor(q/2)+8 and the bit plane stores
-                // q-2*floor(q/2), so joining them rebuilds u = q + 16 in
-                // [1, 31]; offset-binary decode is exact.
-                float4 ve = float4((ne << 1u) | he) - 16.0f;
-                float4 vo = float4((no << 1u) | ho) - 16.0f;
-                // bf16 -> f32 is exactly bits<<16 for every value class.
-                float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
-                float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
-                float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
-                float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
-                float4 axe = metal::abs(xe);
-                float4 axo = metal::abs(xo);
+        if (mode[0] == 0u) {
+            const device uint8_t* hirow = codes_hi + size_t(row) * 256;
+            for (uint gg = 0; gg < 2; ++gg) {
+                uint g = 2 * lane + gg;
+                float sd = laguna_e8m0_decode(srow[g]);
+                uint4 lo4 = ((const device uint4*)(lorow + g * 16))[0];
+                uint hb = ((const device uint*)(hirow + g * 4))[0];
+                const device ushort4* xrow = (const device ushort4*)(x + g * 32);
+                float cg = 0.0f;
+                float ag = 0.0f;
                 #pragma clang loop unroll(full)
-                for (uint k = 0; k < 4; ++k) {
-                    cg += xe[k] * ve[k];
-                    cg += xo[k] * vo[k];
-                    ag += axe[k];
-                    ag += axo[k];
+                for (uint w = 0; w < 4; ++w) {
+                    uint lw = lo4[w];
+                    uint hw = hb >> (8u * w);
+                    uint4 ne = (uint4(lw) >> uint4(0u, 8u, 16u, 24u)) & 15u;
+                    uint4 no = (uint4(lw) >> uint4(4u, 12u, 20u, 28u)) & 15u;
+                    uint4 he = (uint4(hw) >> uint4(0u, 2u, 4u, 6u)) & 1u;
+                    uint4 ho = (uint4(hw) >> uint4(1u, 3u, 5u, 7u)) & 1u;
+                    float4 ve = float4((ne << 1u) | he) - 16.0f;
+                    float4 vo = float4((no << 1u) | ho) - 16.0f;
+                    float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
+                    float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
+                    float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
+                    float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
+                    float4 axe = metal::abs(xe);
+                    float4 axo = metal::abs(xo);
+                    #pragma clang loop unroll(full)
+                    for (uint k = 0; k < 4; ++k) {
+                        cg += xe[k] * ve[k];
+                        cg += xo[k] * vo[k];
+                        ag += axe[k];
+                        ag += axo[k];
+                    }
                 }
+                c_acc += sd * cg;
+                d_acc += (0.5f * sd) * ag;
             }
-            c_acc += sd * cg;
-            d_acc += (0.5f * sd) * ag;
+        } else {
+            for (uint gg = 0; gg < 2; ++gg) {
+                uint g = 2 * lane + gg;
+                float sd = laguna_e8m0_decode(srow[g]);
+                uint4 c4 = ((const device uint4*)(lorow + g * 16))[0];
+                const device ushort4* xrow = (const device ushort4*)(x + g * 32);
+                float cg = 0.0f;
+                float ag = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint w = 0; w < 4; ++w) {
+                    uint lw = c4[w];
+                    uint4 ne = (uint4(lw) >> uint4(0u, 8u, 16u, 24u)) & 15u;
+                    uint4 no = (uint4(lw) >> uint4(4u, 12u, 20u, 28u)) & 15u;
+                    float4 ve = float4(ne << 1u) - 15.5f;
+                    float4 vo = float4(no << 1u) - 15.5f;
+                    float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
+                    float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
+                    float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
+                    float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
+                    float4 axe = metal::abs(xe);
+                    float4 axo = metal::abs(xo);
+                    #pragma clang loop unroll(full)
+                    for (uint k = 0; k < 4; ++k) {
+                        cg += xe[k] * ve[k];
+                        cg += xo[k] * vo[k];
+                        ag += axe[k];
+                        ag += axo[k];
+                    }
+                }
+                c_acc += sd * cg;
+                d_acc += sd * ag;
+            }
         }
         c_acc = simd_sum(c_acc);
         d_acc = simd_sum(d_acc);
         if (lane == 0) {
             coarse[row] = c_acc;
-            // FP32 bound, then rounded UP to BF16 (mask-and-bump, sign clear).
-            float d_up = d_acc * (1.0f + 61.0f * GAMMA);
-            uint dbits = as_type<uint>(d_up);
-            uint dtrunc = dbits & 0xFFFF0000u;
-            if (dtrunc != dbits) {
-                dtrunc += 0x00010000u;
-            }
-            delta[row] = as_type<bfloat>(ushort(dtrunc >> 16));
-        }
-        """,
-    header: lagunaLmHeadPruneHeader,
-    ensureRowContiguous: true
-)
-
-/// Level one of the three-level decode screen: the same 16-rows/threadgroup
-/// launch and lane partition as the one-pass kernel, but reading ONLY the
-/// nibble plane and the scale bytes -- 1088 B/row instead of 1344 B/row, i.e.
-/// 25.7 MB less per decode step across the 100352-row vocabulary.
-///
-/// Certificate (the scale and code facts are the one-pass kernel's, unchanged):
-///   * Midpoint code. The nibble is H = floor(q/2) + 8, so q = 2H + b - 16
-///     with b the residual bit this kernel does not read. Substituting the
-///     cell midpoint b = 0.5 gives q0 = 2H - 15.5 and |q - q0| = 0.5 EXACTLY,
-///     so |w - sd*q0| <= |w - sd*q| + 0.5*sd <= sd: the full cell, twice the
-///     one-pass kernel's half-cell. That is why d_acc accumulates sd*ag here
-///     and (0.5*sd)*ag there.
-///   * Ratio bound. H <= 15 so |q0| <= 15.5, the m term contributes
-///     sd*|x_j|*|q0_ij| and the d term sd*|x_j|, giving m_i <= 15.5*d_i
-///     termwise and d_i*(1+gamma) + 2*gamma*m_i <= d_i*(1 + 32*gamma).
-///     32*gamma is 2^-10, so 1 + 32*gamma is exact in FP32.
-///   * Store. Identical sign-clear mask-and-bump round-UP to BF16; widening
-///     delta is monotone in candidacy and delta never feeds the threshold.
-/// Decode exactness: H << 1 <= 30 and the -15.5f offset are exact in FP32
-/// (q0 = 2H - 15.5 needs 6 significand bits), and sd*q0 multiplies a power of
-/// two by that value: exact.
-private let lagunaLmHeadInt5BaseCoarseKernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_int5_base_coarse_delta_bf16_v1",
-    inputNames: ["x", "codes_base", "scales"],
-    outputNames: ["coarse", "delta"],
-    source: """
-        constexpr float GAMMA = 0x1p-15f;
-
-        uint row = threadgroup_position_in_grid.x * 16 +
-            simdgroup_index_in_threadgroup;
-        uint lane = thread_index_in_simdgroup;
-
-        const device uint8_t* crow = codes_base + size_t(row) * 1024;
-        const device uint8_t* srow = scales + size_t(row) * 64;
-
-        float c_acc = 0.0f;
-        float d_acc = 0.0f;
-        for (uint gg = 0; gg < 2; ++gg) {
-            uint g = 2 * lane + gg;
-            float sd = laguna_e8m0_decode(srow[g]);
-            uint4 c4 = ((const device uint4*)(crow + g * 16))[0];
-            const device ushort4* xrow = (const device ushort4*)(x + g * 32);
-            float cg = 0.0f;
-            float ag = 0.0f;
-            #pragma clang loop unroll(full)
-            for (uint w = 0; w < 4; ++w) {
-                uint lw = c4[w];
-                uint4 ne = (uint4(lw) >> uint4(0u, 8u, 16u, 24u)) & 15u;
-                uint4 no = (uint4(lw) >> uint4(4u, 12u, 20u, 28u)) & 15u;
-                float4 ve = float4(ne << 1u) - 15.5f;
-                float4 vo = float4(no << 1u) - 15.5f;
-                float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
-                float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
-                float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
-                float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
-                float4 axe = metal::abs(xe);
-                float4 axo = metal::abs(xo);
-                #pragma clang loop unroll(full)
-                for (uint k = 0; k < 4; ++k) {
-                    cg += xe[k] * ve[k];
-                    cg += xo[k] * vo[k];
-                    ag += axe[k];
-                    ag += axo[k];
-                }
-            }
-            c_acc += sd * cg;
-            d_acc += sd * ag;
-        }
-        c_acc = simd_sum(c_acc);
-        d_acc = simd_sum(d_acc);
-        if (lane == 0) {
-            coarse[row] = c_acc;
-            float d_up = d_acc * (1.0f + 32.0f * GAMMA);
+            float bound_mult = mode[0] == 0u ? 61.0f : 32.0f;
+            float d_up = d_acc * (1.0f + bound_mult * GAMMA);
             uint dbits = as_type<uint>(d_up);
             uint dtrunc = dbits & 0xFFFF0000u;
             if (dtrunc != dbits) {
@@ -511,113 +450,24 @@ private let lagunaLmHeadExactWinnerBF16PredecessorThresholdKernel = MLXFast.meta
         """,
     ensureRowContiguous: true
 )
-
-/// The inline-mask exact pass over a BF16 `delta`: a fixed four-row block per
-/// simdgroup, the stock `gemv_al_bfloat16` replica for candidate rows, one
-/// owning lane per output slot, and `bfloat(coarse[r])` for the rest. The two
-/// `delta[r]` reads are widened by `float(...)`, an exact conversion.
+/// Unified exact kernel for both prefill's inline-mask pass and decode's
+/// fused-int5 sparse refine pass. `mode[0]==0` selects the one-pass inline
+/// exact form (no residual-plane refinement); `mode[0]==1` selects the
+/// three-level decode form (re-reads the residual bit plane for live blocks
+/// and re-screens with a tightened bound). Both paths share the same
+/// fixed four-row block per simdgroup, the same launch geometry, and the
+/// stock `gemv_al_bfloat16` replica for candidate rows.
 ///
-/// The stored delta was rounded UP, so `coarse[r] + float(delta[r])` is >= the
-/// FP32 bound's sum (FP32 addition is monotone) while `thr[0]` moved DOWN, and
-/// every row an FP32 delta would call a candidate is still a candidate here.
-/// Newly admitted rows are written with the stock-exact GEMV value instead of
-/// their certified-below `bfloat(coarse[r])`, which cannot move the argmax.
-/// `coarse` is untouched FP32, so skipped slots keep the exact bits an FP32
-/// delta arm would store.
-private let lagunaLmHeadInlineExactDeltaBF16Kernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_exact_inline_mask_block_delta_bf16_lane0_mask_v1",
-    inputNames: ["coarse", "delta", "thr", "lm_head", "x"],
-    outputNames: ["assembled"],
-    source: """
-        constexpr uint VOCAB = 100352;
-        constexpr uint K = 2048;
-
-        uint tgid = threadgroup_position_in_grid.x;
-        uint sgid = simdgroup_index_in_threadgroup;
-        uint lane = thread_index_in_simdgroup;
-
-        // This simdgroup's fixed four output rows. VOCAB is 3136 * 32, so the
-        // grid tiles it exactly; the bounds test is belt-and-braces.
-        uint base = tgid * 32 + sgid * 4;
-
-        // The predicate is simdgroup-uniform, so lane 0 forms it once and
-        // broadcasts the four row decisions. Reusing the mask below removes
-        // the same coarse/delta/threshold reads from the final write path.
-        uint candidate_mask = 0;
-        if (lane == 0) {
-            #pragma unroll
-            for (uint tm = 0; tm < 4; ++tm) {
-                uint r = base + tm;
-                if (r < VOCAB && coarse[r] + float(delta[r]) >= thr[0]) {
-                    candidate_mask |= 1u << tm;
-                }
-            }
-        }
-        candidate_mask = simd_broadcast(candidate_mask, 0);
-
-        if (candidate_mask == 0) {
-            if (lane < 4 && base + lane < VOCAB) {
-                assembled[base + lane] = bfloat(coarse[base + lane]);
-            }
-            return;
-        }
-
-        // --- stock gemv_al replica begin (gemv.h:151-289) ---
-        thread float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        thread bfloat inter[4];
-        thread float v_coeff[4];
-        uint bn = lane * 4;
-        for (uint i = 0; i < 16; ++i) {
-            vec<bfloat, 4> xv =
-                *((const device vec<bfloat, 4>*)(x + bn));
-            v_coeff[0] = float(xv.x);
-            v_coeff[1] = float(xv.y);
-            v_coeff[2] = float(xv.z);
-            v_coeff[3] = float(xv.w);
-            #pragma unroll
-            for (uint tm = 0; tm < 4; ++tm) {
-                const device bfloat* mrow = lm_head + size_t(base + tm) * K;
-                vec<bfloat, 4> mv =
-                    *((const device vec<bfloat, 4>*)(mrow + bn));
-                inter[0] = mv.x;
-                inter[1] = mv.y;
-                inter[2] = mv.z;
-                inter[3] = mv.w;
-                result[tm] += inter[0] * v_coeff[0];
-                result[tm] += inter[1] * v_coeff[1];
-                result[tm] += inter[2] * v_coeff[2];
-                result[tm] += inter[3] * v_coeff[3];
-            }
-            bn += 128;
-        }
-        #pragma unroll
-        for (uint tm = 0; tm < 4; ++tm) {
-            #pragma unroll
-            for (ushort sn = 16; sn >= 1; sn >>= 1) {
-                result[tm] += simd_shuffle_down(result[tm], sn);
-            }
-        }
-        // --- stock gemv_al replica end ---
-        if (lane == 0) {
-            #pragma unroll
-            for (uint tm = 0; tm < 4; ++tm) {
-                uint r = base + tm;
-                if (r < VOCAB) {
-                    assembled[r] = (candidate_mask & (1u << tm)) != 0
-                        ? bfloat(result[tm])
-                        : bfloat(coarse[r]);
-                }
-            }
-        }
-        """,
-    ensureRowContiguous: true
-)
-
-/// Levels two and three of the decode screen, fused into the exact dispatch:
-/// the same fixed four-row block per simdgroup and the same launch geometry as
-/// the one-pass exact kernel, with a sparse residual-plane refinement inserted
-/// between the base screen and the BF16 GEMV.
+/// Prefill (mode 0):
+/// The predicate is simdgroup-uniform; lane 0 forms it once and broadcasts the
+/// four row decisions. Non-candidate slots keep `bfloat(coarse[r])`, which the
+/// certificate shows is strictly below the winner; candidate slots get the
+/// stock-exact GEMV value. The stored delta was rounded UP, so
+/// `coarse[r] + float(delta[r])` is >= the FP32 bound's sum while `thr[0]`
+/// moved DOWN, and every row an FP32 delta would call a candidate is still a
+/// candidate here.
 ///
+/// Decode (mode 1):
 /// A block that fails the base screen writes `bfloat(coarse[r])` and returns,
 /// exactly as before. A block that survives re-reads the 256 B residual bit
 /// plane and 64 B of scales for its live rows ONLY, adds
@@ -626,7 +476,7 @@ private let lagunaLmHeadInlineExactDeltaBF16Kernel = MLXFast.metalKernel(
 /// BF16 lm_head. Live blocks are rare (single digits per step), so the plane
 /// bytes this refunds are negligible against the 25.7 MB level one saves.
 ///
-/// Refined bound, re-derived rather than inherited:
+/// Refined bound (mode 1 only):
 ///   * `coarse[r] + correction` reconstructs sd*(2H + b - 16) = sd*q exactly
 ///     (2H - 15.5 + b - 0.5 = 2H + b - 16, and every term is a power of two
 ///     times a <=6-significand-bit value), so the exact-arithmetic error
@@ -641,15 +491,15 @@ private let lagunaLmHeadInlineExactDeltaBF16Kernel = MLXFast.metalKernel(
 ///     margin. The multiply is EXACT in FP32 (a widened BF16 has <= 8
 ///     significand bits, the constant has 13, and 21 < 24), and the
 ///     mask-and-bump round-UP to BF16 that follows only widens further.
-///     Copying the source submission's `0x1.004p-1f` = (1 + 32*gamma)/2
+///   * Copying the source submission's `0x1.004p-1f` = (1 + 32*gamma)/2
 ///     would deliver only d*(1 + 64.03*gamma) and miss the derived bound by
 ///     about one gamma.
 /// The refined value is per-simdgroup scratch held by its owning lane, so no
 /// threadgroup storage or barrier is involved.
-private let lagunaLmHeadRefinedExactKernel = MLXFast.metalKernel(
-    name: "laguna_lmhead_exact_fused_int5_sparse_refine_v1",
+private let lagunaLmHeadExactKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_exact_mask_block_v2",
     inputNames: [
-        "coarse", "delta", "thr", "lm_head", "x", "codes_bit", "scales",
+        "coarse", "delta", "thr", "lm_head", "x", "codes_bit", "scales", "mode",
     ],
     outputNames: ["assembled"],
     source: """
@@ -681,6 +531,58 @@ private let lagunaLmHeadRefinedExactKernel = MLXFast.metalKernel(
             return;
         }
 
+        if (mode[0] == 0u) {
+            // --- stock gemv_al replica begin (gemv.h:151-289) ---
+            thread float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            thread bfloat inter[4];
+            thread float v_coeff[4];
+            uint bn = lane * 4;
+            for (uint i = 0; i < 16; ++i) {
+                vec<bfloat, 4> xv =
+                    *((const device vec<bfloat, 4>*)(x + bn));
+                v_coeff[0] = float(xv.x);
+                v_coeff[1] = float(xv.y);
+                v_coeff[2] = float(xv.z);
+                v_coeff[3] = float(xv.w);
+                #pragma unroll
+                for (uint tm = 0; tm < 4; ++tm) {
+                    const device bfloat* mrow = lm_head + size_t(base + tm) * K;
+                    vec<bfloat, 4> mv =
+                        *((const device vec<bfloat, 4>*)(mrow + bn));
+                    inter[0] = mv.x;
+                    inter[1] = mv.y;
+                    inter[2] = mv.z;
+                    inter[3] = mv.w;
+                    result[tm] += inter[0] * v_coeff[0];
+                    result[tm] += inter[1] * v_coeff[1];
+                    result[tm] += inter[2] * v_coeff[2];
+                    result[tm] += inter[3] * v_coeff[3];
+                }
+                bn += 128;
+            }
+            #pragma unroll
+            for (uint tm = 0; tm < 4; ++tm) {
+                #pragma unroll
+                for (ushort sn = 16; sn >= 1; sn >>= 1) {
+                    result[tm] += simd_shuffle_down(result[tm], sn);
+                }
+            }
+            // --- stock gemv_al replica end ---
+            if (lane == 0) {
+                #pragma unroll
+                for (uint tm = 0; tm < 4; ++tm) {
+                    uint r = base + tm;
+                    if (r < VOCAB) {
+                        assembled[r] = (base_mask & (1u << tm)) != 0
+                            ? bfloat(result[tm])
+                            : bfloat(coarse[r]);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Mode 1: decode with sparse residual-plane refinement.
         // Per-thread scratch: every lane holds a copy, only lane 0's is ever
         // written or consumed.
         thread float refined_coarse[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -808,6 +710,7 @@ private let lagunaLmHeadRefinedExactKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+
 /// Init-time int5 coarse copy of lm_head plus the pruned final-row forward.
 /// Built once (untimed init) by
 /// `LagunaRuntimeModel.prepareFusedRuntimeWeights` when
@@ -930,28 +833,21 @@ final class LagunaLmHeadPruner {
         let vocab = lagunaLmHeadPruneVocab
         let x = hidden.reshaped([lagunaLmHeadPruneHidden])
         let refine = useFusedRefinement && lagunaLmHeadFusedRefinementEnabled
+        let coarseMode = MLXArray([refine ? UInt32(1) : UInt32(0)])
+        let exactMode = MLXArray([refine ? UInt32(1) : UInt32(0)])
         // Four dispatches: the int5 coarse pass, argmax stage one over
         // `coarse` alone (no `delta` read), the exact-winner threshold that
         // absorbs the winning row's 4 KB GEMV, and the inline-mask exact pass.
-        // With `refine` the first and last dispatch swap to the three-level
-        // form: the coarse pass reads 1088 B/row instead of 1344 B/row and the
-        // exact pass re-reads the residual bit plane for live blocks only.
-        let coarseOut =
-            refine
-            ? lagunaLmHeadInt5BaseCoarseKernel(
-                [x, int5CodesLo, int5Scales],
-                grid: (vocab / 16 * 512, 1, 1),
-                threadGroup: (512, 1, 1),
-                outputShapes: [[vocab], [vocab]],
-                outputDTypes: [.float32, .bfloat16]
-            )
-            : lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel(
-                [x, int5CodesLo, int5CodesHi, int5Scales],
-                grid: (vocab / 16 * 512, 1, 1),
-                threadGroup: (512, 1, 1),
-                outputShapes: [[vocab], [vocab]],
-                outputDTypes: [.float32, .bfloat16]
-            )
+        // With `refine` the coarse pass reads 1088 B/row instead of 1344 B/row
+        // and the exact pass re-reads the residual bit plane for live blocks
+        // only.
+        let coarseOut = lagunaLmHeadCoarseKernel(
+            [x, int5CodesLo, int5CodesHi, int5Scales, coarseMode],
+            grid: (vocab / 16 * 512, 1, 1),
+            threadGroup: (512, 1, 1),
+            outputShapes: [[vocab], [vocab]],
+            outputDTypes: [.float32, .bfloat16]
+        )
         let coarse = coarseOut[0]
         let delta = coarseOut[1]
         let argmaxPartials = lagunaLmHeadCoarseArgmaxStage1Kernel(
@@ -968,22 +864,13 @@ final class LagunaLmHeadPruner {
             outputShapes: [[1]],
             outputDTypes: [.float32]
         )[0]
-        let assembled =
-            refine
-            ? lagunaLmHeadRefinedExactKernel(
-                [coarse, delta, thr, lmHeadWeight, x, int5CodesHi, int5Scales],
-                grid: (vocab / 32 * 256, 1, 1),
-                threadGroup: (256, 1, 1),
-                outputShapes: [[vocab]],
-                outputDTypes: [.bfloat16]
-            )[0]
-            : lagunaLmHeadInlineExactDeltaBF16Kernel(
-                [coarse, delta, thr, lmHeadWeight, x],
-                grid: (vocab / 32 * 256, 1, 1),
-                threadGroup: (256, 1, 1),
-                outputShapes: [[vocab]],
-                outputDTypes: [.bfloat16]
-            )[0]
+        let assembled = lagunaLmHeadExactKernel(
+            [coarse, delta, thr, lmHeadWeight, x, int5CodesHi, int5Scales, exactMode],
+            grid: (vocab / 32 * 256, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[vocab]],
+            outputDTypes: [.bfloat16]
+        )[0]
         return assembled.reshaped([1, 1, vocab])
     }
 }
