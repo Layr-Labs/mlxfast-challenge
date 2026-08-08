@@ -9340,6 +9340,14 @@ private let lagunaDecodeRouterOrdinalEnabled =
 private let lagunaDecodeRouterOrdinalScoreTableEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_ORDINAL_SCORE_TABLE"] != "0"
 
+/// Use the exact two-phase 32 -> 64 tournament for decode as well as prefill.
+/// Its second phase keeps one live finalist set instead of sorting four
+/// wrapped duplicates. Set `DARKBLOOM_DECODE_ROUTER_TOURNAMENT=0` to restore
+/// the promoted full 256-entry decode network.
+// Official replay nonce 2: executable and Metal source remain unchanged.
+private let lagunaDecodeRouterTournamentEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ROUTER_TOURNAMENT"] != "0"
+
 func lagunaDecodeRouterTop8AcceptedForTesting(
     logits: MLXArray, correctionBias: MLXArray, normalizing: Bool = false
 ) -> (MLXArray, MLXArray) {
@@ -9408,6 +9416,14 @@ private func lagunaDecodeRouterTop8(
 ) -> (MLXArray, MLXArray) {
     if lagunaDecodeRouterOrdinalEnabled {
         if lagunaDecodeRouterOrdinalScoreTableEnabled {
+            if lagunaDecodeRouterTournamentEnabled {
+                return lagunaPrefillRouterTournamentOrdinalForTesting(
+                    logits: logits,
+                    correctionBias: correctionBias,
+                    rows: 1,
+                    normalizing: normalizing
+                )
+            }
             return lagunaDecodeRouterTop8OrdinalScoreTableForTesting(
                 logits: logits,
                 correctionBias: correctionBias,
@@ -9799,8 +9815,8 @@ if (lane < 8) {
 uint lane = thread_position_in_threadgroup.x;
 uint row = threadgroup_position_in_grid.y;
 
-threadgroup uint xchg_ordinals[256];
-threadgroup uint xchg_indices[256];
+threadgroup uint xchg_ordinals[64];
+threadgroup uint xchg_indices[64];
 threadgroup uint candidate_ordinals[64];
 threadgroup uint candidate_indices[64];
 threadgroup float original_scores[256];
@@ -9815,8 +9831,10 @@ uint my_index = lane;
 
 for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
     for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
-        uint other_ordinal = simd_shuffle_xor(my_ordinal, ushort(stride));
-        uint other_index = simd_shuffle_xor(my_index, ushort(stride));
+        uint2 other_pair = simd_shuffle_xor(
+            uint2(my_ordinal, my_index), ushort(stride));
+        uint other_ordinal = other_pair.x;
+        uint other_index = other_pair.y;
 
         bool is_lower = (lane & stride) == 0;
         bool lower_wants_better = (lane & sequence) == 0;
@@ -9842,24 +9860,22 @@ if (is_local_top8) {
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-uint my_ordinal2 = candidate_ordinals[lane & 63];
-uint my_index2 = candidate_indices[lane & 63];
-for (uint sequence = 2; sequence <= 64; sequence <<= 1) {
+uint my_ordinal2 = 0u;
+uint my_index2 = 0u;
+if (lane < 64) {
+    my_ordinal2 = candidate_ordinals[lane];
+    my_index2 = candidate_indices[lane];
+}
+
+// Sequences through 32 are local to the first two simdgroups; the other six
+// groups no longer sort duplicate finalist sets.
+if (lane < 64) {
+for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
     for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
-        uint other_ordinal;
-        uint other_index;
-        if (stride < 32) {
-            other_ordinal = simd_shuffle_xor(my_ordinal2, ushort(stride));
-            other_index = simd_shuffle_xor(my_index2, ushort(stride));
-        } else {
-            xchg_ordinals[lane] = my_ordinal2;
-            xchg_indices[lane] = my_index2;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint partner = lane ^ stride;
-            other_ordinal = xchg_ordinals[partner];
-            other_index = xchg_indices[partner];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
+        uint2 other_pair = simd_shuffle_xor(
+            uint2(my_ordinal2, my_index2), ushort(stride));
+        uint other_ordinal = other_pair.x;
+        uint other_index = other_pair.y;
 
         bool is_lower = (lane & stride) == 0;
         bool lower_wants_better = (lane & sequence) == 0;
@@ -9867,6 +9883,43 @@ for (uint sequence = 2; sequence <= 64; sequence <<= 1) {
         bool other_before_my = laguna_router_ordinal_before(
             other_ordinal, other_index, my_ordinal2, my_index2);
         bool take_other = want_better ? other_before_my : !other_before_my;
+        if (take_other) {
+            my_ordinal2 = other_ordinal;
+            my_index2 = other_index;
+        }
+    }
+}
+}
+
+// Sequence 64 starts with one cross-simdgroup exchange. Every thread reaches
+// the barrier, while only the 64 live finalist lanes touch scratch or compare.
+if (lane < 64) {
+    xchg_ordinals[lane] = my_ordinal2;
+    xchg_indices[lane] = my_index2;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+if (lane < 64) {
+    uint partner = lane ^ 32u;
+    uint other_ordinal = xchg_ordinals[partner];
+    uint other_index = xchg_indices[partner];
+    bool is_lower = (lane & 32u) == 0;
+    bool other_before_my = laguna_router_ordinal_before(
+        other_ordinal, other_index, my_ordinal2, my_index2);
+    bool take_other = is_lower ? other_before_my : !other_before_my;
+    if (take_other) {
+        my_ordinal2 = other_ordinal;
+        my_index2 = other_index;
+    }
+
+    for (uint stride = 16; stride > 0; stride >>= 1) {
+        uint2 other_pair = simd_shuffle_xor(
+            uint2(my_ordinal2, my_index2), ushort(stride));
+        other_ordinal = other_pair.x;
+        other_index = other_pair.y;
+        is_lower = (lane & stride) == 0;
+        other_before_my = laguna_router_ordinal_before(
+            other_ordinal, other_index, my_ordinal2, my_index2);
+        take_other = is_lower ? other_before_my : !other_before_my;
         if (take_other) {
             my_ordinal2 = other_ordinal;
             my_index2 = other_index;
@@ -9897,7 +9950,7 @@ private let lagunaPrefillRouterTournamentNormalizingKernel = MLXFast.metalKernel
 )
 
 private let lagunaPrefillRouterTournamentOrdinalKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_router_tournament_ordinal_v1",
+    name: "laguna_prefill_router_tournament_ordinal_active64_pair_v3",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaPrefillRouterTournamentOrdinalKernelSource(normalizing: false),
@@ -9906,7 +9959,7 @@ private let lagunaPrefillRouterTournamentOrdinalKernel = MLXFast.metalKernel(
 )
 
 private let lagunaPrefillRouterTournamentOrdinalNormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_router_tournament_ordinal_norm_v1",
+    name: "laguna_prefill_router_tournament_ordinal_norm_active64_pair_v3",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaPrefillRouterTournamentOrdinalKernelSource(normalizing: true),
