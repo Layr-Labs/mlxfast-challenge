@@ -505,12 +505,22 @@ void qmm_nax(
   bool aligned_M = M % 64 == 0;
   bool batched = B > 1;
   std::string type_string = get_type_string(x.dtype());
+  // Detect halved NVFP4 scales: the caller passes group_size=32 so the
+  // ops.cpp validation accepts half-resolution scales [N+1, K/32] (since
+  // K/32 * 32 == K). The extra row at index N holds the escape bytes in
+  // its first columns. We override group_size back to 16 for the kernel.
+  const bool halved_scales =
+      transpose && mode == "nvfp4" && group_size == 32 && bits == 4;
+  if (halved_scales) {
+    group_size = 16;
+  }
   static const bool static_laguna_shapes =
       env::get_var("DARKBLOOM_STATIC_NVFP4_SHAPES", "") != "0";
   const bool use_static_laguna_shape =
       static_laguna_shapes && transpose && aligned && !batched &&
       mode == "nvfp4" && type_string == "bfloat16_t" &&
-      group_size == 16 && bits == 4 && !biases.has_value() &&
+      group_size == 16 && bits == 4 &&
+      (!biases.has_value() || halved_scales) &&
       ((K == 2048 && N == 1024) || (K == 512 && N == 2048));
   concatenate(
       kname,
@@ -596,7 +606,18 @@ void qmm_nax(
   int c = 0;
   compute_encoder.set_input_array(w, c++);
   compute_encoder.set_input_array(scales, c++);
-  if (biases) {
+  if (transpose) {
+    // The qmm_t_nax kernel always has an escape slot at index 2. When
+    // halved, the escape bytes are in the extra row of the scales tensor
+    // (row N); bind that row via a buffer offset. Otherwise pass scales
+    // as a dummy (the kernel ignores it when kHalvedScales is false).
+    if (halved_scales) {
+      int escape_offset = N * scales.shape(-1);
+      compute_encoder.set_input_array(scales, c++, escape_offset);
+    } else {
+      compute_encoder.set_input_array(scales, c++);
+    }
+  } else if (biases) {
     compute_encoder.set_input_array(*biases, c++);
   }
   compute_encoder.set_input_array(x, c++);
@@ -604,6 +625,9 @@ void qmm_nax(
   compute_encoder.set_bytes(K, c++);
   compute_encoder.set_bytes(N, c++);
   compute_encoder.set_bytes(M, c++);
+  if (transpose) {
+    compute_encoder.set_bytes(halved_scales, c++);
+  }
   add_strides_and_shapes(compute_encoder, B <= 1, x, w, scales, biases, c);
 
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
@@ -642,6 +666,15 @@ void gather_qmm_nax(
   kname.reserve(64);
   bool aligned = N % 64 == 0;
   std::string type_string = get_type_string(x.dtype());
+  // Detect halved NVFP4 scales: the caller passes group_size=32 so the
+  // ops.cpp validation accepts half-resolution scales [experts, N+1, K/32].
+  // The kernel computes the escape pointer from the scales buffer after
+  // per-expert offset adjustment, so no separate escape binding is needed.
+  const bool halved_scales =
+      transpose && mode == "nvfp4" && group_size == 32 && bits == 4;
+  if (halved_scales) {
+    group_size = 16;
+  }
   concatenate(
       kname,
       mode + (transpose ? "_gather_qmm_t_nax_" : "_gather_qmm_n_nax_"),
@@ -709,6 +742,9 @@ void gather_qmm_nax(
   compute_encoder.set_bytes(K, c++);
   compute_encoder.set_bytes(N, c++);
   compute_encoder.set_bytes(M, c++);
+  if (transpose) {
+    compute_encoder.set_bytes(halved_scales, c++);
+  }
   c = add_strides_and_shapes(compute_encoder, false, x, w, scales, biases, c);
   add_gather_strides_and_shapes(compute_encoder, lhs_indices, rhs_indices, c);
 
@@ -1590,29 +1626,6 @@ bool darkbloom_bsearch_hoist() {
   return v;
 }
 
-// Exact storage markers installed only by Laguna's certified zero-copy expert
-// scale views. Layout 1 is the fused gate/up walk-order bank; layout 2 is the
-// row-major routed down bank. Keep this classifier at the outer GatherQMM
-// boundary as well as the NAX dispatcher: normalizing either zero-stride view
-// would expand each row by repeating its first compact byte and destroy the
-// representation before the specialized loader can see it.
-int laguna_expert_pairwise_scale_layout(const array& scales) {
-  if (scales.dtype() != uint8 || scales.ndim() != 3 ||
-      scales.offset() != 0 || scales.shape(0) != 256 ||
-      scales.strides()[2] != 0) {
-    return 0;
-  }
-  if (scales.shape(1) == 1024 && scales.shape(2) == 128 &&
-      scales.strides()[0] == 1024 * 64 && scales.strides()[1] == 64) {
-    return 1;
-  }
-  if (scales.shape(1) == 2048 && scales.shape(2) == 32 &&
-      scales.strides()[0] == 2048 * 16 && scales.strides()[1] == 16) {
-    return 2;
-  }
-  return 0;
-}
-
 void gather_qmm_rhs_nax(
     const array& x_,
     const array& w_,
@@ -1652,17 +1665,7 @@ void gather_qmm_rhs_nax(
   // Normalize the input arrays
   array x = broadcast_with_indices(x_);
   array w = ensure_row_contiguous(w_, d, s);
-  // Laguna's certified packed decode scale bank is exposed to this prefill
-  // primitive through a bounded shape-preserving view. Its exact expert shape,
-  // zero last-axis stride, and layout-specific 64-byte or 16-byte compact-row
-  // strides form a fail-closed marker; the kernel consumes the inherited
-  // packed bytes directly. Every ordinary scale array retains the stock
-  // normalization path.
-  const int pairwise_scale_layout =
-      laguna_expert_pairwise_scale_layout(scales_);
-  array scales = pairwise_scale_layout != 0
-      ? scales_
-      : ensure_row_contiguous(scales_, d, s);
+  array scales = ensure_row_contiguous(scales_, d, s);
 
   // TODO: Tune the block sizes
   int bm = 64, bn = 64, bk = 64;
@@ -1693,18 +1696,6 @@ void gather_qmm_rhs_nax(
       darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
       group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
       align_N && align_K && bm == 64 && wm == 4 && (wn == 2 || wn == 1);
-  const bool pairwise_shape =
-      (pairwise_scale_layout == 1 && K == 2048 && N == 1024) ||
-      (pairwise_scale_layout == 2 && K == 512 && N == 2048);
-  const int expert_pairwise_scale_layout =
-      pairwise_scale_layout != 0 && expert_aligned && mode == "nvfp4" &&
-              pairwise_shape && scales_.shape(-1) == K / group_size
-          ? pairwise_scale_layout
-          : 0;
-  if (pairwise_scale_layout != 0 && expert_pairwise_scale_layout == 0) {
-    throw std::runtime_error(
-        "[gather_qmm] Laguna pairwise scale marker reached a non-expert path");
-  }
   std::string type_string = get_type_string(x.dtype());
   static const bool static_laguna_shapes =
       env::get_var("DARKBLOOM_STATIC_NVFP4_SHAPES", "") != "0";
@@ -1815,8 +1806,7 @@ void gather_qmm_rhs_nax(
           : "",
       expert_aligned
           ? ("_eg_" + std::to_string(egroups) + (expert_widest ? "_ws_1" : "_ws_0") +
-             (expert_wideld ? "_wl_1" : "_wl_0") +
-             "_ps_" + std::to_string(expert_pairwise_scale_layout))
+             (expert_wideld ? "_wl_1" : "_wl_0"))
           : "");
 
   // Skipping dead runs is a pure work elision (see function constant 203 in
@@ -1878,48 +1868,40 @@ void gather_qmm_rhs_nax(
     });
   }
 
-  metal::MTLFCList func_consts;
+  // Function constants eliminated: alignment and stage values are now
+  // template parameters baked into the kernel name, not runtime
+  // specializations.
+
+  // Encode alignment and stage values in kname for the non-expert path so
+  // each unique combination gets its own cached JIT library.
   if (!expert_aligned) {
-    func_consts = {
-        {&align_M, MTL::DataType::DataTypeBool, 200},
-        {&align_N, MTL::DataType::DataTypeBool, 201},
-        {&align_K, MTL::DataType::DataTypeBool, 202},
-        {&run_skip, MTL::DataType::DataTypeBool, 203},
-        {&stage_widest, MTL::DataType::DataTypeBool, 204},
-        {&stage_wideld, MTL::DataType::DataTypeBool, 205},
-        {&stage_runbar, MTL::DataType::DataTypeBool, 206},
-        {&stage_novol, MTL::DataType::DataTypeBool, 207},
-    };
+    concatenate(
+        kname,
+        "_aM_",
+        align_M ? 't' : 'n',
+        "_aN_",
+        align_N ? 't' : 'n',
+        "_aK_",
+        align_K ? 't' : 'n',
+        "_rs_",
+        run_skip ? 't' : 'n',
+        "_stg_",
+        stage_widest ? 'W' : 'n',
+        stage_wideld ? 'L' : 'n',
+        stage_runbar ? 'B' : 'n',
+        stage_novol ? 'V' : 'n');
   }
 
-  // And the kernel hash that includes the function constants
-  std::string hash_name;
-  hash_name.reserve(128);
-  concatenate(
-      hash_name,
-      kname,
-      "_align_M_",
-      align_M ? 't' : 'n',
-      "_align_N_",
-      align_N ? 't' : 'n',
-      "_align_K_",
-      align_K ? 't' : 'n',
-      "_rs_",
-      run_skip ? 't' : 'n',
-      "_stg_",
-      stage_widest ? 'W' : 'n',
-      stage_wideld ? 'L' : 'n',
-      stage_runbar ? 'B' : 'n',
-      stage_novol ? 'V' : 'n');
-
-  // Get and set the kernel. Every expert-aligned instantiation (static and
-  // runtime-shaped alike) is built from a template definition here, because
-  // the expert kernel's expert-group count is a template parameter; the
-  // shared gather builder keeps its stock signature for the non-expert path.
+  // Build the template definition with alignment and stage values as
+  // template parameters instead of function constants, eliminating pipeline
+  // specialization overhead. Each value is resolved once per process and
+  // baked into the kernel name.
+  // For affine mode, the kernel (quantized_nax.h) still uses function
+  // constants, so keep the old get_gather_qmm_nax_kernel path.
   auto& compute_encoder = metal::get_command_encoder(s);
   MTL::ComputePipelineState* kernel;
   if (expert_aligned) {
-    auto template_def = get_template_definition(
+    auto expert_template_def = get_template_definition(
         kname,
         "fp_gather_qmm_rhs_expert_nax",
         get_type_string(x.dtype()),
@@ -1936,15 +1918,34 @@ void gather_qmm_rhs_nax(
         "bfloat",
         egroups,
         expert_widest,
-        expert_wideld,
-        expert_pairwise_scale_layout);
-    kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
-  } else {
+        expert_wideld);
+    kernel = get_qmm_nax_kernel(d, kname, expert_template_def, mode);
+  } else if (mode == "affine") {
+    // Affine path: quantized_nax.h still uses function constants
+    std::string hash_name;
+    hash_name.reserve(128);
+    concatenate(
+        hash_name,
+        kname,
+        "_aM_",
+        align_M ? 't' : 'n',
+        "_aN_",
+        align_N ? 't' : 'n',
+        "_aK_",
+        align_K ? 't' : 'n',
+        "_rs_",
+        run_skip ? 't' : 'n');
+    metal::MTLFCList affine_func_consts = {
+        {&align_M, MTL::DataType::DataTypeBool, 200},
+        {&align_N, MTL::DataType::DataTypeBool, 201},
+        {&align_K, MTL::DataType::DataTypeBool, 202},
+        {&run_skip, MTL::DataType::DataTypeBool, 203},
+    };
     kernel = get_gather_qmm_nax_kernel(
         d,
         kname,
         hash_name,
-        func_consts,
+        affine_func_consts,
         x,
         group_size,
         bits,
@@ -1955,6 +1956,28 @@ void gather_qmm_rhs_nax(
         wm,
         wn,
         transpose);
+  } else {
+    auto template_def = get_template_definition(
+        kname,
+        "fp_gather_qmm_rhs_nax",
+        get_type_string(x.dtype()),
+        group_size,
+        bits,
+        bm,
+        bn,
+        bk,
+        wm,
+        wn,
+        transpose,
+        align_M,
+        align_N,
+        align_K,
+        run_skip,
+        stage_widest,
+        stage_wideld,
+        stage_runbar,
+        stage_novol);
+    kernel = get_qmm_nax_kernel(d, kname, template_def, mode);
   }
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -2236,13 +2259,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   array x = ensure_row_contiguous_matrix(inputs[0], d, s);
   array w = ensure_row_contiguous_matrix(inputs[1], d, s);
-  const int pairwise_scale_layout =
-      laguna_expert_pairwise_scale_layout(inputs[2]);
-  // Preserve the exact zero-copy marker for the dedicated NAX loader. Every
-  // ordinary array keeps the stock row-contiguous normalization.
-  array scales = pairwise_scale_layout != 0
-      ? inputs[2]
-      : ensure_row_contiguous_matrix(inputs[2], d, s);
+  array scales = ensure_row_contiguous_matrix(inputs[2], d, s);
   std::optional<array> biases = std::nullopt;
   if (inputs.size() == 6) {
     biases = ensure_row_contiguous_matrix(inputs[3], d, s);
@@ -2258,25 +2275,11 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
 
-  const bool sorted_rhs =
-      M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4;
-  const bool pairwise_contract =
-      sorted_rhs && metal::is_nax_available() && transpose_ &&
-      group_size_ == 16 && bits_ == 4 && mode == "nvfp4" &&
-      !biases.has_value() &&
-      ((pairwise_scale_layout == 1 && K == 2048 && N == 1024) ||
-       (pairwise_scale_layout == 2 && K == 512 && N == 2048));
-  if (pairwise_scale_layout != 0 && !pairwise_contract) {
-    throw std::runtime_error(
-        "[gather_qmm] Laguna pairwise scale marker reached an unsupported "
-        "outer dispatch");
-  }
-
   // We are walking x in order and w is also in order so we can batch up the
   // matmuls and reuse reading x and w.
   //
   // TODO: Tune 16 and 4 here a bit better.
-  if (sorted_rhs) {
+  if (M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4) {
     gather_qmm_rhs(
         x,
         w,
