@@ -356,7 +356,7 @@ template <
     short tgp_size,
     short group_size,
     short bits,
-    short pairwise_scale_layout = 0>
+    bool kHalvedScales = false>
 struct QuantizedBlockLoader {
   MLX_MTL_CONST short pack_factor = get_pack_factor<8, bits>();
   MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack();
@@ -370,6 +370,7 @@ struct QuantizedBlockLoader {
   MLX_MTL_CONST short n_steps_per_read = n_reads / n_reads_per_scale;
 
   MLX_MTL_CONST short n_groups = BCOLS / group_size;
+  MLX_MTL_CONST short n_groups_halved = BCOLS / (group_size * 2);
 
   const int src_ld;
   const int tile_stride;
@@ -384,10 +385,8 @@ struct QuantizedBlockLoader {
   threadgroup T* dst;
   const device uint8_t* src;
   const device uint8_t* scales;
-  const device uint8_t* pairwise_patch_base;
-  const device uint8_t* pairwise_row_base;
-  int pairwise_patch_slot;
-  int logical_group;
+  const device uint8_t* escape;
+  const int escape_mode; // 0=none, 1=gate row0, 2=up row0
 
   QuantizedBlockLoader(
       const device uint8_t* src_,
@@ -395,7 +394,9 @@ struct QuantizedBlockLoader {
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
-      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      const device uint8_t* escape_ = nullptr,
+      const int escape_mode_ = 0)
       : src_ld(src_ld_),
         tile_stride(
             reduction_dim ? BCOLS_PACKED * bytes_per_pack
@@ -408,63 +409,28 @@ struct QuantizedBlockLoader {
         dst(dst_ + bi * dst_ld + bj * pack_factor),
         src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
             bj * bytes_per_pack),
-        scales(scales_ + bi * src_ld / group_size + group_id),
-        pairwise_patch_base(scales_),
-        pairwise_row_base(scales_),
-        pairwise_patch_slot(-1),
-        logical_group(group_id) {
-    static_assert(
-        pairwise_scale_layout == 0 || reduction_dim == 1,
-        "pairwise scales are only defined for reduction-dimension staging");
-    static_assert(
-        pairwise_scale_layout >= 0 && pairwise_scale_layout <= 2,
-        "unknown Laguna pairwise scale layout");
-  }
+        scales(kHalvedScales
+               ? scales_ + bi * src_ld / (group_size * 2) + group_id / 2
+               : scales_ + bi * src_ld / group_size + group_id),
+        escape(escape_),
+        escape_mode(escape_mode_) {}
 
-  short row_in_tile() const { return bi; }
-
-  void set_pairwise_packed(
-      const device uint8_t* patch_base,
-      const device uint8_t* expert_base,
-      int row,
-      int patch_slot) {
-    // Inverse of preparePackedRoutedGateUpBank's walk-order permutation:
-    // 4 logical gate/up row pairs per tile, 4 K blocks, 8 subrows, 16 bytes.
-    const int within_block = row & 63;
-    const int logical_row = (row >> 6) * 32 + (within_block & 31);
-    const int tile = logical_row >> 2;
-    const int sub = ((logical_row & 3) << 1) + (within_block >> 5);
-    pairwise_patch_base = patch_base;
-    pairwise_row_base = expert_base + tile * 512 + sub * 16;
-    pairwise_patch_slot = patch_slot;
-  }
-
-  void set_pairwise_rowmajor(
-      const device uint8_t* patch_base,
-      const device uint8_t* expert_base,
-      int row,
-      int patch_slot) {
-    pairwise_patch_base = patch_base;
-    pairwise_row_base =
-        expert_base + size_t(row) * (src_ld / group_size / 2);
-    pairwise_patch_slot = patch_slot;
-  }
-
-  uint8_t scale_code(int step) const {
-    if constexpr (pairwise_scale_layout == 1) {
-      const int group = logical_group + step;
-      // Four 32-group K blocks are 128 bytes apart in the inherited packed
-      // bank. Each stores the 16 certified even bytes for this fused row.
-      return group == 1 && pairwise_patch_slot >= 0
-          ? pairwise_patch_base[pairwise_patch_slot]
-          : pairwise_row_base[(group >> 5) * 128 + ((group & 31) >> 1)];
-    } else if constexpr (pairwise_scale_layout == 2) {
-      const int group = logical_group + step;
-      return group == 1 && pairwise_patch_slot >= 0
-          ? pairwise_patch_base[pairwise_patch_slot]
-          : pairwise_row_base[group >> 1];
+  // Read scale byte i with halved indexing and escape handling.
+  // In the tile-interleaved fused gate/up layout, gate-row-0 is at bi==0 and
+  // up-row-0 is at bi==BROWS/2, both within tile 0 (tid.x==0).
+  inline uint8_t read_scale(short i) const {
+    if constexpr (kHalvedScales) {
+      uint8_t sc = scales[i / 2];
+      if (escape_mode > 0 && group_id == 0 && i == 1) {
+        if (bi == 0) {
+          sc = escape[0];
+        } else if (escape_mode == 1 && bi == BROWS / 2) {
+          sc = escape[1];
+        }
+      }
+      return sc;
     } else {
-      return scales[step];
+      return scales[i];
     }
   }
 
@@ -481,33 +447,9 @@ struct QuantizedBlockLoader {
   // identical addresses on both paths; see the note above dequantize().
   void stage() const {
     if constexpr (fp4nv_fast) {
-      // A pairwise marker makes adjacent logical group-16 scales aliases of
-      // one certified byte, except for the explicit expert-zero patch. Cache
-      // the decoded float once per physical pair before the source walk. The
-      // same float bits then reach the same fp4nv_decode8 calls; only repeated
-      // byte loads and E4M3 conversions disappear. This is especially useful
-      // at WN=1, where one loader thread owns both groups in a pair.
-      float pair_scales[n_steps_per_read];
-      if constexpr (pairwise_scale_layout != 0) {
-        STEEL_PRAGMA_UNROLL
-        for (short i = 0; i < n_steps_per_read; ++i) {
-          const int group = logical_group + i;
-          const bool shares_previous =
-              i > 0 && ((group >> 1) == ((group - 1) >> 1)) &&
-              !(group == 1 && pairwise_patch_slot >= 0);
-          pair_scales[i] = shares_previous
-              ? pair_scales[i - 1]
-              : fp4nv_scale_x16384(scale_code(i));
-        }
-      }
       int k = 0;
       for (int i = 0; i < n_steps_per_read; i++) {
-        float scale;
-        if constexpr (pairwise_scale_layout != 0) {
-          scale = pair_scales[i];
-        } else {
-          scale = fp4nv_scale_x16384(scale_code(i));
-        }
+        const float scale = fp4nv_scale_x16384(read_scale(i));
         for (int j = 0; j < n_reads_per_scale / 4; j++) {
           T vals[8];
           fp4nv_decode8<T>(fp4nv_pack4(src + k), scale, vals);
@@ -520,7 +462,7 @@ struct QuantizedBlockLoader {
     } else {
       int k = 0;
       for (int i = 0; i < n_steps_per_read; i++) {
-        T scale = dequantize_scale<T, group_size>(scale_code(i));
+        T scale = dequantize_scale<T, group_size>(read_scale(i));
         for (int j = 0; j < n_reads_per_scale; j++) {
           dequantize<T, bits>(
               src[k * bytes_per_pack], scale, dst + k * pack_factor);
@@ -674,25 +616,6 @@ struct QuantizedBlockLoader {
       }
     }
 
-    // The wide writer splits each logical scale span across multiple
-    // WideChunks. On the pairwise specialization, decode every distinct
-    // physical scale byte exactly once before that chunk loop. This removes
-    // both the per-chunk duplicate conversions and the adjacent-group
-    // duplicate, while the expert-zero patch still receives its own value.
-    float pair_scales[n_steps_per_read];
-    if constexpr (fp4nv_fast && pairwise_scale_layout != 0) {
-      STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < n_steps_per_read; ++i) {
-        const int group = logical_group + i;
-        const bool shares_previous =
-            i > 0 && ((group >> 1) == ((group - 1) >> 1)) &&
-            !(group == 1 && pairwise_patch_slot >= 0);
-        pair_scales[i] = shares_previous
-            ? pair_scales[i - 1]
-            : fp4nv_scale_x16384(scale_code(i));
-      }
-    }
-
     STEEL_PRAGMA_UNROLL
     for (short c = 0; c < kWideChunks; c++) {
       const short e0 = c * kWideElems;
@@ -705,20 +628,15 @@ struct QuantizedBlockLoader {
       // when a 16B chunk covers a whole multiple of them (kSrcBytesPerChunk
       // is 4 for bfloat/half staging, 2 for float). Same values either way.
       if constexpr (fp4nv_fast && (kSrcBytesPerChunk % 4) == 0) {
-        float scale;
-        if constexpr (pairwise_scale_layout != 0) {
-          scale = pair_scales[k0 / n_reads_per_scale];
-        } else {
-          scale = fp4nv_scale_x16384(scale_code(k0 / n_reads_per_scale));
-        }
+        const float scale =
+            fp4nv_scale_x16384(read_scale(k0 / n_reads_per_scale));
         STEEL_PRAGMA_UNROLL
         for (short b = 0; b < kSrcBytesPerChunk / 4; b++) {
           fp4nv_decode8<T>(fp4nv_pack4(sb + k0 + b * 4), scale, &out.v[b * 8]);
         }
       } else {
         T scale =
-            dequantize_scale<T, group_size>(
-                scale_code(k0 / n_reads_per_scale));
+            dequantize_scale<T, group_size>(read_scale(k0 / n_reads_per_scale));
         STEEL_PRAGMA_UNROLL
         for (short b = 0; b < kSrcBytesPerChunk; b++) {
           dequantize_pair(sb[k0 + b], scale, &out.v[b * pack_factor]);
@@ -762,13 +680,11 @@ struct QuantizedBlockLoader {
   void next() {
     src += tile_stride;
     if (reduction_dim == 1) {
-      if constexpr (pairwise_scale_layout != 0) {
-        logical_group += n_groups;
-      } else {
-        scales += n_groups;
-      }
+      scales += kHalvedScales ? n_groups_halved : n_groups;
     } else {
-      scales += n_groups * group_stride;
+      scales += kHalvedScales
+          ? n_groups_halved * group_stride
+          : n_groups * group_stride;
     }
   }
 };
@@ -788,10 +704,13 @@ template <
     typename Wtype = bfloat,
     const int fixed_K = 0,
     const int fixed_N = 0,
-    const bool aligned_M = false>
+    const bool aligned_M = false,
+    bool kHalvedScales = false,
+    bool kGatherEscape = false>
 METAL_FUNC void fp_qmm_t_impl(
     const device uint32_t* w,
     const device uint8_t* scales,
+    const device uint8_t* escape,
     const device T* x,
     device T* y,
     threadgroup Wtype* Ws,
@@ -823,11 +742,12 @@ METAL_FUNC void fp_qmm_t_impl(
       1,
       WM * WN * SIMD_SIZE,
       group_size,
-      bits>;
+      bits,
+      kHalvedScales>;
 
   // Set the block
   const int K_w = kernel_K * bytes_per_pack / pack_factor;
-  const int K_g = kernel_K / group_size;
+  const int K_g = kernel_K / (group_size * (kHalvedScales ? 2 : 1));
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
 
@@ -838,8 +758,34 @@ METAL_FUNC void fp_qmm_t_impl(
   scales += y_col * K_g;
   y += y_row * static_cast<int64_t>(kernel_N) + y_col;
 
+  // Determine escape handling for the fused gate/up layout.
+  // escape_mode=0: no escape. escape_mode=1: tile-interleaved (gather),
+  //   bi==0 gets escape[0] (gate row 0), bi==BROWS/2 gets escape[1] (up row 0).
+  // escape_mode=3: sequential (shared expert qmm), only bi==0 gets escape,
+  //   caller pre-offsets escape_ptr to the correct byte per tile.
+  const device uint8_t* escape_ptr = escape;
+  int escape_mode = 0;
+  if constexpr (kHalvedScales) {
+    if constexpr (kGatherEscape) {
+      // Tile-interleaved: gate32+up32 in every 64-row tile. Only tile 0
+      // (y_col==0) has the escape exception (row 0 and row 32).
+      if (y_col == 0) {
+        escape_mode = 1;
+      }
+    } else {
+      // Sequential: gate rows 0..N/2-1, up rows N/2..N-1.
+      if (y_col == 0) {
+        escape_mode = 3;
+      } else if (y_col == kernel_N / 2) {
+        escape_mode = 3;
+        escape_ptr = escape + 1;
+      }
+    }
+  }
+
   // Make the weight loader
-  loader_w_t loader_w(wl, scales, kernel_K, Ws, simd_gid, simd_lid);
+  loader_w_t loader_w(
+      wl, scales, kernel_K, Ws, simd_gid, simd_lid, escape_ptr, escape_mode);
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
@@ -1155,10 +1101,12 @@ template <
     const int BN = 64,
     const int WM = 2,
     const int WN = 2,
-    typename Wtype = bfloat>
+    typename Wtype = bfloat,
+    bool kHalvedScales = false>
 [[kernel]] void fp_qmm_t_nax(
     const device uint32_t* w,
     const device uint8_t* scales,
+    const device uint8_t* escape,
     const device T* x,
     device T* y,
     const constant int& K,
@@ -1197,8 +1145,22 @@ template <
         s_strides,
         tid);
   }
-  fp_qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN, Wtype>(
-      w, scales, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+  fp_qmm_t_impl<
+      T,
+      group_size,
+      bits,
+      aligned_N,
+      BM,
+      BK,
+      BN,
+      WM,
+      WN,
+      Wtype,
+      0,
+      0,
+      false,
+      kHalvedScales>(
+      w, scales, escape, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
 // Laguna's shared-expert NVFP4 projections have two fixed matrix shapes.
@@ -1217,10 +1179,12 @@ template <
     const int BN = 64,
     const int WM = 2,
     const int WN = 2,
-    typename Wtype = bfloat>
+    typename Wtype = bfloat,
+    bool kHalvedScales = false>
 [[kernel]] void fp_qmm_t_nax_static(
     const device uint32_t* w,
     const device uint8_t* scales,
+    const device uint8_t* escape,
     const device T* x,
     device T* y,
     const constant int& K,
@@ -1264,8 +1228,9 @@ template <
       Wtype,
       fixed_K,
       fixed_N,
-      aligned_M>(
-      w, scales, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+      aligned_M,
+      kHalvedScales>(
+      w, scales, escape, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
 template <
@@ -1337,7 +1302,8 @@ template <
     const int BN = 64,
     const int WM = 2,
     const int WN = 2,
-    typename Wtype = bfloat>
+    typename Wtype = bfloat,
+    bool kHalvedScales = false>
 [[kernel]] void fp_gather_qmm_t_nax(
     const device uint32_t* w,
     const device uint8_t* scales,
@@ -1389,8 +1355,33 @@ template <
       w_strides,
       s_strides,
       tid);
-  fp_qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN, Wtype>(
-      w, scales, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+
+  // For halved scales [experts, N+1, K/32], after adjust_matrix_offsets
+  // adjusts `scales` to the selected expert's block, the escape bytes are
+  // at row N (offset N * K_g where K_g = K/32 for halved).
+  const int kernel_K = K;
+  const int kernel_N = N;
+  const int K_g_halved = kernel_K / (group_size * 2);
+  const device uint8_t* escape_ptr =
+      kHalvedScales ? (scales + kernel_N * K_g_halved) : scales;
+
+  fp_qmm_t_impl<
+      T,
+      group_size,
+      bits,
+      aligned_N,
+      BM,
+      BK,
+      BN,
+      WM,
+      WN,
+      Wtype,
+      0,
+      0,
+      false,
+      kHalvedScales,
+      true>(
+      w, scales, escape_ptr, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
 template <
@@ -1827,8 +1818,7 @@ template <
     typename Wtype = bfloat,
     int tg_expert_groups = 64,
     bool wide_store = false,
-    bool wide_load = false,
-    short pairwise_scale_layout = 0>
+    bool wide_load = false>
 [[kernel]] void fp_gather_qmm_rhs_expert_nax(
     const device T* x,
     const device uint32_t* w,
@@ -1869,8 +1859,7 @@ template <
       true,
       WM * WN * SIMD_SIZE,
       group_size,
-      bits,
-      pairwise_scale_layout>;
+      bits>;
 
   constexpr int kWsElems = BN * BK_padded;
   constexpr int kWsPerChunk = 16 / sizeof(Wtype);
@@ -1893,10 +1882,8 @@ template <
   const int y_col = tid.x * BN;
 
   auto wl = (const device uint8_t*)w + size_t(y_col) * K_w;
-  const device uint8_t* scale_base = scales;
-  if constexpr (pairwise_scale_layout == 0) {
-    scale_base += size_t(y_col) * K_g;
-  }
+  const device uint8_t* scale_base =
+      scales + size_t(y_col) * K_g;
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
@@ -1972,33 +1959,13 @@ template <
 
       const device T* xn =
           x + size_t(chunk_start + tm) * kernel_K;
-      const device uint8_t* loader_scales = pairwise_scale_layout != 0
-          ? scales
-          : scale_base + size_t(expert) * stride_s;
       thread loader_w_t loader_w(
           wl + size_t(expert) * stride_w,
-          loader_scales,
+          scale_base + size_t(expert) * stride_s,
           kernel_K,
           Ws,
           simd_group_id,
           simd_lane_id);
-      if constexpr (pairwise_scale_layout == 1) {
-        const int scale_row = y_col + int(loader_w.row_in_tile());
-        const int patch_slot = expert == 0 && scale_row == 0
-            ? 0
-            : (expert == 0 && scale_row == 32 ? 1 : -1);
-        const device uint8_t* packed_expert = scales + 128
-            + size_t(expert) * (size_t(kernel_N) * K_g / 2);
-        loader_w.set_pairwise_packed(
-            scales, packed_expert, scale_row, patch_slot);
-      } else if constexpr (pairwise_scale_layout == 2) {
-        const int scale_row = y_col + int(loader_w.row_in_tile());
-        const int patch_slot = expert == 0 && scale_row == 0 ? 0 : -1;
-        const device uint8_t* packed_expert = scales + 128
-            + size_t(expert) * (size_t(kernel_N) * K_g / 2);
-        loader_w.set_pairwise_rowmajor(
-            scales, packed_expert, scale_row, patch_slot);
-      }
 
       for (int k = 0; k < K_it; ++k) {
         // Bit-exact A-operand hoist (the XMAJOR arm's shipped pattern at
