@@ -95,6 +95,14 @@ let lagunaLmHeadFusedRefinementEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_LMHEAD_FUSED_REFINEMENT"] != "0"
 
+/// Exact M1 composition: compute the 64 activation-group L1
+/// sums once, then reuse them for every vocabulary row's certificate instead
+/// of repeating the same abs/add chain 100,352 times. Keep an explicit
+/// fallback for order-balanced local measurements.
+private let lagunaLmHeadPrecomputeAbsGroupsEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_LMHEAD_PRECOMPUTE_ABS_GROUPS"] != "0"
+
 /// One-line stderr trace hooks (DARKBLOOM_TRACE_FUSION=1) so an active pruner
 /// is visible in run logs.
 private let lagunaTraceFusionEnabled =
@@ -296,6 +304,95 @@ private let lagunaLmHeadInt5BaseCoarseKernel = MLXFast.metalKernel(
             }
             c_acc += sd * cg;
             d_acc += sd * ag;
+        }
+        c_acc = simd_sum(c_acc);
+        d_acc = simd_sum(d_acc);
+        if (lane == 0) {
+            coarse[row] = c_acc;
+            float d_up = d_acc * (1.0f + 32.0f * GAMMA);
+            uint dbits = as_type<uint>(d_up);
+            uint dtrunc = dbits & 0xFFFF0000u;
+            if (dtrunc != dbits) {
+                dtrunc += 0x00010000u;
+            }
+            delta[row] = as_type<bfloat>(ushort(dtrunc >> 16));
+        }
+        """,
+    header: lagunaLmHeadPruneHeader,
+    ensureRowContiguous: true
+)
+
+/// One thread per activation group, reproducing the M1 coarse kernel's local
+/// absolute-value addition order exactly. The 256-byte result replaces the
+/// identical per-row work in the precomputed coarse twin below.
+private let lagunaLmHeadAbsGroupSumsKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_abs_group_sums_v1",
+    inputNames: ["x"],
+    outputNames: ["abs_group_sums"],
+    source: """
+        uint g = thread_position_in_grid.x;
+        const device ushort4* xrow = (const device ushort4*)(x + g * 32);
+        float ag = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint w = 0; w < 4; ++w) {
+            float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
+            float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
+            float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
+            float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
+            float4 axe = metal::abs(xe);
+            float4 axo = metal::abs(xo);
+            #pragma clang loop unroll(full)
+            for (uint k = 0; k < 4; ++k) {
+                ag += axe[k];
+                ag += axo[k];
+            }
+        }
+        abs_group_sums[g] = ag;
+        """,
+    ensureRowContiguous: true
+)
+
+private let lagunaLmHeadInt5BaseCoarsePrecomputedAbsKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_int5_base_coarse_precomputed_abs_delta_bf16_v1",
+    inputNames: ["x", "codes_base", "scales", "abs_group_sums"],
+    outputNames: ["coarse", "delta"],
+    source: """
+        constexpr float GAMMA = 0x1p-15f;
+
+        uint row = threadgroup_position_in_grid.x * 16 +
+            simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        const device uint8_t* crow = codes_base + size_t(row) * 1024;
+        const device uint8_t* srow = scales + size_t(row) * 64;
+
+        float c_acc = 0.0f;
+        float d_acc = 0.0f;
+        for (uint gg = 0; gg < 2; ++gg) {
+            uint g = 2 * lane + gg;
+            float sd = laguna_e8m0_decode(srow[g]);
+            uint4 c4 = ((const device uint4*)(crow + g * 16))[0];
+            const device ushort4* xrow = (const device ushort4*)(x + g * 32);
+            float cg = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint w = 0; w < 4; ++w) {
+                uint lw = c4[w];
+                uint4 ne = (uint4(lw) >> uint4(0u, 8u, 16u, 24u)) & 15u;
+                uint4 no = (uint4(lw) >> uint4(4u, 12u, 20u, 28u)) & 15u;
+                float4 ve = float4(ne << 1u) - 15.5f;
+                float4 vo = float4(no << 1u) - 15.5f;
+                float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
+                float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
+                float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
+                float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
+                #pragma clang loop unroll(full)
+                for (uint k = 0; k < 4; ++k) {
+                    cg += xe[k] * ve[k];
+                    cg += xo[k] * vo[k];
+                }
+            }
+            c_acc += sd * cg;
+            d_acc += sd * abs_group_sums[g];
         }
         c_acc = simd_sum(c_acc);
         d_acc = simd_sum(d_acc);
@@ -930,28 +1027,47 @@ final class LagunaLmHeadPruner {
         let vocab = lagunaLmHeadPruneVocab
         let x = hidden.reshaped([lagunaLmHeadPruneHidden])
         let refine = useFusedRefinement && lagunaLmHeadFusedRefinementEnabled
-        // Four dispatches: the int5 coarse pass, argmax stage one over
-        // `coarse` alone (no `delta` read), the exact-winner threshold that
-        // absorbs the winning row's 4 KB GEMV, and the inline-mask exact pass.
-        // With `refine` the first and last dispatch swap to the three-level
-        // form: the coarse pass reads 1088 B/row instead of 1344 B/row and the
-        // exact pass re-reads the residual bit plane for live blocks only.
-        let coarseOut =
-            refine
-            ? lagunaLmHeadInt5BaseCoarseKernel(
+        let absGroupSums: MLXArray? =
+            refine && lagunaLmHeadPrecomputeAbsGroupsEnabled
+            ? lagunaLmHeadAbsGroupSumsKernel(
+                [x],
+                grid: (64, 1, 1),
+                threadGroup: (64, 1, 1),
+                outputShapes: [[64]],
+                outputDTypes: [.float32]
+            )[0]
+            : nil
+        // Five decode dispatches: one 64-group activation reduction, the int5
+        // coarse pass, argmax stage one over `coarse` alone (no `delta` read),
+        // the exact-winner threshold that absorbs the winning row's 4 KB GEMV,
+        // and the inline-mask exact pass. The activation reduction replaces
+        // the same abs/add chain in every one of the 100,352 coarse rows.
+        let coarseOut: [MLXArray]
+        if refine, let absGroupSums {
+            coarseOut = lagunaLmHeadInt5BaseCoarsePrecomputedAbsKernel(
+                [x, int5CodesLo, int5Scales, absGroupSums],
+                grid: (vocab / 16 * 512, 1, 1),
+                threadGroup: (512, 1, 1),
+                outputShapes: [[vocab], [vocab]],
+                outputDTypes: [.float32, .bfloat16]
+            )
+        } else if refine {
+            coarseOut = lagunaLmHeadInt5BaseCoarseKernel(
                 [x, int5CodesLo, int5Scales],
                 grid: (vocab / 16 * 512, 1, 1),
                 threadGroup: (512, 1, 1),
                 outputShapes: [[vocab], [vocab]],
                 outputDTypes: [.float32, .bfloat16]
             )
-            : lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel(
+        } else {
+            coarseOut = lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel(
                 [x, int5CodesLo, int5CodesHi, int5Scales],
                 grid: (vocab / 16 * 512, 1, 1),
                 threadGroup: (512, 1, 1),
                 outputShapes: [[vocab], [vocab]],
                 outputDTypes: [.float32, .bfloat16]
             )
+        }
         let coarse = coarseOut[0]
         let delta = coarseOut[1]
         let argmaxPartials = lagunaLmHeadCoarseArgmaxStage1Kernel(
@@ -968,22 +1084,24 @@ final class LagunaLmHeadPruner {
             outputShapes: [[1]],
             outputDTypes: [.float32]
         )[0]
-        let assembled =
-            refine
-            ? lagunaLmHeadRefinedExactKernel(
+        let assembled: MLXArray
+        if refine {
+            assembled = lagunaLmHeadRefinedExactKernel(
                 [coarse, delta, thr, lmHeadWeight, x, int5CodesHi, int5Scales],
                 grid: (vocab / 32 * 256, 1, 1),
                 threadGroup: (256, 1, 1),
                 outputShapes: [[vocab]],
                 outputDTypes: [.bfloat16]
             )[0]
-            : lagunaLmHeadInlineExactDeltaBF16Kernel(
+        } else {
+            assembled = lagunaLmHeadInlineExactDeltaBF16Kernel(
                 [coarse, delta, thr, lmHeadWeight, x],
                 grid: (vocab / 32 * 256, 1, 1),
                 threadGroup: (256, 1, 1),
                 outputShapes: [[vocab]],
                 outputDTypes: [.bfloat16]
             )[0]
+        }
         return assembled.reshaped([1, 1, vocab])
     }
 }
