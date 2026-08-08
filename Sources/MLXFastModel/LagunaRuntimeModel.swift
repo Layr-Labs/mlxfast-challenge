@@ -1398,7 +1398,11 @@ func lagunaSlidingQKNormRoPE(
 /// `laguna_sliding_qk_norm_rope_bf16_128_v1`), persists the new K/V row
 /// into the ring backing at the slot `RotatingKVCache.updateInPlace` would
 /// have written, and attends over the full 512-slot ring in slot order with
-/// the GQA-pair schedule of the shipped `sdpa_vector` pair path (textual
+/// a 4-query-head GQA schedule: one threadgroup owns 4 adjacent query heads
+/// of a single kv head, so each kv-head ring plane is read by 2 threadgroups
+/// instead of 4 (251.7 MB -> 125.8 MB of logical KV reads per decode step),
+/// at the cost of halving the grid from 32 to 16 threadgroups. Per-head
+/// arithmetic is that of the shipped `sdpa_vector` pair path (textual
 /// replica: same key visit order per simdgroup, same online-softmax text
 /// including the alpha-skip rescale, same two-plane combine and reduction
 /// trees). Bit-exactness of the substitution: at slot `write_idx` every
@@ -1432,12 +1436,15 @@ constexpr int qk_per_thread = 4;
 constexpr int v_per_thread = 4;
 constexpr uint rotary_pairs = 64;
 constexpr int N = 512;
+constexpr int NH = 4;
 
 typedef float U;
 
 uint pair_tg = threadgroup_position_in_grid.x;
-uint head0 = pair_tg * 2;
+uint head0 = pair_tg * NH;
 uint head1 = head0 + 1;
+uint head2 = head0 + 2;
+uint head3 = head0 + 3;
 uint kv_head = head0 / gqa;
 uint sg = simdgroup_index_in_threadgroup;
 uint lane = thread_index_in_simdgroup;
@@ -1446,18 +1453,19 @@ float scale = scale_arr[0];
 
 threadgroup bfloat tg_q0[head_dim];
 threadgroup bfloat tg_q1[head_dim];
+threadgroup bfloat tg_q2[head_dim];
+threadgroup bfloat tg_q3[head_dim];
 threadgroup bfloat tg_k[head_dim];
 threadgroup bfloat tg_v[head_dim];
 
-if (sg < 3) {
+if (sg < NH + 1) {
     const device bfloat* input =
-        sg == 0 ? raw_queries + head0 * head_dim
-        : sg == 1 ? raw_queries + head1 * head_dim
-                  : raw_keys + kv_head * head_dim;
+        sg == 0 ? raw_queries + head0 * head_dim : sg == 1 ? raw_queries + head1 * head_dim : sg == 2 ? raw_queries + head2 * head_dim : sg == 3 ? raw_queries + head3 * head_dim : 
+        raw_keys + kv_head * head_dim;
     const device bfloat* weight =
-        sg == 2 ? key_weight : query_weight;
+        sg == NH ? key_weight : query_weight;
     threadgroup bfloat* outrow =
-        sg == 0 ? tg_q0 : sg == 1 ? tg_q1 : tg_k;
+        sg == 0 ? tg_q0 : sg == 1 ? tg_q1 : sg == 2 ? tg_q2 : sg == 3 ? tg_q3 : tg_k;
 
     uint base = lane * 4;
     thread bfloat normalized[4];
@@ -1489,13 +1497,16 @@ if (sg < 3) {
                 bfloat(first * sine + second * cosine);
         }
     }
-} else if (sg == 3) {
+} else if (sg == NH + 1) {
     const device bfloat* vin = raw_values + kv_head * head_dim;
     for (uint i = lane; i < head_dim; i += 32) {
         tg_v[i] = vin[i];
     }
 }
+
 threadgroup_barrier(mem_flags::mem_threadgroup);
+
+
 
 if ((head0 % gqa) == 0 && sg == 0) {
     device bfloat* kc = (device bfloat*)k_cache +
@@ -1510,9 +1521,9 @@ if ((head0 % gqa) == 0 && sg == 0) {
     }
 }
 
-threadgroup U outputs[4 * BN * BDP];
-threadgroup U max_scores[2 * BN];
-threadgroup U sum_exp_scores[2 * BN];
+threadgroup U outputs[NH * BN * BDP];
+threadgroup U max_scores[NH * BN];
+threadgroup U sum_exp_scores[NH * BN];
 
 const device bfloat* pair_keys = k_cache +
     (size_t)kv_head * (window * head_dim) +
@@ -1525,24 +1536,34 @@ const int inner_v_stride = BN * int(head_dim);
 
 thread U pair_q0[qk_per_thread];
 thread U pair_q1[qk_per_thread];
+thread U pair_q2[qk_per_thread];
+thread U pair_q3[qk_per_thread];
 thread U pair_o0[v_per_thread];
 thread U pair_o1[v_per_thread];
+thread U pair_o2[v_per_thread];
+thread U pair_o3[v_per_thread];
 
 for (int j = 0; j < qk_per_thread; ++j) {
-    pair_q0[j] =
-        static_cast<U>(scale) * tg_q0[lane * qk_per_thread + j];
-    pair_q1[j] =
-        static_cast<U>(scale) * tg_q1[lane * qk_per_thread + j];
+    pair_q0[j] = static_cast<U>(scale) * tg_q0[lane * qk_per_thread + j];
+    pair_q1[j] = static_cast<U>(scale) * tg_q1[lane * qk_per_thread + j];
+    pair_q2[j] = static_cast<U>(scale) * tg_q2[lane * qk_per_thread + j];
+    pair_q3[j] = static_cast<U>(scale) * tg_q3[lane * qk_per_thread + j];
 }
 for (int j = 0; j < v_per_thread; ++j) {
     pair_o0[j] = 0;
     pair_o1[j] = 0;
+    pair_o2[j] = 0;
+    pair_o3[j] = 0;
 }
 
 U pair_max0 = metal::numeric_limits<U>::lowest();
 U pair_max1 = metal::numeric_limits<U>::lowest();
+U pair_max2 = metal::numeric_limits<U>::lowest();
+U pair_max3 = metal::numeric_limits<U>::lowest();
 U pair_sum0 = 0;
 U pair_sum1 = 0;
+U pair_sum2 = 0;
+U pair_sum3 = 0;
 
 int i = sg;
 for (; i + BN < N; i += 2 * BN) {
@@ -1556,155 +1577,241 @@ for (; i + BN < N; i += 2 * BN) {
     T_LOAD_K(pipe_kb, sub_b, pipe_keys_b);
     bfloat pipe_va0, pipe_va1, pipe_va2, pipe_va3;
     bfloat pipe_vb0, pipe_vb1, pipe_vb2, pipe_vb3;
-    T_LOAD_V(pipe_va0, pipe_va1, pipe_va2, pipe_va3, sub_a,
-        pair_values);
-    T_LOAD_V(pipe_vb0, pipe_vb1, pipe_vb2, pipe_vb3, sub_b,
-        pipe_values_b);
+    T_LOAD_V(pipe_va0, pipe_va1, pipe_va2, pipe_va3, sub_a, pair_values);
+    T_LOAD_V(pipe_vb0, pipe_vb1, pipe_vb2, pipe_vb3, sub_b, pipe_values_b);
 
     U pair_score0 = 0;
     U pair_score1 = 0;
+    U pair_score2 = 0;
+    U pair_score3 = 0;
     pair_score0 += pair_q0[0] * pipe_ka[0];
-    pair_score1 += pair_q1[0] * pipe_ka[0];
     pair_score0 += pair_q0[1] * pipe_ka[1];
-    pair_score1 += pair_q1[1] * pipe_ka[1];
     pair_score0 += pair_q0[2] * pipe_ka[2];
-    pair_score1 += pair_q1[2] * pipe_ka[2];
     pair_score0 += pair_q0[3] * pipe_ka[3];
-    pair_score1 += pair_q1[3] * pipe_ka[3];
     pair_score0 = simd_sum(pair_score0);
+    pair_score1 += pair_q1[0] * pipe_ka[0];
+    pair_score1 += pair_q1[1] * pipe_ka[1];
+    pair_score1 += pair_q1[2] * pipe_ka[2];
+    pair_score1 += pair_q1[3] * pipe_ka[3];
     pair_score1 = simd_sum(pair_score1);
-
+    pair_score2 += pair_q2[0] * pipe_ka[0];
+    pair_score2 += pair_q2[1] * pipe_ka[1];
+    pair_score2 += pair_q2[2] * pipe_ka[2];
+    pair_score2 += pair_q2[3] * pipe_ka[3];
+    pair_score2 = simd_sum(pair_score2);
+    pair_score3 += pair_q3[0] * pipe_ka[0];
+    pair_score3 += pair_q3[1] * pipe_ka[1];
+    pair_score3 += pair_q3[2] * pipe_ka[2];
+    pair_score3 += pair_q3[3] * pipe_ka[3];
+    pair_score3 = simd_sum(pair_score3);
     U pair_new_max0 = metal::max(pair_max0, pair_score0);
     U pair_new_max1 = metal::max(pair_max1, pair_score1);
+    U pair_new_max2 = metal::max(pair_max2, pair_score2);
+    U pair_new_max3 = metal::max(pair_max3, pair_score3);
     U pair_factor0;
     U pair_factor1;
+    U pair_factor2;
+    U pair_factor3;
     LAGUNA_RESCALE(pair_factor0, pair_max0 - pair_new_max0);
     LAGUNA_RESCALE(pair_factor1, pair_max1 - pair_new_max1);
+    LAGUNA_RESCALE(pair_factor2, pair_max2 - pair_new_max2);
+    LAGUNA_RESCALE(pair_factor3, pair_max3 - pair_new_max3);
     U pair_exp0 = metal::fast::exp(pair_score0 - pair_new_max0);
     U pair_exp1 = metal::fast::exp(pair_score1 - pair_new_max1);
-
+    U pair_exp2 = metal::fast::exp(pair_score2 - pair_new_max2);
+    U pair_exp3 = metal::fast::exp(pair_score3 - pair_new_max3);
     pair_max0 = pair_new_max0;
     pair_max1 = pair_new_max1;
+    pair_max2 = pair_new_max2;
+    pair_max3 = pair_new_max3;
     pair_sum0 = pair_sum0 * pair_factor0 + pair_exp0;
     pair_sum1 = pair_sum1 * pair_factor1 + pair_exp1;
-
+    pair_sum2 = pair_sum2 * pair_factor2 + pair_exp2;
+    pair_sum3 = pair_sum3 * pair_factor3 + pair_exp3;
     pair_o0[0] = pair_o0[0] * pair_factor0 + pair_exp0 * pipe_va0;
     pair_o1[0] = pair_o1[0] * pair_factor1 + pair_exp1 * pipe_va0;
+    pair_o2[0] = pair_o2[0] * pair_factor2 + pair_exp2 * pipe_va0;
+    pair_o3[0] = pair_o3[0] * pair_factor3 + pair_exp3 * pipe_va0;
     pair_o0[1] = pair_o0[1] * pair_factor0 + pair_exp0 * pipe_va1;
     pair_o1[1] = pair_o1[1] * pair_factor1 + pair_exp1 * pipe_va1;
+    pair_o2[1] = pair_o2[1] * pair_factor2 + pair_exp2 * pipe_va1;
+    pair_o3[1] = pair_o3[1] * pair_factor3 + pair_exp3 * pipe_va1;
     pair_o0[2] = pair_o0[2] * pair_factor0 + pair_exp0 * pipe_va2;
     pair_o1[2] = pair_o1[2] * pair_factor1 + pair_exp1 * pipe_va2;
+    pair_o2[2] = pair_o2[2] * pair_factor2 + pair_exp2 * pipe_va2;
+    pair_o3[2] = pair_o3[2] * pair_factor3 + pair_exp3 * pipe_va2;
     pair_o0[3] = pair_o0[3] * pair_factor0 + pair_exp0 * pipe_va3;
     pair_o1[3] = pair_o1[3] * pair_factor1 + pair_exp1 * pipe_va3;
+    pair_o2[3] = pair_o2[3] * pair_factor2 + pair_exp2 * pipe_va3;
+    pair_o3[3] = pair_o3[3] * pair_factor3 + pair_exp3 * pipe_va3;
 
     U pipeb_score0 = 0;
     U pipeb_score1 = 0;
+    U pipeb_score2 = 0;
+    U pipeb_score3 = 0;
     pipeb_score0 += pair_q0[0] * pipe_kb[0];
-    pipeb_score1 += pair_q1[0] * pipe_kb[0];
     pipeb_score0 += pair_q0[1] * pipe_kb[1];
-    pipeb_score1 += pair_q1[1] * pipe_kb[1];
     pipeb_score0 += pair_q0[2] * pipe_kb[2];
-    pipeb_score1 += pair_q1[2] * pipe_kb[2];
     pipeb_score0 += pair_q0[3] * pipe_kb[3];
-    pipeb_score1 += pair_q1[3] * pipe_kb[3];
     pipeb_score0 = simd_sum(pipeb_score0);
+    pipeb_score1 += pair_q1[0] * pipe_kb[0];
+    pipeb_score1 += pair_q1[1] * pipe_kb[1];
+    pipeb_score1 += pair_q1[2] * pipe_kb[2];
+    pipeb_score1 += pair_q1[3] * pipe_kb[3];
     pipeb_score1 = simd_sum(pipeb_score1);
-
+    pipeb_score2 += pair_q2[0] * pipe_kb[0];
+    pipeb_score2 += pair_q2[1] * pipe_kb[1];
+    pipeb_score2 += pair_q2[2] * pipe_kb[2];
+    pipeb_score2 += pair_q2[3] * pipe_kb[3];
+    pipeb_score2 = simd_sum(pipeb_score2);
+    pipeb_score3 += pair_q3[0] * pipe_kb[0];
+    pipeb_score3 += pair_q3[1] * pipe_kb[1];
+    pipeb_score3 += pair_q3[2] * pipe_kb[2];
+    pipeb_score3 += pair_q3[3] * pipe_kb[3];
+    pipeb_score3 = simd_sum(pipeb_score3);
     U pipeb_new_max0 = metal::max(pair_max0, pipeb_score0);
     U pipeb_new_max1 = metal::max(pair_max1, pipeb_score1);
+    U pipeb_new_max2 = metal::max(pair_max2, pipeb_score2);
+    U pipeb_new_max3 = metal::max(pair_max3, pipeb_score3);
     U pipeb_factor0;
     U pipeb_factor1;
+    U pipeb_factor2;
+    U pipeb_factor3;
     LAGUNA_RESCALE(pipeb_factor0, pair_max0 - pipeb_new_max0);
     LAGUNA_RESCALE(pipeb_factor1, pair_max1 - pipeb_new_max1);
+    LAGUNA_RESCALE(pipeb_factor2, pair_max2 - pipeb_new_max2);
+    LAGUNA_RESCALE(pipeb_factor3, pair_max3 - pipeb_new_max3);
     U pipeb_exp0 = metal::fast::exp(pipeb_score0 - pipeb_new_max0);
     U pipeb_exp1 = metal::fast::exp(pipeb_score1 - pipeb_new_max1);
-
+    U pipeb_exp2 = metal::fast::exp(pipeb_score2 - pipeb_new_max2);
+    U pipeb_exp3 = metal::fast::exp(pipeb_score3 - pipeb_new_max3);
     pair_max0 = pipeb_new_max0;
     pair_max1 = pipeb_new_max1;
+    pair_max2 = pipeb_new_max2;
+    pair_max3 = pipeb_new_max3;
     pair_sum0 = pair_sum0 * pipeb_factor0 + pipeb_exp0;
     pair_sum1 = pair_sum1 * pipeb_factor1 + pipeb_exp1;
-
+    pair_sum2 = pair_sum2 * pipeb_factor2 + pipeb_exp2;
+    pair_sum3 = pair_sum3 * pipeb_factor3 + pipeb_exp3;
     pair_o0[0] = pair_o0[0] * pipeb_factor0 + pipeb_exp0 * pipe_vb0;
     pair_o1[0] = pair_o1[0] * pipeb_factor1 + pipeb_exp1 * pipe_vb0;
+    pair_o2[0] = pair_o2[0] * pipeb_factor2 + pipeb_exp2 * pipe_vb0;
+    pair_o3[0] = pair_o3[0] * pipeb_factor3 + pipeb_exp3 * pipe_vb0;
     pair_o0[1] = pair_o0[1] * pipeb_factor0 + pipeb_exp0 * pipe_vb1;
     pair_o1[1] = pair_o1[1] * pipeb_factor1 + pipeb_exp1 * pipe_vb1;
+    pair_o2[1] = pair_o2[1] * pipeb_factor2 + pipeb_exp2 * pipe_vb1;
+    pair_o3[1] = pair_o3[1] * pipeb_factor3 + pipeb_exp3 * pipe_vb1;
     pair_o0[2] = pair_o0[2] * pipeb_factor0 + pipeb_exp0 * pipe_vb2;
     pair_o1[2] = pair_o1[2] * pipeb_factor1 + pipeb_exp1 * pipe_vb2;
+    pair_o2[2] = pair_o2[2] * pipeb_factor2 + pipeb_exp2 * pipe_vb2;
+    pair_o3[2] = pair_o3[2] * pipeb_factor3 + pipeb_exp3 * pipe_vb2;
     pair_o0[3] = pair_o0[3] * pipeb_factor0 + pipeb_exp0 * pipe_vb3;
     pair_o1[3] = pair_o1[3] * pipeb_factor1 + pipeb_exp1 * pipe_vb3;
+    pair_o2[3] = pair_o2[3] * pipeb_factor2 + pipeb_exp2 * pipe_vb3;
+    pair_o3[3] = pair_o3[3] * pipeb_factor3 + pipeb_exp3 * pipe_vb3;
 
     pair_keys += 2 * inner_k_stride;
     pair_values += 2 * inner_v_stride;
 }
 
-constexpr int pair_planes = 2;
 constexpr int pair_plane_size = BN * BDP;
 if (lane == 0) {
-    max_scores[sg] = pair_max0;
-    max_scores[BN + sg] = pair_max1;
-    sum_exp_scores[sg] = pair_sum0;
-    sum_exp_scores[BN + sg] = pair_sum1;
+    max_scores[0 * BN + sg] = pair_max0;
+    max_scores[1 * BN + sg] = pair_max1;
+    max_scores[2 * BN + sg] = pair_max2;
+    max_scores[3 * BN + sg] = pair_max3;
+    sum_exp_scores[0 * BN + sg] = pair_sum0;
+    sum_exp_scores[1 * BN + sg] = pair_sum1;
+    sum_exp_scores[2 * BN + sg] = pair_sum2;
+    sum_exp_scores[3 * BN + sg] = pair_sum3;
 }
-for (int p = 0; p < pair_planes; ++p) {
-    outputs[p * pair_plane_size + lane * BDP + sg] = pair_o0[p];
-    outputs[
-        (pair_planes + p) * pair_plane_size + lane * BDP + sg] =
-        pair_o1[p];
-}
+outputs[0 * pair_plane_size + lane * BDP + sg] = pair_o0[0];
+outputs[1 * pair_plane_size + lane * BDP + sg] = pair_o1[0];
+outputs[2 * pair_plane_size + lane * BDP + sg] = pair_o2[0];
+outputs[3 * pair_plane_size + lane * BDP + sg] = pair_o3[0];
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-pair_max0 = max_scores[lane];
-pair_max1 = max_scores[BN + lane];
+pair_max0 = max_scores[0 * BN + lane];
+pair_max1 = max_scores[1 * BN + lane];
+pair_max2 = max_scores[2 * BN + lane];
+pair_max3 = max_scores[3 * BN + lane];
 U pair_global_max0 = simd_max(pair_max0);
 U pair_global_max1 = simd_max(pair_max1);
+U pair_global_max2 = simd_max(pair_max2);
+U pair_global_max3 = simd_max(pair_max3);
 U pair_global_factor0 = metal::fast::exp(pair_max0 - pair_global_max0);
 U pair_global_factor1 = metal::fast::exp(pair_max1 - pair_global_max1);
-pair_sum0 = simd_sum(sum_exp_scores[lane] * pair_global_factor0);
-pair_sum1 = simd_sum(sum_exp_scores[BN + lane] * pair_global_factor1);
+U pair_global_factor2 = metal::fast::exp(pair_max2 - pair_global_max2);
+U pair_global_factor3 = metal::fast::exp(pair_max3 - pair_global_max3);
+pair_sum0 = simd_sum(sum_exp_scores[0 * BN + lane] * pair_global_factor0);
+pair_sum1 = simd_sum(sum_exp_scores[1 * BN + lane] * pair_global_factor1);
+pair_sum2 = simd_sum(sum_exp_scores[2 * BN + lane] * pair_global_factor2);
+pair_sum3 = simd_sum(sum_exp_scores[3 * BN + lane] * pair_global_factor3);
 
-for (int p = 0; p < pair_planes; ++p) {
-    U acc0 = simd_sum(
-        outputs[p * pair_plane_size + sg * BDP + lane] *
-        pair_global_factor0);
-    U acc1 = simd_sum(
-        outputs[
-            (pair_planes + p) * pair_plane_size + sg * BDP + lane] *
-        pair_global_factor1);
-    pair_o0[p] = pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
-    pair_o1[p] = pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
-}
+U acc0_0 = simd_sum(outputs[0 * pair_plane_size + sg * BDP + lane] * pair_global_factor0);
+U acc0_1 = simd_sum(outputs[1 * pair_plane_size + sg * BDP + lane] * pair_global_factor1);
+U acc0_2 = simd_sum(outputs[2 * pair_plane_size + sg * BDP + lane] * pair_global_factor2);
+U acc0_3 = simd_sum(outputs[3 * pair_plane_size + sg * BDP + lane] * pair_global_factor3);
+pair_o0[0] = pair_sum0 == 0 ? acc0_0 : (acc0_0 / pair_sum0);
+pair_o1[0] = pair_sum1 == 0 ? acc0_1 : (acc0_1 / pair_sum1);
+pair_o2[0] = pair_sum2 == 0 ? acc0_2 : (acc0_2 / pair_sum2);
+pair_o3[0] = pair_sum3 == 0 ? acc0_3 : (acc0_3 / pair_sum3);
 
 threadgroup_barrier(mem_flags::mem_threadgroup);
-for (int p = 0; p < pair_planes; ++p) {
-    outputs[p * pair_plane_size + lane * BDP + sg] =
-        pair_o0[pair_planes + p];
-    outputs[
-        (pair_planes + p) * pair_plane_size + lane * BDP + sg] =
-        pair_o1[pair_planes + p];
-}
+outputs[0 * pair_plane_size + lane * BDP + sg] = pair_o0[1];
+outputs[1 * pair_plane_size + lane * BDP + sg] = pair_o1[1];
+outputs[2 * pair_plane_size + lane * BDP + sg] = pair_o2[1];
+outputs[3 * pair_plane_size + lane * BDP + sg] = pair_o3[1];
 threadgroup_barrier(mem_flags::mem_threadgroup);
-for (int p = 0; p < pair_planes; ++p) {
-    U acc0 = simd_sum(
-        outputs[p * pair_plane_size + sg * BDP + lane] *
-        pair_global_factor0);
-    U acc1 = simd_sum(
-        outputs[
-            (pair_planes + p) * pair_plane_size + sg * BDP + lane] *
-        pair_global_factor1);
-    pair_o0[pair_planes + p] =
-        pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
-    pair_o1[pair_planes + p] =
-        pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
-}
+U acc1_0 = simd_sum(outputs[0 * pair_plane_size + sg * BDP + lane] * pair_global_factor0);
+U acc1_1 = simd_sum(outputs[1 * pair_plane_size + sg * BDP + lane] * pair_global_factor1);
+U acc1_2 = simd_sum(outputs[2 * pair_plane_size + sg * BDP + lane] * pair_global_factor2);
+U acc1_3 = simd_sum(outputs[3 * pair_plane_size + sg * BDP + lane] * pair_global_factor3);
+pair_o0[1] = pair_sum0 == 0 ? acc1_0 : (acc1_0 / pair_sum0);
+pair_o1[1] = pair_sum1 == 0 ? acc1_1 : (acc1_1 / pair_sum1);
+pair_o2[1] = pair_sum2 == 0 ? acc1_2 : (acc1_2 / pair_sum2);
+pair_o3[1] = pair_sum3 == 0 ? acc1_3 : (acc1_3 / pair_sum3);
+
+threadgroup_barrier(mem_flags::mem_threadgroup);
+outputs[0 * pair_plane_size + lane * BDP + sg] = pair_o0[2];
+outputs[1 * pair_plane_size + lane * BDP + sg] = pair_o1[2];
+outputs[2 * pair_plane_size + lane * BDP + sg] = pair_o2[2];
+outputs[3 * pair_plane_size + lane * BDP + sg] = pair_o3[2];
+threadgroup_barrier(mem_flags::mem_threadgroup);
+U acc2_0 = simd_sum(outputs[0 * pair_plane_size + sg * BDP + lane] * pair_global_factor0);
+U acc2_1 = simd_sum(outputs[1 * pair_plane_size + sg * BDP + lane] * pair_global_factor1);
+U acc2_2 = simd_sum(outputs[2 * pair_plane_size + sg * BDP + lane] * pair_global_factor2);
+U acc2_3 = simd_sum(outputs[3 * pair_plane_size + sg * BDP + lane] * pair_global_factor3);
+pair_o0[2] = pair_sum0 == 0 ? acc2_0 : (acc2_0 / pair_sum0);
+pair_o1[2] = pair_sum1 == 0 ? acc2_1 : (acc2_1 / pair_sum1);
+pair_o2[2] = pair_sum2 == 0 ? acc2_2 : (acc2_2 / pair_sum2);
+pair_o3[2] = pair_sum3 == 0 ? acc2_3 : (acc2_3 / pair_sum3);
+
+threadgroup_barrier(mem_flags::mem_threadgroup);
+outputs[0 * pair_plane_size + lane * BDP + sg] = pair_o0[3];
+outputs[1 * pair_plane_size + lane * BDP + sg] = pair_o1[3];
+outputs[2 * pair_plane_size + lane * BDP + sg] = pair_o2[3];
+outputs[3 * pair_plane_size + lane * BDP + sg] = pair_o3[3];
+threadgroup_barrier(mem_flags::mem_threadgroup);
+U acc3_0 = simd_sum(outputs[0 * pair_plane_size + sg * BDP + lane] * pair_global_factor0);
+U acc3_1 = simd_sum(outputs[1 * pair_plane_size + sg * BDP + lane] * pair_global_factor1);
+U acc3_2 = simd_sum(outputs[2 * pair_plane_size + sg * BDP + lane] * pair_global_factor2);
+U acc3_3 = simd_sum(outputs[3 * pair_plane_size + sg * BDP + lane] * pair_global_factor3);
+pair_o0[3] = pair_sum0 == 0 ? acc3_0 : (acc3_0 / pair_sum0);
+pair_o1[3] = pair_sum1 == 0 ? acc3_1 : (acc3_1 / pair_sum1);
+pair_o2[3] = pair_sum2 == 0 ? acc3_2 : (acc3_2 / pair_sum2);
+pair_o3[3] = pair_sum3 == 0 ? acc3_3 : (acc3_3 / pair_sum3);
 
 if (lane == 0) {
-    device bfloat* pair_out0 =
-        attended + head0 * head_dim + sg * v_per_thread;
-    device bfloat* pair_out1 =
-        attended + head1 * head_dim + sg * v_per_thread;
+    device bfloat* pair_out0 = attended + head0 * head_dim + sg * v_per_thread;
+    device bfloat* pair_out1 = attended + head1 * head_dim + sg * v_per_thread;
+    device bfloat* pair_out2 = attended + head2 * head_dim + sg * v_per_thread;
+    device bfloat* pair_out3 = attended + head3 * head_dim + sg * v_per_thread;
     for (int p = 0; p < v_per_thread; ++p) {
         pair_out0[p] = static_cast<bfloat>(pair_o0[p]);
         pair_out1[p] = static_cast<bfloat>(pair_o1[p]);
+        pair_out2[p] = static_cast<bfloat>(pair_o2[p]);
+        pair_out3[p] = static_cast<bfloat>(pair_o3[p]);
     }
 }
 """,
@@ -1805,7 +1912,7 @@ func lagunaSlidingFusedAttention(
             queryWeight, keyWeight, angles,
             cacheKeys, cacheValues, params, scale,
         ],
-        grid: ((heads / 2) * 1024, 1, 1),
+        grid: ((heads / 4) * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
         outputDTypes: [.bfloat16]
