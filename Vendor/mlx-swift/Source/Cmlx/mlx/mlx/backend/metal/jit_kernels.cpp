@@ -1064,11 +1064,13 @@ MTL::ComputePipelineState* get_steel_gemm_splitk_nax_kernel(
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
     std::ostringstream kernel_source;
+    const bool headmajor_gate = kernel_name.find("_hmgate_") != std::string::npos;
     kernel_source << metal::utils() << metal::gemm_nax()
                   << metal::steel_gemm_splitk_nax()
                   << get_template_definition(
                          lib_name,
-                         "gemm_splitk_nax",
+                         headmajor_gate ? "gemm_splitk_nax_hmgate"
+                                        : "gemm_splitk_nax",
                          get_type_string(in.dtype()),
                          bm,
                          bn,

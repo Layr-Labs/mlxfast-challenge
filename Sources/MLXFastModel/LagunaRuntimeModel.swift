@@ -246,6 +246,63 @@ func lagunaNAXAvailable(architecture: String, osSupportsNAX: Bool) -> Bool {
     return generation >= (architecture.hasSuffix("p") ? 18 : 17)
 }
 
+/// Exact admission predicate for the prefill head-major gated `o_proj`
+/// carrier. Keep the split-K clause in lockstep with the native Metal
+/// dispatcher's current NAX predicate: this prototype is legal only when the
+/// ordinary BF16 projection would already select that path.
+func lagunaPrefillHeadMajorGatedOProjAdmitted(
+    batch: Int,
+    length: Int,
+    heads: Int,
+    headDim: Int,
+    outputColumns: Int,
+    architecture: String,
+    osSupportsNAX: Bool
+) -> Bool {
+    let k = heads * headDim
+    let largestOutputAxis = max(length, outputColumns)
+    let splitK =
+        k >= 3 * largestOutputAxis
+        || (largestOutputAxis <= 1024 && k > 2 * largestOutputAxis)
+    return batch == 1
+        && length > 1
+        && (heads == LagunaConstants.fullAttentionHeads
+            || heads == LagunaConstants.slidingAttentionHeads)
+        && headDim == LagunaConstants.headDim
+        && outputColumns == LagunaConstants.hiddenSize
+        && splitK
+        && lagunaNAXAvailable(
+            architecture: architecture, osSupportsNAX: osSupportsNAX)
+}
+
+/// `DARKBLOOM_PREFILL_HEADMAJOR_GATED_OPROJ=0` or `..._LAYERS=0` restores the
+/// stock transpose -> broadcast product -> BF16 `o_proj` graph. The six-layer
+/// default is the first acceptance-band-safe rollout. The enabled arm is
+/// admitted from MLX's actual architecture string through `lagunaNAXAvailable`;
+/// no GPU-generation spelling is hard-coded here.
+private let lagunaPrefillHeadMajorGatedOProjArchitecture: String? = {
+    guard #available(macOS 26.2, *) else { return nil }
+    let configured = ProcessInfo.processInfo.environment["MLX_METAL_GPU_ARCH"]
+    return configured.flatMap { $0.isEmpty ? nil : $0 }
+        ?? GPU.deviceInfo().architecture
+}()
+
+private let lagunaPrefillHeadMajorGatedOProjLayerCount: Int = {
+    let requested = Int(ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_HEADMAJOR_GATED_OPROJ_LAYERS"] ?? "6") ?? 6
+    return min(max(requested, 0), LagunaConstants.numHiddenLayers - 1)
+}()
+
+let lagunaPrefillHeadMajorGatedOProjEnabled: Bool = {
+    guard ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_HEADMAJOR_GATED_OPROJ"] != "0",
+        lagunaPrefillHeadMajorGatedOProjLayerCount > 0,
+        let architecture = lagunaPrefillHeadMajorGatedOProjArchitecture
+    else { return false }
+    return lagunaNAXAvailable(
+        architecture: architecture, osSupportsNAX: true)
+}()
+
 func lagunaExpertAlignedStageEnabled(_ value: String?) -> Bool {
     ["", "4", "5"].contains(value ?? "")
 }
@@ -5408,6 +5465,53 @@ private let lagunaCompiledSoftplusGate: @Sendable (MLXArray) -> MLXArray = {
     return MLXHardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
+/// Presents SDPA's native `[1, H, L, 128]` BF16 payload and an already
+/// activated `[1, L, H]` BF16 gate to the dedicated Metal split-K loader.
+/// Both `asStrided` arrays are zero-copy metadata carriers: their zero final
+/// stride is an intentionally impossible ordinary GEMM layout which the
+/// backend recognizes only as a complete AddMM pair and validates before any
+/// generic transpose/copy normalization. `beta == 0` makes the C operand a
+/// carrier only; its backing allocation remains the gate bound at buffer 4.
+///
+/// The loader rounds `attended * gate` back to BF16 before MMA, preserving the
+/// stock product boundary while avoiding the head-major transpose and product
+/// materialization. Across ranked prefill layers 0...38 (10 full + 29
+/// sliding; terminal layer 39 uses the last-row path), those two arrays account
+/// for up to 1,168 MiB of activation read/write traffic.
+private func lagunaPrefillHeadMajorGatedOProj(
+    attended: MLXArray,
+    activatedGate: MLXArray,
+    weight: MLXArray,
+    length: Int,
+    heads: Int
+) -> MLXArray? {
+    let headDim = LagunaConstants.headDim
+    let k = heads * headDim
+    guard attended.dtype == .bfloat16,
+        attended.dims(1, heads, length, headDim),
+        activatedGate.dtype == .bfloat16,
+        activatedGate.dims(1, length, heads),
+        weight.dtype == .bfloat16,
+        weight.dims(LagunaConstants.hiddenSize, k)
+    else { return nil }
+
+    let attendedCarrier = asStrided(
+        attended, [length, k], strides: [headDim, 0], offset: 0)
+    let gateCarrier = asStrided(
+        activatedGate,
+        [length, LagunaConstants.hiddenSize],
+        strides: [heads, 0],
+        offset: 0)
+    lagunaTrace("prefill head-major gated output projection h\(heads)")
+    return addMM(
+        gateCarrier,
+        attendedCarrier,
+        weight.T,
+        alpha: 1,
+        beta: 0
+    ).reshaped(1, length, LagunaConstants.hiddenSize)
+}
+
 /// Decode-only outer compilation of the same gate product with the following
 /// bias-free BF16 output projection. MLX keeps the matmul primitive intact but
 /// schedules the elementwise producer and projection as one compiled graph,
@@ -6136,6 +6240,57 @@ final class LagunaRuntimeAttention: Module {
                 scale: scale,
                 mask: mask
             )
+
+        // Multi-row BF16 `o_proj` already selects native NAX split-K for both
+        // Laguna head counts. Feed that kernel SDPA's native head-major bytes
+        // plus the stock activated per-head gate through the fail-closed AddMM
+        // carrier instead of materializing transpose -> broadcast product.
+        // Every decline leaves the unmodified stock path immediately below.
+        if lagunaPrefillHeadMajorGatedOProjEnabled,
+            layerIdx < lagunaPrefillHeadMajorGatedOProjLayerCount,
+            let architecture = lagunaPrefillHeadMajorGatedOProjArchitecture,
+            lagunaPrefillHeadMajorGatedOProjAdmitted(
+                batch: B,
+                length: L,
+                heads: nHeads,
+                headDim: headDim,
+                outputColumns: LagunaConstants.hiddenSize,
+                architecture: architecture,
+                osSupportsNAX: true),
+            gatingEnabled, gatePerHead,
+            let gateProjection = gProj,
+            let normalizedInput,
+            type(of: gateProjection) == Linear.self,
+            gateProjection.bias == nil,
+            gateProjection.weight.dtype == .bfloat16,
+            gateProjection.weight.dims(nHeads, LagunaConstants.hiddenSize),
+            type(of: wo) == Linear.self,
+            wo.bias == nil,
+            normalizedInput.dtype == .bfloat16,
+            normalizedInput.dims(B, L, LagunaConstants.hiddenSize),
+            attended.dtype == .bfloat16,
+            attended.dims(B, nHeads, L, headDim),
+            wo.weight.dtype == .bfloat16,
+            wo.weight.dims(
+                LagunaConstants.hiddenSize, nHeads * LagunaConstants.headDim)
+        {
+            let gateLogits = gateProjection(normalizedInput)
+            if gateLogits.dtype == .bfloat16,
+                gateLogits.dims(B, L, nHeads)
+            {
+                let activatedGate = lagunaCompiledSoftplusGate(gateLogits)
+                if let projection = lagunaPrefillHeadMajorGatedOProj(
+                    attended: attended,
+                    activatedGate: activatedGate,
+                    weight: wo.weight,
+                    length: L,
+                    heads: nHeads)
+                {
+                    return projection
+                }
+            }
+        }
+
         // SDPA returns `[B, H, L, D]`. When `L == 1`, flattening its
         // contiguous head-major payload directly produces the exact
         // `[B, 1, H*D]` byte order; the transpose only changes singleton-axis
