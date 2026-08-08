@@ -384,7 +384,19 @@ public final class LagunaRuntimeWeightCache {
                 setenv("MLX_BFS_MAX_WIDTH", "50", 0)
                 if env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" {
                     setenv("MLX_MAX_MB_PER_BUFFER", "200", 0)
-                    setenv("MLX_MAX_OPS_PER_BUFFER", "200", 0)
+                    // Op cap halved 200 -> 100. The decode charge is
+                    // (seed_prefill + 128 steps) / 128, so `Cd = steady + 4*Cp`
+                    // and any seed-prefill command buffer still draining when
+                    // the first timed step is submitted is charged to decode.
+                    // Halving the op cap doubles the number of command buffers,
+                    // so each is submitted earlier and the seed prefill drains
+                    // further before the timed window opens. MLX `commit()` is
+                    // asynchronous, so more frequent commits make the GPU start
+                    // sooner -- the same property the decode asyncEval ladder
+                    // already exploits. Scheduling only: no kernel, no
+                    // arithmetic, no layout changes, so the token stream is
+                    // unchanged by construction.
+                    setenv("MLX_MAX_OPS_PER_BUFFER", "100", 0)
                 }
                 // LOCAL PROBE ONLY (not for submission): override the op cap
                 // so the command-buffer boundary phase can be swept without a
