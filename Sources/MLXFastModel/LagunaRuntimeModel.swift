@@ -171,6 +171,20 @@ let lagunaPackedScalesEnabled =
 private let lagunaRouterPrecomputedKeysEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_PRECOMPUTED_KEYS"] != "0"
 
+/// Consume the producer's existing ordinals in the single-row gate selector.
+/// This is independent of producer/QMV key transport so an OFF run isolates
+/// only this new consumer and restores the promoted active64 selector.
+private let lagunaRouterSelectorPrecomputedKeysEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_SELECTOR_PRECOMPUTED_KEYS"] != "0"
+
+/// Number of output tiles one producer-key R1 threadgroup processes after a
+/// single exact Top-8 extraction. One restores the crowned dispatch geometry.
+private let lagunaRoutedGateUpKeyPersistentTiles: Int = {
+    let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTED_GATEUP_KEY_PERSISTENT_TILES"] ?? "8"
+    return [1, 8].contains(Int(raw) ?? 0) ? Int(raw)! : 1
+}()
+
 /// One-shot stderr visibility for the packed-scales arm: with the flag set,
 /// the arm MUST announce either "active" (bank built / packed dispatch taken)
 /// or "inactive" (a guard declined and the stock kernel ran instead), so a
@@ -7731,7 +7745,7 @@ METAL_FUNC uint laguna_router_top8_extract_round(
 }
 """
 
-private let lagunaRouterTop8PrecomputedPrelude = """
+let lagunaRouterTop8PrecomputedPrelude = """
 thread uint top8_keys[8];
     for (uint j = 0; j < 8; ++j) {
         top8_keys[j] = router_keys[lane + 32u * j];
@@ -7767,11 +7781,36 @@ private let lagunaRoutedSwiGLUQMVPackedTop8Kernel = MLXFast.metalKernel(
 let lagunaRoutedGateUpR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1"] != "0"
 
-private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2",
-    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
-    outputNames: ["activated"],
-    source: """
+private func lagunaRoutedSwiGLUQMVPackedR1Source(
+    prologue: String, expertExpression: String, persistentTiles: Int = 1
+) -> String {
+    precondition([1, 8].contains(persistentTiles))
+    let ownership: String
+    let loopOpen: String
+    let loopClose: String
+    if persistentTiles == 1 {
+        ownership = """
+uint tile = group / routed_experts;
+uint simd_group = simdgroup_index_in_threadgroup;
+uint lane = thread_index_in_simdgroup;
+uint logical_row = tile * 2 + simd_group;
+"""
+        loopOpen = ""
+        loopClose = ""
+    } else {
+        ownership = """
+uint first_tile = (group / routed_experts) * \(persistentTiles);
+uint simd_group = simdgroup_index_in_threadgroup;
+uint lane = thread_index_in_simdgroup;
+"""
+        loopOpen = """
+for (uint persistent_tile = 0; persistent_tile < \(persistentTiles); ++persistent_tile) {
+    uint tile = first_tile + persistent_tile;
+    uint logical_row = tile * 2 + simd_group;
+"""
+        loopClose = "}"
+    }
+    return """
 constexpr uint input_width = 2048;
 constexpr uint output_width = 512;
 constexpr uint block_width = 512;
@@ -7788,15 +7827,13 @@ constexpr uint packed_expert_bytes = 128 * scale_tile_bytes;
 
 uint group = threadgroup_position_in_grid.x;
 uint expert_slot = group % routed_experts;
-uint tile = group / routed_experts;
-uint simd_group = simdgroup_index_in_threadgroup;
-uint lane = thread_index_in_simdgroup;
-uint logical_row = tile * 2 + simd_group;
-\(lagunaRouterTop8PrecomputedPrelude)
-uint expert = top8_winner;
+\(ownership)
+\(prologue)
+uint expert = \(expertExpression);
 
 const device uint8_t* expert_weight =
     (const device uint8_t*)fused_weight + expert * fused_expert_bytes;
+\(loopOpen)
 const device uint8_t* row_scales =
     packed_scales + scale_patch_bytes + expert * packed_expert_bytes
     + (logical_row / 4) * scale_tile_bytes;
@@ -7876,7 +7913,30 @@ if (lane == 0) {
     activated[expert_slot * output_width + logical_row] =
         bfloat(silu * up);
 }
-""",
+\(loopClose)
+"""
+}
+
+private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2",
+    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVPackedR1Source(
+        prologue: lagunaRouterTop8PrecomputedPrelude,
+        expertExpression: "top8_winner"),
+    header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
+        + "\n" + lagunaRouterTop8PrologueHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaRoutedSwiGLUQMVPackedTop8R1Persistent8Kernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_p8_bf16_v1",
+    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVPackedR1Source(
+        prologue: lagunaRouterTop8PrecomputedPrelude,
+        expertExpression: "top8_winner",
+        persistentTiles: 8),
     header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
         + "\n" + lagunaRouterTop8PrologueHeader,
     ensureRowContiguous: true
@@ -7886,7 +7946,8 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
     _ input: MLXArray,
     fusedWeight: MLXArray,
     packedScales: MLXArray,
-    routerKeys: MLXArray
+    routerKeys: MLXArray,
+    persistentTiles requestedPersistentTiles: Int? = nil
 ) -> MLXArray {
     precondition(input.dtype == .bfloat16)
     precondition(input.dims(1, 1, LagunaConstants.hiddenSize))
@@ -7897,9 +7958,19 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
     precondition(routerKeys.size == LagunaConstants.numExperts)
 
     if lagunaRoutedGateUpR1Enabled {
-        return lagunaRoutedSwiGLUQMVPackedTop8R1Kernel(
+        let persistentTiles = requestedPersistentTiles
+            ?? lagunaRoutedGateUpKeyPersistentTiles
+        precondition([1, 8].contains(persistentTiles))
+        let kernel: MLXFast.MLXFastKernel
+        switch persistentTiles {
+        case 8: kernel = lagunaRoutedSwiGLUQMVPackedTop8R1Persistent8Kernel
+        default: kernel = lagunaRoutedSwiGLUQMVPackedTop8R1Kernel
+        }
+        return kernel(
             [input, fusedWeight, packedScales, routerKeys],
-            grid: (LagunaConstants.numExpertsPerTok * 256 * 64, 1, 1),
+            grid: (
+                LagunaConstants.numExpertsPerTok * (256 / persistentTiles) * 64,
+                1, 1),
             threadGroup: (64, 1, 1),
             outputShapes: [[
                 1, 1, LagunaConstants.numExpertsPerTok, 1,
@@ -9270,7 +9341,7 @@ for (uint sequence = 2; sequence <= 256; sequence <<= 1) {
 """
 }
 
-private let lagunaDecodeRouterOrdinalHeader = """
+let lagunaDecodeRouterOrdinalHeader = """
 METAL_FUNC uint laguna_router_key_ordinal(float key) {
     uint bits = as_type<uint>(key);
     uint magnitude = bits & 0x7FFFFFFFu;
@@ -9964,6 +10035,144 @@ if (lane < 64) {
 """
 }
 
+/// Single-row active64 twin that consumes the canonical ordinals already
+/// emitted by the fused residual + RMSNorm + router producer. The producer
+/// keys include the correction bias and the exact NaN/zero canonicalization,
+/// so selection needs no second 256-wide sigmoid/key construction. Only the
+/// final eight unbiased sigmoid scores are recomputed for mixture weights.
+/// Keep this source structurally lockstep with the accepted ordinal tournament
+/// above; its sorting network differs only at the input and score epilogue.
+private func lagunaRouterTournamentPrecomputedKeysKernelSource(normalizing: Bool) -> String {
+    let epilogue =
+        normalizing
+        ? """
+float my_score2 = 0.0f;
+if (lane < 8) {
+    float x = float(logits[row * 256 + my_index2]);
+    float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+    my_score2 = x < 0.0f ? y : 1.0f - y;
+}
+float total = 0.0f;
+for (uint i = 0; i < 8; ++i) {
+    total = simd_shuffle(my_score2, ushort(i)) + total;
+}
+if (lane < 8) {
+    router_indices[row * 8 + lane] = my_index2;
+    router_scores[row * 8 + lane] = my_score2 / total;
+}
+"""
+        : """
+if (lane < 8) {
+    float x = float(logits[row * 256 + my_index2]);
+    float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+    float score = x < 0.0f ? y : 1.0f - y;
+    router_indices[row * 8 + lane] = my_index2;
+    router_scores[row * 8 + lane] = score;
+}
+"""
+    return """
+uint lane = thread_position_in_threadgroup.x;
+uint row = threadgroup_position_in_grid.y;
+
+threadgroup uint xchg_ordinals[64];
+threadgroup uint xchg_indices[64];
+threadgroup uint candidate_ordinals[64];
+threadgroup uint candidate_indices[64];
+
+uint my_ordinal = router_keys[row * 256 + lane];
+uint my_index = lane;
+
+for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
+    for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+        uint other_ordinal = simd_shuffle_xor(my_ordinal, ushort(stride));
+        uint other_index = simd_shuffle_xor(my_index, ushort(stride));
+
+        bool is_lower = (lane & stride) == 0;
+        bool lower_wants_better = (lane & sequence) == 0;
+        bool want_better = lower_wants_better == is_lower;
+        bool other_before_my = laguna_router_ordinal_before(
+            other_ordinal, other_index, my_ordinal, my_index);
+        bool take_other = want_better ? other_before_my : !other_before_my;
+        if (take_other) {
+            my_ordinal = other_ordinal;
+            my_index = other_index;
+        }
+    }
+}
+
+uint block = lane >> 5;
+uint within_block = lane & 31;
+bool block_ascending = (block & 1) == 0;
+uint rank_in_block = block_ascending ? within_block : (31 - within_block);
+bool is_local_top8 = block_ascending ? (within_block < 8) : (within_block >= 24);
+if (is_local_top8) {
+    candidate_ordinals[block * 8 + rank_in_block] = my_ordinal;
+    candidate_indices[block * 8 + rank_in_block] = my_index;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+uint my_ordinal2 = 0u;
+uint my_index2 = 0u;
+if (lane < 64) {
+    my_ordinal2 = candidate_ordinals[lane];
+    my_index2 = candidate_indices[lane];
+}
+
+if (lane < 64) {
+for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
+    for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+        uint other_ordinal = simd_shuffle_xor(my_ordinal2, ushort(stride));
+        uint other_index = simd_shuffle_xor(my_index2, ushort(stride));
+
+        bool is_lower = (lane & stride) == 0;
+        bool lower_wants_better = (lane & sequence) == 0;
+        bool want_better = lower_wants_better == is_lower;
+        bool other_before_my = laguna_router_ordinal_before(
+            other_ordinal, other_index, my_ordinal2, my_index2);
+        bool take_other = want_better ? other_before_my : !other_before_my;
+        if (take_other) {
+            my_ordinal2 = other_ordinal;
+            my_index2 = other_index;
+        }
+    }
+}
+}
+
+if (lane < 64) {
+    xchg_ordinals[lane] = my_ordinal2;
+    xchg_indices[lane] = my_index2;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+if (lane < 64) {
+    uint partner = lane ^ 32u;
+    uint other_ordinal = xchg_ordinals[partner];
+    uint other_index = xchg_indices[partner];
+    bool is_lower = (lane & 32u) == 0;
+    bool other_before_my = laguna_router_ordinal_before(
+        other_ordinal, other_index, my_ordinal2, my_index2);
+    bool take_other = is_lower ? other_before_my : !other_before_my;
+    if (take_other) {
+        my_ordinal2 = other_ordinal;
+        my_index2 = other_index;
+    }
+
+    for (uint stride = 16; stride > 0; stride >>= 1) {
+        other_ordinal = simd_shuffle_xor(my_ordinal2, ushort(stride));
+        other_index = simd_shuffle_xor(my_index2, ushort(stride));
+        is_lower = (lane & stride) == 0;
+        other_before_my = laguna_router_ordinal_before(
+            other_ordinal, other_index, my_ordinal2, my_index2);
+        take_other = is_lower ? other_before_my : !other_before_my;
+        if (take_other) {
+            my_ordinal2 = other_ordinal;
+            my_index2 = other_index;
+        }
+    }
+}
+
+\(epilogue)
+"""
+}
 private let lagunaPrefillRouterTournamentKernel = MLXFast.metalKernel(
     name: "laguna_prefill_router_tournament_v1",
     inputNames: ["logits", "correction_bias"],
@@ -9996,6 +10205,24 @@ private let lagunaPrefillRouterTournamentOrdinalNormalizingKernel = MLXFast.meta
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaPrefillRouterTournamentOrdinalKernelSource(normalizing: true),
+    header: lagunaDecodeRouterOrdinalHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaRouterTournamentPrecomputedKeysKernel = MLXFast.metalKernel(
+    name: "laguna_router_tournament_precomputed_keys_active64_v1",
+    inputNames: ["logits", "router_keys"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaRouterTournamentPrecomputedKeysKernelSource(normalizing: false),
+    header: lagunaDecodeRouterOrdinalHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaRouterTournamentPrecomputedKeysNormalizingKernel = MLXFast.metalKernel(
+    name: "laguna_router_tournament_precomputed_keys_norm_active64_v1",
+    inputNames: ["logits", "router_keys"],
+    outputNames: ["router_indices", "router_scores"],
+    source: lagunaRouterTournamentPrecomputedKeysKernelSource(normalizing: true),
     header: lagunaDecodeRouterOrdinalHeader,
     ensureRowContiguous: true
 )
@@ -10038,6 +10265,29 @@ func lagunaPrefillRouterTournamentOrdinalForTesting(
         grid: (256, rows, 1),
         threadGroup: (256, 1, 1),
         outputShapes: [[1, rows, 8], [1, rows, 8]],
+        outputDTypes: [.uint32, .float32]
+    )
+    return (outputs[0], outputs[1])
+}
+
+func lagunaRouterTournamentPrecomputedKeysForTesting(
+    logits: MLXArray, routerKeys: MLXArray, normalizing: Bool = false
+) -> (MLXArray, MLXArray) {
+    precondition(logits.dtype == .bfloat16)
+    precondition(routerKeys.dtype == .uint32)
+    precondition(logits.dims(1, 1, LagunaConstants.numExperts))
+    precondition(routerKeys.dims(1, 1, LagunaConstants.numExperts))
+
+    let kernel =
+        normalizing
+        ? lagunaRouterTournamentPrecomputedKeysNormalizingKernel
+        : lagunaRouterTournamentPrecomputedKeysKernel
+    let outputs = kernel(
+        [logits, routerKeys],
+        grid: (LagunaConstants.numExperts, 1, 1),
+        threadGroup: (LagunaConstants.numExperts, 1, 1),
+        outputShapes: [[1, 1, LagunaConstants.numExpertsPerTok],
+            [1, 1, LagunaConstants.numExpertsPerTok]],
         outputDTypes: [.uint32, .float32]
     )
     return (outputs[0], outputs[1])
@@ -10089,7 +10339,9 @@ final class LagunaRuntimeMoEGate: Module {
     /// the same invocation already produced it (the fused residual + RMSNorm +
     /// router dispatch). It is the identical `x @ weight.T` this method would
     /// otherwise issue.
-    func callAsFunction(_ x: MLXArray, logits: MLXArray? = nil) -> (MLXArray, MLXArray) {
+    func callAsFunction(
+        _ x: MLXArray, logits: MLXArray? = nil, routerKeys: MLXArray? = nil
+    ) -> (MLXArray, MLXArray) {
         let projectedLogits = logits ?? x.matmul(weight.T)
         let inds: MLXArray
         var weights: MLXArray
@@ -10139,15 +10391,36 @@ final class LagunaRuntimeMoEGate: Module {
             // Cast-sink path: consumes the BF16 router GEMV directly. The
             // norm sink is a separate flag, so name it separately.
             let sinkNormalization = normTopkProb && lagunaDecodeRouterNormSinkEnabled
-            lagunaTrace(
-                sinkNormalization
-                    ? "decode router top8 (cast sink + norm sink)"
-                    : "decode router top8 (cast sink)")
-            (inds, weights) = lagunaDecodeRouterTop8(
-                logits: projectedLogits,
-                correctionBias: eScoreCorrectionBias.asType(.float32),
-                normalizing: sinkNormalization
-            )
+            if lagunaRouterSelectorPrecomputedKeysEnabled,
+                lagunaRouterPrecomputedKeysEnabled,
+                lagunaDecodeRouterOrdinalEnabled,
+                lagunaDecodeRouterOrdinalScoreTableEnabled,
+                lagunaDecodeRouterTournamentEnabled,
+                let routerKeys,
+                projectedLogits.dims(1, 1, LagunaConstants.numExperts),
+                routerKeys.dtype == .uint32,
+                routerKeys.dims(1, 1, LagunaConstants.numExperts)
+            {
+                lagunaTrace(
+                    sinkNormalization
+                        ? "decode router top8 (producer keys + norm sink)"
+                        : "decode router top8 (producer keys)")
+                (inds, weights) = lagunaRouterTournamentPrecomputedKeysForTesting(
+                    logits: projectedLogits,
+                    routerKeys: routerKeys,
+                    normalizing: sinkNormalization
+                )
+            } else {
+                lagunaTrace(
+                    sinkNormalization
+                        ? "decode router top8 (cast sink + norm sink)"
+                        : "decode router top8 (cast sink)")
+                (inds, weights) = lagunaDecodeRouterTop8(
+                    logits: projectedLogits,
+                    correctionBias: eScoreCorrectionBias.asType(.float32),
+                    normalizing: sinkNormalization
+                )
+            }
             if sinkNormalization {
                 return (inds, weights)
             }
@@ -10657,7 +10930,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         _ x: MLXArray, residual: MLXArray?, routerLogits: MLXArray?,
         routerKeys: MLXArray? = nil
     ) -> MLXArray {
-        let (inds, weights) = gate(x, logits: routerLogits)
+        let (inds, weights) = gate(x, logits: routerLogits, routerKeys: routerKeys)
         var y: MLXArray
         var routedAlreadyReduced = false
         var sortedTailInverseOrder: MLXArray?
