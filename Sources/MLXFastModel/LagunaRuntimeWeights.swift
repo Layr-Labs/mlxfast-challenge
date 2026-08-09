@@ -693,6 +693,12 @@ let lagunaAttnScaleNarrowOProjEnabled =
 let lagunaAttnScaleLaneMajorEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ATTN_SCALE_LANEMAJOR"] != "0"
 
+/// Applies the same row-base + lane-major nibble encoding to the already
+/// group-32-halved expert planes. OFF leaves every decode site on its literal
+/// halved-byte kernel twin.
+let lagunaExpertScaleNibbleEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_EXPERT_SCALE_NIBBLE"] != "0"
+
 /// `o_proj` uses the same encoding: its decode simdgroup walks the input axis in
 /// the same `block_size / group_size` lane order, so a row costs `groups / 2 + 1`
 /// bytes (193 at 48 heads, 257 at 64) against the 21-per-32-group block form's
@@ -878,17 +884,15 @@ struct LagunaLaneMajorScaleBank {
     var nibbleBytes: Int { pairwise ? groups / 4 : groups / 2 }
 }
 
-/// Packs a uint8 NVFP4 scale plane into `LagunaLaneMajorScaleBank`. `groups`
-/// must be a multiple of 64 so a row's per-lane nibble run is a whole number of
-/// bytes and no byte straddles two lanes. Out-of-span rows are escaped rather
-/// than declining the whole plane; the certificate then requires every
-/// non-escaped row to reproduce the plane byte for byte.
+/// Packs a uint8 NVFP4 scale plane into `LagunaLaneMajorScaleBank`; pairwise
+/// planes permit 32-group rows. Out-of-span rows use the stock-plane escape.
 func lagunaLaneMajorNVFP4ScaleBank(
-    _ scales: MLXArray, site: String, layer: Int, pairwise: Bool = false
+    _ scales: MLXArray, site: String, layer: Int, pairwise: Bool = false,
+    enabled: Bool = lagunaAttnScaleLaneMajorEnabled
 ) -> LagunaLaneMajorScaleBank? {
-    guard lagunaAttnScaleLaneMajorEnabled,
+    guard enabled,
         scales.dtype == .uint8, scales.ndim == 2,
-        scales.dim(1).isMultiple(of: 64)
+        scales.dim(1).isMultiple(of: pairwise ? 32 : 64)
     else {
         return nil
     }
@@ -940,6 +944,25 @@ func lagunaLaneMajorNVFP4ScaleBank(
         "\(form) L\(layer) escaped \(bank.escapedRows)/\(rows)", site)
     lagunaNarrowScaleLog.note("built \(form)", site)
     return bank
+}
+
+/// Builds the nibble bank the expert QMV/fused-down kernels read: expands an
+/// authoritative pair-halved expert plane only long enough to feed the shared
+/// lane-major encoder above. The duplicated pair is certified equal by the
+/// halving pipeline, so the retained bank is a pure byte relayout.
+func lagunaExpertScaleNibbleBank(
+    _ halved: MLXArray, site: String, layer: Int = -1
+) -> LagunaLaneMajorScaleBank? {
+    guard lagunaExpertScaleNibbleEnabled, halved.dtype == .uint8,
+        halved.ndim == 2, halved.dim(1).isMultiple(of: 16)
+    else { return nil }
+    let rows = halved.dim(0)
+    let groups = halved.dim(1)
+    let paired = halved.reshaped([rows, groups, 1])
+    let expanded = contiguous(concatenated([paired, paired], axis: 2))
+        .reshaped([rows, 2 * groups])
+    return lagunaLaneMajorNVFP4ScaleBank(
+        expanded, site: site, layer: layer, pairwise: true, enabled: true)
 }
 
 /// Init-time certificate: undo the lane-major permutation with MLX and require
@@ -1157,6 +1180,17 @@ extension LagunaRuntimeSparseMoEBlock {
             return []
         }
         _packedRoutedGateUpBank = halved
+        let walk = halved[lagunaScalePatchHeaderBytes...]
+            .reshaped([experts, rows / 8, 4, 8, 16])
+        let rowMajor = contiguous(walk.transposed(0, 1, 3, 2, 4))
+            .reshaped([experts * rows, 64])
+        if let bank = lagunaExpertScaleNibbleBank(
+            rowMajor, site: "routed gate/up")
+        {
+            _packedRoutedGateUpScaleNibbles = bank
+            lagunaPackedScalesLog.note("active", "routed gate/up nibbles prepared")
+            return [halved] + bank.arrays
+        }
         lagunaPackedScalesLog.note("active", "packed routed gate/up bank prepared")
         return [halved]
     }

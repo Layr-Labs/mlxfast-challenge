@@ -6838,16 +6838,10 @@ for (uint row = 0; row < 2; ++row) {
     ensureRowContiguous: true
 )
 
-/// One-output-row scheduling twin of `lagunaSharedSwiGLUQMVKernel`.
-/// Arithmetic is textually identical per row; only row ownership changes.
-///
-/// `halved` selects the group-32 halved scale plane built by
-/// `lagunaHalvedGroup32ScalePlane`: one byte per 32 weights behind the patch
-/// header, so a simdgroup's 32 lanes read 16 contiguous bytes in place of 32
-/// and each lane issues one scale load per two it issued before. The fused
-/// plane concatenates gate over up, so the only two pairs the quantizer can
-/// leave unequal are gate row 0 and up row 0, carried in header slots 0 and 1.
-private func lagunaSharedSwiGLUQMVRows1Source(halved: Bool) -> String {
+/// One-row shared QMV source; `halved` and `nibble` select exact scale layouts.
+private func lagunaSharedSwiGLUQMVRows1Source(
+    halved: Bool, nibble: Bool = false
+) -> String {
     let scaleRowBytes = halved ? 64 : 128
     let patch =
         halved
@@ -6855,12 +6849,61 @@ private func lagunaSharedSwiGLUQMVRows1Source(halved: Bool) -> String {
     let base = halved ? "fused_scales + scale_patch_bytes" : "fused_scales"
     let laneTerm = halved ? "(lane >> 1)" : "lane"
     let blockDiv = halved ? 32 : 16
-    func value(_ pointer: String, _ slot: Int) -> String {
-        let read = "\(pointer)[block / \(blockDiv)]"
+    func patched(_ read: String, _ slot: Int) -> String {
         guard halved else { return read }
         return "(row == 0 && block == 0 && lane == 1)"
             + " ? fused_scales[\(slot)] : \(read)"
     }
+    // Leading newline keeps the nibble==false generated source byte-identical
+    // to the pre-nibble literal (no stray blank line on the OFF arms).
+    let nibbleSetup = nibble ? """
+
+const uint8_t gate_row_base = scale_bases[row];
+const uint8_t up_row_base = scale_bases[row + output_width];
+""" : ""
+    func blockLoop(_ narrow: Bool) -> String {
+        let gateRead: String
+        let upRead: String
+        if narrow {
+            let index = "(lane >> 1) * 2 + block / 1024"
+            let shift = "((block / 512) & 1) * 4"
+            gateRead = "uint8_t(gate_row_base + ((scale_nibbles[row * 32 + \(index)] >> \(shift)) & 15u))"
+            upRead = "uint8_t(up_row_base + ((scale_nibbles[(row + output_width) * 32 + \(index)] >> \(shift)) & 15u))"
+        } else {
+            gateRead = "gate_row_scale[block / \(blockDiv)]"
+            upRead = "up_row_scale[block / \(blockDiv)]"
+        }
+        return """
+for (uint block = 0; block < input_width; block += block_width) {
+    const device vec<bfloat, 4>* input_vectors =
+        (const device vec<bfloat, 4>*) (
+            input + block + lane * values_per_lane);
+    for (uint i = 0; i < values_per_lane / 4; ++i) {
+        const vec<bfloat, 4> values = input_vectors[i];
+        input_values[4 * i] = values[0];
+        input_values[4 * i + 1] = values[1];
+        input_values[4 * i + 2] = values[2];
+        input_values[4 * i + 3] = values[3];
+    }
+
+    gate_result += laguna_nvfp4_qdot_16(
+        gate_row_weight + block / 2,
+        input_values,
+        laguna_nvfp4_scale(\(patched(gateRead, 0))));
+    up_result += laguna_nvfp4_qdot_16(
+        up_row_weight + block / 2,
+        input_values,
+        laguna_nvfp4_scale(\(patched(upRead, 1))));
+}
+"""
+    }
+    let loops = nibble ? """
+if (gate_row_base == 0xFFu || up_row_base == 0xFFu) {
+\(blockLoop(false))
+} else {
+\(blockLoop(true))
+}
+""" : blockLoop(false)
     return """
 constexpr uint input_width = 2048;
 constexpr uint output_width = 512;
@@ -6883,33 +6926,13 @@ const device uint8_t* up_row_weight =
 const device uint8_t* gate_row_scale =
     \(base) + row * scale_row_bytes + \(laneTerm);
 const device uint8_t* up_row_scale =
-    \(base) + (row + output_width) * scale_row_bytes + \(laneTerm);
+    \(base) + (row + output_width) * scale_row_bytes + \(laneTerm);\(nibbleSetup)
 
 thread float gate_result = 0.0f;
 thread float up_result = 0.0f;
 thread float input_values[values_per_lane];
 
-for (uint block = 0; block < input_width; block += block_width) {
-    const device vec<bfloat, 4>* input_vectors =
-        (const device vec<bfloat, 4>*) (
-            input + block + lane * values_per_lane);
-    for (uint i = 0; i < values_per_lane / 4; ++i) {
-        const vec<bfloat, 4> values = input_vectors[i];
-        input_values[4 * i] = values[0];
-        input_values[4 * i + 1] = values[1];
-        input_values[4 * i + 2] = values[2];
-        input_values[4 * i + 3] = values[3];
-    }
-
-    gate_result += laguna_nvfp4_qdot_16(
-        gate_row_weight + block / 2,
-        input_values,
-        laguna_nvfp4_scale(\(value("gate_row_scale", 0))));
-    up_result += laguna_nvfp4_qdot_16(
-        up_row_weight + block / 2,
-        input_values,
-        laguna_nvfp4_scale(\(value("up_row_scale", 1))));
-}
+\(loops)
 
 gate_result = simd_sum(gate_result);
 up_result = simd_sum(up_result);
@@ -6940,6 +6963,15 @@ private let lagunaSharedSwiGLUQMVRows1HalvedKernel = MLXFast.metalKernel(
     inputNames: ["input", "fused_weight", "fused_scales"],
     outputNames: ["activated"],
     source: lagunaSharedSwiGLUQMVRows1Source(halved: true),
+    header: lagunaSharedSwiGLUQMVHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaSharedSwiGLUQMVRows1NibbleKernel = MLXFast.metalKernel(
+    name: "laguna_shared_nvfp4_swiglu_qmv_rows1_halved_nib_bf16_v1",
+    inputNames: ["input", "fused_weight", "fused_scales", "scale_nibbles", "scale_bases"],
+    outputNames: ["activated"],
+    source: lagunaSharedSwiGLUQMVRows1Source(halved: true, nibble: true),
     header: lagunaSharedSwiGLUQMVHeader,
     ensureRowContiguous: true
 )
@@ -7040,7 +7072,8 @@ if (lane == 0) {
 func lagunaSharedSwiGLUQMV(
     _ input: MLXArray,
     fusedWeight: MLXArray,
-    fusedScales: MLXArray
+    fusedScales: MLXArray,
+    nibbleScales: LagunaLaneMajorScaleBank? = nil
 ) -> MLXArray {
     precondition(input.dtype == .bfloat16)
     precondition(input.dims(1, 1, LagunaConstants.hiddenSize))
@@ -7065,15 +7098,24 @@ func lagunaSharedSwiGLUQMV(
                 LagunaConstants.hiddenSize / 16))
     }
 
-    let kernel =
-        halved
+    let tiles = lagunaSharedSwiGLUQMVRows1Enabled ? 256 : 128
+    if halved, !lagunaSharedQMVWideCodesEnabled, let nibble = nibbleScales {
+        precondition(nibble.pairwise && nibble.rows == 1_024 && nibble.groups == 128)
+        return lagunaSharedSwiGLUQMVRows1NibbleKernel(
+            [input, fusedWeight, fusedScales, nibble.nibbles, nibble.bases],
+            grid: (tiles * 64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[1, 1, LagunaConstants.sharedExpertIntermediateSize]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+    let kernel = halved
         ? (lagunaSharedQMVWideCodesEnabled
             ? lagunaSharedSwiGLUQMVRows1WideKernel
             : lagunaSharedSwiGLUQMVRows1HalvedKernel)
         : (lagunaSharedSwiGLUQMVRows1Enabled
             ? lagunaSharedSwiGLUQMVRows1Kernel
             : lagunaSharedSwiGLUQMVKernel)
-    let tiles = lagunaSharedSwiGLUQMVRows1Enabled ? 256 : 128
     return kernel(
         [input, fusedWeight, fusedScales],
         grid: (tiles * 64, 1, 1),
@@ -7767,6 +7809,121 @@ private let lagunaRoutedSwiGLUQMVPackedTop8Kernel = MLXFast.metalKernel(
 let lagunaRoutedGateUpR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1"] != "0"
 
+/// Source generator for the NIBBLE twin only. The accepted stock R1 kernel
+/// stays a literal below (this file's convention for promoted kernels); the
+/// generator's `narrow: false` loop is the escape arm INSIDE the nibble
+/// kernel, reading the resident stock halved plane for out-of-span rows.
+private func lagunaRoutedSwiGLUQMVPackedTop8R1NibbleSource() -> String {
+    let baseSetup = """
+uint nibble_row = expert * 1024 + (logical_row / 4) * 8 + sub * 2;
+uint8_t gate_base = scale_bases[nibble_row];
+uint8_t up_base = scale_bases[nibble_row + 1];
+"""
+    func loop(_ narrow: Bool) -> String {
+        let pointer = narrow
+            ? "scale_nibbles + nibble_row * 32"
+            : "packed_scales + scale_patch_bytes + expert * packed_expert_bytes + (logical_row / 4) * scale_tile_bytes"
+        func scale(_ base: String, _ offset: String, _ block: String) -> String {
+            if narrow {
+                return "uint8_t(\(base) + ((row_scales[\(offset) + (lane >> 1) * 2 + \(block) / 1024] >> (((\(block) / 512) & 1) * 4)) & 15u))"
+            }
+            return "row_scales[(\(block) / block_width) * scale_kblock_bytes + sub * 2 * scale_row_bytes + (lane >> 1) + \(offset)]"
+        }
+        return """
+{
+const device uint8_t* row_scales = \(pointer);
+uint2 gate_codes = *(const device uint2*)(
+    expert_weight + gate_row * fused_row_bytes + lane * 8);
+uint2 up_codes = *(const device uint2*)(
+    expert_weight + up_row * fused_row_bytes + lane * 8);
+bool patch_lane = expert == 0 && logical_row == 0 && lane == 1;
+uint8_t gate_sb = patch_lane ? packed_scales[0] : \(scale("gate_base", "0", "0"));
+uint8_t up_sb = patch_lane ? packed_scales[1] : \(scale("up_base", narrow ? "32" : "scale_row_bytes", "0"));
+for (uint block = 0; block < input_width; block += block_width) {
+    const device vec<bfloat, 4>* input_vectors =
+        (const device vec<bfloat, 4>*)(input + block + lane * values_per_lane);
+    for (uint i = 0; i < values_per_lane / 4; ++i) {
+        const vec<bfloat, 4> values = input_vectors[i];
+        input_values[4 * i] = values[0]; input_values[4 * i + 1] = values[1];
+        input_values[4 * i + 2] = values[2]; input_values[4 * i + 3] = values[3];
+    }
+    const uint2 cur_gate_codes = gate_codes, cur_up_codes = up_codes;
+    const uint8_t cur_gate_sb = gate_sb, cur_up_sb = up_sb;
+    const uint next_block = block + block_width;
+    if (next_block < input_width) {
+        gate_sb = \(scale("gate_base", "0", "next_block"));
+        up_sb = \(scale("up_base", narrow ? "32" : "scale_row_bytes", "next_block"));
+        gate_codes = *(const device uint2*)(expert_weight + gate_row * fused_row_bytes + next_block / 2 + lane * 8);
+        up_codes = *(const device uint2*)(expert_weight + up_row * fused_row_bytes + next_block / 2 + lane * 8);
+    }
+    gate_result += laguna_nvfp4_qdot_codes_16(
+        cur_gate_codes, input_values, laguna_nvfp4_scale(cur_gate_sb));
+    up_result += laguna_nvfp4_qdot_codes_16(
+        cur_up_codes, input_values, laguna_nvfp4_scale(cur_up_sb));
+}
+}
+"""
+    }
+    let qmv = """
+if (gate_base == 0xFFu || up_base == 0xFFu) {
+\(loop(false))
+} else {
+\(loop(true))
+}
+"""
+    return """
+constexpr uint input_width = 2048;
+constexpr uint output_width = 512;
+constexpr uint block_width = 512;
+constexpr uint values_per_lane = 16;
+constexpr uint routed_experts = 8;
+constexpr uint fused_row_bytes = 1024;
+constexpr uint fused_expert_bytes = 1024 * fused_row_bytes;
+constexpr uint scale_patch_bytes = \(lagunaScalePatchHeaderBytes);
+constexpr uint scale_row_bytes = 16;
+constexpr uint scale_sub_bytes = 8 * scale_row_bytes;
+constexpr uint scale_kblock_bytes = scale_sub_bytes;
+constexpr uint scale_tile_bytes = 4 * scale_kblock_bytes;
+constexpr uint packed_expert_bytes = 128 * scale_tile_bytes;
+
+uint group = threadgroup_position_in_grid.x;
+uint expert_slot = group % routed_experts;
+uint tile = group / routed_experts;
+uint simd_group = simdgroup_index_in_threadgroup;
+uint lane = thread_index_in_simdgroup;
+uint logical_row = tile * 2 + simd_group;
+\(lagunaRouterTop8PrecomputedPrelude)
+uint expert = top8_winner;
+
+const device uint8_t* expert_weight =
+    (const device uint8_t*)fused_weight + expert * fused_expert_bytes;
+uint sub = logical_row % 4;
+uint gate_row = (logical_row / 32) * 64 + logical_row % 32;
+uint up_row = gate_row + 32;
+\(baseSetup)
+
+thread float gate_result = 0.0f;
+thread float up_result = 0.0f;
+thread float input_values[values_per_lane];
+
+\(qmv)
+
+gate_result = simd_sum(gate_result);
+up_result = simd_sum(up_result);
+if (lane == 0) {
+    bfloat gate = bfloat(gate_result\(lagunaNvfp4RowScaleSuffix));
+    bfloat up = bfloat(up_result\(lagunaNvfp4RowScaleSuffix));
+    bfloat exp_abs = metal::exp(metal::abs(gate));
+    bfloat denominator = bfloat(1) + exp_abs;
+    bfloat y = bfloat(1) / denominator;
+    bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+    bfloat silu = bfloat(gate * sigmoid);
+    activated[expert_slot * output_width + logical_row] =
+        bfloat(silu * up);
+}
+"""
+}
+
 private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
     name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2",
     inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
@@ -7882,11 +8039,25 @@ if (lane == 0) {
     ensureRowContiguous: true
 )
 
+private let lagunaRoutedSwiGLUQMVPackedTop8R1NibbleKernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_nib_bf16_v1",
+    inputNames: [
+        "input", "fused_weight", "packed_scales", "router_keys",
+        "scale_nibbles", "scale_bases",
+    ],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVPackedTop8R1NibbleSource(),
+    header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
+        + "\n" + lagunaRouterTop8PrologueHeader,
+    ensureRowContiguous: true
+)
+
 func lagunaRoutedSwiGLUQMVPackedTop8(
     _ input: MLXArray,
     fusedWeight: MLXArray,
     packedScales: MLXArray,
-    routerKeys: MLXArray
+    routerKeys: MLXArray,
+    nibbleScales: LagunaLaneMajorScaleBank? = nil
 ) -> MLXArray {
     precondition(input.dtype == .bfloat16)
     precondition(input.dims(1, 1, LagunaConstants.hiddenSize))
@@ -7897,6 +8068,23 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
     precondition(routerKeys.size == LagunaConstants.numExperts)
 
     if lagunaRoutedGateUpR1Enabled {
+        if let nibble = nibbleScales {
+            precondition(
+                nibble.pairwise && nibble.groups == 128 && nibble.rows == 262_144)
+            return lagunaRoutedSwiGLUQMVPackedTop8R1NibbleKernel(
+                [
+                    input, fusedWeight, packedScales, routerKeys,
+                    nibble.nibbles, nibble.bases,
+                ],
+                grid: (LagunaConstants.numExpertsPerTok * 256 * 64, 1, 1),
+                threadGroup: (64, 1, 1),
+                outputShapes: [[
+                    1, 1, LagunaConstants.numExpertsPerTok, 1,
+                    LagunaConstants.moeIntermediateSize,
+                ]],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
         return lagunaRoutedSwiGLUQMVPackedTop8R1Kernel(
             [input, fusedWeight, packedScales, routerKeys],
             grid: (LagunaConstants.numExpertsPerTok * 256 * 64, 1, 1),
@@ -8130,7 +8318,7 @@ private let lagunaRoutedSharedDownResidualSharedHalvedKernel =
     )
 
 private func lagunaRoutedSharedDownResidualSource(
-    sharedHalved: Bool, staged: Bool = false
+    sharedHalved: Bool, staged: Bool = false, nibble: Bool = false
 ) -> String {
     let sharedRowBytes = sharedHalved ? 16 : 32
     let sharedBase =
@@ -8145,6 +8333,24 @@ private func lagunaRoutedSharedDownResidualSource(
     // Same accumulation, scale conversion, reduction, and epilogue order in
     // both bodies; `staged` only hoists the four code words and scale bytes
     // ahead of the qdots (the promoted stage4 schedule).
+    // Interpolated at 8-space depth inside `qdots` (Swift requires at least
+    // the closing-delimiter indent), so each fragment's FIRST line carries
+    // only the 4-space remainder; the generated OFF text is byte-identical
+    // to the pre-nibble literal (12/16/16 columns).
+    let stagedScaleRead = nibble ? """
+    const uint8_t rb = expert_scale_bases[output_row];
+            const uint8_t raw = expert_scale_nibbles[
+                output_row * 8 + (lane >> 2)];
+            const uint8_t decoded = uint8_t(
+                rb + ((raw >> (((lane >> 1) & 1) * 4)) & 15u));
+            row_sb[row] =
+                \(patch)
+                : (rb == 0xFFu ? scale[0] : decoded);
+""" : """
+    row_sb[row] =
+                \(patch)
+                : scale[0];
+"""
     let qdots =
         staged
         ? """
@@ -8157,9 +8363,7 @@ private func lagunaRoutedSharedDownResidualSource(
                 expert_weight + output_row * packed_row_bytes + lane * 8);
             const device uint8_t* scale =
                 expert_scales + output_row * scale_row_bytes + scale_lane;
-            row_sb[row] =
-                \(patch)
-                : scale[0];
+        \(stagedScaleRead)
         }
         for (uint row = 0; row < outputs_per_simd; ++row) {
             result[row] = laguna_nvfp4_qdot_codes_16(
@@ -8187,6 +8391,17 @@ private func lagunaRoutedSharedDownResidualSource(
             result[row] = simd_sum(result[row]);
         }
         """
+    // Leading newline keeps the nibble==false generated source byte-identical
+    // to the pre-nibble literal (no stray blank line on the OFF arms).
+    let nibbleSetup = nibble ? """
+
+const device uint8_t* expert_scale_nibbles = is_shared
+    ? shared_scale_nibbles
+    : routed_scale_nibbles + expert * output_width * 8;
+const device uint8_t* expert_scale_bases = is_shared
+    ? shared_scale_bases
+    : routed_scale_bases + expert * output_width;
+""" : ""
     return """
 constexpr uint input_width = 512;
 constexpr uint output_width = 2048;
@@ -8223,7 +8438,7 @@ const device uint8_t* expert_scales = is_shared
         + expert * scale_expert_bytes;
 uint scale_row_bytes =
     is_shared ? shared_scale_row_bytes : routed_scale_row_bytes;
-uint scale_lane = \(scaleLane);
+uint scale_lane = \(scaleLane);\(nibbleSetup)
 
 thread float input_values[values_per_lane];
 const device vec<bfloat, 4>* input_vectors =
@@ -8430,6 +8645,31 @@ private let lagunaRoutedSharedDownResidualStagedSharedHalvedKernel =
         ensureRowContiguous: true
     )
 
+private let lagunaRoutedSharedDownResidualStagedNibbleKernel =
+    MLXFast.metalKernel(
+        name: "laguna_routed_shared_nvfp4_down_residual_bf16_sh_stage4_nib_v1"
+            + (lagunaSharedFirstDownOrderEnabled ? "sf" : ""),
+        inputNames: (lagunaSharedFirstDownOrderEnabled
+            ? [
+                "shared_activated", "shared_down_weight", "shared_down_scales",
+                "routed_activated", "routed_down_weight", "routed_down_scales",
+                "indices", "router_weights", "residual",
+            ]
+            : [
+                "routed_activated", "routed_down_weight", "routed_down_scales",
+                "indices", "router_weights", "shared_activated",
+                "shared_down_weight", "shared_down_scales", "residual",
+            ]) + [
+                "routed_scale_nibbles", "routed_scale_bases",
+                "shared_scale_nibbles", "shared_scale_bases",
+            ],
+        outputNames: ["output"],
+        source: lagunaRoutedSharedDownResidualSource(
+            sharedHalved: true, staged: true, nibble: true),
+        header: lagunaSharedSwiGLUQMVHeader,
+        ensureRowContiguous: true
+    )
+
 func lagunaRoutedSharedDownResidual(
     routedActivated: MLXArray,
     routedDownWeight: MLXArray,
@@ -8439,6 +8679,8 @@ func lagunaRoutedSharedDownResidual(
     sharedActivated: MLXArray,
     sharedDownWeight: MLXArray,
     sharedDownScales: MLXArray,
+    routedScaleNibbles: LagunaLaneMajorScaleBank? = nil,
+    sharedScaleNibbles: LagunaLaneMajorScaleBank? = nil,
     residual: MLXArray,
     staged: Bool = lagunaFusedDownRowStagingEnabled
 ) -> MLXArray {
@@ -8478,8 +8720,35 @@ func lagunaRoutedSharedDownResidual(
     precondition(residual.dtype == .bfloat16)
     precondition(residual.dims(1, 1, LagunaConstants.hiddenSize))
 
-    let fusedKernel =
-        sharedHalved
+    if staged, sharedHalved,
+        let routed = routedScaleNibbles, let shared = sharedScaleNibbles
+    {
+        precondition(
+            routed.pairwise && routed.groups == 32 && routed.rows == 524_288)
+        precondition(
+            shared.pairwise && shared.groups == 32 && shared.rows == 2_048)
+        let inputs = lagunaSharedFirstDownOrderEnabled
+            ? [
+                sharedActivated, sharedDownWeight, sharedDownScales,
+                routedActivated, routedDownWeight, routedDownScales,
+                indices, routerWeights, residual,
+                routed.nibbles, routed.bases, shared.nibbles, shared.bases,
+            ]
+            : [
+                routedActivated, routedDownWeight, routedDownScales,
+                indices, routerWeights, sharedActivated,
+                sharedDownWeight, sharedDownScales, residual,
+                routed.nibbles, routed.bases, shared.nibbles, shared.bases,
+            ]
+        return lagunaRoutedSharedDownResidualStagedNibbleKernel(
+            inputs,
+            grid: (LagunaConstants.hiddenSize / 4 * 288, 1, 1),
+            threadGroup: (288, 1, 1),
+            outputShapes: [[1, 1, LagunaConstants.hiddenSize]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+    let fusedKernel = sharedHalved
         ? (staged
             ? lagunaRoutedSharedDownResidualStagedSharedHalvedKernel
             : lagunaRoutedSharedDownResidualSharedHalvedKernel)
@@ -8712,6 +8981,8 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     /// dispatch on the stock planes.
     var _fusedGateUpScalesHalved: MLXArray?
     var _sharedDownScalesHalved: MLXArray?
+    var _fusedGateUpScaleNibbles: LagunaLaneMajorScaleBank?
+    var _sharedDownScaleNibbles: LagunaLaneMajorScaleBank?
 
     /// Retained fused BF16 `[gate; up]` bank for the dense (non-quantized)
     /// layer-0 MLP, built once after checkpoint load when
@@ -8777,6 +9048,13 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
         {
             _fusedGateUpScalesHalved = halved
             prepared.append(halved)
+            if let bank = lagunaExpertScaleNibbleBank(
+                halved[lagunaScalePatchHeaderBytes...].reshaped([1_024, 64]),
+                site: "shared gate/up")
+            {
+                _fusedGateUpScaleNibbles = bank
+                prepared += bank.arrays
+            }
             lagunaPackedScalesLog.note("active", "shared gate/up halved")
         }
         if let down = downProj as? QuantizedLinear,
@@ -8788,6 +9066,13 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
         {
             _sharedDownScalesHalved = halvedDown
             prepared.append(halvedDown)
+            if let bank = lagunaExpertScaleNibbleBank(
+                halvedDown[lagunaScalePatchHeaderBytes...].reshaped([2_048, 16]),
+                site: "shared down")
+            {
+                _sharedDownScaleNibbles = bank
+                prepared += bank.arrays
+            }
             lagunaPackedScalesLog.note("active", "shared down halved")
         }
         return prepared
@@ -8828,8 +9113,10 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     ) -> (
         gateUpWeight: MLXArray,
         gateUpScales: MLXArray,
+        gateUpScaleNibbles: LagunaLaneMajorScaleBank?,
         downWeight: MLXArray,
-        downScales: MLXArray
+        downScales: MLXArray,
+        downScaleNibbles: LagunaLaneMajorScaleBank?
     )? {
         guard let banks = fusedSharedBankGuard(x) else { return nil }
         return banks
@@ -8846,7 +9133,8 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     ) -> (
         activated: MLXArray,
         downWeight: MLXArray,
-        downScales: MLXArray
+        downScales: MLXArray,
+        downScaleNibbles: LagunaLaneMajorScaleBank?
     )? {
         guard let banks = fusedSharedBankGuard(x) else { return nil }
         let activated =
@@ -8854,9 +9142,10 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
             ?? lagunaSharedSwiGLUQMV(
                 x,
                 fusedWeight: banks.gateUpWeight,
-                fusedScales: banks.gateUpScales
+                fusedScales: banks.gateUpScales,
+                nibbleScales: banks.gateUpScaleNibbles
             )
-        return (activated, banks.downWeight, banks.downScales)
+        return (activated, banks.downWeight, banks.downScales, banks.downScaleNibbles)
     }
 
     private func fusedSharedBankGuard(
@@ -8864,8 +9153,10 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
     ) -> (
         gateUpWeight: MLXArray,
         gateUpScales: MLXArray,
+        gateUpScaleNibbles: LagunaLaneMajorScaleBank?,
         downWeight: MLXArray,
-        downScales: MLXArray
+        downScales: MLXArray,
+        downScaleNibbles: LagunaLaneMajorScaleBank?
     )? {
         guard lagunaFusedSharedSwiGLUQMVEnabled,
             let fusedWeight = _fusedGateUpWeight,
@@ -8897,8 +9188,10 @@ final class LagunaRuntimeMLP: Module, UnaryLayer {
         return (
             fusedWeight,
             _fusedGateUpScalesHalved ?? fusedScales,
+            _fusedGateUpScaleNibbles,
             down.weight,
-            _sharedDownScalesHalved ?? down.scales
+            _sharedDownScalesHalved ?? down.scales,
+            _sharedDownScaleNibbles
         )
     }
 
@@ -10480,38 +10773,22 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ModuleInfo(key: "shared_expert") var sharedExpert: LagunaRuntimeMLP
 
-    /// Retained fused NVFP4 `[gate32, up32]` routed-expert banks (per-expert
-    /// output rows interleaved in matched 32-row tiles), built once after
-    /// checkpoint load when `DARKBLOOM_FUSED_ROUTED_GATE_UP` is enabled, plus
-    /// a reference to the stock `switch_mlp.down_proj` module for the fused
-    /// decode path. Plain stored properties with a leading underscore so
-    /// Module reflection never treats the derived layout as checkpoint
-    /// parameters or a second child module; `switchMLP` keeps the original
-    /// separate banks for checkpoint parameter integrity.
+    /// Derived routed decode banks; leading underscores exclude Module reflection.
     var _fusedRoutedGateUpWeight: MLXArray?
     var _fusedRoutedGateUpScales: MLXArray?
-    /// Shape-preserving marker view over the existing packed decode scale bank
-    /// for the M5 expert prefill NAX loader. It owns no storage.
+    /// Storage-free prefill marker view.
     var _fusedRoutedGateUpPairwiseScales: MLXArray?
     var _fusedRoutedGateUpSplit: Int = 0
     var _routedDownProj: SwitchLinear?
     var _routedDownWeight: MLXArray?
-    /// Group-32 halved routed `down_proj` scale plane (see
-    /// `lagunaHalvedGroup32ScalePlane`): a patch header followed by
-    /// `experts * hiddenSize * (moeIntermediateSize / 32)` bytes. Nil when
-    /// the halved plane would not be bitwise lossless, in which case the
-    /// down projection falls back to the stock module.
+    /// Certified group-32-halved routed down scales.
     var _routedDownScales: MLXArray?
-    /// Shape-preserving marker view over `_routedDownScales` for the M5
-    /// expert-aligned prefill down projection. It owns no storage.
+    var _routedDownScaleNibbles: LagunaLaneMajorScaleBank?
+    /// Storage-free routed-down prefill marker view.
     var _routedDownPairwiseScales: MLXArray?
-    /// `DARKBLOOM_PACKED_SCALES` walk-order scale-interleaved copy of the
-    /// fused routed gate/up scales, group-32 halved and prefixed with the
-    /// patch header; see `lagunaRoutedSwiGLUQMVPackedKernel` for the layout
-    /// contract. Nil when the flag is set to zero (default ON) and whenever
-    /// the halved plane would not be bit-exact, in which case the routed QMV
-    /// path reads the full fused scales instead.
+    /// Certified walk-order group-32-halved routed gate/up scales.
     var _packedRoutedGateUpBank: MLXArray?
+    var _packedRoutedGateUpScaleNibbles: LagunaLaneMajorScaleBank?
 
     /// Builds and retains the fused routed gate/up NVFP4 banks from the
     /// loaded stock `SwitchGLU` submodules (reached through the public
@@ -10604,6 +10881,14 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         {
             _routedDownScales = halvedDown
             prepared.append(halvedDown)
+            if let bank = lagunaExpertScaleNibbleBank(
+                halvedDown[lagunaScalePatchHeaderBytes...]
+                    .reshaped([LagunaConstants.numExperts * 2_048, 16]),
+                site: "routed down")
+            {
+                _routedDownScaleNibbles = bank
+                prepared += bank.arrays
+            }
             if lagunaPrefillExpertDownPairwiseScalesEnabled,
                 lagunaExpertAlignedGatherEnabled,
                 let pairwiseDown = lagunaPackedPrefillDownScaleView(halvedDown)
@@ -10712,7 +10997,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                             x,
                             fusedWeight: fusedWeight,
                             packedScales: packedBank,
-                            routerKeys: routerKeys
+                            routerKeys: routerKeys,
+                            nibbleScales: _packedRoutedGateUpScaleNibbles
                         )
                     } else {
                         lagunaTrace("routed gate/up QMV + SwiGLU (packed scales)")
@@ -10784,6 +11070,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                     sharedActivated: sharedInputs.activated,
                     sharedDownWeight: sharedInputs.downWeight,
                     sharedDownScales: sharedInputs.downScales,
+                    routedScaleNibbles: _routedDownScaleNibbles,
+                    sharedScaleNibbles: sharedInputs.downScaleNibbles,
                     residual: residual
                 )
             } else if lagunaFusedRoutedDownReduceEnabled,
