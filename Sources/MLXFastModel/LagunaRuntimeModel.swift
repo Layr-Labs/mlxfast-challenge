@@ -7767,8 +7767,30 @@ private let lagunaRoutedSwiGLUQMVPackedTop8Kernel = MLXFast.metalKernel(
 let lagunaRoutedGateUpR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1"] != "0"
 
+/// The two SIMD groups own adjacent rows of the same routed slot, hence run
+/// the identical integer Top-8 extraction. Publish SIMD 0's winner once.
+private let lagunaRoutedQMVShareTop8Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_QMV_SHARE_TOP8"] != "0"
+
+private let lagunaRoutedQMVTop8R1Prelude =
+    lagunaRoutedQMVShareTop8Enabled
+    ? """
+threadgroup uint shared_expert;
+if (simd_group == 0) {
+    \(lagunaRouterTop8PrecomputedPrelude)
+    if (lane == 0) shared_expert = top8_winner;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+uint expert = shared_expert;
+"""
+    : """
+\(lagunaRouterTop8PrecomputedPrelude)
+uint expert = top8_winner;
+"""
+
 private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2",
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2"
+        + (lagunaRoutedQMVShareTop8Enabled ? "_shared1" : ""),
     inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
     outputNames: ["activated"],
     source: """
@@ -7792,8 +7814,7 @@ uint tile = group / routed_experts;
 uint simd_group = simdgroup_index_in_threadgroup;
 uint lane = thread_index_in_simdgroup;
 uint logical_row = tile * 2 + simd_group;
-\(lagunaRouterTop8PrecomputedPrelude)
-uint expert = top8_winner;
+\(lagunaRoutedQMVTop8R1Prelude)
 
 const device uint8_t* expert_weight =
     (const device uint8_t*)fused_weight + expert * fused_expert_bytes;
@@ -9345,44 +9366,6 @@ private let lagunaDecodeRouterOrdinalScoreTableEnabled =
 /// cross-simdgroup stages. The optimized second phase runs only one logical
 /// copy on the first 64 threads. Keep the full-sort path as an in-binary
 /// fallback and for the score-recompute ablation.
-// Ranked replay nonce: active64 receipt 1 was exact and raw-faster in both
-// phases; this source-only marker intentionally leaves the executable tree
-// unchanged while producing a distinct submission archive.
-// Receipt 2 confirmed the same raw-positive tree; nonce 3 settles paired draw.
-// Receipt 3 also beat the current crown raw; nonce 4 replays after retiring
-// the exact-but-negative routed/shared merged-dispatch successor.
-// Receipt 4 remained crown-positive raw; nonce 5 continues the paired replay.
-// Receipt 5 was the strongest yet at 4.905191 ms decode and 0.187895 ms/token
-// prefill, normalizing 0.2391% above the unchanged crown; nonce 6 replays it
-// after the exact pairwise-finalist successor priced slower and was retired.
-// Receipt 6 improved the raw lead to 0.3388%; nonce 7 continues the same
-// six-receipt exact active64 runtime against paired-baseline variance.
-// Receipt 7 set a new decode best and stayed 0.2771% crown-positive raw;
-// nonce 8 continues the now seven-receipt exact persistence campaign.
-// Receipt 8 was also crown-positive raw; nonce 9 continues the unchanged
-// eight-receipt exact runtime while the paired baseline remains unfavorable.
-// Receipt 9 was the first slightly crown-negative raw draw; nonce 10 preserves
-// the unchanged runtime because its nine-receipt mean remains crown-positive.
-// Receipt 10 was a second small negative draw; nonce 11 continues because the
-// ten-receipt mean still beats the unchanged crown and eight receipts are up.
-// Receipt 11 was a third small raw-negative draw; nonce 12 continues because
-// the eleven-receipt mean remains crown-positive while the successor is built.
-// Receipt 12 returned crown-positive in both phases; nonce 13 replays the same
-// executable tree while its twelve-receipt raw mean remains crown-positive.
-// Receipt 13 was crown-positive by 0.3459% on raw phases; nonce 14 keeps the
-// thirteen-receipt executable tree unchanged while its raw mean leads 0.1400%.
-// Receipt 14 was crown-positive by 0.0385% on raw phases; nonce 15 keeps the
-// fourteen-receipt executable tree unchanged while its raw mean leads 0.1327%.
-// Receipt 15 was crown-positive by 0.1251% on raw phases; nonce 16 keeps the
-// fifteen-receipt executable tree unchanged while its raw mean leads 0.1322%.
-// Receipt 16 was crown-positive by 0.3039% on raw phases; nonce 17 keeps the
-// sixteen-receipt executable tree unchanged while its raw mean leads 0.1429%.
-// Receipt 17 was crown-positive by 0.3584% on raw phases; nonce 18 keeps the
-// seventeen-receipt executable tree unchanged while its raw mean leads 0.1556%.
-// Receipt 18 was crown-positive by 0.0301% on weighted raw phases; nonce 19
-// keeps the eighteen-receipt executable tree unchanged; its mean leads 0.1486%.
-// Receipt 19 was crown-positive by 0.2420% on raw phases; nonce 20 keeps the
-// nineteen-receipt executable tree unchanged while its raw mean leads 0.1535%.
 private let lagunaDecodeRouterTournamentEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ROUTER_TOURNAMENT"] != "0"
 
@@ -11627,7 +11610,20 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         // position's row. Slice before the row-independent final RMSNorm and
         // vocabulary head so prefill neither normalizes nor projects the
         // preceding rows. For single-token decode the slice is a no-op.
-        let hidden = model.norm(lagunaLastTokenHidden(fullHidden))
+        let finalRow = lagunaLastTokenHidden(fullHidden)
+        let hidden: MLXArray
+        let lmHeadActivationGroupAbs: MLXArray?
+        if inputs.dims(1, 1), lagunaLmHeadSharedActivationAbsEnabled,
+            lmHeadPruner != nil
+        {
+            let fused = lagunaLmHeadFinalNormGroupAbs(
+                hidden: finalRow, weight: model.norm.weight)
+            hidden = fused.normalized
+            lmHeadActivationGroupAbs = fused.groupAbs
+        } else {
+            hidden = model.norm(finalRow)
+            lmHeadActivationGroupAbs = nil
+        }
         if case .norm = lagunaDecodeAsyncStage, inputs.dims(1, 1) {
             asyncEval(hidden)
         }
@@ -11646,6 +11642,7 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                 result = pruner.logits(
                     hidden: hidden,
                     lmHeadWeight: lmHead.weight,
+                    activationGroupAbs: lmHeadActivationGroupAbs,
                     useFusedRefinement: inputs.dims(1, 1))
             } else {
                 result = lmHead(hidden)
