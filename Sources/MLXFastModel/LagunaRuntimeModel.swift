@@ -4541,6 +4541,15 @@ let lagunaTailNVFP4QKVSeedElisionEnabled = lagunaTailNVFP4QKVTailFoldEnabled
 /// `2^22` only makes sense once the fold has parked it in the scale.
 let lagunaTailNVFP4QKVScaleDeferEnabled =
     lagunaTailNVFP4QKVTailFoldEnabled && lagunaTailNVFP4ScaleFoldEnabled
+/// `DARKBLOOM_DECODE_NVFP4_QKV_PREFETCH` (default ON; set "0" to ablate):
+/// register-prefetch the next 512-column code block before evaluating the
+/// current block in every decode Q/K/V R1 schedule. The stock and narrow-scale
+/// arms also carry the next scale byte; lane-major scales are already resident.
+/// Current code words and scales are copied before either pointer advances, so
+/// every qdot, K-block accumulation and simd reduction remains unchanged.
+private let lagunaDecodeNVFP4QKVPrefetchEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_NVFP4_QKV_PREFETCH"] != "0"
+
 
 /// Body of `laguna_tail_nvfp4_scale`. The folded arm parks `256 * 16384 == 2^22`
 /// in the scale; under scale-defer it returns the RAW half and the `2^22` is
@@ -4605,6 +4614,39 @@ private let lagunaTailNVFP4QDotReturn = lagunaTailNVFP4ScaleFoldEnabled
     ? "return scale * accum;"
     : "return (scale * 16384.0f) * accum;"
 
+private let lagunaTailNVFP4QMVCodePrefetchHeader = """
+    static inline float laguna_tail_nvfp4_qdot_codes(
+        uint2 codes,
+        const thread float* x_thread,
+        float scale
+    ) {
+        \(lagunaTailNVFP4QDotAccumDeclSource(seedElide: lagunaTailNVFP4QKVSeedElisionEnabled))
+    #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const uint32_t c = (j == 0) ? codes.x : codes.y;
+            const uint32_t xe = c & 0x0F0F0F0Fu;
+            const uint32_t ge = xe | (xe << 3);
+            const uint32_t yo = c & 0xF0F0F0F0u;
+            const uint32_t go = yo | (yo >> 3);
+            const uint32_t p0 = (ge << 9) & 0x8E008E00u;
+            const uint32_t p1 = (go << 8) & 0x8E008E00u;
+            const uint32_t p2 = (ge << 1) & 0x8E008E00u;
+            const uint32_t p3 = go & 0x8E008E00u;
+            const float2 v04 = float2(as_type<half2>(p0));
+            const float2 v15 = float2(as_type<half2>(p1));
+            const float2 v26 = float2(as_type<half2>(p2));
+            const float2 v37 = float2(as_type<half2>(p3));
+            \(lagunaTailNVFP4QDotFirstGroupSource(seedElide: lagunaTailNVFP4QKVSeedElisionEnabled))
+            accum +=
+                (x_thread[8 * j + 4] * v04.y +
+                 x_thread[8 * j + 5] * v15.y +
+                 x_thread[8 * j + 6] * v26.y +
+                 x_thread[8 * j + 7] * v37.y);
+        }
+        \(lagunaTailNVFP4QDotReturn)
+    }
+    """
+
 private let lagunaTailNVFP4QMVHeader = """
     static inline float laguna_tail_nvfp4_scale(uint8_t bits) {
         \(lagunaTailNVFP4ScaleFoldEnabled
@@ -4652,7 +4694,10 @@ private let lagunaTailNVFP4QMVHeader = """
         }
         \(lagunaTailNVFP4QDotReturn)
     }
-    """
+    """ + (
+        lagunaDecodeNVFP4QKVPrefetchEnabled
+            ? "\n\n" + lagunaTailNVFP4QMVCodePrefetchHeader
+            : "")
 
 /// Decode-only, static-shape R1 schedule for the live group-16 NVFP4 QKV
 /// bank. The generated QMV gives each SIMD group four output rows. This twin
@@ -4693,6 +4738,40 @@ nb += block_size / 32;
     bs += block_size / 512;
 """
         : "sc += block_size / 16;"
+    let qmvLoop =
+        lagunaDecodeNVFP4QKVPrefetchEnabled
+        ? """
+uint2 next_codes = *((const device uint2*)ws);
+uint8_t next_scale_bits = \(scaleCode);
+for (uint k = 0; k < axis_size; k += block_size) {
+    for (uint i = 0; i < values_per_thread; ++i) {
+        x_thread[i] = float(normalized[column + i]);
+    }
+    const uint2 codes = next_codes;
+    const uint8_t scale_bits = next_scale_bits;
+    if (k + block_size < axis_size) {
+        ws += block_size / 2;
+        \(scaleAdvance)
+        next_codes = *((const device uint2*)ws);
+        next_scale_bits = \(scaleCode);
+    }
+    result += laguna_tail_nvfp4_qdot_codes(
+        codes, x_thread, laguna_tail_nvfp4_scale(scale_bits));
+    column += block_size;
+}
+"""
+        : """
+for (uint k = 0; k < axis_size; k += block_size) {
+    for (uint i = 0; i < values_per_thread; ++i) {
+        x_thread[i] = float(normalized[column + i]);
+    }
+    result += laguna_tail_nvfp4_qdot(
+        ws, x_thread, laguna_tail_nvfp4_scale(\(scaleCode)));
+    ws += block_size / 2;
+    \(scaleAdvance)
+    column += block_size;
+}
+"""
     return """
 constexpr uint axis_size = 2048;
 constexpr uint num_simdgroups = 2;
@@ -4714,16 +4793,7 @@ thread float x_thread[values_per_thread];
 thread float result = 0.0f;
 
 uint column = simd_lid * values_per_thread;
-for (uint k = 0; k < axis_size; k += block_size) {
-    for (uint i = 0; i < values_per_thread; ++i) {
-        x_thread[i] = float(normalized[column + i]);
-    }
-    result += laguna_tail_nvfp4_qdot(
-        ws, x_thread, laguna_tail_nvfp4_scale(\(scaleCode)));
-    ws += block_size / 2;
-    \(scaleAdvance)
-    column += block_size;
-}
+\(qmvLoop)
 
 result = simd_sum(result\(lagunaTailNVFP4RowScaleSuffixSource(scaleDefer: lagunaTailNVFP4QKVScaleDeferEnabled)));
 if (simd_lid == 0) {
@@ -4738,7 +4808,8 @@ private let lagunaDecodeNVFP4QKVR1Kernels: [Int: MLXFast.MLXFastKernel] = {
         kernels[heads] = MLXFast.metalKernel(
             name: "laguna_decode_nvfp4_qkv_h\(heads)_r1_v1"
                 + (lagunaTailNVFP4QKVSeedElisionEnabled ? "_se1" : "")
-                + (lagunaTailNVFP4QKVScaleDeferEnabled ? "_sd1" : ""),
+                + (lagunaTailNVFP4QKVScaleDeferEnabled ? "_sd1" : "")
+                + (lagunaDecodeNVFP4QKVPrefetchEnabled ? "_pf1" : ""),
             inputNames: ["normalized", "weight_codes", "weight_scales"],
             outputNames: ["projected"],
             source: lagunaDecodeNVFP4QKVR1Source(),
@@ -4775,7 +4846,36 @@ private let lagunaDecodeNVFP4QKVR1NarrowKernels: [Int: MLXFast.MLXFastKernel] = 
 /// arm and reads the stock plane. Both arms fill the same `sb` registers, so
 /// the K loop below is the R1 loop with its scale argument already resident.
 private func lagunaDecodeNVFP4QKVLaneMajorSource(pairwise: Bool) -> String {
-    """
+    let qmvLoop =
+        lagunaDecodeNVFP4QKVPrefetchEnabled
+        ? """
+uint2 next_codes = *((const device uint2*)ws);
+for (uint k = 0; k < axis_size; k += block_size) {
+    for (uint i = 0; i < values_per_thread; ++i) {
+        x_thread[i] = float(normalized[column + i]);
+    }
+    const uint2 codes = next_codes;
+    if (k + block_size < axis_size) {
+        ws += block_size / 2;
+        next_codes = *((const device uint2*)ws);
+    }
+    result += laguna_tail_nvfp4_qdot_codes(
+        codes, x_thread, laguna_tail_nvfp4_scale(sb[k / block_size]));
+    column += block_size;
+}
+"""
+        : """
+for (uint k = 0; k < axis_size; k += block_size) {
+    for (uint i = 0; i < values_per_thread; ++i) {
+        x_thread[i] = float(normalized[column + i]);
+    }
+    result += laguna_tail_nvfp4_qdot(
+        ws, x_thread, laguna_tail_nvfp4_scale(sb[k / block_size]));
+    ws += block_size / 2;
+    column += block_size;
+}
+"""
+    return """
 constexpr uint axis_size = 2048;
 constexpr uint num_simdgroups = 2;
 constexpr uint values_per_thread = 16;
@@ -4816,15 +4916,7 @@ thread float x_thread[values_per_thread];
 thread float result = 0.0f;
 
 uint column = simd_lid * values_per_thread;
-for (uint k = 0; k < axis_size; k += block_size) {
-    for (uint i = 0; i < values_per_thread; ++i) {
-        x_thread[i] = float(normalized[column + i]);
-    }
-    result += laguna_tail_nvfp4_qdot(
-        ws, x_thread, laguna_tail_nvfp4_scale(sb[k / block_size]));
-    ws += block_size / 2;
-    column += block_size;
-}
+\(qmvLoop)
 
 result = simd_sum(result\(lagunaTailNVFP4RowScaleSuffixSource(scaleDefer: lagunaTailNVFP4QKVScaleDeferEnabled)));
 if (simd_lid == 0) {
@@ -4840,7 +4932,8 @@ private let lagunaDecodeNVFP4QKVLaneMajorKernels: [Int: MLXFast.MLXFastKernel] =
             name: "laguna_decode_nvfp4_qkv_h\(heads)_r1_v1_lm1"
                 + (lagunaAttnScalePairwiseQKVEnabled ? "_pw1" : "")
                 + (lagunaTailNVFP4QKVSeedElisionEnabled ? "_se1" : "")
-                + (lagunaTailNVFP4QKVScaleDeferEnabled ? "_sd1" : ""),
+                + (lagunaTailNVFP4QKVScaleDeferEnabled ? "_sd1" : "")
+                + (lagunaDecodeNVFP4QKVPrefetchEnabled ? "_pf1" : ""),
             inputNames: [
                 "normalized", "weight_codes", "scale_nibbles", "scale_bases",
                 "weight_scales",
