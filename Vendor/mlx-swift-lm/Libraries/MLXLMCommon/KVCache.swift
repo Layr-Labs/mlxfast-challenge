@@ -4,34 +4,6 @@ import Foundation
 import MLX
 import MLXNN
 
-/// Implementation of KV cache functionality for MLX Swift
-///
-///
-/// ## Quantized Cache Usage
-///
-/// **Standard caches:**
-/// ```swift
-/// let cache = KVCacheSimple()
-/// let (keys, values) = cache.update(keys: keys, values: values)
-/// let output = MLXFast.scaledDotProductAttention(queries: q, keys: keys, values: values, ...)
-/// ```
-///
-/// **Quantized cache:**
-/// ```swift
-/// let quantizedCache = QuantizedKVCache(groupSize: 64, bits: 4)
-/// let (qKeys, qValues) = quantizedCache.updateQuantized(keys: keys, values: values)
-///
-/// let output = quantizedScaledDotProductAttention(
-///     queries: queries,
-///     quantizedKeys: qKeys,
-///     quantizedValues: qValues,
-///     scale: scale,
-///     mask: mask,
-///     groupSize: quantizedCache.groupSize,
-///     bits: quantizedCache.bits
-/// )
-/// ```
-///
 /// Interface for Key/Value cache for LLMs.
 ///
 /// See ``LanguageModel/newCache(parameters:)``
@@ -59,15 +31,6 @@ public protocol KVCache: Evaluatable, Updatable {
     func trim(_ n: Int) -> Int
 
     /// Create an attention mask for this cache
-    ///
-    /// This method encapsulates cache-specific mask creation logic. Implementations should handle offset capping, window size logic,
-    /// and optimization decisions (symbolic vs array masks).
-    ///
-    /// - Parameters:
-    ///   - n: The sequence length for the new tokens
-    ///   - windowSize: Optional sliding window size
-    ///   - returnArray: Force return of array mask instead of symbolic
-    /// - Returns: Attention mask mode for scaled dot product attention
     func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode
@@ -77,20 +40,6 @@ public protocol KVCache: Evaluatable, Updatable {
 }
 
 /// Protocol for caches that support efficient quantized operations
-///
-/// **Usage Example:**
-/// ```swift
-/// // Efficient quantized path
-/// if let quantizedCache = cache as? QuantizedKVCacheProtocol {
-///     let (qKeys, qValues) = quantizedCache.updateQuantized(keys: k, values: v)
-///     // Use native quantized operations
-///     let scores = quantizedMM(queries, w: qKeys.0, scales: qKeys.1, biases: qKeys.2, ...)
-/// } else {
-///     // Regular path
-///     let (k, v) = cache.update(keys: k, values: v)
-///     let output = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, ...)
-/// }
-/// ```
 public protocol QuantizedKVCacheProtocol: KVCache {
     /// The quantization group size used
     var groupSize: Int { get }
@@ -102,19 +51,11 @@ public protocol QuantizedKVCacheProtocol: KVCache {
     var mode: QuantizationMode { get }
 
     /// Update cache and return quantized tuples for maximum efficiency
-    ///
-    /// - Parameters:
-    ///   - keys: New key data to add to cache
-    ///   - values: New value data to add to cache
-    /// - Returns: Quantized tuples (keys, values) as ((weight, scales, biases), (weight, scales, biases))
     func updateQuantized(keys: MLXArray, values: MLXArray) -> (
         (MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?)
     )
 
     /// Get current quantized state without updating
-    ///
-    /// Useful for accessing cached data without adding new tokens.
-    /// - Returns: Current quantized state, or nil if cache is empty
     func getQuantizedState() -> ((MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?))?
 }
 
@@ -160,12 +101,10 @@ open class BaseKVCache: KVCache {
     open func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
-        // For single token, no mask needed
         if n == 1 {
             return .none
         }
 
-        // For multi-token sequences
         if returnArray || (windowSize != nil && n > windowSize!) {
             return .array(createCausalMask(n: n, offset: offset, windowSize: windowSize))
         }
@@ -285,13 +224,6 @@ public func createAttentionMask(h: MLXArray, cache: [KVCache]?, returnArray: Boo
 }
 
 /// Create an attention mask with explicit window size parameter.
-///
-/// - Parameters:
-///   - h: The input array (used to determine sequence length)
-///   - cache: Optional single KV cache
-///   - windowSize: Optional sliding window size (if provided, creates windowed attention)
-///   - returnArray: Force return of array mask instead of symbolic "causal"
-/// - Returns: Attention mask mode for scaled dot product attention
 public func createAttentionMask(
     h: MLXArray,
     cache: KVCache?,
@@ -300,12 +232,10 @@ public func createAttentionMask(
 ) -> MLXFast.ScaledDotProductAttentionMaskMode {
     let n = h.dim(1)
 
-    // Delegate to cache's makeMask if available
     if let cache = cache {
         return cache.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
     }
 
-    // Fallback for no cache
     if n == 1 {
         return .none
     }
@@ -341,13 +271,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         let previous = self.offset
         let tokenCount = keys.dim(2)
 
-        // When the first update already lands exactly on an allocation-step
-        // boundary, the stock zero allocation has no spare capacity: it
-        // creates arrays with the same sequence length as `keys`/`values`,
-        // then copies the entire inputs into them. Retain the incoming arrays
-        // directly in this no-slack case. Shapes, offsets, returned values,
-        // and the next growth boundary are identical; only the redundant
-        // zero-fill and full-prompt slice updates disappear.
+        // See notes/MLXLMCommon-KVCache.notes.md#kvcachesimpleupdate
         if self.keys == nil, previous == 0, tokenCount > 0,
             tokenCount.isMultiple(of: step)
         {
@@ -400,20 +324,11 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     }
 
     // MARK: - Fused-decode append access (MLXFastModel fused attention)
-    //
-    // Mirrors the single-token `update` bookkeeping for the fused decode
-    // attention kernel, which performs the slot write itself and attends
-    // over the first `offset + 1` rows with the new row substituted from
-    // registers. Engages only when the backing already has spare capacity
-    // for one more row (i.e. after the first decode step's stock growth
-    // concat), so the growth/reset branches above are provably not taken.
+    // See notes/MLXLMCommon-KVCache.notes.md#kvcachesimplefuseddecodeappend
 
     /// Tracks the one-time contiguization of the backing arrays; in-place
     /// kernel writes require row-contiguous backings (a non-contiguous
     /// backing would be copied per step by `ensureRowContiguous` and the
-    /// slot writes lost). After the first decode step's growth concat the
-    /// backings are concat outputs and already contiguous; `contiguous()`
-    /// is then an identity-value op.
     private var fusedAppendContiguized = false
 
     /// Append state for the fused decode attention kernel, or nil when the
@@ -472,16 +387,10 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     }
 
     /// Convert to quantized cache for maximum efficiency
-    ///
-    /// Use `updateQuantized()` and `quantizedScaledDotProductAttention()` for zero-overhead operation.
     public func toQuantized(groupSize: Int = 64, bits: Int = 4) -> QuantizedKVCache {
         if let keys = self.keys, let values = self.values {
-            // Quantize the current keys and values
             let currentKeys = keys[.ellipsis, ..<offset, 0...]
             let currentValues = values[.ellipsis, ..<offset, 0...]
-            // Pick a group size whose divisibility matches the head dim instead
-            // of trusting the requested one (avoids a hard crash on models whose
-            // head dim isn't divisible by 64). Upstream 01b8624.
             guard
                 let effectiveGroupSize = resolvedKVQuantizationGroupSize(
                     requested: groupSize,
@@ -499,7 +408,6 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             let quantizedKeys = quantized(currentKeys, groupSize: effectiveGroupSize, bits: bits)
             let quantizedValues = quantized(currentValues, groupSize: effectiveGroupSize, bits: bits)
 
-            // Set the quantized state
             quantizedCache.state = [
                 quantizedKeys.wq, quantizedKeys.scales, quantizedKeys.biases,
                 quantizedValues.wq, quantizedValues.scales, quantizedValues.biases,
@@ -589,7 +497,6 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             self.keys = keys
             self.values = values
         } else {
-            // Put the keys/values in temporal order to preserve context
             self.keys = temporalOrder(self.keys!)
             self.values = temporalOrder(self.values!)
             idx = self.keys!.dim(2)
@@ -614,7 +521,6 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         let prev = offset
         var cacheLength = self.keys?.dim(2)
 
-        // May not have hit the max size yet, so potentially keep growing the cache
         if cacheLength == nil
             || (prev >= cacheLength! && cacheLength! < maxCacheSize)
         {
@@ -640,7 +546,6 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             idx = prev
         }
 
-        // Trim if needed
         let trimSize = cacheLength! - maxCacheSize
         if trimSize > 0 {
             self.keys = trim(trimSize: trimSize, self.keys!)
@@ -648,18 +553,15 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             idx = maxCacheSize
         }
 
-        // Rotate if we've hit the end
         if idx == maxCacheSize {
             idx = keep
         }
 
-        // Assign
         self.keys![.ellipsis, idx ..< (idx + tokenCount), 0...] = keys
         self.values![.ellipsis, idx ..< (idx + tokenCount), 0...] = values
         offset += tokenCount
         idx += tokenCount
 
-        // Return the appropriate cache slice
         if offset < maxCacheSize {
             return (
                 self.keys![.ellipsis, ..<offset, 0...],
@@ -681,17 +583,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 
     // MARK: - Fused-decode ring access (MLXFastModel fused attention)
-    //
-    // The fused decode attention kernel performs this cache's single-token
-    // update itself: it writes the new normed+roped K row and raw V row
-    // directly into the ring backing at the slot `updateInPlace` would have
-    // slice-assigned, and attends over the full ring in slot order with the
-    // new row substituted from registers — the same buffers, values, and
-    // slot visit order the stock update + SDPA pair produces. These
-    // accessors expose exactly the state that path needs and mirror
-    // updateInPlace's `tokenCount == 1` bookkeeping. They engage only in
-    // the steady wrapped regime (buffer at capacity, `keep == 0`), where
-    // updateInPlace's growth and trim branches are provably no-ops.
+    // See notes/MLXLMCommon-KVCache.notes.md#rotatingkvcachefuseddecodering
 
     /// Tracks the one-time contiguization of the ring backing. In-place
     /// kernel writes require the backing arrays to be row-contiguous
@@ -800,18 +692,15 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
         if n > 1 {
-            // Multi-token case
             let actualWindowSize = windowSize ?? maxCacheSize
             let cappedOffset = min(maxCacheSize - 1, offset)
 
-            // Decide if we need an array mask
             if cappedOffset + n > actualWindowSize || returnArray {
                 return .array(
                     createCausalMask(n: n, offset: cappedOffset, windowSize: actualWindowSize))
             }
             return .causal
         } else {
-            // Single token case (n == 1)
             guard let windowSize = windowSize else {
                 return .none
             }
@@ -826,7 +715,6 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
                 let maskSize = offset < maxCacheSize ? offset + 1 : maxCacheSize
                 let mask = MLXArray(0 ..< Int32(maskSize)) .>= Int32(maskSize - windowSize)
 
-                // Roll the mask to account for rotation
                 let rolledMask = roll(mask, shift: currentIdx + 1)
 
                 return .array(rolledMask)
@@ -850,19 +738,11 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 
     /// Convert to quantized cache
-    /// Note: This is complex due to the rotating nature and temporal ordering
     public func toQuantized(groupSize: Int = 64, bits: Int = 4) -> QuantizedKVCache {
-        // For now, throw an error like the Python version does
-        // A full implementation would need to handle the temporal ordering correctly
         fatalError(
             "RotatingKVCache quantization not yet implemented - temporal ordering makes this complex"
         )
 
-        // Future implementation would need to:
-        // 1. Put keys/values in temporal order using temporalOrder()
-        // 2. Quantize the temporally ordered arrays
-        // 3. Store metadata about rotation state
-        // 4. Implement corresponding dequantization with rotation restoration
     }
 }
 
@@ -940,7 +820,6 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
     /// Create initial quantized tuples (like Python's init_quant)
     private func initQuant(dim: Int, shape: [Int], dtype: DType) -> (MLXArray, MLXArray, MLXArray?)
     {
-        // Create temporary zero arrays and quantize them using native MLX Swift
         let tempArray = MLXArray.zeros(shape + [dim], dtype: dtype)
         let quantized = quantized(tempArray, groupSize: groupSize, bits: bits)
 
@@ -959,7 +838,6 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
     }
 
     /// Get current quantized keys and values as tuples (efficient access)
-    /// - Returns: Tuple of ((keyWeight, keyScales, keyBiases), (valueWeight, valueScales, valueBiases))
     public func getQuantizedState() -> (
         (MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?)
     )? {
@@ -973,11 +851,6 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
 
     /// Update cache and return quantized tuples (Python's update_and_fetch)
     /// This is needed because `update` in Swift must return `(MLXArray, MLXArray)`
-    ///
-    /// - Parameters:
-    ///   - keys: New key data to add to cache
-    ///   - values: New value data to add to cache
-    /// - Returns: Quantized tuples (keys, values) as ((weight, scales, biases), (weight, scales, biases))
     public func updateQuantized(keys: MLXArray, values: MLXArray) -> (
         (MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?)
     ) {
@@ -987,10 +860,6 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
         let kHeadDim = keys.dim(3)
         let vHeadDim = values.dim(3)
         let prev = offset
-        // Resolve a compatible group size up front; adopt it only while the
-        // cache is still empty so a fresh QuantizedKVCache built with a
-        // mismatched default group size self-corrects instead of crashing.
-        // Upstream 01b8624.
         let effectiveGroupSize = resolvedKVQuantizationGroupSize(
             requested: groupSize,
             keyHeadDim: kHeadDim,
@@ -1010,15 +879,12 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
             )
         }
 
-        // Check if we need to expand the cache
         if self.keys == nil || (prev + numSteps) > self.keys!.0.dim(-2) {
             let newSteps = ((step + numSteps - 1) / step) * step
             let shape = [B, nKVHeads, newSteps]
 
             if let existingKeys = self.keys, let existingValues = self.values {
-                // Trim if needed
                 if prev % step != 0 {
-                    // Use tree_map equivalent to trim both keys and values
                     let (trimmedKeys, trimmedValues) = treeMapPair(
                         { array in
                             array[.ellipsis, ..<prev, 0...]
@@ -1028,11 +894,9 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
                     self.values = trimmedValues
                 }
 
-                // Expand using tree_map equivalent (Python's tree_map(expand_quant, ...))
                 self.keys = expandQuant(self.keys!, newShape: shape)
                 self.values = expandQuant(self.values!, newShape: shape)
             } else {
-                // Initialize new quantized cache
                 self.keys = initQuant(dim: kHeadDim, shape: shape, dtype: keys.dtype)
                 self.values = initQuant(dim: vHeadDim, shape: shape, dtype: keys.dtype)
             }
@@ -1043,16 +907,13 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
         let quantizedKeys = quantized(keys, groupSize: groupSize, bits: bits)
         let quantizedValues = quantized(values, groupSize: groupSize, bits: bits)
 
-        // Convert named tuples to positional tuples
         let qKeys = (quantizedKeys.wq, quantizedKeys.scales, quantizedKeys.biases)
         let qValues = (quantizedValues.wq, quantizedValues.scales, quantizedValues.biases)
 
-        // Assign to storage
         guard let currentKeys = self.keys, let currentValues = self.values else {
             fatalError("Quantized cache not properly initialized")
         }
 
-        // Update each component of the quantized tuples
         currentKeys.0[.ellipsis, prev ..< offset, 0...] = qKeys.0
         currentKeys.1[.ellipsis, prev ..< offset, 0...] = qKeys.1
         if let qKeysBiases = qKeys.2 {
@@ -1068,7 +929,6 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
         self.keys = currentKeys
         self.values = currentValues
 
-        // Return quantized tuples
         let trimmedKeys = treeMap({ $0[.ellipsis, ..<offset, 0...] }, currentKeys)
         let trimmedValues = treeMap({ $0[.ellipsis, ..<offset, 0...] }, currentValues)
 
@@ -1089,16 +949,13 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
             guard let keys = keys, let values = values else { return [] }
 
             if offset < keys.0.dim(2) {
-                // Trim to current offset using tree_map
                 let trimmedKeys = treeMap({ $0[.ellipsis, ..<offset, 0...] }, keys)
                 let trimmedValues = treeMap({ $0[.ellipsis, ..<offset, 0...] }, values)
-                // Flatten tuples to array for serialization
                 return [
                     trimmedKeys.0, trimmedKeys.1, trimmedKeys.2, trimmedValues.0, trimmedValues.1,
                     trimmedValues.2,
                 ].compactMap { $0 }
             } else {
-                // Flatten tuples to array for serialization
                 return [keys.0, keys.1, keys.2, values.0, values.1, values.2].compactMap { $0 }
             }
         }
@@ -1167,7 +1024,6 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
         simpleCache.offset = self.offset
 
         if let keys = keys, let values = values {
-            // Dequantize the current state using tree_map approach
             let currentKeys = treeMap({ $0[.ellipsis, ..<offset, 0...] }, keys)
             let currentValues = treeMap({ $0[.ellipsis, ..<offset, 0...] }, values)
 
@@ -1178,7 +1034,6 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
                 currentValues.0, scales: currentValues.1, biases: currentValues.2,
                 groupSize: groupSize, bits: bits, mode: mode)
 
-            // Set the unquantized state
             simpleCache.state = [dequantizedKeys, dequantizedValues]
         }
 
@@ -1290,7 +1145,6 @@ public class ArraysCache: BaseKVCache {
     /// verify forward. Written by `Qwen35GatedDeltaNet` when `nConfirmed > 0` so that
     /// a rejected draft can restore the SSM state exactly.
     /// Cleared on accept; restored on reject.
-    /// Port of omlx commit 696d90a: patches/mlx_lm_mtp/cache_rollback.py ArraysCache.rollback_state
     public var rollbackState: (MLXArray, MLXArray)? = nil
 
     public init(size: Int, leftPadding: [Int]? = nil) {
@@ -1563,9 +1417,6 @@ public class CacheList: BaseKVCache {
     // MARK: - Serialization
 
     /// metaState format: [childCount, (className, stateCount, metaStateCount, ...metaState)*]
-    ///
-    /// Like Python's CacheList.meta_state which returns [child_class_names, child_meta_states],
-    /// but flattened for Swift's [String] format.
     public override var metaState: [String] {
         get {
             var result = ["\(caches.count)"]
@@ -1646,11 +1497,6 @@ private func cacheClassName(_ cache: KVCache) -> String {
 }
 
 /// Save a pre-computed prompt cache to a file.
-///
-/// - Parameters:
-///   - url: The URL to the `.safetensors` file
-///   - cache: The model cache state
-///   - metadata: Optional metadata to save along with cache state
 public func savePromptCache(
     url: URL,
     cache: [KVCache],
@@ -1692,19 +1538,13 @@ public func savePromptCache(
 }
 
 /// Load a prompt cache from a file.
-///
-/// - Parameters:
-///   - url: The URL to the `.safetensors` file
-/// - Returns: The prompt cache and the metadata
 public func loadPromptCache(
     url: URL
 ) throws -> ([KVCache], [String: String]) {
     let (arrays, metadata) = try loadArraysAndMetadata(url: url)
 
-    // Unflatten arrays using tree_unflatten compatible logic
     let cacheData = unflattenArrays(arrays)
 
-    // Unflatten metadata using tree_unflatten compatible logic
     let unflattenedMetadata = unflattenMetadata(metadata)
 
     // Extract cache_info, user_metadata, and cache_classes from unflattened structure
@@ -1721,7 +1561,6 @@ public func loadPromptCache(
         throw KVCacheError(message: "Mismatch in cache counts")
     }
 
-    // Reconstruct cache instances
     var caches: [KVCache] = []
     for i in 0 ..< cacheData.count {
         let className = cacheClasses[i]
@@ -1736,9 +1575,6 @@ public func loadPromptCache(
 }
 
 /// Reconstruct a single cache from its class name, state arrays, and metaState.
-///
-/// Like Python's `globals()[className].from_state(state, meta_state)`, each cache type
-/// encodes enough info in `metaState` to reconstruct itself.
 private func restoreCacheFromMetaState(
     className: String,
     state: [MLXArray],
@@ -1804,7 +1640,6 @@ private func restoreCacheFromMetaState(
 private func unflattenArrays(_ flatArrays: [String: MLXArray]) -> [[MLXArray]] {
     var arrayMap: [Int: [Int: MLXArray]] = [:]
 
-    // Parse all keys and organize by indices
     for (key, array) in flatArrays {
         let components = key.split(separator: ".")
         if components.count >= 2,
@@ -1818,7 +1653,6 @@ private func unflattenArrays(_ flatArrays: [String: MLXArray]) -> [[MLXArray]] {
         }
     }
 
-    // Convert to ordered array structure
     var result: [[MLXArray]] = []
     let maxI = arrayMap.keys.max() ?? -1
 
@@ -1852,11 +1686,9 @@ private func unflattenMetadata(_ flatMetadata: [String: String]) -> [Any] {
         if components.count >= 3 && components[0] == "0" {
             // Cache info: "0.i.j" format
             if let i = Int(components[1]), let j = Int(components[2]) {
-                // Ensure cacheInfo is large enough
                 while cacheInfo.count <= i {
                     cacheInfo.append([])
                 }
-                // Ensure inner array is large enough
                 while cacheInfo[i].count <= j {
                     cacheInfo[i].append("")
                 }
@@ -1869,7 +1701,6 @@ private func unflattenMetadata(_ flatMetadata: [String: String]) -> [Any] {
         } else if components.count >= 2 && components[0] == "2" {
             // Cache classes: "2.i" format
             if let i = Int(components[1]) {
-                // Ensure cacheClasses is large enough
                 while cacheClasses.count <= i {
                     cacheClasses.append("")
                 }
@@ -1889,8 +1720,6 @@ public func makePromptCache(
     model: any LanguageModel,
     parameters: GenerateParameters? = nil
 ) -> [KVCache] {
-    // The model already conforms to LanguageModel which has newCache
-    // If it also conforms to KVCacheDimensionProvider, the extension will provide the implementation
     return model.newCache(parameters: parameters)
 }
 
@@ -1904,9 +1733,6 @@ public func makePromptCache(
 }
 
 /// Fallback function to create cache when layer count is known
-///
-/// This function creates a default cache structure when the number of layers is known.
-/// Use this when `makePromptCache` cannot determine the layer count automatically.
 public func makePromptCacheWithLayerCount(
     numLayers: Int,
     maxKVSize: Int? = nil
@@ -1943,33 +1769,7 @@ public typealias StandardKVCache = KVCacheSimple
 
 // MARK: - Quantized Attention Operations
 
-// Compiled, shape-agnostic softmax cores for `quantizedScaledDotProductAttention`.
-//
-// The softmax over the score tensor is the largest cluster of small elementwise
-// kernels in the quantized-attention path (max, sub, exp, where, sum, div) —
-// each a separate GPU dispatch. Wrapping it in `compile(shapeless:)` fuses those
-// launches into a single graph and cuts the per-step launch overhead that
-// dominates decode latency.
-//
-// `shapeless: true` is what makes this safe on the decode path. During
-// single-query decode the query length is 1 but the cached-KV (`kL`) axis grows
-// by one every token, so the score tensor's *shape* changes every step. A
-// shapeless graph is NOT recompiled when only shapes change — only a change in
-// rank (ndim) or dtype forces a recompile. The score tensor is always rank-4
-// (`[B, nQHeads, L, kL]`, collapsed below before softmax) and keeps a stable
-// dtype during a run, so the graph compiles once and is reused for every step;
-// there is no per-shape recompilation churn.
-//
-// The cores use only `axis: -1` reductions and broadcasts, so they are
-// independent of batch size, head count, query length and `kL`, and they carry
-// no quantization parameters (groupSize/bits/mode live in the surrounding
-// `quantizedMM` calls, which stay outside the compiled core). The matmuls
-// themselves are intentionally left out: each is a single large kernel whose
-// launch overhead is marginal, and folding the GQA reshape (which depends on the
-// batch axis) into a shapeless graph would bake in a stale batch constant.
-//
-// Numerics are identical to the previous inline version — the same ops in the
-// same order, just fused into one graph.
+// See notes/MLXLMCommon-KVCache.notes.md#compiledquantizedattentionsoftmax
 
 /// Stable no-sink softmax. Keeps fully-masked query rows finite by assigning
 /// zero probability to every key (there is no sink to absorb the mass).
@@ -2013,10 +1813,8 @@ public func quantizedScaledDotProductAttention(
     let nKVHeads = quantizedKeys.0.dim(-3)
     let nRepeats = nQHeads / nKVHeads
 
-    // Scale queries
     var scaledQueries = queries * scale
 
-    // Handle GQA (Grouped Query Attention)
     var qKeys = quantizedKeys
     var qValues = quantizedValues
     if nRepeats > 1 {
@@ -2044,12 +1842,9 @@ public func quantizedScaledDotProductAttention(
 
     // Collapse to the canonical 4D [B, nQHeads, L, kL] layout for masking, sink,
     // and softmax. This is required for correctness with GQA *and* batching:
-    // standard attention masks are [B, 1, L, kL] / [B, nQHeads, L, kL] / [L, kL]
-    // and cannot broadcast against the 5D GQA score tensor when B > 1 (the 5D
-    // path only "worked" at B == 1 because the leading 1s happened to broadcast).
+    // See notes/MLXLMCommon-KVCache.notes.md#quantizedscaleddotproductattentiongqamaskbroadcast
     var scores = nRepeats > 1 ? rawScores.reshaped([B, nQHeads, L, kL]) : rawScores
 
-    // Apply mask
     switch mask {
     case .causal:
         let (qL, kLen) = (scores.dim(-2), scores.dim(-1))
@@ -2083,26 +1878,10 @@ public func quantizedScaledDotProductAttention(
 
     let attentionWeights4D: MLXArray
     if let sinks {
-        // Attention sink: a learned per-(query)head logit that acts as one extra
-        // "virtual" key in the softmax — it has no value vector, so it only
-        // absorbs softmax mass, making the real-token weights sum to < 1.
-        // (Equivalent to concatenating `sinks` as an extra score column and
-        // dropping it after softmax, but done without concat/slice so the
-        // weights stay contiguous for `quantizedMM`.) A no-sink cache is the
-        // `sink -> -inf` limit, i.e. `sinks == nil` below, NOT a zero sink.
-        //
-        // In the canonical 4D layout `sinks` ([nQHeads]) maps directly onto the
-        // head axis. The reshape stays outside the compiled core so the core
-        // never bakes in a head-count constant. The fused, numerically-stable
-        // softmax then folds the sink into the denominator.
+        // See notes/MLXLMCommon-KVCache.notes.md#quantizedscaleddotproductattentionabsentsinklimit
         let sinkLogits = sinks.reshaped([1, nQHeads, 1, 1])
         attentionWeights4D = compiledQuantizedAttentionSoftmaxWithSink(scores, sinkLogits)
     } else {
-        // Fused, stable no-sink softmax. Unlike the generic softmax, this keeps
-        // fully masked query rows finite by assigning zero probability to every
-        // real key (there is no sink to absorb probability mass). Model code
-        // ignores padded query rows, but keeping them finite avoids NaN
-        // propagation.
         attentionWeights4D = compiledQuantizedAttentionSoftmax(scores)
     }
 
@@ -2113,14 +1892,12 @@ public func quantizedScaledDotProductAttention(
         ? attentionWeights4D.reshaped([B, nKVHeads, nRepeats, L, kL])
         : attentionWeights4D
 
-    // Compute output using quantized matmul
     var output = quantizedMM(
         attentionWeights, qValues.0, scales: qValues.1, biases: qValues.2,
         transpose: false, groupSize: groupSize, bits: bits,
         mode: mode
     )
 
-    // Reshape output for GQA
     if nRepeats > 1 {
         output = output.reshaped([B, nQHeads, L, D])
     }
@@ -2131,17 +1908,6 @@ public func quantizedScaledDotProductAttention(
 // MARK: - Dynamic Cache Quantization
 
 /// Dynamically quantize KV caches during generation if conditions are met
-///
-/// Converts regular caches to quantized caches when:
-/// - kvBits is specified
-/// - The cache is not already quantized
-/// - The cache offset is greater than quantizedKVStart
-///
-/// - Parameters:
-///   - cache: Array of KV caches to potentially quantize
-///   - kvBits: Number of bits for quantization (nil = no quantization)
-///   - kvGroupSize: Group size for quantization
-///   - quantizedKVStart: Token count threshold to begin quantizing
 public func maybeQuantizeKVCache(
     cache: inout [KVCache],
     kvBits: Int?,
@@ -2151,9 +1917,7 @@ public func maybeQuantizeKVCache(
     guard let kvBits = kvBits, !cache.isEmpty else { return }
 
     // Find the first quantizable (non-Mamba, non-already-quantized) cache entry.
-    // On hybrid attention+SSM models (Qwen3.5, Qwen3-Next, Nemotron, Falcon-H1)
-    // cache[0] is often a MambaCache, so gating on cache[0] silently no-ops KV
-    // quantization. Scan for the first KVCacheSimple instead. Upstream 88beb40.
+    // See notes/MLXLMCommon-KVCache.notes.md#maybequantizekvcachemambacachegate
     guard let firstQuantizable = cache.first(where: { $0 is KVCacheSimple }),
         !(firstQuantizable is QuantizedKVCache),
         firstQuantizable.offset > quantizedKVStart
@@ -2162,7 +1926,6 @@ public func maybeQuantizeKVCache(
     }
 
     for i in 0 ..< cache.count {
-        // Handle cache types that support quantization
         if let simpleCache = cache[i] as? KVCacheSimple {
             // Skip caches whose head dims aren't divisible by any supported
             // group size rather than crashing in toQuantized. Upstream 01b8624.
@@ -2182,8 +1945,5 @@ public func maybeQuantizeKVCache(
             }
             cache[i] = simpleCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
         }
-        // TODO: RotatingKVCache.toQuantized() is not implemented yet, like in Python.
-        // When implemented, add: else if let rotatingCache = cache[i] as? RotatingKVCache { ... }
-        // MambaCache and CacheList don't use traditional KV quantization
     }
 }
