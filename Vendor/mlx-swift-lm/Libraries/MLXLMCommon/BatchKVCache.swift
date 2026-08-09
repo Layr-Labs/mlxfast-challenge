@@ -1,5 +1,4 @@
 // Port of mlx_lm.models.cache.BatchKVCache.
-// https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/cache.py
 
 import Foundation
 import MLX
@@ -29,13 +28,6 @@ public protocol BatchedCache: KVCache {
 }
 
 /// Continuous-batching KV cache.
-///
-/// Storage is right-justified along axis=2: for each row `b`, real keys
-/// live at `[..., leftPadding[b]..._idx, :]` and the leading `leftPadding[b]`
-/// slots are zero. Per-row position offsets are exposed via `batchOffset`
-/// for RoPE dispatch through `BatchPositionedKVCache`.
-///
-/// Not thread-safe; the `BatchGenerator` mutates this from a single task.
 public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
 
     public func filterBatched(batchIndices: MLXArray) {
@@ -103,20 +95,6 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     // MARK: - Init
 
     /// Construct an empty cache for a batch of `leftPadding.count` rows.
-    ///
-    /// The cache expects inputs to be left-padded. For these prompts:
-    /// ```
-    /// [1, 3, 5]
-    /// [7]
-    /// [2, 6, 8, 9]
-    /// ```
-    /// the effective batched input is right-aligned to:
-    /// ```
-    /// [0, 1, 3, 5]
-    /// [0, 0, 0, 7]
-    /// [2, 6, 8, 9]
-    /// ```
-    /// and `leftPadding = [1, 3, 0]`.
     public init(leftPadding: [Int]) {
         self.leftPadding = MLXArray(leftPadding.map { Int32($0) })
         self.batchOffset = MLXArray(leftPadding.map { Int32(-$0) })
@@ -181,10 +159,6 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
         self.values?[.ellipsis, prev ..< _idx, 0...] = values
 
         // Collapse the per-step `batchOffset` lazy chain on decode.
-        // gemma-4 shares one RoPE `perRowOffset` from the first cache
-        // (Gemma4.swift:1264), so other caches never consume their own
-        // `batchOffset` and leak a tiny scalar buffer/step (COUNT leak, flat
-        // bytes). `asyncEval` detaches it, no GPU sync. Prefill untouched.
         if stepCount == 1 {
             asyncEval(batchOffset)
         }
@@ -262,8 +236,6 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     // MARK: - extend (in-place admission)
 
     /// In-place concatenation of another batched cache's rows onto this one.
-    /// Both caches are padded to be right-justified and same time-axis size,
-    /// then concatenated along the batch axis.
     public func extend(_ other: BatchKVCache) {
         // Both empty: just concat the metadata.
         if keys == nil && other.keys == nil {
@@ -406,14 +378,7 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     }
 
     /// Causal mask that also blocks each row's own left-padded slots.
-    ///
-    /// For single-token decode steps with no left padding we return `.none` so
-    /// the fast attention kernel can take its unmasked path. MLX issue #3384:
-    /// on 4-bit quantized Gemma 4, passing an explicit boolean mask (even an
-    /// all-`true` one) routes `scaled_dot_product_attention` through a divergent
-    /// evaluation branch whose numerical drift flips top-1 logprobs and traps
-    /// continuous-batched generation in repetition loops. The unmasked path is
-    /// safe here because every stored key position is a real token.
+    /// See notes/MLXLMCommon-BatchKVCache.notes.md#makemask
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray _: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
@@ -491,10 +456,6 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
 }
 
 /// Sliding-window batched KV cache.
-///
-/// This cache preserves the per-row position and left-padding semantics of
-/// `BatchKVCache`, while trimming stored keys/values to `maxSize` for sliding
-/// attention layers.
 public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     public static let allocationStep = 256
 
@@ -510,9 +471,6 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// Fast decode path: left index of the logical window inside the
     /// over-allocated physical `keys`/`values` buffers. The logical window is
     /// `[..., _base ..< _base + _idx, ...]`. When the fast path is inactive
-    /// (legacy / freshly normalized layout) `_base == 0` and the buffers are
-    /// exactly `_idx` long along axis 2 — byte-for-byte the legacy layout, so
-    /// every existing reader is unchanged on that path.
     var _base: Int = 0
 
     /// Process default for ``useFastDecodePath``. The in-place decode ring is
@@ -529,12 +487,9 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// Per-instance gate for the in-place decode ring. Defaults to the
     /// process-wide ``fastDecodeEnabledDefault``; parity tests flip it per
     /// instance to compare the fast and legacy paths on identical inputs
-    /// without touching global state.
     public var useFastDecodePath: Bool = BatchRotatingKVCache.fastDecodeEnabledDefault
 
     /// Logical window over the (possibly over-allocated) physical buffer.
-    /// Collapses to the stored buffer itself in the normalized layout so the
-    /// legacy path returns exactly what it did before.
     var windowKeys: MLXArray? {
         guard let k = keys else { return nil }
         if _base == 0, k.dim(2) == _idx { return k }
@@ -549,7 +504,6 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// Collapse any fast-path over-allocation back to the canonical layout
     /// (`_base == 0`, physical length == `_idx`). Cheap no-op when already
     /// normalized. Called before every legacy-path mutation so that code can
-    /// keep reading `keys`/`values` directly.
     func normalizeToWindow() {
         guard let k = keys, let v = values else {
             _base = 0
@@ -626,15 +580,7 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         // ---- Fast in-place decode ring -------------------------------------
         // Engaged for a single-token decode step once the cache is populated,
         // not mid-(ragged-)prefill, and the logical length is within the window
-        // (so at most one slot slides off the front). The legacy path on every
-        // such step allocates and fully copies the window TWICE — once for the
-        // `concatenated` append and again for the front `trim`. Here we instead
-        // write the one new token in place into an over-allocated buffer and
-        // advance a host-side base pointer, compacting only every
-        // `allocationStep` steps. The returned window contents, `_idx`,
-        // `batchOffset`, and `leftPadding` are identical to the legacy path
-        // (see the `Parity` tests), so `makeMask` (which depends only on `_idx`
-        // and `leftPadding`) and RoPE (which reads `batchOffset`) are unchanged.
+        // See notes/MLXLMCommon-BatchKVCache.notes.md#line637
         if useFastDecodePath, stepCount == 1, self.keys != nil, _rightPadding == nil,
             _idx <= maxCacheSize
         {
@@ -663,7 +609,6 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
                 // Multi-token prefill must keep enough temporary context for
                 // every query in this call. Match RotatingKVCache's concat
                 // path: trim old context before appending, but do not trim the
-                // newly returned prefill block.
                 let trimSize = _idx - maxCacheSize + 1
                 if trimSize > 0 {
                     self.keys = self.keys![.ellipsis, trimSize..., 0...]
@@ -691,10 +636,6 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         // Collapse the per-step `batchOffset`/`leftPadding` lazy chains
         // on decode (rebuilt at :594/:600). gemma-4 consumes each from only one
         // representative cache (shared RoPE offset + one sliding mask), so the
-        // others leak ~2 tiny scalar buffers/step until `numResources` hits the
-        // iogpu ceiling and aborts (COUNT leak, flat bytes). keys/values don't
-        // leak (attention consumes them each step). `asyncEval` detaches the
-        // chains, no GPU sync. Prefill untouched.
         if stepCount == 1 {
             asyncEval(batchOffset, leftPadding)
         }
@@ -705,13 +646,6 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// Single-token in-place decode write. See `update` for the contract. The
     /// physical buffer is `maxCacheSize + allocationStep` long; the live window
     /// occupies `[_base, _base + _idx)`. Each call writes one slot at the
-    /// frontier, advances `_idx`, and — once the window is full — slides `_base`
-    /// forward by one (dropping the oldest token without copying). When the
-    /// frontier reaches the end of the physical buffer we compact: a fresh
-    /// over-allocated buffer with the current window re-based to the front. The
-    /// in-place slice write donates the buffer (refcount 1 between steps, like
-    /// `RotatingKVCache.updateInPlace`), so steady-state decode performs no
-    /// full-window copy.
     private func fastDecodeUpdate(keys newKeys: MLXArray, values newValues: MLXArray) -> (
         MLXArray, MLXArray
     ) {
@@ -721,7 +655,6 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         // (Re)establish an over-allocated buffer when there is no room to write
         // the new token at the frontier. Covers both the first decode after a
         // prefill / normalize (physical length == `_idx`, no slack) and the
-        // periodic compaction once `_base` has walked to the buffer end.
         if writePos >= (keys?.dim(2) ?? 0) {
             let B = keys!.dim(0)
             let H = keys!.dim(1)
@@ -915,19 +848,7 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// Inverse of `extract`: build a B=1 batched cache from a single-stream
     /// `RotatingKVCache` (e.g. one restored from an SSD checkpoint snapshot),
     /// ready to decode as batch row 0. The single-stream cache must carry
-    /// both `state` ([keys, values]) and `metaState` ([keep, maxSize, step,
-    /// offset, idx]) — exactly what `extract` emits and `KVCacheSerializer`
-    /// round-trips. `keep != 0` is unsupported (the batched cache has no
-    /// keep region) and a recurrent/ unsupported window returns an empty B=1
-    /// cache (caller should not have routed it here).
-    ///
-    /// Left padding is 0 (single row), so the stored arrays are already in
-    /// the batched layout `[1, H, S, D]`. `batchOffset` is the source's
-    /// absolute offset and `_idx` its physical length — both read from the
-    /// source so a subsequent decode step continues from the right position
-    /// and the sliding mask aligns. This is the restore-side mirror of
-    /// `extract`; the pair is covered by an extract→fromSingleRow→resume
-    /// equivalence test.
+    /// See notes/MLXLMCommon-BatchKVCache.notes.md#fromsinglerow
     public static func fromSingleRow(_ src: RotatingKVCache) -> BatchRotatingKVCache {
         let meta = src.metaState  // [keep, maxSize, step, offset, idx]
         let maxSize = (meta.count > 1 ? Int(meta[1]) : nil) ?? src.maxSize ?? 0
@@ -954,26 +875,7 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         // See BatchKVCache.makeMask comment for the Gemma 4 / MLX #3384
         // workaround. For a single decode token with no left padding the
         // unmasked fast path is safe — but ONLY when every retained key already
-        // fits inside the requested window. When `windowSize < maxCacheSize` the
-        // buffer can hold keys older than the active window; returning `.none`
-        // there would let the query attend past it, so keep the windowed mask.
-        // For Gemma (and any caller where window == cache size) `_idx` is capped
-        // at `maxCacheSize == actualWindowSize`, so this is always taken.
-        // `<= 0`, not `== 0`: a rotating cache that has generated past its window
-        // trims slots and subtracts from `leftPadding`, so unpadded rows go
-        // NEGATIVE once past `maxCacheSize`. Accepting only `== 0` would send
-        // every long (> window) Gemma 4 decode back through the explicit-mask path
-        // (the mlx#3384 slow/divergent path) on every sliding layer.
-        //
-        // Boundary: makeMask runs BEFORE `update`, which appends `n` keys and then
-        // trims to `maxCacheSize` (NOT to the window). So the post-update retained
-        // length is `min(_idx + n, maxCacheSize)`; `.none` is correct only if THAT
-        // fits the window. For Gemma (window == maxCacheSize) this is always true,
-        // so the fast path is unchanged; it only tightens `windowSize <
-        // maxCacheSize`, where the old `_idx <= actualWindowSize` let the query
-        // attend one token past the window. (Plain `_idx + n <= actualWindowSize`
-        // would wrongly drop Gemma's fast path at the full-cache boundary, where
-        // the trim keeps everything in-window.)
+        // See notes/MLXLMCommon-BatchKVCache.notes.md#line976
         if n == 1, min(_idx + n, maxCacheSize) <= actualWindowSize,
             leftPadding.max().item(Int32.self) <= 0
         {
@@ -1101,9 +1003,6 @@ extension BatchKVCache {
 
     /// Zero per-row tail positions. For each row `b`, slots
     /// `[keepLengths[b], _idx)` in both keys and values are set to 0.
-    ///
-    /// This is used by batched speculative decoding when rows accept different
-    /// numbers of tokens within the same verify block.
     public func zeroTailPerRow(keepLengths: MLXArray) {
         guard let storedK = keys, let storedV = values else { return }
         let T = storedK.dim(2)

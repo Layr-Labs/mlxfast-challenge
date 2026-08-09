@@ -302,7 +302,12 @@ void steel_matmul_regular_axpby_nax(
   // TODO: Explore device-based tuning for swizzle
   int swizzle_log = tm <= 3 ? 0 : 1;
   if (devc == 's' || devc == 'c' || devc == 'd') {
-    swizzle_log = 2;
+    // Threadgroups sharing a B column slab are 2^swizzle_log apart in dispatch
+    // order. At swizzle_log 2 a tiles_m of 8 splits them over two grid rows, so
+    // the whole B matrix is streamed from DRAM once per row. Widening to 8
+    // keeps them adjacent and streams B once, provided tiles_m stays an exact
+    // multiple so the tile mapping remains a bijection.
+    swizzle_log = (tm >= 8 && (tm % 8) == 0) ? 3 : 2;
   }
 
   // Prepare steel matmul params
