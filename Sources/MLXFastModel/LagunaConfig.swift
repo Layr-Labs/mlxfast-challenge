@@ -5,12 +5,7 @@ import MLXFastCore
 /// Frozen invariants of the pinned Poolside Laguna XS 2.1 NVFP4 target
 /// (`poolside/Laguna-XS-2.1-NVFP4-mlx`). They live here because
 /// `MLXFastCore` is trusted harness code outside the editable surface.
-///
-/// Laguna is a 256-expert MoE decoder: 40 layers, hidden 2048, GQA with 8 KV
-/// heads and head dim 128, mixed full-attention (48 query heads, YaRN partial
-/// RoPE) and sliding-window layers (64 query heads, plain RoPE, window 512),
-/// a dense MLP only at layer 0, and sigmoid top-8 routing with a shared
-/// expert on layers 1-39. The vocabulary head is untied.
+/// See notes/LagunaConfig.notes.md#lagunaarchitecturesummary
 public enum LagunaConstants {
     public static let modelType = "laguna"
     public static let vocabSize = 100_352
