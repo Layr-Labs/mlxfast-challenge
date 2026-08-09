@@ -7767,8 +7767,35 @@ private let lagunaRoutedSwiGLUQMVPackedTop8Kernel = MLXFast.metalKernel(
 let lagunaRoutedGateUpR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1"] != "0"
 
+/// Both SIMD groups in one R1 threadgroup own adjacent output rows for the
+/// same routed slot, so their exact Top-8 winner is identical. Let SIMD 0
+/// perform that integer-only extraction once and publish the winner through a
+/// threadgroup scalar. Set `DARKBLOOM_ROUTED_QMV_SHARE_TOP8=0` to restore the
+/// duplicate per-SIMD extraction.
+private let lagunaRoutedQMVShareTop8Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_QMV_SHARE_TOP8"] != "0"
+
+private let lagunaRoutedQMVTop8R1Prelude =
+    lagunaRoutedQMVShareTop8Enabled
+    ? """
+threadgroup uint shared_expert;
+if (simd_group == 0) {
+    \(lagunaRouterTop8PrecomputedPrelude)
+    if (lane == 0) {
+        shared_expert = top8_winner;
+    }
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+uint expert = shared_expert;
+"""
+    : """
+\(lagunaRouterTop8PrecomputedPrelude)
+uint expert = top8_winner;
+"""
+
 private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2",
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2"
+        + (lagunaRoutedQMVShareTop8Enabled ? "_shared1" : ""),
     inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
     outputNames: ["activated"],
     source: """
@@ -7792,8 +7819,7 @@ uint tile = group / routed_experts;
 uint simd_group = simdgroup_index_in_threadgroup;
 uint lane = thread_index_in_simdgroup;
 uint logical_row = tile * 2 + simd_group;
-\(lagunaRouterTop8PrecomputedPrelude)
-uint expert = top8_winner;
+\(lagunaRoutedQMVTop8R1Prelude)
 
 const device uint8_t* expert_weight =
     (const device uint8_t*)fused_weight + expert * fused_expert_bytes;
