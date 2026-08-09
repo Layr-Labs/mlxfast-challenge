@@ -1469,13 +1469,33 @@ int darkbloom_stage_bm128_variant() {
   static const int v = [] {
     auto s = env::get_var("DARKBLOOM_STAGE_BM128", "");
     if (s.empty()) {
-      // Default 5 (2026-08-01, final): API absolutes across our four scored
-      // sessions prove the mechanism — candidate prefill 204.90 (base) →
-      // 201.64 (wn1) → 201.42 (steel) → 198.00 µs (both; fastest on record).
-      // Earlier rejections were session-baseline draw fog (bpre 364-371 vs
-      // the 375-386 every recent promotion drew), not mechanism failures.
-      // DARKBLOOM_STAGE_BM128=4 restores the WN2 tiling.
-      return 5;
+      // Default 4, restored 2026-08-08. The table above is this file's own
+      // ABBA measurement: variant 4 is +15.40% vs upstream (4/4 pairs) and
+      // +17.47% vs variant 5 (4/4 pairs), with zero distributional overlap
+      // against its controls (342-371 us vs 414-434 us) across 8 paired
+      // samples. Variant 4 buys the SM 32->16 row split from thread count
+      // rather than the column axis: TN stays at the upstream 2, Dtile halves
+      // 32->16 floats and threads/threadgroup double 128->256, which halves
+      // the accumulator register footprint and doubles the parallelism
+      // available to hide staging latency (39.5% of prefill).
+      //
+      // Arithmetic-neutral by construction, not by argument: only which rows
+      // a simdgroup owns changes (tm = SM * (simd_group_id / WN), SM 32->16,
+      // TM 2->1); each element is still accumulated over the same
+      // K_it x (BK/SK) sequence, in the same order, inside one simdgroup's
+      // fragment accumulator. This file records max_abs_diff = 0 for it on
+      // every timed run and on the full 1025-step gate.
+      //
+      // Provenance of the previous default: variant 5 was defaulted on
+      // 2026-08-01 from ranked API absolutes across four scored sessions
+      // (candidate prefill 204.90 base -> 201.64 wn1 -> 201.42 steel ->
+      // 198.00 us both), while variant 4's earlier rejections were
+      // attributed in this same comment to "session-baseline draw fog
+      // (bpre 364-371 vs the 375-386 every recent promotion drew), not
+      // mechanism failures". So the stronger local evidence has never had a
+      // clean ranked read. DARKBLOOM_STAGE_BM128=5 restores the WN1 tiling
+      // and =0 keeps the upstream tiling reachable as an A/B control arm.
+      return 4;
     }
     if (s == "1") {
       return 1;
