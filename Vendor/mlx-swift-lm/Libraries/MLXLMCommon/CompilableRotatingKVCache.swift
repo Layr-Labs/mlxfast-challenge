@@ -2,56 +2,22 @@
 //
 // Ported from osaurus-ai/vmlx-swift-lm
 // (Libraries/MLXLMCommon/BatchEngine/CompilableRotatingKVCache.swift).
-//
-// Standard RotatingKVCache breaks compile() in two ways:
-//   1. Buffer growth via concat rebinds the keys property — the trace
-//      captures the original object and rebinding loses it.
-//   2. Ring-buffer wrap via Swift Int reset doesn't match the trace's
-//      assumed linear layout.
-//
-// This subclass fixes both by:
-//   - Pre-allocating the unified buffer to maxCacheSize at promotion time.
-//     No concat-growth during decode.
-//   - Tracking the write index as idxArray (MLXArray [1] int32). Wrap
-//     arithmetic uses MLXArray ops (where_ + modulo) so the compile tracer
-//     can follow.
-//   - Returning the FULL [B, H, maxCacheSize, D] buffer from update().
-//     The attention mask restricts valid positions.
-//
-// Initialise via init(from:) on an existing RotatingKVCache populated by
-// prefill, or via the static promote(from:maxLength:) helper.
+// See notes/MLXLMCommon-CompilableRotatingKVCache.notes.md#compilablerotatingkvcache
 
 import Foundation
 import MLX
 import MLXNN
 
 /// Compile-traceable specialisation of ``RotatingKVCache``.
-///
-/// Compared to the parent:
-///
-/// - `keys` and `values` are eagerly allocated at `[B, H, maxCacheSize, D]`
-///   at promotion time. No growth-via-concat during decode.
-/// - `idxArray: MLXArray[1] int32` replaces Swift-Int `idx`. All wrap
-///   arithmetic happens in MLXArray ops so the compile tracer can follow.
-/// - `offsetArray: MLXArray[1] int32` mirrors `offset`. Used by `makeMask`
-///   for the causal upper bound; tracked as an MLXArray so the tracer
-///   follows per-step advances.
-/// - `update(keys:values:)` writes new tokens at `idxArray` via
-///   `dynamicSliceUpdate`, then advances `idxArray` with wrap semantics
-///   entirely in MLXArray space.
-/// - `makeMask` always returns `.array(mask)` — the full-buffer return
-///   means attention must be told which positions are valid.
+/// See notes/MLXLMCommon-CompilableRotatingKVCache.notes.md#compilablerotatingkvcache
 public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendable {
 
     /// Current write index within the ring buffer, as `MLXArray[1] int32`.
-    /// In the linear segment (before wrap), this equals `offsetArray`.
-    /// After wrap, this rotates through `[keep, maxCacheSize)`.
     public var idxArray: MLXArray
 
     /// Total valid tokens seen, as `MLXArray[1] int32`. In the linear
     /// segment, equals `idxArray` and is a tight upper bound on valid
     /// positions. Post-wrap, `offsetArray >= maxCacheSize` and ALL
-    /// `maxCacheSize` positions in the buffer are valid (ring full).
     public var offsetArray: MLXArray
 
     /// Pre-computed column indices `[0, 1, ..., maxCacheSize-1]` used by
@@ -61,7 +27,6 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
     /// Promotion-time proof that the physical ring is already full. Once true,
     /// single-token decode keeps every slot valid forever: each update replaces
     /// one old row with the supplied current row. When the requested attention
-    /// window equals the ring size, a mask is therefore exactly redundant.
     private var canElideFullWindowDecodeMask = false
 
     // MARK: - Init
@@ -76,10 +41,6 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
     /// Promote an existing populated ``RotatingKVCache`` to a compile-
     /// traceable variant. Copies the state references AND allocates the
     /// unified buffer at full `maxCacheSize` size if the parent's buffer
-    /// is smaller (the parent grows lazily in `step`-sized chunks).
-    ///
-    /// - Parameter rotating: Source cache. Typically the result of a
-    ///   prefill that has populated keys/values.
     public convenience init(from rotating: RotatingKVCache) {
         self.init(
             maxSize: rotating.maxCacheSize,
@@ -94,8 +55,6 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
         self.canElideFullWindowDecodeMask = rotating.offset >= maxCacheSize
 
         // Pre-allocate or extend the unified buffer to full maxCacheSize.
-        // This prevents the compile-breaking concat-growth path from ever
-        // firing during decode.
         if let srcK = rotating.keys, let srcV = rotating.values {
             let B = srcK.dim(0)
             let H = srcK.dim(1)
@@ -136,9 +95,6 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
     /// Compile-traceable append. Writes new tokens at `idxArray` position
     /// via `dynamicSliceUpdate`, advances counters with wrap semantics in
     /// MLXArray ops.
-    ///
-    /// Returns the FULL `[B, H, maxCacheSize, D]` buffer. `makeMask`
-    /// restricts attention to valid positions.
     public override func update(
         keys newKeys: MLXArray, values newValues: MLXArray
     ) -> (MLXArray, MLXArray) {
@@ -184,8 +140,6 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
         // DELIBERATELY no Swift-Int mirror updates here:
         // `idx = Int(newIdx.item(Int32.self))` would force an `eval`
         // call, which MLX compile rejects. Consumers that need the Int
-        // view should read the MLXArray counters and materialize
-        // OUTSIDE the compiled trace.
 
         return (keys!, values!)
     }
@@ -194,14 +148,6 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
 
     /// Build an attention mask over the full `[B, H, maxCacheSize, D]`
     /// buffer.
-    ///
-    /// Mask semantics:
-    ///  - **Linear phase** (offsetArray < maxCacheSize): valid positions
-    ///    are `[0, offsetArray)`. Causal mask is `linds >= rinds`.
-    ///  - **Post-wrap phase** (offsetArray >= maxCacheSize): all
-    ///    `maxCacheSize` positions are valid (the ring is full). The
-    ///    ring layout means positions are NOT in logical order — but for
-    ///    single-query decode with `n=1`, every position is attendable.
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
@@ -233,9 +179,6 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
             // After ring wrap, the recent window may be split across buffer
             // end and beginning. Compare in modular token-index space rather
             // than physical ring-column space so both halves are included.
-            // tokenInds maps each physical position to its distance from the
-            // write cursor: idxArray → 0 (oldest/next-write), idxArray-1 →
-            // maxCacheSize-1 (most recent). Keep the RECENT end of the ring.
             let tokenInds = (rinds - idxArray + MLXArray(Int32(maxCacheSize))) % Int32(maxCacheSize)
             let windowFilter = tokenInds .>= Int32(maxCacheSize - windowSize)
             mask = mask & windowFilter
