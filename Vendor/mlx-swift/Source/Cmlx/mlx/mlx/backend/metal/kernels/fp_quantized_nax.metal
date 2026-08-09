@@ -72,6 +72,10 @@
   instantiate_quantized_modes(type, nvfp4, 16, 4) \
   instantiate_quantized_modes(type, mxfp8, 32, 8) \
   instantiate_quantized_modes(type, mxfp4, 32, 4)
+// Wide M=1 NVFP4 decode tile used by the shape-based host route.
+instantiate_quantized_aligned_batched(
+    nvfp4, qmm_t_nax, bfloat16_t, 16, 64, 64, 1, 2, true, 0, 16, 4)
+
 
 instantiate_quantized_types(float)
 instantiate_quantized_types(bfloat16_t)

@@ -336,6 +336,26 @@ let lagunaFusedGatedOutputProjectionEnabled =
 /// `DARKBLOOM_FUSED_QKV_PROJECTION=0` to ablate.
 let lagunaFusedQKVProjectionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV_PROJECTION"] != "0"
+/// Decode-only M=1 NAX probe for the retained group-16 NVFP4 QKV bank.
+/// The source packed codes/scales and `[1, 1, Q+K+V]` output are unchanged,
+/// but `qmm_nax` stages dequantized weights as BF16 before its NAX MMA and
+/// accumulates 64-wide fragments in FP32 rather than using R1's float products
+/// and row-local reduction order. This path is not bit-exact and must earn
+/// promotion through the model's correctness envelope. Set
+/// `DARKBLOOM_DECODE_QKV_NAX_M1=0` to restore the custom R1 dispatch.
+let lagunaDecodeQKVNAXM1Enabled = {
+    let environment = ProcessInfo.processInfo.environment
+    guard environment["DARKBLOOM_DECODE_QKV_NAX_M1"] != "0",
+        #available(macOS 26.2, *)
+    else { return false }
+    let configured = environment["MLX_METAL_GPU_ARCH"]
+    return lagunaNAXAvailable(
+        architecture: configured.flatMap { $0.isEmpty ? nil : $0 }
+            ?? GPU.deviceInfo().architecture,
+        osSupportsNAX: true
+    )
+}()
+
 
 /// TensorFold-derived within-token batching for the serial decode stream.
 /// A native group-32 affine INT8 side layout packs Q/K/V into one batched
@@ -5803,8 +5823,32 @@ final class LagunaRuntimeAttention: Module {
                 // Only materialized when the fused kernel declined; the gate
                 // branches below that read it are unreachable when it fired.
                 let normalized = fusedQKV ?? inputNorm(input)
+                let qkvRows =
+                    (nHeads + 2 * nKVHeads) * headDim
+                let useDecodeQKVNAXM1 =
+                    lagunaDecodeQKVNAXM1Enabled
+                    && fusedQKV == nil
+                    && (nHeads == LagunaConstants.slidingAttentionHeads
+                        || nHeads == LagunaConstants.fullAttentionHeads)
+                    && normalized.dtype == .bfloat16
+                    && normalized.dims(1, 1, LagunaConstants.hiddenSize)
+                    && fusedAffine.mode == .nvfp4
+                    && fusedAffine.bits == 4
+                    && fusedAffine.groupSize == 16
+                    && fusedAffine.biases == nil
+                    && fusedAffine.originalShape
+                        == [qkvRows, LagunaConstants.hiddenSize]
+                    && fusedAffine.packedCodes.dtype == .uint32
+                    && fusedAffine.packedCodes.dims(
+                        qkvRows, LagunaConstants.hiddenSize / 8)
+                    && fusedAffine.scales.dtype == .uint8
+                    && fusedAffine.scales.dims(
+                        qkvRows, LagunaConstants.hiddenSize / 16)
+                if useDecodeQKVNAXM1 {
+                    lagunaTrace("decode nvfp4 qkv NAX M1 h\(nHeads)")
+                }
                 let decodeNVFP4QKVR1 =
-                    fusedQKV == nil
+                    fusedQKV == nil && !useDecodeQKVNAXM1
                     ? lagunaDecodeNVFP4QKVR1(
                         normalized: normalized, bank: fusedAffine, heads: nHeads)
                     : nil

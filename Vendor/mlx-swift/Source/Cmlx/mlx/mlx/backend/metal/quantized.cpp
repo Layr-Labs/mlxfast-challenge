@@ -491,9 +491,13 @@ void qmm_nax(
     const std::string& mode) {
   int B = out.size() / M / N;
 
-  int wm = 2;
+  const bool wide_nvfp4_m1 =
+      M == 1 && K % 64 == 0 && N >= 4096 && N % 64 == 0 &&
+      mode == "nvfp4" && group_size == 16 && bits == 4 && transpose &&
+      !biases.has_value() && B == 1;
+  int wm = wide_nvfp4_m1 ? 1 : 2;
   int wn = 2;
-  int bm = 64;
+  int bm = wide_nvfp4_m1 ? 16 : 64;
   int bn = 64;
   int bk = 64;
   MTL::Size group_dims(32, wn, wm);
@@ -2183,6 +2187,34 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
+  // Shape-based M=1 matrix-engine route. This precedes the vector-limit split
+  // so wide aligned contractions can amortize NAX setup without depending on
+  // a model, layer, request, token position, or benchmark identity.
+  static const bool wide_nvfp4_nax_m1 =
+      env::get_var("DARKBLOOM_DECODE_QKV_NAX_M1", "") != "0";
+  const bool use_wide_nvfp4_nax_m1 =
+      wide_nvfp4_nax_m1 && metal::is_nax_available() && non_batched &&
+      transpose_ && M == 1 && K % 64 == 0 && N >= 4096 && N % 64 == 0 &&
+      x.dtype() == bfloat16 && group_size_ == 16 && bits_ == 4 &&
+      mode == "nvfp4" && !biases.has_value();
+  if (use_wide_nvfp4_nax_m1) {
+    qmm_nax(
+        x,
+        w,
+        scales,
+        biases,
+        out,
+        transpose_,
+        group_size_,
+        bits_,
+        M,
+        N,
+        K,
+        d,
+        s,
+        mode);
+    return;
+  }
   // It is a matrix matrix product.
   if (M >= vector_limit) {
     // Use split-K qmm for small M with transposed weights (non-batched only)
