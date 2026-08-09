@@ -4,27 +4,15 @@ import Foundation
 import MLX
 
 /// The fundamental configuration for any MLX-based model.
-///
-/// `BaseConfiguration` provides the metadata necessary to identify the model architecture
-/// (`modelType`) and describes the quantization parameters used to compress the model's weights.
-/// It is designed to be decoded directly from a model repository's `config.json`.
-///
-/// Typically used the ``GenericModelFactory`` implementations during load.
 public struct BaseConfiguration: Codable, Sendable {
 
     /// The architecture identifier (e.g., "bert", "roberta", "xlm-roberta").
     public let modelType: String
 
     /// Configuration parameters for weight quantization.
-    ///
-    /// MLX uses group-wise quantization to reduce memory footprint. This struct
-    /// defines how weights are grouped and the precision (bits) used for each group.
     public struct Quantization: Codable, Sendable, Equatable {
 
         /// Initializes a new quantization configuration.
-        /// - Parameters:
-        ///   - groupSize: The number of weights that share the same scale and bias.
-        ///   - bits: The bit-depth of the quantized weights (e.g., 4 or 8).
         public init(groupSize: Int, bits: Int) {
             self.groupSize = groupSize
             self.bits = bits
@@ -40,9 +28,6 @@ public struct BaseConfiguration: Codable, Sendable {
         private var _mode: QuantizationMode? = nil
 
         /// The quantization method to use (defaults to `.affine`).
-        ///
-        /// Affine quantization (asymmetric) uses both a scale and a zero-point
-        /// to map floating point values to integers.
         public var mode: QuantizationMode { _mode ?? .affine }
 
         /// Converts the configuration into a tuple format compatible with `MLX.quantize`.
@@ -64,10 +49,6 @@ public struct BaseConfiguration: Codable, Sendable {
     }
 
     /// A container for per-layer ``Quantization`` settings.
-    ///
-    /// This allows for "Mixed-Precision" or "Heterogeneous" quantization, where
-    /// sensitive layers (like the embedding head) can be kept at higher precision
-    /// while the rest of the model is compressed.
     public struct PerLayerQuantization: Sendable {
         /// The default quantization for any layer not explicitly named in `perLayerQuantization`.
         public var quantization: Quantization? = nil
@@ -84,8 +65,6 @@ public struct BaseConfiguration: Codable, Sendable {
         }
 
         /// Resolves the quantization parameters for a specific layer.
-        /// - Parameter layer: The path/name of the layer.
-        /// - Returns: The `Quantization` settings to apply, or `nil` if the layer should be skipped.
         public func quantization(layer: String) -> Quantization? {
             if let perLayer = perLayerQuantization[layer] {
                 switch perLayer {
@@ -101,21 +80,7 @@ public struct BaseConfiguration: Codable, Sendable {
     }
 
     /// An internal container designed to handle the mixed JSON structure found in `config.json`.
-    ///
-    /// ```
-    /// "quantization": {
-    ///     "group_size": 64,
-    ///     "bits": 4,
-    ///     "model.embed_tokens": {
-    ///         "group_size": 32,
-    ///         "bits": 4
-    ///     },
-    ///     "model.layers.0.self_attn.q_norm": false,
-    /// ```
-    ///
-    /// Quantization configs in MLX often interleave global keys (like `bits`) with
-    /// specific layer keys (like `model.layers.0...`). This container uses manual
-    /// decoding to separate these interleaved values.
+    /// See notes/MLXLMCommon-BaseConfiguration.notes.md#quantizationcontainer
     struct QuantizationContainer: Codable, Sendable {
         var quantization: Quantization
         var perLayerQuantization: PerLayerQuantization
