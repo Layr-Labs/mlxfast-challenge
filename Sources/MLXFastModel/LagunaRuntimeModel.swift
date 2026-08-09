@@ -171,6 +171,11 @@ let lagunaPackedScalesEnabled =
 private let lagunaRouterPrecomputedKeysEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_PRECOMPUTED_KEYS"] != "0"
 
+/// Let the packed routed QMV publish the selector outputs it already derives.
+/// Keep this as an explicit opt-in; the default uses the standalone selector.
+private let lagunaPackedRouterOutputsEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_ROUTER_OUTPUTS"] == "1"
+
 /// One-shot stderr visibility for the packed-scales arm: with the flag set,
 /// the arm MUST announce either "active" (bank built / packed dispatch taken)
 /// or "inactive" (a guard declined and the stock kernel ran instead), so a
@@ -905,6 +910,9 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
     let guardOpen = activeSimdGroups < simdGroups
         ? "        if (simd_group < active_simd_groups) {\n" : ""
     let guardClose = activeSimdGroups < simdGroups ? "        }\n" : ""
+    let routerScoreStore = lagunaPackedRouterOutputsEnabled
+        ? "router_keys[256 + router_row + r] = as_type<uint>(score);"
+        : ""
     let routerStore = lagunaRouterPrecomputedKeysEnabled
         ? """
         bfloat logit = bfloat(router_result[r]);
@@ -914,6 +922,7 @@ private func lagunaResidualRMSNormRouterSource(rowsPerGroup: Int) -> String {
         float score = x < 0.0f ? y : 1.0f - y;
         router_keys[router_row + r] = laguna_router_key_ordinal(
             -(score + float(correction_bias[router_row + r])));
+        \(routerScoreStore)
 """
         : "router_logits[router_row + r] = bfloat(router_result[r]);"
 
@@ -1042,7 +1051,9 @@ private let lagunaResidualRMSNormRouterKernels: [Int: MLXFast.MLXFastKernel] =
                 rowsPerGroup,
                 MLXFast.metalKernel(
                     name: "laguna_residual_rms_router_bf16_2048_rpg\(rowsPerGroup)_"
-                        + (lagunaRouterPrecomputedKeysEnabled ? "keys_v1" : "v2"),
+                        + (lagunaRouterPrecomputedKeysEnabled
+                            ? (lagunaPackedRouterOutputsEnabled ? "keys_scores_v1" : "keys_v1")
+                            : "v2"),
                     inputNames: lagunaRouterPrecomputedKeysEnabled
                         ? ["residual", "branch", "weight", "router_weight", "correction_bias"]
                         : ["residual", "branch", "weight", "router_weight"],
@@ -1135,7 +1146,8 @@ func lagunaResidualRMSNormRouter(
         grid: (tiles * 512, 1, 1),
         threadGroup: (512, 1, 1),
         outputShapes: [[1, 1, hidden], [1, 1, hidden], [1, 1, experts]]
-            + (lagunaRouterPrecomputedKeysEnabled ? [[1, 1, experts]] : []),
+            + (lagunaRouterPrecomputedKeysEnabled
+                ? [[1, 1, lagunaPackedRouterOutputsEnabled ? 2 * experts : experts]] : []),
         outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
             + (lagunaRouterPrecomputedKeysEnabled ? [.uint32] : [])
     )
@@ -7744,6 +7756,35 @@ thread uint top8_keys[8];
     }
 """
 
+/// The slot-seven QMV workgroups already perform all eight stable extraction
+/// rounds. One existing SIMDgroup publishes that route and the producer's
+/// exact pre-bias scores without adding a workgroup or synchronization edge.
+private let lagunaRouterTop8OutputPrelude = """
+thread uint top8_keys[8];
+    for (uint j = 0; j < 8; ++j) {
+        top8_keys[j] = router_keys[lane + 32u * j];
+    }
+    uint top8_mask = 0u;
+    uint top8_winner = 0u;
+    bool publish = tile == 0 && expert_slot == 7 && simd_group == 0;
+    float route_total = 0.0f;
+    for (uint r = 0; r <= expert_slot; ++r) {
+        top8_winner = laguna_router_top8_extract_round(
+            top8_keys, top8_mask, lane);
+        if (publish && lane == 0) {
+            float score = as_type<float>(router_keys[256 + top8_winner]);
+            router_indices[r] = top8_winner;
+            router_scores[r] = score;
+            route_total = score + route_total;
+        }
+    }
+    if (publish && lane == 0) {
+        for (uint r = 0; r < 8; ++r) {
+            router_scores[r] = router_scores[r] / route_total;
+        }
+    }
+"""
+
 private let lagunaRoutedSwiGLUQMVPackedTop8Kernel = MLXFast.metalKernel(
     name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_bf16_v1",
     inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
@@ -7756,22 +7797,175 @@ private let lagunaRoutedSwiGLUQMVPackedTop8Kernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// `DARKBLOOM_ROUTED_GATEUP_R1` (default ON; set "0" to restore the accepted
-/// two-rows-per-simdgroup pipeline): one output row per simdgroup for the
-/// routed gate/up packed QMV, with twice the threadgroups — the promoted
-/// down-kernel R1 retile's ownership geometry (isolated receipt `8d35b19d`,
-/// composed in promoted `05e7894f`) applied to its gate/up sibling. Per
-/// output row the operation sequence is identical: same bank bytes via
-/// `bank_tile = logical_row / 4`, `sub = logical_row % 4`, same qdot and
-/// `simd_sum` order, same suffix/SwiGLU/BF16 boundaries, one writer per row.
+private let lagunaRoutedSwiGLUQMVPackedRouterKernel = MLXFast.metalKernel(
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_router_bf16_v1",
+    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
+    outputNames: ["activated", "router_indices", "router_scores"],
+    source: lagunaRoutedSwiGLUQMVPackedSelectedSource(
+        prologue: lagunaRouterTop8OutputPrelude,
+        expertExpression: "top8_winner"),
+    header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
+        + "\n" + lagunaRouterTop8PrologueHeader,
+    ensureRowContiguous: true
+)
+
+/// Default-on one-row-per-simdgroup gate/up R1 retile; `0` restores control.
+/// It preserves the `8d35b19d`/`05e7894f` ownership and arithmetic order.
 let lagunaRoutedGateUpR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1"] != "0"
 
-private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2",
-    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
-    outputNames: ["activated"],
-    source: """
+/// Explicit opt-in all-slot sort.
+private let lagunaRoutedGateUpSortedTop8Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_SORTED_TOP8"] == "1"
+
+/// Default T5: rescan slots 0...4; full-sort slots 5...7.
+private let lagunaRoutedGateUpHybridTop8Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_HYBRID_TOP8"] != "0"
+
+private let lagunaRouterTop8SortedHeader = """
+METAL_FUNC void laguna_router_pair_exchange(
+    thread uint2& a, thread uint2& b) {
+    if (laguna_router_ordinal_before(b.x, b.y, a.x, a.y)) {
+        const uint2 temp = a;
+        a = b;
+        b = temp;
+    }
+}
+"""
+
+private func lagunaRouterTop8SortedPrelude(
+    publishingRoute: Bool, hybridThreshold: Int? = nil
+) -> String {
+    let publicationSetup = publishingRoute
+        ? """
+bool publish = tile == 0 && expert_slot == 7 && simd_group == 0;
+float route_total = 0.0f;
+"""
+        : ""
+    let publicationRound = publishingRoute
+        ? """
+    if (publish && lane == 0) {
+        float score = as_type<float>(router_keys[256 + top8_winner]);
+        router_indices[r] = top8_winner;
+        router_scores[r] = score;
+        route_total = score + route_total;
+    }
+"""
+        : ""
+    let publicationFinish = publishingRoute
+        ? """
+if (publish && lane == 0) {
+    for (uint r = 0; r < 8; ++r) {
+        router_scores[r] = router_scores[r] / route_total;
+    }
+}
+"""
+        : ""
+    let hybridPrefix: String
+    if let hybridThreshold {
+        hybridPrefix = """
+if (expert_slot < \(hybridThreshold)u) {
+    uint top8_mask = 0u;
+    for (uint r = 0; r <= expert_slot; ++r) {
+        uint2 best_pair = uint2(0xFFFFFFFFu, 256u);
+        for (uint j = 0; j < 8; ++j) {
+            if ((top8_mask & (1u << j)) != 0u) continue;
+            const uint2 candidate_pair = top8_pairs[j];
+            if (laguna_router_ordinal_before(
+                candidate_pair.x, candidate_pair.y,
+                best_pair.x, best_pair.y)) {
+                best_pair = candidate_pair;
+            }
+        }
+        for (ushort offset = 16; offset > 0; offset >>= 1) {
+            const uint2 other_pair = simd_shuffle_xor(best_pair, offset);
+            if (laguna_router_ordinal_before(
+                other_pair.x, other_pair.y, best_pair.x, best_pair.y)) {
+                best_pair = other_pair;
+            }
+        }
+        top8_winner = best_pair.y;
+        if ((top8_winner & 31u) == lane) {
+            top8_mask |= 1u << (top8_winner >> 5u);
+        }
+    }
+} else
+"""
+    } else {
+        hybridPrefix = ""
+    }
+
+    return """
+uint top8_winner = 0u;
+{
+thread uint2 top8_pairs[8];
+for (uint j = 0; j < 8; ++j) {
+    uint e = lane + 32u * j;
+    top8_pairs[j] = uint2(router_keys[e], e);
+}
+\(hybridPrefix)
+{
+laguna_router_pair_exchange(top8_pairs[0], top8_pairs[1]);
+laguna_router_pair_exchange(top8_pairs[2], top8_pairs[3]);
+laguna_router_pair_exchange(top8_pairs[4], top8_pairs[5]);
+laguna_router_pair_exchange(top8_pairs[6], top8_pairs[7]);
+laguna_router_pair_exchange(top8_pairs[0], top8_pairs[2]);
+laguna_router_pair_exchange(top8_pairs[1], top8_pairs[3]);
+laguna_router_pair_exchange(top8_pairs[4], top8_pairs[6]);
+laguna_router_pair_exchange(top8_pairs[5], top8_pairs[7]);
+laguna_router_pair_exchange(top8_pairs[1], top8_pairs[2]);
+laguna_router_pair_exchange(top8_pairs[5], top8_pairs[6]);
+laguna_router_pair_exchange(top8_pairs[0], top8_pairs[4]);
+laguna_router_pair_exchange(top8_pairs[3], top8_pairs[7]);
+laguna_router_pair_exchange(top8_pairs[1], top8_pairs[5]);
+laguna_router_pair_exchange(top8_pairs[2], top8_pairs[6]);
+laguna_router_pair_exchange(top8_pairs[1], top8_pairs[4]);
+laguna_router_pair_exchange(top8_pairs[3], top8_pairs[6]);
+laguna_router_pair_exchange(top8_pairs[2], top8_pairs[4]);
+laguna_router_pair_exchange(top8_pairs[3], top8_pairs[5]);
+laguna_router_pair_exchange(top8_pairs[3], top8_pairs[4]);
+
+uint top8_local_rank = 0u;
+\(publicationSetup)
+for (uint r = 0; r <= expert_slot; ++r) {
+    uint2 best_pair = top8_pairs[top8_local_rank];
+    for (ushort offset = 16; offset > 0; offset >>= 1) {
+        const uint2 other_pair = simd_shuffle_xor(best_pair, offset);
+        if (laguna_router_ordinal_before(
+            other_pair.x, other_pair.y, best_pair.x, best_pair.y)) {
+            best_pair = other_pair;
+        }
+    }
+    top8_winner = best_pair.y;
+    if ((top8_winner & 31u) == lane) {
+        ++top8_local_rank;
+    }
+\(publicationRound)
+}
+\(publicationFinish)
+}
+}
+"""
+}
+
+private let lagunaRoutedGateUpR1Top8Prelude =
+    lagunaRoutedGateUpSortedTop8Enabled
+    ? lagunaRouterTop8SortedPrelude(publishingRoute: false)
+    : lagunaRoutedGateUpHybridTop8Enabled
+        ? lagunaRouterTop8SortedPrelude(
+            publishingRoute: false, hybridThreshold: 5)
+        : lagunaRouterTop8PrecomputedPrelude
+
+private let lagunaRoutedGateUpR1Top8OutputPrelude =
+    lagunaRoutedGateUpSortedTop8Enabled
+    ? lagunaRouterTop8SortedPrelude(publishingRoute: true)
+    : lagunaRoutedGateUpHybridTop8Enabled
+        ? lagunaRouterTop8SortedPrelude(
+            publishingRoute: true, hybridThreshold: 5)
+        : lagunaRouterTop8OutputPrelude
+
+private func lagunaRoutedSwiGLUQMVPackedTop8R1Source(prologue: String) -> String {
+    """
 constexpr uint input_width = 2048;
 constexpr uint output_width = 512;
 constexpr uint block_width = 512;
@@ -7792,7 +7986,7 @@ uint tile = group / routed_experts;
 uint simd_group = simdgroup_index_in_threadgroup;
 uint lane = thread_index_in_simdgroup;
 uint logical_row = tile * 2 + simd_group;
-\(lagunaRouterTop8PrecomputedPrelude)
+\(prologue)
 uint expert = top8_winner;
 
 const device uint8_t* expert_weight =
@@ -7876,9 +8070,42 @@ if (lane == 0) {
     activated[expert_slot * output_width + logical_row] =
         bfloat(silu * up);
 }
-""",
+"""
+}
+
+private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
+    name: lagunaRoutedGateUpSortedTop8Enabled
+        ? "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_sorted_bf16_v1"
+        : lagunaRoutedGateUpHybridTop8Enabled
+            ? "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_hybrid5_pairs_bf16_v1"
+            : "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2",
+    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
+    outputNames: ["activated"],
+    source: lagunaRoutedSwiGLUQMVPackedTop8R1Source(
+        prologue: lagunaRoutedGateUpR1Top8Prelude),
     header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
-        + "\n" + lagunaRouterTop8PrologueHeader,
+        + "\n" + lagunaRouterTop8PrologueHeader
+        + (lagunaRoutedGateUpHybridTop8Enabled
+            || lagunaRoutedGateUpSortedTop8Enabled
+            ? "\n" + lagunaRouterTop8SortedHeader : ""),
+    ensureRowContiguous: true
+)
+
+private let lagunaRoutedSwiGLUQMVPackedTop8R1RouterKernel = MLXFast.metalKernel(
+    name: lagunaRoutedGateUpSortedTop8Enabled
+        ? "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_router_sorted_bf16_v1"
+        : lagunaRoutedGateUpHybridTop8Enabled
+            ? "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_router_hybrid5_pairs_bf16_v1"
+            : "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_router_bf16_v1",
+    inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
+    outputNames: ["activated", "router_indices", "router_scores"],
+    source: lagunaRoutedSwiGLUQMVPackedTop8R1Source(
+        prologue: lagunaRoutedGateUpR1Top8OutputPrelude),
+    header: lagunaSharedSwiGLUQMVHeader + "\n" + lagunaDecodeRouterOrdinalHeader
+        + "\n" + lagunaRouterTop8PrologueHeader
+        + (lagunaRoutedGateUpHybridTop8Enabled
+            || lagunaRoutedGateUpSortedTop8Enabled
+            ? "\n" + lagunaRouterTop8SortedHeader : ""),
     ensureRowContiguous: true
 )
 
@@ -7894,7 +8121,9 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
     precondition(packedScales.dtype == .uint8)
     precondition(packedScales.size == lagunaPackedRoutedGateUpScaleBytes)
     precondition(routerKeys.dtype == .uint32)
-    precondition(routerKeys.size == LagunaConstants.numExperts)
+    precondition(
+        routerKeys.size == LagunaConstants.numExperts
+            || routerKeys.size == 2 * LagunaConstants.numExperts)
 
     if lagunaRoutedGateUpR1Enabled {
         return lagunaRoutedSwiGLUQMVPackedTop8R1Kernel(
@@ -7918,6 +8147,42 @@ func lagunaRoutedSwiGLUQMVPackedTop8(
         ]],
         outputDTypes: [.bfloat16]
     )[0]
+}
+
+func lagunaRoutedSwiGLUQMVPackedRouter(
+    _ input: MLXArray,
+    fusedWeight: MLXArray,
+    packedScales: MLXArray,
+    routerKeys: MLXArray
+) -> (activated: MLXArray, indices: MLXArray, weights: MLXArray) {
+    precondition(input.dtype == .bfloat16)
+    precondition(input.dims(1, 1, LagunaConstants.hiddenSize))
+    precondition(fusedWeight.dtype == .uint32)
+    precondition(packedScales.dtype == .uint8)
+    precondition(packedScales.size == lagunaPackedRoutedGateUpScaleBytes)
+    precondition(routerKeys.dtype == .uint32)
+    precondition(routerKeys.size == 2 * LagunaConstants.numExperts)
+
+    let kernel =
+        lagunaRoutedGateUpR1Enabled
+        ? lagunaRoutedSwiGLUQMVPackedTop8R1RouterKernel
+        : lagunaRoutedSwiGLUQMVPackedRouterKernel
+    let tilesPerSlot = lagunaRoutedGateUpR1Enabled ? 256 : 128
+    let outputs = kernel(
+        [input, fusedWeight, packedScales, routerKeys],
+        grid: (LagunaConstants.numExpertsPerTok * tilesPerSlot * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [
+            [
+                1, 1, LagunaConstants.numExpertsPerTok, 1,
+                LagunaConstants.moeIntermediateSize,
+            ],
+            [1, 1, LagunaConstants.numExpertsPerTok],
+            [1, 1, LagunaConstants.numExpertsPerTok],
+        ],
+        outputDTypes: [.bfloat16, .uint32, .float32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
 }
 
 private let lagunaRoutedDownReduceKernel = MLXFast.metalKernel(
@@ -10657,7 +10922,57 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         _ x: MLXArray, residual: MLXArray?, routerLogits: MLXArray?,
         routerKeys: MLXArray? = nil
     ) -> MLXArray {
-        let (inds, weights) = gate(x, logits: routerLogits)
+        let packedRoute: (
+            activated: MLXArray, indices: MLXArray, weights: MLXArray
+        )?
+        if lagunaPackedRouterOutputsEnabled,
+            lagunaRouterPrecomputedKeysEnabled,
+            lagunaPackedScalesEnabled,
+            lagunaFusedRoutedSwiGLUQMVEnabled,
+            lagunaDecodeRouterTop8Enabled,
+            lagunaDecodeRouterCastSinkEnabled,
+            lagunaDecodeRouterNormSinkEnabled,
+            gate.routerLogitSoftcapping == 0,
+            gate.normTopkProb,
+            gate.topK == LagunaConstants.numExpertsPerTok,
+            gate.eScoreCorrectionBias.dtype == .float32,
+            gate.eScoreCorrectionBias.dims(LagunaConstants.numExperts),
+            x.dtype == .bfloat16,
+            x.dims(1, 1, LagunaConstants.hiddenSize),
+            let fusedWeight = _fusedRoutedGateUpWeight,
+            fusedWeight.dtype == .uint32,
+            fusedWeight.dims(
+                LagunaConstants.numExperts,
+                2 * LagunaConstants.moeIntermediateSize,
+                LagunaConstants.hiddenSize / 8),
+            let fusedScales = _fusedRoutedGateUpScales,
+            fusedScales.dtype == .uint8,
+            let packedBank = _packedRoutedGateUpBank,
+            packedBank.dtype == .uint8,
+            packedBank.size == lagunaPackedRoutedGateUpScaleBytes,
+            _fusedRoutedGateUpSplit == LagunaConstants.moeIntermediateSize,
+            _routedDownProj != nil,
+            let routerKeys,
+            routerKeys.dtype == .uint32,
+            routerKeys.dims(1, 1, 2 * LagunaConstants.numExperts)
+        {
+            lagunaTrace("routed gate/up QMV + SwiGLU + router outputs")
+            packedRoute = lagunaRoutedSwiGLUQMVPackedRouter(
+                x,
+                fusedWeight: fusedWeight,
+                packedScales: packedBank,
+                routerKeys: routerKeys)
+        } else {
+            packedRoute = nil
+        }
+        let inds: MLXArray
+        let weights: MLXArray
+        if let packedRoute {
+            inds = packedRoute.indices
+            weights = packedRoute.weights
+        } else {
+            (inds, weights) = gate(x, logits: routerLogits)
+        }
         var y: MLXArray
         var routedAlreadyReduced = false
         var sortedTailInverseOrder: MLXArray?
@@ -10699,10 +11014,13 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 {
                     lagunaPackedScalesLog.note(
                         "active", "routed swiglu qmv packed dispatch")
-                    if lagunaRouterPrecomputedKeysEnabled,
+                    if let packedRoute {
+                        activated = packedRoute.activated
+                    } else if lagunaRouterPrecomputedKeysEnabled,
                         let routerKeys,
                         routerKeys.dtype == .uint32,
-                        routerKeys.size == LagunaConstants.numExperts,
+                        routerKeys.size == LagunaConstants.numExperts
+                            || routerKeys.size == 2 * LagunaConstants.numExperts,
                         gate.topK == LagunaConstants.numExpertsPerTok,
                         gate.routerLogitSoftcapping == 0,
                         gate.eScoreCorrectionBias.size == LagunaConstants.numExperts
