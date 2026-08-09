@@ -7767,8 +7767,35 @@ private let lagunaRoutedSwiGLUQMVPackedTop8Kernel = MLXFast.metalKernel(
 let lagunaRoutedGateUpR1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_GATEUP_R1"] != "0"
 
+/// Both SIMD groups in one R1 threadgroup own adjacent output rows for the
+/// same routed slot, so their exact Top-8 winner is identical. Let SIMD 0
+/// perform that integer-only extraction once and publish the winner through a
+/// threadgroup scalar. Set `DARKBLOOM_ROUTED_QMV_SHARE_TOP8=0` to restore the
+/// duplicate per-SIMD extraction.
+private let lagunaRoutedQMVShareTop8Enabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTED_QMV_SHARE_TOP8"] != "0"
+
+private let lagunaRoutedQMVTop8R1Prelude =
+    lagunaRoutedQMVShareTop8Enabled
+    ? """
+threadgroup uint shared_expert;
+if (simd_group == 0) {
+    \(lagunaRouterTop8PrecomputedPrelude)
+    if (lane == 0) {
+        shared_expert = top8_winner;
+    }
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+uint expert = shared_expert;
+"""
+    : """
+\(lagunaRouterTop8PrecomputedPrelude)
+uint expert = top8_winner;
+"""
+
 private let lagunaRoutedSwiGLUQMVPackedTop8R1Kernel = MLXFast.metalKernel(
-    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2",
+    name: "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2"
+        + (lagunaRoutedQMVShareTop8Enabled ? "_shared1" : ""),
     inputNames: ["input", "fused_weight", "packed_scales", "router_keys"],
     outputNames: ["activated"],
     source: """
@@ -7792,8 +7819,7 @@ uint tile = group / routed_experts;
 uint simd_group = simdgroup_index_in_threadgroup;
 uint lane = thread_index_in_simdgroup;
 uint logical_row = tile * 2 + simd_group;
-\(lagunaRouterTop8PrecomputedPrelude)
-uint expert = top8_winner;
+\(lagunaRoutedQMVTop8R1Prelude)
 
 const device uint8_t* expert_weight =
     (const device uint8_t*)fused_weight + expert * fused_expert_bytes;
@@ -9340,49 +9366,10 @@ private let lagunaDecodeRouterOrdinalEnabled =
 private let lagunaDecodeRouterOrdinalScoreTableEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_ORDINAL_SCORE_TABLE"] != "0"
 
-/// The two-phase 32 -> 64 tournament produces the same globally ordered top
-/// eight as the full 256-entry bitonic network while avoiding its repeated
-/// cross-simdgroup stages. The optimized second phase runs only one logical
-/// copy on the first 64 threads. Keep the full-sort path as an in-binary
-/// fallback and for the score-recompute ablation.
-// Ranked replay nonce: active64 receipt 1 was exact and raw-faster in both
-// phases; this source-only marker intentionally leaves the executable tree
-// unchanged while producing a distinct submission archive.
-// Receipt 2 confirmed the same raw-positive tree; nonce 3 settles paired draw.
-// Receipt 3 also beat the current crown raw; nonce 4 replays after retiring
-// the exact-but-negative routed/shared merged-dispatch successor.
-// Receipt 4 remained crown-positive raw; nonce 5 continues the paired replay.
-// Receipt 5 was the strongest yet at 4.905191 ms decode and 0.187895 ms/token
-// prefill, normalizing 0.2391% above the unchanged crown; nonce 6 replays it
-// after the exact pairwise-finalist successor priced slower and was retired.
-// Receipt 6 improved the raw lead to 0.3388%; nonce 7 continues the same
-// six-receipt exact active64 runtime against paired-baseline variance.
-// Receipt 7 set a new decode best and stayed 0.2771% crown-positive raw;
-// nonce 8 continues the now seven-receipt exact persistence campaign.
-// Receipt 8 was also crown-positive raw; nonce 9 continues the unchanged
-// eight-receipt exact runtime while the paired baseline remains unfavorable.
-// Receipt 9 was the first slightly crown-negative raw draw; nonce 10 preserves
-// the unchanged runtime because its nine-receipt mean remains crown-positive.
-// Receipt 10 was a second small negative draw; nonce 11 continues because the
-// ten-receipt mean still beats the unchanged crown and eight receipts are up.
-// Receipt 11 was a third small raw-negative draw; nonce 12 continues because
-// the eleven-receipt mean remains crown-positive while the successor is built.
-// Receipt 12 returned crown-positive in both phases; nonce 13 replays the same
-// executable tree while its twelve-receipt raw mean remains crown-positive.
-// Receipt 13 was crown-positive by 0.3459% on raw phases; nonce 14 keeps the
-// thirteen-receipt executable tree unchanged while its raw mean leads 0.1400%.
-// Receipt 14 was crown-positive by 0.0385% on raw phases; nonce 15 keeps the
-// fourteen-receipt executable tree unchanged while its raw mean leads 0.1327%.
-// Receipt 15 was crown-positive by 0.1251% on raw phases; nonce 16 keeps the
-// fifteen-receipt executable tree unchanged while its raw mean leads 0.1322%.
-// Receipt 16 was crown-positive by 0.3039% on raw phases; nonce 17 keeps the
-// sixteen-receipt executable tree unchanged while its raw mean leads 0.1429%.
-// Receipt 17 was crown-positive by 0.3584% on raw phases; nonce 18 keeps the
-// seventeen-receipt executable tree unchanged while its raw mean leads 0.1556%.
-// Receipt 18 was crown-positive by 0.0301% on weighted raw phases; nonce 19
-// keeps the eighteen-receipt executable tree unchanged; its mean leads 0.1486%.
-// Receipt 19 was crown-positive by 0.2420% on raw phases; nonce 20 keeps the
-// nineteen-receipt executable tree unchanged while its raw mean leads 0.1535%.
+/// Use the exact two-phase 32 -> 64 tournament for decode as well as prefill.
+/// Its second phase keeps one live finalist set instead of sorting four
+/// wrapped duplicates. Set `DARKBLOOM_DECODE_ROUTER_TOURNAMENT=0` to restore
+/// the promoted full 256-entry decode network.
 private let lagunaDecodeRouterTournamentEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ROUTER_TOURNAMENT"] != "0"
 
@@ -9903,8 +9890,8 @@ if (lane < 64) {
     my_index2 = candidate_indices[lane];
 }
 
-// Sort one 64-candidate set instead of four duplicate copies. Sequences up to
-// 32 are simdgroup-local, so inactive simdgroups can skip them entirely.
+// Sequences through 32 are local to the first two simdgroups; the other six
+// groups no longer sort duplicate finalist sets.
 if (lane < 64) {
 for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
     for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
@@ -9925,9 +9912,8 @@ for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
 }
 }
 
-// The first stage of sequence 64 crosses the two active simdgroups. All 256
-// threads reach the barrier, but only the 64 live candidates touch memory or
-// execute the comparator.
+// Sequence 64 starts with one cross-simdgroup exchange. Every thread reaches
+// the barrier, while only the 64 live finalist lanes touch scratch or compare.
 if (lane < 64) {
     xchg_ordinals[lane] = my_ordinal2;
     xchg_indices[lane] = my_index2;
@@ -9945,7 +9931,6 @@ if (lane < 64) {
         my_ordinal2 = other_ordinal;
         my_index2 = other_index;
     }
-
     for (uint stride = 16; stride > 0; stride >>= 1) {
         other_ordinal = simd_shuffle_xor(my_ordinal2, ushort(stride));
         other_index = simd_shuffle_xor(my_index2, ushort(stride));
@@ -9983,7 +9968,7 @@ private let lagunaPrefillRouterTournamentNormalizingKernel = MLXFast.metalKernel
 )
 
 private let lagunaPrefillRouterTournamentOrdinalKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_router_tournament_ordinal_active64_v2",
+    name: "laguna_prefill_router_tournament_ordinal_active64_scalar_v4",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaPrefillRouterTournamentOrdinalKernelSource(normalizing: false),
@@ -9992,7 +9977,7 @@ private let lagunaPrefillRouterTournamentOrdinalKernel = MLXFast.metalKernel(
 )
 
 private let lagunaPrefillRouterTournamentOrdinalNormalizingKernel = MLXFast.metalKernel(
-    name: "laguna_prefill_router_tournament_ordinal_norm_active64_v2",
+    name: "laguna_prefill_router_tournament_ordinal_norm_active64_scalar_v4",
     inputNames: ["logits", "correction_bias"],
     outputNames: ["router_indices", "router_scores"],
     source: lagunaPrefillRouterTournamentOrdinalKernelSource(normalizing: true),
@@ -10680,11 +10665,6 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
             // fully stock sorted gather-GEMM path and never see the fused
             // bank.
             let activated: MLXArray
-            // Set when the routed and shared gate/up QMVs were issued as one
-            // dispatch below, so the shared half of that same dispatch is
-            // handed to the down projection instead of being issued again.
-            // Purely within this invocation; nothing survives it.
-            var mergedSharedActivated: MLXArray?
             if lagunaFusedRoutedSwiGLUQMVEnabled,
                 x.dtype == .bfloat16,
                 x.dims(1, 1, LagunaConstants.hiddenSize),
@@ -10707,7 +10687,8 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                         gate.routerLogitSoftcapping == 0,
                         gate.eScoreCorrectionBias.size == LagunaConstants.numExperts
                     {
-                        lagunaTrace("routed gate/up QMV + SwiGLU (packed, producer keys)")
+                        lagunaTrace(
+                            "routed gate/up QMV + SwiGLU (packed, producer keys)")
                         activated = lagunaRoutedSwiGLUQMVPackedTop8(
                             x,
                             fusedWeight: fusedWeight,
@@ -10758,8 +10739,7 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
                 let residual,
                 let downWeight = _routedDownWeight,
                 let downScales = _routedDownScales,
-                let sharedInputs = sharedExpert.fusedSharedDownInputs(
-                    x, sharedActivation: mergedSharedActivated),
+                let sharedInputs = sharedExpert.fusedSharedDownInputs(x),
                 activated.dtype == .bfloat16,
                 activated.dims(1, 1, LagunaConstants.numExpertsPerTok, 1,
                     LagunaConstants.moeIntermediateSize),
