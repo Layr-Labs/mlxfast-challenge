@@ -103,7 +103,11 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
             // policy replaced. The 32 GiB soft allocator cap lets the M5 Max
             // retain freed intermediates for reuse; it is not a reservation,
             // and model weights stay active allocations outside it.
-            cacheLimitBytes: 32 << 30,
+            // Ranked M5 Max has 128 GB unified memory. Raise the full-profile MLX
+                // allocator cache from 32 GiB → 48 GiB so decode/prefill reuse
+                // Metal buffer slabs instead of thrashing the allocator between
+                // MoE expert gather-GEMM waves. Low-memory profile unchanged.
+                cacheLimitBytes: 48 << 30,
             // The MLX M5 Max default commits a command buffer after
             // referencing 50 MiB. Many 4-bit projections individually exceed
             // that, so 320 MiB groups adjacent kernels without long command
