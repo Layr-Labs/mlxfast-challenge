@@ -442,6 +442,13 @@ struct QuantizedBlockLoader {
   // certification for 16B bases is strictly stronger than the 8B one, so it
   // is reused unchanged; only the per-thread offset check relaxes to 8B.
   MLX_MTL_CONST bool kWideLoad8ShapeOk = kWidenShapeOk && (kSrcBytes == 8);
+  // Two adjacent 16B device loads cover it instead (the BN = 128
+  // expert-aligned geometry: n_reads 32, one packed byte each). Same
+  // exactness class as the 16B form -- the same source bytes reach the same
+  // sb[] slots in the same order -- and the host's 16B base certification
+  // covers both halves, because the second half starts exactly 16B into the
+  // same contiguous run the first half certified.
+  MLX_MTL_CONST bool kWideLoad32ShapeOk = kWidenShapeOk && (kSrcBytes == 32);
 
   struct alignas(16) WideChunk {
     T v[kWideElems];
@@ -454,6 +461,9 @@ struct QuantizedBlockLoader {
   };
   struct alignas(8) WideSrc8 {
     uint8_t b[kSrcBytes];
+  };
+  struct alignas(16) WideSrc16 {
+    uint8_t b[16];
   };
 
   // Byte offset of this thread's threadgroup destination, relative to the Ws
@@ -486,6 +496,7 @@ struct QuantizedBlockLoader {
         wide_store && kWidenShapeOk && ((dst_byte_off() & 15) == 0);
     const bool load_ok = wide_load &&
         ((kWideLoadShapeOk && ((src_byte_off() & 15) == 0)) ||
+         (kWideLoad32ShapeOk && ((src_byte_off() & 15) == 0)) ||
          (kWideLoad8ShapeOk && ((src_byte_off() & 7) == 0)));
 
     // Nothing widened for this thread: run the untouched scalar path.
@@ -505,6 +516,19 @@ struct QuantizedBlockLoader {
         STEEL_PRAGMA_UNROLL
         for (short b = 0; b < kSrcBytes; b++) {
           sb[b] = packed.b[b];
+        }
+        took_wide_load = true;
+      }
+    }
+    if constexpr (kWideLoad32ShapeOk) {
+      if (load_ok) {
+        const device WideSrc16* wsrc = (const device WideSrc16*)src;
+        WideSrc16 lo = wsrc[0];
+        WideSrc16 hi = wsrc[1];
+        STEEL_PRAGMA_UNROLL
+        for (short b = 0; b < 16; b++) {
+          sb[b] = lo.b[b];
+          sb[16 + b] = hi.b[b];
         }
         took_wide_load = true;
       }
@@ -1730,6 +1754,17 @@ template <
       bits,
       pairwise_scale_layout>;
 
+  // #138 Finding D: widening a tile once silently flipped kSrcBytes 16 -> 32,
+  // which statically disables the wide device load and degrades the weight
+  // stage to kSrcBytes scalar byte loads per thread per k-iteration. The host
+  // certification (darkbloom_stage_wide_load_ok) does not see that, so the
+  // emitted kernel name still reads _wl_1. Fail the build instead.
+  static_assert(
+      !wide_load || loader_w_t::kWideLoadShapeOk ||
+          loader_w_t::kWideLoad8ShapeOk || loader_w_t::kWideLoad32ShapeOk,
+      "wide_load requested but this loader shape falls back to scalar "
+      "per-byte device loads");
+
   constexpr int kWsElems = BN * BK_padded;
   constexpr int kWsPerChunk = 16 / sizeof(Wtype);
   threadgroup NAXWsChunk16<Wtype>
@@ -1778,8 +1813,12 @@ template <
   // i), so silu can be computed register-locally with zero cross-lane
   // traffic. Every other geometry keeps the stock threadgroup-staged
   // epilogue below unchanged.
+  // BN is admitted in 64-column blocks rather than only at 64: the host pack
+  // pairs weight row r with r + 32 inside each 64-row block, so a wider tile
+  // simply holds BN / 64 independent gate/up blocks and the same in-lane
+  // fragment pairing (j <-> j + 2) repeats once per block.
   constexpr bool kSwigluRegLocal =
-      (WN == 1) && (BN == 64) && ((BM / WM) == 16);
+      (WN == 1) && (BN % 64 == 0) && ((BM / WM) == 16);
 #endif // DARKBLOOM_SWIGLU_REGLOCAL
 
 #ifdef DARKBLOOM_BSEARCH_HOIST
@@ -1953,6 +1992,14 @@ template <
           const short qid = short(simd_lane_id >> 2);
           const short fm = (qid & 4) | ((short(simd_lane_id) >> 1) & 3);
           const short fn = ((qid & 2) | (short(simd_lane_id) & 1)) * 4;
+          constexpr short kNBlk = BN / 64;
+          STEEL_PRAGMA_UNROLL
+          for (short blk = 0; blk < kNBlk; ++blk) {
+          // A short-typed `blk` term survives front-end IR as a
+          // sign-extension roundtrip, which would make BN == 64 codegen
+          // differ from the pre-generalization kernel for no semantic reason.
+          const short fbase = (kNBlk == 1) ? short(0) : short(blk * 4);
+          const int cbase = (kNBlk == 1) ? 0 : int(blk) * 32;
           STEEL_PRAGMA_UNROLL
           for (short jf = 0; jf < 2; ++jf) {
             STEEL_PRAGMA_UNROLL
@@ -1961,11 +2008,11 @@ template <
               if (row < sgp_sm) {
                 STEEL_PRAGMA_UNROLL
                 for (short jj = 0; jj < 4; ++jj) {
-                  const int col = jf * 16 + fn + jj;
+                  const int col = cbase + jf * 16 + fn + jj;
                   const bfloat gate = static_cast<bfloat>(
-                      Dtile.frag_at(0, jf)[ie * 4 + jj]);
+                      Dtile.frag_at(0, fbase + jf)[ie * 4 + jj]);
                   const bfloat up = static_cast<bfloat>(
-                      Dtile.frag_at(0, jf + 2)[ie * 4 + jj]);
+                      Dtile.frag_at(0, fbase + jf + 2)[ie * 4 + jj]);
                   const bfloat exp_abs = metal::exp(metal::abs(gate));
                   const bfloat denominator = bfloat(1) + exp_abs;
                   const bfloat z = bfloat(1) / denominator;
@@ -1978,6 +2025,7 @@ template <
                 }
               }
             }
+          }
           }
         }
         if constexpr (!kSwigluRegLocal) {
@@ -1994,10 +2042,18 @@ template <
                linear += SIMD_SIZE) {
             const int row = linear / activated_cols;
             const int col = linear % activated_cols;
+            // Gate/up partners are 32 weight rows apart inside each 64-row
+            // block (host: preparePackedRoutedGateUpBank, pairRows = 32), not
+            // activated_cols apart. Identical to `col` / `activated_cols + col`
+            // when BN == 64; correct for any multiple of 64.
+            // `linear % activated_cols` is a signed remainder, so the compiler
+            // cannot prove col >= 0; spell the BN == 64 case out so it folds.
+            const int blk = (BN == 64) ? 0 : (col >> 5);
+            const int c = (BN == 64) ? col : (col & 31);
             const bfloat gate =
-                gate_up_stage[(tm + row) * BN + col];
+                gate_up_stage[(tm + row) * BN + blk * 64 + c];
             const bfloat up =
-                gate_up_stage[(tm + row) * BN + activated_cols + col];
+                gate_up_stage[(tm + row) * BN + blk * 64 + 32 + c];
             const bfloat exp_abs = metal::exp(metal::abs(gate));
             const bfloat denominator = bfloat(1) + exp_abs;
             const bfloat z = bfloat(1) / denominator;
