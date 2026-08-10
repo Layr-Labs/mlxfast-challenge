@@ -95,6 +95,14 @@ let lagunaLmHeadFusedRefinementEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_LMHEAD_FUSED_REFINEMENT"] != "0"
 
+/// `DARKBLOOM_LMHEAD_COMPACT_SCALES=0` disables the decode-only scale row
+/// for the four-bit first-level vocabulary screen. The full `[V,64]` plane
+/// remains resident for prefill and residual refinement. The compact bank
+/// reconstructs each byte as `row_min + three_bit_delta`
+/// and is admitted only after an init-time byte-for-byte certificate.
+private let lagunaLmHeadCompactScalesEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LMHEAD_COMPACT_SCALES"] != "0"
+
 /// One-line stderr trace hooks (DARKBLOOM_TRACE_FUSION=1) so an active pruner
 /// is visible in run logs.
 private let lagunaTraceFusionEnabled =
@@ -269,6 +277,81 @@ private let lagunaLmHeadInt5BaseCoarseKernel = MLXFast.metalKernel(
         for (uint gg = 0; gg < 2; ++gg) {
             uint g = 2 * lane + gg;
             float sd = laguna_e8m0_decode(srow[g]);
+            uint4 c4 = ((const device uint4*)(crow + g * 16))[0];
+            const device ushort4* xrow = (const device ushort4*)(x + g * 32);
+            float cg = 0.0f;
+            float ag = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint w = 0; w < 4; ++w) {
+                uint lw = c4[w];
+                uint4 ne = (uint4(lw) >> uint4(0u, 8u, 16u, 24u)) & 15u;
+                uint4 no = (uint4(lw) >> uint4(4u, 12u, 20u, 28u)) & 15u;
+                float4 ve = float4(ne << 1u) - 15.5f;
+                float4 vo = float4(no << 1u) - 15.5f;
+                float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
+                float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
+                float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
+                float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
+                float4 axe = metal::abs(xe);
+                float4 axo = metal::abs(xo);
+                #pragma clang loop unroll(full)
+                for (uint k = 0; k < 4; ++k) {
+                    cg += xe[k] * ve[k];
+                    cg += xo[k] * vo[k];
+                    ag += axe[k];
+                    ag += axo[k];
+                }
+            }
+            c_acc += sd * cg;
+            d_acc += sd * ag;
+        }
+        c_acc = simd_sum(c_acc);
+        d_acc = simd_sum(d_acc);
+        if (lane == 0) {
+            coarse[row] = c_acc;
+            float d_up = d_acc * (1.0f + 32.0f * GAMMA);
+            uint dbits = as_type<uint>(d_up);
+            uint dtrunc = dbits & 0xFFFF0000u;
+            if (dtrunc != dbits) {
+                dtrunc += 0x00010000u;
+            }
+            delta[row] = as_type<bfloat>(ushort(dtrunc >> 16));
+        }
+        """,
+    header: lagunaLmHeadPruneHeader,
+    ensureRowContiguous: true
+)
+
+/// Exact scale-packed twin of the first-level kernel. Each row stores one
+/// uint8 base plus one byte per SIMD lane; bits 0...2 and 3...5 hold that
+/// lane's two three-bit group deltas (33 bytes instead of 64). The measured
+/// bank's maximum row span is seven, so there is no fallback branch or stock
+/// scale read. Code, input, dot, bound, reduction, and stores are otherwise
+/// textual replicas of `lagunaLmHeadInt5BaseCoarseKernel`.
+private let lagunaLmHeadInt5BaseCoarseCompactScaleKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_int5_base_coarse_delta_compact_scale_bf16_v2",
+    inputNames: ["x", "codes_base", "scale_bases", "scale_deltas"],
+    outputNames: ["coarse", "delta"],
+    source: """
+        constexpr float GAMMA = 0x1p-15f;
+
+        uint row = threadgroup_position_in_grid.x * 16 +
+            simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        const device uint8_t* crow = codes_base + size_t(row) * 1024;
+        const device uint8_t* drow = scale_deltas + size_t(row) * 32;
+        uint scale_base = uint(scale_bases[row]);
+        uint first_group = 2 * lane;
+        uint packed_deltas = uint(drow[lane]);
+
+        float c_acc = 0.0f;
+        float d_acc = 0.0f;
+        for (uint gg = 0; gg < 2; ++gg) {
+            uint g = first_group + gg;
+            uint scale_byte = scale_base +
+                ((packed_deltas >> (3 * gg)) & 7u);
+            float sd = laguna_e8m0_decode(uint8_t(scale_byte));
             uint4 c4 = ((const device uint4*)(crow + g * 16))[0];
             const device ushort4* xrow = (const device ushort4*)(x + g * 32);
             float cg = 0.0f;
@@ -808,6 +891,61 @@ private let lagunaLmHeadRefinedExactKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Lossless compact form of the first-level int5 scale rows. Every row uses
+/// one base and 32 lane-major bytes containing two three-bit deltas apiece.
+private struct LagunaLmHeadCompactScaleBank {
+    let bases: MLXArray
+    let deltas: MLXArray
+    let maxSpan: Int
+
+    var arrays: [MLXArray] { [bases, deltas] }
+}
+
+/// Pack and then reconstruct the scale plane at untimed initialization. The
+/// certificate compares every decoded byte with the exact `[V,64]` plane
+/// consumed by the control kernel and declines if any row needs >3 bits.
+private func lagunaLmHeadCompactScaleBank(
+    _ scales: MLXArray
+) -> LagunaLmHeadCompactScaleBank? {
+    let rows = lagunaLmHeadPruneVocab
+    let groups = lagunaLmHeadPruneHidden / 32
+    guard scales.dtype == .uint8, scales.dims(rows, groups) else { return nil }
+
+    let plane = contiguous(scales)
+    let rowMin = plane.min(axis: 1, keepDims: true)
+    let span =
+        plane.max(axis: 1, keepDims: true).asType(.int32)
+        - rowMin.asType(.int32)
+    let maxSpan = Int(span.max().item(Int32.self))
+    guard maxSpan <= 7 else { return nil }
+    let bases = contiguous(rowMin.reshaped([rows]))
+    let indices = contiguous(
+        (plane.asType(.int32) - rowMin.asType(.int32)).asType(.uint8))
+
+    // A little-endian uint16 holds two adjacent uint8 deltas. Keep the first
+    // low three bits and move the second from word bits 8...10 to bits 3...5.
+    // The resulting byte is consumed directly by the corresponding SIMD lane.
+    let pairs = indices.view(dtype: .uint16)
+    let deltas = contiguous(
+        ((pairs & MLXArray(UInt16(0x0007)))
+        | ((pairs >> 5) & MLXArray(UInt16(0x0038)))).asType(.uint8))
+
+    let packed = deltas.asType(.int32).reshaped([rows, groups / 2, 1])
+    let unpacked = concatenated([packed & 7, (packed >> 3) & 7], axis: 2)
+        .reshaped([rows, groups])
+    let decoded = (bases.asType(.int32).reshaped([rows, 1]) + unpacked)
+        .asType(.uint8)
+    let mismatches = (decoded .!= plane)
+        .asType(.int32).sum().item(Int32.self)
+    guard mismatches == 0,
+        bases.dims(rows), deltas.dims(rows, groups / 2)
+    else {
+        return nil
+    }
+    return LagunaLmHeadCompactScaleBank(
+        bases: bases, deltas: deltas, maxSpan: maxSpan)
+}
+
 /// Init-time int5 coarse copy of lm_head plus the pruned final-row forward.
 /// Built once (untimed init) by
 /// `LagunaRuntimeModel.prepareFusedRuntimeWeights` when
@@ -822,10 +960,14 @@ final class LagunaLmHeadPruner {
     let int5CodesLo: MLXArray
     let int5CodesHi: MLXArray
     let int5Scales: MLXArray
+    private let compactScaleBank: LagunaLmHeadCompactScaleBank?
 
     /// The resident coarse-copy arrays, for the untimed init-time eval in
     /// `prepareFusedRuntimeWeights`.
-    var residentArrays: [MLXArray] { [int5CodesLo, int5CodesHi, int5Scales] }
+    var residentArrays: [MLXArray] {
+        [int5CodesLo, int5CodesHi, int5Scales]
+            + (compactScaleBank?.arrays ?? [])
+    }
 
     init?(lmHeadWeight: MLXArray) {
         guard lmHeadWeight.shape == [lagunaLmHeadPruneVocab, lagunaLmHeadPruneHidden],
@@ -845,9 +987,14 @@ final class LagunaLmHeadPruner {
         self.int5CodesLo = planes.lo
         self.int5CodesHi = planes.hi
         self.int5Scales = planes.scales
+        self.compactScaleBank = lagunaLmHeadCompactScaleBank(planes.scales)
         if lagunaTraceFusionEnabled {
+            let compact = compactScaleBank.map { bank in
+                let state = lagunaLmHeadCompactScalesEnabled ? "enabled" : "ready"
+                return "+compact-scale-\(state)(max-span=\(bank.maxSpan))"
+            } ?? "+compact-scale-declined"
             FileHandle.standardError.write(
-                Data("fusion active: lmhead-int5-winner-coarse-v5\n".utf8))
+                Data("fusion active: lmhead-int5-winner-coarse-v5\(compact)\n".utf8))
         }
     }
 
@@ -934,24 +1081,35 @@ final class LagunaLmHeadPruner {
         // `coarse` alone (no `delta` read), the exact-winner threshold that
         // absorbs the winning row's 4 KB GEMV, and the inline-mask exact pass.
         // With `refine` the first and last dispatch swap to the three-level
-        // form: the coarse pass reads 1088 B/row instead of 1344 B/row and the
-        // exact pass re-reads the residual bit plane for live blocks only.
-        let coarseOut =
-            refine
-            ? lagunaLmHeadInt5BaseCoarseKernel(
+        // form: the coarse pass reads 1088 B/row (1057 with compact scales)
+        // instead of 1344 B/row and the exact pass re-reads the residual bit
+        // plane for live blocks only.
+        let coarseOut: [MLXArray]
+        if refine, lagunaLmHeadCompactScalesEnabled, let compact = compactScaleBank {
+            coarseOut = lagunaLmHeadInt5BaseCoarseCompactScaleKernel(
+                [x, int5CodesLo, compact.bases, compact.deltas],
+                grid: (vocab / 16 * 512, 1, 1),
+                threadGroup: (512, 1, 1),
+                outputShapes: [[vocab], [vocab]],
+                outputDTypes: [.float32, .bfloat16]
+            )
+        } else if refine {
+            coarseOut = lagunaLmHeadInt5BaseCoarseKernel(
                 [x, int5CodesLo, int5Scales],
                 grid: (vocab / 16 * 512, 1, 1),
                 threadGroup: (512, 1, 1),
                 outputShapes: [[vocab], [vocab]],
                 outputDTypes: [.float32, .bfloat16]
             )
-            : lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel(
+        } else {
+            coarseOut = lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel(
                 [x, int5CodesLo, int5CodesHi, int5Scales],
                 grid: (vocab / 16 * 512, 1, 1),
                 threadGroup: (512, 1, 1),
                 outputShapes: [[vocab], [vocab]],
                 outputDTypes: [.float32, .bfloat16]
             )
+        }
         let coarse = coarseOut[0]
         let delta = coarseOut[1]
         let argmaxPartials = lagunaLmHeadCoarseArgmaxStage1Kernel(
