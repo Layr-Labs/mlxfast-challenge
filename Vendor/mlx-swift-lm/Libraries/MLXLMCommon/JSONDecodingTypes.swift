@@ -2,10 +2,7 @@
 
 import Foundation
 
-// MARK: - IntOrIntArray
 
-/// Decodes a JSON value that can be either a single Int or an array of Ints.
-/// Used for fields like `eos_token_id` which may appear as `128001` or `[128001, 128008]`.
 public struct IntOrIntArray: Codable, Sendable, Equatable {
     public let values: [Int]
 
@@ -44,13 +41,7 @@ public struct IntOrIntArray: Codable, Sendable, Equatable {
     }
 }
 
-// MARK: - StringOrNumber
 
-/// Representation of a heterogenous type in a JSON configuration file.
-///
-/// This can be: a string, a numeric value or an array of numeric values.
-/// There are methods to do unwrapping, see e.g. ``asFloat()`` and
-/// ``asFloats()`` or callers can switch on the enum.
 public enum StringOrNumber: Codable, Equatable, Sendable {
     case string(String)
     case int(Int)
@@ -90,9 +81,6 @@ public enum StringOrNumber: Codable, Equatable, Sendable {
         }
     }
 
-    /// Return the value as an optional array of integers.
-    ///
-    /// This will not coerce `Float` or `String` to `Int`.
     public func asInts() -> [Int]? {
         switch self {
         case .string(_): nil
@@ -104,9 +92,6 @@ public enum StringOrNumber: Codable, Equatable, Sendable {
         }
     }
 
-    /// Return the value as an optional integer.
-    ///
-    /// This will not coerce `Float` or `String` to `Int`.
     public func asInt() -> Int? {
         switch self {
         case .string(_): nil
@@ -118,9 +103,6 @@ public enum StringOrNumber: Codable, Equatable, Sendable {
         }
     }
 
-    /// Return the value as an optional array of floats.
-    ///
-    /// This will not coerce `Int` or `String` to `Float`.
     public func asFloats() -> [Float]? {
         switch self {
         case .string(_): nil
@@ -132,9 +114,6 @@ public enum StringOrNumber: Codable, Equatable, Sendable {
         }
     }
 
-    /// Return the value as an optional float.
-    ///
-    /// This will not coerce `Int` or `String` to `Float`.
     public func asFloat() -> Float? {
         switch self {
         case .string(_): nil
