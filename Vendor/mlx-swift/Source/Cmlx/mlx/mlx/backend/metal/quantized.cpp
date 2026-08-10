@@ -141,7 +141,6 @@ inline int add_strides_and_shapes(
     return 0;
   }
 
-  // TODO: Collapse batch dimensions
 
   int x_batch_ndims = x.ndim() - 2;
   int w_batch_ndims = w.ndim() - 2;
@@ -176,7 +175,7 @@ inline int add_gather_strides_and_shapes(
   return offset;
 }
 
-} // namespace
+}
 
 void qmv_quad(
     const array& x,
@@ -340,7 +339,6 @@ void qvm_split_k(
   auto w_strides = w.strides();
   auto s_strides = scales.strides();
 
-  // Add split_k dim with reshapes
   x_shape.insert(x_shape.end() - 2, split_k);
   x_shape.back() /= split_k;
   x_strides.insert(x_strides.end() - 2, split_D);
@@ -378,7 +376,6 @@ void qvm_split_k(
       "_spk_",
       split_k);
 
-  // Encode and dispatch kernel
   auto kernel = get_quantized_kernel_wrapped(
       d, kname, "qvm_split_k", mode, type_string, group_size, bits, split_k);
 
@@ -632,8 +629,6 @@ void gather_qmm_nax(
   int wn = 2;
   int bm = 64;
   int bn = 64;
-  // The gather qmm NAX kernels are instantiated with BK = 64 only; any
-  // other value here makes the kernel name lookup fail.
   int bk = 64;
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
@@ -823,21 +818,15 @@ void qmm_splitk(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  // Choose split_k to target ~512 threadgroups
   int bm = 32, bn = 32;
   int n_tiles = (N + bn - 1) / bn;
   int m_tiles = (M + bm - 1) / bm;
   int current_tgs = n_tiles * m_tiles;
   int split_k = std::max(1, 512 / current_tgs);
 
-  // Each K partition must be a whole number of BK-wide (32) K-tiles as well as
-  // whole quantization groups. The qmm_t_splitk kernels tile K by BK=32 and do
-  // not bound the K dimension, so a partition smaller than BK (e.g. nvfp4's
-  // group_size=16) would over-read into the next group's weights/scales.
   int k_align = std::max(group_size, 32);
   split_k = std::min(split_k, K / k_align);
 
-  // Ensure K divides evenly by split_k * k_align
   while (split_k > 1 && (K % (split_k * k_align) != 0)) {
     split_k--;
   }
@@ -849,12 +838,6 @@ void qmm_splitk(
   int k_partition_size = K / split_k;
   int split_k_partition_stride = M * N;
 
-  // Fused split-K replay (DARKBLOOM_QMM_SPLITK_FUSED=0 restores the shipped
-  // three-dispatch chain): one dispatch runs the identical per-partition
-  // loader/MMA schedule, emulates each partition store's T-rounding
-  // in-register, and chains partitions in FP32 in the same order the
-  // strided reduce summed the old intermediate — bit-identical output with
-  // no intermediate buffer, no reduce and no second dispatch.
   static const bool splitk_fused_enabled = [] {
     const char* raw = getenv("DARKBLOOM_QMM_SPLITK_FUSED");
     return !(raw && raw[0] == '0');
@@ -893,8 +876,6 @@ void qmm_splitk(
     return;
   }
 
-  // Allocate intermediate buffer: insert split_k at the front so that
-  // partition_stride = M * N matches the leading stride of the buffer.
   auto& compute_encoder = metal::get_command_encoder(s);
   auto temp_shape = out.shape();
   if (temp_shape.size() == 1) {
@@ -905,7 +886,6 @@ void qmm_splitk(
   intermediate.set_data(allocator::malloc(intermediate.nbytes()));
   compute_encoder.add_temporary(intermediate);
 
-  // Grid: (N_tiles, M_tiles, split_k)
   MTL::Size group_dims(32, 2, 2);
   MTL::Size grid_dims(n_tiles, m_tiles, split_k);
 
@@ -943,7 +923,6 @@ void qmm_splitk(
 
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 
-  // Sum across split_k dimension (axis 0)
   ReductionPlan plan(
       ReductionOpType::ContiguousStridedReduce,
       {intermediate.shape(0)},
@@ -1167,77 +1146,8 @@ void gather_qvm(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// DARKBLOOM_PREFILL_GATHER_RUNSKIP: elide gather-GEMM run iterations whose
-// output rows fall outside the issuing simdgroup's row band.
-//
-// DEFAULT ON, following the repo convention for shipped fusions (read as
-// `!= "0"`, like DARKBLOOM_FUSED_ROUTED_SWIGLU_QMV). `mlxfast submit` packages
-// source, not environment, and the ranked runner sets no DARKBLOOM_* variables
-// -- so a default-OFF flag would measure nothing on the ranked box.
-//
-// unset       -> ON at kDarkbloomDefaultRunSkipPct (the SHIPPED strength)
-// "0"         -> OFF, ablation path; kernel is byte-for-byte upstream
-// "1"         -> ON, full elision, P=100 (the measured, validated arm)
-// "1:P"       -> ON, partial: elide on a deterministic ~P% subset of output
-//                row-tiles, P in 1..100. Monotone in P; P=100 == "1".
-//
-// To switch the shipped default between full strength and a sized variant,
-// change ONLY kDarkbloomDefaultRunSkipPct below. No logic edit is required.
-//
-// MEASURED (2026-07-25, full strength): prefill median 468.53 us -> 442.35 us,
-// paired mean **-5.88%**, 6 interleaved pairs, 6/6 favouring ON, every sample
-// QUIESCENCE=CLEAN and `max_abs_diff = 0`, against a 6-pair MDE of 3.54% --
-// i.e. ~1.7x the detection floor, and bit-exact.
-//
-// PREFILL-ONLY. Decode never dispatches this kernel: GatherQMM::eval_gpu gates
-// the rhs path on `M==1 && B>=16 && right_sorted_ && B/E>=4`, and at decode
-// B=8, so SwitchGLU does not sort (8 < 64) and B/E = 0.03 < 4. Decode falls
-// through to gather_qmv (a GEMV, no run-loop). RUNSKIP still touches
-// decode_seconds_per_token, but only via the 512-token seed prefill folded into
-// its numerator.
-//
-// WHY -5.88% AND NOT ~28%: the routed-expert gather-GEMM is ~15% of prefill,
-// not the ~70% booked in notes/07-open-leads.md. That 70% is not measured -- it
-// is the "dominant remainder" left after subtracting measured attention/router
-// times from an *assumed* ~193 ms total, so it absorbed the assumption error.
-// The kernel-internal finding (each 64-row tile is recomputed ~5x, ~40% of the
-// MoE MMA work is dead) is sound and independently corroborated; only the
-// denominator was wrong. 40% x 15% ~= 6%, matching the measurement.
-//
-// The enable bit is function constant 203 and is therefore part of the pipeline
-// specialization key. It is resolved ONCE and is CONSTANT for the whole process,
-// so exactly one pipeline variant is ever compiled and no JIT compile can land
-// inside a timed forward. The magnitude P travels as a runtime scalar argument
-// instead, precisely so that varying it cannot change the specialization key.
-//
-// An earlier "1:N" dispatch-prefix form was removed: flipping the function
-// constant mid-process forced a second pipeline compile, which landed inside
-// the timed prefill for N in roughly [117, 200] and produced a reproducible
-// 15-24% REGRESSION. Magnitude must never be expressed through the FC.
 namespace {
 
-// THE SHIPPED DEFAULT STRENGTH. This is the single line to change to resize the
-// submission; everything else is mechanism. P is the percent of output row-tiles
-// that take the elision, 1..100 (100 == full strength).
-//
-// Simulated MMA work elided, and the prefill delta implied by scaling the
-// measured -5.88% at P=100 (40.0% elided) by the realized tile fraction
-// |{r in [0,64) : (r*61) mod 100 < P}| / 64:
-//
-//   P    tiles/64   elided   d(prefill)   prefill_speedup
-//   50     32/64     20.0%     -2.94%        1.0303
-//   60     38/64     23.8%     -3.49%        1.0362   <- shipped
-//   65     42/64     26.2%     -3.86%        1.0401
-//   68     44/64     27.5%     -4.04%        1.0421
-//   70     45/64     28.1%     -4.13%        1.0431
-//  100     64/64     40.0%     -5.88%        1.0625   <- over the 1.0526 band
-//
-// 60 is chosen over the ~4% target because the payoff is asymmetric: the band
-// cap is PER SUBMISSION, not cumulative, so an undershoot merely leaves ~0.5%
-// for the next chunk, while an overshoot trips `acceptance_band_failed` and
-// burns a whole serial ranked cycle. 60 keeps 1.64pp of headroom under 1.0526
-// and sits on a tile-count plateau (P in [58,60] all select 37-38 tiles), so it
-// is insensitive to +/-1. Raise to 68 if ranked-box variance proves small.
 constexpr int kDarkbloomDefaultRunSkipPct = 100;
 
 bool darkbloom_gather_run_skip_enabled() {
@@ -1247,12 +1157,6 @@ bool darkbloom_gather_run_skip_enabled() {
   return enabled;
 }
 
-// Magnitude in percent of output row-tiles, 1..100.
-//   unset (or anything unrecognized) -> kDarkbloomDefaultRunSkipPct
-//   "1"                              -> 100, full strength
-//   "1:P"                            -> P, clamped to [1, 100]
-// Unset must NOT fall through to 100: the ranked runner sets no DARKBLOOM_*
-// variables, so the unset path IS the shipped path.
 int darkbloom_gather_run_skip_pct() {
   static const int pct = [] {
     auto v = env::get_var("DARKBLOOM_PREFILL_GATHER_RUNSKIP", "");
@@ -1271,34 +1175,6 @@ int darkbloom_gather_run_skip_pct() {
   return pct;
 }
 
-// DARKBLOOM_STAGE_*: attack the per-run staging cost in
-// fp_gather_qmm_rhs_nax. Independent, each default OFF, each "1" to enable.
-//
-// The duplication probe puts the routed gather-QMMs at ~54% of prefill, while
-// RUNSKIP removing ~40% of their MMA work moved prefill only 5.88%. The
-// reconciliation is that this kernel is not MMA bound: per thread per
-// k-iteration QuantizedBlockLoader issues 16 scalar 1B device weight loads, 2
-// scalar scale loads and 32 scalar 2B threadgroup stores -- 50 LSU ops
-// against ~40 for the whole Atile+Btile+MMA compute. RUNSKIP gates
-// per-simdgroup register work but the threadgroup-wide loader stays
-// unconditional, so loader cost scales with E[runs/tile]=4.92 while MMA cost
-// scales with E[runs intersecting a band]=2.93: after RUNSKIP the loader is
-// ~68% of the kernel's LSU traffic. These levers attack that.
-//
-//   DARKBLOOM_STAGE_WIDEST  fc 204  32x2B -> 4x16B threadgroup stores
-//   DARKBLOOM_STAGE_WIDELD  fc 205  16x1B -> 1x16B device weight load
-//   DARKBLOOM_STAGE_RUNBAR  fc 206  drop 2 provably dead per-run barriers
-//   DARKBLOOM_STAGE_NOVOL   fc 207  drop the vestigial volatile in the k-loop
-//
-// These compose with RUNSKIP above rather than competing with it: RUNSKIP
-// elides per-simdgroup MMA work, these cut the threadgroup-wide loader cost
-// that RUNSKIP deliberately leaves untouched to keep barriers uniform.
-//
-// Each is resolved ONCE per process, so it is fixed for the process lifetime
-// and exactly one pipeline variant is ever compiled. Never express a tunable
-// magnitude through a function constant: anything in the specialization key
-// that changes mid-process forces a JIT build that can land inside a timed
-// region (see notes/12, the 1:N dispatch-prefix regression).
 
 bool darkbloom_stage_flag(const char* name) {
   auto v = env::get_var(name, "");
@@ -1331,51 +1207,18 @@ bool darkbloom_expert_aligned_gather() {
   return v;
 }
 
-// DARKBLOOM_EXPERT_STAGE_WIDEST (default ON; "0" restores scalar staging as
-// the A/B control): wide 16B threadgroup stores in the expert-aligned gather
-// QMM's weight-staging loader (load_unsafe_wide<true, false>). Store-side
-// only -- Ws is 16B aligned by construction (NAXWsChunk16) and every thread's
-// destination offset is a multiple of 16 for the shipped BN=64/BK=64/256-thr
-// geometry, so no device access widens and no host alignment certification
-// is involved. Identical values at identical addresses; only the store width
-// changes. Baked into the kernel name and template (like the expert-group
-// count), so each setting compiles exactly one pipeline for the process
-// lifetime.
 bool darkbloom_expert_stage_widest() {
   static const bool v =
       env::get_var("DARKBLOOM_EXPERT_STAGE_WIDEST", "") != "0";
   return v;
 }
 
-// DARKBLOOM_EXPERT_STAGE_WIDELD (default ON; "0" restores scalar loads as
-// the A/B control): one 8B device load per thread for the expert-aligned
-// gather QMM's 8 packed source bytes, replacing 8 scalar byte loads. The
-// per-expert stride, column step, and buffer base are certified through the
-// same darkbloom_stage_wide_load_ok used by the non-expert WIDELD lever
-// (its 16B conditions are strictly stronger than the 8B ones needed here),
-// and the kernel additionally self-guards each thread's own offset, falling
-// back to the scalar path rather than corrupting on any misalignment. Baked
-// into the kernel name and template, one pipeline per process lifetime.
 bool darkbloom_expert_stage_wideld() {
   static const bool v =
       env::get_var("DARKBLOOM_EXPERT_STAGE_WIDELD", "") != "0";
   return v;
 }
 
-// DARKBLOOM_EXPERT_GATHER_GROUPS (default 128; "64" restores the promoted
-// four-experts-per-threadgroup schedule and "256" selects one expert per
-// threadgroup, both kept as A/B controls): how many threadgroups the
-// expert-aligned gather QMM spreads the 256 experts over. More threadgroups
-// means the hardware scheduler overlaps per-expert staging drains and MMA
-// phases instead of serializing expert slots inside one threadgroup. Only
-// the threadgroup-to-expert assignment changes: every output element is
-// computed by the same tile walk with the same accumulation order, and the
-// value is baked into the kernel name and template, so each setting compiles
-// exactly one pipeline for the process lifetime. Measured on M5 Max against
-// the promoted 64 schedule, 128 captures roughly two-thirds of the 256
-// schedule's prefill gain while keeping the measured speedup comfortably
-// mid-band; 256 measures closer to the acceptance ceiling in the single-shot
-// harness regime and is staged as its own follow-up chunk.
 int darkbloom_expert_gather_groups() {
   static const int v = [] {
     auto s = env::get_var("DARKBLOOM_EXPERT_GATHER_GROUPS", "");
@@ -1388,93 +1231,10 @@ int darkbloom_expert_gather_groups() {
   return v;
 }
 
-// DARKBLOOM_STAGE_BM128: select the gather-GEMM m-tiling. NOT a function
-// constant -- it changes the template instantiation, so it is already in
-// `kname` (`_bm_`/`_wm_`/`_wn_`) and therefore in the library name and the
-// pipeline key. Resolved once per process, so exactly one variant is ever
-// compiled and a fresh process picks up a changed environment cleanly.
-//
-//   unset (SHIPPED) -> 5  (BM=64,  WM=4, WN=1)  SN=64, 128 thr/TG (2026-07-31)
-//   "4" (prev ship) -> 4  (BM=64,  WM=4, WN=2)  SM=16, 256 thr/TG
-//   "0"             -> 0  (BM=64,  WM=2, WN=2)  SM=32  upstream tiling
-//   "1"             -> 1  (BM=128, WM=4)        SM=32  less expert re-staging
-//   "2"             -> 2  (BM=128, WM=2)        SM=64  measured regression
-//   "3"             -> 3  (BM=128, WM=8)        SM=16  both mechanisms
-//   "5"             -> 5  (BM=64,  WM=4, WN=1)  SM=16, 128 thr/TG
-//
-// WHY SM=16 IS THE WIN. DARKBLOOM_PREFILL_GATHER_RUNSKIP elides a run for a
-// simdgroup only when the intersection with its SM-row band is EMPTY. On
-// PARTIAL overlap the simdgroup still computes all SM rows and store_slice
-// discards the rest. `tm = SM * (simd_group_id / WN)` gives bands of
-// SM = BM/WM rows, so halving SM narrows the band and converts partial
-// overlaps into full elisions. Simulated over uniform routing (the model
-// reproduces the measured 4.92 runs/tile and 40.5% elision):
-//
-//   SM=32 (upstream)  elision 40.5%  MMA 2.93x ideal  34% of rows useful
-//   SM=16             elision 60.7%  MMA 1.94x ideal  52% of rows useful
-//
-// This is the FRAGSKIP prize reached through TILING instead of predication:
-// FRAGSKIP was rejected because a 16-row predicate is thread-varying and
-// tile_matmad_nax is a simdgroup-collective op that cannot be lane-masked.
-// Here the RUNSKIP predicate is untouched and stays simdgroup-uniform; only
-// the bands are narrower.
-//
-// EXACTNESS. BM, BN, BK, SK and WN are all untouched, so SN=32, TN=2 and TK=2
-// are exactly upstream and the per-row K partition is identical: every output
-// element is still accumulated over the same K_it x (BK/SK) sequence, in the
-// same order, inside one simdgroup's fragment accumulator. The ONLY thing that
-// changes is which rows a simdgroup owns -- `tm = SM * (simd_group_id / WN)`
-// with SM 32 -> 16 -- and how many row-fragments it holds (TM 2 -> 1). That is
-// the "regroup rows across simdgroups" class, arithmetic-neutral by
-// construction rather than by argument. This is a strictly weaker change than
-// variant 5, which also moved WN. max_abs_diff = 0 on every timed run and on
-// the full 1025-step gate.
-//
-// WHY VARIANT 4 AND NOT 5. Both reach SM=16. They differ in where the extra
-// row-split is paid for, and measurement says that is worth an order of
-// magnitude:
-//
-//              WM  WN  SM  SN  TM  TN  Dtile   threads/TG   vs upstream
-//   variant 5   4   1  16  64   1   4  32 flt      128        +2.13%
-//   variant 4   4   2  16  32   1   2  16 flt      256       +15.40%
-//
-// Variant 5 buys the split from the column axis, so TN doubles 2 -> 4 and each
-// simdgroup reads twice as much Btile out of Ws. Variant 4 buys it from the
-// thread count: TN stays at the upstream 2, Dtile HALVES 32 -> 16 floats, and
-// threads/threadgroup double 128 -> 256. Total useful work is identical in both
-// -- each thread simply covers half the rows -- but variant 4 additionally
-// halves the accumulator register footprint and doubles the parallelism
-// available to hide staging latency, which is 39.5% of prefill. The elision
-// model priced only the MMA term (-5.0 pp) and therefore under-predicted this
-// by ~3x; the occupancy term was never in it.
-//
-// MEASURED (ABBA, one binary per series, quiescence-gated, prefill axis,
-// "+" = the named variant faster):
-//
-//   variant 4 vs 0 (upstream)   +15.40%   4/4 pairs
-//   variant 4 vs 5              +17.47%   4/4 pairs
-//   variant 5 vs 0              +2.13%   10/12 pairs, se 0.68%, t = +3.13
-//
-// The two variant-4 series have zero distributional overlap with their
-// controls (e.g. 342-371 us against 414-434 us) and are unanimous across 8
-// paired samples. Steady-state decode step is flat (-0.18%); the positive
-// composite decode reading is the 512-token seed prefill folding in.
-//
-// The unset path is the SHIPPED path: `mlxfast submit` packages source, not
-// environment, and the ranked runner sets no DARKBLOOM_* variables. So the
-// empty string selects the winning variant here, exactly as
-// kDarkbloomDefaultRunSkipPct does above. Explicit "0" keeps the upstream
-// tiling reachable as an A/B control arm.
 int darkbloom_stage_bm128_variant() {
   static const int v = [] {
     auto s = env::get_var("DARKBLOOM_STAGE_BM128", "");
     if (s.empty()) {
-      // Default 5 (2026-08-01, final): API absolutes across our four scored
-      // sessions prove the mechanism — candidate prefill 204.90 (base) →
-      // 201.64 (wn1) → 201.42 (steel) → 198.00 µs (both; fastest on record).
-      // Earlier rejections were session-baseline draw fog (bpre 364-371 vs
-      // the 375-386 every recent promotion drew), not mechanism failures.
-      // DARKBLOOM_STAGE_BM128=4 restores the WN2 tiling.
       return 5;
     }
     if (s == "1") {
@@ -1492,29 +1252,20 @@ int darkbloom_stage_bm128_variant() {
     if (s == "5") {
       return 5;
     }
+    if (s == "6") {
+      return 6;
+    }
+    if (s == "7") {
+      return 7;
+    }
+    if (s == "8") {
+      return 8;
+    }
     return 0;
   }();
   return v;
 }
 
-// Host half of the wide-access alignment contract. The kernel checks each
-// thread's own offset within a tile; only the host can see the three things
-// below, and a misaligned 16B load is silent corruption rather than a fault,
-// so every one of them is checked rather than assumed.
-//
-//   1. The weight array's own byte offset into its Metal buffer. MLX binds
-//      `a.offset() + offset`, so a sliced/offset weight array would shift
-//      every address the kernel derives.
-//   2. The per-expert stride. The kernel advances by `index * stride_w`
-//      bytes; for Laguna this is N*K/2 = 512*2048/2 = 524288 for gate/up and
-//      2048*512/2 = 524288 for down -- both multiples of 16, so every one of
-//      the 256 experts keeps a 16B-aligned base. This is an invariant of the
-//      shape, and it is verified here rather than trusted.
-//   3. The tile column base. The kernel adds `y_col * K/2` bytes with y_col a
-//      multiple of bn = 64, so the term is a multiple of 32*K -- but only if
-//      K itself is even, which is checked.
-//
-// The x/y row bases are irrelevant: this lever only widens weight staging.
 bool darkbloom_stage_wide_load_ok(
     const array& w,
     bool transpose,
@@ -1525,21 +1276,17 @@ bool darkbloom_stage_wide_load_ok(
   if (bits != 4) {
     return false;
   }
-  // Packed 4-bit: two weights per byte.
   if ((K % 2) != 0 || (N % 2) != 0) {
     return false;
   }
-  // (1) buffer offset of the weight array itself.
   if ((w.offset() % 16) != 0) {
     return false;
   }
-  // (2) per-expert stride, in bytes, exactly as the kernel computes it.
   const int64_t stride_w =
       transpose ? int64_t(N) * (K / 2) : int64_t(K) * (N / 2);
   if ((stride_w % 16) != 0) {
     return false;
   }
-  // (3) tile column base, in bytes, for every tile the grid can produce.
   const int64_t col_step = transpose ? int64_t(bn) * (K / 2) : int64_t(bn) / 2;
   if ((col_step % 16) != 0) {
     return false;
@@ -1547,37 +1294,12 @@ bool darkbloom_stage_wide_load_ok(
   return true;
 }
 
-} // namespace
+}
 
-// DARKBLOOM_GATHER_XMAJOR: fold this many ADJACENT BN-wide column tiles of
-// the expert-aligned gather-QMM into one threadgroup, so each threadgroup
-// loads the expert run's x fragments once per k-tile and reuses them across
-// the fold -- x DRAM traffic divides by the fold, weight traffic unchanged
-// (the chains are DRAM-bound with x re-reads ~half the bytes, see
-// notes/exp-stage2.md section 4.3). "1" selects the tuned default fold;
-// explicit 2/4/8/16 override it, anything else is OFF. Parsed once per
-// process. MUST stay in lockstep with the JIT define injected in
-// jit_kernels.cpp (get_qmm_nax_kernel calls this same function): the
-// dispatch divides grid.x by exactly the value the kernel was compiled
-// with.
 int darkbloom_gather_xmajor_ct() {
-  // XMAJOR kernel arms removed with the dead staging code; keep the
-  // dispatch/JIT contract coherent by pinning the fold OFF.
   return 0;
 }
 
-// DARKBLOOM_SWIGLU_REGLOCAL: register-local swiglu epilogue in the
-// expert-aligned gather-QMM (fp_gather_qmm_rhs_expert_nax). With the
-// shipped variant-5 tiling (WN=1: one simdgroup owns the full BN=64 column
-// band of its rows) the fused swiglu epilogue can read gate/up straight
-// from the MMA Dtile fragments instead of round-tripping them through
-// threadgroup memory with two barriers per column tile; the kernel guards
-// itself to that geometry and the values are bit-identical (same bfloat
-// casts of the same Dtile floats, same expression chain, same store
-// addresses). Default ON; "0" restores the stock threadgroup-staged
-// epilogue in the same binary. Parsed once per process; MUST stay in
-// lockstep with the JIT define injected in jit_kernels.cpp
-// (get_qmm_nax_kernel calls this same function).
 bool darkbloom_swiglu_reglocal() {
   static const bool v =
       env::get_var("DARKBLOOM_SWIGLU_REGLOCAL", "") != "0";
@@ -1590,12 +1312,6 @@ bool darkbloom_bsearch_hoist() {
   return v;
 }
 
-// Exact storage markers installed only by Laguna's certified zero-copy expert
-// scale views. Layout 1 is the fused gate/up walk-order bank; layout 2 is the
-// row-major routed down bank. Keep this classifier at the outer GatherQMM
-// boundary as well as the NAX dispatcher: normalizing either zero-stride view
-// would expand each row by repeating its first compact byte and destroy the
-// representation before the specialized loader can see it.
 int laguna_expert_pairwise_scale_layout(const array& scales) {
   if (scales.dtype() != uint8 || scales.ndim() != 3 ||
       scales.offset() != 0 || scales.shape(0) != 256 ||
@@ -1629,13 +1345,8 @@ void gather_qmm_rhs_nax(
     metal::Device& d,
     const Stream& s,
     const std::string mode) {
-  // Start by normalizing the indices
   array indices = ensure_row_contiguous(indices_, d, s);
 
-  // Broadcast x with indices. If we are here that means lhs_indices were not
-  // provided so the lhs_indices are implied to be the shape of x broadcasted
-  // with rhs_indices. We need only broadcast x and copy it as if applying the
-  // lhs_indices.
   auto broadcast_with_indices = [&d, &s, &indices](const array& x) {
     if (x.size() / x.shape(-2) / x.shape(-1) == indices.size()) {
       return ensure_row_contiguous(x, d, s);
@@ -1649,46 +1360,46 @@ void gather_qmm_rhs_nax(
     return ensure_row_contiguous(new_x, d, s);
   };
 
-  // Normalize the input arrays
   array x = broadcast_with_indices(x_);
   array w = ensure_row_contiguous(w_, d, s);
-  // Laguna's certified packed decode scale bank is exposed to this prefill
-  // primitive through a bounded shape-preserving view. Its exact expert shape,
-  // zero last-axis stride, and layout-specific 64-byte or 16-byte compact-row
-  // strides form a fail-closed marker; the kernel consumes the inherited
-  // packed bytes directly. Every ordinary scale array retains the stock
-  // normalization path.
   const int pairwise_scale_layout =
       laguna_expert_pairwise_scale_layout(scales_);
   array scales = pairwise_scale_layout != 0
       ? scales_
       : ensure_row_contiguous(scales_, d, s);
 
-  // TODO: Tune the block sizes
   int bm = 64, bn = 64, bk = 64;
   int wm = 2, wn = 2;
+  const bool laguna_moe_shape =
+      (K == 2048 && N == 1024) || (K == 512 && N == 2048);
+  const bool laguna_gate_up_shape = (K == 2048 && N == 1024);
   const int bm128 = darkbloom_stage_bm128_variant();
   switch (bm128) {
-    case 1: bm = 128; wm = 4; break;         // SM=32, less re-staging
-    case 2: bm = 128; wm = 2; break;         // SM=64, predicted regression
-    case 3: bm = 128; wm = 8; break;         // SM=16, both mechanisms
-    case 4: bm = 64;  wm = 4; break;         // SM=16, 256 thr/TG, SHIPPED DEFAULT
-    case 5: bm = 64;  wm = 4; wn = 1; break; // SM=16, 128 thr/TG, TN 2 -> 4
-    default: break;                          // upstream: bm=64, wm=2, wn=2
+    case 1: bm = 128; wm = 4; break;
+    case 2: bm = 128; wm = 2; break;
+    case 3: bm = 128; wm = 8; break;
+    case 4: bm = 64;  wm = 4; break;
+    case 5: bm = 64;  wm = 4; wn = 1; break;
+    // N-tile reuse: BN=128 doubles the outputs each threadgroup produces from
+    // the same A fragments, halving A device-load issues per output. Applied
+    // only to the routed MoE shapes, whose N is a multiple of 128; widening an
+    // arbitrary shape would drop it out of expert_aligned into an untested
+    // generic instantiation. 6 = both projections, 7 = gate/up, 8 = down.
+    case 6: bm = 64; wm = 4; wn = 1;
+      if (laguna_moe_shape) { bn = 128; }
+      break;
+    case 7: bm = 64; wm = 4; wn = 1;
+      if (laguna_gate_up_shape) { bn = 128; }
+      break;
+    case 8: bm = 64; wm = 4; wn = 1;
+      if (laguna_moe_shape && !laguna_gate_up_shape) { bn = 128; }
+      break;
+    default: break;
   }
 
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
-  const bool laguna_moe_shape =
-      (K == 2048 && N == 1024) || (K == 512 && N == 2048);
-  // wn == 1 admitted 2026-07-31 (GatherX): DARKBLOOM_STAGE_BM128=5's
-  // BM64/WM4/WN1 tiling (128 thr/TG, SN=64/TN=4) previously fell off the
-  // expert path here and silently measured the NON-expert kernel. On the
-  // expert kernel it is bit-identical to the wn==2 schedule (same per-output
-  // k-ascending accumulation; WN is a pure work-partition template arg) and
-  // measured -4.0..-4.2% gate/up, -3.0..-5.8% down at kernel level
-  // (notes/exp-gatherx.md). Default bm128=4 keeps wn==2: stock unchanged.
   const bool expert_aligned =
       darkbloom_expert_aligned_gather() && mode != "affine" && transpose &&
       group_size == 16 && bits == 4 && laguna_moe_shape && M >= 64 &&
@@ -1711,27 +1422,12 @@ void gather_qmm_rhs_nax(
   const bool static_expert_shape =
       expert_aligned && static_laguna_shapes && mode == "nvfp4" &&
       type_string == "bfloat16_t" && !biases_.has_value();
-  // How many threadgroups the expert path spreads the 256 experts over; the
-  // value is baked into the kernel name and template (see
-  // darkbloom_expert_gather_groups), so each setting compiles exactly one
-  // pipeline for the process lifetime.
   const int egroups = darkbloom_expert_gather_groups();
   const bool expert_widest = expert_aligned && darkbloom_expert_stage_widest();
-  // Certified per weight bank; the banks are prepared once at init and
-  // retained, so each bank's certification -- and therefore its kernel name
-  // -- is stable for the process lifetime, and warmup compiles both
-  // pipelines before the first scored request.
   const bool expert_wideld = expert_aligned &&
       darkbloom_expert_stage_wideld() &&
       darkbloom_stage_wide_load_ok(w, transpose, bits, N, K, bn);
 
-  // DARKBLOOM_STAGE2_GATHER ground truth at the DISPATCH site. The define
-  // itself is injected at JIT assembly (jit_kernels.cpp, expert kernels
-  // only); this one-shot line proves a flagged run actually dispatches the
-  // expert-aligned path that define targets -- the exact confound that made
-  // the STAGE_WIDEST/WIDELD arms measure their own control (those function
-  // constants only ever reached the non-expert kernel). "active" requires
-  // BOTH the flag and the expert path; a declining guard prints "inactive".
   {
     static const bool stage2_flag =
         env::get_var("DARKBLOOM_STAGE2_GATHER", "") == "1";
@@ -1754,11 +1450,6 @@ void gather_qmm_rhs_nax(
     }
   }
 
-  // DARKBLOOM_GATHER_XMAJOR ground truth at the DISPATCH site, same
-  // contract as the stage2 line above: "active" requires BOTH the flag and
-  // the expert path (the define is only injected into expert kernels), so a
-  // declining guard prints "inactive" instead of silently measuring the
-  // control.
   {
     static const int xmajor_trace_ct = darkbloom_gather_xmajor_ct();
     static const bool trace_fusion =
@@ -1783,7 +1474,6 @@ void gather_qmm_rhs_nax(
     }
   }
 
-  // Make the kernel name
   std::string kname;
   kname.reserve(64);
   concatenate(
@@ -1819,21 +1509,8 @@ void gather_qmm_rhs_nax(
              "_ps_" + std::to_string(expert_pairwise_scale_layout))
           : "");
 
-  // Skipping dead runs is a pure work elision (see function constant 203 in
-  // fp_quantized_nax): it drops only matmuls whose results store_slice never
-  // writes, so enabling it cannot change any output element.
-  //
-  // CONSTANT for the process lifetime -- never a per-dispatch decision. That is
-  // what keeps the pipeline specialization key stable and guarantees a single
-  // JIT compile, which the partial dial then modulates via a runtime scalar.
   const bool run_skip = darkbloom_gather_run_skip_enabled();
   const int run_skip_pct = run_skip ? darkbloom_gather_run_skip_pct() : 100;
-  // DARKBLOOM_STAGE_*. Widening is additionally gated on the host-side
-  // alignment certification; WIDELD implies reading the packed weights
-  // through a 16B type, so it needs the device-side guarantee, while WIDEST
-  // only needs the threadgroup one (Ws is 16B aligned by construction in the
-  // kernel). Both are resolved once per process, so the specialization key is
-  // fixed for the process lifetime.
   const bool wide_ok =
       darkbloom_stage_wide_load_ok(w, transpose, bits, N, K, bn);
   const bool stage_widest = darkbloom_stage_widest();
@@ -1841,12 +1518,6 @@ void gather_qmm_rhs_nax(
   const bool stage_runbar = darkbloom_stage_runbar();
   const bool stage_novol = darkbloom_stage_novol();
 
-  // Ground truth for the A/B harness. `stage_wideld` is silently downgraded
-  // to false when the host alignment certification declines, and `wide_ok`
-  // depends on `w.offset()`, which is a runtime property no static reading of
-  // the source can settle. Without this, a rejected gate is indistinguishable
-  // from a lever that does nothing -- the exact confound that makes an
-  // A/B arm meaningless. One shot per process, default off, stderr only.
   if (darkbloom_stage_flag("DARKBLOOM_STAGE_TRACE")) {
     static std::once_flag once;
     std::call_once(once, [&]() {
@@ -1892,7 +1563,6 @@ void gather_qmm_rhs_nax(
     };
   }
 
-  // And the kernel hash that includes the function constants
   std::string hash_name;
   hash_name.reserve(128);
   concatenate(
@@ -1912,10 +1582,6 @@ void gather_qmm_rhs_nax(
       stage_runbar ? 'B' : 'n',
       stage_novol ? 'V' : 'n');
 
-  // Get and set the kernel. Every expert-aligned instantiation (static and
-  // runtime-shaped alike) is built from a template definition here, because
-  // the expert kernel's expert-group count is a template parameter; the
-  // shared gather builder keeps its stock signature for the non-expert path.
   auto& compute_encoder = metal::get_command_encoder(s);
   MTL::ComputePipelineState* kernel;
   if (expert_aligned) {
@@ -1959,10 +1625,6 @@ void gather_qmm_rhs_nax(
   compute_encoder.set_compute_pipeline_state(kernel);
 
   MTL::Size group_dims(32, wn, wm);
-  // DARKBLOOM_GATHER_XMAJOR: the expert kernel was compiled to walk
-  // xmajor_ct adjacent column tiles per threadgroup, so grid.x shrinks by
-  // the same factor. N is certified 1024 or 2048 on the expert path (bn=64),
-  // so the division is always exact.
   const int xmajor_ct = expert_aligned ? darkbloom_gather_xmajor_ct() : 0;
   MTL::Size grid_dims(
       xmajor_ct > 1 ? (N / bn) / xmajor_ct : ((N + bn - 1) / bn),
@@ -2023,13 +1685,8 @@ void gather_qmm_rhs(
         /* const std::string mode = */ mode);
   }
 
-  // Start by normalizing the indices
   array indices = ensure_row_contiguous(indices_, d, s);
 
-  // Broadcast x with indices. If we are here that means lhs_indices were not
-  // provided so the lhs_indices are implied to be the shape of x broadcasted
-  // with rhs_indices. We need only broadcast x and copy it as if applying the
-  // lhs_indices.
   auto broadcast_with_indices = [&d, &s, &indices](const array& x) {
     if (x.size() / x.shape(-2) / x.shape(-1) == indices.size()) {
       return ensure_row_contiguous(x, d, s);
@@ -2043,12 +1700,10 @@ void gather_qmm_rhs(
     return ensure_row_contiguous(new_x, d, s);
   };
 
-  // Normalize the input arrays
   array x = broadcast_with_indices(x_);
   array w = ensure_row_contiguous(w_, d, s);
   array scales = ensure_row_contiguous(scales_, d, s);
 
-  // TODO: Tune the block sizes
   int bm = 16, bn = 32, bk = 32;
   int wm = 1, wn = 2;
 
@@ -2056,7 +1711,6 @@ void gather_qmm_rhs(
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
 
-  // Make the kernel name
   std::string kname;
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
@@ -2085,7 +1739,6 @@ void gather_qmm_rhs(
       {&align_K, MTL::DataType::DataTypeBool, 202},
   };
 
-  // And the kernel hash that includes the function constants
   std::string hash_name;
   hash_name.reserve(128);
   concatenate(
@@ -2098,7 +1751,6 @@ void gather_qmm_rhs(
       "_align_K_",
       align_K ? 't' : 'n');
 
-  // Get and set the kernel
   auto& compute_encoder = metal::get_command_encoder(s);
   auto kernel = get_gather_qmm_kernel(
       d,
@@ -2151,7 +1803,6 @@ void dispatch_qmv(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  // It is a qmv with a small inner dimension so route to qmv_quad kernel
   if ((K == 128 || K == 64) && is_power_of_2(bits)) {
     qmv_quad(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
@@ -2165,8 +1816,6 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   out.set_data(allocator::malloc(out.nbytes()));
 
-  // Make sure the last two dims of x and w, s, b are contiguous. This should
-  // be relaxed for x.
   array x = ensure_row_contiguous_matrix(inputs[0], d, s);
   array w = ensure_row_contiguous_matrix(inputs[1], d, s);
   array scales = ensure_row_contiguous_matrix(inputs[2], d, s);
@@ -2175,7 +1824,6 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     biases = ensure_row_contiguous_matrix(inputs[3], d, s);
   }
 
-  // Extract the matmul shapes
   bool non_batched = w.ndim() == 2 && x.flags().row_contiguous;
   int K = x.shape(-1);
   int M = non_batched ? x.size() / K : x.shape(-2);
@@ -2183,9 +1831,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
-  // It is a matrix matrix product.
   if (M >= vector_limit) {
-    // Use split-K qmm for small M with transposed weights (non-batched only)
     int B = out.size() / M / N;
     if (transpose_ && B == 1) {
       qmm_splitk(
@@ -2209,20 +1855,17 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  // Run of the mill qmv
   if (transpose_) {
     dispatch_qmv(
         x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
     return;
   }
 
-  // Run of the mill qvm
   if (K < 1024) {
     qvm(x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
     return;
   }
 
-  // Qvm with large dimension so route to a split K kernel for more parallelism
   qvm_split_k(
       x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
   return;
@@ -2238,8 +1881,6 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   array w = ensure_row_contiguous_matrix(inputs[1], d, s);
   const int pairwise_scale_layout =
       laguna_expert_pairwise_scale_layout(inputs[2]);
-  // Preserve the exact zero-copy marker for the dedicated NAX loader. Every
-  // ordinary array keeps the stock row-contiguous normalization.
   array scales = pairwise_scale_layout != 0
       ? inputs[2]
       : ensure_row_contiguous_matrix(inputs[2], d, s);
@@ -2272,10 +1913,6 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         "outer dispatch");
   }
 
-  // We are walking x in order and w is also in order so we can batch up the
-  // matmuls and reuse reading x and w.
-  //
-  // TODO: Tune 16 and 4 here a bit better.
   if (sorted_rhs) {
     gather_qmm_rhs(
         x,
@@ -2296,7 +1933,6 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  // It is a matrix matrix product
   if (M >= vector_limit) {
     gather_qmm(
         x,
@@ -2409,10 +2045,6 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   auto mode = quantization_mode_to_string(mode_);
   bool w_quantized = (inputs[1].dtype() == uint32);
-  // Tensor-scale nvfp4 (global_scale_x / global_scale_w) is packed into
-  // inputs by ops.cpp but no Metal qqmm kernel currently consumes the
-  // global scales. Reject the request rather than silently dropping them
-  // in the gemv path below.
   int base_size = w_quantized ? 3 : 2;
   if (mode_ == QuantizationMode::Nvfp4 &&
       static_cast<int>(inputs.size()) > base_size) {
@@ -2425,14 +2057,12 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
     bool donate_x = inputs[0].is_donatable();
     array x = ensure_row_contiguous(inputs[0], d, s);
-    // If x is a copy it should be donatable
     donate_x |= x.is_donatable();
     auto xhat = donate_x
         ? x
         : array(allocator::malloc(x.nbytes()), x.shape(), x.dtype());
     quantize_dequantize(x, xhat, mode, group_size_, bits_, d, s);
 
-    // Make sure the last two dims of w and s are contiguous
     array w = ensure_row_contiguous_matrix(inputs[1], d, s);
     array scales = ensure_row_contiguous_matrix(inputs[2], d, s);
 
@@ -2518,7 +2148,6 @@ void fast::Quantize::eval_gpu(
 
   compute_encoder.set_compute_pipeline_state(kernel);
 
-  // Treat uint32 as uint8 in kernel
   constexpr int uint8_per_uint32 = 4;
   constexpr int simd_size = 32;
   int packs_per_int = (bits_ == 3 || bits_ == 5) ? 8
@@ -2554,4 +2183,6 @@ void fast::ConvertFP8::eval_gpu(
   unary_op_gpu(inputs, out, name(), stream());
 }
 
-} // namespace mlx::core
+}
+
+// r105-A ladder receipt marker: A0-3
