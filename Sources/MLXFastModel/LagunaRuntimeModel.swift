@@ -9383,6 +9383,12 @@ private let lagunaDecodeRouterOrdinalScoreTableEnabled =
 // keeps the eighteen-receipt executable tree unchanged; its mean leads 0.1486%.
 // Receipt 19 was crown-positive by 0.2420% on raw phases; nonce 20 keeps the
 // nineteen-receipt executable tree unchanged while its raw mean leads 0.1535%.
+// newjordan campaign (Linux edit host, remote M5 prove only):
+//   sub 1e68b6a3 cacheLimit 32→48 GiB: correct, score 2.58276 (−3.36%) — REVERTED
+//   sub 647f228f CB 320/128→384/192: correct, score 2.58515 (−1.20%) — REVERTED
+// Both absolute phase times were tip-competitive; paired baseline variance +
+// soft-policy regressions lost the crown. Nonce 21 = byte-identical active64
+// executable (tip c5b0a13 / nonce 20) for a fresh paired draw — no runtime change.
 private let lagunaDecodeRouterTournamentEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_DECODE_ROUTER_TOURNAMENT"] != "0"
 
