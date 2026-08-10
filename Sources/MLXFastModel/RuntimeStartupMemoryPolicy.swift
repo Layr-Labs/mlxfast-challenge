@@ -106,12 +106,12 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
             cacheLimitBytes: 32 << 30,
             // The MLX M5 Max default commits a command buffer after
             // referencing 50 MiB. Many 4-bit projections individually exceed
-            // that, so 320 MiB groups adjacent kernels without long command
-            // buffers; decode's explicit async-eval groups remain the outer
-            // command-buffer boundary, and this referenced-buffer budget
-            // governs within them.
-            maxMegabytesPerCommandBuffer: 320,
-            maxOperationsPerCommandBuffer: 128,
+            // that. Tip used 320 MiB / 128 ops; raise to 384 MiB / 192 ops so
+            // adjacent NVFP4 MoE / attention kernels share a command buffer
+            // more often inside decode's outer async-eval groups. Soft budget
+            // only — does not change kernels, numerics, or token outputs.
+            maxMegabytesPerCommandBuffer: 384,
+            maxOperationsPerCommandBuffer: 192,
             clearAllocatorCacheAfterWarmup: false,
             environmentOverrides: [:]
         )
