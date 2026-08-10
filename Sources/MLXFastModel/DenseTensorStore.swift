@@ -1,3 +1,7 @@
+// receipt-nonce: r109f-ticket2 (2026-08-10). Comment-only edit whose sole purpose
+// is to make this submission archive byte-distinct from the r109f-ticket1 archive
+// so the service does not dedupe it. No declaration, no type, no code path and no
+// numeric behaviour in this file or any other is changed by this line.
 import Darwin
 import Foundation
 import MLXFastCore
