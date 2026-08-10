@@ -1836,6 +1836,36 @@ private var lagunaRingIdxAtlas: [MLXArray] { LagunaRingIdxAtlasStore.entries }
 let lagunaParamsAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PARAMS_ATLAS"] != "0"
 
+/// Full-attention twin of the ring-index atlas above: pre-materialized
+/// 12-byte params buffers `[writeIdx, writeIdx + 1, capacity]` for every
+/// (capacity rung, write index) pair the `KVCacheSimple` growth policy can
+/// produce (capacity walks multiples of the 256-row step; a write index
+/// only coexists with the rung that holds its final 256-row window), 4096
+/// entries total. Replaces a fresh 3-element MLXArray allocation per
+/// full-attention call (10/step). Input-independent: all entries are built
+/// unconditionally at warmup; the lookup indexes by request-local cache
+/// state, the same contract as the sliding atlas. Any geometry outside the
+/// table (trimmed cache, capacity past the RoPE atlas) falls back to the
+/// per-call allocation with identical bytes.
+private enum LagunaFullParamsAtlasStore {
+    nonisolated(unsafe) static let rungs: [[MLXArray]] = {
+        (1...(lagunaRoPEAngleAtlasLength / 256)).map { n in
+            let capacity = n * 256
+            let entries = (capacity - 256..<capacity).map {
+                MLXArray([UInt32($0), UInt32($0 + 1), UInt32(capacity)])
+            }
+            for entry in entries { eval(entry) }
+            return entries
+        }
+    }()
+}
+
+/// `DARKBLOOM_FULL_PARAMS_ATLAS=0` restores the per-call fresh 3-element
+/// array (ablation control for the full-attention atlas; identical bytes
+/// either way).
+let lagunaFullParamsAtlasEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FULL_PARAMS_ATLAS"] != "0"
+
 /// `DARKBLOOM_FUSED_FULL_ATTN` (default on; set "0" to disable): decode
 /// fused attention for the ten full-attention layers once the cache backing
 /// has spare capacity (from the second decode step on; the first step's
@@ -2298,9 +2328,18 @@ func lagunaFullFusedAttention(
     precondition(scale.dtype == .float32 && scale.size == 1)
 
     lagunaTrace("full fused attention")
-    let params = MLXArray([
-        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
-    ])
+    let params: MLXArray
+    if lagunaFullParamsAtlasEnabled, capacity % 256 == 0,
+        capacity <= lagunaRoPEAngleAtlasLength, writeIdx >= capacity - 256
+    {
+        params =
+            LagunaFullParamsAtlasStore
+            .rungs[capacity / 256 - 1][writeIdx - (capacity - 256)]
+    } else {
+        params = MLXArray([
+            UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
+        ])
+    }
     return lagunaFullFusedAttentionKernel(
         [
             rawQueries, rawKeys, rawValues,
@@ -2319,6 +2358,12 @@ func lagunaFullFusedAttention(
 /// deterministic, input-independent, evaluated once, and released before the
 /// constructor clears transient allocator cache and wires resident weights.
 func lagunaWarmFullFusedAttentionKernel() {
+    if lagunaFullParamsAtlasEnabled {
+        // Build the params atlas here, before the first scored forward; the
+        // warmup call below uses a 2-row cache and therefore takes the
+        // fallback allocation path.
+        _ = LagunaFullParamsAtlasStore.rungs
+    }
     let headDim = LagunaConstants.headDim
     let heads = LagunaConstants.fullAttentionHeads
     let kvHeads = LagunaConstants.numKeyValueHeads
@@ -11567,7 +11612,6 @@ final class LagunaRuntimeModelInner: Module {
                     asyncEval(h)
                 }
             }
-            lagunaInjectLayerWork(layer: i, isSingleTokenDecode: isSingleTokenDecode)
         }
 
         return h
@@ -11744,259 +11788,3 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     }
 }
 
-// ============================================================================
-// BEGIN M5 HARDWARE-CONSTANT INSTRUMENT — research measurement, NOT a ranking
-// attempt (PR #27). This block deliberately SLOWS the tree.
-//
-// It injects a known, output-neutral quantity of GPU work into the scored
-// forward so that two receipt observables (`prefill_seconds_per_token`,
-// `decode_seconds_per_token`) can be differenced across submissions into
-// hardware constants of the ranked M5 Max:
-//
-//   S = 512000 * prefill_seconds_per_token            (ms, 512-token forward)
-//   T = 1000 * decode_seconds_per_token - S/128       (ms, steady 1-tok step)
-//
-//   DRAM GB/s     = (bytes_B - bytes_A) / (T_B - T_A)
-//   matrix FLOP/s = (flop_B  - flop_A)  / (S_B - S_A)
-//   per-dispatch  = (T_C - T_A) / (dispatch_C - dispatch_A)
-//
-// Output neutrality: every injected kernel writes only into a dedicated sink
-// tensor that no model tensor ever reads, and the sink write is sentinel-gated
-// so it never actually fires. The injected arrays are forced with `asyncEval`,
-// which is what makes them execute (a dangling MLX output would be pruned) and
-// keeps them ahead of the real work in the same stream.
-//
-// Structure invariants that make the differences clean:
-//   * exactly one `asyncEval` per layer boundary in every configuration, so
-//     command-buffer count never varies between runs;
-//   * the bandwidth magnitude is varied per *dispatch* (`SWEEP_PASSES`), never
-//     by dispatch count, and every matmul reuses one `matA`/`matB` pair.
-//     `CommandEncoder::set_input_array` charges `data_size()` of each distinct
-//     buffer once per command buffer (`device.cpp:316-321`) and
-//     `needs_commit()` trips at 40 Mi items on `*g` / 50 Mi on `*s`
-//     (`device.cpp:484-487`, `:574-595`), so holding the bound-buffer set and
-//     the dispatch count fixed holds the injected commit count fixed and it
-//     cancels in `T_B - T_A`;
-//   * empty dispatches bind only 1- and 256-item arrays, so they add no byte
-//     charge at all, and are spread across all 40 layer boundaries so their
-//     launch ramp sits between real dispatches rather than at the step head;
-//   * injection magnitudes are host-side counts and buffer-passed uniforms
-//     only — never a Metal function constant, so no pipeline is recompiled
-//     mid-process (`quantized.cpp:1214-1220` precedent).
-//
-// Delete this block and the single `lagunaInjectLayerWork` call in
-// `LagunaRuntimeModelInner.callAsFunction` to remove the instrument entirely.
-// ============================================================================
-
-private func lagunaInjectEnvInt(_ key: String, _ fallback: Int) -> Int {
-    guard let raw = ProcessInfo.processInfo.environment[key], let value = Int(raw),
-        value >= 0
-    else { return fallback }
-    return value
-}
-
-/// DRAM sweep dispatches injected per single-token decode step. Held constant
-/// across every submitted configuration: the bandwidth magnitude is varied
-/// through `lagunaInjectSweepPasses` (bytes *per* dispatch) so that dispatch
-/// count and the bound-buffer set are identical in every run and the
-/// command-buffer term cancels in `T_B - T_A`.
-///
-/// Every knob below defaults to 0 so that `lagunaInjectActive` is false and the
-/// instrument is fully inert in the committed tree. A configuration is selected
-/// by environment variable for local differencing, or by an explicit source
-/// edit for an authorised official receipt.
-private let lagunaInjectDecodeSweeps = lagunaInjectEnvInt(
-    "DARKBLOOM_INJECT_DECODE_SWEEPS", 0)
-/// Passes over the 256 MiB pool per sweep dispatch. Buffer-passed uniform,
-/// never a Metal function constant.
-private let lagunaInjectSweepPasses = max(
-    1, lagunaInjectEnvInt("DARKBLOOM_INJECT_SWEEP_PASSES", 1))
-/// 512x8192 @ 8192x2048 bf16 matmuls injected per multi-token forward.
-private let lagunaInjectPrefillMatmuls = lagunaInjectEnvInt(
-    "DARKBLOOM_INJECT_PREFILL_MATMULS", 0)
-/// Empty dispatches injected per single-token decode step.
-private let lagunaInjectDecodeEmpty = lagunaInjectEnvInt(
-    "DARKBLOOM_INJECT_DECODE_EMPTY", 0)
-/// Empty dispatches injected per multi-token forward.
-private let lagunaInjectPrefillEmpty = lagunaInjectEnvInt(
-    "DARKBLOOM_INJECT_PREFILL_EMPTY", 0)
-/// 1 spreads the empty dispatches over all 40 layer boundaries; 0 batches them
-/// all at one boundary. Local-only control used to test whether the measured
-/// per-dispatch cost depends on placement.
-private let lagunaInjectEmptySpread = lagunaInjectEnvInt(
-    "DARKBLOOM_INJECT_EMPTY_SPREAD", 1) != 0
-/// Threadgroups per empty dispatch (256 threads each). Set 8 to reproduce
-/// `0411779d`'s geometry, on which n=0/100/400 lie on one M5 curve.
-private let lagunaInjectEmptyThreadgroups = lagunaInjectEnvInt(
-    "DARKBLOOM_INJECT_EMPTY_TG", 160)
-/// 0 unchains the empties: each binds a never-written control array, so no
-/// `memoryBarrier` is emitted (`device.cpp:325`). Unchained outputs all stay in
-/// `pending` so a recycled buffer cannot re-trip it as a WAW (`:331`).
-private let lagunaInjectEmptyChain = lagunaInjectEnvInt(
-    "DARKBLOOM_INJECT_EMPTY_CHAIN", 1) != 0
-
-private let lagunaInjectPoolUInt4 = 1 << 24  // 16,777,216 x 16 B = 256 MiB
-/// 256 threadgroups x 256 threads, 256 uint4 per thread. The pass loop lives
-/// inside the thread, so a threadgroup re-reads its own `perThread * 4 KiB`
-/// window immediately; cross-pass cache hits are possible whenever
-/// `resident_threadgroups * window` fits in cache. At 256 total threadgroups
-/// every threadgroup is resident, the resident window is the whole 256 MiB
-/// pool, and reuse is impossible on any cache size. Measured marginal rates
-/// on M4 Pro against the 262.5 GB/s sequential control from #21: 2^16 threads
-/// 242 GB/s, 2^17 245 GB/s, 2^18 339 GB/s (above the 273 GB/s hardware peak,
-/// i.e. cache-served). A larger machine has more resident threadgroups, so the
-/// safe direction is fewer threadgroups, not more.
-private let lagunaInjectSweepThreads = 1 << 16
-private let lagunaInjectSweepPerThread = lagunaInjectPoolUInt4 / lagunaInjectSweepThreads
-private let lagunaInjectMatmulM = 512
-private let lagunaInjectMatmulK = 8192
-private let lagunaInjectMatmulN = 2048
-
-/// Bytes read from DRAM per injected sweep dispatch.
-let lagunaInjectSweepBytes = lagunaInjectPoolUInt4 * 16 * lagunaInjectSweepPasses
-/// FLOPs issued per injected matmul dispatch (2 * M * N * K).
-let lagunaInjectMatmulFlops = 2 * lagunaInjectMatmulM * lagunaInjectMatmulN * lagunaInjectMatmulK
-
-private let lagunaInjectSweepKernel = MLXFast.metalKernel(
-    name: "laguna_inject_dram_sweep_u4_v2",
-    inputNames: ["pool", "control"],
-    outputNames: ["sink"],
-    source: """
-            constexpr uint kThreads = \(lagunaInjectSweepThreads);
-            constexpr uint kPerThread = \(lagunaInjectSweepPerThread);
-            constexpr uint kMask = \(lagunaInjectPoolUInt4 - 1);
-            const device uint4* quads = (const device uint4*)pool;
-            uint gid = thread_position_in_grid.x;
-            uint idx = (gid + control[0]) & kMask;
-            uint passes = control[1];
-            uint4 acc = uint4(0u);
-            for (uint p = 0; p < passes; ++p) {
-                for (uint i = 0; i < kPerThread; ++i) {
-                    acc ^= quads[idx];
-                    idx = (idx + kThreads) & kMask;
-                }
-            }
-            uint folded = acc.x ^ acc.y ^ acc.z ^ acc.w;
-            if (folded == 0xFFFFFFFFu) {
-                sink[gid & 255u] = folded;
-            }
-        """,
-    ensureRowContiguous: true
-)
-
-/// `prev` is bound only to chain the dispatches. MLX inserts a memory barrier
-/// when a dispatch binds a buffer a previous dispatch wrote
-/// (`device.cpp:325`, `:339`), and its encoder is otherwise
-/// `DispatchTypeConcurrent` (`device.cpp:548`), so without the chain these
-/// dispatches would run concurrently and measure nothing. Chained, they
-/// serialize exactly like the model's dependent dispatch stream.
-private let lagunaInjectEmptyKernel = MLXFast.metalKernel(
-    name: "laguna_inject_empty_dispatch_v1",
-    inputNames: ["control", "prev"],
-    outputNames: ["sink"],
-    source: """
-            uint gid = thread_position_in_grid.x;
-            if (control[0] == 0xFFFFFFFFu) {
-                sink[gid & 255u] = gid + prev[0];
-            }
-        """,
-    ensureRowContiguous: true
-)
-
-/// Process-lifetime scratch. First touched from `warmLibraryModel`'s untimed
-/// warm prefill/decode, so the 296 MB allocation and the JIT compiles happen
-/// before any timed window and before the resident-weight wiring walk.
-private enum LagunaInjectStore {
-    struct Scratch {
-        let pool: MLXArray
-        let control: [MLXArray]
-        let matA: MLXArray
-        let matB: MLXArray
-    }
-
-    nonisolated(unsafe) static let scratch: Scratch = {
-        let pool = MLXArray.zeros([lagunaInjectPoolUInt4 * 4], dtype: .uint32)
-        let control = (0..<8).map {
-            MLXArray([UInt32($0 + 1), UInt32(lagunaInjectSweepPasses)])
-        }
-        let matA = MLXArray.zeros(
-            [lagunaInjectMatmulM, lagunaInjectMatmulK], dtype: .bfloat16)
-        let matB = MLXArray.zeros(
-            [lagunaInjectMatmulK, lagunaInjectMatmulN], dtype: .bfloat16)
-        eval([pool, matA, matB] + control)
-        return Scratch(pool: pool, control: control, matA: matA, matB: matB)
-    }()
-}
-
-/// Tail of the injected-dispatch dependency chain, carried across layer
-/// boundaries. MLX's compute encoder is `DispatchTypeConcurrent`
-/// (`device.cpp:548`) and only inserts a barrier on a real hazard
-/// (`device.cpp:325`, `:339`), so an unchained injected dispatch runs
-/// concurrently with real work and costs almost nothing. Chaining reproduces
-/// the strictly serialised stream the real model runs in, which is the regime
-/// whose marginal cost it reads. See `research/tanjiro-pr47-d1.md`.
-private enum LagunaInjectChain {
-    nonisolated(unsafe) static var tail: MLXArray?
-}
-
-/// Layer `layer`'s share of `total` units, spread evenly over the 40 layers.
-private func lagunaInjectShare(_ total: Int, layer: Int) -> Int {
-    guard total > 0 else { return 0 }
-    let layers = LagunaConstants.numHiddenLayers
-    return (layer + 1) * total / layers - layer * total / layers
-}
-
-private let lagunaInjectActive =
-    lagunaInjectDecodeSweeps + lagunaInjectPrefillMatmuls + lagunaInjectDecodeEmpty
-    + lagunaInjectPrefillEmpty > 0
-
-func lagunaInjectLayerWork(layer: Int, isSingleTokenDecode: Bool) {
-    guard lagunaInjectActive else { return }
-    let sweeps = lagunaInjectShare(
-        isSingleTokenDecode ? lagunaInjectDecodeSweeps : 0, layer: layer)
-    let matmuls = lagunaInjectShare(
-        isSingleTokenDecode ? 0 : lagunaInjectPrefillMatmuls, layer: layer)
-    let emptyTotal = isSingleTokenDecode ? lagunaInjectDecodeEmpty : lagunaInjectPrefillEmpty
-    let empties =
-        lagunaInjectEmptySpread
-        ? lagunaInjectShare(emptyTotal, layer: layer) : (layer == 0 ? emptyTotal : 0)
-    let scratch = LagunaInjectStore.scratch
-    var pending: [MLXArray] = []
-    pending.reserveCapacity(sweeps + matmuls + empties)
-    for k in 0..<sweeps {
-        pending.append(
-            lagunaInjectSweepKernel(
-                [scratch.pool, scratch.control[(layer + k) & 7]],
-                grid: (lagunaInjectSweepThreads, 1, 1),
-                threadGroup: (256, 1, 1),
-                outputShapes: [[256]],
-                outputDTypes: [.uint32]
-            )[0])
-    }
-    for _ in 0..<matmuls {
-        pending.append(matmul(scratch.matA, scratch.matB))
-    }
-    if empties > 0 {
-        var tail = LagunaInjectChain.tail ?? scratch.control[0]
-        for k in 0..<empties {
-            tail = lagunaInjectEmptyKernel(
-                [
-                    scratch.control[(layer + k) & 7],
-                    lagunaInjectEmptyChain ? tail : scratch.control[7],
-                ],
-                grid: (lagunaInjectEmptyThreadgroups * 256, 1, 1),
-                threadGroup: (256, 1, 1),
-                outputShapes: [[256]],
-                outputDTypes: [.uint32]
-            )[0]
-            if !lagunaInjectEmptyChain { pending.append(tail) }
-        }
-        LagunaInjectChain.tail = tail
-        if lagunaInjectEmptyChain { pending.append(tail) }
-    }
-    guard !pending.isEmpty else { return }
-    asyncEval(pending)
-}
-
-// END M5 HARDWARE-CONSTANT INSTRUMENT
-// ============================================================================
