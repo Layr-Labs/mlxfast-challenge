@@ -110,8 +110,11 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
             // buffers; decode's explicit async-eval groups remain the outer
             // command-buffer boundary, and this referenced-buffer budget
             // governs within them.
-            maxMegabytesPerCommandBuffer: 320,
-            maxOperationsPerCommandBuffer: 128,
+            // Last push opposite of rejected 384/192: tighter CB grouping
+            // (256 MiB / 96 ops) so decode's outer async-eval boundaries commit
+            // a bit earlier. Soft budget only; tip kernels/numerics unchanged.
+            maxMegabytesPerCommandBuffer: 256,
+            maxOperationsPerCommandBuffer: 96,
             clearAllocatorCacheAfterWarmup: false,
             environmentOverrides: [:]
         )
