@@ -45,8 +45,6 @@ instantiate_gemv_blocks(float16, half);
 instantiate_gemv_blocks(bfloat16, bfloat16_t);
 instantiate_gemv_blocks(complex64, complex64_t);
 
-// Aligned vector-load twins ("gemv_al"): only instantiated for the 2-byte
-// float types whose GEMVLoader specializations perform vec<T,4> loads.
 // clang-format off
 #define instantiate_gemv_al_helper(                                      \
     name, itype, bm, bn, sm, sn, tm, tn, nc, axpby)                      \
