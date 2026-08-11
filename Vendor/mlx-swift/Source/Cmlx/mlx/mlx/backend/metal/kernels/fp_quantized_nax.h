@@ -1327,6 +1327,7 @@ template <
     const device T* x,
     const device uint32_t* w,
     const device uint8_t* scales,
+    const device uint32_t* row_indices,
     const device uint32_t* indices,
     device T* y,
     const constant int& M,
@@ -1888,6 +1889,41 @@ template <
         if (sg_active) {
           STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+#ifdef DARKBLOOM_ROW_ADDRESSED
+            static_assert(TM == 1, "row-addressed loader requires SM=16");
+            static_assert(TK == 2, "row-addressed loader requires SK=32");
+            const short qid = short(simd_lane_id >> 2);
+            const short frag_row =
+                (qid & 4) | ((short(simd_lane_id) >> 1) & 3);
+            const short frag_col =
+                ((qid & 2) | (short(simd_lane_id) & 1)) * 4;
+            STEEL_PRAGMA_UNROLL
+            for (short jf = 0; jf < TK; ++jf) {
+              thread auto& frag = Atile[kk1 / SK].frag_at(0, jf);
+              STEEL_PRAGMA_UNROLL
+              for (short ie = 0; ie < 2; ++ie) {
+                const short logical_row = frag_row + ie * 8;
+                if (logical_row < sgp_sm) {
+                  const uint32_t source_row =
+                      row_indices[chunk_start + tm + logical_row];
+                  const device T* source =
+                      x + size_t(source_row) * kernel_K + k * BK + kk1 +
+                      jf * 16 + frag_col;
+                  const metal::vec<T, 4> v =
+                      *reinterpret_cast<const device metal::vec<T, 4>*>(source);
+                  frag[ie * 4 + 0] = v.x;
+                  frag[ie * 4 + 1] = v.y;
+                  frag[ie * 4 + 2] = v.z;
+                  frag[ie * 4 + 3] = v.w;
+                } else {
+                  STEEL_PRAGMA_UNROLL
+                  for (short jj = 0; jj < 4; ++jj) {
+                    frag[ie * 4 + jj] = T(0);
+                  }
+                }
+              }
+            }
+#else
             if (sgp_sm == SM) {
               // 8B alignment certified: fn multiples of 4 elems, off_y in
               // {0,16}, kk1 in {0,32}, str_x = 2048. Same bytes, same slots.
@@ -1896,6 +1932,7 @@ template <
               // Same 8B-aligned runs as the full-row arm.
               Atile[kk1 / SK].load_rows_contig(xn + kk1, kernel_K, sgp_sm);
             }
+#endif
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
